@@ -55,6 +55,28 @@ The package installs `/usr/bin/hatchrun-agent` and the systemd unit but
 leaves the unit disabled, because the agent powers the machine off when
 it exits. Runner images enable it with `systemctl enable hatchrun-agent`.
 
+## Broker
+
+[`crates/broker`](crates/broker) is a Cloudflare Worker that hands each
+instance its runner config exactly once, so the config never sits in
+user data. The scaler puts a random ticket in the instance's user data
+and stores the config in the broker under that ticket. At boot the
+agent claims it with the ticket. The claim deletes the config, so the
+ticket is useless once the runner has started, and an unclaimed config
+is deleted when it expires (15 minutes by default). Every cloud has
+user data, so this works the same on all of them.
+
+Each ticket gets its own Durable Object, named by the ticket's SHA-256,
+so two claims of one ticket cannot both succeed and nothing stored is
+keyed by a live ticket. Storing needs the `BROKER_TOKEN` secret; a
+claim needs only the ticket, a 256-bit random value.
+
+```sh
+cd crates/broker
+npx wrangler@4.143.0 secret put BROKER_TOKEN
+npx wrangler@4.143.0 deploy
+```
+
 ## Scale set client
 
 [`crates/scaleset`](crates/scaleset) talks to the GitHub Actions runner
