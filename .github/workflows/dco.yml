@@ -31,7 +31,7 @@ jobs:
             esac
             author="$(git show -s --format='%an <%ae>' "$sha")"
             if ! git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$sha" | grep -qxF "$author"; then
-              echo "::error::commit ${sha:0:12} has no 'Signed-off-by: $author' line. Add it with 'git rebase --signoff $BASE' and force-push."
+              echo "::error::commit ${sha:0:12} has no 'Signed-off-by: $author' line. Add it with 'git rebase --signoff -S $BASE' and force-push."
               status=1
             fi
           done
