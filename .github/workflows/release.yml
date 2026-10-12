@@ -1,0 +1,186 @@
+name: release
+
+# Every push to main checks for unreleased feat, fix, perf or revert
+# commits. When there are some, it computes the next version from them
+# (cliff.toml), builds and packages the binaries, and publishes a GitHub
+# release with a new vX.Y.Z tag. Other commits do not cut a release.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GIT_CLIFF_VERSION: 2.14.2
+  GIT_CLIFF_SHA256: 24f397c733add5390fdceee3a2088588ab0d5f944ce00d34cb7029b888cf2db4
+  NFPM_VERSION: 2.47.0
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install git-cliff
+        run: |
+          archive="git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSLo "$archive" "https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/${archive}"
+          echo "${GIT_CLIFF_SHA256}  ${archive}" | sha256sum -c -
+          sudo tar -xzf "$archive" --strip-components=1 -C /usr/local/bin "git-cliff-${GIT_CLIFF_VERSION}/git-cliff"
+
+      - id: next
+        name: Compute the next version
+        run: |
+          releasable=$(git cliff --unreleased --context | jq '[.[].commits[]] | length')
+          if [ "$releasable" -eq 0 ]; then
+            echo "No feat, fix, perf or revert commits since the last release."
+            exit 0
+          fi
+          version=$(git cliff --bumped-version)
+          git cliff --unreleased --tag "$version" --strip all > release-notes.md
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version"
+
+      - if: steps.next.outputs.version != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  build:
+    needs: version
+    if: needs.version.outputs.version != ''
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            arch: amd64
+            nfpm_arch: x86_64
+            nfpm_sha256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+            nfpm_arch: arm64
+            nfpm_sha256: 1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          HATCHRUN_VERSION="$VERSION" cargo build --locked --release --target "$TARGET" -p hatchrun-agent
+          "target/$TARGET/release/hatchrun-agent" --version | grep -qx "hatchrun-agent $VERSION"
+
+      - name: Install nfpm
+        env:
+          NFPM_ARCH: ${{ matrix.nfpm_arch }}
+          NFPM_SHA256: ${{ matrix.nfpm_sha256 }}
+        run: |
+          archive="nfpm_${NFPM_VERSION}_Linux_${NFPM_ARCH}.tar.gz"
+          curl -fsSLo "$archive" "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/${archive}"
+          echo "${NFPM_SHA256}  ${archive}" | sha256sum -c -
+          sudo tar -xzf "$archive" -C /usr/local/bin nfpm
+
+      - name: Package
+        run: |
+          name="hatchrun-agent-${VERSION}-linux-${ARCH}"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/hatchrun-agent" dist/hatchrun-agent
+          cp dist/hatchrun-agent packaging/systemd/hatchrun-agent.service LICENSE NOTICE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+          nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+
+  sbom:
+    needs: version
+    if: needs.version.outputs.version != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo install --locked cargo-cyclonedx --version 0.5.9
+      - run: |
+          cargo cyclonedx -f json --spec-version 1.5 --manifest-path crates/hatchrun-agent/Cargo.toml --target x86_64-unknown-linux-musl
+          mkdir -p sbom
+          cp crates/hatchrun-agent/hatchrun-agent.cdx.json "sbom/hatchrun-agent-${{ needs.version.outputs.version }}.cdx.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+
+  release:
+    needs: [version, build, sbom]
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom
+          path: dist
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS
+
+      # Signed SLSA build provenance for every file, verifiable with
+      # `gh attestation verify <file> --repo hatchrun/hatchrun`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${VERSION}" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v${VERSION}" \
+            --notes-file release-notes.md

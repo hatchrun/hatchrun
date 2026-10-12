@@ -37,6 +37,28 @@ supplementary groups and the environment from `/etc/environment`. When the
 runner exits, or no config arrives within 10 minutes, the unit powers the
 instance off.
 
+### Installing
+
+Each [release](https://github.com/hatchrun/hatchrun/releases) has a
+`.deb`, an `.rpm` and a tarball for `amd64` and `arm64`, a `SHA256SUMS`
+file and a CycloneDX SBOM. Every file carries signed build provenance:
+
+```sh
+gh attestation verify hatchrun-agent_0.1.0_amd64.deb --repo hatchrun/hatchrun
+sudo apt install ./hatchrun-agent_0.1.0_amd64.deb
+```
+
+The package installs `/usr/bin/hatchrun-agent` and the systemd unit but
+leaves the unit disabled, because the agent powers the machine off when
+it exits. Runner images enable it with `systemctl enable hatchrun-agent`.
+
+## Releases
+
+Merging to `main` releases automatically when there are `feat`, `fix`,
+`perf` or `revert` commits since the last tag. The version comes from
+those Conventional Commits (see `cliff.toml`): `fix` bumps the patch
+version, `feat` and breaking changes bump the minor version until 1.0.
+
 Runner images live in [hatchrun/images](https://github.com/hatchrun/images)
 and the Terraform module in
 [hatchrun/terraform-aws-hatchrun](https://github.com/hatchrun/terraform-aws-hatchrun).
