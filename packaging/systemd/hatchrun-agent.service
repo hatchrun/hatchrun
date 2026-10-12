@@ -1,0 +1,25 @@
+# Runs one GitHub Actions job, then powers the instance off. The launch
+# template sets InstanceInitiatedShutdownBehavior=terminate, so power-off
+# ends the instance.
+[Unit]
+Description=hatchrun agent: run one GitHub Actions job
+Wants=network-online.target docker.socket
+After=network-online.target docker.socket
+# Power off on success and on failure alike, so an instance that could not
+# get a runner config never sits idle and billed. Override with a drop-in
+# setting both to none when debugging an image.
+SuccessAction=poweroff
+FailureAction=poweroff
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/hatchrun-agent
+Restart=no
+# The agent forwards SIGTERM to the runner and waits up to 30s for it.
+KillMode=mixed
+TimeoutStopSec=45
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
