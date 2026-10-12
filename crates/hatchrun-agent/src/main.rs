@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! hatchrun-agent runs on a runner instance at boot. It fetches the
 //! instance's just-in-time runner config, runs exactly one GitHub Actions job
 //! and exits. The systemd unit powers the instance off when it exits, whether

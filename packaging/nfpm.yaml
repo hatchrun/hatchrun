@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # Builds the .deb and .rpm packages. The release workflow sets VERSION and
 # ARCH and copies the binary to dist/hatchrun-agent first.
 name: hatchrun-agent
@@ -6,7 +10,7 @@ platform: linux
 version: ${VERSION}
 section: admin
 priority: optional
-maintainer: The hatchrun Authors <hatchrun@users.noreply.github.com>
+maintainer: Gamunu Balagalla <gamunu.balagalla@gmail.com>
 description: |
   Boot agent for hatchrun runner instances.
   Fetches the instance's just-in-time GitHub Actions runner config, runs

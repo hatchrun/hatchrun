@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Minimal `IMDSv2` client.
 //!
 //! aws-config ships an `IMDS` client, but it only returns UTF-8 text, and user

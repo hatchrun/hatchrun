@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Starts the GitHub Actions runner for one job.
 
 use std::future::Future;
