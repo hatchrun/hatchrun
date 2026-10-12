@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "hatchrun-broker"
+version = "0.1.0"
+description = "Cloudflare Worker that hands each runner instance its JIT config once"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+wasm-bindgen = "0.2.129"
+worker = "0.8.7"
+
+[lints]
+workspace = true

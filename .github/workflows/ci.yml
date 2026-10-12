@@ -33,8 +33,8 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       # The scale set client and scaler core must stay free of I/O so they
-      # run in Workers.
-      - run: cargo check --locked -p hatchrun-scaleset -p hatchrun-scaler-core --target wasm32-unknown-unknown
+      # run in Workers, next to the broker.
+      - run: cargo check --locked -p hatchrun-scaleset -p hatchrun-scaler-core -p hatchrun-broker --target wasm32-unknown-unknown
 
   # Tests that switch users need root and a real account.
   root-tests:
