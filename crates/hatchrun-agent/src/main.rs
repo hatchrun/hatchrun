@@ -26,7 +26,7 @@ use crate::source::Resolver;
 use crate::ssm::Ssm;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = env!("HATCHRUN_VERSION"), about)]
 struct Args {
     /// Directory holding the runner's run.sh.
     #[arg(long, default_value = "/home/runner")]

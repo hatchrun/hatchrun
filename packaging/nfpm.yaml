@@ -1,0 +1,38 @@
+# Builds the .deb and .rpm packages. The release workflow sets VERSION and
+# ARCH and copies the binary to dist/hatchrun-agent first.
+name: hatchrun-agent
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+section: admin
+priority: optional
+maintainer: The hatchrun Authors <hatchrun@users.noreply.github.com>
+description: |
+  Boot agent for hatchrun runner instances.
+  Fetches the instance's just-in-time GitHub Actions runner config, runs
+  one job and powers the instance off. Meant for runner images only: the
+  unit is installed disabled.
+vendor: hatchrun
+homepage: https://github.com/hatchrun/hatchrun
+license: Apache-2.0
+
+contents:
+  - src: dist/hatchrun-agent
+    dst: /usr/bin/hatchrun-agent
+    file_info:
+      mode: 0755
+  - src: packaging/systemd/hatchrun-agent.service
+    dst: /usr/lib/systemd/system/hatchrun-agent.service
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/doc/hatchrun-agent/LICENSE
+    file_info:
+      mode: 0644
+  - src: NOTICE
+    dst: /usr/share/doc/hatchrun-agent/NOTICE
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: packaging/scripts/postinstall.sh

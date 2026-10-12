@@ -13,7 +13,7 @@ FailureAction=poweroff
 
 [Service]
 Type=exec
-ExecStart=/usr/local/bin/hatchrun-agent
+ExecStart=/usr/bin/hatchrun-agent
 Restart=no
 # The agent forwards SIGTERM to the runner and waits up to 30s for it.
 KillMode=mixed

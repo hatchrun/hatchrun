@@ -67,5 +67,5 @@ jobs:
       - run: |
           apt-get update -qq
           apt-get install -y -qq systemd
-          install -m 0755 /bin/true /usr/local/bin/hatchrun-agent
+          install -m 0755 /bin/true /usr/bin/hatchrun-agent
           systemd-analyze verify packaging/systemd/hatchrun-agent.service
