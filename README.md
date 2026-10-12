@@ -52,6 +52,15 @@ The package installs `/usr/bin/hatchrun-agent` and the systemd unit but
 leaves the unit disabled, because the agent powers the machine off when
 it exits. Runner images enable it with `systemctl enable hatchrun-agent`.
 
+## Scale set client
+
+[`crates/scaleset`](crates/scaleset) talks to the GitHub Actions runner
+scale set API, the same API Actions Runner Controller uses. It does no
+I/O: every call returns an HTTP request to send and a parser for the
+response. The scaler sends them with its own HTTP client, which is what
+lets it run on tokio or inside a Cloudflare Worker. CI builds the crate
+for `wasm32-unknown-unknown` to keep it that way.
+
 ## Releases
 
 Merging to `main` releases automatically when there are `feat`, `fix`,
