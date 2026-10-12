@@ -26,3 +26,7 @@ module_name_repetitions = "allow"
 codegen-units = 1
 lto = true
 strip = true
+
+# wasm-bindgen reads custom sections that a full strip removes.
+[profile.release.package.hatchrun-broker]
+strip = "debuginfo"
