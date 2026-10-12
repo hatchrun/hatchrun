@@ -52,6 +52,42 @@ The package installs `/usr/bin/hatchrun-agent` and the systemd unit but
 leaves the unit disabled, because the agent powers the machine off when
 it exits. Runner images enable it with `systemctl enable hatchrun-agent`.
 
+## Scaler
+
+`hatchrun-scaler` serves one scale set. On start it creates or updates
+the scale set, opens a message session and long-polls it. For every
+assigned job it registers a just-in-time runner and starts an instance
+from your launch template, with the runner config in user data for the
+agent. Instances are tagged `hatchrun:scale-set-id`,
+`hatchrun:runner-name` and `hatchrun:runner-id`. Every minute it lists
+the tagged instances, which lets a restarted scaler pick up where the
+last one stopped. On SIGTERM it closes the session and leaves running
+jobs alone.
+
+```sh
+hatchrun-scaler \
+  --github-url https://github.com/acme \
+  --scale-set linux-x64 \
+  --launch-template lt-0123456789abcdef0 \
+  --subnets subnet-aaa,subnet-bbb \
+  --max-runners 20
+```
+
+Every flag also reads from a `HATCHRUN_*` environment variable, listed
+in `--help`. Authenticate with a GitHub App (`--github-app-client-id`,
+`--github-app-installation-id`, `--github-app-private-key`) with read
+and write access to the organization's self-hosted runners (repository
+administration for a repository scale set), or with a personal access
+token (`--github-token`). AWS credentials come from the usual
+SDK chain. The scaler needs `ec2:RunInstances`, `ec2:CreateTags`,
+`ec2:DescribeInstances` and `ec2:TerminateInstances`, plus
+`iam:PassRole` when the launch template sets an instance profile.
+
+The launch template sets the runner image, instance type and security
+groups. The scaler sets the shutdown behaviour to terminate, so the
+agent powering off ends the instance. Subnets are tried in order when
+one is out of capacity.
+
 ## Scale set client
 
 [`crates/scaleset`](crates/scaleset) talks to the GitHub Actions runner
