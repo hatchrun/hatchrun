@@ -1,0 +1,38 @@
+name: dco
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # Every commit needs a Developer Certificate of Origin sign-off
+      # (https://developercertificate.org) from its author. Bot commits,
+      # such as Dependabot's, cannot sign off and are skipped.
+      - name: Check Signed-off-by
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          for sha in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            email="$(git show -s --format='%ae' "$sha")"
+            case "$email" in
+              *"[bot]@users.noreply.github.com") continue ;;
+            esac
+            author="$(git show -s --format='%an <%ae>' "$sha")"
+            if ! git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$sha" | grep -qxF "$author"; then
+              echo "::error::commit ${sha:0:12} has no 'Signed-off-by: $author' line. Add it with 'git rebase --signoff $BASE' and force-push."
+              status=1
+            fi
+          done
+          exit $status
