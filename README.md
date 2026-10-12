@@ -61,6 +61,20 @@ response. The scaler sends them with its own HTTP client, which is what
 lets it run on tokio or inside a Cloudflare Worker. CI builds the crate
 for `wasm32-unknown-unknown` to keep it that way.
 
+## Scaler core
+
+[`crates/scaler-core`](crates/scaler-core) decides what the scaler does.
+It keeps one runner per assigned job, between `min_runners` and
+`max_runners`, and tracks each runner from launch to termination. It
+removes runners that wait for a job longer than the idle timeout (15
+minutes by default), which covers instances that never started the
+runner and jobs that went to another runner. Warm runners kept by
+`min_runners` get recycled on the same timeout. On start, and whenever
+the scaler compares its runners with the instances in the account, it
+adopts instances it does not know and removes the registration of
+runners whose instance is gone. Like the client, it does no I/O and
+builds for `wasm32-unknown-unknown`.
+
 ## Releases
 
 Merging to `main` releases automatically when there are `feat`, `fix`,
