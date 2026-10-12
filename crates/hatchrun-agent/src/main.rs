@@ -7,6 +7,7 @@
 //! and exits. The systemd unit powers the instance off when it exits, whether
 //! the job ran or the agent failed.
 
+mod broker;
 mod envfile;
 mod imds;
 mod runner;
@@ -24,6 +25,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+use crate::broker::HttpBroker;
 use crate::imds::Imds;
 use crate::runner::Runner;
 use crate::source::Resolver;
@@ -89,6 +91,7 @@ async fn run(args: Args) -> Result<()> {
     let resolver = Resolver {
         metadata,
         parameters: Ssm::new(aws_sdk_ssm::Client::new(&aws)),
+        broker: HttpBroker::new()?,
         poll_interval: args.poll_interval,
     };
 
