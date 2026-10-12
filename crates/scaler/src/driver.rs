@@ -18,6 +18,7 @@ use hatchrun_scaleset::{
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use crate::broker::{ConfigStore, boot_document, new_ticket};
 use crate::ec2::Cloud;
 use crate::github::GitHub;
 
@@ -75,9 +76,10 @@ where
 
 /// Owns the session of one scale set and carries out the scaler's
 /// decisions.
-pub struct Driver<T, C> {
+pub struct Driver<T, C, S> {
     github: Rc<GitHub<T>>,
     cloud: C,
+    store: S,
     scaler: Scaler,
     scale_set_id: u64,
     actions: Actions,
@@ -86,11 +88,12 @@ pub struct Driver<T, C> {
     clock: fn() -> u64,
 }
 
-impl<T, C> Driver<T, C>
+impl<T, C, S> Driver<T, C, S>
 where
     T: Transport + 'static,
     T::Error: std::error::Error + Send + Sync + 'static,
     C: Cloud,
+    S: ConfigStore,
 {
     /// Opens a message session. A session left open by a scaler that
     /// crashed blocks a new one until the service expires it, so conflicts
@@ -99,6 +102,7 @@ where
         github: GitHub<T>,
         actions: Actions,
         cloud: C,
+        store: S,
         mut scaler: Scaler,
         scale_set_id: u64,
         owner: &str,
@@ -131,6 +135,7 @@ where
         Ok(Self {
             github: Rc::new(github),
             cloud,
+            store,
             scaler,
             scale_set_id,
             actions,
@@ -296,8 +301,13 @@ where
         Ok(())
     }
 
-    /// Registers the runner and starts its instance. On failure, returns
-    /// the runner id when the registration had already happened.
+    /// Registers the runner, starts its instance with a ticket in user
+    /// data and stores the config in the broker under that ticket. On
+    /// failure, returns the runner id when the registration had already
+    /// happened.
+    ///
+    /// The config is stored only once the instance exists, so nothing can
+    /// claim it before there is an instance to claim it.
     async fn launch(&self, name: &str) -> Result<(u64, String), (Option<u64>, anyhow::Error)> {
         let config = self
             .github
@@ -308,11 +318,20 @@ where
             .await
             .map_err(|err| (None, anyhow::Error::new(err).context("generate JIT config")))?;
         let runner_id = config.runner.id;
+        let ticket = new_ticket().map_err(|err| (Some(runner_id), err))?;
         let instance_id = self
             .cloud
-            .launch(name, runner_id, &config.encoded_jit_config)
+            .launch(name, runner_id, &boot_document(self.store.url(), &ticket))
             .await
             .map_err(|err| (Some(runner_id), err))?;
+        if let Err(err) = self.store.store(&ticket, &config.encoded_jit_config).await {
+            // Without its config the instance would sit out the agent's
+            // timeout before powering off.
+            if let Err(err) = self.cloud.terminate(&instance_id).await {
+                warn!(instance_id, "{err:#}");
+            }
+            return Err((Some(runner_id), err));
+        }
         Ok((runner_id, instance_id))
     }
 
@@ -501,13 +520,11 @@ mod tests {
             &self,
             name: &str,
             runner_id: u64,
-            jit_config: &Secret,
+            user_data: &str,
         ) -> impl Future<Output = Result<String>> {
-            self.launched.borrow_mut().push((
-                name.to_owned(),
-                runner_id,
-                jit_config.expose().to_owned(),
-            ));
+            self.launched
+                .borrow_mut()
+                .push((name.to_owned(), runner_id, user_data.to_owned()));
             std::future::ready(if self.fail_launch {
                 Err(anyhow::anyhow!("InsufficientInstanceCapacity"))
             } else {
@@ -525,7 +542,36 @@ mod tests {
         }
     }
 
-    fn driver(github: &FakeGitHub, cloud: FakeCloud) -> Driver<FakeGitHub, FakeCloud> {
+    #[derive(Default)]
+    struct FakeStore {
+        fail: bool,
+        stored: RefCell<Vec<(String, String)>>,
+    }
+
+    impl ConfigStore for FakeStore {
+        fn url(&self) -> &'static str {
+            "https://broker.example"
+        }
+
+        fn store(&self, ticket: &str, config: &Secret) -> impl Future<Output = Result<()>> {
+            self.stored
+                .borrow_mut()
+                .push((ticket.to_owned(), config.expose().to_owned()));
+            std::future::ready(if self.fail {
+                Err(anyhow::anyhow!("broker answered 500"))
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    type TestDriver = Driver<FakeGitHub, FakeCloud, FakeStore>;
+
+    fn driver(github: &FakeGitHub, cloud: FakeCloud) -> TestDriver {
+        driver_with_store(github, cloud, FakeStore::default())
+    }
+
+    fn driver_with_store(github: &FakeGitHub, cloud: FakeCloud, store: FakeStore) -> TestDriver {
         let session: Session = serde_json::from_str(
             r#"{"sessionId":"s1","messageQueueUrl":"https://broker.example/message","messageQueueAccessToken":"q1"}"#,
         )
@@ -537,6 +583,7 @@ mod tests {
                 Credentials::Token(Secret::new("pat")),
             )),
             cloud,
+            store,
             scaler: Scaler::new(Config {
                 name_prefix: "linux".into(),
                 ..Config::default()
@@ -610,9 +657,20 @@ mod tests {
                 "/message/42",
             ]
         );
+        // User data carries the broker and a ticket, never the config.
         let launched = driver.cloud.launched.borrow();
         assert_eq!(launched[0].1, 4);
-        assert_eq!(launched[0].2, "jit-4");
+        assert!(!launched[0].2.contains("jit-4"));
+        let boot: serde_json::Value = serde_json::from_str(&launched[0].2).unwrap();
+        assert_eq!(boot["broker"], "https://broker.example");
+        let stored = driver.store.stored.borrow();
+        assert_eq!(
+            stored[0],
+            (
+                boot["ticket"].as_str().unwrap().to_owned(),
+                "jit-4".to_owned()
+            )
+        );
         let runner = driver.scaler.runners().values().next().unwrap();
         assert_eq!(runner.phase, Phase::Idle);
         assert_eq!(runner.instance_id.as_deref(), Some("i-4"));
@@ -641,6 +699,31 @@ mod tests {
         )));
         assert_eq!(driver.scaler.runners().len(), 0);
         assert_eq!(driver.cloud.terminated.borrow().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_store_terminates_instance_and_removes_runner() {
+        let github = FakeGitHub::default();
+        jit_route(&github);
+        github.route(Method::DELETE, "/agents/4", 204, "");
+        let mut driver = driver_with_store(
+            &github,
+            FakeCloud::default(),
+            FakeStore {
+                fail: true,
+                ..FakeStore::default()
+            },
+        );
+        driver.scaler.handle_jobs([], Some(1), NOW);
+        let actions = driver.scaler.plan(NOW);
+        driver.execute(actions).await.unwrap();
+
+        assert_eq!(*driver.cloud.terminated.borrow(), ["i-4"]);
+        assert!(github.sent().contains(&(
+            Method::DELETE,
+            "/t/_apis/distributedtask/pools/0/agents/4".into()
+        )));
+        assert_eq!(driver.scaler.runners().len(), 0);
     }
 
     #[tokio::test]

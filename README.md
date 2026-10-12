@@ -57,8 +57,9 @@ it exits. Runner images enable it with `systemctl enable hatchrun-agent`.
 `hatchrun-scaler` serves one scale set. On start it creates or updates
 the scale set, opens a message session and long-polls it. For every
 assigned job it registers a just-in-time runner and starts an instance
-from your launch template, with the runner config in user data for the
-agent. Instances are tagged `hatchrun:scale-set-id`,
+from your launch template. User data holds only the broker URL and a
+single-use ticket; the scaler stores the runner config in the broker
+once the instance exists, and the agent claims it at boot. Instances are tagged `hatchrun:scale-set-id`,
 `hatchrun:runner-name` and `hatchrun:runner-id`. Every minute it lists
 the tagged instances, which lets a restarted scaler pick up where the
 last one stopped. On SIGTERM it closes the session and leaves running
@@ -68,13 +69,14 @@ jobs alone.
 hatchrun-scaler \
   --github-url https://github.com/acme \
   --scale-set linux-x64 \
+  --broker-url https://hatchrun-broker.acme.workers.dev \
   --launch-template lt-0123456789abcdef0 \
   --subnets subnet-aaa,subnet-bbb \
   --max-runners 20
 ```
 
 Every flag also reads from a `HATCHRUN_*` environment variable, listed
-in `--help`. Authenticate with a GitHub App (`--github-app-client-id`,
+in `--help`; pass the broker token as `HATCHRUN_BROKER_TOKEN`. Authenticate with a GitHub App (`--github-app-client-id`,
 `--github-app-installation-id`, `--github-app-private-key`) with read
 and write access to the organization's self-hosted runners (repository
 administration for a repository scale set), or with a personal access

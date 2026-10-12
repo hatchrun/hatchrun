@@ -15,7 +15,6 @@ use aws_sdk_ec2::types::{
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use hatchrun_scaler_core::Instance;
-use hatchrun_scaleset::Secret;
 use tracing::{info, warn};
 
 /// Tag with the scale set id, which marks the instances this scaler owns.
@@ -37,12 +36,13 @@ const CAPACITY_ERRORS: &[&str] = &[
 
 /// Where runners run.
 pub trait Cloud {
-    /// Starts an instance for the runner and returns its id.
+    /// Starts an instance for the runner with `user_data` for the agent
+    /// and returns its id.
     fn launch(
         &self,
         name: &str,
         runner_id: u64,
-        jit_config: &Secret,
+        user_data: &str,
     ) -> impl Future<Output = Result<String>>;
     /// Lists the scale set's instances that are not terminated.
     fn instances(&self) -> impl Future<Output = Result<Vec<Instance>>>;
@@ -91,8 +91,8 @@ impl Ec2 {
 }
 
 impl Cloud for Ec2 {
-    async fn launch(&self, name: &str, runner_id: u64, jit_config: &Secret) -> Result<String> {
-        let user_data = user_data(jit_config);
+    async fn launch(&self, name: &str, runner_id: u64, user_data: &str) -> Result<String> {
+        let user_data = STANDARD.encode(user_data);
         let subnets: Vec<Option<&str>> = if self.subnets.is_empty() {
             vec![None]
         } else {
@@ -224,21 +224,5 @@ impl Cloud for Ec2 {
             Err(err) if err.code() == Some("InvalidInstanceID.NotFound") => Ok(()),
             Err(err) => Err(err).with_context(|| format!("terminate {instance_id}")),
         }
-    }
-}
-
-/// The agent reads `jitConfig` from JSON user data.
-fn user_data(jit_config: &Secret) -> String {
-    STANDARD.encode(serde_json::json!({ "jitConfig": jit_config.expose() }).to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn user_data_is_json_for_the_agent() {
-        let decoded = STANDARD.decode(user_data(&Secret::new("abc"))).unwrap();
-        assert_eq!(decoded, br#"{"jitConfig":"abc"}"#);
     }
 }

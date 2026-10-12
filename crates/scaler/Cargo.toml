@@ -25,7 +25,7 @@ hatchrun-scaler-core = { path = "../scaler-core" }
 hatchrun-scaleset = { path = "../scaleset" }
 http = "1.5.0"
 humantime = "2.4.0"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 serde_json = "1.0.154"
 tokio = { version = "1.53.2", features = ["rt", "macros", "time", "signal"] }
 tracing = "0.1.44"

@@ -6,6 +6,7 @@
 //! launches an EC2 instance for every job assigned to it. Each instance
 //! runs hatchrun-agent, which runs the job and powers the instance off.
 
+mod broker;
 mod driver;
 mod ec2;
 mod github;
@@ -22,6 +23,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
+use crate::broker::Broker;
 use crate::driver::{Driver, ensure_scale_set};
 use crate::ec2::Ec2;
 use crate::github::{Credentials, GitHub, Http};
@@ -56,6 +58,14 @@ struct Args {
     /// GitHub App private key in PEM.
     #[arg(long, env = "HATCHRUN_GITHUB_APP_PRIVATE_KEY", hide_env_values = true)]
     github_app_private_key: Option<String>,
+
+    /// hatchrun-broker URL. Instances claim their runner config there, so
+    /// it never sits in user data.
+    #[arg(long, env = "HATCHRUN_BROKER_URL")]
+    broker_url: String,
+    /// The `BROKER_TOKEN` the broker was deployed with.
+    #[arg(long, env = "HATCHRUN_BROKER_TOKEN", hide_env_values = true)]
+    broker_token: String,
 
     /// Scale set name, which is also the `runs-on` label.
     #[arg(long, env = "HATCHRUN_SCALE_SET")]
@@ -120,6 +130,7 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<()> {
     driver::validate(args.min_runners, args.max_runners)?;
+    let store = Broker::new(&args.broker_url, Secret::new(args.broker_token))?;
     let mut terminate = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("listen for SIGINT")?;
     let shutdown = async move {
@@ -178,7 +189,7 @@ async fn run(args: Args) -> Result<()> {
     });
     let owner = std::env::var("HOSTNAME").unwrap_or_else(|_| "hatchrun-scaler".into());
 
-    Driver::start(github, actions, cloud, scaler, scale_set.id, &owner)
+    Driver::start(github, actions, cloud, store, scaler, scale_set.id, &owner)
         .await?
         .run(shutdown, args.reconcile_interval)
         .await
