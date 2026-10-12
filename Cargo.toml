@@ -1,8 +1,13 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 [workspace]
 members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
+authors = ["Gamunu Balagalla <gamunu.balagalla@gmail.com>"]
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"

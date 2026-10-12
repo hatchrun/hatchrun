@@ -47,6 +47,15 @@ jobs:
           useradd --create-home --groups hatchrun-extra hatchrun-test
       - run: cargo test --locked -- --ignored
 
+  # Every file must carry a licence and copyright (https://reuse.software).
+  reuse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: pipx run reuse==6.2.0 lint
+
   audit:
     runs-on: ubuntu-latest
     steps:

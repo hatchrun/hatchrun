@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 # git-cliff turns Conventional Commits on main into release versions and
 # release notes. Only feat, fix, perf and revert commits cut a release;
 # docs, ci, build, chore, test, refactor and style commits do not.
