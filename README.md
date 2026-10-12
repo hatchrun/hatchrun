@@ -21,8 +21,11 @@ It takes the instance's just-in-time runner config from the first source
 that has one:
 
 1. A `jitConfig` field in JSON user data, plain or gzip.
-2. The SSM parameter named by the `hatchrun:jit-parameter` instance tag.
-3. The token parameter of
+2. A `broker` URL and `ticket` in JSON user data. The agent claims the
+   config from hatchrun-broker, which hands it out once, retrying while
+   the broker has nothing stored yet. The broker must be HTTPS.
+3. The SSM parameter named by the `hatchrun:jit-parameter` instance tag.
+4. The token parameter of
    [github-aws-runners/terraform-aws-github-runner](https://github.com/github-aws-runners/terraform-aws-github-runner),
    found through its `ghr:ssm_config_path` tag. This lets the agent replace
    that module's user data script (`enable_userdata = false`).

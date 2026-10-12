@@ -29,6 +29,13 @@ pub trait Metadata {
     async fn tag(&self, key: &str) -> Result<Option<String>>;
 }
 
+/// Claims runner configs from hatchrun-broker.
+pub trait Broker {
+    /// Claims the config stored under `ticket`. Returns `None` while there
+    /// is nothing to claim yet.
+    async fn claim(&self, broker: &str, ticket: &str) -> Result<Option<String>>;
+}
+
 /// Reads and deletes SSM parameters.
 pub trait Parameters {
     /// Returns `None` when the parameter does not exist.
@@ -38,11 +45,13 @@ pub trait Parameters {
 }
 
 /// Resolves the JIT config for this instance.
-pub struct Resolver<M, P> {
+pub struct Resolver<M, P, B> {
     /// Instance metadata.
     pub metadata: M,
     /// SSM parameters.
     pub parameters: P,
+    /// The broker.
+    pub broker: B,
     /// How often to check for a parameter that does not exist yet.
     pub poll_interval: Duration,
 }
@@ -53,20 +62,50 @@ pub struct Resolver<M, P> {
 struct UserData {
     #[serde(default)]
     jit_config: String,
+    /// hatchrun-broker base URL.
+    #[serde(default)]
+    broker: String,
+    /// Ticket to claim the config with.
+    #[serde(default)]
+    ticket: String,
 }
 
-impl<M: Metadata, P: Parameters> Resolver<M, P> {
+/// Where user data says the config is.
+#[derive(Debug, PartialEq, Eq)]
+enum FromUserData {
+    Config(String),
+    Ticket { broker: String, ticket: String },
+}
+
+impl<M: Metadata, P: Parameters, B: Broker> Resolver<M, P, B> {
     /// Returns the JIT config, in this order of precedence: a `jitConfig`
-    /// field in user data, the parameter named by the `hatchrun:jit-parameter`
-    /// tag, or the github-aws-runners token parameter. A parameter is polled
-    /// until it exists, then deleted. Callers bound the wait with a timeout.
+    /// field in user data, a `broker` and `ticket` in user data, the
+    /// parameter named by the `hatchrun:jit-parameter` tag, or the
+    /// github-aws-runners token parameter. A ticket is claimed and a
+    /// parameter read and deleted, both polled until the config is there.
+    /// Callers bound the wait with a timeout.
     pub async fn jit_config(&self) -> Result<String> {
         let user_data = self.metadata.user_data().await.context("read user data")?;
-        if let Some(config) = jit_config_from_user_data(user_data.as_deref().unwrap_or_default())? {
-            return Ok(config);
+        match from_user_data(user_data.as_deref().unwrap_or_default())? {
+            Some(FromUserData::Config(config)) => return Ok(config),
+            Some(FromUserData::Ticket { broker, ticket }) => {
+                return self.claim(&broker, &ticket).await;
+            }
+            None => {}
         }
         let name = self.parameter_name().await?;
         self.take_parameter(&name).await
+    }
+
+    /// The scaler stores the config after the instance launched, so the
+    /// first claims often find nothing.
+    async fn claim(&self, broker: &str, ticket: &str) -> Result<String> {
+        loop {
+            if let Some(config) = self.broker.claim(broker, ticket).await? {
+                return Ok(config);
+            }
+            tokio::time::sleep(self.poll_interval).await;
+        }
     }
 
     async fn parameter_name(&self) -> Result<String> {
@@ -111,17 +150,27 @@ impl<M: Metadata, P: Parameters> Resolver<M, P> {
     }
 }
 
-/// Reads `jitConfig` from JSON user data, plain or gzip. Anything that is not
-/// a JSON object, such as a shell script meant for another boot tool, is
-/// ignored.
-fn jit_config_from_user_data(raw: &[u8]) -> Result<Option<String>> {
+/// Reads `jitConfig`, or `broker` and `ticket`, from JSON user data, plain
+/// or gzip. Anything that is not a JSON object, such as a shell script
+/// meant for another boot tool, is ignored.
+fn from_user_data(raw: &[u8]) -> Result<Option<FromUserData>> {
     let raw = decompress(raw)?;
     let raw = raw.trim_ascii();
     if raw.first() != Some(&b'{') {
         return Ok(None);
     }
     let doc: UserData = serde_json::from_slice(raw).context("parse user data")?;
-    Ok(Some(doc.jit_config).filter(|config| !config.is_empty()))
+    if !doc.jit_config.is_empty() {
+        return Ok(Some(FromUserData::Config(doc.jit_config)));
+    }
+    match (doc.broker.is_empty(), doc.ticket.is_empty()) {
+        (false, false) => Ok(Some(FromUserData::Ticket {
+            broker: doc.broker,
+            ticket: doc.ticket,
+        })),
+        (true, true) => Ok(None),
+        _ => bail!("user data must set both broker and ticket"),
+    }
 }
 
 fn decompress(raw: &[u8]) -> Result<Vec<u8>> {
@@ -195,13 +244,45 @@ mod tests {
         }
     }
 
+    /// A broker that has the config after `missing_claims` claims.
+    #[derive(Default)]
+    struct FakeBroker {
+        config: Option<&'static str>,
+        missing_claims: Cell<u32>,
+        claims: RefCell<Vec<(String, String)>>,
+    }
+
+    // The fakes answer immediately; the trait is async for the real clients.
+    #[allow(clippy::unused_async_trait_impl)]
+    impl Broker for FakeBroker {
+        async fn claim(&self, broker: &str, ticket: &str) -> Result<Option<String>> {
+            self.claims
+                .borrow_mut()
+                .push((broker.into(), ticket.into()));
+            if self.missing_claims.get() > 0 {
+                self.missing_claims.set(self.missing_claims.get() - 1);
+                return Ok(None);
+            }
+            Ok(self.config.map(ToString::to_string))
+        }
+    }
+
     fn resolver(
         metadata: FakeMetadata,
         parameters: FakeParameters,
-    ) -> Resolver<FakeMetadata, FakeParameters> {
+    ) -> Resolver<FakeMetadata, FakeParameters, FakeBroker> {
+        with_broker(metadata, parameters, FakeBroker::default())
+    }
+
+    fn with_broker(
+        metadata: FakeMetadata,
+        parameters: FakeParameters,
+        broker: FakeBroker,
+    ) -> Resolver<FakeMetadata, FakeParameters, FakeBroker> {
         Resolver {
             metadata,
             parameters,
+            broker,
             poll_interval: Duration::from_millis(1),
         }
     }
@@ -236,6 +317,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(config, "jit-gzip");
+    }
+
+    #[tokio::test]
+    async fn claims_ticket_from_broker() {
+        let metadata = FakeMetadata {
+            user_data: Some(br#"{"broker":"https://broker.example.com","ticket":"t-1"}"#.to_vec()),
+            ..Default::default()
+        };
+        let broker = FakeBroker {
+            config: Some("jit-from-broker"),
+            missing_claims: Cell::new(2),
+            ..Default::default()
+        };
+        let resolver = with_broker(metadata, FakeParameters::default(), broker);
+
+        assert_eq!(resolver.jit_config().await.unwrap(), "jit-from-broker");
+        let claims = resolver.broker.claims.borrow();
+        assert_eq!(claims.len(), 3);
+        assert_eq!(
+            claims[0],
+            ("https://broker.example.com".into(), "t-1".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn half_a_ticket_is_an_error() {
+        let metadata = FakeMetadata {
+            user_data: Some(br#"{"broker":"https://broker.example.com"}"#.to_vec()),
+            ..Default::default()
+        };
+        let err = resolver(metadata, FakeParameters::default())
+            .jit_config()
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("both broker and ticket"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]
