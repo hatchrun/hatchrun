@@ -32,8 +32,9 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      # The scale set client must stay free of I/O so it runs in Workers.
-      - run: cargo check --locked -p hatchrun-scaleset --target wasm32-unknown-unknown
+      # The scale set client and scaler core must stay free of I/O so they
+      # run in Workers.
+      - run: cargo check --locked -p hatchrun-scaleset -p hatchrun-scaler-core --target wasm32-unknown-unknown
 
   # Tests that switch users need root and a real account.
   root-tests:

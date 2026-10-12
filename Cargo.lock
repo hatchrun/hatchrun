@@ -943,6 +943,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hatchrun-scaler-core"
+version = "0.1.0"
+dependencies = [
+ "hatchrun-scaleset",
+ "http",
+ "serde_json",
+]
+
+[[package]]
 name = "hatchrun-scaleset"
 version = "0.1.0"
 dependencies = [
