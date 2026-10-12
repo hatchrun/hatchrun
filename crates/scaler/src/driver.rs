@@ -155,7 +155,11 @@ where
         reconcile_every: Duration,
     ) -> Result<()> {
         tokio::pin!(shutdown);
-        self.reconcile().await?;
+        if let Err(err) = self.reconcile().await {
+            // An open session blocks the next scaler for minutes.
+            self.close().await;
+            return Err(err);
+        }
 
         let mut tick = tokio::time::interval_at(Instant::now() + reconcile_every, reconcile_every);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -510,6 +514,7 @@ mod tests {
     #[derive(Default)]
     struct FakeCloud {
         fail_launch: bool,
+        fail_instances: bool,
         instances: Vec<Instance>,
         launched: RefCell<Vec<(String, u64, String)>>,
         terminated: RefCell<Vec<String>>,
@@ -533,7 +538,13 @@ mod tests {
         }
 
         fn instances(&self) -> impl Future<Output = Result<Vec<Instance>>> {
-            std::future::ready(Ok(self.instances.clone()))
+            std::future::ready(if self.fail_instances {
+                Err(anyhow::anyhow!(
+                    "credentials provider was not properly configured"
+                ))
+            } else {
+                Ok(self.instances.clone())
+            })
         }
 
         fn terminate(&self, instance_id: &str) -> impl Future<Output = Result<()>> {
@@ -820,6 +831,32 @@ mod tests {
                 Method::DELETE,
                 "/t/_apis/runtime/runnerscalesets/9/sessions/s1".into()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_first_reconcile_closes_the_session() {
+        let github = FakeGitHub::default();
+        github.route(Method::DELETE, "/sessions/s1", 204, "");
+        let driver = driver(
+            &github,
+            FakeCloud {
+                fail_instances: true,
+                ..FakeCloud::default()
+            },
+        );
+
+        let err = driver
+            .run(std::future::pending(), Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("credentials"), "{err:#}");
+        assert_eq!(
+            github.sent(),
+            [(
+                Method::DELETE,
+                "/t/_apis/runtime/runnerscalesets/9/sessions/s1".into()
+            )]
         );
     }
 
