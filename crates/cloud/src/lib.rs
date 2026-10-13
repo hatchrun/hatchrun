@@ -12,6 +12,8 @@
 //!
 //! - `POST /github/webhook` takes the App's webhook deliveries.
 
+pub mod aws;
+pub mod http;
 pub mod labels;
 pub mod webhook;
 
