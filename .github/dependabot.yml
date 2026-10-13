@@ -14,3 +14,7 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /packaging/scaler
+    schedule:
+      interval: weekly

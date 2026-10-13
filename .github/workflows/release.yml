@@ -21,6 +21,9 @@ env:
   GIT_CLIFF_VERSION: 2.14.2
   GIT_CLIFF_SHA256: 24f397c733add5390fdceee3a2088588ab0d5f944ce00d34cb7029b888cf2db4
   NFPM_VERSION: 2.47.0
+  IMAGE: ghcr.io/hatchrun/hatchrun-scaler
+  # docker-container builder, needed to push a multi-arch image.
+  BUILDKIT_IMAGE: moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
 
 jobs:
   version:
@@ -89,8 +92,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq musl-tools
-          HATCHRUN_VERSION="$VERSION" cargo build --locked --release --target "$TARGET" -p hatchrun-agent
+          HATCHRUN_VERSION="$VERSION" cargo build --locked --release --target "$TARGET" -p hatchrun-agent -p hatchrun-scaler
           "target/$TARGET/release/hatchrun-agent" --version | grep -qx "hatchrun-agent $VERSION"
+          "target/$TARGET/release/hatchrun-scaler" --version | grep -qx "hatchrun-scaler $VERSION"
 
       - name: Install nfpm
         env:
@@ -111,6 +115,11 @@ jobs:
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           nfpm package -f packaging/nfpm.yaml -p deb -t dist/
           nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+          name="hatchrun-scaler-${VERSION}-linux-${ARCH}"
+          mkdir -p "dist/$name" "scaler/$ARCH"
+          cp "target/$TARGET/release/hatchrun-scaler" LICENSE NOTICE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          cp "target/$TARGET/release/hatchrun-scaler" "scaler/$ARCH/"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -119,6 +128,12 @@ jobs:
             dist/*.tar.gz
             dist/*.deb
             dist/*.rpm
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scaler-${{ matrix.arch }}
+          path: scaler
           if-no-files-found: error
 
   sbom:
@@ -130,18 +145,77 @@ jobs:
         with:
           persist-credentials: false
       - run: cargo install --locked cargo-cyclonedx --version 0.5.9
-      - run: |
-          cargo cyclonedx -f json --spec-version 1.5 --manifest-path crates/hatchrun-agent/Cargo.toml --target x86_64-unknown-linux-musl
+      - env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
           mkdir -p sbom
-          cp crates/hatchrun-agent/hatchrun-agent.cdx.json "sbom/hatchrun-agent-${{ needs.version.outputs.version }}.cdx.json"
+          for crate in hatchrun-agent scaler; do
+            cargo cyclonedx -f json --spec-version 1.5 --manifest-path "crates/$crate/Cargo.toml" --target x86_64-unknown-linux-musl
+          done
+          cp crates/hatchrun-agent/hatchrun-agent.cdx.json "sbom/hatchrun-agent-${VERSION}.cdx.json"
+          cp crates/scaler/hatchrun-scaler.cdx.json "sbom/hatchrun-scaler-${VERSION}.cdx.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom
           path: sbom/*.cdx.json
           if-no-files-found: error
 
+  # The scaler image for amd64 and arm64, built from the binaries of the
+  # build job. Pushed before the release is published, so a release never
+  # points at a missing image.
+  image:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: scaler-*
+          path: context
+          merge-multiple: true
+
+      - name: Build and push
+        id: push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp LICENSE NOTICE context/
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx create --use --driver docker-container --driver-opt "image=${BUILDKIT_IMAGE}"
+          docker buildx build context \
+            --file packaging/scaler/Dockerfile \
+            --platform linux/amd64,linux/arm64 \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --provenance=false \
+            --sbom=false \
+            --tag "${IMAGE}:${VERSION}" \
+            --metadata-file metadata.json \
+            --push
+          digest=$(jq -r '."containerimage.digest"' metadata.json)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          docker run --rm --read-only "${IMAGE}@${digest}" --version | grep -qx "hatchrun-scaler $VERSION"
+
+      # Verifiable with `gh attestation verify oci://IMAGE:TAG --repo
+      # hatchrun/hatchrun`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
   release:
-    needs: [version, build, sbom]
+    needs: [version, build, sbom, image]
     runs-on: ubuntu-24.04
     permissions:
       attestations: write
