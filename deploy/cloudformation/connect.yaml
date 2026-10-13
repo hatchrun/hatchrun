@@ -1,0 +1,336 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Connects this AWS account and region to hatchrun.dev, which runs
+  GitHub Actions jobs here on EC2 instances, one instance per job.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: hatchrun.dev }
+        Parameters:
+          - TenantId
+          - OidcProviderArn
+      - Label: { default: Limits }
+        Parameters:
+          - InstanceTypes
+          - VolumeSizeLimit
+      - Label: { default: Runners }
+        Parameters:
+          - RootVolumeSize
+      - Label: { default: Network }
+        Parameters:
+          - VpcId
+          - SubnetIds
+    ParameterLabels:
+      TenantId: { default: Tenant ID from the hatchrun.dev dashboard }
+      OidcProviderArn: { default: Existing hatchrun.dev OIDC provider }
+      InstanceTypes: { default: Allowed instance types }
+      VolumeSizeLimit: { default: Largest root volume (GiB) }
+
+Parameters:
+  TenantId:
+    Type: String
+    AllowedPattern: ^[a-z0-9]{8,64}$
+    Description: Only hatchrun.dev requests for this tenant can use the role this stack creates.
+  OidcProviderArn:
+    Type: String
+    Default: ""
+    AllowedPattern: ^(arn:aws[a-z-]*:iam::[0-9]{12}:oidc-provider/oidc\.hatchrun\.dev)?$
+    Description: >-
+      IAM holds one OIDC provider per URL in an account. Leave empty for the
+      first stack in the account; for a stack in another region, paste the
+      OidcProviderArn output of the first one.
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Default: "c7g.*,c7i.*,m7g.*,m7i.*,r7g.*,r7i.*"
+    Description: >-
+      Instance types jobs may ask for, wildcards allowed. AWS refuses any
+      other type, whatever a workflow asks for.
+  VolumeSizeLimit:
+    Type: Number
+    Default: 200
+    MinValue: 10
+    MaxValue: 16384
+    Description: AWS refuses root volumes larger than this, in GiB.
+  RootVolumeSize:
+    Type: Number
+    Default: 30
+    MinValue: 10
+    MaxValue: 16384
+    Description: Root volume size in GiB for jobs that do not ask for one.
+  VpcId:
+    Type: String
+    Default: ""
+    Description: Existing VPC for runners. Empty creates a VPC with two public subnets and no NAT gateway.
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Subnets in VpcId, tried in order. They need a route to the internet and public IPs, or a NAT gateway.
+
+Conditions:
+  CreateVpc: !Equals [!Ref VpcId, ""]
+  CreateOidcProvider: !Equals [!Ref OidcProviderArn, ""]
+
+Rules:
+  ExistingVpcNeedsSubnets:
+    RuleCondition: !Not [!Equals [!Ref VpcId, ""]]
+    Assertions:
+      - Assert: !Not [!EachMemberEquals [!Ref SubnetIds, ""]]
+        AssertDescription: Pick the subnets for runners in the VPC.
+
+Resources:
+  # hatchrun.dev signs a short-lived token naming the tenant and trades
+  # it for this role's credentials with AssumeRoleWithWebIdentity. No
+  # access keys exist, and a token for another tenant gets nothing.
+  OidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://oidc.hatchrun.dev
+      ClientIdList: [sts.amazonaws.com]
+
+  # Network, when no VPC is given: public subnets in two zones. Runners
+  # need outbound internet access; a NAT gateway would cost about $32 a
+  # month, so they get public addresses and a security group that allows
+  # no inbound traffic.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateVpc
+    Properties:
+      CidrBlock: 10.88.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: hatchrun }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateVpc
+    Properties:
+      Tags:
+        - { Key: Name, Value: hatchrun }
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: hatchrun }
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVpc
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.88.0.0/18
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: hatchrun-a }
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.88.64.0/18
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: hatchrun-b }
+
+  SubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTable
+
+  SubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref RouteTable
+
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "hatchrun runners: no inbound traffic"
+      VpcId: !If [CreateVpc, !Ref Vpc, !Ref VpcId]
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0, Description: Jobs reach GitHub and whatever they use }
+      Tags:
+        - { Key: Name, Value: hatchrun-runners }
+
+  # The image and instance type come with each launch, from the job's
+  # labels. Runners get no instance profile: the agent claims its runner
+  # config from the hatchrun.dev broker with a one-time ticket in user
+  # data, and jobs that need AWS use GitHub's OIDC.
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        SecurityGroupIds: [!Ref RunnerSecurityGroup]
+        InstanceInitiatedShutdownBehavior: terminate
+        # IMDSv2 only, and a hop limit of 1 so job containers cannot reach
+        # the metadata service.
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: !Ref RootVolumeSize
+              Encrypted: true
+              DeleteOnTermination: true
+
+  # What hatchrun.dev may do here: launch hatchrun images from this
+  # stack's launch template into this VPC, within the instance type and
+  # volume limits above, and stop, start, retag or terminate only the
+  # instances it launched. The conditions keep the launch template's
+  # metadata and encryption settings from being overridden at launch.
+  ControlPlaneRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: hatchrun.dev launches and removes runner instances
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateOidcProvider, !Ref OidcProvider, !Ref OidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                oidc.hatchrun.dev:aud: sts.amazonaws.com
+                oidc.hatchrun.dev:sub: !Sub "tenant:${TenantId}"
+      Policies:
+        - PolicyName: run-jobs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: List
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceTypeOfferings
+                Resource: "*"
+              - Sid: LaunchInstances
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/hatchrun:tenant: !Ref TenantId
+                    ec2:LaunchTemplate: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplate}"
+                    ec2:MetadataHttpTokens: required
+                  NumericLessThanEquals:
+                    ec2:MetadataHttpPutResponseHopLimit: 1
+                  StringLike:
+                    ec2:InstanceType: !Ref InstanceTypes
+              - Sid: LaunchVolumes
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                Condition:
+                  Bool:
+                    ec2:Encrypted: "true"
+                  NumericLessThanEquals:
+                    ec2:VolumeSize: !Ref VolumeSizeLimit
+              - Sid: LaunchImages
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
+                Condition:
+                  StringEquals:
+                    ec2:Owner: "000000000000" # image-owner
+              - Sid: LaunchNetwork
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                Condition:
+                  StringEquals:
+                    ec2:Vpc: !Sub
+                      - "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${Id}"
+                      - Id: !If [CreateVpc, !Ref Vpc, !Ref VpcId]
+              - Sid: LaunchFromTemplate
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplate}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${RunnerSecurityGroup}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+              - Sid: TagAtLaunch
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: RunInstances
+              - Sid: ManageOwnInstances
+                Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/hatchrun:tenant: !Ref TenantId
+              # The first Spot launch in an account creates this role.
+              - Sid: SpotServiceRole
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/spot.amazonaws.com/AWSServiceRoleForEC2Spot"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: spot.amazonaws.com
+
+Outputs:
+  RoleArn:
+    Description: Paste this into the hatchrun.dev dashboard.
+    Value: !GetAtt ControlPlaneRole.Arn
+  OidcProviderArn:
+    Description: Pass this to stacks in other regions of this account.
+    Value: !If [CreateOidcProvider, !Ref OidcProvider, !Ref OidcProviderArn]
+  LaunchTemplateId:
+    Value: !Ref LaunchTemplate
+  SubnetIds:
+    Value: !If
+      - CreateVpc
+      - !Join [",", [!Ref SubnetA, !Ref SubnetB]]
+      - !Join [",", !Ref SubnetIds]
