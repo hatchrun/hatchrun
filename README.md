@@ -93,6 +93,32 @@ SDK chain. The scaler needs `ec2:RunInstances`, `ec2:CreateTags`,
 `ec2:DescribeInstances` and `ec2:TerminateInstances`, plus
 `iam:PassRole` when the launch template sets an instance profile.
 
+### Running the scaler
+
+Each release has a static `hatchrun-scaler` tarball for `amd64` and
+`arm64`, with checksums, an SBOM and build provenance like the agent,
+and a multi-arch image built from the same binaries:
+
+```sh
+docker pull ghcr.io/hatchrun/hatchrun-scaler:0.1.0
+gh attestation verify oci://ghcr.io/hatchrun/hatchrun-scaler:0.1.0 --repo hatchrun/hatchrun
+docker run --rm --read-only \
+  -e HATCHRUN_GITHUB_TOKEN -e HATCHRUN_BROKER_TOKEN \
+  -e AWS_REGION -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  ghcr.io/hatchrun/hatchrun-scaler:0.1.0 \
+  --github-url https://github.com/acme \
+  --scale-set linux-x64 \
+  --broker-url https://hatchrun-broker.acme.workers.dev \
+  --launch-template lt-0123456789abcdef0 \
+  --subnets subnet-aaa,subnet-bbb
+```
+
+The image is distroless with CA certificates and the binary and nothing
+else. It runs as user 65532 and writes no files, so it works with a
+read-only root filesystem, `runAsNonRoot` on Kubernetes and
+`readonlyRootFilesystem` on Fargate. On Fargate or EKS give the task or
+pod an IAM role instead of access keys.
+
 The launch template sets the runner image, instance type and security
 groups. The scaler sets the shutdown behaviour to terminate, so the
 agent powering off ends the instance. Subnets are tried in order when
