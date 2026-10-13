@@ -16,3 +16,9 @@ binding = "DB"
 database_name = "hatchrun-cloud"
 database_id = "local"
 migrations_dir = "migrations"
+
+# Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY (PEM),
+# OIDC_SIGNING_KEY (RSA private key in PEM) and BROKER_TOKEN.
+# Variables: GITHUB_APP_ID (the App's client id), OIDC_KEY_ID (the
+# signing key's kid) and BROKER_URL. GITHUB_API_URL and AWS_ENDPOINT_URL
+# point the Worker at local stubs under wrangler dev.
