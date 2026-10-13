@@ -40,6 +40,11 @@ supplementary groups and the environment from `/etc/environment`. When the
 runner exits, or no config arrives within 10 minutes, the unit powers the
 instance off.
 
+The agent starts only on instances launched as runners: user data with a
+config or ticket, or one of the tags above. `hatchrun-launch.service`
+checks that first, so an instance launched any other way, by hand or by
+the AWS Marketplace scan, boots normally and stays up.
+
 ### Installing
 
 Each [release](https://github.com/hatchrun/hatchrun/releases) has a

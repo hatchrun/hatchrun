@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Marks the instance when it was launched as a runner, so that
+# hatchrun-agent.service starts only then. An instance launched by hand,
+# or by the AWS Marketplace scan, boots and stays up like any other.
+[Unit]
+Description=hatchrun agent: tell whether the instance was launched as a runner
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hatchrun-agent detect
+StandardOutput=journal+console
+StandardError=journal+console
