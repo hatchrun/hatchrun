@@ -3,3 +3,5 @@
 /crates/broker/build
 /crates/broker/.wrangler
 .dev.vars
+/crates/cloud/build
+/crates/cloud/.wrangler

@@ -1133,6 +1133,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hatchrun-cloud"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wasm-bindgen",
+ "worker",
+]
+
+[[package]]
 name = "hatchrun-scaler"
 version = "0.1.0"
 dependencies = [

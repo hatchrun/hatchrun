@@ -139,6 +139,30 @@ npx wrangler@4.143.0 secret put BROKER_TOKEN
 npx wrangler@4.143.0 deploy
 ```
 
+## hatchrun.dev
+
+[`crates/cloud`](crates/cloud) is the Cloudflare Worker behind the
+hosted service. Instead of a scaler per scale set, it takes the
+`workflow_job` webhooks of the hatchrun GitHub App and records every job
+whose only `runs-on` label is `hatchrun` or starts with `hatchrun/`, in
+D1, once per job. Options in the label pick the runner:
+
+```yaml
+runs-on: hatchrun/arm64/cpu=8/disk=100/spot
+```
+
+The options are `amd64` or `arm64`, `cpu=N`, `ram=N` (GiB), `disk=N`
+(GiB), `spot` and `type=INSTANCE_TYPE`. A job with an unknown option, or
+with other labels next to the hatchrun one, is skipped, and the App's
+webhook delivery log says why.
+
+```sh
+cd crates/cloud
+npx wrangler@4.143.0 d1 migrations apply hatchrun-cloud --local
+echo GITHUB_WEBHOOK_SECRET=dev > .dev.vars
+npx wrangler@4.143.0 dev
+```
+
 ## Scale set client
 
 [`crates/scaleset`](crates/scaleset) talks to the GitHub Actions runner

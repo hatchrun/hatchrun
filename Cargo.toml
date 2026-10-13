@@ -30,3 +30,6 @@ strip = true
 # wasm-bindgen reads custom sections that a full strip removes.
 [profile.release.package.hatchrun-broker]
 strip = "debuginfo"
+
+[profile.release.package.hatchrun-cloud]
+strip = "debuginfo"
