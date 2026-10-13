@@ -171,37 +171,63 @@ mod tests {
     use super::*;
     use crate::labels::{Arch, Spec};
 
-    // The example in GitHub's "Validating webhook deliveries".
-    const SECRET: &[u8] = b"It's a Secret to Everybody";
-    const BODY: &[u8] = b"Hello, World!";
-    const SIGNATURE: &str =
-        "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
-
-    #[test]
-    fn accepts_githubs_example() {
-        assert!(verify(SECRET, BODY, Some(SIGNATURE)));
-        assert!(verify(
-            SECRET,
-            BODY,
-            Some(&SIGNATURE.to_uppercase().replace("SHA256", "sha256"))
-        ));
+    /// Signature cases from `testdata/signatures.tsv`: secret, body,
+    /// signature header and whether it verifies.
+    fn signatures() -> Vec<(String, String, String, bool)> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/signatures.tsv");
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let fields: Vec<&str> = line.split('\t').collect();
+                let [secret, body, signature, valid] = fields[..] else {
+                    panic!("bad line in {path}: {line:?}");
+                };
+                (
+                    secret.to_owned(),
+                    body.to_owned(),
+                    signature.to_owned(),
+                    valid == "true",
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn refuses_bad_signatures() {
-        assert!(!verify(SECRET, b"Hello, World?", Some(SIGNATURE)));
-        assert!(!verify(b"another secret", BODY, Some(SIGNATURE)));
-        assert!(!verify(b"", BODY, Some(SIGNATURE)));
-        assert!(!verify(SECRET, BODY, None));
-        assert!(!verify(SECRET, BODY, Some(&SIGNATURE[7..])));
-        assert!(!verify(SECRET, BODY, Some(&SIGNATURE[..70])));
+    fn checks_every_case() {
+        let cases = signatures();
+        assert!(cases.len() >= 4);
+        for (secret, body, signature, valid) in cases {
+            assert_eq!(
+                verify(secret.as_bytes(), body.as_bytes(), Some(&signature)),
+                valid,
+                "{secret:?} {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_upper_case_hex() {
+        let (secret, body, signature, _) = signatures().remove(0);
+        let upper = signature.to_uppercase().replace("SHA256", "sha256");
+        assert!(verify(secret.as_bytes(), body.as_bytes(), Some(&upper)));
+    }
+
+    #[test]
+    fn refuses_malformed_headers() {
+        let (secret, body, signature, _) = signatures().remove(0);
+        let (secret, body) = (secret.as_bytes(), body.as_bytes());
+        assert!(!verify(secret, body, None));
+        assert!(!verify(secret, body, Some(&signature[7..])));
+        assert!(!verify(secret, body, Some(&signature[..70])));
         assert!(!verify(
-            SECRET,
-            BODY,
-            Some(&SIGNATURE.replace("sha256=", "sha1="))
+            secret,
+            body,
+            Some(&signature.replace("sha256=", "sha1="))
         ));
         let not_hex = format!("sha256={}", "zz".repeat(32));
-        assert!(!verify(SECRET, BODY, Some(&not_hex)));
+        assert!(!verify(secret, body, Some(&not_hex)));
     }
 
     fn job(action: &str, labels: &[&str]) -> Vec<u8> {

@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Webhook signature cases, one per line: secret, body, X-Hub-Signature-256
+# and whether it verifies, separated by tabs. The first is the example in
+# GitHub's "Validating webhook deliveries". Test keys live here rather
+# than in the source so code scanning does not report them as hard-coded
+# keys.
+It's a Secret to Everybody	Hello, World!	sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17	true
+It's a Secret to Everybody	Hello, World?	sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17	false
+another secret	Hello, World!	sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17	false
+	Hello, World!	sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17	false
