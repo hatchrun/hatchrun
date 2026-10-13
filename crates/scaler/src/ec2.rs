@@ -9,8 +9,10 @@ use std::future::Future;
 use anyhow::{Context, Result, bail};
 use aws_sdk_ec2::Client;
 use aws_sdk_ec2::error::ProvideErrorMetadata;
+use aws_sdk_ec2::primitives::Blob;
 use aws_sdk_ec2::types::{
-    Filter, LaunchTemplateSpecification, ResourceType, ShutdownBehavior, Tag, TagSpecification,
+    Filter, InstanceStateName, LaunchTemplateSpecification, ResourceType, SecureBlobAttributeValue,
+    ShutdownBehavior, Tag, TagSpecification,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -25,6 +27,8 @@ pub const TAG_SCALE_SET: &str = "hatchrun:scale-set";
 pub const TAG_RUNNER_NAME: &str = "hatchrun:runner-name";
 /// Tag with the runner id.
 pub const TAG_RUNNER_ID: &str = "hatchrun:runner-id";
+/// Tag that marks a warm pool instance, which runs no runner yet.
+pub const TAG_POOL: &str = "hatchrun:pool";
 
 /// Errors that mean "try the next subnet".
 const CAPACITY_ERRORS: &[&str] = &[
@@ -44,8 +48,22 @@ pub trait Cloud {
         runner_id: u64,
         user_data: &str,
     ) -> impl Future<Output = Result<String>>;
+    /// Starts a warm pool instance with no user data, so its agent stays
+    /// off, and returns its id.
+    fn launch_pool(&self, name: &str) -> impl Future<Output = Result<String>>;
+    /// Gives a stopped pool instance the runner's user data and tags, and
+    /// starts it.
+    fn start_pooled(
+        &self,
+        instance_id: &str,
+        name: &str,
+        runner_id: u64,
+        user_data: &str,
+    ) -> impl Future<Output = Result<()>>;
     /// Lists the scale set's instances that are not terminated.
     fn instances(&self) -> impl Future<Output = Result<Vec<Instance>>>;
+    /// Stops an instance.
+    fn stop(&self, instance_id: &str) -> impl Future<Output = Result<()>>;
     /// Terminates an instance. An instance that is already gone is fine.
     fn terminate(&self, instance_id: &str) -> impl Future<Output = Result<()>>;
 }
@@ -77,22 +95,30 @@ impl Ec2 {
         .build()
     }
 
-    fn tags(&self, resource: ResourceType, name: &str, runner_id: u64) -> TagSpecification {
-        let tag = |key: &str, value: String| Tag::builder().key(key).value(value).build();
-        TagSpecification::builder()
+    /// Tags of a runner instance, or of a pool instance when `runner_id`
+    /// is `None`.
+    fn tags(&self, resource: ResourceType, name: &str, runner_id: Option<u64>) -> TagSpecification {
+        let spec = TagSpecification::builder()
             .resource_type(resource)
-            .tags(tag("Name", name.to_owned()))
-            .tags(tag(TAG_SCALE_SET_ID, self.scale_set_id.to_string()))
-            .tags(tag(TAG_SCALE_SET, self.scale_set_name.clone()))
-            .tags(tag(TAG_RUNNER_NAME, name.to_owned()))
-            .tags(tag(TAG_RUNNER_ID, runner_id.to_string()))
-            .build()
+            .tags(tag("Name", name))
+            .tags(tag(TAG_SCALE_SET_ID, &self.scale_set_id.to_string()))
+            .tags(tag(TAG_SCALE_SET, &self.scale_set_name));
+        match runner_id {
+            Some(runner_id) => spec
+                .tags(tag(TAG_RUNNER_NAME, name))
+                .tags(tag(TAG_RUNNER_ID, &runner_id.to_string())),
+            None => spec.tags(tag(TAG_POOL, "true")),
+        }
+        .build()
     }
-}
 
-impl Cloud for Ec2 {
-    async fn launch(&self, name: &str, runner_id: u64, user_data: &str) -> Result<String> {
-        let user_data = STANDARD.encode(user_data);
+    /// Runs one instance, trying the subnets in order.
+    async fn run(
+        &self,
+        name: &str,
+        runner_id: Option<u64>,
+        user_data: Option<String>,
+    ) -> Result<String> {
         let subnets: Vec<Option<&str>> = if self.subnets.is_empty() {
             vec![None]
         } else {
@@ -111,12 +137,12 @@ impl Cloud for Ec2 {
                 .min_count(1)
                 .max_count(1)
                 .set_subnet_id(subnet.map(str::to_owned))
-                .user_data(&user_data)
+                .set_user_data(user_data.clone())
                 .instance_initiated_shutdown_behavior(ShutdownBehavior::Terminate)
                 .tag_specifications(self.tags(ResourceType::Instance, name, runner_id))
                 .tag_specifications(self.tags(ResourceType::Volume, name, runner_id))
-                // Runner names are unique, so a retried call cannot start
-                // a second instance.
+                // Names are unique, so a retried call cannot start a
+                // second instance.
                 .client_token(name)
                 .send()
                 .await;
@@ -128,7 +154,7 @@ impl Cloud for Ec2 {
                         .and_then(|instance| instance.instance_id())
                         .context("RunInstances returned no instance")?
                         .to_owned();
-                    info!(runner = name, instance_id, subnet, "launched instance");
+                    info!(name, instance_id, subnet, "launched instance");
                     return Ok(instance_id);
                 }
                 Err(err)
@@ -137,7 +163,7 @@ impl Cloud for Ec2 {
                         .is_some_and(|code| CAPACITY_ERRORS.contains(&code)) =>
                 {
                     warn!(
-                        runner = name,
+                        name,
                         subnet,
                         "no capacity: {}",
                         err.message().unwrap_or_default()
@@ -151,6 +177,67 @@ impl Cloud for Ec2 {
             Some(err) => Err(err).context("no subnet had capacity"),
             None => bail!("no subnet to launch in"),
         }
+    }
+}
+
+fn tag(key: &str, value: &str) -> Tag {
+    Tag::builder().key(key).value(value).build()
+}
+
+impl Cloud for Ec2 {
+    async fn launch(&self, name: &str, runner_id: u64, user_data: &str) -> Result<String> {
+        self.run(name, Some(runner_id), Some(STANDARD.encode(user_data)))
+            .await
+    }
+
+    async fn launch_pool(&self, name: &str) -> Result<String> {
+        self.run(name, None, None).await
+    }
+
+    async fn start_pooled(
+        &self,
+        instance_id: &str,
+        name: &str,
+        runner_id: u64,
+        user_data: &str,
+    ) -> Result<()> {
+        // User data can only change while the instance is stopped. The SDK
+        // base64-encodes the blob itself.
+        self.client
+            .modify_instance_attribute()
+            .instance_id(instance_id)
+            .user_data(
+                SecureBlobAttributeValue::builder()
+                    .value(Blob::new(user_data.as_bytes()))
+                    .build(),
+            )
+            .send()
+            .await
+            .context("set user data")?;
+        self.client
+            .create_tags()
+            .resources(instance_id)
+            .tags(tag("Name", name))
+            .tags(tag(TAG_RUNNER_NAME, name))
+            .tags(tag(TAG_RUNNER_ID, &runner_id.to_string()))
+            .send()
+            .await
+            .context("tag instance")?;
+        self.client
+            .delete_tags()
+            .resources(instance_id)
+            .tags(Tag::builder().key(TAG_POOL).build())
+            .send()
+            .await
+            .context("untag pool instance")?;
+        self.client
+            .start_instances()
+            .instance_ids(instance_id)
+            .send()
+            .await
+            .context("start instance")?;
+        info!(runner = name, instance_id, "started pool instance");
+        Ok(())
     }
 
     async fn instances(&self) -> Result<Vec<Instance>> {
@@ -191,22 +278,41 @@ impl Cloud for Ec2 {
                         .find(|tag| tag.key() == Some(key))
                         .and_then(|tag| tag.value())
                 };
-                let (Some(id), Some(runner_name)) = (instance.instance_id(), tag(TAG_RUNNER_NAME))
-                else {
+                let Some(id) = instance.instance_id() else {
                     continue;
                 };
+                let runner_name = tag(TAG_RUNNER_NAME);
+                // Neither a runner nor a pool instance: not ours to manage.
+                if runner_name.is_none() && tag(TAG_POOL).is_none() {
+                    continue;
+                }
                 instances.push(Instance {
                     id: id.to_owned(),
-                    runner_name: runner_name.to_owned(),
+                    runner_name: runner_name.map(str::to_owned),
                     runner_id: tag(TAG_RUNNER_ID).and_then(|id| id.parse().ok()),
                     launched_at: instance
                         .launch_time()
                         .and_then(|time| u64::try_from(time.secs()).ok())
                         .unwrap_or_default(),
+                    stopped: instance
+                        .state()
+                        .and_then(|state| state.name())
+                        .is_some_and(|name| *name == InstanceStateName::Stopped),
                 });
             }
         }
         Ok(instances)
+    }
+
+    async fn stop(&self, instance_id: &str) -> Result<()> {
+        self.client
+            .stop_instances()
+            .instance_ids(instance_id)
+            .send()
+            .await
+            .with_context(|| format!("stop {instance_id}"))?;
+        info!(instance_id, "stopped pool instance");
+        Ok(())
     }
 
     async fn terminate(&self, instance_id: &str) -> Result<()> {
