@@ -14,7 +14,7 @@ mod runner;
 mod source;
 mod ssm;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use aws_config::{BehaviorVersion, Region};
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::broker::HttpBroker;
@@ -34,6 +34,8 @@ use crate::ssm::Ssm;
 #[derive(Parser)]
 #[command(version = env!("HATCHRUN_VERSION"), about)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Directory holding the runner's run.sh.
     #[arg(long, default_value = "/home/runner")]
     runner_dir: PathBuf,
@@ -57,6 +59,22 @@ struct Args {
     imds_endpoint: String,
 }
 
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Mark the instance as launched as a runner, for hatchrun-launch.service.
+    ///
+    /// Writes the mark file when user data or tags hold a runner config. An
+    /// instance launched any other way, by hand or by the AWS Marketplace
+    /// scan, gets no mark, so hatchrun-agent.service stays off instead of
+    /// powering it off. When the metadata cannot be read the instance is
+    /// marked, so a runner never sits idle and billed.
+    Detect {
+        /// File to create on a runner launch.
+        #[arg(long, default_value = "/run/hatchrun/launch")]
+        mark: PathBuf,
+    },
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -66,13 +84,37 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    match run(Args::parse()).await {
+    let args = Args::parse();
+    let result = match &args.command {
+        Some(Command::Detect { mark }) => detect(&args.imds_endpoint, mark).await,
+        None => run(args).await,
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             error!("{err:#}");
             ExitCode::FAILURE
         }
     }
+}
+
+async fn detect(imds_endpoint: &str, mark: &Path) -> Result<()> {
+    let launch = match Imds::new(imds_endpoint) {
+        Ok(metadata) => source::is_runner_launch(&metadata).await,
+        Err(err) => Err(err),
+    };
+    let launch = launch.unwrap_or_else(|err| {
+        warn!("cannot tell how the instance was launched, treating it as a runner: {err:#}");
+        true
+    });
+    if !launch {
+        info!("not launched as a runner, hatchrun-agent stays off");
+        return Ok(());
+    }
+    if let Some(dir) = mark.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    std::fs::write(mark, b"").with_context(|| format!("write {}", mark.display()))
 }
 
 async fn run(args: Args) -> Result<()> {

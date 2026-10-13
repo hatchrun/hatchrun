@@ -7,8 +7,11 @@
 # ends the instance.
 [Unit]
 Description=hatchrun agent: run one GitHub Actions job
-Wants=network-online.target docker.socket
-After=network-online.target docker.socket
+Wants=network-online.target docker.socket hatchrun-launch.service
+After=network-online.target docker.socket hatchrun-launch.service
+# Only runner launches get here. A unit skipped by a condition triggers
+# neither action below, so other launches are not powered off.
+ConditionPathExists=/run/hatchrun/launch
 # Power off on success and on failure alike, so an instance that could not
 # get a runner config never sits idle and billed. Override with a drop-in
 # setting both to none when debugging an image.

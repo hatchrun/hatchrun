@@ -153,6 +153,28 @@ impl<M: Metadata, P: Parameters, B: Broker> Resolver<M, P, B> {
 /// Reads `jitConfig`, or `broker` and `ticket`, from JSON user data, plain
 /// or gzip. Anything that is not a JSON object, such as a shell script
 /// meant for another boot tool, is ignored.
+/// Tells whether the instance was launched as a runner: its user data
+/// holds a runner config or a broker ticket, or it has a tag naming the
+/// parameter that will hold the config. Malformed runner user data is an
+/// error rather than `false`, so a broken launch still powers off.
+pub async fn is_runner_launch(metadata: &impl Metadata) -> Result<bool> {
+    let user_data = metadata.user_data().await.context("read user data")?;
+    if from_user_data(user_data.as_deref().unwrap_or_default())?.is_some() {
+        return Ok(true);
+    }
+    for key in [TAG_JIT_PARAMETER, TAG_GHR_CONFIG_PATH] {
+        if metadata
+            .tag(key)
+            .await
+            .with_context(|| format!("read tag {key}"))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn from_user_data(raw: &[u8]) -> Result<Option<FromUserData>> {
     let raw = decompress(raw)?;
     let raw = raw.trim_ascii();
@@ -440,5 +462,50 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn runner_launches() {
+        let user_data: [&[u8]; 3] = [
+            br#"{"jitConfig":"jit"}"#,
+            br#"{"broker":"https://broker.example.com","ticket":"t"}"#,
+            &gzip(br#"{"broker":"https://broker.example.com","ticket":"t"}"#),
+        ];
+        for data in user_data {
+            let metadata = FakeMetadata {
+                user_data: Some(data.to_vec()),
+                ..Default::default()
+            };
+            assert!(is_runner_launch(&metadata).await.unwrap());
+        }
+        for key in [TAG_JIT_PARAMETER, TAG_GHR_CONFIG_PATH] {
+            let metadata = FakeMetadata {
+                tags: HashMap::from([(key, "/runners/config")]),
+                ..Default::default()
+            };
+            assert!(is_runner_launch(&metadata).await.unwrap(), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn other_launches() {
+        // Launched by hand or by the AWS Marketplace scan: no user data, a
+        // script, or JSON that is not for hatchrun.
+        for data in [None, Some(&b"#!/bin/sh\necho hi\n"[..]), Some(&b"{}"[..])] {
+            let metadata = FakeMetadata {
+                user_data: data.map(<[u8]>::to_vec),
+                ..Default::default()
+            };
+            assert!(!is_runner_launch(&metadata).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_runner_user_data_is_an_error() {
+        let metadata = FakeMetadata {
+            user_data: Some(br#"{"broker":"https://broker.example.com"}"#.to_vec()),
+            ..Default::default()
+        };
+        assert!(is_runner_launch(&metadata).await.is_err());
     }
 }

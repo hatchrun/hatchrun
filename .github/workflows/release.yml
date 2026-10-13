@@ -107,7 +107,7 @@ jobs:
           name="hatchrun-agent-${VERSION}-linux-${ARCH}"
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/hatchrun-agent" dist/hatchrun-agent
-          cp dist/hatchrun-agent packaging/systemd/hatchrun-agent.service LICENSE NOTICE README.md "dist/$name/"
+          cp dist/hatchrun-agent packaging/systemd/hatchrun-agent.service packaging/systemd/hatchrun-launch.service LICENSE NOTICE README.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           nfpm package -f packaging/nfpm.yaml -p deb -t dist/
           nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
