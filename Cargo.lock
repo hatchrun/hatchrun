@@ -1140,11 +1140,14 @@ dependencies = [
  "aws-sigv4",
  "base64 0.23.1",
  "hmac",
+ "js-sys",
  "roxmltree",
  "serde",
  "serde_json",
  "sha2",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "worker",
 ]
 
