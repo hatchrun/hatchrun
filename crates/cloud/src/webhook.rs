@@ -179,10 +179,11 @@ mod tests {
             .unwrap()
             .lines()
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| {
+            .enumerate()
+            .map(|(case, line)| {
                 let fields: Vec<&str> = line.split('\t').collect();
                 let [secret, body, signature, valid] = fields[..] else {
-                    panic!("bad line in {path}: {line:?}");
+                    panic!("case {case} in {path} needs four fields");
                 };
                 (
                     secret.to_owned(),
@@ -198,11 +199,11 @@ mod tests {
     fn checks_every_case() {
         let cases = signatures();
         assert!(cases.len() >= 4);
-        for (secret, body, signature, valid) in cases {
+        for (case, (secret, body, signature, valid)) in cases.into_iter().enumerate() {
             assert_eq!(
                 verify(secret.as_bytes(), body.as_bytes(), Some(&signature)),
                 valid,
-                "{secret:?} {body:?}"
+                "case {case} in testdata/signatures.tsv"
             );
         }
     }
