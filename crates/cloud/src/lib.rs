@@ -13,8 +13,11 @@
 //! - `POST /github/webhook` takes the App's webhook deliveries.
 
 pub mod aws;
+pub mod github;
 pub mod http;
+pub mod jwt;
 pub mod labels;
+pub mod oidc;
 pub mod webhook;
 
 use wasm_bindgen::JsValue;
