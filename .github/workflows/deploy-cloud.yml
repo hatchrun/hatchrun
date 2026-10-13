@@ -1,0 +1,91 @@
+name: deploy-cloud
+
+# Deploys crates/cloud, the Worker behind hatchrun.dev, from main. The
+# API token can edit Workers and D1 in the hatchrun account only, and
+# only this job, on main, in the protected production environment, can
+# read it. The account comes from wrangler.toml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/cloud/**
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/deploy-cloud.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: deploy-cloud
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  WRANGLER: wrangler@4.143.0
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: crates/cloud
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # worker-build is installed by the build command in wrangler.toml;
+      # caching ~/.cargo/bin saves compiling it on every deploy.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/worker-build
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: deploy-cloud-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      # rustup installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup show active-toolchain
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Point at the production database
+        env:
+          DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+        run: |
+          test -n "$DATABASE_ID"
+          sed -i "s/^database_id = \"local\"$/database_id = \"${DATABASE_ID}\"/" wrangler.toml
+          grep -qx "database_id = \"${DATABASE_ID}\"" wrangler.toml
+
+      # Migrations only add tables and columns, so the running Worker
+      # keeps working against the new schema until the deploy lands.
+      - name: Apply D1 migrations
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx --yes "$WRANGLER" d1 migrations apply hatchrun-cloud --remote
+
+      # Secrets set in the environment are uploaded with the deploy;
+      # those left empty keep their current value on the Worker.
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GITHUB_WEBHOOK_SECRET: ${{ secrets.GITHUB_WEBHOOK_SECRET }}
+          GITHUB_APP_PRIVATE_KEY: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}
+          OIDC_SIGNING_KEY: ${{ secrets.OIDC_SIGNING_KEY }}
+          BROKER_TOKEN: ${{ secrets.BROKER_TOKEN }}
+        run: |
+          secrets="$RUNNER_TEMP/worker-secrets.json"
+          trap 'rm -f "$secrets"' EXIT
+          (umask 077 && jq -n 'env | with_entries(select(
+              (.key | IN("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_PRIVATE_KEY", "OIDC_SIGNING_KEY", "BROKER_TOKEN"))
+              and .value != ""))' > "$secrets")
+          echo "Uploading secrets: $(jq -r 'keys | join(", ")' "$secrets")"
+          npx --yes "$WRANGLER" deploy --secrets-file "$secrets"
