@@ -98,6 +98,25 @@ groups. The scaler sets the shutdown behaviour to terminate, so the
 agent powering off ends the instance. Subnets are tried in order when
 one is out of capacity.
 
+### Warm pool
+
+`--warm-pool N` keeps N instances ready for new runners. A pool instance
+launches without user data, so the agent stays off, boots once and reads
+the image's files off the snapshot, and is stopped after
+`--warm-pool-warmup` (3 minutes). A new runner gets the oldest stopped
+pool instance: the scaler sets its user data to the ticket, tags it as
+the runner's and starts it, and launches a replacement. A runner from
+the pool skips the launch and the slow first read of a fresh volume.
+Pool instances older than `--warm-pool-max-age` (24 hours) are replaced,
+so the pool picks up new images.
+
+A stopped instance costs its volume and nothing else: a 10 GB gp3 root
+volume is about $0.80 a month per pool instance. The pool needs an
+on-demand launch template, because spot instances cannot be stopped
+this way, and the scaler also needs `ec2:StopInstances`,
+`ec2:StartInstances`, `ec2:ModifyInstanceAttribute` and
+`ec2:DeleteTags`. Pool instances are tagged `hatchrun:pool`.
+
 ## Broker
 
 [`crates/broker`](crates/broker) is a Cloudflare Worker that hands each
@@ -140,8 +159,10 @@ runner and jobs that went to another runner. Warm runners kept by
 `min_runners` get recycled on the same timeout. On start, and whenever
 the scaler compares its runners with the instances in the account, it
 adopts instances it does not know and removes the registration of
-runners whose instance is gone. Like the client, it does no I/O and
-builds for `wasm32-unknown-unknown`.
+runners whose instance is gone. It also keeps the warm pool at its size,
+hands pool instances to new runners and adopts pool instances after a
+restart by whether they are stopped. Like the client, it does no I/O
+and builds for `wasm32-unknown-unknown`.
 
 ## Releases
 

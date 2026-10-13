@@ -89,6 +89,19 @@ struct Args {
     /// How long a runner may wait for a job before it is replaced.
     #[arg(long, env = "HATCHRUN_IDLE_TIMEOUT", default_value = "15m", value_parser = humantime::parse_duration)]
     idle_timeout: Duration,
+    /// Stopped instances kept ready for new runners. They booted once and
+    /// read their files, so a job starts sooner on them. Needs an
+    /// on-demand launch template: spot instances cannot be stopped this
+    /// way.
+    #[arg(long, env = "HATCHRUN_WARM_POOL", default_value_t = 0)]
+    warm_pool: u32,
+    /// How long a pool instance runs after launch before it is stopped.
+    #[arg(long, env = "HATCHRUN_WARM_POOL_WARMUP", default_value = "3m", value_parser = humantime::parse_duration)]
+    warm_pool_warmup: Duration,
+    /// Age at which a pool instance is replaced, so the pool picks up new
+    /// images and launch template versions.
+    #[arg(long, env = "HATCHRUN_WARM_POOL_MAX_AGE", default_value = "24h", value_parser = humantime::parse_duration)]
+    warm_pool_max_age: Duration,
     /// How often to compare runners with instances.
     #[arg(long, env = "HATCHRUN_RECONCILE_INTERVAL", default_value = "1m", value_parser = humantime::parse_duration)]
     reconcile_interval: Duration,
@@ -130,6 +143,9 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<()> {
     driver::validate(args.min_runners, args.max_runners)?;
+    if args.warm_pool > 0 && args.warm_pool_max_age <= args.warm_pool_warmup {
+        anyhow::bail!("--warm-pool-max-age must be longer than --warm-pool-warmup");
+    }
     let store = Broker::new(&args.broker_url, Secret::new(args.broker_token))?;
     let mut terminate = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("listen for SIGINT")?;
@@ -185,6 +201,9 @@ async fn run(args: Args) -> Result<()> {
         min_runners: args.min_runners,
         max_runners: args.max_runners,
         idle_timeout: args.idle_timeout.as_secs(),
+        pool_size: args.warm_pool,
+        pool_warmup: args.warm_pool_warmup.as_secs(),
+        pool_max_age: args.warm_pool_max_age.as_secs(),
         ..Config::default()
     });
     let owner = std::env::var("HOSTNAME").unwrap_or_else(|_| "hatchrun-scaler".into());

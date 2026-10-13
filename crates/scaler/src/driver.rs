@@ -265,10 +265,17 @@ where
         while !actions.is_empty() {
             self.renew().await?;
             let mut launches = Vec::new();
+            let mut pool_launches = Vec::new();
             let mut next = Vec::new();
             for action in actions.drain(..) {
                 match action {
-                    Action::Launch { name } => launches.push(name),
+                    Action::Launch { name, pooled } => launches.push((name, pooled)),
+                    Action::LaunchPool { name } => pool_launches.push(name),
+                    Action::Stop { instance_id } => {
+                        if let Err(err) = self.cloud.stop(&instance_id).await {
+                            warn!(instance_id, "{err:#}");
+                        }
+                    }
                     Action::RemoveRunner { name, runner_id } => {
                         next.extend(self.remove_runner(&name, runner_id).await);
                     }
@@ -280,15 +287,33 @@ where
                 }
             }
 
+            let this = &*self;
             let results: Vec<_> = futures_util::stream::iter(launches)
-                .map(|name| async {
-                    let result = self.launch(&name).await;
+                .map(|(name, pooled)| async move {
+                    let result = this.launch(&name, pooled.as_deref()).await;
+                    (name, result)
+                })
+                .buffer_unordered(LAUNCH_CONCURRENCY)
+                .collect()
+                .await;
+            let pooled: Vec<_> = futures_util::stream::iter(pool_launches)
+                .map(|name| async move {
+                    let result = this.cloud.launch_pool(&name).await;
                     (name, result)
                 })
                 .buffer_unordered(LAUNCH_CONCURRENCY)
                 .collect()
                 .await;
             let now = (self.clock)();
+            for (name, result) in pooled {
+                match result {
+                    Ok(instance_id) => self.scaler.pool_launched(&name, instance_id, now),
+                    Err(err) => {
+                        warn!(name, "pool launch failed: {err:#}");
+                        self.scaler.pool_launch_failed(&name, now);
+                    }
+                }
+            }
             for (name, result) in results {
                 match result {
                     Ok((runner_id, instance_id)) => {
@@ -306,13 +331,18 @@ where
     }
 
     /// Registers the runner, starts its instance with a ticket in user
-    /// data and stores the config in the broker under that ticket. On
+    /// data and stores the config in the broker under that ticket. The
+    /// instance is a new one, or the stopped pool instance `pooled`. On
     /// failure, returns the runner id when the registration had already
     /// happened.
     ///
     /// The config is stored only once the instance exists, so nothing can
     /// claim it before there is an instance to claim it.
-    async fn launch(&self, name: &str) -> Result<(u64, String), (Option<u64>, anyhow::Error)> {
+    async fn launch(
+        &self,
+        name: &str,
+        pooled: Option<&str>,
+    ) -> Result<(u64, String), (Option<u64>, anyhow::Error)> {
         let config = self
             .github
             .call(
@@ -323,11 +353,23 @@ where
             .map_err(|err| (None, anyhow::Error::new(err).context("generate JIT config")))?;
         let runner_id = config.runner.id;
         let ticket = new_ticket().map_err(|err| (Some(runner_id), err))?;
-        let instance_id = self
-            .cloud
-            .launch(name, runner_id, &boot_document(self.store.url(), &ticket))
-            .await
-            .map_err(|err| (Some(runner_id), err))?;
+        let user_data = boot_document(self.store.url(), &ticket);
+        let instance_id = match pooled {
+            // On failure the scaler removes the runner, which terminates
+            // the pool instance: it may already carry the runner's ticket.
+            Some(instance_id) => {
+                self.cloud
+                    .start_pooled(instance_id, name, runner_id, &user_data)
+                    .await
+                    .map_err(|err| (Some(runner_id), err))?;
+                instance_id.to_owned()
+            }
+            None => self
+                .cloud
+                .launch(name, runner_id, &user_data)
+                .await
+                .map_err(|err| (Some(runner_id), err))?,
+        };
         if let Err(err) = self.store.store(&ticket, &config.encoded_jit_config).await {
             // Without its config the instance would sit out the agent's
             // timeout before powering off.
@@ -514,9 +556,13 @@ mod tests {
     #[derive(Default)]
     struct FakeCloud {
         fail_launch: bool,
+        fail_start: bool,
         fail_instances: bool,
         instances: Vec<Instance>,
         launched: RefCell<Vec<(String, u64, String)>>,
+        pool_launched: RefCell<Vec<String>>,
+        started: RefCell<Vec<(String, String, u64, String)>>,
+        stopped: RefCell<Vec<String>>,
         terminated: RefCell<Vec<String>>,
     }
 
@@ -535,6 +581,36 @@ mod tests {
             } else {
                 Ok(format!("i-{runner_id}"))
             })
+        }
+
+        fn launch_pool(&self, name: &str) -> impl Future<Output = Result<String>> {
+            self.pool_launched.borrow_mut().push(name.to_owned());
+            std::future::ready(Ok(format!("i-{name}")))
+        }
+
+        fn start_pooled(
+            &self,
+            instance_id: &str,
+            name: &str,
+            runner_id: u64,
+            user_data: &str,
+        ) -> impl Future<Output = Result<()>> {
+            self.started.borrow_mut().push((
+                instance_id.to_owned(),
+                name.to_owned(),
+                runner_id,
+                user_data.to_owned(),
+            ));
+            std::future::ready(if self.fail_start {
+                Err(anyhow::anyhow!("IncorrectInstanceState"))
+            } else {
+                Ok(())
+            })
+        }
+
+        fn stop(&self, instance_id: &str) -> impl Future<Output = Result<()>> {
+            self.stopped.borrow_mut().push(instance_id.to_owned());
+            std::future::ready(Ok(()))
         }
 
         fn instances(&self) -> impl Future<Output = Result<Vec<Instance>>> {
@@ -771,9 +847,10 @@ mod tests {
             FakeCloud {
                 instances: vec![Instance {
                     id: "i-5".into(),
-                    runner_name: "linux-old".into(),
+                    runner_name: Some("linux-old".into()),
                     runner_id: Some(5),
                     launched_at: NOW - 3600,
+                    stopped: false,
                 }],
                 ..FakeCloud::default()
             },
@@ -799,9 +876,10 @@ mod tests {
             FakeCloud {
                 instances: vec![Instance {
                     id: "i-5".into(),
-                    runner_name: "linux-old".into(),
+                    runner_name: Some("linux-old".into()),
                     runner_id: Some(5),
                     launched_at: NOW - 3600,
+                    stopped: false,
                 }],
                 ..FakeCloud::default()
             },
@@ -878,6 +956,80 @@ mod tests {
             .filter(|(method, _)| method == Method::GET)
             .count();
         assert_eq!(polls, MAX_FAILURES as usize);
+    }
+
+    /// A driver with a one-instance pool and a stopped pool instance in
+    /// the inventory.
+    fn pool_driver(github: &FakeGitHub, fail_start: bool) -> TestDriver {
+        let mut driver = driver(
+            github,
+            FakeCloud {
+                fail_start,
+                instances: vec![Instance {
+                    id: "i-pool".into(),
+                    runner_name: None,
+                    runner_id: None,
+                    launched_at: NOW - 600,
+                    stopped: true,
+                }],
+                ..FakeCloud::default()
+            },
+        );
+        driver.scaler = Scaler::new(Config {
+            name_prefix: "linux".into(),
+            pool_size: 1,
+            ..Config::default()
+        });
+        driver
+    }
+
+    #[tokio::test]
+    async fn job_starts_a_pool_instance_and_the_pool_refills() {
+        let github = FakeGitHub::default();
+        jit_route(&github);
+        github.route(
+            Method::POST,
+            "/acquirejobs",
+            200,
+            r#"{"count":1,"value":[11]}"#,
+        );
+        github.route(Method::DELETE, "/message/42", 204, "");
+        let mut driver = pool_driver(&github, false);
+        driver.reconcile().await.unwrap();
+        assert_eq!(driver.cloud.pool_launched.borrow().len(), 0);
+
+        let jobs = serde_json::json!([{"messageType": "JobAvailable", "runnerRequestId": 11}]);
+        driver.handle(message(42, &jobs, 1)).await.unwrap();
+
+        assert_eq!(driver.cloud.launched.borrow().len(), 0);
+        let started = driver.cloud.started.borrow();
+        assert_eq!(started[0].0, "i-pool");
+        assert_eq!(started[0].2, 4);
+        let boot: serde_json::Value = serde_json::from_str(&started[0].3).unwrap();
+        assert_eq!(boot["broker"], "https://broker.example");
+        assert_eq!(driver.store.stored.borrow()[0].1, "jit-4");
+        let runner = driver.scaler.runners().values().next().unwrap();
+        assert_eq!(runner.phase, Phase::Idle);
+        assert_eq!(runner.instance_id.as_deref(), Some("i-pool"));
+        // The pool refills with a new instance.
+        assert_eq!(driver.cloud.pool_launched.borrow().len(), 1);
+        assert_eq!(driver.scaler.pool().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_pool_start_terminates_the_instance() {
+        let github = FakeGitHub::default();
+        jit_route(&github);
+        github.route(Method::DELETE, "/agents/4", 204, "");
+        let mut driver = pool_driver(&github, true);
+        driver.reconcile().await.unwrap();
+        driver.scaler.handle_jobs([], Some(1), NOW);
+        let actions = driver.scaler.plan(NOW);
+        driver.execute(actions).await.unwrap();
+
+        assert_eq!(*driver.cloud.terminated.borrow(), ["i-pool"]);
+        assert_eq!(driver.store.stored.borrow().len(), 0);
+        assert!(driver.scaler.runners().is_empty());
     }
 
     #[test]
