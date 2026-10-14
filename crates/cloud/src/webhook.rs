@@ -94,6 +94,11 @@ pub enum Event {
         /// The new status.
         status: Status,
     },
+    /// The App was uninstalled; the tenant loses its installation.
+    Uninstalled {
+        /// The installation that is gone.
+        installation_id: u64,
+    },
     /// Nothing to do, and why. GitHub shows the reason in the App's
     /// delivery log, which is where a user looks when a job waits.
     Ignored(String),
@@ -130,6 +135,20 @@ struct Installation {
 ///
 /// When a `workflow_job` body does not parse.
 pub fn parse(event: &str, body: &[u8]) -> Result<Event, serde_json::Error> {
+    if event == "installation" {
+        #[derive(Deserialize)]
+        struct Changed {
+            action: String,
+            installation: Installation,
+        }
+        let changed: Changed = serde_json::from_slice(body)?;
+        return Ok(match changed.action.as_str() {
+            "deleted" => Event::Uninstalled {
+                installation_id: changed.installation.id,
+            },
+            other => Event::Ignored(format!("installation {other} is not used")),
+        });
+    }
     if event != "workflow_job" {
         return Ok(Event::Ignored(format!("{event} events are not used")));
     }
@@ -294,5 +313,22 @@ mod tests {
     #[test]
     fn rejects_malformed_job_events() {
         assert!(parse("workflow_job", b"{\"action\":\"queued\"}").is_err());
+    }
+
+    #[test]
+    fn notices_uninstalls() {
+        let deleted =
+            br#"{"action":"deleted","installation":{"id":77,"account":{"login":"acme"}}}"#;
+        assert_eq!(
+            parse("installation", deleted).unwrap(),
+            Event::Uninstalled {
+                installation_id: 77
+            }
+        );
+        let created = br#"{"action":"created","installation":{"id":77}}"#;
+        assert_eq!(
+            parse("installation", created).unwrap(),
+            Event::Ignored("installation created is not used".to_owned())
+        );
     }
 }

@@ -31,6 +31,7 @@ mod launch;
 pub mod oidc;
 pub mod session;
 pub mod signin;
+pub mod tenant;
 mod webcrypto;
 pub mod webhook;
 
@@ -161,6 +162,13 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
             .bind(&[status.as_str().into(), now, int(id)?])?
             .run()
             .await?;
+            Ok(Response::empty()?.with_status(204))
+        }
+        Event::Uninstalled { installation_id } => {
+            db.prepare("UPDATE tenants SET installation_id = NULL, updated_at = ?2 WHERE installation_id = ?1")
+                .bind(&[int(installation_id)?, now])?
+                .run()
+                .await?;
             Ok(Response::empty()?.with_status(204))
         }
         Event::Ignored(reason) => {

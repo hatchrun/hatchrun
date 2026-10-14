@@ -111,6 +111,37 @@ pub fn check_csrf(id: &[u8], given: Option<&str>) -> bool {
     mac.verify_slice(&given).is_ok()
 }
 
+/// The `state` of an App install started from this session for
+/// `tenant`: the tenant id and a MAC over it keyed with the session id.
+/// The setup URL callback gets it back from GitHub.
+///
+/// # Panics
+///
+/// Never: HMAC takes keys of any length.
+#[must_use]
+pub fn install_state(id: &[u8], tenant: &str) -> String {
+    format!(
+        "{tenant}.{}",
+        b64url(derive(id, &format!("hatchrun install {tenant}")))
+    )
+}
+
+/// The tenant an [`install_state`] names, if this session made it.
+#[must_use]
+pub fn check_install_state<'a>(id: &[u8], state: &'a str) -> Option<&'a str> {
+    let (tenant, _) = state.split_once('.')?;
+    let expected = install_state(id, tenant);
+    // Both sides derive from secrets only this session holds; length
+    // and content leak nothing about another session's state.
+    (expected.len() == state.len()
+        && expected
+            .bytes()
+            .zip(state.bytes())
+            .fold(0, |diff, (a, b)| diff | (a ^ b))
+            == 0)
+        .then_some(tenant)
+}
+
 /// Seals `plain` for storage next to the session: AES-256-GCM under a
 /// key derived from the session id, with a fresh 12-byte `nonce`.
 /// Returns base64url of the nonce and the ciphertext.
@@ -209,6 +240,17 @@ mod tests {
         assert!(!check_csrf(&random::<ID_BYTES>(), Some(&token)));
         assert!(!check_csrf(&id, Some("")));
         assert!(!check_csrf(&id, None));
+    }
+
+    #[test]
+    fn install_states_belong_to_one_session_and_tenant() {
+        let id: [u8; ID_BYTES] = random();
+        let state = install_state(&id, "abcdefgh12345678");
+        assert_eq!(check_install_state(&id, &state), Some("abcdefgh12345678"));
+        assert_eq!(check_install_state(&random::<ID_BYTES>(), &state), None);
+        let other = state.replacen("abcdefgh", "zzzzzzzz", 1);
+        assert_eq!(check_install_state(&id, &other), None);
+        assert_eq!(check_install_state(&id, "abcdefgh12345678"), None);
     }
 
     #[test]

@@ -11,6 +11,13 @@
 //! - `POST /api/auth/logout` ends the session.
 //! - `GET /api/session` returns the signed-in user and the CSRF token
 //!   the app sends back on every request that changes something.
+//! - `/api/orgs`, `/api/tenants` and `/api/github/setup` set up an
+//!   organization and link the App's installation (see [`tenants`]).
+//!
+//! Everything but sign-in needs a session, and everything but `GET`
+//! needs the session's CSRF token.
+
+mod tenants;
 
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
@@ -32,6 +39,8 @@ const CLIENT_SECRET: &str = "GITHUB_CLIENT_SECRET";
 const GITHUB_WEB_URL: &str = "GITHUB_WEB_URL";
 /// Variable that replaces the GitHub API URL, for development.
 const GITHUB_API_URL: &str = "GITHUB_API_URL";
+/// Variable with the App's slug, as in `github.com/apps/<slug>`.
+const APP_SLUG: &str = "GITHUB_APP_SLUG";
 
 /// Longest a session lasts. A session also ends when the user's GitHub
 /// token does, since the app acts with it.
@@ -43,6 +52,7 @@ pub(crate) struct Config {
     pub client_id: String,
     pub github_web: String,
     pub github_api: String,
+    pub app_slug: String,
 }
 
 impl Config {
@@ -58,6 +68,7 @@ impl Config {
                 .unwrap_or_else(|| github::API.to_owned())
                 .trim_end_matches('/')
                 .to_owned(),
+            app_slug: need(env, APP_SLUG)?,
         })
     }
 }
@@ -98,7 +109,6 @@ pub(crate) struct Session {
     pub id: Vec<u8>,
     pub user: UserRow,
     /// The user's GitHub token.
-    #[allow(dead_code)] // Org setup acts with it.
     pub token: String,
 }
 
@@ -142,23 +152,25 @@ impl Session {
 }
 
 /// Answers a request under `/api`.
-pub async fn handle(req: Request, env: Env) -> Result<Response> {
+pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
     let config = Config::read(&env)?;
     let db = env.d1(DB)?;
     let path = req.path();
     match (req.method(), path.as_str()) {
-        (Method::Get, "/api/auth/login") => login(&req, &config),
-        (Method::Get, "/api/auth/callback") => match callback(&req, &env, &config, &db).await {
-            Ok(response) => Ok(response),
-            Err(err) => {
-                console_error!("sign-in: {err}");
-                redirect(
-                    &config,
-                    "/signin?error=github",
-                    &[&session::clear_cookie(session::OAUTH_COOKIE)],
-                )
-            }
-        },
+        (Method::Get, "/api/auth/login") => return login(&req, &config),
+        (Method::Get, "/api/auth/callback") => {
+            return match callback(&req, &env, &config, &db).await {
+                Ok(response) => Ok(response),
+                Err(err) => {
+                    console_error!("sign-in: {err}");
+                    redirect(
+                        &config,
+                        "/signin?error=github",
+                        &[&session::clear_cookie(session::OAUTH_COOKIE)],
+                    )
+                }
+            };
+        }
         (Method::Post, "/api/auth/logout") => {
             let Some(current) = Session::find(&req, &db).await? else {
                 return json_error("not signed in", 401);
@@ -174,23 +186,109 @@ pub async fn handle(req: Request, env: Env) -> Result<Response> {
             response
                 .headers_mut()
                 .append("Set-Cookie", &session::clear_cookie(session::COOKIE))?;
-            Ok(response)
+            return Ok(response);
         }
-        (Method::Get, "/api/session") => match Session::find(&req, &db).await? {
-            Some(current) => Response::from_json(&serde_json::json!({
-                "user": {
-                    "id": current.user.id,
-                    "login": current.user.login,
-                    "name": current.user.name,
-                    "avatarUrl": current.user.avatar_url,
-                },
-                "csrfToken": session::csrf_token(&current.id),
-            })),
-            None => json_error("not signed in", 401),
-        },
-        _ => json_error("not found", 404),
+        _ => {}
+    }
+
+    let Some(current) = Session::find(&req, &db).await? else {
+        if path == SETUP_PATH {
+            // Back from installing the App with the session gone: sign
+            // in again and come back here.
+            let back = req.url()?;
+            let back = format!("{}?{}", back.path(), back.query().unwrap_or_default());
+            return found(
+                &format!(
+                    "{}/api/auth/login?return_to={}",
+                    config.app_url,
+                    crate::http::encode(&back)
+                ),
+                &[],
+            );
+        }
+        return json_error("not signed in", 401);
+    };
+    let method = req.method();
+    if method != Method::Get && !current.csrf_ok(&req)? {
+        return json_error("bad CSRF token", 403);
+    }
+    let ctx = Ctx {
+        env: &env,
+        config: &config,
+        db: &db,
+        session: &current,
+    };
+    let segments: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
+    let answer = match (method, segments.as_slice()) {
+        (Method::Get, ["session"]) => Response::from_json(&serde_json::json!({
+            "user": {
+                "id": current.user.id,
+                "login": current.user.login,
+                "name": current.user.name,
+                "avatarUrl": current.user.avatar_url,
+            },
+            "csrfToken": session::csrf_token(&current.id),
+        }))
+        .map_err(Failure::from),
+        (Method::Get, ["orgs"]) => tenants::orgs(&ctx).await,
+        (Method::Get, ["tenants"]) => tenants::mine(&ctx).await,
+        (Method::Post, ["tenants"]) => tenants::create(&ctx, req.json().await?).await,
+        (Method::Get, ["tenants", org]) => tenants::show(&ctx, org).await,
+        (Method::Get, ["github", "setup"]) => tenants::setup(&ctx, &req).await,
+        _ => return json_error("not found", 404),
+    };
+    match answer {
+        Ok(response) => Ok(response),
+        Err(Failure { status, message }) => {
+            if status >= 500 {
+                console_error!("{} {path}: {message}", req.method().as_ref());
+            }
+            json_error(&message, status)
+        }
     }
 }
+
+/// The app's callback after the App is installed.
+const SETUP_PATH: &str = "/api/github/setup";
+
+/// What a request handler has to work with.
+pub(crate) struct Ctx<'a> {
+    pub env: &'a Env,
+    pub config: &'a Config,
+    pub db: &'a D1Database,
+    pub session: &'a Session,
+}
+
+/// Why a request failed, as the app shows it.
+#[derive(Debug)]
+pub(crate) struct Failure {
+    pub status: u16,
+    pub message: String,
+}
+
+impl Failure {
+    pub(crate) fn new(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<worker::Error> for Failure {
+    fn from(err: worker::Error) -> Self {
+        Self::new(500, err.to_string())
+    }
+}
+
+/// Errors from GitHub, AWS or Polar, which the Worker only relays.
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::new(502, message)
+    }
+}
+
+pub(crate) type Answer = std::result::Result<Response, Failure>;
 
 /// Starts sign-in: a fresh state and verifier in a cookie, and off to
 /// GitHub.
@@ -328,11 +426,11 @@ async fn store_session(
 }
 
 /// A 302 to a path of the app, setting `cookies`.
-fn redirect(config: &Config, path: &str, cookies: &[&str]) -> Result<Response> {
+pub(crate) fn redirect(config: &Config, path: &str, cookies: &[&str]) -> Result<Response> {
     found(&format!("{}{path}", config.app_url), cookies)
 }
 
-fn found(url: &str, cookies: &[&str]) -> Result<Response> {
+pub(crate) fn found(url: &str, cookies: &[&str]) -> Result<Response> {
     let headers = Headers::new();
     headers.set("Location", url)?;
     headers.set("Cache-Control", "no-store")?;

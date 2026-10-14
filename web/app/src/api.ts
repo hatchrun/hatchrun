@@ -17,6 +17,43 @@ export interface Session {
   csrfToken: string;
 }
 
+export interface OrgChoice {
+  id: number;
+  login: string;
+  avatarUrl: string;
+  /** The tenant's id when the organization is already set up. */
+  tenant: string | null;
+}
+
+export interface TenantSummary {
+  id: string;
+  login: string;
+  avatarUrl: string;
+}
+
+export interface Aws {
+  roleArn: string;
+  region: string;
+  launchTemplateId: string;
+  subnetIds: string[];
+}
+
+export interface Steps {
+  organization: boolean;
+  aws: boolean;
+  app: boolean;
+}
+
+export interface Tenant {
+  id: string;
+  org: { id: number; login: string; avatarUrl: string };
+  installationId: number | null;
+  aws: Aws | null;
+  maxRunners: number;
+  steps: Steps;
+  installUrl: string;
+}
+
 export class ApiError extends Error {
   readonly status: number;
 
@@ -83,3 +120,8 @@ export function signInUrl(returnTo: string): string {
 }
 
 export const signOut = () => post<undefined>("/api/auth/logout");
+
+export const listOrgs = () => get<OrgChoice[]>("/api/orgs");
+export const listTenants = () => get<TenantSummary[]>("/api/tenants");
+export const getTenant = (org: string) => get<Tenant>(`/api/tenants/${encodeURIComponent(org)}`);
+export const createTenant = (org: string) => post<Tenant>("/api/tenants", { org });

@@ -9,19 +9,40 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
-interface State {
-  signedIn: boolean;
+interface MockTenant {
+  id: string;
+  org: { id: number; login: string; avatarUrl: string };
+  installationId: number | null;
+  aws: null | { roleArn: string; region: string; launchTemplateId: string; subnetIds: string[] };
+  maxRunners: number;
 }
 
-const state: State = { signedIn: false };
+interface State {
+  signedIn: boolean;
+  tenants: MockTenant[];
+}
 
-const user = {
-  id: 1,
-  login: "octocat",
-  name: "Mona Octocat",
-  avatarUrl:
-    "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 2 2'><rect width='2' height='2' fill='%23f5a524'/></svg>",
-};
+const state: State = { signedIn: false, tenants: [] };
+
+const square = (color: string) =>
+  `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 2 2'><rect width='2' height='2' fill='${encodeURIComponent(color)}'/></svg>`;
+
+const orgs = [
+  { id: 101, login: "acme-corp", avatarUrl: square("#3b82f6") },
+  { id: 102, login: "octo-labs", avatarUrl: square("#10b981") },
+];
+
+function tenantView(tenant: MockTenant) {
+  return {
+    ...tenant,
+    steps: { organization: true, aws: tenant.aws !== null, app: tenant.installationId !== null },
+    installUrl: `/api/github/setup?installation_id=${tenant.org.id * 10}&setup_action=install&state=${tenant.id}`,
+  };
+}
+
+const findTenant = (login: string) => state.tenants.find((tenant) => tenant.org.login === login);
+
+const user = { id: 1, login: "octocat", name: "Mona Octocat", avatarUrl: square("#f5a524") };
 
 type Handler = (req: IncomingMessage, url: URL, body: unknown) => [number, unknown] | string;
 
@@ -36,6 +57,39 @@ const routes: Record<string, Handler> = {
   },
   "GET /api/session": () =>
     state.signedIn ? [200, { user, csrfToken: "mock" }] : [401, { error: "not signed in" }],
+  "GET /api/orgs": () => [
+    200,
+    orgs.map((org) => ({ ...org, tenant: findTenant(org.login)?.id ?? null })),
+  ],
+  "GET /api/tenants": () => [
+    200,
+    state.tenants.map((tenant) => ({ id: tenant.id, login: tenant.org.login, avatarUrl: tenant.org.avatarUrl })),
+  ],
+  "POST /api/tenants": (_req, _url, body) => {
+    const login = (body as { org: string }).org;
+    const org = orgs.find((candidate) => candidate.login === login);
+    if (!org) {
+      return [403, { error: `you are not an owner of ${login} on GitHub` }];
+    }
+    let tenant = findTenant(login);
+    if (!tenant) {
+      tenant = { id: `mock${org.id}tenant00`, org, installationId: null, aws: null, maxRunners: 10 };
+      state.tenants.push(tenant);
+    }
+    return [200, tenantView(tenant)];
+  },
+  "GET /api/tenants/:org": (_req, url) => {
+    const tenant = findTenant(url.pathname.split("/")[3] ?? "");
+    return tenant ? [200, tenantView(tenant)] : [404, { error: "no organization here" }];
+  },
+  "GET /api/github/setup": (_req, url) => {
+    const tenant = state.tenants.find((candidate) => candidate.id === url.searchParams.get("state"));
+    if (!tenant) {
+      return "/?error=install-state";
+    }
+    tenant.installationId = Number(url.searchParams.get("installation_id"));
+    return `/o/${tenant.org.login}?installed=1`;
+  },
 };
 
 async function readBody(req: IncomingMessage): Promise<unknown> {
