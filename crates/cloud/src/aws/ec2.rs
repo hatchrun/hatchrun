@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! `RunInstances` and `TerminateInstances` for runner instances.
+//! `RunInstances` and `TerminateInstances` for runner instances, and the
+//! lookups that check a connected account before it is saved.
 //!
 //! The customer's role allows `RunInstances` only from the stack's launch
 //! template, with the `hatchrun:tenant` tag, `IMDSv2` and a hop limit of 1
@@ -30,6 +31,9 @@ pub const CAPACITY_ERRORS: &[&str] = &[
 /// Tag with the tenant id; the role only launches and manages instances
 /// that carry it.
 pub const TAG_TENANT: &str = "hatchrun:tenant";
+/// Tag connect.yaml puts on its launch template with the subnets runners
+/// launch into, comma separated, so the app finds them from the role.
+pub const TAG_SUBNETS: &str = "hatchrun:subnets";
 /// Tag with the workflow job id.
 pub const TAG_JOB_ID: &str = "hatchrun:job-id";
 /// Tag with the runner name.
@@ -163,6 +167,123 @@ pub fn terminated(response: &Response) -> Result<(), Error> {
         Err(err) if err.code == "InvalidInstanceID.NotFound" => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+/// The launch templates of `tenant`'s stack, found by their
+/// [`TAG_TENANT`] tag.
+#[must_use]
+pub fn describe_launch_templates(endpoint: &str, tenant: &str) -> Request {
+    query(
+        endpoint,
+        "DescribeLaunchTemplates",
+        VERSION,
+        &[
+            ("Filter.1.Name".to_owned(), format!("tag:{TAG_TENANT}")),
+            ("Filter.1.Value.1".to_owned(), tenant.to_owned()),
+        ],
+    )
+}
+
+/// A launch template of a tenant's stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchTemplate {
+    /// `lt-...`
+    pub id: String,
+    /// When it was made, ISO 8601; the newest stack wins.
+    pub created: String,
+    /// The subnets from its [`TAG_SUBNETS`] tag, in order.
+    pub subnets: Vec<String>,
+}
+
+/// Reads the launch templates out of the answer.
+///
+/// # Errors
+///
+/// EC2's error, or a malformed answer.
+pub fn launch_templates(response: &Response) -> Result<Vec<LaunchTemplate>, Error> {
+    let doc = document(response)?;
+    let Some(set) = doc
+        .descendants()
+        .find(|node| node.tag_name().name() == "launchTemplates")
+    else {
+        return Ok(Vec::new());
+    };
+    set.children()
+        .filter(|node| node.tag_name().name() == "item")
+        .map(|item| {
+            let field = |name: &str| {
+                item.children()
+                    .find(|child| child.tag_name().name() == name)
+                    .and_then(|child| child.text())
+            };
+            let subnets = item
+                .descendants()
+                .filter(|node| node.tag_name().name() == "item")
+                .find(|tag| child_text(*tag, "key") == Some(TAG_SUBNETS))
+                .and_then(|tag| child_text(tag, "value"))
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|subnet| !subnet.is_empty())
+                .map(str::to_owned)
+                .collect();
+            Ok(LaunchTemplate {
+                id: field("launchTemplateId")
+                    .ok_or_else(|| Error::malformed("launch template without an id"))?
+                    .to_owned(),
+                created: field("createTime").unwrap_or_default().to_owned(),
+                subnets,
+            })
+        })
+        .collect()
+}
+
+/// The subnets named `ids`.
+#[must_use]
+pub fn describe_subnets(endpoint: &str, ids: &[String]) -> Request {
+    let params: Vec<(String, String)> = ids
+        .iter()
+        .enumerate()
+        .map(|(at, id)| (format!("SubnetId.{}", at + 1), id.clone()))
+        .collect();
+    query(endpoint, "DescribeSubnets", VERSION, &params)
+}
+
+/// A subnet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subnet {
+    /// `subnet-...`
+    pub id: String,
+    /// Its availability zone.
+    pub availability_zone: String,
+}
+
+/// Reads the subnets out of the answer. A subnet that does not exist
+/// makes EC2 answer `InvalidSubnetID.NotFound`.
+///
+/// # Errors
+///
+/// EC2's error, or a malformed answer.
+pub fn subnets(response: &Response) -> Result<Vec<Subnet>, Error> {
+    let doc = document(response)?;
+    let Some(set) = doc
+        .descendants()
+        .find(|node| node.tag_name().name() == "subnetSet")
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(set
+        .children()
+        .filter(|node| node.tag_name().name() == "item")
+        .filter_map(|item| {
+            Some(Subnet {
+                id: child_text(item, "subnetId")?.to_owned(),
+                availability_zone: child_text(item, "availabilityZone")
+                    .unwrap_or_default()
+                    .to_owned(),
+            })
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -352,5 +473,80 @@ mod tests {
                 .to_vec(),
         };
         assert!(terminated(&denied).is_err());
+    }
+
+    #[test]
+    fn finds_the_stacks_launch_template_and_subnets() {
+        let request = describe_launch_templates("https://ec2.eu-west-1.amazonaws.com/", "abc12345");
+        assert_eq!(
+            String::from_utf8(request.body).unwrap(),
+            "Action=DescribeLaunchTemplates&Version=2016-11-15\
+             &Filter.1.Name=tag%3Ahatchrun%3Atenant&Filter.1.Value.1=abc12345"
+        );
+        let answer = Response {
+            status: 200,
+            body: br#"<DescribeLaunchTemplatesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <requestId>r</requestId>
+  <launchTemplates>
+    <item>
+      <createTime>2026-10-14T10:00:00.000Z</createTime>
+      <defaultVersionNumber>1</defaultVersionNumber>
+      <launchTemplateId>lt-0abc</launchTemplateId>
+      <launchTemplateName>LaunchTemplate-x</launchTemplateName>
+      <tagSet>
+        <item><key>hatchrun:tenant</key><value>abc12345</value></item>
+        <item><key>hatchrun:subnets</key><value>subnet-a, subnet-b</value></item>
+      </tagSet>
+    </item>
+  </launchTemplates>
+</DescribeLaunchTemplatesResponse>"#
+                .to_vec(),
+        };
+        assert_eq!(
+            launch_templates(&answer).unwrap(),
+            [LaunchTemplate {
+                id: "lt-0abc".to_owned(),
+                created: "2026-10-14T10:00:00.000Z".to_owned(),
+                subnets: vec!["subnet-a".to_owned(), "subnet-b".to_owned()],
+            }]
+        );
+        let none = Response {
+            status: 200,
+            body: b"<DescribeLaunchTemplatesResponse><launchTemplates/></DescribeLaunchTemplatesResponse>"
+                .to_vec(),
+        };
+        assert_eq!(launch_templates(&none).unwrap(), []);
+
+        let request = describe_subnets(
+            "https://ec2.eu-west-1.amazonaws.com/",
+            &["subnet-a".to_owned(), "subnet-b".to_owned()],
+        );
+        assert!(
+            String::from_utf8(request.body)
+                .unwrap()
+                .ends_with("&SubnetId.1=subnet-a&SubnetId.2=subnet-b")
+        );
+        let answer = Response {
+            status: 200,
+            body: b"<DescribeSubnetsResponse><subnetSet><item><subnetId>subnet-a</subnetId>\
+                    <vpcId>vpc-1</vpcId><availabilityZone>eu-west-1a</availabilityZone></item>\
+                    </subnetSet></DescribeSubnetsResponse>"
+                .to_vec(),
+        };
+        assert_eq!(
+            subnets(&answer).unwrap(),
+            [Subnet {
+                id: "subnet-a".to_owned(),
+                availability_zone: "eu-west-1a".to_owned(),
+            }]
+        );
+        let missing = Response {
+            status: 400,
+            body: b"<Response><Errors><Error><Code>InvalidSubnetID.NotFound</Code><Message>The subnet ID 'subnet-b' does not exist</Message></Error></Errors></Response>".to_vec(),
+        };
+        assert_eq!(
+            subnets(&missing).unwrap_err().code,
+            "InvalidSubnetID.NotFound"
+        );
     }
 }

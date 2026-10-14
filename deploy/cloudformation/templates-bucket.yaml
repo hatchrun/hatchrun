@@ -1,0 +1,143 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Publishes connect.yaml for the hatchrun.io Launch Stack links: a bucket
+  that serves the rendered template to anyone, and a role the publish
+  workflow of hatchrun/hatchrun assumes through GitHub's OIDC provider to
+  upload it.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: hatchrun-templates
+    Description: Globally unique. The Launch Stack links show it.
+  SubjectPrefix:
+    Type: String
+    Default: repo:hatchrun@340033788/hatchrun@1411691909
+    Description: >-
+      Start of the repository's immutable OIDC subject, made of the owner
+      and repository ids so a renamed or recreated repository cannot match.
+      Read it from GET /repos/{owner}/{repo}/actions/oidc/customization/sub
+      (sub_claim_prefix).
+  Environment:
+    Type: String
+    Default: production
+    Description: >-
+      GitHub environment the publish job runs in, whose deployment branches
+      are limited to main.
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN of an existing token.actions.githubusercontent.com provider. An
+      account can hold only one; leave empty to create it.
+
+Conditions:
+  CreateProvider: !Equals [!Ref ExistingOidcProviderArn, ""]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  # CloudFormation reads a Launch Stack link's template over HTTPS from
+  # S3, as the customer, so the template must be public. Only
+  # connect.yaml is; versioning keeps every template a stack was made
+  # from.
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      LifecycleConfiguration:
+        Rules:
+          - Id: old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicTemplate
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${Bucket.Arn}/connect.yaml"
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Sub "${Bucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  PublishRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: hatchrun-template-publish
+      Description: Assumed by publish-template.yml on main to upload connect.yaml.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !If
+                - CreateProvider
+                - !GetAtt GitHubOidcProvider.Arn
+                - !Ref ExistingOidcProviderArn
+            # Only jobs in the protected environment, which runs from
+            # main alone, get this subject.
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "${SubjectPrefix}:environment:${Environment}"
+      Policies:
+        - PolicyName: publish-template
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Upload
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${Bucket.Arn}/connect.yaml"
+              - Sid: Validate
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: "*"
+
+Outputs:
+  PublishRoleArn:
+    Description: The TEMPLATES_ROLE_ARN secret of the production environment.
+    Value: !GetAtt PublishRole.Arn
+  TemplateUrl:
+    Description: CONNECT_TEMPLATE_URL in crates/cloud/wrangler.toml.
+    Value: !Sub "https://${Bucket.RegionalDomainName}/connect.yaml"

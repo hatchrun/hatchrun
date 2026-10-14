@@ -13,12 +13,14 @@
 //!   the app sends back on every request that changes something.
 //! - `/api/orgs`, `/api/tenants` and `/api/github/setup` set up an
 //!   organization and link the App's installation (see [`tenants`]).
+//! - `/api/tenants/<org>/aws` connects the AWS account (see [`aws`]).
 //! - `/api/plan`, `/api/tenants/<org>/{checkout,portal,beta}` and
 //!   `/api/polar/webhook` handle the licence (see [`billing`]).
 //!
 //! Everything but sign-in needs a session, and everything but `GET`
 //! needs the session's CSRF token.
 
+mod aws;
 mod billing;
 mod tenants;
 
@@ -224,20 +226,13 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
     };
     let segments: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
     let answer = match (method, segments.as_slice()) {
-        (Method::Get, ["session"]) => Response::from_json(&serde_json::json!({
-            "user": {
-                "id": current.user.id,
-                "login": current.user.login,
-                "name": current.user.name,
-                "avatarUrl": current.user.avatar_url,
-            },
-            "csrfToken": session::csrf_token(&current.id),
-        }))
-        .map_err(Failure::from),
+        (Method::Get, ["session"]) => session_json(&current),
         (Method::Get, ["orgs"]) => tenants::orgs(&ctx).await,
         (Method::Get, ["tenants"]) => tenants::mine(&ctx).await,
         (Method::Post, ["tenants"]) => tenants::create(&ctx, req.json().await?).await,
         (Method::Get, ["tenants", org]) => tenants::show(&ctx, org).await,
+        (Method::Get, ["tenants", org, "aws"]) => aws::instructions(&ctx, org).await,
+        (Method::Post, ["tenants", org, "aws"]) => aws::verify(&ctx, org, req.json().await?).await,
         (Method::Get, ["plan"]) => billing::plan(&ctx).await,
         (Method::Post, ["tenants", org, "checkout"]) => billing::checkout(&ctx, org).await,
         (Method::Post, ["tenants", org, "portal"]) => billing::portal(&ctx, org).await,
@@ -256,6 +251,19 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             json_error(&message, status)
         }
     }
+}
+
+/// `GET /api/session`
+fn session_json(current: &Session) -> Answer {
+    Ok(Response::from_json(&serde_json::json!({
+        "user": {
+            "id": current.user.id,
+            "login": current.user.login,
+            "name": current.user.name,
+            "avatarUrl": current.user.avatar_url,
+        },
+        "csrfToken": session::csrf_token(&current.id),
+    }))?)
 }
 
 /// The app's callback after the App is installed.

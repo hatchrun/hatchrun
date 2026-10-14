@@ -50,7 +50,7 @@ const BROKER_TOKEN: &str = "BROKER_TOKEN";
 /// Variable that replaces the GitHub API URL, for development.
 const GITHUB_API_URL: &str = "GITHUB_API_URL";
 /// Variable that replaces the STS and EC2 endpoints, for development.
-const AWS_ENDPOINT_URL: &str = "AWS_ENDPOINT_URL";
+pub(crate) const AWS_ENDPOINT_URL: &str = "AWS_ENDPOINT_URL";
 
 /// How long a config waits for its instance. The agent gives up after
 /// ten minutes.
@@ -414,18 +414,55 @@ async fn assume_role(
     job: &QueuedJob,
     tenant: &Tenant,
 ) -> std::result::Result<Credentials, String> {
-    let input = oidc::signing_input(&settings.oidc_kid, &tenant.id, now_ms() / 1000);
-    let signature = webcrypto::sign_rs256(&settings.oidc_key, input.as_bytes())
-        .await
-        .map_err(|err| format!("sign tenant token: {err}"))?;
-    let request = sts::assume_role_with_web_identity(
-        &aws::endpoint("sts", &tenant.region, settings.aws_endpoint.as_deref()),
+    tenant_credentials(
+        &settings.oidc_key,
+        &settings.oidc_kid,
+        settings.aws_endpoint.as_deref(),
+        &tenant.id,
         &tenant.role_arn,
+        &tenant.region,
         &format!("hatchrun-job-{}", job.id),
+    )
+    .await
+    .map_err(|err| format!("AssumeRoleWithWebIdentity {}: {err}", tenant.role_arn))
+}
+
+/// Credentials of `role_arn` in `region`, for a token that names
+/// `tenant`. `session` shows in the customer's `CloudTrail`.
+///
+/// # Errors
+///
+/// STS's error, or a signing failure as an [`aws::Error`] with code
+/// `SigningFailed`.
+pub(crate) async fn tenant_credentials(
+    oidc_key: &[u8],
+    oidc_kid: &str,
+    aws_endpoint: Option<&str>,
+    tenant: &str,
+    role_arn: &str,
+    region: &str,
+    session: &str,
+) -> std::result::Result<Credentials, aws::Error> {
+    let input = oidc::signing_input(oidc_kid, tenant, now_ms() / 1000);
+    let signature = webcrypto::sign_rs256(oidc_key, input.as_bytes())
+        .await
+        .map_err(|err| aws::Error {
+            status: 0,
+            code: "SigningFailed".to_owned(),
+            message: format!("sign tenant token: {err}"),
+        })?;
+    let request = sts::assume_role_with_web_identity(
+        &aws::endpoint("sts", region, aws_endpoint),
+        role_arn,
+        session,
         &jwt::token(&input, &signature),
     );
-    sts::credentials(&send(&request).await?)
-        .map_err(|err| format!("AssumeRoleWithWebIdentity {}: {err}", tenant.role_arn))
+    let response = send(&request).await.map_err(|err| aws::Error {
+        status: 0,
+        code: "Unreachable".to_owned(),
+        message: err,
+    })?;
+    sts::credentials(&response)
 }
 
 async fn installation_token(

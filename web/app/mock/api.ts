@@ -135,6 +135,52 @@ const routes: Record<string, Handler> = {
     tenant.beta = true;
     return [200, tenantView(tenant)];
   },
+  "GET /api/tenants/:org/aws": (_req, url) => {
+    const tenant = findTenant(url.pathname.split("/")[3] ?? "");
+    if (!tenant) {
+      return [404, { error: "no organization here" }];
+    }
+    const regions: [string, string][] = [
+      ["us-east-1", "US East (N. Virginia)"],
+      ["us-west-2", "US West (Oregon)"],
+      ["eu-west-1", "Europe (Ireland)"],
+      ["ap-southeast-2", "Asia Pacific (Sydney)"],
+    ];
+    const template = "https://hatchrun-templates.s3.us-east-1.amazonaws.com/connect.yaml";
+    return [
+      200,
+      {
+        tenantId: tenant.id,
+        templateUrl: template,
+        regions: regions.map(([id, name]) => ({
+          id,
+          name,
+          hasImage: id !== "ap-southeast-2",
+          launchUrl: `https://${id}.console.aws.amazon.com/cloudformation/home?region=${id}#/stacks/create/review?templateURL=${encodeURIComponent(template)}&stackName=hatchrun&param_TenantId=${tenant.id}`,
+        })),
+      },
+    ];
+  },
+  "POST /api/tenants/:org/aws": (_req, url, body) => {
+    const tenant = findTenant(url.pathname.split("/")[3] ?? "");
+    const { region, roleArn } = body as { region: string; roleArn: string };
+    if (!tenant) {
+      return [404, { error: "no organization here" }];
+    }
+    if (!/^arn:aws[a-z-]*:iam::\d{12}:role\/.+$/.test(roleArn)) {
+      return [422, { error: "That is not a role ARN. Paste the RoleArn output of the stack." }];
+    }
+    if (roleArn.endsWith("/wrong")) {
+      return [
+        422,
+        {
+          error: `AWS would not let hatchrun assume ${roleArn}. Check that the stack was created with tenant ID ${tenant.id} and that this is its RoleArn output. AWS said: Not authorized to perform sts:AssumeRoleWithWebIdentity`,
+        },
+      ];
+    }
+    tenant.aws = { roleArn, region, launchTemplateId: "lt-0a1b2c3d4e5f60718", subnetIds: ["subnet-0aa11", "subnet-0bb22"] };
+    return [200, tenantView(tenant)];
+  },
   "GET /api/github/setup": (_req, url) => {
     const tenant = state.tenants.find((candidate) => candidate.id === url.searchParams.get("state"));
     if (!tenant) {

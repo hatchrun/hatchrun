@@ -21,6 +21,7 @@
 
 mod app;
 pub mod aws;
+pub mod connect;
 mod fetch;
 pub mod github;
 pub mod http;
