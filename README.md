@@ -159,6 +159,11 @@ so two claims of one ticket cannot both succeed and nothing stored is
 keyed by a live ticket. Storing needs the `BROKER_TOKEN` secret; a
 claim needs only the ticket, a 256-bit random value.
 
+Neither `wrangler.toml` names the Cloudflare account. The deploy
+workflows pass it as the `CLOUDFLARE_ACCOUNT_ID` secret; run by hand,
+wrangler reads it from `CLOUDFLARE_ACCOUNT_ID` or from the account the
+login can reach, so export it when that login reaches more than one.
+
 ```sh
 cd crates/broker
 npx wrangler@4.143.0 secret put BROKER_TOKEN
@@ -188,6 +193,49 @@ npx wrangler@4.143.0 d1 migrations apply hatchrun-cloud --local
 echo GITHUB_WEBHOOK_SECRET=dev > .dev.vars
 npx wrangler@4.143.0 dev
 ```
+
+### OIDC issuer
+
+The Worker reaches a customer's AWS account by signing a five-minute
+token for `tenant:<id>` and trading it for the role that
+[`connect.yaml`](deploy/cloudformation/connect.yaml) creates, through
+`AssumeRoleWithWebIdentity`. STS checks the token against the keys the
+Worker serves on `oidc.hatchrun.io`:
+
+- `/.well-known/openid-configuration`, the discovery document;
+- `/.well-known/jwks.json`, the public keys, matched by `kid`.
+
+The signing key is an RSA private key, the `OIDC_SIGNING_KEY` secret of
+the `production` environment, and `OIDC_KEY_ID` in
+[`wrangler.toml`](crates/cloud/wrangler.toml) is its `kid`. The JWKS
+derives the public key from the secret on every request, so there is
+nothing to copy by hand and nothing to drift.
+
+```sh
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out ~/oidc-2026-10-14.pem
+gh secret set OIDC_SIGNING_KEY --env production < ~/oidc-2026-10-14.pem
+```
+
+Keep the PEM somewhere safe: Cloudflare and GitHub will not hand it
+back, and rotating needs it once more. Both documents are served with
+`Cache-Control: max-age=3600`, and STS keeps its own copy of the JWKS,
+so a key is published well before it signs and stays published until
+the tokens it signed have expired. Rotation takes three deploys, each a
+change to `wrangler.toml` merged to main:
+
+1. Publish the next key. Generate it, set it as `OIDC_NEXT_SIGNING_KEY`
+   and add `OIDC_NEXT_KEY_ID = "2027-01"`. The JWKS now lists both
+   keys. Wait a day, so every cached JWKS has the new key.
+2. Sign with it. Set the new PEM as `OIDC_SIGNING_KEY` and the old one
+   as `OIDC_PREVIOUS_SIGNING_KEY`, then set `OIDC_KEY_ID = "2027-01"`,
+   `OIDC_PREVIOUS_KEY_ID = "2026-10-14"` and remove `OIDC_NEXT_KEY_ID`.
+3. Retire the old key, at least five minutes later, when the last token
+   it signed has expired: remove `OIDC_PREVIOUS_KEY_ID`.
+
+A slot is published only while its `kid` is set, so the leftover
+secrets do nothing. Delete them anyway, from GitHub with
+`gh secret delete NAME --env production` and from the Worker with
+`npx wrangler@4.143.0 secret delete NAME`.
 
 ## Scale set client
 

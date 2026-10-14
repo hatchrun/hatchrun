@@ -13,6 +13,9 @@
 //! (see the `launch` module).
 //!
 //! - `POST /github/webhook` takes the App's webhook deliveries.
+//! - `GET /.well-known/openid-configuration` and
+//!   `GET /.well-known/jwks.json` on `oidc.hatchrun.io` let STS check
+//!   the tokens the Worker signs (see [`oidc`]).
 
 pub mod aws;
 pub mod github;
@@ -26,8 +29,9 @@ mod webcrypto;
 pub mod webhook;
 
 use wasm_bindgen::JsValue;
-use worker::{Env, Method, Request, Response, Result, console_warn, event};
+use worker::{Env, Method, Request, Response, Result, console_error, console_warn, event};
 
+use crate::jwt::PublicKey;
 use crate::webhook::Event;
 
 /// D1 binding in `wrangler.toml`.
@@ -37,6 +41,9 @@ const WEBHOOK_SECRET: &str = "GITHUB_WEBHOOK_SECRET";
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response> {
+    if req.url()?.host_str() == Some(oidc::HOST) {
+        return issuer(&req, &env);
+    }
     if req.method() == Method::Post && req.path() == "/github/webhook" {
         return github_webhook(req, env, &ctx).await;
     }
@@ -107,6 +114,61 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
             Response::from_json(&serde_json::json!({ "ignored": reason }))
         }
     }
+}
+
+/// The issuer's discovery document and JWKS.
+fn issuer(req: &Request, env: &Env) -> Result<Response> {
+    if !matches!(req.method(), Method::Get | Method::Head) {
+        return error("method not allowed", 405);
+    }
+    let body = match req.path().as_str() {
+        oidc::DISCOVERY_PATH => oidc::discovery(),
+        oidc::JWKS_PATH => {
+            let keys = published_keys(env);
+            if keys.is_empty() {
+                return error("no signing key", 500);
+            }
+            oidc::jwks(&keys)
+        }
+        _ => return error("not found", 404),
+    };
+    let mut response = Response::from_json(&body)?;
+    response
+        .headers_mut()
+        .set("Cache-Control", oidc::CACHE_CONTROL)?;
+    Ok(response)
+}
+
+/// The public keys of the issuer's slots that have a `kid`. A slot whose
+/// key is missing or unreadable is left out and logged, so a bad next
+/// key cannot take the signing key's JWKS down with it.
+fn published_keys(env: &Env) -> Vec<(String, PublicKey)> {
+    let get = |name: &str| {
+        env.secret(name)
+            .map(|value| value.to_string())
+            .ok()
+            .filter(|value| !value.is_empty())
+    };
+    oidc::SLOTS
+        .iter()
+        .filter_map(|(key, kid)| {
+            let kid = get(kid)?;
+            let public = get(key)
+                .ok_or_else(|| "is not set".to_owned())
+                .and_then(|pem| {
+                    jwt::pkcs8_der(&pem)
+                        .and_then(|der| jwt::public_key(&der))
+                        .map_err(|err| err.to_string())
+                });
+            match public {
+                Ok(public) => Some((kid, public)),
+                Err(err) => {
+                    console_error!("{key} (kid {kid}): {err}");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// D1 takes numbers as JavaScript doubles, exact up to 2^53. GitHub ids

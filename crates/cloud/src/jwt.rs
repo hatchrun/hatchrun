@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! RS256 JSON Web Tokens, short of the signature: the signing input, the
-//! finished token and the private key in the form `WebCrypto` imports.
-//! The Worker signs with `WebCrypto` (see [`crate::webcrypto`]).
+//! finished token, the private key in the form `WebCrypto` imports and
+//! the public half of that key, as the JWKS publishes it. The Worker
+//! signs with `WebCrypto` (see [`crate::webcrypto`]).
 //!
 //! Two tokens use this: the GitHub App's JWT, signed with the key GitHub
 //! issued for the App, and the tenant token for AWS (see [`crate::oidc`]).
@@ -78,9 +79,93 @@ pub fn pkcs8_der(pem: &str) -> Result<Vec<u8>, KeyError> {
     Ok(if pkcs1 { wrap_pkcs1(&der) } else { der })
 }
 
+/// An RSA public key: modulus and exponent as unsigned big-endian bytes
+/// with no leading zeros, the form a JWK encodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicKey {
+    /// The modulus, `n`.
+    pub n: Vec<u8>,
+    /// The public exponent, `e`.
+    pub e: Vec<u8>,
+}
+
+/// The public half of a PKCS#8 RSA private key (see [`pkcs8_der`]).
+///
+/// # Errors
+///
+/// When the DER is not an RSA `PrivateKeyInfo`.
+pub fn public_key(pkcs8: &[u8]) -> Result<PublicKey, KeyError> {
+    // PrivateKeyInfo { version, AlgorithmIdentifier, OCTET STRING pkcs1 }
+    let (info, _) = element(pkcs8, SEQUENCE)?;
+    let (_, info) = element(info, INTEGER)?;
+    let (algorithm, info) = element(info, SEQUENCE)?;
+    if element(algorithm, OID)?.0 != RSA_ENCRYPTION {
+        return Err(KeyError("private key is not an RSA key"));
+    }
+    let (pkcs1, _) = element(info, OCTET_STRING)?;
+    // RSAPrivateKey { version, n, e, d, ... }
+    let (key, _) = element(pkcs1, SEQUENCE)?;
+    let (_, key) = element(key, INTEGER)?;
+    let (n, key) = element(key, INTEGER)?;
+    let (e, _) = element(key, INTEGER)?;
+    Ok(PublicKey {
+        n: unsigned(n)?,
+        e: unsigned(e)?,
+    })
+}
+
+const INTEGER: u8 = 0x02;
+const OCTET_STRING: u8 = 0x04;
+const OID: u8 = 0x06;
+const SEQUENCE: u8 = 0x30;
+/// 1.2.840.113549.1.1.1, rsaEncryption.
+const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+
+/// Splits the DER element at the front of `der`, which must have tag
+/// `tag`, into its contents and whatever follows it.
+fn element(der: &[u8], tag: u8) -> Result<(&[u8], &[u8]), KeyError> {
+    const TRUNCATED: KeyError = KeyError("private key DER is truncated");
+    let [found, first, rest @ ..] = der else {
+        return Err(TRUNCATED);
+    };
+    if *found != tag {
+        return Err(KeyError("private key DER is not an RSA private key"));
+    }
+    let (len, rest) = if *first < 0x80 {
+        (usize::from(*first), rest)
+    } else {
+        let size = usize::from(first & 0x7f);
+        if size == 0 || size > std::mem::size_of::<usize>() || rest.len() < size {
+            return Err(TRUNCATED);
+        }
+        let (bytes, rest) = rest.split_at(size);
+        let len = bytes
+            .iter()
+            .fold(0, |len, byte| len << 8 | usize::from(*byte));
+        (len, rest)
+    };
+    if rest.len() < len {
+        return Err(TRUNCATED);
+    }
+    Ok(rest.split_at(len))
+}
+
+/// A positive DER INTEGER as unsigned bytes. DER adds a zero byte in
+/// front of a value whose top bit is set; JWKs leave it out.
+fn unsigned(integer: &[u8]) -> Result<Vec<u8>, KeyError> {
+    if integer.first().is_some_and(|byte| byte & 0x80 != 0) {
+        return Err(KeyError("private key has a negative integer"));
+    }
+    let start = integer
+        .iter()
+        .position(|byte| *byte != 0)
+        .ok_or(KeyError("private key has a zero integer"))?;
+    Ok(integer[start..].to_vec())
+}
+
 /// `PrivateKeyInfo { version 0, rsaEncryption, OCTET STRING pkcs1 }`.
 fn wrap_pkcs1(pkcs1: &[u8]) -> Vec<u8> {
-    // INTEGER 0, then SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }.
+    // INTEGER 0, then SEQUENCE { OID rsaEncryption, NULL }.
     const PREFIX: &[u8] = &[
         0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
         0x01, 0x05, 0x00,
@@ -171,6 +256,64 @@ mod tests {
         assert!(pkcs8_der("-----BEGIN PRIVATE KEY-----\n!!!\n-----END PRIVATE KEY-----").is_err());
         assert!(pkcs8_der(&pem("PRIVATE KEY", &[0x04, 0x00])).is_err());
         assert!(pkcs8_der("").is_err());
+    }
+
+    /// A DER element with tag `tag` around `contents`.
+    fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend(der_length(contents.len()));
+        out.extend_from_slice(contents);
+        out
+    }
+
+    /// PKCS#1 `RSAPrivateKey` with modulus `n`, exponent `e` and stand-ins
+    /// for the private fields.
+    fn pkcs1(n: &[u8], e: &[u8]) -> Vec<u8> {
+        let mut fields = der(INTEGER, &[0]);
+        fields.extend(der(INTEGER, n));
+        fields.extend(der(INTEGER, e));
+        for _ in 0..6 {
+            fields.extend(der(INTEGER, &[0x55; 128]));
+        }
+        der(SEQUENCE, &fields)
+    }
+
+    #[test]
+    fn finds_the_public_key() {
+        // A 2048-bit modulus has its top bit set, so DER puts a zero byte
+        // in front of it.
+        let mut modulus = vec![0xc3];
+        modulus.extend([0xa5; 255]);
+        let mut n = vec![0];
+        n.extend(&modulus);
+        let key = pkcs8_der(&pem("RSA PRIVATE KEY", &pkcs1(&n, &[1, 0, 1]))).unwrap();
+        assert_eq!(
+            public_key(&key).unwrap(),
+            PublicKey {
+                n: modulus,
+                e: vec![1, 0, 1],
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_keys_without_rsa_numbers() {
+        let wrap = |pkcs1: &[u8]| pkcs8_der(&pem("RSA PRIVATE KEY", pkcs1)).unwrap();
+        // A negative modulus, a zero exponent and a key cut short.
+        assert!(public_key(&wrap(&pkcs1(&[0x80, 1], &[1, 0, 1]))).is_err());
+        assert!(public_key(&wrap(&pkcs1(&[0x7f, 1], &[0]))).is_err());
+        let whole = wrap(&pkcs1(&[0x7f, 1], &[1, 0, 1]));
+        assert!(public_key(&whole[..40]).is_err());
+        // An EC key in a PKCS#8 envelope.
+        let mut algorithm = der(OID, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]);
+        algorithm.extend(der(OID, &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]));
+        let mut info = der(INTEGER, &[0]);
+        info.extend(der(SEQUENCE, &algorithm));
+        info.extend(der(OCTET_STRING, &der(SEQUENCE, &[])));
+        assert_eq!(
+            public_key(&der(SEQUENCE, &info)),
+            Err(KeyError("private key is not an RSA key"))
+        );
     }
 
     #[test]

@@ -5,10 +5,6 @@
 name = "hatchrun-cloud"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-01"
-# The hatchrun Cloudflare account. Naming it here keeps wrangler, run
-# by hand or in CI, from deploying or setting secrets in another
-# account the same login can reach.
-account_id = "20438923120e30641ae734882be1937a"
 
 # The webhook shares hatchrun.io with the website, which serves every
 # other path; the OIDC issuer gets its own hostname.
@@ -29,13 +25,18 @@ database_id = "local"
 migrations_dir = "migrations"
 
 # Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY (PEM),
-# OIDC_SIGNING_KEY (RSA private key in PEM) and BROKER_TOKEN.
-# Variables: GITHUB_APP_ID and BROKER_URL below, OIDC_KEY_ID (the
-# signing key's kid). GITHUB_API_URL and AWS_ENDPOINT_URL point the Worker
-# at local stubs under wrangler dev.
+# OIDC_SIGNING_KEY (RSA private key in PEM) and BROKER_TOKEN, plus
+# OIDC_NEXT_SIGNING_KEY and OIDC_PREVIOUS_SIGNING_KEY while a key is
+# rotated. Variables: those below. GITHUB_API_URL and AWS_ENDPOINT_URL
+# point the Worker at local stubs under wrangler dev.
 [vars]
 # Client id of the hatchrun GitHub App (github.com/apps/hatchrun).
 GITHUB_APP_ID = "Iv23liMh4C066YyxQB7R"
 # hatchrun-broker (crates/broker), where launches store runner configs.
 # Both Workers share BROKER_TOKEN.
 BROKER_URL = "https://broker.hatchrun.io"
+# kid of OIDC_SIGNING_KEY in oidc.hatchrun.io's JWKS. The JWKS also
+# lists OIDC_NEXT_SIGNING_KEY and OIDC_PREVIOUS_SIGNING_KEY while
+# OIDC_NEXT_KEY_ID and OIDC_PREVIOUS_KEY_ID are set here. The README
+# has the rotation steps.
+OIDC_KEY_ID = "2026-10-14"

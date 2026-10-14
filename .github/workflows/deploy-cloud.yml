@@ -3,7 +3,7 @@ name: deploy-cloud
 # Deploys crates/cloud, the Worker behind hatchrun.io, from main. The
 # API token can edit Workers and D1 in the hatchrun account only, and
 # only this job, on main, in the protected production environment, can
-# read it. The account comes from wrangler.toml.
+# read it. The account comes from the CLOUDFLARE_ACCOUNT_ID secret.
 
 on:
   push:
@@ -74,6 +74,7 @@ jobs:
       - name: Apply D1 migrations
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npx --yes "$WRANGLER" d1 migrations apply hatchrun-cloud --remote
 
       # Secrets set in the environment are uploaded with the deploy;
@@ -81,15 +82,19 @@ jobs:
       - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           GITHUB_WEBHOOK_SECRET: ${{ secrets.GITHUB_WEBHOOK_SECRET }}
           GITHUB_APP_PRIVATE_KEY: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}
           OIDC_SIGNING_KEY: ${{ secrets.OIDC_SIGNING_KEY }}
+          OIDC_NEXT_SIGNING_KEY: ${{ secrets.OIDC_NEXT_SIGNING_KEY }}
+          OIDC_PREVIOUS_SIGNING_KEY: ${{ secrets.OIDC_PREVIOUS_SIGNING_KEY }}
           BROKER_TOKEN: ${{ secrets.BROKER_TOKEN }}
         run: |
           secrets="$RUNNER_TEMP/worker-secrets.json"
           trap 'rm -f "$secrets"' EXIT
           (umask 077 && jq -n 'env | with_entries(select(
-              (.key | IN("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_PRIVATE_KEY", "OIDC_SIGNING_KEY", "BROKER_TOKEN"))
+              (.key | IN("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_PRIVATE_KEY", "BROKER_TOKEN",
+                         "OIDC_SIGNING_KEY", "OIDC_NEXT_SIGNING_KEY", "OIDC_PREVIOUS_SIGNING_KEY"))
               and .value != ""))' > "$secrets")
           echo "Uploading secrets: $(jq -r 'keys | join(", ")' "$secrets")"
           npx --yes "$WRANGLER" deploy --secrets-file "$secrets"
