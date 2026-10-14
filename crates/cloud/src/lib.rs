@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Worker behind hatchrun.dev.
+//! The Worker behind hatchrun.io.
 //!
 //! Customers install the hatchrun GitHub App on their organization. The
 //! App sends a `workflow_job` webhook for every job; the Worker checks the

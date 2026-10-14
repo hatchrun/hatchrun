@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tokens from the `oidc.hatchrun.dev` issuer.
+//! Tokens from the `oidc.hatchrun.io` issuer.
 //!
 //! A customer's `ControlPlaneRole` (deploy/cloudformation/connect.yaml)
 //! trusts this issuer for the audience `sts.amazonaws.com` and the
@@ -17,7 +17,7 @@
 use crate::jwt;
 
 /// The issuer URL, as the customer's IAM OIDC provider names it.
-pub const ISSUER: &str = "https://oidc.hatchrun.dev";
+pub const ISSUER: &str = "https://oidc.hatchrun.io";
 /// The audience STS expects.
 pub const AUDIENCE: &str = "sts.amazonaws.com";
 /// Secret holding the issuer's RSA private key in PEM.
@@ -70,7 +70,7 @@ mod tests {
         assert_eq!(
             decode(claims),
             serde_json::json!({
-                "iss": "https://oidc.hatchrun.dev",
+                "iss": "https://oidc.hatchrun.io",
                 "sub": "tenant:acme1234",
                 "aud": "sts.amazonaws.com",
                 "iat": 1_000_000,

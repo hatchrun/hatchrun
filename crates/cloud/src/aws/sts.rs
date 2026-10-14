@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! `AssumeRoleWithWebIdentity`: trades an `oidc.hatchrun.dev` token for
+//! `AssumeRoleWithWebIdentity`: trades an `oidc.hatchrun.io` token for
 //! the tenant role's credentials. The call is not signed; the token is
 //! the credential.
 
@@ -97,7 +97,7 @@ mod tests {
       <Expiration>2026-10-13T12:15:00Z</Expiration>
       <AccessKeyId>ASIAEXAMPLE</AccessKeyId>
     </Credentials>
-    <Provider>oidc.hatchrun.dev</Provider>
+    <Provider>oidc.hatchrun.io</Provider>
   </AssumeRoleWithWebIdentityResult>
   <ResponseMetadata><RequestId>r</RequestId></ResponseMetadata>
 </AssumeRoleWithWebIdentityResponse>"#
