@@ -107,7 +107,7 @@ function Steps({
             <li>
               A role hatchrun assumes with a five-minute token for your tenant. It can launch hatchrun
               images, of the instance types and volume sizes you allow, and stop or terminate only the
-              instances it launched.
+              instances it launched. Runner profiles offer only those types and sizes.
             </li>
             <li>A launch template with IMDSv2 and encrypted volumes.</li>
             <li>

@@ -10,17 +10,27 @@ import { Link, navigate, useQuery } from "../router";
 import { ChoosePlan, PlanSummary } from "./Billing";
 import { AwsSummary, ConnectAws } from "./ConnectAws";
 import { Dashboard } from "./Dashboard";
+import { RunnersPage } from "./Runners";
 import { TenantSettings } from "./TenantSettings";
 
 /** Whether every setup step is done. */
 export const setUp = (tenant: Tenant) => Object.values(tenant.steps).every(Boolean);
 
-/** A tenant's pages: setup until it is done, then the dashboard; and settings. */
-export function TenantPage({ tenant: loaded, section }: { tenant: Tenant; section: string | undefined }) {
+/** A tenant's pages: setup until it is done, then the dashboard; runner profiles and settings. */
+export function TenantPage({
+  tenant: loaded,
+  section,
+  item,
+}: {
+  tenant: Tenant;
+  section: string | undefined;
+  item?: string;
+}) {
   const [tenant, setTenant] = useState(loaded);
   const org = tenant.org.login;
   const tabs = [
     { href: `/o/${org}`, label: setUp(tenant) ? "Jobs" : "Setup", current: section === undefined },
+    { href: `/o/${org}/runners`, label: "Runners", current: section === "runners" },
     { href: `/o/${org}/settings`, label: "Settings", current: section === "settings" },
   ];
   return (
@@ -32,7 +42,9 @@ export function TenantPage({ tenant: loaded, section }: { tenant: Tenant; sectio
           </Link>
         ))}
       </nav>
-      {section === "settings" ? (
+      {section === "runners" ? (
+        <RunnersPage tenant={tenant} item={item} />
+      ) : section === "settings" ? (
         <TenantSettings tenant={tenant} onChange={setTenant} />
       ) : setUp(tenant) && !new URLSearchParams(window.location.search).has("checkout") ? (
         <Dashboard tenant={tenant} />
@@ -121,6 +133,13 @@ function Setup({ tenant, setTenant }: { tenant: Tenant; setTenant: (tenant: Tena
       ),
       body: <InstallApp tenant={tenant} />,
     },
+    {
+      key: "runs-on",
+      title: "Name a runner profile in runs-on",
+      done: false,
+      soon: "Built-in profiles such as hatchrun-4cpu-arm64 work once the App is installed. Runners lists them with their prices and lets you add your own.",
+      body: null,
+    },
   ];
 
   return (
@@ -155,7 +174,8 @@ export function InstallApp({ tenant }: { tenant: Tenant }) {
   return (
     <>
       <p>
-        The App tells hatchrun when a job asks for a hatchrun runner and registers a runner for it.
+        The App tells hatchrun when a job names one of your runner profiles and registers a runner
+        for it.
         Install it on <strong>{tenant.org.login}</strong>, for all repositories or the ones that
         should use hatchrun.
       </p>

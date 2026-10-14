@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 import { listJobs, type Job, type JobPage, type Tenant } from "../api";
 import { CopyButton } from "../components/CopyButton";
 import { LoadError, Spinner } from "../components/Status";
-import { useQuery } from "../router";
+import { Link, useQuery } from "../router";
 
 /** Seconds between refreshes of the job list. */
 const REFRESH = 10;
@@ -90,6 +90,9 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
               <dd>At least N vCPUs, N GiB of memory</dd>
             </div>
           </dl>
+          <p className="fine">
+            <Link href={`/o/${org}/runners`}>Every profile, with its instance type and price</Link>
+          </p>
         </section>
         <section className="stats" aria-label="Jobs now">
           <Stat label="Running" value={page?.counts.active} hint={`of ${tenant.maxRunners} at most`} />

@@ -287,9 +287,10 @@ aws cloudformation deploy --region us-east-1 --stack-name hatchrun-templates \
 ```
 
 Once every step is done the app shows the organization's recent jobs,
-what each launch did and the `runs-on` syntax, and its settings: the
-most runners at once and the regions runners may use, which the
-Worker also checks before every launch.
+what each launch did and the `runs-on` syntax, its runner profiles
+with the instance type and on-demand price each gets in the tenant's
+region, and its settings: the most runners at once and the regions
+runners may use, which the Worker also checks before every launch.
 
 `npm run dev` in `web/app` serves the app with hot reload and sends
 `/api` to `wrangler dev` on port 8787. `npm run dev:mock` answers `/api`

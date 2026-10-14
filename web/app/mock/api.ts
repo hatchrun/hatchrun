@@ -9,6 +9,8 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
+import * as profiles from "./runners.ts";
+
 interface MockTenant {
   id: string;
   org: { id: number; login: string; avatarUrl: string };
@@ -217,6 +219,21 @@ const routes: Record<string, Handler> = {
     tenant.allowedRegions = allowedRegions;
     return [200, tenantView(tenant)];
   },
+  "GET /api/tenants/:org/runners": (_req, url) => {
+    const tenant = findTenant(url.pathname.split("/")[3] ?? "");
+    return tenant
+      ? [200, profiles.runners(tenant.org.login, tenant.aws?.region ?? null)]
+      : [404, { error: "no organization here" }];
+  },
+  "POST /api/tenants/:org/runners/preview": (_req, url, body) => {
+    const tenant = findTenant(url.pathname.split("/")[3] ?? "");
+    return tenant
+      ? [200, profiles.preview(body as Parameters<typeof profiles.preview>[0], tenant.aws?.region ?? null)]
+      : [404, { error: "no organization here" }];
+  },
+  "POST /api/tenants/:org/runners": (req, url, body) => runnerChange(req, url, body),
+  "PUT /api/tenants/:org/runners/:name": (req, url, body) => runnerChange(req, url, body),
+  "DELETE /api/tenants/:org/runners/:name": (req, url, body) => runnerChange(req, url, body),
   "GET /api/github/setup": (_req, url) => {
     const tenant = state.tenants.find((candidate) => candidate.id === url.searchParams.get("state"));
     if (!tenant) {
@@ -226,6 +243,21 @@ const routes: Record<string, Handler> = {
     return `/o/${tenant.org.login}?installed=1`;
   },
 };
+
+function runnerChange(req: IncomingMessage, url: URL, body: unknown): [number, unknown] {
+  const [, , , org = "", , name] = url.pathname.split("/");
+  const tenant = findTenant(org);
+  if (!tenant) {
+    return [404, { error: "no organization here" }];
+  }
+  return profiles.change(
+    org,
+    tenant.aws?.region ?? null,
+    req.method ?? "GET",
+    name ? decodeURIComponent(name) : null,
+    (body as Parameters<typeof profiles.preview>[0] | undefined) ?? null,
+  );
+}
 
 async function readBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];

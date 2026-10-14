@@ -58,9 +58,9 @@ export function App() {
   }
 
   const user = state.session.user;
-  const tenantRoute = /^\/o\/([A-Za-z0-9-]+)(?:\/([a-z]+))?\/?$/.exec(path);
+  const tenantRoute = /^\/o\/([A-Za-z0-9-]+)(?:\/([a-z]+)(?:\/([a-z0-9-]+))?)?\/?$/.exec(path);
   if (tenantRoute?.[1]) {
-    return <TenantRoute user={user} org={tenantRoute[1]} section={tenantRoute[2]} />;
+    return <TenantRoute user={user} org={tenantRoute[1]} section={tenantRoute[2]} item={tenantRoute[3]} />;
   }
   return (
     <Shell user={user}>
@@ -69,7 +69,17 @@ export function App() {
   );
 }
 
-function TenantRoute({ user, org, section }: { user: Session["user"]; org: string; section: string | undefined }) {
+function TenantRoute({
+  user,
+  org,
+  section,
+  item,
+}: {
+  user: Session["user"];
+  org: string;
+  section: string | undefined;
+  item: string | undefined;
+}) {
   const [tenant, reload] = useLoad(() => getTenant(org), org);
   const current =
     tenant.state === "ready"
@@ -78,7 +88,7 @@ function TenantRoute({ user, org, section }: { user: Session["user"]; org: strin
   return (
     <Shell user={user} nav={<OrgSwitcher current={current} />}>
       <Await loaded={tenant} retry={reload}>
-        {(data) => <TenantPage tenant={data} section={section} />}
+        {(data) => <TenantPage tenant={data} section={section} item={item} />}
       </Await>
     </Shell>
   );
