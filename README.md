@@ -188,11 +188,28 @@ with other labels next to the hatchrun one, is skipped, and the App's
 webhook delivery log says why.
 
 ```sh
+npm --prefix web/app ci && npm --prefix web/app run build
 cd crates/cloud
 npx wrangler@4.143.0 d1 migrations apply hatchrun-cloud --local
 echo GITHUB_WEBHOOK_SECRET=dev > .dev.vars
 npx wrangler@4.143.0 dev
 ```
+
+### app.hatchrun.io
+
+The same Worker serves the app customers sign up with: the React app
+in [`web/app`](web/app), built into static assets, and its API under
+`/api`. Sign-in uses the hatchrun App's user authorization, GitHub's
+OAuth web flow with a state and PKCE; the App lists
+`https://app.hatchrun.io/api/auth/callback` as its callback URL and the
+client secret is the `GITHUB_CLIENT_SECRET` secret. A session is a
+random id in an `HttpOnly` cookie; D1 keeps only its hash, and the
+user's GitHub token sealed under a key derived from it.
+
+`npm run dev` in `web/app` serves the app with hot reload and sends
+`/api` to `wrangler dev` on port 8787. `npm run dev:mock` answers `/api`
+from [`web/app/mock/api.ts`](web/app/mock/api.ts) instead, with no
+Worker, GitHub or AWS behind it.
 
 ### OIDC issuer
 

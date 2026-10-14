@@ -27,13 +27,11 @@ use std::fmt::Write;
 use std::time::Duration;
 
 use serde::Deserialize;
-use worker::{
-    D1Database, Env, Fetch, Headers, Method, RequestInit, Result, console_error, console_log,
-    console_warn,
-};
+use worker::{D1Database, Env, Result, console_error, console_log, console_warn};
 
 use crate::aws::{self, Credentials, ec2, sts};
-use crate::http::{Request, Response};
+use crate::fetch::send;
+use crate::http::Request;
 use crate::labels::Arch;
 use crate::webhook::QueuedJob;
 use crate::{DB, github, instance, int, jwt, now_ms, oidc, webcrypto};
@@ -456,42 +454,6 @@ async fn store_config(
     Err(format!("store runner config: {last}"))
 }
 
-/// Sends a request with the runtime's `fetch`.
-async fn send(request: &Request) -> std::result::Result<Response, String> {
-    let sent = async {
-        let headers = Headers::new();
-        for (name, value) in &request.headers {
-            headers.set(name, value)?;
-        }
-        let mut init = RequestInit::new();
-        init.with_method(Method::from(request.method.to_owned()))
-            .with_headers(headers);
-        if !request.body.is_empty() {
-            init.with_body(Some(
-                js_sys::Uint8Array::from(request.body.as_slice()).into(),
-            ));
-        }
-        let mut response = Fetch::Request(worker::Request::new_with_init(&request.url, &init)?)
-            .send()
-            .await?;
-        Ok::<_, worker::Error>(Response {
-            status: response.status_code(),
-            body: response.bytes().await?,
-        })
-    };
-    sent.await
-        .map_err(|err| format!("{} {}: {err}", request.method, host(&request.url)))
-}
-
-/// The scheme and host of a URL, for messages that must not carry a
-/// path with a ticket in it.
-fn host(url: &str) -> &str {
-    let after_scheme = url.find("://").map_or(0, |at| at + 3);
-    url[after_scheme..]
-        .find('/')
-        .map_or(url, |at| &url[..after_scheme + at])
-}
-
 /// D1 takes `null` for SQL NULL and refuses `undefined`, which is what
 /// `Option::None` becomes.
 fn nullable(value: Option<String>) -> wasm_bindgen::JsValue {
@@ -513,15 +475,6 @@ mod tests {
             runner_name(7, &[0xab, 0x01, 0, 0xff]),
             "hatchrun-7-ab0100ff"
         );
-    }
-
-    #[test]
-    fn hosts_drop_the_path() {
-        assert_eq!(
-            host("https://broker.example/v1/tickets/secret"),
-            "https://broker.example"
-        );
-        assert_eq!(host("http://127.0.0.1:8788"), "http://127.0.0.1:8788");
     }
 
     #[test]

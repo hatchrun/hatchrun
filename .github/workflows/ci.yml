@@ -36,6 +36,25 @@ jobs:
       # run in Workers, next to the broker.
       - run: cargo check --locked -p hatchrun-scaleset -p hatchrun-scaler-core -p hatchrun-broker -p hatchrun-cloud --target wasm32-unknown-unknown
 
+  # The app in web/app, which hatchrun-cloud serves on app.hatchrun.io.
+  app:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+      - run: npm audit --audit-level=high
+
   # Tests that switch users need root and a real account.
   root-tests:
     runs-on: ubuntu-latest
