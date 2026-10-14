@@ -214,6 +214,26 @@ which links the installation once it belongs to that organization and
 the user still owns it. Every request on a tenant checks the user's
 ownership with GitHub again.
 
+A tenant launches runners only while it holds a licence: a Polar
+subscription to the `POLAR_PRODUCT_ID` product, or a place in the
+invite-only beta. The app opens Polar's checkout with the tenant id as
+the external customer id, and Polar's webhooks, at
+`https://app.hatchrun.io/api/polar/webhook` and checked against
+`POLAR_WEBHOOK_SECRET`, keep the `subscriptions` table current. The
+beta needs no payment. An owner redeems an invite code, or the operator
+lists the organization:
+
+```sh
+code=$(openssl rand -hex 8)
+hash=$(printf %s "$code" | shasum -a 256 | cut -d' ' -f1)
+npx wrangler@4.143.0 d1 execute hatchrun-cloud --remote --command \
+  "INSERT INTO invites (code_hash, note, uses_left, created_at) VALUES ('$hash', 'acme', 1, unixepoch() * 1000)"
+echo "invite code: $code"
+
+npx wrangler@4.143.0 d1 execute hatchrun-cloud --remote --command \
+  "INSERT INTO beta_orgs (org_login, created_at) VALUES ('acme', unixepoch() * 1000)"
+```
+
 `npm run dev` in `web/app` serves the app with hot reload and sends
 `/api` to `wrangler dev` on port 8787. `npm run dev:mock` answers `/api`
 from [`web/app/mock/api.ts`](web/app/mock/api.ts) instead, with no

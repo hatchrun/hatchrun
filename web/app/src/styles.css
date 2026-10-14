@@ -728,3 +728,103 @@ a.list-row:hover {
     flex-wrap: wrap;
   }
 }
+
+/* Forms */
+
+label {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-size: 0.88rem;
+  font-weight: 550;
+}
+
+.input {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 0.75rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 0;
+  border-color: transparent;
+}
+
+.input-mono {
+  font-family: var(--mono);
+  font-size: 0.88rem;
+}
+
+.field-help {
+  margin: 0.35rem 0 0;
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.field-error {
+  margin: 0.35rem 0 0;
+  font-size: 0.86rem;
+  color: var(--danger);
+}
+
+.inline-form {
+  margin: 1rem 0 0;
+}
+
+.inline-form-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.invite-toggle {
+  margin: 0.9rem 0 0;
+  font-size: 0.9rem;
+}
+
+/* Plan */
+
+.plan {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.plan-name {
+  font-weight: 650;
+}
+
+.plan-description {
+  margin: 0.2rem 0 0;
+  font-size: 0.9rem;
+}
+
+.plan-buy {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex: none;
+}
+
+.plan-price {
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+@media (max-width: 560px) {
+  .plan,
+  .plan-buy,
+  .inline-form-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

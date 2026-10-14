@@ -5,7 +5,7 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
-import { mockApi } from "./mock/api";
+import { mockApi } from "./mock/api.ts";
 
 // `npm run dev` sends /api to `wrangler dev` on port 8787. `npm run
 // dev:mock` answers /api from mock/api.ts instead, to work on screens

@@ -15,6 +15,8 @@ interface MockTenant {
   installationId: number | null;
   aws: null | { roleArn: string; region: string; launchTemplateId: string; subnetIds: string[] };
   maxRunners: number;
+  beta: boolean;
+  subscription: null | { status: string; currentPeriodEnd: string | null; cancelAtPeriodEnd: boolean };
 }
 
 interface State {
@@ -33,9 +35,11 @@ const orgs = [
 ];
 
 function tenantView(tenant: MockTenant) {
+  const licensed = tenant.beta || tenant.subscription?.status === "active";
   return {
     ...tenant,
-    steps: { organization: true, aws: tenant.aws !== null, app: tenant.installationId !== null },
+    billing: { beta: tenant.beta, licensed, subscription: tenant.subscription },
+    steps: { organization: true, billing: licensed, aws: tenant.aws !== null, app: tenant.installationId !== null },
     installUrl: `/api/github/setup?installation_id=${tenant.org.id * 10}&setup_action=install&state=${tenant.id}`,
   };
 }
@@ -73,7 +77,15 @@ const routes: Record<string, Handler> = {
     }
     let tenant = findTenant(login);
     if (!tenant) {
-      tenant = { id: `mock${org.id}tenant00`, org, installationId: null, aws: null, maxRunners: 10 };
+      tenant = {
+        id: `mock${org.id}tenant00`,
+        org,
+        installationId: null,
+        aws: null,
+        maxRunners: 10,
+        beta: false,
+        subscription: null,
+      };
       state.tenants.push(tenant);
     }
     return [200, tenantView(tenant)];
@@ -81,6 +93,47 @@ const routes: Record<string, Handler> = {
   "GET /api/tenants/:org": (_req, url) => {
     const tenant = findTenant(url.pathname.split("/")[3] ?? "");
     return tenant ? [200, tenantView(tenant)] : [404, { error: "no organization here" }];
+  },
+  "GET /api/plan": () =>
+    // MOCK_BILLING=off answers like a Worker without a Polar product.
+    process.env.MOCK_BILLING === "off"
+      ? [503, { error: "billing is not set up yet" }]
+      : [
+          200,
+          {
+            name: "hatchrun Team",
+            description: "Runners for one GitHub organization",
+            amount: 4900,
+            currency: "usd",
+            interval: "month",
+          },
+        ],
+  "POST /api/tenants/:org/checkout": (_req, url) => {
+    const org = url.pathname.split("/")[3] ?? "";
+    return [200, { url: `/api/mock/polar?org=${org}` }];
+  },
+  "GET /api/mock/polar": (_req, url) => {
+    const org = url.searchParams.get("org") ?? "";
+    const tenant = findTenant(org);
+    if (tenant) {
+      const end = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+      setTimeout(() => {
+        tenant.subscription = { status: "active", currentPeriodEnd: end, cancelAtPeriodEnd: false };
+      }, 4000);
+    }
+    return `/o/${org}?checkout=mock`;
+  },
+  "POST /api/tenants/:org/portal": (_req, url) => [200, { url: `/o/${url.pathname.split("/")[3]}?portal=mock` }],
+  "POST /api/tenants/:org/beta": (_req, url, body) => {
+    const tenant = findTenant(url.pathname.split("/")[3] ?? "");
+    if (!tenant) {
+      return [404, { error: "no organization here" }];
+    }
+    if ((body as { code: string }).code.trim() !== "BETA") {
+      return [400, { error: "that invite code is not valid or used up" }];
+    }
+    tenant.beta = true;
+    return [200, tenantView(tenant)];
   },
   "GET /api/github/setup": (_req, url) => {
     const tenant = state.tenants.find((candidate) => candidate.id === url.searchParams.get("state"));

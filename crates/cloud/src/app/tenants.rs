@@ -22,6 +22,7 @@
 use serde::{Deserialize, Serialize};
 use worker::{Request, Response};
 
+use super::billing::{Billing, billing, join_listed_beta};
 use super::{Answer, Ctx, Failure, found};
 use crate::fetch::send;
 use crate::github::{self, Membership};
@@ -40,17 +41,20 @@ pub(crate) struct TenantRow {
     pub launch_template_id: Option<String>,
     pub subnet_ids: Option<String>,
     pub max_runners: u32,
+    pub beta: u8,
 }
 
 pub(crate) const TENANT_COLUMNS: &str = "tenants.id, tenants.org_id, tenants.org_login, \
     tenants.installation_id, tenants.role_arn, tenants.region, tenants.launch_template_id, \
-    tenants.subnet_ids, tenants.max_runners";
+    tenants.subnet_ids, tenants.max_runners, tenants.beta";
 
 /// The setup steps a tenant has done.
 #[derive(Debug, Serialize)]
+#[allow(clippy::struct_excessive_bools)] // One per step, as the app shows them.
 #[serde(rename_all = "camelCase")]
 struct Steps {
     organization: bool,
+    billing: bool,
     aws: bool,
     app: bool,
 }
@@ -64,6 +68,7 @@ struct TenantView {
     installation_id: Option<u64>,
     aws: Option<AwsView>,
     max_runners: u32,
+    billing: Billing,
     steps: Steps,
     install_url: String,
 }
@@ -89,7 +94,8 @@ fn avatar(org_id: u64) -> String {
     format!("https://avatars.githubusercontent.com/u/{org_id}?v=4")
 }
 
-fn view(ctx: &Ctx<'_>, row: TenantRow) -> TenantView {
+async fn view(ctx: &Ctx<'_>, row: TenantRow) -> worker::Result<TenantView> {
+    let billing = billing(ctx.db, &row.id, row.beta == 1).await?;
     let aws = match (
         row.role_arn,
         row.region,
@@ -109,7 +115,7 @@ fn view(ctx: &Ctx<'_>, row: TenantRow) -> TenantView {
         }),
         _ => None,
     };
-    TenantView {
+    Ok(TenantView {
         install_url: github::install_url(
             &ctx.config.github_web,
             &ctx.config.app_slug,
@@ -117,6 +123,7 @@ fn view(ctx: &Ctx<'_>, row: TenantRow) -> TenantView {
         ),
         steps: Steps {
             organization: true,
+            billing: billing.licensed,
             aws: aws.is_some(),
             app: row.installation_id.is_some(),
         },
@@ -129,7 +136,8 @@ fn view(ctx: &Ctx<'_>, row: TenantRow) -> TenantView {
         installation_id: row.installation_id,
         aws,
         max_runners: row.max_runners,
-    }
+        billing,
+    })
 }
 
 /// The user's membership of `org` on GitHub, if they own it.
@@ -349,8 +357,12 @@ pub(crate) async fn mine(ctx: &Ctx<'_>) -> Answer {
 
 /// `GET /api/tenants/<org>`
 pub(crate) async fn show(ctx: &Ctx<'_>, org: &str) -> Answer {
-    let row = authorize(ctx, org).await?;
-    Ok(Response::from_json(&view(ctx, row))?)
+    let mut row = authorize(ctx, org).await?;
+    if row.beta == 0 {
+        join_listed_beta(ctx.db, &row.id).await?;
+        row = authorize(ctx, org).await?;
+    }
+    Ok(Response::from_json(&view(ctx, row).await?)?)
 }
 
 #[derive(Debug, Deserialize)]
