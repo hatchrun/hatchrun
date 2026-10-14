@@ -1,3 +1,7 @@
+# Private keys never belong in the repository.
+*.pem
+*.key
+
 /target
 /dist
 /crates/broker/build
