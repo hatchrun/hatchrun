@@ -1262,6 +1262,13 @@ table.jobs {
   color: var(--danger);
 }
 
+.job-note {
+  max-width: 22rem;
+  margin-top: 0.2rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
 /* Settings */
 
 .settings {

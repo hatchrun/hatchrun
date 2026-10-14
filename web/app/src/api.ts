@@ -197,6 +197,15 @@ export interface Job {
   runnerName: string | null;
   instanceId: string | null;
   launchError: string | null;
+  /** Launches started for the job. */
+  launchAttempts: number;
+  /**
+   * After a failed launch: "backoff" when it launches again at nextLaunchAt,
+   * "setup" when it waits for the organization's setup to change.
+   */
+  launchRetry: "backoff" | "setup" | null;
+  /** Unix milliseconds. */
+  nextLaunchAt: number | null;
   /** Unix milliseconds. */
   queuedAt: number;
   updatedAt: number;

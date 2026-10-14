@@ -27,7 +27,10 @@
 //!
 //! The config is stored only once the instance exists, as the scaler
 //! does. When a step after registration fails, the runner is removed and
-//! a started instance terminated, and the job is marked `failed`.
+//! a started instance terminated, and the job is marked `failed` with
+//! what the reconciler does about it (see [`crate::reconcile::retry`]):
+//! launch it again after a wait, or once an owner changes the setup,
+//! which calls [`recheck`].
 
 use std::fmt::Write;
 use std::time::Duration;
@@ -40,6 +43,7 @@ use crate::fetch::send;
 use crate::http::Request;
 use crate::instance::{Choice, Limits};
 use crate::profiles::{self, store};
+use crate::reconcile::retry::{Cause, Failure};
 use crate::webhook::QueuedJob;
 use crate::{DB, github, instance, int, jwt, now_ms, oidc, settings, webcrypto};
 
@@ -172,7 +176,7 @@ async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
             tenant
         }
         other => {
-            let reason = match other {
+            let message = match other {
                 Some(tenant) if tenant.licensed == 1 => format!(
                     "tenant {} does not allow runners in {}",
                     tenant.id, tenant.region
@@ -186,20 +190,27 @@ async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
                     job.installation_id
                 ),
             };
+            let (wait, _) = Failure::new(Cause::Tenant, message.as_str()).outcome(0, now_ms());
             db.prepare(
-                "UPDATE jobs SET launch_state = 'failed', launch_error = ?2, updated_at = ?3 \
+                "UPDATE jobs SET launch_state = 'failed', launch_error = ?2, updated_at = ?3, \
+                 launch_retry = ?4, next_launch_at = NULL \
                  WHERE id = ?1 AND launch_state IS NULL",
             )
-            .bind(&[int(job.id)?, reason.as_str().into(), int(now_ms())?])?
+            .bind(&[
+                int(job.id)?,
+                message.as_str().into(),
+                int(now_ms())?,
+                wait.as_str().into(),
+            ])?
             .run()
             .await?;
-            console_warn!("job {}: {reason}", job.id);
+            console_warn!("job {}: {message}", job.id);
             return Ok(());
         }
     };
 
     let name = runner_name(job.id, &webcrypto::random_bytes(4)?);
-    if !claim(&db, job, &tenant, &name).await? {
+    let Some(attempts) = claim(&db, job, &tenant, &name).await? else {
         console_log!(
             "job {}: not launching, already taken or tenant {} at {} runners",
             job.id,
@@ -207,31 +218,78 @@ async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
             tenant.max_runners
         );
         return Ok(());
-    }
+    };
 
-    let (state, instance_id, error) = match launch_claimed(env, &db, job, &tenant, &name).await {
+    let launched = launch_claimed(env, &db, job, &tenant, &name).await;
+    record(&db, job.id, &name, attempts, launched).await
+}
+
+/// Records how the job's `attempts`th launch, of runner `name`, ended.
+async fn record(
+    db: &D1Database,
+    job_id: u64,
+    name: &str,
+    attempts: u32,
+    launched: std::result::Result<String, Failure>,
+) -> Result<()> {
+    let now = now_ms();
+    let (state, instance_id, error, wait, next) = match launched {
         Ok(instance_id) => {
-            console_log!("job {}: runner {name} on {instance_id}", job.id);
-            ("launched", Some(instance_id), None)
+            console_log!("job {job_id}: runner {name} on {instance_id}");
+            ("launched", Some(instance_id), None, None, None)
         }
-        Err(err) => {
-            console_error!("job {}: launch failed: {err}", job.id);
-            ("failed", None, Some(err))
+        Err(failure) => {
+            let (wait, next) = failure.outcome(attempts, now);
+            match next {
+                Some(at) => console_error!(
+                    "job {job_id}: launch {attempts} failed, trying again in {} s: {failure}",
+                    at.saturating_sub(now) / 1000
+                ),
+                None => console_error!(
+                    "job {job_id}: launch {attempts} failed, waiting for the setup to change: \
+                     {failure}"
+                ),
+            }
+            ("failed", None, Some(failure.message), Some(wait), next)
         }
     };
     db.prepare(
-        "UPDATE jobs SET launch_state = ?2, instance_id = ?3, launch_error = ?4, updated_at = ?5 \
-         WHERE id = ?1",
+        "UPDATE jobs SET launch_state = ?2, instance_id = ?3, launch_error = ?4, updated_at = ?5, \
+         launch_retry = ?6, next_launch_at = ?7 WHERE id = ?1",
     )
     .bind(&[
-        int(job.id)?,
+        int(job_id)?,
         state.into(),
         nullable(instance_id),
         nullable(error),
-        int(now_ms())?,
+        int(now)?,
+        nullable(wait.map(|wait| wait.as_str().to_owned())),
+        next.map_or(Ok(wasm_bindgen::JsValue::NULL), int)?,
     ])?
     .run()
     .await?;
+    Ok(())
+}
+
+/// Puts the tenant's queued jobs that wait for a change to its setup
+/// back in line, for the reconciler to launch within a minute. Called
+/// when an owner verifies the role, edits a profile, changes the
+/// settings or gains a licence.
+pub(crate) async fn recheck(db: &D1Database, tenant_id: &str) -> Result<()> {
+    let result = db
+        .prepare(
+            "UPDATE jobs SET launch_state = NULL, launch_retry = NULL, next_launch_at = NULL, \
+             updated_at = ?2 \
+             WHERE installation_id = (SELECT installation_id FROM tenants WHERE id = ?1) \
+             AND status = 'queued' AND launch_state = 'failed' AND launch_retry = 'setup'",
+        )
+        .bind(&[tenant_id.into(), int(now_ms())?])?
+        .run()
+        .await?;
+    let changed = result.meta()?.and_then(|meta| meta.changes).unwrap_or(0);
+    if changed > 0 {
+        console_log!("tenant {tenant_id}: setup changed, launching {changed} waiting jobs again");
+    }
     Ok(())
 }
 
@@ -246,16 +304,29 @@ fn runner_name(job_id: u64, random: &[u8]) -> String {
 }
 
 /// Moves the job to `launching` if it is queued, nobody took it, and the
-/// tenant has room. D1 runs one statement at a time, so two deliveries of
-/// one job cannot both take it.
-async fn claim(db: &D1Database, job: &QueuedJob, tenant: &Tenant, name: &str) -> Result<bool> {
-    let result = db
+/// tenant has room, and counts the attempt. D1 runs one statement at a
+/// time, so two deliveries of one job cannot both take it. Returns the
+/// job's launch attempts so far, this one included, or `None` when it
+/// was not taken.
+async fn claim(
+    db: &D1Database,
+    job: &QueuedJob,
+    tenant: &Tenant,
+    name: &str,
+) -> Result<Option<u32>> {
+    #[derive(Deserialize)]
+    struct Claimed {
+        launch_attempts: u32,
+    }
+    let claimed: Option<Claimed> = db
         .prepare(
-            "UPDATE jobs SET launch_state = 'launching', runner_name = ?2, updated_at = ?3 \
+            "UPDATE jobs SET launch_state = 'launching', runner_name = ?2, updated_at = ?3, \
+             launch_attempts = launch_attempts + 1 \
              WHERE id = ?1 AND launch_state IS NULL AND status = 'queued' \
              AND (SELECT COUNT(*) FROM jobs \
                   WHERE installation_id = ?4 AND status <> 'completed' \
-                  AND launch_state IN ('launching', 'launched')) < ?5",
+                  AND launch_state IN ('launching', 'launched')) < ?5 \
+             RETURNING launch_attempts",
         )
         .bind(&[
             int(job.id)?,
@@ -264,9 +335,9 @@ async fn claim(db: &D1Database, job: &QueuedJob, tenant: &Tenant, name: &str) ->
             int(job.installation_id)?,
             tenant.max_runners.into(),
         ])?
-        .run()
+        .first(None)
         .await?;
-    Ok(result.meta()?.and_then(|meta| meta.changes) == Some(1))
+    Ok(claimed.map(|claimed| claimed.launch_attempts))
 }
 
 /// Everything after the claim. Returns the instance id.
@@ -276,41 +347,46 @@ async fn launch_claimed(
     job: &QueuedJob,
     tenant: &Tenant,
     name: &str,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<String, Failure> {
     let custom = store::named(db, &tenant.id, &job.spec.profile)
         .await
-        .map_err(text)?;
-    let profile = profiles::resolve(&job.spec, custom)?;
+        .map_err(internal)?;
+    let profile =
+        profiles::resolve(&job.spec, custom).map_err(|err| Failure::new(Cause::NoProfile, err))?;
     let limits = Limits::from_columns(
         tenant.instance_types.as_deref(),
         tenant.volume_size_limit,
         tenant.root_volume_size,
     );
-    let choice = instance::choose(&profile, &tenant.region, &limits)?;
-    let settings = Settings::read(env)?;
+    let choice = instance::choose(&profile, &tenant.region, &limits)
+        .map_err(|err| Failure::new(Cause::NoInstanceType, err))?;
+    let settings = Settings::read(env).map_err(|err| Failure::new(Cause::Settings, err))?;
     let arch = choice.arch.as_str();
     let image: Image = db
         .prepare("SELECT image_id, root_device FROM images WHERE region = ?1 AND arch = ?2")
         .bind(&[tenant.region.as_str().into(), arch.into()])
-        .map_err(text)?
+        .map_err(internal)?
         .first(None)
         .await
-        .map_err(text)?
-        .ok_or_else(|| format!("no {arch} image in {}", tenant.region))?;
+        .map_err(internal)?
+        .ok_or_else(|| {
+            Failure::new(
+                Cause::NoImage,
+                format!("no {arch} image in {}", tenant.region),
+            )
+        })?;
 
     let credentials = assume_role(&settings, job, tenant).await?;
     let org = github::owner(&job.repository);
     let token = installation_token(&settings, job.installation_id).await?;
     let config = github::jit_config(
-        &send(&github::generate_jit_config(
-            &settings.github_api,
-            org,
-            &token,
-            name,
-            &job.label,
-        ))
+        &github_send(
+            &github::generate_jit_config(&settings.github_api, org, &token, name, &job.label),
+            "register runner",
+        )
         .await?,
-    )?;
+    )
+    .map_err(|err| Failure::new(Cause::Internal, err))?;
 
     let result = start(
         &settings,
@@ -355,8 +431,8 @@ async fn start(
     image: &Image,
     credentials: &Credentials,
     config: &str,
-) -> std::result::Result<String, String> {
-    let ticket = jwt::b64url(webcrypto::random_bytes(32).map_err(text)?);
+) -> std::result::Result<String, Failure> {
+    let ticket = jwt::b64url(webcrypto::random_bytes(32).map_err(internal)?);
     let user_data =
         serde_json::json!({ "broker": settings.broker_url, "ticket": ticket }).to_string();
     let job_id = job.id.to_string();
@@ -403,8 +479,12 @@ async fn start(
                 .map(|size| (image.root_device.as_str(), size)),
         }
         .request(&endpoint);
-        aws::sign_v4(&mut request, credentials, &tenant.region, "ec2", now_ms())?;
-        match ec2::instance_id(&send(&request).await?) {
+        aws::sign_v4(&mut request, credentials, &tenant.region, "ec2", now_ms())
+            .map_err(|err| Failure::new(Cause::Internal, err))?;
+        let response = send(&request)
+            .await
+            .map_err(|err| Failure::new(Cause::Unreachable, err))?;
+        match ec2::instance_id(&response) {
             Ok(id) => {
                 instance_id = Some(id);
                 break;
@@ -418,44 +498,56 @@ async fn start(
                 );
                 last_error = Some(err);
             }
-            Err(err) => return Err(format!("RunInstances {instance_type}: {err}")),
+            Err(err) => {
+                return Err(Failure::new(
+                    Cause::Aws(err.code.clone()),
+                    format!("RunInstances {instance_type}: {err}"),
+                ));
+            }
         }
     }
     let Some(instance_id) = instance_id else {
         return Err(match last_error {
-            Some(err) => format!(
-                "no capacity for {} in any subnet: {err}",
-                choice.instance_types.join(", ")
+            Some(err) => Failure::new(
+                Cause::NoCapacity,
+                format!(
+                    "no capacity for {} in any subnet: {err}",
+                    choice.instance_types.join(", ")
+                ),
             ),
-            None => "no subnet to launch in".to_owned(),
+            None => Failure::new(Cause::Internal, "no subnet to launch in"),
         });
     };
 
     if let Err(err) = store_config(settings, &ticket, config).await {
         // Without its config the instance would wait out the agent's
         // timeout before powering off.
-        let mut request = ec2::terminate_instances(&endpoint, &instance_id);
-        let terminated =
-            match aws::sign_v4(&mut request, credentials, &tenant.region, "ec2", now_ms()) {
-                Ok(()) => match send(&request).await {
-                    Ok(response) => ec2::terminated(&response).map_err(|err| err.to_string()),
-                    Err(err) => Err(err),
-                },
-                Err(err) => Err(err),
-            };
-        if let Err(terminate_err) = terminated {
-            console_warn!("terminate {instance_id}: {terminate_err}");
-        }
+        terminate(&endpoint, credentials, &tenant.region, &instance_id).await;
         return Err(err);
     }
     Ok(instance_id)
+}
+
+/// Terminates an instance that will not run, logging a failure.
+async fn terminate(endpoint: &str, credentials: &Credentials, region: &str, instance_id: &str) {
+    let mut request = ec2::terminate_instances(endpoint, instance_id);
+    let terminated = match aws::sign_v4(&mut request, credentials, region, "ec2", now_ms()) {
+        Ok(()) => match send(&request).await {
+            Ok(response) => ec2::terminated(&response).map_err(|err| err.to_string()),
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    if let Err(err) = terminated {
+        console_warn!("terminate {instance_id}: {err}");
+    }
 }
 
 async fn assume_role(
     settings: &Settings,
     job: &QueuedJob,
     tenant: &Tenant,
-) -> std::result::Result<Credentials, String> {
+) -> std::result::Result<Credentials, Failure> {
     tenant_credentials(
         &settings.oidc_key,
         &settings.oidc_kid,
@@ -466,7 +558,12 @@ async fn assume_role(
         &format!("hatchrun-job-{}", job.id),
     )
     .await
-    .map_err(|err| format!("AssumeRoleWithWebIdentity {}: {err}", tenant.role_arn))
+    .map_err(|err| {
+        Failure::new(
+            Cause::Aws(err.code.clone()),
+            format!("AssumeRoleWithWebIdentity {}: {err}", tenant.role_arn),
+        )
+    })
 }
 
 /// Credentials of `role_arn` in `region`, for a token that names
@@ -510,10 +607,34 @@ pub(crate) async fn tenant_credentials(
 async fn installation_token(
     settings: &Settings,
     installation_id: u64,
-) -> std::result::Result<String, String> {
-    let app_jwt = app_jwt(&settings.app_id, &settings.app_key).await?;
+) -> std::result::Result<String, Failure> {
+    let app_jwt = app_jwt(&settings.app_id, &settings.app_key)
+        .await
+        .map_err(|err| Failure::new(Cause::Settings, err))?;
     let request = github::installation_token(&settings.github_api, installation_id, &app_jwt);
-    github::token(&send(&request).await?)
+    github::token(&github_send(&request, "installation token").await?)
+        .map_err(|err| Failure::new(Cause::Internal, err))
+}
+
+/// Sends a request to GitHub; an error answer fails on its status.
+async fn github_send(
+    request: &Request,
+    what: &str,
+) -> std::result::Result<crate::http::Response, Failure> {
+    let response = send(request)
+        .await
+        .map_err(|err| Failure::new(Cause::Unreachable, err))?;
+    if !response.ok() {
+        return Err(Failure::new(
+            Cause::GitHub(response.status),
+            format!(
+                "{what}: GitHub answered {}: {}",
+                response.status,
+                response.text()
+            ),
+        ));
+    }
+    Ok(response)
 }
 
 /// The App's JWT, signed with its private key in PKCS#8 DER.
@@ -530,7 +651,7 @@ async fn store_config(
     settings: &Settings,
     ticket: &str,
     config: &str,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), Failure> {
     let request = Request::new(
         "PUT",
         format!("{}/v1/tickets/{ticket}", settings.broker_url),
@@ -546,10 +667,13 @@ async fn store_config(
                 last = format!("broker answered {}", response.status);
             }
             Ok(response) => {
-                return Err(format!(
-                    "store runner config: broker answered {}: {}",
-                    response.status,
-                    response.text()
+                return Err(Failure::new(
+                    Cause::Broker,
+                    format!(
+                        "store runner config: broker answered {}: {}",
+                        response.status,
+                        response.text()
+                    ),
                 ));
             }
             Err(err) => last = err,
@@ -558,7 +682,10 @@ async fn store_config(
             worker::Delay::from(Duration::from_secs(u64::from(attempt))).await;
         }
     }
-    Err(format!("store runner config: {last}"))
+    Err(Failure::new(
+        Cause::Broker,
+        format!("store runner config: {last}"),
+    ))
 }
 
 /// D1 takes `null` for SQL NULL and refuses `undefined`, which is what
@@ -568,8 +695,8 @@ fn nullable(value: Option<String>) -> wasm_bindgen::JsValue {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn text(err: worker::Error) -> String {
-    err.to_string()
+fn internal(err: worker::Error) -> Failure {
+    Failure::new(Cause::Internal, err.to_string())
 }
 
 #[cfg(test)]

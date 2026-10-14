@@ -27,6 +27,7 @@ use super::tenants::{TenantRow, authorize};
 use super::{Answer, Ctx, Failure};
 use crate::catalog::{self, Family};
 use crate::instance::{self, Limits, size_name};
+use crate::launch;
 use crate::profiles::{self, IMAGES, PROFILES_MAX, Profile, Source, built_in, store};
 
 /// Where prices come from before AWS is connected.
@@ -259,6 +260,7 @@ async fn create(ctx: &Ctx<'_>, org: &str, profile: Profile) -> Answer {
         return Err(refused(format!("At most {PROFILES_MAX} profiles")));
     }
     store::save(ctx.db, &row.id, &profile).await?;
+    launch::recheck(ctx.db, &row.id).await?;
     listing(ctx, &row).await
 }
 
@@ -291,6 +293,7 @@ async fn replace(ctx: &Ctx<'_>, org: &str, name: &str, profile: Profile) -> Answ
     if profile.name != name {
         store::delete(ctx.db, &row.id, name).await?;
     }
+    launch::recheck(ctx.db, &row.id).await?;
     listing(ctx, &row).await
 }
 
@@ -307,5 +310,6 @@ async fn delete(ctx: &Ctx<'_>, org: &str, name: &str) -> Answer {
             },
         ));
     }
+    launch::recheck(ctx.db, &row.id).await?;
     listing(ctx, &row).await
 }
