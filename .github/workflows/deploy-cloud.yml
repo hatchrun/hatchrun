@@ -40,15 +40,19 @@ jobs:
           persist-credentials: false
 
       # worker-build is installed by the build command in wrangler.toml;
-      # caching ~/.cargo/bin saves compiling it on every deploy.
+      # caching it saves compiling it on every deploy. cargo install needs
+      # its own record of the install too, or it refuses to overwrite the
+      # binary it finds.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/worker-build
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: deploy-cloud-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          key: deploy-cloud-v2-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
 
       # rustup installs the toolchain pinned in rust-toolchain.toml.
       - run: rustup show active-toolchain
