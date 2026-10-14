@@ -25,7 +25,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  WRANGLER: wrangler@4.143.0
+  WRANGLER: wrangler@4.145.0
 
 jobs:
   deploy:

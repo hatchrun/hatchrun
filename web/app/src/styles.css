@@ -1391,6 +1391,40 @@ table.jobs {
   text-decoration: underline;
 }
 
+/* Job page */
+
+.stats-wide {
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+}
+
+.chart {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.chart-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.chart-axis {
+  fill: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-band {
+  fill: var(--accent-soft);
+}
+
+.chart-line {
+  fill: none;
+  stroke: var(--accent-strong);
+  stroke-width: 2;
+  stroke-linejoin: round;
+}
+
 .job-error {
   max-width: 22rem;
   margin-top: 0.3rem;

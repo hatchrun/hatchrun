@@ -244,6 +244,53 @@ export interface JobPage {
 
 export const listJobs = (org: string, before?: number) =>
   get<JobPage>(`${tenantPath(org)}/jobs${before ? `?before=${before}` : ""}`);
+/** Ten seconds of a runner's samples, as the agent summed them up. */
+export interface MetricsWindow {
+  /** When the window ended, Unix seconds. */
+  at: number;
+  seconds: number;
+  /** Busy CPU across all cores, percent: lowest and highest second, and the mean. */
+  cpuMin: number;
+  cpuAvg: number;
+  cpuMax: number;
+  cpuSteal: number;
+  /** Bytes. */
+  memMax: number;
+  memTotal: number;
+  cgroupPeak: number;
+  oomKills: number;
+  diskUsed: number;
+  netRx: number;
+  netTx: number;
+}
+
+/** A job's windows together; maxima are approximate when the data is sampled. */
+export interface MetricsSummary {
+  seconds: number | null;
+  cpuAvg: number | null;
+  cpuMax: number | null;
+  cpuSteal: number | null;
+  memMax: number | null;
+  memTotal: number | null;
+  cgroupPeak: number | null;
+  oomKills: number | null;
+  diskUsed: number | null;
+  netRx: number | null;
+  netTx: number | null;
+}
+
+export interface JobMetrics {
+  /** The job on GitHub, with its logs. */
+  githubUrl: string;
+  job: Pick<Job, "id" | "repository" | "runId" | "label" | "status" | "runnerName" | "instanceId" | "queuedAt" | "updatedAt">;
+  /** null when the runner reported nothing. */
+  summary: MetricsSummary | null;
+  /** Oldest first. */
+  windows: MetricsWindow[];
+}
+
+export const getJobMetrics = (org: string, id: string) =>
+  get<JobMetrics>(`${tenantPath(org)}/jobs/${encodeURIComponent(id)}/metrics`);
 export const saveSettings = (org: string, maxRunners: number, allowedRegions: string[] | null) =>
   put<Tenant>(`${tenantPath(org)}/settings`, { maxRunners, allowedRegions });
 
