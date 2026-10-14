@@ -15,6 +15,9 @@
 //!   saves the organization's own version.
 //! - `DELETE /api/tenants/<org>/runners/<name>` removes the
 //!   organization's profile; a built-in it replaced comes back.
+//! - `GET /api/tenants/<org>/runners/instance-types` lists the instance
+//!   type catalog of the tenant's region (see [`crate::instance_types`]),
+//!   with when it was refreshed.
 //!
 //! Changes answer with the new listing. A profile the connect stack
 //! cannot launch is refused once AWS is connected; before that only the
@@ -180,6 +183,24 @@ async fn listing(ctx: &Ctx<'_>, row: &TenantRow) -> Answer {
     }))?)
 }
 
+/// `GET /api/tenants/<org>/runners/instance-types`
+async fn instance_types(ctx: &Ctx<'_>, org: &str) -> Answer {
+    let row = authorize(ctx, org).await?;
+    let Some(region) = row.region.as_deref() else {
+        return Ok(Response::from_json(&serde_json::json!({
+            "region": null, "refreshedAt": null, "error": null, "types": [],
+        }))?);
+    };
+    let (refreshed_at, error) = crate::instance_types::store::refreshed(ctx.db, region).await?;
+    let types = crate::instance_types::store::region(ctx.db, region).await?;
+    Ok(Response::from_json(&serde_json::json!({
+        "region": region,
+        "refreshedAt": refreshed_at,
+        "error": error,
+        "types": types,
+    }))?)
+}
+
 /// Answers `/api/tenants/<org>/runners` and what is under it; `rest`
 /// is the path after `runners`.
 pub(crate) async fn route(
@@ -191,6 +212,7 @@ pub(crate) async fn route(
 ) -> Answer {
     match (method, rest) {
         (Method::Get, []) => list(ctx, org).await,
+        (Method::Get, ["instance-types"]) => instance_types(ctx, org).await,
         (Method::Post, []) => create(ctx, org, req.json().await?).await,
         (Method::Post, ["preview"]) => preview(ctx, org, req.json().await?).await,
         (Method::Put, [name]) => replace(ctx, org, name, req.json().await?).await,

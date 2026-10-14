@@ -8,6 +8,7 @@
 //! [`crate::http::Request`]s, signed with `SigV4` by `aws-sigv4`, and the
 //! XML answers are read with `roxmltree`. Nothing here sends anything.
 
+pub mod describe;
 pub mod ec2;
 pub mod instances;
 pub mod sts;

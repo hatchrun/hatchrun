@@ -21,6 +21,7 @@ aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "al
 aws-credential-types = { version = "1.3.0", default-features = false }
 aws-sigv4 = { version = "1.6.0", default-features = false, features = ["sign-http", "http1"] }
 base64 = "0.23.1"
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 hmac = "0.13.0"
 js-sys = "0.3.106"
