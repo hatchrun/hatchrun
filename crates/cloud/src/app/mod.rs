@@ -21,13 +21,16 @@
 //!   [`runners`]).
 //! - `/api/plan`, `/api/tenants/<org>/{checkout,portal,beta}` and
 //!   `/api/polar/webhook` handle the licence (see [`billing`]).
+//! - `POST /api/internal/images` takes runner image releases from the
+//!   images build (see [`images`]).
 //!
-//! Everything but sign-in needs a session, and everything but `GET`
-//! needs the session's CSRF token.
+//! Everything but sign-in, the webhooks and image releases needs a
+//! session, and everything but `GET` needs the session's CSRF token.
 
 mod aws;
 mod billing;
 mod dashboard;
+mod images;
 mod runners;
 mod tenants;
 
@@ -201,6 +204,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             return Ok(response);
         }
         (Method::Post, "/api/polar/webhook") => return billing::webhook(req, &env).await,
+        (Method::Post, crate::images::PATH) => return images::post(req, &env).await,
         _ => {}
     }
 

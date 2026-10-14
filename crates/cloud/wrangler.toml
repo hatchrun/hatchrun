@@ -43,8 +43,9 @@ migrations_dir = "migrations"
 # POLAR_ACCESS_TOKEN and POLAR_WEBHOOK_SECRET (billing),
 # OIDC_SIGNING_KEY (RSA private key in PEM) and BROKER_TOKEN, plus
 # OIDC_NEXT_SIGNING_KEY and OIDC_PREVIOUS_SIGNING_KEY while a key is
-# rotated. Variables: those below. GITHUB_API_URL, GITHUB_WEB_URL and
-# AWS_ENDPOINT_URL point the Worker at local stubs under wrangler dev.
+# rotated. Variables: those below. GITHUB_API_URL, GITHUB_WEB_URL,
+# AWS_ENDPOINT_URL and ACTIONS_OIDC_ISSUER point the Worker at local
+# stubs under wrangler dev.
 [vars]
 # The app's origin. Sign-in sends GitHub users back to
 # $APP_URL/api/auth/callback, which the App lists as its callback URL.
