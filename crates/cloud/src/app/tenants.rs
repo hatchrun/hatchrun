@@ -36,7 +36,7 @@ use crate::fetch::send;
 use crate::github::{self, Installation, Membership};
 use crate::install::{self, Refusal};
 use crate::launch::{APP_KEY, app_jwt};
-use crate::{int, jwt, now_ms, session, settings, tenant, webcrypto};
+use crate::{connect, int, jwt, now_ms, session, settings, tenant, webcrypto};
 
 /// A tenant row.
 #[derive(Debug, Deserialize)]
@@ -56,13 +56,15 @@ pub(crate) struct TenantRow {
     pub excluded_instance_types: Option<String>,
     pub volume_size_limit: Option<u16>,
     pub root_volume_size: Option<u16>,
+    pub template_version: Option<u32>,
+    pub stack_checked_at: Option<u64>,
 }
 
 pub(crate) const TENANT_COLUMNS: &str = "tenants.id, tenants.org_id, tenants.org_login, \
     tenants.installation_id, tenants.role_arn, tenants.region, tenants.launch_template_id, \
     tenants.subnet_ids, tenants.max_runners, tenants.beta, tenants.allowed_regions, \
     tenants.instance_types, tenants.excluded_instance_types, tenants.volume_size_limit, \
-    tenants.root_volume_size";
+    tenants.root_volume_size, tenants.template_version, tenants.stack_checked_at";
 
 /// The setup steps a tenant has done.
 #[derive(Debug, Serialize)]
@@ -106,6 +108,32 @@ struct AwsView {
     region: String,
     launch_template_id: String,
     subnet_ids: Vec<String>,
+    stack: StackView,
+}
+
+/// The connect stack's version and, when it is older than this
+/// release's, how to update it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StackView {
+    /// The stack's version; 1 for a stack from before the version tag.
+    version: u32,
+    /// This release's version.
+    latest: u32,
+    /// When the stack was last read, Unix milliseconds.
+    checked_at: Option<u64>,
+    /// What the newer versions bring, oldest first; empty when current.
+    changes: Vec<&'static str>,
+    /// Whether the stack still limits instance types with the old
+    /// family list, which an update keeps unless told otherwise.
+    family_list: bool,
+    /// The console page of the stack in its region.
+    console_url: String,
+    /// The template to update to, when the Worker knows it.
+    template_url: Option<String>,
+    /// An AWS CLI command that updates the stack, moving a family list
+    /// to the size cap.
+    update_command: Option<String>,
 }
 
 fn install_url(ctx: &Ctx<'_>) -> String {
@@ -129,6 +157,13 @@ async fn view(ctx: &Ctx<'_>, row: TenantRow) -> worker::Result<TenantView> {
         row.subnet_ids,
     ) {
         (Some(role_arn), Some(region), Some(launch_template_id), Some(subnets)) => Some(AwsView {
+            stack: stack_view(
+                ctx,
+                &region,
+                row.template_version,
+                row.instance_types.as_deref(),
+                row.stack_checked_at,
+            ),
             role_arn,
             region,
             launch_template_id,
@@ -160,6 +195,31 @@ async fn view(ctx: &Ctx<'_>, row: TenantRow) -> worker::Result<TenantView> {
         allowed_regions: settings::regions(row.allowed_regions.as_deref()),
         billing,
     })
+}
+
+fn stack_view(
+    ctx: &Ctx<'_>,
+    region: &str,
+    template_version: Option<u32>,
+    instance_types: Option<&str>,
+    checked_at: Option<u64>,
+) -> StackView {
+    let template_url = super::get(ctx.env, super::aws::TEMPLATE_URL);
+    let family_list = instance_types.is_none_or(|types| types == connect::FAMILY_LIST_DEFAULT);
+    let changes = connect::changes_since(template_version);
+    StackView {
+        version: template_version.unwrap_or(1),
+        latest: connect::TEMPLATE_VERSION,
+        checked_at,
+        console_url: connect::stack_console_url(region),
+        update_command: template_url
+            .as_deref()
+            .filter(|_| !changes.is_empty() || family_list)
+            .map(|url| connect::update_command(region, url, family_list)),
+        changes,
+        family_list,
+        template_url,
+    }
 }
 
 /// The user's membership of `org` on GitHub, if they own it.

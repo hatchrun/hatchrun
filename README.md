@@ -288,6 +288,17 @@ role with a token for the tenant, finds the stack's launch template by
 its `hatchrun:tenant` tag and the subnets on its `hatchrun:subnets`
 tag, checks they exist, and only then saves them.
 
+Published stacks do not change when `connect.yaml` does. The template
+tags its launch template with `hatchrun:template-version`; a change to
+the template bumps that tag and `TEMPLATE_VERSION` in
+[`connect.rs`](crates/cloud/src/connect.rs) together (a test fails
+otherwise) and adds what the version brings to `CHANGES`. The
+dashboard of a tenant on an older stack, or one still limited by the
+old family list, says what an update brings and how to apply it in the
+console or with the AWS CLI. The reconciler reads each tenant's launch
+template again once a day, so an updated stack is picked up without
+anyone verifying the role again, and jobs waiting on the setup launch.
+
 [`publish-template.yml`](.github/workflows/publish-template.yml)
 renders `connect.yaml` with the image owner account and uploads it on
 every change merged to main. It needs, once, the bucket and role from

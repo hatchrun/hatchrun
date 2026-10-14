@@ -4,7 +4,7 @@
 
 import { useEffect, useState } from "react";
 
-import { listJobs, type Job, type JobPage, type Tenant } from "../api";
+import { listJobs, type Job, type JobPage, type Stack, type Tenant } from "../api";
 import { CopyButton } from "../components/CopyButton";
 import { LoadError, Spinner } from "../components/Status";
 import { Link, useQuery } from "../router";
@@ -62,6 +62,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
           The hatchrun App is installed. {org} is ready to run jobs.
         </p>
       )}
+      {tenant.aws && <StackUpdate stack={tenant.aws.stack} region={tenant.aws.region} />}
       <div className="dashboard-grid">
         <section className="card panel">
           <h2>Run a job on hatchrun</h2>
@@ -153,6 +154,75 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
         )}
       </section>
     </div>
+  );
+}
+
+/** Asks the owner to update an older connect stack, and says how. */
+function StackUpdate({ stack, region }: { stack: Stack; region: string }) {
+  if (stack.changes.length === 0 && !stack.familyList) {
+    return null;
+  }
+  const outdated = stack.changes.length > 0;
+  return (
+    <section className="notice notice-accent stack-update" aria-labelledby="stack-update-title">
+      <h2 id="stack-update-title" className="stack-update-title">
+        {outdated ? "Connect stack update available" : "Your connect stack still names instance families"}
+      </h2>
+      {outdated ? (
+        <>
+          <p>
+            Your <code>hatchrun</code> stack in {region} is version {stack.version}; the latest is {stack.latest}.
+            Until you update it, runners launch the way they did before.
+          </p>
+          <ul className="stack-changes">
+            {stack.changes.map((change) => (
+              <li key={change}>{change}</li>
+            ))}
+          </ul>
+        </>
+      ) : (
+        <p>
+          It allows only the families it lists, so instance types AWS adds stay off until you change
+          InstanceTypes. The current default allows any size up to 8xlarge instead.
+        </p>
+      )}
+      <ol className="stack-steps">
+        <li>
+          Open the <a href={stack.consoleUrl}>hatchrun stack in the CloudFormation console</a> and choose
+          Update, then Replace existing template.
+        </li>
+        <li>
+          Choose Amazon S3 URL and paste{" "}
+          {stack.templateUrl ? <code className="break">{stack.templateUrl}</code> : "the template URL"}
+          {stack.templateUrl && <CopyButton text={stack.templateUrl} label="Copy URL" />}
+        </li>
+        <li>
+          Keep the parameters as they are
+          {stack.familyList && (
+            <>
+              , except InstanceTypes: set it to <code>*.medium,*.large,*.xlarge,*.2xlarge,*.4xlarge,*.8xlarge</code>{" "}
+              to stop naming families
+            </>
+          )}
+          . Acknowledge that the stack changes IAM resources and submit.
+        </li>
+      </ol>
+      {stack.updateCommand && (
+        <details className="stack-cli">
+          <summary>Or with the AWS CLI</summary>
+          <div className="snippet">
+            <pre>
+              <code>{stack.updateCommand}</code>
+            </pre>
+            <CopyButton text={stack.updateCommand} />
+          </div>
+        </details>
+      )}
+      <p className="fine">
+        hatchrun reads the stack again once a day, so the update shows here by tomorrow, or at once
+        when you verify the role again under Settings.
+      </p>
+    </section>
   );
 }
 

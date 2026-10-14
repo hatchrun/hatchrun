@@ -13,7 +13,8 @@
 //!    and record the ones it finished (see [`sync`]);
 //! 3. per tenant with a verified role, describe its live instances,
 //!    terminate the ones nothing needs and launch queued jobs again
-//!    (see [`plan`]);
+//!    (see [`plan`]); once a day also read its stack's launch template
+//!    again (see [`crate::stack`]);
 //! 4. refresh the instance type catalog of one region that is due,
 //!    through a tenant role there (see [`crate::instance_types`]);
 //! 5. fail the lost launches of installations with no AWS connected,
@@ -132,6 +133,8 @@ struct Summary {
     gave_up: u32,
     /// Jobs launched again.
     launched: u32,
+    /// Tenants whose connect stack changed since it was last read.
+    stacks_changed: u32,
     /// Instance types in the region whose catalog was refreshed.
     catalog_types: u32,
     /// Lost launches of installations with no AWS connected, failed.
@@ -162,6 +165,7 @@ impl Summary {
         self.gave_up += other.gave_up;
         self.launched += other.launched;
         self.catalog_types += other.catalog_types;
+        self.stacks_changed += other.stacks_changed;
         self.unconnected += other.unconnected;
         self.sessions_deleted += other.sessions_deleted;
         self.jobs_deleted += other.jobs_deleted;
@@ -590,7 +594,8 @@ impl Pass<'_> {
         let tenants = self
             .db
             .prepare(format!(
-                "SELECT id, installation_id, role_arn, region, max_runners FROM tenants \
+                "SELECT id, installation_id, role_arn, region, max_runners, stack_checked_at \
+                 FROM tenants \
                  WHERE {VERIFIED} ORDER BY COALESCE(reconciled_at, 0), id LIMIT ?1"
             ))
             .bind(&[TENANTS_PER_PASS.into()])
@@ -665,6 +670,22 @@ impl Pass<'_> {
                 (None, None)
             }
         };
+        if let Some(credentials) = &credentials
+            && self
+                .now
+                .saturating_sub(tenant.stack_checked_at.unwrap_or(0))
+                > crate::stack::CHECK_EVERY
+            && self.spend(1)
+        {
+            match self.check_stack(tenant, credentials, &endpoint).await {
+                Ok(true) => done.stacks_changed += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    console_warn!("reconcile: tenant {}: stack: {err}", tenant.id);
+                    done.errors += 1;
+                }
+            }
+        }
         let jobs = self.tenant_jobs(tenant, instances.as_deref()).await?;
         let plan = plan::plan(
             self.now,
@@ -679,6 +700,47 @@ impl Pass<'_> {
         }
         self.update_jobs(tenant, &plan, done).await?;
         self.launch(tenant, &plan, done).await
+    }
+
+    /// Reads the tenant's launch template again and records what it
+    /// says. Returns whether it changed; a change puts jobs waiting for
+    /// the setup back in line.
+    async fn check_stack(
+        &self,
+        tenant: &Tenant,
+        credentials: &Credentials,
+        endpoint: &str,
+    ) -> Fallible<bool> {
+        let mut request = ec2::describe_launch_templates(endpoint, &tenant.id);
+        aws::sign_v4(&mut request, credentials, &tenant.region, "ec2", now_ms())?;
+        let templates = ec2::launch_templates(&send(&request).await?)
+            .map_err(|err| format!("DescribeLaunchTemplates: {err}"))?;
+        let Some(template) = crate::connect::newest(templates) else {
+            // Stamped all the same, so a deleted stack is not asked about
+            // every minute; launches say what is wrong.
+            self.db
+                .prepare("UPDATE tenants SET stack_checked_at = ?2 WHERE id = ?1")
+                .bind(&[tenant.id.as_str().into(), int(self.now).map_err(text)?])
+                .map_err(text)?
+                .run()
+                .await
+                .map_err(text)?;
+            return Err("no launch template tagged for the tenant".to_owned());
+        };
+        let changed = crate::stack::record(&self.db, &tenant.id, &template, self.now)
+            .await
+            .map_err(text)?;
+        if changed {
+            console_log!(
+                "reconcile: tenant {}: connect stack changed, template version {}",
+                tenant.id,
+                template
+                    .template_version
+                    .map_or_else(|| "1".to_owned(), |version| version.to_string())
+            );
+            launch::recheck(&self.db, &tenant.id).await.map_err(text)?;
+        }
+        Ok(changed)
     }
 
     /// The tenant role's credentials and its pending and running
@@ -1228,6 +1290,7 @@ struct Tenant {
     role_arn: String,
     region: String,
     max_runners: u32,
+    stack_checked_at: Option<u64>,
 }
 
 #[derive(Deserialize)]

@@ -10,7 +10,6 @@
 //!   the stack in that region and saves it.
 
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::JsValue;
 use worker::Response;
 
 use super::tenants::{authorize, show};
@@ -21,7 +20,7 @@ use crate::launch::{AWS_ENDPOINT_URL, tenant_credentials};
 use crate::{connect, int, jwt, now_ms, oidc, settings};
 
 /// Variable with the public URL of the rendered connect.yaml.
-const TEMPLATE_URL: &str = "CONNECT_TEMPLATE_URL";
+pub(crate) const TEMPLATE_URL: &str = "CONNECT_TEMPLATE_URL";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,7 +170,7 @@ pub(crate) async fn verify(ctx: &Ctx<'_>, org: &str, body: Connect) -> Answer {
     show(ctx, &row.org_login).await
 }
 
-/// Records the verified connection and the stack's limits.
+/// Records the verified connection and what the stack allows.
 async fn save(
     ctx: &Ctx<'_>,
     tenant: &str,
@@ -180,32 +179,16 @@ async fn save(
     template: &ec2::LaunchTemplate,
 ) -> worker::Result<()> {
     ctx.db
-        .prepare(
-            "UPDATE tenants SET role_arn = ?2, region = ?3, launch_template_id = ?4, \
-             subnet_ids = ?5, updated_at = ?6, instance_types = ?7, volume_size_limit = ?8, \
-             root_volume_size = ?9, fleet = ?10, excluded_instance_types = ?11 WHERE id = ?1",
-        )
+        .prepare("UPDATE tenants SET role_arn = ?2, region = ?3, updated_at = ?4 WHERE id = ?1")
         .bind(&[
             tenant.into(),
             role_arn.into(),
             region.into(),
-            template.id.as_str().into(),
-            template.subnets.join(",").into(),
             int(now_ms())?,
-            template
-                .instance_types
-                .as_deref()
-                .map_or(JsValue::NULL, Into::into),
-            template.volume_size_limit.map_or(JsValue::NULL, Into::into),
-            template.root_volume_size.map_or(JsValue::NULL, Into::into),
-            u8::from(template.fleet).into(),
-            template
-                .excluded_instance_types
-                .as_deref()
-                .map_or(JsValue::NULL, Into::into),
         ])?
         .run()
         .await?;
+    crate::stack::record(ctx.db, tenant, template, now_ms()).await?;
     Ok(())
 }
 

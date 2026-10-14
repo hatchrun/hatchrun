@@ -44,6 +44,23 @@ export interface Aws {
   region: string;
   launchTemplateId: string;
   subnetIds: string[];
+  stack: Stack;
+}
+
+/** The connect stack's version and how to update it. */
+export interface Stack {
+  /** 1 for a stack from before the version tag. */
+  version: number;
+  latest: number;
+  /** Unix milliseconds. */
+  checkedAt: number | null;
+  /** What newer versions bring, oldest first; empty when current. */
+  changes: string[];
+  /** Whether instance types are still limited by the old family list. */
+  familyList: boolean;
+  consoleUrl: string;
+  templateUrl: string | null;
+  updateCommand: string | null;
 }
 
 export interface Billing {
