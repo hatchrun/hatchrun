@@ -10,6 +10,7 @@
 
 pub mod describe;
 pub mod ec2;
+pub mod fleet;
 pub mod instances;
 pub mod sts;
 

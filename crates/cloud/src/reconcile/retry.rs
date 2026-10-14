@@ -142,6 +142,9 @@ pub struct Failure {
     pub cause: Cause,
     /// The error, shown on the job.
     pub message: String,
+    /// When what it failed on may have passed, Unix milliseconds: the
+    /// next try waits at least until then.
+    pub not_before: Option<u64>,
 }
 
 impl Failure {
@@ -150,7 +153,15 @@ impl Failure {
         Self {
             cause,
             message: message.into(),
+            not_before: None,
         }
+    }
+
+    /// The same failure, tried again no sooner than `at`.
+    #[must_use]
+    pub fn not_before(mut self, at: Option<u64>) -> Self {
+        self.not_before = at;
+        self
     }
 
     /// How the job row records the failure of its `attempts`th launch
@@ -158,7 +169,13 @@ impl Failure {
     #[must_use]
     pub fn outcome(&self, attempts: u32, now: u64) -> (Wait, Option<u64>) {
         match classify(&self.cause) {
-            Wait::Backoff => (Wait::Backoff, Some(now.saturating_add(delay(attempts)))),
+            Wait::Backoff => {
+                let next = now.saturating_add(delay(attempts));
+                (
+                    Wait::Backoff,
+                    Some(self.not_before.map_or(next, |at| at.max(next))),
+                )
+            }
             Wait::Setup => (Wait::Setup, None),
         }
     }
@@ -243,6 +260,10 @@ mod tests {
         let image = Failure::new(Cause::NoImage, "no arm64 image in ap-south-1");
         assert_eq!(image.outcome(1, 1_000), (Wait::Backoff, Some(31_000)));
         assert_eq!(image.outcome(3, 1_000), (Wait::Backoff, Some(121_000)));
+        // Capacity that comes back later than the backoff waits for it.
+        let full = Failure::new(Cause::NoCapacity, "none").not_before(Some(200_000));
+        assert_eq!(full.outcome(1, 1_000), (Wait::Backoff, Some(200_000)));
+        assert_eq!(full.outcome(5, 1_000), (Wait::Backoff, Some(301_000)));
         let denied = Failure::new(Cause::Aws("AccessDenied".to_owned()), "denied");
         assert_eq!(denied.outcome(1, 1_000), (Wait::Setup, None));
         assert_eq!(Wait::parse(Wait::Backoff.as_str()), Some(Wait::Backoff));

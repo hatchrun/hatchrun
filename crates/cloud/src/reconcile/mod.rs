@@ -61,8 +61,9 @@ const GITHUB_API_URL: &str = "GITHUB_API_URL";
 /// and the app's own requests are well inside the rest.
 const SUBREQUESTS: u32 = 500;
 /// Requests a launch may make: STS, the installation token, the runner,
-/// `RunInstances` per subnet, the broker's retries and the cleanup.
-const LAUNCH_COST: u32 = 12;
+/// the launch template version and up to four fleets (or
+/// `RunInstances` per subnet), the broker's retries and the cleanup.
+const LAUNCH_COST: u32 = 16;
 /// Tenants per pass, least recently reconciled first.
 const TENANTS_PER_PASS: u32 = 50;
 /// Tenants reconciled at once.
@@ -1146,8 +1147,9 @@ impl Pass<'_> {
         Ok(done)
     }
 
-    /// Step 6: deletes expired sessions, jobs past the retention, and
-    /// redeliveries GitHub no longer lists.
+    /// Step 6: deletes expired sessions, jobs past the retention,
+    /// redeliveries GitHub no longer lists and lapsed unavailable
+    /// offerings.
     async fn retention(&self) -> Fallible<Summary> {
         let now = int(self.now).map_err(text)?;
         let jobs_before = int(self.now.saturating_sub(self.limits.retention)).map_err(text)?;
@@ -1175,6 +1177,10 @@ impl Pass<'_> {
                          (SELECT guid FROM redeliveries WHERE redelivered_at < ?1 LIMIT ?2)",
                     )
                     .bind(&[redeliveries_before, DELETE_BATCH.into()])
+                    .map_err(text)?,
+                self.db
+                    .prepare("DELETE FROM unavailable_offerings WHERE until < ?1")
+                    .bind(&[int(self.now).map_err(text)?])
                     .map_err(text)?,
             ])
             .await

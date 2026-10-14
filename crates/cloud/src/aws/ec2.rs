@@ -42,6 +42,9 @@ pub const TAG_INSTANCE_TYPES: &str = "hatchrun:instance-types";
 pub const TAG_VOLUME_SIZE_LIMIT: &str = "hatchrun:volume-size-limit";
 /// See [`TAG_INSTANCE_TYPES`].
 pub const TAG_ROOT_VOLUME_SIZE: &str = "hatchrun:root-volume-size";
+/// Tag connect.yaml puts on its launch template when its role may
+/// launch with EC2 Fleet (see [`super::fleet`]), as `true`.
+pub const TAG_FLEET: &str = "hatchrun:fleet";
 /// Tag with the workflow job id.
 pub const TAG_JOB_ID: &str = "hatchrun:job-id";
 /// Tag with the runner name.
@@ -207,6 +210,8 @@ pub struct LaunchTemplate {
     pub volume_size_limit: Option<u16>,
     /// Its [`TAG_ROOT_VOLUME_SIZE`] tag.
     pub root_volume_size: Option<u16>,
+    /// Whether its [`TAG_FLEET`] tag says the role may use EC2 Fleet.
+    pub fleet: bool,
 }
 
 /// Reads the launch templates out of the answer.
@@ -252,6 +257,7 @@ pub fn launch_templates(response: &Response) -> Result<Vec<LaunchTemplate>, Erro
                 instance_types: tag(TAG_INSTANCE_TYPES).map(str::to_owned),
                 volume_size_limit: tag(TAG_VOLUME_SIZE_LIMIT).and_then(|size| size.parse().ok()),
                 root_volume_size: tag(TAG_ROOT_VOLUME_SIZE).and_then(|size| size.parse().ok()),
+                fleet: tag(TAG_FLEET) == Some("true"),
             })
         })
         .collect()
@@ -518,6 +524,7 @@ mod tests {
         <item><key>hatchrun:instance-types</key><value>m8g.*,c7i.large</value></item>
         <item><key>hatchrun:volume-size-limit</key><value>500</value></item>
         <item><key>hatchrun:root-volume-size</key><value>40</value></item>
+        <item><key>hatchrun:fleet</key><value>true</value></item>
       </tagSet>
     </item>
   </launchTemplates>
@@ -533,6 +540,7 @@ mod tests {
                 instance_types: Some("m8g.*,c7i.large".to_owned()),
                 volume_size_limit: Some(500),
                 root_volume_size: Some(40),
+                fleet: true,
             }]
         );
         let none = Response {

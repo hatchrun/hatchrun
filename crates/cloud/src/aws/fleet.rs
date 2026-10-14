@@ -1,0 +1,424 @@
+// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Starting a runner with EC2 Fleet: an instant fleet of one over every
+//! instance type and subnet that may run it, where EC2 picks the
+//! cheapest offering with capacity (`lowest-price` on-demand,
+//! `price-capacity-optimized` Spot).
+//!
+//! A fleet takes no user data or block devices of its own, so each
+//! launch first makes a version of the tenant's launch template with the
+//! runner's image, ticket and root volume, launches from that version,
+//! and deletes it after. The template's `$Default` version is never
+//! changed.
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+
+use super::{Error, document, query};
+use crate::http::{Request, Response};
+
+/// EC2 API version.
+const VERSION: &str = "2016-11-15";
+
+/// A launch template version for one runner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateVersion<'a> {
+    /// The tenant's launch template, `lt-...`.
+    pub launch_template_id: &'a str,
+    /// The runner's name, which describes the version.
+    pub runner_name: &'a str,
+    /// The runner image.
+    pub image_id: &'a str,
+    /// User data, before base64.
+    pub user_data: &'a str,
+    /// Root volume device and size in GiB, to replace the template's
+    /// volume size.
+    pub root_volume: Option<(&'a str, u16)>,
+    /// Tags for the runner's volumes.
+    pub volume_tags: &'a [(&'a str, &'a str)],
+    /// Makes a retried call idempotent.
+    pub client_token: &'a str,
+}
+
+impl TemplateVersion<'_> {
+    /// The unsigned `CreateLaunchTemplateVersion` request, based on the
+    /// template's default version.
+    #[must_use]
+    pub fn request(&self, endpoint: &str) -> Request {
+        let mut params: Vec<(String, String)> = Vec::new();
+        let mut add = |key: &str, value: &str| params.push((key.to_owned(), value.to_owned()));
+        add("LaunchTemplateId", self.launch_template_id);
+        add("SourceVersion", "$Default");
+        add("VersionDescription", self.runner_name);
+        add("ClientToken", self.client_token);
+        let data = "LaunchTemplateData";
+        add(&format!("{data}.ImageId"), self.image_id);
+        add(
+            &format!("{data}.UserData"),
+            &STANDARD.encode(self.user_data),
+        );
+        add(
+            &format!("{data}.InstanceInitiatedShutdownBehavior"),
+            "terminate",
+        );
+        add(&format!("{data}.MetadataOptions.HttpEndpoint"), "enabled");
+        add(&format!("{data}.MetadataOptions.HttpTokens"), "required");
+        add(
+            &format!("{data}.MetadataOptions.HttpPutResponseHopLimit"),
+            "1",
+        );
+        add(
+            &format!("{data}.MetadataOptions.InstanceMetadataTags"),
+            "enabled",
+        );
+        if let Some((device, size)) = self.root_volume {
+            let bdm = format!("{data}.BlockDeviceMapping.1");
+            add(&format!("{bdm}.DeviceName"), device);
+            add(&format!("{bdm}.Ebs.VolumeSize"), &size.to_string());
+            add(&format!("{bdm}.Ebs.VolumeType"), "gp3");
+            add(&format!("{bdm}.Ebs.Encrypted"), "true");
+            add(&format!("{bdm}.Ebs.DeleteOnTermination"), "true");
+        }
+        let spec = format!("{data}.TagSpecification.1");
+        add(&format!("{spec}.ResourceType"), "volume");
+        for (at, (key, value)) in self.volume_tags.iter().enumerate() {
+            add(&format!("{spec}.Tag.{}.Key", at + 1), key);
+            add(&format!("{spec}.Tag.{}.Value", at + 1), value);
+        }
+        query(endpoint, "CreateLaunchTemplateVersion", VERSION, &params)
+    }
+}
+
+/// The number of the version `CreateLaunchTemplateVersion` made.
+///
+/// # Errors
+///
+/// EC2's error, or a malformed answer.
+pub fn version_number(response: &Response) -> Result<u64, Error> {
+    let doc = document(response)?;
+    doc.descendants()
+        .find(|node| node.has_tag_name("versionNumber"))
+        .and_then(|node| node.text())
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| Error::malformed("no versionNumber in CreateLaunchTemplateVersion"))
+}
+
+/// The unsigned request to delete a version made for one runner.
+#[must_use]
+pub fn delete_version(endpoint: &str, launch_template_id: &str, version: u64) -> Request {
+    query(
+        endpoint,
+        "DeleteLaunchTemplateVersions",
+        VERSION,
+        &[
+            ("LaunchTemplateId".to_owned(), launch_template_id.to_owned()),
+            ("LaunchTemplateVersion.1".to_owned(), version.to_string()),
+        ],
+    )
+}
+
+/// An instance type in a subnet the fleet may launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Override {
+    /// As in `m8g.large`.
+    pub instance_type: String,
+    /// `subnet-...`, or the template's network when `None`.
+    pub subnet_id: Option<String>,
+}
+
+/// An instant fleet of one instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fleet<'a> {
+    /// The tenant's launch template, `lt-...`.
+    pub launch_template_id: &'a str,
+    /// The version made for this runner.
+    pub version: u64,
+    /// What it may launch; at most 300.
+    pub overrides: &'a [Override],
+    /// Spot rather than on-demand.
+    pub spot: bool,
+    /// Tags for the instance.
+    pub tags: &'a [(&'a str, &'a str)],
+    /// Makes a retried call idempotent.
+    pub client_token: &'a str,
+}
+
+impl Fleet<'_> {
+    /// The unsigned `CreateFleet` request.
+    #[must_use]
+    pub fn request(&self, endpoint: &str) -> Request {
+        let mut params: Vec<(String, String)> = Vec::new();
+        let mut add = |key: &str, value: &str| params.push((key.to_owned(), value.to_owned()));
+        add("Type", "instant");
+        add("ClientToken", self.client_token);
+        let config = "LaunchTemplateConfigs.1";
+        add(
+            &format!("{config}.LaunchTemplateSpecification.LaunchTemplateId"),
+            self.launch_template_id,
+        );
+        add(
+            &format!("{config}.LaunchTemplateSpecification.Version"),
+            &self.version.to_string(),
+        );
+        for (at, choice) in self.overrides.iter().enumerate() {
+            let one = format!("{config}.Overrides.{}", at + 1);
+            add(&format!("{one}.InstanceType"), &choice.instance_type);
+            if let Some(subnet) = &choice.subnet_id {
+                add(&format!("{one}.SubnetId"), subnet);
+            }
+        }
+        let capacity = if self.spot { "spot" } else { "on-demand" };
+        add("TargetCapacitySpecification.TotalTargetCapacity", "1");
+        add(
+            "TargetCapacitySpecification.DefaultTargetCapacityType",
+            capacity,
+        );
+        if self.spot {
+            add("TargetCapacitySpecification.SpotTargetCapacity", "1");
+            add("SpotOptions.AllocationStrategy", "price-capacity-optimized");
+            add("SpotOptions.InstanceInterruptionBehavior", "terminate");
+        } else {
+            add("TargetCapacitySpecification.OnDemandTargetCapacity", "1");
+            add("OnDemandOptions.AllocationStrategy", "lowest-price");
+        }
+        add("TagSpecification.1.ResourceType", "instance");
+        for (at, (key, value)) in self.tags.iter().enumerate() {
+            add(&format!("TagSpecification.1.Tag.{}.Key", at + 1), key);
+            add(&format!("TagSpecification.1.Tag.{}.Value", at + 1), value);
+        }
+        query(endpoint, "CreateFleet", VERSION, &params)
+    }
+}
+
+/// An override the fleet could not launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// As in `m8g.large`.
+    pub instance_type: String,
+    /// The override's subnet.
+    pub subnet_id: Option<String>,
+    /// As in `InsufficientInstanceCapacity`.
+    pub code: String,
+    /// EC2's message.
+    pub message: String,
+}
+
+/// What an instant fleet did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Launched {
+    /// The instance, its type and subnet, if it started one.
+    pub instance: Option<(String, String, Option<String>)>,
+    /// The overrides it could not launch, and why.
+    pub refused: Vec<Refused>,
+}
+
+/// Reads what `CreateFleet` did.
+///
+/// # Errors
+///
+/// EC2's error for the call as a whole, or a malformed answer.
+pub fn launched(response: &Response) -> Result<Launched, Error> {
+    let doc = document(response)?;
+    let root = doc.root_element();
+    let overrides = |item: roxmltree::Node<'_, '_>| {
+        let chosen = child(item, "launchTemplateAndOverrides").and_then(|n| child(n, "overrides"));
+        (
+            chosen
+                .and_then(|n| child_text(n, "instanceType"))
+                .map(str::to_owned),
+            chosen
+                .and_then(|n| child_text(n, "subnetId"))
+                .map(str::to_owned),
+        )
+    };
+    let mut done = Launched::default();
+    for item in items(root, "errorSet") {
+        let (instance_type, subnet_id) = overrides(item);
+        done.refused.push(Refused {
+            instance_type: instance_type.unwrap_or_default(),
+            subnet_id,
+            code: child_text(item, "errorCode").unwrap_or_default().to_owned(),
+            message: child_text(item, "errorMessage")
+                .unwrap_or_default()
+                .to_owned(),
+        });
+    }
+    for item in items(root, "fleetInstanceSet") {
+        let Some(id) = items(item, "instanceIds").find_map(|id| id.text()) else {
+            continue;
+        };
+        let (chosen_type, subnet_id) = overrides(item);
+        let instance_type = child_text(item, "instanceType")
+            .map(str::to_owned)
+            .or(chosen_type)
+            .unwrap_or_default();
+        done.instance = Some((id.to_owned(), instance_type, subnet_id));
+        break;
+    }
+    Ok(done)
+}
+
+fn items<'a, 'input>(
+    node: roxmltree::Node<'a, 'input>,
+    set: &str,
+) -> impl Iterator<Item = roxmltree::Node<'a, 'input>> {
+    child(node, set)
+        .into_iter()
+        .flat_map(|set| set.children().filter(|item| item.has_tag_name("item")))
+}
+
+fn child<'a, 'input>(
+    node: roxmltree::Node<'a, 'input>,
+    name: &str,
+) -> Option<roxmltree::Node<'a, 'input>> {
+    node.children()
+        .find(|child| child.tag_name().name() == name)
+}
+
+fn child_text<'a>(node: roxmltree::Node<'a, '_>, name: &str) -> Option<&'a str> {
+    child(node, name).and_then(|child| child.text())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(request: &Request) -> String {
+        String::from_utf8(request.body.clone()).unwrap()
+    }
+
+    #[test]
+    fn versions_carry_the_runner() {
+        let version = TemplateVersion {
+            launch_template_id: "lt-1",
+            runner_name: "hatchrun-7-ab",
+            image_id: "ami-1",
+            user_data: "{}",
+            root_volume: Some(("/dev/sda1", 100)),
+            volume_tags: &[("hatchrun:tenant", "acme")],
+            client_token: "hatchrun-7-ab-v",
+        };
+        let sent = body(&version.request("https://ec2/"));
+        assert!(sent.starts_with(
+            "Action=CreateLaunchTemplateVersion&Version=2016-11-15&LaunchTemplateId=lt-1\
+             &SourceVersion=%24Default&VersionDescription=hatchrun-7-ab"
+        ));
+        for part in [
+            "LaunchTemplateData.ImageId=ami-1",
+            "LaunchTemplateData.UserData=e30%3D",
+            "LaunchTemplateData.MetadataOptions.HttpTokens=required",
+            "LaunchTemplateData.BlockDeviceMapping.1.Ebs.VolumeSize=100",
+            "LaunchTemplateData.BlockDeviceMapping.1.Ebs.Encrypted=true",
+            "LaunchTemplateData.TagSpecification.1.ResourceType=volume",
+            "LaunchTemplateData.TagSpecification.1.Tag.1.Key=hatchrun%3Atenant",
+        ] {
+            assert!(sent.contains(part), "{part} in {sent}");
+        }
+        let created = Response {
+            status: 200,
+            body: b"<CreateLaunchTemplateVersionResponse><launchTemplateVersion>\
+                <launchTemplateId>lt-1</launchTemplateId><versionNumber>12</versionNumber>\
+                </launchTemplateVersion></CreateLaunchTemplateVersionResponse>"
+                .to_vec(),
+        };
+        assert_eq!(version_number(&created), Ok(12));
+        assert_eq!(
+            body(&delete_version("https://ec2/", "lt-1", 12)),
+            "Action=DeleteLaunchTemplateVersions&Version=2016-11-15\
+             &LaunchTemplateId=lt-1&LaunchTemplateVersion.1=12"
+        );
+    }
+
+    #[test]
+    fn fleets_pick_by_price() {
+        let overrides = [
+            Override {
+                instance_type: "m8g.large".to_owned(),
+                subnet_id: Some("subnet-a".to_owned()),
+            },
+            Override {
+                instance_type: "c8g.xlarge".to_owned(),
+                subnet_id: None,
+            },
+        ];
+        let fleet = |spot| Fleet {
+            launch_template_id: "lt-1",
+            version: 12,
+            overrides: &overrides,
+            spot,
+            tags: &[("Name", "r")],
+            client_token: "r-0",
+        };
+        let on_demand = body(&fleet(false).request("https://ec2/"));
+        for part in [
+            "Type=instant",
+            "LaunchTemplateConfigs.1.LaunchTemplateSpecification.Version=12",
+            "LaunchTemplateConfigs.1.Overrides.1.InstanceType=m8g.large",
+            "LaunchTemplateConfigs.1.Overrides.1.SubnetId=subnet-a",
+            "LaunchTemplateConfigs.1.Overrides.2.InstanceType=c8g.xlarge",
+            "DefaultTargetCapacityType=on-demand",
+            "OnDemandOptions.AllocationStrategy=lowest-price",
+            "TagSpecification.1.ResourceType=instance",
+        ] {
+            assert!(on_demand.contains(part), "{part} in {on_demand}");
+        }
+        assert!(!on_demand.contains("Overrides.2.SubnetId"));
+        let spot = body(&fleet(true).request("https://ec2/"));
+        assert!(spot.contains("SpotOptions.AllocationStrategy=price-capacity-optimized"));
+        assert!(spot.contains("DefaultTargetCapacityType=spot"));
+    }
+
+    #[test]
+    fn reads_the_instance_and_refusals() {
+        let answer = Response {
+            status: 200,
+            body: br"<CreateFleetResponse>
+  <fleetId>fleet-1</fleetId>
+  <errorSet><item>
+    <launchTemplateAndOverrides>
+      <launchTemplateSpecification><launchTemplateId>lt-1</launchTemplateId></launchTemplateSpecification>
+      <overrides><instanceType>m8g.large</instanceType><subnetId>subnet-a</subnetId></overrides>
+    </launchTemplateAndOverrides>
+    <lifecycle>spot</lifecycle>
+    <errorCode>InsufficientInstanceCapacity</errorCode>
+    <errorMessage>none</errorMessage>
+  </item></errorSet>
+  <fleetInstanceSet><item>
+    <launchTemplateAndOverrides>
+      <overrides><instanceType>c8g.xlarge</instanceType><subnetId>subnet-b</subnetId></overrides>
+    </launchTemplateAndOverrides>
+    <lifecycle>spot</lifecycle>
+    <instanceIds><item>i-0abc</item></instanceIds>
+    <instanceType>c8g.xlarge</instanceType>
+  </item></fleetInstanceSet>
+</CreateFleetResponse>"
+                .to_vec(),
+        };
+        let done = launched(&answer).unwrap();
+        assert_eq!(
+            done.instance,
+            Some((
+                "i-0abc".to_owned(),
+                "c8g.xlarge".to_owned(),
+                Some("subnet-b".to_owned())
+            ))
+        );
+        assert_eq!(
+            done.refused,
+            [Refused {
+                instance_type: "m8g.large".to_owned(),
+                subnet_id: Some("subnet-a".to_owned()),
+                code: "InsufficientInstanceCapacity".to_owned(),
+                message: "none".to_owned(),
+            }]
+        );
+        let none = Response {
+            status: 200,
+            body: b"<CreateFleetResponse><fleetId>f</fleetId><fleetInstanceSet/></CreateFleetResponse>"
+                .to_vec(),
+        };
+        assert_eq!(launched(&none), Ok(Launched::default()));
+    }
+}

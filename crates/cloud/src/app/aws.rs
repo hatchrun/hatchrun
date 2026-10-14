@@ -183,7 +183,7 @@ async fn save(
         .prepare(
             "UPDATE tenants SET role_arn = ?2, region = ?3, launch_template_id = ?4, \
              subnet_ids = ?5, updated_at = ?6, instance_types = ?7, volume_size_limit = ?8, \
-             root_volume_size = ?9 WHERE id = ?1",
+             root_volume_size = ?9, fleet = ?10 WHERE id = ?1",
         )
         .bind(&[
             tenant.into(),
@@ -198,6 +198,7 @@ async fn save(
                 .map_or(JsValue::NULL, Into::into),
             template.volume_size_limit.map_or(JsValue::NULL, Into::into),
             template.root_volume_size.map_or(JsValue::NULL, Into::into),
+            u8::from(template.fleet).into(),
         ])?
         .run()
         .await?;

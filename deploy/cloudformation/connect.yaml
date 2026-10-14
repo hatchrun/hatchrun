@@ -207,6 +207,8 @@ Resources:
             - { Key: "hatchrun:instance-types", Value: !Join [",", !Ref InstanceTypes] }
             - { Key: "hatchrun:volume-size-limit", Value: !Ref VolumeSizeLimit }
             - { Key: "hatchrun:root-volume-size", Value: !Ref RootVolumeSize }
+            # The role below may launch with EC2 Fleet.
+            - { Key: "hatchrun:fleet", Value: "true" }
       LaunchTemplateData:
         SecurityGroupIds: [!Ref RunnerSecurityGroup]
         InstanceInitiatedShutdownBehavior: terminate
@@ -267,7 +269,7 @@ Resources:
                 Resource: "*"
               - Sid: LaunchInstances
                 Effect: Allow
-                Action: ec2:RunInstances
+                Action: [ec2:RunInstances, ec2:CreateFleet]
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                 Condition:
                   StringEquals:
@@ -280,7 +282,7 @@ Resources:
                     ec2:InstanceType: !Ref InstanceTypes
               - Sid: LaunchVolumes
                 Effect: Allow
-                Action: ec2:RunInstances
+                Action: [ec2:RunInstances, ec2:CreateFleet]
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
                 Condition:
                   Bool:
@@ -289,14 +291,14 @@ Resources:
                     ec2:VolumeSize: !Ref VolumeSizeLimit
               - Sid: LaunchImages
                 Effect: Allow
-                Action: ec2:RunInstances
+                Action: [ec2:RunInstances, ec2:CreateFleet]
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
                 Condition:
                   StringEquals:
                     ec2:Owner: "000000000000" # image-owner
               - Sid: LaunchNetwork
                 Effect: Allow
-                Action: ec2:RunInstances
+                Action: [ec2:RunInstances, ec2:CreateFleet]
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
@@ -307,11 +309,27 @@ Resources:
                       - Id: !If [CreateVpc, !Ref Vpc, !Ref VpcId]
               - Sid: LaunchFromTemplate
                 Effect: Allow
-                Action: ec2:RunInstances
+                Action: [ec2:RunInstances, ec2:CreateFleet]
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplate}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${RunnerSecurityGroup}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+              # Each launch is an instant EC2 Fleet of one, which also
+              # needs the fleet itself; the instance it starts is held to
+              # the statements above.
+              - Sid: LaunchFleet
+                Effect: Allow
+                Action: ec2:CreateFleet
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:fleet/*"
+              # A fleet takes no user data or root volume of its own, so
+              # each launch adds a version of this template with them and
+              # deletes it after. The default version never changes.
+              - Sid: RunnerTemplateVersions
+                Effect: Allow
+                Action:
+                  - ec2:CreateLaunchTemplateVersion
+                  - ec2:DeleteLaunchTemplateVersions
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplate}"
               - Sid: TagAtLaunch
                 Effect: Allow
                 Action: ec2:CreateTags
@@ -321,7 +339,7 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
                 Condition:
                   StringEquals:
-                    ec2:CreateAction: RunInstances
+                    ec2:CreateAction: [RunInstances, CreateFleet]
               - Sid: ManageOwnInstances
                 Effect: Allow
                 Action:
@@ -335,7 +353,8 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:ResourceTag/hatchrun:tenant: !Ref TenantId
-              # The first Spot launch in an account creates this role.
+              # The first Spot launch and the first fleet in an account
+              # create these roles.
               - Sid: SpotServiceRole
                 Effect: Allow
                 Action: iam:CreateServiceLinkedRole
@@ -343,6 +362,13 @@ Resources:
                 Condition:
                   StringEquals:
                     iam:AWSServiceName: spot.amazonaws.com
+              - Sid: FleetServiceRole
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/ec2fleet.amazonaws.com/AWSServiceRoleForEC2Fleet"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: ec2fleet.amazonaws.com
 
 Outputs:
   RoleArn:
