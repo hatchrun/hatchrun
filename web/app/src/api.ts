@@ -48,13 +48,20 @@ export interface Billing {
   };
 }
 
+/** One of the licence's Polar products, one per billing interval. */
 export interface Plan {
+  id: string;
   name: string;
   description: string | null;
   /** Smallest currency unit, such as cents. */
   amount: number | null;
   currency: string | null;
   interval: string | null;
+}
+
+export interface Plans {
+  /** Shortest billing interval first. */
+  plans: Plan[];
 }
 
 export interface Steps {
@@ -150,7 +157,7 @@ export const getTenant = (org: string) => get<Tenant>(`/api/tenants/${encodeURIC
 export const createTenant = (org: string) => post<Tenant>("/api/tenants", { org });
 
 const tenantPath = (org: string) => `/api/tenants/${encodeURIComponent(org)}`;
-export const getPlan = () => get<Plan>("/api/plan");
+export const getPlan = () => get<Plans>("/api/plan");
 export const startCheckout = (org: string) => post<{ url: string }>(`${tenantPath(org)}/checkout`);
 export const openPortal = (org: string) => post<{ url: string }>(`${tenantPath(org)}/portal`);
 export const redeemInvite = (org: string, code: string) => post<Tenant>(`${tenantPath(org)}/beta`, { code });

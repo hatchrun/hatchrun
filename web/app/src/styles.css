@@ -789,14 +789,29 @@ label {
 /* Plan */
 
 .plan {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
   padding: 1rem;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface-2);
+}
+
+.plan-options {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.plan-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.plan-option:first-child {
+  padding-top: 0;
 }
 
 .plan-name {
@@ -808,20 +823,26 @@ label {
   font-size: 0.9rem;
 }
 
-.plan-buy {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  flex: none;
-}
-
 .plan-price {
   font-weight: 650;
   white-space: nowrap;
 }
 
+.plan-buy {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 1rem;
+  padding-top: 1rem;
+}
+
+.plan-pick {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
 @media (max-width: 560px) {
-  .plan,
+  .plan-option,
   .plan-buy,
   .inline-form-row {
     flex-direction: column;

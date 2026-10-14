@@ -105,11 +105,24 @@ const routes: Record<string, Handler> = {
       : [
           200,
           {
-            name: "hatchrun Team",
-            description: "Runners for one GitHub organization",
-            amount: 4900,
-            currency: "usd",
-            interval: "month",
+            plans: [
+              {
+                id: "prod_month",
+                name: "hatchrun Team, monthly",
+                description: "Runners for one GitHub organization",
+                amount: 4900,
+                currency: "usd",
+                interval: "month",
+              },
+              {
+                id: "prod_year",
+                name: "hatchrun Team, yearly",
+                description: "Runners for one GitHub organization",
+                amount: 49000,
+                currency: "usd",
+                interval: "year",
+              },
+            ],
           },
         ],
   "POST /api/tenants/:org/checkout": (_req, url) => {

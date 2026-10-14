@@ -245,9 +245,12 @@ the user still owns it. Every request on a tenant checks the user's
 ownership with GitHub again.
 
 A tenant launches runners only while it holds a licence: a Polar
-subscription to the `POLAR_PRODUCT_ID` product, or a place in the
-invite-only beta. The app opens Polar's checkout with the tenant id as
-the external customer id, and Polar's webhooks, at
+subscription to one of the `POLAR_PRODUCT_ID` products, or a place in
+the invite-only beta. `POLAR_PRODUCT_ID` lists the products separated
+by commas, one per billing interval, since a Polar product has a single
+interval: monthly and yearly. The app opens Polar's checkout with all
+of them, so the buyer picks one, and with the tenant id as the external
+customer id, and Polar's webhooks, at
 `https://app.hatchrun.io/api/polar/webhook` and checked against
 `POLAR_WEBHOOK_SECRET`, keep the `subscriptions` table current. The
 beta needs no payment. An owner redeems an invite code, or the operator

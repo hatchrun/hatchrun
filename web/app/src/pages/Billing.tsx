@@ -29,6 +29,15 @@ function price(plan: Plan): string | null {
   return plan.interval ? `${amount} / ${plan.interval}` : amount;
 }
 
+/** Whole months the yearly plan saves over twelve monthly payments. */
+export function monthsFree(plan: Plan, plans: Plan[]): number {
+  const monthly = plans.find((other) => other.interval === "month");
+  if (plan.interval !== "year" || !monthly || plan.amount === null || !monthly.amount || plan.currency !== monthly.currency) {
+    return 0;
+  }
+  return Math.max(0, Math.round((12 * monthly.amount - plan.amount) / monthly.amount));
+}
+
 /** The plan step: pay for the licence, or join the beta with a code. */
 export function ChoosePlan({
   tenant,
@@ -74,12 +83,29 @@ export function ChoosePlan({
       {plan.state === "loading" && <Spinner label="Loading the plan" />}
       {plan.state === "ready" && (
         <div className="plan">
-          <div>
-            <div className="plan-name">{plan.data.name}</div>
-            {plan.data.description && <p className="muted plan-description">{plan.data.description}</p>}
-          </div>
+          <ul className="plan-options">
+            {plan.data.plans.map((option) => {
+              const free = monthsFree(option, plan.data.plans);
+              return (
+                <li key={option.id} className="plan-option">
+                  <div>
+                    <div className="plan-name">
+                      {option.name}
+                      {free > 0 && (
+                        <span className="badge badge-success">
+                          {free === 1 ? "1 month free" : `${free} months free`}
+                        </span>
+                      )}
+                    </div>
+                    {option.description && <p className="muted plan-description">{option.description}</p>}
+                  </div>
+                  {price(option) && <div className="plan-price">{price(option)}</div>}
+                </li>
+              );
+            })}
+          </ul>
           <div className="plan-buy">
-            {price(plan.data) && <div className="plan-price">{price(plan.data)}</div>}
+            {plan.data.plans.length > 1 && <p className="muted plan-pick">You pick one at checkout.</p>}
             <button type="button" className="button button-primary" disabled={busy} onClick={checkout}>
               {busy ? "Opening checkout" : "Continue to checkout"}
             </button>
