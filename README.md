@@ -301,6 +301,25 @@ with the instance type and on-demand price each gets in the tenant's
 region, and its settings: the most runners at once and the regions
 runners may use, which the Worker also checks before every launch.
 
+### Runner images
+
+Launches take the AMI for the tenant's region and the runner's
+architecture from the `images` table. Every release of
+[hatchrun/images](https://github.com/hatchrun/images) fills it: once
+the AMIs are public, its `register.yml` job posts the release's
+`manifest.json` to `POST https://app.hatchrun.io/api/internal/images`
+with a GitHub Actions OIDC token for the audience
+`https://app.hatchrun.io`. The Worker checks the token's signature
+against GitHub's JWKS and accepts only that job, on `main`, in the
+`image-build` environment of hatchrun/images
+([`images.rs`](crates/cloud/src/images.rs)). It writes every region and
+architecture in one batch and refuses a release older than the one it
+holds. To post the newest release again:
+
+```sh
+gh workflow run register.yml --repo hatchrun/images --ref main
+```
+
 ### Reconciler
 
 A Cron Trigger runs [`reconcile`](crates/cloud/src/reconcile) every

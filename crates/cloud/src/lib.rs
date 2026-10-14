@@ -24,6 +24,7 @@
 //! failed webhooks, launches lost launches again and terminates
 //! instances nothing needs (see the `reconcile` module).
 
+pub mod actions;
 mod app;
 pub mod aws;
 pub mod catalog;
@@ -31,6 +32,7 @@ pub mod connect;
 mod fetch;
 pub mod github;
 pub mod http;
+pub mod images;
 pub mod install;
 pub mod instance;
 pub mod jwt;
