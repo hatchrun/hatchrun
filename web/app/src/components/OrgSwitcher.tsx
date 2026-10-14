@@ -71,7 +71,7 @@ export function OrgSwitcher({ current }: { current: { login: string; avatarUrl: 
             ))
           )}
           <Link role="menuitem" className="menu-item menu-item-new" href="/new" onClick={() => setOpen(false)}>
-            Set up another organization
+            Add an organization
           </Link>
         </div>
       )}

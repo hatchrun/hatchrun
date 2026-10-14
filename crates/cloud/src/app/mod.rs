@@ -11,8 +11,9 @@
 //! - `POST /api/auth/logout` ends the session.
 //! - `GET /api/session` returns the signed-in user and the CSRF token
 //!   the app sends back on every request that changes something.
-//! - `/api/orgs`, `/api/tenants` and `/api/github/setup` set up an
-//!   organization and link the App's installation (see [`tenants`]).
+//! - `/api/installations`, `/api/github/setup` and `/api/tenants` set
+//!   up an organization from an installation of the App (see
+//!   [`tenants`]).
 //! - `/api/tenants/<org>/aws` connects the AWS account (see [`aws`]).
 //! - `/api/tenants/<org>/{jobs,settings}` serve the dashboard (see
 //!   [`dashboard`]).
@@ -233,7 +234,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
     let segments: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
     let answer = match (method, segments.as_slice()) {
         (Method::Get, ["session"]) => session_json(&current),
-        (Method::Get, ["orgs"]) => tenants::orgs(&ctx).await,
+        (Method::Get, ["installations"]) => tenants::installations(&ctx).await,
         (Method::Get, ["tenants"]) => tenants::mine(&ctx).await,
         (Method::Post, ["tenants"]) => tenants::create(&ctx, req.json().await?).await,
         (Method::Get, ["tenants", org]) => tenants::show(&ctx, org).await,

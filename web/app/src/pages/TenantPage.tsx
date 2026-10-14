@@ -55,14 +55,8 @@ export function TenantPage({
   );
 }
 
-const errors: Record<string, string> = {
-  "install-account":
-    "That installation is on a different account. Install the App on this organization.",
-};
-
 function Setup({ tenant, setTenant }: { tenant: Tenant; setTenant: (tenant: Tenant) => void }) {
   const installed = useQuery("installed");
-  const error = useQuery("error");
   const checkout = useQuery("checkout");
   const org = tenant.org.login;
   const confirming = checkout !== null && !tenant.billing.licensed;
@@ -95,15 +89,18 @@ function Setup({ tenant, setTenant }: { tenant: Tenant; setTenant: (tenant: Tena
 
   const steps: Step[] = [
     {
-      key: "organization",
-      title: "Choose a GitHub organization",
-      done: tenant.steps.organization,
-      summary: (
+      key: "app",
+      title: "Install hatchrun on GitHub",
+      done: tenant.steps.app,
+      summary: tenant.installationId && (
         <>
-          Linked to <a href={`https://github.com/${org}`}>github.com/{org}</a>.
+          Installed on <a href={`https://github.com/${org}`}>{org}</a>.{" "}
+          <a href={`https://github.com/organizations/${org}/settings/installations/${tenant.installationId}`}>
+            Change repositories
+          </a>
         </>
       ),
-      body: null,
+      body: <InstallApp tenant={tenant} />,
     },
     {
       key: "plan",
@@ -120,24 +117,10 @@ function Setup({ tenant, setTenant }: { tenant: Tenant; setTenant: (tenant: Tena
       body: <ConnectAws tenant={tenant} onConnected={setTenant} />,
     },
     {
-      key: "app",
-      title: "Install the GitHub App",
-      done: tenant.steps.app,
-      summary: tenant.installationId && (
-        <>
-          Installed on {org}.{" "}
-          <a href={`https://github.com/organizations/${org}/settings/installations/${tenant.installationId}`}>
-            Configure on GitHub
-          </a>
-        </>
-      ),
-      body: <InstallApp tenant={tenant} />,
-    },
-    {
       key: "runs-on",
       title: "Name a runner profile in runs-on",
       done: false,
-      soon: "Built-in profiles such as hatchrun-4cpu-arm64 work once the App is installed. Runners lists them with their prices and lets you add your own.",
+      soon: "Once the steps above are done, set runs-on: hatchrun-4cpu-arm64 (or any profile under Runners) and push.",
       body: null,
     },
   ];
@@ -151,12 +134,7 @@ function Setup({ tenant, setTenant }: { tenant: Tenant; setTenant: (tenant: Tena
       )}
       {installed && (
         <p className="notice notice-success" role="status">
-          The hatchrun App is installed on {org}.
-        </p>
-      )}
-      {error && (
-        <p className="notice notice-error" role="alert">
-          {errors[error] ?? "Something went wrong."}
+          hatchrun is installed on {org}. Two more steps and your jobs can run.
         </p>
       )}
       <div className="page-head">
@@ -170,29 +148,24 @@ function Setup({ tenant, setTenant }: { tenant: Tenant; setTenant: (tenant: Tena
   );
 }
 
+/** Shown when the App is gone from the organization: uninstalled or suspended. */
 export function InstallApp({ tenant }: { tenant: Tenant }) {
+  const org = tenant.org.login;
   return (
     <>
       <p>
-        The App tells hatchrun when a job names one of your runner profiles and registers a runner
-        for it.
-        Install it on <strong>{tenant.org.login}</strong>, for all repositories or the ones that
-        should use hatchrun.
+        hatchrun can't reach <strong>{org}</strong> right now. Someone uninstalled the app or
+        suspended it, so no runners will start. Install it again, or unsuspend it in the
+        organization's settings.
       </p>
-      <ul className="perm-list">
-        <li>
-          <strong>Self-hosted runners</strong>: read and write, to register one runner per job
-        </li>
-        <li>
-          <strong>Actions</strong>: read, to see queued jobs
-        </li>
-        <li>
-          <strong>Metadata</strong>: read, required by GitHub
-        </li>
-      </ul>
-      <a className="button button-primary" href={tenant.installUrl}>
-        Install on GitHub
-      </a>
+      <p className="inline-actions">
+        <a className="button button-primary" href={tenant.installUrl}>
+          Install on GitHub
+        </a>
+        <a className="button" href={`https://github.com/organizations/${org}/settings/installations`}>
+          Open GitHub settings
+        </a>
+      </p>
     </>
   );
 }

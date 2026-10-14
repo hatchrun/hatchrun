@@ -25,9 +25,11 @@ interface MockTenant {
 interface State {
   signedIn: boolean;
   tenants: MockTenant[];
+  /** Organization ids the App is installed on. */
+  installed: number[];
 }
 
-const state: State = { signedIn: false, tenants: [] };
+const state: State = { signedIn: false, tenants: [], installed: [] };
 
 const square = (color: string) =>
   `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 2 2'><rect width='2' height='2' fill='${encodeURIComponent(color)}'/></svg>`;
@@ -42,10 +44,14 @@ function tenantView(tenant: MockTenant) {
   return {
     ...tenant,
     billing: { beta: tenant.beta, licensed, subscription: tenant.subscription },
-    steps: { organization: true, billing: licensed, aws: tenant.aws !== null, app: tenant.installationId !== null },
-    installUrl: `/api/github/setup?installation_id=${tenant.org.id * 10}&setup_action=install&state=${tenant.id}`,
+    steps: { app: tenant.installationId !== null, billing: licensed, aws: tenant.aws !== null },
+    installUrl: installUrl(),
   };
 }
+
+// GitHub's install page, played by /api/mock/install: it installs on the
+// first organization without the App.
+const installUrl = () => "/api/mock/install?state=mock";
 
 const findTenant = (login: string) => state.tenants.find((tenant) => tenant.org.login === login);
 
@@ -64,35 +70,36 @@ const routes: Record<string, Handler> = {
   },
   "GET /api/session": () =>
     state.signedIn ? [200, { user, csrfToken: "mock" }] : [401, { error: "not signed in" }],
-  "GET /api/orgs": () => [
+  "GET /api/installations": () => [
     200,
-    orgs.map((org) => ({ ...org, tenant: findTenant(org.login)?.id ?? null })),
+    {
+      installUrl: installUrl(),
+      installations: orgs
+        .filter((org) => state.installed.includes(org.id))
+        .map((org) => ({
+          id: org.id * 10,
+          login: org.login,
+          avatarUrl: org.avatarUrl,
+          suspended: false,
+          tenant: findTenant(org.login)?.org.login ?? null,
+        })),
+    },
   ],
+  "GET /api/mock/install": (_req, url) => {
+    const org = orgs.find((candidate) => !state.installed.includes(candidate.id));
+    if (!org) {
+      return "/";
+    }
+    state.installed.push(org.id);
+    return `/api/github/setup?installation_id=${org.id * 10}&setup_action=install&state=${url.searchParams.get("state")}`;
+  },
   "GET /api/tenants": () => [
     200,
     state.tenants.map((tenant) => ({ id: tenant.id, login: tenant.org.login, avatarUrl: tenant.org.avatarUrl })),
   ],
   "POST /api/tenants": (_req, _url, body) => {
-    const login = (body as { org: string }).org;
-    const org = orgs.find((candidate) => candidate.login === login);
-    if (!org) {
-      return [403, { error: `you are not an owner of ${login} on GitHub` }];
-    }
-    let tenant = findTenant(login);
-    if (!tenant) {
-      tenant = {
-        id: `mock${org.id}tenant00`,
-        org,
-        installationId: null,
-        aws: null,
-        maxRunners: 10,
-        allowedRegions: null,
-        beta: false,
-        subscription: null,
-      };
-      state.tenants.push(tenant);
-    }
-    return [200, tenantView(tenant)];
+    const tenant = adopt((body as { installationId: number }).installationId);
+    return tenant ? [200, tenantView(tenant)] : [404, { error: "that installation isn't one you can see on GitHub" }];
   },
   "GET /api/tenants/:org": (_req, url) => {
     const tenant = findTenant(url.pathname.split("/")[3] ?? "");
@@ -248,14 +255,40 @@ const routes: Record<string, Handler> = {
   "PUT /api/tenants/:org/runners/:name": (req, url, body) => runnerChange(req, url, body),
   "DELETE /api/tenants/:org/runners/:name": (req, url, body) => runnerChange(req, url, body),
   "GET /api/github/setup": (_req, url) => {
-    const tenant = state.tenants.find((candidate) => candidate.id === url.searchParams.get("state"));
-    if (!tenant) {
+    if (url.searchParams.get("setup_action") === "request") {
+      return "/?install=requested";
+    }
+    if (url.searchParams.get("state") !== "mock") {
       return "/?error=install-state";
     }
-    tenant.installationId = Number(url.searchParams.get("installation_id"));
-    return `/o/${tenant.org.login}?installed=1`;
+    const tenant = adopt(Number(url.searchParams.get("installation_id")));
+    return tenant ? `/o/${tenant.org.login}?installed=1` : "/?error=install-unseen";
   },
 };
+
+/** The tenant of an installed organization, made on first use. */
+function adopt(installationId: number): MockTenant | null {
+  const org = orgs.find((candidate) => candidate.id * 10 === installationId && state.installed.includes(candidate.id));
+  if (!org) {
+    return null;
+  }
+  let tenant = findTenant(org.login);
+  if (!tenant) {
+    tenant = {
+      id: `mock${org.id}tenant00`,
+      org,
+      installationId: null,
+      aws: null,
+      maxRunners: 10,
+      allowedRegions: null,
+      beta: false,
+      subscription: null,
+    };
+    state.tenants.push(tenant);
+  }
+  tenant.installationId = installationId;
+  return tenant;
+}
 
 function runnerChange(req: IncomingMessage, url: URL, body: unknown): [number, unknown] {
   const [, , , org = "", , name] = url.pathname.split("/");

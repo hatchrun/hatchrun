@@ -98,10 +98,19 @@ pub enum Event {
         /// The runner that took the job, once one did.
         runner: Option<String>,
     },
-    /// The App was uninstalled; the tenant loses its installation.
+    /// The App was uninstalled or suspended; the tenant loses its
+    /// installation and launches nothing until it is back.
     Uninstalled {
         /// The installation that is gone.
         installation_id: u64,
+    },
+    /// The App was installed, or unsuspended, on an account. A tenant
+    /// for that account gets the installation back.
+    Installed {
+        /// The installation.
+        installation_id: u64,
+        /// The user or organization it is installed on.
+        account_id: u64,
     },
     /// Nothing to do, and why. GitHub shows the reason in the App's
     /// delivery log, which is where a user looks when a job waits.
@@ -134,6 +143,17 @@ struct Installation {
     id: u64,
 }
 
+#[derive(Deserialize)]
+struct InstalledOn {
+    id: u64,
+    account: Account,
+}
+
+#[derive(Deserialize)]
+struct Account {
+    id: u64,
+}
+
 /// Reads a webhook delivery. `event` is the `X-GitHub-Event` header.
 ///
 /// # Errors
@@ -141,15 +161,19 @@ struct Installation {
 /// When a `workflow_job` body does not parse.
 pub fn parse(event: &str, body: &[u8]) -> Result<Event, serde_json::Error> {
     if event == "installation" {
+        // GitHub sends these to every App; nobody subscribes to them.
         #[derive(Deserialize)]
         struct Changed {
             action: String,
-            installation: Installation,
+            installation: InstalledOn,
         }
         let changed: Changed = serde_json::from_slice(body)?;
+        let installation_id = changed.installation.id;
         return Ok(match changed.action.as_str() {
-            "deleted" => Event::Uninstalled {
-                installation_id: changed.installation.id,
+            "deleted" | "suspend" => Event::Uninstalled { installation_id },
+            "created" | "unsuspend" => Event::Installed {
+                installation_id,
+                account_id: changed.installation.account.id,
             },
             other => Event::Ignored(format!("installation {other} is not used")),
         });
@@ -356,18 +380,36 @@ mod tests {
 
     #[test]
     fn notices_uninstalls() {
-        let deleted =
-            br#"{"action":"deleted","installation":{"id":77,"account":{"login":"acme"}}}"#;
+        let event = |action: &str| {
+            let body = serde_json::json!({
+                "action": action,
+                "installation": {
+                    "id": 77,
+                    "account": { "login": "acme", "id": 9, "type": "Organization" },
+                },
+            });
+            parse("installation", body.to_string().as_bytes()).unwrap()
+        };
+        for action in ["deleted", "suspend"] {
+            assert_eq!(
+                event(action),
+                Event::Uninstalled {
+                    installation_id: 77
+                }
+            );
+        }
+        for action in ["created", "unsuspend"] {
+            assert_eq!(
+                event(action),
+                Event::Installed {
+                    installation_id: 77,
+                    account_id: 9,
+                }
+            );
+        }
         assert_eq!(
-            parse("installation", deleted).unwrap(),
-            Event::Uninstalled {
-                installation_id: 77
-            }
-        );
-        let created = br#"{"action":"created","installation":{"id":77}}"#;
-        assert_eq!(
-            parse("installation", created).unwrap(),
-            Event::Ignored("installation created is not used".to_owned())
+            event("new_permissions_accepted"),
+            Event::Ignored("installation new_permissions_accepted is not used".to_owned())
         );
     }
 }
