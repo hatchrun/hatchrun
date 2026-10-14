@@ -1,6 +1,7 @@
 name: deploy-cloud
 
-# Deploys crates/cloud, the Worker behind hatchrun.io, from main. The
+# Deploys crates/cloud, the Worker behind hatchrun.io, and the app in
+# web/app, which the Worker serves on app.hatchrun.io, from main. The
 # API token can edit Workers and D1 in the hatchrun account only, and
 # only this job, on main, in the protected production environment, can
 # read it. The account comes from the CLOUDFLARE_ACCOUNT_ID secret.
@@ -10,6 +11,7 @@ on:
     branches: [main]
     paths:
       - crates/cloud/**
+      - web/app/**
       - Cargo.lock
       - rust-toolchain.toml
       - .github/workflows/deploy-cloud.yml
@@ -61,6 +63,13 @@ jobs:
         with:
           node-version: 22
 
+      # wrangler.toml points the Worker's static assets at web/app/dist.
+      - name: Build the app
+        working-directory: web/app
+        run: |
+          npm ci
+          npm run build
+
       - name: Point at the production database
         env:
           DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
@@ -85,6 +94,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           GITHUB_WEBHOOK_SECRET: ${{ secrets.GITHUB_WEBHOOK_SECRET }}
           GITHUB_APP_PRIVATE_KEY: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}
+          GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}
           OIDC_SIGNING_KEY: ${{ secrets.OIDC_SIGNING_KEY }}
           OIDC_NEXT_SIGNING_KEY: ${{ secrets.OIDC_NEXT_SIGNING_KEY }}
           OIDC_PREVIOUS_SIGNING_KEY: ${{ secrets.OIDC_PREVIOUS_SIGNING_KEY }}
@@ -93,7 +103,7 @@ jobs:
           secrets="$RUNNER_TEMP/worker-secrets.json"
           trap 'rm -f "$secrets"' EXIT
           (umask 077 && jq -n 'env | with_entries(select(
-              (.key | IN("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_PRIVATE_KEY", "BROKER_TOKEN",
+              (.key | IN("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_PRIVATE_KEY", "GITHUB_CLIENT_SECRET", "BROKER_TOKEN",
                          "OIDC_SIGNING_KEY", "OIDC_NEXT_SIGNING_KEY", "OIDC_PREVIOUS_SIGNING_KEY"))
               and .value != ""))' > "$secrets")
           echo "Uploading secrets: $(jq -r 'keys | join(", ")' "$secrets")"

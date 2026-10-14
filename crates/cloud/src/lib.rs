@@ -13,11 +13,15 @@
 //! (see the `launch` module).
 //!
 //! - `POST /github/webhook` takes the App's webhook deliveries.
+//! - `/api/*` on `app.hatchrun.io` is the app's API (see [`app`]); every
+//!   other path there is the app itself, from the static assets.
 //! - `GET /.well-known/openid-configuration` and
 //!   `GET /.well-known/jwks.json` on `oidc.hatchrun.io` let STS check
 //!   the tokens the Worker signs (see [`oidc`]).
 
+mod app;
 pub mod aws;
+mod fetch;
 pub mod github;
 pub mod http;
 pub mod instance;
@@ -25,17 +29,41 @@ pub mod jwt;
 pub mod labels;
 mod launch;
 pub mod oidc;
+pub mod session;
+pub mod signin;
 mod webcrypto;
 pub mod webhook;
 
 use wasm_bindgen::JsValue;
-use worker::{Env, Method, Request, Response, Result, console_error, console_warn, event};
+use worker::{
+    Env, Headers, Method, Request, Response, ResponseBuilder, Result, console_error, console_warn,
+    event,
+};
 
 use crate::jwt::PublicKey;
 use crate::webhook::Event;
 
 /// D1 binding in `wrangler.toml`.
 pub(crate) const DB: &str = "DB";
+/// Static assets binding in `wrangler.toml`.
+const ASSETS: &str = "ASSETS";
+/// Headers on every page of the app. The app loads nothing from other
+/// origins except GitHub avatars, and no other site may frame it.
+const SECURITY_HEADERS: [(&str, &str); 5] = [
+    (
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' https://avatars.githubusercontent.com data:; \
+         style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; \
+         base-uri 'none'; form-action 'self'",
+    ),
+    ("X-Frame-Options", "DENY"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "strict-origin-when-cross-origin"),
+    (
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains",
+    ),
+];
 /// Secret holding the App's webhook secret.
 const WEBHOOK_SECRET: &str = "GITHUB_WEBHOOK_SECRET";
 
@@ -44,10 +72,38 @@ async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response>
     if req.url()?.host_str() == Some(oidc::HOST) {
         return issuer(&req, &env);
     }
-    if req.method() == Method::Post && req.path() == "/github/webhook" {
+    let path = req.path();
+    if req.method() == Method::Post && path == "/github/webhook" {
         return github_webhook(req, env, &ctx).await;
     }
-    error("not found", 404)
+    if path == "/api" || path.starts_with("/api/") {
+        let mut response = app::handle(req, env).await?;
+        response.headers_mut().set("Cache-Control", "no-store")?;
+        return Ok(response);
+    }
+    if path.starts_with("/github/") {
+        return error("not found", 404);
+    }
+    assets(req, &env).await
+}
+
+/// The app's static assets. Every path that is not a file is the app's
+/// `index.html`, so the app's own routes load it.
+async fn assets(req: Request, env: &Env) -> Result<Response> {
+    let response = env.assets(ASSETS)?.fetch_request(req).await?;
+    let status = response.status_code();
+    let headers = Headers::new();
+    for (name, value) in response.headers().entries() {
+        headers.append(&name, &value)?;
+    }
+    for (name, value) in SECURITY_HEADERS {
+        headers.set(name, value)?;
+    }
+    let (_, body) = response.into_parts();
+    Ok(ResponseBuilder::new()
+        .with_status(status)
+        .with_headers(headers)
+        .body(body))
 }
 
 async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Result<Response> {

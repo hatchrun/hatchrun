@@ -7,11 +7,21 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-01"
 
 # The webhook shares hatchrun.io with the website, which serves every
-# other path; the OIDC issuer gets its own hostname.
+# other path; the OIDC issuer and the app get their own hostnames.
 routes = [
   { pattern = "hatchrun.io/github/*", zone_name = "hatchrun.io" },
   { pattern = "oidc.hatchrun.io", custom_domain = true },
+  { pattern = "app.hatchrun.io", custom_domain = true },
 ]
+
+# The app (web/app), built before deploying. The Worker runs first for
+# every request: /api is its own, and it adds security headers to the
+# rest. Paths that are not files get index.html, the app's router.
+[assets]
+directory = "../../web/app/dist"
+binding = "ASSETS"
+run_worker_first = true
+not_found_handling = "single-page-application"
 
 [build]
 command = "cargo install --locked worker-build --version 0.8.7 && worker-build --release"
@@ -25,11 +35,15 @@ database_id = "local"
 migrations_dir = "migrations"
 
 # Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY (PEM),
+# GITHUB_CLIENT_SECRET (the App's client secret, for sign-in),
 # OIDC_SIGNING_KEY (RSA private key in PEM) and BROKER_TOKEN, plus
 # OIDC_NEXT_SIGNING_KEY and OIDC_PREVIOUS_SIGNING_KEY while a key is
-# rotated. Variables: those below. GITHUB_API_URL and AWS_ENDPOINT_URL
-# point the Worker at local stubs under wrangler dev.
+# rotated. Variables: those below. GITHUB_API_URL, GITHUB_WEB_URL and
+# AWS_ENDPOINT_URL point the Worker at local stubs under wrangler dev.
 [vars]
+# The app's origin. Sign-in sends GitHub users back to
+# $APP_URL/api/auth/callback, which the App lists as its callback URL.
+APP_URL = "https://app.hatchrun.io"
 # Client id of the hatchrun GitHub App (github.com/apps/hatchrun).
 GITHUB_APP_ID = "Iv23liMh4C066YyxQB7R"
 # hatchrun-broker (crates/broker), where launches store runner configs.

@@ -4,7 +4,8 @@
 
 //! The GitHub App's REST calls: an installation token, then a
 //! just-in-time runner for a job, and removing it again when its
-//! instance does not start.
+//! instance does not start; and, with a signed-in user's token, who the
+//! user is.
 
 use serde::Deserialize;
 
@@ -133,6 +134,34 @@ pub fn delete_runner(api: &str, org: &str, token: &str, runner_id: u64) -> Reque
     )
 }
 
+/// The signed-in user, asked with their user token.
+#[must_use]
+pub fn user(api: &str, token: &str) -> Request {
+    call("GET", format!("{api}/user"), token)
+}
+
+/// A GitHub user.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct User {
+    /// Numeric id, which outlives renames.
+    pub id: u64,
+    /// Handle.
+    pub login: String,
+    /// Display name, when set.
+    pub name: Option<String>,
+    /// Avatar image URL.
+    pub avatar_url: String,
+}
+
+/// Reads the user out of the answer.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a user.
+pub fn parse_user(response: &Response) -> Result<User, String> {
+    decode(response, "user")
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(response: &Response, what: &str) -> Result<T, String> {
     if !response.ok() {
         return Err(format!(
@@ -225,6 +254,26 @@ mod tests {
         assert_eq!(
             delete_runner(API, "acme", "t", 23).url,
             "https://api.github.com/orgs/acme/actions/runners/23"
+        );
+    }
+
+    #[test]
+    fn reads_the_signed_in_user() {
+        assert_eq!(user(API, "ghu_x").url, "https://api.github.com/user");
+        let answer = Response {
+            status: 200,
+            body:
+                br#"{"login":"octo","id":1,"avatar_url":"https://a/1","name":null,"type":"User"}"#
+                    .to_vec(),
+        };
+        assert_eq!(
+            parse_user(&answer).unwrap(),
+            User {
+                id: 1,
+                login: "octo".to_owned(),
+                name: None,
+                avatar_url: "https://a/1".to_owned(),
+            }
         );
     }
 }

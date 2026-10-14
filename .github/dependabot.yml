@@ -18,3 +18,13 @@ updates:
     directory: /packaging/scaler
     schedule:
       interval: weekly
+  # The app in web/app. Releases younger than two weeks wait.
+  - package-ecosystem: npm
+    directory: /web/app
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    groups:
+      npm:
+        patterns: ["*"]
