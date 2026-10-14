@@ -36,6 +36,12 @@ struct Job {
     runner_name: Option<String>,
     instance_id: Option<String>,
     launch_error: Option<String>,
+    /// Launches started for the job.
+    launch_attempts: u32,
+    /// After a failed launch: `backoff` to launch again at
+    /// `next_launch_at`, `setup` to wait for the setup to change.
+    launch_retry: Option<String>,
+    next_launch_at: Option<u64>,
     queued_at: u64,
     updated_at: u64,
 }
@@ -43,14 +49,15 @@ struct Job {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all(serialize = "camelCase"))]
 struct Counts {
-    /// Queued and not taken: waiting for room under max runners, or for
-    /// the launch to start.
+    /// Queued and not taken: waiting for room under max runners, for
+    /// the launch to start, or to launch again after a failed launch.
     waiting: u32,
     /// Runners launching or running.
     active: u32,
     /// Finished in the last day.
     completed_today: u32,
-    /// Launches that failed in the last day.
+    /// Launches that failed in the last day and are not tried again
+    /// on a timer.
     failed_today: u32,
 }
 
@@ -75,7 +82,8 @@ pub(crate) async fn jobs(ctx: &Ctx<'_>, org: &str, req: &Request) -> Answer {
         .db
         .prepare(
             "SELECT id, repository, run_id, label, status, launch_state, runner_name, \
-             instance_id, launch_error, queued_at, updated_at FROM jobs \
+             instance_id, launch_error, launch_attempts, launch_retry, next_launch_at, \
+             queued_at, updated_at FROM jobs \
              WHERE installation_id = ?1 AND (?2 IS NULL OR queued_at < ?2) \
              ORDER BY queued_at DESC LIMIT ?3",
         )
@@ -92,13 +100,14 @@ pub(crate) async fn jobs(ctx: &Ctx<'_>, org: &str, req: &Request) -> Answer {
         .db
         .prepare(
             "SELECT \
-             COUNT(*) FILTER (WHERE status = 'queued' AND launch_state IS NULL) AS waiting, \
+             COUNT(*) FILTER (WHERE status = 'queued' AND (launch_state IS NULL \
+               OR (launch_state = 'failed' AND launch_retry = 'backoff'))) AS waiting, \
              COUNT(*) FILTER (WHERE status <> 'completed' \
                AND launch_state IN ('launching', 'launched')) AS active, \
              COUNT(*) FILTER (WHERE status = 'completed' AND updated_at >= ?2) \
                AS completed_today, \
-             COUNT(*) FILTER (WHERE launch_state = 'failed' AND updated_at >= ?2) \
-               AS failed_today \
+             COUNT(*) FILTER (WHERE launch_state = 'failed' AND updated_at >= ?2 \
+               AND NOT (status = 'queued' AND launch_retry IS 'backoff')) AS failed_today \
              FROM jobs WHERE installation_id = ?1 \
              AND (status <> 'completed' OR updated_at >= ?2)",
         )
@@ -153,5 +162,6 @@ pub(crate) async fn settings(ctx: &Ctx<'_>, org: &str, body: Change) -> Answer {
         ])?
         .run()
         .await?;
+    crate::launch::recheck(ctx.db, &row.id).await?;
     show(ctx, &row.org_login).await
 }

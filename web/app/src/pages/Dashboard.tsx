@@ -188,6 +188,14 @@ const STATUS: Record<Job["status"], string> = {
 };
 
 function state(job: Job): { text: string; tone: string } {
+  if (job.launchState === "failed" && job.status === "queued") {
+    if (job.launchRetry === "backoff") {
+      return { text: "Retrying", tone: "accent" };
+    }
+    if (job.launchRetry === "setup") {
+      return { text: "Needs setup", tone: "danger" };
+    }
+  }
   if (job.launchState === "failed") {
     return { text: "Launch failed", tone: "danger" };
   }
@@ -212,7 +220,7 @@ function JobRow({ job, region }: { job: Job; region: string | null }) {
       </td>
       <td>
         <span className={`badge${shown.tone ? ` badge-${shown.tone}` : ""}`}>{shown.text}</span>
-        {job.launchError && <div className="job-error">{job.launchError}</div>}
+        <LaunchProblem job={job} />
       </td>
       <td>
         {job.instanceId ? (
@@ -236,6 +244,62 @@ function JobRow({ job, region }: { job: Job; region: string | null }) {
       <td className="nowrap">{job.status === "completed" ? span(job.updatedAt - job.queuedAt) : <span className="muted">-</span>}</td>
     </tr>
   );
+}
+
+/** What went wrong with the job's launch and what happens next, in plain words. */
+function LaunchProblem({ job }: { job: Job }) {
+  if (!job.launchError) {
+    return null;
+  }
+  const attempt = job.launchAttempts > 0 ? `Attempt ${job.launchAttempts} failed: ` : "";
+  if (job.status !== "queued" || job.launchState === "launched") {
+    return <div className="job-error">{job.launchError}</div>;
+  }
+  if (job.launchState !== "failed") {
+    return (
+      <div className="job-note">
+        Trying again after a failed launch: {job.launchError}
+      </div>
+    );
+  }
+  if (job.launchRetry === "backoff") {
+    return (
+      <>
+        <div className="job-error">
+          {attempt}
+          {job.launchError}
+        </div>
+        <div className="job-note">{nextTry(job.nextLaunchAt)}</div>
+      </>
+    );
+  }
+  if (job.launchRetry === "setup") {
+    return (
+      <>
+        <div className="job-error">{job.launchError}</div>
+        <div className="job-note">
+          This will fail the same way until the setup changes. It launches again once you verify the AWS role, edit a
+          runner profile, change the settings or get a licence.
+        </div>
+      </>
+    );
+  }
+  return <div className="job-error">{job.launchError}</div>;
+}
+
+/** When the reconciler, which runs every minute, tries the launch again. */
+function nextTry(at: number | null): string {
+  if (at === null) {
+    return "Trying again soon.";
+  }
+  const seconds = Math.round((at - Date.now()) / 1000);
+  if (seconds <= 0) {
+    return "Trying again within a minute.";
+  }
+  if (seconds <= 60) {
+    return "Trying again in about a minute.";
+  }
+  return `Trying again in about ${Math.ceil(seconds / 60)} minutes.`;
 }
 
 function ago(ms: number): string {

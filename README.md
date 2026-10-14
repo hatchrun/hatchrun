@@ -329,7 +329,16 @@ webhook for a while, and, per tenant with a verified role, describes
 the instances tagged with the tenant: it terminates the ones whose job
 is over, that never got a job, or that ran past the longest age, and
 launches queued jobs again whose launch was lost or whose runner took
-another job. It also deletes expired sessions and jobs past the
+another job. A launch that failed on something that passes (an EC2 or Spot
+capacity error, throttling, an AWS, GitHub or broker error, no image
+yet for the region) is launched
+again after 30 seconds, doubling up to 5 minutes, for as long as
+GitHub keeps the job queued. A launch that failed on the
+organization's setup (the role cannot be assumed or may not launch,
+no allowed instance type fits the profile, no such profile) waits
+until an owner verifies the role again, edits a profile, changes the
+settings or gains a licence; [`retry.rs`](crates/cloud/src/reconcile/retry.rs)
+lists every case. It also deletes expired sessions and jobs past the
 retention. The timeouts are the `RECONCILE_*` variables in
 `wrangler.toml`. Each pass logs one summary line and keeps it in the
 `reconciler` table:

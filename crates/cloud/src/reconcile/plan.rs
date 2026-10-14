@@ -37,13 +37,15 @@
 //! A job queued for longer than [`Limits::queued_grace`] is launched
 //! again when it never launched (its launch was lost, or waited for
 //! room under `max_runners`), when its launch stalled for longer than
-//! [`Limits::launch_timeout`], or when it launched but its runner is
-//! gone or took another job, unless a spare runner with its label will
-//! take it. Launches stop at `max_runners`; `launch` checks that again
-//! when it claims the job.
+//! [`Limits::launch_timeout`], when it launched but its runner is gone
+//! or took another job, or when its launch failed on something that
+//! passes and its wait is over (see [`super::retry`]), unless a spare
+//! runner with its label will take it. Launches stop at `max_runners`;
+//! `launch` checks that again when it claims the job.
 
 use std::collections::{HashMap, HashSet};
 
+use super::retry::Wait;
 use crate::webhook::Status;
 
 /// Timeouts, in milliseconds.
@@ -182,6 +184,11 @@ pub struct Job {
     pub queued_at: u64,
     /// When its row last changed, Unix milliseconds.
     pub updated_at: u64,
+    /// After a failed launch, what it waits for.
+    pub launch_retry: Option<Wait>,
+    /// After a failed launch that backs off, when to launch it again,
+    /// Unix milliseconds.
+    pub next_launch_at: Option<u64>,
 }
 
 /// A pending or running instance with the tenant's tag.
@@ -425,7 +432,14 @@ fn unserved<'a>(
     for job in queued {
         match job.launch_state {
             None => unserved.push(job),
-            Some(LaunchState::Failed) => {}
+            Some(LaunchState::Failed) => {
+                let due = job.launch_retry == Some(Wait::Backoff)
+                    && job.next_launch_at.is_some_and(|at| at <= now);
+                if due {
+                    plan.reset.push(reset(job, LaunchState::Failed));
+                    unserved.push(job);
+                }
+            }
             Some(_) if !described => {}
             Some(LaunchState::Launching) => {
                 if since(job.updated_at) <= limits.launch_timeout {
@@ -462,6 +476,7 @@ fn reset(job: &Job, launch_state: LaunchState) -> Reset {
 
 #[cfg(test)]
 mod tests {
+    use super::super::retry::{Cause, Failure};
     use super::*;
 
     const MIN: u64 = 60 * 1000;
@@ -482,6 +497,19 @@ mod tests {
             ran_on: None,
             queued_at: NOW - 5 * MIN,
             updated_at: NOW - 5 * MIN,
+            launch_retry: None,
+            next_launch_at: None,
+        }
+    }
+
+    /// A job whose launch failed at `failed_at` on `failure`.
+    fn failed(id: u64, failure: &Failure, attempts: u32, failed_at: u64) -> Job {
+        let (wait, next) = failure.outcome(attempts, failed_at);
+        Job {
+            updated_at: failed_at,
+            launch_retry: Some(wait),
+            next_launch_at: next,
+            ..job(id, Status::Queued, Some(LaunchState::Failed))
         }
     }
 
@@ -739,5 +767,90 @@ mod tests {
         let instances = [instance("i-2", 2, 4 * MIN)];
         let plan = plan(NOW, &limits(), 2, Some(&instances), &jobs);
         assert_eq!(plan.launch, [1]);
+    }
+
+    #[test]
+    fn launches_a_missing_image_again_once_it_is_there() {
+        // 2026-10-14: the first hosted job failed with no arm64 image in
+        // ap-south-1; the image was published a minute later while the
+        // job stayed queued.
+        let image = Failure::new(Cause::NoImage, "no arm64 image in ap-south-1");
+        let mut first = failed(1, &image, 1, NOW - 20 * 1000);
+        first.queued_at = NOW - 2 * MIN;
+        // Not before its wait is over.
+        assert_eq!(
+            plan(NOW, &limits(), 10, Some(&[]), &[first.clone()]),
+            Plan::default()
+        );
+        let later = NOW + 15 * 1000;
+        let relaunch = plan(later, &limits(), 10, Some(&[]), &[first.clone()]);
+        assert_eq!(
+            relaunch.reset,
+            [Reset {
+                job_id: 1,
+                launch_state: LaunchState::Failed,
+                runner_name: Some("r1".to_owned()),
+            }]
+        );
+        assert_eq!(relaunch.launch, [1]);
+        // Without EC2 too: a failed launch has no instance to look for.
+        assert_eq!(plan(later, &limits(), 10, None, &[first]).launch, [1]);
+    }
+
+    #[test]
+    fn backs_off_between_failed_launches() {
+        let capacity = Failure::new(Cause::NoCapacity, "no capacity for c7g.xlarge");
+        // The fourth failure waits four minutes.
+        let fourth = failed(1, &capacity, 4, NOW - 3 * MIN);
+        assert_eq!(fourth.next_launch_at, Some(NOW + MIN));
+        assert_eq!(
+            plan(NOW, &limits(), 10, Some(&[]), std::slice::from_ref(&fourth)).launch,
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            plan(NOW + MIN, &limits(), 10, Some(&[]), &[fourth]).launch,
+            [1]
+        );
+    }
+
+    #[test]
+    fn stops_once_github_finishes_the_job() {
+        let throttled = Failure::new(Cause::Aws("RequestLimitExceeded".to_owned()), "slow down");
+        let mut cancelled = failed(1, &throttled, 2, NOW - 10 * MIN);
+        cancelled.status = Status::Completed;
+        assert_eq!(
+            plan(NOW, &limits(), 10, Some(&[]), &[cancelled]),
+            Plan::default()
+        );
+    }
+
+    #[test]
+    fn a_setup_failure_waits_for_a_change() {
+        let denied = Failure::new(Cause::Aws("AccessDenied".to_owned()), "denied");
+        let waiting = failed(1, &denied, 1, NOW - 60 * MIN);
+        assert_eq!(
+            plan(NOW, &limits(), 10, Some(&[]), &[waiting]),
+            Plan::default()
+        );
+        // A runner that waited too long is not launched again either.
+        let mut given_up = job(2, Status::Queued, Some(LaunchState::Failed));
+        given_up.updated_at = NOW - 60 * MIN;
+        assert_eq!(
+            plan(NOW, &limits(), 10, Some(&[]), &[given_up]),
+            Plan::default()
+        );
+    }
+
+    #[test]
+    fn failed_launches_wait_for_room() {
+        let broker = Failure::new(Cause::Broker, "broker answered 503");
+        let jobs = [
+            job(1, Status::InProgress, Some(LaunchState::Launched)),
+            failed(2, &broker, 1, NOW - MIN),
+        ];
+        let instances = [instance("i-1", 1, 4 * MIN)];
+        let full = plan(NOW, &limits(), 1, Some(&instances), &jobs);
+        assert_eq!(full.launch, Vec::<u64>::new());
+        assert_eq!(plan(NOW, &limits(), 2, Some(&instances), &jobs).launch, [2]);
     }
 }

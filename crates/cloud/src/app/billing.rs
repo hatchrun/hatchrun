@@ -110,13 +110,17 @@ pub(crate) async fn billing(db: &D1Database, id: &str, beta: bool) -> Result<Bil
 /// Puts the tenant in the beta when the operator listed its
 /// organization.
 pub(crate) async fn join_listed_beta(db: &D1Database, id: &str) -> Result<()> {
-    db.prepare(
-        "UPDATE tenants SET beta = 1, updated_at = ?2 WHERE id = ?1 AND beta = 0 \
-         AND EXISTS (SELECT 1 FROM beta_orgs WHERE beta_orgs.org_login = tenants.org_login)",
-    )
-    .bind(&[id.into(), int(now_ms())?])?
-    .run()
-    .await?;
+    let joined = db
+        .prepare(
+            "UPDATE tenants SET beta = 1, updated_at = ?2 WHERE id = ?1 AND beta = 0 \
+             AND EXISTS (SELECT 1 FROM beta_orgs WHERE beta_orgs.org_login = tenants.org_login)",
+        )
+        .bind(&[id.into(), int(now_ms())?])?
+        .run()
+        .await?;
+    if joined.meta()?.and_then(|meta| meta.changes) == Some(1) {
+        crate::launch::recheck(db, id).await?;
+    }
     Ok(())
 }
 
@@ -216,6 +220,7 @@ pub(crate) async fn redeem(ctx: &Ctx<'_>, org: &str, body: Redeem) -> Answer {
         .bind(&[row.id.as_str().into(), int(now_ms())?])?
         .run()
         .await?;
+    crate::launch::recheck(ctx.db, &row.id).await?;
     console_log!("tenant {} joined the beta with an invite code", row.id);
     super::tenants::show(ctx, &row.org_login).await
 }
@@ -287,6 +292,8 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
             subscription.id,
             subscription.tenant
         );
+    } else if polar::LICENSED.contains(&subscription.status.as_str()) {
+        crate::launch::recheck(&db, &subscription.tenant).await?;
     }
     Ok(Response::empty()?.with_status(202))
 }

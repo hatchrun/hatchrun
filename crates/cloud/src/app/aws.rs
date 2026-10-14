@@ -167,6 +167,7 @@ pub(crate) async fn verify(ctx: &Ctx<'_>, org: &str, body: Connect) -> Answer {
     }
 
     save(ctx, &row.id, role_arn, &body.region, &template).await?;
+    crate::launch::recheck(ctx.db, &row.id).await?;
     show(ctx, &row.org_login).await
 }
 

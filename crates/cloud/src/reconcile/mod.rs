@@ -29,6 +29,7 @@
 
 pub mod deliveries;
 pub mod plan;
+pub mod retry;
 pub mod sync;
 pub mod time;
 
@@ -110,7 +111,8 @@ struct Summary {
     tenants: u32,
     /// Instances terminated.
     terminated: u32,
-    /// Launches undone so the job can launch again.
+    /// Launches undone so the job can launch again, failed ones among
+    /// them.
     reset: u32,
     /// Stalled launches whose instance turned up.
     adopted: u32,
@@ -753,7 +755,7 @@ impl Pass<'_> {
             .db
             .prepare(
                 "SELECT id, label, status, launch_state, runner_name, ran_on, queued_at, \
-                 updated_at FROM jobs WHERE installation_id = ?1 AND (status <> 'completed' \
+                 updated_at, launch_retry, next_launch_at FROM jobs WHERE installation_id = ?1 AND (status <> 'completed' \
                  OR id IN (SELECT value FROM json_each(?2)) \
                  OR ran_on IN (SELECT value FROM json_each(?3)))",
             )
@@ -780,6 +782,8 @@ impl Pass<'_> {
                     ran_on: row.ran_on,
                     queued_at: row.queued_at,
                     updated_at: row.updated_at,
+                    launch_retry: row.launch_retry.as_deref().and_then(retry::Wait::parse),
+                    next_launch_at: row.next_launch_at,
                 })
             })
             .collect())
@@ -850,7 +854,8 @@ impl Pass<'_> {
                 self.db
                     .prepare(
                         "UPDATE jobs SET launch_state = NULL, runner_name = NULL, \
-                         instance_id = NULL, launch_error = NULL, updated_at = ?3 \
+                         instance_id = NULL, launch_retry = NULL, next_launch_at = NULL, \
+                         updated_at = ?3 \
                          WHERE id = ?1 AND status = 'queued' AND launch_state = ?2 \
                          AND runner_name IS ?4",
                     )
@@ -876,6 +881,7 @@ impl Pass<'_> {
                 self.db
                     .prepare(
                         "UPDATE jobs SET launch_state = 'failed', launch_error = ?3, \
+                         launch_retry = NULL, next_launch_at = NULL, \
                          updated_at = ?2 WHERE id = ?1 AND status = 'queued' \
                          AND launch_state = 'launched' AND runner_name = ?4",
                     )
@@ -1080,6 +1086,8 @@ struct JobRow {
     ran_on: Option<String>,
     queued_at: u64,
     updated_at: u64,
+    launch_retry: Option<String>,
+    next_launch_at: Option<u64>,
 }
 
 #[derive(Deserialize)]

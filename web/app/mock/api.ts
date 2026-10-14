@@ -369,6 +369,10 @@ function sampleJobs(now: number) {
     queuedAgo: number,
     took: number,
     launchError: string | null = null,
+    retry: { attempts: number; wait: "backoff" | "setup" | null; inMinutes?: number } = {
+      attempts: launchState ? 1 : 0,
+      wait: null,
+    },
   ) => ({
     id,
     repository,
@@ -379,11 +383,20 @@ function sampleJobs(now: number) {
     runnerName: launchState ? `hatchrun-${id}-ab12cd34` : null,
     instanceId: launchState === "launched" ? `i-0${id.toString(16)}f00ba4` : null,
     launchError,
+    launchAttempts: retry.attempts,
+    launchRetry: retry.wait,
+    nextLaunchAt: retry.inMinutes === undefined ? null : now + retry.inMinutes * minute,
     queuedAt: now - queuedAgo * minute,
     updatedAt: now - queuedAgo * minute + took * 1000,
   });
   return [
     job(9123, "acme-corp/api", "hatchrun-8cpu-arm64", "queued", null, 0.2, 0),
+    job(9124, "acme-corp/api", "hatchrun-4cpu-arm64", "queued", "failed", 1, 0,
+      "no capacity for c7g.xlarge, m7g.xlarge in any subnet: InsufficientInstanceCapacity: We currently do not have sufficient capacity in the Availability Zone you requested.",
+      { attempts: 3, wait: "backoff", inMinutes: 2 }),
+    job(9125, "acme-corp/web", "hatchrun", "queued", "failed", 2, 0,
+      "AssumeRoleWithWebIdentity: AccessDenied: Not authorized to perform sts:AssumeRoleWithWebIdentity",
+      { attempts: 1, wait: "setup" }),
     job(9122, "acme-corp/web", "hatchrun", "in_progress", "launched", 3, 0),
     job(9121, "acme-corp/api", "hatchrun-8cpu-arm64/spot=true", "in_progress", "launched", 6, 0),
     job(9120, "acme-corp/infra", "hatchrun-16cpu/disk=300", "completed", "failed", 22, 4,
