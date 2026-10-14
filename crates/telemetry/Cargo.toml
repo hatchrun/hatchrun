@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "hatchrun-telemetry"
+version = "0.1.0"
+description = "Cloudflare Worker that takes runner CPU and memory reports into Analytics Engine"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64 = "0.23.1"
+ed25519-dalek = { version = "3.0.0", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+wasm-bindgen = "0.2.129"
+worker = "0.8.7"
+
+[lints]
+workspace = true
