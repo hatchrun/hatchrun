@@ -6,3 +6,4 @@
 /crates/cloud/build
 /crates/cloud/.wrangler
 *.pem
+*.key

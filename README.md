@@ -211,19 +211,26 @@ the `production` environment, and `OIDC_KEY_ID` in
 derives the public key from the secret on every request, so there is
 nothing to copy by hand and nothing to drift.
 
+Generate keys in a temporary directory, never in a checkout: the repo
+is public. The key goes straight into the secret and into the
+temporary file, nowhere else.
+
 ```sh
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out ~/oidc-2026-10-14.pem
-gh secret set OIDC_SIGNING_KEY --env production < ~/oidc-2026-10-14.pem
+dir=$(mktemp -d)
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 |
+  tee "$dir/oidc-2026-10-14.pem" |
+  gh secret set OIDC_SIGNING_KEY --env production
 ```
 
-Keep the PEM somewhere safe: Cloudflare and GitHub will not hand it
-back, and rotating needs it once more. Both documents are served with
+Move the PEM into a password manager and `rm -r "$dir"`: Cloudflare
+and GitHub will not hand it back, and rotating needs it once more. Both documents are served with
 `Cache-Control: max-age=3600`, and STS keeps its own copy of the JWKS,
 so a key is published well before it signs and stays published until
 the tokens it signed have expired. Rotation takes three deploys, each a
 change to `wrangler.toml` merged to main:
 
-1. Publish the next key. Generate it, set it as `OIDC_NEXT_SIGNING_KEY`
+1. Publish the next key. Generate it as above, piped into
+   `gh secret set OIDC_NEXT_SIGNING_KEY`,
    and add `OIDC_NEXT_KEY_ID = "2027-01"`. The JWKS now lists both
    keys. Wait a day, so every cached JWKS has the new key.
 2. Sign with it. Set the new PEM as `OIDC_SIGNING_KEY` and the old one
