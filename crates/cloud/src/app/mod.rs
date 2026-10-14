@@ -13,10 +13,13 @@
 //!   the app sends back on every request that changes something.
 //! - `/api/orgs`, `/api/tenants` and `/api/github/setup` set up an
 //!   organization and link the App's installation (see [`tenants`]).
+//! - `/api/plan`, `/api/tenants/<org>/{checkout,portal,beta}` and
+//!   `/api/polar/webhook` handle the licence (see [`billing`]).
 //!
 //! Everything but sign-in needs a session, and everything but `GET`
 //! needs the session's CSRF token.
 
+mod billing;
 mod tenants;
 
 use serde::Deserialize;
@@ -188,6 +191,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
                 .append("Set-Cookie", &session::clear_cookie(session::COOKIE))?;
             return Ok(response);
         }
+        (Method::Post, "/api/polar/webhook") => return billing::webhook(req, &env).await,
         _ => {}
     }
 
@@ -234,6 +238,12 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Get, ["tenants"]) => tenants::mine(&ctx).await,
         (Method::Post, ["tenants"]) => tenants::create(&ctx, req.json().await?).await,
         (Method::Get, ["tenants", org]) => tenants::show(&ctx, org).await,
+        (Method::Get, ["plan"]) => billing::plan(&ctx).await,
+        (Method::Post, ["tenants", org, "checkout"]) => billing::checkout(&ctx, org).await,
+        (Method::Post, ["tenants", org, "portal"]) => billing::portal(&ctx, org).await,
+        (Method::Post, ["tenants", org, "beta"]) => {
+            billing::redeem(&ctx, org, req.json().await?).await
+        }
         (Method::Get, ["github", "setup"]) => tenants::setup(&ctx, &req).await,
         _ => return json_error("not found", 404),
     };

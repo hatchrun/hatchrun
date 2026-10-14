@@ -29,6 +29,7 @@ pub mod jwt;
 pub mod labels;
 mod launch;
 pub mod oidc;
+pub mod polar;
 pub mod session;
 pub mod signin;
 pub mod tenant;

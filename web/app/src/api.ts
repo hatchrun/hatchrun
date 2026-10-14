@@ -38,8 +38,28 @@ export interface Aws {
   subnetIds: string[];
 }
 
+export interface Billing {
+  beta: boolean;
+  licensed: boolean;
+  subscription: null | {
+    status: string;
+    currentPeriodEnd: string | null;
+    cancelAtPeriodEnd: boolean;
+  };
+}
+
+export interface Plan {
+  name: string;
+  description: string | null;
+  /** Smallest currency unit, such as cents. */
+  amount: number | null;
+  currency: string | null;
+  interval: string | null;
+}
+
 export interface Steps {
   organization: boolean;
+  billing: boolean;
   aws: boolean;
   app: boolean;
 }
@@ -50,6 +70,7 @@ export interface Tenant {
   installationId: number | null;
   aws: Aws | null;
   maxRunners: number;
+  billing: Billing;
   steps: Steps;
   installUrl: string;
 }
@@ -58,7 +79,7 @@ export class ApiError extends Error {
   readonly status: number;
 
   constructor(status: number, message: string) {
-    super(message);
+    super(message.charAt(0).toUpperCase() + message.slice(1));
     this.status = status;
   }
 }
@@ -125,3 +146,9 @@ export const listOrgs = () => get<OrgChoice[]>("/api/orgs");
 export const listTenants = () => get<TenantSummary[]>("/api/tenants");
 export const getTenant = (org: string) => get<Tenant>(`/api/tenants/${encodeURIComponent(org)}`);
 export const createTenant = (org: string) => post<Tenant>("/api/tenants", { org });
+
+const tenantPath = (org: string) => `/api/tenants/${encodeURIComponent(org)}`;
+export const getPlan = () => get<Plan>("/api/plan");
+export const startCheckout = (org: string) => post<{ url: string }>(`${tenantPath(org)}/checkout`);
+export const openPortal = (org: string) => post<{ url: string }>(`${tenantPath(org)}/portal`);
+export const redeemInvite = (org: string, code: string) => post<Tenant>(`${tenantPath(org)}/beta`, { code });

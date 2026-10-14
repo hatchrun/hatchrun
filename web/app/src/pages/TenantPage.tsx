@@ -2,19 +2,51 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-import type { Tenant } from "../api";
+import { useEffect, useState } from "react";
+
+import { getTenant, type Tenant } from "../api";
 import { Checklist, type Step } from "../components/Checklist";
-import { useQuery } from "../router";
+import { navigate, useQuery } from "../router";
+import { ChoosePlan, PlanSummary } from "./Billing";
 
 const errors: Record<string, string> = {
   "install-account":
     "That installation is on a different account. Install the App on this organization.",
 };
 
-export function TenantPage({ tenant }: { tenant: Tenant }) {
+export function TenantPage({ tenant: loaded }: { tenant: Tenant }) {
+  const [tenant, setTenant] = useState(loaded);
   const installed = useQuery("installed");
   const error = useQuery("error");
+  const checkout = useQuery("checkout");
   const org = tenant.org.login;
+  const confirming = checkout !== null && !tenant.billing.licensed;
+
+  // Back from Polar's checkout: the webhook may land a moment after the
+  // browser does, so look again for half a minute.
+  useEffect(() => {
+    if (!confirming) {
+      return;
+    }
+    let tries = 0;
+    const timer = window.setInterval(() => {
+      tries += 1;
+      getTenant(org).then(setTenant, () => undefined);
+      if (tries >= 10) {
+        window.clearInterval(timer);
+        navigate(`/o/${org}`, true);
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [confirming, org]);
+
+  const refresh = (next?: Tenant) => {
+    if (next) {
+      setTenant(next);
+    } else {
+      getTenant(org).then(setTenant, () => undefined);
+    }
+  };
 
   const steps: Step[] = [
     {
@@ -31,9 +63,9 @@ export function TenantPage({ tenant }: { tenant: Tenant }) {
     {
       key: "plan",
       title: "Choose a plan",
-      done: false,
-      soon: "Billing opens here soon.",
-      body: null,
+      done: tenant.steps.billing,
+      summary: <PlanSummary tenant={tenant} />,
+      body: <ChoosePlan tenant={tenant} onChange={refresh} confirming={confirming} />,
     },
     {
       key: "aws",
@@ -60,6 +92,11 @@ export function TenantPage({ tenant }: { tenant: Tenant }) {
 
   return (
     <section className="narrow">
+      {checkout && tenant.billing.licensed && (
+        <p className="notice notice-success" role="status">
+          Payment received. {org} has a hatchrun licence.
+        </p>
+      )}
       {installed && (
         <p className="notice notice-success" role="status">
           The hatchrun App is installed on {org}.

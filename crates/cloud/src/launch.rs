@@ -5,6 +5,9 @@
 //! Launches a runner instance for a recorded job, after the webhook has
 //! been answered.
 //!
+//! Only tenants with AWS connected and a licence (the beta or a paid
+//! subscription) launch; jobs of any other are marked `failed`.
+//!
 //! The Worker takes the job by moving it from no launch state to
 //! `launching`, which only one request can do, and only while the tenant
 //! has fewer than `max_runners` runners launching or running. Then:
@@ -64,7 +67,15 @@ struct Tenant {
     launch_template_id: String,
     subnet_ids: String,
     max_runners: u32,
+    /// 1 when the tenant holds a licence (see [`LICENSED`]).
+    licensed: u8,
 }
+
+/// SQL that is 1 for a tenant row that may launch: in the beta, or
+/// with a Polar subscription that holds a licence.
+pub(crate) const LICENSED: &str = "(tenants.beta = 1 OR EXISTS (SELECT 1 FROM subscriptions \
+     WHERE subscriptions.tenant_id = tenants.id \
+     AND subscriptions.status IN ('active', 'trialing')))";
 
 impl Tenant {
     fn subnets(&self) -> Vec<&str> {
@@ -132,29 +143,39 @@ pub async fn launch(env: Env, job: QueuedJob) {
 async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
     let db = env.d1(DB)?;
     let tenant: Option<Tenant> = db
-        .prepare(
-            "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners \
+        .prepare(format!(
+            "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners, \
+             {LICENSED} AS licensed \
              FROM tenants WHERE installation_id = ?1 AND role_arn IS NOT NULL \
              AND region IS NOT NULL AND launch_template_id IS NOT NULL \
-             AND subnet_ids IS NOT NULL",
-        )
+             AND subnet_ids IS NOT NULL"
+        ))
         .bind(&[int(job.installation_id)?])?
         .first(None)
         .await?;
-    let Some(tenant) = tenant else {
-        let reason = format!(
-            "installation {} has no tenant with AWS connected",
-            job.installation_id
-        );
-        db.prepare(
-            "UPDATE jobs SET launch_state = 'failed', launch_error = ?2, updated_at = ?3 \
-             WHERE id = ?1 AND launch_state IS NULL",
-        )
-        .bind(&[int(job.id)?, reason.as_str().into(), int(now_ms())?])?
-        .run()
-        .await?;
-        console_warn!("job {}: {reason}", job.id);
-        return Ok(());
+    let tenant = match tenant {
+        Some(tenant) if tenant.licensed == 1 => tenant,
+        other => {
+            let reason = match other {
+                Some(tenant) => format!(
+                    "tenant {} has no licence: neither in the beta nor subscribed",
+                    tenant.id
+                ),
+                None => format!(
+                    "installation {} has no tenant with AWS connected",
+                    job.installation_id
+                ),
+            };
+            db.prepare(
+                "UPDATE jobs SET launch_state = 'failed', launch_error = ?2, updated_at = ?3 \
+                 WHERE id = ?1 AND launch_state IS NULL",
+            )
+            .bind(&[int(job.id)?, reason.as_str().into(), int(now_ms())?])?
+            .run()
+            .await?;
+            console_warn!("job {}: {reason}", job.id);
+            return Ok(());
+        }
     };
 
     let name = runner_name(job.id, &webcrypto::random_bytes(4)?);
@@ -485,6 +506,13 @@ mod tests {
     }
 
     #[test]
+    fn licences_follow_polar() {
+        for status in crate::polar::LICENSED {
+            assert!(LICENSED.contains(&format!("'{status}'")), "{status}");
+        }
+    }
+
+    #[test]
     fn subnets_in_order() {
         let tenant = Tenant {
             id: "acme1234".to_owned(),
@@ -493,6 +521,7 @@ mod tests {
             launch_template_id: String::new(),
             subnet_ids: "subnet-b, subnet-a,,".to_owned(),
             max_runners: 1,
+            licensed: 1,
         };
         assert_eq!(tenant.subnets(), ["subnet-b", "subnet-a"]);
     }
