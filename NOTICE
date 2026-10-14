@@ -2,3 +2,8 @@ hatchrun
 Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 
 Licensed under the Apache License, Version 2.0. See LICENSE.
+
+The hatchrun name, logo, icons and the Pip character are trademarks of
+Gamunu Balagalla. The files under web/app/public/brand/ and the web app
+favicons are not covered by the Apache License; see
+LICENSES/LicenseRef-hatchrun-Proprietary.txt.

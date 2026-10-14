@@ -21,3 +21,16 @@ path = [
 ]
 SPDX-FileCopyrightText = "Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>"
 SPDX-License-Identifier = "Apache-2.0"
+
+# The hatchrun logo and icons are proprietary brand assets, not covered
+# by the Apache License. Source: hatchrun/brand.
+[[annotations]]
+path = [
+  "web/app/public/favicon.svg",
+  "web/app/public/favicon-32.png",
+  "web/app/public/apple-touch-icon.png",
+  "web/app/public/brand/**",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>"
+SPDX-License-Identifier = "LicenseRef-hatchrun-Proprietary"
