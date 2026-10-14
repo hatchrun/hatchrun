@@ -34,6 +34,23 @@ function errorText(code: string, account: string): ReactNode {
       return `hatchrun is suspended on ${who}. An owner can unsuspend it in the organization's GitHub settings, then come back here.`;
     case "install-not-owner":
       return `Only owners of ${who} can set it up. Ask an owner to sign in here and finish the setup.`;
+    case "install-owner-unknown":
+      return (
+        <>
+          GitHub won't tell hatchrun who owns {who} yet. hatchrun asks for one more permission
+          (reading members) to check that. An owner can accept it in the{" "}
+          {account ? (
+            <a href={`https://github.com/organizations/${account}/settings/installations`}>
+              organization's settings
+            </a>
+          ) : (
+            "organization's settings"
+          )}
+          . Then pick {who} from the list below.
+        </>
+      );
+    case "install-failed":
+      return "GitHub didn't answer the way we expected while connecting your install. Pick your organization from the list below to try again.";
     default:
       return "Something went wrong. Try again.";
   }

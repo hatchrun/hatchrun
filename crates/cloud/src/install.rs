@@ -27,6 +27,10 @@ pub enum Refusal {
     Suspended,
     /// The user is not an active owner of its organization.
     NotOwner,
+    /// GitHub would not say who owns the organization: the App lacks
+    /// the Members permission there, usually because an owner has not
+    /// accepted it yet.
+    OwnerUnknown,
 }
 
 impl Refusal {
@@ -38,6 +42,7 @@ impl Refusal {
             Self::PersonalAccount => "install-personal",
             Self::Suspended => "install-suspended",
             Self::NotOwner => "install-not-owner",
+            Self::OwnerUnknown => "install-owner-unknown",
         }
     }
 
@@ -53,6 +58,9 @@ impl Refusal {
                 "hatchrun is suspended on {login}. An owner can unsuspend it in the organization's GitHub settings"
             ),
             Self::NotOwner => format!("only owners of {login} can set it up on hatchrun"),
+            Self::OwnerUnknown => format!(
+                "GitHub won't tell hatchrun who owns {login}. An owner needs to accept hatchrun's updated permissions in the organization's settings"
+            ),
         }
     }
 }
@@ -189,6 +197,7 @@ mod tests {
             Refusal::PersonalAccount,
             Refusal::Suspended,
             Refusal::NotOwner,
+            Refusal::OwnerUnknown,
         ];
         let mut codes: Vec<_> = all.iter().map(|refusal| refusal.code()).collect();
         codes.sort_unstable();
