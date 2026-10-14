@@ -6,11 +6,12 @@
 //!
 //! Customers install the hatchrun GitHub App on their organization. The
 //! App sends a `workflow_job` webhook for every job; the Worker checks the
-//! signature, keeps the jobs whose `runs-on` label asks for a hatchrun
-//! runner (see [`labels`]) and records them in D1, one row per job, so a
-//! webhook GitHub delivers twice is recorded once. After answering, it
-//! launches a runner instance for the job in the tenant's AWS account
-//! (see the `launch` module).
+//! signature, keeps the jobs whose `runs-on` label names one of the
+//! organization's runner profiles (see [`labels`] and [`profiles`]) and
+//! records them in D1, one row per job, so a webhook GitHub delivers
+//! twice is recorded once. After answering, it launches a runner
+//! instance for the job in the tenant's AWS account (see the `launch`
+//! module).
 //!
 //! - `POST /github/webhook` takes the App's webhook deliveries.
 //! - `/api/*` on `app.hatchrun.io` is the app's API (see [`app`]); every
@@ -25,6 +26,7 @@
 
 mod app;
 pub mod aws;
+pub mod catalog;
 pub mod connect;
 mod fetch;
 pub mod github;
@@ -35,6 +37,7 @@ pub mod labels;
 mod launch;
 pub mod oidc;
 pub mod polar;
+pub mod profiles;
 mod reconcile;
 pub mod session;
 pub mod settings;
@@ -144,6 +147,13 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
     let now = int(now_ms())?;
     match event {
         Event::Queued(job) => {
+            if let Some(reason) =
+                profiles::store::unknown(&db, job.installation_id, &job.spec).await?
+            {
+                let reason = format!("{}: {reason}", job.label);
+                console_warn!("{reason}");
+                return Response::from_json(&serde_json::json!({ "ignored": reason }));
+            }
             db.prepare(
                 "INSERT INTO jobs \
                  (id, installation_id, repository, run_id, label, status, queued_at, updated_at) \

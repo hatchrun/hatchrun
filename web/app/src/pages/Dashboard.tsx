@@ -66,40 +66,28 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
         <section className="card panel">
           <h2>Run a job on hatchrun</h2>
           <p className="muted">
-            Set <code>runs-on</code> to one hatchrun label. Each job gets a fresh instance in{" "}
+            Set <code>runs-on</code> to one runner profile. Each job gets a fresh instance in{" "}
             {tenant.aws?.region ?? "your AWS account"}.
           </p>
           <Snippet />
           <dl className="options">
             <div>
               <dt>
-                <code>arm64</code> or <code>amd64</code>
+                <code>hatchrun-2cpu</code> to <code>hatchrun-16cpu</code>
               </dt>
-              <dd>Architecture, amd64 by default</dd>
+              <dd>Built-in profiles, 4 GiB per vCPU, add <code>-arm64</code> for Graviton</dd>
             </div>
             <div>
               <dt>
-                <code>cpu=N</code>, <code>ram=N</code>
+                <code>/disk=N</code>, <code>/spot=true</code>
+              </dt>
+              <dd>Change one job's root volume or market</dd>
+            </div>
+            <div>
+              <dt>
+                <code>/cpu=N</code>, <code>/ram=N</code>
               </dt>
               <dd>At least N vCPUs, N GiB of memory</dd>
-            </div>
-            <div>
-              <dt>
-                <code>disk=N</code>
-              </dt>
-              <dd>Root volume of N GiB</dd>
-            </div>
-            <div>
-              <dt>
-                <code>spot</code>
-              </dt>
-              <dd>A Spot instance</dd>
-            </div>
-            <div>
-              <dt>
-                <code>type=c7g.xlarge</code>
-              </dt>
-              <dd>An exact instance type</dd>
             </div>
           </dl>
         </section>
@@ -166,7 +154,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
 }
 
 function Snippet() {
-  const text = "runs-on: hatchrun/arm64";
+  const text = "runs-on: hatchrun-4cpu-arm64";
   return (
     <div className="snippet">
       <pre>

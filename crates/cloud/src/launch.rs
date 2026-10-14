@@ -12,14 +12,17 @@
 //! `launching`, which only one request can do, and only while the tenant
 //! has fewer than `max_runners` runners launching or running. Then:
 //!
-//! 1. pick the instance type from the label and the image for its
-//!    architecture in the tenant's region;
+//! 1. resolve the label's runner profile (see [`crate::profiles`]),
+//!    pick its instance types in the tenant's region within what the
+//!    connect stack allows, and the image for its architecture;
 //! 2. sign an `oidc.hatchrun.io` token for the tenant and trade it for
 //!    the tenant role's credentials;
 //! 3. register a just-in-time runner with the job's label through the
 //!    App installation;
 //! 4. start the instance with a fresh broker ticket in its user data,
-//!    trying the tenant's subnets in order while they lack capacity;
+//!    trying the tenant's subnets in order and then the profile's other
+//!    instance types while they lack capacity, Spot before on-demand
+//!    for a Spot profile;
 //! 5. store the runner config in the broker under the ticket.
 //!
 //! The config is stored only once the instance exists, as the scaler
@@ -35,7 +38,8 @@ use worker::{D1Database, Env, Result, console_error, console_log, console_warn};
 use crate::aws::{self, Credentials, ec2, sts};
 use crate::fetch::send;
 use crate::http::Request;
-use crate::labels::Arch;
+use crate::instance::{Choice, Limits};
+use crate::profiles::{self, store};
 use crate::webhook::QueuedJob;
 use crate::{DB, github, instance, int, jwt, now_ms, oidc, settings, webcrypto};
 
@@ -71,6 +75,10 @@ struct Tenant {
     allowed_regions: Option<String>,
     /// 1 when the tenant holds a licence (see [`LICENSED`]).
     licensed: u8,
+    /// What its connect stack allows (see [`Limits::from_columns`]).
+    instance_types: Option<String>,
+    volume_size_limit: Option<u16>,
+    root_volume_size: Option<u16>,
 }
 
 /// SQL that is 1 for a tenant row that may launch: in the beta, or
@@ -147,7 +155,8 @@ async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
     let tenant: Option<Tenant> = db
         .prepare(format!(
             "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners, \
-             allowed_regions, {LICENSED} AS licensed \
+             allowed_regions, {LICENSED} AS licensed, instance_types, volume_size_limit, \
+             root_volume_size \
              FROM tenants WHERE installation_id = ?1 AND role_arn IS NOT NULL \
              AND region IS NOT NULL AND launch_template_id IS NOT NULL \
              AND subnet_ids IS NOT NULL"
@@ -268,12 +277,18 @@ async fn launch_claimed(
     tenant: &Tenant,
     name: &str,
 ) -> std::result::Result<String, String> {
+    let custom = store::named(db, &tenant.id, &job.spec.profile)
+        .await
+        .map_err(text)?;
+    let profile = profiles::resolve(&job.spec, custom)?;
+    let limits = Limits::from_columns(
+        tenant.instance_types.as_deref(),
+        tenant.volume_size_limit,
+        tenant.root_volume_size,
+    );
+    let choice = instance::choose(&profile, &tenant.region, &limits)?;
     let settings = Settings::read(env)?;
-    let choice = instance::choose(&job.spec)?;
-    let arch = match choice.arch {
-        Arch::Amd64 => "amd64",
-        Arch::Arm64 => "arm64",
-    };
+    let arch = choice.arch.as_str();
     let image: Image = db
         .prepare("SELECT image_id, root_device FROM images WHERE region = ?1 AND arch = ?2")
         .bind(&[tenant.region.as_str().into(), arch.into()])
@@ -302,7 +317,7 @@ async fn launch_claimed(
         job,
         tenant,
         name,
-        &choice.instance_type,
+        &choice,
         &image,
         &credentials,
         &config.encoded_jit_config,
@@ -336,7 +351,7 @@ async fn start(
     job: &QueuedJob,
     tenant: &Tenant,
     name: &str,
-    instance_type: &str,
+    choice: &Choice,
     image: &Image,
     credentials: &Credentials,
     config: &str,
@@ -357,9 +372,22 @@ async fn start(
     if subnets.is_empty() {
         subnets.push(None);
     }
+    let subnets = &subnets;
+    let markets: &[bool] = if choice.spot {
+        &[true, false]
+    } else {
+        &[false]
+    };
+    let attempts = markets.iter().flat_map(|spot| {
+        choice.instance_types.iter().flat_map(move |instance_type| {
+            subnets
+                .iter()
+                .map(move |subnet| (*spot, instance_type.as_str(), *subnet))
+        })
+    });
     let mut last_error = None;
     let mut instance_id = None;
-    for (index, subnet) in subnets.into_iter().enumerate() {
+    for (index, (spot, instance_type, subnet)) in attempts.enumerate() {
         let client_token = format!("{name}-{index}");
         let mut request = ec2::RunInstances {
             launch_template_id: &tenant.launch_template_id,
@@ -369,10 +397,9 @@ async fn start(
             user_data: &user_data,
             client_token: &client_token,
             tags: &tags,
-            spot: job.spec.spot,
-            root_volume: job
-                .spec
-                .disk_gib
+            spot,
+            root_volume: choice
+                .root_volume
                 .map(|size| (image.root_device.as_str(), size)),
         }
         .request(&endpoint);
@@ -384,18 +411,22 @@ async fn start(
             }
             Err(err) if ec2::CAPACITY_ERRORS.contains(&err.code.as_str()) => {
                 console_warn!(
-                    "job {}: {}: {err}",
+                    "job {}: {instance_type}{} in {}: {err}",
                     job.id,
+                    if spot { " Spot" } else { "" },
                     subnet.unwrap_or("template network")
                 );
                 last_error = Some(err);
             }
-            Err(err) => return Err(format!("RunInstances: {err}")),
+            Err(err) => return Err(format!("RunInstances {instance_type}: {err}")),
         }
     }
     let Some(instance_id) = instance_id else {
         return Err(match last_error {
-            Some(err) => format!("no subnet had capacity: {err}"),
+            Some(err) => format!(
+                "no capacity for {} in any subnet: {err}",
+                choice.instance_types.join(", ")
+            ),
             None => "no subnet to launch in".to_owned(),
         });
     };
@@ -571,6 +602,9 @@ mod tests {
             max_runners: 1,
             allowed_regions: None,
             licensed: 1,
+            instance_types: None,
+            volume_size_limit: None,
+            root_volume_size: None,
         };
         assert_eq!(tenant.subnets(), ["subnet-b", "subnet-a"]);
     }

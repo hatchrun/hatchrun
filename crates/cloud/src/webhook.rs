@@ -78,7 +78,9 @@ pub struct QueuedJob {
     pub repository: String,
     /// The job's hatchrun label, as written in the workflow.
     pub label: String,
-    /// The runner the label asks for.
+    /// The runner profile the label names and its overrides. Whether
+    /// the organization has that profile is checked when the job is
+    /// recorded.
     pub spec: labels::Spec,
 }
 
@@ -198,7 +200,7 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Event, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::labels::{Arch, Spec};
+    use crate::labels::{Overrides, Spec};
 
     /// Signature cases from `testdata/signatures.tsv`: secret, body,
     /// signature header and whether it verifies.
@@ -274,16 +276,23 @@ mod tests {
     #[test]
     fn records_a_queued_hatchrun_job() {
         assert_eq!(
-            parse("workflow_job", &job("queued", &["hatchrun/arm64"])).unwrap(),
+            parse(
+                "workflow_job",
+                &job("queued", &["hatchrun-4cpu-arm64/disk=100"])
+            )
+            .unwrap(),
             Event::Queued(QueuedJob {
                 id: 29_679_449,
                 run_id: 5,
                 installation_id: 42,
                 repository: "acme/app".to_owned(),
-                label: "hatchrun/arm64".to_owned(),
+                label: "hatchrun-4cpu-arm64/disk=100".to_owned(),
                 spec: Spec {
-                    arch: Arch::Arm64,
-                    ..Spec::default()
+                    profile: "hatchrun-4cpu-arm64".to_owned(),
+                    overrides: Overrides {
+                        disk_gib: Some(100),
+                        ..Overrides::default()
+                    },
                 },
             })
         );
@@ -296,8 +305,8 @@ mod tests {
             Event::Ignored("no hatchrun label".to_owned())
         );
         assert_eq!(
-            parse("workflow_job", &job("queued", &["hatchrun/gpu"])).unwrap(),
-            Event::Ignored("hatchrun/gpu: unknown option \"gpu\"".to_owned())
+            parse("workflow_job", &job("queued", &["hatchrun-4cpu/gpu=1"])).unwrap(),
+            Event::Ignored("hatchrun-4cpu/gpu=1: unknown option \"gpu=1\"".to_owned())
         );
         assert_eq!(
             parse("workflow_job", &job("waiting", &["hatchrun"])).unwrap(),

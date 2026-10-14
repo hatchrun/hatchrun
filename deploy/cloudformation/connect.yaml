@@ -46,10 +46,11 @@ Parameters:
       OidcProviderArn output of the first one.
   InstanceTypes:
     Type: CommaDelimitedList
-    Default: "c7g.*,c7i.*,m7g.*,m7i.*,r7g.*,r7i.*"
+    Default: "c7g.*,c7i.*,c8g.*,c8i.*,m7g.*,m7i.*,m8g.*,m8i.*,r7g.*,r7i.*,r8g.*,r8i.*"
     Description: >-
-      Instance types jobs may ask for, wildcards allowed. AWS refuses any
-      other type, whatever a workflow asks for.
+      Instance types jobs may ask for, wildcards allowed, at most 256
+      characters in all. AWS refuses any other type, whatever a workflow
+      asks for, and the app offers only these.
   VolumeSizeLimit:
     Type: Number
     Default: 200
@@ -188,8 +189,9 @@ Resources:
   # labels. Runners get no instance profile: the agent claims its runner
   # config from the hatchrun.io broker with a one-time ticket in user
   # data, and jobs that need AWS use GitHub's OIDC.
-  # The tags let hatchrun.io find this template, and the subnets runners
-  # launch into, from the role alone.
+  # The tags let hatchrun.io find this template, the subnets runners
+  # launch into and the limits above from the role alone, so the app
+  # offers only runners the role can launch.
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -202,6 +204,9 @@ Resources:
                 - CreateVpc
                 - !Join [",", [!Ref SubnetA, !Ref SubnetB]]
                 - !Join [",", !Ref SubnetIds]
+            - { Key: "hatchrun:instance-types", Value: !Join [",", !Ref InstanceTypes] }
+            - { Key: "hatchrun:volume-size-limit", Value: !Ref VolumeSizeLimit }
+            - { Key: "hatchrun:root-volume-size", Value: !Ref RootVolumeSize }
       LaunchTemplateData:
         SecurityGroupIds: [!Ref RunnerSecurityGroup]
         InstanceInitiatedShutdownBehavior: terminate

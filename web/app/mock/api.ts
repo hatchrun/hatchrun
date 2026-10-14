@@ -305,11 +305,11 @@ function sampleJobs(now: number) {
     updatedAt: now - queuedAgo * minute + took * 1000,
   });
   return [
-    job(9123, "acme-corp/api", "hatchrun/arm64/cpu=8", "queued", null, 0.2, 0),
+    job(9123, "acme-corp/api", "hatchrun-8cpu-arm64", "queued", null, 0.2, 0),
     job(9122, "acme-corp/web", "hatchrun", "in_progress", "launched", 3, 0),
-    job(9121, "acme-corp/api", "hatchrun/arm64/cpu=8/spot", "in_progress", "launched", 6, 0),
-    job(9120, "acme-corp/infra", "hatchrun/type=c7i.4xlarge", "completed", "failed", 22, 4,
-      "RunInstances: UnauthorizedOperation: You are not authorized to perform this operation."),
+    job(9121, "acme-corp/api", "hatchrun-8cpu-arm64/spot=true", "in_progress", "launched", 6, 0),
+    job(9120, "acme-corp/infra", "hatchrun-16cpu/disk=300", "completed", "failed", 22, 4,
+      "hatchrun-16cpu asks for a 300 GiB root volume and the connect stack allows at most 200 GiB. Raise VolumeSizeLimit on the stack or ask for less."),
     job(9119, "acme-corp/web", "hatchrun", "completed", "launched", 41, 312),
   ];
 }

@@ -20,12 +20,13 @@ use crate::http::{Request, Response};
 /// EC2 API version.
 const VERSION: &str = "2016-11-15";
 
-/// Error codes that mean "try the next subnet".
+/// Error codes that mean "try the next subnet or instance type".
 pub const CAPACITY_ERRORS: &[&str] = &[
     "InsufficientInstanceCapacity",
     "InsufficientFreeAddressesInSubnet",
     "Unsupported",
     "SpotMaxPriceTooLow",
+    "MaxSpotInstanceCountExceeded",
 ];
 
 /// Tag with the tenant id; the role only launches and manages instances
@@ -34,6 +35,13 @@ pub const TAG_TENANT: &str = "hatchrun:tenant";
 /// Tag connect.yaml puts on its launch template with the subnets runners
 /// launch into, comma separated, so the app finds them from the role.
 pub const TAG_SUBNETS: &str = "hatchrun:subnets";
+/// Tags connect.yaml puts on its launch template with its
+/// `InstanceTypes`, `VolumeSizeLimit` and `RootVolumeSize` parameters.
+pub const TAG_INSTANCE_TYPES: &str = "hatchrun:instance-types";
+/// See [`TAG_INSTANCE_TYPES`].
+pub const TAG_VOLUME_SIZE_LIMIT: &str = "hatchrun:volume-size-limit";
+/// See [`TAG_INSTANCE_TYPES`].
+pub const TAG_ROOT_VOLUME_SIZE: &str = "hatchrun:root-volume-size";
 /// Tag with the workflow job id.
 pub const TAG_JOB_ID: &str = "hatchrun:job-id";
 /// Tag with the runner name.
@@ -193,6 +201,12 @@ pub struct LaunchTemplate {
     pub created: String,
     /// The subnets from its [`TAG_SUBNETS`] tag, in order.
     pub subnets: Vec<String>,
+    /// Its [`TAG_INSTANCE_TYPES`] tag; none on templates from before it.
+    pub instance_types: Option<String>,
+    /// Its [`TAG_VOLUME_SIZE_LIMIT`] tag.
+    pub volume_size_limit: Option<u16>,
+    /// Its [`TAG_ROOT_VOLUME_SIZE`] tag.
+    pub root_volume_size: Option<u16>,
 }
 
 /// Reads the launch templates out of the answer.
@@ -216,11 +230,13 @@ pub fn launch_templates(response: &Response) -> Result<Vec<LaunchTemplate>, Erro
                     .find(|child| child.tag_name().name() == name)
                     .and_then(|child| child.text())
             };
-            let subnets = item
-                .descendants()
-                .filter(|node| node.tag_name().name() == "item")
-                .find(|tag| child_text(*tag, "key") == Some(TAG_SUBNETS))
-                .and_then(|tag| child_text(tag, "value"))
+            let tag = |key: &str| {
+                item.descendants()
+                    .filter(|node| node.tag_name().name() == "item")
+                    .find(|tag| child_text(*tag, "key") == Some(key))
+                    .and_then(|tag| child_text(tag, "value"))
+            };
+            let subnets = tag(TAG_SUBNETS)
                 .unwrap_or_default()
                 .split(',')
                 .map(str::trim)
@@ -233,6 +249,9 @@ pub fn launch_templates(response: &Response) -> Result<Vec<LaunchTemplate>, Erro
                     .to_owned(),
                 created: field("createTime").unwrap_or_default().to_owned(),
                 subnets,
+                instance_types: tag(TAG_INSTANCE_TYPES).map(str::to_owned),
+                volume_size_limit: tag(TAG_VOLUME_SIZE_LIMIT).and_then(|size| size.parse().ok()),
+                root_volume_size: tag(TAG_ROOT_VOLUME_SIZE).and_then(|size| size.parse().ok()),
             })
         })
         .collect()
@@ -496,6 +515,9 @@ mod tests {
       <tagSet>
         <item><key>hatchrun:tenant</key><value>abc12345</value></item>
         <item><key>hatchrun:subnets</key><value>subnet-a, subnet-b</value></item>
+        <item><key>hatchrun:instance-types</key><value>m8g.*,c7i.large</value></item>
+        <item><key>hatchrun:volume-size-limit</key><value>500</value></item>
+        <item><key>hatchrun:root-volume-size</key><value>40</value></item>
       </tagSet>
     </item>
   </launchTemplates>
@@ -508,6 +530,9 @@ mod tests {
                 id: "lt-0abc".to_owned(),
                 created: "2026-10-14T10:00:00.000Z".to_owned(),
                 subnets: vec!["subnet-a".to_owned(), "subnet-b".to_owned()],
+                instance_types: Some("m8g.*,c7i.large".to_owned()),
+                volume_size_limit: Some(500),
+                root_volume_size: Some(40),
             }]
         );
         let none = Response {

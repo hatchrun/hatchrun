@@ -671,7 +671,7 @@ mod tests {
         cancelled.updated_at = NOW - 4 * MIN;
         let waiting = job(2, Status::Queued, None);
         let mut other = job(3, Status::Queued, None);
-        other.label = "hatchrun/arm64".to_owned();
+        other.label = "hatchrun-4cpu-arm64".to_owned();
         let instances = [instance("i-1", 1, 6 * MIN)];
         let plan = plan(
             NOW,
