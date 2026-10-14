@@ -334,8 +334,13 @@ mod tests {
 
     #[test]
     fn registers_a_runner_with_the_job_label_only() {
-        let request =
-            generate_jit_config(API, "acme", "ghs_x", "hatchrun-7-ab12", "hatchrun/arm64");
+        let request = generate_jit_config(
+            API,
+            "acme",
+            "ghs_x",
+            "hatchrun-7-ab12",
+            "hatchrun-4cpu-arm64",
+        );
         assert_eq!(
             request.url,
             "https://api.github.com/orgs/acme/actions/runners/generate-jitconfig"
@@ -346,7 +351,7 @@ mod tests {
             serde_json::json!({
                 "name": "hatchrun-7-ab12",
                 "runner_group_id": 1,
-                "labels": ["hatchrun/arm64"],
+                "labels": ["hatchrun-4cpu-arm64"],
                 "work_folder": "_work",
             })
         );

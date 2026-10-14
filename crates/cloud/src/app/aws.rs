@@ -10,6 +10,7 @@
 //!   the stack in that region and saves it.
 
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::JsValue;
 use worker::Response;
 
 use super::tenants::{authorize, show};
@@ -165,22 +166,41 @@ pub(crate) async fn verify(ctx: &Ctx<'_>, org: &str, body: Connect) -> Answer {
         return Err(refused(format!("Subnet {missing} does not exist")));
     }
 
+    save(ctx, &row.id, role_arn, &body.region, &template).await?;
+    show(ctx, &row.org_login).await
+}
+
+/// Records the verified connection and the stack's limits.
+async fn save(
+    ctx: &Ctx<'_>,
+    tenant: &str,
+    role_arn: &str,
+    region: &str,
+    template: &ec2::LaunchTemplate,
+) -> worker::Result<()> {
     ctx.db
         .prepare(
             "UPDATE tenants SET role_arn = ?2, region = ?3, launch_template_id = ?4, \
-             subnet_ids = ?5, updated_at = ?6 WHERE id = ?1",
+             subnet_ids = ?5, updated_at = ?6, instance_types = ?7, volume_size_limit = ?8, \
+             root_volume_size = ?9 WHERE id = ?1",
         )
         .bind(&[
-            row.id.as_str().into(),
+            tenant.into(),
             role_arn.into(),
-            body.region.as_str().into(),
+            region.into(),
             template.id.as_str().into(),
             template.subnets.join(",").into(),
             int(now_ms())?,
+            template
+                .instance_types
+                .as_deref()
+                .map_or(JsValue::NULL, Into::into),
+            template.volume_size_limit.map_or(JsValue::NULL, Into::into),
+            template.root_volume_size.map_or(JsValue::NULL, Into::into),
         ])?
         .run()
         .await?;
-    show(ctx, &row.org_login).await
+    Ok(())
 }
 
 fn describe_failure(action: &str, err: &aws::Error) -> Failure {

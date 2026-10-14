@@ -16,6 +16,8 @@
 //! - `/api/tenants/<org>/aws` connects the AWS account (see [`aws`]).
 //! - `/api/tenants/<org>/{jobs,settings}` serve the dashboard (see
 //!   [`dashboard`]).
+//! - `/api/tenants/<org>/runners` manages runner profiles (see
+//!   [`runners`]).
 //! - `/api/plan`, `/api/tenants/<org>/{checkout,portal,beta}` and
 //!   `/api/polar/webhook` handle the licence (see [`billing`]).
 //!
@@ -25,6 +27,7 @@
 mod aws;
 mod billing;
 mod dashboard;
+mod runners;
 mod tenants;
 
 use serde::Deserialize;
@@ -239,6 +242,9 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Get, ["tenants", org, "jobs"]) => dashboard::jobs(&ctx, org, &req).await,
         (Method::Put, ["tenants", org, "settings"]) => {
             dashboard::settings(&ctx, org, req.json().await?).await
+        }
+        (method, ["tenants", org, "runners", rest @ ..]) => {
+            runners::route(&ctx, org, method, rest, &mut req).await
         }
         (Method::Get, ["plan"]) => billing::plan(&ctx).await,
         (Method::Post, ["tenants", org, "checkout"]) => billing::checkout(&ctx, org).await,

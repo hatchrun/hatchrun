@@ -136,6 +136,9 @@ mod tests {
             id: id.to_owned(),
             created: created.to_owned(),
             subnets: Vec::new(),
+            instance_types: None,
+            volume_size_limit: None,
+            root_volume_size: None,
         };
         assert_eq!(
             newest(vec![

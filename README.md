@@ -175,17 +175,45 @@ npx wrangler@4.143.0 deploy
 [`crates/cloud`](crates/cloud) is the Cloudflare Worker behind the
 hosted service. Instead of a scaler per scale set, it takes the
 `workflow_job` webhooks of the hatchrun GitHub App and records every job
-whose only `runs-on` label is `hatchrun` or starts with `hatchrun/`, in
-D1, once per job. Options in the label pick the runner:
+whose only `runs-on` label names a runner profile, in D1, once per job.
+A profile names instance families in order of preference, vCPU and
+memory bounds, a root volume, Spot or on-demand, and an image.
 
 ```yaml
-runs-on: hatchrun/arm64/cpu=8/disk=100/spot
+runs-on: hatchrun-4cpu-arm64
 ```
 
-The options are `amd64` or `arm64`, `cpu=N`, `ram=N` (GiB), `disk=N`
-(GiB), `spot` and `type=INSTANCE_TYPE`. A job with an unknown option, or
-with other labels next to the hatchrun one, is skipped, and the App's
-webhook delivery log says why.
+Every organization has the built-in profiles `hatchrun-2cpu`,
+`hatchrun-4cpu`, `hatchrun-8cpu` and `hatchrun-16cpu` (amd64, `m8i`
+then `m7i`), the same with `-arm64` (Graviton, `m8g` then `m7g`), all
+with 4 GiB per vCPU and on-demand, and `hatchrun`, which is
+`hatchrun-2cpu`. Owners add their own profiles in the app, named
+`hatchrun-` and anything, and a profile named like a built-in replaces
+it for that organization.
+
+One job can change its profile with overrides in the same label:
+
+```yaml
+runs-on: hatchrun-4cpu/disk=200/spot=true
+```
+
+The overrides are `cpu=N` (at least N vCPUs), `ram=N` (at least N GiB),
+`disk=N` (GiB) and `spot=true` or `spot=false`. A Spot runner falls
+back to on-demand when Spot has no capacity. A job with an unknown
+profile or option, or with other labels next to the hatchrun one, is
+skipped, and the App's webhook delivery log says why. There is one
+label on purpose: GitHub gives a job any runner whose labels include
+all of the job's labels, so with label sets a job asking for less can
+take the runner launched for a job asking for more and leave that job
+waiting.
+
+The instance type comes from the profile and the tenant's region: the
+smallest size that fits in the first family the region offers and the
+connect stack allows. The stack's `InstanceTypes` and `VolumeSizeLimit`
+stay the final word; when nothing they allow fits, the job fails and
+the app says why. [`scripts/ec2-catalog.py`](crates/cloud/scripts/ec2-catalog.py)
+writes the families, sizes and prices the Worker knows from AWS's
+public price lists.
 
 ```sh
 npm --prefix web/app ci && npm --prefix web/app run build
