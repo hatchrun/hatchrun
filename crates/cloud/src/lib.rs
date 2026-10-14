@@ -39,6 +39,7 @@ pub mod instance_types;
 pub mod jwt;
 pub mod labels;
 mod launch;
+pub mod offerings;
 pub mod oidc;
 pub mod polar;
 pub mod profiles;

@@ -139,6 +139,7 @@ mod tests {
             instance_types: None,
             volume_size_limit: None,
             root_volume_size: None,
+            fleet: false,
         };
         assert_eq!(
             newest(vec![
