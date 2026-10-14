@@ -28,7 +28,7 @@
 //! someone removed as an owner loses access at once.
 
 use serde::{Deserialize, Serialize};
-use worker::{Request, Response};
+use worker::{Request, Response, console_error};
 
 use super::billing::{Billing, billing, join_listed_beta};
 use super::{Answer, Ctx, Failure, found};
@@ -162,15 +162,28 @@ async fn view(ctx: &Ctx<'_>, row: TenantRow) -> worker::Result<TenantView> {
 
 /// The user's membership of `org` on GitHub, if they own it.
 async fn owned(ctx: &Ctx<'_>, org: &str) -> Result<Option<Membership>, Failure> {
-    let membership = github::parse_membership(
-        &send(&github::membership(
-            &ctx.config.github_api,
-            &ctx.session.token,
-            org,
-        ))
-        .await?,
-    )?;
-    Ok(membership.filter(Membership::is_admin))
+    Ok(membership(ctx, org)
+        .await?
+        .map_err(|refusal| Failure::new(403, refusal.message(org)))?
+        .filter(Membership::is_admin))
+}
+
+/// The user's membership of `org`, `None` when they are not in it, or
+/// [`Refusal::OwnerUnknown`] when GitHub refuses to say.
+async fn membership(
+    ctx: &Ctx<'_>,
+    org: &str,
+) -> Result<Result<Option<Membership>, Refusal>, Failure> {
+    let answer = send(&github::membership(
+        &ctx.config.github_api,
+        &ctx.session.token,
+        org,
+    ))
+    .await?;
+    if answer.status == 403 {
+        return Ok(Err(Refusal::OwnerUnknown));
+    }
+    Ok(Ok(github::parse_membership(&answer)?))
 }
 
 /// The tenant of `org`, if the user is a member and owns the
@@ -324,14 +337,10 @@ async fn adopt(
         };
         return Ok(Err((refusal, login)));
     }
-    let membership = github::parse_membership(
-        &send(&github::membership(
-            &ctx.config.github_api,
-            &ctx.session.token,
-            &login,
-        ))
-        .await?,
-    )?;
+    let membership = match membership(ctx, &login).await? {
+        Ok(membership) => membership,
+        Err(refusal) => return Ok(Err((refusal, login))),
+    };
     if let Err(refusal) = install::check_owner(&installation, membership.as_ref()) {
         return Ok(Err((refusal, login)));
     }
@@ -460,12 +469,18 @@ pub(crate) async fn setup(ctx: &Ctx<'_>, req: &Request) -> Answer {
     if !session::check_install_state(&ctx.session.id, &state) {
         return Ok(back("/?error=install-state")?);
     }
-    Ok(match adopt(ctx, installation_id).await? {
-        Ok(login) => back(&format!("/o/{login}?installed=1"))?,
-        Err((refusal, login)) => back(&format!(
+    // The browser came from GitHub, so it gets a page of the app, not
+    // a JSON error.
+    Ok(match adopt(ctx, installation_id).await {
+        Ok(Ok(login)) => back(&format!("/o/{login}?installed=1"))?,
+        Ok(Err((refusal, login))) => back(&format!(
             "/?error={}&account={}",
             refusal.code(),
             crate::http::encode(&login)
         ))?,
+        Err(failure) => {
+            console_error!("setup {installation_id}: {}", failure.message);
+            back("/?error=install-failed")?
+        }
     })
 }
