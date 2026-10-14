@@ -281,9 +281,14 @@ Resources:
                   - ec2:DescribeSpotPriceHistory
                   - ec2:DescribeSubnets
                 Resource: "*"
+              # Instances only through RunInstances, which is also how EC2
+              # authorizes each instance a fleet starts, with the launch
+              # template version's settings as the condition keys.
+              # CreateFleet is never allowed on instances: it would be
+              # checked without any of these keys.
               - Sid: LaunchInstances
                 Effect: Allow
-                Action: [ec2:RunInstances, ec2:CreateFleet]
+                Action: ec2:RunInstances
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                 Condition:
                   StringEquals:
@@ -335,16 +340,20 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplate}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${RunnerSecurityGroup}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
-              # Each launch is an instant EC2 Fleet of one, which also
-              # needs the fleet itself; the instance it starts is held to
-              # the statements above.
+              # Each launch is an instant EC2 Fleet of one. The fleet is
+              # checked on the subnets, template, image, volumes and
+              # security group above and on itself; the instance it
+              # starts is held to LaunchInstances.
               - Sid: LaunchFleet
                 Effect: Allow
                 Action: ec2:CreateFleet
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:fleet/*"
-              # A fleet takes no user data or root volume of its own, so
-              # each launch adds a version of this template with them and
-              # deletes it after. The default version never changes.
+              # A fleet takes no user data, root volume or instance tags of
+              # its own, so each launch adds a version of this template
+              # with them and deletes it after. The default version never
+              # changes, and a version that loosens the metadata or
+              # volume settings cannot launch: LaunchInstances and
+              # LaunchVolumes still refuse it.
               - Sid: RunnerTemplateVersions
                 Effect: Allow
                 Action:
@@ -360,7 +369,7 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
                 Condition:
                   StringEquals:
-                    ec2:CreateAction: [RunInstances, CreateFleet]
+                    ec2:CreateAction: RunInstances
               - Sid: ManageOwnInstances
                 Effect: Allow
                 Action:
