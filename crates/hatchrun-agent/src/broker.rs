@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Claims the runner config from hatchrun-broker.
+//! Claims the runner's boot document from hatchrun-broker.
 
 use std::time::Duration;
 
@@ -49,7 +49,7 @@ impl Broker for HttpBroker {
         };
         match response.status() {
             StatusCode::OK => {
-                let claimed: Claimed = response.json().await.context("read claimed config")?;
+                let claimed: Claimed = response.json().await.context("read claimed document")?;
                 Ok(Some(claimed.config))
             }
             // Not stored yet. The scaler stores the config after the
@@ -64,8 +64,9 @@ impl Broker for HttpBroker {
     }
 }
 
-/// Builds the claim URL. The config is a credential, so it only travels
-/// over HTTPS; plain HTTP is accepted for loopback addresses, for tests.
+/// Builds the claim URL. The boot document holds credentials, so it only
+/// travels over HTTPS; plain HTTP is accepted for loopback addresses, for
+/// tests.
 fn claim_url(broker: &str, ticket: &str) -> Result<Url> {
     let mut url = Url::parse(broker).with_context(|| format!("broker URL {broker:?}"))?;
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));

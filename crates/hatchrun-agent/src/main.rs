@@ -137,12 +137,16 @@ async fn run(args: Args) -> Result<()> {
         poll_interval: args.poll_interval,
     };
 
-    let jit_config = tokio::select! {
-        result = tokio::time::timeout(args.config_timeout, resolver.jit_config()) => {
+    let boot = tokio::select! {
+        result = tokio::time::timeout(args.config_timeout, resolver.boot()) => {
             result.map_err(|_| anyhow!("no runner config after {:?}", args.config_timeout))??
         }
         () = &mut shutdown => bail!("stopped before the runner config arrived"),
     };
+
+    if let Some(telemetry) = &boot.telemetry {
+        info!(url = telemetry.url, "hosted launch");
+    }
 
     let runner = Runner {
         dir: args.runner_dir,
@@ -151,7 +155,7 @@ async fn run(args: Args) -> Result<()> {
         stop_timeout: args.stop_timeout,
     };
     info!(dir = %runner.dir.display(), user = runner.user.as_deref().unwrap_or("(agent)"), "starting runner");
-    let status = runner.run(&jit_config, shutdown).await?;
+    let status = runner.run(&boot.jit_config, shutdown).await?;
     if !status.success() {
         bail!("runner exited with {status}");
     }

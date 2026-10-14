@@ -11,6 +11,7 @@ use web_sys::{Crypto, CryptoKey};
 use worker::{Error, Result};
 
 const RS256: &str = "RSASSA-PKCS1-v1_5";
+const ED25519: &str = "Ed25519";
 
 fn crypto() -> Result<Crypto> {
     Ok(Reflect::get(&js_sys::global(), &"crypto".into())?.unchecked_into())
@@ -48,17 +49,33 @@ pub fn random_bytes(n: usize) -> Result<Vec<u8>> {
 ///
 /// When `WebCrypto` refuses the key.
 pub async fn sign_rs256(pkcs8: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    let subtle = crypto()?.subtle();
     let algorithm = Object::new();
     Reflect::set(&algorithm, &"name".into(), &RS256.into())?;
     Reflect::set(&algorithm, &"hash".into(), &"SHA-256".into())?;
+    sign(pkcs8, &algorithm, RS256, data).await
+}
+
+/// Signs `data` with Ed25519 using a PKCS#8 Ed25519 private key (see
+/// [`crate::jwt::ed25519_pkcs8_der`]).
+///
+/// # Errors
+///
+/// When `WebCrypto` refuses the key.
+pub async fn sign_ed25519(pkcs8: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    let algorithm = Object::new();
+    Reflect::set(&algorithm, &"name".into(), &ED25519.into())?;
+    sign(pkcs8, &algorithm, ED25519, data).await
+}
+
+async fn sign(pkcs8: &[u8], algorithm: &Object, name: &str, data: &[u8]) -> Result<Vec<u8>> {
+    let subtle = crypto()?.subtle();
     let usages = Array::of1(&"sign".into());
     let key: CryptoKey = JsFuture::from(
         subtle
             .import_key_with_object(
                 "pkcs8",
                 &Uint8Array::from(pkcs8).into(),
-                &algorithm,
+                algorithm,
                 false,
                 &usages,
             )
@@ -69,7 +86,7 @@ pub async fn sign_rs256(pkcs8: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     .unchecked_into();
     let signature: ArrayBuffer = JsFuture::from(
         subtle
-            .sign_with_str_and_u8_array(RS256, &key, data)
+            .sign_with_str_and_u8_array(name, &key, data)
             .map_err(js_error)?,
     )
     .await

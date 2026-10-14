@@ -27,7 +27,9 @@
 //!    [`crate::offerings`]); otherwise with `RunInstances`, trying the
 //!    subnets in order and then the profile's other instance types,
 //!    Spot before on-demand for a Spot profile;
-//! 5. store the runner config in the broker under the ticket.
+//! 5. store the runner's boot document in the broker under the ticket:
+//!    its config, and a token for reporting its CPU and memory to
+//!    hatchrun-telemetry (see [`crate::telemetry`]).
 //!
 //! The config is stored only once the instance exists, as the scaler
 //! does. When a step after registration fails, the runner is removed and
@@ -50,7 +52,9 @@ use crate::offerings::{self, Candidate, Unavailable};
 use crate::profiles::{self, store};
 use crate::reconcile::retry::{Cause, Failure};
 use crate::webhook::QueuedJob;
-use crate::{DB, github, instance, instance_types, int, jwt, now_ms, oidc, settings, webcrypto};
+use crate::{
+    DB, github, instance, instance_types, int, jwt, now_ms, oidc, settings, telemetry, webcrypto,
+};
 
 /// Variable with the App's client id.
 const APP_ID: &str = "GITHUB_APP_ID";
@@ -124,6 +128,8 @@ struct Settings {
     oidc_kid: String,
     broker_url: String,
     broker_token: String,
+    telemetry_key: Vec<u8>,
+    telemetry_url: String,
     github_api: String,
     aws_endpoint: Option<String>,
 }
@@ -145,6 +151,9 @@ impl Settings {
             oidc_kid: need(oidc::KEY_ID)?,
             broker_url: need(BROKER_URL)?.trim_end_matches('/').to_owned(),
             broker_token: need(BROKER_TOKEN)?,
+            telemetry_key: jwt::ed25519_pkcs8_der(&need(telemetry::SIGNING_KEY)?)
+                .map_err(|err| format!("{}: {err}", telemetry::SIGNING_KEY))?,
+            telemetry_url: need(telemetry::URL)?.trim_end_matches('/').to_owned(),
             github_api: get(GITHUB_API_URL)
                 .unwrap_or_else(|| github::API.to_owned())
                 .trim_end_matches('/')
@@ -433,7 +442,7 @@ async fn launch_claimed(
     result
 }
 
-/// Starts the instance and hands its config to the broker.
+/// Starts the instance and hands its boot document to the broker.
 #[allow(clippy::too_many_arguments)]
 async fn start(
     settings: &Settings,
@@ -447,6 +456,8 @@ async fn start(
     config: &str,
 ) -> std::result::Result<String, Failure> {
     let ticket = jwt::b64url(webcrypto::random_bytes(32).map_err(internal)?);
+    let token = telemetry_token(settings, job, tenant, name).await?;
+    let boot = telemetry::boot_document(config, &settings.telemetry_url, &token);
     let launch = Launch {
         job_id: job.id.to_string(),
         tenant,
@@ -463,7 +474,7 @@ async fn start(
     } else {
         run_instances(&launch).await?
     };
-    if let Err(err) = store_config(settings, &ticket, config).await {
+    if let Err(err) = store_config(settings, &ticket, &boot).await {
         // Without its config the instance would wait out the agent's
         // timeout before powering off.
         terminate(&launch.endpoint, credentials, &tenant.region, &instance_id).await;
@@ -884,6 +895,26 @@ async fn github_send(
     Ok(response)
 }
 
+/// The runner's token for hatchrun-telemetry.
+async fn telemetry_token(
+    settings: &Settings,
+    job: &QueuedJob,
+    tenant: &Tenant,
+    name: &str,
+) -> std::result::Result<String, Failure> {
+    let runner = telemetry::Runner {
+        tenant: &tenant.id,
+        installation_id: job.installation_id,
+        job_id: job.id,
+        runner_name: name,
+    };
+    let input = telemetry::signing_input(runner, now_ms() / 1000);
+    let signature = webcrypto::sign_ed25519(&settings.telemetry_key, input.as_bytes())
+        .await
+        .map_err(|err| Failure::new(Cause::Settings, format!("sign telemetry token: {err}")))?;
+    Ok(jwt::token(&input, &signature))
+}
+
 /// The App's JWT, signed with its private key in PKCS#8 DER.
 pub(crate) async fn app_jwt(app_id: &str, pkcs8: &[u8]) -> std::result::Result<String, String> {
     let input = github::app_jwt_signing_input(app_id, now_ms() / 1000);
@@ -893,11 +924,12 @@ pub(crate) async fn app_jwt(app_id: &str, pkcs8: &[u8]) -> std::result::Result<S
     Ok(jwt::token(&input, &signature))
 }
 
-/// Stores the config under the ticket, retrying while the broker is busy.
+/// Stores the boot document under the ticket, retrying while the broker
+/// is busy.
 async fn store_config(
     settings: &Settings,
     ticket: &str,
-    config: &str,
+    boot: &str,
 ) -> std::result::Result<(), Failure> {
     let request = Request::new(
         "PUT",
@@ -905,7 +937,7 @@ async fn store_config(
     )
     .header("Authorization", format!("Bearer {}", settings.broker_token))
     .header("Content-Type", "application/json")
-    .body(serde_json::json!({ "config": config, "expiresIn": BROKER_EXPIRES_IN }).to_string());
+    .body(serde_json::json!({ "config": boot, "expiresIn": BROKER_EXPIRES_IN }).to_string());
     let mut last = String::new();
     for attempt in 1..=BROKER_ATTEMPTS {
         match send(&request).await {

@@ -25,7 +25,7 @@ const ATTEMPTS: u32 = 3;
 pub trait ConfigStore {
     /// The broker URL instances claim from.
     fn url(&self) -> &str;
-    /// Stores the config under the ticket.
+    /// Stores the JIT config under the ticket, in a boot document.
     fn store(&self, ticket: &str, config: &Secret) -> impl Future<Output = Result<()>>;
 }
 
@@ -62,7 +62,10 @@ impl Broker {
             .http
             .put(format!("{}/v1/tickets/{ticket}", self.url))
             .bearer_auth(self.token.expose())
-            .json(&serde_json::json!({ "config": config.expose(), "expiresIn": EXPIRES_IN }))
+            .json(&serde_json::json!({
+                "config": boot_document(config.expose()),
+                "expiresIn": EXPIRES_IN,
+            }))
             .send()
             .await;
         let response = match response {
@@ -114,8 +117,14 @@ pub fn new_ticket() -> Result<String> {
 }
 
 /// The user data the agent reads to find its config.
-pub fn boot_document(broker: &str, ticket: &str) -> String {
+pub fn user_data(broker: &str, ticket: &str) -> String {
     serde_json::json!({ "broker": broker, "ticket": ticket }).to_string()
+}
+
+/// What the agent claims from the broker. hatchrun.io adds where to
+/// report metrics; a self-hosted scaler reports nothing.
+fn boot_document(jit_config: &str) -> String {
+    serde_json::json!({ "jitConfig": jit_config }).to_string()
 }
 
 #[cfg(test)]
@@ -142,10 +151,15 @@ mod tests {
     }
 
     #[test]
-    fn boot_document_holds_no_config() {
+    fn user_data_holds_no_config() {
         assert_eq!(
-            boot_document("https://b.example", "t-1"),
+            user_data("https://b.example", "t-1"),
             r#"{"broker":"https://b.example","ticket":"t-1"}"#
         );
+    }
+
+    #[test]
+    fn boot_document_has_no_telemetry() {
+        assert_eq!(boot_document("jit-1"), r#"{"jitConfig":"jit-1"}"#);
     }
 }
