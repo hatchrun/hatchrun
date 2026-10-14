@@ -202,7 +202,9 @@ in [`web/app`](web/app), built into static assets, and its API under
 `/api`. Sign-in uses the hatchrun App's user authorization, GitHub's
 OAuth web flow with a state and PKCE; the App lists
 `https://app.hatchrun.io/api/auth/callback` as its callback URL and the
-client secret is the `GITHUB_CLIENT_SECRET` secret. A session is a
+client secret is the `GITHUB_CLIENT_SECRET` Worker secret, stored in
+the `production` environment as `APP_CLIENT_SECRET` (GitHub refuses
+secret names that start with `GITHUB_`). A session is a
 random id in an `HttpOnly` cookie; D1 keeps only its hash, and the
 user's GitHub token sealed under a key derived from it.
 
