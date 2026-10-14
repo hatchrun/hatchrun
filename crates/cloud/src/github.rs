@@ -31,7 +31,8 @@ pub fn app_jwt_signing_input(app: &str, now: u64) -> String {
     )
 }
 
-fn call(method: &'static str, url: String, token: &str) -> Request {
+/// A REST call with `token`, App JWT or installation or user token.
+pub(crate) fn call(method: &'static str, url: String, token: &str) -> Request {
     Request::new(method, url)
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", format!("Bearer {token}"))

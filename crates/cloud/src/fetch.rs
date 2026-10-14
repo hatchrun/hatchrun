@@ -10,6 +10,17 @@ use crate::http::{Request, Response};
 
 /// Sends a request with the runtime's `fetch`.
 pub async fn send(request: &Request) -> std::result::Result<Response, String> {
+    send_reading(request, None)
+        .await
+        .map(|(response, _)| response)
+}
+
+/// Sends a request and returns the answer with the value of its
+/// `header`, such as GitHub's `Link`.
+pub async fn send_reading(
+    request: &Request,
+    header: Option<&str>,
+) -> std::result::Result<(Response, Option<String>), String> {
     let sent = async {
         let headers = Headers::new();
         for (name, value) in &request.headers {
@@ -26,10 +37,17 @@ pub async fn send(request: &Request) -> std::result::Result<Response, String> {
         let mut response = Fetch::Request(worker::Request::new_with_init(&request.url, &init)?)
             .send()
             .await?;
-        Ok::<_, worker::Error>(Response {
-            status: response.status_code(),
-            body: response.bytes().await?,
-        })
+        let value = match header {
+            Some(name) => response.headers().get(name)?,
+            None => None,
+        };
+        Ok::<_, worker::Error>((
+            Response {
+                status: response.status_code(),
+                body: response.bytes().await?,
+            },
+            value,
+        ))
     };
     sent.await
         .map_err(|err| format!("{} {}: {err}", request.method, host(&request.url)))
