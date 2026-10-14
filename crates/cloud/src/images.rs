@@ -29,8 +29,12 @@ pub const PATH: &str = "/api/internal/images";
 /// The audience the build asks GitHub for.
 pub const AUDIENCE: &str = "https://app.hatchrun.io";
 /// The only callers: the `register.yml` job of hatchrun/images, on
-/// main, in its `image-build` environment. `build.yml` calls it after
-/// the AMIs are public, and it runs on its own to post a release again.
+/// its protected main branch, in its `image-build` environment, on a
+/// GitHub-hosted runner. `build.yml` calls it after the AMIs are
+/// public, on a push, the schedule or by hand, and it runs by hand on
+/// its own to post a release again. Events that run code from outside
+/// the repository, such as `pull_request_target` or `workflow_run`,
+/// are refused even on main.
 pub const POLICY: Policy<'static> = Policy {
     issuer: actions::ISSUER,
     audience: AUDIENCE,
@@ -39,7 +43,23 @@ pub const POLICY: Policy<'static> = Policy {
     git_ref: "refs/heads/main",
     job_workflow_ref: "hatchrun/images/.github/workflows/register.yml@refs/heads/main",
     environment: "image-build",
+    workflow_refs: &[
+        "hatchrun/images/.github/workflows/build.yml@refs/heads/main",
+        "hatchrun/images/.github/workflows/register.yml@refs/heads/main",
+    ],
+    event_names: &["push", "schedule", "workflow_dispatch"],
+    runner_environment: "github-hosted",
 };
+/// The app's origin in production, where the issuer cannot be replaced.
+pub const PRODUCTION_HOST: &str = "app.hatchrun.io";
+/// How far a release's version may be after the token was issued, in
+/// seconds. The build stamps the version before it starts, so a real
+/// release is never ahead of its token; this allows for clock skew.
+pub const VERSION_AHEAD_SECS: u64 = 10 * 60;
+/// How far a release's version may be before the token was issued, in
+/// seconds. Builds run weekly; a month leaves room to post the newest
+/// release again after a few failed builds.
+pub const VERSION_BEHIND_SECS: u64 = 30 * 24 * 60 * 60;
 /// The architectures a release has, as the `images` table names them.
 pub const ARCHES: [&str; 2] = ["amd64", "arm64"];
 /// The root device of every runner image. Ubuntu AMIs boot from
@@ -134,6 +154,51 @@ pub fn parse(body: &[u8]) -> Result<Release, String> {
     })
 }
 
+/// Checks that a release's `version` is close to `issued_at`, the
+/// token's `iat` in Unix seconds (see [`VERSION_AHEAD_SECS`] and
+/// [`VERSION_BEHIND_SECS`]). A version far in the future would make
+/// every later release look older and lock them out.
+///
+/// # Errors
+///
+/// When the version is outside that window or not a valid time.
+pub fn check_version_time(version: &str, issued_at: u64) -> Result<(), String> {
+    let time = version_time(version).ok_or_else(|| format!("version {version:?} is not a time"))?;
+    if time > issued_at.saturating_add(VERSION_AHEAD_SECS) {
+        return Err(format!("version {version} is later than the token"));
+    }
+    if time < issued_at.saturating_sub(VERSION_BEHIND_SECS) {
+        return Err(format!("version {version} is too old to post"));
+    }
+    Ok(())
+}
+
+/// The issuer to trust: GitHub's, or `configured` when it is set and the
+/// Worker is not serving production. `host` is the request's host and
+/// `app_url` the `APP_URL` variable; either naming production refuses
+/// an override, so a forgotten variable or secret cannot hand the table
+/// to another issuer.
+///
+/// # Errors
+///
+/// When another issuer is configured in production.
+pub fn issuer<'a>(
+    configured: Option<&'a str>,
+    host: Option<&str>,
+    app_url: &str,
+) -> Result<&'a str, String> {
+    let Some(configured) = configured.filter(|issuer| *issuer != actions::ISSUER) else {
+        return Ok(actions::ISSUER);
+    };
+    let production = format!("https://{PRODUCTION_HOST}");
+    if host == Some(PRODUCTION_HOST) || app_url.trim_end_matches('/') == production {
+        return Err(format!(
+            "{configured} replaces GitHub's issuer in production"
+        ));
+    }
+    Ok(configured)
+}
+
 /// Whether a release of `version` may replace images of `stored`, the
 /// newest version in the table. Versions are fixed-width timestamps, so
 /// they compare as text. Rows loaded by hand carry no version.
@@ -153,13 +218,48 @@ pub const UPSERT: &str = "INSERT INTO images (region, arch, image_id, root_devic
 
 /// `YYYYMMDD.HHMM`.
 fn is_version(version: &str) -> bool {
+    version_time(version).is_some()
+}
+
+/// A version, `YYYYMMDD.HHMM` in UTC, as Unix seconds, if it is a valid
+/// date and time.
+fn version_time(version: &str) -> Option<u64> {
     let bytes = version.as_bytes();
-    bytes.len() == 13
+    let digits = bytes.len() == 13
         && bytes[8] == b'.'
         && bytes
             .iter()
             .enumerate()
-            .all(|(at, byte)| at == 8 || byte.is_ascii_digit())
+            .all(|(at, byte)| at == 8 || byte.is_ascii_digit());
+    if !digits {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| version[range].parse::<u64>().ok();
+    let (year, month, day) = (number(0..4)?, number(4..6)?, number(6..8)?);
+    let (hour, minute) = (number(9..11)?, number(11..13)?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if year < 1970 || day == 0 || day > days_in_month || hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60)
+}
+
+/// Days from 1970-01-01 to a date at or after it, by Howard Hinnant's
+/// `days_from_civil`.
+fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year / 400;
+    let year_of_era = year % 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// `us-east-1`, `ap-southeast-5`, `us-gov-west-1` and the like.
@@ -318,6 +418,81 @@ mod tests {
         ] {
             assert!(is_region(region), "{region}");
         }
+    }
+
+    #[test]
+    fn reads_versions_as_utc() {
+        assert_eq!(version_time("19700101.0000"), Some(0));
+        assert_eq!(version_time("20000301.0000"), Some(951_868_800));
+        assert_eq!(version_time("20261013.1915"), Some(1_791_918_900));
+        assert_eq!(version_time("20280229.2359"), Some(1_835_481_540));
+        for bad in [
+            "20261313.1915",
+            "20261000.1915",
+            "20261032.1915",
+            "20270229.1200",
+            "21000229.1200",
+            "20261013.2400",
+            "20261013.1960",
+            "19691231.2359",
+        ] {
+            assert_eq!(version_time(bad), None, "{bad}");
+        }
+        assert_eq!(version_time("20000229.1200"), Some(951_825_600));
+    }
+
+    #[test]
+    fn keeps_versions_near_the_token() {
+        let built = version_time("20261013.1915").unwrap();
+        // Posted hours after the build stamped it.
+        assert!(check_version_time("20261013.1915", built + 4 * 3_600).is_ok());
+        // Clock skew, up to ten minutes.
+        assert!(check_version_time("20261013.1915", built - VERSION_AHEAD_SECS).is_ok());
+        assert!(check_version_time("20261013.1925", built).is_ok());
+        assert!(
+            check_version_time("20261013.1926", built)
+                .unwrap_err()
+                .contains("later")
+        );
+        assert!(
+            check_version_time("99991231.2359", built)
+                .unwrap_err()
+                .contains("later")
+        );
+        // Posted again within a month, but not after.
+        assert!(check_version_time("20261013.1915", built + VERSION_BEHIND_SECS).is_ok());
+        assert!(
+            check_version_time("20261013.1915", built + VERSION_BEHIND_SECS + 60)
+                .unwrap_err()
+                .contains("too old")
+        );
+    }
+
+    #[test]
+    fn keeps_githubs_issuer_in_production() {
+        let local = "http://127.0.0.1:8899";
+        assert_eq!(
+            issuer(None, Some(PRODUCTION_HOST), AUDIENCE),
+            Ok(actions::ISSUER)
+        );
+        assert_eq!(
+            issuer(Some(actions::ISSUER), Some(PRODUCTION_HOST), AUDIENCE),
+            Ok(actions::ISSUER)
+        );
+        assert_eq!(
+            issuer(Some(local), Some("localhost"), "http://localhost:8787"),
+            Ok(local)
+        );
+        assert!(issuer(Some(local), Some(PRODUCTION_HOST), "http://localhost:8787").is_err());
+        assert!(
+            issuer(
+                Some(local),
+                Some("hatchrun-cloud.example.workers.dev"),
+                AUDIENCE
+            )
+            .is_err()
+        );
+        assert!(issuer(Some(local), None, "https://app.hatchrun.io/").is_err());
     }
 
     #[test]

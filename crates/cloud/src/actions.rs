@@ -29,8 +29,11 @@ pub const KEYS_MAX_AGE_MS: u64 = 60 * 60 * 1000;
 /// fetched again, in milliseconds, so bad tokens cannot make the Worker
 /// fetch on every request.
 pub const KEYS_REFETCH_MS: u64 = 60 * 1000;
+/// How long a failed fetch of the keys is remembered, in milliseconds,
+/// so an outage at the issuer does not turn every request into a fetch.
+pub const KEYS_FAILURE_MS: u64 = 30 * 1000;
 /// Seconds of clock difference allowed on `exp` and `nbf`.
-const LEEWAY: u64 = 60;
+pub const LEEWAY: u64 = 60;
 /// The smallest modulus accepted, in bits.
 const MIN_MODULUS_BITS: usize = 2048;
 /// `DigestInfo` for SHA-256, which PKCS#1 v1.5 puts in front of the hash.
@@ -149,6 +152,13 @@ pub struct Policy<'a> {
     pub job_workflow_ref: &'a str,
     /// `environment`, the job's deployment environment.
     pub environment: &'a str,
+    /// `workflow_ref`, the workflow file of the run: the caller when the
+    /// job is in a reusable workflow. Any one of these.
+    pub workflow_refs: &'a [&'a str],
+    /// `event_name`, what started the run. Any one of these.
+    pub event_names: &'a [&'a str],
+    /// `runner_environment`, `github-hosted` or `self-hosted`.
+    pub runner_environment: &'a str,
 }
 
 /// The claims of an accepted token that the Worker logs.
@@ -162,6 +172,10 @@ pub struct Claims {
     pub exp: u64,
     /// Start of validity, Unix seconds.
     pub nbf: Option<u64>,
+    /// When GitHub issued the token, Unix seconds.
+    pub iat: u64,
+    /// The token's unique id.
+    pub jti: String,
     /// `repository`.
     pub repository: String,
     /// `repository_id`.
@@ -171,6 +185,15 @@ pub struct Claims {
     pub git_ref: String,
     /// `job_workflow_ref`.
     pub job_workflow_ref: String,
+    /// `workflow_ref`.
+    pub workflow_ref: String,
+    /// `event_name`.
+    pub event_name: String,
+    /// `runner_environment`.
+    pub runner_environment: String,
+    /// `ref_protected`, whether branch protection or a ruleset covers
+    /// the ref. GitHub sends the string `"true"`; a boolean is read too.
+    pub ref_protected: serde_json::Value,
     /// `environment`, missing for a job without one.
     pub environment: Option<String>,
     /// `run_id`.
@@ -308,11 +331,40 @@ pub fn verify(
             claims.environment.as_deref().unwrap_or_default(),
             policy.environment,
         ),
+        (
+            "runner_environment",
+            &claims.runner_environment,
+            policy.runner_environment,
+        ),
     ];
     if let Some((name, found, _)) = checks.iter().find(|(_, found, want)| found != want) {
         return Err(Rejection::Claim {
             name,
             found: (*found).to_owned(),
+        });
+    }
+    let one_of = [
+        ("workflow_ref", &claims.workflow_ref, policy.workflow_refs),
+        ("event_name", &claims.event_name, policy.event_names),
+    ];
+    if let Some((name, found, _)) = one_of
+        .iter()
+        .find(|(_, found, allowed)| !allowed.contains(&found.as_str()))
+    {
+        return Err(Rejection::Claim {
+            name,
+            found: (*found).clone(),
+        });
+    }
+    if !matches!(&claims.ref_protected, serde_json::Value::Bool(true))
+        && claims.ref_protected != "true"
+    {
+        return Err(Rejection::Claim {
+            name: "ref_protected",
+            found: match &claims.ref_protected {
+                serde_json::Value::String(found) => found.clone(),
+                other => other.to_string(),
+            },
         });
     }
     if !claims.aud.contains(policy.audience) {
@@ -409,6 +461,12 @@ mod tests {
         git_ref: "refs/heads/main",
         job_workflow_ref: "hatchrun/images/.github/workflows/register.yml@refs/heads/main",
         environment: "image-build",
+        workflow_refs: &[
+            "hatchrun/images/.github/workflows/build.yml@refs/heads/main",
+            "hatchrun/images/.github/workflows/register.yml@refs/heads/main",
+        ],
+        event_names: &["push", "schedule", "workflow_dispatch"],
+        runner_environment: "github-hosted",
     };
 
     /// Claims as GitHub sends them for a job of `register.yml` that
@@ -500,6 +558,30 @@ mod tests {
             serde_json::json!(["other", "https://app.hatchrun.io"]),
         );
         assert!(check(&many).is_ok());
+        // Run on its own, by hand, and from a push to main.
+        let mut alone = with("event_name", "workflow_dispatch".into());
+        alone["workflow_ref"] = alone["job_workflow_ref"].clone();
+        assert!(check(&alone).is_ok());
+        assert!(check(&with("event_name", "push".into())).is_ok());
+        assert!(check(&with("ref_protected", true.into())).is_ok());
+    }
+
+    #[test]
+    fn needs_the_claims_it_checks() {
+        for claim in [
+            "iat",
+            "jti",
+            "workflow_ref",
+            "event_name",
+            "runner_environment",
+        ] {
+            let mut claims = claims();
+            claims.as_object_mut().unwrap().remove(claim);
+            assert!(
+                matches!(check(&claims), Err(Rejection::Malformed(_))),
+                "{claim}"
+            );
+        }
     }
 
     #[test]
@@ -536,6 +618,41 @@ mod tests {
             refused("environment", serde_json::Value::Null),
             "environment"
         );
+        assert_eq!(
+            refused("runner_environment", "self-hosted".into()),
+            "runner_environment"
+        );
+        for event in [
+            "pull_request",
+            "pull_request_target",
+            "workflow_run",
+            "issue_comment",
+            "dynamic",
+        ] {
+            assert_eq!(refused("event_name", event.into()), "event_name", "{event}");
+        }
+        assert_eq!(
+            refused(
+                "workflow_ref",
+                "hatchrun/images/.github/workflows/lint.yml@refs/heads/main".into()
+            ),
+            "workflow_ref"
+        );
+        assert_eq!(
+            refused(
+                "workflow_ref",
+                "hatchrun/images/.github/workflows/build.yml@refs/heads/other".into()
+            ),
+            "workflow_ref"
+        );
+        for unprotected in [
+            serde_json::json!("false"),
+            serde_json::json!(false),
+            serde_json::json!("TRUE"),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(refused("ref_protected", unprotected), "ref_protected");
+        }
         assert_eq!(refused("aud", "https://github.com/hatchrun".into()), "aud");
         assert_eq!(
             refused("aud", serde_json::json!(["sts.amazonaws.com"])),

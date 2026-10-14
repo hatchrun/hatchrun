@@ -310,11 +310,16 @@ the AMIs are public, its `register.yml` job posts the release's
 `manifest.json` to `POST https://app.hatchrun.io/api/internal/images`
 with a GitHub Actions OIDC token for the audience
 `https://app.hatchrun.io`. The Worker checks the token's signature
-against GitHub's JWKS and accepts only that job, on `main`, in the
-`image-build` environment of hatchrun/images
-([`images.rs`](crates/cloud/src/images.rs)). It writes every region and
-architecture in one batch and refuses a release older than the one it
-holds. To post the newest release again:
+against GitHub's JWKS and accepts only that job, on the protected
+`main` branch, in the `image-build` environment of hatchrun/images, on
+a GitHub-hosted runner, started by a push, the schedule or by hand
+([`images.rs`](crates/cloud/src/images.rs)). Each token posts once. It
+writes every region and architecture in one batch, and refuses a
+release older than the one it holds or whose version is far from the
+token's issue time. `ACTIONS_OIDC_ISSUER` points the Worker at a local
+issuer under `wrangler dev`, together with a local `APP_URL` such as
+`--var APP_URL:http://localhost:8787`; on app.hatchrun.io it is
+refused. To post the newest release again:
 
 ```sh
 gh workflow run register.yml --repo hatchrun/images --ref main
