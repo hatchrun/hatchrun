@@ -50,6 +50,10 @@ GITHUB_APP_ID = "Iv23liMh4C066YyxQB7R"
 # Its slug; owners install it at github.com/apps/$GITHUB_APP_SLUG, and
 # its setup URL is $APP_URL/api/github/setup.
 GITHUB_APP_SLUG = "hatchrun"
+# The published connect.yaml (the TemplateUrl output of
+# deploy/cloudformation/templates-bucket.yaml), which the Launch Stack
+# links open. Empty until the bucket exists; the app says so until then.
+CONNECT_TEMPLATE_URL = ""
 # The Polar product of the per-organization licence. Empty until the
 # product exists; checkout answers 503 until then. POLAR_API_URL points
 # the Worker at Polar's sandbox (https://sandbox-api.polar.sh).

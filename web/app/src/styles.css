@@ -828,3 +828,89 @@ label {
     align-items: stretch;
   }
 }
+
+/* AWS connection */
+
+.substeps > p:first-child {
+  margin-bottom: 1.25rem;
+}
+
+.substep {
+  padding: 1rem 0 0.25rem;
+  border-top: 1px dashed var(--border);
+}
+
+.substep + .substep {
+  margin-top: 1rem;
+}
+
+.substep h3 {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.85rem;
+}
+
+.substep-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.field {
+  margin-bottom: 1rem;
+}
+
+.label {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-size: 0.88rem;
+  font-weight: 550;
+}
+
+select.input {
+  padding-right: 2rem;
+}
+
+.copy-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.35rem 0.35rem 0.35rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.copy-field code {
+  padding: 0;
+  background: none;
+  overflow-wrap: anywhere;
+}
+
+.details {
+  margin-top: 1rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.details summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 550;
+}
+
+.details ul {
+  padding-left: 1.1rem;
+}
+
+.step-summary code {
+  font-size: 0.82em;
+}

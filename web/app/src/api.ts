@@ -152,3 +152,20 @@ export const getPlan = () => get<Plan>("/api/plan");
 export const startCheckout = (org: string) => post<{ url: string }>(`${tenantPath(org)}/checkout`);
 export const openPortal = (org: string) => post<{ url: string }>(`${tenantPath(org)}/portal`);
 export const redeemInvite = (org: string, code: string) => post<Tenant>(`${tenantPath(org)}/beta`, { code });
+
+export interface AwsRegion {
+  id: string;
+  name: string;
+  hasImage: boolean;
+  launchUrl: string | null;
+}
+
+export interface AwsInstructions {
+  tenantId: string;
+  templateUrl: string | null;
+  regions: AwsRegion[];
+}
+
+export const getAwsInstructions = (org: string) => get<AwsInstructions>(`${tenantPath(org)}/aws`);
+export const connectAws = (org: string, region: string, roleArn: string) =>
+  post<Tenant>(`${tenantPath(org)}/aws`, { region, roleArn });

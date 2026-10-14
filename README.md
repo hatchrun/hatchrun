@@ -234,6 +234,28 @@ npx wrangler@4.143.0 d1 execute hatchrun-cloud --remote --command \
   "INSERT INTO beta_orgs (org_login, created_at) VALUES ('acme', unixepoch() * 1000)"
 ```
 
+An owner connects AWS from the app. A Launch Stack link per region
+opens the published `connect.yaml` with the tenant id filled in; the
+owner pastes the stack's `RoleArn` output back. The Worker assumes the
+role with a token for the tenant, finds the stack's launch template by
+its `hatchrun:tenant` tag and the subnets on its `hatchrun:subnets`
+tag, checks they exist, and only then saves them.
+
+[`publish-template.yml`](.github/workflows/publish-template.yml)
+renders `connect.yaml` with the image owner account and uploads it on
+every change merged to main. It needs, once, the bucket and role from
+[`templates-bucket.yaml`](deploy/cloudformation/templates-bucket.yaml),
+the `TEMPLATES_ROLE_ARN` and `IMAGE_OWNER_ACCOUNT_ID` secrets and the
+`TEMPLATES_BUCKET` variable in the `production` environment, and the
+bucket's `TemplateUrl` output as `CONNECT_TEMPLATE_URL` in
+`wrangler.toml`:
+
+```sh
+aws cloudformation deploy --region us-east-1 --stack-name hatchrun-templates \
+  --template-file deploy/cloudformation/templates-bucket.yaml \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
 `npm run dev` in `web/app` serves the app with hot reload and sends
 `/api` to `wrangler dev` on port 8787. `npm run dev:mock` answers `/api`
 from [`web/app/mock/api.ts`](web/app/mock/api.ts) instead, with no

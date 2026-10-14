@@ -8,6 +8,7 @@ import { getTenant, type Tenant } from "../api";
 import { Checklist, type Step } from "../components/Checklist";
 import { navigate, useQuery } from "../router";
 import { ChoosePlan, PlanSummary } from "./Billing";
+import { AwsSummary, ConnectAws } from "./ConnectAws";
 
 const errors: Record<string, string> = {
   "install-account":
@@ -71,8 +72,8 @@ export function TenantPage({ tenant: loaded }: { tenant: Tenant }) {
       key: "aws",
       title: "Connect your AWS account",
       done: tenant.steps.aws,
-      soon: "AWS setup opens here soon.",
-      body: null,
+      summary: <AwsSummary tenant={tenant} />,
+      body: <ConnectAws tenant={tenant} onConnected={setTenant} />,
     },
     {
       key: "app",

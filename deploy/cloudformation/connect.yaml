@@ -188,9 +188,20 @@ Resources:
   # labels. Runners get no instance profile: the agent claims its runner
   # config from the hatchrun.io broker with a one-time ticket in user
   # data, and jobs that need AWS use GitHub's OIDC.
+  # The tags let hatchrun.io find this template, and the subnets runners
+  # launch into, from the role alone.
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - { Key: "hatchrun:tenant", Value: !Ref TenantId }
+            - Key: "hatchrun:subnets"
+              Value: !If
+                - CreateVpc
+                - !Join [",", [!Ref SubnetA, !Ref SubnetB]]
+                - !Join [",", !Ref SubnetIds]
       LaunchTemplateData:
         SecurityGroupIds: [!Ref RunnerSecurityGroup]
         InstanceInitiatedShutdownBehavior: terminate
@@ -235,11 +246,15 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Describing the launch template and subnets lets the
+              # hatchrun.io app check the stack before saving it.
               - Sid: List
                 Effect: Allow
                 Action:
                   - ec2:DescribeInstances
                   - ec2:DescribeInstanceTypeOfferings
+                  - ec2:DescribeLaunchTemplates
+                  - ec2:DescribeSubnets
                 Resource: "*"
               - Sid: LaunchInstances
                 Effect: Allow
