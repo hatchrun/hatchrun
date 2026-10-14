@@ -914,3 +914,286 @@ select.input {
 .step-summary code {
   font-size: 0.82em;
 }
+
+/* Tenant tabs */
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin: -0.75rem 0 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  padding: 0.55rem 0.8rem;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-size: 0.92rem;
+  font-weight: 550;
+  text-decoration: none;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab[aria-current="page"] {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
+/* Dashboard */
+
+.small {
+  font-size: 0.82rem;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.panel {
+  padding: 1.25rem;
+}
+
+.panel h2 {
+  font-size: 1.05rem;
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.panel-foot {
+  padding: 0.75rem 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+  gap: 1.25rem;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  align-content: start;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  padding: 0.9rem 1rem;
+}
+
+.stat-label {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.stat-value {
+  font-size: 1.6rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-hint {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.stat-alarm .stat-value {
+  color: var(--danger);
+}
+
+.snippet {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  padding: 0.75rem 0.75rem 0.75rem 1rem;
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.snippet pre {
+  margin: 0;
+  overflow-x: auto;
+}
+
+.snippet code {
+  padding: 0;
+  background: none;
+}
+
+.options {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+  font-size: 0.88rem;
+}
+
+.options div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+}
+
+.options dt {
+  min-width: 11rem;
+}
+
+.options dd {
+  margin: 0;
+  color: var(--muted);
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table.jobs {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.jobs th {
+  padding: 0.6rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.jobs td {
+  padding: 0.7rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.jobs tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.job-link {
+  font-weight: 550;
+  text-decoration: none;
+}
+
+.job-link:hover {
+  text-decoration: underline;
+}
+
+.job-error {
+  max-width: 22rem;
+  margin-top: 0.3rem;
+  font-size: 0.8rem;
+  color: var(--danger);
+}
+
+/* Settings */
+
+.settings {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  max-width: 760px;
+}
+
+.field-narrow {
+  max-width: 14rem;
+}
+
+fieldset.field {
+  margin: 0 0 1rem;
+  padding: 0;
+  border: 0;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.35rem 0;
+  font-weight: 450;
+}
+
+.check input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.check-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+  gap: 0 1rem;
+  margin-top: 0.4rem;
+}
+
+@media (max-width: 760px) {
+  .dashboard-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tabs {
+    margin-top: -0.5rem;
+  }
+
+  .panel,
+  .panel-head {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .jobs th,
+  .jobs td {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+}
+
+.jobs td .job-link,
+.jobs td .mono,
+.jobs td code {
+  white-space: nowrap;
+}
+
+@media (max-width: 560px) {
+  .options div {
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .options dt {
+    min-width: 0;
+  }
+}

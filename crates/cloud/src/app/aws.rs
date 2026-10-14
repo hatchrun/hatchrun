@@ -17,7 +17,7 @@ use super::{Answer, Ctx, Failure, get, need};
 use crate::aws::{self, Credentials, ec2};
 use crate::fetch::send;
 use crate::launch::{AWS_ENDPOINT_URL, tenant_credentials};
-use crate::{connect, int, jwt, now_ms, oidc};
+use crate::{connect, int, jwt, now_ms, oidc, settings};
 
 /// Variable with the public URL of the rendered connect.yaml.
 const TEMPLATE_URL: &str = "CONNECT_TEMPLATE_URL";
@@ -29,6 +29,8 @@ struct Region {
     name: &'static str,
     /// Whether runner images are published there yet.
     has_image: bool,
+    /// Whether the organization's settings allow it.
+    allowed: bool,
     launch_url: Option<String>,
 }
 
@@ -53,6 +55,7 @@ pub(crate) async fn instructions(ctx: &Ctx<'_>, org: &str) -> Answer {
     let regions: Vec<Region> = connect::REGIONS
         .iter()
         .map(|(id, name)| Region {
+            allowed: settings::region_allowed(id, row.allowed_regions.as_deref()),
             id,
             name,
             has_image: imaged.iter().any(|region| region == id),
@@ -88,6 +91,12 @@ pub(crate) async fn verify(ctx: &Ctx<'_>, org: &str, body: Connect) -> Answer {
         return Err(refused(format!(
             "{} is not a region hatchrun runs in",
             body.region
+        )));
+    }
+    if !settings::region_allowed(&body.region, row.allowed_regions.as_deref()) {
+        return Err(refused(format!(
+            "{} does not allow runners in {}. Change the allowed regions in settings.",
+            row.org_login, body.region
         )));
     }
     if !connect::valid_role_arn(role_arn) {

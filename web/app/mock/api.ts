@@ -15,6 +15,7 @@ interface MockTenant {
   installationId: number | null;
   aws: null | { roleArn: string; region: string; launchTemplateId: string; subnetIds: string[] };
   maxRunners: number;
+  allowedRegions: string[] | null;
   beta: boolean;
   subscription: null | { status: string; currentPeriodEnd: string | null; cancelAtPeriodEnd: boolean };
 }
@@ -83,6 +84,7 @@ const routes: Record<string, Handler> = {
         installationId: null,
         aws: null,
         maxRunners: 10,
+        allowedRegions: null,
         beta: false,
         subscription: null,
       };
@@ -156,6 +158,7 @@ const routes: Record<string, Handler> = {
           id,
           name,
           hasImage: id !== "ap-southeast-2",
+          allowed: tenant.allowedRegions === null || tenant.allowedRegions.includes(id),
           launchUrl: `https://${id}.console.aws.amazon.com/cloudformation/home?region=${id}#/stacks/create/review?templateURL=${encodeURIComponent(template)}&stackName=hatchrun&param_TenantId=${tenant.id}`,
         })),
       },
@@ -179,6 +182,39 @@ const routes: Record<string, Handler> = {
       ];
     }
     tenant.aws = { roleArn, region, launchTemplateId: "lt-0a1b2c3d4e5f60718", subnetIds: ["subnet-0aa11", "subnet-0bb22"] };
+    return [200, tenantView(tenant)];
+  },
+  "GET /api/tenants/:org/jobs": (_req, url) => {
+    const tenant = findTenant(url.pathname.split("/")[3] ?? "");
+    if (!tenant) {
+      return [404, { error: "no organization here" }];
+    }
+    const now = Date.now();
+    const jobs = sampleJobs(now);
+    return [
+      200,
+      {
+        jobs: url.searchParams.has("before") ? [] : jobs,
+        counts: { waiting: 1, active: 2, completedToday: 37, failedToday: 1 },
+        region: tenant.aws?.region ?? null,
+        pageSize: 5,
+      },
+    ];
+  },
+  "PUT /api/tenants/:org/settings": (_req, url, body) => {
+    const tenant = findTenant(url.pathname.split("/")[3] ?? "");
+    if (!tenant) {
+      return [404, { error: "no organization here" }];
+    }
+    const { maxRunners, allowedRegions } = body as { maxRunners: number; allowedRegions: string[] | null };
+    if (allowedRegions && tenant.aws && !allowedRegions.includes(tenant.aws.region)) {
+      return [
+        422,
+        { error: `AWS is connected in ${tenant.aws.region}. Keep it allowed, or connect another region first.` },
+      ];
+    }
+    tenant.maxRunners = maxRunners;
+    tenant.allowedRegions = allowedRegions;
     return [200, tenantView(tenant)];
   },
   "GET /api/github/setup": (_req, url) => {
@@ -242,4 +278,38 @@ export function mockApi(): Plugin {
       });
     },
   };
+}
+
+function sampleJobs(now: number) {
+  const minute = 60_000;
+  const job = (
+    id: number,
+    repository: string,
+    label: string,
+    status: string,
+    launchState: string | null,
+    queuedAgo: number,
+    took: number,
+    launchError: string | null = null,
+  ) => ({
+    id,
+    repository,
+    runId: id * 7,
+    label,
+    status,
+    launchState,
+    runnerName: launchState ? `hatchrun-${id}-ab12cd34` : null,
+    instanceId: launchState === "launched" ? `i-0${id.toString(16)}f00ba4` : null,
+    launchError,
+    queuedAt: now - queuedAgo * minute,
+    updatedAt: now - queuedAgo * minute + took * 1000,
+  });
+  return [
+    job(9123, "acme-corp/api", "hatchrun/arm64/cpu=8", "queued", null, 0.2, 0),
+    job(9122, "acme-corp/web", "hatchrun", "in_progress", "launched", 3, 0),
+    job(9121, "acme-corp/api", "hatchrun/arm64/cpu=8/spot", "in_progress", "launched", 6, 0),
+    job(9120, "acme-corp/infra", "hatchrun/type=c7i.4xlarge", "completed", "failed", 22, 4,
+      "RunInstances: UnauthorizedOperation: You are not authorized to perform this operation."),
+    job(9119, "acme-corp/web", "hatchrun", "completed", "launched", 41, 312),
+  ];
 }

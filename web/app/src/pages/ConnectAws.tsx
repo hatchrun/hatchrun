@@ -29,11 +29,17 @@ function Steps({
   instructions: AwsInstructions;
   onConnected: (tenant: Tenant) => void;
 }) {
-  const [region, setRegion] = useState(tenant.aws?.region ?? "us-east-1");
+  const [region, setRegion] = useState(
+    tenant.aws?.region ??
+      instructions.regions.find((candidate) => candidate.allowed && candidate.id === "us-east-1")?.id ??
+      instructions.regions.find((candidate) => candidate.allowed)?.id ??
+      "",
+  );
   const [roleArn, setRoleArn] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const chosen = instructions.regions.find((candidate) => candidate.id === region);
+  const allowed = instructions.regions.filter((candidate) => candidate.allowed);
+  const chosen = allowed.find((candidate) => candidate.id === region);
 
   const verify = async (event: FormEvent) => {
     event.preventDefault();
@@ -69,7 +75,7 @@ function Steps({
             value={region}
             onChange={(event) => setRegion(event.target.value)}
           >
-            {instructions.regions.map((candidate) => (
+            {allowed.map((candidate) => (
               <option key={candidate.id} value={candidate.id}>
                 {candidate.name} ({candidate.id})
               </option>

@@ -32,6 +32,7 @@ mod launch;
 pub mod oidc;
 pub mod polar;
 pub mod session;
+pub mod settings;
 pub mod signin;
 pub mod tenant;
 mod webcrypto;
