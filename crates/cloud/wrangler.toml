@@ -10,6 +10,13 @@ compatibility_date = "2026-09-01"
 # account the same login can reach.
 account_id = "20438923120e30641ae734882be1937a"
 
+# The webhook shares hatchrun.io with the website, which serves every
+# other path; the OIDC issuer gets its own hostname.
+routes = [
+  { pattern = "hatchrun.io/github/*", zone_name = "hatchrun.io" },
+  { pattern = "oidc.hatchrun.io", custom_domain = true },
+]
+
 [build]
 command = "cargo install --locked worker-build --version 0.8.7 && worker-build --release"
 
