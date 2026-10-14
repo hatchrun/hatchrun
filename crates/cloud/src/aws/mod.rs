@@ -9,6 +9,7 @@
 //! XML answers are read with `roxmltree`. Nothing here sends anything.
 
 pub mod ec2;
+pub mod instances;
 pub mod sts;
 
 use std::time::{Duration, SystemTime};

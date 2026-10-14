@@ -18,6 +18,10 @@
 //! - `GET /.well-known/openid-configuration` and
 //!   `GET /.well-known/jwks.json` on `oidc.hatchrun.io` let STS check
 //!   the tokens the Worker signs (see [`oidc`]).
+//!
+//! A Cron Trigger runs the reconciler every minute, which redelivers
+//! failed webhooks, launches lost launches again and terminates
+//! instances nothing needs (see the `reconcile` module).
 
 mod app;
 pub mod aws;
@@ -31,6 +35,7 @@ pub mod labels;
 mod launch;
 pub mod oidc;
 pub mod polar;
+mod reconcile;
 pub mod session;
 pub mod settings;
 pub mod signin;
@@ -40,8 +45,8 @@ pub mod webhook;
 
 use wasm_bindgen::JsValue;
 use worker::{
-    Env, Headers, Method, Request, Response, ResponseBuilder, Result, console_error, console_warn,
-    event,
+    Env, Headers, Method, Request, Response, ResponseBuilder, Result, ScheduleContext,
+    ScheduledEvent, console_error, console_warn, event,
 };
 
 use crate::jwt::PublicKey;
@@ -89,6 +94,12 @@ async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response>
         return error("not found", 404);
     }
     assets(req, &env).await
+}
+
+/// The Cron Trigger in `wrangler.toml`, every minute: the reconciler.
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    reconcile::run(env).await;
 }
 
 /// The app's static assets. Every path that is not a file is the app's
@@ -155,14 +166,20 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
             ctx.wait_until(launch::launch(env, job));
             Ok(Response::from_json(&serde_json::json!({ "recorded": id }))?.with_status(202))
         }
-        Event::Progress { id, status } => {
+        Event::Progress { id, status, runner } => {
             // Deliveries can arrive out of order; a completed job stays
-            // completed.
+            // completed. The runner shows the reconciler which instance
+            // ran the job (see `reconcile`).
             db.prepare(
-                "UPDATE jobs SET status = ?1, updated_at = ?2 \
+                "UPDATE jobs SET status = ?1, updated_at = ?2, ran_on = COALESCE(?4, ran_on) \
                  WHERE id = ?3 AND status <> 'completed'",
             )
-            .bind(&[status.as_str().into(), now, int(id)?])?
+            .bind(&[
+                status.as_str().into(),
+                now,
+                int(id)?,
+                runner.map_or(JsValue::NULL, Into::into),
+            ])?
             .run()
             .await?;
             Ok(Response::empty()?.with_status(204))
