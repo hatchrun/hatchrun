@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Findings already in history, by fingerprint (commit:file:rule:line).
+# History is not rewritten, so these commits stay. New findings still
+# fail the scan. Add a line here only for a value that is public
+# already or is not a secret, and say why.
+
+# The Cloudflare account ID committed with the first deploy workflow.
+# It has since moved to the CLOUDFLARE_ACCOUNT_ID secret.
+7df828634804161d33ef3546b95970cb0f47d16b:crates/cloud/wrangler.toml:cloudflare-account-id:11
+7df828634804161d33ef3546b95970cb0f47d16b:crates/broker/wrangler.toml:cloudflare-account-id:11
+
+# Test fixture: the example credentials from the AWS STS documentation.
+3f9debf1d225e57da71b587f07c12df1d3047133:crates/cloud/src/aws/sts.rs:generic-api-key:111
+
+# Test fixture: a PEM header around invalid key data, used to check
+# that parsing fails.
+c655aef85db25a00cb3fec70905dbff41b0471b7:crates/scaler/src/github.rs:private-key:301
