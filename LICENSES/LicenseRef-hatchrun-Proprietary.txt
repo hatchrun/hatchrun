@@ -1,0 +1,22 @@
+Copyright 2026 Gamunu Balagalla. All rights reserved.
+
+The files in this repository, including the hatchrun logo, wordmark,
+app icons, the Pip character and every pose and rendering of it, colour
+definitions and the tools that generate them (together, "the Brand
+Assets"), are proprietary.
+
+No licence is granted to copy, modify, distribute, publish, sublicense
+or create derivative works from the Brand Assets, in whole or in part,
+except with prior written permission from the copyright holder.
+
+People with access to this repository may use the Brand Assets only
+for work done for the hatchrun project, and only as described in
+README.md.
+
+"hatchrun", the hatchrun logo and Pip are trademarks of Gamunu
+Balagalla. Use of the trademarks is not granted by access to this
+repository.
+
+THE BRAND ASSETS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+Contact: Gamunu Balagalla <gamunu.balagalla@gmail.com>

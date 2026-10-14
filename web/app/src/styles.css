@@ -5,24 +5,27 @@
  */
 
 :root {
-  --bg: #fafaf9;
-  --surface: #ffffff;
-  --surface-2: #f4f4f2;
-  --border: #e4e4e0;
-  --border-strong: #cfcfca;
-  --text: #0b0d10;
-  --muted: #5d6168;
-  --accent: #f5a524;
-  --accent-ink: #0b0d10;
-  --accent-soft: #fdf1dc;
-  --primary: #0b0d10;
-  --primary-ink: #ffffff;
-  --success: #1a7f45;
-  --success-soft: #e3f4ea;
-  --danger: #b42318;
-  --danger-soft: #fdecea;
-  --focus: #2f6feb;
-  --shadow: 0 1px 2px rgb(11 13 16 / 6%), 0 4px 16px rgb(11 13 16 / 6%);
+  /* Incubator palette, from hatchrun/brand colors/tokens.json. */
+  --bg: #ece6d6; /* bone */
+  --surface: #f6f2e9;
+  --surface-2: #e9e3d3;
+  --border: #d3c9b2; /* bone shade */
+  --border-strong: #c2b597; /* speck */
+  --text: #141517; /* graphite */
+  --muted: #5e636a; /* fog, ink on light */
+  --accent: #ffcf33; /* chick */
+  --accent-ink: #141517;
+  --accent-strong: #7a5a00; /* chick, ink on light: bars and underlines */
+  --accent-soft: #f9e6a9;
+  --primary: #141517;
+  --primary-ink: #ece6d6;
+  --success: #1b6e34; /* passed, ink on light */
+  --success-ink: #ffffff;
+  --success-soft: #d5f4d6;
+  --danger: #a8165e; /* failed, ink on light */
+  --danger-soft: #f4dcde;
+  --focus: #a83e00; /* heat, ink on light */
+  --shadow: 0 1px 2px rgb(20 21 23 / 6%), 0 4px 16px rgb(20 21 23 / 6%);
   --radius: 10px;
   --mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
 
@@ -37,21 +40,23 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0b0d10;
-    --surface: #13161b;
-    --surface-2: #1a1e24;
-    --border: #262b33;
-    --border-strong: #353b45;
-    --text: #eceef1;
-    --muted: #9aa1ab;
-    --accent-soft: #2b2112;
-    --primary: #eceef1;
-    --primary-ink: #0b0d10;
-    --success: #4cc283;
-    --success-soft: #11291c;
-    --danger: #f2786d;
-    --danger-soft: #2f1513;
-    --focus: #6aa0ff;
+    --bg: #141517; /* graphite */
+    --surface: #1e2023; /* housing */
+    --surface-2: #26292d;
+    --border: #34373c; /* rivet */
+    --border-strong: #4a4e54;
+    --text: #ece6d6; /* bone */
+    --muted: #9a9fa6; /* fog */
+    --accent-strong: #ffcf33;
+    --accent-soft: #423c26;
+    --primary: #ece6d6;
+    --primary-ink: #141517;
+    --success: #40ff80; /* passed */
+    --success-ink: #141517;
+    --success-soft: #233f30;
+    --danger: #f06aa8; /* failed, lifted to 4.5:1 on dark panels */
+    --danger-soft: #3e2434;
+    --focus: #ff6a13; /* heat */
     --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 4px 16px rgb(0 0 0 / 30%);
   }
 }
@@ -534,18 +539,22 @@ a.list-row:hover {
   padding: 1rem 0;
 }
 
+/* The brand mark rocks back and forth while something loads. */
 .spinner {
-  width: 16px;
-  height: 16px;
-  border: 2px solid var(--border-strong);
-  border-top-color: var(--text);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+  width: 20px;
+  height: 20px;
+  background: url("/brand/hatchrun-mark-micro.svg") center / contain no-repeat;
+  transform-origin: 50% 85%;
+  animation: rock 1.2s ease-in-out infinite;
 }
 
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
+@keyframes rock {
+  0%,
+  100% {
+    transform: rotate(-24deg);
+  }
+  50% {
+    transform: rotate(24deg);
   }
 }
 
@@ -579,7 +588,7 @@ a.list-row:hover {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: var(--accent);
+  background: var(--accent-strong);
 }
 
 .checklist ol {
@@ -616,7 +625,7 @@ a.list-row:hover {
 .step-done .step-mark {
   border-color: var(--success);
   background: var(--success);
-  color: #fff;
+  color: var(--success-ink);
 }
 
 .step-open .step-mark {
@@ -1073,7 +1082,7 @@ select.input {
 }
 
 .tab[aria-current="page"] {
-  border-bottom-color: var(--accent);
+  border-bottom-color: var(--accent-strong);
   color: var(--text);
 }
 
