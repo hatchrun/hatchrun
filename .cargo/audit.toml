@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+[advisories]
+ignore = [
+  # Marvin attack on rsa: timing of private-key operations (decryption
+  # and signing) can leak the key. hatchrun-cloud uses rsa only to
+  # verify GitHub Actions tokens against GitHub's public keys; only its
+  # tests sign, with keys made for the test. Revisit if anything here
+  # starts signing or decrypting with rsa.
+  "RUSTSEC-2023-0071",
+]
