@@ -27,7 +27,7 @@ use super::{Answer, Ctx, Failure, found};
 use crate::fetch::send;
 use crate::github::{self, Membership};
 use crate::launch::{APP_KEY, app_jwt};
-use crate::{int, jwt, now_ms, session, tenant, webcrypto};
+use crate::{int, jwt, now_ms, session, settings, tenant, webcrypto};
 
 /// A tenant row.
 #[derive(Debug, Deserialize)]
@@ -42,11 +42,12 @@ pub(crate) struct TenantRow {
     pub subnet_ids: Option<String>,
     pub max_runners: u32,
     pub beta: u8,
+    pub allowed_regions: Option<String>,
 }
 
 pub(crate) const TENANT_COLUMNS: &str = "tenants.id, tenants.org_id, tenants.org_login, \
     tenants.installation_id, tenants.role_arn, tenants.region, tenants.launch_template_id, \
-    tenants.subnet_ids, tenants.max_runners, tenants.beta";
+    tenants.subnet_ids, tenants.max_runners, tenants.beta, tenants.allowed_regions";
 
 /// The setup steps a tenant has done.
 #[derive(Debug, Serialize)]
@@ -68,6 +69,8 @@ struct TenantView {
     installation_id: Option<u64>,
     aws: Option<AwsView>,
     max_runners: u32,
+    /// `None` for every region.
+    allowed_regions: Option<Vec<String>>,
     billing: Billing,
     steps: Steps,
     install_url: String,
@@ -136,6 +139,7 @@ async fn view(ctx: &Ctx<'_>, row: TenantRow) -> worker::Result<TenantView> {
         installation_id: row.installation_id,
         aws,
         max_runners: row.max_runners,
+        allowed_regions: settings::regions(row.allowed_regions.as_deref()),
         billing,
     })
 }

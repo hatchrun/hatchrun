@@ -6,17 +6,49 @@ import { useEffect, useState } from "react";
 
 import { getTenant, type Tenant } from "../api";
 import { Checklist, type Step } from "../components/Checklist";
-import { navigate, useQuery } from "../router";
+import { Link, navigate, useQuery } from "../router";
 import { ChoosePlan, PlanSummary } from "./Billing";
 import { AwsSummary, ConnectAws } from "./ConnectAws";
+import { Dashboard } from "./Dashboard";
+import { TenantSettings } from "./TenantSettings";
+
+/** Whether every setup step is done. */
+export const setUp = (tenant: Tenant) => Object.values(tenant.steps).every(Boolean);
+
+/** A tenant's pages: setup until it is done, then the dashboard; and settings. */
+export function TenantPage({ tenant: loaded, section }: { tenant: Tenant; section: string | undefined }) {
+  const [tenant, setTenant] = useState(loaded);
+  const org = tenant.org.login;
+  const tabs = [
+    { href: `/o/${org}`, label: setUp(tenant) ? "Jobs" : "Setup", current: section === undefined },
+    { href: `/o/${org}/settings`, label: "Settings", current: section === "settings" },
+  ];
+  return (
+    <>
+      <nav className="tabs" aria-label={`${org} pages`}>
+        {tabs.map((tab) => (
+          <Link key={tab.href} href={tab.href} className="tab" aria-current={tab.current ? "page" : undefined}>
+            {tab.label}
+          </Link>
+        ))}
+      </nav>
+      {section === "settings" ? (
+        <TenantSettings tenant={tenant} onChange={setTenant} />
+      ) : setUp(tenant) && !new URLSearchParams(window.location.search).has("checkout") ? (
+        <Dashboard tenant={tenant} />
+      ) : (
+        <Setup tenant={tenant} setTenant={setTenant} />
+      )}
+    </>
+  );
+}
 
 const errors: Record<string, string> = {
   "install-account":
     "That installation is on a different account. Install the App on this organization.",
 };
 
-export function TenantPage({ tenant: loaded }: { tenant: Tenant }) {
-  const [tenant, setTenant] = useState(loaded);
+function Setup({ tenant, setTenant }: { tenant: Tenant; setTenant: (tenant: Tenant) => void }) {
   const installed = useQuery("installed");
   const error = useQuery("error");
   const checkout = useQuery("checkout");
@@ -39,7 +71,7 @@ export function TenantPage({ tenant: loaded }: { tenant: Tenant }) {
       }
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [confirming, org]);
+  }, [confirming, org, setTenant]);
 
   const refresh = (next?: Tenant) => {
     if (next) {

@@ -37,7 +37,7 @@ use crate::fetch::send;
 use crate::http::Request;
 use crate::labels::Arch;
 use crate::webhook::QueuedJob;
-use crate::{DB, github, instance, int, jwt, now_ms, oidc, webcrypto};
+use crate::{DB, github, instance, int, jwt, now_ms, oidc, settings, webcrypto};
 
 /// Variable with the App's client id.
 const APP_ID: &str = "GITHUB_APP_ID";
@@ -67,6 +67,8 @@ struct Tenant {
     launch_template_id: String,
     subnet_ids: String,
     max_runners: u32,
+    /// Regions the organization allows, comma separated, or none.
+    allowed_regions: Option<String>,
     /// 1 when the tenant holds a licence (see [`LICENSED`]).
     licensed: u8,
 }
@@ -145,7 +147,7 @@ async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
     let tenant: Option<Tenant> = db
         .prepare(format!(
             "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners, \
-             {LICENSED} AS licensed \
+             allowed_regions, {LICENSED} AS licensed \
              FROM tenants WHERE installation_id = ?1 AND role_arn IS NOT NULL \
              AND region IS NOT NULL AND launch_template_id IS NOT NULL \
              AND subnet_ids IS NOT NULL"
@@ -154,9 +156,18 @@ async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
         .first(None)
         .await?;
     let tenant = match tenant {
-        Some(tenant) if tenant.licensed == 1 => tenant,
+        Some(tenant)
+            if tenant.licensed == 1
+                && settings::region_allowed(&tenant.region, tenant.allowed_regions.as_deref()) =>
+        {
+            tenant
+        }
         other => {
             let reason = match other {
+                Some(tenant) if tenant.licensed == 1 => format!(
+                    "tenant {} does not allow runners in {}",
+                    tenant.id, tenant.region
+                ),
                 Some(tenant) => format!(
                     "tenant {} has no licence: neither in the beta nor subscribed",
                     tenant.id
@@ -558,6 +569,7 @@ mod tests {
             launch_template_id: String::new(),
             subnet_ids: "subnet-b, subnet-a,,".to_owned(),
             max_runners: 1,
+            allowed_regions: None,
             licensed: 1,
         };
         assert_eq!(tenant.subnets(), ["subnet-b", "subnet-a"]);

@@ -14,6 +14,8 @@
 //! - `/api/orgs`, `/api/tenants` and `/api/github/setup` set up an
 //!   organization and link the App's installation (see [`tenants`]).
 //! - `/api/tenants/<org>/aws` connects the AWS account (see [`aws`]).
+//! - `/api/tenants/<org>/{jobs,settings}` serve the dashboard (see
+//!   [`dashboard`]).
 //! - `/api/plan`, `/api/tenants/<org>/{checkout,portal,beta}` and
 //!   `/api/polar/webhook` handle the licence (see [`billing`]).
 //!
@@ -22,6 +24,7 @@
 
 mod aws;
 mod billing;
+mod dashboard;
 mod tenants;
 
 use serde::Deserialize;
@@ -233,6 +236,10 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Get, ["tenants", org]) => tenants::show(&ctx, org).await,
         (Method::Get, ["tenants", org, "aws"]) => aws::instructions(&ctx, org).await,
         (Method::Post, ["tenants", org, "aws"]) => aws::verify(&ctx, org, req.json().await?).await,
+        (Method::Get, ["tenants", org, "jobs"]) => dashboard::jobs(&ctx, org, &req).await,
+        (Method::Put, ["tenants", org, "settings"]) => {
+            dashboard::settings(&ctx, org, req.json().await?).await
+        }
         (Method::Get, ["plan"]) => billing::plan(&ctx).await,
         (Method::Post, ["tenants", org, "checkout"]) => billing::checkout(&ctx, org).await,
         (Method::Post, ["tenants", org, "portal"]) => billing::portal(&ctx, org).await,

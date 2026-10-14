@@ -70,6 +70,8 @@ export interface Tenant {
   installationId: number | null;
   aws: Aws | null;
   maxRunners: number;
+  /** null for every region. */
+  allowedRegions: string[] | null;
   billing: Billing;
   steps: Steps;
   installUrl: string;
@@ -157,6 +159,7 @@ export interface AwsRegion {
   id: string;
   name: string;
   hasImage: boolean;
+  allowed: boolean;
   launchUrl: string | null;
 }
 
@@ -169,3 +172,37 @@ export interface AwsInstructions {
 export const getAwsInstructions = (org: string) => get<AwsInstructions>(`${tenantPath(org)}/aws`);
 export const connectAws = (org: string, region: string, roleArn: string) =>
   post<Tenant>(`${tenantPath(org)}/aws`, { region, roleArn });
+
+export interface Job {
+  id: number;
+  repository: string;
+  runId: number;
+  label: string;
+  status: "queued" | "in_progress" | "completed";
+  launchState: "launching" | "launched" | "failed" | null;
+  runnerName: string | null;
+  instanceId: string | null;
+  launchError: string | null;
+  /** Unix milliseconds. */
+  queuedAt: number;
+  updatedAt: number;
+}
+
+export interface JobCounts {
+  waiting: number;
+  active: number;
+  completedToday: number;
+  failedToday: number;
+}
+
+export interface JobPage {
+  jobs: Job[];
+  counts: JobCounts;
+  region: string | null;
+  pageSize?: number;
+}
+
+export const listJobs = (org: string, before?: number) =>
+  get<JobPage>(`${tenantPath(org)}/jobs${before ? `?before=${before}` : ""}`);
+export const saveSettings = (org: string, maxRunners: number, allowedRegions: string[] | null) =>
+  put<Tenant>(`${tenantPath(org)}/settings`, { maxRunners, allowedRegions });
