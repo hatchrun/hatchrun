@@ -31,6 +31,7 @@ pub mod connect;
 mod fetch;
 pub mod github;
 pub mod http;
+pub mod install;
 pub mod instance;
 pub mod jwt;
 pub mod labels;
@@ -199,6 +200,20 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
                 .bind(&[int(installation_id)?, now])?
                 .run()
                 .await?;
+            Ok(Response::empty()?.with_status(204))
+        }
+        Event::Installed {
+            installation_id,
+            account_id,
+        } => {
+            // A tenant made before an uninstall gets the new installation;
+            // an account without a tenant waits for an owner to set it up.
+            db.prepare(
+                "UPDATE tenants SET installation_id = ?1, updated_at = ?3 WHERE org_id = ?2",
+            )
+            .bind(&[int(installation_id)?, int(account_id)?, now])?
+            .run()
+            .await?;
             Ok(Response::empty()?.with_status(204))
         }
         Event::Ignored(reason) => {

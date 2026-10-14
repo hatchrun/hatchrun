@@ -30,8 +30,7 @@ export function SignIn({ returnTo }: { returnTo: string }) {
           Continue with GitHub
         </a>
         <p className="fine">
-          hatchrun asks GitHub who you are and which organizations you manage. It cannot read
-          your code.
+          Signing in only tells hatchrun who you are. Next, you'll install it on an organization.
         </p>
       </div>
       <p className="auth-footer muted">

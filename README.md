@@ -236,13 +236,19 @@ secret names that start with `GITHUB_`). A session is a
 random id in an `HttpOnly` cookie; D1 keeps only its hash, and the
 user's GitHub token sealed under a key derived from it.
 
-An owner of a GitHub organization sets it up in the app, which makes
-the organization's tenant, then installs the App with a link that
-carries a state tied to the session and the tenant. GitHub sends the
-browser to the App's setup URL, `https://app.hatchrun.io/api/github/setup`,
-which links the installation once it belongs to that organization and
-the user still owns it. Every request on a tenant checks the user's
-ownership with GitHub again.
+A user token from the App sees only accounts the App is installed on,
+so setup starts by installing it. The app links to GitHub's install
+page with a state tied to the session, GitHub picks the organization,
+and the App's setup URL, `https://app.hatchrun.io/api/github/setup`,
+gets the installation id back. It makes the organization's tenant once
+the App's JWT reads the installation, the user's token sees it in
+`/user/installations`, the account is an organization and the user is
+an active owner of it. Owners who already installed the App pick the
+organization from the start page instead. Every request on a tenant
+checks the user's ownership with GitHub again, which needs the App's
+organization permission Members (read). The `installation` webhook
+unlinks a tenant when the App is uninstalled or suspended and links it
+again when the App comes back.
 
 A tenant launches runners only while it holds a licence: a Polar
 subscription to one of the `POLAR_PRODUCT_ID` products, or a place in

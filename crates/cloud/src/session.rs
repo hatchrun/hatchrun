@@ -111,35 +111,29 @@ pub fn check_csrf(id: &[u8], given: Option<&str>) -> bool {
     mac.verify_slice(&given).is_ok()
 }
 
-/// The `state` of an App install started from this session for
-/// `tenant`: the tenant id and a MAC over it keyed with the session id.
-/// The setup URL callback gets it back from GitHub.
+/// The `state` of an App install started from this session. GitHub
+/// hands it back to the setup URL, which accepts the installation only
+/// for the session that asked for it. A MAC keyed with the session id,
+/// so no other session can make it.
+#[must_use]
+pub fn install_state(id: &[u8]) -> String {
+    b64url(derive(id, "hatchrun install"))
+}
+
+/// Whether `state` is this session's [`install_state`], compared in
+/// constant time.
 ///
 /// # Panics
 ///
 /// Never: HMAC takes keys of any length.
 #[must_use]
-pub fn install_state(id: &[u8], tenant: &str) -> String {
-    format!(
-        "{tenant}.{}",
-        b64url(derive(id, &format!("hatchrun install {tenant}")))
-    )
-}
-
-/// The tenant an [`install_state`] names, if this session made it.
-#[must_use]
-pub fn check_install_state<'a>(id: &[u8], state: &'a str) -> Option<&'a str> {
-    let (tenant, _) = state.split_once('.')?;
-    let expected = install_state(id, tenant);
-    // Both sides derive from secrets only this session holds; length
-    // and content leak nothing about another session's state.
-    (expected.len() == state.len()
-        && expected
-            .bytes()
-            .zip(state.bytes())
-            .fold(0, |diff, (a, b)| diff | (a ^ b))
-            == 0)
-        .then_some(tenant)
+pub fn check_install_state(id: &[u8], state: &str) -> bool {
+    let Ok(given) = URL_SAFE_NO_PAD.decode(state) else {
+        return false;
+    };
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(id).expect("HMAC takes any key");
+    mac.update(b"hatchrun install");
+    mac.verify_slice(&given).is_ok()
 }
 
 /// Seals `plain` for storage next to the session: AES-256-GCM under a
@@ -243,14 +237,14 @@ mod tests {
     }
 
     #[test]
-    fn install_states_belong_to_one_session_and_tenant() {
+    fn install_states_belong_to_one_session() {
         let id: [u8; ID_BYTES] = random();
-        let state = install_state(&id, "abcdefgh12345678");
-        assert_eq!(check_install_state(&id, &state), Some("abcdefgh12345678"));
-        assert_eq!(check_install_state(&random::<ID_BYTES>(), &state), None);
-        let other = state.replacen("abcdefgh", "zzzzzzzz", 1);
-        assert_eq!(check_install_state(&id, &other), None);
-        assert_eq!(check_install_state(&id, "abcdefgh12345678"), None);
+        let state = install_state(&id);
+        assert!(check_install_state(&id, &state));
+        assert!(!check_install_state(&random::<ID_BYTES>(), &state));
+        assert!(!check_install_state(&id, &csrf_token(&id)));
+        assert!(!check_install_state(&id, ""));
+        assert!(!check_install_state(&id, "not base64!"));
     }
 
     #[test]

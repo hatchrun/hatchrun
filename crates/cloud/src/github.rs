@@ -163,19 +163,9 @@ pub fn parse_user(response: &Response) -> Result<User, String> {
     decode(response, "user")
 }
 
-/// The organizations the user belongs to, with their role in each.
-/// Only active memberships; the first hundred, more than anyone
-/// administers.
-#[must_use]
-pub fn memberships(api: &str, token: &str) -> Request {
-    call(
-        "GET",
-        format!("{api}/user/memberships/orgs?state=active&per_page=100"),
-        token,
-    )
-}
-
-/// The user's membership of one organization.
+/// The user's membership of one organization. With a user token from
+/// the App this needs the App's organization permission Members (read)
+/// and the App installed on that organization.
 #[must_use]
 pub fn membership(api: &str, token: &str, org: &str) -> Request {
     call("GET", format!("{api}/user/memberships/orgs/{org}"), token)
@@ -211,15 +201,6 @@ impl Membership {
     }
 }
 
-/// Reads the memberships out of the answer.
-///
-/// # Errors
-///
-/// GitHub's answer when it is not a list of memberships.
-pub fn parse_memberships(response: &Response) -> Result<Vec<Membership>, String> {
-    decode(response, "memberships")
-}
-
 /// Reads one membership out of the answer. `None` when GitHub says the
 /// user is not in the organization.
 ///
@@ -250,6 +231,10 @@ pub struct Installation {
     pub id: u64,
     /// The account the App is installed on.
     pub account: Account,
+    /// When an owner suspended it; GitHub refuses its tokens until
+    /// they lift the suspension.
+    #[serde(default)]
+    pub suspended_at: Option<String>,
 }
 
 /// The user or organization an installation belongs to.
@@ -271,6 +256,32 @@ pub struct Account {
 /// GitHub's answer when it is not an installation.
 pub fn parse_installation(response: &Response) -> Result<Installation, String> {
     decode(response, "installation")
+}
+
+/// The installations of the App the signed-in user can see, asked with
+/// their user token: those on accounts where they own or can reach a
+/// repository the App covers. The first hundred.
+#[must_use]
+pub fn user_installations(api: &str, token: &str) -> Request {
+    call(
+        "GET",
+        format!("{api}/user/installations?per_page=100"),
+        token,
+    )
+}
+
+#[derive(Deserialize)]
+struct Installations {
+    installations: Vec<Installation>,
+}
+
+/// Reads the user's installations out of the answer.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a list of installations.
+pub fn parse_user_installations(response: &Response) -> Result<Vec<Installation>, String> {
+    decode::<Installations>(response, "installations").map(|list| list.installations)
 }
 
 /// Where an organization owner installs the App. GitHub hands `state`
@@ -404,26 +415,21 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_orgs_a_user_owns() {
-        assert_eq!(
-            memberships(API, "ghu_x").url,
-            "https://api.github.com/user/memberships/orgs?state=active&per_page=100"
-        );
-        let answer = Response {
-            status: 200,
-            body: br#"[{"url":"u","state":"active","role":"admin","organization":{"login":"acme","id":9,"avatar_url":"https://a/9"}},{"state":"active","role":"member","organization":{"login":"other","id":10,"avatar_url":"https://a/10"}},{"state":"pending","role":"admin","organization":{"login":"soon","id":11,"avatar_url":"https://a/11"}}]"#.to_vec(),
-        };
-        let owned: Vec<_> = parse_memberships(&answer)
-            .unwrap()
-            .into_iter()
-            .filter(Membership::is_admin)
-            .map(|membership| membership.organization.login)
-            .collect();
-        assert_eq!(owned, ["acme"]);
+    fn reads_a_membership() {
         assert_eq!(
             membership(API, "t", "acme").url,
             "https://api.github.com/user/memberships/orgs/acme"
         );
+        let owner = Response {
+            status: 200,
+            body: br#"{"url":"u","state":"active","role":"admin","organization":{"login":"acme","id":9,"avatar_url":"https://a/9"}}"#.to_vec(),
+        };
+        assert!(parse_membership(&owner).unwrap().unwrap().is_admin());
+        let pending = Response {
+            status: 200,
+            body: br#"{"state":"pending","role":"admin","organization":{"login":"acme","id":9,"avatar_url":"https://a/9"}}"#.to_vec(),
+        };
+        assert!(!parse_membership(&pending).unwrap().unwrap().is_admin());
         let gone = Response {
             status: 404,
             body: Vec::new(),
@@ -450,7 +456,22 @@ mod tests {
                     login: "acme".to_owned(),
                     kind: "Organization".to_owned(),
                 },
+                suspended_at: None,
             }
+        );
+        assert_eq!(
+            user_installations(API, "ghu_x").url,
+            "https://api.github.com/user/installations?per_page=100"
+        );
+        let mine = Response {
+            status: 200,
+            body: br#"{"total_count":2,"installations":[{"id":5,"account":{"login":"acme","id":9,"type":"Organization"},"suspended_at":null},{"id":6,"account":{"login":"octo","id":1,"type":"User"},"suspended_at":"2026-10-01T00:00:00Z"}]}"#.to_vec(),
+        };
+        let list = parse_user_installations(&mine).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            list[1].suspended_at.as_deref(),
+            Some("2026-10-01T00:00:00Z")
         );
         assert_eq!(
             install_url("https://github.com", "hatchrun", "t.s/x"),

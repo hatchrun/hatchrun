@@ -2,18 +2,26 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Setting up an organization and linking the App's installation.
+//! Setting up an organization, which starts with installing the App.
 //!
-//! - `GET /api/orgs` lists the organizations the user owns on GitHub and
-//!   whether each already has a tenant.
-//! - `POST /api/tenants` with `{"org": login}` creates the tenant for an
-//!   organization the user owns, or adds the user to the one that
-//!   exists, and makes them a member.
-//! - `GET /api/tenants` lists the user's tenants;
-//!   `GET /api/tenants/<org>` shows one, with what is left to set up.
+//! A user token from the App sees only accounts where the App is
+//! installed, so the App goes on first and GitHub's own install page
+//! picks the organization.
+//!
+//! - `GET /api/installations` lists the App's installations on
+//!   organizations the user can see, whether each has a tenant they are
+//!   in, and the install link for another one.
 //! - `GET /api/github/setup` is the App's setup URL: GitHub sends the
 //!   browser there after an install, with the installation id and the
 //!   state the install link carried.
+//! - `POST /api/tenants` with `{"installationId": id}` does what the
+//!   setup URL does for an installation already listed.
+//! - `GET /api/tenants` lists the user's tenants;
+//!   `GET /api/tenants/<org>` shows one, with what is left to set up.
+//!
+//! The setup URL and `POST /api/tenants` create the organization's
+//! tenant, or add the user to the one that exists, once [`install`]
+//! accepts the installation.
 //!
 //! Membership in D1 says which tenants a user sees. Acting on one also
 //! needs the user to own the organization on GitHub at that moment, so
@@ -25,7 +33,8 @@ use worker::{Request, Response};
 use super::billing::{Billing, billing, join_listed_beta};
 use super::{Answer, Ctx, Failure, found};
 use crate::fetch::send;
-use crate::github::{self, Membership};
+use crate::github::{self, Installation, Membership};
+use crate::install::{self, Refusal};
 use crate::launch::{APP_KEY, app_jwt};
 use crate::{int, jwt, now_ms, session, settings, tenant, webcrypto};
 
@@ -58,10 +67,9 @@ pub(crate) const TENANT_COLUMNS: &str = "tenants.id, tenants.org_id, tenants.org
 #[allow(clippy::struct_excessive_bools)] // One per step, as the app shows them.
 #[serde(rename_all = "camelCase")]
 struct Steps {
-    organization: bool,
+    app: bool,
     billing: bool,
     aws: bool,
-    app: bool,
 }
 
 /// A tenant as the app shows it.
@@ -77,6 +85,7 @@ struct TenantView {
     allowed_regions: Option<Vec<String>>,
     billing: Billing,
     steps: Steps,
+    /// Installs the App again after it was removed.
     install_url: String,
 }
 
@@ -95,6 +104,14 @@ struct AwsView {
     region: String,
     launch_template_id: String,
     subnet_ids: Vec<String>,
+}
+
+fn install_url(ctx: &Ctx<'_>) -> String {
+    github::install_url(
+        &ctx.config.github_web,
+        &ctx.config.app_slug,
+        &session::install_state(&ctx.session.id),
+    )
 }
 
 fn avatar(org_id: u64) -> String {
@@ -123,16 +140,11 @@ async fn view(ctx: &Ctx<'_>, row: TenantRow) -> worker::Result<TenantView> {
         _ => None,
     };
     Ok(TenantView {
-        install_url: github::install_url(
-            &ctx.config.github_web,
-            &ctx.config.app_slug,
-            &session::install_state(&ctx.session.id, &row.id),
-        ),
+        install_url: install_url(ctx),
         steps: Steps {
-            organization: true,
+            app: row.installation_id.is_some(),
             billing: billing.licensed,
             aws: aws.is_some(),
-            app: row.installation_id.is_some(),
         },
         id: row.id,
         org: OrgView {
@@ -189,117 +201,142 @@ pub(crate) async fn authorize(ctx: &Ctx<'_>, org: &str) -> Result<TenantRow, Fai
     Ok(row)
 }
 
+/// An installation as the start page lists it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OrgChoice {
+struct InstallationView {
     id: u64,
     login: String,
     avatar_url: String,
-    /// The tenant's id when the organization has one.
+    suspended: bool,
+    /// The organization's login when the user is in its tenant.
     tenant: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct Existing {
-    id: String,
+struct Joined {
     org_id: u64,
+    org_login: String,
 }
 
-/// `GET /api/orgs`
-pub(crate) async fn orgs(ctx: &Ctx<'_>) -> Answer {
-    let owned: Vec<Membership> = github::parse_memberships(
-        &send(&github::memberships(
+/// `GET /api/installations`
+pub(crate) async fn installations(ctx: &Ctx<'_>) -> Answer {
+    let orgs: Vec<Installation> = github::parse_user_installations(
+        &send(&github::user_installations(
             &ctx.config.github_api,
             &ctx.session.token,
         ))
         .await?,
     )?
     .into_iter()
-    .filter(Membership::is_admin)
+    .filter(|installation| installation.account.kind == "Organization")
     .collect();
 
-    let mut existing = Vec::new();
-    if !owned.is_empty() {
-        let placeholders = (1..=owned.len())
-            .map(|at| format!("?{at}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let ids = owned
-            .iter()
-            .map(|membership| int(membership.organization.id))
-            .collect::<worker::Result<Vec<_>>>()?;
-        existing = ctx
-            .db
-            .prepare(format!(
-                "SELECT id, org_id FROM tenants WHERE org_id IN ({placeholders})"
-            ))
-            .bind(&ids)?
-            .all()
-            .await?
-            .results::<Existing>()?;
-        // Organizations get renamed; keep the login the app routes by
-        // current.
-        let now = int(now_ms())?;
-        let renames = owned
-            .iter()
-            .filter(|membership| {
-                existing
-                    .iter()
-                    .any(|tenant| tenant.org_id == membership.organization.id)
+    let joined = ctx
+        .db
+        .prepare(
+            "SELECT tenants.org_id, tenants.org_login FROM tenants \
+             JOIN members ON members.tenant_id = tenants.id WHERE members.user_id = ?1",
+        )
+        .bind(&[int(ctx.session.user.id)?])?
+        .all()
+        .await?
+        .results::<Joined>()?;
+    // Organizations get renamed; keep the login the app routes by
+    // current.
+    let now = int(now_ms())?;
+    let renames = orgs
+        .iter()
+        .filter(|installation| {
+            joined.iter().any(|tenant| {
+                tenant.org_id == installation.account.id
+                    && tenant.org_login != installation.account.login
             })
-            .map(|membership| {
-                ctx.db
-                    .prepare(
-                        "UPDATE tenants SET org_login = ?2, updated_at = ?3 \
-                         WHERE org_id = ?1 AND org_login <> ?2",
-                    )
-                    .bind(&[
-                        int(membership.organization.id)?,
-                        membership.organization.login.as_str().into(),
-                        now.clone(),
-                    ])
-            })
-            .collect::<worker::Result<Vec<_>>>()?;
-        if !renames.is_empty() {
-            ctx.db.batch(renames).await?;
-        }
+        })
+        .map(|installation| {
+            ctx.db
+                .prepare("UPDATE tenants SET org_login = ?2, updated_at = ?3 WHERE org_id = ?1")
+                .bind(&[
+                    int(installation.account.id)?,
+                    installation.account.login.as_str().into(),
+                    now.clone(),
+                ])
+        })
+        .collect::<worker::Result<Vec<_>>>()?;
+    if !renames.is_empty() {
+        ctx.db.batch(renames).await?;
     }
 
-    let choices: Vec<OrgChoice> = owned
+    let list: Vec<InstallationView> = orgs
         .into_iter()
-        .map(|membership| {
-            let org = membership.organization;
-            OrgChoice {
-                tenant: existing
-                    .iter()
-                    .find(|tenant| tenant.org_id == org.id)
-                    .map(|tenant| tenant.id.clone()),
-                id: org.id,
-                login: org.login,
-                avatar_url: org.avatar_url,
-            }
+        .map(|installation| InstallationView {
+            tenant: joined
+                .iter()
+                .any(|tenant| tenant.org_id == installation.account.id)
+                .then(|| installation.account.login.clone()),
+            id: installation.id,
+            avatar_url: avatar(installation.account.id),
+            login: installation.account.login,
+            suspended: installation.suspended_at.is_some(),
         })
         .collect();
-    Ok(Response::from_json(&choices)?)
+    Ok(Response::from_json(&serde_json::json!({
+        "installUrl": install_url(ctx),
+        "installations": list,
+    }))?)
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct CreateTenant {
-    org: String,
-}
-
-/// `POST /api/tenants`
-pub(crate) async fn create(ctx: &Ctx<'_>, body: CreateTenant) -> Answer {
-    if !tenant::valid_login(&body.org) {
-        return Err(Failure::new(400, "not an organization login"));
+/// Makes `installation_id` the installation of its organization's
+/// tenant, creating the tenant if needed, and the user a member, once
+/// [`install::check`] and [`install::check_owner`] accept it. Returns
+/// the organization's login, or why not with the account's login.
+async fn adopt(
+    ctx: &Ctx<'_>,
+    installation_id: u64,
+) -> Result<Result<String, (Refusal, String)>, Failure> {
+    let key = jwt::pkcs8_der(&super::need(ctx.env, APP_KEY)?)
+        .map_err(|err| Failure::new(500, format!("{APP_KEY}: {err}")))?;
+    let app = app_jwt(&ctx.config.client_id, &key).await?;
+    let read = send(&github::installation(
+        &ctx.config.github_api,
+        &app,
+        installation_id,
+    ))
+    .await?;
+    if read.status == 404 {
+        return Ok(Err((Refusal::Unseen, String::new())));
     }
-    let Some(membership) = owned(ctx, &body.org).await? else {
-        return Err(Failure::new(
-            403,
-            format!("you are not an owner of {} on GitHub", body.org),
-        ));
-    };
-    let org = membership.organization;
+    let installation = github::parse_installation(&read)?;
+    let visible = github::parse_user_installations(
+        &send(&github::user_installations(
+            &ctx.config.github_api,
+            &ctx.session.token,
+        ))
+        .await?,
+    )?;
+    let login = installation.account.login.clone();
+    if let Err(refusal) = install::check(&installation, &visible) {
+        // Name the account only to someone who can see it.
+        let login = if refusal == Refusal::Unseen {
+            String::new()
+        } else {
+            login
+        };
+        return Ok(Err((refusal, login)));
+    }
+    let membership = github::parse_membership(
+        &send(&github::membership(
+            &ctx.config.github_api,
+            &ctx.session.token,
+            &login,
+        ))
+        .await?,
+    )?;
+    if let Err(refusal) = install::check_owner(&installation, membership.as_ref()) {
+        return Ok(Err((refusal, login)));
+    }
+
+    let org_id = int(installation.account.id)?;
     let now = int(now_ms())?;
     let id = tenant::new_id(&webcrypto::random_bytes(tenant::ID_LEN)?);
     ctx.db
@@ -308,14 +345,17 @@ pub(crate) async fn create(ctx: &Ctx<'_>, body: CreateTenant) -> Answer {
             // first one's.
             ctx.db
                 .prepare(
-                    "INSERT INTO tenants (id, org_id, org_login, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?4) \
-                     ON CONFLICT (org_id) DO UPDATE SET org_login = ?3, updated_at = ?4",
+                    "INSERT INTO tenants \
+                     (id, org_id, org_login, installation_id, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+                     ON CONFLICT (org_id) DO UPDATE \
+                     SET org_login = ?3, installation_id = ?4, updated_at = ?5",
                 )
                 .bind(&[
                     id.as_str().into(),
-                    int(org.id)?,
-                    org.login.as_str().into(),
+                    org_id.clone(),
+                    login.as_str().into(),
+                    int(installation.id)?,
                     now.clone(),
                 ])?,
             ctx.db
@@ -324,10 +364,27 @@ pub(crate) async fn create(ctx: &Ctx<'_>, body: CreateTenant) -> Answer {
                      SELECT id, ?2, ?3 FROM tenants WHERE org_id = ?1 \
                      ON CONFLICT DO NOTHING",
                 )
-                .bind(&[int(org.id)?, int(ctx.session.user.id)?, now])?,
+                .bind(&[org_id, int(ctx.session.user.id)?, now])?,
         ])
         .await?;
-    show(ctx, &org.login).await
+    Ok(Ok(login))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateTenant {
+    installation_id: u64,
+}
+
+/// `POST /api/tenants`
+pub(crate) async fn create(ctx: &Ctx<'_>, body: CreateTenant) -> Answer {
+    match adopt(ctx, body.installation_id).await? {
+        Ok(login) => show(ctx, &login).await,
+        Err((refusal, login)) => Err(Failure::new(
+            if refusal == Refusal::Unseen { 404 } else { 403 },
+            refusal.message(&login),
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,63 +431,41 @@ pub(crate) async fn show(ctx: &Ctx<'_>, org: &str) -> Answer {
 }
 
 #[derive(Debug, Deserialize)]
-struct Setup {
+struct SetupQuery {
     installation_id: Option<u64>,
+    setup_action: Option<String>,
     state: Option<String>,
 }
 
-/// `GET /api/github/setup`: records the installation once it is
-/// certain that it belongs to the tenant's organization and that the
-/// user owns that organization.
+/// `GET /api/github/setup`: links the installation GitHub names, once
+/// the state shows this session started the install and [`adopt`]
+/// accepts it, and sends the browser on to the organization's setup.
 pub(crate) async fn setup(ctx: &Ctx<'_>, req: &Request) -> Answer {
-    let query: Setup = req.query()?;
+    let query: SetupQuery = req.query()?;
     let back = |path: &str| found(&format!("{}{path}", ctx.config.app_url), &[]);
-    let (Some(installation_id), Some(state)) = (query.installation_id, query.state) else {
-        // An update to an existing installation, or an install started
-        // on GitHub rather than here: nothing to link.
+    if query.setup_action.as_deref() == Some("request") {
+        // A member asked an owner to install it; GitHub sends no
+        // installation until an owner approves.
+        return Ok(back("/?install=requested")?);
+    }
+    let Some(installation_id) = query.installation_id else {
         return Ok(back("/")?);
     };
-    let Some(tenant_id) = session::check_install_state(&ctx.session.id, &state) else {
-        return Ok(back("/?error=install-state")?);
+    let Some(state) = query.state else {
+        // No install of ours: a change on GitHub's settings page, or an
+        // owner approving a member's request. The start page lists the
+        // installation to carry on from.
+        return Ok(back("/")?);
     };
-    let login: Option<String> = ctx
-        .db
-        .prepare(
-            "SELECT tenants.org_login FROM tenants \
-             JOIN members ON members.tenant_id = tenants.id \
-             WHERE tenants.id = ?1 AND members.user_id = ?2",
-        )
-        .bind(&[tenant_id.into(), int(ctx.session.user.id)?])?
-        .first(Some("org_login"))
-        .await?;
-    let Some(login) = login else {
+    if !session::check_install_state(&ctx.session.id, &state) {
         return Ok(back("/?error=install-state")?);
-    };
-    let row = authorize(ctx, &login).await?;
-    let page = format!("/o/{}", row.org_login);
-
-    let key = jwt::pkcs8_der(&super::need(ctx.env, APP_KEY)?)
-        .map_err(|err| Failure::new(500, format!("{APP_KEY}: {err}")))?;
-    let app = app_jwt(&ctx.config.client_id, &key).await?;
-    let installation = github::parse_installation(
-        &send(&github::installation(
-            &ctx.config.github_api,
-            &app,
-            installation_id,
-        ))
-        .await?,
-    )?;
-    if installation.account.id != row.org_id || installation.account.kind != "Organization" {
-        return Ok(back(&format!("{page}?error=install-account"))?);
     }
-    ctx.db
-        .prepare("UPDATE tenants SET installation_id = ?2, updated_at = ?3 WHERE id = ?1")
-        .bind(&[
-            row.id.as_str().into(),
-            int(installation.id)?,
-            int(now_ms())?,
-        ])?
-        .run()
-        .await?;
-    Ok(back(&format!("{page}?installed=1"))?)
+    Ok(match adopt(ctx, installation_id).await? {
+        Ok(login) => back(&format!("/o/{login}?installed=1"))?,
+        Err((refusal, login)) => back(&format!(
+            "/?error={}&account={}",
+            refusal.code(),
+            crate::http::encode(&login)
+        ))?,
+    })
 }

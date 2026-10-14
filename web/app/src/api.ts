@@ -17,12 +17,20 @@ export interface Session {
   csrfToken: string;
 }
 
-export interface OrgChoice {
+/** An installation of the App on an organization the user can see. */
+export interface InstallationChoice {
   id: number;
   login: string;
   avatarUrl: string;
-  /** The tenant's id when the organization is already set up. */
+  suspended: boolean;
+  /** The organization's login when the user is already in its tenant. */
   tenant: string | null;
+}
+
+export interface Installations {
+  /** Installs the App on another account, tied to this session. */
+  installUrl: string;
+  installations: InstallationChoice[];
 }
 
 export interface TenantSummary {
@@ -65,10 +73,9 @@ export interface Plans {
 }
 
 export interface Steps {
-  organization: boolean;
+  app: boolean;
   billing: boolean;
   aws: boolean;
-  app: boolean;
 }
 
 export interface Tenant {
@@ -151,10 +158,10 @@ export function signInUrl(returnTo: string): string {
 
 export const signOut = () => post<undefined>("/api/auth/logout");
 
-export const listOrgs = () => get<OrgChoice[]>("/api/orgs");
+export const listInstallations = () => get<Installations>("/api/installations");
 export const listTenants = () => get<TenantSummary[]>("/api/tenants");
 export const getTenant = (org: string) => get<Tenant>(`/api/tenants/${encodeURIComponent(org)}`);
-export const createTenant = (org: string) => post<Tenant>("/api/tenants", { org });
+export const createTenant = (installationId: number) => post<Tenant>("/api/tenants", { installationId });
 
 const tenantPath = (org: string) => `/api/tenants/${encodeURIComponent(org)}`;
 export const getPlan = () => get<Plans>("/api/plan");

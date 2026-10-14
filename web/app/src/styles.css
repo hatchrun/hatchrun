@@ -669,6 +669,119 @@ a.list-row:hover {
   font-weight: 550;
 }
 
+.inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+/* Start page */
+
+.start-hero {
+  max-width: 460px;
+  margin: 2.5rem auto 0;
+  text-align: center;
+}
+
+.start-hero h1 {
+  font-size: 1.5rem;
+}
+
+.start-hero > .muted {
+  margin-bottom: 1.5rem;
+}
+
+.start-marks {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  margin-bottom: 1.25rem;
+}
+
+.start-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.start-mark svg {
+  width: 26px;
+  height: 26px;
+}
+
+.start-link {
+  width: 32px;
+  border-top: 2px dashed var(--border);
+}
+
+.start-points {
+  margin: 0 0 1.25rem;
+  padding: 0.25rem 1.1rem;
+  list-style: none;
+  text-align: left;
+  font-size: 0.93rem;
+}
+
+.start-points li {
+  display: flex;
+  gap: 0.65rem;
+  padding: 0.7rem 0;
+}
+
+.start-points li + li {
+  border-top: 1px solid var(--border);
+}
+
+.start-points strong {
+  font-weight: 600;
+}
+
+.start-check {
+  flex: none;
+  margin-top: 0.2rem;
+  color: var(--success);
+}
+
+.start-add {
+  color: var(--muted);
+}
+
+.start-add .list-title {
+  font-weight: 500;
+}
+
+.start-plus {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  font-size: 1.1rem;
+}
+
+.start .page-head .muted {
+  margin: 0.25rem 0 0;
+}
+
+@media (max-width: 560px) {
+  .start-hero {
+    margin-top: 1rem;
+  }
+
+  .start .list-row {
+    flex-wrap: wrap;
+  }
+}
+
 /* Organization switcher */
 
 .switcher {

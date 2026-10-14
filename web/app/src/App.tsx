@@ -10,7 +10,6 @@ import { Shell } from "./components/Shell";
 import { Await } from "./components/Status";
 import { useLoad } from "./load";
 import { Home } from "./pages/Home";
-import { NewOrg } from "./pages/NewOrg";
 import { SignIn } from "./pages/SignIn";
 import { TenantPage } from "./pages/TenantPage";
 import { navigate, useLocation } from "./router";
@@ -64,7 +63,7 @@ export function App() {
   }
   return (
     <Shell user={user}>
-      {path === "/new" ? <NewOrg /> : path === "/" ? <Home /> : <NotFound />}
+      {path === "/new" ? <Home stay /> : path === "/" ? <Home /> : <NotFound />}
     </Shell>
   );
 }
