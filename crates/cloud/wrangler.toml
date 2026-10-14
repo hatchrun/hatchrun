@@ -53,7 +53,7 @@ GITHUB_APP_SLUG = "hatchrun"
 # The published connect.yaml (the TemplateUrl output of
 # deploy/cloudformation/templates-bucket.yaml), which the Launch Stack
 # links open. Empty until the bucket exists; the app says so until then.
-CONNECT_TEMPLATE_URL = ""
+CONNECT_TEMPLATE_URL = "https://hatchrun-templates.s3.us-east-1.amazonaws.com/connect.yaml"
 # The Polar product of the per-organization licence. Empty until the
 # product exists; checkout answers 503 until then. POLAR_API_URL points
 # the Worker at Polar's sandbox (https://sandbox-api.polar.sh).
