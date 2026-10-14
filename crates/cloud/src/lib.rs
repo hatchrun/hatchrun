@@ -33,6 +33,7 @@ pub mod github;
 pub mod http;
 pub mod install;
 pub mod instance;
+pub mod instance_types;
 pub mod jwt;
 pub mod labels;
 mod launch;

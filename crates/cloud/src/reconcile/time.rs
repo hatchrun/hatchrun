@@ -37,6 +37,40 @@ pub fn parse(value: &str) -> Option<u64> {
     Some(seconds * 1000 + millis)
 }
 
+/// `ms` (Unix milliseconds) as `2026-10-14T10:00:00Z`, whole seconds.
+#[must_use]
+pub fn format(ms: u64) -> String {
+    let seconds = ms / 1000;
+    let (year, month, day) = civil(seconds / 86_400);
+    let time = seconds % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        time / 3600,
+        time / 60 % 60,
+        time % 60
+    )
+}
+
+/// The date `days` after 1970-01-01, by Howard Hinnant's
+/// `civil_from_days`.
+fn civil(days: u64) -> (u64, u64, u64) {
+    let shifted = days + 719_468;
+    let era = shifted / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    (year, month, day)
+}
+
 /// Days from 1970-01-01 to a date, by Howard Hinnant's
 /// `days_from_civil`, for years from 1970 on.
 fn days(year: u64, month: u64, day: u64) -> u64 {
@@ -64,6 +98,17 @@ mod tests {
         );
         assert_eq!(parse("2024-02-29T23:59:59Z"), Some(1_709_251_199_000));
         assert_eq!(parse("2000-03-01T00:00:00Z"), Some(951_868_800_000));
+    }
+
+    #[test]
+    fn writes_what_it_reads() {
+        assert_eq!(format(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format(1_791_972_000_250), "2026-10-14T10:00:00Z");
+        assert_eq!(format(1_709_251_199_000), "2024-02-29T23:59:59Z");
+        assert_eq!(format(951_868_800_000), "2000-03-01T00:00:00Z");
+        for ms in (0..20_000u64).map(|day| day * 86_400_000 + 3_723_000) {
+            assert_eq!(parse(&format(ms)), Some(ms));
+        }
     }
 
     #[test]

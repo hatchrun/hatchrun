@@ -252,13 +252,17 @@ Resources:
             Version: "2012-10-17"
             Statement:
               # Describing the launch template and subnets lets the
-              # hatchrun.io app check the stack before saving it.
+              # hatchrun.io app check the stack before saving it; the
+              # instance types, their offerings and Spot prices fill
+              # its daily catalog of what the region offers.
               - Sid: List
                 Effect: Allow
                 Action:
                   - ec2:DescribeInstances
                   - ec2:DescribeInstanceTypeOfferings
+                  - ec2:DescribeInstanceTypes
                   - ec2:DescribeLaunchTemplates
+                  - ec2:DescribeSpotPriceHistory
                   - ec2:DescribeSubnets
                 Resource: "*"
               - Sid: LaunchInstances

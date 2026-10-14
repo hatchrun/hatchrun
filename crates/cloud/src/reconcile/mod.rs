@@ -14,9 +14,11 @@
 //! 3. per tenant with a verified role, describe its live instances,
 //!    terminate the ones nothing needs and launch queued jobs again
 //!    (see [`plan`]);
-//! 4. fail the lost launches of installations with no AWS connected,
+//! 4. refresh the instance type catalog of one region that is due,
+//!    through a tenant role there (see [`crate::instance_types`]);
+//! 5. fail the lost launches of installations with no AWS connected,
 //!    which `launch` does without calling anyone;
-//! 5. delete expired sessions and rows past the retention.
+//! 6. delete expired sessions and rows past the retention.
 //!
 //! Every step is safe to repeat and to run beside a webhook: rows
 //! change only while they still say what the pass read, and `launch`
@@ -42,8 +44,10 @@ use wasm_bindgen::JsValue;
 use worker::{D1Database, D1PreparedStatement, Env, console_error, console_log, console_warn};
 
 use self::plan::{Instance, Job, LaunchState, Limits, Plan};
+use crate::aws::describe;
 use crate::aws::{self, Credentials, ec2, instances};
 use crate::fetch::{send, send_reading};
+use crate::instance_types::{self, store as catalog};
 use crate::launch::{self, APP_KEY, AWS_ENDPOINT_URL};
 use crate::webhook::{QueuedJob, Status};
 use crate::{DB, github, int, jwt, labels, now_ms, oidc};
@@ -87,6 +91,13 @@ const UNCONNECTED_PER_PASS: u32 = 50;
 const DELETE_BATCH: u32 = 1000;
 /// How long a pass holds the lease; a pass that dies holds it no longer.
 const LEASE: u64 = 5 * 60 * 1000;
+/// Pages of each describe call a catalog refresh reads. A region has
+/// about a thousand types: ten pages of types, a few of offerings and
+/// Spot prices.
+const CATALOG_PAGES: u32 = 20;
+/// Requests a catalog refresh may make: STS, the price list and the
+/// pages.
+const CATALOG_COST: u32 = 2 + 3 * CATALOG_PAGES;
 /// What `CloudTrail` shows as the session of the reconciler's calls.
 const SESSION: &str = "hatchrun-reconcile";
 
@@ -120,6 +131,8 @@ struct Summary {
     gave_up: u32,
     /// Jobs launched again.
     launched: u32,
+    /// Instance types in the region whose catalog was refreshed.
+    catalog_types: u32,
     /// Lost launches of installations with no AWS connected, failed.
     unconnected: u32,
     /// Expired sessions deleted.
@@ -147,6 +160,7 @@ impl Summary {
         self.adopted += other.adopted;
         self.gave_up += other.gave_up;
         self.launched += other.launched;
+        self.catalog_types += other.catalog_types;
         self.unconnected += other.unconnected;
         self.sessions_deleted += other.sessions_deleted;
         self.jobs_deleted += other.jobs_deleted;
@@ -207,10 +221,11 @@ pub async fn run(env: Env) {
         more: Cell::new(false),
     };
 
-    let steps: [(&str, Fallible<Summary>); 5] = [
+    let steps: [(&str, Fallible<Summary>); 6] = [
         ("redeliver", pass.redeliver().await),
         ("sync", pass.sync().await),
         ("tenants", pass.tenants().await),
+        ("catalog", pass.catalog().await),
         ("unconnected", pass.unconnected().await),
         ("retention", pass.retention().await),
     ];
@@ -970,7 +985,140 @@ impl Pass<'_> {
         Ok(rows.into_iter().filter_map(queued_job).collect())
     }
 
-    /// Step 4: fails the lost launches of installations with no AWS
+    /// Step 4: refreshes the catalog of the region least recently
+    /// refreshed among those that are due, through the role of a tenant
+    /// there chosen at random, so one tenant whose role refuses does not
+    /// hold the region back.
+    async fn catalog(&self) -> Fallible<Summary> {
+        let due: Option<CatalogTenant> = self
+            .db
+            .prepare(format!(
+                "SELECT id, role_arn, region FROM tenants WHERE {VERIFIED} \
+                 AND NOT EXISTS (SELECT 1 FROM instance_type_regions AS done \
+                   WHERE done.region = tenants.region \
+                   AND (done.refreshed_at >= ?1 OR done.attempted_at >= ?2)) \
+                 ORDER BY COALESCE((SELECT refreshed_at FROM instance_type_regions AS done \
+                   WHERE done.region = tenants.region), 0), RANDOM() LIMIT 1"
+            ))
+            .bind(&[
+                int(self.now.saturating_sub(instance_types::FRESH_FOR)).map_err(text)?,
+                int(self.now.saturating_sub(instance_types::RETRY_AFTER)).map_err(text)?,
+            ])
+            .map_err(text)?
+            .first(None)
+            .await
+            .map_err(text)?;
+        let Some(tenant) = due else {
+            return Ok(Summary::default());
+        };
+        if !self.spend(CATALOG_COST) {
+            return Ok(Summary::default());
+        }
+        match self.refresh_catalog(&tenant).await {
+            Ok(entries) => {
+                catalog::replace(&self.db, &tenant.region, &entries, self.now)
+                    .await
+                    .map_err(text)?;
+                console_log!(
+                    "reconcile: catalog of {}: {} instance types",
+                    tenant.region,
+                    entries.len()
+                );
+                Ok(Summary {
+                    catalog_types: u32::try_from(entries.len()).unwrap_or(u32::MAX),
+                    ..Summary::default()
+                })
+            }
+            Err(err) => {
+                let err = format!("through tenant {}: {err}", tenant.id);
+                catalog::failed(&self.db, &tenant.region, &err, self.now)
+                    .await
+                    .map_err(text)?;
+                Err(format!("catalog of {}: {err}", tenant.region))
+            }
+        }
+    }
+
+    /// Reads `tenant`'s region's instance types, offerings and prices.
+    async fn refresh_catalog(
+        &self,
+        tenant: &CatalogTenant,
+    ) -> Fallible<Vec<instance_types::Entry>> {
+        let price_url = instance_types::price_list_url(&tenant.region)
+            .ok_or_else(|| format!("no price list for {}", tenant.region))?;
+        let key = self.secret_der(oidc::SIGNING_KEY)?;
+        let kid =
+            get(self.env, oidc::KEY_ID).ok_or_else(|| format!("{} is not set", oidc::KEY_ID))?;
+        let credentials = launch::tenant_credentials(
+            &key,
+            &kid,
+            self.aws_endpoint.as_deref(),
+            &tenant.id,
+            &tenant.role_arn,
+            &tenant.region,
+            SESSION,
+        )
+        .await
+        .map_err(|err| format!("AssumeRoleWithWebIdentity {}: {err}", tenant.role_arn))?;
+        let endpoint = aws::endpoint("ec2", &tenant.region, self.aws_endpoint.as_deref());
+        let call = |mut request: crate::http::Request| {
+            let credentials = &credentials;
+            let region = tenant.region.as_str();
+            async move {
+                aws::sign_v4(&mut request, credentials, region, "ec2", now_ms())?;
+                send(&request).await
+            }
+        };
+
+        let mut types = Vec::new();
+        let mut next = None;
+        for _ in 0..CATALOG_PAGES {
+            let response = call(describe::instance_types(&endpoint, next.as_deref())).await?;
+            let (page, token) = describe::described_types(&response)
+                .map_err(|err| format!("DescribeInstanceTypes: {err}"))?;
+            types.extend(page);
+            next = token;
+            if next.is_none() {
+                break;
+            }
+        }
+        let mut offerings = Vec::new();
+        for _ in 0..CATALOG_PAGES {
+            let response = call(describe::offerings(&endpoint, next.as_deref())).await?;
+            let (page, token) = describe::described_offerings(&response)
+                .map_err(|err| format!("DescribeInstanceTypeOfferings: {err}"))?;
+            offerings.extend(page);
+            next = token;
+            if next.is_none() {
+                break;
+            }
+        }
+        let now = time::format(self.now);
+        let mut spot = Vec::new();
+        for _ in 0..CATALOG_PAGES {
+            let response = call(describe::spot_prices(&endpoint, &now, next.as_deref())).await?;
+            let (page, token) = describe::described_spot_prices(&response)
+                .map_err(|err| format!("DescribeSpotPriceHistory: {err}"))?;
+            spot.extend(page);
+            next = token;
+            if next.is_none() {
+                break;
+            }
+        }
+        if next.is_some() {
+            return Err(format!(
+                "more than {CATALOG_PAGES} pages of one describe call"
+            ));
+        }
+        let prices = send(&crate::http::Request::new("GET", price_url)).await?;
+        if !prices.ok() {
+            return Err(format!("price list answered {}", prices.status));
+        }
+        let on_demand = instance_types::on_demand_prices(&prices.body)?;
+        Ok(instance_types::merge(types, &offerings, &on_demand, &spot))
+    }
+
+    /// Step 5: fails the lost launches of installations with no AWS
     /// connected. `launch` finds no tenant and says so on the job.
     async fn unconnected(&self) -> Fallible<Summary> {
         let before = self.now.saturating_sub(self.limits.queued_grace);
@@ -998,7 +1146,7 @@ impl Pass<'_> {
         Ok(done)
     }
 
-    /// Step 5: deletes expired sessions, jobs past the retention, and
+    /// Step 6: deletes expired sessions, jobs past the retention, and
     /// redeliveries GitHub no longer lists.
     async fn retention(&self) -> Fallible<Summary> {
         let now = int(self.now).map_err(text)?;
@@ -1074,6 +1222,13 @@ struct Tenant {
     role_arn: String,
     region: String,
     max_runners: u32,
+}
+
+#[derive(Deserialize)]
+struct CatalogTenant {
+    id: String,
+    role_arn: String,
+    region: String,
 }
 
 #[derive(Deserialize)]

@@ -319,8 +319,13 @@ organization's setup (the role cannot be assumed or may not launch,
 no allowed instance type fits the profile, no such profile) waits
 until an owner verifies the role again, edits a profile, changes the
 settings or gains a licence; [`retry.rs`](crates/cloud/src/reconcile/retry.rs)
-lists every case. It also deletes expired sessions and jobs past the
-retention. The timeouts are the `RECONCILE_*` variables in
+lists every case. Once a day per region it refreshes the instance
+type catalog in D1 through a tenant role there: every current
+generation amd64 and arm64 type with the zones that offer it
+(`DescribeInstanceTypes`, `DescribeInstanceTypeOfferings`), its Linux
+on-demand price from AWS's public price list and its lowest Spot price
+(`DescribeSpotPriceHistory`). It also deletes expired sessions and
+jobs past the retention. The timeouts are the `RECONCILE_*` variables in
 `wrangler.toml`. Each pass logs one summary line and keeps it in the
 `reconciler` table:
 
