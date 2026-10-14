@@ -292,6 +292,28 @@ with the instance type and on-demand price each gets in the tenant's
 region, and its settings: the most runners at once and the regions
 runners may use, which the Worker also checks before every launch.
 
+### Reconciler
+
+A Cron Trigger runs [`reconcile`](crates/cloud/src/reconcile) every
+minute. It asks GitHub to redeliver the App's webhook deliveries that
+failed (each event once), asks GitHub about open jobs that have had no
+webhook for a while, and, per tenant with a verified role, describes
+the instances tagged with the tenant: it terminates the ones whose job
+is over, that never got a job, or that ran past the longest age, and
+launches queued jobs again whose launch was lost or whose runner took
+another job. It also deletes expired sessions and jobs past the
+retention. The timeouts are the `RECONCILE_*` variables in
+`wrangler.toml`. Each pass logs one summary line and keeps it in the
+`reconciler` table:
+
+```sh
+npx wrangler@4.143.0 d1 execute hatchrun-cloud --remote --command \
+  "SELECT finished_at, summary FROM reconciler"
+```
+
+`wrangler dev --test-scheduled` runs a pass on
+`GET /__scheduled?cron=*+*+*+*+*`.
+
 `npm run dev` in `web/app` serves the app with hot reload and sends
 `/api` to `wrangler dev` on port 8787. `npm run dev:mock` answers `/api`
 from [`web/app/mock/api.ts`](web/app/mock/api.ts) instead, with no

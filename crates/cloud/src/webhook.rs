@@ -95,6 +95,8 @@ pub enum Event {
         id: u64,
         /// The new status.
         status: Status,
+        /// The runner that took the job, once one did.
+        runner: Option<String>,
     },
     /// The App was uninstalled; the tenant loses its installation.
     Uninstalled {
@@ -119,6 +121,7 @@ struct Job {
     id: u64,
     run_id: u64,
     labels: Vec<String>,
+    runner_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -163,7 +166,14 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Event, serde_json::Error> {
         other => return Ok(Event::Ignored(format!("workflow_job {other} is not used"))),
     };
     if status != Status::Queued {
-        return Ok(Event::Progress { id, status });
+        return Ok(Event::Progress {
+            id,
+            status,
+            runner: payload
+                .workflow_job
+                .runner_name
+                .filter(|name| !name.is_empty()),
+        });
     }
 
     let label = match labels::job_label(&payload.workflow_job.labels) {
@@ -314,7 +324,27 @@ mod tests {
             parse("workflow_job", &job("completed", &["ubuntu-latest"])).unwrap(),
             Event::Progress {
                 id: 29_679_449,
-                status: Status::Completed
+                status: Status::Completed,
+                runner: None,
+            }
+        );
+    }
+
+    #[test]
+    fn names_the_runner_that_took_the_job() {
+        let body = serde_json::json!({
+            "action": "in_progress",
+            "workflow_job": {
+                "id": 7, "run_id": 5, "labels": ["hatchrun"], "runner_name": "hatchrun-9-ab12",
+            },
+            "repository": { "full_name": "acme/app" },
+        });
+        assert_eq!(
+            parse("workflow_job", body.to_string().as_bytes()).unwrap(),
+            Event::Progress {
+                id: 7,
+                status: Status::InProgress,
+                runner: Some("hatchrun-9-ab12".to_owned()),
             }
         );
     }

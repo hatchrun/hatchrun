@@ -23,6 +23,10 @@ binding = "ASSETS"
 run_worker_first = true
 not_found_handling = "single-page-application"
 
+# The reconciler (crates/cloud/src/reconcile) every minute.
+[triggers]
+crons = ["* * * * *"]
+
 [build]
 command = "cargo install --locked worker-build --version 0.8.7 && worker-build --release"
 
@@ -66,3 +70,21 @@ BROKER_URL = "https://broker.hatchrun.io"
 # OIDC_NEXT_KEY_ID and OIDC_PREVIOUS_KEY_ID are set here. The README
 # has the rotation steps.
 OIDC_KEY_ID = "2026-10-14"
+# The reconciler's timeouts, in seconds (crates/cloud/src/reconcile/plan.rs
+# says what each one bounds). A job queued this long without a runner
+# launches again.
+RECONCILE_QUEUED_GRACE_SECS = "60"
+# The longest a launch takes, and an instance without a known job runs.
+RECONCILE_LAUNCH_TIMEOUT_SECS = "600"
+# How long a runner waits for its job before the launch is given up.
+RECONCILE_IDLE_TIMEOUT_SECS = "1800"
+# How long an instance nothing needs stays up.
+RECONCILE_DONE_GRACE_SECS = "180"
+# The longest any runner instance runs.
+RECONCILE_MAX_INSTANCE_AGE_SECS = "28800"
+# How long an open job goes without a webhook before GitHub is asked.
+RECONCILE_SYNC_AFTER_SECS = "300"
+# How far back failed webhook deliveries are redelivered.
+RECONCILE_REDELIVER_WINDOW_SECS = "21600"
+# How long jobs are kept, in days.
+RECONCILE_RETENTION_DAYS = "30"
