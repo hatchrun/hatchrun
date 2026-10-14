@@ -5,7 +5,7 @@
 [package]
 name = "hatchrun-cloud"
 version = "0.1.0"
-description = "Cloudflare Worker behind hatchrun.dev: GitHub App webhooks in, runner instances out"
+description = "Cloudflare Worker behind hatchrun.io: GitHub App webhooks in, runner instances out"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true

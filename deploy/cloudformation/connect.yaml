@@ -4,13 +4,13 @@
 
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Connects this AWS account and region to hatchrun.dev, which runs
+  Connects this AWS account and region to hatchrun.io, which runs
   GitHub Actions jobs here on EC2 instances, one instance per job.
 
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
-      - Label: { default: hatchrun.dev }
+      - Label: { default: hatchrun.io }
         Parameters:
           - TenantId
           - OidcProviderArn
@@ -26,8 +26,8 @@ Metadata:
           - VpcId
           - SubnetIds
     ParameterLabels:
-      TenantId: { default: Tenant ID from the hatchrun.dev dashboard }
-      OidcProviderArn: { default: Existing hatchrun.dev OIDC provider }
+      TenantId: { default: Tenant ID from the hatchrun.io dashboard }
+      OidcProviderArn: { default: Existing hatchrun.io OIDC provider }
       InstanceTypes: { default: Allowed instance types }
       VolumeSizeLimit: { default: Largest root volume (GiB) }
 
@@ -35,11 +35,11 @@ Parameters:
   TenantId:
     Type: String
     AllowedPattern: ^[a-z0-9]{8,64}$
-    Description: Only hatchrun.dev requests for this tenant can use the role this stack creates.
+    Description: Only hatchrun.io requests for this tenant can use the role this stack creates.
   OidcProviderArn:
     Type: String
     Default: ""
-    AllowedPattern: ^(arn:aws[a-z-]*:iam::[0-9]{12}:oidc-provider/oidc\.hatchrun\.dev)?$
+    AllowedPattern: ^(arn:aws[a-z-]*:iam::[0-9]{12}:oidc-provider/oidc\.hatchrun\.io)?$
     Description: >-
       IAM holds one OIDC provider per URL in an account. Leave empty for the
       first stack in the account; for a stack in another region, paste the
@@ -83,14 +83,14 @@ Rules:
         AssertDescription: Pick the subnets for runners in the VPC.
 
 Resources:
-  # hatchrun.dev signs a short-lived token naming the tenant and trades
+  # hatchrun.io signs a short-lived token naming the tenant and trades
   # it for this role's credentials with AssumeRoleWithWebIdentity. No
   # access keys exist, and a token for another tenant gets nothing.
   OidcProvider:
     Type: AWS::IAM::OIDCProvider
     Condition: CreateOidcProvider
     Properties:
-      Url: https://oidc.hatchrun.dev
+      Url: https://oidc.hatchrun.io
       ClientIdList: [sts.amazonaws.com]
 
   # Network, when no VPC is given: public subnets in two zones. Runners
@@ -186,7 +186,7 @@ Resources:
 
   # The image and instance type come with each launch, from the job's
   # labels. Runners get no instance profile: the agent claims its runner
-  # config from the hatchrun.dev broker with a one-time ticket in user
+  # config from the hatchrun.io broker with a one-time ticket in user
   # data, and jobs that need AWS use GitHub's OIDC.
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
@@ -209,7 +209,7 @@ Resources:
               Encrypted: true
               DeleteOnTermination: true
 
-  # What hatchrun.dev may do here: launch hatchrun images from this
+  # What hatchrun.io may do here: launch hatchrun images from this
   # stack's launch template into this VPC, within the instance type and
   # volume limits above, and stop, start, retag or terminate only the
   # instances it launched. The conditions keep the launch template's
@@ -217,7 +217,7 @@ Resources:
   ControlPlaneRole:
     Type: AWS::IAM::Role
     Properties:
-      Description: hatchrun.dev launches and removes runner instances
+      Description: hatchrun.io launches and removes runner instances
       MaxSessionDuration: 3600
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -228,8 +228,8 @@ Resources:
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
               StringEquals:
-                oidc.hatchrun.dev:aud: sts.amazonaws.com
-                oidc.hatchrun.dev:sub: !Sub "tenant:${TenantId}"
+                oidc.hatchrun.io:aud: sts.amazonaws.com
+                oidc.hatchrun.io:sub: !Sub "tenant:${TenantId}"
       Policies:
         - PolicyName: run-jobs
           PolicyDocument:
@@ -322,7 +322,7 @@ Resources:
 
 Outputs:
   RoleArn:
-    Description: Paste this into the hatchrun.dev dashboard.
+    Description: Paste this into the hatchrun.io dashboard.
     Value: !GetAtt ControlPlaneRole.Arn
   OidcProviderArn:
     Description: Pass this to stacks in other regions of this account.

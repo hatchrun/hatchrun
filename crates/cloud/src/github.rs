@@ -34,7 +34,7 @@ fn call(method: &'static str, url: String, token: &str) -> Request {
     Request::new(method, url)
         .header("Accept", "application/vnd.github+json")
         .header("Authorization", format!("Bearer {token}"))
-        .header("User-Agent", "hatchrun.dev")
+        .header("User-Agent", "hatchrun.io")
         .header("X-GitHub-Api-Version", "2022-11-28")
 }
 

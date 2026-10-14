@@ -165,7 +165,7 @@ npx wrangler@4.143.0 secret put BROKER_TOKEN
 npx wrangler@4.143.0 deploy
 ```
 
-## hatchrun.dev
+## hatchrun.io
 
 [`crates/cloud`](crates/cloud) is the Cloudflare Worker behind the
 hosted service. Instead of a scaler per scale set, it takes the

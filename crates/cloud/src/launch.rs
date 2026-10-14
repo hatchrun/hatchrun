@@ -11,7 +11,7 @@
 //!
 //! 1. pick the instance type from the label and the image for its
 //!    architecture in the tenant's region;
-//! 2. sign an `oidc.hatchrun.dev` token for the tenant and trade it for
+//! 2. sign an `oidc.hatchrun.io` token for the tenant and trade it for
 //!    the tenant role's credentials;
 //! 3. register a just-in-time runner with the job's label through the
 //!    App installation;
