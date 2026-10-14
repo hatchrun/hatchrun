@@ -84,12 +84,15 @@ jobs:
           GITHUB_WEBHOOK_SECRET: ${{ secrets.GITHUB_WEBHOOK_SECRET }}
           GITHUB_APP_PRIVATE_KEY: ${{ secrets.GITHUB_APP_PRIVATE_KEY }}
           OIDC_SIGNING_KEY: ${{ secrets.OIDC_SIGNING_KEY }}
+          OIDC_NEXT_SIGNING_KEY: ${{ secrets.OIDC_NEXT_SIGNING_KEY }}
+          OIDC_PREVIOUS_SIGNING_KEY: ${{ secrets.OIDC_PREVIOUS_SIGNING_KEY }}
           BROKER_TOKEN: ${{ secrets.BROKER_TOKEN }}
         run: |
           secrets="$RUNNER_TEMP/worker-secrets.json"
           trap 'rm -f "$secrets"' EXIT
           (umask 077 && jq -n 'env | with_entries(select(
-              (.key | IN("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_PRIVATE_KEY", "OIDC_SIGNING_KEY", "BROKER_TOKEN"))
+              (.key | IN("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_PRIVATE_KEY", "BROKER_TOKEN",
+                         "OIDC_SIGNING_KEY", "OIDC_NEXT_SIGNING_KEY", "OIDC_PREVIOUS_SIGNING_KEY"))
               and .value != ""))' > "$secrets")
           echo "Uploading secrets: $(jq -r 'keys | join(", ")' "$secrets")"
           npx --yes "$WRANGLER" deploy --secrets-file "$secrets"
