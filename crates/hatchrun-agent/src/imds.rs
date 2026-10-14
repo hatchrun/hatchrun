@@ -48,6 +48,13 @@ impl Imds {
             .context("instance metadata has no placement/region")
     }
 
+    /// Returns the instance type, such as `m7i.large`.
+    pub async fn instance_type(&self) -> Result<String> {
+        self.text("meta-data/instance-type")
+            .await?
+            .context("instance metadata has no instance-type")
+    }
+
     /// Fetches a path under /latest/. Returns `None` on 404. Connection
     /// errors are retried, because the network may still be coming up when
     /// the agent starts.

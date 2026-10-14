@@ -65,18 +65,25 @@ impl Broker for HttpBroker {
 }
 
 /// Builds the claim URL. The boot document holds credentials, so it only
-/// travels over HTTPS; plain HTTP is accepted for loopback addresses, for
-/// tests.
+/// travels over HTTPS.
 fn claim_url(broker: &str, ticket: &str) -> Result<Url> {
-    let mut url = Url::parse(broker).with_context(|| format!("broker URL {broker:?}"))?;
-    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-        bail!("broker URL {broker:?} must use https");
-    }
+    let mut url = https_url(broker, "broker")?;
     url.path_segments_mut()
         .map_err(|()| anyhow::anyhow!("broker URL {broker:?} cannot have a path"))?
         .pop_if_empty()
         .extend(["v1", "tickets", ticket, "claim"]);
+    Ok(url)
+}
+
+/// Parses the URL of a service the agent sends or receives credentials
+/// from, which must be HTTPS. Plain HTTP is accepted for loopback
+/// addresses, for tests.
+pub fn https_url(raw: &str, what: &str) -> Result<Url> {
+    let url = Url::parse(raw).with_context(|| format!("{what} URL {raw:?}"))?;
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        bail!("{what} URL {raw:?} must use https");
+    }
     Ok(url)
 }
 

@@ -70,10 +70,21 @@ pub struct Boot {
 }
 
 /// Where a hosted runner reports its metrics.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(PartialEq, Eq, Deserialize)]
 pub struct Telemetry {
     /// hatchrun-telemetry's base URL.
     pub url: String,
+    /// The bearer token that names the runner's job. It stays in
+    /// memory and out of the log.
+    pub token: String,
+}
+
+impl std::fmt::Debug for Telemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Telemetry")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Boot {
@@ -379,7 +390,7 @@ mod tests {
         };
         let broker = FakeBroker {
             config: Some(
-                r#"{"jitConfig":"jit-from-broker","telemetry":{"url":"https://telemetry.example.com"}}"#,
+                r#"{"jitConfig":"jit-from-broker","telemetry":{"url":"https://telemetry.example.com","token":"a.b.c"}}"#,
             ),
             missing_claims: Cell::new(2),
             ..Default::default()
@@ -391,7 +402,8 @@ mod tests {
             Boot {
                 jit_config: "jit-from-broker".into(),
                 telemetry: Some(Telemetry {
-                    url: "https://telemetry.example.com".into()
+                    url: "https://telemetry.example.com".into(),
+                    token: "a.b.c".into(),
                 }),
             }
         );
