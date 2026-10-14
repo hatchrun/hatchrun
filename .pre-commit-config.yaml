@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Scans staged changes for secrets and account IDs before each commit,
+# using the rules in .gitleaks.toml. Run `pre-commit install` once.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # frozen: v8.30.1
+    hooks:
+      # Runs `gitleaks git --pre-commit --redact --staged --verbose`.
+      - id: gitleaks

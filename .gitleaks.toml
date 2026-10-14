@@ -1,0 +1,81 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Secret scanning rules, shared by every hatchrun repository. Keep this
+# file identical across hatchrun/hatchrun, hatchrun/images,
+# hatchrun/website and hatchrun/.github.
+#
+# The default gitleaks rules cover tokens and keys. They do not flag
+# account IDs, which are not secrets on their own but tie a public
+# repository to a specific cloud account. The rules below catch
+# Cloudflare and AWS account IDs. Pass the real values through CI
+# secrets or variables instead.
+
+title = "hatchrun"
+minVersion = "v8.30.1"
+
+[extend]
+useDefault = true
+
+# A Cloudflare account ID is 32 lowercase hex characters. Match it next
+# to a key that names it: account_id, account-id, accountId and
+# CLOUDFLARE_ACCOUNT_ID, in TOML, YAML, JSON, env files, shell
+# assignments and CLI flags.
+[[rules]]
+id = "cloudflare-account-id"
+description = "Cloudflare account ID next to an account_id key"
+regex = '''(?i:account[_-]?id)["']?[ \t]*[:=]?[ \t]*["']?([0-9a-f]{32})\b'''
+secretGroup = 1
+# Skips runs of one character and other low-entropy placeholders.
+entropy = 3
+keywords = ["accountid", "account_id", "account-id"]
+
+# The same ID inside Cloudflare dashboard, API and R2 URLs.
+[[rules]]
+id = "cloudflare-account-id-url"
+description = "Cloudflare account ID in a dashboard, API or R2 URL"
+regex = '''(?:/accounts/|dash\.cloudflare\.com/)([0-9a-f]{32})\b|\b([0-9a-f]{32})\.r2\.cloudflarestorage\.com'''
+entropy = 3
+keywords = ["/accounts/", "dash.cloudflare.com", "r2.cloudflarestorage.com"]
+
+# An AWS account ID is 12 digits. In an ARN it sits in the fifth field:
+# arn:aws:iam::<id>:role/name.
+[[rules]]
+id = "aws-account-id-arn"
+description = "AWS account ID in an ARN"
+regex = '''\barn:aws[a-z-]*:[a-z0-9-]+:[a-z0-9-]*:([0-9]{12}):'''
+secretGroup = 1
+keywords = ["arn:aws"]
+
+  [[rules.allowlists]]
+  description = "Placeholder account IDs from the AWS documentation"
+  regexTarget = "secret"
+  regexes = ['''^(?:123456789012|000000000000|111111111111)$''']
+
+# Next to a key that names it: account_id, AccountId, aws_account_id,
+# owner, owner_id and owners (Packer and Terraform AMI filters).
+[[rules]]
+id = "aws-account-id"
+description = "AWS account ID next to an account or owner key"
+regex = '''(?i:account[_-]?id|owner[_-]?id|owners?)["']?[ \t]*[:=]?[ \t]*\[?[ \t]*["']?([0-9]{12})\b'''
+secretGroup = 1
+keywords = ["accountid", "account_id", "account-id", "owner"]
+
+  [[rules.allowlists]]
+  description = "Placeholder account IDs from the AWS documentation"
+  regexTarget = "secret"
+  regexes = ['''^(?:123456789012|000000000000|111111111111)$''']
+
+# Registry and endpoint hostnames that start with the account ID.
+[[rules]]
+id = "aws-account-id-hostname"
+description = "AWS account ID in an ECR, sign-in or S3 Control hostname"
+regex = '''\b([0-9]{12})\.(?:dkr\.ecr(?:-fips)?\.[a-z0-9-]+\.amazonaws\.com|signin\.aws\.amazon\.com|s3-control\.[a-z0-9-]+\.amazonaws\.com)'''
+secretGroup = 1
+keywords = ["amazonaws.com", "signin.aws.amazon.com"]
+
+  [[rules.allowlists]]
+  description = "Placeholder account IDs from the AWS documentation"
+  regexTarget = "secret"
+  regexes = ['''^(?:123456789012|000000000000|111111111111)$''']

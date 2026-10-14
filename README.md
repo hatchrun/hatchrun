@@ -227,6 +227,15 @@ and the Terraform module in
 
 Status: early development, not ready for production.
 
+## Before you commit
+
+Run `pre-commit install` once after cloning. The hook runs gitleaks on
+staged changes with the rules in `.gitleaks.toml` and stops the commit
+when it finds a secret or a Cloudflare or AWS account ID. CI scans the
+full history with the same rules. Pass account IDs through CI secrets
+or variables; a finding that is not a secret goes in `.gitleaksignore`
+by fingerprint, with a comment saying why.
+
 ## Licence
 
 Apache License, Version 2.0. See [LICENSE](LICENSE).
