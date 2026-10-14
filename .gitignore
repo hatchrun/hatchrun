@@ -5,3 +5,4 @@
 .dev.vars
 /crates/cloud/build
 /crates/cloud/.wrangler
+*.pem

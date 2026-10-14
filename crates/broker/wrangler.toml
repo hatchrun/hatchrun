@@ -5,10 +5,6 @@
 name = "hatchrun-broker"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-01"
-# The hatchrun Cloudflare account. Naming it here keeps wrangler, run
-# by hand or in CI, from deploying or setting secrets in another
-# account the same login can reach.
-account_id = "20438923120e30641ae734882be1937a"
 
 # Runners claim their config here. The agent only talks to an HTTPS
 # broker, which the custom domain gives it.

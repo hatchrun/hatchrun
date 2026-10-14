@@ -159,6 +159,11 @@ so two claims of one ticket cannot both succeed and nothing stored is
 keyed by a live ticket. Storing needs the `BROKER_TOKEN` secret; a
 claim needs only the ticket, a 256-bit random value.
 
+Neither `wrangler.toml` names the Cloudflare account. The deploy
+workflows pass it as the `CLOUDFLARE_ACCOUNT_ID` secret; run by hand,
+wrangler reads it from `CLOUDFLARE_ACCOUNT_ID` or from the account the
+login can reach, so export it when that login reaches more than one.
+
 ```sh
 cd crates/broker
 npx wrangler@4.143.0 secret put BROKER_TOKEN
