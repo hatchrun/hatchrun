@@ -1197,3 +1197,256 @@ fieldset.field {
     min-width: 0;
   }
 }
+
+/* Runners */
+
+.runners-intro {
+  max-width: 46rem;
+  margin-top: -0.5rem;
+}
+
+.runners-limits {
+  margin-bottom: 1rem;
+}
+
+.runners-limits code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.numeric {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.jobs th.numeric {
+  text-align: right;
+}
+
+.profile-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0;
+}
+
+.profile-name code {
+  font-size: 0.88rem;
+  white-space: nowrap;
+}
+
+.row-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.row-actions .button + .button {
+  margin-left: 0.4rem;
+}
+
+.runner-table tr.has-problem td {
+  border-bottom: 0;
+}
+
+.runner-table .problem-row td {
+  padding-top: 0;
+}
+
+.runner-table .problem-row .job-error {
+  max-width: 48rem;
+  margin: 0;
+}
+
+.editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
+  gap: 1.25rem;
+  align-items: start;
+}
+
+.editor-preview {
+  position: sticky;
+  top: 1rem;
+}
+
+.editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.editor-actions .danger {
+  margin-left: auto;
+  color: var(--danger);
+}
+
+.field-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 1rem;
+}
+
+.segmented {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.segment {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0.45rem 0.8rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.segment:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.segment input {
+  accent-color: var(--accent);
+}
+
+.families-help {
+  margin: 0 0 0.6rem;
+}
+
+.family-list {
+  margin: 0 0 0.6rem;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.family-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.75rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.family-item + .family-item {
+  border-top: 1px solid var(--border);
+}
+
+.family-rank {
+  width: 1.4rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.family-name {
+  font-weight: 600;
+}
+
+.family-buttons {
+  display: flex;
+  gap: 0.3rem;
+  margin-left: auto;
+}
+
+.add-family {
+  max-width: 30rem;
+}
+
+.summary {
+  display: grid;
+  gap: 0.8rem;
+  margin: 0;
+}
+
+.summary dt {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.summary dd {
+  margin: 0;
+}
+
+@media (max-width: 860px) {
+  .editor {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .editor-preview {
+    position: static;
+    order: -1;
+  }
+}
+
+/* The profile table becomes one card per profile on phones. */
+@media (max-width: 760px) {
+  .runner-table thead {
+    display: none;
+  }
+
+  .runner-table,
+  .runner-table tbody,
+  .runner-table tr,
+  .runner-table td {
+    display: block;
+  }
+
+  .runner-table tr {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .runner-table tr.has-problem {
+    border-bottom: 0;
+    padding-bottom: 0;
+  }
+
+  .runner-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .runner-table td,
+  .runner-table td.numeric {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.2rem 0;
+    border: 0;
+    text-align: right;
+  }
+
+  .runner-table td[data-label]::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 0.84rem;
+    text-align: left;
+  }
+
+  .runner-table td[data-label="Profile"] {
+    padding-bottom: 0.4rem;
+  }
+
+  .runner-table td[data-label="Profile"]::before {
+    content: none;
+  }
+
+  .runner-table .row-actions {
+    justify-content: flex-start;
+    padding-top: 0.5rem;
+  }
+
+  .runner-table .problem-row td {
+    display: block;
+    text-align: left;
+  }
+
+  .field-pair {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

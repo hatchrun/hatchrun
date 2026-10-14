@@ -206,3 +206,76 @@ export const listJobs = (org: string, before?: number) =>
   get<JobPage>(`${tenantPath(org)}/jobs${before ? `?before=${before}` : ""}`);
 export const saveSettings = (org: string, maxRunners: number, allowedRegions: string[] | null) =>
   put<Tenant>(`${tenantPath(org)}/settings`, { maxRunners, allowedRegions });
+
+export type Arch = "amd64" | "arm64";
+
+/** A runner profile as workflows name it in runs-on. */
+export interface Profile {
+  name: string;
+  arch: Arch;
+  /** Instance families, preferred first. */
+  families: string[];
+  cpuMin: number;
+  cpuMax: number | null;
+  /** GiB. */
+  memoryMin: number;
+  memoryMax: number | null;
+  /** GiB; null for the connect stack's default. */
+  diskGib: number | null;
+  spot: boolean;
+  image: string;
+  extras: string[];
+  warmPool: number;
+}
+
+export interface Estimate {
+  /** Tried in order when EC2 has no capacity. */
+  instanceTypes: string[];
+  vcpus: number;
+  memoryGib: number;
+  diskGib: number;
+  /** On-demand, millionths of a US dollar. */
+  hourlyMicros: number;
+}
+
+export interface ProfileView extends Profile {
+  source: "builtIn" | "replaced" | "custom";
+  estimate: Estimate | null;
+  /** Why it cannot be launched. */
+  problem: string | null;
+}
+
+export interface Family {
+  name: string;
+  arch: Arch;
+  gibPerVcpu: number;
+  /** [size name, vCPUs], smallest first. */
+  sizes: [string, number][];
+  /** Whether the region offers it. */
+  offered: boolean;
+  /** Whether the connect stack allows at least one size. */
+  allowed: boolean;
+  pricePerVcpu: number | null;
+}
+
+export interface Runners {
+  /** The tenant's region, or where prices come from before AWS is connected. */
+  region: string;
+  connected: boolean;
+  limits: null | { instanceTypes: string[]; volumeSizeLimit: number; rootVolumeSize: number };
+  images: string[];
+  families: Family[];
+  profiles: ProfileView[];
+  maxProfiles: number;
+}
+
+export type Preview = Partial<ProfileView> & { problem: string | null };
+
+const runnersPath = (org: string) => `${tenantPath(org)}/runners`;
+export const listRunners = (org: string) => get<Runners>(runnersPath(org));
+export const previewProfile = (org: string, profile: Profile) => post<Preview>(`${runnersPath(org)}/preview`, profile);
+export const createProfile = (org: string, profile: Profile) => post<Runners>(runnersPath(org), profile);
+export const replaceProfile = (org: string, name: string, profile: Profile) =>
+  put<Runners>(`${runnersPath(org)}/${encodeURIComponent(name)}`, profile);
+export const deleteProfile = (org: string, name: string) =>
+  request<Runners>("DELETE", `${runnersPath(org)}/${encodeURIComponent(name)}`);
