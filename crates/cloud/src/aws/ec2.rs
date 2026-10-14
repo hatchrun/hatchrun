@@ -38,6 +38,8 @@ pub const TAG_SUBNETS: &str = "hatchrun:subnets";
 /// Tags connect.yaml puts on its launch template with its
 /// `InstanceTypes`, `VolumeSizeLimit` and `RootVolumeSize` parameters.
 pub const TAG_INSTANCE_TYPES: &str = "hatchrun:instance-types";
+/// Tag with the stack's `ExcludedInstanceTypes` parameter.
+pub const TAG_EXCLUDED_INSTANCE_TYPES: &str = "hatchrun:excluded-instance-types";
 /// See [`TAG_INSTANCE_TYPES`].
 pub const TAG_VOLUME_SIZE_LIMIT: &str = "hatchrun:volume-size-limit";
 /// See [`TAG_INSTANCE_TYPES`].
@@ -206,6 +208,8 @@ pub struct LaunchTemplate {
     pub subnets: Vec<String>,
     /// Its [`TAG_INSTANCE_TYPES`] tag; none on templates from before it.
     pub instance_types: Option<String>,
+    /// Its [`TAG_EXCLUDED_INSTANCE_TYPES`] tag.
+    pub excluded_instance_types: Option<String>,
     /// Its [`TAG_VOLUME_SIZE_LIMIT`] tag.
     pub volume_size_limit: Option<u16>,
     /// Its [`TAG_ROOT_VOLUME_SIZE`] tag.
@@ -255,6 +259,7 @@ pub fn launch_templates(response: &Response) -> Result<Vec<LaunchTemplate>, Erro
                 created: field("createTime").unwrap_or_default().to_owned(),
                 subnets,
                 instance_types: tag(TAG_INSTANCE_TYPES).map(str::to_owned),
+                excluded_instance_types: tag(TAG_EXCLUDED_INSTANCE_TYPES).map(str::to_owned),
                 volume_size_limit: tag(TAG_VOLUME_SIZE_LIMIT).and_then(|size| size.parse().ok()),
                 root_volume_size: tag(TAG_ROOT_VOLUME_SIZE).and_then(|size| size.parse().ok()),
                 fleet: tag(TAG_FLEET) == Some("true"),
@@ -525,6 +530,7 @@ mod tests {
         <item><key>hatchrun:volume-size-limit</key><value>500</value></item>
         <item><key>hatchrun:root-volume-size</key><value>40</value></item>
         <item><key>hatchrun:fleet</key><value>true</value></item>
+        <item><key>hatchrun:excluded-instance-types</key><value>g*,*.metal*</value></item>
       </tagSet>
     </item>
   </launchTemplates>
@@ -538,6 +544,7 @@ mod tests {
                 created: "2026-10-14T10:00:00.000Z".to_owned(),
                 subnets: vec!["subnet-a".to_owned(), "subnet-b".to_owned()],
                 instance_types: Some("m8g.*,c7i.large".to_owned()),
+                excluded_instance_types: Some("g*,*.metal*".to_owned()),
                 volume_size_limit: Some(500),
                 root_volume_size: Some(40),
                 fleet: true,

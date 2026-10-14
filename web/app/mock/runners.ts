@@ -7,17 +7,20 @@
 // good enough to work on the Runners page.
 
 type Arch = "amd64" | "arm64";
+type Capacity = "on-demand" | "spot" | "spot-with-fallback";
 
 interface Profile {
   name: string;
   arch: Arch;
+  categories: string[];
+  minGeneration: number | null;
   families: string[];
   cpuMin: number;
   cpuMax: number | null;
   memoryMin: number;
   memoryMax: number | null;
   diskGib: number | null;
-  spot: boolean;
+  capacity: Capacity;
   image: string;
   extras: string[];
   warmPool: number;
@@ -37,29 +40,44 @@ const FAMILIES: [string, Arch, number, number, number][] = [
   ["c8i", "amd64", 2, 384, 46_855],
   ["m8i", "amd64", 4, 384, 52_920],
   ["r8i", "amd64", 8, 384, 69_460],
+  ["m8a", "amd64", 4, 192, 50_100],
+  ["c9g", "arm64", 2, 192, 37_900],
+  ["m9g", "arm64", 4, 192, 42_600],
 ];
+const category = (family: string) => family.match(/^[a-z]+/)?.[0] ?? "";
+const generation = (family: string) => Number(family.match(/^[a-z]+(\d+)/)?.[1] ?? 0);
 const SIZES = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 384];
 const IMAGE = "ubuntu-26.04";
-const STACK = { instanceTypes: ["c7g.*", "c7i.*", "m7g.*", "m7i.*", "m8g.*", "r7g.*", "r7i.*"], volumeSizeLimit: 200, rootVolumeSize: 30 };
+const STACK = {
+  instanceTypes: ["*.medium", "*.large", "*.xlarge", "*.2xlarge", "*.4xlarge", "*.8xlarge"],
+  excludedInstanceTypes: ["p*", "g*", "inf*", "trn*", "dl*", "f*", "vt*", "mac*", "*.metal*"],
+  volumeSizeLimit: 200,
+  rootVolumeSize: 30,
+};
 
 const sizeName = (vcpus: number) =>
   vcpus === 1 ? "medium" : vcpus === 2 ? "large" : vcpus === 4 ? "xlarge" : `${vcpus / 4}xlarge`;
 
+const like = (pattern: string, type: string) =>
+  new RegExp(`^${pattern.replace(".", "\\.").replace("*", ".*")}$`).test(type);
 const allows = (connected: boolean, type: string) =>
   !connected ||
-  STACK.instanceTypes.some((pattern) => new RegExp(`^${pattern.replace(".", "\\.").replace("*", ".*")}$`).test(type));
+  (STACK.instanceTypes.some((pattern) => like(pattern, type)) &&
+    !STACK.excludedInstanceTypes.some((pattern) => like(pattern, type)));
 
 function builtIn(cpu: number, arch: Arch, name?: string): Profile {
   return {
     name: name ?? (arch === "amd64" ? `hatchrun-${cpu}cpu` : `hatchrun-${cpu}cpu-arm64`),
     arch,
-    families: arch === "amd64" ? ["m8i", "m7i"] : ["m8g", "m7g"],
+    categories: ["m"],
+    minGeneration: null,
+    families: [],
     cpuMin: cpu,
     cpuMax: cpu,
     memoryMin: cpu * 4,
     memoryMax: null,
     diskGib: null,
-    spot: false,
+    capacity: "on-demand",
     image: IMAGE,
     extras: [],
     warmPool: 0,
@@ -77,8 +95,16 @@ const custom = new Map<string, Profile[]>([
   [
     "acme-corp",
     [
-      { ...builtIn(16, "arm64", "hatchrun-rust"), families: ["c8g", "m8g"], cpuMax: null, memoryMin: 32, diskGib: 150, spot: true },
-      { ...builtIn(4, "amd64", "hatchrun-e2e"), families: ["r8i"], memoryMin: 32 },
+      {
+        ...builtIn(16, "arm64", "hatchrun-rust"),
+        categories: ["c", "m"],
+        minGeneration: 8,
+        cpuMax: null,
+        memoryMin: 32,
+        diskGib: 150,
+        capacity: "spot-with-fallback",
+      },
+      { ...builtIn(4, "amd64", "hatchrun-e2e"), categories: [], families: ["r8i"], memoryMin: 32 },
     ],
   ],
 ]);
@@ -89,13 +115,17 @@ function choose(profile: Profile, connected: boolean) {
       problem: `${profile.name} asks for a ${profile.diskGib} GiB root volume and the connect stack allows at most ${STACK.volumeSizeLimit} GiB. Raise VolumeSizeLimit on the stack or ask for less.`,
     };
   }
-  const fits: { type: string; vcpus: number; ratio: number; price: number; allowed: boolean }[] = [];
-  for (const name of profile.families) {
-    const family = FAMILIES.find(([candidate]) => candidate === name);
-    if (!family) {
-      continue;
-    }
-    const [, , ratio, largest, price] = family;
+  const fits: { type: string; vcpus: number; ratio: number; price: number; generation: number; allowed: boolean }[] = [];
+  const kinds = FAMILIES.filter(
+    ([name, arch]) =>
+      arch === profile.arch &&
+      (profile.families.length > 0
+        ? profile.families.includes(name)
+        : profile.categories.length === 0 || profile.categories.includes(category(name))) &&
+      (profile.minGeneration === null || generation(name) >= profile.minGeneration),
+  );
+  for (const family of kinds) {
+    const [name, , ratio, largest, price] = family;
     const sizes = SIZES.filter(
       (vcpus) =>
         vcpus <= largest &&
@@ -107,16 +137,25 @@ function choose(profile: Profile, connected: boolean) {
     const allowed = sizes.find((vcpus) => allows(connected, `${name}.${sizeName(vcpus)}`));
     const vcpus = allowed ?? sizes[0];
     if (vcpus !== undefined) {
-      fits.push({ type: `${name}.${sizeName(vcpus)}`, vcpus, ratio, price, allowed: allowed !== undefined });
+      fits.push({
+        type: `${name}.${sizeName(vcpus)}`,
+        vcpus,
+        ratio,
+        price,
+        generation: generation(name),
+        allowed: allowed !== undefined,
+      });
     }
   }
-  const ok = fits.filter((fit) => fit.allowed);
+  const ok = fits
+    .filter((fit) => fit.allowed)
+    .sort((a, b) => b.generation - a.generation || a.vcpus * a.price - b.vcpus * b.price);
   const first = ok[0];
   if (!first) {
     return {
       problem: fits.length
-        ? `The connect stack allows none of the instance types that fit ${profile.name} (${fits.map((fit) => fit.type).join(", ")}). It allows ${STACK.instanceTypes.join(", ")}. Add one to InstanceTypes on the stack or change the profile.`
-        : `No size of ${profile.families.join(", ")} fits ${profile.name}`,
+        ? `The connect stack allows none of the instance types that fit ${profile.name} (${fits.map((fit) => fit.type).join(", ")}). It allows ${STACK.instanceTypes.join(", ")} except ${STACK.excludedInstanceTypes.join(", ")}. Change InstanceTypes on the stack or change the profile.`
+        : `us-east-1 offers no instance types for ${profile.arch} that fit ${profile.name}`,
     };
   }
   return {
@@ -156,6 +195,9 @@ export function runners(org: string, region: string | null) {
     images: [IMAGE],
     families: FAMILIES.map(([name, arch, ratio, largest, price]) => ({
       name,
+      category: category(name),
+      generation: generation(name),
+      special: false,
       arch,
       gibPerVcpu: ratio,
       sizes: SIZES.filter((vcpus) => vcpus <= largest).map((vcpus) => [sizeName(vcpus), vcpus]),
@@ -171,9 +213,6 @@ export function runners(org: string, region: string | null) {
 function check(profile: Profile): string | null {
   if (!/^hatchrun(-[a-z0-9]+)*$/.test(profile.name)) {
     return "Name the profile hatchrun-something: lowercase letters, digits and single hyphens, at most 64 characters";
-  }
-  if (profile.families.length === 0) {
-    return "Choose at least one instance family";
   }
   if (!(profile.cpuMin >= 1)) {
     return "Ask for 1 to 384 vCPUs";

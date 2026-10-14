@@ -6,18 +6,20 @@
 //! `runs-on: <profile>` (see [`crate::labels`]).
 //!
 //! Every organization has the built-in profiles without setting
-//! anything up: `hatchrun-2cpu` to `hatchrun-16cpu` with 4 GiB per vCPU,
-//! amd64, and the same with an `-arm64` suffix, all on-demand, plus
-//! `hatchrun`, which is `hatchrun-2cpu`. An organization adds its own in
-//! the app, and one with the name of a built-in replaces it for that
-//! organization.
+//! anything up: `hatchrun-2cpu` to `hatchrun-16cpu`, general purpose
+//! (category `m`) with at least 4 GiB per vCPU, amd64, and the same with
+//! an `-arm64` suffix, all on-demand, plus `hatchrun`, which is
+//! `hatchrun-2cpu`. An organization adds its own in the app, and one
+//! with the name of a built-in replaces it for that organization.
 //!
-//! A profile names instance families in order of preference, vCPU and
-//! memory bounds, a root volume size (or the connect stack's default),
-//! Spot or on-demand, and an image. [`crate::instance`] turns it into
-//! instance types for the tenant's region within what its connect stack
-//! allows. `extras` and `warm_pool` are kept for features to come and
-//! must be empty for now.
+//! A profile holds requirements in Karpenter's vocabulary: instance
+//! categories, the oldest generation, the architecture, vCPU and memory
+//! bounds, a root volume size (or the connect stack's default), the
+//! capacity type and an image. Naming instance families is an optional
+//! pin. [`crate::instance`] turns it into instance types for the
+//! tenant's region within what its connect stack allows, preferring the
+//! newest generation and then the lowest price. `extras` and
+//! `warm_pool` are kept for features to come and must be empty for now.
 //!
 //! Everything here but [`store`], which reads and writes the
 //! `runner_profiles` table, runs and tests without the Workers runtime.
@@ -32,8 +34,10 @@ use crate::labels::{self, Arch, CPU_MAX, DISK_MAX, DISK_MIN, Overrides, RAM_MAX}
 /// Images a profile can run, newest first. The `images` table holds
 /// one AMI per region and architecture for each.
 pub const IMAGES: &[&str] = &["ubuntu-26.04"];
-/// Most families one profile may list.
+/// Most families one profile may pin, and categories it may list.
 pub const FAMILIES_MAX: usize = 8;
+/// The newest generation a profile may ask for at least.
+pub const GENERATION_MAX: u16 = 20;
 /// Most custom profiles an organization may have.
 pub const PROFILES_MAX: usize = 50;
 
@@ -45,7 +49,17 @@ pub struct Profile {
     pub name: String,
     /// CPU architecture.
     pub arch: Arch,
-    /// Instance families, preferred first, such as `m8g`.
+    /// Instance categories, such as `m` for general purpose or `c` for
+    /// compute; empty for any.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// The oldest generation, such as 7; `None` for any. The newest
+    /// generation that fits is preferred either way.
+    #[serde(default)]
+    pub min_generation: Option<u16>,
+    /// Instance families to pin, such as `m8g`; empty for any family
+    /// that meets the rest.
+    #[serde(default)]
     pub families: Vec<String>,
     /// Fewest vCPUs.
     pub cpu_min: u16,
@@ -57,8 +71,9 @@ pub struct Profile {
     pub memory_max: Option<u16>,
     /// Root volume size in GiB, or the connect stack's default.
     pub disk_gib: Option<u16>,
-    /// Spot, falling back to on-demand when Spot has no capacity.
-    pub spot: bool,
+    /// On-demand, Spot, or Spot falling back to on-demand.
+    #[serde(default)]
+    pub capacity: Capacity,
     /// One of [`IMAGES`].
     pub image: String,
     /// Reserved for add-ons such as a run cache; empty for now.
@@ -69,15 +84,61 @@ pub struct Profile {
     pub warm_pool: u16,
 }
 
+/// Karpenter's capacity types, with Spot falling back to on-demand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Capacity {
+    /// On-demand only.
+    #[default]
+    OnDemand,
+    /// Spot only; the job waits while Spot has no capacity.
+    Spot,
+    /// Spot, then on-demand while Spot has no capacity.
+    SpotWithFallback,
+}
+
+impl Capacity {
+    /// The `runner_profiles.capacity` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OnDemand => "on-demand",
+            Self::Spot => "spot",
+            Self::SpotWithFallback => "spot-with-fallback",
+        }
+    }
+
+    /// Reads the column value; anything else is on-demand.
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "spot" => Self::Spot,
+            "spot-with-fallback" => Self::SpotWithFallback,
+            _ => Self::OnDemand,
+        }
+    }
+
+    /// The markets to try in order, `true` for Spot.
+    #[must_use]
+    pub fn markets(self) -> &'static [bool] {
+        match self {
+            Self::OnDemand => &[false],
+            Self::Spot => &[true],
+            Self::SpotWithFallback => &[true, false],
+        }
+    }
+
+    /// Whether it tries Spot.
+    #[must_use]
+    pub fn spot(self) -> bool {
+        self != Self::OnDemand
+    }
+}
+
 /// vCPU counts of the built-in sizes.
 const BUILT_IN_CPUS: [u16; 4] = [2, 4, 8, 16];
-/// Families of the built-ins, preferred first: the newest generation
-/// offered in every region hatchrun runs in (Graviton4), or nearly every
-/// one (Intel's 8th generation, missing from two), and the previous
-/// generation where it is not. On-demand prices per vCPU-hour in
-/// us-east-1 were about 4.5 cents for `m8g` and 5.3 cents for `m8i`.
-const BUILT_IN_ARM64: [&str; 2] = ["m8g", "m7g"];
-const BUILT_IN_AMD64: [&str; 2] = ["m8i", "m7i"];
+/// The category of the built-ins: general purpose, 4 GiB per vCPU.
+const BUILT_IN_CATEGORY: &str = "m";
 
 /// The name of the built-in with `cpu` vCPUs on `arch`.
 fn built_in_name(cpu: u16, arch: Arch) -> String {
@@ -88,20 +149,18 @@ fn built_in_name(cpu: u16, arch: Arch) -> String {
 }
 
 fn built_in_profile(name: String, cpu: u16, arch: Arch) -> Profile {
-    let families = match arch {
-        Arch::Amd64 => BUILT_IN_AMD64,
-        Arch::Arm64 => BUILT_IN_ARM64,
-    };
     Profile {
         name,
         arch,
-        families: families.iter().map(|family| (*family).to_owned()).collect(),
+        categories: vec![BUILT_IN_CATEGORY.to_owned()],
+        min_generation: None,
+        families: Vec::new(),
         cpu_min: cpu,
         cpu_max: Some(cpu),
         memory_min: cpu * 4,
         memory_max: None,
         disk_gib: None,
-        spot: false,
+        capacity: Capacity::OnDemand,
         image: IMAGES[0].to_owned(),
         extras: Vec::new(),
         warm_pool: 0,
@@ -126,15 +185,26 @@ pub fn built_in(name: &str) -> Option<Profile> {
     built_ins().into_iter().find(|profile| profile.name == name)
 }
 
-/// The family called `name` in the catalog.
+/// The family called `name` in the static catalog, which has prices
+/// for regions whose instance type catalog was not read yet.
 #[must_use]
 pub fn family(name: &str) -> Option<&'static Family> {
     catalog::FAMILIES.iter().find(|family| family.name == name)
 }
 
+/// Whether `name` reads as an instance family, as in `m8g` or
+/// `c7i-flex`.
+fn family_name(name: &str) -> bool {
+    crate::instance_types::split(&format!("{name}.large"))
+        .is_some_and(|parts| parts.family == name && parts.generation.is_some())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 impl Profile {
     /// Checks the profile on its own, apart from any tenant's region or
-    /// limits, and puts the name and families in lowercase.
+    /// limits, and puts the name, categories and families in lowercase.
     ///
     /// # Errors
     ///
@@ -148,20 +218,36 @@ impl Profile {
                 labels::NAME_MAX
             ));
         }
-        for family in &mut self.families {
-            *family = family.trim().to_ascii_lowercase();
+        for item in self.categories.iter_mut().chain(&mut self.families) {
+            *item = item.trim().to_ascii_lowercase();
         }
-        if self.families.is_empty() {
-            return Err("Choose at least one instance family".to_owned());
+        if self.categories.len() > FAMILIES_MAX {
+            return Err(format!("Choose at most {FAMILIES_MAX} instance categories"));
+        }
+        for (at, name) in self.categories.iter().enumerate() {
+            if name.is_empty() || name.len() > 4 || !name.bytes().all(|b| b.is_ascii_lowercase()) {
+                return Err(format!(
+                    "{name} is not an instance category, such as c, m or r"
+                ));
+            }
+            if self.categories[..at].contains(name) {
+                return Err(format!("{name} is listed twice"));
+            }
+        }
+        if self
+            .min_generation
+            .is_some_and(|generation| !(1..=GENERATION_MAX).contains(&generation))
+        {
+            return Err(format!("Ask for generation 1 to {GENERATION_MAX}, or any"));
         }
         if self.families.len() > FAMILIES_MAX {
-            return Err(format!("Choose at most {FAMILIES_MAX} instance families"));
+            return Err(format!("Pin at most {FAMILIES_MAX} instance families"));
         }
         for (at, name) in self.families.iter().enumerate() {
-            let Some(family) = family(name) else {
-                return Err(format!("{name} is not an instance family hatchrun knows"));
-            };
-            if family.arch != self.arch {
+            if !family_name(name) {
+                return Err(format!("{name} is not an instance family, such as m8g"));
+            }
+            if family(name).is_some_and(|family| family.arch != self.arch) {
                 return Err(format!("{name} does not run {}", self.arch.as_str()));
             }
             if self.families[..at].contains(name) {
@@ -207,16 +293,6 @@ impl Profile {
         if self.warm_pool != 0 {
             return Err("Warm pools are not available yet".to_owned());
         }
-        if !self.families.iter().any(|name| {
-            family(name).is_some_and(|family| crate::instance::size_in(family, &self).is_some())
-        }) {
-            return Err(format!(
-                "No size of {} has {} and {}",
-                self.families.join(", "),
-                self.cpu_text(),
-                self.memory_text()
-            ));
-        }
         Ok(self)
     }
 
@@ -237,7 +313,11 @@ impl Profile {
             self.disk_gib = Some(disk);
         }
         if let Some(spot) = overrides.spot {
-            self.spot = spot;
+            self.capacity = if spot {
+                Capacity::SpotWithFallback
+            } else {
+                Capacity::OnDemand
+            };
         }
         self
     }
@@ -319,7 +399,7 @@ mod tests {
     fn lists_built_ins_then_custom() {
         let replaced = Profile {
             name: "hatchrun-4cpu".to_owned(),
-            spot: true,
+            capacity: Capacity::Spot,
             ..built_in("hatchrun-4cpu").unwrap()
         };
         let all = merged(vec![
@@ -351,13 +431,15 @@ mod tests {
         Profile {
             name: "hatchrun-big".to_owned(),
             arch: Arch::Arm64,
-            families: vec!["c8g".to_owned(), "m8g".to_owned()],
+            categories: vec!["c".to_owned(), "m".to_owned()],
+            min_generation: Some(7),
+            families: Vec::new(),
             cpu_min: 8,
             cpu_max: Some(16),
             memory_min: 16,
             memory_max: None,
             disk_gib: Some(100),
-            spot: true,
+            capacity: Capacity::SpotWithFallback,
             image: IMAGES[0].to_owned(),
             extras: Vec::new(),
             warm_pool: 0,
@@ -415,7 +497,7 @@ mod tests {
         let spec = labels::parse("hatchrun-4cpu/disk=200/spot=true/cpu=8").unwrap();
         let profile = resolve(&spec, None).unwrap();
         assert_eq!(profile.disk_gib, Some(200));
-        assert!(profile.spot);
+        assert_eq!(profile.capacity, Capacity::SpotWithFallback);
         assert_eq!((profile.cpu_min, profile.cpu_max), (8, None));
         assert_eq!(profile.memory_min, 16);
 
@@ -427,7 +509,7 @@ mod tests {
         });
         assert_eq!((within.cpu_min, within.cpu_max), (12, Some(16)));
         assert_eq!(within.memory_min, 32);
-        assert!(!within.spot);
+        assert_eq!(within.capacity, Capacity::OnDemand);
     }
 
     #[test]
@@ -448,17 +530,35 @@ mod tests {
             Ok(("hatchrun-big".to_owned(), vec!["c8g".to_owned()]))
         );
         assert!(refused(|p| p.name = "big".to_owned()).starts_with("Name the profile"));
+        // Families AWS adds later are fine; known ones must fit the arch.
         assert_eq!(
-            refused(|p| p.families.clear()),
-            "Choose at least one instance family"
+            Profile {
+                families: vec!["m11g".to_owned()],
+                ..custom()
+            }
+            .validate()
+            .map(|profile| profile.families),
+            Ok(vec!["m11g".to_owned()])
         );
         assert_eq!(
             refused(|p| p.families = vec!["m8i".to_owned()]),
             "m8i does not run arm64"
         );
         assert_eq!(
-            refused(|p| p.families = vec!["x9z".to_owned()]),
-            "x9z is not an instance family hatchrun knows"
+            refused(|p| p.families = vec!["m8g.large".to_owned()]),
+            "m8g.large is not an instance family, such as m8g"
+        );
+        assert_eq!(
+            refused(|p| p.categories = vec!["m".to_owned(), "M".to_owned()]),
+            "m is listed twice"
+        );
+        assert_eq!(
+            refused(|p| p.categories = vec!["m8".to_owned()]),
+            "m8 is not an instance category, such as c, m or r"
+        );
+        assert_eq!(
+            refused(|p| p.min_generation = Some(0)),
+            "Ask for generation 1 to 20, or any"
         );
         assert_eq!(
             refused(|p| p.families = vec!["m8g".to_owned(), "m8g".to_owned()]),
@@ -489,13 +589,23 @@ mod tests {
             refused(|p| p.warm_pool = 2),
             "Warm pools are not available yet"
         );
+    }
+
+    #[test]
+    fn capacity_types() {
+        assert_eq!(Capacity::OnDemand.markets(), [false]);
+        assert_eq!(Capacity::Spot.markets(), [true]);
+        assert_eq!(Capacity::SpotWithFallback.markets(), [true, false]);
+        for capacity in [
+            Capacity::OnDemand,
+            Capacity::Spot,
+            Capacity::SpotWithFallback,
+        ] {
+            assert_eq!(Capacity::parse(capacity.as_str()), capacity);
+        }
         assert_eq!(
-            refused(|p| {
-                p.families = vec!["c8g".to_owned()];
-                p.cpu_max = Some(8);
-                p.memory_min = 64;
-            }),
-            "No size of c8g has 8 to 8 vCPUs and at least 64 GiB".replace("8 to 8", "8")
+            serde_json::to_string(&Capacity::SpotWithFallback).unwrap(),
+            "\"spot-with-fallback\""
         );
     }
 
@@ -507,10 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn the_catalog_has_the_built_in_families() {
-        for name in BUILT_IN_ARM64.iter().chain(&BUILT_IN_AMD64) {
-            assert!(family(name).is_some(), "{name}");
-        }
+    fn the_static_catalog_is_ordered() {
         for family in catalog::FAMILIES {
             assert!(!family.sizes.is_empty(), "{}", family.name);
             assert!(family.sizes.windows(2).all(|pair| pair[0] < pair[1]));
