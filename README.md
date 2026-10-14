@@ -310,9 +310,9 @@ webhook for a while, and, per tenant with a verified role, describes
 the instances tagged with the tenant: it terminates the ones whose job
 is over, that never got a job, or that ran past the longest age, and
 launches queued jobs again whose launch was lost or whose runner took
-another job. A launch that failed on something that passes (no EC2
-capacity in any allowed instance type and subnet, throttling, an AWS,
-GitHub or broker error, no image yet for the region) is launched
+another job. A launch that failed on something that passes (an EC2 or Spot
+capacity error, throttling, an AWS, GitHub or broker error, no image
+yet for the region) is launched
 again after 30 seconds, doubling up to 5 minutes, for as long as
 GitHub keeps the job queued. A launch that failed on the
 organization's setup (the role cannot be assumed or may not launch,

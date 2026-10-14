@@ -5,8 +5,8 @@
 //! Whether a failed launch is tried again, and when. Nothing here talks
 //! to anything, so the rules test natively.
 //!
-//! A launch that failed for a reason that passes on its own (no EC2
-//! capacity, throttling, an AWS, STS, GitHub or broker error, no
+//! A launch that failed for a reason that passes on its own (an EC2 or
+//! Spot capacity error, throttling, an AWS, STS, GitHub or broker error, no
 //! answer at all) or that the operator fixes (no image for the region,
 //! a missing Worker setting) waits [`delay`] and the reconciler
 //! launches it again, for as long as GitHub keeps the job queued.
@@ -30,7 +30,8 @@ pub enum Cause {
     Broker,
     /// A request got no answer.
     Unreachable,
-    /// EC2 had no capacity for any instance type and subnet allowed.
+    /// EC2 answered with a capacity error, such as
+    /// `InsufficientInstanceCapacity` or a Spot capacity error.
     NoCapacity,
     /// hatchrun has no image for the architecture in the region yet.
     NoImage,
