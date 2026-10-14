@@ -58,10 +58,12 @@ GITHUB_APP_SLUG = "hatchrun"
 # deploy/cloudformation/templates-bucket.yaml), which the Launch Stack
 # links open. Empty until the bucket exists; the app says so until then.
 CONNECT_TEMPLATE_URL = "https://hatchrun-templates.s3.us-east-1.amazonaws.com/connect.yaml"
-# The Polar product of the per-organization licence. Empty until the
-# product exists; checkout answers 503 until then. POLAR_API_URL points
-# the Worker at Polar's sandbox (https://sandbox-api.polar.sh).
-POLAR_PRODUCT_ID = ""
+# The Polar products of the per-organization licence, separated by
+# commas, one per billing interval (monthly, then yearly), since a Polar
+# product has a single interval. Checkout offers all of them and answers
+# 503 while the list is empty. POLAR_API_URL points the Worker at
+# Polar's sandbox (https://sandbox-api.polar.sh).
+POLAR_PRODUCT_ID = "3c463c01-28ec-4f97-9892-7909cd6c7ea7,f4bdf273-20f0-4c4e-9df5-51e4d353ad41"
 # hatchrun-broker (crates/broker), where launches store runner configs.
 # Both Workers share BROKER_TOKEN.
 BROKER_URL = "https://broker.hatchrun.io"

@@ -5,36 +5,37 @@
 //! An organization's licence: Polar checkout, the customer portal,
 //! Polar's webhooks, and the beta, which needs no payment.
 //!
-//! - `GET /api/plan` describes the licence's Polar product.
+//! - `GET /api/plan` describes the licence's Polar products.
 //! - `POST /api/tenants/<org>/checkout` opens a Polar checkout.
 //! - `POST /api/tenants/<org>/portal` opens Polar's customer portal.
 //! - `POST /api/tenants/<org>/beta` with `{"code": ...}` redeems a beta
 //!   invite code.
 //! - `POST /api/polar/webhook` takes Polar's deliveries.
 
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use worker::{D1Database, Env, Request, Response, Result, console_log, console_warn};
 
 use super::tenants::authorize;
 use super::{Answer, Ctx, Failure, get, json_error, need};
 use crate::fetch::send;
-use crate::http::{Request as Outgoing, encode};
 use crate::polar::{self, Event, Signed};
 use crate::{int, now_ms, session};
 
 /// Variable that replaces Polar's API URL, such as Polar's sandbox.
 const POLAR_API_URL: &str = "POLAR_API_URL";
-/// Variable with the Polar product of the licence.
+/// Variable with the Polar products of the licence, separated by
+/// commas: one per billing interval.
 const PRODUCT_ID: &str = "POLAR_PRODUCT_ID";
 /// Secret with Polar's organization access token.
 const ACCESS_TOKEN: &str = "POLAR_ACCESS_TOKEN";
 /// Secret with the webhook endpoint's secret.
 const WEBHOOK_SECRET: &str = "POLAR_WEBHOOK_SECRET";
 
-/// Where Polar is, and the licence product, when billing is set up.
+/// Where Polar is, and the licence's products, when billing is set up.
 struct Polar {
     api: String,
-    product_id: String,
+    product_ids: Vec<String>,
     token: String,
 }
 
@@ -46,7 +47,10 @@ impl Polar {
                 .unwrap_or_else(|| polar::API.to_owned())
                 .trim_end_matches('/')
                 .to_owned(),
-            product_id: get(env, PRODUCT_ID).ok_or_else(unset)?,
+            product_ids: get(env, PRODUCT_ID)
+                .map(|list| polar::product_ids(&list))
+                .filter(|ids| !ids.is_empty())
+                .ok_or_else(unset)?,
             token: get(env, ACCESS_TOKEN).ok_or_else(unset)?,
         })
     }
@@ -116,70 +120,22 @@ pub(crate) async fn join_listed_beta(db: &D1Database, id: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Plan {
-    name: String,
-    description: Option<String>,
-    /// Smallest currency unit, such as cents.
-    amount: Option<u64>,
-    currency: Option<String>,
-    interval: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Product {
-    name: String,
-    description: Option<String>,
-    recurring_interval: Option<String>,
-    #[serde(default)]
-    prices: Vec<Price>,
-}
-
-#[derive(Deserialize)]
-struct Price {
-    amount_type: Option<String>,
-    #[serde(rename = "price_amount")]
-    amount: Option<u64>,
-    #[serde(rename = "price_currency")]
-    currency: Option<String>,
-    recurring_interval: Option<String>,
-}
-
-/// `GET /api/plan`
+/// `GET /api/plan`: every product of the licence, shortest billing
+/// interval first.
 pub(crate) async fn plan(ctx: &Ctx<'_>) -> Answer {
     let polar = Polar::read(ctx.env)?;
-    let response = send(
-        &Outgoing::new(
-            "GET",
-            format!("{}/v1/products/{}", polar.api, encode(&polar.product_id)),
-        )
-        .header("Accept", "application/json")
-        .header("Authorization", format!("Bearer {}", polar.token))
-        .header("User-Agent", "hatchrun.io"),
-    )
-    .await?;
-    if !response.ok() {
-        return Err(Failure::new(
-            502,
-            format!("product: Polar answered {}", response.status),
-        ));
-    }
-    let product: Product = serde_json::from_slice(&response.body)
-        .map_err(|err| Failure::new(502, format!("product: {err}")))?;
-    let price = product
-        .prices
+    let requests: Vec<_> = polar
+        .product_ids
         .iter()
-        .find(|price| price.amount_type.as_deref() == Some("fixed"));
-    Ok(Response::from_json(&Plan {
-        name: product.name,
-        description: product.description,
-        amount: price.and_then(|price| price.amount),
-        currency: price.and_then(|price| price.currency.clone()),
-        interval: product
-            .recurring_interval
-            .or_else(|| price.and_then(|price| price.recurring_interval.clone())),
-    })?)
+        .map(|id| polar::product(&polar.api, &polar.token, id))
+        .collect();
+    let answers = join_all(requests.iter().map(send)).await;
+    let mut plans = Vec::with_capacity(answers.len());
+    for answer in answers {
+        plans.push(polar::plan(&answer?).map_err(|err| Failure::new(502, err))?);
+    }
+    polar::sort(&mut plans);
+    Ok(Response::from_json(&serde_json::json!({ "plans": plans }))?)
 }
 
 /// `POST /api/tenants/<org>/checkout`
@@ -197,7 +153,7 @@ pub(crate) async fn checkout(ctx: &Ctx<'_>, org: &str) -> Answer {
         &send(&polar::checkout(
             &polar.api,
             &polar.token,
-            &polar.product_id,
+            &polar.product_ids,
             &row.id,
             &row.org_login,
             &format!("{page}?checkout={{CHECKOUT_ID}}"),

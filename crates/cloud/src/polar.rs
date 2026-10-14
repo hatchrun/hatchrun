@@ -5,8 +5,10 @@
 //! Billing through Polar, the merchant of record, kept apart from the
 //! Workers runtime so it tests natively.
 //!
-//! An organization's licence is a Polar subscription to one product.
-//! The app opens a Polar checkout for it with the tenant id as Polar's
+//! An organization's licence is a Polar subscription to one of the
+//! licence's products, one per billing interval, since a Polar product
+//! has a single interval. The app opens a Polar checkout that offers
+//! every one of them, with the tenant id as Polar's
 //! external customer id and in the checkout's metadata, so every
 //! subscription Polar reports names its tenant. Polar's webhooks, signed
 //! as Standard Webhooks, keep the `subscriptions` table current; the
@@ -16,7 +18,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, KeyInit, Mac};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::http::{Request, Response};
@@ -38,13 +40,109 @@ fn call(method: &'static str, url: String, token: &str) -> Request {
         .header("User-Agent", "hatchrun.io")
 }
 
+/// The licence's product ids in `list`, separated by commas.
+#[must_use]
+pub fn product_ids(list: &str) -> Vec<String> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Asks for the product `id`.
+#[must_use]
+pub fn product(api: &str, token: &str, id: &str) -> Request {
+    call(
+        "GET",
+        format!("{api}/v1/products/{}", crate::http::encode(id)),
+        token,
+    )
+}
+
+/// One of the licence's products, as the app shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Plan {
+    /// Polar's product id.
+    pub id: String,
+    /// The product's name.
+    pub name: String,
+    /// The product's description.
+    pub description: Option<String>,
+    /// The fixed price in the smallest currency unit, such as cents.
+    pub amount: Option<u64>,
+    /// The price's currency, such as `usd`.
+    pub currency: Option<String>,
+    /// `month`, `year`, ...
+    pub interval: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Product {
+    id: String,
+    name: String,
+    description: Option<String>,
+    recurring_interval: Option<String>,
+    #[serde(default)]
+    prices: Vec<Price>,
+}
+
+#[derive(Deserialize)]
+struct Price {
+    amount_type: Option<String>,
+    #[serde(rename = "price_amount")]
+    amount: Option<u64>,
+    #[serde(rename = "price_currency")]
+    currency: Option<String>,
+    recurring_interval: Option<String>,
+}
+
+/// The plan of the product Polar answered with.
+///
+/// # Errors
+///
+/// Polar's answer when it is not a product.
+pub fn plan(response: &Response) -> Result<Plan, String> {
+    let product: Product = decode(response, "product")?;
+    let price = product
+        .prices
+        .into_iter()
+        .find(|price| price.amount_type.as_deref() == Some("fixed"));
+    let (amount, currency, price_interval) = price.map_or((None, None, None), |price| {
+        (price.amount, price.currency, price.recurring_interval)
+    });
+    Ok(Plan {
+        id: product.id,
+        name: product.name,
+        description: product.description,
+        amount,
+        currency,
+        interval: product.recurring_interval.or(price_interval),
+    })
+}
+
+/// Orders plans by billing interval, shortest first, so monthly comes
+/// before yearly. Plans with no interval go last.
+pub fn sort(plans: &mut [Plan]) {
+    let rank = |plan: &Plan| match plan.interval.as_deref() {
+        Some("day") => 0,
+        Some("week") => 1,
+        Some("month") => 2,
+        Some("year") => 3,
+        _ => 4,
+    };
+    plans.sort_by_key(rank);
+}
+
 /// A checkout for the licence of `tenant`, the GitHub organization
-/// `org`. Polar sends the buyer to `success_url` afterwards.
+/// `org`, that offers every product in `product_ids`. Polar sends the
+/// buyer to `success_url` afterwards.
 #[must_use]
 pub fn checkout(
     api: &str,
     token: &str,
-    product_id: &str,
+    product_ids: &[String],
     tenant: &str,
     org: &str,
     success_url: &str,
@@ -52,7 +150,7 @@ pub fn checkout(
 ) -> Request {
     call("POST", format!("{api}/v1/checkouts/"), token).body(
         serde_json::json!({
-            "products": [product_id],
+            "products": product_ids,
             "external_customer_id": tenant,
             "metadata": { "tenant_id": tenant, "github_org": org },
             "customer_metadata": { "github_org": org },
@@ -404,7 +502,7 @@ mod tests {
         let request = checkout(
             API,
             "polar_oat",
-            "prod_1",
+            &["prod_month".to_owned(), "prod_year".to_owned()],
             "abcdefgh12345678",
             "acme",
             "https://app/o/acme?checkout={CHECKOUT_ID}",
@@ -416,7 +514,10 @@ mod tests {
             Some("Bearer polar_oat")
         );
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-        assert_eq!(body["products"], serde_json::json!(["prod_1"]));
+        assert_eq!(
+            body["products"],
+            serde_json::json!(["prod_month", "prod_year"])
+        );
         assert_eq!(body["external_customer_id"], "abcdefgh12345678");
         assert_eq!(body["metadata"]["tenant_id"], "abcdefgh12345678");
         assert_eq!(
@@ -446,5 +547,74 @@ mod tests {
             .unwrap_err(),
             "customer session: Polar answered 404: {}"
         );
+    }
+
+    #[test]
+    fn reads_product_ids() {
+        assert_eq!(product_ids(""), Vec::<String>::new());
+        assert_eq!(product_ids("prod_1"), ["prod_1"]);
+        assert_eq!(
+            product_ids(" prod_month , prod_year,"),
+            ["prod_month", "prod_year"]
+        );
+    }
+
+    #[test]
+    fn reads_plans() {
+        let request = product(API, "t", "prod_1");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.url, "https://api.polar.sh/v1/products/prod_1");
+
+        let yearly = plan(&Response {
+            status: 200,
+            body: br#"{"id":"prod_year","name":"hatchrun yearly","description":null,
+                "recurring_interval":"year","prices":[
+                {"amount_type":"free"},
+                {"amount_type":"fixed","price_amount":49000,"price_currency":"usd",
+                 "recurring_interval":"year"}]}"#
+                .to_vec(),
+        })
+        .unwrap();
+        assert_eq!(
+            yearly,
+            Plan {
+                id: "prod_year".to_owned(),
+                name: "hatchrun yearly".to_owned(),
+                description: None,
+                amount: Some(49000),
+                currency: Some("usd".to_owned()),
+                interval: Some("year".to_owned()),
+            }
+        );
+        // The interval may be on the price only, and a product may
+        // have no fixed price.
+        let monthly = plan(&Response {
+            status: 200,
+            body: br#"{"id":"prod_month","name":"hatchrun monthly","description":"d",
+                "prices":[{"amount_type":"fixed","price_amount":4900,
+                "price_currency":"usd","recurring_interval":"month"}]}"#
+                .to_vec(),
+        })
+        .unwrap();
+        assert_eq!(monthly.interval.as_deref(), Some("month"));
+        let custom = plan(&Response {
+            status: 200,
+            body: br#"{"id":"prod_c","name":"c","description":null,"prices":[]}"#.to_vec(),
+        })
+        .unwrap();
+        assert_eq!((custom.amount, custom.interval.as_deref()), (None, None));
+        assert_eq!(
+            plan(&Response {
+                status: 404,
+                body: b"{}".to_vec(),
+            })
+            .unwrap_err(),
+            "product: Polar answered 404: {}"
+        );
+
+        let mut plans = vec![custom, yearly, monthly];
+        sort(&mut plans);
+        let ids: Vec<&str> = plans.iter().map(|plan| plan.id.as_str()).collect();
+        assert_eq!(ids, ["prod_month", "prod_year", "prod_c"]);
     }
 }
