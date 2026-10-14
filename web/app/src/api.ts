@@ -231,12 +231,17 @@ export const saveSettings = (org: string, maxRunners: number, allowedRegions: st
   put<Tenant>(`${tenantPath(org)}/settings`, { maxRunners, allowedRegions });
 
 export type Arch = "amd64" | "arm64";
+export type Capacity = "on-demand" | "spot" | "spot-with-fallback";
 
 /** A runner profile as workflows name it in runs-on. */
 export interface Profile {
   name: string;
   arch: Arch;
-  /** Instance families, preferred first. */
+  /** Instance categories such as "m"; empty for any. */
+  categories: string[];
+  /** The oldest generation; null for any. The newest that fits goes first. */
+  minGeneration: number | null;
+  /** Families to pin; empty for any that meets the rest. */
   families: string[];
   cpuMin: number;
   cpuMax: number | null;
@@ -245,14 +250,14 @@ export interface Profile {
   memoryMax: number | null;
   /** GiB; null for the connect stack's default. */
   diskGib: number | null;
-  spot: boolean;
+  capacity: Capacity;
   image: string;
   extras: string[];
   warmPool: number;
 }
 
 export interface Estimate {
-  /** Tried in order when EC2 has no capacity. */
+  /** Newest generation first, cheapest first within it. */
   instanceTypes: string[];
   vcpus: number;
   memoryGib: number;
@@ -270,6 +275,9 @@ export interface ProfileView extends Profile {
 
 export interface Family {
   name: string;
+  /** As in "m". */
+  category: string;
+  generation: number;
   arch: Arch;
   gibPerVcpu: number;
   /** [size name, vCPUs], smallest first. */
@@ -278,6 +286,8 @@ export interface Family {
   offered: boolean;
   /** Whether the connect stack allows at least one size. */
   allowed: boolean;
+  /** GPUs, accelerators, bare metal, burstable or flex: only a pin launches it. */
+  special: boolean;
   pricePerVcpu: number | null;
 }
 
@@ -285,7 +295,12 @@ export interface Runners {
   /** The tenant's region, or where prices come from before AWS is connected. */
   region: string;
   connected: boolean;
-  limits: null | { instanceTypes: string[]; volumeSizeLimit: number; rootVolumeSize: number };
+  limits: null | {
+    instanceTypes: string[];
+    excludedInstanceTypes: string[];
+    volumeSizeLimit: number;
+    rootVolumeSize: number;
+  };
   images: string[];
   families: Family[];
   profiles: ProfileView[];

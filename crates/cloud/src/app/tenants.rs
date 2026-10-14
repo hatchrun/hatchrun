@@ -53,6 +53,7 @@ pub(crate) struct TenantRow {
     pub beta: u8,
     pub allowed_regions: Option<String>,
     pub instance_types: Option<String>,
+    pub excluded_instance_types: Option<String>,
     pub volume_size_limit: Option<u16>,
     pub root_volume_size: Option<u16>,
 }
@@ -60,7 +61,8 @@ pub(crate) struct TenantRow {
 pub(crate) const TENANT_COLUMNS: &str = "tenants.id, tenants.org_id, tenants.org_login, \
     tenants.installation_id, tenants.role_arn, tenants.region, tenants.launch_template_id, \
     tenants.subnet_ids, tenants.max_runners, tenants.beta, tenants.allowed_regions, \
-    tenants.instance_types, tenants.volume_size_limit, tenants.root_volume_size";
+    tenants.instance_types, tenants.excluded_instance_types, tenants.volume_size_limit, \
+    tenants.root_volume_size";
 
 /// The setup steps a tenant has done.
 #[derive(Debug, Serialize)]

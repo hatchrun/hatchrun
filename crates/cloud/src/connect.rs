@@ -137,6 +137,7 @@ mod tests {
             created: created.to_owned(),
             subnets: Vec::new(),
             instance_types: None,
+            excluded_instance_types: None,
             volume_size_limit: None,
             root_volume_size: None,
             fleet: false,

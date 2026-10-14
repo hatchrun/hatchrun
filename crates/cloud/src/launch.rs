@@ -86,6 +86,7 @@ struct Tenant {
     licensed: u8,
     /// What its connect stack allows (see [`Limits::from_columns`]).
     instance_types: Option<String>,
+    excluded_instance_types: Option<String>,
     volume_size_limit: Option<u16>,
     root_volume_size: Option<u16>,
     /// 1 when its stack lets the role use EC2 Fleet.
@@ -167,7 +168,7 @@ async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
         .prepare(format!(
             "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners, \
              allowed_regions, {LICENSED} AS licensed, instance_types, volume_size_limit, \
-             root_volume_size, fleet \
+             root_volume_size, fleet, excluded_instance_types \
              FROM tenants WHERE installation_id = ?1 AND role_arn IS NOT NULL \
              AND region IS NOT NULL AND launch_template_id IS NOT NULL \
              AND subnet_ids IS NOT NULL"
@@ -362,10 +363,14 @@ async fn launch_claimed(
         profiles::resolve(&job.spec, custom).map_err(|err| Failure::new(Cause::NoProfile, err))?;
     let limits = Limits::from_columns(
         tenant.instance_types.as_deref(),
+        tenant.excluded_instance_types.as_deref(),
         tenant.volume_size_limit,
         tenant.root_volume_size,
     );
-    let choice = instance::choose(&profile, &tenant.region, &limits)
+    let offered = instance_types::store::offered(db, &tenant.region)
+        .await
+        .map_err(internal)?;
+    let choice = instance::choose(&profile, &tenant.region, &offered, &limits)
         .map_err(|err| Failure::new(Cause::NoInstanceType, err))?;
     let settings = Settings::read(env).map_err(|err| Failure::new(Cause::Settings, err))?;
     let arch = choice.arch.as_str();
@@ -499,13 +504,9 @@ impl Launch<'_> {
         }
     }
 
-    /// Spot first for a Spot profile, then on-demand.
+    /// The markets to try in order, `true` for Spot.
     fn markets(&self) -> &'static [bool] {
-        if self.choice.spot {
-            &[true, false]
-        } else {
-            &[false]
-        }
+        self.choice.capacity.markets()
     }
 
     fn root_volume(&self) -> Option<(&str, u16)> {
@@ -978,6 +979,7 @@ mod tests {
             allowed_regions: None,
             licensed: 1,
             instance_types: None,
+            excluded_instance_types: None,
             volume_size_limit: None,
             root_volume_size: None,
             fleet: 0,

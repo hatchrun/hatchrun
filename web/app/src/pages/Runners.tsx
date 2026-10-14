@@ -15,6 +15,7 @@ import {
   previewProfile,
   replaceProfile,
   type Arch,
+  type Capacity,
   type Estimate,
   type Family,
   type Preview,
@@ -35,6 +36,24 @@ export function dollars(micros: number): string {
 }
 
 const ARCH: Record<Arch, string> = { amd64: "x86-64", arm64: "Arm" };
+const CAPACITY: Record<Capacity, { short: string; long: string }> = {
+  "on-demand": { short: "On-demand", long: "On-demand" },
+  spot: { short: "Spot", long: "Spot only; jobs wait while Spot has no capacity" },
+  "spot-with-fallback": { short: "Spot, then on-demand", long: "Spot, then on-demand when Spot has no capacity" },
+};
+/** Karpenter's instance categories, with what AWS calls them. */
+const CATEGORY: Record<string, string> = {
+  c: "Compute optimized",
+  m: "General purpose",
+  r: "Memory optimized",
+  x: "Memory optimized, large",
+  z: "High frequency",
+  i: "Storage optimized",
+  d: "Dense storage",
+  h: "Throughput storage",
+  hpc: "High performance computing",
+  t: "Burstable",
+};
 const SOURCE: Record<ProfileView["source"], { label: string; tone: string }> = {
   builtIn: { label: "Built in", tone: "" },
   replaced: { label: "Changed", tone: " badge-accent" },
@@ -129,9 +148,15 @@ function StackLimits({ runners }: { runners: Runners }) {
   }
   return (
     <p className="fine runners-limits">
-      Your connect stack allows <code>{runners.limits.instanceTypes.join(", ")}</code> and root
-      volumes up to {runners.limits.volumeSizeLimit} GiB. AWS refuses anything else, so profiles
-      get only those.
+      Your connect stack allows <code>{runners.limits.instanceTypes.join(", ")}</code>
+      {runners.limits.excludedInstanceTypes.length > 0 && (
+        <>
+          {" "}
+          except <code>{runners.limits.excludedInstanceTypes.join(", ")}</code>
+        </>
+      )}{" "}
+      and root volumes up to {runners.limits.volumeSizeLimit} GiB. AWS refuses anything else, so
+      profiles get only those.
     </p>
   );
 }
@@ -160,7 +185,7 @@ function ProfileRow({ org, profile }: { org: string; profile: ProfileView }) {
         <td data-label="Disk" className="nowrap">
           {estimate ? `${estimate.diskGib} GiB` : profile.diskGib ? `${profile.diskGib} GiB` : "Default"}
         </td>
-        <td data-label="Market" className="nowrap">{profile.spot ? "Spot" : "On-demand"}</td>
+        <td data-label="Market" className="nowrap">{CAPACITY[profile.capacity].short}</td>
         <td data-label="Per hour" className="numeric">
           {estimate ? dollars(estimate.hourlyMicros) : "-"}
         </td>
@@ -198,13 +223,15 @@ function InstanceTypes({ estimate }: { estimate: Estimate }) {
 interface Draft {
   name: string;
   arch: Arch;
+  categories: string[];
+  minGeneration: string;
   families: string[];
   cpuMin: string;
   cpuMax: string;
   memoryMin: string;
   memoryMax: string;
   diskGib: string;
-  spot: boolean;
+  capacity: Capacity;
   image: string;
 }
 
@@ -215,13 +242,15 @@ function draftOf(profile: Profile): Draft {
   return {
     name: profile.name,
     arch: profile.arch,
+    categories: profile.categories,
+    minGeneration: text(profile.minGeneration),
     families: profile.families,
     cpuMin: text(profile.cpuMin),
     cpuMax: text(profile.cpuMax),
     memoryMin: text(profile.memoryMin),
     memoryMax: text(profile.memoryMax),
     diskGib: text(profile.diskGib),
-    spot: profile.spot,
+    capacity: profile.capacity,
     image: profile.image,
   };
 }
@@ -230,13 +259,15 @@ function profileOf(draft: Draft, base: Profile | null): Profile {
   return {
     name: draft.name.trim().toLowerCase(),
     arch: draft.arch,
+    categories: draft.categories,
+    minGeneration: number(draft.minGeneration),
     families: draft.families,
     cpuMin: number(draft.cpuMin) ?? 0,
     cpuMax: number(draft.cpuMax),
     memoryMin: number(draft.memoryMin) ?? 0,
     memoryMax: number(draft.memoryMax),
     diskGib: number(draft.diskGib),
-    spot: draft.spot,
+    capacity: draft.capacity,
     image: draft.image,
     extras: base?.extras ?? [],
     warmPool: base?.warmPool ?? 0,
@@ -247,15 +278,15 @@ function newDraft(runners: Runners): Draft {
   return {
     name: "hatchrun-",
     arch: "arm64",
-    families: ["m8g", "m7g"].filter((name) =>
-      runners.families.some((family) => family.name === name && family.allowed && family.offered),
-    ),
+    categories: ["c", "m", "r"],
+    minGeneration: "",
+    families: [],
     cpuMin: "4",
     cpuMax: "",
     memoryMin: "16",
     memoryMax: "",
     diskGib: "",
-    spot: false,
+    capacity: "on-demand",
     image: runners.images[0] ?? "",
   };
 }
@@ -376,11 +407,10 @@ function Editor({
             </div>
           </fieldset>
 
-          <Families
+          <Requirements
             families={runners.families.filter((family) => family.arch === draft.arch)}
-            chosen={draft.families}
-            region={runners.region}
-            onChange={(families) => set({ families })}
+            draft={draft}
+            onChange={set}
           />
 
           <div className="field-pair">
@@ -400,16 +430,26 @@ function Editor({
             help={limits ? `Your connect stack allows up to ${limits.volumeSizeLimit} GiB.` : undefined}
           />
 
+          <Families
+            families={runners.families.filter((family) => family.arch === draft.arch)}
+            chosen={draft.families}
+            region={runners.region}
+            onChange={(families) => set({ families })}
+          />
+
           <fieldset className="field">
-            <legend className="label">Market</legend>
-            <label className="check">
-              <input type="radio" name="market" checked={!draft.spot} onChange={() => set({ spot: false })} />
-              On-demand
-            </label>
-            <label className="check">
-              <input type="radio" name="market" checked={draft.spot} onChange={() => set({ spot: true })} />
-              Spot, then on-demand when Spot has no capacity
-            </label>
+            <legend className="label">Capacity type</legend>
+            {(Object.keys(CAPACITY) as Capacity[]).map((capacity) => (
+              <label key={capacity} className="check">
+                <input
+                  type="radio"
+                  name="capacity"
+                  checked={draft.capacity === capacity}
+                  onChange={() => set({ capacity })}
+                />
+                {CAPACITY[capacity].long}
+              </label>
+            ))}
             <p className="field-help">
               Spot usually costs well under the on-demand price, and AWS can take a Spot runner
               back with two minutes&apos; notice, which fails the job.
@@ -491,6 +531,64 @@ function NumberField({
   );
 }
 
+/** Categories and the oldest generation, from what the region offers. */
+function Requirements({
+  families,
+  draft,
+  onChange,
+}: {
+  families: Family[];
+  draft: Draft;
+  onChange: (change: Partial<Draft>) => void;
+}) {
+  const plain = families.filter((family) => !family.special);
+  const categories = [...new Set([...plain.map((family) => family.category), ...draft.categories])].sort(
+    (a, b) => (CATEGORY[a] ? 0 : 1) - (CATEGORY[b] ? 0 : 1) || a.localeCompare(b),
+  );
+  const generations = [...new Set(plain.map((family) => family.generation))].filter((g) => g > 0).sort((a, b) => a - b);
+  const toggle = (category: string) =>
+    onChange({
+      categories: draft.categories.includes(category)
+        ? draft.categories.filter((other) => other !== category)
+        : [...draft.categories, category],
+    });
+  return (
+    <>
+      <fieldset className="field">
+        <legend className="label">Instance categories</legend>
+        <div className="category-list">
+          {categories.map((category) => (
+            <label key={category} className="check">
+              <input type="checkbox" checked={draft.categories.includes(category)} onChange={() => toggle(category)} />
+              <span className="mono">{category}</span> {CATEGORY[category] ?? ""}
+            </label>
+          ))}
+        </div>
+        <p className="field-help">
+          None checked takes any category. Jobs get the newest generation that fits and, within it,
+          the cheapest type with capacity.
+        </p>
+      </fieldset>
+      <div className="field field-narrow">
+        <label htmlFor="min-generation">Oldest generation</label>
+        <select
+          id="min-generation"
+          className="input"
+          value={draft.minGeneration}
+          onChange={(event) => onChange({ minGeneration: event.target.value })}
+        >
+          <option value="">Any, newest first</option>
+          {generations.map((generation) => (
+            <option key={generation} value={String(generation)}>
+              {generation} or newer
+            </option>
+          ))}
+        </select>
+      </div>
+    </>
+  );
+}
+
 function Families({
   families,
   chosen,
@@ -502,48 +600,26 @@ function Families({
   region: string;
   onChange: (families: string[]) => void;
 }) {
-  const move = (at: number, by: number) => {
-    const next = [...chosen];
-    const [name] = next.splice(at, 1);
-    if (name !== undefined) {
-      next.splice(at + by, 0, name);
-    }
-    onChange(next);
-  };
   const left = families.filter((family) => !chosen.includes(family.name));
-  const why = (family: Family) =>
-    !family.offered ? ` (not in ${region})` : !family.allowed ? " (not allowed by your stack)" : "";
+  const why = (family: Family) => (!family.allowed ? " (not allowed by your stack)" : "");
   return (
     <fieldset className="field">
-      <legend className="label">Instance families</legend>
+      <legend className="label">Pinned instance families (optional)</legend>
       <p className="field-help families-help">
-        Jobs get the smallest size that fits in the first family. The others are tried in order
-        when AWS has no capacity.
+        Leave empty to take any family that meets the requirements above. Pinned families replace
+        the categories, and only a pin launches GPU, burstable, flex or bare metal types.
       </p>
       {chosen.length > 0 && (
-        <ol className="family-list">
-          {chosen.map((name, at) => {
+        <ul className="family-list">
+          {chosen.map((name) => {
             const family = families.find((candidate) => candidate.name === name);
             return (
               <li key={name} className="family-item">
-                <span className="family-rank">{at + 1}</span>
                 <span className="family-name mono">{name}</span>
                 <span className="muted small family-detail">
-                  {family ? `${family.gibPerVcpu} GiB per vCPU${why(family)}` : "unknown family"}
+                  {family ? `${family.gibPerVcpu} GiB per vCPU${why(family)}` : `not offered in ${region}`}
                 </span>
                 <span className="family-buttons">
-                  <button type="button" className="button button-small" onClick={() => move(at, -1)} disabled={at === 0} aria-label={`Move ${name} up`}>
-                    Up
-                  </button>
-                  <button
-                    type="button"
-                    className="button button-small"
-                    onClick={() => move(at, 1)}
-                    disabled={at === chosen.length - 1}
-                    aria-label={`Move ${name} down`}
-                  >
-                    Down
-                  </button>
                   <button
                     type="button"
                     className="button button-small"
@@ -556,18 +632,18 @@ function Families({
               </li>
             );
           })}
-        </ol>
+        </ul>
       )}
       {left.length > 0 && chosen.length < 8 && (
         <select
           className="input add-family"
-          aria-label="Add an instance family"
+          aria-label="Pin an instance family"
           value=""
           onChange={(event) => event.target.value && onChange([...chosen, event.target.value])}
         >
-          <option value="">Add a family</option>
+          <option value="">Pin a family</option>
           {left.map((family) => (
-            <option key={family.name} value={family.name} disabled={!family.offered || !family.allowed}>
+            <option key={family.name} value={family.name} disabled={!family.allowed}>
               {family.name}: {family.gibPerVcpu} GiB per vCPU
               {family.pricePerVcpu !== null ? `, ${dollars(family.pricePerVcpu)} per vCPU-hour` : ""}
               {why(family)}

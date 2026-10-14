@@ -1488,10 +1488,10 @@ fieldset.field {
   border-top: 1px solid var(--border);
 }
 
-.family-rank {
-  width: 1.4rem;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
+.category-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+  gap: 0.2rem 1rem;
 }
 
 .family-name {

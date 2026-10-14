@@ -28,8 +28,8 @@ use worker::{Method, Request, Response};
 
 use super::tenants::{TenantRow, authorize};
 use super::{Answer, Ctx, Failure};
-use crate::catalog::{self, Family};
-use crate::instance::{self, Limits, size_name};
+use crate::instance::{self, Limits};
+use crate::instance_types::Entry;
 use crate::launch;
 use crate::profiles::{self, IMAGES, PROFILES_MAX, Profile, Source, built_in, store};
 
@@ -41,24 +41,34 @@ struct Target {
     region: String,
     /// The connect stack's limits, once AWS is connected.
     limits: Option<Limits>,
+    /// What the region offers.
+    offered: Vec<Entry>,
 }
 
 impl Target {
-    fn of(row: &TenantRow) -> Self {
-        match &row.region {
-            Some(region) if row.role_arn.is_some() => Self {
-                region: region.clone(),
-                limits: Some(Limits::from_columns(
+    async fn load(ctx: &Ctx<'_>, row: &TenantRow) -> worker::Result<Self> {
+        let (region, limits) = match &row.region {
+            Some(region) if row.role_arn.is_some() => (
+                region.clone(),
+                Some(Limits::from_columns(
                     row.instance_types.as_deref(),
+                    row.excluded_instance_types.as_deref(),
                     row.volume_size_limit,
                     row.root_volume_size,
                 )),
-            },
-            _ => Self {
-                region: PRICING_REGION.to_owned(),
-                limits: None,
-            },
-        }
+            ),
+            _ => (PRICING_REGION.to_owned(), None),
+        };
+        let offered = crate::instance_types::store::offered(ctx.db, &region).await?;
+        Ok(Self {
+            region,
+            limits,
+            offered,
+        })
+    }
+
+    fn choose(&self, profile: &Profile, limits: &Limits) -> Result<instance::Choice, String> {
+        instance::choose(profile, &self.region, &self.offered, limits)
     }
 
     /// The limits to choose within: the stack's, or none before there
@@ -66,6 +76,7 @@ impl Target {
     fn limits(&self) -> Limits {
         self.limits.clone().unwrap_or_else(|| Limits {
             instance_types: vec!["*".to_owned()],
+            excluded: Vec::new(),
             volume_size_limit: crate::labels::DISK_MAX,
             root_volume_size: instance::LEGACY_ROOT_VOLUME_SIZE,
         })
@@ -95,7 +106,7 @@ struct ProfileView {
 }
 
 fn check(profile: Profile, source: Source, target: &Target) -> ProfileView {
-    match instance::choose(&profile, &target.region, &target.limits()) {
+    match target.choose(&profile, &target.limits()) {
         Ok(choice) => ProfileView {
             profile,
             source,
@@ -120,59 +131,80 @@ fn check(profile: Profile, source: Source, target: &Target) -> ProfileView {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FamilyView {
-    name: &'static str,
+    name: String,
+    /// As in `m`.
+    category: String,
+    /// As in 8.
+    generation: u16,
     arch: crate::labels::Arch,
-    gib_per_vcpu: u16,
+    /// Memory per vCPU of its smallest size, in GiB.
+    gib_per_vcpu: u32,
     /// Size names with their vCPUs, smallest first.
     sizes: Vec<(String, u16)>,
-    /// Whether the region offers it.
+    /// Whether the region offers it; the list holds only those.
     offered: bool,
     /// Whether the connect stack allows at least one size.
     allowed: bool,
-    /// On-demand per vCPU-hour in the region, millionths of a US dollar.
-    price_per_vcpu: Option<u32>,
+    /// GPUs, accelerators, bare metal, burstable or flex: only a pin
+    /// launches it.
+    special: bool,
+    /// On-demand per vCPU-hour of its smallest size, millionths of a US
+    /// dollar.
+    price_per_vcpu: Option<u64>,
 }
 
-fn family_view(family: &'static Family, target: &Target) -> FamilyView {
+/// The region's families, by name, from what it offers.
+fn family_views(target: &Target) -> Vec<FamilyView> {
     let limits = target.limits();
-    let price = family
-        .prices
-        .iter()
-        .find(|(region, _)| *region == target.region)
-        .map(|(_, price)| *price);
-    FamilyView {
-        name: family.name,
-        arch: family.arch,
-        gib_per_vcpu: family.gib_per_vcpu,
-        sizes: family
-            .sizes
-            .iter()
-            .map(|vcpus| (size_name(*vcpus), *vcpus))
-            .collect(),
-        offered: price.is_some(),
-        allowed: family
-            .sizes
-            .iter()
-            .any(|vcpus| limits.allows(&format!("{}.{}", family.name, size_name(*vcpus)))),
-        price_per_vcpu: price,
+    let mut entries: Vec<&Entry> = target.offered.iter().collect();
+    entries.sort_by(|a, b| (a.family.as_str(), a.vcpus).cmp(&(b.family.as_str(), b.vcpus)));
+    let mut views: Vec<FamilyView> = Vec::new();
+    for entry in entries {
+        let size = entry
+            .name
+            .split_once('.')
+            .map_or(String::new(), |(_, size)| size.to_owned());
+        let allowed = limits.allows(&entry.name);
+        if let Some(view) = views.last_mut().filter(|view| view.name == entry.family) {
+            view.sizes.push((size, entry.vcpus));
+            view.allowed |= allowed;
+            continue;
+        }
+        views.push(FamilyView {
+            name: entry.family.clone(),
+            category: entry.category.clone(),
+            generation: entry.generation,
+            arch: entry.arch,
+            gib_per_vcpu: entry.memory_mib / 1024 / u32::from(entry.vcpus.max(1)),
+            sizes: vec![(size, entry.vcpus)],
+            offered: true,
+            allowed,
+            special: entry.gpus > 0
+                || entry.accelerators
+                || entry.bare_metal
+                || entry.burstable
+                || entry.family.ends_with("-flex"),
+            price_per_vcpu: entry
+                .on_demand_micros
+                .map(|price| price / u64::from(entry.vcpus.max(1))),
+        });
     }
+    views
 }
 
 async fn listing(ctx: &Ctx<'_>, row: &TenantRow) -> Answer {
-    let target = Target::of(row);
+    let target = Target::load(ctx, row).await?;
     let profiles: Vec<ProfileView> = profiles::merged(store::custom(ctx.db, &row.id).await?)
         .into_iter()
         .map(|(profile, source)| check(profile, source, &target))
         .collect();
-    let families: Vec<FamilyView> = catalog::FAMILIES
-        .iter()
-        .map(|family| family_view(family, &target))
-        .collect();
+    let families = family_views(&target);
     Ok(Response::from_json(&serde_json::json!({
         "region": target.region,
         "connected": target.limits.is_some(),
         "limits": target.limits.as_ref().map(|limits| serde_json::json!({
             "instanceTypes": limits.instance_types,
+            "excludedInstanceTypes": limits.excluded,
             "volumeSizeLimit": limits.volume_size_limit,
             "rootVolumeSize": limits.root_volume_size,
         })),
@@ -236,7 +268,7 @@ fn refused(message: impl Into<String>) -> Failure {
 fn checked(profile: Profile, target: &Target) -> Result<Profile, Failure> {
     let profile = profile.validate().map_err(refused)?;
     if let Some(limits) = &target.limits {
-        instance::choose(&profile, &target.region, limits).map_err(refused)?;
+        target.choose(&profile, limits).map_err(refused)?;
     }
     Ok(profile)
 }
@@ -244,7 +276,7 @@ fn checked(profile: Profile, target: &Target) -> Result<Profile, Failure> {
 /// `POST /api/tenants/<org>/runners/preview`
 async fn preview(ctx: &Ctx<'_>, org: &str, profile: Profile) -> Answer {
     let row = authorize(ctx, org).await?;
-    let target = Target::of(&row);
+    let target = Target::load(ctx, &row).await?;
     let view = match profile.validate() {
         Ok(profile) => check(profile, Source::Custom, &target),
         Err(problem) => {
@@ -259,7 +291,7 @@ async fn preview(ctx: &Ctx<'_>, org: &str, profile: Profile) -> Answer {
 /// `POST /api/tenants/<org>/runners`
 async fn create(ctx: &Ctx<'_>, org: &str, profile: Profile) -> Answer {
     let row = authorize(ctx, org).await?;
-    let profile = checked(profile, &Target::of(&row))?;
+    let profile = checked(profile, &Target::load(ctx, &row).await?)?;
     if built_in(&profile.name).is_some() {
         return Err(Failure::new(
             409,
@@ -289,7 +321,7 @@ async fn create(ctx: &Ctx<'_>, org: &str, profile: Profile) -> Answer {
 /// `PUT /api/tenants/<org>/runners/<name>`
 async fn replace(ctx: &Ctx<'_>, org: &str, name: &str, profile: Profile) -> Answer {
     let row = authorize(ctx, org).await?;
-    let profile = checked(profile, &Target::of(&row))?;
+    let profile = checked(profile, &Target::load(ctx, &row).await?)?;
     let existing = store::named(ctx.db, &row.id, name).await?;
     if existing.is_none() && built_in(name).is_none() {
         return Err(Failure::new(404, format!("no runner profile {name}")));

@@ -90,6 +90,17 @@ pub(crate) async fn region(db: &D1Database, region: &str) -> Result<Vec<Entry>> 
     Ok(rows.into_iter().map(Row::entry).collect())
 }
 
+/// What `region` offers: its catalog, or the static families before
+/// its catalog is first read.
+pub(crate) async fn offered(db: &D1Database, region: &str) -> Result<Vec<Entry>> {
+    let entries = self::region(db, region).await?;
+    Ok(if entries.is_empty() {
+        crate::instance::static_offerings(region)
+    } else {
+        entries
+    })
+}
+
 /// When `region`'s catalog was last refreshed, and why the last
 /// attempt failed if it did.
 pub(crate) async fn refreshed(

@@ -8,14 +8,15 @@ use serde::Deserialize;
 use wasm_bindgen::JsValue;
 use worker::{D1Database, Result};
 
-use super::{Profile, built_in};
+use super::{Capacity, Profile, built_in};
 use crate::labels::{Arch, Spec};
 use crate::{int, now_ms};
 
 const COLUMNS: &str = "runner_profiles.name, runner_profiles.arch, runner_profiles.families, \
     runner_profiles.cpu_min, runner_profiles.cpu_max, runner_profiles.memory_min, \
-    runner_profiles.memory_max, runner_profiles.disk_gib, runner_profiles.spot, \
-    runner_profiles.image, runner_profiles.extras, runner_profiles.warm_pool";
+    runner_profiles.memory_max, runner_profiles.disk_gib, runner_profiles.capacity, \
+    runner_profiles.image, runner_profiles.extras, runner_profiles.warm_pool, \
+    runner_profiles.categories, runner_profiles.min_generation";
 
 /// A `runner_profiles` row.
 #[derive(Debug, Deserialize)]
@@ -28,10 +29,12 @@ pub(crate) struct Row {
     memory_min: u16,
     memory_max: Option<u16>,
     disk_gib: Option<u16>,
-    spot: u8,
+    capacity: String,
     image: String,
     extras: String,
     warm_pool: u16,
+    categories: String,
+    min_generation: Option<u16>,
 }
 
 fn list(value: &str) -> Vec<String> {
@@ -52,13 +55,15 @@ impl From<Row> for Profile {
             } else {
                 Arch::Amd64
             },
+            categories: list(&row.categories),
+            min_generation: row.min_generation,
             families: list(&row.families),
             cpu_min: row.cpu_min,
             cpu_max: row.cpu_max,
             memory_min: row.memory_min,
             memory_max: row.memory_max,
             disk_gib: row.disk_gib,
-            spot: row.spot == 1,
+            capacity: Capacity::parse(&row.capacity),
             image: row.image,
             extras: list(&row.extras),
             warm_pool: row.warm_pool,
@@ -126,10 +131,12 @@ pub(crate) async fn save(db: &D1Database, tenant_id: &str, profile: &Profile) ->
     db.prepare(
         "INSERT INTO runner_profiles (tenant_id, name, arch, families, cpu_min, cpu_max, \
          memory_min, memory_max, disk_gib, spot, image, extras, warm_pool, created_at, \
-         updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14) \
+         updated_at, categories, min_generation, capacity) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15, ?16, ?17) \
          ON CONFLICT (tenant_id, name) DO UPDATE SET arch = ?3, families = ?4, cpu_min = ?5, \
          cpu_max = ?6, memory_min = ?7, memory_max = ?8, disk_gib = ?9, spot = ?10, \
-         image = ?11, extras = ?12, warm_pool = ?13, updated_at = ?14",
+         image = ?11, extras = ?12, warm_pool = ?13, updated_at = ?14, categories = ?15, \
+         min_generation = ?16, capacity = ?17",
     )
     .bind(&[
         tenant_id.into(),
@@ -141,11 +148,14 @@ pub(crate) async fn save(db: &D1Database, tenant_id: &str, profile: &Profile) ->
         profile.memory_min.into(),
         optional(profile.memory_max),
         optional(profile.disk_gib),
-        u8::from(profile.spot).into(),
+        u8::from(profile.capacity.spot()).into(),
         profile.image.as_str().into(),
         profile.extras.join(",").into(),
         profile.warm_pool.into(),
         int(now_ms())?,
+        profile.categories.join(",").into(),
+        optional(profile.min_generation),
+        profile.capacity.as_str().into(),
     ])?
     .run()
     .await?;
@@ -191,16 +201,19 @@ mod tests {
             memory_min: 16,
             memory_max: Some(64),
             disk_gib: Some(100),
-            spot: 1,
+            capacity: "spot-with-fallback".to_owned(),
             image: "ubuntu-26.04".to_owned(),
             extras: String::new(),
             warm_pool: 0,
+            categories: String::new(),
+            min_generation: None,
         };
         let profile = Profile::from(row);
         assert_eq!(profile.arch, Arch::Arm64);
         assert_eq!(profile.families, ["c8g", "m8g"]);
         assert_eq!(profile.extras.len(), 0);
-        assert!(profile.spot);
+        assert_eq!(profile.capacity, Capacity::SpotWithFallback);
+        assert_eq!(profile.categories, Vec::<String>::new());
         assert_eq!(profile.clone().validate(), Ok(profile));
     }
 }

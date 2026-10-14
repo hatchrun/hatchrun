@@ -176,17 +176,20 @@ npx wrangler@4.143.0 deploy
 hosted service. Instead of a scaler per scale set, it takes the
 `workflow_job` webhooks of the hatchrun GitHub App and records every job
 whose only `runs-on` label names a runner profile, in D1, once per job.
-A profile names instance families in order of preference, vCPU and
-memory bounds, a root volume, Spot or on-demand, and an image.
+A profile holds requirements in Karpenter's terms: instance categories
+(`c`, `m`, `r`, ...), the oldest generation, the architecture, vCPU and
+memory bounds, a root volume, the capacity type (on-demand, Spot, or
+Spot falling back to on-demand) and an image. Naming instance families
+is an optional pin.
 
 ```yaml
 runs-on: hatchrun-4cpu-arm64
 ```
 
 Every organization has the built-in profiles `hatchrun-2cpu`,
-`hatchrun-4cpu`, `hatchrun-8cpu` and `hatchrun-16cpu` (amd64, `m8i`
-then `m7i`), the same with `-arm64` (Graviton, `m8g` then `m7g`), all
-with 4 GiB per vCPU and on-demand, and `hatchrun`, which is
+`hatchrun-4cpu`, `hatchrun-8cpu` and `hatchrun-16cpu` (amd64), the same
+with `-arm64` (Graviton), all general purpose (category `m`) with at
+least 4 GiB per vCPU and on-demand, and `hatchrun`, which is
 `hatchrun-2cpu`. Owners add their own profiles in the app, named
 `hatchrun-` and anything, and a profile named like a built-in replaces
 it for that organization.
@@ -198,8 +201,8 @@ runs-on: hatchrun-4cpu/disk=200/spot=true
 ```
 
 The overrides are `cpu=N` (at least N vCPUs), `ram=N` (at least N GiB),
-`disk=N` (GiB) and `spot=true` or `spot=false`. A Spot runner falls
-back to on-demand when Spot has no capacity. A job with an unknown
+`disk=N` (GiB) and `spot=true` (Spot falling back to on-demand) or
+`spot=false`. A job with an unknown
 profile or option, or with other labels next to the hatchrun one, is
 skipped, and the App's webhook delivery log says why. There is one
 label on purpose: GitHub gives a job any runner whose labels include
@@ -207,13 +210,18 @@ all of the job's labels, so with label sets a job asking for less can
 take the runner launched for a job asking for more and leave that job
 waiting.
 
-The instance type comes from the profile and the tenant's region: the
-smallest size that fits in the first family the region offers and the
-connect stack allows. The stack's `InstanceTypes` and `VolumeSizeLimit`
+The instance types come from the profile and the region's instance
+type catalog: of every family that fits, the smallest size the connect
+stack allows, newest generation first and cheapest first within it.
+GPU, accelerator, bare metal, burstable and flex types only come with a
+pin. A launch hands a generation at a time to EC2 Fleet, which takes
+the cheapest offering with capacity. The stack's `InstanceTypes`
+(by default any size up to `8xlarge`), `ExcludedInstanceTypes` (by
+default GPU, accelerator and bare metal families) and `VolumeSizeLimit`
 stay the final word; when nothing they allow fits, the job fails and
-the app says why. [`scripts/ec2-catalog.py`](crates/cloud/scripts/ec2-catalog.py)
-writes the families, sizes and prices the Worker knows from AWS's
-public price lists.
+the app says why. Until a region's catalog is first read, the families
+[`scripts/ec2-catalog.py`](crates/cloud/scripts/ec2-catalog.py) wrote
+from AWS's public price lists stand in for it.
 
 ```sh
 npm --prefix web/app ci && npm --prefix web/app run build
