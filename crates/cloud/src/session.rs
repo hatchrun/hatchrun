@@ -155,9 +155,16 @@ pub fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::{BuildHasher, RandomState};
+
     use super::*;
 
-    const ID: [u8; ID_BYTES] = [7; ID_BYTES];
+    /// Fresh random bytes for every run, so no key or nonce in the tests
+    /// is fixed.
+    fn random<const N: usize>() -> [u8; N] {
+        let state = RandomState::new();
+        std::array::from_fn(|at| state.hash_one(at).to_le_bytes()[0])
+    }
 
     #[test]
     fn finds_cookies_by_exact_name() {
@@ -179,37 +186,41 @@ mod tests {
 
     #[test]
     fn ids_round_trip_and_must_be_full_length() {
-        assert_eq!(decode_id(&encode_id(&ID)).unwrap(), ID);
-        assert_eq!(decode_id(&encode_id(&ID[..31])), None);
+        let id: [u8; ID_BYTES] = random();
+        assert_eq!(decode_id(&encode_id(&id)).unwrap(), id);
+        assert_eq!(decode_id(&encode_id(&id[..31])), None);
         assert_eq!(decode_id("not base64!"), None);
     }
 
     #[test]
     fn stores_only_a_hash_of_the_id() {
-        let stored = key(&ID);
+        let id: [u8; ID_BYTES] = random();
+        let stored = key(&id);
         assert_eq!(stored.len(), 64);
-        assert!(!stored.contains(&encode_id(&ID)));
-        assert_ne!(key(&[8; ID_BYTES]), stored);
+        assert!(!stored.contains(&encode_id(&id)));
+        assert_ne!(key(&random::<ID_BYTES>()), stored);
     }
 
     #[test]
     fn csrf_tokens_belong_to_one_session() {
-        let token = csrf_token(&ID);
-        assert!(check_csrf(&ID, Some(&token)));
-        assert!(!check_csrf(&[8; ID_BYTES], Some(&token)));
-        assert!(!check_csrf(&ID, Some("")));
-        assert!(!check_csrf(&ID, None));
+        let id: [u8; ID_BYTES] = random();
+        let token = csrf_token(&id);
+        assert!(check_csrf(&id, Some(&token)));
+        assert!(!check_csrf(&random::<ID_BYTES>(), Some(&token)));
+        assert!(!check_csrf(&id, Some("")));
+        assert!(!check_csrf(&id, None));
     }
 
     #[test]
     fn tokens_open_only_with_their_session() {
-        let sealed = seal(&ID, &[1; NONCE_BYTES], "ghu_secret");
+        let id: [u8; ID_BYTES] = random();
+        let sealed = seal(&id, &random(), "ghu_secret");
         assert!(!sealed.contains("ghu_secret"));
-        assert_eq!(open(&ID, &sealed).as_deref(), Some("ghu_secret"));
-        assert_eq!(open(&[8; ID_BYTES], &sealed), None);
-        assert_eq!(open(&ID, "AAAA"), None);
+        assert_eq!(open(&id, &sealed).as_deref(), Some("ghu_secret"));
+        assert_eq!(open(&random::<ID_BYTES>(), &sealed), None);
+        assert_eq!(open(&id, "AAAA"), None);
         let mut tampered = URL_SAFE_NO_PAD.decode(&sealed).unwrap();
         *tampered.last_mut().unwrap() ^= 1;
-        assert_eq!(open(&ID, &b64url(tampered)), None);
+        assert_eq!(open(&id, &b64url(tampered)), None);
     }
 }
