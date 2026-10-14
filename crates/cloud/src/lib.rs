@@ -47,6 +47,7 @@ mod reconcile;
 pub mod session;
 pub mod settings;
 pub mod signin;
+mod stack;
 pub mod tenant;
 mod webcrypto;
 pub mod webhook;

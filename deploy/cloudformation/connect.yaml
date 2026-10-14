@@ -223,6 +223,10 @@ Resources:
             - { Key: "hatchrun:root-volume-size", Value: !Ref RootVolumeSize }
             # The role below may launch with EC2 Fleet.
             - { Key: "hatchrun:fleet", Value: "true" }
+            # Bumped with crates/cloud/src/connect.rs TEMPLATE_VERSION on
+            # every change to this template, so the app can tell owners
+            # of older stacks to update.
+            - { Key: "hatchrun:template-version", Value: "2" }
       LaunchTemplateData:
         SecurityGroupIds: [!Ref RunnerSecurityGroup]
         InstanceInitiatedShutdownBehavior: terminate

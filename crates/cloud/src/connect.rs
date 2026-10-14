@@ -12,6 +12,13 @@
 //! stack's launch template by its `hatchrun:tenant` tag, checks that the
 //! subnets on its `hatchrun:subnets` tag exist, and only then saves the
 //! connection.
+//!
+//! connect.yaml carries its version in the `hatchrun:template-version`
+//! tag of the launch template. When a release changes the template,
+//! [`TEMPLATE_VERSION`] goes up with it and [`CHANGES`] says what the
+//! new version brings; the app tells owners of older stacks to update,
+//! and the reconciler reads the tags again daily, so an updated stack is
+//! picked up without anyone verifying the role again.
 
 use crate::aws::ec2::LaunchTemplate;
 use crate::http::encode;
@@ -40,6 +47,78 @@ pub const REGIONS: [(&str, &str); 17] = [
 
 /// Name of the stack the links create.
 pub const STACK_NAME: &str = "hatchrun";
+
+/// The version of deploy/cloudformation/connect.yaml in this release,
+/// as its launch template's `hatchrun:template-version` tag says. A
+/// stack from before the tag is version 1.
+pub const TEMPLATE_VERSION: u32 = 2;
+
+/// What each version of connect.yaml brings, in words for the owner.
+pub const CHANGES: &[(u32, &str)] = &[(
+    2,
+    "Runners launch through EC2 Fleet, which picks the cheapest instance type with \
+     capacity. hatchrun reads which instance types your region offers and what they cost \
+     each day. The default limit allows any size up to 8xlarge and refuses GPU, \
+     accelerator and bare metal types, instead of naming families.",
+)];
+
+/// The `InstanceTypes` default of connect.yaml before version 2, which
+/// names families; a stack updated with its previous values keeps it.
+pub const FAMILY_LIST_DEFAULT: &str =
+    "c7g.*,c7i.*,c8g.*,c8i.*,m7g.*,m7i.*,m8g.*,m8i.*,r7g.*,r7i.*,r8g.*,r8i.*";
+/// The `InstanceTypes` default from version 2 on.
+pub const SIZE_CAP_DEFAULT: &str = "*.medium,*.large,*.xlarge,*.2xlarge,*.4xlarge,*.8xlarge";
+
+/// What versions after `version` bring, oldest first. `None` is a
+/// stack from before the version tag.
+#[must_use]
+pub fn changes_since(version: Option<u32>) -> Vec<&'static str> {
+    let version = version.unwrap_or(1);
+    CHANGES
+        .iter()
+        .filter(|(added, _)| *added > version)
+        .map(|(_, change)| *change)
+        .collect()
+}
+
+/// The console page listing the connect stack in `region`, where the
+/// owner chooses Update and replaces the template.
+#[must_use]
+pub fn stack_console_url(region: &str) -> String {
+    format!(
+        "https://{region}.console.aws.amazon.com/cloudformation/home?region={region}\
+         #/stacks?filteringText={STACK_NAME}&filteringStatus=active&viewNested=true"
+    )
+}
+
+/// The AWS CLI command that updates the connect stack in `region` to
+/// the template at `template_url`. Every parameter keeps its value
+/// except `InstanceTypes` when `size_cap`, which moves from the old
+/// family list to the size cap; parameters the stack does not have yet
+/// take their defaults.
+#[must_use]
+pub fn update_command(region: &str, template_url: &str, size_cap: bool) -> String {
+    let keep = |name: &str| format!("ParameterKey={name},UsePreviousValue=true");
+    let mut parameters: Vec<String> = ["TenantId", "OidcProviderArn", "VolumeSizeLimit"]
+        .iter()
+        .map(|name| keep(name))
+        .collect();
+    parameters.push(if size_cap {
+        format!("'ParameterKey=InstanceTypes,ParameterValue=\"{SIZE_CAP_DEFAULT}\"'")
+    } else {
+        keep("InstanceTypes")
+    });
+    parameters.extend(
+        ["RootVolumeSize", "VpcId", "SubnetIds"]
+            .iter()
+            .map(|name| keep(name)),
+    );
+    format!(
+        "aws cloudformation update-stack --region {region} --stack-name {STACK_NAME} \
+         --template-url {template_url} --capabilities CAPABILITY_IAM --parameters {}",
+        parameters.join(" ")
+    )
+}
 
 /// Whether `region` is one of [`REGIONS`].
 #[must_use]
@@ -114,6 +193,47 @@ mod tests {
     }
 
     #[test]
+    fn the_template_carries_this_version() {
+        let template = include_str!("../../../deploy/cloudformation/connect.yaml");
+        let tag =
+            format!("{{ Key: \"hatchrun:template-version\", Value: \"{TEMPLATE_VERSION}\" }}");
+        assert!(
+            template.contains(&tag),
+            "connect.yaml must tag its launch template with {tag}; bump TEMPLATE_VERSION and \
+             CHANGES with the template"
+        );
+        assert_eq!(
+            CHANGES.last().map(|(version, _)| *version),
+            Some(TEMPLATE_VERSION)
+        );
+        assert!(template.contains(&format!("Default: \"{SIZE_CAP_DEFAULT}\"")));
+    }
+
+    #[test]
+    fn says_what_an_update_brings() {
+        assert_eq!(changes_since(None).len(), 1);
+        assert_eq!(changes_since(Some(1)), changes_since(None));
+        assert_eq!(changes_since(Some(TEMPLATE_VERSION)), Vec::<&str>::new());
+        assert_eq!(
+            stack_console_url("ap-south-1"),
+            "https://ap-south-1.console.aws.amazon.com/cloudformation/home?region=ap-south-1\
+             #/stacks?filteringText=hatchrun&filteringStatus=active&viewNested=true"
+        );
+        let keep = update_command("ap-south-1", "https://t.example/connect.yaml", false);
+        assert!(keep.starts_with(
+            "aws cloudformation update-stack --region ap-south-1 --stack-name hatchrun \
+             --template-url https://t.example/connect.yaml --capabilities CAPABILITY_IAM"
+        ));
+        assert!(keep.contains("ParameterKey=InstanceTypes,UsePreviousValue=true"));
+        assert!(!keep.contains("ExcludedInstanceTypes"));
+        let capped = update_command("ap-south-1", "https://t.example/connect.yaml", true);
+        assert!(capped.contains(&format!(
+            "'ParameterKey=InstanceTypes,ParameterValue=\"{SIZE_CAP_DEFAULT}\"'"
+        )));
+        assert_eq!(capped.matches("UsePreviousValue=true").count(), 6);
+    }
+
+    #[test]
     fn checks_role_arns() {
         let account = "1".repeat(12);
         assert!(valid_role_arn(&format!(
@@ -141,6 +261,7 @@ mod tests {
             volume_size_limit: None,
             root_volume_size: None,
             fleet: false,
+            template_version: None,
         };
         assert_eq!(
             newest(vec![

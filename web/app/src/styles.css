@@ -234,6 +234,40 @@ code {
   background: var(--accent-soft);
 }
 
+.stack-update {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.stack-update p,
+.stack-update ul,
+.stack-update ol {
+  margin: 0;
+}
+
+.stack-update-title {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.stack-changes,
+.stack-steps {
+  padding-left: 1.2rem;
+}
+
+.stack-steps li + li {
+  margin-top: 0.3rem;
+}
+
+.stack-update .break {
+  overflow-wrap: anywhere;
+}
+
+.stack-cli pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 /* Sign-in */
 
 .auth {

@@ -15,7 +15,13 @@ interface MockTenant {
   id: string;
   org: { id: number; login: string; avatarUrl: string };
   installationId: number | null;
-  aws: null | { roleArn: string; region: string; launchTemplateId: string; subnetIds: string[] };
+  aws: null | {
+    roleArn: string;
+    region: string;
+    launchTemplateId: string;
+    subnetIds: string[];
+    stack: ReturnType<typeof oldStack>;
+  };
   maxRunners: number;
   allowedRegions: string[] | null;
   beta: boolean;
@@ -203,7 +209,13 @@ const routes: Record<string, Handler> = {
         },
       ];
     }
-    tenant.aws = { roleArn, region, launchTemplateId: "lt-0a1b2c3d4e5f60718", subnetIds: ["subnet-0aa11", "subnet-0bb22"] };
+    tenant.aws = {
+      roleArn,
+      region,
+      launchTemplateId: "lt-0a1b2c3d4e5f60718",
+      subnetIds: ["subnet-0aa11", "subnet-0bb22"],
+      stack: oldStack(region),
+    };
     return [200, tenantView(tenant)];
   },
   "GET /api/tenants/:org/jobs": (_req, url) => {
@@ -403,4 +415,21 @@ function sampleJobs(now: number) {
       "hatchrun-16cpu asks for a 300 GiB root volume and the connect stack allows at most 200 GiB. Raise VolumeSizeLimit on the stack or ask for less."),
     job(9119, "acme-corp/web", "hatchrun", "completed", "launched", 41, 312),
   ];
+}
+
+// A stack from before the version tag, so the dashboard offers the update.
+function oldStack(region: string) {
+  const templateUrl = "https://hatchrun-templates.s3.us-east-1.amazonaws.com/connect.yaml";
+  return {
+    version: 1,
+    latest: 2,
+    checkedAt: Date.now() - 3_600_000,
+    changes: [
+      "Runners launch through EC2 Fleet, which picks the cheapest instance type with capacity. hatchrun reads which instance types your region offers and what they cost each day. The default limit allows any size up to 8xlarge and refuses GPU, accelerator and bare metal types, instead of naming families.",
+    ],
+    familyList: true,
+    consoleUrl: `https://${region}.console.aws.amazon.com/cloudformation/home?region=${region}#/stacks?filteringText=hatchrun&filteringStatus=active&viewNested=true`,
+    templateUrl,
+    updateCommand: `aws cloudformation update-stack --region ${region} --stack-name hatchrun --template-url ${templateUrl} --capabilities CAPABILITY_IAM --parameters ParameterKey=TenantId,UsePreviousValue=true ParameterKey=OidcProviderArn,UsePreviousValue=true ParameterKey=VolumeSizeLimit,UsePreviousValue=true 'ParameterKey=InstanceTypes,ParameterValue="*.medium,*.large,*.xlarge,*.2xlarge,*.4xlarge,*.8xlarge"' ParameterKey=RootVolumeSize,UsePreviousValue=true ParameterKey=VpcId,UsePreviousValue=true ParameterKey=SubnetIds,UsePreviousValue=true`,
+  };
 }

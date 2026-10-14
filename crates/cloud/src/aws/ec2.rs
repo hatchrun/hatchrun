@@ -47,6 +47,9 @@ pub const TAG_ROOT_VOLUME_SIZE: &str = "hatchrun:root-volume-size";
 /// Tag connect.yaml puts on its launch template when its role may
 /// launch with EC2 Fleet (see [`super::fleet`]), as `true`.
 pub const TAG_FLEET: &str = "hatchrun:fleet";
+/// Tag connect.yaml puts on its launch template with its version (see
+/// [`crate::connect::TEMPLATE_VERSION`]).
+pub const TAG_TEMPLATE_VERSION: &str = "hatchrun:template-version";
 /// Tag with the workflow job id.
 pub const TAG_JOB_ID: &str = "hatchrun:job-id";
 /// Tag with the runner name.
@@ -216,6 +219,8 @@ pub struct LaunchTemplate {
     pub root_volume_size: Option<u16>,
     /// Whether its [`TAG_FLEET`] tag says the role may use EC2 Fleet.
     pub fleet: bool,
+    /// Its [`TAG_TEMPLATE_VERSION`] tag; none on stacks from before it.
+    pub template_version: Option<u32>,
 }
 
 /// Reads the launch templates out of the answer.
@@ -263,6 +268,7 @@ pub fn launch_templates(response: &Response) -> Result<Vec<LaunchTemplate>, Erro
                 volume_size_limit: tag(TAG_VOLUME_SIZE_LIMIT).and_then(|size| size.parse().ok()),
                 root_volume_size: tag(TAG_ROOT_VOLUME_SIZE).and_then(|size| size.parse().ok()),
                 fleet: tag(TAG_FLEET) == Some("true"),
+                template_version: tag(TAG_TEMPLATE_VERSION).and_then(|v| v.parse().ok()),
             })
         })
         .collect()
@@ -530,6 +536,7 @@ mod tests {
         <item><key>hatchrun:volume-size-limit</key><value>500</value></item>
         <item><key>hatchrun:root-volume-size</key><value>40</value></item>
         <item><key>hatchrun:fleet</key><value>true</value></item>
+        <item><key>hatchrun:template-version</key><value>2</value></item>
         <item><key>hatchrun:excluded-instance-types</key><value>g*,*.metal*</value></item>
       </tagSet>
     </item>
@@ -548,6 +555,7 @@ mod tests {
                 volume_size_limit: Some(500),
                 root_volume_size: Some(40),
                 fleet: true,
+                template_version: Some(2),
             }]
         );
         let none = Response {
