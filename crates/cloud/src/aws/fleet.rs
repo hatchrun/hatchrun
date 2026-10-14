@@ -9,9 +9,17 @@
 //!
 //! A fleet takes no user data or block devices of its own, so each
 //! launch first makes a version of the tenant's launch template with the
-//! runner's image, ticket and root volume, launches from that version,
-//! and deletes it after. The template's `$Default` version is never
-//! changed.
+//! runner's image, ticket, root volume and tags, launches from that
+//! version, and deletes it after. The template's `$Default` version is
+//! never changed.
+//!
+//! The instance is tagged through the version, never by the fleet. EC2
+//! authorizes the instances a fleet starts as `RunInstances` calls of
+//! the caller, with the version's metadata options, volumes, instance
+//! type and tags as their condition keys, so the role's `RunInstances`
+//! conditions bind a fleet launch as they bind a direct one. A fleet
+//! that tags instances itself is instead authorized for
+//! `ec2:CreateFleet` on `instance/*` with none of those keys.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -36,8 +44,8 @@ pub struct TemplateVersion<'a> {
     /// Root volume device and size in GiB, to replace the template's
     /// volume size.
     pub root_volume: Option<(&'a str, u16)>,
-    /// Tags for the runner's volumes.
-    pub volume_tags: &'a [(&'a str, &'a str)],
+    /// Tags for the runner's instance and volumes.
+    pub tags: &'a [(&'a str, &'a str)],
     /// Makes a retried call idempotent.
     pub client_token: &'a str,
 }
@@ -81,11 +89,13 @@ impl TemplateVersion<'_> {
             add(&format!("{bdm}.Ebs.Encrypted"), "true");
             add(&format!("{bdm}.Ebs.DeleteOnTermination"), "true");
         }
-        let spec = format!("{data}.TagSpecification.1");
-        add(&format!("{spec}.ResourceType"), "volume");
-        for (at, (key, value)) in self.volume_tags.iter().enumerate() {
-            add(&format!("{spec}.Tag.{}.Key", at + 1), key);
-            add(&format!("{spec}.Tag.{}.Value", at + 1), value);
+        for (spec, resource) in ["instance", "volume"].into_iter().enumerate() {
+            let spec = format!("{data}.TagSpecification.{}", spec + 1);
+            add(&format!("{spec}.ResourceType"), resource);
+            for (at, (key, value)) in self.tags.iter().enumerate() {
+                add(&format!("{spec}.Tag.{}.Key", at + 1), key);
+                add(&format!("{spec}.Tag.{}.Value", at + 1), value);
+            }
         }
         query(endpoint, "CreateLaunchTemplateVersion", VERSION, &params)
     }
@@ -139,8 +149,6 @@ pub struct Fleet<'a> {
     pub overrides: &'a [Override],
     /// Spot rather than on-demand.
     pub spot: bool,
-    /// Tags for the instance.
-    pub tags: &'a [(&'a str, &'a str)],
     /// Makes a retried call idempotent.
     pub client_token: &'a str,
 }
@@ -182,11 +190,6 @@ impl Fleet<'_> {
         } else {
             add("TargetCapacitySpecification.OnDemandTargetCapacity", "1");
             add("OnDemandOptions.AllocationStrategy", "lowest-price");
-        }
-        add("TagSpecification.1.ResourceType", "instance");
-        for (at, (key, value)) in self.tags.iter().enumerate() {
-            add(&format!("TagSpecification.1.Tag.{}.Key", at + 1), key);
-            add(&format!("TagSpecification.1.Tag.{}.Value", at + 1), value);
         }
         query(endpoint, "CreateFleet", VERSION, &params)
     }
@@ -297,7 +300,7 @@ mod tests {
             image_id: "ami-1",
             user_data: "{}",
             root_volume: Some(("/dev/sda1", 100)),
-            volume_tags: &[("hatchrun:tenant", "acme")],
+            tags: &[("hatchrun:tenant", "acme")],
             client_token: "hatchrun-7-ab-v",
         };
         let sent = body(&version.request("https://ec2/"));
@@ -311,8 +314,10 @@ mod tests {
             "LaunchTemplateData.MetadataOptions.HttpTokens=required",
             "LaunchTemplateData.BlockDeviceMapping.1.Ebs.VolumeSize=100",
             "LaunchTemplateData.BlockDeviceMapping.1.Ebs.Encrypted=true",
-            "LaunchTemplateData.TagSpecification.1.ResourceType=volume",
+            "LaunchTemplateData.TagSpecification.1.ResourceType=instance",
             "LaunchTemplateData.TagSpecification.1.Tag.1.Key=hatchrun%3Atenant",
+            "LaunchTemplateData.TagSpecification.2.ResourceType=volume",
+            "LaunchTemplateData.TagSpecification.2.Tag.1.Value=acme",
         ] {
             assert!(sent.contains(part), "{part} in {sent}");
         }
@@ -348,7 +353,6 @@ mod tests {
             version: 12,
             overrides: &overrides,
             spot,
-            tags: &[("Name", "r")],
             client_token: "r-0",
         };
         let on_demand = body(&fleet(false).request("https://ec2/"));
@@ -360,11 +364,12 @@ mod tests {
             "LaunchTemplateConfigs.1.Overrides.2.InstanceType=c8g.xlarge",
             "DefaultTargetCapacityType=on-demand",
             "OnDemandOptions.AllocationStrategy=lowest-price",
-            "TagSpecification.1.ResourceType=instance",
         ] {
             assert!(on_demand.contains(part), "{part} in {on_demand}");
         }
         assert!(!on_demand.contains("Overrides.2.SubnetId"));
+        // Tags travel in the template version, where IAM sees them.
+        assert!(!on_demand.contains("TagSpecification"));
         let spot = body(&fleet(true).request("https://ec2/"));
         assert!(spot.contains("SpotOptions.AllocationStrategy=price-capacity-optimized"));
         assert!(spot.contains("DefaultTargetCapacityType=spot"));

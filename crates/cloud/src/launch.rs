@@ -664,7 +664,7 @@ async fn fleet(db: &D1Database, launch: &Launch<'_>) -> std::result::Result<Stri
                 image_id: &launch.image.image_id,
                 user_data: &launch.user_data,
                 root_volume: launch.root_volume(),
-                volume_tags: &launch.tags(),
+                tags: &launch.tags(),
                 client_token: &client_token,
             }
             .request(&launch.endpoint),
@@ -719,7 +719,6 @@ async fn fleets(
         })
         .collect();
     let subnets = launch.subnets();
-    let tags = launch.tags();
     let mut created = 0;
     let mut last = None;
     for &spot in launch.markets() {
@@ -735,7 +734,6 @@ async fn fleets(
                 version,
                 overrides: &chosen,
                 spot,
-                tags: &tags,
                 client_token: &client_token,
             }
             .request(&launch.endpoint);
