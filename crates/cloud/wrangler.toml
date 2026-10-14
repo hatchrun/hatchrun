@@ -46,6 +46,9 @@ migrations_dir = "migrations"
 APP_URL = "https://app.hatchrun.io"
 # Client id of the hatchrun GitHub App (github.com/apps/hatchrun).
 GITHUB_APP_ID = "Iv23liMh4C066YyxQB7R"
+# Its slug; owners install it at github.com/apps/$GITHUB_APP_SLUG, and
+# its setup URL is $APP_URL/api/github/setup.
+GITHUB_APP_SLUG = "hatchrun"
 # hatchrun-broker (crates/broker), where launches store runner configs.
 # Both Workers share BROKER_TOKEN.
 BROKER_URL = "https://broker.hatchrun.io"

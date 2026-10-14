@@ -4,10 +4,15 @@
 
 import { useEffect, useState } from "react";
 
-import { getSession, type Session } from "./api";
+import { getSession, getTenant, type Session } from "./api";
+import { OrgSwitcher } from "./components/OrgSwitcher";
 import { Shell } from "./components/Shell";
+import { Await } from "./components/Status";
+import { useLoad } from "./load";
 import { Home } from "./pages/Home";
+import { NewOrg } from "./pages/NewOrg";
 import { SignIn } from "./pages/SignIn";
+import { TenantPage } from "./pages/TenantPage";
 import { navigate, useLocation } from "./router";
 
 type State = { kind: "loading" } | { kind: "error"; message: string } | { kind: "ready"; session: Session | null };
@@ -51,9 +56,39 @@ export function App() {
   if (state.session === null) {
     return <SignIn returnTo={path === "/signin" ? "/" : location} />;
   }
+
+  const user = state.session.user;
+  const tenantRoute = /^\/o\/([A-Za-z0-9-]+)(?:\/([a-z]+))?\/?$/.exec(path);
+  if (tenantRoute?.[1]) {
+    return <TenantRoute user={user} org={tenantRoute[1]} />;
+  }
   return (
-    <Shell user={state.session.user}>
-      <Home user={state.session.user} />
+    <Shell user={user}>
+      {path === "/new" ? <NewOrg /> : path === "/" ? <Home /> : <NotFound />}
     </Shell>
+  );
+}
+
+function TenantRoute({ user, org }: { user: Session["user"]; org: string }) {
+  const [tenant, reload] = useLoad(() => getTenant(org), org);
+  const current =
+    tenant.state === "ready"
+      ? tenant.data.org
+      : { login: org, avatarUrl: "" };
+  return (
+    <Shell user={user} nav={<OrgSwitcher current={current} />}>
+      <Await loaded={tenant} retry={reload}>
+        {(data) => <TenantPage tenant={data} />}
+      </Await>
+    </Shell>
+  );
+}
+
+function NotFound() {
+  return (
+    <section className="narrow">
+      <h1>Nothing here</h1>
+      <p className="muted">That page does not exist.</p>
+    </section>
   );
 }

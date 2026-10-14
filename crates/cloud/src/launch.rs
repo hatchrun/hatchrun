@@ -39,7 +39,7 @@ use crate::{DB, github, instance, int, jwt, now_ms, oidc, webcrypto};
 /// Variable with the App's client id.
 const APP_ID: &str = "GITHUB_APP_ID";
 /// Secret with the App's private key in PEM.
-const APP_KEY: &str = "GITHUB_APP_PRIVATE_KEY";
+pub(crate) const APP_KEY: &str = "GITHUB_APP_PRIVATE_KEY";
 /// Variable with the broker URL instances claim their config from.
 const BROKER_URL: &str = "BROKER_URL";
 /// Secret with the broker's token for storing configs.
@@ -134,13 +134,18 @@ async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
     let tenant: Option<Tenant> = db
         .prepare(
             "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners \
-             FROM tenants WHERE installation_id = ?1",
+             FROM tenants WHERE installation_id = ?1 AND role_arn IS NOT NULL \
+             AND region IS NOT NULL AND launch_template_id IS NOT NULL \
+             AND subnet_ids IS NOT NULL",
         )
         .bind(&[int(job.installation_id)?])?
         .first(None)
         .await?;
     let Some(tenant) = tenant else {
-        let reason = format!("installation {} has no tenant", job.installation_id);
+        let reason = format!(
+            "installation {} has no tenant with AWS connected",
+            job.installation_id
+        );
         db.prepare(
             "UPDATE jobs SET launch_state = 'failed', launch_error = ?2, updated_at = ?3 \
              WHERE id = ?1 AND launch_state IS NULL",
@@ -406,16 +411,18 @@ async fn installation_token(
     settings: &Settings,
     installation_id: u64,
 ) -> std::result::Result<String, String> {
-    let input = github::app_jwt_signing_input(&settings.app_id, now_ms() / 1000);
-    let signature = webcrypto::sign_rs256(&settings.app_key, input.as_bytes())
+    let app_jwt = app_jwt(&settings.app_id, &settings.app_key).await?;
+    let request = github::installation_token(&settings.github_api, installation_id, &app_jwt);
+    github::token(&send(&request).await?)
+}
+
+/// The App's JWT, signed with its private key in PKCS#8 DER.
+pub(crate) async fn app_jwt(app_id: &str, pkcs8: &[u8]) -> std::result::Result<String, String> {
+    let input = github::app_jwt_signing_input(app_id, now_ms() / 1000);
+    let signature = webcrypto::sign_rs256(pkcs8, input.as_bytes())
         .await
         .map_err(|err| format!("sign App JWT: {err}"))?;
-    let request = github::installation_token(
-        &settings.github_api,
-        installation_id,
-        &jwt::token(&input, &signature),
-    );
-    github::token(&send(&request).await?)
+    Ok(jwt::token(&input, &signature))
 }
 
 /// Stores the config under the ticket, retrying while the broker is busy.
