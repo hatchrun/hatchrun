@@ -201,9 +201,6 @@ Resources:
   # labels. Runners get no instance profile: the agent claims its runner
   # config from the hatchrun.io broker with a one-time ticket in user
   # data, and jobs that need AWS use GitHub's OIDC.
-  # The tags let hatchrun.io find this template, the subnets runners
-  # launch into and the limits above from the role alone, so the app
-  # offers only runners the role can launch.
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -211,22 +208,6 @@ Resources:
         - ResourceType: launch-template
           Tags:
             - { Key: "hatchrun:tenant", Value: !Ref TenantId }
-            - Key: "hatchrun:subnets"
-              Value: !If
-                - CreateVpc
-                - !Join [",", [!Ref SubnetA, !Ref SubnetB]]
-                - !Join [",", !Ref SubnetIds]
-            - { Key: "hatchrun:instance-types", Value: !Join [",", !Ref InstanceTypes] }
-            - Key: "hatchrun:excluded-instance-types"
-              Value: !Join [",", !Ref ExcludedInstanceTypes]
-            - { Key: "hatchrun:volume-size-limit", Value: !Ref VolumeSizeLimit }
-            - { Key: "hatchrun:root-volume-size", Value: !Ref RootVolumeSize }
-            # The role below may launch with EC2 Fleet.
-            - { Key: "hatchrun:fleet", Value: "true" }
-            # Bumped with crates/cloud/src/connect.rs TEMPLATE_VERSION on
-            # every change to this template, so the app can tell owners
-            # of older stacks to update.
-            - { Key: "hatchrun:template-version", Value: "3" }
       LaunchTemplateData:
         SecurityGroupIds: [!Ref RunnerSecurityGroup]
         InstanceInitiatedShutdownBehavior: terminate
@@ -250,6 +231,29 @@ Resources:
   # volume limits above, and stop, start, retag or terminate only the
   # instances it launched. The conditions keep the launch template's
   # metadata and encryption settings from being overridden at launch.
+  # What hatchrun.io reads through the role: this template, the subnets
+  # runners launch into and the limits above, so the app offers only
+  # runners the role can launch. A parameter because CloudFormation
+  # rewrites it on every stack update, while the tags of a launch
+  # template keep the values the stack was created with. "version" is
+  # bumped with crates/cloud/src/connect.rs TEMPLATE_VERSION on every
+  # change to this template, so the app can tell owners of older stacks
+  # to update.
+  StackSettings:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /hatchrun/connect/${TenantId}
+      Type: String
+      Description: What the hatchrun connect stack allows; hatchrun.io reads it through the role.
+      Value: !Sub
+        - '{"version":4,"launchTemplateId":"${LaunchTemplate}","subnets":"${Subnets}","instanceTypes":"${Types}","excludedInstanceTypes":"${Excluded}","volumeSizeLimit":${VolumeSizeLimit},"rootVolumeSize":${RootVolumeSize},"fleet":true}'
+        - Subnets: !If
+            - CreateVpc
+            - !Join [",", [!Ref SubnetA, !Ref SubnetB]]
+            - !Join [",", !Ref SubnetIds]
+          Types: !Join [",", !Ref InstanceTypes]
+          Excluded: !Join [",", !Ref ExcludedInstanceTypes]
+
   ControlPlaneRole:
     Type: AWS::IAM::Role
     Properties:
@@ -271,20 +275,23 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # Describing the launch template and subnets lets the
-              # hatchrun.io app check the stack before saving it; the
-              # instance types, their offerings and Spot prices fill
-              # its daily catalog of what the region offers.
+              # Describing the subnets lets the hatchrun.io app check the
+              # stack before saving it; the instance types, their
+              # offerings and Spot prices fill its daily catalog of what
+              # the region offers.
               - Sid: List
                 Effect: Allow
                 Action:
                   - ec2:DescribeInstances
                   - ec2:DescribeInstanceTypeOfferings
                   - ec2:DescribeInstanceTypes
-                  - ec2:DescribeLaunchTemplates
                   - ec2:DescribeSpotPriceHistory
                   - ec2:DescribeSubnets
                 Resource: "*"
+              - Sid: ReadSettings
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/hatchrun/connect/${TenantId}"
               # Instances only through RunInstances, which is also how EC2
               # authorizes each instance a fleet starts, with the launch
               # template version's settings as the condition keys.

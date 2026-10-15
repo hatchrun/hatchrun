@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! The few AWS calls the Worker makes, over the Query API.
+//! The few AWS calls the Worker makes, over the Query API and, for
+//! [`ssm`], JSON.
 //!
 //! aws-sdk does not build for wasm, so requests are built here as
 //! [`crate::http::Request`]s, signed with `SigV4` by `aws-sigv4`, and the
@@ -12,6 +13,7 @@ pub mod describe;
 pub mod ec2;
 pub mod fleet;
 pub mod instances;
+pub mod ssm;
 pub mod sts;
 
 use std::time::{Duration, SystemTime};

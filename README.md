@@ -297,19 +297,22 @@ an image of a product the account has not subscribed to, with
 `OptInRequired`, and the job says where to subscribe. A Launch Stack
 link per region opens the published `connect.yaml` with the tenant id
 filled in; the owner pastes the stack's `RoleArn` output back. The Worker assumes the
-role with a token for the tenant, finds the stack's launch template by
-its `hatchrun:tenant` tag and the subnets on its `hatchrun:subnets`
-tag, checks they exist, and only then saves them.
+role with a token for the tenant, reads what the stack allows (its
+launch template, subnets and instance type limits) from the SSM
+parameter `/hatchrun/connect/<tenant id>`, checks the subnets exist, and
+only then saves them. The settings live in a parameter because
+CloudFormation rewrites it on every stack update; tags on a launch
+template keep the values the stack was created with.
 
-Published stacks do not change when `connect.yaml` does. The template
-tags its launch template with `hatchrun:template-version`; a change to
-the template bumps that tag and `TEMPLATE_VERSION` in
+Published stacks do not change when `connect.yaml` does. The settings
+parameter carries the template's `version`; a change to the template
+bumps it and `TEMPLATE_VERSION` in
 [`connect.rs`](crates/cloud/src/connect.rs) together (a test fails
 otherwise) and adds what the version brings to `CHANGES`. The
 dashboard of a tenant on an older stack, or one still limited by the
 old family list, says what an update brings and how to apply it in the
-console or with the AWS CLI. The reconciler reads each tenant's launch
-template again once a day, so an updated stack is picked up without
+console or with the AWS CLI. The reconciler reads each tenant's stack
+settings again once a day, so an updated stack is picked up without
 anyone verifying the role again, and jobs waiting on the setup launch.
 
 [`publish-template.yml`](.github/workflows/publish-template.yml)

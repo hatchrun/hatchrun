@@ -32,24 +32,6 @@ pub const CAPACITY_ERRORS: &[&str] = &[
 /// Tag with the tenant id; the role only launches and manages instances
 /// that carry it.
 pub const TAG_TENANT: &str = "hatchrun:tenant";
-/// Tag connect.yaml puts on its launch template with the subnets runners
-/// launch into, comma separated, so the app finds them from the role.
-pub const TAG_SUBNETS: &str = "hatchrun:subnets";
-/// Tags connect.yaml puts on its launch template with its
-/// `InstanceTypes`, `VolumeSizeLimit` and `RootVolumeSize` parameters.
-pub const TAG_INSTANCE_TYPES: &str = "hatchrun:instance-types";
-/// Tag with the stack's `ExcludedInstanceTypes` parameter.
-pub const TAG_EXCLUDED_INSTANCE_TYPES: &str = "hatchrun:excluded-instance-types";
-/// See [`TAG_INSTANCE_TYPES`].
-pub const TAG_VOLUME_SIZE_LIMIT: &str = "hatchrun:volume-size-limit";
-/// See [`TAG_INSTANCE_TYPES`].
-pub const TAG_ROOT_VOLUME_SIZE: &str = "hatchrun:root-volume-size";
-/// Tag connect.yaml puts on its launch template when its role may
-/// launch with EC2 Fleet (see [`super::fleet`]), as `true`.
-pub const TAG_FLEET: &str = "hatchrun:fleet";
-/// Tag connect.yaml puts on its launch template with its version (see
-/// [`crate::connect::TEMPLATE_VERSION`]).
-pub const TAG_TEMPLATE_VERSION: &str = "hatchrun:template-version";
 /// Tag with the workflow job id.
 pub const TAG_JOB_ID: &str = "hatchrun:job-id";
 /// Tag with the runner name.
@@ -183,95 +165,6 @@ pub fn terminated(response: &Response) -> Result<(), Error> {
         Err(err) if err.code == "InvalidInstanceID.NotFound" => Ok(()),
         Err(err) => Err(err),
     }
-}
-
-/// The launch templates of `tenant`'s stack, found by their
-/// [`TAG_TENANT`] tag.
-#[must_use]
-pub fn describe_launch_templates(endpoint: &str, tenant: &str) -> Request {
-    query(
-        endpoint,
-        "DescribeLaunchTemplates",
-        VERSION,
-        &[
-            ("Filter.1.Name".to_owned(), format!("tag:{TAG_TENANT}")),
-            ("Filter.1.Value.1".to_owned(), tenant.to_owned()),
-        ],
-    )
-}
-
-/// A launch template of a tenant's stack.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaunchTemplate {
-    /// `lt-...`
-    pub id: String,
-    /// When it was made, ISO 8601; the newest stack wins.
-    pub created: String,
-    /// The subnets from its [`TAG_SUBNETS`] tag, in order.
-    pub subnets: Vec<String>,
-    /// Its [`TAG_INSTANCE_TYPES`] tag; none on templates from before it.
-    pub instance_types: Option<String>,
-    /// Its [`TAG_EXCLUDED_INSTANCE_TYPES`] tag.
-    pub excluded_instance_types: Option<String>,
-    /// Its [`TAG_VOLUME_SIZE_LIMIT`] tag.
-    pub volume_size_limit: Option<u16>,
-    /// Its [`TAG_ROOT_VOLUME_SIZE`] tag.
-    pub root_volume_size: Option<u16>,
-    /// Whether its [`TAG_FLEET`] tag says the role may use EC2 Fleet.
-    pub fleet: bool,
-    /// Its [`TAG_TEMPLATE_VERSION`] tag; none on stacks from before it.
-    pub template_version: Option<u32>,
-}
-
-/// Reads the launch templates out of the answer.
-///
-/// # Errors
-///
-/// EC2's error, or a malformed answer.
-pub fn launch_templates(response: &Response) -> Result<Vec<LaunchTemplate>, Error> {
-    let doc = document(response)?;
-    let Some(set) = doc
-        .descendants()
-        .find(|node| node.tag_name().name() == "launchTemplates")
-    else {
-        return Ok(Vec::new());
-    };
-    set.children()
-        .filter(|node| node.tag_name().name() == "item")
-        .map(|item| {
-            let field = |name: &str| {
-                item.children()
-                    .find(|child| child.tag_name().name() == name)
-                    .and_then(|child| child.text())
-            };
-            let tag = |key: &str| {
-                item.descendants()
-                    .filter(|node| node.tag_name().name() == "item")
-                    .find(|tag| child_text(*tag, "key") == Some(key))
-                    .and_then(|tag| child_text(tag, "value"))
-            };
-            let subnets = tag(TAG_SUBNETS)
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|subnet| !subnet.is_empty())
-                .map(str::to_owned)
-                .collect();
-            Ok(LaunchTemplate {
-                id: field("launchTemplateId")
-                    .ok_or_else(|| Error::malformed("launch template without an id"))?
-                    .to_owned(),
-                created: field("createTime").unwrap_or_default().to_owned(),
-                subnets,
-                instance_types: tag(TAG_INSTANCE_TYPES).map(str::to_owned),
-                excluded_instance_types: tag(TAG_EXCLUDED_INSTANCE_TYPES).map(str::to_owned),
-                volume_size_limit: tag(TAG_VOLUME_SIZE_LIMIT).and_then(|size| size.parse().ok()),
-                root_volume_size: tag(TAG_ROOT_VOLUME_SIZE).and_then(|size| size.parse().ok()),
-                fleet: tag(TAG_FLEET) == Some("true"),
-                template_version: tag(TAG_TEMPLATE_VERSION).and_then(|v| v.parse().ok()),
-            })
-        })
-        .collect()
 }
 
 /// The subnets named `ids`.
@@ -512,59 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_stacks_launch_template_and_subnets() {
-        let request = describe_launch_templates("https://ec2.eu-west-1.amazonaws.com/", "abc12345");
-        assert_eq!(
-            String::from_utf8(request.body).unwrap(),
-            "Action=DescribeLaunchTemplates&Version=2016-11-15\
-             &Filter.1.Name=tag%3Ahatchrun%3Atenant&Filter.1.Value.1=abc12345"
-        );
-        let answer = Response {
-            status: 200,
-            body: br#"<DescribeLaunchTemplatesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
-  <requestId>r</requestId>
-  <launchTemplates>
-    <item>
-      <createTime>2026-10-14T10:00:00.000Z</createTime>
-      <defaultVersionNumber>1</defaultVersionNumber>
-      <launchTemplateId>lt-0abc</launchTemplateId>
-      <launchTemplateName>LaunchTemplate-x</launchTemplateName>
-      <tagSet>
-        <item><key>hatchrun:tenant</key><value>abc12345</value></item>
-        <item><key>hatchrun:subnets</key><value>subnet-a, subnet-b</value></item>
-        <item><key>hatchrun:instance-types</key><value>m8g.*,c7i.large</value></item>
-        <item><key>hatchrun:volume-size-limit</key><value>500</value></item>
-        <item><key>hatchrun:root-volume-size</key><value>40</value></item>
-        <item><key>hatchrun:fleet</key><value>true</value></item>
-        <item><key>hatchrun:template-version</key><value>2</value></item>
-        <item><key>hatchrun:excluded-instance-types</key><value>g*,*.metal*</value></item>
-      </tagSet>
-    </item>
-  </launchTemplates>
-</DescribeLaunchTemplatesResponse>"#
-                .to_vec(),
-        };
-        assert_eq!(
-            launch_templates(&answer).unwrap(),
-            [LaunchTemplate {
-                id: "lt-0abc".to_owned(),
-                created: "2026-10-14T10:00:00.000Z".to_owned(),
-                subnets: vec!["subnet-a".to_owned(), "subnet-b".to_owned()],
-                instance_types: Some("m8g.*,c7i.large".to_owned()),
-                excluded_instance_types: Some("g*,*.metal*".to_owned()),
-                volume_size_limit: Some(500),
-                root_volume_size: Some(40),
-                fleet: true,
-                template_version: Some(2),
-            }]
-        );
-        let none = Response {
-            status: 200,
-            body: b"<DescribeLaunchTemplatesResponse><launchTemplates/></DescribeLaunchTemplatesResponse>"
-                .to_vec(),
-        };
-        assert_eq!(launch_templates(&none).unwrap(), []);
-
+    fn finds_the_subnets() {
         let request = describe_subnets(
             "https://ec2.eu-west-1.amazonaws.com/",
             &["subnet-a".to_owned(), "subnet-b".to_owned()],

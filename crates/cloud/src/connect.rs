@@ -8,19 +8,21 @@
 //!
 //! The owner opens a link for a region, which fills in the tenant id,
 //! creates the stack and pastes its `RoleArn` output into the app. The
-//! Worker then assumes the role with a token for the tenant, finds the
-//! stack's launch template by its `hatchrun:tenant` tag, checks that the
-//! subnets on its `hatchrun:subnets` tag exist, and only then saves the
+//! Worker then assumes the role with a token for the tenant, reads what
+//! the stack allows from its settings parameter ([`parameter_name`]),
+//! checks that the subnets there exist, and only then saves the
 //! connection.
 //!
-//! connect.yaml carries its version in the `hatchrun:template-version`
-//! tag of the launch template. When a release changes the template,
+//! The parameter holds a [`Stack`] as JSON, rewritten on every stack
+//! update; tags on the launch template, where these settings lived
+//! before version 4, keep the values the stack was created with. When a release changes connect.yaml,
 //! [`TEMPLATE_VERSION`] goes up with it and [`CHANGES`] says what the
 //! new version brings; the app tells owners of older stacks to update,
-//! and the reconciler reads the tags again daily, so an updated stack is
-//! picked up without anyone verifying the role again.
+//! and the reconciler reads the parameter again daily, so an updated
+//! stack is picked up without anyone verifying the role again.
 
-use crate::aws::ec2::LaunchTemplate;
+use serde::Deserialize;
+
 use crate::http::encode;
 
 /// Regions a tenant can connect, with their names. Each needs runner
@@ -49,9 +51,9 @@ pub const REGIONS: [(&str, &str); 17] = [
 pub const STACK_NAME: &str = "hatchrun";
 
 /// The version of deploy/cloudformation/connect.yaml in this release,
-/// as its launch template's `hatchrun:template-version` tag says. A
-/// stack from before the tag is version 1.
-pub const TEMPLATE_VERSION: u32 = 3;
+/// as its settings parameter says. A stack from before the version was
+/// recorded is version 1.
+pub const TEMPLATE_VERSION: u32 = 4;
 
 /// What each version of connect.yaml brings, in words for the owner.
 pub const CHANGES: &[(u32, &str)] = &[
@@ -67,6 +69,12 @@ pub const CHANGES: &[(u32, &str)] = &[
         "Runners launch from the hatchrun images in AWS Marketplace. Subscribe this \
          account to the amd64 and arm64 images once, then update the stack; until then \
          runners do not start.",
+    ),
+    (
+        4,
+        "The stack keeps its settings in a Systems Manager parameter that hatchrun reads, \
+         so later stack updates, such as new instance type limits, take effect. Until you \
+         update, hatchrun cannot read this stack and runners do not start.",
     ),
 ];
 
@@ -190,13 +198,56 @@ pub fn valid_role_arn(arn: &str) -> bool {
         })
 }
 
-/// The launch template to use: the newest of the tenant's stacks in the
-/// region.
+/// The settings parameter of `tenant`'s connect stack in a region.
 #[must_use]
-pub fn newest(templates: Vec<LaunchTemplate>) -> Option<LaunchTemplate> {
-    templates
-        .into_iter()
-        .max_by(|a, b| a.created.cmp(&b.created))
+pub fn parameter_name(tenant: &str) -> String {
+    format!("/hatchrun/connect/{tenant}")
+}
+
+/// What a tenant's connect stack allows, as its settings parameter
+/// says.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Stack {
+    /// The connect.yaml version the stack runs.
+    pub version: u32,
+    /// The launch template runners start from, `lt-...`.
+    pub launch_template_id: String,
+    /// The subnets runners launch into, in the order to try them.
+    #[serde(deserialize_with = "comma_list")]
+    pub subnets: Vec<String>,
+    /// The `InstanceTypes` parameter, comma separated patterns.
+    pub instance_types: String,
+    /// The `ExcludedInstanceTypes` parameter, comma separated patterns.
+    pub excluded_instance_types: String,
+    /// The `VolumeSizeLimit` parameter, GiB.
+    pub volume_size_limit: u16,
+    /// The `RootVolumeSize` parameter, GiB.
+    pub root_volume_size: u16,
+    /// Whether the role may launch with EC2 Fleet.
+    pub fleet: bool,
+}
+
+impl Stack {
+    /// Reads the settings parameter's value.
+    ///
+    /// # Errors
+    ///
+    /// When the value is not a stack's settings.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        serde_json::from_str(value).map_err(|err| format!("stack settings: {err}"))
+    }
+}
+
+/// The stack joins its list parameters with commas.
+fn comma_list<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let joined = String::deserialize(deserializer)?;
+    Ok(joined
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 #[cfg(test)]
@@ -233,12 +284,11 @@ mod tests {
     #[test]
     fn the_template_carries_this_version() {
         let template = include_str!("../../../deploy/cloudformation/connect.yaml");
-        let tag =
-            format!("{{ Key: \"hatchrun:template-version\", Value: \"{TEMPLATE_VERSION}\" }}");
+        let version = format!("{{\"version\":{TEMPLATE_VERSION},");
         assert!(
-            template.contains(&tag),
-            "connect.yaml must tag its launch template with {tag}; bump TEMPLATE_VERSION and \
-             CHANGES with the template"
+            template.contains(&version),
+            "connect.yaml's settings parameter must start with {version}; bump \
+             TEMPLATE_VERSION and CHANGES with the template"
         );
         assert_eq!(
             CHANGES.last().map(|(version, _)| *version),
@@ -249,7 +299,7 @@ mod tests {
 
     #[test]
     fn says_what_an_update_brings() {
-        assert_eq!(changes_since(None).len(), 2);
+        assert_eq!(changes_since(None).len(), 3);
         assert_eq!(changes_since(Some(1)), changes_since(None));
         assert_eq!(changes_since(Some(TEMPLATE_VERSION)), Vec::<&str>::new());
         assert_eq!(
@@ -289,27 +339,53 @@ mod tests {
     }
 
     #[test]
-    fn picks_the_newest_stack() {
-        let template = |id: &str, created: &str| LaunchTemplate {
-            id: id.to_owned(),
-            created: created.to_owned(),
-            subnets: Vec::new(),
-            instance_types: None,
-            excluded_instance_types: None,
-            volume_size_limit: None,
-            root_volume_size: None,
-            fleet: false,
-            template_version: None,
-        };
+    fn reads_the_stack_settings() {
+        let value = r#"{"version":4,"launchTemplateId":"lt-0abc","subnets":"subnet-a, subnet-b",
+            "instanceTypes":"*.large,*.xlarge","excludedInstanceTypes":"","volumeSizeLimit":500,
+            "rootVolumeSize":40,"fleet":true}"#;
         assert_eq!(
-            newest(vec![
-                template("lt-old", "2026-01-01T00:00:00.000Z"),
-                template("lt-new", "2026-10-01T00:00:00.000Z"),
-            ])
-            .unwrap()
-            .id,
-            "lt-new"
+            Stack::parse(value).unwrap(),
+            Stack {
+                version: 4,
+                launch_template_id: "lt-0abc".to_owned(),
+                subnets: vec!["subnet-a".to_owned(), "subnet-b".to_owned()],
+                instance_types: "*.large,*.xlarge".to_owned(),
+                excluded_instance_types: String::new(),
+                volume_size_limit: 500,
+                root_volume_size: 40,
+                fleet: true,
+            }
         );
-        assert_eq!(newest(Vec::new()), None);
+        assert!(Stack::parse(r#"{"version":4}"#).is_err());
+        assert!(Stack::parse(&value.replace("\"fleet\":true", "\"fleet\":true,\"x\":1")).is_err());
+        assert_eq!(parameter_name("abc"), "/hatchrun/connect/abc");
+    }
+
+    #[test]
+    fn the_template_writes_settings_this_release_reads() {
+        let template = include_str!("../../../deploy/cloudformation/connect.yaml");
+        let line = template
+            .lines()
+            .find(|line| line.contains(r#"'{"version":"#))
+            .expect("connect.yaml has a settings parameter");
+        let mut value = line
+            .trim()
+            .trim_start_matches("- ")
+            .trim_matches('\'')
+            .to_owned();
+        for (name, sample) in [
+            ("LaunchTemplate", "lt-0abc"),
+            ("Subnets", "subnet-a,subnet-b"),
+            ("Types", "*.large"),
+            ("Excluded", "g*,*.metal*"),
+            ("VolumeSizeLimit", "500"),
+            ("RootVolumeSize", "40"),
+        ] {
+            value = value.replace(&format!("${{{name}}}"), sample);
+        }
+        let stack = Stack::parse(&value).unwrap();
+        assert_eq!(stack.version, TEMPLATE_VERSION);
+        assert_eq!(stack.subnets, ["subnet-a", "subnet-b"]);
+        assert!(stack.fleet);
     }
 }
