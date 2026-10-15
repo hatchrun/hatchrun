@@ -319,16 +319,17 @@ Resources:
                     ec2:Encrypted: "true"
                   NumericLessThanEquals:
                     ec2:VolumeSize: !Ref VolumeSizeLimit
-              # The hatchrun runner images come from AWS Marketplace, whose
-              # copies one account owns in every region. EC2 also refuses
-              # an image of a product this account has not subscribed to.
+              # The hatchrun runner images come from AWS Marketplace. EC2
+              # gives every Marketplace image the owner aws-marketplace in
+              # this key, and refuses an image of a product this account
+              # has not subscribed to.
               - Sid: LaunchImages
                 Effect: Allow
                 Action: [ec2:RunInstances, ec2:CreateFleet]
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
                 Condition:
                   StringEquals:
-                    ec2:Owner: "000000000000" # image-owner
+                    ec2:Owner: aws-marketplace
               - Sid: LaunchNetwork
                 Effect: Allow
                 Action: [ec2:RunInstances, ec2:CreateFleet]

@@ -313,12 +313,11 @@ template again once a day, so an updated stack is picked up without
 anyone verifying the role again, and jobs waiting on the setup launch.
 
 [`publish-template.yml`](.github/workflows/publish-template.yml)
-renders `connect.yaml` with the image owner account (the AWS
-Marketplace account that owns the runner images' copies) and uploads
-it on every change merged to main. It needs, once, the bucket and role from
+uploads `connect.yaml` on every change merged to main. It needs, once,
+the bucket and role from
 [`templates-bucket.yaml`](deploy/cloudformation/templates-bucket.yaml),
-the `TEMPLATES_ROLE_ARN` and `IMAGE_OWNER_ACCOUNT_ID` secrets and the
-`TEMPLATES_BUCKET` variable in the `production` environment, and the
+the `TEMPLATES_ROLE_ARN` secret and the `TEMPLATES_BUCKET` variable in
+the `production` environment, and the
 bucket's `TemplateUrl` output as `CONNECT_TEMPLATE_URL` in
 `wrangler.toml`:
 
