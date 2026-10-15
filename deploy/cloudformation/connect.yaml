@@ -226,7 +226,7 @@ Resources:
             # Bumped with crates/cloud/src/connect.rs TEMPLATE_VERSION on
             # every change to this template, so the app can tell owners
             # of older stacks to update.
-            - { Key: "hatchrun:template-version", Value: "2" }
+            - { Key: "hatchrun:template-version", Value: "3" }
       LaunchTemplateData:
         SecurityGroupIds: [!Ref RunnerSecurityGroup]
         InstanceInitiatedShutdownBehavior: terminate
@@ -245,7 +245,7 @@ Resources:
               Encrypted: true
               DeleteOnTermination: true
 
-  # What hatchrun.io may do here: launch hatchrun images from this
+  # What hatchrun.io may do here: launch AWS Marketplace images from this
   # stack's launch template into this VPC, within the instance type and
   # volume limits above, and stop, start, retag or terminate only the
   # instances it launched. The conditions keep the launch template's
@@ -319,6 +319,9 @@ Resources:
                     ec2:Encrypted: "true"
                   NumericLessThanEquals:
                     ec2:VolumeSize: !Ref VolumeSizeLimit
+              # The hatchrun runner images come from AWS Marketplace, whose
+              # copies one account owns in every region. EC2 also refuses
+              # an image of a product this account has not subscribed to.
               - Sid: LaunchImages
                 Effect: Allow
                 Action: [ec2:RunInstances, ec2:CreateFleet]

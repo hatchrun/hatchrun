@@ -58,14 +58,32 @@ function Steps({
     <div className="substeps">
       <p>
         Runners start in your AWS account, so you control the network, see every instance and pay
-        AWS directly. A CloudFormation stack gives hatchrun a role that can only launch hatchrun
-        images from its own launch template and manage the instances it started. No access keys
-        are created.
+        AWS directly. A CloudFormation stack gives hatchrun a role that can only launch AWS
+        Marketplace images your account subscribed to, from its own launch template, and manage
+        the instances it started. No access keys are created.
       </p>
 
       <section className="substep">
         <h3>
-          <span className="substep-number">1</span>Create the stack
+          <span className="substep-number">1</span>Subscribe to the runner images
+        </h3>
+        <p>
+          The runner images are free in AWS Marketplace; you pay AWS only for the instances. Subscribe
+          this account to both once, signed in to the account you connect.
+        </p>
+        <p className="inline-actions">
+          <a className="button" href={instructions.marketplace.amd64} target="_blank" rel="noreferrer">
+            Subscribe to amd64
+          </a>
+          <a className="button" href={instructions.marketplace.arm64} target="_blank" rel="noreferrer">
+            Subscribe to arm64
+          </a>
+        </p>
+      </section>
+
+      <section className="substep">
+        <h3>
+          <span className="substep-number">2</span>Create the stack
         </h3>
         <div className="field">
           <label htmlFor="aws-region">Region</label>
@@ -105,9 +123,10 @@ function Steps({
           <ul>
             <li>An IAM OIDC provider for oidc.hatchrun.io, once per account.</li>
             <li>
-              A role hatchrun assumes with a five-minute token for your tenant. It can launch hatchrun
-              images, of the instance types and volume sizes you allow, and stop or terminate only the
-              instances it launched. Runner profiles offer only those types and sizes.
+              A role hatchrun assumes with a five-minute token for your tenant. It can launch AWS
+              Marketplace images your account subscribed to, of the instance types and volume sizes you
+              allow, and stop or terminate only the instances it launched. Runner profiles offer only
+              those types and sizes.
             </li>
             <li>A launch template with IMDSv2 and encrypted volumes.</li>
             <li>
@@ -125,7 +144,7 @@ function Steps({
 
       <section className="substep">
         <h3>
-          <span className="substep-number">2</span>Paste the role
+          <span className="substep-number">3</span>Paste the role
         </h3>
         <form onSubmit={verify}>
           <div className="field">

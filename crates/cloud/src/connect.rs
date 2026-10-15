@@ -24,7 +24,7 @@ use crate::aws::ec2::LaunchTemplate;
 use crate::http::encode;
 
 /// Regions a tenant can connect, with their names. Each needs runner
-/// images, which the images pipeline copies to every region.
+/// images, which AWS Marketplace serves in every region.
 pub const REGIONS: [(&str, &str); 17] = [
     ("us-east-1", "US East (N. Virginia)"),
     ("us-east-2", "US East (Ohio)"),
@@ -51,16 +51,24 @@ pub const STACK_NAME: &str = "hatchrun";
 /// The version of deploy/cloudformation/connect.yaml in this release,
 /// as its launch template's `hatchrun:template-version` tag says. A
 /// stack from before the tag is version 1.
-pub const TEMPLATE_VERSION: u32 = 2;
+pub const TEMPLATE_VERSION: u32 = 3;
 
 /// What each version of connect.yaml brings, in words for the owner.
-pub const CHANGES: &[(u32, &str)] = &[(
-    2,
-    "Runners launch through EC2 Fleet, which picks the cheapest instance type with \
-     capacity. hatchrun reads which instance types your region offers and what they cost \
-     each day. The default limit allows any size up to 8xlarge and refuses GPU, \
-     accelerator and bare metal types, instead of naming families.",
-)];
+pub const CHANGES: &[(u32, &str)] = &[
+    (
+        2,
+        "Runners launch through EC2 Fleet, which picks the cheapest instance type with \
+         capacity. hatchrun reads which instance types your region offers and what they \
+         cost each day. The default limit allows any size up to 8xlarge and refuses GPU, \
+         accelerator and bare metal types, instead of naming families.",
+    ),
+    (
+        3,
+        "Runners launch from the hatchrun images in AWS Marketplace. Subscribe this \
+         account to the amd64 and arm64 images once, then update the stack; until then \
+         runners do not start.",
+    ),
+];
 
 /// The `InstanceTypes` default of connect.yaml before version 2, which
 /// names families; a stack updated with its previous values keeps it.
@@ -117,6 +125,26 @@ pub fn update_command(region: &str, template_url: &str, size_cap: bool) -> Strin
         "aws cloudformation update-stack --region {region} --stack-name {STACK_NAME} \
          --template-url {template_url} --capabilities CAPABILITY_IAM --parameters {}",
         parameters.join(" ")
+    )
+}
+
+/// Variable with the AWS Marketplace page of the amd64 runner image,
+/// where an account subscribes to it.
+pub const MARKETPLACE_AMD64_URL: &str = "MARKETPLACE_AMD64_URL";
+/// The same for the arm64 image.
+pub const MARKETPLACE_ARM64_URL: &str = "MARKETPLACE_ARM64_URL";
+
+/// The code EC2 refuses a launch with when the account has not
+/// subscribed to the image's AWS Marketplace product.
+pub const NOT_SUBSCRIBED: &str = "OptInRequired";
+
+/// What a launch refused with [`NOT_SUBSCRIBED`] tells the owner: where
+/// to subscribe to the `arch` image and how to launch again after.
+#[must_use]
+pub fn subscribe_message(arch: &str, url: &str) -> String {
+    format!(
+        "This AWS account has not subscribed to the hatchrun {arch} runner image. Subscribe \
+         once, for free, at {url}, then verify the AWS role to launch the waiting jobs."
     )
 }
 
@@ -193,6 +221,16 @@ mod tests {
     }
 
     #[test]
+    fn tells_where_to_subscribe() {
+        assert_eq!(
+            subscribe_message("arm64", "https://aws.amazon.com/marketplace/pp/prodview-x"),
+            "This AWS account has not subscribed to the hatchrun arm64 runner image. Subscribe \
+             once, for free, at https://aws.amazon.com/marketplace/pp/prodview-x, then verify \
+             the AWS role to launch the waiting jobs."
+        );
+    }
+
+    #[test]
     fn the_template_carries_this_version() {
         let template = include_str!("../../../deploy/cloudformation/connect.yaml");
         let tag =
@@ -211,7 +249,7 @@ mod tests {
 
     #[test]
     fn says_what_an_update_brings() {
-        assert_eq!(changes_since(None).len(), 1);
+        assert_eq!(changes_since(None).len(), 2);
         assert_eq!(changes_since(Some(1)), changes_since(None));
         assert_eq!(changes_since(Some(TEMPLATE_VERSION)), Vec::<&str>::new());
         assert_eq!(

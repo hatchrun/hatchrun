@@ -4,8 +4,9 @@
 
 //! Connecting a tenant's AWS account (see [`crate::connect`]).
 //!
-//! - `GET /api/tenants/<org>/aws` gives the Launch Stack link for each
-//!   region and the account connected now.
+//! - `GET /api/tenants/<org>/aws` gives the AWS Marketplace pages that
+//!   subscribe the account to the runner images, the Launch Stack link
+//!   for each region and the account connected now.
 //! - `POST /api/tenants/<org>/aws` with `{"region", "roleArn"}` checks
 //!   the stack in that region and saves it.
 
@@ -66,6 +67,10 @@ pub(crate) async fn instructions(ctx: &Ctx<'_>, org: &str) -> Answer {
         .collect();
     Ok(Response::from_json(&serde_json::json!({
         "tenantId": row.id,
+        "marketplace": {
+            "amd64": need(ctx.env, connect::MARKETPLACE_AMD64_URL)?,
+            "arm64": need(ctx.env, connect::MARKETPLACE_ARM64_URL)?,
+        },
         "templateUrl": template,
         "regions": regions,
     }))?)

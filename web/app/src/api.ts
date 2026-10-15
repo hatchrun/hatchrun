@@ -196,6 +196,8 @@ export interface AwsRegion {
 
 export interface AwsInstructions {
   tenantId: string;
+  /** AWS Marketplace pages that subscribe the account to the runner images. */
+  marketplace: { amd64: string; arm64: string };
   templateUrl: string | null;
   regions: AwsRegion[];
 }

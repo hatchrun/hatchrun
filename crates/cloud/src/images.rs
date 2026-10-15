@@ -5,7 +5,7 @@
 //! Runner image releases from hatchrun/images.
 //!
 //! Each release of hatchrun/images carries a `manifest.json` with the
-//! public AMI of every region and architecture:
+//! AMI that AWS Marketplace serves in every region, per architecture:
 //!
 //! ```json
 //! { "version": "20261013.1915", "ubuntu": "26.04", "runner": "...",
@@ -13,10 +13,11 @@
 //!   "arm64": { ... } } }
 //! ```
 //!
-//! Its build posts the manifest to `POST /api/internal/images` once the
-//! AMIs are public, with a GitHub Actions token that only its release
-//! job can get (see [`POLICY`]). The Worker writes one row per region
-//! and architecture to the `images` table, which launches read.
+//! Its build posts the manifest to `POST /api/internal/images` once
+//! Marketplace serves the AMIs, with a GitHub Actions token that only
+//! its release job can get (see [`POLICY`]). The Worker writes one row
+//! per region and architecture to the `images` table, which launches
+//! read.
 
 use std::collections::BTreeMap;
 
@@ -30,8 +31,8 @@ pub const PATH: &str = "/api/internal/images";
 pub const AUDIENCE: &str = "https://app.hatchrun.io";
 /// The only callers: the `register.yml` job of hatchrun/images, on
 /// its protected main branch, in its `image-build` environment, on a
-/// GitHub-hosted runner. `build.yml` calls it after the AMIs are
-/// public, on a push, the schedule or by hand, and it runs by hand on
+/// GitHub-hosted runner. `build.yml` calls it once Marketplace serves
+/// the AMIs, on a push, the schedule or by hand, and it runs by hand on
 /// its own to post a release again. Events that run code from outside
 /// the repository, such as `pull_request_target` or `workflow_run`,
 /// are refused even on main.

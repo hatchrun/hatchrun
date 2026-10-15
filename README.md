@@ -290,9 +290,13 @@ npx wrangler@4.145.0 d1 execute hatchrun-cloud --remote --command \
   "INSERT INTO beta_orgs (org_login, created_at) VALUES ('acme', unixepoch() * 1000)"
 ```
 
-An owner connects AWS from the app. A Launch Stack link per region
-opens the published `connect.yaml` with the tenant id filled in; the
-owner pastes the stack's `RoleArn` output back. The Worker assumes the
+An owner connects AWS from the app. The account first subscribes to the
+amd64 and arm64 runner images in AWS Marketplace (`MARKETPLACE_AMD64_URL`
+and `MARKETPLACE_ARM64_URL` in `wrangler.toml`); EC2 refuses to launch
+an image of a product the account has not subscribed to, with
+`OptInRequired`, and the job says where to subscribe. A Launch Stack
+link per region opens the published `connect.yaml` with the tenant id
+filled in; the owner pastes the stack's `RoleArn` output back. The Worker assumes the
 role with a token for the tenant, finds the stack's launch template by
 its `hatchrun:tenant` tag and the subnets on its `hatchrun:subnets`
 tag, checks they exist, and only then saves them.
@@ -309,8 +313,9 @@ template again once a day, so an updated stack is picked up without
 anyone verifying the role again, and jobs waiting on the setup launch.
 
 [`publish-template.yml`](.github/workflows/publish-template.yml)
-renders `connect.yaml` with the image owner account and uploads it on
-every change merged to main. It needs, once, the bucket and role from
+renders `connect.yaml` with the image owner account (the AWS
+Marketplace account that owns the runner images' copies) and uploads
+it on every change merged to main. It needs, once, the bucket and role from
 [`templates-bucket.yaml`](deploy/cloudformation/templates-bucket.yaml),
 the `TEMPLATES_ROLE_ARN` and `IMAGE_OWNER_ACCOUNT_ID` secrets and the
 `TEMPLATES_BUCKET` variable in the `production` environment, and the
@@ -336,8 +341,8 @@ runners may use, which the Worker also checks before every launch.
 Launches take the AMI for the tenant's region and the runner's
 architecture from the `images` table. Every release of
 [hatchrun/images](https://github.com/hatchrun/images) fills it: once
-the AMIs are public, its `register.yml` job posts the release's
-`manifest.json` to `POST https://app.hatchrun.io/api/internal/images`
+AWS Marketplace serves the AMIs, its `register.yml` job posts the
+release's `manifest.json` to `POST https://app.hatchrun.io/api/internal/images`
 with a GitHub Actions OIDC token for the audience
 `https://app.hatchrun.io`. The Worker checks the token's signature
 against GitHub's JWKS and accepts only that job, on the protected
