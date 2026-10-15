@@ -53,14 +53,29 @@ pub fn signing_input(runner: Runner<'_>, now: u64) -> String {
     }))
 }
 
-/// The document the broker hands the runner.
+/// Where a runner's agent reaches the job cache, and its token there
+/// (see [`crate::cache`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Cache<'a> {
+    /// The cache API, ending in `/v1/cache`.
+    pub url: &'a str,
+    /// A cache token for the runner's job.
+    pub token: &'a str,
+}
+
+/// The document the broker hands the runner. `cache` is set when the
+/// runner's profile turns the cache on and the tenant's stack has a
+/// bucket.
 #[must_use]
-pub fn boot_document(jit_config: &str, url: &str, token: &str) -> String {
-    serde_json::json!({
+pub fn boot_document(jit_config: &str, url: &str, token: &str, cache: Option<Cache<'_>>) -> String {
+    let mut doc = serde_json::json!({
         "jitConfig": jit_config,
         "telemetry": { "url": url, "token": token },
-    })
-    .to_string()
+    });
+    if let Some(cache) = cache {
+        doc["cache"] = serde_json::json!({ "url": cache.url, "token": cache.token });
+    }
+    doc.to_string()
 }
 
 #[cfg(test)]
@@ -102,6 +117,7 @@ mod tests {
             "jit",
             "https://telemetry.hatchrun.io",
             "a.b.c",
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -110,6 +126,21 @@ mod tests {
                 "jitConfig": "jit",
                 "telemetry": { "url": "https://telemetry.hatchrun.io", "token": "a.b.c" },
             })
+        );
+        let cache = Cache {
+            url: "https://app.hatchrun.io/v1/cache",
+            token: "d.e.f",
+        };
+        let doc: serde_json::Value = serde_json::from_str(&boot_document(
+            "jit",
+            "https://telemetry.hatchrun.io",
+            "a.b.c",
+            Some(cache),
+        ))
+        .unwrap();
+        assert_eq!(
+            doc["cache"],
+            serde_json::json!({ "url": "https://app.hatchrun.io/v1/cache", "token": "d.e.f" })
         );
     }
 }

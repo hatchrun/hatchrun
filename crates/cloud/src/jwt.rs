@@ -100,6 +100,28 @@ pub fn ed25519_pkcs8_der(pem: &str) -> Result<Vec<u8>, KeyError> {
     Ok(der)
 }
 
+/// The 32-byte seed of an Ed25519 private key in PKCS#8 DER (see
+/// [`ed25519_pkcs8_der`]), from which the key and its public half
+/// follow.
+///
+/// # Errors
+///
+/// When the DER is not an Ed25519 `PrivateKeyInfo`.
+pub fn ed25519_seed(pkcs8: &[u8]) -> Result<[u8; 32], KeyError> {
+    const NOT_ED25519: KeyError = KeyError("not an Ed25519 private key");
+    // PrivateKeyInfo { version, AlgorithmIdentifier, OCTET STRING {
+    //   CurvePrivateKey ::= OCTET STRING } }
+    let (info, _) = element(pkcs8, SEQUENCE)?;
+    let (_, info) = element(info, INTEGER)?;
+    let (algorithm, info) = element(info, SEQUENCE)?;
+    if element(algorithm, OID)?.0 != ED25519 {
+        return Err(NOT_ED25519);
+    }
+    let (wrapped, _) = element(info, OCTET_STRING)?;
+    let (seed, _) = element(wrapped, OCTET_STRING)?;
+    seed.try_into().map_err(|_| NOT_ED25519)
+}
+
 /// The label and DER of the first PEM block in `pem`.
 fn pem_der(pem: &str) -> Result<(&str, Vec<u8>), KeyError> {
     let mut lines = pem
@@ -284,6 +306,7 @@ mod tests {
         ];
         key.extend([7; 32]);
         assert_eq!(ed25519_pkcs8_der(&pem("PRIVATE KEY", &key)).unwrap(), key);
+        assert_eq!(ed25519_seed(&key).unwrap(), [7; 32]);
         // An RSA key in the same envelope is refused, and so is PKCS#1.
         let mut algorithm = der(OID, RSA_ENCRYPTION);
         algorithm.extend([0x05, 0x00]);
@@ -292,6 +315,7 @@ mod tests {
         info.extend(der(OCTET_STRING, &der(SEQUENCE, &[])));
         let rsa = der(SEQUENCE, &info);
         assert!(ed25519_pkcs8_der(&pem("PRIVATE KEY", &rsa)).is_err());
+        assert!(ed25519_seed(&rsa).is_err());
         assert!(ed25519_pkcs8_der(&pem("RSA PRIVATE KEY", &[0x30, 0x00])).is_err());
         assert!(ed25519_pkcs8_der("").is_err());
     }

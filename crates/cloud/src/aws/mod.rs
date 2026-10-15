@@ -13,6 +13,7 @@ pub mod describe;
 pub mod ec2;
 pub mod fleet;
 pub mod instances;
+pub mod s3;
 pub mod ssm;
 pub mod sts;
 
@@ -110,6 +111,40 @@ pub fn sign_v4(
     service: &str,
     now_ms: u64,
 ) -> Result<(), String> {
+    let body = request.body.clone();
+    let (headers, _) = instructions(
+        request,
+        credentials,
+        Signing {
+            region,
+            service,
+            now_ms,
+            settings: SigningSettings::default(),
+            body: SignableBody::Bytes(&body),
+        },
+    )?;
+    request.headers.extend(headers);
+    Ok(())
+}
+
+/// What one signature covers.
+struct Signing<'a> {
+    region: &'a str,
+    service: &'a str,
+    now_ms: u64,
+    settings: SigningSettings,
+    body: SignableBody<'a>,
+}
+
+/// Name and value pairs.
+type Pairs = Vec<(String, String)>;
+
+/// The headers and query parameters that sign `request`.
+fn instructions(
+    request: &Request,
+    credentials: &Credentials,
+    signing: Signing<'_>,
+) -> Result<(Pairs, Pairs), String> {
     let identity = aws_credential_types::Credentials::new(
         &credentials.access_key_id,
         &credentials.secret_access_key,
@@ -120,10 +155,10 @@ pub fn sign_v4(
     .into();
     let params = v4::SigningParams::builder()
         .identity(&identity)
-        .region(region)
-        .name(service)
-        .time(SystemTime::UNIX_EPOCH + Duration::from_millis(now_ms))
-        .settings(SigningSettings::default())
+        .region(signing.region)
+        .name(signing.service)
+        .time(SystemTime::UNIX_EPOCH + Duration::from_millis(signing.now_ms))
+        .settings(signing.settings)
         .build()
         .map_err(|err| err.to_string())?
         .into();
@@ -134,19 +169,23 @@ pub fn sign_v4(
             .headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
-        SignableBody::Bytes(&request.body),
+        signing.body,
     )
     .map_err(|err| err.to_string())?;
     let (instructions, _) = sign(signable, &params)
         .map_err(|err| err.to_string())?
         .into_parts();
-    let (headers, _) = instructions.into_parts();
-    for header in headers {
-        request
-            .headers
-            .push((header.name().to_owned(), header.value().to_owned()));
-    }
-    Ok(())
+    let (headers, params) = instructions.into_parts();
+    Ok((
+        headers
+            .iter()
+            .map(|header| (header.name().to_owned(), header.value().to_owned()))
+            .collect(),
+        params
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.into_owned()))
+            .collect(),
+    ))
 }
 
 /// Parses a Query API answer, returning AWS's error for anything but a

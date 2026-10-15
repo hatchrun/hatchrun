@@ -16,6 +16,7 @@
 //! - `POST /github/webhook` takes the App's webhook deliveries.
 //! - `/api/*` on `app.hatchrun.io` is the app's API (see [`app`]); every
 //!   other path there is the app itself, from the static assets.
+//! - `/v1/cache/*` is the job cache that runners call (see [`cache`]).
 //! - `GET /.well-known/openid-configuration` and
 //!   `GET /.well-known/jwks.json` on `oidc.hatchrun.io` let STS check
 //!   the tokens the Worker signs (see [`oidc`]).
@@ -27,6 +28,7 @@
 pub mod actions;
 mod app;
 pub mod aws;
+pub mod cache;
 pub mod catalog;
 pub mod connect;
 mod fetch;
@@ -94,6 +96,11 @@ async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response>
     let path = req.path();
     if req.method() == Method::Post && path == "/github/webhook" {
         return github_webhook(req, env, &ctx).await;
+    }
+    if path.starts_with("/v1/cache/") {
+        let mut response = cache::serve::handle(req, env).await?;
+        response.headers_mut().set("Cache-Control", "no-store")?;
+        return Ok(response);
     }
     if path == "/api" || path.starts_with("/api/") {
         let mut response = app::handle(req, env).await?;

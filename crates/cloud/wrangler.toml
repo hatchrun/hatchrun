@@ -83,6 +83,10 @@ BROKER_URL = "https://broker.hatchrun.io"
 # hatchrun-telemetry (crates/telemetry), where runners report CPU and
 # memory with a token signed by TELEMETRY_SIGNING_KEY.
 TELEMETRY_URL = "https://telemetry.hatchrun.io"
+# The job cache API this Worker serves, which runners of profiles with
+# the cache extra call with a token in their boot document. Unset, no
+# runner gets the cache.
+CACHE_URL = "https://app.hatchrun.io/v1/cache"
 # kid of OIDC_SIGNING_KEY in oidc.hatchrun.io's JWKS. The JWKS also
 # lists OIDC_NEXT_SIGNING_KEY and OIDC_PREVIOUS_SIGNING_KEY while
 # OIDC_NEXT_KEY_ID and OIDC_PREVIOUS_KEY_ID are set here. The README

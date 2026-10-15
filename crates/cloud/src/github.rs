@@ -294,6 +294,45 @@ pub fn install_url(web: &str, app_slug: &str, state: &str) -> String {
     )
 }
 
+/// A workflow run of `repository` (`owner/name`).
+#[must_use]
+pub fn workflow_run(api: &str, token: &str, repository: &str, run_id: u64) -> Request {
+    call(
+        "GET",
+        format!("{api}/repos/{repository}/actions/runs/{run_id}"),
+        token,
+    )
+}
+
+/// Reads a workflow run as the cache needs it.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a run.
+pub fn parse_workflow_run(response: &Response) -> Result<crate::cache::Run, String> {
+    decode(response, "workflow run")
+}
+
+/// The repository `owner/name`.
+#[must_use]
+pub fn repository(api: &str, token: &str, repository: &str) -> Request {
+    call("GET", format!("{api}/repos/{repository}"), token)
+}
+
+#[derive(Deserialize)]
+struct Repository {
+    default_branch: String,
+}
+
+/// The default branch from a repository answer.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a repository.
+pub fn default_branch(response: &Response) -> Result<String, String> {
+    decode::<Repository>(response, "repository").map(|repository| repository.default_branch)
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(response: &Response, what: &str) -> Result<T, String> {
     if !response.ok() {
         return Err(format!(

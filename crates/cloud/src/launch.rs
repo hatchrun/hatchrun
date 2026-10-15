@@ -54,12 +54,12 @@ use crate::profiles::{self, store};
 use crate::reconcile::retry::{Cause, Failure};
 use crate::webhook::QueuedJob;
 use crate::{
-    DB, connect, github, instance, instance_types, int, jwt, now_ms, oidc, settings, telemetry,
-    webcrypto,
+    DB, cache, connect, github, instance, instance_types, int, jwt, now_ms, oidc, settings,
+    telemetry, webcrypto,
 };
 
 /// Variable with the App's client id.
-const APP_ID: &str = "GITHUB_APP_ID";
+pub(crate) const APP_ID: &str = "GITHUB_APP_ID";
 /// Secret with the App's private key in PEM.
 pub(crate) const APP_KEY: &str = "GITHUB_APP_PRIVATE_KEY";
 /// Variable with the broker URL instances claim their config from.
@@ -67,7 +67,7 @@ const BROKER_URL: &str = "BROKER_URL";
 /// Secret with the broker's token for storing configs.
 const BROKER_TOKEN: &str = "BROKER_TOKEN";
 /// Variable that replaces the GitHub API URL, for development.
-const GITHUB_API_URL: &str = "GITHUB_API_URL";
+pub(crate) const GITHUB_API_URL: &str = "GITHUB_API_URL";
 /// Variable that replaces the STS and EC2 endpoints, for development.
 pub(crate) const AWS_ENDPOINT_URL: &str = "AWS_ENDPOINT_URL";
 
@@ -97,6 +97,8 @@ struct Tenant {
     root_volume_size: Option<u16>,
     /// 1 when its stack lets the role use EC2 Fleet.
     fleet: u8,
+    /// Its stack's cache bucket, version 5 on.
+    cache_bucket: Option<String>,
 }
 
 /// SQL that is 1 for a tenant row that may launch: in the beta, or
@@ -132,6 +134,8 @@ struct Settings {
     broker_token: String,
     telemetry_key: Vec<u8>,
     telemetry_url: String,
+    /// The cache API; without it no runner gets the cache.
+    cache_url: Option<String>,
     github_api: String,
     aws_endpoint: Option<String>,
     /// Where an account subscribes to the amd64 and arm64 images.
@@ -159,6 +163,7 @@ impl Settings {
             telemetry_key: jwt::ed25519_pkcs8_der(&need(telemetry::SIGNING_KEY)?)
                 .map_err(|err| format!("{}: {err}", telemetry::SIGNING_KEY))?,
             telemetry_url: need(telemetry::URL)?.trim_end_matches('/').to_owned(),
+            cache_url: get(cache::URL).map(|url| url.trim_end_matches('/').to_owned()),
             github_api: get(GITHUB_API_URL)
                 .unwrap_or_else(|| github::API.to_owned())
                 .trim_end_matches('/')
@@ -192,7 +197,7 @@ async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
         .prepare(format!(
             "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners, \
              allowed_regions, {LICENSED} AS licensed, instance_types, volume_size_limit, \
-             root_volume_size, fleet, excluded_instance_types \
+             root_volume_size, fleet, excluded_instance_types, cache_bucket \
              FROM tenants WHERE installation_id = ?1 AND role_arn IS NOT NULL \
              AND region IS NOT NULL AND launch_template_id IS NOT NULL \
              AND subnet_ids IS NOT NULL"
@@ -434,6 +439,7 @@ async fn launch_claimed(
         &image,
         &credentials,
         &config.encoded_jit_config,
+        profile.extras.iter().any(|extra| extra == cache::EXTRA),
     )
     .await;
     if result.is_err() {
@@ -469,10 +475,20 @@ async fn start(
     image: &Image,
     credentials: &Credentials,
     config: &str,
+    wants_cache: bool,
 ) -> std::result::Result<String, Failure> {
     let ticket = jwt::b64url(webcrypto::random_bytes(32).map_err(internal)?);
     let token = telemetry_token(settings, job, tenant, name).await?;
-    let boot = telemetry::boot_document(config, &settings.telemetry_url, &token);
+    let cache_token = match (&settings.cache_url, &tenant.cache_bucket) {
+        (Some(_), Some(_)) if wants_cache => Some(cache_token(settings, job, tenant).await?),
+        _ => None,
+    };
+    let cache = settings
+        .cache_url
+        .as_deref()
+        .zip(cache_token.as_deref())
+        .map(|(url, token)| telemetry::Cache { url, token });
+    let boot = telemetry::boot_document(config, &settings.telemetry_url, &token, cache);
     let launch = Launch {
         job_id: job.id.to_string(),
         tenant,
@@ -937,6 +953,25 @@ async fn telemetry_token(
     Ok(jwt::token(&input, &signature))
 }
 
+/// The runner's token for the job cache, signed by the telemetry key
+/// with its own audience.
+async fn cache_token(
+    settings: &Settings,
+    job: &QueuedJob,
+    tenant: &Tenant,
+) -> std::result::Result<String, Failure> {
+    let job = cache::Job {
+        tenant: &tenant.id,
+        installation_id: job.installation_id,
+        job_id: job.id,
+    };
+    let input = cache::signing_input(job, now_ms() / 1000);
+    let signature = webcrypto::sign_ed25519(&settings.telemetry_key, input.as_bytes())
+        .await
+        .map_err(|err| Failure::new(Cause::Settings, format!("sign cache token: {err}")))?;
+    Ok(jwt::token(&input, &signature))
+}
+
 /// The App's JWT, signed with its private key in PKCS#8 DER.
 pub(crate) async fn app_jwt(app_id: &str, pkcs8: &[u8]) -> std::result::Result<String, String> {
     let input = github::app_jwt_signing_input(app_id, now_ms() / 1000);
@@ -1035,6 +1070,7 @@ mod tests {
             volume_size_limit: None,
             root_volume_size: None,
             fleet: 0,
+            cache_bucket: None,
         };
         assert_eq!(tenant.subnets(), ["subnet-b", "subnet-a"]);
     }
