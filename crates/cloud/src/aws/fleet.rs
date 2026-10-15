@@ -11,7 +11,10 @@
 //! launch first makes a version of the tenant's launch template with the
 //! runner's image, ticket, root volume and tags, launches from that
 //! version, and deletes it after. The template's `$Default` version is
-//! never changed.
+//! never changed. A launch that dies before the delete leaves its
+//! version behind; the reconciler lists the template's versions and
+//! deletes those (see [`stale`]), since EC2 refuses new versions past
+//! 10,000 per template.
 //!
 //! The instance is tagged through the version, never by the fleet. EC2
 //! authorizes the instances a fleet starts as `RunInstances` calls of
@@ -118,15 +121,142 @@ pub fn version_number(response: &Response) -> Result<u64, Error> {
 /// The unsigned request to delete a version made for one runner.
 #[must_use]
 pub fn delete_version(endpoint: &str, launch_template_id: &str, version: u64) -> Request {
-    query(
-        endpoint,
-        "DeleteLaunchTemplateVersions",
-        VERSION,
-        &[
-            ("LaunchTemplateId".to_owned(), launch_template_id.to_owned()),
-            ("LaunchTemplateVersion.1".to_owned(), version.to_string()),
-        ],
-    )
+    delete_versions(endpoint, launch_template_id, &[version])
+}
+
+/// Versions one `DeleteLaunchTemplateVersions` call may delete.
+pub const DELETE_BATCH: usize = 200;
+
+/// The unsigned request to delete `versions`, at most [`DELETE_BATCH`].
+#[must_use]
+pub fn delete_versions(endpoint: &str, launch_template_id: &str, versions: &[u64]) -> Request {
+    let mut params = vec![("LaunchTemplateId".to_owned(), launch_template_id.to_owned())];
+    for (at, version) in versions.iter().enumerate() {
+        params.push((
+            format!("LaunchTemplateVersion.{}", at + 1),
+            version.to_string(),
+        ));
+    }
+    query(endpoint, "DeleteLaunchTemplateVersions", VERSION, &params)
+}
+
+/// What `DeleteLaunchTemplateVersions` did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Deleted {
+    /// The versions it deleted.
+    pub deleted: Vec<u64>,
+    /// The versions it did not, with EC2's code and message.
+    pub failed: Vec<(u64, String)>,
+}
+
+/// Reads what `DeleteLaunchTemplateVersions` did.
+///
+/// # Errors
+///
+/// EC2's error for the call as a whole, or a malformed answer.
+pub fn deleted(response: &Response) -> Result<Deleted, Error> {
+    let doc = document(response)?;
+    let root = doc.root_element();
+    let number = |item: roxmltree::Node<'_, '_>| {
+        child_text(item, "versionNumber").and_then(|text| text.parse().ok())
+    };
+    let mut done = Deleted::default();
+    for item in items(root, "successfullyDeletedLaunchTemplateVersionSet") {
+        done.deleted.extend(number(item));
+    }
+    for item in items(root, "unsuccessfullyDeletedLaunchTemplateVersionSet") {
+        let error = child(item, "responseError");
+        let reason = format!(
+            "{}: {}",
+            error
+                .and_then(|n| child_text(n, "code"))
+                .unwrap_or_default(),
+            error
+                .and_then(|n| child_text(n, "message"))
+                .unwrap_or_default()
+        );
+        done.failed.push((number(item).unwrap_or_default(), reason));
+    }
+    Ok(done)
+}
+
+/// The unsigned request for a page of the template's versions other
+/// than `$Default`. Needs `ec2:DescribeLaunchTemplateVersions`, which
+/// the role has from connect stack version 5.
+#[must_use]
+pub fn describe_versions(endpoint: &str, launch_template_id: &str, next: Option<&str>) -> Request {
+    let mut params = vec![
+        ("LaunchTemplateId".to_owned(), launch_template_id.to_owned()),
+        ("Filter.1.Name".to_owned(), "is-default-version".to_owned()),
+        ("Filter.1.Value.1".to_owned(), "false".to_owned()),
+        ("MaxResults".to_owned(), "200".to_owned()),
+    ];
+    if let Some(next) = next {
+        params.push(("NextToken".to_owned(), next.to_owned()));
+    }
+    query(endpoint, "DescribeLaunchTemplateVersions", VERSION, &params)
+}
+
+/// A version of a launch template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    /// Its number.
+    pub number: u64,
+    /// When it was made, as EC2 writes it.
+    pub created: String,
+    /// Its description: the runner's name for a version made by a
+    /// launch.
+    pub description: String,
+    /// Whether it is the template's `$Default`.
+    pub default: bool,
+}
+
+/// Reads a page of `DescribeLaunchTemplateVersions`, and the token of
+/// the next one.
+///
+/// # Errors
+///
+/// EC2's error, or a malformed answer.
+pub fn versions(response: &Response) -> Result<(Vec<Version>, Option<String>), Error> {
+    let doc = document(response)?;
+    let root = doc.root_element();
+    let mut found = Vec::new();
+    for item in items(root, "launchTemplateVersionSet") {
+        let number = child_text(item, "versionNumber")
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| Error::malformed("a launch template version with no number"))?;
+        found.push(Version {
+            number,
+            created: child_text(item, "createTime")
+                .unwrap_or_default()
+                .to_owned(),
+            description: child_text(item, "versionDescription")
+                .unwrap_or_default()
+                .to_owned(),
+            default: child_text(item, "defaultVersion") == Some("true"),
+        });
+    }
+    let next = child_text(root, "nextToken")
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned);
+    Ok((found, next))
+}
+
+/// The versions among `found` that launches left behind: made for a
+/// runner (see `launch::runner_name`) before `before`, Unix
+/// milliseconds, and not `$Default`. Versions the stack made, and ones
+/// with a time that does not read, are kept.
+#[must_use]
+pub fn stale(found: &[Version], before: u64) -> Vec<u64> {
+    found
+        .iter()
+        .filter(|version| {
+            !version.default
+                && version.description.starts_with("hatchrun-")
+                && crate::reconcile::time::parse(&version.created).is_some_and(|at| at < before)
+        })
+        .map(|version| version.number)
+        .collect()
 }
 
 /// An instance type in a subnet the fleet may launch.
@@ -334,6 +464,128 @@ mod tests {
             "Action=DeleteLaunchTemplateVersions&Version=2016-11-15\
              &LaunchTemplateId=lt-1&LaunchTemplateVersion.1=12"
         );
+    }
+
+    #[test]
+    fn lists_and_deletes_left_versions() {
+        let first = body(&describe_versions("https://ec2/", "lt-1", None));
+        assert_eq!(
+            first,
+            "Action=DescribeLaunchTemplateVersions&Version=2016-11-15&LaunchTemplateId=lt-1\
+             &Filter.1.Name=is-default-version&Filter.1.Value.1=false&MaxResults=200"
+        );
+        let next = body(&describe_versions("https://ec2/", "lt-1", Some("t/2")));
+        assert!(next.ends_with("&MaxResults=200&NextToken=t%2F2"), "{next}");
+
+        let page = Response {
+            status: 200,
+            body: br"<DescribeLaunchTemplateVersionsResponse>
+  <launchTemplateVersionSet>
+    <item>
+      <createTime>2026-10-14T09:00:00.000Z</createTime>
+      <defaultVersion>false</defaultVersion>
+      <launchTemplateData><blockDeviceMappingSet><item><deviceName>/dev/sda1</deviceName></item></blockDeviceMappingSet></launchTemplateData>
+      <launchTemplateId>lt-1</launchTemplateId>
+      <versionDescription>hatchrun-7-ab</versionDescription>
+      <versionNumber>12</versionNumber>
+    </item>
+    <item>
+      <createTime>2026-10-01T00:00:00.000Z</createTime>
+      <defaultVersion>true</defaultVersion>
+      <versionNumber>3</versionNumber>
+    </item>
+  </launchTemplateVersionSet>
+  <nextToken>t2</nextToken>
+</DescribeLaunchTemplateVersionsResponse>"
+                .to_vec(),
+        };
+        let (found, token) = versions(&page).unwrap();
+        assert_eq!(token.as_deref(), Some("t2"));
+        assert_eq!(
+            found,
+            [
+                Version {
+                    number: 12,
+                    created: "2026-10-14T09:00:00.000Z".to_owned(),
+                    description: "hatchrun-7-ab".to_owned(),
+                    default: false,
+                },
+                Version {
+                    number: 3,
+                    created: "2026-10-01T00:00:00.000Z".to_owned(),
+                    description: String::new(),
+                    default: true,
+                },
+            ]
+        );
+        let last = Response {
+            status: 200,
+            body: b"<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet/>\
+                <nextToken/></DescribeLaunchTemplateVersionsResponse>"
+                .to_vec(),
+        };
+        assert_eq!(versions(&last), Ok((Vec::new(), None)));
+        let denied = Response {
+            status: 403,
+            body: b"<Response><Errors><Error><Code>UnauthorizedOperation</Code>\
+                <Message>no</Message></Error></Errors></Response>"
+                .to_vec(),
+        };
+        assert_eq!(versions(&denied).unwrap_err().code, "UnauthorizedOperation");
+
+        assert_eq!(
+            body(&delete_versions("https://ec2/", "lt-1", &[4, 9])),
+            "Action=DeleteLaunchTemplateVersions&Version=2016-11-15\
+             &LaunchTemplateId=lt-1&LaunchTemplateVersion.1=4&LaunchTemplateVersion.2=9"
+        );
+        let answer = Response {
+            status: 200,
+            body: br"<DeleteLaunchTemplateVersionsResponse>
+  <successfullyDeletedLaunchTemplateVersionSet>
+    <item><launchTemplateId>lt-1</launchTemplateId><versionNumber>4</versionNumber></item>
+  </successfullyDeletedLaunchTemplateVersionSet>
+  <unsuccessfullyDeletedLaunchTemplateVersionSet>
+    <item>
+      <launchTemplateId>lt-1</launchTemplateId>
+      <responseError><code>launchTemplateVersionDoesNotExist</code><message>gone</message></responseError>
+      <versionNumber>9</versionNumber>
+    </item>
+  </unsuccessfullyDeletedLaunchTemplateVersionSet>
+</DeleteLaunchTemplateVersionsResponse>"
+                .to_vec(),
+        };
+        assert_eq!(
+            deleted(&answer),
+            Ok(Deleted {
+                deleted: vec![4],
+                failed: vec![(9, "launchTemplateVersionDoesNotExist: gone".to_owned())],
+            })
+        );
+    }
+
+    #[test]
+    fn deletes_only_old_runner_versions() {
+        let version = |number, created: &str, description: &str, default| Version {
+            number,
+            created: created.to_owned(),
+            description: description.to_owned(),
+            default,
+        };
+        let found = [
+            // Left by a launch that died.
+            version(5, "2026-10-14T08:00:00.000Z", "hatchrun-7-ab", false),
+            // Made by a launch that may still be running.
+            version(6, "2026-10-14T10:00:00.000Z", "hatchrun-8-cd", false),
+            // Exactly at the cutoff: kept.
+            version(7, "2026-10-14T09:00:00.000Z", "hatchrun-9-ef", false),
+            // The template's own versions.
+            version(2, "2026-10-01T00:00:00.000Z", "", false),
+            version(3, "2026-10-01T00:00:00.000Z", "hatchrun-1-00", true),
+            version(8, "yesterday", "hatchrun-10-aa", false),
+        ];
+        let before = crate::reconcile::time::parse("2026-10-14T09:00:00Z").unwrap();
+        assert_eq!(stale(&found, before), [5]);
+        assert_eq!(stale(&found, 0), Vec::<u64>::new());
     }
 
     #[test]

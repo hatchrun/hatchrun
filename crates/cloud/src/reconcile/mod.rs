@@ -14,7 +14,8 @@
 //! 3. per tenant with a verified role, describe its live instances,
 //!    terminate the ones nothing needs and launch queued jobs again
 //!    (see [`plan`]); once a day also read its stack's launch template
-//!    again (see [`crate::stack`]);
+//!    again (see [`crate::stack`]) and delete the template versions
+//!    launches left behind (see [`crate::aws::fleet::stale`]);
 //! 4. refresh the instance type catalog of one region that is due,
 //!    through a tenant role there (see [`crate::instance_types`]);
 //! 5. fail the lost launches of installations with no AWS connected,
@@ -46,7 +47,7 @@ use worker::{D1Database, D1PreparedStatement, Env, console_error, console_log, c
 
 use self::plan::{Instance, Job, LaunchState, Limits, Plan};
 use crate::aws::describe;
-use crate::aws::{self, Credentials, ec2, instances, ssm};
+use crate::aws::{self, Credentials, ec2, fleet, instances, ssm};
 use crate::fetch::{send, send_reading};
 use crate::instance_types::{self, store as catalog};
 use crate::launch::{self, APP_KEY, AWS_ENDPOINT_URL};
@@ -100,6 +101,18 @@ const CATALOG_PAGES: u32 = 20;
 /// Requests a catalog refresh may make: STS, the price list and the
 /// pages.
 const CATALOG_COST: u32 = 2 + 3 * CATALOG_PAGES;
+/// How often a tenant's launch template versions are swept.
+const SWEEP_EVERY: u64 = 24 * 60 * 60 * 1000;
+/// Pages of launch template versions read per sweep, 200 each. A
+/// template with more is swept again on the next pass, as long as
+/// the pass deleted some.
+const VERSION_PAGES: u32 = 10;
+/// How long before the oldest launch in flight a version must be made
+/// to be swept; more than any launch takes, and any clock skew.
+const SWEEP_MARGIN: u64 = 60 * 60 * 1000;
+/// EC2's answer to a role without `ec2:DescribeLaunchTemplateVersions`,
+/// from a connect stack before version 5.
+const DENIED: &[&str] = &["UnauthorizedOperation", "AccessDenied"];
 /// What `CloudTrail` shows as the session of the reconciler's calls.
 const SESSION: &str = "hatchrun-reconcile";
 
@@ -135,6 +148,8 @@ struct Summary {
     launched: u32,
     /// Tenants whose connect stack changed since it was last read.
     stacks_changed: u32,
+    /// Launch template versions left by launches, deleted.
+    versions_deleted: u32,
     /// Instance types in the region whose catalog was refreshed.
     catalog_types: u32,
     /// Lost launches of installations with no AWS connected, failed.
@@ -166,6 +181,7 @@ impl Summary {
         self.launched += other.launched;
         self.catalog_types += other.catalog_types;
         self.stacks_changed += other.stacks_changed;
+        self.versions_deleted += other.versions_deleted;
         self.unconnected += other.unconnected;
         self.sessions_deleted += other.sessions_deleted;
         self.jobs_deleted += other.jobs_deleted;
@@ -594,8 +610,8 @@ impl Pass<'_> {
         let tenants = self
             .db
             .prepare(format!(
-                "SELECT id, installation_id, role_arn, region, max_runners, stack_checked_at \
-                 FROM tenants \
+                "SELECT id, installation_id, role_arn, region, launch_template_id, max_runners, \
+                 stack_checked_at, versions_swept_at FROM tenants \
                  WHERE {VERIFIED} ORDER BY COALESCE(reconciled_at, 0), id LIMIT ?1"
             ))
             .bind(&[TENANTS_PER_PASS.into()])
@@ -699,7 +715,123 @@ impl Pass<'_> {
                 .await;
         }
         self.update_jobs(tenant, &plan, done).await?;
+        if let Some(credentials) = &credentials
+            && self
+                .now
+                .saturating_sub(tenant.versions_swept_at.unwrap_or(0))
+                > SWEEP_EVERY
+        {
+            match self
+                .sweep_versions(tenant, credentials, &endpoint, &jobs)
+                .await
+            {
+                Ok(deleted) => done.versions_deleted += deleted,
+                Err(err) => {
+                    console_warn!("reconcile: tenant {}: template versions: {err}", tenant.id);
+                    done.errors += 1;
+                }
+            }
+        }
         self.launch(tenant, &plan, done).await
+    }
+
+    /// Deletes the launch template versions that launches made and did
+    /// not delete, because the Worker died between the two. A version
+    /// made before the oldest launch in flight, less a margin, belongs
+    /// to no launch still running. Returns how many it deleted.
+    async fn sweep_versions(
+        &self,
+        tenant: &Tenant,
+        credentials: &Credentials,
+        endpoint: &str,
+        jobs: &[Job],
+    ) -> Fallible<u32> {
+        // A job is queued before it is claimed and its version made.
+        let in_flight = jobs
+            .iter()
+            .filter(|job| job.launch_state == Some(LaunchState::Launching))
+            .map(|job| job.queued_at)
+            .min()
+            .unwrap_or(self.now);
+        let before = in_flight.min(self.now).saturating_sub(SWEEP_MARGIN);
+        let template = tenant.launch_template_id.as_str();
+        let mut found = Vec::new();
+        let mut next: Option<String> = None;
+        for _ in 0..VERSION_PAGES {
+            if !self.spend(1) {
+                return Ok(0);
+            }
+            let mut request = fleet::describe_versions(endpoint, template, next.as_deref());
+            aws::sign_v4(&mut request, credentials, &tenant.region, "ec2", now_ms())?;
+            match fleet::versions(&send(&request).await?) {
+                Ok((page, token)) => {
+                    found.extend(page);
+                    next = token;
+                }
+                Err(err) if DENIED.contains(&err.code.as_str()) => {
+                    console_log!(
+                        "reconcile: tenant {}: connect stack before version 5 may not list \
+                         template versions; skipped",
+                        tenant.id
+                    );
+                    self.swept(tenant).await?;
+                    return Ok(0);
+                }
+                Err(err) => {
+                    // Stamped all the same, so a failing call is not made
+                    // every minute.
+                    self.swept(tenant).await?;
+                    return Err(format!("DescribeLaunchTemplateVersions: {err}"));
+                }
+            }
+            if next.is_none() {
+                break;
+            }
+        }
+        let mut deleted = 0;
+        for batch in fleet::stale(&found, before).chunks(fleet::DELETE_BATCH) {
+            if !self.spend(1) {
+                return Ok(deleted);
+            }
+            let mut request = fleet::delete_versions(endpoint, template, batch);
+            aws::sign_v4(&mut request, credentials, &tenant.region, "ec2", now_ms())?;
+            let done = fleet::deleted(&send(&request).await?)
+                .map_err(|err| format!("DeleteLaunchTemplateVersions: {err}"))?;
+            for (version, reason) in &done.failed {
+                console_warn!(
+                    "reconcile: tenant {}: delete template version {version}: {reason}",
+                    tenant.id
+                );
+            }
+            deleted += u32::try_from(done.deleted.len()).unwrap_or(u32::MAX);
+        }
+        if deleted > 0 {
+            console_log!(
+                "reconcile: tenant {}: deleted {deleted} template versions left by launches",
+                tenant.id
+            );
+        }
+        // A template with more pages is swept again on the next pass,
+        // from the first page, which now holds the versions left. One
+        // that deleted nothing would read the same pages again, so it
+        // waits a day like the rest.
+        if next.is_some() && deleted > 0 {
+            self.more.set(true);
+        } else {
+            self.swept(tenant).await?;
+        }
+        Ok(deleted)
+    }
+
+    async fn swept(&self, tenant: &Tenant) -> Fallible<()> {
+        self.db
+            .prepare("UPDATE tenants SET versions_swept_at = ?2 WHERE id = ?1")
+            .bind(&[tenant.id.as_str().into(), int(self.now).map_err(text)?])
+            .map_err(text)?
+            .run()
+            .await
+            .map_err(text)?;
+        Ok(())
     }
 
     /// Reads the tenant's stack settings again and records what they
@@ -1288,8 +1420,10 @@ struct Tenant {
     installation_id: Option<u64>,
     role_arn: String,
     region: String,
+    launch_template_id: String,
     max_runners: u32,
     stack_checked_at: Option<u64>,
+    versions_swept_at: Option<u64>,
 }
 
 #[derive(Deserialize)]
