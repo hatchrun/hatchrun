@@ -6,9 +6,12 @@
 //! instance's just-in-time runner config, runs exactly one GitHub Actions job
 //! and exits. The systemd unit powers the instance off when it exits, whether
 //! the job ran or the agent failed. On hatchrun.io launches it reports the
-//! instance's CPU and memory while the job runs (see [`telemetry`]).
+//! instance's CPU and memory while the job runs (see [`telemetry`]), and
+//! serves the job cache from the tenant's bucket when the launch says
+//! (see [`cache`]).
 
 mod broker;
+mod cache;
 mod envfile;
 mod imds;
 mod metrics;
@@ -29,6 +32,8 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::broker::HttpBroker;
+use crate::cache::Proxy;
+use crate::cache::patch::{self, Direction};
 use crate::imds::Imds;
 use crate::metrics::Sampler;
 use crate::runner::Runner;
@@ -154,11 +159,26 @@ async fn run(args: Args) -> Result<()> {
         None => None,
     };
 
+    let cache = match boot.cache {
+        Some(cache) => start_cache(&resolver.metadata, cache, &args.runner_dir).await,
+        None => None,
+    };
+    let env = cache
+        .as_ref()
+        .map(|proxy| {
+            vec![
+                ("ACTIONS_RESULTS_URL".to_owned(), proxy.url().to_owned()),
+                ("ACTIONS_CACHE_SERVICE_V2".to_owned(), "true".to_owned()),
+            ]
+        })
+        .unwrap_or_default();
+
     let runner = Runner {
         dir: args.runner_dir,
         user: Some(args.runner_user).filter(|user| !user.is_empty()),
         env_file: args.env_file,
         stop_timeout: args.stop_timeout,
+        env,
     };
     info!(dir = %runner.dir.display(), user = runner.user.as_deref().unwrap_or("(agent)"), "starting runner");
     let run = runner.run(&boot.jit_config, shutdown);
@@ -172,12 +192,45 @@ async fn run(args: Args) -> Result<()> {
             status
         }
         None => run.await,
-    }?;
+    };
+    if let Some(proxy) = cache {
+        proxy.stop().await;
+    }
+    let status = status?;
     if !status.success() {
         bail!("runner exited with {status}");
     }
     info!("runner exited");
     Ok(())
+}
+
+/// The cache proxy for a hosted launch, with the runner pointed at it.
+/// The runner is patched only once the proxy passed its health check; a
+/// proxy that cannot start or fails it is logged and skipped, the runner
+/// stays stock, and the job uses GitHub's cache.
+async fn start_cache(metadata: &Imds, cache: source::Cache, runner_dir: &Path) -> Option<Proxy> {
+    let started = async {
+        let ip = tokio::time::timeout(Duration::from_secs(2), metadata.private_ip())
+            .await
+            .map_err(|_| anyhow!("instance metadata has no local-ipv4 after 2s"))??;
+        let proxy = Proxy::start(cache, ip).await?;
+        proxy.check().await?;
+        patch::patch_runner(runner_dir, Direction::Redirect)?;
+        anyhow::Ok(proxy)
+    };
+    match started.await {
+        Ok(proxy) => {
+            info!(url = proxy.url(), "serving the job cache");
+            Some(proxy)
+        }
+        Err(err) => {
+            warn!("not serving the job cache, the job uses GitHub's: {err:#}");
+            if let Err(err) = patch::patch_runner(runner_dir, Direction::Restore) {
+                warn!("{err:#}");
+            }
+            None
+        }
+    }
 }
 
 /// The metrics reporter for a hosted launch. A reporter that cannot

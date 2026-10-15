@@ -31,6 +31,9 @@ pub struct Runner {
     pub env_file: PathBuf,
     /// How long the runner gets to exit after SIGTERM before it is killed.
     pub stop_timeout: Duration,
+    /// Variables set on top of the environment file, such as the cache
+    /// proxy's.
+    pub env: Vec<(String, String)>,
 }
 
 impl Runner {
@@ -95,6 +98,8 @@ impl Runner {
             ("USER".into(), name.clone()),
             ("LOGNAME".into(), name),
         ]);
+        env.retain(|(key, _)| !self.env.iter().any(|(ours, _)| ours == key));
+        env.extend(self.env.iter().cloned());
         Ok(env)
     }
 }
@@ -176,6 +181,7 @@ mod tests {
             user: None,
             env_file: dir.join("environment"),
             stop_timeout: Duration::from_secs(5),
+            env: Vec::new(),
         }
     }
 
@@ -199,6 +205,32 @@ mod tests {
         );
         assert!(env.contains("ImageOS=ubuntu26"), "{env}");
         assert!(env.contains("PATH=/usr/bin:/bin"), "{env}");
+    }
+
+    #[tokio::test]
+    async fn extra_variables_win_over_the_env_file() {
+        let dir = runner_dir("0");
+        std::fs::write(
+            dir.path().join("environment"),
+            "ACTIONS_RESULTS_URL=http://elsewhere/\nPATH=/usr/bin:/bin\n",
+        )
+        .unwrap();
+        let runner = Runner {
+            env: vec![
+                ("ACTIONS_RESULTS_URL".into(), "http://10.0.0.5:7419/".into()),
+                ("ACTIONS_CACHE_SERVICE_V2".into(), "true".into()),
+            ],
+            ..runner(dir.path())
+        };
+        runner.run("jit", std::future::pending()).await.unwrap();
+
+        let env = recorded_env(dir.path());
+        assert!(
+            env.contains("ACTIONS_RESULTS_URL=http://10.0.0.5:7419/\n"),
+            "{env}"
+        );
+        assert!(!env.contains("elsewhere"), "{env}");
+        assert!(env.contains("ACTIONS_CACHE_SERVICE_V2=true"), "{env}");
     }
 
     #[tokio::test]

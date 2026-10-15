@@ -479,8 +479,8 @@ Runners of a profile with the `cache` extra keep `actions/cache`
 entries in the S3 bucket of the tenant's connect stack (version 5 on),
 in the runners' own account and region. The design is on #53. The
 Worker side is `/v1/cache/*` on `app.hatchrun.io`
-([`cache`](crates/cloud/src/cache.rs)); the agent's proxy, which the
-job's cache calls reach, comes next.
+([`cache`](crates/cloud/src/cache.rs)); the jobs reach it through a
+proxy in the agent ([`cache`](crates/hatchrun-agent/src/cache.rs)).
 
 The boot document of such a runner carries a second token:
 
@@ -510,6 +510,29 @@ are S3 multipart uploads the Worker starts and completes with
 `If-None-Match: *`; the runner uploads the parts to presigned URLs.
 The Worker keeps each tenant's role credentials in the isolate for 30
 minutes, so a cache call costs S3 calls and not an STS call each time.
+
+The proxy listens on the instance's private IP, port 7419, so host
+steps and container jobs reach the same URL, and serves GitHub's cache
+v2 protocol: the three Twirp RPCs `actions/cache` and BuildKit's
+`type=gha` call, the Azure Blob upload to the URL a create hands out,
+and the download from the URL a lookup hands out. Uploads stream to S3
+in parts of up to 64 MiB and never touch disk. A plain download is
+redirected to the presigned S3 GET; a ranged one is fetched by the
+proxy, since S3 ignores Azure's `x-ms-range`. Every other Twirp call,
+such as the artifact service `actions/upload-artifact` uses, passes
+through to `results-receiver.actions.githubusercontent.com`.
+
+The runner sets `ACTIONS_RESULTS_URL` on every action from the job
+message, so nothing in the environment can override it. Once the proxy
+answers its health check (which also checks the cloud takes the token)
+within 5 seconds, the agent renames `ACTIONS_CACHE_URL`,
+`ACTIONS_RESULTS_URL` and `ACTIONS_CACHE_SERVICE_V2` in the runner's
+`bin/Runner.Worker.dll` to `ZCTIONS_*`, and starts the runner with
+`ACTIONS_RESULTS_URL` pointing at the proxy and
+`ACTIONS_CACHE_SERVICE_V2=true`. Each name must occur exactly once in
+the worker, or it is left alone. When anything fails, the runner starts
+stock and the job uses GitHub's cache. A lookup that fails answers a
+miss; a save that fails is a warning in the job.
 
 ### OIDC issuer
 
