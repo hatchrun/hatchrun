@@ -21,9 +21,11 @@ It takes the instance's just-in-time runner config from the first source
 that has one:
 
 1. A `jitConfig` field in JSON user data, plain or gzip.
-2. A `broker` URL and `ticket` in JSON user data. The agent claims the
-   config from hatchrun-broker, which hands it out once, retrying while
-   the broker has nothing stored yet. The broker must be HTTPS.
+2. A `broker` URL and `ticket` in JSON user data. The agent claims its
+   boot document from hatchrun-broker, which hands it out once, retrying
+   while the broker has nothing stored yet. The broker must be HTTPS.
+   The document holds the config and, on hatchrun.io launches, where to
+   report metrics (see [Runner telemetry](#runner-telemetry)).
 3. The SSM parameter named by the `hatchrun:jit-parameter` instance tag.
 4. The token parameter of
    [github-aws-runners/terraform-aws-github-runner](https://github.com/github-aws-runners/terraform-aws-github-runner),
@@ -39,6 +41,12 @@ argv and job steps never see it. The runner runs as `runner` with all its
 supplementary groups and the environment from `/etc/environment`. When the
 runner exits, or no config arrives within 10 minutes, the unit powers the
 instance off.
+
+On hatchrun.io launches the agent samples the instance once a second
+while the job runs and reports CPU, memory, disk and network in
+ten-second windows to `telemetry.hatchrun.io`. Reporting never fails or
+delays the job. Configs from the self-hosted scaler, user data or SSM
+come without telemetry, and the agent reports nothing.
 
 The agent starts only on instances launched as runners: user data with a
 config or ticket, or one of the tags above. `hatchrun-launch.service`
@@ -148,7 +156,8 @@ this way, and the scaler also needs `ec2:StopInstances`,
 [`crates/broker`](crates/broker) is a Cloudflare Worker that hands each
 instance its runner config exactly once, so the config never sits in
 user data. The scaler puts a random ticket in the instance's user data
-and stores the config in the broker under that ticket. At boot the
+and stores a boot document, `{"jitConfig": "..."}`, in the broker under
+that ticket; hatchrun.io adds a `telemetry` field to it. At boot the
 agent claims it with the ticket. The claim deletes the config, so the
 ticket is useless once the runner has started, and an unclaimed config
 is deleted when it expires (15 minutes by default). Every cloud has
@@ -226,9 +235,9 @@ from AWS's public price lists stand in for it.
 ```sh
 npm --prefix web/app ci && npm --prefix web/app run build
 cd crates/cloud
-npx wrangler@4.143.0 d1 migrations apply hatchrun-cloud --local
+npx wrangler@4.145.0 d1 migrations apply hatchrun-cloud --local
 echo GITHUB_WEBHOOK_SECRET=dev > .dev.vars
-npx wrangler@4.143.0 dev
+npx wrangler@4.145.0 dev
 ```
 
 ### app.hatchrun.io
@@ -273,11 +282,11 @@ lists the organization:
 ```sh
 code=$(openssl rand -hex 8)
 hash=$(printf %s "$code" | shasum -a 256 | cut -d' ' -f1)
-npx wrangler@4.143.0 d1 execute hatchrun-cloud --remote --command \
+npx wrangler@4.145.0 d1 execute hatchrun-cloud --remote --command \
   "INSERT INTO invites (code_hash, note, uses_left, created_at) VALUES ('$hash', 'acme', 1, unixepoch() * 1000)"
 echo "invite code: $code"
 
-npx wrangler@4.143.0 d1 execute hatchrun-cloud --remote --command \
+npx wrangler@4.145.0 d1 execute hatchrun-cloud --remote --command \
   "INSERT INTO beta_orgs (org_login, created_at) VALUES ('acme', unixepoch() * 1000)"
 ```
 
@@ -315,7 +324,9 @@ aws cloudformation deploy --region us-east-1 --stack-name hatchrun-templates \
 ```
 
 Once every step is done the app shows the organization's recent jobs,
-what each launch did and the `runs-on` syntax, its runner profiles
+what each launch did, each job's CPU and memory (see
+[Runner telemetry](#runner-telemetry)) and the `runs-on` syntax, its
+runner profiles
 with the instance type and on-demand price each gets in the tenant's
 region, and its settings: the most runners at once and the regions
 runners may use, which the Worker also checks before every launch.
@@ -373,7 +384,7 @@ jobs past the retention. The timeouts are the `RECONCILE_*` variables in
 `reconciler` table:
 
 ```sh
-npx wrangler@4.143.0 d1 execute hatchrun-cloud --remote --command \
+npx wrangler@4.145.0 d1 execute hatchrun-cloud --remote --command \
   "SELECT finished_at, summary FROM reconciler"
 ```
 
@@ -384,6 +395,65 @@ npx wrangler@4.143.0 d1 execute hatchrun-cloud --remote --command \
 `/api` to `wrangler dev` on port 8787. `npm run dev:mock` answers `/api`
 from [`web/app/mock/api.ts`](web/app/mock/api.ts) instead, with no
 Worker, GitHub or AWS behind it.
+
+### Runner telemetry
+
+hatchrun.io shows each job's CPU and memory on its page in the app,
+next to a link to the job on GitHub. Logs stay on GitHub; hatchrun
+neither stores nor shows them.
+
+The launch stores a boot document in the broker instead of the bare
+config:
+
+```json
+{"jitConfig": "...", "telemetry": {"url": "https://telemetry.hatchrun.io", "token": "..."}}
+```
+
+The token is an EdDSA JWT naming the tenant, the installation, the job
+and the runner, valid for nine hours. It is signed with
+`TELEMETRY_SIGNING_KEY`, an Ed25519 key that signs nothing else; the
+OIDC key buys credentials in customer accounts and never signs anything
+a runner holds. The agent keeps the token in memory.
+
+Every ten seconds the agent sums up its one-second samples into a
+window: CPU busy share (lowest second, mean, highest second) and steal,
+the highest memory in use and the instance's total, the peak memory of
+the agent's cgroup and its OOM kills, disk used on the root file system,
+and bytes received and sent. It posts the windows once a minute, at
+most 60 at a time, and once more when the runner exits, with the
+instance type, the architecture and its version. Nothing else leaves
+the instance: no command lines, environment, file names or logs.
+
+[`crates/telemetry`](crates/telemetry) is the Worker at
+`telemetry.hatchrun.io` that takes the reports. It holds only the
+Analytics Engine binding and the token public keys. It checks the
+token's signature and expiry, takes the job and installation from the
+token alone, refuses bodies over 64 KiB, unknown fields and numbers
+out of range, and writes one data point per window to the
+`hatchrun_runner_metrics` dataset: the job id as the index, the
+installation id, instance type, architecture and agent version as
+blobs, the window's numbers as doubles. Analytics Engine keeps data for
+three months. The app reads it back through the Analytics SQL binding,
+always for one installation, with a lower time bound and a limit.
+
+Generate the key once and store both halves in the `production`
+environment: the private key as a secret for hatchrun-cloud, the public
+key, unpadded base64url, as a variable for hatchrun-telemetry.
+
+```sh
+openssl genpkey -algorithm ed25519 -out ~/telemetry-2026-10.pem
+gh secret set TELEMETRY_SIGNING_KEY --env production < ~/telemetry-2026-10.pem
+gh variable set TELEMETRY_PUBLIC_KEYS --env production --body "$(
+  openssl pkey -in ~/telemetry-2026-10.pem -pubout -outform DER |
+    tail -c 32 | base64 | tr '+/' '-_' | tr -d '=')"
+```
+
+To rotate, add the new public key to `TELEMETRY_PUBLIC_KEYS` after a
+comma and deploy hatchrun-telemetry, then set the new private key and
+deploy hatchrun-cloud. Nine hours later, when the last old token has
+expired, drop the old public key. Under `wrangler dev`, put
+`TELEMETRY_SIGNING_KEY` in `crates/cloud/.dev.vars` and
+`TELEMETRY_PUBLIC_KEYS` in `crates/telemetry/.dev.vars`.
 
 ### OIDC issuer
 
@@ -426,7 +496,7 @@ change to `wrangler.toml` merged to main:
 A slot is published only while its `kid` is set, so the leftover
 secrets do nothing. Delete them anyway, from GitHub with
 `gh secret delete NAME --env production` and from the Worker with
-`npx wrangler@4.143.0 secret delete NAME`.
+`npx wrangler@4.145.0 secret delete NAME`.
 
 ## Scale set client
 

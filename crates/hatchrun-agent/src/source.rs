@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Finds the instance's just-in-time runner config.
+//! Finds the instance's just-in-time runner config, and where to report
+//! metrics when the launch says.
 
 use std::io::Read;
 use std::time::Duration;
@@ -29,10 +30,10 @@ pub trait Metadata {
     async fn tag(&self, key: &str) -> Result<Option<String>>;
 }
 
-/// Claims runner configs from hatchrun-broker.
+/// Claims boot documents from hatchrun-broker.
 pub trait Broker {
-    /// Claims the config stored under `ticket`. Returns `None` while there
-    /// is nothing to claim yet.
+    /// Claims the boot document stored under `ticket`. Returns `None`
+    /// while there is nothing to claim yet.
     async fn claim(&self, broker: &str, ticket: &str) -> Result<Option<String>>;
 }
 
@@ -54,6 +55,45 @@ pub struct Resolver<M, P, B> {
     pub broker: B,
     /// How often to check for a parameter that does not exist yet.
     pub poll_interval: Duration,
+}
+
+/// What the runner starts with.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Boot {
+    /// The encoded JIT config.
+    pub jit_config: String,
+    /// Where to report metrics. hatchrun.io sets it; the self-hosted
+    /// scaler and configs from user data or SSM do not.
+    #[serde(default)]
+    pub telemetry: Option<Telemetry>,
+}
+
+/// Where a hosted runner reports its metrics.
+#[derive(PartialEq, Eq, Deserialize)]
+pub struct Telemetry {
+    /// hatchrun-telemetry's base URL.
+    pub url: String,
+    /// The bearer token that names the runner's job. It stays in
+    /// memory and out of the log.
+    pub token: String,
+}
+
+impl std::fmt::Debug for Telemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Telemetry")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Boot {
+    fn config(jit_config: String) -> Self {
+        Self {
+            jit_config,
+            telemetry: None,
+        }
+    }
 }
 
 /// The JSON document the hatchrun scaler passes as user data.
@@ -79,30 +119,31 @@ enum FromUserData {
 
 impl<M: Metadata, P: Parameters, B: Broker> Resolver<M, P, B> {
     /// Returns the JIT config, in this order of precedence: a `jitConfig`
-    /// field in user data, a `broker` and `ticket` in user data, the
-    /// parameter named by the `hatchrun:jit-parameter` tag, or the
-    /// github-aws-runners token parameter. A ticket is claimed and a
-    /// parameter read and deleted, both polled until the config is there.
-    /// Callers bound the wait with a timeout.
-    pub async fn jit_config(&self) -> Result<String> {
+    /// field in user data, the boot document a `broker` and `ticket` in
+    /// user data claim, the parameter named by the
+    /// `hatchrun:jit-parameter` tag, or the github-aws-runners token
+    /// parameter. A ticket is claimed and a parameter read and deleted,
+    /// both polled until the config is there. Callers bound the wait with
+    /// a timeout.
+    pub async fn boot(&self) -> Result<Boot> {
         let user_data = self.metadata.user_data().await.context("read user data")?;
         match from_user_data(user_data.as_deref().unwrap_or_default())? {
-            Some(FromUserData::Config(config)) => return Ok(config),
+            Some(FromUserData::Config(config)) => return Ok(Boot::config(config)),
             Some(FromUserData::Ticket { broker, ticket }) => {
                 return self.claim(&broker, &ticket).await;
             }
             None => {}
         }
         let name = self.parameter_name().await?;
-        self.take_parameter(&name).await
+        Ok(Boot::config(self.take_parameter(&name).await?))
     }
 
-    /// The scaler stores the config after the instance launched, so the
-    /// first claims often find nothing.
-    async fn claim(&self, broker: &str, ticket: &str) -> Result<String> {
+    /// The scaler stores the boot document after the instance launched,
+    /// so the first claims often find nothing.
+    async fn claim(&self, broker: &str, ticket: &str) -> Result<Boot> {
         loop {
-            if let Some(config) = self.broker.claim(broker, ticket).await? {
-                return Ok(config);
+            if let Some(doc) = self.broker.claim(broker, ticket).await? {
+                return serde_json::from_str(&doc).context("parse boot document");
             }
             tokio::time::sleep(self.poll_interval).await;
         }
@@ -322,10 +363,10 @@ mod tests {
             ..Default::default()
         };
         let config = resolver(metadata, FakeParameters::default())
-            .jit_config()
+            .boot()
             .await
             .unwrap();
-        assert_eq!(config, "jit-from-user-data");
+        assert_eq!(config, Boot::config("jit-from-user-data".into()));
     }
 
     #[tokio::test]
@@ -335,10 +376,10 @@ mod tests {
             ..Default::default()
         };
         let config = resolver(metadata, FakeParameters::default())
-            .jit_config()
+            .boot()
             .await
             .unwrap();
-        assert_eq!(config, "jit-gzip");
+        assert_eq!(config, Boot::config("jit-gzip".into()));
     }
 
     #[tokio::test]
@@ -348,13 +389,24 @@ mod tests {
             ..Default::default()
         };
         let broker = FakeBroker {
-            config: Some("jit-from-broker"),
+            config: Some(
+                r#"{"jitConfig":"jit-from-broker","telemetry":{"url":"https://telemetry.example.com","token":"a.b.c"}}"#,
+            ),
             missing_claims: Cell::new(2),
             ..Default::default()
         };
         let resolver = with_broker(metadata, FakeParameters::default(), broker);
 
-        assert_eq!(resolver.jit_config().await.unwrap(), "jit-from-broker");
+        assert_eq!(
+            resolver.boot().await.unwrap(),
+            Boot {
+                jit_config: "jit-from-broker".into(),
+                telemetry: Some(Telemetry {
+                    url: "https://telemetry.example.com".into(),
+                    token: "a.b.c".into(),
+                }),
+            }
+        );
         let claims = resolver.broker.claims.borrow();
         assert_eq!(claims.len(), 3);
         assert_eq!(
@@ -364,13 +416,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scaler_boot_documents_have_no_telemetry() {
+        let metadata = FakeMetadata {
+            user_data: Some(br#"{"broker":"https://broker.example.com","ticket":"t-1"}"#.to_vec()),
+            ..Default::default()
+        };
+        let broker = FakeBroker {
+            config: Some(r#"{"jitConfig":"jit-from-scaler"}"#),
+            ..Default::default()
+        };
+        let resolver = with_broker(metadata, FakeParameters::default(), broker);
+        assert_eq!(
+            resolver.boot().await.unwrap(),
+            Boot::config("jit-from-scaler".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_config_from_the_broker_is_an_error() {
+        let metadata = FakeMetadata {
+            user_data: Some(br#"{"broker":"https://broker.example.com","ticket":"t-1"}"#.to_vec()),
+            ..Default::default()
+        };
+        let broker = FakeBroker {
+            config: Some("jit-1"),
+            ..Default::default()
+        };
+        let resolver = with_broker(metadata, FakeParameters::default(), broker);
+        let err = resolver.boot().await.unwrap_err();
+        assert!(err.to_string().contains("boot document"), "{err:#}");
+    }
+
+    #[tokio::test]
     async fn half_a_ticket_is_an_error() {
         let metadata = FakeMetadata {
             user_data: Some(br#"{"broker":"https://broker.example.com"}"#.to_vec()),
             ..Default::default()
         };
         let err = resolver(metadata, FakeParameters::default())
-            .jit_config()
+            .boot()
             .await
             .unwrap_err();
         assert!(
@@ -392,7 +476,7 @@ mod tests {
         };
         let resolver = resolver(metadata, parameters);
 
-        assert_eq!(resolver.jit_config().await.unwrap(), "jit-from-ssm");
+        assert_eq!(resolver.boot().await.unwrap().jit_config, "jit-from-ssm");
         assert_eq!(
             *resolver.parameters.deleted.borrow(),
             ["/hatchrun/jit/i-0123"]
@@ -417,7 +501,7 @@ mod tests {
         };
         let resolver = resolver(metadata, parameters);
 
-        assert_eq!(resolver.jit_config().await.unwrap(), "jit-from-module");
+        assert_eq!(resolver.boot().await.unwrap().jit_config, "jit-from-module");
         assert_eq!(
             *resolver.parameters.deleted.borrow(),
             ["/ghr/spot/runners/tokens/i-0123"]
@@ -436,15 +520,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolver(metadata, parameters).jit_config().await.unwrap(),
-            "jit-from-ssm"
+            resolver(metadata, parameters).boot().await.unwrap(),
+            Boot::config("jit-from-ssm".into())
         );
     }
 
     #[tokio::test]
     async fn no_source_is_an_error() {
         let err = resolver(FakeMetadata::default(), FakeParameters::default())
-            .jit_config()
+            .boot()
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no runner config"), "{err:#}");
@@ -458,7 +542,7 @@ mod tests {
         };
         assert!(
             resolver(metadata, FakeParameters::default())
-                .jit_config()
+                .boot()
                 .await
                 .is_err()
         );

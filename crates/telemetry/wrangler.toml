@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name = "hatchrun-telemetry"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-09-01"
+
+# Runners report here. The agent only talks to an HTTPS endpoint, which
+# the custom domain gives it.
+routes = [
+  { pattern = "telemetry.hatchrun.io", custom_domain = true },
+]
+
+[build]
+command = "cargo install --locked worker-build --version 0.8.7 && worker-build --release"
+
+# The only binding. hatchrun-cloud reads the dataset back through its
+# Analytics SQL binding.
+[[analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "hatchrun_runner_metrics"
+
+# Variables: TELEMETRY_PUBLIC_KEYS, the public half of hatchrun-cloud's
+# TELEMETRY_SIGNING_KEY as unpadded base64url, two separated by a comma
+# while the key is rotated. The deploy workflow passes it from the
+# production environment; wrangler dev reads it from .dev.vars.

@@ -2,13 +2,15 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! RS256 JSON Web Tokens, short of the signature: the signing input, the
+//! JSON Web Tokens, short of the signature: the signing input, the
 //! finished token, the private key in the form `WebCrypto` imports and
-//! the public half of that key, as the JWKS publishes it. The Worker
+//! the public half of an RSA key, as the JWKS publishes it. The Worker
 //! signs with `WebCrypto` (see [`crate::webcrypto`]).
 //!
-//! Two tokens use this: the GitHub App's JWT, signed with the key GitHub
-//! issued for the App, and the tenant token for AWS (see [`crate::oidc`]).
+//! Two RS256 tokens use this: the GitHub App's JWT, signed with the key
+//! GitHub issued for the App, and the tenant token for AWS (see
+//! [`crate::oidc`]). The runner's telemetry token is `EdDSA`, signed with
+//! a key of its own (see [`crate::telemetry`]).
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -26,6 +28,16 @@ pub fn signing_input(kid: Option<&str>, claims: &serde_json::Value) -> String {
         Some(kid) => serde_json::json!({ "alg": "RS256", "typ": "JWT", "kid": kid }),
         None => serde_json::json!({ "alg": "RS256", "typ": "JWT" }),
     };
+    join(&header, claims)
+}
+
+/// `header.claims` of an `EdDSA` token, signed with Ed25519.
+#[must_use]
+pub fn eddsa_signing_input(claims: &serde_json::Value) -> String {
+    join(&serde_json::json!({ "alg": "EdDSA", "typ": "JWT" }), claims)
+}
+
+fn join(header: &serde_json::Value, claims: &serde_json::Value) -> String {
     format!(
         "{}.{}",
         b64url(header.to_string()),
@@ -58,25 +70,58 @@ impl std::fmt::Display for KeyError {
 ///
 /// When the text is not one of those two PEM blocks.
 pub fn pkcs8_der(pem: &str) -> Result<Vec<u8>, KeyError> {
+    let (label, der) = pem_der(pem)?;
+    match label {
+        "RSA PRIVATE KEY" => Ok(wrap_pkcs1(&der)),
+        "PRIVATE KEY" => Ok(der),
+        _ => Err(KeyError("not an RSA private key in PEM")),
+    }
+}
+
+/// Reads an Ed25519 private key in PKCS#8 PEM (`BEGIN PRIVATE KEY`, as
+/// `openssl genpkey -algorithm ed25519` writes it) and returns its DER.
+///
+/// # Errors
+///
+/// When the text is not such a key.
+pub fn ed25519_pkcs8_der(pem: &str) -> Result<Vec<u8>, KeyError> {
+    const NOT_ED25519: KeyError = KeyError("not an Ed25519 private key in PEM");
+    let (label, der) = pem_der(pem)?;
+    if label != "PRIVATE KEY" {
+        return Err(NOT_ED25519);
+    }
+    // PrivateKeyInfo { version, AlgorithmIdentifier { OID }, OCTET STRING }
+    let (info, _) = element(&der, SEQUENCE)?;
+    let (_, info) = element(info, INTEGER)?;
+    let (algorithm, _) = element(info, SEQUENCE)?;
+    if element(algorithm, OID)?.0 != ED25519 {
+        return Err(NOT_ED25519);
+    }
+    Ok(der)
+}
+
+/// The label and DER of the first PEM block in `pem`.
+fn pem_der(pem: &str) -> Result<(&str, Vec<u8>), KeyError> {
     let mut lines = pem
         .lines()
         .map(str::trim)
         .skip_while(|line| line.is_empty());
-    let pkcs1 = match lines.next().unwrap_or_default() {
-        "-----BEGIN RSA PRIVATE KEY-----" => true,
-        "-----BEGIN PRIVATE KEY-----" => false,
-        _ => return Err(KeyError("not an RSA private key in PEM")),
-    };
+    let label = lines
+        .next()
+        .unwrap_or_default()
+        .strip_prefix("-----BEGIN ")
+        .and_then(|rest| rest.strip_suffix("-----"))
+        .ok_or(KeyError("private key is not PEM"))?;
     let body: String = lines
         .take_while(|line| !line.starts_with("-----END"))
         .collect();
     let der = STANDARD
         .decode(body)
         .map_err(|_| KeyError("private key PEM is not valid base64"))?;
-    if der.first() != Some(&0x30) {
+    if der.first() != Some(&SEQUENCE) {
         return Err(KeyError("private key is not DER"));
     }
-    Ok(if pkcs1 { wrap_pkcs1(&der) } else { der })
+    Ok((label, der))
 }
 
 /// An RSA public key: modulus and exponent as unsigned big-endian bytes
@@ -120,6 +165,8 @@ const OID: u8 = 0x06;
 const SEQUENCE: u8 = 0x30;
 /// 1.2.840.113549.1.1.1, rsaEncryption.
 const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+/// 1.3.101.112, id-Ed25519.
+const ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 
 /// Splits the DER element at the front of `der`, which must have tag
 /// `tag`, into its contents and whatever follows it.
@@ -214,6 +261,39 @@ mod tests {
         assert_eq!(URL_SAFE_NO_PAD.decode(claims).unwrap(), br#"{"iss":"x"}"#);
         assert!(!signing_input(None, &serde_json::json!({})).contains('='));
         assert_eq!(token("a.b", &[0xfb, 0xff]), "a.b.-_8");
+    }
+
+    #[test]
+    fn eddsa_signing_input_names_the_algorithm() {
+        let input = eddsa_signing_input(&serde_json::json!({ "exp": 1 }));
+        let (header, claims) = input.split_once('.').unwrap();
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(header).unwrap(),
+            br#"{"alg":"EdDSA","typ":"JWT"}"#
+        );
+        assert_eq!(URL_SAFE_NO_PAD.decode(claims).unwrap(), br#"{"exp":1}"#);
+    }
+
+    #[test]
+    fn reads_ed25519_keys() {
+        // The layout openssl genpkey -algorithm ed25519 writes, with a
+        // stand-in for the 32-byte seed.
+        let mut key = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        key.extend([7; 32]);
+        assert_eq!(ed25519_pkcs8_der(&pem("PRIVATE KEY", &key)).unwrap(), key);
+        // An RSA key in the same envelope is refused, and so is PKCS#1.
+        let mut algorithm = der(OID, RSA_ENCRYPTION);
+        algorithm.extend([0x05, 0x00]);
+        let mut info = der(INTEGER, &[0]);
+        info.extend(der(SEQUENCE, &algorithm));
+        info.extend(der(OCTET_STRING, &der(SEQUENCE, &[])));
+        let rsa = der(SEQUENCE, &info);
+        assert!(ed25519_pkcs8_der(&pem("PRIVATE KEY", &rsa)).is_err());
+        assert!(ed25519_pkcs8_der(&pem("RSA PRIVATE KEY", &[0x30, 0x00])).is_err());
+        assert!(ed25519_pkcs8_der("").is_err());
     }
 
     fn pem(label: &str, der: &[u8]) -> String {

@@ -138,7 +138,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
                 </thead>
                 <tbody>
                   {jobs.map((job) => (
-                    <JobRow key={job.id} job={job} region={page?.region ?? null} />
+                    <JobRow key={job.id} org={org} job={job} region={page?.region ?? null} />
                   ))}
                 </tbody>
               </table>
@@ -275,15 +275,17 @@ function state(job: Job): { text: string; tone: string } {
   return { text: STATUS[job.status], tone: job.status === "completed" ? "" : "success" };
 }
 
-function JobRow({ job, region }: { job: Job; region: string | null }) {
+function JobRow({ org, job, region }: { org: string; job: Job; region: string | null }) {
   const shown = state(job);
   return (
     <tr>
       <td>
         <a href={`https://github.com/${job.repository}/actions/runs/${job.runId}`} className="job-link">
           {job.repository}
-        </a>
-        <span className="muted small"> #{job.id}</span>
+        </a>{" "}
+        <Link href={`/o/${org}/jobs/${job.id}`} className="muted small">
+          #{job.id}
+        </Link>
       </td>
       <td>
         <code>{job.label}</code>

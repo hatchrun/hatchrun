@@ -16,7 +16,8 @@
 //!   [`tenants`]).
 //! - `/api/tenants/<org>/aws` connects the AWS account (see [`aws`]).
 //! - `/api/tenants/<org>/{jobs,settings}` serve the dashboard (see
-//!   [`dashboard`]).
+//!   [`dashboard`]); `/api/tenants/<org>/jobs/<id>/metrics` serves one
+//!   job's CPU and memory (see [`metrics`]).
 //! - `/api/tenants/<org>/runners` manages runner profiles (see
 //!   [`runners`]).
 //! - `/api/plan`, `/api/tenants/<org>/{checkout,portal,beta}` and
@@ -31,6 +32,7 @@ mod aws;
 mod billing;
 mod dashboard;
 mod images;
+mod metrics;
 mod runners;
 mod tenants;
 
@@ -167,6 +169,7 @@ impl Session {
 }
 
 /// Answers a request under `/api`.
+#[allow(clippy::too_many_lines)] // One match arm per route.
 pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
     let config = Config::read(&env)?;
     let db = env.d1(DB)?;
@@ -245,6 +248,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Get, ["tenants", org, "aws"]) => aws::instructions(&ctx, org).await,
         (Method::Post, ["tenants", org, "aws"]) => aws::verify(&ctx, org, req.json().await?).await,
         (Method::Get, ["tenants", org, "jobs"]) => dashboard::jobs(&ctx, org, &req).await,
+        (Method::Get, ["tenants", org, "jobs", id, "metrics"]) => metrics::job(&ctx, org, id).await,
         (Method::Put, ["tenants", org, "settings"]) => {
             dashboard::settings(&ctx, org, req.json().await?).await
         }

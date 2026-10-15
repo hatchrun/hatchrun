@@ -18,7 +18,7 @@ use hatchrun_scaleset::{
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
-use crate::broker::{ConfigStore, boot_document, new_ticket};
+use crate::broker::{ConfigStore, new_ticket, user_data};
 use crate::ec2::Cloud;
 use crate::github::GitHub;
 
@@ -353,7 +353,7 @@ where
             .map_err(|err| (None, anyhow::Error::new(err).context("generate JIT config")))?;
         let runner_id = config.runner.id;
         let ticket = new_ticket().map_err(|err| (Some(runner_id), err))?;
-        let user_data = boot_document(self.store.url(), &ticket);
+        let user_data = user_data(self.store.url(), &ticket);
         let instance_id = match pooled {
             // On failure the scaler removes the runner, which terminates
             // the pool instance: it may already carry the runner's ticket.

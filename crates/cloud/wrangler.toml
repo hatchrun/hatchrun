@@ -38,10 +38,17 @@ database_name = "hatchrun-cloud"
 database_id = "local"
 migrations_dir = "migrations"
 
+# Runner metrics, which hatchrun-telemetry (crates/telemetry) writes to
+# Analytics Engine, read back for the app's job pages.
+[analytics]
+binding = "ANALYTICS_SQL"
+
 # Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY (PEM),
 # GITHUB_CLIENT_SECRET (the App's client secret, for sign-in),
 # POLAR_ACCESS_TOKEN and POLAR_WEBHOOK_SECRET (billing),
-# OIDC_SIGNING_KEY (RSA private key in PEM) and BROKER_TOKEN, plus
+# OIDC_SIGNING_KEY (RSA private key in PEM), BROKER_TOKEN and
+# TELEMETRY_SIGNING_KEY (Ed25519 private key in PKCS#8 PEM, which signs
+# runners' telemetry tokens and nothing else), plus
 # OIDC_NEXT_SIGNING_KEY and OIDC_PREVIOUS_SIGNING_KEY while a key is
 # rotated. Variables: those below. GITHUB_API_URL, GITHUB_WEB_URL,
 # AWS_ENDPOINT_URL and ACTIONS_OIDC_ISSUER point the Worker at local
@@ -68,6 +75,9 @@ POLAR_PRODUCT_ID = "3c463c01-28ec-4f97-9892-7909cd6c7ea7,f4bdf273-20f0-4c4e-9df5
 # hatchrun-broker (crates/broker), where launches store runner configs.
 # Both Workers share BROKER_TOKEN.
 BROKER_URL = "https://broker.hatchrun.io"
+# hatchrun-telemetry (crates/telemetry), where runners report CPU and
+# memory with a token signed by TELEMETRY_SIGNING_KEY.
+TELEMETRY_URL = "https://telemetry.hatchrun.io"
 # kid of OIDC_SIGNING_KEY in oidc.hatchrun.io's JWKS. The JWKS also
 # lists OIDC_NEXT_SIGNING_KEY and OIDC_PREVIOUS_SIGNING_KEY while
 # OIDC_NEXT_KEY_ID and OIDC_PREVIOUS_KEY_ID are set here. The README

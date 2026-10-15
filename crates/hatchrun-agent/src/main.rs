@@ -5,14 +5,17 @@
 //! hatchrun-agent runs on a runner instance at boot. It fetches the
 //! instance's just-in-time runner config, runs exactly one GitHub Actions job
 //! and exits. The systemd unit powers the instance off when it exits, whether
-//! the job ran or the agent failed.
+//! the job ran or the agent failed. On hatchrun.io launches it reports the
+//! instance's CPU and memory while the job runs (see [`telemetry`]).
 
 mod broker;
 mod envfile;
 mod imds;
+mod metrics;
 mod runner;
 mod source;
 mod ssm;
+mod telemetry;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -27,9 +30,11 @@ use tracing_subscriber::EnvFilter;
 
 use crate::broker::HttpBroker;
 use crate::imds::Imds;
+use crate::metrics::Sampler;
 use crate::runner::Runner;
 use crate::source::Resolver;
 use crate::ssm::Ssm;
+use crate::telemetry::{Machine, Reporter};
 
 #[derive(Parser)]
 #[command(version = env!("HATCHRUN_VERSION"), about)]
@@ -137,11 +142,16 @@ async fn run(args: Args) -> Result<()> {
         poll_interval: args.poll_interval,
     };
 
-    let jit_config = tokio::select! {
-        result = tokio::time::timeout(args.config_timeout, resolver.jit_config()) => {
+    let boot = tokio::select! {
+        result = tokio::time::timeout(args.config_timeout, resolver.boot()) => {
             result.map_err(|_| anyhow!("no runner config after {:?}", args.config_timeout))??
         }
         () = &mut shutdown => bail!("stopped before the runner config arrived"),
+    };
+
+    let reporter = match boot.telemetry {
+        Some(telemetry) => start_reporter(&resolver.metadata, telemetry).await,
+        None => None,
     };
 
     let runner = Runner {
@@ -151,10 +161,55 @@ async fn run(args: Args) -> Result<()> {
         stop_timeout: args.stop_timeout,
     };
     info!(dir = %runner.dir.display(), user = runner.user.as_deref().unwrap_or("(agent)"), "starting runner");
-    let status = runner.run(&jit_config, shutdown).await?;
+    let run = runner.run(&boot.jit_config, shutdown);
+    let status = match reporter {
+        Some(mut reporter) => {
+            let status = tokio::select! {
+                status = run => status,
+                never = reporter.collect() => match never {},
+            };
+            reporter.finish().await;
+            status
+        }
+        None => run.await,
+    }?;
     if !status.success() {
         bail!("runner exited with {status}");
     }
     info!("runner exited");
     Ok(())
+}
+
+/// The metrics reporter for a hosted launch. A reporter that cannot
+/// start is logged and skipped; the job runs either way.
+async fn start_reporter(metadata: &Imds, telemetry: source::Telemetry) -> Option<Reporter> {
+    // Metadata answered for the user data a moment ago; the job does not
+    // wait long for it a second time.
+    let instance_type =
+        match tokio::time::timeout(Duration::from_secs(2), metadata.instance_type()).await {
+            Ok(Ok(instance_type)) => instance_type,
+            Ok(Err(err)) => {
+                warn!("{err:#}");
+                "unknown".to_owned()
+            }
+            Err(_) => {
+                warn!("instance metadata has no instance-type after 2s");
+                "unknown".to_owned()
+            }
+        };
+    let machine = Machine {
+        instance_type,
+        arch: std::env::consts::ARCH,
+        agent_version: env!("HATCHRUN_VERSION"),
+    };
+    match Reporter::new(telemetry, machine, Sampler::new("/")) {
+        Ok(reporter) => {
+            info!("reporting metrics");
+            Some(reporter)
+        }
+        Err(err) => {
+            warn!("not reporting metrics: {err:#}");
+            None
+        }
+    }
 }

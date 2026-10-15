@@ -235,6 +235,24 @@ const routes: Record<string, Handler> = {
       },
     ];
   },
+  "GET /api/tenants/:org/jobs/:id/metrics": (_req, url) => {
+    const [, , , org, , id] = url.pathname.split("/");
+    const tenant = findTenant(org ?? "");
+    const job = sampleJobs(Date.now()).find((job) => String(job.id) === id);
+    if (!tenant || !job) {
+      return [404, { error: `no job ${id} here` }];
+    }
+    const windows = job.launchState === "launched" ? sampleWindows(job.queuedAt) : [];
+    return [
+      200,
+      {
+        githubUrl: `https://github.com/${job.repository}/actions/runs/${job.runId}/job/${job.id}`,
+        job,
+        summary: windows.length === 0 ? null : summarize(windows),
+        windows,
+      },
+    ];
+  },
   "PUT /api/tenants/:org/settings": (_req, url, body) => {
     const tenant = findTenant(url.pathname.split("/")[3] ?? "");
     if (!tenant) {
@@ -367,6 +385,48 @@ export function mockApi(): Plugin {
         answer(res, result[0], result[1]);
       });
     },
+  };
+}
+
+/** Twelve minutes of a build: a busy compile, a quiet test run, one OOM kill. */
+function sampleWindows(queuedAt: number) {
+  const gib = 1024 ** 3;
+  const start = Math.round(queuedAt / 1000) + 40;
+  return Array.from({ length: 72 }, (_, i) => {
+    const busy = i < 40 ? 70 + 25 * Math.sin(i / 3) : 25 + 10 * Math.sin(i / 2);
+    return {
+      at: start + (i + 1) * 10,
+      seconds: 10,
+      cpuMin: Math.max(0, busy - 20),
+      cpuAvg: busy,
+      cpuMax: Math.min(100, busy + 15),
+      cpuSteal: 0.4,
+      memMax: (i < 40 ? 2 + i * 0.12 : 3.2) * gib,
+      memTotal: 8 * gib,
+      cgroupPeak: 6.9 * gib,
+      oomKills: i === 38 ? 1 : 0,
+      diskUsed: (11 + i * 0.05) * gib,
+      netRx: i < 6 ? 120e6 : 2e6,
+      netTx: 1e6,
+    };
+  });
+}
+
+function summarize(windows: ReturnType<typeof sampleWindows>) {
+  const sum = (pick: (w: (typeof windows)[number]) => number) => windows.reduce((total, w) => total + pick(w), 0);
+  const max = (pick: (w: (typeof windows)[number]) => number) => Math.max(...windows.map(pick));
+  return {
+    seconds: sum((w) => w.seconds),
+    cpuAvg: sum((w) => w.cpuAvg) / windows.length,
+    cpuMax: max((w) => w.cpuMax),
+    cpuSteal: sum((w) => w.cpuSteal) / windows.length,
+    memMax: max((w) => w.memMax),
+    memTotal: max((w) => w.memTotal),
+    cgroupPeak: max((w) => w.cgroupPeak),
+    oomKills: sum((w) => w.oomKills),
+    diskUsed: max((w) => w.diskUsed),
+    netRx: sum((w) => w.netRx),
+    netTx: sum((w) => w.netTx),
   };
 }
 

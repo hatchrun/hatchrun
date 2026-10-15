@@ -10,13 +10,14 @@ import { Link, navigate, useQuery } from "../router";
 import { ChoosePlan, PlanSummary } from "./Billing";
 import { AwsSummary, ConnectAws } from "./ConnectAws";
 import { Dashboard } from "./Dashboard";
+import { JobPage } from "./JobPage";
 import { RunnersPage } from "./Runners";
 import { TenantSettings } from "./TenantSettings";
 
 /** Whether every setup step is done. */
 export const setUp = (tenant: Tenant) => Object.values(tenant.steps).every(Boolean);
 
-/** A tenant's pages behind a sidebar: setup until it is done, then the dashboard; runner profiles and settings. */
+/** A tenant's pages behind a sidebar: setup until it is done, then the dashboard and its jobs; runner profiles and settings. */
 export function TenantPage({
   tenant: loaded,
   section,
@@ -55,7 +56,9 @@ export function TenantPage({
         </ul>
       </nav>
       <div className="org-main">
-        {section === "runners" ? (
+        {section === "jobs" && item ? (
+          <JobPage org={org} id={item} />
+        ) : section === "runners" ? (
           <RunnersPage tenant={tenant} item={item} />
         ) : section === "settings" ? (
           <TenantSettings tenant={tenant} onChange={setTenant} />
