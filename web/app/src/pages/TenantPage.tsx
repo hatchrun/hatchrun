@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { getTenant, type Tenant } from "../api";
 import { Checklist, type Step } from "../components/Checklist";
@@ -16,7 +16,7 @@ import { TenantSettings } from "./TenantSettings";
 /** Whether every setup step is done. */
 export const setUp = (tenant: Tenant) => Object.values(tenant.steps).every(Boolean);
 
-/** A tenant's pages: setup until it is done, then the dashboard; runner profiles and settings. */
+/** A tenant's pages behind a sidebar: setup until it is done, then the dashboard; runner profiles and settings. */
 export function TenantPage({
   tenant: loaded,
   section,
@@ -28,30 +28,99 @@ export function TenantPage({
 }) {
   const [tenant, setTenant] = useState(loaded);
   const org = tenant.org.login;
-  const tabs = [
-    { href: `/o/${org}`, label: setUp(tenant) ? "Jobs" : "Setup", current: section === undefined },
-    { href: `/o/${org}/runners`, label: "Runners", current: section === "runners" },
-    { href: `/o/${org}/settings`, label: "Settings", current: section === "settings" },
+  const ready = setUp(tenant);
+  const links = [
+    {
+      href: `/o/${org}`,
+      label: ready ? "Jobs" : "Setup",
+      icon: ready ? <JobsIcon /> : <SetupIcon />,
+      current: section === undefined || section === "jobs",
+    },
+    { href: `/o/${org}/runners`, label: "Runners", icon: <RunnersIcon />, current: section === "runners" },
+    { href: `/o/${org}/settings`, label: "Settings", icon: <SettingsIcon />, current: section === "settings" },
   ];
   return (
-    <>
-      <nav className="tabs" aria-label={`${org} pages`}>
-        {tabs.map((tab) => (
-          <Link key={tab.href} href={tab.href} className="tab" aria-current={tab.current ? "page" : undefined}>
-            {tab.label}
-          </Link>
-        ))}
+    <div className="org">
+      <nav className="sidenav" aria-label={`${org} pages`}>
+        <p className="sidenav-label">Organization</p>
+        <ul>
+          {links.map((link) => (
+            <li key={link.href}>
+              <Link href={link.href} className="sidenav-link" aria-current={link.current ? "page" : undefined}>
+                {link.icon}
+                <span>{link.label}</span>
+              </Link>
+            </li>
+          ))}
+        </ul>
       </nav>
-      {section === "runners" ? (
-        <RunnersPage tenant={tenant} item={item} />
-      ) : section === "settings" ? (
-        <TenantSettings tenant={tenant} onChange={setTenant} />
-      ) : setUp(tenant) && !new URLSearchParams(window.location.search).has("checkout") ? (
-        <Dashboard tenant={tenant} />
-      ) : (
-        <Setup tenant={tenant} setTenant={setTenant} />
-      )}
-    </>
+      <div className="org-main">
+        {section === "runners" ? (
+          <RunnersPage tenant={tenant} item={item} />
+        ) : section === "settings" ? (
+          <TenantSettings tenant={tenant} onChange={setTenant} />
+        ) : ready && !new URLSearchParams(window.location.search).has("checkout") ? (
+          <Dashboard tenant={tenant} />
+        ) : (
+          <Setup tenant={tenant} setTenant={setTenant} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Icon({ children }: { children: ReactNode }) {
+  return (
+    <svg
+      className="sidenav-icon"
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
+
+function JobsIcon() {
+  return (
+    <Icon>
+      <path d="M5.5 4 12 8l-6.5 4z" />
+    </Icon>
+  );
+}
+
+function SetupIcon() {
+  return (
+    <Icon>
+      <path d="m2.5 4.5 1.5 1.5 2.5-2.5M2.5 10.5 4 12l2.5-2.5M9 5h4.5M9 11h4.5" />
+    </Icon>
+  );
+}
+
+function RunnersIcon() {
+  return (
+    <Icon>
+      <rect x="2" y="2.5" width="12" height="4.5" rx="1.2" />
+      <rect x="2" y="9" width="12" height="4.5" rx="1.2" />
+      <path d="M4.75 4.75h.01M4.75 11.25h.01" />
+    </Icon>
+  );
+}
+
+function SettingsIcon() {
+  return (
+    <Icon>
+      <path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6" />
+      <circle cx="10" cy="4.5" r="1.5" />
+      <circle cx="6" cy="11.5" r="1.5" />
+    </Icon>
   );
 }
 
