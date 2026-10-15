@@ -307,8 +307,12 @@ template keep the values the stack was created with.
 Published stacks do not change when `connect.yaml` does. The settings
 parameter carries the template's `version`; a change to the template
 bumps it and `TEMPLATE_VERSION` in
-[`connect.rs`](crates/cloud/src/connect.rs) together (a test fails
-otherwise) and adds what the version brings to `CHANGES`. The
+[`connect.rs`](crates/cloud/src/connect.rs) together (a test and
+the `template-version` CI job fail otherwise) and adds what the version
+brings to `CHANGES`. Owners update on their own schedule, so the Worker
+ignores settings fields it does not know, and fields added later take
+defaults: a stack can be updated before or after the release that
+reads it. The
 dashboard of a tenant on an older stack, or one still limited by the
 old family list, says what an update brings and how to apply it in the
 console or with the AWS CLI. The reconciler reads each tenant's stack
