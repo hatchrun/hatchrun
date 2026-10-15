@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! What a tenant's connect stack allows, as the tags on its launch
-//! template say (see [`crate::connect`]), kept on the tenant row. The
+//! What a tenant's connect stack allows, as its settings parameter says
+//! (see [`crate::connect`]), kept on the tenant row. The
 //! app records it when an owner verifies the role and the reconciler
 //! again once a day, so a stack the owner updated is picked up either
 //! way.
@@ -11,33 +11,31 @@
 use wasm_bindgen::JsValue;
 use worker::{D1Database, Result};
 
-use crate::aws::ec2::LaunchTemplate;
+use crate::connect::Stack;
 use crate::int;
 
-/// How often the reconciler reads a tenant's launch template again, in
+/// How often the reconciler reads a tenant's stack settings again, in
 /// milliseconds.
 pub const CHECK_EVERY: u64 = 24 * 60 * 60 * 1000;
 
-/// Records `template` on the tenant at `now`. Returns whether anything
-/// it says changed.
+/// Records `stack` on the tenant at `now`. Returns whether anything it
+/// says changed.
 pub(crate) async fn record(
     db: &D1Database,
     tenant_id: &str,
-    template: &LaunchTemplate,
+    stack: &Stack,
     now: u64,
 ) -> Result<bool> {
-    let text = |value: Option<&str>| value.map_or(JsValue::NULL, Into::into);
-    let number = |value: Option<u16>| value.map_or(JsValue::NULL, Into::into);
-    let values = [
+    let values: [JsValue; 10] = [
         tenant_id.into(),
-        template.id.as_str().into(),
-        template.subnets.join(",").into(),
-        text(template.instance_types.as_deref()),
-        number(template.volume_size_limit),
-        number(template.root_volume_size),
-        u8::from(template.fleet).into(),
-        text(template.excluded_instance_types.as_deref()),
-        template.template_version.map_or(JsValue::NULL, Into::into),
+        stack.launch_template_id.as_str().into(),
+        stack.subnets.join(",").into(),
+        stack.instance_types.as_str().into(),
+        stack.volume_size_limit.into(),
+        stack.root_volume_size.into(),
+        u8::from(stack.fleet).into(),
+        stack.excluded_instance_types.as_str().into(),
+        stack.version.into(),
         int(now)?,
     ];
     let results = db

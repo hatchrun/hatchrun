@@ -46,7 +46,7 @@ use worker::{D1Database, D1PreparedStatement, Env, console_error, console_log, c
 
 use self::plan::{Instance, Job, LaunchState, Limits, Plan};
 use crate::aws::describe;
-use crate::aws::{self, Credentials, ec2, instances};
+use crate::aws::{self, Credentials, ec2, instances, ssm};
 use crate::fetch::{send, send_reading};
 use crate::instance_types::{self, store as catalog};
 use crate::launch::{self, APP_KEY, AWS_ENDPOINT_URL};
@@ -677,7 +677,7 @@ impl Pass<'_> {
                 > crate::stack::CHECK_EVERY
             && self.spend(1)
         {
-            match self.check_stack(tenant, credentials, &endpoint).await {
+            match self.check_stack(tenant, credentials).await {
                 Ok(true) => done.stacks_changed += 1,
                 Ok(false) => {}
                 Err(err) => {
@@ -702,41 +702,40 @@ impl Pass<'_> {
         self.launch(tenant, &plan, done).await
     }
 
-    /// Reads the tenant's launch template again and records what it
-    /// says. Returns whether it changed; a change puts jobs waiting for
+    /// Reads the tenant's stack settings again and records what they
+    /// say. Returns whether they changed; a change puts jobs waiting for
     /// the setup back in line.
-    async fn check_stack(
-        &self,
-        tenant: &Tenant,
-        credentials: &Credentials,
-        endpoint: &str,
-    ) -> Fallible<bool> {
-        let mut request = ec2::describe_launch_templates(endpoint, &tenant.id);
-        aws::sign_v4(&mut request, credentials, &tenant.region, "ec2", now_ms())?;
-        let templates = ec2::launch_templates(&send(&request).await?)
-            .map_err(|err| format!("DescribeLaunchTemplates: {err}"))?;
-        let Some(template) = crate::connect::newest(templates) else {
-            // Stamped all the same, so a deleted stack is not asked about
-            // every minute; launches say what is wrong.
-            self.db
-                .prepare("UPDATE tenants SET stack_checked_at = ?2 WHERE id = ?1")
-                .bind(&[tenant.id.as_str().into(), int(self.now).map_err(text)?])
-                .map_err(text)?
-                .run()
-                .await
-                .map_err(text)?;
-            return Err("no launch template tagged for the tenant".to_owned());
+    async fn check_stack(&self, tenant: &Tenant, credentials: &Credentials) -> Fallible<bool> {
+        let endpoint = aws::endpoint("ssm", &tenant.region, self.aws_endpoint.as_deref());
+        let mut request =
+            ssm::get_parameter(&endpoint, &crate::connect::parameter_name(&tenant.id));
+        aws::sign_v4(&mut request, credentials, &tenant.region, "ssm", now_ms())?;
+        let stack = ssm::value(&send(&request).await?)
+            .map_err(|err| format!("GetParameter: {err}"))
+            .and_then(|value| crate::connect::Stack::parse(&value));
+        let stack = match stack {
+            Ok(stack) => stack,
+            Err(err) => {
+                // Stamped all the same, so a deleted stack is not asked about
+                // every minute; launches say what is wrong.
+                self.db
+                    .prepare("UPDATE tenants SET stack_checked_at = ?2 WHERE id = ?1")
+                    .bind(&[tenant.id.as_str().into(), int(self.now).map_err(text)?])
+                    .map_err(text)?
+                    .run()
+                    .await
+                    .map_err(text)?;
+                return Err(err);
+            }
         };
-        let changed = crate::stack::record(&self.db, &tenant.id, &template, self.now)
+        let changed = crate::stack::record(&self.db, &tenant.id, &stack, self.now)
             .await
             .map_err(text)?;
         if changed {
             console_log!(
                 "reconcile: tenant {}: connect stack changed, template version {}",
                 tenant.id,
-                template
-                    .template_version
-                    .map_or_else(|| "1".to_owned(), |version| version.to_string())
+                stack.version
             );
             launch::recheck(&self.db, &tenant.id).await.map_err(text)?;
         }

@@ -15,7 +15,7 @@ use worker::Response;
 
 use super::tenants::{authorize, show};
 use super::{Answer, Ctx, Failure, get, need};
-use crate::aws::{self, Credentials, ec2};
+use crate::aws::{self, Credentials, ec2, ssm};
 use crate::fetch::send;
 use crate::launch::{AWS_ENDPOINT_URL, tenant_credentials};
 use crate::{connect, int, jwt, now_ms, oidc, settings};
@@ -133,36 +133,43 @@ pub(crate) async fn verify(ctx: &Ctx<'_>, org: &str, body: Connect) -> Answer {
         _ => Failure::new(502, format!("AssumeRoleWithWebIdentity: {err}")),
     })?;
 
-    let endpoint = aws::endpoint("ec2", &body.region, endpoint_override.as_deref());
-    let mut request = ec2::describe_launch_templates(&endpoint, &row.id);
-    let templates = ec2::launch_templates(&signed(&mut request, &credentials, &body.region).await?)
-        .map_err(|err| describe_failure("DescribeLaunchTemplates", &err))?;
-    let Some(template) = connect::newest(templates) else {
-        return Err(refused(format!(
-            "The role works, but {} has no hatchrun launch template for tenant {}. \
-             Check that the stack is in this region and finished creating.",
-            body.region, row.id
-        )));
-    };
-    if template.subnets.is_empty() {
-        return Err(refused(format!(
-            "Launch template {} has no subnets tagged. Update the stack to the latest \
-             connect.yaml.",
-            template.id
-        )));
-    }
-    let mut request = ec2::describe_subnets(&endpoint, &template.subnets);
-    let found =
-        ec2::subnets(&signed(&mut request, &credentials, &body.region).await?).map_err(|err| {
-            match err.code.as_str() {
-                "InvalidSubnetID.NotFound" => refused(format!(
-                    "A subnet of the stack no longer exists: {}",
-                    err.message
-                )),
-                _ => describe_failure("DescribeSubnets", &err),
-            }
+    let ssm = aws::endpoint("ssm", &body.region, endpoint_override.as_deref());
+    let mut request = ssm::get_parameter(&ssm, &connect::parameter_name(&row.id));
+    let answer = signed(&mut request, &credentials, &body.region, "ssm").await?;
+    let stack = ssm::value(&answer)
+        .map_err(|err| match err.code.as_str() {
+            "ParameterNotFound" => refused(format!(
+                "The role works, but {} has no hatchrun stack settings for tenant {}. Check \
+                 that the stack is in this region and finished creating, or update it to the \
+                 latest connect.yaml.",
+                body.region, row.id
+            )),
+            _ => describe_failure("GetParameter", &err),
+        })
+        .and_then(|value| {
+            connect::Stack::parse(&value).map_err(|err| {
+                refused(format!(
+                    "The stack's settings are not what hatchrun expects ({err}). Update the \
+                     stack to the latest connect.yaml."
+                ))
+            })
         })?;
-    if let Some(missing) = template
+    if stack.subnets.is_empty() {
+        return Err(refused(
+            "The stack names no subnets. Update the stack to the latest connect.yaml.",
+        ));
+    }
+    let endpoint = aws::endpoint("ec2", &body.region, endpoint_override.as_deref());
+    let mut request = ec2::describe_subnets(&endpoint, &stack.subnets);
+    let found = ec2::subnets(&signed(&mut request, &credentials, &body.region, "ec2").await?)
+        .map_err(|err| match err.code.as_str() {
+            "InvalidSubnetID.NotFound" => refused(format!(
+                "A subnet of the stack no longer exists: {}",
+                err.message
+            )),
+            _ => describe_failure("DescribeSubnets", &err),
+        })?;
+    if let Some(missing) = stack
         .subnets
         .iter()
         .find(|subnet| !found.iter().any(|found| &found.id == *subnet))
@@ -170,7 +177,7 @@ pub(crate) async fn verify(ctx: &Ctx<'_>, org: &str, body: Connect) -> Answer {
         return Err(refused(format!("Subnet {missing} does not exist")));
     }
 
-    save(ctx, &row.id, role_arn, &body.region, &template).await?;
+    save(ctx, &row.id, role_arn, &body.region, &stack).await?;
     crate::launch::recheck(ctx.db, &row.id).await?;
     show(ctx, &row.org_login).await
 }
@@ -181,7 +188,7 @@ async fn save(
     tenant: &str,
     role_arn: &str,
     region: &str,
-    template: &ec2::LaunchTemplate,
+    stack: &connect::Stack,
 ) -> worker::Result<()> {
     ctx.db
         .prepare("UPDATE tenants SET role_arn = ?2, region = ?3, updated_at = ?4 WHERE id = ?1")
@@ -193,12 +200,15 @@ async fn save(
         ])?
         .run()
         .await?;
-    crate::stack::record(ctx.db, tenant, template, now_ms()).await?;
+    crate::stack::record(ctx.db, tenant, stack, now_ms()).await?;
     Ok(())
 }
 
 fn describe_failure(action: &str, err: &aws::Error) -> Failure {
-    if err.code == "UnauthorizedOperation" {
+    if matches!(
+        err.code.as_str(),
+        "UnauthorizedOperation" | "AccessDeniedException"
+    ) {
         return refused(format!(
             "The role may not call {action}. Update the stack to the latest connect.yaml."
         ));
@@ -210,7 +220,8 @@ async fn signed(
     request: &mut crate::http::Request,
     credentials: &Credentials,
     region: &str,
+    service: &str,
 ) -> Result<crate::http::Response, Failure> {
-    aws::sign_v4(request, credentials, region, "ec2", now_ms())?;
+    aws::sign_v4(request, credentials, region, service, now_ms())?;
     Ok(send(request).await?)
 }
