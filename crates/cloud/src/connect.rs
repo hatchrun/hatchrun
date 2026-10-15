@@ -53,7 +53,7 @@ pub const STACK_NAME: &str = "hatchrun";
 /// The version of deploy/cloudformation/connect.yaml in this release,
 /// as its settings parameter says. A stack from before the version was
 /// recorded is version 1.
-pub const TEMPLATE_VERSION: u32 = 4;
+pub const TEMPLATE_VERSION: u32 = 5;
 
 /// What each version of connect.yaml brings, in words for the owner.
 pub const CHANGES: &[(u32, &str)] = &[
@@ -76,6 +76,14 @@ pub const CHANGES: &[(u32, &str)] = &[
          so later stack updates, such as new instance type limits, take effect. Until you \
          update, hatchrun keeps the settings it last read and ignores changes to the \
          stack's parameters.",
+    ),
+    (
+        5,
+        "The stack adds an S3 bucket for job caches, kept in this region and emptied after \
+         CacheRetentionDays. hatchrun may also use security groups and capacity \
+         reservations you tag with hatchrun:tenant, keep cache volumes and snapshots, read \
+         a runner's boot log, and pass roles under the /hatchrun/ path to runners you \
+         choose. Runners keep working until you update; the new features need it.",
     ),
 ];
 
@@ -232,6 +240,9 @@ pub struct Stack {
     pub root_volume_size: u16,
     /// Whether the role may launch with EC2 Fleet.
     pub fleet: bool,
+    /// The bucket for job caches, from version 5.
+    #[serde(default)]
+    pub cache_bucket: Option<String>,
 }
 
 impl Stack {
@@ -305,7 +316,7 @@ mod tests {
 
     #[test]
     fn says_what_an_update_brings() {
-        assert_eq!(changes_since(None).len(), 3);
+        assert_eq!(changes_since(None).len(), 4);
         assert_eq!(changes_since(Some(1)), changes_since(None));
         assert_eq!(changes_since(Some(TEMPLATE_VERSION)), Vec::<&str>::new());
         assert_eq!(
@@ -360,6 +371,7 @@ mod tests {
                 volume_size_limit: 500,
                 root_volume_size: 40,
                 fleet: true,
+                cache_bucket: None,
             }
         );
         assert!(Stack::parse(r#"{"version":4}"#).is_err());
@@ -390,6 +402,7 @@ mod tests {
             ("Excluded", "g*,*.metal*"),
             ("VolumeSizeLimit", "500"),
             ("RootVolumeSize", "40"),
+            ("CacheBucket", "hatchrun-cache"),
         ] {
             value = value.replace(&format!("${{{name}}}"), sample);
         }
@@ -397,5 +410,6 @@ mod tests {
         assert_eq!(stack.version, TEMPLATE_VERSION);
         assert_eq!(stack.subnets, ["subnet-a", "subnet-b"]);
         assert!(stack.fleet);
+        assert_eq!(stack.cache_bucket.as_deref(), Some("hatchrun-cache"));
     }
 }
