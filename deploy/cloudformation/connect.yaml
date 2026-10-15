@@ -22,6 +22,7 @@ Metadata:
       - Label: { default: Runners }
         Parameters:
           - RootVolumeSize
+          - CacheRetentionDays
       - Label: { default: Network }
         Parameters:
           - VpcId
@@ -31,7 +32,8 @@ Metadata:
       OidcProviderArn: { default: Existing hatchrun.io OIDC provider }
       InstanceTypes: { default: Allowed instance types }
       ExcludedInstanceTypes: { default: Refused instance types }
-      VolumeSizeLimit: { default: Largest root volume (GiB) }
+      VolumeSizeLimit: { default: Largest runner volume (GiB) }
+      CacheRetentionDays: { default: Days to keep cache entries }
 
 Parameters:
   TenantId:
@@ -68,13 +70,19 @@ Parameters:
     Default: 200
     MinValue: 10
     MaxValue: 16384
-    Description: AWS refuses root volumes larger than this, in GiB.
+    Description: AWS refuses runner volumes, root or cache, larger than this, in GiB.
   RootVolumeSize:
     Type: Number
     Default: 30
     MinValue: 10
     MaxValue: 16384
     Description: Root volume size in GiB for jobs that do not ask for one.
+  CacheRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: S3 deletes a cache entry this many days after it was saved.
   VpcId:
     Type: String
     Default: ""
@@ -198,9 +206,10 @@ Resources:
         - { Key: Name, Value: hatchrun-runners }
 
   # The image and instance type come with each launch, from the job's
-  # labels. Runners get no instance profile: the agent claims its runner
-  # config from the hatchrun.io broker with a one-time ticket in user
-  # data, and jobs that need AWS use GitHub's OIDC.
+  # labels. Runners get no instance profile unless the owner picks one
+  # (PassRunnerRoles below): the agent claims its runner config from the
+  # hatchrun.io broker with a one-time ticket in user data, and jobs
+  # that need AWS use GitHub's OIDC.
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -226,11 +235,6 @@ Resources:
               Encrypted: true
               DeleteOnTermination: true
 
-  # What hatchrun.io may do here: launch AWS Marketplace images from this
-  # stack's launch template into this VPC, within the instance type and
-  # volume limits above, and stop, start, retag or terminate only the
-  # instances it launched. The conditions keep the launch template's
-  # metadata and encryption settings from being overridden at launch.
   # What hatchrun.io reads through the role: this template, the subnets
   # runners launch into and the limits above, so the app offers only
   # runners the role can launch. A parameter because CloudFormation
@@ -246,7 +250,7 @@ Resources:
       Type: String
       Description: What the hatchrun connect stack allows; hatchrun.io reads it through the role.
       Value: !Sub
-        - '{"version":4,"launchTemplateId":"${LaunchTemplate}","subnets":"${Subnets}","instanceTypes":"${Types}","excludedInstanceTypes":"${Excluded}","volumeSizeLimit":${VolumeSizeLimit},"rootVolumeSize":${RootVolumeSize},"fleet":true}'
+        - '{"version":5,"launchTemplateId":"${LaunchTemplate}","subnets":"${Subnets}","instanceTypes":"${Types}","excludedInstanceTypes":"${Excluded}","volumeSizeLimit":${VolumeSizeLimit},"rootVolumeSize":${RootVolumeSize},"fleet":true,"cacheBucket":"${CacheBucket}"}'
         - Subnets: !If
             - CreateVpc
             - !Join [",", [!Ref SubnetA, !Ref SubnetB]]
@@ -254,6 +258,61 @@ Resources:
           Types: !Join [",", !Ref InstanceTypes]
           Excluded: !Join [",", !Ref ExcludedInstanceTypes]
 
+  # Job caches, in this account and region so restores cost no data
+  # transfer. hatchrun.io signs short-lived URLs for one repository's
+  # keys at a time; runners get no credentials for the bucket. The
+  # bucket outlives the stack: delete it by hand after removing the
+  # stack, or let the lifecycle rule empty it first.
+  CacheBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-cache
+            Status: Enabled
+            ExpirationInDays: !Ref CacheRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - { Key: "hatchrun:tenant", Value: !Ref TenantId }
+
+  CacheBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CacheBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CacheBucket.Arn
+              - !Sub "${CacheBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # What hatchrun.io may do here: launch AWS Marketplace images from this
+  # stack's launch template into this VPC, within the instance type and
+  # volume limits above, and stop, start, retag or terminate only the
+  # instances it launched. The conditions keep the launch template's
+  # metadata and encryption settings from being overridden at launch.
   ControlPlaneRole:
     Type: AWS::IAM::Role
     Properties:
@@ -278,15 +337,23 @@ Resources:
               # Describing the subnets lets the hatchrun.io app check the
               # stack before saving it; the instance types, their
               # offerings and Spot prices fill its daily catalog of what
-              # the region offers.
+              # the region offers. The rest find the security groups and
+              # capacity reservations tagged for hatchrun, cache volumes
+              # and snapshots, and launch template versions a launch
+              # failed to delete. EC2 allows describing only on "*".
               - Sid: List
                 Effect: Allow
                 Action:
+                  - ec2:DescribeCapacityReservations
                   - ec2:DescribeInstances
                   - ec2:DescribeInstanceTypeOfferings
                   - ec2:DescribeInstanceTypes
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSnapshots
                   - ec2:DescribeSpotPriceHistory
                   - ec2:DescribeSubnets
+                  - ec2:DescribeVolumes
                 Resource: "*"
               - Sid: ReadSettings
                 Effect: Allow
@@ -355,6 +422,36 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplate}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${RunnerSecurityGroup}"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+              # Security groups and capacity reservations the owner tags
+              # with this tenant, so runners can join more groups in the
+              # VPC or use reserved capacity without a stack update.
+              - Sid: LaunchTaggedSecurityGroups
+                Effect: Allow
+                Action: [ec2:RunInstances, ec2:CreateFleet]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/hatchrun:tenant: !Ref TenantId
+                    ec2:Vpc: !Sub
+                      - "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${Id}"
+                      - Id: !If [CreateVpc, !Ref Vpc, !Ref VpcId]
+              - Sid: LaunchTaggedCapacity
+                Effect: Allow
+                Action: [ec2:RunInstances, ec2:CreateFleet]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:capacity-reservation/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/hatchrun:tenant: !Ref TenantId
+              # Cache volumes start from snapshots hatchrun.io took of
+              # this tenant's earlier volumes. LaunchVolumes holds them to
+              # the same encryption and size limits as root volumes.
+              - Sid: LaunchFromCacheSnapshots
+                Effect: Allow
+                Action: [ec2:RunInstances, ec2:CreateFleet, ec2:CreateVolume]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/hatchrun:tenant: !Ref TenantId
               # Each launch is an instant EC2 Fleet of one. The fleet is
               # checked on the subnets, template, image, volumes and
               # security group above and on itself; the instance it
@@ -382,9 +479,10 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
                   - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*"
                 Condition:
                   StringEquals:
-                    ec2:CreateAction: RunInstances
+                    ec2:CreateAction: [RunInstances, CreateVolume, CreateSnapshot]
               - Sid: ManageOwnInstances
                 Effect: Allow
                 Action:
@@ -394,10 +492,80 @@ Resources:
                   - ec2:ModifyInstanceAttribute
                   - ec2:CreateTags
                   - ec2:DeleteTags
+                  # The boot log of a runner that never registered.
+                  - ec2:GetConsoleOutput
+                  - ec2:AttachVolume
+                  - ec2:DetachVolume
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                 Condition:
                   StringEquals:
                     aws:ResourceTag/hatchrun:tenant: !Ref TenantId
+              # Cache volumes: kept between jobs of one repository and
+              # moved from runner to runner, or snapshotted after a job
+              # and restored at the next launch. Only volumes and
+              # snapshots tagged with this tenant, encrypted and within
+              # VolumeSizeLimit.
+              - Sid: CreateCacheVolumes
+                Effect: Allow
+                Action: ec2:CreateVolume
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/hatchrun:tenant: !Ref TenantId
+                  Bool:
+                    ec2:Encrypted: "true"
+                  NumericLessThanEquals:
+                    ec2:VolumeSize: !Ref VolumeSizeLimit
+              - Sid: ManageCacheVolumes
+                Effect: Allow
+                Action:
+                  - ec2:AttachVolume
+                  - ec2:DetachVolume
+                  - ec2:DeleteVolume
+                  - ec2:CreateSnapshot
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/hatchrun:tenant: !Ref TenantId
+              - Sid: CreateCacheSnapshots
+                Effect: Allow
+                Action: ec2:CreateSnapshot
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/hatchrun:tenant: !Ref TenantId
+              - Sid: DeleteCacheSnapshots
+                Effect: Allow
+                Action: ec2:DeleteSnapshot
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/hatchrun:tenant: !Ref TenantId
+              # hatchrun.io signs the URLs runners use for the cache;
+              # listing finds entries by key prefix, as actions/cache
+              # restore keys do.
+              - Sid: CacheObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub "${CacheBucket.Arn}/*"
+              - Sid: ListCache
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt CacheBucket.Arn
+              # Runners get an instance profile only when the owner makes
+              # a role under the /hatchrun/ path and picks it for a runner
+              # profile; what the role may do is the owner's to decide.
+              - Sid: PassRunnerRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/hatchrun/*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
               # The first Spot launch and the first fleet in an account
               # create these roles.
               - Sid: SpotServiceRole
@@ -424,6 +592,9 @@ Outputs:
     Value: !If [CreateOidcProvider, !Ref OidcProvider, !Ref OidcProviderArn]
   LaunchTemplateId:
     Value: !Ref LaunchTemplate
+  CacheBucket:
+    Description: Job caches. Kept when the stack is deleted.
+    Value: !Ref CacheBucket
   SubnetIds:
     Value: !If
       - CreateVpc

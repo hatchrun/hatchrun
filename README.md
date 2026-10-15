@@ -319,6 +319,13 @@ console or with the AWS CLI. The reconciler reads each tenant's stack
 settings again once a day, so an updated stack is picked up without
 anyone verifying the role again, and jobs waiting on the setup launch.
 
+The stack also holds what features beyond launching need, so they ship
+without asking owners to update again: an S3 bucket for job caches
+that the Worker signs per-repository URLs for, cache volumes and
+snapshots tagged with the tenant, security groups and capacity
+reservations the owner tags `hatchrun:tenant`, runners' boot logs, and
+roles under the `/hatchrun/` path that an owner picks for runners.
+
 [`publish-template.yml`](.github/workflows/publish-template.yml)
 uploads `connect.yaml` on every change merged to main. It needs, once,
 the bucket and role from
