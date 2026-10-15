@@ -46,6 +46,12 @@ const COLUMNS: &str = "double1 AS at, double2 AS seconds, double3 AS cpu_min, \
 const WINDOWS: &str = "FROM events.analyticsEngine.hatchrun_runner_metrics \
     WHERE index1 = $job AND blob1 = $installation AND timestamp >= $since";
 
+/// The job's windows, oldest first. The SQL API resolves column names
+/// in `ORDER BY`, not the aliases of `COLUMNS`.
+fn windows_query() -> String {
+    format!("SELECT {COLUMNS} {WINDOWS} ORDER BY double1 LIMIT {MAX_WINDOWS}")
+}
+
 /// One window, as the agent summed it up.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all(serialize = "camelCase"))]
@@ -130,12 +136,7 @@ pub(crate) async fn job(ctx: &Ctx<'_>, org: &str, id: &str) -> Answer {
             .to_iso_string()
             .into(),
     };
-    let windows: Vec<Window> = query(
-        ctx,
-        &format!("SELECT {COLUMNS} {WINDOWS} ORDER BY at LIMIT {MAX_WINDOWS}"),
-        &params,
-    )
-    .await?;
+    let windows: Vec<Window> = query(ctx, &windows_query(), &params).await?;
     let summary: Option<Summary> = query(ctx, SUMMARY, &params).await?.into_iter().next();
     Ok(Response::from_json(&serde_json::json!({
         "githubUrl": github_url(&ctx.config.github_web, &job),
@@ -203,16 +204,23 @@ async fn query<T: serde::de::DeserializeOwned>(
     let request = Object::new();
     Reflect::set(&request, &"query".into(), &sql.into()).map_err(failed)?;
     Reflect::set(&request, &"params".into(), &named).map_err(failed)?;
-    let run: Function = Reflect::get(&binding, &"query".into())
-        .map_err(failed)?
-        .dyn_into()
-        .map_err(failed)?;
-    let promise: Promise = run
+    // The binding is an RPC stub: `query` is a callable RpcProperty and
+    // its answer a thenable RpcPromise, neither an instance of Function
+    // or Promise, so `dyn_into` refuses both.
+    let run = Reflect::get(&binding, &"query".into()).map_err(failed)?;
+    if !run.is_function() {
+        return Err(Failure::new(
+            500,
+            format!("{BINDING}.query is not callable"),
+        ));
+    }
+    let answered = run
+        .unchecked_into::<Function>()
         .call1(&binding, &request)
-        .map_err(failed)?
-        .dyn_into()
         .map_err(failed)?;
-    let answer = JsFuture::from(promise).await.map_err(failed)?;
+    let answer = JsFuture::from(Promise::resolve(&answered))
+        .await
+        .map_err(failed)?;
     let text: String = JSON::stringify(&answer).map_err(failed)?.into();
     let answered: Answered<T> = serde_json::from_str(&text)
         .map_err(|err| Failure::new(502, format!("metrics query answer: {err}")))?;
@@ -284,7 +292,11 @@ mod tests {
 
     #[test]
     fn every_query_is_bounded_and_scoped() {
-        let windows = format!("SELECT {COLUMNS} {WINDOWS} ORDER BY at LIMIT {MAX_WINDOWS}");
+        let windows = windows_query();
+        assert!(
+            windows.contains(" ORDER BY double1 "),
+            "the SQL API sorts by column, not alias: {windows}"
+        );
         for sql in [windows.as_str(), SUMMARY] {
             assert!(sql.contains("blob1 = $installation"), "{sql}");
             assert!(sql.contains("index1 = $job"), "{sql}");
