@@ -313,6 +313,74 @@ pub fn parse_workflow_run(response: &Response) -> Result<crate::cache::Run, Stri
     decode(response, "workflow run")
 }
 
+/// The branch `branch` of `repository`.
+#[must_use]
+pub fn branch_ref(api: &str, token: &str, repository: &str, branch: &str) -> Request {
+    let path = branch
+        .split('/')
+        .map(crate::http::encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    call(
+        "GET",
+        format!("{api}/repos/{repository}/git/ref/heads/{path}"),
+        token,
+    )
+}
+
+#[derive(Deserialize)]
+struct GitRef {
+    object: GitObject,
+}
+
+#[derive(Deserialize)]
+struct GitObject {
+    sha: String,
+}
+
+/// The commit a branch points at, or `None` when there is no such
+/// branch.
+///
+/// # Errors
+///
+/// GitHub's answer when it is neither a ref nor a 404.
+pub fn branch_sha(response: &Response) -> Result<Option<String>, String> {
+    if response.status == 404 {
+        return Ok(None);
+    }
+    decode::<GitRef>(response, "branch").map(|found| Some(found.object.sha))
+}
+
+/// Compares commit `head` with commit `base` in `repository`.
+#[must_use]
+pub fn compare(api: &str, token: &str, repository: &str, base: &str, head: &str) -> Request {
+    call(
+        "GET",
+        format!(
+            "{api}/repos/{repository}/compare/{}...{}?per_page=1",
+            crate::http::encode(base),
+            crate::http::encode(head)
+        ),
+        token,
+    )
+}
+
+#[derive(Deserialize)]
+struct Comparison {
+    status: String,
+}
+
+/// Whether `head` is `base` or one of its ancestors, from a compare
+/// answer: `identical` or `behind`.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a comparison.
+pub fn contained(response: &Response) -> Result<bool, String> {
+    decode::<Comparison>(response, "comparison")
+        .map(|comparison| matches!(comparison.status.as_str(), "identical" | "behind"))
+}
+
 /// The repository `owner/name`.
 #[must_use]
 pub fn repository(api: &str, token: &str, repository: &str) -> Request {
@@ -516,5 +584,42 @@ mod tests {
             install_url("https://github.com", "hatchrun", "t.s/x"),
             "https://github.com/apps/hatchrun/installations/new?state=t.s%2Fx"
         );
+    }
+
+    #[test]
+    fn finds_whether_a_commit_is_on_a_branch() {
+        let answer = |status: u16, body: &str| Response {
+            status,
+            body: body.as_bytes().to_vec(),
+        };
+        assert_eq!(
+            branch_ref("https://api", "t", "acme/repo", "release/1.x").url,
+            "https://api/repos/acme/repo/git/ref/heads/release/1.x"
+        );
+        assert_eq!(
+            branch_sha(&answer(
+                200,
+                r#"{"ref":"refs/heads/main","object":{"sha":"abc","type":"commit"}}"#
+            )),
+            Ok(Some("abc".to_owned()))
+        );
+        assert_eq!(
+            branch_sha(&answer(404, r#"{"message":"Not Found"}"#)),
+            Ok(None)
+        );
+        assert!(branch_sha(&answer(403, "{}")).is_err());
+        assert_eq!(
+            compare("https://api", "t", "acme/repo", "tip", "head").url,
+            "https://api/repos/acme/repo/compare/tip...head?per_page=1"
+        );
+        for (status, on) in [
+            ("identical", true),
+            ("behind", true),
+            ("ahead", false),
+            ("diverged", false),
+        ] {
+            let body = format!(r#"{{"status":"{status}","ahead_by":0}}"#);
+            assert_eq!(contained(&answer(200, &body)), Ok(on), "{status}");
+        }
     }
 }

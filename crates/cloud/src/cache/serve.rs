@@ -513,7 +513,8 @@ async fn scopes(ctx: &Context<'_>) -> std::result::Result<Scopes, Refusal> {
     let default_branch =
         github::default_branch(&github_send(&github::repository(&api, &token, repository)).await?)
             .map_err(|err| Refusal::new(502, err))?;
-    let scopes = super::scopes(&run, &default_branch);
+    let on_branch = on_branch(&api, &token, repository, &run).await?;
+    let scopes = super::scopes(&run, &default_branch, on_branch);
     let reads =
         serde_json::to_string(&scopes.reads).map_err(|err| Refusal::new(500, err.to_string()))?;
     ctx.db
@@ -526,6 +527,46 @@ async fn scopes(ctx: &Context<'_>) -> std::result::Result<Scopes, Refusal> {
         .run()
         .await?;
     Ok(scopes)
+}
+
+/// Whether the run's commit is on its head branch in the repository:
+/// the branch exists and its tip is the commit or a descendant of it.
+/// Asks GitHub only for runs that could write to a branch's scope.
+async fn on_branch(
+    api: &str,
+    token: &str,
+    repository: &str,
+    run: &super::Run,
+) -> std::result::Result<bool, Refusal> {
+    let Some(branch) = run
+        .head_branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+    else {
+        return Ok(false);
+    };
+    if super::from_outside(run) {
+        return Ok(false);
+    }
+    let tip = github::branch_sha(
+        &github_send(&github::branch_ref(api, token, repository, branch)).await?,
+    )
+    .map_err(|err| Refusal::new(502, err))?;
+    match tip {
+        None => Ok(false),
+        Some(tip) if tip == run.head_sha => Ok(true),
+        Some(tip) => github::contained(
+            &github_send(&github::compare(
+                api,
+                token,
+                repository,
+                &tip,
+                &run.head_sha,
+            ))
+            .await?,
+        )
+        .map_err(|err| Refusal::new(502, err)),
+    }
 }
 
 async fn github_send(request: &Outgoing) -> std::result::Result<crate::http::Response, Refusal> {

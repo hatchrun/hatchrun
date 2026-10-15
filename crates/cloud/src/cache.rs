@@ -13,11 +13,13 @@
 //!
 //! Entries live at `<repository id>/<scope>/<version>/<key>`. A job
 //! writes only to its own scope and reads its own, then the default
-//! branch's. Branches pushed to the repository itself get `b/<hash of
-//! branch>`. Pull requests, and runs whose code comes from a fork, get
-//! `p/<head repository id>/<hash of head branch>`, which no other run
-//! reads, so a pull request cannot put an entry where the default
-//! branch would restore it.
+//! branch's. A run writes to `b/<hash of branch>` only when its commit
+//! is on that branch of the repository itself. Pull requests, and runs
+//! whose code comes from a fork, get `p/<head repository id>/<hash of
+//! head branch>`; any other run, such as one for a tag, gets `o/<hash of
+//! its ref name>`. No branch reads those, so neither a pull request nor
+//! a tag named like a branch can put an entry where that branch would
+//! restore it.
 
 pub mod serve;
 
@@ -156,6 +158,8 @@ pub struct Run {
     /// The branch or tag the run's code is on, in its head repository.
     #[serde(default)]
     pub head_branch: Option<String>,
+    /// The commit the run's code is at.
+    pub head_sha: String,
     /// The repository the code comes from: a fork for pull requests
     /// from forks.
     #[serde(default)]
@@ -180,18 +184,33 @@ pub struct Scopes {
     pub reads: Vec<String>,
 }
 
-/// The scopes of a job in `run`, whose repository's default branch is
-/// `default_branch`.
+/// Whether `run`'s code comes from outside the repository's branches:
+/// a pull request, or a fork. Such a run never writes to a branch's
+/// scope, so there is no need to ask GitHub where its commit is.
 #[must_use]
-pub fn scopes(run: &Run, default_branch: &str) -> Scopes {
+pub fn from_outside(run: &Run) -> bool {
+    let head = run
+        .head_repository
+        .map_or(run.repository.id, |head| head.id);
+    head != run.repository.id || PULL_REQUEST_EVENTS.contains(&run.event.as_str())
+}
+
+/// The scopes of a job in `run`, whose repository's default branch is
+/// `default_branch`. `on_branch` says whether `run.head_sha` is on the
+/// branch `run.head_branch` of the repository: the branch exists and
+/// holds the commit. Without that, a tag named `main` would write where
+/// the `main` branch reads.
+#[must_use]
+pub fn scopes(run: &Run, default_branch: &str, on_branch: bool) -> Scopes {
     let repository = run.repository.id;
     let head = run.head_repository.map_or(repository, |head| head.id);
     let branch = run.head_branch.as_deref().unwrap_or_default();
-    let outside = head != repository || PULL_REQUEST_EVENTS.contains(&run.event.as_str());
-    let write = if outside {
+    let write = if from_outside(run) {
         format!("{repository}/p/{head}/{}", hash(branch))
-    } else {
+    } else if on_branch {
         format!("{repository}/b/{}", hash(branch))
+    } else {
+        format!("{repository}/o/{}", hash(branch))
     };
     let default = format!("{repository}/b/{}", hash(default_branch));
     let mut reads = vec![write.clone()];
@@ -406,6 +425,7 @@ mod tests {
         Run {
             event: event.to_owned(),
             head_branch: Some(branch.to_owned()),
+            head_sha: "abc".to_owned(),
             head_repository: Some(RepositoryId { id: head }),
             repository: RepositoryId { id: 1 },
         }
@@ -413,13 +433,13 @@ mod tests {
 
     #[test]
     fn a_push_writes_its_branch_and_reads_the_default_branch() {
-        let feature = scopes(&run("push", "feature", 1), "main");
+        let feature = scopes(&run("push", "feature", 1), "main", true);
         assert_eq!(feature.write, format!("1/b/{}", hash("feature")));
         assert_eq!(
             feature.reads,
             [feature.write.clone(), format!("1/b/{}", hash("main"))]
         );
-        let main = scopes(&run("push", "main", 1), "main");
+        let main = scopes(&run("push", "main", 1), "main", true);
         assert_eq!(main.reads, std::slice::from_ref(&main.write));
     }
 
@@ -434,13 +454,28 @@ mod tests {
             run("pull_request", "main", 2),
             run("workflow_dispatch", "main", 2),
         ] {
-            let scopes = scopes(&run, "main");
+            assert!(from_outside(&run));
+            let scopes = scopes(&run, "main", true);
             assert!(scopes.write.starts_with("1/p/"), "{scopes:?}");
             assert_eq!(scopes.reads, [scopes.write.clone(), main.clone()]);
         }
         assert_ne!(
-            scopes(&run("pull_request", "main", 2), "main").write,
-            scopes(&run("pull_request", "main", 3), "main").write
+            scopes(&run("pull_request", "main", 2), "main", true).write,
+            scopes(&run("pull_request", "main", 3), "main", true).write
+        );
+    }
+
+    #[test]
+    fn a_tag_named_like_a_branch_writes_apart_from_it() {
+        // A push of the tag main: head_branch is the tag name, and the
+        // commit is not on the branch main.
+        let tag = run("push", "main", 1);
+        assert!(!from_outside(&tag));
+        let scopes = scopes(&tag, "main", false);
+        assert_eq!(scopes.write, format!("1/o/{}", hash("main")));
+        assert_eq!(
+            scopes.reads,
+            [scopes.write.clone(), format!("1/b/{}", hash("main"))]
         );
     }
 

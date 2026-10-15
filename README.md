@@ -496,10 +496,14 @@ the old key get 401 and run without the cache.
 The token names the tenant and the job. Which repository and refs the
 job may use come from its job row and, on its first call, its workflow
 run on GitHub, kept on the row as `cache_write` and `cache_reads`.
-Entries live at `<repository id>/<scope>/<version>/<key>`: pushes to a
-branch of the repository write `b/<branch hash>`; pull requests and
-runs of code from a fork write `p/<head repository id>/<branch hash>`.
-Every job reads its own scope, then the default branch's. A lookup
+Entries live at `<repository id>/<scope>/<version>/<key>`. A run
+writes `b/<branch hash>` only when its commit is on that branch of the
+repository (the branch's tip is the commit or a descendant, checked
+through GitHub's compare API). Pull requests and runs of code from a
+fork write `p/<head repository id>/<branch hash>`, and any other run,
+such as a tag push, writes `o/<ref hash>`, so a tag named `main` cannot
+fill the `main` branch's cache. Every job reads its own scope, then the
+default branch's. A lookup
 takes the exact key, then the newest entry for each restore key in
 turn, and answers a presigned GET that holds for 15 minutes. Uploads
 are S3 multipart uploads the Worker starts and completes with
