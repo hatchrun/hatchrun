@@ -104,7 +104,8 @@ const CATALOG_COST: u32 = 2 + 3 * CATALOG_PAGES;
 /// How often a tenant's launch template versions are swept.
 const SWEEP_EVERY: u64 = 24 * 60 * 60 * 1000;
 /// Pages of launch template versions read per sweep, 200 each. A
-/// template with more is swept again on the next pass.
+/// template with more is swept again on the next pass, as long as
+/// the pass deleted some.
 const VERSION_PAGES: u32 = 10;
 /// How long before the oldest launch in flight a version must be made
 /// to be swept; more than any launch takes, and any clock skew.
@@ -811,8 +812,10 @@ impl Pass<'_> {
             );
         }
         // A template with more pages is swept again on the next pass,
-        // from the first page, which now holds the versions left.
-        if next.is_some() {
+        // from the first page, which now holds the versions left. One
+        // that deleted nothing would read the same pages again, so it
+        // waits a day like the rest.
+        if next.is_some() && deleted > 0 {
             self.more.set(true);
         } else {
             self.swept(tenant).await?;
