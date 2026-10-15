@@ -181,6 +181,10 @@ const routes: Record<string, Handler> = {
       200,
       {
         tenantId: tenant.id,
+        marketplace: {
+          amd64: "https://aws.amazon.com/marketplace/pp/prodview-znhn62372z6jq",
+          arm64: "https://aws.amazon.com/marketplace/pp/prodview-nchg6i6uzlfr2",
+        },
         templateUrl: template,
         regions: regions.map(([id, name]) => ({
           id,
@@ -482,10 +486,11 @@ function oldStack(region: string) {
   const templateUrl = "https://hatchrun-templates.s3.us-east-1.amazonaws.com/connect.yaml";
   return {
     version: 1,
-    latest: 2,
+    latest: 3,
     checkedAt: Date.now() - 3_600_000,
     changes: [
       "Runners launch through EC2 Fleet, which picks the cheapest instance type with capacity. hatchrun reads which instance types your region offers and what they cost each day. The default limit allows any size up to 8xlarge and refuses GPU, accelerator and bare metal types, instead of naming families.",
+      "Runners launch from the hatchrun images in AWS Marketplace. Subscribe this account to the amd64 and arm64 images once, then update the stack; until then runners do not start.",
     ],
     familyList: true,
     consoleUrl: `https://${region}.console.aws.amazon.com/cloudformation/home?region=${region}#/stacks?filteringText=hatchrun&filteringStatus=active&viewNested=true`,

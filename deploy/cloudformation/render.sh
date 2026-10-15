@@ -5,8 +5,9 @@
 
 set -euo pipefail
 
-# Writes connect.yaml with the AWS account that owns the hatchrun images,
-# the only images the control plane role may launch.
+# Writes connect.yaml with the AWS account that owns the hatchrun images:
+# AWS Marketplace's, which owns the copies of every Marketplace image.
+# The control plane role may launch only images of that account.
 #
 #   render.sh IMAGE_OWNER > connect.yaml
 

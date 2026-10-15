@@ -66,6 +66,11 @@ GITHUB_APP_SLUG = "hatchrun"
 # deploy/cloudformation/templates-bucket.yaml), which the Launch Stack
 # links open. Empty until the bucket exists; the app says so until then.
 CONNECT_TEMPLATE_URL = "https://hatchrun-templates.s3.us-east-1.amazonaws.com/connect.yaml"
+# The AWS Marketplace pages of the runner images (hatchrun/images). An
+# account subscribes to each once before the connect stack's role can
+# launch it.
+MARKETPLACE_AMD64_URL = "https://aws.amazon.com/marketplace/pp/prodview-znhn62372z6jq"
+MARKETPLACE_ARM64_URL = "https://aws.amazon.com/marketplace/pp/prodview-nchg6i6uzlfr2"
 # The Polar products of the per-organization licence, separated by
 # commas, one per billing interval (monthly, then yearly), since a Polar
 # product has a single interval. Checkout offers all of them and answers

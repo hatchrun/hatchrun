@@ -48,12 +48,14 @@ use crate::aws::{self, Credentials, ec2, sts};
 use crate::fetch::send;
 use crate::http::Request;
 use crate::instance::{Choice, Limits};
+use crate::labels::Arch;
 use crate::offerings::{self, Candidate, Unavailable};
 use crate::profiles::{self, store};
 use crate::reconcile::retry::{Cause, Failure};
 use crate::webhook::QueuedJob;
 use crate::{
-    DB, github, instance, instance_types, int, jwt, now_ms, oidc, settings, telemetry, webcrypto,
+    DB, connect, github, instance, instance_types, int, jwt, now_ms, oidc, settings, telemetry,
+    webcrypto,
 };
 
 /// Variable with the App's client id.
@@ -132,6 +134,9 @@ struct Settings {
     telemetry_url: String,
     github_api: String,
     aws_endpoint: Option<String>,
+    /// Where an account subscribes to the amd64 and arm64 images.
+    marketplace_amd64: String,
+    marketplace_arm64: String,
 }
 
 impl Settings {
@@ -159,7 +164,17 @@ impl Settings {
                 .trim_end_matches('/')
                 .to_owned(),
             aws_endpoint: get(AWS_ENDPOINT_URL),
+            marketplace_amd64: need(connect::MARKETPLACE_AMD64_URL)?,
+            marketplace_arm64: need(connect::MARKETPLACE_ARM64_URL)?,
         })
+    }
+
+    /// Where an account subscribes to the `arch` image.
+    fn marketplace_url(&self, arch: Arch) -> &str {
+        match arch {
+            Arch::Amd64 => &self.marketplace_amd64,
+            Arch::Arm64 => &self.marketplace_arm64,
+        }
     }
 }
 
@@ -469,11 +484,18 @@ async fn start(
         user_data: serde_json::json!({ "broker": settings.broker_url, "ticket": ticket })
             .to_string(),
     };
-    let instance_id = if tenant.fleet == 1 {
-        fleet(db, &launch).await?
+    let started = if tenant.fleet == 1 {
+        fleet(db, &launch).await
     } else {
-        run_instances(&launch).await?
+        run_instances(&launch).await
     };
+    let instance_id = started.map_err(|failure| match &failure.cause {
+        Cause::Aws(code) if code == connect::NOT_SUBSCRIBED => Failure::new(
+            failure.cause.clone(),
+            connect::subscribe_message(choice.arch.as_str(), settings.marketplace_url(choice.arch)),
+        ),
+        _ => failure,
+    })?;
     if let Err(err) = store_config(settings, &ticket, &boot).await {
         // Without its config the instance would wait out the agent's
         // timeout before powering off.
