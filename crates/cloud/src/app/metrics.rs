@@ -18,8 +18,9 @@
 //! the summary uses only those and approximate maxima. Logs stay on
 //! GitHub; the app links to the job there.
 
-use js_sys::{Function, JSON, Object, Promise, Reflect};
+use js_sys::{JSON, Object, Promise, Reflect};
 use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use worker::Response;
@@ -30,6 +31,17 @@ use crate::int;
 
 /// Analytics SQL binding in `wrangler.toml`.
 const BINDING: &str = "ANALYTICS_SQL";
+
+#[wasm_bindgen]
+extern "C" {
+    /// The Analytics SQL binding.
+    type AnalyticsSql;
+
+    /// Runs one `SELECT`; answers `{ data, rows, statistics }`.
+    #[wasm_bindgen(method, catch)]
+    fn query(this: &AnalyticsSql, request: &Object) -> Result<JsValue, JsValue>;
+}
+
 /// Most windows a job returns: a job runs eight hours at most, 2880
 /// windows of ten seconds.
 const MAX_WINDOWS: u32 = 3000;
@@ -204,19 +216,12 @@ async fn query<T: serde::de::DeserializeOwned>(
     let request = Object::new();
     Reflect::set(&request, &"query".into(), &sql.into()).map_err(failed)?;
     Reflect::set(&request, &"params".into(), &named).map_err(failed)?;
-    // The binding is an RPC stub: `query` is a callable RpcProperty and
-    // its answer a thenable RpcPromise, neither an instance of Function
-    // or Promise, so `dyn_into` refuses both.
-    let run = Reflect::get(&binding, &"query".into()).map_err(failed)?;
-    if !run.is_function() {
-        return Err(Failure::new(
-            500,
-            format!("{BINDING}.query is not callable"),
-        ));
-    }
-    let answered = run
-        .unchecked_into::<Function>()
-        .call1(&binding, &request)
+    // The binding is an RPC stub. Its answer is a thenable RpcPromise,
+    // not a Promise, and anything read off the stub, `query.call`
+    // included, is a remote method; only `binding.query(request)` works.
+    let answered = binding
+        .unchecked_into::<AnalyticsSql>()
+        .query(&request)
         .map_err(failed)?;
     let answer = JsFuture::from(Promise::resolve(&answered))
         .await
