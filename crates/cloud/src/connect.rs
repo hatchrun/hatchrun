@@ -74,7 +74,8 @@ pub const CHANGES: &[(u32, &str)] = &[
         4,
         "The stack keeps its settings in a Systems Manager parameter that hatchrun reads, \
          so later stack updates, such as new instance type limits, take effect. Until you \
-         update, hatchrun cannot read this stack and runners do not start.",
+         update, hatchrun keeps the settings it last read and ignores changes to the \
+         stack's parameters.",
     ),
 ];
 
@@ -206,8 +207,13 @@ pub fn parameter_name(tenant: &str) -> String {
 
 /// What a tenant's connect stack allows, as its settings parameter
 /// says.
+///
+/// Owners update their stacks on their own schedule, so a stack may be
+/// newer than this release. Fields this release does not know are
+/// ignored, and a field added later needs a default, so neither side
+/// has to move first.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Stack {
     /// The connect.yaml version the stack runs.
     pub version: u32,
@@ -357,7 +363,11 @@ mod tests {
             }
         );
         assert!(Stack::parse(r#"{"version":4}"#).is_err());
-        assert!(Stack::parse(&value.replace("\"fleet\":true", "\"fleet\":true,\"x\":1")).is_err());
+        // A newer stack's fields do not stop this release reading it.
+        assert_eq!(
+            Stack::parse(&value.replace("\"fleet\":true", "\"fleet\":true,\"x\":1")).unwrap(),
+            Stack::parse(value).unwrap()
+        );
         assert_eq!(parameter_name("abc"), "/hatchrun/connect/abc");
     }
 
