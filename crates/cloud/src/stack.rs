@@ -26,7 +26,7 @@ pub(crate) async fn record(
     stack: &Stack,
     now: u64,
 ) -> Result<bool> {
-    let values: [JsValue; 10] = [
+    let values: [JsValue; 11] = [
         tenant_id.into(),
         stack.launch_template_id.as_str().into(),
         stack.subnets.join(",").into(),
@@ -37,6 +37,10 @@ pub(crate) async fn record(
         stack.excluded_instance_types.as_str().into(),
         stack.version.into(),
         int(now)?,
+        stack
+            .cache_bucket
+            .as_deref()
+            .map_or(JsValue::NULL, Into::into),
     ];
     let results = db
         .batch(vec![
@@ -44,11 +48,12 @@ pub(crate) async fn record(
                 "UPDATE tenants SET launch_template_id = ?2, subnet_ids = ?3, \
                  instance_types = ?4, volume_size_limit = ?5, root_volume_size = ?6, \
                  fleet = ?7, excluded_instance_types = ?8, template_version = ?9, \
-                 updated_at = ?10 \
+                 updated_at = ?10, cache_bucket = ?11 \
                  WHERE id = ?1 AND (launch_template_id IS NOT ?2 OR subnet_ids IS NOT ?3 \
                  OR instance_types IS NOT ?4 OR volume_size_limit IS NOT ?5 \
                  OR root_volume_size IS NOT ?6 OR fleet IS NOT ?7 \
-                 OR excluded_instance_types IS NOT ?8 OR template_version IS NOT ?9)",
+                 OR excluded_instance_types IS NOT ?8 OR template_version IS NOT ?9 \
+                 OR cache_bucket IS NOT ?11)",
             )
             .bind(&values)?,
             db.prepare("UPDATE tenants SET stack_checked_at = ?2 WHERE id = ?1")

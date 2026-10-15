@@ -88,6 +88,9 @@ const DELIVERY_OVERLAP: u64 = 2 * 60 * 1000;
 /// How long a redelivery is remembered; GitHub keeps deliveries for
 /// three days.
 const REDELIVERY_MEMORY: u64 = 4 * 24 * 60 * 60 * 1000;
+/// How long a cache upload nobody finished keeps its row: the longest a
+/// runner instance runs, and then some.
+const CACHE_UPLOAD_MEMORY: u64 = 24 * 60 * 60 * 1000;
 /// Lost launches of installations with no AWS connected failed per pass.
 const UNCONNECTED_PER_PASS: u32 = 50;
 /// Rows deleted per table per pass.
@@ -1341,12 +1344,14 @@ impl Pass<'_> {
     }
 
     /// Step 6: deletes expired sessions, jobs past the retention,
-    /// redeliveries GitHub no longer lists and lapsed unavailable
-    /// offerings.
+    /// redeliveries GitHub no longer lists, lapsed unavailable offerings
+    /// and cache uploads nobody finished, whose parts S3's lifecycle
+    /// rule removes after a day.
     async fn retention(&self) -> Fallible<Summary> {
         let now = int(self.now).map_err(text)?;
         let jobs_before = int(self.now.saturating_sub(self.limits.retention)).map_err(text)?;
         let redeliveries_before = int(self.now.saturating_sub(REDELIVERY_MEMORY)).map_err(text)?;
+        let uploads_before = int(self.now.saturating_sub(CACHE_UPLOAD_MEMORY)).map_err(text)?;
         let results = self
             .db
             .batch(vec![
@@ -1375,6 +1380,13 @@ impl Pass<'_> {
                     .prepare("DELETE FROM unavailable_offerings WHERE until < ?1")
                     .bind(&[int(self.now).map_err(text)?])
                     .map_err(text)?,
+                self.db
+                    .prepare(
+                        "DELETE FROM cache_uploads WHERE id IN \
+                         (SELECT id FROM cache_uploads WHERE created_at < ?1 LIMIT ?2)",
+                    )
+                    .bind(&[uploads_before, DELETE_BATCH.into()])
+                    .map_err(text)?,
             ])
             .await
             .map_err(text)?;
@@ -1383,7 +1395,10 @@ impl Pass<'_> {
                 u32::try_from(changes(result)).unwrap_or(u32::MAX)
             })
         };
-        if (0..3).any(|at| deleted(at) == DELETE_BATCH) {
+        if [0, 1, 2, 4]
+            .into_iter()
+            .any(|at| deleted(at) == DELETE_BATCH)
+        {
             self.more.set(true);
         }
         Ok(Summary {

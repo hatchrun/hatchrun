@@ -34,6 +34,8 @@ use crate::labels::{self, Arch, CPU_MAX, DISK_MAX, DISK_MIN, Overrides, RAM_MAX}
 /// Images a profile can run, newest first. The `images` table holds
 /// one AMI per region and architecture for each.
 pub const IMAGES: &[&str] = &["ubuntu-26.04"];
+/// Extras a profile can turn on: [`crate::cache::EXTRA`].
+pub const EXTRAS: &[&str] = &[crate::cache::EXTRA];
 /// Most families one profile may pin, and categories it may list.
 pub const FAMILIES_MAX: usize = 8;
 /// The newest generation a profile may ask for at least.
@@ -287,8 +289,20 @@ impl Profile {
         if !IMAGES.contains(&self.image.as_str()) {
             return Err(format!("{} is not an image hatchrun has", self.image));
         }
-        if !self.extras.is_empty() {
-            return Err("No extras are available yet".to_owned());
+        if let Some(extra) = self
+            .extras
+            .iter()
+            .find(|extra| !EXTRAS.contains(&extra.as_str()))
+        {
+            return Err(format!("{extra} is not an extra hatchrun has"));
+        }
+        if self
+            .extras
+            .iter()
+            .enumerate()
+            .any(|(at, extra)| self.extras[..at].contains(extra))
+        {
+            return Err("Name each extra once".to_owned());
         }
         if self.warm_pool != 0 {
             return Err("Warm pools are not available yet".to_owned());
@@ -529,6 +543,14 @@ mod tests {
             .map(|profile| (profile.name, profile.families)),
             Ok(("hatchrun-big".to_owned(), vec!["c8g".to_owned()]))
         );
+        assert!(
+            Profile {
+                extras: vec!["cache".to_owned()],
+                ..custom()
+            }
+            .validate()
+            .is_ok()
+        );
         assert!(refused(|p| p.name = "big".to_owned()).starts_with("Name the profile"));
         // Families AWS adds later are fine; known ones must fit the arch.
         assert_eq!(
@@ -582,8 +604,12 @@ mod tests {
             "windows is not an image hatchrun has"
         );
         assert_eq!(
-            refused(|p| p.extras = vec!["cache".to_owned()]),
-            "No extras are available yet"
+            refused(|p| p.extras = vec!["gpu".to_owned()]),
+            "gpu is not an extra hatchrun has"
+        );
+        assert_eq!(
+            refused(|p| p.extras = vec!["cache".to_owned(), "cache".to_owned()]),
+            "Name each extra once"
         );
         assert_eq!(
             refused(|p| p.warm_pool = 2),

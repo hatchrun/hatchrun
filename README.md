@@ -473,6 +473,44 @@ expired, drop the old public key. Under `wrangler dev`, put
 `TELEMETRY_SIGNING_KEY` in `crates/cloud/.dev.vars` and
 `TELEMETRY_PUBLIC_KEYS` in `crates/telemetry/.dev.vars`.
 
+### Job cache
+
+Runners of a profile with the `cache` extra keep `actions/cache`
+entries in the S3 bucket of the tenant's connect stack (version 5 on),
+in the runners' own account and region. The design is on #53. The
+Worker side is `/v1/cache/*` on `app.hatchrun.io`
+([`cache`](crates/cloud/src/cache.rs)); the agent's proxy, which the
+job's cache calls reach, comes next.
+
+The boot document of such a runner carries a second token:
+
+```json
+{"jitConfig": "...", "telemetry": {...}, "cache": {"url": "https://app.hatchrun.io/v1/cache", "token": "..."}}
+```
+
+It is signed by `TELEMETRY_SIGNING_KEY` like the telemetry token, with
+`"aud": "cache"`, and the Worker checks it against the public half of
+the same key. While that key is rotated, runners holding a token from
+the old key get 401 and run without the cache.
+
+The token names the tenant and the job. Which repository and refs the
+job may use come from its job row and, on its first call, its workflow
+run on GitHub, kept on the row as `cache_write` and `cache_reads`.
+Entries live at `<repository id>/<scope>/<version>/<key>`. A run
+writes `b/<branch hash>` only when its commit is on that branch of the
+repository (the branch's tip is the commit or a descendant, checked
+through GitHub's compare API). Pull requests and runs of code from a
+fork write `p/<head repository id>/<branch hash>`, and any other run,
+such as a tag push, writes `o/<ref hash>`, so a tag named `main` cannot
+fill the `main` branch's cache. Every job reads its own scope, then the
+default branch's. A lookup
+takes the exact key, then the newest entry for each restore key in
+turn, and answers a presigned GET that holds for 15 minutes. Uploads
+are S3 multipart uploads the Worker starts and completes with
+`If-None-Match: *`; the runner uploads the parts to presigned URLs.
+The Worker keeps each tenant's role credentials in the isolate for 30
+minutes, so a cache call costs S3 calls and not an STS call each time.
+
 ### OIDC issuer
 
 The Worker reaches a customer's AWS account by signing a five-minute
