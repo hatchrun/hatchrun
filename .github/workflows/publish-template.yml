@@ -1,17 +1,16 @@
 name: publish-template
 
-# Publishes deploy/cloudformation/connect.yaml, rendered with the account
-# that owns the runner images, to the bucket the hatchrun.io Launch Stack
-# links read (deploy/cloudformation/templates-bucket.yaml). The role and
-# the image owner come from secrets of the production environment, so no
-# account id appears in this public repository or its logs.
+# Publishes deploy/cloudformation/connect.yaml to the bucket the
+# hatchrun.io Launch Stack links read
+# (deploy/cloudformation/templates-bucket.yaml). The role comes from a
+# secret of the production environment, so no account id appears in
+# this public repository or its logs.
 
 on:
   push:
     branches: [main]
     paths:
       - deploy/cloudformation/connect.yaml
-      - deploy/cloudformation/render.sh
       - .github/workflows/publish-template.yml
   workflow_dispatch:
 
@@ -34,13 +33,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Render
-        env:
-          IMAGE_OWNER: ${{ secrets.IMAGE_OWNER_ACCOUNT_ID }}
-        run: |
-          echo "::add-mask::${IMAGE_OWNER}"
-          deploy/cloudformation/render.sh "${IMAGE_OWNER}" > "${RUNNER_TEMP}/connect.yaml"
 
       # Exchanges the job's GitHub OIDC token for the publish role. Every
       # value is masked first, the account id included.
@@ -68,7 +60,7 @@ jobs:
           } >> "${GITHUB_ENV}"
 
       - name: Validate
-        run: aws cloudformation validate-template --template-body "file://${RUNNER_TEMP}/connect.yaml" > /dev/null
+        run: aws cloudformation validate-template --template-body file://deploy/cloudformation/connect.yaml > /dev/null
 
       # Short caching: a stack created from a Launch Stack link right after
       # a release gets the new template within five minutes.
@@ -77,5 +69,5 @@ jobs:
           BUCKET: ${{ vars.TEMPLATES_BUCKET }}
         run: |
           : "${BUCKET:?}"
-          aws s3 cp "${RUNNER_TEMP}/connect.yaml" "s3://${BUCKET}/connect.yaml" \
+          aws s3 cp deploy/cloudformation/connect.yaml "s3://${BUCKET}/connect.yaml" \
             --content-type text/yaml --cache-control "max-age=300" --only-show-errors
