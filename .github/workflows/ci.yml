@@ -52,9 +52,15 @@ jobs:
           if git diff --quiet HEAD^1 HEAD -- deploy/cloudformation/connect.yaml; then
             exit 0
           fi
-          version() { grep -oP '^pub const TEMPLATE_VERSION: u32 = \K[0-9]+'; }
+          version() {
+            grep -oP '^\s*(pub(\([^)]*\))?\s+)?const\s+TEMPLATE_VERSION\s*:\s*u[0-9]+\s*=\s*\K[0-9]+' || true
+          }
           old=$(git show HEAD^1:crates/cloud/src/connect.rs | version)
           new=$(version < crates/cloud/src/connect.rs)
+          if [ -z "${old}" ] || [ -z "${new}" ]; then
+            echo "::error file=crates/cloud/src/connect.rs::Cannot read TEMPLATE_VERSION (base: '${old}', this branch: '${new}')."
+            exit 1
+          fi
           if [ "${new}" -le "${old}" ]; then
             echo "::error file=deploy/cloudformation/connect.yaml::connect.yaml changed but TEMPLATE_VERSION is still ${new}. Bump it in crates/cloud/src/connect.rs and add a CHANGES entry."
             exit 1
