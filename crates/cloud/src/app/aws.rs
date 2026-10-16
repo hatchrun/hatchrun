@@ -40,13 +40,16 @@ struct ImageRegion {
     region: String,
 }
 
+/// Every region with a runner image.
+const IMAGE_REGIONS: &str = "SELECT DISTINCT region FROM images";
+
 /// `GET /api/tenants/<org>/aws`
 pub(crate) async fn instructions(ctx: &Ctx<'_>, org: &str) -> Answer {
     let row = authorize(ctx, org).await?;
     let template = get(ctx.env, TEMPLATE_URL);
     let imaged: Vec<String> = ctx
         .db
-        .prepare("SELECT DISTINCT region FROM images")
+        .prepare(IMAGE_REGIONS)
         .all()
         .await?
         .results::<ImageRegion>()?
@@ -182,6 +185,11 @@ pub(crate) async fn verify(ctx: &Ctx<'_>, org: &str, body: Connect) -> Answer {
     show(ctx, &row.org_login).await
 }
 
+/// Saves a verified role. Binds the tenant, role ARN, region and the
+/// time in milliseconds.
+const SAVE_ROLE: &str =
+    "UPDATE tenants SET role_arn = ?2, region = ?3, updated_at = ?4 WHERE id = ?1";
+
 /// Records the verified connection and what the stack allows.
 async fn save(
     ctx: &Ctx<'_>,
@@ -191,7 +199,7 @@ async fn save(
     stack: &connect::Stack,
 ) -> worker::Result<()> {
     ctx.db
-        .prepare("UPDATE tenants SET role_arn = ?2, region = ?3, updated_at = ?4 WHERE id = ?1")
+        .prepare(SAVE_ROLE)
         .bind(&[
             tenant.into(),
             role_arn.into(),
@@ -224,4 +232,67 @@ async fn signed(
 ) -> Result<crate::http::Response, Failure> {
     aws::sign_v4(request, credentials, region, service, now_ms())?;
     Ok(send(request).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::images::{ROOT_DEVICE, UPSERT};
+    use crate::testdb::{Db, params};
+
+    const NOW: u64 = 1_792_140_000_000;
+
+    #[test]
+    fn lists_each_imaged_region_once() {
+        let db = Db::new();
+        for (region, arch) in [
+            ("us-east-1", "amd64"),
+            ("us-east-1", "arm64"),
+            ("eu-west-1", "amd64"),
+        ] {
+            db.run(
+                UPSERT,
+                &params![
+                    region,
+                    arch,
+                    "ami-0123abcd",
+                    ROOT_DEVICE,
+                    "20261013.1915",
+                    NOW
+                ],
+            );
+        }
+        let mut regions: Vec<String> = db
+            .all::<ImageRegion>(IMAGE_REGIONS, &[])
+            .into_iter()
+            .map(|row| row.region)
+            .collect();
+        regions.sort();
+        assert_eq!(regions, ["eu-west-1", "us-east-1"]);
+    }
+
+    #[test]
+    fn saves_the_role_on_its_tenant() {
+        let db = Db::new();
+        for (id, org) in [("t1", 11u64), ("t2", 12)] {
+            db.run(
+                "INSERT INTO tenants (id, org_id, org_login, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                &params![id, org, format!("org{org}"), NOW],
+            );
+        }
+        let role = "arn:aws:iam::123456789012:role/hatchrun";
+        let changed = db.run(SAVE_ROLE, &params!["t1", role, "eu-west-1", NOW + 1]);
+        assert_eq!(changed, 1);
+        let rows = db
+            .rows(
+                "SELECT id, role_arn, region, updated_at FROM tenants ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0]["role_arn"], role);
+        assert_eq!(rows[0]["region"], "eu-west-1");
+        assert_eq!(rows[0]["updated_at"], NOW + 1);
+        assert!(rows[1]["role_arn"].is_null());
+    }
 }

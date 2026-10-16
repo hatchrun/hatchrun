@@ -107,6 +107,51 @@ pub(crate) const LICENSED: &str = "(tenants.beta = 1 OR EXISTS (SELECT 1 FROM su
      WHERE subscriptions.tenant_id = tenants.id \
      AND subscriptions.status IN ('active', 'trialing')))";
 
+/// The installation's tenant with AWS connected.
+fn tenant_query() -> String {
+    format!(
+        "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners, \
+         allowed_regions, {LICENSED} AS licensed, instance_types, volume_size_limit, \
+         root_volume_size, fleet, excluded_instance_types, cache_bucket \
+         FROM tenants WHERE installation_id = ?1 AND role_arn IS NOT NULL \
+         AND region IS NOT NULL AND launch_template_id IS NOT NULL \
+         AND subnet_ids IS NOT NULL"
+    )
+}
+
+/// Fails a job nobody took because its tenant cannot launch.
+const REFUSE: &str = "UPDATE jobs SET launch_state = 'failed', launch_error = ?2, \
+     updated_at = ?3, launch_retry = ?4, next_launch_at = NULL \
+     WHERE id = ?1 AND launch_state IS NULL";
+
+/// Records how a launch ended.
+const RECORD: &str = "UPDATE jobs SET launch_state = ?2, instance_id = ?3, launch_error = ?4, \
+     updated_at = ?5, launch_retry = ?6, next_launch_at = ?7 WHERE id = ?1";
+
+/// Puts a tenant's jobs that wait for its setup back in line.
+const RECHECK: &str = "UPDATE jobs SET launch_state = NULL, launch_retry = NULL, \
+     next_launch_at = NULL, updated_at = ?2 \
+     WHERE installation_id = (SELECT installation_id FROM tenants WHERE id = ?1) \
+     AND status = 'queued' AND launch_state = 'failed' AND launch_retry = 'setup'";
+
+/// Takes a queued job while the tenant has room, counting the attempt.
+const CLAIM: &str = "UPDATE jobs SET launch_state = 'launching', runner_name = ?2, \
+     updated_at = ?3, launch_attempts = launch_attempts + 1 \
+     WHERE id = ?1 AND launch_state IS NULL AND status = 'queued' \
+     AND (SELECT COUNT(*) FROM jobs \
+          WHERE installation_id = ?4 AND status <> 'completed' \
+          AND launch_state IN ('launching', 'launched')) < ?5 \
+     RETURNING launch_attempts";
+
+/// The runner image for a region and architecture.
+const IMAGE: &str = "SELECT image_id, root_device FROM images WHERE region = ?1 AND arch = ?2";
+
+/// A row of [`CLAIM`].
+#[derive(Deserialize)]
+struct Claimed {
+    launch_attempts: u32,
+}
+
 impl Tenant {
     fn subnets(&self) -> Vec<&str> {
         self.subnet_ids
@@ -194,14 +239,7 @@ pub async fn launch(env: Env, job: QueuedJob) {
 async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
     let db = env.d1(DB)?;
     let tenant: Option<Tenant> = db
-        .prepare(format!(
-            "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners, \
-             allowed_regions, {LICENSED} AS licensed, instance_types, volume_size_limit, \
-             root_volume_size, fleet, excluded_instance_types, cache_bucket \
-             FROM tenants WHERE installation_id = ?1 AND role_arn IS NOT NULL \
-             AND region IS NOT NULL AND launch_template_id IS NOT NULL \
-             AND subnet_ids IS NOT NULL"
-        ))
+        .prepare(tenant_query())
         .bind(&[int(job.installation_id)?])?
         .first(None)
         .await?;
@@ -228,19 +266,15 @@ async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
                 ),
             };
             let (wait, _) = Failure::new(Cause::Tenant, message.as_str()).outcome(0, now_ms());
-            db.prepare(
-                "UPDATE jobs SET launch_state = 'failed', launch_error = ?2, updated_at = ?3, \
-                 launch_retry = ?4, next_launch_at = NULL \
-                 WHERE id = ?1 AND launch_state IS NULL",
-            )
-            .bind(&[
-                int(job.id)?,
-                message.as_str().into(),
-                int(now_ms())?,
-                wait.as_str().into(),
-            ])?
-            .run()
-            .await?;
+            db.prepare(REFUSE)
+                .bind(&[
+                    int(job.id)?,
+                    message.as_str().into(),
+                    int(now_ms())?,
+                    wait.as_str().into(),
+                ])?
+                .run()
+                .await?;
             console_warn!("job {}: {message}", job.id);
             return Ok(());
         }
@@ -290,21 +324,18 @@ async fn record(
             ("failed", None, Some(failure.message), Some(wait), next)
         }
     };
-    db.prepare(
-        "UPDATE jobs SET launch_state = ?2, instance_id = ?3, launch_error = ?4, updated_at = ?5, \
-         launch_retry = ?6, next_launch_at = ?7 WHERE id = ?1",
-    )
-    .bind(&[
-        int(job_id)?,
-        state.into(),
-        nullable(instance_id),
-        nullable(error),
-        int(now)?,
-        nullable(wait.map(|wait| wait.as_str().to_owned())),
-        next.map_or(Ok(wasm_bindgen::JsValue::NULL), int)?,
-    ])?
-    .run()
-    .await?;
+    db.prepare(RECORD)
+        .bind(&[
+            int(job_id)?,
+            state.into(),
+            nullable(instance_id),
+            nullable(error),
+            int(now)?,
+            nullable(wait.map(|wait| wait.as_str().to_owned())),
+            next.map_or(Ok(wasm_bindgen::JsValue::NULL), int)?,
+        ])?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -314,12 +345,7 @@ async fn record(
 /// settings or gains a licence.
 pub(crate) async fn recheck(db: &D1Database, tenant_id: &str) -> Result<()> {
     let result = db
-        .prepare(
-            "UPDATE jobs SET launch_state = NULL, launch_retry = NULL, next_launch_at = NULL, \
-             updated_at = ?2 \
-             WHERE installation_id = (SELECT installation_id FROM tenants WHERE id = ?1) \
-             AND status = 'queued' AND launch_state = 'failed' AND launch_retry = 'setup'",
-        )
+        .prepare(RECHECK)
         .bind(&[tenant_id.into(), int(now_ms())?])?
         .run()
         .await?;
@@ -351,20 +377,8 @@ async fn claim(
     tenant: &Tenant,
     name: &str,
 ) -> Result<Option<u32>> {
-    #[derive(Deserialize)]
-    struct Claimed {
-        launch_attempts: u32,
-    }
     let claimed: Option<Claimed> = db
-        .prepare(
-            "UPDATE jobs SET launch_state = 'launching', runner_name = ?2, updated_at = ?3, \
-             launch_attempts = launch_attempts + 1 \
-             WHERE id = ?1 AND launch_state IS NULL AND status = 'queued' \
-             AND (SELECT COUNT(*) FROM jobs \
-                  WHERE installation_id = ?4 AND status <> 'completed' \
-                  AND launch_state IN ('launching', 'launched')) < ?5 \
-             RETURNING launch_attempts",
-        )
+        .prepare(CLAIM)
         .bind(&[
             int(job.id)?,
             name.into(),
@@ -404,7 +418,7 @@ async fn launch_claimed(
     let settings = Settings::read(env).map_err(|err| Failure::new(Cause::Settings, err))?;
     let arch = choice.arch.as_str();
     let image: Image = db
-        .prepare("SELECT image_id, root_device FROM images WHERE region = ?1 AND arch = ?2")
+        .prepare(IMAGE)
         .bind(&[tenant.region.as_str().into(), arch.into()])
         .map_err(internal)?
         .first(None)
@@ -1038,6 +1052,181 @@ fn internal(err: worker::Error) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdb::{Db, params};
+
+    const NOW: u64 = 1_792_140_000_000;
+    const INSTALLATION: u64 = 42;
+
+    /// A connected tenant, in the beta or not, as the app leaves it.
+    fn seed(beta: bool, max_runners: u32) -> Db {
+        let db = Db::new();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, role_arn, region, \
+             launch_template_id, subnet_ids, max_runners, beta, volume_size_limit, \
+             root_volume_size, fleet, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+            &params![
+                "t1",
+                9u64,
+                "acme",
+                INSTALLATION,
+                "arn:aws:iam::1:role/r",
+                "ap-south-1",
+                "lt-1",
+                "subnet-a,subnet-b",
+                max_runners,
+                u32::from(beta),
+                200u32,
+                30u32,
+                1u32,
+                1u64
+            ],
+        );
+        db
+    }
+
+    fn job(db: &Db, id: u64, status: &str) {
+        db.run(
+            "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+             queued_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            &params![id, INSTALLATION, "acme/app", 77u64, "hatchrun", status, NOW],
+        );
+    }
+
+    fn claim(db: &Db, id: u64, max_runners: u32) -> Option<u32> {
+        db.first::<Claimed>(
+            CLAIM,
+            &params![
+                id,
+                format!("hatchrun-{id}-00"),
+                NOW,
+                INSTALLATION,
+                max_runners
+            ],
+        )
+        .map(|claimed| claimed.launch_attempts)
+    }
+
+    #[test]
+    fn a_connected_tenant_reads() {
+        let db = seed(false, 2);
+        let tenant: Tenant = db.first(&tenant_query(), &params![INSTALLATION]).unwrap();
+        assert_eq!(tenant.id, "t1");
+        assert_eq!(tenant.max_runners, 2);
+        assert_eq!(tenant.licensed, 0);
+        assert_eq!(tenant.volume_size_limit, Some(200));
+        assert_eq!(tenant.root_volume_size, Some(30));
+        assert_eq!(tenant.fleet, 1);
+        assert!(tenant.instance_types.is_none());
+
+        db.run(
+            "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
+             cancel_at_period_end, modified_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &params!["s1", "t1", "active", "c1", "p1", 0u32, "2026-10-01", NOW],
+        );
+        let tenant: Tenant = db.first(&tenant_query(), &params![INSTALLATION]).unwrap();
+        assert_eq!(tenant.licensed, 1);
+        assert!(
+            db.first::<Tenant>(&tenant_query(), &params![INSTALLATION + 1])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claims_stop_at_max_runners() {
+        let db = seed(true, 1);
+        job(&db, 1, "queued");
+        job(&db, 2, "queued");
+        assert_eq!(claim(&db, 1, 1), Some(1));
+        // Taken already, and the tenant is full.
+        assert_eq!(claim(&db, 1, 1), None);
+        assert_eq!(claim(&db, 2, 1), None);
+
+        db.run(
+            RECORD,
+            &params![
+                1u64,
+                "failed",
+                None::<String>,
+                Some("no capacity".to_owned()),
+                NOW,
+                Some("backoff".to_owned()),
+                Some(NOW + 30_000)
+            ],
+        );
+        assert_eq!(claim(&db, 2, 1), Some(1));
+        db.run(
+            RECORD,
+            &params![
+                2u64,
+                "launched",
+                Some("i-1".to_owned()),
+                None::<String>,
+                NOW,
+                None::<String>,
+                None::<u64>
+            ],
+        );
+        let rows = db
+            .rows(
+                "SELECT launch_state, instance_id, next_launch_at FROM jobs ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0]["launch_state"], "failed");
+        assert_eq!(rows[0]["next_launch_at"], NOW + 30_000);
+        assert_eq!(rows[1]["launch_state"], "launched");
+        assert_eq!(rows[1]["instance_id"], "i-1");
+
+        // The retry takes the job again and counts a second attempt.
+        db.run("UPDATE jobs SET launch_state = NULL WHERE id = 1", &[]);
+        assert_eq!(claim(&db, 1, 2), Some(2));
+    }
+
+    #[test]
+    fn refused_jobs_wait_for_the_setup() {
+        let db = seed(false, 1);
+        job(&db, 1, "queued");
+        job(&db, 2, "completed");
+        let refuse = |id: u64| {
+            db.run(
+                REFUSE,
+                &params![id, "tenant t1 has no licence", NOW, "setup"],
+            )
+        };
+        assert_eq!(refuse(1), 1);
+        assert_eq!(refuse(1), 0);
+        assert_eq!(refuse(2), 1);
+        // Only the queued one launches again.
+        assert_eq!(db.run(RECHECK, &params!["t1", NOW + 1]), 1);
+        let rows = db
+            .rows(
+                "SELECT launch_state, launch_retry FROM jobs ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert!(rows[0]["launch_state"].is_null() && rows[0]["launch_retry"].is_null());
+        assert_eq!(rows[1]["launch_state"], "failed");
+        assert_eq!(claim(&db, 1, 1), Some(1));
+    }
+
+    #[test]
+    fn images_by_region_and_arch() {
+        let db = Db::new();
+        db.run(
+            "INSERT INTO images (region, arch, image_id, root_device, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &params!["ap-south-1", "arm64", "ami-1", "/dev/sda1", NOW],
+        );
+        let image: Image = db.first(IMAGE, &params!["ap-south-1", "arm64"]).unwrap();
+        assert_eq!(image.image_id, "ami-1");
+        assert_eq!(image.root_device, "/dev/sda1");
+        assert!(
+            db.first::<Image>(IMAGE, &params!["ap-south-1", "amd64"])
+                .is_none()
+        );
+    }
 
     #[test]
     fn runner_names_are_unique_per_attempt() {

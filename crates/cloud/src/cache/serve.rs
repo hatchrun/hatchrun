@@ -83,6 +83,27 @@ impl From<worker::Error> for Refusal {
 
 type Answer = std::result::Result<Response, Refusal>;
 
+/// The job and its connected tenant, by job, installation and tenant.
+const JOB: &str = "SELECT jobs.repository, jobs.run_id, jobs.cache_write, jobs.cache_reads, \
+     tenants.id AS tenant_id, tenants.role_arn, tenants.region, tenants.cache_bucket \
+     FROM jobs JOIN tenants ON tenants.installation_id = jobs.installation_id \
+     WHERE jobs.id = ?1 AND jobs.installation_id = ?2 AND tenants.id = ?3 \
+     AND tenants.role_arn IS NOT NULL AND tenants.region IS NOT NULL";
+
+/// Records a multipart upload a job started.
+const START: &str = "INSERT INTO cache_uploads (id, job_id, object_key, upload_id, created_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5)";
+
+/// A job's upload, by id.
+const UPLOAD: &str =
+    "SELECT object_key, upload_id FROM cache_uploads WHERE id = ?1 AND job_id = ?2";
+
+/// Forgets an upload once completed or abandoned.
+const FORGET: &str = "DELETE FROM cache_uploads WHERE id = ?1";
+
+/// Stores the scopes worked out for a job.
+const SCOPES: &str = "UPDATE jobs SET cache_write = ?2, cache_reads = ?3 WHERE id = ?1";
+
 /// The job's tenant, as a cache call needs it.
 #[derive(Deserialize)]
 struct Row {
@@ -115,13 +136,7 @@ async fn serve(mut req: Request, env: &Env) -> Answer {
     let claims = authorize(&req, env)?;
     let db = env.d1(DB)?;
     let row: Row = db
-        .prepare(
-            "SELECT jobs.repository, jobs.run_id, jobs.cache_write, jobs.cache_reads, \
-             tenants.id AS tenant_id, tenants.role_arn, tenants.region, tenants.cache_bucket \
-             FROM jobs JOIN tenants ON tenants.installation_id = jobs.installation_id \
-             WHERE jobs.id = ?1 AND jobs.installation_id = ?2 AND tenants.id = ?3 \
-             AND tenants.role_arn IS NOT NULL AND tenants.region IS NOT NULL",
-        )
+        .prepare(JOB)
         .bind(&[
             int(claims.job_id)?,
             int(claims.installation_id)?,
@@ -247,10 +262,7 @@ async fn start_upload(ctx: &Context<'_>, request: UploadRequest) -> Answer {
             .map_err(aws_failure("CreateMultipartUpload"))?;
     let id = jwt::b64url(webcrypto::random_bytes(16)?);
     ctx.db
-        .prepare(
-            "INSERT INTO cache_uploads (id, job_id, object_key, upload_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
+        .prepare(START)
         .bind(&[
             id.as_str().into(),
             int(ctx.claims.job_id)?,
@@ -272,7 +284,7 @@ struct Upload {
 
 async fn upload(ctx: &Context<'_>, id: &str) -> std::result::Result<Upload, Refusal> {
     ctx.db
-        .prepare("SELECT object_key, upload_id FROM cache_uploads WHERE id = ?1 AND job_id = ?2")
+        .prepare(UPLOAD)
         .bind(&[id.into(), int(ctx.claims.job_id)?])?
         .first(None)
         .await?
@@ -280,11 +292,7 @@ async fn upload(ctx: &Context<'_>, id: &str) -> std::result::Result<Upload, Refu
 }
 
 async fn forget(ctx: &Context<'_>, id: &str) -> std::result::Result<(), Refusal> {
-    ctx.db
-        .prepare("DELETE FROM cache_uploads WHERE id = ?1")
-        .bind(&[id.into()])?
-        .run()
-        .await?;
+    ctx.db.prepare(FORGET).bind(&[id.into()])?.run().await?;
     Ok(())
 }
 
@@ -518,7 +526,7 @@ async fn scopes(ctx: &Context<'_>) -> std::result::Result<Scopes, Refusal> {
     let reads =
         serde_json::to_string(&scopes.reads).map_err(|err| Refusal::new(500, err.to_string()))?;
     ctx.db
-        .prepare("UPDATE jobs SET cache_write = ?2, cache_reads = ?3 WHERE id = ?1")
+        .prepare(SCOPES)
         .bind(&[
             int(ctx.claims.job_id)?,
             scopes.write.as_str().into(),
@@ -573,4 +581,87 @@ async fn github_send(request: &Outgoing) -> std::result::Result<crate::http::Res
     send(request)
         .await
         .map_err(|err| Refusal::new(502, format!("GitHub unreachable: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdb::{Db, params};
+
+    const NOW: u64 = 1_792_140_000_000;
+
+    fn seed(role: Option<&str>) -> Db {
+        let db = Db::new();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, role_arn, region, \
+             cache_bucket, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            &params![
+                "t1",
+                9u64,
+                "acme",
+                42u64,
+                role,
+                "ap-south-1",
+                "bucket",
+                1u64
+            ],
+        );
+        db.run(
+            "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+             queued_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            &params![
+                5u64,
+                42u64,
+                "acme/app",
+                77u64,
+                "hatchrun",
+                "in_progress",
+                NOW
+            ],
+        );
+        db
+    }
+
+    #[test]
+    fn a_job_reads_with_its_tenant() {
+        let db = seed(Some("arn:aws:iam::1:role/r"));
+        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        assert_eq!(row.repository, "acme/app");
+        assert_eq!(row.run_id, 77);
+        assert_eq!(row.tenant_id, "t1");
+        assert_eq!(row.role_arn, "arn:aws:iam::1:role/r");
+        assert_eq!(row.region, "ap-south-1");
+        assert_eq!(row.cache_bucket.as_deref(), Some("bucket"));
+        assert!(row.cache_write.is_none() && row.cache_reads.is_none());
+
+        let reads = serde_json::to_string(&["refs/heads/main"]).unwrap();
+        assert_eq!(
+            db.run(SCOPES, &params![5u64, "refs/heads/dev", reads.clone()]),
+            1
+        );
+        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        assert_eq!(row.cache_write.as_deref(), Some("refs/heads/dev"));
+        assert_eq!(row.cache_reads, Some(reads));
+
+        assert!(db.first::<Row>(JOB, &params![5u64, 42u64, "t2"]).is_none());
+        assert!(db.first::<Row>(JOB, &params![5u64, 43u64, "t1"]).is_none());
+    }
+
+    #[test]
+    fn a_tenant_without_a_role_has_no_job() {
+        let db = seed(None);
+        assert!(db.first::<Row>(JOB, &params![5u64, 42u64, "t1"]).is_none());
+    }
+
+    #[test]
+    fn uploads_belong_to_their_job() {
+        let db = seed(Some("arn:aws:iam::1:role/r"));
+        db.run(START, &params!["u1", 5u64, "scope/v/key", "s3-upload", NOW]);
+        let upload: Upload = db.first(UPLOAD, &params!["u1", 5u64]).unwrap();
+        assert_eq!(upload.object_key, "scope/v/key");
+        assert_eq!(upload.upload_id, "s3-upload");
+        assert!(db.first::<Upload>(UPLOAD, &params!["u1", 6u64]).is_none());
+        assert_eq!(db.run(FORGET, &params!["u1"]), 1);
+        assert!(db.first::<Upload>(UPLOAD, &params!["u1", 5u64]).is_none());
+    }
 }

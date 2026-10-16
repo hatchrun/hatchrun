@@ -272,10 +272,14 @@ pub async fn run(env: Env) {
     }
 }
 
+/// Takes the lease: `?1` now, `?2` when it lapses.
+const TAKE_LEASE: &str =
+    "UPDATE reconciler SET lease_until = ?2 WHERE id = 1 AND lease_until <= ?1";
+
 /// Takes the lease on the `reconciler` row if no pass holds it.
 async fn take_lease(db: &D1Database, now: u64) -> Fallible<bool> {
     let result = db
-        .prepare("UPDATE reconciler SET lease_until = ?2 WHERE id = 1 AND lease_until <= ?1")
+        .prepare(TAKE_LEASE)
         .bind(&[int(now).map_err(text)?, int(now + LEASE).map_err(text)?])
         .map_err(text)?
         .run()
@@ -284,23 +288,139 @@ async fn take_lease(db: &D1Database, now: u64) -> Fallible<bool> {
     Ok(changes(&result) == 1)
 }
 
+/// Keeps a pass's summary and gives the lease back.
+const RECORD: &str = "UPDATE reconciler SET started_at = ?1, finished_at = ?2, summary = ?3, \
+     lease_until = 0 WHERE id = 1";
+
 /// Keeps the pass's summary and gives the lease back.
 async fn record(db: &D1Database, started: u64, summary: &str) -> Fallible<()> {
-    db.prepare(
-        "UPDATE reconciler SET started_at = ?1, finished_at = ?2, summary = ?3, lease_until = 0 \
-         WHERE id = 1",
-    )
-    .bind(&[
-        int(started).map_err(text)?,
-        int(now_ms()).map_err(text)?,
-        summary.into(),
-    ])
-    .map_err(text)?
-    .run()
-    .await
-    .map_err(text)?;
+    db.prepare(RECORD)
+        .bind(&[
+            int(started).map_err(text)?,
+            int(now_ms()).map_err(text)?,
+            summary.into(),
+        ])
+        .map_err(text)?
+        .run()
+        .await
+        .map_err(text)?;
     Ok(())
 }
+
+/// The newest delivery the last complete scan saw.
+const DELIVERIES_UNTIL: &str = "SELECT deliveries_until FROM reconciler WHERE id = 1";
+
+/// The guids, of a JSON array in `?1`, already redelivered.
+const REMEMBERED: &str =
+    "SELECT guid FROM redeliveries WHERE guid IN (SELECT value FROM json_each(?1))";
+
+/// Moves the scan's mark forward to `?1`, never back.
+const MOVE_DELIVERIES_UNTIL: &str = "UPDATE reconciler SET deliveries_until = \
+     MAX(COALESCE(deliveries_until, 0), ?1) WHERE id = 1";
+
+/// Remembers a redelivery, unless a pass already did.
+const CLAIM_REDELIVERY: &str = "INSERT INTO redeliveries (guid, delivery_id, event, \
+     redelivered_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (guid) DO NOTHING";
+
+/// Open jobs quiet since `?1`, quietest first, at most `?2`.
+const OPEN_JOBS: &str = "SELECT id, installation_id, repository, status FROM jobs \
+     WHERE status <> 'completed' AND COALESCE(checked_at, updated_at) < ?1 \
+     ORDER BY COALESCE(checked_at, updated_at) LIMIT ?2";
+
+/// Records what GitHub said about job `?1`, while its status is still
+/// `?5`.
+const RECORD_CHECK: &str = "UPDATE jobs SET status = ?2, ran_on = COALESCE(?3, ran_on), \
+     checked_at = ?4, updated_at = CASE WHEN status <> ?2 THEN ?4 ELSE updated_at END \
+     WHERE id = ?1 AND status = ?5";
+
+/// Tenants with a verified role, least recently reconciled first.
+fn tenants_query() -> String {
+    format!(
+        "SELECT id, installation_id, role_arn, region, launch_template_id, max_runners, \
+         stack_checked_at, versions_swept_at FROM tenants \
+         WHERE {VERIFIED} ORDER BY COALESCE(reconciled_at, 0), id LIMIT ?1"
+    )
+}
+
+/// Stamps tenant `?1` as reconciled at `?2`.
+const MARK_RECONCILED: &str = "UPDATE tenants SET reconciled_at = ?2 WHERE id = ?1";
+
+/// Stamps tenant `?1`'s template versions as swept at `?2`.
+const MARK_SWEPT: &str = "UPDATE tenants SET versions_swept_at = ?2 WHERE id = ?1";
+
+/// Stamps tenant `?1`'s stack as read at `?2`.
+const MARK_STACK_CHECKED: &str = "UPDATE tenants SET stack_checked_at = ?2 WHERE id = ?1";
+
+/// An installation's open jobs, and the finished ones whose id is in the
+/// JSON array `?2` or whose runner is in `?3`.
+const TENANT_JOBS: &str = "SELECT id, label, status, launch_state, runner_name, ran_on, \
+     queued_at, updated_at, launch_retry, next_launch_at FROM jobs \
+     WHERE installation_id = ?1 AND (status <> 'completed' \
+     OR id IN (SELECT value FROM json_each(?2)) \
+     OR ran_on IN (SELECT value FROM json_each(?3)))";
+
+/// Adopts instance `?2` for a job still launching.
+const ADOPT: &str = "UPDATE jobs SET launch_state = 'launched', instance_id = ?2, \
+     updated_at = ?3 WHERE id = ?1 AND launch_state = 'launching'";
+
+/// Undoes a launch so the job can launch again.
+const RESET: &str = "UPDATE jobs SET launch_state = NULL, runner_name = NULL, \
+     instance_id = NULL, launch_retry = NULL, next_launch_at = NULL, updated_at = ?3 \
+     WHERE id = ?1 AND status = 'queued' AND launch_state = ?2 AND runner_name IS ?4";
+
+/// Fails a launch whose runner `?4` waited too long.
+const GIVE_UP: &str = "UPDATE jobs SET launch_state = 'failed', launch_error = ?3, \
+     launch_retry = NULL, next_launch_at = NULL, updated_at = ?2 \
+     WHERE id = ?1 AND status = 'queued' AND launch_state = 'launched' AND runner_name = ?4";
+
+/// The jobs of a JSON array of ids, as `launch` takes them, oldest
+/// first.
+const QUEUED_JOBS: &str = "SELECT id, installation_id, repository, run_id, label FROM jobs \
+     WHERE id IN (SELECT value FROM json_each(?1)) ORDER BY queued_at, id";
+
+/// A tenant in a region whose catalog is due: not refreshed since `?1`
+/// nor attempted since `?2`.
+fn catalog_query() -> String {
+    format!(
+        "SELECT id, role_arn, region FROM tenants WHERE {VERIFIED} \
+         AND NOT EXISTS (SELECT 1 FROM instance_type_regions AS done \
+           WHERE done.region = tenants.region \
+           AND (done.refreshed_at >= ?1 OR done.attempted_at >= ?2)) \
+         ORDER BY COALESCE((SELECT refreshed_at FROM instance_type_regions AS done \
+           WHERE done.region = tenants.region), 0), RANDOM() LIMIT 1"
+    )
+}
+
+/// Lost launches, queued before `?1`, of installations with no verified
+/// tenant, at most `?2`.
+fn unconnected_query() -> String {
+    format!(
+        "SELECT id, installation_id, repository, run_id, label FROM jobs \
+         WHERE status = 'queued' AND launch_state IS NULL AND queued_at < ?1 \
+         AND installation_id NOT IN (SELECT installation_id FROM tenants \
+           WHERE installation_id IS NOT NULL AND {VERIFIED}) \
+         ORDER BY queued_at LIMIT ?2"
+    )
+}
+
+/// Deletes up to `?2` sessions expired before `?1`.
+const DELETE_SESSIONS: &str = "DELETE FROM sessions WHERE key IN \
+     (SELECT key FROM sessions WHERE expires_at < ?1 LIMIT ?2)";
+
+/// Deletes up to `?2` jobs queued before `?1`, oldest first.
+const DELETE_JOBS: &str = "DELETE FROM jobs WHERE id IN \
+     (SELECT id FROM jobs WHERE queued_at < ?1 ORDER BY queued_at LIMIT ?2)";
+
+/// Deletes up to `?2` redeliveries made before `?1`.
+const DELETE_REDELIVERIES: &str = "DELETE FROM redeliveries WHERE guid IN \
+     (SELECT guid FROM redeliveries WHERE redelivered_at < ?1 LIMIT ?2)";
+
+/// Deletes unavailable offerings that lapsed before `?1`.
+const DELETE_OFFERINGS: &str = "DELETE FROM unavailable_offerings WHERE until < ?1";
+
+/// Deletes up to `?2` cache uploads started before `?1`.
+const DELETE_UPLOADS: &str = "DELETE FROM cache_uploads WHERE id IN \
+     (SELECT id FROM cache_uploads WHERE created_at < ?1 LIMIT ?2)";
 
 impl Pass<'_> {
     /// Takes `cost` requests from the budget, or notes that the pass
@@ -336,7 +456,7 @@ impl Pass<'_> {
         let app_jwt = self.app_jwt().await?;
         let mark: Option<u64> = self
             .db
-            .prepare("SELECT deliveries_until FROM reconciler WHERE id = 1")
+            .prepare(DELIVERIES_UNTIL)
             .first(Some("deliveries_until"))
             .await
             .map_err(text)?;
@@ -351,9 +471,7 @@ impl Pass<'_> {
         let guids: Vec<&str> = chosen.iter().map(|chosen| chosen.guid.as_str()).collect();
         let remembered: HashSet<String> = self
             .db
-            .prepare(
-                "SELECT guid FROM redeliveries WHERE guid IN (SELECT value FROM json_each(?1))",
-            )
+            .prepare(REMEMBERED)
             .bind(&[json(&guids)?])
             .map_err(text)?
             .all()
@@ -386,10 +504,7 @@ impl Pass<'_> {
         if complete && handled == pending.len() {
             if let Some(newest) = seen.iter().filter_map(deliveries::Delivery::at).max() {
                 self.db
-                    .prepare(
-                        "UPDATE reconciler SET deliveries_until = \
-                         MAX(COALESCE(deliveries_until, 0), ?1) WHERE id = 1",
-                    )
+                    .prepare(MOVE_DELIVERIES_UNTIL)
                     .bind(&[int(newest).map_err(text)?])
                     .map_err(text)?
                     .run()
@@ -412,10 +527,7 @@ impl Pass<'_> {
         // Remembered first, so two passes cannot both ask.
         let claimed = self
             .db
-            .prepare(
-                "INSERT INTO redeliveries (guid, delivery_id, event, redelivered_at) \
-                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (guid) DO NOTHING",
-            )
+            .prepare(CLAIM_REDELIVERY)
             .bind(&[
                 redelivery.guid.as_str().into(),
                 int(redelivery.id).map_err(text)?,
@@ -484,11 +596,7 @@ impl Pass<'_> {
         let quiet = self.now.saturating_sub(self.limits.sync_after);
         let open = self
             .db
-            .prepare(
-                "SELECT id, installation_id, repository, status FROM jobs \
-                 WHERE status <> 'completed' AND COALESCE(checked_at, updated_at) < ?1 \
-                 ORDER BY COALESCE(checked_at, updated_at) LIMIT ?2",
-            )
+            .prepare(OPEN_JOBS)
             .bind(&[int(quiet).map_err(text)?, SYNC_PER_PASS.into()])
             .map_err(text)?
             .all()
@@ -584,11 +692,7 @@ impl Pass<'_> {
         let now = int(self.now).map_err(text)?;
         let result = self
             .db
-            .prepare(
-                "UPDATE jobs SET status = ?2, ran_on = COALESCE(?3, ran_on), checked_at = ?4, \
-                 updated_at = CASE WHEN status <> ?2 THEN ?4 ELSE updated_at END \
-                 WHERE id = ?1 AND status = ?5",
-            )
+            .prepare(RECORD_CHECK)
             .bind(&[
                 int(job.id).map_err(text)?,
                 next.as_str().into(),
@@ -612,11 +716,7 @@ impl Pass<'_> {
     async fn tenants(&self) -> Fallible<Summary> {
         let tenants = self
             .db
-            .prepare(format!(
-                "SELECT id, installation_id, role_arn, region, launch_template_id, max_runners, \
-                 stack_checked_at, versions_swept_at FROM tenants \
-                 WHERE {VERIFIED} ORDER BY COALESCE(reconciled_at, 0), id LIMIT ?1"
-            ))
+            .prepare(tenants_query())
             .bind(&[TENANTS_PER_PASS.into()])
             .map_err(text)?
             .all()
@@ -667,7 +767,7 @@ impl Pass<'_> {
         // Moved to the back of the queue first, so a tenant that fails
         // every time does not hold up the rest.
         self.db
-            .prepare("UPDATE tenants SET reconciled_at = ?2 WHERE id = ?1")
+            .prepare(MARK_RECONCILED)
             .bind(&[tenant.id.as_str().into(), int(self.now).map_err(text)?])
             .map_err(text)?
             .run()
@@ -828,7 +928,7 @@ impl Pass<'_> {
 
     async fn swept(&self, tenant: &Tenant) -> Fallible<()> {
         self.db
-            .prepare("UPDATE tenants SET versions_swept_at = ?2 WHERE id = ?1")
+            .prepare(MARK_SWEPT)
             .bind(&[tenant.id.as_str().into(), int(self.now).map_err(text)?])
             .map_err(text)?
             .run()
@@ -854,7 +954,7 @@ impl Pass<'_> {
                 // Stamped all the same, so a deleted stack is not asked about
                 // every minute; launches say what is wrong.
                 self.db
-                    .prepare("UPDATE tenants SET stack_checked_at = ?2 WHERE id = ?1")
+                    .prepare(MARK_STACK_CHECKED)
                     .bind(&[tenant.id.as_str().into(), int(self.now).map_err(text)?])
                     .map_err(text)?
                     .run()
@@ -965,12 +1065,7 @@ impl Pass<'_> {
             .collect();
         let rows = self
             .db
-            .prepare(
-                "SELECT id, label, status, launch_state, runner_name, ran_on, queued_at, \
-                 updated_at, launch_retry, next_launch_at FROM jobs WHERE installation_id = ?1 AND (status <> 'completed' \
-                 OR id IN (SELECT value FROM json_each(?2)) \
-                 OR ran_on IN (SELECT value FROM json_each(?3)))",
-            )
+            .prepare(TENANT_JOBS)
             .bind(&[
                 int(installation_id).map_err(text)?,
                 json(&ids)?,
@@ -1048,10 +1143,7 @@ impl Pass<'_> {
         for (job_id, instance_id) in &plan.adopt {
             statements.push((
                 self.db
-                    .prepare(
-                        "UPDATE jobs SET launch_state = 'launched', instance_id = ?2, \
-                         updated_at = ?3 WHERE id = ?1 AND launch_state = 'launching'",
-                    )
+                    .prepare(ADOPT)
                     .bind(&[
                         int(*job_id).map_err(text)?,
                         instance_id.as_str().into(),
@@ -1064,13 +1156,7 @@ impl Pass<'_> {
         for reset in &plan.reset {
             statements.push((
                 self.db
-                    .prepare(
-                        "UPDATE jobs SET launch_state = NULL, runner_name = NULL, \
-                         instance_id = NULL, launch_retry = NULL, next_launch_at = NULL, \
-                         updated_at = ?3 \
-                         WHERE id = ?1 AND status = 'queued' AND launch_state = ?2 \
-                         AND runner_name IS ?4",
-                    )
+                    .prepare(RESET)
                     .bind(&[
                         int(reset.job_id).map_err(text)?,
                         reset.launch_state.as_str().into(),
@@ -1091,12 +1177,7 @@ impl Pass<'_> {
             );
             statements.push((
                 self.db
-                    .prepare(
-                        "UPDATE jobs SET launch_state = 'failed', launch_error = ?3, \
-                         launch_retry = NULL, next_launch_at = NULL, \
-                         updated_at = ?2 WHERE id = ?1 AND status = 'queued' \
-                         AND launch_state = 'launched' AND runner_name = ?4",
-                    )
+                    .prepare(GIVE_UP)
                     .bind(&[
                         int(*job_id).map_err(text)?,
                         now.clone(),
@@ -1168,10 +1249,7 @@ impl Pass<'_> {
         }
         let rows = self
             .db
-            .prepare(
-                "SELECT id, installation_id, repository, run_id, label FROM jobs \
-                 WHERE id IN (SELECT value FROM json_each(?1)) ORDER BY queued_at, id",
-            )
+            .prepare(QUEUED_JOBS)
             .bind(&[json(&ids)?])
             .map_err(text)?
             .all()
@@ -1189,14 +1267,7 @@ impl Pass<'_> {
     async fn catalog(&self) -> Fallible<Summary> {
         let due: Option<CatalogTenant> = self
             .db
-            .prepare(format!(
-                "SELECT id, role_arn, region FROM tenants WHERE {VERIFIED} \
-                 AND NOT EXISTS (SELECT 1 FROM instance_type_regions AS done \
-                   WHERE done.region = tenants.region \
-                   AND (done.refreshed_at >= ?1 OR done.attempted_at >= ?2)) \
-                 ORDER BY COALESCE((SELECT refreshed_at FROM instance_type_regions AS done \
-                   WHERE done.region = tenants.region), 0), RANDOM() LIMIT 1"
-            ))
+            .prepare(catalog_query())
             .bind(&[
                 int(self.now.saturating_sub(instance_types::FRESH_FOR)).map_err(text)?,
                 int(self.now.saturating_sub(instance_types::RETRY_AFTER)).map_err(text)?,
@@ -1321,13 +1392,7 @@ impl Pass<'_> {
         let before = self.now.saturating_sub(self.limits.queued_grace);
         let rows = self
             .db
-            .prepare(format!(
-                "SELECT id, installation_id, repository, run_id, label FROM jobs \
-                 WHERE status = 'queued' AND launch_state IS NULL AND queued_at < ?1 \
-                 AND installation_id NOT IN (SELECT installation_id FROM tenants \
-                   WHERE installation_id IS NOT NULL AND {VERIFIED}) \
-                 ORDER BY queued_at LIMIT ?2"
-            ))
+            .prepare(unconnected_query())
             .bind(&[int(before).map_err(text)?, UNCONNECTED_PER_PASS.into()])
             .map_err(text)?
             .all()
@@ -1356,35 +1421,23 @@ impl Pass<'_> {
             .db
             .batch(vec![
                 self.db
-                    .prepare(
-                        "DELETE FROM sessions WHERE key IN \
-                         (SELECT key FROM sessions WHERE expires_at < ?1 LIMIT ?2)",
-                    )
+                    .prepare(DELETE_SESSIONS)
                     .bind(&[now, DELETE_BATCH.into()])
                     .map_err(text)?,
                 self.db
-                    .prepare(
-                        "DELETE FROM jobs WHERE id IN \
-                         (SELECT id FROM jobs WHERE queued_at < ?1 ORDER BY queued_at LIMIT ?2)",
-                    )
+                    .prepare(DELETE_JOBS)
                     .bind(&[jobs_before, DELETE_BATCH.into()])
                     .map_err(text)?,
                 self.db
-                    .prepare(
-                        "DELETE FROM redeliveries WHERE guid IN \
-                         (SELECT guid FROM redeliveries WHERE redelivered_at < ?1 LIMIT ?2)",
-                    )
+                    .prepare(DELETE_REDELIVERIES)
                     .bind(&[redeliveries_before, DELETE_BATCH.into()])
                     .map_err(text)?,
                 self.db
-                    .prepare("DELETE FROM unavailable_offerings WHERE until < ?1")
+                    .prepare(DELETE_OFFERINGS)
                     .bind(&[int(self.now).map_err(text)?])
                     .map_err(text)?,
                 self.db
-                    .prepare(
-                        "DELETE FROM cache_uploads WHERE id IN \
-                         (SELECT id FROM cache_uploads WHERE created_at < ?1 LIMIT ?2)",
-                    )
+                    .prepare(DELETE_UPLOADS)
                     .bind(&[uploads_before, DELETE_BATCH.into()])
                     .map_err(text)?,
             ])
@@ -1523,4 +1576,397 @@ fn changes(result: &worker::D1Result) -> usize {
 #[allow(clippy::needless_pass_by_value)]
 fn text(err: worker::Error) -> String {
     err.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::*;
+    use crate::testdb::{Db, params};
+
+    const NOW: u64 = 1_800_000_000_000;
+
+    fn job(db: &Db, id: u64, installation_id: u64, status: &str, queued_at: u64) {
+        db.run(
+            "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+             queued_at, updated_at) VALUES (?1, ?2, 'acme/app', ?3, 'hatchrun', ?4, ?5, ?5)",
+            &params![id, installation_id, id * 10, status, queued_at],
+        );
+    }
+
+    fn tenant(db: &Db, id: &str, installation_id: Option<u64>, region: Option<&str>) {
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, role_arn, region, \
+             launch_template_id, subnet_ids, created_at, updated_at) \
+             VALUES (?1, ?2, ?1, ?3, 'arn:aws:iam::1:role/r', ?4, 'lt-1', 'subnet-1', ?5, ?5)",
+            &params![
+                id,
+                installation_id.unwrap_or(0) + 1000,
+                installation_id,
+                region,
+                NOW
+            ],
+        );
+    }
+
+    fn value(db: &Db, sql: &str, params: &[crate::testdb::Param]) -> Value {
+        db.rows(sql, params).unwrap()[0]
+            .values()
+            .next()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn the_lease_is_taken_once_and_given_back() {
+        let db = Db::new();
+        let take = params![NOW, NOW + LEASE];
+        assert_eq!(db.run(TAKE_LEASE, &take), 1);
+        assert_eq!(db.run(TAKE_LEASE, &params![NOW + 1, NOW + 1 + LEASE]), 0);
+        assert_eq!(
+            db.run(RECORD, &params![NOW, NOW + 5, r#"{"tenants":1}"#]),
+            1
+        );
+        let row = &db
+            .rows(
+                "SELECT lease_until, started_at, finished_at, summary FROM reconciler",
+                &[],
+            )
+            .unwrap()[0];
+        assert_eq!(row["lease_until"], 0);
+        assert_eq!(row["started_at"], NOW);
+        assert_eq!(row["finished_at"], NOW + 5);
+        assert_eq!(row["summary"], r#"{"tenants":1}"#);
+        assert_eq!(db.run(TAKE_LEASE, &take), 1);
+    }
+
+    #[test]
+    fn the_delivery_mark_only_moves_forward() {
+        let db = Db::new();
+        assert_eq!(
+            db.column::<Option<u64>>(DELIVERIES_UNTIL, &[], "deliveries_until"),
+            Some(None)
+        );
+        assert_eq!(db.run(MOVE_DELIVERIES_UNTIL, &params![NOW]), 1);
+        db.run(MOVE_DELIVERIES_UNTIL, &params![NOW - 10]);
+        assert_eq!(
+            db.column::<Option<u64>>(DELIVERIES_UNTIL, &[], "deliveries_until"),
+            Some(Some(NOW))
+        );
+    }
+
+    #[test]
+    fn a_redelivery_is_claimed_once() {
+        let db = Db::new();
+        let claim = params!["g-1", 77u64, "workflow_job", NOW];
+        assert_eq!(db.run(CLAIM_REDELIVERY, &claim), 1);
+        assert_eq!(db.run(CLAIM_REDELIVERY, &claim), 0);
+        let guids = serde_json::to_string(&["g-1", "g-2"]).unwrap();
+        let remembered: Vec<Guid> = db.all(REMEMBERED, &params![guids]);
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].guid, "g-1");
+        let empty: Vec<Guid> = db.all(REMEMBERED, &params!["[]"]);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn quiet_open_jobs_are_checked_and_recorded() {
+        let db = Db::new();
+        job(&db, 1, 9, "queued", NOW - 3000);
+        job(&db, 2, 9, "in_progress", NOW - 2000);
+        job(&db, 3, 9, "completed", NOW - 4000);
+        job(&db, 4, 9, "queued", NOW);
+        let open: Vec<OpenJob> = db.all(OPEN_JOBS, &params![NOW - 1000, SYNC_PER_PASS]);
+        let ids: Vec<u64> = open.iter().map(|job| job.id).collect();
+        assert_eq!(ids, [1, 2]);
+        assert_eq!(open[0].installation_id, 9);
+        assert_eq!(open[0].repository, "acme/app");
+        assert_eq!(open[0].status, "queued");
+
+        // As `checked`: completed by runner r-1.
+        let done = params![1u64, "completed", Some("r-1"), NOW, "queued"];
+        assert_eq!(db.run(RECORD_CHECK, &done), 1);
+        // The row moved on, so the same update matches nothing.
+        assert_eq!(db.run(RECORD_CHECK, &done), 0);
+        // Only asked, the status unchanged and no runner.
+        let asked = params![2u64, "in_progress", None::<&str>, NOW, "in_progress"];
+        assert_eq!(db.run(RECORD_CHECK, &asked), 1);
+        let rows = db
+            .rows(
+                "SELECT id, status, ran_on, checked_at, updated_at FROM jobs \
+                 WHERE id IN (1, 2) ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0]["status"], "completed");
+        assert_eq!(rows[0]["ran_on"], "r-1");
+        assert_eq!(rows[0]["updated_at"], NOW);
+        assert_eq!(rows[1]["ran_on"], Value::Null);
+        assert_eq!(rows[1]["checked_at"], NOW);
+        assert_eq!(rows[1]["updated_at"], NOW - 2000);
+        let open: Vec<OpenJob> = db.all(OPEN_JOBS, &params![NOW - 1000, SYNC_PER_PASS]);
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn verified_tenants_are_reconciled_oldest_first() {
+        let db = Db::new();
+        tenant(&db, "a", Some(1), Some("eu-west-1"));
+        tenant(&db, "b", Some(2), Some("eu-west-1"));
+        tenant(&db, "c", Some(3), None);
+        db.run(MARK_RECONCILED, &params!["a", NOW]);
+        db.run(MARK_SWEPT, &params!["b", NOW - 1]);
+        db.run(MARK_STACK_CHECKED, &params!["b", NOW - 2]);
+        let tenants: Vec<Tenant> = db.all(&tenants_query(), &params![TENANTS_PER_PASS]);
+        let ids: Vec<&str> = tenants.iter().map(|tenant| tenant.id.as_str()).collect();
+        assert_eq!(ids, ["b", "a"]);
+        let b = &tenants[0];
+        assert_eq!(b.installation_id, Some(2));
+        assert_eq!(b.role_arn, "arn:aws:iam::1:role/r");
+        assert_eq!(b.region, "eu-west-1");
+        assert_eq!(b.launch_template_id, "lt-1");
+        assert_eq!(b.max_runners, 10);
+        assert_eq!(b.versions_swept_at, Some(NOW - 1));
+        assert_eq!(b.stack_checked_at, Some(NOW - 2));
+        assert_eq!(tenants[1].versions_swept_at, None);
+    }
+
+    #[test]
+    fn a_tenants_jobs_include_the_finished_ones_its_instances_name() {
+        let db = Db::new();
+        job(&db, 1, 9, "queued", NOW - 30);
+        job(&db, 2, 9, "completed", NOW - 20);
+        job(&db, 3, 9, "completed", NOW - 10);
+        job(&db, 4, 9, "completed", NOW - 5);
+        job(&db, 5, 8, "queued", NOW);
+        db.run(
+            "UPDATE jobs SET ran_on = 'r-3', launch_state = 'launched', runner_name = 'r-3', \
+             launch_retry = 'backoff', next_launch_at = ?1 WHERE id = 3",
+            &params![NOW + 60_000],
+        );
+        let ids = serde_json::to_string(&[2u64]).unwrap();
+        let runners = serde_json::to_string(&["r-3"]).unwrap();
+        let mut rows: Vec<JobRow> = db.all(TENANT_JOBS, &params![9u64, ids, runners]);
+        rows.sort_by_key(|row| row.id);
+        let ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, [1, 2, 3]);
+        let three = &rows[2];
+        assert_eq!(three.label, "hatchrun");
+        assert_eq!(three.status, "completed");
+        assert_eq!(three.launch_state.as_deref(), Some("launched"));
+        assert_eq!(three.runner_name.as_deref(), Some("r-3"));
+        assert_eq!(three.ran_on.as_deref(), Some("r-3"));
+        assert_eq!(three.queued_at, NOW - 10);
+        assert_eq!(three.updated_at, NOW - 10);
+        assert_eq!(three.launch_retry.as_deref(), Some("backoff"));
+        assert_eq!(three.next_launch_at, Some(NOW + 60_000));
+
+        // No instances: empty arrays.
+        let rows: Vec<JobRow> = db.all(TENANT_JOBS, &params![9u64, "[]", "[]"]);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn job_updates_apply_only_while_the_row_matches() {
+        let db = Db::new();
+        for id in 1..=4 {
+            job(&db, id, 9, "queued", NOW - 100);
+        }
+        db.run(
+            "UPDATE jobs SET launch_state = 'launching', runner_name = 'r-1' WHERE id = 1",
+            &[],
+        );
+        db.run(
+            "UPDATE jobs SET launch_state = 'failed', launch_retry = 'setup', \
+             next_launch_at = 5 WHERE id = 2",
+            &[],
+        );
+        db.run(
+            "UPDATE jobs SET launch_state = 'launched', runner_name = 'r-3' WHERE id = 3",
+            &[],
+        );
+        db.run(
+            "UPDATE jobs SET launch_state = 'launched', runner_name = 'r-4' WHERE id = 4",
+            &[],
+        );
+        let adopt = params![1u64, "i-1", NOW];
+        let reset = params![2u64, "failed", NOW, None::<&str>];
+        let reset_named = params![4u64, "launched", NOW, Some("r-4")];
+        let give_up = params![3u64, NOW, "runner r-3 waited 10 minutes", "r-3"];
+        let changed = db
+            .batch(&[
+                (ADOPT, adopt.clone()),
+                (RESET, reset.clone()),
+                (RESET, reset_named.clone()),
+                (GIVE_UP, give_up.clone()),
+            ])
+            .unwrap();
+        assert_eq!(changed, [1, 1, 1, 1]);
+        let rows = db
+            .rows(
+                "SELECT launch_state, runner_name, instance_id, launch_error, launch_retry, \
+                 next_launch_at, updated_at FROM jobs ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0]["launch_state"], "launched");
+        assert_eq!(rows[0]["instance_id"], "i-1");
+        assert_eq!(rows[1]["launch_state"], Value::Null);
+        assert_eq!(rows[1]["launch_retry"], Value::Null);
+        assert_eq!(rows[1]["next_launch_at"], Value::Null);
+        assert_eq!(rows[2]["launch_state"], "failed");
+        assert_eq!(rows[2]["launch_error"], "runner r-3 waited 10 minutes");
+        assert_eq!(rows[3]["launch_state"], Value::Null);
+        assert_eq!(rows[3]["runner_name"], Value::Null);
+        assert!(rows.iter().all(|row| row["updated_at"] == NOW));
+
+        // The rows moved on; the same statements change nothing.
+        for (sql, params) in [
+            (ADOPT, adopt),
+            (RESET, reset),
+            (RESET, reset_named),
+            (GIVE_UP, give_up),
+        ] {
+            assert_eq!(db.run(sql, &params), 0, "{sql}");
+        }
+    }
+
+    #[test]
+    fn queued_jobs_read_as_launch_takes_them() {
+        let db = Db::new();
+        job(&db, 1, 9, "queued", NOW);
+        job(&db, 2, 9, "queued", NOW - 10);
+        job(&db, 3, 9, "queued", NOW - 20);
+        let ids = serde_json::to_string(&[1u64, 2]).unwrap();
+        let rows: Vec<LaunchRow> = db.all(QUEUED_JOBS, &params![ids]);
+        let ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, [2, 1]);
+        assert_eq!(rows[0].installation_id, 9);
+        assert_eq!(rows[0].repository, "acme/app");
+        assert_eq!(rows[0].run_id, 20);
+        assert_eq!(rows[0].label, "hatchrun");
+    }
+
+    #[test]
+    fn the_catalog_picks_a_region_that_is_due() {
+        let db = Db::new();
+        tenant(&db, "a", Some(1), Some("eu-west-1"));
+        tenant(&db, "b", Some(2), Some("us-east-1"));
+        tenant(&db, "c", Some(3), None);
+        let fresh = NOW - instance_types::FRESH_FOR;
+        let retry = NOW - instance_types::RETRY_AFTER;
+        let due = params![fresh, retry];
+        db.run(
+            "INSERT INTO instance_type_regions (region, refreshed_at, attempted_at) \
+             VALUES ('eu-west-1', ?1, ?1)",
+            &params![NOW],
+        );
+        let picked: Option<CatalogTenant> = db.first(&catalog_query(), &due);
+        let picked = picked.unwrap();
+        assert_eq!(picked.id, "b");
+        assert_eq!(picked.region, "us-east-1");
+        assert_eq!(picked.role_arn, "arn:aws:iam::1:role/r");
+        db.run(
+            "INSERT INTO instance_type_regions (region, attempted_at) VALUES ('us-east-1', ?1)",
+            &params![NOW],
+        );
+        assert!(db.first::<CatalogTenant>(&catalog_query(), &due).is_none());
+    }
+
+    #[test]
+    fn lost_launches_without_aws_are_found() {
+        let db = Db::new();
+        tenant(&db, "a", Some(1), Some("eu-west-1"));
+        tenant(&db, "c", Some(3), None);
+        job(&db, 10, 1, "queued", NOW - 100_000);
+        job(&db, 11, 2, "queued", NOW - 100_000);
+        job(&db, 12, 3, "queued", NOW - 200_000);
+        job(&db, 13, 2, "queued", NOW);
+        let rows: Vec<LaunchRow> = db.all(
+            &unconnected_query(),
+            &params![NOW - 60_000, UNCONNECTED_PER_PASS],
+        );
+        let ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
+        assert_eq!(ids, [12, 11]);
+    }
+
+    #[test]
+    fn retention_deletes_old_rows() {
+        let db = Db::new();
+        db.run(
+            "INSERT INTO users (id, login, avatar_url, created_at, updated_at) \
+             VALUES (1, 'u', 'a', 0, 0)",
+            &[],
+        );
+        for (key, expires_at) in [("old", NOW - 1), ("new", NOW + 1)] {
+            db.run(
+                "INSERT INTO sessions (key, user_id, github_token, created_at, expires_at) \
+                 VALUES (?1, 1, 't', 0, ?2)",
+                &params![key, expires_at],
+            );
+        }
+        job(&db, 1, 9, "completed", NOW - 100);
+        job(&db, 2, 9, "completed", NOW);
+        for (guid, at) in [("old", NOW - REDELIVERY_MEMORY - 1), ("new", NOW)] {
+            db.run(CLAIM_REDELIVERY, &params![guid, 1u64, "e", at]);
+        }
+        for (subnet, until) in [("s-old", NOW - 1), ("s-new", NOW + 1)] {
+            db.run(
+                "INSERT INTO unavailable_offerings \
+                 (tenant_id, instance_type, subnet_id, spot, code, until) \
+                 VALUES ('a', 'm8g.large', ?1, 0, 'c', ?2)",
+                &params![subnet, until],
+            );
+        }
+        for (id, at) in [("old", NOW - CACHE_UPLOAD_MEMORY - 1), ("new", NOW)] {
+            db.run(
+                "INSERT INTO cache_uploads (id, job_id, object_key, upload_id, created_at) \
+                 VALUES (?1, 1, 'k', 'u', ?2)",
+                &params![id, at],
+            );
+        }
+        // As `retention` binds them.
+        let jobs_before = NOW - 50;
+        let deleted = db
+            .batch(&[
+                (DELETE_SESSIONS, params![NOW, DELETE_BATCH]),
+                (DELETE_JOBS, params![jobs_before, DELETE_BATCH]),
+                (
+                    DELETE_REDELIVERIES,
+                    params![NOW - REDELIVERY_MEMORY, DELETE_BATCH],
+                ),
+                (DELETE_OFFERINGS, params![NOW]),
+                (
+                    DELETE_UPLOADS,
+                    params![NOW - CACHE_UPLOAD_MEMORY, DELETE_BATCH],
+                ),
+            ])
+            .unwrap();
+        assert_eq!(deleted, [1, 1, 1, 1, 1]);
+        for (table, key) in [
+            ("sessions", "key"),
+            ("redeliveries", "guid"),
+            ("unavailable_offerings", "subnet_id"),
+            ("cache_uploads", "id"),
+        ] {
+            let left = value(
+                &db,
+                &format!("SELECT group_concat({key}) FROM {table}"),
+                &[],
+            );
+            assert!(left == "new" || left == "s-new", "{table} kept {left}");
+        }
+        assert_eq!(value(&db, "SELECT group_concat(id) FROM jobs", &[]), "2");
+    }
+
+    #[test]
+    fn retention_deletes_a_batch_at_most() {
+        let db = Db::new();
+        for id in 0..3u64 {
+            job(&db, id + 1, 9, "completed", id);
+        }
+        assert_eq!(db.run(DELETE_JOBS, &params![NOW, 2u32]), 2);
+        assert_eq!(value(&db, "SELECT group_concat(id) FROM jobs", &[]), "3");
+    }
 }

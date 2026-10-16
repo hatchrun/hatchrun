@@ -36,5 +36,10 @@ wasm-bindgen-futures = "0.4.79"
 web-sys = { version = "0.3.106", features = ["Crypto", "CryptoKey", "SubtleCrypto"] }
 worker = { version = "0.8.7", features = ["d1"] }
 
+# Runs the Worker's D1 queries against SQLite in tests. Kept off wasm32,
+# where the bundled C library does not build.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
 [lints]
 workspace = true
