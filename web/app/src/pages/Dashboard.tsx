@@ -335,10 +335,16 @@ function Fleet({
   );
 }
 
+/**
+ * The strip's lowest top, in jobs per bucket, so a quiet day with one
+ * job in a bucket draws a short bar instead of a full-height one.
+ */
+const STRIP_FLOOR = 5;
+
 /** Finished and failed jobs per bucket, oldest on the left. */
 function Strip({ activity }: { activity: JobActivity }) {
   const { since, bucketMs, finished, failed } = activity;
-  const top = Math.max(1, ...finished.map((done, i) => done + (failed[i] ?? 0)));
+  const top = Math.max(STRIP_FLOOR, ...finished.map((done, i) => done + (failed[i] ?? 0)));
   const at = (i: number) =>
     new Date(since + i * bucketMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   return (
@@ -396,7 +402,7 @@ function StatusTabs({
   counts: JobCounts | null;
   onPick: (status: JobGroup | undefined) => void;
 }) {
-  const tabs: { id: JobGroup | undefined; label: string; count?: number; note?: string; title?: string }[] = [
+  const tabs: { id: JobGroup | undefined; label: string; count?: number; title?: string }[] = [
     { id: undefined, label: "All" },
     { id: "active", label: "Active", count: counts?.active },
     { id: "waiting", label: "Waiting", count: counts?.waiting },
@@ -404,7 +410,6 @@ function StatusTabs({
       id: "failed",
       label: "Failed",
       count: counts?.failedToday,
-      note: "24 h",
       title: "Failed launches in the last 24 hours. The list goes back further.",
     },
   ];
@@ -420,15 +425,19 @@ function StatusTabs({
             title={tab.title}
             onClick={() => onPick(tab.id)}
             className={cn(
+              // The group clips its children, so the focus ring is drawn
+              // inside the button; outside it, only its right edge shows.
+              // On the bone selected tab it is dark and set in from the edge.
               "cursor-pointer border-r border-rivet px-3 py-1.5 last:border-r-0",
-              on ? "bg-bone text-graphite" : "bg-transparent text-bone-dim hover:bg-seam hover:text-bone",
+              on
+                ? "bg-bone text-graphite focus-visible:-outline-offset-4 focus-visible:outline-graphite"
+                : "bg-transparent text-bone-dim hover:bg-seam hover:text-bone focus-visible:-outline-offset-2",
             )}
           >
             {tab.label}
             {tab.count !== undefined && (
               <span className={cn("ml-1.5", on ? "text-graphite/60" : "text-steel")}>
                 {tab.count}
-                {tab.note && <span className="ml-1 text-[10px]">/ {tab.note}</span>}
               </span>
             )}
           </button>
@@ -606,7 +615,7 @@ function JobRow({ org, job, region, now }: { org: string; job: Job; region: stri
             <span className="text-steel">{job.status === "completed" || shown.tone === "failed" ? "none" : "none yet"}</span>
           )}
         </TableCell>
-        <TableCell className="text-[13px] text-fog" title={new Date(job.queuedAt).toLocaleString()}>
+        <TableCell className="font-mono text-xs text-fog" title={new Date(job.queuedAt).toLocaleString()}>
           {ago(job.queuedAt)}
         </TableCell>
         <TableCell
