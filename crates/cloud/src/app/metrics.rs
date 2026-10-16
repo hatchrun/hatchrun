@@ -6,7 +6,8 @@
 //! hatchrun-telemetry (crates/telemetry).
 //!
 //! - `GET /api/tenants/<org>/jobs/<id>/metrics` returns the job, the
-//!   link to it on GitHub, a summary of its windows and the windows
+//!   link to it on GitHub, the tenant's region for the instance's
+//!   console page, a summary of its windows and the windows
 //!   themselves, oldest first.
 //!
 //! The windows live in Workers Analytics Engine, read through the
@@ -152,6 +153,7 @@ pub(crate) async fn job(ctx: &Ctx<'_>, org: &str, id: &str) -> Answer {
     let summary: Option<Summary> = query(ctx, SUMMARY, &params).await?.into_iter().next();
     Ok(Response::from_json(&serde_json::json!({
         "githubUrl": github_url(&ctx.config.github_web, &job),
+        "region": row.region,
         "job": job,
         "summary": summary.filter(|summary| summary.seconds.is_some_and(|seconds| seconds > 0.0)),
         "windows": distinct(windows),
