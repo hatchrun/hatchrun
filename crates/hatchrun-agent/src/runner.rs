@@ -58,8 +58,9 @@ impl Runner {
         shutdown: impl Future<Output = ()>,
     ) -> Result<ExitStatus> {
         let mut extra = self.env.clone();
-        if !self.env.is_empty() {
-            let hook = self.write_job_started_hook()?;
+        if !self.env.is_empty()
+            && let Some(hook) = self.write_job_started_hook()?
+        {
             extra.push((JOB_STARTED_HOOK.into(), hook.to_string_lossy().into_owned()));
         }
         let mut command = Command::new(self.dir.join("run.sh"));
@@ -97,13 +98,49 @@ impl Runner {
 
     /// Writes a script that appends `env` to `$GITHUB_ENV`. Any old file
     /// is removed first so the write cannot follow a planted symlink.
-    fn write_job_started_hook(&self) -> Result<PathBuf> {
+    ///
+    /// A job-started hook the environment file already sets runs first,
+    /// started the way the runner would start it, so its failure still
+    /// fails the job and our variables win over any it writes. A hook the
+    /// agent cannot start that way is left in place without ours, and
+    /// container jobs then miss the proxy.
+    fn write_job_started_hook(&self) -> Result<Option<PathBuf>> {
         use std::fmt::Write as _;
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
 
         let path = self.dir.join(JOB_STARTED_SCRIPT);
         let mut script = String::from("#!/bin/sh\n");
+        if let Some(existing) = envfile::read(&self.env_file)?
+            .into_iter()
+            .rev()
+            .find(|(key, value)| key == JOB_STARTED_HOOK && !value.is_empty())
+            .map(|(_, value)| value)
+        {
+            // The runner runs .sh hooks with bash and .ps1 hooks with pwsh,
+            // with these arguments (ScriptHandlerHelpers.cs).
+            let start = match std::path::Path::new(&existing)
+                .extension()
+                .and_then(|ext| ext.to_str())
+            {
+                Some("sh") => "bash --noprofile --norc -e -o pipefail",
+                Some("ps1") => "pwsh -command",
+                _ => {
+                    warn!(
+                        hook = existing,
+                        "keeping the job-started hook, which is not a .sh or .ps1 script; \
+                         container jobs do not get the job cache"
+                    );
+                    return Ok(None);
+                }
+            };
+            let target = if start.starts_with("pwsh") {
+                sh_quote(&format!(". '{}'", existing.replace('\'', "''")))
+            } else {
+                sh_quote(&existing)
+            };
+            writeln!(script, "{start} {target}")?;
+        }
         for (key, value) in &self.env {
             let line = sh_quote(&format!("{key}={value}"));
             writeln!(script, "printf '%s\\n' {line} >> \"$GITHUB_ENV\"")?;
@@ -121,7 +158,7 @@ impl Runner {
             .open(&path)
             .and_then(|mut file| file.write_all(script.as_bytes()))
             .with_context(|| format!("write {}", path.display()))?;
-        Ok(path)
+        Ok(Some(path))
     }
 
     fn environment(&self, extra: &[(String, String)]) -> Result<Vec<(String, String)>> {
@@ -337,6 +374,95 @@ mod tests {
             std::fs::metadata(&hook).unwrap().permissions().mode() & 0o777,
             0o755
         );
+    }
+
+    #[tokio::test]
+    async fn job_started_hook_runs_an_existing_hook_first() {
+        let dir = runner_dir("0");
+        let existing = dir.path().join("customer-hook.sh");
+        std::fs::write(&existing, "echo ACTIONS_CACHE_SERVICE_V2=false >> \"$GITHUB_ENV\"\necho CUSTOMER=1 >> \"$GITHUB_ENV\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("environment"),
+            format!(
+                "{JOB_STARTED_HOOK}={}\nPATH=/usr/bin:/bin\n",
+                existing.display()
+            ),
+        )
+        .unwrap();
+        let runner = Runner {
+            env: vec![("ACTIONS_CACHE_SERVICE_V2".into(), "true".into())],
+            ..runner(dir.path())
+        };
+        runner.run("jit", std::future::pending()).await.unwrap();
+
+        let hook = dir.path().join(JOB_STARTED_SCRIPT);
+        let env = recorded_env(dir.path());
+        assert!(
+            env.contains(&format!("{JOB_STARTED_HOOK}={}\n", hook.display())),
+            "{env}"
+        );
+        let github_env = dir.path().join("github_env");
+        let status = std::process::Command::new("bash")
+            .arg("-e")
+            .arg(&hook)
+            .env("GITHUB_ENV", &github_env)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&github_env).unwrap(),
+            "ACTIONS_CACHE_SERVICE_V2=false\nCUSTOMER=1\nACTIONS_CACHE_SERVICE_V2=true\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_started_hook_fails_when_the_existing_hook_fails() {
+        let dir = runner_dir("0");
+        let existing = dir.path().join("fails.sh");
+        std::fs::write(&existing, "exit 7\n").unwrap();
+        std::fs::write(
+            dir.path().join("environment"),
+            format!("{JOB_STARTED_HOOK}={}\n", existing.display()),
+        )
+        .unwrap();
+        let runner = Runner {
+            env: vec![("ACTIONS_CACHE_SERVICE_V2".into(), "true".into())],
+            ..runner(dir.path())
+        };
+        runner.run("jit", std::future::pending()).await.unwrap();
+
+        let github_env = dir.path().join("github_env");
+        let status = std::process::Command::new("bash")
+            .arg("-e")
+            .arg(dir.path().join(JOB_STARTED_SCRIPT))
+            .env("GITHUB_ENV", &github_env)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert!(!github_env.exists());
+    }
+
+    #[tokio::test]
+    async fn job_started_hook_keeps_a_hook_it_cannot_start() {
+        let dir = runner_dir("0");
+        std::fs::write(
+            dir.path().join("environment"),
+            format!("{JOB_STARTED_HOOK}=/opt/hooks/started.js\n"),
+        )
+        .unwrap();
+        let runner = Runner {
+            env: vec![("ACTIONS_CACHE_SERVICE_V2".into(), "true".into())],
+            ..runner(dir.path())
+        };
+        runner.run("jit", std::future::pending()).await.unwrap();
+
+        let env = recorded_env(dir.path());
+        assert!(
+            env.contains(&format!("{JOB_STARTED_HOOK}=/opt/hooks/started.js\n")),
+            "{env}"
+        );
+        assert!(env.contains("ACTIONS_CACHE_SERVICE_V2=true"), "{env}");
+        assert!(!dir.path().join(JOB_STARTED_SCRIPT).exists());
     }
 
     #[tokio::test]
