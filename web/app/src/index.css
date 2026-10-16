@@ -1,0 +1,154 @@
+/*
+ * SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+
+/*
+ * The app's theme: shadcn/ui on the hatchrun dark palette. The screens
+ * that are not rebuilt on it yet keep their hand-written classes in
+ * styles.css, which sits in its own layer so utilities still win.
+ */
+
+@layer theme, base, legacy, components, utilities;
+
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/archivo/wdth.css";
+@import "@fontsource-variable/jetbrains-mono/index.css";
+@import "./styles.css" layer(legacy);
+
+:root {
+  /* Incubator palette, from hatchrun/brand colors/tokens.json. */
+  --graphite: #141517;
+  --panel: #1a1c1f;
+  --housing: #1e2023;
+  --seam: #26282c;
+  --rivet: #34373c;
+  --steel: #5e636a;
+  --fog: #9a9fa6;
+  --bone-dim: #c9c3b4;
+  --bone: #ece6d6;
+  --chick: #ffcf33;
+  --heat: #ff6a13;
+  --blush: #ff9466;
+  --ember: #6a3010;
+  --passed: #40ff80;
+  --passed-halo: #142a1b;
+  --failed: #e6398f;
+  --failed-soft: #f7a8cf;
+
+  --background: var(--graphite);
+  --foreground: var(--bone);
+  --card: var(--panel);
+  --card-foreground: var(--bone);
+  --popover: var(--housing);
+  --popover-foreground: var(--bone);
+  --primary: var(--chick);
+  --primary-foreground: var(--graphite);
+  --secondary: var(--housing);
+  --secondary-foreground: var(--bone);
+  --muted: var(--housing);
+  --muted-foreground: var(--fog);
+  --accent: var(--seam);
+  --accent-foreground: var(--bone);
+  --destructive: var(--failed);
+  --border: var(--rivet);
+  --input: var(--rivet);
+  --ring: var(--chick);
+  --radius: 4px;
+
+  color-scheme: dark;
+}
+
+@theme inline {
+  --font-sans: "Archivo Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-graphite: var(--graphite);
+  --color-panel: var(--panel);
+  --color-housing: var(--housing);
+  --color-seam: var(--seam);
+  --color-rivet: var(--rivet);
+  --color-steel: var(--steel);
+  --color-fog: var(--fog);
+  --color-bone-dim: var(--bone-dim);
+  --color-bone: var(--bone);
+  --color-chick: var(--chick);
+  --color-heat: var(--heat);
+  --color-blush: var(--blush);
+  --color-ember: var(--ember);
+  --color-passed: var(--passed);
+  --color-passed-halo: var(--passed-halo);
+  --color-failed: var(--failed);
+  --color-failed-soft: var(--failed-soft);
+
+  --radius-xs: 2px;
+  --radius-sm: 3px;
+  --radius-md: var(--radius);
+  --radius-lg: 6px;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background font-sans text-foreground;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--chick);
+    outline-offset: 2px;
+  }
+}
+
+/* A mono caption: column heads, panel labels. */
+@utility cap {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fog);
+}
+
+/* Archivo at its widest, as the brand sets titles. */
+@utility display {
+  font-weight: 900;
+  font-stretch: 125%;
+  text-transform: uppercase;
+  line-height: 1;
+  letter-spacing: -0.01em;
+}
+
+/* A link whose text is underlined quietly until hovered. */
+@utility quiet-underline {
+  text-decoration: underline;
+  text-decoration-color: var(--rivet);
+  text-underline-offset: 3px;
+}

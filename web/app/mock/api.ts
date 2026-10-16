@@ -9,6 +9,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
+import type { Job } from "../src/api.ts";
 import * as profiles from "./runners.ts";
 
 interface MockTenant {
@@ -228,14 +229,31 @@ const routes: Record<string, Handler> = {
       return [404, { error: "no organization here" }];
     }
     const now = Date.now();
-    const jobs = sampleJobs(now);
+    const all = sampleJobs(now);
+    const before = Number(url.searchParams.get("before")) || Infinity;
+    const status = url.searchParams.get("status");
+    const group = status === "active" || status === "waiting" || status === "failed" ? IN_GROUP[status] : null;
+    if (status && !group) {
+      return [400, { error: "status is one of active, waiting or failed." }];
+    }
+    const pageSize = 12;
+    const day = all.filter((job) => job.updatedAt >= now - 86_400_000);
+    const activity = before === Infinity ? sampleActivity(now, day) : undefined;
+    const sum = (values: number[] | undefined) => (values ?? []).reduce((a, b) => a + b, 0);
     return [
       200,
       {
-        jobs: url.searchParams.has("before") ? [] : jobs,
-        counts: { waiting: 1, active: 2, completedToday: 37, failedToday: 1 },
+        jobs: all.filter((job) => job.queuedAt < before && (!group || group(job))).slice(0, pageSize),
+        counts: {
+          waiting: all.filter(IN_GROUP.waiting).length,
+          active: all.filter(IN_GROUP.active).length,
+          running: all.filter((job) => IN_GROUP.active(job) && job.status === "in_progress").length,
+          completedToday: activity ? sum(activity.finished) : day.filter((job) => job.status === "completed").length,
+          failedToday: day.filter(IN_GROUP.failed).length,
+        },
         region: tenant.aws?.region ?? null,
-        pageSize: 5,
+        pageSize,
+        ...(activity && { activity }),
       },
     ];
   },
@@ -246,12 +264,16 @@ const routes: Record<string, Handler> = {
     if (!tenant || !job) {
       return [404, { error: `no job ${id} here` }];
     }
-    const windows = job.launchState === "launched" ? sampleWindows(job.queuedAt) : [];
+    const windows =
+      job.launchState === "launched"
+        ? sampleWindows(job.queuedAt).filter((w) => w.at * 1000 <= Date.now())
+        : [];
     return [
       200,
       {
         githubUrl: `https://github.com/${job.repository}/actions/runs/${job.runId}/job/${job.id}`,
         job,
+        region: tenant.aws?.region ?? null,
         summary: windows.length === 0 ? null : summarize(windows),
         windows,
       },
@@ -313,7 +335,7 @@ function adopt(installationId: number): MockTenant | null {
       org,
       installationId: null,
       aws: null,
-      maxRunners: 10,
+      maxRunners: 40,
       allowedRegions: null,
       beta: false,
       subscription: null,
@@ -434,14 +456,14 @@ function summarize(windows: ReturnType<typeof sampleWindows>) {
   };
 }
 
-function sampleJobs(now: number) {
+function sampleJobs(now: number): Job[] {
   const minute = 60_000;
   const job = (
     id: number,
     repository: string,
     label: string,
-    status: string,
-    launchState: string | null,
+    status: Job["status"],
+    launchState: Job["launchState"],
     queuedAgo: number,
     took: number,
     launchError: string | null = null,
@@ -452,12 +474,12 @@ function sampleJobs(now: number) {
   ) => ({
     id,
     repository,
-    runId: id * 7,
+    runId: 11582000000 + id * 13,
     label,
     status,
     launchState,
     runnerName: launchState ? `hatchrun-${id}-ab12cd34` : null,
-    instanceId: launchState === "launched" ? `i-0${id.toString(16)}f00ba4` : null,
+    instanceId: launchState === "launched" ? `i-0${(id * 2654435761).toString(16).padStart(16, "0").slice(-16)}` : null,
     launchError,
     launchAttempts: retry.attempts,
     launchRetry: retry.wait,
@@ -465,20 +487,65 @@ function sampleJobs(now: number) {
     queuedAt: now - queuedAgo * minute,
     updatedAt: now - queuedAgo * minute + took * 1000,
   });
+  const repos = ["acme-corp/api", "acme-corp/web", "acme-corp/infra", "acme-corp/mobile", "acme-corp/data"];
+  const labels = ["hatchrun-4cpu-arm64", "hatchrun-2cpu", "hatchrun-8cpu-arm64", "hatchrun/disk=100", "hatchrun-16cpu"];
+  // Finished jobs going back two days, a few minutes apart.
+  const done = Array.from({ length: 70 }, (_, i) =>
+    job(9118 - i, repos[i % repos.length] ?? "", labels[(i * 3) % labels.length] ?? "", "completed", "launched",
+      45 + i * 37, 150 + ((i * 97) % 600)),
+  );
   return [
-    job(9123, "acme-corp/api", "hatchrun-8cpu-arm64", "queued", null, 0.2, 0),
-    job(9124, "acme-corp/api", "hatchrun-4cpu-arm64", "queued", "failed", 1, 0,
+    job(9127, "acme-corp/infra", "hatchrun", "queued", null, 0.1, 0),
+    job(9126, "acme-corp/api", "hatchrun-8cpu-arm64", "queued", "launching", 0.3, 0),
+    job(9123, "acme-corp/web", "hatchrun-2cpu", "queued", "launched", 0.8, 0),
+    job(9124, "acme-corp/mobile", "hatchrun-16cpu", "queued", "failed", 1, 0,
       "no capacity for c7g.xlarge, m7g.xlarge in any subnet: InsufficientInstanceCapacity: We currently do not have sufficient capacity in the Availability Zone you requested.",
       { attempts: 3, wait: "backoff", inMinutes: 2 }),
-    job(9125, "acme-corp/web", "hatchrun", "queued", "failed", 2, 0,
-      "AssumeRoleWithWebIdentity: AccessDenied: Not authorized to perform sts:AssumeRoleWithWebIdentity",
+    job(9125, "acme-corp/data", "hatchrun-8cpu/spot=true", "queued", "failed", 2, 0,
+      "OptInRequired: subscribe this account to the hatchrun runner images in AWS Marketplace",
       { attempts: 1, wait: "setup" }),
-    job(9122, "acme-corp/web", "hatchrun", "in_progress", "launched", 3, 0),
-    job(9121, "acme-corp/api", "hatchrun-8cpu-arm64/spot=true", "in_progress", "launched", 6, 0),
+    job(9122, "acme-corp/api", "hatchrun-4cpu-arm64", "in_progress", "launched", 5, 0),
+    job(9121, "acme-corp/api", "hatchrun-8cpu-arm64/spot=true", "in_progress", "launched", 9, 0),
     job(9120, "acme-corp/infra", "hatchrun-16cpu/disk=300", "completed", "failed", 22, 4,
       "hatchrun-16cpu asks for a 300 GiB root volume and the connect stack allows at most 200 GiB. Raise VolumeSizeLimit on the stack or ask for less."),
     job(9119, "acme-corp/web", "hatchrun", "completed", "launched", 41, 312),
+    ...done,
   ];
+}
+
+// The same groups as the counts query in crates/cloud/src/app/dashboard.rs.
+const IN_GROUP: Record<"active" | "waiting" | "failed", (job: Job) => boolean> = {
+  active: (job) => job.status !== "completed" && (job.launchState === "launching" || job.launchState === "launched"),
+  waiting: (job) =>
+    job.status === "queued" &&
+    (job.launchState === null || (job.launchState === "failed" && job.launchRetry === "backoff")),
+  failed: (job) => job.launchState === "failed" && !(job.status === "queued" && job.launchRetry === "backoff"),
+};
+
+// A day of 15 minute buckets: the sample jobs plus a busy working day
+// around them, so the strip has a shape.
+function sampleActivity(now: number, day: Job[]) {
+  const bucketMs = 900_000;
+  const since = (Math.floor(now / bucketMs) + 1 - 96) * bucketMs;
+  const finished = Array.from({ length: 96 }, (_, i) => {
+    const hour = new Date(since + i * bucketMs).getHours();
+    const busy = hour >= 8 && hour <= 19 ? 1 : 0.15;
+    return Math.round((2 + 4 * Math.abs(Math.sin(i * 1.7)) + 2 * Math.abs(Math.cos(i * 0.6))) * busy);
+  });
+  const failed = Array.from({ length: 96 }, () => 0);
+  for (const job of day) {
+    const i = Math.floor((job.updatedAt - since) / bucketMs);
+    if (i < 0 || i >= 96) {
+      continue;
+    }
+    if (IN_GROUP.failed(job)) {
+      failed[i] = (failed[i] ?? 0) + 1;
+    }
+    if (job.status === "completed") {
+      finished[i] = (finished[i] ?? 0) + 1;
+    }
+  }
+  return { since, bucketMs, finished, failed };
 }
 
 // A stack from before the version tag, so the dashboard offers the update.

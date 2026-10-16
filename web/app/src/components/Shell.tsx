@@ -2,53 +2,102 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
-import { signOut, type User } from "../api";
-import { Link } from "../router";
+import { signOut, type User } from "@/api";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { cn } from "@/lib/utils";
+import { Link } from "@/router";
+import { OpenIcon } from "./icons";
 import { Logo } from "./Logo";
 
-export function Shell({ user, nav, children }: { user: User; nav?: ReactNode; children: ReactNode }) {
+/**
+ * The top bar and the page under it. `nav` follows the brand after a
+ * slash (the organization and its pages); `status` sits on the right
+ * before Docs.
+ */
+export function Shell({
+  user,
+  nav,
+  status,
+  children,
+}: {
+  user: User;
+  nav?: ReactNode;
+  status?: ReactNode;
+  children: ReactNode;
+}) {
   return (
-    <div className="shell">
-      <header className="topbar">
-        <Link href="/" className="brand" aria-label="hatchrun home">
-          <Logo size={24} />
-          <span>hatchrun</span>
-        </Link>
-        {nav && <span className="topbar-sep" aria-hidden="true">/</span>}
-        <div className="topbar-nav">{nav}</div>
-        <a className="topbar-link" href="https://hatchrun.io/docs/overview/">
-          Docs
-        </a>
-        <UserMenu user={user} />
+    <div className="min-h-screen bg-background text-foreground">
+      <header className="border-b border-rivet bg-graphite">
+        <div className="flex flex-wrap items-center gap-x-3.5 px-4 sm:px-6">
+          <Link href="/" aria-label="hatchrun home" className="flex h-13 items-center gap-2">
+            <Logo size={26} />
+            <span className="hidden text-base font-extrabold tracking-[-0.01em] [font-stretch:125%] sm:inline">hatchrun</span>
+          </Link>
+          {nav && (
+            <span aria-hidden="true" className="text-xl text-rivet">
+              /
+            </span>
+          )}
+          {nav}
+          <div className="ml-auto flex h-13 items-center gap-4.5">
+            {status}
+            <a
+              href="https://hatchrun.io/docs/overview/"
+              className="inline-flex items-center gap-1.5 text-[13px] text-bone-dim hover:text-bone"
+            >
+              Docs
+              <OpenIcon />
+            </a>
+            <UserMenu user={user} />
+          </div>
+        </div>
       </header>
-      <main className="page">{children}</main>
+      <main className="px-4 pt-5 pb-8 sm:px-6">{children}</main>
     </div>
   );
 }
 
-function UserMenu({ user }: { user: User }) {
-  const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
+export interface Tab {
+  href: string;
+  label: string;
+  current: boolean;
+}
 
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    const close = (event: MouseEvent | KeyboardEvent) => {
-      if (event instanceof KeyboardEvent ? event.key === "Escape" : !ref.current?.contains(event.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", close);
-    document.addEventListener("keydown", close);
-    return () => {
-      document.removeEventListener("mousedown", close);
-      document.removeEventListener("keydown", close);
-    };
-  }, [open]);
+/** An organization's pages as tabs with a yellow underline. */
+export function PageTabs({ label, tabs }: { label: string; tabs: Tab[] }) {
+  return (
+    <nav
+      aria-label={label}
+      className="order-last -mx-4 flex w-[calc(100%+2rem)] overflow-x-auto border-t border-seam px-1 sm:order-none sm:mx-0 sm:ml-2.5 sm:w-auto sm:border-0 sm:px-0"
+    >
+      {tabs.map((tab) => (
+        <Link
+          key={tab.href}
+          href={tab.href}
+          aria-current={tab.current ? "page" : undefined}
+          className={cn(
+            "flex h-13 items-center border-b-2 border-transparent px-3.5 text-sm font-semibold text-fog hover:text-bone",
+            "aria-[current=page]:border-chick aria-[current=page]:text-bone",
+          )}
+        >
+          {tab.label}
+        </Link>
+      ))}
+    </nav>
+  );
+}
+
+function UserMenu({ user }: { user: User }) {
+  const [busy, setBusy] = useState(false);
 
   const leave = async () => {
     setBusy(true);
@@ -60,28 +109,23 @@ function UserMenu({ user }: { user: User }) {
   };
 
   return (
-    <div className="menu" ref={ref}>
-      <button
-        type="button"
-        className="avatar-button"
-        aria-haspopup="menu"
-        aria-expanded={open}
+    <DropdownMenu>
+      <DropdownMenuTrigger
         aria-label={`Account menu for ${user.login}`}
-        onClick={() => setOpen(!open)}
+        className="size-7 cursor-pointer overflow-hidden rounded-full border border-rivet bg-housing p-0"
       >
-        <img className="avatar" src={user.avatarUrl} alt="" width={28} height={28} />
-      </button>
-      {open && (
-        <div className="menu-popover" role="menu">
-          <div className="menu-header">
-            <strong>{user.name ?? user.login}</strong>
-            <span className="muted">@{user.login}</span>
-          </div>
-          <button type="button" role="menuitem" className="menu-item" disabled={busy} onClick={leave}>
-            Sign out
-          </button>
-        </div>
-      )}
-    </div>
+        <img src={user.avatarUrl || "/brand/pip-avatar.svg"} alt="" width={28} height={28} className="size-full" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-52">
+        <DropdownMenuLabel className="flex flex-col">
+          <span>{user.name ?? user.login}</span>
+          <span className="font-mono text-xs font-normal text-fog">@{user.login}</span>
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem disabled={busy} onSelect={leave}>
+          Sign out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

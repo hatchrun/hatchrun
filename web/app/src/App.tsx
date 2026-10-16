@@ -63,7 +63,9 @@ export function App() {
   }
   return (
     <Shell user={user}>
-      {path === "/new" ? <Home stay /> : path === "/" ? <Home /> : <NotFound />}
+      <div className="mx-auto w-full max-w-[1080px] pt-3">
+        {path === "/new" ? <Home stay /> : path === "/" ? <Home /> : <NotFound />}
+      </div>
     </Shell>
   );
 }
@@ -80,14 +82,15 @@ function TenantRoute({
   item: string | undefined;
 }) {
   const [tenant, reload] = useLoad(() => getTenant(org), org);
-  const current =
-    tenant.state === "ready"
-      ? tenant.data.org
-      : { login: org, avatarUrl: "" };
+  if (tenant.state === "ready") {
+    return (
+      <TenantPage key={tenant.data.org.login} user={user} tenant={tenant.data} section={section} item={item} />
+    );
+  }
   return (
-    <Shell user={user} nav={<OrgSwitcher current={current} />}>
+    <Shell user={user} nav={<OrgSwitcher current={{ login: org, avatarUrl: "" }} />}>
       <Await loaded={tenant} retry={reload}>
-        {(data) => <TenantPage tenant={data} section={section} item={item} />}
+        {() => null}
       </Await>
     </Shell>
   );

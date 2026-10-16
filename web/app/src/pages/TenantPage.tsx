@@ -2,10 +2,12 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 
-import { getTenant, type Tenant } from "../api";
+import { getTenant, type Aws, type Tenant, type User } from "../api";
 import { Checklist, type Step } from "../components/Checklist";
+import { OrgSwitcher } from "../components/OrgSwitcher";
+import { PageTabs, Shell } from "../components/Shell";
 import { Link, navigate, useQuery } from "../router";
 import { ChoosePlan, PlanSummary } from "./Billing";
 import { AwsSummary, ConnectAws } from "./ConnectAws";
@@ -17,12 +19,14 @@ import { TenantSettings } from "./TenantSettings";
 /** Whether every setup step is done. */
 export const setUp = (tenant: Tenant) => Object.values(tenant.steps).every(Boolean);
 
-/** A tenant's pages behind a sidebar: setup until it is done, then the dashboard and its jobs; runner profiles and settings. */
+/** A tenant's pages as tabs in the top bar: setup until it is done, then the jobs; runner profiles and settings. */
 export function TenantPage({
+  user,
   tenant: loaded,
   section,
   item,
 }: {
+  user: User;
   tenant: Tenant;
   section: string | undefined;
   item?: string;
@@ -30,100 +34,62 @@ export function TenantPage({
   const [tenant, setTenant] = useState(loaded);
   const org = tenant.org.login;
   const ready = setUp(tenant);
-  const links = [
-    {
-      href: `/o/${org}`,
-      label: ready ? "Jobs" : "Setup",
-      icon: ready ? <JobsIcon /> : <SetupIcon />,
-      current: section === undefined || section === "jobs",
-    },
-    { href: `/o/${org}/runners`, label: "Runners", icon: <RunnersIcon />, current: section === "runners" },
-    { href: `/o/${org}/settings`, label: "Settings", icon: <SettingsIcon />, current: section === "settings" },
+  const tabs = [
+    { href: `/o/${org}`, label: ready ? "Jobs" : "Setup", current: section === undefined || section === "jobs" },
+    { href: `/o/${org}/runners`, label: "Runners", current: section === "runners" },
+    { href: `/o/${org}/settings`, label: "Settings", current: section === "settings" },
   ];
   return (
-    <div className="org">
-      <nav className="sidenav" aria-label={`${org} pages`}>
-        <p className="sidenav-label">Organization</p>
-        <ul>
-          {links.map((link) => (
-            <li key={link.href}>
-              <Link href={link.href} className="sidenav-link" aria-current={link.current ? "page" : undefined}>
-                {link.icon}
-                <span>{link.label}</span>
-              </Link>
-            </li>
-          ))}
-        </ul>
-      </nav>
-      <div className="org-main">
-        {section === "jobs" && item ? (
-          <JobPage org={org} id={item} />
-        ) : section === "runners" ? (
-          <RunnersPage tenant={tenant} item={item} />
-        ) : section === "settings" ? (
-          <TenantSettings tenant={tenant} onChange={setTenant} />
-        ) : ready && !new URLSearchParams(window.location.search).has("checkout") ? (
-          <Dashboard tenant={tenant} />
-        ) : (
-          <Setup tenant={tenant} setTenant={setTenant} />
-        )}
-      </div>
-    </div>
-  );
-}
-
-function Icon({ children }: { children: ReactNode }) {
-  return (
-    <svg
-      className="sidenav-icon"
-      width="16"
-      height="16"
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
+    <Shell
+      user={user}
+      nav={
+        <>
+          <OrgSwitcher current={tenant.org} />
+          <PageTabs label={`${org} pages`} tabs={tabs} />
+        </>
+      }
+      status={tenant.aws && <CloudAccount org={org} aws={tenant.aws} />}
     >
-      {children}
-    </svg>
+      {section === "jobs" && item ? (
+        <JobPage org={org} id={item} />
+      ) : section === "runners" ? (
+        <Narrow>
+          <RunnersPage tenant={tenant} item={item} />
+        </Narrow>
+      ) : section === "settings" ? (
+        <Narrow>
+          <TenantSettings tenant={tenant} onChange={setTenant} />
+        </Narrow>
+      ) : ready && !new URLSearchParams(window.location.search).has("checkout") ? (
+        <Dashboard tenant={tenant} />
+      ) : (
+        <Narrow>
+          <Setup tenant={tenant} setTenant={setTenant} />
+        </Narrow>
+      )}
+    </Shell>
   );
 }
 
-function JobsIcon() {
-  return (
-    <Icon>
-      <path d="M5.5 4 12 8l-6.5 4z" />
-    </Icon>
-  );
+/** The column the pages not yet on the new layout were drawn for. */
+function Narrow({ children }: { children: React.ReactNode }) {
+  return <div className="mx-auto w-full max-w-[1080px] pt-3">{children}</div>;
 }
 
-function SetupIcon() {
+/** The connected cloud account and region; opens Settings. */
+function CloudAccount({ org, aws }: { org: string; aws: Aws }) {
+  const account = /^arn:aws[a-z-]*:iam::(\d{12}):/.exec(aws.roleArn)?.[1];
   return (
-    <Icon>
-      <path d="m2.5 4.5 1.5 1.5 2.5-2.5M2.5 10.5 4 12l2.5-2.5M9 5h4.5M9 11h4.5" />
-    </Icon>
-  );
-}
-
-function RunnersIcon() {
-  return (
-    <Icon>
-      <rect x="2" y="2.5" width="12" height="4.5" rx="1.2" />
-      <rect x="2" y="9" width="12" height="4.5" rx="1.2" />
-      <path d="M4.75 4.75h.01M4.75 11.25h.01" />
-    </Icon>
-  );
-}
-
-function SettingsIcon() {
-  return (
-    <Icon>
-      <path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6" />
-      <circle cx="10" cy="4.5" r="1.5" />
-      <circle cx="6" cy="11.5" r="1.5" />
-    </Icon>
+    <Link
+      href={`/o/${org}/settings`}
+      title="Connected AWS account, opens Settings"
+      className="hidden items-center gap-2 font-mono text-xs text-fog hover:text-bone md:flex"
+    >
+      <span aria-hidden="true" className="size-[7px] rounded-full bg-passed shadow-[0_0_0_3px_var(--passed-halo)]" />
+      aws
+      {account && <span className="hidden text-bone lg:inline">{account}</span>}
+      <span>{aws.region}</span>
+    </Link>
   );
 }
 
