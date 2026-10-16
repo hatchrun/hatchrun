@@ -44,6 +44,9 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
   const [more, setMore] = useState(true);
   const [paging, setPaging] = useState(false);
   const table = useRef<HTMLElement>(null);
+  // Advanced whenever the list starts over, so an older page that comes
+  // back after a tab change or "Back to newest" is dropped.
+  const round = useRef(0);
   const now = useNow(REFRESH * 1000);
 
   useEffect(() => {
@@ -78,25 +81,36 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
     if (!last) {
       return;
     }
+    const asked = round.current;
     setPaging(true);
     try {
       const next = await listJobs(org, { before: last.queuedAt, status });
-      setOlder((was) => [...was, ...next.jobs]);
-      setMore(next.jobs.length === (next.pageSize ?? PAGE));
+      if (asked === round.current) {
+        setOlder((was) => [...was, ...next.jobs]);
+        setMore(next.jobs.length === (next.pageSize ?? PAGE));
+      }
     } catch (err) {
-      setError(err instanceof Error ? err : new Error(String(err)));
+      if (asked === round.current) {
+        setError(err instanceof Error ? err : new Error(String(err)));
+      }
     } finally {
-      setPaging(false);
+      if (asked === round.current) {
+        setPaging(false);
+      }
     }
+  };
+  const startOver = () => {
+    round.current += 1;
+    setOlder([]);
+    setMore(true);
+    setPaging(false);
   };
   const pick = (next: JobGroup | undefined) => {
     setStatus(next);
-    setOlder([]);
-    setMore(true);
+    startOver();
   };
   const backToNewest = () => {
-    setOlder([]);
-    setMore(true);
+    startOver();
     table.current?.scrollIntoView({ block: "start" });
   };
 
