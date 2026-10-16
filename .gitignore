@@ -12,3 +12,7 @@
 /crates/telemetry/build
 /crates/telemetry/.wrangler
 *.pem
+
+# Website captures from web/app/mock/capture.ts; only the README is kept.
+/captures/*
+!/captures/README.md

@@ -9,7 +9,8 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
-import type { Job } from "../src/api.ts";
+import type { Job, Stack } from "../src/api.ts";
+import * as boot from "./boot.ts";
 import * as profiles from "./runners.ts";
 
 interface MockTenant {
@@ -21,7 +22,7 @@ interface MockTenant {
     region: string;
     launchTemplateId: string;
     subnetIds: string[];
-    stack: ReturnType<typeof oldStack>;
+    stack: Stack;
   };
   maxRunners: number;
   allowedRegions: string[] | null;
@@ -45,6 +46,17 @@ const orgs = [
   { id: 101, login: "acme-corp", avatarUrl: square("#3b82f6") },
   { id: 102, login: "octo-labs", avatarUrl: square("#10b981") },
 ];
+
+// MOCK_SCENARIO=boot starts signed in to the one organization of the
+// website captures; see boot.ts.
+const scenario = process.env.MOCK_SCENARIO === "boot";
+if (scenario) {
+  orgs.splice(0, orgs.length, boot.org);
+  state.signedIn = true;
+  state.installed.push(boot.org.id);
+  state.tenants.push(boot.tenant());
+}
+const listJobs = (now: number) => (scenario ? boot.jobs(now) : sampleJobs(now));
 
 function tenantView(tenant: MockTenant) {
   const licensed = tenant.beta || tenant.subscription?.status === "active";
@@ -229,7 +241,7 @@ const routes: Record<string, Handler> = {
       return [404, { error: "no organization here" }];
     }
     const now = Date.now();
-    const all = sampleJobs(now);
+    const all = listJobs(now);
     const before = Number(url.searchParams.get("before")) || Infinity;
     const status = url.searchParams.get("status");
     const group = status === "active" || status === "waiting" || status === "failed" ? IN_GROUP[status] : null;
@@ -238,7 +250,8 @@ const routes: Record<string, Handler> = {
     }
     const pageSize = 12;
     const day = all.filter((job) => job.updatedAt >= now - 86_400_000);
-    const activity = before === Infinity ? sampleActivity(now, day) : undefined;
+    const activity =
+      before === Infinity ? (scenario ? boot.activity(now, day) : sampleActivity(now, day)) : undefined;
     const sum = (values: number[] | undefined) => (values ?? []).reduce((a, b) => a + b, 0);
     return [
       200,
@@ -260,14 +273,16 @@ const routes: Record<string, Handler> = {
   "GET /api/tenants/:org/jobs/:id/metrics": (_req, url) => {
     const [, , , org, , id] = url.pathname.split("/");
     const tenant = findTenant(org ?? "");
-    const job = sampleJobs(Date.now()).find((job) => String(job.id) === id);
+    const job = listJobs(Date.now()).find((job) => String(job.id) === id);
     if (!tenant || !job) {
       return [404, { error: `no job ${id} here` }];
     }
     const windows =
-      job.launchState === "launched"
-        ? sampleWindows(job.queuedAt).filter((w) => w.at * 1000 <= Date.now())
-        : [];
+      job.launchState !== "launched"
+        ? []
+        : scenario
+          ? boot.windows(job, Date.now())
+          : sampleWindows(job.queuedAt).filter((w) => w.at * 1000 <= Date.now());
     return [
       200,
       {
@@ -279,6 +294,8 @@ const routes: Record<string, Handler> = {
       },
     ];
   },
+  "GET /api/mock/boot": (_req, url) =>
+    scenario ? [200, boot.start(url.searchParams, Date.now())] : [404, { error: "start with MOCK_SCENARIO=boot" }],
   "PUT /api/tenants/:org/settings": (_req, url, body) => {
     const tenant = findTenant(url.pathname.split("/")[3] ?? "");
     if (!tenant) {
