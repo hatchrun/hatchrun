@@ -19,6 +19,7 @@ base64 = "0.22.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 flate2 = "1.1.10"
+getrandom = "0.4.3"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
 humantime = "2.4.0"

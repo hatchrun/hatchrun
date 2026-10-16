@@ -914,6 +914,18 @@ pub(crate) async fn tenant_credentials(
     sts::credentials(&response)
 }
 
+/// The GitHub API and a token of installation `installation_id`.
+pub(crate) async fn github_token(
+    env: &Env,
+    installation_id: u64,
+) -> std::result::Result<(String, String), String> {
+    let settings = Settings::read(env)?;
+    let token = installation_token(&settings, installation_id)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok((settings.github_api, token))
+}
+
 async fn installation_token(
     settings: &Settings,
     installation_id: u64,

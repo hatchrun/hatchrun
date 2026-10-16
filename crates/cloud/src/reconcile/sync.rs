@@ -10,7 +10,8 @@ use serde::Deserialize;
 
 use crate::github;
 use crate::http::{Request, Response};
-use crate::webhook::Status;
+use crate::reconcile::time;
+use crate::webhook::{Outcome, Status};
 
 /// One job, with the installation's token.
 #[must_use]
@@ -29,12 +30,17 @@ pub struct Seen {
     pub status: Status,
     /// The runner that took it, once one did.
     pub runner_name: Option<String>,
+    /// Its conclusion and times, once GitHub has them.
+    pub outcome: Outcome,
 }
 
 #[derive(Deserialize)]
 struct Job {
     status: String,
     runner_name: Option<String>,
+    conclusion: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
 }
 
 /// Reads the job out of the answer. A job GitHub no longer has (its
@@ -49,6 +55,7 @@ pub fn parse(response: &Response) -> Result<Seen, String> {
         return Ok(Seen {
             status: Status::Completed,
             runner_name: None,
+            outcome: Outcome::default(),
         });
     }
     if !response.ok() {
@@ -65,9 +72,18 @@ pub fn parse(response: &Response) -> Result<Seen, String> {
         // queued, waiting, requested, pending.
         _ => Status::Queued,
     };
+    // As the webhook reads it: a start only once a runner took the job.
+    let time = |value: Option<String>| value.as_deref().and_then(time::parse);
+    let completed = status == Status::Completed;
+    let runner_name = job.runner_name.filter(|name| !name.is_empty());
     Ok(Seen {
         status,
-        runner_name: job.runner_name.filter(|name| !name.is_empty()),
+        outcome: Outcome {
+            conclusion: job.conclusion.filter(|_| completed),
+            started_at: time(job.started_at).filter(|_| runner_name.is_some()),
+            completed_at: time(job.completed_at).filter(|_| completed),
+        },
+        runner_name,
     })
 }
 
@@ -117,17 +133,24 @@ mod tests {
             Seen {
                 status: Status::InProgress,
                 runner_name: Some("hatchrun-7-ab".to_owned()),
+                outcome: Outcome::default(),
             }
         );
         assert_eq!(
             parse(&answer(
                 200,
-                r#"{"status":"completed","conclusion":"cancelled","runner_name":""}"#
+                r#"{"status":"completed","conclusion":"cancelled","runner_name":"",
+                    "started_at":"2026-10-14T10:00:00Z","completed_at":"2026-10-14T10:00:05Z"}"#
             ))
             .unwrap(),
             Seen {
                 status: Status::Completed,
                 runner_name: None,
+                outcome: Outcome {
+                    conclusion: Some("cancelled".to_owned()),
+                    started_at: None,
+                    completed_at: Some(1_791_972_005_000),
+                },
             }
         );
         assert_eq!(

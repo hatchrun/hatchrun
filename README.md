@@ -184,7 +184,9 @@ npx wrangler@4.143.0 deploy
 [`crates/cloud`](crates/cloud) is the Cloudflare Worker behind the
 hosted service. Instead of a scaler per scale set, it takes the
 `workflow_job` webhooks of the hatchrun GitHub App and records every job
-whose only `runs-on` label names a runner profile, in D1, once per job.
+whose only `runs-on` label names a runner profile, in D1, once per job,
+under its workflow run. The app lists runs with their jobs nested under
+them; a run's state rolls up from its hatchrun jobs.
 A profile holds requirements in Karpenter's terms: instance categories
 (`c`, `m`, `r`, ...), the oldest generation, the architecture, vCPU and
 memory bounds, a root volume, the capacity type (on-demand, Spot, or

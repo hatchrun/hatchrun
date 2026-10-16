@@ -11,6 +11,7 @@ use serde::Deserialize;
 use sha2::Sha256;
 
 use crate::labels;
+use crate::reconcile::time;
 
 /// Checks `X-Hub-Signature-256`, GitHub's HMAC-SHA256 of the body keyed
 /// with the App's webhook secret. The comparison is constant time.
@@ -84,11 +85,37 @@ pub struct QueuedJob {
     pub spec: labels::Spec,
 }
 
+/// Where a queued job sits in its workflow run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Placement {
+    /// The job's name as the run shows it, such as `Save (host)`.
+    pub name: String,
+    /// The run attempt the job belongs to, from 1.
+    pub attempt: u64,
+    /// The workflow's name; GitHub may leave it out.
+    pub workflow_name: Option<String>,
+    /// The branch or tag the run is on.
+    pub head_branch: Option<String>,
+    /// The commit the run is at.
+    pub head_sha: String,
+}
+
+/// How a job ended or got on, from a progress event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// GitHub's conclusion, once completed.
+    pub conclusion: Option<String>,
+    /// When a runner took the job, Unix ms.
+    pub started_at: Option<u64>,
+    /// When it finished, Unix ms.
+    pub completed_at: Option<u64>,
+}
+
 /// What a webhook asks the Worker to do.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
-    /// Record a job that needs a runner.
-    Queued(QueuedJob),
+    /// Record a job that needs a runner, and its run.
+    Queued(QueuedJob, Placement),
     /// Move a recorded job to a new status.
     Progress {
         /// Workflow job id.
@@ -97,6 +124,8 @@ pub enum Event {
         status: Status,
         /// The runner that took the job, once one did.
         runner: Option<String>,
+        /// Its conclusion and times, as far as GitHub has them.
+        outcome: Outcome,
     },
     /// The App was uninstalled or suspended; the tenant loses its
     /// installation and launches nothing until it is back.
@@ -129,8 +158,16 @@ struct Payload {
 struct Job {
     id: u64,
     run_id: u64,
+    run_attempt: u64,
+    name: String,
+    workflow_name: Option<String>,
+    head_branch: Option<String>,
+    head_sha: String,
     labels: Vec<String>,
     runner_name: Option<String>,
+    conclusion: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -189,18 +226,27 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Event, serde_json::Error> {
         "completed" => Status::Completed,
         other => return Ok(Event::Ignored(format!("workflow_job {other} is not used"))),
     };
+    let job = payload.workflow_job;
     if status != Status::Queued {
+        // GitHub gives every job a start time, a job cancelled while
+        // queued too; it is when a runner took the job only once one
+        // did.
+        let time = |value: Option<String>| value.as_deref().and_then(time::parse);
+        let completed = status == Status::Completed;
+        let runner = job.runner_name.filter(|name| !name.is_empty());
         return Ok(Event::Progress {
             id,
             status,
-            runner: payload
-                .workflow_job
-                .runner_name
-                .filter(|name| !name.is_empty()),
+            outcome: Outcome {
+                conclusion: job.conclusion.filter(|_| completed),
+                started_at: time(job.started_at).filter(|_| runner.is_some()),
+                completed_at: time(job.completed_at).filter(|_| completed),
+            },
+            runner,
         });
     }
 
-    let label = match labels::job_label(&payload.workflow_job.labels) {
+    let label = match labels::job_label(&job.labels) {
         Ok(label) => label.to_owned(),
         Err(error) => return Ok(Event::Ignored(error.to_string())),
     };
@@ -211,14 +257,23 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Event, serde_json::Error> {
     let Some(installation) = payload.installation else {
         return Ok(Event::Ignored("no App installation".to_owned()));
     };
-    Ok(Event::Queued(QueuedJob {
-        id,
-        run_id: payload.workflow_job.run_id,
-        installation_id: installation.id,
-        repository: payload.repository.full_name,
-        label,
-        spec,
-    }))
+    Ok(Event::Queued(
+        QueuedJob {
+            id,
+            run_id: job.run_id,
+            installation_id: installation.id,
+            repository: payload.repository.full_name,
+            label,
+            spec,
+        },
+        Placement {
+            name: job.name,
+            attempt: job.run_attempt,
+            workflow_name: job.workflow_name,
+            head_branch: job.head_branch,
+            head_sha: job.head_sha,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -289,7 +344,12 @@ mod tests {
     fn job(action: &str, labels: &[&str]) -> Vec<u8> {
         serde_json::json!({
             "action": action,
-            "workflow_job": { "id": 29_679_449, "run_id": 5, "labels": labels, "status": action },
+            "workflow_job": {
+                "id": 29_679_449, "run_id": 5, "run_attempt": 2, "name": "Save (host)",
+                "workflow_name": "Smoke test", "head_branch": "main", "head_sha": "3f9c2e1",
+                "labels": labels, "status": action, "conclusion": null,
+                "started_at": "2026-10-14T10:00:00Z", "completed_at": null,
+            },
             "repository": { "full_name": "acme/app" },
             "installation": { "id": 42 },
         })
@@ -305,20 +365,29 @@ mod tests {
                 &job("queued", &["hatchrun-4cpu-arm64/disk=100"])
             )
             .unwrap(),
-            Event::Queued(QueuedJob {
-                id: 29_679_449,
-                run_id: 5,
-                installation_id: 42,
-                repository: "acme/app".to_owned(),
-                label: "hatchrun-4cpu-arm64/disk=100".to_owned(),
-                spec: Spec {
-                    profile: "hatchrun-4cpu-arm64".to_owned(),
-                    overrides: Overrides {
-                        disk_gib: Some(100),
-                        ..Overrides::default()
+            Event::Queued(
+                QueuedJob {
+                    id: 29_679_449,
+                    run_id: 5,
+                    installation_id: 42,
+                    repository: "acme/app".to_owned(),
+                    label: "hatchrun-4cpu-arm64/disk=100".to_owned(),
+                    spec: Spec {
+                        profile: "hatchrun-4cpu-arm64".to_owned(),
+                        overrides: Overrides {
+                            disk_gib: Some(100),
+                            ..Overrides::default()
+                        },
                     },
                 },
-            })
+                Placement {
+                    name: "Save (host)".to_owned(),
+                    attempt: 2,
+                    workflow_name: Some("Smoke test".to_owned()),
+                    head_branch: Some("main".to_owned()),
+                    head_sha: "3f9c2e1".to_owned(),
+                },
+            )
         );
     }
 
@@ -350,6 +419,47 @@ mod tests {
                 id: 29_679_449,
                 status: Status::Completed,
                 runner: None,
+                // No runner took it, so the start time GitHub sends is
+                // not a start.
+                outcome: Outcome::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn reads_how_a_job_ended() {
+        let outcome = |action: &str| {
+            let body = serde_json::json!({
+                "action": action,
+                "workflow_job": {
+                    "id": 7, "run_id": 5, "run_attempt": 1, "name": "Verify", "head_sha": "ab",
+                    "labels": ["hatchrun"], "runner_name": "hatchrun-7-ab",
+                    "conclusion": "failure", "started_at": "2026-10-14T10:00:00Z",
+                    "completed_at": "2026-10-14T10:01:30.500Z",
+                },
+                "repository": { "full_name": "acme/app" },
+            });
+            match parse("workflow_job", body.to_string().as_bytes()).unwrap() {
+                Event::Progress { outcome, .. } => outcome,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(
+            outcome("completed"),
+            Outcome {
+                conclusion: Some("failure".to_owned()),
+                started_at: Some(1_791_972_000_000),
+                completed_at: Some(1_791_972_090_500),
+            }
+        );
+        // An in_progress delivery has no conclusion or end yet, whatever
+        // the body says.
+        assert_eq!(
+            outcome("in_progress"),
+            Outcome {
+                conclusion: None,
+                started_at: Some(1_791_972_000_000),
+                completed_at: None,
             }
         );
     }
@@ -359,7 +469,9 @@ mod tests {
         let body = serde_json::json!({
             "action": "in_progress",
             "workflow_job": {
-                "id": 7, "run_id": 5, "labels": ["hatchrun"], "runner_name": "hatchrun-9-ab12",
+                "id": 7, "run_id": 5, "run_attempt": 1, "name": "build", "head_sha": "ab",
+                "labels": ["hatchrun"], "runner_name": "hatchrun-9-ab12",
+                "started_at": "2026-10-14T10:00:00Z",
             },
             "repository": { "full_name": "acme/app" },
         });
@@ -369,6 +481,10 @@ mod tests {
                 id: 7,
                 status: Status::InProgress,
                 runner: Some("hatchrun-9-ab12".to_owned()),
+                outcome: Outcome {
+                    started_at: Some(1_791_972_000_000),
+                    ..Outcome::default()
+                },
             }
         );
     }

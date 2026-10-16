@@ -10,7 +10,8 @@
 //! 1. redeliver the App's webhook deliveries that failed, each once
 //!    (see [`deliveries`]);
 //! 2. ask GitHub about open jobs that have had no webhook for a while,
-//!    and record the ones it finished (see [`sync`]);
+//!    and record the ones it finished (see [`sync`]), and fetch the
+//!    runs whose details the webhook did not (see [`crate::runs`]);
 //! 3. per tenant with a verified role, describe its live instances,
 //!    terminate the ones nothing needs and launch queued jobs again
 //!    (see [`plan`]); once a day also read its stack's launch template
@@ -52,7 +53,7 @@ use crate::fetch::{send, send_reading};
 use crate::instance_types::{self, store as catalog};
 use crate::launch::{self, APP_KEY, AWS_ENDPOINT_URL};
 use crate::webhook::{QueuedJob, Status};
-use crate::{DB, github, int, jwt, labels, now_ms, oidc};
+use crate::{DB, changes, github, int, jwt, labels, now_ms, oidc, runs};
 
 /// Variable with the App's client id.
 const APP_ID: &str = "GITHUB_APP_ID";
@@ -79,6 +80,10 @@ const TERMINATE_BATCH: usize = 100;
 /// Open jobs asked about per pass, and installations asked at once.
 const SYNC_PER_PASS: u32 = 30;
 const INSTALLATIONS_AT_ONCE: usize = 4;
+/// Runs whose details are fetched per pass, and how long after the
+/// webhook recorded one the reconciler steps in.
+const DETAILS_PER_PASS: u32 = 20;
+const DETAILS_AFTER: u64 = 60 * 1000;
 /// Pages of deliveries, and redeliveries, per pass.
 const DELIVERY_PAGES: u32 = 10;
 const REDELIVERIES_PER_PASS: usize = 30;
@@ -136,6 +141,8 @@ struct Summary {
     checked: u32,
     /// Of those, jobs GitHub had finished.
     closed: u32,
+    /// Runs whose details were fetched.
+    run_details: u32,
     /// Tenants reconciled.
     tenants: u32,
     /// Instances terminated.
@@ -161,6 +168,8 @@ struct Summary {
     sessions_deleted: u32,
     /// Jobs past the retention deleted.
     jobs_deleted: u32,
+    /// Runs left without jobs, deleted.
+    runs_deleted: u32,
     /// Steps or tenants that failed; the log has each.
     errors: u32,
     /// Whether the pass stopped at a limit with work left.
@@ -176,6 +185,7 @@ impl Summary {
         self.redelivered += other.redelivered;
         self.checked += other.checked;
         self.closed += other.closed;
+        self.run_details += other.run_details;
         self.tenants += other.tenants;
         self.terminated += other.terminated;
         self.reset += other.reset;
@@ -188,6 +198,7 @@ impl Summary {
         self.unconnected += other.unconnected;
         self.sessions_deleted += other.sessions_deleted;
         self.jobs_deleted += other.jobs_deleted;
+        self.runs_deleted += other.runs_deleted;
         self.errors += other.errors;
     }
 }
@@ -245,9 +256,10 @@ pub async fn run(env: Env) {
         more: Cell::new(false),
     };
 
-    let steps: [(&str, Fallible<Summary>); 6] = [
+    let steps: [(&str, Fallible<Summary>); 7] = [
         ("redeliver", pass.redeliver().await),
         ("sync", pass.sync().await),
+        ("details", pass.details().await),
         ("tenants", pass.tenants().await),
         ("catalog", pass.catalog().await),
         ("unconnected", pass.unconnected().await),
@@ -328,10 +340,25 @@ const OPEN_JOBS: &str = "SELECT id, installation_id, repository, status FROM job
      ORDER BY COALESCE(checked_at, updated_at) LIMIT ?2";
 
 /// Records what GitHub said about job `?1`, while its status is still
-/// `?5`.
+/// `?5`: the status, the runner, and the conclusion and times `?6` to
+/// `?8` once GitHub has them.
 const RECORD_CHECK: &str = "UPDATE jobs SET status = ?2, ran_on = COALESCE(?3, ran_on), \
-     checked_at = ?4, updated_at = CASE WHEN status <> ?2 THEN ?4 ELSE updated_at END \
+     checked_at = ?4, updated_at = CASE WHEN status <> ?2 THEN ?4 ELSE updated_at END, \
+     conclusion = COALESCE(?6, conclusion), started_at = COALESCE(?7, started_at), \
+     completed_at = COALESCE(?8, completed_at) \
      WHERE id = ?1 AND status = ?5";
+
+/// Runs without details, not created or tried since `?1`, least
+/// recently tried first, at most `?2`.
+const RUNS_WITHOUT_DETAILS: &str = "SELECT id, installation_id, repository FROM runs \
+     WHERE details_at IS NULL AND COALESCE(details_tried_at, created_at) < ?1 \
+     ORDER BY COALESCE(details_tried_at, created_at) LIMIT ?2";
+
+/// Stamps the runs of a JSON array `?2` as tried at `?1`, so a run that
+/// keeps failing, such as one of an uninstalled App, does not hold the
+/// others back.
+const DETAILS_TRIED: &str = "UPDATE runs SET details_tried_at = ?1 \
+     WHERE id IN (SELECT value FROM json_each(?2)) AND details_at IS NULL";
 
 /// Tenants with a verified role, least recently reconciled first.
 fn tenants_query() -> String {
@@ -410,6 +437,12 @@ const DELETE_SESSIONS: &str = "DELETE FROM sessions WHERE key IN \
 /// Deletes up to `?2` jobs queued before `?1`, oldest first.
 const DELETE_JOBS: &str = "DELETE FROM jobs WHERE id IN \
      (SELECT id FROM jobs WHERE queued_at < ?1 ORDER BY queued_at LIMIT ?2)";
+
+/// Deletes up to `?2` runs queued before `?1` that have no jobs left.
+const DELETE_RUNS: &str = "DELETE FROM runs WHERE id IN \
+     (SELECT id FROM runs WHERE queued_at < ?1 \
+       AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.run_id = runs.id) \
+     ORDER BY queued_at LIMIT ?2)";
 
 /// Deletes up to `?2` redeliveries made before `?1`.
 const DELETE_REDELIVERIES: &str = "DELETE FROM redeliveries WHERE guid IN \
@@ -689,6 +722,8 @@ impl Pass<'_> {
         let stored = status(&job.status).unwrap_or(Status::Queued);
         let next = seen.map_or(stored, |seen| sync::advance(stored, seen.status));
         let runner = seen.and_then(|seen| seen.runner_name.as_deref());
+        let outcome = seen.map(|seen| &seen.outcome);
+        let time = |value: Option<u64>| value.map_or(Ok(JsValue::NULL), int).map_err(text);
         let now = int(self.now).map_err(text)?;
         let result = self
             .db
@@ -699,6 +734,11 @@ impl Pass<'_> {
                 runner.map_or(JsValue::NULL, Into::into),
                 now,
                 job.status.as_str().into(),
+                outcome
+                    .and_then(|outcome| outcome.conclusion.as_deref())
+                    .map_or(JsValue::NULL, Into::into),
+                time(outcome.and_then(|outcome| outcome.started_at))?,
+                time(outcome.and_then(|outcome| outcome.completed_at))?,
             ])
             .map_err(text)?
             .run()
@@ -709,6 +749,78 @@ impl Pass<'_> {
             console_log!("reconcile: job {} completed on GitHub", job.id);
         }
         Ok(closed)
+    }
+
+    /// Step 2, continued: fetches the details of runs the webhook could
+    /// not, oldest first.
+    async fn details(&self) -> Fallible<Summary> {
+        let before = self.now.saturating_sub(DETAILS_AFTER);
+        let runs = self
+            .db
+            .prepare(RUNS_WITHOUT_DETAILS)
+            .bind(&[int(before).map_err(text)?, DETAILS_PER_PASS.into()])
+            .map_err(text)?
+            .all()
+            .await
+            .map_err(text)?
+            .results::<RunWithoutDetails>()
+            .map_err(text)?;
+        let mut done = Summary::default();
+        if runs.is_empty() {
+            return Ok(done);
+        }
+        let ids: Vec<u64> = runs.iter().map(|run| run.id).collect();
+        self.db
+            .prepare(DETAILS_TRIED)
+            .bind(&[int(self.now).map_err(text)?, json(&ids)?])
+            .map_err(text)?
+            .run()
+            .await
+            .map_err(text)?;
+        let app_jwt = self.app_jwt().await?;
+        let mut by_installation: BTreeMap<u64, Vec<RunWithoutDetails>> = BTreeMap::new();
+        for run in runs {
+            by_installation
+                .entry(run.installation_id)
+                .or_default()
+                .push(run);
+        }
+        for (installation_id, runs) in by_installation {
+            if !self.spend(1) {
+                break;
+            }
+            let token = match self.installation_token(&app_jwt, installation_id).await {
+                Ok(token) => token,
+                Err(err) => {
+                    console_warn!("reconcile: installation {installation_id}: {err}");
+                    done.errors += 1;
+                    continue;
+                }
+            };
+            for run in runs {
+                if !self.spend(1) {
+                    break;
+                }
+                let request =
+                    github::workflow_run(&self.github_api, &token, &run.repository, run.id);
+                match send(&request)
+                    .await
+                    .and_then(|response| runs::parse(&response))
+                {
+                    Ok(details) => {
+                        runs::record(&self.db, run.id, &details)
+                            .await
+                            .map_err(text)?;
+                        done.run_details += 1;
+                    }
+                    Err(err) => {
+                        console_warn!("reconcile: run {}: {err}", run.id);
+                        done.errors += 1;
+                    }
+                }
+            }
+        }
+        Ok(done)
     }
 
     /// Step 3: every tenant with a verified role, least recently
@@ -1415,6 +1527,7 @@ impl Pass<'_> {
     async fn retention(&self) -> Fallible<Summary> {
         let now = int(self.now).map_err(text)?;
         let jobs_before = int(self.now.saturating_sub(self.limits.retention)).map_err(text)?;
+        let jobs_before_runs = jobs_before.clone();
         let redeliveries_before = int(self.now.saturating_sub(REDELIVERY_MEMORY)).map_err(text)?;
         let uploads_before = int(self.now.saturating_sub(CACHE_UPLOAD_MEMORY)).map_err(text)?;
         let results = self
@@ -1440,6 +1553,11 @@ impl Pass<'_> {
                     .prepare(DELETE_UPLOADS)
                     .bind(&[uploads_before, DELETE_BATCH.into()])
                     .map_err(text)?,
+                // After the jobs, so a run goes with its last job.
+                self.db
+                    .prepare(DELETE_RUNS)
+                    .bind(&[jobs_before_runs, DELETE_BATCH.into()])
+                    .map_err(text)?,
             ])
             .await
             .map_err(text)?;
@@ -1448,7 +1566,7 @@ impl Pass<'_> {
                 u32::try_from(changes(result)).unwrap_or(u32::MAX)
             })
         };
-        if [0, 1, 2, 4]
+        if [0, 1, 2, 4, 5]
             .into_iter()
             .any(|at| deleted(at) == DELETE_BATCH)
         {
@@ -1457,6 +1575,7 @@ impl Pass<'_> {
         Ok(Summary {
             sessions_deleted: deleted(0),
             jobs_deleted: deleted(1),
+            runs_deleted: deleted(5),
             ..Summary::default()
         })
     }
@@ -1472,6 +1591,13 @@ enum Kind {
 #[derive(Deserialize)]
 struct Guid {
     guid: String,
+}
+
+#[derive(Deserialize)]
+struct RunWithoutDetails {
+    id: u64,
+    installation_id: u64,
+    repository: String,
 }
 
 #[derive(Deserialize)]
@@ -1562,15 +1688,6 @@ fn json<T: Serialize>(values: &T) -> Fallible<JsValue> {
     serde_json::to_string(values)
         .map(Into::into)
         .map_err(|err| err.to_string())
-}
-
-fn changes(result: &worker::D1Result) -> usize {
-    result
-        .meta()
-        .ok()
-        .flatten()
-        .and_then(|meta| meta.changes)
-        .unwrap_or(0)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1671,6 +1788,57 @@ mod tests {
     }
 
     #[test]
+    fn runs_without_details_are_fetched_after_a_minute() {
+        let db = Db::new();
+        for (id, created_at) in [
+            (1u64, NOW - 2 * DETAILS_AFTER),
+            (2, NOW),
+            (3, NOW - DETAILS_AFTER - 1),
+        ] {
+            db.run(
+                "INSERT INTO runs (id, installation_id, repository, head_sha, attempt, \
+                 queued_at, created_at, updated_at) VALUES (?1, 9, 'acme/app', 'a', 1, ?2, ?2, ?2)",
+                &params![id, created_at],
+            );
+        }
+        let due = |db: &Db| -> Vec<u64> {
+            db.all::<RunWithoutDetails>(
+                RUNS_WITHOUT_DETAILS,
+                &params![NOW - DETAILS_AFTER, DETAILS_PER_PASS],
+            )
+            .into_iter()
+            .map(|run| run.id)
+            .collect()
+        };
+        assert_eq!(due(&db), [1, 3]);
+        db.run(
+            runs::DETAILS,
+            &params![
+                1u64,
+                None::<u64>,
+                None::<&str>,
+                None::<&str>,
+                None::<&str>,
+                None::<&str>,
+                NOW
+            ],
+        );
+        assert_eq!(due(&db), [3]);
+        // Tried and failed: it waits its turn behind the others.
+        assert_eq!(db.run(DETAILS_TRIED, &params![NOW, "[3]"]), 1);
+        assert_eq!(due(&db), Vec::<u64>::new());
+        let later: Vec<u64> = db
+            .all::<RunWithoutDetails>(
+                RUNS_WITHOUT_DETAILS,
+                &params![NOW + DETAILS_AFTER + 1, DETAILS_PER_PASS],
+            )
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        assert_eq!(later, [2, 3]);
+    }
+
+    #[test]
     fn quiet_open_jobs_are_checked_and_recorded() {
         let db = Db::new();
         job(&db, 1, 9, "queued", NOW - 3000);
@@ -1685,12 +1853,30 @@ mod tests {
         assert_eq!(open[0].status, "queued");
 
         // As `checked`: completed by runner r-1.
-        let done = params![1u64, "completed", Some("r-1"), NOW, "queued"];
+        let done = params![
+            1u64,
+            "completed",
+            Some("r-1"),
+            NOW,
+            "queued",
+            Some("success"),
+            Some(NOW - 2500),
+            Some(NOW - 100)
+        ];
         assert_eq!(db.run(RECORD_CHECK, &done), 1);
         // The row moved on, so the same update matches nothing.
         assert_eq!(db.run(RECORD_CHECK, &done), 0);
         // Only asked, the status unchanged and no runner.
-        let asked = params![2u64, "in_progress", None::<&str>, NOW, "in_progress"];
+        let asked = params![
+            2u64,
+            "in_progress",
+            None::<&str>,
+            NOW,
+            "in_progress",
+            None::<&str>,
+            None::<u64>,
+            None::<u64>
+        ];
         assert_eq!(db.run(RECORD_CHECK, &asked), 1);
         let rows = db
             .rows(
@@ -1701,6 +1887,14 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0]["status"], "completed");
         assert_eq!(rows[0]["ran_on"], "r-1");
+        let ended = db
+            .rows(
+                "SELECT conclusion, completed_at FROM jobs WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(ended[0]["conclusion"], "success");
+        assert_eq!(ended[0]["completed_at"], NOW - 100);
         assert_eq!(rows[0]["updated_at"], NOW);
         assert_eq!(rows[1]["ran_on"], Value::Null);
         assert_eq!(rows[1]["checked_at"], NOW);
@@ -1908,6 +2102,14 @@ mod tests {
         }
         job(&db, 1, 9, "completed", NOW - 100);
         job(&db, 2, 9, "completed", NOW);
+        // Run 10 loses its only job; run 20 is as old but keeps one.
+        for (id, queued_at) in [(10u64, NOW - 100), (20, NOW - 100), (30, NOW)] {
+            db.run(
+                "INSERT INTO runs (id, installation_id, repository, head_sha, attempt, \
+                 queued_at, created_at, updated_at) VALUES (?1, 9, 'acme/app', 'a', 1, ?2, ?2, ?2)",
+                &params![id, queued_at],
+            );
+        }
         for (guid, at) in [("old", NOW - REDELIVERY_MEMORY - 1), ("new", NOW)] {
             db.run(CLAIM_REDELIVERY, &params![guid, 1u64, "e", at]);
         }
@@ -1941,9 +2143,14 @@ mod tests {
                     DELETE_UPLOADS,
                     params![NOW - CACHE_UPLOAD_MEMORY, DELETE_BATCH],
                 ),
+                (DELETE_RUNS, params![jobs_before, DELETE_BATCH]),
             ])
             .unwrap();
-        assert_eq!(deleted, [1, 1, 1, 1, 1]);
+        assert_eq!(deleted, [1, 1, 1, 1, 1, 1]);
+        assert_eq!(
+            value(&db, "SELECT group_concat(id) FROM runs", &[]),
+            "20,30"
+        );
         for (table, key) in [
             ("sessions", "key"),
             ("redeliveries", "guid"),

@@ -225,15 +225,14 @@ impl Cloud {
         Ok(true)
     }
 
-    /// Starts a ranged GET of a presigned URL. The response, error or
-    /// not, is the caller's to pass on.
-    pub async fn download(&self, url: &str, range: &str) -> Result<reqwest::Response> {
-        self.download
-            .get(url)
-            .header(reqwest::header::RANGE, range)
-            .send()
-            .await
-            .context("download cache entry")
+    /// Starts a GET of a presigned URL, of `range` when there is one.
+    /// The response, error or not, is the caller's to pass on.
+    pub async fn download(&self, url: &str, range: Option<&str>) -> Result<reqwest::Response> {
+        let mut request = self.download.get(url);
+        if let Some(range) = range {
+            request = request.header(reqwest::header::RANGE, range);
+        }
+        request.send().await.context("download cache entry")
     }
 
     /// Abandons an upload.
