@@ -1,6 +1,6 @@
 -- SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 --
--- SPDX-License-Identifier: Apache-2.0
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 -- Regions an organization lets its runners use, comma separated; NULL
 -- for every region hatchrun runs in. The app connects AWS only in one

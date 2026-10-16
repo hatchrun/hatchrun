@@ -1,6 +1,6 @@
 -- SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 --
--- SPDX-License-Identifier: Apache-2.0
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 -- An organization's own runner profiles (crates/cloud/src/profiles.rs).
 -- Workflows name one in runs-on; a row named like a built-in profile

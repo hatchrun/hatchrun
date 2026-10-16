@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! hatchrun-agent runs on a runner instance at boot. It fetches the
 //! instance's just-in-time runner config, runs exactly one GitHub Actions job

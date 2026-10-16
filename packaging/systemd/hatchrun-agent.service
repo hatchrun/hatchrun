@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 #
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 
 # Runs one GitHub Actions job, then powers the instance off. The launch
 # template sets InstanceInitiatedShutdownBehavior=terminate, so power-off

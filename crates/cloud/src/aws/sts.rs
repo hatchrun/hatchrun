@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! `AssumeRoleWithWebIdentity`: trades an `oidc.hatchrun.io` token for
 //! the tenant role's credentials. The call is not signed; the token is
