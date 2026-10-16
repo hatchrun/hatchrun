@@ -239,15 +239,38 @@ export interface JobCounts {
   failedToday: number;
 }
 
+/** Finished and failed jobs per bucket over the last day, oldest first. */
+export interface JobActivity {
+  /** Unix milliseconds: the start of the first bucket. */
+  since: number;
+  bucketMs: number;
+  finished: number[];
+  failed: number[];
+}
+
 export interface JobPage {
   jobs: Job[];
   counts: JobCounts;
   region: string | null;
   pageSize?: number;
+  /** On the first page only. */
+  activity?: JobActivity;
 }
 
-export const listJobs = (org: string, before?: number) =>
-  get<JobPage>(`${tenantPath(org)}/jobs${before ? `?before=${before}` : ""}`);
+/** A status tab of the jobs table: the jobs each count in JobCounts counts. */
+export type JobGroup = "active" | "waiting" | "failed";
+
+export const listJobs = (org: string, { before, status }: { before?: number; status?: JobGroup } = {}) => {
+  const query = new URLSearchParams();
+  if (status) {
+    query.set("status", status);
+  }
+  if (before) {
+    query.set("before", String(before));
+  }
+  const search = query.toString();
+  return get<JobPage>(`${tenantPath(org)}/jobs${search ? `?${search}` : ""}`);
+};
 /** Ten seconds of a runner's samples, as the agent summed them up. */
 export interface MetricsWindow {
   /** When the window ended, Unix seconds. */
