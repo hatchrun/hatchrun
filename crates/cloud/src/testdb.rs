@@ -158,24 +158,20 @@ impl Db {
     /// rolls them all back. Returns the rows each statement changed, as
     /// the `changes` of each result's meta.
     pub(crate) fn batch(&self, statements: &[(&str, Vec<Param>)]) -> Result<Vec<usize>, String> {
-        self.0
-            .execute_batch("BEGIN")
+        // Rolls back on drop, so an error or a panic leaves no
+        // transaction open.
+        let tx = self
+            .0
+            .unchecked_transaction()
             .map_err(|err| err.to_string())?;
         let mut changes = Vec::with_capacity(statements.len());
         for (sql, params) in statements {
-            match self.try_run(sql, params) {
-                Ok(count) => changes.push(count),
-                Err(err) => {
-                    self.0
-                        .execute_batch("ROLLBACK")
-                        .map_err(|err| err.to_string())?;
-                    return Err(format!("{err}\n{sql}"));
-                }
-            }
+            changes.push(
+                self.try_run(sql, params)
+                    .map_err(|err| format!("{err}\n{sql}"))?,
+            );
         }
-        self.0
-            .execute_batch("COMMIT")
-            .map_err(|err| err.to_string())?;
+        tx.commit().map_err(|err| err.to_string())?;
         Ok(changes)
     }
 
