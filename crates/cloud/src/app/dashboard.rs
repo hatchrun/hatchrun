@@ -332,6 +332,7 @@ mod tests {
         assert!(list_query(None).contains(" LIMIT ?3"));
         assert!(activity_query().contains("updated_at >= ?2"));
         assert!(activity_query().starts_with("SELECT CAST((updated_at - ?2) / "));
+        assert!(activity_query().contains(" AS INTEGER) AS bucket, "));
     }
 
     #[test]
