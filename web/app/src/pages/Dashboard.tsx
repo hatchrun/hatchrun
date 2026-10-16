@@ -5,18 +5,33 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 
 import {
-  listJobs,
+  listRuns,
   type Job,
   type JobActivity,
   type JobCounts,
   type JobGroup,
-  type JobPage,
+  type ListedRun,
+  type RunPage,
   type Stack,
   type Tenant,
 } from "@/api";
 import { CopyButton } from "@/components/CopyButton";
 import { ChevronRightIcon, ExternalIcon, GitHubIcon, OpenIcon } from "@/components/icons";
-import { ago, instanceUrl, span, state, StatusMark, TONE_TEXT } from "@/components/JobStatus";
+import {
+  ago,
+  endOf,
+  instanceUrl,
+  runName,
+  runRef,
+  runSpan,
+  runState,
+  span,
+  state,
+  StatusMark,
+  tally,
+  TONE_TEXT,
+  type Shown,
+} from "@/components/JobStatus";
 import { LoadError, Spinner } from "@/components/Status";
 import { useNow } from "@/load";
 import { Button } from "@/components/ui/button";
@@ -25,10 +40,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { cn } from "@/lib/utils";
 import { Link, useQuery } from "@/router";
 
-/** Seconds between refreshes of the job list. */
+/** Seconds between refreshes of the run list. */
 const REFRESH = 10;
-/** Jobs in a page when the API does not say. */
-const PAGE = 50;
+/** Runs in a page when the API does not say. */
+const PAGE = 25;
 /** The profile the page suggests for runs-on. */
 const SUGGESTED = "hatchrun-4cpu-arm64";
 
@@ -38,8 +53,10 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
   const [status, setStatus] = useState<JobGroup | undefined>(undefined);
   // The newest page of the last tab loaded. The fleet panel keeps showing
   // it while another tab loads; the table shows it only for its own tab.
-  const [loaded, setLoaded] = useState<{ status: JobGroup | undefined; page: JobPage } | null>(null);
-  const [older, setOlder] = useState<Job[]>([]);
+  const [loaded, setLoaded] = useState<{ status: JobGroup | undefined; page: RunPage } | null>(null);
+  const [older, setOlder] = useState<ListedRun[]>([]);
+  // Runs the user opened or closed; the rest follow `openByDefault`.
+  const [toggled, setToggled] = useState<Record<number, boolean>>({});
   const [error, setError] = useState<Error | null>(null);
   const [more, setMore] = useState(true);
   const [paging, setPaging] = useState(false);
@@ -52,7 +69,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
   useEffect(() => {
     let current = true;
     const load = () =>
-      listJobs(org, { status }).then(
+      listRuns(org, { status }).then(
         (next) => {
           if (current) {
             setLoaded({ status, page: next });
@@ -75,8 +92,8 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
 
   const page = loaded && loaded.status === status ? loaded.page : null;
   const pageSize = page?.pageSize ?? PAGE;
-  const jobs = page ? [...page.jobs, ...older.filter((job) => !page.jobs.some((seen) => seen.id === job.id))] : [];
-  const last = jobs[jobs.length - 1];
+  const runs = page ? [...page.runs, ...older.filter((run) => !page.runs.some((seen) => seen.id === run.id))] : [];
+  const last = runs[runs.length - 1];
   const loadOlder = async () => {
     if (!last) {
       return;
@@ -84,10 +101,10 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
     const asked = round.current;
     setPaging(true);
     try {
-      const next = await listJobs(org, { before: last.queuedAt, status });
+      const next = await listRuns(org, { before: last, status });
       if (asked === round.current) {
-        setOlder((was) => [...was, ...next.jobs]);
-        setMore(next.jobs.length === (next.pageSize ?? PAGE));
+        setOlder((was) => [...was, ...next.runs]);
+        setMore(next.runs.length === (next.pageSize ?? PAGE));
       }
     } catch (err) {
       if (asked === round.current) {
@@ -136,13 +153,13 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
       <Fleet
         max={tenant.maxRunners}
         counts={loaded?.page.counts ?? null}
-        jobs={loaded?.page.jobs ?? []}
+        jobs={loaded?.page.runs.flatMap((run) => run.jobs) ?? []}
         activity={loaded?.page.activity ?? null}
       />
 
       {tenant.aws && <StackUpdate stack={tenant.aws.stack} region={tenant.aws.region} />}
 
-      <section ref={table} aria-label="Jobs" className="scroll-mt-4 overflow-hidden rounded-md border border-rivet">
+      <section ref={table} aria-label="Runs" className="scroll-mt-4 overflow-hidden rounded-md border border-rivet">
         <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-rivet bg-panel px-3.5 py-2.5">
           <StatusTabs status={status} counts={loaded?.page.counts ?? null} onPick={pick} />
           <span className="font-mono text-xs text-fog">newest first</span>
@@ -157,45 +174,55 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
             <Spinner />
           </div>
         )}
-        {page && jobs.length === 0 && status && <p className="px-3.5 py-10 text-center text-fog">{EMPTY[status]}</p>}
-        {page && jobs.length === 0 && !status && (
+        {page && runs.length === 0 && status && <p className="px-3.5 py-10 text-center text-fog">{EMPTY[status]}</p>}
+        {page && runs.length === 0 && !status && (
           <p className="px-3.5 py-10 text-center text-fog">
             No jobs yet. Push a workflow with <code className="font-mono text-bone">runs-on: {SUGGESTED}</code> and it
             shows up here. <Link href={`/o/${org}/runners`} className="quiet-underline text-bone-dim hover:text-bone">See every runner profile</Link>.
           </p>
         )}
-        {jobs.length > 0 && (
+        {runs.length > 0 && (
           <>
             <Table className="min-w-[1040px]">
               <TableHeader>
                 <TableRow>
                   <TableHead className="cap">Status</TableHead>
                   <TableHead>
-                    <span className="cap">Job</span>{" "}
+                    <span className="cap">Run / job</span>{" "}
                     <span className="ml-1 font-mono text-[10px] text-chick">→ details</span>
                   </TableHead>
                   <TableHead>
-                    <span className="cap">GitHub run</span>{" "}
+                    <span className="cap">On GitHub / label</span>{" "}
                     <span className="ml-1 font-mono text-[10px] text-steel">↗ logs</span>
                   </TableHead>
-                  <TableHead className="cap">Label</TableHead>
                   <TableHead>
                     <span className="cap">EC2 instance</span>{" "}
                     <span className="ml-1 font-mono text-[10px] text-steel">↗ aws console</span>
                   </TableHead>
-                  <TableHead className="cap">Queued</TableHead>
+                  <TableHead className="cap">Started</TableHead>
                   <TableHead className="cap text-right">Took</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {jobs.map((job) => (
-                  <JobRow key={job.id} org={org} job={job} region={page?.region ?? null} now={now} />
-                ))}
+                {runs.map((run) => {
+                  const open = toggled[run.id] ?? openByDefault(run);
+                  return (
+                    <RunRows
+                      key={run.id}
+                      org={org}
+                      run={run}
+                      region={page?.region ?? null}
+                      now={now}
+                      open={open}
+                      onToggle={() => setToggled((was) => ({ ...was, [run.id]: !open }))}
+                    />
+                  );
+                })}
               </TableBody>
             </Table>
             <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-rivet bg-panel px-3.5 py-2.5 font-mono text-xs text-fog">
               <span>
-                {jobs.length} {jobs.length === 1 ? "job" : "jobs"} shown
+                {runs.length} {runs.length === 1 ? "run" : "runs"} shown
                 {last && <>, back to {ago(last.queuedAt)}</>}
               </span>
               <div className="flex gap-2">
@@ -204,7 +231,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
                     ↑ Back to newest
                   </Button>
                 )}
-                {more && jobs.length >= pageSize && (
+                {more && runs.length >= pageSize && (
                   <Button variant="outline" onClick={loadOlder} disabled={paging}>
                     {paging ? "Loading" : `Load ${pageSize} older ↓`}
                   </Button>
@@ -381,12 +408,12 @@ function Strip({ activity }: { activity: JobActivity }) {
 }
 
 const EMPTY: Record<JobGroup, string> = {
-  active: "No runners are launching or running.",
-  waiting: "No jobs are waiting for a runner.",
-  failed: "No failed launches.",
+  active: "No runs have runners launching or running.",
+  waiting: "No runs have jobs waiting for a runner.",
+  failed: "No runs have failed launches.",
 };
 
-/** All, Active, Waiting and Failed, each with the count the API gives. */
+/** All, Active, Waiting and Failed, each with the runs the API counts. */
 function StatusTabs({
   status,
   counts,
@@ -398,14 +425,14 @@ function StatusTabs({
 }) {
   const tabs: { id: JobGroup | undefined; label: string; count?: number; note?: string; title?: string }[] = [
     { id: undefined, label: "All" },
-    { id: "active", label: "Active", count: counts?.active },
-    { id: "waiting", label: "Waiting", count: counts?.waiting },
+    { id: "active", label: "Active", count: counts?.activeRuns },
+    { id: "waiting", label: "Waiting", count: counts?.waitingRuns },
     {
       id: "failed",
       label: "Failed",
-      count: counts?.failedToday,
+      count: counts?.failedRunsToday,
       note: "24 h",
-      title: "Failed launches in the last 24 hours. The list goes back further.",
+      title: "Runs with a failed launch in the last 24 hours. The list goes back further.",
     },
   ];
   return (
@@ -547,45 +574,191 @@ function StackUpdate({ stack, region }: { stack: Stack; region: string }) {
 const INLINE_COPY =
   "cursor-pointer rounded-sm border border-rivet bg-housing px-1.5 py-0.5 font-mono text-[11px] text-bone uppercase hover:border-steel";
 
-function JobRow({ org, job, region, now }: { org: string; job: Job; region: string | null; now: number }) {
+/** A run starts open while a job is still going or a launch needs a hand. */
+function openByDefault(run: ListedRun): boolean {
+  return run.jobs.some((job) => job.status !== "completed" || job.launchState === "failed");
+}
+
+/** The red or yellow left edge of a row that needs a look. */
+function edgeOf(tone: Shown["tone"]): string {
+  return tone === "failed"
+    ? "shadow-[inset_3px_0_0_var(--failed)]"
+    : tone === "retrying"
+      ? "shadow-[inset_3px_0_0_var(--chick)]"
+      : "";
+}
+
+/** A run's row and, when open, a row per current job under it. */
+function RunRows({
+  org,
+  run,
+  region,
+  now,
+  open,
+  onToggle,
+}: {
+  org: string;
+  run: ListedRun;
+  region: string | null;
+  now: number;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const shown = runState(run.jobs);
+  // The run takes the edge of its worst job, so a closed run with a failed launch still stands out.
+  const worst = run.jobs.map(state).find((s) => s.tone === "failed") ?? run.jobs.map(state).find((s) => s.tone === "retrying");
+  const edge = edgeOf(worst?.tone ?? shown.tone);
+  const took = runSpan(run, run.jobs, now);
+  const name = runName(run);
+  const several = run.attempt > 1;
+  const rows = open ? run.jobs.length + (run.olderJobs > 0 ? 1 : 0) : 0;
+  return (
+    <Fragment>
+      <TableRow className="bg-panel/40">
+        <TableCell className={edge}>
+          <span className="inline-flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onToggle}
+              aria-expanded={open}
+              aria-label={`${open ? "Hide" : "Show"} the jobs of ${name} ${runRef(run)}`}
+              className="cursor-pointer rounded-xs p-0.5 text-fog hover:bg-seam hover:text-bone"
+            >
+              <ChevronRightIcon className={cn("transition-transform", open && "rotate-90")} />
+            </button>
+            <StatusMark shown={shown} />
+          </span>
+          <Tally jobs={run.jobs} />
+        </TableCell>
+        <TableCell className="max-w-[360px]">
+          <Link
+            href={`/o/${org}/runs/${run.id}`}
+            aria-label={`${name} ${runRef(run)} in ${run.repository}, open the run`}
+            className="group flex min-w-0 flex-col"
+          >
+            <span className="inline-flex items-center gap-2">
+              <span className="font-bold text-bone group-hover:text-chick">{name}</span>
+              <ChevronRightIcon className="text-chick" />
+            </span>
+            {run.displayTitle && <span className="truncate text-[13px] text-fog">{run.displayTitle}</span>}
+          </Link>
+        </TableCell>
+        <TableCell className="font-mono text-xs">
+          <a
+            href={run.githubUrl}
+            aria-label={`${run.repository} run ${runRef(run)} on GitHub, opens github.com`}
+            className="group inline-flex flex-wrap items-center gap-x-2 gap-y-1 text-bone-dim hover:text-bone"
+          >
+            <GitHubIcon className="text-fog" />
+            <span className="quiet-underline group-hover:decoration-fog">{run.repository}</span>
+            <span>{runRef(run)}</span>
+            <ExternalIcon />
+          </a>
+          <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-fog">
+            {run.headBranch && (
+              <span className="rounded-xs border border-rivet bg-housing px-1.5 py-px text-bone-dim">{run.headBranch}</span>
+            )}
+            {run.event && <span>{run.event}</span>}
+            {several && <span className="text-chick">attempt {run.attempt}</span>}
+          </div>
+        </TableCell>
+        <TableCell className="font-mono text-xs text-steel">
+          {run.jobs.length} {run.jobs.length === 1 ? "job" : "jobs"}
+        </TableCell>
+        <TableCell className="text-[13px] text-fog" title={new Date(run.queuedAt).toLocaleString()}>
+          {ago(run.queuedAt)}
+        </TableCell>
+        <TableCell className={cn("text-right font-mono text-xs", took.live ? "text-blush" : "text-bone")}>
+          {span(took.ms)}
+        </TableCell>
+      </TableRow>
+      {open &&
+        run.jobs.map((job, i) => (
+          <JobRows
+            key={job.id}
+            org={org}
+            job={job}
+            region={region}
+            now={now}
+            last={i === rows - 1}
+            attempt={several ? job.runAttempt : null}
+          />
+        ))}
+      {open && run.olderJobs > 0 && (
+        <TableRow className="hover:bg-transparent">
+          <TableCell />
+          <TableCell colSpan={5} className="font-mono text-xs text-steel">
+            <span>└ </span>
+            <Link href={`/o/${org}/runs/${run.id}`} className="quiet-underline text-fog hover:text-bone">
+              {run.olderJobs} {run.olderJobs === 1 ? "job" : "jobs"} from earlier attempts, on the run page
+            </Link>
+          </TableCell>
+        </TableRow>
+      )}
+    </Fragment>
+  );
+}
+
+/** The run's jobs by how they show, such as 3 ✓ 1 ▶. */
+function Tally({ jobs }: { jobs: Job[] }) {
+  if (jobs.length < 2) {
+    return null;
+  }
+  return (
+    <span className="mt-1 flex gap-2 pl-6 font-mono text-[11px]" aria-label={tally(jobs).map((t) => `${t.count} ${t.shown.text.toLowerCase()}`).join(", ")}>
+      {tally(jobs).map((t) => (
+        <span key={`${t.shown.glyph}${t.shown.tone}`} className={TONE_TEXT[t.shown.tone]} title={t.shown.text}>
+          {t.count} {t.shown.glyph}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+/** A job under its run: the job's row and its launch problem, if any. */
+function JobRows({
+  org,
+  job,
+  region,
+  now,
+  last,
+  attempt,
+}: {
+  org: string;
+  job: Job;
+  region: string | null;
+  now: number;
+  last: boolean;
+  attempt: number | null;
+}) {
   const shown = state(job);
   const trouble = problem(job);
-  const edge =
-    shown.tone === "failed"
-      ? "shadow-[inset_3px_0_0_var(--failed)]"
-      : shown.tone === "retrying"
-        ? "shadow-[inset_3px_0_0_var(--chick)]"
-        : "";
+  const edge = edgeOf(shown.tone);
   const live = job.status === "in_progress";
   const took =
-    job.status === "completed" ? span(job.updatedAt - job.queuedAt) : live ? span(now - job.queuedAt) : null;
+    job.status === "completed" ? span(endOf(job) - job.queuedAt) : live ? span(now - job.queuedAt) : null;
+  const branch = last && !trouble ? "└" : "├";
   return (
     <Fragment>
       <TableRow>
-        <TableCell className={edge}>
-          <StatusMark shown={shown} />
+        <TableCell className={cn("pl-9", edge)}>
+          <span className="inline-flex items-center gap-2">
+            <span aria-hidden="true" className="font-mono text-steel">
+              {branch}
+            </span>
+            <StatusMark shown={shown} />
+          </span>
         </TableCell>
         <TableCell>
           <Link
             href={`/o/${org}/jobs/${job.id}`}
-            aria-label={`Job ${job.id} in ${job.repository}, open details`}
+            aria-label={`Job ${job.name || job.id}, open details`}
             className="group inline-flex items-center gap-2.5"
           >
-            <span className="font-bold text-bone group-hover:text-chick">{job.repository}</span>
-            <span className="font-mono text-xs text-fog">#{job.id}</span>
+            <span className="text-bone group-hover:text-chick">{job.name || `#${job.id}`}</span>
+            {attempt !== null && <span className="font-mono text-[11px] text-fog">attempt {attempt}</span>}
             <ChevronRightIcon className="text-chick" />
           </Link>
-        </TableCell>
-        <TableCell className="font-mono">
-          <a
-            href={`https://github.com/${job.repository}/actions/runs/${job.runId}/job/${job.id}`}
-            aria-label={`GitHub run ${job.runId} logs, opens github.com`}
-            className="group inline-flex items-center gap-1.5 text-xs text-bone-dim hover:text-bone"
-          >
-            <GitHubIcon className="text-fog" />
-            <span className="quiet-underline group-hover:decoration-fog">{job.runId}</span>
-            <ExternalIcon />
-          </a>
         </TableCell>
         <TableCell className="font-mono text-xs text-bone-dim">{job.label}</TableCell>
         <TableCell className="font-mono text-xs">
@@ -615,16 +788,31 @@ function JobRow({ org, job, region, now }: { org: string; job: Job; region: stri
           {took ?? "-"}
         </TableCell>
       </TableRow>
-      {trouble && (
-        <TableRow className="border-t-0 hover:bg-transparent">
-          <TableCell colSpan={7} className={cn("pt-0 pb-2.5 pl-9 font-mono text-xs whitespace-normal", edge)}>
-            <span className="text-steel">└ </span>
-            <span className={TONE_TEXT_PROBLEM[trouble.tone]}>{trouble.text}</span>
-            {trouble.next && <span className="text-fog"> · {trouble.next}</span>}
-          </TableCell>
-        </TableRow>
-      )}
+      {trouble && <ProblemRow trouble={trouble} edge={edge} last={last} />}
     </Fragment>
+  );
+}
+
+/** The launch problem under a job, in plain words. */
+export function ProblemRow({
+  trouble,
+  edge,
+  last,
+  colSpan = 6,
+}: {
+  trouble: NonNullable<ReturnType<typeof problem>>;
+  edge: string;
+  last: boolean;
+  colSpan?: number;
+}) {
+  return (
+    <TableRow className="border-t-0 hover:bg-transparent">
+      <TableCell colSpan={colSpan} className={cn("pt-0 pb-2.5 pl-9 font-mono text-xs whitespace-normal", edge)}>
+        <span className="text-steel">{last ? "  └ " : "│ └ "}</span>
+        <span className={TONE_TEXT_PROBLEM[trouble.tone]}>{trouble.text}</span>
+        {trouble.next && <span className="text-fog"> · {trouble.next}</span>}
+      </TableCell>
+    </TableRow>
   );
 }
 
@@ -635,7 +823,7 @@ const TONE_TEXT_PROBLEM = {
 };
 
 /** What went wrong with the job's launch and what happens next, in plain words. */
-function problem(job: Job): { text: string; tone: keyof typeof TONE_TEXT_PROBLEM; next?: string } | null {
+export function problem(job: Job): { text: string; tone: keyof typeof TONE_TEXT_PROBLEM; next?: string } | null {
   if (!job.launchError) {
     return null;
   }

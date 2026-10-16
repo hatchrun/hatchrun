@@ -15,7 +15,7 @@
 //!   up an organization from an installation of the App (see
 //!   [`tenants`]).
 //! - `/api/tenants/<org>/aws` connects the AWS account (see [`aws`]).
-//! - `/api/tenants/<org>/{jobs,settings}` serve the dashboard (see
+//! - `/api/tenants/<org>/{runs,settings}` serve the dashboard (see
 //!   [`dashboard`]); `/api/tenants/<org>/jobs/<id>/metrics` serves one
 //!   job's CPU and memory (see [`metrics`]).
 //! - `/api/tenants/<org>/runners` manages runner profiles (see
@@ -266,7 +266,8 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (Method::Get, ["tenants", org]) => tenants::show(&ctx, org).await,
         (Method::Get, ["tenants", org, "aws"]) => aws::instructions(&ctx, org).await,
         (Method::Post, ["tenants", org, "aws"]) => aws::verify(&ctx, org, req.json().await?).await,
-        (Method::Get, ["tenants", org, "jobs"]) => dashboard::jobs(&ctx, org, &req).await,
+        (Method::Get, ["tenants", org, "runs"]) => dashboard::runs(&ctx, org, &req).await,
+        (Method::Get, ["tenants", org, "runs", id]) => dashboard::run(&ctx, org, id).await,
         (Method::Get, ["tenants", org, "jobs", id, "metrics"]) => metrics::job(&ctx, org, id).await,
         (Method::Put, ["tenants", org, "settings"]) => {
             dashboard::settings(&ctx, org, req.json().await?).await

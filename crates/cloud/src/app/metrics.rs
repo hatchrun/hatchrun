@@ -5,10 +5,13 @@
 //! One job's CPU and memory, as its runner reported them to
 //! hatchrun-telemetry (crates/telemetry).
 //!
-//! - `GET /api/tenants/<org>/jobs/<id>/metrics` returns the job, the
-//!   link to it on GitHub, the tenant's region for the instance's
-//!   console page, a summary of its windows and the windows
+//! - `GET /api/tenants/<org>/jobs/<id>/metrics` returns the job and its
+//!   run, the link to it on GitHub, the tenant's region for the
+//!   instance's console page, a summary of its windows and the windows
 //!   themselves, oldest first.
+//!
+//! The run page shows a few of the summary's numbers for each of its
+//! jobs, from one query over them all ([`resources`]).
 //!
 //! The windows live in Workers Analytics Engine, read through the
 //! Analytics SQL binding. Every query names the tenant's installation,
@@ -110,18 +113,93 @@ struct Job {
     id: u64,
     repository: String,
     run_id: u64,
+    name: String,
+    run_attempt: u64,
     label: String,
     status: String,
+    conclusion: Option<String>,
     runner_name: Option<String>,
     instance_id: Option<String>,
     queued_at: u64,
+    started_at: Option<u64>,
+    completed_at: Option<u64>,
     updated_at: u64,
+    /// The run's, for the way back to it.
+    workflow_name: Option<String>,
+    run_number: Option<u64>,
 }
 
-/// One job of an installation, from D1. Binds the job id and the
-/// installation.
-const JOB: &str = "SELECT id, repository, run_id, label, status, runner_name, instance_id, \
-    queued_at, updated_at FROM jobs WHERE id = ?1 AND installation_id = ?2";
+/// One job of an installation and its run, from D1. Binds the job id
+/// and the installation. A job from before runs were recorded has no
+/// run until the backfill gives it one.
+const JOB: &str = "SELECT jobs.id, jobs.repository, jobs.run_id, jobs.name, jobs.run_attempt, \
+    jobs.label, jobs.status, jobs.conclusion, jobs.runner_name, jobs.instance_id, \
+    jobs.queued_at, jobs.started_at, jobs.completed_at, jobs.updated_at, \
+    runs.workflow_name, runs.run_number \
+    FROM jobs LEFT JOIN runs ON runs.id = jobs.run_id \
+    WHERE jobs.id = ?1 AND jobs.installation_id = ?2";
+
+/// Most jobs of a run [`resources`] covers, the largest matrix GitHub
+/// allows and then some.
+const MAX_RESOURCES: usize = 300;
+
+/// What one job used, as the run page lists it.
+#[derive(Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all(serialize = "camelCase"))]
+pub(crate) struct Resources {
+    /// The job id, as `index1` holds it.
+    job: String,
+    cpu_avg: Option<f64>,
+    cpu_max: Option<f64>,
+    mem_max: Option<f64>,
+    mem_total: Option<f64>,
+    oom_kills: Option<f64>,
+}
+
+/// The query for [`resources`]. The ids come from D1, never the
+/// request, and are digits only.
+fn resources_query(jobs: &[u64]) -> String {
+    let ids: Vec<String> = jobs
+        .iter()
+        .take(MAX_RESOURCES)
+        .map(|id| format!("'{id}'"))
+        .collect();
+    format!(
+        "SELECT index1 AS job, AVG(double4) AS cpu_avg, APPROX_MAX(double5) AS cpu_max, \
+         APPROX_MAX(double7) AS mem_max, APPROX_MAX(double8) AS mem_total, \
+         SUM(double10) AS oom_kills \
+         FROM events.analyticsEngine.hatchrun_runner_metrics \
+         WHERE blob1 = $installation AND index1 IN ({}) AND timestamp >= $since \
+         GROUP BY index1 LIMIT {MAX_RESOURCES}",
+        ids.join(", ")
+    )
+}
+
+/// What each of `jobs` of `installation` used, from `since` on, the
+/// oldest job's queue time. Jobs with nothing reported are left out.
+pub(crate) async fn resources(
+    ctx: &Ctx<'_>,
+    installation: u64,
+    jobs: &[u64],
+    since: u64,
+) -> Result<Vec<Resources>, Failure> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let installation = installation.to_string();
+    let since = iso(since)?;
+    query(
+        ctx,
+        &resources_query(jobs),
+        &[("installation", &installation), ("since", &since)],
+    )
+    .await
+}
+
+/// `ms` as an ISO 8601 string, as the SQL API compares `timestamp`.
+fn iso(ms: u64) -> Result<String, Failure> {
+    Ok(js_sys::Date::new(&int(ms)?).to_iso_string().into())
+}
 
 /// What the SQL binding answers.
 #[derive(Deserialize)]
@@ -144,13 +222,14 @@ pub(crate) async fn job(ctx: &Ctx<'_>, org: &str, id: &str) -> Answer {
         .await?
         .ok_or_else(missing)?;
 
-    let params = Params {
-        job: job.id.to_string(),
-        installation: installation.to_string(),
-        since: js_sys::Date::new(&int(job.queued_at)?)
-            .to_iso_string()
-            .into(),
-    };
+    let id = job.id.to_string();
+    let installation = installation.to_string();
+    let since = iso(job.queued_at)?;
+    let params = [
+        ("job", id.as_str()),
+        ("installation", installation.as_str()),
+        ("since", since.as_str()),
+    ];
     let windows: Vec<Window> = query(ctx, &windows_query(), &params).await?;
     let summary: Option<Summary> = query(ctx, SUMMARY, &params).await?.into_iter().next();
     Ok(Response::from_json(&serde_json::json!({
@@ -178,19 +257,13 @@ const SUMMARY: &str = "SELECT SUM(double2) AS seconds, \
     FROM events.analyticsEngine.hatchrun_runner_metrics \
     WHERE index1 = $job AND blob1 = $installation AND timestamp >= $since LIMIT 1";
 
-/// The named parameters of every query.
-struct Params {
-    job: String,
-    installation: String,
-    /// The job's queue time as an ISO 8601 string, the lower time bound.
-    since: String,
-}
-
-/// Runs `sql` through the Analytics SQL binding.
+/// Runs `sql` through the Analytics SQL binding with its named
+/// parameters: the installation, the lower time bound as an ISO 8601
+/// string, and for one job's queries the job.
 async fn query<T: serde::de::DeserializeOwned>(
     ctx: &Ctx<'_>,
     sql: &str,
-    params: &Params,
+    params: &[(&str, &str)],
 ) -> Result<Vec<T>, Failure> {
     let failed = |err: JsValue| {
         Failure::new(
@@ -210,11 +283,7 @@ async fn query<T: serde::de::DeserializeOwned>(
         return Err(Failure::new(500, format!("no {BINDING} binding")));
     }
     let named = Object::new();
-    for (name, value) in [
-        ("job", &params.job),
-        ("installation", &params.installation),
-        ("since", &params.since),
-    ] {
+    for &(name, value) in params {
         Reflect::set(&named, &name.into(), &value.into()).map_err(failed)?;
     }
     let request = Object::new();
@@ -271,13 +340,29 @@ mod tests {
                 "i-0123456789abcdef0",
             ],
         );
+        db.run(
+            "INSERT INTO runs (id, installation_id, repository, workflow_name, head_sha, attempt, \
+             queued_at, run_number, created_at, updated_at) \
+             VALUES (9, 3, 'acme/app', 'Smoke test', 'ab', 1, ?1, 412, ?1, ?1)",
+            &params![queued_at],
+        );
         let job: Job = db.first(JOB, &params![7u64, 3u64]).unwrap();
         assert_eq!(job.id, 7);
         assert_eq!(job.run_id, 9);
+        assert_eq!(job.workflow_name.as_deref(), Some("Smoke test"));
+        assert_eq!(job.run_number, Some(412));
         assert_eq!(job.queued_at, queued_at);
         assert_eq!(job.updated_at, queued_at + 60_000);
         assert_eq!(job.instance_id.as_deref(), Some("i-0123456789abcdef0"));
         assert!(db.first::<Job>(JOB, &params![7u64, 4u64]).is_none());
+        // A job from before runs were recorded, until the backfill.
+        db.run(
+            "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+             queued_at, updated_at) VALUES (8, 3, 'acme/app', 99, 'hatchrun', 'completed', 1, 2)",
+            &[],
+        );
+        let old: Job = db.first(JOB, &params![8u64, 3u64]).unwrap();
+        assert_eq!((old.workflow_name, old.run_number), (None, None));
     }
 
     fn window(at: f64) -> Window {
@@ -318,17 +403,46 @@ mod tests {
             id: 7,
             repository: "acme/app".into(),
             run_id: 3,
+            name: "build".into(),
+            run_attempt: 1,
             label: "hatchrun-2cpu".into(),
             status: "completed".into(),
+            conclusion: Some("success".into()),
             runner_name: None,
             instance_id: None,
             queued_at: 0,
+            started_at: None,
+            completed_at: None,
             updated_at: 0,
+            workflow_name: None,
+            run_number: None,
         };
         assert_eq!(
             github_url("https://github.com", &job),
             "https://github.com/acme/app/actions/runs/3/job/7"
         );
+    }
+
+    #[test]
+    fn resources_cover_the_run_s_jobs_at_most() {
+        let sql = resources_query(&[7, 8]);
+        assert!(sql.contains("index1 IN ('7', '8')"), "{sql}");
+        assert!(sql.contains("blob1 = $installation"), "{sql}");
+        assert!(sql.contains("timestamp >= $since"), "{sql}");
+        assert!(sql.contains(" GROUP BY index1 LIMIT "), "{sql}");
+        assert!(!sql.replace("APPROX_MAX(", "").contains("MAX("), "{sql}");
+        let many: Vec<u64> = (1..=1000).collect();
+        assert_eq!(
+            resources_query(&many).matches('\'').count(),
+            2 * MAX_RESOURCES
+        );
+        let answered: Answered<Resources> = serde_json::from_str(
+            r#"{"data":[{"job":"7","cpu_avg":40.5,"cpu_max":99,"mem_max":1024,
+                "mem_total":4096,"oom_kills":0}]}"#,
+        )
+        .unwrap();
+        assert_eq!(answered.data[0].job, "7");
+        assert_eq!(answered.data[0].cpu_avg, Some(40.5));
     }
 
     #[test]
