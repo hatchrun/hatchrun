@@ -1,6 +1,6 @@
 -- SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 --
--- SPDX-License-Identifier: Apache-2.0
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 -- One row per GitHub workflow job that asked for a hatchrun runner. GitHub
 -- may deliver a webhook more than once; the job id keeps the second

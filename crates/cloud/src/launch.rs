@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Launches a runner instance for a recorded job, after the webhook has
 //! been answered.

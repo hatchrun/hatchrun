@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! A tenant's runner instances: `DescribeInstances` on the
 //! `hatchrun:tenant` tag and `TerminateInstances` on several at once,

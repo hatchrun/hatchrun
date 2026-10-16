@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! GitHub App webhooks: the signature check and the `workflow_job` events
 //! the Worker acts on, kept apart from the Workers runtime so they test

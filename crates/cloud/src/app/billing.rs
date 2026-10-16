@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! An organization's licence: Polar checkout, the customer portal,
 //! Polar's webhooks, and the beta, which needs no payment.

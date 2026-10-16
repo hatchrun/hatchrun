@@ -38,7 +38,9 @@ jobs:
 
   # Owners get the update offer only for stacks older than
   # TEMPLATE_VERSION, so a change to connect.yaml that keeps the version
-  # would reach new stacks and never the existing ones.
+  # would reach new stacks and never the existing ones. Full-line
+  # comments are ignored: CloudFormation never sees them, and a header
+  # change should not offer every owner a stack update.
   template-version:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -49,7 +51,12 @@ jobs:
           fetch-depth: 2
       # HEAD is the merge commit; its first parent is the base branch.
       - run: |
-          if git diff --quiet HEAD^1 HEAD -- deploy/cloudformation/connect.yaml; then
+          template() {
+            grep -v '^[[:space:]]*#' || true
+          }
+          if cmp -s \
+            <(git show HEAD^1:deploy/cloudformation/connect.yaml | template) \
+            <(template < deploy/cloudformation/connect.yaml); then
             exit 0
           fi
           version() {

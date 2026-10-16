@@ -1,6 +1,6 @@
 -- SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 --
--- SPDX-License-Identifier: Apache-2.0
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 -- People who have signed in to app.hatchrun.io with GitHub, by GitHub
 -- user id, which survives a rename.

@@ -1,6 +1,6 @@
 -- SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 --
--- SPDX-License-Identifier: Apache-2.0
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 -- Tenants now begin when an organization owner sets the organization
 -- up in the app, before the App is installed or AWS connected, so the

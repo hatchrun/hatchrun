@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 #
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 
 [workspace]
 members = ["crates/*"]
@@ -10,7 +10,7 @@ resolver = "3"
 authors = ["Gamunu Balagalla <gamunu.balagalla@gmail.com>"]
 edition = "2024"
 rust-version = "1.99"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 repository = "https://github.com/hatchrun/hatchrun"
 
 [workspace.lints.rust]

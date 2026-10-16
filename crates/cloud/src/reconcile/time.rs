@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! UTC timestamps as GitHub and EC2 write them, such as
 //! `2026-10-14T10:00:00Z` and `2026-10-14T10:00:00.000Z`.

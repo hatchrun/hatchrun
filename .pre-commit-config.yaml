@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 #
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 
 # Scans staged changes for secrets and account IDs before each commit,
 # using the rules in .gitleaks.toml. Run `pre-commit install` once.

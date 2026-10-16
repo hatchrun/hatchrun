@@ -1,6 +1,6 @@
 -- SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 --
--- SPDX-License-Identifier: Apache-2.0
+-- SPDX-License-Identifier: AGPL-3.0-only
 
 -- The instance type catalog (crates/cloud/src/instance_types.rs): the
 -- current generation amd64 and arm64 types each region offers, which

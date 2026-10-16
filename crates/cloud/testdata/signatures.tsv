@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 #
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 
 # Webhook signature cases, one per line: secret, body, X-Hub-Signature-256
 # and whether it verifies, separated by tabs. The first is the example in

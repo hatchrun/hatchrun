@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 #
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 
 # Findings already in history, by fingerprint (commit:file:rule:line).
 # History is not rewritten, so these commits stay. New findings still

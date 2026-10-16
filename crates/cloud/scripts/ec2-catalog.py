@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
 #
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Writes src/catalog.rs: the instance families runner profiles can use,
 their sizes and their Linux on-demand price in every region hatchrun
@@ -116,7 +116,7 @@ def main():
     out.write(
         "// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>\n"
         "//\n"
-        "// SPDX-License-Identifier: Apache-2.0\n\n"
+        "// SPDX-License-Identifier: AGPL-3.0-only\n\n"
     )
     # REUSE-IgnoreEnd
     out.write(
