@@ -4,7 +4,16 @@
 
 import { Fragment, useEffect, useRef, useState } from "react";
 
-import { listJobs, type Job, type JobCounts, type JobPage, type Stack, type Tenant } from "@/api";
+import {
+  listJobs,
+  type Job,
+  type JobActivity,
+  type JobCounts,
+  type JobGroup,
+  type JobPage,
+  type Stack,
+  type Tenant,
+} from "@/api";
 import { CopyButton } from "@/components/CopyButton";
 import { ChevronRightIcon, ExternalIcon, GitHubIcon, OpenIcon } from "@/components/icons";
 import { ago, instanceUrl, span, state, StatusMark, TONE_TEXT } from "@/components/JobStatus";
@@ -26,7 +35,10 @@ const SUGGESTED = "hatchrun-4cpu-arm64";
 export function Dashboard({ tenant }: { tenant: Tenant }) {
   const org = tenant.org.login;
   const installed = useQuery("installed");
-  const [page, setPage] = useState<JobPage | null>(null);
+  const [status, setStatus] = useState<JobGroup | undefined>(undefined);
+  // The newest page of the last tab loaded. The fleet panel keeps showing
+  // it while another tab loads; the table shows it only for its own tab.
+  const [loaded, setLoaded] = useState<{ status: JobGroup | undefined; page: JobPage } | null>(null);
   const [older, setOlder] = useState<Job[]>([]);
   const [error, setError] = useState<Error | null>(null);
   const [more, setMore] = useState(true);
@@ -37,10 +49,10 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
   useEffect(() => {
     let current = true;
     const load = () =>
-      listJobs(org).then(
+      listJobs(org, { status }).then(
         (next) => {
           if (current) {
-            setPage(next);
+            setLoaded({ status, page: next });
             setError(null);
           }
         },
@@ -56,8 +68,9 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
       current = false;
       window.clearInterval(timer);
     };
-  }, [org]);
+  }, [org, status]);
 
+  const page = loaded && loaded.status === status ? loaded.page : null;
   const pageSize = page?.pageSize ?? PAGE;
   const jobs = page ? [...page.jobs, ...older.filter((job) => !page.jobs.some((seen) => seen.id === job.id))] : [];
   const last = jobs[jobs.length - 1];
@@ -67,7 +80,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
     }
     setPaging(true);
     try {
-      const next = await listJobs(org, last.queuedAt);
+      const next = await listJobs(org, { before: last.queuedAt, status });
       setOlder((was) => [...was, ...next.jobs]);
       setMore(next.jobs.length === (next.pageSize ?? PAGE));
     } catch (err) {
@@ -75,6 +88,11 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
     } finally {
       setPaging(false);
     }
+  };
+  const pick = (next: JobGroup | undefined) => {
+    setStatus(next);
+    setOlder([]);
+    setMore(true);
   };
   const backToNewest = () => {
     setOlder([]);
@@ -101,13 +119,18 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
         </p>
       )}
 
-      <Fleet max={tenant.maxRunners} counts={page?.counts ?? null} jobs={page?.jobs ?? []} />
+      <Fleet
+        max={tenant.maxRunners}
+        counts={loaded?.page.counts ?? null}
+        jobs={loaded?.page.jobs ?? []}
+        activity={loaded?.page.activity ?? null}
+      />
 
       {tenant.aws && <StackUpdate stack={tenant.aws.stack} region={tenant.aws.region} />}
 
       <section ref={table} aria-label="Jobs" className="scroll-mt-4 overflow-hidden rounded-md border border-rivet">
         <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-rivet bg-panel px-3.5 py-2.5">
-          <span className="cap">Recent jobs</span>
+          <StatusTabs status={status} counts={loaded?.page.counts ?? null} onPick={pick} />
           <span className="font-mono text-xs text-fog">newest first</span>
         </div>
         {error && (
@@ -120,7 +143,8 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
             <Spinner />
           </div>
         )}
-        {page && jobs.length === 0 && (
+        {page && jobs.length === 0 && status && <p className="px-3.5 py-10 text-center text-fog">{EMPTY[status]}</p>}
+        {page && jobs.length === 0 && !status && (
           <p className="px-3.5 py-10 text-center text-fog">
             No jobs yet. Push a workflow with <code className="font-mono text-bone">runs-on: {SUGGESTED}</code> and it
             shows up here. <Link href={`/o/${org}/runners`} className="quiet-underline text-bone-dim hover:text-bone">See every runner profile</Link>.
@@ -199,7 +223,17 @@ function RunsOn({ text }: { text: string }) {
  * The runner slots under max runners: running, booting and free, with
  * the jobs GitHub has queued beside them; and the last day's totals.
  */
-function Fleet({ max, counts, jobs }: { max: number; counts: JobCounts | null; jobs: Job[] }) {
+function Fleet({
+  max,
+  counts,
+  jobs,
+  activity,
+}: {
+  max: number;
+  counts: JobCounts | null;
+  jobs: Job[];
+  activity: JobActivity | null;
+}) {
   const active = counts?.active ?? 0;
   const running = Math.min(active, counts?.running ?? jobs.filter((job) => job.status === "in_progress").length);
   const booting = active - running;
@@ -214,7 +248,7 @@ function Fleet({ max, counts, jobs }: { max: number; counts: JobCounts | null; j
       aria-label="Fleet now and today"
       className="flex flex-wrap rounded-md border border-rivet bg-panel"
     >
-      <div className="flex min-w-0 flex-[2_1_460px] flex-col gap-3 px-4.5 py-4">
+      <div className="flex min-w-0 flex-[1_1_460px] flex-col gap-3 px-4.5 py-4">
         <div className="flex items-baseline justify-between gap-3">
           <span className="cap">Runner slots</span>
           <span className="font-mono text-xs text-fog">
@@ -269,27 +303,124 @@ function Fleet({ max, counts, jobs }: { max: number; counts: JobCounts | null; j
           <Legend swatch="border-dashed border-fog" value={n(waiting)} label="waiting on GitHub" />
         </div>
       </div>
-      <div className="flex flex-[1_1_260px] flex-col justify-between gap-3 border-t border-rivet px-4.5 py-4 sm:border-t-0 sm:border-l">
-        <span className="cap">Last 24 hours</span>
-        <div className="flex flex-wrap gap-x-8 gap-y-2 font-mono text-xs text-fog">
-          <span className="flex flex-col">
-            <span className="text-[22px] leading-tight font-bold text-bone">{n(counts?.completedToday ?? 0)}</span>
-            finished
-          </span>
-          <span className="flex flex-col">
-            <span
-              className={cn(
-                "text-[22px] leading-tight font-bold",
-                (counts?.failedToday ?? 0) > 0 ? "text-failed" : "text-bone",
-              )}
-            >
+      <div className="flex min-w-0 flex-[1_1_460px] flex-col gap-2.5 border-t border-rivet px-4.5 py-4 sm:border-t-0 sm:border-l">
+        <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1.5">
+          <span className="cap">Last 24 hours</span>
+          <span className="font-mono text-xs text-fog">
+            <span className="text-lg font-bold text-bone">{n(counts?.completedToday ?? 0)}</span> finished{" "}
+            <span className="text-rivet">|</span>{" "}
+            <span className={cn("text-lg font-bold", (counts?.failedToday ?? 0) > 0 ? "text-failed" : "text-bone")}>
               {n(counts?.failedToday ?? 0)}
-            </span>
+            </span>{" "}
             {counts?.failedToday === 1 ? "failed launch" : "failed launches"}
           </span>
         </div>
+        {activity && <Strip activity={activity} />}
       </div>
     </section>
+  );
+}
+
+/** Finished and failed jobs per bucket, oldest on the left. */
+function Strip({ activity }: { activity: JobActivity }) {
+  const { since, bucketMs, finished, failed } = activity;
+  const top = Math.max(1, ...finished.map((done, i) => done + (failed[i] ?? 0)));
+  const at = (i: number) =>
+    new Date(since + i * bucketMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return (
+    <>
+      <div
+        role="img"
+        aria-label={`Jobs per ${bucketMs / 60_000} minutes over the last 24 hours`}
+        className="flex h-[46px] items-end gap-[2px] border-b border-rivet"
+      >
+        {finished.map((done, i) => {
+          const fails = failed[i] ?? 0;
+          const total = done + fails;
+          // The last three buckets are the last 45 minutes.
+          const recent = i >= finished.length - 3;
+          return (
+            <span
+              key={i}
+              title={`${at(i)}: ${done} finished${fails ? `, ${fails} failed ${fails === 1 ? "launch" : "launches"}` : ""}`}
+              className="flex min-h-px flex-1 flex-col-reverse overflow-hidden rounded-t-[1px]"
+              style={{ height: total ? Math.max(2, Math.round((total / top) * 44)) : 1 }}
+            >
+              <span
+                className={total === 0 ? "bg-rivet" : recent ? "bg-bone" : "bg-steel"}
+                style={{ flexGrow: total ? done : 1 }}
+              />
+              {fails > 0 && <span className="bg-failed" style={{ flexGrow: fails }} />}
+            </span>
+          );
+        })}
+      </div>
+      <div aria-hidden="true" className="flex justify-between font-mono text-[10px] text-steel">
+        <span>-24 h</span>
+        <span>-18 h</span>
+        <span>-12 h</span>
+        <span>-6 h</span>
+        <span className="text-fog">now</span>
+      </div>
+    </>
+  );
+}
+
+const EMPTY: Record<JobGroup, string> = {
+  active: "No runners are launching or running.",
+  waiting: "No jobs are waiting for a runner.",
+  failed: "No failed launches.",
+};
+
+/** All, Active, Waiting and Failed, each with the count the API gives. */
+function StatusTabs({
+  status,
+  counts,
+  onPick,
+}: {
+  status: JobGroup | undefined;
+  counts: JobCounts | null;
+  onPick: (status: JobGroup | undefined) => void;
+}) {
+  const tabs: { id: JobGroup | undefined; label: string; count?: number; note?: string; title?: string }[] = [
+    { id: undefined, label: "All" },
+    { id: "active", label: "Active", count: counts?.active },
+    { id: "waiting", label: "Waiting", count: counts?.waiting },
+    {
+      id: "failed",
+      label: "Failed",
+      count: counts?.failedToday,
+      note: "24 h",
+      title: "Failed launches in the last 24 hours. The list goes back further.",
+    },
+  ];
+  return (
+    <div role="group" aria-label="Filter by status" className="flex overflow-hidden rounded-sm border border-rivet font-mono text-xs">
+      {tabs.map((tab) => {
+        const on = tab.id === status;
+        return (
+          <button
+            key={tab.label}
+            type="button"
+            aria-pressed={on}
+            title={tab.title}
+            onClick={() => onPick(tab.id)}
+            className={cn(
+              "cursor-pointer border-r border-rivet px-3 py-1.5 last:border-r-0",
+              on ? "bg-bone text-graphite" : "bg-transparent text-bone-dim hover:bg-seam hover:text-bone",
+            )}
+          >
+            {tab.label}
+            {tab.count !== undefined && (
+              <span className={cn("ml-1.5", on ? "text-graphite/60" : "text-steel")}>
+                {tab.count}
+                {tab.note && <span className="ml-1 text-[10px]">/ {tab.note}</span>}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 

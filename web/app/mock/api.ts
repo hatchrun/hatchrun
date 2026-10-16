@@ -9,6 +9,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
+import type { Job } from "../src/api.ts";
 import * as profiles from "./runners.ts";
 
 interface MockTenant {
@@ -230,22 +231,29 @@ const routes: Record<string, Handler> = {
     const now = Date.now();
     const all = sampleJobs(now);
     const before = Number(url.searchParams.get("before")) || Infinity;
+    const status = url.searchParams.get("status");
+    const group = status === "active" || status === "waiting" || status === "failed" ? IN_GROUP[status] : null;
+    if (status && !group) {
+      return [400, { error: "status is one of active, waiting or failed." }];
+    }
     const pageSize = 12;
-    const open = all.filter((job) => job.status !== "completed");
     const day = all.filter((job) => job.updatedAt >= now - 86_400_000);
+    const activity = before === Infinity ? sampleActivity(now, day) : undefined;
+    const sum = (values: number[] | undefined) => (values ?? []).reduce((a, b) => a + b, 0);
     return [
       200,
       {
-        jobs: all.filter((job) => job.queuedAt < before).slice(0, pageSize),
+        jobs: all.filter((job) => job.queuedAt < before && (!group || group(job))).slice(0, pageSize),
         counts: {
-          waiting: open.filter((job) => job.launchState === null || job.launchRetry === "backoff").length + 2,
-          active: open.filter((job) => job.launchState === "launching" || job.launchState === "launched").length + 3,
-          running: open.filter((job) => job.status === "in_progress").length + 3,
-          completedToday: day.filter((job) => job.status === "completed").length + 280,
-          failedToday: day.filter((job) => job.launchState === "failed" && job.launchRetry !== "backoff").length,
+          waiting: all.filter(IN_GROUP.waiting).length,
+          active: all.filter(IN_GROUP.active).length,
+          running: all.filter((job) => IN_GROUP.active(job) && job.status === "in_progress").length,
+          completedToday: activity ? sum(activity.finished) : day.filter((job) => job.status === "completed").length,
+          failedToday: day.filter(IN_GROUP.failed).length,
         },
         region: tenant.aws?.region ?? null,
         pageSize,
+        ...(activity && { activity }),
       },
     ];
   },
@@ -448,14 +456,14 @@ function summarize(windows: ReturnType<typeof sampleWindows>) {
   };
 }
 
-function sampleJobs(now: number) {
+function sampleJobs(now: number): Job[] {
   const minute = 60_000;
   const job = (
     id: number,
     repository: string,
     label: string,
-    status: string,
-    launchState: string | null,
+    status: Job["status"],
+    launchState: Job["launchState"],
     queuedAgo: number,
     took: number,
     launchError: string | null = null,
@@ -503,6 +511,41 @@ function sampleJobs(now: number) {
     job(9119, "acme-corp/web", "hatchrun", "completed", "launched", 41, 312),
     ...done,
   ];
+}
+
+// The same groups as the counts query in crates/cloud/src/app/dashboard.rs.
+const IN_GROUP: Record<"active" | "waiting" | "failed", (job: Job) => boolean> = {
+  active: (job) => job.status !== "completed" && (job.launchState === "launching" || job.launchState === "launched"),
+  waiting: (job) =>
+    job.status === "queued" &&
+    (job.launchState === null || (job.launchState === "failed" && job.launchRetry === "backoff")),
+  failed: (job) => job.launchState === "failed" && !(job.status === "queued" && job.launchRetry === "backoff"),
+};
+
+// A day of 15 minute buckets: the sample jobs plus a busy working day
+// around them, so the strip has a shape.
+function sampleActivity(now: number, day: Job[]) {
+  const bucketMs = 900_000;
+  const since = (Math.floor(now / bucketMs) + 1 - 96) * bucketMs;
+  const finished = Array.from({ length: 96 }, (_, i) => {
+    const hour = new Date(since + i * bucketMs).getHours();
+    const busy = hour >= 8 && hour <= 19 ? 1 : 0.15;
+    return Math.round((2 + 4 * Math.abs(Math.sin(i * 1.7)) + 2 * Math.abs(Math.cos(i * 0.6))) * busy);
+  });
+  const failed = Array.from({ length: 96 }, () => 0);
+  for (const job of day) {
+    const i = Math.floor((job.updatedAt - since) / bucketMs);
+    if (i < 0 || i >= 96) {
+      continue;
+    }
+    if (IN_GROUP.failed(job)) {
+      failed[i] = (failed[i] ?? 0) + 1;
+    }
+    if (job.status === "completed") {
+      finished[i] = (finished[i] ?? 0) + 1;
+    }
+  }
+  return { since, bucketMs, finished, failed };
 }
 
 // A stack from before the version tag, so the dashboard offers the update.
