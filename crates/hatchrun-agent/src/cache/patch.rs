@@ -8,9 +8,12 @@
 //! and container action from the job message, after the step
 //! environment is merged, so nothing a job or the agent sets can win.
 //! Renaming the strings in `bin/Runner.Worker.dll` to `ZCTIONS_*`, which
-//! have the same length, makes the runner set names nobody reads, and
-//! the `ACTIONS_*` names come from the environment the agent starts the
-//! runner with. .NET keeps string literals in UTF-16LE.
+//! have the same length, makes the runner set names nobody reads. The
+//! `ACTIONS_*` names then come from the step environment: the agent's
+//! job-started hook writes them to `$GITHUB_ENV`, which also reaches
+//! container jobs and Docker actions. A job's `env:`, or a later write
+//! to `$GITHUB_ENV`, overrides the agent's value. .NET keeps string
+//! literals in UTF-16LE.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
