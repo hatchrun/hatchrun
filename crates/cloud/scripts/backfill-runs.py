@@ -113,13 +113,15 @@ def sql(value):
 
 def run_jobs(repository, run_id, token):
     """Every job of a run, of every attempt, by id; empty for a run
-    GitHub will not show."""
+    GitHub no longer has. Any other error raises, so no job is deleted
+    because a page went missing."""
     jobs, page = {}, 1
     while True:
         answer = github(
             "GET",
             f"/repos/{repository}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}",
             token,
+            gone=(404, 410) if page == 1 else (),
         )
         listed = (answer or {}).get("jobs", [])
         jobs.update({job["id"]: job for job in listed})
