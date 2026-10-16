@@ -54,10 +54,10 @@ fn login<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<String>, D::E
 ///
 /// # Errors
 ///
-/// A server error or an answer that is not a run; asking again may
-/// work.
+/// A server error, an expired token, a rate limit or an answer that is
+/// not a run; asking again may work.
 pub fn parse(response: &Response) -> Result<Details, String> {
-    if (400..500).contains(&response.status) {
+    if (400..500).contains(&response.status) && !matches!(response.status, 401 | 429) {
         return Ok(Details::default());
     }
     if !response.ok() {
@@ -152,6 +152,8 @@ mod tests {
         assert_eq!(parse(&answer(404, "{}")).unwrap(), Details::default());
         assert_eq!(parse(&answer(403, "{}")).unwrap(), Details::default());
         assert!(parse(&answer(502, "bad gateway")).is_err());
+        assert!(parse(&answer(401, "{}")).is_err());
+        assert!(parse(&answer(429, "{}")).is_err());
         assert!(parse(&answer(200, "[]")).is_err());
     }
 

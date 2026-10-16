@@ -441,7 +441,9 @@ pub(crate) async fn run(ctx: &Ctx<'_>, org: &str, id: &str) -> Answer {
         .map(|job| job.queued_at)
         .min()
         .unwrap_or(run.queued_at);
-    let ids: Vec<u64> = jobs.iter().map(|job| job.id).collect();
+    // Newest attempt first, so a run past the resources cap loses the
+    // numbers of its oldest jobs.
+    let ids: Vec<u64> = jobs.iter().rev().map(|job| job.id).collect();
     // The run page stands without its numbers.
     let resources = match metrics::resources(ctx, installation, &ids, since).await {
         Ok(resources) => Some(resources),

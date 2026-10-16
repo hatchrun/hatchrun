@@ -110,7 +110,7 @@ function RunView({ org, data }: { org: string; data: RunDetail }) {
             value={`${run.repository} ${runRef(run)}`}
           />
           <Destination
-            href={`https://github.com/${run.repository}/commit/${run.headSha}`}
+            href={run.githubUrl.replace(/\/actions\/runs\/\d+$/, `/commit/${run.headSha}`)}
             label="The commit on GitHub, opens github.com"
             icon={<GitHubIcon size={18} className="text-bone" />}
             caption="Commit on GitHub"

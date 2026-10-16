@@ -130,12 +130,13 @@ struct Job {
 }
 
 /// One job of an installation and its run, from D1. Binds the job id
-/// and the installation.
+/// and the installation. A job from before runs were recorded has no
+/// run until the backfill gives it one.
 const JOB: &str = "SELECT jobs.id, jobs.repository, jobs.run_id, jobs.name, jobs.run_attempt, \
     jobs.label, jobs.status, jobs.conclusion, jobs.runner_name, jobs.instance_id, \
     jobs.queued_at, jobs.started_at, jobs.completed_at, jobs.updated_at, \
     runs.workflow_name, runs.run_number \
-    FROM jobs JOIN runs ON runs.id = jobs.run_id \
+    FROM jobs LEFT JOIN runs ON runs.id = jobs.run_id \
     WHERE jobs.id = ?1 AND jobs.installation_id = ?2";
 
 /// Most jobs of a run [`resources`] covers, the largest matrix GitHub
@@ -354,6 +355,14 @@ mod tests {
         assert_eq!(job.updated_at, queued_at + 60_000);
         assert_eq!(job.instance_id.as_deref(), Some("i-0123456789abcdef0"));
         assert!(db.first::<Job>(JOB, &params![7u64, 4u64]).is_none());
+        // A job from before runs were recorded, until the backfill.
+        db.run(
+            "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+             queued_at, updated_at) VALUES (8, 3, 'acme/app', 99, 'hatchrun', 'completed', 1, 2)",
+            &[],
+        );
+        let old: Job = db.first(JOB, &params![8u64, 3u64]).unwrap();
+        assert_eq!((old.workflow_name, old.run_number), (None, None));
     }
 
     fn window(at: f64) -> Window {

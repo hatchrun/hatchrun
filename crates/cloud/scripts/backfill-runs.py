@@ -63,7 +63,8 @@ def app_jwt(app_id, key):
 
 
 def github(method, path, token, scheme="token"):
-    """GitHub's answer as JSON, or None for a 404."""
+    """GitHub's answer as JSON, or None when GitHub will not show it. A
+    rate limit raises, so no job is taken for gone because of one."""
     request = urllib.request.Request(
         API + path,
         method=method,
@@ -78,7 +79,11 @@ def github(method, path, token, scheme="token"):
         with urllib.request.urlopen(request) as response:
             return json.load(response)
     except urllib.error.HTTPError as err:
-        if err.code in (403, 404, 410):
+        limited = err.code == 429 or (
+            err.code == 403
+            and (err.headers.get("X-RateLimit-Remaining") == "0" or err.headers.get("Retry-After"))
+        )
+        if not limited and err.code in (403, 404, 410):
             return None
         raise
 
