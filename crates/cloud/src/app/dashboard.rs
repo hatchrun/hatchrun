@@ -151,10 +151,13 @@ fn counts_query() -> String {
 }
 
 /// The query for the activity buckets. `?2` is the start of the first
-/// bucket. A completed job's `updated_at` is when it finished.
+/// bucket. A completed job's `updated_at` is when it finished. D1 binds
+/// every number as a double, so `?2` is a REAL and the division is
+/// float division; the cast truncates it to the bucket index, which is
+/// the floor since `updated_at >= ?2`.
 fn activity_query() -> String {
     format!(
-        "SELECT (updated_at - ?2) / {BUCKET_MS} AS bucket, \
+        "SELECT CAST((updated_at - ?2) / {BUCKET_MS} AS INTEGER) AS bucket, \
          COUNT(*) FILTER (WHERE status = 'completed') AS finished, \
          COUNT(*) FILTER (WHERE {FAILED}) AS failed \
          FROM jobs WHERE installation_id = ?1 AND updated_at >= ?2 \
@@ -328,6 +331,7 @@ mod tests {
         }
         assert!(list_query(None).contains(" LIMIT ?3"));
         assert!(activity_query().contains("updated_at >= ?2"));
+        assert!(activity_query().starts_with("SELECT CAST((updated_at - ?2) / "));
     }
 
     #[test]
