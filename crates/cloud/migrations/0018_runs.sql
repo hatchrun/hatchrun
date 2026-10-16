@@ -28,14 +28,19 @@ CREATE TABLE runs (
   actor TEXT,
   path TEXT,
   details_at INTEGER,
+  -- When the reconciler last asked, so runs it cannot fetch take turns
+  -- with the rest.
+  details_tried_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 ) STRICT;
 
 CREATE INDEX runs_recent ON runs (installation_id, queued_at, id);
 CREATE INDEX runs_age ON runs (queued_at);
--- Runs the reconciler fetches the details of.
-CREATE INDEX runs_details ON runs (created_at) WHERE details_at IS NULL;
+-- Runs the reconciler fetches the details of, least recently tried
+-- first.
+CREATE INDEX runs_details ON runs (COALESCE(details_tried_at, created_at))
+  WHERE details_at IS NULL;
 
 -- The job's name as the run shows it, such as "Save (host)", and the
 -- run attempt it belongs to. The defaults only let SQLite add the

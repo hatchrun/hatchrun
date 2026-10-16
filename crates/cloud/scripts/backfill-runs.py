@@ -5,16 +5,19 @@
 """Fills in jobs recorded before migration 0018 and gives each its run.
 
 Jobs from before 0018 have no name, attempt or conclusion, and no row in
-`runs`, so the app cannot list them by run. This asks GitHub about each,
-as the App, and writes what it says to D1:
+`runs`, so the app cannot list them by run. This asks GitHub about each
+run, as the App, and writes what it says to D1:
 
     python3 scripts/backfill-runs.py --app-id 123456 --app-key app.pem
 
 Run it once, after the migration and the Worker that writes the new
-columns are deployed. It prints the SQL and asks before running it;
---yes skips the question. Jobs GitHub no longer has (the repository is
-gone or out of the App's reach) cannot be named or linked, and are
-deleted. Needs wrangler signed in to the account and openssl.
+columns are deployed. It asks once before writing (--yes skips the
+question, --dry-run prints the SQL instead) and writes each
+installation's jobs as it finishes them, so a run stopped by an error or
+a rate limit picks up where it left off. Jobs GitHub no longer has (the
+repository is gone, or the App uninstalled) cannot be named or linked,
+and are deleted; a suspended installation is skipped. Needs wrangler
+signed in to the account and openssl.
 """
 
 import argparse
@@ -62,9 +65,17 @@ def app_jwt(app_id, key):
     return f"{header}.{claims}.{b64(signature)}"
 
 
-def github(method, path, token, scheme="token"):
-    """GitHub's answer as JSON, or None when GitHub will not show it. A
-    rate limit raises, so no job is taken for gone because of one."""
+def rate_limited(err):
+    return err.code == 429 or (
+        err.code == 403
+        and (err.headers.get("X-RateLimit-Remaining") == "0" or err.headers.get("Retry-After"))
+    )
+
+
+def github(method, path, token, scheme="token", gone=(403, 404, 410)):
+    """GitHub's answer as JSON, or None when GitHub will not show it: a
+    status in `gone`. A rate limit raises, so no job is taken for gone
+    because of one."""
     request = urllib.request.Request(
         API + path,
         method=method,
@@ -79,11 +90,7 @@ def github(method, path, token, scheme="token"):
         with urllib.request.urlopen(request) as response:
             return json.load(response)
     except urllib.error.HTTPError as err:
-        limited = err.code == 429 or (
-            err.code == 403
-            and (err.headers.get("X-RateLimit-Remaining") == "0" or err.headers.get("Retry-After"))
-        )
-        if not limited and err.code in (403, 404, 410):
+        if not rate_limited(err) and err.code in gone:
             return None
         raise
 
@@ -104,11 +111,93 @@ def sql(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def run_jobs(repository, run_id, token):
+    """Every job of a run, of every attempt, by id; empty for a run
+    GitHub will not show."""
+    jobs, page = {}, 1
+    while True:
+        answer = github(
+            "GET",
+            f"/repos/{repository}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}",
+            token,
+        )
+        listed = (answer or {}).get("jobs", [])
+        jobs.update({job["id"]: job for job in listed})
+        if len(listed) < 100:
+            return jobs
+        page += 1
+
+
+def installation_token(app_id, key, installation):
+    """A token of the installation, None when it is uninstalled. Raises
+    for a suspended one."""
+    # A fresh JWT each time: it lives nine minutes, less than a large
+    # installation can take.
+    path = f"/app/installations/{installation}/access_tokens"
+    answer = github("POST", path, app_jwt(app_id, key), "Bearer", gone=(404,))
+    return (answer or {}).get("token")
+
+
+def statements_for(job_ids, run_id, repository, installation, known, token):
+    """The SQL that names a run's jobs and records the run, and the jobs
+    GitHub no longer has."""
+    statements, gone = [], []
+    seen_jobs = run_jobs(repository, run_id, token) if token else {}
+    for job_id in job_ids:
+        seen = seen_jobs.get(job_id)
+        if not seen:
+            gone.append(job_id)
+            continue
+        statements.append(
+            "UPDATE jobs SET "
+            f"name = {sql(seen['name'])}, run_attempt = {sql(seen.get('run_attempt') or 1)}, "
+            f"conclusion = {sql(seen.get('conclusion') if seen['status'] == 'completed' else None)}, "
+            f"started_at = {sql(ms(seen.get('started_at')) if seen.get('runner_name') else None)}, "
+            f"completed_at = {sql(ms(seen.get('completed_at')) if seen['status'] == 'completed' else None)} "
+            f"WHERE id = {job_id};"
+        )
+    named = [seen_jobs[j] for j in job_ids if j in seen_jobs]
+    if named and run_id not in known:
+        seen = named[0]
+        run = github("GET", f"/repos/{repository}/actions/runs/{run_id}", token) or {}
+        now = int(time.time() * 1000)
+        attempt = f"(SELECT MAX(run_attempt) FROM jobs WHERE run_id = {run_id})"
+        queued_at = (
+            f"(SELECT MIN(queued_at) FROM jobs WHERE run_id = {run_id} AND run_attempt = {attempt})"
+        )
+        statements.append(
+            "INSERT INTO runs (id, installation_id, repository, workflow_name, head_branch, "
+            "head_sha, attempt, queued_at, run_number, event, display_title, actor, path, "
+            "details_at, created_at, updated_at) VALUES ("
+            f"{run_id}, {installation}, {sql(repository)}, "
+            f"{sql(seen.get('workflow_name') or run.get('name'))}, {sql(seen.get('head_branch'))}, "
+            f"{sql(seen['head_sha'])}, {attempt}, {queued_at}, {sql(run.get('run_number'))}, "
+            f"{sql(run.get('event'))}, {sql(run.get('display_title'))}, "
+            f"{sql((run.get('actor') or {}).get('login'))}, {sql(run.get('path'))}, "
+            f"{now}, {now}, {now}) ON CONFLICT (id) DO NOTHING;"
+        )
+    return statements, gone
+
+
+def write(statements, dry_run):
+    if dry_run:
+        print("\n".join(statements))
+        return
+    with tempfile.NamedTemporaryFile("w", suffix=".sql") as file:
+        file.write("\n".join(statements))
+        file.flush()
+        subprocess.run(
+            ["npx", "wrangler", "d1", "execute", DATABASE, "--remote", "--file", file.name],
+            check=True,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--app-id", required=True, help="the App's id or client id")
     parser.add_argument("--app-key", required=True, help="the App's private key, PEM")
-    parser.add_argument("--yes", action="store_true", help="run the SQL without asking")
+    parser.add_argument("--yes", action="store_true", help="write without asking")
+    parser.add_argument("--dry-run", action="store_true", help="print the SQL, write nothing")
     args = parser.parse_args()
 
     jobs = d1(
@@ -118,67 +207,43 @@ def main():
     if not jobs:
         print("nothing to backfill", file=sys.stderr)
         return
+    installations = {}
+    for job in jobs:
+        runs = installations.setdefault(job["installation_id"], {})
+        runs.setdefault((job["repository"], job["run_id"]), []).append(job["id"])
+    question = (
+        f"Backfill {len(jobs)} jobs of {len(installations)} installations "
+        "in the remote database? [y/N] "
+    )
+    if not (args.yes or args.dry_run) and input(question).strip().lower() != "y":
+        return
     known = {row["id"] for row in d1("SELECT id FROM runs")}
 
-    jwt = app_jwt(args.app_id, args.app_key)
-    tokens = {}
-    statements, gone, runs = [], [], {}
-    for job in jobs:
-        installation = job["installation_id"]
-        if installation not in tokens:
-            answer = github("POST", f"/app/installations/{installation}/access_tokens", jwt, "Bearer")
-            tokens[installation] = answer and answer["token"]
-        token = tokens[installation]
-        seen = token and github("GET", f"/repos/{job['repository']}/actions/jobs/{job['id']}", token)
-        if not seen:
-            gone.append(job["id"])
+    for installation, runs in installations.items():
+        try:
+            token = installation_token(args.app_id, args.app_key, installation)
+        except urllib.error.HTTPError as err:
+            if err.code != 403 or rate_limited(err):
+                raise
+            print(
+                f"installation {installation}: skipped, GitHub answered 403 (suspended?)",
+                file=sys.stderr,
+            )
             continue
-        statements.append(
-            "UPDATE jobs SET "
-            f"name = {sql(seen['name'])}, run_attempt = {sql(seen.get('run_attempt') or 1)}, "
-            f"conclusion = {sql(seen.get('conclusion') if seen['status'] == 'completed' else None)}, "
-            f"started_at = {sql(ms(seen.get('started_at')) if seen['status'] != 'queued' else None)}, "
-            f"completed_at = {sql(ms(seen.get('completed_at')) if seen['status'] == 'completed' else None)} "
-            f"WHERE id = {job['id']};"
+        statements, gone = [], []
+        for (repository, run_id), job_ids in runs.items():
+            named, lost = statements_for(job_ids, run_id, repository, installation, known, token)
+            statements += named
+            gone += lost
+        if gone:
+            statements.append(f"DELETE FROM jobs WHERE id IN ({', '.join(map(str, gone))});")
+        count = sum(len(ids) for ids in runs.values())
+        print(
+            f"installation {installation}: {count - len(gone)} jobs named, {len(gone)} deleted",
+            file=sys.stderr,
         )
-        if job["run_id"] not in known and job["run_id"] not in runs:
-            runs[job["run_id"]] = (job, seen, token)
-
-    now = int(time.time() * 1000)
-    for run_id, (job, seen, token) in runs.items():
-        run = github("GET", f"/repos/{job['repository']}/actions/runs/{run_id}", token) or {}
-        attempt = f"(SELECT MAX(run_attempt) FROM jobs WHERE run_id = {run_id})"
-        queued_at = (
-            f"(SELECT MIN(queued_at) FROM jobs WHERE run_id = {run_id} AND run_attempt = {attempt})"
-        )
-        statements.append(
-            "INSERT INTO runs (id, installation_id, repository, workflow_name, head_branch, "
-            "head_sha, attempt, queued_at, run_number, event, display_title, actor, path, "
-            "details_at, created_at, updated_at) VALUES ("
-            f"{run_id}, {job['installation_id']}, {sql(job['repository'])}, "
-            f"{sql(seen.get('workflow_name') or run.get('name'))}, {sql(seen.get('head_branch'))}, "
-            f"{sql(seen['head_sha'])}, {attempt}, {queued_at}, {sql(run.get('run_number'))}, "
-            f"{sql(run.get('event'))}, {sql(run.get('display_title'))}, "
-            f"{sql((run.get('actor') or {}).get('login'))}, {sql(run.get('path'))}, "
-            f"{now}, {now}, {now}) ON CONFLICT (id) DO NOTHING;"
-        )
-    if gone:
-        statements.append(f"DELETE FROM jobs WHERE id IN ({', '.join(map(str, gone))});")
-
-    print("\n".join(statements))
-    print(
-        f"-- {len(jobs) - len(gone)} jobs named, {len(runs)} runs added, {len(gone)} jobs deleted",
-        file=sys.stderr,
-    )
-    if not args.yes and input("Run this against the remote database? [y/N] ").strip().lower() != "y":
-        return
-    with tempfile.NamedTemporaryFile("w", suffix=".sql") as file:
-        file.write("\n".join(statements))
-        file.flush()
-        subprocess.run(
-            ["npx", "wrangler", "d1", "execute", DATABASE, "--remote", "--file", file.name],
-            check=True,
-        )
+        if statements:
+            write(statements, args.dry_run)
 
 
 if __name__ == "__main__":

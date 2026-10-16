@@ -57,7 +57,9 @@ fn login<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<String>, D::E
 /// A server error, an expired token, a rate limit or an answer that is
 /// not a run; asking again may work.
 pub fn parse(response: &Response) -> Result<Details, String> {
-    if (400..500).contains(&response.status) && !matches!(response.status, 401 | 429) {
+    // GitHub answers a rate limit with 403 too, saying so in the body.
+    let limited = response.status == 403 && response.text().contains("rate limit");
+    if (400..500).contains(&response.status) && !matches!(response.status, 401 | 429) && !limited {
         return Ok(Details::default());
     }
     if !response.ok() {
@@ -154,6 +156,13 @@ mod tests {
         assert!(parse(&answer(502, "bad gateway")).is_err());
         assert!(parse(&answer(401, "{}")).is_err());
         assert!(parse(&answer(429, "{}")).is_err());
+        for message in [
+            "API rate limit exceeded for installation ID 42.",
+            "You have exceeded a secondary rate limit.",
+        ] {
+            let body = format!(r#"{{"message":"{message}"}}"#);
+            assert!(parse(&answer(403, &body)).is_err(), "{message}");
+        }
         assert!(parse(&answer(200, "[]")).is_err());
     }
 

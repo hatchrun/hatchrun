@@ -252,8 +252,8 @@ fn counts_query() -> String {
          COUNT(*) FILTER (WHERE status = 'completed' AND updated_at >= ?2) \
            AS completed_today, \
          COUNT(*) FILTER (WHERE updated_at >= ?2 AND ({FAILED})) AS failed_today, \
-         COUNT(DISTINCT run_id) FILTER (WHERE {WAITING}) AS waiting_runs, \
-         COUNT(DISTINCT run_id) FILTER (WHERE {ACTIVE}) AS active_runs, \
+         COUNT(DISTINCT run_id) FILTER (WHERE ({WAITING}) AND {CURRENT}) AS waiting_runs, \
+         COUNT(DISTINCT run_id) FILTER (WHERE ({ACTIVE}) AND {CURRENT}) AS active_runs, \
          COUNT(DISTINCT run_id) FILTER (WHERE updated_at >= ?2 AND ({FAILED}) AND {CURRENT}) \
            AS failed_runs_today \
          FROM jobs AS j WHERE installation_id = ?1 \
@@ -533,7 +533,7 @@ mod tests {
         for group in [Group::Active, Group::Waiting, Group::Failed] {
             let list = list_query(Some(group));
             assert!(list.contains(&format!(" AND {} AND {CURRENT})", group.predicate())));
-            assert!(counts.contains(group.predicate()));
+            assert!(counts.contains(&format!("({}) AND {CURRENT})", group.predicate())));
         }
         let all = list_query(None);
         assert!([ACTIVE, WAITING, FAILED].iter().all(|p| !all.contains(p)));

@@ -348,10 +348,17 @@ const RECORD_CHECK: &str = "UPDATE jobs SET status = ?2, ran_on = COALESCE(?3, r
      completed_at = COALESCE(?8, completed_at) \
      WHERE id = ?1 AND status = ?5";
 
-/// Runs created before `?1` whose details were never fetched, oldest
-/// first, at most `?2`.
+/// Runs without details, not created or tried since `?1`, least
+/// recently tried first, at most `?2`.
 const RUNS_WITHOUT_DETAILS: &str = "SELECT id, installation_id, repository FROM runs \
-     WHERE details_at IS NULL AND created_at < ?1 ORDER BY created_at LIMIT ?2";
+     WHERE details_at IS NULL AND COALESCE(details_tried_at, created_at) < ?1 \
+     ORDER BY COALESCE(details_tried_at, created_at) LIMIT ?2";
+
+/// Stamps the runs of a JSON array `?2` as tried at `?1`, so a run that
+/// keeps failing, such as one of an uninstalled App, does not hold the
+/// others back.
+const DETAILS_TRIED: &str = "UPDATE runs SET details_tried_at = ?1 \
+     WHERE id IN (SELECT value FROM json_each(?2)) AND details_at IS NULL";
 
 /// Tenants with a verified role, least recently reconciled first.
 fn tenants_query() -> String {
@@ -762,6 +769,14 @@ impl Pass<'_> {
         if runs.is_empty() {
             return Ok(done);
         }
+        let ids: Vec<u64> = runs.iter().map(|run| run.id).collect();
+        self.db
+            .prepare(DETAILS_TRIED)
+            .bind(&[int(self.now).map_err(text)?, json(&ids)?])
+            .map_err(text)?
+            .run()
+            .await
+            .map_err(text)?;
         let app_jwt = self.app_jwt().await?;
         let mut by_installation: BTreeMap<u64, Vec<RunWithoutDetails>> = BTreeMap::new();
         for run in runs {
@@ -1809,6 +1824,18 @@ mod tests {
             ],
         );
         assert_eq!(due(&db), [3]);
+        // Tried and failed: it waits its turn behind the others.
+        assert_eq!(db.run(DETAILS_TRIED, &params![NOW, "[3]"]), 1);
+        assert_eq!(due(&db), Vec::<u64>::new());
+        let later: Vec<u64> = db
+            .all::<RunWithoutDetails>(
+                RUNS_WITHOUT_DETAILS,
+                &params![NOW + DETAILS_AFTER + 1, DETAILS_PER_PASS],
+            )
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        assert_eq!(later, [2, 3]);
     }
 
     #[test]
