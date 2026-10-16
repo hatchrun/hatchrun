@@ -529,7 +529,10 @@ within 5 seconds, the agent renames `ACTIONS_CACHE_URL`,
 `ACTIONS_RESULTS_URL` and `ACTIONS_CACHE_SERVICE_V2` in the runner's
 `bin/Runner.Worker.dll` to `ZCTIONS_*`, and starts the runner with
 `ACTIONS_RESULTS_URL` pointing at the proxy and
-`ACTIONS_CACHE_SERVICE_V2=true`. Each name must occur exactly once in
+`ACTIONS_CACHE_SERVICE_V2=true`. A job-started hook
+(`ACTIONS_RUNNER_HOOK_JOB_STARTED`) writes both to `$GITHUB_ENV`, so
+container jobs and Docker actions get them too. A job's `env:` can
+override them. Each name must occur exactly once in
 the worker, or it is left alone. When anything fails, the runner starts
 stock and the job uses GitHub's cache. A lookup that fails answers a
 miss; a save that fails is a warning in the job.
