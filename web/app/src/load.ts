@@ -32,3 +32,13 @@ export function useLoad<T>(load: () => Promise<T>, key: string): [Loaded<T>, () 
   const reload = useCallback(() => setRound((n) => n + 1), []);
   return [result, reload];
 }
+
+/** The time in Unix milliseconds, read again every `every` milliseconds. */
+export function useNow(every: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), every);
+    return () => window.clearInterval(timer);
+  }, [every]);
+  return now;
+}

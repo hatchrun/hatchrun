@@ -233,6 +233,8 @@ export interface Job {
 export interface JobCounts {
   waiting: number;
   active: number;
+  /** Of the active ones, those GitHub has handed a job; the rest are booting. */
+  running?: number;
   completedToday: number;
   failedToday: number;
 }
@@ -284,6 +286,8 @@ export interface MetricsSummary {
 export interface JobMetrics {
   /** The job on GitHub, with its logs. */
   githubUrl: string;
+  /** The tenant's region, for the instance's console page; null when AWS is not connected. */
+  region?: string | null;
   job: Pick<Job, "id" | "repository" | "runId" | "label" | "status" | "runnerName" | "instanceId" | "queuedAt" | "updatedAt">;
   /** null when the runner reported nothing. */
   summary: MetricsSummary | null;

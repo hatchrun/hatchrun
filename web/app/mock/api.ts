@@ -228,14 +228,24 @@ const routes: Record<string, Handler> = {
       return [404, { error: "no organization here" }];
     }
     const now = Date.now();
-    const jobs = sampleJobs(now);
+    const all = sampleJobs(now);
+    const before = Number(url.searchParams.get("before")) || Infinity;
+    const pageSize = 12;
+    const open = all.filter((job) => job.status !== "completed");
+    const day = all.filter((job) => job.updatedAt >= now - 86_400_000);
     return [
       200,
       {
-        jobs: url.searchParams.has("before") ? [] : jobs,
-        counts: { waiting: 1, active: 2, completedToday: 37, failedToday: 1 },
+        jobs: all.filter((job) => job.queuedAt < before).slice(0, pageSize),
+        counts: {
+          waiting: open.filter((job) => job.launchState === null || job.launchRetry === "backoff").length + 2,
+          active: open.filter((job) => job.launchState === "launching" || job.launchState === "launched").length + 3,
+          running: open.filter((job) => job.status === "in_progress").length + 3,
+          completedToday: day.filter((job) => job.status === "completed").length + 280,
+          failedToday: day.filter((job) => job.launchState === "failed" && job.launchRetry !== "backoff").length,
+        },
         region: tenant.aws?.region ?? null,
-        pageSize: 5,
+        pageSize,
       },
     ];
   },
@@ -246,12 +256,16 @@ const routes: Record<string, Handler> = {
     if (!tenant || !job) {
       return [404, { error: `no job ${id} here` }];
     }
-    const windows = job.launchState === "launched" ? sampleWindows(job.queuedAt) : [];
+    const windows =
+      job.launchState === "launched"
+        ? sampleWindows(job.queuedAt).filter((w) => w.at * 1000 <= Date.now())
+        : [];
     return [
       200,
       {
         githubUrl: `https://github.com/${job.repository}/actions/runs/${job.runId}/job/${job.id}`,
         job,
+        region: tenant.aws?.region ?? null,
         summary: windows.length === 0 ? null : summarize(windows),
         windows,
       },
@@ -313,7 +327,7 @@ function adopt(installationId: number): MockTenant | null {
       org,
       installationId: null,
       aws: null,
-      maxRunners: 10,
+      maxRunners: 40,
       allowedRegions: null,
       beta: false,
       subscription: null,
@@ -452,12 +466,12 @@ function sampleJobs(now: number) {
   ) => ({
     id,
     repository,
-    runId: id * 7,
+    runId: 11582000000 + id * 13,
     label,
     status,
     launchState,
     runnerName: launchState ? `hatchrun-${id}-ab12cd34` : null,
-    instanceId: launchState === "launched" ? `i-0${id.toString(16)}f00ba4` : null,
+    instanceId: launchState === "launched" ? `i-0${(id * 2654435761).toString(16).padStart(16, "0").slice(-16)}` : null,
     launchError,
     launchAttempts: retry.attempts,
     launchRetry: retry.wait,
@@ -465,19 +479,29 @@ function sampleJobs(now: number) {
     queuedAt: now - queuedAgo * minute,
     updatedAt: now - queuedAgo * minute + took * 1000,
   });
+  const repos = ["acme-corp/api", "acme-corp/web", "acme-corp/infra", "acme-corp/mobile", "acme-corp/data"];
+  const labels = ["hatchrun-4cpu-arm64", "hatchrun-2cpu", "hatchrun-8cpu-arm64", "hatchrun/disk=100", "hatchrun-16cpu"];
+  // Finished jobs going back two days, a few minutes apart.
+  const done = Array.from({ length: 70 }, (_, i) =>
+    job(9118 - i, repos[i % repos.length] ?? "", labels[(i * 3) % labels.length] ?? "", "completed", "launched",
+      45 + i * 37, 150 + ((i * 97) % 600)),
+  );
   return [
-    job(9123, "acme-corp/api", "hatchrun-8cpu-arm64", "queued", null, 0.2, 0),
-    job(9124, "acme-corp/api", "hatchrun-4cpu-arm64", "queued", "failed", 1, 0,
+    job(9127, "acme-corp/infra", "hatchrun", "queued", null, 0.1, 0),
+    job(9126, "acme-corp/api", "hatchrun-8cpu-arm64", "queued", "launching", 0.3, 0),
+    job(9123, "acme-corp/web", "hatchrun-2cpu", "queued", "launched", 0.8, 0),
+    job(9124, "acme-corp/mobile", "hatchrun-16cpu", "queued", "failed", 1, 0,
       "no capacity for c7g.xlarge, m7g.xlarge in any subnet: InsufficientInstanceCapacity: We currently do not have sufficient capacity in the Availability Zone you requested.",
       { attempts: 3, wait: "backoff", inMinutes: 2 }),
-    job(9125, "acme-corp/web", "hatchrun", "queued", "failed", 2, 0,
-      "AssumeRoleWithWebIdentity: AccessDenied: Not authorized to perform sts:AssumeRoleWithWebIdentity",
+    job(9125, "acme-corp/data", "hatchrun-8cpu/spot=true", "queued", "failed", 2, 0,
+      "OptInRequired: subscribe this account to the hatchrun runner images in AWS Marketplace",
       { attempts: 1, wait: "setup" }),
-    job(9122, "acme-corp/web", "hatchrun", "in_progress", "launched", 3, 0),
-    job(9121, "acme-corp/api", "hatchrun-8cpu-arm64/spot=true", "in_progress", "launched", 6, 0),
+    job(9122, "acme-corp/api", "hatchrun-4cpu-arm64", "in_progress", "launched", 5, 0),
+    job(9121, "acme-corp/api", "hatchrun-8cpu-arm64/spot=true", "in_progress", "launched", 9, 0),
     job(9120, "acme-corp/infra", "hatchrun-16cpu/disk=300", "completed", "failed", 22, 4,
       "hatchrun-16cpu asks for a 300 GiB root volume and the connect stack allows at most 200 GiB. Raise VolumeSizeLimit on the stack or ask for less."),
     job(9119, "acme-corp/web", "hatchrun", "completed", "launched", 41, 312),
+    ...done,
   ];
 }
 

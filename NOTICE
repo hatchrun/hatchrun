@@ -7,3 +7,6 @@ The hatchrun name, logo, icons and the Pip character are trademarks of
 Gamunu Balagalla. The files under web/app/public/brand/ and the web app
 favicons are not covered by the Apache License; see
 LICENSES/LicenseRef-hatchrun-Proprietary.txt.
+
+The components in web/app/src/components/ui/ come from shadcn/ui,
+Copyright 2023 shadcn, under the MIT License; see LICENSES/MIT.txt.
