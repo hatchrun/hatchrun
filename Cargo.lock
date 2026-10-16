@@ -1289,6 +1289,7 @@ dependencies = [
  "bytes",
  "clap",
  "flate2",
+ "getrandom 0.4.3",
  "http-body-util",
  "httpdate",
  "humantime",
