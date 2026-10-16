@@ -54,6 +54,8 @@ struct Counts {
     waiting: u32,
     /// Runners launching or running.
     active: u32,
+    /// Of the active ones, those running a job; the rest are booting.
+    running: u32,
     /// Finished in the last day.
     completed_today: u32,
     /// Launches that failed in the last day and are not tried again
@@ -104,6 +106,8 @@ pub(crate) async fn jobs(ctx: &Ctx<'_>, org: &str, req: &Request) -> Answer {
                OR (launch_state = 'failed' AND launch_retry = 'backoff'))) AS waiting, \
              COUNT(*) FILTER (WHERE status <> 'completed' \
                AND launch_state IN ('launching', 'launched')) AS active, \
+             COUNT(*) FILTER (WHERE status = 'in_progress' \
+               AND launch_state IN ('launching', 'launched')) AS running, \
              COUNT(*) FILTER (WHERE status = 'completed' AND updated_at >= ?2) \
                AS completed_today, \
              COUNT(*) FILTER (WHERE launch_state = 'failed' AND updated_at >= ?2 \
