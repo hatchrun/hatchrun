@@ -120,6 +120,29 @@ struct SessionRow {
     github_token: String,
 }
 
+/// The user of a session that has not expired. Binds the session key
+/// and the time in milliseconds.
+const FIND_SESSION: &str = "SELECT users.id, users.login, users.name, users.avatar_url, \
+    sessions.github_token FROM sessions JOIN users ON users.id = sessions.user_id \
+    WHERE sessions.key = ?1 AND sessions.expires_at > ?2";
+
+/// Ends a session, by its key.
+const END_SESSION: &str = "DELETE FROM sessions WHERE key = ?1";
+
+/// Writes a user who signed in. Binds the GitHub user id, login, name
+/// or NULL, avatar URL and the time in milliseconds.
+const UPSERT_USER: &str = "INSERT INTO users (id, login, name, avatar_url, created_at, updated_at) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+    ON CONFLICT (id) DO UPDATE SET login = ?2, name = ?3, avatar_url = ?4, updated_at = ?5";
+
+/// Starts a session. Binds the key, user id, sealed token, the time and
+/// when it expires, both in milliseconds.
+const START_SESSION: &str = "INSERT INTO sessions (key, user_id, github_token, created_at, \
+    expires_at) VALUES (?1, ?2, ?3, ?4, ?5)";
+
+/// Sweeps sessions that expired before the time in milliseconds.
+const SWEEP_SESSIONS: &str = "DELETE FROM sessions WHERE expires_at < ?1";
+
 /// The session a request's cookie names, while it lasts.
 pub(crate) struct Session {
     /// The session id from the cookie.
@@ -138,11 +161,7 @@ impl Session {
             return Ok(None);
         };
         let row: Option<SessionRow> = db
-            .prepare(
-                "SELECT users.id, users.login, users.name, users.avatar_url, sessions.github_token \
-                 FROM sessions JOIN users ON users.id = sessions.user_id \
-                 WHERE sessions.key = ?1 AND sessions.expires_at > ?2",
-            )
+            .prepare(FIND_SESSION)
             .bind(&[session::key(&id).into(), int(now_ms())?])?
             .first(None)
             .await?;
@@ -196,7 +215,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             if !current.csrf_ok(&req)? {
                 return json_error("bad CSRF token", 403);
             }
-            db.prepare("DELETE FROM sessions WHERE key = ?1")
+            db.prepare(END_SESSION)
                 .bind(&[session::key(&current.id).into()])?
                 .run()
                 .await?;
@@ -434,23 +453,14 @@ async fn store_session(
 ) -> Result<()> {
     let now_value = int(now)?;
     db.batch(vec![
-        db.prepare(
-            "INSERT INTO users (id, login, name, avatar_url, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
-             ON CONFLICT (id) DO UPDATE SET login = ?2, name = ?3, avatar_url = ?4, updated_at = ?5",
-        )
-        .bind(&[
+        db.prepare(UPSERT_USER).bind(&[
             int(user.id)?,
             user.login.as_str().into(),
             user.name.as_deref().map_or(JsValue::NULL, Into::into),
             user.avatar_url.as_str().into(),
             now_value.clone(),
         ])?,
-        db.prepare(
-            "INSERT INTO sessions (key, user_id, github_token, created_at, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .bind(&[
+        db.prepare(START_SESSION).bind(&[
             session::key(id).into(),
             int(user.id)?,
             sealed.into(),
@@ -458,8 +468,7 @@ async fn store_session(
             int(now + max_age * 1000)?,
         ])?,
         // Sign-ins are rare enough to sweep expired sessions here.
-        db.prepare("DELETE FROM sessions WHERE expires_at < ?1")
-            .bind(&[now_value])?,
+        db.prepare(SWEEP_SESSIONS).bind(&[now_value])?,
     ])
     .await?;
     Ok(())
@@ -482,4 +491,77 @@ pub(crate) fn found(url: &str, cookies: &[&str]) -> Result<Response> {
 
 pub(crate) fn json_error(message: &str, status: u16) -> Result<Response> {
     Ok(Response::from_json(&serde_json::json!({ "error": message }))?.with_status(status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdb::{Db, Param, params};
+
+    const NOW: u64 = 1_792_140_000_000;
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+
+    /// The statements [`store_session`] batches for a sign-in.
+    fn sign_in(
+        id: u64,
+        login: &str,
+        name: Option<&str>,
+        key: &str,
+        now: u64,
+    ) -> Vec<(&'static str, Vec<Param>)> {
+        vec![
+            (
+                UPSERT_USER,
+                params![id, login, name, "https://avatars.example/u", now],
+            ),
+            (
+                START_SESSION,
+                params![key, id, "sealed", now, now + SESSION_MAX_AGE * 1000],
+            ),
+            (SWEEP_SESSIONS, params![now]),
+        ]
+    }
+
+    fn find(db: &Db, key: &str, now: u64) -> Option<SessionRow> {
+        db.first(FIND_SESSION, &params![key, now])
+    }
+
+    #[test]
+    fn a_sign_in_starts_a_session() {
+        let db = Db::new();
+        db.batch(&sign_in(42, "octo", Some("Octo Cat"), "k1", NOW))
+            .unwrap();
+        let row = find(&db, "k1", NOW + 1).unwrap();
+        assert_eq!(row.id, 42);
+        assert_eq!(row.login, "octo");
+        assert_eq!(row.name.as_deref(), Some("Octo Cat"));
+        assert_eq!(row.avatar_url, "https://avatars.example/u");
+        assert_eq!(row.github_token, "sealed");
+        assert!(find(&db, "k2", NOW + 1).is_none());
+        assert!(find(&db, "k1", NOW + SESSION_MAX_AGE * 1000).is_none());
+    }
+
+    #[test]
+    fn signing_in_again_updates_the_user_and_sweeps_old_sessions() {
+        let db = Db::new();
+        db.batch(&sign_in(42, "octo", Some("Octo Cat"), "k1", NOW))
+            .unwrap();
+        let later = NOW + 8 * DAY;
+        db.batch(&sign_in(42, "octocat", None, "k2", later))
+            .unwrap();
+        let row = find(&db, "k2", later).unwrap();
+        assert_eq!(row.login, "octocat");
+        assert_eq!(row.name, None);
+        let keys = db.rows("SELECT key FROM sessions", &[]).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["key"], "k2");
+    }
+
+    #[test]
+    fn signing_out_ends_the_session() {
+        let db = Db::new();
+        db.batch(&sign_in(42, "octo", None, "k1", NOW)).unwrap();
+        assert_eq!(db.run(END_SESSION, &params!["k1"]), 1);
+        assert!(find(&db, "k1", NOW).is_none());
+    }
 }

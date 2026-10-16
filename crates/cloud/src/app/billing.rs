@@ -80,15 +80,15 @@ struct SubscriptionRow {
     cancel_at_period_end: u8,
 }
 
+/// The tenant's licensed subscription if there is one, else its latest.
+const SUBSCRIPTION: &str = "SELECT status, current_period_end, cancel_at_period_end \
+    FROM subscriptions WHERE tenant_id = ?1 \
+    ORDER BY status IN ('active', 'trialing') DESC, modified_at DESC LIMIT 1";
+
 /// The licence of tenant `id`, which is in the beta when `beta`.
 pub(crate) async fn billing(db: &D1Database, id: &str, beta: bool) -> Result<Billing> {
-    // The licensed subscription if there is one, else the latest.
     let row: Option<SubscriptionRow> = db
-        .prepare(
-            "SELECT status, current_period_end, cancel_at_period_end FROM subscriptions \
-             WHERE tenant_id = ?1 \
-             ORDER BY status IN ('active', 'trialing') DESC, modified_at DESC LIMIT 1",
-        )
+        .prepare(SUBSCRIPTION)
         .bind(&[id.into()])?
         .first(None)
         .await?;
@@ -107,14 +107,17 @@ pub(crate) async fn billing(db: &D1Database, id: &str, beta: bool) -> Result<Bil
     })
 }
 
+/// Puts a tenant in the beta when its organization is in `beta_orgs`.
+/// Binds the tenant and the time in milliseconds.
+const JOIN_LISTED_BETA: &str = "UPDATE tenants SET beta = 1, updated_at = ?2 \
+    WHERE id = ?1 AND beta = 0 \
+    AND EXISTS (SELECT 1 FROM beta_orgs WHERE beta_orgs.org_login = tenants.org_login)";
+
 /// Puts the tenant in the beta when the operator listed its
 /// organization.
 pub(crate) async fn join_listed_beta(db: &D1Database, id: &str) -> Result<()> {
     let joined = db
-        .prepare(
-            "UPDATE tenants SET beta = 1, updated_at = ?2 WHERE id = ?1 AND beta = 0 \
-             AND EXISTS (SELECT 1 FROM beta_orgs WHERE beta_orgs.org_login = tenants.org_login)",
-        )
+        .prepare(JOIN_LISTED_BETA)
         .bind(&[id.into(), int(now_ms())?])?
         .run()
         .await?;
@@ -185,6 +188,14 @@ pub(crate) async fn portal(ctx: &Ctx<'_>, org: &str) -> Answer {
     Ok(Response::from_json(&serde_json::json!({ "url": url }))?)
 }
 
+/// Uses up one use of an invite code, by its hash.
+const USE_INVITE: &str =
+    "UPDATE invites SET uses_left = uses_left - 1 WHERE code_hash = ?1 AND uses_left > 0";
+
+/// Puts a tenant in the beta. Binds the tenant and the time in
+/// milliseconds.
+const JOIN_BETA: &str = "UPDATE tenants SET beta = 1, updated_at = ?2 WHERE id = ?1";
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct Redeem {
     code: String,
@@ -203,9 +214,7 @@ pub(crate) async fn redeem(ctx: &Ctx<'_>, org: &str, body: Redeem) -> Answer {
     let hash = session::hex(&sha256(code.as_bytes()));
     let used = ctx
         .db
-        .prepare(
-            "UPDATE invites SET uses_left = uses_left - 1 WHERE code_hash = ?1 AND uses_left > 0",
-        )
+        .prepare(USE_INVITE)
         .bind(&[hash.into()])?
         .run()
         .await?;
@@ -216,7 +225,7 @@ pub(crate) async fn redeem(ctx: &Ctx<'_>, org: &str, body: Redeem) -> Answer {
         ));
     }
     ctx.db
-        .prepare("UPDATE tenants SET beta = 1, updated_at = ?2 WHERE id = ?1")
+        .prepare(JOIN_BETA)
         .bind(&[row.id.as_str().into(), int(now_ms())?])?
         .run()
         .await?;
@@ -229,6 +238,20 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).to_vec()
 }
+
+/// Writes a subscription of an existing tenant, unless the row holds a
+/// newer delivery. Binds the subscription id, tenant, status, customer,
+/// product, period end or NULL, cancel at period end as 0 or 1,
+/// Polar's modified time and the time in milliseconds.
+const UPSERT_SUBSCRIPTION: &str = "INSERT INTO subscriptions (id, tenant_id, status, \
+    customer_id, product_id, current_period_end, cancel_at_period_end, modified_at, updated_at) \
+    SELECT ?1, id, ?3, ?4, ?5, ?6, ?7, ?8, ?9 FROM tenants WHERE id = ?2 \
+    ON CONFLICT (id) DO UPDATE SET status = excluded.status, \
+    customer_id = excluded.customer_id, product_id = excluded.product_id, \
+    current_period_end = excluded.current_period_end, \
+    cancel_at_period_end = excluded.cancel_at_period_end, \
+    modified_at = excluded.modified_at, updated_at = excluded.updated_at \
+    WHERE excluded.modified_at >= subscriptions.modified_at";
 
 /// `POST /api/polar/webhook`: no session, the signature is the
 /// authentication.
@@ -259,17 +282,7 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
     };
     let db = env.d1(crate::DB)?;
     let result = db
-        .prepare(
-            "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             current_period_end, cancel_at_period_end, modified_at, updated_at) \
-             SELECT ?1, id, ?3, ?4, ?5, ?6, ?7, ?8, ?9 FROM tenants WHERE id = ?2 \
-             ON CONFLICT (id) DO UPDATE SET status = excluded.status, \
-             customer_id = excluded.customer_id, product_id = excluded.product_id, \
-             current_period_end = excluded.current_period_end, \
-             cancel_at_period_end = excluded.cancel_at_period_end, \
-             modified_at = excluded.modified_at, updated_at = excluded.updated_at \
-             WHERE excluded.modified_at >= subscriptions.modified_at",
-        )
+        .prepare(UPSERT_SUBSCRIPTION)
         .bind(&[
             subscription.id.as_str().into(),
             subscription.tenant.as_str().into(),
@@ -296,4 +309,176 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
         crate::launch::recheck(&db, &subscription.tenant).await?;
     }
     Ok(Response::empty()?.with_status(202))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdb::{Db, Param, params};
+
+    const NOW: u64 = 1_792_140_000_000;
+
+    fn tenant(db: &Db, id: &str, org_id: u64, login: &str) {
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            &params![id, org_id, login, NOW],
+        );
+    }
+
+    /// The values the webhook binds for one delivery.
+    fn delivery(
+        id: &str,
+        tenant: &str,
+        status: &str,
+        period_end: Option<&str>,
+        cancel: bool,
+        modified_at: &str,
+    ) -> Vec<Param> {
+        params![
+            id,
+            tenant,
+            status,
+            "cus_1",
+            "prod_1",
+            period_end,
+            u32::from(u8::from(cancel)),
+            modified_at,
+            NOW,
+        ]
+    }
+
+    fn subscription(db: &Db, tenant: &str) -> Option<SubscriptionRow> {
+        db.first(SUBSCRIPTION, &params![tenant])
+    }
+
+    #[test]
+    fn a_delivery_writes_the_subscription() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        let changed = db.run(
+            UPSERT_SUBSCRIPTION,
+            &delivery(
+                "sub_1",
+                "t1",
+                "active",
+                Some("2026-11-16T00:00:00Z"),
+                true,
+                "2026-10-16T10:00:00Z",
+            ),
+        );
+        assert_eq!(changed, 1);
+        let row = subscription(&db, "t1").unwrap();
+        assert_eq!(row.status, "active");
+        assert_eq!(
+            row.current_period_end.as_deref(),
+            Some("2026-11-16T00:00:00Z")
+        );
+        assert_eq!(row.cancel_at_period_end, 1);
+        assert!(subscription(&db, "t2").is_none());
+    }
+
+    #[test]
+    fn an_older_delivery_changes_nothing() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        let newer = delivery(
+            "sub_1",
+            "t1",
+            "canceled",
+            None,
+            false,
+            "2026-10-16T11:00:00Z",
+        );
+        let older = delivery("sub_1", "t1", "active", None, false, "2026-10-16T10:00:00Z");
+        assert_eq!(db.run(UPSERT_SUBSCRIPTION, &newer), 1);
+        assert_eq!(db.run(UPSERT_SUBSCRIPTION, &older), 0);
+        let row = subscription(&db, "t1").unwrap();
+        assert_eq!(row.status, "canceled");
+        assert_eq!(row.current_period_end, None);
+        assert_eq!(row.cancel_at_period_end, 0);
+    }
+
+    #[test]
+    fn a_delivery_for_no_tenant_changes_nothing() {
+        let db = Db::new();
+        let changed = db.run(
+            UPSERT_SUBSCRIPTION,
+            &delivery(
+                "sub_1",
+                "gone",
+                "active",
+                None,
+                false,
+                "2026-10-16T10:00:00Z",
+            ),
+        );
+        assert_eq!(changed, 0);
+    }
+
+    #[test]
+    fn the_licensed_subscription_comes_first() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        for (id, status, modified_at) in [
+            ("sub_1", "active", "2026-10-01T00:00:00Z"),
+            ("sub_2", "canceled", "2026-10-02T00:00:00Z"),
+        ] {
+            db.run(
+                UPSERT_SUBSCRIPTION,
+                &delivery(id, "t1", status, None, false, modified_at),
+            );
+        }
+        assert_eq!(subscription(&db, "t1").unwrap().status, "active");
+        db.run(
+            UPSERT_SUBSCRIPTION,
+            &delivery(
+                "sub_1",
+                "t1",
+                "revoked",
+                None,
+                false,
+                "2026-10-03T00:00:00Z",
+            ),
+        );
+        assert_eq!(subscription(&db, "t1").unwrap().status, "revoked");
+    }
+
+    fn beta(db: &Db, id: &str) -> serde_json::Value {
+        db.rows("SELECT beta FROM tenants WHERE id = ?1", &params![id])
+            .unwrap()[0]["beta"]
+            .clone()
+    }
+
+    #[test]
+    fn a_listed_organization_joins_the_beta_once() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "Acme");
+        tenant(&db, "t2", 12, "other");
+        db.run(
+            "INSERT INTO beta_orgs (org_login, created_at) VALUES (?1, ?2)",
+            &params!["acme", NOW],
+        );
+        assert_eq!(db.run(JOIN_LISTED_BETA, &params!["t1", NOW]), 1);
+        assert_eq!(db.run(JOIN_LISTED_BETA, &params!["t1", NOW]), 0);
+        assert_eq!(db.run(JOIN_LISTED_BETA, &params!["t2", NOW]), 0);
+        assert_eq!(beta(&db, "t1"), 1);
+        assert_eq!(beta(&db, "t2"), 0);
+    }
+
+    #[test]
+    fn an_invite_code_runs_out() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        let hash = session::hex(&sha256(b"code"));
+        db.run(
+            "INSERT INTO invites (code_hash, uses_left, created_at) VALUES (?1, ?2, ?3)",
+            &params![hash.as_str(), 1u64, NOW],
+        );
+        assert_eq!(db.run(USE_INVITE, &params![hash.clone()]), 1);
+        assert_eq!(db.run(USE_INVITE, &params![hash]), 0);
+        assert_eq!(db.run(USE_INVITE, &params!["unknown"]), 0);
+        assert_eq!(db.run(JOIN_BETA, &params!["t1", NOW]), 1);
+        assert_eq!(beta(&db, "t1"), 1);
+    }
 }

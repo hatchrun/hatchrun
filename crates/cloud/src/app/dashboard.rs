@@ -151,10 +151,13 @@ fn counts_query() -> String {
 }
 
 /// The query for the activity buckets. `?2` is the start of the first
-/// bucket. A completed job's `updated_at` is when it finished.
+/// bucket. A completed job's `updated_at` is when it finished. D1 binds
+/// every number as a double, so `?2` is a REAL and the division is
+/// float division; the cast truncates it to the bucket index, which is
+/// the floor since `updated_at >= ?2`.
 fn activity_query() -> String {
     format!(
-        "SELECT (updated_at - ?2) / {BUCKET_MS} AS bucket, \
+        "SELECT CAST((updated_at - ?2) / {BUCKET_MS} AS INTEGER) AS bucket, \
          COUNT(*) FILTER (WHERE status = 'completed') AS finished, \
          COUNT(*) FILTER (WHERE {FAILED}) AS failed \
          FROM jobs WHERE installation_id = ?1 AND updated_at >= ?2 \
@@ -241,6 +244,10 @@ pub(crate) async fn jobs(ctx: &Ctx<'_>, org: &str, req: &Request) -> Answer {
     Ok(Response::from_json(&body)?)
 }
 
+/// Changes a tenant's settings.
+const SET_SETTINGS: &str = "UPDATE tenants SET max_runners = ?2, allowed_regions = ?3, \
+     updated_at = ?4 WHERE id = ?1";
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Change {
@@ -268,10 +275,7 @@ pub(crate) async fn settings(ctx: &Ctx<'_>, org: &str, body: Change) -> Answer {
         ));
     }
     ctx.db
-        .prepare(
-            "UPDATE tenants SET max_runners = ?2, allowed_regions = ?3, updated_at = ?4 \
-             WHERE id = ?1",
-        )
+        .prepare(SET_SETTINGS)
         .bind(&[
             row.id.as_str().into(),
             checked.max_runners.into(),
@@ -287,6 +291,7 @@ pub(crate) async fn settings(ctx: &Ctx<'_>, org: &str, body: Change) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdb::{Db, params};
 
     #[test]
     fn status_names_a_group() {
@@ -328,6 +333,239 @@ mod tests {
         }
         assert!(list_query(None).contains(" LIMIT ?3"));
         assert!(activity_query().contains("updated_at >= ?2"));
+    }
+
+    /// A job as the webhook and the launch leave it.
+    struct Seed {
+        id: u64,
+        status: &'static str,
+        launch_state: Option<&'static str>,
+        launch_retry: Option<&'static str>,
+        queued_at: u64,
+        updated_at: u64,
+    }
+
+    const INSTALLATION: u64 = 7;
+    const NOW: u64 = 1_792_140_000_000 + 7 * 60 * 1000;
+
+    fn seed(db: &Db, jobs: &[Seed]) {
+        for job in jobs {
+            db.run(
+                "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+                 launch_state, runner_name, instance_id, launch_error, launch_attempts, \
+                 launch_retry, next_launch_at, queued_at, updated_at) \
+                 VALUES (?1, ?2, 'acme/web', ?3, 'hatchrun', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                &params![
+                    job.id,
+                    INSTALLATION,
+                    job.id * 10,
+                    job.status,
+                    job.launch_state,
+                    job.launch_state.map(|_| format!("hatchrun-{}", job.id)),
+                    (job.launch_state == Some("launched")).then_some("i-0abc"),
+                    (job.launch_state == Some("failed")).then_some("no capacity"),
+                    u32::from(job.launch_state.is_some()),
+                    job.launch_retry,
+                    job.launch_retry.map(|_| job.updated_at + 60_000),
+                    job.queued_at,
+                    job.updated_at,
+                ],
+            );
+        }
+    }
+
+    /// One job of each kind the dashboard tells apart, plus one of
+    /// another installation, at times that do not fall on a bucket edge.
+    fn jobs() -> Db {
+        let db = Db::new();
+        let ago = |minutes: u64| NOW - minutes * 60 * 1000 - 123;
+        seed(
+            &db,
+            &[
+                Seed {
+                    id: 1,
+                    status: "queued",
+                    launch_state: None,
+                    launch_retry: None,
+                    queued_at: ago(3),
+                    updated_at: ago(3),
+                },
+                Seed {
+                    id: 2,
+                    status: "queued",
+                    launch_state: Some("launching"),
+                    launch_retry: None,
+                    queued_at: ago(5),
+                    updated_at: ago(4),
+                },
+                Seed {
+                    id: 3,
+                    status: "in_progress",
+                    launch_state: Some("launched"),
+                    launch_retry: None,
+                    queued_at: ago(20),
+                    updated_at: ago(10),
+                },
+                Seed {
+                    id: 4,
+                    status: "completed",
+                    launch_state: Some("launched"),
+                    launch_retry: None,
+                    queued_at: ago(90),
+                    updated_at: ago(61),
+                },
+                Seed {
+                    id: 5,
+                    status: "queued",
+                    launch_state: Some("failed"),
+                    launch_retry: Some("backoff"),
+                    queued_at: ago(30),
+                    updated_at: ago(29),
+                },
+                Seed {
+                    id: 6,
+                    status: "queued",
+                    launch_state: Some("failed"),
+                    launch_retry: Some("setup"),
+                    queued_at: ago(40),
+                    updated_at: ago(38),
+                },
+                Seed {
+                    id: 7,
+                    status: "completed",
+                    launch_state: Some("launched"),
+                    launch_retry: None,
+                    queued_at: ago(3000),
+                    updated_at: ago(2990),
+                },
+            ],
+        );
+        db.run(
+            "UPDATE jobs SET installation_id = ?1 WHERE id = 7",
+            &params![INSTALLATION + 1],
+        );
+        seed(
+            &db,
+            &[Seed {
+                id: 8,
+                status: "completed",
+                launch_state: Some("launched"),
+                launch_retry: None,
+                queued_at: ago(3000),
+                updated_at: ago(2990),
+            }],
+        );
+        db
+    }
+
+    fn ids(jobs: &[Job]) -> Vec<u64> {
+        jobs.iter().map(|job| job.id).collect()
+    }
+
+    #[test]
+    fn the_list_reads_into_jobs() {
+        let db = jobs();
+        let all: Vec<Job> = db.all(&list_query(None), &params![INSTALLATION, None::<u64>, PAGE]);
+        assert_eq!(ids(&all), [1, 2, 3, 5, 6, 4, 8]);
+        let failed = &all[4];
+        assert_eq!(failed.launch_error.as_deref(), Some("no capacity"));
+        assert_eq!(failed.launch_attempts, 1);
+        assert!(failed.next_launch_at.is_some());
+
+        let older: Vec<Job> = db.all(
+            &list_query(None),
+            &params![INSTALLATION, all[2].queued_at, 2u32],
+        );
+        assert_eq!(ids(&older), [5, 6]);
+
+        let group = |g| {
+            ids(&db.all::<Job>(
+                &list_query(Some(g)),
+                &params![INSTALLATION, None::<u64>, PAGE],
+            ))
+        };
+        assert_eq!(group(Group::Active), [2, 3]);
+        assert_eq!(group(Group::Waiting), [1, 5]);
+        assert_eq!(group(Group::Failed), [6]);
+    }
+
+    #[test]
+    fn the_counts_read_into_counts() {
+        let db = jobs();
+        let counts: Counts = db
+            .first(&counts_query(), &params![INSTALLATION, NOW - DAY_MS])
+            .unwrap();
+        assert_eq!(
+            (
+                counts.waiting,
+                counts.active,
+                counts.running,
+                counts.completed_today,
+                counts.failed_today
+            ),
+            (2, 2, 1, 1, 1)
+        );
+        let none: Counts = db
+            .first(&counts_query(), &params![99u64, NOW - DAY_MS])
+            .unwrap();
+        assert_eq!(none.active, 0);
+    }
+
+    #[test]
+    fn the_activity_reads_into_buckets() {
+        let db = jobs();
+        let since = activity_since(NOW);
+        let rows: Vec<Grouped> = db.all(&activity_query(), &params![INSTALLATION, since]);
+        let got = activity(since, &rows);
+        assert_eq!(got.finished.iter().sum::<u32>(), 1);
+        assert_eq!(got.failed.iter().sum::<u32>(), 1);
+        // 61 minutes back from 7 minutes into the last bucket is four
+        // buckets back, 38 minutes back is three.
+        assert_eq!(got.finished[BUCKETS - 5], 1);
+        assert_eq!(got.failed[BUCKETS - 4], 1);
+    }
+
+    /// hatchrun/hatchrun#92: without the cast the bucket is a REAL such
+    /// as 1.55, which does not read into the `i64` of `Grouped`.
+    #[test]
+    fn a_fractional_bucket_fails_to_read() {
+        let before = format!(
+            "SELECT (updated_at - ?2) / {BUCKET_MS} AS bucket, \
+             COUNT(*) FILTER (WHERE status = 'completed') AS finished, \
+             COUNT(*) FILTER (WHERE {FAILED}) AS failed \
+             FROM jobs WHERE installation_id = ?1 AND updated_at >= ?2 \
+             GROUP BY bucket"
+        );
+        let db = jobs();
+        let since = activity_since(NOW);
+        let err = db
+            .try_all::<Grouped>(&before, &params![INSTALLATION, since])
+            .unwrap_err();
+        assert!(err.contains("floating point"), "{err}");
+    }
+
+    #[test]
+    fn the_settings_change_a_tenant() {
+        let db = Db::new();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, created_at, updated_at) \
+             VALUES ('t1', 1, 'acme', 0, 0)",
+            &[],
+        );
+        let changed = db.run(
+            SET_SETTINGS,
+            &params!["t1", 3u32, Some("eu-west-1,us-east-1"), NOW],
+        );
+        assert_eq!(changed, 1);
+        let rows = db
+            .rows(
+                "SELECT max_runners, allowed_regions, updated_at FROM tenants",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0]["max_runners"], 3);
+        assert_eq!(rows[0]["allowed_regions"], "eu-west-1,us-east-1");
+        db.run(SET_SETTINGS, &params!["t1", 3u32, None::<&str>, NOW]);
     }
 
     #[test]

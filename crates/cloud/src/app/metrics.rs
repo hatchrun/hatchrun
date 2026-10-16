@@ -118,6 +118,11 @@ struct Job {
     updated_at: u64,
 }
 
+/// One job of an installation, from D1. Binds the job id and the
+/// installation.
+const JOB: &str = "SELECT id, repository, run_id, label, status, runner_name, instance_id, \
+    queued_at, updated_at FROM jobs WHERE id = ?1 AND installation_id = ?2";
+
 /// What the SQL binding answers.
 #[derive(Deserialize)]
 struct Answered<T> {
@@ -133,10 +138,7 @@ pub(crate) async fn job(ctx: &Ctx<'_>, org: &str, id: &str) -> Answer {
     };
     let job: Job = ctx
         .db
-        .prepare(
-            "SELECT id, repository, run_id, label, status, runner_name, instance_id, \
-             queued_at, updated_at FROM jobs WHERE id = ?1 AND installation_id = ?2",
-        )
+        .prepare(JOB)
         .bind(&[int(id)?, int(installation)?])?
         .first(None)
         .await?
@@ -245,6 +247,38 @@ fn distinct(mut windows: Vec<Window>) -> Vec<Window> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdb::{Db, params};
+
+    #[test]
+    fn reads_a_job_of_the_installation() {
+        let db = Db::new();
+        let queued_at = 1_792_140_000_000u64;
+        db.run(
+            "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+             queued_at, updated_at, launch_state, runner_name, instance_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            &params![
+                7u64,
+                3u64,
+                "acme/app",
+                9u64,
+                "hatchrun-2cpu",
+                "completed",
+                queued_at,
+                queued_at + 60_000,
+                "launched",
+                "hatchrun-7",
+                "i-0123456789abcdef0",
+            ],
+        );
+        let job: Job = db.first(JOB, &params![7u64, 3u64]).unwrap();
+        assert_eq!(job.id, 7);
+        assert_eq!(job.run_id, 9);
+        assert_eq!(job.queued_at, queued_at);
+        assert_eq!(job.updated_at, queued_at + 60_000);
+        assert_eq!(job.instance_id.as_deref(), Some("i-0123456789abcdef0"));
+        assert!(db.first::<Job>(JOB, &params![7u64, 4u64]).is_none());
+    }
 
     fn window(at: f64) -> Window {
         Window {

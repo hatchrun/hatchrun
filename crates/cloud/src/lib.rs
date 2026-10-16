@@ -52,6 +52,8 @@ pub mod signin;
 mod stack;
 pub mod telemetry;
 pub mod tenant;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod testdb;
 mod webcrypto;
 pub mod webhook;
 
@@ -138,6 +140,24 @@ async fn assets(req: Request, env: &Env) -> Result<Response> {
         .body(body))
 }
 
+/// Records a queued job once, however often GitHub delivers it.
+const QUEUED: &str = "INSERT INTO jobs \
+     (id, installation_id, repository, run_id, label, status, queued_at, updated_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6) \
+     ON CONFLICT (id) DO NOTHING";
+
+/// Moves a job on unless it completed.
+const PROGRESS: &str = "UPDATE jobs SET status = ?1, updated_at = ?2, \
+     ran_on = COALESCE(?4, ran_on) WHERE id = ?3 AND status <> 'completed'";
+
+/// Detaches the tenant from an uninstalled installation.
+const UNINSTALLED: &str =
+    "UPDATE tenants SET installation_id = NULL, updated_at = ?2 WHERE installation_id = ?1";
+
+/// Gives the organization's tenant its new installation.
+const INSTALLED: &str =
+    "UPDATE tenants SET installation_id = ?1, updated_at = ?3 WHERE org_id = ?2";
+
 async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Result<Response> {
     let secret = env
         .secret(WEBHOOK_SECRET)
@@ -168,22 +188,17 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
                 console_warn!("{reason}");
                 return Response::from_json(&serde_json::json!({ "ignored": reason }));
             }
-            db.prepare(
-                "INSERT INTO jobs \
-                 (id, installation_id, repository, run_id, label, status, queued_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6) \
-                 ON CONFLICT (id) DO NOTHING",
-            )
-            .bind(&[
-                int(job.id)?,
-                int(job.installation_id)?,
-                job.repository.as_str().into(),
-                int(job.run_id)?,
-                job.label.as_str().into(),
-                now,
-            ])?
-            .run()
-            .await?;
+            db.prepare(QUEUED)
+                .bind(&[
+                    int(job.id)?,
+                    int(job.installation_id)?,
+                    job.repository.as_str().into(),
+                    int(job.run_id)?,
+                    job.label.as_str().into(),
+                    now,
+                ])?
+                .run()
+                .await?;
             // A repeated delivery comes here too; the launch claims the
             // job first, so only one of them launches.
             let id = job.id;
@@ -194,22 +209,19 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
             // Deliveries can arrive out of order; a completed job stays
             // completed. The runner shows the reconciler which instance
             // ran the job (see `reconcile`).
-            db.prepare(
-                "UPDATE jobs SET status = ?1, updated_at = ?2, ran_on = COALESCE(?4, ran_on) \
-                 WHERE id = ?3 AND status <> 'completed'",
-            )
-            .bind(&[
-                status.as_str().into(),
-                now,
-                int(id)?,
-                runner.map_or(JsValue::NULL, Into::into),
-            ])?
-            .run()
-            .await?;
+            db.prepare(PROGRESS)
+                .bind(&[
+                    status.as_str().into(),
+                    now,
+                    int(id)?,
+                    runner.map_or(JsValue::NULL, Into::into),
+                ])?
+                .run()
+                .await?;
             Ok(Response::empty()?.with_status(204))
         }
         Event::Uninstalled { installation_id } => {
-            db.prepare("UPDATE tenants SET installation_id = NULL, updated_at = ?2 WHERE installation_id = ?1")
+            db.prepare(UNINSTALLED)
                 .bind(&[int(installation_id)?, now])?
                 .run()
                 .await?;
@@ -221,12 +233,10 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
         } => {
             // A tenant made before an uninstall gets the new installation;
             // an account without a tenant waits for an owner to set it up.
-            db.prepare(
-                "UPDATE tenants SET installation_id = ?1, updated_at = ?3 WHERE org_id = ?2",
-            )
-            .bind(&[int(installation_id)?, int(account_id)?, now])?
-            .run()
-            .await?;
+            db.prepare(INSTALLED)
+                .bind(&[int(installation_id)?, int(account_id)?, now])?
+                .run()
+                .await?;
             Ok(Response::empty()?.with_status(204))
         }
         Event::Ignored(reason) => {
@@ -312,4 +322,75 @@ fn error(message: &str, status: u16) -> Result<Response> {
 
 pub(crate) fn now_ms() -> u64 {
     worker::Date::now().as_millis()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::testdb::{Db, params};
+
+    const NOW: u64 = 1_792_140_000_000;
+
+    fn queued(db: &Db, id: u64, label: &str, now: u64) -> usize {
+        db.run(QUEUED, &params![id, 42u64, "acme/app", 77u64, label, now])
+    }
+
+    fn progress(db: &Db, id: u64, status: &str, runner: Option<&str>, now: u64) -> usize {
+        db.run(PROGRESS, &params![status, now, id, runner])
+    }
+
+    #[test]
+    fn a_job_is_recorded_once_and_stays_completed() {
+        let db = Db::new();
+        assert_eq!(queued(&db, 5, "hatchrun", NOW), 1);
+        assert_eq!(queued(&db, 5, "other", NOW + 1), 0);
+
+        assert_eq!(
+            progress(&db, 5, "in_progress", Some("hatchrun-5-ab"), NOW + 2),
+            1
+        );
+        // A completed delivery without a runner keeps the one recorded.
+        assert_eq!(progress(&db, 5, "completed", None, NOW + 3), 1);
+        assert_eq!(progress(&db, 5, "in_progress", Some("other"), NOW + 4), 0);
+        let rows = db
+            .rows(
+                "SELECT label, status, ran_on, queued_at, updated_at, typeof(updated_at) AS t \
+                 FROM jobs",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["label"], "hatchrun");
+        assert_eq!(rows[0]["status"], "completed");
+        assert_eq!(rows[0]["ran_on"], "hatchrun-5-ab");
+        assert_eq!(rows[0]["queued_at"], NOW);
+        assert_eq!(rows[0]["updated_at"], NOW + 3);
+        assert_eq!(rows[0]["t"], "integer");
+        assert_eq!(progress(&db, 6, "in_progress", None, NOW), 0);
+    }
+
+    #[test]
+    fn installs_move_the_tenant() {
+        let db = Db::new();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            &params!["t1", 9u64, "acme", 42u64, 1u64],
+        );
+        assert_eq!(db.run(UNINSTALLED, &params![42u64, NOW]), 1);
+        let installation: Option<Option<u64>> = db.column(
+            "SELECT installation_id FROM tenants",
+            &[],
+            "installation_id",
+        );
+        assert_eq!(installation, Some(None));
+        assert_eq!(db.run(INSTALLED, &params![43u64, 9u64, NOW]), 1);
+        assert_eq!(db.run(INSTALLED, &params![44u64, 10u64, NOW]), 0);
+        let installation: Option<u64> = db.column(
+            "SELECT installation_id FROM tenants",
+            &[],
+            "installation_id",
+        );
+        assert_eq!(installation, Some(43));
+    }
 }

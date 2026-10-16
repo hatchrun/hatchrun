@@ -52,6 +52,18 @@ struct Stored {
     version: Option<String>,
 }
 
+/// A row when the token with this jti posted a release before.
+const TOKEN_USED: &str = "SELECT 1 FROM used_tokens WHERE jti = ?1";
+
+/// The newest release in the table.
+const NEWEST_VERSION: &str = "SELECT MAX(version) AS version FROM images";
+
+/// Forgets tokens that expired before the time in milliseconds.
+const FORGET_TOKENS: &str = "DELETE FROM used_tokens WHERE expires_at < ?1";
+
+/// Spends a token. Binds its jti and when it expires, in milliseconds.
+const SPEND_TOKEN: &str = "INSERT INTO used_tokens (jti, expires_at) VALUES (?1, ?2)";
+
 pub(crate) async fn post(mut req: Request, env: &Env) -> Result<Response> {
     let token = req
         .headers()
@@ -99,17 +111,14 @@ pub(crate) async fn post(mut req: Request, env: &Env) -> Result<Response> {
     }
     let db = env.d1(DB)?;
     let used = db
-        .prepare("SELECT 1 FROM used_tokens WHERE jti = ?1")
+        .prepare(TOKEN_USED)
         .bind(&[claims.jti.as_str().into()])?
         .first::<serde_json::Value>(None)
         .await?;
     if used.is_some() {
         return json_error("token already used", 401);
     }
-    let stored: Option<Stored> = db
-        .prepare("SELECT MAX(version) AS version FROM images")
-        .first(None)
-        .await?;
+    let stored: Option<Stored> = db.prepare(NEWEST_VERSION).first(None).await?;
     let stored = stored.and_then(|row| row.version);
     if !images::is_current(&release.version, stored.as_deref()) {
         return json_error(
@@ -239,16 +248,14 @@ fn trusted_issuer(req: &Request, env: &Env) -> Result<std::result::Result<String
 async fn store(db: &D1Database, release: &Release, claims: &actions::Claims) -> Result<()> {
     let now = int(now_ms())?;
     let mut statements = vec![
-        db.prepare("DELETE FROM used_tokens WHERE expires_at < ?1")
-            .bind(std::slice::from_ref(&now))?,
-        db.prepare("INSERT INTO used_tokens (jti, expires_at) VALUES (?1, ?2)")
-            .bind(&[
-                claims.jti.as_str().into(),
-                int(claims
-                    .exp
-                    .saturating_add(actions::LEEWAY)
-                    .saturating_mul(1000))?,
-            ])?,
+        db.prepare(FORGET_TOKENS).bind(std::slice::from_ref(&now))?,
+        db.prepare(SPEND_TOKEN).bind(&[
+            claims.jti.as_str().into(),
+            int(claims
+                .exp
+                .saturating_add(actions::LEEWAY)
+                .saturating_mul(1000))?,
+        ])?,
     ];
     for image in &release.images {
         statements.push(db.prepare(UPSERT).bind(&[
@@ -262,4 +269,149 @@ async fn store(db: &D1Database, release: &Release, claims: &actions::Claims) -> 
     }
     db.batch(statements).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdb::{Db, Param, params};
+
+    const NOW: u64 = 1_792_140_000_000;
+
+    /// The statements [`store`] batches for a release posted with `jti`.
+    fn store_batch(
+        jti: &str,
+        exp: u64,
+        version: &str,
+        images: &[(&str, &str, &str)],
+    ) -> Vec<(&'static str, Vec<Param>)> {
+        let mut statements = vec![
+            (FORGET_TOKENS, params![NOW]),
+            (
+                SPEND_TOKEN,
+                params![
+                    jti,
+                    exp.saturating_add(actions::LEEWAY).saturating_mul(1000)
+                ],
+            ),
+        ];
+        for &(region, arch, image_id) in images {
+            statements.push((
+                UPSERT,
+                params![region, arch, image_id, ROOT_DEVICE, version, NOW],
+            ));
+        }
+        statements
+    }
+
+    fn images(db: &Db) -> Vec<(String, String, String)> {
+        db.rows(
+            "SELECT region, arch, image_id, version FROM images ORDER BY region, arch",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            let text = |name: &str| row[name].as_str().unwrap().to_owned();
+            (text("region"), text("image_id"), text("version"))
+        })
+        .collect()
+    }
+
+    fn newest(db: &Db) -> Option<String> {
+        db.first::<Stored>(NEWEST_VERSION, &[])
+            .and_then(|row| row.version)
+    }
+
+    #[test]
+    fn a_release_spends_its_token_and_writes_its_images() {
+        let db = Db::new();
+        assert_eq!(newest(&db), None);
+        assert!(
+            db.first::<serde_json::Value>(TOKEN_USED, &params!["j1"])
+                .is_none()
+        );
+        db.batch(&store_batch(
+            "j1",
+            NOW / 1000,
+            "20261013.1915",
+            &[
+                ("us-east-1", "amd64", "ami-0123abcd"),
+                ("us-east-1", "arm64", "ami-4567abcd"),
+            ],
+        ))
+        .unwrap();
+        assert!(
+            db.first::<serde_json::Value>(TOKEN_USED, &params!["j1"])
+                .is_some()
+        );
+        assert_eq!(newest(&db).as_deref(), Some("20261013.1915"));
+        assert_eq!(images(&db).len(), 2);
+    }
+
+    #[test]
+    fn a_spent_token_writes_nothing() {
+        let db = Db::new();
+        let first = [("us-east-1", "amd64", "ami-0123abcd")];
+        db.batch(&store_batch("j1", NOW / 1000, "20261013.1915", &first))
+            .unwrap();
+        let again = [("us-east-1", "amd64", "ami-89abcdef")];
+        assert!(
+            db.batch(&store_batch("j1", NOW / 1000, "20261014.1915", &again))
+                .is_err()
+        );
+        assert_eq!(
+            images(&db),
+            [(
+                "us-east-1".to_owned(),
+                "ami-0123abcd".to_owned(),
+                "20261013.1915".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_older_release_keeps_the_newer_image() {
+        let db = Db::new();
+        db.batch(&store_batch(
+            "j1",
+            NOW / 1000,
+            "20261014.1915",
+            &[("us-east-1", "amd64", "ami-89abcdef")],
+        ))
+        .unwrap();
+        db.batch(&store_batch(
+            "j2",
+            NOW / 1000,
+            "20261013.1915",
+            &[
+                ("us-east-1", "amd64", "ami-0123abcd"),
+                ("eu-west-1", "amd64", "ami-4567abcd"),
+            ],
+        ))
+        .unwrap();
+        let rows = images(&db);
+        assert_eq!(rows[0].1, "ami-4567abcd");
+        assert_eq!(rows[1].1, "ami-89abcdef");
+        assert_eq!(rows[1].2, "20261014.1915");
+    }
+
+    #[test]
+    fn expired_tokens_are_forgotten() {
+        let db = Db::new();
+        // Expired a minute before NOW, leeway included.
+        let old = (NOW - 60_000) / 1000 - actions::LEEWAY;
+        db.batch(&store_batch("j1", old, "20261013.1915", &[]))
+            .unwrap();
+        db.batch(&store_batch("j2", NOW / 1000, "20261013.1915", &[]))
+            .unwrap();
+        assert!(
+            db.first::<serde_json::Value>(TOKEN_USED, &params!["j1"])
+                .is_none()
+        );
+        assert!(
+            db.first::<serde_json::Value>(TOKEN_USED, &params!["j2"])
+                .is_some()
+        );
+    }
 }

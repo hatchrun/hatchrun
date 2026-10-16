@@ -66,6 +66,16 @@ pub(crate) const TENANT_COLUMNS: &str = "tenants.id, tenants.org_id, tenants.org
     tenants.instance_types, tenants.excluded_instance_types, tenants.volume_size_limit, \
     tenants.root_volume_size, tenants.template_version, tenants.stack_checked_at";
 
+/// The tenant of an organization, by login, that a user is a member
+/// of. Binds the login and the user id.
+fn authorize_query() -> String {
+    format!(
+        "SELECT {TENANT_COLUMNS} FROM tenants \
+         JOIN members ON members.tenant_id = tenants.id \
+         WHERE tenants.org_login = ?1 COLLATE NOCASE AND members.user_id = ?2"
+    )
+}
+
 /// The setup steps a tenant has done.
 #[derive(Debug, Serialize)]
 #[allow(clippy::struct_excessive_bools)] // One per step, as the app shows them.
@@ -258,11 +268,7 @@ pub(crate) async fn authorize(ctx: &Ctx<'_>, org: &str) -> Result<TenantRow, Fai
     }
     let row: Option<TenantRow> = ctx
         .db
-        .prepare(format!(
-            "SELECT {TENANT_COLUMNS} FROM tenants \
-             JOIN members ON members.tenant_id = tenants.id \
-             WHERE tenants.org_login = ?1 COLLATE NOCASE AND members.user_id = ?2"
-        ))
+        .prepare(authorize_query())
         .bind(&[org.into(), int(ctx.session.user.id)?])?
         .first(None)
         .await?;
@@ -294,6 +300,14 @@ struct Joined {
     org_login: String,
 }
 
+/// The organizations of the tenants a user is a member of.
+const JOINED: &str = "SELECT tenants.org_id, tenants.org_login FROM tenants \
+    JOIN members ON members.tenant_id = tenants.id WHERE members.user_id = ?1";
+
+/// Renames an organization. Binds its id, the new login and the time in
+/// milliseconds.
+const RENAME: &str = "UPDATE tenants SET org_login = ?2, updated_at = ?3 WHERE org_id = ?1";
+
 /// `GET /api/installations`
 pub(crate) async fn installations(ctx: &Ctx<'_>) -> Answer {
     let orgs: Vec<Installation> = github::parse_user_installations(
@@ -309,10 +323,7 @@ pub(crate) async fn installations(ctx: &Ctx<'_>) -> Answer {
 
     let joined = ctx
         .db
-        .prepare(
-            "SELECT tenants.org_id, tenants.org_login FROM tenants \
-             JOIN members ON members.tenant_id = tenants.id WHERE members.user_id = ?1",
-        )
+        .prepare(JOINED)
         .bind(&[int(ctx.session.user.id)?])?
         .all()
         .await?
@@ -329,13 +340,11 @@ pub(crate) async fn installations(ctx: &Ctx<'_>) -> Answer {
             })
         })
         .map(|installation| {
-            ctx.db
-                .prepare("UPDATE tenants SET org_login = ?2, updated_at = ?3 WHERE org_id = ?1")
-                .bind(&[
-                    int(installation.account.id)?,
-                    installation.account.login.as_str().into(),
-                    now.clone(),
-                ])
+            ctx.db.prepare(RENAME).bind(&[
+                int(installation.account.id)?,
+                installation.account.login.as_str().into(),
+                now.clone(),
+            ])
         })
         .collect::<worker::Result<Vec<_>>>()?;
     if !renames.is_empty() {
@@ -360,6 +369,19 @@ pub(crate) async fn installations(ctx: &Ctx<'_>) -> Answer {
         "installations": list,
     }))?)
 }
+
+/// Creates the organization's tenant, or links the installation to the
+/// one that exists. Binds a new tenant id, the organization's id and
+/// login, the installation and the time in milliseconds.
+const ADOPT_TENANT: &str = "INSERT INTO tenants \
+    (id, org_id, org_login, installation_id, created_at, updated_at) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+    ON CONFLICT (org_id) DO UPDATE SET org_login = ?3, installation_id = ?4, updated_at = ?5";
+
+/// Makes a user a member of the organization's tenant. Binds the
+/// organization's id, the user id and the time in milliseconds.
+const ADOPT_MEMBER: &str = "INSERT INTO members (tenant_id, user_id, created_at) \
+    SELECT id, ?2, ?3 FROM tenants WHERE org_id = ?1 ON CONFLICT DO NOTHING";
 
 /// Makes `installation_id` the installation of its organization's
 /// tenant, creating the tenant if needed, and the user a member, once
@@ -414,27 +436,15 @@ async fn adopt(
         .batch(vec![
             // One tenant per organization: a second owner joins the
             // first one's.
+            ctx.db.prepare(ADOPT_TENANT).bind(&[
+                id.as_str().into(),
+                org_id.clone(),
+                login.as_str().into(),
+                int(installation.id)?,
+                now.clone(),
+            ])?,
             ctx.db
-                .prepare(
-                    "INSERT INTO tenants \
-                     (id, org_id, org_login, installation_id, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
-                     ON CONFLICT (org_id) DO UPDATE \
-                     SET org_login = ?3, installation_id = ?4, updated_at = ?5",
-                )
-                .bind(&[
-                    id.as_str().into(),
-                    org_id.clone(),
-                    login.as_str().into(),
-                    int(installation.id)?,
-                    now.clone(),
-                ])?,
-            ctx.db
-                .prepare(
-                    "INSERT INTO members (tenant_id, user_id, created_at) \
-                     SELECT id, ?2, ?3 FROM tenants WHERE org_id = ?1 \
-                     ON CONFLICT DO NOTHING",
-                )
+                .prepare(ADOPT_MEMBER)
                 .bind(&[org_id, int(ctx.session.user.id)?, now])?,
         ])
         .await?;
@@ -465,15 +475,16 @@ struct Summary {
     org_id: u64,
 }
 
+/// The tenants a user is a member of, by login.
+const MINE: &str = "SELECT tenants.id, tenants.org_login, tenants.org_id FROM tenants \
+    JOIN members ON members.tenant_id = tenants.id \
+    WHERE members.user_id = ?1 ORDER BY tenants.org_login";
+
 /// `GET /api/tenants`
 pub(crate) async fn mine(ctx: &Ctx<'_>) -> Answer {
     let rows = ctx
         .db
-        .prepare(
-            "SELECT tenants.id, tenants.org_login, tenants.org_id FROM tenants \
-             JOIN members ON members.tenant_id = tenants.id \
-             WHERE members.user_id = ?1 ORDER BY tenants.org_login",
-        )
+        .prepare(MINE)
         .bind(&[int(ctx.session.user.id)?])?
         .all()
         .await?
@@ -545,4 +556,145 @@ pub(crate) async fn setup(ctx: &Ctx<'_>, req: &Request) -> Answer {
             back("/?error=install-failed")?
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdb::{Db, Param, params};
+
+    const NOW: u64 = 1_792_140_000_000;
+
+    fn user(db: &Db, id: u64) {
+        db.run(
+            "INSERT INTO users (id, login, avatar_url, created_at, updated_at) \
+             VALUES (?1, ?2, '', ?3, ?3)",
+            &params![id, format!("user{id}"), NOW],
+        );
+    }
+
+    /// The statements [`adopt`] batches.
+    fn adopt_batch(
+        id: &str,
+        org_id: u64,
+        login: &str,
+        installation: u64,
+        user: u64,
+    ) -> Vec<(&'static str, Vec<Param>)> {
+        vec![
+            (ADOPT_TENANT, params![id, org_id, login, installation, NOW]),
+            (ADOPT_MEMBER, params![org_id, user, NOW]),
+        ]
+    }
+
+    fn authorized(db: &Db, org: &str, user: u64) -> Option<TenantRow> {
+        db.first(&authorize_query(), &params![org, user])
+    }
+
+    #[test]
+    fn a_second_owner_joins_the_first_ones_tenant() {
+        let db = Db::new();
+        user(&db, 5);
+        user(&db, 6);
+        db.batch(&adopt_batch("aaaaaaaaaaaaaaaa", 11, "Acme", 100, 5))
+            .unwrap();
+        db.batch(&adopt_batch("bbbbbbbbbbbbbbbb", 11, "Acme", 101, 6))
+            .unwrap();
+        let first = authorized(&db, "acme", 5).unwrap();
+        let second = authorized(&db, "ACME", 6).unwrap();
+        assert_eq!(first.id, "aaaaaaaaaaaaaaaa");
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.installation_id, Some(101));
+        assert!(authorized(&db, "acme", 7).is_none());
+    }
+
+    #[test]
+    fn a_new_tenant_reads_into_its_row() {
+        let db = Db::new();
+        user(&db, 5);
+        db.batch(&adopt_batch("aaaaaaaaaaaaaaaa", 11, "acme", 100, 5))
+            .unwrap();
+        let row = authorized(&db, "acme", 5).unwrap();
+        assert_eq!(row.org_id, 11);
+        assert_eq!(row.org_login, "acme");
+        assert_eq!(row.max_runners, 10);
+        assert_eq!(row.beta, 0);
+        assert_eq!(row.role_arn, None);
+        assert_eq!(row.template_version, None);
+        assert_eq!(row.stack_checked_at, None);
+    }
+
+    #[test]
+    fn a_connected_tenant_reads_into_its_row() {
+        let db = Db::new();
+        user(&db, 5);
+        db.batch(&adopt_batch("aaaaaaaaaaaaaaaa", 11, "acme", 100, 5))
+            .unwrap();
+        // As aws::save and stack::record bind them.
+        db.run(
+            "UPDATE tenants SET role_arn = ?2, region = ?3, updated_at = ?4 WHERE id = ?1",
+            &params![
+                "aaaaaaaaaaaaaaaa",
+                "arn:aws:iam::1:role/r",
+                "eu-west-1",
+                NOW
+            ],
+        );
+        db.run(
+            "UPDATE tenants SET launch_template_id = ?2, subnet_ids = ?3, \
+             instance_types = ?4, volume_size_limit = ?5, root_volume_size = ?6, \
+             fleet = ?7, excluded_instance_types = ?8, template_version = ?9, \
+             updated_at = ?10, stack_checked_at = ?10 WHERE id = ?1",
+            &params![
+                "aaaaaaaaaaaaaaaa",
+                "lt-1",
+                "subnet-1,subnet-2",
+                "m7g",
+                200u32,
+                40u32,
+                1u32,
+                "",
+                5u32,
+                NOW,
+            ],
+        );
+        let row = authorized(&db, "acme", 5).unwrap();
+        assert_eq!(row.region.as_deref(), Some("eu-west-1"));
+        assert_eq!(row.subnet_ids.as_deref(), Some("subnet-1,subnet-2"));
+        assert_eq!(row.volume_size_limit, Some(200));
+        assert_eq!(row.root_volume_size, Some(40));
+        assert_eq!(row.template_version, Some(5));
+        assert_eq!(row.stack_checked_at, Some(NOW));
+    }
+
+    #[test]
+    fn lists_and_renames_a_users_tenants() {
+        let db = Db::new();
+        user(&db, 5);
+        user(&db, 6);
+        db.batch(&adopt_batch("aaaaaaaaaaaaaaaa", 11, "zeta", 100, 5))
+            .unwrap();
+        db.batch(&adopt_batch("bbbbbbbbbbbbbbbb", 12, "acme", 101, 5))
+            .unwrap();
+        db.batch(&adopt_batch("cccccccccccccccc", 13, "other", 102, 6))
+            .unwrap();
+
+        let mine: Vec<Summary> = db.all(MINE, &params![5u64]);
+        let logins: Vec<&str> = mine.iter().map(|row| row.org_login.as_str()).collect();
+        assert_eq!(logins, ["acme", "zeta"]);
+        assert_eq!(mine[0].id, "bbbbbbbbbbbbbbbb");
+        assert_eq!(mine[0].org_id, 12);
+
+        let joined: Vec<Joined> = db.all(JOINED, &params![5u64]);
+        assert_eq!(joined.len(), 2);
+
+        db.batch(&[(RENAME, params![11u64, "zeta-labs", NOW])])
+            .unwrap();
+        let joined: Vec<Joined> = db.all(JOINED, &params![5u64]);
+        assert!(
+            joined
+                .iter()
+                .any(|row| row.org_id == 11 && row.org_login == "zeta-labs")
+        );
+    }
 }
