@@ -13,6 +13,7 @@ import { ChoosePlan, PlanSummary } from "./Billing";
 import { AwsSummary, ConnectAws } from "./ConnectAws";
 import { Dashboard } from "./Dashboard";
 import { JobPage } from "./JobPage";
+import { RunPage } from "./RunPage";
 import { RunnersPage } from "./Runners";
 import { TenantSettings } from "./TenantSettings";
 
@@ -35,7 +36,7 @@ export function TenantPage({
   const org = tenant.org.login;
   const ready = setUp(tenant);
   const tabs = [
-    { href: `/o/${org}`, label: ready ? "Jobs" : "Setup", current: section === undefined || section === "jobs" },
+    { href: `/o/${org}`, label: ready ? "Jobs" : "Setup", current: section === undefined || section === "jobs" || section === "runs" },
     { href: `/o/${org}/runners`, label: "Runners", current: section === "runners" },
     { href: `/o/${org}/settings`, label: "Settings", current: section === "settings" },
   ];
@@ -52,6 +53,8 @@ export function TenantPage({
     >
       {section === "jobs" && item ? (
         <JobPage org={org} id={item} />
+      ) : section === "runs" && item ? (
+        <RunPage org={org} id={item} />
       ) : section === "runners" ? (
         <Narrow>
           <RunnersPage tenant={tenant} item={item} />

@@ -6,7 +6,7 @@ import type { ReactNode } from "react";
 
 import { getJobMetrics, type JobMetrics, type MetricsSummary, type MetricsWindow } from "@/api";
 import { ChevronLeftIcon, ExternalIcon, GitHubIcon } from "@/components/icons";
-import { instanceUrl, span, state, StatusMark } from "@/components/JobStatus";
+import { endOf, instanceUrl, runRef, span, state, StatusMark } from "@/components/JobStatus";
 import { Await } from "@/components/Status";
 import { useLoad, useNow } from "@/load";
 import { cn } from "@/lib/utils";
@@ -29,10 +29,15 @@ export function JobPage({ org, id }: { org: string; id: string }) {
           <>
             <span className="text-rivet">/</span>
             <span>{metrics.data.job.repository}</span>
+            <span className="text-rivet">/</span>
+            <Link href={`/o/${org}/runs/${metrics.data.job.runId}`} className="text-bone hover:text-chick">
+              {metrics.data.job.workflowName ?? "Run"}{" "}
+              {runRef({ runNumber: metrics.data.job.runNumber, id: metrics.data.job.runId })}
+            </Link>
           </>
         )}
         <span className="text-rivet">/</span>
-        <span>#{id}</span>
+        <span>{metrics.state === "ready" && metrics.data.job.name ? metrics.data.job.name : `#${id}`}</span>
       </nav>
       <Await loaded={metrics} retry={reload}>
         {(data) => <JobView data={data} />}
@@ -43,7 +48,7 @@ export function JobPage({ org, id }: { org: string; id: string }) {
 
 function JobView({ data }: { data: JobMetrics }) {
   const { job, summary, windows } = data;
-  const shown = state({ status: job.status, launchState: null, launchRetry: null });
+  const shown = state({ status: job.status, launchState: null, launchRetry: null, conclusion: job.conclusion });
   const region = data.region ?? null;
   const queued = new Date(job.queuedAt);
   const now = useNow(1000);
@@ -56,12 +61,12 @@ function JobView({ data }: { data: JobMetrics }) {
               {job.status === "in_progress"
                 ? `for ${span(now - job.queuedAt)}`
                 : job.status === "completed"
-                  ? `took ${span(job.updatedAt - job.queuedAt)}`
+                  ? `took ${span(endOf(job) - job.queuedAt)}`
                   : `since ${queued.toLocaleTimeString()}`}
             </span>
           </StatusMark>
           <h1 className="display text-[26px] leading-[1.05] break-words">
-            {job.repository}{" "}
+            {job.name || job.repository}{" "}
             <span className="font-mono text-xl font-medium tracking-normal text-fog normal-case [font-stretch:100%]">
               #{job.id}
             </span>
@@ -72,6 +77,9 @@ function JobView({ data }: { data: JobMetrics }) {
             <time dateTime={queued.toISOString()} title={queued.toLocaleString()}>
               {queued.toLocaleTimeString()}
             </time>
+            {job.startedAt !== null && <> · waited {span(job.startedAt - job.queuedAt)}</>}
+            {job.startedAt !== null && job.completedAt !== null && <>, ran {span(job.completedAt - job.startedAt)}</>}
+            {job.runAttempt > 1 && <> · attempt {job.runAttempt}</>}
           </span>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -151,7 +159,7 @@ function JobView({ data }: { data: JobMetrics }) {
 }
 
 /** A link button that names where it goes; without an href it says what is missing. */
-function Destination({
+export function Destination({
   href,
   label,
   icon,
@@ -348,11 +356,11 @@ function split(windows: MetricsWindow[]): MetricsWindow[][] {
   return runs;
 }
 
-function pct(value: number | null): string {
+export function pct(value: number | null): string {
   return value === null ? "-" : `${Math.round(value)}%`;
 }
 
-function bytes(value: number): string {
+export function bytes(value: number): string {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let unit = 0;
   while (value >= 1024 && unit < units.length - 1) {

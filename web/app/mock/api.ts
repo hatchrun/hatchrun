@@ -9,7 +9,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
-import type { Job } from "../src/api.ts";
+import type { Job, ListedRun, Run } from "../src/api.ts";
 import * as profiles from "./runners.ts";
 
 interface MockTenant {
@@ -223,33 +223,42 @@ const routes: Record<string, Handler> = {
     };
     return [200, tenantView(tenant)];
   },
-  "GET /api/tenants/:org/jobs": (_req, url) => {
+  "GET /api/tenants/:org/runs": (_req, url) => {
     const tenant = findTenant(url.pathname.split("/")[3] ?? "");
     if (!tenant) {
       return [404, { error: "no organization here" }];
     }
     const now = Date.now();
-    const all = sampleJobs(now);
-    const before = Number(url.searchParams.get("before")) || Infinity;
+    const runs = sampleRuns(now);
+    const all = runs.flatMap((run) => run.jobs);
+    const [beforeAt = 0, beforeId = 0] = (url.searchParams.get("before") ?? "").split(":").map(Number);
     const status = url.searchParams.get("status");
     const group = status === "active" || status === "waiting" || status === "failed" ? IN_GROUP[status] : null;
     if (status && !group) {
       return [400, { error: "status is one of active, waiting or failed." }];
     }
-    const pageSize = 12;
+    const pageSize = 8;
     const day = all.filter((job) => job.updatedAt >= now - 86_400_000);
-    const activity = before === Infinity ? sampleActivity(now, day) : undefined;
+    const first = !beforeAt;
+    const activity = first ? sampleActivity(now, day) : undefined;
     const sum = (values: number[] | undefined) => (values ?? []).reduce((a, b) => a + b, 0);
+    const runsIn = (test: (job: Job) => boolean, list = runs) => list.filter((run) => run.jobs.some(test));
+    const listed = (group ? runsIn(group) : runs)
+      .filter((run) => first || run.queuedAt < beforeAt || (run.queuedAt === beforeAt && run.id < beforeId))
+      .slice(0, pageSize);
     return [
       200,
       {
-        jobs: all.filter((job) => job.queuedAt < before && (!group || group(job))).slice(0, pageSize),
+        runs: listed,
         counts: {
           waiting: all.filter(IN_GROUP.waiting).length,
           active: all.filter(IN_GROUP.active).length,
           running: all.filter((job) => IN_GROUP.active(job) && job.status === "in_progress").length,
           completedToday: activity ? sum(activity.finished) : day.filter((job) => job.status === "completed").length,
           failedToday: day.filter(IN_GROUP.failed).length,
+          waitingRuns: runsIn(IN_GROUP.waiting).length,
+          activeRuns: runsIn(IN_GROUP.active).length,
+          failedRunsToday: runsIn((job) => IN_GROUP.failed(job) && job.updatedAt >= now - 86_400_000).length,
         },
         region: tenant.aws?.region ?? null,
         pageSize,
@@ -257,11 +266,45 @@ const routes: Record<string, Handler> = {
       },
     ];
   },
+  "GET /api/tenants/:org/runs/:id": (_req, url) => {
+    const [, , , org, , id] = url.pathname.split("/");
+    const tenant = findTenant(org ?? "");
+    const now = Date.now();
+    const run = sampleRuns(now).find((run) => String(run.id) === id);
+    if (!tenant || !run) {
+      return [404, { error: `no run ${id} here` }];
+    }
+    const { jobs: current, ...rest } = run;
+    delete (rest as Partial<ListedRun>).olderJobs;
+    const jobs = [...(OLDER.get(run.id) ?? []).map((job) => ({ ...job, current: false })), ...current.map((job) => ({ ...job, current: true }))];
+    return [
+      200,
+      {
+        run: { ...rest, jobs },
+        region: tenant.aws?.region ?? null,
+        resources: jobs
+          .filter((job) => job.launchState === "launched")
+          .map((job) => {
+            const windows = sampleWindows(job.queuedAt).filter((w) => w.at * 1000 <= now);
+            const summary = summarize(windows);
+            return {
+              job: String(job.id),
+              cpuAvg: summary.cpuAvg,
+              cpuMax: summary.cpuMax,
+              memMax: summary.memMax,
+              memTotal: summary.memTotal,
+              oomKills: job.id % 7 === 0 ? 2 : 0,
+            };
+          }),
+      },
+    ];
+  },
   "GET /api/tenants/:org/jobs/:id/metrics": (_req, url) => {
     const [, , , org, , id] = url.pathname.split("/");
     const tenant = findTenant(org ?? "");
-    const job = sampleJobs(Date.now()).find((job) => String(job.id) === id);
-    if (!tenant || !job) {
+    const run = sampleRuns(Date.now()).find((run) => run.jobs.some((job) => String(job.id) === id));
+    const job = run?.jobs.find((job) => String(job.id) === id);
+    if (!tenant || !run || !job) {
       return [404, { error: `no job ${id} here` }];
     }
     const windows =
@@ -271,8 +314,8 @@ const routes: Record<string, Handler> = {
     return [
       200,
       {
-        githubUrl: `https://github.com/${job.repository}/actions/runs/${job.runId}/job/${job.id}`,
-        job,
+        githubUrl: `https://github.com/${run.repository}/actions/runs/${run.id}/job/${job.id}`,
+        job: { ...job, repository: run.repository, workflowName: run.workflowName, runNumber: run.runNumber },
         region: tenant.aws?.region ?? null,
         summary: windows.length === 0 ? null : summarize(windows),
         windows,
@@ -456,61 +499,146 @@ function summarize(windows: ReturnType<typeof sampleWindows>) {
   };
 }
 
-function sampleJobs(now: number): Job[] {
+/** Jobs of earlier attempts, by run, that later attempts replaced. */
+const OLDER = new Map<number, Job[]>();
+
+function sampleRuns(now: number): ListedRun[] {
   const minute = 60_000;
+  let next = 9200;
   const job = (
-    id: number,
-    repository: string,
+    name: string,
     label: string,
     status: Job["status"],
     launchState: Job["launchState"],
     queuedAgo: number,
     took: number,
-    launchError: string | null = null,
-    retry: { attempts: number; wait: "backoff" | "setup" | null; inMinutes?: number } = {
-      attempts: launchState ? 1 : 0,
-      wait: null,
-    },
-  ) => ({
-    id,
-    repository,
-    runId: 11582000000 + id * 13,
-    label,
-    status,
-    launchState,
-    runnerName: launchState ? `hatchrun-${id}-ab12cd34` : null,
-    instanceId: launchState === "launched" ? `i-0${(id * 2654435761).toString(16).padStart(16, "0").slice(-16)}` : null,
-    launchError,
-    launchAttempts: retry.attempts,
-    launchRetry: retry.wait,
-    nextLaunchAt: retry.inMinutes === undefined ? null : now + retry.inMinutes * minute,
-    queuedAt: now - queuedAgo * minute,
-    updatedAt: now - queuedAgo * minute + took * 1000,
-  });
+    {
+      conclusion = status === "completed" ? "success" : null,
+      launchError = null,
+      attempts = launchState ? 1 : 0,
+      wait = null,
+      inMinutes,
+      waited = 40,
+      runAttempt = 1,
+    }: {
+      conclusion?: string | null;
+      launchError?: string | null;
+      attempts?: number;
+      wait?: "backoff" | "setup" | null;
+      inMinutes?: number;
+      waited?: number;
+      runAttempt?: number;
+    } = {},
+  ): Job => {
+    const id = next++;
+    const queuedAt = now - queuedAgo * minute;
+    const started = status !== "queued" && launchState === "launched" ? queuedAt + waited * 1000 : null;
+    return {
+      id,
+      runId: 0,
+      name,
+      runAttempt,
+      label,
+      status,
+      conclusion,
+      launchState,
+      runnerName: launchState ? `hatchrun-${id}-ab12cd34` : null,
+      instanceId: launchState === "launched" ? `i-0${(id * 2654435761).toString(16).padStart(16, "0").slice(-16)}` : null,
+      launchError,
+      launchAttempts: attempts,
+      launchRetry: wait,
+      nextLaunchAt: inMinutes === undefined ? null : now + inMinutes * minute,
+      queuedAt,
+      startedAt: started,
+      completedAt: status === "completed" ? queuedAt + took * 1000 : null,
+      updatedAt: queuedAt + took * 1000,
+    };
+  };
+  const run = (
+    id: number,
+    fields: Partial<Run> & Pick<Run, "repository" | "workflowName">,
+    jobs: Job[],
+    older: Job[] = [],
+  ): ListedRun => {
+    for (const j of [...jobs, ...older]) {
+      j.runId = id;
+    }
+    OLDER.set(id, older);
+    const attempt = Math.max(1, ...jobs.map((j) => j.runAttempt));
+    const queuedAt = Math.min(...jobs.filter((j) => j.runAttempt === attempt).map((j) => j.queuedAt));
+    return {
+      id,
+      headBranch: "main",
+      headSha: (id * 2654435761).toString(16).padStart(40, "a").slice(0, 40),
+      attempt,
+      queuedAt,
+      runNumber: id % 1000,
+      event: "push",
+      displayTitle: null,
+      actor: "octocat",
+      path: ".github/workflows/ci.yml",
+      githubUrl: `https://github.com/${fields.repository}/actions/runs/${id}`,
+      ...fields,
+      jobs,
+      olderJobs: older.length,
+    };
+  };
   const repos = ["acme-corp/api", "acme-corp/web", "acme-corp/infra", "acme-corp/mobile", "acme-corp/data"];
-  const labels = ["hatchrun-4cpu-arm64", "hatchrun-2cpu", "hatchrun-8cpu-arm64", "hatchrun/disk=100", "hatchrun-16cpu"];
-  // Finished jobs going back two days, a few minutes apart.
-  const done = Array.from({ length: 70 }, (_, i) =>
-    job(9118 - i, repos[i % repos.length] ?? "", labels[(i * 3) % labels.length] ?? "", "completed", "launched",
-      45 + i * 37, 150 + ((i * 97) % 600)),
-  );
-  return [
-    job(9127, "acme-corp/infra", "hatchrun", "queued", null, 0.1, 0),
-    job(9126, "acme-corp/api", "hatchrun-8cpu-arm64", "queued", "launching", 0.3, 0),
-    job(9123, "acme-corp/web", "hatchrun-2cpu", "queued", "launched", 0.8, 0),
-    job(9124, "acme-corp/mobile", "hatchrun-16cpu", "queued", "failed", 1, 0,
-      "no capacity for c7g.xlarge, m7g.xlarge in any subnet: InsufficientInstanceCapacity: We currently do not have sufficient capacity in the Availability Zone you requested.",
-      { attempts: 3, wait: "backoff", inMinutes: 2 }),
-    job(9125, "acme-corp/data", "hatchrun-8cpu/spot=true", "queued", "failed", 2, 0,
-      "OptInRequired: subscribe this account to the hatchrun runner images in AWS Marketplace",
-      { attempts: 1, wait: "setup" }),
-    job(9122, "acme-corp/api", "hatchrun-4cpu-arm64", "in_progress", "launched", 5, 0),
-    job(9121, "acme-corp/api", "hatchrun-8cpu-arm64/spot=true", "in_progress", "launched", 9, 0),
-    job(9120, "acme-corp/infra", "hatchrun-16cpu/disk=300", "completed", "failed", 22, 4,
-      "hatchrun-16cpu asks for a 300 GiB root volume and the connect stack allows at most 200 GiB. Raise VolumeSizeLimit on the stack or ask for less."),
-    job(9119, "acme-corp/web", "hatchrun", "completed", "launched", 41, 312),
-    ...done,
+  const workflows = ["CI", "Build images", "Release", "Nightly", "Lint"];
+  const titles = [
+    "fix(api): retry the token refresh",
+    "feat(web): show runs as a tree",
+    "chore(deps): bump vite to 8.3",
+    "refactor(infra): split the network module",
+    "docs: explain the cache scopes",
   ];
+  // Finished runs going back two days, a few minutes apart.
+  const done = Array.from({ length: 30 }, (_, i) => {
+    const ago = 45 + i * 83;
+    const jobs = Array.from({ length: 1 + (i % 3) }, (_, k) =>
+      job(["build", "test", "lint"][k] ?? "build", ["hatchrun-4cpu-arm64", "hatchrun-2cpu", "hatchrun-8cpu-arm64"][(i + k) % 3] ?? "hatchrun", "completed", "launched",
+        ago, 150 + ((i * 97 + k * 31) % 600), { conclusion: i % 9 === 4 && k === 0 ? "failure" : "success" }),
+    );
+    return run(18234560000 - i * 17, {
+      repository: repos[i % repos.length] ?? "",
+      workflowName: workflows[i % workflows.length] ?? "CI",
+      displayTitle: titles[i % titles.length] ?? null,
+      event: i % 4 === 0 ? "pull_request" : "push",
+    }, jobs);
+  });
+  const label = "hatchrun-4cpu-arm64";
+  return [
+    run(18234567890, { repository: "acme-corp/api", workflowName: "Smoke test", displayTitle: "fix(agent): retry the cache upload", runNumber: 412 }, [
+      job("Save (host)", label, "completed", "launched", 3, 72),
+      job("Save (container)", label, "completed", "launched", 3, 90),
+      job("Restore (host)", label, "in_progress", "launched", 3, 0, { waited: 35 }),
+      job("Restore (container)", label, "queued", "launching", 3, 0),
+      job("Verify", label, "queued", null, 3, 0),
+    ]),
+    run(18234567811, { repository: "acme-corp/mobile", workflowName: "CI", headBranch: "fix-login", event: "pull_request", displayTitle: "Fix login on Android 16" }, [
+      job("build (android)", "hatchrun-16cpu", "queued", "failed", 6, 0, {
+        launchError: "no capacity for c7g.xlarge, m7g.xlarge in any subnet: InsufficientInstanceCapacity: We currently do not have sufficient capacity in the Availability Zone you requested.",
+        attempts: 3, wait: "backoff", inMinutes: 2,
+      }),
+      job("build (ios)", "hatchrun-16cpu", "in_progress", "launched", 6, 0),
+    ]),
+    run(18234567702, { repository: "acme-corp/data", workflowName: "Backfill", event: "workflow_dispatch", displayTitle: "Backfill" }, [
+      job("load", "hatchrun-8cpu/spot=true", "queued", "failed", 8, 0, {
+        launchError: "OptInRequired: subscribe this account to the hatchrun runner images in AWS Marketplace", wait: "setup",
+      }),
+    ]),
+    run(18234567650, { repository: "acme-corp/web", workflowName: "CI", displayTitle: "feat(web): show runs as a tree" }, [
+      job("lint", "hatchrun-2cpu", "completed", "launched", 40, 60),
+      job("test", "hatchrun-2cpu", "in_progress", "launched", 2, 0, { runAttempt: 2 }),
+    ], [job("test", "hatchrun-2cpu", "completed", "launched", 40, 200, { conclusion: "failure" })]),
+    run(18234567600, { repository: "acme-corp/infra", workflowName: "Nightly", event: "schedule", headBranch: "main" }, [
+      job("plan", "hatchrun-16cpu/disk=300", "completed", "failed", 22, 4, {
+        conclusion: "cancelled",
+        launchError: "hatchrun-16cpu asks for a 300 GiB root volume and the connect stack allows at most 200 GiB. Raise VolumeSizeLimit on the stack or ask for less.",
+      }),
+    ]),
+    ...done,
+  ].sort((a, b) => b.queuedAt - a.queuedAt || b.id - a.id);
 }
 
 // The same groups as the counts query in crates/cloud/src/app/dashboard.rs.

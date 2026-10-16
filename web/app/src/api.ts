@@ -208,10 +208,15 @@ export const connectAws = (org: string, region: string, roleArn: string) =>
 
 export interface Job {
   id: number;
-  repository: string;
   runId: number;
+  /** The job's name as the run shows it, such as "Save (host)". */
+  name: string;
+  /** The run attempt the job belongs to, from 1. */
+  runAttempt: number;
   label: string;
   status: "queued" | "in_progress" | "completed";
+  /** GitHub's, once completed: success, failure, cancelled, skipped, timed_out, neutral, action_required. */
+  conclusion: string | null;
   launchState: "launching" | "launched" | "failed" | null;
   runnerName: string | null;
   instanceId: string | null;
@@ -225,9 +230,39 @@ export interface Job {
   launchRetry: "backoff" | "setup" | null;
   /** Unix milliseconds. */
   nextLaunchAt: number | null;
-  /** Unix milliseconds. */
+  /** Unix milliseconds: when hatchrun heard of the job. */
   queuedAt: number;
+  /** Unix milliseconds, GitHub's: when a runner took the job, and when it finished. */
+  startedAt: number | null;
+  completedAt: number | null;
   updatedAt: number;
+}
+
+/** A workflow run with at least one hatchrun job. */
+export interface Run {
+  id: number;
+  repository: string;
+  workflowName: string | null;
+  headBranch: string | null;
+  headSha: string;
+  /** The newest attempt. */
+  attempt: number;
+  /** Unix milliseconds: when the newest attempt's first job was queued. */
+  queuedAt: number;
+  /** Null until hatchrun has read the run on GitHub. */
+  runNumber: number | null;
+  event: string | null;
+  displayTitle: string | null;
+  actor: string | null;
+  path: string | null;
+  githubUrl: string;
+}
+
+/** A run in the list, with its current jobs: the newest attempt of each job name. */
+export interface ListedRun extends Run {
+  jobs: Job[];
+  /** Jobs of earlier attempts that later ones replaced. */
+  olderJobs: number;
 }
 
 export interface JobCounts {
@@ -237,6 +272,10 @@ export interface JobCounts {
   running?: number;
   completedToday: number;
   failedToday: number;
+  /** Runs with a job in each group, as the status tabs list them. */
+  waitingRuns: number;
+  activeRuns: number;
+  failedRunsToday: number;
 }
 
 /** Finished and failed jobs per bucket over the last day, oldest first. */
@@ -248,8 +287,8 @@ export interface JobActivity {
   failed: number[];
 }
 
-export interface JobPage {
-  jobs: Job[];
+export interface RunPage {
+  runs: ListedRun[];
   counts: JobCounts;
   region: string | null;
   pageSize?: number;
@@ -257,20 +296,41 @@ export interface JobPage {
   activity?: JobActivity;
 }
 
-/** A status tab of the jobs table: the jobs each count in JobCounts counts. */
+/** A status tab of the runs table: the runs with a current job in the group. */
 export type JobGroup = "active" | "waiting" | "failed";
 
-export const listJobs = (org: string, { before, status }: { before?: number; status?: JobGroup } = {}) => {
+export const listRuns = (org: string, { before, status }: { before?: Run; status?: JobGroup } = {}) => {
   const query = new URLSearchParams();
   if (status) {
     query.set("status", status);
   }
   if (before) {
-    query.set("before", String(before));
+    query.set("before", `${before.queuedAt}:${before.id}`);
   }
   const search = query.toString();
-  return get<JobPage>(`${tenantPath(org)}/jobs${search ? `?${search}` : ""}`);
+  return get<RunPage>(`${tenantPath(org)}/runs${search ? `?${search}` : ""}`);
 };
+
+/** What one job used of its instance; maxima are approximate when the data is sampled. */
+export interface JobResources {
+  /** The job id, as a string. */
+  job: string;
+  cpuAvg: number | null;
+  cpuMax: number | null;
+  memMax: number | null;
+  memTotal: number | null;
+  oomKills: number | null;
+}
+
+export interface RunDetail {
+  run: Run & { jobs: (Job & { current: boolean })[] };
+  region: string | null;
+  /** null when the numbers could not be read. */
+  resources: JobResources[] | null;
+}
+
+export const getRun = (org: string, id: string) => get<RunDetail>(`${tenantPath(org)}/runs/${encodeURIComponent(id)}`);
+
 /** Ten seconds of a runner's samples, as the agent summed them up. */
 export interface MetricsWindow {
   /** When the window ended, Unix seconds. */
@@ -311,7 +371,22 @@ export interface JobMetrics {
   githubUrl: string;
   /** The tenant's region, for the instance's console page; null when AWS is not connected. */
   region?: string | null;
-  job: Pick<Job, "id" | "repository" | "runId" | "label" | "status" | "runnerName" | "instanceId" | "queuedAt" | "updatedAt">;
+  job: Pick<
+    Job,
+    | "id"
+    | "runId"
+    | "name"
+    | "runAttempt"
+    | "label"
+    | "status"
+    | "conclusion"
+    | "runnerName"
+    | "instanceId"
+    | "queuedAt"
+    | "startedAt"
+    | "completedAt"
+    | "updatedAt"
+  > & { repository: string; workflowName: string | null; runNumber: number | null };
   /** null when the runner reported nothing. */
   summary: MetricsSummary | null;
   /** Oldest first. */
