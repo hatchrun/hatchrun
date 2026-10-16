@@ -15,12 +15,23 @@ path = [
   ".gitignore",
   "Cargo.lock",
   "NOTICE",
+  "web/app/components.json",
   "web/app/package.json",
   "web/app/package-lock.json",
   "web/app/tsconfig.json",
 ]
 SPDX-FileCopyrightText = "Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>"
 SPDX-License-Identifier = "AGPL-3.0-only"
+
+# Components copied from shadcn/ui (https://ui.shadcn.com) and themed
+# for hatchrun. shadcn/ui is MIT-licensed.
+[[annotations]]
+path = ["web/app/src/components/ui/**"]
+SPDX-FileCopyrightText = [
+  "Copyright 2023 shadcn",
+  "Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>",
+]
+SPDX-License-Identifier = "MIT"
 
 # The hatchrun logo and icons are proprietary brand assets, not covered
 # by the AGPL. Source: hatchrun/brand.

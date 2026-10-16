@@ -4,7 +4,15 @@
 
 import { useState } from "react";
 
-export function CopyButton({ text, label = "Copy" }: { text: string; label?: string }) {
+export function CopyButton({
+  text,
+  label = "Copy",
+  className = "button button-small",
+}: {
+  text: string;
+  label?: string;
+  className?: string;
+}) {
   const [copied, setCopied] = useState(false);
   const copy = async () => {
     try {
@@ -17,8 +25,8 @@ export function CopyButton({ text, label = "Copy" }: { text: string; label?: str
     }
   };
   return (
-    <button type="button" className="button button-small" onClick={copy} aria-live="polite">
-      {copied ? "Copied" : label}
+    <button type="button" className={className} onClick={copy} aria-live="polite">
+      {copied ? (label === label.toLowerCase() ? "copied" : "Copied") : label}
     </button>
   );
 }
