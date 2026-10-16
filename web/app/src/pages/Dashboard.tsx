@@ -53,7 +53,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
   const [status, setStatus] = useState<JobGroup | undefined>(undefined);
   // The newest page of the last tab loaded. The fleet panel keeps showing
   // it while another tab loads; the table shows it only for its own tab.
-  const [loaded, setLoaded] = useState<{ status: JobGroup | undefined; page: RunPage } | null>(null);
+  const [loaded, setLoaded] = useState<{ status: JobGroup | undefined; page: RunPage; at: number } | null>(null);
   const [older, setOlder] = useState<ListedRun[]>([]);
   // Runs the user opened or closed; the rest follow `openByDefault`.
   const [toggled, setToggled] = useState<Record<number, boolean>>({});
@@ -72,7 +72,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
       listRuns(org, { status }).then(
         (next) => {
           if (current) {
-            setLoaded({ status, page: next });
+            setLoaded({ status, page: next, at: Date.now() });
             setError(null);
           }
         },
@@ -136,10 +136,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1.5">
           <h1 className="display text-[26px]">Jobs</h1>
-          <span className="inline-flex items-center gap-2 font-mono text-xs text-fog">
-            <span aria-hidden="true" className={cn("size-1.5 rounded-full", error ? "bg-failed" : "bg-passed")} />
-            {error ? "refresh failed, trying again" : `live, refreshes every ${REFRESH} s`}
-          </span>
+          <Updated at={loaded?.at ?? null} failed={error !== null} />
         </div>
         <RunsOn text={SUGGESTED} />
       </div>
@@ -242,6 +239,23 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
         )}
       </section>
     </div>
+  );
+}
+
+/** When the list last came back, ticking, or that the last refresh failed. */
+function Updated({ at, failed }: { at: number | null; failed: boolean }) {
+  const now = useNow(1000);
+  if (failed) {
+    return <span className="font-mono text-xs text-failed">refresh failed, trying again</span>;
+  }
+  if (at === null) {
+    return null;
+  }
+  const seconds = Math.max(0, Math.round((now - at) / 1000));
+  return (
+    <span className="font-mono text-xs text-fog" title={`Refreshes every ${REFRESH} s`}>
+      updated {seconds < 1 ? "just now" : seconds < 60 ? `${seconds} s ago` : ago(at)}
+    </span>
   );
 }
 

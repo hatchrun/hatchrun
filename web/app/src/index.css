@@ -34,7 +34,6 @@
   --blush: #ff9466;
   --ember: #6a3010;
   --passed: #40ff80;
-  --passed-halo: #142a1b;
   --failed: #e6398f;
   --failed-soft: #f7a8cf;
 
@@ -98,7 +97,6 @@
   --color-blush: var(--blush);
   --color-ember: var(--ember);
   --color-passed: var(--passed);
-  --color-passed-halo: var(--passed-halo);
   --color-failed: var(--failed);
   --color-failed-soft: var(--failed-soft);
 

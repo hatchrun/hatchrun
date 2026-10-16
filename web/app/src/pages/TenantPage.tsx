@@ -92,7 +92,6 @@ function CloudAccount({ org, aws }: { org: string; aws: Aws }) {
       title="Connected AWS account, opens Settings"
       className="hidden items-center gap-2 font-mono text-xs text-fog hover:text-bone md:flex"
     >
-      <span aria-hidden="true" className="size-[7px] rounded-full bg-passed shadow-[0_0_0_3px_var(--passed-halo)]" />
       aws
       {account && <span className="hidden text-bone lg:inline">{account}</span>}
       <span>{aws.region}</span>
