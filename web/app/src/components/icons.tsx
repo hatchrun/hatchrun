@@ -59,6 +59,15 @@ export function ChevronLeftIcon(props: Props) {
   );
 }
 
+export function SearchIcon(props: Props) {
+  return (
+    <Stroke size={13} line={2.2} {...props}>
+      <circle cx="11" cy="11" r="6.5" />
+      <path d="M16 16l4.5 4.5" />
+    </Stroke>
+  );
+}
+
 export function UpDownIcon({ size = 12, ...rest }: Props) {
   return (
     <svg aria-hidden="true" width={size} height={size} viewBox="0 0 16 16" fill="currentColor" {...rest}>

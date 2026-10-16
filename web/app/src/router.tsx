@@ -37,6 +37,26 @@ export function navigate(to: string, replace = false) {
   }
 }
 
+/**
+ * Sets or, for null and "", drops query parameters of the current
+ * location in place: no new history entry and no scroll, for a view's
+ * filters as they change.
+ */
+export function setQuery(params: Record<string, string | null>) {
+  const url = new URL(window.location.href);
+  for (const [name, value] of Object.entries(params)) {
+    if (value) {
+      url.searchParams.set(name, value);
+    } else {
+      url.searchParams.delete(name);
+    }
+  }
+  window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+  for (const listener of listeners) {
+    listener();
+  }
+}
+
 /** A query parameter of the current location. */
 export function useQuery(name: string): string | null {
   const current = useLocation();

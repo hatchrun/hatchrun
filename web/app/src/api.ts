@@ -318,13 +318,42 @@ export interface RunPage {
 /** A status tab of the runs table: the runs with a current job in the group. */
 export type JobGroup = "active" | "waiting" | "failed";
 
-export const listRuns = (org: string, { before, status }: { before?: Run; status?: JobGroup } = {}) => {
+/**
+ * The columns the runs table sorts by. By repository, each repository's
+ * runs are newest first. A run's duration and state are left out: both
+ * change while it runs, so a page boundary in either would move.
+ */
+export type RunSort = "started" | "repository";
+export type SortDir = "asc" | "desc";
+
+export interface RunQuery {
+  /** The last run of the page before. */
+  before?: Run;
+  status?: JobGroup;
+  /** Started, newest first, when not set. */
+  sort?: RunSort;
+  dir?: SortDir;
+  /** Text a run's repository, workflow or branch, or one of its jobs' name, label or instance, contains. */
+  q?: string;
+}
+
+export const listRuns = (org: string, { before, status, sort = "started", dir = "desc", q }: RunQuery = {}) => {
   const query = new URLSearchParams();
   if (status) {
     query.set("status", status);
   }
+  if (sort !== "started" || dir !== "desc") {
+    query.set("sort", sort);
+    query.set("dir", dir);
+  }
+  if (q) {
+    query.set("q", q);
+  }
   if (before) {
-    query.set("before", `${before.queuedAt}:${before.id}`);
+    query.set(
+      "before",
+      sort === "repository" ? `${before.queuedAt}:${before.id}:${before.repository}` : `${before.queuedAt}:${before.id}`,
+    );
   }
   const search = query.toString();
   return get<RunPage>(`${tenantPath(org)}/runs${search ? `?${search}` : ""}`);
