@@ -67,6 +67,10 @@ pub struct Boot {
     /// scaler and configs from user data or SSM do not.
     #[serde(default)]
     pub telemetry: Option<Telemetry>,
+    /// Where the job cache lives. hatchrun.io sets it for profiles with
+    /// the `cache` extra on a stack that has a cache bucket.
+    #[serde(default)]
+    pub cache: Option<Cache>,
 }
 
 /// Where a hosted runner reports its metrics.
@@ -87,11 +91,30 @@ impl std::fmt::Debug for Telemetry {
     }
 }
 
+/// The job cache API of a hosted runner.
+#[derive(PartialEq, Eq, Deserialize)]
+pub struct Cache {
+    /// `/v1/cache` on hatchrun-cloud.
+    pub url: String,
+    /// The bearer token that names the runner's job. It stays in
+    /// memory and out of the log.
+    pub token: String,
+}
+
+impl std::fmt::Debug for Cache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cache")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Boot {
     fn config(jit_config: String) -> Self {
         Self {
             jit_config,
             telemetry: None,
+            cache: None,
         }
     }
 }
@@ -390,7 +413,7 @@ mod tests {
         };
         let broker = FakeBroker {
             config: Some(
-                r#"{"jitConfig":"jit-from-broker","telemetry":{"url":"https://telemetry.example.com","token":"a.b.c"}}"#,
+                r#"{"jitConfig":"jit-from-broker","telemetry":{"url":"https://telemetry.example.com","token":"a.b.c"},"cache":{"url":"https://app.example.com/v1/cache","token":"d.e.f"}}"#,
             ),
             missing_claims: Cell::new(2),
             ..Default::default()
@@ -404,6 +427,10 @@ mod tests {
                 telemetry: Some(Telemetry {
                     url: "https://telemetry.example.com".into(),
                     token: "a.b.c".into(),
+                }),
+                cache: Some(Cache {
+                    url: "https://app.example.com/v1/cache".into(),
+                    token: "d.e.f".into(),
                 }),
             }
         );

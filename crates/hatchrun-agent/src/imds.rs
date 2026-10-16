@@ -55,6 +55,17 @@ impl Imds {
             .context("instance metadata has no instance-type")
     }
 
+    /// Returns the instance's primary private IPv4 address.
+    pub async fn private_ip(&self) -> Result<std::net::IpAddr> {
+        let ip = self
+            .text("meta-data/local-ipv4")
+            .await?
+            .context("instance metadata has no local-ipv4")?;
+        ip.trim()
+            .parse()
+            .with_context(|| format!("instance metadata local-ipv4 {ip:?}"))
+    }
+
     /// Fetches a path under /latest/. Returns `None` on 404. Connection
     /// errors are retried, because the network may still be coming up when
     /// the agent starts.
@@ -161,6 +172,22 @@ mod tests {
 
         let imds = Imds::new(&server.uri()).unwrap();
         assert_eq!(imds.instance_id().await.unwrap(), "i-0123");
+    }
+
+    #[tokio::test]
+    async fn reads_the_private_ip() {
+        let server = server().await;
+        Mock::given(method("GET"))
+            .and(path("/latest/meta-data/local-ipv4"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("10.0.3.17"))
+            .mount(&server)
+            .await;
+
+        let imds = Imds::new(&server.uri()).unwrap();
+        assert_eq!(
+            imds.private_ip().await.unwrap(),
+            std::net::IpAddr::from([10, 0, 3, 17])
+        );
     }
 
     #[tokio::test]
