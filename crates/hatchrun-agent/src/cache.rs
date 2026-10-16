@@ -14,9 +14,10 @@
 //! entries in the tenant's S3 bucket:
 //!
 //! - a lookup answers a download URL on the proxy for the presigned S3
-//!   GET the cloud found. A plain GET of it is redirected to S3; a
-//!   ranged one, which `BuildKit` sends with `x-ms-range`, is fetched from
-//!   S3 with `Range` and passed through.
+//!   GET the cloud found. A GET of it is fetched from S3 and streamed
+//!   back, with `Range` or `BuildKit`'s `x-ms-range` sent on as `Range`.
+//!   The toolkit's HTTP client is built for the proxy's `http:` URL and
+//!   cannot follow a redirect to S3's `https:` one.
 //! - a create starts an S3 multipart upload and answers an upload URL
 //!   on the proxy. An existing entry answers 409 `already_exists`,
 //!   which `BuildKit` relies on to number its index entries.
@@ -87,7 +88,7 @@ const MAX_SMALL_BODY: usize = 4 << 20;
 /// The Azure Blob version the proxy answers as.
 const AZURE_VERSION: &str = "2024-11-04";
 /// Upload URLs are `/cache/upload/<id>`, download URLs
-/// `/cache/download/<n>`. Azure clients read the path of a URL on an IP
+/// `/cache/download/<token>`. Azure clients read the path of a URL on an IP
 /// address as `/<account>/<container>/<blob>` and want all three.
 const UPLOAD_PATH: &str = "/cache/upload/";
 const DOWNLOAD_PATH: &str = "/cache/download/";
@@ -110,10 +111,10 @@ struct State {
     results: String,
     http: reqwest::Client,
     uploads: Mutex<Uploads>,
-    /// Presigned GETs by the number in their download URL.
-    downloads: Mutex<HashMap<u64, String>>,
+    /// Entries looked up, by the token in their download URL.
+    downloads: Mutex<HashMap<String, Download>>,
     blocks: Semaphore,
-    /// Numbers download URLs, request ids and entry ids.
+    /// Numbers request ids and entry ids.
     counter: AtomicU64,
 }
 
@@ -121,6 +122,23 @@ impl State {
     fn next(&self) -> u64 {
         self.counter.fetch_add(1, Ordering::Relaxed) + 1
     }
+}
+
+/// An entry a lookup found.
+struct Download {
+    /// Presigned GET of the entry.
+    url: String,
+    /// Bytes.
+    size: u64,
+}
+
+/// The secret part of a download URL. Any process on the instance can
+/// reach the proxy, so a download URL must not be guessable from the
+/// ones before it: knowing one lets a process read the entry.
+fn download_token() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|err| anyhow!("random download token: {err}"))?;
+    Ok(format!("{:032x}", u128::from_be_bytes(bytes)))
 }
 
 /// Uploads by their cloud id, and their cloud ids by key and version.
@@ -308,14 +326,14 @@ async fn handle(state: &State, req: Request<Incoming>) -> Reply {
             )
         };
     }
-    if let Some(n) = path.strip_prefix(DOWNLOAD_PATH) {
-        return if req.method() == Method::GET {
-            download(state, n, req.headers()).await
-        } else {
-            azure_error(
+    if let Some(token) = path.strip_prefix(DOWNLOAD_PATH) {
+        return match *req.method() {
+            Method::GET => download(state, token, req.headers()).await,
+            Method::HEAD => head(state, token),
+            _ => azure_error(
                 state,
                 &blob::Error::new(405, "UnsupportedHttpVerb", "download URLs take GET"),
-            )
+            ),
         };
     }
     if path == "/healthz" {
@@ -412,16 +430,26 @@ async fn lookup(state: &State, request: twirp::LookupRequest) -> Reply {
                 size = hit.size,
                 "cache hit"
             );
-            let n = state.next();
-            state
-                .downloads
-                .lock()
-                .expect("downloads lock")
-                .insert(n, hit.url);
-            twirp::LookupResponse {
-                ok: true,
-                signed_download_url: format!("{}{DOWNLOAD_PATH}{n}", state.base),
-                matched_key: hit.key,
+            match download_token() {
+                Ok(token) => {
+                    let url = format!("{}{DOWNLOAD_PATH}{token}", state.base);
+                    state.downloads.lock().expect("downloads lock").insert(
+                        token,
+                        Download {
+                            url: hit.url,
+                            size: hit.size,
+                        },
+                    );
+                    twirp::LookupResponse {
+                        ok: true,
+                        signed_download_url: url,
+                        matched_key: hit.key,
+                    }
+                }
+                Err(err) => {
+                    warn!(key = request.key, "answering a miss: {err:#}");
+                    twirp::LookupResponse::miss()
+                }
             }
         }
         Ok(None) => {
@@ -544,36 +572,36 @@ async fn abandon(state: &State, id: &str) {
     }
 }
 
-/// Without a range the client is sent to S3. With one, `x-ms-range`
-/// from the Azure SDKs or `Range`, S3's answer is passed through, since
-/// S3 ignores `x-ms-range` and would answer the whole entry.
-async fn download(state: &State, n: &str, headers: &HeaderMap) -> Reply {
-    let url = n.parse::<u64>().ok().and_then(|n| {
-        state
-            .downloads
-            .lock()
-            .expect("downloads lock")
-            .get(&n)
-            .cloned()
-    });
-    let Some(url) = url else {
-        return azure_error(
-            state,
-            &blob::Error::new(404, "BlobNotFound", "no such entry"),
-        );
+/// The presigned GET and size of the entry behind a download token.
+fn entry(state: &State, token: &str) -> Option<(String, u64)> {
+    state
+        .downloads
+        .lock()
+        .expect("downloads lock")
+        .get(token)
+        .map(|download| (download.url.clone(), download.size))
+}
+
+fn no_entry(state: &State) -> Reply {
+    azure_error(
+        state,
+        &blob::Error::new(404, "BlobNotFound", "no such entry"),
+    )
+}
+
+/// Streams the entry from S3. A range, `x-ms-range` from the Azure SDKs
+/// or `Range`, goes to S3 as `Range`, since S3 ignores `x-ms-range`.
+/// S3's status, 200 or 206, and its length and range headers come back
+/// with the body; the toolkit checks the file it wrote against
+/// `Content-Length`.
+async fn download(state: &State, token: &str, headers: &HeaderMap) -> Reply {
+    let Some((url, _)) = entry(state, token) else {
+        return no_entry(state);
     };
     let range = headers
         .get("x-ms-range")
         .or_else(|| headers.get(header::RANGE))
         .and_then(|value| value.to_str().ok());
-    let Some(range) = range else {
-        let mut response = reply(StatusCode::TEMPORARY_REDIRECT, "text/plain", Bytes::new());
-        if let Ok(location) = HeaderValue::from_str(&url) {
-            response.headers_mut().insert(header::LOCATION, location);
-        }
-        azure_headers(state, response.headers_mut());
-        return response;
-    };
     let upstream = match state.cloud.download(&url, range).await {
         Ok(upstream) => upstream,
         Err(err) => {
@@ -584,6 +612,9 @@ async fn download(state: &State, n: &str, headers: &HeaderMap) -> Reply {
             );
         }
     };
+    if !upstream.status().is_success() {
+        warn!(status = %upstream.status(), range, "cache download refused by S3");
+    }
     let mut response = passthrough(
         upstream,
         &[
@@ -596,6 +627,21 @@ async fn download(state: &State, n: &str, headers: &HeaderMap) -> Reply {
         ],
     );
     let headers = response.headers_mut();
+    headers.insert("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
+    azure_headers(state, headers);
+    response
+}
+
+/// The entry's length, from the lookup: a presigned GET does not take
+/// HEAD. The toolkit's concurrent download sizes the entry this way.
+fn head(state: &State, token: &str) -> Reply {
+    let Some((_, size)) = entry(state, token) else {
+        return no_entry(state);
+    };
+    let mut response = reply(StatusCode::OK, "application/octet-stream", Bytes::new());
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
     azure_headers(state, headers);
     response
@@ -1123,9 +1169,76 @@ mod tests {
         assert_eq!(finalize(&proxy, "k").await["ok"], false);
     }
 
+    const ENTRY: &[u8] = b"0123456789";
+
+    /// An S3 that serves [`ENTRY`] at `/s3/entry`, whole or by `Range`,
+    /// and refuses a request that is not signed.
+    async fn s3(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/s3/entry"))
+            .respond_with(|req: &wiremock::Request| {
+                if !req.url.query().unwrap_or("").contains("X-Amz-Signature=") {
+                    return ResponseTemplate::new(403).set_body_string("<Error/>");
+                }
+                let Some(range) = req.headers.get("range") else {
+                    return ResponseTemplate::new(200).set_body_bytes(ENTRY.to_vec());
+                };
+                let (start, end) = range
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix("bytes=")
+                    .unwrap()
+                    .split_once('-')
+                    .unwrap();
+                let start: usize = start.parse().unwrap();
+                let end: usize = end.parse().unwrap_or(ENTRY.len() - 1);
+                ResponseTemplate::new(206)
+                    .insert_header(
+                        "Content-Range",
+                        format!("bytes {start}-{end}/{}", ENTRY.len()),
+                    )
+                    .set_body_bytes(ENTRY[start..=end].to_vec())
+            })
+            .mount(server)
+            .await;
+    }
+
+    /// A cloud whose lookups find [`ENTRY`] behind `entry`.
+    async fn found(server: &MockServer, entry: &str) {
+        Mock::given(method("POST"))
+            .and(path("/v1/cache/lookup"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "key": "npm-old", "url": entry, "size": ENTRY.len()
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn look_up(proxy: &Proxy) -> String {
+        let (status, body) = rpc(
+            proxy,
+            "GetCacheEntryDownloadURL",
+            json!({ "key": "npm-abc", "restore_keys": ["npm-"], "version": "v1" }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ok"], true, "{body}");
+        body["signed_download_url"].as_str().unwrap().to_owned()
+    }
+
+    /// The client the toolkit downloads with is built for the proxy's
+    /// `http:` URL and cannot follow a redirect to S3.
+    fn no_redirects() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn restores_from_s3() {
         let server = cloud().await;
+        s3(&server).await;
         let entry = format!("{}/s3/entry?X-Amz-Signature=abc", server.uri());
         Mock::given(method("POST"))
             .and(path("/v1/cache/lookup"))
@@ -1135,16 +1248,6 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "key": "npm-old", "url": entry, "size": 10
             })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/s3/entry"))
-            .and(wiremock::matchers::header("range", "bytes=4-"))
-            .respond_with(
-                ResponseTemplate::new(206)
-                    .insert_header("Content-Range", "bytes 4-9/10")
-                    .set_body_bytes(b"456789".to_vec()),
-            )
             .mount(&server)
             .await;
         let proxy = proxy(&server).await;
@@ -1159,27 +1262,109 @@ mod tests {
         assert_eq!(body["ok"], true);
         assert_eq!(body["matched_key"], "npm-old");
         let url = body["signed_download_url"].as_str().unwrap();
+        assert!(
+            url.starts_with(&format!("{}cache/download/", proxy.url())),
+            "{url}"
+        );
 
-        // A plain GET goes to S3.
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
+        // The toolkit's single GET, which checks Content-Length.
+        let response = no_redirects().get(url).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-length"], "10");
+        assert!(response.headers().contains_key("x-ms-request-id"));
+        assert_eq!(response.bytes().await.unwrap(), ENTRY);
+
+        let received = server.received_requests().await.unwrap();
+        let get = received
+            .iter()
+            .find(|req| req.url.path() == "/s3/entry")
             .unwrap();
-        let response = http.get(url).send().await.unwrap();
-        assert_eq!(response.status(), 307);
-        assert_eq!(response.headers()["location"], entry.as_str());
+        assert!(!get.headers.contains_key("range"));
+    }
 
-        // A ranged one, as the Go Azure SDK sends it, comes through.
+    #[tokio::test]
+    async fn passes_ranges_through() {
+        let server = cloud().await;
+        s3(&server).await;
+        found(
+            &server,
+            &format!("{}/s3/entry?X-Amz-Signature=abc", server.uri()),
+        )
+        .await;
+        let proxy = proxy(&server).await;
+        let url = look_up(&proxy).await;
+        let http = no_redirects();
+
+        // The toolkit's concurrent download: HEAD for the length, then
+        // ranged GETs at once.
+        let response = http.head(&url).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-length"], "10");
+        assert_eq!(response.headers()["accept-ranges"], "bytes");
+        let get = |range: &'static str| http.get(&url).header("Range", range).send();
+        let (first, second) = tokio::join!(get("bytes=0-4"), get("bytes=5-9"));
+        let mut body = Vec::new();
+        for (response, range) in [(first, "bytes 0-4/10"), (second, "bytes 5-9/10")] {
+            let response = response.unwrap();
+            assert_eq!(response.status(), 206);
+            assert_eq!(response.headers()["content-range"], range);
+            assert_eq!(response.headers()["content-length"], "5");
+            body.extend_from_slice(&response.bytes().await.unwrap());
+        }
+        assert_eq!(body, ENTRY);
+
+        // BuildKit's Go Azure SDK, which S3 would ignore.
         let response = http
-            .get(url)
+            .get(&url)
             .header("x-ms-range", "bytes=4-")
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), 206);
         assert_eq!(response.headers()["content-range"], "bytes 4-9/10");
-        assert!(response.headers().contains_key("x-ms-request-id"));
+        assert_eq!(response.headers()["x-ms-blob-type"], "BlockBlob");
         assert_eq!(response.bytes().await.unwrap(), &b"456789"[..]);
+    }
+
+    #[tokio::test]
+    async fn download_urls_are_not_guessable() {
+        let server = cloud().await;
+        s3(&server).await;
+        found(
+            &server,
+            &format!("{}/s3/entry?X-Amz-Signature=abc", server.uri()),
+        )
+        .await;
+        let proxy = proxy(&server).await;
+
+        let first = look_up(&proxy).await;
+        let second = look_up(&proxy).await;
+        assert_ne!(first, second);
+        let base = format!("{}cache/download/", proxy.url());
+        for url in [&first, &second] {
+            let token = url.strip_prefix(&base).unwrap();
+            assert_eq!(token.len(), 32, "{token}");
+            assert!(token.bytes().all(|b| b.is_ascii_hexdigit()), "{token}");
+        }
+
+        for guess in ["1", "2", "3", "0000"] {
+            let url = format!("{base}{guess}");
+            assert_eq!(reqwest::get(&url).await.unwrap().status(), 404);
+            let response = reqwest::Client::new().head(&url).send().await.unwrap();
+            assert_eq!(response.status(), 404);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_s3_refusal_passes_through() {
+        let server = cloud().await;
+        s3(&server).await;
+        found(&server, &format!("{}/s3/entry", server.uri())).await;
+        let proxy = proxy(&server).await;
+        let url = look_up(&proxy).await;
+
+        let response = no_redirects().get(&url).send().await.unwrap();
+        assert_eq!(response.status(), 403);
     }
 
     #[tokio::test]
