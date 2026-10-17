@@ -38,6 +38,28 @@ database_name = "hatchrun-cloud"
 database_id = "local"
 migrations_dir = "migrations"
 
+# Launches. The webhook sends each queued job here and this Worker's
+# consumer launches it (crates/cloud/src/launches.rs), so a launch
+# outlives the webhook request. Messages that fail max_retries times go
+# to the dead-letter queue; the reconciler launches their jobs again.
+[[queues.producers]]
+binding = "LAUNCHES"
+queue = "hatchrun-launches"
+
+# Small batches, sent after a second at most, so a runner's start does
+# not wait for other jobs. max_concurrency caps the batches launching at
+# once, and so the launches in flight: each one calls GitHub for an
+# installation token and a runner registration, and a burst from one
+# organization would otherwise spend its installation's rate limit,
+# which the reconciler and the app share.
+[[queues.consumers]]
+queue = "hatchrun-launches"
+max_batch_size = 5
+max_batch_timeout = 1
+max_retries = 3
+max_concurrency = 10
+dead_letter_queue = "hatchrun-launches-dlq"
+
 # Runner metrics, which hatchrun-telemetry (crates/telemetry) writes to
 # Analytics Engine, read back for the app's job pages.
 [analytics]

@@ -2,9 +2,10 @@ name: deploy-cloud
 
 # Deploys crates/cloud, the Worker behind hatchrun.io, and the app in
 # web/app, which the Worker serves on app.hatchrun.io, from main. The
-# API token can edit Workers and D1 in the hatchrun account only, and
-# only this job, on main, in the protected production environment, can
-# read it. The account comes from the CLOUDFLARE_ACCOUNT_ID secret.
+# API token can edit Workers, D1 and Queues in the hatchrun account
+# only, and only this job, on main, in the protected production
+# environment, can read it. The account comes from the
+# CLOUDFLARE_ACCOUNT_ID secret.
 
 on:
   push:
