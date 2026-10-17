@@ -38,6 +38,13 @@ database_name = "hatchrun-cloud"
 database_id = "local"
 migrations_dir = "migrations"
 
+# Installation tokens, reused until shortly before they expire
+# (crates/cloud/src/tokens.rs). The deploy workflow sets id from the
+# CLOUDFLARE_KV_TOKENS_ID secret.
+[[kv_namespaces]]
+binding = "TOKENS"
+id = "local"
+
 # Launches. The webhook sends each queued job here and this Worker's
 # consumer launches it (crates/cloud/src/launches.rs), so a launch
 # outlives the webhook request. Messages that fail max_retries times go
@@ -48,10 +55,9 @@ queue = "hatchrun-launches"
 
 # Small batches, sent after a second at most, so a runner's start does
 # not wait for other jobs. max_concurrency caps the batches launching at
-# once, and so the launches in flight: each one calls GitHub for an
-# installation token and a runner registration, and a burst from one
-# organization would otherwise spend its installation's rate limit,
-# which the reconciler and the app share.
+# once, and so the launches in flight: each one registers a runner
+# with GitHub, and a burst from one organization would otherwise spend
+# its installation's rate limit, which the reconciler and the app share.
 [[queues.consumers]]
 queue = "hatchrun-launches"
 max_batch_size = 5

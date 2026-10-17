@@ -79,6 +79,14 @@ jobs:
           sed -i "s/^database_id = \"local\"$/database_id = \"${DATABASE_ID}\"/" wrangler.toml
           grep -qx "database_id = \"${DATABASE_ID}\"" wrangler.toml
 
+      - name: Point at the production token namespace
+        env:
+          NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_TOKENS_ID }}
+        run: |
+          test -n "$NAMESPACE_ID"
+          sed -i "s/^id = \"local\"$/id = \"${NAMESPACE_ID}\"/" wrangler.toml
+          grep -qx "id = \"${NAMESPACE_ID}\"" wrangler.toml
+
       # Migrations only add tables and columns, so the running Worker
       # keeps working against the new schema until the deploy lands.
       - name: Apply D1 migrations

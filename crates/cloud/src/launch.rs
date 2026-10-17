@@ -18,7 +18,8 @@
 //! 2. sign an `oidc.hatchrun.io` token for the tenant and trade it for
 //!    the tenant role's credentials;
 //! 3. register a just-in-time runner with the job's label through the
-//!    App installation;
+//!    App installation, with its token kept in KV (see
+//!    [`crate::tokens`]);
 //! 4. start the instance with a fresh broker ticket in its user data:
 //!    through EC2 Fleet when the tenant's stack allows it, over every
 //!    fitting type of the newest generation in every subnet, skipping
@@ -45,13 +46,14 @@ use serde::Deserialize;
 use worker::{D1Database, Env, Result, console_error, console_log, console_warn};
 
 use crate::aws::{self, Credentials, ec2, sts};
-use crate::fetch::send;
+use crate::fetch::{Counted, send};
 use crate::http::Request;
 use crate::instance::{Choice, Limits};
 use crate::labels::Arch;
 use crate::offerings::{self, Candidate, Unavailable};
 use crate::profiles::{self, store};
 use crate::reconcile::retry::{Cause, Failure};
+use crate::tokens::{self, App, Kv, Tokens};
 use crate::webhook::QueuedJob;
 use crate::{
     DB, cache, connect, github, instance, instance_types, int, jwt, now_ms, oidc, settings,
@@ -296,34 +298,38 @@ pub(crate) async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
         return Ok(());
     };
 
-    let launched = launch_claimed(env, &db, job, &tenant, &name).await;
-    record(&db, job.id, &name, attempts, launched).await
+    let calls = Counted::default();
+    let launched = launch_claimed(env, &db, job, &tenant, &name, &calls).await;
+    record(&db, job.id, &name, attempts, launched, calls.sent()).await
 }
 
-/// Records how the job's `attempts`th launch, of runner `name`, ended.
+/// Records how the job's `attempts`th launch, of runner `name`, ended
+/// after `calls` GitHub calls.
 async fn record(
     db: &D1Database,
     job_id: u64,
     name: &str,
     attempts: u32,
     launched: std::result::Result<String, Failure>,
+    calls: u32,
 ) -> Result<()> {
     let now = now_ms();
     let (state, instance_id, error, wait, next) = match launched {
         Ok(instance_id) => {
-            console_log!("job {job_id}: runner {name} on {instance_id}");
+            console_log!("job {job_id}: runner {name} on {instance_id}, {calls} GitHub calls");
             ("launched", Some(instance_id), None, None, None)
         }
         Err(failure) => {
             let (wait, next) = failure.outcome(attempts, now);
             match next {
                 Some(at) => console_error!(
-                    "job {job_id}: launch {attempts} failed, trying again in {} s: {failure}",
+                    "job {job_id}: launch {attempts} failed after {calls} GitHub calls, \
+                     trying again in {} s: {failure}",
                     at.saturating_sub(now) / 1000
                 ),
                 None => console_error!(
-                    "job {job_id}: launch {attempts} failed, waiting for the setup to change: \
-                     {failure}"
+                    "job {job_id}: launch {attempts} failed after {calls} GitHub calls, \
+                     waiting for the setup to change: {failure}"
                 ),
             }
             ("failed", None, Some(failure.message), Some(wait), next)
@@ -396,13 +402,15 @@ async fn claim(
     Ok(claimed.map(|claimed| claimed.launch_attempts))
 }
 
-/// Everything after the claim. Returns the instance id.
+/// Everything after the claim, with GitHub calls sent through `calls`.
+/// Returns the instance id.
 async fn launch_claimed(
     env: &Env,
     db: &D1Database,
     job: &QueuedJob,
     tenant: &Tenant,
     name: &str,
+    calls: &Counted,
 ) -> std::result::Result<String, Failure> {
     let custom = store::named(db, &tenant.id, &job.spec.profile)
         .await
@@ -437,16 +445,22 @@ async fn launch_claimed(
         })?;
 
     let credentials = assume_role(&settings, job, tenant).await?;
+    let api = settings.github_api.as_str();
     let org = github::owner(&job.repository);
-    let token = installation_token(&settings, job.installation_id).await?;
-    let config = github::jit_config(
-        &github_send(
-            &github::generate_jit_config(&settings.github_api, org, &token, name, &job.label),
-            "register runner",
-        )
-        .await?,
-    )
-    .map_err(|err| Failure::new(Cause::Internal, err))?;
+    let app = App::new(
+        settings.github_api.clone(),
+        settings.app_id.clone(),
+        settings.app_key.clone(),
+    );
+    let tokens = Tokens::new(Kv::new(env), app, calls, now_ms());
+    let registered = tokens
+        .send(job.installation_id, |token| {
+            github::generate_jit_config(api, org, token, name, &job.label)
+        })
+        .await
+        .map_err(token_failure)?;
+    let config = github::jit_config(&checked(registered, "register runner")?)
+        .map_err(|err| Failure::new(Cause::Internal, err))?;
 
     let result = start(
         &settings,
@@ -462,13 +476,11 @@ async fn launch_claimed(
     )
     .await;
     if result.is_err() {
-        let removed = send(&github::delete_runner(
-            &settings.github_api,
-            org,
-            &token,
-            config.runner.id,
-        ))
-        .await;
+        let removed = tokens
+            .send(job.installation_id, |token| {
+                github::delete_runner(api, org, token, config.runner.id)
+            })
+            .await;
         match removed {
             Ok(response) if response.ok() || response.status == 404 => {}
             Ok(response) => console_warn!(
@@ -919,38 +931,21 @@ pub(crate) async fn tenant_credentials(
     sts::credentials(&response)
 }
 
-/// The GitHub API and a token of installation `installation_id`.
-pub(crate) async fn github_token(
-    env: &Env,
-    installation_id: u64,
-) -> std::result::Result<(String, String), String> {
-    let settings = Settings::read(env)?;
-    let token = installation_token(&settings, installation_id)
-        .await
-        .map_err(|err| err.to_string())?;
-    Ok((settings.github_api, token))
+/// A launch failure for a token GitHub would not mint.
+fn token_failure(err: tokens::Error) -> Failure {
+    match err {
+        tokens::Error::Settings(message) => Failure::new(Cause::Settings, message),
+        tokens::Error::Unreachable(message) => Failure::new(Cause::Unreachable, message),
+        tokens::Error::GitHub { status, message } => Failure::new(Cause::GitHub(status), message),
+        tokens::Error::Answer(message) => Failure::new(Cause::Internal, message),
+    }
 }
 
-async fn installation_token(
-    settings: &Settings,
-    installation_id: u64,
-) -> std::result::Result<String, Failure> {
-    let app_jwt = app_jwt(&settings.app_id, &settings.app_key)
-        .await
-        .map_err(|err| Failure::new(Cause::Settings, err))?;
-    let request = github::installation_token(&settings.github_api, installation_id, &app_jwt);
-    github::token(&github_send(&request, "installation token").await?)
-        .map_err(|err| Failure::new(Cause::Internal, err))
-}
-
-/// Sends a request to GitHub; an error answer fails on its status.
-async fn github_send(
-    request: &Request,
+/// GitHub's answer to `what`; an error answer fails on its status.
+fn checked(
+    response: crate::http::Response,
     what: &str,
 ) -> std::result::Result<crate::http::Response, Failure> {
-    let response = send(request)
-        .await
-        .map_err(|err| Failure::new(Cause::Unreachable, err))?;
     if !response.ok() {
         return Err(Failure::new(
             Cause::GitHub(response.status),

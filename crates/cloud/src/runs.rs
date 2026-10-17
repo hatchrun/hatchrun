@@ -20,9 +20,10 @@ use serde::Deserialize;
 use wasm_bindgen::JsValue;
 use worker::{D1Database, Env, console_warn};
 
-use crate::fetch::send;
+use crate::fetch::Counted;
 use crate::http::Response;
-use crate::{DB, github, int, launch, now_ms};
+use crate::tokens::{App, Kv, Tokens};
+use crate::{DB, github, int, now_ms};
 
 /// What the app shows of a run beyond its jobs.
 #[derive(Debug, Default, PartialEq, Eq, Deserialize)]
@@ -99,9 +100,17 @@ pub(crate) async fn record(db: &D1Database, id: u64, details: &Details) -> worke
 /// end up in the log; the reconciler asks again.
 pub async fn fetch(env: Env, installation_id: u64, repository: String, run_id: u64) {
     let fetched = async {
-        let (api, token) = launch::github_token(&env, installation_id).await?;
-        let details =
-            parse(&send(&github::workflow_run(&api, &token, &repository, run_id)).await?)?;
+        let app = App::read(&env)?;
+        let api = app.api.clone();
+        let calls = Counted::default();
+        let tokens = Tokens::new(Kv::new(&env), app, &calls, now_ms());
+        let response = tokens
+            .send(installation_id, |token| {
+                github::workflow_run(&api, token, &repository, run_id)
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        let details = parse(&response)?;
         let db = env.d1(DB).map_err(|err| err.to_string())?;
         record(&db, run_id, &details)
             .await
