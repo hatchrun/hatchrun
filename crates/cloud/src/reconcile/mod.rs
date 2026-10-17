@@ -49,9 +49,10 @@ use worker::{D1Database, D1PreparedStatement, Env, console_error, console_log, c
 use self::plan::{Instance, Job, LaunchState, Limits, Plan};
 use crate::aws::describe;
 use crate::aws::{self, Credentials, ec2, fleet, instances, ssm};
-use crate::fetch::{send, send_reading};
+use crate::fetch::{Counted, send, send_reading};
 use crate::instance_types::{self, store as catalog};
 use crate::launch::{self, APP_KEY, AWS_ENDPOINT_URL};
+use crate::tokens::{App, Kv, Tokens};
 use crate::webhook::{QueuedJob, Status};
 use crate::{DB, changes, github, int, jwt, labels, now_ms, oidc, runs};
 
@@ -478,9 +479,15 @@ impl Pass<'_> {
         launch::app_jwt(&app_id, &self.secret_der(APP_KEY)?).await
     }
 
-    async fn installation_token(&self, app_jwt: &str, installation_id: u64) -> Fallible<String> {
-        let request = github::installation_token(&self.github_api, installation_id, app_jwt);
-        github::token(&send(&request).await?)
+    /// Installation tokens for one step, kept in KV across passes (see
+    /// [`crate::tokens`]).
+    fn tokens<'c>(&self, calls: &'c Counted) -> Fallible<Tokens<'c, Kv, App, Counted>> {
+        Ok(Tokens::new(
+            Kv::new(self.env),
+            App::read(self.env)?,
+            calls,
+            self.now,
+        ))
     }
 
     /// Step 1: asks GitHub to deliver failed webhooks again.
@@ -640,7 +647,8 @@ impl Pass<'_> {
         if open.is_empty() {
             return Ok(Summary::default());
         }
-        let app_jwt = self.app_jwt().await?;
+        let calls = Counted::default();
+        let tokens = self.tokens(&calls)?;
         let mut by_installation: BTreeMap<u64, Vec<OpenJob>> = BTreeMap::new();
         for job in open {
             by_installation
@@ -649,7 +657,7 @@ impl Pass<'_> {
                 .push(job);
         }
         let results: Vec<Summary> = stream::iter(by_installation)
-            .map(|(installation_id, jobs)| self.sync_installation(&app_jwt, installation_id, jobs))
+            .map(|(installation_id, jobs)| self.sync_installation(&tokens, installation_id, jobs))
             .buffer_unordered(INSTALLATIONS_AT_ONCE)
             .collect()
             .await;
@@ -662,7 +670,7 @@ impl Pass<'_> {
 
     async fn sync_installation(
         &self,
-        app_jwt: &str,
+        tokens: &Tokens<'_, Kv, App, Counted>,
         installation_id: u64,
         jobs: Vec<OpenJob>,
     ) -> Summary {
@@ -670,32 +678,28 @@ impl Pass<'_> {
         if !self.spend(1) {
             return done;
         }
-        let token = match self.installation_token(app_jwt, installation_id).await {
-            Ok(token) => token,
-            Err(err) => {
-                console_warn!("reconcile: installation {installation_id}: {err}");
-                done.errors += 1;
-                for job in &jobs {
-                    if let Err(err) = self.checked(job, None).await {
-                        console_error!("reconcile: job {}: {err}", job.id);
-                    }
+        if let Err(err) = tokens.token(installation_id).await {
+            console_warn!("reconcile: installation {installation_id}: {err}");
+            done.errors += 1;
+            for job in &jobs {
+                if let Err(err) = self.checked(job, None).await {
+                    console_error!("reconcile: job {}: {err}", job.id);
                 }
-                return done;
             }
-        };
+            return done;
+        }
         for job in &jobs {
             if !self.spend(1) {
                 break;
             }
             done.checked += 1;
-            let seen = match send(&sync::job(
-                &self.github_api,
-                &token,
-                &job.repository,
-                job.id,
-            ))
-            .await
-            .and_then(|response| sync::parse(&response))
+            let seen = match tokens
+                .send(installation_id, |token| {
+                    sync::job(&self.github_api, token, &job.repository, job.id)
+                })
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|response| sync::parse(&response))
             {
                 Ok(seen) => Some(seen),
                 Err(err) => {
@@ -777,7 +781,8 @@ impl Pass<'_> {
             .run()
             .await
             .map_err(text)?;
-        let app_jwt = self.app_jwt().await?;
+        let calls = Counted::default();
+        let tokens = self.tokens(&calls)?;
         let mut by_installation: BTreeMap<u64, Vec<RunWithoutDetails>> = BTreeMap::new();
         for run in runs {
             by_installation
@@ -789,22 +794,21 @@ impl Pass<'_> {
             if !self.spend(1) {
                 break;
             }
-            let token = match self.installation_token(&app_jwt, installation_id).await {
-                Ok(token) => token,
-                Err(err) => {
-                    console_warn!("reconcile: installation {installation_id}: {err}");
-                    done.errors += 1;
-                    continue;
-                }
-            };
+            if let Err(err) = tokens.token(installation_id).await {
+                console_warn!("reconcile: installation {installation_id}: {err}");
+                done.errors += 1;
+                continue;
+            }
             for run in runs {
                 if !self.spend(1) {
                     break;
                 }
-                let request =
-                    github::workflow_run(&self.github_api, &token, &run.repository, run.id);
-                match send(&request)
+                match tokens
+                    .send(installation_id, |token| {
+                        github::workflow_run(&self.github_api, token, &run.repository, run.id)
+                    })
                     .await
+                    .map_err(|err| err.to_string())
                     .and_then(|response| runs::parse(&response))
                 {
                     Ok(details) => {

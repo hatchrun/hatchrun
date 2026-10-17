@@ -50,9 +50,23 @@ pub fn installation_token(api: &str, installation_id: u64, app_jwt: &str) -> Req
     )
 }
 
+/// An installation token.
 #[derive(Deserialize)]
-struct Token {
-    token: String,
+pub struct Token {
+    /// The token.
+    pub token: String,
+    /// When it stops working, such as `2026-10-13T13:00:00Z`: an hour
+    /// after it was made.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Token")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Reads the token out of the answer.
@@ -60,8 +74,8 @@ struct Token {
 /// # Errors
 ///
 /// GitHub's answer when it is not a token.
-pub fn token(response: &Response) -> Result<String, String> {
-    decode::<Token>(response, "installation token").map(|token| token.token)
+pub fn token(response: &Response) -> Result<Token, String> {
+    decode(response, "installation token")
 }
 
 /// The owner of an `owner/name` repository.
@@ -448,7 +462,9 @@ mod tests {
             status: 201,
             body: br#"{"token":"ghs_x","expires_at":"2026-10-13T13:00:00Z"}"#.to_vec(),
         };
-        assert_eq!(token(&answer).unwrap(), "ghs_x");
+        let token = token(&answer).unwrap();
+        assert_eq!(token.token, "ghs_x");
+        assert_eq!(token.expires_at.as_deref(), Some("2026-10-13T13:00:00Z"));
     }
 
     #[test]

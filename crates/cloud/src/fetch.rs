@@ -4,9 +4,39 @@
 
 //! Sends [`crate::http::Request`]s with the runtime's `fetch`.
 
+use std::cell::Cell;
+
 use worker::{Fetch, Headers, Method, RequestInit};
 
 use crate::http::{Request, Response};
+
+/// Sends requests. [`Counted`] sends them with `fetch`; tests answer
+/// them in place.
+pub(crate) trait Sender {
+    /// Sends `request`.
+    async fn send(&self, request: &Request) -> std::result::Result<Response, String>;
+}
+
+/// Sends with `fetch` and counts what it sent, so a launch can log how
+/// many GitHub calls it made.
+#[derive(Default)]
+pub(crate) struct Counted {
+    sent: Cell<u32>,
+}
+
+impl Counted {
+    /// Requests sent so far.
+    pub(crate) fn sent(&self) -> u32 {
+        self.sent.get()
+    }
+}
+
+impl Sender for Counted {
+    async fn send(&self, request: &Request) -> std::result::Result<Response, String> {
+        self.sent.set(self.sent.get() + 1);
+        send(request).await
+    }
+}
 
 /// Sends a request with the runtime's `fetch`.
 pub async fn send(request: &Request) -> std::result::Result<Response, String> {

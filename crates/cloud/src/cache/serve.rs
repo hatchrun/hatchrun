@@ -18,6 +18,11 @@
 //! Every call assumes the tenant's role. Its credentials are kept in the
 //! isolate for [`CREDENTIALS_TTL`], so a lookup costs S3 calls and
 //! not an STS call each time.
+//!
+//! A job's scopes come from its workflow run on GitHub, up to four calls
+//! against the installation's rate limit. The first job of a run to call
+//! works them out and keeps them on the run's row, where the run's other
+//! jobs find them.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -25,7 +30,7 @@ use std::collections::HashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
-use worker::{D1Database, Env, Method, Request, Response, Result, console_warn};
+use worker::{D1Database, Env, Method, Request, Response, Result, console_log, console_warn};
 
 use super::{
     CREDENTIALS_TTL, Claims, CompleteRequest, LookupRequest, LookupResponse, MAX_PAGES,
@@ -34,12 +39,11 @@ use super::{
 };
 use crate::aws::s3::{self, Completed, Object, Part};
 use crate::aws::{self, Credentials};
-use crate::fetch::send;
+use crate::fetch::{Counted, Sender, send};
 use crate::http::Request as Outgoing;
-use crate::launch::{
-    APP_ID, APP_KEY, AWS_ENDPOINT_URL, GITHUB_API_URL, app_jwt, tenant_credentials,
-};
-use crate::{DB, github, int, jwt, now_ms, oidc, telemetry, webcrypto};
+use crate::launch::{AWS_ENDPOINT_URL, tenant_credentials};
+use crate::tokens::{self, App, Kv, Mint, Store, Tokens};
+use crate::{DB, changes, github, int, jwt, now_ms, oidc, telemetry, webcrypto};
 
 thread_local! {
     /// Role credentials by tenant id, with when they were fetched.
@@ -61,6 +65,7 @@ pub(crate) async fn handle(req: Request, env: Env) -> Result<Response> {
 }
 
 /// An answer other than success.
+#[derive(Debug)]
 struct Refusal {
     status: u16,
     message: String,
@@ -83,10 +88,13 @@ impl From<worker::Error> for Refusal {
 
 type Answer = std::result::Result<Response, Refusal>;
 
-/// The job and its connected tenant, by job, installation and tenant.
+/// The job, its run's scopes and its connected tenant, by job,
+/// installation and tenant.
 const JOB: &str = "SELECT jobs.repository, jobs.run_id, jobs.cache_write, jobs.cache_reads, \
+     runs.cache_write AS run_cache_write, runs.cache_reads AS run_cache_reads, \
      tenants.id AS tenant_id, tenants.role_arn, tenants.region, tenants.cache_bucket \
      FROM jobs JOIN tenants ON tenants.installation_id = jobs.installation_id \
+     LEFT JOIN runs ON runs.id = jobs.run_id \
      WHERE jobs.id = ?1 AND jobs.installation_id = ?2 AND tenants.id = ?3 \
      AND tenants.role_arn IS NOT NULL AND tenants.region IS NOT NULL";
 
@@ -101,7 +109,10 @@ const UPLOAD: &str =
 /// Forgets an upload once completed or abandoned.
 const FORGET: &str = "DELETE FROM cache_uploads WHERE id = ?1";
 
-/// Stores the scopes worked out for a job.
+/// Stores the scopes worked out for a run, for all its jobs.
+const RUN_SCOPES: &str = "UPDATE runs SET cache_write = ?2, cache_reads = ?3 WHERE id = ?1";
+
+/// Stores the scopes worked out for a job whose run has no row.
 const SCOPES: &str = "UPDATE jobs SET cache_write = ?2, cache_reads = ?3 WHERE id = ?1";
 
 /// The job's tenant, as a cache call needs it.
@@ -111,6 +122,8 @@ struct Row {
     run_id: u64,
     cache_write: Option<String>,
     cache_reads: Option<String>,
+    run_cache_write: Option<String>,
+    run_cache_reads: Option<String>,
     tenant_id: String,
     role_arn: String,
     region: String,
@@ -468,125 +481,168 @@ async fn credentials(ctx: &Context<'_>) -> std::result::Result<Credentials, Refu
     Ok(credentials)
 }
 
-/// The job's scopes: from its row, or worked out from its workflow run
-/// on GitHub the first time and kept on the row.
+/// The job's scopes: kept on its row or its run's, or worked out from
+/// its workflow run on GitHub and kept on the run's row.
 async fn scopes(ctx: &Context<'_>) -> std::result::Result<Scopes, Refusal> {
-    if let (Some(write), Some(reads)) = (&ctx.row.cache_write, &ctx.row.cache_reads)
-        && let Ok(reads) = serde_json::from_str(reads)
-    {
-        return Ok(Scopes {
-            write: write.clone(),
-            reads,
-        });
+    if let Some(scopes) = stored(&ctx.row) {
+        return Ok(scopes);
     }
-    let secret = |name: &str| {
-        ctx.env
-            .secret(name)
-            .map(|value| value.to_string())
-            .ok()
-            .filter(|value| !value.is_empty())
-    };
-    let api = secret(GITHUB_API_URL)
-        .unwrap_or_else(|| github::API.to_owned())
-        .trim_end_matches('/')
-        .to_owned();
-    let app_id = secret(APP_ID).ok_or_else(|| Refusal::new(500, format!("{APP_ID} is not set")))?;
-    let app_key = jwt::pkcs8_der(
-        &secret(APP_KEY).ok_or_else(|| Refusal::new(500, format!("{APP_KEY} is not set")))?,
-    )
-    .map_err(|err| Refusal::new(500, format!("{APP_KEY}: {err}")))?;
-    let app = app_jwt(&app_id, &app_key)
-        .await
-        .map_err(|err| Refusal::new(500, err))?;
-    let token = github::token(
-        &github_send(&github::installation_token(
-            &api,
-            ctx.claims.installation_id,
-            &app,
-        ))
-        .await?,
-    )
-    .map_err(|err| Refusal::new(502, err))?;
-    let repository = &ctx.row.repository;
-    let run = github::parse_workflow_run(
-        &github_send(&github::workflow_run(
-            &api,
-            &token,
-            repository,
-            ctx.row.run_id,
-        ))
-        .await?,
-    )
-    .map_err(|err| Refusal::new(502, err))?;
-    let default_branch =
-        github::default_branch(&github_send(&github::repository(&api, &token, repository)).await?)
-            .map_err(|err| Refusal::new(502, err))?;
-    let on_branch = on_branch(&api, &token, repository, &run).await?;
-    let scopes = super::scopes(&run, &default_branch, on_branch);
+    let app = App::read(ctx.env).map_err(|err| Refusal::new(500, err))?;
+    let api = app.api.clone();
+    let calls = Counted::default();
+    let tokens = Tokens::new(Kv::new(ctx.env), app, &calls, now_ms());
+    let (scopes, resolved) = find(&ctx.row, &api, &tokens, ctx.claims.installation_id).await?;
+    if !resolved {
+        return Ok(scopes);
+    }
+    console_log!(
+        "cache: run {}: scopes from GitHub, {} GitHub calls",
+        ctx.row.run_id,
+        calls.sent()
+    );
     let reads =
         serde_json::to_string(&scopes.reads).map_err(|err| Refusal::new(500, err.to_string()))?;
-    ctx.db
-        .prepare(SCOPES)
-        .bind(&[
-            int(ctx.claims.job_id)?,
+    let bind = |id: u64| -> std::result::Result<Vec<JsValue>, Refusal> {
+        Ok(vec![
+            int(id)?,
             scopes.write.as_str().into(),
-            JsValue::from(reads),
-        ])?
+            JsValue::from(reads.as_str()),
+        ])
+    };
+    let kept = ctx
+        .db
+        .prepare(RUN_SCOPES)
+        .bind(&bind(ctx.row.run_id)?)?
         .run()
         .await?;
+    if changes(&kept) == 0 {
+        ctx.db
+            .prepare(SCOPES)
+            .bind(&bind(ctx.claims.job_id)?)?
+            .run()
+            .await?;
+    }
     Ok(scopes)
 }
 
-/// Whether the run's commit is on its head branch in the repository:
-/// the branch exists and its tip is the commit or a descendant of it.
-/// Asks GitHub only for runs that could write to a branch's scope.
-async fn on_branch(
-    api: &str,
-    token: &str,
-    repository: &str,
-    run: &super::Run,
-) -> std::result::Result<bool, Refusal> {
-    let Some(branch) = run
-        .head_branch
-        .as_deref()
-        .filter(|branch| !branch.is_empty())
-    else {
-        return Ok(false);
-    };
-    if super::from_outside(run) {
-        return Ok(false);
-    }
-    let tip = github::branch_sha(
-        &github_send(&github::branch_ref(api, token, repository, branch)).await?,
-    )
-    .map_err(|err| Refusal::new(502, err))?;
-    match tip {
-        None => Ok(false),
-        Some(tip) if tip == run.head_sha => Ok(true),
-        Some(tip) => github::contained(
-            &github_send(&github::compare(
-                api,
-                token,
-                repository,
-                &tip,
-                &run.head_sha,
-            ))
-            .await?,
-        )
-        .map_err(|err| Refusal::new(502, err)),
-    }
+/// Scopes kept on the job's row, then on its run's.
+fn stored(row: &Row) -> Option<Scopes> {
+    [
+        (&row.cache_write, &row.cache_reads),
+        (&row.run_cache_write, &row.run_cache_reads),
+    ]
+    .into_iter()
+    .find_map(|(write, reads)| {
+        let reads = serde_json::from_str(reads.as_deref()?).ok()?;
+        Some(Scopes {
+            write: write.clone()?,
+            reads,
+        })
+    })
 }
 
-async fn github_send(request: &Outgoing) -> std::result::Result<crate::http::Response, Refusal> {
-    send(request)
-        .await
-        .map_err(|err| Refusal::new(502, format!("GitHub unreachable: {err}")))
+/// The job's scopes, and `true` when they were worked out from GitHub
+/// at `api` now and are to be kept.
+async fn find<S: Store, M: Mint, G: Sender>(
+    row: &Row,
+    api: &str,
+    tokens: &Tokens<'_, S, M, G>,
+    installation_id: u64,
+) -> std::result::Result<(Scopes, bool), Refusal> {
+    if let Some(scopes) = stored(row) {
+        return Ok((scopes, false));
+    }
+    let github = GitHub {
+        api,
+        tokens,
+        installation_id,
+        repository: &row.repository,
+    };
+    let run = github::parse_workflow_run(
+        &github
+            .send(|token| github::workflow_run(api, token, &row.repository, row.run_id))
+            .await?,
+    )
+    .map_err(|err| Refusal::new(502, err))?;
+    let default_branch = github::default_branch(
+        &github
+            .send(|token| github::repository(api, token, &row.repository))
+            .await?,
+    )
+    .map_err(|err| Refusal::new(502, err))?;
+    let on_branch = github.on_branch(&run).await?;
+    Ok((super::scopes(&run, &default_branch, on_branch), true))
+}
+
+/// GitHub calls about the job's repository with the installation's
+/// token.
+struct GitHub<'a, S, M, G> {
+    api: &'a str,
+    tokens: &'a Tokens<'a, S, M, G>,
+    installation_id: u64,
+    repository: &'a str,
+}
+
+impl<S: Store, M: Mint, G: Sender> GitHub<'_, S, M, G> {
+    async fn send(
+        &self,
+        build: impl Fn(&str) -> Outgoing,
+    ) -> std::result::Result<crate::http::Response, Refusal> {
+        self.tokens
+            .send(self.installation_id, build)
+            .await
+            .map_err(|err| match err {
+                tokens::Error::Settings(message) => Refusal::new(500, message),
+                tokens::Error::Unreachable(message) => {
+                    Refusal::new(502, format!("GitHub unreachable: {message}"))
+                }
+                tokens::Error::GitHub { message, .. } | tokens::Error::Answer(message) => {
+                    Refusal::new(502, message)
+                }
+            })
+    }
+
+    /// Whether the run's commit is on its head branch in the repository:
+    /// the branch exists and its tip is the commit or a descendant of
+    /// it. Asks GitHub only for runs that could write to a branch's
+    /// scope.
+    async fn on_branch(&self, run: &super::Run) -> std::result::Result<bool, Refusal> {
+        let Some(branch) = run
+            .head_branch
+            .as_deref()
+            .filter(|branch| !branch.is_empty())
+        else {
+            return Ok(false);
+        };
+        if super::from_outside(run) {
+            return Ok(false);
+        }
+        let (api, repository) = (self.api, self.repository);
+        let tip = github::branch_sha(
+            &self
+                .send(|token| github::branch_ref(api, token, repository, branch))
+                .await?,
+        )
+        .map_err(|err| Refusal::new(502, err))?;
+        match tip {
+            None => Ok(false),
+            Some(tip) if tip == run.head_sha => Ok(true),
+            Some(tip) => github::contained(
+                &self
+                    .send(|token| github::compare(api, token, repository, &tip, &run.head_sha))
+                    .await?,
+            )
+            .map_err(|err| Refusal::new(502, err)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testdb::{Db, params};
+    use crate::http::Response as Answer;
+    use crate::testdb::{Db, block_on, params};
+    use crate::tokens::tests::{GitHub, Memory, Minted, answer};
 
     const NOW: u64 = 1_792_140_000_000;
 
@@ -663,5 +719,81 @@ mod tests {
         assert!(db.first::<Upload>(UPLOAD, &params!["u1", 6u64]).is_none());
         assert_eq!(db.run(FORGET, &params!["u1"]), 1);
         assert!(db.first::<Upload>(UPLOAD, &params!["u1", 5u64]).is_none());
+    }
+
+    /// GitHub as it answers for run 77 of acme/app: a push to main,
+    /// which is the default branch, at the branch's tip.
+    fn github() -> GitHub<impl Fn(&Outgoing) -> Answer> {
+        GitHub::new(|request: &Outgoing| {
+            let path = request.url.strip_prefix(github::API).unwrap_or_default();
+            match path {
+                "/repos/acme/app/actions/runs/77" => answer(
+                    200,
+                    r#"{"event":"push","head_branch":"main","head_sha":"abc",
+                        "head_repository":{"id":1},"repository":{"id":1}}"#,
+                ),
+                "/repos/acme/app" => answer(200, r#"{"default_branch":"main"}"#),
+                "/repos/acme/app/git/ref/heads/main" => answer(200, r#"{"object":{"sha":"abc"}}"#),
+                _ => answer(404, "{}"),
+            }
+        })
+    }
+
+    #[test]
+    fn the_second_job_of_a_run_reuses_its_scopes() {
+        let db = seed(Some("arn:aws:iam::1:role/r"));
+        db.run(
+            "INSERT INTO runs (id, installation_id, repository, head_sha, attempt, queued_at, \
+             created_at, updated_at) VALUES (77, 42, 'acme/app', 'abc', 1, 5, 5, 5)",
+            &[],
+        );
+        db.run(
+            "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+             queued_at, updated_at) VALUES (6, 42, 'acme/app', 77, 'hatchrun', 'queued', 5, 5)",
+            &[],
+        );
+        let store = Memory::default();
+        let minted = Minted::default();
+        let github = github();
+
+        let tokens = Tokens::new(&store, &minted, &github, NOW);
+        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        let (scopes, resolved) = block_on(find(&row, github::API, &tokens, 42)).unwrap();
+        assert!(resolved);
+        assert!(scopes.write.starts_with("1/b/"), "{scopes:?}");
+        // The run, the repository and the branch.
+        assert_eq!(github.calls.get(), 3);
+        let reads = serde_json::to_string(&scopes.reads).unwrap();
+        assert_eq!(
+            db.run(RUN_SCOPES, &params![77u64, scopes.write.as_str(), reads]),
+            1
+        );
+
+        let tokens = Tokens::new(&store, &minted, &github, NOW);
+        let row: Row = db.first(JOB, &params![6u64, 42u64, "t1"]).unwrap();
+        let (again, resolved) = block_on(find(&row, github::API, &tokens, 42)).unwrap();
+        assert!(!resolved);
+        assert_eq!(again, scopes);
+        assert_eq!((github.calls.get(), minted.0.get()), (3, 1));
+    }
+
+    #[test]
+    fn a_job_without_a_run_row_keeps_its_own_scopes() {
+        let db = seed(Some("arn:aws:iam::1:role/r"));
+        let reads = serde_json::to_string(&["1/b/x"]).unwrap();
+        assert_eq!(
+            db.run(RUN_SCOPES, &params![77u64, "1/b/x", reads.clone()]),
+            0
+        );
+        assert_eq!(db.run(SCOPES, &params![5u64, "1/b/x", reads]), 1);
+        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        assert!(row.run_cache_write.is_none());
+        assert_eq!(
+            stored(&row),
+            Some(Scopes {
+                write: "1/b/x".to_owned(),
+                reads: vec!["1/b/x".to_owned()],
+            })
+        );
     }
 }

@@ -20,6 +20,8 @@
 //! works on the rows where the float happens to be whole.
 
 use std::path::Path;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, params_from_iter};
@@ -268,6 +270,18 @@ fn json(value: ValueRef<'_>) -> serde_json::Value {
         }
         ValueRef::Text(t) => serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
         ValueRef::Blob(b) => serde_json::Value::Array(b.iter().map(|&byte| byte.into()).collect()),
+    }
+}
+
+/// Runs `future` to its end on this thread. The tests' stand-ins for
+/// GitHub and KV answer at once, so it never waits.
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
     }
 }
 

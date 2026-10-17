@@ -55,6 +55,7 @@ pub mod telemetry;
 pub mod tenant;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod testdb;
+mod tokens;
 mod webcrypto;
 pub mod webhook;
 
