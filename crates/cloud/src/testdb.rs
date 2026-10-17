@@ -225,6 +225,17 @@ impl Db {
         self.all(sql, params).into_iter().next()
     }
 
+    /// SQLite's plan for a statement, one step per line, such as
+    /// `SEARCH jobs USING INDEX jobs_open (installation_id=?)`.
+    pub(crate) fn plan(&self, sql: &str, params: &[Param]) -> String {
+        self.rows(&format!("EXPLAIN QUERY PLAN {sql}"), params)
+            .unwrap_or_else(|err| panic!("{err}\n{sql}"))
+            .iter()
+            .map(|row| row["detail"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// One column of the first row, as `.first(Some(column))`.
     pub(crate) fn column<T: DeserializeOwned>(
         &self,
