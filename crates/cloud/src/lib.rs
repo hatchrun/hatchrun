@@ -148,9 +148,12 @@ const RUN: &str = "INSERT INTO runs (id, installation_id, repository, workflow_n
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8) ON CONFLICT (id) DO NOTHING";
 
 /// Moves a run on to attempt `?2` when its first job is queued. A late
-/// delivery from an earlier attempt changes nothing.
+/// delivery from an earlier attempt changes nothing. The branch may have
+/// moved since the last attempt, so its cache scopes are worked out
+/// again.
 const RUN_ATTEMPT: &str = "UPDATE runs SET attempt = ?2, queued_at = ?3, head_sha = ?4, \
-     head_branch = ?5, updated_at = ?3 WHERE id = ?1 AND attempt < ?2";
+     head_branch = ?5, updated_at = ?3, cache_write = NULL, cache_reads = NULL \
+     WHERE id = ?1 AND attempt < ?2";
 
 /// Records a queued job once, however often GitHub delivers it.
 const QUEUED: &str = "INSERT INTO jobs \
@@ -472,13 +475,18 @@ mod tests {
         let db = Db::new();
         assert_eq!(job_of_run(&db, 1, 1, "a1", NOW), [1, 0, 1]);
         assert_eq!(job_of_run(&db, 2, 1, "a1", NOW + 5), [0, 0, 1]);
+        db.run(
+            "UPDATE runs SET cache_write = '1/b/x', cache_reads = '[\"1/b/x\"]'",
+            &[],
+        );
         // A re-run: new job ids, attempt 2 and the list's place moves.
         assert_eq!(job_of_run(&db, 3, 2, "a2", NOW + 100), [0, 1, 1]);
         // A late delivery of attempt 1 leaves the run on attempt 2.
         assert_eq!(job_of_run(&db, 4, 1, "a1", NOW + 200), [0, 0, 1]);
         let rows = db
             .rows(
-                "SELECT attempt, queued_at, head_sha, workflow_name FROM runs",
+                "SELECT attempt, queued_at, head_sha, workflow_name, cache_write, cache_reads \
+                 FROM runs",
                 &[],
             )
             .unwrap();
@@ -487,6 +495,8 @@ mod tests {
         assert_eq!(rows[0]["queued_at"], NOW + 100);
         assert_eq!(rows[0]["head_sha"], "a2");
         assert_eq!(rows[0]["workflow_name"], "Smoke test");
+        // The re-run works out its cache scopes again.
+        assert!(rows[0]["cache_write"].is_null() && rows[0]["cache_reads"].is_null());
         let attempts = db
             .rows("SELECT name, run_attempt FROM jobs ORDER BY id", &[])
             .unwrap();
