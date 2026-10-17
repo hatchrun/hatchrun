@@ -38,6 +38,13 @@ database_name = "hatchrun-cloud"
 database_id = "local"
 migrations_dir = "migrations"
 
+# Installation tokens, reused until shortly before they expire
+# (crates/cloud/src/tokens.rs). The deploy workflow sets id from the
+# CLOUDFLARE_KV_TOKENS_ID secret.
+[[kv_namespaces]]
+binding = "TOKENS"
+id = "local"
+
 # Runner metrics, which hatchrun-telemetry (crates/telemetry) writes to
 # Analytics Engine, read back for the app's job pages.
 [analytics]
