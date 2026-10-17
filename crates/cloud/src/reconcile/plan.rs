@@ -67,13 +67,10 @@ pub struct Limits {
     pub sync_after: u64,
     /// How far back failed webhook deliveries are redelivered.
     pub redeliver_window: u64,
-    /// How long finished jobs are kept.
-    pub retention: u64,
 }
 
-/// The variables that set [`Limits`], with their defaults, in seconds
-/// except the retention, in days.
-pub const VARS: [(&str, u64); 8] = [
+/// The variables that set [`Limits`], with their defaults, in seconds.
+pub const VARS: [(&str, u64); 7] = [
     ("RECONCILE_QUEUED_GRACE_SECS", 60),
     ("RECONCILE_LAUNCH_TIMEOUT_SECS", 10 * 60),
     ("RECONCILE_IDLE_TIMEOUT_SECS", 30 * 60),
@@ -81,7 +78,6 @@ pub const VARS: [(&str, u64); 8] = [
     ("RECONCILE_MAX_INSTANCE_AGE_SECS", 8 * 60 * 60),
     ("RECONCILE_SYNC_AFTER_SECS", 5 * 60),
     ("RECONCILE_REDELIVER_WINDOW_SECS", 6 * 60 * 60),
-    ("RECONCILE_RETENTION_DAYS", 30),
 ];
 
 impl Default for Limits {
@@ -116,7 +112,6 @@ impl Limits {
             max_age,
             sync_after,
             redeliver_window,
-            retention_days,
         ] = values.map(|value| value.saturating_mul(1000));
         Ok(Self {
             queued_grace,
@@ -126,7 +121,6 @@ impl Limits {
             max_age,
             sync_after,
             redeliver_window,
-            retention: retention_days.saturating_mul(24 * 60 * 60),
         })
     }
 }
@@ -534,7 +528,6 @@ mod tests {
         let limits = Limits::default();
         assert_eq!(limits.queued_grace, 60_000);
         assert_eq!(limits.max_age, 8 * 60 * MIN);
-        assert_eq!(limits.retention, 30 * 24 * 60 * MIN);
         let set = Limits::read(|name| match name {
             "RECONCILE_IDLE_TIMEOUT_SECS" => Some(" 90 ".to_owned()),
             "RECONCILE_QUEUED_GRACE_SECS" => Some(String::new()),

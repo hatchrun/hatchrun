@@ -1141,6 +1141,17 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_counts_runners_through_the_open_jobs() {
+        let db = seed(true, 1);
+        let plan = db.plan(
+            CLAIM,
+            &params![1u64, "hatchrun-1-00", NOW, INSTALLATION, 1u32],
+        );
+        assert!(plan.contains("INDEX jobs_open"), "{plan}");
+        assert!(!plan.contains("SCAN jobs"), "{plan}");
+    }
+
+    #[test]
     fn claims_stop_at_max_runners() {
         let db = seed(true, 1);
         job(&db, 1, "queued");

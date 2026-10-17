@@ -873,9 +873,9 @@ mod tests {
             .join("\n")
         };
         let failed = plan(&list_query(Some(Group::Failed)));
-        // Through jobs_failed or jobs_launch, never every job, and the
-        // later attempts through jobs_run.
-        assert!(failed.contains("launch_state=?"), "{failed}");
+        // Through jobs_failed, never every job, and the later attempts
+        // through jobs_run.
+        assert!(failed.contains("jobs_failed"), "{failed}");
         assert!(!failed.contains("SCAN"), "{failed}");
         assert!(failed.contains("jobs_run"), "{failed}");
         let all = plan(&list_query(None));

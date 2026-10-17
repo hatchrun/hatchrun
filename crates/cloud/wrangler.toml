@@ -115,5 +115,3 @@ RECONCILE_MAX_INSTANCE_AGE_SECS = "28800"
 RECONCILE_SYNC_AFTER_SECS = "300"
 # How far back failed webhook deliveries are redelivered.
 RECONCILE_REDELIVER_WINDOW_SECS = "21600"
-# How long jobs are kept, in days.
-RECONCILE_RETENTION_DAYS = "30"
