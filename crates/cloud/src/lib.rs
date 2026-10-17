@@ -141,21 +141,33 @@ async fn assets(req: Request, env: &Env) -> Result<Response> {
         .body(body))
 }
 
-/// Records a run the first time one of its jobs is queued.
+/// Records a run the first time one of its jobs is queued. It expires
+/// with its jobs, `retention_days` after it was queued (see
+/// [`QUEUED`]).
 const RUN: &str = "INSERT INTO runs (id, installation_id, repository, workflow_name, \
-     head_branch, head_sha, attempt, queued_at, created_at, updated_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8) ON CONFLICT (id) DO NOTHING";
+     head_branch, head_sha, attempt, queued_at, created_at, updated_at, expires_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, ?8 + COALESCE((SELECT retention_days \
+       FROM tenants WHERE installation_id = ?2), 30) * 86400000) \
+     ON CONFLICT (id) DO NOTHING";
 
 /// Moves a run on to attempt `?2` when its first job is queued. A late
-/// delivery from an earlier attempt changes nothing.
+/// delivery from an earlier attempt changes nothing. The run expires
+/// from the new attempt, as its jobs do.
 const RUN_ATTEMPT: &str = "UPDATE runs SET attempt = ?2, queued_at = ?3, head_sha = ?4, \
-     head_branch = ?5, updated_at = ?3 WHERE id = ?1 AND attempt < ?2";
+     head_branch = ?5, updated_at = ?3, expires_at = ?3 + COALESCE((SELECT retention_days \
+       FROM tenants WHERE tenants.installation_id = runs.installation_id), 30) * 86400000 \
+     WHERE id = ?1 AND attempt < ?2";
 
-/// Records a queued job once, however often GitHub delivers it.
+/// Records a queued job once, however often GitHub delivers it. It
+/// expires after the `retention_days` of the installation's tenant, or
+/// that column's default of 30 days for an installation without one.
+/// The lookup rides along with the insert, so the webhook makes no
+/// extra round trip for it.
 const QUEUED: &str = "INSERT INTO jobs \
      (id, installation_id, repository, run_id, label, status, queued_at, updated_at, \
-     name, run_attempt) \
-     VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6, ?7, ?8) \
+     name, run_attempt, expires_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6, ?7, ?8, ?6 + COALESCE((SELECT retention_days \
+       FROM tenants WHERE installation_id = ?2), 30) * 86400000) \
      ON CONFLICT (id) DO NOTHING";
 
 /// Moves a job on unless it completed, with GitHub's conclusion and
@@ -477,7 +489,7 @@ mod tests {
         assert_eq!(job_of_run(&db, 4, 1, "a1", NOW + 200), [0, 0, 1]);
         let rows = db
             .rows(
-                "SELECT attempt, queued_at, head_sha, workflow_name FROM runs",
+                "SELECT attempt, queued_at, head_sha, workflow_name, expires_at FROM runs",
                 &[],
             )
             .unwrap();
@@ -486,6 +498,8 @@ mod tests {
         assert_eq!(rows[0]["queued_at"], NOW + 100);
         assert_eq!(rows[0]["head_sha"], "a2");
         assert_eq!(rows[0]["workflow_name"], "Smoke test");
+        // No tenant: the default 30 days, from the newest attempt.
+        assert_eq!(rows[0]["expires_at"], NOW + 100 + 30 * 24 * 60 * 60 * 1000);
         let attempts = db
             .rows("SELECT name, run_attempt FROM jobs ORDER BY id", &[])
             .unwrap();

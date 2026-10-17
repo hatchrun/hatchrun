@@ -398,8 +398,9 @@ type catalog in D1 through a tenant role there: every current
 generation amd64 and arm64 type with the zones that offer it
 (`DescribeInstanceTypes`, `DescribeInstanceTypeOfferings`), its Linux
 on-demand price from AWS's public price list and its lowest Spot price
-(`DescribeSpotPriceHistory`). It also deletes expired sessions and
-jobs past the retention. The timeouts are the `RECONCILE_*` variables in
+(`DescribeSpotPriceHistory`). It also deletes expired sessions, and
+jobs and runs past their tenant's retention (`tenants.retention_days`,
+30 days unless set, up to 90). The timeouts are the `RECONCILE_*` variables in
 `wrangler.toml`. Each pass logs one summary line and keeps it in the
 `reconciler` table:
 
