@@ -55,7 +55,8 @@ queue = "hatchrun-launches"
 
 # Small batches, sent after a second at most, so a runner's start does
 # not wait for other jobs. max_concurrency caps the batches launching at
-# once, and so the launches in flight: each one registers a runner
+# once, and with max_batch_size the launches in flight: 10 batches of 5,
+# at most 50 launches across all tenants. Each one registers a runner
 # with GitHub, and a burst from one organization would otherwise spend
 # its installation's rate limit, which the reconciler and the app share.
 [[queues.consumers]]

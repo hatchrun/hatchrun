@@ -119,8 +119,15 @@ pub(crate) enum Verdict {
     Retry(String),
 }
 
-/// Launches the job of one message.
-pub(crate) async fn deliver(launcher: &impl Launcher, message: Launch) -> Verdict {
+/// Launches the job of one message. A body that is not a [`Launch`],
+/// such as one sent by a Worker version with another message format,
+/// is retried, so after `max_retries` it waits in the dead-letter queue
+/// rather than disappearing.
+pub(crate) async fn deliver(launcher: &impl Launcher, body: serde_json::Value) -> Verdict {
+    let message = match Launch::deserialize(body) {
+        Ok(message) => message,
+        Err(err) => return Verdict::Retry(format!("unreadable message: {err}")),
+    };
     let job = match message.job() {
         Ok(job) => job,
         Err(err) => return Verdict::Drop(err),
@@ -132,14 +139,15 @@ pub(crate) async fn deliver(launcher: &impl Launcher, message: Launch) -> Verdic
 }
 
 /// The consumer: launches a batch's jobs side by side and acks or
-/// retries each message. A message whose body does not read is left
-/// alone, which the queue counts as acked once the handler returns.
-pub(crate) async fn consume(batch: MessageBatch<Launch>, env: Env) {
+/// retries each message. Bodies are read as JSON first and as a
+/// [`Launch`] in [`deliver`], so a message that does not read is still
+/// in hand to retry.
+pub(crate) async fn consume(batch: MessageBatch<serde_json::Value>, env: Env) {
     let messages: Vec<_> = batch
         .iter()
         .filter_map(|message| {
             message
-                .inspect_err(|err| console_error!("launch queue: unreadable message: {err}"))
+                .inspect_err(|err| console_error!("launch queue: message is not JSON: {err}"))
                 .ok()
         })
         .collect();
@@ -153,15 +161,17 @@ pub(crate) async fn consume(batch: MessageBatch<Launch>, env: Env) {
         .with_delay_seconds(RETRY_DELAY)
         .build();
     for (message, verdict) in messages.iter().zip(verdicts) {
-        let id = message.body().id;
+        let id = message.id();
         match verdict {
             Verdict::Ack => message.ack(),
             Verdict::Drop(err) => {
-                console_error!("launch queue: job {id}: {err}");
+                console_error!("launch queue: message {id}: {err}");
                 message.ack();
             }
             Verdict::Retry(err) => {
-                console_error!("launch queue: job {id}: {err}, trying again in {RETRY_DELAY} s");
+                console_error!(
+                    "launch queue: message {id}: {err}, trying again in {RETRY_DELAY} s"
+                );
                 message.retry_with_options(&retry);
             }
         }
@@ -260,7 +270,9 @@ mod tests {
     }
 
     fn deliver_now(launcher: &impl Launcher, message: Launch) -> Verdict {
-        deliver(launcher, message).now_or_never().unwrap()
+        deliver(launcher, serde_json::to_value(message).unwrap())
+            .now_or_never()
+            .unwrap()
     }
 
     #[test]
@@ -325,6 +337,15 @@ mod tests {
             deliver_now(&claims, message),
             Verdict::Drop(err) if err.starts_with("ubuntu-latest")
         ));
+        assert!(claims.started.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_message_retries_into_the_dead_letter_queue() {
+        let claims = Claims::new();
+        let body = serde_json::json!({ "job": 5 });
+        let verdict = deliver(&claims, body).now_or_never().unwrap();
+        assert!(matches!(verdict, Verdict::Retry(err) if err.starts_with("unreadable")));
         assert!(claims.started.borrow().is_empty());
     }
 }

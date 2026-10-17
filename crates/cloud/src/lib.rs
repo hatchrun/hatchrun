@@ -128,7 +128,7 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 /// The launch queue's consumer in `wrangler.toml` (see [`launches`]).
 #[event(queue)]
 async fn queue(
-    batch: MessageBatch<launches::Launch>,
+    batch: MessageBatch<serde_json::Value>,
     env: Env,
     _ctx: worker::Context,
 ) -> Result<()> {
@@ -290,7 +290,11 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
             // job first, so only one of them launches. The job is
             // recorded either way, and the reconciler launches it when
             // the queue does not take the message.
-            if let Err(err) = launches::enqueue(&env.queue(launches::QUEUE)?, &job).await {
+            let queued = match env.queue(launches::QUEUE) {
+                Ok(queue) => launches::enqueue(&queue, &job).await,
+                Err(err) => Err(err.to_string()),
+            };
+            if let Err(err) = queued {
                 console_error!("job {}: not queued for launch: {err}", job.id);
             }
             Ok(Response::from_json(&serde_json::json!({ "recorded": job.id }))?.with_status(202))
