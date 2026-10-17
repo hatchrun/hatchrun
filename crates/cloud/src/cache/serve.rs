@@ -88,10 +88,12 @@ impl From<worker::Error> for Refusal {
 
 type Answer = std::result::Result<Response, Refusal>;
 
-/// The job, its run's scopes and its connected tenant, by job,
-/// installation and tenant.
-const JOB: &str = "SELECT jobs.repository, jobs.run_id, jobs.cache_write, jobs.cache_reads, \
-     runs.cache_write AS run_cache_write, runs.cache_reads AS run_cache_reads, \
+/// The job, its run's scopes while the run is on the job's attempt, and
+/// its connected tenant, by job, installation and tenant.
+const JOB: &str = "SELECT jobs.repository, jobs.run_id, jobs.run_attempt, jobs.cache_write, \
+     jobs.cache_reads, \
+     CASE WHEN runs.attempt = jobs.run_attempt THEN runs.cache_write END AS run_cache_write, \
+     CASE WHEN runs.attempt = jobs.run_attempt THEN runs.cache_reads END AS run_cache_reads, \
      tenants.id AS tenant_id, tenants.role_arn, tenants.region, tenants.cache_bucket \
      FROM jobs JOIN tenants ON tenants.installation_id = jobs.installation_id \
      LEFT JOIN runs ON runs.id = jobs.run_id \
@@ -109,10 +111,13 @@ const UPLOAD: &str =
 /// Forgets an upload once completed or abandoned.
 const FORGET: &str = "DELETE FROM cache_uploads WHERE id = ?1";
 
-/// Stores the scopes worked out for a run, for all its jobs.
-const RUN_SCOPES: &str = "UPDATE runs SET cache_write = ?2, cache_reads = ?3 WHERE id = ?1";
+/// Stores the scopes worked out for a run's attempt `?4`, for all its
+/// jobs. A job of an earlier attempt leaves a re-run's scopes alone.
+const RUN_SCOPES: &str = "UPDATE runs SET cache_write = ?2, cache_reads = ?3 \
+     WHERE id = ?1 AND attempt = ?4";
 
-/// Stores the scopes worked out for a job whose run has no row.
+/// Stores the scopes worked out for a job whose run has no row, or has
+/// moved on to another attempt.
 const SCOPES: &str = "UPDATE jobs SET cache_write = ?2, cache_reads = ?3 WHERE id = ?1";
 
 /// The job's tenant, as a cache call needs it.
@@ -120,6 +125,7 @@ const SCOPES: &str = "UPDATE jobs SET cache_write = ?2, cache_reads = ?3 WHERE i
 struct Row {
     repository: String,
     run_id: u64,
+    run_attempt: u64,
     cache_write: Option<String>,
     cache_reads: Option<String>,
     run_cache_write: Option<String>,
@@ -509,12 +515,9 @@ async fn scopes(ctx: &Context<'_>) -> std::result::Result<Scopes, Refusal> {
             JsValue::from(reads.as_str()),
         ])
     };
-    let kept = ctx
-        .db
-        .prepare(RUN_SCOPES)
-        .bind(&bind(ctx.row.run_id)?)?
-        .run()
-        .await?;
+    let mut run = bind(ctx.row.run_id)?;
+    run.push(int(ctx.row.run_attempt)?);
+    let kept = ctx.db.prepare(RUN_SCOPES).bind(&run)?.run().await?;
     if changes(&kept) == 0 {
         ctx.db
             .prepare(SCOPES)
@@ -765,7 +768,10 @@ mod tests {
         assert_eq!(github.calls.get(), 3);
         let reads = serde_json::to_string(&scopes.reads).unwrap();
         assert_eq!(
-            db.run(RUN_SCOPES, &params![77u64, scopes.write.as_str(), reads]),
+            db.run(
+                RUN_SCOPES,
+                &params![77u64, scopes.write.as_str(), reads, 1u64]
+            ),
             1
         );
 
@@ -782,7 +788,7 @@ mod tests {
         let db = seed(Some("arn:aws:iam::1:role/r"));
         let reads = serde_json::to_string(&["1/b/x"]).unwrap();
         assert_eq!(
-            db.run(RUN_SCOPES, &params![77u64, "1/b/x", reads.clone()]),
+            db.run(RUN_SCOPES, &params![77u64, "1/b/x", reads.clone(), 1u64]),
             0
         );
         assert_eq!(db.run(SCOPES, &params![5u64, "1/b/x", reads]), 1);
@@ -795,5 +801,28 @@ mod tests {
                 reads: vec!["1/b/x".to_owned()],
             })
         );
+    }
+
+    #[test]
+    fn a_job_of_an_earlier_attempt_keeps_out_of_the_re_runs_scopes() {
+        let db = seed(Some("arn:aws:iam::1:role/r"));
+        db.run(
+            "INSERT INTO runs (id, installation_id, repository, head_sha, attempt, queued_at, \
+             created_at, updated_at) VALUES (77, 42, 'acme/app', 'abc', 2, 5, 5, 5)",
+            &[],
+        );
+        let reads = serde_json::to_string(&["1/o/x"]).unwrap();
+        // Job 5 ran in attempt 1, which the run has moved on from.
+        assert_eq!(
+            db.run(RUN_SCOPES, &params![77u64, "1/o/x", reads.clone(), 1u64]),
+            0
+        );
+        assert_eq!(db.run(RUN_SCOPES, &params![77u64, "1/b/x", reads, 2u64]), 1);
+        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        assert_eq!(row.run_attempt, 1);
+        assert!(stored(&row).is_none());
+        db.run("UPDATE jobs SET run_attempt = 2", &[]);
+        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        assert_eq!(stored(&row).unwrap().write, "1/b/x");
     }
 }

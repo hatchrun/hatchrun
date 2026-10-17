@@ -64,6 +64,11 @@ const GITHUB_API_URL: &str = "GITHUB_API_URL";
 /// Requests a pass may make. Workers allow 1000 per invocation; launches
 /// and the app's own requests are well inside the rest.
 const SUBREQUESTS: u32 = 500;
+/// Requests one GitHub call may make with a kept token: the call, and
+/// when GitHub refuses the token, a new token and the call again. Each
+/// call reserves this much; [`Pass::settle`] gives back what it did not
+/// send.
+const GITHUB_CALL_COST: u32 = 3;
 /// Requests a launch may make: STS, the installation token, the runner,
 /// the launch template version and up to four fleets (or
 /// `RunInstances` per subnet), the broker's retries and the cleanup.
@@ -487,6 +492,13 @@ const DELETE_OFFERINGS: &str = "DELETE FROM unavailable_offerings WHERE until < 
 const DELETE_UPLOADS: &str = "DELETE FROM cache_uploads WHERE id IN \
      (SELECT id FROM cache_uploads WHERE created_at < ?1 LIMIT ?2)";
 
+/// The budget left once a step that found `before` and left `left`
+/// gets back what it reserved beyond the `sent` requests it made.
+fn settled(left: u32, before: u32, sent: u32) -> u32 {
+    let reserved = before.saturating_sub(left);
+    left + reserved.saturating_sub(sent)
+}
+
 impl Pass<'_> {
     /// Takes `cost` requests from the budget, or notes that the pass
     /// stopped with work left.
@@ -498,6 +510,12 @@ impl Pass<'_> {
         }
         self.budget.set(left - cost);
         true
+    }
+
+    /// Gives back what a step reserved since the budget stood at `before`
+    /// and did not use, `sent` requests having gone out.
+    fn settle(&self, before: u32, sent: u32) {
+        self.budget.set(settled(self.budget.get(), before, sent));
     }
 
     fn secret_der(&self, name: &str) -> Fallible<Vec<u8>> {
@@ -680,6 +698,7 @@ impl Pass<'_> {
         }
         let calls = Counted::default();
         let tokens = self.tokens(&calls)?;
+        let before = self.budget.get();
         let mut by_installation: BTreeMap<u64, Vec<OpenJob>> = BTreeMap::new();
         for job in open {
             by_installation
@@ -692,6 +711,7 @@ impl Pass<'_> {
             .buffer_unordered(INSTALLATIONS_AT_ONCE)
             .collect()
             .await;
+        self.settle(before, calls.sent());
         let mut done = Summary::default();
         for result in &results {
             done.add(result);
@@ -720,7 +740,7 @@ impl Pass<'_> {
             return done;
         }
         for job in &jobs {
-            if !self.spend(1) {
+            if !self.spend(GITHUB_CALL_COST) {
                 break;
             }
             done.checked += 1;
@@ -800,7 +820,7 @@ impl Pass<'_> {
             .map_err(text)?
             .results::<RunWithoutDetails>()
             .map_err(text)?;
-        let mut done = Summary::default();
+        let done = Summary::default();
         if runs.is_empty() {
             return Ok(done);
         }
@@ -814,6 +834,7 @@ impl Pass<'_> {
             .map_err(text)?;
         let calls = Counted::default();
         let tokens = self.tokens(&calls)?;
+        let before = self.budget.get();
         let mut by_installation: BTreeMap<u64, Vec<RunWithoutDetails>> = BTreeMap::new();
         for run in runs {
             by_installation
@@ -821,6 +842,18 @@ impl Pass<'_> {
                 .or_default()
                 .push(run);
         }
+        let fetched = self.fetch_details(&tokens, by_installation, done).await;
+        self.settle(before, calls.sent());
+        fetched
+    }
+
+    /// Fetches and records the details of `runs`, by installation.
+    async fn fetch_details(
+        &self,
+        tokens: &Tokens<'_, Kv, App, Counted>,
+        by_installation: BTreeMap<u64, Vec<RunWithoutDetails>>,
+        mut done: Summary,
+    ) -> Fallible<Summary> {
         for (installation_id, runs) in by_installation {
             if !self.spend(1) {
                 break;
@@ -831,7 +864,7 @@ impl Pass<'_> {
                 continue;
             }
             for run in runs {
-                if !self.spend(1) {
+                if !self.spend(GITHUB_CALL_COST) {
                     break;
                 }
                 match tokens
@@ -1786,6 +1819,15 @@ mod tests {
             .next()
             .unwrap()
             .clone()
+    }
+
+    #[test]
+    fn a_step_gives_back_what_it_did_not_send() {
+        // Two calls reserved three each and sent one each.
+        assert_eq!(settled(494, 500, 2), 498);
+        // A refused token took all three of one call.
+        assert_eq!(settled(494, 500, 4), 496);
+        assert_eq!(settled(500, 500, 0), 500);
     }
 
     #[test]
