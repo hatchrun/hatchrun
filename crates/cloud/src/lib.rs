@@ -55,6 +55,7 @@ pub mod telemetry;
 pub mod tenant;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod testdb;
+mod tokens;
 mod webcrypto;
 pub mod webhook;
 
@@ -152,10 +153,12 @@ const RUN: &str = "INSERT INTO runs (id, installation_id, repository, workflow_n
 
 /// Moves a run on to attempt `?2` when its first job is queued. A late
 /// delivery from an earlier attempt changes nothing. The run expires
-/// from the new attempt, as its jobs do.
+/// from the new attempt, as its jobs do. The branch may have moved since
+/// the last attempt, so its cache scopes are worked out again.
 const RUN_ATTEMPT: &str = "UPDATE runs SET attempt = ?2, queued_at = ?3, head_sha = ?4, \
      head_branch = ?5, updated_at = ?3, expires_at = ?3 + COALESCE((SELECT retention_days \
-       FROM tenants WHERE tenants.installation_id = runs.installation_id), 30) * 86400000 \
+       FROM tenants WHERE tenants.installation_id = runs.installation_id), 30) * 86400000, \
+     cache_write = NULL, cache_reads = NULL \
      WHERE id = ?1 AND attempt < ?2";
 
 /// Records a queued job once, however often GitHub delivers it. It
@@ -483,13 +486,18 @@ mod tests {
         let db = Db::new();
         assert_eq!(job_of_run(&db, 1, 1, "a1", NOW), [1, 0, 1]);
         assert_eq!(job_of_run(&db, 2, 1, "a1", NOW + 5), [0, 0, 1]);
+        db.run(
+            "UPDATE runs SET cache_write = '1/b/x', cache_reads = '[\"1/b/x\"]'",
+            &[],
+        );
         // A re-run: new job ids, attempt 2 and the list's place moves.
         assert_eq!(job_of_run(&db, 3, 2, "a2", NOW + 100), [0, 1, 1]);
         // A late delivery of attempt 1 leaves the run on attempt 2.
         assert_eq!(job_of_run(&db, 4, 1, "a1", NOW + 200), [0, 0, 1]);
         let rows = db
             .rows(
-                "SELECT attempt, queued_at, head_sha, workflow_name, expires_at FROM runs",
+                "SELECT attempt, queued_at, head_sha, workflow_name, expires_at, cache_write, \
+                 cache_reads FROM runs",
                 &[],
             )
             .unwrap();
@@ -500,6 +508,8 @@ mod tests {
         assert_eq!(rows[0]["workflow_name"], "Smoke test");
         // No tenant: the default 30 days, from the newest attempt.
         assert_eq!(rows[0]["expires_at"], NOW + 100 + 30 * 24 * 60 * 60 * 1000);
+        // The re-run works out its cache scopes again.
+        assert!(rows[0]["cache_write"].is_null() && rows[0]["cache_reads"].is_null());
         let attempts = db
             .rows("SELECT name, run_attempt FROM jobs ORDER BY id", &[])
             .unwrap();
