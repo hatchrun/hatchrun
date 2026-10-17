@@ -96,6 +96,11 @@ const REDELIVERY_MEMORY: u64 = 4 * 24 * 60 * 60 * 1000;
 /// How long a cache upload nobody finished keeps its row: the longest a
 /// runner instance runs, and then some.
 const CACHE_UPLOAD_MEMORY: u64 = 24 * 60 * 60 * 1000;
+/// How long a job or run recorded without `expires_at` is kept: the
+/// default `retention_days`. Only a Worker from before migration 0019,
+/// still running while it applies, records rows without one, and it
+/// knew no tenant's retention.
+const UNSET_RETENTION: u64 = 30 * 24 * 60 * 60 * 1000;
 /// Lost launches of installations with no AWS connected failed per pass.
 const UNCONNECTED_PER_PASS: u32 = 50;
 /// Rows deleted per table per pass.
@@ -448,6 +453,16 @@ fn unconnected_query() -> String {
 /// Deletes up to `?2` sessions expired before `?1`.
 const DELETE_SESSIONS: &str = "DELETE FROM sessions WHERE key IN \
      (SELECT key FROM sessions WHERE expires_at < ?1 LIMIT ?2)";
+
+/// Gives up to `?2` jobs without `expires_at` one `?1` after they were
+/// queued. `jobs_expiry` holds the NULLs, so once none are left this
+/// reads nothing.
+const BACKFILL_JOBS: &str = "UPDATE jobs SET expires_at = queued_at + ?1 WHERE id IN \
+     (SELECT id FROM jobs WHERE expires_at IS NULL LIMIT ?2)";
+
+/// As [`BACKFILL_JOBS`], for runs.
+const BACKFILL_RUNS: &str = "UPDATE runs SET expires_at = queued_at + ?1 WHERE id IN \
+     (SELECT id FROM runs WHERE expires_at IS NULL LIMIT ?2)";
 
 /// Deletes up to `?2` jobs that expired before `?1`, oldest first.
 const DELETE_JOBS: &str = "DELETE FROM jobs WHERE id IN \
@@ -1544,9 +1559,20 @@ impl Pass<'_> {
         let now = int(self.now).map_err(text)?;
         let redeliveries_before = int(self.now.saturating_sub(REDELIVERY_MEMORY)).map_err(text)?;
         let uploads_before = int(self.now.saturating_sub(CACHE_UPLOAD_MEMORY)).map_err(text)?;
+        let unset = int(UNSET_RETENTION).map_err(text)?;
         let results = self
             .db
             .batch(vec![
+                // Before the deletes, so a row without an expiry that
+                // is past it goes in the same pass.
+                self.db
+                    .prepare(BACKFILL_JOBS)
+                    .bind(&[unset.clone(), DELETE_BATCH.into()])
+                    .map_err(text)?,
+                self.db
+                    .prepare(BACKFILL_RUNS)
+                    .bind(&[unset, DELETE_BATCH.into()])
+                    .map_err(text)?,
                 self.db
                     .prepare(DELETE_SESSIONS)
                     .bind(&[now.clone(), DELETE_BATCH.into()])
@@ -1580,16 +1606,16 @@ impl Pass<'_> {
                 u32::try_from(changes(result)).unwrap_or(u32::MAX)
             })
         };
-        if [0, 1, 2, 4, 5]
+        if [0, 1, 2, 3, 4, 6, 7]
             .into_iter()
             .any(|at| deleted(at) == DELETE_BATCH)
         {
             self.more.set(true);
         }
         Ok(Summary {
-            sessions_deleted: deleted(0),
-            jobs_deleted: deleted(1),
-            runs_deleted: deleted(5),
+            sessions_deleted: deleted(2),
+            jobs_deleted: deleted(3),
+            runs_deleted: deleted(7),
             db_bytes: db_bytes(&results),
             ..Summary::default()
         })
@@ -2275,6 +2301,38 @@ mod tests {
     }
 
     #[test]
+    fn rows_without_an_expiry_get_the_default() {
+        let db = Db::new();
+        // As the Worker from before migration 0019 recorded them: an
+        // old job and run, and a recent job.
+        job(&db, 1, 9, "completed", NOW - UNSET_RETENTION - 1);
+        job(&db, 2, 9, "queued", NOW);
+        db.run(
+            "INSERT INTO runs (id, installation_id, repository, head_sha, attempt, \
+             queued_at, created_at, updated_at) VALUES (10, 9, 'acme/app', 'a', 1, ?1, ?1, ?1)",
+            &params![NOW - UNSET_RETENTION - 1],
+        );
+        // As `retention` binds them.
+        let pass = |db: &Db| {
+            db.batch(&[
+                (BACKFILL_JOBS, params![UNSET_RETENTION, DELETE_BATCH]),
+                (BACKFILL_RUNS, params![UNSET_RETENTION, DELETE_BATCH]),
+                (DELETE_JOBS, params![NOW, DELETE_BATCH]),
+                (DELETE_RUNS, params![NOW, DELETE_BATCH]),
+            ])
+            .unwrap()
+        };
+        assert_eq!(pass(&db), [2, 1, 1, 1]);
+        let left = db.rows("SELECT id, expires_at FROM jobs", &[]).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0]["id"], 2);
+        assert_eq!(left[0]["expires_at"], NOW + UNSET_RETENTION);
+        assert_eq!(value(&db, "SELECT COUNT(*) FROM runs", &[]), 0);
+        // Filled in: the next pass has nothing to do.
+        assert_eq!(pass(&db), [0, 0, 0, 0]);
+    }
+
+    #[test]
     fn retention_days_stay_between_one_and_ninety() {
         let db = Db::new();
         tenant(&db, "a", Some(1), Some("eu-west-1"));
@@ -2314,6 +2372,16 @@ mod tests {
                 "DELETE_RUNS",
                 db.plan(DELETE_RUNS, &params![NOW, DELETE_BATCH]),
                 &["runs_expiry", "jobs_run"][..],
+            ),
+            (
+                "BACKFILL_JOBS",
+                db.plan(BACKFILL_JOBS, &params![UNSET_RETENTION, DELETE_BATCH]),
+                &["jobs_expiry (expires_at=?)"][..],
+            ),
+            (
+                "BACKFILL_RUNS",
+                db.plan(BACKFILL_RUNS, &params![UNSET_RETENTION, DELETE_BATCH]),
+                &["runs_expiry (expires_at=?)"][..],
             ),
         ];
         for (name, plan, indexes) in plans {
