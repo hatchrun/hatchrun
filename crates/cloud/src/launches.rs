@@ -139,22 +139,14 @@ pub(crate) async fn deliver(launcher: &impl Launcher, body: serde_json::Value) -
 }
 
 /// The consumer: launches a batch's jobs side by side and acks or
-/// retries each message. Bodies are read as JSON first and as a
-/// [`Launch`] in [`deliver`], so a message that does not read is still
-/// in hand to retry.
+/// retries each message. Bodies are read raw and parsed in [`deliver`],
+/// so a message that does not read is retried like any other.
 pub(crate) async fn consume(batch: MessageBatch<serde_json::Value>, env: Env) {
-    let messages: Vec<_> = batch
-        .iter()
-        .filter_map(|message| {
-            message
-                .inspect_err(|err| console_error!("launch queue: message is not JSON: {err}"))
-                .ok()
-        })
-        .collect();
+    let messages: Vec<_> = batch.raw_iter().collect();
     let verdicts = futures_util::future::join_all(
         messages
             .iter()
-            .map(|message| deliver(&env, message.body().clone())),
+            .map(|message| deliver(&env, json(&message.body()))),
     )
     .await;
     let retry = QueueRetryOptionsBuilder::new()
@@ -176,6 +168,16 @@ pub(crate) async fn consume(batch: MessageBatch<serde_json::Value>, env: Env) {
             }
         }
     }
+}
+
+/// A message body as JSON, or `null` when it is not JSON, which
+/// [`deliver`] retries as unreadable.
+fn json(body: &wasm_bindgen::JsValue) -> serde_json::Value {
+    js_sys::JSON::stringify(body)
+        .ok()
+        .and_then(|text| text.as_string())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
