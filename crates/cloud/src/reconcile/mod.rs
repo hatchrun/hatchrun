@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The reconciler, run by a Cron Trigger every minute. Webhooks get
-//! lost, launches die with the request that started them and runners
-//! take each other's jobs; each pass puts D1 and the tenants' instances
-//! back in line:
+//! lost, launch messages run out of retries and runners take each
+//! other's jobs; each pass puts D1 and the tenants' instances back in
+//! line:
 //!
 //! 1. redeliver the App's webhook deliveries that failed, each once
 //!    (see [`deliveries`]);

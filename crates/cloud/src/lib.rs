@@ -9,9 +9,10 @@
 //! signature, keeps the jobs whose `runs-on` label names one of the
 //! organization's runner profiles (see [`labels`] and [`profiles`]) and
 //! records them in D1, one row per job, so a webhook GitHub delivers
-//! twice is recorded once. After answering, it launches a runner
-//! instance for the job in the tenant's AWS account (see the `launch`
-//! module).
+//! twice is recorded once. It sends each recorded job to the launch
+//! queue, whose consumer in this Worker launches a runner instance for
+//! it in the tenant's AWS account (see the `launches` and `launch`
+//! modules).
 //!
 //! - `POST /github/webhook` takes the App's webhook deliveries.
 //! - `/api/*` on `app.hatchrun.io` is the app's API (see [`app`]); every
@@ -41,6 +42,7 @@ pub mod instance_types;
 pub mod jwt;
 pub mod labels;
 mod launch;
+mod launches;
 pub mod offerings;
 pub mod oidc;
 pub mod polar;
@@ -61,8 +63,8 @@ pub mod webhook;
 
 use wasm_bindgen::JsValue;
 use worker::{
-    D1Database, Env, Headers, Method, Request, Response, ResponseBuilder, Result, ScheduleContext,
-    ScheduledEvent, console_error, console_warn, event,
+    D1Database, Env, Headers, MessageBatch, Method, Request, Response, ResponseBuilder, Result,
+    ScheduleContext, ScheduledEvent, console_error, console_warn, event,
 };
 
 use crate::jwt::PublicKey;
@@ -121,6 +123,17 @@ async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response>
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     reconcile::run(env).await;
+}
+
+/// The launch queue's consumer in `wrangler.toml` (see [`launches`]).
+#[event(queue)]
+async fn queue(
+    batch: MessageBatch<serde_json::Value>,
+    env: Env,
+    _ctx: worker::Context,
+) -> Result<()> {
+    launches::consume(batch, env).await;
+    Ok(())
 }
 
 /// The app's static assets. Every path that is not a file is the app's
@@ -274,10 +287,17 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
             }
             record_queued(&db, &env, ctx, &job, &placement, now).await?;
             // A repeated delivery comes here too; the launch claims the
-            // job first, so only one of them launches.
-            let id = job.id;
-            ctx.wait_until(launch::launch(env, job));
-            Ok(Response::from_json(&serde_json::json!({ "recorded": id }))?.with_status(202))
+            // job first, so only one of them launches. The job is
+            // recorded either way, and the reconciler launches it when
+            // the queue does not take the message.
+            let queued = match env.queue(launches::QUEUE) {
+                Ok(queue) => launches::enqueue(&queue, &job).await,
+                Err(err) => Err(err.to_string()),
+            };
+            if let Err(err) = queued {
+                console_error!("job {}: not queued for launch: {err}", job.id);
+            }
+            Ok(Response::from_json(&serde_json::json!({ "recorded": job.id }))?.with_status(202))
         }
         Event::Progress {
             id,

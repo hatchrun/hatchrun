@@ -45,6 +45,28 @@ migrations_dir = "migrations"
 binding = "TOKENS"
 id = "local"
 
+# Launches. The webhook sends each queued job here and this Worker's
+# consumer launches it (crates/cloud/src/launches.rs), so a launch
+# outlives the webhook request. Messages that fail max_retries times go
+# to the dead-letter queue; the reconciler launches their jobs again.
+[[queues.producers]]
+binding = "LAUNCHES"
+queue = "hatchrun-launches"
+
+# Small batches, sent after a second at most, so a runner's start does
+# not wait for other jobs. max_concurrency caps the batches launching at
+# once, and with max_batch_size the launches in flight: 10 batches of 5,
+# at most 50 launches across all tenants. Each one registers a runner
+# with GitHub, and a burst from one organization would otherwise spend
+# its installation's rate limit, which the reconciler and the app share.
+[[queues.consumers]]
+queue = "hatchrun-launches"
+max_batch_size = 5
+max_batch_timeout = 1
+max_retries = 3
+max_concurrency = 10
+dead_letter_queue = "hatchrun-launches-dlq"
+
 # Runner metrics, which hatchrun-telemetry (crates/telemetry) writes to
 # Analytics Engine, read back for the app's job pages.
 [analytics]

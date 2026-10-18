@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Launches a runner instance for a recorded job, after the webhook has
-//! been answered.
+//! Launches a runner instance for a recorded job, from the launch queue
+//! the webhook sends it to (see [`crate::launches`]).
 //!
 //! Only tenants with AWS connected and a licence (the beta or a paid
 //! subscription) launch; jobs of any other are marked `failed`.
@@ -137,7 +137,7 @@ const RECHECK: &str = "UPDATE jobs SET launch_state = NULL, launch_retry = NULL,
      AND status = 'queued' AND launch_state = 'failed' AND launch_retry = 'setup'";
 
 /// Takes a queued job while the tenant has room, counting the attempt.
-const CLAIM: &str = "UPDATE jobs SET launch_state = 'launching', runner_name = ?2, \
+pub(crate) const CLAIM: &str = "UPDATE jobs SET launch_state = 'launching', runner_name = ?2, \
      updated_at = ?3, launch_attempts = launch_attempts + 1 \
      WHERE id = ?1 AND launch_state IS NULL AND status = 'queued' \
      AND (SELECT COUNT(*) FROM jobs \
@@ -238,7 +238,12 @@ pub async fn launch(env: Env, job: QueuedJob) {
     }
 }
 
-async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
+/// Launches a runner for `job` if nothing else has. Returns once the
+/// outcome is decided: launched, refused, taken by another launch, or
+/// failed and recorded on the job row. An error means the launch could
+/// not get that far, such as D1 not answering before the claim, and is
+/// safe to try again: the claim keeps a second try from launching twice.
+pub(crate) async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
     let db = env.d1(DB)?;
     let tenant: Option<Tenant> = db
         .prepare(tenant_query())
