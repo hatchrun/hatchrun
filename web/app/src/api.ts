@@ -268,6 +268,8 @@ export interface Run {
   attempt: number;
   /** Unix milliseconds: when the newest attempt's first job was queued. */
   queuedAt: number;
+  /** Unix milliseconds: when its last current job ended; null while one has not. */
+  endedAt: number | null;
   /** Null until hatchrun has read the run on GitHub. */
   runNumber: number | null;
   event: string | null;
@@ -320,10 +322,11 @@ export type JobGroup = "active" | "waiting" | "failed";
 
 /**
  * The columns the runs table sorts by. By repository, each repository's
- * runs are newest first. A run's duration and state are left out: both
- * change while it runs, so a page boundary in either would move.
+ * runs are newest first. By took, the runs still going come after the
+ * finished ones, oldest first either way. A run's state is left out: it
+ * changes while the run goes, so a page boundary in it would move.
  */
-export type RunSort = "started" | "repository";
+export type RunSort = "started" | "repository" | "took";
 export type SortDir = "asc" | "desc";
 
 export interface RunQuery {
@@ -350,10 +353,9 @@ export const listRuns = (org: string, { before, status, sort = "started", dir = 
     query.set("q", q);
   }
   if (before) {
-    query.set(
-      "before",
-      sort === "repository" ? `${before.queuedAt}:${before.id}:${before.repository}` : `${before.queuedAt}:${before.id}`,
-    );
+    const third =
+      sort === "repository" ? `:${before.repository}` : sort === "took" ? `:${before.endedAt ?? ""}` : "";
+    query.set("before", `${before.queuedAt}:${before.id}${third}`);
   }
   const search = query.toString();
   return get<RunPage>(`${tenantPath(org)}/runs${search ? `?${search}` : ""}`);

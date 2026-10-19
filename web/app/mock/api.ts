@@ -253,27 +253,45 @@ const routes: Record<string, Handler> = {
     const now = Date.now();
     const runs = sampleRuns(now);
     const all = runs.flatMap((run) => run.jobs);
-    const [at = "", id = "", ...repository] = (url.searchParams.get("before") ?? "").split(":");
+    const [at = "", id = "", ...rest] = (url.searchParams.get("before") ?? "").split(":");
     const status = url.searchParams.get("status");
     const group = status === "active" || status === "waiting" || status === "failed" ? IN_GROUP[status] : null;
     const sort = url.searchParams.get("sort") ?? "started";
     const dir = url.searchParams.get("dir") ?? "desc";
-    if ((status && !group) || !["started", "repository"].includes(sort) || !["asc", "desc"].includes(dir)) {
-      return [400, { error: "status is active, waiting or failed; sort is started or repository; dir is asc or desc." }];
+    if ((status && !group) || !["started", "repository", "took"].includes(sort) || !["asc", "desc"].includes(dir)) {
+      return [400, { error: "status is active, waiting or failed; sort is started, repository or took; dir is asc or desc." }];
     }
     const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
     // As list_query in crates/cloud/src/app/dashboard.rs: by repository
-    // case aside, each repository newest first, and the cursor is the
-    // last run of the page before.
-    type Key = Pick<Run, "queuedAt" | "id" | "repository">;
+    // case aside, each repository newest first; by took, finished runs
+    // by how long they took, ties by id, then the runs still going,
+    // oldest first; and the cursor is the last run of the page before.
+    type Key = Pick<Run, "queuedAt" | "id" | "repository" | "endedAt">;
     const newest = (a: Key, b: Key) => b.queuedAt - a.queuedAt || b.id - a.id;
     const name = (run: Key) => run.repository.toLowerCase();
+    const took = (a: Key, b: Key) => {
+      if ((a.endedAt === null) !== (b.endedAt === null)) {
+        return a.endedAt === null ? 1 : -1;
+      }
+      if (a.endedAt === null || b.endedAt === null) {
+        return a.queuedAt - b.queuedAt || a.id - b.id;
+      }
+      return (a.endedAt - a.queuedAt - (b.endedAt - b.queuedAt)) * (dir === "asc" ? 1 : -1) || a.id - b.id;
+    };
     const order =
       sort === "repository"
         ? (a: Key, b: Key) => (name(a) < name(b) ? -1 : name(a) > name(b) ? 1 : 0) * (dir === "asc" ? 1 : -1) || newest(a, b)
-        : (a: Key, b: Key) => newest(a, b) * (dir === "asc" ? -1 : 1);
+        : sort === "took"
+          ? took
+          : (a: Key, b: Key) => newest(a, b) * (dir === "asc" ? -1 : 1);
     const first = !at;
-    const cursor: Key = { queuedAt: Number(at), id: Number(id), repository: repository.join(":") };
+    const third = rest.join(":");
+    const cursor: Key = {
+      queuedAt: Number(at),
+      id: Number(id),
+      repository: third,
+      endedAt: sort === "took" && third !== "" ? Number(third) : null,
+    };
     const matches = (run: ListedRun) =>
       !q ||
       [run.repository, run.workflowName, run.headBranch, ...[...run.jobs, ...(OLDER.get(run.id) ?? [])].flatMap((j) => [j.name, j.label, j.instanceId])].some(
@@ -613,12 +631,17 @@ function sampleRuns(now: number): ListedRun[] {
     OLDER.set(id, older);
     const attempt = Math.max(1, ...jobs.map((j) => j.runAttempt));
     const queuedAt = Math.min(...jobs.filter((j) => j.runAttempt === attempt).map((j) => j.queuedAt));
+    // As the jobs_end triggers in crates/cloud/migrations/0024_run_ended.sql.
+    const endedAt = jobs.some((j) => j.status !== "completed")
+      ? null
+      : Math.max(queuedAt, ...jobs.map((j) => j.completedAt ?? j.updatedAt));
     return {
       id,
       headBranch: "main",
       headSha: (id * 2654435761).toString(16).padStart(40, "a").slice(0, 40),
       attempt,
       queuedAt,
+      endedAt,
       runNumber: id % 1000,
       event: "push",
       displayTitle: null,
