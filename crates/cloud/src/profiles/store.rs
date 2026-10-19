@@ -5,12 +5,12 @@
 //! Custom profiles in the `runner_profiles` table.
 
 use serde::Deserialize;
-use wasm_bindgen::JsValue;
-use worker::{D1Database, Result};
+use worker::Result;
 
 use super::{Capacity, Profile, built_in};
+use crate::db::{Db, params};
 use crate::labels::{Arch, Spec};
-use crate::{int, now_ms};
+use crate::now_ms;
 
 const COLUMNS: &str = "runner_profiles.name, runner_profiles.arch, runner_profiles.families, \
     runner_profiles.cpu_min, runner_profiles.cpu_max, runner_profiles.memory_min, \
@@ -73,34 +73,34 @@ impl From<Row> for Profile {
 
 /// The tenant's own profiles, by name.
 fn custom_query() -> String {
-    format!("SELECT {COLUMNS} FROM runner_profiles WHERE tenant_id = ?1 ORDER BY name")
+    format!("SELECT {COLUMNS} FROM runner_profiles WHERE tenant_id = $1 ORDER BY name")
 }
 
 /// The tenant's own profile with a name.
 fn named_query() -> String {
-    format!("SELECT {COLUMNS} FROM runner_profiles WHERE tenant_id = ?1 AND name = ?2")
+    format!("SELECT {COLUMNS} FROM runner_profiles WHERE tenant_id = $1 AND name = $2")
 }
 
 /// The installation's tenant, with the profile's name when it has one.
 const UNKNOWN: &str = "SELECT tenants.id, runner_profiles.name FROM tenants \
      LEFT JOIN runner_profiles ON runner_profiles.tenant_id = tenants.id \
-     AND runner_profiles.name = ?2 WHERE tenants.installation_id = ?1";
+     AND runner_profiles.name = $2 WHERE tenants.installation_id = $1";
 
 /// Inserts or replaces a profile.
 const SAVE: &str = "INSERT INTO runner_profiles (tenant_id, name, arch, families, cpu_min, \
      cpu_max, memory_min, memory_max, disk_gib, spot, image, extras, warm_pool, created_at, \
      updated_at, categories, min_generation, capacity) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15, ?16, ?17) \
-     ON CONFLICT (tenant_id, name) DO UPDATE SET arch = ?3, families = ?4, cpu_min = ?5, \
-     cpu_max = ?6, memory_min = ?7, memory_max = ?8, disk_gib = ?9, spot = ?10, \
-     image = ?11, extras = ?12, warm_pool = ?13, updated_at = ?14, categories = ?15, \
-     min_generation = ?16, capacity = ?17";
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14, $15, $16, $17) \
+     ON CONFLICT (tenant_id, name) DO UPDATE SET arch = $3, families = $4, cpu_min = $5, \
+     cpu_max = $6, memory_min = $7, memory_max = $8, disk_gib = $9, spot = $10, \
+     image = $11, extras = $12, warm_pool = $13, updated_at = $14, categories = $15, \
+     min_generation = $16, capacity = $17";
 
 /// How many profiles a tenant has.
-const COUNT: &str = "SELECT COUNT(*) AS count FROM runner_profiles WHERE tenant_id = ?1";
+const COUNT: &str = "SELECT COUNT(*) AS count FROM runner_profiles WHERE tenant_id = $1";
 
 /// Removes a tenant's profile.
-const DELETE: &str = "DELETE FROM runner_profiles WHERE tenant_id = ?1 AND name = ?2";
+const DELETE: &str = "DELETE FROM runner_profiles WHERE tenant_id = $1 AND name = $2";
 
 /// A row of [`COUNT`].
 #[derive(Deserialize)]
@@ -109,44 +109,27 @@ struct Count {
 }
 
 /// The tenant's own profiles, by name.
-pub(crate) async fn custom(db: &D1Database, tenant_id: &str) -> Result<Vec<Profile>> {
-    Ok(db
-        .prepare(custom_query())
-        .bind(&[tenant_id.into()])?
-        .all()
-        .await?
-        .results::<Row>()?
-        .into_iter()
-        .map(Profile::from)
-        .collect())
+pub(crate) async fn custom(db: &Db, tenant_id: &str) -> Result<Vec<Profile>> {
+    let rows: Vec<Row> = db.all(&custom_query(), &params![tenant_id]).await?;
+    Ok(rows.into_iter().map(Profile::from).collect())
 }
 
 /// The tenant's own profile called `name`.
-pub(crate) async fn named(db: &D1Database, tenant_id: &str, name: &str) -> Result<Option<Profile>> {
-    Ok(db
-        .prepare(named_query())
-        .bind(&[tenant_id.into(), name.into()])?
-        .first::<Row>(None)
-        .await?
-        .map(Profile::from))
+pub(crate) async fn named(db: &Db, tenant_id: &str, name: &str) -> Result<Option<Profile>> {
+    let row: Option<Row> = db.first(&named_query(), &params![tenant_id, name]).await?;
+    Ok(row.map(Profile::from))
 }
 
 /// Why a job's label names no profile of the tenant behind
 /// `installation_id`, or `None` when it names one. Jobs of an
 /// installation without a tenant are left to the launch, which says so
 /// on the job.
-pub(crate) async fn unknown(
-    db: &D1Database,
-    installation_id: u64,
-    spec: &Spec,
-) -> Result<Option<String>> {
+pub(crate) async fn unknown(db: &Db, installation_id: u64, spec: &Spec) -> Result<Option<String>> {
     if built_in(&spec.profile).is_some() {
         return Ok(None);
     }
     let found: Option<serde_json::Value> = db
-        .prepare(UNKNOWN)
-        .bind(&[int(installation_id)?, spec.profile.as_str().into()])?
-        .first(None)
+        .first(UNKNOWN, &params![installation_id, spec.profile.as_str()])
         .await?;
     Ok(match found {
         Some(row) if row["name"].is_null() => Some(format!("no runner profile {}", spec.profile)),
@@ -155,51 +138,42 @@ pub(crate) async fn unknown(
 }
 
 /// Stores `profile` for the tenant, replacing one of the same name.
-pub(crate) async fn save(db: &D1Database, tenant_id: &str, profile: &Profile) -> Result<()> {
-    let optional = |value: Option<u16>| value.map_or(JsValue::NULL, Into::into);
-    db.prepare(SAVE)
-        .bind(&[
-            tenant_id.into(),
-            profile.name.as_str().into(),
-            profile.arch.as_str().into(),
-            profile.families.join(",").into(),
-            profile.cpu_min.into(),
-            optional(profile.cpu_max),
-            profile.memory_min.into(),
-            optional(profile.memory_max),
-            optional(profile.disk_gib),
-            u8::from(profile.capacity.spot()).into(),
-            profile.image.as_str().into(),
-            profile.extras.join(",").into(),
-            profile.warm_pool.into(),
-            int(now_ms())?,
-            profile.categories.join(",").into(),
-            optional(profile.min_generation),
-            profile.capacity.as_str().into(),
-        ])?
-        .run()
-        .await?;
+pub(crate) async fn save(db: &Db, tenant_id: &str, profile: &Profile) -> Result<()> {
+    db.run(
+        SAVE,
+        &params![
+            tenant_id,
+            profile.name.as_str(),
+            profile.arch.as_str(),
+            profile.families.join(","),
+            profile.cpu_min,
+            profile.cpu_max,
+            profile.memory_min,
+            profile.memory_max,
+            profile.disk_gib,
+            profile.capacity.spot(),
+            profile.image.as_str(),
+            profile.extras.join(","),
+            profile.warm_pool,
+            now_ms(),
+            profile.categories.join(","),
+            profile.min_generation,
+            profile.capacity.as_str(),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
 /// How many profiles the tenant has.
-pub(crate) async fn count(db: &D1Database, tenant_id: &str) -> Result<usize> {
-    Ok(db
-        .prepare(COUNT)
-        .bind(&[tenant_id.into()])?
-        .first::<Count>(None)
-        .await?
-        .map_or(0, |row| row.count))
+pub(crate) async fn count(db: &Db, tenant_id: &str) -> Result<usize> {
+    let row: Option<Count> = db.first(COUNT, &params![tenant_id]).await?;
+    Ok(row.map_or(0, |row| row.count))
 }
 
 /// Removes the tenant's profile called `name`. Whether there was one.
-pub(crate) async fn delete(db: &D1Database, tenant_id: &str, name: &str) -> Result<bool> {
-    let result = db
-        .prepare(DELETE)
-        .bind(&[tenant_id.into(), name.into()])?
-        .run()
-        .await?;
-    Ok(result.meta()?.and_then(|meta| meta.changes) == Some(1))
+pub(crate) async fn delete(db: &Db, tenant_id: &str, name: &str) -> Result<bool> {
+    Ok(db.run(DELETE, &params![tenant_id, name]).await? == 1)
 }
 
 #[cfg(test)]
@@ -241,7 +215,7 @@ mod tests {
             u32::from(profile.memory_min),
             optional(profile.memory_max),
             optional(profile.disk_gib),
-            u32::from(u8::from(profile.capacity.spot())),
+            profile.capacity.spot(),
             profile.image.as_str(),
             profile.extras.join(","),
             u32::from(profile.warm_pool),
@@ -256,7 +230,7 @@ mod tests {
         let db = Db::new();
         db.run(
             "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+             VALUES ($1, $2, $3, $4, $5, $5)",
             &params!["t1", 9u64, "acme", 42u64, 1u64],
         );
         db

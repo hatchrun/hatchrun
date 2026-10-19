@@ -44,9 +44,10 @@ use std::fmt::Write;
 use std::time::Duration;
 
 use serde::Deserialize;
-use worker::{D1Database, Env, Result, console_error, console_log, console_warn};
+use worker::{Env, Result, console_error, console_log, console_warn};
 
 use crate::aws::{self, Credentials, ec2, sts};
+use crate::db::{Db, params};
 use crate::fetch::{Counted, send};
 use crate::http::Request;
 use crate::instance::{Choice, Limits};
@@ -57,8 +58,8 @@ use crate::reconcile::retry::{Cause, Failure};
 use crate::tokens::{self, App, Kv, Tokens};
 use crate::webhook::QueuedJob;
 use crate::{
-    DB, cache, connect, github, instance, instance_types, int, jwt, now_ms, oidc, settings,
-    telemetry, webcrypto,
+    cache, connect, github, instance, instance_types, jwt, now_ms, oidc, settings, telemetry,
+    webcrypto,
 };
 
 /// Variable with the App's client id.
@@ -91,20 +92,20 @@ struct Tenant {
     max_runners: u32,
     /// Regions the organization allows, comma separated, or none.
     allowed_regions: Option<String>,
-    /// 1 when the tenant holds a licence (see [`LICENSED`]).
-    licensed: u8,
+    /// Whether the tenant holds a licence (see [`LICENSED`]).
+    licensed: bool,
     /// What its connect stack allows (see [`Limits::from_columns`]).
     instance_types: Option<String>,
     excluded_instance_types: Option<String>,
     volume_size_limit: Option<u16>,
     root_volume_size: Option<u16>,
-    /// 1 when its stack lets the role use EC2 Fleet.
-    fleet: u8,
+    /// Whether its stack lets the role use EC2 Fleet.
+    fleet: bool,
     /// Its stack's cache bucket, version 5 on.
     cache_bucket: Option<String>,
 }
 
-/// SQL that is 1 for a tenant row that may launch (see
+/// SQL that is true for a tenant row that may launch (see
 /// [`crate::usage::MAY_LAUNCH`]).
 pub(crate) const LICENSED: &str = crate::usage::MAY_LAUNCH;
 
@@ -114,38 +115,38 @@ fn tenant_query() -> String {
         "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners, \
          allowed_regions, {LICENSED} AS licensed, instance_types, volume_size_limit, \
          root_volume_size, fleet, excluded_instance_types, cache_bucket \
-         FROM tenants WHERE installation_id = ?1 AND role_arn IS NOT NULL \
+         FROM tenants WHERE installation_id = $1 AND role_arn IS NOT NULL \
          AND region IS NOT NULL AND launch_template_id IS NOT NULL \
          AND subnet_ids IS NOT NULL"
     )
 }
 
 /// Fails a job nobody took because its tenant cannot launch.
-const REFUSE: &str = "UPDATE jobs SET launch_state = 'failed', launch_error = ?2, \
-     updated_at = ?3, launch_retry = ?4, next_launch_at = NULL \
-     WHERE id = ?1 AND launch_state IS NULL";
+const REFUSE: &str = "UPDATE jobs SET launch_state = 'failed', launch_error = $2, \
+     updated_at = $3, launch_retry = $4, next_launch_at = NULL \
+     WHERE id = $1 AND launch_state IS NULL";
 
 /// Records how a launch ended.
-const RECORD: &str = "UPDATE jobs SET launch_state = ?2, instance_id = ?3, launch_error = ?4, \
-     updated_at = ?5, launch_retry = ?6, next_launch_at = ?7 WHERE id = ?1";
+const RECORD: &str = "UPDATE jobs SET launch_state = $2, instance_id = $3, launch_error = $4, \
+     updated_at = $5, launch_retry = $6, next_launch_at = $7 WHERE id = $1";
 
 /// Puts a tenant's jobs that wait for its setup back in line.
 const RECHECK: &str = "UPDATE jobs SET launch_state = NULL, launch_retry = NULL, \
-     next_launch_at = NULL, updated_at = ?2 \
-     WHERE installation_id = (SELECT installation_id FROM tenants WHERE id = ?1) \
+     next_launch_at = NULL, updated_at = $2 \
+     WHERE installation_id = (SELECT installation_id FROM tenants WHERE id = $1) \
      AND status = 'queued' AND launch_state = 'failed' AND launch_retry = 'setup'";
 
 /// Takes a queued job while the tenant has room, counting the attempt.
-pub(crate) const CLAIM: &str = "UPDATE jobs SET launch_state = 'launching', runner_name = ?2, \
-     updated_at = ?3, launch_attempts = launch_attempts + 1 \
-     WHERE id = ?1 AND launch_state IS NULL AND status = 'queued' \
+pub(crate) const CLAIM: &str = "UPDATE jobs SET launch_state = 'launching', runner_name = $2, \
+     updated_at = $3, launch_attempts = launch_attempts + 1 \
+     WHERE id = $1 AND launch_state IS NULL AND status = 'queued' \
      AND (SELECT COUNT(*) FROM jobs \
-          WHERE installation_id = ?4 AND status <> 'completed' \
-          AND launch_state IN ('launching', 'launched')) < ?5 \
+          WHERE installation_id = $4 AND status <> 'completed' \
+          AND launch_state IN ('launching', 'launched')) < $5 \
      RETURNING launch_attempts";
 
 /// The runner image for a region and architecture.
-const IMAGE: &str = "SELECT image_id, root_device FROM images WHERE region = ?1 AND arch = ?2";
+const IMAGE: &str = "SELECT image_id, root_device FROM images WHERE region = $1 AND arch = $2";
 
 /// A row of [`CLAIM`].
 #[derive(Deserialize)]
@@ -240,25 +241,23 @@ pub async fn launch(env: Env, job: QueuedJob) {
 /// Launches a runner for `job` if nothing else has. Returns once the
 /// outcome is decided: launched, refused, taken by another launch, or
 /// failed and recorded on the job row. An error means the launch could
-/// not get that far, such as D1 not answering before the claim, and is
+/// not get that far, such as the database not answering before the claim, and is
 /// safe to try again: the claim keeps a second try from launching twice.
 pub(crate) async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
-    let db = env.d1(DB)?;
+    let db = Db::connect(env).await?;
     let tenant: Option<Tenant> = db
-        .prepare(tenant_query())
-        .bind(&[int(job.installation_id)?])?
-        .first(None)
+        .first(&tenant_query(), &params![job.installation_id])
         .await?;
     let tenant = match tenant {
         Some(tenant)
-            if tenant.licensed == 1
+            if tenant.licensed
                 && settings::region_allowed(&tenant.region, tenant.allowed_regions.as_deref()) =>
         {
             tenant
         }
         other => {
             let message = match other {
-                Some(tenant) if tenant.licensed == 1 => format!(
+                Some(tenant) if tenant.licensed => format!(
                     "tenant {} does not allow runners in {}",
                     tenant.id, tenant.region
                 ),
@@ -274,15 +273,11 @@ pub(crate) async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
                 ),
             };
             let (wait, _) = Failure::new(Cause::Tenant, message.as_str()).outcome(0, now_ms());
-            db.prepare(REFUSE)
-                .bind(&[
-                    int(job.id)?,
-                    message.as_str().into(),
-                    int(now_ms())?,
-                    wait.as_str().into(),
-                ])?
-                .run()
-                .await?;
+            db.run(
+                REFUSE,
+                &params![job.id, message.as_str(), now_ms(), wait.as_str()],
+            )
+            .await?;
             console_warn!("job {}: {message}", job.id);
             return Ok(());
         }
@@ -308,7 +303,7 @@ pub(crate) async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
 /// Records how the job's `attempts`th launch, of runner `name`, ended
 /// after `calls` GitHub calls.
 async fn record(
-    db: &D1Database,
+    db: &Db,
     job_id: u64,
     name: &str,
     attempts: u32,
@@ -337,18 +332,19 @@ async fn record(
             ("failed", None, Some(failure.message), Some(wait), next)
         }
     };
-    db.prepare(RECORD)
-        .bind(&[
-            int(job_id)?,
-            state.into(),
-            nullable(instance_id),
-            nullable(error),
-            int(now)?,
-            nullable(wait.map(|wait| wait.as_str().to_owned())),
-            next.map_or(Ok(wasm_bindgen::JsValue::NULL), int)?,
-        ])?
-        .run()
-        .await?;
+    db.run(
+        RECORD,
+        &params![
+            job_id,
+            state,
+            instance_id,
+            error,
+            now,
+            wait.map(super::reconcile::retry::Wait::as_str),
+            next,
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -356,13 +352,8 @@ async fn record(
 /// back in line, for the reconciler to launch within a minute. Called
 /// when an owner verifies the role, edits a profile, changes the
 /// settings or gains a licence.
-pub(crate) async fn recheck(db: &D1Database, tenant_id: &str) -> Result<()> {
-    let result = db
-        .prepare(RECHECK)
-        .bind(&[tenant_id.into(), int(now_ms())?])?
-        .run()
-        .await?;
-    let changed = result.meta()?.and_then(|meta| meta.changes).unwrap_or(0);
+pub(crate) async fn recheck(db: &Db, tenant_id: &str) -> Result<()> {
+    let changed = db.run(RECHECK, &params![tenant_id, now_ms()]).await?;
     if changed > 0 {
         console_log!("tenant {tenant_id}: setup changed, launching {changed} waiting jobs again");
     }
@@ -380,26 +371,28 @@ fn runner_name(job_id: u64, random: &[u8]) -> String {
 }
 
 /// Moves the job to `launching` if it is queued, nobody took it, and the
-/// tenant has room, and counts the attempt. D1 runs one statement at a
-/// time, so two deliveries of one job cannot both take it. Returns the
+/// tenant has room, and counts the attempt. Claims for one installation
+/// hold its advisory lock in turn, so the second sees the first's
+/// runner in its count and the second delivery of a job finds
+/// `launch_state` set. Returns the
 /// job's launch attempts so far, this one included, or `None` when it
 /// was not taken.
-async fn claim(
-    db: &D1Database,
-    job: &QueuedJob,
-    tenant: &Tenant,
-    name: &str,
-) -> Result<Option<u32>> {
+async fn claim(db: &Db, job: &QueuedJob, tenant: &Tenant, name: &str) -> Result<Option<u32>> {
+    // Claims for one installation take turns, so two of them cannot
+    // both count the same free place under max_runners.
+    let lock = i64::try_from(job.installation_id).unwrap_or(i64::MAX);
     let claimed: Option<Claimed> = db
-        .prepare(CLAIM)
-        .bind(&[
-            int(job.id)?,
-            name.into(),
-            int(now_ms())?,
-            int(job.installation_id)?,
-            tenant.max_runners.into(),
-        ])?
-        .first(None)
+        .first_locked(
+            lock,
+            CLAIM,
+            &params![
+                job.id,
+                name,
+                now_ms(),
+                job.installation_id,
+                tenant.max_runners
+            ],
+        )
         .await?;
     Ok(claimed.map(|claimed| claimed.launch_attempts))
 }
@@ -408,7 +401,7 @@ async fn claim(
 /// Returns the instance id.
 async fn launch_claimed(
     env: &Env,
-    db: &D1Database,
+    db: &Db,
     job: &QueuedJob,
     tenant: &Tenant,
     name: &str,
@@ -433,10 +426,7 @@ async fn launch_claimed(
     let settings = Settings::read(env).map_err(|err| Failure::new(Cause::Settings, err))?;
     let arch = choice.arch.as_str();
     let image: Image = db
-        .prepare(IMAGE)
-        .bind(&[tenant.region.as_str().into(), arch.into()])
-        .map_err(internal)?
-        .first(None)
+        .first(IMAGE, &params![tenant.region.as_str(), arch])
         .await
         .map_err(internal)?
         .ok_or_else(|| {
@@ -500,7 +490,7 @@ async fn launch_claimed(
 #[allow(clippy::too_many_arguments)]
 async fn start(
     settings: &Settings,
-    db: &D1Database,
+    db: &Db,
     job: &QueuedJob,
     tenant: &Tenant,
     name: &str,
@@ -533,7 +523,7 @@ async fn start(
         user_data: serde_json::json!({ "broker": settings.broker_url, "ticket": ticket })
             .to_string(),
     };
-    let started = if tenant.fleet == 1 {
+    let started = if tenant.fleet {
         fleet(db, &launch).await
     } else {
         run_instances(&launch).await
@@ -737,7 +727,7 @@ const FLEETS_PER_LAUNCH: u32 = 4;
 /// Starts the instance with EC2 Fleet from a launch template version
 /// made for it, which is deleted after (see [`crate::aws::fleet`] and
 /// [`crate::offerings`]).
-async fn fleet(db: &D1Database, launch: &Launch<'_>) -> std::result::Result<String, Failure> {
+async fn fleet(db: &Db, launch: &Launch<'_>) -> std::result::Result<String, Failure> {
     let client_token = format!("{}-v", launch.name);
     let created = launch
         .send(
@@ -782,7 +772,7 @@ async fn fleet(db: &D1Database, launch: &Launch<'_>) -> std::result::Result<Stri
 /// Creates fleets from template `version` until one starts the
 /// instance, remembering the offerings EC2 refuses for capacity.
 async fn fleets(
-    db: &D1Database,
+    db: &Db,
     launch: &Launch<'_>,
     version: u64,
 ) -> std::result::Result<String, Failure> {
@@ -1052,12 +1042,6 @@ async fn store_config(
     ))
 }
 
-/// D1 takes `null` for SQL NULL and refuses `undefined`, which is what
-/// `Option::None` becomes.
-fn nullable(value: Option<String>) -> wasm_bindgen::JsValue {
-    value.map_or(wasm_bindgen::JsValue::NULL, Into::into)
-}
-
 #[allow(clippy::needless_pass_by_value)]
 fn internal(err: worker::Error) -> Failure {
     Failure::new(Cause::Internal, err.to_string())
@@ -1078,7 +1062,7 @@ mod tests {
             "INSERT INTO tenants (id, org_id, org_login, installation_id, role_arn, region, \
              launch_template_id, subnet_ids, max_runners, beta, volume_size_limit, \
              root_volume_size, fleet, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)",
             &params![
                 "t1",
                 9u64,
@@ -1089,10 +1073,10 @@ mod tests {
                 "lt-1",
                 "subnet-a,subnet-b",
                 max_runners,
-                u32::from(beta),
+                beta,
                 200u32,
                 30u32,
-                1u32,
+                true,
                 1u64
             ],
         );
@@ -1102,13 +1086,15 @@ mod tests {
     fn job(db: &Db, id: u64, status: &str) {
         db.run(
             "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
-             queued_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+             queued_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
             &params![id, INSTALLATION, "acme/app", 77u64, "hatchrun", status, NOW],
         );
     }
 
     fn claim(db: &Db, id: u64, max_runners: u32) -> Option<u32> {
-        db.first::<Claimed>(
+        let lock = i64::try_from(INSTALLATION).unwrap();
+        db.wait(db.db().first_locked::<Claimed>(
+            lock,
             CLAIM,
             &params![
                 id,
@@ -1117,7 +1103,8 @@ mod tests {
                 INSTALLATION,
                 max_runners
             ],
-        )
+        ))
+        .unwrap()
         .map(|claimed| claimed.launch_attempts)
     }
 
@@ -1128,10 +1115,10 @@ mod tests {
         assert_eq!(tenant.id, "t1");
         assert_eq!(tenant.max_runners, 2);
         // Unpaid, within its free minutes.
-        assert_eq!(tenant.licensed, 1);
+        assert!(tenant.licensed);
         assert_eq!(tenant.volume_size_limit, Some(200));
         assert_eq!(tenant.root_volume_size, Some(30));
-        assert_eq!(tenant.fleet, 1);
+        assert!(tenant.fleet);
         assert!(tenant.instance_types.is_none());
 
         // Past them and the grace period after them.
@@ -1144,24 +1131,24 @@ mod tests {
         .unwrap();
         db.run(
             "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed) \
-             VALUES (1, 't1', ?1, ?2, 0)",
+             VALUES (1, 't1', $1, $2, false)",
             &params![crate::usage::FREE_MINUTES, now],
         );
         db.run(
-            "UPDATE tenants SET free_used_up_at = ?1 WHERE id = 't1'",
+            "UPDATE tenants SET free_used_up_at = $1 WHERE id = 't1'",
             &params![now - crate::usage::GRACE_MS - 60_000],
         );
         let tenant: Tenant = db.first(&tenant_query(), &params![INSTALLATION]).unwrap();
-        assert_eq!(tenant.licensed, 0);
+        assert!(!tenant.licensed);
 
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
              cancel_at_period_end, modified_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            &params!["s1", "t1", "active", "c1", "p1", 0u32, "2026-10-01", NOW],
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &params!["s1", "t1", "active", "c1", "p1", false, "2026-10-01", NOW],
         );
         let tenant: Tenant = db.first(&tenant_query(), &params![INSTALLATION]).unwrap();
-        assert_eq!(tenant.licensed, 1);
+        assert!(tenant.licensed);
         assert!(
             db.first::<Tenant>(&tenant_query(), &params![INSTALLATION + 1])
                 .is_none()
@@ -1175,8 +1162,8 @@ mod tests {
             CLAIM,
             &params![1u64, "hatchrun-1-00", NOW, INSTALLATION, 1u32],
         );
-        assert!(plan.contains("INDEX jobs_open"), "{plan}");
-        assert!(!plan.contains("SCAN jobs"), "{plan}");
+        assert!(plan.contains("jobs_open on jobs"), "{plan}");
+        assert!(!plan.contains("Seq Scan"), "{plan}");
     }
 
     #[test]
@@ -1262,7 +1249,7 @@ mod tests {
         let db = Db::new();
         db.run(
             "INSERT INTO images (region, arch, image_id, root_device, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             VALUES ($1, $2, $3, $4, $5)",
             &params!["ap-south-1", "arm64", "ami-1", "/dev/sda1", NOW],
         );
         let image: Image = db.first(IMAGE, &params!["ap-south-1", "arm64"]).unwrap();
@@ -1299,12 +1286,12 @@ mod tests {
             subnet_ids: "subnet-b, subnet-a,,".to_owned(),
             max_runners: 1,
             allowed_regions: None,
-            licensed: 1,
+            licensed: true,
             instance_types: None,
             excluded_instance_types: None,
             volume_size_limit: None,
             root_volume_size: None,
-            fleet: 0,
+            fleet: false,
             cache_bucket: None,
         };
         assert_eq!(tenant.subnets(), ["subnet-b", "subnet-a"]);

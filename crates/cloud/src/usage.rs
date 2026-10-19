@@ -16,9 +16,9 @@
 //! tenants count minutes and pay nothing.
 
 use serde::Deserialize;
-use worker::{D1Database, Result};
+use worker::Result;
 
-use crate::int;
+use crate::db::{Db, params};
 
 /// Free job minutes per organization and month. Polar's meter credit
 /// benefit on the product grants the same number per billing period.
@@ -34,25 +34,29 @@ pub(crate) const PAID: &str = "EXISTS (SELECT 1 FROM subscriptions \
      AND subscriptions.status IN ('active', 'trialing'))";
 
 /// SQL for the start of the current UTC month, Unix ms.
-const MONTH_START: &str = "(unixepoch('now', 'start of month') * 1000)";
+const MONTH_START: &str =
+    "(extract(epoch from date_trunc('month', now() AT TIME ZONE 'UTC'))::bigint * 1000)";
 
 /// SQL for a `tenants` row's job minutes this month.
-pub(crate) const USED: &str = "(SELECT COALESCE(SUM(usage_events.minutes), 0) \
+pub(crate) const USED: &str = "(SELECT COALESCE(SUM(usage_events.minutes), 0)::bigint \
      FROM usage_events WHERE usage_events.tenant_id = tenants.id \
-     AND usage_events.ended_at >= (unixepoch('now', 'start of month') * 1000))";
+     AND usage_events.ended_at >= \
+     (extract(epoch from date_trunc('month', now() AT TIME ZONE 'UTC'))::bigint * 1000))";
 
-/// SQL that is 1 for a `tenants` row that may launch: in the beta, paid,
-/// within its free minutes this month, or within the grace period after
-/// it used them up.
-pub(crate) const MAY_LAUNCH: &str = "(tenants.beta = 1 \
+/// SQL that is true for a `tenants` row that may launch: in the beta,
+/// paid, within its free minutes this month, or within the grace period
+/// after it used them up.
+pub(crate) const MAY_LAUNCH: &str = "(tenants.beta \
      OR EXISTS (SELECT 1 FROM subscriptions \
      WHERE subscriptions.tenant_id = tenants.id \
      AND subscriptions.status IN ('active', 'trialing')) \
-     OR (SELECT COALESCE(SUM(usage_events.minutes), 0) \
+     OR (SELECT COALESCE(SUM(usage_events.minutes), 0)::bigint \
      FROM usage_events WHERE usage_events.tenant_id = tenants.id \
-     AND usage_events.ended_at >= (unixepoch('now', 'start of month') * 1000)) < 3000 \
-     OR (tenants.free_used_up_at >= (unixepoch('now', 'start of month') * 1000) \
-     AND tenants.free_used_up_at > unixepoch() * 1000 - 604800000))";
+     AND usage_events.ended_at >= \
+     (extract(epoch from date_trunc('month', now() AT TIME ZONE 'UTC'))::bigint * 1000)) < 3000 \
+     OR (tenants.free_used_up_at >= \
+     (extract(epoch from date_trunc('month', now() AT TIME ZONE 'UTC'))::bigint * 1000) \
+     AND tenants.free_used_up_at > (floor(extract(epoch from now()))::bigint * 1000) - 604800000))";
 
 /// Billed minutes of a job that ran from `started` to `completed`
 /// (Unix ms): whole minutes, rounded up, at least one.
@@ -64,119 +68,113 @@ pub fn minutes(started: u64, completed: u64) -> u32 {
         .max(1)
 }
 
-/// Records `?2` minutes of job `?1`, which completed at `?3`, if a
+/// Records `$2` minutes of job `$1`, which completed at `$3`, if a
 /// hatchrun runner took it and nothing recorded it before. The row is
 /// billed when the tenant pays and is not in the beta.
 fn insert_sql() -> String {
     format!(
         "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed) \
-         SELECT jobs.id, tenants.id, ?2, ?3, tenants.beta = 0 AND {PAID} \
+         SELECT jobs.id, tenants.id, $2::bigint, $3::bigint, NOT tenants.beta AND {PAID} \
          FROM jobs JOIN tenants ON tenants.installation_id = jobs.installation_id \
-         WHERE jobs.id = ?1 AND jobs.ran_on IS NOT NULL \
+         WHERE jobs.id = $1 AND jobs.ran_on IS NOT NULL \
          ON CONFLICT (job_id) DO NOTHING"
     )
 }
 
-/// Sets `free_used_up_at` to `?2` on the tenant of job `?1` when it is
+/// Sets `free_used_up_at` to `$2` on the tenant of job `$1` when it is
 /// unpaid, not in the beta, has not used up its free minutes yet this
-/// month and now has at least `?3` minutes.
+/// month and now has at least `$3` minutes.
 fn used_up_sql() -> String {
     format!(
-        "UPDATE tenants SET free_used_up_at = ?2 \
-         WHERE id = (SELECT tenant_id FROM usage_events WHERE job_id = ?1) \
-         AND beta = 0 AND NOT {PAID} \
+        "UPDATE tenants SET free_used_up_at = $2 \
+         WHERE id = (SELECT tenant_id FROM usage_events WHERE job_id = $1) \
+         AND NOT beta AND NOT {PAID} \
          AND (free_used_up_at IS NULL OR free_used_up_at < {MONTH_START}) \
-         AND {USED} >= ?3"
+         AND {USED} >= $3"
     )
 }
 
-/// Tenant `?1`'s minutes this month, when it used up its free ones this
+/// Tenant `$1`'s minutes this month, when it used up its free ones this
 /// month, and whether it may launch.
 fn month_sql() -> String {
     format!(
         "SELECT {USED} AS minutes, \
          CASE WHEN free_used_up_at >= {MONTH_START} THEN free_used_up_at END \
-         AS free_used_up_at, {MAY_LAUNCH} AS may_launch FROM tenants WHERE id = ?1"
+         AS free_used_up_at, {MAY_LAUNCH} AS may_launch FROM tenants WHERE id = $1"
     )
 }
 
-/// Sets `free_used_up_at` to `?2` on tenant `?1` when it is unpaid,
+/// Sets `free_used_up_at` to `$2` on tenant `$1` when it is unpaid,
 /// not in the beta, has not used up its free minutes yet this month and
-/// has at least `?3` minutes: the start of its grace period when a
+/// has at least `$3` minutes: the start of its grace period when a
 /// subscription ends after it went past them.
 fn grace_sql() -> String {
     format!(
-        "UPDATE tenants SET free_used_up_at = ?2 \
-         WHERE id = ?1 AND beta = 0 AND NOT {PAID} \
+        "UPDATE tenants SET free_used_up_at = $2 \
+         WHERE id = $1 AND NOT beta AND NOT {PAID} \
          AND (free_used_up_at IS NULL OR free_used_up_at < {MONTH_START}) \
-         AND {USED} >= ?3"
+         AND {USED} >= $3"
     )
 }
 
-/// Records up to `?2` jobs that a runner took and that completed at or
-/// after `?1` with GitHub's times but have no minutes yet, as when
+/// Records up to `$2` jobs that a runner took and that completed at or
+/// after `$1` with GitHub's times but have no minutes yet, as when
 /// recording failed after the reconciler marked the job completed.
 /// Returns each recorded row's tenant.
 fn sweep_sql() -> String {
     format!(
         "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed) \
          SELECT jobs.id, tenants.id, \
-         MAX(1, (jobs.completed_at - jobs.started_at + 59999) / 60000), jobs.completed_at, \
-         tenants.beta = 0 AND {PAID} \
+         GREATEST(1, (jobs.completed_at - jobs.started_at + 59999) / 60000), jobs.completed_at, \
+         NOT tenants.beta AND {PAID} \
          FROM jobs JOIN tenants ON tenants.installation_id = jobs.installation_id \
-         WHERE jobs.ran_on IS NOT NULL AND jobs.completed_at >= ?1 \
+         WHERE jobs.ran_on IS NOT NULL AND jobs.completed_at >= $1 \
          AND jobs.started_at IS NOT NULL \
          AND NOT EXISTS (SELECT 1 FROM usage_events WHERE usage_events.job_id = jobs.id) \
-         ORDER BY jobs.completed_at LIMIT ?2 \
+         ORDER BY jobs.completed_at LIMIT $2 \
          ON CONFLICT (job_id) DO NOTHING RETURNING tenant_id"
     )
 }
 
-/// Clears tenant `?1`'s `free_used_up_at`, so a subscription that ends
+/// Clears tenant `$1`'s `free_used_up_at`, so a subscription that ends
 /// later starts a grace period of its own.
 const CLEAR_GRACE: &str =
-    "UPDATE tenants SET free_used_up_at = NULL WHERE id = ?1 AND free_used_up_at IS NOT NULL";
+    "UPDATE tenants SET free_used_up_at = NULL WHERE id = $1 AND free_used_up_at IS NOT NULL";
 
-/// Up to `?1` billed minutes Polar has not taken, oldest first.
+/// Up to `$1` billed minutes Polar has not taken, oldest first.
 const UNSENT: &str = "SELECT job_id, tenant_id, minutes, ended_at FROM usage_events \
-     WHERE billed = 1 AND sent_at IS NULL ORDER BY ended_at LIMIT ?1";
+     WHERE billed AND sent_at IS NULL ORDER BY ended_at LIMIT $1";
 
-/// Marks the minutes of the jobs in the JSON array `?1` as taken by
-/// Polar at `?2`.
-const SENT: &str = "UPDATE usage_events SET sent_at = ?2 \
-     WHERE job_id IN (SELECT value FROM json_each(?1))";
+/// Marks the minutes of the jobs in the JSON array `$1` as taken by
+/// Polar at `$2`.
+const SENT: &str = "UPDATE usage_events SET sent_at = $2 \
+     WHERE job_id IN (SELECT json_array_elements_text($1::json)::bigint)";
 
 /// Records the minutes of job `id`, which ran from `started` to
 /// `completed` (Unix ms), if a hatchrun runner took it and it was not
 /// recorded before. An unpaid tenant that this job takes past its free
 /// minutes gets `free_used_up_at`, which starts its grace period. Both
-/// statements run in one D1 batch, which is a transaction. Returns
+/// statements run in one transaction. Returns
 /// whether the job was recorded now.
 pub(crate) async fn record(
-    db: &D1Database,
+    db: &crate::db::Db,
     id: u64,
     started: u64,
     completed: u64,
     now: u64,
 ) -> Result<bool> {
+    let insert = insert_sql();
+    let used_up = used_up_sql();
     let results = db
-        .batch(vec![
-            db.prepare(insert_sql()).bind(&[
-                int(id)?,
-                minutes(started, completed).into(),
-                int(completed)?,
-            ])?,
-            db.prepare(used_up_sql())
-                .bind(&[int(id)?, int(now)?, FREE_MINUTES.into()])?,
+        .batch(&[
+            (
+                insert.as_str(),
+                params![id, minutes(started, completed), completed],
+            ),
+            (used_up.as_str(), params![id, now, FREE_MINUTES]),
         ])
         .await?;
-    let changed = |at: usize| {
-        results
-            .get(at)
-            .and_then(|result| result.meta().ok().flatten())
-            .and_then(|meta| meta.changes)
-            .unwrap_or(0)
-    };
+    let changed = |at: usize| results.get(at).copied().unwrap_or(0);
     if changed(1) == 1 {
         worker::console_log!("job {id}: its tenant used up its free minutes this month");
     }
@@ -186,30 +184,23 @@ pub(crate) async fn record(
 /// Starts the grace period of tenant `id` at `now` if it is unpaid and
 /// past its free minutes this month without one, as a tenant whose
 /// subscription just ended can be. Returns whether it started.
-pub(crate) async fn start_grace(db: &D1Database, id: &str, now: u64) -> Result<bool> {
-    let result = db
-        .prepare(grace_sql())
-        .bind(&[id.into(), int(now)?, FREE_MINUTES.into()])?
-        .run()
+pub(crate) async fn start_grace(db: &Db, id: &str, now: u64) -> Result<bool> {
+    let changed = db
+        .run(&grace_sql(), &params![id, now, FREE_MINUTES])
         .await?;
-    Ok(result.meta()?.and_then(|meta| meta.changes) == Some(1))
+    Ok(changed == 1)
 }
 
 /// Records the minutes of up to `limit` jobs that completed at or after
 /// `since` (Unix ms) and that no webhook or sync recorded, and starts
 /// the grace period of any tenant they take past its free minutes.
 /// Returns how many it recorded.
-pub(crate) async fn sweep(db: &D1Database, since: u64, limit: u32, now: u64) -> Result<usize> {
+pub(crate) async fn sweep(db: &Db, since: u64, limit: u32, now: u64) -> Result<usize> {
     #[derive(Deserialize)]
     struct Recorded {
         tenant_id: String,
     }
-    let recorded: Vec<Recorded> = db
-        .prepare(sweep_sql())
-        .bind(&[int(since)?, limit.into()])?
-        .all()
-        .await?
-        .results()?;
+    let recorded: Vec<Recorded> = db.all(&sweep_sql(), &params![since, limit]).await?;
     let mut tenants: Vec<&str> = recorded.iter().map(|row| row.tenant_id.as_str()).collect();
     tenants.sort_unstable();
     tenants.dedup();
@@ -222,8 +213,8 @@ pub(crate) async fn sweep(db: &D1Database, since: u64, limit: u32, now: u64) -> 
 /// Forgets when tenant `id` used up its free minutes, as it does once a
 /// subscription starts: the grace period it had before paying does not
 /// carry over to when the subscription ends.
-pub(crate) async fn clear_grace(db: &D1Database, id: &str) -> Result<()> {
-    db.prepare(CLEAR_GRACE).bind(&[id.into()])?.run().await?;
+pub(crate) async fn clear_grace(db: &Db, id: &str) -> Result<()> {
+    db.run(CLEAR_GRACE, &params![id]).await?;
     Ok(())
 }
 
@@ -242,16 +233,12 @@ pub struct Month {
 struct MonthRow {
     minutes: u64,
     free_used_up_at: Option<u64>,
-    may_launch: u8,
+    may_launch: bool,
 }
 
 /// The minutes of tenant `id` this month.
-pub(crate) async fn month(db: &D1Database, id: &str) -> Result<Month> {
-    let row: Option<MonthRow> = db
-        .prepare(month_sql())
-        .bind(&[id.into()])?
-        .first(None)
-        .await?;
+pub(crate) async fn month(db: &Db, id: &str) -> Result<Month> {
+    let row: Option<MonthRow> = db.first(&month_sql(), &params![id]).await?;
     Ok(row.map_or(
         Month {
             minutes: 0,
@@ -261,7 +248,7 @@ pub(crate) async fn month(db: &D1Database, id: &str) -> Result<Month> {
         |row| Month {
             minutes: row.minutes,
             free_used_up_at: row.free_used_up_at,
-            may_launch: row.may_launch == 1,
+            may_launch: row.may_launch,
         },
     ))
 }
@@ -280,22 +267,15 @@ pub struct Unsent {
 }
 
 /// Up to `limit` billed events Polar has not taken, oldest first.
-pub(crate) async fn unsent(db: &D1Database, limit: u32) -> Result<Vec<Unsent>> {
-    db.prepare(UNSENT)
-        .bind(&[limit.into()])?
-        .all()
-        .await?
-        .results()
+pub(crate) async fn unsent(db: &Db, limit: u32) -> Result<Vec<Unsent>> {
+    db.all(UNSENT, &params![limit]).await
 }
 
 /// Marks the events of `jobs` as taken by Polar at `now`.
-pub(crate) async fn sent(db: &D1Database, jobs: &[u64], now: u64) -> Result<()> {
+pub(crate) async fn sent(db: &Db, jobs: &[u64], now: u64) -> Result<()> {
     let ids =
         serde_json::to_string(jobs).map_err(|err| worker::Error::RustError(err.to_string()))?;
-    db.prepare(SENT)
-        .bind(&[ids.into(), int(now)?])?
-        .run()
-        .await?;
+    db.run(SENT, &params![ids, now]).await?;
     Ok(())
 }
 
@@ -320,7 +300,9 @@ mod tests {
         // since a const &str cannot be formatted.
         assert!(MAY_LAUNCH.contains(PAID));
         assert!(MAY_LAUNCH.contains(&format!("{USED} < {FREE_MINUTES}")));
-        assert!(MAY_LAUNCH.contains(&format!("unixepoch() * 1000 - {GRACE_MS}")));
+        assert!(MAY_LAUNCH.contains(&format!(
+            "(floor(extract(epoch from now()))::bigint * 1000) - {GRACE_MS}"
+        )));
         assert!(MAY_LAUNCH.contains(MONTH_START));
     }
 }
@@ -349,14 +331,14 @@ mod sql {
         for (id, installation, beta) in [("free", 1u64, 0u32), ("paid", 2, 0), ("beta", 3, 1)] {
             db.run(
                 "INSERT INTO tenants (id, org_id, org_login, installation_id, beta, \
-                 created_at, updated_at) VALUES (?1, ?2, ?1, ?2, ?3, 1, 1)",
+                 created_at, updated_at) VALUES ($1, $2, $1, $2, $3, 1, 1)",
                 &params![id, installation, beta],
             );
         }
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
              cancel_at_period_end, modified_at, updated_at) \
-             VALUES ('sub', 'paid', 'active', 'c', 'p', 0, 't', 1)",
+             VALUES ('sub', 'paid', 'active', 'c', 'p', false, 't', 1)",
             &[],
         );
         db
@@ -369,8 +351,8 @@ mod sql {
         let runner = ran.then(|| format!("hatchrun-{id}-ab"));
         db.run(
             "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
-             queued_at, updated_at, ran_on) VALUES (?1, ?2, 'acme/app', 7, 'hatchrun', \
-             'completed', 1, 1, ?3)",
+             queued_at, updated_at, ran_on) VALUES ($1, $2, 'acme/app', 7, 'hatchrun', \
+             'completed', 1, 1, $3)",
             &params![id, installation, runner],
         );
         let completed = now() - ago;
@@ -390,13 +372,13 @@ mod sql {
     fn free_minutes_then_grace_then_stop() {
         let db = seed();
         let row = month(&db, "free");
-        assert_eq!((row.minutes, row.may_launch), (0, 1));
+        assert_eq!((row.minutes, row.may_launch), (0, true));
 
         assert_eq!(record(&db, 1, 1, 2999, 0, true), [1, 0]);
         let row = month(&db, "free");
         assert_eq!(
             (row.minutes, row.free_used_up_at, row.may_launch),
-            (2999, None, 1)
+            (2999, None, true)
         );
 
         // The job past the free minutes starts the grace period, once.
@@ -405,17 +387,17 @@ mod sql {
         let row = month(&db, "free");
         assert_eq!(row.minutes, 3009);
         assert!(row.free_used_up_at.is_some());
-        assert_eq!(row.may_launch, 1);
+        assert!(row.may_launch);
 
         let used_up = |ago: u64| {
             db.run(
-                "UPDATE tenants SET free_used_up_at = ?1 WHERE id = 'free'",
+                "UPDATE tenants SET free_used_up_at = $1 WHERE id = 'free'",
                 &params![now() - ago],
             );
             month(&db, "free").may_launch
         };
-        assert_eq!(used_up(6 * DAY), 1);
-        assert_eq!(used_up(8 * DAY), 0);
+        assert!(used_up(6 * DAY));
+        assert!(!used_up(8 * DAY));
     }
 
     #[test]
@@ -435,13 +417,13 @@ mod sql {
         // Past the free minutes and the grace, but before this month.
         record(&db, 1, 1, 4000, 40 * DAY, true);
         db.run(
-            "UPDATE tenants SET free_used_up_at = ?1 WHERE id = 'free'",
+            "UPDATE tenants SET free_used_up_at = $1 WHERE id = 'free'",
             &params![now() - 40 * DAY],
         );
         let row = month(&db, "free");
         assert_eq!(
             (row.minutes, row.free_used_up_at, row.may_launch),
-            (0, None, 1)
+            (0, None, true)
         );
     }
 
@@ -450,8 +432,8 @@ mod sql {
         let db = seed();
         assert_eq!(record(&db, 1, 2, 5000, 0, true), [1, 0]);
         assert_eq!(record(&db, 2, 3, 5000, 0, true), [1, 0]);
-        assert_eq!(month(&db, "paid").may_launch, 1);
-        assert_eq!(month(&db, "beta").may_launch, 1);
+        assert!(month(&db, "paid").may_launch);
+        assert!(month(&db, "beta").may_launch);
 
         let unsent: Vec<Unsent> = db.all(UNSENT, &params![500u32]);
         assert_eq!(unsent.len(), 1);
@@ -473,12 +455,15 @@ mod sql {
         let grace = || db.run(&grace_sql(), &params!["paid", now(), FREE_MINUTES]);
         assert_eq!(grace(), 0);
 
-        db.run("UPDATE subscriptions SET status = 'canceled'", &[]);
+        db.run(
+            "UPDATE subscriptions SET status = 'canceled' WHERE id = 'sub'",
+            &[],
+        );
         assert_eq!(grace(), 1);
         assert_eq!(grace(), 0);
         let row = month(&db, "paid");
         assert!(row.free_used_up_at.is_some());
-        assert_eq!(row.may_launch, 1);
+        assert!(row.may_launch);
 
         // Within its free minutes, nothing starts.
         assert_eq!(
@@ -493,16 +478,16 @@ mod sql {
         // Used up the free minutes while unpaid, ten days ago.
         record(&db, 1, 1, 3500, 0, true);
         db.run(
-            "UPDATE tenants SET free_used_up_at = ?1 WHERE id = 'free'",
+            "UPDATE tenants SET free_used_up_at = $1 WHERE id = 'free'",
             &params![now() - 10 * DAY],
         );
-        assert_eq!(month(&db, "free").may_launch, 0);
+        assert!(!month(&db, "free").may_launch);
 
         // Adds a card, which clears it, then the subscription ends.
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
              cancel_at_period_end, modified_at, updated_at) \
-             VALUES ('sub2', 'free', 'active', 'c', 'p', 0, 't', 1)",
+             VALUES ('sub2', 'free', 'active', 'c', 'p', false, 't', 1)",
             &[],
         );
         assert_eq!(db.run(CLEAR_GRACE, &params!["free"]), 1);
@@ -514,7 +499,7 @@ mod sql {
             db.run(&grace_sql(), &params!["free", now(), FREE_MINUTES]),
             1
         );
-        assert_eq!(month(&db, "free").may_launch, 1);
+        assert!(month(&db, "free").may_launch);
     }
 
     #[test]
@@ -524,7 +509,7 @@ mod sql {
             db.run(
                 "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
                  queued_at, updated_at, ran_on, started_at, completed_at) \
-                 VALUES (?1, 1, 'acme/app', 7, 'hatchrun', 'completed', 1, 1, ?2, ?3, ?4)",
+                 VALUES ($1, 1, 'acme/app', 7, 'hatchrun', 'completed', 1, 1, $2, $3, $4)",
                 &params![id, ran.then_some("hatchrun-x"), started, completed],
             );
         };
@@ -546,8 +531,8 @@ mod sql {
         assert_eq!(
             rows,
             [
-                serde_json::json!({ "job_id": 1, "minutes": 11, "billed": 0 }),
-                serde_json::json!({ "job_id": 5, "minutes": 1, "billed": 0 }),
+                serde_json::json!({ "job_id": 1, "minutes": 11, "billed": false }),
+                serde_json::json!({ "job_id": 5, "minutes": 1, "billed": false }),
             ]
         );
         let again: Vec<serde_json::Value> = db.all(&sweep_sql(), &params![t - DAY, 100u32]);

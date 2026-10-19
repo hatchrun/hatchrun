@@ -37,14 +37,14 @@ mod runners;
 mod tenants;
 
 use serde::Deserialize;
-use wasm_bindgen::JsValue;
-use worker::{D1Database, Env, Headers, Method, Request, Response, Result, console_error};
+use worker::{Env, Headers, Method, Request, Response, Result, console_error};
 
+use crate::db::{Db, params};
 use crate::fetch::send;
 use crate::github::{self, User};
 use crate::session;
 use crate::signin::{self, Pending};
-use crate::{DB, int, jwt, now_ms, webcrypto};
+use crate::{jwt, now_ms, webcrypto};
 
 /// Variable with the app's origin, such as `https://app.hatchrun.io`.
 const APP_URL: &str = "APP_URL";
@@ -124,24 +124,24 @@ struct SessionRow {
 /// and the time in milliseconds.
 const FIND_SESSION: &str = "SELECT users.id, users.login, users.name, users.avatar_url, \
     sessions.github_token FROM sessions JOIN users ON users.id = sessions.user_id \
-    WHERE sessions.key = ?1 AND sessions.expires_at > ?2";
+    WHERE sessions.key = $1 AND sessions.expires_at > $2";
 
 /// Ends a session, by its key.
-const END_SESSION: &str = "DELETE FROM sessions WHERE key = ?1";
+const END_SESSION: &str = "DELETE FROM sessions WHERE key = $1";
 
 /// Writes a user who signed in. Binds the GitHub user id, login, name
 /// or NULL, avatar URL and the time in milliseconds.
 const UPSERT_USER: &str = "INSERT INTO users (id, login, name, avatar_url, created_at, updated_at) \
-    VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
-    ON CONFLICT (id) DO UPDATE SET login = ?2, name = ?3, avatar_url = ?4, updated_at = ?5";
+    VALUES ($1, $2, $3, $4, $5, $5) \
+    ON CONFLICT (id) DO UPDATE SET login = $2, name = $3, avatar_url = $4, updated_at = $5";
 
 /// Starts a session. Binds the key, user id, sealed token, the time and
 /// when it expires, both in milliseconds.
 const START_SESSION: &str = "INSERT INTO sessions (key, user_id, github_token, created_at, \
-    expires_at) VALUES (?1, ?2, ?3, ?4, ?5)";
+    expires_at) VALUES ($1, $2, $3, $4, $5)";
 
 /// Sweeps sessions that expired before the time in milliseconds.
-const SWEEP_SESSIONS: &str = "DELETE FROM sessions WHERE expires_at < ?1";
+const SWEEP_SESSIONS: &str = "DELETE FROM sessions WHERE expires_at < $1";
 
 /// The session a request's cookie names, while it lasts.
 pub(crate) struct Session {
@@ -153,7 +153,7 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) async fn find(req: &Request, db: &D1Database) -> Result<Option<Self>> {
+    pub(crate) async fn find(req: &Request, db: &Db) -> Result<Option<Self>> {
         let cookies = req.headers().get("Cookie")?;
         let Some(id) =
             session::cookie(cookies.as_deref(), session::COOKIE).and_then(session::decode_id)
@@ -161,9 +161,7 @@ impl Session {
             return Ok(None);
         };
         let row: Option<SessionRow> = db
-            .prepare(FIND_SESSION)
-            .bind(&[session::key(&id).into(), int(now_ms())?])?
-            .first(None)
+            .first(FIND_SESSION, &params![session::key(&id), now_ms()])
             .await?;
         Ok(row.and_then(|row| {
             let token = session::open(&id, &row.github_token)?;
@@ -191,7 +189,7 @@ impl Session {
 #[allow(clippy::too_many_lines)] // One match arm per route.
 pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
     let config = Config::read(&env)?;
-    let db = env.d1(DB)?;
+    let db = Db::connect(&env).await?;
     let path = req.path();
     match (req.method(), path.as_str()) {
         (Method::Get, "/api/auth/login") => return login(&req, &config),
@@ -215,9 +213,7 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             if !current.csrf_ok(&req)? {
                 return json_error("bad CSRF token", 403);
             }
-            db.prepare(END_SESSION)
-                .bind(&[session::key(&current.id).into()])?
-                .run()
+            db.run(END_SESSION, &params![session::key(&current.id)])
                 .await?;
             let mut response = Response::empty()?.with_status(204);
             response
@@ -315,7 +311,7 @@ const SETUP_PATH: &str = "/api/github/setup";
 pub(crate) struct Ctx<'a> {
     pub env: &'a Env,
     pub config: &'a Config,
-    pub db: &'a D1Database,
+    pub db: &'a Db,
     pub session: &'a Session,
 }
 
@@ -392,7 +388,7 @@ async fn callback(
     req: &Request,
     env: &Env,
     config: &Config,
-    db: &D1Database,
+    db: &Db,
 ) -> std::result::Result<Response, String> {
     let query: Callback = req.query().map_err(|err| err.to_string())?;
     let cookies = req.headers().get("Cookie").map_err(|err| err.to_string())?;
@@ -445,31 +441,30 @@ async fn callback(
 }
 
 async fn store_session(
-    db: &D1Database,
+    db: &Db,
     user: &User,
     id: &[u8],
     sealed: &str,
     now: u64,
     max_age: u64,
 ) -> Result<()> {
-    let now_value = int(now)?;
-    db.batch(vec![
-        db.prepare(UPSERT_USER).bind(&[
-            int(user.id)?,
-            user.login.as_str().into(),
-            user.name.as_deref().map_or(JsValue::NULL, Into::into),
-            user.avatar_url.as_str().into(),
-            now_value.clone(),
-        ])?,
-        db.prepare(START_SESSION).bind(&[
-            session::key(id).into(),
-            int(user.id)?,
-            sealed.into(),
-            now_value.clone(),
-            int(now + max_age * 1000)?,
-        ])?,
+    db.batch(&[
+        (
+            UPSERT_USER,
+            params![
+                user.id,
+                user.login.as_str(),
+                user.name.as_deref(),
+                user.avatar_url.as_str(),
+                now,
+            ],
+        ),
+        (
+            START_SESSION,
+            params![session::key(id), user.id, sealed, now, now + max_age * 1000],
+        ),
         // Sign-ins are rare enough to sweep expired sessions here.
-        db.prepare(SWEEP_SESSIONS).bind(&[now_value])?,
+        (SWEEP_SESSIONS, params![now]),
     ])
     .await?;
     Ok(())

@@ -16,9 +16,10 @@ use worker::Response;
 use super::tenants::{authorize, show};
 use super::{Answer, Ctx, Failure, get, need};
 use crate::aws::{self, Credentials, ec2, ssm};
+use crate::db::params;
 use crate::fetch::send;
 use crate::launch::{AWS_ENDPOINT_URL, tenant_credentials};
-use crate::{connect, int, jwt, now_ms, oidc, settings};
+use crate::{connect, jwt, now_ms, oidc, settings};
 
 /// Variable with the public URL of the rendered connect.yaml.
 pub(crate) const TEMPLATE_URL: &str = "CONNECT_TEMPLATE_URL";
@@ -49,10 +50,8 @@ pub(crate) async fn instructions(ctx: &Ctx<'_>, org: &str) -> Answer {
     let template = get(ctx.env, TEMPLATE_URL);
     let imaged: Vec<String> = ctx
         .db
-        .prepare(IMAGE_REGIONS)
-        .all()
+        .all::<ImageRegion>(IMAGE_REGIONS, &[])
         .await?
-        .results::<ImageRegion>()?
         .into_iter()
         .map(|row| row.region)
         .collect();
@@ -188,7 +187,7 @@ pub(crate) async fn verify(ctx: &Ctx<'_>, org: &str, body: Connect) -> Answer {
 /// Saves a verified role. Binds the tenant, role ARN, region and the
 /// time in milliseconds.
 const SAVE_ROLE: &str =
-    "UPDATE tenants SET role_arn = ?2, region = ?3, updated_at = ?4 WHERE id = ?1";
+    "UPDATE tenants SET role_arn = $2, region = $3, updated_at = $4 WHERE id = $1";
 
 /// Records the verified connection and what the stack allows.
 async fn save(
@@ -199,14 +198,7 @@ async fn save(
     stack: &connect::Stack,
 ) -> worker::Result<()> {
     ctx.db
-        .prepare(SAVE_ROLE)
-        .bind(&[
-            tenant.into(),
-            role_arn.into(),
-            region.into(),
-            int(now_ms())?,
-        ])?
-        .run()
+        .run(SAVE_ROLE, &params![tenant, role_arn, region, now_ms()])
         .await?;
     crate::stack::record(ctx.db, tenant, stack, now_ms()).await?;
     Ok(())
@@ -277,7 +269,7 @@ mod tests {
         for (id, org) in [("t1", 11u64), ("t2", 12)] {
             db.run(
                 "INSERT INTO tenants (id, org_id, org_login, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                 VALUES ($1, $2, $3, $4, $4)",
                 &params![id, org, format!("org{org}"), NOW],
             );
         }

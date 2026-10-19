@@ -8,65 +8,49 @@
 //! again once a day, so a stack the owner updated is picked up either
 //! way.
 
-use wasm_bindgen::JsValue;
-use worker::{D1Database, Result};
+use worker::Result;
 
 use crate::connect::Stack;
-use crate::int;
+use crate::db::{Db, params};
 
 /// How often the reconciler reads a tenant's stack settings again, in
 /// milliseconds.
 pub const CHECK_EVERY: u64 = 24 * 60 * 60 * 1000;
 
 /// Writes the stack's settings on the tenant, only when one differs.
-const RECORD: &str = "UPDATE tenants SET launch_template_id = ?2, subnet_ids = ?3, \
-     instance_types = ?4, volume_size_limit = ?5, root_volume_size = ?6, \
-     fleet = ?7, excluded_instance_types = ?8, template_version = ?9, \
-     updated_at = ?10, cache_bucket = ?11 \
-     WHERE id = ?1 AND (launch_template_id IS NOT ?2 OR subnet_ids IS NOT ?3 \
-     OR instance_types IS NOT ?4 OR volume_size_limit IS NOT ?5 \
-     OR root_volume_size IS NOT ?6 OR fleet IS NOT ?7 \
-     OR excluded_instance_types IS NOT ?8 OR template_version IS NOT ?9 \
-     OR cache_bucket IS NOT ?11)";
+const RECORD: &str = "UPDATE tenants SET launch_template_id = $2, subnet_ids = $3, \
+     instance_types = $4, volume_size_limit = $5, root_volume_size = $6, \
+     fleet = $7, excluded_instance_types = $8, template_version = $9, \
+     updated_at = $10, cache_bucket = $11 \
+     WHERE id = $1 AND (launch_template_id IS DISTINCT FROM $2 OR subnet_ids IS DISTINCT FROM $3 \
+     OR instance_types IS DISTINCT FROM $4 OR volume_size_limit IS DISTINCT FROM $5 \
+     OR root_volume_size IS DISTINCT FROM $6 OR fleet IS DISTINCT FROM $7 \
+     OR excluded_instance_types IS DISTINCT FROM $8 OR template_version IS DISTINCT FROM $9 \
+     OR cache_bucket IS DISTINCT FROM $11)";
 
 /// Stamps when the tenant's stack was last read.
-const CHECKED: &str = "UPDATE tenants SET stack_checked_at = ?2 WHERE id = ?1";
+const CHECKED: &str = "UPDATE tenants SET stack_checked_at = $2 WHERE id = $1";
 
 /// Records `stack` on the tenant at `now`. Returns whether anything it
 /// says changed.
-pub(crate) async fn record(
-    db: &D1Database,
-    tenant_id: &str,
-    stack: &Stack,
-    now: u64,
-) -> Result<bool> {
-    let values: [JsValue; 11] = [
-        tenant_id.into(),
-        stack.launch_template_id.as_str().into(),
-        stack.subnets.join(",").into(),
-        stack.instance_types.as_str().into(),
-        stack.volume_size_limit.into(),
-        stack.root_volume_size.into(),
-        u8::from(stack.fleet).into(),
-        stack.excluded_instance_types.as_str().into(),
-        stack.version.into(),
-        int(now)?,
-        stack
-            .cache_bucket
-            .as_deref()
-            .map_or(JsValue::NULL, Into::into),
+pub(crate) async fn record(db: &Db, tenant_id: &str, stack: &Stack, now: u64) -> Result<bool> {
+    let values = params![
+        tenant_id,
+        stack.launch_template_id.as_str(),
+        stack.subnets.join(","),
+        stack.instance_types.as_str(),
+        stack.volume_size_limit,
+        stack.root_volume_size,
+        stack.fleet,
+        stack.excluded_instance_types.as_str(),
+        stack.version,
+        now,
+        stack.cache_bucket.as_deref(),
     ];
     let results = db
-        .batch(vec![
-            db.prepare(RECORD).bind(&values)?,
-            db.prepare(CHECKED).bind(&[tenant_id.into(), int(now)?])?,
-        ])
+        .batch(&[(RECORD, values), (CHECKED, params![tenant_id, now])])
         .await?;
-    Ok(results
-        .first()
-        .and_then(|result| result.meta().ok().flatten())
-        .and_then(|meta| meta.changes)
-        == Some(1))
+    Ok(results.first() == Some(&1))
 }
 
 #[cfg(test)]
@@ -95,7 +79,7 @@ mod tests {
             stack.instance_types.as_str(),
             u32::from(stack.volume_size_limit),
             u32::from(stack.root_volume_size),
-            u32::from(u8::from(stack.fleet)),
+            stack.fleet,
             stack.excluded_instance_types.as_str(),
             stack.version,
             NOW,
@@ -115,7 +99,7 @@ mod tests {
         let db = Db::new();
         db.run(
             "INSERT INTO tenants (id, org_id, org_login, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?4)",
+             VALUES ($1, $2, $3, $4, $4)",
             &params!["t1", 9u64, "acme", 1u64],
         );
         db.batch(&[
@@ -125,16 +109,15 @@ mod tests {
         .unwrap();
         let rows = db
             .rows(
-                "SELECT subnet_ids, fleet, template_version, cache_bucket, \
-                 typeof(root_volume_size) AS t, stack_checked_at FROM tenants",
+                "SELECT subnet_ids, fleet, template_version, cache_bucket, stack_checked_at \
+                 FROM tenants",
                 &[],
             )
             .unwrap();
         assert_eq!(rows[0]["subnet_ids"], "subnet-a,subnet-b");
-        assert_eq!(rows[0]["fleet"], 1);
+        assert_eq!(rows[0]["fleet"], true);
         assert_eq!(rows[0]["template_version"], 5);
         assert_eq!(rows[0]["cache_bucket"], "bucket");
-        assert_eq!(rows[0]["t"], "integer");
         assert_eq!(rows[0]["stack_checked_at"], NOW);
 
         assert!(!record(&db, &values(Some("bucket"), 30)));

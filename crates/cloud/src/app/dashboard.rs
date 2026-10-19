@@ -28,13 +28,13 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::JsValue;
 use worker::{Request, Response, console_warn};
 
 use super::tenants::{authorize, show};
 use super::{Answer, Ctx, Failure, metrics};
+use crate::db::{Param, params};
+use crate::now_ms;
 use crate::settings::Settings;
-use crate::{int, now_ms};
 
 /// Runs in one page.
 const PAGE: u32 = 25;
@@ -52,9 +52,9 @@ const ACTIVE: &str = "status <> 'completed' AND launch_state IN ('launching', 'l
 const WAITING: &str = "status = 'queued' AND (launch_state IS NULL \
      OR (launch_state = 'failed' AND launch_retry = 'backoff'))";
 /// Launches that failed and are not tried again on a timer. The leading
-/// `launch_state = 'failed'` lets SQLite use the `jobs_failed` index.
+/// `launch_state = 'failed'` lets Postgres use the `jobs_failed` index.
 const FAILED: &str = "launch_state = 'failed' \
-     AND NOT (status = 'queued' AND launch_retry IS 'backoff')";
+     AND NOT (status = 'queued' AND launch_retry IS NOT DISTINCT FROM 'backoff')";
 /// A job no later attempt of its run replaced, for a job named `j`.
 const CURRENT: &str = "NOT EXISTS (SELECT 1 FROM jobs AS later \
      WHERE later.run_id = j.run_id AND later.name = j.name \
@@ -190,7 +190,7 @@ impl Group {
 /// The column the runs table sorts by. A run's state is not here: it
 /// rolls up from its jobs and changes while it runs, so a page boundary
 /// in it moves under the reader. A run's time is kept on the run as
-/// `ended_at` (`migrations/0024_run_ended.sql`), and a live run sorts by
+/// `ended_at` (the `jobs_end` trigger in `migrations/0001_schema.sql`), and a live run sorts by
 /// when it was queued, which does not move.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -264,7 +264,7 @@ fn cursor(value: &str, sort: Sort) -> Option<Cursor> {
     })
 }
 
-/// A `LIKE` pattern that matches `text` anywhere, with `%`, `_` and the
+/// An `ILIKE` pattern that matches `text` anywhere, with `%`, `_` and the
 /// escape character itself taken literally under `ESCAPE '\'`.
 fn contains(text: &str) -> String {
     let mut pattern = String::with_capacity(text.len() + 2);
@@ -296,52 +296,56 @@ struct Grouped {
     failed: u32,
 }
 
-/// Matches `?6`, a [`contains`] pattern, against a run and its jobs of
-/// every attempt. The jobs are read through `jobs_run`, one run at a
-/// time, so a page stops reading once it is full.
-const SEARCH: &str = "(repository LIKE ?6 ESCAPE '\\' \
-     OR workflow_name LIKE ?6 ESCAPE '\\' \
-     OR head_branch LIKE ?6 ESCAPE '\\' \
+/// Matches `$6`, a [`contains`] pattern, against a run and its jobs of
+/// every attempt. Postgres reads the jobs through an index, one run at
+/// a time through `jobs_run` or the installation's jobs once into a
+/// hash, whichever it costs lower.
+const SEARCH: &str = "(repository ILIKE $6 ESCAPE '\\' \
+     OR workflow_name ILIKE $6 ESCAPE '\\' \
+     OR head_branch ILIKE $6 ESCAPE '\\' \
      OR EXISTS (SELECT 1 FROM jobs AS s \
-       WHERE s.run_id = runs.id AND s.installation_id = ?1 \
-       AND (s.name LIKE ?6 ESCAPE '\\' OR s.label LIKE ?6 ESCAPE '\\' \
-         OR s.instance_id LIKE ?6 ESCAPE '\\')))";
+       WHERE s.run_id = runs.id AND s.installation_id = $1 \
+       AND (s.name ILIKE $6 ESCAPE '\\' OR s.label ILIKE $6 ESCAPE '\\' \
+         OR s.instance_id ILIKE $6 ESCAPE '\\')))";
 
-/// Where the page after the cursor `?2`, `?3` and `?5` starts, and the
-/// order it is in. `?5` is the repository by repository and the end by
+/// Where the page after the cursor `$2`, `$3` and `$5` starts, and the
+/// order it is in. `$5` is the repository by repository and the end by
 /// how long runs took. Within a repository runs stay newest first
 /// either way. By how long runs took, the key is how long a finished
 /// run took and when a live run was queued, ahead of the finished ones;
-/// each side of the comparison is the expression its index holds.
+/// each side of the comparison is the expression its index holds. The
+/// casts give Postgres the parameters' types where nothing else does.
 fn order(sort: Sort, dir: Direction) -> (&'static str, &'static str) {
     match (sort, dir) {
-        // `?5` is null here; naming it keeps the parameter count.
+        // `$5` is null here; naming it keeps the parameter count.
         (Sort::Started, Direction::Desc) => (
-            "(queued_at, id) < (?2, ?3) AND ?5 IS NULL",
+            "(queued_at, id) < ($2, $3) AND $5::text IS NULL",
             "queued_at DESC, id DESC",
         ),
-        (Sort::Started, Direction::Asc) => {
-            ("(queued_at, id) > (?2, ?3) AND ?5 IS NULL", "queued_at, id")
-        }
+        (Sort::Started, Direction::Asc) => (
+            "(queued_at, id) > ($2, $3) AND $5::text IS NULL",
+            "queued_at, id",
+        ),
         (Sort::Repository, Direction::Asc) => (
-            "(repository COLLATE NOCASE > ?5 \
-             OR (repository COLLATE NOCASE = ?5 AND (queued_at, id) < (?2, ?3)))",
-            "repository COLLATE NOCASE, queued_at DESC, id DESC",
+            "(lower(repository) > lower($5) \
+             OR (lower(repository) = lower($5) AND (queued_at, id) < ($2, $3)))",
+            "lower(repository), queued_at DESC, id DESC",
         ),
         (Sort::Repository, Direction::Desc) => (
-            "(repository COLLATE NOCASE < ?5 \
-             OR (repository COLLATE NOCASE = ?5 AND (queued_at, id) < (?2, ?3)))",
-            "repository COLLATE NOCASE DESC, queued_at DESC, id DESC",
+            "(lower(repository) < lower($5) \
+             OR (lower(repository) = lower($5) AND (queued_at, id) < ($2, $3)))",
+            "lower(repository) DESC, queued_at DESC, id DESC",
         ),
         (Sort::Took, Direction::Asc) => (
             "(ended_at IS NOT NULL, COALESCE(ended_at - queued_at, queued_at), id) \
-             > (?5 IS NOT NULL, COALESCE(?5 - ?2, ?2), ?3)",
+             > ($5::bigint IS NOT NULL, COALESCE($5::bigint - $2::bigint, $2::bigint), $3)",
             "ended_at IS NOT NULL, COALESCE(ended_at - queued_at, queued_at), id",
         ),
         (Sort::Took, Direction::Desc) => (
             "(ended_at IS NOT NULL, \
              CASE WHEN ended_at IS NULL THEN queued_at ELSE queued_at - ended_at END, id) \
-             > (?5 IS NOT NULL, CASE WHEN ?5 IS NULL THEN ?2 ELSE ?2 - ?5 END, ?3)",
+             > ($5::bigint IS NOT NULL, \
+             CASE WHEN $5::bigint IS NULL THEN $2::bigint ELSE $2::bigint - $5::bigint END, $3)",
             "ended_at IS NOT NULL, \
              CASE WHEN ended_at IS NULL THEN queued_at ELSE queued_at - ended_at END, id",
         ),
@@ -349,74 +353,74 @@ fn order(sort: Sort, dir: Direction) -> (&'static str, &'static str) {
 }
 
 /// The query for one page of runs, of one group or of all, in `sort`
-/// order and, unless `?6` is null, only the runs matching it. A run is
+/// order and, unless `$6` is null, only the runs matching it. A run is
 /// in a group when one of its current jobs is; the inner query starts
 /// from the jobs, through their indexes, so a tenant with few failures
 /// does not read every run. Every piece is a constant; the search text
-/// is only ever bound. Each order names `?5` and the search `?6`, so
-/// every query takes the same six values, as D1 wants as many values
-/// as the query has parameters.
+/// is only ever bound. Each order names `$5` and the search `$6`, so
+/// every query takes the same six values, as Postgres wants as many
+/// values as the query has parameters.
 fn list_query(group: Option<Group>, sort: Sort, dir: Direction) -> String {
     let filter = group.map_or(String::new(), |g| {
         format!(
             " AND id IN (SELECT j.run_id FROM jobs AS j \
-             WHERE j.installation_id = ?1 AND {} AND {CURRENT})",
+             WHERE j.installation_id = $1 AND {} AND {CURRENT})",
             g.predicate()
         )
     });
     let (after, order) = order(sort, dir);
     format!(
         "SELECT {RUN_COLUMNS} FROM runs \
-         WHERE installation_id = ?1 AND (?2 IS NULL OR {after}){filter} \
-         AND (?6 IS NULL OR {SEARCH}) \
-         ORDER BY {order} LIMIT ?4"
+         WHERE installation_id = $1 AND ($2::bigint IS NULL OR {after}){filter} \
+         AND ($6::text IS NULL OR {SEARCH}) \
+         ORDER BY {order} LIMIT $4"
     )
 }
 
-/// The jobs, of every attempt, of the runs in the JSON array `?2`.
+/// The jobs, of every attempt, of the runs in the JSON array `$2`.
 fn jobs_query() -> String {
     format!(
         "SELECT {JOB_COLUMNS} FROM jobs \
-         WHERE installation_id = ?1 AND run_id IN (SELECT value FROM json_each(?2)) \
+         WHERE installation_id = $1 \
+         AND run_id IN (SELECT json_array_elements_text($2::json)::bigint) \
          ORDER BY run_id, run_attempt, queued_at, id"
     )
 }
 
 /// One run of an installation.
 fn run_query() -> String {
-    format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1 AND installation_id = ?2")
+    format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = $1 AND installation_id = $2")
 }
 
-/// The query for the counts. `?2` is the start of the last day.
+/// The query for the counts. `$2` is the start of the last day.
 fn counts_query() -> String {
     format!(
         "SELECT \
          COUNT(*) FILTER (WHERE {WAITING}) AS waiting, \
          COUNT(*) FILTER (WHERE {ACTIVE}) AS active, \
          COUNT(*) FILTER (WHERE status = 'in_progress' AND ({ACTIVE})) AS running, \
-         COUNT(*) FILTER (WHERE status = 'completed' AND updated_at >= ?2) \
+         COUNT(*) FILTER (WHERE status = 'completed' AND updated_at >= $2) \
            AS completed_today, \
-         COUNT(*) FILTER (WHERE updated_at >= ?2 AND ({FAILED})) AS failed_today, \
+         COUNT(*) FILTER (WHERE updated_at >= $2 AND ({FAILED})) AS failed_today, \
          COUNT(DISTINCT run_id) FILTER (WHERE ({WAITING}) AND {CURRENT}) AS waiting_runs, \
          COUNT(DISTINCT run_id) FILTER (WHERE ({ACTIVE}) AND {CURRENT}) AS active_runs, \
-         COUNT(DISTINCT run_id) FILTER (WHERE updated_at >= ?2 AND ({FAILED}) AND {CURRENT}) \
+         COUNT(DISTINCT run_id) FILTER (WHERE updated_at >= $2 AND ({FAILED}) AND {CURRENT}) \
            AS failed_runs_today \
-         FROM jobs AS j WHERE installation_id = ?1 \
-         AND (status <> 'completed' OR updated_at >= ?2)"
+         FROM jobs AS j WHERE installation_id = $1 \
+         AND (status <> 'completed' OR updated_at >= $2)"
     )
 }
 
-/// The query for the activity buckets. `?2` is the start of the first
-/// bucket. A completed job's `updated_at` is when it finished. D1 binds
-/// every number as a double, so `?2` is a REAL and the division is
-/// float division; the cast truncates it to the bucket index, which is
-/// the floor since `updated_at >= ?2`.
+/// The query for the activity buckets. `$2` is the start of the first
+/// bucket. A completed job's `updated_at` is when it finished. The
+/// division is integer division, which is the floor since
+/// `updated_at >= $2`.
 fn activity_query() -> String {
     format!(
-        "SELECT CAST((updated_at - ?2) / {BUCKET_MS} AS INTEGER) AS bucket, \
+        "SELECT (updated_at - $2) / {BUCKET_MS} AS bucket, \
          COUNT(*) FILTER (WHERE status = 'completed') AS finished, \
          COUNT(*) FILTER (WHERE {FAILED}) AS failed \
-         FROM jobs WHERE installation_id = ?1 AND updated_at >= ?2 \
+         FROM jobs WHERE installation_id = $1 AND updated_at >= $2 \
          GROUP BY bucket"
     )
 }
@@ -490,18 +494,15 @@ fn list(web: &str, runs: Vec<WorkflowRun>, jobs: &[Job]) -> Vec<Listed> {
         .collect()
 }
 
-async fn jobs_of(ctx: &Ctx<'_>, installation: &JsValue, runs: &[u64]) -> Result<Vec<Job>, Failure> {
+async fn jobs_of(ctx: &Ctx<'_>, installation: u64, runs: &[u64]) -> Result<Vec<Job>, Failure> {
     if runs.is_empty() {
         return Ok(Vec::new());
     }
     let ids = serde_json::to_string(runs).map_err(|err| Failure::new(500, err.to_string()))?;
     Ok(ctx
         .db
-        .prepare(jobs_query())
-        .bind(&[installation.clone(), ids.into()])?
-        .all()
-        .await?
-        .results::<Job>()?)
+        .all(&jobs_query(), &params![installation, ids])
+        .await?)
 }
 
 /// `GET /api/tenants/<org>/runs`
@@ -538,46 +539,45 @@ pub(crate) async fn runs(ctx: &Ctx<'_>, org: &str, req: &Request) -> Answer {
             format!("q is at most {SEARCH_MAX} characters."),
         ));
     }
-    let installation = int(installation)?;
-    let runs = ctx
+    let fifth = match (&before, page.sort) {
+        (
+            Some(Cursor {
+                repository: Some(repository),
+                ..
+            }),
+            Sort::Repository,
+        ) => Param::from(repository.as_str()),
+        (
+            Some(Cursor {
+                ended_at: Some(at), ..
+            }),
+            Sort::Took,
+        ) => Param::from(*at),
+        _ => Param::Null,
+    };
+    let runs: Vec<WorkflowRun> = ctx
         .db
-        .prepare(list_query(page.status, page.sort, page.dir))
-        .bind(&[
-            installation.clone(),
-            before
-                .as_ref()
-                .map_or(Ok(JsValue::NULL), |c| int(c.queued_at))?,
-            before.as_ref().map_or(Ok(JsValue::NULL), |c| int(c.id))?,
-            PAGE.into(),
-            match (&before, page.sort) {
-                (
-                    Some(Cursor {
-                        repository: Some(repository),
-                        ..
-                    }),
-                    Sort::Repository,
-                ) => repository.as_str().into(),
-                (
-                    Some(Cursor {
-                        ended_at: Some(at), ..
-                    }),
-                    Sort::Took,
-                ) => int(*at)?,
-                _ => JsValue::NULL,
-            },
-            q.map_or(JsValue::NULL, |q| contains(q).into()),
-        ])?
-        .all()
-        .await?
-        .results::<WorkflowRun>()?;
+        .all(
+            &list_query(page.status, page.sort, page.dir),
+            &params![
+                installation,
+                before.as_ref().map(|c| c.queued_at),
+                before.as_ref().map(|c| c.id),
+                PAGE,
+                fifth,
+                q.map(contains),
+            ],
+        )
+        .await?;
     let ids: Vec<u64> = runs.iter().map(|run| run.id).collect();
-    let jobs = jobs_of(ctx, &installation, &ids).await?;
+    let jobs = jobs_of(ctx, installation, &ids).await?;
     let now = now_ms();
     let counts: Counts = ctx
         .db
-        .prepare(counts_query())
-        .bind(&[installation.clone(), int(now.saturating_sub(DAY_MS))?])?
-        .first(None)
+        .first(
+            &counts_query(),
+            &params![installation, now.saturating_sub(DAY_MS)],
+        )
         .await?
         .unwrap_or_default();
     let mut body = serde_json::json!({
@@ -588,13 +588,10 @@ pub(crate) async fn runs(ctx: &Ctx<'_>, org: &str, req: &Request) -> Answer {
     });
     if before.is_none() {
         let since = activity_since(now);
-        let rows = ctx
+        let rows: Vec<Grouped> = ctx
             .db
-            .prepare(activity_query())
-            .bind(&[installation, int(since)?])?
-            .all()
-            .await?
-            .results::<Grouped>()?;
+            .all(&activity_query(), &params![installation, since])
+            .await?;
         body["activity"] = serde_json::json!(activity(since, &rows));
     }
     Ok(Response::from_json(&body)?)
@@ -609,12 +606,10 @@ pub(crate) async fn run(ctx: &Ctx<'_>, org: &str, id: &str) -> Answer {
     };
     let run: WorkflowRun = ctx
         .db
-        .prepare(run_query())
-        .bind(&[int(id)?, int(installation)?])?
-        .first(None)
+        .first(&run_query(), &params![id, installation])
         .await?
         .ok_or_else(missing)?;
-    let jobs = jobs_of(ctx, &int(installation)?, &[id]).await?;
+    let jobs = jobs_of(ctx, installation, &[id]).await?;
     let since = jobs
         .iter()
         .map(|job| job.queued_at)
@@ -649,8 +644,8 @@ pub(crate) async fn run(ctx: &Ctx<'_>, org: &str, id: &str) -> Answer {
 }
 
 /// Changes a tenant's settings.
-const SET_SETTINGS: &str = "UPDATE tenants SET max_runners = ?2, allowed_regions = ?3, \
-     updated_at = ?4 WHERE id = ?1";
+const SET_SETTINGS: &str = "UPDATE tenants SET max_runners = $2, allowed_regions = $3, \
+     updated_at = $4 WHERE id = $1";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -679,14 +674,15 @@ pub(crate) async fn settings(ctx: &Ctx<'_>, org: &str, body: Change) -> Answer {
         ));
     }
     ctx.db
-        .prepare(SET_SETTINGS)
-        .bind(&[
-            row.id.as_str().into(),
-            checked.max_runners.into(),
-            checked.regions_column().map_or(JsValue::NULL, Into::into),
-            int(now_ms())?,
-        ])?
-        .run()
+        .run(
+            SET_SETTINGS,
+            &params![
+                row.id.as_str(),
+                checked.max_runners,
+                checked.regions_column(),
+                now_ms()
+            ],
+        )
         .await?;
     crate::launch::recheck(ctx.db, &row.id).await?;
     show(ctx, &row.org_login).await
@@ -801,16 +797,15 @@ mod tests {
             counts_query(),
             activity_query(),
         ]) {
-            assert!(query.contains("WHERE installation_id = ?1 "), "{query}");
+            assert!(query.contains("WHERE installation_id = $1 "), "{query}");
         }
         let failed = list_query(Some(Group::Failed), Sort::Started, Direction::Desc);
-        assert!(failed.contains("WHERE j.installation_id = ?1 "));
-        assert!(SEARCH.contains("s.installation_id = ?1 "));
-        assert!(run_query().ends_with("WHERE id = ?1 AND installation_id = ?2"));
-        assert!(list_query(None, Sort::Started, Direction::Desc).contains(" LIMIT ?4"));
-        assert!(activity_query().contains("updated_at >= ?2"));
-        assert!(activity_query().starts_with("SELECT CAST((updated_at - ?2) / "));
-        assert!(activity_query().contains(" AS INTEGER) AS bucket, "));
+        assert!(failed.contains("WHERE j.installation_id = $1 "));
+        assert!(SEARCH.contains("s.installation_id = $1 "));
+        assert!(run_query().ends_with("WHERE id = $1 AND installation_id = $2"));
+        assert!(list_query(None, Sort::Started, Direction::Desc).contains(" LIMIT $4"));
+        assert!(activity_query().contains("updated_at >= $2"));
+        assert!(activity_query().starts_with("SELECT (updated_at - $2) / "));
     }
 
     /// A job as the webhook and the launch leave it.
@@ -833,14 +828,14 @@ mod tests {
             db.run(
                 "INSERT INTO runs (id, installation_id, repository, workflow_name, head_sha, \
                  attempt, queued_at, created_at, updated_at) \
-                 VALUES (?1, ?2, 'acme/web', 'CI', 'ab', 1, ?3, ?3, ?3) ON CONFLICT (id) DO NOTHING",
+                 VALUES ($1, $2, 'acme/web', 'CI', 'ab', 1, $3, $3, $3) ON CONFLICT (id) DO NOTHING",
                 &params![job.id * 10, INSTALLATION, job.queued_at],
             );
             db.run(
                 "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
                  launch_state, runner_name, instance_id, launch_error, launch_attempts, \
                  launch_retry, next_launch_at, queued_at, updated_at) \
-                 VALUES (?1, ?2, 'acme/web', ?3, 'hatchrun', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 VALUES ($1, $2, 'acme/web', $3, 'hatchrun', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
                 &params![
                     job.id,
                     INSTALLATION,
@@ -927,11 +922,11 @@ mod tests {
             ],
         );
         db.run(
-            "UPDATE jobs SET installation_id = ?1 WHERE id = 7",
+            "UPDATE jobs SET installation_id = $1 WHERE id = 7",
             &params![INSTALLATION + 1],
         );
         db.run(
-            "UPDATE runs SET installation_id = ?1 WHERE id = 70",
+            "UPDATE runs SET installation_id = $1 WHERE id = 70",
             &params![INSTALLATION + 1],
         );
         seed(
@@ -1069,7 +1064,7 @@ mod tests {
         );
         db.run(
             "INSERT INTO runs (id, installation_id, repository, head_sha, attempt, queued_at, \
-             created_at, updated_at) VALUES (100, ?1, 'acme/web', 'ab', 2, ?2, ?2, ?2)",
+             created_at, updated_at) VALUES (100, $1, 'acme/web', 'ab', 2, $2, $2, $2)",
             &params![INSTALLATION, ago(2)],
         );
         db.run("DELETE FROM runs WHERE id IN (110, 120, 130)", &[]);
@@ -1131,8 +1126,8 @@ mod tests {
     fn tabs_start_from_the_job_indexes() {
         let db = jobs();
         let plan = |sql: &str| -> String {
-            db.rows(
-                &format!("EXPLAIN QUERY PLAN {sql}"),
+            db.plan(
+                sql,
                 &params![
                     INSTALLATION,
                     None::<u64>,
@@ -1142,11 +1137,6 @@ mod tests {
                     None::<&str>
                 ],
             )
-            .unwrap()
-            .iter()
-            .map(|row| row["detail"].as_str().unwrap_or_default().to_owned())
-            .collect::<Vec<_>>()
-            .join("\n")
         };
         let failed = plan(&list_query(
             Some(Group::Failed),
@@ -1156,7 +1146,7 @@ mod tests {
         // Through jobs_failed, never every job, and the later attempts
         // through jobs_run.
         assert!(failed.contains("jobs_failed"), "{failed}");
-        assert!(!failed.contains("SCAN"), "{failed}");
+        assert!(!failed.contains("Seq Scan"), "{failed}");
         assert!(failed.contains("jobs_run"), "{failed}");
         let all = plan(&list_query(None, Sort::Started, Direction::Desc));
         assert!(all.contains("runs_recent"), "{all}");
@@ -1165,16 +1155,11 @@ mod tests {
     #[test]
     fn every_sort_walks_an_index() {
         let db = jobs();
-        let plan = |sql: &str| -> String {
-            db.rows(
-                &format!("EXPLAIN QUERY PLAN {sql}"),
-                &params![INSTALLATION, 1u64, 1u64, PAGE, "acme/web", "%web%"],
-            )
-            .unwrap()
-            .iter()
-            .map(|row| row["detail"].as_str().unwrap_or_default().to_owned())
-            .collect::<Vec<_>>()
-            .join("\n")
+        let plan = |sql: &str, fifth: Param| -> String {
+            let mut values = params![INSTALLATION, 1u64, 1u64, PAGE];
+            values.push(fifth);
+            values.push(Param::from("%web%"));
+            db.plan(sql, &values)
         };
         for (sort, dir, index) in [
             (Sort::Started, Direction::Desc, "runs_recent"),
@@ -1184,10 +1169,17 @@ mod tests {
             (Sort::Took, Direction::Asc, "runs_took "),
             (Sort::Took, Direction::Desc, "runs_took_desc"),
         ] {
-            let got = plan(&list_query(None, sort, dir));
+            let fifth = match sort {
+                Sort::Started => Param::Null,
+                Sort::Repository => Param::from("acme/web"),
+                Sort::Took => Param::from(1u64),
+            };
+            let got = plan(&list_query(None, sort, dir), fifth);
             assert!(got.contains(index), "{sort:?} {dir:?}: {got}");
-            assert!(!got.contains("TEMP B-TREE"), "{sort:?} {dir:?}: {got}");
-            assert!(got.contains("jobs_run"), "{sort:?} {dir:?}: {got}");
+            assert!(!got.contains("Seq Scan"), "{sort:?} {dir:?}: {got}");
+            assert!(!got.contains("Sort"), "{sort:?} {dir:?}: {got}");
+            // The search reads jobs through an index too.
+            assert!(got.contains("on jobs s"), "{sort:?} {dir:?}: {got}");
         }
     }
 
@@ -1204,7 +1196,7 @@ mod tests {
             db.run(
                 "INSERT INTO runs (id, installation_id, repository, workflow_name, head_branch, \
                  head_sha, attempt, queued_at, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'ab', 1, ?6, ?6, ?6)",
+                 VALUES ($1, $2, $3, $4, $5, 'ab', 1, $6, $6, $6)",
                 &params![
                     id,
                     INSTALLATION,
@@ -1217,7 +1209,7 @@ mod tests {
             db.run(
                 "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
                  launch_state, instance_id, queued_at, updated_at, name, completed_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9 + ?11, ?10, ?12)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9::bigint + $11::bigint, $10, $12)",
                 &params![
                     id * 10,
                     INSTALLATION,
@@ -1245,7 +1237,7 @@ mod tests {
         db.run(
             "INSERT INTO runs (id, installation_id, repository, workflow_name, head_branch, \
              head_sha, attempt, queued_at, created_at, updated_at) \
-             VALUES (9000, ?1, 'acme/web', 'Release', 'fix_50%', 'ab', 1, ?2, ?2, ?2)",
+             VALUES (9000, $1, 'acme/web', 'Release', 'fix_50%', 'ab', 1, $2, $2, $2)",
             &params![INSTALLATION + 1, NOW],
         );
         db
@@ -1279,7 +1271,7 @@ mod tests {
     fn every_sort_pages_through_every_run_once() {
         let db = many();
         let all: Vec<WorkflowRun> = db.all(
-            &format!("SELECT {RUN_COLUMNS} FROM runs WHERE installation_id = ?1"),
+            &format!("SELECT {RUN_COLUMNS} FROM runs WHERE installation_id = $1"),
             &params![INSTALLATION],
         );
         let key = |r: &WorkflowRun| {
@@ -1407,7 +1399,7 @@ mod tests {
         assert_eq!(ended(), None);
         // Launch bookkeeping on a live job leaves the run alone.
         db.run(
-            "UPDATE jobs SET launch_state = 'launching', updated_at = ?1 WHERE id = 2",
+            "UPDATE jobs SET launch_state = 'launching', updated_at = $1 WHERE id = 2",
             &params![t0 + 6_000],
         );
         assert_eq!(ended(), None);
@@ -1425,7 +1417,7 @@ mod tests {
         assert_eq!(ended(), Some(t1 + 7_000));
         // A completed job that changes again keeps GitHub's time.
         db.run(
-            "UPDATE jobs SET updated_at = ?1 WHERE id = 3",
+            "UPDATE jobs SET updated_at = $1 WHERE id = 3",
             &params![t1 + 50_000],
         );
         assert_eq!(ended(), Some(t1 + 7_000));
@@ -1536,25 +1528,6 @@ mod tests {
         // buckets back, 38 minutes back is three.
         assert_eq!(got.finished[BUCKETS - 5], 1);
         assert_eq!(got.failed[BUCKETS - 4], 1);
-    }
-
-    /// hatchrun/hatchrun#92: without the cast the bucket is a REAL such
-    /// as 1.55, which does not read into the `i64` of `Grouped`.
-    #[test]
-    fn a_fractional_bucket_fails_to_read() {
-        let before = format!(
-            "SELECT (updated_at - ?2) / {BUCKET_MS} AS bucket, \
-             COUNT(*) FILTER (WHERE status = 'completed') AS finished, \
-             COUNT(*) FILTER (WHERE {FAILED}) AS failed \
-             FROM jobs WHERE installation_id = ?1 AND updated_at >= ?2 \
-             GROUP BY bucket"
-        );
-        let db = jobs();
-        let since = activity_since(NOW);
-        let err = db
-            .try_all::<Grouped>(&before, &params![INSTALLATION, since])
-            .unwrap_err();
-        assert!(err.contains("floating point"), "{err}");
     }
 
     #[test]

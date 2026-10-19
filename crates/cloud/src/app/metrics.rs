@@ -31,7 +31,7 @@ use worker::Response;
 
 use super::tenants::authorize;
 use super::{Answer, Ctx, Failure};
-use crate::int;
+use crate::db::params;
 
 /// Analytics SQL binding in `wrangler.toml`.
 const BINDING: &str = "ANALYTICS_SQL";
@@ -129,7 +129,7 @@ struct Job {
     run_number: Option<u64>,
 }
 
-/// One job of an installation and its run, from D1. Binds the job id
+/// One job of an installation and its run, from the database. Binds the job id
 /// and the installation. A job from before runs were recorded has no
 /// run until the backfill gives it one.
 const JOB: &str = "SELECT jobs.id, jobs.repository, jobs.run_id, jobs.name, jobs.run_attempt, \
@@ -137,7 +137,7 @@ const JOB: &str = "SELECT jobs.id, jobs.repository, jobs.run_id, jobs.name, jobs
     jobs.queued_at, jobs.started_at, jobs.completed_at, jobs.updated_at, \
     runs.workflow_name, runs.run_number \
     FROM jobs LEFT JOIN runs ON runs.id = jobs.run_id \
-    WHERE jobs.id = ?1 AND jobs.installation_id = ?2";
+    WHERE jobs.id = $1 AND jobs.installation_id = $2";
 
 /// Most jobs of a run [`resources`] covers, the largest matrix GitHub
 /// allows and then some.
@@ -156,7 +156,7 @@ pub(crate) struct Resources {
     oom_kills: Option<f64>,
 }
 
-/// The query for [`resources`]. The ids come from D1, never the
+/// The query for [`resources`]. The ids come from the database, never the
 /// request, and are digits only.
 fn resources_query(jobs: &[u64]) -> String {
     let ids: Vec<String> = jobs
@@ -187,7 +187,7 @@ pub(crate) async fn resources(
         return Ok(Vec::new());
     }
     let installation = installation.to_string();
-    let since = iso(since)?;
+    let since = iso(since);
     query(
         ctx,
         &resources_query(jobs),
@@ -197,8 +197,12 @@ pub(crate) async fn resources(
 }
 
 /// `ms` as an ISO 8601 string, as the SQL API compares `timestamp`.
-fn iso(ms: u64) -> Result<String, Failure> {
-    Ok(js_sys::Date::new(&int(ms)?).to_iso_string().into())
+fn iso(ms: u64) -> String {
+    // Times in milliseconds are far below 2^53, where a double stops
+    // being exact.
+    #[allow(clippy::cast_precision_loss)]
+    let ms = JsValue::from_f64(ms as f64);
+    js_sys::Date::new(&ms).to_iso_string().into()
 }
 
 /// What the SQL binding answers.
@@ -216,15 +220,13 @@ pub(crate) async fn job(ctx: &Ctx<'_>, org: &str, id: &str) -> Answer {
     };
     let job: Job = ctx
         .db
-        .prepare(JOB)
-        .bind(&[int(id)?, int(installation)?])?
-        .first(None)
+        .first(JOB, &params![id, installation])
         .await?
         .ok_or_else(missing)?;
 
     let id = job.id.to_string();
     let installation = installation.to_string();
-    let since = iso(job.queued_at)?;
+    let since = iso(job.queued_at);
     let params = [
         ("job", id.as_str()),
         ("installation", installation.as_str()),
@@ -325,7 +327,7 @@ mod tests {
         db.run(
             "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
              queued_at, updated_at, launch_state, runner_name, instance_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &params![
                 7u64,
                 3u64,
@@ -343,7 +345,7 @@ mod tests {
         db.run(
             "INSERT INTO runs (id, installation_id, repository, workflow_name, head_sha, attempt, \
              queued_at, run_number, created_at, updated_at) \
-             VALUES (9, 3, 'acme/app', 'Smoke test', 'ab', 1, ?1, 412, ?1, ?1)",
+             VALUES (9, 3, 'acme/app', 'Smoke test', 'ab', 1, $1, 412, $1, $1)",
             &params![queued_at],
         );
         let job: Job = db.first(JOB, &params![7u64, 3u64]).unwrap();

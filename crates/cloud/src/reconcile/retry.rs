@@ -37,7 +37,7 @@ pub enum Cause {
     NoImage,
     /// A Worker variable or secret is missing or does not parse.
     Settings,
-    /// D1 failed, or an answer did not parse.
+    /// The database failed, or an answer did not parse.
     Internal,
     /// The label names no runner profile of the organization.
     NoProfile,

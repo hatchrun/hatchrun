@@ -8,7 +8,7 @@
 //! App sends a `workflow_job` webhook for every job; the Worker checks the
 //! signature, keeps the jobs whose `runs-on` label names one of the
 //! organization's runner profiles (see [`labels`] and [`profiles`]) and
-//! records them in D1, one row per job, so a webhook GitHub delivers
+//! records them in Postgres, one row per job, so a webhook GitHub delivers
 //! twice is recorded once. It sends each recorded job to the launch
 //! queue, whose consumer in this Worker launches a runner instance for
 //! it in the tenant's AWS account (see the `launches` and `launch`
@@ -36,6 +36,7 @@ pub mod aws;
 pub mod cache;
 pub mod catalog;
 pub mod connect;
+mod db;
 mod fetch;
 pub mod github;
 pub mod http;
@@ -66,17 +67,15 @@ pub mod usage;
 mod webcrypto;
 pub mod webhook;
 
-use wasm_bindgen::JsValue;
 use worker::{
-    D1Database, Env, Headers, MessageBatch, Method, Request, Response, ResponseBuilder, Result,
+    Env, Headers, MessageBatch, Method, Request, Response, ResponseBuilder, Result,
     ScheduleContext, ScheduledEvent, console_error, console_warn, event,
 };
 
+use crate::db::{Db, params};
 use crate::jwt::PublicKey;
 use crate::webhook::{Event, Placement, QueuedJob};
 
-/// D1 binding in `wrangler.toml`.
-pub(crate) const DB: &str = "DB";
 /// Static assets binding in `wrangler.toml`.
 const ASSETS: &str = "ASSETS";
 /// Headers on every page of the app. The app loads nothing from other
@@ -150,15 +149,22 @@ async fn queue(
 }
 
 /// Whether the reconciler is running: 200 while its last pass is
-/// recent and the passes are not all failing, 503 otherwise.
+/// recent and the passes are not all failing, 503 otherwise, or when
+/// the database does not answer.
 async fn healthz(env: &Env) -> Result<Response> {
-    let row = env
-        .d1(DB)?
-        .prepare(alerts::HEALTH)
-        .first::<alerts::HealthRow>(None)
-        .await?
-        .unwrap_or_default();
-    let (status, body) = alerts::health(&row, now_ms());
+    let read = async {
+        Db::connect(env)
+            .await?
+            .first::<alerts::HealthRow>(alerts::HEALTH, &[])
+            .await
+    };
+    let (status, body) = match read.await {
+        Ok(row) => alerts::health(&row.unwrap_or_default(), now_ms()),
+        Err(err) => {
+            console_error!("healthz: {err}");
+            (503, serde_json::json!({ "status": "database" }))
+        }
+    };
     let mut response = Response::from_json(&body)?.with_status(status);
     response.headers_mut().set("Cache-Control", "no-store")?;
     Ok(response)
@@ -188,19 +194,19 @@ async fn assets(req: Request, env: &Env) -> Result<Response> {
 /// [`QUEUED`]).
 const RUN: &str = "INSERT INTO runs (id, installation_id, repository, workflow_name, \
      head_branch, head_sha, attempt, queued_at, created_at, updated_at, expires_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, ?8 + COALESCE((SELECT retention_days \
-       FROM tenants WHERE installation_id = ?2), 30) * 86400000) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $8, $8 + COALESCE((SELECT retention_days \
+       FROM tenants WHERE installation_id = $2), 30) * 86400000) \
      ON CONFLICT (id) DO NOTHING";
 
-/// Moves a run on to attempt `?2` when its first job is queued. A late
+/// Moves a run on to attempt `$2` when its first job is queued. A late
 /// delivery from an earlier attempt changes nothing. The run expires
 /// from the new attempt, as its jobs do. The branch may have moved since
 /// the last attempt, so its cache scopes are worked out again.
-const RUN_ATTEMPT: &str = "UPDATE runs SET attempt = ?2, queued_at = ?3, head_sha = ?4, \
-     head_branch = ?5, updated_at = ?3, expires_at = ?3 + COALESCE((SELECT retention_days \
+const RUN_ATTEMPT: &str = "UPDATE runs SET attempt = $2, queued_at = $3, head_sha = $4, \
+     head_branch = $5, updated_at = $3, expires_at = $3 + COALESCE((SELECT retention_days \
        FROM tenants WHERE tenants.installation_id = runs.installation_id), 30) * 86400000, \
      cache_write = NULL, cache_reads = NULL \
-     WHERE id = ?1 AND attempt < ?2";
+     WHERE id = $1 AND attempt < $2";
 
 /// Records a queued job once, however often GitHub delivers it. It
 /// expires after the `retention_days` of the installation's tenant, or
@@ -210,69 +216,77 @@ const RUN_ATTEMPT: &str = "UPDATE runs SET attempt = ?2, queued_at = ?3, head_sh
 const QUEUED: &str = "INSERT INTO jobs \
      (id, installation_id, repository, run_id, label, status, queued_at, updated_at, \
      name, run_attempt, expires_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6, ?7, ?8, ?6 + COALESCE((SELECT retention_days \
-       FROM tenants WHERE installation_id = ?2), 30) * 86400000) \
+     VALUES ($1, $2, $3, $4, $5, 'queued', $6, $6, $7, $8, $6 + COALESCE((SELECT retention_days \
+       FROM tenants WHERE installation_id = $2), 30) * 86400000) \
      ON CONFLICT (id) DO NOTHING";
 
 /// Moves a job on unless it completed, with GitHub's conclusion and
 /// times when the event has them.
-const PROGRESS: &str = "UPDATE jobs SET status = ?1, updated_at = ?2, \
-     ran_on = COALESCE(?4, ran_on), conclusion = COALESCE(?5, conclusion), \
-     started_at = COALESCE(?6, started_at), completed_at = COALESCE(?7, completed_at) \
-     WHERE id = ?3 AND status <> 'completed'";
+const PROGRESS: &str = "UPDATE jobs SET status = $1, updated_at = $2, \
+     ran_on = COALESCE($4, ran_on), conclusion = COALESCE($5, conclusion), \
+     started_at = COALESCE($6, started_at), completed_at = COALESCE($7, completed_at) \
+     WHERE id = $3 AND status <> 'completed'";
 
 /// Detaches the tenant from an uninstalled installation.
 const UNINSTALLED: &str =
-    "UPDATE tenants SET installation_id = NULL, updated_at = ?2 WHERE installation_id = ?1";
+    "UPDATE tenants SET installation_id = NULL, updated_at = $2 WHERE installation_id = $1";
 
 /// Gives the organization's tenant its new installation.
 const INSTALLED: &str =
-    "UPDATE tenants SET installation_id = ?1, updated_at = ?3 WHERE org_id = ?2";
+    "UPDATE tenants SET installation_id = $1, updated_at = $3 WHERE org_id = $2";
 
 /// Records a queued job and its run. The run's first job fetches the
 /// rest of the run from GitHub; the reconciler tries again if that
 /// fails.
 async fn record_queued(
-    db: &D1Database,
+    db: &Db,
     env: &Env,
     ctx: &worker::Context,
     job: &QueuedJob,
     placement: &Placement,
-    now: JsValue,
+    now: u64,
 ) -> Result<()> {
-    let text = |value: &Option<String>| value.as_deref().map_or(JsValue::NULL, Into::into);
     let recorded = db
-        .batch(vec![
-            db.prepare(RUN).bind(&[
-                int(job.run_id)?,
-                int(job.installation_id)?,
-                job.repository.as_str().into(),
-                text(&placement.workflow_name),
-                text(&placement.head_branch),
-                placement.head_sha.as_str().into(),
-                int(placement.attempt)?,
-                now.clone(),
-            ])?,
-            db.prepare(RUN_ATTEMPT).bind(&[
-                int(job.run_id)?,
-                int(placement.attempt)?,
-                now.clone(),
-                placement.head_sha.as_str().into(),
-                text(&placement.head_branch),
-            ])?,
-            db.prepare(QUEUED).bind(&[
-                int(job.id)?,
-                int(job.installation_id)?,
-                job.repository.as_str().into(),
-                int(job.run_id)?,
-                job.label.as_str().into(),
-                now,
-                placement.name.as_str().into(),
-                int(placement.attempt)?,
-            ])?,
+        .batch(&[
+            (
+                RUN,
+                params![
+                    job.run_id,
+                    job.installation_id,
+                    &job.repository,
+                    &placement.workflow_name,
+                    &placement.head_branch,
+                    &placement.head_sha,
+                    placement.attempt,
+                    now,
+                ],
+            ),
+            (
+                RUN_ATTEMPT,
+                params![
+                    job.run_id,
+                    placement.attempt,
+                    now,
+                    &placement.head_sha,
+                    &placement.head_branch,
+                ],
+            ),
+            (
+                QUEUED,
+                params![
+                    job.id,
+                    job.installation_id,
+                    &job.repository,
+                    job.run_id,
+                    &job.label,
+                    now,
+                    &placement.name,
+                    placement.attempt,
+                ],
+            ),
         ])
         .await?;
-    if recorded.first().is_some_and(|result| changes(result) == 1) {
+    if recorded.first() == Some(&1) {
         ctx.wait_until(runs::fetch(
             env.clone(),
             job.installation_id,
@@ -302,8 +316,8 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
         Err(err) => return error(&format!("bad {kind} payload: {err}"), 400),
     };
 
-    let db = env.d1(DB)?;
-    let now = int(now_ms())?;
+    let db = Db::connect(&env).await?;
+    let now = now_ms();
     match event {
         Event::Queued(job, placement) => {
             if let Some(reason) =
@@ -336,19 +350,19 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
             // Deliveries can arrive out of order; a completed job stays
             // completed. The runner shows the reconciler which instance
             // ran the job (see `reconcile`).
-            let time = |value: Option<u64>| value.map_or(Ok(JsValue::NULL), int);
-            db.prepare(PROGRESS)
-                .bind(&[
-                    status.as_str().into(),
+            db.run(
+                PROGRESS,
+                &params![
+                    status.as_str(),
                     now,
-                    int(id)?,
-                    runner.map_or(JsValue::NULL, Into::into),
-                    outcome.conclusion.map_or(JsValue::NULL, Into::into),
-                    time(outcome.started_at)?,
-                    time(outcome.completed_at)?,
-                ])?
-                .run()
-                .await?;
+                    id,
+                    runner,
+                    outcome.conclusion,
+                    outcome.started_at,
+                    outcome.completed_at,
+                ],
+            )
+            .await?;
             if status == webhook::Status::Completed
                 && let (Some(started), Some(completed)) = (outcome.started_at, outcome.completed_at)
             {
@@ -357,10 +371,7 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
             Ok(Response::empty()?.with_status(204))
         }
         Event::Uninstalled { installation_id } => {
-            db.prepare(UNINSTALLED)
-                .bind(&[int(installation_id)?, now])?
-                .run()
-                .await?;
+            db.run(UNINSTALLED, &params![installation_id, now]).await?;
             Ok(Response::empty()?.with_status(204))
         }
         Event::Installed {
@@ -369,9 +380,7 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
         } => {
             // A tenant made before an uninstall gets the new installation;
             // an account without a tenant waits for an owner to set it up.
-            db.prepare(INSTALLED)
-                .bind(&[int(installation_id)?, int(account_id)?, now])?
-                .run()
+            db.run(INSTALLED, &params![installation_id, account_id, now])
                 .await?;
             Ok(Response::empty()?.with_status(204))
         }
@@ -439,31 +448,8 @@ fn published_keys(env: &Env) -> Vec<(String, PublicKey)> {
         .collect()
 }
 
-/// D1 takes numbers as JavaScript doubles, exact up to 2^53. GitHub ids
-/// are far below that; anything above it is refused rather than rounded.
-pub(crate) fn int(value: u64) -> Result<JsValue> {
-    const MAX_SAFE: u64 = (1 << 53) - 1;
-    if value > MAX_SAFE {
-        return Err(worker::Error::RustError(format!(
-            "{value} is too large for D1"
-        )));
-    }
-    #[allow(clippy::cast_precision_loss)]
-    Ok(JsValue::from_f64(value as f64))
-}
-
 fn error(message: &str, status: u16) -> Result<Response> {
     Ok(Response::from_json(&serde_json::json!({ "error": message }))?.with_status(status))
-}
-
-/// Rows a statement changed.
-pub(crate) fn changes(result: &worker::D1Result) -> usize {
-    result
-        .meta()
-        .ok()
-        .flatten()
-        .and_then(|meta| meta.changes)
-        .unwrap_or(0)
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -473,7 +459,7 @@ pub(crate) fn now_ms() -> u64 {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use crate::testdb::{Db, params};
+    use crate::testdb::Db;
 
     const NOW: u64 = 1_792_140_000_000;
 
@@ -540,7 +526,7 @@ mod tests {
         assert_eq!(job_of_run(&db, 1, 1, "a1", NOW), [1, 0, 1]);
         assert_eq!(job_of_run(&db, 2, 1, "a1", NOW + 5), [0, 0, 1]);
         db.run(
-            "UPDATE runs SET cache_write = '1/b/x', cache_reads = '[\"1/b/x\"]'",
+            "UPDATE runs SET cache_write = '1/b/x', cache_reads = '[\"1/b/x\"]' WHERE id = 77",
             &[],
         );
         // A re-run: new job ids, attempt 2 and the list's place moves.
@@ -609,8 +595,7 @@ mod tests {
         assert_eq!(progress(&db, 5, "in_progress", Some("other"), NOW + 4), 0);
         let rows = db
             .rows(
-                "SELECT label, status, ran_on, queued_at, updated_at, typeof(updated_at) AS t \
-                 FROM jobs",
+                "SELECT label, status, ran_on, queued_at, updated_at FROM jobs",
                 &[],
             )
             .unwrap();
@@ -620,7 +605,6 @@ mod tests {
         assert_eq!(rows[0]["ran_on"], "hatchrun-5-ab");
         assert_eq!(rows[0]["queued_at"], NOW);
         assert_eq!(rows[0]["updated_at"], NOW + 3);
-        assert_eq!(rows[0]["t"], "integer");
         assert_eq!(progress(&db, 6, "in_progress", None, NOW), 0);
     }
 
@@ -629,7 +613,7 @@ mod tests {
         let db = Db::new();
         db.run(
             "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+             VALUES ($1, $2, $3, $4, $5, $5)",
             &params!["t1", 9u64, "acme", 42u64, 1u64],
         );
         assert_eq!(db.run(UNINSTALLED, &params![42u64, NOW]), 1);
