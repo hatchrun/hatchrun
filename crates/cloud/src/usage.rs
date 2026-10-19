@@ -328,7 +328,9 @@ mod sql {
     /// on installations 1, 2 and 3.
     fn seed() -> Db {
         let db = Db::new();
-        for (id, installation, beta) in [("free", 1u64, 0u32), ("paid", 2, 0), ("beta", 3, 1)] {
+        for (id, installation, beta) in
+            [("free", 1u64, false), ("paid", 2, false), ("beta", 3, true)]
+        {
             db.run(
                 "INSERT INTO tenants (id, org_id, org_login, installation_id, beta, \
                  created_at, updated_at) VALUES ($1, $2, $1, $2, $3, 1, 1)",

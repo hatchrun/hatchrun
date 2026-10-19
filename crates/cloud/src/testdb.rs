@@ -236,12 +236,12 @@ mod tests {
     }
 
     #[test]
-    fn values_bind_to_the_types_postgres_infers() {
+    fn values_bind_as_their_declared_types() {
         let db = Db::new();
         db.run(
             "INSERT INTO rate_limits (installation_id, remaining, limited, seen_at) \
              VALUES ($1, $2, $3, $4)",
-            &params![7u64, None::<u64>, 1u64, 5u64],
+            &params![7u64, None::<u64>, true, 5u64],
         );
         let row: Row = db
             .first(
@@ -251,6 +251,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!((row.n, row.flag, row.name), (7, true, None));
+    }
+
+    #[test]
+    fn an_integer_is_no_boolean() {
+        let db = Db::new();
+        let err = db
+            .try_run(
+                "INSERT INTO rate_limits (installation_id, remaining, limited, seen_at) \
+                 VALUES ($1, $2, $3, $4)",
+                &params![7u64, None::<u64>, 1u64, 5u64],
+            )
+            .unwrap_err();
+        assert!(err.contains("boolean"), "{err}");
     }
 
     #[test]

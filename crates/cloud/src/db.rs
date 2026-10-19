@@ -5,23 +5,27 @@
 //! The database: `PlanetScale` Postgres, reached through the `HYPERDRIVE`
 //! binding with tokio-postgres.
 //!
-//! Statements take [`Param`]s, which bind to whatever type Postgres
-//! infers for each placeholder, so a `u64` binds to a `bigint` column
-//! and a `0` or `1` to a `boolean` one. Rows come back as JSON objects
-//! by column name and deserialize into the caller's row structs, as
-//! they did from D1.
+//! Every round trip to Hyperdrive costs more than the query behind it,
+//! so a statement goes out as one unnamed Parse, Bind and Execute with
+//! the types of its [`Param`]s: integers as `bigint`, text as `text`,
+//! booleans as `boolean`, and NULL untyped for Postgres to infer. A
+//! transaction goes out whole, `BEGIN` to `COMMIT`, in one round trip;
+//! after a failed statement Postgres refuses the rest and turns the
+//! `COMMIT` into a rollback. Rows come back as JSON objects by column
+//! name and deserialize into the caller's row structs.
 //!
 //! One connection serves a request, an invocation of the reconciler or
-//! a queue batch. Its statements take turns behind a lock, and
-//! [`Db::batch`] holds the lock for its whole transaction, so another
-//! task on the same connection cannot slip a statement into it.
+//! a queue batch. Statements from several tasks share it, pipelined; a
+//! transaction has it to itself, so no other task's statement lands
+//! inside one.
 
 use std::error::Error as StdError;
 
-use futures_util::lock::Mutex;
+use async_lock::RwLock;
+use futures_util::future::join_all;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Number, Value};
-use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
+use tokio_postgres::types::{IsNull, Kind, ToSql, Type, to_sql_checked};
 use tokio_postgres::{Client, Row};
 
 /// Hyperdrive binding in `wrangler.toml`.
@@ -31,14 +35,16 @@ const HYPERDRIVE: &str = "HYPERDRIVE";
 /// A value bound to a statement.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Param {
-    /// An integer, bound to any integer, `double precision` or, as 0
-    /// or 1, `boolean` placeholder.
+    /// An integer, sent as `bigint`.
     Int(i64),
     /// An integer past `i64::MAX`, which no column holds.
     TooLarge(u64),
+    /// Sent as `double precision`.
     Float(f64),
     Bool(bool),
+    /// Sent as `text`; `$1::json` and the like cast it.
     Text(String),
+    /// Sent untyped, as Postgres infers it.
     Null,
 }
 
@@ -129,50 +135,15 @@ impl<T: Into<Param> + Clone> From<&Option<T>> for Param {
 type BoxError = Box<dyn StdError + Sync + Send>;
 
 impl ToSql for Param {
+    /// Encodes the value as the type [`Param::declared`] gave it.
     fn to_sql(&self, ty: &Type, out: &mut bytes::BytesMut) -> Result<IsNull, BoxError> {
         match self {
             Param::Null => Ok(IsNull::Yes),
             Param::TooLarge(value) => Err(format!("{value} is too large for Postgres").into()),
-            Param::Int(value) => match *ty {
-                Type::INT8 => value.to_sql(ty, out),
-                Type::INT4 => i32::try_from(*value)?.to_sql(ty, out),
-                Type::INT2 => i16::try_from(*value)?.to_sql(ty, out),
-                #[allow(clippy::cast_precision_loss)]
-                Type::FLOAT8 => (*value as f64).to_sql(ty, out),
-                Type::BOOL => match value {
-                    0 => false.to_sql(ty, out),
-                    1 => true.to_sql(ty, out),
-                    _ => Err(format!("{value} is not a boolean").into()),
-                },
-                _ => Err(format!("an integer bound to {ty}").into()),
-            },
-            Param::Float(value) => match *ty {
-                Type::FLOAT8 => value.to_sql(ty, out),
-                _ => Err(format!("a float bound to {ty}").into()),
-            },
-            Param::Bool(value) => match *ty {
-                Type::BOOL => value.to_sql(ty, out),
-                Type::INT8 => i64::from(*value).to_sql(ty, out),
-                Type::INT4 => i32::from(*value).to_sql(ty, out),
-                _ => Err(format!("a boolean bound to {ty}").into()),
-            },
-            Param::Text(value) => match *ty {
-                Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
-                    value.as_str().to_sql(ty, out)
-                }
-                // json's binary form is its text; jsonb's starts with
-                // its version, 1. Postgres checks the text either way.
-                Type::JSON => {
-                    out.extend_from_slice(value.as_bytes());
-                    Ok(IsNull::No)
-                }
-                Type::JSONB => {
-                    out.extend_from_slice(&[1]);
-                    out.extend_from_slice(value.as_bytes());
-                    Ok(IsNull::No)
-                }
-                _ => Err(format!("text bound to {ty}").into()),
-            },
+            Param::Int(value) => value.to_sql(ty, out),
+            Param::Float(value) => value.to_sql(ty, out),
+            Param::Bool(value) => value.to_sql(ty, out),
+            Param::Text(value) => value.as_str().to_sql(ty, out),
         }
     }
 
@@ -192,18 +163,38 @@ macro_rules! params {
 }
 pub(crate) use params;
 
+impl Param {
+    /// The type the statement declares for this value. NULL goes out
+    /// with type 0, which leaves it to Postgres.
+    fn declared(&self) -> Type {
+        match self {
+            Param::Int(_) | Param::TooLarge(_) => Type::INT8,
+            Param::Float(_) => Type::FLOAT8,
+            Param::Bool(_) => Type::BOOL,
+            Param::Text(_) => Type::TEXT,
+            Param::Null => Type::new("unknown".to_owned(), 0, Kind::Simple, String::new()),
+        }
+    }
+}
+
 /// An open connection.
 pub(crate) struct Db {
     client: Client,
-    turn: Mutex<()>,
+    /// Shared by single statements, held alone by a transaction.
+    turn: RwLock<()>,
 }
 
 fn error(err: impl std::fmt::Display) -> worker::Error {
     worker::Error::RustError(format!("database: {err}"))
 }
 
-fn refs(params: &[Param]) -> Vec<&(dyn ToSql + Sync)> {
-    params.iter().map(|p| p as &(dyn ToSql + Sync)).collect()
+type Typed<'a> = Vec<(&'a (dyn ToSql + Sync), Type)>;
+
+fn typed(params: &[Param]) -> Typed<'_> {
+    params
+        .iter()
+        .map(|p| (p as &(dyn ToSql + Sync), p.declared()))
+        .collect()
 }
 
 impl Db {
@@ -212,7 +203,7 @@ impl Db {
     pub(crate) fn new(client: Client) -> Self {
         Db {
             client,
-            turn: Mutex::new(()),
+            turn: RwLock::new(()),
         }
     }
 
@@ -260,9 +251,9 @@ impl Db {
     ///
     /// Postgres refused the statement or a value.
     pub(crate) async fn run(&self, sql: &str, params: &[Param]) -> worker::Result<u64> {
-        let _turn = self.turn.lock().await;
+        let _turn = self.turn.read().await;
         self.client
-            .execute(sql, &refs(params))
+            .execute_typed(sql, &typed(params))
             .await
             .map_err(|err| statement_error(&err, sql))
     }
@@ -314,9 +305,9 @@ impl Db {
         params: &[Param],
     ) -> worker::Result<Vec<Map<String, Value>>> {
         let rows = {
-            let _turn = self.turn.lock().await;
+            let _turn = self.turn.read().await;
             self.client
-                .query(sql, &refs(params))
+                .query_typed(sql, &typed(params))
                 .await
                 .map_err(|err| statement_error(&err, sql))?
         };
@@ -331,36 +322,26 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// As [`Db::all`], after the rollback.
+    /// As [`Db::all`]; the transaction rolls back.
     pub(crate) async fn first_locked<T: DeserializeOwned>(
         &self,
         key: i64,
         sql: &str,
         params: &[Param],
     ) -> worker::Result<Option<T>> {
-        let _turn = self.turn.lock().await;
-        self.client.batch_execute("BEGIN").await.map_err(error)?;
-        let rows = async {
-            self.client
-                .execute("SELECT pg_advisory_xact_lock($1)", &[&key])
-                .await
-                .map_err(error)?;
-            self.client
-                .query(sql, &refs(params))
-                .await
-                .map_err(|err| statement_error(&err, sql))
-        }
-        .await;
-        let rows = match rows {
-            Ok(rows) => rows,
-            Err(err) => {
-                let _ = self.client.batch_execute("ROLLBACK").await;
-                return Err(err);
-            }
-        };
-        self.client.batch_execute("COMMIT").await.map_err(error)?;
-        rows.first()
-            .map(|row| json(row).map_err(error).and_then(|row| decode(row, sql)))
+        let lock = [Param::Int(key)];
+        let statements = [
+            (
+                "SELECT true AS locked FROM pg_advisory_xact_lock($1)",
+                &lock[..],
+            ),
+            (sql, params),
+        ];
+        let mut results = self.transaction(&statements).await?;
+        results
+            .pop()
+            .and_then(|rows| rows.into_iter().next())
+            .map(|row| decode(row, sql))
             .transpose()
     }
 
@@ -369,25 +350,68 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// The statement that failed, after the rollback.
+    /// The first statement that failed.
     pub(crate) async fn batch(
         &self,
         statements: &[(&str, Vec<Param>)],
     ) -> worker::Result<Vec<u64>> {
-        let _turn = self.turn.lock().await;
-        self.client.batch_execute("BEGIN").await.map_err(error)?;
-        let mut changes = Vec::with_capacity(statements.len());
-        for (sql, params) in statements {
-            match self.client.execute(*sql, &refs(params)).await {
-                Ok(count) => changes.push(count),
-                Err(err) => {
-                    let _ = self.client.batch_execute("ROLLBACK").await;
-                    return Err(statement_error(&err, sql));
-                }
-            }
-        }
-        self.client.batch_execute("COMMIT").await.map_err(error)?;
+        let statements: Vec<(&str, &[Param])> = statements
+            .iter()
+            .map(|(sql, params)| (*sql, params.as_slice()))
+            .collect();
+        let values: Vec<Typed> = statements.iter().map(|(_, params)| typed(params)).collect();
+        let _turn = self.turn.write().await;
+        let (begin, done, commit) = futures_util::join!(
+            self.client.batch_execute("BEGIN"),
+            join_all(
+                statements
+                    .iter()
+                    .zip(&values)
+                    .map(|((sql, _), values)| self.client.execute_typed(sql, values))
+            ),
+            self.client.batch_execute("COMMIT"),
+        );
+        begin.map_err(error)?;
+        let changes = statements
+            .iter()
+            .zip(done)
+            .map(|((sql, _), done)| done.map_err(|err| statement_error(&err, sql)))
+            .collect::<worker::Result<Vec<u64>>>()?;
+        commit.map_err(error)?;
         Ok(changes)
+    }
+
+    /// Runs statements in one transaction, sent together, and returns
+    /// each one's rows.
+    async fn transaction(
+        &self,
+        statements: &[(&str, &[Param])],
+    ) -> worker::Result<Vec<Vec<Map<String, Value>>>> {
+        let values: Vec<Typed> = statements.iter().map(|(_, params)| typed(params)).collect();
+        let _turn = self.turn.write().await;
+        let (begin, done, commit) = futures_util::join!(
+            self.client.batch_execute("BEGIN"),
+            join_all(
+                statements
+                    .iter()
+                    .zip(&values)
+                    .map(|((sql, _), values)| self.client.query_typed(sql, values))
+            ),
+            self.client.batch_execute("COMMIT"),
+        );
+        begin.map_err(error)?;
+        let rows = statements
+            .iter()
+            .zip(done)
+            .map(|((sql, _), done)| {
+                done.map_err(|err| statement_error(&err, sql))?
+                    .iter()
+                    .map(|row| json(row).map_err(error))
+                    .collect()
+            })
+            .collect::<worker::Result<Vec<_>>>()?;
+        commit.map_err(error)?;
+        Ok(rows)
     }
 }
 
