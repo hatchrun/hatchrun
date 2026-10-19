@@ -7,7 +7,7 @@ import { useState, type FormEvent } from "react";
 import { getAwsInstructions, saveSettings, type Tenant } from "../api";
 import { Await } from "../components/Status";
 import { useLoad } from "../load";
-import { ChoosePlan, PlanSummary, PortalLink } from "./Billing";
+import { BillingPanel, PortalLink } from "./Billing";
 import { AwsSummary, ConnectAws } from "./ConnectAws";
 import { InstallApp } from "./TenantPage";
 
@@ -18,13 +18,7 @@ export function TenantSettings({ tenant, onChange }: { tenant: Tenant; onChange:
       <AwsSection tenant={tenant} onChange={onChange} />
       <section className="card panel">
         <h2>Billing</h2>
-        {tenant.billing.licensed ? (
-          <p>
-            <PlanSummary tenant={tenant} />
-          </p>
-        ) : (
-          <ChoosePlan tenant={tenant} onChange={(next) => next && onChange(next)} confirming={false} />
-        )}
+        <BillingPanel tenant={tenant} onChange={onChange} />
         {tenant.billing.beta && tenant.billing.subscription && (
           <p className="fine">
             <PortalLink org={tenant.org.login} label="Open the Polar customer portal" />

@@ -21,7 +21,9 @@
 //!    through a tenant role there (see [`crate::instance_types`]);
 //! 5. fail the lost launches of installations with no AWS connected,
 //!    which `launch` does without calling anyone;
-//! 6. delete expired sessions and rows past the retention.
+//! 6. send the minutes of completed jobs of paying tenants to Polar's
+//!    meter (see [`crate::usage`]);
+//! 7. delete expired sessions and rows past the retention.
 //!
 //! Every step is safe to repeat and to run beside a webhook: rows
 //! change only while they still say what the pass read, and `launch`
@@ -53,11 +55,15 @@ use crate::fetch::{Counted, send, send_reading};
 use crate::instance_types::{self, store as catalog};
 use crate::launch::{self, APP_KEY, AWS_ENDPOINT_URL};
 use crate::tokens::{App, Kv, Tokens};
-use crate::webhook::{QueuedJob, Status};
-use crate::{DB, changes, github, int, jwt, labels, now_ms, oidc, runs};
+use crate::webhook::{Outcome, QueuedJob, Status};
+use crate::{DB, changes, github, int, jwt, labels, now_ms, oidc, polar, runs, usage};
 
 /// Variable with the App's client id.
 const APP_ID: &str = "GITHUB_APP_ID";
+/// Secret with Polar's organization access token.
+const POLAR_ACCESS_TOKEN: &str = "POLAR_ACCESS_TOKEN";
+/// Variable that replaces Polar's API URL, such as Polar's sandbox.
+const POLAR_API_URL: &str = "POLAR_API_URL";
 /// Variable that replaces the GitHub API URL, for development.
 const GITHUB_API_URL: &str = "GITHUB_API_URL";
 
@@ -102,6 +108,13 @@ const REDELIVERY_MEMORY: u64 = 4 * 24 * 60 * 60 * 1000;
 /// How long a cache upload nobody finished keeps its row: the longest a
 /// runner instance runs, and then some.
 const CACHE_UPLOAD_MEMORY: u64 = 24 * 60 * 60 * 1000;
+/// How long job minutes are kept once Polar has them or never needed
+/// them: past a year, so last year's month can be compared.
+const USAGE_MEMORY: u64 = 400 * 24 * 60 * 60 * 1000;
+/// How far back the meter step looks for completed jobs whose minutes
+/// nothing recorded: a day, longer than GitHub retries a webhook and the
+/// sync takes to notice a job.
+const SWEEP_WINDOW: u64 = 24 * 60 * 60 * 1000;
 /// How long a job or run recorded without `expires_at` is kept: the
 /// default `retention_days`. Only a Worker from before migration 0019,
 /// still running while it applies, records rows without one, and it
@@ -179,6 +192,8 @@ struct Summary {
     sessions_deleted: u32,
     /// Jobs past the retention deleted.
     jobs_deleted: u32,
+    /// Jobs whose minutes Polar took.
+    metered: u32,
     /// Runs left without jobs, deleted.
     runs_deleted: u32,
     /// The database's size in bytes after the retention deletes, as D1
@@ -212,6 +227,7 @@ impl Summary {
         self.unconnected += other.unconnected;
         self.sessions_deleted += other.sessions_deleted;
         self.jobs_deleted += other.jobs_deleted;
+        self.metered += other.metered;
         self.runs_deleted += other.runs_deleted;
         self.db_bytes = other.db_bytes.or(self.db_bytes);
         self.errors += other.errors;
@@ -271,13 +287,14 @@ pub async fn run(env: Env) {
         more: Cell::new(false),
     };
 
-    let steps: [(&str, Fallible<Summary>); 7] = [
+    let steps: [(&str, Fallible<Summary>); 8] = [
         ("redeliver", pass.redeliver().await),
         ("sync", pass.sync().await),
         ("details", pass.details().await),
         ("tenants", pass.tenants().await),
         ("catalog", pass.catalog().await),
         ("unconnected", pass.unconnected().await),
+        ("meter", pass.meter().await),
         ("retention", pass.retention().await),
     ];
     for (step, result) in steps {
@@ -491,6 +508,12 @@ const DELETE_OFFERINGS: &str = "DELETE FROM unavailable_offerings WHERE until < 
 /// Deletes up to `?2` cache uploads started before `?1`.
 const DELETE_UPLOADS: &str = "DELETE FROM cache_uploads WHERE id IN \
      (SELECT id FROM cache_uploads WHERE created_at < ?1 LIMIT ?2)";
+
+/// Deletes up to `?2` job minutes that completed before `?1` and that
+/// Polar has, or never needed.
+const DELETE_USAGE: &str = "DELETE FROM usage_events WHERE job_id IN \
+     (SELECT job_id FROM usage_events WHERE ended_at < ?1 \
+       AND (billed = 0 OR sent_at IS NOT NULL) LIMIT ?2)";
 
 /// The budget left once a step that found `before` and left `left`
 /// gets back what it reserved beyond the `sent` requests it made.
@@ -802,6 +825,20 @@ impl Pass<'_> {
         let closed = changes(&result) == 1 && next == Status::Completed;
         if closed {
             console_log!("reconcile: job {} completed on GitHub", job.id);
+            if let Some(sync::Seen {
+                outcome:
+                    Outcome {
+                        started_at: Some(started),
+                        completed_at: Some(completed),
+                        ..
+                    },
+                ..
+            }) = seen
+            {
+                usage::record(&self.db, job.id, *started, *completed, self.now)
+                    .await
+                    .map_err(text)?;
+            }
         }
         Ok(closed)
     }
@@ -1588,14 +1625,66 @@ impl Pass<'_> {
         Ok(done)
     }
 
-    /// Step 6: deletes expired sessions, jobs past the retention,
+    /// Step 6: records the minutes of jobs that completed in the last
+    /// [`SWEEP_WINDOW`] with none recorded, then sends the minutes Polar
+    /// has not taken yet, oldest first,
+    /// one batch a pass. Without Polar's token nothing is sent and the
+    /// events wait.
+    async fn meter(&self) -> Fallible<Summary> {
+        let swept = usage::sweep(
+            &self.db,
+            self.now.saturating_sub(SWEEP_WINDOW),
+            DELETE_BATCH,
+            self.now,
+        )
+        .await
+        .map_err(text)?;
+        if swept > 0 {
+            console_log!("reconcile: recorded the minutes of {swept} jobs no webhook recorded");
+        }
+        let Some(token) = get(self.env, POLAR_ACCESS_TOKEN) else {
+            return Ok(Summary::default());
+        };
+        let batch = u32::try_from(polar::INGEST_BATCH).unwrap_or(u32::MAX);
+        let unsent = usage::unsent(&self.db, batch).await.map_err(text)?;
+        if unsent.is_empty() || !self.spend(1) {
+            return Ok(Summary::default());
+        }
+        let api = get(self.env, POLAR_API_URL)
+            .unwrap_or_else(|| polar::API.to_owned())
+            .trim_end_matches('/')
+            .to_owned();
+        let events: Vec<polar::Minutes<'_>> = unsent
+            .iter()
+            .map(|event| polar::Minutes {
+                job_id: event.job_id,
+                tenant: &event.tenant_id,
+                minutes: event.minutes,
+                at: time::format(event.ended_at),
+            })
+            .collect();
+        polar::ingested(&send(&polar::ingest(&api, &token, &events)).await?)?;
+        let jobs: Vec<u64> = unsent.iter().map(|event| event.job_id).collect();
+        usage::sent(&self.db, &jobs, self.now).await.map_err(text)?;
+        if unsent.len() == polar::INGEST_BATCH {
+            self.more.set(true);
+        }
+        Ok(Summary {
+            metered: u32::try_from(jobs.len()).unwrap_or(u32::MAX),
+            ..Summary::default()
+        })
+    }
+
+    /// Step 7: deletes expired sessions, jobs past the retention,
     /// redeliveries GitHub no longer lists, lapsed unavailable offerings
-    /// and cache uploads nobody finished, whose parts S3's lifecycle
-    /// rule removes after a day.
+    /// cache uploads nobody finished, whose parts S3's lifecycle rule
+    /// removes after a day, and job minutes older than
+    /// [`USAGE_MEMORY`] that Polar has or never needed.
     async fn retention(&self) -> Fallible<Summary> {
         let now = int(self.now).map_err(text)?;
         let redeliveries_before = int(self.now.saturating_sub(REDELIVERY_MEMORY)).map_err(text)?;
         let uploads_before = int(self.now.saturating_sub(CACHE_UPLOAD_MEMORY)).map_err(text)?;
+        let usage_before = int(self.now.saturating_sub(USAGE_MEMORY)).map_err(text)?;
         let unset = int(UNSET_RETENTION).map_err(text)?;
         let results = self
             .db
@@ -1635,6 +1724,10 @@ impl Pass<'_> {
                     .prepare(DELETE_RUNS)
                     .bind(&[now, DELETE_BATCH.into()])
                     .map_err(text)?,
+                self.db
+                    .prepare(DELETE_USAGE)
+                    .bind(&[usage_before, DELETE_BATCH.into()])
+                    .map_err(text)?,
             ])
             .await
             .map_err(text)?;
@@ -1643,7 +1736,7 @@ impl Pass<'_> {
                 u32::try_from(changes(result)).unwrap_or(u32::MAX)
             })
         };
-        if [0, 1, 2, 3, 4, 6, 7]
+        if [0, 1, 2, 3, 4, 6, 7, 8]
             .into_iter()
             .any(|at| deleted(at) == DELETE_BATCH)
         {
@@ -2428,6 +2521,11 @@ mod tests {
                 "BACKFILL_RUNS",
                 db.plan(BACKFILL_RUNS, &params![UNSET_RETENTION, DELETE_BATCH]),
                 &["runs_expiry (expires_at=?)"][..],
+            ),
+            (
+                "DELETE_USAGE",
+                db.plan(DELETE_USAGE, &params![NOW, DELETE_BATCH]),
+                &["usage_events_done"][..],
             ),
         ];
         for (name, plan, indexes) in plans {

@@ -78,11 +78,9 @@ fn authorize_query() -> String {
 
 /// The setup steps a tenant has done.
 #[derive(Debug, Serialize)]
-#[allow(clippy::struct_excessive_bools)] // One per step, as the app shows them.
 #[serde(rename_all = "camelCase")]
 struct Steps {
     app: bool,
-    billing: bool,
     aws: bool,
 }
 
@@ -190,7 +188,6 @@ async fn view(ctx: &Ctx<'_>, row: TenantRow) -> worker::Result<TenantView> {
         install_url: install_url(ctx),
         steps: Steps {
             app: row.installation_id.is_some(),
-            billing: billing.licensed,
             aws: aws.is_some(),
         },
         id: row.id,

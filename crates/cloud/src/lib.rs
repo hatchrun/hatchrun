@@ -58,6 +58,7 @@ pub mod tenant;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod testdb;
 mod tokens;
+pub mod usage;
 mod webcrypto;
 pub mod webhook;
 
@@ -321,6 +322,11 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
                 ])?
                 .run()
                 .await?;
+            if status == webhook::Status::Completed
+                && let (Some(started), Some(completed)) = (outcome.started_at, outcome.completed_at)
+            {
+                usage::record(&db, id, started, completed, now_ms()).await?;
+            }
             Ok(Response::empty()?.with_status(204))
         }
         Event::Uninstalled { installation_id } => {

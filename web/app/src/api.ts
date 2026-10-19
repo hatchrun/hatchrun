@@ -65,15 +65,31 @@ export interface Stack {
 
 export interface Billing {
   beta: boolean;
+  /** In the beta or paying, so there is nothing to set up. */
   licensed: boolean;
   subscription: null | {
     status: string;
     currentPeriodEnd: string | null;
     cancelAtPeriodEnd: boolean;
   };
+  usage: Usage;
 }
 
-/** One of the licence's Polar products, one per billing interval. */
+/** Job minutes this calendar month (UTC). */
+export interface Usage {
+  monthStart: string;
+  monthEnd: string;
+  minutes: number;
+  freeMinutes: number;
+  /** When the free minutes ran out this month. */
+  freeUsedUpAt: string | null;
+  /** When runners stop launching without a card. */
+  graceEndsAt: string | null;
+  /** Whether runners launch now. */
+  mayLaunch: boolean;
+}
+
+/** The metered Polar product. */
 export interface Plan {
   id: string;
   name: string;
@@ -82,6 +98,10 @@ export interface Plan {
   amount: number | null;
   currency: string | null;
   interval: string | null;
+  /** Price per minute in the smallest currency unit, a decimal string such as "0.1". */
+  unitAmount: string | null;
+  /** Most a billing period costs, in the smallest currency unit. */
+  capAmount: number | null;
 }
 
 export interface Plans {
@@ -91,7 +111,6 @@ export interface Plans {
 
 export interface Steps {
   app: boolean;
-  billing: boolean;
   aws: boolean;
 }
 

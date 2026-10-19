@@ -2,11 +2,15 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! An organization's licence: Polar checkout, the customer portal,
-//! Polar's webhooks, and the beta, which needs no payment.
+//! An organization's billing: its job minutes this month, Polar
+//! checkout, the customer portal, Polar's webhooks, and the beta, which
+//! needs no payment. See [`crate::usage`] for the free minutes and who
+//! may launch.
 //!
-//! - `GET /api/plan` describes the licence's Polar products.
-//! - `POST /api/tenants/<org>/checkout` opens a Polar checkout.
+//! - `GET /api/plan` describes the metered product and the free
+//!   minutes.
+//! - `POST /api/tenants/<org>/checkout` opens a Polar checkout, which
+//!   adds the card that pays per minute past the free ones.
 //! - `POST /api/tenants/<org>/portal` opens Polar's customer portal.
 //! - `POST /api/tenants/<org>/beta` with `{"code": ...}` redeems a beta
 //!   invite code.
@@ -20,7 +24,8 @@ use super::tenants::authorize;
 use super::{Answer, Ctx, Failure, get, json_error, need};
 use crate::fetch::send;
 use crate::polar::{self, Event, Signed};
-use crate::{int, now_ms, session};
+use crate::reconcile::time;
+use crate::{int, now_ms, session, usage};
 
 /// Variable that replaces Polar's API URL, such as Polar's sandbox.
 const POLAR_API_URL: &str = "POLAR_API_URL";
@@ -56,13 +61,32 @@ impl Polar {
     }
 }
 
-/// A tenant's licence, as the app shows it.
+/// A tenant's billing, as the app shows it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Billing {
     pub beta: bool,
+    /// In the beta or paying, so there is nothing to set up.
     pub licensed: bool,
     pub subscription: Option<SubscriptionView>,
+    pub usage: UsageView,
+}
+
+/// A tenant's job minutes this month.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UsageView {
+    /// The month's first and the next month's first instant, ISO 8601.
+    month_start: String,
+    month_end: String,
+    minutes: u64,
+    free_minutes: u32,
+    /// When it used up the free minutes this month, ISO 8601.
+    free_used_up_at: Option<String>,
+    /// When runners stop launching without a card, ISO 8601.
+    grace_ends_at: Option<String>,
+    /// Whether runners launch now.
+    pub may_launch: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,10 +124,25 @@ pub(crate) async fn billing(db: &D1Database, id: &str, beta: bool) -> Result<Bil
     let paid = subscription
         .as_ref()
         .is_some_and(|subscription| polar::LICENSED.contains(&subscription.status.as_str()));
+    let month = usage::month(db, id).await?;
+    let (start, end) = time::month(now_ms());
+    let unpaid = !beta && !paid;
     Ok(Billing {
         beta,
         licensed: beta || paid,
         subscription,
+        usage: UsageView {
+            month_start: time::format(start),
+            month_end: time::format(end),
+            minutes: month.minutes,
+            free_minutes: usage::FREE_MINUTES,
+            free_used_up_at: month.free_used_up_at.map(time::format),
+            grace_ends_at: month
+                .free_used_up_at
+                .filter(|_| unpaid)
+                .map(|at| time::format(at + usage::GRACE_MS)),
+            may_launch: month.may_launch,
+        },
     })
 }
 
@@ -155,7 +194,7 @@ pub(crate) async fn checkout(ctx: &Ctx<'_>, org: &str) -> Answer {
             format!("{} already has a licence", row.org_login),
         ));
     }
-    let page = format!("{}/o/{}", ctx.config.app_url, row.org_login);
+    let page = format!("{}/o/{}/settings", ctx.config.app_url, row.org_login);
     let url = polar::checkout_url(
         &send(&polar::checkout(
             &polar.api,
@@ -306,7 +345,14 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
             subscription.tenant
         );
     } else if polar::LICENSED.contains(&subscription.status.as_str()) {
+        usage::clear_grace(&db, &subscription.tenant).await?;
         crate::launch::recheck(&db, &subscription.tenant).await?;
+    } else if usage::start_grace(&db, &subscription.tenant, now_ms()).await? {
+        console_log!(
+            "tenant {}: subscription {} ended past the free minutes, grace period started",
+            subscription.tenant,
+            subscription.id
+        );
     }
     Ok(Response::empty()?.with_status(202))
 }
