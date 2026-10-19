@@ -345,6 +345,7 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
             subscription.tenant
         );
     } else if polar::LICENSED.contains(&subscription.status.as_str()) {
+        usage::clear_grace(&db, &subscription.tenant).await?;
         crate::launch::recheck(&db, &subscription.tenant).await?;
     } else if usage::start_grace(&db, &subscription.tenant, now_ms()).await? {
         console_log!(
