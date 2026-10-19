@@ -61,7 +61,7 @@ const CURRENT: &str = "NOT EXISTS (SELECT 1 FROM jobs AS later \
      AND later.run_attempt > j.run_attempt)";
 
 const RUN_COLUMNS: &str = "id, repository, workflow_name, head_branch, head_sha, attempt, \
-     queued_at, run_number, event, display_title, actor, path";
+     queued_at, ended_at, run_number, event, display_title, actor, path";
 
 const JOB_COLUMNS: &str = "id, run_id, name, run_attempt, label, status, conclusion, \
      launch_state, runner_name, instance_id, launch_error, launch_attempts, launch_retry, \
@@ -80,6 +80,8 @@ struct WorkflowRun {
     attempt: u64,
     /// When the newest attempt's first job was queued.
     queued_at: u64,
+    /// When its last current job ended, null while one has not.
+    ended_at: Option<u64>,
     /// The rest is null until the run's details are fetched.
     run_number: Option<u64>,
     event: Option<String>,
@@ -185,9 +187,11 @@ impl Group {
     }
 }
 
-/// The column the runs table sorts by. A run's duration and state are
-/// not here: both roll up from its jobs and change while it runs, so a
-/// page boundary in either moves under the reader.
+/// The column the runs table sorts by. A run's state is not here: it
+/// rolls up from its jobs and changes while it runs, so a page boundary
+/// in it moves under the reader. A run's time is kept on the run as
+/// `ended_at` (`migrations/0024_run_ended.sql`), and a live run sorts by
+/// when it was queued, which does not move.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Sort {
@@ -196,6 +200,9 @@ enum Sort {
     Started,
     /// By repository, then newest first within it.
     Repository,
+    /// By how long a finished run took, ties by id; then the runs still
+    /// going, oldest first, in either direction.
+    Took,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -227,19 +234,33 @@ struct Cursor {
     id: u64,
     /// Set when sorted by repository.
     repository: Option<String>,
+    /// When sorted by how long runs took, when the run ended; none for
+    /// a run still going.
+    ended_at: Option<u64>,
 }
 
-/// Reads `?before=<queued_at>:<id>[:<repository>]`. A repository name
-/// has no colon, but everything after the second is taken as it is.
-fn cursor(value: &str) -> Option<Cursor> {
+/// Reads `?before=<queued_at>:<id>`, and in `sort` order the third part
+/// it needs: `:<repository>` by repository, `:<ended_at>` by how long
+/// runs took, empty for a run still going. A repository name has no
+/// colon, but everything after the second is taken as it is.
+fn cursor(value: &str, sort: Sort) -> Option<Cursor> {
     let mut parts = value.splitn(3, ':');
     let queued_at = parts.next()?.parse().ok()?;
     let id = parts.next()?.parse().ok()?;
-    let repository = parts.next().map(str::to_owned);
+    let rest = parts.next();
+    let (repository, ended_at) = match sort {
+        Sort::Started => (None, None),
+        Sort::Repository => (Some(rest?.to_owned()), None),
+        Sort::Took => match rest? {
+            "" => (None, None),
+            at => (None, Some(at.parse().ok()?)),
+        },
+    };
     Some(Cursor {
         queued_at,
         id,
         repository,
+        ended_at,
     })
 }
 
@@ -286,9 +307,12 @@ const SEARCH: &str = "(repository LIKE ?6 ESCAPE '\\' \
        AND (s.name LIKE ?6 ESCAPE '\\' OR s.label LIKE ?6 ESCAPE '\\' \
          OR s.instance_id LIKE ?6 ESCAPE '\\')))";
 
-/// Where the page after the cursor `?2`, `?3` and, by repository, `?5`
-/// starts, and the order it is in. Within a repository runs stay newest
-/// first either way.
+/// Where the page after the cursor `?2`, `?3` and `?5` starts, and the
+/// order it is in. `?5` is the repository by repository and the end by
+/// how long runs took. Within a repository runs stay newest first
+/// either way. By how long runs took, the key is how long a finished
+/// run took and when a live run was queued, behind the finished ones;
+/// each side of the comparison is the expression its index holds.
 fn order(sort: Sort, dir: Direction) -> (&'static str, &'static str) {
     match (sort, dir) {
         // `?5` is null here; naming it keeps the parameter count.
@@ -308,6 +332,18 @@ fn order(sort: Sort, dir: Direction) -> (&'static str, &'static str) {
             "(repository COLLATE NOCASE < ?5 \
              OR (repository COLLATE NOCASE = ?5 AND (queued_at, id) < (?2, ?3)))",
             "repository COLLATE NOCASE DESC, queued_at DESC, id DESC",
+        ),
+        (Sort::Took, Direction::Asc) => (
+            "(ended_at IS NULL, COALESCE(ended_at - queued_at, queued_at), id) \
+             > (?5 IS NULL, COALESCE(?5 - ?2, ?2), ?3)",
+            "ended_at IS NULL, COALESCE(ended_at - queued_at, queued_at), id",
+        ),
+        (Sort::Took, Direction::Desc) => (
+            "(ended_at IS NULL, \
+             CASE WHEN ended_at IS NULL THEN queued_at ELSE queued_at - ended_at END, id) \
+             > (?5 IS NULL, CASE WHEN ?5 IS NULL THEN ?2 ELSE ?2 - ?5 END, ?3)",
+            "ended_at IS NULL, \
+             CASE WHEN ended_at IS NULL THEN queued_at ELSE queued_at - ended_at END, id",
         ),
     }
 }
@@ -481,20 +517,18 @@ pub(crate) async fn runs(ctx: &Ctx<'_>, org: &str, req: &Request) -> Answer {
     let page: Page = req.query().map_err(|_| {
         Failure::new(
             400,
-            "status is active, waiting or failed; sort is started or repository; dir is asc or desc.",
+            "status is active, waiting or failed; sort is started, repository or took; \
+             dir is asc or desc.",
         )
     })?;
     let before = match page.before.as_deref() {
-        Some(value) => Some(
-            cursor(value)
-                .filter(|c| page.sort != Sort::Repository || c.repository.is_some())
-                .ok_or_else(|| {
-                    Failure::new(
-                        400,
-                        "before is <queuedAt>:<id>, and <queuedAt>:<id>:<repository> by repository.",
-                    )
-                })?,
-        ),
+        Some(value) => Some(cursor(value, page.sort).ok_or_else(|| {
+            Failure::new(
+                400,
+                "before is <queuedAt>:<id>, <queuedAt>:<id>:<repository> by repository \
+                     and <queuedAt>:<id>:<endedAt> by took, with no endedAt for a live run.",
+            )
+        })?),
         None => None,
     };
     let q = page.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
@@ -515,11 +549,22 @@ pub(crate) async fn runs(ctx: &Ctx<'_>, org: &str, req: &Request) -> Answer {
                 .map_or(Ok(JsValue::NULL), |c| int(c.queued_at))?,
             before.as_ref().map_or(Ok(JsValue::NULL), |c| int(c.id))?,
             PAGE.into(),
-            before
-                .as_ref()
-                .and_then(|c| c.repository.as_deref())
-                .filter(|_| page.sort == Sort::Repository)
-                .map_or(JsValue::NULL, Into::into),
+            match (&before, page.sort) {
+                (
+                    Some(Cursor {
+                        repository: Some(repository),
+                        ..
+                    }),
+                    Sort::Repository,
+                ) => repository.as_str().into(),
+                (
+                    Some(Cursor {
+                        ended_at: Some(at), ..
+                    }),
+                    Sort::Took,
+                ) => int(*at)?,
+                _ => JsValue::NULL,
+            },
             q.map_or(JsValue::NULL, |q| contains(q).into()),
         ])?
         .all()
@@ -650,7 +695,7 @@ pub(crate) async fn settings(ctx: &Ctx<'_>, org: &str, body: Change) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testdb::{Db, params};
+    use crate::testdb::{Db, Param, params};
 
     #[test]
     fn status_names_a_group() {
@@ -671,8 +716,10 @@ mod tests {
         .unwrap();
         assert_eq!((page.sort, page.dir), (Sort::Repository, Direction::Asc));
         assert_eq!(page.q.as_deref(), Some("web"));
+        let page: Page = serde_json::from_value(serde_json::json!({"sort": "took"})).unwrap();
+        assert_eq!(page.sort, Sort::Took);
         for bad in [
-            serde_json::json!({"sort": "took"}),
+            serde_json::json!({"sort": "duration"}),
             serde_json::json!({"sort": "status"}),
             serde_json::json!({"dir": "up"}),
         ] {
@@ -701,19 +748,37 @@ mod tests {
     #[test]
     fn a_cursor_is_a_time_and_a_run() {
         assert_eq!(
-            cursor("1792140000000:18234567890"),
+            cursor("1792140000000:18234567890", Sort::Started),
             Some(Cursor {
                 queued_at: 1_792_140_000_000,
                 id: 18_234_567_890,
                 repository: None,
+                ended_at: None,
             })
         );
         assert_eq!(
-            cursor("1:2:acme/web").and_then(|c| c.repository),
+            cursor("1:2:acme/web", Sort::Repository).and_then(|c| c.repository),
             Some("acme/web".to_owned())
         );
-        assert_eq!(cursor("1792140000000"), None);
-        assert_eq!(cursor("x:1"), None);
+        assert_eq!(cursor("1:2", Sort::Repository), None);
+        assert_eq!(
+            cursor("1:2:3", Sort::Took).and_then(|c| c.ended_at),
+            Some(3)
+        );
+        // A run still going has no end.
+        assert_eq!(
+            cursor("1:2:", Sort::Took),
+            Some(Cursor {
+                queued_at: 1,
+                id: 2,
+                repository: None,
+                ended_at: None,
+            })
+        );
+        assert_eq!(cursor("1:2", Sort::Took), None);
+        assert_eq!(cursor("1:2:x", Sort::Took), None);
+        assert_eq!(cursor("1792140000000", Sort::Started), None);
+        assert_eq!(cursor("x:1", Sort::Started), None);
     }
 
     #[test]
@@ -893,40 +958,46 @@ mod tests {
         before: Option<(u64, u64)>,
         limit: u32,
     ) -> Vec<WorkflowRun> {
+        let before = before.map(|(queued_at, id)| Cursor {
+            queued_at,
+            id,
+            repository: None,
+            ended_at: None,
+        });
         sorted(
             db,
             group,
             (Sort::Started, Direction::Desc),
             None,
-            before.map(|(at, id)| (at, id, "")),
+            before.as_ref(),
             limit,
         )
     }
 
     /// A page in any order, of the runs matching `q` when set, after
-    /// the run `before` as `(queued_at, id, repository)`.
+    /// the run `before`, bound as `runs` binds it.
     fn sorted(
         db: &Db,
         group: Option<Group>,
         (sort, dir): (Sort, Direction),
         q: Option<&str>,
-        before: Option<(u64, u64, &str)>,
+        before: Option<&Cursor>,
         limit: u32,
     ) -> Vec<WorkflowRun> {
-        let repository = before
-            .filter(|_| sort == Sort::Repository)
-            .map(|(_, _, repository)| repository);
-        db.all(
-            &list_query(group, sort, dir),
-            &params![
-                INSTALLATION,
-                before.map(|(at, _, _)| at),
-                before.map(|(_, id, _)| id),
-                limit,
-                repository,
-                q.map(contains)
-            ],
-        )
+        let fifth = match (before, sort) {
+            (Some(c), Sort::Repository) => Param::from(c.repository.as_deref()),
+            (Some(c), Sort::Took) => Param::from(c.ended_at),
+            _ => Param::from(None::<u64>),
+        };
+        let mut values = params![
+            INSTALLATION,
+            before.map(|c| c.queued_at),
+            before.map(|c| c.id),
+            limit
+        ];
+        values.push(fifth);
+        values.push(Param::from(q.map(contains)));
+        db.all(&list_query(group, sort, dir), &values)
     }
 
     fn jobs_of(db: &Db, runs: &[u64]) -> Vec<Job> {
@@ -1110,6 +1181,8 @@ mod tests {
             (Sort::Started, Direction::Asc, "runs_recent"),
             (Sort::Repository, Direction::Asc, "runs_repository_az"),
             (Sort::Repository, Direction::Desc, "runs_repository "),
+            (Sort::Took, Direction::Asc, "runs_took "),
+            (Sort::Took, Direction::Desc, "runs_took_desc"),
         ] {
             let got = plan(&list_query(None, sort, dir));
             assert!(got.contains(index), "{sort:?} {dir:?}: {got}");
@@ -1120,7 +1193,9 @@ mod tests {
 
     /// Twelve runs over three repositories, some at the same time, one
     /// of them with a job on an instance and a branch; and a run of
-    /// another installation that matches every search.
+    /// another installation that matches every search. The first three
+    /// are running; the rest took 0 or 2 minutes, by GitHub's `completed_at`
+    /// where even and by when the job last changed where odd.
     fn many() -> Db {
         let db = Db::new();
         let repos = ["acme/web", "acme/API", "acme/infra"];
@@ -1141,8 +1216,8 @@ mod tests {
             );
             db.run(
                 "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
-                 launch_state, instance_id, queued_at, updated_at, name) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
+                 launch_state, instance_id, queued_at, updated_at, name, completed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9 + ?11, ?10, ?12)",
                 &params![
                     id * 10,
                     INSTALLATION,
@@ -1157,7 +1232,13 @@ mod tests {
                     "launched",
                     (i == 5).then_some("i-0abc5"),
                     NOW - (i / 2) * 60_000,
-                    if i == 9 { "Deploy (prod)" } else { "build" }
+                    if i == 9 { "Deploy (prod)" } else { "build" },
+                    if i % 2 == 0 {
+                        1_000
+                    } else {
+                        ((i + 1) % 4) * 60_000
+                    },
+                    (i >= 3 && i % 2 == 0).then(|| NOW - (i / 2) * 60_000 + (i % 4) * 60_000)
                 ],
             );
         }
@@ -1175,14 +1256,21 @@ mod tests {
         let mut seen = Vec::new();
         let mut before = None;
         loop {
-            let cursor = before
-                .as_ref()
-                .map(|(at, id, repo): &(u64, u64, String)| (*at, *id, repo.as_str()));
-            let got = sorted(db, group, order, q, cursor, 2);
+            let got = sorted(db, group, order, q, before.as_ref(), 2);
             let Some(last) = got.last() else {
                 return seen;
             };
-            before = Some((last.queued_at, last.id, last.repository.clone()));
+            // As the app writes it, read back as the Worker reads it.
+            let third = match order.0 {
+                Sort::Started => String::new(),
+                Sort::Repository => format!(":{}", last.repository),
+                Sort::Took => format!(
+                    ":{}",
+                    last.ended_at.map_or(String::new(), |at| at.to_string())
+                ),
+            };
+            before = cursor(&format!("{}:{}{third}", last.queued_at, last.id), order.0);
+            assert!(before.is_some(), "{order:?} after {}", last.id);
             seen.extend(ids(&got));
         }
     }
@@ -1230,9 +1318,122 @@ mod tests {
             walk(&db, None, (Sort::Repository, Direction::Desc), None),
             list(&za)
         );
+        // Finished by how long they took, ties by id; then the runs
+        // still going, oldest first, either way. 1000 and 1001 were
+        // queued at the same time.
+        let took = |id: u64| {
+            let run = all.iter().find(|r| r.id == id).unwrap();
+            run.ended_at.map(|at| at - run.queued_at)
+        };
+        assert_eq!(
+            [1000, 1003, 1004, 1005, 1006].map(took),
+            [None, Some(0), Some(0), Some(120_000), Some(120_000)]
+        );
+        assert_eq!(
+            walk(&db, None, (Sort::Took, Direction::Asc), None),
+            [
+                1003, 1004, 1007, 1008, 1011, 1005, 1006, 1009, 1010, 1002, 1000, 1001
+            ]
+        );
+        assert_eq!(
+            walk(&db, None, (Sort::Took, Direction::Desc), None),
+            [
+                1005, 1006, 1009, 1010, 1003, 1004, 1007, 1008, 1011, 1002, 1000, 1001
+            ]
+        );
         // API sorts with the lower case names, before infra and web.
         assert_eq!(az[0].repository, "acme/API");
         assert_eq!(za[0].repository, "acme/web");
+    }
+
+    /// Through the webhook's own statements: a run of two jobs, then a
+    /// re-run of one of them.
+    #[test]
+    fn a_run_ends_when_its_current_jobs_do() {
+        let db = Db::new();
+        let ended = || -> Option<u64> {
+            let run: WorkflowRun = db
+                .first(&run_query(), &params![100u64, INSTALLATION])
+                .unwrap();
+            run.ended_at
+        };
+        let t0 = NOW - 600_000;
+        let queue = |id: u64, name: &str, attempt: u64, at: u64| {
+            db.run(
+                crate::QUEUED,
+                &params![
+                    id,
+                    INSTALLATION,
+                    "acme/web",
+                    100u64,
+                    "hatchrun",
+                    at,
+                    name,
+                    attempt
+                ],
+            );
+        };
+        let complete = |id: u64, at: u64, completed_at: Option<u64>| {
+            db.run(
+                crate::PROGRESS,
+                &params![
+                    "completed",
+                    at,
+                    id,
+                    None::<&str>,
+                    "success",
+                    None::<u64>,
+                    completed_at
+                ],
+            );
+        };
+        db.run(
+            crate::RUN,
+            &params![
+                100u64,
+                INSTALLATION,
+                "acme/web",
+                "CI",
+                "main",
+                "ab",
+                1u64,
+                t0
+            ],
+        );
+        queue(1, "build", 1, t0);
+        queue(2, "test", 1, t0);
+        assert_eq!(ended(), None);
+        complete(1, t0 + 5_000, Some(t0 + 4_000));
+        assert_eq!(ended(), None);
+        // Launch bookkeeping on a live job leaves the run alone.
+        db.run(
+            "UPDATE jobs SET launch_state = 'launching', updated_at = ?1 WHERE id = 2",
+            &params![t0 + 6_000],
+        );
+        assert_eq!(ended(), None);
+        // No completed_at from GitHub: when the job last changed.
+        complete(2, t0 + 9_000, None);
+        assert_eq!(ended(), Some(t0 + 9_000));
+
+        // The re-run of test starts the run again, and its end is the
+        // new attempt's, past the build that was not run again.
+        let t1 = t0 + 100_000;
+        db.run(crate::RUN_ATTEMPT, &params![100u64, 2u64, t1, "cd", "main"]);
+        queue(3, "test", 2, t1);
+        assert_eq!(ended(), None);
+        complete(3, t1 + 8_000, Some(t1 + 7_000));
+        assert_eq!(ended(), Some(t1 + 7_000));
+        // A completed job that changes again keeps GitHub's time.
+        db.run(
+            "UPDATE jobs SET updated_at = ?1 WHERE id = 3",
+            &params![t1 + 50_000],
+        );
+        assert_eq!(ended(), Some(t1 + 7_000));
+
+        // With the re-run's job gone, attempt 1's test is current again,
+        // and no end falls before the run was queued.
+        db.run("DELETE FROM jobs WHERE id = 3", &[]);
+        assert_eq!(ended(), Some(t1));
     }
 
     #[test]
@@ -1243,6 +1444,8 @@ mod tests {
             (Sort::Started, Direction::Asc),
             (Sort::Repository, Direction::Asc),
             (Sort::Repository, Direction::Desc),
+            (Sort::Took, Direction::Asc),
+            (Sort::Took, Direction::Desc),
         ];
         let set = |mut ids: Vec<u64>| {
             ids.sort_unstable();
