@@ -42,7 +42,7 @@ const FROM: &str = "alerts@notify.hatchrun.io";
 const MINUTE: u64 = 60 * 1000;
 const DAY: u64 = 24 * 60 * MINUTE;
 /// Bytes in a gigabyte, as D1's limits count them.
-const GB: usize = 1_000_000_000;
+const GB: u64 = 1_000_000_000;
 
 /// Passes the `reconciler` row remembers.
 pub(crate) const HISTORY: usize = 10;
@@ -88,7 +88,7 @@ pub(crate) enum Key {
 
 /// The size alerts, with the size in GB each fires at and what it
 /// means.
-const SIZES: [(Key, usize, &str); 3] = [
+const SIZES: [(Key, u64, &str); 3] = [
     (
         Key::Size4,
         4,
@@ -453,7 +453,7 @@ pub(crate) struct Facts {
     /// The last passes, newest last, this one among them.
     pub history: Option<Vec<PassRecord>>,
     /// The database's size after this pass's retention deletes.
-    pub db_bytes: Option<usize>,
+    pub db_bytes: Option<u64>,
     pub waiting: Option<Vec<Waiting>>,
     pub failed: Option<Vec<FailedLaunch>>,
     pub rate_limits: Option<Vec<LowRateLimit>>,
@@ -798,7 +798,7 @@ pub(crate) async fn after_pass(
     db: &D1Database,
     now: u64,
     history: Option<Vec<PassRecord>>,
-    db_bytes: Option<usize>,
+    db_bytes: Option<u64>,
 ) {
     let facts = Facts {
         history,
@@ -1133,6 +1133,14 @@ mod tests {
             Seen::Firing(detail) if detail.contains("installation 42: rate limited")
                 && detail.contains("installation 43: 1200 requests left")
         ));
+
+        let full = check(&Facts {
+            db_bytes: Some(8_500_000_000),
+            ..Facts::default()
+        });
+        assert!(
+            matches!(found(&full, Key::Size8), Seen::Firing(detail) if detail.contains("8.5 GB"))
+        );
 
         let clear = check(&Facts {
             db_bytes: Some(3_999_999_999),

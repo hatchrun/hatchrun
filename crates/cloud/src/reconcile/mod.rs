@@ -203,7 +203,7 @@ struct Summary {
     runs_deleted: u32,
     /// The database's size in bytes after the retention deletes, as D1
     /// reports it; None when the step failed.
-    db_bytes: Option<usize>,
+    db_bytes: Option<u64>,
     /// Steps or tenants that failed; the log has each.
     errors: u32,
     /// Whether the pass stopped at a limit with work left.
@@ -1738,9 +1738,9 @@ impl Pass<'_> {
         let unset = int(UNSET_RETENTION).map_err(text)?;
         let failed_before = int(self.now.saturating_sub(FAILED_LAUNCH_MEMORY)).map_err(text)?;
         let limits_before = int(self.now.saturating_sub(RATE_LIMIT_MEMORY)).map_err(text)?;
-        let results = self
-            .db
-            .batch(vec![
+        let results = batch_meta(
+            &self.db,
+            vec![
                 // Before the deletes, so a row without an expiry that
                 // is past it goes in the same pass.
                 self.db
@@ -1788,12 +1788,12 @@ impl Pass<'_> {
                     .prepare(DELETE_USAGE)
                     .bind(&[usage_before, DELETE_BATCH.into()])
                     .map_err(text)?,
-            ])
-            .await
-            .map_err(text)?;
+            ],
+        )
+        .await?;
         let deleted = |at: usize| {
-            results.get(at).map_or(0, |result| {
-                u32::try_from(changes(result)).unwrap_or(u32::MAX)
+            results.get(at).map_or(0, |meta| {
+                u32::try_from(meta.changes.unwrap_or(0)).unwrap_or(u32::MAX)
             })
         };
         if [0, 1, 2, 3, 4, 6, 7, 9, 10]
@@ -1806,7 +1806,7 @@ impl Pass<'_> {
             sessions_deleted: deleted(2),
             jobs_deleted: deleted(3),
             runs_deleted: deleted(9),
-            db_bytes: db_bytes(&results),
+            db_bytes: results.iter().rev().find_map(|meta| meta.size_after),
             ..Summary::default()
         })
     }
@@ -1901,12 +1901,55 @@ fn queued_job(row: LaunchRow) -> Option<QueuedJob> {
     }
 }
 
-/// The database's size after the last statement of a batch that says.
-fn db_bytes(results: &[worker::D1Result]) -> Option<usize> {
-    results
+/// The meta D1 hands back for one statement of a batch, as far as the
+/// retention reads it. workers-rs reads `size_after` into a `usize`,
+/// 32 bits on wasm32, which fails once the database passes 4 GiB, so
+/// the batch is sent and its meta read here.
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+struct Meta {
+    changes: Option<u64>,
+    size_after: Option<u64>,
+}
+
+/// Runs `statements` as one batch, as [`D1Database::batch`], and
+/// returns each statement's meta.
+async fn batch_meta(db: &D1Database, statements: Vec<D1PreparedStatement>) -> Fallible<Vec<Meta>> {
+    use wasm_bindgen::JsCast;
+
+    let error = |err: JsValue| format!("D1 batch: {err:?}");
+    let array = js_sys::Array::new();
+    for statement in &statements {
+        array.push(statement.inner());
+    }
+    let batch: js_sys::Function = js_sys::Reflect::get(db.as_ref(), &"batch".into())
+        .map_err(error)?
+        .dyn_into()
+        .map_err(error)?;
+    let promise: js_sys::Promise = batch
+        .call1(db.as_ref(), &array)
+        .map_err(error)?
+        .dyn_into()
+        .map_err(error)?;
+    let results = wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(error)?;
+    Ok(js_sys::Array::from(&results)
         .iter()
-        .rev()
-        .find_map(|result| result.meta().ok().flatten()?.size_after)
+        .map(|result| {
+            js_sys::Reflect::get(&result, &"meta".into())
+                .ok()
+                .and_then(|meta| js_sys::JSON::stringify(&meta).ok())
+                .and_then(|text| text.as_string())
+                .map(|text| meta(&text))
+                .unwrap_or_default()
+        })
+        .collect())
+}
+
+/// A statement's meta from its JSON; one that does not read says
+/// nothing.
+fn meta(text: &str) -> Meta {
+    serde_json::from_str(text).unwrap_or_default()
 }
 
 fn status(value: &str) -> Option<Status> {
@@ -1981,6 +2024,19 @@ mod tests {
         // A refused token took all three of one call.
         assert_eq!(settled(494, 500, 4), 496);
         assert_eq!(settled(500, 500, 0), 500);
+    }
+
+    #[test]
+    fn the_database_size_reads_past_four_gigabytes() {
+        let read = meta(r#"{"changes":3,"size_after":5400000000,"duration":0.5}"#);
+        assert_eq!(
+            read,
+            Meta {
+                changes: Some(3),
+                size_after: Some(5_400_000_000),
+            }
+        );
+        assert_eq!(meta("null"), Meta::default());
     }
 
     #[test]
