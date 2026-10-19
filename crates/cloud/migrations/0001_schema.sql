@@ -390,8 +390,14 @@ CREATE INDEX runs_took_desc ON runs (installation_id, (ended_at IS NOT NULL),
   (CASE WHEN ended_at IS NULL THEN queued_at ELSE queued_at - ended_at END), id);
 
 -- Works out a run's ended_at again from its current jobs, the newest
--- attempt of each job name.
-CREATE FUNCTION runs_end(run bigint) RETURNS void LANGUAGE sql AS $$
+-- attempt of each job name. Writes to two jobs of a run can run at
+-- once, as when matrix jobs finish together. The run's row is locked
+-- first, in a statement of its own, so the UPDATE that follows reads
+-- the jobs as the other writer committed them; in one statement it
+-- would read them as they were before it waited for the lock.
+CREATE FUNCTION runs_end(run bigint) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM 1 FROM runs WHERE id = run FOR UPDATE;
   UPDATE runs SET ended_at = (
     SELECT CASE WHEN bool_or(j.status <> 'completed') THEN NULL
       ELSE GREATEST(runs.queued_at,
@@ -402,6 +408,7 @@ CREATE FUNCTION runs_end(run bigint) RETURNS void LANGUAGE sql AS $$
       WHERE later.run_id = j.run_id AND later.name = j.name
       AND later.run_attempt > j.run_attempt)
   ) WHERE runs.id = run;
+END;
 $$;
 
 -- Every write to a job that can change its run's end. Launch
