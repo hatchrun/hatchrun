@@ -31,7 +31,7 @@ use worker::Response;
 
 use super::tenants::authorize;
 use super::{Answer, Ctx, Failure};
-use crate::db::params;
+use crate::jobs;
 
 /// Analytics SQL binding in `wrangler.toml`.
 const BINDING: &str = "ANALYTICS_SQL";
@@ -129,16 +129,6 @@ struct Job {
     run_number: Option<u64>,
 }
 
-/// One job of an installation and its run, from the database. Binds the job id
-/// and the installation. A job from before runs were recorded has no
-/// run until the backfill gives it one.
-const JOB: &str = "SELECT jobs.id, jobs.repository, jobs.run_id, jobs.name, jobs.run_attempt, \
-    jobs.label, jobs.status, jobs.conclusion, jobs.runner_name, jobs.instance_id, \
-    jobs.queued_at, jobs.started_at, jobs.completed_at, jobs.updated_at, \
-    runs.workflow_name, runs.run_number \
-    FROM jobs LEFT JOIN runs ON runs.id = jobs.run_id \
-    WHERE jobs.id = $1 AND jobs.installation_id = $2";
-
 /// Most jobs of a run [`resources`] covers, the largest matrix GitHub
 /// allows and then some.
 const MAX_RESOURCES: usize = 300;
@@ -218,9 +208,7 @@ pub(crate) async fn job(ctx: &Ctx<'_>, org: &str, id: &str) -> Answer {
     let (Some(installation), Ok(id)) = (row.installation_id, id.parse::<u64>()) else {
         return Err(missing());
     };
-    let job: Job = ctx
-        .db
-        .first(JOB, &params![id, installation])
+    let job: Job = jobs::job_with_run(ctx.db, id, installation)
         .await?
         .ok_or_else(missing)?;
 
@@ -348,7 +336,9 @@ mod tests {
              VALUES (9, 3, 'acme/app', 'Smoke test', 'ab', 1, $1, 412, $1, $1)",
             &params![queued_at],
         );
-        let job: Job = db.first(JOB, &params![7u64, 3u64]).unwrap();
+        let job: Job = db
+            .first(crate::jobs::JOB_WITH_RUN, &params![7u64, 3u64])
+            .unwrap();
         assert_eq!(job.id, 7);
         assert_eq!(job.run_id, 9);
         assert_eq!(job.workflow_name.as_deref(), Some("Smoke test"));
@@ -356,14 +346,19 @@ mod tests {
         assert_eq!(job.queued_at, queued_at);
         assert_eq!(job.updated_at, queued_at + 60_000);
         assert_eq!(job.instance_id.as_deref(), Some("i-0123456789abcdef0"));
-        assert!(db.first::<Job>(JOB, &params![7u64, 4u64]).is_none());
+        assert!(
+            db.first::<Job>(crate::jobs::JOB_WITH_RUN, &params![7u64, 4u64])
+                .is_none()
+        );
         // A job from before runs were recorded, until the backfill.
         db.run(
             "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
              queued_at, updated_at) VALUES (8, 3, 'acme/app', 99, 'hatchrun', 'completed', 1, 2)",
             &[],
         );
-        let old: Job = db.first(JOB, &params![8u64, 3u64]).unwrap();
+        let old: Job = db
+            .first(crate::jobs::JOB_WITH_RUN, &params![8u64, 3u64])
+            .unwrap();
         assert_eq!((old.workflow_name, old.run_number), (None, None));
     }
 

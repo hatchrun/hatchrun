@@ -288,7 +288,7 @@ mod tests {
                 return std::future::ready(Err("database unavailable".to_owned()));
             }
             let claimed = self.db.run(
-                launch::CLAIM,
+                crate::jobs::CLAIM,
                 &params![
                     job.id,
                     format!("hatchrun-{}-00", job.id),

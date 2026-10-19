@@ -44,6 +44,7 @@ pub mod images;
 pub mod install;
 pub mod instance;
 pub mod instance_types;
+mod jobs;
 pub mod jwt;
 pub mod labels;
 mod launch;
@@ -189,44 +190,6 @@ async fn assets(req: Request, env: &Env) -> Result<Response> {
         .body(body))
 }
 
-/// Records a run the first time one of its jobs is queued. It expires
-/// with its jobs, `retention_days` after it was queued (see
-/// [`QUEUED`]).
-const RUN: &str = "INSERT INTO runs (id, installation_id, repository, workflow_name, \
-     head_branch, head_sha, attempt, queued_at, created_at, updated_at, expires_at) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $8, $8 + COALESCE((SELECT retention_days \
-       FROM tenants WHERE installation_id = $2), 30) * 86400000) \
-     ON CONFLICT (id) DO NOTHING";
-
-/// Moves a run on to attempt `$2` when its first job is queued. A late
-/// delivery from an earlier attempt changes nothing. The run expires
-/// from the new attempt, as its jobs do. The branch may have moved since
-/// the last attempt, so its cache scopes are worked out again.
-const RUN_ATTEMPT: &str = "UPDATE runs SET attempt = $2, queued_at = $3, head_sha = $4, \
-     head_branch = $5, updated_at = $3, expires_at = $3 + COALESCE((SELECT retention_days \
-       FROM tenants WHERE tenants.installation_id = runs.installation_id), 30) * 86400000, \
-     cache_write = NULL, cache_reads = NULL \
-     WHERE id = $1 AND attempt < $2";
-
-/// Records a queued job once, however often GitHub delivers it. It
-/// expires after the `retention_days` of the installation's tenant, or
-/// that column's default of 30 days for an installation without one.
-/// The lookup rides along with the insert, so the webhook makes no
-/// extra round trip for it.
-const QUEUED: &str = "INSERT INTO jobs \
-     (id, installation_id, repository, run_id, label, status, queued_at, updated_at, \
-     name, run_attempt, expires_at) \
-     VALUES ($1, $2, $3, $4, $5, 'queued', $6, $6, $7, $8, $6 + COALESCE((SELECT retention_days \
-       FROM tenants WHERE installation_id = $2), 30) * 86400000) \
-     ON CONFLICT (id) DO NOTHING";
-
-/// Moves a job on unless it completed, with GitHub's conclusion and
-/// times when the event has them.
-const PROGRESS: &str = "UPDATE jobs SET status = $1, updated_at = $2, \
-     ran_on = COALESCE($4, ran_on), conclusion = COALESCE($5, conclusion), \
-     started_at = COALESCE($6, started_at), completed_at = COALESCE($7, completed_at) \
-     WHERE id = $3 AND status <> 'completed'";
-
 /// Detaches the tenant from an uninstalled installation.
 const UNINSTALLED: &str =
     "UPDATE tenants SET installation_id = NULL, updated_at = $2 WHERE installation_id = $1";
@@ -246,47 +209,7 @@ async fn record_queued(
     placement: &Placement,
     now: u64,
 ) -> Result<()> {
-    let recorded = db
-        .batch(&[
-            (
-                RUN,
-                params![
-                    job.run_id,
-                    job.installation_id,
-                    &job.repository,
-                    &placement.workflow_name,
-                    &placement.head_branch,
-                    &placement.head_sha,
-                    placement.attempt,
-                    now,
-                ],
-            ),
-            (
-                RUN_ATTEMPT,
-                params![
-                    job.run_id,
-                    placement.attempt,
-                    now,
-                    &placement.head_sha,
-                    &placement.head_branch,
-                ],
-            ),
-            (
-                QUEUED,
-                params![
-                    job.id,
-                    job.installation_id,
-                    &job.repository,
-                    job.run_id,
-                    &job.label,
-                    now,
-                    &placement.name,
-                    placement.attempt,
-                ],
-            ),
-        ])
-        .await?;
-    if recorded.first() == Some(&1) {
+    if jobs::record_queued(db, job, placement, now).await? {
         ctx.wait_until(runs::fetch(
             env.clone(),
             job.installation_id,
@@ -350,19 +273,7 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
             // Deliveries can arrive out of order; a completed job stays
             // completed. The runner shows the reconciler which instance
             // ran the job (see `reconcile`).
-            db.run(
-                PROGRESS,
-                &params![
-                    status.as_str(),
-                    now,
-                    id,
-                    runner,
-                    outcome.conclusion,
-                    outcome.started_at,
-                    outcome.completed_at,
-                ],
-            )
-            .await?;
+            jobs::progress(&db, id, status.as_str(), runner.as_deref(), &outcome, now).await?;
             if status == webhook::Status::Completed
                 && let (Some(started), Some(completed)) = (outcome.started_at, outcome.completed_at)
             {
@@ -465,14 +376,14 @@ mod tests {
 
     fn queued(db: &Db, id: u64, label: &str, now: u64) -> usize {
         db.run(
-            QUEUED,
+            jobs::QUEUED,
             &params![id, 42u64, "acme/app", 77u64, label, now, "build", 1u64],
         )
     }
 
     fn progress(db: &Db, id: u64, status: &str, runner: Option<&str>, now: u64) -> usize {
         db.run(
-            PROGRESS,
+            jobs::PROGRESS,
             &params![
                 status,
                 now,
@@ -490,7 +401,7 @@ mod tests {
     fn job_of_run(db: &Db, id: u64, attempt: u64, sha: &str, now: u64) -> Vec<usize> {
         db.batch(&[
             (
-                RUN,
+                jobs::RUN,
                 params![
                     77u64,
                     42u64,
@@ -502,9 +413,9 @@ mod tests {
                     now
                 ],
             ),
-            (RUN_ATTEMPT, params![77u64, attempt, now, sha, "main"]),
+            (jobs::RUN_ATTEMPT, params![77u64, attempt, now, sha, "main"]),
             (
-                QUEUED,
+                jobs::QUEUED,
                 params![
                     id,
                     42u64,
@@ -563,7 +474,7 @@ mod tests {
         let progress =
             |status: &str, conclusion: Option<&str>, started: Option<u64>, ended: Option<u64>| {
                 db.run(
-                    PROGRESS,
+                    jobs::PROGRESS,
                     &params![status, NOW, 5u64, None::<&str>, conclusion, started, ended],
                 )
             };

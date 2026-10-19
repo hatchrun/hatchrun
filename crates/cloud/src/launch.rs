@@ -58,7 +58,7 @@ use crate::reconcile::retry::{Cause, Failure};
 use crate::tokens::{self, App, Kv, Tokens};
 use crate::webhook::QueuedJob;
 use crate::{
-    cache, connect, github, instance, instance_types, jwt, now_ms, oidc, settings, telemetry,
+    cache, connect, github, instance, instance_types, jobs, jwt, now_ms, oidc, settings, telemetry,
     webcrypto,
 };
 
@@ -121,38 +121,8 @@ fn tenant_query() -> String {
     )
 }
 
-/// Fails a job nobody took because its tenant cannot launch.
-const REFUSE: &str = "UPDATE jobs SET launch_state = 'failed', launch_error = $2, \
-     updated_at = $3, launch_retry = $4, next_launch_at = NULL \
-     WHERE id = $1 AND launch_state IS NULL";
-
-/// Records how a launch ended.
-const RECORD: &str = "UPDATE jobs SET launch_state = $2, instance_id = $3, launch_error = $4, \
-     updated_at = $5, launch_retry = $6, next_launch_at = $7 WHERE id = $1";
-
-/// Puts a tenant's jobs that wait for its setup back in line.
-const RECHECK: &str = "UPDATE jobs SET launch_state = NULL, launch_retry = NULL, \
-     next_launch_at = NULL, updated_at = $2 \
-     WHERE installation_id = (SELECT installation_id FROM tenants WHERE id = $1) \
-     AND status = 'queued' AND launch_state = 'failed' AND launch_retry = 'setup'";
-
-/// Takes a queued job while the tenant has room, counting the attempt.
-pub(crate) const CLAIM: &str = "UPDATE jobs SET launch_state = 'launching', runner_name = $2, \
-     updated_at = $3, launch_attempts = launch_attempts + 1 \
-     WHERE id = $1 AND launch_state IS NULL AND status = 'queued' \
-     AND (SELECT COUNT(*) FROM jobs \
-          WHERE installation_id = $4 AND status <> 'completed' \
-          AND launch_state IN ('launching', 'launched')) < $5 \
-     RETURNING launch_attempts";
-
 /// The runner image for a region and architecture.
 const IMAGE: &str = "SELECT image_id, root_device FROM images WHERE region = $1 AND arch = $2";
-
-/// A row of [`CLAIM`].
-#[derive(Deserialize)]
-struct Claimed {
-    launch_attempts: u32,
-}
 
 impl Tenant {
     fn subnets(&self) -> Vec<&str> {
@@ -273,11 +243,7 @@ pub(crate) async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
                 ),
             };
             let (wait, _) = Failure::new(Cause::Tenant, message.as_str()).outcome(0, now_ms());
-            db.run(
-                REFUSE,
-                &params![job.id, message.as_str(), now_ms(), wait.as_str()],
-            )
-            .await?;
+            jobs::refuse(&db, job.id, message.as_str(), now_ms(), wait.as_str()).await?;
             console_warn!("job {}: {message}", job.id);
             return Ok(());
         }
@@ -332,20 +298,19 @@ async fn record(
             ("failed", None, Some(failure.message), Some(wait), next)
         }
     };
-    db.run(
-        RECORD,
-        &params![
-            job_id,
+    jobs::record_launch(
+        db,
+        job_id,
+        jobs::Launched {
             state,
             instance_id,
             error,
-            now,
-            wait.map(super::reconcile::retry::Wait::as_str),
-            next,
-        ],
+            wait: wait.map(super::reconcile::retry::Wait::as_str),
+            next_launch_at: next,
+        },
+        now,
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// Puts the tenant's queued jobs that wait for a change to its setup
@@ -353,7 +318,7 @@ async fn record(
 /// when an owner verifies the role, edits a profile, changes the
 /// settings or gains a licence.
 pub(crate) async fn recheck(db: &Db, tenant_id: &str) -> Result<()> {
-    let changed = db.run(RECHECK, &params![tenant_id, now_ms()]).await?;
+    let changed = jobs::recheck(db, tenant_id, now_ms()).await?;
     if changed > 0 {
         console_log!("tenant {tenant_id}: setup changed, launching {changed} waiting jobs again");
     }
@@ -371,30 +336,19 @@ fn runner_name(job_id: u64, random: &[u8]) -> String {
 }
 
 /// Moves the job to `launching` if it is queued, nobody took it, and the
-/// tenant has room, and counts the attempt. Claims for one installation
-/// hold its advisory lock in turn, so the second sees the first's
-/// runner in its count and the second delivery of a job finds
-/// `launch_state` set. Returns the
-/// job's launch attempts so far, this one included, or `None` when it
-/// was not taken.
+/// tenant has room, and counts the attempt (see [`jobs::claim`]).
+/// Returns the job's launch attempts so far, this one included, or
+/// `None` when it was not taken.
 async fn claim(db: &Db, job: &QueuedJob, tenant: &Tenant, name: &str) -> Result<Option<u32>> {
-    // Claims for one installation take turns, so two of them cannot
-    // both count the same free place under max_runners.
-    let lock = i64::try_from(job.installation_id).unwrap_or(i64::MAX);
-    let claimed: Option<Claimed> = db
-        .first_locked(
-            lock,
-            CLAIM,
-            &params![
-                job.id,
-                name,
-                now_ms(),
-                job.installation_id,
-                tenant.max_runners
-            ],
-        )
-        .await?;
-    Ok(claimed.map(|claimed| claimed.launch_attempts))
+    jobs::claim(
+        db,
+        job.id,
+        name,
+        now_ms(),
+        job.installation_id,
+        tenant.max_runners,
+    )
+    .await
 }
 
 /// Everything after the claim, with GitHub calls sent through `calls`.
@@ -1092,20 +1046,15 @@ mod tests {
     }
 
     fn claim(db: &Db, id: u64, max_runners: u32) -> Option<u32> {
-        let lock = i64::try_from(INSTALLATION).unwrap();
-        db.wait(db.db().first_locked::<Claimed>(
-            lock,
-            CLAIM,
-            &params![
-                id,
-                format!("hatchrun-{id}-00"),
-                NOW,
-                INSTALLATION,
-                max_runners
-            ],
+        db.wait(jobs::claim(
+            db.db(),
+            id,
+            &format!("hatchrun-{id}-00"),
+            NOW,
+            INSTALLATION,
+            max_runners,
         ))
         .unwrap()
-        .map(|claimed| claimed.launch_attempts)
     }
 
     #[test]
@@ -1159,7 +1108,7 @@ mod tests {
     fn a_claim_counts_runners_through_the_open_jobs() {
         let db = seed(true, 1);
         let plan = db.plan(
-            CLAIM,
+            jobs::CLAIM,
             &params![1u64, "hatchrun-1-00", NOW, INSTALLATION, 1u32],
         );
         assert!(plan.contains("jobs_open on jobs"), "{plan}");
@@ -1177,7 +1126,7 @@ mod tests {
         assert_eq!(claim(&db, 2, 1), None);
 
         db.run(
-            RECORD,
+            jobs::RECORD_LAUNCH,
             &params![
                 1u64,
                 "failed",
@@ -1190,7 +1139,7 @@ mod tests {
         );
         assert_eq!(claim(&db, 2, 1), Some(1));
         db.run(
-            RECORD,
+            jobs::RECORD_LAUNCH,
             &params![
                 2u64,
                 "launched",
@@ -1224,7 +1173,7 @@ mod tests {
         job(&db, 2, "completed");
         let refuse = |id: u64| {
             db.run(
-                REFUSE,
+                jobs::REFUSE,
                 &params![id, "tenant t1 has no licence", NOW, "setup"],
             )
         };
@@ -1232,7 +1181,7 @@ mod tests {
         assert_eq!(refuse(1), 0);
         assert_eq!(refuse(2), 1);
         // Only the queued one launches again.
-        assert_eq!(db.run(RECHECK, &params!["t1", NOW + 1]), 1);
+        assert_eq!(db.run(jobs::RECHECK, &params!["t1", NOW + 1]), 1);
         let rows = db
             .rows(
                 "SELECT launch_state, launch_retry FROM jobs ORDER BY id",
