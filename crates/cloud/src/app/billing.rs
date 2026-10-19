@@ -346,6 +346,12 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
         );
     } else if polar::LICENSED.contains(&subscription.status.as_str()) {
         crate::launch::recheck(&db, &subscription.tenant).await?;
+    } else if usage::start_grace(&db, &subscription.tenant, now_ms()).await? {
+        console_log!(
+            "tenant {}: subscription {} ended past the free minutes, grace period started",
+            subscription.tenant,
+            subscription.id
+        );
     }
     Ok(Response::empty()?.with_status(202))
 }

@@ -88,8 +88,8 @@ export function UsageMeter({ tenant, plan }: { tenant: Tenant; plan: Plan | null
           ? beta
             ? `${minutes(over)} past the free ones, not billed in the beta.`
             : `${minutes(over)} past the free ones.`
-          : `${minutes(usage.freeMinutes - usage.minutes)} of free minutes left.`}{" "}
-        {bill && `About ${bill} so far this month. `}
+          : `${(usage.freeMinutes - usage.minutes).toLocaleString()} free ${usage.freeMinutes - usage.minutes === 1 ? "minute" : "minutes"} left.`}{" "}
+        {bill && `About ${bill} for this calendar month. Polar invoices by your billing period, so the invoice can differ. `}
         The count starts again on {formatDate(usage.monthEnd)}.
       </p>
     </div>

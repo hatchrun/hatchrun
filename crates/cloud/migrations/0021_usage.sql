@@ -26,6 +26,9 @@ CREATE TABLE usage_events (
 CREATE INDEX usage_events_month ON usage_events (tenant_id, ended_at);
 CREATE INDEX usage_events_unsent ON usage_events (ended_at)
   WHERE billed = 1 AND sent_at IS NULL;
+-- The rows the retention may delete: never billed, or sent to Polar.
+CREATE INDEX usage_events_done ON usage_events (ended_at)
+  WHERE billed = 0 OR sent_at IS NOT NULL;
 
 -- When an unpaid tenant first used up its free minutes in a month,
 -- Unix ms. Runners keep launching for a grace period after it, then

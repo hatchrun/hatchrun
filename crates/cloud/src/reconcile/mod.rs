@@ -2505,6 +2505,11 @@ mod tests {
                 db.plan(BACKFILL_RUNS, &params![UNSET_RETENTION, DELETE_BATCH]),
                 &["runs_expiry (expires_at=?)"][..],
             ),
+            (
+                "DELETE_USAGE",
+                db.plan(DELETE_USAGE, &params![NOW, DELETE_BATCH]),
+                &["usage_events_done"][..],
+            ),
         ];
         for (name, plan, indexes) in plans {
             assert!(!plan.contains("SCAN jobs"), "{name}\n{plan}");

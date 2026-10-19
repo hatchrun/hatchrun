@@ -100,6 +100,19 @@ fn month_sql() -> String {
     )
 }
 
+/// Sets `free_used_up_at` to `?2` on tenant `?1` when it is unpaid,
+/// not in the beta, has not used up its free minutes yet this month and
+/// has at least `?3` minutes: the start of its grace period when a
+/// subscription ends after it went past them.
+fn grace_sql() -> String {
+    format!(
+        "UPDATE tenants SET free_used_up_at = ?2 \
+         WHERE id = ?1 AND beta = 0 AND NOT {PAID} \
+         AND (free_used_up_at IS NULL OR free_used_up_at < {MONTH_START}) \
+         AND {USED} >= ?3"
+    )
+}
+
 /// Up to `?1` billed minutes Polar has not taken, oldest first.
 const UNSENT: &str = "SELECT job_id, tenant_id, minutes, ended_at FROM usage_events \
      WHERE billed = 1 AND sent_at IS NULL ORDER BY ended_at LIMIT ?1";
@@ -144,6 +157,18 @@ pub(crate) async fn record(
         worker::console_log!("job {id}: its tenant used up its free minutes this month");
     }
     Ok(changed(0) == 1)
+}
+
+/// Starts the grace period of tenant `id` at `now` if it is unpaid and
+/// past its free minutes this month without one, as a tenant whose
+/// subscription just ended can be. Returns whether it started.
+pub(crate) async fn start_grace(db: &D1Database, id: &str, now: u64) -> Result<bool> {
+    let result = db
+        .prepare(grace_sql())
+        .bind(&[id.into(), int(now)?, FREE_MINUTES.into()])?
+        .run()
+        .await?;
+    Ok(result.meta()?.and_then(|meta| meta.changes) == Some(1))
 }
 
 /// A tenant's minutes this month, as the app shows them.
@@ -382,6 +407,28 @@ mod sql {
 
         db.run(SENT, &params!["[1]", now()]);
         assert_eq!(db.all::<Unsent>(UNSENT, &params![500u32]), []);
+    }
+
+    #[test]
+    fn grace_starts_when_a_subscription_ends() {
+        let db = seed();
+        // Past the free minutes while paid: no grace period yet.
+        assert_eq!(record(&db, 1, 2, 5000, 0, true), [1, 0]);
+        let grace = || db.run(&grace_sql(), &params!["paid", now(), FREE_MINUTES]);
+        assert_eq!(grace(), 0);
+
+        db.run("UPDATE subscriptions SET status = 'canceled'", &[]);
+        assert_eq!(grace(), 1);
+        assert_eq!(grace(), 0);
+        let row = month(&db, "paid");
+        assert!(row.free_used_up_at.is_some());
+        assert_eq!(row.may_launch, 1);
+
+        // Within its free minutes, nothing starts.
+        assert_eq!(
+            db.run(&grace_sql(), &params!["free", now(), FREE_MINUTES]),
+            0
+        );
     }
 
     #[test]
