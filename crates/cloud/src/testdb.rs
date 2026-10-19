@@ -17,6 +17,7 @@
 use std::path::Path;
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
 use serde::de::DeserializeOwned;
@@ -60,6 +61,9 @@ impl Db {
     /// A fresh schema, migrated.
     pub(crate) fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Tests migrate one at a time: a migration may change the
+        // database itself, which two sessions cannot do at once.
+        static MIGRATING: Mutex<()> = Mutex::new(());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -71,6 +75,7 @@ impl Db {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
+        let migrating = MIGRATING.lock().unwrap_or_else(PoisonError::into_inner);
         let client = runtime.block_on(async {
             let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
                 .await
@@ -91,6 +96,7 @@ impl Db {
             }
             client
         });
+        drop(migrating);
         Db {
             runtime,
             inner: crate::db::Db::new(client),

@@ -44,19 +44,23 @@ pub(crate) const USED: &str = "(SELECT COALESCE(SUM(usage_events.minutes), 0)::b
      (extract(epoch from date_trunc('month', now() AT TIME ZONE 'UTC'))::bigint * 1000))";
 
 /// SQL that is true for a `tenants` row that may launch: in the beta,
-/// paid, within its free minutes this month, or within the grace period
-/// after it used them up.
-pub(crate) const MAY_LAUNCH: &str = "(tenants.beta \
+/// paid, within the grace period after it used up its free minutes, or
+/// within its free minutes this month. The month's sum reads every
+/// usage row of the month, so CASE keeps it for last, after the checks
+/// that settle most tenants.
+pub(crate) const MAY_LAUNCH: &str = "(CASE WHEN tenants.beta \
      OR EXISTS (SELECT 1 FROM subscriptions \
      WHERE subscriptions.tenant_id = tenants.id \
      AND subscriptions.status IN ('active', 'trialing')) \
-     OR (SELECT COALESCE(SUM(usage_events.minutes), 0)::bigint \
+     OR (tenants.free_used_up_at >= \
+     (extract(epoch from date_trunc('month', now() AT TIME ZONE 'UTC'))::bigint * 1000) \
+     AND tenants.free_used_up_at > (floor(extract(epoch from now()))::bigint * 1000) - 604800000) \
+     THEN true \
+     ELSE (SELECT COALESCE(SUM(usage_events.minutes), 0)::bigint \
      FROM usage_events WHERE usage_events.tenant_id = tenants.id \
      AND usage_events.ended_at >= \
      (extract(epoch from date_trunc('month', now() AT TIME ZONE 'UTC'))::bigint * 1000)) < 3000 \
-     OR (tenants.free_used_up_at >= \
-     (extract(epoch from date_trunc('month', now() AT TIME ZONE 'UTC'))::bigint * 1000) \
-     AND tenants.free_used_up_at > (floor(extract(epoch from now()))::bigint * 1000) - 604800000))";
+     END)";
 
 /// Billed minutes of a job that ran from `started` to `completed`
 /// (Unix ms): whole minutes, rounded up, at least one.
@@ -88,9 +92,8 @@ pub(crate) fn used_up_sql() -> String {
     format!(
         "UPDATE tenants SET free_used_up_at = $2 \
          WHERE id = (SELECT tenant_id FROM usage_events WHERE job_id = $1) \
-         AND NOT beta AND NOT {PAID} \
-         AND (free_used_up_at IS NULL OR free_used_up_at < {MONTH_START}) \
-         AND {USED} >= $3"
+         AND CASE WHEN beta OR {PAID} OR free_used_up_at >= {MONTH_START} THEN false \
+         ELSE {USED} >= $3 END"
     )
 }
 

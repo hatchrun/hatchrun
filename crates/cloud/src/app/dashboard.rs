@@ -357,36 +357,49 @@ pub(crate) async fn runs(ctx: &Ctx<'_>, org: &str, req: &Request) -> Answer {
         ) => Param::from(*at),
         _ => Param::Null,
     };
-    let runs: Vec<WorkflowRun> = jobs::list_runs(
-        ctx.db,
-        installation,
-        RunsPage {
-            group: page.status,
-            sort: page.sort,
-            dir: page.dir,
-            queued_at: before.as_ref().map(|c| c.queued_at),
-            id: before.as_ref().map(|c| c.id),
-            limit: PAGE,
-            fifth,
-            search: q.map(contains),
-        },
-    )
-    .await?;
-    let ids: Vec<u64> = runs.iter().map(|run| run.id).collect();
-    let jobs = jobs_of(ctx, installation, &ids).await?;
+    // The page, then its jobs; the counts and the activity strip at the
+    // same time, on the same connection, in one round trip each.
     let now = now_ms();
-    let counts: Counts = jobs::counts(ctx.db, installation, now.saturating_sub(DAY_MS))
-        .await?
-        .unwrap_or_default();
+    let since = activity_since(now);
+    let page = async {
+        let runs: Vec<WorkflowRun> = jobs::list_runs(
+            ctx.db,
+            installation,
+            RunsPage {
+                group: page.status,
+                sort: page.sort,
+                dir: page.dir,
+                queued_at: before.as_ref().map(|c| c.queued_at),
+                id: before.as_ref().map(|c| c.id),
+                limit: PAGE,
+                fifth,
+                search: q.map(contains),
+            },
+        )
+        .await?;
+        let ids: Vec<u64> = runs.iter().map(|run| run.id).collect();
+        let jobs = jobs_of(ctx, installation, &ids).await?;
+        Ok::<_, Failure>((runs, jobs))
+    };
+    let counts = jobs::counts::<Counts>(ctx.db, installation, now.saturating_sub(DAY_MS));
+    let strip = async {
+        if before.is_some() {
+            return Ok(None);
+        }
+        jobs::activity::<Grouped>(ctx.db, installation, since, BUCKET_MS)
+            .await
+            .map(Some)
+    };
+    let (page, counts, strip) = futures_util::join!(page, counts, strip);
+    let (runs, jobs) = page?;
+    let counts = counts?.unwrap_or_default();
     let mut body = serde_json::json!({
         "runs": list(&ctx.config.github_web, runs, &jobs),
         "counts": counts,
         "region": row.region,
         "pageSize": PAGE,
     });
-    if before.is_none() {
-        let since = activity_since(now);
-        let rows: Vec<Grouped> = jobs::activity(ctx.db, installation, since, BUCKET_MS).await?;
+    if let Some(rows) = strip? {
         body["activity"] = serde_json::json!(activity(since, &rows));
     }
     Ok(Response::from_json(&body)?)

@@ -495,10 +495,14 @@ fn order(sort: Sort, dir: Direction) -> (&'static str, &'static str) {
 /// every query takes the same six values, as Postgres wants as many
 /// values as the query has parameters.
 pub(crate) fn list_query(group: Option<Group>, sort: Sort, dir: Direction) -> String {
+    // ARRAY() runs once, before the runs are read: the group's jobs come
+    // through their own index and the runs by id. As `IN`, Postgres
+    // could walk the tenant's runs in order and probe each one's jobs,
+    // which reads every run when few are in the group.
     let filter = group.map_or(String::new(), |g| {
         format!(
-            " AND id IN (SELECT j.run_id FROM jobs AS j \
-             WHERE j.installation_id = $1 AND {} AND {CURRENT})",
+            " AND id = ANY (ARRAY(SELECT j.run_id FROM jobs AS j \
+             WHERE j.installation_id = $1 AND {} AND {CURRENT}))",
             g.predicate()
         )
     });
