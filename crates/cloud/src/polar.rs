@@ -7,7 +7,7 @@
 //!
 //! An organization pays per job minute through a Polar subscription to
 //! the metered product: a metered price on the job minutes meter, with
-//! a cap, and a meter credit benefit for the free minutes (see
+//! no cap, and a meter credit benefit for the free minutes (see
 //! [`crate::usage`]). The reconciler sends each job's minutes as an
 //! event (see [`ingest`]). The app opens a Polar checkout for the
 //! product, with the tenant id as Polar's

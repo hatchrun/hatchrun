@@ -12,7 +12,7 @@
 //! subscription starts or the next month does. A subscription pays per
 //! minute: its jobs' minutes go to Polar's meter (see
 //! [`crate::polar::ingest`]), where a meter credit benefit gives the
-//! same free minutes each billing period and the price has a cap. Beta
+//! same free minutes each billing period. The price has no cap. Beta
 //! tenants count minutes and pay nothing.
 
 use serde::Deserialize;
