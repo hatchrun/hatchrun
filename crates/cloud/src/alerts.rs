@@ -33,7 +33,8 @@ use crate::{changes, int};
 
 /// The `send_email` binding in `wrangler.toml`.
 const BINDING: &str = "ALERTS";
-/// The variable with the inbox alerts go to.
+/// The secret with the inbox alerts go to, a secret so the address
+/// stays out of the public `wrangler.toml`.
 const TO: &str = "ALERT_EMAIL";
 /// The sender, on the subdomain onboarded to Email Sending.
 const FROM: &str = "alerts@notify.hatchrun.io";
@@ -758,7 +759,7 @@ pub(crate) struct Inbox(Result<(SendEmail, String), String>);
 impl Inbox {
     pub(crate) fn new(env: &Env) -> Self {
         let to = env
-            .var(TO)
+            .secret(TO)
             .map(|value| value.to_string())
             .ok()
             .filter(|to| !to.is_empty())
