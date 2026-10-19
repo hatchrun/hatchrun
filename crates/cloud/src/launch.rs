@@ -110,7 +110,7 @@ struct Tenant {
 pub(crate) const LICENSED: &str = crate::usage::MAY_LAUNCH;
 
 /// The installation's tenant with AWS connected.
-fn tenant_query() -> String {
+pub(crate) fn tenant_query() -> String {
     format!(
         "SELECT id, role_arn, region, launch_template_id, subnet_ids, max_runners, \
          allowed_regions, {LICENSED} AS licensed, instance_types, volume_size_limit, \
@@ -122,7 +122,8 @@ fn tenant_query() -> String {
 }
 
 /// The runner image for a region and architecture.
-const IMAGE: &str = "SELECT image_id, root_device FROM images WHERE region = $1 AND arch = $2";
+pub(crate) const IMAGE: &str =
+    "SELECT image_id, root_device FROM images WHERE region = $1 AND arch = $2";
 
 impl Tenant {
     fn subnets(&self) -> Vec<&str> {

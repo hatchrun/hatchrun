@@ -332,7 +332,7 @@ pub async fn run(env: Env) {
 }
 
 /// The passes before this one, newest last.
-const HISTORY: &str = "SELECT history FROM reconciler WHERE id = 1";
+pub(crate) const HISTORY: &str = "SELECT history FROM reconciler WHERE id = 1";
 
 /// The history the `reconciler` row keeps.
 async fn previous(db: &Db) -> Fallible<Vec<PassRecord>> {
@@ -341,7 +341,7 @@ async fn previous(db: &Db) -> Fallible<Vec<PassRecord>> {
 }
 
 /// Takes the lease: `$1` now, `$2` when it lapses.
-const TAKE_LEASE: &str =
+pub(crate) const TAKE_LEASE: &str =
     "UPDATE reconciler SET lease_until = $2 WHERE id = 1 AND lease_until <= $1";
 
 /// Takes the lease on the `reconciler` row if no pass holds it.
@@ -355,7 +355,7 @@ async fn take_lease(db: &Db, now: u64) -> Fallible<bool> {
 
 /// Keeps a pass's summary and the history `$4`, unless that is NULL,
 /// and gives the lease back.
-const RECORD: &str = "UPDATE reconciler SET started_at = $1, finished_at = $2, summary = $3, \
+pub(crate) const RECORD: &str = "UPDATE reconciler SET started_at = $1, finished_at = $2, summary = $3, \
      history = COALESCE($4, history), lease_until = 0 WHERE id = 1";
 
 /// Keeps the pass's summary and history and gives the lease back.
@@ -388,7 +388,7 @@ const CLAIM_REDELIVERY: &str = "INSERT INTO redeliveries (guid, delivery_id, eve
      redelivered_at) VALUES ($1, $2, $3, $4) ON CONFLICT (guid) DO NOTHING";
 
 /// Tenants with a verified role, least recently reconciled first.
-fn tenants_query() -> String {
+pub(crate) fn tenants_query() -> String {
     format!(
         "SELECT id, installation_id, role_arn, region, launch_template_id, max_runners, \
          stack_checked_at, versions_swept_at FROM tenants \
@@ -397,7 +397,7 @@ fn tenants_query() -> String {
 }
 
 /// Stamps tenant `$1` as reconciled at `$2`.
-const MARK_RECONCILED: &str = "UPDATE tenants SET reconciled_at = $2 WHERE id = $1";
+pub(crate) const MARK_RECONCILED: &str = "UPDATE tenants SET reconciled_at = $2 WHERE id = $1";
 
 /// Stamps tenant `$1`'s template versions as swept at `$2`.
 const MARK_SWEPT: &str = "UPDATE tenants SET versions_swept_at = $2 WHERE id = $1";
@@ -407,7 +407,7 @@ const MARK_STACK_CHECKED: &str = "UPDATE tenants SET stack_checked_at = $2 WHERE
 
 /// A tenant in a region whose catalog is due: not refreshed since `$1`
 /// nor attempted since `$2`.
-fn catalog_query() -> String {
+pub(crate) fn catalog_query() -> String {
     format!(
         "SELECT id, role_arn, region FROM tenants WHERE {VERIFIED} \
          AND NOT EXISTS (SELECT 1 FROM instance_type_regions AS done \
@@ -419,7 +419,7 @@ fn catalog_query() -> String {
 }
 
 /// Deletes up to `$2` sessions expired before `$1`.
-const DELETE_SESSIONS: &str = "DELETE FROM sessions WHERE key IN \
+pub(crate) const DELETE_SESSIONS: &str = "DELETE FROM sessions WHERE key IN \
      (SELECT key FROM sessions WHERE expires_at < $1 LIMIT $2)";
 
 /// How long failed launches are kept.
@@ -428,15 +428,15 @@ const FAILED_LAUNCH_MEMORY: u64 = 30 * 24 * 60 * 60 * 1000;
 const RATE_LIMIT_MEMORY: u64 = 24 * 60 * 60 * 1000;
 
 /// Deletes up to `$2` redeliveries made before `$1`.
-const DELETE_REDELIVERIES: &str = "DELETE FROM redeliveries WHERE guid IN \
+pub(crate) const DELETE_REDELIVERIES: &str = "DELETE FROM redeliveries WHERE guid IN \
      (SELECT guid FROM redeliveries WHERE redelivered_at < $1 LIMIT $2)";
 
 /// Deletes unavailable offerings that lapsed before `$1`.
-const DELETE_OFFERINGS: &str = "DELETE FROM unavailable_offerings WHERE until < $1";
+pub(crate) const DELETE_OFFERINGS: &str = "DELETE FROM unavailable_offerings WHERE until < $1";
 
 /// Deletes up to `$2` job minutes that completed before `$1` and that
 /// Polar has, or never needed.
-const DELETE_USAGE: &str = "DELETE FROM usage_events WHERE job_id IN \
+pub(crate) const DELETE_USAGE: &str = "DELETE FROM usage_events WHERE job_id IN \
      (SELECT job_id FROM usage_events WHERE ended_at < $1 \
        AND (NOT billed OR sent_at IS NOT NULL) LIMIT $2)";
 

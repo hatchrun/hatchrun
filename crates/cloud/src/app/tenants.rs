@@ -69,7 +69,7 @@ pub(crate) const TENANT_COLUMNS: &str = "tenants.id, tenants.org_id, tenants.org
 
 /// The tenant of an organization, by login, that a user is a member
 /// of. Binds the login and the user id.
-fn authorize_query() -> String {
+pub(crate) fn authorize_query() -> String {
     format!(
         "SELECT {TENANT_COLUMNS} FROM tenants \
          JOIN members ON members.tenant_id = tenants.id \

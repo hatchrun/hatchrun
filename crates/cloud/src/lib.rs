@@ -33,6 +33,8 @@ pub mod actions;
 mod alerts;
 mod app;
 pub mod aws;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod bench;
 pub mod cache;
 pub mod catalog;
 pub mod connect;

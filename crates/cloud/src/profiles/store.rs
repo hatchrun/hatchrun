@@ -82,7 +82,7 @@ fn named_query() -> String {
 }
 
 /// The installation's tenant, with the profile's name when it has one.
-const UNKNOWN: &str = "SELECT tenants.id, runner_profiles.name FROM tenants \
+pub(crate) const UNKNOWN: &str = "SELECT tenants.id, runner_profiles.name FROM tenants \
      LEFT JOIN runner_profiles ON runner_profiles.tenant_id = tenants.id \
      AND runner_profiles.name = $2 WHERE tenants.installation_id = $1";
 
