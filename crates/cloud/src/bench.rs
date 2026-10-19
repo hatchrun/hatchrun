@@ -201,6 +201,9 @@ fn seed(td: &testdb::Db, runs: u64, now: u64) {
     statements.extend(seed_jobs_after(now));
     statements.extend(seed_rest(now));
     statements.push("ALTER TABLE jobs ENABLE TRIGGER jobs_end".to_owned());
+    // The timed statements commit as the Worker's do, waiting for the
+    // WAL flush.
+    statements.push("RESET synchronous_commit".to_owned());
     statements.push(
         "VACUUM (ANALYZE) jobs, runs, usage_events, tenants, subscriptions, users, members, \
          sessions, runner_profiles, images, instance_type_regions, cache_uploads, \
