@@ -355,7 +355,7 @@ const routes: Record<string, Handler> = {
     }
     const windows =
       job.launchState === "launched"
-        ? sampleWindows(job.queuedAt).filter((w) => w.at * 1000 <= Date.now())
+        ? sampleWindows(job.queuedAt).filter((w) => w.at * 1000 <= (job.completedAt ?? Date.now()))
         : [];
     return [
       200,
