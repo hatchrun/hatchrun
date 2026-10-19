@@ -40,6 +40,57 @@ pub(crate) fn call(method: &'static str, url: String, token: &str) -> Request {
         .header("X-GitHub-Api-Version", "2022-11-28")
 }
 
+/// The header with the requests an installation has left this hour.
+pub const RATE_LIMIT_REMAINING: &str = "x-ratelimit-remaining";
+/// Fewer requests left than this is low: the reconciler, launches and
+/// the app share an installation's 5,000 an hour.
+pub const RATE_LIMIT_LOW: u32 = 2000;
+
+/// What one or more answers said about an installation's rate limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateLimit {
+    /// The fewest requests left, when an answer said.
+    pub remaining: Option<u32>,
+    /// Whether GitHub refused a request for the rate limit.
+    pub limited: bool,
+}
+
+impl RateLimit {
+    /// What both say together: the fewer requests left, and limited if
+    /// either was.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        let remaining = match (self.remaining, other.remaining) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        Self {
+            remaining,
+            limited: self.limited || other.limited,
+        }
+    }
+
+    /// Whether it is worth an alert.
+    #[must_use]
+    pub fn low(self) -> bool {
+        self.limited || self.remaining.is_some_and(|left| left < RATE_LIMIT_LOW)
+    }
+}
+
+/// The rate limit an answer shows, with its `x-ratelimit-remaining`
+/// header. GitHub refuses with 429, or with 403 when nothing is left or
+/// a secondary limit applies, which only its message tells apart from a
+/// missing permission.
+#[must_use]
+pub fn rate_limit(response: &Response, remaining: Option<&str>) -> RateLimit {
+    let remaining = remaining.and_then(|value| value.trim().parse().ok());
+    let limited = response.status == 429
+        || (response.status == 403
+            && (remaining == Some(0)
+                || response.text().to_ascii_lowercase().contains("rate limit")));
+    RateLimit { remaining, limited }
+}
+
 /// Trades the App's JWT for a token of one installation.
 #[must_use]
 pub fn installation_token(api: &str, installation_id: u64, app_jwt: &str) -> Request {
@@ -465,6 +516,44 @@ mod tests {
         let token = token(&answer).unwrap();
         assert_eq!(token.token, "ghs_x");
         assert_eq!(token.expires_at.as_deref(), Some("2026-10-13T13:00:00Z"));
+    }
+
+    #[test]
+    fn reads_the_rate_limit() {
+        let answer = |status: u16, body: &str| Response {
+            status,
+            body: body.as_bytes().to_vec(),
+        };
+        let ok = rate_limit(&answer(200, "{}"), Some("4999"));
+        assert_eq!(ok.remaining, Some(4999));
+        assert!(!ok.limited && !ok.low());
+        assert!(rate_limit(&answer(200, "{}"), Some("1999")).low());
+        assert!(rate_limit(&answer(429, "{}"), None).limited);
+        assert!(rate_limit(&answer(403, "{}"), Some("0")).limited);
+        let secondary = r#"{"message":"You have exceeded a secondary rate limit."}"#;
+        assert!(rate_limit(&answer(403, secondary), Some("4000")).limited);
+        // A missing permission is no rate limit.
+        let denied = r#"{"message":"Resource not accessible by integration"}"#;
+        assert!(!rate_limit(&answer(403, denied), Some("4000")).low());
+        assert_eq!(rate_limit(&answer(200, "{}"), Some("x")).remaining, None);
+
+        let merged = ok.merge(RateLimit {
+            remaining: Some(1500),
+            limited: false,
+        });
+        assert_eq!(merged.remaining, Some(1500));
+        assert!(merged.low());
+        let limited = RateLimit {
+            remaining: None,
+            limited: true,
+        };
+        assert_eq!(
+            ok.merge(limited),
+            RateLimit {
+                remaining: Some(4999),
+                limited: true
+            }
+        );
     }
 
     #[test]

@@ -4,10 +4,12 @@
 
 //! Sends [`crate::http::Request`]s with the runtime's `fetch`.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 use worker::{Fetch, Headers, Method, RequestInit};
 
+use crate::github::{self, RateLimit};
 use crate::http::{Request, Response};
 
 /// Sends requests. [`Counted`] sends them with `fetch`; tests answer
@@ -15,13 +17,26 @@ use crate::http::{Request, Response};
 pub(crate) trait Sender {
     /// Sends `request`.
     async fn send(&self, request: &Request) -> std::result::Result<Response, String>;
+
+    /// Sends `request` with a token of the installation, so a sender
+    /// that keeps rate limits knows whose answer it is.
+    async fn send_as(
+        &self,
+        _installation_id: u64,
+        request: &Request,
+    ) -> std::result::Result<Response, String> {
+        self.send(request).await
+    }
 }
 
 /// Sends with `fetch` and counts what it sent, so a launch can log how
-/// many GitHub calls it made.
+/// many GitHub calls it made. It keeps the lowest rate limit each
+/// installation's answers showed, for the alerts (see
+/// [`crate::alerts`]).
 #[derive(Default)]
 pub(crate) struct Counted {
     sent: Cell<u32>,
+    limits: RefCell<BTreeMap<u64, RateLimit>>,
 }
 
 impl Counted {
@@ -29,12 +44,40 @@ impl Counted {
     pub(crate) fn sent(&self) -> u32 {
         self.sent.get()
     }
+
+    /// The installations whose answers had little left or were refused
+    /// for the rate limit, with the lowest each showed.
+    pub(crate) fn low(&self) -> Vec<(u64, RateLimit)> {
+        self.limits
+            .borrow()
+            .iter()
+            .filter(|(_, limit)| limit.low())
+            .map(|(id, limit)| (*id, *limit))
+            .collect()
+    }
 }
 
 impl Sender for Counted {
     async fn send(&self, request: &Request) -> std::result::Result<Response, String> {
         self.sent.set(self.sent.get() + 1);
         send(request).await
+    }
+
+    async fn send_as(
+        &self,
+        installation_id: u64,
+        request: &Request,
+    ) -> std::result::Result<Response, String> {
+        self.sent.set(self.sent.get() + 1);
+        let (response, remaining) =
+            send_reading(request, Some(github::RATE_LIMIT_REMAINING)).await?;
+        let seen = github::rate_limit(&response, remaining.as_deref());
+        self.limits
+            .borrow_mut()
+            .entry(installation_id)
+            .and_modify(|limit| *limit = limit.merge(seen))
+            .or_insert(seen);
+        Ok(response)
     }
 }
 

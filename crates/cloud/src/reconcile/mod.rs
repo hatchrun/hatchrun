@@ -23,7 +23,9 @@
 //!    which `launch` does without calling anyone;
 //! 6. send the minutes of completed jobs of paying tenants to Polar's
 //!    meter (see [`crate::usage`]);
-//! 7. delete expired sessions and rows past the retention.
+//! 7. delete expired sessions and rows past the retention;
+//! 8. check the pass and the database and email the alerts that are due
+//!    (see [`crate::alerts`]).
 //!
 //! Every step is safe to repeat and to run beside a webhook: rows
 //! change only while they still say what the pass read, and `launch`
@@ -32,7 +34,9 @@
 //! most [`SUBREQUESTS`] requests and handles a bounded number of
 //! tenants, jobs and deliveries, oldest first; what is left waits for
 //! the next minute. It logs one summary line and keeps it, with its
-//! time, in the `reconciler` row.
+//! time and the last passes' errors, in the `reconciler` row. The
+//! alerts run after the row is written and the lease given back, so
+//! they never hold up or fail a pass.
 
 pub mod deliveries;
 pub mod plan;
@@ -49,6 +53,7 @@ use wasm_bindgen::JsValue;
 use worker::{D1Database, D1PreparedStatement, Env, console_error, console_log, console_warn};
 
 use self::plan::{Instance, Job, LaunchState, Limits, Plan};
+use crate::alerts::{self, PassRecord};
 use crate::aws::describe;
 use crate::aws::{self, Credentials, ec2, fleet, instances, ssm};
 use crate::fetch::{Counted, send, send_reading};
@@ -150,7 +155,7 @@ const SESSION: &str = "hatchrun-reconcile";
 
 /// SQL that is true for a tenant row whose role is verified, as
 /// `launch` requires.
-const VERIFIED: &str = "role_arn IS NOT NULL AND region IS NOT NULL \
+pub(crate) const VERIFIED: &str = "role_arn IS NOT NULL AND region IS NOT NULL \
      AND launch_template_id IS NOT NULL AND subnet_ids IS NOT NULL";
 
 type Fallible<T> = std::result::Result<T, String>;
@@ -311,9 +316,35 @@ pub async fn run(env: Env) {
     summary.ms = now_ms().saturating_sub(started);
     let line = serde_json::to_string(&summary).unwrap_or_default();
     console_log!("reconcile: {line}");
-    if let Err(err) = record(&pass.db, started, &line).await {
+    let this = PassRecord {
+        at: started,
+        errors: summary.errors,
+        more: summary.more,
+    };
+    let history = match previous(&pass.db).await {
+        Ok(history) => Some(alerts::remember(history, this)),
+        Err(err) => {
+            console_error!("reconcile: history: {err}");
+            None
+        }
+    };
+    if let Err(err) = record(&pass.db, started, &line, history.as_deref()).await {
         console_error!("reconcile: record: {err}");
     }
+    alerts::after_pass(&env, &pass.db, now_ms(), history, summary.db_bytes).await;
+}
+
+/// The passes before this one, newest last.
+const HISTORY: &str = "SELECT history FROM reconciler WHERE id = 1";
+
+/// The history the `reconciler` row keeps.
+async fn previous(db: &D1Database) -> Fallible<Vec<PassRecord>> {
+    let text: Option<String> = db
+        .prepare(HISTORY)
+        .first(Some("history"))
+        .await
+        .map_err(text)?;
+    Ok(alerts::history(text.as_deref()))
 }
 
 /// Takes the lease: `?1` now, `?2` when it lapses.
@@ -332,17 +363,28 @@ async fn take_lease(db: &D1Database, now: u64) -> Fallible<bool> {
     Ok(changes(&result) == 1)
 }
 
-/// Keeps a pass's summary and gives the lease back.
+/// Keeps a pass's summary and the history `?4`, unless that is NULL,
+/// and gives the lease back.
 const RECORD: &str = "UPDATE reconciler SET started_at = ?1, finished_at = ?2, summary = ?3, \
-     lease_until = 0 WHERE id = 1";
+     history = COALESCE(?4, history), lease_until = 0 WHERE id = 1";
 
-/// Keeps the pass's summary and gives the lease back.
-async fn record(db: &D1Database, started: u64, summary: &str) -> Fallible<()> {
+/// Keeps the pass's summary and history and gives the lease back.
+async fn record(
+    db: &D1Database,
+    started: u64,
+    summary: &str,
+    history: Option<&[PassRecord]>,
+) -> Fallible<()> {
+    let history = match history {
+        Some(history) => json(&history)?,
+        None => JsValue::NULL,
+    };
     db.prepare(RECORD)
         .bind(&[
             int(started).map_err(text)?,
             int(now_ms()).map_err(text)?,
             summary.into(),
+            history,
         ])
         .map_err(text)?
         .run()
@@ -497,6 +539,11 @@ const DELETE_RUNS: &str = "DELETE FROM runs WHERE id IN \
      (SELECT id FROM runs WHERE expires_at < ?1 \
        AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.run_id = runs.id) \
      ORDER BY expires_at LIMIT ?2)";
+
+/// How long failed launches are kept.
+const FAILED_LAUNCH_MEMORY: u64 = 30 * 24 * 60 * 60 * 1000;
+/// How long a low rate limit is kept; the alert reads the last minutes.
+const RATE_LIMIT_MEMORY: u64 = 24 * 60 * 60 * 1000;
 
 /// Deletes up to `?2` redeliveries made before `?1`.
 const DELETE_REDELIVERIES: &str = "DELETE FROM redeliveries WHERE guid IN \
@@ -735,6 +782,7 @@ impl Pass<'_> {
             .collect()
             .await;
         self.settle(before, calls.sent());
+        alerts::note_rate_limits(&self.db, &calls, self.now).await;
         let mut done = Summary::default();
         for result in &results {
             done.add(result);
@@ -881,6 +929,7 @@ impl Pass<'_> {
         }
         let fetched = self.fetch_details(&tokens, by_installation, done).await;
         self.settle(before, calls.sent());
+        alerts::note_rate_limits(&self.db, &calls, self.now).await;
         fetched
     }
 
@@ -1676,16 +1725,19 @@ impl Pass<'_> {
     }
 
     /// Step 7: deletes expired sessions, jobs past the retention,
-    /// redeliveries GitHub no longer lists, lapsed unavailable offerings
+    /// redeliveries GitHub no longer lists, lapsed unavailable offerings,
     /// cache uploads nobody finished, whose parts S3's lifecycle rule
-    /// removes after a day, and job minutes older than
-    /// [`USAGE_MEMORY`] that Polar has or never needed.
+    /// removes after a day, job minutes older than [`USAGE_MEMORY`]
+    /// that Polar has or never needed, and old failed launches and rate
+    /// limits.
     async fn retention(&self) -> Fallible<Summary> {
         let now = int(self.now).map_err(text)?;
         let redeliveries_before = int(self.now.saturating_sub(REDELIVERY_MEMORY)).map_err(text)?;
         let uploads_before = int(self.now.saturating_sub(CACHE_UPLOAD_MEMORY)).map_err(text)?;
         let usage_before = int(self.now.saturating_sub(USAGE_MEMORY)).map_err(text)?;
         let unset = int(UNSET_RETENTION).map_err(text)?;
+        let failed_before = int(self.now.saturating_sub(FAILED_LAUNCH_MEMORY)).map_err(text)?;
+        let limits_before = int(self.now.saturating_sub(RATE_LIMIT_MEMORY)).map_err(text)?;
         let results = self
             .db
             .batch(vec![
@@ -1719,6 +1771,14 @@ impl Pass<'_> {
                     .prepare(DELETE_UPLOADS)
                     .bind(&[uploads_before, DELETE_BATCH.into()])
                     .map_err(text)?,
+                self.db
+                    .prepare(alerts::DELETE_FAILED)
+                    .bind(&[failed_before, DELETE_BATCH.into()])
+                    .map_err(text)?,
+                self.db
+                    .prepare(alerts::DELETE_RATE_LIMITS)
+                    .bind(&[limits_before])
+                    .map_err(text)?,
                 // After the jobs, so a run goes with its last job.
                 self.db
                     .prepare(DELETE_RUNS)
@@ -1736,7 +1796,7 @@ impl Pass<'_> {
                 u32::try_from(changes(result)).unwrap_or(u32::MAX)
             })
         };
-        if [0, 1, 2, 3, 4, 6, 7, 8]
+        if [0, 1, 2, 3, 4, 6, 7, 9, 10]
             .into_iter()
             .any(|at| deleted(at) == DELETE_BATCH)
         {
@@ -1745,7 +1805,7 @@ impl Pass<'_> {
         Ok(Summary {
             sessions_deleted: deleted(2),
             jobs_deleted: deleted(3),
-            runs_deleted: deleted(7),
+            runs_deleted: deleted(9),
             db_bytes: db_bytes(&results),
             ..Summary::default()
         })
@@ -1929,13 +1989,14 @@ mod tests {
         let take = params![NOW, NOW + LEASE];
         assert_eq!(db.run(TAKE_LEASE, &take), 1);
         assert_eq!(db.run(TAKE_LEASE, &params![NOW + 1, NOW + 1 + LEASE]), 0);
+        let history = r#"[{"at":1,"errors":0,"more":false}]"#;
         assert_eq!(
-            db.run(RECORD, &params![NOW, NOW + 5, r#"{"tenants":1}"#]),
+            db.run(RECORD, &params![NOW, NOW + 5, r#"{"tenants":1}"#, history]),
             1
         );
         let row = &db
             .rows(
-                "SELECT lease_until, started_at, finished_at, summary FROM reconciler",
+                "SELECT lease_until, started_at, finished_at, summary, history FROM reconciler",
                 &[],
             )
             .unwrap()[0];
@@ -1943,7 +2004,12 @@ mod tests {
         assert_eq!(row["started_at"], NOW);
         assert_eq!(row["finished_at"], NOW + 5);
         assert_eq!(row["summary"], r#"{"tenants":1}"#);
+        assert_eq!(row["history"], history);
         assert_eq!(db.run(TAKE_LEASE, &take), 1);
+        // A pass that could not read the history keeps the one there.
+        db.run(RECORD, &params![NOW, NOW + 6, "{}", None::<&str>]);
+        let kept: Option<String> = db.column(HISTORY, &[], "history");
+        assert_eq!(kept.as_deref(), Some(history));
     }
 
     #[test]

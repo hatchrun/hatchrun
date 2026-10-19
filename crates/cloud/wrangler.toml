@@ -67,6 +67,24 @@ max_retries = 3
 max_concurrency = 10
 dead_letter_queue = "hatchrun-launches-dlq"
 
+# Launch messages that ran out of retries. This Worker records each one
+# in failed_launches and emails the failed launch alert
+# (crates/cloud/src/alerts.rs); the reconciler launches the job again.
+[[queues.consumers]]
+queue = "hatchrun-launches-dlq"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+
+# Alert emails, sent through Cloudflare Email Service from
+# alerts@notify.hatchrun.io, a subdomain onboarded to Email Sending so
+# hatchrun.io's own mail records stay as they are. The binding sends to
+# the addresses listed here and nowhere else; ALERT_EMAIL below must be
+# one of them.
+[[send_email]]
+name = "ALERTS"
+allowed_destination_addresses = ["alerts-inbox@example.invalid"]
+
 # Runner metrics, which hatchrun-telemetry (crates/telemetry) writes to
 # Analytics Engine, read back for the app's job pages.
 [analytics]
@@ -139,3 +157,7 @@ RECONCILE_MAX_INSTANCE_AGE_SECS = "28800"
 RECONCILE_SYNC_AFTER_SECS = "300"
 # How far back failed webhook deliveries are redelivered.
 RECONCILE_REDELIVER_WINDOW_SECS = "21600"
+# The inbox alerts go to (crates/cloud/src/alerts.rs), listed in the
+# ALERTS binding's allowed_destination_addresses above. The uptime
+# monitor that polls https://app.hatchrun.io/healthz emails it too.
+ALERT_EMAIL = "alerts-inbox@example.invalid"
