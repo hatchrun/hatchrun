@@ -232,10 +232,14 @@ pub(crate) async fn recheck(db: &Db, tenant_id: &str, now: u64) -> Result<u64> {
     db.run(RECHECK, &params![tenant_id, now]).await
 }
 
+/// Locks the tenant of installation `$1` until the transaction ends.
+pub(crate) const LOCK_INSTALLATION: &str =
+    "SELECT true AS locked FROM tenants WHERE installation_id = $1 FOR UPDATE";
+
 /// Moves job `id` to `launching` as runner `name` at `now` if it is
 /// queued, nobody took it, and `installation` has fewer than
 /// `max_runners` runners, and counts the attempt. Claims for one
-/// installation hold its advisory lock in turn, so the second sees the
+/// installation lock its tenant's row in turn, so the second sees the
 /// first's runner in its count and the second delivery of a job finds
 /// `launch_state` set. Returns the job's launch attempts so far, this
 /// one included, or `None` when it was not taken.
@@ -247,10 +251,10 @@ pub(crate) async fn claim(
     installation: u64,
     max_runners: u32,
 ) -> Result<Option<u32>> {
-    let lock = i64::try_from(installation).unwrap_or(i64::MAX);
+    let lock = params![installation];
     let claimed: Option<Claimed> = db
         .first_locked(
-            lock,
+            (LOCK_INSTALLATION, &lock),
             CLAIM,
             &params![id, name, now, installation, max_runners],
         )
@@ -904,6 +908,11 @@ mod tests {
     #[test]
     fn claims_at_once_stop_at_max_runners() {
         let db = testdb::Db::new();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, \
+             updated_at) VALUES ('t', 9, 'acme', 42, 1, 1)",
+            &[],
+        );
         job(&db, 1, "a", "in_progress", Some("launched"));
         job(&db, 2, "b", "queued", None);
         job(&db, 3, "c", "queued", None);

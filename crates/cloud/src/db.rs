@@ -314,29 +314,24 @@ impl Db {
         rows.iter().map(|row| json(row).map_err(error)).collect()
     }
 
-    /// The first row of `sql`, run in a transaction that first takes
-    /// the advisory lock `key`. Statements that read rows to decide what
-    /// they write, such as a count against a limit, see what an earlier
-    /// holder of the lock wrote: each statement in a transaction reads
-    /// as of its own start, after the lock is held.
+    /// The first row of `sql`, run in a transaction after `lock`, a
+    /// statement that locks rows (`SELECT ... FOR UPDATE`). Statements
+    /// that read rows to decide what they write, such as a count against
+    /// a limit, then see what an earlier holder of the lock wrote: each
+    /// statement in a transaction reads as of its own start, after the
+    /// lock is held. Hyperdrive does not pass advisory locks through, so
+    /// the lock is on a row.
     ///
     /// # Errors
     ///
     /// As [`Db::all`]; the transaction rolls back.
     pub(crate) async fn first_locked<T: DeserializeOwned>(
         &self,
-        key: i64,
+        lock: (&str, &[Param]),
         sql: &str,
         params: &[Param],
     ) -> worker::Result<Option<T>> {
-        let lock = [Param::Int(key)];
-        let statements = [
-            (
-                "SELECT true AS locked FROM pg_advisory_xact_lock($1)",
-                &lock[..],
-            ),
-            (sql, params),
-        ];
+        let statements = [lock, (sql, params)];
         let mut results = self.transaction(&statements).await?;
         results
             .pop()
