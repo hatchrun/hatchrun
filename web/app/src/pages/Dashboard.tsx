@@ -21,8 +21,8 @@ import { CopyButton } from "@/components/CopyButton";
 import { ChevronRightIcon, ExternalIcon, GitHubIcon, OpenIcon, SearchIcon } from "@/components/icons";
 import {
   ago,
-  endOf,
   instanceUrl,
+  jobSpan,
   runName,
   runRef,
   runSpan,
@@ -52,6 +52,9 @@ const SUGGESTED = "hatchrun-4cpu-arm64";
 /** Milliseconds the search box waits after the last key before it asks. */
 const DEBOUNCE_MS = 300;
 /** The order a column sorts in when first picked. */
+// "started" is the API's name for the queued order: the newest attempt's
+// first job's queued_at. The column is headed Queued, as that is what it
+// shows; a job's start is GitHub's startedAt, which the list does not sort by.
 const FIRST_DIR: Record<RunSort, SortDir> = { started: "desc", repository: "asc", took: "desc" };
 /** How each order reads, for the column head's label. */
 const ORDER_TEXT: Record<RunSort, Record<SortDir, string>> = {
@@ -247,7 +250,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
                     <span className="cap">EC2 instance</span>{" "}
                     <span className="ml-1 font-mono text-[10px] text-steel">↗ aws console</span>
                   </TableHead>
-                  <SortHead column="started" label="Started" {...head} />
+                  <SortHead column="started" label="Queued" {...head} />
                   <SortHead column="took" label="Took" className="text-right" {...head} />
                 </TableRow>
               </TableHeader>
@@ -772,6 +775,10 @@ function RunRows({
   open: boolean;
   onToggle: () => void;
 }) {
+  const [only] = run.jobs;
+  if (only && run.jobs.length === 1) {
+    return <OneJobRun org={org} run={run} job={only} region={region} now={now} />;
+  }
   const shown = runState(run.jobs);
   // The run takes the edge of its worst job, so a closed run with a failed launch still stands out.
   const worst = run.jobs.map(state).find((s) => s.tone === "failed") ?? run.jobs.map(state).find((s) => s.tone === "retrying");
@@ -799,46 +806,14 @@ function RunRows({
           <Tally jobs={run.jobs} />
         </TableCell>
         <TableCell className="max-w-[360px]">
-          <Link
-            href={`/o/${org}/runs/${run.id}`}
-            aria-label={`${name} ${runRef(run)} in ${run.repository}, open the run`}
-            className="group flex min-w-0 flex-col"
-          >
-            <span className="inline-flex items-center gap-2">
-              <span className="font-bold text-bone group-hover:text-chick">{name}</span>
-              <ChevronRightIcon className="text-chick" />
-            </span>
-            {run.displayTitle && <span className="truncate text-[13px] text-fog">{run.displayTitle}</span>}
-          </Link>
+          <RunLink org={org} run={run} />
         </TableCell>
         <TableCell className="font-mono text-xs">
-          <a
-            href={run.githubUrl}
-            aria-label={`${run.repository} run ${runRef(run)} on GitHub, opens github.com`}
-            className="group inline-flex flex-wrap items-center gap-x-2 gap-y-1 text-bone-dim hover:text-bone"
-          >
-            <GitHubIcon className="text-fog" />
-            <span className="quiet-underline group-hover:decoration-fog">{run.repository}</span>
-            <span>{runRef(run)}</span>
-            <ExternalIcon />
-          </a>
-          <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-fog">
-            {run.headBranch && (
-              <span className="rounded-xs border border-rivet bg-housing px-1.5 py-px text-bone-dim">{run.headBranch}</span>
-            )}
-            {run.event && <span>{run.event}</span>}
-            {several && <span className="text-chick">attempt {run.attempt}</span>}
-          </div>
+          <RunRepository run={run} />
         </TableCell>
-        <TableCell className="font-mono text-xs text-steel">
-          {run.jobs.length} {run.jobs.length === 1 ? "job" : "jobs"}
-        </TableCell>
-        <TableCell className="font-mono text-xs text-fog" title={new Date(run.queuedAt).toLocaleString()}>
-          {ago(run.queuedAt)}
-        </TableCell>
-        <TableCell className={cn("text-right font-mono text-xs", took.live ? "text-blush" : "text-bone")}>
-          {span(took.ms)}
-        </TableCell>
+        <TableCell className="font-mono text-xs text-steel">{run.jobs.length} jobs</TableCell>
+        <QueuedCell at={run.queuedAt} />
+        <TookCell took={took} />
       </TableRow>
       {open &&
         run.jobs.map((job, i) => (
@@ -864,6 +839,148 @@ function RunRows({
         </TableRow>
       )}
     </Fragment>
+  );
+}
+
+/**
+ * A run of one job, in one row: the job's state, the run with the job
+ * under it, the job's label and instance. A second row would only say
+ * the same state again.
+ */
+function OneJobRun({
+  org,
+  run,
+  job,
+  region,
+  now,
+}: {
+  org: string;
+  run: ListedRun;
+  job: Job;
+  region: string | null;
+  now: number;
+}) {
+  const shown = state(job);
+  const trouble = problem(job);
+  const edge = edgeOf(shown.tone);
+  return (
+    <Fragment>
+      <TableRow className="bg-panel/40">
+        <TableCell className={edge}>
+          <span className="inline-flex items-center gap-2">
+            {/* Keeps the state in line with the runs that open. */}
+            <span aria-hidden="true" className="invisible p-0.5">
+              <ChevronRightIcon />
+            </span>
+            <StatusMark shown={shown} />
+          </span>
+        </TableCell>
+        <TableCell className="max-w-[360px]">
+          <RunLink org={org} run={run} />
+          <Link
+            href={`/o/${org}/jobs/${job.id}`}
+            aria-label={`Job ${job.name || job.id}, open details`}
+            className="group mt-1 inline-flex items-center gap-2 font-mono text-xs"
+          >
+            <span aria-hidden="true" className="text-steel">
+              └
+            </span>
+            <span className="text-bone-dim group-hover:text-chick">{job.name || `#${job.id}`}</span>
+            <ChevronRightIcon className="text-chick" />
+          </Link>
+        </TableCell>
+        <TableCell className="font-mono text-xs">
+          <RunRepository run={run} />
+          <div className="mt-1 text-bone-dim">{job.label}</div>
+        </TableCell>
+        <TableCell className="font-mono text-xs">
+          <Instance job={job} region={region} failed={shown.tone === "failed"} />
+        </TableCell>
+        <QueuedCell at={run.queuedAt} />
+        <TookCell took={jobSpan(job, now)} />
+      </TableRow>
+      {trouble && <ProblemRow trouble={trouble} edge={edge} last />}
+    </Fragment>
+  );
+}
+
+/** The run's name and title, linking to the run page. */
+function RunLink({ org, run }: { org: string; run: ListedRun }) {
+  const name = runName(run);
+  return (
+    <Link
+      href={`/o/${org}/runs/${run.id}`}
+      aria-label={`${name} ${runRef(run)} in ${run.repository}, open the run`}
+      className="group flex min-w-0 flex-col"
+    >
+      <span className="inline-flex items-center gap-2">
+        <span className="font-bold text-bone group-hover:text-chick">{name}</span>
+        <ChevronRightIcon className="text-chick" />
+      </span>
+      {run.displayTitle && <span className="truncate text-[13px] text-fog">{run.displayTitle}</span>}
+    </Link>
+  );
+}
+
+/** The run's repository and number, linking to GitHub, with its branch, event and attempt. */
+function RunRepository({ run }: { run: ListedRun }) {
+  return (
+    <>
+      <a
+        href={run.githubUrl}
+        aria-label={`${run.repository} run ${runRef(run)} on GitHub, opens github.com`}
+        className="group inline-flex flex-wrap items-center gap-x-2 gap-y-1 text-bone-dim hover:text-bone"
+      >
+        <GitHubIcon className="text-fog" />
+        <span className="quiet-underline group-hover:decoration-fog">{run.repository}</span>
+        <span>{runRef(run)}</span>
+        <ExternalIcon />
+      </a>
+      <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-fog">
+        {run.headBranch && (
+          <span className="rounded-xs border border-rivet bg-housing px-1.5 py-px text-bone-dim">{run.headBranch}</span>
+        )}
+        {run.event && <span>{run.event}</span>}
+        {run.attempt > 1 && <span className="text-chick">attempt {run.attempt}</span>}
+      </div>
+    </>
+  );
+}
+
+/** A job's instance, linking to the EC2 console when the region is known. */
+function Instance({ job, region, failed }: { job: Job; region: string | null; failed: boolean }) {
+  if (!job.instanceId) {
+    return <span className="text-steel">{job.status === "completed" || failed ? "none" : "none yet"}</span>;
+  }
+  if (!region) {
+    return <span className="text-bone-dim">{job.instanceId}</span>;
+  }
+  return (
+    <a
+      href={instanceUrl(region, job.instanceId)}
+      aria-label={`Instance ${job.instanceId}, opens the AWS EC2 console`}
+      className="group inline-flex items-center gap-1.5 text-bone-dim hover:text-bone"
+    >
+      <span className="quiet-underline group-hover:decoration-fog">{job.instanceId}</span>
+      <ExternalIcon />
+    </a>
+  );
+}
+
+function QueuedCell({ at }: { at: number }) {
+  return (
+    <TableCell className="font-mono text-xs text-fog" title={new Date(at).toLocaleString()}>
+      {ago(at)}
+    </TableCell>
+  );
+}
+
+/** How long a run or job took; blush while it still counts up. */
+function TookCell({ took }: { took: { ms: number; live: boolean } }) {
+  return (
+    <TableCell className={cn("text-right font-mono text-xs", took.live ? "text-blush" : "text-bone")}>
+      {span(took.ms)}
+    </TableCell>
   );
 }
 
@@ -902,9 +1019,6 @@ function JobRows({
   const shown = state(job);
   const trouble = problem(job);
   const edge = edgeOf(shown.tone);
-  const live = job.status === "in_progress";
-  const took =
-    job.status === "completed" ? span(endOf(job) - job.queuedAt) : live ? span(now - job.queuedAt) : null;
   const branch = last && !trouble ? "└" : "├";
   return (
     <Fragment>
@@ -930,31 +1044,10 @@ function JobRows({
         </TableCell>
         <TableCell className="font-mono text-xs text-bone-dim">{job.label}</TableCell>
         <TableCell className="font-mono text-xs">
-          {job.instanceId ? (
-            region ? (
-              <a
-                href={instanceUrl(region, job.instanceId)}
-                aria-label={`Instance ${job.instanceId}, opens the AWS EC2 console`}
-                className="group inline-flex items-center gap-1.5 text-bone-dim hover:text-bone"
-              >
-                <span className="quiet-underline group-hover:decoration-fog">{job.instanceId}</span>
-                <ExternalIcon />
-              </a>
-            ) : (
-              <span className="text-bone-dim">{job.instanceId}</span>
-            )
-          ) : (
-            <span className="text-steel">{job.status === "completed" || shown.tone === "failed" ? "none" : "none yet"}</span>
-          )}
+          <Instance job={job} region={region} failed={shown.tone === "failed"} />
         </TableCell>
-        <TableCell className="font-mono text-xs text-fog" title={new Date(job.queuedAt).toLocaleString()}>
-          {ago(job.queuedAt)}
-        </TableCell>
-        <TableCell
-          className={cn("text-right font-mono text-xs", took === null ? "text-steel" : live ? "text-blush" : "text-bone")}
-        >
-          {took ?? "-"}
-        </TableCell>
+        <QueuedCell at={job.queuedAt} />
+        <TookCell took={jobSpan(job, now)} />
       </TableRow>
       {trouble && <ProblemRow trouble={trouble} edge={edge} last={last} />}
     </Fragment>
