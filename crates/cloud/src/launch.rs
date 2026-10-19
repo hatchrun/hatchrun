@@ -301,6 +301,7 @@ pub(crate) async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
 
     let calls = Counted::default();
     let launched = launch_claimed(env, &db, job, &tenant, &name, &calls).await;
+    crate::alerts::note_rate_limits(&db, &calls, now_ms()).await;
     record(&db, job.id, &name, attempts, launched, calls.sent()).await
 }
 

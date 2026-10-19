@@ -18,19 +18,23 @@
 //! [`crate::reconcile::retry`]). An error before that, such as D1 not
 //! answering, retries the message after [`RETRY_DELAY`]. After the
 //! consumer's `max_retries` the message goes to `hatchrun-launches-dlq`,
-//! and the reconciler launches the job again once its grace is up.
+//! and the reconciler launches the job again once its grace is up. This
+//! Worker consumes the dead-letter queue too: it records each message
+//! in `failed_launches` and fires the failed launch alert (see
+//! [`crate::alerts`]).
 
 use std::future::Future;
 
 use serde::{Deserialize, Serialize};
 use worker::{Env, MessageBatch, MessageExt, QueueRetryOptionsBuilder, console_error};
 
-use crate::labels;
-use crate::launch;
 use crate::webhook::QueuedJob;
+use crate::{DB, alerts, labels, launch, now_ms};
 
 /// Queue producer binding in `wrangler.toml`.
 pub(crate) const QUEUE: &str = "LAUNCHES";
+/// The dead-letter queue in `wrangler.toml`.
+pub(crate) const DEAD_LETTERS: &str = "hatchrun-launches-dlq";
 /// How long a message waits before it is delivered again, seconds. With
 /// the consumer's three retries a message gives up within a minute, the
 /// reconciler's grace for a queued job without a runner.
@@ -165,6 +169,45 @@ pub(crate) async fn consume(batch: MessageBatch<serde_json::Value>, env: Env) {
                     "launch queue: message {id}: {err}, trying again in {RETRY_DELAY} s"
                 );
                 message.retry_with_options(&retry);
+            }
+        }
+    }
+}
+
+/// A dead letter as `failed_launches` records it: the message id, and
+/// the job and installation when the body reads.
+fn dead_letter(id: String, body: serde_json::Value) -> (String, Option<u64>, Option<u64>) {
+    match Launch::deserialize(body) {
+        Ok(message) => (id, Some(message.id), Some(message.installation_id)),
+        Err(_) => (id, None, None),
+    }
+}
+
+/// The dead-letter queue's consumer: records the batch's launches as
+/// failed and acks them, or retries the batch when D1 does not take
+/// them. The alert's own errors do not hold the messages back.
+pub(crate) async fn dead_letters(batch: MessageBatch<serde_json::Value>, env: Env) {
+    let messages: Vec<_> = batch.raw_iter().collect();
+    let failed: Vec<_> = messages
+        .iter()
+        .map(|message| dead_letter(message.id(), json(&message.body())))
+        .collect();
+    let recorded = match env.d1(DB) {
+        Ok(db) => alerts::launches_failed(&env, &db, now_ms(), &failed).await,
+        Err(err) => Err(err.to_string()),
+    };
+    match recorded {
+        Ok(()) => {
+            for ((id, job, _), message) in failed.iter().zip(&messages) {
+                let job = job.map_or_else(|| "unreadable".to_owned(), |job| job.to_string());
+                console_error!("launch queue: message {id}: job {job}: out of retries");
+                message.ack();
+            }
+        }
+        Err(err) => {
+            console_error!("launch dead letters: {err}");
+            for message in &messages {
+                message.retry();
             }
         }
     }
@@ -340,6 +383,19 @@ mod tests {
             Verdict::Drop(err) if err.starts_with("ubuntu-latest")
         ));
         assert!(claims.started.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_dead_letter_names_its_job_when_it_reads() {
+        let message = Launch::from(&job(5, "hatchrun"));
+        assert_eq!(
+            dead_letter("m1".to_owned(), serde_json::to_value(message).unwrap()),
+            ("m1".to_owned(), Some(5), Some(INSTALLATION))
+        );
+        assert_eq!(
+            dead_letter("m2".to_owned(), serde_json::json!({ "job": 5 })),
+            ("m2".to_owned(), None, None)
+        );
     }
 
     #[test]

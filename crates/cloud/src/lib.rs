@@ -18,15 +18,19 @@
 //! - `/api/*` on `app.hatchrun.io` is the app's API (see [`app`]); every
 //!   other path there is the app itself, from the static assets.
 //! - `/v1/cache/*` is the job cache that runners call (see [`cache`]).
+//! - `GET /healthz` says whether the reconciler is running, for an
+//!   uptime monitor (see the `alerts` module).
 //! - `GET /.well-known/openid-configuration` and
 //!   `GET /.well-known/jwks.json` on `oidc.hatchrun.io` let STS check
 //!   the tokens the Worker signs (see [`oidc`]).
 //!
 //! A Cron Trigger runs the reconciler every minute, which redelivers
 //! failed webhooks, launches lost launches again and terminates
-//! instances nothing needs (see the `reconcile` module).
+//! instances nothing needs (see the `reconcile` module), then emails
+//! the alerts that are due (see the `alerts` module).
 
 pub mod actions;
+mod alerts;
 mod app;
 pub mod aws;
 pub mod cache;
@@ -114,6 +118,9 @@ async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response>
         response.headers_mut().set("Cache-Control", "no-store")?;
         return Ok(response);
     }
+    if path == "/healthz" {
+        return healthz(&env).await;
+    }
     if path.starts_with("/github/") {
         return error("not found", 404);
     }
@@ -126,15 +133,35 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     reconcile::run(env).await;
 }
 
-/// The launch queue's consumer in `wrangler.toml` (see [`launches`]).
+/// The launch queue's consumers in `wrangler.toml`: the launches, and
+/// the messages that ran out of retries (see [`launches`]).
 #[event(queue)]
 async fn queue(
     batch: MessageBatch<serde_json::Value>,
     env: Env,
     _ctx: worker::Context,
 ) -> Result<()> {
-    launches::consume(batch, env).await;
+    if batch.queue() == launches::DEAD_LETTERS {
+        launches::dead_letters(batch, env).await;
+    } else {
+        launches::consume(batch, env).await;
+    }
     Ok(())
+}
+
+/// Whether the reconciler is running: 200 while its last pass is
+/// recent and the passes are not all failing, 503 otherwise.
+async fn healthz(env: &Env) -> Result<Response> {
+    let row = env
+        .d1(DB)?
+        .prepare(alerts::HEALTH)
+        .first::<alerts::HealthRow>(None)
+        .await?
+        .unwrap_or_default();
+    let (status, body) = alerts::health(&row, now_ms());
+    let mut response = Response::from_json(&body)?.with_status(status);
+    response.headers_mut().set("Cache-Control", "no-store")?;
+    Ok(response)
 }
 
 /// The app's static assets. Every path that is not a file is the app's

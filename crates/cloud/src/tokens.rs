@@ -312,7 +312,7 @@ impl<'a, S: Store, M: Mint, G: Sender> Tokens<'a, S, M, G> {
         let (token, minted) = self.find(installation_id).await?;
         let response = self
             .github
-            .send(&build(&token))
+            .send_as(installation_id, &build(&token))
             .await
             .map_err(Error::Unreachable)?;
         if response.status != 401 || minted {
@@ -320,7 +320,7 @@ impl<'a, S: Store, M: Mint, G: Sender> Tokens<'a, S, M, G> {
         }
         let token = self.replace(installation_id).await?;
         self.github
-            .send(&build(&token))
+            .send_as(installation_id, &build(&token))
             .await
             .map_err(Error::Unreachable)
     }
