@@ -71,7 +71,7 @@ pub fn minutes(started: u64, completed: u64) -> u32 {
 /// Records `$2` minutes of job `$1`, which completed at `$3`, if a
 /// hatchrun runner took it and nothing recorded it before. The row is
 /// billed when the tenant pays and is not in the beta.
-fn insert_sql() -> String {
+pub(crate) fn insert_sql() -> String {
     format!(
         "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed) \
          SELECT jobs.id, tenants.id, $2::bigint, $3::bigint, NOT tenants.beta AND {PAID} \
@@ -84,7 +84,7 @@ fn insert_sql() -> String {
 /// Sets `free_used_up_at` to `$2` on the tenant of job `$1` when it is
 /// unpaid, not in the beta, has not used up its free minutes yet this
 /// month and now has at least `$3` minutes.
-fn used_up_sql() -> String {
+pub(crate) fn used_up_sql() -> String {
     format!(
         "UPDATE tenants SET free_used_up_at = $2 \
          WHERE id = (SELECT tenant_id FROM usage_events WHERE job_id = $1) \
@@ -96,7 +96,7 @@ fn used_up_sql() -> String {
 
 /// Tenant `$1`'s minutes this month, when it used up its free ones this
 /// month, and whether it may launch.
-fn month_sql() -> String {
+pub(crate) fn month_sql() -> String {
     format!(
         "SELECT {USED} AS minutes, \
          CASE WHEN free_used_up_at >= {MONTH_START} THEN free_used_up_at END \
@@ -121,7 +121,7 @@ fn grace_sql() -> String {
 /// after `$1` with GitHub's times but have no minutes yet, as when
 /// recording failed after the reconciler marked the job completed.
 /// Returns each recorded row's tenant.
-fn sweep_sql() -> String {
+pub(crate) fn sweep_sql() -> String {
     format!(
         "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed) \
          SELECT jobs.id, tenants.id, \
@@ -142,20 +142,25 @@ const CLEAR_GRACE: &str =
     "UPDATE tenants SET free_used_up_at = NULL WHERE id = $1 AND free_used_up_at IS NOT NULL";
 
 /// Up to `$1` billed minutes Polar has not taken, oldest first.
-const UNSENT: &str = "SELECT job_id, tenant_id, minutes, ended_at FROM usage_events \
+pub(crate) const UNSENT: &str = "SELECT job_id, tenant_id, minutes, ended_at FROM usage_events \
      WHERE billed AND sent_at IS NULL ORDER BY ended_at LIMIT $1";
 
 /// Marks the minutes of the jobs in the JSON array `$1` as taken by
 /// Polar at `$2`.
-const SENT: &str = "UPDATE usage_events SET sent_at = $2 \
+pub(crate) const SENT: &str = "UPDATE usage_events SET sent_at = $2 \
      WHERE job_id IN (SELECT json_array_elements_text($1::json)::bigint)";
+
+/// Locks the tenant of job `$1` until the transaction ends.
+pub(crate) const LOCK_TENANT: &str = "SELECT 1 FROM tenants WHERE installation_id = \
+     (SELECT installation_id FROM jobs WHERE id = $1) FOR UPDATE";
 
 /// Records the minutes of job `id`, which ran from `started` to
 /// `completed` (Unix ms), if a hatchrun runner took it and it was not
 /// recorded before. An unpaid tenant that this job takes past its free
-/// minutes gets `free_used_up_at`, which starts its grace period. Both
-/// statements run in one transaction. Returns
-/// whether the job was recorded now.
+/// minutes gets `free_used_up_at`, which starts its grace period. The
+/// statements run in one transaction that first locks the job's tenant,
+/// so two jobs of a tenant completing at once take turns and the second
+/// counts the first's minutes. Returns whether the job was recorded now.
 pub(crate) async fn record(
     db: &crate::db::Db,
     id: u64,
@@ -167,6 +172,7 @@ pub(crate) async fn record(
     let used_up = used_up_sql();
     let results = db
         .batch(&[
+            (LOCK_TENANT, params![id]),
             (
                 insert.as_str(),
                 params![id, minutes(started, completed), completed],
@@ -175,10 +181,10 @@ pub(crate) async fn record(
         ])
         .await?;
     let changed = |at: usize| results.get(at).copied().unwrap_or(0);
-    if changed(1) == 1 {
+    if changed(2) == 1 {
         worker::console_log!("job {id}: its tenant used up its free minutes this month");
     }
-    Ok(changed(0) == 1)
+    Ok(changed(1) == 1)
 }
 
 /// Starts the grace period of tenant `id` at `now` if it is unpaid and
@@ -310,6 +316,7 @@ mod tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sql {
     use super::*;
+    use crate::db::Param;
     use crate::testdb::{Db, params};
 
     const DAY: u64 = 24 * 60 * 60 * 1000;
@@ -346,10 +353,8 @@ mod sql {
         db
     }
 
-    /// Records job `id` of `installation` that ran `mins` minutes and
-    /// completed `ago` ms before now. Returns the rows each statement
-    /// changed.
-    fn record(db: &Db, id: u64, installation: u64, mins: u64, ago: u64, ran: bool) -> Vec<usize> {
+    /// A completed job `id` of `installation`.
+    fn job(db: &Db, id: u64, installation: u64, ran: bool) {
         let runner = ran.then(|| format!("hatchrun-{id}-ab"));
         db.run(
             "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
@@ -357,13 +362,64 @@ mod sql {
              'completed', 1, 1, $3)",
             &params![id, installation, runner],
         );
+    }
+
+    /// [`super::record`]'s statements for job `id` that ran `mins`
+    /// minutes and completed `ago` ms before now.
+    fn statements(id: u64, mins: u64, ago: u64) -> Vec<(String, Vec<Param>)> {
         let completed = now() - ago;
         let used = minutes(completed - mins * 60_000, completed);
-        db.batch(&[
-            (insert_sql().as_str(), params![id, used, completed]),
-            (used_up_sql().as_str(), params![id, now(), FREE_MINUTES]),
-        ])
-        .unwrap()
+        vec![
+            (LOCK_TENANT.to_owned(), params![id]),
+            (insert_sql(), params![id, used, completed]),
+            (used_up_sql(), params![id, now(), FREE_MINUTES]),
+        ]
+    }
+
+    /// Runs `statements` as [`super::record`] does on `db`. Returns the
+    /// rows the insert and the update changed.
+    async fn send(db: &crate::db::Db, statements: Vec<(String, Vec<Param>)>) -> Vec<usize> {
+        let statements: Vec<(&str, Vec<Param>)> = statements
+            .iter()
+            .map(|(sql, params)| (sql.as_str(), params.clone()))
+            .collect();
+        let changes = db.batch(&statements).await.unwrap();
+        changes[1..]
+            .iter()
+            .map(|n| usize::try_from(*n).unwrap())
+            .collect()
+    }
+
+    /// Records job `id` of `installation` that ran `mins` minutes and
+    /// completed `ago` ms before now. Returns the rows the insert and
+    /// the update changed.
+    fn record(db: &Db, id: u64, installation: u64, mins: u64, ago: u64, ran: bool) -> Vec<usize> {
+        job(db, id, installation, ran);
+        db.wait(send(db.db(), statements(id, mins, ago)))
+    }
+
+    #[test]
+    fn jobs_completing_together_start_the_grace_period() {
+        let db = seed();
+        assert_eq!(record(&db, 1, 1, 2995, 0, true), [1, 0]);
+        job(&db, 2, 1, true);
+        job(&db, 3, 1, true);
+        let other = db.connect(&crate::testdb::url().parse().unwrap());
+        // Each alone stays under the free minutes; both together pass
+        // them. Sent at once on two connections, the second waits for
+        // the first's lock on the tenant and counts its minutes.
+        let (first, second) = db.wait(async {
+            futures_util::join!(
+                send(db.db(), statements(2, 3, 0)),
+                send(&other, statements(3, 3, 0))
+            )
+        });
+        assert_eq!(first[0] + second[0], 2);
+        assert_eq!(first[1] + second[1], 1, "{first:?} {second:?}");
+        let row = month(&db, "free");
+        assert_eq!(row.minutes, 3001);
+        assert!(row.free_used_up_at.is_some());
+        assert!(row.may_launch);
     }
 
     fn month(db: &Db, id: &str) -> MonthRow {

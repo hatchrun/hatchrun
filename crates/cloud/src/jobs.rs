@@ -879,3 +879,87 @@ pub(crate) async fn unconnected<T: DeserializeOwned>(
 ) -> Result<Vec<T>> {
     db.all(&unconnected_query(), &params![before, limit]).await
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::testdb;
+
+    const NOW: u64 = 1_792_140_000_000;
+
+    /// A second client on `db`'s schema.
+    fn other(db: &testdb::Db) -> Db {
+        db.connect(&testdb::url().parse().unwrap())
+    }
+
+    fn job(db: &testdb::Db, id: u64, name: &str, status: &str, launch: Option<&str>) {
+        db.run(
+            "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+             queued_at, updated_at, name, launch_state) \
+             VALUES ($1, 42, 'acme/app', 7, 'hatchrun', $2, $3, $3, $4, $5)",
+            &testdb::params![id, status, NOW, name, launch],
+        );
+    }
+
+    #[test]
+    fn claims_at_once_stop_at_max_runners() {
+        let db = testdb::Db::new();
+        job(&db, 1, "a", "in_progress", Some("launched"));
+        job(&db, 2, "b", "queued", None);
+        job(&db, 3, "c", "queued", None);
+        let other = other(&db);
+        // One place left under max_runners 2, two claims sent at once.
+        let (first, second) = db.wait(async {
+            futures_util::join!(
+                claim(db.db(), 2, "hatchrun-2", NOW, 42, 2),
+                claim(&other, 3, "hatchrun-3", NOW, 42, 2)
+            )
+        });
+        let taken = [first.unwrap(), second.unwrap()];
+        assert_eq!(taken.iter().flatten().count(), 1, "{taken:?}");
+    }
+
+    #[test]
+    fn jobs_of_a_run_completing_together_end_it() {
+        let db = testdb::Db::new();
+        db.run(
+            "INSERT INTO runs (id, installation_id, repository, head_sha, attempt, queued_at, \
+             created_at, updated_at) VALUES (7, 42, 'acme/app', 'ab', 1, $1, $1, $1)",
+            &testdb::params![NOW],
+        );
+        job(&db, 1, "a", "in_progress", Some("launched"));
+        job(&db, 2, "b", "in_progress", Some("launched"));
+        let other = other(&db);
+        let complete = |id: u64, at: u64| {
+            (
+                PROGRESS,
+                params![
+                    "completed",
+                    at,
+                    id,
+                    None::<&str>,
+                    "success",
+                    None::<u64>,
+                    at
+                ],
+            )
+        };
+        // The first completion holds its transaction open while the
+        // second one waits for the run's row.
+        let slow = [
+            complete(1, NOW + 1000),
+            ("SELECT pg_sleep(0.2)", Vec::new()),
+        ];
+        let quick = [complete(2, NOW + 2000)];
+        let (first, second) = db.wait(async {
+            futures_util::join!(db.db().batch(&slow), async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                other.batch(&quick).await
+            })
+        });
+        first.unwrap();
+        second.unwrap();
+        let ended: Option<u64> = db.column("SELECT ended_at FROM runs", &[], "ended_at");
+        assert_eq!(ended, Some(NOW + 2000));
+    }
+}

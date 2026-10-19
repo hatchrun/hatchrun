@@ -46,7 +46,7 @@ tokio-postgres = { version = "0.7.15", default-features = false, features = ["js
 
 # Tests run the Worker's queries against a real Postgres over TCP.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { version = "1.48.0", features = ["rt", "net"] }
+tokio = { version = "1.48.0", features = ["rt", "net", "time", "io-util", "sync"] }
 tokio-postgres = { version = "0.7.15", features = ["runtime"] }
 
 [lints]

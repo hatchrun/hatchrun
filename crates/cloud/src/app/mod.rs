@@ -34,7 +34,7 @@ mod dashboard;
 mod images;
 mod metrics;
 mod runners;
-mod tenants;
+pub(crate) mod tenants;
 
 use serde::Deserialize;
 use worker::{Env, Headers, Method, Request, Response, Result, console_error};
@@ -122,7 +122,7 @@ struct SessionRow {
 
 /// The user of a session that has not expired. Binds the session key
 /// and the time in milliseconds.
-const FIND_SESSION: &str = "SELECT users.id, users.login, users.name, users.avatar_url, \
+pub(crate) const FIND_SESSION: &str = "SELECT users.id, users.login, users.name, users.avatar_url, \
     sessions.github_token FROM sessions JOIN users ON users.id = sessions.user_id \
     WHERE sessions.key = $1 AND sessions.expires_at > $2";
 
@@ -189,10 +189,17 @@ impl Session {
 #[allow(clippy::too_many_lines)] // One match arm per route.
 pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
     let config = Config::read(&env)?;
-    let db = Db::connect(&env).await?;
     let path = req.path();
+    // Routes that need no database, or connect only once a request's
+    // signature checks out.
     match (req.method(), path.as_str()) {
         (Method::Get, "/api/auth/login") => return login(&req, &config),
+        (Method::Post, "/api/polar/webhook") => return billing::webhook(req, &env).await,
+        (Method::Post, crate::images::PATH) => return images::post(req, &env).await,
+        _ => {}
+    }
+    let db = Db::connect(&env).await?;
+    match (req.method(), path.as_str()) {
         (Method::Get, "/api/auth/callback") => {
             return match callback(&req, &env, &config, &db).await {
                 Ok(response) => Ok(response),
@@ -221,8 +228,6 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
                 .append("Set-Cookie", &session::clear_cookie(session::COOKIE))?;
             return Ok(response);
         }
-        (Method::Post, "/api/polar/webhook") => return billing::webhook(req, &env).await,
-        (Method::Post, crate::images::PATH) => return images::post(req, &env).await,
         _ => {}
     }
 

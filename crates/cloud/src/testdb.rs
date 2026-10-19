@@ -35,6 +35,11 @@ pub(crate) struct Db {
     schema: String,
 }
 
+/// The test server's URL.
+pub(crate) fn url() -> String {
+    std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned())
+}
+
 /// The migrations, in file name order.
 fn migrations() -> Vec<String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -57,9 +62,10 @@ impl Db {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
+            .enable_time()
             .build()
             .expect("start a runtime");
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned());
+        let url = url();
         let schema = format!(
             "test_{}_{}",
             std::process::id(),
@@ -90,6 +96,25 @@ impl Db {
             inner: crate::db::Db::new(client),
             schema,
         }
+    }
+
+    /// Another client on this schema, through `config`, such as one
+    /// that reaches the server by another address. Its connection runs
+    /// on this runtime.
+    pub(crate) fn connect(&self, config: &tokio_postgres::Config) -> crate::db::Db {
+        let client = self.runtime.block_on(async {
+            let (client, connection) = config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .unwrap_or_else(|err| panic!("connect a second client: {err}"));
+            tokio::spawn(connection);
+            client
+                .batch_execute(&format!("SET search_path TO {}", self.schema))
+                .await
+                .expect("set the search path");
+            client
+        });
+        crate::db::Db::new(client)
     }
 
     /// The Worker's client, for the functions that take one.
