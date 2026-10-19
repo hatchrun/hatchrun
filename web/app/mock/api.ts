@@ -263,15 +263,15 @@ const routes: Record<string, Handler> = {
     }
     const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
     // As list_query in crates/cloud/src/app/dashboard.rs: by repository
-    // case aside, each repository newest first; by took, finished runs
-    // by how long they took, ties by id, then the runs still going,
-    // oldest first; and the cursor is the last run of the page before.
+    // case aside, each repository newest first; by took, the runs still
+    // going, oldest first, then finished runs by how long they took, ties
+    // by id; and the cursor is the last run of the page before.
     type Key = Pick<Run, "queuedAt" | "id" | "repository" | "endedAt">;
     const newest = (a: Key, b: Key) => b.queuedAt - a.queuedAt || b.id - a.id;
     const name = (run: Key) => run.repository.toLowerCase();
     const took = (a: Key, b: Key) => {
       if ((a.endedAt === null) !== (b.endedAt === null)) {
-        return a.endedAt === null ? 1 : -1;
+        return a.endedAt === null ? -1 : 1;
       }
       if (a.endedAt === null || b.endedAt === null) {
         return a.queuedAt - b.queuedAt || a.id - b.id;
@@ -701,6 +701,19 @@ function sampleRuns(now: number): ListedRun[] {
       job("lint", "hatchrun-2cpu", "completed", "launched", 40, 60),
       job("test", "hatchrun-2cpu", "in_progress", "launched", 2, 0, { runAttempt: 2 }),
     ], [job("test", "hatchrun-2cpu", "completed", "launched", 40, 200, { conclusion: "failure" })]),
+    // One job each, waiting for a runner, launching one, starting on one and running.
+    run(18234567990, { repository: "acme-corp/web", workflowName: "Lint", displayTitle: "chore(deps): bump vite to 8.3" }, [
+      job("lint", "hatchrun-2cpu", "queued", null, 0.2, 0),
+    ]),
+    run(18234567980, { repository: "acme-corp/api", workflowName: "Build images", displayTitle: "fix(api): retry the token refresh" }, [
+      job("image (arm64)", label, "queued", "launching", 0.5, 0),
+    ]),
+    run(18234567970, { repository: "acme-corp/data", workflowName: "CI", headBranch: "dbt-1.9", event: "pull_request", displayTitle: "Upgrade dbt to 1.9" }, [
+      job("dbt build", "hatchrun-8cpu-arm64", "queued", "launched", 1, 0),
+    ]),
+    run(18234567960, { repository: "acme-corp/infra", workflowName: "Release", event: "release", displayTitle: "v2.14.0" }, [
+      job("publish", label, "in_progress", "launched", 4, 0, { waited: 50 }),
+    ]),
     run(18234567600, { repository: "acme-corp/infra", workflowName: "Nightly", event: "schedule", headBranch: "main" }, [
       job("plan", "hatchrun-16cpu/disk=300", "completed", "failed", 22, 4, {
         conclusion: "cancelled",

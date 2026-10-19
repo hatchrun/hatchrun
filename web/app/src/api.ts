@@ -322,7 +322,7 @@ export type JobGroup = "active" | "waiting" | "failed";
 
 /**
  * The columns the runs table sorts by. By repository, each repository's
- * runs are newest first. By took, the runs still going come after the
+ * runs are newest first. By took, the runs still going come before the
  * finished ones, oldest first either way. A run's state is left out: it
  * changes while the run goes, so a page boundary in it would move.
  */

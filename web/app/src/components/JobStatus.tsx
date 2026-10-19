@@ -127,6 +127,19 @@ export function endOf(job: Pick<Job, "completedAt" | "updatedAt">): number {
   return job.completedAt ?? job.updatedAt;
 }
 
+/*
+ * Took, for a run and for a job alike, runs from when the job was queued
+ * to when it ended, and counts up while it has not: a job waiting for a
+ * runner is taking time too. The list's took order measures runs the
+ * same way.
+ */
+
+/** How long a job took, or has taken so far. */
+export function jobSpan(job: Pick<Job, "status" | "queuedAt" | "completedAt" | "updatedAt">, now: number): { ms: number; live: boolean } {
+  const live = job.status !== "completed";
+  return { ms: (live ? now : endOf(job)) - job.queuedAt, live };
+}
+
 /** How long a run took, or has taken so far: from its newest attempt's first job to its last job's end. */
 export function runSpan(run: Pick<Run, "queuedAt">, jobs: Job[], now: number): { ms: number; live: boolean } {
   const live = jobs.some((job) => job.status !== "completed");
