@@ -52,11 +52,12 @@ const SUGGESTED = "hatchrun-4cpu-arm64";
 /** Milliseconds the search box waits after the last key before it asks. */
 const DEBOUNCE_MS = 300;
 /** The order a column sorts in when first picked. */
-const FIRST_DIR: Record<RunSort, SortDir> = { started: "desc", repository: "asc" };
+const FIRST_DIR: Record<RunSort, SortDir> = { started: "desc", repository: "asc", took: "desc" };
 /** How each order reads, for the column head's label. */
 const ORDER_TEXT: Record<RunSort, Record<SortDir, string>> = {
   started: { desc: "newest first", asc: "oldest first" },
   repository: { asc: "A to Z", desc: "Z to A" },
+  took: { desc: "longest first", asc: "shortest first" },
 };
 const TAB_LABEL: Record<JobGroup, string> = { active: "Active", waiting: "Waiting", failed: "Failed" };
 
@@ -66,7 +67,7 @@ function useView(): { status: JobGroup | undefined; sort: RunSort; dir: SortDir;
   const sort = useQuery("sort");
   const dir = useQuery("dir");
   const q = useQuery("q") ?? "";
-  const by: RunSort = sort === "repository" ? "repository" : "started";
+  const by: RunSort = sort === "repository" || sort === "took" ? sort : "started";
   return {
     status: status === "active" || status === "waiting" || status === "failed" ? status : undefined,
     sort: by,
@@ -247,7 +248,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
                     <span className="ml-1 font-mono text-[10px] text-steel">↗ aws console</span>
                   </TableHead>
                   <SortHead column="started" label="Started" {...head} />
-                  <TableHead className="cap text-right">Took</TableHead>
+                  <SortHead column="took" label="Took" className="text-right" {...head} />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -316,6 +317,7 @@ function SortHead({
   sort,
   dir,
   onSort,
+  className,
   children,
 }: {
   column: RunSort;
@@ -323,12 +325,13 @@ function SortHead({
   sort: RunSort;
   dir: SortDir;
   onSort: (column: RunSort) => void;
+  className?: string;
   children?: ReactNode;
 }) {
   const on = sort === column;
   const next = on ? (dir === "asc" ? "desc" : "asc") : FIRST_DIR[column];
   return (
-    <TableHead aria-sort={on ? (dir === "asc" ? "ascending" : "descending") : "none"}>
+    <TableHead className={className} aria-sort={on ? (dir === "asc" ? "ascending" : "descending") : "none"}>
       <button
         type="button"
         onClick={() => onSort(column)}
