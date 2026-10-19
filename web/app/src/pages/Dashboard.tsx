@@ -91,6 +91,9 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
   const [toggled, setToggled] = useState<Record<number, boolean>>({});
   const [error, setError] = useState<Error | null>(null);
   const [paging, setPaging] = useState<string | null>(null);
+  // Counts "Load more" requests, so only the newest one clears `paging`,
+  // whatever view it was asked from.
+  const pagingRequest = useRef(0);
   const table = useRef<HTMLElement>(null);
   // Advanced whenever the list starts over, so an older page that comes
   // back after the view changes or "Back to newest" is dropped.
@@ -133,6 +136,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
       return;
     }
     const asked = round.current;
+    const request = ++pagingRequest.current;
     setPaging(view);
     try {
       const next = await listRuns(org, { before: last, status, sort, dir, q });
@@ -148,7 +152,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
         setError(err instanceof Error ? err : new Error(String(err)));
       }
     } finally {
-      if (asked === round.current) {
+      if (request === pagingRequest.current) {
         setPaging(null);
       }
     }
