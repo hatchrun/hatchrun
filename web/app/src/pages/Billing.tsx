@@ -2,11 +2,12 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 
-import { ApiError, getPlan, openPortal, redeemInvite, startCheckout, type Plan, type Tenant } from "../api";
+import { getPlan, getTenant, openPortal, redeemInvite, startCheckout, type Plan, type Tenant } from "../api";
 import { Spinner } from "../components/Status";
 import { useLoad } from "../load";
+import { navigate, useQuery } from "../router";
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -17,113 +18,223 @@ export function formatDate(iso: string | null): string {
   return new Date(iso).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
 }
 
-function price(plan: Plan): string | null {
-  if (plan.amount === null || !plan.currency) {
+/** The UTC calendar month `iso` starts, such as "October". */
+function monthName(iso: string): string {
+  return new Date(iso).toLocaleDateString(undefined, { month: "long", timeZone: "UTC" });
+}
+
+const minutes = (count: number) => `${count.toLocaleString()} ${count === 1 ? "minute" : "minutes"}`;
+
+/** `cents` in `currency`, with as many decimals as it needs, up to five. */
+export function money(cents: number, currency: string): string {
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: currency.toUpperCase(),
+    minimumFractionDigits: Number.isInteger(cents) && cents % 100 === 0 ? 0 : 2,
+    maximumFractionDigits: 5,
+  }).format(cents / 100);
+}
+
+/** The metered price per minute and the cap, when the product has them. */
+export function pricing(plan: Plan): { rate: string; cap: string | null } | null {
+  const unit = plan.unitAmount === null ? NaN : Number(plan.unitAmount);
+  if (!plan.currency || !Number.isFinite(unit)) {
     return null;
   }
-  const amount = new Intl.NumberFormat(undefined, {
-    style: "currency",
-    currency: plan.currency.toUpperCase(),
-    minimumFractionDigits: plan.amount % 100 === 0 ? 0 : 2,
-  }).format(plan.amount / 100);
-  return plan.interval ? `${amount} / ${plan.interval}` : amount;
+  return {
+    rate: money(unit, plan.currency),
+    cap: plan.capAmount === null ? null : money(plan.capAmount, plan.currency),
+  };
 }
 
-/** Whole months the yearly plan saves over twelve monthly payments. */
-export function monthsFree(plan: Plan, plans: Plan[]): number {
-  const monthly = plans.find((other) => other.interval === "month");
-  if (plan.interval !== "year" || !monthly || plan.amount === null || !monthly.amount || plan.currency !== monthly.currency) {
-    return 0;
+/** What minutes past the free ones cost this month, at the plan's price and cap. */
+export function estimate(tenant: Tenant, plan: Plan): string | null {
+  const unit = plan.unitAmount === null ? NaN : Number(plan.unitAmount);
+  if (!plan.currency || !Number.isFinite(unit)) {
+    return null;
   }
-  return Math.max(0, Math.round((12 * monthly.amount - plan.amount) / monthly.amount));
+  const { minutes: used, freeMinutes } = tenant.billing.usage;
+  const cents = Math.max(0, used - freeMinutes) * unit;
+  return money(plan.capAmount === null ? cents : Math.min(cents, plan.capAmount), plan.currency);
 }
 
-/** The plan step: pay for the licence, or join the beta with a code. */
-export function ChoosePlan({
-  tenant,
-  onChange,
-  confirming,
-}: {
-  tenant: Tenant;
-  onChange: (tenant?: Tenant) => void;
-  confirming: boolean;
-}) {
-  const [plan] = useLoad(getPlan, "plan");
+/** The month's job minutes against the free ones. */
+export function UsageMeter({ tenant, plan }: { tenant: Tenant; plan: Plan | null }) {
+  const { usage, beta, licensed } = tenant.billing;
+  const share = usage.freeMinutes > 0 ? Math.min(1, usage.minutes / usage.freeMinutes) : 1;
+  const over = Math.max(0, usage.minutes - usage.freeMinutes);
+  const bill = licensed && !beta && plan ? estimate(tenant, plan) : null;
+  return (
+    <div className="usage">
+      <div className="usage-head">
+        <span>
+          <strong className="mono">{usage.minutes.toLocaleString()}</strong> job minutes in{" "}
+          {monthName(usage.monthStart)}
+        </span>
+        <span className="muted mono small">{minutes(usage.freeMinutes)} free</span>
+      </div>
+      <div
+        className={over > 0 ? "usage-bar usage-bar-over" : "usage-bar"}
+        role="meter"
+        aria-label="Free minutes used"
+        aria-valuemin={0}
+        aria-valuemax={usage.freeMinutes}
+        aria-valuenow={Math.min(usage.minutes, usage.freeMinutes)}
+      >
+        <span style={{ width: `${share * 100}%` }} />
+      </div>
+      <p className="muted small">
+        {over > 0
+          ? beta
+            ? `${minutes(over)} past the free ones, not billed in the beta.`
+            : `${minutes(over)} past the free ones.`
+          : `${minutes(usage.freeMinutes - usage.minutes)} of free minutes left.`}{" "}
+        {bill && `About ${bill} so far this month. `}
+        The count starts again on {formatDate(usage.monthEnd)}.
+      </p>
+    </div>
+  );
+}
+
+/** A banner for an unpaid tenant near, past or done with its free minutes. */
+export function UsageNotice({ tenant }: { tenant: Tenant }) {
+  const { usage, licensed } = tenant.billing;
+  if (licensed) {
+    return null;
+  }
+  const org = tenant.org.login;
+  const free = `${usage.freeMinutes.toLocaleString()} free minutes`;
+  const month = monthName(usage.monthStart);
+  if (!usage.mayLaunch) {
+    return (
+      <div className="notice notice-error usage-notice" role="alert">
+        <span>
+          Runners stopped launching. {org} used its {free} for {month} and the grace period after
+          them. Add a card to start them again, or wait until {formatDate(usage.monthEnd)}.
+        </span>
+        <AddCard org={org} primary />
+      </div>
+    );
+  }
+  if (usage.graceEndsAt) {
+    return (
+      <div className="notice notice-accent usage-notice" role="status">
+        <span>
+          {org} used its {free} for {month}. Runners keep launching until{" "}
+          {formatDate(usage.graceEndsAt)}, then stop until you add a card.
+        </span>
+        <AddCard org={org} primary />
+      </div>
+    );
+  }
+  if (usage.minutes >= usage.freeMinutes * 0.8) {
+    return (
+      <div className="notice notice-accent usage-notice" role="status">
+        <span>
+          {org} used {usage.minutes.toLocaleString()} of its {free} for {month}. Add a card so
+          runners keep launching past them.
+        </span>
+        <AddCard org={org} />
+      </div>
+    );
+  }
+  return null;
+}
+
+/** Opens a Polar checkout, which adds the card that pays past the free minutes. */
+export function AddCard({ org, primary = false }: { org: string; primary?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const billingOff = plan.state === "error" && plan.error instanceof ApiError && plan.error.status === 503;
-
   const checkout = async () => {
     setBusy(true);
     setError(null);
     try {
-      const { url } = await startCheckout(tenant.org.login);
+      const { url } = await startCheckout(org);
       window.location.assign(url);
     } catch (err) {
       setError(message(err));
       setBusy(false);
     }
   };
+  return (
+    <span className="add-card">
+      <button
+        type="button"
+        className={primary ? "button button-primary button-small" : "button button-small"}
+        disabled={busy}
+        onClick={checkout}
+      >
+        {busy ? "Opening checkout" : "Add a card"}
+      </button>
+      {error && (
+        <span className="field-error" role="alert">
+          {" "}
+          {error}
+        </span>
+      )}
+    </span>
+  );
+}
 
-  if (confirming) {
-    return <Spinner label="Confirming your payment with Polar" />;
-  }
+/** The Billing section of Settings: the month's minutes, the price, and the card. */
+export function BillingPanel({ tenant, onChange }: { tenant: Tenant; onChange: (tenant: Tenant) => void }) {
+  const [plan] = useLoad(getPlan, "plan");
+  const checkout = useQuery("checkout");
+  const org = tenant.org.login;
+  const { beta, licensed, usage } = tenant.billing;
+  const confirming = checkout !== null && !licensed;
+  const product = plan.state === "ready" ? (plan.data.plans[0] ?? null) : null;
+  const price = product ? pricing(product) : null;
+
+  // Back from Polar's checkout: the webhook may land a moment after the
+  // browser does, so look again for half a minute.
+  useEffect(() => {
+    if (!confirming) {
+      return;
+    }
+    let tries = 0;
+    const timer = window.setInterval(() => {
+      tries += 1;
+      getTenant(org).then(onChange, () => undefined);
+      if (tries >= 10) {
+        window.clearInterval(timer);
+        navigate(`/o/${org}/settings`, true);
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [confirming, org, onChange]);
 
   return (
     <>
-      <p>
-        One licence covers every repository in <strong>{tenant.org.login}</strong>. Runners run in
-        your AWS account, so you pay AWS for compute directly.
-      </p>
-      {error && (
-        <p className="notice notice-error" role="alert">
-          {error}
+      {checkout && licensed && (
+        <p className="notice notice-success" role="status">
+          Card added. {org} pays per minute past its free ones.
         </p>
       )}
-      {plan.state === "loading" && <Spinner label="Loading the plan" />}
-      {plan.state === "ready" && (
-        <div className="plan">
-          <ul className="plan-options">
-            {plan.data.plans.map((option) => {
-              const free = monthsFree(option, plan.data.plans);
-              return (
-                <li key={option.id} className="plan-option">
-                  <div>
-                    <div className="plan-name">
-                      {option.name}
-                      {free > 0 && (
-                        <span className="badge badge-success">
-                          {free === 1 ? "1 month free" : `${free} months free`}
-                        </span>
-                      )}
-                    </div>
-                    {option.description && <p className="muted plan-description">{option.description}</p>}
-                  </div>
-                  {price(option) && <div className="plan-price">{price(option)}</div>}
-                </li>
-              );
-            })}
-          </ul>
-          <div className="plan-buy">
-            {plan.data.plans.length > 1 && <p className="muted plan-pick">You pick one at checkout.</p>}
-            <button type="button" className="button button-primary" disabled={busy} onClick={checkout}>
-              {busy ? "Opening checkout" : "Continue to checkout"}
-            </button>
-          </div>
-        </div>
-      )}
-      {plan.state === "error" && !billingOff && (
-        <p className="notice notice-error" role="alert">
-          {plan.error.message}
+      <UsageMeter tenant={tenant} plan={product} />
+      {confirming ? (
+        <Spinner label="Confirming your card with Polar" />
+      ) : beta ? (
+        <p>In the invite-only beta. Minutes are counted and nothing is billed.</p>
+      ) : licensed ? (
+        <p>
+          <PlanSummary tenant={tenant} />
         </p>
+      ) : (
+        <>
+          <p>
+            Every organization gets {minutes(usage.freeMinutes)} a month without a card.
+            {price &&
+              ` Past them, hatchrun costs ${price.rate} a minute${price.cap ? `, and never more than ${price.cap} a month` : ""}.`}{" "}
+            Runners run in your cloud account, so your provider bills compute directly, with no
+            markup.
+          </p>
+          <p className="inline-actions">
+            <AddCard org={org} primary />
+          </p>
+          <InviteCode tenant={tenant} onRedeemed={onChange} />
+        </>
       )}
-      {billingOff && (
-        <p className="notice notice-accent">
-          hatchrun is in an invite-only beta and free while it lasts. Enter the invite code you
-          were given.
-        </p>
-      )}
-      <InviteCode tenant={tenant} onRedeemed={onChange} open={billingOff} />
       <p className="fine">
         Payments are handled by Polar, our merchant of record, who sends the invoices and handles
         sales tax.
@@ -132,17 +243,8 @@ export function ChoosePlan({
   );
 }
 
-function InviteCode({
-  tenant,
-  onRedeemed,
-  open,
-}: {
-  tenant: Tenant;
-  onRedeemed: (tenant: Tenant) => void;
-  open: boolean;
-}) {
-  const [asked, setAsked] = useState(false);
-  const shown = asked || open;
+function InviteCode({ tenant, onRedeemed }: { tenant: Tenant; onRedeemed: (tenant: Tenant) => void }) {
+  const [shown, setShown] = useState(false);
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -163,7 +265,7 @@ function InviteCode({
   if (!shown) {
     return (
       <p className="invite-toggle">
-        <button type="button" className="button-link" onClick={() => setAsked(true)}>
+        <button type="button" className="button-link" onClick={() => setShown(true)}>
           Have a beta invite code?
         </button>
       </p>
@@ -195,22 +297,19 @@ function InviteCode({
   );
 }
 
-/** What the plan step says once the tenant holds a licence. */
+/** What Billing says once the tenant pays per minute. */
 export function PlanSummary({ tenant }: { tenant: Tenant }) {
-  const { beta, subscription } = tenant.billing;
-  if (beta) {
-    return <>In the invite-only beta. Nothing to pay while it lasts.</>;
-  }
+  const { subscription } = tenant.billing;
   if (!subscription) {
     return null;
   }
   return (
     <>
-      Licence active.{" "}
+      Card on file, paying per minute past the free ones.{" "}
       {subscription.currentPeriodEnd &&
         (subscription.cancelAtPeriodEnd
           ? `Ends on ${formatDate(subscription.currentPeriodEnd)}. `
-          : `Renews on ${formatDate(subscription.currentPeriodEnd)}. `)}
+          : `Next invoice on ${formatDate(subscription.currentPeriodEnd)}. `)}
       <PortalLink org={tenant.org.login} />
     </>
   );

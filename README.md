@@ -269,17 +269,31 @@ organization permission Members (read). The `installation` webhook
 unlinks a tenant when the App is uninstalled or suspended and links it
 again when the App comes back.
 
-A tenant launches runners only while it holds a licence: a Polar
-subscription to one of the `POLAR_PRODUCT_ID` products, or a place in
-the invite-only beta. `POLAR_PRODUCT_ID` lists the products separated
-by commas, one per billing interval, since a Polar product has a single
-interval: monthly and yearly. The app opens Polar's checkout with all
-of them, so the buyer picks one, and with the tenant id as the external
-customer id, and Polar's webhooks, at
-`https://app.hatchrun.io/api/polar/webhook` and checked against
-`POLAR_WEBHOOK_SECRET`, keep the `subscriptions` table current. The
-beta needs no payment. An owner redeems an invite code, or the operator
-lists the organization:
+Billing is per job minute. A job that ran on a hatchrun runner counts
+GitHub's `started_at` to `completed_at`, rounded up to whole minutes,
+once, when its `completed` webhook (or the reconciler's sync) lands; the
+`usage_events` table keeps one row per job. Every organization gets
+3,000 free minutes each UTC calendar month with no card. An unpaid
+tenant past them keeps launching for seven days, then launches nothing
+until it adds a card or the next month starts; the app shows the count
+and a banner from 80% on. `FREE_MINUTES` and `GRACE_MS` in
+[`usage.rs`](crates/cloud/src/usage.rs) set both.
+
+Adding a card is a Polar subscription to the `POLAR_PRODUCT_ID`
+product: a metered price of 0.1 cents a minute on the "Job minutes"
+meter, capped at $199 a month, and a meter credit benefit of 3,000
+minutes per billing period, which matches `FREE_MINUTES`. The app opens
+Polar's checkout with the tenant id as the external customer id, and
+Polar's webhooks, at `https://app.hatchrun.io/api/polar/webhook` and
+checked against `POLAR_WEBHOOK_SECRET`, keep the `subscriptions` table
+current. Minutes of jobs that completed while the tenant paid go to
+Polar as `job.minutes` events, which the meter sums: the reconciler
+sends up to 500 a minute, with the job as each event's `external_id`,
+so an event sent twice counts once. `POLAR_ACCESS_TOKEN` needs the
+`events:write` scope for that.
+
+Tenants in the invite-only beta count minutes and pay nothing. An owner
+redeems an invite code, or the operator lists the organization:
 
 ```sh
 code=$(openssl rand -hex 8)
@@ -392,13 +406,14 @@ GitHub keeps the job queued. A launch that failed on the
 organization's setup (the role cannot be assumed or may not launch,
 no allowed instance type fits the profile, no such profile) waits
 until an owner verifies the role again, edits a profile, changes the
-settings or gains a licence; [`retry.rs`](crates/cloud/src/reconcile/retry.rs)
+settings or adds a card; [`retry.rs`](crates/cloud/src/reconcile/retry.rs)
 lists every case. Once a day per region it refreshes the instance
 type catalog in D1 through a tenant role there: every current
 generation amd64 and arm64 type with the zones that offer it
 (`DescribeInstanceTypes`, `DescribeInstanceTypeOfferings`), its Linux
 on-demand price from AWS's public price list and its lowest Spot price
-(`DescribeSpotPriceHistory`). It also deletes expired sessions, and
+(`DescribeSpotPriceHistory`). It sends job minutes to Polar, and
+deletes expired sessions, and
 jobs and runs past their tenant's retention (`tenants.retention_days`,
 30 days unless set, up to 90). The timeouts are the `RECONCILE_*` variables in
 `wrangler.toml`. Each pass logs one summary line and keeps it in the

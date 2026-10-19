@@ -51,6 +51,22 @@ pub fn format(ms: u64) -> String {
     )
 }
 
+/// Unix milliseconds of the start of the UTC calendar month `ms` falls
+/// in, and of the next one.
+#[must_use]
+pub fn month(ms: u64) -> (u64, u64) {
+    let (year, month, _) = civil(ms / 86_400_000);
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    (
+        days(year, month, 1) * 86_400_000,
+        days(next_year, next_month, 1) * 86_400_000,
+    )
+}
+
 /// The date `days` after 1970-01-01, by Howard Hinnant's
 /// `civil_from_days`.
 fn civil(days: u64) -> (u64, u64, u64) {
@@ -109,6 +125,23 @@ mod tests {
         for ms in (0..20_000u64).map(|day| day * 86_400_000 + 3_723_000) {
             assert_eq!(parse(&format(ms)), Some(ms));
         }
+    }
+
+    #[test]
+    fn finds_calendar_months() {
+        let at = |value| parse(value).unwrap();
+        assert_eq!(
+            month(at("2026-10-14T10:00:00Z")),
+            (at("2026-10-01T00:00:00Z"), at("2026-11-01T00:00:00Z"))
+        );
+        assert_eq!(
+            month(at("2026-12-31T23:59:59.999Z")),
+            (at("2026-12-01T00:00:00Z"), at("2027-01-01T00:00:00Z"))
+        );
+        assert_eq!(
+            month(at("2024-02-01T00:00:00Z")),
+            (at("2024-02-01T00:00:00Z"), at("2024-03-01T00:00:00Z"))
+        );
     }
 
     #[test]

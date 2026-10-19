@@ -2,14 +2,14 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
-import { getTenant, type Aws, type Tenant, type User } from "../api";
+import { type Aws, type Tenant, type User } from "../api";
 import { Checklist, type Step } from "../components/Checklist";
 import { OrgSwitcher } from "../components/OrgSwitcher";
 import { PageTabs, Shell } from "../components/Shell";
-import { Link, navigate, useQuery } from "../router";
-import { ChoosePlan, PlanSummary } from "./Billing";
+import { Link, useQuery } from "../router";
+import { UsageNotice } from "./Billing";
 import { AwsSummary, ConnectAws } from "./ConnectAws";
 import { Dashboard } from "./Dashboard";
 import { JobPage } from "./JobPage";
@@ -61,10 +61,14 @@ export function TenantPage({
         </Narrow>
       ) : section === "settings" ? (
         <Narrow>
+          <UsageNotice tenant={tenant} />
           <TenantSettings tenant={tenant} onChange={setTenant} />
         </Narrow>
-      ) : ready && !new URLSearchParams(window.location.search).has("checkout") ? (
-        <Dashboard tenant={tenant} />
+      ) : ready ? (
+        <>
+          <UsageNotice tenant={tenant} />
+          <Dashboard tenant={tenant} />
+        </>
       ) : (
         <Narrow>
           <Setup tenant={tenant} setTenant={setTenant} />
@@ -98,35 +102,7 @@ function CloudAccount({ org, aws }: { org: string; aws: Aws }) {
 
 function Setup({ tenant, setTenant }: { tenant: Tenant; setTenant: (tenant: Tenant) => void }) {
   const installed = useQuery("installed");
-  const checkout = useQuery("checkout");
   const org = tenant.org.login;
-  const confirming = checkout !== null && !tenant.billing.licensed;
-
-  // Back from Polar's checkout: the webhook may land a moment after the
-  // browser does, so look again for half a minute.
-  useEffect(() => {
-    if (!confirming) {
-      return;
-    }
-    let tries = 0;
-    const timer = window.setInterval(() => {
-      tries += 1;
-      getTenant(org).then(setTenant, () => undefined);
-      if (tries >= 10) {
-        window.clearInterval(timer);
-        navigate(`/o/${org}`, true);
-      }
-    }, 3000);
-    return () => window.clearInterval(timer);
-  }, [confirming, org, setTenant]);
-
-  const refresh = (next?: Tenant) => {
-    if (next) {
-      setTenant(next);
-    } else {
-      getTenant(org).then(setTenant, () => undefined);
-    }
-  };
 
   const steps: Step[] = [
     {
@@ -142,13 +118,6 @@ function Setup({ tenant, setTenant }: { tenant: Tenant; setTenant: (tenant: Tena
         </>
       ),
       body: <InstallApp tenant={tenant} />,
-    },
-    {
-      key: "plan",
-      title: "Choose a plan",
-      done: tenant.steps.billing,
-      summary: <PlanSummary tenant={tenant} />,
-      body: <ChoosePlan tenant={tenant} onChange={refresh} confirming={confirming} />,
     },
     {
       key: "aws",
@@ -168,14 +137,9 @@ function Setup({ tenant, setTenant }: { tenant: Tenant; setTenant: (tenant: Tena
 
   return (
     <section className="narrow">
-      {checkout && tenant.billing.licensed && (
-        <p className="notice notice-success" role="status">
-          Payment received. {org} has a hatchrun licence.
-        </p>
-      )}
       {installed && (
         <p className="notice notice-success" role="status">
-          hatchrun is installed on {org}. Two more steps and your jobs can run.
+          hatchrun is installed on {org}. One more step and your jobs can run.
         </p>
       )}
       <div className="page-head">

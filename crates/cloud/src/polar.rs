@@ -5,10 +5,12 @@
 //! Billing through Polar, the merchant of record, kept apart from the
 //! Workers runtime so it tests natively.
 //!
-//! An organization's licence is a Polar subscription to one of the
-//! licence's products, one per billing interval, since a Polar product
-//! has a single interval. The app opens a Polar checkout that offers
-//! every one of them, with the tenant id as Polar's
+//! An organization pays per job minute through a Polar subscription to
+//! the metered product: a metered price on the job minutes meter, with
+//! a cap, and a meter credit benefit for the free minutes (see
+//! [`crate::usage`]). The reconciler sends each job's minutes as an
+//! event (see [`ingest`]). The app opens a Polar checkout for the
+//! product, with the tenant id as Polar's
 //! external customer id and in the checkout's metadata, so every
 //! subscription Polar reports names its tenant. Polar's webhooks, signed
 //! as Standard Webhooks, keep the `subscriptions` table current; the
@@ -76,6 +78,12 @@ pub struct Plan {
     pub currency: Option<String>,
     /// `month`, `year`, ...
     pub interval: Option<String>,
+    /// The metered price per unit in the smallest currency unit, as
+    /// Polar writes it: a decimal string such as `"0.1"`.
+    pub unit_amount: Option<String>,
+    /// The most the metered price charges per period, in the smallest
+    /// currency unit.
+    pub cap_amount: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +104,8 @@ struct Price {
     #[serde(rename = "price_currency")]
     currency: Option<String>,
     recurring_interval: Option<String>,
+    unit_amount: Option<serde_json::Value>,
+    cap_amount: Option<u64>,
 }
 
 /// The plan of the product Polar answered with.
@@ -105,12 +115,27 @@ struct Price {
 /// Polar's answer when it is not a product.
 pub fn plan(response: &Response) -> Result<Plan, String> {
     let product: Product = decode(response, "product")?;
-    let price = product
-        .prices
+    let mut prices = product.prices;
+    let metered = prices
+        .iter()
+        .position(|price| price.amount_type.as_deref() == Some("metered_unit"))
+        .map(|at| prices.swap_remove(at));
+    let fixed = prices
         .into_iter()
         .find(|price| price.amount_type.as_deref() == Some("fixed"));
-    let (amount, currency, price_interval) = price.map_or((None, None, None), |price| {
+    let (amount, mut currency, price_interval) = fixed.map_or((None, None, None), |price| {
         (price.amount, price.currency, price.recurring_interval)
+    });
+    let (unit_amount, cap_amount) = metered.map_or((None, None), |price| {
+        if currency.is_none() {
+            currency = price.currency;
+        }
+        let unit = price.unit_amount.and_then(|value| match value {
+            serde_json::Value::String(text) => Some(text),
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        });
+        (unit, price.cap_amount)
     });
     Ok(Plan {
         id: product.id,
@@ -119,6 +144,8 @@ pub fn plan(response: &Response) -> Result<Plan, String> {
         amount,
         currency,
         interval: product.recurring_interval.or(price_interval),
+        unit_amount,
+        cap_amount,
     })
 }
 
@@ -192,6 +219,63 @@ fn decode<T: for<'de> Deserialize<'de>>(response: &Response, what: &str) -> Resu
         ));
     }
     serde_json::from_slice(&response.body).map_err(|err| format!("{what}: {err}"))
+}
+
+/// Name of the events that carry a job's minutes. The job minutes
+/// meter sums their `minutes`.
+pub const MINUTES_EVENT: &str = "job.minutes";
+
+/// Most events in one ingest call.
+pub const INGEST_BATCH: usize = 500;
+
+/// One job's minutes, as Polar's meter takes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Minutes<'a> {
+    /// The job, which keeps Polar from counting it twice.
+    pub job_id: u64,
+    /// The tenant, Polar's external customer id.
+    pub tenant: &'a str,
+    /// Its minutes.
+    pub minutes: u32,
+    /// When it completed, ISO 8601.
+    pub at: String,
+}
+
+/// Sends job minutes to Polar. Each event's `external_id` is the job,
+/// so an event sent again after a lost answer is skipped as a
+/// duplicate.
+#[must_use]
+pub fn ingest(api: &str, token: &str, events: &[Minutes<'_>]) -> Request {
+    let events: Vec<_> = events
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "name": MINUTES_EVENT,
+                "external_customer_id": event.tenant,
+                "external_id": format!("job:{}", event.job_id),
+                "timestamp": event.at,
+                "metadata": { "minutes": event.minutes, "job_id": event.job_id.to_string() },
+            })
+        })
+        .collect();
+    call("POST", format!("{api}/v1/events/ingest"), token)
+        .body(serde_json::json!({ "events": events }).to_string())
+}
+
+#[derive(Deserialize)]
+struct Ingested {
+    inserted: u32,
+    #[serde(default)]
+    duplicates: u32,
+}
+
+/// How many events Polar took, new and duplicate.
+///
+/// # Errors
+///
+/// Polar's answer when it did not take the events.
+pub fn ingested(response: &Response) -> Result<u32, String> {
+    decode::<Ingested>(response, "events").map(|answer| answer.inserted + answer.duplicates)
 }
 
 /// The URL of the checkout Polar made.
@@ -550,6 +634,46 @@ mod tests {
     }
 
     #[test]
+    fn sends_job_minutes() {
+        let request = ingest(
+            API,
+            "t",
+            &[Minutes {
+                job_id: 29_679_449,
+                tenant: "abcdefgh12345678",
+                minutes: 10,
+                at: "2026-10-14T10:09:30Z".to_owned(),
+            }],
+        );
+        assert_eq!(request.url, "https://api.polar.sh/v1/events/ingest");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "events": [{
+                "name": "job.minutes",
+                "external_customer_id": "abcdefgh12345678",
+                "external_id": "job:29679449",
+                "timestamp": "2026-10-14T10:09:30Z",
+                "metadata": { "minutes": 10, "job_id": "29679449" },
+            }] })
+        );
+        assert_eq!(
+            ingested(&Response {
+                status: 200,
+                body: br#"{"inserted":2,"duplicates":1}"#.to_vec(),
+            }),
+            Ok(3)
+        );
+        assert!(
+            ingested(&Response {
+                status: 422,
+                body: br#"{"detail":[]}"#.to_vec(),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn reads_product_ids() {
         assert_eq!(product_ids(""), Vec::<String>::new());
         assert_eq!(product_ids("prod_1"), ["prod_1"]);
@@ -584,6 +708,8 @@ mod tests {
                 amount: Some(49000),
                 currency: Some("usd".to_owned()),
                 interval: Some("year".to_owned()),
+                unit_amount: None,
+                cap_amount: None,
             }
         );
         // The interval may be on the price only, and a product may
@@ -610,6 +736,29 @@ mod tests {
             })
             .unwrap_err(),
             "product: Polar answered 404: {}"
+        );
+
+        assert_eq!(
+            (yearly.unit_amount.as_deref(), yearly.cap_amount),
+            (None, None)
+        );
+        let metered = plan(&Response {
+            status: 200,
+            body: br#"{"id":"prod_m","name":"hatchrun","description":null,
+                "recurring_interval":"month","prices":[
+                {"amount_type":"metered_unit","price_currency":"usd","unit_amount":"0.1",
+                 "cap_amount":19900,"meter_id":"m"}]}"#
+                .to_vec(),
+        })
+        .unwrap();
+        assert_eq!(
+            (
+                metered.amount,
+                metered.currency.as_deref(),
+                metered.unit_amount.as_deref(),
+                metered.cap_amount
+            ),
+            (None, Some("usd"), Some("0.1"), Some(19900))
         );
 
         let mut plans = vec![custom, yearly, monthly];

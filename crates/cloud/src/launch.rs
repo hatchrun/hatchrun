@@ -5,8 +5,9 @@
 //! Launches a runner instance for a recorded job, from the launch queue
 //! the webhook sends it to (see [`crate::launches`]).
 //!
-//! Only tenants with AWS connected and a licence (the beta or a paid
-//! subscription) launch; jobs of any other are marked `failed`.
+//! Only tenants with AWS connected that may launch (in the beta, paid,
+//! or within their free minutes, see [`crate::usage`]) launch; jobs of
+//! any other are marked `failed`.
 //!
 //! The Worker takes the job by moving it from no launch state to
 //! `launching`, which only one request can do, and only while the tenant
@@ -103,11 +104,9 @@ struct Tenant {
     cache_bucket: Option<String>,
 }
 
-/// SQL that is 1 for a tenant row that may launch: in the beta, or
-/// with a Polar subscription that holds a licence.
-pub(crate) const LICENSED: &str = "(tenants.beta = 1 OR EXISTS (SELECT 1 FROM subscriptions \
-     WHERE subscriptions.tenant_id = tenants.id \
-     AND subscriptions.status IN ('active', 'trialing')))";
+/// SQL that is 1 for a tenant row that may launch (see
+/// [`crate::usage::MAY_LAUNCH`]).
+pub(crate) const LICENSED: &str = crate::usage::MAY_LAUNCH;
 
 /// The installation's tenant with AWS connected.
 fn tenant_query() -> String {
@@ -264,8 +263,10 @@ pub(crate) async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
                     tenant.id, tenant.region
                 ),
                 Some(tenant) => format!(
-                    "tenant {} has no licence: neither in the beta nor subscribed",
-                    tenant.id
+                    "tenant {} used its {} free minutes this month and the grace period \
+                     after them: add a card in the app to keep launching",
+                    tenant.id,
+                    crate::usage::FREE_MINUTES
                 ),
                 None => format!(
                     "installation {} has no tenant with AWS connected",
@@ -1125,11 +1126,32 @@ mod tests {
         let tenant: Tenant = db.first(&tenant_query(), &params![INSTALLATION]).unwrap();
         assert_eq!(tenant.id, "t1");
         assert_eq!(tenant.max_runners, 2);
-        assert_eq!(tenant.licensed, 0);
+        // Unpaid, within its free minutes.
+        assert_eq!(tenant.licensed, 1);
         assert_eq!(tenant.volume_size_limit, Some(200));
         assert_eq!(tenant.root_volume_size, Some(30));
         assert_eq!(tenant.fleet, 1);
         assert!(tenant.instance_types.is_none());
+
+        // Past them and the grace period after them.
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        db.run(
+            "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed) \
+             VALUES (1, 't1', ?1, ?2, 0)",
+            &params![crate::usage::FREE_MINUTES, now],
+        );
+        db.run(
+            "UPDATE tenants SET free_used_up_at = ?1 WHERE id = 't1'",
+            &params![now - crate::usage::GRACE_MS - 60_000],
+        );
+        let tenant: Tenant = db.first(&tenant_query(), &params![INSTALLATION]).unwrap();
+        assert_eq!(tenant.licensed, 0);
 
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \

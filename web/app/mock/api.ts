@@ -27,7 +27,12 @@ interface MockTenant {
   allowedRegions: string[] | null;
   beta: boolean;
   subscription: null | { status: string; currentPeriodEnd: string | null; cancelAtPeriodEnd: boolean };
+  /** Job minutes this month. */
+  minutes: number;
 }
+
+const FREE_MINUTES = 3000;
+const GRACE_MS = 7 * 24 * 3600 * 1000;
 
 interface State {
   signedIn: boolean;
@@ -48,10 +53,33 @@ const orgs = [
 
 function tenantView(tenant: MockTenant) {
   const licensed = tenant.beta || tenant.subscription?.status === "active";
+  const now = new Date();
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const monthEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+  // MOCK_USAGE=near, grace or stopped puts unpaid tenants at that point.
+  const minutes = { near: 2600, grace: 3400, stopped: 3900 }[process.env.MOCK_USAGE ?? ""] ?? tenant.minutes;
+  const usedUpAt =
+    minutes >= FREE_MINUTES
+      ? new Date(Date.now() - (process.env.MOCK_USAGE === "stopped" ? 8 : 2) * 24 * 3600 * 1000)
+      : null;
+  const graceEndsAt = usedUpAt && !licensed ? new Date(usedUpAt.getTime() + GRACE_MS) : null;
   return {
     ...tenant,
-    billing: { beta: tenant.beta, licensed, subscription: tenant.subscription },
-    steps: { app: tenant.installationId !== null, billing: licensed, aws: tenant.aws !== null },
+    billing: {
+      beta: tenant.beta,
+      licensed,
+      subscription: tenant.subscription,
+      usage: {
+        monthStart: monthStart.toISOString(),
+        monthEnd: monthEnd.toISOString(),
+        minutes,
+        freeMinutes: FREE_MINUTES,
+        freeUsedUpAt: usedUpAt?.toISOString() ?? null,
+        graceEndsAt: graceEndsAt?.toISOString() ?? null,
+        mayLaunch: licensed || graceEndsAt === null || graceEndsAt.getTime() > Date.now(),
+      },
+    },
+    steps: { app: tenant.installationId !== null, aws: tenant.aws !== null },
     installUrl: installUrl(),
   };
 }
@@ -121,20 +149,14 @@ const routes: Record<string, Handler> = {
           {
             plans: [
               {
-                id: "prod_month",
-                name: "hatchrun Team, monthly",
-                description: "Runners for one GitHub organization",
-                amount: 4900,
+                id: "prod_metered",
+                name: "hatchrun",
+                description: "Per job minute past 3,000 free minutes a month",
+                amount: null,
                 currency: "usd",
                 interval: "month",
-              },
-              {
-                id: "prod_year",
-                name: "hatchrun Team, yearly",
-                description: "Runners for one GitHub organization",
-                amount: 49000,
-                currency: "usd",
-                interval: "year",
+                unitAmount: "0.1",
+                capAmount: 19900,
               },
             ],
           },
@@ -152,7 +174,7 @@ const routes: Record<string, Handler> = {
         tenant.subscription = { status: "active", currentPeriodEnd: end, cancelAtPeriodEnd: false };
       }, 4000);
     }
-    return `/o/${org}?checkout=mock`;
+    return `/o/${org}/settings?checkout=mock`;
   },
   "POST /api/tenants/:org/portal": (_req, url) => [200, { url: `/o/${url.pathname.split("/")[3]}?portal=mock` }],
   "POST /api/tenants/:org/beta": (_req, url, body) => {
@@ -382,6 +404,7 @@ function adopt(installationId: number): MockTenant | null {
       allowedRegions: null,
       beta: false,
       subscription: null,
+      minutes: 1240,
     };
     state.tenants.push(tenant);
   }
