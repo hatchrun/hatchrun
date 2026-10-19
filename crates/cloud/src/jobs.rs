@@ -431,9 +431,9 @@ pub(crate) enum Direction {
 }
 
 /// Matches `$6`, the dashboard's `contains` pattern, against a run and
-/// its jobs of every attempt. Postgres reads the jobs through an index,
-/// one run at a time through `jobs_run` or the installation's jobs once
-/// into a hash, whichever it costs lower.
+/// its jobs of every attempt. The matching jobs come from the trigram
+/// index `jobs_search` once, into a hash, for a pattern of three
+/// characters or more (`migrations/0003_search.sql`).
 pub(crate) const SEARCH: &str = "(repository ILIKE $6 ESCAPE '\\' \
      OR workflow_name ILIKE $6 ESCAPE '\\' \
      OR head_branch ILIKE $6 ESCAPE '\\' \
