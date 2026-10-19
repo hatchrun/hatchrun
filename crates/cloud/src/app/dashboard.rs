@@ -200,8 +200,8 @@ enum Sort {
     Started,
     /// By repository, then newest first within it.
     Repository,
-    /// By how long a finished run took, ties by id; then the runs still
-    /// going, oldest first, in either direction.
+    /// The runs still going, oldest first, in either direction; then by
+    /// how long a finished run took, ties by id.
     Took,
 }
 
@@ -311,7 +311,7 @@ const SEARCH: &str = "(repository LIKE ?6 ESCAPE '\\' \
 /// order it is in. `?5` is the repository by repository and the end by
 /// how long runs took. Within a repository runs stay newest first
 /// either way. By how long runs took, the key is how long a finished
-/// run took and when a live run was queued, behind the finished ones;
+/// run took and when a live run was queued, ahead of the finished ones;
 /// each side of the comparison is the expression its index holds.
 fn order(sort: Sort, dir: Direction) -> (&'static str, &'static str) {
     match (sort, dir) {
@@ -334,15 +334,15 @@ fn order(sort: Sort, dir: Direction) -> (&'static str, &'static str) {
             "repository COLLATE NOCASE DESC, queued_at DESC, id DESC",
         ),
         (Sort::Took, Direction::Asc) => (
-            "(ended_at IS NULL, COALESCE(ended_at - queued_at, queued_at), id) \
-             > (?5 IS NULL, COALESCE(?5 - ?2, ?2), ?3)",
-            "ended_at IS NULL, COALESCE(ended_at - queued_at, queued_at), id",
+            "(ended_at IS NOT NULL, COALESCE(ended_at - queued_at, queued_at), id) \
+             > (?5 IS NOT NULL, COALESCE(?5 - ?2, ?2), ?3)",
+            "ended_at IS NOT NULL, COALESCE(ended_at - queued_at, queued_at), id",
         ),
         (Sort::Took, Direction::Desc) => (
-            "(ended_at IS NULL, \
+            "(ended_at IS NOT NULL, \
              CASE WHEN ended_at IS NULL THEN queued_at ELSE queued_at - ended_at END, id) \
-             > (?5 IS NULL, CASE WHEN ?5 IS NULL THEN ?2 ELSE ?2 - ?5 END, ?3)",
-            "ended_at IS NULL, \
+             > (?5 IS NOT NULL, CASE WHEN ?5 IS NULL THEN ?2 ELSE ?2 - ?5 END, ?3)",
+            "ended_at IS NOT NULL, \
              CASE WHEN ended_at IS NULL THEN queued_at ELSE queued_at - ended_at END, id",
         ),
     }
@@ -1318,9 +1318,9 @@ mod tests {
             walk(&db, None, (Sort::Repository, Direction::Desc), None),
             list(&za)
         );
-        // Finished by how long they took, ties by id; then the runs
-        // still going, oldest first, either way. 1000 and 1001 were
-        // queued at the same time.
+        // The runs still going, oldest first, either way; then the
+        // finished ones by how long they took, ties by id. 1000 and 1001
+        // were queued at the same time.
         let took = |id: u64| {
             let run = all.iter().find(|r| r.id == id).unwrap();
             run.ended_at.map(|at| at - run.queued_at)
@@ -1332,13 +1332,13 @@ mod tests {
         assert_eq!(
             walk(&db, None, (Sort::Took, Direction::Asc), None),
             [
-                1003, 1004, 1007, 1008, 1011, 1005, 1006, 1009, 1010, 1002, 1000, 1001
+                1002, 1000, 1001, 1003, 1004, 1007, 1008, 1011, 1005, 1006, 1009, 1010
             ]
         );
         assert_eq!(
             walk(&db, None, (Sort::Took, Direction::Desc), None),
             [
-                1005, 1006, 1009, 1010, 1003, 1004, 1007, 1008, 1011, 1002, 1000, 1001
+                1002, 1000, 1001, 1005, 1006, 1009, 1010, 1003, 1004, 1007, 1008, 1011
             ]
         );
         // API sorts with the lower case names, before infra and web.
