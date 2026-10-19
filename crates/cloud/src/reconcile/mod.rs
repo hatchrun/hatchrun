@@ -111,6 +111,10 @@ const CACHE_UPLOAD_MEMORY: u64 = 24 * 60 * 60 * 1000;
 /// How long job minutes are kept once Polar has them or never needed
 /// them: past a year, so last year's month can be compared.
 const USAGE_MEMORY: u64 = 400 * 24 * 60 * 60 * 1000;
+/// How far back the meter step looks for completed jobs whose minutes
+/// nothing recorded: a day, longer than GitHub retries a webhook and the
+/// sync takes to notice a job.
+const SWEEP_WINDOW: u64 = 24 * 60 * 60 * 1000;
 /// How long a job or run recorded without `expires_at` is kept: the
 /// default `retention_days`. Only a Worker from before migration 0019,
 /// still running while it applies, records rows without one, and it
@@ -1621,10 +1625,23 @@ impl Pass<'_> {
         Ok(done)
     }
 
-    /// Step 6: sends the minutes Polar has not taken yet, oldest first,
+    /// Step 6: records the minutes of jobs that completed in the last
+    /// [`SWEEP_WINDOW`] with none recorded, then sends the minutes Polar
+    /// has not taken yet, oldest first,
     /// one batch a pass. Without Polar's token nothing is sent and the
     /// events wait.
     async fn meter(&self) -> Fallible<Summary> {
+        let swept = usage::sweep(
+            &self.db,
+            self.now.saturating_sub(SWEEP_WINDOW),
+            DELETE_BATCH,
+            self.now,
+        )
+        .await
+        .map_err(text)?;
+        if swept > 0 {
+            console_log!("reconcile: recorded the minutes of {swept} jobs no webhook recorded");
+        }
         let Some(token) = get(self.env, POLAR_ACCESS_TOKEN) else {
             return Ok(Summary::default());
         };

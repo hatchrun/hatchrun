@@ -113,6 +113,25 @@ fn grace_sql() -> String {
     )
 }
 
+/// Records up to `?2` jobs that a runner took and that completed at or
+/// after `?1` with GitHub's times but have no minutes yet, as when
+/// recording failed after the reconciler marked the job completed.
+/// Returns each recorded row's tenant.
+fn sweep_sql() -> String {
+    format!(
+        "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed) \
+         SELECT jobs.id, tenants.id, \
+         MAX(1, (jobs.completed_at - jobs.started_at + 59999) / 60000), jobs.completed_at, \
+         tenants.beta = 0 AND {PAID} \
+         FROM jobs JOIN tenants ON tenants.installation_id = jobs.installation_id \
+         WHERE jobs.ran_on IS NOT NULL AND jobs.completed_at >= ?1 \
+         AND jobs.started_at IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM usage_events WHERE usage_events.job_id = jobs.id) \
+         ORDER BY jobs.completed_at LIMIT ?2 \
+         ON CONFLICT (job_id) DO NOTHING RETURNING tenant_id"
+    )
+}
+
 /// Clears tenant `?1`'s `free_used_up_at`, so a subscription that ends
 /// later starts a grace period of its own.
 const CLEAR_GRACE: &str =
@@ -174,6 +193,30 @@ pub(crate) async fn start_grace(db: &D1Database, id: &str, now: u64) -> Result<b
         .run()
         .await?;
     Ok(result.meta()?.and_then(|meta| meta.changes) == Some(1))
+}
+
+/// Records the minutes of up to `limit` jobs that completed at or after
+/// `since` (Unix ms) and that no webhook or sync recorded, and starts
+/// the grace period of any tenant they take past its free minutes.
+/// Returns how many it recorded.
+pub(crate) async fn sweep(db: &D1Database, since: u64, limit: u32, now: u64) -> Result<usize> {
+    #[derive(Deserialize)]
+    struct Recorded {
+        tenant_id: String,
+    }
+    let recorded: Vec<Recorded> = db
+        .prepare(sweep_sql())
+        .bind(&[int(since)?, limit.into()])?
+        .all()
+        .await?
+        .results()?;
+    let mut tenants: Vec<&str> = recorded.iter().map(|row| row.tenant_id.as_str()).collect();
+    tenants.sort_unstable();
+    tenants.dedup();
+    for tenant in tenants {
+        start_grace(db, tenant, now).await?;
+    }
+    Ok(recorded.len())
 }
 
 /// Forgets when tenant `id` used up its free minutes, as it does once a
@@ -472,6 +515,45 @@ mod sql {
             1
         );
         assert_eq!(month(&db, "free").may_launch, 1);
+    }
+
+    #[test]
+    fn the_sweep_records_what_no_webhook_did() {
+        let db = seed();
+        let job = |id: u64, ran: bool, started: Option<u64>, completed: u64| {
+            db.run(
+                "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+                 queued_at, updated_at, ran_on, started_at, completed_at) \
+                 VALUES (?1, 1, 'acme/app', 7, 'hatchrun', 'completed', 1, 1, ?2, ?3, ?4)",
+                &params![id, ran.then_some("hatchrun-x"), started, completed],
+            );
+        };
+        let t = now();
+        job(1, true, Some(t - 600_001), t);
+        job(2, false, Some(t - 60_000), t);
+        job(3, true, None, t);
+        job(4, true, Some(t - 2 * DAY - 60_000), t - 2 * DAY);
+        job(5, true, Some(t - 30_000), t);
+        // Already recorded by its webhook.
+        db.run(&insert_sql(), &params![5u64, 1u32, t]);
+
+        let swept: Vec<serde_json::Value> = db.all(&sweep_sql(), &params![t - DAY, 100u32]);
+        assert_eq!(swept, [serde_json::json!({ "tenant_id": "free" })]);
+        let rows: Vec<serde_json::Value> = db.all(
+            "SELECT job_id, minutes, billed FROM usage_events ORDER BY job_id",
+            &[],
+        );
+        assert_eq!(
+            rows,
+            [
+                serde_json::json!({ "job_id": 1, "minutes": 11, "billed": 0 }),
+                serde_json::json!({ "job_id": 5, "minutes": 1, "billed": 0 }),
+            ]
+        );
+        let again: Vec<serde_json::Value> = db.all(&sweep_sql(), &params![t - DAY, 100u32]);
+        assert_eq!(again, Vec::<serde_json::Value>::new());
+        let plan = db.plan(&sweep_sql(), &params![t - DAY, 100u32]);
+        assert!(plan.contains("jobs_completed"), "{plan}");
     }
 
     #[test]

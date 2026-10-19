@@ -30,6 +30,10 @@ CREATE INDEX usage_events_unsent ON usage_events (ended_at)
 CREATE INDEX usage_events_done ON usage_events (ended_at)
   WHERE billed = 0 OR sent_at IS NOT NULL;
 
+-- Completed jobs a runner took, by when they completed, for the
+-- reconciler's sweep of jobs whose minutes no webhook recorded.
+CREATE INDEX jobs_completed ON jobs (completed_at) WHERE ran_on IS NOT NULL;
+
 -- When an unpaid tenant first used up its free minutes in a month,
 -- Unix ms. Runners keep launching for a grace period after it, then
 -- stop until a subscription starts or the next month does.
