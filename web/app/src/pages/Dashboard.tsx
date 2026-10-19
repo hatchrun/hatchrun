@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
   listRuns,
@@ -12,11 +12,13 @@ import {
   type JobGroup,
   type ListedRun,
   type RunPage,
+  type RunSort,
+  type SortDir,
   type Stack,
   type Tenant,
 } from "@/api";
 import { CopyButton } from "@/components/CopyButton";
-import { ChevronRightIcon, ExternalIcon, GitHubIcon, OpenIcon } from "@/components/icons";
+import { ChevronRightIcon, ExternalIcon, GitHubIcon, OpenIcon, SearchIcon } from "@/components/icons";
 import {
   ago,
   endOf,
@@ -38,7 +40,7 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
-import { Link, useQuery } from "@/router";
+import { Link, setQuery, useQuery } from "@/router";
 
 /** Seconds between refreshes of the run list. */
 const REFRESH = 10;
@@ -47,32 +49,65 @@ const PAGE = 25;
 /** The profile the page suggests for runs-on. */
 const SUGGESTED = "hatchrun-4cpu-arm64";
 
+/** Milliseconds the search box waits after the last key before it asks. */
+const DEBOUNCE_MS = 300;
+/** The order a column sorts in when first picked. */
+const FIRST_DIR: Record<RunSort, SortDir> = { started: "desc", repository: "asc" };
+/** How each order reads, for the column head's label. */
+const ORDER_TEXT: Record<RunSort, Record<SortDir, string>> = {
+  started: { desc: "newest first", asc: "oldest first" },
+  repository: { asc: "A to Z", desc: "Z to A" },
+};
+const TAB_LABEL: Record<JobGroup, string> = { active: "Active", waiting: "Waiting", failed: "Failed" };
+
+/** The table's tab, order and search as the URL holds them, so a link reproduces the view. */
+function useView(): { status: JobGroup | undefined; sort: RunSort; dir: SortDir; q: string } {
+  const status = useQuery("status");
+  const sort = useQuery("sort");
+  const dir = useQuery("dir");
+  const q = useQuery("q") ?? "";
+  const by: RunSort = sort === "repository" ? "repository" : "started";
+  return {
+    status: status === "active" || status === "waiting" || status === "failed" ? status : undefined,
+    sort: by,
+    dir: dir === "asc" || dir === "desc" ? dir : FIRST_DIR[by],
+    q,
+  };
+}
+
 export function Dashboard({ tenant }: { tenant: Tenant }) {
   const org = tenant.org.login;
   const installed = useQuery("installed");
-  const [status, setStatus] = useState<JobGroup | undefined>(undefined);
-  // The newest page of the last tab loaded. The fleet panel keeps showing
-  // it while another tab loads; the table shows it only for its own tab.
-  const [loaded, setLoaded] = useState<{ status: JobGroup | undefined; page: RunPage } | null>(null);
-  const [older, setOlder] = useState<ListedRun[]>([]);
+  const { status, sort, dir, q: typed } = useView();
+  const q = typed.trim();
+  // A change to any of these starts the list over.
+  const view = `${status ?? "all"} ${sort} ${dir} ${q}`;
+  // The newest page of the last view loaded. The fleet panel keeps
+  // showing it while another view loads; the table shows it only for
+  // its own view.
+  const [loaded, setLoaded] = useState<{ view: string; page: RunPage; at: number } | null>(null);
+  const [older, setOlder] = useState<{ view: string; runs: ListedRun[]; done: boolean } | null>(null);
   // Runs the user opened or closed; the rest follow `openByDefault`.
   const [toggled, setToggled] = useState<Record<number, boolean>>({});
   const [error, setError] = useState<Error | null>(null);
-  const [more, setMore] = useState(true);
-  const [paging, setPaging] = useState(false);
+  const [paging, setPaging] = useState<string | null>(null);
+  // Counts "Load more" requests, so only the newest one clears `paging`,
+  // whatever view it was asked from.
+  const pagingRequest = useRef(0);
   const table = useRef<HTMLElement>(null);
   // Advanced whenever the list starts over, so an older page that comes
-  // back after a tab change or "Back to newest" is dropped.
+  // back after the view changes or "Back to newest" is dropped.
   const round = useRef(0);
   const now = useNow(REFRESH * 1000);
 
   useEffect(() => {
+    round.current += 1;
     let current = true;
     const load = () =>
-      listRuns(org, { status }).then(
+      listRuns(org, { status, sort, dir, q }).then(
         (next) => {
           if (current) {
-            setLoaded({ status, page: next });
+            setLoaded({ view, page: next, at: Date.now() });
             setError(null);
           }
         },
@@ -88,58 +123,59 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
       current = false;
       window.clearInterval(timer);
     };
-  }, [org, status]);
+  }, [org, view, status, sort, dir, q]);
 
-  const page = loaded && loaded.status === status ? loaded.page : null;
+  const page = loaded && loaded.view === view ? loaded.page : null;
   const pageSize = page?.pageSize ?? PAGE;
-  const runs = page ? [...page.runs, ...older.filter((run) => !page.runs.some((seen) => seen.id === run.id))] : [];
+  const olderRuns = older?.view === view ? older.runs : [];
+  const more = !(older?.view === view && older.done);
+  const runs = page ? [...page.runs, ...olderRuns.filter((run) => !page.runs.some((seen) => seen.id === run.id))] : [];
   const last = runs[runs.length - 1];
   const loadOlder = async () => {
     if (!last) {
       return;
     }
     const asked = round.current;
-    setPaging(true);
+    const request = ++pagingRequest.current;
+    setPaging(view);
     try {
-      const next = await listRuns(org, { before: last, status });
+      const next = await listRuns(org, { before: last, status, sort, dir, q });
       if (asked === round.current) {
-        setOlder((was) => [...was, ...next.runs]);
-        setMore(next.runs.length === (next.pageSize ?? PAGE));
+        setOlder((was) => ({
+          view,
+          runs: [...(was?.view === view ? was.runs : []), ...next.runs],
+          done: next.runs.length < (next.pageSize ?? PAGE),
+        }));
       }
     } catch (err) {
       if (asked === round.current) {
         setError(err instanceof Error ? err : new Error(String(err)));
       }
     } finally {
-      if (asked === round.current) {
-        setPaging(false);
+      if (request === pagingRequest.current) {
+        setPaging(null);
       }
     }
   };
-  const startOver = () => {
-    round.current += 1;
-    setOlder([]);
-    setMore(true);
-    setPaging(false);
-  };
-  const pick = (next: JobGroup | undefined) => {
-    setStatus(next);
-    startOver();
-  };
   const backToNewest = () => {
-    startOver();
+    round.current += 1;
+    setOlder(null);
+    setPaging(null);
     table.current?.scrollIntoView({ block: "start" });
   };
+  const pick = (next: JobGroup | undefined) => setQuery({ status: next ?? null });
+  const sortBy = (column: RunSort) => {
+    const next = column === sort ? (dir === "asc" ? "desc" : "asc") : FIRST_DIR[column];
+    setQuery({ sort: column === "started" ? null : column, dir: next === FIRST_DIR[column] ? null : next });
+  };
+  const head = { sort, dir, onSort: sortBy };
 
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1.5">
           <h1 className="display text-[26px]">Jobs</h1>
-          <span className="inline-flex items-center gap-2 font-mono text-xs text-fog">
-            <span aria-hidden="true" className={cn("size-1.5 rounded-full", error ? "bg-failed" : "bg-passed")} />
-            {error ? "refresh failed, trying again" : `live, refreshes every ${REFRESH} s`}
-          </span>
+          <Updated at={loaded?.at ?? null} failed={error !== null} />
         </div>
         <RunsOn text={SUGGESTED} />
       </div>
@@ -162,7 +198,7 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
       <section ref={table} aria-label="Runs" className="scroll-mt-4 overflow-hidden rounded-md border border-rivet">
         <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-rivet bg-panel px-3.5 py-2.5">
           <StatusTabs status={status} counts={loaded?.page.counts ?? null} onPick={pick} />
-          <span className="font-mono text-xs text-fog">newest first</span>
+          <Search value={typed} />
         </div>
         {error && (
           <div className="border-b border-rivet p-3.5">
@@ -174,8 +210,19 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
             <Spinner />
           </div>
         )}
-        {page && runs.length === 0 && status && <p className="px-3.5 py-10 text-center text-fog">{EMPTY[status]}</p>}
-        {page && runs.length === 0 && !status && (
+        {page && runs.length === 0 && q && (
+          <div className="flex flex-col items-center gap-3 px-3.5 py-10 text-center text-fog">
+            <p>
+              No runs match <span className="font-mono text-bone">'{q}'</span>
+              {status && <> in {TAB_LABEL[status]}</>}.
+            </p>
+            <Button variant="outline" onClick={() => setQuery({ q: null })}>
+              Clear search
+            </Button>
+          </div>
+        )}
+        {page && runs.length === 0 && !q && status && <p className="px-3.5 py-10 text-center text-fog">{EMPTY[status]}</p>}
+        {page && runs.length === 0 && !q && !status && (
           <p className="px-3.5 py-10 text-center text-fog">
             No jobs yet. Push a workflow with <code className="font-mono text-bone">runs-on: {SUGGESTED}</code> and it
             shows up here. <Link href={`/o/${org}/runners`} className="quiet-underline text-bone-dim hover:text-bone">See every runner profile</Link>.
@@ -191,15 +238,15 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
                     <span className="cap">Run / job</span>{" "}
                     <span className="ml-1 font-mono text-[10px] text-chick">→ details</span>
                   </TableHead>
-                  <TableHead>
-                    <span className="cap">On GitHub / label</span>{" "}
+                  <SortHead column="repository" label="Repository" {...head}>
+                    <span className="cap ml-1">/ label</span>{" "}
                     <span className="ml-1 font-mono text-[10px] text-steel">↗ logs</span>
-                  </TableHead>
+                  </SortHead>
                   <TableHead>
                     <span className="cap">EC2 instance</span>{" "}
                     <span className="ml-1 font-mono text-[10px] text-steel">↗ aws console</span>
                   </TableHead>
-                  <TableHead className="cap">Started</TableHead>
+                  <SortHead column="started" label="Started" {...head} />
                   <TableHead className="cap text-right">Took</TableHead>
                 </TableRow>
               </TableHeader>
@@ -223,17 +270,17 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
             <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-rivet bg-panel px-3.5 py-2.5 font-mono text-xs text-fog">
               <span>
                 {runs.length} {runs.length === 1 ? "run" : "runs"} shown
-                {last && <>, back to {ago(last.queuedAt)}</>}
+                {last && sort === "started" && dir === "desc" && <>, back to {ago(last.queuedAt)}</>}
               </span>
               <div className="flex gap-2">
-                {older.length > 0 && (
+                {olderRuns.length > 0 && (
                   <Button variant="outline" onClick={backToNewest}>
-                    ↑ Back to newest
+                    ↑ Back to the top
                   </Button>
                 )}
                 {more && runs.length >= pageSize && (
-                  <Button variant="outline" onClick={loadOlder} disabled={paging}>
-                    {paging ? "Loading" : `Load ${pageSize} older ↓`}
+                  <Button variant="outline" onClick={loadOlder} disabled={paging === view}>
+                    {paging === view ? "Loading" : `Load ${pageSize} more ↓`}
                   </Button>
                 )}
               </div>
@@ -242,6 +289,115 @@ export function Dashboard({ tenant }: { tenant: Tenant }) {
         )}
       </section>
     </div>
+  );
+}
+
+/** When the list last came back, ticking, or that the last refresh failed. */
+function Updated({ at, failed }: { at: number | null; failed: boolean }) {
+  const now = useNow(1000);
+  if (failed) {
+    return <span className="font-mono text-xs text-failed">refresh failed, trying again</span>;
+  }
+  if (at === null) {
+    return null;
+  }
+  const seconds = Math.max(0, Math.round((now - at) / 1000));
+  return (
+    <span className="font-mono text-xs text-fog" title={`Refreshes every ${REFRESH} s`}>
+      updated {seconds < 1 ? "just now" : seconds < 60 ? `${seconds} s ago` : ago(at)}
+    </span>
+  );
+}
+
+/** A column head that sorts the runs; the sorted one carries an arrow. */
+function SortHead({
+  column,
+  label,
+  sort,
+  dir,
+  onSort,
+  children,
+}: {
+  column: RunSort;
+  label: string;
+  sort: RunSort;
+  dir: SortDir;
+  onSort: (column: RunSort) => void;
+  children?: ReactNode;
+}) {
+  const on = sort === column;
+  const next = on ? (dir === "asc" ? "desc" : "asc") : FIRST_DIR[column];
+  return (
+    <TableHead aria-sort={on ? (dir === "asc" ? "ascending" : "descending") : "none"}>
+      <button
+        type="button"
+        onClick={() => onSort(column)}
+        title={`Sort by ${label.toLowerCase()}, ${ORDER_TEXT[column][next]}`}
+        className={cn(
+          "inline-flex cursor-pointer items-center gap-1 rounded-xs font-mono text-[11px] tracking-[0.08em] uppercase",
+          on ? "text-chick" : "text-fog hover:text-bone",
+        )}
+      >
+        {label}
+        {on && (
+          <>
+            <span aria-hidden="true">{dir === "asc" ? "↑" : "↓"}</span>
+            <span className="sr-only">, {ORDER_TEXT[column][dir]}</span>
+          </>
+        )}
+      </button>
+      {children}
+    </TableHead>
+  );
+}
+
+/**
+ * The search over the runs. It asks once typing stops; the URL holds
+ * what it asked, and the box follows the URL on back, forward and Clear.
+ */
+function Search({ value }: { value: string }) {
+  const [text, setText] = useState(value);
+  const [shown, setShown] = useState(value);
+  if (value !== shown) {
+    setShown(value);
+    setText(value);
+  }
+  useEffect(() => {
+    if (text === value) {
+      return;
+    }
+    const timer = window.setTimeout(() => setQuery({ q: text.trim() ? text : null }), DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [text, value]);
+  const clear = () => {
+    setText("");
+    setQuery({ q: null });
+  };
+  return (
+    <label className="flex h-[30px] w-full items-center gap-2 rounded-sm border border-rivet bg-housing px-2.5 font-mono text-xs text-fog focus-within:border-chick sm:w-[360px]">
+      <SearchIcon />
+      <input
+        type="search"
+        aria-label="Search runs"
+        placeholder="repo, workflow, job, branch, label, instance"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => event.key === "Escape" && text && clear()}
+        autoComplete="off"
+        spellCheck={false}
+        className="min-w-0 flex-1 bg-transparent text-bone outline-none placeholder:text-steel [&::-webkit-search-cancel-button]:appearance-none"
+      />
+      {text && (
+        <button
+          type="button"
+          onClick={clear}
+          aria-label="Clear search"
+          className="cursor-pointer rounded-xs px-1 text-fog hover:bg-seam hover:text-bone"
+        >
+          ×
+        </button>
+      )}
+    </label>
   );
 }
 

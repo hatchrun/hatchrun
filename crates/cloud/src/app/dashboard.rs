@@ -8,9 +8,14 @@
 //!   hatchrun jobs and the jobs' instances, newest first, and counts
 //!   what is running now. `?status=active|waiting|failed` lists the runs
 //!   with a current job in that group, the runs the group's count
-//!   counts. `?before=<queued_at>:<id>` pages back. The first page also
-//!   carries the last day's finished jobs and failed launches in buckets
-//!   of 15 minutes.
+//!   counts. `?sort=started|repository&dir=desc|asc` orders the list,
+//!   newest first by default; by repository, each repository's runs are
+//!   newest first. `?q=<text>` keeps the runs whose repository, workflow
+//!   or branch, or one of whose jobs' name, label or instance, contains
+//!   the text. `?before=<queued_at>:<id>`, with `:<repository>` when
+//!   sorted by repository, is the last run of the page before. The
+//!   first page also carries the last day's finished jobs and failed
+//!   launches in buckets of 15 minutes.
 //! - `GET /api/tenants/<org>/runs/<id>` returns one run with the jobs of
 //!   every attempt and what each job used of its instance.
 //! - `PUT /api/tenants/<org>/settings` with `{"maxRunners",
@@ -180,16 +185,77 @@ impl Group {
     }
 }
 
+/// The column the runs table sorts by. A run's duration and state are
+/// not here: both roll up from its jobs and change while it runs, so a
+/// page boundary in either moves under the reader.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Sort {
+    /// When the newest attempt's first job was queued.
+    #[default]
+    Started,
+    /// By repository, then newest first within it.
+    Repository,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Direction {
+    Asc,
+    #[default]
+    Desc,
+}
+
 #[derive(Debug, Deserialize)]
 struct Page {
     before: Option<String>,
     status: Option<Group>,
+    #[serde(default)]
+    sort: Sort,
+    #[serde(default)]
+    dir: Direction,
+    q: Option<String>,
 }
 
-/// Reads `?before=<queued_at>:<id>`, the last run of the page before.
-fn cursor(value: &str) -> Option<(u64, u64)> {
-    let (queued_at, id) = value.split_once(':')?;
-    Some((queued_at.parse().ok()?, id.parse().ok()?))
+/// The longest search the list takes.
+const SEARCH_MAX: usize = 200;
+
+/// The last run of the page before.
+#[derive(Debug, PartialEq, Eq)]
+struct Cursor {
+    queued_at: u64,
+    id: u64,
+    /// Set when sorted by repository.
+    repository: Option<String>,
+}
+
+/// Reads `?before=<queued_at>:<id>[:<repository>]`. A repository name
+/// has no colon, but everything after the second is taken as it is.
+fn cursor(value: &str) -> Option<Cursor> {
+    let mut parts = value.splitn(3, ':');
+    let queued_at = parts.next()?.parse().ok()?;
+    let id = parts.next()?.parse().ok()?;
+    let repository = parts.next().map(str::to_owned);
+    Some(Cursor {
+        queued_at,
+        id,
+        repository,
+    })
+}
+
+/// A `LIKE` pattern that matches `text` anywhere, with `%`, `_` and the
+/// escape character itself taken literally under `ESCAPE '\'`.
+fn contains(text: &str) -> String {
+    let mut pattern = String::with_capacity(text.len() + 2);
+    pattern.push('%');
+    for c in text.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
 }
 
 /// Finished and failed jobs per bucket over the last day, oldest first.
@@ -209,11 +275,52 @@ struct Grouped {
     failed: u32,
 }
 
-/// The query for one page of runs, of one group or of all. A run is in
-/// a group when one of its current jobs is; the inner query starts from
-/// the jobs, through their indexes, so a tenant with few failures does
-/// not read every run.
-fn list_query(group: Option<Group>) -> String {
+/// Matches `?6`, a [`contains`] pattern, against a run and its jobs of
+/// every attempt. The jobs are read through `jobs_run`, one run at a
+/// time, so a page stops reading once it is full.
+const SEARCH: &str = "(repository LIKE ?6 ESCAPE '\\' \
+     OR workflow_name LIKE ?6 ESCAPE '\\' \
+     OR head_branch LIKE ?6 ESCAPE '\\' \
+     OR EXISTS (SELECT 1 FROM jobs AS s \
+       WHERE s.run_id = runs.id AND s.installation_id = ?1 \
+       AND (s.name LIKE ?6 ESCAPE '\\' OR s.label LIKE ?6 ESCAPE '\\' \
+         OR s.instance_id LIKE ?6 ESCAPE '\\')))";
+
+/// Where the page after the cursor `?2`, `?3` and, by repository, `?5`
+/// starts, and the order it is in. Within a repository runs stay newest
+/// first either way.
+fn order(sort: Sort, dir: Direction) -> (&'static str, &'static str) {
+    match (sort, dir) {
+        // `?5` is null here; naming it keeps the parameter count.
+        (Sort::Started, Direction::Desc) => (
+            "(queued_at, id) < (?2, ?3) AND ?5 IS NULL",
+            "queued_at DESC, id DESC",
+        ),
+        (Sort::Started, Direction::Asc) => {
+            ("(queued_at, id) > (?2, ?3) AND ?5 IS NULL", "queued_at, id")
+        }
+        (Sort::Repository, Direction::Asc) => (
+            "(repository COLLATE NOCASE > ?5 \
+             OR (repository COLLATE NOCASE = ?5 AND (queued_at, id) < (?2, ?3)))",
+            "repository COLLATE NOCASE, queued_at DESC, id DESC",
+        ),
+        (Sort::Repository, Direction::Desc) => (
+            "(repository COLLATE NOCASE < ?5 \
+             OR (repository COLLATE NOCASE = ?5 AND (queued_at, id) < (?2, ?3)))",
+            "repository COLLATE NOCASE DESC, queued_at DESC, id DESC",
+        ),
+    }
+}
+
+/// The query for one page of runs, of one group or of all, in `sort`
+/// order and, unless `?6` is null, only the runs matching it. A run is
+/// in a group when one of its current jobs is; the inner query starts
+/// from the jobs, through their indexes, so a tenant with few failures
+/// does not read every run. Every piece is a constant; the search text
+/// is only ever bound. Each order names `?5` and the search `?6`, so
+/// every query takes the same six values, as D1 wants as many values
+/// as the query has parameters.
+fn list_query(group: Option<Group>, sort: Sort, dir: Direction) -> String {
     let filter = group.map_or(String::new(), |g| {
         format!(
             " AND id IN (SELECT j.run_id FROM jobs AS j \
@@ -221,10 +328,12 @@ fn list_query(group: Option<Group>) -> String {
             g.predicate()
         )
     });
+    let (after, order) = order(sort, dir);
     format!(
         "SELECT {RUN_COLUMNS} FROM runs \
-         WHERE installation_id = ?1 AND (?2 IS NULL OR (queued_at, id) < (?2, ?3)){filter} \
-         ORDER BY queued_at DESC, id DESC LIMIT ?4"
+         WHERE installation_id = ?1 AND (?2 IS NULL OR {after}){filter} \
+         AND (?6 IS NULL OR {SEARCH}) \
+         ORDER BY {order} LIMIT ?4"
     )
 }
 
@@ -369,24 +478,49 @@ pub(crate) async fn runs(ctx: &Ctx<'_>, org: &str, req: &Request) -> Answer {
             "region": row.region,
         }))?);
     };
-    let page: Page = req
-        .query()
-        .map_err(|_| Failure::new(400, "status is one of active, waiting or failed."))?;
+    let page: Page = req.query().map_err(|_| {
+        Failure::new(
+            400,
+            "status is active, waiting or failed; sort is started or repository; dir is asc or desc.",
+        )
+    })?;
     let before = match page.before.as_deref() {
-        Some(value) => {
-            Some(cursor(value).ok_or_else(|| Failure::new(400, "before is <queuedAt>:<id>."))?)
-        }
+        Some(value) => Some(
+            cursor(value)
+                .filter(|c| page.sort != Sort::Repository || c.repository.is_some())
+                .ok_or_else(|| {
+                    Failure::new(
+                        400,
+                        "before is <queuedAt>:<id>, and <queuedAt>:<id>:<repository> by repository.",
+                    )
+                })?,
+        ),
         None => None,
     };
+    let q = page.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    if q.is_some_and(|q| q.chars().count() > SEARCH_MAX) {
+        return Err(Failure::new(
+            400,
+            format!("q is at most {SEARCH_MAX} characters."),
+        ));
+    }
     let installation = int(installation)?;
     let runs = ctx
         .db
-        .prepare(list_query(page.status))
+        .prepare(list_query(page.status, page.sort, page.dir))
         .bind(&[
             installation.clone(),
-            before.map_or(Ok(JsValue::NULL), |(at, _)| int(at))?,
-            before.map_or(Ok(JsValue::NULL), |(_, id)| int(id))?,
+            before
+                .as_ref()
+                .map_or(Ok(JsValue::NULL), |c| int(c.queued_at))?,
+            before.as_ref().map_or(Ok(JsValue::NULL), |c| int(c.id))?,
             PAGE.into(),
+            before
+                .as_ref()
+                .and_then(|c| c.repository.as_deref())
+                .filter(|_| page.sort == Sort::Repository)
+                .map_or(JsValue::NULL, Into::into),
+            q.map_or(JsValue::NULL, |q| contains(q).into()),
         ])?
         .all()
         .await?
@@ -528,14 +662,39 @@ mod tests {
     }
 
     #[test]
+    fn the_list_is_newest_first_unless_asked() {
+        let page: Page = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!((page.sort, page.dir), (Sort::Started, Direction::Desc));
+        let page: Page = serde_json::from_value(
+            serde_json::json!({"sort": "repository", "dir": "asc", "q": "web"}),
+        )
+        .unwrap();
+        assert_eq!((page.sort, page.dir), (Sort::Repository, Direction::Asc));
+        assert_eq!(page.q.as_deref(), Some("web"));
+        for bad in [
+            serde_json::json!({"sort": "took"}),
+            serde_json::json!({"sort": "status"}),
+            serde_json::json!({"dir": "up"}),
+        ] {
+            assert!(serde_json::from_value::<Page>(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn a_search_takes_wildcards_literally() {
+        assert_eq!(contains("web"), "%web%");
+        assert_eq!(contains("50%_off\\"), "%50\\%\\_off\\\\%");
+    }
+
+    #[test]
     fn a_group_lists_what_its_count_counts() {
         let counts = counts_query();
         for group in [Group::Active, Group::Waiting, Group::Failed] {
-            let list = list_query(Some(group));
+            let list = list_query(Some(group), Sort::Started, Direction::Desc);
             assert!(list.contains(&format!(" AND {} AND {CURRENT})", group.predicate())));
             assert!(counts.contains(&format!("({}) AND {CURRENT})", group.predicate())));
         }
-        let all = list_query(None);
+        let all = list_query(None, Sort::Started, Direction::Desc);
         assert!([ACTIVE, WAITING, FAILED].iter().all(|p| !all.contains(p)));
     }
 
@@ -543,7 +702,15 @@ mod tests {
     fn a_cursor_is_a_time_and_a_run() {
         assert_eq!(
             cursor("1792140000000:18234567890"),
-            Some((1_792_140_000_000, 18_234_567_890))
+            Some(Cursor {
+                queued_at: 1_792_140_000_000,
+                id: 18_234_567_890,
+                repository: None,
+            })
+        );
+        assert_eq!(
+            cursor("1:2:acme/web").and_then(|c| c.repository),
+            Some("acme/web".to_owned())
         );
         assert_eq!(cursor("1792140000000"), None);
         assert_eq!(cursor("x:1"), None);
@@ -558,18 +725,24 @@ mod tests {
 
     #[test]
     fn every_query_is_scoped_to_the_installation() {
-        for query in [
-            list_query(None),
-            list_query(Some(Group::Failed)),
+        let lists = [Sort::Started, Sort::Repository]
+            .into_iter()
+            .flat_map(|sort| {
+                [Direction::Asc, Direction::Desc].map(|dir| list_query(None, sort, dir))
+            });
+        for query in lists.chain([
+            list_query(Some(Group::Failed), Sort::Started, Direction::Desc),
             jobs_query(),
             counts_query(),
             activity_query(),
-        ] {
+        ]) {
             assert!(query.contains("WHERE installation_id = ?1 "), "{query}");
         }
-        assert!(list_query(Some(Group::Failed)).contains("WHERE j.installation_id = ?1 "));
+        let failed = list_query(Some(Group::Failed), Sort::Started, Direction::Desc);
+        assert!(failed.contains("WHERE j.installation_id = ?1 "));
+        assert!(SEARCH.contains("s.installation_id = ?1 "));
         assert!(run_query().ends_with("WHERE id = ?1 AND installation_id = ?2"));
-        assert!(list_query(None).contains(" LIMIT ?4"));
+        assert!(list_query(None, Sort::Started, Direction::Desc).contains(" LIMIT ?4"));
         assert!(activity_query().contains("updated_at >= ?2"));
         assert!(activity_query().starts_with("SELECT CAST((updated_at - ?2) / "));
         assert!(activity_query().contains(" AS INTEGER) AS bucket, "));
@@ -720,13 +893,38 @@ mod tests {
         before: Option<(u64, u64)>,
         limit: u32,
     ) -> Vec<WorkflowRun> {
+        sorted(
+            db,
+            group,
+            (Sort::Started, Direction::Desc),
+            None,
+            before.map(|(at, id)| (at, id, "")),
+            limit,
+        )
+    }
+
+    /// A page in any order, of the runs matching `q` when set, after
+    /// the run `before` as `(queued_at, id, repository)`.
+    fn sorted(
+        db: &Db,
+        group: Option<Group>,
+        (sort, dir): (Sort, Direction),
+        q: Option<&str>,
+        before: Option<(u64, u64, &str)>,
+        limit: u32,
+    ) -> Vec<WorkflowRun> {
+        let repository = before
+            .filter(|_| sort == Sort::Repository)
+            .map(|(_, _, repository)| repository);
         db.all(
-            &list_query(group),
+            &list_query(group, sort, dir),
             &params![
                 INSTALLATION,
-                before.map(|(at, _)| at),
-                before.map(|(_, id)| id),
-                limit
+                before.map(|(at, _, _)| at),
+                before.map(|(_, id, _)| id),
+                limit,
+                repository,
+                q.map(contains)
             ],
         )
     }
@@ -864,7 +1062,14 @@ mod tests {
         let plan = |sql: &str| -> String {
             db.rows(
                 &format!("EXPLAIN QUERY PLAN {sql}"),
-                &params![INSTALLATION, None::<u64>, None::<u64>, PAGE],
+                &params![
+                    INSTALLATION,
+                    None::<u64>,
+                    None::<u64>,
+                    PAGE,
+                    None::<&str>,
+                    None::<&str>
+                ],
             )
             .unwrap()
             .iter()
@@ -872,14 +1077,218 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
         };
-        let failed = plan(&list_query(Some(Group::Failed)));
+        let failed = plan(&list_query(
+            Some(Group::Failed),
+            Sort::Started,
+            Direction::Desc,
+        ));
         // Through jobs_failed, never every job, and the later attempts
         // through jobs_run.
         assert!(failed.contains("jobs_failed"), "{failed}");
         assert!(!failed.contains("SCAN"), "{failed}");
         assert!(failed.contains("jobs_run"), "{failed}");
-        let all = plan(&list_query(None));
+        let all = plan(&list_query(None, Sort::Started, Direction::Desc));
         assert!(all.contains("runs_recent"), "{all}");
+    }
+
+    #[test]
+    fn every_sort_walks_an_index() {
+        let db = jobs();
+        let plan = |sql: &str| -> String {
+            db.rows(
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                &params![INSTALLATION, 1u64, 1u64, PAGE, "acme/web", "%web%"],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row["detail"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+        };
+        for (sort, dir, index) in [
+            (Sort::Started, Direction::Desc, "runs_recent"),
+            (Sort::Started, Direction::Asc, "runs_recent"),
+            (Sort::Repository, Direction::Asc, "runs_repository_az"),
+            (Sort::Repository, Direction::Desc, "runs_repository "),
+        ] {
+            let got = plan(&list_query(None, sort, dir));
+            assert!(got.contains(index), "{sort:?} {dir:?}: {got}");
+            assert!(!got.contains("TEMP B-TREE"), "{sort:?} {dir:?}: {got}");
+            assert!(got.contains("jobs_run"), "{sort:?} {dir:?}: {got}");
+        }
+    }
+
+    /// Twelve runs over three repositories, some at the same time, one
+    /// of them with a job on an instance and a branch; and a run of
+    /// another installation that matches every search.
+    fn many() -> Db {
+        let db = Db::new();
+        let repos = ["acme/web", "acme/API", "acme/infra"];
+        for i in 0..12u64 {
+            let id = 1000 + i;
+            db.run(
+                "INSERT INTO runs (id, installation_id, repository, workflow_name, head_branch, \
+                 head_sha, attempt, queued_at, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'ab', 1, ?6, ?6, ?6)",
+                &params![
+                    id,
+                    INSTALLATION,
+                    repos[(i % 3) as usize],
+                    if i % 4 == 0 { "Release" } else { "CI" },
+                    if i == 7 { "fix_50%" } else { "main" },
+                    NOW - (i / 2) * 60_000
+                ],
+            );
+            db.run(
+                "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+                 launch_state, instance_id, queued_at, updated_at, name) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
+                &params![
+                    id * 10,
+                    INSTALLATION,
+                    repos[(i % 3) as usize],
+                    id,
+                    if i % 2 == 0 {
+                        "hatchrun-2cpu"
+                    } else {
+                        "hatchrun-8cpu-arm64"
+                    },
+                    if i < 3 { "in_progress" } else { "completed" },
+                    "launched",
+                    (i == 5).then_some("i-0abc5"),
+                    NOW - (i / 2) * 60_000,
+                    if i == 9 { "Deploy (prod)" } else { "build" }
+                ],
+            );
+        }
+        db.run(
+            "INSERT INTO runs (id, installation_id, repository, workflow_name, head_branch, \
+             head_sha, attempt, queued_at, created_at, updated_at) \
+             VALUES (9000, ?1, 'acme/web', 'Release', 'fix_50%', 'ab', 1, ?2, ?2, ?2)",
+            &params![INSTALLATION + 1, NOW],
+        );
+        db
+    }
+
+    /// Every run of a list, read two at a time through the cursor.
+    fn walk(db: &Db, group: Option<Group>, order: (Sort, Direction), q: Option<&str>) -> Vec<u64> {
+        let mut seen = Vec::new();
+        let mut before = None;
+        loop {
+            let cursor = before
+                .as_ref()
+                .map(|(at, id, repo): &(u64, u64, String)| (*at, *id, repo.as_str()));
+            let got = sorted(db, group, order, q, cursor, 2);
+            let Some(last) = got.last() else {
+                return seen;
+            };
+            before = Some((last.queued_at, last.id, last.repository.clone()));
+            seen.extend(ids(&got));
+        }
+    }
+
+    #[test]
+    fn every_sort_pages_through_every_run_once() {
+        let db = many();
+        let all: Vec<WorkflowRun> = db.all(
+            &format!("SELECT {RUN_COLUMNS} FROM runs WHERE installation_id = ?1"),
+            &params![INSTALLATION],
+        );
+        let key = |r: &WorkflowRun| {
+            (
+                r.repository.to_lowercase(),
+                std::cmp::Reverse((r.queued_at, r.id)),
+            )
+        };
+        let mut newest: Vec<&WorkflowRun> = all.iter().collect();
+        newest.sort_by_key(|r| std::cmp::Reverse((r.queued_at, r.id)));
+        let mut az: Vec<&WorkflowRun> = all.iter().collect();
+        az.sort_by_key(|r| key(r));
+        let mut za: Vec<&WorkflowRun> = all.iter().collect();
+        za.sort_by_key(|r| {
+            (
+                std::cmp::Reverse(r.repository.to_lowercase()),
+                std::cmp::Reverse((r.queued_at, r.id)),
+            )
+        });
+        let list = |runs: &[&WorkflowRun]| runs.iter().map(|r| r.id).collect::<Vec<_>>();
+        let oldest: Vec<u64> = list(&newest).into_iter().rev().collect();
+
+        assert_eq!(
+            walk(&db, None, (Sort::Started, Direction::Desc), None),
+            list(&newest)
+        );
+        assert_eq!(
+            walk(&db, None, (Sort::Started, Direction::Asc), None),
+            oldest
+        );
+        assert_eq!(
+            walk(&db, None, (Sort::Repository, Direction::Asc), None),
+            list(&az)
+        );
+        assert_eq!(
+            walk(&db, None, (Sort::Repository, Direction::Desc), None),
+            list(&za)
+        );
+        // API sorts with the lower case names, before infra and web.
+        assert_eq!(az[0].repository, "acme/API");
+        assert_eq!(za[0].repository, "acme/web");
+    }
+
+    #[test]
+    fn a_search_combines_with_a_tab_and_every_sort() {
+        let db = many();
+        let orders = [
+            (Sort::Started, Direction::Desc),
+            (Sort::Started, Direction::Asc),
+            (Sort::Repository, Direction::Asc),
+            (Sort::Repository, Direction::Desc),
+        ];
+        let set = |mut ids: Vec<u64>| {
+            ids.sort_unstable();
+            ids
+        };
+        for order in orders {
+            let find = |q: &str| set(walk(&db, None, order, Some(q)));
+            // Repository, case aside; workflow; branch; job name, label
+            // and instance.
+            assert_eq!(find("API"), [1001, 1004, 1007, 1010]);
+            assert_eq!(find("api"), [1001, 1004, 1007, 1010]);
+            assert_eq!(find("release"), [1000, 1004, 1008]);
+            assert_eq!(find("fix_50"), [1007]);
+            assert_eq!(find("prod"), [1009]);
+            assert_eq!(find("8cpu"), set((1001..1012).step_by(2).collect()));
+            assert_eq!(find("i-0abc"), [1005]);
+            // The wildcards match only themselves.
+            assert_eq!(find("50%"), [1007]);
+            assert_eq!(find("fix%50"), Vec::<u64>::new());
+            assert_eq!(find("a_i"), Vec::<u64>::new());
+            assert_eq!(find("%"), [1007]);
+            assert_eq!(find("_"), [1007]);
+            // With a tab: running is the first three runs.
+            assert_eq!(
+                set(walk(&db, Some(Group::Active), order, Some("acme/web"))),
+                [1000]
+            );
+            assert_eq!(
+                set(walk(&db, Some(Group::Active), order, Some("8cpu"))),
+                [1001]
+            );
+        }
+        // The searched list keeps the order it was asked for.
+        assert_eq!(
+            walk(&db, None, (Sort::Started, Direction::Asc), Some("API")),
+            [1010, 1007, 1004, 1001]
+        );
+        assert_eq!(
+            walk(
+                &db,
+                None,
+                (Sort::Repository, Direction::Desc),
+                Some("release")
+            ),
+            [1000, 1008, 1004]
+        );
     }
 
     #[test]

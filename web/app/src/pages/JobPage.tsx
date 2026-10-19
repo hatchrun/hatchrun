@@ -107,8 +107,7 @@ function JobView({ data }: { data: JobMetrics }) {
               title="CPU"
               legend={
                 <>
-                  <span className="text-heat">━</span> mean <span className="ml-2.5 text-ember">█</span> quietest to
-                  busiest second
+                  <span className="text-heat">━</span> mean <span className="ml-2.5 text-blush">╌</span> busiest second
                 </>
               }
             >
@@ -117,7 +116,8 @@ function JobView({ data }: { data: JobMetrics }) {
                 max={100}
                 format={(value) => `${Math.round(value)}%`}
                 line={(w) => w.cpuAvg}
-                band={(w) => [w.cpuMin, w.cpuMax]}
+                peak={(w) => w.cpuMax}
+                until={job.completedAt}
                 tone="heat"
                 label={`CPU: mean ${pct(summary.cpuAvg)}, highest ${pct(summary.cpuMax)}`}
               />
@@ -136,6 +136,7 @@ function JobView({ data }: { data: JobMetrics }) {
                 max={Math.max(...windows.map((w) => w.memTotal), 1)}
                 format={bytes}
                 line={(w) => w.memMax}
+                until={job.completedAt}
                 tone="chick"
                 label={`Memory: highest ${bytes(summary.memMax ?? 0)} of ${bytes(summary.memTotal ?? 0)}`}
               />
@@ -253,16 +254,19 @@ const TOP = 8;
 const BOTTOM = 172;
 
 /**
- * A line over time, with an optional band, drawn as SVG. A gap in the
- * reports breaks the line instead of drawing across it. Without a band
- * the line gets a faint area and the top is marked as the limit.
+ * A line over time, with an optional thin line for the peaks, drawn as
+ * SVG. A gap in the reports breaks the line instead of drawing across
+ * it. Without peaks the line gets a faint area and the top is marked as
+ * the limit. The time axis runs from the first report to the last, or
+ * to `until`, when the job finished, if the reports stopped before it.
  */
 function Chart({
   windows,
   max,
   format,
   line,
-  band,
+  peak,
+  until,
   tone,
   label,
 }: {
@@ -270,12 +274,14 @@ function Chart({
   max: number;
   format: (value: number) => string;
   line: (window: MetricsWindow) => number;
-  band?: (window: MetricsWindow) => [number, number];
+  peak?: (window: MetricsWindow) => number;
+  /** Unix milliseconds, when the job finished. */
+  until: number | null;
   tone: "heat" | "chick";
   label: string;
 }) {
   const start = (windows[0]?.at ?? 0) - (windows[0]?.seconds ?? 0);
-  const end = Math.max(windows[windows.length - 1]?.at ?? 0, start + 60);
+  const end = Math.max(windows[windows.length - 1]?.at ?? 0, until === null ? 0 : until / 1000, start + 1);
   const x = (at: number) => LEFT + ((at - start) / (end - start)) * (WIDTH - LEFT);
   const y = (value: number) => BOTTOM - (Math.min(value, max) / max) * (BOTTOM - TOP);
   const runs = split(windows);
@@ -285,36 +291,37 @@ function Chart({
       <g className="font-mono" fontSize="11" fill="var(--steel)">
         {[1, 0.5, 0].map((share) => (
           <text key={share} x={LEFT - 8} y={y(max * share) + 4} textAnchor="end">
-            {share === 0 && !band ? "0" : format(max * share)}
+            {share === 0 && !peak ? "0" : format(max * share)}
           </text>
         ))}
         <text x={LEFT} y={HEIGHT - 4}>
-          0 min
+          0
         </text>
         <text x={WIDTH - 4} y={HEIGHT - 4} textAnchor="end">
-          {Math.round((end - start) / 60)} min
+          {span((end - start) * 1000)}
         </text>
       </g>
       <g stroke="var(--seam)">
-        {(band ? [1, 0.5, 0] : [0.5, 0]).map((share) => (
+        {(peak ? [1, 0.5, 0] : [0.5, 0]).map((share) => (
           <line key={share} x1={LEFT} x2={WIDTH} y1={y(max * share)} y2={y(max * share)} />
         ))}
       </g>
-      {!band && <line x1={LEFT} x2={WIDTH} y1={TOP} y2={TOP} stroke="var(--fog)" strokeDasharray="4 4" />}
+      {!peak && <line x1={LEFT} x2={WIDTH} y1={TOP} y2={TOP} stroke="var(--fog)" strokeDasharray="4 4" />}
       {runs.map((run) => {
         const points = run.map((w) => `${x(w.at)},${y(line(w))}`);
         const first = run[0];
         const last = run[run.length - 1];
         return (
           <g key={first?.at}>
-            {band ? (
-              <polygon
-                fill="var(--ember)"
-                opacity={0.7}
-                points={[
-                  ...run.map((w) => `${x(w.at)},${y(band(w)[1])}`),
-                  ...[...run].reverse().map((w) => `${x(w.at)},${y(band(w)[0])}`),
-                ].join(" ")}
+            {peak ? (
+              <polyline
+                points={run.map((w) => `${x(w.at)},${y(peak(w))}`).join(" ")}
+                fill="none"
+                stroke="var(--blush)"
+                strokeWidth={1}
+                strokeDasharray="4 3"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
               />
             ) : (
               first &&
