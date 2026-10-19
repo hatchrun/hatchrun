@@ -156,7 +156,7 @@ const routes: Record<string, Handler> = {
                 currency: "usd",
                 interval: "month",
                 unitAmount: "0.1",
-                capAmount: 19900,
+                capAmount: null,
               },
             ],
           },

@@ -122,7 +122,7 @@ MARKETPLACE_AMD64_URL = "https://aws.amazon.com/marketplace/pp/prodview-znhn6237
 MARKETPLACE_ARM64_URL = "https://aws.amazon.com/marketplace/pp/prodview-nchg6i6uzlfr2"
 # The Polar product an organization subscribes to: a metered price on
 # the job minutes meter (the "job.minutes" events the reconciler sends)
-# with a cap, and a meter credit benefit for the free minutes, which
+# with no cap, and a meter credit benefit for the free minutes, which
 # matches FREE_MINUTES in src/usage.rs. Several products may be listed,
 # separated by commas; checkout offers all of them and answers 503
 # while the list is empty. POLAR_API_URL points the Worker at Polar's

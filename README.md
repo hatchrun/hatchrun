@@ -281,8 +281,8 @@ and a banner from 80% on. `FREE_MINUTES` and `GRACE_MS` in
 
 Adding a card is a Polar subscription to the `POLAR_PRODUCT_ID`
 product: a metered price of 0.1 cents a minute on the "Job minutes"
-meter, capped at $199 a month, and a meter credit benefit of 3,000
-minutes per billing period, which matches `FREE_MINUTES`. The app opens
+meter with no monthly cap, and a meter credit benefit of 3,000 minutes
+per billing period, which matches `FREE_MINUTES`. The app opens
 Polar's checkout with the tenant id as the external customer id, and
 Polar's webhooks, at `https://app.hatchrun.io/api/polar/webhook` and
 checked against `POLAR_WEBHOOK_SECRET`, keep the `subscriptions` table
