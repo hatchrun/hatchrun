@@ -912,3 +912,148 @@ workflows:
         Vec::new()
     );
 }
+
+fn one_job(job: &str) -> String {
+    format!(
+        "
+jobs:
+  t:
+{job}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs: [t]
+"
+    )
+}
+
+#[test]
+fn validate_checks_every_expression() {
+    for (job, words) in [
+        (
+            "    runs-on: ubuntu-latest\n    steps: [{ run: \"echo ${{ github.ref == }}\" }]",
+            &["job `t`", "step 1 `run`", "after", "at byte"][..],
+        ),
+        (
+            "    runs-on: ubuntu-latest\n    steps: [{ run: x, if: nosuch.x }]",
+            &["step 1 `if`", "unknown context 'nosuch'"],
+        ),
+        (
+            "    runs-on: ubuntu-latest\n    env: { A: \"${{ nosuch(1) }}\" }\n    steps: []",
+            &["`env.A`", "unknown function"],
+        ),
+        (
+            "    runs-on: ubuntu-latest\n    if: \"${{ strategy.job-index }}\"\n    steps: []",
+            &["`if`", "unknown context 'strategy'"],
+        ),
+        (
+            "    runs-on: ubuntu-latest\n    steps: [{ uses: a/b@v1, with: { x: [\"${{ 1 +\" ] } }]",
+            &["step 1 `with.x`", "no closing"],
+        ),
+        (
+            "    runs-on: ubuntu-latest\n    steps: [{ cache: { key: \"${{ jobs }}\", paths: [a] } }]",
+            &["`cache.key`", "unknown context 'jobs'"],
+        ),
+    ] {
+        assert_error(&one_job(job), words);
+    }
+    // vars and inputs are known; a whole substitution and run-time
+    // contexts pass.
+    let ok = one_job(
+        "    runs-on: ubuntu-latest\n    parameters: { go: { type: boolean, default: true } }\n    if: ${{ parameters.go }}\n    steps: [{ run: \"echo ${{ vars.A }} ${{ inputs.b }}\", if: \"github.ref == 'refs/heads/main' && success()\" }]",
+    );
+    assert_eq!(errors(&ok), []);
+}
+
+#[test]
+fn validate_rejects_parameters_read_at_run_time() {
+    for (cond, field) in [
+        ("if: parameters.go", "`if`"),
+        ("if: \"${{ parameters.go && 'a' }}\"", "`if`"),
+        (
+            "env: { A: \"${{ format('{0}', parameters.go) }}\" }",
+            "`env.A`",
+        ),
+    ] {
+        let yaml = one_job(&format!(
+            "    runs-on: ubuntu-latest\n    parameters: {{ go: {{ type: boolean, default: true }} }}\n    {cond}\n    steps: []"
+        ));
+        assert_error(&yaml, &["job `t`", field, "reads `parameters`"]);
+    }
+    let yaml = "
+commands:
+  c:
+    parameters: { go: { type: boolean, default: true } }
+    steps: [{ run: x, if: parameters.go }]
+jobs: { t: { runs-on: ubuntu-latest, steps: [c] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+";
+    assert_error(yaml, &["command `c`", "step 1 `if`", "reads `parameters`"]);
+    let yaml = "
+jobs:
+  t: { runs-on: ubuntu-latest, parameters: { v: { type: string } }, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [ t: { v: \"${{ github.sha && parameters.v }}\" } ]
+";
+    assert_error(yaml, &["`t` sets `v`", "reads `parameters`"]);
+}
+
+#[test]
+fn rejects_job_parameters_named_like_entry_keys() {
+    for key in ["tags", "branches", "name", "requires", "type", "matrix"] {
+        let yaml = one_job(&format!(
+            "    runs-on: ubuntu-latest\n    parameters: {{ {key}: {{ type: string, default: x }} }}\n    steps: []"
+        ));
+        assert_error(&yaml, &["job `t`", &format!("parameter `{key}`"), "rename"]);
+    }
+}
+
+#[test]
+fn validate_checks_jobs_and_commands_no_workflow_runs() {
+    for (yaml, words) in [
+        (
+            "jobs: { a: { runs-on: nope, steps: [] } }",
+            &["job `a`", "runs-on: nope"][..],
+        ),
+        (
+            "jobs: { a: { executor: e, steps: [] } }",
+            &["job `a`", "executor `e`"],
+        ),
+        (
+            "jobs: { a: { steps: [] } }",
+            &["job `a`", "needs `executor` or `runs-on`"],
+        ),
+        (
+            "jobs: { a: { runs-on: ubuntu-latest, parameters: { n: { type: integer, default: x } }, steps: [] } }",
+            &["job `a` parameter `n`", "an integer"],
+        ),
+        (
+            "commands: { c: { parameters: { b: { type: boolean, default: 1 } }, steps: [] } }",
+            &["command `c` parameter `b`", "a boolean"],
+        ),
+        (
+            "commands: { c: { steps: [missing] } }",
+            &["command `c`", "command `missing`"],
+        ),
+        (
+            "commands: { c: { steps: [{ run: \"${{ nosuch }}\" }] } }",
+            &["command `c`", "unknown context"],
+        ),
+        (
+            "commands: { c: { steps: [{ uses: docker://alpine }] } }",
+            &["command `c`", "docker://"],
+        ),
+        (
+            "commands:\n  c: { parameters: { v: { type: string } }, steps: [] }\njobs: { a: { runs-on: ubuntu-latest, steps: [ c: { w: 1 } ] } }",
+            &["command `c`", "no parameter `w`"],
+        ),
+        (
+            "commands:\n  c: { parameters: { v: { type: string } }, steps: [] }\njobs: { a: { runs-on: ubuntu-latest, steps: [c] } }",
+            &["command `c`", "parameter `v`", "required"],
+        ),
+    ] {
+        assert_error(yaml, words);
+    }
+}

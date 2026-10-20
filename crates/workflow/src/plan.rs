@@ -18,6 +18,7 @@ use crate::config::{
     WorkflowJob, WorkspaceStep,
 };
 use crate::diagnostic::Diagnostic;
+use crate::expr::{self, ExprError};
 use crate::templates::{Template, template, template_labels};
 use crate::trigger::{Filter, Triggers};
 
@@ -80,6 +81,10 @@ const STEP_KEYS: &[&str] = &[
     "continue-on-error",
     "timeout-minutes",
 ];
+
+/// Keys of a workflow entry. A job parameter with one of these names
+/// could never be set from a workflow: the entry reads the key itself.
+const ENTRY_KEYS: &[&str] = &["name", "requires", "type", "branches", "tags", "matrix"];
 
 /// The jobs one workflow runs for one ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,10 +157,14 @@ pub enum PlannedStep {
     },
 }
 
-/// Compiles `workflow` for a push of `git_ref` (`refs/heads/main`,
-/// `refs/tags/v1`). `branches:` and `tags:` on workflow jobs are matched
-/// against the ref; a job that does not match is dropped, and so is
-/// every job that requires it.
+/// Compiles `workflow` for one event. `branches:` and `tags:` on
+/// workflow jobs are matched against `git_ref`; a job that does not
+/// match is dropped, and so is every job that requires it.
+///
+/// `git_ref` is the pushed ref for a push (`refs/heads/main`,
+/// `refs/tags/v1`), the base branch for a pull request
+/// (`refs/heads/<base>`), and the default branch for a schedule or the
+/// dispatched ref for a manual run.
 ///
 /// # Errors
 ///
@@ -177,11 +186,19 @@ pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, V
     }
 }
 
-/// Compiles every workflow against `refs/heads/main` and returns every
-/// problem found. Empty when the config is valid.
+/// Checks every job and command on its own, then compiles every
+/// workflow against `refs/heads/main`, and returns every problem found.
+/// Empty when the config is valid.
+///
+/// On its own, each job and command must name a runner and the commands
+/// it calls, give parameter defaults of the declared kind, and write
+/// only expressions that parse and read known contexts. A `parameters`
+/// read is valid only as a whole `${{ parameters.NAME }}`, which compile
+/// substitutes; the plan carries no parameter values to run time.
 #[must_use]
 pub fn validate(config: &Config) -> Vec<Diagnostic> {
     let mut errors = config_errors(config);
+    standalone_errors(config, &mut errors);
     let mut budget = Budget::new();
     for (name, wf) in &config.workflows {
         compile_workflow(config, name, wf, VALIDATE_REF, &mut budget, &mut errors);
@@ -218,6 +235,309 @@ fn unknown_template(owner: &str, label: &str) -> Diagnostic {
         "{owner} has `runs-on: {label}`, which names no runner template; use one of {}",
         template_labels().join(", ")
     ))
+}
+
+/// Problems in each job, command and workflow entry on its own, whether
+/// or not a workflow reaches it.
+fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
+    for (name, job) in &config.jobs {
+        let owner = format!("job `{name}`");
+        for key in job.parameters.keys() {
+            if ENTRY_KEYS.contains(&key.as_str()) {
+                errors.push(Diagnostic::new(format!(
+                    "{owner} has parameter `{key}`, which a workflow entry reads as its own key; rename it"
+                )));
+            }
+        }
+        resolve_template(config, &owner, job, errors);
+        let nodes = job.parallelism.unwrap_or(1);
+        if !(1..=MAX_PARALLELISM).contains(&nodes) {
+            errors.push(Diagnostic::new(format!(
+                "{owner} has parallelism {nodes}; it must be 1 to {MAX_PARALLELISM}"
+            )));
+        }
+        default_errors(&owner, &job.parameters, errors);
+        let mut check = Check {
+            config,
+            owner: &owner,
+            params: Some(&job.parameters),
+            errors,
+        };
+        for (key, value) in &job.env {
+            check.text(&format!("env.{key}"), value);
+        }
+        if let Some(cond) = &job.if_ {
+            check.cond("if", cond);
+        }
+        for (key, value) in &job.outputs {
+            check.text(&format!("outputs.{key}"), value);
+        }
+        check.steps(&job.steps);
+    }
+    for (name, command) in &config.commands {
+        let owner = format!("command `{name}`");
+        default_errors(&owner, &command.parameters, errors);
+        Check {
+            config,
+            owner: &owner,
+            params: Some(&command.parameters),
+            errors,
+        }
+        .steps(&command.steps);
+    }
+    for (workflow, wf) in &config.workflows {
+        for entry in &wf.jobs {
+            let id = entry.name.as_deref().unwrap_or(&entry.job);
+            let owner = format!("workflow `{workflow}` entry `{id}`");
+            let mut check = Check {
+                config,
+                owner: &owner,
+                params: None,
+                errors,
+            };
+            for (key, value) in &entry.with {
+                check.value(key, value, &mut |c, field, text| {
+                    if c.text(field, text) {
+                        c.errors.push(no_parameters_here(id, key));
+                    }
+                });
+            }
+            for (key, values) in &entry.matrix {
+                for value in values {
+                    check.value(key, value, &mut |c, field, text| {
+                        if c.text(field, text) {
+                            c.errors.push(no_parameters_here(id, key));
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Reports parameter defaults that do not fit their declared kind.
+fn default_errors(owner: &str, params: &BTreeMap<String, Parameter>, errors: &mut Vec<Diagnostic>) {
+    for (key, param) in params {
+        if let Some(default) = &param.default
+            && let Some(want) = kind_mismatch(&param.kind, default)
+        {
+            errors.push(Diagnostic::new(format!(
+                "{owner} parameter `{key}` must be {want}, found {default}"
+            )));
+        }
+    }
+}
+
+/// Checks the strings of one job, command or workflow entry.
+struct Check<'a> {
+    config: &'a Config,
+    /// The job or command, as named in errors.
+    owner: &'a str,
+    /// The declared parameters; `None` where nothing can be substituted.
+    params: Option<&'a BTreeMap<String, Parameter>>,
+    errors: &'a mut Vec<Diagnostic>,
+}
+
+impl Check<'_> {
+    fn steps(&mut self, steps: &[Step]) {
+        for (i, step) in steps.iter().enumerate() {
+            let at = |key: &str| format!("step {} `{key}`", i + 1);
+            match step {
+                Step::Run(run) => {
+                    self.opt(&at("name"), run.name.as_deref());
+                    self.text(&at("run"), &run.run);
+                    self.opt(&at("shell"), run.shell.as_deref());
+                    self.opt(&at("working-directory"), run.working_directory.as_deref());
+                    self.env(&at("env"), &run.env);
+                    if let Some(cond) = &run.if_ {
+                        self.cond(&at("if"), cond);
+                    }
+                }
+                Step::Uses(uses) => {
+                    self.opt(&at("name"), uses.name.as_deref());
+                    self.text(&at("uses"), &uses.uses);
+                    if uses.uses.starts_with("docker://") {
+                        self.errors.push(Diagnostic::new(format!(
+                            "{} has `uses: {}`; `uses: docker://` is not supported yet; Docker services and containers come in a later release",
+                            self.owner, uses.uses
+                        )));
+                    }
+                    for (key, value) in &uses.with {
+                        self.value(&at(&format!("with.{key}")), value, &mut |c, f, t| {
+                            c.text(f, t);
+                        });
+                    }
+                    self.env(&at("env"), &uses.env);
+                    if let Some(cond) = &uses.if_ {
+                        self.cond(&at("if"), cond);
+                    }
+                }
+                Step::Cache(cache) => {
+                    self.text(&at("cache.key"), &cache.key);
+                    for item in &cache.restore_keys {
+                        self.text(&at("cache.restore-keys"), item);
+                    }
+                    for item in &cache.paths {
+                        self.text(&at("cache.paths"), item);
+                    }
+                }
+                Step::Workspace(WorkspaceStep::Persist { root, paths }) => {
+                    self.text(&at("workspace.persist.root"), root);
+                    for item in paths {
+                        self.text(&at("workspace.persist.paths"), item);
+                    }
+                }
+                Step::Workspace(WorkspaceStep::Attach { at: dir }) => {
+                    self.text(&at("workspace.attach.at"), dir);
+                }
+                Step::TestResults { path } => {
+                    self.text(&at("test-results"), path);
+                }
+                Step::Command { name, with } => self.call(&at(name), name, with),
+            }
+        }
+    }
+
+    /// Checks a command call: the command exists and the values fit its
+    /// parameters.
+    fn call(&mut self, field: &str, name: &str, with: &BTreeMap<String, Value>) {
+        for (key, value) in with {
+            self.value(&format!("{field} {key}"), value, &mut |c, f, t| {
+                c.text(f, t);
+            });
+        }
+        let Some(command) = self.config.commands.get(name) else {
+            self.errors.push(Diagnostic::new(format!(
+                "{} uses command `{name}`, which is not defined in `commands:`",
+                self.owner
+            )));
+            return;
+        };
+        let inner = format!("command `{name}`");
+        for key in with.keys() {
+            if !command.parameters.contains_key(key) {
+                self.errors
+                    .push(Diagnostic::new(format!("{inner} has no parameter `{key}`")));
+            }
+        }
+        for (key, param) in &command.parameters {
+            let Some(value) = with.get(key).or(param.default.as_ref()) else {
+                self.errors.push(Diagnostic::new(format!(
+                    "{inner} needs a value for parameter `{key}`, which is required"
+                )));
+                continue;
+            };
+            if let Some(want) = kind_mismatch(&param.kind, value) {
+                self.errors.push(Diagnostic::new(format!(
+                    "{inner} parameter `{key}` must be {want}, found {value}"
+                )));
+            }
+        }
+    }
+
+    fn opt(&mut self, field: &str, text: Option<&str>) {
+        if let Some(text) = text {
+            self.text(field, text);
+        }
+    }
+
+    fn env(&mut self, field: &str, env: &BTreeMap<String, String>) {
+        for (key, value) in env {
+            self.text(&format!("{field}.{key}"), value);
+        }
+    }
+
+    /// Calls `f` on every string inside `value`.
+    fn value(&mut self, field: &str, value: &Value, f: &mut dyn FnMut(&mut Self, &str, &str)) {
+        match value {
+            Value::String(text) => f(self, field, text),
+            Value::Array(items) => {
+                for item in items {
+                    self.value(field, item, f);
+                }
+            }
+            Value::Object(map) => {
+                for item in map.values() {
+                    self.value(field, item, f);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Checks every `${{ }}` in a string. Returns whether one reads
+    /// `parameters` other than as a whole substitution where there are
+    /// no parameters, which the caller reports.
+    fn text(&mut self, field: &str, text: &str) -> bool {
+        let found = match expr::expressions(text) {
+            Ok(found) => found,
+            Err(e) => {
+                self.bad(field, &e);
+                return false;
+            }
+        };
+        let mut reads = false;
+        for (start, inner) in found {
+            if let Some(name) = parameter_name(inner) {
+                match self.params {
+                    Some(params) if !params.contains_key(name) => {
+                        self.errors.push(Diagnostic::new(format!(
+                            "{} reads `${{{{ parameters.{name} }}}}` but declares no parameter `{name}`",
+                            self.owner
+                        )));
+                    }
+                    Some(_) => {}
+                    None => reads = true,
+                }
+                continue;
+            }
+            reads |= self.expression(field, inner, start);
+        }
+        reads
+    }
+
+    /// Checks an `if:`, which is a bare expression unless it is wrapped
+    /// in `${{ }}`.
+    fn cond(&mut self, field: &str, cond: &str) {
+        if cond.contains("${{") {
+            self.text(field, cond);
+        } else {
+            self.expression(field, cond, 0);
+        }
+    }
+
+    /// Checks one expression that is evaluated at run time, where
+    /// `parameters` cannot be read. Returns whether it reads
+    /// `parameters` where there are no parameters at all.
+    fn expression(&mut self, field: &str, inner: &str, start: usize) -> bool {
+        if let Err(e) = expr::check(inner) {
+            self.bad(
+                field,
+                &ExprError {
+                    message: e.message,
+                    offset: e.offset + start,
+                },
+            );
+            return false;
+        }
+        let reads = expr::contexts(inner)
+            .is_ok_and(|names| names.iter().any(|(name, _)| name == "parameters"));
+        if reads && self.params.is_some() {
+            self.errors.push(Diagnostic::new(format!(
+                "{} `{field}` reads `parameters` inside an expression; only a whole `${{{{ parameters.NAME }}}}` is substituted, and run time has no parameters",
+                self.owner
+            )));
+            return false;
+        }
+        reads
+    }
+
+    fn bad(&mut self, field: &str, e: &ExprError) {
+        self.errors.push(Diagnostic::new(format!(
+            "{} `{field}` has a bad expression: {e}",
+            self.owner
+        )));
+    }
 }
 
 /// Drops repeated messages, keeping the first of each.
