@@ -1379,6 +1379,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hatchrun-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hatchrun-workflow",
+ "serde_json",
+]
+
+[[package]]
 name = "hatchrun-cloud"
 version = "0.1.0"
 dependencies = [
