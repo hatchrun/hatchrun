@@ -1385,7 +1385,6 @@ dependencies = [
  "anyhow",
  "clap",
  "hatchrun-workflow",
- "serde_json",
 ]
 
 [[package]]

@@ -3,16 +3,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The `hatchrun` command line. Customers run `validate` and `convert`
-//! locally; jobs run `tests split` on the runner.
+//! locally.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use hatchrun_workflow::{Diagnostic, convert, parse, split, to_yaml, validate};
+use clap::{Parser, Subcommand};
+use hatchrun_workflow::{Diagnostic, convert, parse, to_yaml, validate};
 
 #[derive(Parser)]
 #[command(name = "hatchrun", version = env!("HATCHRUN_VERSION"), about)]
@@ -40,43 +39,6 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Commands for test runs
-    Tests {
-        #[command(subcommand)]
-        command: TestsCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum TestsCommand {
-    /// Print the items this node should run
-    Split(SplitArgs),
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum By {
-    /// Balance by recorded timings
-    Timings,
-    /// Balance by item count, ignoring timings
-    Name,
-}
-
-#[derive(Args)]
-struct SplitArgs {
-    /// How to balance the nodes
-    #[arg(long, value_enum, default_value = "timings")]
-    by: By,
-    /// A JSON object of item to seconds
-    #[arg(long, env = "HATCHRUN_TIMINGS_FILE")]
-    timings: Option<PathBuf>,
-    /// This node, counting from 0
-    #[arg(long, env = "HATCHRUN_NODE_INDEX", default_value_t = 0)]
-    index: u32,
-    /// How many nodes there are
-    #[arg(long, env = "HATCHRUN_NODE_TOTAL", default_value_t = 1)]
-    total: u32,
-    /// The items to split (default: one per line from stdin)
-    items: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -93,9 +55,6 @@ fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Validate { path } => run_validate(&path),
         Command::Convert { files, output } => run_convert(files, output.as_deref()),
-        Command::Tests {
-            command: TestsCommand::Split(args),
-        } => run_split(args),
     }
 }
 
@@ -180,35 +139,6 @@ fn default_workflows() -> Result<Vec<PathBuf>> {
     }
     found.sort();
     Ok(found)
-}
-
-fn run_split(args: SplitArgs) -> Result<ExitCode> {
-    let items = if args.items.is_empty() {
-        let mut input = String::new();
-        std::io::stdin()
-            .read_to_string(&mut input)
-            .context("read stdin")?;
-        input
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(str::to_owned)
-            .collect()
-    } else {
-        args.items
-    };
-    let timings: BTreeMap<String, f64> = match (args.by, &args.timings) {
-        (By::Timings, Some(path)) => {
-            let json = std::fs::read_to_string(path)
-                .with_context(|| format!("read timings {}", path.display()))?;
-            serde_json::from_str(&json)
-                .with_context(|| format!("parse timings {}", path.display()))?
-        }
-        _ => BTreeMap::new(),
-    };
-    let refs: Vec<&str> = items.iter().map(String::as_str).collect();
-    let mine = split(&refs, &timings, args.index, args.total);
-    println!("{}", mine.join(" "));
-    Ok(ExitCode::SUCCESS)
 }
 
 fn exit(ok: bool) -> ExitCode {

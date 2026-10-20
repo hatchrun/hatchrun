@@ -8,15 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn hatchrun() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hatchrun"));
-    for var in [
-        "HATCHRUN_NODE_INDEX",
-        "HATCHRUN_NODE_TOTAL",
-        "HATCHRUN_TIMINGS_FILE",
-    ] {
-        cmd.env_remove(var);
-    }
-    cmd
+    Command::new(env!("CARGO_BIN_EXE_hatchrun"))
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -123,103 +115,11 @@ fn convert_writes_what_converts_and_reports_the_rest() {
     assert!(!written.contains("partial-build"), "{written}");
 }
 
-fn timings_file() -> PathBuf {
-    let path = scratch("timings.json");
-    std::fs::write(&path, r#"{"a":10,"b":1,"c":1,"d":8}"#).unwrap();
-    path
-}
-
 #[test]
-fn split_reads_env() {
-    let out = run(hatchrun()
-        .env("HATCHRUN_NODE_INDEX", "1")
-        .env("HATCHRUN_NODE_TOTAL", "2")
-        .env("HATCHRUN_TIMINGS_FILE", timings_file())
-        .args(["tests", "split", "a", "b", "c", "d", "e"]));
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(text(&out.stdout), "d e\n");
-}
-
-#[test]
-fn split_defaults_to_one_node_and_reads_stdin() {
-    use std::io::Write;
-    use std::process::Stdio;
-    let mut child = hatchrun()
-        .args(["tests", "split"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"a\n\nb\nc\n")
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(text(&out.stdout), "a b c\n");
-}
-
-#[test]
-fn split_by_name_ignores_timings() {
-    let out = run(hatchrun()
-        .env("HATCHRUN_TIMINGS_FILE", scratch("absent.json"))
-        .args([
-            "tests", "split", "--by", "name", "--total", "2", "a", "b", "c",
-        ]));
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(text(&out.stdout), "a c\n");
-}
-
-#[test]
-fn split_bad_timings_fail() {
-    let out = run(hatchrun()
-        .env("HATCHRUN_TIMINGS_FILE", scratch("absent.json"))
-        .args(["tests", "split", "a"]));
-    assert_eq!(out.status.code(), Some(1));
+fn tests_split_is_not_a_subcommand() {
+    let out = run(hatchrun().args(["tests", "split", "a"]));
+    assert!(!out.status.success());
     assert_ne!(text(&out.stderr), "");
-
-    let bad = scratch("bad.json");
-    std::fs::write(&bad, "{nope").unwrap();
-    let out = run(hatchrun()
-        .args(["tests", "split", "--timings"])
-        .arg(&bad)
-        .arg("a"));
-    assert_eq!(out.status.code(), Some(1));
-    assert_ne!(text(&out.stderr), "");
-}
-
-#[test]
-fn split_huge_total_is_cheap() {
-    let out = run(hatchrun().args([
-        "tests",
-        "split",
-        "--by",
-        "name",
-        "--index",
-        "1",
-        "--total",
-        "4000000000",
-        "a",
-        "b",
-        "c",
-    ]));
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(text(&out.stdout), "b\n");
-
-    let out = run(hatchrun().args([
-        "tests",
-        "split",
-        "--by",
-        "name",
-        "--index",
-        "3999999999",
-        "--total",
-        "4000000000",
-        "a",
-    ]));
-    assert!(out.status.success());
-    assert_eq!(text(&out.stdout), "\n");
 }
 
 #[test]
