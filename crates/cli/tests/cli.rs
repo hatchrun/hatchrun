@@ -94,6 +94,35 @@ fn convert_prints_to_stdout_and_fails_on_bad_input() {
     assert_ne!(text(&out.stderr), "");
 }
 
+#[test]
+fn convert_writes_what_converts_and_reports_the_rest() {
+    let good = scratch("partial.yml");
+    std::fs::write(
+        &good,
+        "on: push\njobs:\n  build:\n    runs-on: ${{ matrix.runner }}\n    steps: [{ run: make }]\n  lint:\n    runs-on: ubuntu-latest\n    steps: [{ run: lint }]\n",
+    )
+    .unwrap();
+    let bad = scratch("torn.yml");
+    std::fs::write(&bad, "on: push\njobs:\n  t: [\n").unwrap();
+    let dest = scratch("partial-out.yml");
+    let out = run(hatchrun()
+        .arg("convert")
+        .arg(&good)
+        .arg(&bad)
+        .arg("-o")
+        .arg(&dest));
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("job `build`"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{}:3:", bad.display())),
+        "{stderr}"
+    );
+    let written = std::fs::read_to_string(&dest).unwrap();
+    assert!(written.contains("partial-lint"), "{written}");
+    assert!(!written.contains("partial-build"), "{written}");
+}
+
 fn timings_file() -> PathBuf {
     let path = scratch("timings.json");
     std::fs::write(&path, r#"{"a":10,"b":1,"c":1,"d":8}"#).unwrap();

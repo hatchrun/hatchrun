@@ -30,6 +30,9 @@ enum Command {
         path: PathBuf,
     },
     /// Convert GitHub Actions workflow files into a hatchrun config
+    ///
+    /// Jobs and files that cannot convert are left out and reported; the
+    /// config holds the rest, and the exit code is 1 when any were left out.
     Convert {
         /// The files to convert (default: .github/workflows/*.yml and *.yaml)
         files: Vec<PathBuf>,
@@ -124,6 +127,8 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
         files = default_workflows()?;
     }
     let mut inputs = Vec::new();
+    // Problems name the file by its name; print them with its path.
+    let mut paths: BTreeMap<String, &Path> = BTreeMap::new();
     for path in &files {
         let source =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -131,28 +136,36 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
             || path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
+        paths.insert(name.clone(), path);
         inputs.push((name, source));
     }
-    match convert(&inputs) {
-        Ok(conversion) => {
-            for warning in &conversion.warnings {
-                eprintln!("{warning}");
-            }
-            let yaml = to_yaml(&conversion.config);
-            match output {
-                Some(dest) => std::fs::write(dest, yaml)
-                    .with_context(|| format!("write {}", dest.display()))?,
-                None => print!("{yaml}"),
-            }
-            Ok(ExitCode::SUCCESS)
-        }
+    let shown = |problem: &Diagnostic| match problem.file.as_deref().and_then(|f| paths.get(f)) {
+        Some(path) => located(path, problem),
+        None => problem.to_string(),
+    };
+    let conversion = match convert(&inputs) {
+        Ok(conversion) => conversion,
         Err(problems) => {
             for problem in &problems {
-                eprintln!("{problem}");
+                eprintln!("{}", shown(problem));
             }
-            Ok(ExitCode::FAILURE)
+            return Ok(ExitCode::FAILURE);
         }
+    };
+    for warning in &conversion.warnings {
+        eprintln!("{}", shown(warning));
     }
+    for error in &conversion.errors {
+        eprintln!("{}", shown(error));
+    }
+    let yaml = to_yaml(&conversion.config);
+    match output {
+        Some(dest) => {
+            std::fs::write(dest, yaml).with_context(|| format!("write {}", dest.display()))?;
+        }
+        None => print!("{yaml}"),
+    }
+    Ok(exit(conversion.errors.is_empty()))
 }
 
 /// `.github/workflows/*.yml` and `*.yaml`, sorted by name.
@@ -193,27 +206,9 @@ fn run_split(args: SplitArgs) -> Result<ExitCode> {
         _ => BTreeMap::new(),
     };
     let refs: Vec<&str> = items.iter().map(String::as_str).collect();
-    let mine = split_node(&refs, &timings, args.index, args.total);
+    let mine = split(&refs, &timings, args.index, args.total);
     println!("{}", mine.join(" "));
     Ok(ExitCode::SUCCESS)
-}
-
-/// Runs `split` without letting a huge `total` cost memory.
-///
-/// A node past the last item gets nothing, and with `total` at least the
-/// item count every item lands on one of the first `items` nodes, so
-/// capping `total` at the item count keeps the assignment.
-fn split_node<'a>(
-    items: &[&'a str],
-    timings: &BTreeMap<String, f64>,
-    index: u32,
-    total: u32,
-) -> Vec<&'a str> {
-    let count = u32::try_from(items.len()).unwrap_or(u32::MAX);
-    if index >= total || index >= count {
-        return Vec::new();
-    }
-    split(items, timings, index, total.min(count))
 }
 
 fn exit(ok: bool) -> ExitCode {
