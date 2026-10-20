@@ -59,8 +59,8 @@ impl Filter {
 enum Tok {
     /// A literal character.
     Lit(char),
-    /// `?`: any one character.
-    One,
+    /// `X?`: zero or one of the single-character token `X`.
+    Opt(Box<Tok>),
     /// `[...]`: a character class.
     Class {
         negated: bool,
@@ -79,11 +79,10 @@ impl Tok {
     fn accepts(&self, c: char) -> bool {
         match self {
             Tok::Lit(l) => *l == c,
-            Tok::One => true,
             Tok::Class { negated, items } => {
                 items.iter().any(|&(lo, hi)| lo <= c && c <= hi) != *negated
             }
-            Tok::Star | Tok::StarStar | Tok::Plus(_) => false,
+            Tok::Star | Tok::StarStar | Tok::Plus(_) | Tok::Opt(_) => false,
         }
     }
 }
@@ -102,7 +101,6 @@ fn compile(pattern: &str) -> Vec<Tok> {
                 Tok::StarStar
             }
             '*' => Tok::Star,
-            '?' => Tok::One,
             '\\' if i < chars.len() => {
                 i += 1;
                 Tok::Lit(chars[i - 1])
@@ -114,12 +112,17 @@ fn compile(pattern: &str) -> Vec<Tok> {
                 }
                 None => Tok::Lit('['),
             },
-            '+' if toks
-                .last()
-                .is_some_and(|t| matches!(t, Tok::Lit(_) | Tok::One | Tok::Class { .. })) =>
+            '+' | '?'
+                if toks
+                    .last()
+                    .is_some_and(|t| matches!(t, Tok::Lit(_) | Tok::Class { .. })) =>
             {
-                let prev = toks.pop().expect("checked by the guard");
-                Tok::Plus(Box::new(prev))
+                let prev = Box::new(toks.pop().expect("checked by the guard"));
+                if c == '+' {
+                    Tok::Plus(prev)
+                } else {
+                    Tok::Opt(prev)
+                }
             }
             other => Tok::Lit(other),
         };
@@ -170,6 +173,12 @@ fn glob_matches(toks: &[Tok], value: &[char]) -> bool {
                     while q < n && (matches!(tok, Tok::StarStar) || value[q] != '/') {
                         q += 1;
                         next[q] = true;
+                    }
+                }
+                Tok::Opt(inner) => {
+                    next[p] = true;
+                    if p < n && inner.accepts(value[p]) {
+                        next[p + 1] = true;
                     }
                 }
                 Tok::Plus(inner) => {
@@ -341,7 +350,9 @@ pub enum Event {
     Push {
         /// The pushed ref.
         r#ref: String,
-        /// Paths changed by the push.
+        /// Paths changed by the push. Empty when the caller could not
+        /// compute them; path filters then pass, as GitHub runs the
+        /// workflow. Path filters are not evaluated for tag pushes.
         changed: Vec<String>,
     },
     /// Activity on a pull request.
@@ -350,7 +361,8 @@ pub enum Event {
         action: String,
         /// The base branch, as a short name.
         base_ref: String,
-        /// Paths changed by the pull request.
+        /// Paths changed by the pull request. Empty when the caller could
+        /// not compute them; path filters then pass.
         changed: Vec<String>,
     },
     /// A cron schedule firing.
@@ -388,6 +400,7 @@ pub fn triggered(on: &Triggers, event: &Event) -> bool {
 fn push_matches(push: &PushTrigger, full_ref: &str, changed: &[String]) -> bool {
     let has_branch_filter = push.branches.is_some() || push.branches_ignore.is_some();
     let has_tag_filter = push.tags.is_some() || push.tags_ignore.is_some();
+    let is_tag = full_ref.starts_with("refs/tags/");
     let (name, own_filter, other_filter, include, ignore) =
         if let Some(name) = full_ref.strip_prefix("refs/heads/") {
             (
@@ -414,7 +427,8 @@ fn push_matches(push: &PushTrigger, full_ref: &str, changed: &[String]) -> bool 
     } else {
         !other_filter
     };
-    ref_ok && paths_pass(push.paths.as_ref(), push.paths_ignore.as_ref(), changed)
+    // GitHub does not evaluate path filters for tag pushes.
+    ref_ok && (is_tag || paths_pass(push.paths.as_ref(), push.paths_ignore.as_ref(), changed))
 }
 
 /// Applies an include filter and an ignore filter to a short ref name.
@@ -428,11 +442,13 @@ fn ref_passes(include: Option<&Filter>, ignore: Option<&Filter>, name: &str) -> 
     }
 }
 
-/// Applies the path filters: it passes when any changed path passes.
+/// Applies the path filters: it passes when any changed path passes, or
+/// when the changed list is empty (unknown).
 fn paths_pass(include: Option<&Filter>, ignore: Option<&Filter>, changed: &[String]) -> bool {
     match (include, ignore) {
         (None, None) => true,
         (Some(_), Some(_)) => false,
+        _ if changed.is_empty() => true,
         (Some(include), None) => changed.iter().any(|p| include.matches(p)),
         (None, Some(ignore)) => changed.iter().any(|p| !ignore.matches(p)),
     }

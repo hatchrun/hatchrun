@@ -52,7 +52,10 @@ fn only_negative_patterns_match_nothing() {
 #[test]
 fn question_plus_and_classes() {
     let g = f(&["v1.?"]);
-    assert!(g.matches("v1.x") && !g.matches("v1.") && !g.matches("v1.xy"));
+    assert!(g.matches("v1") && g.matches("v1.") && !g.matches("v1.x"));
+    let col = f(&["colou?r"]);
+    assert!(col.matches("color") && col.matches("colour") && !col.matches("colouur"));
+    assert!(f(&["?a"]).matches("?a") && f(&["a*?"]).matches("a?"));
     let h = f(&["v1+.0"]);
     assert!(h.matches("v1.0") && h.matches("v111.0") && !h.matches("v.0"));
     let c = f(&["v[0-9]", "!v[3-4]"]);
@@ -160,4 +163,27 @@ fn schedule_and_dispatch() {
         }
     ));
     assert!(!triggered(&t, &push("refs/heads/main", &[])));
+}
+
+#[test]
+fn empty_changed_passes_path_filters() {
+    let t = on("push: { paths: ['src/**'] }\npull_request: { paths-ignore: ['docs/**'] }");
+    assert!(triggered(&t, &push("refs/heads/main", &[])));
+    assert!(triggered(&t, &pr("opened", "main", &[])));
+}
+
+#[test]
+fn tag_pushes_skip_path_filters() {
+    let t = on("push: { tags: ['v*'], paths: ['src/**'] }");
+    assert!(triggered(&t, &push("refs/tags/v1", &["README.md"])));
+    assert!(!triggered(&t, &push("refs/heads/main", &["README.md"])));
+}
+
+#[test]
+fn hostile_and_malformed_patterns() {
+    let long = format!("{}-x", "a/".repeat(2500));
+    assert!(f(&["**/**/**/**-x"]).matches(&long));
+    assert!(!f(&["**/**/**/**-y"]).matches(&long));
+    assert!(f(&["a[b"]).matches("a[b") && !f(&["a[b"]).matches("ab"));
+    assert!(f(&["a\\"]).matches("a\\"));
 }
