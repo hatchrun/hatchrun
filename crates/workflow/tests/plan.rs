@@ -486,3 +486,92 @@ workflows:
     assert_eq!(err.len(), 1);
     assert!(err[0].message.contains("`a`, `b`") && !err[0].message.contains("`c`"));
 }
+
+/// Commands `c0` to `c<depth-1>` each list the next one `fan` times; the
+/// last one is `leaf`.
+fn fan_out(depth: usize, fan: usize, leaf: &str) -> String {
+    use std::fmt::Write as _;
+    let mut yaml = String::from("commands:\n");
+    for i in 0..depth {
+        let list = vec![format!("c{}", i + 1); fan].join(", ");
+        writeln!(yaml, "  c{i}: {{ steps: [{list}] }}").unwrap();
+    }
+    writeln!(yaml, "  c{depth}: {{ steps: [{leaf}] }}").unwrap();
+    yaml += "jobs: { t: { runs-on: ubuntu-latest, steps: [c0] } }\n";
+    yaml += "workflows: { ci: { on: { push: {} }, jobs: [t] } }\n";
+    yaml
+}
+
+#[test]
+fn command_expansion_has_a_work_budget() {
+    let config = parse(&fan_out(9, 10, "")).unwrap();
+    let started = std::time::Instant::now();
+    let err = validate(&config);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert!(err[0].message.contains("job `t`") && err[0].message.contains("10000"));
+
+    // Leaves that fail add no error per visit.
+    let err = validate(&parse(&fan_out(9, 10, "{ run: '${{ parameters.x }}' }")).unwrap());
+    assert!(err.len() <= 2, "{err:?}");
+    assert!(err.iter().any(|e| e.message.contains("10000")));
+
+    // A wide but small expansion still compiles.
+    let plan = plan(&fan_out(2, 10, "{ run: echo }"));
+    assert_eq!(plan.jobs[0].steps.len(), 100);
+}
+
+#[test]
+fn approval_id_is_its_key() {
+    assert_error(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [t, { hold: { type: approval, name: wait, requires: [t] } }] } }
+",
+        &["`hold`", "`name`"],
+    );
+}
+
+#[test]
+fn rejects_repeated_matrix_values() {
+    for values in ["[1, '1']", "[a, a]"] {
+        assert_error(
+            &format!(
+                "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ matrix: {{ n: {values} }} }} }}] }} }}
+"
+            ),
+            &["`t`", "`n`", "twice"],
+        );
+    }
+}
+
+#[test]
+fn rejects_expanded_id_collisions() {
+    assert_error(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [{ t: { matrix: { n: [a] } } }, { t: { name: 't (a)' } }] } }
+",
+        &["`t (a)`", "`t`", "id"],
+    );
+}
+
+#[test]
+fn rejects_parameter_reads_at_workflow_level() {
+    let job =
+        "jobs: { t: { runs-on: ubuntu-latest, parameters: { x: { type: string } }, steps: [] } }\n";
+    assert_error(
+        &format!(
+            "{job}workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ x: '${{{{parameters.y}}}}' }} }}] }} }}"
+        ),
+        &["`t`", "`x`", "parameters"],
+    );
+    assert_error(
+        &format!(
+            "{job}workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ matrix: {{ x: ['a ${{{{ parameters.y }}}}'] }} }} }}] }} }}"
+        ),
+        &["`t`", "`x`", "parameters"],
+    );
+}

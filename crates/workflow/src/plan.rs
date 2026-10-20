@@ -29,8 +29,9 @@ const MAX_PARALLELISM: u32 = 64;
 /// The most entries one matrix can expand to.
 const MAX_MATRIX: usize = 256;
 
-/// The most steps one job can expand to, so nested commands cannot blow up.
-const MAX_STEPS: usize = 1024;
+/// The most steps and command calls one job can visit while expanding,
+/// so nested commands cannot make the planner do unbounded work.
+const MAX_VISITS: usize = 10_000;
 
 /// The deepest commands can nest.
 const MAX_NESTING: usize = 64;
@@ -193,13 +194,11 @@ fn unknown_template(owner: &str, label: &str) -> Diagnostic {
 
 /// Drops repeated messages, keeping the first of each.
 fn dedup(errors: Vec<Diagnostic>) -> Vec<Diagnostic> {
-    let mut out: Vec<Diagnostic> = Vec::with_capacity(errors.len());
-    for e in errors {
-        if !out.contains(&e) {
-            out.push(e);
-        }
-    }
-    out
+    let mut seen = BTreeSet::new();
+    errors
+        .into_iter()
+        .filter(|e| seen.insert(e.to_string()))
+        .collect()
 }
 
 /// Compiles one workflow, adding its problems to `errors`. Returns the
@@ -217,7 +216,10 @@ fn compile_workflow(
     let ids: Vec<String> = wf
         .jobs
         .iter()
-        .map(|e| e.name.clone().unwrap_or_else(|| e.job.clone()))
+        .map(|e| match &e.name {
+            Some(name) if !e.approval => name.clone(),
+            _ => e.job.clone(),
+        })
         .collect();
     let mut index: BTreeMap<&str, usize> = BTreeMap::new();
     for (i, id) in ids.iter().enumerate() {
@@ -249,6 +251,22 @@ fn compile_workflow(
         .zip(&ids)
         .map(|(entry, id)| expand_entry(config, name, entry, id, errors))
         .collect();
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, jobs) in expansions.iter().enumerate() {
+        for job in jobs {
+            match seen.get(job.id.as_str()) {
+                // Two entries with one id are reported above.
+                Some(&other) if other != i && ids[other] == ids[i] => {}
+                Some(&other) => errors.push(Diagnostic::new(format!(
+                    "workflow `{name}` has two jobs with the id `{}`, from `{}` and `{}`",
+                    job.id, ids[other], ids[i]
+                ))),
+                None => {
+                    seen.insert(&job.id, i);
+                }
+            }
+        }
+    }
 
     let order = topological(&deps);
     if order.len() < ids.len() {
@@ -428,6 +446,7 @@ fn expand_entry(
             "{owner} has parallelism {nodes}; it must be 1 to {MAX_PARALLELISM}"
         )));
     }
+    entry_value_errors(entry, id, errors);
     let mut size: usize = 1;
     for (key, values) in &entry.matrix {
         if values.is_empty() {
@@ -465,8 +484,9 @@ fn expand_entry(
         let Some(values) = bind(&job.parameters, &args, &owner, errors) else {
             continue;
         };
+        // Steps fail the same way for every combination; stop at the first.
         let Some(base) = expand_job(config, job, &owner, &values, errors) else {
-            continue;
+            break;
         };
         let matrix_id = if combo.is_empty() {
             id.to_owned()
@@ -496,10 +516,39 @@ fn expand_entry(
     out
 }
 
+/// Checks the values a workflow entry sets: none may read `parameters`,
+/// and no matrix key may list one value twice.
+fn entry_value_errors(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) {
+    for (key, value) in &entry.with {
+        if reads_parameters(value) {
+            errors.push(no_parameters_here(id, key));
+        }
+    }
+    for (key, values) in &entry.matrix {
+        let mut shown = BTreeSet::new();
+        for value in values {
+            if reads_parameters(value) {
+                errors.push(no_parameters_here(id, key));
+            }
+            let text = render(value);
+            if !shown.insert(text.clone()) {
+                errors.push(Diagnostic::new(format!(
+                    "`{id}` lists `{text}` twice in matrix key `{key}`"
+                )));
+            }
+        }
+    }
+}
+
 /// The planned job of an approval entry, which takes no parameters and
 /// no matrix.
 fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<PlannedJob> {
     let before = errors.len();
+    if entry.name.is_some() {
+        errors.push(Diagnostic::new(format!(
+            "approval `{id}` cannot have a `name`; its id is its key"
+        )));
+    }
     for key in entry.with.keys() {
         errors.push(Diagnostic::new(format!(
             "approval `{id}` takes no parameters, found `{key}`"
@@ -597,14 +646,17 @@ fn expand_job(
 ) -> Option<PlannedJob> {
     let before = errors.len();
     let mut steps = Vec::new();
-    let mut stack = Vec::new();
+    let mut walk = Walk {
+        job: owner,
+        stack: Vec::new(),
+        left: MAX_VISITS,
+        spent: false,
+    };
     expand_steps(
-        config, &job.steps, values, owner, &mut stack, &mut steps, errors,
+        config, &job.steps, values, owner, &mut walk, &mut steps, errors,
     );
-    if steps.len() > MAX_STEPS {
-        errors.push(Diagnostic::new(format!(
-            "{owner} expands to more than {MAX_STEPS} steps"
-        )));
+    if walk.spent {
+        return None;
     }
     let mut sub = |text: &str| substitute(text, values, owner, errors);
     let env = job.env.iter().map(|(k, v)| (k.clone(), sub(v))).collect();
@@ -632,19 +684,49 @@ fn expand_job(
     })
 }
 
-/// Expands commands depth first. `stack` holds the commands being
-/// expanded, so a command that reaches itself is caught.
+/// The state of expanding one job's steps.
+struct Walk<'a> {
+    /// The job, as named in errors.
+    job: &'a str,
+    /// The commands being expanded, so one that reaches itself is caught.
+    stack: Vec<String>,
+    /// Steps and command calls still allowed.
+    left: usize,
+    /// The budget ran out; no further errors are reported for the job.
+    spent: bool,
+}
+
+impl Walk<'_> {
+    /// Counts one visit. False once the budget is spent, after reporting
+    /// it once.
+    fn visit(&mut self, errors: &mut Vec<Diagnostic>) -> bool {
+        if self.left == 0 {
+            if !self.spent {
+                self.spent = true;
+                errors.push(Diagnostic::new(format!(
+                    "{} expands to more than {MAX_VISITS} steps and command calls; the limit is {MAX_VISITS}",
+                    self.job
+                )));
+            }
+            return false;
+        }
+        self.left -= 1;
+        true
+    }
+}
+
+/// Expands commands depth first, within the walk's budget.
 fn expand_steps(
     config: &Config,
     steps: &[Step],
     values: &BTreeMap<String, Value>,
     scope: &str,
-    stack: &mut Vec<String>,
+    walk: &mut Walk<'_>,
     out: &mut Vec<PlannedStep>,
     errors: &mut Vec<Diagnostic>,
 ) {
     for step in steps {
-        if out.len() > MAX_STEPS {
+        if !walk.visit(errors) {
             return;
         }
         let Step::Command { name, with } = step else {
@@ -657,8 +739,8 @@ fn expand_steps(
             )));
             continue;
         };
-        if let Some(pos) = stack.iter().position(|c| c == name) {
-            let chain: Vec<String> = stack[pos..]
+        if let Some(pos) = walk.stack.iter().position(|c| c == name) {
+            let chain: Vec<String> = walk.stack[pos..]
                 .iter()
                 .chain(std::iter::once(name))
                 .map(|c| format!("`{c}`"))
@@ -669,7 +751,7 @@ fn expand_steps(
             )));
             continue;
         }
-        if stack.len() >= MAX_NESTING {
+        if walk.stack.len() >= MAX_NESTING {
             errors.push(Diagnostic::new(format!(
                 "{scope} nests commands deeper than {MAX_NESTING}"
             )));
@@ -683,9 +765,12 @@ fn expand_steps(
         let Some(bound) = bind(&command.parameters, &args, &inner, errors) else {
             continue;
         };
-        stack.push(name.clone());
-        expand_steps(config, &command.steps, &bound, &inner, stack, out, errors);
-        stack.pop();
+        walk.stack.push(name.clone());
+        expand_steps(config, &command.steps, &bound, &inner, walk, out, errors);
+        walk.stack.pop();
+        if walk.spent {
+            return;
+        }
     }
 }
 
@@ -842,6 +927,27 @@ fn substitute_value(
         ),
         other => other.clone(),
     }
+}
+
+/// Whether a value set on a workflow entry reads `${{ parameters... }}`.
+/// A workflow has no parameters, so such a value can never be filled in.
+fn reads_parameters(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.split("${{").skip(1).any(|expr| {
+            expr.split("}}")
+                .next()
+                .is_some_and(|inner| inner.trim_start().starts_with("parameters"))
+        }),
+        Value::Array(items) => items.iter().any(reads_parameters),
+        Value::Object(map) => map.values().any(reads_parameters),
+        _ => false,
+    }
+}
+
+fn no_parameters_here(id: &str, key: &str) -> Diagnostic {
+    Diagnostic::new(format!(
+        "`{id}` sets `{key}` to a value that reads `parameters`; a workflow has no parameters to read"
+    ))
 }
 
 /// The parameter name when `text` is one `${{ parameters.x }}` and
