@@ -24,7 +24,9 @@ use crate::trigger::{Filter, Triggers};
 ///
 /// Returns the problems found, each with its line and column when known.
 pub fn parse(source: &str) -> Result<Config, Vec<Diagnostic>> {
-    serde_saphyr::from_str(source).map_err(|err| vec![Diagnostic::from(&err)])
+    // YAML 1.2 booleans only: `y`, `yes`, `on` and `off` stay strings.
+    let options = serde_saphyr::options! { strict_booleans: true };
+    serde_saphyr::from_str_with_options(source, options).map_err(|err| vec![Diagnostic::from(&err)])
 }
 
 /// A whole `.hatchrun/config.yml`.

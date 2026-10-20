@@ -42,12 +42,19 @@ pub struct Conversion {
 ///
 /// Returns every problem that stops the conversion: YAML that does not
 /// parse, a `runs-on` that names no runner template, a `docker://` step,
+/// a `needs` that names no job, a file with no name before its extension,
 /// or two files or jobs that end up with one name.
 pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>> {
     let mut cx = Cx::default();
     let mut stems: BTreeMap<String, &str> = BTreeMap::new();
     for (file, source) in files {
         let stem = stem(file);
+        if stem.is_empty() {
+            cx.errors.push(Diagnostic::new(format!(
+                "`{file}` has no name before its extension; rename it"
+            )));
+            continue;
+        }
         if let Some(other) = stems.insert(stem.to_owned(), file) {
             cx.errors.push(Diagnostic::new(format!(
                 "`{other}` and `{file}` both become workflow `{stem}`; rename one of them"
@@ -84,13 +91,58 @@ pub fn to_yaml(config: &Config) -> String {
     serde_saphyr::to_string(config).expect("a config always serializes")
 }
 
-/// The file name without its directories and its `.yml` or `.yaml`.
+/// The file name without its directories and its `.yml` or `.yaml`, in
+/// any case.
 fn stem(file: &str) -> &str {
     let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
-    base.strip_suffix(".yml")
-        .or_else(|| base.strip_suffix(".yaml"))
-        .unwrap_or(base)
+    for ext in [".yml", ".yaml"] {
+        let Some(cut) = base.len().checked_sub(ext.len()) else {
+            continue;
+        };
+        if base.is_char_boundary(cut) && base[cut..].eq_ignore_ascii_case(ext) {
+            return &base[..cut];
+        }
+    }
+    base
 }
+
+/// The keys of a GitHub job.
+const JOB_KEYS: &[&str] = &[
+    "name",
+    "permissions",
+    "needs",
+    "if",
+    "runs-on",
+    "environment",
+    "concurrency",
+    "outputs",
+    "env",
+    "defaults",
+    "steps",
+    "timeout-minutes",
+    "strategy",
+    "continue-on-error",
+    "container",
+    "services",
+    "uses",
+    "with",
+    "secrets",
+];
+
+/// The keys of a GitHub step.
+const STEP_KEYS: &[&str] = &[
+    "id",
+    "if",
+    "name",
+    "uses",
+    "run",
+    "working-directory",
+    "shell",
+    "with",
+    "env",
+    "continue-on-error",
+    "timeout-minutes",
+];
 
 /// Labels GitHub retires that become `ubuntu-latest`.
 const OLD_UBUNTU: &[&str] = &["ubuntu-24.04", "ubuntu-22.04"];
@@ -100,7 +152,7 @@ const EVENTS: &str = "push, pull_request, schedule and workflow_dispatch";
 
 /// The part of a GitHub workflow file the converter reads.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 struct GhWorkflow {
     #[serde(default, rename = "name")]
     _name: Option<Value>,
@@ -116,12 +168,14 @@ struct GhWorkflow {
     #[serde(default)]
     concurrency: Option<Value>,
     #[serde(default)]
-    jobs: Ordered<GhJob>,
+    jobs: Ordered<Value>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, Value>,
 }
 
 /// A GitHub job.
 #[derive(Deserialize, Default)]
-#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case")]
 struct GhJob {
     #[serde(rename = "name")]
     _name: Option<Value>,
@@ -135,13 +189,13 @@ struct GhJob {
     outputs: Option<BTreeMap<String, Value>>,
     env: Option<BTreeMap<String, Value>>,
     defaults: Option<Value>,
-    steps: Option<Vec<GhStep>>,
+    steps: Option<Vec<Value>>,
     timeout_minutes: Option<Value>,
     strategy: Option<BTreeMap<String, Value>>,
     continue_on_error: Option<Value>,
     container: Option<Value>,
     services: Option<Value>,
-    uses: Option<String>,
+    uses: Option<Value>,
     #[serde(rename = "with")]
     _with: Option<Value>,
     #[serde(rename = "secrets")]
@@ -150,20 +204,36 @@ struct GhJob {
 
 /// A GitHub step.
 #[derive(Deserialize, Default)]
-#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case")]
 struct GhStep {
+    #[serde(deserialize_with = "text")]
     id: Option<String>,
     #[serde(rename = "if")]
     if_: Option<Value>,
+    #[serde(deserialize_with = "text")]
     name: Option<String>,
+    #[serde(deserialize_with = "text")]
     uses: Option<String>,
+    #[serde(deserialize_with = "text")]
     run: Option<String>,
+    #[serde(deserialize_with = "text")]
     working_directory: Option<String>,
+    #[serde(deserialize_with = "text")]
     shell: Option<String>,
     with: Option<BTreeMap<String, Value>>,
     env: Option<BTreeMap<String, Value>>,
     continue_on_error: Option<Value>,
     timeout_minutes: Option<Value>,
+}
+
+/// Reads a string, number or boolean as text.
+fn text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    match Option::<Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(value) => scalar(&value)
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom(format!("expected a string, found `{value}`"))),
+    }
 }
 
 /// One input of `on.workflow_dispatch.inputs`.
@@ -245,13 +315,20 @@ impl Cx {
                 ));
             }
         }
+        for key in gh.unknown.keys() {
+            self.warn(format!("`{file}`: unknown key `{key}` was dropped"));
+        }
         let on = self.triggers(file, &gh.on);
         let shared_env = self.env(&format!("`{file}`"), "env", gh.env.as_ref());
 
+        let ids: BTreeSet<String> = gh.jobs.0.iter().map(|(id, _)| id.clone()).collect();
         let mut dropped = BTreeSet::new();
         let mut entries = Vec::new();
         for (id, job) in gh.jobs.0 {
             let at = format!("`{file}` job `{id}`");
+            let Some(job) = self.gh_job(&at, &job) else {
+                continue;
+            };
             if job.uses.is_some() {
                 self.warn(format!(
                     "{at} calls a reusable workflow, which is not supported; the job was dropped"
@@ -266,7 +343,7 @@ impl Cx {
                 ));
                 continue;
             }
-            let Some((mut converted, entry)) = self.job(&at, &id, &key, job) else {
+            let Some((mut converted, entry)) = self.job(&at, &id, &key, &ids, job) else {
                 continue;
             };
             for (name, value) in &shared_env {
@@ -279,7 +356,20 @@ impl Cx {
             entries.push(entry);
         }
         for entry in &mut entries {
-            entry.requires.retain(|r| !dropped.contains(r));
+            let id = entry.name.clone().unwrap_or_default();
+            let mut lost = Vec::new();
+            entry.requires.retain(|r| {
+                let keep = !dropped.contains(r);
+                if !keep {
+                    lost.push(r.clone());
+                }
+                keep
+            });
+            for need in lost {
+                self.warn(format!(
+                    "`{file}` job `{id}`: its dependency on `{need}` was dropped with that reusable workflow job"
+                ));
+            }
         }
         self.config
             .workflows
@@ -391,14 +481,15 @@ impl Cx {
                     continue;
                 }
             };
-            let default = input.default.map(|value| match (&kind, value) {
-                (ParameterKind::Boolean, Value::String(s)) if s == "true" || s == "false" => {
-                    Value::Bool(s == "true")
+            let default = input.default.and_then(|value| {
+                let fitted = fit_default(&kind, &value);
+                if fitted.is_none() {
+                    self.warn(format!(
+                        "{at}: `default: {}` does not fit the input type and was dropped",
+                        show(&value)
+                    ));
                 }
-                (ParameterKind::String | ParameterKind::Enum(_), value) => {
-                    scalar(&value).map_or(value, Value::String)
-                }
-                (_, value) => value,
+                fitted
             });
             dispatch.inputs.insert(
                 name.clone(),
@@ -412,9 +503,34 @@ impl Cx {
         dispatch
     }
 
+    /// Reads one GitHub job, warning about keys GitHub does not define.
+    fn gh_job(&mut self, at: &str, value: &Value) -> Option<GhJob> {
+        let Some(map) = value.as_object() else {
+            self.error(format!("{at} is not a map"));
+            return None;
+        };
+        for key in map.keys().filter(|k| !JOB_KEYS.contains(&k.as_str())) {
+            self.warn(format!("{at}: unknown key `{key}` was dropped"));
+        }
+        match GhJob::deserialize(value) {
+            Ok(job) => Some(job),
+            Err(err) => {
+                self.error(format!("{at}: {err}"));
+                None
+            }
+        }
+    }
+
     /// Converts one job into the job and its workflow entry. `None` when
     /// the job has errors, which are recorded.
-    fn job(&mut self, at: &str, id: &str, key: &str, gh: GhJob) -> Option<(Job, WorkflowJob)> {
+    fn job(
+        &mut self,
+        at: &str,
+        id: &str,
+        key: &str,
+        ids: &BTreeSet<String>,
+        gh: GhJob,
+    ) -> Option<(Job, WorkflowJob)> {
         let before = self.errors.len();
         for (name, set, why) in [
             ("services", gh.services.is_some(), LATER),
@@ -443,6 +559,17 @@ impl Cx {
                 Vec::new()
             }
         };
+        let mut requires_unique: Vec<String> = Vec::new();
+        for need in requires {
+            if !ids.contains(&need) {
+                self.error(format!(
+                    "{at} needs `{need}`, which is not a job of the workflow"
+                ));
+            } else if !requires_unique.contains(&need) {
+                requires_unique.push(need);
+            }
+        }
+        let requires = requires_unique;
         let matrix = self.strategy(at, gh.strategy);
         let timeout_minutes = self.minutes(at, "timeout-minutes", gh.timeout_minutes.as_ref());
         let outputs = self.env(at, "outputs", gh.outputs.as_ref());
@@ -452,7 +579,7 @@ impl Cx {
             .unwrap_or_default()
             .into_iter()
             .enumerate()
-            .filter_map(|(i, step)| self.step(at, i, step))
+            .filter_map(|(i, step)| self.step(at, i, &step))
             .collect();
         if self.errors.len() > before {
             return None;
@@ -581,13 +708,26 @@ impl Cx {
     }
 
     /// Converts one step. `None` when it is an error, which is recorded.
-    fn step(&mut self, job_at: &str, index: usize, gh: GhStep) -> Option<Step> {
-        let label = gh
-            .name
-            .as_ref()
-            .or(gh.id.as_ref())
+    fn step(&mut self, job_at: &str, index: usize, value: &Value) -> Option<Step> {
+        let label = ["name", "id"]
+            .iter()
+            .find_map(|k| value.get(k).and_then(scalar))
             .map_or_else(|| format!("{}", index + 1), |n| format!("`{n}`"));
         let at = format!("{job_at} step {label}");
+        let Some(map) = value.as_object() else {
+            self.error(format!("{at} is not a map"));
+            return None;
+        };
+        for key in map.keys().filter(|k| !STEP_KEYS.contains(&k.as_str())) {
+            self.warn(format!("{at}: unknown key `{key}` was dropped"));
+        }
+        let gh = match GhStep::deserialize(value) {
+            Ok(gh) => gh,
+            Err(err) => {
+                self.error(format!("{at}: {err}"));
+                return None;
+            }
+        };
         let continue_on_error = match &gh.continue_on_error {
             None => false,
             Some(Value::Bool(b)) => *b,
@@ -658,6 +798,27 @@ impl Cx {
                 None
             }
         }
+    }
+}
+
+/// A dispatch input default as a value of `kind`: numeric strings become
+/// integers and `"true"`/`"false"` booleans. `None` when it does not fit.
+fn fit_default(kind: &ParameterKind, value: &Value) -> Option<Value> {
+    match kind {
+        ParameterKind::String => scalar(value).map(Value::String),
+        ParameterKind::Boolean => match value {
+            Value::Bool(_) => Some(value.clone()),
+            Value::String(s) if s == "true" || s == "false" => Some(Value::Bool(s == "true")),
+            _ => None,
+        },
+        ParameterKind::Integer => match value {
+            Value::Number(n) if n.is_i64() || n.is_u64() => Some(value.clone()),
+            Value::String(s) => s.trim().parse::<i64>().ok().map(Value::from),
+            _ => None,
+        },
+        ParameterKind::Enum(options) => scalar(value)
+            .filter(|s| options.contains(s))
+            .map(Value::String),
     }
 }
 

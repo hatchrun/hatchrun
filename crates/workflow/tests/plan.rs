@@ -861,3 +861,54 @@ fn the_budget_is_charged_before_each_entry_is_made() {
     let err = timed_compile(&yaml);
     assert!(err.iter().any(|e| e.message.contains("8388608")), "{err:?}");
 }
+
+#[test]
+fn dispatch_input_defaults_must_fit_their_kind() {
+    for (input, words) in [
+        (
+            "{ type: integer, default: '5' }",
+            &["`ci`", "`n`", "an integer"][..],
+        ),
+        (
+            "{ type: integer, default: 1.5 }",
+            &["`ci`", "`n`", "an integer"],
+        ),
+        (
+            "{ type: boolean, default: 'yes' }",
+            &["`ci`", "`n`", "a boolean"],
+        ),
+        (
+            "{ type: enum, enum: [a, b], default: z }",
+            &["`ci`", "`n`", "one of a, b"],
+        ),
+        (
+            "{ type: string, default: [x] }",
+            &["`ci`", "`n`", "a string"],
+        ),
+    ] {
+        assert_error(
+            &format!(
+                "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  ci:
+    on: {{ workflow_dispatch: {{ inputs: {{ n: {input} }} }} }}
+    jobs: [t]
+"
+            ),
+            words,
+        );
+    }
+    assert_eq!(
+        errors(
+            "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { workflow_dispatch: { inputs: { n: { type: integer, default: 5 }, e: { type: enum, enum: [a], default: a } } } }
+    jobs: [t]
+"
+        ),
+        Vec::new()
+    );
+}

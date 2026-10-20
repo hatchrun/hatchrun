@@ -387,8 +387,21 @@ fn id_collisions(
 }
 
 /// Reports a trigger that has both an include and an ignore filter of
-/// one kind, which GitHub rejects.
+/// one kind, which GitHub rejects, and a manual input whose default does
+/// not fit its type.
 fn trigger_errors(name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
+    if let Some(dispatch) = &on.workflow_dispatch {
+        for (input, param) in &dispatch.inputs {
+            let Some(default) = &param.default else {
+                continue;
+            };
+            if let Some(want) = kind_mismatch(&param.kind, default) {
+                errors.push(Diagnostic::new(format!(
+                    "workflow `{name}`: `on.workflow_dispatch` input `{input}` default must be {want}, found {default}"
+                )));
+            }
+        }
+    }
     let mut both = |event: &str, key: &str, include: Option<&Filter>, ignore: Option<&Filter>| {
         if include.is_some() && ignore.is_some() {
             errors.push(Diagnostic::new(format!(

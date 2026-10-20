@@ -120,3 +120,39 @@ fn rejects_a_step_with_run_and_uses() {
     assert!(err[0].message.contains("both run and uses"), "{err:?}");
     assert_eq!(err[0].line, Some(4));
 }
+
+#[test]
+fn reads_yaml_1_1_booleans_as_strings() {
+    let config = parse(
+        "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    env: { A: yes, B: off }
+    steps: [{ run: echo }]
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t:
+          matrix:
+            flag: [y, yes, on, off, n, no, true]
+",
+    )
+    .unwrap();
+    let wf = &config.workflows["ci"];
+    assert!(wf.on.push.is_some());
+    assert_eq!(
+        wf.jobs[0].matrix["flag"],
+        [
+            "y".into(),
+            "yes".into(),
+            "on".into(),
+            "off".into(),
+            "n".into(),
+            "no".into(),
+            serde_json::Value::Bool(true)
+        ]
+    );
+    assert_eq!(config.jobs["t"].env["A"], "yes");
+}

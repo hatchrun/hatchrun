@@ -439,3 +439,120 @@ jobs:
     assert!(out.config.workflows["ci"].jobs[0].matrix.is_empty());
     round_trips(&out);
 }
+
+fn dispatch_with(inputs: &str) -> Conversion {
+    ok(&format!(
+        "on:\n  workflow_dispatch:\n    inputs:\n{inputs}\njobs:\n  t: {{ runs-on: ubuntu-latest, steps: [{{ run: x }}] }}\n"
+    ))
+}
+
+#[test]
+fn dispatch_defaults_are_coerced_or_dropped() {
+    let out = dispatch_with(
+        "      a: { type: number, default: '5' }
+      b: { type: number, default: 1.5 }
+      c: { type: boolean, default: 'yes' }
+      d: { type: boolean, default: 'true' }
+      e: { type: choice, options: [x, y], default: z }
+      f: { type: choice, options: [x, y], default: y }
+      g: { type: string, default: 3 }",
+    );
+    round_trips(&out);
+    let inputs = &out.config.workflows["ci"]
+        .on
+        .workflow_dispatch
+        .as_ref()
+        .unwrap()
+        .inputs;
+    assert_eq!(inputs["a"].default, Some(json!(5)));
+    assert_eq!(inputs["b"].default, None);
+    assert_eq!(inputs["c"].default, None);
+    assert_eq!(inputs["d"].default, Some(json!(true)));
+    assert_eq!(inputs["e"].default, None);
+    assert_eq!(inputs["f"].default, Some(json!("y")));
+    assert_eq!(inputs["g"].default, Some(json!("3")));
+    for name in ["`b`", "`c`", "`e`"] {
+        assert!(
+            has(&out.warnings, &["ci.yml", name, "default"]),
+            "{name}: {:?}",
+            out.warnings
+        );
+    }
+    assert!(!has(&out.warnings, &["`a`", "default"]));
+}
+
+#[test]
+fn unknown_keys_warn_and_are_dropped() {
+    let out = ok("
+on: push
+mystery: 1
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    snapshot: image
+    steps:
+      - name: Go
+        run: make
+        sparkle: true
+");
+    assert!(has(&out.warnings, &["ci.yml", "mystery"]));
+    assert!(has(&out.warnings, &["ci.yml", "build", "snapshot"]));
+    assert!(has(&out.warnings, &["ci.yml", "build", "Go", "sparkle"]));
+    round_trips(&out);
+}
+
+#[test]
+fn scalar_step_fields_read_as_text() {
+    let out = ok(
+        "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - name: 1\n        run: 123\n",
+    );
+    let Step::Run(run) = &out.config.jobs["ci-t"].steps[0] else {
+        panic!()
+    };
+    assert_eq!(run.name.as_deref(), Some("1"));
+    assert_eq!(run.run, "123");
+}
+
+#[test]
+fn needs_must_name_a_job_and_repeats_collapse() {
+    let errs = one(
+        "ci.yml",
+        "on: push\njobs:\n  t:\n    needs: [ghost]\n    runs-on: ubuntu-latest\n    steps: [{ run: x }]\n",
+    )
+    .unwrap_err();
+    assert!(has(&errs, &["ci.yml", "`t`", "ghost"]), "{errs:?}");
+
+    let out = ok(
+        "on: push\njobs:\n  a: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n  b: { needs: [a, a], runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+    );
+    assert_eq!(out.config.workflows["ci"].jobs[1].requires, ["a"]);
+}
+
+#[test]
+fn file_stems_ignore_extension_case_and_must_not_be_empty() {
+    let out = one("CI.YML", "on: push\njobs: {}\n").unwrap();
+    assert!(out.config.workflows.contains_key("CI"));
+    let out = one("deploy.Yaml", "on: push\njobs: {}\n").unwrap();
+    assert!(out.config.workflows.contains_key("deploy"));
+    let errs = one(".github/workflows/.yml", "on: push\njobs: {}\n").unwrap_err();
+    assert!(has(&errs, &[".yml", "name"]), "{errs:?}");
+}
+
+#[test]
+fn dependents_of_a_dropped_reusable_job_are_warned() {
+    let out = ok("
+on: push
+jobs:
+  call:
+    uses: org/repo/.github/workflows/build.yml@main
+  after:
+    needs: call
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+");
+    assert!(
+        has(&out.warnings, &["ci.yml", "`after`", "`call`", "dropped"]),
+        "{:?}",
+        out.warnings
+    );
+}
