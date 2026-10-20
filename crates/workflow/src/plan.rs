@@ -9,6 +9,7 @@
 //! Every other expression is left in place for the runner to evaluate.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use serde_json::Value;
 
@@ -36,12 +37,11 @@ const MAX_MATRIX: usize = 256;
 /// config.
 const BUDGET: usize = 50_000;
 
-/// The bytes one `compile` or `validate` call may produce. Every
-/// substituted string is charged its length as it is made, including
-/// values passed into nested commands, and every planned job is charged
-/// the bytes of its steps, `env`, `outputs`, `if`, id and matrix once per
-/// copy, plus `ENTRY_OVERHEAD` per map entry and list string and the size
-/// of each job and step struct. Charges are made before the memory is allocated.
+/// The bytes one `compile` or `validate` call may produce. Everything
+/// the call stores is charged before it is allocated: each string, each
+/// map entry and list item (plus `ENTRY_OVERHEAD`), each value passed
+/// into a command, each step and job struct, each matrix entry, each
+/// reported problem, and each extra copy of a job for parallel nodes.
 const BYTE_BUDGET: usize = 8 << 20;
 
 /// The bytes charged for each stored map entry or list string on top of
@@ -301,10 +301,7 @@ fn compile_workflow(
         return None;
     }
 
-    let expanded_ids: Vec<Vec<String>> = expansions
-        .iter()
-        .map(|jobs| jobs.iter().map(|j| j.id.clone()).collect())
-        .collect();
+    let expanded_ids = planned_ids(&expansions, name, budget, errors)?;
     let mut expansions = expansions;
     let mut kept = vec![false; ids.len()];
     let mut jobs = Vec::new();
@@ -317,8 +314,9 @@ fn compile_workflow(
             .iter()
             .flat_map(|&d| expanded_ids[d].iter().map(|id| id.len() + ENTRY_OVERHEAD))
             .sum();
+        // One list, then a clone of it per planned job.
         if !budget.charge_bytes(
-            requires_bytes.saturating_mul(expansions[i].len()),
+            requires_bytes.saturating_mul(expansions[i].len() + 1),
             name,
             errors,
         ) {
@@ -337,6 +335,29 @@ fn compile_workflow(
         workflow: name.to_owned(),
         jobs,
     })
+}
+
+/// The ids of each entry's planned jobs, charged before they are copied.
+fn planned_ids(
+    expansions: &[Vec<PlannedJob>],
+    workflow: &str,
+    budget: &mut Budget,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<Vec<Vec<String>>> {
+    let bytes = expansions
+        .iter()
+        .flatten()
+        .map(|j| j.id.len() + ENTRY_OVERHEAD)
+        .sum();
+    if !budget.charge_bytes(bytes, workflow, errors) {
+        return None;
+    }
+    Some(
+        expansions
+            .iter()
+            .map(|jobs| jobs.iter().map(|j| j.id.clone()).collect())
+            .collect(),
+    )
 }
 
 /// Reports planned jobs of different entries, or of one entry, that
@@ -527,60 +548,151 @@ fn expand_entry(
         budget,
     };
     let mut out = Vec::new();
-    for combo in combinations(&entry.matrix) {
-        let mut args = entry.with.clone();
-        for (key, value) in &combo {
-            if job.parameters.contains_key(key) {
-                args.insert(key.clone(), value.clone());
+    for index in 0..size {
+        let Some(combo) = combination(&entry.matrix, index, &mut walk, errors) else {
+            break;
+        };
+        let Some(args) = entry_args(entry, job, &combo, &mut walk, errors) else {
+            break;
+        };
+        let Some(values) = bind(&job.parameters, &args, &owner, &mut walk, errors) else {
+            if walk.budget.spent {
+                break;
             }
-        }
-        let Some(values) = bind(&job.parameters, &args, &owner, errors) else {
             continue;
         };
+        drop(args);
         // Steps fail the same way for every combination; stop at the first.
-        let Some(base) = expand_job(config, job, &owner, &values, &mut walk, errors) else {
+        let Some(mut base) = expand_job(config, job, &owner, &values, &mut walk, errors) else {
             break;
         };
-        // Pay for the copies before making them: an id is at most the
-        // entry id, the matrix values and a node suffix.
-        let matrix_bytes: usize = combo
-            .iter()
-            .map(|(k, v)| k.len() + 2 * value_len(v) + ENTRY_OVERHEAD)
-            .sum();
-        let copy_bytes = job_bytes(&base) + 2 * id.len() + matrix_bytes + 32;
-        if !walk
-            .budget
-            .charge(base.steps.len() * copies, workflow, errors)
-            || !walk.bytes(copy_bytes.saturating_mul(copies), errors)
-        {
+        base.kind = JobKind::Run { template };
+        let Some(jobs) = copy_job(base, combo, id, nodes, &mut walk, errors) else {
             break;
-        }
-        let matrix_id = if combo.is_empty() {
-            id.to_owned()
-        } else {
-            let shown: Vec<String> = combo.values().map(render).collect();
-            format!("{id} ({})", shown.join(", "))
         };
-        for node in 0..nodes {
-            let (job_id, node_of) = if nodes > 1 {
-                (
-                    format!("{matrix_id} [{}/{nodes}]", node + 1),
-                    Some((node, nodes)),
-                )
-            } else {
-                (matrix_id.clone(), None)
-            };
-            out.push(PlannedJob {
-                id: job_id,
-                name: id.to_owned(),
-                kind: JobKind::Run { template },
-                matrix: combo.clone(),
-                node: node_of,
-                ..base.clone()
-            });
-        }
+        out.extend(jobs);
     }
     out
+}
+
+/// The matrix entry at `index`, charged before it is made. The first key
+/// changes slowest.
+fn combination(
+    matrix: &BTreeMap<String, Vec<Value>>,
+    index: usize,
+    walk: &mut Walk<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<BTreeMap<String, Value>> {
+    let mut picked = Vec::with_capacity(matrix.len());
+    let mut rest = index;
+    for (key, values) in matrix.iter().rev() {
+        picked.push((key, &values[rest % values.len()]));
+        rest /= values.len();
+    }
+    let bytes = picked
+        .iter()
+        .map(|(k, v)| k.len() + ENTRY_OVERHEAD + value_bytes(v))
+        .sum();
+    if !walk.bytes(bytes, errors) {
+        return None;
+    }
+    Some(
+        picked
+            .into_iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    )
+}
+
+/// The values a workflow entry passes to its job: its `with` and the
+/// matrix keys the job declares as parameters. Charged before each is
+/// copied.
+fn entry_args(
+    entry: &WorkflowJob,
+    job: &Job,
+    combo: &BTreeMap<String, Value>,
+    walk: &mut Walk<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<BTreeMap<String, Value>> {
+    let picked = combo
+        .iter()
+        .filter(|(k, _)| job.parameters.contains_key(*k));
+    let mut args = BTreeMap::new();
+    for (key, value) in entry.with.iter().chain(picked) {
+        if !walk.bytes(key.len() + ENTRY_OVERHEAD + value_bytes(value), errors) {
+            return None;
+        }
+        args.insert(key.clone(), value.clone());
+    }
+    Some(args)
+}
+
+/// Spreads one matrix entry's job over its parallel nodes. The base job
+/// and the matrix entry were charged as they were made; the other copies
+/// are charged here, before they are made. `None` once the budget is
+/// spent.
+fn copy_job(
+    base: PlannedJob,
+    combo: BTreeMap<String, Value>,
+    id: &str,
+    nodes: u32,
+    walk: &mut Walk<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<Vec<PlannedJob>> {
+    let copies = nodes as usize;
+    let workflow = walk.workflow;
+    // An id is at most the entry id, the matrix values and a node suffix,
+    // and the name is the entry id again.
+    let combo_bytes: usize = combo
+        .iter()
+        .map(|(k, v)| k.len() + ENTRY_OVERHEAD + value_bytes(v))
+        .sum();
+    let combo_text: usize = combo.values().map(|v| rendered_len(v) + 2).sum();
+    let per_copy = 2 * (id.len() + combo_text) + combo_bytes + 32;
+    let clones = job_bytes(&base).saturating_mul(copies - 1);
+    if !walk
+        .budget
+        .charge(base.steps.len() * copies, workflow, errors)
+        || !walk.bytes(
+            clones.saturating_add(per_copy.saturating_mul(copies)),
+            errors,
+        )
+    {
+        return None;
+    }
+    let matrix_id = if combo.is_empty() {
+        id.to_owned()
+    } else {
+        let shown: Vec<String> = combo.values().map(render).collect();
+        format!("{id} ({})", shown.join(", "))
+    };
+    let mut base = Some(base);
+    let mut combo = Some(combo);
+    let mut out = Vec::with_capacity(copies);
+    for node in 0..nodes {
+        let (job_id, node_of) = if nodes > 1 {
+            (
+                format!("{matrix_id} [{}/{nodes}]", node + 1),
+                Some((node, nodes)),
+            )
+        } else {
+            (matrix_id.clone(), None)
+        };
+        // The last copy takes the base itself.
+        let (from, matrix) = if node + 1 == nodes {
+            (base.take()?, combo.take()?)
+        } else {
+            (base.clone()?, combo.clone()?)
+        };
+        out.push(PlannedJob {
+            id: job_id,
+            name: id.to_owned(),
+            matrix,
+            node: node_of,
+            ..from
+        });
+    }
+    Some(out)
 }
 
 /// Counts `count` more jobs into the plan, or reports that the plan
@@ -681,23 +793,6 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
     }]
 }
 
-/// Every combination of matrix values. The first key changes slowest.
-fn combinations(matrix: &BTreeMap<String, Vec<Value>>) -> Vec<BTreeMap<String, Value>> {
-    let mut combos = vec![BTreeMap::new()];
-    for (key, values) in matrix {
-        let mut next = Vec::with_capacity(combos.len() * values.len());
-        for combo in &combos {
-            for value in values {
-                let mut c = combo.clone();
-                c.insert(key.clone(), value.clone());
-                next.push(c);
-            }
-        }
-        combos = next;
-    }
-    combos
-}
-
 /// Finds the template a job runs on.
 fn resolve_template(
     config: &Config,
@@ -750,19 +845,23 @@ fn expand_job(
     errors: &mut Vec<Diagnostic>,
 ) -> Option<PlannedJob> {
     let before = errors.len();
+    if !walk.bytes(size_of::<PlannedJob>(), errors) {
+        return None;
+    }
     let mut steps = Vec::new();
     expand_steps(config, &job.steps, values, owner, walk, &mut steps, errors);
     if walk.budget.spent {
         return None;
     }
-    let mut sub = |text: &str| substitute(text, values, owner, walk, errors);
-    let env = job.env.iter().map(|(k, v)| (k.clone(), sub(v))).collect();
-    let if_ = job.if_.as_deref().map(&mut sub);
-    let outputs = job
-        .outputs
-        .iter()
-        .map(|(k, v)| (k.clone(), sub(v)))
-        .collect();
+    let mut sub = Sub {
+        values,
+        scope: owner,
+        walk,
+        errors,
+    };
+    let env = sub.map(&job.env);
+    let if_ = sub.opt(job.if_.as_deref());
+    let outputs = sub.map(&job.outputs);
     if errors.len() > before || walk.budget.spent {
         return None;
     }
@@ -857,6 +956,14 @@ impl Walk<'_> {
     fn bytes(&mut self, bytes: usize, errors: &mut Vec<Diagnostic>) -> bool {
         self.budget.charge_bytes(bytes, self.workflow, errors)
     }
+
+    /// Reports a problem found while expanding, charging its bytes first:
+    /// one config problem can be found once per command call.
+    fn report(&mut self, message: String, errors: &mut Vec<Diagnostic>) {
+        if self.bytes(size_of::<Diagnostic>() + message.len(), errors) {
+            errors.push(Diagnostic::new(message));
+        }
+    }
 }
 
 /// Expands commands depth first, within the walk's budget.
@@ -874,13 +981,21 @@ fn expand_steps(
             return;
         }
         let Step::Command { name, with } = step else {
-            out.push(plan_step(step, values, scope, walk, errors));
+            if !walk.bytes(size_of::<PlannedStep>(), errors) {
+                return;
+            }
+            let planned = plan_step(step, values, scope, walk, errors);
+            if walk.budget.spent {
+                return;
+            }
+            out.push(planned);
             continue;
         };
         let Some(command) = config.commands.get(name) else {
-            errors.push(Diagnostic::new(format!(
-                "{scope} uses command `{name}`, which is not defined in `commands:`"
-            )));
+            walk.report(
+                format!("{scope} uses command `{name}`, which is not defined in `commands:`"),
+                errors,
+            );
             continue;
         };
         if let Some(pos) = walk.stack.iter().position(|c| c == name) {
@@ -889,29 +1004,37 @@ fn expand_steps(
                 .chain(std::iter::once(name))
                 .map(|c| format!("`{c}`"))
                 .collect();
-            errors.push(Diagnostic::new(format!(
-                "command `{name}` reaches itself: {}",
-                chain.join(" -> ")
-            )));
+            walk.report(
+                format!("command `{name}` reaches itself: {}", chain.join(" -> ")),
+                errors,
+            );
             continue;
         }
         if walk.stack.len() >= MAX_NESTING {
-            errors.push(Diagnostic::new(format!(
-                "{scope} nests commands deeper than {MAX_NESTING}"
-            )));
+            walk.report(
+                format!("{scope} nests commands deeper than {MAX_NESTING}"),
+                errors,
+            );
             continue;
         }
-        let args: BTreeMap<String, Value> = with
-            .iter()
-            .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, walk, errors)))
-            .collect();
+        let args = Sub {
+            values,
+            scope,
+            walk,
+            errors,
+        }
+        .value_map(with);
         if walk.budget.spent {
             return;
         }
         let inner = format!("command `{name}`");
-        let Some(bound) = bind(&command.parameters, &args, &inner, errors) else {
+        let Some(bound) = bind(&command.parameters, &args, &inner, walk, errors) else {
+            if walk.budget.spent {
+                return;
+            }
             continue;
         };
+        drop(args);
         walk.stack.push(name.clone());
         expand_steps(config, &command.steps, &bound, &inner, walk, out, errors);
         walk.stack.pop();
@@ -922,32 +1045,42 @@ fn expand_steps(
 }
 
 /// Checks parameter values against their declarations and fills in
-/// defaults. `None` when a value is missing, unknown or the wrong kind.
+/// defaults. `None` when a value is missing, unknown or the wrong kind,
+/// or the budget is spent. Each value is charged before it is copied.
 fn bind(
     params: &BTreeMap<String, Parameter>,
     args: &BTreeMap<String, Value>,
     owner: &str,
+    walk: &mut Walk<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<BTreeMap<String, Value>> {
     let before = errors.len();
     for key in args.keys() {
         if !params.contains_key(key) {
-            errors.push(Diagnostic::new(format!("{owner} has no parameter `{key}`")));
+            walk.report(format!("{owner} has no parameter `{key}`"), errors);
         }
     }
     let mut values = BTreeMap::new();
     for (key, param) in params {
+        if walk.budget.spent {
+            return None;
+        }
         let Some(value) = args.get(key).or(param.default.as_ref()) else {
-            errors.push(Diagnostic::new(format!(
-                "{owner} needs a value for parameter `{key}`, which is required"
-            )));
+            walk.report(
+                format!("{owner} needs a value for parameter `{key}`, which is required"),
+                errors,
+            );
             continue;
         };
         if let Some(want) = kind_mismatch(&param.kind, value) {
-            errors.push(Diagnostic::new(format!(
-                "{owner} parameter `{key}` must be {want}, found {value}"
-            )));
+            walk.report(
+                format!("{owner} parameter `{key}` must be {want}, found {value}"),
+                errors,
+            );
             continue;
+        }
+        if !walk.bytes(key.len() + ENTRY_OVERHEAD + value_bytes(value), errors) {
+            return None;
         }
         values.insert(key.clone(), value.clone());
     }
@@ -981,7 +1114,8 @@ fn kind_mismatch(kind: &ParameterKind, value: &Value) -> Option<String> {
     })
 }
 
-/// Substitutes parameters in every string field of a step.
+/// Substitutes parameters in every string field of a step. Every string,
+/// entry and value is charged before it is made.
 fn plan_step(
     step: &Step,
     values: &BTreeMap<String, Value>,
@@ -989,95 +1123,173 @@ fn plan_step(
     walk: &mut Walk<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> PlannedStep {
-    let mut sub = |text: &str| substitute(text, values, scope, walk, errors);
+    let mut sub = Sub {
+        values,
+        scope,
+        walk,
+        errors,
+    };
     match step {
-        Step::Run(run) => {
-            let planned = RunStep {
-                name: run.name.as_deref().map(&mut sub),
-                id: run.id.clone(),
-                run: sub(&run.run),
-                shell: run.shell.as_deref().map(&mut sub),
-                working_directory: run.working_directory.as_deref().map(&mut sub),
-                env: run.env.iter().map(|(k, v)| (k.clone(), sub(v))).collect(),
-                if_: run.if_.as_deref().map(&mut sub),
-                continue_on_error: run.continue_on_error,
-                timeout_minutes: run.timeout_minutes,
-            };
-            PlannedStep::Run(planned)
-        }
+        Step::Run(run) => PlannedStep::Run(RunStep {
+            name: sub.opt(run.name.as_deref()),
+            id: sub.copy(run.id.as_deref()),
+            run: sub.text(&run.run),
+            shell: sub.opt(run.shell.as_deref()),
+            working_directory: sub.opt(run.working_directory.as_deref()),
+            env: sub.map(&run.env),
+            if_: sub.opt(run.if_.as_deref()),
+            continue_on_error: run.continue_on_error,
+            timeout_minutes: run.timeout_minutes,
+        }),
         Step::Uses(uses) => {
             let planned = UsesStep {
-                name: uses.name.as_deref().map(&mut sub),
-                id: uses.id.clone(),
-                uses: sub(&uses.uses),
-                with: BTreeMap::new(),
-                env: uses.env.iter().map(|(k, v)| (k.clone(), sub(v))).collect(),
-                if_: uses.if_.as_deref().map(&mut sub),
+                name: sub.opt(uses.name.as_deref()),
+                id: sub.copy(uses.id.as_deref()),
+                uses: sub.text(&uses.uses),
+                with: sub.value_map(&uses.with),
+                env: sub.map(&uses.env),
+                if_: sub.opt(uses.if_.as_deref()),
                 continue_on_error: uses.continue_on_error,
             };
-            let with = uses
-                .with
-                .iter()
-                .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, walk, errors)))
-                .collect();
             if planned.uses.starts_with("docker://") {
-                errors.push(Diagnostic::new(format!(
-                    "{scope} has `uses: {}`; `uses: docker://` is not supported yet; Docker services and containers come in a later release",
-                    planned.uses
-                )));
+                sub.walk.report(
+                    format!(
+                        "{scope} has `uses: {}`; `uses: docker://` is not supported yet; Docker services and containers come in a later release",
+                        planned.uses
+                    ),
+                    sub.errors,
+                );
             }
-            PlannedStep::Uses(UsesStep { with, ..planned })
+            PlannedStep::Uses(planned)
         }
         Step::Cache(cache) => PlannedStep::Cache(CacheStep {
-            key: sub(&cache.key),
-            restore_keys: cache.restore_keys.iter().map(|k| sub(k)).collect(),
-            paths: cache.paths.iter().map(|p| sub(p)).collect(),
+            key: sub.text(&cache.key),
+            restore_keys: sub.list(&cache.restore_keys),
+            paths: sub.list(&cache.paths),
         }),
         Step::Workspace(WorkspaceStep::Persist { root, paths }) => {
             PlannedStep::Workspace(WorkspaceStep::Persist {
-                root: sub(root),
-                paths: paths.iter().map(|p| sub(p)).collect(),
+                root: sub.text(root),
+                paths: sub.list(paths),
             })
         }
         Step::Workspace(WorkspaceStep::Attach { at }) => {
-            PlannedStep::Workspace(WorkspaceStep::Attach { at: sub(at) })
+            PlannedStep::Workspace(WorkspaceStep::Attach { at: sub.text(at) })
         }
-        Step::TestResults { path } => PlannedStep::TestResults { path: sub(path) },
+        Step::TestResults { path } => PlannedStep::TestResults {
+            path: sub.text(path),
+        },
         Step::Command { .. } => unreachable!("commands are expanded by expand_steps"),
     }
 }
 
-/// Substitutes parameters inside a value. A string that is exactly one
-/// `${{ parameters.x }}` becomes the parameter's value, keeping its type.
-fn substitute_value(
-    value: &Value,
-    values: &BTreeMap<String, Value>,
-    scope: &str,
-    walk: &mut Walk<'_>,
-    errors: &mut Vec<Diagnostic>,
-) -> Value {
-    match value {
-        Value::String(text) => {
-            if let Some(found) = sole_parameter(text).and_then(|name| values.get(name)) {
-                if !walk.bytes(value_len(found), errors) {
-                    return Value::Null;
-                }
-                return found.clone();
+/// Substitutes the parameters of one scope into strings and values,
+/// charging the walk's budget for each string, map entry, list item and
+/// value before it is made. Once the budget is spent it makes empty
+/// strings and stops filling maps and lists.
+struct Sub<'s, 'w> {
+    /// The parameter values of the scope.
+    values: &'s BTreeMap<String, Value>,
+    /// The scope, as named in errors.
+    scope: &'s str,
+    /// The walk whose budget is charged.
+    walk: &'s mut Walk<'w>,
+    /// Where problems go.
+    errors: &'s mut Vec<Diagnostic>,
+}
+
+impl Sub<'_, '_> {
+    /// `text` with parameters substituted.
+    fn text(&mut self, text: &str) -> String {
+        substitute(text, self.values, self.scope, self.walk, self.errors)
+    }
+
+    /// An optional string with parameters substituted.
+    fn opt(&mut self, text: Option<&str>) -> Option<String> {
+        text.map(|t| self.text(t))
+    }
+
+    /// An optional string copied as it is.
+    fn copy(&mut self, text: Option<&str>) -> Option<String> {
+        let text = text?;
+        self.walk
+            .bytes(text.len(), self.errors)
+            .then(|| text.to_owned())
+    }
+
+    /// A map of strings with parameters substituted in its values.
+    /// Collected, not inserted one by one: a map built from sorted
+    /// entries packs its nodes full.
+    fn map(&mut self, map: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        map.iter()
+            .map_while(|(key, value)| {
+                self.walk
+                    .bytes(key.len() + ENTRY_OVERHEAD, self.errors)
+                    .then(|| (key.clone(), self.text(value)))
+            })
+            .collect()
+    }
+
+    /// A list of strings with parameters substituted.
+    fn list(&mut self, list: &[String]) -> Vec<String> {
+        list.iter()
+            .map_while(|item| {
+                self.walk
+                    .bytes(ENTRY_OVERHEAD, self.errors)
+                    .then(|| self.text(item))
+            })
+            .collect()
+    }
+
+    /// A map of values with parameters substituted in its values.
+    fn value_map(&mut self, map: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+        map.iter()
+            .map_while(|(key, value)| {
+                self.walk
+                    .bytes(key.len() + ENTRY_OVERHEAD, self.errors)
+                    .then(|| (key.clone(), self.value(value)))
+            })
+            .collect()
+    }
+
+    /// Substitutes parameters inside a value. A string that is exactly
+    /// one `${{ parameters.x }}` becomes the parameter's value, keeping
+    /// its type.
+    fn value(&mut self, value: &Value) -> Value {
+        if let Value::String(text) = value
+            && let Some(found) = sole_parameter(text).and_then(|name| self.values.get(name))
+        {
+            if !self.walk.bytes(value_bytes(found), self.errors) {
+                return Value::Null;
             }
-            Value::String(substitute(text, values, scope, walk, errors))
+            return found.clone();
         }
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|v| substitute_value(v, values, scope, walk, errors))
-                .collect(),
-        ),
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, walk, errors)))
-                .collect(),
-        ),
-        other => other.clone(),
+        if !self.walk.bytes(size_of::<Value>(), self.errors) {
+            return Value::Null;
+        }
+        match value {
+            Value::String(text) => Value::String(self.text(text)),
+            Value::Array(items) => {
+                let mut out = Vec::new();
+                for item in items {
+                    if self.walk.budget.spent {
+                        break;
+                    }
+                    out.push(self.value(item));
+                }
+                Value::Array(out)
+            }
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map_while(|(key, item)| {
+                        self.walk
+                            .bytes(key.len() + ENTRY_OVERHEAD, self.errors)
+                            .then(|| (key.clone(), self.value(item)))
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
     }
 }
 
@@ -1164,6 +1376,9 @@ fn substitute(
     walk: &mut Walk<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> String {
+    if walk.budget.spent {
+        return String::new();
+    }
     if !text.contains("${{") {
         return if walk.bytes(text.len(), errors) {
             text.to_owned()
@@ -1180,20 +1395,26 @@ fn substitute(
             Piece::Param(name, whole) => {
                 if let Some(value) = values.get(*name) {
                     first.get_or_insert(*name);
-                    value_len(value)
+                    rendered_len(value)
                 } else {
-                    errors.push(Diagnostic::new(format!(
-                        "{scope} reads `${{{{ parameters.{name} }}}}` but declares no parameter `{name}`"
-                    )));
+                    walk.report(
+                        format!(
+                            "{scope} reads `${{{{ parameters.{name} }}}}` but declares no parameter `{name}`"
+                        ),
+                        errors,
+                    );
                     whole.len()
                 }
             }
         });
     }
     if let Some(name) = first.filter(|_| len > MAX_VALUE) {
-        errors.push(Diagnostic::new(format!(
-            "{scope} substitutes `${{{{ parameters.{name} }}}}` into a value of {len} bytes; the limit is {MAX_VALUE}"
-        )));
+        walk.report(
+            format!(
+                "{scope} substitutes `${{{{ parameters.{name} }}}}` into a value of {len} bytes; the limit is {MAX_VALUE}"
+            ),
+            errors,
+        );
         return String::new();
     }
     if !walk.bytes(len, errors) {
@@ -1205,6 +1426,10 @@ fn substitute(
             Piece::Text(t) => out.push_str(t),
             Piece::Param(name, whole) => match values.get(name) {
                 Some(Value::String(v)) => out.push_str(v),
+                // Written in place: the text was charged, a copy was not.
+                Some(v @ (Value::Array(_) | Value::Object(_))) => {
+                    let _ = write!(out, "{v}");
+                }
                 Some(other) => out.push_str(&render(other)),
                 None => out.push_str(whole),
             },
@@ -1213,12 +1438,43 @@ fn substitute(
     out
 }
 
-/// The length of a value rendered as text.
-fn value_len(value: &Value) -> usize {
+/// The length of a value rendered as text, worked out without
+/// rendering a list or map.
+fn rendered_len(value: &Value) -> usize {
     match value {
         Value::String(s) => s.len(),
+        Value::Array(_) | Value::Object(_) => {
+            let mut count = Count(0);
+            let _ = write!(count, "{value}");
+            count.0
+        }
         other => render(other).len(),
     }
+}
+
+/// Counts the bytes written to it.
+struct Count(usize);
+
+impl std::fmt::Write for Count {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 += s.len();
+        Ok(())
+    }
+}
+
+/// The bytes a value holds in memory: a `Value` per node, its strings,
+/// and `ENTRY_OVERHEAD` per map entry.
+fn value_bytes(value: &Value) -> usize {
+    size_of::<Value>()
+        + match value {
+            Value::String(s) => s.len(),
+            Value::Array(items) => items.iter().map(value_bytes).sum(),
+            Value::Object(map) => map
+                .iter()
+                .map(|(k, v)| k.len() + ENTRY_OVERHEAD + value_bytes(v))
+                .sum(),
+            _ => 0,
+        }
 }
 
 /// The bytes of a map of strings: its text and `ENTRY_OVERHEAD` per entry.
@@ -1255,7 +1511,7 @@ fn step_bytes(step: &PlannedStep) -> usize {
                     + u.uses.len()
                     + u.with
                         .iter()
-                        .map(|(k, v)| k.len() + value_len(v) + ENTRY_OVERHEAD)
+                        .map(|(k, v)| k.len() + value_bytes(v) + ENTRY_OVERHEAD)
                         .sum::<usize>()
                     + map_bytes(&u.env)
                     + opt(&u.if_)

@@ -800,3 +800,64 @@ fn the_budget_counts_each_stored_entry() {
     assert_eq!(plan.jobs.len(), 256);
     assert_eq!(plan.jobs[0].env.len(), 200);
 }
+
+/// Command `b` holds `step` once; `f` calls `b` `calls` times and `g`
+/// calls `f` ten times, so one config step is planned `10 * calls` times.
+fn fan_out_step(step: &str, calls: usize) -> String {
+    format!(
+        "commands:\n  b: {{ steps: [{step}] }}\n  f: {{ steps: [{}] }}\n  g: {{ steps: [f, f, f, f, f, f, f, f, f, f] }}\njobs: {{ t: {{ runs-on: ubuntu-latest, steps: [g] }} }}\nworkflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [t] }} }}\n",
+        vec!["b"; calls].join(", ")
+    )
+}
+
+#[test]
+fn the_budget_is_charged_before_each_entry_is_made() {
+    let ones = vec!["1"; 5_000].join(", ");
+    let params: Vec<String> = (0..1_000)
+        .map(|i| format!("p{i}: {{ type: string }}"))
+        .collect();
+    let cases = [
+        fan_out_step(
+            &format!("{{ run: x, env: {{ {} }} }}", short_entries(5_000)),
+            1_000,
+        ),
+        fan_out_step(
+            &format!("{{ run: x, env: {{ {} }} }}", short_entries(20_000)),
+            1_000,
+        ),
+        fan_out_step(
+            &format!("{{ uses: a/b@v1, with: {{ {} }} }}", short_entries(5_000)),
+            1_000,
+        ),
+        fan_out_step(
+            &format!("{{ uses: a/b@v1, env: {{ {} }} }}", short_entries(5_000)),
+            1_000,
+        ),
+        fan_out_step(
+            &format!("{{ uses: a/b@v1, with: {{ a: [{ones}] }} }}"),
+            1_000,
+        ),
+        fan_out_step(
+            &format!(
+                "{{ workspace: {{ persist: {{ root: r, paths: [{}] }} }} }}",
+                short_strings(5_000)
+            ),
+            1_000,
+        ),
+    ];
+    for yaml in &cases {
+        let err = timed_compile(yaml);
+        assert!(err.iter().any(|e| e.message.contains("8388608")), "{err:?}");
+    }
+    // A command missing many required parameters, called many times:
+    // the repeated messages are charged too.
+    let yaml = fan_out_step("x", 1_000).replace(
+        "  b: { steps: [x] }",
+        &format!(
+            "  b: {{ parameters: {{ {} }}, steps: [] }}",
+            params.join(", ")
+        ),
+    );
+    let err = timed_compile(&yaml);
+    assert!(err.iter().any(|e| e.message.contains("8388608")), "{err:?}");
+}
