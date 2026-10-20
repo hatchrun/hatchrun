@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use serde_json::{Number, Value};
 
 use super::parser::{Expr, Op, Step};
-use super::{CONTEXTS, ExprError, Functions, JobStatus};
+use super::{CONTEXTS, ExprError, Functions, JobStatus, MAX_STRING};
 
 /// Whether `v` counts as true in a condition: everything but `null`,
 /// `false`, `0`, `NaN` and the empty string.
@@ -57,6 +57,51 @@ fn format_float(f: f64) -> String {
     } else {
         // Display prints whole floats without a decimal point.
         f.to_string()
+    }
+}
+
+/// The length of [`to_string`] of `v`, without copying a string.
+fn text_len(v: &Value) -> usize {
+    match v {
+        Value::String(s) => s.len(),
+        other => to_string(other).len(),
+    }
+}
+
+/// Passes [`to_string`] of `v` to `f`, without copying a string.
+fn with_text<R>(v: &Value, f: impl FnOnce(&str) -> R) -> R {
+    match v {
+        Value::String(s) => f(s),
+        other => f(&to_string(other)),
+    }
+}
+
+/// Fails when a function would make a string longer than [`MAX_STRING`].
+fn fits(len: usize, name: &str, offset: usize) -> Result<(), ExprError> {
+    if len > MAX_STRING {
+        return Err(ExprError::new(
+            format!("{name}() would make a string of {len} bytes; the limit is {MAX_STRING}"),
+            offset,
+        ));
+    }
+    Ok(())
+}
+
+/// Counts bytes written to it and fails past [`MAX_STRING`], so a value
+/// too big to serialize is found without serializing all of it.
+struct Counter(usize);
+
+impl std::io::Write for Counter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        if self.0 > MAX_STRING {
+            return Err(std::io::Error::other("too long"));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -201,6 +246,34 @@ fn lookup(v: &Value, key: &Value) -> Value {
     }
 }
 
+/// Calls `f` with the name and offset of every context `expr` reads,
+/// including ones a short circuit would skip, stopping at its first
+/// error.
+pub(crate) fn visit_contexts(
+    expr: &Expr,
+    f: &mut dyn FnMut(&str, usize) -> Result<(), ExprError>,
+) -> Result<(), ExprError> {
+    match expr {
+        Expr::Literal(_) => Ok(()),
+        Expr::Context { name, offset } => f(name, *offset),
+        Expr::Not(inner) => visit_contexts(inner, f),
+        Expr::Access { base, path } => {
+            visit_contexts(base, f)?;
+            path.iter().try_for_each(|step| match step {
+                Step::Index(index) => visit_contexts(index, f),
+                Step::Property(_) | Step::Filter => Ok(()),
+            })
+        }
+        Expr::Call { args, .. } | Expr::And(args) | Expr::Or(args) => {
+            args.iter().try_for_each(|a| visit_contexts(a, f))
+        }
+        Expr::Compare { first, rest } => {
+            visit_contexts(first, f)?;
+            rest.iter().try_for_each(|(_, e)| visit_contexts(e, f))
+        }
+    }
+}
+
 /// Evaluates expression trees against one context.
 pub(crate) struct Evaluator<'a> {
     pub ctx: &'a Value,
@@ -233,28 +306,10 @@ impl Evaluator<'_> {
     }
 
     fn check(&self, expr: &Expr) -> Result<(), ExprError> {
-        match expr {
-            Expr::Literal(_) => Ok(()),
-            Expr::Context { name, offset } => match self.context(name) {
-                Some(_) => Ok(()),
-                None => Err(ExprError::new(format!("unknown context '{name}'"), *offset)),
-            },
-            Expr::Not(inner) => self.check(inner),
-            Expr::Access { base, path } => {
-                self.check(base)?;
-                path.iter().try_for_each(|step| match step {
-                    Step::Index(index) => self.check(index),
-                    Step::Property(_) | Step::Filter => Ok(()),
-                })
-            }
-            Expr::Call { args, .. } | Expr::And(args) | Expr::Or(args) => {
-                args.iter().try_for_each(|a| self.check(a))
-            }
-            Expr::Compare { first, rest } => {
-                self.check(first)?;
-                rest.iter().try_for_each(|(_, e)| self.check(e))
-            }
-        }
+        visit_contexts(expr, &mut |name, offset| match self.context(name) {
+            Some(_) => Ok(()),
+            None => Err(ExprError::new(format!("unknown context '{name}'"), offset)),
+        })
     }
 
     fn value(&self, expr: &Expr) -> Result<Value, ExprError> {
@@ -323,21 +378,8 @@ impl Evaluator<'_> {
             "startswith" => Value::Bool(fold(&string(0)).starts_with(&fold(&string(1)))),
             "endswith" => Value::Bool(fold(&string(0)).ends_with(&fold(&string(1)))),
             "format" => Value::String(format(&string(0), &args[1..], offset)?),
-            "join" => Value::String(match &args[0] {
-                Value::Array(items) => {
-                    let sep = if args.len() > 1 {
-                        string(1)
-                    } else {
-                        ",".to_owned()
-                    };
-                    items.iter().map(to_string).collect::<Vec<_>>().join(&sep)
-                }
-                other => to_string(other),
-            }),
-            "tojson" => Value::String(
-                serde_json::to_string_pretty(&args[0])
-                    .map_err(|e| ExprError::new(format!("toJSON: {e}"), offset))?,
-            ),
+            "join" => Value::String(join(args, offset)?),
+            "tojson" => Value::String(to_json(&args[0], offset)?),
             "fromjson" => serde_json::from_str(&string(0))
                 .map_err(|e| ExprError::new(format!("fromJSON: {e}"), offset))?,
             "hashfiles" => {
@@ -358,16 +400,67 @@ impl Evaluator<'_> {
     }
 }
 
+/// `join(array, sep)`: the items as text with `sep` (`,` by default)
+/// between them. Anything but an array is returned as text.
+fn join(args: &[Value], offset: usize) -> Result<String, ExprError> {
+    let Value::Array(items) = &args[0] else {
+        fits(text_len(&args[0]), "join", offset)?;
+        return Ok(to_string(&args[0]));
+    };
+    let sep = args.get(1).map_or_else(|| ",".to_owned(), to_string);
+    let len = items
+        .iter()
+        .map(text_len)
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(sep.len().saturating_mul(items.len().saturating_sub(1)));
+    fits(len, "join", offset)?;
+    let mut out = String::with_capacity(len);
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(&sep);
+        }
+        with_text(item, |t| out.push_str(t));
+    }
+    Ok(out)
+}
+
+/// `toJSON(value)`: the value as indented JSON.
+fn to_json(value: &Value, offset: usize) -> Result<String, ExprError> {
+    let mut count = Counter(0);
+    if serde_json::to_writer_pretty(&mut count, value).is_err() {
+        fits(count.0, "toJSON", offset)?;
+    }
+    serde_json::to_string_pretty(value).map_err(|e| ExprError::new(format!("toJSON: {e}"), offset))
+}
+
 /// `format(fmt, args...)`: `{N}` takes argument N, `{{` and `}}` are
-/// literal braces.
+/// literal braces. The length is worked out first, then the string is
+/// made.
 fn format(fmt: &str, args: &[Value], offset: usize) -> Result<String, ExprError> {
-    let mut out = String::with_capacity(fmt.len());
+    let mut len = 0usize;
+    format_parts(fmt, args, offset, &mut |part| {
+        len = len.saturating_add(part.len());
+    })?;
+    fits(len, "format", offset)?;
+    let mut out = String::with_capacity(len);
+    format_parts(fmt, args, offset, &mut |part| out.push_str(part))?;
+    Ok(out)
+}
+
+/// Passes each piece of a `format` result to `emit`, in order.
+fn format_parts(
+    fmt: &str,
+    args: &[Value],
+    offset: usize,
+    emit: &mut dyn FnMut(&str),
+) -> Result<(), ExprError> {
+    let mut buf = [0; 4];
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '{' if chars.peek() == Some(&'{') => {
                 chars.next();
-                out.push('{');
+                emit("{");
             }
             '{' => {
                 let mut digits = String::new();
@@ -387,11 +480,11 @@ fn format(fmt: &str, args: &[Value], offset: usize) -> Result<String, ExprError>
                     .ok_or_else(|| {
                         ExprError::new(format!("format: no argument for {{{digits}}}"), offset)
                     })?;
-                out.push_str(&to_string(arg));
+                with_text(arg, |t| emit(t));
             }
             '}' if chars.peek() == Some(&'}') => {
                 chars.next();
-                out.push('}');
+                emit("}");
             }
             '}' => {
                 return Err(ExprError::new(
@@ -399,8 +492,8 @@ fn format(fmt: &str, args: &[Value], offset: usize) -> Result<String, ExprError>
                     offset,
                 ));
             }
-            c => out.push(c),
+            c => emit(c.encode_utf8(&mut buf)),
         }
     }
-    Ok(out)
+    Ok(())
 }

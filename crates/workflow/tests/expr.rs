@@ -4,6 +4,7 @@
 
 //! GitHub-style `${{ }}` expressions.
 
+use hatchrun_workflow::expr::check;
 use hatchrun_workflow::{ExprError, Functions, JobStatus, evaluate, interpolate, truthy};
 use serde_json::{Value, json};
 
@@ -430,4 +431,84 @@ fn many_nots_fail_cleanly() {
         evaluate(&nested("!", 10_000, ""), &json!({}), &NoFiles)
     });
     assert!(e.is_err());
+}
+
+/// `format('{0}...{0}', x)` nested `levels` deep around `'aaaaaaaaaaaaaaaa'`,
+/// each level repeating its argument `copies` times.
+fn blowup(levels: usize, copies: usize) -> String {
+    let fmt = format!("format('{}', ", "{0}".repeat(copies));
+    format!(
+        "{}'{}'{}",
+        fmt.repeat(levels),
+        "a".repeat(16),
+        ")".repeat(levels)
+    )
+}
+
+#[test]
+fn produced_strings_are_capped_at_one_mib() {
+    // 16 bytes times 8^12 would be 1 TiB; the cap stops it at the first
+    // level past 1 MiB, before that string is made.
+    let e = blowup(12, 8);
+    assert!(e.len() < 500, "{}", e.len());
+    let err = evaluate(&e, &json!({}), &NoFiles).unwrap_err();
+    assert!(err.message.contains("format()"), "{}", err.message);
+    assert!(err.message.contains("1048576"), "{}", err.message);
+    // The innermost level that overflows: 16 * 8^6 = 4 MiB, the 6th
+    // call from the inside, whose `format` starts at its offset.
+    let level = 12 - 6;
+    assert_eq!(
+        err.offset,
+        level * "format('{0}{0}{0}{0}{0}{0}{0}{0}', ".len()
+    );
+
+    // Exactly 1 MiB passes.
+    let mib = blowup(16, 2);
+    assert_eq!(
+        evaluate(&mib, &json!({}), &NoFiles).unwrap(),
+        json!("a".repeat(1 << 20))
+    );
+
+    let big = json!({"x": {"s": "a".repeat(600 << 10)}});
+    let join = evaluate("join(fromJSON('[1,2]'), x.s)", &big, &NoFiles);
+    assert_eq!(join.unwrap(), json!(format!("1{}2", "a".repeat(600 << 10))));
+    let two = json!({"x": ["a".repeat(600 << 10), "b".repeat(600 << 10)]});
+    let err = evaluate("join(x, '')", &two, &NoFiles).unwrap_err();
+    assert!(err.message.contains("join()"), "{}", err.message);
+    let err = evaluate("toJSON(x)", &two, &NoFiles).unwrap_err();
+    assert!(err.message.contains("toJSON()"), "{}", err.message);
+    assert_eq!(err.offset, 0);
+
+    let err = interpolate("ab ${{ x[0] }}${{ x[1] }}", &two, &NoFiles).unwrap_err();
+    assert!(err.message.contains("1048576"), "{}", err.message);
+    assert_eq!(err.offset, 14);
+}
+
+#[test]
+fn check_parses_without_evaluating() {
+    for ok in [
+        "github.ref == 'refs/heads/main'",
+        "vars.REGION",
+        "inputs.debug && success()",
+        "hashFiles('**/Cargo.lock')",
+        "parameters.x",
+        "needs.build.outputs.v",
+    ] {
+        assert_eq!(check(ok), Ok(()), "{ok}");
+    }
+    for (bad, words, offset) in [
+        ("github.ref ==", "after", 11),
+        ("nosuch.x", "unknown context 'nosuch'", 0),
+        (
+            "false && strategy.job-index",
+            "unknown context 'strategy'",
+            9,
+        ),
+        ("nosuch(1)", "unknown function", 0),
+        ("contains('a')", "takes 2", 0),
+    ] {
+        let e = check(bad).unwrap_err();
+        assert!(e.message.contains(words), "{bad}: {}", e.message);
+        assert_eq!(e.offset, offset, "{bad}");
+    }
 }

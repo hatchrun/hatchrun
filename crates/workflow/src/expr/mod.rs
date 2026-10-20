@@ -31,10 +31,17 @@ const CONTEXTS: &[&str] = &[
     "parameters",
     "runner",
     "job",
+    "vars",
+    "inputs",
 ];
 
 /// The longest expression, in bytes, that [`evaluate`] accepts.
 const MAX_LEN: usize = 4096;
+
+/// The longest string an expression can produce, in bytes: the result
+/// of `format`, `join`, `toJSON` or an [`interpolate`]. The length is
+/// worked out before the string is made.
+pub const MAX_STRING: usize = 1 << 20;
 
 /// An expression that does not parse or fails to evaluate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +110,47 @@ pub trait Functions {
 /// When the expression is too long or too deep, does not parse, names an unknown context or
 /// function, or a function fails. The offset is relative to `expr`.
 pub fn evaluate(expr: &str, ctx: &Value, funcs: &dyn Functions) -> Result<Value, ExprError> {
+    let ast = tree(expr)?;
+    eval::Evaluator { ctx, funcs }.eval(&ast)
+}
+
+/// Checks one expression without evaluating it: it must parse, call
+/// only known functions with the right number of arguments and read
+/// only known contexts.
+///
+/// # Errors
+///
+/// When the expression is too long or too deep, does not parse, or
+/// names an unknown context or function. The offset is relative to
+/// `expr`.
+pub fn check(expr: &str) -> Result<(), ExprError> {
+    for (name, offset) in contexts(expr)? {
+        if !CONTEXTS.contains(&name.as_str()) {
+            return Err(ExprError::new(format!("unknown context '{name}'"), offset));
+        }
+    }
+    Ok(())
+}
+
+/// The contexts an expression reads, lowercased, with the offset of
+/// each read, in the order they appear. Unknown names are included.
+///
+/// # Errors
+///
+/// When the expression is too long or too deep, does not parse, or
+/// calls an unknown function.
+pub(crate) fn contexts(expr: &str) -> Result<Vec<(String, usize)>, ExprError> {
+    let ast = tree(expr)?;
+    let mut names = Vec::new();
+    eval::visit_contexts(&ast, &mut |name, offset| {
+        names.push((name.to_ascii_lowercase(), offset));
+        Ok(())
+    })?;
+    Ok(names)
+}
+
+/// Lexes and parses one expression, within the length limit.
+fn tree(expr: &str) -> Result<parser::Expr, ExprError> {
     if expr.len() > MAX_LEN {
         return Err(ExprError::new(
             format!("expression is longer than {MAX_LEN} bytes"),
@@ -110,16 +158,37 @@ pub fn evaluate(expr: &str, ctx: &Value, funcs: &dyn Functions) -> Result<Value,
         ));
     }
     let tokens = lexer::lex(expr)?;
-    let ast = parser::parse(&tokens)?;
-    eval::Evaluator { ctx, funcs }.eval(&ast)
+    parser::parse(&tokens)
+}
+
+/// The `${{ }}` expressions in `template`: the byte offset of the text
+/// between the braces and that text.
+///
+/// # Errors
+///
+/// When a `${{` has no closing `}}`. The offset is relative to
+/// `template`.
+pub(crate) fn expressions(template: &str) -> Result<Vec<(usize, &str)>, ExprError> {
+    let mut out = Vec::new();
+    let mut rest = 0;
+    while let Some(found) = template[rest..].find("${{") {
+        let open = rest + found;
+        let start = open + 3;
+        let end = closing(template, start)
+            .ok_or_else(|| ExprError::new("'${{' has no closing '}}'", open))?;
+        out.push((start, &template[start..end]));
+        rest = end + 2;
+    }
+    Ok(out)
 }
 
 /// Replaces every `${{ }}` in `template` with its value as a string.
 ///
 /// # Errors
 ///
-/// When a `${{` has no closing `}}`, or an expression fails. The offset
-/// is relative to `template`.
+/// When a `${{` has no closing `}}`, an expression fails, or the result
+/// would be longer than [`MAX_STRING`]. The offset is relative to
+/// `template`.
 pub fn interpolate(
     template: &str,
     ctx: &Value,
@@ -136,8 +205,19 @@ pub fn interpolate(
             message: e.message,
             offset: e.offset + start,
         })?;
+        let text = match value {
+            Value::String(s) => s,
+            other => eval::to_string(&other),
+        };
+        let len = out.len() + (open - rest) + text.len() + (template.len() - end - 2);
+        if len > MAX_STRING {
+            return Err(ExprError::new(
+                format!("the value would be {len} bytes or more; the limit is {MAX_STRING}"),
+                open,
+            ));
+        }
         out.push_str(&template[rest..open]);
-        out.push_str(&eval::to_string(&value));
+        out.push_str(&text);
         rest = end + 2;
     }
     out.push_str(&template[rest..]);
