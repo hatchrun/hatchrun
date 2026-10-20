@@ -6,6 +6,12 @@
 //!
 //! Precedence, low to high: `||`, `&&`, `==` `!=`, `<` `<=` `>` `>=`,
 //! `!`, then property access and calls.
+//!
+//! Chains of one operator (`a || b || c`, `a.b[0].c`) are parsed by a
+//! loop and kept flat in one node, so parsing, walking and dropping the
+//! tree recurse only per nesting level: brackets, parentheses, call
+//! arguments and `!`. [`MAX_DEPTH`] caps those levels, which bounds every
+//! recursion over the tree.
 
 use serde_json::Value;
 
@@ -22,18 +28,11 @@ pub(crate) enum Expr {
         name: String,
         offset: usize,
     },
-    /// `target.name`.
-    Property {
-        target: Box<Expr>,
-        name: String,
+    /// `base` followed by `.name`, `[index]`, `.*` or `[*]` steps.
+    Access {
+        base: Box<Expr>,
+        path: Vec<Step>,
     },
-    /// `target[index]`.
-    Index {
-        target: Box<Expr>,
-        index: Box<Expr>,
-    },
-    /// `target.*` or `target[*]`.
-    Filter(Box<Expr>),
     /// A function call; `name` is lowercased, `offset` is where it starts.
     Call {
         name: String,
@@ -41,10 +40,31 @@ pub(crate) enum Expr {
         offset: usize,
     },
     Not(Box<Expr>),
-    And(Box<Expr>, Box<Expr>),
-    Or(Box<Expr>, Box<Expr>),
-    Compare(Op, Box<Expr>, Box<Expr>),
+    /// Operands of a `&&` chain, at least two.
+    And(Vec<Expr>),
+    /// Operands of a `||` chain, at least two.
+    Or(Vec<Expr>),
+    /// `first`, then each operator and right operand, applied left to
+    /// right.
+    Compare {
+        first: Box<Expr>,
+        rest: Vec<(Op, Expr)>,
+    },
 }
+
+/// One step of a property access.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Step {
+    /// `.name`.
+    Property(String),
+    /// `[expr]`.
+    Index(Expr),
+    /// `.*` or `[*]`.
+    Filter,
+}
+
+/// How deeply brackets, parentheses, calls and `!` may nest.
+pub(crate) const MAX_DEPTH: usize = 64;
 
 /// A comparison operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,11 +96,15 @@ const FUNCTIONS: &[(&str, usize, usize)] = &[
 
 /// Parses a whole token list, which must end with [`Kind::Eof`].
 pub(crate) fn parse(tokens: &[Token]) -> Result<Expr, ExprError> {
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    };
     if p.peek().kind == Kind::Eof {
         return Err(ExprError::new("expected an expression", p.peek().offset));
     }
-    let expr = p.or()?;
+    let expr = p.expr()?;
     let next = p.peek();
     if next.kind != Kind::Eof {
         return Err(ExprError::new(
@@ -94,6 +118,7 @@ pub(crate) fn parse(tokens: &[Token]) -> Result<Expr, ExprError> {
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    depth: usize,
 }
 
 impl Parser<'_> {
@@ -125,103 +150,97 @@ impl Parser<'_> {
         }
     }
 
-    fn or(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.and()?;
-        while self.peek().kind == Kind::Or {
-            let op = self.bump();
-            self.operand_after(&op)?;
-            left = Expr::Or(Box::new(left), Box::new(self.and()?));
+    /// Goes one nesting level deeper at `token`, failing past
+    /// [`MAX_DEPTH`]. Pair with [`Parser::leave`].
+    fn enter(&mut self, token: &Token) -> Result<(), ExprError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(ExprError::new(
+                format!("expression nests deeper than {MAX_DEPTH} levels"),
+                token.offset,
+            ));
         }
-        Ok(left)
+        Ok(())
     }
 
-    fn and(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.equality()?;
-        while self.peek().kind == Kind::And {
-            let op = self.bump();
-            self.operand_after(&op)?;
-            left = Expr::And(Box::new(left), Box::new(self.equality()?));
-        }
-        Ok(left)
+    fn leave(&mut self) {
+        self.depth -= 1;
     }
 
-    fn equality(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.relational()?;
-        loop {
-            let op = match self.peek().kind {
-                Kind::Eq => Op::Eq,
-                Kind::Ne => Op::Ne,
-                _ => return Ok(left),
-            };
+    /// Parses a full expression.
+    fn expr(&mut self) -> Result<Expr, ExprError> {
+        self.climb(0)
+    }
+
+    /// Precedence climbing: parses operands joined by binary operators
+    /// binding at least as tightly as `min`. It recurses only when
+    /// precedence rises, so a chain of one operator is a loop.
+    fn climb(&mut self, min: u8) -> Result<Expr, ExprError> {
+        let mut lhs = self.unary()?;
+        while let Some((level, op)) = binary(&self.peek().kind) {
+            if level < min {
+                break;
+            }
             let token = self.bump();
             self.operand_after(&token)?;
-            left = Expr::Compare(op, Box::new(left), Box::new(self.relational()?));
+            let rhs = self.climb(level + 1)?;
+            lhs = join(lhs, op, rhs);
         }
-    }
-
-    fn relational(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.unary()?;
-        loop {
-            let op = match self.peek().kind {
-                Kind::Lt => Op::Lt,
-                Kind::Le => Op::Le,
-                Kind::Gt => Op::Gt,
-                Kind::Ge => Op::Ge,
-                _ => return Ok(left),
-            };
-            let token = self.bump();
-            self.operand_after(&token)?;
-            left = Expr::Compare(op, Box::new(left), Box::new(self.unary()?));
-        }
+        Ok(lhs)
     }
 
     fn unary(&mut self) -> Result<Expr, ExprError> {
         if self.peek().kind == Kind::Not {
             let op = self.bump();
             self.operand_after(&op)?;
-            return Ok(Expr::Not(Box::new(self.unary()?)));
+            self.enter(&op)?;
+            let inner = self.unary()?;
+            self.leave();
+            return Ok(Expr::Not(Box::new(inner)));
         }
         self.postfix()
     }
 
     fn postfix(&mut self) -> Result<Expr, ExprError> {
-        let mut expr = self.primary()?;
+        let base = self.primary()?;
+        let mut path = Vec::new();
         loop {
             match self.peek().kind {
                 Kind::Dot => {
                     let dot = self.bump();
                     let next = self.bump();
-                    expr = match next.kind {
-                        Kind::Ident(name) => Expr::Property {
-                            target: Box::new(expr),
-                            name,
-                        },
-                        Kind::Star => Expr::Filter(Box::new(expr)),
+                    path.push(match next.kind {
+                        Kind::Ident(name) => Step::Property(name),
+                        Kind::Star => Step::Filter,
                         _ => {
                             return Err(ExprError::new(
                                 "expected a property name or '*' after '.'",
                                 dot.offset,
                             ));
                         }
-                    };
+                    });
                 }
                 Kind::LBracket => {
                     let open = self.bump();
                     if self.peek().kind == Kind::Star {
                         self.bump();
-                        expr = Expr::Filter(Box::new(expr));
+                        path.push(Step::Filter);
                     } else {
-                        let index = self.or()?;
-                        expr = Expr::Index {
-                            target: Box::new(expr),
-                            index: Box::new(index),
-                        };
+                        self.enter(&open)?;
+                        path.push(Step::Index(self.expr()?));
+                        self.leave();
                     }
                     if self.bump().kind != Kind::RBracket {
                         return Err(ExprError::new("'[' is not closed", open.offset));
                     }
                 }
-                _ => return Ok(expr),
+                _ if path.is_empty() => return Ok(base),
+                _ => {
+                    return Ok(Expr::Access {
+                        base: Box::new(base),
+                        path,
+                    });
+                }
             }
         }
     }
@@ -242,7 +261,9 @@ impl Parser<'_> {
                 }),
             },
             Kind::LParen => {
-                let inner = self.or()?;
+                self.enter(&token)?;
+                let inner = self.expr()?;
+                self.leave();
                 if self.bump().kind != Kind::RParen {
                     return Err(ExprError::new("'(' is not closed", token.offset));
                 }
@@ -261,14 +282,16 @@ impl Parser<'_> {
         if self.peek().kind == Kind::RParen {
             self.bump();
         } else {
+            self.enter(&open)?;
             loop {
-                args.push(self.or()?);
+                args.push(self.expr()?);
                 match self.bump().kind {
                     Kind::Comma => {}
                     Kind::RParen => break,
                     _ => return Err(ExprError::new("'(' is not closed", open.offset)),
                 }
             }
+            self.leave();
         }
         let lower = name.to_ascii_lowercase();
         let Some(&(_, min, max)) = FUNCTIONS.iter().find(|(f, _, _)| *f == lower) else {
@@ -290,6 +313,61 @@ impl Parser<'_> {
             args,
             offset,
         })
+    }
+}
+
+/// A binary operator: its precedence level (higher binds tighter) and
+/// what it does.
+#[derive(Clone, Copy)]
+enum Binary {
+    Or,
+    And,
+    Compare(Op),
+}
+
+fn binary(kind: &Kind) -> Option<(u8, Binary)> {
+    Some(match kind {
+        Kind::Or => (0, Binary::Or),
+        Kind::And => (1, Binary::And),
+        Kind::Eq => (2, Binary::Compare(Op::Eq)),
+        Kind::Ne => (2, Binary::Compare(Op::Ne)),
+        Kind::Lt => (3, Binary::Compare(Op::Lt)),
+        Kind::Le => (3, Binary::Compare(Op::Le)),
+        Kind::Gt => (3, Binary::Compare(Op::Gt)),
+        Kind::Ge => (3, Binary::Compare(Op::Ge)),
+        _ => return None,
+    })
+}
+
+/// Whether two comparison operators share a precedence level.
+fn same_level(a: Op, b: Op) -> bool {
+    matches!(a, Op::Eq | Op::Ne) == matches!(b, Op::Eq | Op::Ne)
+}
+
+/// Builds `lhs op rhs`, appending to `lhs` when it is already a chain of
+/// the same level, so chains stay flat and are walked by loops.
+fn join(lhs: Expr, op: Binary, rhs: Expr) -> Expr {
+    match (op, lhs) {
+        (Binary::Or, Expr::Or(mut operands)) => {
+            operands.push(rhs);
+            Expr::Or(operands)
+        }
+        (Binary::Or, lhs) => Expr::Or(vec![lhs, rhs]),
+        (Binary::And, Expr::And(mut operands)) => {
+            operands.push(rhs);
+            Expr::And(operands)
+        }
+        (Binary::And, lhs) => Expr::And(vec![lhs, rhs]),
+        (Binary::Compare(op), Expr::Compare { first, mut rest })
+            if rest.first().is_some_and(|(o, _)| same_level(*o, op)) =>
+        {
+            rest.push((op, rhs));
+            Expr::Compare { first, rest }
+        }
+        (Binary::Compare(op), lhs) => Expr::Compare {
+            first: Box::new(lhs),
+            rest: vec![(op, rhs)],
+        },
     }
 }
 

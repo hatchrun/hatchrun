@@ -33,6 +33,9 @@ const CONTEXTS: &[&str] = &[
     "job",
 ];
 
+/// The longest expression, in bytes, that [`evaluate`] accepts.
+const MAX_LEN: usize = 4096;
+
 /// An expression that does not parse or fails to evaluate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprError {
@@ -91,11 +94,21 @@ pub trait Functions {
 /// `ctx` is an object whose keys are context names such as `github`,
 /// `matrix` or `needs`.
 ///
+/// Expressions longer than 4096 bytes, or nesting brackets, parentheses,
+/// calls and `!` deeper than 64 levels, are rejected so evaluation fits
+/// a small stack.
+///
 /// # Errors
 ///
-/// When the expression does not parse, names an unknown context or
+/// When the expression is too long or too deep, does not parse, names an unknown context or
 /// function, or a function fails. The offset is relative to `expr`.
 pub fn evaluate(expr: &str, ctx: &Value, funcs: &dyn Functions) -> Result<Value, ExprError> {
+    if expr.len() > MAX_LEN {
+        return Err(ExprError::new(
+            format!("expression is longer than {MAX_LEN} bytes"),
+            0,
+        ));
+    }
     let tokens = lexer::lex(expr)?;
     let ast = parser::parse(&tokens)?;
     eval::Evaluator { ctx, funcs }.eval(&ast)

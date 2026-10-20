@@ -320,3 +320,114 @@ fn truthiness() {
         assert_eq!(truthy(&v), want, "{v}");
     }
 }
+
+/// Runs `f` on a thread with a stack of `kb` KB, standing in for the
+/// small wasm stack of a Worker.
+fn small_stack<T: Send + 'static>(kb: usize, f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(kb * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+fn nested(open: &str, n: usize, close: &str) -> String {
+    format!("{}1{}", open.repeat(n), close.repeat(n))
+}
+
+#[test]
+fn nesting_is_capped_at_64() {
+    // 64 levels take under 64 KB of stack in a release build. Debug
+    // frames are several times larger.
+    let kb = if cfg!(debug_assertions) { 512 } else { 64 };
+    let (ok, deep) = small_stack(kb, || {
+        (
+            [
+                evaluate(&nested("(", 64, ")"), &json!({}), &NoFiles),
+                evaluate(&nested("!", 64, ""), &json!({}), &NoFiles),
+                evaluate(&nested("format('{0}', ", 64, ")"), &json!({}), &NoFiles),
+                evaluate(
+                    &format!("fromJSON('[1]'){}", "[0".repeat(64) + &"]".repeat(64)),
+                    &json!({}),
+                    &NoFiles,
+                ),
+            ],
+            [
+                evaluate(&nested("(", 65, ")"), &json!({}), &NoFiles),
+                evaluate(&nested("!", 65, ""), &json!({}), &NoFiles),
+                evaluate(&nested("format('{0}', ", 65, ")"), &json!({}), &NoFiles),
+            ],
+        )
+    });
+    assert_eq!(ok[0].as_ref().unwrap(), &json!(1));
+    assert_eq!(ok[1].as_ref().unwrap(), &json!(true));
+    assert_eq!(ok[2].as_ref().unwrap(), &json!("1"));
+    assert_eq!(ok[3].as_ref().unwrap(), &json!(null));
+    for (e, offset) in deep.iter().zip([64, 64, 64 * 14 + 6]) {
+        let e = e.as_ref().unwrap_err();
+        assert!(e.message.contains("64"), "{}", e.message);
+        assert_eq!(e.offset, offset, "{}", e.message);
+    }
+}
+
+#[test]
+fn length_is_capped_at_4096_bytes() {
+    let long = format!("'{}'", "a".repeat(4094));
+    assert_eq!(long.len(), 4096);
+    assert_eq!(eval(&long), json!("a".repeat(4094)));
+    let too_long = format!("'{}'", "a".repeat(4095));
+    let e = err(&too_long);
+    assert!(e.message.contains("4096"), "{}", e.message);
+    assert_eq!(e.offset, 0);
+    let e = interpolate(&format!("x ${{{{{too_long}}}}}"), &json!({}), &NoFiles).unwrap_err();
+    assert!(e.message.contains("4096"), "{}", e.message);
+    assert_eq!(e.offset, 5);
+}
+
+#[test]
+fn long_chains_fit_a_small_stack() {
+    let results = small_stack(256, || {
+        let chain = |unit: &str, last: &str| {
+            let n = (4096 - last.len()) / unit.len();
+            let e = format!("{}{last}", unit.repeat(n));
+            assert!(e.len() > 4096 - unit.len() && e.len() <= 4096);
+            evaluate(&e, &json!({"matrix": {}}), &NoFiles)
+        };
+        [
+            chain("null || ", "1"),
+            chain("1 && ", "'x'"),
+            chain("1 == ", "1"),
+            chain("1 < ", "2"),
+            evaluate(
+                &format!("matrix{}", "[0]".repeat(4090 / 3)),
+                &json!({"matrix": {}}),
+                &NoFiles,
+            ),
+            evaluate(
+                &format!("matrix{}", ".a".repeat(4090 / 2)),
+                &json!({"matrix": {}}),
+                &NoFiles,
+            ),
+        ]
+    });
+    let want = [
+        json!(1),
+        json!("x"),
+        json!(true),
+        json!(true),
+        json!(null),
+        json!(null),
+    ];
+    for (got, want) in results.iter().zip(want) {
+        assert_eq!(got.as_ref().unwrap(), &want);
+    }
+}
+
+#[test]
+fn many_nots_fail_cleanly() {
+    let e = small_stack(256, || {
+        evaluate(&nested("!", 10_000, ""), &json!({}), &NoFiles)
+    });
+    assert!(e.is_err());
+}

@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 
 use serde_json::{Number, Value};
 
-use super::parser::{Expr, Op};
+use super::parser::{Expr, Op, Step};
 use super::{CONTEXTS, ExprError, Functions, JobStatus};
 
 /// Whether `v` counts as true in a condition: everything but `null`,
@@ -114,21 +114,19 @@ fn loose_eq(a: &Value, b: &Value) -> bool {
 }
 
 fn compare(op: Op, a: &Value, b: &Value) -> bool {
-    let ordering = match (op, a, b) {
-        (Op::Eq, ..) => return loose_eq(a, b),
-        (Op::Ne, ..) => return !loose_eq(a, b),
-        (_, Value::String(x), Value::String(y)) => Some(fold(x).cmp(&fold(y))),
+    // Strings order ignoring case; anything else orders as numbers, and
+    // NaN orders against nothing.
+    let ordering = || match (a, b) {
+        (Value::String(x), Value::String(y)) => Some(fold(x).cmp(&fold(y))),
         _ => to_number(a).partial_cmp(&to_number(b)),
     };
-    let Some(ordering) = ordering else {
-        return false;
-    };
     match op {
-        Op::Lt => ordering == Ordering::Less,
-        Op::Le => ordering != Ordering::Greater,
-        Op::Gt => ordering == Ordering::Greater,
-        Op::Ge => ordering != Ordering::Less,
-        Op::Eq | Op::Ne => unreachable!("handled above"),
+        Op::Eq => loose_eq(a, b),
+        Op::Ne => !loose_eq(a, b),
+        Op::Lt => ordering() == Some(Ordering::Less),
+        Op::Le => matches!(ordering(), Some(Ordering::Less | Ordering::Equal)),
+        Op::Gt => ordering() == Some(Ordering::Greater),
+        Op::Ge => matches!(ordering(), Some(Ordering::Greater | Ordering::Equal)),
     }
 }
 
@@ -241,17 +239,20 @@ impl Evaluator<'_> {
                 Some(_) => Ok(()),
                 None => Err(ExprError::new(format!("unknown context '{name}'"), *offset)),
             },
-            Expr::Property { target, .. } | Expr::Filter(target) | Expr::Not(target) => {
-                self.check(target)
+            Expr::Not(inner) => self.check(inner),
+            Expr::Access { base, path } => {
+                self.check(base)?;
+                path.iter().try_for_each(|step| match step {
+                    Step::Index(index) => self.check(index),
+                    Step::Property(_) | Step::Filter => Ok(()),
+                })
             }
-            Expr::Index { target, index } => {
-                self.check(target)?;
-                self.check(index)
+            Expr::Call { args, .. } | Expr::And(args) | Expr::Or(args) => {
+                args.iter().try_for_each(|a| self.check(a))
             }
-            Expr::Call { args, .. } => args.iter().try_for_each(|a| self.check(a)),
-            Expr::And(l, r) | Expr::Or(l, r) | Expr::Compare(_, l, r) => {
-                self.check(l)?;
-                self.check(r)
+            Expr::Compare { first, rest } => {
+                self.check(first)?;
+                rest.iter().try_for_each(|(_, e)| self.check(e))
             }
         }
     }
@@ -264,24 +265,29 @@ impl Evaluator<'_> {
         let v = match expr {
             Expr::Literal(v) => v.clone(),
             Expr::Context { name, .. } => self.context(name).unwrap_or(Value::Null),
-            Expr::Property { target, name } => {
-                return Ok(self.walk(target)?.deref(&Value::String(name.clone())));
+            Expr::Access { base, path } => {
+                let mut val = self.walk(base)?;
+                for step in path {
+                    val = match step {
+                        Step::Property(name) => val.deref(&Value::String(name.clone())),
+                        Step::Index(index) => val.deref(&self.value(index)?),
+                        Step::Filter => val.filter(),
+                    };
+                }
+                return Ok(val);
             }
-            Expr::Index { target, index } => {
-                let target = self.walk(target)?;
-                return Ok(target.deref(&self.value(index)?));
-            }
-            Expr::Filter(target) => return Ok(self.walk(target)?.filter()),
             Expr::Not(inner) => Value::Bool(!truthy(&self.value(inner)?)),
-            Expr::And(l, r) => {
-                let l = self.value(l)?;
-                if truthy(&l) { self.value(r)? } else { l }
+            // `&&` returns the first falsy operand, `||` the first truthy
+            // one, and each returns its last operand when none qualifies.
+            Expr::And(operands) => self.first(operands, false)?,
+            Expr::Or(operands) => self.first(operands, true)?,
+            Expr::Compare { first, rest } => {
+                let mut acc = self.value(first)?;
+                for (op, e) in rest {
+                    acc = Value::Bool(compare(*op, &acc, &self.value(e)?));
+                }
+                acc
             }
-            Expr::Or(l, r) => {
-                let l = self.value(l)?;
-                if truthy(&l) { l } else { self.value(r)? }
-            }
-            Expr::Compare(op, l, r) => Value::Bool(compare(*op, &self.value(l)?, &self.value(r)?)),
             Expr::Call { name, args, offset } => {
                 let args = args
                     .iter()
@@ -291,6 +297,19 @@ impl Evaluator<'_> {
             }
         };
         Ok(Val::One(v))
+    }
+
+    /// Evaluates `operands` in order and returns the first whose
+    /// truthiness is `stop_when`, or the last one.
+    fn first(&self, operands: &[Expr], stop_when: bool) -> Result<Value, ExprError> {
+        let mut last = Value::Null;
+        for e in operands {
+            last = self.value(e)?;
+            if truthy(&last) == stop_when {
+                break;
+            }
+        }
+        Ok(last)
     }
 
     fn call(&self, name: &str, args: &[Value], offset: usize) -> Result<Value, ExprError> {
