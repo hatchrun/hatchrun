@@ -102,7 +102,7 @@ commands:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - cache: { key: deps-${{ hashFiles('Cargo.lock') }}, paths: [target] }
+      - cache: { key: "deps-${{ hashFiles('Cargo.lock') }}", paths: [target] }
 
 jobs:
   test:
