@@ -8,6 +8,7 @@
 //! in a Cloudflare Worker, the runner agent and the CLI.
 
 pub mod config;
+pub mod convert;
 pub mod diagnostic;
 pub mod expr;
 pub mod plan;
@@ -18,6 +19,7 @@ pub use config::{
     CacheStep, Command, Config, Executor, Job, Parameter, ParameterKind, RunStep, Step, UsesStep,
     Workflow, WorkflowJob, WorkspaceStep, parse,
 };
+pub use convert::{Conversion, convert, to_yaml};
 pub use diagnostic::Diagnostic;
 pub use expr::{ExprError, Functions, JobStatus, evaluate, interpolate, truthy};
 pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, validate};
