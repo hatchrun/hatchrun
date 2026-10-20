@@ -29,11 +29,22 @@ const MAX_PARALLELISM: u32 = 64;
 /// The most entries one matrix can expand to.
 const MAX_MATRIX: usize = 256;
 
-/// The work one `compile` or `validate` call may do. Every step and
-/// command call visited costs one, and so does every step written into
-/// the plan, counted once per matrix entry and parallel node. It bounds
-/// both time and memory, whatever the config.
+/// The work one `compile` or `validate` call may do, in units. Every
+/// step and command call visited costs one, and so does every step
+/// written into the plan, counted once per matrix entry and parallel
+/// node. With `BYTE_BUDGET` it bounds both time and memory, whatever the
+/// config.
 const BUDGET: usize = 50_000;
+
+/// The bytes one `compile` or `validate` call may produce. Every
+/// substituted string is charged its length as it is made, including
+/// values passed into nested commands, and every planned job is charged
+/// the bytes of its steps, `env`, `outputs`, `if`, id and matrix once per
+/// copy. Charges are made before the memory is allocated.
+const BYTE_BUDGET: usize = 8 << 20;
+
+/// The longest string one substitution can make.
+const MAX_VALUE: usize = 64 << 10;
 
 /// The most jobs one plan can hold, as GitHub caps a run's matrix.
 const MAX_JOBS: usize = 256;
@@ -266,22 +277,7 @@ fn compile_workflow(
     if budget.spent {
         return None;
     }
-    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-    for (i, jobs) in expansions.iter().enumerate() {
-        for job in jobs {
-            match seen.get(job.id.as_str()) {
-                // Two entries with one id are reported above.
-                Some(&other) if other != i && ids[other] == ids[i] => {}
-                Some(&other) => errors.push(Diagnostic::new(format!(
-                    "workflow `{name}` has two jobs with the id `{}`, from `{}` and `{}`",
-                    job.id, ids[other], ids[i]
-                ))),
-                None => {
-                    seen.insert(&job.id, i);
-                }
-            }
-        }
-    }
+    id_collisions(name, &ids, &expansions, errors);
 
     let order = topological(&deps);
     if order.len() < ids.len() {
@@ -310,6 +306,17 @@ fn compile_workflow(
         if !kept[i] {
             continue;
         }
+        let requires_bytes: usize = deps[i]
+            .iter()
+            .flat_map(|&d| expanded_ids[d].iter().map(String::len))
+            .sum();
+        if !budget.charge_bytes(
+            requires_bytes.saturating_mul(expansions[i].len()),
+            name,
+            errors,
+        ) {
+            return None;
+        }
         let requires: Vec<String> = deps[i]
             .iter()
             .flat_map(|&d| expanded_ids[d].iter().cloned())
@@ -323,6 +330,32 @@ fn compile_workflow(
         workflow: name.to_owned(),
         jobs,
     })
+}
+
+/// Reports planned jobs of different entries, or of one entry, that
+/// ended up with the same id.
+fn id_collisions(
+    name: &str,
+    ids: &[String],
+    expansions: &[Vec<PlannedJob>],
+    errors: &mut Vec<Diagnostic>,
+) {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, jobs) in expansions.iter().enumerate() {
+        for job in jobs {
+            match seen.get(job.id.as_str()) {
+                // Two entries with one id are reported above.
+                Some(&other) if other != i && ids[other] == ids[i] => {}
+                Some(&other) => errors.push(Diagnostic::new(format!(
+                    "workflow `{name}` has two jobs with the id `{}`, from `{}` and `{}`",
+                    job.id, ids[other], ids[i]
+                ))),
+                None => {
+                    seen.insert(&job.id, i);
+                }
+            }
+        }
+    }
 }
 
 /// Reports a trigger that has both an include and an ignore filter of
@@ -501,10 +534,14 @@ fn expand_entry(
         let Some(base) = expand_job(config, job, &owner, &values, &mut walk, errors) else {
             break;
         };
-        // Pay for the copies before making them.
+        // Pay for the copies before making them: an id is at most the
+        // entry id, the matrix values and a node suffix.
+        let matrix_bytes: usize = combo.iter().map(|(k, v)| k.len() + 2 * value_len(v)).sum();
+        let copy_bytes = job_bytes(&base) + 2 * id.len() + matrix_bytes + 32;
         if !walk
             .budget
             .charge(base.steps.len() * copies, workflow, errors)
+            || !walk.bytes(copy_bytes.saturating_mul(copies), errors)
         {
             break;
         }
@@ -708,7 +745,7 @@ fn expand_job(
     if walk.budget.spent {
         return None;
     }
-    let mut sub = |text: &str| substitute(text, values, owner, errors);
+    let mut sub = |text: &str| substitute(text, values, owner, walk, errors);
     let env = job.env.iter().map(|(k, v)| (k.clone(), sub(v))).collect();
     let if_ = job.if_.as_deref().map(&mut sub);
     let outputs = job
@@ -716,7 +753,7 @@ fn expand_job(
         .iter()
         .map(|(k, v)| (k.clone(), sub(v)))
         .collect();
-    if errors.len() > before {
+    if errors.len() > before || walk.budget.spent {
         return None;
     }
     Some(PlannedJob {
@@ -738,6 +775,8 @@ fn expand_job(
 struct Budget {
     /// Units still allowed.
     left: usize,
+    /// Bytes still allowed.
+    bytes_left: usize,
     /// The budget ran out and was reported; all work stops.
     spent: bool,
 }
@@ -746,8 +785,27 @@ impl Budget {
     fn new() -> Self {
         Self {
             left: BUDGET,
+            bytes_left: BYTE_BUDGET,
             spent: false,
         }
+    }
+
+    /// Takes `bytes`. False once the budget is spent, after reporting it
+    /// once.
+    fn charge_bytes(&mut self, bytes: usize, workflow: &str, errors: &mut Vec<Diagnostic>) -> bool {
+        if self.spent {
+            return false;
+        }
+        if bytes > self.bytes_left {
+            self.spent = true;
+            self.bytes_left = 0;
+            errors.push(Diagnostic::new(format!(
+                "workflow `{workflow}` expands to more than {BYTE_BUDGET} bytes of steps and values, counting each matrix entry and parallel node; the limit is {BYTE_BUDGET} bytes"
+            )));
+            return false;
+        }
+        self.bytes_left -= bytes;
+        true
     }
 
     /// Takes `units`. False once the budget is spent, after reporting it
@@ -784,6 +842,11 @@ impl Walk<'_> {
     fn visit(&mut self, errors: &mut Vec<Diagnostic>) -> bool {
         self.budget.charge(1, self.workflow, errors)
     }
+
+    /// Counts bytes about to be allocated. False once the budget is spent.
+    fn bytes(&mut self, bytes: usize, errors: &mut Vec<Diagnostic>) -> bool {
+        self.budget.charge_bytes(bytes, self.workflow, errors)
+    }
 }
 
 /// Expands commands depth first, within the walk's budget.
@@ -801,7 +864,7 @@ fn expand_steps(
             return;
         }
         let Step::Command { name, with } = step else {
-            out.push(plan_step(step, values, scope, errors));
+            out.push(plan_step(step, values, scope, walk, errors));
             continue;
         };
         let Some(command) = config.commands.get(name) else {
@@ -830,8 +893,11 @@ fn expand_steps(
         }
         let args: BTreeMap<String, Value> = with
             .iter()
-            .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, errors)))
+            .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, walk, errors)))
             .collect();
+        if walk.budget.spent {
+            return;
+        }
         let inner = format!("command `{name}`");
         let Some(bound) = bind(&command.parameters, &args, &inner, errors) else {
             continue;
@@ -910,9 +976,10 @@ fn plan_step(
     step: &Step,
     values: &BTreeMap<String, Value>,
     scope: &str,
+    walk: &mut Walk<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> PlannedStep {
-    let mut sub = |text: &str| substitute(text, values, scope, errors);
+    let mut sub = |text: &str| substitute(text, values, scope, walk, errors);
     match step {
         Step::Run(run) => {
             let planned = RunStep {
@@ -941,7 +1008,7 @@ fn plan_step(
             let with = uses
                 .with
                 .iter()
-                .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, errors)))
+                .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, walk, errors)))
                 .collect();
             if planned.uses.starts_with("docker://") {
                 errors.push(Diagnostic::new(format!(
@@ -976,24 +1043,28 @@ fn substitute_value(
     value: &Value,
     values: &BTreeMap<String, Value>,
     scope: &str,
+    walk: &mut Walk<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Value {
     match value {
         Value::String(text) => {
             if let Some(found) = sole_parameter(text).and_then(|name| values.get(name)) {
+                if !walk.bytes(value_len(found), errors) {
+                    return Value::Null;
+                }
                 return found.clone();
             }
-            Value::String(substitute(text, values, scope, errors))
+            Value::String(substitute(text, values, scope, walk, errors))
         }
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|v| substitute_value(v, values, scope, errors))
+                .map(|v| substitute_value(v, values, scope, walk, errors))
                 .collect(),
         ),
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, errors)))
+                .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, walk, errors)))
                 .collect(),
         ),
         other => other.clone(),
@@ -1041,40 +1112,148 @@ fn parameter_name(expr: &str) -> Option<&str> {
     ident.then_some(name)
 }
 
-/// Replaces each `${{ parameters.x }}` in `text` with the value of `x`.
-/// Every other `${{ }}` is left as it is.
-fn substitute(
-    text: &str,
-    values: &BTreeMap<String, Value>,
-    scope: &str,
-    errors: &mut Vec<Diagnostic>,
-) -> String {
-    let mut out = String::with_capacity(text.len());
+/// One piece of a string being substituted.
+enum Piece<'t> {
+    /// Text kept as it is, including expressions left for run time.
+    Text(&'t str),
+    /// A `${{ parameters.x }}`: the name and the whole expression.
+    Param(&'t str, &'t str),
+}
+
+/// Splits `text` into kept text and parameter reads.
+fn pieces(text: &str) -> Vec<Piece<'_>> {
+    let mut out = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find("${{") {
         let body = &rest[start + 3..];
         let Some(end) = body.find("}}") else {
             break;
         };
-        let whole = &rest[..start + 3 + end + 2];
+        let whole_end = start + 3 + end + 2;
         match parameter_name(&body[..end]) {
             Some(name) => {
-                out.push_str(&rest[..start]);
-                if let Some(value) = values.get(name) {
-                    out.push_str(&render(value));
+                out.push(Piece::Text(&rest[..start]));
+                out.push(Piece::Param(name, &rest[start..whole_end]));
+            }
+            None => out.push(Piece::Text(&rest[..whole_end])),
+        }
+        rest = &rest[whole_end..];
+    }
+    out.push(Piece::Text(rest));
+    out
+}
+
+/// Replaces each `${{ parameters.x }}` in `text` with the value of `x`.
+/// Every other `${{ }}` is left as it is. The result's length is worked
+/// out and charged to the budget before it is built; a result over
+/// `MAX_VALUE` is an error. Returns an empty string on any error.
+fn substitute(
+    text: &str,
+    values: &BTreeMap<String, Value>,
+    scope: &str,
+    walk: &mut Walk<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> String {
+    if !text.contains("${{") {
+        return if walk.bytes(text.len(), errors) {
+            text.to_owned()
+        } else {
+            String::new()
+        };
+    }
+    let pieces = pieces(text);
+    let mut len: usize = 0;
+    let mut first = None;
+    for piece in &pieces {
+        len = len.saturating_add(match piece {
+            Piece::Text(t) => t.len(),
+            Piece::Param(name, whole) => {
+                if let Some(value) = values.get(*name) {
+                    first.get_or_insert(*name);
+                    value_len(value)
                 } else {
                     errors.push(Diagnostic::new(format!(
                         "{scope} reads `${{{{ parameters.{name} }}}}` but declares no parameter `{name}`"
                     )));
-                    out.push_str(&whole[start..]);
+                    whole.len()
                 }
             }
-            None => out.push_str(whole),
-        }
-        rest = &body[end + 2..];
+        });
     }
-    out.push_str(rest);
+    if let Some(name) = first.filter(|_| len > MAX_VALUE) {
+        errors.push(Diagnostic::new(format!(
+            "{scope} substitutes `${{{{ parameters.{name} }}}}` into a value of {len} bytes; the limit is {MAX_VALUE}"
+        )));
+        return String::new();
+    }
+    if !walk.bytes(len, errors) {
+        return String::new();
+    }
+    let mut out = String::with_capacity(len);
+    for piece in pieces {
+        match piece {
+            Piece::Text(t) => out.push_str(t),
+            Piece::Param(name, whole) => match values.get(name) {
+                Some(Value::String(v)) => out.push_str(v),
+                Some(other) => out.push_str(&render(other)),
+                None => out.push_str(whole),
+            },
+        }
+    }
     out
+}
+
+/// The length of a value rendered as text.
+fn value_len(value: &Value) -> usize {
+    match value {
+        Value::String(s) => s.len(),
+        other => render(other).len(),
+    }
+}
+
+/// The bytes of a step's strings.
+fn step_bytes(step: &PlannedStep) -> usize {
+    let opt = |o: &Option<String>| o.as_ref().map_or(0, String::len);
+    let map =
+        |m: &BTreeMap<String, String>| m.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+    let list = |l: &[String]| l.iter().map(String::len).sum::<usize>();
+    match step {
+        PlannedStep::Run(r) => {
+            opt(&r.name)
+                + opt(&r.id)
+                + r.run.len()
+                + opt(&r.shell)
+                + opt(&r.working_directory)
+                + map(&r.env)
+                + opt(&r.if_)
+        }
+        PlannedStep::Uses(u) => {
+            opt(&u.name)
+                + opt(&u.id)
+                + u.uses.len()
+                + u.with
+                    .iter()
+                    .map(|(k, v)| k.len() + value_len(v))
+                    .sum::<usize>()
+                + map(&u.env)
+                + opt(&u.if_)
+        }
+        PlannedStep::Cache(c) => c.key.len() + list(&c.restore_keys) + list(&c.paths),
+        PlannedStep::Workspace(WorkspaceStep::Persist { root, paths }) => root.len() + list(paths),
+        PlannedStep::Workspace(WorkspaceStep::Attach { at }) => at.len(),
+        PlannedStep::TestResults { path } => path.len(),
+    }
+}
+
+/// The bytes a copy of a planned job holds in steps, `env`, `outputs` and
+/// `if`.
+fn job_bytes(job: &PlannedJob) -> usize {
+    let map =
+        |m: &BTreeMap<String, String>| m.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+    job.steps.iter().map(step_bytes).sum::<usize>()
+        + map(&job.env)
+        + map(&job.outputs)
+        + job.if_.as_ref().map_or(0, String::len)
 }
 
 /// A parameter or matrix value as text: strings as they are, whole

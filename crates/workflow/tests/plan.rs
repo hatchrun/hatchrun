@@ -686,3 +686,53 @@ fn spec_example_fits_the_budget() {
     assert!(compile(&config, "ci", "refs/heads/main").is_ok());
     assert_eq!(validate(&config), []);
 }
+
+/// Each command passes `${{ parameters.x }}${{ parameters.x }}` to the
+/// next, doubling the value at every level.
+fn doubling(levels: usize) -> String {
+    use std::fmt::Write as _;
+    let mut yaml = String::from("commands:\n");
+    for i in 0..levels {
+        writeln!(
+            yaml,
+            "  c{i}: {{ parameters: {{ x: {{ type: string }} }}, steps: [{{ c{}: {{ x: '${{{{ parameters.x }}}}${{{{ parameters.x }}}}' }} }}] }}",
+            i + 1
+        )
+        .unwrap();
+    }
+    writeln!(
+        yaml,
+        "  c{levels}: {{ parameters: {{ x: {{ type: string }} }}, steps: [{{ run: '${{{{ parameters.x }}}}' }}] }}"
+    )
+    .unwrap();
+    yaml += "jobs: { t: { runs-on: ubuntu-latest, steps: [{ c0: { x: ab } }] } }\n";
+    yaml += "workflows: { ci: { on: { push: {} }, jobs: [t] } }\n";
+    yaml
+}
+
+/// One `run` of `size` bytes, called 190 times, on a 16x16 matrix.
+fn big_step(size: usize) -> String {
+    let m: Vec<String> = (0..16).map(|i| format!("v{i}")).collect();
+    let m = m.join(", ");
+    format!(
+        "commands:\n  b: {{ steps: [{{ run: {} }}] }}\n  f: {{ steps: [{}] }}\njobs: {{ t: {{ runs-on: ubuntu-latest, steps: [f] }} }}\nworkflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ matrix: {{ a: [{m}], b: [{m}] }} }} }}] }} }}\n",
+        "x".repeat(size),
+        vec!["b"; 190].join(", ")
+    )
+}
+
+#[test]
+fn substituted_values_are_capped() {
+    let err = timed_compile(&doubling(26));
+    assert!(err.iter().any(|e| e.message.contains("65536")), "{err:?}");
+    // A few doublings stay well under the cap.
+    let plan = plan(&doubling(4));
+    assert_eq!(runs(&plan.jobs[0]), ["ab".repeat(16)]);
+}
+
+#[test]
+fn the_budget_counts_bytes() {
+    let err = timed_compile(&big_step(10_240));
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert!(err[0].message.contains("workflow `ci`") && err[0].message.contains("8388608"));
+}
