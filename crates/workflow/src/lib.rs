@@ -12,6 +12,7 @@ pub mod convert;
 pub mod diagnostic;
 pub mod expr;
 pub mod plan;
+pub mod split;
 pub mod templates;
 pub mod trigger;
 
@@ -23,6 +24,7 @@ pub use convert::{Conversion, convert, to_yaml};
 pub use diagnostic::Diagnostic;
 pub use expr::{ExprError, Functions, JobStatus, evaluate, interpolate, truthy};
 pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, validate};
+pub use split::split;
 pub use templates::{Arch, TEMPLATES, Template, template, template_labels};
 pub use trigger::{
     Dispatch, Event, Filter, PullRequestTrigger, PushTrigger, Schedule, Triggers, triggered,
