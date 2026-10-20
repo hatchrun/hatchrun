@@ -92,9 +92,10 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq musl-tools
-          HATCHRUN_VERSION="$VERSION" cargo build --locked --release --target "$TARGET" -p hatchrun-agent -p hatchrun-scaler
+          HATCHRUN_VERSION="$VERSION" cargo build --locked --release --target "$TARGET" -p hatchrun-agent -p hatchrun-scaler -p hatchrun-cli
           "target/$TARGET/release/hatchrun-agent" --version | grep -qx "hatchrun-agent $VERSION"
           "target/$TARGET/release/hatchrun-scaler" --version | grep -qx "hatchrun-scaler $VERSION"
+          "target/$TARGET/release/hatchrun" --version | grep -qx "hatchrun $VERSION"
 
       - name: Install nfpm
         env:
@@ -120,6 +121,10 @@ jobs:
           cp "target/$TARGET/release/hatchrun-scaler" LICENSE NOTICE README.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           cp "target/$TARGET/release/hatchrun-scaler" "scaler/$ARCH/"
+          name="hatchrun-${VERSION}-linux-${ARCH}"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/hatchrun" LICENSE NOTICE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

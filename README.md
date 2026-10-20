@@ -12,6 +12,8 @@ This repository holds the two Rust programs:
 - **agent**: baked into the runner image. It starts early in boot, reads
   the instance's just-in-time runner config, runs exactly one job as the
   `runner` user and powers the instance off.
+- **hatchrun**: command line tool for workflow files, shipped on the
+  runner image.
 
 ## Agent
 
@@ -67,6 +69,21 @@ sudo apt install ./hatchrun-agent_0.1.0_amd64.deb
 The package installs `/usr/bin/hatchrun-agent` and the systemd unit but
 leaves the unit disabled, because the agent powers the machine off when
 it exits. Runner images enable it with `systemctl enable hatchrun-agent`.
+
+## hatchrun
+
+`hatchrun` is a command line tool for workflow files and test runs. It has
+three commands:
+
+- `hatchrun validate` checks a workflow file and reports every error.
+- `hatchrun convert` converts GitHub Actions workflow files into a
+  hatchrun config.
+- `hatchrun tests split` prints the tests this node should run, so a
+  test run can be spread across nodes.
+
+Each release has a static tarball for `amd64` and `arm64`, named
+`hatchrun-<version>-linux-<arch>.tar.gz`, with checksums and build
+provenance like the agent.
 
 ## Scaler
 
