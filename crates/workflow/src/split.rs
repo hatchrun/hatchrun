@@ -16,6 +16,10 @@ use std::collections::BTreeMap;
 /// on the node with the smallest total so far (ties to the lowest node).
 /// The result keeps the input order. Duplicate items are separate items.
 /// `total == 0` or `index >= total` gives an empty list.
+///
+/// Every item lands on one of the first `items.len()` nodes, so the work
+/// is done for at most that many nodes (at least one) whatever `total`
+/// is, and a node past them gets nothing.
 #[must_use]
 pub fn split<'a>(
     items: &[&'a str],
@@ -23,7 +27,8 @@ pub fn split<'a>(
     index: u32,
     total: u32,
 ) -> Vec<&'a str> {
-    if total == 0 || index >= total {
+    let nodes = (total as usize).min(items.len().max(1));
+    if total == 0 || index as usize >= nodes {
         return Vec::new();
     }
     let known: Vec<Option<f64>> = items
@@ -46,7 +51,7 @@ pub fn split<'a>(
             .then_with(|| a.cmp(&b))
     });
 
-    let mut sums = vec![0.0_f64; total as usize];
+    let mut sums = vec![0.0_f64; nodes];
     let mut mine = vec![false; items.len()];
     for i in order {
         let mut best = 0;
@@ -130,5 +135,21 @@ mod tests {
         let items = ["a", "b", "c", "d"];
         let lens: Vec<usize> = (0..2).map(|i| split(&items, &bad, i, 2).len()).collect();
         assert_eq!(lens, [2, 2]);
+    }
+
+    #[test]
+    fn a_huge_total_costs_no_memory() {
+        let items = ["a", "b", "c"];
+        let none = BTreeMap::new();
+        // `vec![0.0; u32::MAX]` would be 32 GiB.
+        assert_eq!(split(&items, &none, 0, u32::MAX), ["a"]);
+        assert_eq!(split(&items, &none, 2, u32::MAX), ["c"]);
+        assert_eq!(split(&items, &none, 3, u32::MAX).len(), 0);
+        assert_eq!(split(&items, &none, u32::MAX - 1, u32::MAX).len(), 0);
+        assert_eq!(split(&[], &none, 0, u32::MAX).len(), 0);
+        // Clamping keeps the assignment a larger total would give.
+        for i in 0..3 {
+            assert_eq!(split(&items, &none, i, 3), split(&items, &none, i, 1000));
+        }
     }
 }
