@@ -156,3 +156,20 @@ workflows:
     );
     assert_eq!(config.jobs["t"].env["A"], "yes");
 }
+
+#[test]
+fn library_messages_read_plainly() {
+    let errs = parse("jobs: {}\njobs: {}\n").unwrap_err();
+    assert_eq!(errs[0].message, "duplicate key `jobs`");
+    assert_eq!(errs[0].line, Some(2));
+
+    let big = format!(
+        "commands: {{ c: {{ steps: [{}] }} }}\n",
+        vec!["a"; 250_001].join(",")
+    );
+    let errs = parse(&big).unwrap_err();
+    assert_eq!(
+        errs[0].message,
+        "the file is too large or nests too deeply to read"
+    );
+}

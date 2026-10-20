@@ -7,7 +7,8 @@
 //! Each workflow file becomes one entry of `workflows:`, keyed by the file
 //! stem, and each of its jobs becomes `jobs.<stem>-<job>`. Keys hatchrun has
 //! no place for are dropped with a warning. Docker steps and runner labels
-//! that name no template are errors.
+//! that name no template are errors; the job is dropped and the rest of
+//! the files still convert.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -21,16 +22,20 @@ use crate::config::{
     Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow, WorkflowJob,
 };
 use crate::diagnostic::Diagnostic;
+use crate::expr;
 use crate::templates::{template, template_labels};
 use crate::trigger::{Dispatch, PullRequestTrigger, PushTrigger, Schedule, Triggers};
 
 /// The result of a conversion: the config and what was dropped on the way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversion {
-    /// The converted config.
+    /// The converted config, without the jobs and files that had errors.
     pub config: Config,
     /// Keys that were dropped or changed, naming the file and job.
     pub warnings: Vec<Diagnostic>,
+    /// Problems that dropped a job, an event or a whole file. The config
+    /// is still usable, but it does not do everything the files did.
+    pub errors: Vec<Diagnostic>,
 }
 
 /// Converts GitHub workflow files into one config.
@@ -38,12 +43,16 @@ pub struct Conversion {
 /// Each pair is a file name and its contents. The workflow is keyed by the
 /// file stem, so `.github/workflows/ci.yml` becomes workflow `ci`.
 ///
+/// A job with a problem (a `runs-on` that names no runner template, a
+/// `docker://` step, a `needs` that names no job, a job key another file
+/// already uses) is dropped, like a reusable workflow call: jobs that
+/// need it lose that dependency with a warning. A file that does not
+/// parse, has no name before its extension or repeats another file's
+/// name is skipped. Each problem is in [`Conversion::errors`].
+///
 /// # Errors
 ///
-/// Returns every problem that stops the conversion: YAML that does not
-/// parse, a `runs-on` that names no runner template, a `docker://` step,
-/// a `needs` that names no job, a file with no name before its extension,
-/// or two files or jobs that end up with one name.
+/// Returns the problems when there were some and nothing converted.
 pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>> {
     let mut cx = Cx::default();
     let mut stems: BTreeMap<String, &str> = BTreeMap::new();
@@ -66,19 +75,19 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
             Ok(gh) => cx.workflow(file, stem, gh),
             Err(err) => {
                 let mut diag = Diagnostic::from(&err);
-                diag.message = format!("`{file}`: {}", diag.message);
+                diag.file = Some(file.clone());
                 cx.errors.push(diag);
             }
         }
     }
-    if cx.errors.is_empty() {
-        Ok(Conversion {
-            config: cx.config,
-            warnings: cx.warnings,
-        })
-    } else {
-        Err(cx.errors)
+    if !cx.errors.is_empty() && cx.config.workflows.is_empty() {
+        return Err(cx.errors);
     }
+    Ok(Conversion {
+        config: cx.config,
+        warnings: cx.warnings,
+        errors: cx.errors,
+    })
 }
 
 /// Writes a config as YAML that [`parse`](crate::parse) reads back.
@@ -144,8 +153,16 @@ const STEP_KEYS: &[&str] = &[
     "timeout-minutes",
 ];
 
-/// Labels GitHub retires that become `ubuntu-latest`.
-const OLD_UBUNTU: &[&str] = &["ubuntu-24.04", "ubuntu-22.04"];
+/// Labels GitHub retires and the template each becomes.
+const OLD_UBUNTU: &[(&str, &str)] = &[
+    ("ubuntu-24.04", "ubuntu-latest"),
+    ("ubuntu-22.04", "ubuntu-latest"),
+    ("ubuntu-24.04-arm", "ubuntu-26.04-arm"),
+    ("ubuntu-22.04-arm", "ubuntu-26.04-arm"),
+];
+
+/// GitHub contexts hatchrun does not provide.
+const UNSUPPORTED_CONTEXTS: &[&str] = &["strategy", "jobs"];
 
 /// The events hatchrun can start a workflow on.
 const EVENTS: &str = "push, pull_request, schedule and workflow_dispatch";
@@ -322,18 +339,20 @@ impl Cx {
         let shared_env = self.env(&format!("`{file}`"), "env", gh.env.as_ref());
 
         let ids: BTreeSet<String> = gh.jobs.0.iter().map(|(id, _)| id.clone()).collect();
-        let mut dropped = BTreeSet::new();
+        // Jobs left out, with why.
+        let mut dropped: BTreeMap<String, &str> = BTreeMap::new();
         let mut entries = Vec::new();
         for (id, job) in gh.jobs.0 {
             let at = format!("`{file}` job `{id}`");
             let Some(job) = self.gh_job(&at, &job) else {
+                dropped.insert(id, FAILED);
                 continue;
             };
             if job.uses.is_some() {
                 self.warn(format!(
                     "{at} calls a reusable workflow, which is not supported; the job was dropped"
                 ));
-                dropped.insert(id);
+                dropped.insert(id, "with that reusable workflow job");
                 continue;
             }
             let key = format!("{stem}-{id}");
@@ -341,9 +360,11 @@ impl Cx {
                 self.error(format!(
                     "{at} becomes job `{key}`, which another workflow already uses; rename one of them"
                 ));
+                dropped.insert(id, FAILED);
                 continue;
             }
             let Some((mut converted, entry)) = self.job(&at, &id, &key, &ids, job) else {
+                dropped.insert(id, FAILED);
                 continue;
             };
             for (name, value) in &shared_env {
@@ -352,24 +373,33 @@ impl Cx {
                     .entry(name.clone())
                     .or_insert_with(|| value.clone());
             }
+            for context in unsupported_contexts(&converted) {
+                self.warn(format!(
+                    "{at} reads the `{context}` context, which hatchrun does not provide; validate reports each use"
+                ));
+            }
             self.config.jobs.insert(key, converted);
             entries.push(entry);
         }
         for entry in &mut entries {
             let id = entry.name.clone().unwrap_or_default();
             let mut lost = Vec::new();
-            entry.requires.retain(|r| {
-                let keep = !dropped.contains(r);
-                if !keep {
-                    lost.push(r.clone());
+            entry.requires.retain(|r| match dropped.get(r) {
+                Some(why) => {
+                    lost.push((r.clone(), *why));
+                    false
                 }
-                keep
+                None => true,
             });
-            for need in lost {
+            for (need, why) in lost {
                 self.warn(format!(
-                    "`{file}` job `{id}`: its dependency on `{need}` was dropped with that reusable workflow job"
+                    "`{file}` job `{id}`: its dependency on `{need}` was dropped {why}"
                 ));
             }
+        }
+        // A file whose every job failed converts to nothing.
+        if entries.is_empty() && dropped.values().any(|why| *why == FAILED) {
+            return;
         }
         self.config
             .workflows
@@ -612,11 +642,11 @@ impl Cx {
         };
         let templates = template_labels().join(", ");
         match label {
-            Some(old) if OLD_UBUNTU.contains(&old) => {
+            Some(old) if let Some((_, new)) = OLD_UBUNTU.iter().find(|(o, _)| *o == old) => {
                 self.warn(format!(
-                    "{at}: `runs-on: {old}` became `ubuntu-latest`, which runs Ubuntu 26.04"
+                    "{at}: `runs-on: {old}` became `{new}`, which runs Ubuntu 26.04"
                 ));
-                Some("ubuntu-latest".to_owned())
+                Some((*new).to_owned())
             }
             Some(label) if template(label).is_some() => Some(label.to_owned()),
             _ => {
@@ -820,6 +850,61 @@ fn fit_default(kind: &ParameterKind, value: &Value) -> Option<Value> {
             .filter(|s| options.contains(s))
             .map(Value::String),
     }
+}
+
+/// Why a job that had errors is missing from those that need it.
+const FAILED: &str = "because that job did not convert";
+
+/// The GitHub contexts a converted job reads that hatchrun does not
+/// provide, in [`UNSUPPORTED_CONTEXTS`] order.
+fn unsupported_contexts(job: &Job) -> Vec<&'static str> {
+    let mut texts: Vec<&str> = Vec::new();
+    let mut conds: Vec<&str> = job.if_.iter().map(String::as_str).collect();
+    texts.extend(job.env.values().map(String::as_str));
+    texts.extend(job.outputs.values().map(String::as_str));
+    for step in &job.steps {
+        match step {
+            Step::Run(run) => {
+                texts.push(&run.run);
+                texts.extend(run.name.as_deref());
+                texts.extend(run.shell.as_deref());
+                texts.extend(run.working_directory.as_deref());
+                texts.extend(run.env.values().map(String::as_str));
+                conds.extend(run.if_.as_deref());
+            }
+            Step::Uses(uses) => {
+                texts.push(&uses.uses);
+                texts.extend(uses.name.as_deref());
+                texts.extend(uses.with.values().filter_map(Value::as_str));
+                texts.extend(uses.env.values().map(String::as_str));
+                conds.extend(uses.if_.as_deref());
+            }
+            _ => {}
+        }
+    }
+    let mut read = BTreeSet::new();
+    let mut add = |expr: &str| {
+        for (name, _) in expr::contexts(expr).unwrap_or_default() {
+            read.insert(name);
+        }
+    };
+    for cond in conds {
+        if cond.contains("${{") {
+            texts.push(cond);
+        } else {
+            add(cond);
+        }
+    }
+    for text in texts {
+        for (_, inner) in expr::expressions(text).unwrap_or_default() {
+            add(inner);
+        }
+    }
+    UNSUPPORTED_CONTEXTS
+        .iter()
+        .copied()
+        .filter(|c| read.contains(*c))
+        .collect()
 }
 
 /// The reason Docker-phase keys are dropped.

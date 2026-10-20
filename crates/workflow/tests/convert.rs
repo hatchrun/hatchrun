@@ -409,19 +409,109 @@ fn several_files_become_several_workflows() {
 
 #[test]
 fn two_files_with_one_stem_are_an_error() {
-    let errs = convert(&[
+    let out = convert(&[
         ("ci.yml".into(), "on: push\njobs: {}\n".into()),
         ("ci.yaml".into(), "on: push\njobs: {}\n".into()),
     ])
-    .unwrap_err();
-    assert!(has(&errs, &["ci.yml", "ci.yaml"]), "{errs:?}");
+    .unwrap();
+    assert!(has(&out.errors, &["ci.yml", "ci.yaml"]), "{:?}", out.errors);
+    assert!(out.config.workflows.contains_key("ci"));
 }
 
 #[test]
 fn bad_yaml_names_the_file_and_line() {
     let errs = one("ci.yml", "on: push\njobs:\n  t: [\n").unwrap_err();
-    assert!(errs[0].message.contains("ci.yml"), "{errs:?}");
+    assert_eq!(errs[0].file.as_deref(), Some("ci.yml"), "{errs:?}");
     assert!(errs[0].line.is_some());
+    assert!(!errs[0].message.contains("ci.yml"), "{errs:?}");
+    assert!(errs[0].to_string().starts_with("ci.yml:3:"), "{}", errs[0]);
+}
+
+#[test]
+fn a_job_that_fails_is_dropped_and_the_rest_converts() {
+    let out = convert(&[
+        (
+            "release.yml".into(),
+            "
+on: push
+jobs:
+  build:
+    strategy: { matrix: { runner: [ubuntu-latest] } }
+    runs-on: ${{ matrix.runner }}
+    steps: [{ run: make }]
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps: [{ run: publish }]
+"
+            .into(),
+        ),
+        ("broken.yml".into(), "on: [push\n".into()),
+    ])
+    .unwrap();
+    assert!(
+        has(&out.errors, &["release.yml", "`build`", "runs-on"]),
+        "{:?}",
+        out.errors
+    );
+    assert!(
+        out.errors
+            .iter()
+            .any(|e| e.file.as_deref() == Some("broken.yml"))
+    );
+    assert!(!out.config.jobs.contains_key("release-build"));
+    let wf = &out.config.workflows["release"];
+    assert_eq!(wf.jobs.len(), 1);
+    assert_eq!(wf.jobs[0].requires, Vec::<String>::new());
+    assert!(
+        has(&out.warnings, &["`publish`", "`build`", "did not convert"]),
+        "{:?}",
+        out.warnings
+    );
+    assert!(!out.config.workflows.contains_key("broken"));
+    round_trips(&out);
+}
+
+#[test]
+fn arm_labels_become_the_26_04_arm_template() {
+    for old in ["ubuntu-24.04-arm", "ubuntu-22.04-arm"] {
+        let out = ok(&format!(
+            "on: push\njobs:\n  b:\n    runs-on: {old}\n    steps: [{{ run: make }}]\n"
+        ));
+        assert_eq!(
+            out.config.jobs["ci-b"].runs_on.as_deref(),
+            Some("ubuntu-26.04-arm")
+        );
+        assert!(has(&out.warnings, &["`b`", old, "ubuntu-26.04-arm"]));
+        round_trips(&out);
+    }
+}
+
+#[test]
+fn strategy_and_jobs_contexts_warn() {
+    let out = ok("
+on: push
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    if: strategy.fail-fast
+    steps: [{ run: \"echo ${{ jobs.x.result }}\" }]
+");
+    assert!(
+        has(&out.warnings, &["`b`", "`strategy` context"]),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        has(&out.warnings, &["`b`", "`jobs` context"]),
+        "{:?}",
+        out.warnings
+    );
+    let errs = validate(&out.config);
+    assert!(
+        errs.iter().any(|e| e.message.contains("'strategy'")),
+        "{errs:?}"
+    );
 }
 
 #[test]
