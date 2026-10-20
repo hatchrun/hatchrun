@@ -71,8 +71,8 @@ From CircleCI:
   `requires`, branch and tag filters, and approval jobs
   (`type: approval`).
 - `parallelism: N` on a job with timing-based test splitting
-  (`hatchrun tests split --by timings`, fed by earlier runs), which
-  GitHub has no equivalent for. Per-minute pricing makes parallel VMs
+  (the runner provides it through the agent, fed by earlier runs),
+  which GitHub has no equivalent for. Per-minute pricing makes parallel VMs
   cheap.
 - Built-in `cache`, `workspace` and `test-results` steps backed by our
   own storage.
@@ -110,7 +110,7 @@ jobs:
     parallelism: 4
     steps:
       - setup
-      - run: cargo nextest run $(hatchrun tests split --by timings tests/*.rs)
+      - run: cargo nextest run $(hatchrun-agent split --by timings tests/*.rs)
       - test-results: target/nextest
   deploy:
     executor: rust
@@ -235,9 +235,9 @@ and the minute reconciler. The orchestrator follows the same patterns.
 - `hatchrun` is its own binary, separate from `hatchrun-agent`, built
   from its own crate on top of the shared format crate. Owner's
   decision. Customers run it locally (`hatchrun convert`,
-  `hatchrun validate`) and jobs run it on the runner
-  (`hatchrun tests split`). Releases publish it like the other
-  binaries, and the runner image ships it on `PATH`.
+  `hatchrun validate`). Releases publish it like the other binaries.
+  Test splitting is not part of it; the runner provides that through
+  the agent.
 - act and Forgejo Actions are the reference for behaviour and their
   test workflows seed the compatibility suite.
 
