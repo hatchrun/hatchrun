@@ -20,4 +20,6 @@ pub use config::{
 pub use diagnostic::Diagnostic;
 pub use expr::{ExprError, Functions, JobStatus, evaluate, interpolate, truthy};
 pub use templates::{Arch, TEMPLATES, Template, template, template_labels};
-pub use trigger::{Dispatch, Filter, PullRequestTrigger, PushTrigger, Schedule, Triggers};
+pub use trigger::{
+    Dispatch, Event, Filter, PullRequestTrigger, PushTrigger, Schedule, Triggers, triggered,
+};
