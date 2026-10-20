@@ -29,9 +29,14 @@ const MAX_PARALLELISM: u32 = 64;
 /// The most entries one matrix can expand to.
 const MAX_MATRIX: usize = 256;
 
-/// The most steps and command calls one job can visit while expanding,
-/// so nested commands cannot make the planner do unbounded work.
-const MAX_VISITS: usize = 10_000;
+/// The work one `compile` or `validate` call may do. Every step and
+/// command call visited costs one, and so does every step written into
+/// the plan, counted once per matrix entry and parallel node. It bounds
+/// both time and memory, whatever the config.
+const BUDGET: usize = 50_000;
+
+/// The most jobs one plan can hold, as GitHub caps a run's matrix.
+const MAX_JOBS: usize = 256;
 
 /// The deepest commands can nest.
 const MAX_NESTING: usize = 64;
@@ -146,7 +151,8 @@ pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, V
         )));
         return Err(dedup(errors));
     };
-    let plan = compile_workflow(config, workflow, wf, git_ref, &mut errors);
+    let mut budget = Budget::new();
+    let plan = compile_workflow(config, workflow, wf, git_ref, &mut budget, &mut errors);
     match plan {
         Some(plan) if errors.is_empty() => Ok(plan),
         _ => Err(dedup(errors)),
@@ -158,8 +164,12 @@ pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, V
 #[must_use]
 pub fn validate(config: &Config) -> Vec<Diagnostic> {
     let mut errors = config_errors(config);
+    let mut budget = Budget::new();
     for (name, wf) in &config.workflows {
-        compile_workflow(config, name, wf, VALIDATE_REF, &mut errors);
+        compile_workflow(config, name, wf, VALIDATE_REF, &mut budget, &mut errors);
+        if budget.spent {
+            break;
+        }
     }
     dedup(errors)
 }
@@ -208,6 +218,7 @@ fn compile_workflow(
     name: &str,
     wf: &Workflow,
     git_ref: &str,
+    budget: &mut Budget,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<Plan> {
     let before = errors.len();
@@ -245,12 +256,16 @@ fn compile_workflow(
         deps.push(own);
     }
 
+    let mut planned = 0;
     let expansions: Vec<Vec<PlannedJob>> = wf
         .jobs
         .iter()
         .zip(&ids)
-        .map(|(entry, id)| expand_entry(config, name, entry, id, errors))
+        .map(|(entry, id)| expand_entry(config, name, entry, id, budget, &mut planned, errors))
         .collect();
+    if budget.spent {
+        return None;
+    }
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
     for (i, jobs) in expansions.iter().enumerate() {
         for job in jobs {
@@ -423,9 +438,17 @@ fn expand_entry(
     workflow: &str,
     entry: &WorkflowJob,
     id: &str,
+    budget: &mut Budget,
+    planned: &mut usize,
     errors: &mut Vec<Diagnostic>,
 ) -> Vec<PlannedJob> {
+    if budget.spent {
+        return Vec::new();
+    }
     if entry.approval {
+        if !reserve_jobs(workflow, planned, 1, errors) {
+            return Vec::new();
+        }
         return approval(entry, id, errors);
     }
 
@@ -446,33 +469,23 @@ fn expand_entry(
             "{owner} has parallelism {nodes}; it must be 1 to {MAX_PARALLELISM}"
         )));
     }
-    entry_value_errors(entry, id, errors);
-    let mut size: usize = 1;
-    for (key, values) in &entry.matrix {
-        if values.is_empty() {
-            errors.push(Diagnostic::new(format!(
-                "`{id}` has matrix key `{key}` with no values"
-            )));
-        }
-        if entry.with.contains_key(key) {
-            errors.push(Diagnostic::new(format!(
-                "`{id}` sets `{key}` both in its matrix and as a parameter"
-            )));
-        }
-        size = size.saturating_mul(values.len());
-    }
-    if size > MAX_MATRIX {
-        errors.push(Diagnostic::new(format!(
-            "`{id}` has a matrix of {size} entries; the limit is {MAX_MATRIX}"
-        )));
-    }
+    let size = entry_value_errors(entry, id, errors);
     if errors.len() > before {
         return Vec::new();
     }
     let Some(template) = template else {
         return Vec::new();
     };
+    let copies = nodes as usize;
+    if !reserve_jobs(workflow, planned, size * copies, errors) {
+        return Vec::new();
+    }
 
+    let mut walk = Walk {
+        workflow,
+        stack: Vec::new(),
+        budget,
+    };
     let mut out = Vec::new();
     for combo in combinations(&entry.matrix) {
         let mut args = entry.with.clone();
@@ -485,9 +498,16 @@ fn expand_entry(
             continue;
         };
         // Steps fail the same way for every combination; stop at the first.
-        let Some(base) = expand_job(config, job, &owner, &values, errors) else {
+        let Some(base) = expand_job(config, job, &owner, &values, &mut walk, errors) else {
             break;
         };
+        // Pay for the copies before making them.
+        if !walk
+            .budget
+            .charge(base.steps.len() * copies, workflow, errors)
+        {
+            break;
+        }
         let matrix_id = if combo.is_empty() {
             id.to_owned()
         } else {
@@ -516,15 +536,46 @@ fn expand_entry(
     out
 }
 
+/// Counts `count` more jobs into the plan, or reports that the plan
+/// would hold more than `MAX_JOBS`.
+fn reserve_jobs(
+    workflow: &str,
+    planned: &mut usize,
+    count: usize,
+    errors: &mut Vec<Diagnostic>,
+) -> bool {
+    *planned = planned.saturating_add(count);
+    if *planned > MAX_JOBS {
+        errors.push(Diagnostic::new(format!(
+            "workflow `{workflow}` plans more than {MAX_JOBS} jobs; the limit is {MAX_JOBS}"
+        )));
+        return false;
+    }
+    true
+}
+
 /// Checks the values a workflow entry sets: none may read `parameters`,
-/// and no matrix key may list one value twice.
-fn entry_value_errors(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) {
+/// and the matrix must have values, list none twice, not repeat a `with`
+/// key and stay within `MAX_MATRIX` entries. Returns the matrix size.
+fn entry_value_errors(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> usize {
     for (key, value) in &entry.with {
         if reads_parameters(value) {
             errors.push(no_parameters_here(id, key));
         }
     }
+    let mut size: usize = 1;
     for (key, values) in &entry.matrix {
+        if values.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has matrix key `{key}` with no values"
+            )));
+        }
+        if entry.with.contains_key(key) {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` sets `{key}` both in its matrix and as a parameter"
+            )));
+        }
+        size = size.saturating_mul(values.len());
         let mut shown = BTreeSet::new();
         for value in values {
             if reads_parameters(value) {
@@ -538,6 +589,12 @@ fn entry_value_errors(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic
             }
         }
     }
+    if size > MAX_MATRIX {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has a matrix of {size} entries; the limit is {MAX_MATRIX}"
+        )));
+    }
+    size
 }
 
 /// The planned job of an approval entry, which takes no parameters and
@@ -642,20 +699,13 @@ fn expand_job(
     job: &Job,
     owner: &str,
     values: &BTreeMap<String, Value>,
+    walk: &mut Walk<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<PlannedJob> {
     let before = errors.len();
     let mut steps = Vec::new();
-    let mut walk = Walk {
-        job: owner,
-        stack: Vec::new(),
-        left: MAX_VISITS,
-        spent: false,
-    };
-    expand_steps(
-        config, &job.steps, values, owner, &mut walk, &mut steps, errors,
-    );
-    if walk.spent {
+    expand_steps(config, &job.steps, values, owner, walk, &mut steps, errors);
+    if walk.budget.spent {
         return None;
     }
     let mut sub = |text: &str| substitute(text, values, owner, errors);
@@ -684,34 +734,55 @@ fn expand_job(
     })
 }
 
-/// The state of expanding one job's steps.
-struct Walk<'a> {
-    /// The job, as named in errors.
-    job: &'a str,
-    /// The commands being expanded, so one that reaches itself is caught.
-    stack: Vec<String>,
-    /// Steps and command calls still allowed.
+/// What is left of the work one `compile` or `validate` call may do.
+struct Budget {
+    /// Units still allowed.
     left: usize,
-    /// The budget ran out; no further errors are reported for the job.
+    /// The budget ran out and was reported; all work stops.
     spent: bool,
 }
 
-impl Walk<'_> {
-    /// Counts one visit. False once the budget is spent, after reporting
-    /// it once.
-    fn visit(&mut self, errors: &mut Vec<Diagnostic>) -> bool {
-        if self.left == 0 {
-            if !self.spent {
-                self.spent = true;
-                errors.push(Diagnostic::new(format!(
-                    "{} expands to more than {MAX_VISITS} steps and command calls; the limit is {MAX_VISITS}",
-                    self.job
-                )));
-            }
+impl Budget {
+    fn new() -> Self {
+        Self {
+            left: BUDGET,
+            spent: false,
+        }
+    }
+
+    /// Takes `units`. False once the budget is spent, after reporting it
+    /// once.
+    fn charge(&mut self, units: usize, workflow: &str, errors: &mut Vec<Diagnostic>) -> bool {
+        if self.spent {
             return false;
         }
-        self.left -= 1;
+        if units > self.left {
+            self.spent = true;
+            self.left = 0;
+            errors.push(Diagnostic::new(format!(
+                "workflow `{workflow}` expands to more than {BUDGET} steps and command calls, counting each matrix entry and parallel node; the limit is {BUDGET}"
+            )));
+            return false;
+        }
+        self.left -= units;
         true
+    }
+}
+
+/// The state of expanding one workflow entry's steps.
+struct Walk<'a> {
+    /// The workflow, as named in errors.
+    workflow: &'a str,
+    /// The commands being expanded, so one that reaches itself is caught.
+    stack: Vec<String>,
+    /// The work left for the whole call.
+    budget: &'a mut Budget,
+}
+
+impl Walk<'_> {
+    /// Counts one visit. False once the budget is spent.
+    fn visit(&mut self, errors: &mut Vec<Diagnostic>) -> bool {
+        self.budget.charge(1, self.workflow, errors)
     }
 }
 
@@ -768,7 +839,7 @@ fn expand_steps(
         walk.stack.push(name.clone());
         expand_steps(config, &command.steps, &bound, &inner, walk, out, errors);
         walk.stack.pop();
-        if walk.spent {
+        if walk.budget.spent {
             return;
         }
     }

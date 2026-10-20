@@ -509,12 +509,12 @@ fn command_expansion_has_a_work_budget() {
     let err = validate(&config);
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     assert_eq!(err.len(), 1, "{err:?}");
-    assert!(err[0].message.contains("job `t`") && err[0].message.contains("10000"));
+    assert!(err[0].message.contains("workflow `ci`") && err[0].message.contains("50000"));
 
     // Leaves that fail add no error per visit.
     let err = validate(&parse(&fan_out(9, 10, "{ run: '${{ parameters.x }}' }")).unwrap());
     assert!(err.len() <= 2, "{err:?}");
-    assert!(err.iter().any(|e| e.message.contains("10000")));
+    assert!(err.iter().any(|e| e.message.contains("50000")));
 
     // A wide but small expansion still compiles.
     let plan = plan(&fan_out(2, 10, "{ run: echo }"));
@@ -574,4 +574,115 @@ fn rejects_parameter_reads_at_workflow_level() {
         ),
         &["`t`", "`x`", "parameters"],
     );
+}
+
+/// The reviewer's probe: `c0` calls `c1` nine times, down to `c3`, which
+/// has nine run steps (6561 steps), on a 16x16 matrix job.
+fn wide_matrix(parallelism: u32, entries: usize) -> String {
+    use std::fmt::Write as _;
+    let mut yaml = String::from("commands:\n");
+    for i in 0..3 {
+        let list = vec![format!("c{}", i + 1); 9].join(", ");
+        writeln!(yaml, "  c{i}: {{ steps: [{list}] }}").unwrap();
+    }
+    yaml += "  c3: { steps: [{run: a},{run: a},{run: a},{run: a},{run: a},{run: a},{run: a},{run: a},{run: a}] }\n";
+    writeln!(
+        yaml,
+        "jobs: {{ t: {{ runs-on: ubuntu-latest, parallelism: {parallelism}, parameters: {{ a: {{type: string}}, b: {{type: string}} }}, steps: [c0] }} }}"
+    )
+    .unwrap();
+    let values: Vec<String> = (0..16).map(|i| format!("v{i}")).collect();
+    let m = values.join(", ");
+    let jobs: Vec<String> = (0..entries)
+        .map(|e| format!("{{ t: {{ name: e{e}, matrix: {{ a: [{m}], b: [{m}] }} }} }}"))
+        .collect();
+    writeln!(
+        yaml,
+        "workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{}] }} }}",
+        jobs.join(", ")
+    )
+    .unwrap();
+    yaml
+}
+
+fn timed_compile(yaml: &str) -> Vec<Diagnostic> {
+    let config = parse(yaml).unwrap();
+    let started = std::time::Instant::now();
+    let err = compile(&config, "ci", "refs/heads/main").unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    err
+}
+
+#[test]
+fn one_budget_covers_matrix_and_parallel_copies() {
+    // 256 combinations of 6561 steps each: the shared budget runs out.
+    let err = timed_compile(&wide_matrix(1, 1));
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert!(err[0].message.contains("workflow `ci`") && err[0].message.contains("50000"));
+
+    // With 64 nodes the plan would hold 16384 jobs; refused before any
+    // expansion.
+    let err = timed_compile(&wide_matrix(64, 1));
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert!(err[0].message.contains("workflow `ci`") && err[0].message.contains("256 jobs"));
+}
+
+#[test]
+fn a_plan_holds_at_most_256_jobs() {
+    let job = "jobs: { t: { runs-on: ubuntu-latest, parallelism: 2, steps: [] } }\n";
+    let values: Vec<String> = (0..16).map(|i| i.to_string()).collect();
+    let m = values.join(", ");
+    // 16x16 matrix, two nodes each: 512 jobs.
+    assert_error(
+        &format!(
+            "{job}workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ matrix: {{ a: [{m}], b: [{m}] }} }} }}] }} }}"
+        ),
+        &["workflow `ci`", "256 jobs"],
+    );
+    // 16x17 matrix: 272 entries.
+    let job = "jobs: { t: { runs-on: ubuntu-latest, steps: [] } }\n";
+    assert_error(
+        &format!(
+            "{job}workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ matrix: {{ a: [{m}], b: [{m}, 16] }} }} }}] }} }}"
+        ),
+        &["`t`", "272", "256"],
+    );
+    // 256 jobs over two entries is fine.
+    let plan = plan(&format!(
+        "{job}workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ matrix: {{ a: [{m}], b: [{}] }} }} }}, {{ t: {{ name: u, matrix: {{ a: [{m}], b: [{}] }} }} }}] }} }}",
+        values[..8].join(", "),
+        values[..8].join(", ")
+    ));
+    assert_eq!(plan.jobs.len(), 256);
+}
+
+#[test]
+fn validate_shares_the_budget_across_workflows() {
+    use std::fmt::Write as _;
+    // One workflow costs about 27000 units (7380 visits plus 3 nodes of
+    // 6561 steps), so each fits alone and the two together do not.
+    let mut yaml = String::from("commands:\n");
+    for i in 0..3 {
+        let list = vec![format!("c{}", i + 1); 9].join(", ");
+        writeln!(yaml, "  c{i}: {{ steps: [{list}] }}").unwrap();
+    }
+    yaml += "  c3: { steps: [{run: a},{run: a},{run: a},{run: a},{run: a},{run: a},{run: a},{run: a},{run: a}] }\n";
+    yaml += "jobs: { t: { runs-on: ubuntu-latest, parallelism: 3, steps: [c0] } }\n";
+    yaml += "workflows:\n";
+    for w in ["one", "two"] {
+        writeln!(yaml, "  {w}: {{ on: {{ push: {{}} }}, jobs: [t] }}").unwrap();
+    }
+    let config = parse(&yaml).unwrap();
+    assert!(compile(&config, "one", "refs/heads/main").is_ok());
+    assert!(compile(&config, "two", "refs/heads/main").is_ok());
+    let err = validate(&config);
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert!(err[0].message.contains("50000"));
+}
+
+#[test]
+fn spec_example_fits_the_budget() {
+    let config = parse(include_str!("fixtures/spec_example.yml")).unwrap();
+    assert!(compile(&config, "ci", "refs/heads/main").is_ok());
+    assert_eq!(validate(&config), []);
 }
