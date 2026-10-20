@@ -6,7 +6,7 @@
 //! they test natively.
 //!
 //! A session id is 32 random bytes. The browser holds it, base64url
-//! encoded, in an `HttpOnly`, `Secure`, `SameSite=Lax` cookie; D1 holds
+//! encoded, in an `HttpOnly`, `Secure`, `SameSite=Lax` cookie; the database holds
 //! only its SHA-256 ([`key`]), so a copy of the database cannot be
 //! replayed as a cookie. The user's GitHub token is stored next to it,
 //! sealed with AES-256-GCM under a key derived from the session id
@@ -77,7 +77,7 @@ pub fn encode_id(id: &[u8]) -> String {
     b64url(id)
 }
 
-/// The key D1 stores the session under: the id's SHA-256 in hex.
+/// The key the database stores the session under: the id's SHA-256 in hex.
 #[must_use]
 pub fn key(id: &[u8]) -> String {
     hex(&Sha256::digest(id))

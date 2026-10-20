@@ -237,7 +237,8 @@ from AWS's public price lists stand in for it.
 ```sh
 npm --prefix web/app ci && npm --prefix web/app run build
 cd crates/cloud
-npx wrangler@4.145.0 d1 migrations apply hatchrun-cloud --local
+docker run -d --name hatchrun-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17
+DATABASE_MIGRATE_URL=postgres://postgres:postgres@localhost:5432/postgres scripts/migrate.sh
 echo GITHUB_WEBHOOK_SECRET=dev > .dev.vars
 npx wrangler@4.145.0 dev
 ```
@@ -252,7 +253,7 @@ OAuth web flow with a state and PKCE; the App lists
 client secret is the `GITHUB_CLIENT_SECRET` Worker secret, stored in
 the `production` environment as `APP_CLIENT_SECRET` (GitHub refuses
 secret names that start with `GITHUB_`). A session is a
-random id in an `HttpOnly` cookie; D1 keeps only its hash, and the
+random id in an `HttpOnly` cookie; the database keeps only its hash, and the
 user's GitHub token sealed under a key derived from it.
 
 A user token from the App sees only accounts the App is installed on,
@@ -298,12 +299,12 @@ redeems an invite code, or the operator lists the organization:
 ```sh
 code=$(openssl rand -hex 8)
 hash=$(printf %s "$code" | shasum -a 256 | cut -d' ' -f1)
-npx wrangler@4.145.0 d1 execute hatchrun-cloud --remote --command \
-  "INSERT INTO invites (code_hash, note, uses_left, created_at) VALUES ('$hash', 'acme', 1, unixepoch() * 1000)"
+psql "$DATABASE_MIGRATE_URL" -c \
+  "INSERT INTO invites (code_hash, note, uses_left, created_at) VALUES ('$hash', 'acme', 1, (extract(epoch from now()) * 1000)::bigint)"
 echo "invite code: $code"
 
-npx wrangler@4.145.0 d1 execute hatchrun-cloud --remote --command \
-  "INSERT INTO beta_orgs (org_login, created_at) VALUES ('acme', unixepoch() * 1000)"
+psql "$DATABASE_MIGRATE_URL" -c \
+  "INSERT INTO beta_orgs (org_login, created_at) VALUES (lower('acme'), (extract(epoch from now()) * 1000)::bigint)"
 ```
 
 An owner connects AWS from the app. The account first subscribes to the
@@ -408,7 +409,7 @@ no allowed instance type fits the profile, no such profile) waits
 until an owner verifies the role again, edits a profile, changes the
 settings or adds a card; [`retry.rs`](crates/cloud/src/reconcile/retry.rs)
 lists every case. Once a day per region it refreshes the instance
-type catalog in D1 through a tenant role there: every current
+type catalog in the database through a tenant role there: every current
 generation amd64 and arm64 type with the zones that offer it
 (`DescribeInstanceTypes`, `DescribeInstanceTypeOfferings`), its Linux
 on-demand price from AWS's public price list and its lowest Spot price
@@ -420,8 +421,7 @@ jobs and runs past their tenant's retention (`tenants.retention_days`,
 `reconciler` table:
 
 ```sh
-npx wrangler@4.145.0 d1 execute hatchrun-cloud --remote --command \
-  "SELECT finished_at, summary FROM reconciler"
+psql "$DATABASE_MIGRATE_URL" -c "SELECT finished_at, summary FROM reconciler"
 ```
 
 `wrangler dev --test-scheduled` runs a pass on

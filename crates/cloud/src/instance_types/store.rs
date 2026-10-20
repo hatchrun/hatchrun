@@ -5,44 +5,46 @@
 //! The `instance_types` and `instance_type_regions` tables.
 
 use serde::Deserialize;
-use worker::{D1Database, Result};
+use worker::Result;
 
 use super::Entry;
-use crate::int;
+use crate::db::{Db, Param, params};
 use crate::labels::Arch;
 
 /// Rows per `INSERT`, which takes them as one JSON parameter.
 const ROWS_PER_INSERT: usize = 200;
 
 /// Drops a region's catalog before it is written again.
-const CLEAR: &str = "DELETE FROM instance_types WHERE region = ?1";
+const CLEAR: &str = "DELETE FROM instance_types WHERE region = $1";
 
 /// Inserts a JSON array of [`row`]s into a region's catalog.
 const INSERT: &str = "INSERT INTO instance_types (region, name, family, category, generation, \
      arch, vcpus, memory_mib, gpus, accelerators, bare_metal, burstable, local_storage, \
      spot, zones, on_demand_micros, spot_micros) \
-     SELECT ?1, value ->> 0, value ->> 1, value ->> 2, value ->> 3, value ->> 4, \
-     value ->> 5, value ->> 6, value ->> 7, value ->> 8, value ->> 9, value ->> 10, \
-     value ->> 11, value ->> 12, value ->> 13, value ->> 14, value ->> 15 \
-     FROM json_each(?2)";
+     SELECT $1, value ->> 0, value ->> 1, value ->> 2, (value ->> 3)::bigint, value ->> 4, \
+     (value ->> 5)::bigint, (value ->> 6)::bigint, (value ->> 7)::bigint, \
+     (value ->> 8)::boolean, (value ->> 9)::boolean, (value ->> 10)::boolean, \
+     (value ->> 11)::boolean, (value ->> 12)::boolean, value ->> 13, \
+     (value ->> 14)::bigint, (value ->> 15)::bigint \
+     FROM json_array_elements($2::json) AS value";
 
 /// Records a region's successful refresh.
 const REFRESHED: &str = "INSERT INTO instance_type_regions \
      (region, refreshed_at, attempted_at, types, error) \
-     VALUES (?1, ?2, ?2, ?3, NULL) ON CONFLICT (region) DO UPDATE SET \
-     refreshed_at = ?2, attempted_at = ?2, types = ?3, error = NULL";
+     VALUES ($1, $2, $2, $3, NULL) ON CONFLICT (region) DO UPDATE SET \
+     refreshed_at = $2, attempted_at = $2, types = $3, error = NULL";
 
 /// Records a region's failed refresh.
 const FAILED: &str = "INSERT INTO instance_type_regions (region, attempted_at, error) \
-     VALUES (?1, ?2, ?3) ON CONFLICT (region) DO UPDATE SET attempted_at = ?2, error = ?3";
+     VALUES ($1, $2, $3) ON CONFLICT (region) DO UPDATE SET attempted_at = $2, error = $3";
 
 /// A region's catalog, by name.
 const REGION: &str = "SELECT name, family, category, generation, arch, vcpus, memory_mib, gpus, \
      accelerators, bare_metal, burstable, local_storage, spot, zones, \
-     on_demand_micros, spot_micros FROM instance_types WHERE region = ?1 ORDER BY name";
+     on_demand_micros, spot_micros FROM instance_types WHERE region = $1 ORDER BY name";
 
 /// A region's refresh status.
-const STATUS: &str = "SELECT refreshed_at, error FROM instance_type_regions WHERE region = ?1";
+const STATUS: &str = "SELECT refreshed_at, error FROM instance_type_regions WHERE region = $1";
 
 /// A row of [`STATUS`].
 #[derive(Deserialize)]
@@ -53,57 +55,35 @@ struct Status {
 
 /// Replaces `region`'s catalog with `entries` and records the refresh,
 /// all or nothing.
-pub(crate) async fn replace(
-    db: &D1Database,
-    region: &str,
-    entries: &[Entry],
-    now: u64,
-) -> Result<()> {
-    let mut statements = vec![db.prepare(CLEAR).bind(&[region.into()])?];
+pub(crate) async fn replace(db: &Db, region: &str, entries: &[Entry], now: u64) -> Result<()> {
+    let mut statements: Vec<(&str, Vec<Param>)> = vec![(CLEAR, params![region])];
     for chunk in entries.chunks(ROWS_PER_INSERT) {
         let rows: Vec<serde_json::Value> = chunk.iter().map(row).collect();
-        statements.push(
-            db.prepare(INSERT).bind(&[
-                region.into(),
-                serde_json::to_string(&rows)
-                    .map_err(|err| worker::Error::RustError(err.to_string()))?
-                    .into(),
-            ])?,
-        );
+        let rows = serde_json::to_string(&rows)
+            .map_err(|err| worker::Error::RustError(err.to_string()))?;
+        statements.push((INSERT, params![region, rows]));
     }
-    statements.push(db.prepare(REFRESHED).bind(&[
-        region.into(),
-        int(now)?,
-        u32::try_from(entries.len()).unwrap_or(u32::MAX).into(),
-    ])?);
-    db.batch(statements).await?;
+    statements.push((REFRESHED, params![region, now, entries.len()]));
+    db.batch(&statements).await?;
     Ok(())
 }
 
 /// Records that refreshing `region` failed with `error`; its catalog
 /// stays as it was.
-pub(crate) async fn failed(db: &D1Database, region: &str, error: &str, now: u64) -> Result<()> {
-    db.prepare(FAILED)
-        .bind(&[region.into(), int(now)?, error.into()])?
-        .run()
-        .await?;
+pub(crate) async fn failed(db: &Db, region: &str, error: &str, now: u64) -> Result<()> {
+    db.run(FAILED, &params![region, now, error]).await?;
     Ok(())
 }
 
 /// `region`'s catalog, by name; empty before its first refresh.
-pub(crate) async fn region(db: &D1Database, region: &str) -> Result<Vec<Entry>> {
-    let rows = db
-        .prepare(REGION)
-        .bind(&[region.into()])?
-        .all()
-        .await?
-        .results::<Row>()?;
+pub(crate) async fn region(db: &Db, region: &str) -> Result<Vec<Entry>> {
+    let rows: Vec<Row> = db.all(REGION, &params![region]).await?;
     Ok(rows.into_iter().map(Row::entry).collect())
 }
 
 /// What `region` offers: its catalog, or the static families before
 /// its catalog is first read.
-pub(crate) async fn offered(db: &D1Database, region: &str) -> Result<Vec<Entry>> {
+pub(crate) async fn offered(db: &Db, region: &str) -> Result<Vec<Entry>> {
     let entries = self::region(db, region).await?;
     Ok(if entries.is_empty() {
         crate::instance::static_offerings(region)
@@ -114,15 +94,8 @@ pub(crate) async fn offered(db: &D1Database, region: &str) -> Result<Vec<Entry>>
 
 /// When `region`'s catalog was last refreshed, and why the last
 /// attempt failed if it did.
-pub(crate) async fn refreshed(
-    db: &D1Database,
-    region: &str,
-) -> Result<(Option<u64>, Option<String>)> {
-    let status: Option<Status> = db
-        .prepare(STATUS)
-        .bind(&[region.into()])?
-        .first(None)
-        .await?;
+pub(crate) async fn refreshed(db: &Db, region: &str) -> Result<(Option<u64>, Option<String>)> {
+    let status: Option<Status> = db.first(STATUS, &params![region]).await?;
     Ok(status.map_or((None, None), |status| (status.refreshed_at, status.error)))
 }
 
@@ -136,17 +109,19 @@ fn row(entry: &Entry) -> serde_json::Value {
         entry.vcpus,
         entry.memory_mib,
         entry.gpus,
-        u8::from(entry.accelerators),
-        u8::from(entry.bare_metal),
-        u8::from(entry.burstable),
-        u8::from(entry.local_storage),
-        u8::from(entry.spot),
+        entry.accelerators,
+        entry.bare_metal,
+        entry.burstable,
+        entry.local_storage,
+        entry.spot,
         entry.zones.join(","),
         entry.on_demand_micros,
         entry.spot_micros,
     ])
 }
 
+/// A row of [`REGION`], a field for each of the table's flags.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Deserialize)]
 struct Row {
     name: String,
@@ -157,11 +132,11 @@ struct Row {
     vcpus: u16,
     memory_mib: u32,
     gpus: u16,
-    accelerators: u8,
-    bare_metal: u8,
-    burstable: u8,
-    local_storage: u8,
-    spot: u8,
+    accelerators: bool,
+    bare_metal: bool,
+    burstable: bool,
+    local_storage: bool,
+    spot: bool,
     zones: String,
     on_demand_micros: Option<u64>,
     spot_micros: Option<u64>,
@@ -178,11 +153,11 @@ impl Row {
             vcpus: self.vcpus,
             memory_mib: self.memory_mib,
             gpus: self.gpus,
-            accelerators: self.accelerators == 1,
-            bare_metal: self.bare_metal == 1,
-            burstable: self.burstable == 1,
-            local_storage: self.local_storage == 1,
-            spot: self.spot == 1,
+            accelerators: self.accelerators,
+            bare_metal: self.bare_metal,
+            burstable: self.burstable,
+            local_storage: self.local_storage,
+            spot: self.spot,
             zones: self
                 .zones
                 .split(',')
@@ -198,7 +173,7 @@ impl Row {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testdb::{Db, Param, params};
+    use crate::testdb::Db;
 
     const NOW: u64 = 1_792_140_000_000;
 
@@ -233,10 +208,7 @@ mod tests {
                 params![region, serde_json::to_string(&rows).unwrap()],
             ));
         }
-        statements.push((
-            REFRESHED,
-            params![region, NOW, u32::try_from(entries.len()).unwrap()],
-        ));
+        statements.push((REFRESHED, params![region, NOW, entries.len()]));
         statements
     }
 
@@ -259,7 +231,7 @@ mod tests {
         assert_eq!(status.refreshed_at, Some(NOW));
         assert_eq!(status.error, None);
         let types: Option<u64> = db.column(
-            "SELECT types FROM instance_type_regions WHERE region = ?1",
+            "SELECT types FROM instance_type_regions WHERE region = $1",
             &params!["ap-south-1"],
             "types",
         );

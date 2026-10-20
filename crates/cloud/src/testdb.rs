@@ -2,141 +2,138 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Runs the Worker's D1 queries against SQLite in tests.
+//! Runs the Worker's queries against a real Postgres in tests.
 //!
-//! D1 is SQLite, but the Worker only reaches it through JavaScript, and
-//! that changes the types. Every number the Worker binds is a double, so
-//! SQLite sees a REAL even where Rust had a `u64`: `?2 - 1` is REAL and
-//! `(updated_at - ?2) / 900000` divides as floats. [`Db`] binds the same
-//! way, numbers as REAL, strings as TEXT and nothing as NULL.
+//! `DATABASE_URL` names the server, `postgres://postgres:postgres@
+//! localhost:5432/postgres` when unset; CI starts one as a service.
+//! Each [`Db`] gets its own schema with every migration applied, so
+//! tests run side by side, and drops it when the test ends.
 //!
-//! Rows come back the way D1 hands them over: an object by column name,
-//! INTEGER as an integer, REAL as a float, TEXT as a string. They are
-//! deserialized into the Worker's own row structs, so a REAL in a `u32`
-//! field fails the test as it would fail the request. This is stricter
-//! than D1 in one place: D1 turns a whole REAL such as `2.0` into the
-//! number 2, which then reads into an integer field, while here it stays
-//! a float and fails. A query that hands an integer field a REAL only
-//! works on the rows where the float happens to be whole.
+//! The statements go through [`crate::db::Db`], the Worker's own
+//! client, so values bind and rows deserialize as they do in
+//! production. [`Db`] waits on each one, for tests written as plain
+//! functions.
 
 use std::path::Path;
 use std::pin::pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 
-use rusqlite::types::{Value, ValueRef};
-use rusqlite::{Connection, params_from_iter};
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Number};
+use serde_json::Map;
+use tokio::runtime::Runtime;
 
-/// A value bound to a statement, as D1 receives it from JavaScript.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Param {
-    /// A JavaScript number, a REAL to SQLite.
-    Num(f64),
-    /// A JavaScript string.
-    Text(String),
-    /// `null`.
-    Null,
+pub(crate) use crate::db::{Param, params};
+
+const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:5432/postgres";
+
+/// A schema of its own on the test server, with every migration
+/// applied.
+pub(crate) struct Db {
+    runtime: Runtime,
+    inner: crate::db::Db,
+    schema: String,
 }
 
-impl From<u64> for Param {
-    #[allow(clippy::cast_precision_loss)]
-    fn from(value: u64) -> Self {
-        // As `crate::int`, which refuses anything above 2^53.
-        assert!(value < 1 << 53, "{value} is too large for D1");
-        Param::Num(value as f64)
-    }
+/// The test server's URL.
+pub(crate) fn url() -> String {
+    std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned())
 }
 
-impl From<u32> for Param {
-    fn from(value: u32) -> Self {
-        Param::Num(f64::from(value))
-    }
+/// The migrations, in file name order.
+fn migrations() -> Vec<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read migrations")
+        .map(|entry| entry.expect("read migrations").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "no migrations in {}", dir.display());
+    files
+        .iter()
+        .map(|file| std::fs::read_to_string(file).expect("read migration"))
+        .collect()
 }
-
-impl From<i64> for Param {
-    #[allow(clippy::cast_precision_loss)]
-    fn from(value: i64) -> Self {
-        Param::Num(value as f64)
-    }
-}
-
-impl From<f64> for Param {
-    fn from(value: f64) -> Self {
-        Param::Num(value)
-    }
-}
-
-impl From<&str> for Param {
-    fn from(value: &str) -> Self {
-        Param::Text(value.to_owned())
-    }
-}
-
-impl From<String> for Param {
-    fn from(value: String) -> Self {
-        Param::Text(value)
-    }
-}
-
-impl From<&String> for Param {
-    fn from(value: &String) -> Self {
-        Param::Text(value.clone())
-    }
-}
-
-impl<T: Into<Param>> From<Option<T>> for Param {
-    fn from(value: Option<T>) -> Self {
-        value.map_or(Param::Null, Into::into)
-    }
-}
-
-impl Param {
-    fn value(&self) -> Value {
-        match self {
-            Param::Num(n) => Value::Real(*n),
-            Param::Text(s) => Value::Text(s.clone()),
-            Param::Null => Value::Null,
-        }
-    }
-}
-
-/// The parameters of one statement, each converted as D1 would. A
-/// `Vec` so that a batch can mix statements with different counts;
-/// built without `vec!` so `&params![..]` passes clippy.
-macro_rules! params {
-    () => { Vec::<$crate::testdb::Param>::new() };
-    ($($value:expr),+ $(,)?) => {
-        <[$crate::testdb::Param]>::into_vec(Box::new([$($crate::testdb::Param::from($value)),+]))
-    };
-}
-pub(crate) use params;
-
-/// An in-memory database with every migration applied.
-pub(crate) struct Db(Connection);
 
 impl Db {
-    /// A fresh database, migrated in file name order as wrangler does.
+    /// A fresh schema, migrated.
     pub(crate) fn new() -> Self {
-        let conn = Connection::open_in_memory().expect("open SQLite");
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-        let mut files: Vec<_> = std::fs::read_dir(&dir)
-            .expect("read migrations")
-            .map(|entry| entry.expect("read migrations").path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
-            .collect();
-        files.sort();
-        assert!(!files.is_empty(), "no migrations in {}", dir.display());
-        for file in files {
-            let sql = std::fs::read_to_string(&file).expect("read migration");
-            conn.execute_batch(&sql)
-                .unwrap_or_else(|err| panic!("{}: {err}", file.display()));
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Tests migrate one at a time: a migration may change the
+        // database itself, which two sessions cannot do at once.
+        static MIGRATING: Mutex<()> = Mutex::new(());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("start a runtime");
+        let url = url();
+        let schema = format!(
+            "test_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let migrating = MIGRATING.lock().unwrap_or_else(PoisonError::into_inner);
+        let client = runtime.block_on(async {
+            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                .await
+                .unwrap_or_else(|err| panic!("connect to {url} (set DATABASE_URL): {err}"));
+            tokio::spawn(connection);
+            client
+                .batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+                     SET search_path TO {schema}"
+                ))
+                .await
+                .expect("create the schema");
+            for sql in migrations() {
+                client
+                    .batch_execute(&sql)
+                    .await
+                    .unwrap_or_else(|err| panic!("migrate: {err:?}"));
+            }
+            client
+        });
+        drop(migrating);
+        Db {
+            runtime,
+            inner: crate::db::Db::new(client),
+            schema,
         }
-        Db(conn)
     }
 
-    /// Runs a statement for its effect, as `.run()`, and returns the
-    /// rows it changed.
+    /// Another client on this schema, through `config`, such as one
+    /// that reaches the server by another address. Its connection runs
+    /// on this runtime.
+    pub(crate) fn connect(&self, config: &tokio_postgres::Config) -> crate::db::Db {
+        let client = self.runtime.block_on(async {
+            let (client, connection) = config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .unwrap_or_else(|err| panic!("connect a second client: {err}"));
+            tokio::spawn(connection);
+            client
+                .batch_execute(&format!("SET search_path TO {}", self.schema))
+                .await
+                .expect("set the search path");
+            client
+        });
+        crate::db::Db::new(client)
+    }
+
+    /// The Worker's client, for the functions that take one.
+    pub(crate) fn db(&self) -> &crate::db::Db {
+        &self.inner
+    }
+
+    /// Waits for `future`, which may use [`Db::db`].
+    pub(crate) fn wait<F: Future>(&self, future: F) -> F::Output {
+        self.runtime.block_on(future)
+    }
+
+    /// Runs a statement for its effect and returns the rows it changed.
     pub(crate) fn run(&self, sql: &str, params: &[Param]) -> usize {
         self.try_run(sql, params)
             .unwrap_or_else(|err| panic!("{err}\n{sql}"))
@@ -144,76 +141,42 @@ impl Db {
 
     /// As [`Db::run`], with the error instead of a panic.
     pub(crate) fn try_run(&self, sql: &str, params: &[Param]) -> Result<usize, String> {
-        let mut stmt = self.0.prepare(sql).map_err(|err| err.to_string())?;
-        check_arity(&stmt, params)?;
-        // A query rather than `execute`, which refuses a statement that
-        // returns rows; D1 runs those too.
-        let mut rows = stmt
-            .query(params_from_iter(params.iter().map(Param::value)))
-            .map_err(|err| err.to_string())?;
-        while rows.next().map_err(|err| err.to_string())?.is_some() {}
-        drop(rows);
-        Ok(usize::try_from(self.0.changes()).expect("changes fit usize"))
+        self.wait(self.inner.run(sql, params))
+            .map(|n| usize::try_from(n).expect("changes fit usize"))
+            .map_err(|err| err.to_string())
     }
 
-    /// Runs statements in one transaction, as `.batch()`: one failing
-    /// rolls them all back. Returns the rows each statement changed, as
-    /// the `changes` of each result's meta.
+    /// Runs statements in one transaction: one failing rolls them all
+    /// back. Returns the rows each statement changed.
     pub(crate) fn batch(&self, statements: &[(&str, Vec<Param>)]) -> Result<Vec<usize>, String> {
-        // Rolls back on drop, so an error or a panic leaves no
-        // transaction open.
-        let tx = self
-            .0
-            .unchecked_transaction()
-            .map_err(|err| err.to_string())?;
-        let mut changes = Vec::with_capacity(statements.len());
-        for (sql, params) in statements {
-            changes.push(
-                self.try_run(sql, params)
-                    .map_err(|err| format!("{err}\n{sql}"))?,
-            );
-        }
-        tx.commit().map_err(|err| err.to_string())?;
-        Ok(changes)
+        self.wait(self.inner.batch(statements))
+            .map(|changes| {
+                changes
+                    .into_iter()
+                    .map(|n| usize::try_from(n).expect("changes fit usize"))
+                    .collect()
+            })
+            .map_err(|err| err.to_string())
     }
 
-    /// Every row as an object by column name, as D1 hands it over.
+    /// Every row as an object by column name.
     pub(crate) fn rows(
         &self,
         sql: &str,
         params: &[Param],
     ) -> Result<Vec<Map<String, serde_json::Value>>, String> {
-        let mut stmt = self.0.prepare(sql).map_err(|err| err.to_string())?;
-        check_arity(&stmt, params)?;
-        let names: Vec<String> = stmt.column_names().iter().map(|&n| n.to_owned()).collect();
-        let mut rows = stmt
-            .query(params_from_iter(params.iter().map(Param::value)))
-            .map_err(|err| err.to_string())?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(|err| err.to_string())? {
-            let mut object = Map::new();
-            for (i, name) in names.iter().enumerate() {
-                let value = row.get_ref(i).map_err(|err| err.to_string())?;
-                object.insert(name.clone(), json(value));
-            }
-            out.push(object);
-        }
-        Ok(out)
+        self.wait(self.inner.rows(sql, params))
+            .map_err(|err| err.to_string())
     }
 
-    /// Every row deserialized into `T`, as `.all()` then `.results()`.
+    /// Every row deserialized into `T`.
     pub(crate) fn try_all<T: DeserializeOwned>(
         &self,
         sql: &str,
         params: &[Param],
     ) -> Result<Vec<T>, String> {
-        self.rows(sql, params)?
-            .into_iter()
-            .map(|row| {
-                let text = serde_json::Value::Object(row.clone());
-                serde_json::from_value(text).map_err(|err| format!("{err} in {row:?}"))
-            })
-            .collect()
+        self.wait(self.inner.all(sql, params))
+            .map_err(|err| err.to_string())
     }
 
     /// As [`Db::try_all`], failing the test on an error.
@@ -222,23 +185,12 @@ impl Db {
             .unwrap_or_else(|err| panic!("{err}\n{sql}"))
     }
 
-    /// The first row deserialized into `T`, as `.first(None)`.
+    /// The first row deserialized into `T`.
     pub(crate) fn first<T: DeserializeOwned>(&self, sql: &str, params: &[Param]) -> Option<T> {
         self.all(sql, params).into_iter().next()
     }
 
-    /// SQLite's plan for a statement, one step per line, such as
-    /// `SEARCH jobs USING INDEX jobs_open (installation_id=?)`.
-    pub(crate) fn plan(&self, sql: &str, params: &[Param]) -> String {
-        self.rows(&format!("EXPLAIN QUERY PLAN {sql}"), params)
-            .unwrap_or_else(|err| panic!("{err}\n{sql}"))
-            .iter()
-            .map(|row| row["detail"].as_str().unwrap_or_default().to_owned())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// One column of the first row, as `.first(Some(column))`.
+    /// One column of the first row.
     pub(crate) fn column<T: DeserializeOwned>(
         &self,
         sql: &str,
@@ -256,31 +208,36 @@ impl Db {
             .clone();
         Some(serde_json::from_value(value).unwrap_or_else(|err| panic!("{err}\n{sql}")))
     }
-}
 
-/// D1 refuses a statement bound with fewer values than it numbers, and
-/// SQLite would read the missing ones as NULL.
-fn check_arity(stmt: &rusqlite::Statement<'_>, params: &[Param]) -> Result<(), String> {
-    let wanted = stmt.parameter_count();
-    if wanted == params.len() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the statement takes {wanted} values, bound {}",
-            params.len()
-        ))
+    /// Postgres's plan for a statement with sequential scans turned
+    /// off, one node per line, such as `Index Scan using jobs_open on
+    /// jobs`. Test tables are small enough that the planner would
+    /// otherwise scan every one; with scans off it shows which index a
+    /// large table would use, or a `Seq Scan` where none fits.
+    pub(crate) fn plan(&self, sql: &str, params: &[Param]) -> String {
+        self.run("SET enable_seqscan = off", &[]);
+        let plan = self
+            .rows(&format!("EXPLAIN (COSTS OFF) {sql}"), params)
+            .unwrap_or_else(|err| panic!("{err}\n{sql}"))
+            .iter()
+            .map(|row| {
+                row["QUERY PLAN"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.run("RESET enable_seqscan", &[]);
+        plan
     }
 }
 
-fn json(value: ValueRef<'_>) -> serde_json::Value {
-    match value {
-        ValueRef::Null => serde_json::Value::Null,
-        ValueRef::Integer(i) => serde_json::Value::Number(i.into()),
-        ValueRef::Real(f) => {
-            Number::from_f64(f).map_or(serde_json::Value::Null, serde_json::Value::Number)
-        }
-        ValueRef::Text(t) => serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
-        ValueRef::Blob(b) => serde_json::Value::Array(b.iter().map(|&byte| byte.into()).collect()),
+impl Drop for Db {
+    fn drop(&mut self) {
+        let sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema);
+        let _ = self.runtime.block_on(self.inner.run(&sql, &[]));
     }
 }
 
@@ -303,50 +260,75 @@ mod tests {
     use super::*;
 
     #[derive(Debug, Deserialize)]
-    struct Whole {
+    struct Row {
         n: u64,
+        flag: bool,
+        name: Option<String>,
     }
 
     #[test]
-    fn numbers_bind_as_real() {
-        let db = Db::new();
-        let rows = db
-            .rows(
-                "SELECT typeof(?1) AS t, ?2 / 2 AS half",
-                &params![5u64, 3u64],
-            )
-            .unwrap();
-        assert_eq!(rows[0]["t"], "real");
-        assert_eq!(rows[0]["half"], 1.5);
-    }
-
-    #[test]
-    fn a_real_does_not_read_into_an_integer() {
-        let db = Db::new();
-        assert!(
-            db.try_all::<Whole>("SELECT ?1 AS n", &params![2u64])
-                .is_err()
-        );
-        let whole = db.try_all::<Whole>("SELECT 2 AS n", &[]).unwrap();
-        assert_eq!(whole[0].n, 2);
-    }
-
-    #[test]
-    fn strict_tables_store_a_whole_real_as_an_integer() {
+    fn values_bind_as_their_declared_types() {
         let db = Db::new();
         db.run(
-            "INSERT INTO used_tokens (jti, expires_at) VALUES (?1, ?2)",
-            &params!["a", 7u64],
+            "INSERT INTO rate_limits (installation_id, remaining, limited, seen_at) \
+             VALUES ($1, $2, $3, $4)",
+            &params![7u64, None::<u64>, true, 5u64],
         );
-        let rows = db
-            .rows("SELECT typeof(expires_at) AS t FROM used_tokens", &[])
+        let row: Row = db
+            .first(
+                "SELECT installation_id AS n, limited AS flag, NULL::text AS name \
+                 FROM rate_limits",
+                &[],
+            )
             .unwrap();
-        assert_eq!(rows[0]["t"], "integer");
+        assert_eq!((row.n, row.flag, row.name), (7, true, None));
+    }
+
+    #[test]
+    fn an_integer_is_no_boolean() {
+        let db = Db::new();
+        let err = db
+            .try_run(
+                "INSERT INTO rate_limits (installation_id, remaining, limited, seen_at) \
+                 VALUES ($1, $2, $3, $4)",
+                &params![7u64, None::<u64>, 1u64, 5u64],
+            )
+            .unwrap_err();
+        assert!(err.contains("boolean"), "{err}");
+    }
+
+    #[test]
+    fn a_batch_rolls_back_whole() {
+        let db = Db::new();
+        let insert = "INSERT INTO used_tokens (jti, expires_at) VALUES ($1, $2)";
+        assert!(
+            db.batch(&[(insert, params!["a", 1u64]), (insert, params!["a", 2u64])])
+                .is_err()
+        );
+        let count: i64 = db
+            .column("SELECT COUNT(*) AS n FROM used_tokens", &[], "n")
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(
+            db.batch(&[(insert, params!["a", 1u64]), (insert, params!["b", 2u64])])
+                .unwrap(),
+            vec![1, 1]
+        );
+    }
+
+    #[test]
+    fn a_numeric_column_says_to_cast_it() {
+        let db = Db::new();
+        let err = db.rows("SELECT SUM(1::bigint) AS n", &[]).unwrap_err();
+        assert!(err.contains("cast it"), "{err}");
     }
 
     #[test]
     fn a_missing_value_is_an_error() {
         let db = Db::new();
-        assert!(db.rows("SELECT ?1, ?2", &params![1u64]).is_err());
+        assert!(
+            db.rows("SELECT $1::bigint, $2::bigint", &params![1u64])
+                .is_err()
+        );
     }
 }

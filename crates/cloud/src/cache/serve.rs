@@ -29,8 +29,7 @@ use std::collections::HashMap;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Deserialize;
-use wasm_bindgen::JsValue;
-use worker::{D1Database, Env, Method, Request, Response, Result, console_log, console_warn};
+use worker::{Env, Method, Request, Response, Result, console_log, console_warn};
 
 use super::{
     CREDENTIALS_TTL, Claims, CompleteRequest, LookupRequest, LookupResponse, MAX_PAGES,
@@ -39,11 +38,13 @@ use super::{
 };
 use crate::aws::s3::{self, Completed, Object, Part};
 use crate::aws::{self, Credentials};
+use crate::db::Db;
 use crate::fetch::{Counted, Sender, send};
 use crate::http::Request as Outgoing;
+use crate::jobs::{self, Upload};
 use crate::launch::{AWS_ENDPOINT_URL, tenant_credentials};
 use crate::tokens::{self, App, Kv, Mint, Store, Tokens};
-use crate::{DB, changes, github, int, jwt, now_ms, oidc, telemetry, webcrypto};
+use crate::{github, jwt, now_ms, oidc, telemetry, webcrypto};
 
 thread_local! {
     /// Role credentials by tenant id, with when they were fetched.
@@ -88,38 +89,6 @@ impl From<worker::Error> for Refusal {
 
 type Answer = std::result::Result<Response, Refusal>;
 
-/// The job, its run's scopes while the run is on the job's attempt, and
-/// its connected tenant, by job, installation and tenant.
-const JOB: &str = "SELECT jobs.repository, jobs.run_id, jobs.run_attempt, jobs.cache_write, \
-     jobs.cache_reads, \
-     CASE WHEN runs.attempt = jobs.run_attempt THEN runs.cache_write END AS run_cache_write, \
-     CASE WHEN runs.attempt = jobs.run_attempt THEN runs.cache_reads END AS run_cache_reads, \
-     tenants.id AS tenant_id, tenants.role_arn, tenants.region, tenants.cache_bucket \
-     FROM jobs JOIN tenants ON tenants.installation_id = jobs.installation_id \
-     LEFT JOIN runs ON runs.id = jobs.run_id \
-     WHERE jobs.id = ?1 AND jobs.installation_id = ?2 AND tenants.id = ?3 \
-     AND tenants.role_arn IS NOT NULL AND tenants.region IS NOT NULL";
-
-/// Records a multipart upload a job started.
-const START: &str = "INSERT INTO cache_uploads (id, job_id, object_key, upload_id, created_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5)";
-
-/// A job's upload, by id.
-const UPLOAD: &str =
-    "SELECT object_key, upload_id FROM cache_uploads WHERE id = ?1 AND job_id = ?2";
-
-/// Forgets an upload once completed or abandoned.
-const FORGET: &str = "DELETE FROM cache_uploads WHERE id = ?1";
-
-/// Stores the scopes worked out for a run's attempt `?4`, for all its
-/// jobs. A job of an earlier attempt leaves a re-run's scopes alone.
-const RUN_SCOPES: &str = "UPDATE runs SET cache_write = ?2, cache_reads = ?3 \
-     WHERE id = ?1 AND attempt = ?4";
-
-/// Stores the scopes worked out for a job whose run has no row, or has
-/// moved on to another attempt.
-const SCOPES: &str = "UPDATE jobs SET cache_write = ?2, cache_reads = ?3 WHERE id = ?1";
-
 /// The job's tenant, as a cache call needs it.
 #[derive(Deserialize)]
 struct Row {
@@ -139,7 +108,7 @@ struct Row {
 /// Everything a call works with once the token checks out.
 struct Context<'a> {
     env: &'a Env,
-    db: D1Database,
+    db: Db,
     claims: Claims,
     row: Row,
     bucket: String,
@@ -153,17 +122,15 @@ async fn serve(mut req: Request, env: &Env) -> Answer {
         .ok_or_else(|| Refusal::new(404, "not found"))?
         .to_owned();
     let claims = authorize(&req, env)?;
-    let db = env.d1(DB)?;
-    let row: Row = db
-        .prepare(JOB)
-        .bind(&[
-            int(claims.job_id)?,
-            int(claims.installation_id)?,
-            claims.tenant.as_str().into(),
-        ])?
-        .first(None)
-        .await?
-        .ok_or_else(|| Refusal::new(403, "no such job"))?;
+    let db = Db::connect(env).await?;
+    let row: Row = jobs::cache_job(
+        &db,
+        claims.job_id,
+        claims.installation_id,
+        claims.tenant.as_str(),
+    )
+    .await?
+    .ok_or_else(|| Refusal::new(403, "no such job"))?;
     let bucket = row
         .cache_bucket
         .clone()
@@ -280,38 +247,26 @@ async fn start_upload(ctx: &Context<'_>, request: UploadRequest) -> Answer {
         s3::upload_id(&signed(ctx, &credentials, s3::create_multipart_upload(&url)).await?)
             .map_err(aws_failure("CreateMultipartUpload"))?;
     let id = jwt::b64url(webcrypto::random_bytes(16)?);
-    ctx.db
-        .prepare(START)
-        .bind(&[
-            id.as_str().into(),
-            int(ctx.claims.job_id)?,
-            key.as_str().into(),
-            upload_id.as_str().into(),
-            int(now_ms())?,
-        ])?
-        .run()
-        .await?;
+    jobs::start_upload(
+        &ctx.db,
+        id.as_str(),
+        ctx.claims.job_id,
+        key.as_str(),
+        upload_id.as_str(),
+        now_ms(),
+    )
+    .await?;
     json(&UploadResponse { upload_id: id }, 201)
 }
 
-/// An upload of this job.
-#[derive(Deserialize)]
-struct Upload {
-    object_key: String,
-    upload_id: String,
-}
-
 async fn upload(ctx: &Context<'_>, id: &str) -> std::result::Result<Upload, Refusal> {
-    ctx.db
-        .prepare(UPLOAD)
-        .bind(&[id.into(), int(ctx.claims.job_id)?])?
-        .first(None)
+    jobs::upload(&ctx.db, id, ctx.claims.job_id)
         .await?
         .ok_or_else(|| Refusal::new(404, "no such upload"))
 }
 
 async fn forget(ctx: &Context<'_>, id: &str) -> std::result::Result<(), Refusal> {
-    ctx.db.prepare(FORGET).bind(&[id.into()])?.run().await?;
+    jobs::forget_upload(&ctx.db, id).await?;
     Ok(())
 }
 
@@ -508,22 +463,22 @@ async fn scopes(ctx: &Context<'_>) -> std::result::Result<Scopes, Refusal> {
     );
     let reads =
         serde_json::to_string(&scopes.reads).map_err(|err| Refusal::new(500, err.to_string()))?;
-    let bind = |id: u64| -> std::result::Result<Vec<JsValue>, Refusal> {
-        Ok(vec![
-            int(id)?,
-            scopes.write.as_str().into(),
-            JsValue::from(reads.as_str()),
-        ])
-    };
-    let mut run = bind(ctx.row.run_id)?;
-    run.push(int(ctx.row.run_attempt)?);
-    let kept = ctx.db.prepare(RUN_SCOPES).bind(&run)?.run().await?;
-    if changes(&kept) == 0 {
-        ctx.db
-            .prepare(SCOPES)
-            .bind(&bind(ctx.claims.job_id)?)?
-            .run()
-            .await?;
+    let kept = jobs::run_scopes(
+        &ctx.db,
+        ctx.row.run_id,
+        scopes.write.as_str(),
+        reads.as_str(),
+        ctx.row.run_attempt,
+    )
+    .await?;
+    if kept == 0 {
+        jobs::job_scopes(
+            &ctx.db,
+            ctx.claims.job_id,
+            scopes.write.as_str(),
+            reads.as_str(),
+        )
+        .await?;
     }
     Ok(scopes)
 }
@@ -653,7 +608,7 @@ mod tests {
         let db = Db::new();
         db.run(
             "INSERT INTO tenants (id, org_id, org_login, installation_id, role_arn, region, \
-             cache_bucket, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+             cache_bucket, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)",
             &params![
                 "t1",
                 9u64,
@@ -667,7 +622,7 @@ mod tests {
         );
         db.run(
             "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
-             queued_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+             queued_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
             &params![
                 5u64,
                 42u64,
@@ -684,7 +639,9 @@ mod tests {
     #[test]
     fn a_job_reads_with_its_tenant() {
         let db = seed(Some("arn:aws:iam::1:role/r"));
-        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        let row: Row = db
+            .first(jobs::CACHE_JOB, &params![5u64, 42u64, "t1"])
+            .unwrap();
         assert_eq!(row.repository, "acme/app");
         assert_eq!(row.run_id, 77);
         assert_eq!(row.tenant_id, "t1");
@@ -695,33 +652,56 @@ mod tests {
 
         let reads = serde_json::to_string(&["refs/heads/main"]).unwrap();
         assert_eq!(
-            db.run(SCOPES, &params![5u64, "refs/heads/dev", reads.clone()]),
+            db.run(
+                jobs::JOB_SCOPES,
+                &params![5u64, "refs/heads/dev", reads.clone()]
+            ),
             1
         );
-        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        let row: Row = db
+            .first(jobs::CACHE_JOB, &params![5u64, 42u64, "t1"])
+            .unwrap();
         assert_eq!(row.cache_write.as_deref(), Some("refs/heads/dev"));
         assert_eq!(row.cache_reads, Some(reads));
 
-        assert!(db.first::<Row>(JOB, &params![5u64, 42u64, "t2"]).is_none());
-        assert!(db.first::<Row>(JOB, &params![5u64, 43u64, "t1"]).is_none());
+        assert!(
+            db.first::<Row>(jobs::CACHE_JOB, &params![5u64, 42u64, "t2"])
+                .is_none()
+        );
+        assert!(
+            db.first::<Row>(jobs::CACHE_JOB, &params![5u64, 43u64, "t1"])
+                .is_none()
+        );
     }
 
     #[test]
     fn a_tenant_without_a_role_has_no_job() {
         let db = seed(None);
-        assert!(db.first::<Row>(JOB, &params![5u64, 42u64, "t1"]).is_none());
+        assert!(
+            db.first::<Row>(jobs::CACHE_JOB, &params![5u64, 42u64, "t1"])
+                .is_none()
+        );
     }
 
     #[test]
     fn uploads_belong_to_their_job() {
         let db = seed(Some("arn:aws:iam::1:role/r"));
-        db.run(START, &params!["u1", 5u64, "scope/v/key", "s3-upload", NOW]);
-        let upload: Upload = db.first(UPLOAD, &params!["u1", 5u64]).unwrap();
+        db.run(
+            jobs::START_UPLOAD,
+            &params!["u1", 5u64, "scope/v/key", "s3-upload", NOW],
+        );
+        let upload: Upload = db.first(jobs::UPLOAD, &params!["u1", 5u64]).unwrap();
         assert_eq!(upload.object_key, "scope/v/key");
         assert_eq!(upload.upload_id, "s3-upload");
-        assert!(db.first::<Upload>(UPLOAD, &params!["u1", 6u64]).is_none());
-        assert_eq!(db.run(FORGET, &params!["u1"]), 1);
-        assert!(db.first::<Upload>(UPLOAD, &params!["u1", 5u64]).is_none());
+        assert!(
+            db.first::<Upload>(jobs::UPLOAD, &params!["u1", 6u64])
+                .is_none()
+        );
+        assert_eq!(db.run(jobs::FORGET_UPLOAD, &params!["u1"]), 1);
+        assert!(
+            db.first::<Upload>(jobs::UPLOAD, &params!["u1", 5u64])
+                .is_none()
+        );
     }
 
     /// GitHub as it answers for run 77 of acme/app: a push to main,
@@ -760,7 +740,9 @@ mod tests {
         let github = github();
 
         let tokens = Tokens::new(&store, &minted, &github, NOW);
-        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        let row: Row = db
+            .first(jobs::CACHE_JOB, &params![5u64, 42u64, "t1"])
+            .unwrap();
         let (scopes, resolved) = block_on(find(&row, github::API, &tokens, 42)).unwrap();
         assert!(resolved);
         assert!(scopes.write.starts_with("1/b/"), "{scopes:?}");
@@ -769,14 +751,16 @@ mod tests {
         let reads = serde_json::to_string(&scopes.reads).unwrap();
         assert_eq!(
             db.run(
-                RUN_SCOPES,
+                jobs::RUN_SCOPES,
                 &params![77u64, scopes.write.as_str(), reads, 1u64]
             ),
             1
         );
 
         let tokens = Tokens::new(&store, &minted, &github, NOW);
-        let row: Row = db.first(JOB, &params![6u64, 42u64, "t1"]).unwrap();
+        let row: Row = db
+            .first(jobs::CACHE_JOB, &params![6u64, 42u64, "t1"])
+            .unwrap();
         let (again, resolved) = block_on(find(&row, github::API, &tokens, 42)).unwrap();
         assert!(!resolved);
         assert_eq!(again, scopes);
@@ -788,11 +772,16 @@ mod tests {
         let db = seed(Some("arn:aws:iam::1:role/r"));
         let reads = serde_json::to_string(&["1/b/x"]).unwrap();
         assert_eq!(
-            db.run(RUN_SCOPES, &params![77u64, "1/b/x", reads.clone(), 1u64]),
+            db.run(
+                jobs::RUN_SCOPES,
+                &params![77u64, "1/b/x", reads.clone(), 1u64]
+            ),
             0
         );
-        assert_eq!(db.run(SCOPES, &params![5u64, "1/b/x", reads]), 1);
-        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        assert_eq!(db.run(jobs::JOB_SCOPES, &params![5u64, "1/b/x", reads]), 1);
+        let row: Row = db
+            .first(jobs::CACHE_JOB, &params![5u64, 42u64, "t1"])
+            .unwrap();
         assert!(row.run_cache_write.is_none());
         assert_eq!(
             stored(&row),
@@ -814,15 +803,25 @@ mod tests {
         let reads = serde_json::to_string(&["1/o/x"]).unwrap();
         // Job 5 ran in attempt 1, which the run has moved on from.
         assert_eq!(
-            db.run(RUN_SCOPES, &params![77u64, "1/o/x", reads.clone(), 1u64]),
+            db.run(
+                jobs::RUN_SCOPES,
+                &params![77u64, "1/o/x", reads.clone(), 1u64]
+            ),
             0
         );
-        assert_eq!(db.run(RUN_SCOPES, &params![77u64, "1/b/x", reads, 2u64]), 1);
-        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        assert_eq!(
+            db.run(jobs::RUN_SCOPES, &params![77u64, "1/b/x", reads, 2u64]),
+            1
+        );
+        let row: Row = db
+            .first(jobs::CACHE_JOB, &params![5u64, 42u64, "t1"])
+            .unwrap();
         assert_eq!(row.run_attempt, 1);
         assert!(stored(&row).is_none());
-        db.run("UPDATE jobs SET run_attempt = 2", &[]);
-        let row: Row = db.first(JOB, &params![5u64, 42u64, "t1"]).unwrap();
+        db.run("UPDATE jobs SET run_attempt = 2 WHERE id = 5", &[]);
+        let row: Row = db
+            .first(jobs::CACHE_JOB, &params![5u64, 42u64, "t1"])
+            .unwrap();
         assert_eq!(stored(&row).unwrap().write, "1/b/x");
     }
 }

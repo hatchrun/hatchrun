@@ -17,13 +17,13 @@
 //! record. A run's state in the app rolls up from its recorded jobs.
 
 use serde::Deserialize;
-use wasm_bindgen::JsValue;
-use worker::{D1Database, Env, console_warn};
+use worker::{Env, console_warn};
 
+use crate::db::Db;
 use crate::fetch::Counted;
 use crate::http::Response;
 use crate::tokens::{App, Kv, Tokens};
-use crate::{DB, github, int, now_ms};
+use crate::{github, jobs, now_ms};
 
 /// What the app shows of a run beyond its jobs.
 #[derive(Debug, Default, PartialEq, Eq, Deserialize)]
@@ -73,29 +73,6 @@ pub fn parse(response: &Response) -> Result<Details, String> {
     serde_json::from_slice(&response.body).map_err(|err| format!("run: {err}"))
 }
 
-/// Records run `?1`'s details at `?7`, once.
-pub(crate) const DETAILS: &str = "UPDATE runs SET run_number = ?2, event = ?3, \
-     display_title = ?4, actor = ?5, path = ?6, details_at = ?7, updated_at = ?7 \
-     WHERE id = ?1 AND details_at IS NULL";
-
-/// Records `details` of run `id`.
-pub(crate) async fn record(db: &D1Database, id: u64, details: &Details) -> worker::Result<()> {
-    let text = |value: &Option<String>| value.as_deref().map_or(JsValue::NULL, Into::into);
-    db.prepare(DETAILS)
-        .bind(&[
-            int(id)?,
-            details.run_number.map_or(Ok(JsValue::NULL), int)?,
-            text(&details.event),
-            text(&details.display_title),
-            text(&details.actor),
-            text(&details.path),
-            int(now_ms())?,
-        ])?
-        .run()
-        .await?;
-    Ok(())
-}
-
 /// Fetches run `run_id` of `repository` and records its details. Errors
 /// end up in the log; the reconciler asks again.
 pub async fn fetch(env: Env, installation_id: u64, repository: String, run_id: u64) {
@@ -111,8 +88,8 @@ pub async fn fetch(env: Env, installation_id: u64, repository: String, run_id: u
             .await
             .map_err(|err| err.to_string())?;
         let details = parse(&response)?;
-        let db = env.d1(DB).map_err(|err| err.to_string())?;
-        record(&db, run_id, &details)
+        let db = Db::connect(&env).await.map_err(|err| err.to_string())?;
+        jobs::record_details(&db, run_id, &details, now_ms())
             .await
             .map_err(|err| err.to_string())
     };
@@ -185,7 +162,7 @@ mod tests {
         );
         let set = |number: u64| {
             db.run(
-                DETAILS,
+                jobs::DETAILS,
                 &params![
                     9u64,
                     number,

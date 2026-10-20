@@ -4,7 +4,7 @@
 
 //! The reconciler, run by a Cron Trigger every minute. Webhooks get
 //! lost, launch messages run out of retries and runners take each
-//! other's jobs; each pass puts D1 and the tenants' instances back in
+//! other's jobs; each pass puts the database and the tenants' instances back in
 //! line:
 //!
 //! 1. redeliver the App's webhook deliveries that failed, each once
@@ -49,19 +49,20 @@ use std::collections::{BTreeMap, HashSet};
 
 use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::JsValue;
-use worker::{D1Database, D1PreparedStatement, Env, console_error, console_log, console_warn};
+use worker::{Env, console_error, console_log, console_warn};
 
 use self::plan::{Instance, Job, LaunchState, Limits, Plan};
 use crate::alerts::{self, PassRecord};
 use crate::aws::describe;
 use crate::aws::{self, Credentials, ec2, fleet, instances, ssm};
+use crate::db::{Db, params};
 use crate::fetch::{Counted, send, send_reading};
 use crate::instance_types::{self, store as catalog};
+use crate::jobs::{self, LaunchChange};
 use crate::launch::{self, APP_KEY, AWS_ENDPOINT_URL};
 use crate::tokens::{App, Kv, Tokens};
 use crate::webhook::{Outcome, QueuedJob, Status};
-use crate::{DB, changes, github, int, jwt, labels, now_ms, oidc, polar, runs, usage};
+use crate::{github, jwt, labels, now_ms, oidc, polar, runs, usage};
 
 /// Variable with the App's client id.
 const APP_ID: &str = "GITHUB_APP_ID";
@@ -201,9 +202,6 @@ struct Summary {
     metered: u32,
     /// Runs left without jobs, deleted.
     runs_deleted: u32,
-    /// The database's size in bytes after the retention deletes, as D1
-    /// reports it; None when the step failed.
-    db_bytes: Option<u64>,
     /// Steps or tenants that failed; the log has each.
     errors: u32,
     /// Whether the pass stopped at a limit with work left.
@@ -234,7 +232,6 @@ impl Summary {
         self.jobs_deleted += other.jobs_deleted;
         self.metered += other.metered;
         self.runs_deleted += other.runs_deleted;
-        self.db_bytes = other.db_bytes.or(self.db_bytes);
         self.errors += other.errors;
     }
 }
@@ -242,7 +239,7 @@ impl Summary {
 /// One pass's settings and request budget.
 struct Pass<'a> {
     env: &'a Env,
-    db: D1Database,
+    db: Db,
     now: u64,
     limits: Limits,
     github_api: String,
@@ -254,7 +251,7 @@ struct Pass<'a> {
 /// Runs one pass. Errors end up in the log and the summary.
 pub async fn run(env: Env) {
     let started = now_ms();
-    let db = match env.d1(DB) {
+    let db = match Db::connect(&env).await {
         Ok(db) => db,
         Err(err) => {
             console_error!("reconcile: {err}");
@@ -331,63 +328,45 @@ pub async fn run(env: Env) {
     if let Err(err) = record(&pass.db, started, &line, history.as_deref()).await {
         console_error!("reconcile: record: {err}");
     }
-    alerts::after_pass(&env, &pass.db, now_ms(), history, summary.db_bytes).await;
+    alerts::after_pass(&env, &pass.db, now_ms(), history).await;
 }
 
 /// The passes before this one, newest last.
-const HISTORY: &str = "SELECT history FROM reconciler WHERE id = 1";
+pub(crate) const HISTORY: &str = "SELECT history FROM reconciler WHERE id = 1";
 
 /// The history the `reconciler` row keeps.
-async fn previous(db: &D1Database) -> Fallible<Vec<PassRecord>> {
-    let text: Option<String> = db
-        .prepare(HISTORY)
-        .first(Some("history"))
-        .await
-        .map_err(text)?;
-    Ok(alerts::history(text.as_deref()))
+async fn previous(db: &Db) -> Fallible<Vec<PassRecord>> {
+    let row: Option<History> = db.first(HISTORY, &[]).await.map_err(text)?;
+    Ok(alerts::history(row.and_then(|row| row.history).as_deref()))
 }
 
-/// Takes the lease: `?1` now, `?2` when it lapses.
-const TAKE_LEASE: &str =
-    "UPDATE reconciler SET lease_until = ?2 WHERE id = 1 AND lease_until <= ?1";
+/// Takes the lease: `$1` now, `$2` when it lapses.
+pub(crate) const TAKE_LEASE: &str =
+    "UPDATE reconciler SET lease_until = $2 WHERE id = 1 AND lease_until <= $1";
 
 /// Takes the lease on the `reconciler` row if no pass holds it.
-async fn take_lease(db: &D1Database, now: u64) -> Fallible<bool> {
-    let result = db
-        .prepare(TAKE_LEASE)
-        .bind(&[int(now).map_err(text)?, int(now + LEASE).map_err(text)?])
-        .map_err(text)?
-        .run()
+async fn take_lease(db: &Db, now: u64) -> Fallible<bool> {
+    let changed = db
+        .run(TAKE_LEASE, &params![now, now + LEASE])
         .await
         .map_err(text)?;
-    Ok(changes(&result) == 1)
+    Ok(changed == 1)
 }
 
-/// Keeps a pass's summary and the history `?4`, unless that is NULL,
+/// Keeps a pass's summary and the history `$4`, unless that is NULL,
 /// and gives the lease back.
-const RECORD: &str = "UPDATE reconciler SET started_at = ?1, finished_at = ?2, summary = ?3, \
-     history = COALESCE(?4, history), lease_until = 0 WHERE id = 1";
+pub(crate) const RECORD: &str = "UPDATE reconciler SET started_at = $1, finished_at = $2, summary = $3, \
+     history = COALESCE($4, history), lease_until = 0 WHERE id = 1";
 
 /// Keeps the pass's summary and history and gives the lease back.
 async fn record(
-    db: &D1Database,
+    db: &Db,
     started: u64,
     summary: &str,
     history: Option<&[PassRecord]>,
 ) -> Fallible<()> {
-    let history = match history {
-        Some(history) => json(&history)?,
-        None => JsValue::NULL,
-    };
-    db.prepare(RECORD)
-        .bind(&[
-            int(started).map_err(text)?,
-            int(now_ms()).map_err(text)?,
-            summary.into(),
-            history,
-        ])
-        .map_err(text)?
-        .run()
+    let history = history.map(|history| json(&history)).transpose()?;
+    db.run(RECORD, &params![started, now_ms(), summary, history])
         .await
         .map_err(text)?;
     Ok(())
@@ -396,171 +375,70 @@ async fn record(
 /// The newest delivery the last complete scan saw.
 const DELIVERIES_UNTIL: &str = "SELECT deliveries_until FROM reconciler WHERE id = 1";
 
-/// The guids, of a JSON array in `?1`, already redelivered.
-const REMEMBERED: &str =
-    "SELECT guid FROM redeliveries WHERE guid IN (SELECT value FROM json_each(?1))";
+/// The guids, of a JSON array in `$1`, already redelivered.
+const REMEMBERED: &str = "SELECT guid FROM redeliveries \
+     WHERE guid IN (SELECT value FROM json_array_elements_text($1::json))";
 
-/// Moves the scan's mark forward to `?1`, never back.
+/// Moves the scan's mark forward to `$1`, never back.
 const MOVE_DELIVERIES_UNTIL: &str = "UPDATE reconciler SET deliveries_until = \
-     MAX(COALESCE(deliveries_until, 0), ?1) WHERE id = 1";
+     GREATEST(COALESCE(deliveries_until, 0), $1) WHERE id = 1";
 
 /// Remembers a redelivery, unless a pass already did.
 const CLAIM_REDELIVERY: &str = "INSERT INTO redeliveries (guid, delivery_id, event, \
-     redelivered_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (guid) DO NOTHING";
-
-/// Open jobs quiet since `?1`, quietest first, at most `?2`.
-const OPEN_JOBS: &str = "SELECT id, installation_id, repository, status FROM jobs \
-     WHERE status <> 'completed' AND COALESCE(checked_at, updated_at) < ?1 \
-     ORDER BY COALESCE(checked_at, updated_at) LIMIT ?2";
-
-/// Records what GitHub said about job `?1`, while its status is still
-/// `?5`: the status, the runner, and the conclusion and times `?6` to
-/// `?8` once GitHub has them.
-const RECORD_CHECK: &str = "UPDATE jobs SET status = ?2, ran_on = COALESCE(?3, ran_on), \
-     checked_at = ?4, updated_at = CASE WHEN status <> ?2 THEN ?4 ELSE updated_at END, \
-     conclusion = COALESCE(?6, conclusion), started_at = COALESCE(?7, started_at), \
-     completed_at = COALESCE(?8, completed_at) \
-     WHERE id = ?1 AND status = ?5";
-
-/// Runs without details, not created or tried since `?1`, least
-/// recently tried first, at most `?2`.
-const RUNS_WITHOUT_DETAILS: &str = "SELECT id, installation_id, repository FROM runs \
-     WHERE details_at IS NULL AND COALESCE(details_tried_at, created_at) < ?1 \
-     ORDER BY COALESCE(details_tried_at, created_at) LIMIT ?2";
-
-/// Stamps the runs of a JSON array `?2` as tried at `?1`, so a run that
-/// keeps failing, such as one of an uninstalled App, does not hold the
-/// others back.
-const DETAILS_TRIED: &str = "UPDATE runs SET details_tried_at = ?1 \
-     WHERE id IN (SELECT value FROM json_each(?2)) AND details_at IS NULL";
+     redelivered_at) VALUES ($1, $2, $3, $4) ON CONFLICT (guid) DO NOTHING";
 
 /// Tenants with a verified role, least recently reconciled first.
-fn tenants_query() -> String {
+pub(crate) fn tenants_query() -> String {
     format!(
         "SELECT id, installation_id, role_arn, region, launch_template_id, max_runners, \
          stack_checked_at, versions_swept_at FROM tenants \
-         WHERE {VERIFIED} ORDER BY COALESCE(reconciled_at, 0), id LIMIT ?1"
+         WHERE {VERIFIED} ORDER BY COALESCE(reconciled_at, 0), id LIMIT $1"
     )
 }
 
-/// Stamps tenant `?1` as reconciled at `?2`.
-const MARK_RECONCILED: &str = "UPDATE tenants SET reconciled_at = ?2 WHERE id = ?1";
+/// Stamps tenant `$1` as reconciled at `$2`.
+pub(crate) const MARK_RECONCILED: &str = "UPDATE tenants SET reconciled_at = $2 WHERE id = $1";
 
-/// Stamps tenant `?1`'s template versions as swept at `?2`.
-const MARK_SWEPT: &str = "UPDATE tenants SET versions_swept_at = ?2 WHERE id = ?1";
+/// Stamps tenant `$1`'s template versions as swept at `$2`.
+const MARK_SWEPT: &str = "UPDATE tenants SET versions_swept_at = $2 WHERE id = $1";
 
-/// Stamps tenant `?1`'s stack as read at `?2`.
-const MARK_STACK_CHECKED: &str = "UPDATE tenants SET stack_checked_at = ?2 WHERE id = ?1";
+/// Stamps tenant `$1`'s stack as read at `$2`.
+const MARK_STACK_CHECKED: &str = "UPDATE tenants SET stack_checked_at = $2 WHERE id = $1";
 
-/// An installation's open jobs, and the finished ones whose id is in the
-/// JSON array `?2` or whose runner is in `?3`. Three lookups, through
-/// `jobs_open`, the primary key and `jobs_ran_on`, so a tenant's
-/// finished jobs are never read; the unary `+` keeps SQLite off the
-/// installation and status indexes in the last two. They share no row,
-/// so `UNION ALL` needs no sort to drop duplicates.
-const TENANT_JOBS: &str = "SELECT id, label, status, launch_state, runner_name, ran_on, \
-     queued_at, updated_at, launch_retry, next_launch_at FROM jobs \
-     WHERE installation_id = ?1 AND status <> 'completed' \
-     UNION ALL SELECT id, label, status, launch_state, runner_name, ran_on, \
-     queued_at, updated_at, launch_retry, next_launch_at FROM jobs \
-     WHERE id IN (SELECT value FROM json_each(?2)) \
-     AND +installation_id = ?1 AND +status = 'completed' \
-     UNION ALL SELECT id, label, status, launch_state, runner_name, ran_on, \
-     queued_at, updated_at, launch_retry, next_launch_at FROM jobs \
-     WHERE ran_on IN (SELECT value FROM json_each(?3)) \
-     AND +installation_id = ?1 AND +status = 'completed' \
-     AND id NOT IN (SELECT value FROM json_each(?2))";
-
-/// Adopts instance `?2` for a job still launching.
-const ADOPT: &str = "UPDATE jobs SET launch_state = 'launched', instance_id = ?2, \
-     updated_at = ?3 WHERE id = ?1 AND launch_state = 'launching'";
-
-/// Undoes a launch so the job can launch again.
-const RESET: &str = "UPDATE jobs SET launch_state = NULL, runner_name = NULL, \
-     instance_id = NULL, launch_retry = NULL, next_launch_at = NULL, updated_at = ?3 \
-     WHERE id = ?1 AND status = 'queued' AND launch_state = ?2 AND runner_name IS ?4";
-
-/// Fails a launch whose runner `?4` waited too long.
-const GIVE_UP: &str = "UPDATE jobs SET launch_state = 'failed', launch_error = ?3, \
-     launch_retry = NULL, next_launch_at = NULL, updated_at = ?2 \
-     WHERE id = ?1 AND status = 'queued' AND launch_state = 'launched' AND runner_name = ?4";
-
-/// The jobs of a JSON array of ids, as `launch` takes them, oldest
-/// first.
-const QUEUED_JOBS: &str = "SELECT id, installation_id, repository, run_id, label FROM jobs \
-     WHERE id IN (SELECT value FROM json_each(?1)) ORDER BY queued_at, id";
-
-/// A tenant in a region whose catalog is due: not refreshed since `?1`
-/// nor attempted since `?2`.
-fn catalog_query() -> String {
+/// A tenant in a region whose catalog is due: not refreshed since `$1`
+/// nor attempted since `$2`.
+pub(crate) fn catalog_query() -> String {
     format!(
         "SELECT id, role_arn, region FROM tenants WHERE {VERIFIED} \
          AND NOT EXISTS (SELECT 1 FROM instance_type_regions AS done \
            WHERE done.region = tenants.region \
-           AND (done.refreshed_at >= ?1 OR done.attempted_at >= ?2)) \
+           AND (done.refreshed_at >= $1 OR done.attempted_at >= $2)) \
          ORDER BY COALESCE((SELECT refreshed_at FROM instance_type_regions AS done \
            WHERE done.region = tenants.region), 0), RANDOM() LIMIT 1"
     )
 }
 
-/// Lost launches, queued before `?1`, of installations with no verified
-/// tenant, at most `?2`.
-fn unconnected_query() -> String {
-    format!(
-        "SELECT id, installation_id, repository, run_id, label FROM jobs \
-         WHERE status = 'queued' AND launch_state IS NULL AND queued_at < ?1 \
-         AND installation_id NOT IN (SELECT installation_id FROM tenants \
-           WHERE installation_id IS NOT NULL AND {VERIFIED}) \
-         ORDER BY queued_at LIMIT ?2"
-    )
-}
-
-/// Deletes up to `?2` sessions expired before `?1`.
-const DELETE_SESSIONS: &str = "DELETE FROM sessions WHERE key IN \
-     (SELECT key FROM sessions WHERE expires_at < ?1 LIMIT ?2)";
-
-/// Gives up to `?2` jobs without `expires_at` one `?1` after they were
-/// queued. `jobs_expiry` holds the NULLs, so once none are left this
-/// reads nothing.
-const BACKFILL_JOBS: &str = "UPDATE jobs SET expires_at = queued_at + ?1 WHERE id IN \
-     (SELECT id FROM jobs WHERE expires_at IS NULL LIMIT ?2)";
-
-/// As [`BACKFILL_JOBS`], for runs.
-const BACKFILL_RUNS: &str = "UPDATE runs SET expires_at = queued_at + ?1 WHERE id IN \
-     (SELECT id FROM runs WHERE expires_at IS NULL LIMIT ?2)";
-
-/// Deletes up to `?2` jobs that expired before `?1`, oldest first.
-const DELETE_JOBS: &str = "DELETE FROM jobs WHERE id IN \
-     (SELECT id FROM jobs WHERE expires_at < ?1 ORDER BY expires_at LIMIT ?2)";
-
-/// Deletes up to `?2` runs that expired before `?1` and have no jobs
-/// left.
-const DELETE_RUNS: &str = "DELETE FROM runs WHERE id IN \
-     (SELECT id FROM runs WHERE expires_at < ?1 \
-       AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.run_id = runs.id) \
-     ORDER BY expires_at LIMIT ?2)";
+/// Deletes up to `$2` sessions expired before `$1`.
+pub(crate) const DELETE_SESSIONS: &str = "DELETE FROM sessions WHERE key IN \
+     (SELECT key FROM sessions WHERE expires_at < $1 LIMIT $2)";
 
 /// How long failed launches are kept.
 const FAILED_LAUNCH_MEMORY: u64 = 30 * 24 * 60 * 60 * 1000;
 /// How long a low rate limit is kept; the alert reads the last minutes.
 const RATE_LIMIT_MEMORY: u64 = 24 * 60 * 60 * 1000;
 
-/// Deletes up to `?2` redeliveries made before `?1`.
-const DELETE_REDELIVERIES: &str = "DELETE FROM redeliveries WHERE guid IN \
-     (SELECT guid FROM redeliveries WHERE redelivered_at < ?1 LIMIT ?2)";
+/// Deletes up to `$2` redeliveries made before `$1`.
+pub(crate) const DELETE_REDELIVERIES: &str = "DELETE FROM redeliveries WHERE guid IN \
+     (SELECT guid FROM redeliveries WHERE redelivered_at < $1 LIMIT $2)";
 
-/// Deletes unavailable offerings that lapsed before `?1`.
-const DELETE_OFFERINGS: &str = "DELETE FROM unavailable_offerings WHERE until < ?1";
+/// Deletes unavailable offerings that lapsed before `$1`.
+pub(crate) const DELETE_OFFERINGS: &str = "DELETE FROM unavailable_offerings WHERE until < $1";
 
-/// Deletes up to `?2` cache uploads started before `?1`.
-const DELETE_UPLOADS: &str = "DELETE FROM cache_uploads WHERE id IN \
-     (SELECT id FROM cache_uploads WHERE created_at < ?1 LIMIT ?2)";
-
-/// Deletes up to `?2` job minutes that completed before `?1` and that
+/// Deletes up to `$2` job minutes that completed before `$1` and that
 /// Polar has, or never needed.
-const DELETE_USAGE: &str = "DELETE FROM usage_events WHERE job_id IN \
-     (SELECT job_id FROM usage_events WHERE ended_at < ?1 \
-       AND (billed = 0 OR sent_at IS NOT NULL) LIMIT ?2)";
+pub(crate) const DELETE_USAGE: &str = "DELETE FROM usage_events WHERE job_id IN \
+     (SELECT job_id FROM usage_events WHERE ended_at < $1 \
+       AND (NOT billed OR sent_at IS NOT NULL) LIMIT $2)";
 
 /// The budget left once a step that found `before` and left `left`
 /// gets back what it reserved beyond the `sent` requests it made.
@@ -613,12 +491,12 @@ impl Pass<'_> {
     async fn redeliver(&self) -> Fallible<Summary> {
         let mut done = Summary::default();
         let app_jwt = self.app_jwt().await?;
-        let mark: Option<u64> = self
+        let mark = self
             .db
-            .prepare(DELIVERIES_UNTIL)
-            .first(Some("deliveries_until"))
+            .first::<Mark>(DELIVERIES_UNTIL, &[])
             .await
-            .map_err(text)?;
+            .map_err(text)?
+            .and_then(|row| row.deliveries_until);
         let floor = self.now.saturating_sub(self.limits.redeliver_window);
         let since = mark.map_or(floor, |mark| {
             mark.saturating_sub(DELIVERY_OVERLAP).max(floor)
@@ -630,13 +508,8 @@ impl Pass<'_> {
         let guids: Vec<&str> = chosen.iter().map(|chosen| chosen.guid.as_str()).collect();
         let remembered: HashSet<String> = self
             .db
-            .prepare(REMEMBERED)
-            .bind(&[json(&guids)?])
-            .map_err(text)?
-            .all()
+            .all::<Guid>(REMEMBERED, &params![json(&guids)?])
             .await
-            .map_err(text)?
-            .results::<Guid>()
             .map_err(text)?
             .into_iter()
             .map(|row| row.guid)
@@ -663,10 +536,7 @@ impl Pass<'_> {
         if complete && handled == pending.len() {
             if let Some(newest) = seen.iter().filter_map(deliveries::Delivery::at).max() {
                 self.db
-                    .prepare(MOVE_DELIVERIES_UNTIL)
-                    .bind(&[int(newest).map_err(text)?])
-                    .map_err(text)?
-                    .run()
+                    .run(MOVE_DELIVERIES_UNTIL, &params![newest])
                     .await
                     .map_err(text)?;
             }
@@ -686,18 +556,18 @@ impl Pass<'_> {
         // Remembered first, so two passes cannot both ask.
         let claimed = self
             .db
-            .prepare(CLAIM_REDELIVERY)
-            .bind(&[
-                redelivery.guid.as_str().into(),
-                int(redelivery.id).map_err(text)?,
-                redelivery.event.as_str().into(),
-                int(self.now).map_err(text)?,
-            ])
-            .map_err(text)?
-            .run()
+            .run(
+                CLAIM_REDELIVERY,
+                &params![
+                    redelivery.guid.as_str(),
+                    redelivery.id,
+                    redelivery.event.as_str(),
+                    self.now,
+                ],
+            )
             .await
             .map_err(text)?;
-        if changes(&claimed) != 1 {
+        if claimed != 1 {
             return Ok(None);
         }
         let request = deliveries::redeliver(&self.github_api, app_jwt, redelivery.id);
@@ -753,15 +623,8 @@ impl Pass<'_> {
     /// Step 2: asks GitHub about open jobs that have gone quiet.
     async fn sync(&self) -> Fallible<Summary> {
         let quiet = self.now.saturating_sub(self.limits.sync_after);
-        let open = self
-            .db
-            .prepare(OPEN_JOBS)
-            .bind(&[int(quiet).map_err(text)?, SYNC_PER_PASS.into()])
-            .map_err(text)?
-            .all()
+        let open = jobs::open_jobs::<OpenJob>(&self.db, quiet, SYNC_PER_PASS)
             .await
-            .map_err(text)?
-            .results::<OpenJob>()
             .map_err(text)?;
         if open.is_empty() {
             return Ok(Summary::default());
@@ -849,28 +712,18 @@ impl Pass<'_> {
         let next = seen.map_or(stored, |seen| sync::advance(stored, seen.status));
         let runner = seen.and_then(|seen| seen.runner_name.as_deref());
         let outcome = seen.map(|seen| &seen.outcome);
-        let time = |value: Option<u64>| value.map_or(Ok(JsValue::NULL), int).map_err(text);
-        let now = int(self.now).map_err(text)?;
-        let result = self
-            .db
-            .prepare(RECORD_CHECK)
-            .bind(&[
-                int(job.id).map_err(text)?,
-                next.as_str().into(),
-                runner.map_or(JsValue::NULL, Into::into),
-                now,
-                job.status.as_str().into(),
-                outcome
-                    .and_then(|outcome| outcome.conclusion.as_deref())
-                    .map_or(JsValue::NULL, Into::into),
-                time(outcome.and_then(|outcome| outcome.started_at))?,
-                time(outcome.and_then(|outcome| outcome.completed_at))?,
-            ])
-            .map_err(text)?
-            .run()
-            .await
-            .map_err(text)?;
-        let closed = changes(&result) == 1 && next == Status::Completed;
+        let changed = jobs::record_check(
+            &self.db,
+            job.id,
+            next.as_str(),
+            runner,
+            job.status.as_str(),
+            outcome,
+            self.now,
+        )
+        .await
+        .map_err(text)?;
+        let closed = changed == 1 && next == Status::Completed;
         if closed {
             console_log!("reconcile: job {} completed on GitHub", job.id);
             if let Some(sync::Seen {
@@ -895,26 +748,16 @@ impl Pass<'_> {
     /// not, oldest first.
     async fn details(&self) -> Fallible<Summary> {
         let before = self.now.saturating_sub(DETAILS_AFTER);
-        let runs = self
-            .db
-            .prepare(RUNS_WITHOUT_DETAILS)
-            .bind(&[int(before).map_err(text)?, DETAILS_PER_PASS.into()])
-            .map_err(text)?
-            .all()
-            .await
-            .map_err(text)?
-            .results::<RunWithoutDetails>()
-            .map_err(text)?;
+        let runs =
+            jobs::runs_without_details::<RunWithoutDetails>(&self.db, before, DETAILS_PER_PASS)
+                .await
+                .map_err(text)?;
         let done = Summary::default();
         if runs.is_empty() {
             return Ok(done);
         }
         let ids: Vec<u64> = runs.iter().map(|run| run.id).collect();
-        self.db
-            .prepare(DETAILS_TRIED)
-            .bind(&[int(self.now).map_err(text)?, json(&ids)?])
-            .map_err(text)?
-            .run()
+        jobs::details_tried(&self.db, &json(&ids)?, self.now)
             .await
             .map_err(text)?;
         let calls = Counted::default();
@@ -962,7 +805,7 @@ impl Pass<'_> {
                     .and_then(|response| runs::parse(&response))
                 {
                     Ok(details) => {
-                        runs::record(&self.db, run.id, &details)
+                        jobs::record_details(&self.db, run.id, &details, now_ms())
                             .await
                             .map_err(text)?;
                         done.run_details += 1;
@@ -982,13 +825,8 @@ impl Pass<'_> {
     async fn tenants(&self) -> Fallible<Summary> {
         let tenants = self
             .db
-            .prepare(tenants_query())
-            .bind(&[TENANTS_PER_PASS.into()])
-            .map_err(text)?
-            .all()
+            .all::<Tenant>(&tenants_query(), &params![TENANTS_PER_PASS])
             .await
-            .map_err(text)?
-            .results::<Tenant>()
             .map_err(text)?;
         if tenants.len() == TENANTS_PER_PASS as usize {
             self.more.set(true);
@@ -1033,10 +871,7 @@ impl Pass<'_> {
         // Moved to the back of the queue first, so a tenant that fails
         // every time does not hold up the rest.
         self.db
-            .prepare(MARK_RECONCILED)
-            .bind(&[tenant.id.as_str().into(), int(self.now).map_err(text)?])
-            .map_err(text)?
-            .run()
+            .run(MARK_RECONCILED, &params![tenant.id.as_str(), self.now])
             .await
             .map_err(text)?;
 
@@ -1194,10 +1029,7 @@ impl Pass<'_> {
 
     async fn swept(&self, tenant: &Tenant) -> Fallible<()> {
         self.db
-            .prepare(MARK_SWEPT)
-            .bind(&[tenant.id.as_str().into(), int(self.now).map_err(text)?])
-            .map_err(text)?
-            .run()
+            .run(MARK_SWEPT, &params![tenant.id.as_str(), self.now])
             .await
             .map_err(text)?;
         Ok(())
@@ -1220,10 +1052,7 @@ impl Pass<'_> {
                 // Stamped all the same, so a deleted stack is not asked about
                 // every minute; launches say what is wrong.
                 self.db
-                    .prepare(MARK_STACK_CHECKED)
-                    .bind(&[tenant.id.as_str().into(), int(self.now).map_err(text)?])
-                    .map_err(text)?
-                    .run()
+                    .run(MARK_STACK_CHECKED, &params![tenant.id.as_str(), self.now])
                     .await
                     .map_err(text)?;
                 return Err(err);
@@ -1329,20 +1158,10 @@ impl Pass<'_> {
             .iter()
             .filter_map(|instance| instance.runner_name.as_deref())
             .collect();
-        let rows = self
-            .db
-            .prepare(TENANT_JOBS)
-            .bind(&[
-                int(installation_id).map_err(text)?,
-                json(&ids)?,
-                json(&runners)?,
-            ])
-            .map_err(text)?
-            .all()
-            .await
-            .map_err(text)?
-            .results::<JobRow>()
-            .map_err(text)?;
+        let rows =
+            jobs::tenant_jobs::<JobRow>(&self.db, installation_id, &json(&ids)?, &json(&runners)?)
+                .await
+                .map_err(text)?;
         Ok(rows
             .into_iter()
             .filter_map(|row| {
@@ -1404,35 +1223,23 @@ impl Pass<'_> {
     /// Adopts, undoes and gives up launches, each only while the row
     /// still says what the plan saw.
     async fn update_jobs(&self, tenant: &Tenant, plan: &Plan, done: &mut Summary) -> Fallible<()> {
-        let now = int(self.now).map_err(text)?;
-        let mut statements: Vec<(D1PreparedStatement, Kind)> = Vec::new();
+        let mut changes: Vec<(LaunchChange, Kind)> = Vec::new();
         for (job_id, instance_id) in &plan.adopt {
-            statements.push((
-                self.db
-                    .prepare(ADOPT)
-                    .bind(&[
-                        int(*job_id).map_err(text)?,
-                        instance_id.as_str().into(),
-                        now.clone(),
-                    ])
-                    .map_err(text)?,
+            changes.push((
+                LaunchChange::Adopt {
+                    id: *job_id,
+                    instance_id: instance_id.as_str(),
+                },
                 Kind::Adopted,
             ));
         }
         for reset in &plan.reset {
-            statements.push((
-                self.db
-                    .prepare(RESET)
-                    .bind(&[
-                        int(reset.job_id).map_err(text)?,
-                        reset.launch_state.as_str().into(),
-                        now.clone(),
-                        reset
-                            .runner_name
-                            .as_deref()
-                            .map_or(JsValue::NULL, Into::into),
-                    ])
-                    .map_err(text)?,
+            changes.push((
+                LaunchChange::Reset {
+                    id: reset.job_id,
+                    launch_state: reset.launch_state.as_str(),
+                    runner_name: reset.runner_name.as_deref(),
+                },
                 Kind::Reset,
             ));
         }
@@ -1441,26 +1248,24 @@ impl Pass<'_> {
                 "runner {runner} waited {} minutes without GitHub handing it the job",
                 self.limits.idle_timeout / 60_000
             );
-            statements.push((
-                self.db
-                    .prepare(GIVE_UP)
-                    .bind(&[
-                        int(*job_id).map_err(text)?,
-                        now.clone(),
-                        reason.as_str().into(),
-                        runner.as_str().into(),
-                    ])
-                    .map_err(text)?,
+            changes.push((
+                LaunchChange::GiveUp {
+                    id: *job_id,
+                    reason,
+                    runner: runner.as_str(),
+                },
                 Kind::GaveUp,
             ));
         }
-        if statements.is_empty() {
+        if changes.is_empty() {
             return Ok(());
         }
-        let (statements, kinds): (Vec<_>, Vec<_>) = statements.into_iter().unzip();
-        let results = self.db.batch(statements).await.map_err(text)?;
-        for (result, kind) in results.iter().zip(kinds) {
-            if changes(result) != 1 {
+        let (changes, kinds): (Vec<_>, Vec<_>) = changes.into_iter().unzip();
+        let results = jobs::update_launches(&self.db, &changes, self.now)
+            .await
+            .map_err(text)?;
+        for (changed, kind) in results.into_iter().zip(kinds) {
+            if changed != 1 {
                 continue;
             }
             match kind {
@@ -1513,15 +1318,8 @@ impl Pass<'_> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = self
-            .db
-            .prepare(QUEUED_JOBS)
-            .bind(&[json(&ids)?])
-            .map_err(text)?
-            .all()
+        let rows = jobs::queued_jobs::<LaunchRow>(&self.db, &json(&ids)?)
             .await
-            .map_err(text)?
-            .results::<LaunchRow>()
             .map_err(text)?;
         Ok(rows.into_iter().filter_map(queued_job).collect())
     }
@@ -1533,13 +1331,13 @@ impl Pass<'_> {
     async fn catalog(&self) -> Fallible<Summary> {
         let due: Option<CatalogTenant> = self
             .db
-            .prepare(catalog_query())
-            .bind(&[
-                int(self.now.saturating_sub(instance_types::FRESH_FOR)).map_err(text)?,
-                int(self.now.saturating_sub(instance_types::RETRY_AFTER)).map_err(text)?,
-            ])
-            .map_err(text)?
-            .first(None)
+            .first(
+                &catalog_query(),
+                &params![
+                    self.now.saturating_sub(instance_types::FRESH_FOR),
+                    self.now.saturating_sub(instance_types::RETRY_AFTER),
+                ],
+            )
             .await
             .map_err(text)?;
         let Some(tenant) = due else {
@@ -1656,15 +1454,8 @@ impl Pass<'_> {
     /// connected. `launch` finds no tenant and says so on the job.
     async fn unconnected(&self) -> Fallible<Summary> {
         let before = self.now.saturating_sub(self.limits.queued_grace);
-        let rows = self
-            .db
-            .prepare(unconnected_query())
-            .bind(&[int(before).map_err(text)?, UNCONNECTED_PER_PASS.into()])
-            .map_err(text)?
-            .all()
+        let rows = jobs::unconnected::<LaunchRow>(&self.db, before, UNCONNECTED_PER_PASS)
             .await
-            .map_err(text)?
-            .results::<LaunchRow>()
             .map_err(text)?;
         let mut done = Summary::default();
         for job in rows.into_iter().filter_map(queued_job) {
@@ -1731,70 +1522,46 @@ impl Pass<'_> {
     /// that Polar has or never needed, and old failed launches and rate
     /// limits.
     async fn retention(&self) -> Fallible<Summary> {
-        let now = int(self.now).map_err(text)?;
-        let redeliveries_before = int(self.now.saturating_sub(REDELIVERY_MEMORY)).map_err(text)?;
-        let uploads_before = int(self.now.saturating_sub(CACHE_UPLOAD_MEMORY)).map_err(text)?;
-        let usage_before = int(self.now.saturating_sub(USAGE_MEMORY)).map_err(text)?;
-        let unset = int(UNSET_RETENTION).map_err(text)?;
-        let failed_before = int(self.now.saturating_sub(FAILED_LAUNCH_MEMORY)).map_err(text)?;
-        let limits_before = int(self.now.saturating_sub(RATE_LIMIT_MEMORY)).map_err(text)?;
-        let results = batch_meta(
-            &self.db,
-            vec![
+        let now = self.now;
+        let results = self
+            .db
+            .batch(&[
                 // Before the deletes, so a row without an expiry that
                 // is past it goes in the same pass.
-                self.db
-                    .prepare(BACKFILL_JOBS)
-                    .bind(&[unset.clone(), DELETE_BATCH.into()])
-                    .map_err(text)?,
-                self.db
-                    .prepare(BACKFILL_RUNS)
-                    .bind(&[unset, DELETE_BATCH.into()])
-                    .map_err(text)?,
-                self.db
-                    .prepare(DELETE_SESSIONS)
-                    .bind(&[now.clone(), DELETE_BATCH.into()])
-                    .map_err(text)?,
-                self.db
-                    .prepare(DELETE_JOBS)
-                    .bind(&[now.clone(), DELETE_BATCH.into()])
-                    .map_err(text)?,
-                self.db
-                    .prepare(DELETE_REDELIVERIES)
-                    .bind(&[redeliveries_before, DELETE_BATCH.into()])
-                    .map_err(text)?,
-                self.db
-                    .prepare(DELETE_OFFERINGS)
-                    .bind(std::slice::from_ref(&now))
-                    .map_err(text)?,
-                self.db
-                    .prepare(DELETE_UPLOADS)
-                    .bind(&[uploads_before, DELETE_BATCH.into()])
-                    .map_err(text)?,
-                self.db
-                    .prepare(alerts::DELETE_FAILED)
-                    .bind(&[failed_before, DELETE_BATCH.into()])
-                    .map_err(text)?,
-                self.db
-                    .prepare(alerts::DELETE_RATE_LIMITS)
-                    .bind(&[limits_before])
-                    .map_err(text)?,
+                (jobs::BACKFILL_JOBS, params![UNSET_RETENTION, DELETE_BATCH]),
+                (jobs::BACKFILL_RUNS, params![UNSET_RETENTION, DELETE_BATCH]),
+                (DELETE_SESSIONS, params![now, DELETE_BATCH]),
+                (jobs::DELETE_JOBS, params![now, DELETE_BATCH]),
+                (
+                    DELETE_REDELIVERIES,
+                    params![now.saturating_sub(REDELIVERY_MEMORY), DELETE_BATCH],
+                ),
+                (DELETE_OFFERINGS, params![now]),
+                (
+                    jobs::DELETE_UPLOADS,
+                    params![now.saturating_sub(CACHE_UPLOAD_MEMORY), DELETE_BATCH],
+                ),
+                (
+                    alerts::DELETE_FAILED,
+                    params![now.saturating_sub(FAILED_LAUNCH_MEMORY), DELETE_BATCH],
+                ),
+                (
+                    alerts::DELETE_RATE_LIMITS,
+                    params![now.saturating_sub(RATE_LIMIT_MEMORY)],
+                ),
                 // After the jobs, so a run goes with its last job.
-                self.db
-                    .prepare(DELETE_RUNS)
-                    .bind(&[now, DELETE_BATCH.into()])
-                    .map_err(text)?,
-                self.db
-                    .prepare(DELETE_USAGE)
-                    .bind(&[usage_before, DELETE_BATCH.into()])
-                    .map_err(text)?,
-            ],
-        )
-        .await?;
+                (jobs::DELETE_RUNS, params![now, DELETE_BATCH]),
+                (
+                    DELETE_USAGE,
+                    params![now.saturating_sub(USAGE_MEMORY), DELETE_BATCH],
+                ),
+            ])
+            .await
+            .map_err(text)?;
         let deleted = |at: usize| {
-            results.get(at).map_or(0, |meta| {
-                u32::try_from(meta.changes.unwrap_or(0)).unwrap_or(u32::MAX)
-            })
+            results
+                .get(at)
+                .map_or(0, |changed| u32::try_from(*changed).unwrap_or(u32::MAX))
         };
         if [0, 1, 2, 3, 4, 6, 7, 9, 10]
             .into_iter()
@@ -1806,7 +1573,6 @@ impl Pass<'_> {
             sessions_deleted: deleted(2),
             jobs_deleted: deleted(3),
             runs_deleted: deleted(9),
-            db_bytes: results.iter().rev().find_map(|meta| meta.size_after),
             ..Summary::default()
         })
     }
@@ -1817,6 +1583,16 @@ enum Kind {
     Adopted,
     Reset,
     GaveUp,
+}
+
+#[derive(Deserialize)]
+struct History {
+    history: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Mark {
+    deliveries_until: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1901,57 +1677,6 @@ fn queued_job(row: LaunchRow) -> Option<QueuedJob> {
     }
 }
 
-/// The meta D1 hands back for one statement of a batch, as far as the
-/// retention reads it. workers-rs reads `size_after` into a `usize`,
-/// 32 bits on wasm32, which fails once the database passes 4 GiB, so
-/// the batch is sent and its meta read here.
-#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
-struct Meta {
-    changes: Option<u64>,
-    size_after: Option<u64>,
-}
-
-/// Runs `statements` as one batch, as [`D1Database::batch`], and
-/// returns each statement's meta.
-async fn batch_meta(db: &D1Database, statements: Vec<D1PreparedStatement>) -> Fallible<Vec<Meta>> {
-    use wasm_bindgen::JsCast;
-
-    let error = |err: JsValue| format!("D1 batch: {err:?}");
-    let array = js_sys::Array::new();
-    for statement in &statements {
-        array.push(statement.inner());
-    }
-    let batch: js_sys::Function = js_sys::Reflect::get(db.as_ref(), &"batch".into())
-        .map_err(error)?
-        .dyn_into()
-        .map_err(error)?;
-    let promise: js_sys::Promise = batch
-        .call1(db.as_ref(), &array)
-        .map_err(error)?
-        .dyn_into()
-        .map_err(error)?;
-    let results = wasm_bindgen_futures::JsFuture::from(promise)
-        .await
-        .map_err(error)?;
-    Ok(js_sys::Array::from(&results)
-        .iter()
-        .map(|result| {
-            js_sys::Reflect::get(&result, &"meta".into())
-                .ok()
-                .and_then(|meta| js_sys::JSON::stringify(&meta).ok())
-                .and_then(|text| text.as_string())
-                .map(|text| meta(&text))
-                .unwrap_or_default()
-        })
-        .collect())
-}
-
-/// A statement's meta from its JSON; one that does not read says
-/// nothing.
-fn meta(text: &str) -> Meta {
-    serde_json::from_str(text).unwrap_or_default()
-}
-
 fn status(value: &str) -> Option<Status> {
     [Status::Queued, Status::InProgress, Status::Completed]
         .into_iter()
@@ -1966,10 +1691,9 @@ fn get(env: &Env, name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn json<T: Serialize>(values: &T) -> Fallible<JsValue> {
-    serde_json::to_string(values)
-        .map(Into::into)
-        .map_err(|err| err.to_string())
+/// `values` as JSON text, for the queries that take a JSON array.
+fn json<T: Serialize>(values: &T) -> Fallible<String> {
+    serde_json::to_string(values).map_err(|err| err.to_string())
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1989,7 +1713,7 @@ mod tests {
     fn job(db: &Db, id: u64, installation_id: u64, status: &str, queued_at: u64) {
         db.run(
             "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
-             queued_at, updated_at) VALUES (?1, ?2, 'acme/app', ?3, 'hatchrun', ?4, ?5, ?5)",
+             queued_at, updated_at) VALUES ($1, $2, 'acme/app', $3, 'hatchrun', $4, $5, $5)",
             &params![id, installation_id, id * 10, status, queued_at],
         );
     }
@@ -1998,7 +1722,7 @@ mod tests {
         db.run(
             "INSERT INTO tenants (id, org_id, org_login, installation_id, role_arn, region, \
              launch_template_id, subnet_ids, created_at, updated_at) \
-             VALUES (?1, ?2, ?1, ?3, 'arn:aws:iam::1:role/r', ?4, 'lt-1', 'subnet-1', ?5, ?5)",
+             VALUES ($1, $2, $1, $3, 'arn:aws:iam::1:role/r', $4, 'lt-1', 'subnet-1', $5, $5)",
             &params![
                 id,
                 installation_id.unwrap_or(0) + 1000,
@@ -2024,19 +1748,6 @@ mod tests {
         // A refused token took all three of one call.
         assert_eq!(settled(494, 500, 4), 496);
         assert_eq!(settled(500, 500, 0), 500);
-    }
-
-    #[test]
-    fn the_database_size_reads_past_four_gigabytes() {
-        let read = meta(r#"{"changes":3,"size_after":5400000000,"duration":0.5}"#);
-        assert_eq!(
-            read,
-            Meta {
-                changes: Some(3),
-                size_after: Some(5_400_000_000),
-            }
-        );
-        assert_eq!(meta("null"), Meta::default());
     }
 
     #[test]
@@ -2107,13 +1818,13 @@ mod tests {
         ] {
             db.run(
                 "INSERT INTO runs (id, installation_id, repository, head_sha, attempt, \
-                 queued_at, created_at, updated_at) VALUES (?1, 9, 'acme/app', 'a', 1, ?2, ?2, ?2)",
+                 queued_at, created_at, updated_at) VALUES ($1, 9, 'acme/app', 'a', 1, $2, $2, $2)",
                 &params![id, created_at],
             );
         }
         let due = |db: &Db| -> Vec<u64> {
             db.all::<RunWithoutDetails>(
-                RUNS_WITHOUT_DETAILS,
+                jobs::RUNS_WITHOUT_DETAILS,
                 &params![NOW - DETAILS_AFTER, DETAILS_PER_PASS],
             )
             .into_iter()
@@ -2122,7 +1833,7 @@ mod tests {
         };
         assert_eq!(due(&db), [1, 3]);
         db.run(
-            runs::DETAILS,
+            jobs::DETAILS,
             &params![
                 1u64,
                 None::<u64>,
@@ -2135,11 +1846,11 @@ mod tests {
         );
         assert_eq!(due(&db), [3]);
         // Tried and failed: it waits its turn behind the others.
-        assert_eq!(db.run(DETAILS_TRIED, &params![NOW, "[3]"]), 1);
+        assert_eq!(db.run(jobs::DETAILS_TRIED, &params![NOW, "[3]"]), 1);
         assert_eq!(due(&db), Vec::<u64>::new());
         let later: Vec<u64> = db
             .all::<RunWithoutDetails>(
-                RUNS_WITHOUT_DETAILS,
+                jobs::RUNS_WITHOUT_DETAILS,
                 &params![NOW + DETAILS_AFTER + 1, DETAILS_PER_PASS],
             )
             .into_iter()
@@ -2155,7 +1866,7 @@ mod tests {
         job(&db, 2, 9, "in_progress", NOW - 2000);
         job(&db, 3, 9, "completed", NOW - 4000);
         job(&db, 4, 9, "queued", NOW);
-        let open: Vec<OpenJob> = db.all(OPEN_JOBS, &params![NOW - 1000, SYNC_PER_PASS]);
+        let open: Vec<OpenJob> = db.all(jobs::OPEN_JOBS, &params![NOW - 1000, SYNC_PER_PASS]);
         let ids: Vec<u64> = open.iter().map(|job| job.id).collect();
         assert_eq!(ids, [1, 2]);
         assert_eq!(open[0].installation_id, 9);
@@ -2173,9 +1884,9 @@ mod tests {
             Some(NOW - 2500),
             Some(NOW - 100)
         ];
-        assert_eq!(db.run(RECORD_CHECK, &done), 1);
+        assert_eq!(db.run(jobs::RECORD_CHECK, &done), 1);
         // The row moved on, so the same update matches nothing.
-        assert_eq!(db.run(RECORD_CHECK, &done), 0);
+        assert_eq!(db.run(jobs::RECORD_CHECK, &done), 0);
         // Only asked, the status unchanged and no runner.
         let asked = params![
             2u64,
@@ -2187,7 +1898,7 @@ mod tests {
             None::<u64>,
             None::<u64>
         ];
-        assert_eq!(db.run(RECORD_CHECK, &asked), 1);
+        assert_eq!(db.run(jobs::RECORD_CHECK, &asked), 1);
         let rows = db
             .rows(
                 "SELECT id, status, ran_on, checked_at, updated_at FROM jobs \
@@ -2209,7 +1920,7 @@ mod tests {
         assert_eq!(rows[1]["ran_on"], Value::Null);
         assert_eq!(rows[1]["checked_at"], NOW);
         assert_eq!(rows[1]["updated_at"], NOW - 2000);
-        let open: Vec<OpenJob> = db.all(OPEN_JOBS, &params![NOW - 1000, SYNC_PER_PASS]);
+        let open: Vec<OpenJob> = db.all(jobs::OPEN_JOBS, &params![NOW - 1000, SYNC_PER_PASS]);
         assert!(open.is_empty());
     }
 
@@ -2246,12 +1957,12 @@ mod tests {
         job(&db, 5, 8, "queued", NOW);
         db.run(
             "UPDATE jobs SET ran_on = 'r-3', launch_state = 'launched', runner_name = 'r-3', \
-             launch_retry = 'backoff', next_launch_at = ?1 WHERE id = 3",
+             launch_retry = 'backoff', next_launch_at = $1 WHERE id = 3",
             &params![NOW + 60_000],
         );
         let ids = serde_json::to_string(&[2u64]).unwrap();
         let runners = serde_json::to_string(&["r-3"]).unwrap();
-        let mut rows: Vec<JobRow> = db.all(TENANT_JOBS, &params![9u64, ids, runners]);
+        let mut rows: Vec<JobRow> = db.all(jobs::TENANT_JOBS, &params![9u64, ids, runners]);
         rows.sort_by_key(|row| row.id);
         let ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
         assert_eq!(ids, [1, 2, 3]);
@@ -2267,7 +1978,7 @@ mod tests {
         assert_eq!(three.next_launch_at, Some(NOW + 60_000));
 
         // No instances: empty arrays.
-        let rows: Vec<JobRow> = db.all(TENANT_JOBS, &params![9u64, "[]", "[]"]);
+        let rows: Vec<JobRow> = db.all(jobs::TENANT_JOBS, &params![9u64, "[]", "[]"]);
         assert_eq!(rows.len(), 1);
     }
 
@@ -2300,10 +2011,10 @@ mod tests {
         let give_up = params![3u64, NOW, "runner r-3 waited 10 minutes", "r-3"];
         let changed = db
             .batch(&[
-                (ADOPT, adopt.clone()),
-                (RESET, reset.clone()),
-                (RESET, reset_named.clone()),
-                (GIVE_UP, give_up.clone()),
+                (jobs::ADOPT, adopt.clone()),
+                (jobs::RESET, reset.clone()),
+                (jobs::RESET, reset_named.clone()),
+                (jobs::GIVE_UP, give_up.clone()),
             ])
             .unwrap();
         assert_eq!(changed, [1, 1, 1, 1]);
@@ -2327,10 +2038,10 @@ mod tests {
 
         // The rows moved on; the same statements change nothing.
         for (sql, params) in [
-            (ADOPT, adopt),
-            (RESET, reset),
-            (RESET, reset_named),
-            (GIVE_UP, give_up),
+            (jobs::ADOPT, adopt),
+            (jobs::RESET, reset),
+            (jobs::RESET, reset_named),
+            (jobs::GIVE_UP, give_up),
         ] {
             assert_eq!(db.run(sql, &params), 0, "{sql}");
         }
@@ -2343,7 +2054,7 @@ mod tests {
         job(&db, 2, 9, "queued", NOW - 10);
         job(&db, 3, 9, "queued", NOW - 20);
         let ids = serde_json::to_string(&[1u64, 2]).unwrap();
-        let rows: Vec<LaunchRow> = db.all(QUEUED_JOBS, &params![ids]);
+        let rows: Vec<LaunchRow> = db.all(jobs::QUEUED_JOBS, &params![ids]);
         let ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
         assert_eq!(ids, [2, 1]);
         assert_eq!(rows[0].installation_id, 9);
@@ -2363,7 +2074,7 @@ mod tests {
         let due = params![fresh, retry];
         db.run(
             "INSERT INTO instance_type_regions (region, refreshed_at, attempted_at) \
-             VALUES ('eu-west-1', ?1, ?1)",
+             VALUES ('eu-west-1', $1, $1)",
             &params![NOW],
         );
         let picked: Option<CatalogTenant> = db.first(&catalog_query(), &due);
@@ -2372,7 +2083,7 @@ mod tests {
         assert_eq!(picked.region, "us-east-1");
         assert_eq!(picked.role_arn, "arn:aws:iam::1:role/r");
         db.run(
-            "INSERT INTO instance_type_regions (region, attempted_at) VALUES ('us-east-1', ?1)",
+            "INSERT INTO instance_type_regions (region, attempted_at) VALUES ('us-east-1', $1)",
             &params![NOW],
         );
         assert!(db.first::<CatalogTenant>(&catalog_query(), &due).is_none());
@@ -2388,7 +2099,7 @@ mod tests {
         job(&db, 12, 3, "queued", NOW - 200_000);
         job(&db, 13, 2, "queued", NOW);
         let rows: Vec<LaunchRow> = db.all(
-            &unconnected_query(),
+            &jobs::unconnected_query(),
             &params![NOW - 60_000, UNCONNECTED_PER_PASS],
         );
         let ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
@@ -2406,14 +2117,14 @@ mod tests {
         for (key, expires_at) in [("old", NOW - 1), ("new", NOW + 1)] {
             db.run(
                 "INSERT INTO sessions (key, user_id, github_token, created_at, expires_at) \
-                 VALUES (?1, 1, 't', 0, ?2)",
+                 VALUES ($1, 1, 't', 0, $2)",
                 &params![key, expires_at],
             );
         }
         job(&db, 1, 9, "completed", NOW - 100);
         job(&db, 2, 9, "completed", NOW);
         db.run(
-            "UPDATE jobs SET expires_at = CASE id WHEN 1 THEN ?1 ELSE ?2 END",
+            "UPDATE jobs SET expires_at = CASE id WHEN 1 THEN $1::bigint ELSE $2::bigint END WHERE id IN (1, 2)",
             &params![NOW - 1, NOW + 1],
         );
         // Run 10 loses its only job; run 20 expired too but keeps one.
@@ -2421,7 +2132,7 @@ mod tests {
             db.run(
                 "INSERT INTO runs (id, installation_id, repository, head_sha, attempt, \
                  queued_at, created_at, updated_at, expires_at) \
-                 VALUES (?1, 9, 'acme/app', 'a', 1, 0, 0, 0, ?2)",
+                 VALUES ($1, 9, 'acme/app', 'a', 1, 0, 0, 0, $2)",
                 &params![id, expires_at],
             );
         }
@@ -2432,14 +2143,14 @@ mod tests {
             db.run(
                 "INSERT INTO unavailable_offerings \
                  (tenant_id, instance_type, subnet_id, spot, code, until) \
-                 VALUES ('a', 'm8g.large', ?1, 0, 'c', ?2)",
+                 VALUES ('a', 'm8g.large', $1, false, 'c', $2)",
                 &params![subnet, until],
             );
         }
         for (id, at) in [("old", NOW - CACHE_UPLOAD_MEMORY - 1), ("new", NOW)] {
             db.run(
                 "INSERT INTO cache_uploads (id, job_id, object_key, upload_id, created_at) \
-                 VALUES (?1, 1, 'k', 'u', ?2)",
+                 VALUES ($1, 1, 'k', 'u', $2)",
                 &params![id, at],
             );
         }
@@ -2447,22 +2158,26 @@ mod tests {
         let deleted = db
             .batch(&[
                 (DELETE_SESSIONS, params![NOW, DELETE_BATCH]),
-                (DELETE_JOBS, params![NOW, DELETE_BATCH]),
+                (jobs::DELETE_JOBS, params![NOW, DELETE_BATCH]),
                 (
                     DELETE_REDELIVERIES,
                     params![NOW - REDELIVERY_MEMORY, DELETE_BATCH],
                 ),
                 (DELETE_OFFERINGS, params![NOW]),
                 (
-                    DELETE_UPLOADS,
+                    jobs::DELETE_UPLOADS,
                     params![NOW - CACHE_UPLOAD_MEMORY, DELETE_BATCH],
                 ),
-                (DELETE_RUNS, params![NOW, DELETE_BATCH]),
+                (jobs::DELETE_RUNS, params![NOW, DELETE_BATCH]),
             ])
             .unwrap();
         assert_eq!(deleted, [1, 1, 1, 1, 1, 1]);
         assert_eq!(
-            value(&db, "SELECT group_concat(id) FROM runs", &[]),
+            value(
+                &db,
+                "SELECT string_agg(id::text, ',' ORDER BY id) AS ids FROM runs",
+                &[]
+            ),
             "20,30"
         );
         for (table, key) in [
@@ -2473,12 +2188,19 @@ mod tests {
         ] {
             let left = value(
                 &db,
-                &format!("SELECT group_concat({key}) FROM {table}"),
+                &format!("SELECT string_agg({key}::text, ',') AS kept FROM {table}"),
                 &[],
             );
             assert!(left == "new" || left == "s-new", "{table} kept {left}");
         }
-        assert_eq!(value(&db, "SELECT group_concat(id) FROM jobs", &[]), "2");
+        assert_eq!(
+            value(
+                &db,
+                "SELECT string_agg(id::text, ',' ORDER BY id) AS ids FROM jobs",
+                &[]
+            ),
+            "2"
+        );
     }
 
     #[test]
@@ -2487,9 +2209,19 @@ mod tests {
         for id in 0..3u64 {
             job(&db, id + 1, 9, "completed", id);
         }
-        db.run("UPDATE jobs SET expires_at = queued_at", &[]);
-        assert_eq!(db.run(DELETE_JOBS, &params![NOW, 2u32]), 2);
-        assert_eq!(value(&db, "SELECT group_concat(id) FROM jobs", &[]), "3");
+        db.run(
+            "UPDATE jobs SET expires_at = queued_at WHERE expires_at IS NULL",
+            &[],
+        );
+        assert_eq!(db.run(jobs::DELETE_JOBS, &params![NOW, 2u32]), 2);
+        assert_eq!(
+            value(
+                &db,
+                "SELECT string_agg(id::text, ',' ORDER BY id) AS ids FROM jobs",
+                &[]
+            ),
+            "3"
+        );
     }
 
     #[test]
@@ -2505,7 +2237,7 @@ mod tests {
             // As the webhook records a job of run `installation`.
             db.batch(&[
                 (
-                    crate::RUN,
+                    crate::jobs::RUN,
                     params![
                         installation,
                         installation,
@@ -2518,7 +2250,7 @@ mod tests {
                     ],
                 ),
                 (
-                    crate::QUEUED,
+                    crate::jobs::QUEUED,
                     params![
                         installation,
                         installation,
@@ -2537,7 +2269,7 @@ mod tests {
             value(
                 &db,
                 &format!(
-                    "SELECT group_concat(expires_at) FROM (SELECT expires_at FROM {table} ORDER BY id)"
+                    "SELECT string_agg(expires_at::text, ',' ORDER BY id) AS expiry FROM {table}"
                 ),
                 &[],
             )
@@ -2548,15 +2280,29 @@ mod tests {
 
         let retention = |now: u64| {
             db.batch(&[
-                (DELETE_JOBS, params![now, DELETE_BATCH]),
-                (DELETE_RUNS, params![now, DELETE_BATCH]),
+                (jobs::DELETE_JOBS, params![now, DELETE_BATCH]),
+                (jobs::DELETE_RUNS, params![now, DELETE_BATCH]),
             ])
             .unwrap()
         };
         assert_eq!(retention(NOW + 30 * DAY), [0, 0]);
         assert_eq!(retention(NOW + 30 * DAY + 1), [2, 2]);
-        assert_eq!(value(&db, "SELECT group_concat(id) FROM jobs", &[]), "1");
-        assert_eq!(value(&db, "SELECT group_concat(id) FROM runs", &[]), "1");
+        assert_eq!(
+            value(
+                &db,
+                "SELECT string_agg(id::text, ',' ORDER BY id) AS ids FROM jobs",
+                &[]
+            ),
+            "1"
+        );
+        assert_eq!(
+            value(
+                &db,
+                "SELECT string_agg(id::text, ',' ORDER BY id) AS ids FROM runs",
+                &[]
+            ),
+            "1"
+        );
         assert_eq!(retention(NOW + 90 * DAY), [0, 0]);
         assert_eq!(retention(NOW + 90 * DAY + 1), [1, 1]);
     }
@@ -2570,16 +2316,16 @@ mod tests {
         job(&db, 2, 9, "queued", NOW);
         db.run(
             "INSERT INTO runs (id, installation_id, repository, head_sha, attempt, \
-             queued_at, created_at, updated_at) VALUES (10, 9, 'acme/app', 'a', 1, ?1, ?1, ?1)",
+             queued_at, created_at, updated_at) VALUES (10, 9, 'acme/app', 'a', 1, $1, $1, $1)",
             &params![NOW - UNSET_RETENTION - 1],
         );
         // As `retention` binds them.
         let pass = |db: &Db| {
             db.batch(&[
-                (BACKFILL_JOBS, params![UNSET_RETENTION, DELETE_BATCH]),
-                (BACKFILL_RUNS, params![UNSET_RETENTION, DELETE_BATCH]),
-                (DELETE_JOBS, params![NOW, DELETE_BATCH]),
-                (DELETE_RUNS, params![NOW, DELETE_BATCH]),
+                (jobs::BACKFILL_JOBS, params![UNSET_RETENTION, DELETE_BATCH]),
+                (jobs::BACKFILL_RUNS, params![UNSET_RETENTION, DELETE_BATCH]),
+                (jobs::DELETE_JOBS, params![NOW, DELETE_BATCH]),
+                (jobs::DELETE_RUNS, params![NOW, DELETE_BATCH]),
             ])
             .unwrap()
         };
@@ -2588,7 +2334,7 @@ mod tests {
         assert_eq!(left.len(), 1);
         assert_eq!(left[0]["id"], 2);
         assert_eq!(left[0]["expires_at"], NOW + UNSET_RETENTION);
-        assert_eq!(value(&db, "SELECT COUNT(*) FROM runs", &[]), 0);
+        assert_eq!(value(&db, "SELECT COUNT(*) AS n FROM runs", &[]), 0);
         // Filled in: the next pass has nothing to do.
         assert_eq!(pass(&db), [0, 0, 0, 0]);
     }
@@ -2599,13 +2345,19 @@ mod tests {
         tenant(&db, "a", Some(1), Some("eu-west-1"));
         for days in [0u32, 91] {
             assert!(
-                db.try_run("UPDATE tenants SET retention_days = ?1", &params![days])
-                    .is_err(),
+                db.try_run(
+                    "UPDATE tenants SET retention_days = $1 WHERE id = 'a'",
+                    &params![days]
+                )
+                .is_err(),
                 "{days}"
             );
         }
         assert_eq!(
-            db.run("UPDATE tenants SET retention_days = ?1", &params![1u32]),
+            db.run(
+                "UPDATE tenants SET retention_days = $1 WHERE id = 'a'",
+                &params![1u32]
+            ),
             1
         );
     }
@@ -2613,36 +2365,42 @@ mod tests {
     #[test]
     fn job_queries_read_through_indexes() {
         let db = Db::new();
+        // On these empty tables the planner would read a whole index
+        // in no useful order and sort; a large table reads the indexes
+        // below in order.
+        db.run("SET enable_bitmapscan = off", &[]);
+        db.run("SET enable_mergejoin = off", &[]);
+        db.run("SET enable_hashjoin = off", &[]);
         let plans = [
             (
                 "OPEN_JOBS",
-                db.plan(OPEN_JOBS, &params![NOW, SYNC_PER_PASS]),
+                db.plan(jobs::OPEN_JOBS, &params![NOW, SYNC_PER_PASS]),
                 &["jobs_unchecked"][..],
             ),
             (
                 "TENANT_JOBS",
-                db.plan(TENANT_JOBS, &params![9u64, "[1]", r#"["r-1"]"#]),
-                &["jobs_open", "INTEGER PRIMARY KEY", "jobs_ran_on"][..],
+                db.plan(jobs::TENANT_JOBS, &params![9u64, "[1]", r#"["r-1"]"#]),
+                &["jobs_open", "jobs_pkey", "jobs_ran_on"][..],
             ),
             (
                 "DELETE_JOBS",
-                db.plan(DELETE_JOBS, &params![NOW, DELETE_BATCH]),
+                db.plan(jobs::DELETE_JOBS, &params![NOW, DELETE_BATCH]),
                 &["jobs_expiry"][..],
             ),
             (
                 "DELETE_RUNS",
-                db.plan(DELETE_RUNS, &params![NOW, DELETE_BATCH]),
+                db.plan(jobs::DELETE_RUNS, &params![NOW, DELETE_BATCH]),
                 &["runs_expiry", "jobs_run"][..],
             ),
             (
                 "BACKFILL_JOBS",
-                db.plan(BACKFILL_JOBS, &params![UNSET_RETENTION, DELETE_BATCH]),
-                &["jobs_expiry (expires_at=?)"][..],
+                db.plan(jobs::BACKFILL_JOBS, &params![UNSET_RETENTION, DELETE_BATCH]),
+                &["jobs_expiry", "(expires_at IS NULL)"][..],
             ),
             (
                 "BACKFILL_RUNS",
-                db.plan(BACKFILL_RUNS, &params![UNSET_RETENTION, DELETE_BATCH]),
-                &["runs_expiry (expires_at=?)"][..],
+                db.plan(jobs::BACKFILL_RUNS, &params![UNSET_RETENTION, DELETE_BATCH]),
+                &["runs_expiry", "(expires_at IS NULL)"][..],
             ),
             (
                 "DELETE_USAGE",
@@ -2651,9 +2409,8 @@ mod tests {
             ),
         ];
         for (name, plan, indexes) in plans {
-            assert!(!plan.contains("SCAN jobs"), "{name}\n{plan}");
-            assert!(!plan.contains("SCAN runs"), "{name}\n{plan}");
-            assert!(!plan.contains("TEMP B-TREE"), "{name}\n{plan}");
+            assert!(!plan.contains("Seq Scan"), "{name}\n{plan}");
+            assert!(!plan.contains("Sort"), "{name}\n{plan}");
             for index in indexes {
                 assert!(plan.contains(index), "{name} without {index}\n{plan}");
             }

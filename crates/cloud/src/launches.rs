@@ -15,8 +15,8 @@
 //! nothing the second time. A message is acked once `launch` has
 //! decided: it launched, refused the tenant, found the job taken, or
 //! recorded a failure for the reconciler to retry (see
-//! [`crate::reconcile::retry`]). An error before that, such as D1 not
-//! answering, retries the message after [`RETRY_DELAY`]. After the
+//! [`crate::reconcile::retry`]). An error before that, such as the database
+//! not answering, retries the message after [`RETRY_DELAY`]. After the
 //! consumer's `max_retries` the message goes to `hatchrun-launches-dlq`,
 //! and the reconciler launches the job again once its grace is up. This
 //! Worker consumes the dead-letter queue too: it records each message
@@ -28,8 +28,9 @@ use std::future::Future;
 use serde::{Deserialize, Serialize};
 use worker::{Env, MessageBatch, MessageExt, QueueRetryOptionsBuilder, console_error};
 
+use crate::db::Db;
 use crate::webhook::QueuedJob;
-use crate::{DB, alerts, labels, launch, now_ms};
+use crate::{alerts, labels, launch, now_ms};
 
 /// Queue producer binding in `wrangler.toml`.
 pub(crate) const QUEUE: &str = "LAUNCHES";
@@ -184,15 +185,15 @@ fn dead_letter(id: String, body: serde_json::Value) -> (String, Option<u64>, Opt
 }
 
 /// The dead-letter queue's consumer: records the batch's launches as
-/// failed and acks them, or retries the batch when D1 does not take
-/// them. The alert's own errors do not hold the messages back.
+/// failed and acks them, or retries the batch when the database does not
+/// take them. The alert's own errors do not hold the messages back.
 pub(crate) async fn dead_letters(batch: MessageBatch<serde_json::Value>, env: Env) {
     let messages: Vec<_> = batch.raw_iter().collect();
     let failed: Vec<_> = messages
         .iter()
         .map(|message| dead_letter(message.id(), json(&message.body())))
         .collect();
-    let recorded = match env.d1(DB) {
+    let recorded = match Db::connect(&env).await {
         Ok(db) => alerts::launches_failed(&env, &db, now_ms(), &failed).await,
         Err(err) => Err(err.to_string()),
     };
@@ -246,9 +247,9 @@ mod tests {
         }
     }
 
-    /// `launch` up to the claim, against SQLite: claims the job with the
+    /// `launch` up to the claim, against Postgres: claims the job with the
     /// Worker's own statement and counts the runners it would start.
-    /// `down` fails the next calls before the claim, as D1 would.
+    /// `down` fails the next calls before the claim, as the database would.
     struct Claims {
         db: Db,
         down: Cell<u32>,
@@ -260,7 +261,7 @@ mod tests {
             let db = Db::new();
             db.run(
                 "INSERT INTO tenants (id, org_id, org_login, installation_id, max_runners, \
-                 created_at, updated_at) VALUES ('t1', 9, 'acme', ?1, 10, ?2, ?2)",
+                 created_at, updated_at) VALUES ('t1', 9, 'acme', $1, 10, $2, $2)",
                 &params![INSTALLATION, NOW],
             );
             Self {
@@ -273,8 +274,8 @@ mod tests {
         fn record(&self, id: u64) {
             self.db.run(
                 "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
-                 queued_at, updated_at) VALUES (?1, ?2, 'acme/app', 77, 'hatchrun', 'queued', \
-                 ?3, ?3)",
+                 queued_at, updated_at) VALUES ($1, $2, 'acme/app', 77, 'hatchrun', 'queued', \
+                 $3, $3)",
                 &params![id, INSTALLATION, NOW],
             );
         }
@@ -284,10 +285,10 @@ mod tests {
         fn launch(&self, job: &QueuedJob) -> impl Future<Output = Result<(), String>> {
             if self.down.get() > 0 {
                 self.down.set(self.down.get() - 1);
-                return std::future::ready(Err("D1_ERROR: database unavailable".to_owned()));
+                return std::future::ready(Err("database unavailable".to_owned()));
             }
             let claimed = self.db.run(
-                launch::CLAIM,
+                crate::jobs::CLAIM,
                 &params![
                     job.id,
                     format!("hatchrun-{}-00", job.id),

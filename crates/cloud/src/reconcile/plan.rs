@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! What one pass does about a tenant: which instances to terminate and
-//! which queued jobs to launch again, from the tenant's jobs in D1 and
-//! its live instances in EC2. Nothing here talks to anything, so the
-//! rules test natively.
+//! which queued jobs to launch again, from the tenant's jobs in the
+//! database and its live instances in EC2. Nothing here talks to
+//! anything, so the rules test natively.
 //!
 //! A runner registers with its job's label and GitHub hands it any job
 //! with that label (see [`crate::labels`]), so the runner launched for

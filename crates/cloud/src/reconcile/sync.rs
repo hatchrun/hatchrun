@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Where GitHub says a job stands, for jobs whose webhooks went
-//! missing: an open job in D1 that GitHub finished keeps a runner's
-//! place under `max_runners` and its instance alive.
+//! missing: an open job in the database that GitHub finished keeps a
+//! runner's place under `max_runners` and its instance alive.
 
 use serde::Deserialize;
 
@@ -87,8 +87,8 @@ pub fn parse(response: &Response) -> Result<Seen, String> {
     })
 }
 
-/// The status to store: GitHub's, unless D1 already has a later one,
-/// since a job never goes back.
+/// The status to store: GitHub's, unless the database already has a
+/// later one, since a job never goes back.
 #[must_use]
 pub fn advance(stored: Status, seen: Status) -> Status {
     let rank = |status| match status {

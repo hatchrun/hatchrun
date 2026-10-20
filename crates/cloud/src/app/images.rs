@@ -10,16 +10,15 @@
 use std::cell::RefCell;
 
 use serde::Deserialize;
-use worker::{
-    D1Database, Env, Request, Response, Result, console_error, console_log, console_warn,
-};
+use worker::{Env, Request, Response, Result, console_error, console_log, console_warn};
 
 use super::{get, json_error};
 use crate::actions::{self, Key, Policy, Rejection};
+use crate::db::{Db, params};
 use crate::fetch::send;
 use crate::http;
 use crate::images::{self, MAX_BODY, ROOT_DEVICE, Release, UPSERT};
-use crate::{DB, int, now_ms};
+use crate::now_ms;
 
 /// Variable that replaces GitHub's Actions issuer, for development.
 /// Production refuses it (see [`images::issuer`]).
@@ -53,16 +52,16 @@ struct Stored {
 }
 
 /// A row when the token with this jti posted a release before.
-const TOKEN_USED: &str = "SELECT 1 FROM used_tokens WHERE jti = ?1";
+const TOKEN_USED: &str = "SELECT 1 FROM used_tokens WHERE jti = $1";
 
 /// The newest release in the table.
 const NEWEST_VERSION: &str = "SELECT MAX(version) AS version FROM images";
 
 /// Forgets tokens that expired before the time in milliseconds.
-const FORGET_TOKENS: &str = "DELETE FROM used_tokens WHERE expires_at < ?1";
+const FORGET_TOKENS: &str = "DELETE FROM used_tokens WHERE expires_at < $1";
 
 /// Spends a token. Binds its jti and when it expires, in milliseconds.
-const SPEND_TOKEN: &str = "INSERT INTO used_tokens (jti, expires_at) VALUES (?1, ?2)";
+const SPEND_TOKEN: &str = "INSERT INTO used_tokens (jti, expires_at) VALUES ($1, $2)";
 
 pub(crate) async fn post(mut req: Request, env: &Env) -> Result<Response> {
     let token = req
@@ -109,16 +108,14 @@ pub(crate) async fn post(mut req: Request, env: &Env) -> Result<Response> {
     if let Err(err) = images::check_version_time(&release.version, claims.iat) {
         return json_error(&err, 400);
     }
-    let db = env.d1(DB)?;
+    let db = Db::connect(env).await?;
     let used = db
-        .prepare(TOKEN_USED)
-        .bind(&[claims.jti.as_str().into()])?
-        .first::<serde_json::Value>(None)
+        .first::<serde_json::Value>(TOKEN_USED, &params![claims.jti.as_str()])
         .await?;
     if used.is_some() {
         return json_error("token already used", 401);
     }
-    let stored: Option<Stored> = db.prepare(NEWEST_VERSION).first(None).await?;
+    let stored: Option<Stored> = db.first(NEWEST_VERSION, &[]).await?;
     let stored = stored.and_then(|row| row.version);
     if !images::is_current(&release.version, stored.as_deref()) {
         return json_error(
@@ -245,29 +242,35 @@ fn trusted_issuer(req: &Request, env: &Env) -> Result<std::result::Result<String
 /// Spends the token and writes the release's images in one batch, so a
 /// second post with the token fails on its primary key and writes
 /// nothing.
-async fn store(db: &D1Database, release: &Release, claims: &actions::Claims) -> Result<()> {
-    let now = int(now_ms())?;
+async fn store(db: &Db, release: &Release, claims: &actions::Claims) -> Result<()> {
+    let now = now_ms();
     let mut statements = vec![
-        db.prepare(FORGET_TOKENS).bind(std::slice::from_ref(&now))?,
-        db.prepare(SPEND_TOKEN).bind(&[
-            claims.jti.as_str().into(),
-            int(claims
-                .exp
-                .saturating_add(actions::LEEWAY)
-                .saturating_mul(1000))?,
-        ])?,
+        (FORGET_TOKENS, params![now]),
+        (
+            SPEND_TOKEN,
+            params![
+                claims.jti.as_str(),
+                claims
+                    .exp
+                    .saturating_add(actions::LEEWAY)
+                    .saturating_mul(1000),
+            ],
+        ),
     ];
     for image in &release.images {
-        statements.push(db.prepare(UPSERT).bind(&[
-            image.region.as_str().into(),
-            image.arch.into(),
-            image.image_id.as_str().into(),
-            ROOT_DEVICE.into(),
-            release.version.as_str().into(),
-            now.clone(),
-        ])?);
+        statements.push((
+            UPSERT,
+            params![
+                image.region.as_str(),
+                image.arch,
+                image.image_id.as_str(),
+                ROOT_DEVICE,
+                release.version.as_str(),
+                now,
+            ],
+        ));
     }
-    db.batch(statements).await?;
+    db.batch(&statements).await?;
     Ok(())
 }
 

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Alerts by email on the reconciler, launches, GitHub's rate limit and
-//! the database's size.
+//! the database's connections.
 //!
 //! After each pass the reconciler checks its own history, the pass
 //! summary and a few indexed queries (see [`check`]), and the
@@ -24,12 +24,12 @@
 use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
-use worker::{D1Database, Env, SendEmail, SendEmailBuilder, console_error};
+use worker::{Env, SendEmail, SendEmailBuilder, console_error};
 
+use crate::db::{Db, Param, params};
 use crate::fetch::Counted;
 use crate::github::RateLimit;
 use crate::reconcile::{VERIFIED, time};
-use crate::{changes, int};
 
 /// The `send_email` binding in `wrangler.toml`.
 const BINDING: &str = "ALERTS";
@@ -41,8 +41,11 @@ const FROM: &str = "alerts@notify.hatchrun.io";
 
 const MINUTE: u64 = 60 * 1000;
 const DAY: u64 = 24 * 60 * MINUTE;
-/// Bytes in a gigabyte, as D1's limits count them.
+/// Bytes in a gigabyte.
 const GB: u64 = 1_000_000_000;
+/// The share of the database's connections in use, in percent, at which
+/// its alert fires.
+const CONNECTIONS_PERCENT: u64 = 80;
 
 /// Passes the `reconciler` row remembers.
 pub(crate) const HISTORY: usize = 10;
@@ -78,29 +81,11 @@ pub(crate) enum Key {
     /// GitHub refused a request for the rate limit, or an installation
     /// has little left.
     RateLimit,
-    /// The database is past 4 GB: `JobStore` (#103) is due.
-    Size4,
-    /// Past 5 GB: sharding the jobs (#104) is due.
-    Size5,
-    /// Past 8 GB, near D1's 10 GB limit.
-    Size8,
+    /// The database has [`CONNECTIONS_PERCENT`] of its connections in
+    /// use. Hyperdrive pools the Worker's, so this is Hyperdrive's pool,
+    /// the migrations and anyone connected by hand.
+    DatabaseConnections,
 }
-
-/// The size alerts, with the size in GB each fires at and what it
-/// means.
-const SIZES: [(Key, u64, &str); 3] = [
-    (
-        Key::Size4,
-        4,
-        "Time to move job storage behind JobStore (#103).",
-    ),
-    (Key::Size5, 5, "Time to shard the jobs (#104)."),
-    (
-        Key::Size8,
-        8,
-        "D1 stops taking writes at 10 GB; the jobs need to move now.",
-    ),
-];
 
 impl Key {
     /// Its row's key.
@@ -111,9 +96,7 @@ impl Key {
             Key::LaunchFailed => "launch_failed",
             Key::JobsWaiting => "jobs_waiting",
             Key::RateLimit => "github_rate_limit",
-            Key::Size4 => "d1_size_4gb",
-            Key::Size5 => "d1_size_5gb",
-            Key::Size8 => "d1_size_8gb",
+            Key::DatabaseConnections => "database_connections",
         }
     }
 }
@@ -126,9 +109,7 @@ fn title(key: &str) -> &str {
         "launch_failed" => "Launch failed for good",
         "jobs_waiting" => "Jobs waiting for a runner",
         "github_rate_limit" => "GitHub rate limit",
-        "d1_size_4gb" => "D1 past 4 GB",
-        "d1_size_5gb" => "D1 past 5 GB",
-        "d1_size_8gb" => "D1 past 8 GB",
+        "database_connections" => "Database connections near the limit",
         other => other,
     }
 }
@@ -281,7 +262,7 @@ fn duration(ms: u64) -> String {
     }
 }
 
-/// Where alerts are kept: D1, or SQLite in tests.
+/// Where alerts are kept.
 pub(crate) trait Store {
     /// Every alert.
     async fn alerts(&self) -> Result<Vec<Alert>, String>;
@@ -304,7 +285,7 @@ const ALERTS: &str = "SELECT key, state, detail, fired_at, resolved_at, sent FRO
 
 /// Writes an alert's row.
 const SAVE: &str = "INSERT INTO alerts (key, state, detail, fired_at, resolved_at, sent, \
-     updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+     updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
      ON CONFLICT (key) DO UPDATE SET state = excluded.state, detail = excluded.detail, \
      fired_at = excluded.fired_at, resolved_at = excluded.resolved_at, sent = excluded.sent, \
      updated_at = excluded.updated_at";
@@ -312,8 +293,8 @@ const SAVE: &str = "INSERT INTO alerts (key, state, detail, fired_at, resolved_a
 /// When the last digest went out.
 const DIGEST_AT: &str = "SELECT digest_at FROM reconciler WHERE id = 1";
 
-/// Notes that a digest went out at `?1`.
-const DIGESTED: &str = "UPDATE reconciler SET digest_at = ?1 WHERE id = 1";
+/// Notes that a digest went out at `$1`.
+const DIGESTED: &str = "UPDATE reconciler SET digest_at = $1 WHERE id = 1";
 
 /// Applies what the checks in `seen` found at `now` and sends the
 /// emails that are due; with `digest`, also the daily digest. Returns
@@ -444,7 +425,18 @@ pub(crate) struct FailedLaunch {
 pub(crate) struct LowRateLimit {
     pub installation_id: u64,
     pub remaining: Option<u32>,
-    pub limited: u8,
+    pub limited: bool,
+}
+
+/// The database as [`DATABASE`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct Database {
+    /// Client connections open.
+    pub connections: u64,
+    /// The server's `max_connections`.
+    pub max_connections: u64,
+    /// The database's size in bytes.
+    pub bytes: u64,
 }
 
 /// What the checks after a pass read; `None` where the read failed.
@@ -452,8 +444,7 @@ pub(crate) struct LowRateLimit {
 pub(crate) struct Facts {
     /// The last passes, newest last, this one among them.
     pub history: Option<Vec<PassRecord>>,
-    /// The database's size after this pass's retention deletes.
-    pub db_bytes: Option<u64>,
+    pub database: Option<Database>,
     pub waiting: Option<Vec<Waiting>>,
     pub failed: Option<Vec<FailedLaunch>>,
     pub rate_limits: Option<Vec<LowRateLimit>>,
@@ -512,23 +503,26 @@ pub(crate) fn check(facts: &Facts) -> Vec<(Key, Seen)> {
             .as_deref()
             .map_or(Seen::Unknown, rate_limited),
     ));
-    for (key, gb, meaning) in SIZES {
-        seen.push((
-            key,
-            facts.db_bytes.map_or(Seen::Unknown, |bytes| {
-                if bytes >= gb * GB {
-                    Seen::Firing(format!(
-                        "The database is {}.{} GB. {meaning}",
-                        bytes / GB,
-                        bytes % GB / (GB / 10)
-                    ))
-                } else {
-                    Seen::Clear
-                }
-            }),
-        ));
-    }
+    seen.push((
+        Key::DatabaseConnections,
+        facts.database.as_ref().map_or(Seen::Unknown, connections),
+    ));
     seen
+}
+
+/// The database connections alert.
+fn connections(database: &Database) -> Seen {
+    if database.connections * 100 < database.max_connections * CONNECTIONS_PERCENT {
+        return Seen::Clear;
+    }
+    Seen::Firing(format!(
+        "{} of {} connections are in use. New ones fail at the limit, Hyperdrive's \
+         among them. The database is {}.{} GB.",
+        database.connections,
+        database.max_connections,
+        database.bytes / GB,
+        database.bytes % GB / (GB / 10)
+    ))
 }
 
 /// The jobs waiting alert, from the tenants with jobs waiting.
@@ -562,7 +556,7 @@ fn rate_limited(limits: &[LowRateLimit]) -> Seen {
     let lines: Vec<String> = limits
         .iter()
         .map(|limit| match (limit.limited, limit.remaining) {
-            (1, _) => format!("installation {}: rate limited", limit.installation_id),
+            (true, _) => format!("installation {}: rate limited", limit.installation_id),
             (_, Some(left)) => format!(
                 "installation {}: {left} requests left",
                 limit.installation_id
@@ -609,9 +603,9 @@ fn failed_launches(failed: &[FailedLaunch]) -> Seen {
     ))
 }
 
-/// Verified tenants with jobs queued before `?1` that no runner is
+/// Verified tenants with jobs queued before `$1` that no runner is
 /// launching for, while they have room for another runner, at most
-/// `?2`. A job waiting for a backoff counts; one waiting for its owner
+/// `$2`. A job waiting for a backoff counts; one waiting for its owner
 /// to finish the setup does not. Reads `jobs_open` per tenant.
 pub(crate) fn waiting_query() -> String {
     format!(
@@ -619,43 +613,52 @@ pub(crate) fn waiting_query() -> String {
          FROM tenants JOIN jobs ON jobs.installation_id = tenants.installation_id \
          WHERE {VERIFIED} AND jobs.status <> 'completed' AND jobs.status = 'queued' \
          AND (jobs.launch_state IS NULL OR jobs.launch_retry = 'backoff') \
-         AND jobs.queued_at < ?1 \
+         AND jobs.queued_at < $1 \
          AND (SELECT COUNT(*) FROM jobs AS busy \
            WHERE busy.installation_id = tenants.installation_id \
            AND busy.status <> 'completed' \
            AND busy.launch_state IN ('launching', 'launched')) < tenants.max_runners \
-         GROUP BY tenants.id ORDER BY oldest LIMIT ?2"
+         GROUP BY tenants.id ORDER BY oldest LIMIT $2"
     )
 }
 
-/// Launches that failed since `?1`, newest first, at most `?2`.
+/// Launches that failed since `$1`, newest first, at most `$2`.
 pub(crate) const FAILED_SINCE: &str = "SELECT job_id, installation_id, error, attempts, \
-     failed_at FROM failed_launches WHERE failed_at >= ?1 ORDER BY failed_at DESC LIMIT ?2";
+     failed_at FROM failed_launches WHERE failed_at >= $1 ORDER BY failed_at DESC LIMIT $2";
 
-/// Installations whose rate limit was low since `?1`, at most `?2`.
+/// Installations whose rate limit was low since `$1`, at most `$2`.
 pub(crate) const LOW_SINCE: &str = "SELECT installation_id, remaining, limited FROM rate_limits \
-     WHERE seen_at >= ?1 ORDER BY seen_at DESC LIMIT ?2";
+     WHERE seen_at >= $1 ORDER BY seen_at DESC LIMIT $2";
 
-/// Notes an installation's low rate limit at `?4`.
+/// Notes an installation's low rate limit at `$4`.
 pub(crate) const NOTE_RATE_LIMIT: &str = "INSERT INTO rate_limits \
-     (installation_id, remaining, limited, seen_at) VALUES (?1, ?2, ?3, ?4) \
+     (installation_id, remaining, limited, seen_at) VALUES ($1, $2, $3, $4) \
      ON CONFLICT (installation_id) DO UPDATE SET remaining = excluded.remaining, \
      limited = excluded.limited, seen_at = excluded.seen_at";
 
-/// Records a failed launch message `?1`, with its job's error and
+/// Records a failed launch message `$1`, with its job's error and
 /// attempts, once.
 pub(crate) const RECORD_FAILED: &str = "INSERT INTO failed_launches \
      (message_id, job_id, installation_id, error, attempts, failed_at) \
-     VALUES (?1, ?2, ?3, (SELECT launch_error FROM jobs WHERE id = ?2), \
-       (SELECT launch_attempts FROM jobs WHERE id = ?2), ?4) \
+     VALUES ($1, $2, $3, (SELECT launch_error FROM jobs WHERE id = $2), \
+       (SELECT launch_attempts FROM jobs WHERE id = $2), $4) \
      ON CONFLICT (message_id) DO NOTHING";
 
-/// Deletes up to `?2` failed launches recorded before `?1`.
+/// Deletes up to `$2` failed launches recorded before `$1`.
 pub(crate) const DELETE_FAILED: &str = "DELETE FROM failed_launches WHERE id IN \
-     (SELECT id FROM failed_launches WHERE failed_at < ?1 LIMIT ?2)";
+     (SELECT id FROM failed_launches WHERE failed_at < $1 LIMIT $2)";
 
-/// Deletes rate limits seen before `?1`.
-pub(crate) const DELETE_RATE_LIMITS: &str = "DELETE FROM rate_limits WHERE seen_at < ?1";
+/// Deletes rate limits seen before `$1`.
+pub(crate) const DELETE_RATE_LIMITS: &str = "DELETE FROM rate_limits WHERE seen_at < $1";
+
+/// The database's client connections, its limit and its size. The
+/// Worker's role sees every row of `pg_stat_activity`, if not what each
+/// one runs.
+pub(crate) const DATABASE: &str = "SELECT \
+     (SELECT COUNT(*) FROM pg_stat_activity WHERE backend_type = 'client backend') \
+       AS connections, \
+     current_setting('max_connections')::bigint AS max_connections, \
+     pg_database_size(current_database()) AS bytes";
 
 /// The `reconciler` row as `/healthz` reads it.
 pub(crate) const HEALTH: &str = "SELECT finished_at, history FROM reconciler WHERE id = 1";
@@ -693,62 +696,48 @@ pub(crate) fn health(row: &HealthRow, now: u64) -> (u16, serde_json::Value) {
     (if status == "ok" { 200 } else { 503 }, body)
 }
 
-/// Alerts kept in D1.
-pub(crate) struct D1<'a>(pub &'a D1Database);
+/// Alerts kept in the database.
+pub(crate) struct Kept<'a>(pub &'a Db);
 
-impl Store for D1<'_> {
+impl Store for Kept<'_> {
     async fn alerts(&self) -> Result<Vec<Alert>, String> {
-        self.0
-            .prepare(ALERTS)
-            .all()
-            .await
-            .map_err(text)?
-            .results::<Alert>()
-            .map_err(text)
+        self.0.all(ALERTS, &[]).await.map_err(text)
     }
 
     async fn save(&self, alert: &Alert, now: u64) -> Result<(), String> {
-        let resolved_at = match alert.resolved_at {
-            Some(at) => int(at).map_err(text)?,
-            None => wasm_bindgen::JsValue::NULL,
-        };
         self.0
-            .prepare(SAVE)
-            .bind(&[
-                alert.key.as_str().into(),
-                alert.state.as_str().into(),
-                alert.detail.as_str().into(),
-                int(alert.fired_at).map_err(text)?,
-                resolved_at,
-                alert
-                    .sent
-                    .map_or(wasm_bindgen::JsValue::NULL, |sent| sent.as_str().into()),
-                int(now).map_err(text)?,
-            ])
-            .map_err(text)?
-            .run()
+            .run(
+                SAVE,
+                &params![
+                    alert.key.as_str(),
+                    alert.state.as_str(),
+                    alert.detail.as_str(),
+                    alert.fired_at,
+                    alert.resolved_at,
+                    alert.sent.map(State::as_str),
+                    now,
+                ],
+            )
             .await
             .map_err(text)?;
         Ok(())
     }
 
     async fn digest_at(&self) -> Result<Option<u64>, String> {
-        self.0
-            .prepare(DIGEST_AT)
-            .first::<Option<u64>>(Some("digest_at"))
+        #[derive(Deserialize)]
+        struct Row {
+            digest_at: Option<u64>,
+        }
+        Ok(self
+            .0
+            .first::<Row>(DIGEST_AT, &[])
             .await
-            .map(Option::flatten)
-            .map_err(text)
+            .map_err(text)?
+            .and_then(|row| row.digest_at))
     }
 
     async fn digested(&self, at: u64) -> Result<(), String> {
-        self.0
-            .prepare(DIGESTED)
-            .bind(&[int(at).map_err(text)?])
-            .map_err(text)?
-            .run()
-            .await
-            .map_err(text)?;
+        self.0.run(DIGESTED, &params![at]).await.map_err(text)?;
         Ok(())
     }
 }
@@ -793,16 +782,16 @@ impl Mail for Inbox {
 
 /// Runs the checks after a pass and sends what is due. `history` is the
 /// pass history with this pass in it, `None` when it could not be read.
-pub(crate) async fn after_pass(
-    env: &Env,
-    db: &D1Database,
-    now: u64,
-    history: Option<Vec<PassRecord>>,
-    db_bytes: Option<u64>,
-) {
+pub(crate) async fn after_pass(env: &Env, db: &Db, now: u64, history: Option<Vec<PassRecord>>) {
     let facts = Facts {
         history,
-        db_bytes,
+        database: logged(
+            "database",
+            db.first::<Database>(DATABASE, &[])
+                .await
+                .map_err(text)
+                .and_then(|row| row.ok_or_else(|| "no row".to_owned())),
+        ),
         waiting: logged(
             "waiting jobs",
             since(db, &waiting_query(), now.saturating_sub(WAITING)).await,
@@ -813,7 +802,7 @@ pub(crate) async fn after_pass(
             since(db, LOW_SINCE, now.saturating_sub(RATE_LIMITS_FOR)).await,
         ),
     };
-    for err in settle(&D1(db), &Inbox::new(env), now, &check(&facts), true).await {
+    for err in settle(&Kept(db), &Inbox::new(env), now, &check(&facts), true).await {
         console_error!("alerts: {err}");
     }
 }
@@ -823,36 +812,31 @@ pub(crate) async fn after_pass(
 /// Returns whether they were recorded; the alert's errors are logged.
 pub(crate) async fn launches_failed(
     env: &Env,
-    db: &D1Database,
+    db: &Db,
     now: u64,
     failed: &[(String, Option<u64>, Option<u64>)],
 ) -> Result<(), String> {
     if failed.is_empty() {
         return Ok(());
     }
-    let id = |value: Option<u64>| value.map_or(Ok(wasm_bindgen::JsValue::NULL), int);
-    let mut statements = Vec::with_capacity(failed.len());
-    for (message, job, installation) in failed {
-        statements.push(
-            db.prepare(RECORD_FAILED)
-                .bind(&[
-                    message.as_str().into(),
-                    id(*job).map_err(text)?,
-                    id(*installation).map_err(text)?,
-                    int(now).map_err(text)?,
-                ])
-                .map_err(text)?,
-        );
-    }
-    let recorded = db.batch(statements).await.map_err(text)?;
-    if recorded.iter().all(|result| changes(result) == 0) {
+    let statements: Vec<(&str, Vec<Param>)> = failed
+        .iter()
+        .map(|(message, job, installation)| {
+            (
+                RECORD_FAILED,
+                params![message.as_str(), *job, *installation, now],
+            )
+        })
+        .collect();
+    let recorded = db.batch(&statements).await.map_err(text)?;
+    if recorded.iter().all(|changed| *changed == 0) {
         return Ok(());
     }
     let Some(failed) = logged("failed launches", recent_failures(db, now).await) else {
         return Ok(());
     };
     let seen = [(Key::LaunchFailed, failed_launches(&failed))];
-    for err in settle(&D1(db), &Inbox::new(env), now, &seen, false).await {
+    for err in settle(&Kept(db), &Inbox::new(env), now, &seen, false).await {
         console_error!("alerts: {err}");
     }
     Ok(())
@@ -860,53 +844,35 @@ pub(crate) async fn launches_failed(
 
 /// Notes the installations a step's or launch's GitHub calls found low
 /// on requests. Errors are logged.
-pub(crate) async fn note_rate_limits(db: &D1Database, calls: &Counted, now: u64) {
+pub(crate) async fn note_rate_limits(db: &Db, calls: &Counted, now: u64) {
     let low = calls.low();
     if low.is_empty() {
         return;
     }
     let statement = |(installation_id, limit): (u64, RateLimit)| {
-        db.prepare(NOTE_RATE_LIMIT).bind(&[
-            int(installation_id)?,
-            limit
-                .remaining
-                .map_or(wasm_bindgen::JsValue::NULL, Into::into),
-            u32::from(limit.limited).into(),
-            int(now)?,
-        ])
+        (
+            NOTE_RATE_LIMIT,
+            params![installation_id, limit.remaining, limit.limited, now],
+        )
     };
-    let noted = match low
-        .into_iter()
-        .map(statement)
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(statements) => db.batch(statements).await.map(|_| ()),
-        Err(err) => Err(err),
-    };
-    if let Err(err) = noted {
+    let statements: Vec<(&str, Vec<Param>)> = low.into_iter().map(statement).collect();
+    if let Err(err) = db.batch(&statements).await {
         console_error!("alerts: rate limits: {err}");
     }
 }
 
-async fn recent_failures(db: &D1Database, now: u64) -> Result<Vec<FailedLaunch>, String> {
+async fn recent_failures(db: &Db, now: u64) -> Result<Vec<FailedLaunch>, String> {
     since(db, FAILED_SINCE, now.saturating_sub(FAILED_LAUNCHES_FOR)).await
 }
 
-/// The rows of a query that takes a time, `?1`, and at most [`LISTED`]
-/// rows, `?2`.
+/// The rows of a query that takes a time, `$1`, and at most [`LISTED`]
+/// rows, `$2`.
 async fn since<T: for<'de> Deserialize<'de>>(
-    db: &D1Database,
+    db: &Db,
     sql: &str,
     at: u64,
 ) -> Result<Vec<T>, String> {
-    db.prepare(sql)
-        .bind(&[int(at).map_err(text)?, LISTED.into()])
-        .map_err(text)?
-        .all()
-        .await
-        .map_err(text)?
-        .results::<T>()
-        .map_err(text)
+    db.all(sql, &params![at, LISTED]).await.map_err(text)
 }
 
 /// The value, or `None` with the error logged.
@@ -926,45 +892,11 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
-    use crate::testdb::{Db, block_on, params};
+    use crate::testdb::Db;
 
     const NOW: u64 = 1_800_000_000_000;
     const HOUR: u64 = 60 * MINUTE;
     const NONE: [&str; 0] = [];
-
-    // The Worker's statements against SQLite; it answers at once.
-    #[allow(clippy::unused_async_trait_impl)]
-    impl Store for Db {
-        async fn alerts(&self) -> Result<Vec<Alert>, String> {
-            self.try_all(ALERTS, &[])
-        }
-
-        async fn save(&self, alert: &Alert, now: u64) -> Result<(), String> {
-            self.try_run(
-                SAVE,
-                &params![
-                    alert.key.as_str(),
-                    alert.state.as_str(),
-                    alert.detail.as_str(),
-                    alert.fired_at,
-                    alert.resolved_at,
-                    alert.sent.map(State::as_str),
-                    now
-                ],
-            )
-            .map(|_| ())
-        }
-
-        async fn digest_at(&self) -> Result<Option<u64>, String> {
-            Ok(self
-                .column::<Option<u64>>(DIGEST_AT, &[], "digest_at")
-                .flatten())
-        }
-
-        async fn digested(&self, at: u64) -> Result<(), String> {
-            self.try_run(DIGESTED, &params![at]).map(|_| ())
-        }
-    }
 
     /// Collects emails, or fails them while `down`.
     #[derive(Default)]
@@ -996,7 +928,7 @@ mod tests {
     }
 
     fn pass(db: &Db, outbox: &Outbox, now: u64, seen: &[(Key, Seen)]) -> Vec<String> {
-        block_on(settle(db, outbox, now, seen, true))
+        db.wait(settle(&Kept(db.db()), outbox, now, seen, true))
     }
 
     fn firing(detail: &str) -> Seen {
@@ -1021,7 +953,7 @@ mod tests {
 
     fn alert(db: &Db, key: Key) -> Alert {
         db.first(
-            "SELECT key, state, detail, fired_at, resolved_at, sent FROM alerts WHERE key = ?1",
+            "SELECT key, state, detail, fired_at, resolved_at, sent FROM alerts WHERE key = $1",
             &params![key.as_str()],
         )
         .unwrap()
@@ -1079,13 +1011,17 @@ mod tests {
         // Data that could not be read changes nothing.
         let seen = check(&Facts::default());
         assert!(seen.iter().all(|(_, seen)| *seen == Seen::Unknown));
-        assert_eq!(seen.len(), 8);
+        assert_eq!(seen.len(), 6);
     }
 
     #[test]
     fn checks_read_the_database_and_github() {
         let facts = Facts {
-            db_bytes: Some(5_400_000_000),
+            database: Some(Database {
+                connections: 41,
+                max_connections: 50,
+                bytes: 5_400_000_000,
+            }),
             waiting: Some(vec![Waiting {
                 org: "acme".to_owned(),
                 jobs: 3,
@@ -1102,24 +1038,22 @@ mod tests {
                 LowRateLimit {
                     installation_id: 42,
                     remaining: Some(0),
-                    limited: 1,
+                    limited: true,
                 },
                 LowRateLimit {
                     installation_id: 43,
                     remaining: Some(1200),
-                    limited: 0,
+                    limited: false,
                 },
             ]),
             ..Facts::default()
         };
         let seen = check(&facts);
-        assert!(
-            matches!(found(&seen, Key::Size4), Seen::Firing(detail) if detail.contains("5.4 GB") && detail.contains("#103"))
-        );
-        assert!(
-            matches!(found(&seen, Key::Size5), Seen::Firing(detail) if detail.contains("#104"))
-        );
-        assert_eq!(*found(&seen, Key::Size8), Seen::Clear);
+        assert!(matches!(
+            found(&seen, Key::DatabaseConnections),
+            Seen::Firing(detail) if detail.contains("41 of 50 connections")
+                && detail.contains("5.4 GB")
+        ));
         assert!(
             matches!(found(&seen, Key::JobsWaiting), Seen::Firing(detail) if detail.contains("acme: 3 jobs"))
         );
@@ -1134,25 +1068,32 @@ mod tests {
                 && detail.contains("installation 43: 1200 requests left")
         ));
 
-        let full = check(&Facts {
-            db_bytes: Some(8_500_000_000),
+        let at_the_line = check(&Facts {
+            database: Some(Database {
+                connections: 40,
+                max_connections: 50,
+                bytes: 0,
+            }),
             ..Facts::default()
         });
-        assert!(
-            matches!(found(&full, Key::Size8), Seen::Firing(detail) if detail.contains("8.5 GB"))
-        );
+        assert!(matches!(
+            found(&at_the_line, Key::DatabaseConnections),
+            Seen::Firing(_)
+        ));
 
         let clear = check(&Facts {
-            db_bytes: Some(3_999_999_999),
+            database: Some(Database {
+                connections: 39,
+                max_connections: 50,
+                bytes: 0,
+            }),
             waiting: Some(Vec::new()),
             failed: Some(Vec::new()),
             rate_limits: Some(Vec::new()),
             ..Facts::default()
         });
         for key in [
-            Key::Size4,
-            Key::Size5,
-            Key::Size8,
+            Key::DatabaseConnections,
             Key::JobsWaiting,
             Key::LaunchFailed,
             Key::RateLimit,
@@ -1271,7 +1212,12 @@ mod tests {
         let outbox = Outbox::default();
         // The first pass starts the day.
         pass(&db, &outbox, NOW, &[]);
-        pass(&db, &outbox, NOW + HOUR, &[(Key::Size4, firing("4.1 GB"))]);
+        pass(
+            &db,
+            &outbox,
+            NOW + HOUR,
+            &[(Key::DatabaseConnections, firing("45 of 50"))],
+        );
         pass(
             &db,
             &outbox,
@@ -1285,15 +1231,19 @@ mod tests {
         // A day on, one digest with both; one that fires in the same
         // pass has its own email instead.
         outbox.down.set(true);
-        let errors = pass(&db, &outbox, NOW + DAY, &[(Key::Size5, firing("5.1 GB"))]);
+        let errors = pass(&db, &outbox, NOW + DAY, &[(Key::RateLimit, firing("42"))]);
         assert_eq!(errors.len(), 2, "{errors:?}");
         outbox.down.set(false);
         pass(&db, &outbox, NOW + DAY + MINUTE, &[]);
         let sent = outbox.sent.borrow_mut().drain(..).collect::<Vec<_>>();
         assert_eq!(sent.len(), 2);
-        assert_eq!(sent[0].subject, "[hatchrun] Firing: D1 past 5 GB");
+        assert_eq!(sent[0].subject, "[hatchrun] Firing: GitHub rate limit");
         assert_eq!(sent[1].subject, "[hatchrun] Still firing: 2 alerts");
-        assert!(sent[1].text.contains("D1 past 4 GB, for 23 h 1 min"));
+        assert!(
+            sent[1]
+                .text
+                .contains("Database connections near the limit, for 23 h 1 min")
+        );
         assert!(sent[1].text.contains("Jobs waiting for a runner"));
         pass(&db, &outbox, NOW + DAY + 2 * MINUTE, &[]);
         assert_eq!(outbox.take(), NONE);
@@ -1303,7 +1253,7 @@ mod tests {
         assert_eq!(outbox.take(), ["[hatchrun] Still firing: 3 alerts"]);
 
         // With nothing firing there is no digest.
-        for key in [Key::Size4, Key::Size5, Key::JobsWaiting] {
+        for key in [Key::DatabaseConnections, Key::RateLimit, Key::JobsWaiting] {
             pass(&db, &outbox, NOW + 2 * DAY + HOUR, &[(key, Seen::Clear)]);
         }
         assert_eq!(outbox.take().len(), 3);
@@ -1320,7 +1270,7 @@ mod tests {
         assert_eq!(status, 503);
         assert_eq!(body["status"], "stale");
 
-        let record = "UPDATE reconciler SET finished_at = ?1, history = ?2 WHERE id = 1";
+        let record = "UPDATE reconciler SET finished_at = $1, history = $2 WHERE id = 1";
         let clean = serde_json::to_string(&passes(&[0, 3, 0], false)).unwrap();
         db.run(record, &params![NOW, clean.as_str()]);
         let (status, body) = health(&read(&db), NOW + 30_000);
@@ -1344,7 +1294,7 @@ mod tests {
         db.run(
             "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
              queued_at, updated_at, launch_state) \
-             VALUES (?1, ?2, 'acme/app', 7, 'hatchrun', 'queued', ?3, ?3, ?4)",
+             VALUES ($1, $2, 'acme/app', 7, 'hatchrun', 'queued', $3, $3, $4)",
             &params![id, installation_id, queued_at, launch],
         );
     }
@@ -1353,7 +1303,7 @@ mod tests {
         db.run(
             "INSERT INTO tenants (id, org_id, org_login, installation_id, role_arn, region, \
              launch_template_id, subnet_ids, max_runners, created_at, updated_at) \
-             VALUES (?1, ?2, ?1, ?2, ?3, 'eu-west-1', 'lt-1', 'subnet-1', 2, ?4, ?4)",
+             VALUES ($1, $2, $1, $2, $3, 'eu-west-1', 'lt-1', 'subnet-1', 2, $4, $4)",
             &params![
                 org,
                 installation_id,
@@ -1395,7 +1345,7 @@ mod tests {
         assert_eq!(waiting(&db), []);
 
         let plan = db.plan(&waiting_query(), &params![NOW - WAITING, LISTED]);
-        assert!(!plan.contains("SCAN jobs"), "{plan}");
+        assert!(!plan.contains("Seq Scan on jobs"), "{plan}");
         assert!(plan.contains("jobs_open"), "{plan}");
     }
 
@@ -1432,8 +1382,8 @@ mod tests {
 
         let outbox = Outbox::default();
         let fire = |now| {
-            block_on(settle(
-                &db,
+            db.wait(settle(
+                &Kept(db.db()),
                 &outbox,
                 now,
                 &[(Key::LaunchFailed, seen.clone())],
@@ -1444,7 +1394,7 @@ mod tests {
         assert_eq!(fire(NOW + 5), NONE);
         assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
         // The consumer sends no digest.
-        assert_eq!(block_on(Store::digest_at(&db)), Ok(None));
+        assert_eq!(db.wait(Kept(db.db()).digest_at()), Ok(None));
 
         // An hour on, the reconciler finds none and resolves it.
         let recent = db.all::<FailedLaunch>(FAILED_SINCE, &params![NOW + 2, LISTED]);
@@ -1458,22 +1408,22 @@ mod tests {
     #[test]
     fn low_rate_limits_are_kept_per_installation() {
         let db = Db::new();
-        let note = |installation: u64, remaining: Option<u32>, limited: u32, at: u64| {
+        let note = |installation: u64, remaining: Option<u32>, limited: bool, at: u64| {
             db.run(
                 NOTE_RATE_LIMIT,
                 &params![installation, remaining, limited, at],
             )
         };
-        note(42, Some(1500), 0, NOW - 20 * MINUTE);
-        note(42, Some(0), 1, NOW - MINUTE);
-        note(43, Some(1900), 0, NOW - 20 * MINUTE);
+        note(42, Some(1500), false, NOW - 20 * MINUTE);
+        note(42, Some(0), true, NOW - MINUTE);
+        note(43, Some(1900), false, NOW - 20 * MINUTE);
         let low = db.all::<LowRateLimit>(LOW_SINCE, &params![NOW - RATE_LIMITS_FOR, LISTED]);
         assert_eq!(
             low,
             [LowRateLimit {
                 installation_id: 42,
                 remaining: Some(0),
-                limited: 1,
+                limited: true,
             }]
         );
         assert_eq!(db.run(DELETE_RATE_LIMITS, &params![NOW - 10 * MINUTE]), 1);
@@ -1487,7 +1437,7 @@ mod tests {
             ("DELETE_FAILED", DELETE_FAILED, "failed_launches_age"),
             ("LOW_SINCE", LOW_SINCE, "rate_limits_seen"),
         ] {
-            let params = if sql.contains("?2") {
+            let params = if sql.contains("$2") {
                 params![NOW, LISTED]
             } else {
                 params![NOW]
@@ -1495,5 +1445,17 @@ mod tests {
             let plan = db.plan(sql, &params);
             assert!(plan.contains(index), "{name} without {index}\n{plan}");
         }
+    }
+
+    #[test]
+    fn the_database_reads_its_connections_and_size() {
+        let db = Db::new();
+        let database: Database = db.first(DATABASE, &[]).unwrap();
+        assert!(database.connections >= 1, "{database:?}");
+        assert!(
+            database.max_connections > database.connections,
+            "{database:?}"
+        );
+        assert!(database.bytes > 0, "{database:?}");
     }
 }

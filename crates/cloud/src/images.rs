@@ -212,7 +212,7 @@ pub fn is_current(version: &str, stored: Option<&str>) -> bool {
 /// region and architecture. Binds region, arch, image id, root device,
 /// version and the time in milliseconds.
 pub const UPSERT: &str = "INSERT INTO images (region, arch, image_id, root_device, version, updated_at) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+     VALUES ($1, $2, $3, $4, $5, $6) \
      ON CONFLICT (region, arch) DO UPDATE SET image_id = excluded.image_id, \
      root_device = excluded.root_device, version = excluded.version, updated_at = excluded.updated_at \
      WHERE images.version IS NULL OR images.version <= excluded.version";

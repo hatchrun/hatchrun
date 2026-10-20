@@ -5,49 +5,40 @@
 //! The `unavailable_offerings` table.
 
 use serde::Deserialize;
-use worker::{D1Database, Result};
+use worker::Result;
 
 use super::Unavailable;
-use crate::int;
+use crate::db::{Db, Param, params};
 
 /// The tenant's offerings that have not lapsed.
 const CURRENT: &str = "SELECT instance_type, subnet_id, spot, until FROM unavailable_offerings \
-     WHERE tenant_id = ?1 AND until > ?2";
+     WHERE tenant_id = $1 AND until > $2";
 
 /// Records a refused offering, keeping the later of two lapse times.
 const REMEMBER: &str = "INSERT INTO unavailable_offerings \
      (tenant_id, instance_type, subnet_id, spot, code, until) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+     VALUES ($1, $2, $3, $4, $5, $6) \
      ON CONFLICT (tenant_id, instance_type, subnet_id, spot) \
-     DO UPDATE SET code = ?5, until = MAX(until, ?6)";
+     DO UPDATE SET code = $5, until = GREATEST(unavailable_offerings.until, $6)";
 
 /// A row of [`CURRENT`].
 #[derive(Deserialize)]
 struct Row {
     instance_type: String,
     subnet_id: String,
-    spot: u8,
+    spot: bool,
     until: u64,
 }
 
 /// The tenant's offerings that are still unavailable at `now`.
-pub(crate) async fn current(
-    db: &D1Database,
-    tenant_id: &str,
-    now: u64,
-) -> Result<Vec<Unavailable>> {
-    let rows = db
-        .prepare(CURRENT)
-        .bind(&[tenant_id.into(), int(now)?])?
-        .all()
-        .await?
-        .results::<Row>()?;
+pub(crate) async fn current(db: &Db, tenant_id: &str, now: u64) -> Result<Vec<Unavailable>> {
+    let rows: Vec<Row> = db.all(CURRENT, &params![tenant_id, now]).await?;
     Ok(rows
         .into_iter()
         .map(|row| Unavailable {
             instance_type: row.instance_type,
             subnet_id: Some(row.subnet_id).filter(|subnet| !subnet.is_empty()),
-            spot: row.spot == 1,
+            spot: row.spot,
             until: row.until,
         })
         .collect())
@@ -55,44 +46,42 @@ pub(crate) async fn current(
 
 /// Records offerings EC2 refused with `code`s, as (offering, code).
 pub(crate) async fn remember(
-    db: &D1Database,
+    db: &Db,
     tenant_id: &str,
     refused: &[(Unavailable, String)],
 ) -> Result<()> {
     if refused.is_empty() {
         return Ok(());
     }
-    let mut statements = Vec::new();
-    for (gone, code) in refused {
-        statements.push(db.prepare(REMEMBER).bind(&[
-            tenant_id.into(),
-            gone.instance_type.as_str().into(),
-            gone.subnet_id.as_deref().unwrap_or_default().into(),
-            u8::from(gone.spot).into(),
-            code.as_str().into(),
-            int(gone.until)?,
-        ])?);
-    }
-    db.batch(statements).await?;
+    let statements: Vec<(&str, Vec<Param>)> = refused
+        .iter()
+        .map(|(gone, code)| (REMEMBER, values(tenant_id, gone, code)))
+        .collect();
+    db.batch(&statements).await?;
     Ok(())
+}
+
+/// The values of [`REMEMBER`].
+fn values(tenant_id: &str, gone: &Unavailable, code: &str) -> Vec<Param> {
+    params![
+        tenant_id,
+        gone.instance_type.as_str(),
+        gone.subnet_id.as_deref().unwrap_or_default(),
+        gone.spot,
+        code,
+        gone.until,
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testdb::{Db, Param, params};
+    use crate::testdb::Db;
 
     const NOW: u64 = 1_792_140_000_000;
 
     fn remember(gone: &Unavailable, code: &str) -> Vec<Param> {
-        params![
-            "t1",
-            gone.instance_type.as_str(),
-            gone.subnet_id.as_deref().unwrap_or_default(),
-            u32::from(u8::from(gone.spot)),
-            code,
-            gone.until,
-        ]
+        values("t1", gone, code)
     }
 
     #[test]
@@ -127,10 +116,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].instance_type, "m8g.large");
         assert_eq!(rows[0].subnet_id, "");
-        assert_eq!(rows[0].spot, 1);
+        assert!(rows[0].spot);
         assert_eq!(rows[0].until, NOW + 60_000);
         let code: Option<String> = db.column(
-            "SELECT code FROM unavailable_offerings WHERE spot = 1",
+            "SELECT code FROM unavailable_offerings WHERE spot",
             &[],
             "code",
         );
