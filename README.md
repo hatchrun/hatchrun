@@ -3,7 +3,7 @@
 Self-hosted GitHub Actions runners on your own AWS account, one fresh EC2
 instance per job.
 
-This repository holds the two Rust programs:
+This repository holds three Rust programs:
 
 - **scaler**: long-polls GitHub's runner scale set API, launches an
   instance for every assigned job and cleans up the ones that finish or
@@ -12,8 +12,8 @@ This repository holds the two Rust programs:
 - **agent**: baked into the runner image. It starts early in boot, reads
   the instance's just-in-time runner config, runs exactly one job as the
   `runner` user and powers the instance off.
-- **hatchrun**: command line tool for workflow files, shipped on the
-  runner image.
+- **hatchrun**: command line tool for workflow files and test runs,
+  released as its own tarball.
 
 ## Agent
 
@@ -77,7 +77,8 @@ three commands:
 
 - `hatchrun validate` checks a workflow file and reports every error.
 - `hatchrun convert` converts GitHub Actions workflow files into a
-  hatchrun config.
+  hatchrun config. Jobs that cannot convert are left out and reported,
+  and the command then exits 1.
 - `hatchrun tests split` prints the tests this node should run, so a
   test run can be spread across nodes.
 
