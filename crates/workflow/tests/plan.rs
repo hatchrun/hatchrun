@@ -736,3 +736,67 @@ fn the_budget_counts_bytes() {
     assert_eq!(err.len(), 1, "{err:?}");
     assert!(err[0].message.contains("workflow `ci`") && err[0].message.contains("8388608"));
 }
+
+/// A 16x16 matrix of job `t`, whose job or step holds `items`.
+fn many_items(job: &str, step: &str) -> String {
+    let m: Vec<String> = (0..16).map(|i| format!("v{i}")).collect();
+    let m = m.join(", ");
+    format!(
+        "jobs: {{ t: {{ runs-on: ubuntu-latest, {job} steps: [{step}] }} }}\nworkflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ matrix: {{ a: [{m}], b: [{m}] }} }} }}] }} }}\n"
+    )
+}
+
+fn short_entries(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("{i:x}: ''"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn short_strings(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("'{i:x}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[test]
+fn the_budget_counts_each_stored_entry() {
+    // Each entry is a few bytes of text but tens of bytes in memory.
+    let cases = [
+        many_items(&format!("env: {{ {} }},", short_entries(5_000)), ""),
+        many_items(&format!("env: {{ {} }},", short_entries(20_000)), ""),
+        many_items(
+            "",
+            &format!("{{ run: x, env: {{ {} }} }}", short_entries(5_000)),
+        ),
+        many_items(
+            "",
+            &format!(
+                "{{ cache: {{ key: k, restore-keys: [{}] }} }}",
+                short_strings(5_000)
+            ),
+        ),
+        many_items(
+            "",
+            &format!(
+                "{{ cache: {{ key: k, paths: [{}] }} }}",
+                short_strings(5_000)
+            ),
+        ),
+    ];
+    for yaml in &cases {
+        let err = timed_compile(yaml);
+        assert_eq!(err.len(), 1, "{err:?}");
+        assert!(err[0].message.contains("8388608"), "{err:?}");
+    }
+    // A job env of a few hundred entries still compiles on 16x16.
+    let config = parse(&many_items(
+        &format!("env: {{ {} }},", short_entries(200)),
+        "",
+    ))
+    .unwrap();
+    let plan = compile(&config, "ci", "refs/heads/main").unwrap();
+    assert_eq!(plan.jobs.len(), 256);
+    assert_eq!(plan.jobs[0].env.len(), 200);
+}

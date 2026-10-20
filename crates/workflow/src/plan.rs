@@ -40,8 +40,15 @@ const BUDGET: usize = 50_000;
 /// substituted string is charged its length as it is made, including
 /// values passed into nested commands, and every planned job is charged
 /// the bytes of its steps, `env`, `outputs`, `if`, id and matrix once per
-/// copy. Charges are made before the memory is allocated.
+/// copy, plus `ENTRY_OVERHEAD` per map entry and list string and the size
+/// of each job and step struct. Charges are made before the memory is allocated.
 const BYTE_BUDGET: usize = 8 << 20;
+
+/// The bytes charged for each stored map entry or list string on top of
+/// its text: its `String` headers, the key's heap block and the map node
+/// share. Without it a config of many short entries costs far more
+/// memory than it is charged.
+const ENTRY_OVERHEAD: usize = 64;
 
 /// The longest string one substitution can make.
 const MAX_VALUE: usize = 64 << 10;
@@ -308,7 +315,7 @@ fn compile_workflow(
         }
         let requires_bytes: usize = deps[i]
             .iter()
-            .flat_map(|&d| expanded_ids[d].iter().map(String::len))
+            .flat_map(|&d| expanded_ids[d].iter().map(|id| id.len() + ENTRY_OVERHEAD))
             .sum();
         if !budget.charge_bytes(
             requires_bytes.saturating_mul(expansions[i].len()),
@@ -536,7 +543,10 @@ fn expand_entry(
         };
         // Pay for the copies before making them: an id is at most the
         // entry id, the matrix values and a node suffix.
-        let matrix_bytes: usize = combo.iter().map(|(k, v)| k.len() + 2 * value_len(v)).sum();
+        let matrix_bytes: usize = combo
+            .iter()
+            .map(|(k, v)| k.len() + 2 * value_len(v) + ENTRY_OVERHEAD)
+            .sum();
         let copy_bytes = job_bytes(&base) + 2 * id.len() + matrix_bytes + 32;
         if !walk
             .budget
@@ -1211,48 +1221,63 @@ fn value_len(value: &Value) -> usize {
     }
 }
 
-/// The bytes of a step's strings.
-fn step_bytes(step: &PlannedStep) -> usize {
-    let opt = |o: &Option<String>| o.as_ref().map_or(0, String::len);
-    let map =
-        |m: &BTreeMap<String, String>| m.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
-    let list = |l: &[String]| l.iter().map(String::len).sum::<usize>();
-    match step {
-        PlannedStep::Run(r) => {
-            opt(&r.name)
-                + opt(&r.id)
-                + r.run.len()
-                + opt(&r.shell)
-                + opt(&r.working_directory)
-                + map(&r.env)
-                + opt(&r.if_)
-        }
-        PlannedStep::Uses(u) => {
-            opt(&u.name)
-                + opt(&u.id)
-                + u.uses.len()
-                + u.with
-                    .iter()
-                    .map(|(k, v)| k.len() + value_len(v))
-                    .sum::<usize>()
-                + map(&u.env)
-                + opt(&u.if_)
-        }
-        PlannedStep::Cache(c) => c.key.len() + list(&c.restore_keys) + list(&c.paths),
-        PlannedStep::Workspace(WorkspaceStep::Persist { root, paths }) => root.len() + list(paths),
-        PlannedStep::Workspace(WorkspaceStep::Attach { at }) => at.len(),
-        PlannedStep::TestResults { path } => path.len(),
-    }
+/// The bytes of a map of strings: its text and `ENTRY_OVERHEAD` per entry.
+fn map_bytes(m: &BTreeMap<String, String>) -> usize {
+    m.iter()
+        .map(|(k, v)| k.len() + v.len() + ENTRY_OVERHEAD)
+        .sum()
 }
 
-/// The bytes a copy of a planned job holds in steps, `env`, `outputs` and
-/// `if`.
+/// The bytes of a list of strings: its text and `ENTRY_OVERHEAD` per
+/// string.
+fn list_bytes(l: &[String]) -> usize {
+    l.iter().map(|s| s.len() + ENTRY_OVERHEAD).sum()
+}
+
+/// The bytes a copy of a step holds: the step struct, its strings and
+/// `ENTRY_OVERHEAD` per map entry and list string.
+fn step_bytes(step: &PlannedStep) -> usize {
+    let opt = |o: &Option<String>| o.as_ref().map_or(0, String::len);
+    size_of::<PlannedStep>()
+        + match step {
+            PlannedStep::Run(r) => {
+                opt(&r.name)
+                    + opt(&r.id)
+                    + r.run.len()
+                    + opt(&r.shell)
+                    + opt(&r.working_directory)
+                    + map_bytes(&r.env)
+                    + opt(&r.if_)
+            }
+            PlannedStep::Uses(u) => {
+                opt(&u.name)
+                    + opt(&u.id)
+                    + u.uses.len()
+                    + u.with
+                        .iter()
+                        .map(|(k, v)| k.len() + value_len(v) + ENTRY_OVERHEAD)
+                        .sum::<usize>()
+                    + map_bytes(&u.env)
+                    + opt(&u.if_)
+            }
+            PlannedStep::Cache(c) => {
+                c.key.len() + list_bytes(&c.restore_keys) + list_bytes(&c.paths)
+            }
+            PlannedStep::Workspace(WorkspaceStep::Persist { root, paths }) => {
+                root.len() + list_bytes(paths)
+            }
+            PlannedStep::Workspace(WorkspaceStep::Attach { at }) => at.len(),
+            PlannedStep::TestResults { path } => path.len(),
+        }
+}
+
+/// The bytes a copy of a planned job holds: the job struct, its steps,
+/// `env`, `outputs` and `if`.
 fn job_bytes(job: &PlannedJob) -> usize {
-    let map =
-        |m: &BTreeMap<String, String>| m.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
-    job.steps.iter().map(step_bytes).sum::<usize>()
-        + map(&job.env)
-        + map(&job.outputs)
+    size_of::<PlannedJob>()
+        + job.steps.iter().map(step_bytes).sum::<usize>()
+        + map_bytes(&job.env)
+        + map_bytes(&job.outputs)
         + job.if_.as_ref().map_or(0, String::len)
 }
 
