@@ -1,0 +1,916 @@
+// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Compiles one workflow of a config into a plan: the jobs to run, in
+//! order, with commands expanded, `${{ parameters.x }}` substituted and
+//! matrices and parallel nodes spread out.
+//!
+//! Every other expression is left in place for the runner to evaluate.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::Value;
+
+use crate::config::{
+    CacheStep, Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow,
+    WorkflowJob, WorkspaceStep,
+};
+use crate::diagnostic::Diagnostic;
+use crate::templates::{Template, template, template_labels};
+use crate::trigger::{Filter, Triggers};
+
+/// The timeout of a job that sets none.
+pub const DEFAULT_TIMEOUT_MINUTES: u32 = 360;
+
+/// The most parallel nodes one job can run.
+const MAX_PARALLELISM: u32 = 64;
+
+/// The most entries one matrix can expand to.
+const MAX_MATRIX: usize = 256;
+
+/// The most steps one job can expand to, so nested commands cannot blow up.
+const MAX_STEPS: usize = 1024;
+
+/// The deepest commands can nest.
+const MAX_NESTING: usize = 64;
+
+/// The ref `validate` compiles every workflow against.
+const VALIDATE_REF: &str = "refs/heads/main";
+
+/// Keys of a step map. A command with one of these names could not be
+/// told apart from a step.
+const STEP_KEYS: &[&str] = &[
+    "name",
+    "id",
+    "env",
+    "if",
+    "with",
+    "shell",
+    "run",
+    "uses",
+    "cache",
+    "workspace",
+    "test-results",
+    "working-directory",
+    "continue-on-error",
+    "timeout-minutes",
+];
+
+/// The jobs one workflow runs for one ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// The workflow's name.
+    pub workflow: String,
+    /// The jobs. Every job comes after the jobs it requires.
+    pub jobs: Vec<PlannedJob>,
+}
+
+/// One job of a plan: one matrix entry and one parallel node of a
+/// workflow job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedJob {
+    /// Unique in the plan: the entry's id, then `(<v1>, <v2>)` for a
+    /// matrix entry and `[<i+1>/<n>]` for a parallel node.
+    pub id: String,
+    /// The workflow entry's id: its `name`, else its key. Shared by all
+    /// expansions of the entry.
+    pub name: String,
+    /// Ids of the jobs that must finish first.
+    pub requires: Vec<String>,
+    /// What the job does.
+    pub kind: JobKind,
+    /// This job's matrix entry, read as `${{ matrix.x }}` at run time.
+    pub matrix: BTreeMap<String, Value>,
+    /// `(index, total)` of a parallel node, 0-based. `None` without
+    /// `parallelism` or with `parallelism: 1`.
+    pub node: Option<(u32, u32)>,
+    /// Environment variables for every step.
+    pub env: BTreeMap<String, String>,
+    /// The job runs only when this expression is true.
+    pub if_: Option<String>,
+    /// The job is cancelled after this many minutes.
+    pub timeout_minutes: u32,
+    /// Values later jobs can read.
+    pub outputs: BTreeMap<String, String>,
+    /// The steps, with commands expanded.
+    pub steps: Vec<PlannedStep>,
+}
+
+/// What a planned job does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    /// Runs steps on a runner made from the template.
+    Run {
+        /// The runner template.
+        template: &'static Template,
+    },
+    /// Waits for a person to approve.
+    Approval,
+}
+
+/// One step of a planned job. Commands are expanded, so there is no
+/// command step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedStep {
+    /// A shell command.
+    Run(RunStep),
+    /// A GitHub action.
+    Uses(UsesStep),
+    /// Restore a cache now, save it when the job ends.
+    Cache(CacheStep),
+    /// Pass files to later jobs of the workflow.
+    Workspace(WorkspaceStep),
+    /// Upload `JUnit` results from a path.
+    TestResults {
+        /// A file or directory of `JUnit` XML.
+        path: String,
+    },
+}
+
+/// Compiles `workflow` for a push of `git_ref` (`refs/heads/main`,
+/// `refs/tags/v1`). `branches:` and `tags:` on workflow jobs are matched
+/// against the ref; a job that does not match is dropped, and so is
+/// every job that requires it.
+///
+/// # Errors
+///
+/// Returns every problem found in the config and the workflow. Problems
+/// in jobs the ref drops are reported too.
+pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, Vec<Diagnostic>> {
+    let mut errors = config_errors(config);
+    let Some(wf) = config.workflows.get(workflow) else {
+        errors.push(Diagnostic::new(format!(
+            "there is no workflow `{workflow}`"
+        )));
+        return Err(dedup(errors));
+    };
+    let plan = compile_workflow(config, workflow, wf, git_ref, &mut errors);
+    match plan {
+        Some(plan) if errors.is_empty() => Ok(plan),
+        _ => Err(dedup(errors)),
+    }
+}
+
+/// Compiles every workflow against `refs/heads/main` and returns every
+/// problem found. Empty when the config is valid.
+#[must_use]
+pub fn validate(config: &Config) -> Vec<Diagnostic> {
+    let mut errors = config_errors(config);
+    for (name, wf) in &config.workflows {
+        compile_workflow(config, name, wf, VALIDATE_REF, &mut errors);
+    }
+    dedup(errors)
+}
+
+/// Problems that belong to the config as a whole, not one workflow.
+fn config_errors(config: &Config) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    for name in config.commands.keys() {
+        if STEP_KEYS.contains(&name.as_str()) {
+            errors.push(Diagnostic::new(format!(
+                "command `{name}` has the name of a step key; rename it"
+            )));
+        }
+    }
+    for (name, executor) in &config.executors {
+        if template(&executor.runs_on).is_none() {
+            errors.push(unknown_template(
+                &format!("executor `{name}`"),
+                &executor.runs_on,
+            ));
+        }
+    }
+    errors
+}
+
+fn unknown_template(owner: &str, label: &str) -> Diagnostic {
+    Diagnostic::new(format!(
+        "{owner} has `runs-on: {label}`, which names no runner template; use one of {}",
+        template_labels().join(", ")
+    ))
+}
+
+/// Drops repeated messages, keeping the first of each.
+fn dedup(errors: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = Vec::with_capacity(errors.len());
+    for e in errors {
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// Compiles one workflow, adding its problems to `errors`. Returns the
+/// plan only when the workflow had no problems.
+fn compile_workflow(
+    config: &Config,
+    name: &str,
+    wf: &Workflow,
+    git_ref: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<Plan> {
+    let before = errors.len();
+    trigger_errors(name, &wf.on, errors);
+
+    let ids: Vec<String> = wf
+        .jobs
+        .iter()
+        .map(|e| e.name.clone().unwrap_or_else(|| e.job.clone()))
+        .collect();
+    let mut index: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, id) in ids.iter().enumerate() {
+        if index.insert(id, i).is_some() {
+            errors.push(Diagnostic::new(format!(
+                "workflow `{name}` has a duplicate job id `{id}`; give one of them a `name`"
+            )));
+        }
+    }
+
+    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(ids.len());
+    for (entry, id) in wf.jobs.iter().zip(&ids) {
+        let mut own = Vec::new();
+        for req in &entry.requires {
+            match index.get(req.as_str()) {
+                Some(&d) if !own.contains(&d) => own.push(d),
+                Some(_) => {}
+                None => errors.push(Diagnostic::new(format!(
+                    "job `{id}` in workflow `{name}` requires `{req}`, which is not a job of the workflow"
+                ))),
+            }
+        }
+        deps.push(own);
+    }
+
+    let expansions: Vec<Vec<PlannedJob>> = wf
+        .jobs
+        .iter()
+        .zip(&ids)
+        .map(|(entry, id)| expand_entry(config, name, entry, id, errors))
+        .collect();
+
+    let order = topological(&deps);
+    if order.len() < ids.len() {
+        let cycle: Vec<String> = cycle_members(&deps, &order)
+            .into_iter()
+            .map(|i| format!("`{}`", ids[i]))
+            .collect();
+        errors.push(Diagnostic::new(format!(
+            "workflow `{name}` has a requires cycle between {}",
+            cycle.join(", ")
+        )));
+    }
+    if errors.len() > before {
+        return None;
+    }
+
+    let expanded_ids: Vec<Vec<String>> = expansions
+        .iter()
+        .map(|jobs| jobs.iter().map(|j| j.id.clone()).collect())
+        .collect();
+    let mut expansions = expansions;
+    let mut kept = vec![false; ids.len()];
+    let mut jobs = Vec::new();
+    for i in order {
+        kept[i] = ref_allows(&wf.jobs[i], git_ref) && deps[i].iter().all(|&d| kept[d]);
+        if !kept[i] {
+            continue;
+        }
+        let requires: Vec<String> = deps[i]
+            .iter()
+            .flat_map(|&d| expanded_ids[d].iter().cloned())
+            .collect();
+        for mut job in std::mem::take(&mut expansions[i]) {
+            job.requires.clone_from(&requires);
+            jobs.push(job);
+        }
+    }
+    Some(Plan {
+        workflow: name.to_owned(),
+        jobs,
+    })
+}
+
+/// Reports a trigger that has both an include and an ignore filter of
+/// one kind, which GitHub rejects.
+fn trigger_errors(name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
+    let mut both = |event: &str, key: &str, include: Option<&Filter>, ignore: Option<&Filter>| {
+        if include.is_some() && ignore.is_some() {
+            errors.push(Diagnostic::new(format!(
+                "workflow `{name}`: `on.{event}` has both `{key}` and `{key}-ignore`; use one"
+            )));
+        }
+    };
+    if let Some(push) = &on.push {
+        both(
+            "push",
+            "branches",
+            push.branches.as_ref(),
+            push.branches_ignore.as_ref(),
+        );
+        both(
+            "push",
+            "tags",
+            push.tags.as_ref(),
+            push.tags_ignore.as_ref(),
+        );
+        both(
+            "push",
+            "paths",
+            push.paths.as_ref(),
+            push.paths_ignore.as_ref(),
+        );
+    }
+    if let Some(pr) = &on.pull_request {
+        both(
+            "pull_request",
+            "branches",
+            pr.branches.as_ref(),
+            pr.branches_ignore.as_ref(),
+        );
+        both(
+            "pull_request",
+            "paths",
+            pr.paths.as_ref(),
+            pr.paths_ignore.as_ref(),
+        );
+    }
+}
+
+/// Kahn's algorithm. Among the jobs that are ready, the one declared
+/// first goes first. Jobs on or after a cycle are left out.
+fn topological(deps: &[Vec<usize>]) -> Vec<usize> {
+    let mut waiting: Vec<usize> = deps.iter().map(Vec::len).collect();
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); deps.len()];
+    for (i, own) in deps.iter().enumerate() {
+        for &d in own {
+            dependents[d].push(i);
+        }
+    }
+    let mut ready: BTreeSet<usize> = (0..deps.len()).filter(|&i| waiting[i] == 0).collect();
+    let mut order = Vec::with_capacity(deps.len());
+    while let Some(i) = ready.pop_first() {
+        order.push(i);
+        for &next in &dependents[i] {
+            waiting[next] -= 1;
+            if waiting[next] == 0 {
+                ready.insert(next);
+            }
+        }
+    }
+    order
+}
+
+/// The jobs Kahn's algorithm left out, without those that only wait on
+/// a cycle and that no cycle waits on.
+fn cycle_members(deps: &[Vec<usize>], order: &[usize]) -> Vec<usize> {
+    let mut left: BTreeSet<usize> = (0..deps.len()).collect();
+    for i in order {
+        left.remove(i);
+    }
+    loop {
+        let needed: BTreeSet<usize> = left.iter().flat_map(|&i| deps[i].iter().copied()).collect();
+        let before = left.len();
+        left.retain(|i| needed.contains(i));
+        if left.len() == before {
+            return left.into_iter().collect();
+        }
+    }
+}
+
+/// Whether a workflow job's `branches:` and `tags:` let it run for
+/// `git_ref`. A job with only a tag filter runs only for tags, and one
+/// with only a branch filter only for branches.
+fn ref_allows(entry: &WorkflowJob, git_ref: &str) -> bool {
+    if let Some(branch) = git_ref.strip_prefix("refs/heads/") {
+        match &entry.branches {
+            Some(filter) => filter.matches(branch),
+            None => entry.tags.is_none(),
+        }
+    } else if let Some(tag) = git_ref.strip_prefix("refs/tags/") {
+        match &entry.tags {
+            Some(filter) => filter.matches(tag),
+            None => entry.branches.is_none(),
+        }
+    } else {
+        entry.branches.is_none() && entry.tags.is_none()
+    }
+}
+
+/// Expands one workflow entry into its matrix entries and parallel
+/// nodes, with `requires` left empty.
+fn expand_entry(
+    config: &Config,
+    workflow: &str,
+    entry: &WorkflowJob,
+    id: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<PlannedJob> {
+    if entry.approval {
+        return approval(entry, id, errors);
+    }
+
+    let Some(job) = config.jobs.get(&entry.job) else {
+        errors.push(Diagnostic::new(format!(
+            "workflow `{workflow}` runs job `{}`, which is not defined in `jobs:`",
+            entry.job
+        )));
+        return Vec::new();
+    };
+    let before = errors.len();
+    let owner = format!("job `{}`", entry.job);
+    let template = resolve_template(config, &owner, job, errors);
+
+    let nodes = job.parallelism.unwrap_or(1);
+    if !(1..=MAX_PARALLELISM).contains(&nodes) {
+        errors.push(Diagnostic::new(format!(
+            "{owner} has parallelism {nodes}; it must be 1 to {MAX_PARALLELISM}"
+        )));
+    }
+    let mut size: usize = 1;
+    for (key, values) in &entry.matrix {
+        if values.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has matrix key `{key}` with no values"
+            )));
+        }
+        if entry.with.contains_key(key) {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` sets `{key}` both in its matrix and as a parameter"
+            )));
+        }
+        size = size.saturating_mul(values.len());
+    }
+    if size > MAX_MATRIX {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has a matrix of {size} entries; the limit is {MAX_MATRIX}"
+        )));
+    }
+    if errors.len() > before {
+        return Vec::new();
+    }
+    let Some(template) = template else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for combo in combinations(&entry.matrix) {
+        let mut args = entry.with.clone();
+        for (key, value) in &combo {
+            if job.parameters.contains_key(key) {
+                args.insert(key.clone(), value.clone());
+            }
+        }
+        let Some(values) = bind(&job.parameters, &args, &owner, errors) else {
+            continue;
+        };
+        let Some(base) = expand_job(config, job, &owner, &values, errors) else {
+            continue;
+        };
+        let matrix_id = if combo.is_empty() {
+            id.to_owned()
+        } else {
+            let shown: Vec<String> = combo.values().map(render).collect();
+            format!("{id} ({})", shown.join(", "))
+        };
+        for node in 0..nodes {
+            let (job_id, node_of) = if nodes > 1 {
+                (
+                    format!("{matrix_id} [{}/{nodes}]", node + 1),
+                    Some((node, nodes)),
+                )
+            } else {
+                (matrix_id.clone(), None)
+            };
+            out.push(PlannedJob {
+                id: job_id,
+                name: id.to_owned(),
+                kind: JobKind::Run { template },
+                matrix: combo.clone(),
+                node: node_of,
+                ..base.clone()
+            });
+        }
+    }
+    out
+}
+
+/// The planned job of an approval entry, which takes no parameters and
+/// no matrix.
+fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<PlannedJob> {
+    let before = errors.len();
+    for key in entry.with.keys() {
+        errors.push(Diagnostic::new(format!(
+            "approval `{id}` takes no parameters, found `{key}`"
+        )));
+    }
+    if !entry.matrix.is_empty() {
+        errors.push(Diagnostic::new(format!(
+            "approval `{id}` cannot have a matrix"
+        )));
+    }
+    if errors.len() > before {
+        return Vec::new();
+    }
+    vec![PlannedJob {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        requires: Vec::new(),
+        kind: JobKind::Approval,
+        matrix: BTreeMap::new(),
+        node: None,
+        env: BTreeMap::new(),
+        if_: None,
+        timeout_minutes: DEFAULT_TIMEOUT_MINUTES,
+        outputs: BTreeMap::new(),
+        steps: Vec::new(),
+    }]
+}
+
+/// Every combination of matrix values. The first key changes slowest.
+fn combinations(matrix: &BTreeMap<String, Vec<Value>>) -> Vec<BTreeMap<String, Value>> {
+    let mut combos = vec![BTreeMap::new()];
+    for (key, values) in matrix {
+        let mut next = Vec::with_capacity(combos.len() * values.len());
+        for combo in &combos {
+            for value in values {
+                let mut c = combo.clone();
+                c.insert(key.clone(), value.clone());
+                next.push(c);
+            }
+        }
+        combos = next;
+    }
+    combos
+}
+
+/// Finds the template a job runs on.
+fn resolve_template(
+    config: &Config,
+    owner: &str,
+    job: &Job,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<&'static Template> {
+    match (&job.executor, &job.runs_on) {
+        (Some(_), Some(_)) => {
+            errors.push(Diagnostic::new(format!(
+                "{owner} has both `executor` and `runs-on`; use one"
+            )));
+            None
+        }
+        (None, None) => {
+            errors.push(Diagnostic::new(format!(
+                "{owner} needs `executor` or `runs-on`"
+            )));
+            None
+        }
+        (Some(name), None) => {
+            // An executor's label is checked once, in `config_errors`.
+            let found = config.executors.get(name).map(|e| template(&e.runs_on));
+            if found.is_none() {
+                errors.push(Diagnostic::new(format!(
+                    "{owner} uses executor `{name}`, which is not defined in `executors:`"
+                )));
+            }
+            found.flatten()
+        }
+        (None, Some(label)) => {
+            let found = template(label);
+            if found.is_none() {
+                errors.push(unknown_template(owner, label));
+            }
+            found
+        }
+    }
+}
+
+/// The job-level fields and steps of a planned job, with parameters
+/// substituted. Id, name, kind, matrix and node are filled in by the
+/// caller.
+fn expand_job(
+    config: &Config,
+    job: &Job,
+    owner: &str,
+    values: &BTreeMap<String, Value>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<PlannedJob> {
+    let before = errors.len();
+    let mut steps = Vec::new();
+    let mut stack = Vec::new();
+    expand_steps(
+        config, &job.steps, values, owner, &mut stack, &mut steps, errors,
+    );
+    if steps.len() > MAX_STEPS {
+        errors.push(Diagnostic::new(format!(
+            "{owner} expands to more than {MAX_STEPS} steps"
+        )));
+    }
+    let mut sub = |text: &str| substitute(text, values, owner, errors);
+    let env = job.env.iter().map(|(k, v)| (k.clone(), sub(v))).collect();
+    let if_ = job.if_.as_deref().map(&mut sub);
+    let outputs = job
+        .outputs
+        .iter()
+        .map(|(k, v)| (k.clone(), sub(v)))
+        .collect();
+    if errors.len() > before {
+        return None;
+    }
+    Some(PlannedJob {
+        id: String::new(),
+        name: String::new(),
+        requires: Vec::new(),
+        kind: JobKind::Approval,
+        matrix: BTreeMap::new(),
+        node: None,
+        env,
+        if_,
+        timeout_minutes: job.timeout_minutes.unwrap_or(DEFAULT_TIMEOUT_MINUTES),
+        outputs,
+        steps,
+    })
+}
+
+/// Expands commands depth first. `stack` holds the commands being
+/// expanded, so a command that reaches itself is caught.
+fn expand_steps(
+    config: &Config,
+    steps: &[Step],
+    values: &BTreeMap<String, Value>,
+    scope: &str,
+    stack: &mut Vec<String>,
+    out: &mut Vec<PlannedStep>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    for step in steps {
+        if out.len() > MAX_STEPS {
+            return;
+        }
+        let Step::Command { name, with } = step else {
+            out.push(plan_step(step, values, scope, errors));
+            continue;
+        };
+        let Some(command) = config.commands.get(name) else {
+            errors.push(Diagnostic::new(format!(
+                "{scope} uses command `{name}`, which is not defined in `commands:`"
+            )));
+            continue;
+        };
+        if let Some(pos) = stack.iter().position(|c| c == name) {
+            let chain: Vec<String> = stack[pos..]
+                .iter()
+                .chain(std::iter::once(name))
+                .map(|c| format!("`{c}`"))
+                .collect();
+            errors.push(Diagnostic::new(format!(
+                "command `{name}` reaches itself: {}",
+                chain.join(" -> ")
+            )));
+            continue;
+        }
+        if stack.len() >= MAX_NESTING {
+            errors.push(Diagnostic::new(format!(
+                "{scope} nests commands deeper than {MAX_NESTING}"
+            )));
+            continue;
+        }
+        let args: BTreeMap<String, Value> = with
+            .iter()
+            .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, errors)))
+            .collect();
+        let inner = format!("command `{name}`");
+        let Some(bound) = bind(&command.parameters, &args, &inner, errors) else {
+            continue;
+        };
+        stack.push(name.clone());
+        expand_steps(config, &command.steps, &bound, &inner, stack, out, errors);
+        stack.pop();
+    }
+}
+
+/// Checks parameter values against their declarations and fills in
+/// defaults. `None` when a value is missing, unknown or the wrong kind.
+fn bind(
+    params: &BTreeMap<String, Parameter>,
+    args: &BTreeMap<String, Value>,
+    owner: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<BTreeMap<String, Value>> {
+    let before = errors.len();
+    for key in args.keys() {
+        if !params.contains_key(key) {
+            errors.push(Diagnostic::new(format!("{owner} has no parameter `{key}`")));
+        }
+    }
+    let mut values = BTreeMap::new();
+    for (key, param) in params {
+        let Some(value) = args.get(key).or(param.default.as_ref()) else {
+            errors.push(Diagnostic::new(format!(
+                "{owner} needs a value for parameter `{key}`, which is required"
+            )));
+            continue;
+        };
+        if let Some(want) = kind_mismatch(&param.kind, value) {
+            errors.push(Diagnostic::new(format!(
+                "{owner} parameter `{key}` must be {want}, found {value}"
+            )));
+            continue;
+        }
+        values.insert(key.clone(), value.clone());
+    }
+    (errors.len() == before).then_some(values)
+}
+
+/// What a value should have been, when it is not of `kind`. A string
+/// holding an expression passes any kind; it is checked at run time.
+fn kind_mismatch(kind: &ParameterKind, value: &Value) -> Option<String> {
+    if value.as_str().is_some_and(|s| s.contains("${{")) {
+        return None;
+    }
+    let ok = match kind {
+        ParameterKind::String => {
+            matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_))
+        }
+        ParameterKind::Boolean => value.is_boolean(),
+        ParameterKind::Integer => value.is_i64() || value.is_u64(),
+        ParameterKind::Enum(options) => value
+            .as_str()
+            .is_some_and(|s| options.iter().any(|o| o == s)),
+    };
+    if ok {
+        return None;
+    }
+    Some(match kind {
+        ParameterKind::String => "a string".into(),
+        ParameterKind::Boolean => "a boolean".into(),
+        ParameterKind::Integer => "an integer".into(),
+        ParameterKind::Enum(options) => format!("one of {}", options.join(", ")),
+    })
+}
+
+/// Substitutes parameters in every string field of a step.
+fn plan_step(
+    step: &Step,
+    values: &BTreeMap<String, Value>,
+    scope: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> PlannedStep {
+    let mut sub = |text: &str| substitute(text, values, scope, errors);
+    match step {
+        Step::Run(run) => {
+            let planned = RunStep {
+                name: run.name.as_deref().map(&mut sub),
+                id: run.id.clone(),
+                run: sub(&run.run),
+                shell: run.shell.as_deref().map(&mut sub),
+                working_directory: run.working_directory.as_deref().map(&mut sub),
+                env: run.env.iter().map(|(k, v)| (k.clone(), sub(v))).collect(),
+                if_: run.if_.as_deref().map(&mut sub),
+                continue_on_error: run.continue_on_error,
+                timeout_minutes: run.timeout_minutes,
+            };
+            PlannedStep::Run(planned)
+        }
+        Step::Uses(uses) => {
+            let planned = UsesStep {
+                name: uses.name.as_deref().map(&mut sub),
+                id: uses.id.clone(),
+                uses: sub(&uses.uses),
+                with: BTreeMap::new(),
+                env: uses.env.iter().map(|(k, v)| (k.clone(), sub(v))).collect(),
+                if_: uses.if_.as_deref().map(&mut sub),
+                continue_on_error: uses.continue_on_error,
+            };
+            let with = uses
+                .with
+                .iter()
+                .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, errors)))
+                .collect();
+            if planned.uses.starts_with("docker://") {
+                errors.push(Diagnostic::new(format!(
+                    "{scope} has `uses: {}`; `uses: docker://` is not supported yet; Docker services and containers come in a later release",
+                    planned.uses
+                )));
+            }
+            PlannedStep::Uses(UsesStep { with, ..planned })
+        }
+        Step::Cache(cache) => PlannedStep::Cache(CacheStep {
+            key: sub(&cache.key),
+            restore_keys: cache.restore_keys.iter().map(|k| sub(k)).collect(),
+            paths: cache.paths.iter().map(|p| sub(p)).collect(),
+        }),
+        Step::Workspace(WorkspaceStep::Persist { root, paths }) => {
+            PlannedStep::Workspace(WorkspaceStep::Persist {
+                root: sub(root),
+                paths: paths.iter().map(|p| sub(p)).collect(),
+            })
+        }
+        Step::Workspace(WorkspaceStep::Attach { at }) => {
+            PlannedStep::Workspace(WorkspaceStep::Attach { at: sub(at) })
+        }
+        Step::TestResults { path } => PlannedStep::TestResults { path: sub(path) },
+        Step::Command { .. } => unreachable!("commands are expanded by expand_steps"),
+    }
+}
+
+/// Substitutes parameters inside a value. A string that is exactly one
+/// `${{ parameters.x }}` becomes the parameter's value, keeping its type.
+fn substitute_value(
+    value: &Value,
+    values: &BTreeMap<String, Value>,
+    scope: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Value {
+    match value {
+        Value::String(text) => {
+            if let Some(found) = sole_parameter(text).and_then(|name| values.get(name)) {
+                return found.clone();
+            }
+            Value::String(substitute(text, values, scope, errors))
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| substitute_value(v, values, scope, errors))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), substitute_value(v, values, scope, errors)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// The parameter name when `text` is one `${{ parameters.x }}` and
+/// nothing else.
+fn sole_parameter(text: &str) -> Option<&str> {
+    let inner = text.trim().strip_prefix("${{")?.strip_suffix("}}")?;
+    if inner.contains("}}") {
+        return None;
+    }
+    parameter_name(inner)
+}
+
+/// `x` when `expr` is `parameters.x`, surrounded by any whitespace.
+fn parameter_name(expr: &str) -> Option<&str> {
+    let name = expr.trim().strip_prefix("parameters.")?;
+    let ident = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    ident.then_some(name)
+}
+
+/// Replaces each `${{ parameters.x }}` in `text` with the value of `x`.
+/// Every other `${{ }}` is left as it is.
+fn substitute(
+    text: &str,
+    values: &BTreeMap<String, Value>,
+    scope: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${{") {
+        let body = &rest[start + 3..];
+        let Some(end) = body.find("}}") else {
+            break;
+        };
+        let whole = &rest[..start + 3 + end + 2];
+        match parameter_name(&body[..end]) {
+            Some(name) => {
+                out.push_str(&rest[..start]);
+                if let Some(value) = values.get(name) {
+                    out.push_str(&render(value));
+                } else {
+                    errors.push(Diagnostic::new(format!(
+                        "{scope} reads `${{{{ parameters.{name} }}}}` but declares no parameter `{name}`"
+                    )));
+                    out.push_str(&whole[start..]);
+                }
+            }
+            None => out.push_str(whole),
+        }
+        rest = &body[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A parameter or matrix value as text: strings as they are, whole
+/// numbers without `.0`, booleans as `true` or `false`.
+fn render(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => match n.as_f64() {
+            Some(f) if n.is_f64() => f.to_string(),
+            _ => n.to_string(),
+        },
+        Value::Bool(b) => b.to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
