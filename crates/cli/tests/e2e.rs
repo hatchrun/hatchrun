@@ -10,8 +10,9 @@
 //! written `.hatchrun/config.yml` back and then plays every webhook in
 //! `tests/fixtures/e2e/events/` against it the way the control plane
 //! will: `triggered` picks the workflows, `compile` plans each one for
-//! the event's ref, and every job and step `if:` is evaluated against a
-//! context built from the payload.
+//! the event's ref, `ready` gates each job on its `requires` statuses,
+//! and every job and step `if:` is evaluated against a context built
+//! from the payload.
 //!
 //! The run is simulated twice. In the "ok" run every job that runs
 //! passes; in the "fail" run every job that runs fails. A job's line
@@ -29,8 +30,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use hatchrun_workflow::{
-    Arch, Config, Event, ExprError, Functions, JobKind, JobStatus, ParameterKind, Plan, PlannedJob,
-    PlannedStep, Workflow, compile, interpolate, parse, to_yaml, triggered,
+    Arch, Config, Event, ExprError, Functions, JobKind, JobStatus, Outcome, ParameterKind, Plan,
+    PlannedJob, PlannedStep, Ready, Statuses, Workflow, compile, interpolate, parse, ready,
+    to_yaml, triggered,
 };
 use serde_json::{Map, Value, json};
 
@@ -299,29 +301,6 @@ impl Functions for Status {
     }
 }
 
-/// How the jobs a job needs ended, as its status functions see them.
-#[derive(Clone, Copy)]
-enum Upstream {
-    /// Every ancestor passed.
-    Passed,
-    /// An ancestor failed.
-    Failed,
-    /// None failed but one was skipped: `success()` and `failure()` are
-    /// both false. `JobStatus` has no such state, so `Cancelled` stands
-    /// in; no fixture calls `cancelled()`.
-    Skipped,
-}
-
-impl Upstream {
-    fn status(self) -> JobStatus {
-        match self {
-            Self::Passed => JobStatus::Success,
-            Self::Failed => JobStatus::Failure,
-            Self::Skipped => JobStatus::Cancelled,
-        }
-    }
-}
-
 /// Evaluates an `if:` with the job's status as `status`.
 fn condition(cond: &str, ctx: &Value, status: JobStatus) -> Result<bool, ExprError> {
     hatchrun_workflow::condition(cond, ctx, &Status(status))
@@ -366,28 +345,37 @@ fn step_parts(step: &PlannedStep) -> (String, Option<&str>, Option<&str>) {
 
 /// One simulated run of a plan: the result of every job by name.
 struct Run {
-    results: BTreeMap<String, &'static str>,
+    results: BTreeMap<String, Outcome>,
     lines: BTreeMap<String, Result<bool, ExprError>>,
 }
 
 /// Plays a plan through once. `fail` makes every job that runs fail.
+/// `ready` decides from the `requires` statuses whether a job may start,
+/// as the control plane will; then its `if:` decides whether it runs.
 fn simulate(plan: &Plan, base: &Value, outputs: &Value, fail: bool) -> Run {
     let by_id: BTreeMap<&str, &PlannedJob> = plan.jobs.iter().map(|j| (j.id.as_str(), j)).collect();
-    let mut ran: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
+    let mut ran: BTreeMap<String, Vec<Outcome>> = BTreeMap::new();
+    let mut ended: BTreeMap<String, Outcome> = BTreeMap::new();
     let mut lines = BTreeMap::new();
     for job in &plan.jobs {
-        let upstream = upstream(job, &by_id, &ran);
-        let ctx = job_context(job, base, &by_id, &ran, outputs);
-        let runs = match &job.if_ {
-            Some(cond) => condition(cond, &ctx, upstream.status()),
-            None => Ok(matches!(upstream, Upstream::Passed)),
+        let runs = match ready(plan, job, |id| ended.get(id).copied()) {
+            Ready::Wait => panic!("{}: plan order put it before a job it requires", job.id),
+            Ready::NotRun => Ok(false),
+            Ready::Start => match &job.if_ {
+                Some(cond) => {
+                    let ctx = job_context(job, base, &by_id, &ran, outputs);
+                    condition(cond, &ctx, JobStatus::Success)
+                }
+                None => Ok(true),
+            },
         };
         let result = match runs {
-            Ok(true) if fail => "failure",
-            Ok(true) => "success",
-            _ => "skipped",
+            Ok(true) if fail => Outcome::Failed,
+            Ok(true) => Outcome::Success,
+            _ => Outcome::NotRun,
         };
         ran.entry(job.name.clone()).or_default().push(result);
+        ended.insert(job.id.clone(), result);
         lines.insert(job.id.clone(), runs);
     }
     let results = ran
@@ -398,13 +386,13 @@ fn simulate(plan: &Plan, base: &Value, outputs: &Value, fail: bool) -> Run {
 }
 
 /// One result for a job and all its matrix legs and nodes.
-fn combined(legs: &[&'static str]) -> &'static str {
-    if legs.contains(&"failure") {
-        "failure"
-    } else if legs.iter().all(|r| *r == "skipped") {
-        "skipped"
+fn combined(legs: &[Outcome]) -> Outcome {
+    if legs.contains(&Outcome::Failed) {
+        Outcome::Failed
+    } else if legs.iter().all(|r| *r == Outcome::NotRun) {
+        Outcome::NotRun
     } else {
-        "success"
+        Outcome::Success
     }
 }
 
@@ -418,34 +406,6 @@ fn needs_names<'a>(job: &PlannedJob, by_id: &BTreeMap<&str, &'a PlannedJob>) -> 
         }
     }
     names
-}
-
-fn upstream(
-    job: &PlannedJob,
-    by_id: &BTreeMap<&str, &PlannedJob>,
-    ran: &BTreeMap<String, Vec<&'static str>>,
-) -> Upstream {
-    // Every ancestor, not only the direct needs.
-    let mut seen = BTreeSet::new();
-    let mut todo: Vec<&str> = job.requires.iter().map(String::as_str).collect();
-    let mut skipped = false;
-    while let Some(id) = todo.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        let up = by_id[id];
-        match combined(&ran[&up.name]) {
-            "failure" => return Upstream::Failed,
-            "skipped" => skipped = true,
-            _ => {}
-        }
-        todo.extend(up.requires.iter().map(String::as_str));
-    }
-    if skipped {
-        Upstream::Skipped
-    } else {
-        Upstream::Passed
-    }
 }
 
 /// The step outputs a step id produced, from the scenario's
@@ -492,21 +452,21 @@ fn job_context(
     job: &PlannedJob,
     base: &Value,
     by_id: &BTreeMap<&str, &PlannedJob>,
-    ran: &BTreeMap<String, Vec<&'static str>>,
+    ran: &BTreeMap<String, Vec<Outcome>>,
     outputs: &Value,
 ) -> Value {
     let mut needs = Map::new();
     for name in needs_names(job, by_id) {
         let first = by_id.values().find(|j| j.name == name).unwrap();
         let result = combined(&ran[name]);
-        let outs = if result == "success" {
+        let outs = if result == Outcome::Success {
             job_outputs(first, base, outputs)
         } else {
             json!({})
         };
         needs.insert(
             name.to_owned(),
-            json!({ "result": result, "outputs": outs }),
+            json!({ "result": JobStatus::from(result).result(), "outputs": outs }),
         );
     }
     let mut ctx = base.clone();
@@ -579,6 +539,11 @@ fn render_job(
     if job.name != job.id.split(" (").next().unwrap_or_default() {
         writeln!(out, "      name {}", job.name).unwrap();
     }
+    for (name, statuses) in &job.statuses {
+        if *statuses != Statuses::SUCCESS {
+            writeln!(out, "      requires {name}: {statuses}").unwrap();
+        }
+    }
     if let Some(cond) = &job.if_ {
         writeln!(out, "      if {cond}").unwrap();
     }
@@ -633,7 +598,7 @@ fn render_job(
     }
 }
 
-fn as_legs(results: &BTreeMap<String, &'static str>) -> BTreeMap<String, Vec<&'static str>> {
+fn as_legs(results: &BTreeMap<String, Outcome>) -> BTreeMap<String, Vec<Outcome>> {
     results
         .iter()
         .map(|(name, result)| (name.clone(), vec![*result]))

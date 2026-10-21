@@ -5,7 +5,10 @@
 //! GitHub-style `${{ }}` expressions.
 
 use hatchrun_workflow::expr::check;
-use hatchrun_workflow::{ExprError, Functions, JobStatus, evaluate, interpolate, truthy};
+use hatchrun_workflow::{
+    ExprError, Functions, JobStatus, Outcome, StatusCall, evaluate, interpolate, split_status,
+    truthy,
+};
 use serde_json::{Value, json};
 
 struct NoFiles;
@@ -241,6 +244,7 @@ fn status_functions() {
         (JobStatus::Success, true, false, false),
         (JobStatus::Failure, false, true, false),
         (JobStatus::Cancelled, false, false, true),
+        (JobStatus::Skipped, false, false, false),
     ] {
         let f = Files(status);
         let e = |s: &str| evaluate(s, &json!({}), &f).unwrap();
@@ -249,6 +253,71 @@ fn status_functions() {
         assert_eq!(e("cancelled()"), json!(cancelled));
         assert_eq!(e("always()"), json!(true));
     }
+}
+
+#[test]
+fn job_status_reads_as_a_needs_result() {
+    let results: Vec<&str> = Outcome::ALL
+        .into_iter()
+        .map(|o| JobStatus::from(o).result())
+        .collect();
+    assert_eq!(results, ["success", "skipped", "failure", "cancelled"]);
+}
+
+#[test]
+fn split_status_takes_status_calls_off_the_top_level_and() {
+    use StatusCall::{Always, Cancelled, Failure, NotCancelled, Success};
+    for (cond, calls, rest) in [
+        (
+            "${{ (!cancelled()) && needs.a.result != 'skipped' }}",
+            &[NotCancelled][..],
+            &["needs.a.result != 'skipped'"][..],
+        ),
+        ("success() && x", &[Success], &["x"]),
+        ("always()", &[Always], &[]),
+        ("  ${{ failure() }}  ", &[Failure], &[]),
+        ("((cancelled() && (a || b)))", &[Cancelled], &["a || b"]),
+        (
+            "!cancelled() && (a || b) && always() && c",
+            &[NotCancelled, Always],
+            &["(a || b)", "c"],
+        ),
+        // Nested `&&` inside parentheses is flattened.
+        ("(success() && a) && b", &[Success], &["a", "b"]),
+        // `&&` inside a string or a call does not split.
+        (
+            "always() && contains('a && b', x)",
+            &[Always],
+            &["contains('a && b', x)"],
+        ),
+        (
+            "always() && x == 'success() && y'",
+            &[Always],
+            &["x == 'success() && y'"],
+        ),
+    ] {
+        let split = split_status(cond).unwrap().unwrap();
+        assert_eq!((&split.calls[..], &split.rest[..]), (calls, rest), "{cond}");
+    }
+    // A condition with no status call comes back whole, as written.
+    for cond in ["a && b", "x ${{ y }}", "${{ a }}"] {
+        let split = split_status(cond).unwrap().unwrap();
+        assert_eq!(split.calls, []);
+        assert_eq!(split.rest, [cond]);
+    }
+    // Status calls that cannot be split out.
+    for cond in [
+        "success() || a",
+        "a && (failure() || b)",
+        "!success()",
+        "!always() && a",
+        "format('{0}', failure())",
+        "failure() == true",
+        "x ${{ always() }}",
+    ] {
+        assert_eq!(split_status(cond).unwrap(), None, "{cond}");
+    }
+    assert!(split_status("always() &&").is_err());
 }
 
 #[test]

@@ -92,6 +92,35 @@ pub enum JobStatus {
     Failure,
     /// The run was cancelled.
     Cancelled,
+    /// The job did not run. `success()`, `failure()` and `cancelled()`
+    /// are all false; `always()` is still true.
+    Skipped,
+}
+
+impl JobStatus {
+    /// The status as `needs.<id>.result` reports it: `success`,
+    /// `failure`, `cancelled` or `skipped`.
+    #[must_use]
+    pub fn result(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+impl From<crate::config::Outcome> for JobStatus {
+    fn from(outcome: crate::config::Outcome) -> Self {
+        use crate::config::Outcome;
+        match outcome {
+            Outcome::Success => Self::Success,
+            Outcome::Failed => Self::Failure,
+            Outcome::Canceled => Self::Cancelled,
+            Outcome::NotRun => Self::Skipped,
+        }
+    }
 }
 
 /// The functions whose answer depends on where the expression runs.
@@ -189,11 +218,7 @@ pub fn condition(cond: &str, ctx: &Value, funcs: &dyn Functions) -> Result<bool,
             offset: e.offset + by,
         }
     };
-    let inner = trimmed
-        .strip_prefix("${{")
-        .and_then(|rest| rest.strip_suffix("}}"))
-        .filter(|inner| find_open(inner).is_none());
-    let value = match inner {
+    let value = match whole(trimmed) {
         Some(inner) => evaluate(inner, ctx, funcs).map_err(shift(lead + 3))?,
         None if find_open(trimmed).is_some() => {
             Value::String(interpolate(trimmed, ctx, funcs).map_err(shift(lead))?)
@@ -204,6 +229,186 @@ pub fn condition(cond: &str, ctx: &Value, funcs: &dyn Functions) -> Result<bool,
         return Ok(false);
     }
     Ok(funcs.status() == JobStatus::Success || checks_status(trimmed).map_err(shift(lead))?)
+}
+
+/// The expression inside `text` when `text` is one whole `${{ }}`.
+fn whole(text: &str) -> Option<&str> {
+    text.strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .filter(|inner| find_open(inner).is_none())
+}
+
+/// A status function call that is a whole operand of a condition's
+/// top-level `&&`, as [`split_status`] finds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusCall {
+    /// `success()`.
+    Success,
+    /// `always()`.
+    Always,
+    /// `failure()`.
+    Failure,
+    /// `cancelled()`.
+    Cancelled,
+    /// `!cancelled()`.
+    NotCancelled,
+}
+
+/// A condition split on its top-level `&&` by [`split_status`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusSplit<'a> {
+    /// The operands that are status calls, in order.
+    pub calls: Vec<StatusCall>,
+    /// The other operands, as written. A lone operand loses the
+    /// parentheses around it; with several, each keeps its own, so
+    /// joining them with ` && ` means what they meant.
+    pub rest: Vec<&'a str>,
+}
+
+/// Splits an `if:` on its top-level `&&` into status calls and the
+/// other operands.
+///
+/// A whole `${{ }}` is unwrapped first, and so are parentheses around
+/// the whole condition or an operand, so `${{ (!cancelled()) && x }}`
+/// splits into `!cancelled()` and `x`. `&&` inside parentheses,
+/// brackets, call arguments or strings does not split. A condition with
+/// no status call comes back whole, as written, as the one operand.
+///
+/// Returns `Ok(None)` when a status function is called where it cannot
+/// be split out: under `||`, under `!` (other than `!cancelled()`), as
+/// an argument or a compared value, or in text that mixes `${{ }}` with
+/// other text.
+///
+/// # Errors
+///
+/// When an expression does not parse or a `${{` is not closed. The
+/// offset is relative to `cond`.
+pub fn split_status(cond: &str) -> Result<Option<StatusSplit<'_>>, ExprError> {
+    let trimmed = cond.trim();
+    let lead = cond.len() - cond.trim_start().len();
+    let (src, at) = match whole(trimmed) {
+        Some(inner) => (inner, lead + 3),
+        None if find_open(trimmed).is_some() => {
+            let found = checks_status(trimmed).map_err(|e| ExprError {
+                message: e.message,
+                offset: e.offset + lead,
+            })?;
+            return Ok((!found).then(|| StatusSplit {
+                calls: Vec::new(),
+                rest: vec![cond],
+            }));
+        }
+        None => (trimmed, lead),
+    };
+    let ast = tree(src).map_err(|e| ExprError {
+        message: e.message,
+        offset: e.offset + at,
+    })?;
+    if !eval::calls_status(&ast) {
+        return Ok(Some(StatusSplit {
+            calls: Vec::new(),
+            rest: vec![cond],
+        }));
+    }
+    let mut split = StatusSplit::default();
+    if !conjuncts(src, &mut split)? {
+        return Ok(None);
+    }
+    if let [one] = split.rest.as_mut_slice() {
+        *one = unwrap_parens(one)?;
+    }
+    Ok(Some(split))
+}
+
+/// Adds the operands of the top-level `&&` of `src`, a part of an
+/// expression that parses, to `split`. False when a status function is
+/// called where it cannot be split out.
+fn conjuncts<'a>(src: &'a str, split: &mut StatusSplit<'a>) -> Result<bool, ExprError> {
+    let tokens = lexer::lex(src)?;
+    let (from, to) = inside_parens(&tokens);
+    let mut depth = 0usize;
+    let mut cuts = Vec::new();
+    for (i, token) in tokens.iter().enumerate().take(to).skip(from) {
+        match token.kind {
+            lexer::Kind::LParen | lexer::Kind::LBracket => depth += 1,
+            lexer::Kind::RParen | lexer::Kind::RBracket => depth = depth.saturating_sub(1),
+            lexer::Kind::And if depth == 0 => cuts.push(i),
+            // `&&` binds tighter, so the whole range is one operand.
+            lexer::Kind::Or if depth == 0 => {
+                cuts.clear();
+                break;
+            }
+            _ => {}
+        }
+    }
+    if cuts.is_empty() {
+        let text = src.trim();
+        let ast = tree(text)?;
+        match status_call(&ast) {
+            Some(call) => split.calls.push(call),
+            None if eval::calls_status(&ast) => return Ok(false),
+            None => split.rest.push(text),
+        }
+        return Ok(true);
+    }
+    let mut start = from;
+    for end in cuts.into_iter().chain([to]) {
+        let operand = &src[tokens[start].offset..tokens[end].offset];
+        if !conjuncts(operand, split)? {
+            return Ok(false);
+        }
+        start = end + 1;
+    }
+    Ok(true)
+}
+
+/// `text` without the parentheses around all of it.
+fn unwrap_parens(text: &str) -> Result<&str, ExprError> {
+    let tokens = lexer::lex(text)?;
+    let (from, to) = inside_parens(&tokens);
+    Ok(text[tokens[from].offset..tokens[to].offset].trim())
+}
+
+/// The token range inside the parentheses that enclose all of `tokens`,
+/// as many pairs as there are, up to the [`lexer::Kind::Eof`] or the
+/// closing parenthesis.
+fn inside_parens(tokens: &[lexer::Token<'_>]) -> (usize, usize) {
+    let mut from = 0;
+    let mut to = tokens.len() - 1;
+    while from + 1 < to && tokens[from].kind == lexer::Kind::LParen {
+        let mut depth = 0usize;
+        let closes = tokens[from..to].iter().position(|t| {
+            match t.kind {
+                lexer::Kind::LParen => depth += 1,
+                lexer::Kind::RParen => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        });
+        if closes != Some(to - 1 - from) {
+            break;
+        }
+        from += 1;
+        to -= 1;
+    }
+    (from, to)
+}
+
+/// The status call `expr` is, if it is a whole one.
+fn status_call(expr: &parser::Expr<'_>) -> Option<StatusCall> {
+    match expr {
+        parser::Expr::Call { name, args, .. } if args.is_empty() => match *name {
+            "success" => Some(StatusCall::Success),
+            "always" => Some(StatusCall::Always),
+            "failure" => Some(StatusCall::Failure),
+            "cancelled" => Some(StatusCall::Cancelled),
+            _ => None,
+        },
+        parser::Expr::Not(inner) => {
+            (status_call(inner) == Some(StatusCall::Cancelled)).then_some(StatusCall::NotCancelled)
+        }
+        _ => None,
+    }
 }
 
 /// Checks one expression without evaluating it: it must parse, call

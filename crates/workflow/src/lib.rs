@@ -17,15 +17,16 @@ pub mod templates;
 pub mod trigger;
 
 pub use config::{
-    CacheStep, Command, Config, Executor, Job, MAX_SOURCE, Parameter, ParameterKind, RunStep, Step,
-    UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
+    CacheStep, Command, Config, Executor, Job, MAX_SOURCE, Outcome, Parameter, ParameterKind,
+    Require, RunStep, Statuses, Step, UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
 };
 pub use convert::{Conversion, convert, to_yaml};
 pub use diagnostic::Diagnostic;
 pub use expr::{
-    ExprError, Functions, JobStatus, checks_status, condition, evaluate, interpolate, truthy,
+    ExprError, Functions, JobStatus, StatusCall, StatusSplit, checks_status, condition, evaluate,
+    interpolate, split_status, truthy,
 };
-pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, validate};
+pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, Ready, compile, ready, validate};
 pub use split::split;
 pub use templates::{Arch, TEMPLATES, Template, template, template_labels};
 pub use trigger::{

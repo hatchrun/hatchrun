@@ -4,7 +4,9 @@
 
 //! Parsing `.hatchrun/config.yml`.
 
-use hatchrun_workflow::{MAX_SOURCE, ParameterKind, Step, WorkspaceStep, parse};
+use hatchrun_workflow::{
+    MAX_SOURCE, Outcome, ParameterKind, Require, Statuses, Step, WorkspaceStep, parse, to_yaml,
+};
 
 #[test]
 fn parses_the_spec_example() {
@@ -13,8 +15,8 @@ fn parses_the_spec_example() {
     assert_eq!(config.jobs["test"].parallelism, Some(4));
     assert!(matches!(&config.jobs["test"].steps[0], Step::Command { name, .. } if name == "setup"));
     let ci = &config.workflows["ci"].jobs;
-    assert!(ci[1].approval && ci[1].requires == ["test"]);
-    assert_eq!(ci[2].requires, ["hold"]);
+    assert!(ci[1].approval && ci[1].requires == [Require::new("test")]);
+    assert_eq!(ci[2].requires, [Require::new("hold")]);
 }
 
 #[test]
@@ -217,5 +219,73 @@ fn files_past_the_parser_limits_get_a_plain_message() {
             err[0].message, "the file is too large or nests too deeply to read",
             "{err:?}"
         );
+    }
+}
+
+#[test]
+fn requires_entries_carry_statuses() {
+    let config = parse(
+        "jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { name: build }
+      - t: { name: test, requires: [build] }
+      - t: { name: lint, requires: [build] }
+      - t:
+          name: report
+          requires: [build, { test: [failed, not_run] }, { lint: terminal }, { x: failed }, { w: [success] }, { z: [canceled, terminal] }]
+",
+    )
+    .unwrap();
+    let requires = &config.workflows["ci"].jobs[3].requires;
+    let statuses: Vec<(&str, Statuses)> = requires
+        .iter()
+        .map(|r| (r.job.as_str(), r.statuses))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            ("build", Statuses::SUCCESS),
+            ("test", Statuses::FAILED.union(Statuses::NOT_RUN)),
+            ("lint", Statuses::TERMINAL),
+            ("x", Statuses::FAILED),
+            ("w", Statuses::SUCCESS),
+            ("z", Statuses::TERMINAL),
+        ]
+    );
+    assert!(Statuses::TERMINAL.outcomes().eq(Outcome::ALL));
+
+    // Written back in the shortest form, and read back the same.
+    let yaml = to_yaml(&config);
+    for form in [
+        "- build\n",
+        "- test:\n",
+        "- not_run\n",
+        "- failed\n",
+        "- lint: terminal\n",
+        "- x: failed\n",
+        "- w\n",
+        "- z: terminal\n",
+    ] {
+        assert!(yaml.contains(form), "{form:?} in\n{yaml}");
+    }
+    assert_eq!(parse(&yaml).unwrap(), config);
+}
+
+#[test]
+fn rejects_bad_requires_statuses() {
+    for (entry, word) in [
+        ("{ build: failure }", "unknown status `failure`"),
+        ("{ build: [] }", "lists no statuses"),
+        ("{ build: failed, test: failed }", "one key"),
+        ("{ build: { a: b } }", "a status"),
+    ] {
+        let yaml = format!(
+            "workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ requires: [{entry}] }} }}] }} }}"
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err[0].message.contains(word), "{entry}: {err:?}");
     }
 }

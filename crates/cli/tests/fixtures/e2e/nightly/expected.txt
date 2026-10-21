@@ -43,7 +43,8 @@ event schedule '0 12 * * 0' (compile refs/heads/main)
       step actions/checkout@v5
       step run: cargo install cargo-audit --locked && cargo audit
     job report on ubuntu-latest after fuzz (parse) + fuzz (eval) + audit: ok=run fail=run
-      if always()
+      requires audit: terminal
+      requires fuzz: terminal
       step Open an issue if contains(needs.*.result, 'failure'): ok=skip/skip fail=run/skip
       step Close the issue if !contains(needs.*.result, 'failure'): ok=run/skip fail=skip/skip
 event schedule '17 3 * * *' (compile refs/heads/main)
@@ -69,7 +70,8 @@ event schedule '17 3 * * *' (compile refs/heads/main)
       step actions/checkout@v5
       step run: cargo install cargo-audit --locked && cargo audit
     job report on ubuntu-latest after fuzz (parse) + fuzz (eval) + audit: ok=run fail=run
-      if always()
+      requires audit: terminal
+      requires fuzz: terminal
       step Open an issue if contains(needs.*.result, 'failure'): ok=skip/skip fail=run/skip
       step Close the issue if !contains(needs.*.result, 'failure'): ok=run/skip fail=skip/skip
 event workflow_dispatch (compile refs/heads/main)
@@ -95,6 +97,7 @@ event workflow_dispatch (compile refs/heads/main)
       step actions/checkout@v5
       step run: cargo install cargo-audit --locked && cargo audit
     job report on ubuntu-latest after fuzz (parse) + fuzz (eval) + audit: ok=run fail=run
-      if always()
+      requires audit: terminal
+      requires fuzz: terminal
       step Open an issue if contains(needs.*.result, 'failure'): ok=skip/skip fail=run/skip
       step Close the issue if !contains(needs.*.result, 'failure'): ok=run/skip fail=skip/skip

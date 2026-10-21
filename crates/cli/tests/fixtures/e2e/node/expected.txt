@@ -36,7 +36,8 @@ event push-main (compile refs/heads/main)
       step run: npm run build
       step Keep the bundle if github.event_name == 'push' && github.ref_name == 'main': ok=run/skip
     job report on ubuntu-latest after test (20, ubuntu-latest) + test (22, ubuntu-latest) + build: ok=run fail=run
-      if always()
+      requires build: terminal
+      requires test: terminal
       step run: echo "test ${{ needs.test.result }}, build ${{ needs.build.result }}"
 event push-feature (compile refs/heads/feature/login)
   node: triggered
@@ -65,7 +66,8 @@ event push-feature (compile refs/heads/feature/login)
       step run: npm run build
       step Keep the bundle if github.event_name == 'push' && github.ref_name == 'main': never reached
     job report on ubuntu-latest after test (20, ubuntu-latest) + test (22, ubuntu-latest) + build: ok=run fail=run
-      if always()
+      requires build: terminal
+      requires test: terminal
       step run: echo "test ${{ needs.test.result }}, build ${{ needs.build.result }}"
 event push-tag (compile refs/tags/v1.4.0)
   node: triggered
@@ -94,7 +96,8 @@ event push-tag (compile refs/tags/v1.4.0)
       step run: npm run build
       step Keep the bundle if github.event_name == 'push' && github.ref_name == 'main': ok=skip/skip
     job report on ubuntu-latest after test (20, ubuntu-latest) + test (22, ubuntu-latest) + build: ok=run fail=run
-      if always()
+      requires build: terminal
+      requires test: terminal
       step run: echo "test ${{ needs.test.result }}, build ${{ needs.build.result }}"
 event pull_request-opened (compile refs/heads/main)
   node: triggered
@@ -123,7 +126,8 @@ event pull_request-opened (compile refs/heads/main)
       step run: npm run build
       step Keep the bundle if github.event_name == 'push' && github.ref_name == 'main': ok=skip/skip
     job report on ubuntu-latest after test (20, ubuntu-latest) + test (22, ubuntu-latest) + build: ok=run fail=run
-      if always()
+      requires build: terminal
+      requires test: terminal
       step run: echo "test ${{ needs.test.result }}, build ${{ needs.build.result }}"
 event pull_request-synchronize (compile refs/heads/main)
   node: triggered
@@ -152,7 +156,8 @@ event pull_request-synchronize (compile refs/heads/main)
       step run: npm run build
       step Keep the bundle if github.event_name == 'push' && github.ref_name == 'main': ok=skip/skip
     job report on ubuntu-latest after test (20, ubuntu-latest) + test (22, ubuntu-latest) + build: ok=run fail=run
-      if always()
+      requires build: terminal
+      requires test: terminal
       step run: echo "test ${{ needs.test.result }}, build ${{ needs.build.result }}"
 event pull_request-closed (compile refs/heads/main)
   node: not triggered

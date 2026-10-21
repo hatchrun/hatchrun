@@ -14,8 +14,8 @@ use std::fmt::{self, Write as _};
 use serde_json::Value;
 
 use crate::config::{
-    CacheStep, Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow,
-    WorkflowJob, WorkspaceStep,
+    CacheStep, Config, Job, Outcome, Parameter, ParameterKind, RunStep, Statuses, Step, UsesStep,
+    Workflow, WorkflowJob, WorkspaceStep,
 };
 use crate::diagnostic::Diagnostic;
 use crate::expr::{self, ExprError};
@@ -107,6 +107,11 @@ pub struct PlannedJob {
     pub name: String,
     /// Ids of the jobs that must finish first.
     pub requires: Vec<String>,
+    /// For each workflow entry required, by its id (the `name` of its
+    /// planned jobs), the end states its ancestry must reach for this
+    /// job to start. [`ready`] reads it; an entry left out asks for
+    /// [`Statuses::SUCCESS`].
+    pub statuses: BTreeMap<String, Statuses>,
     /// What the job does.
     pub kind: JobKind,
     /// This job's matrix entry, read as `${{ matrix.x }}` at run time.
@@ -159,7 +164,8 @@ pub enum PlannedStep {
 
 /// Compiles `workflow` for one event. `branches:` and `tags:` on
 /// workflow jobs are matched against `git_ref`; a job that does not
-/// match is dropped, and so is every job that requires it.
+/// match is dropped, and so is every job that requires it, whatever
+/// statuses it lists.
 ///
 /// `git_ref` is the pushed ref for a push (`refs/heads/main`,
 /// `refs/tags/v1`), the base branch for a pull request
@@ -194,7 +200,9 @@ pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, V
 /// it calls, give parameter defaults of the declared kind, and write
 /// only expressions that parse and read known contexts. A `parameters`
 /// read is valid only as a whole `${{ parameters.NAME }}`, which compile
-/// substitutes; the plan carries no parameter values to run time.
+/// substitutes; the plan carries no parameter values to run time. A
+/// job's `if` may not call a status function: what a job waits for goes
+/// on its workflow entries' `requires` statuses. Step `if`s may.
 #[must_use]
 pub fn validate(config: &Config) -> Vec<Diagnostic> {
     let mut errors = config_errors(config);
@@ -207,6 +215,79 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
         }
     }
     dedup(errors)
+}
+
+/// Whether a planned job can start, as [`ready`] decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ready {
+    /// A job it requires, or a job before that one, has not ended yet.
+    Wait,
+    /// Every required entry reached one of its statuses. The job's `if:`
+    /// decides next whether it runs.
+    Start,
+    /// A required entry ended in a state its statuses do not list. The
+    /// job does not run: it ends as [`Outcome::NotRun`].
+    NotRun,
+}
+
+/// Decides whether `job`, a job of `plan`, can start. `outcome` tells
+/// how a job of the plan ended, by id, or `None` while it has not.
+///
+/// The job waits until every job before it has ended. It then starts
+/// when, for each workflow entry it requires, the aggregate outcome of
+/// that entry's ancestry (all of the entry's planned jobs and every job
+/// before them) is one of the statuses `job.statuses` lists for the
+/// entry, or [`Statuses::SUCCESS`] when it lists none. [`Statuses`]
+/// describes how outcomes aggregate. A job that requires nothing starts
+/// at once. Ids the plan does not hold count only through `outcome`.
+pub fn ready<'a, F>(plan: &'a Plan, job: &'a PlannedJob, outcome: F) -> Ready
+where
+    F: Fn(&str) -> Option<Outcome>,
+{
+    let by_id: BTreeMap<&str, &PlannedJob> = plan.jobs.iter().map(|j| (j.id.as_str(), j)).collect();
+    let entry = |id: &'a str| -> &'a str { by_id.get(id).map_or(id, |j| j.name.as_str()) };
+    let mut entries: Vec<&str> = Vec::new();
+    for id in &job.requires {
+        let name = entry(id);
+        if !entries.contains(&name) {
+            entries.push(name);
+        }
+    }
+    let mut start = true;
+    for name in entries {
+        let roots = job.requires.iter().filter(|id| entry(id) == name);
+        let Some(state) = ancestry(roots, &by_id, &outcome) else {
+            return Ready::Wait;
+        };
+        let wanted = job.statuses.get(name).copied().unwrap_or_default();
+        start &= wanted.contains(state);
+    }
+    if start { Ready::Start } else { Ready::NotRun }
+}
+
+/// The aggregate outcome of `roots` and every job before them: the
+/// strongest of their outcomes. `None` while one of them has not ended.
+fn ancestry<'a, F>(
+    roots: impl Iterator<Item = &'a String>,
+    by_id: &BTreeMap<&str, &'a PlannedJob>,
+    outcome: &F,
+) -> Option<Outcome>
+where
+    F: Fn(&str) -> Option<Outcome>,
+{
+    let mut seen = BTreeSet::new();
+    let mut todo: Vec<&str> = roots.map(String::as_str).collect();
+    let mut strongest = Outcome::Success;
+    while let Some(id) = todo.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        strongest = strongest.max(outcome(id)?);
+        if let Some(job) = by_id.get(id) {
+            todo.extend(job.requires.iter().map(String::as_str));
+        }
+    }
+    Some(strongest)
 }
 
 /// Problems that belong to the config as a whole, not one workflow.
@@ -327,6 +408,11 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
         }
         if let Some(cond) = &job.if_ {
             check.cond(&"`if`", cond);
+            if expr::checks_status(cond) == Ok(true) {
+                check.errors.push(Diagnostic::new(format!(
+                    "{owner} `if` calls a status function (`success()`, `failure()`, `cancelled()` or `always()`); a job's `if` cannot, as statuses go on the workflow entry's `requires`, such as `requires: [{{build: failed}}]`"
+                )));
+            }
         }
         for (key, value) in &job.outputs {
             check.text(&format_args!("`outputs.{key}`"), value);
@@ -676,20 +762,7 @@ fn compile_workflow(
         }
     }
 
-    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(ids.len());
-    for (entry, id) in wf.jobs.iter().zip(&ids) {
-        let mut own = Vec::new();
-        for req in &entry.requires {
-            match index.get(req.as_str()) {
-                Some(&d) if !own.contains(&d) => own.push(d),
-                Some(_) => {}
-                None => errors.push(Diagnostic::new(format!(
-                    "job `{id}` in workflow `{name}` requires `{req}`, which is not a job of the workflow"
-                ))),
-            }
-        }
-        deps.push(own);
-    }
+    let (deps, wanted) = dependencies(name, wf, &ids, &index, errors);
 
     let mut planned = 0;
     let expansions: Vec<Vec<PlannedJob>> = wf
@@ -730,6 +803,7 @@ fn compile_workflow(
         let requires_bytes: usize = deps[i]
             .iter()
             .flat_map(|&d| expanded_ids[d].iter().map(|id| id.len() + ENTRY_OVERHEAD))
+            .chain(deps[i].iter().map(|&d| ids[d].len() + ENTRY_OVERHEAD))
             .sum();
         // One list, then a clone of it per planned job.
         if !budget.charge_bytes(
@@ -743,8 +817,14 @@ fn compile_workflow(
             .iter()
             .flat_map(|&d| expanded_ids[d].iter().cloned())
             .collect();
+        let statuses: BTreeMap<String, Statuses> = deps[i]
+            .iter()
+            .zip(&wanted[i])
+            .map(|(&d, &s)| (ids[d].clone(), s))
+            .collect();
         for mut job in std::mem::take(&mut expansions[i]) {
             job.requires.clone_from(&requires);
+            job.statuses.clone_from(&statuses);
             jobs.push(job);
         }
     }
@@ -752,6 +832,42 @@ fn compile_workflow(
         workflow: name.to_owned(),
         jobs,
     })
+}
+
+/// The entries each entry requires, as indexes into `ids`, once each,
+/// and the statuses each must reach. An entry required twice must meet
+/// both lists. Reports a requires that names no entry.
+fn dependencies(
+    name: &str,
+    wf: &Workflow,
+    ids: &[String],
+    index: &BTreeMap<&str, usize>,
+    errors: &mut Vec<Diagnostic>,
+) -> (Vec<Vec<usize>>, Vec<Vec<Statuses>>) {
+    let mut deps = Vec::with_capacity(ids.len());
+    let mut wanted = Vec::with_capacity(ids.len());
+    for (entry, id) in wf.jobs.iter().zip(ids) {
+        let mut own: Vec<usize> = Vec::new();
+        let mut own_wanted: Vec<Statuses> = Vec::new();
+        for req in &entry.requires {
+            let Some(&d) = index.get(req.job.as_str()) else {
+                errors.push(Diagnostic::new(format!(
+                    "job `{id}` in workflow `{name}` requires `{}`, which is not a job of the workflow",
+                    req.job
+                )));
+                continue;
+            };
+            if let Some(at) = own.iter().position(|&o| o == d) {
+                own_wanted[at] = own_wanted[at].intersection(req.statuses);
+            } else {
+                own.push(d);
+                own_wanted.push(req.statuses);
+            }
+        }
+        deps.push(own);
+        wanted.push(own_wanted);
+    }
+    (deps, wanted)
 }
 
 /// The ids of each entry's planned jobs, charged before they are copied.
@@ -1245,6 +1361,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         id: id.to_owned(),
         name: id.to_owned(),
         requires: Vec::new(),
+        statuses: BTreeMap::new(),
         kind: JobKind::Approval,
         matrix: BTreeMap::new(),
         node: None,
@@ -1332,6 +1449,7 @@ fn expand_job(
         id: String::new(),
         name: String::new(),
         requires: Vec::new(),
+        statuses: BTreeMap::new(),
         kind: JobKind::Approval,
         matrix: BTreeMap::new(),
         node: None,

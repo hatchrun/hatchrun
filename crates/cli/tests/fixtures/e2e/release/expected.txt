@@ -36,10 +36,11 @@ event push-tag (compile refs/tags/v1.4.0)
       step Create the release if needs.version.outputs.prerelease != 'true': ok=run/skip
       step Create a prerelease if needs.version.outputs.prerelease == 'true': ok=skip/skip
     job announce on ubuntu-latest after version + publish: ok=run fail=skip
-      if success() && inputs.channel != 'beta'
+      if inputs.channel != 'beta'
       step run: ./scripts/announce.sh "${{ needs.version.outputs.version }}"
     job notify-failure on ubuntu-latest after build (x86_64-unknown-linux-gnu) + build (aarch64-unknown-linux-gnu) + publish: ok=skip fail=run
-      if failure()
+      requires build: terminal
+      requires publish: failed
       step run: ./scripts/notify.sh "release ${{ github.ref_name }} failed"
 event pull_request-opened (compile refs/heads/main)
   release: not triggered
@@ -69,8 +70,9 @@ event workflow_dispatch (compile refs/heads/main)
       step Create the release if needs.version.outputs.prerelease != 'true': ok=skip/skip
       step Create a prerelease if needs.version.outputs.prerelease == 'true': ok=run/skip
     job announce on ubuntu-latest after version + publish: ok=skip fail=skip
-      if success() && inputs.channel != 'beta'
+      if inputs.channel != 'beta'
       step run: ./scripts/announce.sh "${{ needs.version.outputs.version }}"
     job notify-failure on ubuntu-latest after build (x86_64-unknown-linux-gnu) + build (aarch64-unknown-linux-gnu) + publish: ok=skip fail=run
-      if failure()
+      requires build: terminal
+      requires publish: failed
       step run: ./scripts/notify.sh "release ${{ github.ref_name }} failed"

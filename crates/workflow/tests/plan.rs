@@ -4,8 +4,11 @@
 
 //! Compiling a workflow into a job plan.
 
+use std::collections::BTreeMap;
+
 use hatchrun_workflow::{
-    Diagnostic, JobKind, Plan, PlannedJob, PlannedStep, compile, parse, template, validate,
+    Diagnostic, JobKind, Outcome, Plan, PlannedJob, PlannedStep, Ready, Statuses, compile, parse,
+    ready, template, validate,
 };
 
 const CYCLE: &str = "
@@ -1118,4 +1121,167 @@ fn filters_are_capped() {
     // Plain text, `text**` and `**text` match as text and do not count.
     let plain = many_patterns(20, 250, |i| format!("'docs/{i}/**'"));
     assert_eq!(errors(&plain), Vec::new());
+}
+
+/// A, B after A, C after B, with C's statuses on B as given.
+fn chain(statuses: &str) -> Plan {
+    plan(&format!(
+        "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs:
+      - t: {{ name: a }}
+      - t: {{ name: b, requires: [a] }}
+      - t: {{ name: c, requires: [{{ b: {statuses} }}] }}
+"
+    ))
+}
+
+/// What `ready` says for the plan's last job, given how A and B ended.
+fn decide(plan: &Plan, a: Option<Outcome>, b: Option<Outcome>) -> Ready {
+    let ended: BTreeMap<&str, Outcome> = [("a", a), ("b", b)]
+        .into_iter()
+        .filter_map(|(id, o)| Some((id, o?)))
+        .collect();
+    ready(plan, plan.jobs.last().unwrap(), |id| ended.get(id).copied())
+}
+
+#[test]
+fn compile_carries_requires_statuses() {
+    let plan = chain("[failed, not_run]");
+    assert_eq!(
+        plan.jobs[2].statuses,
+        BTreeMap::from([("b".to_owned(), Statuses::FAILED.union(Statuses::NOT_RUN))])
+    );
+    assert_eq!(
+        plan.jobs[1].statuses,
+        BTreeMap::from([("a".to_owned(), Statuses::SUCCESS)])
+    );
+}
+
+#[test]
+fn ready_checks_statuses_over_every_ancestor() {
+    use Outcome::{Canceled, Failed, NotRun, Success};
+    // (statuses of C on B, how A ended, how B ended, what C does)
+    let table = [
+        ("success", Success, Success, Ready::Start),
+        ("success", Success, Failed, Ready::NotRun),
+        ("success", Failed, NotRun, Ready::NotRun),
+        // A failed and B did not run: B's ancestry failed.
+        ("failed", Failed, NotRun, Ready::Start),
+        ("failed", Success, Failed, Ready::Start),
+        ("failed", Success, Success, Ready::NotRun),
+        ("failed", Success, NotRun, Ready::NotRun),
+        ("failed", Canceled, NotRun, Ready::NotRun),
+        ("not_run", Success, NotRun, Ready::Start),
+        ("not_run", Failed, NotRun, Ready::NotRun),
+        ("canceled", Canceled, NotRun, Ready::Start),
+        ("canceled", Failed, Canceled, Ready::Start),
+        ("[success, failed, not_run]", Failed, NotRun, Ready::Start),
+        ("[success, failed, not_run]", Success, Success, Ready::Start),
+        (
+            "[success, failed, not_run]",
+            Success,
+            Canceled,
+            Ready::NotRun,
+        ),
+        (
+            "[success, failed, not_run]",
+            Canceled,
+            NotRun,
+            Ready::NotRun,
+        ),
+        ("terminal", Canceled, NotRun, Ready::Start),
+        ("terminal", Success, Failed, Ready::Start),
+    ];
+    for (statuses, a, b, want) in table {
+        let plan = chain(statuses);
+        assert_eq!(
+            decide(&plan, Some(a), Some(b)),
+            want,
+            "{statuses} after a={a:?} b={b:?}"
+        );
+    }
+}
+
+#[test]
+fn ready_waits_for_every_ancestor() {
+    let plan = chain("terminal");
+    assert_eq!(decide(&plan, None, None), Ready::Wait);
+    assert_eq!(decide(&plan, Some(Outcome::Success), None), Ready::Wait);
+    // B cannot end before A; if it did, C would still wait for A.
+    assert_eq!(decide(&plan, None, Some(Outcome::Failed)), Ready::Wait);
+    // A job that requires nothing starts at once.
+    assert_eq!(ready(&plan, &plan.jobs[0], |_| None), Ready::Start);
+}
+
+#[test]
+fn ready_reads_every_matrix_leg_and_each_entry_on_its_own() {
+    use Outcome::{Failed, Success};
+
+    let plan = plan(
+        "
+jobs: { t: { runs-on: ubuntu-latest, parameters: { v: { type: integer } }, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { name: m, matrix: { v: [1, 2] } }
+      - t: { name: other, v: 0 }
+      - t: { name: last, v: 0, requires: [{ m: failed }, other] }
+",
+    );
+    let last = plan.jobs.last().unwrap();
+    assert_eq!(last.requires, ["m (1)", "m (2)", "other"]);
+    let check = |legs: [Outcome; 3]| {
+        let ended: BTreeMap<&str, Outcome> =
+            ["m (1)", "m (2)", "other"].into_iter().zip(legs).collect();
+        ready(&plan, last, |id| ended.get(id).copied())
+    };
+    // One failed leg makes the entry failed.
+    assert_eq!(check([Success, Failed, Success]), Ready::Start);
+    assert_eq!(check([Success, Success, Success]), Ready::NotRun);
+    // `other` asks for success on its own.
+    assert_eq!(check([Failed, Failed, Failed]), Ready::NotRun);
+}
+
+#[test]
+fn an_entry_required_twice_meets_both_lists() {
+    let plan = plan(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { name: a }
+      - t: { name: b, requires: [{ a: [failed, success] }, { a: [failed, canceled] }] }
+",
+    );
+    assert_eq!(plan.jobs[1].requires, ["a"]);
+    assert_eq!(plan.jobs[1].statuses["a"], Statuses::FAILED);
+}
+
+#[test]
+fn a_job_if_cannot_call_status_functions() {
+    for cond in [
+        "failure()",
+        "always() && github.ref == 'x'",
+        "${{ !cancelled() }}",
+    ] {
+        assert_error(
+            &format!("jobs: {{ t: {{ runs-on: ubuntu-latest, if: \"{cond}\", steps: [] }} }}"),
+            &["job `t` `if` calls a status function", "requires"],
+        );
+    }
+    // Step conditions keep them, and a string that spells one is not a
+    // call.
+    assert_eq!(
+        errors(
+            "jobs: { t: { runs-on: ubuntu-latest, if: \"github.ref != 'failure()'\", steps: [{ run: x, if: failure() }] } }"
+        ),
+        []
+    );
 }

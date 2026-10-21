@@ -7,7 +7,8 @@
 use std::fmt::Write as _;
 
 use hatchrun_workflow::{
-    Conversion, Diagnostic, Filter, ParameterKind, Step, convert, parse, to_yaml, validate,
+    Conversion, Diagnostic, Filter, ParameterKind, Require, Statuses, Step, convert, parse,
+    to_yaml, validate,
 };
 use serde_json::{Value, json};
 
@@ -49,7 +50,7 @@ fn converts_a_typical_ci_workflow() {
             .find(|j| j.job == "ci-lint")
             .unwrap()
             .requires,
-        Vec::<String>::new()
+        Vec::<Require>::new()
     );
     assert!(out.warnings.iter().any(|w| w.message.contains("services")));
     // round trip: the YAML we write parses and validates clean
@@ -70,7 +71,7 @@ fn the_ci_fixture_maps_every_part() {
     assert!(wf.on.push.is_some());
     assert!(wf.on.pull_request.is_some());
     let test = wf.jobs.iter().find(|j| j.job == "ci-test").unwrap();
-    assert_eq!(test.requires, ["lint"]);
+    assert_eq!(test.requires, [Require::new("lint")]);
     assert_eq!(test.name.as_deref(), Some("test"));
     assert_eq!(test.matrix["toolchain"], [json!("stable"), json!("beta")]);
     assert!(test.with.is_empty());
@@ -634,7 +635,10 @@ fn needs_must_name_a_job_and_repeats_collapse() {
     let out = ok(
         "on: push\njobs:\n  a: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n  b: { needs: [a, a], runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
     );
-    assert_eq!(out.config.workflows["ci"].jobs[1].requires, ["a"]);
+    assert_eq!(
+        out.config.workflows["ci"].jobs[1].requires,
+        [Require::new("a")]
+    );
 }
 
 #[test]
@@ -1169,4 +1173,170 @@ fn a_workflow_whose_events_all_fail_is_dropped() {
     )
     .unwrap_err();
     assert!(has(&out, &["ci.yml", "on.push"]), "{out:?}");
+}
+
+/// The `requires` statuses and kept `if:` of job `id` in workflow `ci`.
+fn split(out: &Conversion, id: &str) -> (Vec<(String, Statuses)>, Option<String>) {
+    let entry = out.config.workflows["ci"]
+        .jobs
+        .iter()
+        .find(|e| e.name.as_deref() == Some(id))
+        .unwrap();
+    let requires = entry
+        .requires
+        .iter()
+        .map(|r| (r.job.clone(), r.statuses))
+        .collect();
+    (requires, out.config.jobs[&entry.job].if_.clone())
+}
+
+/// A workflow of a job `a` and a job `b` that needs it, with `b`'s `if:`.
+fn after_a(cond: &str) -> String {
+    format!(
+        "on: push\njobs:\n  a: {{ runs-on: ubuntu-latest, steps: [{{ run: x }}] }}\n  b:\n    needs: a\n    if: \"{cond}\"\n    runs-on: ubuntu-latest\n    steps: [{{ run: x }}]\n  c: {{ needs: b, runs-on: ubuntu-latest, steps: [{{ run: x }}] }}\n"
+    )
+}
+
+/// The ids of the jobs workflow `ci` kept.
+fn kept(out: &Conversion) -> Vec<&str> {
+    out.config.workflows["ci"]
+        .jobs
+        .iter()
+        .filter_map(|e| e.name.as_deref())
+        .collect()
+}
+
+#[test]
+fn job_status_calls_become_requires_statuses() {
+    let not_cancelled = Statuses::SUCCESS
+        .union(Statuses::NOT_RUN)
+        .union(Statuses::FAILED);
+    for (cond, statuses, rest) in [
+        (
+            "success() && github.ref == 'x'",
+            Statuses::SUCCESS,
+            Some("github.ref == 'x'"),
+        ),
+        (
+            "always() && github.ref == 'x'",
+            Statuses::TERMINAL,
+            Some("github.ref == 'x'"),
+        ),
+        ("!cancelled()", not_cancelled, None),
+        ("failure()", Statuses::FAILED, None),
+        ("cancelled()", Statuses::CANCELED, None),
+        (
+            "${{ (!cancelled()) && needs.a.result != 'skipped' }}",
+            not_cancelled,
+            Some("needs.a.result != 'skipped'"),
+        ),
+        // They are ANDed, so the stricter meaning wins.
+        ("!cancelled() && always()", not_cancelled, None),
+        ("always() && failure()", Statuses::FAILED, None),
+        // No status call: GitHub's implicit `success()`, `if:` as written.
+        (
+            "${{ github.ref == 'x' }}",
+            Statuses::SUCCESS,
+            Some("${{ github.ref == 'x' }}"),
+        ),
+    ] {
+        let out = ok(&after_a(cond));
+        round_trips(&out);
+        assert_eq!(
+            split(&out, "b"),
+            (vec![("a".to_owned(), statuses)], rest.map(str::to_owned)),
+            "{cond}"
+        );
+    }
+}
+
+#[test]
+fn a_job_whose_status_calls_never_meet_is_dropped() {
+    let out = ok(&after_a("success() && failure()"));
+    assert!(
+        has(&out.warnings, &["`b`", "never true", "dropped"]),
+        "{:?}",
+        out.warnings
+    );
+    // What needs it goes too.
+    assert!(has(&out.warnings, &["`c`", "could never run"]));
+    assert_eq!(kept(&out), ["a"]);
+    assert_eq!(out.errors, Vec::new());
+}
+
+#[test]
+fn status_calls_without_needs() {
+    // `always()` and `!cancelled()` just go.
+    for (cond, rest) in [
+        ("always()", None),
+        (
+            "!cancelled() && github.ref == 'x'",
+            Some("github.ref == 'x'"),
+        ),
+    ] {
+        let out = ok(&format!(
+            "on: push\njobs:\n  a: {{ if: \"{cond}\", runs-on: ubuntu-latest, steps: [{{ run: x }}] }}\n"
+        ));
+        round_trips(&out);
+        assert_eq!(split(&out, "a"), (vec![], rest.map(str::to_owned)));
+    }
+    // `failure()` with nothing before it never runs.
+    let out = ok(
+        "on: push\njobs:\n  a: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n  b: { if: failure(), runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+    );
+    assert!(
+        has(&out.warnings, &["`b`", "no needs", "dropped"]),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(kept(&out), ["a"]);
+}
+
+#[test]
+fn an_unsplittable_status_condition_drops_the_job() {
+    for cond in ["failure() || github.ref == 'x'", "!success()"] {
+        let out = ok(&after_a(cond));
+        assert!(
+            has(&out.errors, &["`b`", cond, "cannot be split"]),
+            "{:?}",
+            out.errors
+        );
+        assert_eq!(kept(&out), ["a"], "{cond}");
+    }
+}
+
+#[test]
+fn failure_after_a_chain_reads_the_last_need() {
+    let out = ok("
+on: push
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+  test: { needs: build, runs-on: ubuntu-latest, steps: [{ run: x }] }
+  lint: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+  chain: { needs: [build, test], if: failure(), runs-on: ubuntu-latest, steps: [{ run: x }] }
+  apart: { needs: [test, lint], if: failure(), runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    round_trips(&out);
+    // `build` is behind `test`, whose ancestry covers it.
+    assert_eq!(
+        split(&out, "chain").0,
+        [
+            ("build".to_owned(), Statuses::TERMINAL),
+            ("test".to_owned(), Statuses::FAILED)
+        ]
+    );
+    assert!(!has(&out.warnings, &["`chain`"]));
+    // Needs apart from each other each have to fail; GitHub asks one.
+    assert_eq!(
+        split(&out, "apart").0,
+        [
+            ("test".to_owned(), Statuses::FAILED),
+            ("lint".to_owned(), Statuses::FAILED)
+        ]
+    );
+    assert!(
+        has(&out.warnings, &["`apart`", "`test`, `lint`", "any one"]),
+        "{:?}",
+        out.warnings
+    );
 }

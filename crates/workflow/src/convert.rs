@@ -19,11 +19,11 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::config::{
-    Config, Job, MAX_SOURCE, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow,
-    WorkflowJob, too_big, yaml_options,
+    Config, Job, MAX_SOURCE, Outcome, Parameter, ParameterKind, Require, RunStep, Statuses, Step,
+    UsesStep, Workflow, WorkflowJob, too_big, yaml_options,
 };
 use crate::diagnostic::Diagnostic;
-use crate::expr::{self, ExprError};
+use crate::expr::{self, ExprError, StatusCall};
 use crate::plan;
 use crate::templates::{template, template_labels};
 use crate::trigger::{Dispatch, PullRequestTrigger, PushTrigger, Schedule, Triggers};
@@ -53,7 +53,11 @@ pub struct Conversion {
 /// chain of jobs it needed. A file over [`MAX_SOURCE`](crate::MAX_SOURCE)
 /// bytes, one that does not parse, has no name before its extension or
 /// repeats another file's name is skipped. Each problem is in
-/// [`Conversion::errors`]. A workflow left with no event hatchrun runs
+/// [`Conversion::errors`]. The status functions of a job's `if:`
+/// (`success()`, `always()`, `failure()`, `cancelled()`, `!cancelled()`)
+/// become statuses on its `requires` when they are operands of the
+/// top-level `&&`; called anywhere else, they drop the job with an
+/// error. A workflow left with no event hatchrun runs
 /// on, such as one that runs only on `issues`, is dropped with its jobs
 /// and a warning.
 ///
@@ -400,7 +404,16 @@ impl Cx {
                 failed = true;
                 continue;
             }
-            let Some((mut converted, entry)) = self.job(&at, &id, &key, &ids, job) else {
+            let condition = match self.job_condition(&at, &job) {
+                Ok(condition) => condition,
+                Err(why) => {
+                    failed |= why == FAILED;
+                    dropped.insert(id, why.to_owned());
+                    continue;
+                }
+            };
+            let Some((mut converted, entry)) = self.job(&at, &id, &key, &ids, job, condition)
+            else {
                 dropped.insert(id, FAILED.to_owned());
                 failed = true;
                 continue;
@@ -430,11 +443,29 @@ impl Cx {
             self.config.jobs.insert(key, converted);
             entries.push(entry);
         }
-        // A job that needs a dropped job would run without it, so it is
-        // dropped too, and so on down the chain.
+        self.drop_dependents(file, &mut entries, dropped);
+        // A file whose every job failed converts to nothing.
+        if entries.is_empty() && failed {
+            return;
+        }
+        self.narrow_statuses(file, &mut entries);
+        self.config
+            .workflows
+            .insert(stem.to_owned(), Workflow { on, jobs: entries });
+    }
+
+    /// Drops each entry that needs a dropped job, as it would run
+    /// without it, and so on down the chain. `dropped` maps each dropped
+    /// job to what happened to it, worded to follow "which".
+    fn drop_dependents(
+        &mut self,
+        file: &str,
+        entries: &mut Vec<WorkflowJob>,
+        mut dropped: BTreeMap<String, String>,
+    ) {
         while let Some((i, need)) = entries.iter().enumerate().find_map(|(i, e)| {
-            let need = e.requires.iter().find(|r| dropped.contains_key(*r))?;
-            Some((i, need.clone()))
+            let need = e.requires.iter().find(|r| dropped.contains_key(&r.job))?;
+            Some((i, need.job.clone()))
         }) {
             let entry = entries.remove(i);
             self.config.jobs.remove(&entry.job);
@@ -443,13 +474,6 @@ impl Cx {
             self.warn(format!("`{file}` job `{id}` was dropped: it {why}"));
             dropped.insert(id, why);
         }
-        // A file whose every job failed converts to nothing.
-        if entries.is_empty() && failed {
-            return;
-        }
-        self.config
-            .workflows
-            .insert(stem.to_owned(), Workflow { on, jobs: entries });
     }
 
     /// Converts `on:`, which GitHub accepts as an event name, a list of
@@ -629,6 +653,120 @@ impl Cx {
         }
     }
 
+    /// Splits a job's `if:` into the statuses its needs must reach and
+    /// the `if:` kept, as [`JobCondition`] describes. A job that could
+    /// never run is dropped with a warning, `Err(NEVER)`, and one whose
+    /// condition cannot be split with an error, `Err(FAILED)`: its
+    /// status functions are called under `||` or `!`, or as a value.
+    fn job_condition(&mut self, at: &str, gh: &GhJob) -> Result<JobCondition, &'static str> {
+        let Some(cond) = gh.if_.as_ref().and_then(scalar) else {
+            return Ok(JobCondition::default());
+        };
+        let split = match expr::split_status(&cond) {
+            // `validate` reports the expression; see `expression_problems`.
+            Err(_) => None,
+            Ok(Some(split)) if split.calls.is_empty() => None,
+            Ok(Some(split)) => Some(split),
+            Ok(None) => {
+                self.error(format!(
+                    "{at} has `if: {cond}`, which calls a status function where it cannot be split out; hatchrun checks job status in `requires`, so only `success()`, `always()`, `failure()`, `cancelled()` and `!cancelled()` joined to the rest by a top-level `&&` convert. The job was dropped"
+                ));
+                return Err(FAILED);
+            }
+        };
+        let Some(split) = split else {
+            return Ok(JobCondition {
+                if_: Some(cond),
+                statuses: Statuses::SUCCESS,
+            });
+        };
+        let statuses = split.calls.iter().fold(Statuses::TERMINAL, |all, call| {
+            all.intersection(statuses_of(*call))
+        });
+        let has_needs = match &gh.needs {
+            None => false,
+            Some(Value::Array(needs)) => !needs.is_empty(),
+            Some(_) => true,
+        };
+        if statuses.is_empty() || (!has_needs && !statuses.contains(Outcome::Success)) {
+            self.warn(format!(
+                "{at} has `if: {cond}`, which is never true for a job {}; the job was dropped",
+                if has_needs {
+                    "whatever its needs did"
+                } else {
+                    "with no needs"
+                }
+            ));
+            return Err(NEVER);
+        }
+        let if_ = (!split.rest.is_empty()).then(|| split.rest.join(" && "));
+        Ok(JobCondition {
+            if_,
+            statuses: if has_needs {
+                statuses
+            } else {
+                Statuses::SUCCESS
+            },
+        })
+    }
+
+    /// Brings `failure()` and `cancelled()` jobs closer to GitHub, which
+    /// checks all the jobs before a job together, where `requires`
+    /// checks each required entry's ancestry on its own. A need that
+    /// another need comes after is covered by that need's ancestry, so
+    /// it gets `terminal`. When two or more needs are left, the job runs
+    /// only when each of them failed (or was cancelled), not any one, and
+    /// a warning says so.
+    fn narrow_statuses(&mut self, file: &str, entries: &mut [WorkflowJob]) {
+        let graph: BTreeMap<String, Vec<String>> = entries
+            .iter()
+            .map(|e| {
+                let id = e.name.clone().unwrap_or_default();
+                (id, e.requires.iter().map(|r| r.job.clone()).collect())
+            })
+            .collect();
+        for entry in entries {
+            let needs: Vec<String> = entry
+                .requires
+                .iter()
+                .filter(|r| !r.statuses.contains(Outcome::Success))
+                .map(|r| r.job.clone())
+                .collect();
+            let Some(status) = entry
+                .requires
+                .iter()
+                .find(|r| !r.statuses.contains(Outcome::Success))
+                .map(|r| r.statuses)
+            else {
+                continue;
+            };
+            if needs.len() < 2 {
+                continue;
+            }
+            let covered: Vec<&String> = needs
+                .iter()
+                .filter(|n| needs.iter().any(|other| comes_before(&graph, n, other)))
+                .collect();
+            for r in &mut entry.requires {
+                if covered.contains(&&r.job) {
+                    r.statuses = Statuses::TERMINAL;
+                }
+            }
+            let left: Vec<String> = needs
+                .iter()
+                .filter(|n| !covered.contains(n))
+                .map(|n| format!("`{n}`"))
+                .collect();
+            if left.len() > 1 {
+                let id = entry.name.as_deref().unwrap_or_default();
+                self.warn(format!(
+                    "`{file}` job `{id}` now runs when each of {} ends `{status}`, counting the jobs before it; GitHub runs it when any one does",
+                    left.join(", ")
+                ));
+            }
+        }
+    }
+
     /// Converts one job into the job and its workflow entry. `None` when
     /// the job has errors, which are recorded.
     fn job(
@@ -638,6 +776,7 @@ impl Cx {
         key: &str,
         ids: &BTreeSet<String>,
         gh: GhJob,
+        condition: JobCondition,
     ) -> Option<(Job, WorkflowJob)> {
         let before = self.errors.len();
         for (name, set, why) in [
@@ -677,7 +816,13 @@ impl Cx {
                 requires_unique.push(need);
             }
         }
-        let requires = requires_unique;
+        let requires: Vec<Require> = requires_unique
+            .into_iter()
+            .map(|job| Require {
+                job,
+                statuses: condition.statuses,
+            })
+            .collect();
         let timeout_minutes = self.minutes(at, "timeout-minutes", gh.timeout_minutes.as_ref());
         let outputs = self.env(at, "outputs", gh.outputs.as_ref());
         let env = self.env(at, "env", gh.env.as_ref());
@@ -696,7 +841,7 @@ impl Cx {
         let job = Job {
             runs_on,
             env,
-            if_: gh.if_.as_ref().and_then(scalar),
+            if_: condition.if_,
             timeout_minutes,
             outputs,
             steps,
@@ -1112,6 +1257,71 @@ const FAILED: &str = "did not convert";
 
 /// What happened to a reusable workflow call, after "which".
 const REUSABLE: &str = "calls a reusable workflow";
+
+/// What happened to a job whose `if:` is never true, after "which".
+const NEVER: &str = "could never run";
+
+/// A GitHub job `if:` split for hatchrun: GitHub reads the status of the
+/// jobs before a job with status functions in the job's `if:`; hatchrun
+/// reads it from the statuses of the entry's `requires`.
+///
+/// The `if:` is split on its top-level `&&`. Each status call among the
+/// operands maps to statuses:
+///
+/// | GitHub | `requires` statuses |
+/// | --- | --- |
+/// | `success()` | `success` (the default) |
+/// | `always()` | `terminal` |
+/// | `!cancelled()` | `[success, not_run, failed]` |
+/// | `failure()` | `failed` |
+/// | `cancelled()` | `canceled` |
+///
+/// Several calls are joined by `&&`, so their statuses intersect:
+/// `!cancelled() && always()` is `!cancelled()`, and
+/// `success() && failure()` is never true. A condition with no status
+/// call keeps GitHub's implicit `success()`. The statuses go on every
+/// need; the other operands stay as the `if:`.
+#[derive(Debug, Default)]
+struct JobCondition {
+    /// The `if:` left once the status calls are taken out.
+    if_: Option<String>,
+    /// The statuses for each of the job's needs.
+    statuses: Statuses,
+}
+
+/// The statuses one status call stands for, as [`JobCondition`] lists.
+fn statuses_of(call: StatusCall) -> Statuses {
+    match call {
+        StatusCall::Success => Statuses::SUCCESS,
+        StatusCall::Always => Statuses::TERMINAL,
+        StatusCall::NotCancelled => Statuses::SUCCESS
+            .union(Statuses::NOT_RUN)
+            .union(Statuses::FAILED),
+        StatusCall::Failure => Statuses::FAILED,
+        StatusCall::Cancelled => Statuses::CANCELED,
+    }
+}
+
+/// Whether `before` comes before `job` in `graph`, a map of
+/// each entry id to the ids it requires.
+fn comes_before(graph: &BTreeMap<String, Vec<String>>, before: &str, job: &str) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut todo: Vec<&str> = graph
+        .get(job)
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    while let Some(id) = todo.pop() {
+        if id == before {
+            return true;
+        }
+        if seen.insert(id) {
+            todo.extend(graph.get(id).into_iter().flatten().map(String::as_str));
+        }
+    }
+    false
+}
 
 /// What in a converted job's expressions `validate` would reject: the
 /// GitHub contexts it reads that hatchrun does not provide, in
