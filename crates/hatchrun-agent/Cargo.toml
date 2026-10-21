@@ -23,6 +23,7 @@ getrandom = "0.4.3"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
 humantime = "2.4.0"
+hatchrun-workflow = { path = "../workflow" }
 hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 nix = { version = "0.31.3", features = ["fs", "user", "process", "signal"] }

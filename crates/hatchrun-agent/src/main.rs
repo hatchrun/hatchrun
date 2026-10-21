@@ -13,6 +13,7 @@
 mod broker;
 mod cache;
 mod envfile;
+mod exec;
 mod imds;
 mod metrics;
 mod runner;
@@ -83,6 +84,32 @@ enum Command {
         #[arg(long, default_value = "/run/hatchrun/launch")]
         mark: PathBuf,
     },
+    /// Run one job from a job document, without GitHub's runner.
+    ///
+    /// Exits 0 when the job succeeds, 1 when it does not, and 2 when the
+    /// document cannot be read or describes an approval job.
+    Exec {
+        /// The job document, as JSON.
+        job_file: PathBuf,
+        /// Work directory, laid out like GitHub's hosted runners.
+        #[arg(long, default_value = "/home/runner/work")]
+        work_dir: PathBuf,
+        /// User steps run as. Pass an empty value to keep the agent's user.
+        #[arg(long, default_value = "runner")]
+        runner_user: String,
+        /// KEY=VALUE file that becomes the steps' environment.
+        #[arg(long, default_value = "/etc/environment")]
+        env_file: PathBuf,
+        /// Node binary that runs JavaScript actions.
+        #[arg(long)]
+        node: Option<PathBuf>,
+        /// Directory of prefetched actions.
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Where to write the job result, as JSON.
+        #[arg(long)]
+        result: Option<PathBuf>,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -95,8 +122,29 @@ async fn main() -> ExitCode {
         .init();
 
     let args = Args::parse();
+    if let Some(Command::Exec {
+        job_file,
+        work_dir,
+        runner_user,
+        env_file,
+        node,
+        store,
+        result,
+    }) = &args.command
+    {
+        let opts = exec::Options {
+            work_dir: work_dir.clone(),
+            runner_user: Some(runner_user.clone()).filter(|user| !user.is_empty()),
+            env_file: env_file.clone(),
+            node: node.clone(),
+            store: store.clone(),
+            tool_cache: PathBuf::from("/opt/hostedtoolcache"),
+        };
+        return exec_command(job_file, &opts, result.as_deref()).await;
+    }
     let result = match &args.command {
         Some(Command::Detect { mark }) => detect(&args.imds_endpoint, mark).await,
+        Some(Command::Exec { .. }) => unreachable!("handled above"),
         None => run(args).await,
     };
     match result {
@@ -105,6 +153,62 @@ async fn main() -> ExitCode {
             error!("{err:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Runs the job file. Exit codes: 0 success, 1 the job did not succeed
+/// or the run failed, 2 the document cannot be used.
+async fn exec_command(job_file: &Path, opts: &exec::Options, result: Option<&Path>) -> ExitCode {
+    let doc = match std::fs::read(job_file)
+        .with_context(|| format!("read {}", job_file.display()))
+        .and_then(|bytes| {
+            serde_json::from_slice::<hatchrun_workflow::JobDocument>(&bytes)
+                .with_context(|| format!("parse {}", job_file.display()))
+        }) {
+        Ok(doc) => doc,
+        Err(err) => {
+            error!("{err:#}");
+            return ExitCode::from(2);
+        }
+    };
+    if matches!(doc.job.kind, hatchrun_workflow::JobKind::Approval) {
+        error!("approval jobs do not run on a runner");
+        return ExitCode::from(2);
+    }
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(err) => {
+            error!("listen for SIGTERM: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cancel = async move {
+        terminate.recv().await;
+    };
+    let mut sink = exec::sink::TextSink::new(std::io::stdout());
+    let outcome = exec::run_job(doc, opts, &mut sink, cancel).await;
+    let job = match outcome {
+        Ok(job) => job,
+        Err(err) => {
+            error!("{err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(path) = result {
+        let written = serde_json::to_vec(&job)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
+            });
+        if let Err(err) = written {
+            error!("{err:#}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if job.conclusion == hatchrun_workflow::Conclusion::Success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
