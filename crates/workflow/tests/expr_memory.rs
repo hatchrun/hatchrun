@@ -97,4 +97,87 @@ fn reads_walk_the_context_by_reference() {
     assert!(bytes < 2 * MIB, "{bytes}");
     let err = evaluate("github.event", &context(9 * MIB), &Funcs).unwrap_err();
     assert!(err.message.contains("memory limit"), "{}", err.message);
+
+    filtered_lists_are_charged();
+    long_needles_are_charged();
+    and_or_keep_a_filtered_list_borrowed();
+}
+
+/// A `*` filter makes a list of references, one per item. Each list is
+/// charged, so a wide array read many times hits the budget instead of
+/// taking hundreds of megabytes.
+fn filtered_lists_are_charged() {
+    let labels: Vec<Value> = (0..100_000)
+        .map(|i| json!({"name": format!("l{i}")}))
+        .collect();
+    let ctx = json!({"github": {"event": {"labels": labels}}});
+    let one = "contains(github.event.labels.*.name, 'l99999')";
+    let (v, bytes) = allocated(|| evaluate(one, &ctx, &Funcs).unwrap());
+    assert_eq!(v, json!(true));
+    assert!(bytes < 16 << 20, "{bytes}");
+    // 140 reads in 3933 bytes of expression.
+    let many = format!(
+        "format('{{0}}',{})",
+        vec!["github.event.labels.*.name"; 140].join(",")
+    );
+    let (r, bytes) = allocated(|| evaluate(&many, &ctx, &Funcs));
+    let err = r.unwrap_err();
+    assert!(err.message.contains("`*` filter"), "{}", err.message);
+    assert!(bytes < 24 << 20, "{bytes}");
+}
+
+/// `contains()` copies only its needle, and charges it first; a needle
+/// longer than the haystack is not copied at all.
+fn long_needles_are_charged() {
+    let big = format!("{}é", "a".repeat(25 << 20));
+    let ctx = json!({"github": {"event": {"big": big, "small": "é"}}});
+    let (v, bytes) = allocated(|| {
+        evaluate(
+            "contains(github.event.small, github.event.big)",
+            &ctx,
+            &Funcs,
+        )
+        .unwrap()
+    });
+    assert_eq!(v, json!(false));
+    assert!(bytes < 64 << 10, "{bytes}");
+    let (r, bytes) =
+        allocated(|| evaluate("contains(github.event.big, github.event.big)", &ctx, &Funcs));
+    let err = r.unwrap_err();
+    assert!(err.message.contains("contains()"), "{}", err.message);
+    assert!(bytes < 64 << 10, "{bytes}");
+}
+
+/// `x.* || y` hands on the filtered list without copying what it holds.
+fn and_or_keep_a_filtered_list_borrowed() {
+    let commits: Vec<Value> = (0..2000)
+        .map(|i| {
+            json!({
+                "message": "m".repeat(4096),
+                "added": (0..100).map(|f| format!("src/dir{i}/file{f}.rs")).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let ctx = json!({"github": {"event": {"commits": commits}}});
+    for e in [
+        "!(github.event.commits.*.added || '')",
+        "contains(github.event.commits.*.added || '', 'x')",
+        "(github.event.commits.*.added || '')[0][0] == 'src/dir0/file0.rs'",
+        "(github.event.commits.*.added || '').length == null",
+    ] {
+        let (r, bytes) = allocated(|| evaluate(e, &ctx, &Funcs));
+        r.unwrap_or_else(|err| panic!("{e}: {err}"));
+        assert!(bytes < 256 << 10, "{e}: {bytes}");
+    }
+    let (v, _) = allocated(|| {
+        evaluate(
+            "(github.event.commits.*.added || '')[0][0] == 'src/dir0/file0.rs'",
+            &ctx,
+            &Funcs,
+        )
+        .unwrap()
+    });
+    assert_eq!(v, json!(true));
+    let text = "${{ github.event.commits.*.added || '' }}";
+    assert_eq!(interpolate(text, &ctx, &Funcs).unwrap(), "Array");
 }

@@ -217,16 +217,35 @@ fn ends_folded(s: &str, suffix: &str) -> bool {
 
 /// Whether `needle` occurs in `hay`, ignoring case. Only the needle is
 /// copied; the haystack is read once, as Knuth-Morris-Pratt reads it.
-fn contains_folded(hay: &str, needle: &str) -> bool {
+/// The folded needle and its table are charged to `budget` before they
+/// are made, and a needle longer than the haystack is not copied at all.
+fn contains_folded(
+    hay: &str,
+    needle: &str,
+    budget: &Budget,
+    offset: usize,
+) -> Result<bool, ExprError> {
+    // Per needle character: the folded character and its KMP entry.
+    const TABLE: usize = std::mem::size_of::<u32>();
     if hay.is_ascii() && needle.is_ascii() {
         if needle.len() > hay.len() {
-            return false;
+            return Ok(false);
         }
+        budget.charge(needle.len().saturating_mul(1 + TABLE), "contains()", offset)?;
         let needle: Vec<u8> = needle.bytes().map(|b| b.to_ascii_uppercase()).collect();
-        return kmp(hay.bytes().map(|b| b.to_ascii_uppercase()), &needle);
+        return Ok(kmp(hay.bytes().map(|b| b.to_ascii_uppercase()), &needle));
     }
+    let len = upper(needle).count();
+    if len > upper(hay).count() {
+        return Ok(false);
+    }
+    budget.charge(
+        len.saturating_mul(std::mem::size_of::<char>() + TABLE),
+        "contains()",
+        offset,
+    )?;
     let needle: Vec<char> = upper(needle).collect();
-    kmp(upper(hay), &needle)
+    Ok(kmp(upper(hay), &needle))
 }
 
 /// Whether `needle` occurs in `hay`, in time linear in both.
@@ -307,45 +326,87 @@ static ARRAY: Value = Value::Array(Vec::new());
 /// value is copied only when it is returned, and the copy is charged.
 type Ref<'a> = Cow<'a, Value>;
 
-/// A value, or the array a `*` filter produced. Property access on a
-/// filtered array applies to each element and drops what is missing.
+/// A value; the array a `*` filter produced; or such an array passed on
+/// by `&&` or `||`, which is an ordinary array again. Property access on
+/// a filtered array applies to each element and drops what is missing.
+/// The lists hold references, so neither copies the context.
 enum Val<'a> {
     One(Ref<'a>),
     Many(Vec<Ref<'a>>),
+    List(Vec<Ref<'a>>),
+}
+
+/// The bytes a list of `n` references takes, as charged to the budget.
+fn list_bytes(n: usize) -> usize {
+    n.saturating_mul(std::mem::size_of::<Ref<'_>>())
 }
 
 impl<'a> Val<'a> {
-    /// The value, with a filtered array standing in as an empty array.
+    /// The value, with a list standing in as an empty array.
     fn scalar(&self) -> &Value {
         match self {
             Val::One(v) => v,
-            Val::Many(_) => &ARRAY,
+            Val::Many(_) | Val::List(_) => &ARRAY,
         }
     }
 
-    fn deref(self, key: Key<'_>) -> Val<'a> {
+    /// The items of a list, or `None` for one value.
+    fn items(&self) -> Option<&[Ref<'a>]> {
         match self {
+            Val::One(_) => None,
+            Val::Many(items) | Val::List(items) => Some(items),
+        }
+    }
+
+    fn deref(self, key: Key<'_>, budget: &Budget) -> Result<Val<'a>, ExprError> {
+        Ok(match self {
             Val::One(v) => Val::One(lookup(v, key)),
-            Val::Many(vs) => Val::Many(
-                vs.into_iter()
-                    .map(|v| lookup(v, key))
-                    .filter(|v| !v.is_null())
-                    .collect(),
-            ),
-        }
+            Val::Many(vs) => {
+                budget.charge(list_bytes(vs.len()), "a `*` filter", 0)?;
+                Val::Many(
+                    vs.into_iter()
+                        .map(|v| lookup(v, key))
+                        .filter(|v| !v.is_null())
+                        .collect(),
+                )
+            }
+            // An array: only a whole-number index finds an item.
+            Val::List(mut items) => Val::One(match key.index() {
+                Some(i) if i < items.len() => items.swap_remove(i),
+                _ => Cow::Borrowed(&NULL),
+            }),
+        })
     }
 
-    fn filter(self) -> Val<'a> {
-        let mut out = Vec::new();
-        match self {
-            Val::One(v) => children(v, &mut out),
+    fn filter(self, budget: &Budget) -> Result<Val<'a>, ExprError> {
+        Ok(match self {
+            Val::One(v) => {
+                budget.charge(list_bytes(child_count(&v)), "a `*` filter", 0)?;
+                let mut out = Vec::new();
+                children(v, &mut out);
+                Val::Many(out)
+            }
             Val::Many(vs) => {
+                let n = vs.iter().map(|v| child_count(v)).sum();
+                budget.charge(list_bytes(n), "a `*` filter", 0)?;
+                let mut out = Vec::with_capacity(n);
                 for v in vs {
                     children(v, &mut out);
                 }
+                Val::Many(out)
             }
-        }
-        Val::Many(out)
+            // The items of an array are already a list.
+            Val::List(items) => Val::Many(items),
+        })
+    }
+}
+
+/// How many items an array or values an object has; 0 for anything else.
+fn child_count(v: &Value) -> usize {
+    match v {
+        Value::Array(items) => items.len(),
+        Value::Object(map) => map.len(),
+        _ => 0,
     }
 }
 
@@ -510,7 +571,7 @@ impl<'a> Evaluator<'a> {
         self.check(expr)?;
         match self.walk(expr)? {
             Val::One(v) => self.own(v),
-            Val::Many(vs) => self.own_all(vs).map(Value::Array),
+            Val::Many(vs) | Val::List(vs) => self.own_all(vs).map(Value::Array),
         }
     }
 
@@ -545,14 +606,6 @@ impl<'a> Evaluator<'a> {
         vs.into_iter().map(|v| self.own(v)).collect()
     }
 
-    /// The value as one value: a filtered array becomes an array.
-    fn one(&self, v: Val<'a>) -> Result<Ref<'a>, ExprError> {
-        match v {
-            Val::One(v) => Ok(v),
-            Val::Many(vs) => Ok(Cow::Owned(Value::Array(self.own_all(vs)?))),
-        }
-    }
-
     fn context(&self, name: &str) -> Option<&'a Value> {
         let given = self.ctx.as_object().and_then(|m| {
             m.get(name).or_else(|| {
@@ -585,12 +638,12 @@ impl<'a> Evaluator<'a> {
                 let mut val = self.walk(base)?;
                 for step in path {
                     val = match step {
-                        Step::Property(name) => val.deref(Key::Name(name)),
+                        Step::Property(name) => val.deref(Key::Name(name), self.budget)?,
                         Step::Index(index) => {
                             let key = self.walk(index)?;
-                            val.deref(Key::Value(key.scalar()))
+                            val.deref(Key::Value(key.scalar()), self.budget)?
                         }
-                        Step::Filter => val.filter(),
+                        Step::Filter => val.filter(self.budget)?,
                     };
                 }
                 return Ok(val);
@@ -598,8 +651,8 @@ impl<'a> Evaluator<'a> {
             Expr::Not(inner) => Cow::Owned(Value::Bool(!truthy(self.walk(inner)?.scalar()))),
             // `&&` returns the first falsy operand, `||` the first truthy
             // one, and each returns its last operand when none qualifies.
-            Expr::And(operands) => self.first(operands, false)?,
-            Expr::Or(operands) => self.first(operands, true)?,
+            Expr::And(operands) => return self.first(operands, false),
+            Expr::Or(operands) => return self.first(operands, true),
             Expr::Compare { first, rest } => {
                 let mut acc = self.walk(first)?;
                 for (op, e) in rest {
@@ -610,7 +663,8 @@ impl<'a> Evaluator<'a> {
                         rhs.scalar(),
                     ))));
                 }
-                self.one(acc)?
+                // The parser gives a comparison at least one operator.
+                return Ok(acc);
             }
             Expr::Call { name, args, offset } => {
                 let args = args
@@ -625,7 +679,8 @@ impl<'a> Evaluator<'a> {
 
     /// Evaluates `operands` in order and returns the first whose
     /// truthiness is `stop_when`, or the last one.
-    fn first(&self, operands: &'a [Expr<'_>], stop_when: bool) -> Result<Ref<'a>, ExprError> {
+    /// A filtered array comes out as an ordinary array, still borrowed.
+    fn first(&self, operands: &'a [Expr<'_>], stop_when: bool) -> Result<Val<'a>, ExprError> {
         let mut last = Val::One(Cow::Borrowed(&NULL));
         for e in operands {
             last = self.walk(e)?;
@@ -633,13 +688,16 @@ impl<'a> Evaluator<'a> {
                 break;
             }
         }
-        self.one(last)
+        Ok(match last {
+            Val::Many(items) => Val::List(items),
+            other => other,
+        })
     }
 
     fn call(&self, name: &str, args: &[Val<'a>], offset: usize) -> Result<Value, ExprError> {
         let arg = |i: usize| args.get(i).map_or(&NULL, Val::scalar);
         let v = match name {
-            "contains" => Value::Bool(contains(&args[0], args[1].scalar())),
+            "contains" => Value::Bool(contains(&args[0], args[1].scalar(), offset, self.budget)?),
             "startswith" => Value::Bool(with_text(arg(0), |s| {
                 with_text(arg(1), |prefix| starts_folded(s, prefix))
             })),
@@ -652,7 +710,7 @@ impl<'a> Evaluator<'a> {
             "join" => Value::String(join(args, offset, self.budget)?),
             "tojson" => Value::String(match &args[0] {
                 Val::One(v) => to_json(&**v, offset, self.budget)?,
-                Val::Many(vs) => to_json(vs, offset, self.budget)?,
+                Val::Many(vs) | Val::List(vs) => to_json(vs, offset, self.budget)?,
             }),
             "fromjson" => with_text(arg(0), |t| from_json(t, offset, self.budget))?,
             "hashfiles" => {
@@ -676,17 +734,22 @@ impl<'a> Evaluator<'a> {
 /// `contains(search, item)`: an array holds an item loosely equal to
 /// `item`, or the text of `search` holds the text of `item`, ignoring
 /// case. An object holds nothing.
-fn contains(search: &Val<'_>, item: &Value) -> bool {
-    match search {
-        Val::Many(items) => items.iter().any(|v| loose_eq(v, item)),
-        Val::One(v) => match &**v {
-            Value::Array(items) => items.iter().any(|v| loose_eq(v, item)),
-            Value::Object(_) => false,
-            text => with_text(text, |hay| {
-                with_text(item, |needle| contains_folded(hay, needle))
-            }),
-        },
+fn contains(
+    search: &Val<'_>,
+    item: &Value,
+    offset: usize,
+    budget: &Budget,
+) -> Result<bool, ExprError> {
+    if let Some(items) = search.items() {
+        return Ok(items.iter().any(|v| loose_eq(v, item)));
     }
+    Ok(match search.scalar() {
+        Value::Array(items) => items.iter().any(|v| loose_eq(v, item)),
+        Value::Object(_) => false,
+        text => with_text(text, |hay| {
+            with_text(item, |needle| contains_folded(hay, needle, budget, offset))
+        })?,
+    })
 }
 
 /// `join(array, sep)`: the items as text with `sep` (`,` by default)
@@ -696,7 +759,9 @@ fn join(args: &[Val<'_>], offset: usize, budget: &Budget) -> Result<String, Expr
         .get(1)
         .map_or_else(|| ",".to_owned(), |a| to_string(a.scalar()));
     match &args[0] {
-        Val::Many(items) => join_items(items.iter().map(|v| &**v), &sep, offset, budget),
+        Val::Many(items) | Val::List(items) => {
+            join_items(items.iter().map(|v| &**v), &sep, offset, budget)
+        }
         Val::One(v) => match &**v {
             Value::Array(items) => join_items(items.iter(), &sep, offset, budget),
             other => {
@@ -951,13 +1016,13 @@ mod tests {
                 );
                 assert_eq!(ends_folded(x, y), fx.ends_with(&fy), "{x:?} ends {y:?}");
                 assert_eq!(
-                    contains_folded(x, y),
+                    contains_folded(x, y, &Budget::new(), 0).unwrap(),
                     fx.contains(&fy),
                     "{x:?} contains {y:?}"
                 );
                 let (xx, yy) = (format!("{x}{y}{x}"), format!("{y}{x}"));
                 assert_eq!(
-                    contains_folded(&xx, &yy),
+                    contains_folded(&xx, &yy, &Budget::new(), 0).unwrap(),
                     fold(&xx).contains(&fold(&yy)),
                     "{xx:?} contains {yy:?}"
                 );
