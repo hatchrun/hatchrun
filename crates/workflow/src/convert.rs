@@ -46,10 +46,10 @@ pub struct Conversion {
 ///
 /// A job with a problem (a `runs-on` that names no runner template, a
 /// `docker://` step, a `needs` that names no job, a job key another file
-/// already uses) is dropped, like a reusable workflow call. Every job
-/// that needs a dropped job, directly or through others, is dropped too,
-/// with a warning naming the chain of jobs it needed. A file that does not
-/// parse, has no name before its extension or repeats another file's
+/// already uses, a read of the `strategy` or `jobs` context) is dropped,
+/// like a reusable workflow call. Every job that needs a dropped job,
+/// directly or through others, is dropped too, with a warning naming the
+/// chain of jobs it needed. A file that does not parse, has no name before its extension or repeats another file's
 /// name is skipped. Each problem is in [`Conversion::errors`].
 ///
 /// # Errors
@@ -380,10 +380,17 @@ impl Cx {
                     .entry(name.clone())
                     .or_insert_with(|| value.clone());
             }
-            for context in unsupported_contexts(&converted) {
-                self.warn(format!(
-                    "{at} reads the `{context}` context, which hatchrun does not provide; validate reports each use"
-                ));
+            // validate rejects these reads, so the job could not run.
+            let contexts = unsupported_contexts(&converted);
+            if !contexts.is_empty() {
+                for context in contexts {
+                    self.error(format!(
+                        "{at} reads the `{context}` context, which hatchrun does not provide; the job was dropped"
+                    ));
+                }
+                dropped.insert(id, FAILED.to_owned());
+                failed = true;
+                continue;
             }
             self.config.jobs.insert(key, converted);
             entries.push(entry);

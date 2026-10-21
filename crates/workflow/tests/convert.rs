@@ -498,7 +498,9 @@ fn arm_labels_become_the_26_04_arm_template() {
 }
 
 #[test]
-fn strategy_and_jobs_contexts_warn() {
+fn a_job_that_reads_strategy_or_jobs_is_dropped() {
+    // hatchrun provides neither context, so validate would reject the
+    // job; convert leaves it out instead and its output validates.
     let out = ok("
 on: push
 jobs:
@@ -506,22 +508,27 @@ jobs:
     runs-on: ubuntu-latest
     if: strategy.fail-fast
     steps: [{ run: \"echo ${{ jobs.x.result }}\" }]
+  after:
+    needs: b
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{ run: lint }]
 ");
     assert!(
-        has(&out.warnings, &["`b`", "`strategy` context"]),
+        has(&out.errors, &["`b`", "`strategy` context"]),
         "{:?}",
-        out.warnings
+        out.errors
     );
     assert!(
-        has(&out.warnings, &["`b`", "`jobs` context"]),
+        has(&out.errors, &["`b`", "`jobs` context"]),
         "{:?}",
-        out.warnings
+        out.errors
     );
-    let errs = validate(&out.config);
-    assert!(
-        errs.iter().any(|e| e.message.contains("'strategy'")),
-        "{errs:?}"
-    );
+    assert!(has(&out.warnings, &["`after` was dropped", "needs `b`"]));
+    assert_eq!(out.config.jobs.keys().collect::<Vec<_>>(), ["ci-lint"]);
+    round_trips(&out);
 }
 
 #[test]
