@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use hatchrun_workflow::trigger::Filter;
@@ -18,6 +19,7 @@ use hatchrun_workflow::{
     Arch, Conclusion, ExprError, Functions, JobDocument, JobKind, JobStatus, checks_status,
     evaluate, truthy,
 };
+use nix::fcntl::OFlag;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -256,7 +258,7 @@ fn hash_files_in(
     let filter = Filter::new(with_root_variants(patterns));
     let root = fs::canonicalize(workspace)
         .map_err(|e| fail(format!("hashFiles: {}: {e}", workspace.display())))?;
-    let mut matched: Vec<(String, PathBuf)> = Vec::new();
+    let mut matched: Vec<(String, PathBuf, (u64, u64))> = Vec::new();
     let mut seen = 0usize;
     let mut dirs = vec![(root.clone(), String::new())];
     while let Some((dir, rel)) = dirs.pop() {
@@ -281,13 +283,19 @@ fn hash_files_in(
                 dirs.push((path, rel_path));
                 continue;
             }
-            let file = if kind.is_symlink() {
+            let (file, meta) = if kind.is_symlink() {
                 match fs::canonicalize(&path) {
-                    Ok(target) if target.starts_with(&root) && target.is_file() => target,
+                    Ok(target) if target.starts_with(&root) => match fs::metadata(&target) {
+                        Ok(meta) if meta.is_file() => (target, meta),
+                        _ => continue,
+                    },
                     _ => continue,
                 }
             } else if kind.is_file() {
-                path
+                match entry.metadata() {
+                    Ok(meta) => (path, meta),
+                    Err(_) => continue,
+                }
             } else {
                 continue;
             };
@@ -298,7 +306,7 @@ fn hash_files_in(
                 )));
             }
             if filter.matches(&rel_path) {
-                matched.push((rel_path, file));
+                matched.push((rel_path, file, (meta.dev(), meta.ino())));
             }
         }
     }
@@ -307,8 +315,12 @@ fn hash_files_in(
     }
     matched.sort_by(|a, b| a.0.cmp(&b.0));
     let mut all = Sha256::new();
-    for (rel, path) in &matched {
-        all.update(digest_file(path).map_err(|e| fail(format!("hashFiles: read {rel}: {e}")))?);
+    for (rel, path, id) in &matched {
+        let digest = digest_file(path, *id, &root)
+            .map_err(|e| fail(format!("hashFiles: read {rel}: {e}")))?;
+        if let Some(digest) = digest {
+            all.update(digest);
+        }
     }
     Ok(hex(&all.finalize()))
 }
@@ -341,8 +353,37 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-fn digest_file(path: &Path) -> std::io::Result<[u8; 32]> {
-    let mut file = fs::File::open(path)?;
+/// Hashes `path` if it is still the file the walk saw. The file is
+/// opened without following a link, and the open file must have the
+/// walked file's device and inode and, where `/proc` shows it, lie under
+/// `root`. A file that was swapped for something else since the walk is
+/// skipped (`None`).
+fn digest_file(path: &Path, id: (u64, u64), root: &Path) -> std::io::Result<Option<[u8; 32]>> {
+    let opened = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OFlag::O_NOFOLLOW.bits())
+        .open(path);
+    let mut file = match opened {
+        Ok(file) => file,
+        // A link now sits where the file was.
+        Err(e) if e.raw_os_error() == Some(nix::libc::ELOOP) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() || (meta.dev(), meta.ino()) != id {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let real = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        if !real.starts_with(root) {
+            return Ok(None);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = root;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8 * 1024];
     loop {
@@ -352,7 +393,7 @@ fn digest_file(path: &Path) -> std::io::Result<[u8; 32]> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().into())
+    Ok(Some(hasher.finalize().into()))
 }
 
 #[cfg(test)]
@@ -372,7 +413,7 @@ mod tests {
 
     fn job(template_label: &str) -> PlannedJob {
         PlannedJob {
-            id: "build".into(),
+            id: "build (linux) [1/2]".into(),
             name: "build".into(),
             requires: Vec::new(),
             kind: JobKind::Run {
@@ -584,6 +625,29 @@ mod tests {
             std::fs::write(dir.path().join(format!("f{i}")), "x").unwrap();
         }
         let err = hash_files_in(dir.path(), &["*".to_owned()], 3).unwrap_err();
-        assert!(err.message.contains('3'), "{}", err.message);
+        assert!(err.message.contains("more than 3 files"), "{}", err.message);
+    }
+
+    #[test]
+    fn digest_skips_a_file_swapped_after_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let file = root.join("a.lock");
+        fs::write(&file, "x").unwrap();
+        let meta = fs::metadata(&file).unwrap();
+        let id = (meta.dev(), meta.ino());
+        assert!(digest_file(&file, id, &root).unwrap().is_some());
+        fs::write(root.join("other"), "o").unwrap();
+        fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(root.join("other"), &file).unwrap();
+        assert!(digest_file(&file, id, &root).unwrap().is_none());
+        fs::remove_file(&file).unwrap();
+        fs::write(&file, "y").unwrap();
+        // Same path, different inode than the walk saw.
+        assert!(
+            digest_file(&file, (id.0, id.1 + 1_000_000), &root)
+                .unwrap()
+                .is_none()
+        );
     }
 }
