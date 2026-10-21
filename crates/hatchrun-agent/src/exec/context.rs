@@ -47,7 +47,7 @@ pub fn step_debug(doc: &JobDocument) -> bool {
 
 /// The action whose step is running, for `github.action_path` and
 /// `inputs`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ActionScope {
     /// `github.action`: the action's name or id.
     pub action: String,
@@ -61,11 +61,32 @@ pub struct ActionScope {
     pub inputs: BTreeMap<String, String>,
 }
 
+impl std::fmt::Debug for ActionScope {
+    /// Inputs can carry secrets, so only their names print.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActionScope")
+            .field("action", &self.action)
+            .field("path", &self.path)
+            .field("ref_", &self.ref_)
+            .field("repository", &self.repository)
+            .field("inputs", &self.inputs.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 /// The context object that expressions read.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Contexts {
     value: Value,
     cancel: Option<watch::Receiver<u32>>,
+}
+
+impl std::fmt::Debug for Contexts {
+    /// The contexts hold secrets and the job token, so nothing of them
+    /// prints.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Contexts").finish_non_exhaustive()
+    }
 }
 
 impl Contexts {
@@ -594,6 +615,27 @@ mod tests {
         assert_eq!(eval(&ctx, "github.event_name"), json!("pull_request"));
         assert_eq!(eval(&ctx, "secrets.GITHUB_TOKEN"), json!("tok"));
         assert_eq!(eval(&ctx, "secrets.NPM"), json!("s3"));
+    }
+
+    #[test]
+    fn debug_output_hides_secrets_and_inputs() {
+        let mut d = doc("ubuntu-latest");
+        d.secrets
+            .insert("ZED".to_owned(), "xyzzy-secret-123".to_owned());
+        d.github.token = "ghs_tokenvalue987".to_owned();
+        let ctx = Contexts::new(&d, &layout());
+        let text = format!("{ctx:?}");
+        assert!(!text.contains("xyzzy") && !text.contains("ghs_"), "{text}");
+        let scope = ActionScope {
+            action: "setup".into(),
+            path: "/p".into(),
+            ref_: "v1".into(),
+            repository: "o/r".into(),
+            inputs: BTreeMap::from([("key".to_owned(), "xyzzy-input-456".to_owned())]),
+        };
+        let text = format!("{scope:?} {:?}", ctx.with_action(scope.clone()));
+        assert!(!text.contains("xyzzy"), "{text}");
+        assert!(text.contains("key"), "{text}");
     }
 
     #[test]

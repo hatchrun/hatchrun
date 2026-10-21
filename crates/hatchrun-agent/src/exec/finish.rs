@@ -51,6 +51,9 @@ impl Job<'_> {
     /// steps run with no cache.
     pub(super) async fn start_cache(&mut self, sink: &mut dyn Sink) -> Option<Proxy> {
         let service = self.doc.cache.as_ref()?;
+        // The service token is the agent's own credential; an error text
+        // that quotes it must not print.
+        self.masker.add(&service.token);
         let cache = source::Cache {
             url: service.url.clone(),
             token: service.token.clone(),
@@ -85,7 +88,8 @@ impl Job<'_> {
     }
 
     fn cache_unavailable(&mut self, sink: &mut dyn Sink, err: &anyhow::Error) {
-        warn!("cache proxy: {err:#}");
+        let text = self.masker.mask(&format!("{err:#}")).into_owned();
+        warn!("cache proxy: {text}");
         let message = format!("The cache service is not available, running without it: {err:#}");
         self.say(sink, Line::Warning(&message));
     }

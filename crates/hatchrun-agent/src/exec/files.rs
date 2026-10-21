@@ -127,6 +127,30 @@ impl StepFiles {
     }
 }
 
+impl StepFiles {
+    /// Deletes the step's files. Called once they are read, so a step
+    /// that left a process running cannot write to them for the agent
+    /// to find later. An entry that is already gone is fine.
+    pub fn remove(&self) {
+        for path in [
+            &self.env,
+            &self.output,
+            &self.state,
+            &self.path,
+            &self.summary,
+        ] {
+            let removed = path.parent().zip(path.file_name()).and_then(|(dir, name)| {
+                let dirfd = open_dir(dir).ok()?;
+                unlinkat(&dirfd, name, UnlinkatFlags::NoRemoveDir).ok()
+            });
+            if removed.is_none() {
+                // Best effort: the directory is cleared at the next job.
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// What a step wrote.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Written {
@@ -189,11 +213,15 @@ pub fn read(files: &StepFiles) -> Result<Written, FileError> {
     written.state = parse_pairs(&state, &file_name(&files.state))?;
 
     let path = read_text(&files.path, MAX_FILE)?;
-    written.path = path
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(str::to_owned)
-        .collect();
+    let name = file_name(&files.path);
+    for (index, line) in path.lines().enumerate() {
+        if line.contains('\0') {
+            return Err(nul(&name, index + 1));
+        }
+        if !line.trim().is_empty() {
+            written.path.push(line.to_owned());
+        }
+    }
 
     let (summary, over) = read_capped(&files.summary, MAX_SUMMARY)?;
     if over {
@@ -204,6 +232,14 @@ pub fn read(files: &StepFiles) -> Result<Written, FileError> {
         written.summary = summary;
     }
     Ok(written)
+}
+
+fn nul(file: &str, line: usize) -> FileError {
+    FileError {
+        file: file.to_owned(),
+        line: Some(line),
+        message: "contains a NUL byte".to_owned(),
+    }
 }
 
 fn file_name(path: &Path) -> String {
@@ -291,6 +327,9 @@ fn parse_pairs(text: &str, file: &str) -> Result<Vec<(String, String)>, FileErro
             if eq == 0 {
                 return Err(fail(number, "empty name"));
             }
+            if line.contains('\0') {
+                return Err(nul(file, number));
+            }
             pairs.push((line[..eq].to_owned(), line[eq + 1..].to_owned()));
         } else if let Some(h) = heredoc {
             let name = &line[..h];
@@ -298,15 +337,21 @@ fn parse_pairs(text: &str, file: &str) -> Result<Vec<(String, String)>, FileErro
             if name.is_empty() {
                 return Err(fail(number, "empty name"));
             }
+            if line.contains('\0') {
+                return Err(nul(file, number));
+            }
             if delimiter.is_empty() {
                 return Err(fail(number, "empty delimiter"));
             }
             let mut value: Vec<&str> = Vec::new();
             let mut closed = false;
-            for (_, body) in lines.by_ref() {
+            for (at, body) in lines.by_ref() {
                 if body == delimiter {
                     closed = true;
                     break;
+                }
+                if body.contains('\0') {
+                    return Err(nul(file, at));
                 }
                 value.push(body);
             }
@@ -350,6 +395,46 @@ mod tests {
         let files = StepFiles::create(dir.path(), 2, None).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
         assert!(!fs::symlink_metadata(&files.env).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn nul_bytes_are_refused_with_the_file_and_line() {
+        for (text, line) in [
+            ("A=1\nB=x\0y\n", 2),
+            ("A\0=1\n", 1),
+            ("A=1\nB<<EOF\nx\0\nEOF\n", 3),
+            ("A<<E\0OF\nx\nE\0OF\n", 1),
+        ] {
+            let (_d, files) = files_with(text);
+            let err = read(&files).unwrap_err();
+            assert_eq!(err.line, Some(line), "{text:?}: {err}");
+            assert!(err.message.contains("NUL"), "{err}");
+            assert_eq!(err.file, "env_1");
+        }
+        let (_d, files) = files_with("");
+        fs::write(&files.path, "/a\n/b\0c\n").unwrap();
+        let err = read(&files).unwrap_err();
+        assert_eq!((err.file.as_str(), err.line), ("path_1", Some(2)));
+        let (_d, files) = files_with("");
+        fs::write(&files.output, "o=\0\n").unwrap();
+        assert!(read(&files).is_err());
+    }
+
+    #[test]
+    fn remove_deletes_the_files() {
+        let (_d, files) = files_with("A=1\n");
+        files.remove();
+        for path in [
+            &files.env,
+            &files.output,
+            &files.state,
+            &files.path,
+            &files.summary,
+        ] {
+            assert!(fs::symlink_metadata(path).is_err(), "{}", path.display());
+        }
+        // Removing again is fine.
+        files.remove();
     }
 
     #[test]

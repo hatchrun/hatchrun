@@ -230,26 +230,34 @@ pub async fn fetch_with(
     layout: &Layout,
     limits: Limits,
 ) -> Result<Action> {
+    let (root, rel);
     let dir = match r {
-        ActionRef::Local(p) => local_dir(&layout.workspace, p)?,
+        ActionRef::Local(p) => {
+            let dir = local_dir(&layout.workspace, p)?;
+            root = layout.workspace.canonicalize()?;
+            rel = dir.strip_prefix(&root).unwrap_or(Path::new("")).to_owned();
+            dir
+        }
         ActionRef::Remote {
             owner,
             repo,
             path,
             git_ref,
         } => {
-            let root = layout
+            let cached = layout
                 .actions
                 .join(owner)
                 .join(repo)
                 .join(cache_key(git_ref));
-            if !root.join(COMPLETE).is_file() {
-                download(github, owner, repo, git_ref, &root, limits).await?;
+            if !cached.join(COMPLETE).is_file() {
+                download(github, owner, repo, git_ref, &cached, limits).await?;
             }
-            root.join(TREE).join(path)
+            root = cached.join(TREE);
+            rel = PathBuf::from(path);
+            root.join(path)
         }
     };
-    let meta = read_metadata(&dir)?;
+    let meta = read_metadata_in(&root, &rel)?;
     Ok(Action { dir, meta })
 }
 
@@ -493,32 +501,70 @@ async fn try_download(
 }
 
 /// Reads `action.yml` or `action.yaml` from `dir`.
+#[cfg(test)]
 pub fn read_metadata(dir: &Path) -> Result<Metadata> {
-    let canon = dir
-        .canonicalize()
-        .with_context(|| format!("resolve {}", dir.display()))?;
-    for name in ["action.yml", "action.yaml"] {
-        let path = canon.join(name);
-        if std::fs::symlink_metadata(&path).is_err() {
-            continue;
+    read_metadata_in(dir, Path::new(""))
+}
+
+/// Reads `action.yml` or `action.yaml` from `root/rel`. The directory
+/// is reached one component at a time with `O_NOFOLLOW` from `root`,
+/// and the file is opened the same way and must be a regular file, so
+/// a step that swaps either for a link or a FIFO after the action was
+/// resolved cannot make the agent read or block on something else.
+pub fn read_metadata_in(root: &Path, rel: &Path) -> Result<Metadata> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+
+    let shown = root.join(rel);
+    let mut dir = open(
+        root,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("open {}", root.display()))?;
+    for part in rel.components() {
+        match part {
+            std::path::Component::Normal(name) => {
+                dir = openat(
+                    &dir,
+                    name,
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .with_context(|| format!("open {}", shown.display()))?;
+            }
+            std::path::Component::CurDir => {}
+            _ => bail!("action path {} leaves the action", rel.display()),
         }
-        // A symlinked action.yml must still point inside the action.
-        let real = path
-            .canonicalize()
-            .with_context(|| format!("resolve {}", path.display()))?;
-        if !real.starts_with(&canon) {
-            bail!("{} points outside the action", path.display());
+    }
+    for name in ["action.yml", "action.yaml"] {
+        let path = shown.join(name);
+        let fd = match openat(
+            &dir,
+            name,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::ENOENT) => continue,
+            Err(Errno::ELOOP) => bail!("{} is a symbolic link", path.display()),
+            Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+        };
+        let file = std::fs::File::from(fd);
+        if !file.metadata()?.is_file() {
+            bail!("{} is not a regular file", path.display());
         }
         let mut text = String::new();
-        std::fs::File::open(&real)
-            .and_then(|f| f.take(MAX_META + 1).read_to_string(&mut text))
+        file.take(MAX_META + 1)
+            .read_to_string(&mut text)
             .with_context(|| format!("read {}", path.display()))?;
         if text.len() as u64 > MAX_META {
             bail!("{} is larger than 1 MiB", path.display());
         }
         return parse_metadata(&text).map_err(|e| anyhow!("parse {}: {e:#}", path.display()));
     }
-    bail!("no action.yml or action.yaml in {}", dir.display())
+    bail!("no action.yml or action.yaml in {}", shown.display())
 }
 
 fn parse_metadata(text: &str) -> Result<Metadata> {
@@ -1031,6 +1077,50 @@ mod tests {
             err.contains("action.yml") && err.contains("action.yaml"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_linked_or_fifo_action_file_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let elsewhere = d.path().join("elsewhere.yml");
+        fs::write(&elsewhere, NODE_YML).unwrap();
+        let act = d.path().join("act");
+        fs::create_dir(&act).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, act.join("action.yml")).unwrap();
+        let err = read_metadata(&act).unwrap_err().to_string();
+        assert!(err.contains("symbolic link"), "{err}");
+
+        let fifo = d.path().join("fifo");
+        fs::create_dir(&fifo).unwrap();
+        nix::unistd::mkfifo(
+            &fifo.join("action.yml"),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_metadata(&fifo).map(|_| ()).map_err(|e| e.to_string()));
+        });
+        let done = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reading a FIFO must not block");
+        assert!(done.unwrap_err().contains("not a regular file"));
+    }
+
+    #[test]
+    fn a_linked_directory_on_the_way_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("action.yml"), NODE_YML).unwrap();
+        let root = d.path().join("root");
+        fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&real, root.join("sub")).unwrap();
+        assert!(read_metadata_in(&root, Path::new("sub")).is_err());
+        fs::create_dir(root.join("plain")).unwrap();
+        fs::write(root.join("plain/action.yml"), NODE_YML).unwrap();
+        assert!(read_metadata_in(&root, Path::new("plain")).is_ok());
+        assert!(read_metadata_in(&root, Path::new("../real")).is_err());
     }
 
     #[test]

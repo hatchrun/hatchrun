@@ -711,7 +711,11 @@ impl Job<'_> {
         }
 
         let mut state = Vec::new();
-        match files::read(launch.files) {
+        let read = files::read(launch.files);
+        // Nothing needs the files now, and a process left running must
+        // not write to them for a later reader to trust.
+        launch.files.remove();
+        match read {
             Ok(written) => {
                 for warning in &written.warnings {
                     out.warning(warning);

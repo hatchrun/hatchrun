@@ -2198,7 +2198,7 @@ async fn cache_service_starts_the_proxy() {
     let mut doc = make::document(vec![make::step(script)]);
     doc.cache = Some(hatchrun_workflow::CacheService {
         url: format!("{}/v1/cache", server.uri()),
-        token: "t".to_owned(),
+        token: "cache-service-token".to_owned(),
     });
     let with_cache = json(&doc);
     doc.cache = None;
@@ -2449,6 +2449,51 @@ fn problem_matcher_commands_are_swallowed() {
         lines(&out).contains(&"::mystery::kept".to_owned()),
         "{text}"
     );
+}
+
+#[test]
+fn a_nul_in_a_file_command_fails_only_that_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut after = make::run("echo still-ran");
+    after.if_ = Some("always()".to_owned());
+    let out = run_steps(
+        dir.path(),
+        vec![
+            make::step("printf 'A=1\\nB=x\\0y\\n' >> \"$GITHUB_ENV\""),
+            make::planned(after),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let got = lines(&out);
+    assert!(
+        got.iter()
+            .any(|l| l.starts_with("Error: env_0 line 2: contains a NUL")),
+        "{got:?}"
+    );
+    assert!(got.contains(&"still-ran".to_owned()), "{got:?}");
+    let result = result(dir.path());
+    assert_eq!(result.steps[0].outcome, Conclusion::Failure);
+    assert_eq!(result.steps[1].outcome, Conclusion::Success);
+}
+
+#[test]
+fn file_command_files_are_deleted_after_the_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(
+        dir.path(),
+        vec![
+            make::step(
+                "echo \"$GITHUB_ENV\" > \"$RUNNER_TEMP/env.path\"; echo A=1 >> \"$GITHUB_ENV\"",
+            ),
+            make::step(
+                "echo \"A=$A\"; test ! -e \"$(cat \"$RUNNER_TEMP/env.path\")\" && echo gone",
+            ),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let got = lines(&out);
+    assert!(got.contains(&"A=1".to_owned()), "{got:?}");
+    assert!(got.contains(&"gone".to_owned()), "{got:?}");
 }
 
 #[test]
