@@ -44,10 +44,14 @@ const MAX_LEN: usize = 4096;
 pub const MAX_STRING: usize = 1 << 20;
 
 /// The most memory, in bytes, one [`evaluate`] or [`interpolate`] call
-/// may spend on the strings it makes and the values `fromJSON` parses,
-/// across all of its expressions and calls. Each value is charged
-/// before it is made: a string by its length, a parsed value by
+/// may spend on the strings it makes, the values `fromJSON` parses and
+/// the values it copies out of the context, across all of its
+/// expressions and calls. Each value is charged before it is made: a
+/// string by its length, a parsed or copied value by
 /// `size_of::<Value>()` per node plus its string and key bytes.
+///
+/// Reading a context does not copy it: the evaluator walks contexts by
+/// reference, and only a value [`evaluate`] returns is copied out.
 pub const MAX_MEMORY: usize = 8 << 20;
 
 /// An expression that does not parse or fails to evaluate.
@@ -221,25 +225,33 @@ pub fn interpolate(
         let start = open + 3;
         let end = closing(template, start)
             .ok_or_else(|| ExprError::new("'${{' has no closing '}}'", open))?;
-        let value =
-            evaluate_in(&template[start..end], ctx, funcs, &budget).map_err(|e| ExprError {
-                message: e.message,
-                offset: e.offset + start,
-            })?;
-        let text = match value {
-            Value::String(s) => s,
-            other => eval::to_string(&other),
+        let shift = |e: ExprError| ExprError {
+            message: e.message,
+            offset: e.offset + start,
         };
-        let len = out.len() + (open - rest) + text.len() + (template.len() - end - 2);
-        if len > MAX_STRING {
-            return Err(ExprError::new(
-                format!("the value would be {len} bytes or more; the limit is {MAX_STRING}"),
-                open,
-            ));
-        }
-        budget.charge((open - rest) + text.len(), "interpolation", open)?;
-        out.push_str(&template[rest..open]);
-        out.push_str(&text);
+        let ast = tree(&template[start..end]).map_err(shift)?;
+        let evaluator = eval::Evaluator {
+            ctx,
+            funcs,
+            budget: &budget,
+        };
+        evaluator
+            .eval_text(&ast, |text| {
+                let len = out.len() + (open - rest) + text.len() + (template.len() - end - 2);
+                if len > MAX_STRING {
+                    return Err(ExprError::new(
+                        format!(
+                            "the value would be {len} bytes or more; the limit is {MAX_STRING}"
+                        ),
+                        open,
+                    ));
+                }
+                budget.charge((open - rest) + text.len(), "interpolation", open)?;
+                out.push_str(&template[rest..open]);
+                out.push_str(text);
+                Ok(())
+            })
+            .map_err(shift)??;
         rest = end + 2;
     }
     out.push_str(&template[rest..]);

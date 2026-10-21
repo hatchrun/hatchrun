@@ -4,6 +4,7 @@
 
 //! Walks an expression tree against a context, with GitHub's loose typing.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::fmt;
@@ -91,7 +92,8 @@ fn fits(len: usize, name: &str, offset: usize) -> Result<(), ExprError> {
 }
 
 /// The bytes one `evaluate` or `interpolate` call has spent on the
-/// strings it made and the values `fromJSON` parsed. Every such
+/// strings it made, the values `fromJSON` parsed and the values it
+/// copied out of the context. Every such
 /// allocation is charged before it is made, and nothing is given back.
 pub(crate) struct Budget {
     used: Cell<usize>,
@@ -178,9 +180,89 @@ fn parse_number(s: &str) -> f64 {
     s.parse().unwrap_or(f64::NAN)
 }
 
-/// GitHub's case-insensitive string comparison.
-fn fold(s: &str) -> String {
-    s.to_uppercase()
+/// The characters of `s` in upper case, one by one, as
+/// `str::to_uppercase` would make them, without making a string.
+fn upper(s: &str) -> impl DoubleEndedIterator<Item = char> + '_ {
+    s.chars().flat_map(char::to_uppercase)
+}
+
+/// GitHub's case-insensitive string equality.
+fn eq_folded(x: &str, y: &str) -> bool {
+    if x.is_ascii() && y.is_ascii() {
+        return x.eq_ignore_ascii_case(y);
+    }
+    upper(x).eq(upper(y))
+}
+
+/// GitHub's case-insensitive string order.
+fn cmp_folded(x: &str, y: &str) -> Ordering {
+    if x.is_ascii() && y.is_ascii() {
+        let up = u8::to_ascii_uppercase;
+        return x.bytes().map(|b| up(&b)).cmp(y.bytes().map(|b| up(&b)));
+    }
+    upper(x).cmp(upper(y))
+}
+
+/// Whether `s` starts with `prefix`, ignoring case.
+fn starts_folded(s: &str, prefix: &str) -> bool {
+    let mut chars = upper(s);
+    upper(prefix).all(|c| chars.next() == Some(c))
+}
+
+/// Whether `s` ends with `suffix`, ignoring case.
+fn ends_folded(s: &str, suffix: &str) -> bool {
+    let mut chars = upper(s).rev();
+    upper(suffix).rev().all(|c| chars.next() == Some(c))
+}
+
+/// Whether `needle` occurs in `hay`, ignoring case. Only the needle is
+/// copied; the haystack is read once, as Knuth-Morris-Pratt reads it.
+fn contains_folded(hay: &str, needle: &str) -> bool {
+    if hay.is_ascii() && needle.is_ascii() {
+        if needle.len() > hay.len() {
+            return false;
+        }
+        let needle: Vec<u8> = needle.bytes().map(|b| b.to_ascii_uppercase()).collect();
+        return kmp(hay.bytes().map(|b| b.to_ascii_uppercase()), &needle);
+    }
+    let needle: Vec<char> = upper(needle).collect();
+    kmp(upper(hay), &needle)
+}
+
+/// Whether `needle` occurs in `hay`, in time linear in both.
+fn kmp<T: Copy + Eq>(hay: impl Iterator<Item = T>, needle: &[T]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    // fail[i]: the length of the longest proper prefix of needle[..=i]
+    // that is also its suffix.
+    let mut fail = vec![0u32; needle.len()];
+    let mut k = 0;
+    for i in 1..needle.len() {
+        while k > 0 && needle[i] != needle[k] {
+            k = fail[k - 1] as usize;
+        }
+        if needle[i] == needle[k] {
+            k += 1;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            fail[i] = k as u32;
+        }
+    }
+    let mut k = 0;
+    for c in hay {
+        while k > 0 && c != needle[k] {
+            k = fail[k - 1] as usize;
+        }
+        if c == needle[k] {
+            k += 1;
+            if k == needle.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Loose equality: same-typed values compare directly (strings ignoring
@@ -189,7 +271,7 @@ fn loose_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::String(x), Value::String(y)) => fold(x) == fold(y),
+        (Value::String(x), Value::String(y)) => eq_folded(x, y),
         (Value::Array(_), Value::Array(_)) | (Value::Object(_), Value::Object(_)) => false,
         _ => to_number(a) == to_number(b),
     }
@@ -199,7 +281,7 @@ fn compare(op: Op, a: &Value, b: &Value) -> bool {
     // Strings order ignoring case; anything else orders as numbers, and
     // NaN orders against nothing.
     let ordering = || match (a, b) {
-        (Value::String(x), Value::String(y)) => Some(fold(x).cmp(&fold(y))),
+        (Value::String(x), Value::String(y)) => Some(cmp_folded(x, y)),
         _ => to_number(a).partial_cmp(&to_number(b)),
     };
     match op {
@@ -212,26 +294,40 @@ fn compare(op: Op, a: &Value, b: &Value) -> bool {
     }
 }
 
+/// The `null` a known context reads as when the context object leaves
+/// it out, and a missing property reads as.
+static NULL: Value = Value::Null;
+
+/// What a `*` filter's result is where only its type matters.
+/// Comparisons, truthiness and text never look inside an array.
+static ARRAY: Value = Value::Array(Vec::new());
+
+/// A value borrowed from the context or the expression, or one made
+/// while evaluating. Reads walk the context by reference; a borrowed
+/// value is copied only when it is returned, and the copy is charged.
+type Ref<'a> = Cow<'a, Value>;
+
 /// A value, or the array a `*` filter produced. Property access on a
 /// filtered array applies to each element and drops what is missing.
-enum Val {
-    One(Value),
-    Many(Vec<Value>),
+enum Val<'a> {
+    One(Ref<'a>),
+    Many(Vec<Ref<'a>>),
 }
 
-impl Val {
-    fn into_value(self) -> Value {
+impl<'a> Val<'a> {
+    /// The value, with a filtered array standing in as an empty array.
+    fn scalar(&self) -> &Value {
         match self {
             Val::One(v) => v,
-            Val::Many(vs) => Value::Array(vs),
+            Val::Many(_) => &ARRAY,
         }
     }
 
-    fn deref(self, key: &Value) -> Val {
+    fn deref(self, key: Key<'_>) -> Val<'a> {
         match self {
-            Val::One(v) => Val::One(lookup(&v, key)),
+            Val::One(v) => Val::One(lookup(v, key)),
             Val::Many(vs) => Val::Many(
-                vs.iter()
+                vs.into_iter()
                     .map(|v| lookup(v, key))
                     .filter(|v| !v.is_null())
                     .collect(),
@@ -239,47 +335,135 @@ impl Val {
         }
     }
 
-    fn filter(self) -> Val {
-        let children = |v: Value| match v {
-            Value::Array(items) => items,
-            Value::Object(map) => map.into_iter().map(|(_, v)| v).collect(),
-            _ => Vec::new(),
-        };
+    fn filter(self) -> Val<'a> {
+        let mut out = Vec::new();
         match self {
-            Val::One(v) => Val::Many(children(v)),
-            Val::Many(vs) => Val::Many(vs.into_iter().flat_map(children).collect()),
+            Val::One(v) => children(v, &mut out),
+            Val::Many(vs) => {
+                for v in vs {
+                    children(v, &mut out);
+                }
+            }
         }
+        Val::Many(out)
+    }
+}
+
+/// Adds the items of an array or the values of an object to `out`,
+/// borrowing what was borrowed and moving what was owned.
+fn children<'a>(v: Ref<'a>, out: &mut Vec<Ref<'a>>) {
+    match v {
+        Cow::Borrowed(Value::Array(items)) => out.extend(items.iter().map(Cow::Borrowed)),
+        Cow::Borrowed(Value::Object(map)) => out.extend(map.values().map(Cow::Borrowed)),
+        Cow::Owned(Value::Array(items)) => out.extend(items.into_iter().map(Cow::Owned)),
+        Cow::Owned(Value::Object(map)) => out.extend(map.into_iter().map(|(_, v)| Cow::Owned(v))),
+        Cow::Borrowed(_) | Cow::Owned(_) => {}
+    }
+}
+
+/// A property name or an index value.
+#[derive(Clone, Copy)]
+enum Key<'k> {
+    Name(&'k str),
+    Value(&'k Value),
+}
+
+impl Key<'_> {
+    /// The key as an array index: a whole, non-negative number.
+    fn index(self) -> Option<usize> {
+        let Key::Value(Value::Number(n)) = self else {
+            return None;
+        };
+        n.as_f64()
+            .filter(|f| f.fract() == 0.0 && *f >= 0.0)
+            .map(|f| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                {
+                    f as usize
+                }
+            })
     }
 }
 
 /// Reads `v[key]`: an object key (exact, then ignoring case) or an array
-/// index. Anything missing is `null`.
-fn lookup(v: &Value, key: &Value) -> Value {
+/// index. Anything missing is `null`. A borrowed value gives a borrowed
+/// child; an owned one gives up its child without copying it.
+fn lookup<'a>(v: Ref<'a>, key: Key<'_>) -> Ref<'a> {
     match v {
-        Value::Object(map) => {
-            let key = to_string(key);
-            map.get(&key)
-                .or_else(|| {
-                    map.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&key))
-                        .map(|(_, v)| v)
-                })
-                .cloned()
-                .unwrap_or(Value::Null)
-        }
-        Value::Array(items) => match key {
-            Value::Number(n) => n
-                .as_f64()
-                .filter(|f| f.fract() == 0.0 && *f >= 0.0)
-                .and_then(|f| {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    items.get(f as usize)
-                })
-                .cloned()
-                .unwrap_or(Value::Null),
+        Cow::Borrowed(v) => Cow::Borrowed(find(v, key).unwrap_or(&NULL)),
+        Cow::Owned(v) => Cow::Owned(take(v, key)),
+    }
+}
+
+fn find<'v>(v: &'v Value, key: Key<'_>) -> Option<&'v Value> {
+    match v {
+        Value::Object(map) => with_key(key, |name| {
+            map.get(name).or_else(|| {
+                map.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v)
+            })
+        }),
+        Value::Array(items) => key.index().and_then(|i| items.get(i)),
+        _ => None,
+    }
+}
+
+fn take(v: Value, key: Key<'_>) -> Value {
+    match v {
+        Value::Object(mut map) => with_key(key, |name| {
+            if let Some(found) = map.remove(name) {
+                return found;
+            }
+            map.into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map_or(Value::Null, |(_, v)| v)
+        }),
+        Value::Array(mut items) => match key.index() {
+            Some(i) if i < items.len() => items.swap_remove(i),
             _ => Value::Null,
         },
         _ => Value::Null,
+    }
+}
+
+/// Passes the key as an object key to `f`, copying it only when it is
+/// not already a string.
+fn with_key<R>(key: Key<'_>, f: impl FnOnce(&str) -> R) -> R {
+    match key {
+        Key::Name(name) => f(name),
+        Key::Value(Value::String(name)) => f(name),
+        Key::Value(other) => f(&to_string(other)),
+    }
+}
+
+/// The bytes a copy of `v` holds, counted the way `fromJSON` charges a
+/// parsed value. Counting stops once it passes `limit`.
+fn copy_bytes(v: &Value, total: &mut usize, limit: usize) {
+    let own = match v {
+        Value::String(s) => s.len(),
+        _ => 0,
+    };
+    *total = total.saturating_add(std::mem::size_of::<Value>() + own);
+    match v {
+        Value::Array(items) => {
+            for item in items {
+                if *total > limit {
+                    return;
+                }
+                copy_bytes(item, total, limit);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                if *total > limit {
+                    return;
+                }
+                *total = total.saturating_add(std::mem::size_of::<String>() + key.len());
+                copy_bytes(item, total, limit);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -318,15 +502,58 @@ pub(crate) struct Evaluator<'a> {
     pub budget: &'a Budget,
 }
 
-impl Evaluator<'_> {
+impl<'a> Evaluator<'a> {
     /// Checks every context name, including ones a short circuit would
-    /// skip, then evaluates.
-    pub(crate) fn eval(&self, expr: &Expr) -> Result<Value, ExprError> {
+    /// skip, then evaluates. The result is copied out of the context
+    /// only if it was read from there, and the copy is charged.
+    pub(crate) fn eval(&self, expr: &'a Expr) -> Result<Value, ExprError> {
         self.check(expr)?;
-        Ok(self.walk(expr)?.into_value())
+        match self.walk(expr)? {
+            Val::One(v) => self.own(v),
+            Val::Many(vs) => self.own_all(vs).map(Value::Array),
+        }
     }
 
-    fn context(&self, name: &str) -> Option<Value> {
+    /// Like [`Evaluator::eval`], but passes the result as text to `f`
+    /// without copying it.
+    pub(crate) fn eval_text<R>(
+        &self,
+        expr: &'a Expr,
+        f: impl FnOnce(&str) -> R,
+    ) -> Result<R, ExprError> {
+        self.check(expr)?;
+        Ok(with_text(self.walk(expr)?.scalar(), f))
+    }
+
+    /// A value the caller keeps: borrowed values are copied, after the
+    /// copy is charged.
+    fn own(&self, v: Ref<'a>) -> Result<Value, ExprError> {
+        match v {
+            Cow::Owned(v) => Ok(v),
+            Cow::Borrowed(v) => {
+                let mut bytes = 0;
+                copy_bytes(v, &mut bytes, MAX_MEMORY);
+                self.budget.charge(bytes, "copying a value", 0)?;
+                Ok(v.clone())
+            }
+        }
+    }
+
+    fn own_all(&self, vs: Vec<Ref<'a>>) -> Result<Vec<Value>, ExprError> {
+        self.budget
+            .charge(std::mem::size_of::<Value>(), "copying a value", 0)?;
+        vs.into_iter().map(|v| self.own(v)).collect()
+    }
+
+    /// The value as one value: a filtered array becomes an array.
+    fn one(&self, v: Val<'a>) -> Result<Ref<'a>, ExprError> {
+        match v {
+            Val::One(v) => Ok(v),
+            Val::Many(vs) => Ok(Cow::Owned(Value::Array(self.own_all(vs)?))),
+        }
+    }
+
+    fn context(&self, name: &str) -> Option<&'a Value> {
         let given = self.ctx.as_object().and_then(|m| {
             m.get(name).or_else(|| {
                 m.iter()
@@ -334,13 +561,13 @@ impl Evaluator<'_> {
                     .map(|(_, v)| v)
             })
         });
-        if let Some(v) = given {
-            return Some(v.clone());
+        if given.is_some() {
+            return given;
         }
         CONTEXTS
             .iter()
             .any(|c| c.eq_ignore_ascii_case(name))
-            .then_some(Value::Null)
+            .then_some(&NULL)
     }
 
     fn check(&self, expr: &Expr) -> Result<(), ExprError> {
@@ -350,43 +577,47 @@ impl Evaluator<'_> {
         })
     }
 
-    fn value(&self, expr: &Expr) -> Result<Value, ExprError> {
-        Ok(self.walk(expr)?.into_value())
-    }
-
-    fn walk(&self, expr: &Expr) -> Result<Val, ExprError> {
+    fn walk(&self, expr: &'a Expr) -> Result<Val<'a>, ExprError> {
         let v = match expr {
-            Expr::Literal(v) => v.clone(),
-            Expr::Context { name, .. } => self.context(name).unwrap_or(Value::Null),
+            Expr::Literal(v) => Cow::Borrowed(v),
+            Expr::Context { name, .. } => Cow::Borrowed(self.context(name).unwrap_or(&NULL)),
             Expr::Access { base, path } => {
                 let mut val = self.walk(base)?;
                 for step in path {
                     val = match step {
-                        Step::Property(name) => val.deref(&Value::String(name.clone())),
-                        Step::Index(index) => val.deref(&self.value(index)?),
+                        Step::Property(name) => val.deref(Key::Name(name)),
+                        Step::Index(index) => {
+                            let key = self.walk(index)?;
+                            val.deref(Key::Value(key.scalar()))
+                        }
                         Step::Filter => val.filter(),
                     };
                 }
                 return Ok(val);
             }
-            Expr::Not(inner) => Value::Bool(!truthy(&self.value(inner)?)),
+            Expr::Not(inner) => Cow::Owned(Value::Bool(!truthy(self.walk(inner)?.scalar()))),
             // `&&` returns the first falsy operand, `||` the first truthy
             // one, and each returns its last operand when none qualifies.
             Expr::And(operands) => self.first(operands, false)?,
             Expr::Or(operands) => self.first(operands, true)?,
             Expr::Compare { first, rest } => {
-                let mut acc = self.value(first)?;
+                let mut acc = self.walk(first)?;
                 for (op, e) in rest {
-                    acc = Value::Bool(compare(*op, &acc, &self.value(e)?));
+                    let rhs = self.walk(e)?;
+                    acc = Val::One(Cow::Owned(Value::Bool(compare(
+                        *op,
+                        acc.scalar(),
+                        rhs.scalar(),
+                    ))));
                 }
-                acc
+                self.one(acc)?
             }
             Expr::Call { name, args, offset } => {
                 let args = args
                     .iter()
-                    .map(|a| self.value(a))
+                    .map(|a| self.walk(a))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.call(name, &args, *offset)?
+                Cow::Owned(self.call(name, &args, *offset)?)
             }
         };
         Ok(Val::One(v))
@@ -394,36 +625,38 @@ impl Evaluator<'_> {
 
     /// Evaluates `operands` in order and returns the first whose
     /// truthiness is `stop_when`, or the last one.
-    fn first(&self, operands: &[Expr], stop_when: bool) -> Result<Value, ExprError> {
-        let mut last = Value::Null;
+    fn first(&self, operands: &'a [Expr], stop_when: bool) -> Result<Ref<'a>, ExprError> {
+        let mut last = Val::One(Cow::Borrowed(&NULL));
         for e in operands {
-            last = self.value(e)?;
-            if truthy(&last) == stop_when {
+            last = self.walk(e)?;
+            if truthy(last.scalar()) == stop_when {
                 break;
             }
         }
-        Ok(last)
+        self.one(last)
     }
 
-    fn call(&self, name: &str, args: &[Value], offset: usize) -> Result<Value, ExprError> {
-        let string = |i: usize| args.get(i).map(to_string).unwrap_or_default();
+    fn call(&self, name: &str, args: &[Val<'a>], offset: usize) -> Result<Value, ExprError> {
+        let arg = |i: usize| args.get(i).map_or(&NULL, Val::scalar);
         let v = match name {
-            "contains" => Value::Bool(match &args[0] {
-                Value::Array(items) => items.iter().any(|item| loose_eq(item, &args[1])),
-                Value::Object(_) => false,
-                search => fold(&to_string(search)).contains(&fold(&string(1))),
-            }),
-            "startswith" => Value::Bool(fold(&string(0)).starts_with(&fold(&string(1)))),
-            "endswith" => Value::Bool(fold(&string(0)).ends_with(&fold(&string(1)))),
-            "format" => {
-                let fmt = string(0);
-                Value::String(format(&fmt, &args[1..], offset, self.budget)?)
-            }
+            "contains" => Value::Bool(contains(&args[0], args[1].scalar())),
+            "startswith" => Value::Bool(with_text(arg(0), |s| {
+                with_text(arg(1), |prefix| starts_folded(s, prefix))
+            })),
+            "endswith" => Value::Bool(with_text(arg(0), |s| {
+                with_text(arg(1), |suffix| ends_folded(s, suffix))
+            })),
+            "format" => Value::String(with_text(arg(0), |fmt| {
+                format(fmt, &args[1..], offset, self.budget)
+            })?),
             "join" => Value::String(join(args, offset, self.budget)?),
-            "tojson" => Value::String(to_json(&args[0], offset, self.budget)?),
-            "fromjson" => with_text(&args[0], |t| from_json(t, offset, self.budget))?,
+            "tojson" => Value::String(match &args[0] {
+                Val::One(v) => to_json(&**v, offset, self.budget)?,
+                Val::Many(vs) => to_json(vs, offset, self.budget)?,
+            }),
+            "fromjson" => with_text(arg(0), |t| from_json(t, offset, self.budget))?,
             "hashfiles" => {
-                let patterns: Vec<String> = args.iter().map(to_string).collect();
+                let patterns: Vec<String> = args.iter().map(|a| to_string(a.scalar())).collect();
                 let hash = self
                     .funcs
                     .hash_files(&patterns)
@@ -440,27 +673,58 @@ impl Evaluator<'_> {
     }
 }
 
+/// `contains(search, item)`: an array holds an item loosely equal to
+/// `item`, or the text of `search` holds the text of `item`, ignoring
+/// case. An object holds nothing.
+fn contains(search: &Val<'_>, item: &Value) -> bool {
+    match search {
+        Val::Many(items) => items.iter().any(|v| loose_eq(v, item)),
+        Val::One(v) => match &**v {
+            Value::Array(items) => items.iter().any(|v| loose_eq(v, item)),
+            Value::Object(_) => false,
+            text => with_text(text, |hay| {
+                with_text(item, |needle| contains_folded(hay, needle))
+            }),
+        },
+    }
+}
+
 /// `join(array, sep)`: the items as text with `sep` (`,` by default)
 /// between them. Anything but an array is returned as text.
-fn join(args: &[Value], offset: usize, budget: &Budget) -> Result<String, ExprError> {
-    let Value::Array(items) = &args[0] else {
-        let len = text_len(&args[0]);
-        fits(len, "join", offset)?;
-        budget.charge(len, "join()", offset)?;
-        return Ok(to_string(&args[0]));
-    };
-    let sep = args.get(1).map_or_else(|| ",".to_owned(), to_string);
-    let len = items
-        .iter()
-        .map(text_len)
-        .fold(0usize, usize::saturating_add)
-        .saturating_add(sep.len().saturating_mul(items.len().saturating_sub(1)));
+fn join(args: &[Val<'_>], offset: usize, budget: &Budget) -> Result<String, ExprError> {
+    let sep = args
+        .get(1)
+        .map_or_else(|| ",".to_owned(), |a| to_string(a.scalar()));
+    match &args[0] {
+        Val::Many(items) => join_items(items.iter().map(|v| &**v), &sep, offset, budget),
+        Val::One(v) => match &**v {
+            Value::Array(items) => join_items(items.iter(), &sep, offset, budget),
+            other => {
+                let len = text_len(other);
+                fits(len, "join", offset)?;
+                budget.charge(len, "join()", offset)?;
+                Ok(to_string(other))
+            }
+        },
+    }
+}
+
+fn join_items<'v>(
+    items: impl Iterator<Item = &'v Value> + Clone,
+    sep: &str,
+    offset: usize,
+    budget: &Budget,
+) -> Result<String, ExprError> {
+    let (count, text) = items.clone().fold((0usize, 0usize), |(n, len), v| {
+        (n + 1, len.saturating_add(text_len(v)))
+    });
+    let len = text.saturating_add(sep.len().saturating_mul(count.saturating_sub(1)));
     fits(len, "join", offset)?;
     budget.charge(len, "join()", offset)?;
     let mut out = String::with_capacity(len);
-    for (i, item) in items.iter().enumerate() {
+    for (i, item) in items.enumerate() {
         if i > 0 {
-            out.push_str(&sep);
+            out.push_str(sep);
         }
         with_text(item, |t| out.push_str(t));
     }
@@ -468,7 +732,11 @@ fn join(args: &[Value], offset: usize, budget: &Budget) -> Result<String, ExprEr
 }
 
 /// `toJSON(value)`: the value as indented JSON.
-fn to_json(value: &Value, offset: usize, budget: &Budget) -> Result<String, ExprError> {
+fn to_json<T: serde::Serialize + ?Sized>(
+    value: &T,
+    offset: usize,
+    budget: &Budget,
+) -> Result<String, ExprError> {
     let mut count = Counter(0);
     if serde_json::to_writer_pretty(&mut count, value).is_err() {
         fits(count.0, "toJSON", offset)?;
@@ -480,7 +748,12 @@ fn to_json(value: &Value, offset: usize, budget: &Budget) -> Result<String, Expr
 /// `format(fmt, args...)`: `{N}` takes argument N, `{{` and `}}` are
 /// literal braces. The length is worked out first, then the string is
 /// made.
-fn format(fmt: &str, args: &[Value], offset: usize, budget: &Budget) -> Result<String, ExprError> {
+fn format(
+    fmt: &str,
+    args: &[Val<'_>],
+    offset: usize,
+    budget: &Budget,
+) -> Result<String, ExprError> {
     let mut len = 0usize;
     format_parts(fmt, args, offset, &mut |part| {
         len = len.saturating_add(part.len());
@@ -495,7 +768,7 @@ fn format(fmt: &str, args: &[Value], offset: usize, budget: &Budget) -> Result<S
 /// Passes each piece of a `format` result to `emit`, in order.
 fn format_parts(
     fmt: &str,
-    args: &[Value],
+    args: &[Val<'_>],
     offset: usize,
     emit: &mut dyn FnMut(&str),
 ) -> Result<(), ExprError> {
@@ -525,7 +798,7 @@ fn format_parts(
                     .ok_or_else(|| {
                         ExprError::new(format!("format: no argument for {{{digits}}}"), offset)
                     })?;
-                with_text(arg, |t| emit(t));
+                with_text(arg.scalar(), |t| emit(t));
             }
             '}' if chars.peek() == Some(&'}') => {
                 chars.next();
@@ -649,5 +922,46 @@ impl<'de> Visitor<'de> for Parse<'_> {
             out.insert(key, value);
         }
         Ok(out.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Strings whose upper case is longer, shorter or special, mixed
+    /// with ASCII.
+    const WORDS: &[&str] = &[
+        "", "a", "A", "ab", "AB", "abc", "ss", "SS", "ß", "aß", "ßa", "straße", "STRASSE", "é",
+        "É", "ﬁ", "FI", "ﬁx", "İ", "i", "ς", "Σ", "aaab", "aab", "abab", "ababab", "x", "ẞ",
+    ];
+
+    #[test]
+    fn folding_matches_to_uppercase() {
+        let fold = |s: &str| s.to_uppercase();
+        for x in WORDS {
+            for y in WORDS {
+                let (fx, fy) = (fold(x), fold(y));
+                assert_eq!(eq_folded(x, y), fx == fy, "{x:?} == {y:?}");
+                assert_eq!(cmp_folded(x, y), fx.cmp(&fy), "{x:?} cmp {y:?}");
+                assert_eq!(
+                    starts_folded(x, y),
+                    fx.starts_with(&fy),
+                    "{x:?} starts {y:?}"
+                );
+                assert_eq!(ends_folded(x, y), fx.ends_with(&fy), "{x:?} ends {y:?}");
+                assert_eq!(
+                    contains_folded(x, y),
+                    fx.contains(&fy),
+                    "{x:?} contains {y:?}"
+                );
+                let (xx, yy) = (format!("{x}{y}{x}"), format!("{y}{x}"));
+                assert_eq!(
+                    contains_folded(&xx, &yy),
+                    fold(&xx).contains(&fold(&yy)),
+                    "{xx:?} contains {yy:?}"
+                );
+            }
+        }
     }
 }
