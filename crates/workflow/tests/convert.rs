@@ -592,6 +592,118 @@ fn arm_labels_become_the_26_04_arm_template() {
 }
 
 #[test]
+fn third_party_labels_become_the_template_of_their_size() {
+    for (label, want, words) in [
+        (
+            "ubuntu-slim",
+            "ubuntu-latest",
+            "asks for 1 vCPUs, rounded up to 2",
+        ),
+        ("blacksmith-4vcpu-ubuntu-2404", "ubuntu-26.04-4core", ""),
+        ("blacksmith-2vcpu-ubuntu-2404-arm", "ubuntu-26.04-arm", ""),
+        ("buildjet-8vcpu-ubuntu-2204", "ubuntu-26.04-8core", ""),
+        (
+            "buildjet-4vcpu-ubuntu-2204-arm",
+            "ubuntu-26.04-4core-arm",
+            "",
+        ),
+        ("depot-ubuntu-24.04", "ubuntu-latest", ""),
+        ("depot-ubuntu-24.04-arm-8", "ubuntu-26.04-8core-arm", ""),
+        (
+            "namespace-profile-default-6x12",
+            "ubuntu-26.04-8core",
+            "asks for 6 vCPUs, rounded up to 8",
+        ),
+        ("namespace-profile-ci", "ubuntu-latest", ""),
+        ("ubicloud-standard-4", "ubuntu-26.04-4core", ""),
+        (
+            "ubicloud-standard-30-arm",
+            "ubuntu-26.04-16core-arm",
+            "asks for 30 vCPUs and the largest template has 16",
+        ),
+        ("warp-ubuntu-latest-x64-16x", "ubuntu-26.04-16core", ""),
+        ("warp-ubuntu-2404-arm64-2x", "ubuntu-26.04-arm", ""),
+    ] {
+        let out = ok(&format!(
+            "on: push\njobs:\n  b:\n    runs-on: {label}\n    steps: [{{ run: make }}]\n"
+        ));
+        assert_eq!(out.config.jobs["ci-b"].runs_on.as_deref(), Some(want));
+        assert!(
+            has(
+                &out.warnings,
+                &["`b`", &format!("`runs-on: {label}` became `{want}`"), words]
+            ),
+            "{label}: {:?}",
+            out.warnings
+        );
+        round_trips(&out);
+    }
+}
+
+#[test]
+fn runs_on_labels_maps_read_their_label_and_groups_are_errors() {
+    for runs_on in [
+        "{ labels: depot-ubuntu-24.04-4 }",
+        "{ labels: [depot-ubuntu-24.04-4] }",
+    ] {
+        let out = ok(&format!(
+            "on: push\njobs:\n  b:\n    runs-on: {runs_on}\n    steps: [{{ run: make }}]\n"
+        ));
+        assert_eq!(
+            out.config.jobs["ci-b"].runs_on.as_deref(),
+            Some("ubuntu-26.04-4core")
+        );
+        round_trips(&out);
+    }
+    for runs_on in [
+        "{ group: large }",
+        "{ group: large, labels: ubuntu-latest }",
+    ] {
+        let errs = one(
+            "ci.yml",
+            &format!(
+                "on: push\njobs:\n  b:\n    runs-on: {runs_on}\n    steps: [{{ run: make }}]\n"
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            has(
+                &errs,
+                &["`b`", "group: large", "runner groups are not supported"]
+            ),
+            "{errs:?}"
+        );
+    }
+    let errs = one(
+        "ci.yml",
+        "on: push\njobs:\n  b:\n    runs-on: { labels: [a, b] }\n    steps: [{ run: make }]\n",
+    )
+    .unwrap_err();
+    assert!(has(&errs, &["`b`", "names no runner template"]), "{errs:?}");
+}
+
+#[test]
+fn a_runs_on_matrix_maps_third_party_labels() {
+    let out = ok("on: push
+jobs:
+  t:
+    runs-on: ${{ matrix.os }}
+    strategy: { matrix: { os: [blacksmith-4vcpu-ubuntu-2404, windows-latest] } }
+    steps: [{ run: make }]
+");
+    assert_eq!(out.errors, Vec::new());
+    assert_eq!(
+        out.config.jobs["ci-t"].runs_on.as_deref(),
+        Some("ubuntu-26.04-4core")
+    );
+    assert!(has(
+        &out.warnings,
+        &["`runs-on: blacksmith-4vcpu-ubuntu-2404` became `ubuntu-26.04-4core`"]
+    ));
+    round_trips(&out);
+}
+
+#[test]
 fn a_job_that_reads_strategy_or_jobs_is_dropped() {
     // hatchrun provides neither context, so validate would reject the
     // job; convert leaves it out instead and its output validates.
