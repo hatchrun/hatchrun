@@ -4,9 +4,6 @@
 
 //! Workflow commands: `::name key=value::message` lines a step prints.
 
-// Steps are not wired to the parser yet.
-#![allow(dead_code)]
-
 use hatchrun_workflow::{Annotation, AnnotationLevel};
 
 /// A workflow command found in a line of step output.

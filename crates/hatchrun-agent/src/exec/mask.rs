@@ -4,9 +4,6 @@
 
 //! Secret masking for step output.
 
-// Steps are not wired to the masker yet.
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::OnceLock;

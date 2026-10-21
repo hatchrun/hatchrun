@@ -109,6 +109,9 @@ enum Command {
         /// Where to write the job result, as JSON.
         #[arg(long)]
         result: Option<PathBuf>,
+        /// How long one `timeout-minutes` minute lasts. Tests shorten it.
+        #[arg(long, default_value = "60s", value_parser = humantime::parse_duration, hide = true)]
+        minute: Duration,
     },
 }
 
@@ -130,6 +133,7 @@ async fn main() -> ExitCode {
         node,
         store,
         result,
+        minute,
     }) = &args.command
     {
         let opts = exec::Options {
@@ -139,6 +143,7 @@ async fn main() -> ExitCode {
             node: node.clone(),
             store: store.clone(),
             tool_cache: PathBuf::from("/opt/hostedtoolcache"),
+            minute: *minute,
         };
         return exec_command(job_file, &opts, result.as_deref()).await;
     }

@@ -4,9 +4,6 @@
 
 //! Where a running job's output goes.
 
-// Steps start emitting once `run_job` walks them.
-#![allow(dead_code)]
-
 use std::io::Write;
 
 use hatchrun_workflow::{Annotation, AnnotationLevel, StepSummary};

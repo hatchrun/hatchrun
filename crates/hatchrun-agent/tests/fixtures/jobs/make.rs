@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use hatchrun_workflow::{
-    CacheService, Github, JobDocument, JobKind, PlannedJob, PlannedStep, template,
+    CacheService, Github, JobDocument, JobKind, PlannedJob, PlannedStep, RunStep, template,
 };
 use serde_json::json;
 
@@ -65,4 +65,22 @@ pub fn approval() -> JobDocument {
     let mut doc = document(Vec::new());
     doc.job.kind = JobKind::Approval;
     doc
+}
+
+/// A `run:` step running `script`.
+pub fn run(script: &str) -> RunStep {
+    RunStep {
+        run: script.to_owned(),
+        ..RunStep::default()
+    }
+}
+
+/// `run(script)` as a planned step.
+pub fn step(script: &str) -> PlannedStep {
+    PlannedStep::Run(run(script))
+}
+
+/// A planned step from a customised [`RunStep`].
+pub fn planned(step: RunStep) -> PlannedStep {
+    PlannedStep::Run(step)
 }

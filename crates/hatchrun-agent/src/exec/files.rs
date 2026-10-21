@@ -5,9 +5,6 @@
 //! The files a step writes to: `GITHUB_ENV`, `GITHUB_OUTPUT`,
 //! `GITHUB_STATE`, `GITHUB_PATH` and `GITHUB_STEP_SUMMARY`.
 
-// Steps are not wired to the file reader yet.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
@@ -150,7 +147,13 @@ fn read_capped(path: &Path, cap: usize) -> Result<(String, bool), FileError> {
         line: None,
         message,
     };
-    let file = File::open(path).map_err(|e| err(format!("cannot open: {e}")))?;
+    let file = match File::open(path) {
+        Ok(file) => file,
+        // A step may delete a file command file. That is the same as
+        // writing nothing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((String::new(), false)),
+        Err(e) => return Err(err(format!("cannot open: {e}"))),
+    };
     let mut bytes = Vec::new();
     // One byte past the cap is enough to know the file is too big, and
     // keeps a runaway step from filling memory.
@@ -244,6 +247,16 @@ mod tests {
 
     fn pair(k: &str, v: &str) -> (String, String) {
         (k.to_owned(), v.to_owned())
+    }
+
+    #[test]
+    fn a_deleted_file_is_empty() {
+        let (_dir, files) = files_with("A=1\n");
+        fs::remove_file(&files.output).unwrap();
+        fs::remove_file(&files.summary).unwrap();
+        let written = read(&files).unwrap();
+        assert_eq!(written.env, [pair("A", "1")]);
+        assert_eq!(written.outputs, Vec::new());
     }
 
     #[test]

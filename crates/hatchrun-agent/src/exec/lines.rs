@@ -4,9 +4,6 @@
 
 //! Splits a byte stream into output lines.
 
-// Steps are not wired to the splitter yet.
-#![allow(dead_code)]
-
 use super::mask::Masker;
 
 /// The longest line, in bytes, handed on. Longer lines are cut.
@@ -23,6 +20,7 @@ impl Lines {
     /// Adds bytes and returns every line they complete. A line ends at
     /// `\n` (a preceding `\r` is dropped) or when it reaches
     /// [`MAX_LINE`] bytes. A multi-byte character is never cut.
+    #[cfg(test)]
     pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
         self.buf.extend_from_slice(bytes);
         self.drain(None, false)
@@ -36,6 +34,7 @@ impl Lines {
     }
 
     /// Returns the unfinished last line, if there is one.
+    #[cfg(test)]
     pub fn finish(self) -> Option<String> {
         if self.buf.is_empty() {
             None
