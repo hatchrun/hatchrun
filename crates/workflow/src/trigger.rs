@@ -15,27 +15,24 @@ use crate::config::Parameter;
 
 /// Ordered GitHub filter patterns. A leading `!` negates a pattern.
 ///
-/// In YAML it is a list of strings or a single string. Each pattern is
-/// compiled once, when the filter is made.
+/// In YAML it is a list of strings or a single string. A pattern that
+/// is plain text, text then `**`, or `**` then text is matched as text;
+/// that shape is worked out when the filter is made and costs a byte per
+/// pattern. Any other pattern is compiled when it is matched, so a large
+/// filter takes no more memory than its text.
 #[derive(Clone, Default)]
 pub struct Filter {
     patterns: Vec<String>,
-    /// Each pattern, compiled: whether it is negated, and its glob.
-    compiled: Vec<(bool, Glob)>,
+    /// The shape of each pattern.
+    shapes: Vec<Shape>,
 }
 
 impl Filter {
     /// A filter from patterns in the order they apply.
     #[must_use]
     pub fn new(patterns: Vec<String>) -> Self {
-        let compiled = patterns
-            .iter()
-            .map(|pattern| match pattern.strip_prefix('!') {
-                Some(rest) => (true, Glob::new(rest)),
-                None => (false, Glob::new(pattern)),
-            })
-            .collect();
-        Self { patterns, compiled }
+        let shapes = patterns.iter().map(|p| Shape::of(body(p))).collect();
+        Self { patterns, shapes }
     }
 
     /// The patterns in the order they apply.
@@ -54,33 +51,105 @@ impl Filter {
         self.matches_in(value, &mut Scratch::default())
     }
 
-    /// [`Filter::matches`], with buffers kept between calls.
+    /// [`Filter::matches`], with buffers and compiled patterns kept
+    /// between calls.
     fn matches_in(&self, value: &str, scratch: &mut Scratch) -> bool {
         let mut split = false;
         // The last pattern that matches decides, so look from the end.
-        self.compiled
-            .iter()
+        (0..self.patterns.len())
             .rev()
-            .find(|(_, glob)| match glob {
-                Glob::Literal(text) => text == value,
-                Glob::Prefix(text) => value.starts_with(text.as_str()),
-                Glob::Suffix(text) => value.ends_with(text.as_str()),
-                Glob::Tokens(toks) => {
-                    if !split {
-                        scratch.chars.clear();
-                        scratch.chars.extend(value.chars());
-                        split = true;
+            .find(|&i| {
+                let text = body(&self.patterns[i]);
+                match self.shapes[i] {
+                    Shape::Literal => text == value,
+                    Shape::Prefix => value.starts_with(&text[..text.len() - 2]),
+                    Shape::Suffix => value.ends_with(&text[2..]),
+                    Shape::Glob => {
+                        if !split {
+                            scratch.buffers.chars.clear();
+                            scratch.buffers.chars.extend(value.chars());
+                            split = true;
+                        }
+                        scratch.glob(i, text)
                     }
-                    glob_matches(toks, scratch)
                 }
             })
-            .is_some_and(|(negated, _)| !negated)
+            .is_some_and(|i| !self.patterns[i].starts_with('!'))
     }
 }
 
-/// Buffers for matching: the value's characters and two position sets.
+/// A pattern without its leading `!`.
+fn body(pattern: &str) -> &str {
+    pattern.strip_prefix('!').unwrap_or(pattern)
+}
+
+/// How a pattern is matched.
+#[derive(Debug, Clone, Copy)]
+enum Shape {
+    /// No wildcard, class, repeat or escape: only the text matches.
+    Literal,
+    /// Such text then `**`: what starts with the text matches.
+    Prefix,
+    /// `**` then such text: what ends with the text matches.
+    Suffix,
+    /// Anything else, compiled to tokens when matched.
+    Glob,
+}
+
+impl Shape {
+    fn of(pattern: &str) -> Self {
+        let plain = |t: &str| !t.contains(['*', '?', '+', '[', '\\']);
+        if plain(pattern) {
+            Shape::Literal
+        } else if let Some(text) = pattern.strip_suffix("**")
+            && plain(text)
+        {
+            Shape::Prefix
+        } else if let Some(text) = pattern.strip_prefix("**")
+            && plain(text)
+        {
+            Shape::Suffix
+        } else {
+            Shape::Glob
+        }
+    }
+}
+
+/// The most tokens one matching call keeps compiled, about 128 KiB.
+/// Past it, patterns are compiled again for each value.
+const CACHED_TOKENS: usize = 4096;
+
+/// What matching keeps between values: buffers, and the patterns
+/// compiled so far while they fit [`CACHED_TOKENS`].
 #[derive(Default)]
 struct Scratch {
+    buffers: Buffers,
+    compiled: Vec<Option<Vec<Tok>>>,
+    cached: usize,
+}
+
+impl Scratch {
+    /// Whether `buffers.chars` matches pattern `i`, whose text is `text`.
+    fn glob(&mut self, i: usize, text: &str) -> bool {
+        if let Some(Some(toks)) = self.compiled.get(i) {
+            return glob_matches(toks, &mut self.buffers);
+        }
+        let toks = compile(text);
+        let matched = glob_matches(&toks, &mut self.buffers);
+        if self.cached + toks.len() <= CACHED_TOKENS {
+            self.cached += toks.len();
+            if self.compiled.len() <= i {
+                self.compiled.resize_with(i + 1, || None);
+            }
+            self.compiled[i] = Some(toks);
+        }
+        matched
+    }
+}
+
+/// The value's characters and two position sets.
+#[derive(Default)]
+struct Buffers {
     chars: Vec<char>,
     at: Vec<bool>,
     next: Vec<bool>,
@@ -100,50 +169,8 @@ impl fmt::Debug for Filter {
     }
 }
 
-/// A compiled pattern.
-#[derive(Debug, Clone)]
-enum Glob {
-    /// A pattern with no wildcard, class or repeat: only this text
-    /// matches.
-    Literal(String),
-    /// Text then `**`: what starts with the text matches.
-    Prefix(String),
-    /// `**` then text: what ends with the text matches.
-    Suffix(String),
-    /// Anything else.
-    Tokens(Vec<Tok>),
-}
-
-impl Glob {
-    fn new(pattern: &str) -> Self {
-        let toks = compile(pattern);
-        let text = |toks: &[Tok]| -> Option<String> {
-            toks.iter()
-                .map(|t| match t {
-                    Tok::Lit(c) => Some(*c),
-                    _ => None,
-                })
-                .collect()
-        };
-        if let Some(lit) = text(&toks) {
-            return Glob::Literal(lit);
-        }
-        if let Some((Tok::StarStar, rest)) = toks.split_last()
-            && let Some(lit) = text(rest)
-        {
-            return Glob::Prefix(lit);
-        }
-        if let Some((Tok::StarStar, rest)) = toks.split_first()
-            && let Some(lit) = text(rest)
-        {
-            return Glob::Suffix(lit);
-        }
-        Glob::Tokens(toks)
-    }
-}
-
 /// One element of a compiled pattern.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum Tok {
     /// A literal character.
     Lit(char),
@@ -245,11 +272,11 @@ fn class(chars: &[char], start: usize) -> Option<(Tok, usize)> {
     }
 }
 
-/// Whether the whole of `scratch.chars` matches the tokens. Tracks the
+/// Whether the whole of `buffers.chars` matches the tokens. Tracks the
 /// set of reachable positions, so the cost stays polynomial for any
 /// pattern.
-fn glob_matches(toks: &[Tok], scratch: &mut Scratch) -> bool {
-    let Scratch { chars, at, next } = scratch;
+fn glob_matches(toks: &[Tok], buffers: &mut Buffers) -> bool {
+    let Buffers { chars, at, next } = buffers;
     let value = &chars[..];
     let n = value.len();
     at.clear();
@@ -652,6 +679,8 @@ mod tests {
                 None => (false, pattern.as_str()),
             };
             let toks = compile(body);
+            // One scratch across values, as paths_pass keeps it.
+            let mut scratch = Scratch::default();
             for value in &values {
                 let chars: Vec<char> = value.chars().collect();
                 let want = if reference(&toks, &chars) {
@@ -660,6 +689,11 @@ mod tests {
                     value == "x"
                 };
                 assert_eq!(filter.matches(value), want, "{pattern:?} on {value:?}");
+                assert_eq!(
+                    filter.matches_in(value, &mut scratch),
+                    want,
+                    "{pattern:?} on {value:?}, kept scratch"
+                );
             }
         }
     }

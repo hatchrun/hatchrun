@@ -19,7 +19,7 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::config::{
-    Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow, WorkflowJob,
+    Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow, WorkflowJob, too_big,
     yaml_options,
 };
 use crate::diagnostic::Diagnostic;
@@ -49,9 +49,10 @@ pub struct Conversion {
 /// already uses, a read of the `strategy` or `jobs` context) is dropped,
 /// like a reusable workflow call. Every job that needs a dropped job,
 /// directly or through others, is dropped too, with a warning naming the
-/// chain of jobs it needed. A file that does not parse, has no name
-/// before its extension or repeats another file's name is skipped. Each
-/// problem is in [`Conversion::errors`].
+/// chain of jobs it needed. A file over [`MAX_SOURCE`](crate::MAX_SOURCE)
+/// bytes, one that does not parse, has no name before its extension or
+/// repeats another file's name is skipped. Each problem is in
+/// [`Conversion::errors`].
 ///
 /// # Errors
 ///
@@ -71,6 +72,11 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
             cx.errors.push(Diagnostic::new(format!(
                 "`{other}` and `{file}` both become workflow `{stem}`; rename one of them"
             )));
+            continue;
+        }
+        if let Some(mut diag) = too_big(&format!("`{file}`"), source) {
+            diag.file = Some(file.clone());
+            cx.errors.push(diag);
             continue;
         }
         match serde_saphyr::from_str_with_options::<GhWorkflow>(source, yaml_options()) {

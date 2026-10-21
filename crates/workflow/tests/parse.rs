@@ -4,7 +4,7 @@
 
 //! Parsing `.hatchrun/config.yml`.
 
-use hatchrun_workflow::{ParameterKind, Step, WorkspaceStep, parse};
+use hatchrun_workflow::{MAX_SOURCE, ParameterKind, Step, WorkspaceStep, parse};
 
 #[test]
 fn parses_the_spec_example() {
@@ -183,4 +183,19 @@ fn reads_a_long_run_of_comments() {
         format!("jobs:\n{comments}  t:\n    runs-on: ubuntu-latest\n    steps: [{{ run: a }}]\n");
     let config = parse(&source).unwrap();
     assert_eq!(config.jobs["t"].steps.len(), 1);
+}
+
+#[test]
+fn a_config_over_one_mebibyte_is_an_error() {
+    let mut yaml = String::from("jobs: {}\n");
+    yaml.push_str(&"# padding\n".repeat(MAX_SOURCE / 10 + 1));
+    let errors = parse(&yaml).unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].message,
+        format!("the config is {} bytes; the limit is 1048576", yaml.len())
+    );
+    // At the limit it parses.
+    yaml.truncate(MAX_SOURCE);
+    parse(&yaml).unwrap();
 }

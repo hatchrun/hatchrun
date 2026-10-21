@@ -915,3 +915,28 @@ jobs:
     assert_eq!(run.shell.as_deref(), Some("bash"));
     round_trips(&out);
 }
+
+#[test]
+fn a_file_over_one_mebibyte_is_skipped() {
+    let big = format!(
+        "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: x\n{}",
+        "# padding\n".repeat(110_000)
+    );
+    let errors = one("big.yml", &big).unwrap_err();
+    assert!(
+        has(&errors, &["`big.yml` is", "bytes; the limit is 1048576"]),
+        "{errors:?}"
+    );
+    assert_eq!(errors[0].file.as_deref(), Some("big.yml"));
+    let out = convert(&[
+        ("big.yml".into(), big),
+        (
+            "ci.yml".into(),
+            "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: x\n"
+                .into(),
+        ),
+    ])
+    .unwrap();
+    assert!(out.config.workflows.contains_key("ci"));
+    assert!(!out.config.workflows.contains_key("big"));
+}

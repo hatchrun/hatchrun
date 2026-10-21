@@ -22,10 +22,29 @@ use crate::trigger::{Filter, Triggers};
 ///
 /// # Errors
 ///
-/// Returns the problems found, each with its line and column when known.
+/// Returns the problems found, each with its line and column when known,
+/// or one problem when the file is over [`MAX_SOURCE`] bytes.
 pub fn parse(source: &str) -> Result<Config, Vec<Diagnostic>> {
+    if let Some(too_big) = too_big("the config", source) {
+        return Err(vec![too_big]);
+    }
     serde_saphyr::from_str_with_options(source, yaml_options())
         .map_err(|err| vec![Diagnostic::from(&err)])
+}
+
+/// The largest file, in bytes, that [`parse`] and
+/// [`convert`](crate::convert) read. It keeps a parsed config, and the
+/// work done on each webhook, small.
+pub const MAX_SOURCE: usize = 1 << 20;
+
+/// An error when `source` is over [`MAX_SOURCE`]; `what` names it.
+pub(crate) fn too_big(what: &str, source: &str) -> Option<Diagnostic> {
+    (source.len() > MAX_SOURCE).then(|| {
+        Diagnostic::new(format!(
+            "{what} is {} bytes; the limit is {MAX_SOURCE}",
+            source.len()
+        ))
+    })
 }
 
 /// How workflow YAML is read. Only YAML 1.2 booleans count: `y`, `yes`,
