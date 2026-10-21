@@ -785,7 +785,7 @@ jobs:
 }
 
 #[test]
-fn a_runs_on_matrix_keeps_old_ubuntu_values_as_written() {
+fn a_runs_on_matrix_keeps_one_leg_per_template() {
     let out = ok("on: push
 jobs:
   test:
@@ -798,9 +798,11 @@ jobs:
         out.config.jobs["ci-test"].runs_on.as_deref(),
         Some("ubuntu-latest")
     );
+    // `ubuntu-26.04` runs on the template `ubuntu-22.04` became, so its
+    // leg would repeat the first one; the first value is kept as written.
     assert_eq!(
         out.config.workflows["ci"].jobs[0].matrix["os"],
-        [json!("ubuntu-22.04"), json!("ubuntu-26.04")]
+        [json!("ubuntu-22.04")]
     );
     assert!(
         has(
@@ -810,7 +812,58 @@ jobs:
         "{:?}",
         out.warnings
     );
+    assert!(
+        has(
+            &out.warnings,
+            &[
+                "matrix key `os` values `ubuntu-26.04` (same runner as `ubuntu-22.04`) were dropped",
+                "same runner template",
+            ]
+        ),
+        "{:?}",
+        out.warnings
+    );
     round_trips(&out);
+    let plan = hatchrun_workflow::compile(
+        &parse(&to_yaml(&out.config)).unwrap(),
+        "ci",
+        "refs/heads/main",
+    )
+    .unwrap();
+    assert_eq!(plan.jobs.len(), 1);
+}
+
+#[test]
+fn a_runs_on_matrix_with_latest_and_a_version_plans_one_leg() {
+    let out = ok("on: push
+jobs:
+  a:
+    runs-on: ${{ matrix.os }}
+    strategy: { matrix: { os: [ubuntu-latest, ubuntu-24.04, macos-latest], node: [20, 22] } }
+    steps:
+      - run: echo ${{ matrix.os }}
+");
+    assert_eq!(out.errors, Vec::new());
+    assert_eq!(
+        out.config.workflows["ci"].jobs[0].matrix["os"],
+        [json!("ubuntu-latest")]
+    );
+    assert!(has(
+        &out.warnings,
+        &["`ubuntu-24.04` (same runner as `ubuntu-latest`)"]
+    ));
+    assert!(has(
+        &out.warnings,
+        &["`macos-latest`", "no runner template"]
+    ));
+    round_trips(&out);
+    let plan = hatchrun_workflow::compile(
+        &parse(&to_yaml(&out.config)).unwrap(),
+        "ci",
+        "refs/heads/main",
+    )
+    .unwrap();
+    assert_eq!(plan.jobs.len(), 2);
 }
 
 #[test]

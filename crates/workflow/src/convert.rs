@@ -693,7 +693,8 @@ impl Cx {
     }
 
     /// Resolves `runs-on: ${{ matrix.KEY }}`, keeping in `values` only
-    /// the legs that run on the one template found.
+    /// the legs that run on the one template found, and of those only
+    /// the first value for each template.
     fn matrix_runs_on(
         &mut self,
         at: &str,
@@ -702,17 +703,23 @@ impl Cx {
         values: &mut Vec<Value>,
     ) -> Option<String> {
         let mut found: Vec<&'static str> = Vec::new();
+        let mut kept: Vec<String> = Vec::new();
         let mut dropped = Vec::new();
+        let mut duplicates = Vec::new();
         values.retain(|value| {
             let Some(new) = value.as_str().and_then(runner_label) else {
                 dropped.push(format!("`{}`", show(value)));
                 return false;
             };
             // Two labels of one template, such as `ubuntu-latest` and
-            // `ubuntu-26.04`, are one runner.
-            if !found.iter().any(|f| template(f) == template(new)) {
-                found.push(new);
+            // `ubuntu-24.04`, are one runner: the second leg would run
+            // the same job again.
+            if let Some(i) = found.iter().position(|f| template(f) == template(new)) {
+                duplicates.push(format!("`{}` (same runner as `{}`)", show(value), kept[i]));
+                return false;
             }
+            found.push(new);
+            kept.push(show(value));
             true
         });
         let new = match found.as_slice() {
@@ -737,6 +744,12 @@ impl Cx {
             self.warn(format!(
                 "{at}: matrix key `{key}` values {} name no runner template and were dropped; hatchrun runs Linux only",
                 dropped.join(", ")
+            ));
+        }
+        if !duplicates.is_empty() {
+            self.warn(format!(
+                "{at}: matrix key `{key}` values {} were dropped: each runs on the same runner template as an earlier value, so its legs would repeat that value's jobs",
+                duplicates.join(", ")
             ));
         }
         for value in values.iter().filter_map(Value::as_str) {
