@@ -4,6 +4,8 @@
 
 //! Converting GitHub Actions workflows into a hatchrun config.
 
+use std::fmt::Write as _;
+
 use hatchrun_workflow::{
     Conversion, Diagnostic, Filter, ParameterKind, Step, convert, parse, to_yaml, validate,
 };
@@ -1036,4 +1038,58 @@ jobs:
     assert!(has(&out.errors, &["job `d`", "no closing", "dropped"]));
     assert_eq!(out.config.jobs.keys().collect::<Vec<_>>(), ["ci-ok"]);
     round_trips(&out);
+}
+
+/// A GitHub workflow with `jobs` jobs, each with a run step of `pad`
+/// bytes.
+fn workflow_with(jobs: usize, pad: usize) -> String {
+    let mut y = String::from("on: push\njobs:\n");
+    for j in 0..jobs {
+        write!(
+            y,
+            "  j{j}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo {}\n",
+            "x".repeat(pad)
+        )
+        .unwrap();
+    }
+    y
+}
+
+#[test]
+fn a_workflow_over_the_job_limit_is_an_error() {
+    let out = ok(&workflow_with(257, 1));
+    assert!(
+        has(
+            &out.errors,
+            &["workflow `ci` plans more than 256 jobs; the limit is 256"]
+        ),
+        "{:?}",
+        out.errors
+    );
+    let at_limit = ok(&workflow_with(256, 1));
+    assert_eq!(at_limit.errors, Vec::new());
+    round_trips(&at_limit);
+}
+
+#[test]
+fn a_converted_config_over_one_mebibyte_is_an_error() {
+    // Six files of about 192 KB: each is under the limit, together the
+    // written config is not.
+    let files: Vec<(String, String)> = (0..6)
+        .map(|i| (format!("w{i}.yml"), workflow_with(48, 4000)))
+        .collect();
+    assert!(files.iter().all(|(_, f)| f.len() < 200_000));
+    let out = convert(&files).unwrap();
+    let written = to_yaml(&out.config).len();
+    assert!(written > 1 << 20);
+    assert!(
+        has(
+            &out.errors,
+            &[&format!(
+                "the converted config is {written} bytes; the limit is 1048576"
+            )]
+        ),
+        "{:?}",
+        out.errors
+    );
 }

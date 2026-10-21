@@ -1066,6 +1066,41 @@ fn copy_job(
     Some(out)
 }
 
+/// The jobs a workflow plans at most: each entry's matrix size times
+/// its job's parallelism, and one per approval. An entry whose job is
+/// missing counts as one.
+pub(crate) fn planned_jobs(config: &Config, wf: &Workflow) -> usize {
+    wf.jobs
+        .iter()
+        .map(|entry| {
+            let size = entry
+                .matrix
+                .values()
+                .fold(1usize, |n, values| n.saturating_mul(values.len()));
+            let nodes = config
+                .jobs
+                .get(&entry.job)
+                .and_then(|job| job.parallelism)
+                .unwrap_or(1);
+            if entry.approval {
+                1
+            } else {
+                size.saturating_mul(nodes as usize)
+            }
+        })
+        .fold(0, usize::saturating_add)
+}
+
+/// The message for a workflow that plans more than `MAX_JOBS` jobs.
+pub(crate) fn too_many_jobs(workflow: &str) -> String {
+    format!("workflow `{workflow}` plans more than {MAX_JOBS} jobs; the limit is {MAX_JOBS}")
+}
+
+/// Whether a workflow plans more than `MAX_JOBS` jobs.
+pub(crate) fn over_job_limit(config: &Config, wf: &Workflow) -> bool {
+    planned_jobs(config, wf) > MAX_JOBS
+}
+
 /// Counts `count` more jobs into the plan, or reports that the plan
 /// would hold more than `MAX_JOBS`.
 fn reserve_jobs(
@@ -1076,9 +1111,7 @@ fn reserve_jobs(
 ) -> bool {
     *planned = planned.saturating_add(count);
     if *planned > MAX_JOBS {
-        errors.push(Diagnostic::new(format!(
-            "workflow `{workflow}` plans more than {MAX_JOBS} jobs; the limit is {MAX_JOBS}"
-        )));
+        errors.push(Diagnostic::new(too_many_jobs(workflow)));
         return false;
     }
     true

@@ -19,11 +19,12 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::config::{
-    Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow, WorkflowJob, too_big,
-    yaml_options,
+    Config, Job, MAX_SOURCE, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow,
+    WorkflowJob, too_big, yaml_options,
 };
 use crate::diagnostic::Diagnostic;
 use crate::expr::{self, ExprError};
+use crate::plan;
 use crate::templates::{template, template_labels};
 use crate::trigger::{Dispatch, PullRequestTrigger, PushTrigger, Schedule, Triggers};
 
@@ -90,6 +91,19 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
     }
     if !cx.errors.is_empty() && cx.config.workflows.is_empty() {
         return Err(cx.errors);
+    }
+    // validate refuses these, so they are errors here, not a file that
+    // only fails later.
+    for (name, wf) in &cx.config.workflows {
+        if plan::over_job_limit(&cx.config, wf) {
+            cx.errors.push(Diagnostic::new(plan::too_many_jobs(name)));
+        }
+    }
+    let written = to_yaml(&cx.config).len();
+    if written > MAX_SOURCE {
+        cx.errors.push(Diagnostic::new(format!(
+            "the converted config is {written} bytes; the limit is {MAX_SOURCE}"
+        )));
     }
     Ok(Conversion {
         config: cx.config,

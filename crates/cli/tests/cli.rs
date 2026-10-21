@@ -4,6 +4,7 @@
 
 //! Runs the `hatchrun` binary end to end.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -148,4 +149,28 @@ fn convert_creates_the_output_directory() {
         .current_dir(&dir));
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(dir.join(".hatchrun/config.yml").is_file());
+}
+
+#[test]
+fn convert_fails_on_what_validate_would_refuse() {
+    let mut many = String::from("on: push\njobs:\n");
+    for j in 0..257 {
+        write!(
+            many,
+            "  j{j}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: x\n"
+        )
+        .unwrap();
+    }
+    let src = scratch("many.yml");
+    std::fs::write(&src, many).unwrap();
+    let dest = scratch("many-out.yml");
+    let out = run(hatchrun().arg("convert").arg(&src).arg("-o").arg(&dest));
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("workflow `many` plans more than 256 jobs; the limit is 256"),
+        "{stderr}"
+    );
+    let out = run(hatchrun().arg("validate").arg(&dest));
+    assert_eq!(out.status.code(), Some(1));
 }
