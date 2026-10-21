@@ -1313,3 +1313,80 @@ jobs:
     );
     assert!(!out.config.jobs.contains_key("ci-deploy"));
 }
+
+#[test]
+fn workflows_with_no_events_left_are_dropped() {
+    let out = convert(&[
+        (
+            "triage.yml".into(),
+            "
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+jobs:
+  label: { runs-on: windows-latest, steps: [{ run: x }] }
+"
+            .into(),
+        ),
+        (
+            "ci.yml".into(),
+            "on: push\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n".into(),
+        ),
+    ])
+    .unwrap();
+    assert!(has(
+        &out.warnings,
+        &[
+            "triage.yml",
+            "dropped",
+            "`issues`",
+            "`issue_comment`",
+            "GitHub Actions"
+        ]
+    ));
+    // One warning for the file, none per event, and its jobs are not
+    // converted, so the Windows runner is not an error.
+    assert_eq!(
+        out.warnings
+            .iter()
+            .filter(|w| w.message.contains("triage.yml"))
+            .count(),
+        1,
+        "{:?}",
+        out.warnings
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert!(!out.config.workflows.contains_key("triage"));
+    assert!(!out.config.jobs.contains_key("triage-label"));
+    assert!(out.config.workflows.contains_key("ci"));
+    round_trips(&out);
+}
+
+#[test]
+fn reusable_workflow_files_are_dropped() {
+    let out = ok("
+on:
+  workflow_call:
+    inputs:
+      target: { type: string }
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert!(has(
+        &out.warnings,
+        &["ci.yml", "reusable workflow", "workflow_call"]
+    ));
+    assert!(out.config.workflows.is_empty());
+    assert!(out.config.jobs.is_empty());
+}
+
+#[test]
+fn a_workflow_whose_events_all_fail_is_dropped() {
+    let out = one(
+        "ci.yml",
+        "on:\n  push:\n    branches: 3\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+    )
+    .unwrap_err();
+    assert!(has(&out, &["ci.yml", "on.push"]), "{out:?}");
+}

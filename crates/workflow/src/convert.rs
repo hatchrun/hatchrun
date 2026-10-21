@@ -55,7 +55,9 @@ pub struct Conversion {
 /// chain of jobs it needed. A file over [`MAX_SOURCE`](crate::MAX_SOURCE)
 /// bytes, one that does not parse, has no name before its extension or
 /// repeats another file's name is skipped. Each problem is in
-/// [`Conversion::errors`].
+/// [`Conversion::errors`]. A workflow left with no event hatchrun runs
+/// on, such as one that runs only on `issues`, is dropped with its jobs
+/// and a warning.
 ///
 /// # Errors
 ///
@@ -357,8 +359,10 @@ impl Cx {
         for key in gh.unknown.keys() {
             self.warn(format!("`{file}`: unknown key `{key}` was dropped"));
         }
+        let Some(on) = self.kept_triggers(file, &gh.on) else {
+            return;
+        };
         let permissions = self.permissions(&format!("`{file}`"), gh.permissions.as_ref(), false);
-        let on = self.triggers(file, &gh.on);
         let shared_env = self.env(&format!("`{file}`"), "env", gh.env.as_ref());
         let shared_defaults = self.defaults(&format!("`{file}`"), gh.defaults.as_ref());
 
@@ -496,18 +500,40 @@ impl Cx {
         }
     }
 
+    /// Converts `on:` and warns about the events dropped. Returns `None`
+    /// for a workflow left with no event, which is dropped with a warning.
+    fn kept_triggers(&mut self, file: &str, on: &Value) -> Option<Triggers> {
+        let (triggers, unsupported) = self.triggers(file, on);
+        if triggers == Triggers::default() {
+            self.no_events(file, &unsupported);
+            return None;
+        }
+        for event in unsupported {
+            self.warn(format!(
+                "`{file}`: `on.{event}` is not supported and was dropped; hatchrun runs on {EVENTS}"
+            ));
+        }
+        Some(triggers)
+    }
+
     /// Converts `on:`, which GitHub accepts as an event name, a list of
-    /// names or a map of events to their filters.
-    fn triggers(&mut self, file: &str, on: &Value) -> Triggers {
+    /// names or a map of events to their filters. Returns the events
+    /// hatchrun does not run on too, so the caller can tell a workflow
+    /// that keeps some events from one left with none.
+    fn triggers(&mut self, file: &str, on: &Value) -> (Triggers, Vec<String>) {
         let mut triggers = Triggers::default();
+        let mut unsupported = Vec::new();
+        let mut event = |cx: &mut Self, name: &str, body: &Value| {
+            if !cx.event(file, name, body, &mut triggers) {
+                unsupported.push(name.to_owned());
+            }
+        };
         match on {
-            Value::String(event) => self.event(file, event, &Value::Null, &mut triggers),
+            Value::String(name) => event(self, name, &Value::Null),
             Value::Array(events) => {
-                for event in events {
-                    match event {
-                        Value::String(event) => {
-                            self.event(file, event, &Value::Null, &mut triggers);
-                        }
+                for name in events {
+                    match name {
+                        Value::String(name) => event(self, name, &Value::Null),
                         other => self.error(format!(
                             "`{file}`: `on` lists `{other}`, which is not an event name"
                         )),
@@ -515,18 +541,20 @@ impl Cx {
                 }
             }
             Value::Object(events) => {
-                for (event, body) in events {
-                    self.event(file, event, body, &mut triggers);
+                for (name, body) in events {
+                    event(self, name, body);
                 }
             }
             other => self.error(format!(
                 "`{file}`: `on` is `{other}`; it must be an event name, a list or a map"
             )),
         }
-        triggers
+        (triggers, unsupported)
     }
 
-    fn event(&mut self, file: &str, event: &str, body: &Value, triggers: &mut Triggers) {
+    /// Converts one event into `triggers`. Returns false when hatchrun
+    /// does not run on it.
+    fn event(&mut self, file: &str, event: &str, body: &Value, triggers: &mut Triggers) -> bool {
         let bad = |err: serde_json::Error| format!("`{file}`: `on.{event}`: {err}");
         match event {
             "push" => match Option::<PushTrigger>::deserialize(body) {
@@ -544,10 +572,34 @@ impl Cx {
             "workflow_dispatch" => {
                 triggers.workflow_dispatch = Some(self.dispatch(file, body));
             }
-            other => self.warn(format!(
-                "`{file}`: `on.{other}` is not supported and was dropped; hatchrun runs on {EVENTS}"
-            )),
+            _ => return false,
         }
+        true
+    }
+
+    /// Reports a workflow left with no event to run on, which is dropped
+    /// with its jobs: they could never start. `unsupported` names the
+    /// events it had that hatchrun does not run on.
+    fn no_events(&mut self, file: &str, unsupported: &[String]) {
+        if !unsupported.is_empty() && unsupported.iter().all(|e| e == "workflow_call") {
+            self.warn(format!(
+                "`{file}` was dropped: it is a reusable workflow (`on: workflow_call`), which is not supported"
+            ));
+            return;
+        }
+        if unsupported.is_empty() {
+            // `on` named no event, or the events it named did not convert
+            // and are errors already.
+            self.warn(format!(
+                "`{file}` was dropped: none of its events converted"
+            ));
+            return;
+        }
+        let shown: Vec<String> = unsupported.iter().map(|e| format!("`{e}`")).collect();
+        self.warn(format!(
+            "`{file}` was dropped: it runs on {}, and hatchrun runs on {EVENTS}; keep it on GitHub Actions",
+            shown.join(", ")
+        ));
     }
 
     /// Converts `on.workflow_dispatch`, mapping GitHub input types onto
