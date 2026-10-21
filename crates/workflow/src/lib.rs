@@ -27,5 +27,6 @@ pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, validate};
 pub use split::split;
 pub use templates::{Arch, TEMPLATES, Template, template, template_labels};
 pub use trigger::{
-    Dispatch, Event, Filter, PullRequestTrigger, PushTrigger, Schedule, Triggers, triggered,
+    Dispatch, Event, Filter, MAX_CHANGED, MAX_GLOBS, MAX_PATTERNS, PullRequestTrigger, PushTrigger,
+    Schedule, Triggers, triggered,
 };

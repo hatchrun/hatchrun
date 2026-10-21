@@ -20,7 +20,7 @@ use crate::config::{
 use crate::diagnostic::Diagnostic;
 use crate::expr::{self, ExprError};
 use crate::templates::{Template, template, template_labels};
-use crate::trigger::{Filter, Triggers};
+use crate::trigger::{Filter, MAX_GLOBS, MAX_PATTERNS, Triggers};
 
 /// The timeout of a job that sets none.
 pub const DEFAULT_TIMEOUT_MINUTES: u32 = 360;
@@ -227,7 +227,66 @@ fn config_errors(config: &Config) -> Vec<Diagnostic> {
             ));
         }
     }
+    filter_errors(config, &mut errors);
     errors
+}
+
+/// Reports a filter with more than `MAX_PATTERNS` patterns, and a config
+/// whose filters hold more than `MAX_GLOBS` glob patterns in all. Glob
+/// patterns are compiled each time they are matched, so these bound the
+/// work of one webhook.
+fn filter_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
+    let mut globs = 0usize;
+    let mut check = |owner: &str, key: &str, filter: Option<&Filter>| {
+        let Some(filter) = filter else { return };
+        globs = globs.saturating_add(filter.globs());
+        let n = filter.patterns().len();
+        if n > MAX_PATTERNS {
+            errors.push(Diagnostic::new(format!(
+                "{owner}: `{key}` has {n} patterns; the limit is {MAX_PATTERNS}"
+            )));
+        }
+    };
+    for (name, wf) in &config.workflows {
+        let owner = format!("workflow `{name}`");
+        if let Some(push) = &wf.on.push {
+            check(&owner, "on.push.branches", push.branches.as_ref());
+            check(
+                &owner,
+                "on.push.branches-ignore",
+                push.branches_ignore.as_ref(),
+            );
+            check(&owner, "on.push.tags", push.tags.as_ref());
+            check(&owner, "on.push.tags-ignore", push.tags_ignore.as_ref());
+            check(&owner, "on.push.paths", push.paths.as_ref());
+            check(&owner, "on.push.paths-ignore", push.paths_ignore.as_ref());
+        }
+        if let Some(pr) = &wf.on.pull_request {
+            check(&owner, "on.pull_request.branches", pr.branches.as_ref());
+            check(
+                &owner,
+                "on.pull_request.branches-ignore",
+                pr.branches_ignore.as_ref(),
+            );
+            check(&owner, "on.pull_request.paths", pr.paths.as_ref());
+            check(
+                &owner,
+                "on.pull_request.paths-ignore",
+                pr.paths_ignore.as_ref(),
+            );
+        }
+        for entry in &wf.jobs {
+            let id = entry.name.as_deref().unwrap_or(&entry.job);
+            let owner = format!("workflow `{name}` entry `{id}`");
+            check(&owner, "branches", entry.branches.as_ref());
+            check(&owner, "tags", entry.tags.as_ref());
+        }
+    }
+    if globs > MAX_GLOBS {
+        errors.push(Diagnostic::new(format!(
+            "the config's filters have {globs} glob patterns; the limit is {MAX_GLOBS}"
+        )));
+    }
 }
 
 fn unknown_template(owner: &str, label: &str) -> Diagnostic {

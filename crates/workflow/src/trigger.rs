@@ -41,6 +41,15 @@ impl Filter {
         &self.patterns
     }
 
+    /// How many patterns are compiled when matched: those that are not
+    /// plain text, text then `**`, or `**` then text.
+    pub(crate) fn globs(&self) -> usize {
+        self.shapes
+            .iter()
+            .filter(|s| matches!(s, Shape::Glob))
+            .count()
+    }
+
     /// Whether `value` passes the filter.
     ///
     /// Patterns apply in order and the last one that matches decides, so
@@ -48,33 +57,35 @@ impl Filter {
     /// pattern matches does not pass.
     #[must_use]
     pub fn matches(&self, value: &str) -> bool {
-        self.matches_in(value, &mut Scratch::default())
+        let mut scratch = Scratch::with_work(usize::MAX);
+        self.matches_in(value, &mut scratch).unwrap_or(true)
     }
 
     /// [`Filter::matches`], with buffers and compiled patterns kept
-    /// between calls.
-    fn matches_in(&self, value: &str, scratch: &mut Scratch) -> bool {
+    /// between calls. `None` when the scratch's work ran out first.
+    fn matches_in(&self, value: &str, scratch: &mut Scratch) -> Option<bool> {
         let mut split = false;
         // The last pattern that matches decides, so look from the end.
-        (0..self.patterns.len())
-            .rev()
-            .find(|&i| {
-                let text = body(&self.patterns[i]);
-                match self.shapes[i] {
-                    Shape::Literal => text == value,
-                    Shape::Prefix => value.starts_with(&text[..text.len() - 2]),
-                    Shape::Suffix => value.ends_with(&text[2..]),
-                    Shape::Glob => {
-                        if !split {
-                            scratch.buffers.chars.clear();
-                            scratch.buffers.chars.extend(value.chars());
-                            split = true;
-                        }
-                        scratch.glob(i, text)
+        for i in (0..self.patterns.len()).rev() {
+            let text = body(&self.patterns[i]);
+            let matched = match self.shapes[i] {
+                Shape::Literal => text == value,
+                Shape::Prefix => value.starts_with(&text[..text.len() - 2]),
+                Shape::Suffix => value.ends_with(&text[2..]),
+                Shape::Glob => {
+                    if !split {
+                        scratch.buffers.chars.clear();
+                        scratch.buffers.chars.extend(value.chars());
+                        split = true;
                     }
+                    scratch.glob(i, text)?
                 }
-            })
-            .is_some_and(|i| !self.patterns[i].starts_with('!'))
+            };
+            if matched {
+                return Some(!self.patterns[i].starts_with('!'));
+            }
+        }
+        Some(false)
     }
 }
 
@@ -115,27 +126,54 @@ impl Shape {
     }
 }
 
-/// The most tokens one matching call keeps compiled, about 128 KiB.
-/// Past it, patterns are compiled again for each value.
-const CACHED_TOKENS: usize = 4096;
+/// The most tokens one matching call keeps compiled, about 2 MiB:
+/// every pattern of a filter at the 256-pattern limit, at up to 256
+/// characters each. Past it, patterns are compiled again for each value.
+const CACHED_TOKENS: usize = 1 << 16;
 
-/// What matching keeps between values: buffers, and the patterns
-/// compiled so far while they fit [`CACHED_TOKENS`].
-#[derive(Default)]
+/// What matching keeps between values: buffers, the patterns compiled
+/// so far while they fit [`CACHED_TOKENS`], and the work left.
 struct Scratch {
     buffers: Buffers,
     compiled: Vec<Option<Vec<Tok>>>,
     cached: usize,
+    /// Steps left: a compiled character, or a position looked at for
+    /// one token.
+    left: usize,
 }
 
 impl Scratch {
+    fn with_work(left: usize) -> Self {
+        Self {
+            buffers: Buffers::default(),
+            compiled: Vec::new(),
+            cached: 0,
+            left,
+        }
+    }
+
+    /// Takes `steps` from the work left; false when there is not enough.
+    fn spend(&mut self, steps: usize) -> bool {
+        match self.left.checked_sub(steps) {
+            Some(left) => {
+                self.left = left;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether `buffers.chars` matches pattern `i`, whose text is `text`.
-    fn glob(&mut self, i: usize, text: &str) -> bool {
+    /// `None` when the work runs out.
+    fn glob(&mut self, i: usize, text: &str) -> Option<bool> {
         if let Some(Some(toks)) = self.compiled.get(i) {
-            return glob_matches(toks, &mut self.buffers);
+            return glob_matches(toks, &mut self.buffers, &mut self.left);
+        }
+        if !self.spend(text.len()) {
+            return None;
         }
         let toks = compile(text);
-        let matched = glob_matches(&toks, &mut self.buffers);
+        let matched = glob_matches(&toks, &mut self.buffers, &mut self.left);
         if self.cached + toks.len() <= CACHED_TOKENS {
             self.cached += toks.len();
             if self.compiled.len() <= i {
@@ -274,15 +312,20 @@ fn class(chars: &[char], start: usize) -> Option<(Tok, usize)> {
 
 /// Whether the whole of `buffers.chars` matches the tokens. Tracks the
 /// set of reachable positions, so the cost stays polynomial for any
-/// pattern.
-fn glob_matches(toks: &[Tok], buffers: &mut Buffers) -> bool {
+/// pattern. Each token's work is charged to `left` before it is done;
+/// `None` when it does not fit.
+fn glob_matches(toks: &[Tok], buffers: &mut Buffers, left: &mut usize) -> Option<bool> {
     let Buffers { chars, at, next } = buffers;
     let value = &chars[..];
     let n = value.len();
+    *left = left.checked_sub(n + 1)?;
     at.clear();
     at.resize(n + 1, false);
     at[0] = true;
     for tok in toks {
+        // A token looks at every position and may walk every position
+        // once more. Most patterns stop at their first tokens.
+        *left = left.checked_sub(2 * (n + 1))?;
         next.clear();
         next.resize(n + 1, false);
         let mut any = false;
@@ -325,10 +368,10 @@ fn glob_matches(toks: &[Tok], buffers: &mut Buffers) -> bool {
         }
         std::mem::swap(at, next);
         if !any {
-            return false;
+            return Some(false);
         }
     }
-    at[n]
+    Some(at[n])
 }
 
 impl<'de> Deserialize<'de> for Filter {
@@ -474,6 +517,25 @@ pub struct Dispatch {
     pub inputs: BTreeMap<String, Parameter>,
 }
 
+/// The most changed paths path filters look at. GitHub limits diffs to
+/// 300 files: a change outside the first 300 does not start a workflow.
+pub const MAX_CHANGED: usize = 300;
+
+/// The most work, in steps, matching one path filter against an
+/// event's changed paths may take: about 40 ms on the worst patterns
+/// validate accepts, against about 1 ms for 256 ordinary patterns. A
+/// filter that needs more passes, as path filters do when the changed
+/// paths are not known. Only crafted patterns get there: ordinary ones
+/// stop within their first few characters.
+const PATH_WORK: usize = 1 << 25;
+
+/// The most patterns one filter may have.
+pub const MAX_PATTERNS: usize = 256;
+
+/// The most glob patterns, those not matched as plain text, a config's
+/// filters may have in all. Each is compiled when it is matched.
+pub const MAX_GLOBS: usize = 4096;
+
 /// A GitHub event, reduced to what trigger matching needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -484,6 +546,8 @@ pub enum Event {
         /// Paths changed by the push. Empty when the caller could not
         /// compute them; path filters then pass, as GitHub runs the
         /// workflow. Path filters are not evaluated for tag pushes.
+        /// Only the first [`MAX_CHANGED`] paths are looked at, as GitHub
+        /// limits diffs to 300 files.
         changed: Vec<String>,
     },
     /// Activity on a pull request.
@@ -493,7 +557,8 @@ pub enum Event {
         /// The base branch, as a short name.
         base_ref: String,
         /// Paths changed by the pull request. Empty when the caller could
-        /// not compute them; path filters then pass.
+        /// not compute them; path filters then pass. Only the first
+        /// [`MAX_CHANGED`] paths are looked at.
         changed: Vec<String>,
     },
     /// A cron schedule firing.
@@ -576,17 +641,24 @@ fn ref_passes(include: Option<&Filter>, ignore: Option<&Filter>, name: &str) -> 
 /// Applies the path filters: it passes when any changed path passes, or
 /// when the changed list is empty (unknown).
 fn paths_pass(include: Option<&Filter>, ignore: Option<&Filter>, changed: &[String]) -> bool {
+    let changed = &changed[..changed.len().min(MAX_CHANGED)];
     match (include, ignore) {
         (None, None) => true,
         (Some(_), Some(_)) => false,
         _ if changed.is_empty() => true,
+        // A filter that needs more than PATH_WORK to decide passes, as
+        // when the changed paths are unknown.
         (Some(include), None) => {
-            let mut scratch = Scratch::default();
-            changed.iter().any(|p| include.matches_in(p, &mut scratch))
+            let mut scratch = Scratch::with_work(PATH_WORK);
+            changed
+                .iter()
+                .any(|p| include.matches_in(p, &mut scratch).unwrap_or(true))
         }
         (None, Some(ignore)) => {
-            let mut scratch = Scratch::default();
-            changed.iter().any(|p| !ignore.matches_in(p, &mut scratch))
+            let mut scratch = Scratch::with_work(PATH_WORK);
+            changed
+                .iter()
+                .any(|p| ignore.matches_in(p, &mut scratch).is_none_or(|m| !m))
         }
     }
 }
@@ -680,7 +752,7 @@ mod tests {
             };
             let toks = compile(body);
             // One scratch across values, as paths_pass keeps it.
-            let mut scratch = Scratch::default();
+            let mut scratch = Scratch::with_work(usize::MAX);
             for value in &values {
                 let chars: Vec<char> = value.chars().collect();
                 let want = if reference(&toks, &chars) {
@@ -691,10 +763,24 @@ mod tests {
                 assert_eq!(filter.matches(value), want, "{pattern:?} on {value:?}");
                 assert_eq!(
                     filter.matches_in(value, &mut scratch),
-                    want,
+                    Some(want),
                     "{pattern:?} on {value:?}, kept scratch"
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_filter_out_of_work_is_undecided() {
+        let filter = Filter::new(vec![format!("{}b", "*a".repeat(100))]);
+        let value = "a".repeat(200);
+        let mut scratch = Scratch::with_work(1000);
+        assert_eq!(filter.matches_in(&value, &mut scratch), None);
+        let mut scratch = Scratch::with_work(usize::MAX);
+        assert_eq!(filter.matches_in(&value, &mut scratch), Some(false));
+        // Text shapes take no work.
+        let filter = Filter::new(vec!["docs/**".to_owned()]);
+        let mut scratch = Scratch::with_work(0);
+        assert_eq!(filter.matches_in("docs/a.md", &mut scratch), Some(true));
     }
 }

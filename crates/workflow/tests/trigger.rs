@@ -187,3 +187,58 @@ fn hostile_and_malformed_patterns() {
     assert!(f(&["a[b"]).matches("a[b") && !f(&["a[b"]).matches("ab"));
     assert!(f(&["a\\"]).matches("a\\"));
 }
+
+#[test]
+fn only_the_first_300_changed_paths_count() {
+    let on = on("push: { paths: ['docs/**'] }\npull_request: { paths-ignore: ['src/**'] }");
+    let mut changed: Vec<String> = (0..299).map(|i| format!("src/f{i}.rs")).collect();
+    changed.push("docs/a.md".to_owned());
+    let push_with = |changed: &[String]| Event::Push {
+        r#ref: "refs/heads/main".into(),
+        changed: changed.to_vec(),
+    };
+    let pr_with = |changed: &[String]| Event::PullRequest {
+        action: "opened".into(),
+        base_ref: "main".into(),
+        changed: changed.to_vec(),
+    };
+    // The 300th path counts.
+    assert!(triggered(&on, &push_with(&changed)));
+    assert!(triggered(&on, &pr_with(&changed)));
+    // The 301st does not.
+    changed.insert(0, "src/first.rs".to_owned());
+    assert_eq!(changed.len(), 301);
+    assert!(!triggered(&on, &push_with(&changed)));
+    assert!(!triggered(&on, &pr_with(&changed)));
+}
+
+#[test]
+fn a_path_filter_that_needs_too_much_work_passes() {
+    // Crafted patterns that keep every position reachable, against long
+    // paths none of them match: deciding would take seconds, so the
+    // filter passes, as when the changed paths are unknown.
+    let patterns: Vec<String> = (0..256)
+        .map(|i| format!("{}{}b", i % 10, "*a".repeat(100)))
+        .collect();
+    let on = Triggers {
+        push: Some(hatchrun_workflow::PushTrigger {
+            paths: Some(Filter::new(patterns)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let changed: Vec<String> = (0..300)
+        .map(|i| format!("{}{}", i % 10, "a".repeat(400)))
+        .collect();
+    let event = Event::Push {
+        r#ref: "refs/heads/main".into(),
+        changed,
+    };
+    assert!(triggered(&on, &event));
+    // A few such paths are decided: none matches.
+    let event = Event::Push {
+        r#ref: "refs/heads/main".into(),
+        changed: vec![format!("0{}", "a".repeat(40))],
+    };
+    assert!(!triggered(&on, &event));
+}

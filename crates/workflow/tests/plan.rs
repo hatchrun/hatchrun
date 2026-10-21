@@ -1084,3 +1084,38 @@ fn validate_checks_jobs_and_commands_no_workflow_runs() {
         assert_error(yaml, words);
     }
 }
+
+/// A config with `workflows` workflows, each filtering pushes on
+/// `patterns` patterns made by `pattern`.
+fn many_patterns(workflows: usize, patterns: usize, pattern: fn(usize) -> String) -> String {
+    use std::fmt::Write as _;
+    let list: Vec<String> = (0..patterns).map(pattern).collect();
+    let mut y = String::from("jobs: { t: { runs-on: ubuntu-latest, steps: [] } }\nworkflows:\n");
+    for w in 0..workflows {
+        writeln!(
+            y,
+            "  w{w}: {{ on: {{ push: {{ paths: [{}] }} }}, jobs: [t] }}",
+            list.join(", ")
+        )
+        .unwrap();
+    }
+    y
+}
+
+#[test]
+fn filters_are_capped() {
+    let glob = |i| format!("'src/m{i}/**/*.rs'");
+    assert_eq!(errors(&many_patterns(1, 256, glob)), Vec::new());
+    assert_error(
+        &many_patterns(1, 257, glob),
+        &["workflow `w0`: `on.push.paths` has 257 patterns; the limit is 256"],
+    );
+    assert_eq!(errors(&many_patterns(16, 256, glob)), Vec::new());
+    assert_error(
+        &many_patterns(17, 256, glob),
+        &["the config's filters have 4352 glob patterns; the limit is 4096"],
+    );
+    // Plain text, `text**` and `**text` match as text and do not count.
+    let plain = many_patterns(20, 250, |i| format!("'docs/{i}/**'"));
+    assert_eq!(errors(&plain), Vec::new());
+}
