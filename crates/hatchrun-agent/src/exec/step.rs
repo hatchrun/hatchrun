@@ -185,6 +185,25 @@ impl<'a> StepOutput<'a> {
         self.refused
     }
 
+    /// Adds pairs from the `GITHUB_OUTPUT` file, under the same limits as
+    /// `::set-output::`.
+    pub fn push_outputs(&mut self, pairs: Vec<(String, String)>) {
+        for (name, value) in pairs {
+            self.push_output(name, value);
+        }
+    }
+
+    fn push_output(&mut self, name: String, value: String) {
+        self.output_bytes += name.len() + value.len();
+        if self.outputs.len() >= MAX_OUTPUTS || self.output_bytes > MAX_OUTPUT_BYTES {
+            self.warn_limit(
+                "output limit reached: 1000 values and 1 MiB per step; the rest are dropped",
+            );
+        } else {
+            self.outputs.push((name, value));
+        }
+    }
+
     fn warn_limit(&mut self, message: &str) {
         if !self.warned[0] {
             self.warned[0] = true;
@@ -228,8 +247,12 @@ impl<'a> StepOutput<'a> {
             }
             WorkflowCommand::Annotation(mut a) => {
                 a.message = truncate(self.masker.mask(&a.message).into_owned(), MAX_MESSAGE);
-                a.title = a.title.map(|t| self.masker.mask(&t).into_owned());
-                a.file = a.file.map(|f| self.masker.mask(&f).into_owned());
+                a.title = a
+                    .title
+                    .map(|t| truncate(self.masker.mask(&t).into_owned(), MAX_MESSAGE));
+                a.file = a
+                    .file
+                    .map(|f| truncate(self.masker.mask(&f).into_owned(), MAX_MESSAGE));
                 let level = match a.level {
                     AnnotationLevel::Error => "Error",
                     AnnotationLevel::Warning => "Warning",
@@ -258,14 +281,7 @@ impl<'a> StepOutput<'a> {
             WorkflowCommand::Echo(on) => self.echo = on,
             WorkflowCommand::SetOutput { name, value } => {
                 self.line(SET_OUTPUT_WARNING);
-                self.output_bytes += name.len() + value.len();
-                if self.outputs.len() >= MAX_OUTPUTS || self.output_bytes > MAX_OUTPUT_BYTES {
-                    self.warn_limit(
-                        "output limit reached: 1000 values and 1 MiB per step; the rest are dropped",
-                    );
-                } else {
-                    self.outputs.push((name, value));
-                }
+                self.push_output(name, value);
             }
             WorkflowCommand::Refused(message) => {
                 self.refused = true;
@@ -337,18 +353,20 @@ pub async fn spawn(
     // The child holds the only write ends now. Keeping ours would stop
     // the reader from ever seeing end of file.
     drop(command);
-    let pid = Pid::from_raw(
-        child
-            .id()
-            .and_then(|id| i32::try_from(id).ok())
-            .context("read process id")?,
-    );
+    let Some(pid) = child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .map(Pid::from_raw)
+    else {
+        let _ = child.start_kill();
+        anyhow::bail!("read process id");
+    };
+    let mut guard = GroupGuard { pid, armed: true };
 
     let fd: std::os::fd::OwnedFd = reader.into();
     fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).context("set output pipe non-blocking")?;
     let mut reader = Receiver::from_owned_fd(fd).context("read output pipe")?;
 
-    let mut guard = GroupGuard { pid, armed: true };
     let mut buf = vec![0u8; 16 << 10];
     let timeout_at = p.timeout.map(|t| Instant::now() + t);
     let mut stopping: Option<Exit> = None;
@@ -546,5 +564,32 @@ mod tests {
         assert_eq!(sink.lines.len(), 1);
         assert!(sink.lines[0].contains("64 KiB") && !sink.lines[0].contains("LLL"));
         assert_eq!(masker.mask("LLLL"), "LLLL");
+    }
+
+    #[test]
+    fn file_outputs_share_the_cap() {
+        let mut masker = Masker::default();
+        let mut sink = Rec::default();
+        let mut kept = Vec::new();
+        let mut budget = Budget::default();
+        let mut out = StepOutput::new(&mut masker, &mut sink, &mut kept, &mut budget);
+        out.push(b"::set-output name=a::1\n");
+        out.push_outputs(
+            (0..1500)
+                .map(|i| (format!("n{i}"), "v".to_owned()))
+                .collect(),
+        );
+        assert_eq!(out.take_outputs().len(), MAX_OUTPUTS);
+    }
+
+    #[test]
+    fn annotation_title_and_file_are_truncated() {
+        let long = "t".repeat(10_000);
+        let (_, kept, _) = feed(
+            &format!("::error title={long},file={long}::m\n"),
+            &mut Budget::default(),
+        );
+        assert_eq!(kept[0].title.as_ref().unwrap().len(), 4096);
+        assert_eq!(kept[0].file.as_ref().unwrap().len(), 4096);
     }
 }

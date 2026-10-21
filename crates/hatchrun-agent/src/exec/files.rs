@@ -8,10 +8,14 @@
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use nix::errno::Errno;
+use nix::fcntl::{OFlag, open, openat};
+use nix::sys::stat::Mode;
+use nix::unistd::{UnlinkatFlags, fchown, unlinkat};
 
 /// The most a step may write to one file command file.
 const MAX_FILE: usize = 16 << 20;
@@ -34,21 +38,83 @@ pub struct StepFiles {
     pub summary: PathBuf,
 }
 
+const DIR_NAME: &str = "_runner_file_commands";
+
+/// Opens a directory without following a symlink at its last component.
+fn open_dir(path: &Path) -> nix::Result<OwnedFd> {
+    open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+}
+
 impl StepFiles {
+    /// Removes whatever sits at `<temp>/_runner_file_commands` and makes
+    /// a fresh root-owned directory there. Called once per job, before
+    /// any step can plant something in a runner-owned temp directory.
+    ///
+    /// # Errors
+    ///
+    /// When the old entry cannot be removed or the directory not made.
+    pub fn reset(temp: &Path) -> Result<()> {
+        let dir = temp.join(DIR_NAME);
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&dir),
+            Ok(_) => fs::remove_file(&dir),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+        .with_context(|| format!("clearing {}", dir.display()))?;
+        fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))
+    }
+
     /// Creates empty files for step number `step` under
-    /// `<temp>/_runner_file_commands`.
-    pub fn create(temp: &Path, step: usize) -> Result<Self> {
-        let dir = temp.join("_runner_file_commands");
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    /// `<temp>/_runner_file_commands`, owned by `owner` when given. An
+    /// entry already at a file's path is unlinked, never followed, and
+    /// the file is opened with `O_EXCL | O_NOFOLLOW` and handed over
+    /// with `fchown`, so a planted symlink cannot redirect the agent.
+    ///
+    /// # Errors
+    ///
+    /// When the directory is not a plain directory or a file cannot be
+    /// made.
+    pub fn create(
+        temp: &Path,
+        step: usize,
+        owner: Option<(nix::unistd::Uid, nix::unistd::Gid)>,
+    ) -> Result<Self> {
+        let dir = temp.join(DIR_NAME);
+        if let Err(e) = fs::create_dir(&dir)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(e).with_context(|| format!("creating {}", dir.display()));
+        }
+        let dirfd = open_dir(&dir).with_context(|| format!("opening {}", dir.display()))?;
         let make = |kind: &str| -> Result<PathBuf> {
-            let path = dir.join(format!("{kind}_{step}"));
-            fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .with_context(|| format!("creating {}", path.display()))?;
+            let name = format!("{kind}_{step}");
+            let path = dir.join(&name);
+            match unlinkat(&dirfd, name.as_str(), UnlinkatFlags::NoRemoveDir) {
+                Ok(()) | Err(Errno::ENOENT) => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("removing {}", path.display()));
+                }
+            }
+            let fd = openat(
+                &dirfd,
+                name.as_str(),
+                OFlag::O_WRONLY
+                    | OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_CLOEXEC,
+                Mode::from_bits_truncate(0o600),
+            )
+            .with_context(|| format!("creating {}", path.display()))?;
+            if let Some((uid, gid)) = owner {
+                fchown(&fd, Some(uid), Some(gid))
+                    .with_context(|| format!("chown {}", path.display()))?;
+            }
             Ok(path)
         };
         Ok(Self {
@@ -58,30 +124,6 @@ impl StepFiles {
             path: make("path")?,
             summary: make("summary")?,
         })
-    }
-}
-
-impl StepFiles {
-    /// Hands the files, and the directory that holds them, to `owner`
-    /// so a step running as that user can write them.
-    ///
-    /// # Errors
-    ///
-    /// When a chown fails.
-    pub fn give_to(&self, owner: (nix::unistd::Uid, nix::unistd::Gid)) -> Result<()> {
-        let dir = self.env.parent().unwrap_or(&self.env);
-        for path in [
-            dir,
-            &self.env,
-            &self.output,
-            &self.state,
-            &self.path,
-            &self.summary,
-        ] {
-            nix::unistd::chown(path, Some(owner.0), Some(owner.1))
-                .with_context(|| format!("chown {}", path.display()))?;
-        }
-        Ok(())
     }
 }
 
@@ -178,13 +220,30 @@ fn read_capped(path: &Path, cap: usize) -> Result<(String, bool), FileError> {
         line: None,
         message,
     };
-    let file = match File::open(path) {
-        Ok(file) => file,
-        // A step may delete a file command file. That is the same as
-        // writing nothing.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((String::new(), false)),
+    let opened = path
+        .parent()
+        .zip(path.file_name())
+        .ok_or(Errno::EINVAL)
+        .and_then(|(dir, name)| {
+            let dirfd = open_dir(dir)?;
+            openat(
+                &dirfd,
+                name,
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+        });
+    // A step may delete a file command file. That is the same as
+    // writing nothing.
+    let file = match opened {
+        Ok(fd) => File::from(fd),
+        Err(Errno::ENOENT) => return Ok((String::new(), false)),
         Err(e) => return Err(err(format!("cannot open: {e}"))),
     };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        _ => return Err(err("cannot open: not a regular file".to_owned())),
+    }
     let mut bytes = Vec::new();
     // One byte past the cap is enough to know the file is too big, and
     // keeps a runaway step from filling memory.
@@ -271,13 +330,49 @@ mod tests {
 
     fn files_with(env: &str) -> (tempfile::TempDir, StepFiles) {
         let dir = tempfile::tempdir().unwrap();
-        let files = StepFiles::create(dir.path(), 1).unwrap();
+        let files = StepFiles::create(dir.path(), 1, None).unwrap();
         fs::write(&files.env, env).unwrap();
         (dir, files)
     }
 
     fn pair(k: &str, v: &str) -> (String, String) {
         (k.to_owned(), v.to_owned())
+    }
+
+    #[test]
+    fn a_planted_symlink_is_replaced_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("victim");
+        fs::write(&target, "keep").unwrap();
+        StepFiles::reset(dir.path()).unwrap();
+        let planted = dir.path().join(DIR_NAME).join("env_2");
+        std::os::unix::fs::symlink(&target, &planted).unwrap();
+        let files = StepFiles::create(dir.path(), 2, None).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+        assert!(!fs::symlink_metadata(&files.env).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn a_symlinked_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(DIR_NAME)).unwrap();
+        assert!(StepFiles::create(dir.path(), 1, None).is_err());
+        // The per-job reset replaces the link with a real directory.
+        StepFiles::reset(dir.path()).unwrap();
+        StepFiles::create(dir.path(), 1, None).unwrap();
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn read_refuses_a_symlinked_file() {
+        let (dir, files) = files_with("");
+        let secret = dir.path().join("secret");
+        fs::write(&secret, "TOKEN=hunter2\n").unwrap();
+        fs::remove_file(&files.env).unwrap();
+        std::os::unix::fs::symlink(&secret, &files.env).unwrap();
+        let err = read(&files).unwrap_err();
+        assert!(err.message.contains("cannot open"), "{err}");
     }
 
     #[test]
@@ -301,8 +396,8 @@ mod tests {
     #[test]
     fn create_makes_empty_files_per_step() {
         let dir = tempfile::tempdir().unwrap();
-        let one = StepFiles::create(dir.path(), 1).unwrap();
-        let two = StepFiles::create(dir.path(), 2).unwrap();
+        let one = StepFiles::create(dir.path(), 1, None).unwrap();
+        let two = StepFiles::create(dir.path(), 2, None).unwrap();
         assert_ne!(one.env, two.env);
         assert!(
             one.env

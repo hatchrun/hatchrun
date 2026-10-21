@@ -74,6 +74,7 @@ pub async fn run_job(
     let layout = Layout::new(&opts.work_dir, &doc.github.repository, &opts.tool_cache);
     layout.create()?;
     let event = write_event(&layout, &doc)?;
+    StepFiles::reset(&layout.temp)?;
     let owner = opts.runner_user.as_deref().map(owner_of).transpose()?;
     if let Some(owner) = owner {
         let dirs = [
@@ -86,8 +87,15 @@ pub async fn run_job(
             &event,
         ];
         for path in dirs {
-            nix::unistd::chown(path, Some(owner.0), Some(owner.1))
-                .with_context(|| format!("chown {}", path.display()))?;
+            // The link itself, never what it points at.
+            nix::unistd::fchownat(
+                nix::fcntl::AT_FDCWD,
+                path,
+                Some(owner.0),
+                Some(owner.1),
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .with_context(|| format!("chown {}", path.display()))?;
         }
     }
 
@@ -434,7 +442,6 @@ impl Job<'_> {
             outcome = Conclusion::Failure;
         }
 
-        let mut set_outputs = out.take_outputs();
         let read = files::read(&prepared.files);
         match read {
             Ok(written) => {
@@ -443,7 +450,7 @@ impl Job<'_> {
                 }
                 self.github_env.extend(written.env);
                 self.path_dirs.extend(written.path);
-                set_outputs.extend(written.outputs);
+                out.push_outputs(written.outputs);
             }
             Err(err) => {
                 out.error(&err.to_string());
@@ -452,7 +459,7 @@ impl Job<'_> {
                 }
             }
         }
-        let outputs: BTreeMap<String, String> = set_outputs.into_iter().collect();
+        let outputs: BTreeMap<String, String> = out.take_outputs().into_iter().collect();
         self.sync_env();
         (common, outcome, outputs)
     }
@@ -491,10 +498,7 @@ fn exit_outcome(
 fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, String> {
     let layout = &job.layout;
     let workspace = &layout.workspace;
-    let files = StepFiles::create(&layout.temp, index).map_err(|e| format!("{e:#}"))?;
-    if let Some(owner) = job.owner {
-        files.give_to(owner).map_err(|e| format!("{e:#}"))?;
-    }
+    let files = StepFiles::create(&layout.temp, index, job.owner).map_err(|e| format!("{e:#}"))?;
 
     let mut step_env = BTreeMap::new();
     for (key, value) in &step.env {
