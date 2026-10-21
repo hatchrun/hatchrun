@@ -25,7 +25,7 @@ use crate::config::{
 use crate::diagnostic::Diagnostic;
 use crate::expr::{self, ExprError};
 use crate::plan;
-use crate::templates::{template, template_labels};
+use crate::templates::{template, template_labels, vendor_template};
 use crate::trigger::{Dispatch, PullRequestTrigger, PushTrigger, Schedule, Triggers};
 
 /// The result of a conversion: the config and what was dropped on the way.
@@ -712,7 +712,10 @@ impl Cx {
         Some((job, entry))
     }
 
-    /// Maps `runs-on` to a runner template label. `runs-on: ${{ matrix.KEY }}`
+    /// Maps `runs-on` to a runner template label. A third-party label,
+    /// such as `blacksmith-4vcpu-ubuntu-2404`, becomes the template of
+    /// its arch and size with a warning; `{labels: ...}` reads its labels
+    /// and `{group: ...}` is an error. `runs-on: ${{ matrix.KEY }}`
     /// over a list of labels keeps the legs whose labels name one
     /// template and drops the others, such as macOS and Windows legs,
     /// with a warning.
@@ -722,17 +725,23 @@ impl Cx {
         runs_on: Option<&Value>,
         matrix: &mut BTreeMap<String, Vec<Value>>,
     ) -> Option<String> {
-        if let Some(Value::String(text)) = runs_on
+        let label = runs_on.and_then(runs_on_text);
+        if let Some(text) = label
             && let Some(key) = matrix_key(text)
             && let Some(values) = matrix.get_mut(key)
         {
             return self.matrix_runs_on(at, text, key, values);
         }
-        let label = match runs_on {
-            Some(Value::String(label)) => Some(label.as_str()),
-            Some(Value::Array(labels)) if labels.len() == 1 => labels[0].as_str(),
-            _ => None,
-        };
+        if let Some(Value::Object(map)) = runs_on
+            && let Some(group) = map.get("group")
+        {
+            self.error(format!(
+                "{at} has `runs-on: {{group: {}}}`; runner groups are not supported; use one of {}",
+                show(group),
+                template_labels().join(", ")
+            ));
+            return None;
+        }
         if let Some(old) = label
             && let Some(new) = runner_label(old)
         {
@@ -1057,17 +1066,45 @@ impl RunDefaults {
     }
 }
 
-/// The template label a GitHub `runs-on` label becomes, if any.
+/// The template label a GitHub `runs-on` label becomes, if any: the
+/// label itself, the template a retired Ubuntu label moved to, or the
+/// template of a third-party label's arch and size.
 fn runner_label(label: &str) -> Option<&'static str> {
     if let Some((_, new)) = OLD_UBUNTU.iter().find(|(old, _)| *old == label) {
         return Some(new);
     }
-    template_labels().into_iter().find(|l| *l == label)
+    if let Some(found) = template_labels().into_iter().find(|l| *l == label) {
+        return Some(found);
+    }
+    vendor_template(label).map(|(t, _)| t.labels[0])
 }
 
-/// The warning for a retired label that became a template label.
+/// The warning for a label that became another template label, saying
+/// when a third-party label's size was rounded.
 fn became(at: &str, old: &str, new: &str) -> String {
-    format!("{at}: `runs-on: {old}` became `{new}`, which runs Ubuntu 26.04")
+    let size = match vendor_template(old) {
+        Some((t, asked)) if asked > t.vcpu => format!(
+            "; it asks for {asked} vCPUs and the largest template has {}",
+            t.vcpu
+        ),
+        Some((t, asked)) if asked < t.vcpu => {
+            format!("; it asks for {asked} vCPUs, rounded up to {}", t.vcpu)
+        }
+        _ => String::new(),
+    };
+    format!("{at}: `runs-on: {old}` became `{new}`, which runs Ubuntu 26.04{size}")
+}
+
+/// The label `runs-on` names: a string, a list of one, or the `labels`
+/// of a `{labels: ...}` map. `None` for anything else, including a
+/// runner `group`.
+fn runs_on_text(runs_on: &Value) -> Option<&str> {
+    match runs_on {
+        Value::String(label) => Some(label),
+        Value::Array(labels) if labels.len() == 1 => labels[0].as_str(),
+        Value::Object(map) if map.len() == 1 => runs_on_text(map.get("labels")?),
+        _ => None,
+    }
 }
 
 /// The key `KEY` of `${{ matrix.KEY }}`, when that is the whole text.
