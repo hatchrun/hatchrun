@@ -8,6 +8,7 @@
 pub mod action;
 pub mod archive;
 pub mod commands;
+pub mod composite;
 pub mod context;
 pub mod files;
 pub mod layout;
@@ -135,6 +136,9 @@ pub async fn run_job(
         fetched: BTreeMap::new(),
         states: BTreeMap::new(),
         posts: Vec::new(),
+        scope_env: BTreeMap::new(),
+        depth: 0,
+        next_slot: 3 * doc.job.steps.len(),
     };
     job.start();
 
@@ -214,6 +218,14 @@ struct Job<'a> {
     states: BTreeMap<usize, BTreeMap<String, String>>,
     /// `post` hooks that are due, in the order they were queued.
     posts: Vec<node::Post>,
+    /// The `env` of the composite action steps that are running, outer
+    /// ones first. Empty outside composite actions.
+    scope_env: BTreeMap<String, String>,
+    /// How many composite actions the running step is inside.
+    depth: usize,
+    /// The next file command slot for a step inside a composite action.
+    /// Real steps and their `pre` and `post` use the slots below it.
+    next_slot: usize,
 }
 
 /// What a step needs to start.
@@ -270,7 +282,15 @@ impl Job<'_> {
     fn env_context(&self) -> BTreeMap<String, String> {
         let mut env = self.declared_env.clone();
         env.extend(self.github_env.clone());
+        env.extend(self.scope_env.clone());
         env
+    }
+
+    /// A file command slot nothing else uses.
+    fn fresh_slot(&mut self) -> usize {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        slot
     }
 
     fn set_status(&mut self, status: JobStatus) {
@@ -697,6 +717,7 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
     let mut env = base_env(job, &files, &step_action(step, index))?;
     env.extend(job.github_env.clone());
     env.extend(job.declared_env.clone());
+    env.extend(job.scope_env.clone());
     env.extend(step_env);
     job.with_path(&mut env);
 

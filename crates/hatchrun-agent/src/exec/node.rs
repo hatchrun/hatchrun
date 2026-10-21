@@ -74,8 +74,10 @@ fn locate(
 
 /// A `post` script that is due after the job's steps.
 pub struct Post {
-    /// The step's index, for its `STATE_*` and file command files.
+    /// The step's index, for its `STATE_*`.
     index: usize,
+    /// Which file command files it uses.
+    slot: usize,
     /// The `uses:` value, for the header.
     uses: String,
     action_name: String,
@@ -88,14 +90,18 @@ pub struct Post {
 }
 
 /// The inputs and environment a `uses:` step gives its action.
-struct Evaluated {
+pub(super) struct Evaluated {
     /// The step's `env`, `INPUT_*` and the `GITHUB_ACTION_*` variables.
-    env: BTreeMap<String, String>,
-    warnings: Vec<String>,
+    pub(super) env: BTreeMap<String, String>,
+    /// The step's `env` alone.
+    pub(super) step_env: BTreeMap<String, String>,
+    /// The action's scope, with every input and its default.
+    pub(super) scope: ActionScope,
+    pub(super) warnings: Vec<String>,
 }
 
 /// The `GITHUB_ACTION` of a `uses:` step: its id, else a generated name.
-fn action_name(step: &UsesStep, r: &ActionRef) -> String {
+pub(super) fn action_name(step: &UsesStep, r: &ActionRef) -> String {
     match (&step.id, r) {
         (Some(id), _) => id.clone(),
         (None, ActionRef::Remote { owner, repo, .. }) => format!("__{owner}_{repo}"),
@@ -195,7 +201,6 @@ impl Job<'_> {
 
     /// Runs the `post` scripts queued by the steps that ran, last first.
     pub(super) async fn post_phase(&mut self, sink: &mut dyn Sink) {
-        let steps = self.doc.job.steps.len();
         while let Some(post) = self.posts.pop() {
             if self.aborted {
                 self.posts.clear();
@@ -214,7 +219,7 @@ impl Job<'_> {
             self.announce(sink, post.index, "Post", &post.uses);
             let hook = Hook {
                 index: post.index,
-                slot: 2 * steps + post.index,
+                slot: post.slot,
                 version: "",
                 script: "",
                 condition: None,
@@ -298,6 +303,10 @@ impl Job<'_> {
             Ok(action) => action,
             Err(message) => return failed(self, sink, common, &message),
         };
+        if let Runs::Composite { steps } = &action.meta.runs {
+            let (outcome, outputs) = self.composite(step, &action, &r, steps, sink).await;
+            return (common, outcome, outputs);
+        }
         let Runs::Node {
             version,
             main,
@@ -306,13 +315,10 @@ impl Job<'_> {
             ..
         } = &action.meta.runs
         else {
-            let message = match action.meta.runs {
-                Runs::Docker => format!(
-                    "`{}` is a Docker container action; Docker services and containers come in a later release",
-                    step.uses
-                ),
-                _ => "composite actions are not supported yet".to_owned(),
-            };
+            let message = format!(
+                "`{}` is a Docker container action; Docker services and containers come in a later release",
+                step.uses
+            );
             return failed(self, sink, common, &message);
         };
 
@@ -331,8 +337,9 @@ impl Job<'_> {
             self.say(sink, Line::Warning(warning));
         }
         if let Some(post) = post {
-            self.posts.push(Post {
+            let due = Post {
                 index,
+                slot: 0,
                 uses: step.uses.clone(),
                 action_name: name.clone(),
                 node: node.clone(),
@@ -340,12 +347,29 @@ impl Job<'_> {
                 condition: post_if.clone(),
                 extra: evaluated.env.clone(),
                 continue_on_error: step.continue_on_error,
-            });
+            };
+            self.queue_post(due);
         }
         let ran = self
             .run_hook(&hook, &node, &script, &name, &evaluated.env, sink)
             .await;
         (common, ran.outcome, ran.outputs)
+    }
+
+    /// Queues a `post` that is due at the end of the job. Inside a
+    /// composite action the step has no slot reserved for it, and the
+    /// composite step's `env` still applies to it.
+    fn queue_post(&mut self, mut post: Post) {
+        let steps = self.doc.job.steps.len();
+        post.slot = if post.index < steps {
+            2 * steps + post.index
+        } else {
+            self.fresh_slot()
+        };
+        let mut extra = self.scope_env.clone();
+        extra.extend(std::mem::take(&mut post.extra));
+        post.extra = extra;
+        self.posts.push(post);
     }
 
     /// The Node binary, the script's path, `GITHUB_ACTION` and the
@@ -365,7 +389,7 @@ impl Job<'_> {
 
     /// Evaluates the step's `env` and `with:` in the caller's contexts,
     /// and the action's input defaults in the action's.
-    fn evaluate(
+    pub(super) fn evaluate(
         &self,
         step: &UsesStep,
         action: &Action,
@@ -406,13 +430,14 @@ impl Job<'_> {
             ActionRef::Local(_) => (String::new(), String::new()),
         };
         let path = action.dir.to_string_lossy().into_owned();
-        let scope = caller.with_action(ActionScope {
+        let mut action_scope = ActionScope {
             action: name.to_owned(),
             path: path.clone(),
             ref_: ref_.clone(),
             repository: repository.clone(),
             inputs: given.clone(),
-        });
+        };
+        let scope = caller.with_action(action_scope.clone());
 
         let mut warnings = Vec::new();
         let declared = &action.meta.inputs;
@@ -448,6 +473,8 @@ impl Job<'_> {
             ));
         }
 
+        action_scope.inputs = inputs.clone();
+        let step_env = env.clone();
         for (input, value) in inputs {
             let key = format!("INPUT_{}", input.replace(' ', "_").to_uppercase());
             env.insert(key, value);
@@ -457,7 +484,12 @@ impl Job<'_> {
             env.insert("GITHUB_ACTION_REPOSITORY".to_owned(), repository);
             env.insert("GITHUB_ACTION_REF".to_owned(), ref_);
         }
-        Ok(Evaluated { env, warnings })
+        Ok(Evaluated {
+            env,
+            step_env,
+            scope: action_scope,
+            warnings,
+        })
     }
 
     /// Runs one script of a JavaScript action on Node, as the runner
@@ -521,6 +553,7 @@ impl Job<'_> {
         let mut env = base_env(self, &files, action_name)?;
         env.extend(self.github_env.clone());
         env.extend(self.declared_env.clone());
+        env.extend(self.scope_env.clone());
         env.extend(extra.clone());
         if let Some(state) = self.states.get(&hook.index) {
             for (key, value) in state {

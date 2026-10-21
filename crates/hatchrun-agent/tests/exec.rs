@@ -913,3 +913,247 @@ fn a_second_sigterm_stops_the_job_at_once() {
     assert_eq!(result.conclusion, Conclusion::Cancelled);
     assert_eq!(result.steps[2].outcome, Conclusion::Skipped);
 }
+
+// Composite actions.
+
+/// A `with:` value for a step.
+fn with(step: &mut hatchrun_workflow::UsesStep, key: &str, value: &str) {
+    step.with.insert(key.to_owned(), value.into());
+}
+
+#[test]
+fn composite_inputs_steps_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\n\
+         inputs:\n  n:\n    description: x\n\
+         outputs:\n  out:\n    description: x\n    value: ${{ steps.s.outputs.v }}\n\
+         runs:\n  using: composite\n  steps:\n\
+         \x20   - id: s\n      shell: bash\n      run: echo \"v=${{ inputs.n }}0\" >> \"$GITHUB_OUTPUT\"\n",
+        &[],
+    );
+    let mut step = make::uses("c", "./comp");
+    with(&mut step, "n", "4");
+    let out = run_steps(
+        dir.path(),
+        vec![
+            PlannedStep::Uses(step),
+            make::step("echo got=${{ steps.c.outputs.out }}"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    assert!(
+        lines(&out).contains(&"got=40".to_owned()),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(result(dir.path()).steps.len(), 2);
+}
+
+#[test]
+fn composite_steps_context_is_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\nruns:\n  using: composite\n  steps:\n\
+         \x20   - id: inner\n      shell: bash\n      run: echo \"v=2\" >> \"$GITHUB_OUTPUT\"\n\
+         \x20   - shell: bash\n      run: |\n        echo \"sees-caller=[${{ steps.before.outputs.v }}]\"\n        echo \"sees-own=[${{ steps.inner.outputs.v }}]\"\n        echo \"secret=[${{ secrets.S }}]\"\n",
+        &[],
+    );
+    let mut before = make::run("echo v=1 >> \"$GITHUB_OUTPUT\"");
+    before.id = Some("before".to_owned());
+    let out = run_steps(
+        dir.path(),
+        vec![
+            make::planned(before),
+            PlannedStep::Uses(make::uses("c", "./comp")),
+            make::step("echo \"sees-inner=[${{ steps.inner.outputs.v }}]\""),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    let text = lines(&out);
+    for want in [
+        "sees-caller=[]",
+        "sees-own=[2]",
+        "secret=[]",
+        "sees-inner=[]",
+    ] {
+        assert!(text.contains(&want.to_owned()), "{want}: {text:?}");
+    }
+}
+
+#[test]
+fn composite_run_needs_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\nruns:\n  using: composite\n  steps:\n    - run: echo hi\n",
+        &[],
+    );
+    let out = run_steps(
+        dir.path(),
+        vec![PlannedStep::Uses(make::uses("c", "./comp"))],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        stdout(&out).contains("Required property is missing: shell"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!lines(&out).contains(&"hi".to_owned()));
+}
+
+#[test]
+fn composite_calls_a_js_action() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    hooked(dir.path(), "1");
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\nruns:\n  using: composite\n  steps:\n    - uses: ./1\n    - shell: bash\n      run: echo after-js\n",
+        &[],
+    );
+    let out = run_steps(
+        dir.path(),
+        vec![
+            PlannedStep::Uses(make::uses("c", "./comp")),
+            make::step("echo last"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    let text: Vec<String> = lines(&out)
+        .into_iter()
+        .filter(|l| !l.starts_with("=="))
+        .collect();
+    // The nested action has no `pre`; its `post` runs at the job's end.
+    assert_eq!(text, ["main1", "after-js", "last", "post1", "statesaved1"]);
+    assert_eq!(result(dir.path()).steps.len(), 2);
+}
+
+#[test]
+fn nesting_is_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: loop\nruns:\n  using: composite\n  steps:\n    - uses: ./comp\n",
+        &[],
+    );
+    let out = run_steps(
+        dir.path(),
+        vec![PlannedStep::Uses(make::uses("c", "./comp"))],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        stdout(&out).contains("`./comp` is nested more than 10 composite actions deep"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(result(dir.path()).conclusion, Conclusion::Failure);
+}
+
+#[test]
+fn composite_env_github_env_and_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\nruns:\n  using: composite\n  steps:\n\
+         \x20   - shell: bash\n      run: echo \"a=$A b=$B path=$GITHUB_ACTION_PATH\"\n      env:\n        B: inner\n\
+         \x20   - shell: bash\n      run: echo X=set >> \"$GITHUB_ENV\"\n\
+         \x20   - shell: bash\n      run: echo \"x=$X\"\n\
+         \x20   - shell: bash\n      run: exit 1\n      continue-on-error: true\n\
+         \x20   - shell: bash\n      run: echo after-tolerated-failure\n\
+         \x20   - shell: bash\n      run: exit 3\n\
+         \x20   - shell: bash\n      run: echo not-run\n\
+         \x20   - if: always()\n      shell: bash\n      run: echo cleanup\n",
+        &[],
+    );
+    let mut step = make::uses("c", "./comp");
+    step.env.insert("A".to_owned(), "outer".to_owned());
+    step.env.insert("B".to_owned(), "outer".to_owned());
+    let out = run_steps(
+        dir.path(),
+        vec![
+            PlannedStep::Uses(step),
+            make::step("echo caller-x=$X caller-a=[$A]"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}\n{}", stdout(&out));
+    let text = lines(&out);
+    assert!(
+        text.iter()
+            .any(|l| l.starts_with("a=outer b=inner path=") && l.ends_with("/repo/repo/comp")),
+        "{text:?}"
+    );
+    assert!(text.contains(&"x=set".to_owned()), "{text:?}");
+    assert!(
+        text.contains(&"after-tolerated-failure".to_owned()),
+        "{text:?}"
+    );
+    assert!(!text.contains(&"not-run".to_owned()), "{text:?}");
+    assert!(text.contains(&"cleanup".to_owned()), "{text:?}");
+    let result = result(dir.path());
+    assert_eq!(result.steps[0].conclusion, Conclusion::Failure);
+}
+
+#[test]
+fn composite_github_env_persists_for_the_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo X=set >> \"$GITHUB_ENV\"\n",
+        &[],
+    );
+    let mut step = make::uses("c", "./comp");
+    step.env.insert("A".to_owned(), "outer".to_owned());
+    let out = run_steps(
+        dir.path(),
+        vec![
+            PlannedStep::Uses(step),
+            make::step("echo caller-x=$X caller-a=[$A]"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    assert!(
+        lines(&out).contains(&"caller-x=set caller-a=[]".to_owned()),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn a_cancel_stops_a_composite_step() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\nruns:\n  using: composite\n  steps:\n\
+         \x20   - shell: bash\n      run: echo inner-started; sleep 600\n\
+         \x20   - shell: bash\n      run: echo never\n",
+        &[],
+    );
+    let doc = make::document(vec![
+        PlannedStep::Uses(make::uses("c", "./comp")),
+        make::step("echo also-never"),
+    ]);
+    let child = start_agent(dir.path(), &doc);
+    std::thread::sleep(Duration::from_secs(1));
+    term(&child);
+    let out = child.wait_with_output().unwrap();
+    let text = lines(&out);
+    assert!(text.contains(&"inner-started".to_owned()), "{text:?}");
+    assert!(!text.contains(&"never".to_owned()), "{text:?}");
+    assert!(!text.contains(&"also-never".to_owned()), "{text:?}");
+    let result = result(dir.path());
+    assert_eq!(result.conclusion, Conclusion::Cancelled);
+    assert_eq!(result.steps[0].outcome, Conclusion::Cancelled);
+}
