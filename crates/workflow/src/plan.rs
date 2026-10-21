@@ -502,7 +502,7 @@ impl Check<'_> {
     /// Checks an `if:`, which is a bare expression unless it is wrapped
     /// in `${{ }}`.
     fn cond(&mut self, field: &str, cond: &str) {
-        if cond.contains("${{") {
+        if expr::find_open(cond).is_some() {
             self.text(field, cond);
         } else {
             self.expression(field, cond, 0);
@@ -1428,7 +1428,7 @@ fn bind(
 /// What a value should have been, when it is not of `kind`. A string
 /// holding an expression passes any kind; it is checked at run time.
 fn kind_mismatch(kind: &ParameterKind, value: &Value) -> Option<String> {
-    if value.as_str().is_some_and(|s| s.contains("${{")) {
+    if value.as_str().is_some_and(|s| expr::find_open(s).is_some()) {
         return None;
     }
     let ok = match kind {
@@ -1656,7 +1656,7 @@ fn no_parameters_here(id: &str, key: &str) -> Diagnostic {
 /// nothing else.
 fn sole_parameter(text: &str) -> Option<&str> {
     let inner = text.trim().strip_prefix("${{")?.strip_suffix("}}")?;
-    if inner.contains("}}") {
+    if expr::find_close(inner).is_some() {
         return None;
     }
     parameter_name(inner)
@@ -1684,9 +1684,9 @@ enum Piece<'t> {
 fn pieces(text: &str) -> Vec<Piece<'_>> {
     let mut out = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find("${{") {
+    while let Some(start) = expr::find_open(rest) {
         let body = &rest[start + 3..];
-        let Some(end) = body.find("}}") else {
+        let Some(end) = expr::find_close(body) else {
             break;
         };
         let whole_end = start + 3 + end + 2;
@@ -1717,7 +1717,7 @@ fn substitute(
     if walk.budget.spent {
         return String::new();
     }
-    if !text.contains("${{") {
+    if expr::find_open(text).is_none() {
         return if walk.bytes(text.len(), errors) {
             text.to_owned()
         } else {

@@ -199,6 +199,46 @@ fn tree(expr: &str) -> Result<parser::Expr<'_>, ExprError> {
     parser::parse(lexer::lex(expr)?)
 }
 
+/// The byte offset of the first `${{` in `text`.
+///
+/// `str::find` with a string sets up a two-way searcher on every call,
+/// which costs more than the search on the short strings of a workflow.
+/// A short text is searched for the needle's first character, which
+/// `memchr` finds, and the rest is checked; after a few false starts
+/// the rest of the text goes to `str::find`, so text full of `$` stays
+/// linear. A long text is first checked with `str::contains`, which is
+/// faster than both on long text.
+pub(crate) fn find_open(text: &str) -> Option<usize> {
+    find(text, '$', "${{")
+}
+
+/// The byte offset of the first `}}` in `text`.
+pub(crate) fn find_close(text: &str) -> Option<usize> {
+    find(text, '}', "}}")
+}
+
+/// Text up to this long is searched by its first character.
+const SHORT: usize = 256;
+
+fn find(text: &str, first: char, needle: &str) -> Option<usize> {
+    if text.len() > SHORT {
+        return if text.contains(needle) {
+            text.find(needle)
+        } else {
+            None
+        };
+    }
+    let mut from = 0;
+    for _ in 0..8 {
+        let at = from + text[from..].find(first)?;
+        if text[at..].starts_with(needle) {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    text[from..].find(needle).map(|i| from + i)
+}
+
 /// The `${{ }}` expressions in `template`: the byte offset of the text
 /// between the braces and that text.
 ///
@@ -209,7 +249,7 @@ fn tree(expr: &str) -> Result<parser::Expr<'_>, ExprError> {
 pub(crate) fn expressions(template: &str) -> Result<Vec<(usize, &str)>, ExprError> {
     let mut out = Vec::new();
     let mut rest = 0;
-    while let Some(found) = template[rest..].find("${{") {
+    while let Some(found) = find_open(&template[rest..]) {
         let open = rest + found;
         let start = open + 3;
         let end = closing(template, start)
@@ -236,7 +276,7 @@ pub fn interpolate(
     let budget = eval::Budget::new();
     let mut out = String::with_capacity(template.len());
     let mut rest = 0;
-    while let Some(found) = template[rest..].find("${{") {
+    while let Some(found) = find_open(&template[rest..]) {
         let open = rest + found;
         let start = open + 3;
         let end = closing(template, start)
