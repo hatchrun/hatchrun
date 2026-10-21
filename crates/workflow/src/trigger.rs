@@ -15,21 +15,33 @@ use crate::config::Parameter;
 
 /// Ordered GitHub filter patterns. A leading `!` negates a pattern.
 ///
-/// In YAML it is a list of strings or a single string.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Filter(Vec<String>);
+/// In YAML it is a list of strings or a single string. Each pattern is
+/// compiled once, when the filter is made.
+#[derive(Clone, Default)]
+pub struct Filter {
+    patterns: Vec<String>,
+    /// Each pattern, compiled: whether it is negated, and its glob.
+    compiled: Vec<(bool, Glob)>,
+}
 
 impl Filter {
     /// A filter from patterns in the order they apply.
     #[must_use]
     pub fn new(patterns: Vec<String>) -> Self {
-        Self(patterns)
+        let compiled = patterns
+            .iter()
+            .map(|pattern| match pattern.strip_prefix('!') {
+                Some(rest) => (true, Glob::new(rest)),
+                None => (false, Glob::new(pattern)),
+            })
+            .collect();
+        Self { patterns, compiled }
     }
 
     /// The patterns in the order they apply.
     #[must_use]
     pub fn patterns(&self) -> &[String] {
-        &self.0
+        &self.patterns
     }
 
     /// Whether `value` passes the filter.
@@ -39,23 +51,99 @@ impl Filter {
     /// pattern matches does not pass.
     #[must_use]
     pub fn matches(&self, value: &str) -> bool {
-        let chars: Vec<char> = value.chars().collect();
-        let mut passes = false;
-        for pattern in &self.0 {
-            let (negated, body) = match pattern.strip_prefix('!') {
-                Some(rest) => (true, rest),
-                None => (false, pattern.as_str()),
-            };
-            if glob_matches(&compile(body), &chars) {
-                passes = !negated;
-            }
+        self.matches_in(value, &mut Scratch::default())
+    }
+
+    /// [`Filter::matches`], with buffers kept between calls.
+    fn matches_in(&self, value: &str, scratch: &mut Scratch) -> bool {
+        let mut split = false;
+        // The last pattern that matches decides, so look from the end.
+        self.compiled
+            .iter()
+            .rev()
+            .find(|(_, glob)| match glob {
+                Glob::Literal(text) => text == value,
+                Glob::Prefix(text) => value.starts_with(text.as_str()),
+                Glob::Suffix(text) => value.ends_with(text.as_str()),
+                Glob::Tokens(toks) => {
+                    if !split {
+                        scratch.chars.clear();
+                        scratch.chars.extend(value.chars());
+                        split = true;
+                    }
+                    glob_matches(toks, scratch)
+                }
+            })
+            .is_some_and(|(negated, _)| !negated)
+    }
+}
+
+/// Buffers for matching: the value's characters and two position sets.
+#[derive(Default)]
+struct Scratch {
+    chars: Vec<char>,
+    at: Vec<bool>,
+    next: Vec<bool>,
+}
+
+impl PartialEq for Filter {
+    fn eq(&self, other: &Self) -> bool {
+        self.patterns == other.patterns
+    }
+}
+
+impl Eq for Filter {}
+
+impl fmt::Debug for Filter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Filter").field(&self.patterns).finish()
+    }
+}
+
+/// A compiled pattern.
+#[derive(Debug, Clone)]
+enum Glob {
+    /// A pattern with no wildcard, class or repeat: only this text
+    /// matches.
+    Literal(String),
+    /// Text then `**`: what starts with the text matches.
+    Prefix(String),
+    /// `**` then text: what ends with the text matches.
+    Suffix(String),
+    /// Anything else.
+    Tokens(Vec<Tok>),
+}
+
+impl Glob {
+    fn new(pattern: &str) -> Self {
+        let toks = compile(pattern);
+        let text = |toks: &[Tok]| -> Option<String> {
+            toks.iter()
+                .map(|t| match t {
+                    Tok::Lit(c) => Some(*c),
+                    _ => None,
+                })
+                .collect()
+        };
+        if let Some(lit) = text(&toks) {
+            return Glob::Literal(lit);
         }
-        passes
+        if let Some((Tok::StarStar, rest)) = toks.split_last()
+            && let Some(lit) = text(rest)
+        {
+            return Glob::Prefix(lit);
+        }
+        if let Some((Tok::StarStar, rest)) = toks.split_first()
+            && let Some(lit) = text(rest)
+        {
+            return Glob::Suffix(lit);
+        }
+        Glob::Tokens(toks)
     }
 }
 
 /// One element of a compiled pattern.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Tok {
     /// A literal character.
     Lit(char),
@@ -157,16 +245,25 @@ fn class(chars: &[char], start: usize) -> Option<(Tok, usize)> {
     }
 }
 
-/// Whether the whole of `value` matches the tokens. Tracks the set of
-/// reachable positions, so the cost stays polynomial for any pattern.
-fn glob_matches(toks: &[Tok], value: &[char]) -> bool {
+/// Whether the whole of `scratch.chars` matches the tokens. Tracks the
+/// set of reachable positions, so the cost stays polynomial for any
+/// pattern.
+fn glob_matches(toks: &[Tok], scratch: &mut Scratch) -> bool {
+    let Scratch { chars, at, next } = scratch;
+    let value = &chars[..];
     let n = value.len();
-    let mut at = vec![false; n + 1];
+    at.clear();
+    at.resize(n + 1, false);
     at[0] = true;
     for tok in toks {
-        let mut next = vec![false; n + 1];
+        next.clear();
+        next.resize(n + 1, false);
+        let mut any = false;
         for p in (0..=n).filter(|&p| at[p]) {
             match tok {
+                // A run already reached `p` from further left and went on
+                // as far as one from `p` would.
+                Tok::Star | Tok::StarStar | Tok::Plus(_) if next[p] => {}
                 Tok::Star | Tok::StarStar => {
                     let mut q = p;
                     next[q] = true;
@@ -174,28 +271,35 @@ fn glob_matches(toks: &[Tok], value: &[char]) -> bool {
                         q += 1;
                         next[q] = true;
                     }
+                    any = true;
                 }
                 Tok::Opt(inner) => {
                     next[p] = true;
                     if p < n && inner.accepts(value[p]) {
                         next[p + 1] = true;
                     }
+                    any = true;
                 }
                 Tok::Plus(inner) => {
                     let mut q = p;
                     while q < n && inner.accepts(value[q]) {
                         q += 1;
                         next[q] = true;
+                        any = true;
                     }
                 }
                 single => {
                     if p < n && single.accepts(value[p]) {
                         next[p + 1] = true;
+                        any = true;
                     }
                 }
             }
         }
-        at = next;
+        std::mem::swap(at, next);
+        if !any {
+            return false;
+        }
     }
     at[n]
 }
@@ -212,7 +316,7 @@ impl<'de> Deserialize<'de> for Filter {
             }
 
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Filter, E> {
-                Ok(Filter(vec![value.to_owned()]))
+                Ok(Filter::new(vec![value.to_owned()]))
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Filter, A::Error> {
@@ -220,7 +324,7 @@ impl<'de> Deserialize<'de> for Filter {
                 while let Some(pattern) = seq.next_element::<String>()? {
                     patterns.push(pattern);
                 }
-                Ok(Filter(patterns))
+                Ok(Filter::new(patterns))
             }
         }
 
@@ -230,8 +334,8 @@ impl<'de> Deserialize<'de> for Filter {
 
 impl Serialize for Filter {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for pattern in &self.0 {
+        let mut seq = serializer.serialize_seq(Some(self.patterns.len()))?;
+        for pattern in &self.patterns {
             seq.serialize_element(pattern)?;
         }
         seq.end()
@@ -449,8 +553,14 @@ fn paths_pass(include: Option<&Filter>, ignore: Option<&Filter>, changed: &[Stri
         (None, None) => true,
         (Some(_), Some(_)) => false,
         _ if changed.is_empty() => true,
-        (Some(include), None) => changed.iter().any(|p| include.matches(p)),
-        (None, Some(ignore)) => changed.iter().any(|p| !ignore.matches(p)),
+        (Some(include), None) => {
+            let mut scratch = Scratch::default();
+            changed.iter().any(|p| include.matches_in(p, &mut scratch))
+        }
+        (None, Some(ignore)) => {
+            let mut scratch = Scratch::default();
+            changed.iter().any(|p| !ignore.matches_in(p, &mut scratch))
+        }
     }
 }
 
@@ -464,4 +574,93 @@ where
     Ok(Some(
         Option::<T>::deserialize(deserializer)?.unwrap_or_default(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The plain set-of-positions match, with no shortcuts.
+    fn reference(toks: &[Tok], value: &[char]) -> bool {
+        let n = value.len();
+        let mut at = vec![false; n + 1];
+        at[0] = true;
+        for tok in toks {
+            let mut next = vec![false; n + 1];
+            for p in (0..=n).filter(|&p| at[p]) {
+                match tok {
+                    Tok::Star | Tok::StarStar => {
+                        let mut q = p;
+                        next[q] = true;
+                        while q < n && (matches!(tok, Tok::StarStar) || value[q] != '/') {
+                            q += 1;
+                            next[q] = true;
+                        }
+                    }
+                    Tok::Opt(inner) => {
+                        next[p] = true;
+                        if p < n && inner.accepts(value[p]) {
+                            next[p + 1] = true;
+                        }
+                    }
+                    Tok::Plus(inner) => {
+                        let mut q = p;
+                        while q < n && inner.accepts(value[q]) {
+                            q += 1;
+                            next[q] = true;
+                        }
+                    }
+                    single => {
+                        if p < n && single.accepts(value[p]) {
+                            next[p + 1] = true;
+                        }
+                    }
+                }
+            }
+            at = next;
+        }
+        at[n]
+    }
+
+    /// Every string of up to `len` pieces drawn from `parts`.
+    fn strings(parts: &[&str], len: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut last = vec![String::new()];
+        for _ in 0..len {
+            last = last
+                .iter()
+                .flat_map(|s| parts.iter().map(move |p| format!("{s}{p}")))
+                .collect();
+            out.extend(last.iter().cloned());
+        }
+        out
+    }
+
+    #[test]
+    fn compiled_filters_match_like_the_plain_glob() {
+        let patterns = strings(
+            &[
+                "a", "b", "/", "*", "**", "?", "+", "[ab]", "[!a]", "\\*", "!",
+            ],
+            3,
+        );
+        let values = strings(&["a", "b", "/", "*"], 4);
+        for pattern in &patterns {
+            let filter = Filter::new(vec!["x".to_owned(), pattern.clone()]);
+            let (negated, body) = match pattern.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, pattern.as_str()),
+            };
+            let toks = compile(body);
+            for value in &values {
+                let chars: Vec<char> = value.chars().collect();
+                let want = if reference(&toks, &chars) {
+                    !negated
+                } else {
+                    value == "x"
+                };
+                assert_eq!(filter.matches(value), want, "{pattern:?} on {value:?}");
+            }
+        }
+    }
 }
