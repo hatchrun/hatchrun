@@ -75,10 +75,7 @@ impl Lines {
                     cut = MAX_LINE;
                 }
                 if let Some(m) = masker {
-                    let safe = m.safe_cut(rest, cut);
-                    if safe > 0 {
-                        cut = safe;
-                    }
+                    cut = m.safe_cut(rest, cut);
                 }
                 out.push(decode(&rest[..cut]));
                 start += cut;
@@ -134,6 +131,20 @@ mod tests {
         );
         assert!(got.iter().all(|l| l.len() <= MAX_LINE));
         assert_eq!(text.len(), (200 << 10) - 6 + 3);
+    }
+
+    #[test]
+    fn a_secret_longer_than_a_line_is_cut_after_it() {
+        let mut m = Masker::default();
+        let secret = "S".repeat(70_000);
+        m.add(&secret);
+        let mut data = secret.clone().into_bytes();
+        data.extend_from_slice(b" tail\n");
+        let mut lines = Lines::default();
+        let mut got = lines.push_masked(&data, &m);
+        got.extend(lines.finish_masked(&m));
+        let text: Vec<String> = got.iter().map(|l| m.mask(l).into_owned()).collect();
+        assert_eq!(text, vec!["***".to_owned(), " tail".to_owned()]);
     }
 
     #[test]

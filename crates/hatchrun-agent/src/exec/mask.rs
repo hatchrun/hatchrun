@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
-use aho_corasick::{AhoCorasick, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -35,6 +35,15 @@ const URI_COMPONENT: &AsciiSet = &STRICT
     .remove(b'(')
     .remove(b')');
 
+/// Patterns kept out of the automaton before they move into it, at
+/// least. The allowance grows with the automaton so the total rebuild
+/// work stays linear.
+const RECENT_MAX: usize = 64;
+
+/// Values longer than this get only their whole encoded forms, not the
+/// forms they take inside a longer base64 string.
+const MAX_PARTIAL_B64_VALUE: usize = 4 << 10;
+
 /// Finds the hidden values in a byte string.
 enum Matcher {
     /// One Aho-Corasick pass.
@@ -47,7 +56,11 @@ enum Matcher {
 impl Matcher {
     fn build(patterns: &BTreeSet<String>) -> Self {
         AhoCorasick::builder()
-            .match_kind(MatchKind::LeftmostLongest)
+            .match_kind(MatchKind::Standard)
+            // The default builds a DFA with a row of states per input
+            // byte of every pattern, which takes minutes for a value of
+            // tens of kilobytes.
+            .kind(Some(AhoCorasickKind::ContiguousNFA))
             .build(patterns)
             .map_or_else(|_| Self::plain(patterns), Self::Fast)
     }
@@ -58,32 +71,72 @@ impl Matcher {
         Self::Plain(sorted)
     }
 
-    /// Non-overlapping `(start, end)` spans, left to right, longest first.
+    /// Every `(start, end)` match, overlapping ones included, in no
+    /// particular order.
     fn spans(&self, hay: &[u8]) -> Vec<(usize, usize)> {
         match self {
-            Self::Fast(ac) => ac.find_iter(hay).map(|m| (m.start(), m.end())).collect(),
-            Self::Plain(sorted) => {
-                let mut out = Vec::new();
-                let mut i = 0;
-                while i < hay.len() {
+            Self::Fast(ac) => ac
+                .find_overlapping_iter(hay)
+                .map(|m| (m.start(), m.end()))
+                .collect(),
+            Self::Plain(sorted) => (0..hay.len())
+                .filter_map(|i| {
                     let rest = &hay[i..];
-                    if let Some(p) = sorted.iter().find(|p| rest.starts_with(p.as_bytes())) {
-                        out.push((i, i + p.len()));
-                        i += p.len();
-                    } else {
-                        i += 1;
-                    }
-                }
-                out
-            }
+                    sorted
+                        .iter()
+                        .find(|p| rest.starts_with(p.as_bytes()))
+                        .map(|p| (i, i + p.len()))
+                })
+                .collect(),
         }
     }
 }
 
+/// Every place any of `patterns` occurs in `hay`, overlaps included. A
+/// plain scan: cheaper than building an automaton for a handful of
+/// patterns that will be replaced soon.
+fn scan(patterns: &BTreeSet<String>, hay: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for p in patterns {
+        let p = p.as_bytes();
+        let Some((&first, _)) = p.split_first() else {
+            continue;
+        };
+        let mut from = 0;
+        while let Some(i) = hay[from..].iter().position(|&b| b == first) {
+            let at = from + i;
+            if hay[at..].starts_with(p) {
+                out.push((at, at + p.len()));
+            }
+            from = at + 1;
+        }
+    }
+    out
+}
+
+/// Sorts spans and joins those that overlap, so the union of the hidden
+/// values is replaced once. Spans that only touch stay apart.
+fn merge(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    spans.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(spans.len().min(1024));
+    for (start, end) in spans {
+        match out.last_mut() {
+            Some(last) if start < last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
 /// The set of values to hide, matched in one pass over each line.
+///
+/// New values are found by a plain scan and move into the automaton in
+/// batches, so a job that adds many masks between lines of output does
+/// not rebuild the automaton each time.
 #[derive(Default)]
 pub struct Masker {
     patterns: BTreeSet<String>,
+    recent: BTreeSet<String>,
     max_len: usize,
     matcher: OnceLock<Option<Matcher>>,
 }
@@ -109,24 +162,32 @@ impl Masker {
                 self.insert(upper);
             }
         }
-        self.matcher = OnceLock::new();
+        if self.recent.len() > RECENT_MAX.max(self.patterns.len() / 8) {
+            self.patterns.append(&mut self.recent);
+            self.matcher = OnceLock::new();
+        }
     }
 
     fn insert(&mut self, pattern: String) {
-        if !pattern.trim().is_empty() {
+        if !pattern.trim().is_empty() && !self.patterns.contains(&pattern) {
             self.max_len = self.max_len.max(pattern.len());
-            self.patterns.insert(pattern);
+            self.recent.insert(pattern);
         }
     }
 
     /// Adds the base64 text of `bytes` (standard and URL-safe alphabets)
     /// as it appears at each of the three alignments inside a longer
     /// base64 string. Only the characters that do not depend on
-    /// neighbouring bytes are kept.
+    /// neighbouring bytes are kept. A long value gets just its whole
+    /// forms.
     fn insert_base64(&mut self, bytes: &[u8]) {
         self.insert(STANDARD.encode(bytes));
         self.insert(URL_SAFE.encode(bytes));
+        let partials = bytes.len() <= MAX_PARTIAL_B64_VALUE;
         for (pad, skip) in [(0usize, 0usize), (1, 2), (2, 3)] {
+            if pad > 0 && !partials {
+                break;
+            }
             let mut buf = vec![0u8; pad];
             buf.extend_from_slice(bytes);
             for engine in [STANDARD_NO_PAD, URL_SAFE_NO_PAD] {
@@ -145,25 +206,23 @@ impl Masker {
         }
     }
 
-    fn matcher(&self) -> Option<&Matcher> {
-        self.matcher
-            .get_or_init(|| {
-                if self.patterns.is_empty() {
-                    None
-                } else {
-                    Some(Matcher::build(&self.patterns))
-                }
-            })
-            .as_ref()
+    /// The union of the places hidden values occur in `hay`, sorted.
+    fn spans(&self, hay: &[u8]) -> Vec<(usize, usize)> {
+        let big = self
+            .matcher
+            .get_or_init(|| (!self.patterns.is_empty()).then(|| Matcher::build(&self.patterns)));
+        let mut all = big.as_ref().map_or_else(Vec::new, |m| m.spans(hay));
+        all.extend(scan(&self.recent, hay));
+        merge(all)
     }
 
-    /// Replaces every hidden value in `line` with `***`. At each position
-    /// the longest match wins.
+    /// Replaces every hidden value in `line` with `***`. Values that
+    /// overlap are replaced as one.
     pub fn mask<'a>(&self, line: &'a str) -> Cow<'a, str> {
-        let Some(matcher) = self.matcher() else {
+        if self.max_len == 0 {
             return Cow::Borrowed(line);
-        };
-        let spans = matcher.spans(line.as_bytes());
+        }
+        let spans = self.spans(line.as_bytes());
         if spans.is_empty() {
             return Cow::Borrowed(line);
         }
@@ -184,15 +243,17 @@ impl Masker {
     }
 
     /// The largest cut point at or below `max` that is not inside a
-    /// hidden value in `buf`. Returns `max` when no value spans it.
+    /// hidden value in `buf`. Returns `max` when no value spans it. When
+    /// a value spans it from the very start of `buf`, the cut is at the
+    /// end of that value instead, because no earlier cut exists.
     pub fn safe_cut(&self, buf: &[u8], max: usize) -> usize {
-        let Some(matcher) = self.matcher() else {
+        if self.max_len == 0 {
             return max;
-        };
+        }
         let end = buf.len().min(max.saturating_add(self.max_len));
-        for (start, stop) in matcher.spans(&buf[..end]) {
+        for (start, stop) in self.spans(&buf[..end]) {
             if start < max && max < stop {
-                return start;
+                return if start == 0 { stop } else { start };
             }
         }
         max
@@ -307,6 +368,54 @@ mod tests {
         assert!(matches!(m.mask("plain"), Cow::Borrowed("plain")));
         m.add("zzzz");
         assert!(matches!(m.mask("plain"), Cow::Borrowed("plain")));
+    }
+
+    #[test]
+    fn a_long_base64_form_is_masked_whole() {
+        let mut m = Masker::default();
+        let value = "k".repeat(55_000);
+        m.add(&value);
+        let text = STANDARD.encode(&value);
+        let mut lines = Lines::default();
+        let mut got = lines.push_masked(text.as_bytes(), &m);
+        got.extend(lines.finish_masked(&m));
+        let text: Vec<String> = got.iter().map(|l| m.mask(l).into_owned()).collect();
+        assert_eq!(text, vec!["***".to_owned()]);
+    }
+
+    #[test]
+    fn overlapping_secrets_are_masked_as_one() {
+        let mut m = Masker::default();
+        m.add("deploy-");
+        m.add("-key-9f8e7d6c5b4a");
+        assert_eq!(m.mask("token=deploy-key-9f8e7d6c5b4a"), "token=***");
+        assert_eq!(m.mask("x deploy- y"), "x *** y");
+    }
+
+    #[test]
+    fn a_cut_never_lands_inside_overlapping_secrets() {
+        let mut m = Masker::default();
+        m.add("deploy-");
+        m.add("-key-9f8e7d6c5b4a");
+        let mut buf = vec![b'a'; 100];
+        buf[40..47].copy_from_slice(b"deploy-");
+        buf[46..63].copy_from_slice(b"-key-9f8e7d6c5b4a");
+        assert_eq!(m.safe_cut(&buf, 55), 40);
+    }
+
+    #[test]
+    fn many_adds_between_output_stay_fast() {
+        let started = std::time::Instant::now();
+        let mut m = Masker::default();
+        for i in 0..1000 {
+            m.add(&format!("secret-value-{i:04}-{}", "x".repeat(64)));
+            assert_eq!(m.mask("plain"), "plain");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

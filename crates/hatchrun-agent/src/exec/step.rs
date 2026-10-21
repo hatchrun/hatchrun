@@ -51,7 +51,7 @@ pub const MAX_MASKS: usize = 1000;
 /// The longest `::add-mask::` value, in bytes.
 const MAX_MASK_LEN: usize = 64 << 10;
 /// The most bytes of `::add-mask::` values one job may hide.
-pub const MAX_MASK_BYTES: usize = 1 << 20;
+pub const MAX_MASK_BYTES: usize = 256 << 10;
 
 const SET_OUTPUT_WARNING: &str = "Warning: The `set-output` command is deprecated and will be disabled soon. Write name=value to the file named by $GITHUB_OUTPUT instead.";
 
@@ -244,7 +244,7 @@ impl<'a> StepOutput<'a> {
                 } else if self.budget.masks >= MAX_MASKS {
                     self.warn_mask("the limit of 1000 `add-mask` values was reached");
                 } else if self.budget.mask_bytes + value.len() > MAX_MASK_BYTES {
-                    self.warn_mask("the limit of 1 MiB of `add-mask` values was reached");
+                    self.warn_mask("the limit of 256 KiB of `add-mask` values was reached");
                 } else {
                     self.budget.masks += 1;
                     self.budget.mask_bytes += value.len();
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn add_mask_bytes_are_capped_per_job() {
         let mut budget = Budget::default();
-        let value = "m".repeat(60_000);
+        let value = "m".repeat(20_000);
         let mut text = String::new();
         for i in 0..25 {
             let _ = writeln!(text, "::add-mask::{i}{value}");
@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(
             sink.lines
                 .iter()
-                .filter(|l| l.contains("1 MiB of `add-mask` values"))
+                .filter(|l| l.contains("256 KiB of `add-mask` values"))
                 .count(),
             1
         );
