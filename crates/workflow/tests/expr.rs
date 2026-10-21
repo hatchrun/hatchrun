@@ -589,3 +589,46 @@ fn checks_status_finds_status_calls_in_the_parsed_expression() {
     assert!(checks_status("${{ 1 + }}").is_err());
     assert!(checks_status("${{ success()").is_err());
 }
+
+#[test]
+fn condition_runs_on_success_unless_it_checks_status() {
+    use hatchrun_workflow::condition;
+    let ctx = json!({ "github": { "ref": "refs/heads/main", "sha": "abc" } });
+    let run = |cond: &str, status| condition(cond, &ctx, &Files(status));
+    for (cond, passing, failed) in [
+        ("github.ref == 'refs/heads/main'", true, false),
+        ("${{ github.ref == 'refs/heads/main' }}", true, false),
+        ("  ${{ github.ref == 'refs/heads/dev' }} ", false, false),
+        ("always()", true, true),
+        (
+            "${{ always() && github.ref == 'refs/heads/main' }}",
+            true,
+            true,
+        ),
+        ("failure()", false, true),
+        ("!cancelled()", true, true),
+        ("github.ref == 'success()'", false, false),
+        ("sha ${{ github.sha }}", true, false),
+        ("${{ github.sha }} ${{ always() }}", true, true),
+        ("${{ github.nothing }}", false, false),
+    ] {
+        assert_eq!(run(cond, JobStatus::Success), Ok(passing), "{cond} passing");
+        assert_eq!(run(cond, JobStatus::Failure), Ok(failed), "{cond} failed");
+    }
+    assert_eq!(run("${{ success() }}", JobStatus::Cancelled), Ok(false));
+    assert_eq!(run("${{ cancelled() }}", JobStatus::Cancelled), Ok(true));
+}
+
+#[test]
+fn condition_errors_point_into_the_whole_condition() {
+    use hatchrun_workflow::condition;
+    let at = |cond: &str| {
+        condition(cond, &json!({}), &Files(JobStatus::Success))
+            .unwrap_err()
+            .offset
+    };
+    assert_eq!(at("nosuch(1)"), 0);
+    assert_eq!(at("  ${{ nosuch(1) }}"), 6);
+    assert_eq!(at("x ${{ nosuch(1) }}"), 6);
+    assert!(condition("${{ always()", &json!({}), &Files(JobStatus::Success)).is_err());
+}

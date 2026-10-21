@@ -30,8 +30,7 @@ use std::process::Command;
 
 use hatchrun_workflow::{
     Arch, Config, Event, ExprError, Functions, JobKind, JobStatus, ParameterKind, Plan, PlannedJob,
-    PlannedStep, Workflow, checks_status, compile, evaluate, interpolate, parse, to_yaml,
-    triggered, truthy,
+    PlannedStep, Workflow, compile, interpolate, parse, to_yaml, triggered,
 };
 use serde_json::{Map, Value, json};
 
@@ -323,21 +322,9 @@ impl Upstream {
     }
 }
 
-/// Evaluates an `if:` as GitHub does: a condition that calls no status
-/// function runs only on success, and a whole `${{ }}` is unwrapped.
+/// Evaluates an `if:` with the job's status as `status`.
 fn condition(cond: &str, ctx: &Value, status: JobStatus) -> Result<bool, ExprError> {
-    let trimmed = cond.trim();
-    let inner = trimmed
-        .strip_prefix("${{")
-        .and_then(|rest| rest.strip_suffix("}}"))
-        .filter(|inner| !inner.contains("${{"));
-    let funcs = Status(status);
-    let value = match inner {
-        Some(inner) => evaluate(inner, ctx, &funcs)?,
-        None if trimmed.contains("${{") => Value::String(interpolate(trimmed, ctx, &funcs)?),
-        None => evaluate(trimmed, ctx, &funcs)?,
-    };
-    Ok(truthy(&value) && (checks_status(trimmed)? || status == JobStatus::Success))
+    hatchrun_workflow::condition(cond, ctx, &Status(status))
 }
 
 fn shown(result: Result<bool, ExprError>) -> String {

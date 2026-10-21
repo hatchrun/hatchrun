@@ -167,6 +167,45 @@ pub fn checks_status(cond: &str) -> Result<bool, ExprError> {
     Ok(false)
 }
 
+/// Whether an `if:` lets its step or job run, as GitHub decides it.
+///
+/// A whole `${{ }}` is unwrapped and evaluated as one expression. Text
+/// holding `${{ }}` among other text is interpolated, so it is true
+/// when the result is not empty. Bare text is evaluated as an
+/// expression. A condition that calls no status function runs only
+/// while `funcs` reports [`JobStatus::Success`], as [`checks_status`]
+/// describes.
+///
+/// # Errors
+///
+/// When an expression does not parse or fails to evaluate, or a `${{`
+/// is not closed. The offset is relative to `cond`.
+pub fn condition(cond: &str, ctx: &Value, funcs: &dyn Functions) -> Result<bool, ExprError> {
+    let trimmed = cond.trim();
+    let lead = cond.len() - cond.trim_start().len();
+    let shift = |by: usize| {
+        move |e: ExprError| ExprError {
+            message: e.message,
+            offset: e.offset + by,
+        }
+    };
+    let inner = trimmed
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .filter(|inner| find_open(inner).is_none());
+    let value = match inner {
+        Some(inner) => evaluate(inner, ctx, funcs).map_err(shift(lead + 3))?,
+        None if find_open(trimmed).is_some() => {
+            Value::String(interpolate(trimmed, ctx, funcs).map_err(shift(lead))?)
+        }
+        None => evaluate(trimmed, ctx, funcs).map_err(shift(lead))?,
+    };
+    if !truthy(&value) {
+        return Ok(false);
+    }
+    Ok(funcs.status() == JobStatus::Success || checks_status(trimmed).map_err(shift(lead))?)
+}
+
 /// Checks one expression without evaluating it: it must parse, call
 /// only known functions with the right number of arguments and read
 /// only known contexts.
