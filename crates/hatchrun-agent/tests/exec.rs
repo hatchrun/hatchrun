@@ -1827,3 +1827,33 @@ fn a_cancel_ends_a_large_save_promptly() {
         0
     );
 }
+
+#[test]
+fn parallel_node_gets_timings_and_node_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step(
+        "echo \"node=$HATCHRUN_NODE_INDEX/$HATCHRUN_NODE_TOTAL\"; cat \"$HATCHRUN_TIMINGS\"; echo; \
+         stat -c 'mode=%a' \"$HATCHRUN_TIMINGS\" 2>/dev/null || stat -f 'mode=%Lp' \"$HATCHRUN_TIMINGS\"",
+    )]);
+    doc.job.node = Some((1, 3));
+    doc.timings.insert("a".to_owned(), 2.5);
+    let out = exec(dir.path(), &json(&doc));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = stdout(&out);
+    assert!(text.lines().any(|l| l == "node=1/3"), "{text}");
+    assert!(text.lines().any(|l| l == r#"{"a":2.5}"#), "{text}");
+    assert!(text.lines().any(|l| l == "mode=644"), "{text}");
+}
+
+#[test]
+fn job_without_a_node_gets_timings_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = make::document(vec![make::step(
+        "echo \"node=[$HATCHRUN_NODE_INDEX][$HATCHRUN_NODE_TOTAL]\"; test -f \"$HATCHRUN_TIMINGS\" && echo file",
+    )]);
+    let out = exec(dir.path(), &json(&doc));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = stdout(&out);
+    assert!(text.lines().any(|l| l == "node=[][]"), "{text}");
+    assert!(text.lines().any(|l| l == "file"), "{text}");
+}

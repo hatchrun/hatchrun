@@ -18,6 +18,7 @@ mod imds;
 mod metrics;
 mod runner;
 mod source;
+mod split;
 mod ssm;
 mod telemetry;
 
@@ -119,6 +120,26 @@ enum Command {
         #[arg(long, default_value = "60s", value_parser = humantime::parse_duration, hide = true)]
         minute: Duration,
     },
+    /// Print this parallel node's share of a list of tests.
+    ///
+    /// Reads `HATCHRUN_NODE_INDEX`, `HATCHRUN_NODE_TOTAL` and
+    /// `HATCHRUN_TIMINGS`, which `exec` sets for a parallel job. Items
+    /// come from the arguments, or from stdin one per line. Outside a
+    /// parallel job every item is printed. Exits 2 on unusable input.
+    Split {
+        /// How to split. Only `timings` is supported.
+        #[arg(long, value_enum)]
+        by: SplitBy,
+        /// The items to split. Without any, stdin is read.
+        items: Vec<String>,
+    },
+}
+
+/// How `split` divides the items.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SplitBy {
+    /// By the timings recorded for earlier runs.
+    Timings,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -155,9 +176,16 @@ async fn main() -> ExitCode {
         };
         return exec_command(job_file, &opts, result.as_deref()).await;
     }
+    if let Some(Command::Split {
+        by: SplitBy::Timings,
+        items,
+    }) = args.command
+    {
+        return split::run(items);
+    }
     let result = match &args.command {
         Some(Command::Detect { mark }) => detect(&args.imds_endpoint, mark).await,
-        Some(Command::Exec { .. }) => unreachable!("handled above"),
+        Some(Command::Exec { .. } | Command::Split { .. }) => unreachable!("handled above"),
         None => run(args).await,
     };
     match result {

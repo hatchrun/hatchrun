@@ -89,6 +89,7 @@ pub async fn run_job(
     let layout = Layout::new(&opts.work_dir, &doc.github.repository, &opts.tool_cache);
     layout.create()?;
     let event = write_event(&layout, &doc)?;
+    write_timings(&layout, &doc)?;
     StepFiles::reset(&layout.temp)?;
     let owner = opts.runner_user.as_deref().map(owner_of).transpose()?;
     if let Some(owner) = owner {
@@ -208,6 +209,37 @@ fn write_event(layout: &Layout, doc: &JobDocument) -> Result<PathBuf> {
     let text = serde_json::to_vec(&doc.event).context("serialize the event")?;
     std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
+}
+
+/// Name of the timings file in `RUNNER_TEMP`.
+const TIMINGS_FILE: &str = "hatchrun-timings.json";
+
+/// Writes `doc.timings` where `HATCHRUN_TIMINGS` points, readable by
+/// every user so the runner user's `split` can read it. The agent makes
+/// the file, never following a link a leftover run planted at its path.
+fn write_timings(layout: &Layout, doc: &JobDocument) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = layout.temp.join(TIMINGS_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("clear {}", path.display())),
+    }
+    let text = serde_json::to_vec(&doc.timings).context("serialize the timings")?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("create {}", path.display()))?;
+    // The mode above is cut by the umask.
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("chmod {}", path.display()))?;
+    file.write_all(&text)
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// The state of a running job.
@@ -839,6 +871,14 @@ fn base_env(
         ("RUNNER_WORKSPACE", runner_workspace),
     ];
     env.extend(vars.into_iter().map(|(k, v)| (k.to_owned(), v)));
+    env.insert(
+        "HATCHRUN_TIMINGS".to_owned(),
+        path(&layout.temp.join(TIMINGS_FILE)),
+    );
+    if let Some((index, total)) = doc.job.node {
+        env.insert("HATCHRUN_NODE_INDEX".to_owned(), index.to_string());
+        env.insert("HATCHRUN_NODE_TOTAL".to_owned(), total.to_string());
+    }
     Ok(env)
 }
 
