@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+    - cron: "0 12 * * 0"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
+    runs-on: ubuntu-26.04-16core
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        target: [parse, eval]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
+
+  audit:
+    if: github.event.schedule != '17 3 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo install cargo-audit --locked && cargo audit
+
+  report:
+    needs: [fuzz, audit]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open an issue
+        if: contains(needs.*.result, 'failure')
+        run: gh issue create --title "nightly failed" --body "${{ github.server_url }}/${{ github.repository }}"
+      - name: Close the issue
+        if: "!contains(needs.*.result, 'failure')"
+        run: ./scripts/close-nightly-issue.sh

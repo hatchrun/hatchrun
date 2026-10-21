@@ -3,7 +3,7 @@
 Self-hosted GitHub Actions runners on your own AWS account, one fresh EC2
 instance per job.
 
-This repository holds the two Rust programs:
+This repository holds three Rust programs:
 
 - **scaler**: long-polls GitHub's runner scale set API, launches an
   instance for every assigned job and cleans up the ones that finish or
@@ -12,6 +12,8 @@ This repository holds the two Rust programs:
 - **agent**: baked into the runner image. It starts early in boot, reads
   the instance's just-in-time runner config, runs exactly one job as the
   `runner` user and powers the instance off.
+- **hatchrun**: command line tool developers run locally to convert and
+  validate workflow files, released as its own tarball.
 
 ## Agent
 
@@ -67,6 +69,20 @@ sudo apt install ./hatchrun-agent_0.1.0_amd64.deb
 The package installs `/usr/bin/hatchrun-agent` and the systemd unit but
 leaves the unit disabled, because the agent powers the machine off when
 it exits. Runner images enable it with `systemctl enable hatchrun-agent`.
+
+## hatchrun
+
+`hatchrun` is a command line tool developers run locally on workflow
+files. It has two commands:
+
+- `hatchrun validate` checks a workflow file and reports every error.
+- `hatchrun convert` converts GitHub Actions workflow files into a
+  hatchrun config. Jobs that cannot convert are left out and reported,
+  and the command then exits 1.
+
+Each release has a static tarball for `amd64` and `arm64`, named
+`hatchrun-<version>-linux-<arch>.tar.gz`, with checksums and build
+provenance like the agent.
 
 ## Scaler
 

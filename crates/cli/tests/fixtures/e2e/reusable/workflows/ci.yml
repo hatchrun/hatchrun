@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    uses: acme/shared-workflows/.github/workflows/lint.yml@v3
+    with:
+      node-version: 22
+    secrets: inherit
+
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      target: web
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: npm ci && npm test
+
+  deploy-preview:
+    needs: [build, test]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - id: deploy
+        run: ./scripts/deploy-preview.sh
+
+  e2e:
+    needs: deploy-preview
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx playwright test
+        env:
+          BASE_URL: ${{ needs.deploy-preview.outputs.url }}

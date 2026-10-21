@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+executors:
+  rust: { runs-on: ubuntu-26.04-4core }
+
+commands:
+  setup:
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - cache: { key: "deps-${{ hashFiles('Cargo.lock') }}", paths: [target] }
+
+jobs:
+  test:
+    executor: rust
+    parallelism: 4
+    steps:
+      - setup
+      - run: cargo nextest run $(hatchrun-agent split --by timings tests/*.rs)
+      - test-results: target/nextest
+  deploy:
+    executor: rust
+    steps: [setup, { run: ./deploy.sh }]
+
+workflows:
+  ci:
+    on: { push: { branches: [main] }, pull_request: {} }
+    jobs:
+      - test
+      - hold: { type: approval, requires: [test] }
+      - deploy: { requires: [hold], branches: [main] }

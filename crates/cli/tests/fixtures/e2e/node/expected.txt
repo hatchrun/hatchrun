@@ -1,0 +1,160 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# What crates/cli/tests/e2e.rs expects for this scenario. ok/fail: does
+# the job run when every job before it passed, or failed. A step `if`
+# shows A/B: runs while the job passes / runs after an earlier step failed.
+
+convert: exit 0
+  `node.yml` job `test`: matrix key `os` values `macos-latest`, `windows-latest` name no runner template and were dropped; hatchrun runs Linux only
+validate: exit 0
+event push-main (compile refs/heads/main)
+  node: triggered
+    job lint on ubuntu-latest: ok=run fail=run
+      if !contains(github.event.head_commit.message, '[skip ci]')
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm run lint
+    job test (20, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
+      matrix node=20 os="ubuntu-latest"
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm test
+    job test (22, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
+      matrix node=22 os="ubuntu-latest"
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm test
+    job build on ubuntu-latest after lint: ok=run fail=skip
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm run build
+      step Keep the bundle if github.event_name == 'push' && github.ref_name == 'main': ok=run/skip
+    job report on ubuntu-latest after test (20, ubuntu-latest) + test (22, ubuntu-latest) + build: ok=run fail=run
+      if always()
+      step run: echo "test ${{ needs.test.result }}, build ${{ needs.build.result }}"
+event push-feature (compile refs/heads/feature/login)
+  node: triggered
+    job lint on ubuntu-latest: ok=skip fail=skip
+      if !contains(github.event.head_commit.message, '[skip ci]')
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm run lint
+    job test (20, ubuntu-latest) on ubuntu-latest after lint: ok=skip fail=skip
+      matrix node=20 os="ubuntu-latest"
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm test
+    job test (22, ubuntu-latest) on ubuntu-latest after lint: ok=skip fail=skip
+      matrix node=22 os="ubuntu-latest"
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm test
+    job build on ubuntu-latest after lint: ok=skip fail=skip
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm run build
+      step Keep the bundle if github.event_name == 'push' && github.ref_name == 'main': never reached
+    job report on ubuntu-latest after test (20, ubuntu-latest) + test (22, ubuntu-latest) + build: ok=run fail=run
+      if always()
+      step run: echo "test ${{ needs.test.result }}, build ${{ needs.build.result }}"
+event push-tag (compile refs/tags/v1.4.0)
+  node: triggered
+    job lint on ubuntu-latest: ok=run fail=run
+      if !contains(github.event.head_commit.message, '[skip ci]')
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm run lint
+    job test (20, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
+      matrix node=20 os="ubuntu-latest"
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm test
+    job test (22, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
+      matrix node=22 os="ubuntu-latest"
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm test
+    job build on ubuntu-latest after lint: ok=run fail=skip
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm run build
+      step Keep the bundle if github.event_name == 'push' && github.ref_name == 'main': ok=skip/skip
+    job report on ubuntu-latest after test (20, ubuntu-latest) + test (22, ubuntu-latest) + build: ok=run fail=run
+      if always()
+      step run: echo "test ${{ needs.test.result }}, build ${{ needs.build.result }}"
+event pull_request-opened (compile refs/heads/main)
+  node: triggered
+    job lint on ubuntu-latest: ok=run fail=run
+      if !contains(github.event.head_commit.message, '[skip ci]')
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm run lint
+    job test (20, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
+      matrix node=20 os="ubuntu-latest"
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm test
+    job test (22, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
+      matrix node=22 os="ubuntu-latest"
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm test
+    job build on ubuntu-latest after lint: ok=run fail=skip
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm run build
+      step Keep the bundle if github.event_name == 'push' && github.ref_name == 'main': ok=skip/skip
+    job report on ubuntu-latest after test (20, ubuntu-latest) + test (22, ubuntu-latest) + build: ok=run fail=run
+      if always()
+      step run: echo "test ${{ needs.test.result }}, build ${{ needs.build.result }}"
+event pull_request-synchronize (compile refs/heads/main)
+  node: triggered
+    job lint on ubuntu-latest: ok=run fail=run
+      if !contains(github.event.head_commit.message, '[skip ci]')
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm run lint
+    job test (20, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
+      matrix node=20 os="ubuntu-latest"
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm test
+    job test (22, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
+      matrix node=22 os="ubuntu-latest"
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm test
+    job build on ubuntu-latest after lint: ok=run fail=skip
+      step actions/checkout@v5
+      step actions/setup-node@v4
+      step run: npm ci
+      step run: npm run build
+      step Keep the bundle if github.event_name == 'push' && github.ref_name == 'main': ok=skip/skip
+    job report on ubuntu-latest after test (20, ubuntu-latest) + test (22, ubuntu-latest) + build: ok=run fail=run
+      if always()
+      step run: echo "test ${{ needs.test.result }}, build ${{ needs.build.result }}"
+event pull_request-closed (compile refs/heads/main)
+  node: not triggered
+event workflow_dispatch (compile refs/heads/main)
+  node: not triggered

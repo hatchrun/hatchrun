@@ -1,0 +1,4 @@
+{
+  "schedule": "",
+  "repository": { "full_name": "acme/widgets", "name": "widgets", "owner": { "login": "acme" }, "default_branch": "main", "private": false }
+}

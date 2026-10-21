@@ -1,0 +1,7 @@
+{
+  "ref": "refs/heads/main",
+  "workflow": ".github/workflows/release.yml",
+  "inputs": { "version": "1.5.0-rc.1", "dry-run": "false", "channel": "beta" },
+  "repository": { "full_name": "acme/widgets", "name": "widgets", "owner": { "login": "acme" }, "default_branch": "main", "private": false },
+  "sender": { "login": "octocat" }
+}

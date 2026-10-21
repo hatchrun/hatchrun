@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# What crates/cli/tests/e2e.rs expects for this scenario. ok/fail: does
+# the job run when every job before it passed, or failed. A step `if`
+# shows A/B: runs while the job passes / runs after an earlier step failed.
+
+convert: exit 0
+validate: exit 0
+event push-main (compile refs/heads/main)
+  api: triggered
+    job test on ubuntu-latest: ok=run fail=run
+      step actions/checkout@v5
+      step run: cargo test (in services/api)
+      step run: ./scripts/check-openapi.sh services/api/openapi.yaml (in .)
+  docs: not triggered
+  web: not triggered
+event push-feature (compile refs/heads/feature/login)
+  api: not triggered
+  docs: not triggered
+  web: triggered
+    job build on ubuntu-latest: ok=run fail=run
+      step actions/checkout@v5
+      step run: npm ci && npm run build (in web)
+event push-tag (compile refs/tags/v1.4.0)
+  api: not triggered
+  docs: not triggered
+  web: not triggered
+event pull_request-opened (compile refs/heads/main)
+  api: not triggered
+  docs: triggered
+    job preview on ubuntu-latest: ok=run fail=run
+      if github.event.action != 'closed'
+      step actions/checkout@v5
+      step run: mdbook build docs
+      step Publish the preview if github.event_name == 'pull_request': ok=run/skip fail=run/skip
+    job cleanup on ubuntu-latest: ok=skip fail=skip
+      if github.event.action == 'closed' && github.event.pull_request.merged
+      step run: ./scripts/preview.sh --delete ${{ github.event.number }}
+  web: triggered
+    job build on ubuntu-latest: ok=run fail=run
+      step actions/checkout@v5
+      step run: npm ci && npm run build (in web)
+event pull_request-synchronize (compile refs/heads/main)
+  api: not triggered
+  docs: triggered
+    job preview on ubuntu-latest: ok=run fail=run
+      if github.event.action != 'closed'
+      step actions/checkout@v5
+      step run: mdbook build docs
+      step Publish the preview if github.event_name == 'pull_request': ok=run/skip fail=run/skip
+    job cleanup on ubuntu-latest: ok=skip fail=skip
+      if github.event.action == 'closed' && github.event.pull_request.merged
+      step run: ./scripts/preview.sh --delete ${{ github.event.number }}
+  web: triggered
+    job build on ubuntu-latest: ok=run fail=run
+      step actions/checkout@v5
+      step run: npm ci && npm run build (in web)
+event pull_request-closed (compile refs/heads/main)
+  api: not triggered
+  docs: triggered
+    job preview on ubuntu-latest: ok=skip fail=skip
+      if github.event.action != 'closed'
+      step actions/checkout@v5
+      step run: mdbook build docs
+      step Publish the preview if github.event_name == 'pull_request': never reached
+    job cleanup on ubuntu-latest: ok=run fail=run
+      if github.event.action == 'closed' && github.event.pull_request.merged
+      step run: ./scripts/preview.sh --delete ${{ github.event.number }}
+  web: not triggered
+event workflow_dispatch (compile refs/heads/main)
+  api: not triggered
+  docs: not triggered
+  web: not triggered

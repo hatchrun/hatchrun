@@ -51,6 +51,8 @@ jobs:
       # The scale set client and scaler core must stay free of I/O so they
       # run in Workers, next to the broker.
       - run: cargo check --locked -p hatchrun-scaleset -p hatchrun-scaler-core -p hatchrun-broker -p hatchrun-cloud -p hatchrun-telemetry --target wasm32-unknown-unknown
+      # The workflow format crate also runs in the Worker.
+      - run: cargo build --locked -p hatchrun-workflow --target wasm32-unknown-unknown
 
   # Owners get the update offer only for stacks older than
   # TEMPLATE_VERSION, so a change to connect.yaml that keeps the version

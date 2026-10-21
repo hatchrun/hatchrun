@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# What crates/cli/tests/e2e.rs expects for this scenario. ok/fail: does
+# the job run when every job before it passed, or failed. A step `if`
+# shows A/B: runs while the job passes / runs after an earlier step failed.
+
+convert: exit 0
+validate: exit 0
+event push-main (compile refs/heads/main)
+  nightly: not triggered
+event push-feature (compile refs/heads/feature/login)
+  nightly: not triggered
+event push-tag (compile refs/tags/v1.4.0)
+  nightly: not triggered
+event pull_request-opened (compile refs/heads/main)
+  nightly: not triggered
+event pull_request-synchronize (compile refs/heads/main)
+  nightly: not triggered
+event pull_request-closed (compile refs/heads/main)
+  nightly: not triggered
+event schedule '0 12 * * 0' (compile refs/heads/main)
+  nightly: triggered
+    job fuzz (parse) on ubuntu-26.04-16core: ok=skip fail=skip
+      if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
+      matrix target="parse"
+      timeout 120m
+      step actions/checkout@v5
+      step dtolnay/rust-toolchain@nightly
+      step run: cargo install cargo-fuzz --locked
+      step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
+    job fuzz (eval) on ubuntu-26.04-16core: ok=skip fail=skip
+      if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
+      matrix target="eval"
+      timeout 120m
+      step actions/checkout@v5
+      step dtolnay/rust-toolchain@nightly
+      step run: cargo install cargo-fuzz --locked
+      step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
+    job audit on ubuntu-latest: ok=run fail=run
+      if github.event.schedule != '17 3 * * *'
+      step actions/checkout@v5
+      step run: cargo install cargo-audit --locked && cargo audit
+    job report on ubuntu-latest after fuzz (parse) + fuzz (eval) + audit: ok=run fail=run
+      if always()
+      step Open an issue if contains(needs.*.result, 'failure'): ok=skip/skip fail=run/skip
+      step Close the issue if !contains(needs.*.result, 'failure'): ok=run/skip fail=skip/skip
+event schedule '17 3 * * *' (compile refs/heads/main)
+  nightly: triggered
+    job fuzz (parse) on ubuntu-26.04-16core: ok=run fail=run
+      if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
+      matrix target="parse"
+      timeout 120m
+      step actions/checkout@v5
+      step dtolnay/rust-toolchain@nightly
+      step run: cargo install cargo-fuzz --locked
+      step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
+    job fuzz (eval) on ubuntu-26.04-16core: ok=run fail=run
+      if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
+      matrix target="eval"
+      timeout 120m
+      step actions/checkout@v5
+      step dtolnay/rust-toolchain@nightly
+      step run: cargo install cargo-fuzz --locked
+      step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
+    job audit on ubuntu-latest: ok=skip fail=skip
+      if github.event.schedule != '17 3 * * *'
+      step actions/checkout@v5
+      step run: cargo install cargo-audit --locked && cargo audit
+    job report on ubuntu-latest after fuzz (parse) + fuzz (eval) + audit: ok=run fail=run
+      if always()
+      step Open an issue if contains(needs.*.result, 'failure'): ok=skip/skip fail=run/skip
+      step Close the issue if !contains(needs.*.result, 'failure'): ok=run/skip fail=skip/skip
+event workflow_dispatch (compile refs/heads/main)
+  nightly: triggered
+    job fuzz (parse) on ubuntu-26.04-16core: ok=run fail=run
+      if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
+      matrix target="parse"
+      timeout 120m
+      step actions/checkout@v5
+      step dtolnay/rust-toolchain@nightly
+      step run: cargo install cargo-fuzz --locked
+      step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
+    job fuzz (eval) on ubuntu-26.04-16core: ok=run fail=run
+      if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
+      matrix target="eval"
+      timeout 120m
+      step actions/checkout@v5
+      step dtolnay/rust-toolchain@nightly
+      step run: cargo install cargo-fuzz --locked
+      step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
+    job audit on ubuntu-latest: ok=run fail=run
+      if github.event.schedule != '17 3 * * *'
+      step actions/checkout@v5
+      step run: cargo install cargo-audit --locked && cargo audit
+    job report on ubuntu-latest after fuzz (parse) + fuzz (eval) + audit: ok=run fail=run
+      if always()
+      step Open an issue if contains(needs.*.result, 'failure'): ok=skip/skip fail=run/skip
+      step Close the issue if !contains(needs.*.result, 'failure'): ok=run/skip fail=skip/skip

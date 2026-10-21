@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the v
+        required: true
+        type: string
+      dry-run:
+        description: Build everything but publish nothing
+        type: boolean
+        default: true
+      channel:
+        type: choice
+        options: [stable, beta]
+        default: stable
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        name: Work out the version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          v="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          case "$v" in *-*) echo prerelease=true ;; *) echo prerelease=false ;; esac >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    runs-on: ubuntu-26.04-8core
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo build --release --target ${{ matrix.target }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/widget
+
+  publish:
+    needs: [version, build]
+    if: github.event_name == 'push' || !inputs.dry-run
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Create the release
+        if: needs.version.outputs.prerelease != 'true'
+        run: gh release create "v${{ needs.version.outputs.version }}" dist/*/*
+      - name: Create a prerelease
+        if: needs.version.outputs.prerelease == 'true'
+        run: gh release create --prerelease "v${{ needs.version.outputs.version }}" dist/*/*
+
+  announce:
+    needs: [version, publish]
+    if: success() && inputs.channel != 'beta'
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./scripts/announce.sh "${{ needs.version.outputs.version }}"
+
+  notify-failure:
+    needs: [build, publish]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./scripts/notify.sh "release ${{ github.ref_name }} failed"
