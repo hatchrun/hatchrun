@@ -328,7 +328,7 @@ pub enum Step {
 }
 
 /// A `run:` step.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RunStep {
     /// Shown in logs.
@@ -346,13 +346,13 @@ pub struct RunStep {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
     /// Environment variables for this step.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// The step runs only when this expression is true.
     #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
     pub if_: Option<String>,
     /// A failure does not fail the job.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub continue_on_error: bool,
     /// The step is cancelled after this many minutes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,7 +360,7 @@ pub struct RunStep {
 }
 
 /// A `uses:` step.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct UsesStep {
     /// Shown in logs.
@@ -372,16 +372,16 @@ pub struct UsesStep {
     /// The action, as `owner/repo@ref` or a local path.
     pub uses: String,
     /// The action's inputs.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub with: BTreeMap<String, Value>,
     /// Environment variables for this step.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// The step runs only when this expression is true.
     #[serde(rename = "if", skip_serializing_if = "Option::is_none")]
     pub if_: Option<String>,
     /// A failure does not fail the job.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub continue_on_error: bool,
 }
 
