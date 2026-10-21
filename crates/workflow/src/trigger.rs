@@ -72,10 +72,12 @@ impl Filter {
                 Shape::Literal => text == value,
                 Shape::Prefix => value.starts_with(&text[..text.len() - 2]),
                 Shape::Suffix => value.ends_with(&text[2..]),
+                // A pattern whose leading text the value does not start
+                // with cannot match; that takes no work.
+                Shape::Glob if prefix_differs(text, value) => false,
                 Shape::Glob => {
                     if !split {
-                        scratch.buffers.chars.clear();
-                        scratch.buffers.chars.extend(value.chars());
+                        scratch.buffers.set(value);
                         split = true;
                     }
                     scratch.glob(i, text)?
@@ -87,6 +89,24 @@ impl Filter {
         }
         Some(false)
     }
+}
+
+/// Whether `value` differs from the text a glob pattern starts with,
+/// the characters before its first wildcard, class, repeat or escape,
+/// so the pattern cannot match. A character that `?` or `+` follows is
+/// not checked. Stops at the first difference.
+fn prefix_differs(pattern: &str, value: &str) -> bool {
+    let mut value = value.chars();
+    let mut pattern = pattern.chars().peekable();
+    while let Some(c) = pattern.next() {
+        if matches!(c, '*' | '?' | '+' | '[' | '\\') || matches!(pattern.peek(), Some('?' | '+')) {
+            return false;
+        }
+        if value.next() != Some(c) {
+            return true;
+        }
+    }
+    false
 }
 
 /// A pattern without its leading `!`.
@@ -185,12 +205,28 @@ impl Scratch {
     }
 }
 
-/// The value's characters and two position sets.
+/// The value's characters, the positions reachable before and after
+/// the current token in ascending order, and a mark per position that
+/// says it was reached by the current token.
 #[derive(Default)]
 struct Buffers {
     chars: Vec<char>,
-    at: Vec<bool>,
-    next: Vec<bool>,
+    at: Vec<usize>,
+    next: Vec<usize>,
+    marks: Vec<u32>,
+    /// The mark of the current token.
+    mark: u32,
+}
+
+impl Buffers {
+    /// Makes `value` the value matched.
+    fn set(&mut self, value: &str) {
+        self.chars.clear();
+        self.chars.extend(value.chars());
+        self.marks.clear();
+        self.marks.resize(self.chars.len() + 1, 0);
+        self.mark = 0;
+    }
 }
 
 impl PartialEq for Filter {
@@ -310,68 +346,83 @@ fn class(chars: &[char], start: usize) -> Option<(Tok, usize)> {
     }
 }
 
+/// Adds position `q` to `next` unless the current token, marked `m`,
+/// already reached it.
+fn reach(marks: &mut [u32], m: u32, q: usize, next: &mut Vec<usize>) {
+    if marks[q] != m {
+        marks[q] = m;
+        next.push(q);
+    }
+}
+
 /// Whether the whole of `buffers.chars` matches the tokens. Tracks the
-/// set of reachable positions, so the cost stays polynomial for any
-/// pattern. Each token's work is charged to `left` before it is done;
-/// `None` when it does not fit.
+/// reachable positions, so the cost stays polynomial for any pattern.
+/// Each reachable position a token looks at, and each position a run
+/// walks over, is one step charged to `left`; `None` when it runs out.
 fn glob_matches(toks: &[Tok], buffers: &mut Buffers, left: &mut usize) -> Option<bool> {
-    let Buffers { chars, at, next } = buffers;
+    let Buffers {
+        chars,
+        at,
+        next,
+        marks,
+        mark,
+    } = buffers;
     let value = &chars[..];
     let n = value.len();
-    *left = left.checked_sub(n + 1)?;
     at.clear();
-    at.resize(n + 1, false);
-    at[0] = true;
+    at.push(0);
     for tok in toks {
-        // A token looks at every position and may walk every position
-        // once more. Most patterns stop at their first tokens.
-        *left = left.checked_sub(2 * (n + 1))?;
         next.clear();
-        next.resize(n + 1, false);
-        let mut any = false;
-        for p in (0..=n).filter(|&p| at[p]) {
+        *mark = mark.wrapping_add(1);
+        if *mark == 0 {
+            marks.fill(0);
+            *mark = 1;
+        }
+        let m = *mark;
+        // Positions are visited in ascending order and every run walks
+        // right, so `next` stays ascending.
+        *left = left.checked_sub(at.len())?;
+        for &p in at.iter() {
             match tok {
                 // A run already reached `p` from further left and went on
                 // as far as one from `p` would.
-                Tok::Star | Tok::StarStar | Tok::Plus(_) if next[p] => {}
+                Tok::Star | Tok::StarStar | Tok::Plus(_) if marks[p] == m => {}
                 Tok::Star | Tok::StarStar => {
                     let mut q = p;
-                    next[q] = true;
+                    reach(marks, m, q, next);
                     while q < n && (matches!(tok, Tok::StarStar) || value[q] != '/') {
+                        *left = left.checked_sub(1)?;
                         q += 1;
-                        next[q] = true;
+                        reach(marks, m, q, next);
                     }
-                    any = true;
                 }
                 Tok::Opt(inner) => {
-                    next[p] = true;
+                    reach(marks, m, p, next);
                     if p < n && inner.accepts(value[p]) {
-                        next[p + 1] = true;
+                        reach(marks, m, p + 1, next);
                     }
-                    any = true;
                 }
                 Tok::Plus(inner) => {
                     let mut q = p;
                     while q < n && inner.accepts(value[q]) {
+                        *left = left.checked_sub(1)?;
                         q += 1;
-                        next[q] = true;
-                        any = true;
+                        reach(marks, m, q, next);
                     }
                 }
                 single => {
                     if p < n && single.accepts(value[p]) {
-                        next[p + 1] = true;
-                        any = true;
+                        reach(marks, m, p + 1, next);
                     }
                 }
             }
         }
         std::mem::swap(at, next);
-        if !any {
+        if at.is_empty() {
             return Some(false);
         }
     }
-    Some(at[n])
+    Some(at.last() == Some(&n))
 }
 
 impl<'de> Deserialize<'de> for Filter {
@@ -522,11 +573,16 @@ pub struct Dispatch {
 pub const MAX_CHANGED: usize = 300;
 
 /// The most work, in steps, matching one path filter against an
-/// event's changed paths may take: about 40 ms on the worst patterns
-/// validate accepts, against about 1 ms for 256 ordinary patterns. A
-/// filter that needs more passes, as path filters do when the changed
-/// paths are not known. Only crafted patterns get there: ordinary ones
-/// stop within their first few characters.
+/// event's changed paths may take. A step is one reachable position
+/// looked at for one token, or one character a `*`, `**` or `+` run
+/// walks over; a pattern whose leading text the path does not start
+/// with takes none. Ordinary patterns reach a few positions per path
+/// and use a small part of this: 256 patterns like `apps/a07/**/*.tsx`
+/// against 300 paths take under 2 ms. It runs out only for patterns
+/// with many runs, such as `*a*a*a...b`, against long paths, where
+/// most positions stay reachable for most tokens: about 50 ms per
+/// filter. A filter that runs out passes, as path filters do when the
+/// changed paths are not known.
 const PATH_WORK: usize = 1 << 25;
 
 /// The most patterns one filter may have.

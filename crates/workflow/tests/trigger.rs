@@ -242,3 +242,39 @@ fn a_path_filter_that_needs_too_much_work_passes() {
     };
     assert!(!triggered(&on, &event));
 }
+
+/// `n` patterns `apps/appNN/**/*.tsx` on pushes, and 300 changed `.ts`
+/// paths of about 110 characters under those apps.
+fn apps(n: usize) -> (Triggers, Vec<String>) {
+    let patterns = (0..n).map(|i| format!("apps/app{i:02}/**/*.tsx")).collect();
+    let on = Triggers {
+        push: Some(hatchrun_workflow::PushTrigger {
+            paths: Some(Filter::new(patterns)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let changed = (0..300)
+        .map(|i| {
+            format!(
+                "apps/app{:02}/src/components/feature/subfeature/deeper/nested/folder/structure/here/Component{i}.test.ts",
+                i % n
+            )
+        })
+        .collect();
+    (on, changed)
+}
+
+#[test]
+fn ordinary_path_filters_decide_within_the_work_cap() {
+    for n in [100, 256] {
+        let (on, mut changed) = apps(n);
+        let event = |changed: &[String]| Event::Push {
+            r#ref: "refs/heads/main".into(),
+            changed: changed.to_vec(),
+        };
+        assert!(!triggered(&on, &event(&changed)), "{n} patterns");
+        changed[299] = changed[299].replace(".test.ts", ".tsx");
+        assert!(triggered(&on, &event(&changed)), "{n} patterns");
+    }
+}
