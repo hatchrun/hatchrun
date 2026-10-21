@@ -6,12 +6,13 @@
 //! locally.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hatchrun_workflow::{Diagnostic, convert, parse, to_yaml, validate};
+use hatchrun_workflow::{Diagnostic, MAX_SOURCE, convert, parse, to_yaml, validate};
 
 #[derive(Parser)]
 #[command(name = "hatchrun", version = env!("HATCHRUN_VERSION"), about)]
@@ -58,9 +59,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
+/// Reads a workflow file, stopping one byte past [`MAX_SOURCE`] so a huge
+/// file is refused without being loaded into memory.
+fn read_source(path: &Path) -> Result<String> {
+    let read = || format!("read {}", path.display());
+    let file = std::fs::File::open(path).with_context(read)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SOURCE as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(read)?;
+    if bytes.len() > MAX_SOURCE {
+        let size = std::fs::metadata(path).map_or(bytes.len() as u64, |m| m.len());
+        anyhow::bail!(
+            "{} is {size} bytes; the limit is {MAX_SOURCE}",
+            path.display()
+        );
+    }
+    String::from_utf8(bytes).with_context(read)
+}
+
 fn run_validate(path: &Path) -> Result<ExitCode> {
-    let source =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let source = read_source(path)?;
     let problems = match parse(&source) {
         Ok(config) => validate(&config),
         Err(problems) => problems,
@@ -89,8 +108,7 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
     // Problems name the file by its name; print them with its path.
     let mut paths: BTreeMap<String, &Path> = BTreeMap::new();
     for path in &files {
-        let source =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let source = read_source(path)?;
         let name = path.file_name().map_or_else(
             || path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),

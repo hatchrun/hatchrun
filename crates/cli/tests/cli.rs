@@ -191,3 +191,18 @@ fn convert_fails_on_what_validate_would_refuse() {
     let out = run(hatchrun().arg("validate").arg(&dest));
     assert_eq!(out.status.code(), Some(1));
 }
+
+#[test]
+fn oversized_files_are_refused_before_reading_them_whole() {
+    let big = scratch("big.yml");
+    std::fs::write(&big, format!("# {}\n", "x".repeat(2 << 20))).unwrap();
+    for command in ["validate", "convert"] {
+        let out = run(hatchrun().arg(command).arg(&big));
+        assert_eq!(out.status.code(), Some(1), "{command}");
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("bytes; the limit is 1048576"),
+            "{command}: {err}"
+        );
+    }
+}
