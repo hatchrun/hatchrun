@@ -13,18 +13,18 @@ validate: exit 0
 event push-main (compile refs/heads/main)
   ci: triggered
     job fmt on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@stable
       step run: cargo fmt --all --check
     job clippy on ubuntu-26.04-arm: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@stable
       step Swatinem/rust-cache@v2
       step run: cargo clippy --all-targets -- -D warnings
     job test (default, stable) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="default" toolchain="stable"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -34,7 +34,7 @@ event push-main (compile refs/heads/main)
     job test (default, beta) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="default" toolchain="beta"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -44,7 +44,7 @@ event push-main (compile refs/heads/main)
     job test (all, stable) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="all" toolchain="stable"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -54,7 +54,7 @@ event push-main (compile refs/heads/main)
     job test (all, beta) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="all" toolchain="beta"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -63,7 +63,7 @@ event push-main (compile refs/heads/main)
       step Upload test logs if failure(): ok=skip/run
     job coverage on ubuntu-latest after test (default, stable) + test (default, beta) + test (all, stable) + test (all, beta): ok=run fail=skip
       if github.event_name == 'push' && github.ref == 'refs/heads/main'
-      step actions/checkout@v5
+      step checkout
       step taiki-e/install-action@cargo-llvm-cov
       step run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       step codecov/codecov-action@v5 if always(): ok=run/run
@@ -74,18 +74,18 @@ event push-tag (compile refs/tags/v1.4.0)
 event pull_request-opened (compile refs/heads/main)
   ci: triggered
     job fmt on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@stable
       step run: cargo fmt --all --check
     job clippy on ubuntu-26.04-arm: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@stable
       step Swatinem/rust-cache@v2
       step run: cargo clippy --all-targets -- -D warnings
     job test (default, stable) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="default" toolchain="stable"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -95,7 +95,7 @@ event pull_request-opened (compile refs/heads/main)
     job test (default, beta) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="default" toolchain="beta"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -105,7 +105,7 @@ event pull_request-opened (compile refs/heads/main)
     job test (all, stable) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="all" toolchain="stable"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -115,7 +115,7 @@ event pull_request-opened (compile refs/heads/main)
     job test (all, beta) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="all" toolchain="beta"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -124,25 +124,25 @@ event pull_request-opened (compile refs/heads/main)
       step Upload test logs if failure(): ok=skip/run
     job coverage on ubuntu-latest after test (default, stable) + test (default, beta) + test (all, stable) + test (all, beta): ok=skip fail=skip
       if github.event_name == 'push' && github.ref == 'refs/heads/main'
-      step actions/checkout@v5
+      step checkout
       step taiki-e/install-action@cargo-llvm-cov
       step run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       step codecov/codecov-action@v5 if always(): never reached
 event pull_request-synchronize (compile refs/heads/main)
   ci: triggered
     job fmt on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@stable
       step run: cargo fmt --all --check
     job clippy on ubuntu-26.04-arm: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@stable
       step Swatinem/rust-cache@v2
       step run: cargo clippy --all-targets -- -D warnings
     job test (default, stable) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="default" toolchain="stable"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -152,7 +152,7 @@ event pull_request-synchronize (compile refs/heads/main)
     job test (default, beta) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="default" toolchain="beta"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -162,7 +162,7 @@ event pull_request-synchronize (compile refs/heads/main)
     job test (all, stable) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="all" toolchain="stable"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -172,7 +172,7 @@ event pull_request-synchronize (compile refs/heads/main)
     job test (all, beta) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="all" toolchain="beta"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -181,7 +181,7 @@ event pull_request-synchronize (compile refs/heads/main)
       step Upload test logs if failure(): ok=skip/run
     job coverage on ubuntu-latest after test (default, stable) + test (default, beta) + test (all, stable) + test (all, beta): ok=skip fail=skip
       if github.event_name == 'push' && github.ref == 'refs/heads/main'
-      step actions/checkout@v5
+      step checkout
       step taiki-e/install-action@cargo-llvm-cov
       step run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       step codecov/codecov-action@v5 if always(): never reached
@@ -190,18 +190,18 @@ event pull_request-closed (compile refs/heads/main)
 event workflow_dispatch (compile refs/heads/main)
   ci: triggered
     job fmt on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@stable
       step run: cargo fmt --all --check
     job clippy on ubuntu-26.04-arm: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@stable
       step Swatinem/rust-cache@v2
       step run: cargo clippy --all-targets -- -D warnings
     job test (default, stable) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="default" toolchain="stable"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -211,7 +211,7 @@ event workflow_dispatch (compile refs/heads/main)
     job test (default, beta) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="default" toolchain="beta"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -221,7 +221,7 @@ event workflow_dispatch (compile refs/heads/main)
     job test (all, stable) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="all" toolchain="stable"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -231,7 +231,7 @@ event workflow_dispatch (compile refs/heads/main)
     job test (all, beta) on ubuntu-26.04-4core after fmt: ok=run fail=skip
       matrix features="all" toolchain="beta"
       timeout 30m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@master
       step Swatinem/rust-cache@v2
       step Cache cargo binaries
@@ -240,7 +240,7 @@ event workflow_dispatch (compile refs/heads/main)
       step Upload test logs if failure(): ok=skip/run
     job coverage on ubuntu-latest after test (default, stable) + test (default, beta) + test (all, stable) + test (all, beta): ok=skip fail=skip
       if github.event_name == 'push' && github.ref == 'refs/heads/main'
-      step actions/checkout@v5
+      step checkout
       step taiki-e/install-action@cargo-llvm-cov
       step run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       step codecov/codecov-action@v5 if always(): never reached

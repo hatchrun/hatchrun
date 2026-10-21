@@ -505,6 +505,20 @@ pub struct Triggers {
         skip_serializing_if = "Option::is_none"
     )]
     pub workflow_dispatch: Option<Dispatch>,
+    /// Another workflow of the config finishing.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_run: Option<WorkflowRunTrigger>,
+    /// Activity on a release.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub release: Option<ReleaseTrigger>,
 }
 
 /// Filters for `on: push`.
@@ -584,6 +598,72 @@ pub struct Dispatch {
     pub inputs: BTreeMap<String, Parameter>,
 }
 
+/// `on: workflow_run`: the workflow starts after another workflow of
+/// the same config finishes. It is run by hatchrun itself, so it works
+/// the same on every host.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct WorkflowRunTrigger {
+    /// The workflows, by their keys under `workflows:`, whose runs start
+    /// this one. One may be written as a plain string.
+    #[serde(deserialize_with = "one_or_many")]
+    pub workflows: Vec<String>,
+    /// Activity types; only `completed`, which is also the default.
+    #[serde(
+        default = "completed",
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "is_completed"
+    )]
+    pub types: Vec<String>,
+    /// Branches the finished run ran on that trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branches: Option<Filter>,
+    /// Branches the finished run ran on that do not trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branches_ignore: Option<Filter>,
+}
+
+/// The activity types `on.workflow_run` accepts.
+pub const WORKFLOW_RUN_TYPES: &[&str] = &["completed"];
+
+fn completed() -> Vec<String> {
+    vec!["completed".to_owned()]
+}
+
+fn is_completed(types: &[String]) -> bool {
+    types == ["completed"]
+}
+
+/// `on: release`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ReleaseTrigger {
+    /// Activity types, from [`RELEASE_TYPES`]; `published` when absent.
+    /// One type may be written as a plain string.
+    #[serde(deserialize_with = "one_or_many")]
+    pub types: Vec<String>,
+    /// Release tags that trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Filter>,
+    /// Release tags that do not trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags_ignore: Option<Filter>,
+}
+
+/// The activity types `on.release` accepts. GitHub's `unpublished`,
+/// `edited` and `deleted` are left out.
+pub const RELEASE_TYPES: &[&str] = &["published", "created", "released", "prereleased"];
+
+impl Default for ReleaseTrigger {
+    fn default() -> Self {
+        Self {
+            types: vec!["published".to_owned()],
+            tags: None,
+            tags_ignore: None,
+        }
+    }
+}
+
 /// The most changed paths path filters look at. GitHub limits diffs to
 /// 300 files: a change outside the first 300 does not start a workflow.
 pub const MAX_CHANGED: usize = 300;
@@ -640,6 +720,22 @@ pub enum Event {
     },
     /// A manual start.
     Dispatch,
+    /// A run of another workflow of the config changing state.
+    WorkflowRun {
+        /// The activity type, such as `completed`.
+        action: String,
+        /// The key of the workflow that ran.
+        workflow: String,
+        /// The branch it ran on, as a short name.
+        branch: String,
+    },
+    /// Activity on a release.
+    Release {
+        /// The activity type, such as `published`.
+        action: String,
+        /// The release's tag, as a short name.
+        tag: String,
+    },
 }
 
 /// Whether `event` starts a workflow with the triggers `on`.
@@ -662,6 +758,21 @@ pub fn triggered(on: &Triggers, event: &Event) -> bool {
         }),
         Event::Schedule { cron } => on.schedule.iter().any(|s| &s.cron == cron),
         Event::Dispatch => on.workflow_dispatch.is_some(),
+        Event::WorkflowRun {
+            action,
+            workflow,
+            branch,
+        } => on.workflow_run.as_ref().is_some_and(|run| {
+            run.types.iter().any(|t| t == action)
+                && run.workflows.iter().any(|w| w == workflow)
+                && ref_passes(run.branches.as_ref(), run.branches_ignore.as_ref(), branch)
+                    == Some(true)
+        }),
+        Event::Release { action, tag } => on.release.as_ref().is_some_and(|release| {
+            release.types.iter().any(|t| t == action)
+                && ref_passes(release.tags.as_ref(), release.tags_ignore.as_ref(), tag)
+                    == Some(true)
+        }),
     }
 }
 
@@ -745,6 +856,16 @@ where
     Ok(Some(
         Option::<T>::deserialize(deserializer)?.unwrap_or_default(),
     ))
+}
+
+/// Reads a present key as its value, so an empty value is an error
+/// rather than no trigger.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[cfg(test)]

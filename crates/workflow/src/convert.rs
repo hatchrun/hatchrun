@@ -5,8 +5,9 @@
 //! Converts GitHub Actions workflows into a `.hatchrun/config.yml`.
 //!
 //! Each workflow file becomes one entry of `workflows:`, keyed by the file
-//! stem, and each of its jobs becomes `jobs.<stem>-<job>`. Keys hatchrun has
-//! no place for are dropped with a warning. Docker steps and runner labels
+//! stem, and each of its jobs becomes `jobs.<stem>-<job>`. `actions/checkout`
+//! becomes the built-in checkout step. Keys hatchrun has no place for are
+//! dropped with a warning. Docker steps and runner labels
 //! that name no template are errors; the job is dropped and the rest of
 //! the files still convert.
 
@@ -19,8 +20,8 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::config::{
-    Config, Job, MAX_SOURCE, Matrix, Parameter, ParameterKind, Require, RunStep, Step, UsesStep,
-    Workflow, WorkflowJob, too_big, yaml_options,
+    CheckoutStep, Config, Job, MAX_SOURCE, Matrix, Parameter, ParameterKind, Require, RunStep,
+    Step, Submodules, UsesStep, Workflow, WorkflowJob, too_big, yaml_options,
 };
 use crate::diagnostic::Diagnostic;
 use crate::environment::valid_environment_name;
@@ -28,7 +29,10 @@ use crate::expr::{self, ExprError};
 use crate::permissions::{Level, Permissions, SCOPES};
 use crate::plan;
 use crate::templates::{template, template_labels, vendor_template};
-use crate::trigger::{Dispatch, PullRequestTrigger, PushTrigger, Schedule, Triggers};
+use crate::trigger::{
+    Dispatch, Filter, PullRequestTrigger, PushTrigger, RELEASE_TYPES, ReleaseTrigger, Schedule,
+    Triggers, WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
+};
 
 /// The result of a conversion: the config and what was dropped on the way.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,12 +63,18 @@ pub struct Conversion {
 /// on, such as one that runs only on `issues`, is dropped with its jobs
 /// and a warning.
 ///
+/// `on.workflow_run` names workflows as GitHub does, by their `name:`,
+/// or by their file name when they have none. Each name becomes the stem of
+/// the file that has it; a name no converted file has is dropped with a
+/// warning, and so is the event when none is left.
+///
 /// # Errors
 ///
 /// Returns the problems when there were some and nothing converted.
 pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>> {
     let mut cx = Cx::default();
     let mut stems: BTreeMap<String, &str> = BTreeMap::new();
+    let mut parsed = Vec::new();
     for (file, source) in files {
         let stem = stem(file);
         if stem.is_empty() {
@@ -85,7 +95,12 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
             continue;
         }
         match serde_saphyr::from_str_with_options::<GhWorkflow>(source, yaml_options()) {
-            Ok(gh) => cx.workflow(file, stem, gh),
+            Ok(gh) => {
+                let name = gh.name.as_ref().and_then(scalar);
+                let name = name.unwrap_or_else(|| file.clone());
+                cx.names.entry(name).or_default().push(stem.to_owned());
+                parsed.push((file, stem, gh));
+            }
             Err(err) => {
                 let mut diag = Diagnostic::from(&err);
                 diag.file = Some(file.clone());
@@ -93,6 +108,10 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
             }
         }
     }
+    for (file, stem, gh) in parsed {
+        cx.workflow(file, stem, gh);
+    }
+    cx.unreachable_runs(&stems);
     if !cx.errors.is_empty() && cx.config.workflows.is_empty() {
         return Err(cx.errors);
     }
@@ -191,14 +210,22 @@ const OLD_UBUNTU: &[(&str, &str)] = &[
 const UNSUPPORTED_CONTEXTS: &[&str] = &["strategy", "jobs"];
 
 /// The events hatchrun can start a workflow on.
-const EVENTS: &str = "push, pull_request, schedule and workflow_dispatch";
+const EVENTS: &str = "push, pull_request, schedule, workflow_dispatch, workflow_run and release";
+
+/// Events that only GitHub can deliver, as they act on GitHub's own
+/// issues and pull requests with the base repository's secrets.
+const GITHUB_ONLY: &[&str] = &["pull_request_target", "issues", "issue_comment"];
+
+/// Inputs of `actions/checkout` that check out another repository or
+/// use other credentials. A step with one stays a `uses:` step.
+const CHECKOUT_KEEPS: &[&str] = &["repository", "token", "ssh-key", "github-server-url"];
 
 /// The part of a GitHub workflow file the converter reads.
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct GhWorkflow {
-    #[serde(default, rename = "name")]
-    _name: Option<Value>,
+    #[serde(default)]
+    name: Option<Value>,
     #[serde(default)]
     run_name: Option<Value>,
     on: Value,
@@ -328,6 +355,27 @@ impl RunsOn {
     }
 }
 
+/// `on.workflow_run`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct GhWorkflowRun {
+    workflows: Vec<String>,
+    #[serde(default)]
+    types: Option<Value>,
+    #[serde(default)]
+    branches: Option<Filter>,
+    #[serde(default)]
+    branches_ignore: Option<Filter>,
+}
+
+/// `on.release`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GhRelease {
+    #[serde(default)]
+    types: Option<Value>,
+}
+
 /// A map that keeps the order its keys were written in.
 struct Ordered<T>(Vec<(String, T)>);
 
@@ -371,6 +419,8 @@ struct Cx {
     config: Config,
     warnings: Vec<Diagnostic>,
     errors: Vec<Diagnostic>,
+    /// The stems of the files that have each GitHub workflow name.
+    names: BTreeMap<String, Vec<String>>,
 }
 
 impl Cx {
@@ -397,7 +447,7 @@ impl Cx {
         for key in gh.unknown.keys() {
             self.warn(format!("`{file}`: unknown key `{key}` was dropped"));
         }
-        let Some(on) = self.kept_triggers(file, &gh.on) else {
+        let Some(on) = self.kept_triggers(file, stem, &gh.on) else {
             return;
         };
         let permissions = self.permissions(&format!("`{file}`"), gh.permissions.as_ref(), false);
@@ -545,17 +595,13 @@ impl Cx {
 
     /// Converts `on:` and warns about the events dropped. Returns `None`
     /// for a workflow left with no event, which is dropped with a warning.
-    fn kept_triggers(&mut self, file: &str, on: &Value) -> Option<Triggers> {
-        let (triggers, unsupported) = self.triggers(file, on);
+    fn kept_triggers(&mut self, file: &str, stem: &str, on: &Value) -> Option<Triggers> {
+        let (triggers, unsupported) = self.triggers(file, stem, on);
         if triggers == Triggers::default() {
             self.no_events(file, &unsupported);
             return None;
         }
-        for event in unsupported {
-            self.warn(format!(
-                "`{file}`: `on.{event}` is not supported and was dropped; hatchrun runs on {EVENTS}"
-            ));
-        }
+        self.dropped_events(file, &unsupported);
         Some(triggers)
     }
 
@@ -563,11 +609,11 @@ impl Cx {
     /// names or a map of events to their filters. Returns the events
     /// hatchrun does not run on too, so the caller can tell a workflow
     /// that keeps some events from one left with none.
-    fn triggers(&mut self, file: &str, on: &Value) -> (Triggers, Vec<String>) {
+    fn triggers(&mut self, file: &str, stem: &str, on: &Value) -> (Triggers, Vec<String>) {
         let mut triggers = Triggers::default();
         let mut unsupported = Vec::new();
         let mut event = |cx: &mut Self, name: &str, body: &Value| {
-            if !cx.event(file, name, body, &mut triggers) {
+            if !cx.event(file, stem, name, body, &mut triggers) {
                 unsupported.push(name.to_owned());
             }
         };
@@ -597,7 +643,14 @@ impl Cx {
 
     /// Converts one event into `triggers`. Returns false when hatchrun
     /// does not run on it.
-    fn event(&mut self, file: &str, event: &str, body: &Value, triggers: &mut Triggers) -> bool {
+    fn event(
+        &mut self,
+        file: &str,
+        stem: &str,
+        event: &str,
+        body: &Value,
+        triggers: &mut Triggers,
+    ) -> bool {
         let bad = |err: serde_json::Error| format!("`{file}`: `on.{event}`: {err}");
         match event {
             "push" => match Option::<PushTrigger>::deserialize(body) {
@@ -615,9 +668,35 @@ impl Cx {
             "workflow_dispatch" => {
                 triggers.workflow_dispatch = Some(self.dispatch(file, body));
             }
+            "workflow_run" => match GhWorkflowRun::deserialize(body) {
+                Ok(run) => triggers.workflow_run = self.workflow_run(file, stem, run),
+                Err(err) => self.error(bad(err)),
+            },
+            "release" => match Option::<GhRelease>::deserialize(body) {
+                Ok(release) => {
+                    let types = release.and_then(|r| r.types);
+                    triggers.release = self.release(file, types.as_ref());
+                }
+                Err(err) => self.error(bad(err)),
+            },
             _ => return false,
         }
         true
+    }
+
+    /// Warns about each event of a workflow that hatchrun does not run
+    /// on, and for those only GitHub delivers, to keep them there.
+    fn dropped_events(&mut self, file: &str, unsupported: &[String]) {
+        for event in unsupported {
+            let keep = if GITHUB_ONLY.contains(&event.as_str()) {
+                format!("; keep `on.{event}` on GitHub Actions")
+            } else {
+                String::new()
+            };
+            self.warn(format!(
+                "`{file}`: `on.{event}` is not supported and was dropped; hatchrun runs on {EVENTS}{keep}"
+            ));
+        }
     }
 
     /// Reports a workflow left with no event to run on, which is dropped
@@ -643,6 +722,153 @@ impl Cx {
             "`{file}` was dropped: it runs on {}, and hatchrun runs on {EVENTS}; keep it on GitHub Actions",
             shown.join(", ")
         ));
+    }
+
+    /// Converts `on.workflow_run`, naming each workflow by the stem of
+    /// the file that has its GitHub name. Names no file has, the file's
+    /// own name and types other than `completed` are dropped with a
+    /// warning. `None` when no workflow or no type is left.
+    fn workflow_run(
+        &mut self,
+        file: &str,
+        stem: &str,
+        run: GhWorkflowRun,
+    ) -> Option<WorkflowRunTrigger> {
+        let at = format!("`{file}`: `on.workflow_run`");
+        let mut workflows: Vec<String> = Vec::new();
+        for name in run.workflows {
+            let Some(found) = self.names.get(&name).cloned() else {
+                self.warn(format!(
+                    "{at} names workflow `{name}`, which none of the converted files is; it was dropped"
+                ));
+                continue;
+            };
+            for other in found {
+                if other == stem {
+                    self.warn(format!(
+                        "{at} names workflow `{name}`, which is this file; it was dropped"
+                    ));
+                } else if !workflows.contains(&other) {
+                    workflows.push(other);
+                }
+            }
+        }
+        let types = match &run.types {
+            None | Some(Value::Null) => vec!["completed".to_owned()],
+            Some(types) => self.types(&at, types, WORKFLOW_RUN_TYPES)?,
+        };
+        if workflows.is_empty() {
+            self.warn(format!(
+                "{at} was dropped: it names no other converted workflow"
+            ));
+            return None;
+        }
+        Some(WorkflowRunTrigger {
+            workflows,
+            types,
+            branches: run.branches,
+            branches_ignore: run.branches_ignore,
+        })
+    }
+
+    /// Converts `on.release`. Types hatchrun does not run on are dropped
+    /// with a warning; with no `types`, GitHub runs on every type, and
+    /// the release runs on `published` only. `None` when no type is left.
+    fn release(&mut self, file: &str, types: Option<&Value>) -> Option<ReleaseTrigger> {
+        let at = format!("`{file}`: `on.release`");
+        let Some(types) = types.filter(|t| !t.is_null()) else {
+            self.warn(format!("{at} has no `types`; it runs on `published` only"));
+            return Some(ReleaseTrigger::default());
+        };
+        Some(ReleaseTrigger {
+            types: self.types(&at, types, RELEASE_TYPES)?,
+            ..ReleaseTrigger::default()
+        })
+    }
+
+    /// The activity types of an event out of `known`, dropping the rest
+    /// with a warning. `None` when none of them is known, which drops
+    /// the event with a warning.
+    fn types(&mut self, at: &str, types: &Value, known: &[&str]) -> Option<Vec<String>> {
+        let given: Vec<String> = match types {
+            Value::Array(items) => items.iter().filter_map(scalar).collect(),
+            other => scalar(other).into_iter().collect(),
+        };
+        let (kept, dropped): (Vec<String>, Vec<String>) =
+            given.into_iter().partition(|t| known.contains(&t.as_str()));
+        let shown: Vec<String> = dropped.iter().map(|t| format!("`{t}`")).collect();
+        let runs = known.join(", ");
+        if kept.is_empty() {
+            self.warn(format!(
+                "{at} was dropped: its types {} are not supported; hatchrun runs on {runs}",
+                shown.join(", ")
+            ));
+            return None;
+        }
+        if !dropped.is_empty() {
+            self.warn(format!(
+                "{at}: types {} are not supported and were dropped; hatchrun runs on {runs}",
+                shown.join(", ")
+            ));
+        }
+        Some(kept)
+    }
+
+    /// Drops from `on.workflow_run` the workflows that did not convert,
+    /// then the event when none is left, then a workflow left with no
+    /// event and its jobs, until every name it keeps is a workflow.
+    /// `stems` maps each stem to its file.
+    fn unreachable_runs(&mut self, stems: &BTreeMap<String, &str>) {
+        loop {
+            let mut changed = false;
+            let keys: Vec<String> = self.config.workflows.keys().cloned().collect();
+            for key in keys {
+                let file = stems.get(&key).copied().unwrap_or(key.as_str());
+                let wf = &self.config.workflows[&key];
+                let Some(run) = &wf.on.workflow_run else {
+                    continue;
+                };
+                let gone: Vec<String> = run
+                    .workflows
+                    .iter()
+                    .filter(|w| !self.config.workflows.contains_key(*w))
+                    .cloned()
+                    .collect();
+                if gone.is_empty() {
+                    continue;
+                }
+                changed = true;
+                let at = format!("`{file}`: `on.workflow_run`");
+                for other in &gone {
+                    self.warn(format!(
+                        "{at} names workflow `{other}`, which did not convert; it was dropped"
+                    ));
+                }
+                let wf = self.config.workflows.get_mut(&key).expect("listed above");
+                let run = wf.on.workflow_run.as_mut().expect("checked above");
+                run.workflows.retain(|w| !gone.contains(w));
+                if !run.workflows.is_empty() {
+                    continue;
+                }
+                wf.on.workflow_run = None;
+                if wf.on != Triggers::default() {
+                    self.warn(format!(
+                        "{at} was dropped: it names no other converted workflow"
+                    ));
+                    continue;
+                }
+                let wf = self.config.workflows.remove(&key).expect("listed above");
+                for entry in wf.jobs {
+                    self.config.jobs.remove(&entry.job);
+                }
+                self.warn(format!(
+                    "`{file}` was dropped: it runs only after workflows that did not convert"
+                ));
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 
     /// Converts `on.workflow_dispatch`, mapping GitHub input types onto
@@ -1366,7 +1592,7 @@ impl Cx {
                         ));
                     }
                 }
-                Some(Step::Uses(UsesStep {
+                let step = UsesStep {
                     name: gh.name,
                     id: gh.id,
                     uses,
@@ -1374,7 +1600,11 @@ impl Cx {
                     env,
                     if_,
                     continue_on_error,
-                }))
+                };
+                match self.checkout(&at, &step) {
+                    Some(checkout) => Some(Step::Checkout(checkout)),
+                    None => Some(Step::Uses(step)),
+                }
             }
             (Some(_), Some(_)) => {
                 self.error(format!("{at} has both `run` and `uses`"));
@@ -1386,6 +1616,92 @@ impl Cx {
             }
         }
     }
+
+    /// `actions/checkout` as the built-in checkout step, with `ref`,
+    /// `fetch-depth`, `submodules`, `lfs` and `path` carried over and
+    /// other inputs dropped with a warning; the step's name is dropped.
+    /// `None` when the step stays a `uses:` step: it is another action,
+    /// has an `id`, `if`, `env` or `continue-on-error`, checks out
+    /// another repository or with other credentials, or sets an option
+    /// to something the step cannot hold, such as an expression.
+    fn checkout(&mut self, at: &str, step: &UsesStep) -> Option<CheckoutStep> {
+        if !is_checkout(&step.uses)
+            || step.id.is_some()
+            || step.if_.is_some()
+            || !step.env.is_empty()
+            || step.continue_on_error
+        {
+            return None;
+        }
+        let mut checkout = CheckoutStep::default();
+        let mut dropped = Vec::new();
+        for (key, value) in &step.with {
+            let text = scalar(value);
+            match key.as_str() {
+                "repository"
+                    if text
+                        .as_deref()
+                        .is_some_and(|t| is_expr(t, "github.repository")) => {}
+                "token"
+                    if text.as_deref().is_some_and(|t| {
+                        is_expr(t, "github.token") || is_expr(t, "secrets.GITHUB_TOKEN")
+                    }) => {}
+                key if CHECKOUT_KEEPS.contains(&key) => return None,
+                "ref" => checkout.r#ref = Some(text?).filter(|t| !t.is_empty()),
+                "fetch-depth" => checkout.fetch_depth = text?.trim().parse().ok()?,
+                "submodules" => {
+                    checkout.submodules = match text?.as_str() {
+                        "false" => Submodules::None,
+                        "true" => Submodules::Top,
+                        "recursive" => Submodules::Recursive,
+                        _ => return None,
+                    }
+                }
+                "lfs" => {
+                    checkout.lfs = match text?.as_str() {
+                        "false" => false,
+                        "true" => true,
+                        _ => return None,
+                    }
+                }
+                "path" => {
+                    let path = text?;
+                    if path.starts_with('/') || path.split(['/', '\\']).any(|p| p == "..") {
+                        return None;
+                    }
+                    checkout.path = Some(path).filter(|p| !p.is_empty());
+                }
+                other => dropped.push(format!("`{other}`")),
+            }
+        }
+        if !dropped.is_empty() {
+            self.warn(format!(
+                "{at}: `{}` became the built-in checkout step; inputs {} are not supported and were dropped",
+                step.uses,
+                dropped.join(", ")
+            ));
+        }
+        Some(checkout)
+    }
+}
+
+/// Whether `uses` is `actions/checkout` at any ref, also by URL as
+/// Forgejo writes it (`https://code.forgejo.org/actions/checkout@v4`).
+fn is_checkout(uses: &str) -> bool {
+    let path = match uses.strip_prefix("https://") {
+        Some(rest) => rest.split_once('/').map_or(rest, |(_, path)| path),
+        None => uses,
+    };
+    path.split_once('@')
+        .is_some_and(|(action, _)| action.eq_ignore_ascii_case("actions/checkout"))
+}
+
+/// Whether `text` is the whole expression `${{ name }}`, in any case.
+fn is_expr(text: &str, name: &str) -> bool {
+    text.trim()
+        .strip_prefix("${{")
+        .and_then(|t| t.strip_suffix("}}"))
+        .is_some_and(|inner| inner.trim().eq_ignore_ascii_case(name))
 }
 
 /// One combination of matrix keys and values.
@@ -1647,6 +1963,10 @@ fn expression_problems(job: &Job) -> (Vec<&'static str>, Vec<String>) {
                 }
                 texts.extend(uses.env.values().map(String::as_str));
                 conds.extend(uses.if_.as_deref());
+            }
+            Step::Checkout(checkout) => {
+                texts.extend(checkout.r#ref.as_deref());
+                texts.extend(checkout.path.as_deref());
             }
             _ => {}
         }

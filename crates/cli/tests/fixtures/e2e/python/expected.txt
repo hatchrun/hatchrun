@@ -13,20 +13,20 @@ event push-main (compile refs/heads/main)
   tests: triggered
     job test (3.12) on ubuntu-latest: ok=run fail=run
       matrix python-version="3.12"
-      step actions/checkout@v5
+      step checkout
       step actions/setup-python@v5
       step run: python -m pip install -r requirements-dev.txt
       step run: pytest --junitxml=reports/junit-${{ matrix.python-version }}.xml
       step Keep the test report if always(): ok=run/run fail=run/run
     job test (3.13) on ubuntu-latest: ok=run fail=run
       matrix python-version="3.13"
-      step actions/checkout@v5
+      step checkout
       step actions/setup-python@v5
       step run: python -m pip install -r requirements-dev.txt
       step run: pytest --junitxml=reports/junit-${{ matrix.python-version }}.xml
       step Keep the test report if always(): ok=run/run fail=run/run
     job typecheck on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step actions/setup-python@v5
       step run: python -m pip install mypy
       step run: mypy src
@@ -38,20 +38,20 @@ event pull_request-opened (compile refs/heads/main)
   tests: triggered
     job test (3.12) on ubuntu-latest: ok=run fail=run
       matrix python-version="3.12"
-      step actions/checkout@v5
+      step checkout
       step actions/setup-python@v5
       step run: python -m pip install -r requirements-dev.txt
       step run: pytest --junitxml=reports/junit-${{ matrix.python-version }}.xml
       step Keep the test report if always(): ok=run/run fail=run/run
     job test (3.13) on ubuntu-latest: ok=run fail=run
       matrix python-version="3.13"
-      step actions/checkout@v5
+      step checkout
       step actions/setup-python@v5
       step run: python -m pip install -r requirements-dev.txt
       step run: pytest --junitxml=reports/junit-${{ matrix.python-version }}.xml
       step Keep the test report if always(): ok=run/run fail=run/run
     job typecheck on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step actions/setup-python@v5
       step run: python -m pip install mypy
       step run: mypy src
@@ -59,20 +59,20 @@ event pull_request-synchronize (compile refs/heads/main)
   tests: triggered
     job test (3.12) on ubuntu-latest: ok=run fail=run
       matrix python-version="3.12"
-      step actions/checkout@v5
+      step checkout
       step actions/setup-python@v5
       step run: python -m pip install -r requirements-dev.txt
       step run: pytest --junitxml=reports/junit-${{ matrix.python-version }}.xml
       step Keep the test report if always(): ok=run/run fail=run/run
     job test (3.13) on ubuntu-latest: ok=run fail=run
       matrix python-version="3.13"
-      step actions/checkout@v5
+      step checkout
       step actions/setup-python@v5
       step run: python -m pip install -r requirements-dev.txt
       step run: pytest --junitxml=reports/junit-${{ matrix.python-version }}.xml
       step Keep the test report if always(): ok=run/run fail=run/run
     job typecheck on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step actions/setup-python@v5
       step run: python -m pip install mypy
       step run: mypy src

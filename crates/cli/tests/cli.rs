@@ -169,6 +169,59 @@ fn convert_creates_the_output_directory() {
 }
 
 #[test]
+fn convert_reads_forgejo_and_gitea_workflows_too() {
+    let dir = scratch("forgejo-repo");
+    let _ = std::fs::remove_dir_all(&dir);
+    for (sub, name) in [
+        (".github/workflows", "ci.yml"),
+        (".forgejo/workflows", "lint.yaml"),
+        (".gitea/workflows", "docs.yml"),
+    ] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+        std::fs::write(
+            dir.join(sub).join(name),
+            "on: push\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        )
+        .unwrap();
+    }
+    let out = run(hatchrun().arg("convert").current_dir(&dir));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let yaml = text(&out.stdout);
+    for workflow in ["ci:", "lint:", "docs:"] {
+        assert!(yaml.contains(workflow), "{workflow}\n{yaml}");
+    }
+
+    // Only a Forgejo directory is enough.
+    std::fs::remove_dir_all(dir.join(".github")).unwrap();
+    std::fs::remove_dir_all(dir.join(".gitea")).unwrap();
+    let out = run(hatchrun().arg("convert").current_dir(&dir));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("lint:"));
+
+    // One name in two directories is refused, as two named files are.
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::copy(
+        dir.join(".forgejo/workflows/lint.yaml"),
+        dir.join(".github/workflows/lint.yaml"),
+    )
+    .unwrap();
+    let out = run(hatchrun().arg("convert").current_dir(&dir));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("have the same file name"));
+}
+
+#[test]
+fn convert_with_no_workflow_directory_fails() {
+    let dir = scratch("no-workflows");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = run(hatchrun().arg("convert").current_dir(&dir));
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains(".forgejo/workflows"), "{err}");
+}
+
+#[test]
 fn convert_fails_on_what_validate_would_refuse() {
     let mut many = String::from("on: push\njobs:\n");
     for j in 0..257 {

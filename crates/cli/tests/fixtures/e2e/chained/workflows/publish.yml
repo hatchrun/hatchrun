@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Publish
+
+on:
+  release:
+    types: [published, edited]
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true
+      - name: Upload the assets for ${{ github.ref_name }}
+        run: gh release upload "${{ hatchrun.ref_name }}" dist/*
+      - name: Check out the docs
+        uses: actions/checkout@v5
+        with:
+          repository: acme/docs
+          path: docs

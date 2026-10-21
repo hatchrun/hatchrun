@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use hatchrun_workflow::{
-    Annotation, Conclusion, ExprError, JobDocument, JobResult, JobStatus, PlannedStep, RunStep,
-    StepSummary, interpolate,
+    Annotation, CheckoutStep, Conclusion, ExprError, JobDocument, JobResult, JobStatus,
+    PlannedStep, RunStep, StepSummary, Submodules, UsesStep, interpolate,
 };
 
 use self::context::{Contexts, Runtime, condition};
@@ -490,6 +490,10 @@ impl Job<'_> {
             PlannedStep::Cache(cache) => self.cache_step(index, cache, sink).await,
             PlannedStep::Workspace(workspace) => self.workspace_step(index, workspace, sink).await,
             PlannedStep::TestResults { path } => self.test_results_step(index, path, sink).await,
+            PlannedStep::Checkout(checkout) => {
+                self.uses_step(index, &checkout_action(checkout), sink)
+                    .await
+            }
         };
         let conclusion = self.settle(outcome, common.continue_on_error);
         if let Some(id) = &common.id {
@@ -519,6 +523,7 @@ impl Job<'_> {
             PlannedStep::Cache(_) => "Cache".to_owned(),
             PlannedStep::Workspace(_) => "Workspace".to_owned(),
             PlannedStep::TestResults { .. } => "Test results".to_owned(),
+            PlannedStep::Checkout(_) => CHECKOUT_NAME.to_owned(),
         };
         let name = self.masker.mask(&name).into_owned();
         sink.step_started(index, &name);
@@ -1054,6 +1059,35 @@ fn random_name() -> Result<String, String> {
     Ok(name)
 }
 
+/// What a built-in `checkout` step shows in logs.
+const CHECKOUT_NAME: &str = "Checkout";
+
+/// The action a built-in `checkout` step runs: `actions/checkout` with
+/// the step's options as inputs.
+fn checkout_action(checkout: &CheckoutStep) -> UsesStep {
+    let mut with = BTreeMap::new();
+    if let Some(r#ref) = &checkout.r#ref {
+        with.insert("ref".to_owned(), r#ref.clone().into());
+    }
+    with.insert("fetch-depth".to_owned(), checkout.fetch_depth.into());
+    let submodules = match checkout.submodules {
+        Submodules::None => "false",
+        Submodules::Top => "true",
+        Submodules::Recursive => "recursive",
+    };
+    with.insert("submodules".to_owned(), submodules.into());
+    with.insert("lfs".to_owned(), checkout.lfs.into());
+    if let Some(path) = &checkout.path {
+        with.insert("path".to_owned(), path.clone().into());
+    }
+    UsesStep {
+        name: Some(CHECKOUT_NAME.to_owned()),
+        uses: "actions/checkout@v5".to_owned(),
+        with,
+        ..UsesStep::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1067,5 +1101,31 @@ mod tests {
             dirs.iter().all(|d| !d.starts_with(&layout.actions)),
             "{dirs:?}"
         );
+    }
+
+    #[test]
+    fn a_checkout_step_runs_actions_checkout_with_its_options() {
+        let step = checkout_action(&CheckoutStep {
+            r#ref: Some("main".to_owned()),
+            fetch_depth: 0,
+            submodules: Submodules::Recursive,
+            lfs: true,
+            path: Some("src".to_owned()),
+        });
+        assert_eq!(step.uses, "actions/checkout@v5");
+        assert_eq!(step.name.as_deref(), Some("Checkout"));
+        assert_eq!(
+            serde_json::to_value(&step.with).unwrap(),
+            serde_json::json!({
+                "ref": "main",
+                "fetch-depth": 0,
+                "submodules": "recursive",
+                "lfs": true,
+                "path": "src",
+            })
+        );
+        let plain = checkout_action(&CheckoutStep::default());
+        assert_eq!(plain.with.len(), 3);
+        assert_eq!(plain.with["submodules"], "false");
     }
 }

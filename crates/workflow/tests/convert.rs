@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use hatchrun_workflow::{
-    Conversion, Diagnostic, Filter, JobKind, Level, ParameterKind, Permissions, Require, Step,
-    convert, parse, to_yaml, validate,
+    CheckoutStep, Conversion, Diagnostic, Filter, JobKind, Level, ParameterKind, Permissions,
+    Require, Step, Submodules, convert, parse, to_yaml, validate,
 };
 use serde_json::{Value, json};
 
@@ -246,8 +246,10 @@ on:
 jobs:
   t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
 ");
-    assert!(out.config.workflows["ci"].on.push.is_some());
-    assert!(has(&out.warnings, &["ci.yml", "release"]));
+    let on = &out.config.workflows["ci"].on;
+    assert!(on.push.is_some());
+    assert_eq!(on.release.as_ref().unwrap().types, ["published"]);
+    assert!(!has(&out.warnings, &["`on.release`"]));
     assert!(has(&out.warnings, &["ci.yml", "pull_request_target"]));
     round_trips(&out);
 }
@@ -1725,4 +1727,264 @@ fn a_workflow_whose_events_all_fail_is_dropped() {
     )
     .unwrap_err();
     assert!(has(&out, &["ci.yml", "on.push"]), "{out:?}");
+}
+
+#[test]
+fn github_only_events_say_to_stay_on_github_actions() {
+    for event in ["pull_request_target", "issues", "issue_comment"] {
+        let out = ok(&format!(
+            "on: [push, {event}]\njobs:\n  t: {{ runs-on: ubuntu-latest, steps: [{{ run: x }}] }}\n"
+        ));
+        assert!(
+            has(
+                &out.warnings,
+                &[
+                    &format!("`on.{event}` is not supported"),
+                    "keep",
+                    "GitHub Actions"
+                ]
+            ),
+            "{event}: {:?}",
+            out.warnings
+        );
+    }
+    // Others do not.
+    let out =
+        ok("on: [push, watch]\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n");
+    assert!(has(&out.warnings, &["`on.watch` is not supported"]));
+    assert!(!has(&out.warnings, &["GitHub Actions"]));
+}
+
+/// Converts several files at once.
+fn many(files: &[(&str, &str)]) -> Conversion {
+    let files: Vec<(String, String)> = files
+        .iter()
+        .map(|(n, s)| ((*n).to_owned(), (*s).to_owned()))
+        .collect();
+    convert(&files).unwrap()
+}
+
+const CI: &str =
+    "name: CI\non: push\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n";
+
+#[test]
+fn workflow_run_names_workflows_by_their_stem() {
+    let out = many(&[
+        ("ci.yml", CI),
+        (
+            "unnamed.yml",
+            "on: push\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+        (
+            "deploy.yml",
+            "
+on:
+  workflow_run:
+    workflows: [CI, unnamed.yml, Missing, Deploy]
+    types: [completed, requested]
+    branches: [main]
+name: Deploy
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+",
+        ),
+    ]);
+    let run = out.config.workflows["deploy"]
+        .on
+        .workflow_run
+        .as_ref()
+        .unwrap();
+    assert_eq!(run.workflows, ["ci", "unnamed"]);
+    assert_eq!(run.types, ["completed"]);
+    assert_eq!(run.branches, Some(Filter::new(vec!["main".into()])));
+    assert!(has(&out.warnings, &["deploy.yml", "`Missing`", "dropped"]));
+    assert!(has(&out.warnings, &["deploy.yml", "`Deploy`", "this file"]));
+    assert!(has(
+        &out.warnings,
+        &["deploy.yml", "`requested`", "dropped"]
+    ));
+    assert_eq!(out.errors, []);
+    round_trips(&out);
+}
+
+#[test]
+fn workflow_run_with_no_known_workflow_is_dropped() {
+    let out = many(&[
+        ("ci.yml", CI),
+        (
+            "deploy.yml",
+            "on:\n  push:\n  workflow_run: { workflows: [Nope] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+        (
+            "only.yml",
+            "on:\n  workflow_run: { workflows: [CI], types: [requested] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+    ]);
+    let deploy = &out.config.workflows["deploy"].on;
+    assert!(deploy.workflow_run.is_none() && deploy.push.is_some());
+    assert!(has(
+        &out.warnings,
+        &["deploy.yml", "`on.workflow_run` was dropped"]
+    ));
+    // A workflow left with no event is dropped with its jobs.
+    assert!(!out.config.workflows.contains_key("only"));
+    assert!(!out.config.jobs.contains_key("only-t"));
+    assert!(has(&out.warnings, &["only.yml", "`requested`"]));
+    round_trips(&out);
+}
+
+#[test]
+fn workflow_run_after_a_workflow_that_did_not_convert() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "name: CI\non: issues\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+        (
+            "deploy.yml",
+            "name: Deploy\non:\n  workflow_run: { workflows: [CI] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+        (
+            "notify.yml",
+            "on:\n  workflow_run: { workflows: [Deploy] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+    ]);
+    // ci is dropped, so deploy is, and so notify is.
+    assert!(
+        out.config.workflows.is_empty(),
+        "{:?}",
+        out.config.workflows
+    );
+    assert!(out.config.jobs.is_empty());
+    assert!(has(
+        &out.warnings,
+        &["deploy.yml", "`ci`", "did not convert"]
+    ));
+    assert!(has(&out.warnings, &["notify.yml` was dropped"]));
+}
+
+#[test]
+fn release_types_convert() {
+    let out = ok(
+        "on:\n  release:\n    types: [published, created, edited]\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+    );
+    let release = out.config.workflows["ci"].on.release.as_ref().unwrap();
+    assert_eq!(release.types, ["published", "created"]);
+    assert!(has(&out.warnings, &["`on.release`", "`edited`", "dropped"]));
+    round_trips(&out);
+
+    let out = ok("on: release\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n");
+    let release = out.config.workflows["ci"].on.release.as_ref().unwrap();
+    assert_eq!(release.types, ["published"]);
+    assert!(has(
+        &out.warnings,
+        &["`on.release` has no `types`", "`published`"]
+    ));
+    round_trips(&out);
+
+    let out = ok(
+        "on:\n  push:\n  release: { types: deleted }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+    );
+    assert!(out.config.workflows["ci"].on.release.is_none());
+    assert!(has(
+        &out.warnings,
+        &["`on.release` was dropped", "`deleted`"]
+    ));
+}
+
+/// The steps of the one job of a converted one-step workflow.
+fn converted_steps(steps: &str) -> Conversion {
+    ok(&format!(
+        "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n{steps}"
+    ))
+}
+
+#[test]
+fn checkout_becomes_the_built_in_step() {
+    let out = converted_steps(
+        "
+      - uses: actions/checkout@v5
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          submodules: recursive
+          lfs: true
+          path: src
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          persist-credentials: false
+          clean: false
+      - uses: https://code.forgejo.org/actions/checkout@v4
+        with: { submodules: 'true', fetch-depth: '2' }
+",
+    );
+    let steps = &out.config.jobs["ci-t"].steps;
+    assert_eq!(steps[0], Step::Checkout(CheckoutStep::default()));
+    assert_eq!(
+        steps[1],
+        Step::Checkout(CheckoutStep {
+            r#ref: Some("${{ github.head_ref }}".into()),
+            fetch_depth: 0,
+            submodules: Submodules::Recursive,
+            lfs: true,
+            path: Some("src".into()),
+        })
+    );
+    assert_eq!(
+        steps[2],
+        Step::Checkout(CheckoutStep {
+            fetch_depth: 2,
+            submodules: Submodules::Top,
+            ..CheckoutStep::default()
+        })
+    );
+    assert!(has(
+        &out.warnings,
+        &[
+            "step `Check out`",
+            "built-in checkout",
+            "`clean`, `persist-credentials`"
+        ]
+    ));
+    assert!(!has(&out.warnings, &["`token`"]));
+    round_trips(&out);
+}
+
+#[test]
+fn checkout_that_needs_more_stays_a_uses_step() {
+    for with in [
+        "{ repository: acme/docs }",
+        "{ token: \"${{ secrets.PAT }}\" }",
+        "{ ssh-key: \"${{ secrets.KEY }}\" }",
+        "{ fetch-depth: \"${{ inputs.depth }}\" }",
+        "{ submodules: \"${{ inputs.subs }}\" }",
+        "{ lfs: maybe }",
+        "{ path: ../elsewhere }",
+    ] {
+        let out = converted_steps(&format!(
+            "      - uses: actions/checkout@v5\n        with: {with}\n"
+        ));
+        assert!(
+            matches!(&out.config.jobs["ci-t"].steps[0], Step::Uses(u) if u.uses == "actions/checkout@v5"),
+            "{with}"
+        );
+        assert!(!has(&out.warnings, &["built-in checkout"]), "{with}");
+    }
+    for extra in [
+        "        if: github.event_name == 'push'\n",
+        "        id: co\n",
+        "        env: { A: b }\n",
+        "        continue-on-error: true\n",
+    ] {
+        let out = converted_steps(&format!("      - uses: actions/checkout@v5\n{extra}"));
+        assert!(
+            matches!(&out.config.jobs["ci-t"].steps[0], Step::Uses(_)),
+            "{extra}"
+        );
+    }
+    // Another action with a similar name is left alone.
+    let out = converted_steps("      - uses: actions/checkout-extra@v1\n");
+    assert!(matches!(&out.config.jobs["ci-t"].steps[0], Step::Uses(_)));
 }

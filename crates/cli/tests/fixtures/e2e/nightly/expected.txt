@@ -26,7 +26,7 @@ event schedule '0 12 * * 0' (compile refs/heads/main)
       if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
       matrix target="parse"
       timeout 120m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@nightly
       step run: cargo install cargo-fuzz --locked
       step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
@@ -34,13 +34,13 @@ event schedule '0 12 * * 0' (compile refs/heads/main)
       if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
       matrix target="eval"
       timeout 120m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@nightly
       step run: cargo install cargo-fuzz --locked
       step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
     job audit on ubuntu-latest: ok=run fail=run
       if github.event.schedule != '17 3 * * *'
-      step actions/checkout@v5
+      step checkout
       step run: cargo install cargo-audit --locked && cargo audit
     job report on ubuntu-latest after fuzz (parse) + fuzz (eval) + audit: ok=run fail=run
       if always()
@@ -52,7 +52,7 @@ event schedule '17 3 * * *' (compile refs/heads/main)
       if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
       matrix target="parse"
       timeout 120m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@nightly
       step run: cargo install cargo-fuzz --locked
       step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
@@ -60,13 +60,13 @@ event schedule '17 3 * * *' (compile refs/heads/main)
       if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
       matrix target="eval"
       timeout 120m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@nightly
       step run: cargo install cargo-fuzz --locked
       step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
     job audit on ubuntu-latest: ok=skip fail=skip
       if github.event.schedule != '17 3 * * *'
-      step actions/checkout@v5
+      step checkout
       step run: cargo install cargo-audit --locked && cargo audit
     job report on ubuntu-latest after fuzz (parse) + fuzz (eval) + audit: ok=run fail=run
       if always()
@@ -78,7 +78,7 @@ event workflow_dispatch (compile refs/heads/main)
       if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
       matrix target="parse"
       timeout 120m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@nightly
       step run: cargo install cargo-fuzz --locked
       step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
@@ -86,13 +86,13 @@ event workflow_dispatch (compile refs/heads/main)
       if github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
       matrix target="eval"
       timeout 120m
-      step actions/checkout@v5
+      step checkout
       step dtolnay/rust-toolchain@nightly
       step run: cargo install cargo-fuzz --locked
       step run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3000
     job audit on ubuntu-latest: ok=run fail=run
       if github.event.schedule != '17 3 * * *'
-      step actions/checkout@v5
+      step checkout
       step run: cargo install cargo-audit --locked && cargo audit
     job report on ubuntu-latest after fuzz (parse) + fuzz (eval) + audit: ok=run fail=run
       if always()
