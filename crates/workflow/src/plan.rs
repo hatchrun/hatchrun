@@ -9,7 +9,7 @@
 //! Every other expression is left in place for the runner to evaluate.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 
 use serde_json::Value;
 
@@ -264,13 +264,13 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
             errors,
         };
         for (key, value) in &job.env {
-            check.text(&format!("`env.{key}`"), value);
+            check.text(&format_args!("`env.{key}`"), value);
         }
         if let Some(cond) = &job.if_ {
-            check.cond("`if`", cond);
+            check.cond(&"`if`", cond);
         }
         for (key, value) in &job.outputs {
-            check.text(&format!("`outputs.{key}`"), value);
+            check.text(&format_args!("`outputs.{key}`"), value);
         }
         check.steps(&job.steps);
     }
@@ -296,7 +296,7 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
                 errors,
             };
             for (key, value) in &entry.with {
-                check.value(&format!("`{key}`"), value, &mut |c, field, text| {
+                check.value(&format_args!("`{key}`"), value, &mut |c, field, text| {
                     if c.text(field, text) {
                         c.errors.push(no_parameters_here(id, key));
                     }
@@ -304,7 +304,7 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
             }
             for (key, values) in &entry.matrix {
                 for value in values {
-                    check.value(&format!("`{key}`"), value, &mut |c, field, text| {
+                    check.value(&format_args!("`{key}`"), value, &mut |c, field, text| {
                         if c.text(field, text) {
                             c.errors.push(no_parameters_here(id, key));
                         }
@@ -343,14 +343,18 @@ struct Check<'a> {
 impl Check<'_> {
     fn steps(&mut self, steps: &[Step]) {
         for (i, step) in steps.iter().enumerate() {
-            let at = |key: &str| format!("step {} `{key}`", i + 1);
+            let at = |key| At {
+                step: i + 1,
+                prefix: "",
+                key,
+            };
             match step {
                 Step::Run(run) => {
                     self.opt(&at("name"), run.name.as_deref());
                     self.text(&at("run"), &run.run);
                     self.opt(&at("shell"), run.shell.as_deref());
                     self.opt(&at("working-directory"), run.working_directory.as_deref());
-                    self.env(&at, &run.env);
+                    self.env(i + 1, &run.env);
                     if let Some(cond) = &run.if_ {
                         self.cond(&at("if"), cond);
                     }
@@ -365,11 +369,16 @@ impl Check<'_> {
                         )));
                     }
                     for (key, value) in &uses.with {
-                        self.value(&at(&format!("with.{key}")), value, &mut |c, f, t| {
+                        let field = At {
+                            step: i + 1,
+                            prefix: "with.",
+                            key,
+                        };
+                        self.value(&field, value, &mut |c, f, t| {
                             c.text(f, t);
                         });
                     }
-                    self.env(&at, &uses.env);
+                    self.env(i + 1, &uses.env);
                     if let Some(cond) = &uses.if_ {
                         self.cond(&at("if"), cond);
                     }
@@ -402,9 +411,9 @@ impl Check<'_> {
 
     /// Checks a command call: the command exists and the values fit its
     /// parameters.
-    fn call(&mut self, field: &str, name: &str, with: &BTreeMap<String, Value>) {
+    fn call(&mut self, field: &dyn fmt::Display, name: &str, with: &BTreeMap<String, Value>) {
         for (key, value) in with {
-            self.value(&format!("{field} `{key}`"), value, &mut |c, f, t| {
+            self.value(&format_args!("{field} `{key}`"), value, &mut |c, f, t| {
                 c.text(f, t);
             });
         }
@@ -437,21 +446,31 @@ impl Check<'_> {
         }
     }
 
-    fn opt(&mut self, field: &str, text: Option<&str>) {
+    fn opt(&mut self, field: &dyn fmt::Display, text: Option<&str>) {
         if let Some(text) = text {
             self.text(field, text);
         }
     }
 
-    /// Checks a step's `env`; `at` names a key of the step.
-    fn env(&mut self, at: &dyn Fn(&str) -> String, env: &BTreeMap<String, String>) {
+    /// Checks the `env` of step `step`.
+    fn env(&mut self, step: usize, env: &BTreeMap<String, String>) {
         for (key, value) in env {
-            self.text(&at(&format!("env.{key}")), value);
+            let field = At {
+                step,
+                prefix: "env.",
+                key,
+            };
+            self.text(&field, value);
         }
     }
 
     /// Calls `f` on every string inside `value`.
-    fn value(&mut self, field: &str, value: &Value, f: &mut dyn FnMut(&mut Self, &str, &str)) {
+    fn value(
+        &mut self,
+        field: &dyn fmt::Display,
+        value: &Value,
+        f: &mut dyn FnMut(&mut Self, &dyn fmt::Display, &str),
+    ) {
         match value {
             Value::String(text) => f(self, field, text),
             Value::Array(items) => {
@@ -471,7 +490,7 @@ impl Check<'_> {
     /// Checks every `${{ }}` in a string. Returns whether one reads
     /// `parameters` other than as a whole substitution where there are
     /// no parameters, which the caller reports.
-    fn text(&mut self, field: &str, text: &str) -> bool {
+    fn text(&mut self, field: &dyn fmt::Display, text: &str) -> bool {
         let found = match expr::expressions(text) {
             Ok(found) => found,
             Err(e) => {
@@ -501,7 +520,7 @@ impl Check<'_> {
 
     /// Checks an `if:`, which is a bare expression unless it is wrapped
     /// in `${{ }}`.
-    fn cond(&mut self, field: &str, cond: &str) {
+    fn cond(&mut self, field: &dyn fmt::Display, cond: &str) {
         if expr::find_open(cond).is_some() {
             self.text(field, cond);
         } else {
@@ -512,7 +531,7 @@ impl Check<'_> {
     /// Checks one expression that is evaluated at run time, where
     /// `parameters` cannot be read. Returns whether it reads
     /// `parameters` where there are no parameters at all.
-    fn expression(&mut self, field: &str, inner: &str, start: usize) -> bool {
+    fn expression(&mut self, field: &dyn fmt::Display, inner: &str, start: usize) -> bool {
         let names = match expr::checked_contexts(inner) {
             Ok(names) => names,
             Err(e) => {
@@ -537,11 +556,25 @@ impl Check<'_> {
         reads
     }
 
-    fn bad(&mut self, field: &str, e: &ExprError) {
+    fn bad(&mut self, field: &dyn fmt::Display, e: &ExprError) {
         self.errors.push(Diagnostic::new(format!(
             "{} {field} has a bad expression: {e}",
             self.owner
         )));
+    }
+}
+
+/// A key of a step as it reads in a message, such as step 2 `env.X`.
+/// It is written out only when a message is made.
+struct At<'k> {
+    step: usize,
+    prefix: &'k str,
+    key: &'k str,
+}
+
+impl fmt::Display for At<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "step {} `{}{}`", self.step, self.prefix, self.key)
     }
 }
 
