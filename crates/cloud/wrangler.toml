@@ -90,6 +90,19 @@ max_retries = 3
 name = "ALERTS"
 allowed_sender_addresses = ["alerts@notify.hatchrun.io"]
 
+# The key that seals the secrets owners set for their jobs
+# (crates/cloud/src/secrets.rs): 32 random bytes, base64, kept in the
+# account's Secrets Store rather than among the Worker's own secrets.
+# The deploy workflow sets store_id from the CLOUDFLARE_SECRETS_STORE_ID
+# secret. SECRETS_KEY_ID below names the key, and each row records the
+# id of the key that sealed it. While keys rotate, a second entry binds
+# the old key as SECRETS_KEY_PREVIOUS, with its id in
+# SECRETS_KEY_PREVIOUS_ID; the README has the steps.
+[[secrets_store_secrets]]
+binding = "SECRETS_KEY"
+store_id = "secrets-store-local"
+secret_name = "secrets-key-2026-10"
+
 # Runner metrics, which hatchrun-telemetry (crates/telemetry) writes to
 # Analytics Engine, read back for the app's job pages.
 [analytics]
@@ -148,6 +161,9 @@ CACHE_URL = "https://app.hatchrun.io/v1/cache"
 # OIDC_NEXT_KEY_ID and OIDC_PREVIOUS_KEY_ID are set here. The README
 # has the rotation steps.
 OIDC_KEY_ID = "2026-10-14"
+# Id of the SECRETS_KEY binding's key, recorded with every secret it
+# seals.
+SECRETS_KEY_ID = "2026-10"
 # The reconciler's timeouts, in seconds (crates/cloud/src/reconcile/plan.rs
 # says what each one bounds). A job queued this long without a runner
 # launches again.

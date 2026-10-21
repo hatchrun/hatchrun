@@ -466,6 +466,55 @@ pub fn default_branch(response: &Response) -> Result<String, String> {
     decode::<Repository>(response, "repository").map(|repository| repository.default_branch)
 }
 
+/// Repositories in a page of [`installation_repositories`].
+pub const REPOSITORIES_PER_PAGE: u32 = 100;
+
+/// Page `page`, from 1, of the repositories an installation token
+/// reaches.
+#[must_use]
+pub fn installation_repositories(api: &str, token: &str, page: u32) -> Request {
+    call(
+        "GET",
+        format!("{api}/installation/repositories?per_page={REPOSITORIES_PER_PAGE}&page={page}"),
+        token,
+    )
+}
+
+/// A repository an installation reaches.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct InstalledRepository {
+    /// Its name, without the owner.
+    pub name: String,
+    /// `owner/name`.
+    pub full_name: String,
+    /// Whether it is private.
+    #[serde(default)]
+    pub private: bool,
+    /// Whether it is archived.
+    #[serde(default)]
+    pub archived: bool,
+}
+
+/// A page of an installation's repositories.
+#[derive(Debug, Deserialize)]
+pub struct InstalledRepositories {
+    /// Repositories on every page.
+    pub total_count: u64,
+    /// This page's.
+    pub repositories: Vec<InstalledRepository>,
+}
+
+/// Reads a page of [`installation_repositories`].
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a page of repositories.
+pub fn parse_installation_repositories(
+    response: &Response,
+) -> Result<InstalledRepositories, String> {
+    decode(response, "installation repositories")
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(response: &Response, what: &str) -> Result<T, String> {
     if !response.ok() {
         return Err(format!(
@@ -726,5 +775,35 @@ mod tests {
             let body = format!(r#"{{"status":"{status}","ahead_by":0}}"#);
             assert_eq!(contained(&answer(200, &body)), Ok(on), "{status}");
         }
+    }
+
+    #[test]
+    fn lists_an_installations_repositories() {
+        let request = installation_repositories("https://api", "ghs_x", 2);
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.url,
+            "https://api/installation/repositories?per_page=100&page=2"
+        );
+        assert_eq!(request.header_value("authorization"), Some("Bearer ghs_x"));
+        let page = parse_installation_repositories(&Response {
+            status: 200,
+            body: br#"{"total_count":2,"repositories":[
+                {"id":1,"name":"web","full_name":"acme/web","private":true,"archived":false},
+                {"id":2,"name":"old","full_name":"acme/old","archived":true}]}"#
+                .to_vec(),
+        })
+        .unwrap();
+        assert_eq!(page.total_count, 2);
+        assert_eq!(page.repositories[0].full_name, "acme/web");
+        assert!(page.repositories[0].private);
+        assert!(page.repositories[1].archived && !page.repositories[1].private);
+        assert!(
+            parse_installation_repositories(&Response {
+                status: 403,
+                body: b"{}".to_vec(),
+            })
+            .is_err()
+        );
     }
 }

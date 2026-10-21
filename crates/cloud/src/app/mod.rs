@@ -20,6 +20,8 @@
 //!   job's CPU and memory (see [`metrics`]).
 //! - `/api/tenants/<org>/runners` manages runner profiles (see
 //!   [`runners`]).
+//! - `/api/tenants/<org>/{secrets,variables,environments,repositories}`
+//!   manage what jobs get besides their code (see [`secrets`]).
 //! - `/api/plan`, `/api/tenants/<org>/{checkout,portal,beta}` and
 //!   `/api/polar/webhook` handle the licence (see [`billing`]).
 //! - `POST /api/internal/images` takes runner image releases from the
@@ -34,6 +36,7 @@ mod dashboard;
 mod images;
 mod metrics;
 mod runners;
+mod secrets;
 pub(crate) mod tenants;
 
 use serde::Deserialize;
@@ -275,6 +278,14 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         }
         (method, ["tenants", org, "runners", rest @ ..]) => {
             runners::route(&ctx, org, method, rest, &mut req).await
+        }
+        (method, ["tenants", org, rest @ ..])
+            if matches!(
+                rest.first(),
+                Some(&("secrets" | "variables" | "environments" | "repositories"))
+            ) =>
+        {
+            secrets::route(&ctx, org, method, rest, &mut req).await
         }
         (Method::Get, ["plan"]) => billing::plan(&ctx).await,
         (Method::Post, ["tenants", org, "checkout"]) => billing::checkout(&ctx, org).await,

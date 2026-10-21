@@ -57,6 +57,7 @@ pub mod polar;
 pub mod profiles;
 mod reconcile;
 pub mod runs;
+mod secrets;
 pub mod session;
 pub mod settings;
 pub mod signin;

@@ -616,6 +616,42 @@ secrets do nothing. Delete them anyway, from GitHub with
 `gh secret delete NAME --env production` and from the Worker with
 `npx wrangler@4.145.0 secret delete NAME`.
 
+### Secrets and variables
+
+Owners set secrets and variables for their jobs in the app, for the
+organization, one repository or one environment, under
+`/api/tenants/<org>/{secrets,variables,environments}`
+([`secrets`](crates/cloud/src/app/secrets.rs)). Variables are stored as
+they are. Secrets are sealed with AES-256-GCM through `WebCrypto`
+([`secrets`](crates/cloud/src/secrets.rs)) and the API never returns
+them; every change adds a row to `secret_events`.
+
+The key is 32 random bytes, base64, in the account's Cloudflare Secrets
+Store, bound as `SECRETS_KEY`; `SECRETS_KEY_ID` in
+[`wrangler.toml`](crates/cloud/wrangler.toml) is its id, which each row
+records. The deploy workflow reads the store's id from the
+`CLOUDFLARE_SECRETS_STORE_ID` secret. Create the key once, pasting the
+output of `openssl rand -base64 32` at the prompt:
+
+```sh
+npx wrangler@4.145.0 secrets-store secret create "$STORE_ID" \
+  --name secrets-key-2026-10 --scopes workers --remote
+gh secret set CLOUDFLARE_SECRETS_STORE_ID --env production --body "$STORE_ID"
+```
+
+Losing the key loses every secret it sealed; owners would have to set
+them again.
+
+To rotate, create the next key in the store, then in one change to
+`wrangler.toml` point `SECRETS_KEY` at it and set `SECRETS_KEY_ID` to
+its id, and add a second `[[secrets_store_secrets]]` entry binding the
+old key as `SECRETS_KEY_PREVIOUS`, with its id in
+`SECRETS_KEY_PREVIOUS_ID`. New values are sealed with the new key and
+old rows still open with the old one. Remove the previous key once no
+row names it. Under `wrangler dev`, create a key in the local store
+(the same command without `--remote`, with the `store_id` from
+`wrangler.toml`).
+
 ## Scale set client
 
 [`crates/scaleset`](crates/scaleset) talks to the GitHub Actions runner
