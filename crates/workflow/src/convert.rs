@@ -645,7 +645,6 @@ impl Cx {
             ("container", gh.container.is_some(), LATER),
             ("concurrency", gh.concurrency.is_some(), ""),
             ("permissions", gh.permissions.is_some(), ""),
-            ("environment", gh.environment.is_some(), ""),
             ("continue-on-error", gh.continue_on_error.is_some(), ""),
         ] {
             if set {
@@ -654,6 +653,10 @@ impl Cx {
                 ));
             }
         }
+        let environment = gh
+            .environment
+            .as_ref()
+            .and_then(|env| self.environment(at, env));
         let mut matrix = self.strategy(at, gh.strategy);
         let runs_on = self.runs_on(at, gh.runs_on.as_ref(), &mut matrix);
         let requires = match gh.needs {
@@ -707,9 +710,53 @@ impl Cx {
             name: Some(id.to_owned()),
             requires,
             matrix,
+            environment,
             ..WorkflowJob::default()
         };
         Some((job, entry))
+    }
+
+    /// The name of a job's `environment: NAME` or
+    /// `environment: { name: NAME, url: URL }`, which moves to the
+    /// workflow entry. `url` is dropped, and so is a name hatchrun
+    /// cannot hold: one with an expression, or with characters outside
+    /// `[A-Za-z0-9_.-]`. Each drop warns.
+    fn environment(&mut self, at: &str, value: &Value) -> Option<String> {
+        let name = match value {
+            Value::Object(map) => {
+                for key in map.keys().filter(|k| *k != "name") {
+                    if key == "url" {
+                        self.warn(format!(
+                            "{at}: `environment.url` is not supported and was dropped"
+                        ));
+                    } else {
+                        self.warn(format!("{at}: unknown key `environment.{key}` was dropped"));
+                    }
+                }
+                map.get("name")
+            }
+            other => Some(other),
+        };
+        let Some(Value::String(name)) = name else {
+            let shown = name.map_or_else(|| "nothing".to_owned(), show);
+            self.warn(format!(
+                "{at}: environment `{shown}` is not a name and was dropped"
+            ));
+            return None;
+        };
+        if expr::find_open(name).is_some() {
+            self.warn(format!(
+                "{at}: environment `{name}` is an expression, which is not supported; it was dropped"
+            ));
+            return None;
+        }
+        if !plan::environment_name(name) {
+            self.warn(format!(
+                "{at}: environment `{name}` was dropped; a name is letters, digits, `_`, `.` and `-`"
+            ));
+            return None;
+        }
+        Some(name.clone())
     }
 
     /// Maps `runs-on` to a runner template label. `runs-on: ${{ matrix.KEY }}`

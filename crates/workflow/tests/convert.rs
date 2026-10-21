@@ -285,7 +285,6 @@ jobs:
         "container",
         "concurrency",
         "permissions",
-        "environment",
         "include",
         "exclude",
         "fail-fast",
@@ -307,6 +306,59 @@ jobs:
     }
     let entry = &out.config.workflows["ci"].jobs[0];
     assert_eq!(entry.matrix["node"], [json!(20), json!(22)]);
+    assert_eq!(entry.environment.as_deref(), Some("prod"));
+    assert!(!has(&out.warnings, &["environment"]), "{:?}", out.warnings);
+    round_trips(&out);
+}
+
+#[test]
+fn environment_moves_to_the_entry() {
+    let out = ok("
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://example.com
+    steps: [{ run: ./deploy }]
+  preview:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    steps: [{ run: ./preview }]
+  odd:
+    runs-on: ubuntu-latest
+    environment: my env
+    steps: [{ run: ./odd }]
+");
+    let entries = &out.config.workflows["ci"].jobs;
+    let env = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.name.as_deref() == Some(name))
+            .unwrap()
+            .environment
+            .clone()
+    };
+    assert_eq!(env("deploy").as_deref(), Some("production"));
+    assert_eq!(env("preview"), None);
+    assert_eq!(env("odd"), None);
+    assert!(
+        has(&out.warnings, &["deploy", "`environment.url`", "dropped"]),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        has(&out.warnings, &["preview", "expression", "dropped"]),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        has(&out.warnings, &["odd", "`my env`", "dropped"]),
+        "{:?}",
+        out.warnings
+    );
+    assert!(to_yaml(&out.config).contains("environment: production"));
     round_trips(&out);
 }
 

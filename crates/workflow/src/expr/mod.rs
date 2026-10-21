@@ -14,6 +14,7 @@ mod lexer;
 mod parser;
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde_json::Value;
@@ -255,6 +256,154 @@ pub(crate) fn contexts(expr: &str) -> Result<Vec<(Cow<'_, str>, usize)>, ExprErr
         Ok(())
     })?;
     Ok(names)
+}
+
+/// The secret or variable names something reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Needed {
+    /// These names, uppercased.
+    Names(BTreeSet<String>),
+    /// Every name: the context is read whole, as in `toJSON(secrets)`,
+    /// or through a key known only at run time, as in `secrets[x]`.
+    All,
+}
+
+impl Default for Needed {
+    fn default() -> Self {
+        Self::Names(BTreeSet::new())
+    }
+}
+
+impl Needed {
+    /// Whether nothing is needed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Names(names) if names.is_empty())
+    }
+
+    /// Adds `key`, uppercased, or makes this [`Needed::All`] for `None`.
+    fn add(&mut self, key: Option<&str>) {
+        match (key, &mut *self) {
+            (_, Self::All) => {}
+            (None, _) => *self = Self::All,
+            (Some(key), Self::Names(names)) => {
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(key)) {
+                    names.insert(key.to_ascii_uppercase());
+                }
+            }
+        }
+    }
+
+    /// Adds everything `other` needs.
+    pub fn extend(&mut self, other: Needed) {
+        match other {
+            Self::All => *self = Self::All,
+            Self::Names(names) => names.iter().for_each(|n| self.add(Some(n))),
+        }
+    }
+}
+
+/// The names joined with `, `, or `all`.
+impl fmt::Display for Needed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => f.write_str("all"),
+            Self::Names(names) => {
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(name)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The secret minted for each job rather than stored.
+pub const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
+
+/// The secrets and variables expressions read, so a job is sent only
+/// those. Expressions that do not parse are skipped; validation reports
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Needs {
+    /// Names read from `secrets`, without [`GITHUB_TOKEN`].
+    pub secrets: Needed,
+    /// Names read from `vars`.
+    pub vars: Needed,
+    /// Whether `secrets.GITHUB_TOKEN` is read. The token is minted for
+    /// the job, not stored, so it is kept out of `secrets`. A read of
+    /// every secret ([`Needed::All`]) does not set it.
+    pub github_token: bool,
+}
+
+impl Needs {
+    /// Adds the reads of every `${{ }}` in `text`. Text with an unclosed
+    /// `${{` adds nothing.
+    pub fn read(&mut self, text: &str) {
+        if let Ok(found) = expressions(text) {
+            for (_, inner) in found {
+                self.read_expr(inner);
+            }
+        }
+    }
+
+    /// Adds the reads of an `if:`, which may be a bare expression.
+    pub fn read_condition(&mut self, cond: &str) {
+        if find_open(cond).is_some() {
+            self.read(cond);
+        } else {
+            self.read_expr(cond);
+        }
+    }
+
+    /// Adds the reads of one expression, the text between `${{` and `}}`.
+    pub fn read_expr(&mut self, expr: &str) {
+        let Ok(ast) = tree(expr) else { return };
+        eval::visit_keys(&ast, &mut |name, key| {
+            if name.eq_ignore_ascii_case("secrets") {
+                if key.is_some_and(|k| k.eq_ignore_ascii_case(GITHUB_TOKEN)) {
+                    self.github_token = true;
+                } else {
+                    self.secrets.add(key);
+                }
+            } else if name.eq_ignore_ascii_case("vars") {
+                self.vars.add(key);
+            }
+        });
+    }
+
+    /// Adds everything `other` needs.
+    pub fn extend(&mut self, other: Needs) {
+        self.secrets.extend(other.secrets);
+        self.vars.extend(other.vars);
+        self.github_token |= other.github_token;
+    }
+
+    /// Whether no secret or variable is read, [`GITHUB_TOKEN`] aside.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.secrets.is_empty() && self.vars.is_empty()
+    }
+}
+
+/// `secrets A, B; vars C`, leaving out an empty part and
+/// [`GITHUB_TOKEN`]; `all` stands for [`Needed::All`].
+impl fmt::Display for Needs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.secrets.is_empty() {
+            write!(f, "secrets {}", self.secrets)?;
+            if !self.vars.is_empty() {
+                f.write_str("; ")?;
+            }
+        }
+        if !self.vars.is_empty() {
+            write!(f, "vars {}", self.vars)?;
+        }
+        Ok(())
+    }
 }
 
 /// Lexes and parses one expression, within the length limit.

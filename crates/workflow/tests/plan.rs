@@ -5,7 +5,7 @@
 //! Compiling a workflow into a job plan.
 
 use hatchrun_workflow::{
-    Diagnostic, JobKind, Plan, PlannedJob, PlannedStep, compile, parse, template, validate,
+    Diagnostic, JobKind, Plan, PlannedJob, PlannedStep, compile, parse, template, to_yaml, validate,
 };
 
 const CYCLE: &str = "
@@ -1118,4 +1118,68 @@ fn filters_are_capped() {
     // Plain text, `text**` and `**text` match as text and do not count.
     let plain = many_patterns(20, 250, |i| format!("'docs/{i}/**'"));
     assert_eq!(errors(&plain), Vec::new());
+}
+
+#[test]
+fn entry_environment_reaches_every_planned_job() {
+    let yaml = "
+jobs:
+  t: { runs-on: ubuntu-latest, parallelism: 2, parameters: { v: { type: integer } }, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { environment: prod.eu-1, matrix: { v: [1, 2] } }
+      - hold: { type: approval, requires: [t] }
+";
+    let config = parse(yaml).unwrap();
+    assert_eq!(
+        config.workflows["ci"].jobs[0].environment.as_deref(),
+        Some("prod.eu-1")
+    );
+    let yaml = to_yaml(&config);
+    assert!(yaml.contains("environment: prod.eu-1"), "{yaml}");
+    assert_eq!(parse(&yaml).unwrap(), config);
+    let plan = compile(&config, "ci", "refs/heads/main").unwrap();
+    assert_eq!(plan.jobs.len(), 5);
+    for job in &plan.jobs[..4] {
+        assert_eq!(job.environment.as_deref(), Some("prod.eu-1"), "{}", job.id);
+    }
+    assert_eq!(plan.jobs[4].environment, None);
+}
+
+#[test]
+fn rejects_bad_environments() {
+    let entry = |body: &str| {
+        format!(
+            "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{body}] }} }}
+"
+        )
+    };
+    assert_error(
+        &entry("{ t: { environment: '' } }"),
+        &["`ci`", "`t`", "empty `environment`"],
+    );
+    assert_error(
+        &entry("{ t: { environment: 'my env' } }"),
+        &["environment `my env`", "letters"],
+    );
+    assert_error(
+        &entry("{ t: { environment: '${{ github.ref }}' } }"),
+        &["letters"],
+    );
+    assert_error(
+        &entry("t, { hold: { type: approval, environment: prod } }"),
+        &["approval `hold`", "`environment`"],
+    );
+    let bad = parse(&entry("{ t: { environment: 'a/b' } }")).unwrap();
+    assert!(compile(&bad, "ci", "refs/heads/main").is_err());
+    assert_error(
+        "
+jobs: { t: { runs-on: ubuntu-latest, parameters: { environment: { type: string } }, steps: [] } }
+",
+        &["`t`", "`environment`", "rename"],
+    );
 }

@@ -18,7 +18,7 @@ use crate::config::{
     WorkflowJob, WorkspaceStep,
 };
 use crate::diagnostic::Diagnostic;
-use crate::expr::{self, ExprError};
+use crate::expr::{self, ExprError, Needs};
 use crate::templates::{Template, template, template_labels};
 use crate::trigger::{Filter, MAX_GLOBS, MAX_PATTERNS, Triggers};
 
@@ -84,7 +84,15 @@ const STEP_KEYS: &[&str] = &[
 
 /// Keys of a workflow entry. A job parameter with one of these names
 /// could never be set from a workflow: the entry reads the key itself.
-const ENTRY_KEYS: &[&str] = &["name", "requires", "type", "branches", "tags", "matrix"];
+const ENTRY_KEYS: &[&str] = &[
+    "name",
+    "requires",
+    "type",
+    "branches",
+    "tags",
+    "matrix",
+    "environment",
+];
 
 /// The jobs one workflow runs for one ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +122,11 @@ pub struct PlannedJob {
     /// `(index, total)` of a parallel node, 0-based. `None` without
     /// `parallelism` or with `parallelism: 1`.
     pub node: Option<(u32, u32)>,
+    /// The workflow entry's deployment environment. The control plane
+    /// checks it exists and allows the ref, holds the job when it
+    /// requires approval, and resolves secrets and variables from it
+    /// first.
+    pub environment: Option<String>,
     /// Environment variables for every step.
     pub env: BTreeMap<String, String>,
     /// The job runs only when this expression is true.
@@ -209,6 +222,135 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
     dedup(errors)
 }
 
+/// The secrets and variables `job` reads: in its `env`, `if`, `outputs`,
+/// steps and parameter defaults, and in the commands it calls.
+#[must_use]
+pub fn job_needs(config: &Config, job: &Job) -> Needs {
+    let mut reader = NeedsReader {
+        config,
+        needs: Needs::default(),
+        commands: BTreeSet::new(),
+    };
+    reader.job(job);
+    reader.needs
+}
+
+/// The secrets and variables a workflow reads: [`job_needs`] of every
+/// job it runs, and the values its entries pass in. Every entry counts,
+/// whatever its `branches` and `tags`.
+#[must_use]
+pub fn workflow_needs(config: &Config, workflow: &Workflow) -> Needs {
+    let mut reader = NeedsReader {
+        config,
+        needs: Needs::default(),
+        commands: BTreeSet::new(),
+    };
+    let mut jobs = BTreeSet::new();
+    for entry in &workflow.jobs {
+        entry.with.values().for_each(|v| reader.value(v));
+        entry
+            .matrix
+            .values()
+            .flatten()
+            .for_each(|v| reader.value(v));
+        if !entry.approval
+            && jobs.insert(entry.job.as_str())
+            && let Some(job) = config.jobs.get(&entry.job)
+        {
+            reader.job(job);
+        }
+    }
+    reader.needs
+}
+
+/// Collects [`Needs`], reading each command once.
+struct NeedsReader<'a> {
+    config: &'a Config,
+    needs: Needs,
+    commands: BTreeSet<&'a str>,
+}
+
+impl<'a> NeedsReader<'a> {
+    fn job(&mut self, job: &'a Job) {
+        self.params(&job.parameters);
+        job.env.values().for_each(|v| self.needs.read(v));
+        if let Some(cond) = &job.if_ {
+            self.needs.read_condition(cond);
+        }
+        job.outputs.values().for_each(|v| self.needs.read(v));
+        self.steps(&job.steps);
+    }
+
+    fn params(&mut self, params: &BTreeMap<String, Parameter>) {
+        for param in params.values() {
+            if let Some(default) = &param.default {
+                self.value(default);
+            }
+        }
+    }
+
+    fn steps(&mut self, steps: &'a [Step]) {
+        for step in steps {
+            match step {
+                Step::Run(run) => {
+                    let texts = [&run.name, &run.shell, &run.working_directory];
+                    texts.into_iter().flatten().for_each(|t| self.needs.read(t));
+                    self.needs.read(&run.run);
+                    run.env.values().for_each(|v| self.needs.read(v));
+                    if let Some(cond) = &run.if_ {
+                        self.needs.read_condition(cond);
+                    }
+                }
+                Step::Uses(uses) => {
+                    if let Some(name) = &uses.name {
+                        self.needs.read(name);
+                    }
+                    self.needs.read(&uses.uses);
+                    uses.with.values().for_each(|v| self.value(v));
+                    uses.env.values().for_each(|v| self.needs.read(v));
+                    if let Some(cond) = &uses.if_ {
+                        self.needs.read_condition(cond);
+                    }
+                }
+                Step::Command { name, with } => {
+                    for value in with.values() {
+                        self.value(value);
+                    }
+                    if self.commands.insert(name.as_str())
+                        && let Some(command) = self.config.commands.get(name)
+                    {
+                        self.params(&command.parameters);
+                        self.steps(&command.steps);
+                    }
+                }
+                Step::Cache(cache) => {
+                    self.needs.read(&cache.key);
+                    let paths = cache.restore_keys.iter().chain(&cache.paths);
+                    paths.for_each(|p| self.needs.read(p));
+                }
+                Step::Workspace(WorkspaceStep::Persist { root, paths }) => {
+                    self.needs.read(root);
+                    for path in paths {
+                        self.needs.read(path);
+                    }
+                }
+                Step::Workspace(WorkspaceStep::Attach { at }) => self.needs.read(at),
+                Step::TestResults { path } => self.needs.read(path),
+            }
+        }
+    }
+
+    /// Reads every string in a parameter value.
+    fn value(&mut self, value: &Value) {
+        match value {
+            Value::String(text) => self.needs.read(text),
+            Value::Array(items) => items.iter().for_each(|v| self.value(v)),
+            Value::Object(map) => map.values().for_each(|v| self.value(v)),
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+}
+
 /// Problems that belong to the config as a whole, not one workflow.
 fn config_errors(config: &Config) -> Vec<Diagnostic> {
     let mut errors = Vec::new();
@@ -228,7 +370,42 @@ fn config_errors(config: &Config) -> Vec<Diagnostic> {
         }
     }
     filter_errors(config, &mut errors);
+    environment_errors(config, &mut errors);
     errors
+}
+
+/// Whether `name` can name an environment: it matches `[A-Za-z0-9_.-]+`.
+pub(crate) fn environment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Reports an entry environment whose name is empty or holds a
+/// character outside `[A-Za-z0-9_.-]`, and an approval with one.
+fn environment_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
+    for (workflow, wf) in &config.workflows {
+        for entry in &wf.jobs {
+            let Some(environment) = &entry.environment else {
+                continue;
+            };
+            let id = entry.name.as_deref().unwrap_or(&entry.job);
+            if entry.approval {
+                errors.push(Diagnostic::new(format!(
+                    "workflow `{workflow}` approval `{id}` cannot have an `environment`"
+                )));
+            } else if environment.is_empty() {
+                errors.push(Diagnostic::new(format!(
+                    "workflow `{workflow}` entry `{id}` has an empty `environment`"
+                )));
+            } else if !environment_name(environment) {
+                errors.push(Diagnostic::new(format!(
+                    "workflow `{workflow}` entry `{id}` has environment `{environment}`; a name is letters, digits, `_`, `.` and `-`"
+                )));
+            }
+        }
+    }
 }
 
 /// Reports a filter with more than `MAX_PATTERNS` patterns, and a config
@@ -997,6 +1174,12 @@ fn expand_entry(
             break;
         };
         base.kind = JobKind::Run { template };
+        if let Some(environment) = &entry.environment {
+            if !walk.bytes(environment.len(), errors) {
+                break;
+            }
+            base.environment = Some(environment.clone());
+        }
         let Some(jobs) = copy_job(base, combo, id, nodes, &mut walk, errors) else {
             break;
         };
@@ -1248,6 +1431,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         kind: JobKind::Approval,
         matrix: BTreeMap::new(),
         node: None,
+        environment: None,
         env: BTreeMap::new(),
         if_: None,
         timeout_minutes: DEFAULT_TIMEOUT_MINUTES,
@@ -1335,6 +1519,7 @@ fn expand_job(
         kind: JobKind::Approval,
         matrix: BTreeMap::new(),
         node: None,
+        environment: None,
         env,
         if_,
         timeout_minutes: job.timeout_minutes.unwrap_or(DEFAULT_TIMEOUT_MINUTES),
@@ -1998,6 +2183,7 @@ fn job_bytes(job: &PlannedJob) -> usize {
         + map_bytes(&job.env)
         + map_bytes(&job.outputs)
         + job.if_.as_ref().map_or(0, String::len)
+        + job.environment.as_ref().map_or(0, String::len)
 }
 
 /// A parameter or matrix value as text: strings as they are, whole

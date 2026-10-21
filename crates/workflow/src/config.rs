@@ -607,7 +607,7 @@ pub struct Workflow {
 ///
 /// In YAML a bare job name or a map with one key, the job name, whose
 /// value holds `requires`, `type: approval`, `branches`, `tags`,
-/// `matrix`, `name` and parameter values.
+/// `matrix`, `name`, `environment` and parameter values.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkflowJob {
     /// The job from `jobs:`, or the approval's own name.
@@ -624,6 +624,14 @@ pub struct WorkflowJob {
     pub tags: Option<Filter>,
     /// Parameter values to run the job with, one copy per combination.
     pub matrix: BTreeMap<String, Vec<Value>>,
+    /// The deployment environment whose secrets and variables the job
+    /// reads before the repository's and the organization's. The name
+    /// matches `[A-Za-z0-9_.-]+`; an approval cannot have one. The
+    /// config cannot see which environments exist: the control plane
+    /// checks the name and the ref against the environment's branch
+    /// rules, and holds the job for a reviewer when the environment
+    /// requires approval.
+    pub environment: Option<String>,
     /// Parameter values for the job.
     pub with: BTreeMap<String, Value>,
 }
@@ -639,7 +647,9 @@ impl<'de> Deserialize<'de> for WorkflowJobBody {
             type Value = WorkflowJobBody;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a map of requires, type, branches, tags, matrix, name and parameters")
+                f.write_str(
+                    "a map of requires, type, branches, tags, matrix, name, environment and parameters",
+                )
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
@@ -661,6 +671,7 @@ impl<'de> Deserialize<'de> for WorkflowJobBody {
                         "branches" => job.branches = Some(map.next_value()?),
                         "tags" => job.tags = Some(map.next_value()?),
                         "matrix" => job.matrix = map.next_value()?,
+                        "environment" => job.environment = Some(map.next_value()?),
                         _ => {
                             let value: Value = map.next_value()?;
                             job.with.insert(key, value);
@@ -735,6 +746,7 @@ impl WorkflowJobBodyRef<'_> {
             && j.branches.is_none()
             && j.tags.is_none()
             && j.matrix.is_empty()
+            && j.environment.is_none()
             && j.with.is_empty()
     }
 }
@@ -760,6 +772,9 @@ impl Serialize for WorkflowJobBodyRef<'_> {
         }
         if !j.matrix.is_empty() {
             map.serialize_entry("matrix", &j.matrix)?;
+        }
+        if let Some(environment) = &j.environment {
+            map.serialize_entry("environment", environment)?;
         }
         for (key, value) in &j.with {
             map.serialize_entry(key, value)?;

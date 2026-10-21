@@ -556,6 +556,46 @@ pub(crate) fn visit_contexts<'s>(
     }
 }
 
+/// Calls `f` for every context `expr` reads, with the context's name
+/// and the key of its first step: `Some` for `.name` or `['name']`,
+/// `None` when the context is read whole, through `.*`, or through an
+/// index that is not a string literal.
+pub(crate) fn visit_keys<'s>(expr: &'s Expr<'s>, f: &mut dyn FnMut(&'s str, Option<&'s str>)) {
+    match expr {
+        Expr::Literal(_) => {}
+        Expr::Context { name, .. } => f(name, None),
+        Expr::Not(inner) => visit_keys(inner, f),
+        Expr::Access { base, path } => {
+            if let Expr::Context { name, .. } = **base {
+                let key = match path.first() {
+                    Some(Step::Property(key)) => Some(*key),
+                    Some(Step::Index(Expr::Literal(Value::String(key)))) => Some(key.as_str()),
+                    _ => None,
+                };
+                f(name, key);
+            } else {
+                visit_keys(base, f);
+            }
+            for step in path {
+                if let Step::Index(index) = step {
+                    visit_keys(index, f);
+                }
+            }
+        }
+        Expr::Call { args, .. } | Expr::And(args) | Expr::Or(args) => {
+            for arg in args {
+                visit_keys(arg, f);
+            }
+        }
+        Expr::Compare { first, rest } => {
+            visit_keys(first, f);
+            for (_, e) in rest {
+                visit_keys(e, f);
+            }
+        }
+    }
+}
+
 /// Whether `expr` calls a function whose answer is the job status.
 pub(crate) fn calls_status(expr: &Expr<'_>) -> bool {
     match expr {

@@ -12,7 +12,9 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hatchrun_workflow::{Diagnostic, MAX_SOURCE, convert, parse, to_yaml, validate};
+use hatchrun_workflow::{
+    Config, Diagnostic, MAX_SOURCE, convert, parse, to_yaml, validate, workflow_needs,
+};
 
 #[derive(Parser)]
 #[command(name = "hatchrun", version = env!("HATCHRUN_VERSION"), about)]
@@ -28,11 +30,15 @@ enum Command {
         /// The workflow file
         #[arg(default_value = ".hatchrun/config.yml")]
         path: PathBuf,
+        /// Also print the secrets and variables each workflow reads
+        #[arg(long)]
+        needs: bool,
     },
     /// Convert GitHub Actions workflow files into a hatchrun config
     ///
     /// Jobs and files that cannot convert are left out and reported; the
     /// config holds the rest, and the exit code is 1 when any were left out.
+    /// The last lines name the secrets and variables each workflow reads.
     Convert {
         /// The files to convert (default: .github/workflows/*.yml and *.yaml)
         files: Vec<PathBuf>,
@@ -54,7 +60,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        Command::Validate { path } => run_validate(&path),
+        Command::Validate { path, needs } => run_validate(&path, needs),
         Command::Convert { files, output } => run_convert(files, output.as_deref()),
     }
 }
@@ -79,16 +85,35 @@ fn read_source(path: &Path) -> Result<Result<String, String>> {
     Ok(Ok(String::from_utf8(bytes).with_context(read)?))
 }
 
-fn run_validate(path: &Path) -> Result<ExitCode> {
+fn run_validate(path: &Path, needs: bool) -> Result<ExitCode> {
     let source = read_source(path)?.map_err(anyhow::Error::msg)?;
-    let problems = match parse(&source) {
-        Ok(config) => validate(&config),
-        Err(problems) => problems,
+    let (problems, config) = match parse(&source) {
+        Ok(config) => (validate(&config), Some(config)),
+        Err(problems) => (problems, None),
     };
     for problem in &problems {
         println!("{}", located(path, problem));
     }
+    if needs && let Some(config) = &config {
+        for line in needs_lines(config) {
+            println!("{line}");
+        }
+    }
     Ok(exit(problems.is_empty()))
+}
+
+/// `<workflow>: secrets A, B; vars C` for each workflow that reads a
+/// secret or a variable. `GITHUB_TOKEN` is left out: it is minted for
+/// each job, not stored.
+fn needs_lines(config: &Config) -> Vec<String> {
+    config
+        .workflows
+        .iter()
+        .filter_map(|(name, wf)| {
+            let needs = workflow_needs(config, wf);
+            (!needs.is_empty()).then(|| format!("{name}: {needs}"))
+        })
+        .collect()
 }
 
 /// `PATH:line:column: message`, or `PATH: message` with no position.
@@ -156,6 +181,9 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
     }
     for error in &conversion.errors {
         eprintln!("{}", shown(error));
+    }
+    for line in needs_lines(&conversion.config) {
+        eprintln!("{line}");
     }
     let yaml = to_yaml(&conversion.config);
     match output {

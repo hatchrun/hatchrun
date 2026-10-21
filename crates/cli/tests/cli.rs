@@ -226,3 +226,56 @@ fn convert_skips_an_oversized_file_and_converts_the_rest() {
     let out = run(hatchrun().arg("validate").arg(&out_file));
     assert!(out.status.success(), "{}", text(&out.stdout));
 }
+
+#[test]
+fn convert_ends_with_what_each_workflow_reads() {
+    let deploy = scratch("needs/deploy.yml");
+    let lint = scratch("needs/lint.yml");
+    let quiet = scratch("needs/quiet.yml");
+    std::fs::create_dir_all(deploy.parent().unwrap()).unwrap();
+    std::fs::write(
+        &deploy,
+        "on: push\njobs:\n  ship:\n    runs-on: ubuntu-latest\n    environment: { name: prod, url: https://x }\n    env:\n      TOKEN: ${{ secrets.dockerhub_token }}\n      GH: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n      - run: echo ${{ secrets.CODECOV_TOKEN }} ${{ vars.REGISTRY }}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &lint,
+        "on: push\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo '${{ toJSON(secrets) }}'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &quiet,
+        "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ secrets.GITHUB_TOKEN }}\n",
+    )
+    .unwrap();
+    let dest = scratch("needs/out.yml");
+    let out = run(hatchrun()
+        .arg("convert")
+        .args([&deploy, &lint, &quiet])
+        .arg("-o")
+        .arg(&dest));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(
+        lines[0].contains("`environment.url` is not supported"),
+        "{stderr}"
+    );
+    assert_eq!(
+        lines[1..],
+        [
+            "deploy: secrets CODECOV_TOKEN, DOCKERHUB_TOKEN; vars REGISTRY",
+            "lint: secrets all",
+        ],
+        "{stderr}"
+    );
+
+    let out = run(hatchrun().arg("validate").arg("--needs").arg(&dest));
+    assert!(out.status.success(), "{}", text(&out.stdout));
+    assert_eq!(
+        text(&out.stdout),
+        "deploy: secrets CODECOV_TOKEN, DOCKERHUB_TOKEN; vars REGISTRY\nlint: secrets all\n"
+    );
+    let out = run(hatchrun().arg("validate").arg(&dest));
+    assert_eq!(text(&out.stdout), "");
+}
