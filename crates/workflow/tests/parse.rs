@@ -173,3 +173,14 @@ fn library_messages_read_plainly() {
         "the file is too large or nests too deeply to read"
     );
 }
+
+#[test]
+fn reads_a_long_run_of_comments() {
+    // A job commented out: more comment lines in a row than the YAML
+    // library buffers when it keeps comments.
+    let comments = "  # old:\n  #   runs-on: ubuntu-latest\n\n".repeat(20);
+    let source =
+        format!("jobs:\n{comments}  t:\n    runs-on: ubuntu-latest\n    steps: [{{ run: a }}]\n");
+    let config = parse(&source).unwrap();
+    assert_eq!(config.jobs["t"].steps.len(), 1);
+}

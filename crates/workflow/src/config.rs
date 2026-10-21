@@ -24,9 +24,16 @@ use crate::trigger::{Filter, Triggers};
 ///
 /// Returns the problems found, each with its line and column when known.
 pub fn parse(source: &str) -> Result<Config, Vec<Diagnostic>> {
-    // YAML 1.2 booleans only: `y`, `yes`, `on` and `off` stay strings.
-    let options = serde_saphyr::options! { strict_booleans: true };
-    serde_saphyr::from_str_with_options(source, options).map_err(|err| vec![Diagnostic::from(&err)])
+    serde_saphyr::from_str_with_options(source, yaml_options())
+        .map_err(|err| vec![Diagnostic::from(&err)])
+}
+
+/// How workflow YAML is read. Only YAML 1.2 booleans count: `y`, `yes`,
+/// `on` and `off` stay strings. Comments are skipped rather than kept:
+/// nothing reads them, and kept comments are capped at 32 in a row, so
+/// a block commented out would fail the file.
+pub(crate) fn yaml_options() -> serde_saphyr::Options {
+    serde_saphyr::options! { strict_booleans: true, emit_comments: false }
 }
 
 /// A whole `.hatchrun/config.yml`.

@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use crate::config::{
     Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow, WorkflowJob,
+    yaml_options,
 };
 use crate::diagnostic::Diagnostic;
 use crate::expr;
@@ -71,8 +72,7 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
             )));
             continue;
         }
-        let options = serde_saphyr::options! { strict_booleans: true };
-        match serde_saphyr::from_str_with_options::<GhWorkflow>(source, options) {
+        match serde_saphyr::from_str_with_options::<GhWorkflow>(source, yaml_options()) {
             Ok(gh) => cx.workflow(file, stem, gh),
             Err(err) => {
                 let mut diag = Diagnostic::from(&err);

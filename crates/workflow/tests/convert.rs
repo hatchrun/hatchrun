@@ -731,3 +731,13 @@ jobs:
     );
     round_trips(&out);
 }
+
+#[test]
+fn converts_a_file_with_a_long_run_of_comments() {
+    let comments = "  # old:\n  #   runs-on: ubuntu-latest\n\n".repeat(20);
+    let out = ok(&format!(
+        "on: push\njobs:\n{comments}  t:\n    runs-on: ubuntu-latest\n    steps: [{{ run: a }}]\n"
+    ));
+    assert_eq!(out.config.jobs["ci-t"].steps.len(), 1);
+    round_trips(&out);
+}
