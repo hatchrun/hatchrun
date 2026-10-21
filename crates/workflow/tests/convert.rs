@@ -440,7 +440,7 @@ fn a_job_that_fails_is_dropped_and_the_rest_converts() {
 on: push
 jobs:
   build:
-    strategy: { matrix: { runner: [ubuntu-latest] } }
+    strategy: { matrix: { runner: [macos-latest] } }
     runs-on: ${{ matrix.runner }}
     steps: [{ run: make }]
   publish:
@@ -740,4 +740,98 @@ fn converts_a_file_with_a_long_run_of_comments() {
     ));
     assert_eq!(out.config.jobs["ci-t"].steps.len(), 1);
     round_trips(&out);
+}
+
+#[test]
+fn a_runs_on_matrix_keeps_its_linux_legs() {
+    let out = ok("on: push
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22]
+    steps: [{ run: npm test }]
+  report:
+    needs: test
+    runs-on: ubuntu-latest
+    steps: [{ run: echo done }]
+");
+    assert_eq!(out.errors, Vec::new());
+    assert_eq!(
+        out.config.jobs["ci-test"].runs_on.as_deref(),
+        Some("ubuntu-latest")
+    );
+    let entry = &out.config.workflows["ci"].jobs[0];
+    assert_eq!(entry.matrix["os"], [json!("ubuntu-latest")]);
+    assert_eq!(entry.matrix["node"], [json!(20), json!(22)]);
+    assert!(
+        has(
+            &out.warnings,
+            &["job `test`", "`macos-latest`, `windows-latest`", "dropped"]
+        ),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(out.config.workflows["ci"].jobs.len(), 2);
+    round_trips(&out);
+}
+
+#[test]
+fn a_runs_on_matrix_keeps_old_ubuntu_values_as_written() {
+    let out = ok("on: push
+jobs:
+  test:
+    runs-on: ${{matrix.os}}
+    strategy: { matrix: { os: [ubuntu-22.04, windows-2022, ubuntu-26.04] } }
+    steps: [{ run: make }]
+");
+    assert_eq!(out.errors, Vec::new());
+    assert_eq!(
+        out.config.jobs["ci-test"].runs_on.as_deref(),
+        Some("ubuntu-latest")
+    );
+    assert_eq!(
+        out.config.workflows["ci"].jobs[0].matrix["os"],
+        [json!("ubuntu-22.04"), json!("ubuntu-26.04")]
+    );
+    assert!(
+        has(
+            &out.warnings,
+            &["`runs-on: ubuntu-22.04` became `ubuntu-latest`"]
+        ),
+        "{:?}",
+        out.warnings
+    );
+    round_trips(&out);
+}
+
+#[test]
+fn a_runs_on_matrix_without_one_template_is_an_error() {
+    for (os, words) in [
+        (
+            "[macos-latest, windows-latest]",
+            &["names no runner template"][..],
+        ),
+        (
+            "[ubuntu-latest, ubuntu-26.04-arm]",
+            &["`ubuntu-latest`, `ubuntu-26.04-arm`", "one runner template"][..],
+        ),
+    ] {
+        let out = ok(&format!(
+            "on: push
+jobs:
+  test:
+    runs-on: ${{{{ matrix.os }}}}
+    strategy: {{ matrix: {{ os: {os} }} }}
+    steps: [{{ run: make }}]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{{ run: lint }}]
+"
+        ));
+        assert!(has(&out.errors, words), "{os}: {:?}", out.errors);
+        assert!(!out.config.jobs.contains_key("ci-test"));
+    }
 }

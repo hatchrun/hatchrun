@@ -580,7 +580,8 @@ impl Cx {
                 ));
             }
         }
-        let runs_on = self.runs_on(at, gh.runs_on.as_ref());
+        let mut matrix = self.strategy(at, gh.strategy);
+        let runs_on = self.runs_on(at, gh.runs_on.as_ref(), &mut matrix);
         let requires = match gh.needs {
             None => Vec::new(),
             Some(Value::String(need)) => vec![need],
@@ -603,7 +604,6 @@ impl Cx {
             }
         }
         let requires = requires_unique;
-        let matrix = self.strategy(at, gh.strategy);
         let timeout_minutes = self.minutes(at, "timeout-minutes", gh.timeout_minutes.as_ref());
         let outputs = self.env(at, "outputs", gh.outputs.as_ref());
         let env = self.env(at, "env", gh.env.as_ref());
@@ -636,30 +636,96 @@ impl Cx {
         Some((job, entry))
     }
 
-    /// Maps `runs-on` to a runner template label.
-    fn runs_on(&mut self, at: &str, runs_on: Option<&Value>) -> Option<String> {
+    /// Maps `runs-on` to a runner template label. `runs-on: ${{ matrix.KEY }}`
+    /// over a list of labels keeps the legs whose labels name one
+    /// template and drops the others, such as macOS and Windows legs,
+    /// with a warning.
+    fn runs_on(
+        &mut self,
+        at: &str,
+        runs_on: Option<&Value>,
+        matrix: &mut BTreeMap<String, Vec<Value>>,
+    ) -> Option<String> {
+        if let Some(Value::String(text)) = runs_on
+            && let Some(key) = matrix_key(text)
+            && let Some(values) = matrix.get_mut(key)
+        {
+            return self.matrix_runs_on(at, text, key, values);
+        }
         let label = match runs_on {
             Some(Value::String(label)) => Some(label.as_str()),
             Some(Value::Array(labels)) if labels.len() == 1 => labels[0].as_str(),
             _ => None,
         };
-        let templates = template_labels().join(", ");
-        match label {
-            Some(old) if let Some((_, new)) = OLD_UBUNTU.iter().find(|(o, _)| *o == old) => {
-                self.warn(format!(
-                    "{at}: `runs-on: {old}` became `{new}`, which runs Ubuntu 26.04"
-                ));
-                Some((*new).to_owned())
+        if let Some(old) = label
+            && let Some(new) = runner_label(old)
+        {
+            if new != old {
+                self.warn(became(at, old, new));
             }
-            Some(label) if template(label).is_some() => Some(label.to_owned()),
-            _ => {
-                let shown = runs_on.map_or_else(|| "nothing".to_owned(), show);
+            return Some(new.to_owned());
+        }
+        let shown = runs_on.map_or_else(|| "nothing".to_owned(), show);
+        self.error(format!(
+            "{at} has `runs-on: {shown}`, which names no runner template; use one of {}",
+            template_labels().join(", ")
+        ));
+        None
+    }
+
+    /// Resolves `runs-on: ${{ matrix.KEY }}`, keeping in `values` only
+    /// the legs that run on the one template found.
+    fn matrix_runs_on(
+        &mut self,
+        at: &str,
+        text: &str,
+        key: &str,
+        values: &mut Vec<Value>,
+    ) -> Option<String> {
+        let mut found: Vec<&'static str> = Vec::new();
+        let mut dropped = Vec::new();
+        values.retain(|value| {
+            let Some(new) = value.as_str().and_then(runner_label) else {
+                dropped.push(format!("`{}`", show(value)));
+                return false;
+            };
+            // Two labels of one template, such as `ubuntu-latest` and
+            // `ubuntu-26.04`, are one runner.
+            if !found.iter().any(|f| template(f) == template(new)) {
+                found.push(new);
+            }
+            true
+        });
+        let new = match found.as_slice() {
+            [] => {
                 self.error(format!(
-                    "{at} has `runs-on: {shown}`, which names no runner template; use one of {templates}"
+                    "{at} has `runs-on: {text}`, and matrix key `{key}` names no runner template; use one of {}",
+                    template_labels().join(", ")
                 ));
-                None
+                return None;
+            }
+            [one] => *one,
+            many => {
+                let shown: Vec<String> = many.iter().map(|l| format!("`{l}`")).collect();
+                self.error(format!(
+                    "{at} has `runs-on: {text}` over legs that run on {}; a job runs on one runner template",
+                    shown.join(", ")
+                ));
+                return None;
+            }
+        };
+        if !dropped.is_empty() {
+            self.warn(format!(
+                "{at}: matrix key `{key}` values {} name no runner template and were dropped; hatchrun runs Linux only",
+                dropped.join(", ")
+            ));
+        }
+        for value in values.iter().filter_map(Value::as_str) {
+            if value != new {
+                self.warn(became(at, value, new));
             }
         }
+        Some(new.to_owned())
     }
 
     /// Reads `strategy.matrix` as plain value lists, dropping the rest.
@@ -832,6 +898,34 @@ impl Cx {
             }
         }
     }
+}
+
+/// The template label a GitHub `runs-on` label becomes, if any.
+fn runner_label(label: &str) -> Option<&'static str> {
+    if let Some((_, new)) = OLD_UBUNTU.iter().find(|(old, _)| *old == label) {
+        return Some(new);
+    }
+    template_labels().into_iter().find(|l| *l == label)
+}
+
+/// The warning for a retired label that became a template label.
+fn became(at: &str, old: &str, new: &str) -> String {
+    format!("{at}: `runs-on: {old}` became `{new}`, which runs Ubuntu 26.04")
+}
+
+/// The key `KEY` of `${{ matrix.KEY }}`, when that is the whole text.
+fn matrix_key(text: &str) -> Option<&str> {
+    let key = text
+        .trim()
+        .strip_prefix("${{")?
+        .strip_suffix("}}")?
+        .trim()
+        .strip_prefix("matrix.")?;
+    let ok = !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    ok.then_some(key)
 }
 
 /// A dispatch input default as a value of `kind`: numeric strings become
