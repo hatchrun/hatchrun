@@ -13,6 +13,7 @@ mod eval;
 mod lexer;
 mod parser;
 
+use std::borrow::Cow;
 use std::fmt;
 
 use serde_json::Value;
@@ -146,12 +147,23 @@ fn evaluate_in(
 /// names an unknown context or function. The offset is relative to
 /// `expr`.
 pub fn check(expr: &str) -> Result<(), ExprError> {
-    for (name, offset) in contexts(expr)? {
-        if !CONTEXTS.contains(&name.as_str()) {
-            return Err(ExprError::new(format!("unknown context '{name}'"), offset));
+    checked_contexts(expr).map(|_| ())
+}
+
+/// [`check`], returning the contexts the expression reads, lowercased,
+/// as [`contexts`] does.
+///
+/// # Errors
+///
+/// As [`check`].
+pub(crate) fn checked_contexts(expr: &str) -> Result<Vec<(Cow<'_, str>, usize)>, ExprError> {
+    let names = contexts(expr)?;
+    for (name, offset) in &names {
+        if !CONTEXTS.contains(&name.as_ref()) {
+            return Err(ExprError::new(format!("unknown context '{name}'"), *offset));
         }
     }
-    Ok(())
+    Ok(names)
 }
 
 /// The contexts an expression reads, lowercased, with the offset of
@@ -161,26 +173,30 @@ pub fn check(expr: &str) -> Result<(), ExprError> {
 ///
 /// When the expression is too long or too deep, does not parse, or
 /// calls an unknown function.
-pub(crate) fn contexts(expr: &str) -> Result<Vec<(String, usize)>, ExprError> {
+pub(crate) fn contexts(expr: &str) -> Result<Vec<(Cow<'_, str>, usize)>, ExprError> {
     let ast = tree(expr)?;
     let mut names = Vec::new();
     eval::visit_contexts(&ast, &mut |name, offset| {
-        names.push((name.to_ascii_lowercase(), offset));
+        let name = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(name.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(name)
+        };
+        names.push((name, offset));
         Ok(())
     })?;
     Ok(names)
 }
 
 /// Lexes and parses one expression, within the length limit.
-fn tree(expr: &str) -> Result<parser::Expr, ExprError> {
+fn tree(expr: &str) -> Result<parser::Expr<'_>, ExprError> {
     if expr.len() > MAX_LEN {
         return Err(ExprError::new(
             format!("expression is longer than {MAX_LEN} bytes"),
             0,
         ));
     }
-    let tokens = lexer::lex(expr)?;
-    parser::parse(&tokens)
+    parser::parse(lexer::lex(expr)?)
 }
 
 /// The `${{ }}` expressions in `template`: the byte offset of the text

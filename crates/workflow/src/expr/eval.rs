@@ -470,9 +470,9 @@ fn copy_bytes(v: &Value, total: &mut usize, limit: usize) {
 /// Calls `f` with the name and offset of every context `expr` reads,
 /// including ones a short circuit would skip, stopping at its first
 /// error.
-pub(crate) fn visit_contexts(
-    expr: &Expr,
-    f: &mut dyn FnMut(&str, usize) -> Result<(), ExprError>,
+pub(crate) fn visit_contexts<'s>(
+    expr: &Expr<'s>,
+    f: &mut dyn FnMut(&'s str, usize) -> Result<(), ExprError>,
 ) -> Result<(), ExprError> {
     match expr {
         Expr::Literal(_) => Ok(()),
@@ -506,7 +506,7 @@ impl<'a> Evaluator<'a> {
     /// Checks every context name, including ones a short circuit would
     /// skip, then evaluates. The result is copied out of the context
     /// only if it was read from there, and the copy is charged.
-    pub(crate) fn eval(&self, expr: &'a Expr) -> Result<Value, ExprError> {
+    pub(crate) fn eval(&self, expr: &'a Expr<'_>) -> Result<Value, ExprError> {
         self.check(expr)?;
         match self.walk(expr)? {
             Val::One(v) => self.own(v),
@@ -518,7 +518,7 @@ impl<'a> Evaluator<'a> {
     /// without copying it.
     pub(crate) fn eval_text<R>(
         &self,
-        expr: &'a Expr,
+        expr: &'a Expr<'_>,
         f: impl FnOnce(&str) -> R,
     ) -> Result<R, ExprError> {
         self.check(expr)?;
@@ -570,14 +570,14 @@ impl<'a> Evaluator<'a> {
             .then_some(&NULL)
     }
 
-    fn check(&self, expr: &Expr) -> Result<(), ExprError> {
+    fn check(&self, expr: &Expr<'_>) -> Result<(), ExprError> {
         visit_contexts(expr, &mut |name, offset| match self.context(name) {
             Some(_) => Ok(()),
             None => Err(ExprError::new(format!("unknown context '{name}'"), offset)),
         })
     }
 
-    fn walk(&self, expr: &'a Expr) -> Result<Val<'a>, ExprError> {
+    fn walk(&self, expr: &'a Expr<'_>) -> Result<Val<'a>, ExprError> {
         let v = match expr {
             Expr::Literal(v) => Cow::Borrowed(v),
             Expr::Context { name, .. } => Cow::Borrowed(self.context(name).unwrap_or(&NULL)),
@@ -625,7 +625,7 @@ impl<'a> Evaluator<'a> {
 
     /// Evaluates `operands` in order and returns the first whose
     /// truthiness is `stop_when`, or the last one.
-    fn first(&self, operands: &'a [Expr], stop_when: bool) -> Result<Ref<'a>, ExprError> {
+    fn first(&self, operands: &'a [Expr<'_>], stop_when: bool) -> Result<Ref<'a>, ExprError> {
         let mut last = Val::One(Cow::Borrowed(&NULL));
         for e in operands {
             last = self.walk(e)?;

@@ -1063,7 +1063,9 @@ fn unsupported_contexts(job: &Job) -> Vec<&'static str> {
     let mut read = BTreeSet::new();
     let mut add = |expr: &str| {
         for (name, _) in expr::contexts(expr).unwrap_or_default() {
-            read.insert(name);
+            if let Some(&c) = UNSUPPORTED_CONTEXTS.iter().find(|c| **c == name) {
+                read.insert(c);
+            }
         }
     };
     for cond in conds {

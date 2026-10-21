@@ -8,9 +8,10 @@ use super::ExprError;
 
 /// What a token is.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Kind {
-    /// A name: a context, property, function or `true`/`false`/`null`.
-    Ident(String),
+pub(crate) enum Kind<'s> {
+    /// A name: a context, property, function or `true`/`false`/`null`,
+    /// borrowed from the source.
+    Ident(&'s str),
     Number(f64),
     Str(String),
     Dot,
@@ -34,15 +35,17 @@ pub(crate) enum Kind {
 
 /// A token and the byte offset where it starts.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Token {
-    pub kind: Kind,
+pub(crate) struct Token<'s> {
+    pub kind: Kind<'s>,
     pub offset: usize,
 }
 
 /// Lexes `src`. The last token is always [`Kind::Eof`].
-pub(crate) fn lex(src: &str) -> Result<Vec<Token>, ExprError> {
+pub(crate) fn lex(src: &str) -> Result<Vec<Token<'_>>, ExprError> {
     let bytes = src.as_bytes();
-    let mut tokens = Vec::new();
+    // Most tokens take a few bytes; reserving for that saves the copies
+    // of growing the list.
+    let mut tokens = Vec::with_capacity(src.len() / 4 + 2);
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
@@ -96,7 +99,7 @@ pub(crate) fn lex(src: &str) -> Result<Vec<Token>, ExprError> {
                 }
                 i = end;
                 tokens.push(Token {
-                    kind: Kind::Ident(src[start..end].to_owned()),
+                    kind: Kind::Ident(&src[start..end]),
                     offset: start,
                 });
                 continue;

@@ -19,46 +19,46 @@ use super::ExprError;
 use super::eval::number;
 use super::lexer::{Kind, Token};
 
-/// A node of the expression tree.
+/// A node of the expression tree. Names are borrowed from the source.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Expr {
+pub(crate) enum Expr<'s> {
     Literal(Value),
     /// A context name such as `github`, at `offset`.
     Context {
-        name: String,
+        name: &'s str,
         offset: usize,
     },
     /// `base` followed by `.name`, `[index]`, `.*` or `[*]` steps.
     Access {
-        base: Box<Expr>,
-        path: Vec<Step>,
+        base: Box<Expr<'s>>,
+        path: Vec<Step<'s>>,
     },
     /// A function call; `name` is lowercased, `offset` is where it starts.
     Call {
-        name: String,
-        args: Vec<Expr>,
+        name: &'static str,
+        args: Vec<Expr<'s>>,
         offset: usize,
     },
-    Not(Box<Expr>),
+    Not(Box<Expr<'s>>),
     /// Operands of a `&&` chain, at least two.
-    And(Vec<Expr>),
+    And(Vec<Expr<'s>>),
     /// Operands of a `||` chain, at least two.
-    Or(Vec<Expr>),
+    Or(Vec<Expr<'s>>),
     /// `first`, then each operator and right operand, applied left to
     /// right.
     Compare {
-        first: Box<Expr>,
-        rest: Vec<(Op, Expr)>,
+        first: Box<Expr<'s>>,
+        rest: Vec<(Op, Expr<'s>)>,
     },
 }
 
 /// One step of a property access.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Step {
+pub(crate) enum Step<'s> {
     /// `.name`.
-    Property(String),
+    Property(&'s str),
     /// `[expr]`.
-    Index(Expr),
+    Index(Expr<'s>),
     /// `.*` or `[*]`.
     Filter,
 }
@@ -95,7 +95,7 @@ const FUNCTIONS: &[(&str, usize, usize)] = &[
 ];
 
 /// Parses a whole token list, which must end with [`Kind::Eof`].
-pub(crate) fn parse(tokens: &[Token]) -> Result<Expr, ExprError> {
+pub(crate) fn parse(tokens: Vec<Token<'_>>) -> Result<Expr<'_>, ExprError> {
     let mut p = Parser {
         tokens,
         pos: 0,
@@ -115,28 +115,38 @@ pub(crate) fn parse(tokens: &[Token]) -> Result<Expr, ExprError> {
     Ok(expr)
 }
 
-struct Parser<'a> {
-    tokens: &'a [Token],
+struct Parser<'s> {
+    tokens: Vec<Token<'s>>,
     pos: usize,
     depth: usize,
 }
 
-impl Parser<'_> {
-    fn peek(&self) -> &Token {
+impl<'s> Parser<'s> {
+    fn peek(&self) -> &Token<'s> {
         &self.tokens[self.pos]
     }
 
-    fn bump(&mut self) -> Token {
-        let token = self.tokens[self.pos].clone();
-        if token.kind != Kind::Eof {
-            self.pos += 1;
+    /// Takes the next token. The parser never looks back, so the token
+    /// is moved out, not copied; the end stays where it is.
+    fn bump(&mut self) -> Token<'s> {
+        let token = &mut self.tokens[self.pos];
+        if token.kind == Kind::Eof {
+            return token.clone();
         }
-        token
+        self.pos += 1;
+        let offset = token.offset;
+        std::mem::replace(
+            token,
+            Token {
+                kind: Kind::Eof,
+                offset,
+            },
+        )
     }
 
     /// Checks that an operand follows the operator `op`, so a missing
     /// right side is reported at the operator.
-    fn operand_after(&self, op: &Token) -> Result<(), ExprError> {
+    fn operand_after(&self, op: &Token<'s>) -> Result<(), ExprError> {
         if matches!(
             self.peek().kind,
             Kind::Ident(_) | Kind::Number(_) | Kind::Str(_) | Kind::LParen | Kind::Not
@@ -152,7 +162,7 @@ impl Parser<'_> {
 
     /// Goes one nesting level deeper at `token`, failing past
     /// [`MAX_DEPTH`]. Pair with [`Parser::leave`].
-    fn enter(&mut self, token: &Token) -> Result<(), ExprError> {
+    fn enter(&mut self, token: &Token<'s>) -> Result<(), ExprError> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             return Err(ExprError::new(
@@ -168,14 +178,14 @@ impl Parser<'_> {
     }
 
     /// Parses a full expression.
-    fn expr(&mut self) -> Result<Expr, ExprError> {
+    fn expr(&mut self) -> Result<Expr<'s>, ExprError> {
         self.climb(0)
     }
 
     /// Precedence climbing: parses operands joined by binary operators
     /// binding at least as tightly as `min`. It recurses only when
     /// precedence rises, so a chain of one operator is a loop.
-    fn climb(&mut self, min: u8) -> Result<Expr, ExprError> {
+    fn climb(&mut self, min: u8) -> Result<Expr<'s>, ExprError> {
         let mut lhs = self.unary()?;
         while let Some((level, op)) = binary(&self.peek().kind) {
             if level < min {
@@ -189,7 +199,7 @@ impl Parser<'_> {
         Ok(lhs)
     }
 
-    fn unary(&mut self) -> Result<Expr, ExprError> {
+    fn unary(&mut self) -> Result<Expr<'s>, ExprError> {
         if self.peek().kind == Kind::Not {
             let op = self.bump();
             self.operand_after(&op)?;
@@ -201,7 +211,7 @@ impl Parser<'_> {
         self.postfix()
     }
 
-    fn postfix(&mut self) -> Result<Expr, ExprError> {
+    fn postfix(&mut self) -> Result<Expr<'s>, ExprError> {
         let base = self.primary()?;
         let mut path = Vec::new();
         loop {
@@ -245,16 +255,16 @@ impl Parser<'_> {
         }
     }
 
-    fn primary(&mut self) -> Result<Expr, ExprError> {
+    fn primary(&mut self) -> Result<Expr<'s>, ExprError> {
         let token = self.bump();
         match token.kind {
             Kind::Number(n) => Ok(Expr::Literal(number(n))),
             Kind::Str(s) => Ok(Expr::Literal(Value::String(s))),
-            Kind::Ident(name) => match name.as_str() {
+            Kind::Ident(name) => match name {
                 "null" => Ok(Expr::Literal(Value::Null)),
                 "true" => Ok(Expr::Literal(Value::Bool(true))),
                 "false" => Ok(Expr::Literal(Value::Bool(false))),
-                _ if self.peek().kind == Kind::LParen => self.call(&name, token.offset),
+                _ if self.peek().kind == Kind::LParen => self.call(name, token.offset),
                 _ => Ok(Expr::Context {
                     name,
                     offset: token.offset,
@@ -276,7 +286,7 @@ impl Parser<'_> {
         }
     }
 
-    fn call(&mut self, name: &str, offset: usize) -> Result<Expr, ExprError> {
+    fn call(&mut self, name: &str, offset: usize) -> Result<Expr<'s>, ExprError> {
         let open = self.bump();
         let mut args = Vec::new();
         if self.peek().kind == Kind::RParen {
@@ -293,8 +303,10 @@ impl Parser<'_> {
             }
             self.leave();
         }
-        let lower = name.to_ascii_lowercase();
-        let Some(&(_, min, max)) = FUNCTIONS.iter().find(|(f, _, _)| *f == lower) else {
+        let Some(&(lower, min, max)) = FUNCTIONS
+            .iter()
+            .find(|(f, _, _)| f.eq_ignore_ascii_case(name))
+        else {
             return Err(ExprError::new(format!("unknown function '{name}'"), offset));
         };
         if args.len() < min || args.len() > max {
@@ -325,7 +337,7 @@ enum Binary {
     Compare(Op),
 }
 
-fn binary(kind: &Kind) -> Option<(u8, Binary)> {
+fn binary(kind: &Kind<'_>) -> Option<(u8, Binary)> {
     Some(match kind {
         Kind::Or => (0, Binary::Or),
         Kind::And => (1, Binary::And),
@@ -346,7 +358,7 @@ fn same_level(a: Op, b: Op) -> bool {
 
 /// Builds `lhs op rhs`, appending to `lhs` when it is already a chain of
 /// the same level, so chains stay flat and are walked by loops.
-fn join(lhs: Expr, op: Binary, rhs: Expr) -> Expr {
+fn join<'s>(lhs: Expr<'s>, op: Binary, rhs: Expr<'s>) -> Expr<'s> {
     match (op, lhs) {
         (Binary::Or, Expr::Or(mut operands)) => {
             operands.push(rhs);
@@ -372,7 +384,7 @@ fn join(lhs: Expr, op: Binary, rhs: Expr) -> Expr {
 }
 
 /// How a token reads in an error message.
-fn describe(kind: &Kind) -> String {
+fn describe(kind: &Kind<'_>) -> String {
     let s = match kind {
         Kind::Ident(name) => return format!("'{name}'"),
         Kind::Number(_) => "a number",

@@ -513,18 +513,20 @@ impl Check<'_> {
     /// `parameters` cannot be read. Returns whether it reads
     /// `parameters` where there are no parameters at all.
     fn expression(&mut self, field: &str, inner: &str, start: usize) -> bool {
-        if let Err(e) = expr::check(inner) {
-            self.bad(
-                field,
-                &ExprError {
-                    message: e.message,
-                    offset: e.offset + start,
-                },
-            );
-            return false;
-        }
-        let reads = expr::contexts(inner)
-            .is_ok_and(|names| names.iter().any(|(name, _)| name == "parameters"));
+        let names = match expr::checked_contexts(inner) {
+            Ok(names) => names,
+            Err(e) => {
+                self.bad(
+                    field,
+                    &ExprError {
+                        message: e.message,
+                        offset: e.offset + start,
+                    },
+                );
+                return false;
+            }
+        };
+        let reads = names.iter().any(|(name, _)| name == "parameters");
         if reads && self.params.is_some() {
             self.errors.push(Diagnostic::new(format!(
                 "{} {field} reads `parameters` inside an expression; only a whole `${{{{ parameters.NAME }}}}` is substituted, and run time has no parameters",
