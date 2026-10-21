@@ -802,12 +802,14 @@ fn parallelism_added_after_converting() {
     assert_eq!(node.matrix["features"], json!("default"));
 }
 
-/// This repository's own workflows: everything converts but the release
-/// build matrix, which names its runner through `matrix.runner`, so the
-/// release workflow keeps only `version` and `sbom`.
+/// This repository's own workflows, as a snapshot in
+/// `tests/fixtures/this-repository` so the test does not change when
+/// they do: everything converts but the release build matrix, which
+/// names its runner through `matrix.runner`, so the release workflow
+/// keeps only `version` and `sbom`.
 #[test]
 fn this_repository() {
-    let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+    let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/this-repository");
     let dir = repository("self", &workflows);
     let (code, stdout, stderr) = hatchrun(&dir, &["convert", "-o", ".hatchrun/config.yml"]);
     assert_eq!(code, 1, "{stderr}");

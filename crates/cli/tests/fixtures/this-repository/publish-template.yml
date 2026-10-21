@@ -1,0 +1,73 @@
+name: publish-template
+
+# Publishes deploy/cloudformation/connect.yaml to the bucket the
+# hatchrun.io Launch Stack links read
+# (deploy/cloudformation/templates-bucket.yaml). The role comes from a
+# secret of the production environment, so no account id appears in
+# this public repository or its logs.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - deploy/cloudformation/connect.yaml
+      - .github/workflows/publish-template.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-template
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the publish role
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Exchanges the job's GitHub OIDC token for the publish role. Every
+      # value is masked first, the account id included.
+      - name: Assume the publish role
+        env:
+          ROLE_ARN: ${{ secrets.TEMPLATES_ROLE_ARN }}
+        run: |
+          : "${ROLE_ARN:?}"
+          echo "::add-mask::$(cut -d: -f5 <<<"${ROLE_ARN}")"
+          token=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r .value)
+          echo "::add-mask::${token}"
+          credentials=$(aws sts assume-role-with-web-identity \
+            --role-arn "${ROLE_ARN}" \
+            --role-session-name "publish-template-${GITHUB_RUN_ID}" \
+            --web-identity-token "${token}" \
+            --query Credentials --output json)
+          for key in AccessKeyId SecretAccessKey SessionToken; do
+            echo "::add-mask::$(jq -r ".${key}" <<<"${credentials}")"
+          done
+          {
+            echo "AWS_ACCESS_KEY_ID=$(jq -r .AccessKeyId <<<"${credentials}")"
+            echo "AWS_SECRET_ACCESS_KEY=$(jq -r .SecretAccessKey <<<"${credentials}")"
+            echo "AWS_SESSION_TOKEN=$(jq -r .SessionToken <<<"${credentials}")"
+          } >> "${GITHUB_ENV}"
+
+      - name: Validate
+        run: aws cloudformation validate-template --template-body file://deploy/cloudformation/connect.yaml > /dev/null
+
+      # Short caching: a stack created from a Launch Stack link right after
+      # a release gets the new template within five minutes.
+      - name: Upload
+        env:
+          BUCKET: ${{ vars.TEMPLATES_BUCKET }}
+        run: |
+          : "${BUCKET:?}"
+          aws s3 cp deploy/cloudformation/connect.yaml "s3://${BUCKET}/connect.yaml" \
+            --content-type text/yaml --cache-control "max-age=300" --only-show-errors
