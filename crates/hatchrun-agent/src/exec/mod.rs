@@ -29,10 +29,10 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use hatchrun_workflow::{
-    Annotation, Conclusion, ExprError, JobDocument, JobKind, JobResult, JobStatus, PlannedStep,
-    RunStep, StepSummary, interpolate,
+    Annotation, Conclusion, ExprError, JobDocument, JobResult, JobStatus, PlannedStep, RunStep,
+    StepSummary, interpolate,
 };
 
 use self::context::{Contexts, Runtime, condition};
@@ -40,7 +40,7 @@ use self::files::StepFiles;
 use self::layout::Layout;
 use self::mask::Masker;
 use self::sink::Sink;
-use self::step::{Budget, Exit, Process, StepOutput, spawn};
+use self::step::{Background, Budget, Exit, Process, StepOutput, spawn};
 use crate::envfile;
 use crate::runner::{DEFAULT_PATH, home_of};
 
@@ -75,6 +75,8 @@ pub struct Options {
 /// [`GRACE_MINUTES`] minutes left for what still runs, and a second
 /// kills the running process at once and skips everything left.
 ///
+/// An approval job is not run: the caller checks for one first.
+///
 /// # Errors
 ///
 /// When the work directory cannot be set up.
@@ -84,9 +86,6 @@ pub async fn run_job(
     sink: &mut dyn Sink,
     cancel: tokio::sync::watch::Receiver<u32>,
 ) -> Result<JobResult> {
-    if matches!(doc.job.kind, JobKind::Approval) {
-        bail!("approval jobs do not run on a runner");
-    }
     let layout = Layout::new(&opts.work_dir, &doc.github.repository, &opts.tool_cache);
     layout.create()?;
     let event = write_event(&layout, &doc)?;
@@ -177,6 +176,7 @@ pub async fn run_job(
         stage_fd: std::sync::Arc::new(stage_fd),
         cache_saves: Vec::new(),
         cache_env: BTreeMap::new(),
+        background: Background::default(),
     };
     job.start();
 
@@ -216,6 +216,8 @@ async fn finish(
     }
     job.note_cancel();
     job.post_phase(sink).await;
+    // Servers the steps left running stop before the archives are cut.
+    job.background.stop().await;
     job.save_caches(sink).await;
     let outputs = job.job_outputs(sink);
     if let Some(proxy) = proxy {
@@ -274,10 +276,18 @@ fn owner_of(name: &str) -> Result<(nix::unistd::Uid, nix::unistd::Gid)> {
 /// Writes the webhook payload where `GITHUB_EVENT_PATH` points.
 fn write_event(layout: &Layout, doc: &JobDocument) -> Result<PathBuf> {
     let dir = layout.temp.join("_github_workflow");
+    // A leftover link in place of the directory is replaced, never
+    // followed.
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => std::fs::remove_file(&dir).with_context(|| format!("clear {}", dir.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("stat {}", dir.display())),
+    }
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("event.json");
     let text = serde_json::to_vec(&doc.event).context("serialize the event")?;
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    write_fresh(&path, &text)?;
     Ok(path)
 }
 
@@ -285,30 +295,35 @@ fn write_event(layout: &Layout, doc: &JobDocument) -> Result<PathBuf> {
 const TIMINGS_FILE: &str = "hatchrun-timings.json";
 
 /// Writes `doc.timings` where `HATCHRUN_TIMINGS` points, readable by
-/// every user so the runner user's `split` can read it. The agent makes
-/// the file, never following a link a leftover run planted at its path.
+/// every user so the runner user's `split` can read it.
 fn write_timings(layout: &Layout, doc: &JobDocument) -> Result<()> {
+    let text = serde_json::to_vec(&doc.timings).context("serialize the timings")?;
+    write_fresh(&layout.temp.join(TIMINGS_FILE), &text)
+}
+
+/// Makes `path` a new file with mode 0644 that holds `text`. The agent
+/// makes the file itself, never following a link a leftover run
+/// planted at its path.
+fn write_fresh(path: &Path, text: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let path = layout.temp.join(TIMINGS_FILE);
-    match std::fs::remove_file(&path) {
+    match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("clear {}", path.display())),
     }
-    let text = serde_json::to_vec(&doc.timings).context("serialize the timings")?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o644)
         .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("create {}", path.display()))?;
     // The mode above is cut by the umask.
     file.set_permissions(std::fs::Permissions::from_mode(0o644))
         .with_context(|| format!("chmod {}", path.display()))?;
-    file.write_all(&text)
+    file.write_all(text)
         .with_context(|| format!("write {}", path.display()))
 }
 
@@ -364,6 +379,8 @@ struct Job<'a> {
     cache_saves: Vec<builtin::CacheSave>,
     /// The cache proxy's variables, when it runs. Every step gets them.
     cache_env: BTreeMap<String, String>,
+    /// Process groups that steps left running. They end with the job.
+    background: Background,
 }
 
 /// What a step needs to start.
@@ -417,7 +434,12 @@ impl Job<'_> {
         self.ctx.set_env(&self.env_context());
     }
 
-    fn env_context(&self) -> BTreeMap<String, String> {
+    /// The job's variables in GitHub's order: the job's `env`, then
+    /// `GITHUB_ENV`, then the `env` of the composite action steps that
+    /// are running. A step's own `env` goes on top of this. The `env`
+    /// context and the process environment both use it, so `$X` and
+    /// `${{ env.X }}` agree.
+    pub(super) fn env_context(&self) -> BTreeMap<String, String> {
         let mut env = self.declared_env.clone();
         env.extend(self.github_env.clone());
         env.extend(self.scope_env.clone());
@@ -638,7 +660,14 @@ impl Job<'_> {
             wait_for(self.cancel_requests.clone(), 1)
         };
         let mut abort = wait_for(self.cancel_requests.clone(), 2);
-        let spawned = spawn(process, &mut out, &mut cancel, &mut abort).await;
+        let spawned = spawn(
+            process,
+            &mut out,
+            &mut cancel,
+            &mut abort,
+            &mut self.background,
+        )
+        .await;
         let mut outcome = match spawned {
             // The grace period ran out: the job is cancelled, not slow.
             Ok(Exit::TimedOut) if grace_limited => {
@@ -649,6 +678,7 @@ impl Job<'_> {
         if outcome == Conclusion::Cancelled {
             if *self.cancel_requests.borrow() >= 2 {
                 self.aborted = true;
+                self.background.kill();
             }
             if self.grace_until.is_none() {
                 self.grace_until = Some(Instant::now() + self.opts.minute * GRACE_MINUTES);
@@ -801,9 +831,7 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
     };
 
     let mut env = base_env(job, &files, &step_action(step, index))?;
-    env.extend(job.github_env.clone());
-    env.extend(job.declared_env.clone());
-    env.extend(job.scope_env.clone());
+    env.extend(job.env_context());
     env.extend(step_env);
     job.with_path(&mut env);
 
@@ -850,8 +878,9 @@ fn write_script(
         .write_all(text.as_bytes())
         .map_err(|e| fail(&e))
         .and_then(|()| match owner {
+            // The open file, never the path, which a step could swap.
             Some((uid, gid)) => {
-                nix::unistd::chown(path, Some(uid), Some(gid)).map_err(|e| fail(&e))
+                nix::unistd::fchown(&file, Some(uid), Some(gid)).map_err(|e| fail(&e))
             }
             None => Ok(()),
         });

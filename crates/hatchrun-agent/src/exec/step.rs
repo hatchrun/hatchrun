@@ -50,6 +50,8 @@ const MAX_OUTPUT_BYTES: usize = 1 << 20;
 pub const MAX_MASKS: usize = 1000;
 /// The longest `::add-mask::` value, in bytes.
 const MAX_MASK_LEN: usize = 64 << 10;
+/// The most bytes of `::add-mask::` values one job may hide.
+pub const MAX_MASK_BYTES: usize = 1 << 20;
 
 const SET_OUTPUT_WARNING: &str = "Warning: The `set-output` command is deprecated and will be disabled soon. Write name=value to the file named by $GITHUB_OUTPUT instead.";
 
@@ -86,6 +88,8 @@ pub enum Exit {
 pub struct Budget {
     /// Values hidden with `::add-mask::` so far.
     pub masks: usize,
+    /// The bytes of those values.
+    pub mask_bytes: usize,
 }
 
 /// Cuts `text` to at most `max` bytes without splitting a character.
@@ -239,8 +243,11 @@ impl<'a> StepOutput<'a> {
                     self.warn_mask("an `add-mask` value over 64 KiB was ignored");
                 } else if self.budget.masks >= MAX_MASKS {
                     self.warn_mask("the limit of 1000 `add-mask` values was reached");
+                } else if self.budget.mask_bytes + value.len() > MAX_MASK_BYTES {
+                    self.warn_mask("the limit of 1 MiB of `add-mask` values was reached");
                 } else {
                     self.budget.masks += 1;
+                    self.budget.mask_bytes += value.len();
                     self.masker.add(&value);
                 }
                 self.echoed(raw);
@@ -315,11 +322,68 @@ fn signal_group(pid: Pid, signal: Signal) {
     let _ = killpg(pid, signal);
 }
 
+/// Process groups that outlived the step that started them, such as a
+/// server a step leaves running for the steps after it. The job stops
+/// them when it ends, and the drop kills any that are left.
+#[derive(Debug, Default)]
+pub struct Background {
+    groups: Vec<Pid>,
+}
+
+impl Background {
+    /// Records the group of a step that ended, if anything still runs
+    /// in it.
+    fn keep(&mut self, group: Pid) {
+        if killpg(group, None).is_ok() {
+            self.groups.push(group);
+        }
+    }
+
+    /// Kills every group at once.
+    pub fn kill(&mut self) {
+        for group in self.groups.drain(..) {
+            signal_group(group, Signal::SIGKILL);
+        }
+    }
+
+    /// SIGTERM to every group, SIGKILL to what is left after
+    /// 2.5 seconds.
+    pub async fn stop(&mut self) {
+        if self.groups.is_empty() {
+            return;
+        }
+        for group in &self.groups {
+            signal_group(*group, Signal::SIGTERM);
+        }
+        let end = Instant::now() + AFTER_TERM;
+        while Instant::now() < end && self.groups.iter().any(|g| killpg(*g, None).is_ok()) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.kill();
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// The read end of the output pipe, for async reads.
+fn nonblocking(reader: std::io::PipeReader) -> Result<Receiver> {
+    let fd: std::os::fd::OwnedFd = reader.into();
+    fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).context("set output pipe non-blocking")?;
+    Receiver::from_owned_fd(fd).context("read output pipe")
+}
+
 /// Runs `p` in its own process group and feeds its output, stdout and
 /// stderr together, to `out`.
 ///
-/// When the process ends, its group is killed and output is read until
-/// end of file or one second, whichever comes first. A timeout or
+/// When the process ends, output is read until end of file or one
+/// second, whichever comes first, and a group that still has members
+/// goes to `background`: what a step starts in the background outlives
+/// it, as on GitHub's runner. A process that ends while it is being
+/// stopped takes its group with it. A timeout or
 /// `cancel` stops the group the way GitHub does: SIGINT, 7.5 seconds,
 /// SIGTERM, 2.5 seconds, SIGKILL. `abort` kills the group at once.
 ///
@@ -331,6 +395,7 @@ pub async fn spawn(
     out: &mut StepOutput<'_>,
     cancel: &mut (impl Future<Output = ()> + Unpin),
     abort: &mut (impl Future<Output = ()> + Unpin),
+    background: &mut Background,
 ) -> Result<Exit> {
     let (reader, writer) = std::io::pipe().context("create output pipe")?;
     let stderr = writer.try_clone().context("create output pipe")?;
@@ -364,9 +429,7 @@ pub async fn spawn(
     };
     let mut guard = GroupGuard { pid, armed: true };
 
-    let fd: std::os::fd::OwnedFd = reader.into();
-    fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).context("set output pipe non-blocking")?;
-    let mut reader = Receiver::from_owned_fd(fd).context("read output pipe")?;
+    let mut reader = nonblocking(reader)?;
 
     let mut buf = vec![0u8; 16 << 10];
     let timeout_at = p.timeout.map(|t| Instant::now() + t);
@@ -389,7 +452,9 @@ pub async fn spawn(
             },
             waited = child.wait(), if status.is_none() => {
                 status = Some(waited.context("wait for process")?);
-                signal_group(pid, Signal::SIGKILL);
+                if stopping.is_some() {
+                    signal_group(pid, Signal::SIGKILL);
+                }
                 escalate_at = None;
                 drain_at = Some(Instant::now() + DRAIN);
             }
@@ -431,11 +496,15 @@ pub async fn spawn(
     if let Some(exit) = stopping {
         return Ok(exit);
     }
-    let status = status.context("process status")?;
-    let code = status
+    background.keep(pid);
+    Ok(Exit::Code(code_of(status.context("process status")?)))
+}
+
+/// The exit code, or 128 plus the signal that killed the process.
+fn code_of(status: std::process::ExitStatus) -> i32 {
+    status
         .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-    Ok(Exit::Code(code))
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -536,6 +605,29 @@ mod tests {
             "{}",
             outputs.len()
         );
+    }
+
+    #[test]
+    fn add_mask_bytes_are_capped_per_job() {
+        let mut budget = Budget::default();
+        let value = "m".repeat(60_000);
+        let mut text = String::new();
+        for i in 0..25 {
+            let _ = writeln!(text, "::add-mask::{i}{value}");
+        }
+        let (sink, _, _) = feed(&text, &mut budget);
+        assert!(budget.mask_bytes <= MAX_MASK_BYTES, "{}", budget.mask_bytes);
+        assert!(budget.masks < 25 && budget.masks > 10, "{}", budget.masks);
+        assert_eq!(
+            sink.lines
+                .iter()
+                .filter(|l| l.contains("1 MiB of `add-mask` values"))
+                .count(),
+            1
+        );
+        // Past the cap nothing is added, in a later step either.
+        let (_, _, _) = feed(&format!("::add-mask::{value}z\n"), &mut budget);
+        assert!(budget.mask_bytes <= MAX_MASK_BYTES);
     }
 
     #[test]

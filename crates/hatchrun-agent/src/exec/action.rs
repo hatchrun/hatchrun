@@ -141,6 +141,9 @@ pub struct Limits {
     pub expanded: u64,
     /// The pause before the first retry, doubled each time.
     pub backoff: Duration,
+    /// Who owns the extracted tree, so a composite action can write in
+    /// its own directory. `None` leaves it to the agent's user.
+    pub owner: Option<(nix::unistd::Uid, nix::unistd::Gid)>,
 }
 
 /// The limits for real jobs: 1 GiB compressed, 4 GiB expanded.
@@ -148,7 +151,15 @@ pub const LIMITS: Limits = Limits {
     compressed: 1 << 30,
     expanded: 4 << 30,
     backoff: Duration::from_millis(500),
+    owner: None,
 };
+
+/// How long a connection may take to open.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the download may go without receiving a byte.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long one download attempt may take in all.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Marks a finished extraction. It sits beside the extracted tree, so
 /// an archive cannot ship its own.
@@ -211,11 +222,6 @@ fn is_name(s: &str) -> bool {
 }
 
 /// Fetches the action, downloading it unless it is already cached.
-pub async fn fetch(r: &ActionRef, github: &Github, layout: &Layout) -> Result<Action> {
-    fetch_with(r, github, layout, LIMITS).await
-}
-
-/// [`fetch`] with explicit limits.
 pub async fn fetch_with(
     r: &ActionRef,
     github: &Github,
@@ -318,6 +324,9 @@ async fn download(
     );
     let client = reqwest::Client::builder()
         .user_agent("hatchrun-agent")
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .timeout(ATTEMPT_TIMEOUT)
         .build()
         .context("build http client")?;
     let mut pause = limits.backoff;
@@ -337,12 +346,15 @@ async fn download(
         }
     }
 
-    let (archive_path, expanded) = (archive.clone(), limits.expanded);
+    let (archive_path, expanded, owner) = (archive.clone(), limits.expanded, limits.owner);
     let extract_into = tree.clone();
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&archive_path)?;
         extract_tar_gz(file, &extract_into, 1, expanded)?;
         open_for_reading(&extract_into)?;
+        if let Some(owner) = owner {
+            chown_tree(&extract_into, owner)?;
+        }
         anyhow::Ok(())
     })
     .await
@@ -384,6 +396,31 @@ fn open_for_reading(dir: &Path) -> Result<()> {
         } else if kind.is_file() {
             let owner_exec = entry.metadata()?.permissions().mode() & 0o100 != 0;
             widen(&entry.path(), if owner_exec { 0o055 } else { 0o044 })?;
+        }
+    }
+    Ok(())
+}
+
+/// Hands `dir` and everything under it to `owner`. Links are handed over
+/// themselves, never what they point at, and are not walked into.
+fn chown_tree(dir: &Path, owner: (nix::unistd::Uid, nix::unistd::Gid)) -> Result<()> {
+    let give = |path: &Path| {
+        nix::unistd::fchownat(
+            nix::fcntl::AT_FDCWD,
+            path,
+            Some(owner.0),
+            Some(owner.1),
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .with_context(|| format!("chown {}", path.display()))
+    };
+    give(dir)?;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            chown_tree(&entry.path(), owner)?;
+        } else {
+            give(&entry.path())?;
         }
     }
     Ok(())
@@ -668,6 +705,26 @@ mod tests {
             graphql_url: String::new(),
             token: "tok".into(),
         }
+    }
+
+    #[test]
+    fn chown_tree_walks_without_following_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(tree.join("a/b")).unwrap();
+        fs::write(tree.join("a/b/f"), "x").unwrap();
+        // A link that points nowhere fails if it is followed.
+        std::os::unix::fs::symlink("/nonexistent/target", tree.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), tree.join("a/up")).unwrap();
+        let me = (nix::unistd::getuid(), nix::unistd::getgid());
+        chown_tree(&tree, me).unwrap();
+        // Still the same tree, links intact.
+        assert!(
+            fs::symlink_metadata(tree.join("dangling"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(tree.join("a/b/f")).unwrap(), "x");
     }
 
     fn tarball(files: &[(&str, &str)]) -> Vec<u8> {

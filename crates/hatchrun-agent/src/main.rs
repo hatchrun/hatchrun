@@ -104,7 +104,8 @@ enum Command {
         /// Node binary that runs JavaScript actions.
         #[arg(long)]
         node: Option<PathBuf>,
-        /// Directory of prefetched actions.
+        /// Directory that holds the archives of cache, workspace and
+        /// test result steps.
         #[arg(long)]
         store: Option<PathBuf>,
         /// Where the agent keeps what the runner user must not reach,
@@ -226,31 +227,51 @@ async fn exec_command(job_file: &Path, opts: &exec::Options, result: Option<&Pat
             requests.send_modify(|n| *n += 1);
         }
     });
+    let mut masker = exec::mask::Masker::default();
+    for secret in doc.secrets.values() {
+        masker.add(secret);
+    }
+    masker.add(&doc.github.token);
     let mut sink = exec::sink::TextSink::new(std::io::stdout());
     let outcome = exec::run_job(doc, opts, &mut sink, cancel).await;
     let job = match outcome {
         Ok(job) => job,
         Err(err) => {
-            error!("{err:#}");
+            // The job could not start, but the control plane still gets
+            // a result to read. The message can name a secret that a
+            // path or a user name happens to hold.
+            error!("{}", masker.mask(&format!("{err:#}")));
+            let failed = hatchrun_workflow::JobResult {
+                conclusion: hatchrun_workflow::Conclusion::Failure,
+                outputs: std::collections::BTreeMap::new(),
+                steps: Vec::new(),
+                annotations: Vec::new(),
+            };
+            if let Some(path) = result
+                && let Err(err) = write_result(path, &failed)
+            {
+                error!("{}", masker.mask(&format!("{err:#}")));
+            }
             return ExitCode::FAILURE;
         }
     };
-    if let Some(path) = result {
-        let written = serde_json::to_vec(&job)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| {
-                std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
-            });
-        if let Err(err) = written {
-            error!("{err:#}");
-            return ExitCode::FAILURE;
-        }
+    if let Some(path) = result
+        && let Err(err) = write_result(path, &job)
+    {
+        error!("{err:#}");
+        return ExitCode::FAILURE;
     }
     if job.conclusion == hatchrun_workflow::Conclusion::Success {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Writes the job result as JSON.
+fn write_result(path: &Path, job: &hatchrun_workflow::JobResult) -> Result<()> {
+    let bytes = serde_json::to_vec(job).context("serialize the result")?;
+    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
 }
 
 async fn detect(imds_endpoint: &str, mark: &Path) -> Result<()> {

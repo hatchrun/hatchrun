@@ -233,6 +233,8 @@ fn timeout_kills_the_process_group() {
 
 #[test]
 fn background_child_does_not_hold_the_step() {
+    // The step ends when its shell does; the child lives on until the
+    // job ends, which stops it.
     let dir = tempfile::tempdir().unwrap();
     let began = Instant::now();
     let out = run_steps(
@@ -327,33 +329,15 @@ fn sigterm_cancels_the_running_step() {
     let dir = tempfile::tempdir().unwrap();
     let mut always = make::run("echo after");
     always.if_ = Some("always()".to_owned());
-    let doc = make::document(vec![make::step("sleep 600"), make::planned(always)]);
-    let job = dir.path().join("job.json");
-    std::fs::write(&job, json(&doc)).unwrap();
-    let env = dir.path().join("environment");
-    std::fs::write(&env, "PATH=/usr/bin:/bin\n").unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_hatchrun-agent"))
-        .arg("exec")
-        .arg(&job)
-        .arg("--work-dir")
-        .arg(dir.path().join("work"))
-        .arg("--state-dir")
-        .arg(state_dir(dir.path()))
-        .args(["--runner-user", ""])
-        .arg("--env-file")
-        .arg(&env)
-        .arg("--result")
-        .arg(dir.path().join("result.json"))
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(Duration::from_secs(1));
-    Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .unwrap();
+    let doc = make::document(vec![
+        make::step("echo running; sleep 600"),
+        make::planned(always),
+    ]);
+    let mut agent = Agent::start(dir.path(), &doc);
+    agent.wait_for("running");
+    agent.term();
     let began = Instant::now();
-    let out = child.wait_with_output().unwrap();
+    let out = agent.finish();
     assert!(
         began.elapsed() < Duration::from_secs(15),
         "{:?}",
@@ -830,27 +814,97 @@ async fn remote_action_is_fetched_and_readable() {
     );
 }
 
-/// Starts the agent on `doc` with minutes of one second.
-fn start_agent(dir: &Path, doc: &JobDocument) -> std::process::Child {
-    let job = dir.join("job.json");
-    std::fs::write(&job, json(doc)).unwrap();
-    let env = dir.join("environment");
-    std::fs::write(&env, "PATH=/usr/bin:/bin\n").unwrap();
-    Command::new(env!("CARGO_BIN_EXE_hatchrun-agent"))
-        .arg("exec")
-        .arg(&job)
-        .arg("--work-dir")
-        .arg(dir.join("work"))
-        .arg("--state-dir")
-        .arg(state_dir(dir))
-        .args(["--runner-user", "", "--minute", "1s"])
-        .arg("--env-file")
-        .arg(&env)
-        .arg("--result")
-        .arg(dir.join("result.json"))
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap()
+/// A running agent whose stdout is read line by line, so a test can wait
+/// for a marker the job printed before it sends a signal.
+struct Agent {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    reader: std::thread::JoinHandle<()>,
+    seen: Vec<String>,
+}
+
+impl Agent {
+    /// Starts the agent on `doc` with minutes of one second.
+    fn start(dir: &Path, doc: &JobDocument) -> Self {
+        Self::start_with(dir, doc, &[])
+    }
+
+    fn start_with(dir: &Path, doc: &JobDocument, extra: &[&str]) -> Self {
+        let job = dir.join("job.json");
+        std::fs::write(&job, json(doc)).unwrap();
+        let env = dir.join("environment");
+        std::fs::write(&env, "PATH=/usr/bin:/bin\n").unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_hatchrun-agent"))
+            .arg("exec")
+            .arg(&job)
+            .arg("--work-dir")
+            .arg(dir.join("work"))
+            .arg("--state-dir")
+            .arg(state_dir(dir))
+            .args(["--runner-user", "", "--minute", "1s"])
+            .arg("--env-file")
+            .arg(&env)
+            .arg("--result")
+            .arg(dir.join("result.json"))
+            .args(extra)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufRead::lines(std::io::BufReader::new(out)) {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            lines,
+            reader,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Blocks until the job printed a line equal to `marker`.
+    fn wait_for(&mut self, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Ok(line) = self.lines.recv_timeout(left) else {
+                panic!("no `{marker}` line, saw {:?}", self.seen);
+            };
+            let found = line == marker;
+            self.seen.push(line);
+            if found {
+                return;
+            }
+        }
+    }
+
+    /// Sends SIGTERM.
+    fn term(&self) {
+        term(&self.child);
+    }
+
+    /// Waits for the agent to exit and returns everything it printed.
+    fn finish(mut self) -> Output {
+        let status = self.child.wait().unwrap();
+        self.reader.join().unwrap();
+        let mut text = self.seen.join("\n");
+        for line in self.lines.try_iter() {
+            text.push('\n');
+            text.push_str(&line);
+        }
+        text.push('\n');
+        Output {
+            status,
+            stdout: text.into_bytes(),
+            stderr: Vec::new(),
+        }
+    }
 }
 
 fn term(child: &std::process::Child) {
@@ -876,7 +930,7 @@ fn sleeping_post(dir: &Path) -> JobDocument {
     );
     make::document(vec![
         PlannedStep::Uses(make::uses("a", "./act")),
-        make::step("sleep 600"),
+        make::step("echo step-started; sleep 600"),
     ])
 }
 
@@ -887,11 +941,11 @@ fn a_post_after_a_cancel_ends_within_the_grace_period() {
     }
     let dir = tempfile::tempdir().unwrap();
     let doc = sleeping_post(dir.path());
-    let child = start_agent(dir.path(), &doc);
+    let mut agent = Agent::start(dir.path(), &doc);
+    agent.wait_for("step-started");
     let began = Instant::now();
-    std::thread::sleep(Duration::from_secs(1));
-    term(&child);
-    let out = child.wait_with_output().unwrap();
+    agent.term();
+    let out = agent.finish();
     let took = began.elapsed();
     assert!(took < Duration::from_secs(12), "{took:?}");
     assert!(took > Duration::from_secs(4), "{took:?}");
@@ -907,14 +961,14 @@ fn a_second_sigterm_stops_the_job_at_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut doc = sleeping_post(dir.path());
     doc.job.steps.push(make::step("echo never"));
-    let child = start_agent(dir.path(), &doc);
-    std::thread::sleep(Duration::from_secs(1));
-    term(&child);
+    let mut agent = Agent::start(dir.path(), &doc);
+    agent.wait_for("step-started");
+    agent.term();
     // Wait until the post is running, then ask again.
-    std::thread::sleep(Duration::from_secs(1));
+    agent.wait_for("post-started");
     let second = Instant::now();
-    term(&child);
-    let out = child.wait_with_output().unwrap();
+    agent.term();
+    let out = agent.finish();
     assert!(
         second.elapsed() < Duration::from_secs(3),
         "{:?}",
@@ -1201,10 +1255,10 @@ fn a_cancel_stops_a_composite_step() {
         PlannedStep::Uses(make::uses("c", "./comp")),
         make::step("echo also-never"),
     ]);
-    let child = start_agent(dir.path(), &doc);
-    std::thread::sleep(Duration::from_secs(2));
-    term(&child);
-    let out = child.wait_with_output().unwrap();
+    let mut agent = Agent::start(dir.path(), &doc);
+    agent.wait_for("inner-started");
+    agent.term();
+    let out = agent.finish();
     let text = lines(&out);
     assert!(text.contains(&"inner-started".to_owned()), "{text:?}");
     assert!(!text.contains(&"never".to_owned()), "{text:?}");
@@ -1786,31 +1840,16 @@ fn a_cancel_ends_a_large_save_promptly() {
         make::step("dd if=/dev/null of=big bs=1048576 seek=200000 count=0 2>/dev/null"),
         persist(".", &["big"]),
     ]);
-    let job = dir.path().join("job.json");
-    std::fs::write(&job, json(&doc)).unwrap();
-    let env = dir.path().join("environment");
-    std::fs::write(&env, "PATH=/usr/bin:/bin\n").unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_hatchrun-agent"))
-        .arg("exec")
-        .arg(&job)
-        .arg("--work-dir")
-        .arg(dir.path().join("work"))
-        .arg("--state-dir")
-        .arg(state_dir(dir.path()))
-        .args(["--runner-user", "", "--minute", "1s"])
-        .arg("--env-file")
-        .arg(&env)
-        .arg("--store")
-        .arg(store.path())
-        .arg("--result")
-        .arg(dir.path().join("result.json"))
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(Duration::from_secs(2));
+    let mut agent = Agent::start_with(
+        dir.path(),
+        &doc,
+        &["--store", store.path().to_str().unwrap()],
+    );
+    // The step header comes before the save starts.
+    agent.wait_for("== Workspace");
     let asked = Instant::now();
-    term(&child);
-    let _ = child.wait_with_output().unwrap();
+    agent.term();
+    let _ = agent.finish();
     assert!(
         asked.elapsed() < Duration::from_secs(5),
         "{:?}",
@@ -1974,14 +2013,14 @@ fn cancel_runs_always_steps() {
     plain.name = Some("plain".to_owned());
     let doc = make::document(vec![
         PlannedStep::Uses(make::uses("a", "./act")),
-        make::step("sleep 600"),
+        make::step("echo running; sleep 600"),
         make::planned(plain),
         make::planned(always),
     ]);
-    let child = start_agent(dir.path(), &doc);
-    std::thread::sleep(Duration::from_secs(2));
-    term(&child);
-    let out = child.wait_with_output().unwrap();
+    let mut agent = Agent::start(dir.path(), &doc);
+    agent.wait_for("running");
+    agent.term();
+    let out = agent.finish();
     let text = lines(&out);
     assert!(text.contains(&"after".to_owned()), "{text:?}");
     assert!(text.contains(&"post-ran".to_owned()), "{text:?}");
@@ -2125,4 +2164,166 @@ async fn cache_service_starts_the_proxy() {
         "{a}"
     );
     assert!(b.lines().any(|l| l == "url=unset v2=unset tok="), "{b}");
+}
+
+// Fixes from the whole-branch review.
+
+#[test]
+fn github_env_beats_the_job_env_and_the_step_env_beats_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(Vec::new());
+    doc.job.env.insert("VERSION".to_owned(), "dev".to_owned());
+    let mut show = make::run("echo \"seen=$VERSION ${{ env.VERSION }}\"");
+    show.name = Some("show".to_owned());
+    let mut over = make::run("echo \"over=$VERSION ${{ env.VERSION }}\"");
+    over.env.insert("VERSION".to_owned(), "s".to_owned());
+    doc.job.steps = vec![
+        make::step("echo VERSION=1.2 >> \"$GITHUB_ENV\""),
+        make::planned(show),
+        make::planned(over),
+    ];
+    let out = exec(dir.path(), &json(&doc));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = lines(&out);
+    assert!(text.contains(&"seen=1.2 1.2".to_owned()), "{text:?}");
+    assert!(text.contains(&"over=s s".to_owned()), "{text:?}");
+}
+
+#[tokio::test]
+async fn a_cancel_interrupts_an_action_download() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![PlannedStep::Uses(make::uses("r", "acme/act@v1"))]);
+    doc.github.api_url = server.uri();
+    let agent = Agent::start(dir.path(), &doc);
+    // The request is on its way once the server has seen it.
+    while server.received_requests().await.unwrap().is_empty() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    agent.term();
+    let asked = Instant::now();
+    let out = tokio::task::spawn_blocking(move || agent.finish())
+        .await
+        .unwrap();
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        asked.elapsed()
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(result(dir.path()).conclusion, Conclusion::Cancelled);
+}
+
+/// Whether a process is still running.
+fn alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn background_server_survives_into_the_next_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(
+        dir.path(),
+        vec![
+            make::step("sleep 30 & echo $! > \"$RUNNER_TEMP/server.pid\""),
+            make::step("kill -0 \"$(cat \"$RUNNER_TEMP/server.pid\")\" && echo still-up"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(lines(&out).contains(&"still-up".to_owned()), "{out:?}");
+}
+
+#[test]
+fn background_processes_die_at_job_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(
+        dir.path(),
+        vec![
+            make::step("(trap '' TERM HUP; sleep 600) & echo $! > \"$RUNNER_TEMP/bg.pid\""),
+            make::step("echo working"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let pid = std::fs::read_to_string(dir.path().join("work/_temp/bg.pid")).unwrap();
+    let gone = (0..20).any(|_| {
+        let up = alive(&pid);
+        if up {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        !up
+    });
+    assert!(gone, "background process {} is still running", pid.trim());
+}
+
+#[test]
+fn event_files_are_never_written_through_a_planted_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, "keep").unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let temp = dir.path().join("work/_temp");
+    std::fs::create_dir_all(temp.join("_github_workflow")).unwrap();
+    std::os::unix::fs::symlink(&victim, temp.join("_github_workflow/event.json")).unwrap();
+    let out = run_steps(dir.path(), vec![make::step("cat \"$GITHUB_EVENT_PATH\"")]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+    assert!(
+        !std::fs::symlink_metadata(temp.join("_github_workflow/event.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    // A planted directory link is replaced as well.
+    std::fs::remove_dir_all(&temp).unwrap();
+    std::fs::create_dir_all(&temp).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, temp.join("_github_workflow")).unwrap();
+    let out = run_steps(dir.path(), vec![make::step("cat \"$GITHUB_EVENT_PATH\"")]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+#[test]
+fn a_setup_failure_still_writes_a_masked_failure_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("echo hi")]);
+    doc.secrets.insert("K".to_owned(), "blockedpath".to_owned());
+    // A file where the work directory should be.
+    std::fs::write(dir.path().join("blockedpath"), "").unwrap();
+    let blocked = dir.path().join("blockedpath/work");
+    let job = dir.path().join("job.json");
+    std::fs::write(&job, json(&doc)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_hatchrun-agent"))
+        .arg("exec")
+        .arg(&job)
+        .arg("--work-dir")
+        .arg(&blocked)
+        .arg("--state-dir")
+        .arg(state_dir(dir.path()))
+        .args(["--runner-user", ""])
+        .arg("--result")
+        .arg(dir.path().join("result.json"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("***"), "{stderr}");
+    assert!(!stderr.contains("blockedpath"), "{stderr}");
+    let result = result(dir.path());
+    assert_eq!(result.conclusion, Conclusion::Failure);
+    assert_eq!(result.steps.len(), 0);
 }

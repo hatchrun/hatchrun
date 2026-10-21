@@ -96,6 +96,7 @@ impl Job<'_> {
         let requests = *self.cancel_requests.borrow();
         if requests >= 2 {
             self.aborted = true;
+            self.background.kill();
         }
         if requests >= 1 && self.grace_until.is_none() {
             self.grace_until = Some(Instant::now() + self.opts.minute * GRACE_MINUTES);

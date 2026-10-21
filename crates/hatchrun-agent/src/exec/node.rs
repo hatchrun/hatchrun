@@ -123,9 +123,7 @@ impl Job<'_> {
             let Ok(r) = action::parse_ref(&uses.uses) else {
                 continue;
             };
-            let found = action::fetch(&r, &doc.github, &self.layout)
-                .await
-                .map_err(|e| format!("{e:#}"));
+            let found = self.fetch_action(&r).await;
             if matches!((&r, &found), (ActionRef::Local(_), Err(_))) {
                 continue;
             }
@@ -161,6 +159,36 @@ impl Job<'_> {
                 self.run_pre(&hook, uses, &action, &r, sink).await;
             }
         }
+    }
+
+    /// Fetches an action, giving up when the job is stopped. The first
+    /// stop request ends a download at once, since nothing that is
+    /// waiting for it can run any more; once the grace period of a
+    /// stopped job is running, its end and a second request do.
+    pub(super) async fn fetch_action(&mut self, r: &ActionRef) -> Result<Action, String> {
+        let limits = action::Limits {
+            owner: self.owner,
+            ..action::LIMITS
+        };
+        let first = self.grace_until.is_none();
+        let deadline = self.grace_until;
+        let mut stop = super::wait_for(self.cancel_requests.clone(), if first { 1 } else { 2 });
+        let fetch = action::fetch_with(r, &self.doc.github, &self.layout, limits);
+        let fetched = tokio::select! {
+            found = fetch => Some(found),
+            () = &mut stop => None,
+            () = async {
+                match deadline {
+                    Some(end) => tokio::time::sleep_until(end.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => None,
+        };
+        if let Some(found) = fetched {
+            return found.map_err(|e| format!("{e:#}"));
+        }
+        self.note_cancel();
+        Err("The operation was canceled while downloading the action.".to_owned())
     }
 
     async fn run_pre(
@@ -295,9 +323,7 @@ impl Job<'_> {
         // A local action may have arrived since the job started.
         let action = match (&r, self.fetched.get(&index)) {
             (ActionRef::Remote { .. }, Some(found)) => found.clone(),
-            _ => action::fetch(&r, &self.doc.github, &self.layout)
-                .await
-                .map_err(|e| format!("{e:#}")),
+            _ => self.fetch_action(&r).await,
         };
         let action = match action {
             Ok(action) => action,
@@ -540,7 +566,7 @@ impl Job<'_> {
     }
 
     /// The file command files and the environment of a hook: the
-    /// runner's variables, `GITHUB_ENV` and the job's `env`, then the
+    /// runner's variables, the job's `env` and `GITHUB_ENV`, then the
     /// step's own, then `STATE_*`.
     fn hook_env(
         &self,
@@ -551,9 +577,7 @@ impl Job<'_> {
         let files = StepFiles::create(&self.layout.temp, hook.slot, self.owner)
             .map_err(|e| format!("{e:#}"))?;
         let mut env = base_env(self, &files, action_name)?;
-        env.extend(self.github_env.clone());
-        env.extend(self.declared_env.clone());
-        env.extend(self.scope_env.clone());
+        env.extend(self.env_context());
         env.extend(extra.clone());
         if let Some(state) = self.states.get(&hook.index) {
             for (key, value) in state {
