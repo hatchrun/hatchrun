@@ -1,0 +1,589 @@
+// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! The expression contexts of a running job and the functions that
+//! need the machine, such as `hashFiles`.
+
+// Steps are not wired to the contexts yet.
+#![allow(dead_code)]
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use hatchrun_workflow::trigger::Filter;
+use hatchrun_workflow::{
+    Arch, Conclusion, ExprError, Functions, JobDocument, JobKind, JobStatus, checks_status,
+    evaluate, truthy,
+};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+
+use super::layout::Layout;
+
+/// The most files `hashFiles` looks at before it gives up.
+const MAX_FILES: usize = 100_000;
+
+/// The action whose step is running, for `github.action_path` and
+/// `inputs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionScope {
+    /// `github.action`: the action's name or id.
+    pub action: String,
+    /// `github.action_path`: where the action was downloaded.
+    pub path: String,
+    /// `github.action_ref`: the ref the workflow asked for.
+    pub ref_: String,
+    /// `github.action_repository`: `owner/name`.
+    pub repository: String,
+    /// `inputs`: the action's inputs with defaults applied.
+    pub inputs: BTreeMap<String, String>,
+}
+
+/// The context object that expressions read.
+#[derive(Debug, Clone)]
+pub struct Contexts {
+    value: Value,
+}
+
+impl Contexts {
+    /// The contexts at the start of the job.
+    pub fn new(doc: &JobDocument, layout: &Layout) -> Self {
+        let g = &doc.github;
+        let workspace = layout.workspace.to_string_lossy();
+        let github = json!({
+            "repository": g.repository,
+            "repository_owner": g.repository_owner,
+            "sha": g.sha,
+            "ref": g.ref_,
+            "ref_name": g.ref_name,
+            "ref_type": g.ref_type,
+            "head_ref": g.head_ref,
+            "base_ref": g.base_ref,
+            "actor": g.actor,
+            "server_url": g.server_url,
+            "api_url": g.api_url,
+            "graphql_url": g.graphql_url,
+            "token": g.token,
+            "event": doc.event,
+            "event_name": doc.event_name,
+            "run_id": doc.run_id,
+            "run_number": doc.run_number,
+            "run_attempt": doc.run_attempt,
+            "workflow": doc.workflow,
+            "job": doc.job.name,
+            "workspace": workspace,
+            "action": "",
+            "action_path": "",
+            "action_ref": "",
+            "action_repository": "",
+        });
+
+        let arch = match doc.job.kind {
+            JobKind::Run { template } => match template.arch {
+                Arch::Amd64 => "X64",
+                Arch::Arm64 => "ARM64",
+            },
+            JobKind::Approval => "X64",
+        };
+        let runner_workspace = layout.workspace.parent().unwrap_or(&layout.workspace);
+        let runner = json!({
+            "name": "hatchrun",
+            "os": "Linux",
+            "arch": arch,
+            "temp": layout.temp.to_string_lossy(),
+            "tool_cache": layout.tool_cache.to_string_lossy(),
+            "workspace": runner_workspace.to_string_lossy(),
+            "debug": "",
+        });
+
+        let needs: Map<String, Value> = doc
+            .needs
+            .iter()
+            .map(|(name, need)| {
+                let entry = json!({
+                    "result": conclusion(need.result),
+                    "outputs": need.outputs,
+                });
+                (name.clone(), entry)
+            })
+            .collect();
+
+        let mut secrets = doc.secrets.clone();
+        secrets.insert("GITHUB_TOKEN".to_owned(), g.token.clone());
+
+        let value = json!({
+            "github": github,
+            "env": {},
+            "matrix": doc.job.matrix,
+            "needs": needs,
+            "steps": {},
+            "secrets": secrets,
+            "vars": doc.vars,
+            // The compiler substitutes every `parameters.x`, so none is
+            // left to read.
+            "parameters": {},
+            "runner": runner,
+            "job": { "status": "success" },
+            "inputs": {},
+        });
+        Self { value }
+    }
+
+    /// The object [`evaluate`] reads.
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// Replaces the `env` context.
+    pub fn set_env(&mut self, env: &BTreeMap<String, String>) {
+        self.value["env"] = json!(env);
+    }
+
+    /// Records a finished step under `steps.<id>`.
+    pub fn record_step(
+        &mut self,
+        id: &str,
+        outcome: Conclusion,
+        conclusion_: Conclusion,
+        outputs: &BTreeMap<String, String>,
+    ) {
+        self.value["steps"][id] = json!({
+            "outcome": conclusion(outcome),
+            "conclusion": conclusion(conclusion_),
+            "outputs": outputs,
+        });
+    }
+
+    /// Sets `job.status`.
+    pub fn set_status(&mut self, status: JobStatus) {
+        let text = match status {
+            JobStatus::Success => "success",
+            JobStatus::Failure => "failure",
+            JobStatus::Cancelled => "cancelled",
+        };
+        self.value["job"]["status"] = json!(text);
+    }
+
+    /// The contexts a step of `action` sees. The action has its own
+    /// `steps` and `inputs` and cannot read the caller's secrets.
+    #[must_use]
+    pub fn with_action(&self, action: ActionScope) -> Contexts {
+        let mut value = self.value.clone();
+        value["github"]["action"] = Value::String(action.action);
+        value["github"]["action_path"] = Value::String(action.path);
+        value["github"]["action_ref"] = Value::String(action.ref_);
+        value["github"]["action_repository"] = Value::String(action.repository);
+        value["inputs"] = json!(&action.inputs);
+        value["steps"] = json!({});
+        value["secrets"] = json!({});
+        Contexts { value }
+    }
+}
+
+fn conclusion(c: Conclusion) -> &'static str {
+    match c {
+        Conclusion::Success => "success",
+        Conclusion::Failure => "failure",
+        Conclusion::Cancelled => "cancelled",
+        Conclusion::Skipped => "skipped",
+    }
+}
+
+/// What the expression functions need from the machine.
+pub struct Runtime<'a> {
+    /// `GITHUB_WORKSPACE`, the root `hashFiles` patterns are relative to.
+    pub workspace: &'a Path,
+    /// The job's status so far.
+    pub status: JobStatus,
+}
+
+impl Functions for Runtime<'_> {
+    fn hash_files(&self, patterns: &[String]) -> Result<String, ExprError> {
+        hash_files_in(self.workspace, patterns, MAX_FILES)
+    }
+
+    fn status(&self) -> JobStatus {
+        self.status
+    }
+}
+
+/// Whether a step's or job's `if:` holds. No condition, and one that
+/// calls no status function, mean `success() && (...)`.
+///
+/// # Errors
+///
+/// When the expression does not parse or fails to evaluate.
+pub fn condition(expr: Option<&str>, ctx: &Contexts, rt: &Runtime) -> Result<bool, ExprError> {
+    let Some(expr) = expr else {
+        return Ok(rt.status == JobStatus::Success);
+    };
+    let trimmed = expr.trim();
+    let inner = trimmed
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .filter(|inner| !inner.contains("${{"))
+        .map_or(trimmed, str::trim);
+    let wrapped;
+    let run = if checks_status(inner)? {
+        inner
+    } else {
+        wrapped = format!("success() && ({inner})");
+        &wrapped
+    };
+    Ok(truthy(&evaluate(run, ctx.value(), rt)?))
+}
+
+fn fail(message: impl Into<String>) -> ExprError {
+    ExprError {
+        message: message.into(),
+        offset: 0,
+    }
+}
+
+/// `hashFiles`: the SHA-256, in hex, of the SHA-256 digests of the
+/// files under `workspace` that match `patterns`, in path order. A
+/// file outside the workspace is never read. Symbolic links are not
+/// followed into directories, and a link to a file counts only when it
+/// resolves inside the workspace.
+fn hash_files_in(
+    workspace: &Path,
+    patterns: &[String],
+    max_files: usize,
+) -> Result<String, ExprError> {
+    let filter = Filter::new(with_root_variants(patterns));
+    let root = fs::canonicalize(workspace)
+        .map_err(|e| fail(format!("hashFiles: {}: {e}", workspace.display())))?;
+    let mut matched: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen = 0usize;
+    let mut dirs = vec![(root.clone(), String::new())];
+    while let Some((dir, rel)) = dirs.pop() {
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| fail(format!("hashFiles: read {}: {e}", dir.display())))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| fail(format!("hashFiles: read {}: {e}", dir.display())))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| fail(format!("hashFiles: {}: {e}", path.display())))?;
+            let rel_path = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if kind.is_dir() {
+                dirs.push((path, rel_path));
+                continue;
+            }
+            let file = if kind.is_symlink() {
+                match fs::canonicalize(&path) {
+                    Ok(target) if target.starts_with(&root) && target.is_file() => target,
+                    _ => continue,
+                }
+            } else if kind.is_file() {
+                path
+            } else {
+                continue;
+            };
+            seen += 1;
+            if seen > max_files {
+                return Err(fail(format!(
+                    "hashFiles: more than {max_files} files in the workspace"
+                )));
+            }
+            if filter.matches(&rel_path) {
+                matched.push((rel_path, file));
+            }
+        }
+    }
+    if matched.is_empty() {
+        return Ok(String::new());
+    }
+    matched.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut all = Sha256::new();
+    for (rel, path) in &matched {
+        all.update(digest_file(path).map_err(|e| fail(format!("hashFiles: read {rel}: {e}")))?);
+    }
+    Ok(hex(&all.finalize()))
+}
+
+/// `Filter` needs a directory for `**/` to match; `@actions/glob`, which
+/// `hashFiles` uses, also lets it match nothing, so `**/*.lock` finds
+/// `a.lock` at the root. Each pattern that starts with `**/` is followed
+/// by the same pattern without it.
+fn with_root_variants(patterns: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        out.push(pattern.clone());
+        let (bang, body) = pattern
+            .strip_prefix('!')
+            .map_or(("", pattern.as_str()), |rest| ("!", rest));
+        let mut stripped = body;
+        while let Some(rest) = stripped.strip_prefix("**/") {
+            stripped = rest;
+            out.push(format!("{bang}{stripped}"));
+        }
+    }
+    out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+fn digest_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use hatchrun_workflow::{
+        Conclusion, Github, JobDocument, JobKind, JobStatus, PlannedJob, evaluate, interpolate,
+        template,
+    };
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+    use crate::exec::layout::Layout;
+
+    fn job(template_label: &str) -> PlannedJob {
+        PlannedJob {
+            id: "build".into(),
+            name: "build".into(),
+            requires: Vec::new(),
+            kind: JobKind::Run {
+                template: template(template_label).unwrap(),
+            },
+            matrix: BTreeMap::new(),
+            node: None,
+            env: BTreeMap::new(),
+            if_: None,
+            timeout_minutes: 10,
+            outputs: BTreeMap::new(),
+            steps: Vec::new(),
+        }
+    }
+
+    fn doc(template_label: &str) -> JobDocument {
+        JobDocument {
+            run_id: "42".into(),
+            run_number: 7,
+            run_attempt: 1,
+            workflow: "ci".into(),
+            job: job(template_label),
+            event_name: "pull_request".into(),
+            event: json!({"pull_request": {"number": 12}}),
+            github: Github {
+                repository: "acme/repo".into(),
+                repository_owner: "acme".into(),
+                sha: "abc".into(),
+                ref_: "refs/heads/main".into(),
+                ref_name: "main".into(),
+                ref_type: "branch".into(),
+                head_ref: String::new(),
+                base_ref: String::new(),
+                actor: "octo".into(),
+                server_url: "https://github.com".into(),
+                api_url: "https://api.github.com".into(),
+                graphql_url: "https://api.github.com/graphql".into(),
+                token: "tok".into(),
+            },
+            needs: BTreeMap::new(),
+            secrets: BTreeMap::from([("NPM".to_owned(), "s3".to_owned())]),
+            vars: BTreeMap::new(),
+            timings: BTreeMap::new(),
+            cache: None,
+        }
+    }
+
+    fn layout() -> Layout {
+        Layout::new(
+            Path::new("/w"),
+            "acme/repo",
+            Path::new("/opt/hostedtoolcache"),
+        )
+    }
+
+    fn eval(ctx: &Contexts, expr: &str) -> Value {
+        let rt = Runtime {
+            workspace: Path::new("/nonexistent"),
+            status: JobStatus::Success,
+        };
+        evaluate(expr, ctx.value(), &rt).unwrap()
+    }
+
+    #[test]
+    fn github_context_has_the_runner_fields() {
+        let ctx = Contexts::new(&doc("ubuntu-latest"), &layout());
+        assert_eq!(eval(&ctx, "github.workspace"), json!("/w/repo/repo"));
+        assert_eq!(eval(&ctx, "github.event.pull_request.number"), json!(12));
+        assert_eq!(eval(&ctx, "github.ref"), json!("refs/heads/main"));
+        assert_eq!(eval(&ctx, "github.run_id"), json!("42"));
+        assert_eq!(eval(&ctx, "github.run_number"), json!(7));
+        assert_eq!(eval(&ctx, "github.job"), json!("build"));
+        assert_eq!(eval(&ctx, "github.event_name"), json!("pull_request"));
+        assert_eq!(eval(&ctx, "secrets.GITHUB_TOKEN"), json!("tok"));
+        assert_eq!(eval(&ctx, "secrets.NPM"), json!("s3"));
+    }
+
+    #[test]
+    fn runner_context() {
+        let ctx = Contexts::new(&doc("ubuntu-latest"), &layout());
+        assert_eq!(eval(&ctx, "runner.os"), json!("Linux"));
+        assert_eq!(eval(&ctx, "runner.arch"), json!("X64"));
+        assert_eq!(eval(&ctx, "runner.temp"), json!("/w/_temp"));
+        let arm = Contexts::new(&doc("ubuntu-26.04-arm"), &layout());
+        assert_eq!(eval(&arm, "runner.arch"), json!("ARM64"));
+    }
+
+    #[test]
+    fn missing_step_reads_null() {
+        let ctx = Contexts::new(&doc("ubuntu-latest"), &layout());
+        assert_eq!(eval(&ctx, "steps.nope.outputs.x"), Value::Null);
+        let rt = Runtime {
+            workspace: Path::new("/nonexistent"),
+            status: JobStatus::Success,
+        };
+        let text = interpolate("a${{ steps.nope.outputs.x }}b", ctx.value(), &rt).unwrap();
+        assert_eq!(text, "ab");
+    }
+
+    #[test]
+    fn steps_env_and_action_scope() {
+        let mut ctx = Contexts::new(&doc("ubuntu-latest"), &layout());
+        ctx.record_step(
+            "build",
+            Conclusion::Failure,
+            Conclusion::Success,
+            &BTreeMap::from([("v".to_owned(), "1".to_owned())]),
+        );
+        ctx.set_env(&BTreeMap::from([("A".to_owned(), "b".to_owned())]));
+        assert_eq!(eval(&ctx, "steps.build.outcome"), json!("failure"));
+        assert_eq!(eval(&ctx, "steps.build.conclusion"), json!("success"));
+        assert_eq!(eval(&ctx, "steps.build.outputs.v"), json!("1"));
+        assert_eq!(eval(&ctx, "env.A"), json!("b"));
+
+        let scoped = ctx.with_action(ActionScope {
+            action: "setup".into(),
+            path: "/w/_actions/o/r/v1".into(),
+            ref_: "v1".into(),
+            repository: "o/r".into(),
+            inputs: BTreeMap::from([("k".to_owned(), "v".to_owned())]),
+        });
+        assert_eq!(
+            eval(&scoped, "github.action_path"),
+            json!("/w/_actions/o/r/v1")
+        );
+        assert_eq!(eval(&scoped, "github.action_repository"), json!("o/r"));
+        assert_eq!(eval(&scoped, "inputs.k"), json!("v"));
+        assert_eq!(eval(&scoped, "steps.build.outcome"), Value::Null);
+        assert_eq!(eval(&ctx, "github.action_path"), json!(""));
+    }
+
+    #[test]
+    fn default_condition_is_success() {
+        let ctx = Contexts::new(&doc("ubuntu-latest"), &layout());
+        let ws = Path::new("/nonexistent");
+        let ok = Runtime {
+            workspace: ws,
+            status: JobStatus::Success,
+        };
+        let failed = Runtime {
+            workspace: ws,
+            status: JobStatus::Failure,
+        };
+        assert!(condition(None, &ctx, &ok).unwrap());
+        assert!(!condition(None, &ctx, &failed).unwrap());
+        assert!(!condition(Some("true"), &ctx, &failed).unwrap());
+        assert!(condition(Some("true"), &ctx, &ok).unwrap());
+        assert!(!condition(Some("false"), &ctx, &ok).unwrap());
+        assert!(condition(Some("always()"), &ctx, &failed).unwrap());
+        assert!(condition(Some("${{ failure() }}"), &ctx, &failed).unwrap());
+        assert!(!condition(Some("failure()"), &ctx, &ok).unwrap());
+    }
+
+    fn digest_of(parts: &[&str]) -> String {
+        let mut all = Sha256::new();
+        for p in parts {
+            all.update(Sha256::digest(p.as_bytes()));
+        }
+        hex(&all.finalize())
+    }
+
+    fn hash(ws: &Path, patterns: &[&str]) -> String {
+        let rt = Runtime {
+            workspace: ws,
+            status: JobStatus::Success,
+        };
+        let patterns: Vec<String> = patterns.iter().map(|s| (*s).to_owned()).collect();
+        rt.hash_files(&patterns).unwrap()
+    }
+
+    #[test]
+    fn hash_files_matches_github() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("b")).unwrap();
+        std::fs::write(ws.join("a.lock"), "x").unwrap();
+        std::fs::write(ws.join("b/c.lock"), "y").unwrap();
+        std::fs::write(ws.join("skip.txt"), "z").unwrap();
+        std::fs::write(dir.path().join("outside.lock"), "o").unwrap();
+
+        assert_eq!(hash(&ws, &["**/*.lock"]), digest_of(&["x", "y"]));
+        assert_eq!(hash(&ws, &["**/*.lock", "!b/**"]), digest_of(&["x"]));
+        assert_eq!(hash(&ws, &["**/*.nothing"]), "");
+        assert_eq!(hash(&ws, &["../outside.lock"]), "");
+        assert_eq!(
+            hash(&ws, &["**/*.lock", "../outside.lock"]),
+            digest_of(&["x", "y"])
+        );
+    }
+
+    #[test]
+    fn hash_files_stays_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("secret.lock"), "s").unwrap();
+        std::fs::write(dir.path().join("elsewhere.lock"), "e").unwrap();
+        std::os::unix::fs::symlink(&out, ws.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere.lock"), ws.join("e.lock")).unwrap();
+        assert_eq!(hash(&ws, &["**/*.lock"]), "");
+    }
+
+    #[test]
+    fn hash_files_refuses_a_huge_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("f{i}")), "x").unwrap();
+        }
+        let err = hash_files_in(dir.path(), &["*".to_owned()], 3).unwrap_err();
+        assert!(err.message.contains('3'), "{}", err.message);
+    }
+}
