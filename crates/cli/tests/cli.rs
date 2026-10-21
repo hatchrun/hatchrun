@@ -211,7 +211,7 @@ fn oversized_files_are_refused_before_reading_them_whole() {
 fn convert_skips_an_oversized_file_and_converts_the_rest() {
     let big = scratch("huge.yml");
     std::fs::write(&big, format!("# {}\n", "x".repeat(2 << 20))).unwrap();
-    let out_file = scratch("partial.yml");
+    let out_file = scratch("oversized-out.yml");
     let out = run(hatchrun()
         .arg("convert")
         .arg(&big)
