@@ -22,8 +22,11 @@ use sha2::{Digest, Sha256};
 
 use super::layout::Layout;
 
-/// The most files `hashFiles` looks at before it gives up.
-const MAX_FILES: usize = 100_000;
+/// The most files one `hashFiles` call may match.
+const MAX_MATCHED: usize = 100_000;
+
+/// The most directory entries one `hashFiles` call may walk.
+const MAX_WALKED: usize = 1_000_000;
 
 /// The action whose step is running, for `github.action_path` and
 /// `inputs`.
@@ -201,7 +204,7 @@ pub struct Runtime<'a> {
 
 impl Functions for Runtime<'_> {
     fn hash_files(&self, patterns: &[String]) -> Result<String, ExprError> {
-        hash_files_in(self.workspace, patterns, MAX_FILES)
+        hash_files_in(self.workspace, patterns, MAX_MATCHED, MAX_WALKED)
     }
 
     fn status(&self) -> JobStatus {
@@ -246,17 +249,20 @@ fn fail(message: impl Into<String>) -> ExprError {
 /// files under `workspace` that match `patterns`, in path order. A
 /// file outside the workspace is never read. Symbolic links are not
 /// followed into directories, and a link to a file counts only when it
-/// resolves inside the workspace.
+/// resolves inside the workspace. `.git` directories are not entered.
+/// A call that matches more than `max_matched` files or walks more than
+/// `max_walked` entries fails and names its patterns.
 fn hash_files_in(
     workspace: &Path,
     patterns: &[String],
-    max_files: usize,
+    max_matched: usize,
+    max_walked: usize,
 ) -> Result<String, ExprError> {
     let filter = Filter::new(with_root_variants(patterns));
     let root = fs::canonicalize(workspace)
         .map_err(|e| fail(format!("hashFiles: {}: {e}", workspace.display())))?;
     let mut matched: Vec<(String, PathBuf, (u64, u64))> = Vec::new();
-    let mut seen = 0usize;
+    let mut walked = 0usize;
     let mut dirs = vec![(root.clone(), String::new())];
     while let Some((dir, rel)) = dirs.pop() {
         let entries = fs::read_dir(&dir)
@@ -267,10 +273,20 @@ fn hash_files_in(
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
+            walked += 1;
+            if walked > max_walked {
+                return Err(fail(format!(
+                    "hashFiles: more than {max_walked} entries in the workspace while looking for {}",
+                    patterns.join(", ")
+                )));
+            }
             let path = entry.path();
             let kind = entry
                 .file_type()
                 .map_err(|e| fail(format!("hashFiles: {}: {e}", path.display())))?;
+            if kind.is_dir() && name == ".git" {
+                continue;
+            }
             let rel_path = if rel.is_empty() {
                 name
             } else {
@@ -296,13 +312,13 @@ fn hash_files_in(
             } else {
                 continue;
             };
-            seen += 1;
-            if seen > max_files {
-                return Err(fail(format!(
-                    "hashFiles: more than {max_files} files in the workspace"
-                )));
-            }
             if filter.matches(&rel_path) {
+                if matched.len() >= max_matched {
+                    return Err(fail(format!(
+                        "hashFiles: more than {max_matched} files match {}",
+                        patterns.join(", ")
+                    )));
+                }
                 matched.push((rel_path, file, (meta.dev(), meta.ino())));
             }
         }
@@ -358,7 +374,8 @@ fn hex(bytes: &[u8]) -> String {
 fn digest_file(path: &Path, id: (u64, u64), root: &Path) -> std::io::Result<Option<[u8; 32]>> {
     let opened = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(OFlag::O_NOFOLLOW.bits())
+        // A FIFO swapped in since the walk must not block the open.
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
         .open(path);
     let mut file = match opened {
         Ok(file) => file,
@@ -621,8 +638,58 @@ mod tests {
         for i in 0..5 {
             std::fs::write(dir.path().join(format!("f{i}")), "x").unwrap();
         }
-        let err = hash_files_in(dir.path(), &["*".to_owned()], 3).unwrap_err();
+        let err = hash_files_in(dir.path(), &["*".to_owned()], 3, 1000).unwrap_err();
         assert!(err.message.contains("more than 3 files"), "{}", err.message);
+        assert!(err.message.contains('*'), "{}", err.message);
+    }
+
+    #[test]
+    fn hash_files_stops_walking_after_too_many_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("f{i}")), "x").unwrap();
+        }
+        let err = hash_files_in(dir.path(), &["**/*.lock".to_owned()], 100, 5).unwrap_err();
+        assert!(
+            err.message.contains("more than 5 entries"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("**/*.lock"), "{}", err.message);
+    }
+
+    #[test]
+    fn hash_files_does_not_look_inside_git_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(ws.join("sub/.git")).unwrap();
+        std::fs::write(ws.join(".git/hooks/a.lock"), "g").unwrap();
+        std::fs::write(ws.join("sub/.git/b.lock"), "g").unwrap();
+        std::fs::write(ws.join("c.lock"), "x").unwrap();
+        assert_eq!(hash(ws, &["**/*.lock"]), digest_of(&["x"]));
+        // Only matches count against the file cap.
+        for i in 0..5 {
+            std::fs::write(ws.join(format!("other{i}")), "o").unwrap();
+        }
+        assert!(hash_files_in(ws, &["*.lock".to_owned()], 1, 1000).is_ok());
+    }
+
+    #[test]
+    fn digest_does_not_block_on_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let fifo = root.join("a.lock");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(digest_file(&path, (0, 0), &root));
+        });
+        let done = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("digest_file blocked on a FIFO");
+        assert!(done.unwrap().is_none());
     }
 
     #[test]

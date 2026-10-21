@@ -191,7 +191,7 @@ pub fn read(files: &StepFiles) -> Result<Written, FileError> {
     let path = read_text(&files.path, MAX_FILE)?;
     written.path = path
         .lines()
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.trim().is_empty())
         .map(str::to_owned)
         .collect();
 
@@ -350,6 +350,14 @@ mod tests {
         let files = StepFiles::create(dir.path(), 2, None).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
         assert!(!fs::symlink_metadata(&files.env).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn github_path_skips_blank_and_whitespace_lines() {
+        let (_dir, files) = files_with("");
+        fs::write(&files.path, "/opt/a\n   \n\t\n\n/opt/b\n").unwrap();
+        let written = read(&files).unwrap();
+        assert_eq!(written.path, ["/opt/a", "/opt/b"]);
     }
 
     #[test]
