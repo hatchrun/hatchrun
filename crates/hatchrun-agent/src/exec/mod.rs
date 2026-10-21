@@ -5,7 +5,10 @@
 //! `hatchrun-agent exec`: runs one job from a [`JobDocument`] on this
 //! machine, without GitHub's runner.
 
+pub mod commands;
 pub mod layout;
+pub mod lines;
+pub mod mask;
 pub mod sink;
 
 use std::collections::BTreeMap;
