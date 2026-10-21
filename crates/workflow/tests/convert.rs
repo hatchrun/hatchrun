@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use hatchrun_workflow::{
-    Conversion, Diagnostic, Filter, Level, ParameterKind, Permissions, Step, convert, parse,
-    to_yaml, validate,
+    Conversion, Diagnostic, Filter, Level, ParameterKind, Permissions, Require, Step, convert,
+    parse, to_yaml, validate,
 };
 use serde_json::{Value, json};
 
@@ -51,7 +51,7 @@ fn converts_a_typical_ci_workflow() {
             .find(|j| j.job == "ci-lint")
             .unwrap()
             .requires,
-        Vec::<String>::new()
+        Vec::<Require>::new()
     );
     assert!(out.warnings.iter().any(|w| w.message.contains("services")));
     // round trip: the YAML we write parses and validates clean
@@ -72,7 +72,7 @@ fn the_ci_fixture_maps_every_part() {
     assert!(wf.on.push.is_some());
     assert!(wf.on.pull_request.is_some());
     let test = wf.jobs.iter().find(|j| j.job == "ci-test").unwrap();
-    assert_eq!(test.requires, ["lint"]);
+    assert_eq!(test.requires, [Require::new("lint")]);
     assert_eq!(test.name.as_deref(), Some("test"));
     assert_eq!(test.matrix["toolchain"], [json!("stable"), json!("beta")]);
     assert!(test.with.is_empty());
@@ -726,7 +726,10 @@ fn needs_must_name_a_job_and_repeats_collapse() {
     let out = ok(
         "on: push\njobs:\n  a: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n  b: { needs: [a, a], runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
     );
-    assert_eq!(out.config.workflows["ci"].jobs[1].requires, ["a"]);
+    assert_eq!(
+        out.config.workflows["ci"].jobs[1].requires,
+        [Require::new("a")]
+    );
 }
 
 #[test]

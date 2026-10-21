@@ -630,8 +630,9 @@ pub struct WorkflowJob {
     pub job: String,
     /// A display name, needed when one job appears twice.
     pub name: Option<String>,
-    /// Entries that must finish first.
-    pub requires: Vec<String>,
+    /// Entries that must end first, each with the end states it must
+    /// reach for this entry to start.
+    pub requires: Vec<Require>,
     /// The entry waits for a person to approve; it names no job.
     pub approval: bool,
     /// Branches the entry runs on.
@@ -642,6 +643,273 @@ pub struct WorkflowJob {
     pub matrix: BTreeMap<String, Vec<Value>>,
     /// Parameter values for the job.
     pub with: BTreeMap<String, Value>,
+}
+
+/// One entry of a workflow job's `requires:` list.
+///
+/// In YAML a bare entry id (`- build`), which asks for
+/// [`Statuses::SUCCESS`], or a map with one key, the entry id, whose
+/// value is one status or a list of them: `- test: failed`,
+/// `- lint: [failed, not_run]`, `- deploy: terminal`. It is written back
+/// in the shortest of these forms.
+///
+/// The statuses are checked over the required entry and every entry
+/// before it, not only the entry itself: see [`Statuses`] and
+/// [`plan::ready`](crate::plan::ready).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Require {
+    /// The id of the required entry: its `name`, else its key.
+    pub job: String,
+    /// The end states that let the requiring entry start.
+    pub statuses: Statuses,
+}
+
+impl Require {
+    /// Requires `job` to succeed, as a bare id does.
+    pub fn new(job: impl Into<String>) -> Self {
+        Self {
+            job: job.into(),
+            statuses: Statuses::SUCCESS,
+        }
+    }
+}
+
+/// How a job ended, as a `requires` entry sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Outcome {
+    /// Every step passed, or an approval was given.
+    Success,
+    /// The job never started: its `requires` statuses or its `if:` kept
+    /// it from running.
+    NotRun,
+    /// A step failed, or an approval was refused.
+    Failed,
+    /// The run was cancelled, or the job ran out of time.
+    Canceled,
+}
+
+impl Outcome {
+    /// Every outcome, weakest first, in the order an ancestry
+    /// aggregates them: see [`Statuses`].
+    pub const ALL: [Self; 4] = [Self::Success, Self::NotRun, Self::Failed, Self::Canceled];
+
+    /// The name a `requires` status uses.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::NotRun => "not_run",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+        }
+    }
+
+    fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// The end states a `requires` entry accepts: a set of [`Outcome`]s.
+///
+/// A required entry is judged by the aggregate outcome of its ancestry:
+/// the entry itself and every entry before it, transitively through
+/// their `requires`, counting each planned job (matrix leg, parallel
+/// node) of those entries. The aggregate is the strongest outcome among
+/// them, in the order `canceled` > `failed` > `not_run` > `success`:
+///
+/// - `canceled` when any of them was cancelled;
+/// - else `failed` when any of them failed;
+/// - else `not_run` when any of them did not run;
+/// - else `success`: all of them succeeded.
+///
+/// This is how GitHub's job-level status functions read the jobs
+/// before a job. So when A fails and B, which requires A, does not run,
+/// an entry requiring `B: failed` runs: B's aggregate is `failed`. The
+/// default, `success`, means every ancestor succeeded; `terminal`
+/// accepts any end state.
+///
+/// An entry with several `requires` starts only when each of them,
+/// judged on its own ancestry, reaches one of its own statuses.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Statuses(u8);
+
+impl Statuses {
+    /// No end state: the entry never starts.
+    pub const NONE: Self = Self(0);
+    /// Every ancestor succeeded. The default.
+    pub const SUCCESS: Self = Self(1 << Outcome::Success as u8);
+    /// The aggregate is `not_run`: an ancestor did not run, and none
+    /// failed or was cancelled.
+    pub const NOT_RUN: Self = Self(1 << Outcome::NotRun as u8);
+    /// The aggregate is `failed`: an ancestor failed, and none was
+    /// cancelled.
+    pub const FAILED: Self = Self(1 << Outcome::Failed as u8);
+    /// The aggregate is `canceled`: an ancestor was cancelled.
+    pub const CANCELED: Self = Self(1 << Outcome::Canceled as u8);
+    /// Any end state.
+    pub const TERMINAL: Self = Self(0b1111);
+
+    /// Whether `outcome` is one of the statuses.
+    #[must_use]
+    pub fn contains(self, outcome: Outcome) -> bool {
+        self.0 & outcome.bit() != 0
+    }
+
+    /// The statuses in both sets.
+    #[must_use]
+    pub fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    /// The statuses in either set.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether no end state is accepted.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The outcomes in the set, weakest first.
+    pub fn outcomes(self) -> impl Iterator<Item = Outcome> {
+        Outcome::ALL.into_iter().filter(move |o| self.contains(*o))
+    }
+
+    /// Parses one status name.
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "success" => Self::SUCCESS,
+            "failed" => Self::FAILED,
+            "canceled" => Self::CANCELED,
+            "not_run" => Self::NOT_RUN,
+            "terminal" => Self::TERMINAL,
+            _ => return None,
+        })
+    }
+
+    /// The names written for the set: `terminal`, else each outcome.
+    fn names(self) -> Vec<&'static str> {
+        if self == Self::TERMINAL {
+            vec!["terminal"]
+        } else {
+            self.outcomes().map(Outcome::name).collect()
+        }
+    }
+}
+
+impl Default for Statuses {
+    fn default() -> Self {
+        Self::SUCCESS
+    }
+}
+
+/// Shown as YAML writes it: one name, or a list of names.
+impl fmt::Display for Statuses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.names().as_slice() {
+            [one] => f.write_str(one),
+            many => write!(f, "[{}]", many.join(", ")),
+        }
+    }
+}
+
+impl fmt::Debug for Statuses {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// The status names a `requires` entry accepts.
+const STATUS_NAMES: &str = "success, failed, canceled, not_run or terminal";
+
+impl<'de> Deserialize<'de> for Statuses {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StatusesVisitor;
+
+        impl<'de> Visitor<'de> for StatusesVisitor {
+            type Value = Statuses;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "a status ({STATUS_NAMES}) or a list of them")
+            }
+
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<Statuses, E> {
+                Statuses::from_name(name).ok_or_else(|| {
+                    E::custom(format!("unknown status `{name}`; use {STATUS_NAMES}"))
+                })
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Statuses, A::Error> {
+                let mut all = Statuses::NONE;
+                while let Some(name) = seq.next_element::<String>()? {
+                    all = all.union(StatusesVisitor.visit_str::<A::Error>(&name)?);
+                }
+                if all.is_empty() {
+                    return Err(de::Error::custom(
+                        "a requires entry lists no statuses; give at least one",
+                    ));
+                }
+                Ok(all)
+            }
+        }
+
+        deserializer.deserialize_any(StatusesVisitor)
+    }
+}
+
+impl Serialize for Statuses {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.names().as_slice() {
+            [one] => serializer.serialize_str(one),
+            many => many.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Require {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RequireVisitor;
+
+        impl<'de> Visitor<'de> for RequireVisitor {
+            type Value = Require;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an entry id or a map of one entry id to its statuses")
+            }
+
+            fn visit_str<E: de::Error>(self, job: &str) -> Result<Require, E> {
+                Ok(Require::new(job))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Require, A::Error> {
+                let Some(job) = map.next_key::<String>()? else {
+                    return Err(de::Error::invalid_length(0, &self));
+                };
+                let statuses = map.next_value()?;
+                if let Some(other) = map.next_key::<String>()? {
+                    return Err(de::Error::custom(format!(
+                        "a requires entry is a map with one key, the entry id; found `{other}` after `{job}`"
+                    )));
+                }
+                Ok(Require { job, statuses })
+            }
+        }
+
+        deserializer.deserialize_any(RequireVisitor)
+    }
+}
+
+impl Serialize for Require {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.statuses == Statuses::SUCCESS {
+            serializer.serialize_str(&self.job)
+        } else {
+            single_entry(serializer, &self.job, &self.statuses)
+        }
+    }
 }
 
 /// The body of a workflow job entry: everything but the job name.

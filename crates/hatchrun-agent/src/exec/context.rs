@@ -538,6 +538,7 @@ mod tests {
             id: "build (linux) [1/2]".into(),
             name: "build".into(),
             requires: Vec::new(),
+            statuses: std::collections::BTreeMap::new(),
             kind: JobKind::Run {
                 template: template(template_label).unwrap(),
             },

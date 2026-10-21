@@ -23,8 +23,8 @@ pub mod templates;
 pub mod trigger;
 
 pub use config::{
-    CacheStep, Command, Config, Executor, Job, MAX_SOURCE, Parameter, ParameterKind, RunStep, Step,
-    UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
+    CacheStep, Command, Config, Executor, Job, MAX_SOURCE, Outcome, Parameter, ParameterKind,
+    Require, RunStep, Statuses, Step, UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
 };
 pub use convert::{Conversion, convert, to_yaml};
 pub use cron::{Cron, UtcMinute};
@@ -39,7 +39,9 @@ pub use job::{
     StepSummary,
 };
 pub use permissions::{DEFAULT_SCOPES, Level, Permissions, SCOPES, token_scopes};
-pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, config_errors, validate};
+pub use plan::{
+    JobKind, Plan, PlannedJob, PlannedStep, Ready, compile, config_errors, ready, validate,
+};
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;
 pub use templates::{

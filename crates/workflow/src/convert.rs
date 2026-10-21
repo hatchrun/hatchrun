@@ -19,7 +19,7 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::config::{
-    Config, Job, MAX_SOURCE, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow,
+    Config, Job, MAX_SOURCE, Parameter, ParameterKind, Require, RunStep, Step, UsesStep, Workflow,
     WorkflowJob, too_big, yaml_options,
 };
 use crate::diagnostic::Diagnostic;
@@ -428,8 +428,8 @@ impl Cx {
         // A job that needs a dropped job would run without it, so it is
         // dropped too, and so on down the chain.
         while let Some((i, need)) = entries.iter().enumerate().find_map(|(i, e)| {
-            let need = e.requires.iter().find(|r| dropped.contains_key(*r))?;
-            Some((i, need.clone()))
+            let need = e.requires.iter().find(|r| dropped.contains_key(&r.job))?;
+            Some((i, need.job.clone()))
         }) {
             let entry = entries.remove(i);
             self.config.jobs.remove(&entry.job);
@@ -818,7 +818,11 @@ impl Cx {
         let entry = WorkflowJob {
             job: key.to_owned(),
             name: Some(id.to_owned()),
-            requires,
+            requires: requires
+                .iter()
+                .map(String::as_str)
+                .map(Require::new)
+                .collect(),
             matrix,
             ..WorkflowJob::default()
         };

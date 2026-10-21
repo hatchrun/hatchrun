@@ -232,6 +232,7 @@ mod tests {
             id: "j".into(),
             name: "j".into(),
             requires: vec![],
+            statuses: BTreeMap::new(),
             kind: crate::plan::JobKind::Run {
                 template: &TEMPLATES[0],
             },
