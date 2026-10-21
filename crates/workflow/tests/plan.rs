@@ -1119,3 +1119,190 @@ fn filters_are_capped() {
     let plain = many_patterns(20, 250, |i| format!("'docs/{i}/**'"));
     assert_eq!(errors(&plain), Vec::new());
 }
+
+#[test]
+fn exclude_leaves_out_matching_combinations() {
+    let yaml = "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t:
+          matrix:
+            os: [a, b]
+            n: [1, 2, 3]
+            exclude:
+              - { os: a, n: 2 }
+              - { n: 3 }
+      - t: { name: after, requires: [t] }
+";
+    let plan = plan(yaml);
+    let ids: Vec<_> = plan.jobs.iter().map(|j| j.id.as_str()).collect();
+    assert_eq!(ids, ["t (1, a)", "t (1, b)", "t (2, b)", "after"]);
+    assert_eq!(plan.jobs[3].requires, &ids[..3]);
+}
+
+/// A config whose one workflow runs `t` with `matrix`.
+fn with_matrix(matrix: &str) -> String {
+    format!(
+        "jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}\nworkflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ matrix: {matrix} }} }}] }} }}\n"
+    )
+}
+
+#[test]
+fn exclude_must_name_matrix_keys_and_leave_a_combination() {
+    assert_error(
+        &with_matrix("{ os: [a], exclude: [{ arch: x }] }"),
+        &["`t`", "`exclude` key `arch`", "not a key of the matrix"],
+    );
+    assert_error(
+        &with_matrix("{ os: [a], exclude: [{}] }"),
+        &["`t`", "empty matrix `exclude` entry"],
+    );
+    assert_error(
+        &with_matrix("{ os: [a, b], exclude: [{ os: a }, { os: b }] }"),
+        &["`t`", "leaves no combination"],
+    );
+    assert_error(
+        &with_matrix("{ os: [a], exclude: [{ os: '${{ parameters.x }}' }] }"),
+        &["`t`", "reads `parameters`"],
+    );
+    assert_eq!(
+        errors(&with_matrix("{ os: [a], exclude: [{ os: b }] }")),
+        Vec::new()
+    );
+    // An approval has no matrix, `exclude` included.
+    assert_error(
+        "workflows: { ci: { on: { push: {} }, jobs: [{ ok: { type: approval, matrix: { exclude: [{ a: 1 }] } } }] } }",
+        &["approval `ok`", "cannot have a matrix"],
+    );
+}
+
+#[test]
+fn the_matrix_limit_counts_after_exclude() {
+    let list = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    let m = list(17);
+    // 17x17 is 289; leaving out `a: 0` and `a: 1` leaves 255.
+    assert_eq!(
+        plan(&with_matrix(&format!(
+            "{{ a: [{m}], b: [{m}], exclude: [{{ a: 0 }}, {{ a: 1 }}] }}"
+        )))
+        .jobs
+        .len(),
+        255
+    );
+    assert_error(
+        &with_matrix(&format!("{{ a: [{m}], b: [{m}], exclude: [{{ a: 0 }}] }}")),
+        &["`t`", "272 entries", "256"],
+    );
+    // Too many combinations to check, whatever `exclude` leaves.
+    let big = list(65);
+    assert_error(
+        &with_matrix(&format!(
+            "{{ a: [{big}], b: [{big}], exclude: [{{ a: 0 }}] }}"
+        )),
+        &["`t`", "4225 combinations before `exclude`", "4096"],
+    );
+    let many: Vec<String> = (0..257).map(|i| format!("{{ a: {i} }}")).collect();
+    assert_error(
+        &with_matrix(&format!("{{ a: [{m}], exclude: [{}] }}", many.join(", "))),
+        &["`t`", "257 matrix `exclude` entries", "256"],
+    );
+}
+
+#[test]
+fn exclude_round_trips() {
+    let config = parse(&with_matrix("{ os: [a, b], exclude: [{ os: a }] }")).unwrap();
+    let entry = &config.workflows["ci"].jobs[0];
+    assert_eq!(entry.matrix["os"].len(), 2);
+    assert_eq!(entry.matrix.exclude.len(), 1);
+    let yaml = hatchrun_workflow::to_yaml(&config);
+    assert!(yaml.contains("exclude"), "{yaml}");
+    assert_eq!(parse(&yaml).unwrap(), config);
+}
+
+const PER_LEG: &str = "
+jobs:
+  t:
+    runs-on: ${{ parameters.os }}
+    parameters: { os: { type: string } }
+    steps: [{ run: 'echo ${{ parameters.os }}' }]
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { matrix: { os: [ubuntu-latest, ubuntu-26.04-16core-arm] } }
+";
+
+#[test]
+fn runs_on_a_parameter_picks_each_legs_template() {
+    let plan = plan(PER_LEG);
+    let picked: Vec<_> = plan
+        .jobs
+        .iter()
+        .map(|j| match j.kind {
+            JobKind::Run { template } => (j.id.as_str(), template),
+            JobKind::Approval => panic!("{j:?}"),
+        })
+        .collect();
+    assert_eq!(
+        picked,
+        [
+            ("t (ubuntu-latest)", template("ubuntu-latest").unwrap()),
+            (
+                "t (ubuntu-26.04-16core-arm)",
+                template("ubuntu-26.04-16core-arm").unwrap()
+            ),
+        ]
+    );
+    assert_eq!(runs(&plan.jobs[1]), ["echo ubuntu-26.04-16core-arm"]);
+}
+
+#[test]
+fn runs_on_a_parameter_must_name_templates() {
+    assert_error(
+        &PER_LEG.replace("ubuntu-26.04-16core-arm]", "macos-latest]"),
+        &[
+            "job `t`",
+            "`runs-on: ${{ parameters.os }}`",
+            "`macos-latest` for `t (macos-latest)`",
+            "names no runner template",
+        ],
+    );
+    assert_error(
+        &PER_LEG.replace("parameters: { os: { type: string } }", "parameters: {}"),
+        &["job `t`", "declares no parameter `os`"],
+    );
+    assert_error(
+        &PER_LEG.replace("{ type: string }", "{ type: integer }"),
+        &["job `t`", "parameter `os`", "string or an enum"],
+    );
+    assert_error(
+        &PER_LEG.replace("{ type: string }", "{ type: string, default: macos-14 }"),
+        &["job `t` parameter `os`", "`runs-on: macos-14`"],
+    );
+    assert_error(
+        &PER_LEG.replace(
+            "{ type: string }",
+            "{ type: enum, enum: [ubuntu-latest, windows-latest] }",
+        ),
+        &["job `t` parameter `os`", "`runs-on: windows-latest`"],
+    );
+    // With a default, an entry without a matrix runs on it.
+    let yaml = PER_LEG
+        .replace(
+            "{ type: string }",
+            "{ type: string, default: ubuntu-26.04-arm }",
+        )
+        .replace(
+            "- t: { matrix: { os: [ubuntu-latest, ubuntu-26.04-16core-arm] } }",
+            "- t",
+        );
+    assert_eq!(
+        plan(&yaml).jobs[0].kind,
+        JobKind::Run {
+            template: template("ubuntu-26.04-arm").unwrap()
+        }
+    );
+}

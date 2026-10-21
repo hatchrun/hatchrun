@@ -17,8 +17,8 @@ pub mod templates;
 pub mod trigger;
 
 pub use config::{
-    CacheStep, Command, Config, Executor, Job, MAX_SOURCE, Parameter, ParameterKind, RunStep, Step,
-    UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
+    CacheStep, Command, Config, Executor, Job, MAX_SOURCE, Matrix, Parameter, ParameterKind,
+    RunStep, Step, UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
 };
 pub use convert::{Conversion, convert, to_yaml};
 pub use diagnostic::Diagnostic;

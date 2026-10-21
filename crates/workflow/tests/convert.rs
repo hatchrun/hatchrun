@@ -4,10 +4,11 @@
 
 //! Converting GitHub Actions workflows into a hatchrun config.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use hatchrun_workflow::{
-    Conversion, Diagnostic, Filter, ParameterKind, Step, convert, parse, to_yaml, validate,
+    Conversion, Diagnostic, Filter, JobKind, ParameterKind, Step, convert, parse, to_yaml, validate,
 };
 use serde_json::{Value, json};
 
@@ -286,8 +287,6 @@ jobs:
         "concurrency",
         "permissions",
         "environment",
-        "include",
-        "exclude",
         "fail-fast",
     ] {
         assert!(
@@ -305,9 +304,20 @@ jobs:
             out.warnings
         );
     }
-    let entry = &out.config.workflows["ci"].jobs[0];
-    assert_eq!(entry.matrix["node"], [json!(20), json!(22)]);
+    // `exclude` passes through; the `include` entry matches no
+    // combination, so it runs as an entry of its own.
+    let jobs = &out.config.workflows["ci"].jobs;
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].matrix["node"], [json!(20), json!(22)]);
+    assert_eq!(jobs[0].matrix.exclude, [matrix_map(json!({"node": 20}))]);
+    assert_eq!(jobs[1].name.as_deref(), Some("build-2"));
+    assert_eq!(jobs[1].matrix["node"], [json!(23)]);
     round_trips(&out);
+}
+
+/// A JSON object as an `exclude` entry.
+fn matrix_map(value: Value) -> BTreeMap<String, Value> {
+    serde_json::from_value(value).unwrap()
 }
 
 #[test]
@@ -981,32 +991,246 @@ jobs:
 }
 
 #[test]
-fn a_runs_on_matrix_without_one_template_is_an_error() {
-    for (os, words) in [
-        (
-            "[macos-latest, windows-latest]",
-            &["names no runner template"][..],
-        ),
-        (
-            "[ubuntu-latest, ubuntu-26.04-arm]",
-            &["`ubuntu-latest`, `ubuntu-26.04-arm`", "one runner template"][..],
-        ),
-    ] {
-        let out = ok(&format!(
-            "on: push
+fn a_runs_on_matrix_without_a_template_is_an_error() {
+    let out = ok("on: push
 jobs:
   test:
-    runs-on: ${{{{ matrix.os }}}}
-    strategy: {{ matrix: {{ os: {os} }} }}
-    steps: [{{ run: make }}]
+    runs-on: ${{ matrix.os }}
+    strategy: { matrix: { os: [macos-latest, windows-latest] } }
+    steps: [{ run: make }]
   lint:
     runs-on: ubuntu-latest
-    steps: [{{ run: lint }}]
-"
-        ));
-        assert!(has(&out.errors, words), "{os}: {:?}", out.errors);
-        assert!(!out.config.jobs.contains_key("ci-test"));
+    steps: [{ run: lint }]
+");
+    assert!(
+        has(&out.errors, &["names no runner template"]),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-test"));
+}
+
+/// Compiles the converted config, read back from YAML, for a push to
+/// main.
+fn compiled(out: &Conversion) -> hatchrun_workflow::Plan {
+    let config = parse(&to_yaml(&out.config)).unwrap();
+    hatchrun_workflow::compile(&config, "ci", "refs/heads/main").unwrap()
+}
+
+/// Each planned job's id and the first label of its template.
+fn legs(plan: &hatchrun_workflow::Plan) -> Vec<(String, &'static str)> {
+    plan.jobs
+        .iter()
+        .map(|j| match j.kind {
+            JobKind::Run { template } => (j.id.clone(), template.labels[0]),
+            JobKind::Approval => (j.id.clone(), "approval"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_runs_on_matrix_over_two_templates_runs_each_leg_on_its_own() {
+    let out = ok("on: push
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04-arm, macos-latest]
+        node: [20, 22]
+        exclude:
+          - os: ubuntu-24.04-arm
+            node: 20
+          - os: macos-latest
+    steps: [{ run: 'echo ${{ matrix.os }}' }]
+");
+    assert_eq!(out.errors, Vec::new());
+    let job = &out.config.jobs["ci-test"];
+    assert_eq!(job.runs_on.as_deref(), Some("${{ parameters.os }}"));
+    assert_eq!(job.parameters["os"].kind, ParameterKind::String);
+    let entry = &out.config.workflows["ci"].jobs[0];
+    assert_eq!(
+        entry.matrix["os"],
+        [json!("ubuntu-latest"), json!("ubuntu-26.04-arm")]
+    );
+    // The exclude of a dropped leg is gone; the other names the new label.
+    assert_eq!(
+        entry.matrix.exclude,
+        [matrix_map(json!({"os": "ubuntu-26.04-arm", "node": 20}))]
+    );
+    for (old, new) in [
+        ("ubuntu-22.04", "ubuntu-latest"),
+        ("ubuntu-24.04-arm", "ubuntu-26.04-arm"),
+    ] {
+        assert!(
+            has(
+                &out.warnings,
+                &[&format!("`runs-on: {old}` became `{new}`")]
+            ),
+            "{:?}",
+            out.warnings
+        );
     }
+    round_trips(&out);
+    assert_eq!(
+        legs(&compiled(&out)),
+        [
+            ("test (20, ubuntu-latest)".into(), "ubuntu-latest"),
+            ("test (22, ubuntu-latest)".into(), "ubuntu-latest"),
+            ("test (22, ubuntu-26.04-arm)".into(), "ubuntu-26.04-arm"),
+        ]
+    );
+}
+
+#[test]
+fn include_extends_matching_combinations_and_adds_the_rest() {
+    // GitHub's documented example: six jobs.
+    let out = ok("on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        fruit: [apple, pear]
+        animal: [cat, dog]
+        include:
+          - color: green
+          - color: pink
+            animal: cat
+          - fruit: apple
+            shape: circle
+          - fruit: banana
+          - fruit: banana
+            animal: cat
+    steps: [{ run: 'echo ${{ matrix.fruit }}' }]
+  after:
+    needs: t
+    runs-on: ubuntu-latest
+    steps: [{ run: done }]
+");
+    assert_eq!(out.errors, Vec::new());
+    round_trips(&out);
+    let plan = compiled(&out);
+    let mut got: Vec<Value> = plan.jobs[..6].iter().map(|j| json!(j.matrix)).collect();
+    got.sort_by_key(Value::to_string);
+    let mut want = vec![
+        json!({"fruit": "apple", "animal": "cat", "color": "pink", "shape": "circle"}),
+        json!({"fruit": "apple", "animal": "dog", "color": "green", "shape": "circle"}),
+        json!({"fruit": "pear", "animal": "cat", "color": "pink"}),
+        json!({"fruit": "pear", "animal": "dog", "color": "green"}),
+        json!({"fruit": "banana"}),
+        json!({"fruit": "banana", "animal": "cat"}),
+    ];
+    want.sort_by_key(Value::to_string);
+    assert_eq!(got, want);
+    // `needs: t` waits for every entry `t` became.
+    let entries = &out.config.workflows["ci"].jobs;
+    let names: Vec<&str> = entries[..6]
+        .iter()
+        .map(|e| e.name.as_deref().unwrap())
+        .collect();
+    assert_eq!(names, ["t", "t-2", "t-3", "t-4", "t-5", "t-6"]);
+    assert_eq!(entries[6].requires, names);
+    let ids: Vec<&str> = plan.jobs[..6].iter().map(|j| j.id.as_str()).collect();
+    assert_eq!(plan.jobs[6].requires, ids);
+}
+
+#[test]
+fn include_that_extends_every_combination_alike_keeps_one_entry() {
+    let out = ok("on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+        include: [{ npm: 10 }]
+    steps: [{ run: x }]
+");
+    let entries = &out.config.workflows["ci"].jobs;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].matrix["npm"], [json!(10)]);
+    round_trips(&out);
+    assert_eq!(compiled(&out).jobs.len(), 2);
+}
+
+#[test]
+fn an_include_only_matrix_runs_each_entry_on_its_runner() {
+    // The shape of this repository's release build.
+    let out = ok("on: push
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64 }
+          - { runner: macos-latest, target: darwin }
+          - { target: none }
+    steps: [{ run: 'cargo build --target ${{ matrix.target }}' }]
+  build-2:
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+  publish:
+    needs: [build, build-2]
+    runs-on: ubuntu-latest
+    steps: [{ run: publish }]
+");
+    assert_eq!(out.errors, Vec::new());
+    assert!(has(&out.warnings, &["`macos-latest`", "dropped"]));
+    assert!(has(
+        &out.warnings,
+        &["without `runner`", "`runs-on` reads", "dropped"]
+    ));
+    let entries = &out.config.workflows["ci"].jobs;
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_deref().unwrap()).collect();
+    // `build-2` is a job of its own, so the second entry skips it.
+    assert_eq!(names, ["build", "build-3", "build-2", "publish"]);
+    assert_eq!(entries[3].requires, ["build", "build-3", "build-2"]);
+    round_trips(&out);
+    assert_eq!(
+        legs(&compiled(&out))[..2],
+        [
+            ("build (ubuntu-latest, x86_64)".into(), "ubuntu-latest"),
+            (
+                "build-3 (ubuntu-26.04-arm, aarch64)".into(),
+                "ubuntu-26.04-arm"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn bad_include_and_exclude_entries_are_dropped_with_a_warning() {
+    let out = ok("on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+        os: ${{ fromJSON(needs.setup.outputs.os) }}
+        include: ${{ fromJSON(needs.setup.outputs.include) }}
+        exclude:
+          - os: linux
+          - 7
+    steps: [{ run: x }]
+");
+    for words in [
+        &["matrix key `os`", "not a list"][..],
+        &["`strategy.matrix.include`", "not a list of maps"],
+        &["`strategy.matrix.exclude` entry `7`", "not a map"],
+        &[
+            "`strategy.matrix.exclude` entry names `os`",
+            "not a matrix key",
+        ],
+    ] {
+        assert!(has(&out.warnings, words), "{words:?}: {:?}", out.warnings);
+    }
+    let entry = &out.config.workflows["ci"].jobs[0];
+    assert_eq!(entry.matrix.exclude, Vec::<BTreeMap<String, Value>>::new());
+    round_trips(&out);
 }
 
 #[test]

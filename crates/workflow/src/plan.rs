@@ -14,7 +14,7 @@ use std::fmt::{self, Write as _};
 use serde_json::Value;
 
 use crate::config::{
-    CacheStep, Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow,
+    CacheStep, Config, Job, Matrix, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow,
     WorkflowJob, WorkspaceStep,
 };
 use crate::diagnostic::Diagnostic;
@@ -30,6 +30,14 @@ const MAX_PARALLELISM: u32 = 64;
 
 /// The most entries one matrix can expand to.
 const MAX_MATRIX: usize = 256;
+
+/// The most combinations a matrix with `exclude` may have before the
+/// excluded ones are taken out. Each is checked against every `exclude`
+/// entry.
+pub(crate) const MAX_COMBINATIONS: usize = 4096;
+
+/// The most `exclude` entries one matrix may have.
+pub(crate) const MAX_EXCLUDE: usize = 256;
 
 /// The work one `compile` or `validate` call may do, in units. Every
 /// step and command call visited costs one, and so does every step
@@ -84,7 +92,7 @@ const STEP_KEYS: &[&str] = &[
 
 /// Keys of a workflow entry. A job parameter with one of these names
 /// could never be set from a workflow: the entry reads the key itself.
-const ENTRY_KEYS: &[&str] = &["name", "requires", "type", "branches", "tags", "matrix"];
+pub(crate) const ENTRY_KEYS: &[&str] = &["name", "requires", "type", "branches", "tags", "matrix"];
 
 /// The jobs one workflow runs for one ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,7 +316,7 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
                 )));
             }
         }
-        resolve_template(config, &owner, job, errors);
+        resolve_runner(config, &owner, job, errors);
         let nodes = job.parallelism.unwrap_or(1);
         if !(1..=MAX_PARALLELISM).contains(&nodes) {
             errors.push(Diagnostic::new(format!(
@@ -361,14 +369,19 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
                     }
                 });
             }
-            for (key, values) in &entry.matrix {
-                for value in values {
-                    check.value(&format_args!("`{key}`"), value, &mut |c, field, text| {
-                        if c.text(field, text) {
-                            c.errors.push(no_parameters_here(id, key));
-                        }
-                    });
-                }
+            let excluded = entry.matrix.exclude.iter().flatten();
+            for (key, value) in entry
+                .matrix
+                .values
+                .iter()
+                .flat_map(|(key, values)| values.iter().map(move |v| (key, v)))
+                .chain(excluded)
+            {
+                check.value(&format_args!("`{key}`"), value, &mut |c, field, text| {
+                    if c.text(field, text) {
+                        c.errors.push(no_parameters_here(id, key));
+                    }
+                });
             }
         }
     }
@@ -952,7 +965,7 @@ fn expand_entry(
     };
     let before = errors.len();
     let owner = format!("job `{}`", entry.job);
-    let template = resolve_template(config, &owner, job, errors);
+    let runner = resolve_runner(config, &owner, job, errors);
 
     let nodes = job.parallelism.unwrap_or(1);
     if !(1..=MAX_PARALLELISM).contains(&nodes) {
@@ -960,26 +973,29 @@ fn expand_entry(
             "{owner} has parallelism {nodes}; it must be 1 to {MAX_PARALLELISM}"
         )));
     }
-    let size = entry_value_errors(entry, id, errors);
+    let combinations = entry_value_errors(entry, id, errors);
     if errors.len() > before {
         return Vec::new();
     }
-    let Some(template) = template else {
+    let Some(runner) = runner else {
         return Vec::new();
     };
-    let copies = nodes as usize;
-    if !reserve_jobs(workflow, planned, size * copies, errors) {
-        return Vec::new();
-    }
-
     let mut walk = Walk {
         workflow,
         stack: Vec::new(),
         budget,
     };
+    let Some(kept) = kept_combinations(&entry.matrix, combinations, id, &mut walk, errors) else {
+        return Vec::new();
+    };
+    let copies = nodes as usize;
+    if !reserve_jobs(workflow, planned, kept.len() * copies, errors) {
+        return Vec::new();
+    }
+
     let mut out = Vec::new();
-    for index in 0..size {
-        let Some(combo) = combination(&entry.matrix, index, &mut walk, errors) else {
+    for index in kept {
+        let Some(combo) = combination(&entry.matrix.values, index, &mut walk, errors) else {
             break;
         };
         let Some(args) = entry_args(entry, job, &combo, &mut walk, errors) else {
@@ -992,6 +1008,13 @@ fn expand_entry(
             continue;
         };
         drop(args);
+        let leg = (id, &combo);
+        let Some(template) = leg_template(&runner, &values, &owner, leg, &mut walk, errors) else {
+            if walk.budget.spent {
+                break;
+            }
+            continue;
+        };
         // Steps fail the same way for every combination; stop at the first.
         let Some(mut base) = expand_job(config, job, &owner, &values, &mut walk, errors) else {
             break;
@@ -1003,6 +1026,92 @@ fn expand_entry(
         out.extend(jobs);
     }
     out
+}
+
+/// The id of one matrix entry's job: the entry id, then `(<v1>, <v2>)`
+/// when there is a matrix.
+fn matrix_id(id: &str, combo: &BTreeMap<String, Value>) -> String {
+    if combo.is_empty() {
+        id.to_owned()
+    } else {
+        let shown: Vec<String> = combo.values().map(render).collect();
+        format!("{id} ({})", shown.join(", "))
+    }
+}
+
+/// The indexes of the combinations `exclude` leaves in, out of
+/// `combinations`. Each combination checked costs one unit, and the
+/// list is charged before it is made. `None` after reporting a matrix
+/// left over `MAX_MATRIX` or with nothing, or a spent budget.
+fn kept_combinations(
+    matrix: &Matrix,
+    combinations: usize,
+    id: &str,
+    walk: &mut Walk<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<Vec<usize>> {
+    if !matrix.exclude.is_empty() && !walk.budget.charge(combinations, walk.workflow, errors) {
+        return None;
+    }
+    let kept: Vec<usize> = (0..combinations)
+        .filter(|&i| !excluded(matrix, i))
+        .collect();
+    if !walk.bytes(kept.len() * size_of::<usize>(), errors) {
+        return None;
+    }
+    if kept.is_empty() {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has a matrix whose `exclude` leaves no combination"
+        )));
+        return None;
+    }
+    if kept.len() > MAX_MATRIX {
+        errors.push(too_big_matrix(id, kept.len()));
+        return None;
+    }
+    Some(kept)
+}
+
+/// Whether the combination at `index` matches every key of one
+/// `exclude` entry.
+pub(crate) fn excluded(matrix: &Matrix, index: usize) -> bool {
+    if matrix.exclude.is_empty() {
+        return false;
+    }
+    let mut picked: Vec<(&str, &Value)> = Vec::with_capacity(matrix.values.len());
+    let mut rest = index;
+    for (key, values) in matrix.values.iter().rev() {
+        picked.push((key, &values[rest % values.len()]));
+        rest /= values.len();
+    }
+    matrix.exclude.iter().any(|entry| {
+        entry.iter().all(|(key, want)| {
+            picked
+                .iter()
+                .any(|(k, value)| *k == key.as_str() && *value == want)
+        })
+    })
+}
+
+/// The number of combinations a matrix runs: every combination of its
+/// values without those `exclude` leaves out. When there are more than
+/// `MAX_COMBINATIONS` to check, all of them, which is over the limit
+/// either way.
+fn matrix_size(matrix: &Matrix) -> usize {
+    let all = matrix
+        .values
+        .values()
+        .fold(1usize, |n, values| n.saturating_mul(values.len()));
+    if matrix.exclude.is_empty() || all > MAX_COMBINATIONS {
+        return all;
+    }
+    (0..all).filter(|&i| !excluded(matrix, i)).count()
+}
+
+fn too_big_matrix(id: &str, size: usize) -> Diagnostic {
+    Diagnostic::new(format!(
+        "`{id}` has a matrix of {size} entries; the limit is {MAX_MATRIX}"
+    ))
 }
 
 /// The matrix entry at `index`, charged before it is made. The first key
@@ -1090,12 +1199,7 @@ fn copy_job(
     {
         return None;
     }
-    let matrix_id = if combo.is_empty() {
-        id.to_owned()
-    } else {
-        let shown: Vec<String> = combo.values().map(render).collect();
-        format!("{id} ({})", shown.join(", "))
-    };
+    let matrix_id = matrix_id(id, &combo);
     let mut base = Some(base);
     let mut combo = Some(combo);
     let mut out = Vec::with_capacity(copies);
@@ -1132,10 +1236,7 @@ pub(crate) fn planned_jobs(config: &Config, wf: &Workflow) -> usize {
     wf.jobs
         .iter()
         .map(|entry| {
-            let size = entry
-                .matrix
-                .values()
-                .fold(1usize, |n, values| n.saturating_mul(values.len()));
+            let size = matrix_size(&entry.matrix);
             let nodes = config
                 .jobs
                 .get(&entry.job)
@@ -1178,15 +1279,42 @@ fn reserve_jobs(
 
 /// Checks the values a workflow entry sets: none may read `parameters`,
 /// and the matrix must have values, list none twice, not repeat a `with`
-/// key and stay within `MAX_MATRIX` entries. Returns the matrix size.
+/// key and stay within `MAX_MATRIX` entries. Each `exclude` entry must
+/// name only matrix keys, and with `exclude` there may be at most
+/// `MAX_COMBINATIONS` combinations to check. Returns the number of
+/// combinations before `exclude`.
 fn entry_value_errors(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> usize {
     for (key, value) in &entry.with {
         if reads_parameters(value) {
             errors.push(no_parameters_here(id, key));
         }
     }
+    let matrix = &entry.matrix;
+    if matrix.exclude.len() > MAX_EXCLUDE {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has {} matrix `exclude` entries; the limit is {MAX_EXCLUDE}",
+            matrix.exclude.len()
+        )));
+    }
+    for exclude in &matrix.exclude {
+        if exclude.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has an empty matrix `exclude` entry, which would leave out every combination"
+            )));
+        }
+        for (key, value) in exclude {
+            if !matrix.values.contains_key(key) {
+                errors.push(Diagnostic::new(format!(
+                    "`{id}` has matrix `exclude` key `{key}`, which is not a key of the matrix"
+                )));
+            }
+            if reads_parameters(value) {
+                errors.push(no_parameters_here(id, key));
+            }
+        }
+    }
     let mut size: usize = 1;
-    for (key, values) in &entry.matrix {
+    for (key, values) in &matrix.values {
         if values.is_empty() {
             errors.push(Diagnostic::new(format!(
                 "`{id}` has matrix key `{key}` with no values"
@@ -1211,9 +1339,13 @@ fn entry_value_errors(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic
             }
         }
     }
-    if size > MAX_MATRIX {
+    if matrix.exclude.is_empty() {
+        if size > MAX_MATRIX {
+            errors.push(too_big_matrix(id, size));
+        }
+    } else if size > MAX_COMBINATIONS {
         errors.push(Diagnostic::new(format!(
-            "`{id}` has a matrix of {size} entries; the limit is {MAX_MATRIX}"
+            "`{id}` has a matrix of {size} combinations before `exclude`; the limit is {MAX_COMBINATIONS}"
         )));
     }
     size
@@ -1256,7 +1388,91 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
     }]
 }
 
-/// Finds the template a job runs on.
+/// What a job runs on: one template, or the template a parameter names,
+/// which can differ for each matrix entry.
+enum Runner<'j> {
+    /// Every planned job of the entry runs on this template.
+    Fixed(&'static Template),
+    /// `runs-on: ${{ parameters.NAME }}`: each planned job runs on the
+    /// template its value of `NAME` names.
+    Parameter(&'j str),
+}
+
+/// Finds what a job runs on. A `runs-on` that is one whole
+/// `${{ parameters.NAME }}` must name a declared string or enum
+/// parameter, and its default and enum values must name templates; the
+/// value each planned job gets is checked when it is planned.
+fn resolve_runner<'j>(
+    config: &Config,
+    owner: &str,
+    job: &'j Job,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<Runner<'j>> {
+    let Some(name) = job.runs_on.as_deref().and_then(sole_parameter) else {
+        return resolve_template(config, owner, job, errors).map(Runner::Fixed);
+    };
+    if job.executor.is_some() {
+        return resolve_template(config, owner, job, errors).map(Runner::Fixed);
+    }
+    let Some(param) = job.parameters.get(name) else {
+        errors.push(Diagnostic::new(format!(
+            "{owner} has `runs-on: ${{{{ parameters.{name} }}}}` but declares no parameter `{name}`"
+        )));
+        return None;
+    };
+    let before = errors.len();
+    let mut labels: Vec<&str> = Vec::new();
+    match &param.kind {
+        ParameterKind::String => {}
+        ParameterKind::Enum(options) => labels.extend(options.iter().map(String::as_str)),
+        _ => errors.push(Diagnostic::new(format!(
+            "{owner} runs on parameter `{name}`, which must be a string or an enum"
+        ))),
+    }
+    labels.extend(param.default.as_ref().and_then(Value::as_str));
+    for label in labels {
+        if template(label).is_none() {
+            errors.push(unknown_template(
+                &format!("{owner} parameter `{name}`"),
+                label,
+            ));
+        }
+    }
+    (errors.len() == before).then_some(Runner::Parameter(name))
+}
+
+/// The template the planned job of one matrix entry runs on, given the
+/// entry id and the combination, or `None` after reporting a parameter
+/// value that names none.
+fn leg_template(
+    runner: &Runner<'_>,
+    values: &BTreeMap<String, Value>,
+    owner: &str,
+    (id, combo): (&str, &BTreeMap<String, Value>),
+    walk: &mut Walk<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<&'static Template> {
+    let name = match runner {
+        Runner::Fixed(template) => return Some(template),
+        Runner::Parameter(name) => *name,
+    };
+    let found = values.get(name).and_then(Value::as_str).and_then(template);
+    if found.is_none() {
+        let value = values.get(name).map_or_else(String::new, render);
+        walk.report(
+            format!(
+                "{owner} has `runs-on: ${{{{ parameters.{name} }}}}`, which is `{value}` for `{}` and names no runner template; use one of {}",
+                matrix_id(id, combo),
+                template_labels().join(", ")
+            ),
+            errors,
+        );
+    }
+    found
+}
+
+/// Finds the template of a job that names one, through `executor` or a
+/// `runs-on` label.
 fn resolve_template(
     config: &Config,
     owner: &str,
