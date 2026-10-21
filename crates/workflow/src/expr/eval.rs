@@ -4,12 +4,15 @@
 
 //! Walks an expression tree against a context, with GitHub's loose typing.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
+use std::fmt;
 
-use serde_json::{Number, Value};
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value};
 
 use super::parser::{Expr, Op, Step};
-use super::{CONTEXTS, ExprError, Functions, JobStatus, MAX_STRING};
+use super::{CONTEXTS, ExprError, Functions, JobStatus, MAX_MEMORY, MAX_STRING};
 
 /// Whether `v` counts as true in a condition: everything but `null`,
 /// `false`, `0`, `NaN` and the empty string.
@@ -85,6 +88,40 @@ fn fits(len: usize, name: &str, offset: usize) -> Result<(), ExprError> {
         ));
     }
     Ok(())
+}
+
+/// The bytes one `evaluate` or `interpolate` call has spent on the
+/// strings it made and the values `fromJSON` parsed. Every such
+/// allocation is charged before it is made, and nothing is given back.
+pub(crate) struct Budget {
+    used: Cell<usize>,
+    over: Cell<bool>,
+}
+
+impl Budget {
+    pub(crate) fn new() -> Self {
+        Self {
+            used: Cell::new(0),
+            over: Cell::new(false),
+        }
+    }
+
+    /// Takes `bytes` from the budget, or fails with an error at `offset`
+    /// that names `what` and the limit.
+    pub(crate) fn charge(&self, bytes: usize, what: &str, offset: usize) -> Result<(), ExprError> {
+        let used = self.used.get().saturating_add(bytes);
+        if used > MAX_MEMORY {
+            self.over.set(true);
+            return Err(ExprError::new(
+                format!(
+                    "{what} would take the expression past its memory limit of {MAX_MEMORY} bytes"
+                ),
+                offset,
+            ));
+        }
+        self.used.set(used);
+        Ok(())
+    }
 }
 
 /// Counts bytes written to it and fails past [`MAX_STRING`], so a value
@@ -278,6 +315,7 @@ pub(crate) fn visit_contexts(
 pub(crate) struct Evaluator<'a> {
     pub ctx: &'a Value,
     pub funcs: &'a dyn Functions,
+    pub budget: &'a Budget,
 }
 
 impl Evaluator<'_> {
@@ -377,11 +415,13 @@ impl Evaluator<'_> {
             }),
             "startswith" => Value::Bool(fold(&string(0)).starts_with(&fold(&string(1)))),
             "endswith" => Value::Bool(fold(&string(0)).ends_with(&fold(&string(1)))),
-            "format" => Value::String(format(&string(0), &args[1..], offset)?),
-            "join" => Value::String(join(args, offset)?),
-            "tojson" => Value::String(to_json(&args[0], offset)?),
-            "fromjson" => serde_json::from_str(&string(0))
-                .map_err(|e| ExprError::new(format!("fromJSON: {e}"), offset))?,
+            "format" => {
+                let fmt = string(0);
+                Value::String(format(&fmt, &args[1..], offset, self.budget)?)
+            }
+            "join" => Value::String(join(args, offset, self.budget)?),
+            "tojson" => Value::String(to_json(&args[0], offset, self.budget)?),
+            "fromjson" => with_text(&args[0], |t| from_json(t, offset, self.budget))?,
             "hashfiles" => {
                 let patterns: Vec<String> = args.iter().map(to_string).collect();
                 let hash = self
@@ -402,9 +442,11 @@ impl Evaluator<'_> {
 
 /// `join(array, sep)`: the items as text with `sep` (`,` by default)
 /// between them. Anything but an array is returned as text.
-fn join(args: &[Value], offset: usize) -> Result<String, ExprError> {
+fn join(args: &[Value], offset: usize, budget: &Budget) -> Result<String, ExprError> {
     let Value::Array(items) = &args[0] else {
-        fits(text_len(&args[0]), "join", offset)?;
+        let len = text_len(&args[0]);
+        fits(len, "join", offset)?;
+        budget.charge(len, "join()", offset)?;
         return Ok(to_string(&args[0]));
     };
     let sep = args.get(1).map_or_else(|| ",".to_owned(), to_string);
@@ -414,6 +456,7 @@ fn join(args: &[Value], offset: usize) -> Result<String, ExprError> {
         .fold(0usize, usize::saturating_add)
         .saturating_add(sep.len().saturating_mul(items.len().saturating_sub(1)));
     fits(len, "join", offset)?;
+    budget.charge(len, "join()", offset)?;
     let mut out = String::with_capacity(len);
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
@@ -425,23 +468,25 @@ fn join(args: &[Value], offset: usize) -> Result<String, ExprError> {
 }
 
 /// `toJSON(value)`: the value as indented JSON.
-fn to_json(value: &Value, offset: usize) -> Result<String, ExprError> {
+fn to_json(value: &Value, offset: usize, budget: &Budget) -> Result<String, ExprError> {
     let mut count = Counter(0);
     if serde_json::to_writer_pretty(&mut count, value).is_err() {
         fits(count.0, "toJSON", offset)?;
     }
+    budget.charge(count.0, "toJSON()", offset)?;
     serde_json::to_string_pretty(value).map_err(|e| ExprError::new(format!("toJSON: {e}"), offset))
 }
 
 /// `format(fmt, args...)`: `{N}` takes argument N, `{{` and `}}` are
 /// literal braces. The length is worked out first, then the string is
 /// made.
-fn format(fmt: &str, args: &[Value], offset: usize) -> Result<String, ExprError> {
+fn format(fmt: &str, args: &[Value], offset: usize, budget: &Budget) -> Result<String, ExprError> {
     let mut len = 0usize;
     format_parts(fmt, args, offset, &mut |part| {
         len = len.saturating_add(part.len());
     })?;
     fits(len, "format", offset)?;
+    budget.charge(len, "format()", offset)?;
     let mut out = String::with_capacity(len);
     format_parts(fmt, args, offset, &mut |part| out.push_str(part))?;
     Ok(out)
@@ -496,4 +541,113 @@ fn format_parts(
         }
     }
     Ok(())
+}
+
+/// `fromJSON(text)`: parses `text`, charging each value to `budget` as
+/// it is built, so a large document fails before it is all in memory.
+fn from_json(text: &str, offset: usize, budget: &Budget) -> Result<Value, ExprError> {
+    let mut de = serde_json::Deserializer::from_str(text);
+    let parsed = Parse { budget, offset }
+        .deserialize(&mut de)
+        .and_then(|v| de.end().map(|()| v));
+    parsed.map_err(|e| {
+        if budget.over.get() {
+            ExprError::new(
+                format!("fromJSON() would take the expression past its memory limit of {MAX_MEMORY} bytes"),
+                offset,
+            )
+        } else {
+            ExprError::new(format!("fromJSON: {e}"), offset)
+        }
+    })
+}
+
+/// Builds a [`Value`] the way `serde_json` does, charging every node
+/// (`size_of::<Value>()`) and every string and key byte first.
+#[derive(Clone, Copy)]
+struct Parse<'b> {
+    budget: &'b Budget,
+    offset: usize,
+}
+
+impl Parse<'_> {
+    fn charge<E: de::Error>(self, bytes: usize) -> Result<(), E> {
+        self.budget
+            .charge(bytes, "fromJSON()", self.offset)
+            .map_err(|e| E::custom(e.message))
+    }
+
+    fn node<E: de::Error>(self, v: Value) -> Result<Value, E> {
+        self.charge(std::mem::size_of::<Value>())?;
+        Ok(v)
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for Parse<'_> {
+    type Value = Value;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Parse<'_> {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Value, E> {
+        self.node(Value::Bool(v))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> {
+        self.node(Value::Number(v.into()))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
+        self.node(Value::Number(v.into()))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Value, E> {
+        self.node(Number::from_f64(v).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
+        self.charge(std::mem::size_of::<Value>().saturating_add(v.len()))?;
+        Ok(Value::String(v.to_owned()))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        self.node(Value::Null)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Value, E> {
+        self.node(Value::Null)
+    }
+
+    fn visit_some<D: de::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        self.deserialize(d)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        self.charge(std::mem::size_of::<Value>())?;
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element_seed(self)? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        self.charge(std::mem::size_of::<Value>())?;
+        let mut out = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            self.charge(std::mem::size_of::<String>().saturating_add(key.len()))?;
+            let value = map.next_value_seed(self)?;
+            out.insert(key, value);
+        }
+        Ok(out.into())
+    }
 }

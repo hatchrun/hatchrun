@@ -484,6 +484,61 @@ fn produced_strings_are_capped_at_one_mib() {
     assert_eq!(err.offset, 14);
 }
 
+/// A format chain of `'0,'` repeated `4^levels` times, wrapped in
+/// `[ ... 0]`: a JSON array of `4^levels + 1` zeros, as text.
+fn zeros(levels: usize) -> String {
+    let mut x = "'0,'".to_owned();
+    for _ in 0..levels {
+        x = format!("format('{{0}}{{0}}{{0}}{{0}}', {x})");
+    }
+    format!("format('[{{0}}0]', {x})")
+}
+
+#[test]
+fn from_json_is_charged_to_one_budget_per_call() {
+    // 512 KiB of text is 256 Ki zeros, 8 MiB and more as values: the
+    // first `fromJSON` fails before the array is all built.
+    let x = zeros(9);
+    assert!(x.len() < 256, "{}", x.len());
+    let args = vec![format!("fromJSON({x})"); 14].join(", ");
+    let e = format!("format('a', {args})");
+    let err = evaluate(&e, &json!({}), &NoFiles).unwrap_err();
+    assert!(err.message.contains("fromJSON()"), "{}", err.message);
+    assert!(err.message.contains("8388608"), "{}", err.message);
+    assert_eq!(err.offset, "format('a', ".len());
+
+    // 16 Ki zeros (512 KiB as values) fit alone, and two of them, but
+    // every argument of a call and every call share the budget.
+    let x = zeros(7);
+    let one = format!("fromJSON({x})[0]");
+    assert_eq!(evaluate(&one, &json!({}), &NoFiles).unwrap(), json!(0));
+    let calls = |n: usize| {
+        let args = vec![format!("fromJSON({x})"); n].join(", ");
+        format!("format('{{0}}', {args})")
+    };
+    assert_eq!(
+        evaluate(&calls(2), &json!({}), &NoFiles).unwrap(),
+        json!("Array")
+    );
+    let err = evaluate(&calls(16), &json!({}), &NoFiles).unwrap_err();
+    assert!(err.message.contains("memory limit"), "{}", err.message);
+
+    // One `interpolate` shares the budget across its expressions.
+    let one = format!("${{{{ {one} }}}}");
+    assert_eq!(interpolate(&one, &json!({}), &NoFiles).unwrap(), "0");
+    let err = interpolate(&one.repeat(16), &json!({}), &NoFiles).unwrap_err();
+    assert!(err.message.contains("8388608"), "{}", err.message);
+    assert!(err.offset > 0);
+
+    // Strings count too: a 1 MiB string made by doubling spends 2 MiB,
+    // so the fifth one is over.
+    let mib = blowup(16, 2);
+    let e = format!("format('{{0}}', {})", vec![mib; 5].join(", "));
+    let err = evaluate(&e, &json!({}), &NoFiles).unwrap_err();
+    assert!(err.message.contains("format()"), "{}", err.message);
+    assert!(err.message.contains("8388608"), "{}", err.message);
+}
+
 #[test]
 fn check_parses_without_evaluating() {
     for ok in [

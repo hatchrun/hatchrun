@@ -43,6 +43,13 @@ const MAX_LEN: usize = 4096;
 /// worked out before the string is made.
 pub const MAX_STRING: usize = 1 << 20;
 
+/// The most memory, in bytes, one [`evaluate`] or [`interpolate`] call
+/// may spend on the strings it makes and the values `fromJSON` parses,
+/// across all of its expressions and calls. Each value is charged
+/// before it is made: a string by its length, a parsed value by
+/// `size_of::<Value>()` per node plus its string and key bytes.
+pub const MAX_MEMORY: usize = 8 << 20;
+
 /// An expression that does not parse or fails to evaluate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExprError {
@@ -108,10 +115,21 @@ pub trait Functions {
 /// # Errors
 ///
 /// When the expression is too long or too deep, does not parse, names an unknown context or
-/// function, or a function fails. The offset is relative to `expr`.
+/// function, a function fails, or it would use more than [`MAX_MEMORY`].
+/// The offset is relative to `expr`.
 pub fn evaluate(expr: &str, ctx: &Value, funcs: &dyn Functions) -> Result<Value, ExprError> {
+    evaluate_in(expr, ctx, funcs, &eval::Budget::new())
+}
+
+/// Evaluates one expression, charging what it makes to `budget`.
+fn evaluate_in(
+    expr: &str,
+    ctx: &Value,
+    funcs: &dyn Functions,
+    budget: &eval::Budget,
+) -> Result<Value, ExprError> {
     let ast = tree(expr)?;
-    eval::Evaluator { ctx, funcs }.eval(&ast)
+    eval::Evaluator { ctx, funcs, budget }.eval(&ast)
 }
 
 /// Checks one expression without evaluating it: it must parse, call
@@ -186,14 +204,16 @@ pub(crate) fn expressions(template: &str) -> Result<Vec<(usize, &str)>, ExprErro
 ///
 /// # Errors
 ///
-/// When a `${{` has no closing `}}`, an expression fails, or the result
-/// would be longer than [`MAX_STRING`]. The offset is relative to
-/// `template`.
+/// When a `${{` has no closing `}}`, an expression fails, the result
+/// would be longer than [`MAX_STRING`], or the expressions and the
+/// result together would use more than [`MAX_MEMORY`]. The offset is
+/// relative to `template`.
 pub fn interpolate(
     template: &str,
     ctx: &Value,
     funcs: &dyn Functions,
 ) -> Result<String, ExprError> {
+    let budget = eval::Budget::new();
     let mut out = String::with_capacity(template.len());
     let mut rest = 0;
     while let Some(found) = template[rest..].find("${{") {
@@ -201,10 +221,11 @@ pub fn interpolate(
         let start = open + 3;
         let end = closing(template, start)
             .ok_or_else(|| ExprError::new("'${{' has no closing '}}'", open))?;
-        let value = evaluate(&template[start..end], ctx, funcs).map_err(|e| ExprError {
-            message: e.message,
-            offset: e.offset + start,
-        })?;
+        let value =
+            evaluate_in(&template[start..end], ctx, funcs, &budget).map_err(|e| ExprError {
+                message: e.message,
+                offset: e.offset + start,
+            })?;
         let text = match value {
             Value::String(s) => s,
             other => eval::to_string(&other),
@@ -216,6 +237,7 @@ pub fn interpolate(
                 open,
             ));
         }
+        budget.charge((open - rest) + text.len(), "interpolation", open)?;
         out.push_str(&template[rest..open]);
         out.push_str(&text);
         rest = end + 2;
