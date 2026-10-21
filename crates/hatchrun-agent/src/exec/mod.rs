@@ -6,6 +6,7 @@
 //! machine, without GitHub's runner.
 
 pub mod commands;
+pub mod files;
 pub mod layout;
 pub mod lines;
 pub mod mask;
