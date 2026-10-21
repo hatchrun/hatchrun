@@ -284,7 +284,6 @@ jobs:
         "concurrency",
         "permissions",
         "environment",
-        "defaults",
         "include",
         "exclude",
         "fail-fast",
@@ -295,7 +294,7 @@ jobs:
             out.warnings
         );
     }
-    for key in ["permissions", "concurrency", "defaults"] {
+    for key in ["permissions", "concurrency"] {
         assert!(
             out.warnings.iter().any(|w| w.message.contains("ci.yml")
                 && !w.message.contains("build")
@@ -834,4 +833,78 @@ jobs:
         assert!(has(&out.errors, words), "{os}: {:?}", out.errors);
         assert!(!out.config.jobs.contains_key("ci-test"));
     }
+}
+
+#[test]
+fn defaults_run_applies_to_run_steps() {
+    let out = ok("
+on: push
+defaults:
+  run:
+    shell: bash
+    working-directory: app
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - run: npm test
+      - run: make
+        shell: sh
+        working-directory: .
+      - uses: actions/checkout@v5
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: lint
+");
+    assert_eq!(out.warnings, Vec::new());
+    let shape = |job: &str, i: usize| {
+        let Step::Run(run) = &out.config.jobs[job].steps[i] else {
+            panic!("{job} step {i} is not a run step");
+        };
+        (run.shell.clone(), run.working_directory.clone())
+    };
+    let some = |s: &str| Some(s.to_owned());
+    assert_eq!(shape("ci-build", 0), (some("bash"), some("web")));
+    assert_eq!(shape("ci-build", 1), (some("sh"), some(".")));
+    assert_eq!(shape("ci-lint", 0), (some("bash"), some("app")));
+    round_trips(&out);
+}
+
+#[test]
+fn other_defaults_are_dropped_with_a_warning() {
+    let out = ok("
+on: push
+defaults:
+  run:
+    shell: bash
+    locale: C
+  other: 1
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults: [bash]
+    steps:
+      - run: make
+");
+    assert!(has(
+        &out.warnings,
+        &["ci.yml", "`defaults.run.locale`", "dropped"]
+    ));
+    assert!(has(
+        &out.warnings,
+        &["ci.yml", "`defaults.other`", "dropped"]
+    ));
+    assert!(has(
+        &out.warnings,
+        &["job `build`", "`defaults`", "dropped"]
+    ));
+    let Step::Run(run) = &out.config.jobs["ci-build"].steps[0] else {
+        panic!("not a run step");
+    };
+    assert_eq!(run.shell.as_deref(), Some("bash"));
+    round_trips(&out);
 }

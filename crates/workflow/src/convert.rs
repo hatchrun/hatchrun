@@ -325,7 +325,6 @@ impl Cx {
             ("run-name", gh.run_name.is_some()),
             ("permissions", gh.permissions.is_some()),
             ("concurrency", gh.concurrency.is_some()),
-            ("defaults", gh.defaults.is_some()),
         ] {
             if set {
                 self.warn(format!(
@@ -338,6 +337,7 @@ impl Cx {
         }
         let on = self.triggers(file, &gh.on);
         let shared_env = self.env(&format!("`{file}`"), "env", gh.env.as_ref());
+        let shared_defaults = self.defaults(&format!("`{file}`"), gh.defaults.as_ref());
 
         let ids: BTreeSet<String> = gh.jobs.0.iter().map(|(id, _)| id.clone()).collect();
         // Jobs left out, with what happened to each, worded to follow
@@ -373,6 +373,7 @@ impl Cx {
                 failed = true;
                 continue;
             };
+            shared_defaults.apply(&mut converted.steps);
             for (name, value) in &shared_env {
                 converted
                     .env
@@ -571,7 +572,6 @@ impl Cx {
             ("concurrency", gh.concurrency.is_some(), ""),
             ("permissions", gh.permissions.is_some(), ""),
             ("environment", gh.environment.is_some(), ""),
-            ("defaults", gh.defaults.is_some(), ""),
             ("continue-on-error", gh.continue_on_error.is_some(), ""),
         ] {
             if set {
@@ -607,7 +607,8 @@ impl Cx {
         let timeout_minutes = self.minutes(at, "timeout-minutes", gh.timeout_minutes.as_ref());
         let outputs = self.env(at, "outputs", gh.outputs.as_ref());
         let env = self.env(at, "env", gh.env.as_ref());
-        let steps: Vec<Step> = gh
+        let defaults = self.defaults(at, gh.defaults.as_ref());
+        let mut steps: Vec<Step> = gh
             .steps
             .unwrap_or_default()
             .into_iter()
@@ -617,6 +618,7 @@ impl Cx {
         if self.errors.len() > before {
             return None;
         }
+        defaults.apply(&mut steps);
         let job = Job {
             runs_on,
             env,
@@ -772,6 +774,50 @@ impl Cx {
         matrix
     }
 
+    /// Reads `defaults`, keeping `run.shell` and `run.working-directory`
+    /// and dropping the rest with a warning.
+    fn defaults(&mut self, at: &str, value: Option<&Value>) -> RunDefaults {
+        let mut defaults = RunDefaults::default();
+        let Some(value) = value else {
+            return defaults;
+        };
+        let Value::Object(map) = value else {
+            self.warn(format!("{at}: `defaults` is not a map and was dropped"));
+            return defaults;
+        };
+        for (key, value) in map {
+            if key != "run" {
+                self.warn(format!(
+                    "{at}: `defaults.{key}` is not supported and was dropped"
+                ));
+                continue;
+            }
+            let Value::Object(run) = value else {
+                self.warn(format!("{at}: `defaults.run` is not a map and was dropped"));
+                continue;
+            };
+            for (key, value) in run {
+                let slot = match key.as_str() {
+                    "shell" => &mut defaults.shell,
+                    "working-directory" => &mut defaults.working_directory,
+                    _ => {
+                        self.warn(format!(
+                            "{at}: `defaults.run.{key}` is not supported and was dropped"
+                        ));
+                        continue;
+                    }
+                };
+                match scalar(value) {
+                    Some(text) => *slot = Some(text),
+                    None => self.warn(format!(
+                        "{at}: `defaults.run.{key}` is not a string and was dropped"
+                    )),
+                }
+            }
+        }
+        defaults
+    }
+
     /// Reads a whole number of minutes, dropping an expression.
     fn minutes(&mut self, at: &str, key: &str, value: Option<&Value>) -> Option<u32> {
         let value = value?;
@@ -895,6 +941,30 @@ impl Cx {
             (None, None) => {
                 self.error(format!("{at} has neither `run` nor `uses`"));
                 None
+            }
+        }
+    }
+}
+
+/// `defaults.run` of a workflow or job: what its run steps get when they
+/// set no shell or working directory of their own.
+#[derive(Default)]
+struct RunDefaults {
+    shell: Option<String>,
+    working_directory: Option<String>,
+}
+
+impl RunDefaults {
+    /// Fills in what each run step leaves unset.
+    fn apply(&self, steps: &mut [Step]) {
+        for step in steps {
+            if let Step::Run(run) = step {
+                if run.shell.is_none() {
+                    run.shell.clone_from(&self.shell);
+                }
+                if run.working_directory.is_none() {
+                    run.working_directory.clone_from(&self.working_directory);
+                }
             }
         }
     }
