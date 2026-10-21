@@ -29,8 +29,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use hatchrun_workflow::{
-    Arch, Config, Event, ExprError, Functions, JobKind, JobStatus, ParameterKind, Plan, PlannedJob,
-    PlannedStep, Workflow, compile, interpolate, parse, to_yaml, triggered,
+    Arch, Config, Event, ExprError, Functions, HATCHRUN_KEYS, JobKind, JobStatus, ParameterKind,
+    Plan, PlannedJob, PlannedStep, Submodules, Workflow, compile, interpolate, parse, to_yaml,
+    triggered,
 };
 use serde_json::{Map, Value, json};
 
@@ -95,7 +96,9 @@ struct Delivery {
 }
 
 /// The deliveries the scenarios are played against. A schedule is
-/// delivered once per cron any workflow of the config lists.
+/// delivered once per cron any workflow of the config lists, a finished
+/// run once per workflow any `workflow_run` names, and a release only
+/// when a workflow runs on one.
 fn deliveries(config: &Config) -> Vec<Delivery> {
     let dir = fixtures().join("events");
     let mut out = Vec::new();
@@ -132,6 +135,28 @@ fn deliveries(config: &Config) -> Vec<Delivery> {
         event: "workflow_dispatch",
         payload: read_json(&dir.join("workflow_dispatch.json")),
     });
+    let finished: BTreeSet<&str> = config
+        .workflows
+        .values()
+        .filter_map(|wf| wf.on.workflow_run.as_ref())
+        .flat_map(|run| run.workflows.iter().map(String::as_str))
+        .collect();
+    for workflow in finished {
+        let mut payload = read_json(&dir.join("workflow_run-completed.json"));
+        payload["workflow"] = json!(workflow);
+        out.push(Delivery {
+            label: format!("workflow_run '{workflow}'"),
+            event: "workflow_run",
+            payload,
+        });
+    }
+    if config.workflows.values().any(|wf| wf.on.release.is_some()) {
+        out.push(Delivery {
+            label: "release-published".to_owned(),
+            event: "release",
+            payload: read_json(&dir.join("release-published.json")),
+        });
+    }
     out
 }
 
@@ -173,6 +198,15 @@ fn trigger_event(d: &Delivery) -> Event {
         "schedule" => Event::Schedule {
             cron: text(&d.payload["schedule"]).to_owned(),
         },
+        "workflow_run" => Event::WorkflowRun {
+            action: text(&d.payload["action"]).to_owned(),
+            workflow: text(&d.payload["workflow"]).to_owned(),
+            branch: text(&d.payload["workflow_run"]["head_branch"]).to_owned(),
+        },
+        "release" => Event::Release {
+            action: text(&d.payload["action"]).to_owned(),
+            tag: text(&d.payload["release"]["tag_name"]).to_owned(),
+        },
         _ => Event::Dispatch,
     }
 }
@@ -185,6 +219,7 @@ fn compile_ref(d: &Delivery) -> String {
             "refs/heads/{}",
             text(&d.payload["pull_request"]["base"]["ref"])
         ),
+        "release" => format!("refs/tags/{}", text(&d.payload["release"]["tag_name"])),
         _ => format!(
             "refs/heads/{}",
             text(&d.payload["repository"]["default_branch"])
@@ -360,6 +395,27 @@ fn step_parts(step: &PlannedStep) -> (String, Option<&str>, Option<&str>) {
             uses.id.as_deref(),
             uses.if_.as_deref(),
         ),
+        PlannedStep::Checkout(checkout) => {
+            let mut label = "checkout".to_owned();
+            if let Some(r) = &checkout.r#ref {
+                write!(label, " ref={r}").unwrap();
+            }
+            if checkout.fetch_depth != 1 {
+                write!(label, " fetch-depth={}", checkout.fetch_depth).unwrap();
+            }
+            match checkout.submodules {
+                Submodules::None => {}
+                Submodules::Top => label.push_str(" submodules"),
+                Submodules::Recursive => label.push_str(" submodules=recursive"),
+            }
+            if checkout.lfs {
+                label.push_str(" lfs");
+            }
+            if let Some(path) = &checkout.path {
+                write!(label, " path={path}").unwrap();
+            }
+            (label, None, None)
+        }
         other => (format!("{other:?}"), None, None),
     }
 }
@@ -538,8 +594,16 @@ fn play(config: &Config, d: &Delivery, outputs: &Value, out: &mut String) {
         assert_eq!(plan.workflow, *name);
         writeln!(out, "  {name}: triggered").unwrap();
         let inputs = inputs(d, wf);
+        let github = github(d, name, &inputs);
+        // The host-neutral context, which the GitHub adapter fills from
+        // the same values.
+        let hatchrun: Map<String, Value> = HATCHRUN_KEYS
+            .iter()
+            .map(|k| ((*k).to_owned(), github[*k].clone()))
+            .collect();
         let base = json!({
-            "github": github(d, name, &inputs),
+            "hatchrun": hatchrun,
+            "github": github,
             "vars": vars(),
             "inputs": inputs,
         });
@@ -751,6 +815,11 @@ fn nightly_schedule() {
 #[test]
 fn reusable_workflow_calls_drop_their_dependents() {
     scenario("reusable");
+}
+
+#[test]
+fn workflows_chained_by_workflow_run_and_a_release() {
+    scenario("chained");
 }
 
 /// A developer adds `parallelism` to a converted job: each matrix leg

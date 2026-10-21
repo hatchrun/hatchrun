@@ -17,14 +17,14 @@ pub mod templates;
 pub mod trigger;
 
 pub use config::{
-    CacheStep, Command, Config, Executor, Job, MAX_SOURCE, Parameter, ParameterKind, RunStep, Step,
-    UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
+    CacheStep, CheckoutStep, Command, Config, Executor, Job, MAX_SOURCE, Parameter, ParameterKind,
+    RunStep, Step, Submodules, UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
 };
 pub use convert::{Conversion, convert, to_yaml};
 pub use diagnostic::Diagnostic;
 pub use expr::{
-    ExprError, Functions, GITHUB_TOKEN, JobStatus, Needed, Needs, checks_status, condition,
-    evaluate, interpolate, truthy,
+    ExprError, Functions, GITHUB_TOKEN, HATCHRUN_KEYS, JobStatus, Needed, Needs, checks_status,
+    condition, evaluate, interpolate, truthy,
 };
 pub use plan::{
     JobKind, Plan, PlannedJob, PlannedStep, compile, job_needs, validate, workflow_needs,
@@ -33,5 +33,6 @@ pub use split::split;
 pub use templates::{Arch, TEMPLATES, Template, template, template_labels};
 pub use trigger::{
     Dispatch, Event, Filter, MAX_CHANGED, MAX_GLOBS, MAX_PATTERNS, PullRequestTrigger, PushTrigger,
-    Schedule, Triggers, triggered,
+    RELEASE_TYPES, ReleaseTrigger, Schedule, Triggers, WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
+    triggered,
 };

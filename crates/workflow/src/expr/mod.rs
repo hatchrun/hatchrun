@@ -23,7 +23,13 @@ pub use eval::truthy;
 
 /// Context names an expression may read even when the context object
 /// leaves them out. Any other name must be a key of the context object.
+///
+/// `hatchrun` holds the [`HATCHRUN_KEYS`] and reads the same on every
+/// host: each host adapter fills it from its own event. The GitHub and
+/// Forgejo adapters also fill `github`, so converted workflows keep
+/// working.
 pub(crate) const CONTEXTS: &[&str] = &[
+    "hatchrun",
     "github",
     "env",
     "matrix",
@@ -35,6 +41,21 @@ pub(crate) const CONTEXTS: &[&str] = &[
     "job",
     "vars",
     "inputs",
+];
+
+/// The keys of the `hatchrun` context, as GitHub names them in `github`:
+/// the full ref, its short name, the commit, who caused the event, the
+/// event's name, the repository as `owner/name`, the host's base URL
+/// and the workflow's key.
+pub const HATCHRUN_KEYS: &[&str] = &[
+    "ref",
+    "ref_name",
+    "sha",
+    "actor",
+    "event_name",
+    "repository",
+    "server_url",
+    "workflow",
 ];
 
 /// The longest expression, in bytes, that [`evaluate`] accepts.

@@ -300,9 +300,10 @@ impl From<JobDe> for Job {
 /// One step of a job or a command.
 ///
 /// In YAML a bare string (`- setup`) or a map with one key that names a
-/// command (`- setup: { version: 2 }`) is a [`Step::Command`]. The other
-/// kinds are maps keyed by `run`, `uses`, `cache`, `workspace` or
-/// `test-results`.
+/// command (`- setup: { version: 2 }`) is a [`Step::Command`], except
+/// `- checkout`, which is a [`Step::Checkout`] with no options. The
+/// other kinds are maps keyed by `run`, `uses`, `checkout`, `cache`,
+/// `workspace` or `test-results`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     /// A shell command.
@@ -316,6 +317,8 @@ pub enum Step {
         /// Parameter values.
         with: BTreeMap<String, Value>,
     },
+    /// Check out the repository at the event's commit.
+    Checkout(CheckoutStep),
     /// Restore a cache now, save it when the job ends.
     Cache(CacheStep),
     /// Pass files to later jobs of the workflow.
@@ -325,6 +328,98 @@ pub enum Step {
         /// A file or directory of `JUnit` XML.
         path: String,
     },
+}
+
+/// A `checkout:` step. The host adapter gives the agent the clone URL
+/// and a token for the repository the event came from; no other
+/// repository can be checked out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct CheckoutStep {
+    /// The branch, tag or commit to check out; the event's commit when
+    /// absent.
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
+    /// How many commits of history to fetch; 0 fetches all of it.
+    #[serde(skip_serializing_if = "is_one")]
+    pub fetch_depth: u32,
+    /// Which submodules to check out too.
+    #[serde(skip_serializing_if = "Submodules::is_none")]
+    pub submodules: Submodules,
+    /// Download LFS files.
+    #[serde(skip_serializing_if = "is_false")]
+    pub lfs: bool,
+    /// Where to check out, relative to the job's working directory; the
+    /// working directory itself when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl Default for CheckoutStep {
+    fn default() -> Self {
+        Self {
+            r#ref: None,
+            fetch_depth: 1,
+            submodules: Submodules::None,
+            lfs: false,
+            path: None,
+        }
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_one(value: &u32) -> bool {
+    *value == 1
+}
+
+/// The `submodules` option of a checkout step: `false`, `true` or
+/// `recursive`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Submodules {
+    /// None of them.
+    #[default]
+    None,
+    /// The repository's own submodules.
+    Top,
+    /// Submodules and theirs, all the way down.
+    Recursive,
+}
+
+impl Submodules {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_none(&self) -> bool {
+        *self == Submodules::None
+    }
+}
+
+impl<'de> Deserialize<'de> for Submodules {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Text(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Bool(false) => Ok(Submodules::None),
+            Raw::Bool(true) => Ok(Submodules::Top),
+            Raw::Text(text) if text == "recursive" => Ok(Submodules::Recursive),
+            Raw::Text(text) => Err(de::Error::invalid_value(
+                de::Unexpected::Str(&text),
+                &"true, false or recursive",
+            )),
+        }
+    }
+}
+
+impl Serialize for Submodules {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Submodules::None => serializer.serialize_bool(false),
+            Submodules::Top => serializer.serialize_bool(true),
+            Submodules::Recursive => serializer.serialize_str("recursive"),
+        }
+    }
 }
 
 /// A `run:` step.
@@ -438,6 +533,7 @@ struct StepFields {
     if_: Option<String>,
     continue_on_error: Option<bool>,
     timeout_minutes: Option<u32>,
+    checkout: Option<CheckoutStep>,
     cache: Option<CacheStep>,
     workspace: Option<WorkspaceStep>,
     test_results: Option<String>,
@@ -457,6 +553,10 @@ impl StepFields {
                 format!("unknown step key `{name}`; a command step is a map with one key")
             })?;
             return Ok(Step::Command { name, with });
+        }
+        if let Some(checkout) = self.checkout {
+            only("checkout")?;
+            return Ok(Step::Checkout(checkout));
         }
         if let Some(cache) = self.cache {
             only("cache")?;
@@ -509,7 +609,8 @@ impl StepFields {
                 }))
             }
             (None, None) => Err(
-                "a step needs run, uses, cache, workspace, test-results or a command name".into(),
+                "a step needs run, uses, checkout, cache, workspace, test-results or a command name"
+                    .into(),
             ),
         }
     }
@@ -527,6 +628,9 @@ impl<'de> Deserialize<'de> for Step {
             }
 
             fn visit_str<E: de::Error>(self, name: &str) -> Result<Step, E> {
+                if name == "checkout" {
+                    return Ok(Step::Checkout(CheckoutStep::default()));
+                }
                 Ok(Step::Command {
                     name: name.to_owned(),
                     with: BTreeMap::new(),
@@ -551,6 +655,10 @@ impl<'de> Deserialize<'de> for Step {
                         "if" => f.if_ = Some(map.next_value()?),
                         "continue-on-error" => f.continue_on_error = Some(map.next_value()?),
                         "timeout-minutes" => f.timeout_minutes = Some(map.next_value()?),
+                        "checkout" => {
+                            let checkout: Option<CheckoutStep> = map.next_value()?;
+                            f.checkout = Some(checkout.unwrap_or_default());
+                        }
                         "cache" => f.cache = Some(map.next_value()?),
                         "workspace" => f.workspace = Some(map.next_value()?),
                         "test-results" => f.test_results = Some(map.next_value()?),
@@ -576,6 +684,10 @@ impl Serialize for Step {
             Step::Uses(step) => step.serialize(serializer),
             Step::Command { name, with } if with.is_empty() => serializer.serialize_str(name),
             Step::Command { name, with } => single_entry(serializer, name, with),
+            Step::Checkout(checkout) if *checkout == CheckoutStep::default() => {
+                serializer.serialize_str("checkout")
+            }
+            Step::Checkout(checkout) => single_entry(serializer, "checkout", checkout),
             Step::Cache(cache) => single_entry(serializer, "cache", cache),
             Step::Workspace(workspace) => single_entry(serializer, "workspace", workspace),
             Step::TestResults { path } => single_entry(serializer, "test-results", path),

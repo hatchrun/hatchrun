@@ -11,7 +11,7 @@ validate: exit 0
 event push-main (compile refs/heads/main)
   api: triggered
     job test on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step run: cargo test (in services/api)
       step run: ./scripts/check-openapi.sh services/api/openapi.yaml (in .)
   docs: not triggered
@@ -21,7 +21,7 @@ event push-feature (compile refs/heads/feature/login)
   docs: not triggered
   web: triggered
     job build on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step run: npm ci && npm run build (in web)
 event push-tag (compile refs/tags/v1.4.0)
   api: not triggered
@@ -32,7 +32,7 @@ event pull_request-opened (compile refs/heads/main)
   docs: triggered
     job preview on ubuntu-latest: ok=run fail=run
       if github.event.action != 'closed'
-      step actions/checkout@v5
+      step checkout
       step run: mdbook build docs
       step Publish the preview if github.event_name == 'pull_request': ok=run/skip fail=run/skip
     job cleanup on ubuntu-latest: ok=skip fail=skip
@@ -40,14 +40,14 @@ event pull_request-opened (compile refs/heads/main)
       step run: ./scripts/preview.sh --delete ${{ github.event.number }}
   web: triggered
     job build on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step run: npm ci && npm run build (in web)
 event pull_request-synchronize (compile refs/heads/main)
   api: not triggered
   docs: triggered
     job preview on ubuntu-latest: ok=run fail=run
       if github.event.action != 'closed'
-      step actions/checkout@v5
+      step checkout
       step run: mdbook build docs
       step Publish the preview if github.event_name == 'pull_request': ok=run/skip fail=run/skip
     job cleanup on ubuntu-latest: ok=skip fail=skip
@@ -55,14 +55,14 @@ event pull_request-synchronize (compile refs/heads/main)
       step run: ./scripts/preview.sh --delete ${{ github.event.number }}
   web: triggered
     job build on ubuntu-latest: ok=run fail=run
-      step actions/checkout@v5
+      step checkout
       step run: npm ci && npm run build (in web)
 event pull_request-closed (compile refs/heads/main)
   api: not triggered
   docs: triggered
     job preview on ubuntu-latest: ok=skip fail=skip
       if github.event.action != 'closed'
-      step actions/checkout@v5
+      step checkout
       step run: mdbook build docs
       step Publish the preview if github.event_name == 'pull_request': never reached
     job cleanup on ubuntu-latest: ok=run fail=run

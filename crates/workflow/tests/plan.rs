@@ -5,7 +5,8 @@
 //! Compiling a workflow into a job plan.
 
 use hatchrun_workflow::{
-    Diagnostic, JobKind, Plan, PlannedJob, PlannedStep, compile, parse, template, to_yaml, validate,
+    CheckoutStep, Diagnostic, JobKind, Plan, PlannedJob, PlannedStep, compile, parse, template,
+    to_yaml, validate,
 };
 
 const CYCLE: &str = "
@@ -1182,4 +1183,146 @@ jobs: { t: { runs-on: ubuntu-latest, parameters: { environment: { type: string }
 ",
         &["`t`", "`environment`", "rename"],
     );
+}
+
+/// A config with workflow `ci` and workflow `deploy`, whose `on:` is
+/// `on`.
+fn chained(on: &str) -> String {
+    format!(
+        "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs: [t]
+  deploy:
+    on: {on}
+    jobs: [t]
+"
+    )
+}
+
+#[test]
+fn workflow_run_names_another_workflow_of_the_config() {
+    assert_eq!(
+        errors(&chained("{ workflow_run: { workflows: [ci] } }")),
+        []
+    );
+    assert_error(
+        &chained("{ workflow_run: { workflows: [ci, nosuch] } }"),
+        &[
+            "workflow `deploy`",
+            "`on.workflow_run` names workflow `nosuch`",
+            "not defined",
+        ],
+    );
+    assert_error(
+        &chained("{ workflow_run: { workflows: [deploy] } }"),
+        &["workflow `deploy`", "names the workflow itself"],
+    );
+    assert_error(
+        &chained("{ workflow_run: { workflows: [] } }"),
+        &["`on.workflow_run` names no workflow"],
+    );
+    assert_error(
+        &chained("{ workflow_run: { workflows: [ci], types: [requested] } }"),
+        &[
+            "`on.workflow_run` type `requested` is not supported",
+            "completed",
+        ],
+    );
+    assert_error(
+        &chained("{ workflow_run: { workflows: [ci], branches: [a], branches-ignore: [b] } }"),
+        &["`on.workflow_run` has both `branches` and `branches-ignore`"],
+    );
+}
+
+#[test]
+fn release_types_and_tags_are_checked() {
+    assert_eq!(
+        errors(&chained(
+            "{ release: { types: [published, created, released, prereleased] } }"
+        )),
+        []
+    );
+    assert_error(
+        &chained("{ release: { types: [published, edited] } }"),
+        &["`on.release` type `edited` is not supported"],
+    );
+    assert_error(
+        &chained("{ release: { types: [] } }"),
+        &["`on.release.types` is empty"],
+    );
+    assert_error(
+        &chained("{ release: { tags: [a], tags-ignore: [b] } }"),
+        &["`on.release` has both `tags` and `tags-ignore`"],
+    );
+}
+
+#[test]
+fn checkout_steps_are_planned_and_checked() {
+    let config = "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    parameters: { at: { type: string, default: v1 } }
+    steps:
+      - checkout
+      - checkout: { ref: \"${{ parameters.at }}\", fetch-depth: 0, path: \"src/${{ parameters.at }}\" }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [t]
+";
+    assert_eq!(errors(config), []);
+    let plan = plan(config);
+    let steps = &plan.jobs[0].steps;
+    assert_eq!(steps[0], PlannedStep::Checkout(CheckoutStep::default()));
+    assert_eq!(
+        steps[1],
+        PlannedStep::Checkout(CheckoutStep {
+            r#ref: Some("v1".into()),
+            fetch_depth: 0,
+            path: Some("src/v1".into()),
+            ..CheckoutStep::default()
+        })
+    );
+    for (step, words) in [
+        (
+            "{ checkout: { ref: \"${{ nosuch.x }}\" } }",
+            &["step 1 `checkout.ref`", "unknown context 'nosuch'"][..],
+        ),
+        (
+            "{ checkout: { path: /etc } }",
+            &[
+                "step 1 `checkout.path` is `/etc`",
+                "inside the working directory",
+            ],
+        ),
+        (
+            "{ checkout: { path: a/../../b } }",
+            &["`checkout.path`", "inside the working directory"],
+        ),
+    ] {
+        assert_error(
+            &one_job(&format!("    runs-on: ubuntu-latest\n    steps: [{step}]")),
+            words,
+        );
+    }
+}
+
+#[test]
+fn a_command_cannot_be_named_checkout() {
+    assert_error(
+        "commands: { checkout: { steps: [] } }",
+        &["command `checkout` has the name of a step key"],
+    );
+}
+
+#[test]
+fn the_hatchrun_context_is_known() {
+    let ok = one_job(
+        "    runs-on: ubuntu-latest\n    if: hatchrun.event_name == 'push'\n    steps: [{ run: \"echo ${{ hatchrun.ref_name }} ${{ hatchrun.sha }}\" }]",
+    );
+    assert_eq!(errors(&ok), []);
 }

@@ -14,13 +14,15 @@ use std::fmt::{self, Write as _};
 use serde_json::Value;
 
 use crate::config::{
-    CacheStep, Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow,
-    WorkflowJob, WorkspaceStep,
+    CacheStep, CheckoutStep, Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep,
+    Workflow, WorkflowJob, WorkspaceStep,
 };
 use crate::diagnostic::Diagnostic;
 use crate::expr::{self, ExprError, Needs};
 use crate::templates::{Template, template, template_labels};
-use crate::trigger::{Filter, MAX_GLOBS, MAX_PATTERNS, Triggers};
+use crate::trigger::{
+    Filter, MAX_GLOBS, MAX_PATTERNS, RELEASE_TYPES, Triggers, WORKFLOW_RUN_TYPES,
+};
 
 /// The timeout of a job that sets none.
 pub const DEFAULT_TIMEOUT_MINUTES: u32 = 360;
@@ -74,6 +76,7 @@ const STEP_KEYS: &[&str] = &[
     "shell",
     "run",
     "uses",
+    "checkout",
     "cache",
     "workspace",
     "test-results",
@@ -159,6 +162,8 @@ pub enum PlannedStep {
     Run(RunStep),
     /// A GitHub action.
     Uses(UsesStep),
+    /// Check out the repository at the event's commit.
+    Checkout(CheckoutStep),
     /// Restore a cache now, save it when the job ends.
     Cache(CacheStep),
     /// Pass files to later jobs of the workflow.
@@ -176,8 +181,9 @@ pub enum PlannedStep {
 ///
 /// `git_ref` is the pushed ref for a push (`refs/heads/main`,
 /// `refs/tags/v1`), the base branch for a pull request
-/// (`refs/heads/<base>`), and the default branch for a schedule or the
-/// dispatched ref for a manual run.
+/// (`refs/heads/<base>`), the default branch for a schedule or a
+/// finished workflow run, the release's tag (`refs/tags/<tag>`) for a
+/// release, and the dispatched ref for a manual run.
 ///
 /// # Errors
 ///
@@ -323,6 +329,10 @@ impl<'a> NeedsReader<'a> {
                         self.steps(&command.steps);
                     }
                 }
+                Step::Checkout(checkout) => {
+                    let texts = [&checkout.r#ref, &checkout.path];
+                    texts.into_iter().flatten().for_each(|t| self.needs.read(t));
+                }
                 Step::Cache(cache) => {
                     self.needs.read(&cache.key);
                     let paths = cache.restore_keys.iter().chain(&cache.paths);
@@ -450,6 +460,22 @@ fn filter_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
                 &owner,
                 "on.pull_request.paths-ignore",
                 pr.paths_ignore.as_ref(),
+            );
+        }
+        if let Some(run) = &wf.on.workflow_run {
+            check(&owner, "on.workflow_run.branches", run.branches.as_ref());
+            check(
+                &owner,
+                "on.workflow_run.branches-ignore",
+                run.branches_ignore.as_ref(),
+            );
+        }
+        if let Some(release) = &wf.on.release {
+            check(&owner, "on.release.tags", release.tags.as_ref());
+            check(
+                &owner,
+                "on.release.tags-ignore",
+                release.tags_ignore.as_ref(),
             );
         }
         for entry in &wf.jobs {
@@ -617,6 +643,19 @@ impl Check<'_> {
                     self.env(i + 1, &uses.env);
                     if let Some(cond) = &uses.if_ {
                         self.cond(&at("if"), cond);
+                    }
+                }
+                Step::Checkout(checkout) => {
+                    self.opt(&at("checkout.ref"), checkout.r#ref.as_deref());
+                    if let Some(path) = &checkout.path {
+                        self.text(&at("checkout.path"), path);
+                        if path.starts_with('/') || path.split(['/', '\\']).any(|p| p == "..") {
+                            self.errors.push(Diagnostic::new(format!(
+                                "{} {} is `{path}`; it must stay inside the working directory",
+                                self.owner,
+                                at("checkout.path")
+                            )));
+                        }
                     }
                 }
                 Step::Cache(cache) => {
@@ -834,7 +873,7 @@ fn compile_workflow(
     errors: &mut Vec<Diagnostic>,
 ) -> Option<Plan> {
     let before = errors.len();
-    trigger_errors(name, &wf.on, errors);
+    trigger_errors(config, name, &wf.on, errors);
 
     let ids: Vec<String> = wf
         .jobs
@@ -981,9 +1020,10 @@ fn id_collisions(
 }
 
 /// Reports a trigger that has both an include and an ignore filter of
-/// one kind, which GitHub rejects, and a manual input whose default does
-/// not fit its type.
-fn trigger_errors(name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
+/// one kind, which GitHub rejects, a manual input whose default does
+/// not fit its type, an activity type hatchrun does not run on, and a
+/// `workflow_run` that names no other workflow of the config.
+fn trigger_errors(config: &Config, name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
     if let Some(dispatch) = &on.workflow_dispatch {
         for (input, param) in &dispatch.inputs {
             let Some(default) = &param.default else {
@@ -1036,6 +1076,67 @@ fn trigger_errors(name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
             pr.paths.as_ref(),
             pr.paths_ignore.as_ref(),
         );
+    }
+    if let Some(run) = &on.workflow_run {
+        both(
+            "workflow_run",
+            "branches",
+            run.branches.as_ref(),
+            run.branches_ignore.as_ref(),
+        );
+    }
+    if let Some(release) = &on.release {
+        both(
+            "release",
+            "tags",
+            release.tags.as_ref(),
+            release.tags_ignore.as_ref(),
+        );
+    }
+    if let Some(run) = &on.workflow_run {
+        types_errors(name, "workflow_run", &run.types, WORKFLOW_RUN_TYPES, errors);
+        if run.workflows.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "workflow `{name}`: `on.workflow_run` names no workflow"
+            )));
+        }
+        for other in &run.workflows {
+            if other == name {
+                errors.push(Diagnostic::new(format!(
+                    "workflow `{name}`: `on.workflow_run` names the workflow itself"
+                )));
+            } else if !config.workflows.contains_key(other) {
+                errors.push(Diagnostic::new(format!(
+                    "workflow `{name}`: `on.workflow_run` names workflow `{other}`, which is not defined in `workflows:`"
+                )));
+            }
+        }
+    }
+    if let Some(release) = &on.release {
+        types_errors(name, "release", &release.types, RELEASE_TYPES, errors);
+    }
+}
+
+/// Reports an empty `types` list and a type outside `known`.
+fn types_errors(
+    name: &str,
+    event: &str,
+    types: &[String],
+    known: &[&str],
+    errors: &mut Vec<Diagnostic>,
+) {
+    if types.is_empty() {
+        errors.push(Diagnostic::new(format!(
+            "workflow `{name}`: `on.{event}.types` is empty"
+        )));
+    }
+    for kind in types {
+        if !known.contains(&kind.as_str()) {
+            errors.push(Diagnostic::new(format!(
+                "workflow `{name}`: `on.{event}` type `{kind}` is not supported; use {}",
+                known.join(", ")
+            )));
+        }
     }
 }
 
@@ -1810,6 +1911,13 @@ fn plan_step(
             }
             PlannedStep::Uses(planned)
         }
+        Step::Checkout(checkout) => PlannedStep::Checkout(CheckoutStep {
+            r#ref: sub.opt(checkout.r#ref.as_deref()),
+            fetch_depth: checkout.fetch_depth,
+            submodules: checkout.submodules,
+            lfs: checkout.lfs,
+            path: sub.opt(checkout.path.as_deref()),
+        }),
         Step::Cache(cache) => PlannedStep::Cache(CacheStep {
             key: sub.text(&cache.key),
             restore_keys: sub.list(&cache.restore_keys),
@@ -2164,6 +2272,7 @@ fn step_bytes(step: &PlannedStep) -> usize {
                     + map_bytes(&u.env)
                     + opt(&u.if_)
             }
+            PlannedStep::Checkout(c) => opt(&c.r#ref) + opt(&c.path),
             PlannedStep::Cache(c) => {
                 c.key.len() + list_bytes(&c.restore_keys) + list_bytes(&c.paths)
             }

@@ -34,13 +34,15 @@ enum Command {
         #[arg(long)]
         needs: bool,
     },
-    /// Convert GitHub Actions workflow files into a hatchrun config
+    /// Convert GitHub Actions or Forgejo Actions workflow files into a
+    /// hatchrun config
     ///
     /// Jobs and files that cannot convert are left out and reported; the
     /// config holds the rest, and the exit code is 1 when any were left out.
     /// The last lines name the secrets and variables each workflow reads.
     Convert {
-        /// The files to convert (default: .github/workflows/*.yml and *.yaml)
+        /// The files to convert (default: *.yml and *.yaml in .github/workflows,
+        /// .forgejo/workflows and .gitea/workflows)
         files: Vec<PathBuf>,
         /// Write the config here instead of stdout
         #[arg(short, long)]
@@ -201,18 +203,41 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
     Ok(exit(conversion.errors.is_empty() && refused.is_empty()))
 }
 
-/// `.github/workflows/*.yml` and `*.yaml`, sorted by name.
+/// The directories `convert` reads when no files are named: GitHub's,
+/// then Forgejo's and Gitea's.
+const WORKFLOW_DIRS: &[&str] = &[
+    ".github/workflows",
+    ".forgejo/workflows",
+    ".gitea/workflows",
+];
+
+/// `*.yml` and `*.yaml` in each of [`WORKFLOW_DIRS`] that exists, sorted
+/// by name within each.
 fn default_workflows() -> Result<Vec<PathBuf>> {
-    let dir = Path::new(".github/workflows");
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let path = entry?.path();
-        if path.is_file() && path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
-            found.push(path);
+    let mut all = Vec::new();
+    let mut any = false;
+    for dir in WORKFLOW_DIRS.iter().map(Path::new) {
+        if !dir.is_dir() {
+            continue;
         }
+        any = true;
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+            let path = entry?.path();
+            if path.is_file() && path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
+                found.push(path);
+            }
+        }
+        found.sort();
+        all.extend(found);
     }
-    found.sort();
-    Ok(found)
+    if !any {
+        anyhow::bail!(
+            "found none of {}; name the files to convert",
+            WORKFLOW_DIRS.join(", ")
+        );
+    }
+    Ok(all)
 }
 
 fn exit(ok: bool) -> ExitCode {
