@@ -791,25 +791,22 @@ fn parallelism_added_after_converting() {
 
 /// This repository's own workflows, as a snapshot in
 /// `tests/fixtures/this-repository` so the test does not change when
-/// they do: everything converts but the release build matrix, which
-/// names its runner through `matrix.runner`, so the release workflow
-/// keeps only `version` and `sbom`.
+/// they do: everything converts. The release build matrix names its
+/// runner through `matrix.runner` in two `include` entries, so it
+/// becomes two entries that each run on their own template.
 #[test]
 fn this_repository() {
     let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/this-repository");
     let dir = repository("self", &workflows);
     let (code, stdout, stderr) = hatchrun(&dir, &["convert", "-o", ".hatchrun/config.yml"]);
-    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, "");
     assert!(
-        stderr.contains("`release.yml` job `build` has `runs-on: ${{ matrix.runner }}`"),
+        stderr.contains(
+            "`release.yml` job `build`: `runs-on: ubuntu-24.04-arm` became `ubuntu-26.04-arm`"
+        ),
         "{stderr}"
     );
-    let errors: Vec<&str> = stderr
-        .lines()
-        .filter(|l| l.contains("names no runner template"))
-        .collect();
-    assert_eq!(errors.len(), 1, "{stderr}");
     let (code, stdout, stderr) = hatchrun(&dir, &["validate"]);
     assert_eq!((code, stdout.as_str(), stderr.as_str()), (0, "", ""));
 
@@ -820,7 +817,10 @@ fn this_repository() {
         .iter()
         .map(|j| j.name.as_deref().unwrap_or(&j.job))
         .collect();
-    assert_eq!(release, ["version", "sbom"]);
+    assert_eq!(
+        release,
+        ["version", "build", "build-2", "sbom", "image", "release"]
+    );
     let mut planned = 0;
     for d in deliveries(&config) {
         let event = trigger_event(&d);
@@ -843,6 +843,28 @@ fn this_repository() {
         &trigger_event(&push)
     ));
     let plan = compile(&config, "release", &compile_ref(&push)).unwrap();
-    let ids: Vec<&str> = plan.jobs.iter().map(|j| j.id.as_str()).collect();
-    assert_eq!(ids, ["version", "sbom"]);
+    let names: Vec<&str> = plan.jobs.iter().map(|j| j.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["version", "build", "build-2", "sbom", "image", "release"]
+    );
+    let arches: Vec<Arch> = plan.jobs[1..3]
+        .iter()
+        .map(|j| match j.kind {
+            JobKind::Run { template } => template.arch,
+            JobKind::Approval => panic!("{j:?}"),
+        })
+        .collect();
+    assert_eq!(arches, [Arch::Amd64, Arch::Arm64]);
+    assert_eq!(plan.jobs[2].matrix["target"], "aarch64-unknown-linux-musl");
+    // `needs: [version, build]` waits for both build entries.
+    let image = &plan.jobs[4];
+    assert_eq!(
+        image.requires,
+        [
+            plan.jobs[0].id.as_str(),
+            plan.jobs[1].id.as_str(),
+            plan.jobs[2].id.as_str()
+        ]
+    );
 }

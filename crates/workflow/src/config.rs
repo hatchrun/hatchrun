@@ -640,7 +640,7 @@ pub struct WorkflowJob {
     /// Tags the entry runs on.
     pub tags: Option<Filter>,
     /// Parameter values to run the job with, one copy per combination.
-    pub matrix: BTreeMap<String, Vec<Value>>,
+    pub matrix: Matrix,
     /// Parameter values for the job.
     pub with: BTreeMap<String, Value>,
 }
@@ -909,6 +909,81 @@ impl Serialize for Require {
         } else {
             single_entry(serializer, &self.job, &self.statuses)
         }
+    }
+}
+
+/// The `matrix` of a workflow job entry.
+///
+/// In YAML a map of keys to value lists, with `exclude` holding the
+/// partial combinations left out. A combination is left out when it
+/// matches every key of one `exclude` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Matrix {
+    /// Each key and its values; every combination of them runs.
+    pub values: BTreeMap<String, Vec<Value>>,
+    /// Partial combinations that do not run.
+    pub exclude: Vec<BTreeMap<String, Value>>,
+}
+
+impl Matrix {
+    /// Whether the matrix has no keys and no `exclude`.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty() && self.exclude.is_empty()
+    }
+}
+
+impl std::ops::Index<&str> for Matrix {
+    type Output = Vec<Value>;
+
+    fn index(&self, key: &str) -> &Vec<Value> {
+        &self.values[key]
+    }
+}
+
+impl<'de> Deserialize<'de> for Matrix {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MatrixVisitor;
+
+        impl<'de> Visitor<'de> for MatrixVisitor {
+            type Value = Matrix;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a map of value lists and `exclude`")
+            }
+
+            fn visit_unit<E>(self) -> Result<Matrix, E> {
+                Ok(Matrix::default())
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Matrix, A::Error> {
+                let mut matrix = Matrix::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "exclude" {
+                        matrix.exclude = map.next_value()?;
+                    } else {
+                        let values = map.next_value()?;
+                        matrix.values.insert(key, values);
+                    }
+                }
+                Ok(matrix)
+            }
+        }
+
+        deserializer.deserialize_map(MatrixVisitor)
+    }
+}
+
+impl Serialize for Matrix {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        for (key, values) in &self.values {
+            map.serialize_entry(key, values)?;
+        }
+        if !self.exclude.is_empty() {
+            map.serialize_entry("exclude", &self.exclude)?;
+        }
+        map.end()
     }
 }
 

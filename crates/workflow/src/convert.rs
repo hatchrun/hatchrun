@@ -19,8 +19,8 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::config::{
-    Config, Job, MAX_SOURCE, Parameter, ParameterKind, Require, RunStep, Step, UsesStep, Workflow,
-    WorkflowJob, too_big, yaml_options,
+    Config, Job, MAX_SOURCE, Matrix, Parameter, ParameterKind, Require, RunStep, Step, UsesStep,
+    Workflow, WorkflowJob, too_big, yaml_options,
 };
 use crate::diagnostic::Diagnostic;
 use crate::environment::valid_environment_name;
@@ -290,6 +290,44 @@ struct GhInput {
     options: Option<Vec<Value>>,
 }
 
+/// A GitHub `strategy.matrix` as read.
+#[derive(Default)]
+struct GhMatrix {
+    /// Each key and its values.
+    values: BTreeMap<String, Vec<Value>>,
+    /// Partial combinations left out.
+    exclude: Vec<BTreeMap<String, Value>>,
+    /// Keys added to combinations, or combinations of their own.
+    include: Vec<BTreeMap<String, Value>>,
+}
+
+/// What a converted job runs on.
+enum RunsOn {
+    /// One template label.
+    Label(String),
+    /// The template the matrix key, passed as a parameter, names in each
+    /// leg.
+    Matrix(String),
+}
+
+impl RunsOn {
+    /// The job's `runs-on` and the parameter it reads, if any.
+    fn into_job(self) -> (String, BTreeMap<String, Parameter>) {
+        match self {
+            Self::Label(label) => (label, BTreeMap::new()),
+            Self::Matrix(name) => {
+                let read = format!("${{{{ parameters.{name} }}}}");
+                let param = Parameter {
+                    kind: ParameterKind::String,
+                    default: None,
+                    description: None,
+                };
+                (read, BTreeMap::from([(name, param)]))
+            }
+        }
+    }
+}
+
 /// A map that keeps the order its keys were written in.
 struct Ordered<T>(Vec<(String, T)>);
 
@@ -371,7 +409,8 @@ impl Cx {
         // "which".
         let mut dropped: BTreeMap<String, String> = BTreeMap::new();
         let mut failed = false;
-        let mut entries = Vec::new();
+        // Each converted job's id and its workflow entries.
+        let mut entries: Vec<(String, Vec<WorkflowJob>)> = Vec::new();
         for (id, job) in gh.jobs.0 {
             let at = format!("`{file}` job `{id}`");
             let Some(job) = self.gh_job(&at, &job) else {
@@ -395,7 +434,7 @@ impl Cx {
                 failed = true;
                 continue;
             }
-            let Some((mut converted, entry)) = self.job(&at, &id, &key, &ids, job) else {
+            let Some((mut converted, expanded)) = self.job(&at, &id, &key, &ids, job) else {
                 dropped.insert(id, FAILED.to_owned());
                 failed = true;
                 continue;
@@ -422,18 +461,21 @@ impl Cx {
                 failed = true;
                 continue;
             }
-            self.config.jobs.insert(key, converted);
-            entries.push(entry);
+            self.config.jobs.insert(key.clone(), converted);
+            entries.push((id, expanded));
         }
         // A job that needs a dropped job would run without it, so it is
-        // dropped too, and so on down the chain.
-        while let Some((i, need)) = entries.iter().enumerate().find_map(|(i, e)| {
-            let need = e.requires.iter().find(|r| dropped.contains_key(&r.job))?;
+        // dropped too, and so on down the chain. The entries of one job
+        // share their `requires`.
+        while let Some((i, need)) = entries.iter().enumerate().find_map(|(i, (_, e))| {
+            let need = e[0]
+                .requires
+                .iter()
+                .find(|r| dropped.contains_key(&r.job))?;
             Some((i, need.job.clone()))
         }) {
-            let entry = entries.remove(i);
-            self.config.jobs.remove(&entry.job);
-            let id = entry.name.unwrap_or_default();
+            let (id, expanded) = entries.remove(i);
+            self.config.jobs.remove(&expanded[0].job);
             let why = format!("needs `{need}`, which {}", dropped[&need]);
             self.warn(format!("`{file}` job `{id}` was dropped: it {why}"));
             dropped.insert(id, why);
@@ -442,12 +484,13 @@ impl Cx {
         if entries.is_empty() && failed {
             return;
         }
+        let jobs = flatten(entries);
         self.config.workflows.insert(
             stem.to_owned(),
             Workflow {
                 on,
                 permissions,
-                jobs: entries,
+                jobs,
             },
         );
     }
@@ -740,8 +783,9 @@ impl Cx {
         Some(name.clone())
     }
 
-    /// Converts one job into the job and its workflow entry. `None` when
-    /// the job has errors, which are recorded.
+    /// Converts one job into the job and its workflow entries: one, or
+    /// more when the matrix `include` adds combinations of its own.
+    /// `None` when the job has errors, which are recorded.
     fn job(
         &mut self,
         at: &str,
@@ -749,7 +793,7 @@ impl Cx {
         key: &str,
         ids: &BTreeSet<String>,
         gh: GhJob,
-    ) -> Option<(Job, WorkflowJob)> {
+    ) -> Option<(Job, Vec<WorkflowJob>)> {
         let before = self.errors.len();
         for (name, set, why) in [
             ("services", gh.services.is_some(), LATER),
@@ -766,6 +810,12 @@ impl Cx {
         let environment = self.environment(at, gh.environment.as_ref());
         let mut matrix = self.strategy(at, gh.strategy);
         let runs_on = self.runs_on(at, gh.runs_on.as_ref(), &mut matrix);
+        let leg_key = gh
+            .runs_on
+            .as_ref()
+            .and_then(runs_on_text)
+            .and_then(matrix_key);
+        let matrices = self.include(at, matrix, leg_key);
         let requires = match gh.needs {
             None => Vec::new(),
             Some(Value::String(need)) => vec![need],
@@ -804,8 +854,10 @@ impl Cx {
             return None;
         }
         defaults.apply(&mut steps);
+        let (runs_on, parameters) = runs_on?.into_job();
         let job = Job {
-            runs_on,
+            runs_on: Some(runs_on),
+            parameters,
             env,
             if_: gh.if_.as_ref().and_then(scalar),
             timeout_minutes,
@@ -815,39 +867,28 @@ impl Cx {
             steps,
             ..Job::default()
         };
-        let entry = WorkflowJob {
-            job: key.to_owned(),
-            name: Some(id.to_owned()),
-            requires: requires
-                .iter()
-                .map(String::as_str)
-                .map(Require::new)
-                .collect(),
-            matrix,
-            ..WorkflowJob::default()
-        };
-        Some((job, entry))
+        Some((job, entries(id, key, ids, &requires, matrices)))
     }
 
     /// Maps `runs-on` to a runner template label. A third-party label,
     /// such as `blacksmith-4vcpu-ubuntu-2404`, becomes the template of
     /// its arch and size with a warning; `{labels: ...}` reads its labels
     /// and `{group: ...}` is an error. `runs-on: ${{ matrix.KEY }}`
-    /// over a list of labels keeps the legs whose labels name one
-    /// template and drops the others, such as macOS and Windows legs,
-    /// with a warning.
+    /// keeps the legs whose labels name a template and drops the others,
+    /// such as macOS and Windows legs, with a warning.
     fn runs_on(
         &mut self,
         at: &str,
         runs_on: Option<&Value>,
-        matrix: &mut BTreeMap<String, Vec<Value>>,
-    ) -> Option<String> {
+        matrix: &mut GhMatrix,
+    ) -> Option<RunsOn> {
         let label = runs_on.and_then(runs_on_text);
         if let Some(text) = label
             && let Some(key) = matrix_key(text)
-            && let Some(values) = matrix.get_mut(key)
+            && (matrix.values.contains_key(key)
+                || matrix.include.iter().any(|i| i.contains_key(key)))
         {
-            return self.matrix_runs_on(at, text, key, values);
+            return self.matrix_runs_on(at, text, key, matrix);
         }
         if let Some(Value::Object(map)) = runs_on
             && let Some(group) = map.get("group")
@@ -865,7 +906,7 @@ impl Cx {
             if new != old {
                 self.warn(became(at, old, new));
             }
-            return Some(new.to_owned());
+            return Some(RunsOn::Label(new.to_owned()));
         }
         let shown = runs_on.map_or_else(|| "nothing".to_owned(), show);
         self.error(format!(
@@ -875,81 +916,121 @@ impl Cx {
         None
     }
 
-    /// Resolves `runs-on: ${{ matrix.KEY }}`, keeping in `values` only
-    /// the legs that run on the one template found, and of those only
-    /// the first value for each template.
+    /// Resolves `runs-on: ${{ matrix.KEY }}`. Legs whose value names no
+    /// template are dropped, and so is a value that runs on the same
+    /// template as an earlier one. When the legs left run on one
+    /// template the job runs on it and the values stay as written;
+    /// otherwise the job takes `KEY` as a parameter and runs on the
+    /// template it names, and each value becomes its template's label.
     fn matrix_runs_on(
         &mut self,
         at: &str,
         text: &str,
         key: &str,
-        values: &mut Vec<Value>,
-    ) -> Option<String> {
+        matrix: &mut GhMatrix,
+    ) -> Option<RunsOn> {
         let mut found: Vec<&'static str> = Vec::new();
-        let mut kept: Vec<String> = Vec::new();
         let mut dropped = Vec::new();
-        let mut duplicates = Vec::new();
-        values.retain(|value| {
+        if let Some(values) = matrix.values.get_mut(key) {
+            let mut kept: Vec<String> = Vec::new();
+            let mut duplicates = Vec::new();
+            values.retain(|value| {
+                let Some(new) = value.as_str().and_then(runner_label) else {
+                    dropped.push(format!("`{}`", show(value)));
+                    return false;
+                };
+                // Two labels of one template, such as `ubuntu-latest` and
+                // `ubuntu-24.04`, are one runner: the second leg would
+                // run the same job again.
+                if let Some(i) = found.iter().position(|f| template(f) == template(new)) {
+                    duplicates.push(format!("`{}` (same runner as `{}`)", show(value), kept[i]));
+                    return false;
+                }
+                found.push(new);
+                kept.push(show(value));
+                true
+            });
+            // Every combination of the other keys ran on a dropped value.
+            if values.is_empty() {
+                matrix.values.clear();
+                matrix.exclude.clear();
+            }
+            if !duplicates.is_empty() {
+                self.warn(format!(
+                    "{at}: matrix key `{key}` values {} were dropped: each runs on the same runner template as an earlier value, so its legs would repeat that value's jobs",
+                    duplicates.join(", ")
+                ));
+            }
+        }
+        matrix.include.retain(|entry| {
+            let Some(value) = entry.get(key) else {
+                return true;
+            };
             let Some(new) = value.as_str().and_then(runner_label) else {
                 dropped.push(format!("`{}`", show(value)));
                 return false;
             };
-            // Two labels of one template, such as `ubuntu-latest` and
-            // `ubuntu-24.04`, are one runner: the second leg would run
-            // the same job again.
-            if let Some(i) = found.iter().position(|f| template(f) == template(new)) {
-                duplicates.push(format!("`{}` (same runner as `{}`)", show(value), kept[i]));
-                return false;
+            if !found.contains(&new) {
+                found.push(new);
             }
-            found.push(new);
-            kept.push(show(value));
             true
         });
-        let new = match found.as_slice() {
-            [] => {
-                self.error(format!(
-                    "{at} has `runs-on: {text}`, and matrix key `{key}` names no runner template; use one of {}",
-                    template_labels().join(", ")
-                ));
-                return None;
-            }
-            [one] => *one,
-            many => {
-                let shown: Vec<String> = many.iter().map(|l| format!("`{l}`")).collect();
-                self.error(format!(
-                    "{at} has `runs-on: {text}` over legs that run on {}; a job runs on one runner template",
-                    shown.join(", ")
-                ));
-                return None;
-            }
-        };
+        // An `exclude` of a dropped leg has nothing left to match.
+        matrix.exclude.retain(|entry| {
+            entry
+                .get(key)
+                .is_none_or(|v| v.as_str().and_then(runner_label).is_some())
+        });
         if !dropped.is_empty() {
             self.warn(format!(
                 "{at}: matrix key `{key}` values {} name no runner template and were dropped; hatchrun runs Linux only",
                 dropped.join(", ")
             ));
         }
-        if !duplicates.is_empty() {
-            self.warn(format!(
-                "{at}: matrix key `{key}` values {} were dropped: each runs on the same runner template as an earlier value, so its legs would repeat that value's jobs",
-                duplicates.join(", ")
+        if found.is_empty() {
+            self.error(format!(
+                "{at} has `runs-on: {text}`, and matrix key `{key}` names no runner template; use one of {}",
+                template_labels().join(", ")
             ));
+            return None;
         }
-        for value in values.iter().filter_map(Value::as_str) {
-            if value != new {
-                self.warn(became(at, value, new));
+        let per_leg = found.len() > 1;
+        let mut warned = BTreeSet::new();
+        let values = matrix.values.get_mut(key).into_iter().flatten();
+        let include = matrix.include.iter_mut().filter_map(|e| e.get_mut(key));
+        let exclude = matrix.exclude.iter_mut().filter_map(|e| e.get_mut(key));
+        for value in values.chain(include).chain(exclude) {
+            let Some(old) = value.as_str() else { continue };
+            let Some(new) = runner_label(old) else {
+                continue;
+            };
+            if new == old {
+                continue;
+            }
+            if warned.insert(old.to_owned()) {
+                self.warn(became(at, old, new));
+            }
+            if per_leg {
+                *value = Value::String(new.to_owned());
             }
         }
-        Some(new.to_owned())
+        if !per_leg {
+            return Some(RunsOn::Label(found[0].to_owned()));
+        }
+        if plan::ENTRY_KEYS.contains(&key) {
+            self.error(format!(
+                "{at} has `runs-on: {text}` over legs that run on more than one template, and matrix key `{key}` cannot be passed as a parameter; rename it"
+            ));
+            return None;
+        }
+        Some(RunsOn::Matrix(key.to_owned()))
     }
 
-    /// Reads `strategy.matrix` as plain value lists, dropping the rest.
-    fn strategy(
-        &mut self,
-        at: &str,
-        strategy: Option<BTreeMap<String, Value>>,
-    ) -> BTreeMap<String, Vec<Value>> {
-        let mut matrix = BTreeMap::new();
+    /// Reads `strategy.matrix`: value lists, `exclude` and `include`. The
+    /// rest of `strategy`, and a matrix or key that is an expression,
+    /// such as `${{ fromJSON(...) }}`, are dropped with a warning.
+    fn strategy(&mut self, at: &str, strategy: Option<BTreeMap<String, Value>>) -> GhMatrix {
+        let mut matrix = GhMatrix::default();
         for (key, value) in strategy.unwrap_or_default() {
             if key != "matrix" {
                 self.warn(format!(
@@ -965,18 +1046,23 @@ impl Cx {
             };
             for (name, values) in keys {
                 match values {
-                    Value::Array(values) if name != "include" && name != "exclude" => {
+                    _ if name == "include" || name == "exclude" => {
+                        let entries = self.combinations(at, &name, values);
+                        if name == "include" {
+                            matrix.include = entries;
+                        } else {
+                            matrix.exclude = entries;
+                        }
+                    }
+                    Value::Array(values) => {
                         if values.is_empty() {
                             self.warn(format!(
                                 "{at}: matrix key `{name}` has no values and was dropped"
                             ));
                         } else {
-                            matrix.insert(name, values);
+                            matrix.values.insert(name, values);
                         }
                     }
-                    _ if name == "include" || name == "exclude" => self.warn(format!(
-                        "{at}: `strategy.matrix.{name}` is not supported and was dropped; only plain value lists convert"
-                    )),
                     other => self.warn(format!(
                         "{at}: matrix key `{name}` is `{}`, not a list, and was dropped",
                         show(&other)
@@ -984,7 +1070,150 @@ impl Cx {
                 }
             }
         }
+        // GitHub rejects these; the key may also have been dropped above.
+        let values = &matrix.values;
+        let mut unknown = Vec::new();
+        matrix.exclude.retain(|entry| {
+            let missing = entry.keys().find(|k| !values.contains_key(*k));
+            if let Some(k) = missing {
+                unknown.push(k.clone());
+            }
+            missing.is_none()
+        });
+        for key in unknown {
+            self.warn(format!(
+                "{at}: a `strategy.matrix.exclude` entry names `{key}`, which is not a matrix key, and was dropped"
+            ));
+        }
         matrix
+    }
+
+    /// Reads `strategy.matrix.include` or `exclude`: a list of maps.
+    /// Anything else is dropped with a warning.
+    fn combinations(&mut self, at: &str, name: &str, value: Value) -> Vec<BTreeMap<String, Value>> {
+        let Value::Array(items) = value else {
+            self.warn(format!(
+                "{at}: `strategy.matrix.{name}` is `{}`, not a list of maps, and was dropped",
+                show(&value)
+            ));
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for item in items {
+            match item {
+                Value::Object(map) => out.push(map.into_iter().collect()),
+                other => self.warn(format!(
+                    "{at}: `strategy.matrix.{name}` entry `{}` is not a map and was dropped",
+                    show(&other)
+                )),
+            }
+        }
+        out
+    }
+
+    /// Applies GitHub's `include` to the matrix and returns the matrix of
+    /// each workflow entry the job becomes.
+    ///
+    /// As on GitHub, `exclude` applies first. Then each `include` entry
+    /// extends every combination whose matrix values it does not change
+    /// with its other keys (a later entry can change keys an earlier one
+    /// added), and an entry that extends none is a combination of its
+    /// own. The first matrix holds the combinations no entry extended,
+    /// with the others excluded; each extended or added combination gets
+    /// a matrix of its own with one value per key. When every
+    /// combination was extended the same way, the added keys join the
+    /// first matrix instead. A combination with no `leg_key`, which
+    /// `runs-on` reads, is dropped with a warning.
+    fn include(&mut self, at: &str, matrix: GhMatrix, leg_key: Option<&str>) -> Vec<Matrix> {
+        let GhMatrix {
+            values,
+            exclude,
+            include,
+        } = matrix;
+        let base = Matrix { values, exclude };
+        if include.is_empty() {
+            return vec![base];
+        }
+        let total = base
+            .values
+            .values()
+            .fold(1usize, |n, v| n.saturating_mul(v.len()));
+        if total > plan::MAX_COMBINATIONS {
+            self.error(format!(
+                "{at} has a matrix of {total} combinations with `include`; the limit is {}",
+                plan::MAX_COMBINATIONS
+            ));
+            return Vec::new();
+        }
+        // Each combination left after `exclude`: its matrix values and
+        // the keys `include` added.
+        let mut legs: Vec<(Combo, Combo)> = Vec::new();
+        if !base.values.is_empty() {
+            for index in (0..total).filter(|&i| !plan::excluded(&base, i)) {
+                let mut rest = index;
+                let mut combo = BTreeMap::new();
+                for (key, values) in base.values.iter().rev() {
+                    combo.insert(key.clone(), values[rest % values.len()].clone());
+                    rest /= values.len();
+                }
+                legs.push((combo, BTreeMap::new()));
+            }
+        }
+        let mut added: Vec<Combo> = Vec::new();
+        for entry in include {
+            let mut matched = false;
+            for (combo, extra) in &mut legs {
+                if entry
+                    .iter()
+                    .all(|(k, v)| combo.get(k).is_none_or(|c| c == v))
+                {
+                    matched = true;
+                    for (k, v) in &entry {
+                        if !combo.contains_key(k) {
+                            extra.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            if matched {
+                continue;
+            }
+            if let Some(key) = leg_key
+                && !entry.contains_key(key)
+            {
+                self.warn(format!(
+                    "{at}: a `strategy.matrix.include` entry adds a combination without `{key}`, which `runs-on` reads, and was dropped"
+                ));
+                continue;
+            }
+            added.push(entry);
+        }
+        let mut plain = Vec::new();
+        let mut extended = Vec::new();
+        let mut left_out = Vec::new();
+        for (combo, extra) in legs {
+            if leg_key.is_some_and(|k| !combo.contains_key(k) && !extra.contains_key(k)) {
+                left_out.push(combo);
+            } else if extra.is_empty() {
+                plain.push(combo);
+            } else {
+                extended.push((combo, extra));
+            }
+        }
+        if let Some(key) = leg_key
+            && !left_out.is_empty()
+        {
+            self.warn(format!(
+                "{at}: {} matrix combinations get no `{key}`, which `runs-on` reads, from `strategy.matrix.include` and were dropped",
+                left_out.len()
+            ));
+        }
+        let mut out = group(base, plain, extended, left_out);
+        out.extend(added.into_iter().map(one_each));
+        if out.is_empty() {
+            self.error(format!("{at} has a matrix with no combination left to run"));
+        }
+        out
     }
 
     /// Reads `defaults`, keeping `run.shell` and `run.working-directory`
@@ -1157,6 +1386,129 @@ impl Cx {
             }
         }
     }
+}
+
+/// One combination of matrix keys and values.
+type Combo = BTreeMap<String, Value>;
+
+/// A matrix of one combination: one value per key.
+fn one_each(combo: Combo) -> Matrix {
+    Matrix {
+        values: combo.into_iter().map(|(k, v)| (k, vec![v])).collect(),
+        exclude: Vec::new(),
+    }
+}
+
+/// The matrices of a job's combinations after `include`: `plain` ones
+/// no entry extended, `extended` ones with the keys added, and
+/// `left_out` ones that run nowhere. `base` runs the plain ones, with
+/// the others excluded, unless that is more `exclude` entries than a
+/// matrix may have; then each plain one gets a matrix of its own, as
+/// each extended one does. When every combination was extended alike,
+/// `base` takes the added keys and runs them all.
+fn group(
+    mut base: Matrix,
+    plain: Vec<Combo>,
+    extended: Vec<(Combo, Combo)>,
+    left_out: Vec<Combo>,
+) -> Vec<Matrix> {
+    let mut out = Vec::new();
+    let same = extended.first().map(|(_, extra)| extra);
+    if plain.is_empty() && left_out.is_empty() && extended.iter().all(|(_, e)| Some(e) == same) {
+        if let Some(extra) = same {
+            for (k, v) in extra {
+                base.values.insert(k.clone(), vec![v.clone()]);
+            }
+            out.push(base);
+        }
+        return out;
+    }
+    let taken = extended.len() + left_out.len();
+    if !plain.is_empty() && base.exclude.len() + taken <= plan::MAX_EXCLUDE {
+        base.exclude
+            .extend(extended.iter().map(|(combo, _)| combo.clone()));
+        base.exclude.extend(left_out);
+        out.push(base);
+    } else {
+        out.extend(plain.into_iter().map(one_each));
+    }
+    out.extend(extended.into_iter().map(|(mut combo, extra)| {
+        combo.extend(extra);
+        one_each(combo)
+    }));
+    out
+}
+
+/// Lists the entries of each converted job, given with its GitHub id,
+/// with `requires` naming every entry each needed job became.
+fn flatten(entries: Vec<(String, Vec<WorkflowJob>)>) -> Vec<WorkflowJob> {
+    let names: BTreeMap<String, Vec<String>> = entries
+        .iter()
+        .map(|(id, e)| {
+            (
+                id.clone(),
+                e.iter().filter_map(|e| e.name.clone()).collect(),
+            )
+        })
+        .collect();
+    entries
+        .into_iter()
+        .flat_map(|(_, e)| e)
+        .map(|mut entry| {
+            entry.requires = entry
+                .requires
+                .iter()
+                .flat_map(|r| {
+                    names.get(&r.job).into_iter().flatten().map(|name| Require {
+                        job: name.clone(),
+                        statuses: r.statuses,
+                    })
+                })
+                .collect();
+            entry
+        })
+        .collect()
+}
+
+/// The workflow entries of job `key`, GitHub id `id`, one per matrix.
+/// The first is named `id` and the others `id-2`, `id-3` and on,
+/// skipping the ids of the workflow's other jobs.
+fn entries(
+    id: &str,
+    key: &str,
+    ids: &BTreeSet<String>,
+    requires: &[String],
+    matrices: Vec<Matrix>,
+) -> Vec<WorkflowJob> {
+    let mut n = 1;
+    matrices
+        .into_iter()
+        .enumerate()
+        .map(|(i, matrix)| {
+            let name = if i == 0 {
+                id.to_owned()
+            } else {
+                loop {
+                    n += 1;
+                    let name = format!("{id}-{n}");
+                    if !ids.contains(&name) {
+                        break name;
+                    }
+                }
+            };
+            WorkflowJob {
+                job: key.to_owned(),
+                name: Some(name),
+                requires: requires
+                    .iter()
+                    .map(String::as_str)
+                    .map(Require::new)
+                    .collect(),
+                matrix,
+                ..WorkflowJob::default()
+            }
+        })
+        .collect()
 }
 
 /// `defaults.run` of a workflow or job: what its run steps get when they

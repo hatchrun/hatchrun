@@ -23,8 +23,9 @@ pub mod templates;
 pub mod trigger;
 
 pub use config::{
-    CacheStep, Command, Config, Executor, Job, MAX_SOURCE, Outcome, Parameter, ParameterKind,
-    Require, RunStep, Statuses, Step, UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
+    CacheStep, Command, Config, Executor, Job, MAX_SOURCE, Matrix, Outcome, Parameter,
+    ParameterKind, Require, RunStep, Statuses, Step, UsesStep, Workflow, WorkflowJob,
+    WorkspaceStep, parse,
 };
 pub use convert::{Conversion, convert, to_yaml};
 pub use cron::{Cron, UtcMinute};
