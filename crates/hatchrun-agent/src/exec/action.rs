@@ -290,7 +290,15 @@ async fn download(
     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     // `<owner>/<repo>` is root's to create; the steps only need to pass through.
     for dir in [Some(parent), parent.parent()].into_iter().flatten() {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+        // Open the directory itself, never through a link a step planted.
+        let flags = nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC;
+        let Ok(fd) = nix::fcntl::open(dir, flags, nix::sys::stat::Mode::empty()) else {
+            continue;
+        };
+        nix::sys::stat::fchmod(&fd, nix::sys::stat::Mode::from_bits_truncate(0o755))
             .with_context(|| format!("set mode on {}", dir.display()))?;
     }
     // A name no cache key can have: keys never start with `%tmp`.

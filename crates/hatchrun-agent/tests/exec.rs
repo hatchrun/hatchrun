@@ -819,3 +819,97 @@ async fn remote_action_is_fetched_and_readable() {
         0o055
     );
 }
+
+/// Starts the agent on `doc` with minutes of one second.
+fn start_agent(dir: &Path, doc: &JobDocument) -> std::process::Child {
+    let job = dir.join("job.json");
+    std::fs::write(&job, json(doc)).unwrap();
+    let env = dir.join("environment");
+    std::fs::write(&env, "PATH=/usr/bin:/bin\n").unwrap();
+    Command::new(env!("CARGO_BIN_EXE_hatchrun-agent"))
+        .arg("exec")
+        .arg(&job)
+        .arg("--work-dir")
+        .arg(dir.join("work"))
+        .args(["--runner-user", "", "--minute", "1s"])
+        .arg("--env-file")
+        .arg(&env)
+        .arg("--result")
+        .arg(dir.join("result.json"))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn term(child: &std::process::Child) {
+    Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+}
+
+/// A job that sleeps in a step, then in the `post` of an earlier action.
+fn sleeping_post(dir: &Path) -> JobDocument {
+    local_action(
+        dir,
+        "act",
+        "name: s\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            ("main.js", "console.log('main');\n"),
+            (
+                "post.js",
+                "console.log('post-started');\nsetTimeout(() => {}, 600000);\n",
+            ),
+        ],
+    );
+    make::document(vec![
+        PlannedStep::Uses(make::uses("a", "./act")),
+        make::step("sleep 600"),
+    ])
+}
+
+#[test]
+fn a_post_after_a_cancel_ends_within_the_grace_period() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let doc = sleeping_post(dir.path());
+    let child = start_agent(dir.path(), &doc);
+    let began = Instant::now();
+    std::thread::sleep(Duration::from_secs(1));
+    term(&child);
+    let out = child.wait_with_output().unwrap();
+    let took = began.elapsed();
+    assert!(took < Duration::from_secs(12), "{took:?}");
+    assert!(took > Duration::from_secs(4), "{took:?}");
+    assert!(lines(&out).contains(&"post-started".to_owned()));
+    assert_eq!(result(dir.path()).conclusion, Conclusion::Cancelled);
+}
+
+#[test]
+fn a_second_sigterm_stops_the_job_at_once() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = sleeping_post(dir.path());
+    doc.job.steps.push(make::step("echo never"));
+    let child = start_agent(dir.path(), &doc);
+    std::thread::sleep(Duration::from_secs(1));
+    term(&child);
+    // Wait until the post is running, then ask again.
+    std::thread::sleep(Duration::from_secs(1));
+    let second = Instant::now();
+    term(&child);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        second.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        second.elapsed()
+    );
+    assert!(!lines(&out).contains(&"never".to_owned()));
+    let result = result(dir.path());
+    assert_eq!(result.conclusion, Conclusion::Cancelled);
+    assert_eq!(result.steps[2].outcome, Conclusion::Skipped);
+}

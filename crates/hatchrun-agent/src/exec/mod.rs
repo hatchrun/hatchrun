@@ -39,6 +39,10 @@ use self::step::{Budget, Exit, Process, StepOutput, spawn};
 use crate::envfile;
 use crate::runner::{DEFAULT_PATH, home_of};
 
+/// How long a cancelled job may keep running steps that still run,
+/// such as `always()` steps and `post` hooks, in `--minute`s.
+const GRACE_MINUTES: u32 = 5;
+
 /// How the agent runs a job.
 pub struct Options {
     /// The work directory, laid out like GitHub's hosted runners.
@@ -59,8 +63,10 @@ pub struct Options {
     pub minute: Duration,
 }
 
-/// Runs the document's job and reports how it went. `cancel` resolves
-/// when the agent is asked to stop.
+/// Runs the document's job and reports how it went. `cancel` counts the
+/// requests to stop: the first cancels the job, which then has
+/// [`GRACE_MINUTES`] minutes left for what still runs, and a second
+/// kills the running process at once and skips everything left.
 ///
 /// # Errors
 ///
@@ -69,7 +75,7 @@ pub async fn run_job(
     doc: JobDocument,
     opts: &Options,
     sink: &mut dyn Sink,
-    cancel: impl Future<Output = ()> + 'static,
+    cancel: tokio::sync::watch::Receiver<u32>,
 ) -> Result<JobResult> {
     if matches!(doc.job.kind, JobKind::Approval) {
         bail!("approval jobs do not run on a runner");
@@ -121,7 +127,9 @@ pub async fn run_job(
         github_env: BTreeMap::new(),
         path_dirs: Vec::new(),
         status: JobStatus::Success,
-        cancel: Box::pin(cancel),
+        cancel_requests: cancel,
+        grace_until: None,
+        aborted: false,
         declared_env: BTreeMap::new(),
         env_error: None,
         fetched: BTreeMap::new(),
@@ -134,7 +142,11 @@ pub async fn run_job(
     job.pre_phase(sink).await;
     let mut summaries = Vec::new();
     for (index, step) in doc.job.steps.iter().enumerate() {
-        summaries.push(job.step(index, step, sink).await);
+        if job.aborted {
+            summaries.push(job.skip(index, step, sink));
+        } else {
+            summaries.push(job.step(index, step, sink).await);
+        }
     }
     job.post_phase(sink).await;
 
@@ -186,7 +198,12 @@ struct Job<'a> {
     /// `GITHUB_PATH` directories so far, oldest first.
     path_dirs: Vec<String>,
     status: JobStatus,
-    cancel: Pin<Box<dyn Future<Output = ()>>>,
+    /// How many times the agent was asked to stop.
+    cancel_requests: tokio::sync::watch::Receiver<u32>,
+    /// When the grace period after the first cancel ends.
+    grace_until: Option<Instant>,
+    /// A second cancel arrived: nothing else runs.
+    aborted: bool,
     /// The job's `env` with expressions replaced.
     declared_env: BTreeMap<String, String>,
     /// Why `declared_env` could not be built. Every step then fails with it.
@@ -303,6 +320,33 @@ impl Job<'_> {
             outcome,
             conclusion,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        sink.step_finished(index, &summary);
+        summary
+    }
+
+    /// A step that does not run because the job was stopped for good.
+    fn skip(&mut self, index: usize, step: &PlannedStep, sink: &mut dyn Sink) -> StepSummary {
+        let name = match step {
+            PlannedStep::Run(run) => run
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Run {}", run.run.lines().next().unwrap_or_default())),
+            PlannedStep::Uses(uses) => uses
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Run {}", uses.uses)),
+            PlannedStep::Cache(_) => "Cache".to_owned(),
+            PlannedStep::Workspace(_) => "Workspace".to_owned(),
+            PlannedStep::TestResults { .. } => "Test results".to_owned(),
+        };
+        let name = self.masker.mask(&name).into_owned();
+        sink.step_started(index, &name);
+        let summary = StepSummary {
+            name,
+            outcome: Conclusion::Skipped,
+            conclusion: Conclusion::Skipped,
+            duration_ms: 0,
         };
         sink.step_finished(index, &summary);
         summary
@@ -466,19 +510,44 @@ impl Job<'_> {
             &mut self.annotations,
             &mut self.budget,
         );
+        // After a cancel, whatever still runs shares the grace period.
+        let timeout = match self.grace_until {
+            Some(end) => {
+                let left = end.saturating_duration_since(Instant::now());
+                Some(launch.timeout.map_or(left, |t| t.min(left)))
+            }
+            None => launch.timeout,
+        };
         let process = Process {
             program: launch.program,
             args: launch.args,
             cwd: launch.cwd,
             env: launch.env,
             user: self.opts.runner_user.as_deref(),
-            timeout: launch.timeout,
+            timeout,
         };
-        let spawned = spawn(process, &mut out, &mut self.cancel).await;
-        let mut outcome = exit_outcome(&mut out, spawned, launch.timeout_minutes);
+        let mut cancel: Pin<Box<dyn Future<Output = ()>>> = if self.grace_until.is_some() {
+            Box::pin(std::future::pending())
+        } else {
+            wait_for(self.cancel_requests.clone(), 1)
+        };
+        let mut abort = wait_for(self.cancel_requests.clone(), 2);
+        let spawned = spawn(process, &mut out, &mut cancel, &mut abort).await;
+        let grace_over = self.grace_until.is_some_and(|end| Instant::now() >= end);
+        let mut outcome = match spawned {
+            // The grace period ran out: the job is cancelled, not slow.
+            Ok(Exit::TimedOut) if grace_over && launch.timeout.is_none() => {
+                exit_outcome(&mut out, Ok(Exit::Cancelled), None)
+            }
+            other => exit_outcome(&mut out, other, launch.timeout_minutes),
+        };
         if outcome == Conclusion::Cancelled {
-            // The signal future resolved once and must not be polled again.
-            self.cancel = Box::pin(std::future::pending());
+            if *self.cancel_requests.borrow() >= 2 {
+                self.aborted = true;
+            }
+            if self.grace_until.is_none() {
+                self.grace_until = Some(Instant::now() + self.opts.minute * GRACE_MINUTES);
+            }
         }
         if out.refused() && outcome == Conclusion::Success {
             outcome = Conclusion::Failure;
@@ -525,6 +594,19 @@ impl Job<'_> {
         let joined = dirs.join(":");
         env.insert("PATH".to_owned(), joined);
     }
+}
+
+/// Resolves once `requests` reaches `count`.
+fn wait_for(
+    mut requests: tokio::sync::watch::Receiver<u32>,
+    count: u32,
+) -> Pin<Box<dyn Future<Output = ()>>> {
+    Box::pin(async move {
+        // A closed channel means no more requests will come.
+        if requests.wait_for(|n| *n >= count).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    })
 }
 
 /// A line the agent prints about a step.

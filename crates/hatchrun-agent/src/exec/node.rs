@@ -129,6 +129,9 @@ impl Job<'_> {
             let PlannedStep::Uses(uses) = step else {
                 continue;
             };
+            if self.aborted {
+                break;
+            }
             let Some(Ok(action)) = self.fetched.get(&index).cloned() else {
                 continue;
             };
@@ -194,6 +197,10 @@ impl Job<'_> {
     pub(super) async fn post_phase(&mut self, sink: &mut dyn Sink) {
         let steps = self.doc.job.steps.len();
         while let Some(post) = self.posts.pop() {
+            if self.aborted {
+                self.posts.clear();
+                break;
+            }
             match self.runs(Some(post.condition.as_deref().unwrap_or("always()"))) {
                 Ok(true) => {}
                 Ok(false) => continue,

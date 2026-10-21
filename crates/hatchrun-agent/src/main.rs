@@ -187,9 +187,14 @@ async fn exec_command(job_file: &Path, opts: &exec::Options, result: Option<&Pat
             return ExitCode::FAILURE;
         }
     };
-    let cancel = async move {
-        terminate.recv().await;
-    };
+    // Each SIGTERM bumps the count. The first cancels the job, the
+    // second stops it for good.
+    let (requests, cancel) = tokio::sync::watch::channel(0u32);
+    tokio::spawn(async move {
+        while terminate.recv().await.is_some() {
+            requests.send_modify(|n| *n += 1);
+        }
+    });
     let mut sink = exec::sink::TextSink::new(std::io::stdout());
     let outcome = exec::run_job(doc, opts, &mut sink, cancel).await;
     let job = match outcome {

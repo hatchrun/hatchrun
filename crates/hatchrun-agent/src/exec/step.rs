@@ -321,7 +321,7 @@ fn signal_group(pid: Pid, signal: Signal) {
 /// When the process ends, its group is killed and output is read until
 /// end of file or one second, whichever comes first. A timeout or
 /// `cancel` stops the group the way GitHub does: SIGINT, 7.5 seconds,
-/// SIGTERM, 2.5 seconds, SIGKILL.
+/// SIGTERM, 2.5 seconds, SIGKILL. `abort` kills the group at once.
 ///
 /// # Errors
 ///
@@ -330,6 +330,7 @@ pub async fn spawn(
     p: Process<'_>,
     out: &mut StepOutput<'_>,
     cancel: &mut (impl Future<Output = ()> + Unpin),
+    abort: &mut (impl Future<Output = ()> + Unpin),
 ) -> Result<Exit> {
     let (reader, writer) = std::io::pipe().context("create output pipe")?;
     let stderr = writer.try_clone().context("create output pipe")?;
@@ -375,6 +376,7 @@ pub async fn spawn(
     let mut drain_at: Option<Instant> = None;
     let mut status = None;
     let mut eof = false;
+    let mut aborted = false;
 
     loop {
         if status.is_some() && eof {
@@ -404,6 +406,11 @@ pub async fn spawn(
                 signal_group(pid, Signal::SIGINT);
                 stage = 1;
                 escalate_at = Some(Instant::now() + AFTER_INT);
+            }
+            () = &mut *abort, if !aborted && status.is_none() => {
+                aborted = true;
+                stopping = Some(Exit::Cancelled);
+                signal_group(pid, Signal::SIGKILL);
             }
             () = sleep_until(escalate_at.unwrap_or_else(far_future)), if escalate_at.is_some() => {
                 if stage == 1 {
