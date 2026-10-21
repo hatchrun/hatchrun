@@ -5,6 +5,8 @@
 //! `hatchrun-agent exec`: runs one job from a [`JobDocument`] on this
 //! machine, without GitHub's runner.
 
+pub mod action;
+pub mod archive;
 pub mod commands;
 pub mod context;
 pub mod files;
