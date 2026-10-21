@@ -8,11 +8,11 @@
 //! archive.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
@@ -25,6 +25,13 @@ const MAX_LINK_DEPTH: usize = 40;
 /// The most a GNU long-name, long-link or pax header body may hold. The
 /// tar crate reads these fully into memory.
 const MAX_EXTENSION: u64 = 64 << 10;
+
+/// The longest symlink target, in bytes, that is accepted.
+const MAX_LINK_TARGET: usize = 4096;
+
+/// The most target components of all the symlinks in one archive that
+/// are checked before the archive is refused.
+const MAX_LINK_STEPS: usize = 1_000_000;
 
 /// What one entry costs against the expanded budget, so that empty
 /// files, directories and links are not free.
@@ -63,10 +70,19 @@ impl ExtractLimits {
 /// `dest`. Files get the archive's permission bits minus setuid, setgid
 /// and sticky, and are owned by the extracting user.
 ///
+/// A symlink target over 4096 bytes is an error. Extraction ends with an
+/// error soon after `cancel` is set.
+///
 /// On error `dest` may hold a partial tree (never a symlink). Callers
 /// must discard it.
-pub fn extract_tar_gz(src: impl Read, dest: &Path, strip: usize, max_bytes: u64) -> Result<()> {
-    extract_tar_gz_with(src, dest, strip, ExtractLimits::new(max_bytes))
+pub fn extract_tar_gz(
+    src: impl Read,
+    dest: &Path,
+    strip: usize,
+    max_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    extract_tar_gz_with(src, dest, strip, ExtractLimits::new(max_bytes), cancel)
 }
 
 /// [`extract_tar_gz`] with explicit limits.
@@ -75,6 +91,7 @@ pub fn extract_tar_gz_with(
     dest: &Path,
     strip: usize,
     limits: ExtractLimits,
+    cancel: &AtomicBool,
 ) -> Result<()> {
     let max_bytes = limits.bytes;
     fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
@@ -98,6 +115,7 @@ pub fn extract_tar_gz_with(
 
     for entry in archive.entries().context("read archive")? {
         let mut entry = entry.context("read archive entry")?;
+        stop_if_cancelled(cancel)?;
         entries += 1;
         if entries > limits.entries {
             bail!("archive has more than {} entries", limits.entries);
@@ -151,6 +169,12 @@ pub fn extract_tar_gz_with(
                     .context("read link target")?
                     .map(std::borrow::Cow::into_owned)
                     .unwrap_or_default();
+                if target.as_os_str().len() > MAX_LINK_TARGET {
+                    bail!(
+                        "symlink {} has a target longer than {MAX_LINK_TARGET} bytes",
+                        rel.display()
+                    );
+                }
                 if target.as_os_str().is_empty() || target.has_root() {
                     bail!(
                         "symlink {} points outside the archive: {}",
@@ -167,27 +191,138 @@ pub fn extract_tar_gz_with(
         }
     }
 
-    create_links(&dest, &links)
+    create_links(&dest, &links, cancel)
 }
 
 /// Checks every link against the planned set before creating any.
-fn create_links(dest: &Path, links: &[(PathBuf, PathBuf)]) -> Result<()> {
-    let mut plan: HashMap<PathBuf, PathBuf> = HashMap::new();
+fn create_links(dest: &Path, links: &[(PathBuf, PathBuf)], cancel: &AtomicBool) -> Result<()> {
+    let mut plan = Plan::default();
     for (rel, target) in links {
-        if fs::symlink_metadata(dest.join(rel)).is_ok()
-            || plan.insert(rel.clone(), target.clone()).is_some()
-        {
+        stop_if_cancelled(cancel)?;
+        if fs::symlink_metadata(dest.join(rel)).is_ok() || !plan.add(rel, target) {
             bail!("symlink {} collides with another entry", rel.display());
         }
     }
-    for (rel, _) in links {
-        check_link(&plan, rel)?;
+    for (index, (rel, _)) in links.iter().enumerate() {
+        stop_if_cancelled(cancel)?;
+        plan.resolve(index, 0, cancel)
+            .with_context(|| format!("symlink {}", rel.display()))?;
     }
     for (rel, target) in links {
+        stop_if_cancelled(cancel)?;
         symlink(target, dest.join(rel))
             .with_context(|| format!("create symlink {}", rel.display()))?;
     }
     Ok(())
+}
+
+fn stop_if_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("extraction was cancelled");
+    }
+    Ok(())
+}
+
+/// Where a planned link has got to.
+#[derive(Clone, Copy)]
+enum Resolved {
+    Pending,
+    Working,
+    /// The directory node the link ends at.
+    Done(usize),
+}
+
+/// The planned links as a tree of path components, so that resolving a
+/// link walks each component of its target once and a link met again
+/// costs one lookup.
+#[derive(Default)]
+struct Plan<'a> {
+    /// `(parent, component)` of each node. Node 0 is the destination.
+    nodes: Vec<(usize, u32)>,
+    names: HashMap<&'a std::ffi::OsStr, u32>,
+    children: HashMap<(usize, u32), usize>,
+    /// The planned link that sits at a node.
+    link_at: HashMap<usize, usize>,
+    /// The node and target of each planned link, in the order given.
+    links: Vec<(usize, &'a Path)>,
+    state: Vec<Resolved>,
+    /// Target components walked so far, over all links.
+    walked: usize,
+}
+
+impl<'a> Plan<'a> {
+    fn child(&mut self, parent: usize, part: &'a std::ffi::OsStr) -> usize {
+        let next_name = u32::try_from(self.names.len()).unwrap_or(u32::MAX);
+        let name = *self.names.entry(part).or_insert(next_name);
+        if self.nodes.is_empty() {
+            self.nodes.push((0, 0));
+        }
+        let next_node = self.nodes.len();
+        let node = *self.children.entry((parent, name)).or_insert(next_node);
+        if node == next_node {
+            self.nodes.push((parent, name));
+        }
+        node
+    }
+
+    /// Records the link at `rel`. False when something is there already.
+    fn add(&mut self, rel: &'a Path, target: &'a Path) -> bool {
+        let mut node = 0;
+        for part in rel.components() {
+            node = self.child(node, part.as_os_str());
+        }
+        let index = self.links.len();
+        if self.link_at.insert(node, index).is_some() {
+            return false;
+        }
+        self.links.push((node, target));
+        self.state.push(Resolved::Pending);
+        true
+    }
+
+    /// Resolves the planned link `index` by hand, through the other
+    /// planned links it meets, and fails when the result leaves the
+    /// destination. Returns the node it ends at.
+    fn resolve(&mut self, index: usize, depth: usize, cancel: &AtomicBool) -> Result<usize> {
+        match self.state[index] {
+            Resolved::Done(node) => return Ok(node),
+            Resolved::Working => bail!("loops"),
+            Resolved::Pending => {}
+        }
+        if depth > MAX_LINK_DEPTH {
+            bail!("loops");
+        }
+        self.state[index] = Resolved::Working;
+        let (at, target) = self.links[index];
+        let mut dir = self.nodes[at].0;
+        for part in target.components() {
+            self.walked += 1;
+            if self.walked > MAX_LINK_STEPS {
+                bail!("the symlinks in the archive are too complex to check");
+            }
+            if self.walked.is_multiple_of(4096) {
+                stop_if_cancelled(cancel)?;
+            }
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if dir == 0 {
+                        bail!("points outside the archive");
+                    }
+                    dir = self.nodes[dir].0;
+                }
+                Component::Normal(name) => {
+                    dir = self.child(dir, name);
+                    if let Some(&other) = self.link_at.get(&dir) {
+                        dir = self.resolve(other, depth + 1, cancel)?;
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => bail!("points outside the archive"),
+            }
+        }
+        self.state[index] = Resolved::Done(dir);
+        Ok(dir)
+    }
 }
 
 /// Passes the decompressed tar through while enforcing a byte cap and
@@ -319,44 +454,6 @@ fn make_dir(path: &Path) -> Result<()> {
     }
 }
 
-/// Resolves the planned symlink at `rel` by hand, through the other
-/// planned symlinks it meets, and fails when the result leaves the
-/// destination.
-fn check_link(plan: &HashMap<PathBuf, PathBuf>, rel: &Path) -> Result<()> {
-    let mut dir: Vec<OsString> = rel
-        .parent()
-        .map(|p| p.components().map(|c| c.as_os_str().to_owned()).collect())
-        .unwrap_or_default();
-    let mut todo: Vec<OsString> = plan[rel]
-        .components()
-        .rev()
-        .map(|c| c.as_os_str().to_owned())
-        .collect();
-    let mut hops = 0;
-    while let Some(part) = todo.pop() {
-        if part == "." {
-            continue;
-        }
-        if part == ".." {
-            if dir.pop().is_none() {
-                bail!("symlink {} points outside the archive", rel.display());
-            }
-            continue;
-        }
-        dir.push(part);
-        let full: PathBuf = dir.iter().collect();
-        if let Some(next) = plan.get(&full) {
-            hops += 1;
-            if hops > MAX_LINK_DEPTH {
-                bail!("symlink {} loops", rel.display());
-            }
-            dir.pop();
-            todo.extend(next.components().rev().map(|c| c.as_os_str().to_owned()));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use flate2::Compression;
@@ -426,7 +523,7 @@ mod tests {
     }
 
     fn extract(bytes: &[u8], dest: &Path, strip: usize, max: u64) -> Result<()> {
-        extract_tar_gz(bytes, dest, strip, max)
+        extract_tar_gz(bytes, dest, strip, max, &AtomicBool::new(false))
     }
 
     fn outer() -> (tempfile::TempDir, PathBuf) {
@@ -486,6 +583,68 @@ mod tests {
             raw("s", b'2', "p/q/../..", b""),
         ]);
         assert!(extract(&bytes, &dest, 0, 1 << 20).is_err());
+    }
+
+    /// A symlink entry whose target can be longer than a tar header
+    /// holds, through a GNU long-link entry.
+    fn long_link(path: &str, target: &str) -> Vec<Raw> {
+        let body: &'static [u8] = format!("{target}\0").into_bytes().leak();
+        let path: &'static str = path.to_owned().leak();
+        vec![
+            raw("././@LongLink", b'K', "", body),
+            raw(path, b'2', "", b""),
+        ]
+    }
+
+    #[test]
+    fn many_links_through_a_long_link_check_in_linear_time() {
+        let (_t, dest) = outer();
+        // `big` walks 400 components and ends at the root. Each other
+        // link passes through it 39 times.
+        let mut entries = long_link("big", &"d/../".repeat(200));
+        let hops = ["big"; 39].join("/");
+        for i in 0..2000 {
+            entries.extend(long_link(&format!("l{i}"), &hops));
+        }
+        let bytes = tgz(&entries);
+        let began = std::time::Instant::now();
+        extract(&bytes, &dest, 0, 1 << 30).unwrap();
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(fs::symlink_metadata(dest.join("l1999")).is_ok());
+    }
+
+    #[test]
+    fn a_link_target_over_4096_bytes_is_refused() {
+        let (_t, dest) = outer();
+        let bytes = tgz(&long_link("l", &"a/".repeat(2049)));
+        let msg = err_text(extract(&bytes, &dest, 0, 1 << 20));
+        assert!(msg.contains("longer than 4096"), "{msg}");
+    }
+
+    #[test]
+    fn links_with_too_many_components_in_all_are_refused() {
+        let (_t, dest) = outer();
+        let target = "a/".repeat(500);
+        let mut entries = Vec::new();
+        for i in 0..2100 {
+            entries.extend(long_link(&format!("l{i}"), &target));
+        }
+        let msg = err_text(extract(&tgz(&entries), &dest, 0, 1 << 30));
+        assert!(msg.contains("too complex"), "{msg}");
+    }
+
+    #[test]
+    fn a_cancelled_extract_stops() {
+        let (_t, dest) = outer();
+        let bytes = tgz(&[raw("a", b'0', "", b"x"), raw("l", b'2', "a", b"")]);
+        let cancel = AtomicBool::new(true);
+        let msg = err_text(extract_tar_gz(&bytes[..], &dest, 0, 1 << 20, &cancel));
+        assert!(msg.contains("cancelled"), "{msg}");
+        assert!(fs::symlink_metadata(dest.join("l")).is_err());
     }
 
     fn err_text(r: Result<()>) -> String {
@@ -553,7 +712,13 @@ mod tests {
             stream: 1000,
             ..ExtractLimits::new(1 << 30)
         };
-        let msg = err_text(extract_tar_gz_with(&bytes[..], &dest, 0, limits));
+        let msg = err_text(extract_tar_gz_with(
+            &bytes[..],
+            &dest,
+            0,
+            limits,
+            &AtomicBool::new(false),
+        ));
         assert!(msg.contains("1000 byte limit"), "{msg}");
     }
 
@@ -568,7 +733,13 @@ mod tests {
             entries: 3,
             ..ExtractLimits::new(1 << 30)
         };
-        let msg = err_text(extract_tar_gz_with(&tgz(&dirs)[..], &dest, 0, limits));
+        let msg = err_text(extract_tar_gz_with(
+            &tgz(&dirs)[..],
+            &dest,
+            0,
+            limits,
+            &AtomicBool::new(false),
+        ));
         assert!(msg.contains("more than 3 entries"), "{msg}");
 
         let (_t, dest) = outer();

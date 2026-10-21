@@ -9,6 +9,8 @@ use std::fmt::Write as _;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -348,9 +350,13 @@ async fn download(
 
     let (archive_path, expanded, owner) = (archive.clone(), limits.expanded, limits.owner);
     let extract_into = tree.clone();
+    // Dropping this future, as a cancelled job does, stops the blocking
+    // extraction too.
+    let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
+    let flag = Arc::clone(&stop.0);
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&archive_path)?;
-        extract_tar_gz(file, &extract_into, 1, expanded)?;
+        extract_tar_gz(file, &extract_into, 1, expanded, &flag)?;
         open_for_reading(&extract_into)?;
         if let Some(owner) = owner {
             chown_tree(&extract_into, owner)?;
@@ -424,6 +430,15 @@ fn chown_tree(dir: &Path, owner: (nix::unistd::Uid, nix::unistd::Gid)) -> Result
         }
     }
     Ok(())
+}
+
+/// Sets its flag when dropped.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 enum Failure {

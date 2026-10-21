@@ -143,7 +143,9 @@ enum SplitBy {
     Timings,
 }
 
-#[tokio::main(flavor = "current_thread")]
+// A second thread keeps the SIGTERM listener and the job timer running
+// while a long `hashFiles` call holds the main one.
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -176,7 +178,16 @@ async fn main() -> ExitCode {
                 tool_cache: PathBuf::from("/opt/hostedtoolcache"),
                 minute: *minute,
             };
-            return exec_command(job_file, &opts, result.as_deref()).await;
+            let code = exec_command(job_file, &opts, result.as_deref()).await;
+            // A blocking task that outlived the job, such as an archive
+            // still being read, must not keep the process up once the
+            // result is written.
+            {
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+            }
+            std::process::exit(code);
         }
         Some(Command::Split {
             by: SplitBy::Timings,
@@ -193,9 +204,10 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Runs the job file. Exit codes: 0 success, 1 the job did not succeed
-/// or the run failed, 2 the document cannot be used.
-async fn exec_command(job_file: &Path, opts: &exec::Options, result: Option<&Path>) -> ExitCode {
+/// Runs the job file and returns the exit code: 0 success, 1 the job
+/// did not succeed or the run failed, 2 the document cannot be used.
+/// With `result`, every exit leaves a result file behind.
+async fn exec_command(job_file: &Path, opts: &exec::Options, result: Option<&Path>) -> i32 {
     let doc = match std::fs::read(job_file)
         .with_context(|| format!("read {}", job_file.display()))
         .and_then(|bytes| {
@@ -205,18 +217,23 @@ async fn exec_command(job_file: &Path, opts: &exec::Options, result: Option<&Pat
         Ok(doc) => doc,
         Err(err) => {
             error!("{err:#}");
-            return ExitCode::from(2);
+            return failed(result, 2, &exec::mask::Masker::default());
         }
     };
+    let mut masker = exec::mask::Masker::default();
+    for secret in doc.secrets.values() {
+        masker.add(secret);
+    }
+    masker.add(&doc.github.token);
     if matches!(doc.job.kind, hatchrun_workflow::JobKind::Approval) {
         error!("approval jobs do not run on a runner");
-        return ExitCode::from(2);
+        return failed(result, 2, &masker);
     }
     let mut terminate = match signal(SignalKind::terminate()) {
         Ok(terminate) => terminate,
         Err(err) => {
             error!("listen for SIGTERM: {err}");
-            return ExitCode::FAILURE;
+            return failed(result, 1, &masker);
         }
     };
     // Each SIGTERM bumps the count. The first cancels the job, the
@@ -227,11 +244,6 @@ async fn exec_command(job_file: &Path, opts: &exec::Options, result: Option<&Pat
             requests.send_modify(|n| *n += 1);
         }
     });
-    let mut masker = exec::mask::Masker::default();
-    for secret in doc.secrets.values() {
-        masker.add(secret);
-    }
-    masker.add(&doc.github.token);
     let mut sink = exec::sink::TextSink::new(std::io::stdout());
     let outcome = exec::run_job(doc, opts, &mut sink, cancel).await;
     let job = match outcome {
@@ -241,31 +253,33 @@ async fn exec_command(job_file: &Path, opts: &exec::Options, result: Option<&Pat
             // a result to read. The message can name a secret that a
             // path or a user name happens to hold.
             error!("{}", masker.mask(&format!("{err:#}")));
-            let failed = hatchrun_workflow::JobResult {
-                conclusion: hatchrun_workflow::Conclusion::Failure,
-                outputs: std::collections::BTreeMap::new(),
-                steps: Vec::new(),
-                annotations: Vec::new(),
-            };
-            if let Some(path) = result
-                && let Err(err) = write_result(path, &failed)
-            {
-                error!("{}", masker.mask(&format!("{err:#}")));
-            }
-            return ExitCode::FAILURE;
+            return failed(result, 1, &masker);
         }
     };
     if let Some(path) = result
         && let Err(err) = write_result(path, &job)
     {
         error!("{err:#}");
-        return ExitCode::FAILURE;
+        return 1;
     }
-    if job.conclusion == hatchrun_workflow::Conclusion::Success {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    i32::from(job.conclusion != hatchrun_workflow::Conclusion::Success)
+}
+
+/// Writes a failed result to `result`, if there is a path, and returns
+/// `code`.
+fn failed(result: Option<&Path>, code: i32, masker: &exec::mask::Masker) -> i32 {
+    let failure = hatchrun_workflow::JobResult {
+        conclusion: hatchrun_workflow::Conclusion::Failure,
+        outputs: std::collections::BTreeMap::new(),
+        steps: Vec::new(),
+        annotations: Vec::new(),
+    };
+    if let Some(path) = result
+        && let Err(err) = write_result(path, &failure)
+    {
+        error!("{}", masker.mask(&format!("{err:#}")));
     }
+    code
 }
 
 /// Writes the job result as JSON.

@@ -10,6 +10,7 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use hatchrun_workflow::trigger::Filter;
 use hatchrun_workflow::{
@@ -19,6 +20,7 @@ use hatchrun_workflow::{
 use nix::fcntl::OFlag;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 
 use super::layout::Layout;
 
@@ -27,6 +29,13 @@ const MAX_MATCHED: usize = 100_000;
 
 /// The most directory entries one `hashFiles` call may walk.
 const MAX_WALKED: usize = 1_000_000;
+
+/// How long one `hashFiles` call may run.
+const HASH_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How many bytes `hashFiles` reads between looks at the clock and the
+/// cancel signal.
+const HASH_CHUNK: usize = 1 << 20;
 
 /// The action whose step is running, for `github.action_path` and
 /// `inputs`.
@@ -48,6 +57,7 @@ pub struct ActionScope {
 #[derive(Debug, Clone)]
 pub struct Contexts {
     value: Value,
+    cancel: Option<watch::Receiver<u32>>,
 }
 
 impl Contexts {
@@ -131,7 +141,22 @@ impl Contexts {
             "job": { "status": "success" },
             "inputs": {},
         });
-        Self { value }
+        Self {
+            value,
+            cancel: None,
+        }
+    }
+
+    /// Lets `hashFiles` stop early when the job is asked to stop.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: watch::Receiver<u32>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// The signal that tells a long expression function to give up.
+    pub fn cancel(&self) -> Option<&watch::Receiver<u32>> {
+        self.cancel.as_ref()
     }
 
     /// The object [`evaluate`] reads.
@@ -181,7 +206,10 @@ impl Contexts {
         value["inputs"] = json!(&action.inputs);
         value["steps"] = json!({});
         value["secrets"] = json!({});
-        Contexts { value }
+        Contexts {
+            value,
+            cancel: self.cancel.clone(),
+        }
     }
 }
 
@@ -200,11 +228,17 @@ pub struct Runtime<'a> {
     pub workspace: &'a Path,
     /// The job's status so far.
     pub status: JobStatus,
+    /// Set once the job is asked to stop. `hashFiles` gives up then.
+    pub cancel: Option<&'a watch::Receiver<u32>>,
 }
 
 impl Functions for Runtime<'_> {
     fn hash_files(&self, patterns: &[String]) -> Result<String, ExprError> {
-        hash_files_in(self.workspace, patterns, MAX_MATCHED, MAX_WALKED)
+        let stop = Stop {
+            cancel: self.cancel,
+            deadline: Instant::now() + HASH_DEADLINE,
+        };
+        hash_files_in(self.workspace, patterns, MAX_MATCHED, MAX_WALKED, &stop)
     }
 
     fn status(&self) -> JobStatus {
@@ -245,18 +279,53 @@ fn fail(message: impl Into<String>) -> ExprError {
     }
 }
 
+/// When a `hashFiles` call has to give up.
+struct Stop<'a> {
+    cancel: Option<&'a watch::Receiver<u32>>,
+    deadline: Instant,
+}
+
+impl Stop<'_> {
+    /// Whether the call must end now.
+    fn interrupted(&self) -> impl Fn() -> bool + '_ {
+        move || self.check(&[]).is_err()
+    }
+
+    /// An error that names `patterns` when the call must end.
+    fn check(&self, patterns: &[String]) -> Result<(), ExprError> {
+        if self.cancel.is_some_and(|c| *c.borrow() > 0) {
+            Err(fail(format!(
+                "hashFiles: stopped while looking for {}: the job was cancelled",
+                patterns.join(", ")
+            )))
+        } else if Instant::now() >= self.deadline {
+            Err(fail(format!(
+                "hashFiles: gave up after {} seconds while looking for {}",
+                HASH_DEADLINE.as_secs(),
+                patterns.join(", ")
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// `hashFiles`: the SHA-256, in hex, of the SHA-256 digests of the
 /// files under `workspace` that match `patterns`, in path order. A
 /// file outside the workspace is never read. Symbolic links are not
 /// followed into directories, and a link to a file counts only when it
 /// resolves inside the workspace. `.git` directories are not entered.
 /// A call that matches more than `max_matched` files or walks more than
-/// `max_walked` entries fails and names its patterns.
+/// `max_walked` entries fails and names its patterns, and so does one
+/// that outlasts `stop`. Reads are made in 1 MiB steps and `stop` is
+/// looked at between them, so a huge or growing file cannot hold the
+/// job past its timeout.
 fn hash_files_in(
     workspace: &Path,
     patterns: &[String],
     max_matched: usize,
     max_walked: usize,
+    stop: &Stop<'_>,
 ) -> Result<String, ExprError> {
     let filter = Filter::new(with_root_variants(patterns));
     let root = fs::canonicalize(workspace)
@@ -274,6 +343,7 @@ fn hash_files_in(
                 continue;
             };
             walked += 1;
+            stop.check(patterns)?;
             if walked > max_walked {
                 return Err(fail(format!(
                     "hashFiles: more than {max_walked} entries in the workspace while looking for {}",
@@ -329,8 +399,12 @@ fn hash_files_in(
     matched.sort_by(|a, b| a.0.cmp(&b.0));
     let mut all = Sha256::new();
     for (rel, path, id) in &matched {
-        let digest = digest_file(path, *id, &root)
-            .map_err(|e| fail(format!("hashFiles: read {rel}: {e}")))?;
+        stop.check(patterns)?;
+        let digest = digest_file(path, *id, &root, stop.interrupted()).map_err(|e| {
+            stop.check(patterns)
+                .err()
+                .unwrap_or_else(|| fail(format!("hashFiles: read {rel}: {e}")))
+        })?;
         if let Some(digest) = digest {
             all.update(digest);
         }
@@ -370,8 +444,13 @@ fn hex(bytes: &[u8]) -> String {
 /// opened without following a link, and the open file must have the
 /// walked file's device and inode and, where `/proc` shows it, lie under
 /// `root`. A file that was swapped for something else since the walk is
-/// skipped (`None`).
-fn digest_file(path: &Path, id: (u64, u64), root: &Path) -> std::io::Result<Option<[u8; 32]>> {
+/// skipped (`None`). `interrupted` is asked before each 1 MiB read.
+fn digest_file(
+    path: &Path,
+    id: (u64, u64),
+    root: &Path,
+    interrupted: impl Fn() -> bool,
+) -> std::io::Result<Option<[u8; 32]>> {
     let opened = fs::OpenOptions::new()
         .read(true)
         // A FIFO swapped in since the walk must not block the open.
@@ -399,8 +478,11 @@ fn digest_file(path: &Path, id: (u64, u64), root: &Path) -> std::io::Result<Opti
     #[cfg(not(target_os = "linux"))]
     let _ = root;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8 * 1024];
+    let mut buf = vec![0u8; HASH_CHUNK];
     loop {
+        if interrupted() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
@@ -487,6 +569,7 @@ mod tests {
         let rt = Runtime {
             workspace: Path::new("/nonexistent"),
             status: JobStatus::Success,
+            cancel: None,
         };
         evaluate(expr, ctx.value(), &rt).unwrap()
     }
@@ -522,6 +605,7 @@ mod tests {
         let rt = Runtime {
             workspace: Path::new("/nonexistent"),
             status: JobStatus::Success,
+            cancel: None,
         };
         let text = interpolate("a${{ steps.nope.outputs.x }}b", ctx.value(), &rt).unwrap();
         assert_eq!(text, "ab");
@@ -566,10 +650,12 @@ mod tests {
         let ok = Runtime {
             workspace: ws,
             status: JobStatus::Success,
+            cancel: None,
         };
         let failed = Runtime {
             workspace: ws,
             status: JobStatus::Failure,
+            cancel: None,
         };
         assert!(condition(None, &ctx, &ok).unwrap());
         assert!(!condition(None, &ctx, &failed).unwrap());
@@ -579,6 +665,44 @@ mod tests {
         assert!(condition(Some("always()"), &ctx, &failed).unwrap());
         assert!(condition(Some("${{ failure() }}"), &ctx, &failed).unwrap());
         assert!(!condition(Some("failure()"), &ctx, &ok).unwrap());
+    }
+
+    fn free() -> Stop<'static> {
+        Stop {
+            cancel: None,
+            deadline: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn hash_files_gives_up_at_the_deadline_and_names_the_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.lock"), vec![0u8; 3 << 20]).unwrap();
+        let stop = Stop {
+            cancel: None,
+            deadline: Instant::now(),
+        };
+        let err = hash_files_in(dir.path(), &["big.lock".to_owned()], 10, 100, &stop).unwrap_err();
+        assert!(
+            err.message.contains("gave up") && err.message.contains("big.lock"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn hash_files_stops_when_the_job_is_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.lock"), vec![0u8; 3 << 20]).unwrap();
+        let (tx, rx) = watch::channel(0u32);
+        let stop = Stop {
+            cancel: Some(&rx),
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        assert!(hash_files_in(dir.path(), &["big.lock".to_owned()], 10, 100, &stop).is_ok());
+        tx.send_replace(1);
+        let err = hash_files_in(dir.path(), &["big.lock".to_owned()], 10, 100, &stop).unwrap_err();
+        assert!(err.message.contains("cancelled"), "{}", err.message);
     }
 
     fn digest_of(parts: &[&str]) -> String {
@@ -593,6 +717,7 @@ mod tests {
         let rt = Runtime {
             workspace: ws,
             status: JobStatus::Success,
+            cancel: None,
         };
         let patterns: Vec<String> = patterns.iter().map(|s| (*s).to_owned()).collect();
         rt.hash_files(&patterns).unwrap()
@@ -638,7 +763,7 @@ mod tests {
         for i in 0..5 {
             std::fs::write(dir.path().join(format!("f{i}")), "x").unwrap();
         }
-        let err = hash_files_in(dir.path(), &["*".to_owned()], 3, 1000).unwrap_err();
+        let err = hash_files_in(dir.path(), &["*".to_owned()], 3, 1000, &free()).unwrap_err();
         assert!(err.message.contains("more than 3 files"), "{}", err.message);
         assert!(err.message.contains('*'), "{}", err.message);
     }
@@ -649,7 +774,8 @@ mod tests {
         for i in 0..10 {
             std::fs::write(dir.path().join(format!("f{i}")), "x").unwrap();
         }
-        let err = hash_files_in(dir.path(), &["**/*.lock".to_owned()], 100, 5).unwrap_err();
+        let err =
+            hash_files_in(dir.path(), &["**/*.lock".to_owned()], 100, 5, &free()).unwrap_err();
         assert!(
             err.message.contains("more than 5 entries"),
             "{}",
@@ -672,7 +798,7 @@ mod tests {
         for i in 0..5 {
             std::fs::write(ws.join(format!("other{i}")), "o").unwrap();
         }
-        assert!(hash_files_in(ws, &["*.lock".to_owned()], 1, 1000).is_ok());
+        assert!(hash_files_in(ws, &["*.lock".to_owned()], 1, 1000, &free()).is_ok());
     }
 
     #[test]
@@ -684,7 +810,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let path = fifo.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(digest_file(&path, (0, 0), &root));
+            let _ = tx.send(digest_file(&path, (0, 0), &root, || false));
         });
         let done = rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -700,16 +826,16 @@ mod tests {
         fs::write(&file, "x").unwrap();
         let meta = fs::metadata(&file).unwrap();
         let id = (meta.dev(), meta.ino());
-        assert!(digest_file(&file, id, &root).unwrap().is_some());
+        assert!(digest_file(&file, id, &root, || false).unwrap().is_some());
         fs::write(root.join("other"), "o").unwrap();
         fs::remove_file(&file).unwrap();
         std::os::unix::fs::symlink(root.join("other"), &file).unwrap();
-        assert!(digest_file(&file, id, &root).unwrap().is_none());
+        assert!(digest_file(&file, id, &root, || false).unwrap().is_none());
         fs::remove_file(&file).unwrap();
         fs::write(&file, "y").unwrap();
         // Same path, different inode than the walk saw.
         assert!(
-            digest_file(&file, (id.0, id.1 + 1_000_000), &root)
+            digest_file(&file, (id.0, id.1 + 1_000_000), &root, || false)
                 .unwrap()
                 .is_none()
         );

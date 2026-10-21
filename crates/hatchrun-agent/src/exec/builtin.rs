@@ -285,6 +285,7 @@ impl Fs {
             &path,
             0,
             ExtractLimits::new(MAX_EXPANDED_BYTES),
+            cancel,
         )
         .map_err(|err| {
             if cancel.load(Ordering::Relaxed) {

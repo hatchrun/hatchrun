@@ -278,7 +278,14 @@ mod tests {
         .unwrap();
         assert_eq!(n, 3);
         let dest = t.path().join("out");
-        extract_tar_gz(&out[..], &dest, 0, 1 << 20).unwrap();
+        extract_tar_gz(
+            &out[..],
+            &dest,
+            0,
+            1 << 20,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(fs::read(dest.join("d/e/f.txt")).unwrap(), b"data");
         assert_eq!(fs::read(dest.join("top.txt")).unwrap(), b"top");
         assert_eq!(

@@ -147,7 +147,7 @@ pub async fn run_job(
     ));
 
     let mut job = Job {
-        ctx: Contexts::new(&doc, &layout),
+        ctx: Contexts::new(&doc, &layout).with_cancel(cancel.clone()),
         doc: &doc,
         opts,
         layout,
@@ -407,7 +407,12 @@ fn interp(
     workspace: &Path,
     status: JobStatus,
 ) -> Result<String, ExprError> {
-    interpolate(text, ctx.value(), &Runtime { workspace, status })
+    let rt = Runtime {
+        workspace,
+        status,
+        cancel: ctx.cancel(),
+    };
+    interpolate(text, ctx.value(), &rt)
 }
 
 impl Job<'_> {
@@ -546,6 +551,7 @@ impl Job<'_> {
         let rt = Runtime {
             workspace: &self.layout.workspace,
             status: self.status,
+            cancel: self.ctx.cancel(),
         };
         condition(if_, &self.ctx, &rt)
     }

@@ -41,6 +41,7 @@ impl Job<'_> {
         let rt = Runtime {
             workspace: &self.layout.workspace,
             status,
+            cancel: self.ctx.cancel(),
         };
         super::context::condition(self.doc.job.if_.as_deref(), &self.ctx, &rt)
     }

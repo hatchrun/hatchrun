@@ -92,6 +92,25 @@ fn approval_job_is_refused() {
     );
 }
 
+#[test]
+fn a_failure_result_is_written_when_the_job_cannot_start() {
+    let deep = format!("{}1{}", "[".repeat(5000), "]".repeat(5000));
+    let approval = json(&make::approval());
+    for (doc, what) in [
+        ("{}".to_owned(), "bad document"),
+        (deep, "deeply nested document"),
+        (approval, "approval job"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = exec(dir.path(), &doc);
+        assert_eq!(out.status.code(), Some(2), "{what}: {out:?}");
+        let text = std::fs::read_to_string(dir.path().join("result.json"))
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        let result: JobResult = serde_json::from_str(&text).unwrap();
+        assert_eq!(result.conclusion, Conclusion::Failure, "{what}");
+    }
+}
+
 fn result(dir: &Path) -> JobResult {
     let text = std::fs::read_to_string(dir.join("result.json")).unwrap();
     serde_json::from_str(&text).unwrap()
@@ -2056,6 +2075,33 @@ fn job_timeout() {
     assert_eq!(result.conclusion, Conclusion::Failure);
     assert_eq!(result.steps[0].outcome, Conclusion::Cancelled);
     assert_eq!(result.steps[1].outcome, Conclusion::Success);
+}
+
+#[test]
+fn hash_files_on_a_huge_file_does_not_hold_the_job_past_its_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gated = make::run("echo hashed");
+    gated.if_ = Some("hashFiles('big.lock') != ''".to_owned());
+    let mut doc = make::document(vec![
+        // A sparse file of 1 TiB.
+        make::step("dd if=/dev/null of=big.lock bs=1048576 seek=1048576 count=0 2>/dev/null"),
+        make::planned(gated),
+    ]);
+    doc.job.timeout_minutes = 1;
+    let began = Instant::now();
+    let out = exec_with(dir.path(), &json(&doc), &["--minute", "3s"]);
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let text = stdout(&out);
+    assert!(
+        text.contains("hashFiles") && text.contains("big.lock"),
+        "{text}"
+    );
+    assert_eq!(result(dir.path()).steps[1].outcome, Conclusion::Failure);
 }
 
 #[test]
