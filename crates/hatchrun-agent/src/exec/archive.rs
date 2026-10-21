@@ -10,15 +10,13 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use flate2::Compression;
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use tar::{Archive, Builder, EntryType};
+use tar::{Archive, EntryType};
 
 /// How many symlinks one path may pass through before it is treated as
 /// a loop.
@@ -359,111 +357,13 @@ fn check_link(plan: &HashMap<PathBuf, PathBuf>, rel: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Writes a gzipped tar of `paths` (relative to `root`) to `dest` and
-/// returns the number of bytes written. Directories are added with
-/// their contents. Symlinks are stored as symlinks. Every path must
-/// resolve inside `root`.
-pub fn create_tar_gz(root: &Path, paths: &[String], dest: impl Write) -> Result<u64> {
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("resolve {}", root.display()))?;
-    let counter = Counter {
-        inner: dest,
-        count: 0,
-    };
-    let mut builder = Builder::new(GzEncoder::new(counter, Compression::default()));
-    builder.follow_symlinks(false);
-    for p in paths {
-        let rel = Path::new(p);
-        if rel.has_root() {
-            bail!("{p} is an absolute path");
-        }
-        let full = resolve_inside(&root, rel).with_context(|| format!("path {p}"))?;
-        let name = full.strip_prefix(&root).expect("checked by resolve_inside");
-        if name.as_os_str().is_empty() {
-            add_dir(&mut builder, &full, Path::new(""))?;
-        } else {
-            add_tree(&mut builder, &full, name)?;
-        }
-    }
-    let counter = builder
-        .into_inner()
-        .context("finish archive")?
-        .finish()
-        .context("finish compression")?;
-    Ok(counter.count)
-}
-
-/// Resolves `rel` under `root` through `..` and symlinks, except for a
-/// final symlink, which is stored as it is. The result is inside `root`.
-fn resolve_inside(root: &Path, rel: &Path) -> Result<PathBuf> {
-    let joined = root.join(rel);
-    let last_is_name = matches!(rel.components().next_back(), Some(Component::Normal(_)));
-    let resolved = if last_is_name {
-        let parent = joined.parent().context("no parent")?;
-        let parent = parent
-            .canonicalize()
-            .with_context(|| format!("resolve {}", parent.display()))?;
-        parent.join(joined.file_name().context("no file name")?)
-    } else {
-        joined
-            .canonicalize()
-            .with_context(|| format!("resolve {}", joined.display()))?
-    };
-    if !resolved.starts_with(root) {
-        bail!("leaves {}", root.display());
-    }
-    fs::symlink_metadata(&resolved).with_context(|| format!("stat {}", resolved.display()))?;
-    Ok(resolved)
-}
-
-fn add_dir<W: Write>(b: &mut Builder<W>, full: &Path, name: &Path) -> Result<()> {
-    if !name.as_os_str().is_empty() {
-        b.append_dir(name, full)
-            .with_context(|| format!("add {}", name.display()))?;
-    }
-    let mut kids: Vec<_> = fs::read_dir(full)
-        .with_context(|| format!("read {}", full.display()))?
-        .collect::<io::Result<_>>()?;
-    kids.sort_by_key(std::fs::DirEntry::file_name);
-    for kid in kids {
-        add_tree(b, &kid.path(), &name.join(kid.file_name()))?;
-    }
-    Ok(())
-}
-
-fn add_tree<W: Write>(b: &mut Builder<W>, full: &Path, name: &Path) -> Result<()> {
-    let meta = fs::symlink_metadata(full)?;
-    if meta.is_dir() {
-        add_dir(b, full, name)
-    } else if meta.file_type().is_symlink() || meta.is_file() {
-        b.append_path_with_name(full, name)
-            .with_context(|| format!("add {}", name.display()))
-    } else {
-        bail!("{} is not a file, directory or symlink", name.display())
-    }
-}
-
-/// Counts the bytes that pass through.
-struct Counter<W> {
-    inner: W,
-    count: u64,
-}
-
-impl<W: Write> Write for Counter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.count += n as u64;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use flate2::Compression;
+    use std::io::Write;
+
+    use flate2::write::GzEncoder;
+
     use super::*;
 
     /// A raw tar entry, so tests can build paths `tar::Builder` refuses.
@@ -717,56 +617,5 @@ mod tests {
         let err = extract(&bytes, &dest, 0, 1000).unwrap_err();
         assert!(err.to_string().contains("1000 byte limit"), "{err}");
         assert!(!dest.join("big").exists());
-    }
-
-    #[test]
-    fn round_trips_files_dirs_and_symlinks() {
-        let t = tempfile::tempdir().unwrap();
-        let root = t.path().join("root");
-        fs::create_dir_all(root.join("d/e")).unwrap();
-        fs::write(root.join("d/e/f.txt"), "data").unwrap();
-        fs::write(root.join("top.txt"), "top").unwrap();
-        symlink("e/f.txt", root.join("d/link")).unwrap();
-        let mut out = Vec::new();
-        let n = create_tar_gz(&root, &["d".into(), "top.txt".into()], &mut out).unwrap();
-        assert_eq!(n, out.len() as u64);
-        let dest = t.path().join("out");
-        extract(&out, &dest, 0, 1 << 20).unwrap();
-        assert_eq!(fs::read(dest.join("d/e/f.txt")).unwrap(), b"data");
-        assert_eq!(fs::read(dest.join("top.txt")).unwrap(), b"top");
-        assert_eq!(
-            fs::read_link(dest.join("d/link")).unwrap(),
-            Path::new("e/f.txt")
-        );
-    }
-
-    #[test]
-    fn create_refuses_paths_outside_the_root() {
-        let t = tempfile::tempdir().unwrap();
-        let root = t.path().join("root");
-        fs::create_dir_all(root.join("in")).unwrap();
-        fs::write(t.path().join("secret"), "s").unwrap();
-        let outside = t.path().join("outside");
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("f"), "o").unwrap();
-        symlink(&outside, root.join("via")).unwrap();
-        for p in [
-            "../secret",
-            "in/../../secret",
-            "via/f",
-            "/etc/passwd",
-            "missing",
-        ] {
-            let r = create_tar_gz(&root, &[p.to_string()], Vec::new());
-            assert!(r.is_err(), "{p} should fail");
-        }
-        // `a/../in` stays inside.
-        create_tar_gz(&root, &["in/../in".to_string()], Vec::new()).unwrap();
-        // A symlink that points outside is stored as a link, not followed.
-        let mut out = Vec::new();
-        create_tar_gz(&root, &["via".to_string()], &mut out).unwrap();
-        let mut a = Archive::new(GzDecoder::new(&out[..]));
-        let e = a.entries().unwrap().next().unwrap().unwrap();
-        assert_eq!(e.header().entry_type(), EntryType::Symlink);
     }
 }

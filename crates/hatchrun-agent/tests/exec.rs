@@ -1373,7 +1373,7 @@ fn workspace_persist_attach() {
         ],
     );
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
-    assert!(store.path().join("workspace/1/build.tar.gz").is_file());
+    assert!(store.path().join("workspace/1/build.1.tar.gz").is_file());
 
     let mut doc = make::document(vec![attach("ws"), make::step("cat ws/dist/x")]);
     doc.job.id = "test".to_owned();
@@ -1403,7 +1403,7 @@ fn workspace_attach_applies_required_jobs_in_order() {
             persist(".", &["f"]),
         ]);
         doc.job.id = format!("{name} (x)");
-        doc.job.name = name.to_owned();
+        name.clone_into(&mut doc.job.name);
         let dir = tempfile::tempdir().unwrap();
         let out = exec_with(
             dir.path(),
@@ -1460,7 +1460,7 @@ fn test_results_are_stored() {
         ],
     );
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
-    let archive = dir.path().join("store/test-results/1/build.tar.gz");
+    let archive = dir.path().join("store/test-results/1/build.1.tar.gz");
     let list = Command::new("tar")
         .arg("tzf")
         .arg(&archive)
@@ -1641,4 +1641,160 @@ fn symlinks_are_stored_as_links() {
         .unwrap();
     let text = String::from_utf8_lossy(&list.stdout).into_owned();
     assert!(text.contains("d/p -> /etc/passwd"), "{text}");
+}
+
+fn job_named(id: &str, name: &str, steps: Vec<PlannedStep>) -> JobDocument {
+    let mut doc = make::document(steps);
+    id.clone_into(&mut doc.job.id);
+    name.clone_into(&mut doc.job.name);
+    doc
+}
+
+fn run_in_new_dir(store: &Path, doc: &JobDocument) -> (tempfile::TempDir, Output) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = exec_with(
+        dir.path(),
+        &json(doc),
+        &["--store", store.to_str().unwrap()],
+    );
+    (dir, out)
+}
+
+fn requiring(ids: &[&str], steps: Vec<PlannedStep>) -> JobDocument {
+    let mut doc = job_named("last", "last", steps);
+    doc.job.requires = ids.iter().map(|id| (*id).to_owned()).collect();
+    doc.needs.insert("m".to_owned(), need());
+    doc
+}
+
+#[test]
+fn matrix_jobs_and_repeated_steps_keep_their_own_workspaces() {
+    let store = tempfile::tempdir().unwrap();
+    for (id, file) in [("m (a)", "fa"), ("m (b)", "fb")] {
+        let doc = job_named(
+            id,
+            "m",
+            vec![
+                make::step(&format!("echo {file} > {file}")),
+                persist(".", &[file]),
+            ],
+        );
+        let (_dir, out) = run_in_new_dir(store.path(), &doc);
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    }
+    let doc = job_named(
+        "two",
+        "two",
+        vec![
+            make::step("echo one > f1 && echo two > f2"),
+            persist(".", &["f1"]),
+            persist(".", &["f2"]),
+        ],
+    );
+    let (_dir, out) = run_in_new_dir(store.path(), &doc);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    let doc = requiring(
+        &["m (a)", "m (b)", "two"],
+        vec![attach("."), make::step("cat fa fb f1 f2")],
+    );
+    let (_dir, out) = run_in_new_dir(store.path(), &doc);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let text = stdout(&out);
+    for line in ["fa", "fb", "one", "two"] {
+        assert!(text.lines().any(|l| l == line), "{line}: {text}");
+    }
+}
+
+#[test]
+fn the_stage_is_private_and_left_empty() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let store = tempfile::tempdir().unwrap();
+    let (dir, out) = shared(
+        store.path(),
+        vec![
+            cache("k", &[], &["t"]),
+            make::step("mkdir t && echo x > t/a"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let stage = dir.path().join("work/_hatchrun");
+    let mode = std::fs::metadata(&stage).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+    assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 0);
+}
+
+#[test]
+fn a_planted_stage_link_stops_the_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, work.join("_hatchrun")).unwrap();
+    let out = run_steps(dir.path(), vec![make::step("echo ran")]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!stdout(&out).contains("ran"));
+}
+
+#[test]
+fn a_failed_restore_does_not_queue_a_save() {
+    let store = tempfile::tempdir().unwrap();
+    let dir = store.path().join("cache/acme%2Frepo");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("old.tar.gz"), "not an archive").unwrap();
+    let (_dir, out) = shared(store.path(), vec![cache("new", &["old"], &["t"])]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(!cache_file(store.path(), "new").exists());
+    assert!(!stdout(&out).contains("Post Cache"), "{}", stdout(&out));
+}
+
+#[test]
+fn a_cancel_ends_a_large_save_promptly() {
+    let store = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // A sparse file that takes minutes to compress.
+    let doc = make::document(vec![
+        make::step("dd if=/dev/null of=big bs=1048576 seek=200000 count=0 2>/dev/null"),
+        persist(".", &["big"]),
+    ]);
+    let job = dir.path().join("job.json");
+    std::fs::write(&job, json(&doc)).unwrap();
+    let env = dir.path().join("environment");
+    std::fs::write(&env, "PATH=/usr/bin:/bin\n").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_hatchrun-agent"))
+        .arg("exec")
+        .arg(&job)
+        .arg("--work-dir")
+        .arg(dir.path().join("work"))
+        .args(["--runner-user", "", "--minute", "1s"])
+        .arg("--env-file")
+        .arg(&env)
+        .arg("--store")
+        .arg(store.path())
+        .arg("--result")
+        .arg(dir.path().join("result.json"))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let asked = Instant::now();
+    term(&child);
+    let _ = child.wait_with_output().unwrap();
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        asked.elapsed()
+    );
+    let result = result(dir.path());
+    assert_eq!(result.conclusion, Conclusion::Cancelled);
+    assert_eq!(result.steps[1].outcome, Conclusion::Cancelled);
+    assert!(!store.path().join("workspace/1/build.1.tar.gz").exists());
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("work/_hatchrun"))
+            .unwrap()
+            .count(),
+        0
+    );
 }

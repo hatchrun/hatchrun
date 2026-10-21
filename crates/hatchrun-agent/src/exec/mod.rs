@@ -16,6 +16,7 @@ pub mod layout;
 pub mod lines;
 pub mod mask;
 pub mod node;
+pub mod pack;
 pub mod shell;
 pub mod sink;
 pub mod step;
@@ -122,6 +123,8 @@ pub async fn run_job(
     )
     .with_context(|| format!("open {}", layout.workspace.display()))?;
 
+    let stage_fd = builtin::open_stage(&layout.stage)?;
+
     let mut masker = Masker::default();
     for secret in doc.secrets.values() {
         masker.add(secret);
@@ -153,7 +156,8 @@ pub async fn run_job(
         depth: 0,
         composite_runs: 0,
         next_slot: 3 * doc.job.steps.len(),
-        workspace_fd,
+        workspace_fd: std::sync::Arc::new(workspace_fd),
+        stage_fd: std::sync::Arc::new(stage_fd),
         cache_saves: Vec::new(),
     };
     job.start();
@@ -246,7 +250,9 @@ struct Job<'a> {
     /// Real steps and their `pre` and `post` use the slots below it.
     next_slot: usize,
     /// The workspace directory, opened before any step ran.
-    workspace_fd: std::os::fd::OwnedFd,
+    workspace_fd: std::sync::Arc<std::os::fd::OwnedFd>,
+    /// `<work>/_hatchrun`, which only the agent can write.
+    stage_fd: std::sync::Arc<std::os::fd::OwnedFd>,
     /// Caches to save when the job ends, in step order.
     cache_saves: Vec<builtin::CacheSave>,
 }

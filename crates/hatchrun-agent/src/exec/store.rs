@@ -7,14 +7,13 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 
 /// The longest key or restore key, in bytes.
-pub const MAX_KEY_BYTES: usize = 512;
+pub const MAX_KEY_BYTES: usize = 240;
 
 /// The file name suffix of a stored archive.
 const SUFFIX: &str = ".tar.gz";
@@ -57,8 +56,12 @@ pub trait Store {
     /// Opens the archive stored under `key`, if there is one.
     async fn get(&self, key: &StoreKey) -> Result<Option<Box<dyn Read + Send>>>;
 
-    /// Stores the file at `file` under `key`, replacing what was there.
-    async fn put(&self, key: &StoreKey, file: &Path) -> Result<()>;
+    /// Stores what `src` yields under `key`, replacing what was there.
+    async fn put(&self, key: &StoreKey, src: &mut (dyn Read + Send)) -> Result<()>;
+
+    /// The names of the archives of `kind` in `scope` whose name starts
+    /// with `prefix`, in no particular order.
+    async fn list_prefix(&self, kind: Kind, scope: &str, prefix: &str) -> Result<Vec<String>>;
 
     /// The name of the newest archive of `kind` in `scope` whose name
     /// starts with `prefix`.
@@ -107,36 +110,43 @@ impl Store for DirStore {
         }
     }
 
-    async fn put(&self, key: &StoreKey, file: &Path) -> Result<()> {
+    async fn put(&self, key: &StoreKey, src: &mut (dyn Read + Send)) -> Result<()> {
         let dest = self.file(key)?;
         let dir = dest.parent().context("no parent")?;
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        // The file sits in a directory the runner user can write to, so
-        // it is never followed if it was swapped for a link.
-        let mut src = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
-            .open(file)
-            .with_context(|| format!("open {}", file.display()))?;
         let mut tmp = tempfile::Builder::new()
             .prefix(".put-")
             .tempfile_in(dir)
             .with_context(|| format!("create a file in {}", dir.display()))?;
-        io::copy(&mut src, tmp.as_file_mut()).context("copy the archive")?;
+        io::copy(src, tmp.as_file_mut()).context("copy the archive")?;
         tmp.persist(&dest)
             .map_err(|e| e.error)
             .with_context(|| format!("write {}", dest.display()))?;
         Ok(())
     }
 
+    async fn list_prefix(&self, kind: Kind, scope: &str, prefix: &str) -> Result<Vec<String>> {
+        let found = self.scan(kind, scope, prefix)?;
+        Ok(found.into_iter().map(|(_, name)| name).collect())
+    }
+
     async fn find_prefix(&self, kind: Kind, scope: &str, prefix: &str) -> Result<Option<String>> {
+        let found = self.scan(kind, scope, prefix)?;
+        Ok(found.into_iter().max().map(|(_, name)| name))
+    }
+}
+
+impl DirStore {
+    /// The `(mtime, name)` of every archive in `scope` whose name starts
+    /// with `prefix`.
+    fn scan(&self, kind: Kind, scope: &str, prefix: &str) -> Result<Vec<(SystemTime, String)>> {
         let dir = self.scope_dir(kind, scope)?;
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err).with_context(|| format!("read {}", dir.display())),
         };
-        let mut best: Option<(SystemTime, String)> = None;
+        let mut found = Vec::new();
         for entry in entries {
             let entry = entry.with_context(|| format!("read {}", dir.display()))?;
             let file_name = entry.file_name();
@@ -148,18 +158,11 @@ impl Store for DirStore {
                 continue;
             };
             let meta = entry.metadata()?;
-            if !meta.is_file() {
-                continue;
-            }
-            let mtime = meta.modified()?;
-            if best
-                .as_ref()
-                .is_none_or(|(t, n)| (mtime, name) > (*t, n.as_str()))
-            {
-                best = Some((mtime, name.to_owned()));
+            if meta.is_file() {
+                found.push((meta.modified()?, name.to_owned()));
             }
         }
-        Ok(best.map(|(_, name)| name))
+        Ok(found)
     }
 }
 
@@ -187,19 +190,39 @@ pub fn validate_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Turns a job name into a file name: everything but letters, digits,
-/// and `. _ -` and the space becomes `%XX`, so that two names never
-/// share a file.
+/// Turns a job id into a file name part: everything but letters, digits,
+/// `_`, `-` and the space becomes `%XX` (so the `.` that ends the part
+/// never appears inside it), and two ids never share a part.
 pub fn encode_name(name: &str) -> String {
     use std::fmt::Write;
 
     let mut out = String::with_capacity(name.len());
     for byte in name.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b' ') {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b' ') {
             out.push(char::from(byte));
         } else {
             let _ = write!(out, "%{byte:02X}");
         }
+    }
+    out
+}
+
+/// The longest encoded job id kept as it is, in bytes.
+const MAX_ID_BYTES: usize = 200;
+
+/// The file name part for a job id: its encoding, or the SHA-256 in hex
+/// when that would be longer than [`MAX_ID_BYTES`].
+pub fn entry_id(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let encoded = encode_name(id);
+    if encoded.len() <= MAX_ID_BYTES {
+        return encoded;
+    }
+    let mut out = String::with_capacity(64);
+    for byte in Sha256::digest(id.as_bytes()) {
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }
@@ -216,10 +239,8 @@ mod tests {
         }
     }
 
-    fn source(dir: &Path, text: &str) -> PathBuf {
-        let path = dir.join("src.tar.gz");
-        fs::write(&path, text).unwrap();
-        path
+    fn source(text: &str) -> io::Cursor<Vec<u8>> {
+        io::Cursor::new(text.as_bytes().to_vec())
     }
 
     #[tokio::test]
@@ -230,8 +251,8 @@ mod tests {
         };
         let k = key(Kind::Cache, "acme%2Frepo", "k1");
         assert!(store.get(&k).await.unwrap().is_none());
-        store.put(&k, &source(dir.path(), "one")).await.unwrap();
-        store.put(&k, &source(dir.path(), "two")).await.unwrap();
+        store.put(&k, &mut source("one")).await.unwrap();
+        store.put(&k, &mut source("two")).await.unwrap();
         let mut text = String::new();
         store
             .get(&k)
@@ -258,12 +279,14 @@ mod tests {
         let store = DirStore {
             root: dir.path().to_owned(),
         };
-        let src = source(dir.path(), "x");
         for name in ["deps-a", "deps-b", "other"] {
-            store.put(&key(Kind::Cache, "s", name), &src).await.unwrap();
+            store
+                .put(&key(Kind::Cache, "s", name), &mut source("x"))
+                .await
+                .unwrap();
         }
         store
-            .put(&key(Kind::Cache, "t", "deps-z"), &src)
+            .put(&key(Kind::Cache, "t", "deps-z"), &mut source("x"))
             .await
             .unwrap();
         let old = File::options()
@@ -281,6 +304,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other_kind, None);
+        let mut all = store.list_prefix(Kind::Cache, "s", "deps-").await.unwrap();
+        all.sort();
+        assert_eq!(all, ["deps-a", "deps-b"]);
     }
 
     #[tokio::test]
@@ -289,10 +315,9 @@ mod tests {
         let store = DirStore {
             root: dir.path().to_owned(),
         };
-        let src = source(dir.path(), "x");
         for (scope, name) in [("..", "a"), ("s", "../a"), ("a/b", "k"), ("", "k")] {
             let err = store
-                .put(&key(Kind::Cache, scope, name), &src)
+                .put(&key(Kind::Cache, scope, name), &mut source("x"))
                 .await
                 .unwrap_err();
             assert!(
@@ -302,31 +327,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn put_does_not_follow_a_link_as_its_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = DirStore {
-            root: dir.path().join("store"),
-        };
-        let secret = dir.path().join("secret");
-        fs::write(&secret, "s").unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&secret, &link).unwrap();
-        let err = store
-            .put(&key(Kind::Cache, "s", "k"), &link)
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("open"), "{err:#}");
-    }
-
     #[test]
     fn keys_are_checked() {
         assert!(validate_key("deps-v1.2_x y!#").is_ok());
-        assert!(validate_key(&"a".repeat(512)).is_ok());
+        assert!(validate_key(&"a".repeat(240)).is_ok());
         for bad in ["", "a/b", "a\\b", "caf\u{e9}", "a\nb", "a\u{0}b"] {
             assert!(validate_key(bad).is_err(), "{bad:?}");
         }
-        assert!(validate_key(&"a".repeat(513)).is_err());
+        assert!(validate_key(&"a".repeat(241)).is_err());
     }
 
     #[test]
@@ -335,5 +343,16 @@ mod tests {
         assert_eq!(encode_name("a/b"), "a%2Fb");
         assert_eq!(encode_name("a%2Fb"), "a%252Fb");
         assert_eq!(encode_name("t (x)"), "t %28x%29");
+        assert_eq!(encode_name("a.1"), "a%2E1");
+    }
+
+    #[test]
+    fn long_ids_become_a_hash() {
+        assert_eq!(entry_id("build"), "build");
+        let long = "x".repeat(300);
+        let id = entry_id(&long);
+        assert_eq!(id.len(), 64);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(id, entry_id(&"x".repeat(301)));
     }
 }
