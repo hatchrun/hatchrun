@@ -18,9 +18,6 @@ pub struct Layout {
     pub workspace: PathBuf,
     /// `RUNNER_TEMP`: `<work>/_temp`.
     pub temp: PathBuf,
-    /// Where the agent stages archives: `<work>/_hatchrun`. Owned by
-    /// the agent and closed to the runner user.
-    pub stage: PathBuf,
     /// Downloaded actions: `<work>/_actions`.
     pub actions: PathBuf,
     /// `RUNNER_TOOL_CACHE`.
@@ -35,7 +32,6 @@ impl Layout {
             work: work.to_owned(),
             workspace: work.join(name).join(name),
             temp: work.join("_temp"),
-            stage: work.join("_hatchrun"),
             actions: work.join("_actions"),
             tool_cache: tool_cache.to_owned(),
         }
@@ -64,7 +60,6 @@ mod tests {
         );
         assert_eq!(layout.workspace, Path::new("/w/repo/repo"));
         assert_eq!(layout.temp, Path::new("/w/_temp"));
-        assert_eq!(layout.stage, Path::new("/w/_hatchrun"));
         assert_eq!(layout.actions, Path::new("/w/_actions"));
         assert_eq!(layout.tool_cache, Path::new("/opt/hostedtoolcache"));
     }

@@ -13,6 +13,12 @@ use std::time::{Duration, Instant};
 
 use hatchrun_workflow::{Conclusion, JobDocument, JobResult, PlannedStep};
 
+/// A state directory the test owns. The path is canonical, since the
+/// agent refuses links on the way to it.
+fn state_dir(dir: &Path) -> std::path::PathBuf {
+    dir.canonicalize().unwrap().join("state")
+}
+
 fn exec(dir: &Path, doc: &str) -> Output {
     exec_with(dir, doc, &[])
 }
@@ -27,6 +33,8 @@ fn exec_with(dir: &Path, doc: &str, extra: &[&str]) -> Output {
         .arg(&job)
         .arg("--work-dir")
         .arg(dir.join("work"))
+        .arg("--state-dir")
+        .arg(state_dir(dir))
         .args(["--runner-user", ""])
         .arg("--env-file")
         .arg(&env)
@@ -329,6 +337,8 @@ fn sigterm_cancels_the_running_step() {
         .arg(&job)
         .arg("--work-dir")
         .arg(dir.path().join("work"))
+        .arg("--state-dir")
+        .arg(state_dir(dir.path()))
         .args(["--runner-user", ""])
         .arg("--env-file")
         .arg(&env)
@@ -831,6 +841,8 @@ fn start_agent(dir: &Path, doc: &JobDocument) -> std::process::Child {
         .arg(&job)
         .arg("--work-dir")
         .arg(dir.join("work"))
+        .arg("--state-dir")
+        .arg(state_dir(dir))
         .args(["--runner-user", "", "--minute", "1s"])
         .arg("--env-file")
         .arg(&env)
@@ -1719,7 +1731,7 @@ fn the_stage_is_private_and_left_empty() {
         ],
     );
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
-    let stage = dir.path().join("work/_hatchrun");
+    let stage = state_dir(dir.path()).join("stage");
     let mode = std::fs::metadata(&stage).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700);
     assert_eq!(std::fs::read_dir(&stage).unwrap().count(), 0);
@@ -1728,14 +1740,29 @@ fn the_stage_is_private_and_left_empty() {
 #[test]
 fn a_planted_stage_link_stops_the_job() {
     let dir = tempfile::tempdir().unwrap();
-    let work = dir.path().join("work");
-    std::fs::create_dir_all(&work).unwrap();
+    let state = state_dir(dir.path());
+    std::fs::create_dir_all(&state).unwrap();
     let elsewhere = dir.path().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, work.join("_hatchrun")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, state.join("stage")).unwrap();
     let out = run_steps(dir.path(), vec![make::step("echo ran")]);
     assert_ne!(out.status.code(), Some(0));
     assert!(!stdout(&out).contains("ran"));
+}
+
+#[test]
+fn a_state_dir_others_can_write_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_dir(dir.path());
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let out = run_steps(dir.path(), vec![make::step("echo ran")]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!stdout(&out).contains("ran"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not be writable by others"), "{stderr}");
 }
 
 #[test]
@@ -1768,6 +1795,8 @@ fn a_cancel_ends_a_large_save_promptly() {
         .arg(&job)
         .arg("--work-dir")
         .arg(dir.path().join("work"))
+        .arg("--state-dir")
+        .arg(state_dir(dir.path()))
         .args(["--runner-user", "", "--minute", "1s"])
         .arg("--env-file")
         .arg(&env)
@@ -1792,7 +1821,7 @@ fn a_cancel_ends_a_large_save_promptly() {
     assert_eq!(result.steps[1].outcome, Conclusion::Cancelled);
     assert!(!store.path().join("workspace/1/build.1.tar.gz").exists());
     assert_eq!(
-        std::fs::read_dir(dir.path().join("work/_hatchrun"))
+        std::fs::read_dir(state_dir(dir.path()).join("stage"))
             .unwrap()
             .count(),
         0

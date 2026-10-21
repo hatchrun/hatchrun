@@ -60,6 +60,9 @@ pub struct Options {
     /// The directory that keeps cache, workspace and test result
     /// archives.
     pub store: Option<PathBuf>,
+    /// Where the agent keeps files the runner user must not reach. The
+    /// archive staging area is `<state_dir>/stage`.
+    pub state_dir: PathBuf,
     /// `RUNNER_TOOL_CACHE`.
     pub tool_cache: PathBuf,
     /// How long one `timeout-minutes` minute lasts. Tests shorten it.
@@ -123,7 +126,7 @@ pub async fn run_job(
     )
     .with_context(|| format!("open {}", layout.workspace.display()))?;
 
-    let stage_fd = builtin::open_stage(&layout.stage)?;
+    let stage_fd = builtin::open_stage(&opts.state_dir)?;
 
     let mut masker = Masker::default();
     for secret in doc.secrets.values() {
@@ -157,6 +160,7 @@ pub async fn run_job(
         composite_runs: 0,
         next_slot: 3 * doc.job.steps.len(),
         workspace_fd: std::sync::Arc::new(workspace_fd),
+        stage: opts.state_dir.join("stage"),
         stage_fd: std::sync::Arc::new(stage_fd),
         cache_saves: Vec::new(),
     };
@@ -251,7 +255,8 @@ struct Job<'a> {
     next_slot: usize,
     /// The workspace directory, opened before any step ran.
     workspace_fd: std::sync::Arc<std::os::fd::OwnedFd>,
-    /// `<work>/_hatchrun`, which only the agent can write.
+    /// `<state dir>/stage`, which only the agent can write.
+    stage: PathBuf,
     stage_fd: std::sync::Arc<std::os::fd::OwnedFd>,
     /// Caches to save when the job ends, in step order.
     cache_saves: Vec<builtin::CacheSave>,

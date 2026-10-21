@@ -106,6 +106,12 @@ enum Command {
         /// Directory of prefetched actions.
         #[arg(long)]
         store: Option<PathBuf>,
+        /// Where the agent keeps what the runner user must not reach,
+        /// such as the staging area for cache and workspace archives.
+        /// Created if missing; every directory on the path must belong
+        /// to the agent or root and be closed to others.
+        #[arg(long, default_value = "/var/lib/hatchrun-agent")]
+        state_dir: PathBuf,
         /// Where to write the job result, as JSON.
         #[arg(long)]
         result: Option<PathBuf>,
@@ -132,6 +138,7 @@ async fn main() -> ExitCode {
         env_file,
         node,
         store,
+        state_dir,
         result,
         minute,
     }) = &args.command
@@ -142,6 +149,7 @@ async fn main() -> ExitCode {
             env_file: env_file.clone(),
             node: node.clone(),
             store: store.clone(),
+            state_dir: state_dir.clone(),
             tool_cache: PathBuf::from("/opt/hostedtoolcache"),
             minute: *minute,
         };

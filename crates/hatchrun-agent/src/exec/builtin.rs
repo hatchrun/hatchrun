@@ -8,7 +8,7 @@
 //! is writable by steps and background processes while the agent works
 //! on it as root. So:
 //!
-//! - Restores extract into a directory under `<work>/_hatchrun`, which
+//! - Restores extract into a directory under `<state-dir>/stage`, which
 //!   the runner user cannot write, then move entries into the workspace
 //!   one path component at a time with `openat(O_NOFOLLOW)` from a
 //!   descriptor of the workspace that was opened before any step ran.
@@ -82,36 +82,74 @@ fn common(name: &str) -> Common {
     }
 }
 
-/// Creates `<work>/_hatchrun` for the agent alone and opens it. The
-/// directory is never handed to the runner user. One that already
-/// exists must be a real directory owned by the agent, closed to
-/// everyone else.
+/// Opens `<state_dir>/stage`, creating missing directories 0700. Every
+/// directory from `/` down is opened with `O_NOFOLLOW` from the one
+/// above it and must belong to the agent or root and be closed to
+/// other writers, so the runner user cannot rename or replace any
+/// part of the path. The stage itself must be closed to everyone else.
 ///
 /// # Errors
 ///
-/// When the directory cannot be created or is not private.
-pub fn open_stage(path: &Path) -> anyhow::Result<OwnedFd> {
-    use anyhow::Context;
+/// When a directory cannot be created or opened, is a link, or is not
+/// private; the message names it.
+pub fn open_stage(state_dir: &Path) -> anyhow::Result<OwnedFd> {
+    use anyhow::{Context, bail};
 
-    match mkdirat(AT_FDCWD, path, Mode::from_bits_truncate(0o700)) {
-        Ok(()) | Err(Errno::EEXIST) => {}
-        Err(err) => return Err(err).with_context(|| format!("create {}", path.display())),
+    if !state_dir.is_absolute() {
+        bail!(
+            "--state-dir {} must be an absolute path",
+            state_dir.display()
+        );
     }
-    let fd = openat(
-        AT_FDCWD,
-        path,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .with_context(|| format!("open {}, which must be a directory", path.display()))?;
-    let stat = fstat(&fd)?;
-    if stat.st_uid != geteuid().as_raw() || stat.st_mode & 0o077 != 0 {
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut shown = PathBuf::from("/");
+    let mut dir = openat(AT_FDCWD, "/", flags, Mode::empty()).context("open /")?;
+    check_private(&dir, &shown, false)?;
+    let parts: Vec<&OsStr> = state_dir
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(Ok(name)),
+            Component::RootDir => None,
+            _ => Some(Err(anyhow::anyhow!(
+                "--state-dir {} must not contain `.` or `..`",
+                state_dir.display()
+            ))),
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let total = parts.len() + 1;
+    for (i, part) in parts.into_iter().chain([OsStr::new("stage")]).enumerate() {
+        shown.push(part);
+        match mkdirat(&dir, part, Mode::from_bits_truncate(0o700)) {
+            Ok(()) | Err(Errno::EEXIST) => {}
+            Err(err) => return Err(err).with_context(|| format!("create {}", shown.display())),
+        }
+        dir = openat(&dir, part, flags, Mode::empty()).with_context(|| {
+            format!(
+                "open {}, which must be a directory and not a link",
+                shown.display()
+            )
+        })?;
+        check_private(&dir, &shown, i + 1 == total)?;
+    }
+    Ok(dir)
+}
+
+/// Requires `dir` to belong to the agent or root, and to be closed to
+/// group and others (a sticky directory may be writable: others cannot
+/// rename what they do not own). `strict` closes it to reading as well.
+fn check_private(dir: &OwnedFd, path: &Path, strict: bool) -> anyhow::Result<()> {
+    let stat = fstat(dir)?;
+    let mode = u32::from(stat.st_mode);
+    let sticky = mode & 0o1000 != 0;
+    let writable_by_others = mode & 0o022 != 0 && !sticky;
+    let owner_ok = stat.st_uid == geteuid().as_raw() || stat.st_uid == 0;
+    if !owner_ok || writable_by_others || (strict && mode & 0o077 != 0) {
         anyhow::bail!(
-            "{} must be owned by the agent and closed to other users",
+            "{} must belong to the agent or root and not be writable by others",
             path.display()
         );
     }
-    Ok(fd)
+    Ok(())
 }
 
 /// What a blocking thread needs of the job.
@@ -233,7 +271,10 @@ impl Fs {
         )
         .map_err(|e| format!("create a directory in {}: {e}", self.stage.display()))?;
         let path = self.stage.join(&name);
-        let _cleanup = RemoveDir(&path);
+        let _cleanup = RemoveDir {
+            stage: self.stage_fd.clone(),
+            name: name.clone(),
+        };
         let held = open_dir(&*self.stage_fd, &name)
             .map_err(|e| format!("open the restore directory: {e}"))?;
         extract_tar_gz_with(
@@ -273,14 +314,44 @@ impl Fs {
     }
 }
 
-/// Removes a directory tree when dropped. A link there is removed, not
-/// followed.
-struct RemoveDir<'a>(&'a Path);
+/// Removes a directory of the stage when dropped, relative to the
+/// stage descriptor. Links are removed, never followed.
+struct RemoveDir {
+    stage: Arc<OwnedFd>,
+    name: String,
+}
 
-impl Drop for RemoveDir<'_> {
+impl Drop for RemoveDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(self.0);
+        remove_tree(&self.stage, OsStr::new(&self.name));
     }
+}
+
+fn remove_tree(parent: &OwnedFd, name: &OsStr) {
+    if let Ok(dir) = open_dir(parent, name)
+        && let Ok(mut listing) = Dir::openat(
+            &dir,
+            ".",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+    {
+        let names: Vec<OsString> = listing
+            .iter()
+            .filter_map(Result::ok)
+            .map(|e| OsStr::from_bytes(e.file_name().to_bytes()).to_owned())
+            .filter(|n| n != "." && n != "..")
+            .collect();
+        for child in names {
+            match fstatat(&dir, child.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(st) if kind_of(st.st_mode) == SFlag::S_IFDIR => remove_tree(&dir, &child),
+                _ => {
+                    let _ = unlinkat(&dir, child.as_os_str(), UnlinkatFlags::NoRemoveDir);
+                }
+            }
+        }
+    }
+    let _ = unlinkat(parent, name, UnlinkatFlags::RemoveDir);
 }
 
 impl Job<'_> {
@@ -404,7 +475,7 @@ impl Job<'_> {
             workspace_fd: self.workspace_fd.clone(),
             workspace: self.layout.workspace.clone(),
             stage_fd: self.stage_fd.clone(),
-            stage: self.layout.stage.clone(),
+            stage: self.stage.clone(),
             owner: self.owner,
         }
     }
