@@ -376,3 +376,65 @@ fn set_output_works_and_warns() {
         "{text}"
     );
 }
+
+#[test]
+fn script_is_private_and_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut step = make::run(
+        "import os, stat, sys\nprint('mode', oct(stat.S_IMODE(os.stat(sys.argv[0]).st_mode)))\nprint('file', sys.argv[0])",
+    );
+    step.shell = Some("python3 {0}".to_owned());
+    let out = run_steps(dir.path(), vec![make::planned(step)]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = stdout(&out);
+    assert!(text.lines().any(|l| l == "mode 0o600"), "{text}");
+    let file = text.lines().find_map(|l| l.strip_prefix("file ")).unwrap();
+    assert!(!Path::new(file).exists(), "{file} was not removed");
+}
+
+#[test]
+fn script_is_removed_when_the_step_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    run_steps(dir.path(), vec![make::step("exit 1")]);
+    let left: Vec<_> = std::fs::read_dir(dir.path().join("work/_temp"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| Path::new(n).extension().is_some_and(|e| e == "sh"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn bad_step_name_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut step = make::run("echo ok");
+    step.name = Some("${{ nope( }}".to_owned());
+    let out = run_steps(dir.path(), vec![make::planned(step)]);
+    assert!(stdout(&out).contains("Warning: name:"), "{}", stdout(&out));
+}
+
+#[test]
+fn no_process_survives_an_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(
+        dir.path(),
+        vec![make::step(
+            "(trap '' HUP; sleep 600) & echo $! > \"$RUNNER_TEMP/p.pid\"",
+        )],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let pid = std::fs::read_to_string(dir.path().join("work/_temp/p.pid")).unwrap();
+    let gone = (0..20).any(|_| {
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if alive {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        !alive
+    });
+    assert!(gone);
+}

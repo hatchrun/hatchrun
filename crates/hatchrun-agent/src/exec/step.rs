@@ -36,6 +36,21 @@ const AFTER_INT: Duration = Duration::from_millis(7500);
 /// SIGTERM, then this long, then SIGKILL.
 const AFTER_TERM: Duration = Duration::from_millis(2500);
 
+/// Annotations of one level one step may attach.
+const MAX_PER_LEVEL: usize = 10;
+/// Annotations one job may attach.
+pub const MAX_PER_JOB: usize = 50;
+/// The longest annotation message kept, in bytes.
+const MAX_MESSAGE: usize = 4 << 10;
+/// `::set-output::` pairs one step may print.
+const MAX_OUTPUTS: usize = 1000;
+/// The most bytes of `::set-output::` names and values one step may print.
+const MAX_OUTPUT_BYTES: usize = 1 << 20;
+/// Values one job may hide with `::add-mask::`.
+pub const MAX_MASKS: usize = 1000;
+/// The longest `::add-mask::` value, in bytes.
+const MAX_MASK_LEN: usize = 64 << 10;
+
 const SET_OUTPUT_WARNING: &str = "Warning: The `set-output` command is deprecated and will be disabled soon. Write name=value to the file named by $GITHUB_OUTPUT instead.";
 
 /// A process to run for a step.
@@ -66,12 +81,36 @@ pub enum Exit {
     Cancelled,
 }
 
+/// What a job has used up of its limits. One per job, shared by its steps.
+#[derive(Debug, Default)]
+pub struct Budget {
+    /// Values hidden with `::add-mask::` so far.
+    pub masks: usize,
+}
+
+/// Cuts `text` to at most `max` bytes without splitting a character.
+fn truncate(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut cut = max;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    text
+}
+
 /// Where a step's text goes: lines are split, commands act, and the
 /// [`Masker`] hides secrets before the [`Sink`] sees anything.
 pub struct StepOutput<'a> {
     masker: &'a mut Masker,
     sink: &'a mut dyn Sink,
     annotations: &'a mut Vec<Annotation>,
+    budget: &'a mut Budget,
+    per_level: [usize; 3],
+    output_bytes: usize,
+    /// Whether the limit warning and the mask warning were printed.
+    warned: [bool; 2],
     parser: Parser,
     lines: Lines,
     echo: bool,
@@ -86,11 +125,16 @@ impl<'a> StepOutput<'a> {
         masker: &'a mut Masker,
         sink: &'a mut dyn Sink,
         annotations: &'a mut Vec<Annotation>,
+        budget: &'a mut Budget,
     ) -> Self {
         Self {
             masker,
             sink,
             annotations,
+            budget,
+            per_level: [0; 3],
+            output_bytes: 0,
+            warned: [false; 2],
             parser: Parser::default(),
             lines: Lines::default(),
             echo: false,
@@ -141,6 +185,20 @@ impl<'a> StepOutput<'a> {
         self.refused
     }
 
+    fn warn_limit(&mut self, message: &str) {
+        if !self.warned[0] {
+            self.warned[0] = true;
+            self.warning(message);
+        }
+    }
+
+    fn warn_mask(&mut self, message: &str) {
+        if !self.warned[1] {
+            self.warned[1] = true;
+            self.warning(message);
+        }
+    }
+
     fn handle(&mut self, raw: &str) {
         match self.parser.parse(raw) {
             None => self.line(raw),
@@ -158,11 +216,18 @@ impl<'a> StepOutput<'a> {
     fn command(&mut self, command: WorkflowCommand, raw: &str) {
         match command {
             WorkflowCommand::AddMask(value) => {
-                self.masker.add(&value);
+                if value.len() > MAX_MASK_LEN {
+                    self.warn_mask("an `add-mask` value over 64 KiB was ignored");
+                } else if self.budget.masks >= MAX_MASKS {
+                    self.warn_mask("the limit of 1000 `add-mask` values was reached");
+                } else {
+                    self.budget.masks += 1;
+                    self.masker.add(&value);
+                }
                 self.echoed(raw);
             }
             WorkflowCommand::Annotation(mut a) => {
-                a.message = self.masker.mask(&a.message).into_owned();
+                a.message = truncate(self.masker.mask(&a.message).into_owned(), MAX_MESSAGE);
                 a.title = a.title.map(|t| self.masker.mask(&t).into_owned());
                 a.file = a.file.map(|f| self.masker.mask(&f).into_owned());
                 let level = match a.level {
@@ -170,9 +235,21 @@ impl<'a> StepOutput<'a> {
                     AnnotationLevel::Warning => "Warning",
                     AnnotationLevel::Notice => "Notice",
                 };
-                self.sink.annotation(&a);
                 self.sink.line(&format!("{level}: {}", a.message));
-                self.annotations.push(a);
+                let slot = match a.level {
+                    AnnotationLevel::Error => 0,
+                    AnnotationLevel::Warning => 1,
+                    AnnotationLevel::Notice => 2,
+                };
+                if self.per_level[slot] >= MAX_PER_LEVEL || self.annotations.len() >= MAX_PER_JOB {
+                    self.warn_limit(
+                        "annotation limit reached: 10 per level per step and 50 per job; the rest are dropped",
+                    );
+                } else {
+                    self.per_level[slot] += 1;
+                    self.sink.annotation(&a);
+                    self.annotations.push(a);
+                }
             }
             WorkflowCommand::Debug(text) => self.line(&format!("##[debug]{text}")),
             WorkflowCommand::Group(title) => self.line(&format!("##[group]{title}")),
@@ -181,7 +258,14 @@ impl<'a> StepOutput<'a> {
             WorkflowCommand::Echo(on) => self.echo = on,
             WorkflowCommand::SetOutput { name, value } => {
                 self.line(SET_OUTPUT_WARNING);
-                self.outputs.push((name, value));
+                self.output_bytes += name.len() + value.len();
+                if self.outputs.len() >= MAX_OUTPUTS || self.output_bytes > MAX_OUTPUT_BYTES {
+                    self.warn_limit(
+                        "output limit reached: 1000 values and 1 MiB per step; the rest are dropped",
+                    );
+                } else {
+                    self.outputs.push((name, value));
+                }
             }
             WorkflowCommand::Refused(message) => {
                 self.refused = true;
@@ -193,6 +277,21 @@ impl<'a> StepOutput<'a> {
 
 fn far_future() -> Instant {
     Instant::now() + Duration::from_hours(24 * 365 * 30)
+}
+
+/// Kills the process group when dropped, so no exit path of [`spawn`],
+/// including a dropped future, leaves it running.
+struct GroupGuard {
+    pid: Pid,
+    armed: bool,
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            signal_group(self.pid, Signal::SIGKILL);
+        }
+    }
 }
 
 fn signal_group(pid: Pid, signal: Signal) {
@@ -249,6 +348,7 @@ pub async fn spawn(
     fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).context("set output pipe non-blocking")?;
     let mut reader = Receiver::from_owned_fd(fd).context("read output pipe")?;
 
+    let mut guard = GroupGuard { pid, armed: true };
     let mut buf = vec![0u8; 16 << 10];
     let timeout_at = p.timeout.map(|t| Instant::now() + t);
     let mut stopping: Option<Exit> = None;
@@ -301,6 +401,7 @@ pub async fn spawn(
         }
     }
     out.finish();
+    guard.armed = false;
 
     if let Some(exit) = stopping {
         return Ok(exit);
@@ -310,4 +411,140 @@ pub async fn spawn(
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
     Ok(Exit::Code(code))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Write;
+
+    use hatchrun_workflow::StepSummary;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Rec {
+        lines: Vec<String>,
+        annotations: usize,
+    }
+
+    impl Sink for Rec {
+        fn step_started(&mut self, _: usize, _: &str) {}
+        fn line(&mut self, text: &str) {
+            self.lines.push(text.to_owned());
+        }
+        fn annotation(&mut self, _: &Annotation) {
+            self.annotations += 1;
+        }
+        fn step_finished(&mut self, _: usize, _: &StepSummary) {}
+    }
+
+    fn feed(text: &str, budget: &mut Budget) -> (Rec, Vec<Annotation>, Vec<(String, String)>) {
+        let mut masker = Masker::default();
+        let mut sink = Rec::default();
+        let mut annotations = Vec::new();
+        let outputs = {
+            let mut out = StepOutput::new(&mut masker, &mut sink, &mut annotations, budget);
+            out.push(text.as_bytes());
+            out.finish();
+            out.take_outputs()
+        };
+        (sink, annotations, outputs)
+    }
+
+    #[test]
+    fn annotations_are_capped_per_level_and_truncated() {
+        let mut text = String::new();
+        for _ in 0..15 {
+            text.push_str("::error::e\n");
+        }
+        let _ = writeln!(text, "::warning::{}", "x".repeat(10_000));
+        let (sink, kept, _) = feed(&text, &mut Budget::default());
+        assert_eq!(kept.len(), 11);
+        assert_eq!(sink.annotations, 11);
+        assert_eq!(kept[10].message.len(), 4096);
+        let warnings = sink
+            .lines
+            .iter()
+            .filter(|l| l.contains("limit reached"))
+            .count();
+        assert_eq!(warnings, 1);
+        assert_eq!(sink.lines.iter().filter(|l| *l == "Error: e").count(), 15);
+    }
+
+    #[test]
+    fn annotations_are_capped_per_job() {
+        let mut masker = Masker::default();
+        let mut sink = Rec::default();
+        let mut kept = Vec::new();
+        let mut budget = Budget::default();
+        for _ in 0..8 {
+            let mut out = StepOutput::new(&mut masker, &mut sink, &mut kept, &mut budget);
+            for level in ["error", "warning", "notice"] {
+                for _ in 0..3 {
+                    out.push(format!("::{level}::m\n").as_bytes());
+                }
+            }
+            out.finish();
+        }
+        assert_eq!(kept.len(), MAX_PER_JOB);
+    }
+
+    #[test]
+    fn set_output_pairs_are_capped() {
+        let mut text = String::new();
+        for i in 0..1100 {
+            let _ = writeln!(text, "::set-output name=n{i}::v");
+        }
+        let (sink, _, outputs) = feed(&text, &mut Budget::default());
+        assert_eq!(outputs.len(), 1000);
+        assert_eq!(
+            sink.lines
+                .iter()
+                .filter(|l| l.contains("output limit"))
+                .count(),
+            1
+        );
+        let line = format!("::set-output name=a::{}\n", "v".repeat(60_000));
+        let (_, _, outputs) = feed(&line.repeat(25), &mut Budget::default());
+        assert!(
+            !outputs.is_empty() && outputs.len() < 25,
+            "{}",
+            outputs.len()
+        );
+    }
+
+    #[test]
+    fn add_mask_is_capped_and_never_printed() {
+        let mut budget = Budget::default();
+        let mut text = String::new();
+        for i in 0..1005 {
+            let _ = writeln!(text, "::add-mask::value{i}");
+        }
+        let (sink, _, _) = feed(&text, &mut budget);
+        assert_eq!(budget.masks, MAX_MASKS);
+        assert!(
+            sink.lines
+                .iter()
+                .all(|l| !(0..1005).any(|i| l.contains(&format!("value{i}"))))
+        );
+        assert_eq!(
+            sink.lines.iter().filter(|l| l.contains("add-mask")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_oversized_mask_value_is_ignored() {
+        let mut masker = Masker::default();
+        let mut sink = Rec::default();
+        let mut kept = Vec::new();
+        let mut budget = Budget::default();
+        let mut out = StepOutput::new(&mut masker, &mut sink, &mut kept, &mut budget);
+        out.command(WorkflowCommand::AddMask("L".repeat(70_000)), "raw");
+        drop(out);
+        assert_eq!(budget.masks, 0);
+        assert_eq!(sink.lines.len(), 1);
+        assert!(sink.lines[0].contains("64 KiB") && !sink.lines[0].contains("LLL"));
+        assert_eq!(masker.mask("LLLL"), "LLLL");
+    }
 }

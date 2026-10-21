@@ -32,7 +32,7 @@ use self::files::StepFiles;
 use self::layout::Layout;
 use self::mask::Masker;
 use self::sink::Sink;
-use self::step::{Exit, Process, StepOutput, spawn};
+use self::step::{Budget, Exit, Process, StepOutput, spawn};
 use crate::envfile;
 use crate::runner::{DEFAULT_PATH, home_of};
 
@@ -74,6 +74,22 @@ pub async fn run_job(
     let layout = Layout::new(&opts.work_dir, &doc.github.repository, &opts.tool_cache);
     layout.create()?;
     let event = write_event(&layout, &doc)?;
+    let owner = opts.runner_user.as_deref().map(owner_of).transpose()?;
+    if let Some(owner) = owner {
+        let dirs = [
+            &layout.work,
+            layout.workspace.parent().unwrap_or(&layout.workspace),
+            &layout.workspace,
+            &layout.temp,
+            &layout.actions,
+            &layout.temp.join("_github_workflow"),
+            &event,
+        ];
+        for path in dirs {
+            nix::unistd::chown(path, Some(owner.0), Some(owner.1))
+                .with_context(|| format!("chown {}", path.display()))?;
+        }
+    }
 
     let mut masker = Masker::default();
     for secret in doc.secrets.values() {
@@ -89,6 +105,8 @@ pub async fn run_job(
         event,
         masker,
         annotations: Vec::new(),
+        budget: Budget::default(),
+        owner,
         github_env: BTreeMap::new(),
         path_dirs: Vec::new(),
         status: JobStatus::Success,
@@ -116,6 +134,14 @@ pub async fn run_job(
     })
 }
 
+/// The user's uid and gid, for handing step files to it.
+fn owner_of(name: &str) -> Result<(nix::unistd::Uid, nix::unistd::Gid)> {
+    let user = nix::unistd::User::from_name(name)
+        .with_context(|| format!("look up user {name}"))?
+        .with_context(|| format!("user {name} does not exist"))?;
+    Ok((user.uid, user.gid))
+}
+
 /// Writes the webhook payload where `GITHUB_EVENT_PATH` points.
 fn write_event(layout: &Layout, doc: &JobDocument) -> Result<PathBuf> {
     let dir = layout.temp.join("_github_workflow");
@@ -135,6 +161,9 @@ struct Job<'a> {
     ctx: Contexts,
     masker: Masker,
     annotations: Vec<Annotation>,
+    budget: Budget,
+    /// The runner user's ids, when steps run as one.
+    owner: Option<(nix::unistd::Uid, nix::unistd::Gid)>,
     /// `GITHUB_ENV` values so far.
     github_env: BTreeMap<String, String>,
     /// `GITHUB_PATH` directories so far, oldest first.
@@ -298,7 +327,12 @@ impl Job<'_> {
     ) -> (Common, Conclusion, BTreeMap<String, String>) {
         sink.step_started(index, &self.masker.mask(&common.name));
         let runs = self.runs(common.if_.as_deref());
-        let mut out = StepOutput::new(&mut self.masker, sink, &mut self.annotations);
+        let mut out = StepOutput::new(
+            &mut self.masker,
+            sink,
+            &mut self.annotations,
+            &mut self.budget,
+        );
         let outcome = match runs {
             Ok(true) => {
                 out.error(&format!("{what} are not supported yet"));
@@ -320,15 +354,13 @@ impl Job<'_> {
         sink: &mut dyn Sink,
     ) -> (Common, Conclusion, BTreeMap<String, String>) {
         let workspace = self.layout.workspace.clone();
-        let default_name = || {
-            let first = step.run.lines().next().unwrap_or_default();
-            format!("Run {first}")
-        };
+        let mut name_error = None;
         let name = match &step.name {
-            Some(name) => {
-                interp(name, &self.ctx, &workspace, self.status).unwrap_or_else(|_| name.clone())
-            }
-            None => default_name(),
+            Some(name) => interp(name, &self.ctx, &workspace, self.status).unwrap_or_else(|err| {
+                name_error = Some(format!("name: {err}"));
+                name.clone()
+            }),
+            None => format!("Run {}", step.run.lines().next().unwrap_or_default()),
         };
         let common = Common {
             name,
@@ -337,12 +369,26 @@ impl Job<'_> {
             continue_on_error: step.continue_on_error,
         };
         sink.step_started(index, &self.masker.mask(&common.name));
+        if let Some(message) = name_error {
+            StepOutput::new(
+                &mut self.masker,
+                sink,
+                &mut self.annotations,
+                &mut self.budget,
+            )
+            .warning(&message);
+        }
 
         match self.runs(common.if_.as_deref()) {
             Ok(true) => {}
             Ok(false) => return (common, Conclusion::Skipped, BTreeMap::new()),
             Err(err) => {
-                let mut out = StepOutput::new(&mut self.masker, sink, &mut self.annotations);
+                let mut out = StepOutput::new(
+                    &mut self.masker,
+                    sink,
+                    &mut self.annotations,
+                    &mut self.budget,
+                );
                 out.error(&format!("if: {err}"));
                 return (common, Conclusion::Failure, BTreeMap::new());
             }
@@ -354,7 +400,12 @@ impl Job<'_> {
         };
         // `prepare` borrowed the job; the output borrows its masker and
         // annotations from here on.
-        let mut out = StepOutput::new(&mut self.masker, sink, &mut self.annotations);
+        let mut out = StepOutput::new(
+            &mut self.masker,
+            sink,
+            &mut self.annotations,
+            &mut self.budget,
+        );
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(message) => {
@@ -371,26 +422,10 @@ impl Job<'_> {
             user: self.opts.runner_user.as_deref(),
             timeout: prepared.timeout,
         };
-        let mut outcome = match spawn(process, &mut out, &mut self.cancel).await {
-            Ok(Exit::Code(0)) => Conclusion::Success,
-            Ok(Exit::Code(code)) => {
-                out.error(&format!("Process completed with exit code {code}."));
-                Conclusion::Failure
-            }
-            Ok(Exit::TimedOut) => {
-                let minutes = step.timeout_minutes.unwrap_or_default();
-                out.error(&format!("The step timed out after {minutes} minutes."));
-                Conclusion::Failure
-            }
-            Ok(Exit::Cancelled) => {
-                out.error("The operation was canceled.");
-                Conclusion::Cancelled
-            }
-            Err(err) => {
-                out.error(&format!("{err:#}"));
-                Conclusion::Failure
-            }
-        };
+        let spawned = spawn(process, &mut out, &mut self.cancel).await;
+        // The script may hold secrets. Nothing needs it after the run.
+        let _ = std::fs::remove_file(&prepared.script);
+        let mut outcome = exit_outcome(&mut out, spawned, step.timeout_minutes);
         if outcome == Conclusion::Cancelled {
             // The signal future resolved once and must not be polled again.
             self.cancel = Box::pin(std::future::pending());
@@ -399,9 +434,9 @@ impl Job<'_> {
             outcome = Conclusion::Failure;
         }
 
-        let mut outputs = BTreeMap::new();
         let mut set_outputs = out.take_outputs();
-        match files::read(&prepared.files) {
+        let read = files::read(&prepared.files);
+        match read {
             Ok(written) => {
                 for warning in &written.warnings {
                     out.warning(warning);
@@ -417,9 +452,37 @@ impl Job<'_> {
                 }
             }
         }
-        outputs.extend(set_outputs);
+        let outputs: BTreeMap<String, String> = set_outputs.into_iter().collect();
         self.sync_env();
         (common, outcome, outputs)
+    }
+}
+
+/// Prints how the process ended and maps it to the step's outcome.
+fn exit_outcome(
+    out: &mut StepOutput<'_>,
+    spawned: Result<Exit>,
+    timeout_minutes: Option<u32>,
+) -> Conclusion {
+    match spawned {
+        Ok(Exit::Code(0)) => Conclusion::Success,
+        Ok(Exit::Code(code)) => {
+            out.error(&format!("Process completed with exit code {code}."));
+            Conclusion::Failure
+        }
+        Ok(Exit::TimedOut) => {
+            let minutes = timeout_minutes.unwrap_or_default();
+            out.error(&format!("The step timed out after {minutes} minutes."));
+            Conclusion::Failure
+        }
+        Ok(Exit::Cancelled) => {
+            out.error("The operation was canceled.");
+            Conclusion::Cancelled
+        }
+        Err(err) => {
+            out.error(&format!("{err:#}"));
+            Conclusion::Failure
+        }
     }
 }
 
@@ -429,6 +492,9 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
     let layout = &job.layout;
     let workspace = &layout.workspace;
     let files = StepFiles::create(&layout.temp, index).map_err(|e| format!("{e:#}"))?;
+    if let Some(owner) = job.owner {
+        files.give_to(owner).map_err(|e| format!("{e:#}"))?;
+    }
 
     let mut step_env = BTreeMap::new();
     for (key, value) in &step.env {
@@ -476,7 +542,7 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
     let script = layout
         .temp
         .join(format!("{}.{}", random_name()?, shell.extension));
-    std::fs::write(&script, script_text).map_err(|e| format!("write {}: {e}", script.display()))?;
+    write_script(&script, &script_text, job.owner)?;
 
     Ok(Prepared {
         shell,
@@ -488,6 +554,38 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
             .map(|minutes| job.opts.minute * minutes),
         files,
     })
+}
+
+/// Writes the script readable by its owner only. A script the step
+/// cannot read is removed again.
+fn write_script(
+    path: &Path,
+    text: &str,
+    owner: Option<(nix::unistd::Uid, nix::unistd::Gid)>,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let fail = |e: &dyn std::fmt::Display| format!("write {}: {e}", path.display());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| fail(&e))?;
+    let written = file
+        .write_all(text.as_bytes())
+        .map_err(|e| fail(&e))
+        .and_then(|()| match owner {
+            Some((uid, gid)) => {
+                nix::unistd::chown(path, Some(uid), Some(gid)).map_err(|e| fail(&e))
+            }
+            None => Ok(()),
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    written
 }
 
 /// The environment file's variables, then the ones the runner sets.

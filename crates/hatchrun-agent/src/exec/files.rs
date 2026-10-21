@@ -8,6 +8,7 @@
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -41,7 +42,13 @@ impl StepFiles {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let make = |kind: &str| -> Result<PathBuf> {
             let path = dir.join(format!("{kind}_{step}"));
-            File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("creating {}", path.display()))?;
             Ok(path)
         };
         Ok(Self {
@@ -51,6 +58,30 @@ impl StepFiles {
             path: make("path")?,
             summary: make("summary")?,
         })
+    }
+}
+
+impl StepFiles {
+    /// Hands the files, and the directory that holds them, to `owner`
+    /// so a step running as that user can write them.
+    ///
+    /// # Errors
+    ///
+    /// When a chown fails.
+    pub fn give_to(&self, owner: (nix::unistd::Uid, nix::unistd::Gid)) -> Result<()> {
+        let dir = self.env.parent().unwrap_or(&self.env);
+        for path in [
+            dir,
+            &self.env,
+            &self.output,
+            &self.state,
+            &self.path,
+            &self.summary,
+        ] {
+            nix::unistd::chown(path, Some(owner.0), Some(owner.1))
+                .with_context(|| format!("chown {}", path.display()))?;
+        }
+        Ok(())
     }
 }
 
@@ -247,6 +278,14 @@ mod tests {
 
     fn pair(k: &str, v: &str) -> (String, String) {
         (k.to_owned(), v.to_owned())
+    }
+
+    #[test]
+    fn files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, files) = files_with("");
+        let mode = fs::metadata(&files.env).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
