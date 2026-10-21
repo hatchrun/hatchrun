@@ -132,3 +132,20 @@ fn version() {
     assert_eq!(text(&out.stdout), expected);
     assert!(expected.starts_with("hatchrun "));
 }
+
+#[test]
+fn convert_creates_the_output_directory() {
+    let dir = scratch("fresh-repo");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::copy(
+        fixture("github/ci.yml"),
+        dir.join(".github/workflows/ci.yml"),
+    )
+    .unwrap();
+    let out = run(hatchrun()
+        .args(["convert", "-o", ".hatchrun/config.yml"])
+        .current_dir(&dir));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(dir.join(".hatchrun/config.yml").is_file());
+}

@@ -62,7 +62,6 @@ fn repository(name: &str, workflows: &Path) -> PathBuf {
     }
     let dest = dir.join(".github/workflows");
     std::fs::create_dir_all(&dest).unwrap();
-    std::fs::create_dir_all(dir.join(".hatchrun")).unwrap();
     for entry in std::fs::read_dir(workflows).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {

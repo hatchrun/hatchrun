@@ -120,6 +120,12 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
     let yaml = to_yaml(&conversion.config);
     match output {
         Some(dest) => {
+            // `-o .hatchrun/config.yml` in a repository that has no
+            // `.hatchrun/` yet.
+            if let Some(dir) = dest.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("create {}", dir.display()))?;
+            }
             std::fs::write(dest, yaml).with_context(|| format!("write {}", dest.display()))?;
         }
         None => print!("{yaml}"),
