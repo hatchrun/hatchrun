@@ -30,7 +30,8 @@ use std::process::Command;
 
 use hatchrun_workflow::{
     Arch, Config, Event, ExprError, Functions, JobKind, JobStatus, ParameterKind, Plan, PlannedJob,
-    PlannedStep, Workflow, compile, evaluate, interpolate, parse, to_yaml, triggered, truthy,
+    PlannedStep, Workflow, checks_status, compile, evaluate, interpolate, parse, to_yaml,
+    triggered, truthy,
 };
 use serde_json::{Map, Value, json};
 
@@ -336,11 +337,7 @@ fn condition(cond: &str, ctx: &Value, status: JobStatus) -> Result<bool, ExprErr
         None if trimmed.contains("${{") => Value::String(interpolate(trimmed, ctx, &funcs)?),
         None => evaluate(trimmed, ctx, &funcs)?,
     };
-    let lower = trimmed.to_ascii_lowercase();
-    let checks_status = ["success(", "failure(", "cancelled(", "always("]
-        .iter()
-        .any(|f| lower.contains(f));
-    Ok(truthy(&value) && (checks_status || status == JobStatus::Success))
+    Ok(truthy(&value) && (checks_status(trimmed)? || status == JobStatus::Success))
 }
 
 fn shown(result: Result<bool, ExprError>) -> String {

@@ -137,6 +137,36 @@ fn evaluate_in(
     eval::Evaluator { ctx, funcs, budget }.eval(&ast)
 }
 
+/// Whether an `if:` calls `success()`, `failure()`, `cancelled()` or
+/// `always()`. GitHub runs a step or job whose condition calls none of
+/// them only while everything before it succeeded, as if the condition
+/// were `success() && (...)`.
+///
+/// `cond` is the `if:` as written: a bare expression, or text holding
+/// `${{ }}` expressions. Calls are found in the parsed expression, so a
+/// string literal or a property that spells `success(` is not one.
+///
+/// # Errors
+///
+/// When an expression does not parse or a `${{` is not closed.
+pub fn checks_status(cond: &str) -> Result<bool, ExprError> {
+    let found = if find_open(cond).is_some() {
+        expressions(cond)?
+    } else {
+        vec![(0, cond)]
+    };
+    for (start, inner) in found {
+        let ast = tree(inner).map_err(|e| ExprError {
+            message: e.message,
+            offset: e.offset + start,
+        })?;
+        if eval::calls_status(&ast) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Checks one expression without evaluating it: it must parse, call
 /// only known functions with the right number of arguments and read
 /// only known contexts.

@@ -556,6 +556,29 @@ pub(crate) fn visit_contexts<'s>(
     }
 }
 
+/// Whether `expr` calls a function whose answer is the job status.
+pub(crate) fn calls_status(expr: &Expr<'_>) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Context { .. } => false,
+        Expr::Not(inner) => calls_status(inner),
+        Expr::Access { base, path } => {
+            calls_status(base)
+                || path.iter().any(|step| match step {
+                    Step::Index(index) => calls_status(index),
+                    Step::Property(_) | Step::Filter => false,
+                })
+        }
+        Expr::Call { name, args, .. } => {
+            matches!(*name, "success" | "failure" | "cancelled" | "always")
+                || args.iter().any(calls_status)
+        }
+        Expr::And(args) | Expr::Or(args) => args.iter().any(calls_status),
+        Expr::Compare { first, rest } => {
+            calls_status(first) || rest.iter().any(|(_, e)| calls_status(e))
+        }
+    }
+}
+
 /// Evaluates expression trees against one context.
 pub(crate) struct Evaluator<'a> {
     pub ctx: &'a Value,

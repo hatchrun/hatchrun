@@ -567,3 +567,25 @@ fn check_parses_without_evaluating() {
         assert_eq!(e.offset, offset, "{bad}");
     }
 }
+
+#[test]
+fn checks_status_finds_status_calls_in_the_parsed_expression() {
+    use hatchrun_workflow::checks_status;
+    for (cond, want) in [
+        ("success()", true),
+        ("github.event_name == 'push' || FAILURE()", true),
+        ("!cancelled()", true),
+        ("${{ always() }}", true),
+        ("x ${{ github.sha }} ${{ cancelled() }}", true),
+        ("contains(format('{0}', failure()), 'x')", true),
+        ("github.event.commits[success() && 0]", true),
+        ("github.ref == 'success()'", false),
+        ("steps.failure.outcome == 'always'", false),
+        ("${{ github.event.head_commit.message }} always()", false),
+        ("github.event_name == 'push'", false),
+    ] {
+        assert_eq!(checks_status(cond), Ok(want), "{cond}");
+    }
+    assert!(checks_status("${{ 1 + }}").is_err());
+    assert!(checks_status("${{ success()").is_err());
+}
