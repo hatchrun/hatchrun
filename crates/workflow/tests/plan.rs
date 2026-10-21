@@ -28,6 +28,13 @@ fn errors(yaml: &str) -> Vec<Diagnostic> {
 
 fn assert_error(yaml: &str, words: &[&str]) {
     let errs = errors(yaml);
+    for e in &errs {
+        assert!(
+            !e.message.contains("``"),
+            "doubled backticks: {}",
+            e.message
+        );
+    }
     assert!(
         errs.iter()
             .any(|e| words.iter().all(|w| e.message.contains(w))),
@@ -932,7 +939,11 @@ fn validate_checks_every_expression() {
     for (job, words) in [
         (
             "    runs-on: ubuntu-latest\n    steps: [{ run: \"echo ${{ github.ref == }}\" }]",
-            &["job `t`", "step 1 `run`", "after", "at byte"][..],
+            &[
+                "job `t` step 1 `run` has a bad expression",
+                "after",
+                "at byte",
+            ][..],
         ),
         (
             "    runs-on: ubuntu-latest\n    steps: [{ run: x, if: nosuch.x }]",
@@ -940,7 +951,14 @@ fn validate_checks_every_expression() {
         ),
         (
             "    runs-on: ubuntu-latest\n    env: { A: \"${{ nosuch(1) }}\" }\n    steps: []",
-            &["`env.A`", "unknown function"],
+            &["job `t` `env.A` has a bad expression", "unknown function"],
+        ),
+        (
+            "    runs-on: ubuntu-latest\n    steps: [{ run: x, env: { B: \"${{ nosuch(1) }}\" } }]",
+            &[
+                "job `t` step 1 `env.B` has a bad expression",
+                "unknown function",
+            ],
         ),
         (
             "    runs-on: ubuntu-latest\n    if: \"${{ strategy.job-index }}\"\n    steps: []",
@@ -988,7 +1006,16 @@ commands:
 jobs: { t: { runs-on: ubuntu-latest, steps: [c] } }
 workflows: { ci: { on: { push: {} }, jobs: [t] } }
 ";
-    assert_error(yaml, &["command `c`", "step 1 `if`", "reads `parameters`"]);
+    assert_error(yaml, &["command `c` step 1 `if` reads `parameters`"]);
+    let yaml = "
+commands:
+  c:
+    parameters: { v: { type: string, default: x } }
+    steps: [{ run: x }]
+jobs: { t: { runs-on: ubuntu-latest, steps: [{ c: { v: \"${{ 1 + }}\" } }] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+";
+    assert_error(yaml, &["job `t` step 1 `c` `v` has a bad expression"]);
     let yaml = "
 jobs:
   t: { runs-on: ubuntu-latest, parameters: { v: { type: string } }, steps: [] }

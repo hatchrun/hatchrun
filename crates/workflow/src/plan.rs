@@ -264,13 +264,13 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
             errors,
         };
         for (key, value) in &job.env {
-            check.text(&format!("env.{key}"), value);
+            check.text(&format!("`env.{key}`"), value);
         }
         if let Some(cond) = &job.if_ {
-            check.cond("if", cond);
+            check.cond("`if`", cond);
         }
         for (key, value) in &job.outputs {
-            check.text(&format!("outputs.{key}"), value);
+            check.text(&format!("`outputs.{key}`"), value);
         }
         check.steps(&job.steps);
     }
@@ -296,7 +296,7 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
                 errors,
             };
             for (key, value) in &entry.with {
-                check.value(key, value, &mut |c, field, text| {
+                check.value(&format!("`{key}`"), value, &mut |c, field, text| {
                     if c.text(field, text) {
                         c.errors.push(no_parameters_here(id, key));
                     }
@@ -304,7 +304,7 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
             }
             for (key, values) in &entry.matrix {
                 for value in values {
-                    check.value(key, value, &mut |c, field, text| {
+                    check.value(&format!("`{key}`"), value, &mut |c, field, text| {
                         if c.text(field, text) {
                             c.errors.push(no_parameters_here(id, key));
                         }
@@ -328,7 +328,9 @@ fn default_errors(owner: &str, params: &BTreeMap<String, Parameter>, errors: &mu
     }
 }
 
-/// Checks the strings of one job, command or workflow entry.
+/// Checks the strings of one job, command or workflow entry. Each
+/// method takes the field it checks as it reads in a message, with its
+/// key in backticks, such as "`env.X`" or "step 2 `if`".
 struct Check<'a> {
     config: &'a Config,
     /// The job or command, as named in errors.
@@ -348,7 +350,7 @@ impl Check<'_> {
                     self.text(&at("run"), &run.run);
                     self.opt(&at("shell"), run.shell.as_deref());
                     self.opt(&at("working-directory"), run.working_directory.as_deref());
-                    self.env(&at("env"), &run.env);
+                    self.env(&at, &run.env);
                     if let Some(cond) = &run.if_ {
                         self.cond(&at("if"), cond);
                     }
@@ -367,7 +369,7 @@ impl Check<'_> {
                             c.text(f, t);
                         });
                     }
-                    self.env(&at("env"), &uses.env);
+                    self.env(&at, &uses.env);
                     if let Some(cond) = &uses.if_ {
                         self.cond(&at("if"), cond);
                     }
@@ -402,7 +404,7 @@ impl Check<'_> {
     /// parameters.
     fn call(&mut self, field: &str, name: &str, with: &BTreeMap<String, Value>) {
         for (key, value) in with {
-            self.value(&format!("{field} {key}"), value, &mut |c, f, t| {
+            self.value(&format!("{field} `{key}`"), value, &mut |c, f, t| {
                 c.text(f, t);
             });
         }
@@ -441,9 +443,10 @@ impl Check<'_> {
         }
     }
 
-    fn env(&mut self, field: &str, env: &BTreeMap<String, String>) {
+    /// Checks a step's `env`; `at` names a key of the step.
+    fn env(&mut self, at: &dyn Fn(&str) -> String, env: &BTreeMap<String, String>) {
         for (key, value) in env {
-            self.text(&format!("{field}.{key}"), value);
+            self.text(&at(&format!("env.{key}")), value);
         }
     }
 
@@ -524,7 +527,7 @@ impl Check<'_> {
             .is_ok_and(|names| names.iter().any(|(name, _)| name == "parameters"));
         if reads && self.params.is_some() {
             self.errors.push(Diagnostic::new(format!(
-                "{} `{field}` reads `parameters` inside an expression; only a whole `${{{{ parameters.NAME }}}}` is substituted, and run time has no parameters",
+                "{} {field} reads `parameters` inside an expression; only a whole `${{{{ parameters.NAME }}}}` is substituted, and run time has no parameters",
                 self.owner
             )));
             return false;
@@ -534,7 +537,7 @@ impl Check<'_> {
 
     fn bad(&mut self, field: &str, e: &ExprError) {
         self.errors.push(Diagnostic::new(format!(
-            "{} `{field}` has a bad expression: {e}",
+            "{} {field} has a bad expression: {e}",
             self.owner
         )));
     }
