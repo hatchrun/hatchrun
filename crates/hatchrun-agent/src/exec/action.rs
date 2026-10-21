@@ -134,8 +134,6 @@ pub struct CompositeStep {
 
 /// Size and retry limits for a download. Tests shrink them.
 #[derive(Debug, Clone, Copy)]
-// Read by `fetch`, which the step dispatch calls in the next task.
-#[allow(dead_code)]
 pub struct Limits {
     /// The most compressed bytes to read from the response.
     pub compressed: u64,
@@ -166,8 +164,6 @@ const MAX_META: u64 = 1 << 20;
 const RETRIES: u32 = 3;
 
 /// Splits a `uses:` value.
-// Called by the step dispatch in the next task.
-#[allow(dead_code)]
 pub fn parse_ref(uses: &str) -> Result<ActionRef, String> {
     if uses.starts_with("docker://") {
         return Err(format!(
@@ -215,8 +211,6 @@ fn is_name(s: &str) -> bool {
 }
 
 /// Fetches the action, downloading it unless it is already cached.
-// Called by the step dispatch in the next task.
-#[allow(dead_code)]
 pub async fn fetch(r: &ActionRef, github: &Github, layout: &Layout) -> Result<Action> {
     fetch_with(r, github, layout, LIMITS).await
 }
@@ -294,6 +288,11 @@ async fn download(
 ) -> Result<()> {
     let parent = root.parent().context("action cache path has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    // `<owner>/<repo>` is root's to create; the steps only need to pass through.
+    for dir in [Some(parent), parent.parent()].into_iter().flatten() {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("set mode on {}", dir.display()))?;
+    }
     // A name no cache key can have: keys never start with `%tmp`.
     let tmp = tempfile::Builder::new()
         .prefix("%tmp-")
@@ -335,6 +334,7 @@ async fn download(
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&archive_path)?;
         extract_tar_gz(file, &extract_into, 1, expanded)?;
+        open_for_reading(&extract_into)?;
         anyhow::Ok(())
     })
     .await
@@ -352,6 +352,31 @@ async fn download(
             Err(e) => return Err(e).with_context(|| format!("clear {}", root.display())),
         }
         std::fs::rename(tmp.path(), root).with_context(|| format!("move {label} into place"))?;
+    }
+    Ok(())
+}
+
+/// Lets everyone read the extracted tree and enter its directories.
+/// The agent extracts as root, and an archive can ship 0700 entries,
+/// but the steps run as another user. Execute bits are kept as they
+/// are, except that a file the owner can execute stays executable for
+/// everyone who can read it. Symlinks are left alone.
+fn open_for_reading(dir: &Path) -> Result<()> {
+    let widen = |path: &Path, bits: u32| -> Result<()> {
+        let mode = std::fs::symlink_metadata(path)?.permissions().mode() & 0o7777;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | bits))
+            .with_context(|| format!("set mode on {}", path.display()))
+    };
+    widen(dir, 0o055)?;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            open_for_reading(&entry.path())?;
+        } else if kind.is_file() {
+            let owner_exec = entry.metadata()?.permissions().mode() & 0o100 != 0;
+            widen(&entry.path(), if owner_exec { 0o055 } else { 0o044 })?;
+        }
     }
     Ok(())
 }

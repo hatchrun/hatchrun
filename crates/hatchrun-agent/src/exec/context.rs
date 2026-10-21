@@ -27,8 +27,6 @@ const MAX_FILES: usize = 100_000;
 
 /// The action whose step is running, for `github.action_path` and
 /// `inputs`.
-// JavaScript and composite actions read the scope once they run.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionScope {
     /// `github.action`: the action's name or id.
@@ -170,8 +168,6 @@ impl Contexts {
 
     /// The contexts a step of `action` sees. The action has its own
     /// `steps` and `inputs` and cannot read the caller's secrets.
-    // Called once actions run.
-    #[allow(dead_code)]
     #[must_use]
     pub fn with_action(&self, action: ActionScope) -> Contexts {
         let mut value = self.value.clone();

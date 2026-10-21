@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 
 use hatchrun_workflow::{
-    CacheService, Github, JobDocument, JobKind, PlannedJob, PlannedStep, RunStep, template,
+    CacheService, Github, JobDocument, JobKind, PlannedJob, PlannedStep, RunStep, UsesStep,
+    template,
 };
 use serde_json::json;
 
@@ -83,4 +84,13 @@ pub fn step(script: &str) -> PlannedStep {
 /// A planned step from a customised [`RunStep`].
 pub fn planned(step: RunStep) -> PlannedStep {
     PlannedStep::Run(step)
+}
+
+/// A `uses:` step with the given id and no inputs.
+pub fn uses(id: &str, action: &str) -> UsesStep {
+    UsesStep {
+        id: Some(id.to_owned()),
+        uses: action.to_owned(),
+        ..UsesStep::default()
+    }
 }

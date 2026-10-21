@@ -13,6 +13,7 @@ pub mod files;
 pub mod layout;
 pub mod lines;
 pub mod mask;
+pub mod node;
 pub mod shell;
 pub mod sink;
 pub mod step;
@@ -39,8 +40,6 @@ use crate::envfile;
 use crate::runner::{DEFAULT_PATH, home_of};
 
 /// How the agent runs a job.
-// The node binary and the store are read once actions run.
-#[allow(dead_code)]
 pub struct Options {
     /// The work directory, laid out like GitHub's hosted runners.
     pub work_dir: PathBuf,
@@ -51,6 +50,8 @@ pub struct Options {
     /// The Node binary that runs JavaScript actions.
     pub node: Option<PathBuf>,
     /// A directory of prefetched actions.
+    // Read once the action cache can be seeded from it.
+    #[allow(dead_code)]
     pub store: Option<PathBuf>,
     /// `RUNNER_TOOL_CACHE`.
     pub tool_cache: PathBuf,
@@ -123,13 +124,19 @@ pub async fn run_job(
         cancel: Box::pin(cancel),
         declared_env: BTreeMap::new(),
         env_error: None,
+        fetched: BTreeMap::new(),
+        states: BTreeMap::new(),
+        posts: Vec::new(),
     };
     job.start();
 
+    // GitHub runs every `pre` before the first step, in step order.
+    job.pre_phase(sink).await;
     let mut summaries = Vec::new();
     for (index, step) in doc.job.steps.iter().enumerate() {
         summaries.push(job.step(index, step, sink).await);
     }
+    job.post_phase(sink).await;
 
     let conclusion = match job.status {
         JobStatus::Success => Conclusion::Success,
@@ -184,6 +191,12 @@ struct Job<'a> {
     declared_env: BTreeMap<String, String>,
     /// Why `declared_env` could not be built. Every step then fails with it.
     env_error: Option<String>,
+    /// What the job-start fetch found for each `uses:` step.
+    fetched: BTreeMap<usize, Result<action::Action, String>>,
+    /// `GITHUB_STATE` pairs per step, for its `post` as `STATE_*`.
+    states: BTreeMap<usize, BTreeMap<String, String>>,
+    /// `post` hooks that are due, in the order they were queued.
+    posts: Vec<node::Post>,
 }
 
 /// What a step needs to start.
@@ -252,18 +265,7 @@ impl Job<'_> {
         let started = Instant::now();
         let (common, outcome, outputs) = match step {
             PlannedStep::Run(run) => self.run_step(index, run, sink).await,
-            PlannedStep::Uses(uses) => {
-                let common = Common {
-                    name: uses
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("Run {}", uses.uses)),
-                    id: uses.id.clone(),
-                    if_: uses.if_.clone(),
-                    continue_on_error: uses.continue_on_error,
-                };
-                self.unsupported(index, common, "`uses:` steps", sink)
-            }
+            PlannedStep::Uses(uses) => self.uses_step(index, uses, sink).await,
             PlannedStep::Cache(_) => {
                 let common = Common {
                     name: "Cache".to_owned(),
@@ -292,18 +294,7 @@ impl Job<'_> {
                 self.unsupported(index, common, "`test-results` steps", sink)
             }
         };
-        let conclusion = if outcome == Conclusion::Failure && common.continue_on_error {
-            Conclusion::Success
-        } else {
-            outcome
-        };
-        match (outcome, conclusion) {
-            (Conclusion::Cancelled, _) => self.set_status(JobStatus::Cancelled),
-            (_, Conclusion::Failure) if self.status != JobStatus::Cancelled => {
-                self.set_status(JobStatus::Failure);
-            }
-            _ => {}
-        }
+        let conclusion = self.settle(outcome, common.continue_on_error);
         if let Some(id) = &common.id {
             self.ctx.record_step(id, outcome, conclusion, &outputs);
         }
@@ -315,6 +306,38 @@ impl Job<'_> {
         };
         sink.step_finished(index, &summary);
         summary
+    }
+
+    /// The conclusion of a step with `outcome`, and its effect on the
+    /// job's status.
+    fn settle(&mut self, outcome: Conclusion, continue_on_error: bool) -> Conclusion {
+        let conclusion = if outcome == Conclusion::Failure && continue_on_error {
+            Conclusion::Success
+        } else {
+            outcome
+        };
+        match (outcome, conclusion) {
+            (Conclusion::Cancelled, _) => self.set_status(JobStatus::Cancelled),
+            (_, Conclusion::Failure) if self.status != JobStatus::Cancelled => {
+                self.set_status(JobStatus::Failure);
+            }
+            _ => {}
+        }
+        conclusion
+    }
+
+    /// Prints a line the agent wrote for the current step.
+    fn say(&mut self, sink: &mut dyn Sink, line: Line<'_>) {
+        let mut out = StepOutput::new(
+            &mut self.masker,
+            sink,
+            &mut self.annotations,
+            &mut self.budget,
+        );
+        match line {
+            Line::Error(text) => out.error(text),
+            Line::Warning(text) => out.warning(text),
+        }
     }
 
     /// Whether a step's `if:` lets it run.
@@ -408,34 +431,51 @@ impl Job<'_> {
             Some(message) => Err(message.clone()),
             None => prepare(self, index, step),
         };
-        // `prepare` borrowed the job; the output borrows its masker and
-        // annotations from here on.
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(message) => {
+                self.say(sink, Line::Error(&message));
+                return (common, Conclusion::Failure, BTreeMap::new());
+            }
+        };
+        let args = prepared.shell.args_for(&prepared.script.to_string_lossy());
+        let ran = self
+            .execute(
+                Launch {
+                    program: &prepared.shell.program,
+                    args: &args,
+                    cwd: &prepared.cwd,
+                    env: &prepared.env,
+                    timeout: prepared.timeout,
+                    timeout_minutes: step.timeout_minutes,
+                    files: &prepared.files,
+                },
+                sink,
+            )
+            .await;
+        // The script may hold secrets. Nothing needs it after the run.
+        let _ = std::fs::remove_file(&prepared.script);
+        (common, ran.outcome, ran.outputs)
+    }
+
+    /// Runs a process for a step, then reads the file commands it wrote.
+    async fn execute(&mut self, launch: Launch<'_>, sink: &mut dyn Sink) -> Ran {
         let mut out = StepOutput::new(
             &mut self.masker,
             sink,
             &mut self.annotations,
             &mut self.budget,
         );
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
-            Err(message) => {
-                out.error(&message);
-                return (common, Conclusion::Failure, BTreeMap::new());
-            }
-        };
-        let args = prepared.shell.args_for(&prepared.script.to_string_lossy());
         let process = Process {
-            program: &prepared.shell.program,
-            args: &args,
-            cwd: &prepared.cwd,
-            env: &prepared.env,
+            program: launch.program,
+            args: launch.args,
+            cwd: launch.cwd,
+            env: launch.env,
             user: self.opts.runner_user.as_deref(),
-            timeout: prepared.timeout,
+            timeout: launch.timeout,
         };
         let spawned = spawn(process, &mut out, &mut self.cancel).await;
-        // The script may hold secrets. Nothing needs it after the run.
-        let _ = std::fs::remove_file(&prepared.script);
-        let mut outcome = exit_outcome(&mut out, spawned, step.timeout_minutes);
+        let mut outcome = exit_outcome(&mut out, spawned, launch.timeout_minutes);
         if outcome == Conclusion::Cancelled {
             // The signal future resolved once and must not be polled again.
             self.cancel = Box::pin(std::future::pending());
@@ -444,14 +484,15 @@ impl Job<'_> {
             outcome = Conclusion::Failure;
         }
 
-        let read = files::read(&prepared.files);
-        match read {
+        let mut state = Vec::new();
+        match files::read(launch.files) {
             Ok(written) => {
                 for warning in &written.warnings {
                     out.warning(warning);
                 }
                 self.github_env.extend(written.env);
                 self.path_dirs.extend(written.path);
+                state = written.state;
                 out.push_outputs(written.outputs);
             }
             Err(err) => {
@@ -463,8 +504,53 @@ impl Job<'_> {
         }
         let outputs: BTreeMap<String, String> = out.take_outputs().into_iter().collect();
         self.sync_env();
-        (common, outcome, outputs)
+        Ran {
+            outcome,
+            outputs,
+            state,
+        }
     }
+
+    /// Puts the `GITHUB_PATH` directories, newest first, in front of
+    /// `env`'s `PATH`.
+    fn with_path(&self, env: &mut BTreeMap<String, String>) {
+        if self.path_dirs.is_empty() {
+            return;
+        }
+        let mut dirs: Vec<&str> = self.path_dirs.iter().rev().map(String::as_str).collect();
+        let path = env.get("PATH").cloned().unwrap_or_default();
+        if !path.is_empty() {
+            dirs.push(&path);
+        }
+        let joined = dirs.join(":");
+        env.insert("PATH".to_owned(), joined);
+    }
+}
+
+/// A line the agent prints about a step.
+#[derive(Clone, Copy)]
+enum Line<'a> {
+    Error(&'a str),
+    Warning(&'a str),
+}
+
+/// A process to run for a step, with the files it writes to.
+struct Launch<'a> {
+    program: &'a str,
+    args: &'a [String],
+    cwd: &'a Path,
+    env: &'a BTreeMap<String, String>,
+    timeout: Option<Duration>,
+    timeout_minutes: Option<u32>,
+    files: &'a StepFiles,
+}
+
+/// How a launched process went.
+struct Ran {
+    outcome: Conclusion,
+    outputs: BTreeMap<String, String>,
+    /// `GITHUB_STATE` pairs it wrote.
+    state: Vec<(String, String)>,
 }
 
 /// Prints how the process ended and maps it to the step's outcome.
@@ -526,19 +612,11 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
         None => None,
     };
 
-    let mut env = base_env(job, &files, step, index)?;
+    let mut env = base_env(job, &files, &step_action(step, index))?;
     env.extend(job.github_env.clone());
     env.extend(job.declared_env.clone());
     env.extend(step_env);
-    if !job.path_dirs.is_empty() {
-        let mut dirs: Vec<&str> = job.path_dirs.iter().rev().map(String::as_str).collect();
-        let path = env.get("PATH").cloned().unwrap_or_default();
-        if !path.is_empty() {
-            dirs.push(&path);
-        }
-        let joined = dirs.join(":");
-        env.insert("PATH".to_owned(), joined);
-    }
+    job.with_path(&mut env);
 
     let has_bash = env.get("PATH").is_some_and(|path| {
         path.split(':')
@@ -594,12 +672,20 @@ fn write_script(
     written
 }
 
+/// `GITHUB_ACTION` of a `run:` step: its id, else a generated name.
+fn step_action(step: &RunStep, index: usize) -> String {
+    match (&step.id, index) {
+        (Some(id), _) => id.clone(),
+        (None, 0) => "__run".to_owned(),
+        (None, n) => format!("__run_{}", n + 1),
+    }
+}
+
 /// The environment file's variables, then the ones the runner sets.
 fn base_env(
     job: &Job<'_>,
     files: &StepFiles,
-    step: &RunStep,
-    index: usize,
+    action: &str,
 ) -> Result<BTreeMap<String, String>, String> {
     let doc = job.doc;
     let g = &doc.github;
@@ -621,11 +707,6 @@ fn base_env(
     env.insert("LOGNAME".to_owned(), user.clone());
     env.insert("USER".to_owned(), user);
 
-    let action = match (&step.id, index) {
-        (Some(id), _) => id.clone(),
-        (None, 0) => "__run".to_owned(),
-        (None, n) => format!("__run_{}", n + 1),
-    };
     let arch = job.ctx.value()["runner"]["arch"]
         .as_str()
         .unwrap_or("X64")
@@ -640,7 +721,7 @@ fn base_env(
     let vars = [
         ("CI", "true".to_owned()),
         ("GITHUB_ACTIONS", "true".to_owned()),
-        ("GITHUB_ACTION", action),
+        ("GITHUB_ACTION", action.to_owned()),
         ("GITHUB_ACTOR", g.actor.clone()),
         ("GITHUB_API_URL", g.api_url.clone()),
         ("GITHUB_BASE_REF", g.base_ref.clone()),

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use hatchrun_workflow::{Conclusion, JobDocument, JobResult};
+use hatchrun_workflow::{Conclusion, JobDocument, JobResult, PlannedStep};
 
 fn exec(dir: &Path, doc: &str) -> Output {
     exec_with(dir, doc, &[])
@@ -437,4 +437,385 @@ fn no_process_survives_an_exit() {
         !alive
     });
     assert!(gone);
+}
+
+/// Whether `node` can be found. Prints why a test is skipped.
+fn has_node() -> bool {
+    let found = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join("node").is_file()));
+    if !found {
+        eprintln!("skipping: no node on PATH");
+    }
+    found
+}
+
+/// Writes a local action `name` under the workspace of `dir`.
+fn local_action(dir: &Path, name: &str, yml: &str, files: &[(&str, &str)]) {
+    let act = dir.join("work/repo/repo").join(name);
+    std::fs::create_dir_all(&act).unwrap();
+    std::fs::write(act.join("action.yml"), yml).unwrap();
+    for (file, text) in files {
+        std::fs::write(act.join(file), text).unwrap();
+    }
+}
+
+fn lines(out: &Output) -> Vec<String> {
+    stdout(out).lines().map(str::to_owned).collect()
+}
+
+#[test]
+fn js_action_inputs_and_outputs() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "act",
+        "name: greet\ninputs:\n  who is:\n    description: x\nruns:\n  using: node20\n  main: index.js\n",
+        &[(
+            "index.js",
+            "console.log('who=' + process.env.INPUT_WHO_IS);\n\
+             console.log('path=' + process.env.GITHUB_ACTION_PATH);\n\
+             require('fs').appendFileSync(process.env.GITHUB_OUTPUT, 'greeting=hi\\n');\n",
+        )],
+    );
+    let mut step = make::uses("g", "./act");
+    step.with.insert("who is".to_owned(), "me".into());
+    let out = run_steps(
+        dir.path(),
+        vec![
+            PlannedStep::Uses(step),
+            make::step("echo got ${{ steps.g.outputs.greeting }}"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    let text = lines(&out);
+    assert!(text.contains(&"who=me".to_owned()), "{text:?}");
+    assert!(text.contains(&"got hi".to_owned()), "{text:?}");
+    assert!(
+        text.iter()
+            .any(|l| l.starts_with("path=") && l.ends_with("/repo/repo/act")),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn non_string_inputs_are_json_text() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "act",
+        "name: n\nruns:\n  using: node20\n  main: index.js\n",
+        &[(
+            "index.js",
+            "console.log('n=' + process.env.INPUT_N + ' b=' + process.env.INPUT_B + \
+             ' l=' + process.env.INPUT_L);\n",
+        )],
+    );
+    let mut step = make::uses("g", "./act");
+    step.with.insert("n".to_owned(), 3.into());
+    step.with.insert("b".to_owned(), true.into());
+    step.with
+        .insert("l".to_owned(), serde_json::json!([1, "x"]));
+    let out = run_steps(dir.path(), vec![PlannedStep::Uses(step)]);
+    assert!(
+        lines(&out).contains(&r#"n=3 b=true l=[1,"x"]"#.to_owned()),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn input_defaults_are_evaluated() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "act",
+        "name: d\ninputs:\n  repo:\n    default: ${{ github.repository }}\n  secret:\n    default: ${{ secrets.S }}\nruns:\n  using: node20\n  main: index.js\n",
+        &[(
+            "index.js",
+            "console.log('repo=' + process.env.INPUT_REPO);\n\
+             console.log('secret=[' + process.env.INPUT_SECRET + ']');\n",
+        )],
+    );
+    let out = run_steps(
+        dir.path(),
+        vec![PlannedStep::Uses(make::uses("g", "./act"))],
+    );
+    let text = lines(&out);
+    assert!(text.contains(&"repo=acme/repo".to_owned()), "{text:?}");
+    assert!(text.contains(&"secret=[]".to_owned()), "{text:?}");
+}
+
+#[test]
+fn caller_expressions_see_caller_contexts() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "act",
+        "name: c\nruns:\n  using: node20\n  main: index.js\n",
+        &[(
+            "index.js",
+            "console.log('v=' + process.env.INPUT_V + ' e=' + process.env.E);\n",
+        )],
+    );
+    let mut doc = make::document(Vec::new());
+    doc.secrets.insert("S".to_owned(), "hunter2".to_owned());
+    let mut first = make::run("echo val=1 >> \"$GITHUB_OUTPUT\"");
+    first.id = Some("a".to_owned());
+    let mut step = make::uses("g", "./act");
+    step.with
+        .insert("v".to_owned(), "${{ steps.a.outputs.val }}".into());
+    step.env
+        .insert("E".to_owned(), "${{ github.actor }}".to_owned());
+    doc.job.steps = vec![make::planned(first), PlannedStep::Uses(step)];
+    let out = exec(dir.path(), &json(&doc));
+    assert!(
+        lines(&out).contains(&"v=1 e=octocat".to_owned()),
+        "{}",
+        stdout(&out)
+    );
+}
+
+fn hooked(dir: &Path, name: &str) {
+    local_action(
+        dir,
+        name,
+        &format!(
+            "name: {name}\nruns:\n  using: node20\n  pre: pre.js\n  main: main.js\n  post: post.js\n"
+        ),
+        &[
+            ("pre.js", &format!("console.log('pre{name}');\n")),
+            (
+                "main.js",
+                &format!(
+                    "console.log('main{name}');\n\
+                     require('fs').appendFileSync(process.env.GITHUB_STATE, 'x=saved{name}\\n');\n"
+                ),
+            ),
+            (
+                "post.js",
+                &format!(
+                    "console.log('post{name}');\nconsole.log('state' + process.env.STATE_x);\n"
+                ),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn pre_and_post_order() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    hooked(dir.path(), "1");
+    hooked(dir.path(), "2");
+    let out = run_steps(
+        dir.path(),
+        vec![
+            make::step("echo first"),
+            PlannedStep::Uses(make::uses("a", "./1")),
+            PlannedStep::Uses(make::uses("b", "./2")),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    let text: Vec<String> = lines(&out)
+        .into_iter()
+        .filter(|l| !l.starts_with("=="))
+        .collect();
+    assert_eq!(
+        text,
+        [
+            "pre1",
+            "pre2",
+            "first",
+            "main1",
+            "main2",
+            "post2",
+            "statesaved2",
+            "post1",
+            "statesaved1"
+        ]
+    );
+    assert_eq!(result(dir.path()).steps.len(), 3);
+}
+
+#[test]
+fn post_runs_after_failure() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    hooked(dir.path(), "1");
+    let out = run_steps(
+        dir.path(),
+        vec![
+            PlannedStep::Uses(make::uses("a", "./1")),
+            make::step("exit 1"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        lines(&out).contains(&"post1".to_owned()),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(result(dir.path()).conclusion, Conclusion::Failure);
+}
+
+#[test]
+fn post_if_decides_and_skipped_main_queues_no_post() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "ok",
+        "name: ok\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n  post-if: success()\n",
+        &[
+            ("main.js", "console.log('main-ok');\n"),
+            ("post.js", "console.log('post-ok');\n"),
+        ],
+    );
+    hooked(dir.path(), "1");
+    let mut skipped = make::uses("s", "./1");
+    skipped.if_ = Some("false".to_owned());
+    let out = run_steps(
+        dir.path(),
+        vec![
+            PlannedStep::Uses(make::uses("a", "./ok")),
+            PlannedStep::Uses(skipped),
+            make::step("exit 1"),
+        ],
+    );
+    let text = lines(&out);
+    assert!(text.contains(&"main-ok".to_owned()), "{text:?}");
+    assert!(!text.contains(&"post-ok".to_owned()), "{text:?}");
+    assert!(!text.contains(&"post1".to_owned()), "{text:?}");
+}
+
+#[test]
+fn failing_node_action_fails_the_step() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "act",
+        "name: f\nruns:\n  using: node20\n  main: index.js\n",
+        &[("index.js", "console.log('boom'); process.exit(3);\n")],
+    );
+    let out = run_steps(
+        dir.path(),
+        vec![PlannedStep::Uses(make::uses("a", "./act"))],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stdout(&out).contains("Process completed with exit code 3."),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn docker_action_fails_the_step() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "act",
+        "name: d\nruns:\n  using: docker\n  image: Dockerfile\n",
+        &[],
+    );
+    let out = run_steps(
+        dir.path(),
+        vec![PlannedStep::Uses(make::uses("a", "./act"))],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stdout(&out).contains(
+            "`./act` is a Docker container action; Docker services and containers come in a later release"
+        ),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[tokio::test]
+async fn remote_action_is_fetched_and_readable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    if !has_node() {
+        return;
+    }
+    let mut tar = tar::Builder::new(Vec::new());
+    let mut add = |name: &str, kind: tar::EntryType, mode: u32, body: &[u8]| {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(kind);
+        h.set_mode(mode);
+        h.set_size(body.len() as u64);
+        tar.append_data(&mut h, name, body).unwrap();
+    };
+    add("acme-act-abc/", tar::EntryType::Directory, 0o700, b"");
+    add(
+        "acme-act-abc/action.yml",
+        tar::EntryType::Regular,
+        0o600,
+        b"name: r\nruns:\n  using: node24\n  main: index.js\n",
+    );
+    add(
+        "acme-act-abc/index.js",
+        tar::EntryType::Regular,
+        0o600,
+        b"console.log('remote ' + process.env.GITHUB_ACTION_REPOSITORY + '@' + process.env.GITHUB_ACTION_REF);\n",
+    );
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut gz, &tar.into_inner().unwrap()).unwrap();
+    let body = gz.finish().unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/act/tarball/v1"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![PlannedStep::Uses(make::uses("r", "acme/act@v1"))]);
+    doc.github.api_url = server.uri();
+    let job = json(&doc);
+    let root = dir.path().to_owned();
+    let out = tokio::task::spawn_blocking(move || exec(&root, &job))
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    assert!(
+        lines(&out).contains(&"remote acme/act@v1".to_owned()),
+        "{}",
+        stdout(&out)
+    );
+
+    let tree = dir.path().join("work/_actions/acme/act/v1/tree");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&tree) & 0o055, 0o055);
+    assert_eq!(mode(&tree.join("index.js")) & 0o044, 0o044);
+    assert_eq!(
+        mode(&dir.path().join("work/_actions/acme/act")) & 0o055,
+        0o055
+    );
 }
