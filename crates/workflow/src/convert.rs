@@ -45,8 +45,9 @@ pub struct Conversion {
 ///
 /// A job with a problem (a `runs-on` that names no runner template, a
 /// `docker://` step, a `needs` that names no job, a job key another file
-/// already uses) is dropped, like a reusable workflow call: jobs that
-/// need it lose that dependency with a warning. A file that does not
+/// already uses) is dropped, like a reusable workflow call. Every job
+/// that needs a dropped job, directly or through others, is dropped too,
+/// with a warning naming the chain of jobs it needed. A file that does not
 /// parse, has no name before its extension or repeats another file's
 /// name is skipped. Each problem is in [`Conversion::errors`].
 ///
@@ -339,20 +340,23 @@ impl Cx {
         let shared_env = self.env(&format!("`{file}`"), "env", gh.env.as_ref());
 
         let ids: BTreeSet<String> = gh.jobs.0.iter().map(|(id, _)| id.clone()).collect();
-        // Jobs left out, with why.
-        let mut dropped: BTreeMap<String, &str> = BTreeMap::new();
+        // Jobs left out, with what happened to each, worded to follow
+        // "which".
+        let mut dropped: BTreeMap<String, String> = BTreeMap::new();
+        let mut failed = false;
         let mut entries = Vec::new();
         for (id, job) in gh.jobs.0 {
             let at = format!("`{file}` job `{id}`");
             let Some(job) = self.gh_job(&at, &job) else {
-                dropped.insert(id, FAILED);
+                dropped.insert(id, FAILED.to_owned());
+                failed = true;
                 continue;
             };
             if job.uses.is_some() {
                 self.warn(format!(
                     "{at} calls a reusable workflow, which is not supported; the job was dropped"
                 ));
-                dropped.insert(id, "with that reusable workflow job");
+                dropped.insert(id, REUSABLE.to_owned());
                 continue;
             }
             let key = format!("{stem}-{id}");
@@ -360,11 +364,13 @@ impl Cx {
                 self.error(format!(
                     "{at} becomes job `{key}`, which another workflow already uses; rename one of them"
                 ));
-                dropped.insert(id, FAILED);
+                dropped.insert(id, FAILED.to_owned());
+                failed = true;
                 continue;
             }
             let Some((mut converted, entry)) = self.job(&at, &id, &key, &ids, job) else {
-                dropped.insert(id, FAILED);
+                dropped.insert(id, FAILED.to_owned());
+                failed = true;
                 continue;
             };
             for (name, value) in &shared_env {
@@ -381,24 +387,21 @@ impl Cx {
             self.config.jobs.insert(key, converted);
             entries.push(entry);
         }
-        for entry in &mut entries {
-            let id = entry.name.clone().unwrap_or_default();
-            let mut lost = Vec::new();
-            entry.requires.retain(|r| match dropped.get(r) {
-                Some(why) => {
-                    lost.push((r.clone(), *why));
-                    false
-                }
-                None => true,
-            });
-            for (need, why) in lost {
-                self.warn(format!(
-                    "`{file}` job `{id}`: its dependency on `{need}` was dropped {why}"
-                ));
-            }
+        // A job that needs a dropped job would run without it, so it is
+        // dropped too, and so on down the chain.
+        while let Some((i, need)) = entries.iter().enumerate().find_map(|(i, e)| {
+            let need = e.requires.iter().find(|r| dropped.contains_key(*r))?;
+            Some((i, need.clone()))
+        }) {
+            let entry = entries.remove(i);
+            self.config.jobs.remove(&entry.job);
+            let id = entry.name.unwrap_or_default();
+            let why = format!("needs `{need}`, which {}", dropped[&need]);
+            self.warn(format!("`{file}` job `{id}` was dropped: it {why}"));
+            dropped.insert(id, why);
         }
         // A file whose every job failed converts to nothing.
-        if entries.is_empty() && dropped.values().any(|why| *why == FAILED) {
+        if entries.is_empty() && failed {
             return;
         }
         self.config
@@ -853,7 +856,11 @@ fn fit_default(kind: &ParameterKind, value: &Value) -> Option<Value> {
 }
 
 /// Why a job that had errors is missing from those that need it.
-const FAILED: &str = "because that job did not convert";
+/// What happened to a job that had errors, after "which".
+const FAILED: &str = "did not convert";
+
+/// What happened to a reusable workflow call, after "which".
+const REUSABLE: &str = "calls a reusable workflow";
 
 /// The GitHub contexts a converted job reads that hatchrun does not
 /// provide, in [`UNSUPPORTED_CONTEXTS`] order.

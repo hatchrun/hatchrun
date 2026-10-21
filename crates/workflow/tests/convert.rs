@@ -310,7 +310,7 @@ jobs:
 }
 
 #[test]
-fn reusable_workflow_calls_are_dropped_with_their_requires() {
+fn reusable_workflow_calls_are_dropped_with_their_dependents() {
     let out = ok("
 on: push
 jobs:
@@ -323,12 +323,16 @@ jobs:
     needs: [call]
     runs-on: ubuntu-latest
     steps: [{ run: x }]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
 ");
     assert!(has(&out.warnings, &["ci.yml", "call", "reusable"]));
     assert!(!out.config.jobs.contains_key("ci-call"));
+    assert!(!out.config.jobs.contains_key("ci-after"));
     let wf = &out.config.workflows["ci"];
     assert_eq!(wf.jobs.len(), 1);
-    assert_eq!(wf.jobs[0].requires, Vec::<String>::new());
+    assert_eq!(wf.jobs[0].job, "ci-lint");
     round_trips(&out);
 }
 
@@ -443,6 +447,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps: [{ run: publish }]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{ run: lint }]
 "
             .into(),
         ),
@@ -460,11 +467,15 @@ jobs:
             .any(|e| e.file.as_deref() == Some("broken.yml"))
     );
     assert!(!out.config.jobs.contains_key("release-build"));
+    assert!(!out.config.jobs.contains_key("release-publish"));
     let wf = &out.config.workflows["release"];
     assert_eq!(wf.jobs.len(), 1);
-    assert_eq!(wf.jobs[0].requires, Vec::<String>::new());
+    assert_eq!(wf.jobs[0].job, "release-lint");
     assert!(
-        has(&out.warnings, &["`publish`", "`build`", "did not convert"]),
+        has(
+            &out.warnings,
+            &["`publish` was dropped", "`build`", "did not convert"]
+        ),
         "{:?}",
         out.warnings
     );
@@ -629,7 +640,7 @@ fn file_stems_ignore_extension_case_and_must_not_be_empty() {
 }
 
 #[test]
-fn dependents_of_a_dropped_reusable_job_are_warned() {
+fn dependents_of_a_dropped_reusable_job_are_dropped() {
     let out = ok("
 on: push
 jobs:
@@ -641,8 +652,82 @@ jobs:
     steps: [{ run: x }]
 ");
     assert!(
-        has(&out.warnings, &["ci.yml", "`after`", "`call`", "dropped"]),
+        has(
+            &out.warnings,
+            &[
+                "ci.yml",
+                "`after` was dropped",
+                "needs `call`, which calls a reusable workflow"
+            ]
+        ),
         "{:?}",
         out.warnings
     );
+    assert_eq!(out.config.jobs.len(), 0);
+    assert_eq!(out.config.workflows["ci"].jobs, Vec::new());
+    round_trips(&out);
+}
+
+#[test]
+fn a_dropped_job_takes_every_job_that_needs_it() {
+    // `c` comes first so the chain is followed whatever the file order.
+    let out = convert(&[(
+        "ci.yml".into(),
+        "
+on: push
+jobs:
+  c:
+    needs: [b, d]
+    runs-on: ubuntu-latest
+    steps: [{ run: c }]
+  a:
+    runs-on: macos-latest
+    steps: [{ run: a }]
+  b:
+    needs: a
+    runs-on: ubuntu-latest
+    steps: [{ run: b }]
+  d:
+    runs-on: ubuntu-latest
+    steps: [{ run: d }]
+  e:
+    needs: d
+    runs-on: ubuntu-latest
+    steps: [{ run: e }]
+"
+        .into(),
+    )])
+    .unwrap();
+    assert!(has(&out.errors, &["`a`", "runs-on"]), "{:?}", out.errors);
+    assert!(
+        has(
+            &out.warnings,
+            &["`b` was dropped: it needs `a`, which did not convert"]
+        ),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        has(
+            &out.warnings,
+            &["`c` was dropped: it needs `b`, which needs `a`, which did not convert"]
+        ),
+        "{:?}",
+        out.warnings
+    );
+    let jobs: Vec<&str> = out.config.workflows["ci"]
+        .jobs
+        .iter()
+        .map(|j| j.job.as_str())
+        .collect();
+    assert_eq!(jobs, ["ci-d", "ci-e"]);
+    assert_eq!(
+        out.config
+            .jobs
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["ci-d", "ci-e"]
+    );
+    round_trips(&out);
 }
