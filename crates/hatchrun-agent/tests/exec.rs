@@ -476,6 +476,14 @@ fn lines(out: &Output) -> Vec<String> {
     stdout(out).lines().map(str::to_owned).collect()
 }
 
+/// The output lines without the `== name` step headers.
+fn body(out: &Output) -> Vec<String> {
+    lines(out)
+        .into_iter()
+        .filter(|l| !l.starts_with("== "))
+        .collect()
+}
+
 #[test]
 fn js_action_inputs_and_outputs() {
     if !has_node() {
@@ -2312,6 +2320,135 @@ fn background_processes_die_at_job_end() {
         !up
     });
     assert!(gone, "background process {} is still running", pid.trim());
+}
+
+#[test]
+fn background_output_keeps_printing_and_the_process_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![
+        make::step(
+            "(while true; do echo tick; echo \"key ${{ secrets.K }}\"; sleep 0.2; done) & \
+             echo $! > \"$RUNNER_TEMP/pid\"",
+        ),
+        make::step("sleep 2; kill -0 \"$(cat \"$RUNNER_TEMP/pid\")\" && echo alive"),
+    ]);
+    doc.secrets
+        .insert("K".to_owned(), "hunter2hunter2".to_owned());
+    let out = exec(dir.path(), &json(&doc));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let got = lines(&out);
+    assert!(got.contains(&"alive".to_owned()), "{got:?}");
+    assert!(got.iter().filter(|l| *l == "tick").count() >= 3, "{got:?}");
+    assert!(got.contains(&"key ***".to_owned()), "{got:?}");
+    assert!(!stdout(&out).contains("hunter2hunter2"));
+}
+
+#[test]
+fn a_background_server_answers_in_the_next_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(
+        dir.path(),
+        vec![
+            make::step(
+                "PORT=$(python3 -c 'import socket;s=socket.socket();s.bind((\"127.0.0.1\",0));print(s.getsockname()[1])'); \
+                 echo $PORT > \"$RUNNER_TEMP/port\"; \
+                 python3 -m http.server $PORT --bind 127.0.0.1 & \
+                 sleep 1",
+            ),
+            make::step(
+                "curl -s -o /dev/null -w 'first %{http_code}\\n' \"http://127.0.0.1:$(cat \"$RUNNER_TEMP/port\")/\"; \
+                 curl -s -o /dev/null -w 'second %{http_code}\\n' \"http://127.0.0.1:$(cat \"$RUNNER_TEMP/port\")/\"",
+            ),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let got = lines(&out);
+    assert!(got.contains(&"first 200".to_owned()), "{got:?}");
+    assert!(got.contains(&"second 200".to_owned()), "{got:?}");
+}
+
+#[test]
+fn background_output_is_capped_but_still_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(
+        dir.path(),
+        vec![
+            make::step(
+                "(sleep 1.5; head -c 20000000 /dev/zero | tr '\\0' 'a'; echo; echo finished > \"$RUNNER_TEMP/done\"; sleep 30) &",
+            ),
+            make::step(
+                "for i in $(seq 1 100); do test -f \"$RUNNER_TEMP/done\" && break; sleep 0.2; done; \
+                 test -f \"$RUNNER_TEMP/done\" && echo writer-finished",
+            ),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out).len());
+    assert!(stdout(&out).contains("writer-finished"));
+    let size = stdout(&out).len();
+    assert!(
+        size > (1 << 20) && size < (17 << 20),
+        "printed {size} bytes"
+    );
+}
+
+#[test]
+fn debug_lines_need_step_debugging() {
+    let script = "echo '::debug::dbg-line'; echo \"[$RUNNER_DEBUG][${{ runner.debug }}]\"";
+    let dir = tempfile::tempdir().unwrap();
+    let off = run_steps(dir.path(), vec![make::step(script)]);
+    assert_eq!(off.status.code(), Some(0), "{off:?}");
+    assert!(
+        body(&off).iter().all(|l| !l.contains("dbg-line")),
+        "{}",
+        stdout(&off)
+    );
+    assert!(lines(&off).contains(&"[][]".to_owned()), "{}", stdout(&off));
+
+    for secret in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = make::document(vec![make::step(script)]);
+        let set = if secret {
+            &mut doc.secrets
+        } else {
+            &mut doc.vars
+        };
+        set.insert("ACTIONS_STEP_DEBUG".to_owned(), "true".to_owned());
+        let on = exec(dir.path(), &json(&doc));
+        assert_eq!(on.status.code(), Some(0), "{on:?}");
+        let got = lines(&on);
+        assert!(got.contains(&"##[debug]dbg-line".to_owned()), "{got:?}");
+        assert!(got.contains(&"[1][1]".to_owned()), "{got:?}");
+    }
+}
+
+#[test]
+fn an_error_command_prints_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(dir.path(), vec![make::step("echo \"::error::boom\"")]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let got: Vec<String> = body(&out)
+        .into_iter()
+        .filter(|l| l.contains("boom"))
+        .collect();
+    assert_eq!(got, vec!["Error: boom".to_owned()]);
+}
+
+#[test]
+fn problem_matcher_commands_are_swallowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(
+        dir.path(),
+        vec![make::step(
+            "echo '::add-matcher::/x/m.json'; echo '::remove-matcher owner=x::'; echo '::mystery::kept'",
+        )],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = stdout(&out);
+    assert!(body(&out).iter().all(|l| !l.contains("matcher")), "{text}");
+    assert!(
+        lines(&out).contains(&"::mystery::kept".to_owned()),
+        "{text}"
+    );
 }
 
 #[test]

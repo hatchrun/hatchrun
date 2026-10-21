@@ -32,6 +32,10 @@ pub enum Command {
         /// The output value.
         value: String,
     },
+    /// `::add-matcher::path` or `::remove-matcher owner=x::`. Problem
+    /// matchers are not supported, so the command is accepted and does
+    /// nothing, and its line is not printed.
+    Matcher,
     /// A command that is turned off. The text says what to use instead.
     Refused(&'static str),
 }
@@ -116,6 +120,7 @@ pub fn parse(line: &str) -> Option<Command> {
                 value: unescape_data(message),
             })
         }
+        "add-matcher" | "remove-matcher" => Some(Command::Matcher),
         "set-env" => Some(Command::Refused(SET_ENV_REFUSED)),
         "add-path" => Some(Command::Refused(ADD_PATH_REFUSED)),
         _ => None,
@@ -263,6 +268,16 @@ mod tests {
         assert_eq!(parse("::endgroup::"), Some(Command::EndGroup));
         assert_eq!(parse("::echo::ON"), Some(Command::Echo(true)));
         assert_eq!(parse("::debug::hi"), Some(Command::Debug("hi".into())));
+    }
+
+    #[test]
+    fn problem_matcher_commands_are_known_and_other_unknown_ones_are_not() {
+        assert_eq!(
+            parse("::add-matcher::.github/m.json"),
+            Some(Command::Matcher)
+        );
+        assert_eq!(parse("::remove-matcher owner=x::"), Some(Command::Matcher));
+        assert_eq!(parse("::add-matcherx::y"), None);
     }
 
     #[test]

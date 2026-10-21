@@ -37,6 +37,14 @@ const HASH_DEADLINE: Duration = Duration::from_secs(120);
 /// cancel signal.
 const HASH_CHUNK: usize = 1 << 20;
 
+/// Whether the job runs with step debugging on: `ACTIONS_STEP_DEBUG` is
+/// `true` among the secrets or the variables.
+pub fn step_debug(doc: &JobDocument) -> bool {
+    [&doc.secrets, &doc.vars]
+        .iter()
+        .any(|set| set.get("ACTIONS_STEP_DEBUG").is_some_and(|v| v == "true"))
+}
+
 /// The action whose step is running, for `github.action_path` and
 /// `inputs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +116,7 @@ impl Contexts {
             "temp": layout.temp.to_string_lossy(),
             "tool_cache": layout.tool_cache.to_string_lossy(),
             "workspace": runner_workspace.to_string_lossy(),
-            "debug": "",
+            "debug": if step_debug(doc) { "1" } else { "" },
         });
 
         let needs: Map<String, Value> = doc

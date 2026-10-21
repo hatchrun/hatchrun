@@ -90,6 +90,8 @@ pub struct Budget {
     pub masks: usize,
     /// The bytes of those values.
     pub mask_bytes: usize,
+    /// Whether `::debug::` lines are printed: step debugging is on.
+    pub debug: bool,
 }
 
 /// Cuts `text` to at most `max` bytes without splitting a character.
@@ -150,6 +152,21 @@ impl<'a> StepOutput<'a> {
     /// Adds bytes the process printed.
     pub fn push(&mut self, bytes: &[u8]) {
         for line in self.lines.push_masked(bytes, self.masker) {
+            self.handle(&line);
+        }
+    }
+
+    /// Adds bytes a background process printed, split into lines by
+    /// `lines`, which belongs to that process's pipe.
+    pub fn push_from(&mut self, lines: &mut Lines, bytes: &[u8]) {
+        for line in lines.push_masked(bytes, self.masker) {
+            self.handle(&line);
+        }
+    }
+
+    /// Handles the unfinished last line of a background pipe.
+    pub fn finish_from(&mut self, lines: Lines) {
+        for line in lines.finish_masked(self.masker) {
             self.handle(&line);
         }
     }
@@ -281,7 +298,12 @@ impl<'a> StepOutput<'a> {
                     self.annotations.push(a);
                 }
             }
-            WorkflowCommand::Debug(text) => self.line(&format!("##[debug]{text}")),
+            WorkflowCommand::Debug(text) => {
+                if self.budget.debug {
+                    self.line(&format!("##[debug]{text}"));
+                }
+            }
+            WorkflowCommand::Matcher => {}
             WorkflowCommand::Group(title) => self.line(&format!("##[group]{title}")),
             WorkflowCommand::EndGroup => self.line("##[endgroup]"),
             WorkflowCommand::StopCommands(_) | WorkflowCommand::Resume(_) => self.echoed(raw),
@@ -322,20 +344,109 @@ fn signal_group(pid: Pid, signal: Signal) {
     let _ = killpg(pid, signal);
 }
 
+/// The most bytes of background output one job prints. Output past it
+/// is read and dropped.
+const MAX_BACKGROUND_BYTES: u64 = 16 << 20;
+
 /// Process groups that outlived the step that started them, such as a
 /// server a step leaves running for the steps after it. The job stops
 /// them when it ends, and the drop kills any that are left.
-#[derive(Debug, Default)]
+///
+/// Each group's output pipe stays open and is read until the group
+/// ends, because a process that writes to a closed pipe dies. What it
+/// prints goes through the masker like any step output, as the steps
+/// after it run.
 pub struct Background {
     groups: Vec<Pid>,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+    /// Output the readers have read: a reader id and its bytes. Empty
+    /// bytes mean the pipe reached its end.
+    chunks: tokio::sync::mpsc::UnboundedReceiver<(usize, Vec<u8>)>,
+    sender: tokio::sync::mpsc::UnboundedSender<(usize, Vec<u8>)>,
+    /// The unfinished last line of each open pipe.
+    lines: std::collections::HashMap<usize, Lines>,
+    /// Bytes handed on so far, by all readers.
+    passed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    next_reader: usize,
+}
+
+impl Default for Background {
+    fn default() -> Self {
+        let (sender, chunks) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            groups: Vec::new(),
+            readers: Vec::new(),
+            chunks,
+            sender,
+            lines: std::collections::HashMap::new(),
+            passed: std::sync::Arc::default(),
+            next_reader: 0,
+        }
+    }
 }
 
 impl Background {
     /// Records the group of a step that ended, if anything still runs
-    /// in it.
-    fn keep(&mut self, group: Pid) {
-        if killpg(group, None).is_ok() {
-            self.groups.push(group);
+    /// in it, and keeps reading its output pipe.
+    fn keep(&mut self, group: Pid, reader: Option<Receiver>) {
+        if killpg(group, None).is_err() {
+            return;
+        }
+        self.groups.push(group);
+        let Some(mut reader) = reader else {
+            return;
+        };
+        let id = self.next_reader;
+        self.next_reader += 1;
+        self.lines.insert(id, Lines::default());
+        let sender = self.sender.clone();
+        let passed = std::sync::Arc::clone(&self.passed);
+        self.readers.push(tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+
+            let mut buf = vec![0u8; 16 << 10];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(n) if n > 0 => {
+                        let before = passed.fetch_add(n as u64, Ordering::Relaxed);
+                        if before < MAX_BACKGROUND_BYTES {
+                            let keep = usize::try_from(MAX_BACKGROUND_BYTES - before)
+                                .map_or(n, |room| room.min(n));
+                            let _ = sender.send((id, buf[..keep].to_vec()));
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            let _ = sender.send((id, Vec::new()));
+        }));
+    }
+
+    /// Whether any output pipe is still being read.
+    fn reading(&self) -> bool {
+        !self.lines.is_empty()
+    }
+
+    /// The next piece of background output.
+    async fn next(&mut self) -> Option<(usize, Vec<u8>)> {
+        self.chunks.recv().await
+    }
+
+    /// Prints a piece of background output.
+    fn print(&mut self, (id, bytes): (usize, Vec<u8>), out: &mut StepOutput<'_>) {
+        if bytes.is_empty() {
+            if let Some(lines) = self.lines.remove(&id) {
+                out.finish_from(lines);
+            }
+        } else if let Some(lines) = self.lines.get_mut(&id) {
+            out.push_from(lines, &bytes);
+        }
+    }
+
+    /// Prints the background output that is waiting.
+    pub fn drain(&mut self, out: &mut StepOutput<'_>) {
+        while let Ok(chunk) = self.chunks.try_recv() {
+            self.print(chunk, out);
         }
     }
 
@@ -347,25 +458,32 @@ impl Background {
     }
 
     /// SIGTERM to every group, SIGKILL to what is left after
-    /// 2.5 seconds.
+    /// 2.5 seconds, then a moment for the readers to reach the end of
+    /// their pipes.
     pub async fn stop(&mut self) {
-        if self.groups.is_empty() {
-            return;
+        if !self.groups.is_empty() {
+            for group in &self.groups {
+                signal_group(*group, Signal::SIGTERM);
+            }
+            let end = Instant::now() + AFTER_TERM;
+            while Instant::now() < end && self.groups.iter().any(|g| killpg(*g, None).is_ok()) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            self.kill();
         }
-        for group in &self.groups {
-            signal_group(*group, Signal::SIGTERM);
+        for reader in self.readers.drain(..) {
+            // A process that escaped its group can hold the pipe open.
+            let _ = tokio::time::timeout(Duration::from_millis(500), reader).await;
         }
-        let end = Instant::now() + AFTER_TERM;
-        while Instant::now() < end && self.groups.iter().any(|g| killpg(*g, None).is_ok()) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        self.kill();
     }
 }
 
 impl Drop for Background {
     fn drop(&mut self) {
         self.kill();
+        for reader in &self.readers {
+            reader.abort();
+        }
     }
 }
 
@@ -450,6 +568,9 @@ pub async fn spawn(
                 Ok(n) if n > 0 => out.push(&buf[..n]),
                 _ => eof = true,
             },
+            Some(chunk) = background.next(), if background.reading() => {
+                background.print(chunk, out);
+            }
             waited = child.wait(), if status.is_none() => {
                 status = Some(waited.context("wait for process")?);
                 if stopping.is_some() {
@@ -496,7 +617,8 @@ pub async fn spawn(
     if let Some(exit) = stopping {
         return Ok(exit);
     }
-    background.keep(pid);
+    // Writers are left on the pipe when it did not reach its end.
+    background.keep(pid, (!eof).then_some(reader));
     Ok(Exit::Code(code_of(status.context("process status")?)))
 }
 

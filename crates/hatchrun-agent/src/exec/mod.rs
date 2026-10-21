@@ -154,7 +154,10 @@ pub async fn run_job(
         event,
         masker,
         annotations: Vec::new(),
-        budget: Budget::default(),
+        budget: Budget {
+            debug: context::step_debug(&doc),
+            ..Budget::default()
+        },
         owner,
         github_env: BTreeMap::new(),
         path_dirs: Vec::new(),
@@ -218,6 +221,7 @@ async fn finish(
     job.post_phase(sink).await;
     // Servers the steps left running stop before the archives are cut.
     job.background.stop().await;
+    job.drain_background(sink);
     job.save_caches(sink).await;
     let outputs = job.job_outputs(sink);
     if let Some(proxy) = proxy {
@@ -544,6 +548,18 @@ impl Job<'_> {
             Line::Warning(text) => out.warning(text),
             Line::Note(text) => out.line(text),
         }
+    }
+
+    /// Prints the output background processes wrote that is still
+    /// waiting.
+    fn drain_background(&mut self, sink: &mut dyn Sink) {
+        let mut out = StepOutput::new(
+            &mut self.masker,
+            sink,
+            &mut self.annotations,
+            &mut self.budget,
+        );
+        self.background.drain(&mut out);
     }
 
     /// Whether a step's `if:` lets it run.
@@ -979,6 +995,9 @@ fn base_env(
         ("RUNNER_WORKSPACE", runner_workspace),
     ];
     env.extend(vars.into_iter().map(|(k, v)| (k.to_owned(), v)));
+    if job.budget.debug {
+        env.insert("RUNNER_DEBUG".to_owned(), "1".to_owned());
+    }
     env.insert(
         "HATCHRUN_TIMINGS".to_owned(),
         path(&layout.temp.join(TIMINGS_FILE)),

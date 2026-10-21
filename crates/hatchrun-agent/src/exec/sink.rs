@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use hatchrun_workflow::{Annotation, AnnotationLevel, StepSummary};
+use hatchrun_workflow::{Annotation, StepSummary};
 
 /// Receives a job's progress. Lines are already masked.
 pub trait Sink {
@@ -42,14 +42,9 @@ impl<W: Write> Sink for TextSink<W> {
         let _ = writeln!(self.out, "{text}");
     }
 
-    fn annotation(&mut self, annotation: &Annotation) {
-        let level = match annotation.level {
-            AnnotationLevel::Error => "error",
-            AnnotationLevel::Warning => "warning",
-            AnnotationLevel::Notice => "notice",
-        };
-        let _ = writeln!(self.out, "::{level}:: {}", annotation.message);
-    }
+    // The step output already shows the annotation as an `Error: ...`
+    // line, so the log does not repeat it.
+    fn annotation(&mut self, _annotation: &Annotation) {}
 
     fn step_finished(&mut self, _index: usize, _summary: &StepSummary) {}
 }
