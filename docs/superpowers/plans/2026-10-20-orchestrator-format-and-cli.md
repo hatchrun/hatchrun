@@ -40,9 +40,11 @@ order. Each one ships and tests on its own.
 
 ## Global Constraints
 
+<!-- REUSE-IgnoreStart -->
 - Every source file starts with the SPDX header used across the repo:
   `SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>`
   and `SPDX-License-Identifier: AGPL-3.0-only`.
+<!-- REUSE-IgnoreEnd -->
 - Crates use `version = "0.1.0"`, `publish = false`, the workspace's
   `authors`, `edition`, `rust-version`, `license`, `repository`, and
   `[lints] workspace = true` (clippy `all` + `pedantic` as warnings,
