@@ -46,11 +46,11 @@ pub struct ExtractLimits {
 
 impl ExtractLimits {
     /// The defaults for an expanded cap of `max_bytes`: a stream of
-    /// twice that plus 64 MiB, and a million entries.
+    /// that plus 64 MiB, and a million entries.
     pub fn new(max_bytes: u64) -> Self {
         Self {
             bytes: max_bytes,
-            stream: max_bytes.saturating_mul(2).saturating_add(64 << 20),
+            stream: max_bytes.saturating_add(64 << 20),
             entries: 1_000_000,
         }
     }
@@ -205,6 +205,37 @@ struct Guard<R> {
     body_left: u64,
 }
 
+impl<R> Guard<R> {
+    /// Parses the finished header block the way the tar crate does and
+    /// returns its body size. Anything the crate would allocate for
+    /// before the extractor sees it is refused here.
+    fn inspect(&self) -> io::Result<u64> {
+        if self.hdr.iter().all(|b| *b == 0) {
+            return Ok(0);
+        }
+        let header = tar::Header::from_byte_slice(&self.hdr);
+        let size = header.entry_size()?;
+        let kind = header.entry_type();
+        let extension = matches!(
+            kind,
+            EntryType::GNULongName
+                | EntryType::GNULongLink
+                | EntryType::XHeader
+                | EntryType::XGlobalHeader
+        );
+        if extension && size > MAX_EXTENSION {
+            return Err(io::Error::other(format!(
+                "archive has an extension header of {size} bytes, more than {MAX_EXTENSION}"
+            )));
+        }
+        if kind == EntryType::GNUSparse || header.as_gnu().is_some_and(tar::GnuHeader::is_extended)
+        {
+            return Err(io::Error::other("archive has a sparse entry"));
+        }
+        Ok(size)
+    }
+}
+
 impl<R: Read> Read for Guard<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
@@ -229,39 +260,12 @@ impl<R: Read> Read for Guard<R> {
             data = &data[k..];
             if self.hdr_len == 512 {
                 self.hdr_len = 0;
-                let size = header_size(&self.hdr);
-                if matches!(self.hdr[156], b'L' | b'K' | b'x' | b'g') && size > MAX_EXTENSION {
-                    return Err(io::Error::other(format!(
-                        "archive has an extension header of {size} bytes, more than {MAX_EXTENSION}"
-                    )));
-                }
+                let size = self.inspect()?;
                 self.body_left = size.div_ceil(512).saturating_mul(512);
             }
         }
         Ok(n)
     }
-}
-
-/// The size field of a tar header: octal, or base-256 when the high bit
-/// is set. A malformed field reads as 0 and the tar crate rejects it.
-fn header_size(hdr: &[u8; 512]) -> u64 {
-    let field = &hdr[124..136];
-    if field[0] & 0x80 != 0 {
-        if field[1..4].iter().any(|b| *b != 0) || field[0] & 0x7f != 0 {
-            return u64::MAX;
-        }
-        return field[4..]
-            .iter()
-            .fold(0u64, |a, b| (a << 8) | u64::from(*b));
-    }
-    let mut n: u64 = 0;
-    for b in field.iter().skip_while(|b| **b == b' ') {
-        match b {
-            b'0'..=b'7' => n = n.saturating_mul(8).saturating_add(u64::from(b - b'0')),
-            _ => break,
-        }
-    }
-    n
 }
 
 /// Validates an entry path and drops `strip` leading components.
@@ -494,6 +498,16 @@ mod tests {
     }
 
     fn tgz(entries: &[Raw]) -> Vec<u8> {
+        regzip(&tar_bytes(entries))
+    }
+
+    fn regzip(tar: &[u8]) -> Vec<u8> {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    fn tar_bytes(entries: &[Raw]) -> Vec<u8> {
         let mut out = Vec::new();
         for e in entries {
             let mut h = [0u8; 512];
@@ -518,9 +532,7 @@ mod tests {
             out.resize(out.len().div_ceil(512) * 512, 0);
         }
         out.extend_from_slice(&[0u8; 1024]);
-        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-        gz.write_all(&out).unwrap();
-        gz.finish().unwrap()
+        out
     }
 
     fn extract(bytes: &[u8], dest: &Path, strip: usize, max: u64) -> Result<()> {
@@ -599,6 +611,48 @@ mod tests {
             let msg = err_text(extract(&tgz(&[e]), &dest, 0, u64::MAX / 4));
             assert!(msg.contains("extension header"), "{msg}");
         }
+    }
+
+    #[test]
+    fn parses_sizes_the_way_tar_does() {
+        // A `+` prefix reads as octal for tar; the guard must see it too.
+        let (_t, dest) = outer();
+        let mut e = raw("long", b'L', "", b"");
+        e.claim = Some(1 << 30);
+        let mut bytes = tar_bytes(&[e]);
+        let at = 124;
+        bytes[at..at + 12].copy_from_slice(b"+77777777777");
+        let msg = err_text(extract(&regzip(&bytes), &dest, 0, u64::MAX / 4));
+        assert!(msg.contains("extension header"), "{msg}");
+
+        // Base-256 with high bytes set must not switch inspection off.
+        let (_t, dest) = outer();
+        let mut first = tar_bytes(&[raw("f", b'0', "", b"")]);
+        first[124] = 0x80;
+        first[125] = 0xff;
+        first[148..156].copy_from_slice(b"        ");
+        let sum: u32 = first[..512].iter().map(|b| u32::from(*b)).sum();
+        first[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+        let mut long = raw("long", b'L', "", b"");
+        long.claim = Some(1 << 30);
+        let second = tar_bytes(&[long]);
+        let mut all = first[..512].to_vec();
+        all.extend_from_slice(&second[..512]);
+        // tar reads the high bytes as a huge size and skips past the end
+        // of the stream; the guard sees the same size, so the extension
+        // header behind it is never left unchecked and never allocated.
+        assert!(extract(&regzip(&all), &dest, 0, u64::MAX / 4).is_err());
+    }
+
+    #[test]
+    fn rejects_sparse_headers_in_the_guard() {
+        let (_t, dest) = outer();
+        let mut bytes = tar_bytes(&[raw("s", b'0', "", b"")]);
+        // GNU magic and the isextended flag at offset 482.
+        bytes[257..265].copy_from_slice(b"ustar  \0");
+        bytes[482] = 1;
+        let msg = err_text(extract(&regzip(&bytes), &dest, 0, 1 << 20));
+        assert!(msg.contains("sparse"), "{msg}");
     }
 
     #[test]
