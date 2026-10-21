@@ -15,7 +15,7 @@ of `compile()` as a `Plan`.
 
 **Tech Stack:** Rust 1.99 (edition 2024), `serde`, `serde-saphyr`
 2.0.0 (YAML with locations), `serde_json` (expression values),
-`globset` 0.4.20 (filters), `thiserror`, `clap` 4.
+a hand-written glob matcher (filters), `clap` 4.
 
 **Spec:** `docs/superpowers/specs/2026-10-19-orchestrator-design.md`
 
@@ -35,7 +35,7 @@ order. Each one ships and tests on its own.
    finished logs.
 4. **Accounts.** Runner templates in the launcher, warm pool sized by
    demand, secrets (Postgres + Secrets Store key), billing caps.
-5. **Extensions.** Timing data for `tests split`, cache, workspace and
+5. **Extensions.** Timing data for test splitting, cache, workspace and
    test result storage, approval jobs in the app.
 
 ## Global Constraints
@@ -134,17 +134,16 @@ fn sixteen_core_arm() {
 fn unknown_label() {
     assert!(template("ubuntu-24.04").is_none());
     assert!(template_labels().contains(&"ubuntu-26.04-8core"));
-    assert_eq!(template_labels().len(), 10);
+    assert_eq!(template_labels().len(), 9);
 }
 ```
 
 - [ ] **Step 2: Run** `cargo test -p hatchrun-workflow templates` and
   expect a compile failure (crate missing).
 - [ ] **Step 3: Create the crate and fill `TEMPLATES`** from the table
-  in Global Constraints: 8 templates, 10 labels. Memory is 4 GiB per
+  in Global Constraints: 8 templates, 9 labels. Memory is 4 GiB per
   vCPU. Dependencies for the whole plan go in now: `serde` (derive),
-  `serde-saphyr = "2.0.0"`, `serde_json`, `globset = "0.4.20"`,
-  `thiserror = "2.0.21"`.
+  `serde-saphyr = "2.0.0"` and `serde_json`.
 - [ ] **Step 4: Run** `cargo test -p hatchrun-workflow templates`
   (PASS) and `cargo build -p hatchrun-workflow --target wasm32-unknown-unknown`
   (builds).
@@ -356,16 +355,16 @@ passes.
 ```rust
 #[test]
 fn star_does_not_cross_slash() {
-    let f = Filter(vec!["feature/*".into()]);
+    let f = Filter::new(vec!["feature/*".into()]);
     assert!(f.matches("feature/a") && !f.matches("feature/a/b"));
-    assert!(Filter(vec!["feature/**".into()]).matches("feature/a/b"));
+    assert!(Filter::new(vec!["feature/**".into()]).matches("feature/a/b"));
 }
 
 #[test]
 fn negation_order_matters() {
-    let f = Filter(vec!["releases/**".into(), "!releases/**-alpha".into()]);
+    let f = Filter::new(vec!["releases/**".into(), "!releases/**-alpha".into()]);
     assert!(f.matches("releases/1.0") && !f.matches("releases/1.0-alpha"));
-    let g = Filter(vec!["!releases/**-alpha".into(), "releases/**".into()]);
+    let g = Filter::new(vec!["!releases/**-alpha".into(), "releases/**".into()]);
     assert!(g.matches("releases/1.0-alpha"));
 }
 
@@ -386,9 +385,9 @@ fn pull_request_default_types() {
 ```
 
 - [ ] **Step 2: Run** `cargo test -p hatchrun-workflow --test trigger` (FAIL).
-- [ ] **Step 3: Implement** by translating each GitHub pattern to a
-  `globset::GlobBuilder` with `literal_separator(true)`; evaluate the
-  list in order, last match wins.
+- [ ] **Step 3: Implement** a matcher for GitHub's pattern syntax
+  (`globset` has no `+` and no `?` as zero-or-one of the preceding
+  character); evaluate the list in order, last match wins.
 - [ ] **Step 4: Run** the tests (PASS).
 - [ ] **Step 5: Commit** `feat(workflow): match triggers with github filter rules`
 
@@ -610,21 +609,15 @@ fn no_timings_balances_by_count() {
 - Test: `crates/cli/tests/cli.rs`
 
 **Interfaces:**
-- Consumes: `parse`, `validate`, `convert`, `to_yaml`, `split`.
-- Produces the commands later plans and the runner image rely on:
+- Consumes: `parse`, `validate`, `convert`, `to_yaml`.
+- Produces the developer commands (the CLI is a local tool; runners get
+  test splitting through `hatchrun-agent` in Plan 2):
   - `hatchrun validate [PATH]`: default `.hatchrun/config.yml`; prints
     `PATH:line:column: message` per diagnostic; exit 0 clean, 1 with
     errors.
   - `hatchrun convert [FILES]... [-o PATH]`: default files
     `.github/workflows/*.yml` and `*.yaml`; writes YAML to `-o` or
     stdout; warnings to stderr as `file: message`; exit 1 on errors.
-  - `hatchrun tests split [--by timings|name] [--timings FILE] [--index N] [--total N] [ITEMS]...`:
-    items from arguments, else one per line from stdin; prints the
-    node's items space-separated on one line. `--index`/`--total`
-    default to `HATCHRUN_NODE_INDEX` / `HATCHRUN_NODE_TOTAL` (0 and 1
-    when unset); `--timings` defaults to `HATCHRUN_TIMINGS_FILE`, a
-    JSON object of item to seconds; `--by name` ignores timings.
-    Plan 2's agent sets those three variables on parallel nodes.
   - `hatchrun --version` prints `hatchrun <version>`, with `build.rs`
     copied from `crates/scaler/build.rs` (`HATCHRUN_VERSION`).
 
@@ -636,9 +629,6 @@ fn no_timings_balances_by_count() {
   - `convert_writes_yaml`: converting `fixtures/github/ci.yml` (copy
     it under `crates/cli/tests/fixtures/`) to `-o` a temp file exits 0,
     and `validate` on that file exits 0; stderr mentions `services`.
-  - `split_reads_env`: with `HATCHRUN_NODE_INDEX=1`,
-    `HATCHRUN_NODE_TOTAL=2` and the Task 7 timings in a temp
-    `HATCHRUN_TIMINGS_FILE`, `tests split a b c d e` prints `d e`.
   - `version`: prints `hatchrun 0.1.0`.
 - [ ] **Step 2: Run** `cargo test -p hatchrun-cli` (FAIL).
 - [ ] **Step 3: Implement `main.rs`** with `clap` derive (`anyhow` for

@@ -425,6 +425,20 @@ fn glob_matches(toks: &[Tok], buffers: &mut Buffers, left: &mut usize) -> Option
     Some(at.last() == Some(&n))
 }
 
+/// Reads a string or a list of strings into a list.
+fn one_or_many<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(one) => vec![one],
+        OneOrMany::Many(many) => many,
+    })
+}
+
 impl<'de> Deserialize<'de> for Filter {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct FilterVisitor;
@@ -522,6 +536,8 @@ pub struct PushTrigger {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PullRequestTrigger {
     /// Activity types; `opened`, `synchronize` and `reopened` when absent.
+    /// One type may be written as a plain string, as GitHub allows.
+    #[serde(deserialize_with = "one_or_many")]
     pub types: Vec<String>,
     /// Base branches that trigger.
     #[serde(skip_serializing_if = "Option::is_none")]

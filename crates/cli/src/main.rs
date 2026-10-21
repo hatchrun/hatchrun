@@ -95,7 +95,13 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
             || path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
-        paths.insert(name.clone(), path);
+        if let Some(other) = paths.insert(name.clone(), path) {
+            anyhow::bail!(
+                "{} and {} have the same file name; convert them separately",
+                other.display(),
+                path.display()
+            );
+        }
         inputs.push((name, source));
     }
     let shown = |problem: &Diagnostic| match problem.file.as_deref().and_then(|f| paths.get(f)) {

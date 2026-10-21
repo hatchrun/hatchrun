@@ -88,6 +88,23 @@ fn convert_prints_to_stdout_and_fails_on_bad_input() {
 }
 
 #[test]
+fn convert_rejects_two_files_with_one_name() {
+    let a = scratch("dup-a/ci.yml");
+    let b = scratch("dup-b/ci.yml");
+    for path in [&a, &b] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(fixture("github/ci.yml"), path).unwrap();
+    }
+    let out = run(hatchrun().arg("convert").arg(&a).arg(&b));
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(text(&out.stdout), "");
+    let err = text(&out.stderr);
+    assert!(err.contains(&a.display().to_string()), "{err}");
+    assert!(err.contains(&b.display().to_string()), "{err}");
+    assert!(err.contains("have the same file name"), "{err}");
+}
+
+#[test]
 fn convert_writes_what_converts_and_reports_the_rest() {
     let good = scratch("partial.yml");
     std::fs::write(

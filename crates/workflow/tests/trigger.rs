@@ -130,6 +130,13 @@ fn pull_request_default_types() {
 }
 
 #[test]
+fn pull_request_types_take_one_string() {
+    let t = on("pull_request: { types: closed }");
+    assert!(triggered(&t, &pr("closed", "main", &[])));
+    assert!(!triggered(&t, &pr("opened", "main", &[])));
+}
+
+#[test]
 fn pull_request_filters() {
     let t = on("pull_request: { types: [closed], branches: [main], paths: ['src/**'] }");
     assert!(triggered(&t, &pr("closed", "main", &["src/a"])));
