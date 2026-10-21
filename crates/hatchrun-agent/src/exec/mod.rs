@@ -12,6 +12,7 @@ pub mod commands;
 pub mod composite;
 pub mod context;
 pub mod files;
+pub mod finish;
 pub mod layout;
 pub mod lines;
 pub mod mask;
@@ -135,6 +136,17 @@ pub async fn run_job(
     }
     masker.add(&doc.github.token);
 
+    // The job's own timeout cancels it like a request to stop does.
+    let external = cancel;
+    let (requests, cancel) = tokio::sync::watch::channel(*external.borrow());
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let timer = tokio::spawn(forward_cancels(
+        external.clone(),
+        requests,
+        opts.minute * doc.job.timeout_minutes,
+        std::sync::Arc::clone(&timed_out),
+    ));
+
     let mut job = Job {
         ctx: Contexts::new(&doc, &layout),
         doc: &doc,
@@ -164,33 +176,91 @@ pub async fn run_job(
         stage: opts.state_dir.join("stage"),
         stage_fd: std::sync::Arc::new(stage_fd),
         cache_saves: Vec::new(),
+        cache_env: BTreeMap::new(),
     };
     job.start();
 
+    let result = finish(&mut job, sink, &timed_out, &external).await;
+    timer.abort();
+    Ok(result)
+}
+
+/// Runs the job's steps and collects its result.
+async fn finish(
+    job: &mut Job<'_>,
+    sink: &mut dyn Sink,
+    timed_out: &std::sync::atomic::AtomicBool,
+    external: &tokio::sync::watch::Receiver<u32>,
+) -> JobResult {
+    let doc = job.doc;
+    match job.job_condition() {
+        Ok(true) => {}
+        Ok(false) => return job.result(Conclusion::Skipped, BTreeMap::new(), Vec::new()),
+        Err(err) => {
+            job.say(sink, Line::Error(&format!("if: {err}")));
+            return job.result(Conclusion::Failure, BTreeMap::new(), Vec::new());
+        }
+    }
+
+    let proxy = job.start_cache(sink).await;
     // GitHub runs every `pre` before the first step, in step order.
     job.pre_phase(sink).await;
     let mut summaries = Vec::new();
     for (index, step) in doc.job.steps.iter().enumerate() {
+        job.note_cancel();
         if job.aborted {
             summaries.push(job.skip(index, step, sink));
         } else {
             summaries.push(job.step(index, step, sink).await);
         }
     }
+    job.note_cancel();
     job.post_phase(sink).await;
     job.save_caches(sink).await;
+    let outputs = job.job_outputs(sink);
+    if let Some(proxy) = proxy {
+        proxy.stop().await;
+    }
 
+    // GitHub reports a job that ran out of time as failed.
+    let timed_out = timed_out.load(std::sync::atomic::Ordering::Relaxed) && *external.borrow() == 0;
     let conclusion = match job.status {
         JobStatus::Success => Conclusion::Success,
         JobStatus::Failure => Conclusion::Failure,
+        JobStatus::Cancelled if timed_out => Conclusion::Failure,
         JobStatus::Cancelled => Conclusion::Cancelled,
     };
-    Ok(JobResult {
-        conclusion,
-        outputs: BTreeMap::new(),
-        steps: summaries,
-        annotations: job.annotations,
-    })
+    job.result(conclusion, outputs, summaries)
+}
+
+/// Passes the agent's stop requests on to the job and adds the job's
+/// timeout as a first request. A request that comes after the timeout
+/// does not count again, so the next one still aborts.
+async fn forward_cancels(
+    mut external: tokio::sync::watch::Receiver<u32>,
+    requests: tokio::sync::watch::Sender<u32>,
+    limit: Duration,
+    timed_out: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let sleep = tokio::time::sleep(limit);
+    tokio::pin!(sleep);
+    let mut waiting = true;
+    let mut open = true;
+    while waiting || open {
+        tokio::select! {
+            () = &mut sleep, if waiting => {
+                waiting = false;
+                timed_out.store(true, Ordering::Relaxed);
+            }
+            changed = external.changed(), if open => {
+                open = changed.is_ok();
+            }
+        }
+        let count = (*external.borrow()).max(u32::from(timed_out.load(Ordering::Relaxed)));
+        requests.send_replace(count);
+    }
 }
 
 /// The user's uid and gid, for handing step files to it.
@@ -292,6 +362,8 @@ struct Job<'a> {
     stage_fd: std::sync::Arc<std::os::fd::OwnedFd>,
     /// Caches to save when the job ends, in step order.
     cache_saves: Vec<builtin::CacheSave>,
+    /// The cache proxy's variables, when it runs. Every step gets them.
+    cache_env: BTreeMap<String, String>,
 }
 
 /// What a step needs to start.
@@ -543,13 +615,15 @@ impl Job<'_> {
             &mut self.budget,
         );
         // After a cancel, whatever still runs shares the grace period.
-        let timeout = match self.grace_until {
-            Some(end) => {
-                let left = end.saturating_duration_since(Instant::now());
-                Some(launch.timeout.map_or(left, |t| t.min(left)))
-            }
+        let left = self
+            .grace_until
+            .map(|end| end.saturating_duration_since(Instant::now()));
+        let timeout = match left {
+            Some(left) => Some(launch.timeout.map_or(left, |t| t.min(left))),
             None => launch.timeout,
         };
+        // The step's own timeout only counts when it ends first.
+        let grace_limited = left.is_some_and(|left| launch.timeout.is_none_or(|t| t > left));
         let process = Process {
             program: launch.program,
             args: launch.args,
@@ -565,10 +639,9 @@ impl Job<'_> {
         };
         let mut abort = wait_for(self.cancel_requests.clone(), 2);
         let spawned = spawn(process, &mut out, &mut cancel, &mut abort).await;
-        let grace_over = self.grace_until.is_some_and(|end| Instant::now() >= end);
         let mut outcome = match spawned {
             // The grace period ran out: the job is cancelled, not slow.
-            Ok(Exit::TimedOut) if grace_over && launch.timeout.is_none() => {
+            Ok(Exit::TimedOut) if grace_limited => {
                 exit_outcome(&mut out, Ok(Exit::Cancelled), None)
             }
             other => exit_outcome(&mut out, other, launch.timeout_minutes),
@@ -875,6 +948,7 @@ fn base_env(
         "HATCHRUN_TIMINGS".to_owned(),
         path(&layout.temp.join(TIMINGS_FILE)),
     );
+    env.extend(job.cache_env.clone());
     if let Some((index, total)) = doc.job.node {
         env.insert("HATCHRUN_NODE_INDEX".to_owned(), index.to_string());
         env.insert("HATCHRUN_NODE_TOTAL".to_owned(), total.to_string());

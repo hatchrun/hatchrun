@@ -1857,3 +1857,272 @@ fn job_without_a_node_gets_timings_only() {
     assert!(text.lines().any(|l| l == "node=[][]"), "{text}");
     assert!(text.lines().any(|l| l == "file"), "{text}");
 }
+
+// Finishing a job.
+
+#[test]
+fn job_outputs_are_evaluated() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut step = make::run("echo v=42 >> \"$GITHUB_OUTPUT\"");
+    step.id = Some("a".to_owned());
+    let mut doc = make::document(vec![make::planned(step)]);
+    doc.job
+        .outputs
+        .insert("v".to_owned(), "n${{ steps.a.outputs.v }}".to_owned());
+    let out = exec(dir.path(), &json(&doc));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let result = result(dir.path());
+    assert_eq!(result.outputs.get("v").map(String::as_str), Some("n42"));
+}
+
+#[test]
+fn job_outputs_with_secrets_are_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("echo hi")]);
+    doc.secrets
+        .insert("K".to_owned(), "hunter2hunter2".to_owned());
+    doc.job
+        .outputs
+        .insert("leak".to_owned(), "x-${{ secrets.K }}".to_owned());
+    doc.job.outputs.insert("fine".to_owned(), "ok".to_owned());
+    let out = exec(dir.path(), &json(&doc));
+    let text = stdout(&out);
+    assert!(!text.contains("hunter2hunter2"), "{text}");
+    assert!(text.contains("leak"), "{text}");
+    let result = result(dir.path());
+    assert_eq!(result.outputs.len(), 1, "{:?}", result.outputs);
+    assert_eq!(result.outputs.get("fine").map(String::as_str), Some("ok"));
+}
+
+#[test]
+fn job_outputs_are_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("echo hi")]);
+    for n in 0..1100 {
+        doc.job.outputs.insert(format!("o{n:04}"), "v".to_owned());
+    }
+    let out = exec(dir.path(), &json(&doc));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(result(dir.path()).outputs.len(), 1000);
+}
+
+#[test]
+fn job_if_false_skips_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("echo ran")]);
+    doc.job.if_ = Some("false".to_owned());
+    let out = exec(dir.path(), &json(&doc));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(!stdout(&out).contains("ran"), "{}", stdout(&out));
+    let result = result(dir.path());
+    assert_eq!(result.conclusion, Conclusion::Skipped);
+    assert_eq!(result.steps.len(), 0);
+}
+
+#[test]
+fn job_if_sees_needs_and_a_failed_need_skips_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("echo ran")]);
+    doc.needs.insert(
+        "a".to_owned(),
+        hatchrun_workflow::Need {
+            result: Conclusion::Failure,
+            outputs: std::collections::BTreeMap::new(),
+        },
+    );
+    doc.job.if_ = Some("needs.a.result == 'failure'".to_owned());
+    let out = exec(dir.path(), &json(&doc));
+    assert!(!stdout(&out).contains("ran"), "{}", stdout(&out));
+    assert_eq!(result(dir.path()).conclusion, Conclusion::Skipped);
+
+    let dir = tempfile::tempdir().unwrap();
+    doc.job.if_ = Some("always() && needs.a.result == 'failure'".to_owned());
+    let out = exec(dir.path(), &json(&doc));
+    assert!(lines(&out).contains(&"ran".to_owned()), "{}", stdout(&out));
+}
+
+#[test]
+fn job_if_error_fails_the_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("echo ran")]);
+    doc.secrets.insert("K".to_owned(), "s3cr3t".to_owned());
+    doc.job.if_ = Some("secrets.K.nope( == 's3cr3t'".to_owned());
+    let out = exec(dir.path(), &json(&doc));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(!stdout(&out).contains("ran"));
+    assert_eq!(result(dir.path()).conclusion, Conclusion::Failure);
+}
+
+#[test]
+fn cancel_runs_always_steps() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "act",
+        "name: p\nruns:\n  using: node20\n  main: main.js\n  post: post.js\n",
+        &[
+            ("main.js", "console.log('main');\n"),
+            ("post.js", "console.log('post-ran');\n"),
+        ],
+    );
+    let mut always = make::run("echo after");
+    always.if_ = Some("always()".to_owned());
+    let mut plain = make::run("echo skipped-by-cancel");
+    plain.name = Some("plain".to_owned());
+    let doc = make::document(vec![
+        PlannedStep::Uses(make::uses("a", "./act")),
+        make::step("sleep 600"),
+        make::planned(plain),
+        make::planned(always),
+    ]);
+    let child = start_agent(dir.path(), &doc);
+    std::thread::sleep(Duration::from_secs(2));
+    term(&child);
+    let out = child.wait_with_output().unwrap();
+    let text = lines(&out);
+    assert!(text.contains(&"after".to_owned()), "{text:?}");
+    assert!(text.contains(&"post-ran".to_owned()), "{text:?}");
+    assert!(!text.contains(&"skipped-by-cancel".to_owned()), "{text:?}");
+    let result = result(dir.path());
+    assert_eq!(result.conclusion, Conclusion::Cancelled);
+    assert_eq!(result.steps[1].outcome, Conclusion::Cancelled);
+    assert_eq!(result.steps[2].outcome, Conclusion::Skipped);
+    assert_eq!(result.steps[3].outcome, Conclusion::Success);
+}
+
+#[test]
+fn job_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut always = make::run("echo after");
+    always.if_ = Some("always()".to_owned());
+    let mut doc = make::document(vec![make::step("sleep 600"), make::planned(always)]);
+    doc.job.timeout_minutes = 1;
+    let began = Instant::now();
+    let out = exec_with(dir.path(), &json(&doc), &["--minute", "3s"]);
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        lines(&out).contains(&"after".to_owned()),
+        "{}",
+        stdout(&out)
+    );
+    let result = result(dir.path());
+    assert_eq!(result.conclusion, Conclusion::Failure);
+    assert_eq!(result.steps[0].outcome, Conclusion::Cancelled);
+    assert_eq!(result.steps[1].outcome, Conclusion::Success);
+}
+
+#[test]
+fn a_step_timeout_longer_than_the_grace_time_ends_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut always = make::run("sleep 600");
+    always.if_ = Some("always()".to_owned());
+    always.timeout_minutes = Some(60);
+    let mut doc = make::document(vec![make::step("sleep 600"), make::planned(always)]);
+    doc.job.timeout_minutes = 1;
+    let out = exec_with(dir.path(), &json(&doc), &["--minute", "1s"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let result = result(dir.path());
+    assert_eq!(result.steps[1].outcome, Conclusion::Cancelled);
+}
+
+#[test]
+fn secret_never_printed() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\ninputs:\n  s:\n    description: x\nruns:\n  using: composite\n  steps:\n\
+         \x20   - shell: bash\n      run: echo \"comp ${{ inputs.s }}\"\n",
+        &[],
+    );
+    let mut steps = vec![
+        make::step("echo ${{ secrets.K }}"),
+        make::step("printf hunter2; printf 'hunter2\\n'"),
+        make::step("echo \"::error::bad ${{ secrets.K }}\""),
+    ];
+    let mut comp = make::uses("c", "./comp");
+    with(&mut comp, "s", "${{ secrets.K }}");
+    steps.push(PlannedStep::Uses(comp));
+    if has_node() {
+        local_action(
+            dir.path(),
+            "js",
+            "name: j\ninputs:\n  s:\n    description: x\nruns:\n  using: node20\n  main: index.js\n",
+            &[("index.js", "console.log('js ' + process.env.INPUT_S);\n")],
+        );
+        let mut js = make::uses("j", "./js");
+        with(&mut js, "s", "${{ secrets.K }}");
+        steps.push(PlannedStep::Uses(js));
+    }
+    let mut doc = make::document(steps);
+    doc.secrets
+        .insert("K".to_owned(), "hunter2hunter2".to_owned());
+    let out = exec(dir.path(), &json(&doc));
+    let text = stdout(&out);
+    assert!(!text.contains("hunter2hunter2"), "{text}");
+    assert!(text.contains("comp ***"), "{text}");
+    let raw = std::fs::read_to_string(dir.path().join("result.json")).unwrap();
+    assert!(!raw.contains("hunter2hunter2"), "{raw}");
+}
+
+#[test]
+fn annotations_in_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(
+        dir.path(),
+        vec![make::step("echo '::warning file=a,line=2::w'")],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let result = result(dir.path());
+    assert_eq!(result.annotations.len(), 1, "{:?}", result.annotations);
+    let note = &result.annotations[0];
+    assert_eq!(note.message, "w");
+    assert_eq!(note.file.as_deref(), Some("a"));
+    assert_eq!(note.line, Some(2));
+}
+
+#[tokio::test]
+async fn cache_service_starts_the_proxy() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/cache/lookup"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let script = "echo \"url=${ACTIONS_RESULTS_URL-unset} v2=${ACTIONS_CACHE_SERVICE_V2-unset} \
+                  tok=${ACTIONS_RUNTIME_TOKEN:+set}\"";
+    let mut doc = make::document(vec![make::step(script)]);
+    doc.cache = Some(hatchrun_workflow::CacheService {
+        url: format!("{}/v1/cache", server.uri()),
+        token: "t".to_owned(),
+    });
+    let with_cache = json(&doc);
+    doc.cache = None;
+    let without = json(&doc);
+    let (a, b) = tokio::task::spawn_blocking(move || {
+        let one = tempfile::tempdir().unwrap();
+        let on = exec(one.path(), &with_cache);
+        let two = tempfile::tempdir().unwrap();
+        let off = exec(two.path(), &without);
+        (stdout(&on), stdout(&off))
+    })
+    .await
+    .unwrap();
+    assert!(
+        a.lines()
+            .any(|l| l.starts_with("url=http://127.0.0.1:") && l.contains("v2=true tok=set")),
+        "{a}"
+    );
+    assert!(b.lines().any(|l| l == "url=unset v2=unset tok="), "{b}");
+}

@@ -152,40 +152,35 @@ async fn main() -> ExitCode {
         .init();
 
     let args = Args::parse();
-    if let Some(Command::Exec {
-        job_file,
-        work_dir,
-        runner_user,
-        env_file,
-        node,
-        store,
-        state_dir,
-        result,
-        minute,
-    }) = &args.command
-    {
-        let opts = exec::Options {
-            work_dir: work_dir.clone(),
-            runner_user: Some(runner_user.clone()).filter(|user| !user.is_empty()),
-            env_file: env_file.clone(),
-            node: node.clone(),
-            store: store.clone(),
-            state_dir: state_dir.clone(),
-            tool_cache: PathBuf::from("/opt/hostedtoolcache"),
-            minute: *minute,
-        };
-        return exec_command(job_file, &opts, result.as_deref()).await;
-    }
-    if let Some(Command::Split {
-        by: SplitBy::Timings,
-        items,
-    }) = args.command
-    {
-        return split::run(items);
-    }
     let result = match &args.command {
         Some(Command::Detect { mark }) => detect(&args.imds_endpoint, mark).await,
-        Some(Command::Exec { .. } | Command::Split { .. }) => unreachable!("handled above"),
+        Some(Command::Exec {
+            job_file,
+            work_dir,
+            runner_user,
+            env_file,
+            node,
+            store,
+            state_dir,
+            result,
+            minute,
+        }) => {
+            let opts = exec::Options {
+                work_dir: work_dir.clone(),
+                runner_user: Some(runner_user.clone()).filter(|user| !user.is_empty()),
+                env_file: env_file.clone(),
+                node: node.clone(),
+                store: store.clone(),
+                state_dir: state_dir.clone(),
+                tool_cache: PathBuf::from("/opt/hostedtoolcache"),
+                minute: *minute,
+            };
+            return exec_command(job_file, &opts, result.as_deref()).await;
+        }
+        Some(Command::Split {
+            by: SplitBy::Timings,
+            items,
+        }) => return split::run(items.clone()),
         None => run(args).await,
     };
     match result {
