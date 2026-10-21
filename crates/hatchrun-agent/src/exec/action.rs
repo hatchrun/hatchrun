@@ -5,9 +5,10 @@
 //! Fetching actions and reading their `action.yml`.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -151,8 +152,12 @@ pub const LIMITS: Limits = Limits {
     backoff: Duration::from_millis(500),
 };
 
-/// The file that marks a finished extraction in the cache.
-const COMPLETE: &str = ".hatchrun-complete";
+/// Marks a finished extraction. It sits beside the extracted tree, so
+/// an archive cannot ship its own.
+const COMPLETE: &str = "complete";
+
+/// The extracted repository inside a cache entry.
+const TREE: &str = "tree";
 
 /// The most `action.yml` may hold.
 const MAX_META: u64 = 1 << 20;
@@ -231,11 +236,15 @@ pub async fn fetch_with(
             path,
             git_ref,
         } => {
-            let root = layout.actions.join(owner).join(repo).join(git_ref);
+            let root = layout
+                .actions
+                .join(owner)
+                .join(repo)
+                .join(cache_key(git_ref));
             if !root.join(COMPLETE).is_file() {
                 download(github, owner, repo, git_ref, &root, limits).await?;
             }
-            root.join(path)
+            root.join(TREE).join(path)
         }
     };
     let meta = read_metadata(&dir)?;
@@ -257,9 +266,24 @@ fn local_dir(workspace: &Path, p: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The cache directory name for a ref: one path component, with every
+/// byte outside `[A-Za-z0-9._-]` percent-encoded, so `a/b` and `a` can
+/// never nest.
+fn cache_key(git_ref: &str) -> String {
+    let mut key = String::new();
+    for b in git_ref.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') {
+            key.push(b as char);
+        } else {
+            let _ = write!(key, "%{b:02X}");
+        }
+    }
+    key
+}
+
 /// Downloads `owner/repo@git_ref` and extracts it to `root`. The
-/// extraction happens in a sibling directory that is renamed into
-/// place, so a half-extracted action is never reused.
+/// extraction happens in a fresh temp directory next to it that is
+/// renamed into place, so a half-extracted action is never reused.
 async fn download(
     github: &Github,
     owner: &str,
@@ -268,39 +292,23 @@ async fn download(
     root: &Path,
     limits: Limits,
 ) -> Result<()> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = root.parent().context("action cache path has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    let base = root.file_name().context("action cache path has no name")?;
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let suffix = format!(".tmp-{}-{n}", std::process::id());
-    let tmp = parent.join(format!("{}{suffix}", base.to_string_lossy()));
-    let archive = parent.join(format!("{}{suffix}.tgz", base.to_string_lossy()));
+    // A name no cache key can have: keys never start with `%tmp`.
+    let tmp = tempfile::Builder::new()
+        .prefix("%tmp-")
+        .tempdir_in(parent)
+        .context("create temp directory")?;
+    // The steps run as another user and need to read the tree.
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))?;
+    let label = format!("{owner}/{repo}@{git_ref}");
+    let archive = tmp.path().join("download.tgz");
+    let tree = tmp.path().join(TREE);
 
-    let result = download_to(github, owner, repo, git_ref, &archive, &tmp, root, limits).await;
-    let _ = std::fs::remove_file(&archive);
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn download_to(
-    github: &Github,
-    owner: &str,
-    repo: &str,
-    git_ref: &str,
-    archive: &Path,
-    tmp: &Path,
-    root: &Path,
-    limits: Limits,
-) -> Result<()> {
     let url = format!(
         "{}/repos/{owner}/{repo}/tarball/{git_ref}",
         github.api_url.trim_end_matches('/')
     );
-    let label = format!("{owner}/{repo}@{git_ref}");
     let client = reqwest::Client::builder()
         .user_agent("hatchrun-agent")
         .build()
@@ -308,7 +316,7 @@ async fn download_to(
     let mut pause = limits.backoff;
     let mut attempt = 0;
     loop {
-        match try_download(&client, &url, &github.token, archive, limits.compressed).await {
+        match try_download(&client, &url, &github.token, &archive, limits.compressed).await {
             Ok(()) => break,
             Err(Failure::Retry(e)) if attempt < RETRIES => {
                 tracing::warn!("download of {label} failed, retrying: {e:#}");
@@ -322,23 +330,28 @@ async fn download_to(
         }
     }
 
-    let (archive, tmp_dir, expanded) = (archive.to_owned(), tmp.to_owned(), limits.expanded);
+    let (archive_path, expanded) = (archive.clone(), limits.expanded);
+    let extract_into = tree.clone();
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&archive)?;
-        extract_tar_gz(file, &tmp_dir, 1, expanded)?;
-        std::fs::write(tmp_dir.join(COMPLETE), b"")?;
+        let file = std::fs::File::open(&archive_path)?;
+        extract_tar_gz(file, &extract_into, 1, expanded)?;
         anyhow::Ok(())
     })
     .await
     .context("extract task")?
     .with_context(|| format!("extract {label}"))?;
+    std::fs::remove_file(&archive)?;
+    std::fs::write(tmp.path().join(COMPLETE), b"")?;
 
-    if let Err(e) = std::fs::rename(tmp, root) {
-        // A concurrent job may have finished the same action first.
-        if !root.join(COMPLETE).is_file() {
-            return Err(e).with_context(|| format!("move {label} into place"));
+    // A leftover without the marker is incomplete: replace it. One with
+    // the marker was finished by a concurrent job.
+    if !root.join(COMPLETE).is_file() {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("clear {}", root.display())),
         }
-        let _ = std::fs::remove_dir_all(tmp);
+        std::fs::rename(tmp.path(), root).with_context(|| format!("move {label} into place"))?;
     }
     Ok(())
 }
@@ -703,7 +716,7 @@ mod tests {
         let r = remote("o", "r", "", "v1");
 
         let a = fetch_with(&r, &gh, &layout, fast()).await.unwrap();
-        assert_eq!(a.dir, layout.actions.join("o/r/v1"));
+        assert_eq!(a.dir, layout.actions.join("o/r/v1/tree"));
         assert!(a.dir.join("dist/index.js").is_file());
         assert!(matches!(a.meta.runs, Runs::Node { .. }));
 
@@ -745,7 +758,77 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(a.dir, layout.actions.join("o/r/v2/init"));
+        assert_eq!(a.dir, layout.actions.join("o/r/v2/tree/init"));
+    }
+
+    #[tokio::test]
+    async fn slashed_refs_get_one_component_and_stale_entries_are_replaced() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/tarball/feat/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball(&[
+                ("o-r-abc/action.yml", NODE_YML),
+                ("o-r-abc/complete", "shipped"),
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let work = tempfile::tempdir().unwrap();
+        let layout = Layout::new(work.path(), "o/r", Path::new("/tc"));
+        // A crashed run left a tree but no marker.
+        let stale = layout.actions.join("o/r/feat%2Fx");
+        fs::create_dir_all(stale.join("tree")).unwrap();
+        fs::write(stale.join("tree/old"), "old").unwrap();
+        let a = fetch_with(
+            &remote("o", "r", "", "feat/x"),
+            &github(&server.uri()),
+            &layout,
+            fast(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.dir, stale.join("tree"));
+        assert!(!stale.join("tree/old").exists());
+        // The archive's own `complete` file is inside the tree only.
+        assert!(stale.join("tree/complete").is_file());
+        assert!(stale.join("complete").is_file());
+        assert_eq!(cache_key("a/b%"), "a%2Fb%25");
+    }
+
+    #[tokio::test]
+    async fn a_shipped_marker_does_not_make_a_failed_fetch_cached() {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(7);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, "o-r-abc/complete", &b"shipped"[..])
+            .unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_size(0);
+        h.set_cksum();
+        b.append_link(&mut h, "o-r-abc/hard", "/etc/passwd")
+            .unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&b.into_inner().unwrap()).unwrap();
+        let body = gz.finish().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        let work = tempfile::tempdir().unwrap();
+        let layout = Layout::new(work.path(), "o/r", Path::new("/tc"));
+        let r = remote("o", "r", "", "bad");
+        assert!(
+            fetch_with(&r, &github(&server.uri()), &layout, fast())
+                .await
+                .is_err()
+        );
+        assert!(!layout.actions.join("o/r/bad").exists());
+        let leftovers: Vec<_> = fs::read_dir(layout.actions.join("o/r")).unwrap().collect();
+        assert!(leftovers.is_empty(), "temp dir cleaned up");
     }
 
     #[tokio::test]

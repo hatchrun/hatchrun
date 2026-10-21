@@ -7,6 +7,8 @@
 //! destination and never takes ownership or setuid bits from the
 //! archive.
 
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
@@ -22,27 +24,90 @@ use tar::{Archive, Builder, EntryType};
 /// a loop.
 const MAX_LINK_DEPTH: usize = 40;
 
+/// The most a GNU long-name, long-link or pax header body may hold. The
+/// tar crate reads these fully into memory.
+const MAX_EXTENSION: u64 = 64 << 10;
+
+/// What one entry costs against the expanded budget, so that empty
+/// files, directories and links are not free.
+const ENTRY_COST: u64 = 512;
+
+/// Limits for [`extract_tar_gz_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractLimits {
+    /// The most the entries may expand to: file bytes plus 512 per entry.
+    pub bytes: u64,
+    /// The most decompressed tar bytes to read, headers and padding
+    /// included.
+    pub stream: u64,
+    /// The most entries to read.
+    pub entries: u64,
+}
+
+impl ExtractLimits {
+    /// The defaults for an expanded cap of `max_bytes`: a stream of
+    /// twice that plus 64 MiB, and a million entries.
+    pub fn new(max_bytes: u64) -> Self {
+        Self {
+            bytes: max_bytes,
+            stream: max_bytes.saturating_mul(2).saturating_add(64 << 20),
+            entries: 1_000_000,
+        }
+    }
+}
+
 /// Extracts the gzipped tar in `src` into `dest`, dropping the first
 /// `strip` path components of every entry. `max_bytes` caps the sum of
-/// the entry sizes written.
+/// the entry sizes written plus 512 per entry.
 ///
-/// Absolute paths, `..` components, hard links, devices and FIFOs are
-/// errors. Symlinks are kept when they resolve inside `dest`. Files
-/// get the archive's permission bits minus setuid, setgid and sticky,
-/// and are owned by the extracting user.
+/// Absolute paths, `..` components, hard links, sparse files, devices
+/// and FIFOs are errors. Symlinks are kept when they resolve inside
+/// `dest`. Files get the archive's permission bits minus setuid, setgid
+/// and sticky, and are owned by the extracting user.
+///
+/// On error `dest` may hold a partial tree (never a symlink). Callers
+/// must discard it.
 pub fn extract_tar_gz(src: impl Read, dest: &Path, strip: usize, max_bytes: u64) -> Result<()> {
+    extract_tar_gz_with(src, dest, strip, ExtractLimits::new(max_bytes))
+}
+
+/// [`extract_tar_gz`] with explicit limits.
+pub fn extract_tar_gz_with(
+    src: impl Read,
+    dest: &Path,
+    strip: usize,
+    limits: ExtractLimits,
+) -> Result<()> {
+    let max_bytes = limits.bytes;
     fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
     let dest = dest
         .canonicalize()
         .with_context(|| format!("resolve {}", dest.display()))?;
-    let mut archive = Archive::new(GzDecoder::new(src));
+    let guard = Guard {
+        inner: GzDecoder::new(src),
+        total: 0,
+        cap: limits.stream,
+        hdr: [0; 512],
+        hdr_len: 0,
+        body_left: 0,
+    };
+    let mut archive = Archive::new(guard);
     let mut written: u64 = 0;
-    // Symlinks are created after every file and directory, so no later
-    // entry can be written through one.
+    let mut entries: u64 = 0;
+    // Symlinks are planned first and created after every file and
+    // directory, so no later entry can be written through one.
     let mut links: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     for entry in archive.entries().context("read archive")? {
         let mut entry = entry.context("read archive entry")?;
+        entries += 1;
+        if entries > limits.entries {
+            bail!("archive has more than {} entries", limits.entries);
+        }
+        written = written
+            .checked_add(ENTRY_COST)
+            .filter(|w| *w <= max_bytes)
+            .with_context(|| format!("archive expands past the {max_bytes} byte limit"))?;
         let kind = entry.header().entry_type();
         let raw = entry.path().context("read entry path")?.into_owned();
         let Some(rel) = clean_entry_path(&raw, strip)? else {
@@ -57,8 +122,8 @@ pub fn extract_tar_gz(src: impl Read, dest: &Path, strip: usize, max_bytes: u64)
                 fs::set_permissions(&path, fs::Permissions::from_mode(mode))
                     .with_context(|| format!("set mode on {}", path.display()))?;
             }
-            EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
-                let size = entry.header().size().context("read entry size")?;
+            EntryType::Regular | EntryType::Continuous => {
+                let size = entry.size();
                 if size > max_bytes - written {
                     bail!("archive expands past the {max_bytes} byte limit");
                 }
@@ -99,21 +164,104 @@ pub fn extract_tar_gz(src: impl Read, dest: &Path, strip: usize, max_bytes: u64)
                 links.push((rel, target));
             }
             EntryType::Link => bail!("hard link {} is not allowed", rel.display()),
+            EntryType::GNUSparse => bail!("sparse file {} is not allowed", rel.display()),
             other => bail!("entry {} has unsupported type {other:?}", rel.display()),
         }
     }
 
-    for (rel, target) in &links {
-        let path = dest.join(rel);
-        if fs::symlink_metadata(&path).is_ok() {
+    create_links(&dest, &links)
+}
+
+/// Checks every link against the planned set before creating any.
+fn create_links(dest: &Path, links: &[(PathBuf, PathBuf)]) -> Result<()> {
+    let mut plan: HashMap<PathBuf, PathBuf> = HashMap::new();
+    for (rel, target) in links {
+        if fs::symlink_metadata(dest.join(rel)).is_ok()
+            || plan.insert(rel.clone(), target.clone()).is_some()
+        {
             bail!("symlink {} collides with another entry", rel.display());
         }
-        symlink(target, &path).with_context(|| format!("create symlink {}", rel.display()))?;
     }
-    for (rel, _) in &links {
-        check_link(&dest, rel)?;
+    for (rel, _) in links {
+        check_link(&plan, rel)?;
+    }
+    for (rel, target) in links {
+        symlink(target, dest.join(rel))
+            .with_context(|| format!("create symlink {}", rel.display()))?;
     }
     Ok(())
+}
+
+/// Passes the decompressed tar through while enforcing a byte cap and
+/// refusing oversized extension headers before the tar crate reads
+/// their bodies into memory.
+struct Guard<R> {
+    inner: R,
+    total: u64,
+    cap: u64,
+    hdr: [u8; 512],
+    hdr_len: usize,
+    /// Body and padding bytes of the current entry still to pass.
+    body_left: u64,
+}
+
+impl<R: Read> Read for Guard<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.total += n as u64;
+        if self.total > self.cap {
+            return Err(io::Error::other(format!(
+                "archive stream is larger than the {} byte limit",
+                self.cap
+            )));
+        }
+        let mut data = &buf[..n];
+        while !data.is_empty() {
+            if self.body_left > 0 {
+                let k = usize::try_from(self.body_left).map_or(data.len(), |b| b.min(data.len()));
+                self.body_left -= k as u64;
+                data = &data[k..];
+                continue;
+            }
+            let k = (512 - self.hdr_len).min(data.len());
+            self.hdr[self.hdr_len..self.hdr_len + k].copy_from_slice(&data[..k]);
+            self.hdr_len += k;
+            data = &data[k..];
+            if self.hdr_len == 512 {
+                self.hdr_len = 0;
+                let size = header_size(&self.hdr);
+                if matches!(self.hdr[156], b'L' | b'K' | b'x' | b'g') && size > MAX_EXTENSION {
+                    return Err(io::Error::other(format!(
+                        "archive has an extension header of {size} bytes, more than {MAX_EXTENSION}"
+                    )));
+                }
+                self.body_left = size.div_ceil(512).saturating_mul(512);
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// The size field of a tar header: octal, or base-256 when the high bit
+/// is set. A malformed field reads as 0 and the tar crate rejects it.
+fn header_size(hdr: &[u8; 512]) -> u64 {
+    let field = &hdr[124..136];
+    if field[0] & 0x80 != 0 {
+        if field[1..4].iter().any(|b| *b != 0) || field[0] & 0x7f != 0 {
+            return u64::MAX;
+        }
+        return field[4..]
+            .iter()
+            .fold(0u64, |a, b| (a << 8) | u64::from(*b));
+    }
+    let mut n: u64 = 0;
+    for b in field.iter().skip_while(|b| **b == b' ') {
+        match b {
+            b'0'..=b'7' => n = n.saturating_mul(8).saturating_add(u64::from(b - b'0')),
+            _ => break,
+        }
+    }
+    n
 }
 
 /// Validates an entry path and drops `strip` leading components.
@@ -169,16 +317,15 @@ fn make_dir(path: &Path) -> Result<()> {
     }
 }
 
-/// Resolves the symlink at `rel` by hand, through every other symlink
-/// it meets, and fails when the result leaves `dest`.
-fn check_link(dest: &Path, rel: &Path) -> Result<()> {
-    // Components still to walk, relative to the link's directory.
-    let mut dir: Vec<std::ffi::OsString> = rel
+/// Resolves the planned symlink at `rel` by hand, through the other
+/// planned symlinks it meets, and fails when the result leaves the
+/// destination.
+fn check_link(plan: &HashMap<PathBuf, PathBuf>, rel: &Path) -> Result<()> {
+    let mut dir: Vec<OsString> = rel
         .parent()
         .map(|p| p.components().map(|c| c.as_os_str().to_owned()).collect())
         .unwrap_or_default();
-    let target = fs::read_link(dest.join(rel))?;
-    let mut todo: Vec<std::ffi::OsString> = target
+    let mut todo: Vec<OsString> = plan[rel]
         .components()
         .rev()
         .map(|c| c.as_os_str().to_owned())
@@ -195,18 +342,11 @@ fn check_link(dest: &Path, rel: &Path) -> Result<()> {
             continue;
         }
         dir.push(part);
-        let mut full = dest.to_owned();
-        full.extend(&dir);
-        if let Ok(meta) = fs::symlink_metadata(&full)
-            && meta.file_type().is_symlink()
-        {
+        let full: PathBuf = dir.iter().collect();
+        if let Some(next) = plan.get(&full) {
             hops += 1;
             if hops > MAX_LINK_DEPTH {
                 bail!("symlink {} loops", rel.display());
-            }
-            let next = fs::read_link(&full)?;
-            if next.has_root() {
-                bail!("symlink {} points outside the archive", rel.display());
             }
             dir.pop();
             todo.extend(next.components().rev().map(|c| c.as_os_str().to_owned()));
@@ -339,6 +479,7 @@ mod tests {
         link: &'static str,
         body: &'static [u8],
         mode: u32,
+        claim: Option<u64>,
     }
 
     fn raw(path: &'static str, kind: u8, link: &'static str, body: &'static [u8]) -> Raw {
@@ -348,6 +489,7 @@ mod tests {
             link,
             body,
             mode: 0o644,
+            claim: None,
         }
     }
 
@@ -359,7 +501,9 @@ mod tests {
             h[100..107].copy_from_slice(format!("{:07o}", e.mode).as_bytes());
             h[108..115].copy_from_slice(b"0000000");
             h[116..123].copy_from_slice(b"0000000");
-            h[124..135].copy_from_slice(format!("{:011o}", e.body.len()).as_bytes());
+            h[124..135].copy_from_slice(
+                format!("{:011o}", e.claim.unwrap_or(e.body.len() as u64)).as_bytes(),
+            );
             h[136..147].copy_from_slice(b"00000000000");
             h[148..156].copy_from_slice(b"        ");
             h[156] = e.kind;
@@ -440,6 +584,76 @@ mod tests {
             raw("s", b'2', "p/q/../..", b""),
         ]);
         assert!(extract(&bytes, &dest, 0, 1 << 20).is_err());
+    }
+
+    fn err_text(r: Result<()>) -> String {
+        format!("{:#}", r.unwrap_err())
+    }
+
+    #[test]
+    fn refuses_a_huge_extension_header_before_reading_it() {
+        for kind in *b"LKxg" {
+            let (_t, dest) = outer();
+            let mut e = raw("././@LongLink", kind, "", b"");
+            e.claim = Some(1 << 30);
+            let msg = err_text(extract(&tgz(&[e]), &dest, 0, u64::MAX / 4));
+            assert!(msg.contains("extension header"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn stops_at_the_stream_cap() {
+        let (_t, dest) = outer();
+        let bytes = tgz(&[raw("f", b'0', "", &[0u8; 4096])]);
+        let limits = ExtractLimits {
+            stream: 1000,
+            ..ExtractLimits::new(1 << 30)
+        };
+        let msg = err_text(extract_tar_gz_with(&bytes[..], &dest, 0, limits));
+        assert!(msg.contains("1000 byte limit"), "{msg}");
+    }
+
+    #[test]
+    fn caps_entry_count_and_charges_each_entry() {
+        let (_t, dest) = outer();
+        let dirs: Vec<Raw> = ["a/", "b/", "c/", "d/", "e/"]
+            .iter()
+            .map(|p| raw(p, b'5', "", b""))
+            .collect();
+        let limits = ExtractLimits {
+            entries: 3,
+            ..ExtractLimits::new(1 << 30)
+        };
+        let msg = err_text(extract_tar_gz_with(&tgz(&dirs)[..], &dest, 0, limits));
+        assert!(msg.contains("more than 3 entries"), "{msg}");
+
+        let (_t, dest) = outer();
+        let empties: Vec<Raw> = ["a", "b", "c"]
+            .iter()
+            .map(|p| raw(p, b'0', "", b""))
+            .collect();
+        let msg = err_text(extract(&tgz(&empties), &dest, 0, 1000));
+        assert!(msg.contains("1000 byte limit"), "{msg}");
+    }
+
+    #[test]
+    fn a_bad_link_leaves_no_links_behind() {
+        let (_t, dest) = outer();
+        let bytes = tgz(&[
+            raw("a", b'0', "", b"x"),
+            raw("ok", b'2', "a", b""),
+            raw("bad", b'2', "../x", b""),
+        ]);
+        assert!(extract(&bytes, &dest, 0, 1 << 20).is_err());
+        assert!(fs::symlink_metadata(dest.join("ok")).is_err());
+        assert!(fs::symlink_metadata(dest.join("bad")).is_err());
+    }
+
+    #[test]
+    fn rejects_sparse_entries() {
+        let (_t, dest) = outer();
+        let msg = err_text(extract(&tgz(&[raw("s", b'S', "", b"")]), &dest, 0, 1 << 20));
+        assert!(msg.contains("sparse"), "{msg}");
     }
 
     #[test]
