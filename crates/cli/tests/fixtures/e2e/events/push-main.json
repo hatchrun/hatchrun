@@ -1,0 +1,22 @@
+{
+  "ref": "refs/heads/main",
+  "before": "1c5e0a7d9b3f4e2a8c6d0b1f2e3a4c5d6e7f8a9b",
+  "after": "7d2f9c1e4b6a8d0f3e5c7a9b1d3f5e7a9c1b3d5f",
+  "created": false,
+  "deleted": false,
+  "head_commit": {
+    "id": "7d2f9c1e4b6a8d0f3e5c7a9b1d3f5e7a9c1b3d5f",
+    "message": "fix(api): answer 400 on an empty body"
+  },
+  "commits": [
+    {
+      "id": "7d2f9c1e4b6a8d0f3e5c7a9b1d3f5e7a9c1b3d5f",
+      "message": "fix(api): answer 400 on an empty body",
+      "added": [],
+      "removed": [],
+      "modified": ["services/api/src/handler.rs", "README.md"]
+    }
+  ],
+  "repository": { "full_name": "acme/widgets", "name": "widgets", "owner": { "login": "acme" }, "default_branch": "main", "private": false },
+  "sender": { "login": "octocat" }
+}

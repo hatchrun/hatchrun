@@ -22,5 +22,8 @@ anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 hatchrun-workflow = { path = "../workflow" }
 
+[dev-dependencies]
+serde_json = "1"
+
 [lints]
 workspace = true

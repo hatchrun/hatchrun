@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: api
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/api/**"
+      - Cargo.lock
+  pull_request:
+    paths:
+      - "services/api/**"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/api
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo test
+      - run: ./scripts/check-openapi.sh services/api/openapi.yaml
+        working-directory: .

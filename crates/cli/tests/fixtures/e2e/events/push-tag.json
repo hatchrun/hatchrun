@@ -1,0 +1,15 @@
+{
+  "ref": "refs/tags/v1.4.0",
+  "before": "0000000000000000000000000000000000000000",
+  "after": "7d2f9c1e4b6a8d0f3e5c7a9b1d3f5e7a9c1b3d5f",
+  "created": true,
+  "deleted": false,
+  "base_ref": "refs/heads/main",
+  "head_commit": {
+    "id": "7d2f9c1e4b6a8d0f3e5c7a9b1d3f5e7a9c1b3d5f",
+    "message": "fix(api): answer 400 on an empty body"
+  },
+  "commits": [],
+  "repository": { "full_name": "acme/widgets", "name": "widgets", "owner": { "login": "acme" }, "default_branch": "main", "private": false },
+  "sender": { "login": "octocat" }
+}
