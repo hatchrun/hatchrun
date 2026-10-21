@@ -960,29 +960,29 @@ fn composite_steps_context_is_scoped() {
         "comp",
         "name: c\nruns:\n  using: composite\n  steps:\n\
          \x20   - id: inner\n      shell: bash\n      run: echo \"v=2\" >> \"$GITHUB_OUTPUT\"\n\
-         \x20   - shell: bash\n      run: |\n        echo \"sees-caller=[${{ steps.before.outputs.v }}]\"\n        echo \"sees-own=[${{ steps.inner.outputs.v }}]\"\n        echo \"secret=[${{ secrets.S }}]\"\n",
+         \x20   - shell: bash\n      run: |\n        echo \"sees-caller=[${{ steps.before.outputs.v }}]\"\n        echo \"sees-own=[${{ steps.inner.outputs.v }}]\"\n        echo \"secrets=${{ toJSON(secrets) }}\"\n",
         &[],
     );
     let mut before = make::run("echo v=1 >> \"$GITHUB_OUTPUT\"");
     before.id = Some("before".to_owned());
-    let out = run_steps(
-        dir.path(),
-        vec![
-            make::planned(before),
-            PlannedStep::Uses(make::uses("c", "./comp")),
-            make::step("echo \"sees-inner=[${{ steps.inner.outputs.v }}]\""),
-        ],
-    );
+    let mut doc = make::document(vec![
+        make::planned(before),
+        PlannedStep::Uses(make::uses("c", "./comp")),
+        make::step("echo \"sees-inner=[${{ steps.inner.outputs.v }}]\""),
+    ]);
+    doc.secrets.insert("S".to_owned(), "s3cr3t".to_owned());
+    let out = exec(dir.path(), &json(&doc));
     assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
     let text = lines(&out);
     for want in [
         "sees-caller=[]",
         "sees-own=[2]",
-        "secret=[]",
+        "secrets={}",
         "sees-inner=[]",
     ] {
         assert!(text.contains(&want.to_owned()), "{want}: {text:?}");
     }
+    assert!(!stdout(&out).contains("s3cr3t"), "{}", stdout(&out));
 }
 
 #[test]
@@ -1057,6 +1057,50 @@ fn nesting_is_capped() {
         stdout(&out)
     );
     assert_eq!(result(dir.path()).conclusion, Conclusion::Failure);
+}
+
+#[test]
+fn ten_levels_of_nesting_run() {
+    let dir = tempfile::tempdir().unwrap();
+    for level in 1..=10 {
+        let body = if level < 10 {
+            format!("    - uses: ./c{}\n", level + 1)
+        } else {
+            "    - shell: bash\n      run: echo deepest\n".to_owned()
+        };
+        local_action(
+            dir.path(),
+            &format!("c{level}"),
+            &format!("name: c\nruns:\n  using: composite\n  steps:\n{body}"),
+            &[],
+        );
+    }
+    let out = run_steps(dir.path(), vec![PlannedStep::Uses(make::uses("c", "./c1"))]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    assert!(lines(&out).contains(&"deepest".to_owned()));
+}
+
+#[test]
+fn composite_fan_out_is_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: fan\nruns:\n  using: composite\n  steps:\n\
+         \x20   - uses: ./comp\n      if: always()\n\
+         \x20   - uses: ./comp\n      if: always()\n",
+        &[],
+    );
+    let out = run_steps(
+        dir.path(),
+        vec![PlannedStep::Uses(make::uses("c", "./comp"))],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        stdout(&out).contains("`./comp` would run more than 1000 composite actions in one job"),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]
@@ -1146,7 +1190,7 @@ fn a_cancel_stops_a_composite_step() {
         make::step("echo also-never"),
     ]);
     let child = start_agent(dir.path(), &doc);
-    std::thread::sleep(Duration::from_secs(1));
+    std::thread::sleep(Duration::from_secs(2));
     term(&child);
     let out = child.wait_with_output().unwrap();
     let text = lines(&out);

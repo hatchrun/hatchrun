@@ -19,6 +19,9 @@ use super::{Job, Line, interp};
 /// How many composite actions may nest. The eleventh level fails.
 const MAX_DEPTH: usize = 10;
 
+/// How many composite actions one job may run in total.
+const MAX_RUNS: usize = 1000;
+
 /// The sink for the inner steps of a composite action. They are not
 /// steps of the job, so a header is a plain line and nothing ends.
 struct Inner<'a> {
@@ -74,6 +77,14 @@ impl Job<'_> {
         if self.depth >= MAX_DEPTH {
             let message = format!(
                 "`{}` is nested more than {MAX_DEPTH} composite actions deep",
+                step.uses
+            );
+            return failed(self, sink, &message);
+        }
+        self.composite_runs += 1;
+        if self.composite_runs > MAX_RUNS {
+            let message = format!(
+                "`{}` would run more than {MAX_RUNS} composite actions in one job",
                 step.uses
             );
             return failed(self, sink, &message);

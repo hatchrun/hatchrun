@@ -138,6 +138,7 @@ pub async fn run_job(
         posts: Vec::new(),
         scope_env: BTreeMap::new(),
         depth: 0,
+        composite_runs: 0,
         next_slot: 3 * doc.job.steps.len(),
     };
     job.start();
@@ -223,6 +224,8 @@ struct Job<'a> {
     scope_env: BTreeMap<String, String>,
     /// How many composite actions the running step is inside.
     depth: usize,
+    /// How many composite actions the job has started.
+    composite_runs: usize,
     /// The next file command slot for a step inside a composite action.
     /// Real steps and their `pre` and `post` use the slots below it.
     next_slot: usize,
