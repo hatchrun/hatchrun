@@ -49,8 +49,9 @@ pub struct Conversion {
 /// already uses, a read of the `strategy` or `jobs` context) is dropped,
 /// like a reusable workflow call. Every job that needs a dropped job,
 /// directly or through others, is dropped too, with a warning naming the
-/// chain of jobs it needed. A file that does not parse, has no name before its extension or repeats another file's
-/// name is skipped. Each problem is in [`Conversion::errors`].
+/// chain of jobs it needed. A file that does not parse, has no name
+/// before its extension or repeats another file's name is skipped. Each
+/// problem is in [`Conversion::errors`].
 ///
 /// # Errors
 ///
