@@ -206,3 +206,23 @@ fn oversized_files_are_refused_before_reading_them_whole() {
         );
     }
 }
+
+#[test]
+fn convert_skips_an_oversized_file_and_converts_the_rest() {
+    let big = scratch("huge.yml");
+    std::fs::write(&big, format!("# {}\n", "x".repeat(2 << 20))).unwrap();
+    let out_file = scratch("partial.yml");
+    let out = run(hatchrun()
+        .arg("convert")
+        .arg(&big)
+        .arg(fixture("github/ci.yml"))
+        .arg("-o")
+        .arg(&out_file));
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("bytes; the limit is 1048576"), "{err}");
+    let written = std::fs::read_to_string(&out_file).unwrap();
+    assert!(written.contains("workflows"), "{written}");
+    let out = run(hatchrun().arg("validate").arg(&out_file));
+    assert!(out.status.success(), "{}", text(&out.stdout));
+}

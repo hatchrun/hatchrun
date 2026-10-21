@@ -60,8 +60,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
 }
 
 /// Reads a workflow file, stopping one byte past [`MAX_SOURCE`] so a huge
-/// file is refused without being loaded into memory.
-fn read_source(path: &Path) -> Result<String> {
+/// file is refused without being loaded into memory. The inner `Err` is
+/// the refusal, for the caller to report its own way.
+fn read_source(path: &Path) -> Result<Result<String, String>> {
     let read = || format!("read {}", path.display());
     let file = std::fs::File::open(path).with_context(read)?;
     let mut bytes = Vec::new();
@@ -70,16 +71,16 @@ fn read_source(path: &Path) -> Result<String> {
         .with_context(read)?;
     if bytes.len() > MAX_SOURCE {
         let size = std::fs::metadata(path).map_or(bytes.len() as u64, |m| m.len());
-        anyhow::bail!(
+        return Ok(Err(format!(
             "{} is {size} bytes; the limit is {MAX_SOURCE}",
             path.display()
-        );
+        )));
     }
-    String::from_utf8(bytes).with_context(read)
+    Ok(Ok(String::from_utf8(bytes).with_context(read)?))
 }
 
 fn run_validate(path: &Path) -> Result<ExitCode> {
-    let source = read_source(path)?;
+    let source = read_source(path)?.map_err(anyhow::Error::msg)?;
     let problems = match parse(&source) {
         Ok(config) => validate(&config),
         Err(problems) => problems,
@@ -107,8 +108,17 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
     let mut inputs = Vec::new();
     // Problems name the file by its name; print them with its path.
     let mut paths: BTreeMap<String, &Path> = BTreeMap::new();
+    // Files too large to read are reported and left out; the rest still
+    // convert, as files that fail to convert do.
+    let mut refused = Vec::new();
     for path in &files {
-        let source = read_source(path)?;
+        let source = match read_source(path)? {
+            Ok(source) => source,
+            Err(refusal) => {
+                refused.push(refusal);
+                continue;
+            }
+        };
         let name = path.file_name().map_or_else(
             || path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -126,6 +136,12 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
         Some(path) => located(path, problem),
         None => problem.to_string(),
     };
+    for refusal in &refused {
+        eprintln!("{refusal}");
+    }
+    if inputs.is_empty() {
+        return Ok(ExitCode::FAILURE);
+    }
     let conversion = match convert(&inputs) {
         Ok(conversion) => conversion,
         Err(problems) => {
@@ -154,7 +170,7 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
         }
         None => print!("{yaml}"),
     }
-    Ok(exit(conversion.errors.is_empty()))
+    Ok(exit(conversion.errors.is_empty() && refused.is_empty()))
 }
 
 /// `.github/workflows/*.yml` and `*.yaml`, sorted by name.
