@@ -1201,3 +1201,444 @@ fn a_cancel_stops_a_composite_step() {
     assert_eq!(result.conclusion, Conclusion::Cancelled);
     assert_eq!(result.steps[0].outcome, Conclusion::Cancelled);
 }
+
+// Built-in steps.
+
+use hatchrun_workflow::{CacheStep, Need, WorkspaceStep};
+
+fn cache(key: &str, restore_keys: &[&str], paths: &[&str]) -> PlannedStep {
+    PlannedStep::Cache(CacheStep {
+        key: key.to_owned(),
+        restore_keys: restore_keys.iter().map(|k| (*k).to_owned()).collect(),
+        paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+    })
+}
+
+fn persist(root: &str, paths: &[&str]) -> PlannedStep {
+    PlannedStep::Workspace(WorkspaceStep::Persist {
+        root: root.to_owned(),
+        paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+    })
+}
+
+fn need() -> Need {
+    Need {
+        result: Conclusion::Success,
+        outputs: std::collections::BTreeMap::new(),
+    }
+}
+
+fn attach(at: &str) -> PlannedStep {
+    PlannedStep::Workspace(WorkspaceStep::Attach { at: at.to_owned() })
+}
+
+fn stored(dir: &Path, steps: Vec<PlannedStep>) -> Output {
+    let store = dir.join("store");
+    exec_with(
+        dir,
+        &json(&make::document(steps)),
+        &["--store", store.to_str().unwrap()],
+    )
+}
+
+/// Runs `steps` in a fresh work directory that shares `store`.
+fn shared(store: &Path, steps: Vec<PlannedStep>) -> (tempfile::TempDir, Output) {
+    let dir = tempfile::tempdir().unwrap();
+    let out = exec_with(
+        dir.path(),
+        &json(&make::document(steps)),
+        &["--store", store.to_str().unwrap()],
+    );
+    (dir, out)
+}
+
+fn cache_file(store: &Path, key: &str) -> std::path::PathBuf {
+    store
+        .join("cache/acme%2Frepo")
+        .join(format!("{key}.tar.gz"))
+}
+
+#[test]
+fn cache_restore_then_save() {
+    let store = tempfile::tempdir().unwrap();
+    let (_first, out) = shared(
+        store.path(),
+        vec![
+            cache("k1", &[], &["target"]),
+            make::step("mkdir target && echo built > target/a"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(stdout(&out).contains("Cache not found for key: k1"));
+    assert!(stdout(&out).contains("Cache saved with key: k1"));
+    assert!(cache_file(store.path(), "k1").is_file());
+
+    let (_second, out) = shared(
+        store.path(),
+        vec![cache("k1", &[], &["target"]), make::step("cat target/a")],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(stdout(&out).contains("Cache restored from key: k1"));
+    assert!(
+        stdout(&out).lines().any(|l| l == "built"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn cache_restore_keys_take_the_newest_prefix_match() {
+    let store = tempfile::tempdir().unwrap();
+    for (key, text) in [("deps-a", "old"), ("deps-b", "new")] {
+        let script = format!("echo {text} > file");
+        let (_dir, out) = shared(
+            store.path(),
+            vec![cache(key, &[], &["file"]), make::step(&script)],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    }
+    let older = std::fs::File::options()
+        .write(true)
+        .open(cache_file(store.path(), "deps-a"))
+        .unwrap();
+    older
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(5000))
+        .unwrap();
+
+    let (_dir, out) = shared(
+        store.path(),
+        vec![
+            cache("deps-c", &["deps-"], &["file"]),
+            make::step("cat file"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(stdout(&out).contains("Cache restored from key: deps-b"));
+    assert!(stdout(&out).lines().any(|l| l == "new"), "{}", stdout(&out));
+    assert!(cache_file(store.path(), "deps-c").is_file());
+}
+
+#[test]
+fn cache_not_saved_on_failure_or_exact_hit() {
+    let store = tempfile::tempdir().unwrap();
+    let (_dir, out) = shared(
+        store.path(),
+        vec![
+            cache("k", &[], &["t"]),
+            make::step("mkdir t && echo x > t/a; exit 1"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!cache_file(store.path(), "k").exists());
+
+    let (_dir, out) = shared(
+        store.path(),
+        vec![
+            cache("k", &[], &["t"]),
+            make::step("mkdir t && echo x > t/a"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let saved = cache_file(store.path(), "k");
+    assert!(saved.is_file());
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(5000);
+    std::fs::File::options()
+        .write(true)
+        .open(&saved)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+
+    let (_dir, out) = shared(
+        store.path(),
+        vec![cache("k", &[], &["t"]), make::step("echo y > t/a || true")],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(stdout(&out).contains("Cache restored from key: k"));
+    assert_eq!(
+        std::fs::metadata(&saved).unwrap().modified().unwrap(),
+        long_ago,
+        "an exact hit saves nothing"
+    );
+}
+
+#[test]
+fn workspace_persist_attach() {
+    let store = tempfile::tempdir().unwrap();
+    let (_dir, out) = shared(
+        store.path(),
+        vec![
+            make::step("mkdir dist && echo built > dist/x"),
+            persist(".", &["dist"]),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(store.path().join("workspace/1/build.tar.gz").is_file());
+
+    let mut doc = make::document(vec![attach("ws"), make::step("cat ws/dist/x")]);
+    doc.job.id = "test".to_owned();
+    doc.job.name = "test".to_owned();
+    doc.job.requires = vec!["build".to_owned()];
+    doc.needs.insert("build".to_owned(), need());
+    let dir = tempfile::tempdir().unwrap();
+    let out = exec_with(
+        dir.path(),
+        &json(&doc),
+        &["--store", store.path().to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(
+        stdout(&out).lines().any(|l| l == "built"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn workspace_attach_applies_required_jobs_in_order() {
+    let store = tempfile::tempdir().unwrap();
+    for (name, text) in [("one", "from one"), ("two", "from two")] {
+        let mut doc = make::document(vec![
+            make::step(&format!("echo '{text}' > f")),
+            persist(".", &["f"]),
+        ]);
+        doc.job.id = format!("{name} (x)");
+        doc.job.name = name.to_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let out = exec_with(
+            dir.path(),
+            &json(&doc),
+            &["--store", store.path().to_str().unwrap()],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    }
+    let mut doc = make::document(vec![attach("."), make::step("cat f")]);
+    doc.job.id = "last".to_owned();
+    doc.job.name = "last".to_owned();
+    doc.job.requires = vec!["two (x)".to_owned(), "one (x)".to_owned()];
+    for name in ["one", "two"] {
+        doc.needs.insert(name.to_owned(), need());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = exec_with(
+        dir.path(),
+        &json(&doc),
+        &["--store", store.path().to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(
+        stdout(&out).lines().any(|l| l == "from one"),
+        "the later file wins: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn workspace_attach_with_nothing_persisted_is_a_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = stored(dir.path(), vec![attach("ws")]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("nothing to attach"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn test_results_are_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = stored(
+        dir.path(),
+        vec![
+            make::step(
+                "mkdir -p r/sub && echo '<a/>' > r/a.xml && echo '<b/>' > r/sub/b.XML && echo no > r/c.txt",
+            ),
+            PlannedStep::TestResults {
+                path: "r".to_owned(),
+            },
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let archive = dir.path().join("store/test-results/1/build.tar.gz");
+    let list = Command::new("tar")
+        .arg("tzf")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    let names = String::from_utf8_lossy(&list.stdout).into_owned();
+    assert!(
+        names.contains("a.xml") && names.contains("sub/b.XML"),
+        "{names}"
+    );
+    assert!(!names.contains("c.txt"), "{names}");
+
+    let out = stored(
+        dir.path(),
+        vec![PlannedStep::TestResults {
+            path: "nothing".to_owned(),
+        }],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stdout(&out).contains("no test results found at nothing"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn no_store_fails_the_builtin_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(dir.path(), vec![cache("k", &[], &["t"])]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stdout(&out).contains("this agent has no store for cache steps"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn bad_keys_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for key in ["a/b", "a\\b", "caf\u{e9}"] {
+        let out = stored(dir.path(), vec![cache(key, &[], &["t"])]);
+        assert_eq!(out.status.code(), Some(1), "{key}");
+        assert!(stdout(&out).contains("Error: key"), "{}", stdout(&out));
+    }
+    assert!(!dir.path().join("store").join("cache").exists());
+}
+
+#[test]
+fn paths_cannot_leave_the_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("work/repo")).unwrap();
+    std::fs::write(dir.path().join("work/repo/secret"), "s").unwrap();
+    for step in [
+        cache("k", &[], &["../secret"]),
+        cache("k2", &[], &["link/secret"]),
+        persist("..", &["secret"]),
+        persist("link", &["secret"]),
+        attach("../x"),
+        attach("/etc"),
+    ] {
+        let out = stored(
+            dir.path(),
+            vec![make::step("ln -sfn ../.. link"), step.clone()],
+        );
+        let text = stdout(&out);
+        let saved = dir.path().join("store").exists()
+            && std::fs::read_dir(dir.path().join("store/cache/acme%2Frepo"))
+                .map_or(0, Iterator::count)
+                > 0;
+        assert!(!saved, "{step:?}: {text}");
+        if matches!(step, PlannedStep::Cache(_)) {
+            // A failed save is a warning, and the job stays green.
+            assert!(text.contains("Failed to save cache"), "{step:?}: {text}");
+        } else {
+            assert_eq!(out.status.code(), Some(1), "{step:?}: {text}");
+        }
+    }
+}
+
+#[test]
+fn restore_refuses_a_planted_symlink_component() {
+    let store = tempfile::tempdir().unwrap();
+    let (_dir, out) = shared(
+        store.path(),
+        vec![
+            make::step("mkdir -p d/sub && echo x > d/sub/f"),
+            persist(".", &["d"]),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    let outside = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![
+        make::step(&format!("ln -s {} d", outside.path().display())),
+        attach("."),
+    ]);
+    doc.job.id = "t".to_owned();
+    doc.job.name = "t".to_owned();
+    doc.job.requires = vec!["build".to_owned()];
+    doc.needs.insert("build".to_owned(), need());
+    let dir = tempfile::tempdir().unwrap();
+    let out = exec_with(
+        dir.path(),
+        &json(&doc),
+        &["--store", store.path().to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stdout(&out).contains("d is a symlink"), "{}", stdout(&out));
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+
+    // The same planted link on the attach target.
+    let mut doc = make::document(vec![
+        make::step(&format!("ln -s {} at", outside.path().display())),
+        attach("at/deeper"),
+    ]);
+    doc.job.requires = vec!["build".to_owned()];
+    doc.job.id = "t".to_owned();
+    doc.job.name = "t".to_owned();
+    doc.needs.insert("build".to_owned(), need());
+    let dir = tempfile::tempdir().unwrap();
+    let out = exec_with(
+        dir.path(),
+        &json(&doc),
+        &["--store", store.path().to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stdout(&out).contains("at is a symlink"), "{}", stdout(&out));
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn restore_replaces_a_planted_file_symlink_without_following_it() {
+    let store = tempfile::tempdir().unwrap();
+    let (_dir, out) = shared(
+        store.path(),
+        vec![
+            cache("k", &[], &["d"]),
+            make::step("mkdir d && echo real > d/f"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("victim");
+    std::fs::write(&target, "keep").unwrap();
+    let script = format!("mkdir d && ln -s {} d/f", target.display());
+    let dir = tempfile::tempdir().unwrap();
+    let doc = make::document(vec![make::step(&script), cache("k", &[], &["d"])]);
+    let out = exec_with(
+        dir.path(),
+        &json(&doc),
+        &["--store", store.path().to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+    let placed = dir.path().join("work/repo/repo/d/f");
+    assert!(!std::fs::symlink_metadata(&placed).unwrap().is_symlink());
+    assert_eq!(std::fs::read_to_string(placed).unwrap(), "real\n");
+}
+
+#[test]
+fn symlinks_are_stored_as_links() {
+    let store = tempfile::tempdir().unwrap();
+    let (_dir, out) = shared(
+        store.path(),
+        vec![
+            cache("k", &[], &["d"]),
+            make::step("mkdir d && ln -s /etc/passwd d/p && ln -s f d/q"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let list = Command::new("tar")
+        .arg("tvzf")
+        .arg(cache_file(store.path(), "k"))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&list.stdout).into_owned();
+    assert!(text.contains("d/p -> /etc/passwd"), "{text}");
+}

@@ -7,6 +7,7 @@
 
 pub mod action;
 pub mod archive;
+pub mod builtin;
 pub mod commands;
 pub mod composite;
 pub mod context;
@@ -18,6 +19,7 @@ pub mod node;
 pub mod shell;
 pub mod sink;
 pub mod step;
+pub mod store;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -54,9 +56,8 @@ pub struct Options {
     pub env_file: PathBuf,
     /// The Node binary that runs JavaScript actions.
     pub node: Option<PathBuf>,
-    /// A directory of prefetched actions.
-    // Read once the action cache can be seeded from it.
-    #[allow(dead_code)]
+    /// The directory that keeps cache, workspace and test result
+    /// archives.
     pub store: Option<PathBuf>,
     /// `RUNNER_TOOL_CACHE`.
     pub tool_cache: PathBuf,
@@ -109,6 +110,18 @@ pub async fn run_job(
         }
     }
 
+    // Held for the whole job: restores place files through it, so a
+    // step that swaps a parent directory for a link cannot redirect them.
+    let workspace_fd = nix::fcntl::open(
+        &layout.workspace,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .with_context(|| format!("open {}", layout.workspace.display()))?;
+
     let mut masker = Masker::default();
     for secret in doc.secrets.values() {
         masker.add(secret);
@@ -140,6 +153,8 @@ pub async fn run_job(
         depth: 0,
         composite_runs: 0,
         next_slot: 3 * doc.job.steps.len(),
+        workspace_fd,
+        cache_saves: Vec::new(),
     };
     job.start();
 
@@ -154,6 +169,7 @@ pub async fn run_job(
         }
     }
     job.post_phase(sink).await;
+    job.save_caches(sink).await;
 
     let conclusion = match job.status {
         JobStatus::Success => Conclusion::Success,
@@ -229,6 +245,10 @@ struct Job<'a> {
     /// The next file command slot for a step inside a composite action.
     /// Real steps and their `pre` and `post` use the slots below it.
     next_slot: usize,
+    /// The workspace directory, opened before any step ran.
+    workspace_fd: std::os::fd::OwnedFd,
+    /// Caches to save when the job ends, in step order.
+    cache_saves: Vec<builtin::CacheSave>,
 }
 
 /// What a step needs to start.
@@ -306,33 +326,9 @@ impl Job<'_> {
         let (common, outcome, outputs) = match step {
             PlannedStep::Run(run) => self.run_step(index, run, sink).await,
             PlannedStep::Uses(uses) => self.uses_step(index, uses, sink).await,
-            PlannedStep::Cache(_) => {
-                let common = Common {
-                    name: "Cache".to_owned(),
-                    id: None,
-                    if_: None,
-                    continue_on_error: false,
-                };
-                self.unsupported(index, common, "`cache` steps", sink)
-            }
-            PlannedStep::Workspace(_) => {
-                let common = Common {
-                    name: "Workspace".to_owned(),
-                    id: None,
-                    if_: None,
-                    continue_on_error: false,
-                };
-                self.unsupported(index, common, "workspace steps", sink)
-            }
-            PlannedStep::TestResults { .. } => {
-                let common = Common {
-                    name: "Test results".to_owned(),
-                    id: None,
-                    if_: None,
-                    continue_on_error: false,
-                };
-                self.unsupported(index, common, "`test-results` steps", sink)
-            }
+            PlannedStep::Cache(cache) => self.cache_step(index, cache, sink).await,
+            PlannedStep::Workspace(workspace) => self.workspace_step(index, workspace, sink).await,
+            PlannedStep::TestResults { path } => self.test_results_step(index, path, sink).await,
         };
         let conclusion = self.settle(outcome, common.continue_on_error);
         if let Some(id) = &common.id {
@@ -404,6 +400,7 @@ impl Job<'_> {
         match line {
             Line::Error(text) => out.error(text),
             Line::Warning(text) => out.warning(text),
+            Line::Note(text) => out.line(text),
         }
     }
 
@@ -414,37 +411,6 @@ impl Job<'_> {
             status: self.status,
         };
         condition(if_, &self.ctx, &rt)
-    }
-
-    /// A step kind a later release adds. It fails, unless its `if`
-    /// skips it.
-    fn unsupported(
-        &mut self,
-        index: usize,
-        common: Common,
-        what: &str,
-        sink: &mut dyn Sink,
-    ) -> (Common, Conclusion, BTreeMap<String, String>) {
-        sink.step_started(index, &self.masker.mask(&common.name));
-        let runs = self.runs(common.if_.as_deref());
-        let mut out = StepOutput::new(
-            &mut self.masker,
-            sink,
-            &mut self.annotations,
-            &mut self.budget,
-        );
-        let outcome = match runs {
-            Ok(true) => {
-                out.error(&format!("{what} are not supported yet"));
-                Conclusion::Failure
-            }
-            Ok(false) => Conclusion::Skipped,
-            Err(err) => {
-                out.error(&format!("if: {err}"));
-                Conclusion::Failure
-            }
-        };
-        (common, outcome, BTreeMap::new())
     }
 
     async fn run_step(
@@ -637,6 +603,7 @@ fn wait_for(
 enum Line<'a> {
     Error(&'a str),
     Warning(&'a str),
+    Note(&'a str),
 }
 
 /// A process to run for a step, with the files it writes to.

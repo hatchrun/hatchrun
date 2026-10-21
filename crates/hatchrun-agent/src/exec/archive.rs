@@ -363,8 +363,6 @@ fn check_link(plan: &HashMap<PathBuf, PathBuf>, rel: &Path) -> Result<()> {
 /// returns the number of bytes written. Directories are added with
 /// their contents. Symlinks are stored as symlinks. Every path must
 /// resolve inside `root`.
-// Used by the cache and workspace steps in a later task.
-#[allow(dead_code)]
 pub fn create_tar_gz(root: &Path, paths: &[String], dest: impl Write) -> Result<u64> {
     let root = root
         .canonicalize()
@@ -398,8 +396,6 @@ pub fn create_tar_gz(root: &Path, paths: &[String], dest: impl Write) -> Result<
 
 /// Resolves `rel` under `root` through `..` and symlinks, except for a
 /// final symlink, which is stored as it is. The result is inside `root`.
-// Used by the cache and workspace steps in a later task.
-#[allow(dead_code)]
 fn resolve_inside(root: &Path, rel: &Path) -> Result<PathBuf> {
     let joined = root.join(rel);
     let last_is_name = matches!(rel.components().next_back(), Some(Component::Normal(_)));
@@ -421,8 +417,6 @@ fn resolve_inside(root: &Path, rel: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-// Used by the cache and workspace steps in a later task.
-#[allow(dead_code)]
 fn add_dir<W: Write>(b: &mut Builder<W>, full: &Path, name: &Path) -> Result<()> {
     if !name.as_os_str().is_empty() {
         b.append_dir(name, full)
@@ -438,8 +432,6 @@ fn add_dir<W: Write>(b: &mut Builder<W>, full: &Path, name: &Path) -> Result<()>
     Ok(())
 }
 
-// Used by the cache and workspace steps in a later task.
-#[allow(dead_code)]
 fn add_tree<W: Write>(b: &mut Builder<W>, full: &Path, name: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(full)?;
     if meta.is_dir() {
@@ -453,8 +445,6 @@ fn add_tree<W: Write>(b: &mut Builder<W>, full: &Path, name: &Path) -> Result<()
 }
 
 /// Counts the bytes that pass through.
-// Used by the cache and workspace steps in a later task.
-#[allow(dead_code)]
 struct Counter<W> {
     inner: W,
     count: u64,
