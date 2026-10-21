@@ -940,3 +940,47 @@ fn a_file_over_one_mebibyte_is_skipped() {
     assert!(out.config.workflows.contains_key("ci"));
     assert!(!out.config.workflows.contains_key("big"));
 }
+
+#[test]
+fn a_job_with_a_bad_expression_is_dropped() {
+    let out = ok(r"
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ foo.bar }}
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ 1 + }}
+  c:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ parameters.node }}
+  d:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - run: echo ${{ github.sha
+  ok:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ github.sha }}
+");
+    assert!(
+        has(
+            &out.errors,
+            &["job `a`", "unknown context 'foo'", "dropped"]
+        ),
+        "{:?}",
+        out.errors
+    );
+    assert!(has(&out.errors, &["job `b`", "bad expression", "dropped"]));
+    assert!(has(&out.errors, &["job `c`", "`parameters`", "dropped"]));
+    assert!(has(&out.errors, &["job `d`", "no closing", "dropped"]));
+    assert_eq!(out.config.jobs.keys().collect::<Vec<_>>(), ["ci-ok"]);
+    round_trips(&out);
+}

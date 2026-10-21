@@ -22,7 +22,7 @@ pub use eval::truthy;
 
 /// Context names an expression may read even when the context object
 /// leaves them out. Any other name must be a key of the context object.
-const CONTEXTS: &[&str] = &[
+pub(crate) const CONTEXTS: &[&str] = &[
     "github",
     "env",
     "matrix",
