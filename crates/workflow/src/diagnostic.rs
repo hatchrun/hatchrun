@@ -49,6 +49,9 @@ impl fmt::Display for Diagnostic {
     }
 }
 
+/// What a file over the parser's node or depth limit is told.
+const TOO_BIG: &str = "the file is too large or nests too deeply to read";
+
 impl From<&serde_saphyr::Error> for Diagnostic {
     fn from(err: &serde_saphyr::Error) -> Self {
         let err = err.without_snippet();
@@ -58,10 +61,18 @@ impl From<&serde_saphyr::Error> for Diagnostic {
                 format!("duplicate key `{key}`")
             }
             serde_saphyr::Error::DuplicateMappingKey { key: None, .. } => "duplicate key".into(),
-            serde_saphyr::Error::Budget { .. } => {
-                "the file is too large or nests too deeply to read".into()
+            serde_saphyr::Error::Budget { .. } => TOO_BIG.into(),
+            other => {
+                let text = DefaultMessageFormatter.format_message(other).into_owned();
+                // The node budget and the parser's depth limit can also
+                // reach us wrapped, with the library's own wording.
+                if text.starts_with("budget breached") || text.contains("recursion limit exceeded")
+                {
+                    TOO_BIG.into()
+                } else {
+                    text
+                }
             }
-            other => DefaultMessageFormatter.format_message(other).into_owned(),
         };
         let location = err.location();
         Self {

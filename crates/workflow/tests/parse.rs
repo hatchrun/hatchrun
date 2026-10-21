@@ -199,3 +199,23 @@ fn a_config_over_one_mebibyte_is_an_error() {
     yaml.truncate(MAX_SOURCE);
     parse(&yaml).unwrap();
 }
+
+#[test]
+fn files_past_the_parser_limits_get_a_plain_message() {
+    let many = format!(
+        "jobs: {{t: {{runs-on: ubuntu-latest, steps: [{{uses: a/b@v1, with: {{x: [{}]}}}}]}}}}\n",
+        vec!["1"; 260_000].join(",")
+    );
+    let deep = format!(
+        "jobs: {{t: {{runs-on: ubuntu-latest, steps: [{{run: {}{}}}]}}}}\n",
+        "[".repeat(2000),
+        "]".repeat(2000)
+    );
+    for source in [many, deep] {
+        let err = parse(&source).unwrap_err();
+        assert_eq!(
+            err[0].message, "the file is too large or nests too deeply to read",
+            "{err:?}"
+        );
+    }
+}
