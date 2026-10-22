@@ -1240,3 +1240,45 @@ fieldset.field {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Job logs: lines are text nodes; the ansi classes are the only styling a line can carry. */
+.log-lines {
+  margin: 0;
+  padding: 0.5rem 0;
+  overflow-x: auto;
+  font-family: var(--app-mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.log-line {
+  min-height: 1.45em;
+  padding: 0 0.75rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.log-line:hover {
+  background: var(--app-surface-2);
+}
+
+.ansi-bold { font-weight: 700; }
+.ansi-dim { opacity: 0.7; }
+.ansi-italic { font-style: italic; }
+.ansi-underline { text-decoration: underline; }
+.ansi-fg-30, .ansi-fg-90 { color: #7d828a; }
+.ansi-fg-31, .ansi-fg-91 { color: #f06aa8; }
+.ansi-fg-32, .ansi-fg-92 { color: #40ff80; }
+.ansi-fg-33, .ansi-fg-93 { color: #ffcf33; }
+.ansi-fg-34, .ansi-fg-94 { color: #6aa8f0; }
+.ansi-fg-35, .ansi-fg-95 { color: #c58af0; }
+.ansi-fg-36, .ansi-fg-96 { color: #5fd7d7; }
+.ansi-fg-37, .ansi-fg-97 { color: #ece6d6; }
+.ansi-bg-40, .ansi-bg-100 { background: #34373c; }
+.ansi-bg-41, .ansi-bg-101 { background: #5a2540; }
+.ansi-bg-42, .ansi-bg-102 { background: #1f4a31; }
+.ansi-bg-43, .ansi-bg-103 { background: #554a1c; }
+.ansi-bg-44, .ansi-bg-104 { background: #1f3a5e; }
+.ansi-bg-45, .ansi-bg-105 { background: #46285e; }
+.ansi-bg-46, .ansi-bg-106 { background: #1e4b4b; }
+.ansi-bg-47, .ansi-bg-107 { background: #5e636a; }

@@ -4,7 +4,7 @@
 
 import { useState, type ReactNode } from "react";
 
-import { signOut, type User } from "@/api";
+import { signInUrl, signOut, type User } from "@/api";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -29,7 +29,8 @@ export function Shell({
   status,
   children,
 }: {
-  user: User;
+  /** Null for a viewer who is not signed in: the bar offers to sign in. */
+  user: User | null;
   nav?: ReactNode;
   status?: ReactNode;
   children: ReactNode;
@@ -57,7 +58,13 @@ export function Shell({
               Docs
               <OpenIcon />
             </a>
-            <UserMenu user={user} />
+            {user ? (
+              <UserMenu user={user} />
+            ) : (
+              <a className="text-[13px] font-semibold text-bone hover:text-chick" href={signInUrl(window.location.pathname)}>
+                Sign in
+              </a>
+            )}
           </div>
         </div>
       </header>
