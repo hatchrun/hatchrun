@@ -598,6 +598,7 @@ fn job_condition_defaults_to_success() {
     assert!(job_condition(None, &ctx, &Files(JobStatus::Success)).unwrap());
     assert!(!job_condition(None, &ctx, &Files(JobStatus::Failure)).unwrap());
     assert!(!job_condition(None, &ctx, &Files(JobStatus::Cancelled)).unwrap());
+    assert!(!job_condition(None, &ctx, &Files(JobStatus::Skipped)).unwrap());
 }
 
 #[test]
