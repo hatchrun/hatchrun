@@ -42,10 +42,8 @@ is built on branch `feat/control-plane` and this plan builds on it.
   organization and repository secrets and vars, `permissions:` for the
   job token, the card requirement, free minutes, the concurrency and
   spend caps, metering and Polar usage, removing `tenants.ci_enabled`,
-  and the end-to-end script's new scenarios.
-- **Not here:** per-tenant retention (Plan 3 left the enterprise 90
-  days to Plan 4; this plan's scope does not list it, so rows and logs
-  stay at 30 days).
+  per-tenant retention (30 days, 90 for enterprise), and the
+  end-to-end script's new scenarios.
 - **Plan 5:** cache, artifacts, test timings (`timings` stays empty),
   approval jobs.
 - **Later phases:** Oracle and microVM backends.
@@ -64,7 +62,11 @@ line says otherwise.
    after the object answered, so no value enters the object at all.
    The object keeps the job's `GITHUB_TOKEN` in `JobState.github_token`,
    as Plan 3 does, to revoke it when the job ends; it is not in the
-   graph or the R2 snapshot.
+   graph or the R2 snapshot. The Worker reads and opens the job's
+   secrets and vars before it asks the object to claim: a failure that
+   may pass answers `503` with nothing claimed, so nothing is metered or
+   shown running, and a secret that can never be opened ends the job
+   through Plan 3's `/failed` path with a message naming the secret.
 2. Minutes are counted from claim (`ci_jobs.started_at`) to result
    (`completed_at`), rounded up per started minute with at least one,
    as `hatchrun_cloud::usage::minutes` does. A job that was never
@@ -75,11 +77,19 @@ line says otherwise.
 4. Prices and cap amounts live in one place:
    `crates/workflow/src/templates.rs`, with the spec's values. SQL
    receives them as bound parameters.
-5. **Added:** a `runs-on` label that names no template is caught when
-   the config compiles, because labels are fixed once matrices expand
-   at compile time. Nothing launches, and the existing
-   `hatchrun / config` check run carries the message that lists every
-   template. Plan 3's `planning::launchable` gate goes away.
+5. **Added, for the owner to confirm:** a `runs-on` label that names
+   no template fails only the workflow that uses it, before launch.
+   Labels are fixed once matrices expand at compile time, and
+   `JobKind::Run` holds a `&'static Template`, so the failure is per
+   workflow, not per job. The workflow gets a failed `<workflow> / config`
+   check run whose summary lists every template; the other workflows of
+   the event still run. Today an executor's bad label is a config-wide
+   error (`plan.rs::config_errors`); the smallest change that separates
+   workflows moves that check to where a workflow's job uses the
+   executor, keeps it in `validate` for `hatchrun validate`, and makes
+   `config_errors` public so `planning::select` can tell config-wide
+   errors from one workflow's. Plan 3's `planning::launchable` gate goes
+   away.
 6. **Added:** the 500 free minutes are minutes of the 2 vCPU template,
    so $1.00 of usage a month; a 4 vCPU minute uses two of them. The
    billing unit everywhere (Polar's meter, the cap) is one 2 vCPU
@@ -89,11 +99,17 @@ line says otherwise.
    collects the card at checkout. `subscriptions` gains a `product`
    column so a CI subscription never licenses hatchrun.io runners and
    the reverse. `tenants.beta` does not apply to CI.
-8. **Added:** a tenant without a card gets no run. A push or pull
-   request gets one `hatchrun / billing` check run with conclusion
-   `action_required`; schedules fire nothing. A tenant whose
-   subscription ends after its runs were created has its queued jobs
-   held with the card message.
+8. **Added:** the tenant's CI billing state is read with the tenant
+   row, before any config read. A tenant that never had a CI
+   subscription (every hatchrun.io-only tenant of the shared App) is
+   ignored silently: no config read, no GitHub call, no check run. A
+   tenant whose CI subscription lapsed has its config read; when a
+   workflow would run, the commit gets one `hatchrun / billing` check
+   run with conclusion `action_required` and no run is created. No
+   config, or no triggered workflow, means nothing. Schedules fire only
+   for tenants with an active subscription. Queued jobs of a tenant
+   whose subscription ends after its runs were created are held with
+   the card message.
 9. **Added:** the spend cap counts the minutes of completed jobs this
    UTC month; jobs running when it is reached finish. The owner sets it
    in whole dollars from $50 to $10,000. The concurrency cap is a fixed
@@ -109,6 +125,20 @@ line says otherwise.
     Every var goes in the job document (vars are not secret); secrets
     go only when referenced. Job-level `if:` still reads only `github`
     and `needs`.
+13. **Added:** retention is per tenant: `tenants.retention_days`, 30
+    by default and 90 for enterprise tenants (set by the owner in SQL;
+    nothing in billing sets it). A run's `expires_at` uses it, and logs
+    and state snapshots go under `logs/<days>d/` and `state/<days>d/`
+    so one R2 lifecycle rule per tier deletes them.
+14. **Added:** the launch consumer posts `/held` to the run object every
+    time it holds a job; the object ignores a message equal to the one
+    it has. A post that fails is retried by the reconciler: the held job
+    is requeued 30 s later, the consumer holds it again and posts again.
+    The check run update itself goes through the object's outbox, which
+    retries GitHub as Plan 3 does.
+15. **Added:** when the App holds less than a job's `permissions:` asks
+    for, the token gets the lower level and the job's check run summary
+    says which scopes were capped.
 
 ## Global Constraints
 
@@ -147,13 +177,20 @@ line says otherwise.
   key that sealed it; the associated data binds the value to its
   tenant, scope and name.
 - GitHub calls per job attempt stay as Plan 3 has them, plus one check
-  run update when a job's hold reason changes and one when a held job
-  is claimed.
+  run update when a job's hold reason changes and one at claim when the
+  job was held or its token scopes were capped. The installation's
+  permissions come from `GET /app/installations/{id}` (App JWT, not the
+  installation's budget), cached 600 s per installation in KV. A
+  lapsed tenant costs one check run list and at most one create per
+  commit with a triggered workflow; a tenant that never subscribed
+  costs no GitHub call.
 - One migration file for this plan,
   `crates/cloud/migrations/0005_ci_accounts.sql`. Task 4 creates it and
   later tasks append to it. New columns on tables that may hold rows
   are added `NOT NULL DEFAULT <value>` and the default is dropped in
-  the same file, so the column is required from then on.
+  the same file, so the column is required from then on. The one
+  exception is `tenants.retention_days`, which keeps `DEFAULT 30`
+  because every new tenant starts at 30 days.
 - No backward compatibility shims: new fields are required, and the
   agent and both Workers deploy together.
 - Commits are Conventional Commits, GPG-signed and DCO signed off
@@ -293,7 +330,10 @@ git commit -S -s -m "feat(workflow): keep prices and caps in one place"
 - Create: `crates/workflow/src/permissions.rs`
 - Modify: `crates/workflow/src/config.rs` (`Job`, `Workflow`),
   `crates/workflow/src/plan.rs` (`PlannedJob`, compile),
-  `crates/workflow/src/convert.rs`, `crates/workflow/src/lib.rs`
+  `crates/workflow/src/convert.rs`, `crates/workflow/src/lib.rs`, and
+  the `PlannedJob` literals in `crates/ci/src/checks.rs`,
+  `crates/hatchrun-agent/src/ci/client.rs` and
+  `crates/hatchrun-agent/src/exec/context.rs`
 - Test: `crates/workflow/tests/plan.rs`, `crates/workflow/tests/convert.rs`
 
 **Interfaces:**
@@ -307,7 +347,9 @@ pub enum Level { None, Read, Write }
 
 /// `permissions:` as written: `read-all`, `write-all` or a map.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Permissions { ReadAll, WriteAll, Scopes(BTreeMap<String, Level>) }  // custom Deserialize
+pub enum Permissions { ReadAll, WriteAll, Scopes(BTreeMap<String, Level>) }
+// custom Serialize and Deserialize: "read-all", "write-all" or the map
+// (config::Job and config::Workflow derive Serialize for convert::to_yaml)
 
 /// Workflow keys and the GitHub App permission each one asks for.
 pub const SCOPES: &[(&str, &str)] = &[
@@ -352,6 +394,7 @@ pub fn token_scopes(p: Option<&Permissions>) -> BTreeMap<String, Level>;
     // message: "`permissions` names unknown scope `foo`; use one of actions, attestations, checks, contents, deployments, discussions, issues, packages, pages, pull-requests, repository-projects, security-events, statuses"
 #[test] fn unknown_level_is_an_error()   // "`permissions.contents` is `admin`; use read, write or none"
 #[test] fn id_token_comes_later()        // "`id-token` permission: OIDC tokens come in a later release"
+#[test] fn permissions_round_trip()      // read-all, write-all and a map serialize back to what was parsed
 ```
 
   In `tests/convert.rs`:
@@ -378,14 +421,14 @@ Expected: FAIL, module not defined.
 
 - [ ] **Step 4: Run the workflow and CLI tests**
 
-Run: `cargo test -p hatchrun-workflow && cargo test -p hatchrun-cli`
-Expected: PASS. Existing tests that build `PlannedJob` literals gain
+Run: `cargo test -p hatchrun-workflow && cargo test -p hatchrun-cli && cargo check --workspace --all-targets`
+Expected: PASS. The three `PlannedJob` literals outside the crate gain
 `token_permissions`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/workflow
+git add crates/workflow crates/ci/src/checks.rs crates/hatchrun-agent
 git commit -S -s -m "feat(workflow): read permissions for the job token"
 ```
 
@@ -475,12 +518,38 @@ git commit -S -s -m "feat(workflow): find the secrets a job references"
 - Modify: `crates/ci/src/launcher.rs`, `crates/ci/src/launches.rs`,
   `crates/ci/src/planning.rs`, `crates/ci/src/graph.rs`,
   `crates/ci/src/store.rs` (`NewJob`, `JobRow`, `insert_jobs`,
-  `JOB_COLUMNS`), `crates/ci/src/runs.rs` (`start_plan`),
-  `crates/ci-dev/src/launcher.rs`
+  `JOB_COLUMNS`), `crates/ci/src/runs.rs` (`start_plan`, `create`),
+  `crates/ci-dev/src/launcher.rs`, `crates/workflow/src/plan.rs`
+  (executor label check), `crates/workflow/src/lib.rs`
 
 **Interfaces:**
 - Consumes: Task 2 (`PlannedJob.token_permissions`), Task 3
   (`PlannedJob::secret_refs`), `hatchrun_cloud::profiles::built_in`.
+- Produces, for Ruling 5:
+
+```rust
+// hatchrun_workflow (plan.rs): was private
+/// Problems of the config as a whole (command names, filters, crons).
+/// An executor's unknown label is no longer one of them: compile reports
+/// it for a workflow whose job uses the executor, and `validate` still
+/// reports it for every executor.
+pub fn config_errors(config: &Config) -> Vec<Diagnostic>;
+// hatchrun_ci::planning
+pub struct Failed { pub workflow: String, pub diagnostics: Vec<Diagnostic> }
+pub enum Selected {
+    /// Plans of the triggered workflows that compiled, and those that did not.
+    Plans { plans: Vec<Plan>, failed: Vec<Failed> },
+    /// The config does not parse, or `config_errors` found something.
+    Invalid(Vec<Diagnostic>),
+}
+// hatchrun_ci::runs
+/// A failed check run named `<workflow> / config`, title "Invalid workflow".
+pub fn invalid_workflow_check_run(workflow: &str, diagnostics: &[Diagnostic], sha: &str) -> CheckRun;
+```
+
+  `runs::create` starts the `plans` and reports each `failed` workflow
+  once per commit (list by its check name first, as `report_invalid`
+  does).
 - Produces:
 
 ```rust
@@ -525,11 +594,18 @@ ALTER TABLE ci_jobs ALTER COLUMN secret_refs DROP DEFAULT;
 // graph.rs (replaces unsupported_template_fails_before_launch)
 #[test] fn every_template_launches()     // a job on ubuntu-26.04-16core-arm -> [Launch(id)]
 // planning.rs (replaces other_templates_are_not_launchable)
-#[test] fn unknown_label_lists_the_templates()
-    // runs-on: ubuntu-24.04 -> Selected::Invalid with a message containing
+#[test] fn bad_label_fails_only_its_workflow()
+    // workflows ci (ubuntu-latest) and bad (runs-on: ubuntu-24.04), both on push ->
+    // Plans { plans: [ci], failed: [bad] }, bad's message contains
     // "names no runner template; use one of ubuntu-latest, ubuntu-26.04, ubuntu-26.04-arm,
     //  ubuntu-26.04-4core, ubuntu-26.04-4core-arm, ubuntu-26.04-8core, ubuntu-26.04-8core-arm,
     //  ubuntu-26.04-16core, ubuntu-26.04-16core-arm"
+#[test] fn bad_executor_fails_only_the_workflows_that_use_it()
+#[test] fn config_wide_error_is_still_invalid()  // an invalid cron -> Selected::Invalid
+// workflow tests/plan.rs
+#[test] fn unused_executor_with_a_bad_label_compiles()   // compile Ok; validate reports it
+// runs.rs
+#[test] fn invalid_workflow_check_run_names_the_workflow() // name "bad / config", conclusion failure
 // store.rs (Postgres)
 #[test] fn insert_jobs_keeps_template_permissions_and_refs()
     // round trip through insert_jobs and job(); approval job has template None
@@ -546,13 +622,17 @@ Expected: FAIL.
   template or an unknown one ends the job through the run object with
   `job has no runner template`. Delete `planning::launchable` and the
   graph's gate. Drop the Plan 3 constraint line about `ubuntu-latest`
-  from the crate docs that repeat it.
+  from the crate docs that repeat it. In `plan.rs`, `config_errors`
+  stops checking executor labels; the executor arm of the job runner
+  lookup (the `(Some(name), None)` arm) reports `unknown_template` for
+  the executor's label, and `validate` adds the executor check that
+  `config_errors` dropped.
 
 - [ ] **Step 4: Run the crate tests and the wasm build**
 
 Run:
 ```bash
-cargo test -p hatchrun-ci -p hatchrun-ci-dev && cargo test -p hatchrun-cloud
+cargo test -p hatchrun-ci -p hatchrun-ci-dev -p hatchrun-workflow -p hatchrun-cli && cargo test -p hatchrun-cloud
 cargo check -p hatchrun-ci --target wasm32-unknown-unknown
 ```
 Expected: PASS.
@@ -560,7 +640,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/ci crates/ci-dev crates/cloud/migrations/0005_ci_accounts.sql
+git add crates/ci crates/ci-dev crates/workflow crates/cloud/migrations/0005_ci_accounts.sql
 git commit -S -s -m "feat(ci): launch every runner template"
 ```
 
@@ -570,14 +650,15 @@ git commit -S -s -m "feat(ci): launch every runner template"
 
 **Files:**
 - Modify: `crates/cloud/migrations/0005_ci_accounts.sql`,
-  `crates/cloud/src/polar.rs`, `crates/cloud/src/app/billing.rs`,
+  `crates/cloud/src/polar.rs`, `crates/cloud/src/app/billing.rs`
+  (`UPSERT_SUBSCRIPTION`, `SUBSCRIPTION`, the webhook),
   `crates/cloud/src/usage.rs`, `crates/cloud/wrangler.toml`,
   `crates/ci/src/store.rs`, `crates/ci/src/webhook.rs`,
   `crates/ci/src/runs.rs`, `crates/ci/src/reconcile.rs`,
   `crates/ci/scripts/e2e.sh` (the tenant insert)
 
 **Interfaces:**
-- Consumes: Task 1 (`FREE_UNITS`).
+- Consumes: Task 1 (`FREE_UNITS`), Task 4 (`Selected::Plans`).
 - Produces:
 
 ```sql
@@ -593,7 +674,18 @@ ALTER TABLE subscriptions ALTER COLUMN product DROP DEFAULT;
 /// `ci` for the CI product, `runners` for anything else.
 pub fn product_kind(product_id: &str, ci_product_id: &str) -> &'static str;
 // hatchrun_ci::store
-pub struct TenantRow { pub id: String, pub org_login: String }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiBilling {
+    /// No CI subscription row ever: a hatchrun.io-only tenant.
+    Never,
+    /// A CI subscription exists but none is active or trialing.
+    Lapsed,
+    /// An active or trialing CI subscription: a card on file.
+    Active,
+}
+/// Read in the same statement as the tenant, so the gate costs no extra query.
+pub struct TenantRow { pub id: String, pub org_login: String, pub ci_billing: CiBilling }
 /// An active or trialing subscription to the CI product.
 pub async fn has_card(db: &Db, tenant_id: &str) -> Result<bool>;
 // hatchrun_ci::runs
@@ -607,6 +699,16 @@ pub fn no_card_check_run(sha: &str, org: &str, app_url: &str) -> CheckRun;
   `Add a card for {org} at {app_url}/o/{org}/ci to run this commit's workflows. Each organization gets 500 free minutes a month.`
   (500 from `FREE_UNITS`).
 
+  The gate, in this order (Ruling 8):
+  1. `webhook::gate`: no tenant, or `CiBilling::Never`, answers `200`
+     and stops before `read_config`, `upsert_repo` or any GitHub call.
+  2. `runs::create` with `Config::Missing` returns before anything else.
+  3. `Lapsed`: plan the config; when `Selected::Plans` holds at least
+     one plan, report `no_card_check_run` once per commit (list by
+     `CARD_CHECK` first, as `report_invalid` does); start nothing. An
+     invalid config or no triggered workflow posts nothing.
+  4. `Active`: Plan 3's path.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
@@ -619,13 +721,18 @@ pub fn no_card_check_run(sha: &str, org: &str, app_url: &str) -> CheckRun;
 // cloud app/billing.rs
 #[test] fn webhook_stores_the_product()       // subscription for POLAR_CI_PRODUCT_ID stored with product 'ci'
 #[test] fn ci_subscription_leaves_the_grace_alone() // a 'ci' cancel does not start the runners grace period
+#[test] fn ci_only_tenant_shows_no_runners_subscription() // SUBSCRIPTION returns none, licensed false
 // ci store.rs
 #[test] fn has_card_needs_an_active_ci_subscription()
     // none -> false; runners active -> false; ci canceled -> false; ci active -> true; ci trialing -> true
-// ci runs.rs
-#[test] fn no_card_check_run_asks_for_a_card() // name, conclusion, details_url and summary exactly as above
+#[test] fn tenant_row_reads_the_ci_billing_state()
+    // no ci row -> Never (a runners subscription too); ci canceled -> Lapsed; ci active -> Active
 // ci webhook.rs (replaces disabled_tenant_is_ignored)
 #[test] fn unknown_installation_is_ignored()
+#[test] fn never_subscribed_tenant_is_ignored_before_the_config() // gate -> ignored for Never
+// ci runs.rs
+#[test] fn no_card_check_run_asks_for_a_card() // name, conclusion, details_url and summary exactly as above
+#[test] fn lapsed_without_a_triggered_workflow_reports_nothing() // pure decision fn: (Lapsed, no plans) -> Nothing
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -633,19 +740,17 @@ pub fn no_card_check_run(sha: &str, org: &str, app_url: &str) -> CheckRun;
 Run: `cargo test -p hatchrun-cloud usage polar billing && cargo test -p hatchrun-ci store runs webhook`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement.** `PAID` and `MAY_LAUNCH` in `usage.rs` add
-  `AND subscriptions.product = 'runners'`. The Polar webhook in
-  `app/billing.rs` (next to `PRODUCT_ID`) binds the product from
-  `POLAR_CI_PRODUCT_ID` (new var in cloud's
-  `wrangler.toml`, the CI product's id) and, for a `ci` subscription,
-  stores it and answers `202` without the grace and recheck calls.
-  `hatchrun-ci`'s webhook gate checks only that the tenant exists.
-  `runs::create` calls `has_card` first; without one it reports
-  `no_card_check_run` once per commit (list by `CARD_CHECK` first, as
-  `report_invalid` does) and starts nothing. The reconciler's schedule
-  step skips tenants without a card and posts nothing. The e2e script's
-  tenant insert loses `ci_enabled` and gains a `subscriptions` row
-  (`product 'ci'`, `status 'active'`).
+- [ ] **Step 3: Implement.** `PAID` and `MAY_LAUNCH` in `usage.rs`, and
+  the `SUBSCRIPTION` query of the hatchrun.io billing page in
+  `app/billing.rs`, add `AND subscriptions.product = 'runners'`.
+  `UPSERT_SUBSCRIPTION` writes `product` (insert and update). The
+  webhook binds it with `product_kind` from `POLAR_CI_PRODUCT_ID` (new
+  var in cloud's `wrangler.toml`, read next to `PRODUCT_ID`) and, for a
+  `ci` subscription, answers `202` without the grace and recheck calls.
+  The gate is as listed above. The reconciler's schedule step fires
+  only for `Active` tenants and posts nothing for the others. The e2e
+  script's tenant insert loses `ci_enabled` and gains a `subscriptions`
+  row (`product 'ci'`, `status 'active'`).
 
 - [ ] **Step 4: Run both crates' tests**
 
@@ -709,10 +814,15 @@ pub fn units(standing: &Standing) -> u64;          // sum of Template::units; un
 pub fn spend_micros(standing: &Standing) -> u64;   // templates::spend_micros(units)
 ```
 
-  `finish_job` runs its update and this insert through `Db::batch`: a
-  `ci_usage` row from the job row when `started_at` and `template` are
-  set, minutes `GREATEST(1, CEIL((completed_at - started_at) / 60000.0))`,
-  `ON CONFLICT DO NOTHING`. `running` counts the tenant's jobs in
+  `finish_job` runs its update and this insert through `Db::batch`. The
+  insert reads the row only as this call left it, so it writes nothing
+  when the update did not apply (a stale attempt, or a job already
+  completed): `INSERT INTO ci_usage ... SELECT ... FROM ci_jobs JOIN
+  ci_runs ... WHERE ci_jobs.id = $1 AND attempt = $6 AND status =
+  'completed' AND completed_at = $5 AND started_at IS NOT NULL AND
+  template IS NOT NULL ON CONFLICT DO NOTHING`, with the row's
+  `attempt` as the key and minutes
+  `GREATEST(1, CEIL((completed_at - started_at) / 60000.0))`. `running` counts the tenant's jobs in
   `launching`, `launched` or `running`. `cap_micros` is the
   `ci_spend_caps` row or `default_cap`. `store::sweep` also deletes
   `ci_usage` rows sent more than 90 days ago.
@@ -725,6 +835,8 @@ pub fn spend_micros(standing: &Standing) -> u64;   // templates::spend_micros(un
 #[test] fn a_job_never_claimed_is_not_metered()     // finish without start_job -> no row
 #[test] fn finishing_twice_records_once()
 #[test] fn each_attempt_is_metered()                // reset_job to attempt 2, run again -> two rows
+#[test] fn stale_result_is_not_metered()
+    // attempt 1 started, reset_job to attempt 2, start_job; finish_job(attempt 1) -> false, no ci_usage row
 #[test] fn minutes_round_up_like_usage_minutes()    // durations 0, 1, 60_000, 60_001 -> 1, 1, 1, 2
 #[test] fn standing_counts_this_month_and_running_jobs()
     // usage rows on Sep 30 and Oct 2, month_start Oct 1 -> only Oct; two running jobs -> running 2;
@@ -763,7 +875,8 @@ git commit -S -s -m "feat(ci): meter job minutes from claim to result"
 **Files:**
 - Modify: `crates/cloud/migrations/0005_ci_accounts.sql`,
   `crates/ci/src/billing.rs`, `crates/ci/src/store.rs`,
-  `crates/ci/src/launches.rs`, `crates/ci/src/run/object.rs`,
+  `crates/ci/src/launches.rs`, `crates/ci/src/run/object.rs` (the
+  `/held` arm in `route()`, next to `/failed` and `/rerun`),
   `crates/ci/src/run/mod.rs` (`JobState`), `crates/ci/src/checks.rs`,
   `crates/ci/src/reconcile.rs` (test only)
 
@@ -795,24 +908,27 @@ pub enum Claim { Claimed(JobRow), Busy, Gone }
 /// launched or running. Clears `held`.
 pub async fn claim_launch(db: &Db, job_id: u64, tenant_id: &str, max_running: u32, now: u64) -> Result<Claim>;
 /// Keeps attempt `attempt` queued with `hold` until `retry_at`; bumps
-/// updated_at. True when `held` changed.
+/// updated_at. True when `held` changed (for the log line only).
 pub async fn hold(db: &Db, job_id: u64, attempt: u32, hold: &str, retry_at: u64, now: u64) -> Result<bool>;
 // JobState gains `held: Option<String>`; JobView gains `held: Option<&'a str>`.
 // Run object route: POST /held?job=&attempt=&run=&tenant= with {"message": "..."}.
 ```
 
   Messages, exactly (`{cap}` is `dollars(cap_micros)`, `5` is
-  `MAX_RUNNING_JOBS`):
+  `MAX_RUNNING_JOBS`; both are formatted in, never written as text):
   - `Card`: `Waiting for a card. Add one for {org} at {app_url}/o/{org}/ci.`
   - `SpendCap`: `Waiting: {org} reached its {cap} monthly spend cap. Raise it at {app_url}/o/{org}/ci.`
   - `Concurrency`: `Waiting: {org} has 5 jobs running, the most at once. This job starts when one of them ends.`
 
   In `launches::launch`, a `Delivery::Launch` reads `standing`; a hold,
   or `Claim::Busy` (as `Concurrency`), calls `store::hold` with
-  `now + HOLD_RECHECK_MS` and, when it changed, posts `/held` to the
-  run object; the message is acked either way. `Claim::Gone` acks. The
-  object stores the message in `JobState.held` and marks the outbox
-  only when the message differs. A claim by the agent clears `held` and
+  `now + HOLD_RECHECK_MS` and then posts `/held` to the run object every
+  time, changed or not (Ruling 14); the message is acked either way, so
+  a failed post is retried when the reconciler requeues the job. A
+  `Claim::Gone` acks. The object's `/held` arm checks the job and
+  attempt like `/failed`, stores the message in `JobState.held` and
+  marks the outbox only when the message differs; the outbox retries
+  the GitHub update. A claim by the agent clears `held` and
   marks the outbox when it was set. `render` shows a queued job with
   `held` as title `Waiting` and the message as the first summary line.
   The reconciler is unchanged: `fix` already requeues a queued job
@@ -833,6 +949,8 @@ pub async fn hold(db: &Db, job_id: u64, attempt: u32, hold: &str, retry_at: u64,
 #[test] fn claim_clears_the_hold()
 #[test] fn hold_reports_a_change_once() // hold(card) true, hold(card) false, hold(concurrency) true; next_launch_at set
 #[test] fn hold_leaves_another_attempt_alone()
+// run/decide.rs
+#[test] fn held_message_marks_the_outbox_once() // pure fn on JobState: new -> true, same -> false, other -> true
 // checks.rs
 #[test] fn held_job_says_why() // Queued + held -> status queued, title "Waiting", summary starts with the message
 #[test] fn running_job_drops_the_hold() // Running + held -> title "Running", no message
@@ -868,7 +986,8 @@ git commit -S -s -m "feat(ci): hold launches past the caps"
 
 **Files:**
 - Create: `crates/ci/src/settings_api.rs`
-- Modify: `crates/ci/src/api.rs` (dispatch `orgs/*` to the new module),
+- Modify: `crates/ci/src/api.rs` (the request guard; dispatch
+  `orgs/*` and the repository settings paths to the new module),
   `crates/ci/src/access.rs`, `crates/ci/src/env.rs`,
   `crates/ci/src/billing.rs`, `crates/ci/src/store.rs`,
   `crates/ci/src/reconcile.rs`, `crates/cloud/src/polar.rs`,
@@ -896,7 +1015,8 @@ pub async fn org_admin(settings: &Settings, session: &Session, org: &str) -> Res
 pub struct BillingView { pub card: bool, pub minutes: u64, pub units: u64, pub free_units: u64,
     pub spend_cents: u64, pub cap_dollars: u64, pub running: u32, pub max_running: u32 }
 pub fn view(standing: &Standing) -> BillingView;
-/// Cap in micros from whole dollars; error "Set a cap from $50 to $10,000".
+/// Cap in micros from whole dollars. The error is built from the consts:
+/// format!("Set a cap from {} to {}", dollars(MIN_SPEND_CAP_MICROS), dollars(MAX_SPEND_CAP_MICROS)).
 pub fn cap_micros(dollars: u64) -> Result<u64, String>;
 // store.rs
 pub async fn set_spend_cap(db: &Db, tenant_id: &str, cap_micros: u64, now: u64) -> Result<()>;
@@ -912,8 +1032,23 @@ pub struct CiUsage<'a> { pub job_id: u64, pub attempt: u32, pub tenant: &'a str,
 pub fn ci_ingest(api: &str, token: &str, events: &[CiUsage<'_>]) -> Request;
 // reconcile.rs
 pub struct Shares { pub schedules: u32, pub stalled: u32, pub orphans: u32,
-    pub pool: u32, pub retention: u32, pub usage: u32 }
+    pub pool: u32, pub usage: u32, pub reseal: u32, pub retention: u32 }
+// api.rs
+/// Origin, CSRF and the body cap apply to every method but GET.
+pub(crate) fn guarded(method: &Method) -> bool;
+/// 128 KiB for secret and var PUT bodies (a 48 KB value after JSON
+/// escaping), MAX_BODY (64 KiB) for every other body.
+pub(crate) fn body_cap(route: &SettingsRoute) -> usize;
+// settings_api.rs: one parser for every org route and the repository
+// secrets and vars routes of Task 10.
+pub enum SettingsRoute<'a> { /* Billing, Checkout, Portal, Cap, Secrets, Secret, Vars, Var */ }
+pub fn settings_route<'a>(path: &'a str, method: &Method) -> Option<SettingsRoute<'a>>;
 ```
+
+  `api.rs serve()` runs the Origin check, the CSRF check and the body
+  cap for POST, PUT and DELETE (today it does so for POST only, and
+  `Route::method()` knows only GET and POST); the settings routes go
+  through the same guard before `settings_api` sees them.
 
   `Settings` gains `polar_api` (`POLAR_API_URL`, default
   `hatchrun_cloud::polar::API`), `polar_token` (secret
@@ -921,22 +1056,34 @@ pub struct Shares { pub schedules: u32, pub stalled: u32, pub orphans: u32,
   (`POLAR_CI_PRODUCT_ID`). The reconciler gains a sixth step, usage:
   up to `INGEST_BATCH` unsent rows go to `ci_ingest`, then
   `usage_sent`. `shares` keeps schedules at 5/9 up to 500 and splits the
-  rest half to stalled and an eighth each to orphans, pool, retention
-  and usage (the pool share is spent in Task 13).
+  rest: stalled 3/8, orphans 1/8, pool 1/8, usage 1/16, reseal 1/16,
+  each rounded down, and retention takes the remainder, so at 900 it is
+  schedules 500, stalled 150, orphans 50, pool 50, usage 25, reseal 25,
+  retention 100. Retention needs `SWEEP_LIMIT * PURGE_COST` (100) or
+  `retain` skips the sweep. The pool share is spent in Task 13 and the
+  reseal share in Task 9.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
 // billing.rs
-#[test] fn cap_bounds() // 49 -> Err("Set a cap from $50 to $10,000"); 50 -> 50_000_000; 10_000 -> Ok; 10_001 -> Err
+#[test] fn cap_bounds() // 49 -> Err("Set a cap from $50.00 to $10000.00"); 50 -> 50_000_000; 10_000 -> Ok; 10_001 -> Err
 #[test] fn view_from_standing() // 600 units, cap default -> spend_cents 20, cap_dollars 50, free_units 500, max_running 5
 // settings_api.rs
 #[test] fn routes_parse() // "orgs/acme/billing" GET, ".../checkout" POST, ".../portal" POST, ".../cap" PUT; others None
+// api.rs
+#[test] fn every_mutating_method_is_guarded() // guarded: POST, PUT, DELETE true; GET false
+#[test] fn put_without_csrf_is_refused()      // guard check fn: PUT, no X-CSRF-Token -> 403
+#[test] fn delete_from_another_origin_is_refused() // DELETE, Origin https://evil.example -> 403
+#[test] fn secret_bodies_get_more_room()      // body_cap(Secret PUT) == 128 << 10; body_cap(Cap) == 64 << 10
 // polar.rs
 #[test] fn ci_ingest_names_job_and_attempt()
     // event name "ci.usage", external_customer_id tenant, external_id "ci:7:2", metadata.units 20
 // reconcile.rs (replaces the old shares test)
-#[test] fn shares_split_the_budget() // shares(900) == {500, 200, 50, 50, 50, 50}
+#[test] fn shares_split_the_budget()
+    // shares(900) == {schedules 500, stalled 150, orphans 50, pool 50, usage 25, reseal 25, retention 100};
+    // retention >= store::SWEEP_LIMIT at BUDGET; for total in [0, 1, 8, 100, 900, 5_000]
+    // the seven shares sum to total and schedules <= 500
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -1042,9 +1189,11 @@ pub async fn reseal(db: &Db, row: &StaleRow, key_id: &str, sealed: &str) -> Resu
 ```
 
   The nonce is 12 bytes from `webcrypto::random_bytes` on wasm; tests
-  pass fixed nonces. The reconciler gains a re-seal step (after usage):
-  up to 200 rows of `stale_secrets`, opened with the keyring and sealed
-  with the current key. `wrangler.toml` gets the bindings:
+  pass fixed nonces. The reconciler gains a re-seal step (after usage)
+  with its own share, `shares.reseal` (25 at the full budget): it takes
+  that many rows of `stale_secrets`, one unit per row, opens each with
+  the keyring and seals it with the current key. `wrangler.toml` gets
+  the bindings:
 
 ```toml
 # The key that seals CI secrets, from the account's Secrets Store. To
@@ -1106,8 +1255,9 @@ git commit -S -s -m "feat(ci): store secrets and vars sealed with a rotating key
 ### Task 10 [standard]: Secrets and vars routes
 
 **Files:**
-- Modify: `crates/ci/src/settings_api.rs`, `crates/ci/src/api.rs`
-  (repository routes), `crates/ci/src/access.rs`,
+- Modify: `crates/ci/src/settings_api.rs` (the handlers; the routes
+  parse through Task 8's `settings_route` and pass Task 8's guard),
+  `crates/ci/src/access.rs`,
   `crates/ci/src/github.rs` (`Permissions` gains `admin`),
   `crates/ci-dev/src/github.rs` (repository answer gains
   `"admin": true`)
@@ -1130,8 +1280,11 @@ git commit -S -s -m "feat(ci): store secrets and vars sealed with a rotating key
 // access.rs: Access gains Admin above Write; from_permissions gives Admin when p.admin.
 ```
 
-  A bad name or value answers `400` with the error text; a value over
-  `MAX_VALUE_BYTES` answers `413` with `Values are at most 48 KB`;
+  A secret or var PUT body may be 128 KiB (`body_cap`), so a 48 KB
+  value fits after JSON escaping; `MAX_VALUE_BYTES` is checked on the
+  decoded value. A bad name or value answers `400` with the error text;
+  a decoded value over `MAX_VALUE_BYTES` answers `413` with
+  `Values are at most 48 KB`;
   `Put::TooMany` answers `409` with
   `{org or owner/repo} has 100 secrets, the most allowed` (or `1000`,
   or `vars`). Secret values are never answered, logged or echoed in an
@@ -1142,7 +1295,8 @@ git commit -S -s -m "feat(ci): store secrets and vars sealed with a rotating key
 ```rust
 #[test] fn routes_parse()          // every row of the table, with name segments decoded
 #[test] fn admin_needs_the_admin_permission() // from_permissions(true, admin) -> Admin; write only -> Write
-#[test] fn value_too_large()       // 49_153 bytes -> 413 text above
+#[test] fn value_too_large()       // decoded 49_153 bytes -> 413 text above
+#[test] fn escaped_value_fits()    // 48 KiB of '"' (about 96 KiB as JSON) -> accepted
 #[test] fn too_many_message()      // ("acme", repo None, secrets, 1000) -> "acme has 1000 secrets, the most allowed"
 ```
 
@@ -1173,41 +1327,62 @@ git commit -S -s -m "feat(ci): add secrets and vars routes for the app"
 
 **Files:**
 - Modify: `crates/ci/src/agent.rs`, `crates/ci/src/github.rs`,
-  `crates/ci/src/secrets.rs`, `crates/ci-dev/src/github.rs` (`GET /app/installations/{id}`)
+  `crates/ci/src/secrets.rs`, `crates/ci/src/run/object.rs`,
+  `crates/ci/src/run/mod.rs` (`JobState.capped`, `ClaimBody`),
+  `crates/ci/src/checks.rs` (`JobView.capped`),
+  `crates/cloud/src/github.rs` (`Installation.permissions`),
+  `crates/ci-dev/src/github.rs` (`GET /app/installations/{id}`)
 
 **Interfaces:**
 - Consumes: Task 4 (`JobRow.token_permissions`, `JobRow.secret_refs`),
-  Task 9 (`sealed_secrets`, `job_vars`, `open`, `Keyring`).
+  Task 9 (`sealed_secrets`, `job_vars`, `open`, `Keyring`),
+  `hatchrun_cloud::github::installation` (the request builder, reused),
+  `launches::post_failed`.
 - Produces:
 
 ```rust
-// github.rs
-pub fn installation(api: &str, app_jwt: &str, installation_id: u64) -> Request;
-/// The installation's `permissions` map.
-pub fn installation_permissions(response: &Response) -> Result<BTreeMap<String, String>, String>;
+// hatchrun_cloud::github::Installation gains (required, GitHub always sends it):
+pub permissions: BTreeMap<String, String>,
+// hatchrun_ci::github
+/// One scope the App holds less of than the job asked.
+pub struct Capped { pub scope: String, pub asked: String, pub got: String } // got "none" when dropped
 /// Each asked scope at the lower of the asked and held level; scopes the
 /// App does not hold are left out; `metadata: read` is always kept.
-pub fn cap_permissions(asked: &BTreeMap<String, String>, held: &BTreeMap<String, String>) -> BTreeMap<String, String>;
+pub fn cap_permissions(asked: &BTreeMap<String, String>, held: &BTreeMap<String, String>)
+    -> (BTreeMap<String, String>, Vec<Capped>);
 pub fn scoped_token(api: &str, installation_id: u64, app_jwt: &str, repo_id: u64,
     permissions: &BTreeMap<String, String>) -> Request;
 // secrets.rs
 /// The values `refs` names (all of them when refs.all), repository rows
-/// over organization rows. A row that does not open fails the claim.
+/// over organization rows. The error names the secret, never its value.
 pub fn job_secrets(refs: &SecretRefs, rows: &[SealedRow], keyring: &Keyring, tenant: &str)
-    -> Result<BTreeMap<String, String>, SecretError>;
+    -> Result<BTreeMap<String, String>, (String, SecretError)>;
 // agent.rs
 pub(crate) fn fill(doc: &mut JobDocument, secrets: BTreeMap<String, String>, vars: BTreeMap<String, String>);
+// run object: ClaimBody { token: String, capped: Vec<Capped> }; JobState gains capped: Vec<Capped>
 ```
 
-  The installation's permissions are cached in the `TOKENS` KV for 600
-  s under `ci:installation-permissions:{id}`, since App JWT calls share
-  one budget across all installations. The claim mints the token with
-  `cap_permissions(row.token_permissions, held)`. After the run object
-  answers `200` with the document, the handler reads `sealed_secrets`
-  (names from `secret_refs`, all when `all`), `job_vars`, `fill`s the
-  document and answers it. A secret that does not open logs
-  `job {id}: secret {name}: {err}` and answers `503`. Any other object
-  answer passes through unchanged.
+  The claim, after metadata is off, in this order (Ruling 1):
+  1. Read `sealed_secrets` (names from `secret_refs`, all when `all`)
+     and `job_vars`, load the keyring and open the values. A database
+     or keyring failure answers `503` with nothing claimed. A secret
+     that does not open (`UnknownKey`, `Corrupt`) will not open on a
+     retry: the handler ends the job with `launches::post_failed` and
+     the message
+     ``Secret `NAME` cannot be read. Set it again in the hatchrun app.``,
+     logs `job {id}: secret {name}: {err:?}` and answers `409`.
+  2. Read the installation's permissions from KV
+     (`ci:installation-permissions:{id}`, 600 s), else through
+     `hatchrun_cloud::github::installation` with the App JWT, and store
+     them. Mint the token with the capped map; log
+     `job {id}: token scope {scope} capped to {got}` for each `Capped`.
+  3. Post the claim to the run object with the token and `capped`.
+  4. On `200`, `fill` the document and answer it. Any other answer
+     passes through unchanged.
+
+  The object keeps `capped` in `JobState` and marks the outbox at claim
+  when it is not empty. `render` adds one summary line per entry:
+  ``The token's `{scope}` permission is {got}: the job asked for {asked} and the hatchrun App holds no more.``
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1215,38 +1390,44 @@ pub(crate) fn fill(doc: &mut JobDocument, secrets: BTreeMap<String, String>, var
 // github.rs
 #[test] fn cap_keeps_what_the_app_holds()
     // asked {contents: write, issues: write, metadata: read}, held {contents: read, metadata: read, checks: write}
-    // -> {contents: read, metadata: read}
+    // -> ({contents: read, metadata: read},
+    //     [Capped{contents, write, read}, Capped{issues, write, none}])
 #[test] fn scoped_token_asks_for_the_capped_scopes() // body permissions equal the map, repository_ids [repo]
-#[test] fn installation_permissions_reads_the_map()
+// cloud github.rs
+#[test] fn installation_reads_its_permissions()
 // secrets.rs
 #[test] fn repo_value_wins()               // org and repo NPM_TOKEN -> repo's
 #[test] fn only_named_secrets_go()         // refs {A}, rows A, B -> {A}
 #[test] fn all_refs_send_every_secret()
 #[test] fn missing_secret_is_left_out()    // refs {A}, no rows -> {}
+#[test] fn unreadable_secret_names_itself() // row sealed under an unknown key -> Err(("A", UnknownKey(..)))
 // agent.rs
 #[test] fn fill_sets_secrets_and_vars()    // keeps every other field of the document
+#[test] fn unreadable_secret_ends_the_job() // pure decision fn: Err(UnknownKey) -> EndJob(message), db error -> Retry
+// checks.rs
+#[test] fn capped_scopes_are_named()       // Running job with one Capped -> the line above in the summary
 ```
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test -p hatchrun-ci github secrets agent`
+Run: `cargo test -p hatchrun-ci github secrets agent checks && cargo test -p hatchrun-cloud github`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement** the cache, the capped mint, the fill. The
-  fake GitHub answers `/app/installations/{id}` with
-  `{"permissions": {"contents": "write", "metadata": "read", "checks": "write", "pull_requests": "write"}}`
+- [ ] **Step 3: Implement** as listed. The fake GitHub answers
+  `/app/installations/{id}` with Plan 3's installation fields and
+  `"permissions": {"contents": "write", "metadata": "read", "checks": "write", "pull_requests": "write"}`
   and records the permissions of every access token request in
   `/_state`.
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test -p hatchrun-ci -p hatchrun-ci-dev && cargo check -p hatchrun-ci --target wasm32-unknown-unknown`
+Run: `cargo test -p hatchrun-ci -p hatchrun-ci-dev && cargo test -p hatchrun-cloud && cargo check -p hatchrun-ci --target wasm32-unknown-unknown`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/ci crates/ci-dev
+git add crates/ci crates/ci-dev crates/cloud/src/github.rs
 git commit -S -s -m "feat(ci): hand jobs their secrets, vars and scoped token"
 ```
 
@@ -1259,47 +1440,71 @@ git commit -S -s -m "feat(ci): hand jobs their secrets, vars and scoped token"
 - Modify: `crates/scaler-core/src/lib.rs`
 
 **Interfaces:**
-- Produces, in `hatchrun_scaler_core::pool` (times in seconds, as the
-  crate uses):
+- Produces, in `hatchrun_scaler_core::pool`. `Pool` reads every time in
+  the unit of its config: `Scaler` keeps seconds, and CI passes
+  milliseconds everywhere (config, `now`, rows), so CI has one unit.
 
 ```rust
 #[derive(Clone, Debug)]
-pub struct PoolConfig { pub name_prefix: String, pub size: u32, pub warmup: u64,
-    pub max_age: u64, pub inventory_grace: u64 }
+pub struct PoolConfig { pub size: u32, pub warmup: u64, pub max_age: u64, pub inventory_grace: u64 }
+/// Launch failures and the time before which nothing launches. `Scaler`
+/// shares one between its runners and its pool, as today.
+#[derive(Clone, Debug)]
+pub struct Backoff { pub failures: u32, pub after: u64, pub base: u64, pub max: u64 }
+impl Backoff {
+    pub fn new(base: u64, max: u64) -> Backoff;   // Scaler: (5, 300) s; CI: (5_000, 300_000) ms
+    pub fn failed(&mut self, now: u64);           // base * 2^failures, at most max, as back_off does
+    pub fn succeeded(&mut self);
+    pub fn ready(&self, now: u64) -> bool;
+}
+/// Runner and pool names from one counter, as `Scaler.launched` is today.
+#[derive(Clone, Debug)]
+pub struct Names { pub prefix: String, pub launched: u64 }
+impl Names {
+    pub fn runner(&mut self, now: u64) -> String;   // "{prefix}-{now:x}-{n}"
+    pub fn pool(&mut self, now: u64) -> String;     // "{prefix}-pool-{now:x}-{n}"
+}
 pub struct Pool { /* instances by id, names launching */ }
 impl Pool {
     pub fn new(config: PoolConfig) -> Pool;
     /// A pool that already holds these instances, by id.
     pub fn restore(config: PoolConfig, instances: impl IntoIterator<Item = (String, PoolInstance)>) -> Pool;
     pub fn set_size(&mut self, size: u32);
-    /// Takes in instances without a runner name; drops entries missing
-    /// from the inventory past the grace.
-    pub fn reconcile(&mut self, instances: &[Instance], now: u64);
+    /// Takes in instances without a runner name, except those `handed`
+    /// says a runner already owns; drops entries missing from the
+    /// inventory past the grace.
+    pub fn reconcile(&mut self, instances: &[Instance], handed: &dyn Fn(&str) -> bool, now: u64);
     /// Stop actions for warmed-up instances, Terminate for old and excess ones.
     pub fn upkeep(&mut self, now: u64) -> Vec<Action>;
-    /// LaunchPool actions up to the size.
-    pub fn refill(&mut self, now: u64) -> Vec<Action>;
+    /// LaunchPool actions up to the size, none while `backoff` is not ready.
+    pub fn refill(&mut self, now: u64, backoff: &Backoff, names: &mut Names) -> Vec<Action>;
     pub fn take_ready(&mut self) -> Option<String>;
-    pub fn launched(&mut self, name: &str, instance_id: String, now: u64);
-    pub fn launch_failed(&mut self, name: &str);
+    pub fn launched(&mut self, name: &str, instance_id: String, now: u64, backoff: &mut Backoff);
+    pub fn launch_failed(&mut self, name: &str, now: u64, backoff: &mut Backoff);
     pub fn instances(&self) -> &BTreeMap<String, PoolInstance>;
 }
 ```
 
-  `Scaler` holds a `Pool` and calls it where it ran the same code
-  inline; its public API and every existing test stay as they are.
-  `PoolInstance`, `PoolState`, `Instance` and `Action` stay in
+  `Scaler` holds a `Pool`, a `Backoff` and `Names`, and passes as
+  `handed` whether a runner's `instance_id` is that id (today's
+  `reconcile_pool_instance` skip). Its public API, including
+  `pool_launch_failed(name, now)`, and every existing test stay as they
+  are. `PoolInstance`, `PoolState`, `Instance` and `Action` stay in
   `lib.rs`.
 
 - [ ] **Step 1: Write the failing tests** in `pool.rs`:
 
 ```rust
 #[test] fn refill_launches_up_to_size()         // size 3, empty -> 3 LaunchPool; again -> none
+#[test] fn refill_waits_for_the_backoff()       // launch_failed at 0 -> refill at 4 none, at 5 one (base 5)
+#[test] fn names_share_one_counter()            // runner(t), pool(t), runner(t) end in -1, -2, -3
 #[test] fn upkeep_stops_warmed_instances()      // launched at 0, warmup 180 -> Stop at 180, not at 179
 #[test] fn shrinking_terminates_the_oldest()    // 3 ready, set_size(1) -> Terminate the two oldest
 #[test] fn old_instances_are_replaced()         // age >= max_age -> Terminate, refill launches one
+#[test] fn handed_instances_are_skipped()       // handed("i-1") true -> i-1 not taken into the pool
 #[test] fn restore_keeps_entries_within_grace() // restored entry missing from inventory at since+119 kept, +120 dropped
 #[test] fn take_ready_takes_the_oldest()
+#[test] fn milliseconds_work_the_same()         // warmup 180_000, now in ms -> Stop at 180_000
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -1307,12 +1512,14 @@ impl Pool {
 Run: `cargo test -p hatchrun-scaler-core pool`
 Expected: FAIL.
 
-- [ ] **Step 3: Move** the pool fields and code out of `Scaler`.
+- [ ] **Step 3: Move** the pool fields, the backoff and the name counter
+  out of `Scaler` into these types.
 
 - [ ] **Step 4: Run every scaler test**
 
 Run: `cargo test -p hatchrun-scaler-core -p hatchrun-scaler && cargo check -p hatchrun-scaler-core --target wasm32-unknown-unknown`
-Expected: PASS, with no change to the existing tests.
+Expected: PASS, with no change to the existing tests
+(`failed_pool_launch_backs_off` among them).
 
 - [ ] **Step 5: Commit**
 
@@ -1335,7 +1542,7 @@ git commit -S -s -m "refactor(scaler-core): move the warm pool into its own type
   `deploy/cloudformation/ci-account.yaml`
 
 **Interfaces:**
-- Consumes: Task 12 (`Pool`, `PoolConfig`), Task 4 (`profile_for`,
+- Consumes: Task 12 (`Pool`, `PoolConfig`, `Backoff`, `Names`), Task 4 (`profile_for`,
   `LaunchSpec.template`), Task 8 (`Shares.pool`).
 - Produces:
 
@@ -1345,8 +1552,8 @@ CREATE TABLE ci_pool (
   instance_id text PRIMARY KEY,
   template text NOT NULL,
   state text NOT NULL CHECK (state IN ('warming', 'stopping', 'ready')),
-  launched_at bigint NOT NULL,
-  since bigint NOT NULL
+  launched_at bigint NOT NULL,                 -- Unix ms
+  since bigint NOT NULL                        -- Unix ms
 );
 CREATE INDEX ci_pool_ready ON ci_pool (template, launched_at) WHERE state = 'ready';
 CREATE INDEX ci_jobs_started ON ci_jobs (started_at) WHERE started_at IS NOT NULL;
@@ -1375,7 +1582,13 @@ pub const BUCKET_MS: u64 = 300_000;
 pub const WINDOW_MS: u64 = 3_600_000;
 /// The busiest five-minute bucket of the last hour, at most POOL_MAX; 0 when idle.
 pub fn pool_target(claims_per_bucket: &[u64]) -> u32;
-pub fn config(template: &Template) -> PoolConfig;  // prefix "ci-pool-<label>", warmup 180, max_age 86_400, grace 120
+/// Every time in ms: warmup 180_000, max_age 86_400_000, grace 120_000.
+pub fn config(template: &Template, size: u32) -> PoolConfig;
+/// Names "ci-pool-<label>-pool-<now hex>-<n>", counter from 0 each pass;
+/// the time in the name keeps names apart across passes.
+pub fn names(template: &Template) -> Names;
+/// Backoff::new(5_000, 300_000), fresh each pass.
+pub fn backoff() -> Backoff;
 // store.rs
 pub struct PoolRow { pub instance_id: String, pub template: String, pub state: String,
     pub launched_at: u64, pub since: u64 }
@@ -1398,8 +1611,9 @@ pub async fn claims_by_bucket(db: &Db, since: u64) -> Result<Vec<(String, u64, u
   The reconciler's pool step (after orphans, within `shares.pool`)
   skips when the backend is local. Per template: restore a `Pool` from
   `pool_rows`, `reconcile` with `pool_instances` whose `pool` tag is the
-  template's first label (stopped means ready), `set_size(pool_target)`,
-  run `upkeep` then `refill`. A `Terminate` or `Stop` acts only after
+  template's first label (stopped means ready; `handed` is always
+  false, since a taken instance has lost its pool tag), all times in
+  ms, `set_size(pool_target)`, run `upkeep` then `refill`. A `Terminate` or `Stop` acts only after
   `drop_pool` (terminate) or a state update `WHERE state = 'warming'`
   (stop) changed a row; otherwise a launch took the instance. Then
   `save_pool`. A pool launch starts the template's profile with empty
@@ -1429,6 +1643,7 @@ pub async fn claims_by_bucket(db: &Db, since: u64) -> Result<Vec<(String, u64, u
 #[test] fn pool_target_follows_the_busiest_bucket() // [0,0,1,3,0,0,0,0,0,0,0,1] -> 3
 #[test] fn pool_target_is_zero_when_idle()          // twelve zeros -> 0
 #[test] fn pool_target_caps_at_ten()                // [25] -> 10
+#[test] fn rows_and_pool_agree_on_milliseconds()    // PoolRow -> PoolInstance -> PoolRow keeps launched_at and since
 // reconcile.rs
 #[test] fn orphans_skip_pool_instances() // running, no job tag, pool "ubuntu-latest" -> not an orphan
 // store.rs (Postgres)
@@ -1476,8 +1691,10 @@ git commit -S -s -m "feat(ci): keep a warm pool per runner template"
 - Create: `web/app/src/pages/ci/CiSettings.tsx`,
   `web/app/src/pages/ci/RepoSettings.tsx`,
   `web/app/src/pages/ci/SecretsTable.tsx`, `web/app/mock/ci-settings.ts`
-- Modify: `web/app/src/App.tsx` (the `/o/:org/ci` section),
-  `web/app/src/router.tsx` (`/ci/:owner/:repo/settings`),
+- Modify: `web/app/src/pages/TenantPage.tsx` (a `CI` tab and the
+  `section === "ci"` branch, as Jobs, Runners and Settings are done),
+  `web/app/src/router.tsx` (`matchCi` accepts `/ci/:owner/:repo/settings`
+  and `CiPages` renders `RepoSettings` for it),
   `web/app/src/api.ts`, the mock server setup in `web/app/mock`
 
 **Interfaces:**
@@ -1526,7 +1743,9 @@ git commit -S -s -m "feat(app): add CI billing, secrets and vars pages"
 - Produces: a deploy that needs, once, by hand:
   - a Secrets Store secret `ci-secrets-key-2026-10` holding base64 of
     32 random bytes (`openssl rand -base64 32`), scope `workers`, and
-    the store id written into `crates/ci/wrangler.toml`;
+    the store id written into `crates/ci/wrangler.toml` before the
+    first deploy (the end-to-end script never reads that id; Task 17
+    gives it a local one);
   - a Polar meter `CI usage` that sums `metadata.units` of events named
     `ci.usage`, a product `hatchrun CI` with a metered price of $0.002
     per unit on it and a meter credit benefit of 500 units per month,
@@ -1553,63 +1772,152 @@ git commit -S -s -m "chore(ci): wire the secrets key and polar for deploy"
 
 ---
 
-### Task 16 [standard]: End-to-end scenarios
+### Task 16 [standard]: Per-tenant retention
+
+**Files:**
+- Modify: `crates/cloud/migrations/0005_ci_accounts.sql`,
+  `crates/ci/src/store.rs` (`insert_run`, `TenantRow`),
+  `crates/ci/src/run/mod.rs` (`RunInfo`, `snapshot_key`),
+  `crates/ci/src/logs.rs` (log and index keys), `crates/ci/src/api.rs`
+  (`owns_key`), `crates/ci/src/runs.rs` (the start body),
+  `crates/ci/r2-lifecycle.json`
+
+**Interfaces:**
+- Consumes: Task 5 (`TenantRow`).
+- Produces:
+
+```sql
+-- appended to 0005 (keeps its default: Global Constraints)
+ALTER TABLE tenants ADD COLUMN retention_days bigint NOT NULL DEFAULT 30
+  CHECK (retention_days IN (30, 90));
+```
+
+```rust
+// TenantRow gains `retention_days: u32`; RunInfo gains `retention_days: u32` (required).
+pub fn snapshot_key(days: u32, tenant: &str, run_id: u64) -> String;   // "state/{days}d/{tenant}/{run}.json"
+// logs.rs: "logs/{days}d/{tenant}/{repo_id}/{run}/{job}/{attempt}.log.gz" and ".index.json"
+// api.rs: owns_key(key, days, tenant, repo_id, run_id)
+```
+
+  `insert_run` sets `expires_at` to
+  `created_at + retention_days * 86_400_000` from the tenant row in the
+  same statement. Deliveries keep 30 days (`RETENTION_MS`).
+  `r2-lifecycle.json` has four rules: `logs/30d/` and `state/30d/` at
+  2,592,000 s, `logs/90d/` and `state/90d/` at 7,776,000 s. An
+  enterprise tenant is set with
+  `UPDATE tenants SET retention_days = 90 WHERE id = ...`; nothing else
+  sets it.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+// store.rs (Postgres)
+#[test] fn expiry_follows_the_tenant() // 30-day tenant: expires 5 + 30 * DAY; 90-day tenant: 5 + 90 * DAY
+#[test] fn retention_days_is_30_or_90() // UPDATE to 60 fails the CHECK
+// run/mod.rs
+#[test] fn snapshot_key_has_the_tier()  // snapshot_key(90, "abc", 12) == "state/90d/abc/12.json"
+// logs.rs, api.rs
+#[test] fn log_keys_have_the_tier()     // "logs/30d/t1/5/7/9/1.log.gz"
+#[test] fn log_keys_stay_inside_the_run() // updated: another tier, tenant, repo or run, or "..", is refused
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `cargo test -p hatchrun-ci store run logs api`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement** and update the Plan 3 tests that spell the
+  old keys (`snapshot_key("abc", 12)`, `owns_key` cases, the R2 key in
+  `run/object.rs` tests).
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cargo test -p hatchrun-ci && cargo check -p hatchrun-ci --target wasm32-unknown-unknown && jq . crates/ci/r2-lifecycle.json`
+Expected: PASS; the lifecycle file parses with four rules.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/ci crates/cloud/migrations/0005_ci_accounts.sql
+git commit -S -s -m "feat(ci): keep runs and logs for the tenant's retention"
+```
+
+---
+
+### Task 17 [standard]: End-to-end scenarios
 
 **Files:**
 - Modify: `crates/ci/scripts/e2e.sh`,
   `crates/ci/tests/e2e/repo/.hatchrun/config.yml`,
-  `crates/ci-dev/src/github.rs` (answers for a second installation)
+  `crates/ci-dev/src/github.rs` (a second installation, and Polar's
+  `POST /v1/events/ingest`), `.gitignore` (`crates/ci/wrangler.e2e.toml`)
 
 **Interfaces:**
 - Consumes: every earlier task.
-- Produces four new scenarios, run after Plan 3's and in this order,
-  plus a fifth label case:
+- Produces: the environment and five new scenarios, run after Plan 3's
+  in this order.
 
-  1. **Template label.** Branch `arm` runs workflow `arm` with job
-     `arm-hello` on `ubuntu-26.04-arm`. The launcher's `/_events` show
-     its launch with `"template": "ubuntu-26.04-arm"`, and the job
-     passes.
-  2. **Unknown label.** Branch `bad` has a workflow whose job asks for
-     `ubuntu-24.04`. The commit gets a failed `hatchrun / config` check
-     run whose summary contains
-     `names no runner template; use one of ubuntu-latest` and no
-     launch.
-  3. **Masked secret.** Before the push the script sets
+  Environment:
+  - `ci.env` gains `POLAR_ACCESS_TOKEN="e2e-polar-token"`; `wrangler
+    dev` gains `--var POLAR_API_URL:"$GITHUB"`,
+    `--var POLAR_CI_PRODUCT_ID:e2e-ci-product`,
+    `--var CI_SECRETS_KEY_ID:e2e` and `--var CI_SECRETS_KEY_OLD_ID:`.
+    The fake GitHub also answers `POST /v1/events/ingest` like Polar
+    (`{"inserted": n, "duplicates": 0}`) and lists the events in
+    `/_state` under `polar_events`.
+  - The Secrets Store binding gets a local value: the script writes
+    `crates/ci/wrangler.e2e.toml`, a copy of `wrangler.toml` whose
+    `store_id` is the fixed local id `e2e00000000000000000000000000000`,
+    runs (in `crates/ci`)
+    `npx --yes "$WRANGLER" secrets-store secret create e2e00000000000000000000000000000 --name ci-secrets-key-2026-10 --value "$(openssl rand -base64 32)" --scopes workers --persist-to "$tmp/ci-state"`,
+    and starts `wrangler dev -c wrangler.e2e.toml` with the same
+    `--persist-to`. The cleanup removes the copy.
+
+  Scenarios:
+  1. **Secret, then a template label.** The script first sets
      `E2E_SECRET=e2e-secret-<16 random hex>` through
      `PUT /api/ci/repos/e2e/demo/secrets/E2E_SECRET` with the session
-     cookie and CSRF token. `arm-hello` runs
-     `echo "secret is ${{ secrets.E2E_SECRET }}"`. The R2 log holds
-     `secret is ***`. `grep -rF "$secret" "$tmp/ci-state" "$logs"` finds
-     nothing (R2 objects, Durable Object storage, KV, Worker logs, fake
-     GitHub state), and the `ci_secrets` row's `sealed` column does not
-     contain it.
+     cookie and CSRF token, then pushes branch `arm`: workflow `arm`,
+     job `arm-hello` on `ubuntu-26.04-arm`, which runs
+     `echo "secret is ${{ secrets.E2E_SECRET }}"`. The launcher's
+     `/_events` show its launch with `"template": "ubuntu-26.04-arm"`
+     and the job passes.
+  2. **Masked secret.** The R2 log of `arm-hello` holds
+     `secret is ***`. `grep -rF "$secret" "$tmp/ci-state" "$logs"`
+     finds nothing (R2 objects, Durable Object storage, KV, Worker logs,
+     fake GitHub state), and the `ci_secrets` row's `sealed` column does
+     not contain it.
+  3. **Unknown label.** Branch `bad` triggers workflows `bad` (a job on
+     `ubuntu-24.04`) and `bad-ok` (a job on `ubuntu-latest`). The commit
+     gets a failed `bad / config` check run whose summary contains
+     `names no runner template; use one of ubuntu-latest`, and `bad-ok`
+     runs and passes. Both workflows live in the fixture config, since a
+     bad label now fails only its workflow.
   4. **Concurrency cap.** Branch `wide` runs a matrix job `nap` over
      `n: [1, 2, 3, 4, 5, 6]`, each `sleep 20`. While the first five run,
      the run's API shows five jobs `launching`, `launched` or `running`
      and one `queued`, and the queued job's check run summary contains
      `has 5 jobs running, the most at once`. After one ends, the script
      triggers the reconciler (`/__scheduled`) until the sixth runs; all
-     six pass.
+     six pass. The fake Polar then holds a `ci.usage` event for each
+     completed job (external id `ci:<job>:1`).
   5. **No card.** A second tenant `e2etenant0000002`, installation 43,
-     no subscription. A push for its repository gets one
-     `hatchrun / billing` check run with conclusion `action_required`,
-     no run in Postgres and no launch.
+     with a canceled `ci` subscription (lapsed). A push for its
+     repository gets one `hatchrun / billing` check run with conclusion
+     `action_required`, no run in Postgres and no launch. A third
+     tenant, installation 44, with no subscription at all, gets no check
+     run and no config read (the fake GitHub's `/_state` shows no
+     contents request for it).
 
-  The key for sealing comes from the local Secrets Store before
-  `wrangler dev` starts:
-  `npx --yes "$WRANGLER" secrets-store secret create <store id from wrangler.toml> --name ci-secrets-key-2026-10 --value "$(openssl rand -base64 32)" --scopes workers --persist-to "$tmp/ci-state"`
-  (run in `crates/ci`, local by default). The instance counts the
-  script waits for grow by one for `arm` and six for `wide`.
+  The instance counts the script waits for grow by two for `arm` and
+  `bad-ok` and six for `wide`.
 
-- [ ] **Step 1: Add the workflows** `arm` and `wide` to the fixture
-  config. The `bad` case cannot live there, since one bad label fails
-  the whole config at compile and the fake GitHub serves one directory
-  for every ref: the script appends the `bad` workflow to the repo copy
-  right before that push and restores the file after the check run
-  arrives.
+- [ ] **Step 1: Add the workflows** `arm`, `bad`, `bad-ok` and `wide` to
+  the fixture config, and the fake Polar route and installations 43 and
+  44 to `hatchrun-ci-dev`.
 
-- [ ] **Step 2: Add the scenarios** to `e2e.sh` and the header comment
-  that lists them.
+- [ ] **Step 2: Add the environment and the scenarios** to `e2e.sh`, and
+  the header comment that lists them.
 
 - [ ] **Step 3: Run it**
 
@@ -1619,6 +1927,6 @@ Expected: exit 0, ending with `e2e passed`.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/ci/scripts/e2e.sh crates/ci/tests/e2e crates/ci-dev
+git add crates/ci/scripts/e2e.sh crates/ci/tests/e2e crates/ci-dev .gitignore
 git commit -S -s -m "test(ci): cover templates, secrets, caps and the card in e2e"
 ```
