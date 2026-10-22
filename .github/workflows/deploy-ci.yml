@@ -3,7 +3,7 @@ name: deploy-ci
 # Deploys crates/ci, the hatchrun-ci Worker at ci.hatchrun.io that runs
 # hatchrun CI jobs, from main. It shares the database with hatchrun-cloud,
 # so this workflow applies the migrations too, as the owner role in
-# DATABASE_MIGRATE_URL, and it sets the 30 day retention of the
+# DATABASE_MIGRATE_URL, and it sets the 30 and 90 day retention of the
 # hatchrun-ci-logs bucket. The account comes from the
 # CLOUDFLARE_ACCOUNT_ID secret.
 #
@@ -125,7 +125,8 @@ jobs:
           test -n "$DATABASE_MIGRATE_URL"
           ../cloud/scripts/migrate.sh
 
-      # Objects under logs/ and state/ expire after 30 days. The rules
+      # Objects under logs/ and state/ expire after 30 or 90 days, by the
+      # prefix of the tenant's tier (logs/30d/, logs/90d/). The rules
       # replace the bucket's whole lifecycle, so r2-lifecycle.json is
       # all of it.
       - name: Set the log retention
