@@ -132,7 +132,7 @@ export function handleCiSettings(
       });
     } else if (sub === "checkout" && method === "POST") {
       if (billing.card) {
-        json(res, 409, { error: `${owner} already has a card` });
+        json(res, 409, { error: `${owner} already has a CI subscription; change the card or cancel it in the billing portal` });
       } else {
         billing.card = true;
         json(res, 200, { url: `/o/${owner}/ci?checkout=mock` });

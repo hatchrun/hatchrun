@@ -260,6 +260,18 @@ fn polar_failed(what: &str, err: &str) -> Stop {
     )
 }
 
+/// Why no checkout may start for `tenant`: it has an active or trialing
+/// CI subscription already, and a second would charge the same meter
+/// twice.
+fn checkout_refusal(tenant: &TenantRow) -> Option<String> {
+    (tenant.ci_billing == CiBilling::Active).then(|| {
+        format!(
+            "{} already has a CI subscription; change the card or cancel it in the billing portal",
+            tenant.org_login
+        )
+    })
+}
+
 async fn checkout(cx: &Cx<'_>, org: &str) -> Result<Served> {
     let tenant = match admin_tenant(cx, org).await? {
         Ok(tenant) => tenant,
@@ -268,11 +280,8 @@ async fn checkout(cx: &Cx<'_>, org: &str) -> Result<Served> {
     if let Err(stop) = polar_ready(cx) {
         return Ok(Err(stop));
     }
-    if tenant.ci_billing == CiBilling::Active {
-        return Ok(stop(
-            409,
-            format!("{} already has a card", tenant.org_login),
-        ));
+    if let Some(message) = checkout_refusal(&tenant) {
+        return Ok(stop(409, message));
     }
     let settings = cx.settings;
     let page = format!("{}/o/{}/ci", settings.app_url, tenant.org_login);
@@ -592,6 +601,20 @@ async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checkout_is_refused_while_a_ci_subscription_is_active() {
+        let tenant = |ci_billing| TenantRow {
+            id: "t1".into(),
+            org_login: "acme".into(),
+            ci_billing,
+            retention_days: 30,
+        };
+        let message = checkout_refusal(&tenant(CiBilling::Active)).unwrap();
+        assert!(message.contains("acme already has a CI subscription"));
+        assert_eq!(checkout_refusal(&tenant(CiBilling::Never)), None);
+        assert_eq!(checkout_refusal(&tenant(CiBilling::Lapsed)), None);
+    }
 
     #[test]
     fn routes_parse() {
