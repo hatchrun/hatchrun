@@ -75,15 +75,20 @@ export function Link({ href, onClick, ...rest }: AnchorHTMLAttributes<HTMLAnchor
   return <a href={href} onClick={follow} {...rest} />;
 }
 
-/** The parts of a `/ci/:owner/:repo[/runs/:run[/jobs/:job]]` path, null for any other. */
+/** The parts of a `/ci/:owner/:repo[/runs/:run[/jobs/:job] | /settings]` path, null for any other. */
 export interface CiRoute {
   owner: string;
   repo: string;
   run: string | null;
   job: string | null;
+  /** The repository's secrets and variables page. */
+  settings: boolean;
 }
 
 export function matchCi(path: string): CiRoute | null {
-  const found = /^\/ci\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)(?:\/runs\/(\d+)(?:\/jobs\/(\d+))?)?\/?$/.exec(path);
-  return found?.[1] && found[2] ? { owner: found[1], repo: found[2], run: found[3] ?? null, job: found[4] ?? null } : null;
+  const found =
+    /^\/ci\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)(?:\/runs\/(\d+)(?:\/jobs\/(\d+))?|(\/settings))?\/?$/.exec(path);
+  return found?.[1] && found[2]
+    ? { owner: found[1], repo: found[2], run: found[3] ?? null, job: found[4] ?? null, settings: found[5] !== undefined }
+    : null;
 }

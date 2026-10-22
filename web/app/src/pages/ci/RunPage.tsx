@@ -28,6 +28,7 @@ import { Link, navigate, useLocation, type CiRoute } from "@/router";
 import { SignIn } from "../SignIn";
 import { DispatchDialog } from "./DispatchDialog";
 import { JobLog } from "./JobLog";
+import { RepoSettings } from "./RepoSettings";
 
 /** How often a page with unfinished work reads again, in milliseconds. */
 const REFRESH_MS = 5000;
@@ -85,6 +86,9 @@ function useRefresh(active: boolean, reload: () => void) {
 }
 
 export function CiPages({ session, route }: { session: Session | null; route: CiRoute }) {
+  if (route.settings) {
+    return <RepoSettings session={session} owner={route.owner} repo={route.repo} />;
+  }
   if (route.run !== null && route.job !== null) {
     return <JobView session={session} route={route} run={route.run} job={route.job} />;
   }
@@ -128,9 +132,14 @@ function RepoRuns({ session, route }: { session: Session | null; route: CiRoute 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="display text-[26px] leading-[1.05]">Runs</h1>
         {session && (
-          <button type="button" className="button button-primary" onClick={() => setDispatching(true)}>
-            Run workflow
-          </button>
+          <div className="flex gap-2">
+            <Link href={`/ci/${owner}/${repo}/settings`} className="button">
+              Settings
+            </Link>
+            <button type="button" className="button button-primary" onClick={() => setDispatching(true)}>
+              Run workflow
+            </button>
+          </div>
         )}
       </div>
       <Await loaded={first} retry={reload}>

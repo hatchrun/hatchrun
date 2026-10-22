@@ -665,3 +665,62 @@ export interface DispatchRequest {
 /** Starts a workflow by hand; answers the ids of the runs it started. */
 export const dispatchWorkflow = (owner: string, repo: string, body: DispatchRequest) =>
   post<{ runs: number[] }>(`${repoPath(owner, repo)}/dispatch`, body);
+
+/** What /api/ci/orgs/:org/billing answers. */
+export interface CiBilling {
+  /** Whether a card is on file. */
+  card: boolean;
+  /** Runner minutes used this month, of every template. */
+  minutes: number;
+  /** Billing units used this month; a 2 vCPU minute is one unit. */
+  units: number;
+  freeUnits: number;
+  /** This month's cost past the free units, in cents. */
+  spendCents: number;
+  /** The monthly spend cap, in whole dollars. */
+  capDollars: number;
+  running: number;
+  maxRunning: number;
+}
+
+/**
+ * The range of the spend cap in whole dollars. The API enforces it and
+ * answers 422 outside it, but does not report it; these are the
+ * MIN_SPEND_CAP_MICROS and MAX_SPEND_CAP_MICROS of crates/workflow.
+ */
+export const CAP_MIN_DOLLARS = 50;
+export const CAP_MAX_DOLLARS = 10_000;
+
+const orgCiPath = (org: string) => `/api/ci/orgs/${encodeURIComponent(org)}`;
+
+export const getCiBilling = (org: string) => get<CiBilling>(`${orgCiPath(org)}/billing`);
+export const startCiCheckout = (org: string) => post<{ url: string }>(`${orgCiPath(org)}/billing/checkout`);
+export const openCiPortal = (org: string) => post<{ url: string }>(`${orgCiPath(org)}/billing/portal`);
+export const setCiCap = (org: string, capDollars: number) => put<undefined>(`${orgCiPath(org)}/billing/cap`, { capDollars });
+
+/** Whose secrets and variables: an organization's, or one repository's. */
+export type CiScope = { org: string } | { owner: string; repo: string };
+
+export type CiItemKind = "secrets" | "vars";
+
+const scopePath = (scope: CiScope) => ("org" in scope ? orgCiPath(scope.org) : repoPath(scope.owner, scope.repo));
+
+/** A secret as listed: never its value. Times are Unix milliseconds. */
+export interface CiSecret {
+  name: string;
+  updatedAt: number;
+}
+
+export interface CiVar extends CiSecret {
+  value: string;
+}
+
+export const listCiSecrets = (scope: CiScope) => get<CiSecret[]>(`${scopePath(scope)}/secrets`);
+export const listCiVars = (scope: CiScope) => get<CiVar[]>(`${scopePath(scope)}/vars`);
+
+/** Sets or replaces one secret or variable; the API uppercases the name. */
+export const putCiItem = (scope: CiScope, kind: CiItemKind, name: string, value: string) =>
+  put<undefined>(`${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`, { value });
+
+export const deleteCiItem = (scope: CiScope, kind: CiItemKind, name: string) =>
+  request<undefined>("DELETE", `${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`);
