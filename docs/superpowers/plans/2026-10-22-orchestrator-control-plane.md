@@ -88,7 +88,8 @@ line says otherwise.
 6. Plan 4 owns templates, secrets, billing. Plan 5 owns cache and
    artifacts.
 7. **Added:** CI runs only for tenants with `tenants.ci_enabled = true`
-   until Plan 4 adds the card requirement and caps.
+   until Plan 4 adds the card requirement and caps. `runs::create`
+   checks it, so webhooks, schedules and dispatch all respect it.
 8. **Added:** the one template, `ubuntu-latest` / `ubuntu-26.04`
    (amd64, 2 vCPU, 8 GB), launches hatchrun.io's built-in profile
    `hatchrun-2cpu` (general purpose `m` family, 4 GiB per vCPU, on
@@ -126,8 +127,8 @@ line says otherwise.
 - Times are Unix milliseconds in `bigint` columns, as in the existing
   schema; ids of runs and jobs are Postgres identities; GitHub ids are
   `bigint`.
-- GitHub calls per job: one check run create, one update per step end
-  and one at job end, never per log line. A `403` or `429` from GitHub
+- GitHub calls per job attempt: one check run create, one update per
+  step end and one at job end, never per log line (none at claim). A `403` or `429` from GitHub
   waits for `retry-after`, else for `x-ratelimit-reset` when
   `x-ratelimit-remaining` is `0`, else 60 s doubling per attempt up to
   900 s.
@@ -194,24 +195,41 @@ line says otherwise.
 - Modify: `crates/cloud/Cargo.toml`, `crates/cloud/src/lib.rs`,
   `crates/cloud/src/db.rs`, `crates/cloud/src/testdb.rs`,
   `crates/cloud/src/app/mod.rs`, `crates/cloud/src/tokens.rs`,
-  `crates/cloud/src/fetch.rs`, `.github/workflows/ci.yml`
+  `crates/cloud/src/fetch.rs`, `crates/cloud/src/http.rs`,
+  `crates/cloud/src/reconcile/time.rs`, every file that builds a
+  `http::Response { .. }` literal (find them with
+  `rg -l 'Response \{' crates/cloud/src`), `.github/workflows/ci.yml`
 
 **Interfaces:**
 - Produces (all reachable from `hatchrun_cloud::`):
+  - `http::Response` gains `pub headers: Vec<(String, String)>`
+    (names lowercased) and
+    `pub fn header(&self, name: &str) -> Option<&str>` (case-insensitive).
+    `fetch::send` and `Counted::send` fill it from the fetch answer.
+    Existing `Response { status, body }` literals add
+    `headers: Vec::new()`.
+  - `pub use reconcile::time::parse as parse_rfc3339;` with
+    `parse_rfc3339(value: &str) -> Option<u64>` (Unix ms)
   - features: `default = ["worker"]`, `worker = []` (the `#[event]`
     exports), `testdb = ["dep:tokio", "tokio-postgres/runtime"]`
   - `pub mod db` with `pub struct Db`, `pub enum Param`, and
     `params!` exported with `#[macro_export]` (callers write
     `hatchrun_cloud::params![..]`; inside the crate
-    `crate::db::params` keeps working through `pub use crate::params;`)
+    `crate::db::params` keeps working through `pub use crate::params;`).
+    `Db::{new, connect, run, all, first, rows, first_locked, batch}`
+    become `pub`.
   - `pub mod tokens` with `Tokens`, `Kv`, `App`, `Store`, `Mint`,
-    `Token`, `Error` public; `pub mod fetch` with `Sender`, `Counted`,
+    `Token`, `Error` public, and `Kv::new`, `App::{new, read}`,
+    `Tokens::{new, token, send}`, `Token::fresh` public;
+    `pub mod fetch` with `Sender`, `Counted` (and its `Default`),
     `send`; `pub mod webcrypto`
-  - `pub use app::Session;` with `Session::find(req: &Request, db: &Db)
-    -> Result<Option<Session>>`, `Session::csrf_ok`, and fields `id`,
-    `user`, `token` public
+  - `pub use app::{Session, UserRow};` with `UserRow` and its fields
+    public, `Session::find(req: &Request, db: &Db) -> Result<Option<Session>>`
+    and `Session::csrf_ok(&self, req: &Request) -> Result<bool>` public,
+    and fields `id`, `user`, `token` public
   - `pub mod testdb` when `any(test, feature = "testdb")` on non-wasm,
-    with `Db::new()`, `run`, `rows`, `first`, `all` public
+    with `url`, `Db::{new, connect, db, wait, run, try_run, batch, rows,
+    first, all}` and every other `pub(crate)` item in it public
 
 - [ ] **Step 1: Move the entry points.** Move `fetch`, `scheduled`,
   `queue` and the helpers only they use (`healthz`, `assets`,
@@ -226,7 +244,13 @@ line says otherwise.
   `testdb` with
   `#[cfg(all(not(target_arch = "wasm32"), any(test, feature = "testdb")))]`.
 
-- [ ] **Step 3: Check both builds and the tests**
+- [ ] **Step 3: Write the failing header test** in `http.rs`:
+  `header_lookup_ignores_case` (a `Response` with
+  `("retry-after", "30")` answers `header("Retry-After") == Some("30")`).
+  Run `cargo test -p hatchrun-cloud http`; expect FAIL, then add the
+  field, the method and the `fetch` change.
+
+- [ ] **Step 4: Check both builds and the tests**
 
 Run:
 ```bash
@@ -234,10 +258,11 @@ cargo test -p hatchrun-cloud
 cargo check -p hatchrun-cloud --target wasm32-unknown-unknown
 cargo check -p hatchrun-cloud --no-default-features --target wasm32-unknown-unknown
 ```
-Expected: all tests pass unchanged; both checks build. Add the
+Expected: all tests pass (only `Response` literals gain
+`headers: Vec::new()`); both checks build. Add the
 `--no-default-features` check to the wasm step of `.github/workflows/ci.yml`.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add crates/cloud .github/workflows/ci.yml
@@ -251,7 +276,11 @@ git commit -S -s -m "refactor(cloud): gate worker entry points behind a feature 
 **Files:**
 - Create: `crates/cloud/src/start.rs`
 - Modify: `crates/cloud/src/launch.rs`, `crates/cloud/src/lib.rs`,
-  `crates/cloud/src/aws/ec2.rs`
+  `crates/cloud/src/aws/ec2.rs`, `crates/cloud/src/tokens.rs` and
+  `crates/cloud/src/app/aws.rs` (both import `app_jwt` /
+  `tenant_credentials` from `crate::launch` today; they import from
+  `crate::start` instead, and `app/aws.rs` calls `role_credentials`
+  with `subject_tenant` = the tenant id)
 
 **Interfaces:**
 - Consumes: Task 1 visibility.
@@ -359,12 +388,17 @@ pub struct RepoRow { pub id: u64, pub tenant_id: String, pub installation_id: u6
 pub struct NewRun { pub tenant_id: String, pub repo_id: u64, pub workflow: String,
     pub delivery: String, pub event: String, pub git_ref: String, pub sha: String,
     pub actor: String, pub now: u64 }
-pub struct RunRow { pub id: u64, pub run_number: u64, pub run_attempt: u32, /* NewRun fields */ }
+pub struct RunRow { pub id: u64, pub run_number: u64, pub run_attempt: u32, pub status: String,
+    pub conclusion: Option<String>, pub created_at: u64, pub completed_at: Option<u64>,
+    /* NewRun fields */ }
 pub struct NewJob { pub plan_id: String, pub name: String, pub timeout_minutes: u32 }
-pub struct JobRow { pub id: u64, pub run_id: u64, pub plan_id: String, pub status: String,
-    pub conclusion: Option<String>, pub instance_id: Option<String>, pub attempt: u32,
-    pub launch_attempts: u32, pub timeout_minutes: u32, pub updated_at: u64,
-    pub heartbeat_at: Option<u64>, pub completed_at: Option<u64> }
+pub struct JobRow { pub id: u64, pub run_id: u64, pub plan_id: String, pub name: String,
+    pub status: String, pub conclusion: Option<String>, pub instance_id: Option<String>,
+    pub attempt: u32, pub launch_attempts: u32, pub next_launch_at: Option<u64>,
+    pub timeout_minutes: u32, pub updated_at: u64, pub heartbeat_at: Option<u64>,
+    pub started_at: Option<u64>, pub completed_at: Option<u64>,
+    pub steps: serde_json::Value, pub log_key: Option<String> }
+pub struct ScheduleRow { pub repo_id: u64, pub workflow: String, pub cron: String }
 
 pub async fn tenant_for_installation(db: &Db, installation_id: u64) -> Result<Option<TenantRow>>;
 pub async fn upsert_repo(db: &Db, repo: &RepoRow, now: u64) -> Result<()>;
@@ -373,8 +407,19 @@ pub async fn repo_by_name(db: &Db, full_name: &str) -> Result<Option<RepoRow>>;
 pub async fn delivery_seen(db: &Db, guid: &str) -> Result<bool>;
 pub async fn record_delivery(db: &Db, guid: &str, event: &str, now: u64) -> Result<()>;
 pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>>; // None on (delivery, workflow) conflict
-pub async fn insert_jobs(db: &Db, run_id: u64, jobs: &[NewJob], now: u64) -> Result<Vec<(String, u64)>>;
+pub async fn insert_jobs(db: &Db, run_id: u64, jobs: &[NewJob], now: u64) -> Result<Vec<(String, u64)>>; // status 'waiting'
+pub async fn run(db: &Db, run_id: u64) -> Result<Option<RunRow>>;
+pub async fn runs_for_repo(db: &Db, repo_id: u64, before: Option<u64>, limit: u32) -> Result<Vec<RunRow>>; // id < before, newest first
+pub async fn jobs_for_run(db: &Db, run_id: u64) -> Result<Vec<JobRow>>;     // plan order (id)
+pub async fn open_jobs(db: &Db, limit: u32) -> Result<Vec<JobRow>>;         // status <> 'completed', oldest updated_at first
+pub async fn jobs_by_ids(db: &Db, ids: &[u64]) -> Result<Vec<JobRow>>;      // for orphan checks
 pub async fn job(db: &Db, job_id: u64) -> Result<Option<JobRow>>;
+pub async fn start_job(db: &Db, job_id: u64, now: u64) -> Result<()>;       // running, started_at = heartbeat_at = now
+pub async fn reset_job(db: &Db, job_id: u64, attempt: u32, now: u64) -> Result<()>;
+    // status 'waiting', attempt, launch_attempts 0, conclusion, instance_id, launch_error,
+    // next_launch_at, heartbeat_at, started_at, completed_at and log_key NULL, steps '[]'
+pub async fn run_started(db: &Db, run_id: u64, now: u64) -> Result<()>;     // queued -> in_progress
+pub async fn reopen_run(db: &Db, run_id: u64, now: u64) -> Result<u32>;     // in_progress, conclusion NULL, run_attempt + 1; returns it
 pub async fn set_job(db: &Db, job_id: u64, status: &str, conclusion: Option<&str>, now: u64) -> Result<()>;
 pub async fn claim_launch(db: &Db, job_id: u64, now: u64) -> Result<Option<JobRow>>; // queued -> launching
 pub async fn launched(db: &Db, job_id: u64, instance_id: &str, now: u64) -> Result<()>;
@@ -384,7 +429,11 @@ pub async fn finish_job(db: &Db, job_id: u64, conclusion: &str, steps: &serde_js
     log_key: Option<&str>, now: u64) -> Result<()>;
 pub async fn finish_run(db: &Db, run_id: u64, conclusion: &str, now: u64) -> Result<()>;
 pub async fn replace_schedules(db: &Db, repo_id: u64, schedules: &[(String, String)]) -> Result<()>; // (workflow, cron)
-pub async fn sweep(db: &Db, now: u64) -> Result<u64>;
+pub async fn schedules(db: &Db, limit: u32) -> Result<Vec<ScheduleRow>>;
+pub async fn lease(db: &Db, now: u64, until: u64) -> Result<bool>;         // takes ci_reconciler when lease_until < now
+pub async fn last_minute(db: &Db) -> Result<Option<u64>>;
+pub async fn set_last_minute(db: &Db, minute_ms: u64) -> Result<()>;
+pub async fn sweep(db: &Db, now: u64) -> Result<Vec<u64>>;                 // ids of the runs it deleted
 ```
 
 `crates/cloud/migrations/0004_ci.sql` (the plan fixes this schema):
@@ -572,8 +621,14 @@ This task's `lib.rs` has `#[event(fetch)]` answering 404 for every path.
     // job status 'queued': first claim Some with launch_attempts 1,
     // second None; status is 'launching'
 #[test] fn sweep_deletes_expired_runs_and_old_deliveries()
-    // run expires_at < now is gone with its jobs; delivery older than
-    // 7 days gone, newer kept
+    // run expires_at < now is gone with its jobs and its id returned;
+    // delivery older than 30 days gone, newer kept
+#[test] fn reset_job_clears_the_attempt()
+    // after start_job + finish_job, reset_job(id, 2): status waiting,
+    // attempt 2, launch_attempts 0, heartbeat_at None, steps []
+#[test] fn start_job_sets_the_heartbeat()   // heartbeat_at == started_at == now
+#[test] fn reopen_run_counts_attempts()     // completed run -> in_progress, returns 2
+#[test] fn lease_is_taken_once()            // lease(now, now+55s) true, again false
 #[test] fn replace_schedules_replaces_the_repo_rows()
 ```
 
@@ -586,7 +641,9 @@ Expected: FAIL, functions not defined.
   each SQL string in a `const` with a doc comment saying what it binds,
   as `crates/cloud/src/jobs.rs` does. `sweep` deletes `ci_runs` with
   `expires_at < now` (jobs cascade) and `ci_deliveries` with
-  `received_at < now - 7 days`.
+  `received_at < now - 30 days`, and returns the deleted run ids so the
+  reconciler can purge their objects. The migration inserts the one
+  `ci_reconciler` row (`id 1, lease_until 0`).
 
 - [ ] **Step 4: Run the tests and the wasm build**
 
@@ -775,14 +832,14 @@ pub fn launchable(template: &Template) -> Result<(), String>;
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test -p hatchrun-ci intake planning`
+Run: `cargo test -p hatchrun-ci`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement** both modules.
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test -p hatchrun-ci intake planning`
+Run: `cargo test -p hatchrun-ci`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -801,7 +858,8 @@ git commit -S -s -m "feat(ci): read GitHub events and select the workflows they 
 - Modify: `crates/ci/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `hatchrun_cloud::http::{Request, Response}`.
+- Consumes: `hatchrun_cloud::http::{Request, Response}`, with
+  `Response::header` (Task 1) for the rate limit headers.
 - Produces, in `hatchrun_ci::github` (requests as data, like
   `crates/cloud/src/github.rs`; every request sets
   `Accept: application/vnd.github+json`,
@@ -911,30 +969,40 @@ pub enum Action {
 }
 impl Graph {
     pub fn new(jobs: Vec<(u64, PlannedJob)>) -> Self;
-    pub fn advance(&mut self, github: &Value) -> Vec<Action>;
+    pub fn advance(&mut self, github_ctx: &Value) -> Vec<Action>;
     pub fn running(&mut self, job: u64);
-    pub fn finished(&mut self, job: u64, result: JobResult, github: &Value) -> Vec<Action>;
-    pub fn failed(&mut self, job: u64, message: String, github: &Value) -> Vec<Action>;
-    pub fn cancel(&mut self, github: &Value) -> Vec<Action>;
+    pub fn finished(&mut self, job: u64, result: JobResult, github_ctx: &Value) -> Vec<Action>;
+    pub fn failed(&mut self, job: u64, message: String, github_ctx: &Value) -> Vec<Action>;
+    pub fn cancel(&mut self, github_ctx: &Value) -> Vec<Action>;
     pub fn escalate(&mut self) -> Vec<Action>;      // running jobs with cancel 1 -> 2
-    pub fn rerun(&mut self, job: u64, github: &Value) -> Vec<Action>;
+    pub fn rerun(&mut self, job: u64, github_ctx: &Value) -> Vec<Action>;
     pub fn needs(&self, job: u64) -> BTreeMap<String, Need>;
     pub fn conclusion(&self) -> Option<Conclusion>; // None while any job is not Done
     pub fn node(&self, job: u64) -> Option<&Node>;
 }
 ```
 
+  `github_ctx` is the expression context's `github` object, built by
+  `run::github_context` (Task 9): a JSON object with `repository`,
+  `repository_owner`, `sha`, `ref`, `ref_name`, `ref_type`, `head_ref`,
+  `base_ref`, `actor`, `event_name`, `event`, `workflow`, `run_id`,
+  `run_number`, `run_attempt`, `server_url`, `api_url`, and no token. It
+  is not `JobDocument.github` (the typed `Github` struct, which carries
+  the token and is built separately by `run::github_struct`).
+
   `advance` looks at each `Waiting` node whose `requires` are all `Done`,
   in plan order:
-  - the graph is cancelled: `Done(Cancelled)`;
   - `JobKind::Approval`: `Done(Skipped)`, message `Approval jobs come in a later release.`;
   - `launchable` fails: `Done(Failure)` with its message;
   - otherwise evaluate `job_condition(job.if_, ctx)` where `ctx` is
-    `{"github": github, "needs": needs, "matrix": job.matrix, "vars": {}, "inputs": github.event.inputs or {}}`
-    and `status()` is `Success` when every need succeeded, else
-    `Failure`; `hashFiles` returns an error. `true` → `Queued` +
-    `Launch`; `false` → `Done(Skipped)`; an error → `Done(Failure)` with
-    `if: <error>`.
+    `{"github": github_ctx, "needs": needs, "matrix": job.matrix, "vars": {}, "inputs": github_ctx.event.inputs or {}}`
+    and `status()` is `Cancelled` when the graph is cancelled, else
+    `Success` when every need succeeded, else `Failure`; `hashFiles`
+    returns an error. `true` → `Queued` + `Launch`; `false` →
+    `Done(Cancelled)` when the graph is cancelled, else `Done(Skipped)`;
+    an error → `Done(Failure)` with `if: <error>`. As on GitHub, after a
+    cancel only jobs whose `if:` calls `always()` or `cancelled()` and
+    is true still run.
   Every `Done` set here also emits `Finished`. When all nodes are `Done`
   it emits `RunDone` once with: `Failure` if any failed, else
   `Cancelled` if any was cancelled, else `Success` if any succeeded,
@@ -946,11 +1014,15 @@ impl Graph {
   `outputs` merge the members' `result.outputs` in plan order, a later
   non-empty value replacing an earlier one.
 
-  `cancel` marks the graph cancelled, ends `Waiting` and `Queued` nodes
-  as `Cancelled`, and sets `cancel = 1` on `Running` nodes with a
-  `Cancel` action. `rerun` resets the job and every job that requires
-  it, directly or not, to `Waiting` with `attempt + 1`, clears
-  `cancelled`, then advances.
+  `cancel` marks the graph cancelled, sets `cancel = 1` on `Running`
+  nodes with a `Cancel` action, and re-evaluates each `Queued` node's
+  `if:` with status `Cancelled`: false ends it as `Cancelled` (its queue
+  message finds the row `completed` and is dropped), true keeps it.
+  `Waiting` nodes stay and meet the same rule in `advance`. `rerun`
+  resets the job and every job that requires it, directly or not, to
+  `Waiting` with `attempt + 1`, `result`, `message` and `cancel`
+  cleared, clears `cancelled` and the emitted `RunDone`, then advances,
+  so `RunDone` fires again when the rerun ends.
 
 - [ ] **Step 1: Write the failing tests** in `graph.rs`, building
   plans with `hatchrun_workflow::compile` from small inline configs:
@@ -967,6 +1039,8 @@ impl Graph {
 #[test] fn approval_is_skipped_with_a_message()
 #[test] fn unsupported_template_fails_before_launch()
 #[test] fn cancel_ends_waiting_and_signals_running()
+#[test] fn always_job_still_runs_after_cancel() // b requires a, if: always(); cancel while a runs; a cancelled -> Launch(b)
+#[test] fn rerun_emits_run_done_again()
 #[test] fn escalate_raises_cancel_to_two()
 #[test] fn rerun_resets_dependents()          // a, b requires a; rerun(a) -> a attempt 2 Queued, b Waiting
 #[test] fn run_done_is_emitted_once()
@@ -1020,10 +1094,12 @@ pub fn details_url(app_url: &str, repo: &str, run_id: u64, job_id: u64) -> Strin
 pub struct StepView { pub index: usize, pub name: String, pub summary: Option<StepSummary> }
 pub struct JobView<'a> {
     pub workflow: &'a str, pub node: &'a Node, pub head_sha: &'a str, pub details_url: String,
-    pub steps: &'a [StepView], pub annotations: &'a [Annotation],
+    pub steps: &'a [StepView],
+    pub annotations: &'a [Annotation],   // every annotation of the attempt, as stored
+    pub file_annotations_sent: usize,    // how many with a file GitHub already has
     pub failed_tail: Option<&'a [String]>, pub started_at: Option<u64>, pub completed_at: Option<u64>,
 }
-pub fn render(view: &JobView<'_>) -> CheckRun;
+pub fn render(view: &JobView<'_>) -> (CheckRun, usize);   // the request and the new file_annotations_sent
 pub fn annotation(a: &Annotation) -> Option<GhAnnotation>;
 
 pub struct Outbox { /* serde */ }
@@ -1044,9 +1120,14 @@ impl Outbox {
   with ` in <m>m <s>s` when both times are known. The summary is the
   node's `message` (if any) as a paragraph, then a Markdown table
   `| Step | Result | Time |` with one row per step. `text` is the failed
-  tail in a fenced block, if any. Annotations: the first
-  `MAX_ANNOTATIONS` that `annotation` maps; one without `file` is
-  listed in the summary instead (`- **error**: message`). Levels map
+  tail in a fenced block, if any. Every render works from the whole
+  stored list. Annotations without `file` are listed in the summary
+  (`- **error**: message`) on every update, since each PATCH replaces
+  `output.summary`. Annotations with a file go in `output.annotations`,
+  but only those past `file_annotations_sent`, because GitHub appends
+  the annotations of each request to the ones it has; resending them
+  would duplicate them. At most `MAX_ANNOTATIONS` with a file are sent
+  per job attempt. Levels map
   `Error` → `failure`, `Warning` → `warning`, `Notice` → `notice`;
   `start_line` defaults to 1, `end_line` to `start_line`; columns are
   sent only when `start_line == end_line`.
@@ -1064,6 +1145,9 @@ impl Outbox {
     // Annotation { level: Error, file: Some("src/a.rs"), line: Some(3), .. } -> path src/a.rs, start 3, end 3, failure
 #[test] fn annotation_without_a_file_goes_in_the_summary()
 #[test] fn caps_annotations_at_fifty()
+#[test] fn later_updates_keep_every_summary_annotation()
+    // two file-less and one file annotation; render with sent 1 -> summary lists both
+    // file-less ones, output.annotations empty, returned sent still 1
 #[test] fn outbox_keeps_only_the_latest_state_while_blocked()
     // mark(1); throttled(now, 60); mark(1); mark(1); due(now+59s) empty; due(now+60s) == [1]
 #[test] fn next_alarm_is_the_unblock_time()
@@ -1107,7 +1191,9 @@ git commit -S -s -m "feat(ci): render check runs and coalesce their updates"
   as in Task 3's `wrangler.toml`; `GITHUB_API_URL` and
   `AWS_ENDPOINT_URL` override for development, as in cloud), and
   `pub fn run_stub(env: &Env, run_id: u64) -> Result<Stub>` (DO named
-  `run_id.to_string()` in `RUNS`).
+  `run_id.to_string()` in `RUNS`). `Settings::read` accepts empty
+  `CI_ROLE_ARN`, `CI_LAUNCH_TEMPLATE_ID` and `CI_SUBNET_IDS`; the `Ec2`
+  backend refuses to launch with them empty.
 - Produces, in `hatchrun_ci::run`: `#[durable_object] pub struct RunObject`
   and its internal routes, called only by this Worker through
   `run_stub` (host `https://run`):
@@ -1121,6 +1207,7 @@ git commit -S -s -m "feat(ci): render check runs and coalesce their updates"
 | `POST /failed?job=ID` | `{ "message": "..." }` | `204` |
 | `POST /cancel` | none | `204` |
 | `POST /rerun?job=ID` | none | `204` |
+| `POST /purge` | none | `204` (deletes all storage; idempotent) |
 | `GET /state` | none | `200 RunState` (graph nodes, step views) |
 
 ```rust
@@ -1131,51 +1218,89 @@ pub struct RunInfo { pub run_id: u64, pub run_number: u64, pub run_attempt: u32,
 ```
 
   Storage keys: `info` (RunInfo), `graph` (Graph), `outbox` (Outbox),
-  `event` (payload; when its JSON is over 1 MiB the `commits` array is
-  replaced by `[]`), `job:<id>` (`JobState { check_run_id: Option<u64>,
-  steps: Vec<StepView>, annotations: Vec<Annotation>, annotations_sent:
-  usize, started_at, completed_at, last_seq: u64, github_token:
+  `deadlines` (Deadlines), `event` (payload; when its JSON is over
+  1 MiB the `commits` array is replaced by `[]`), `job:<id>`
+  (`JobState { check_run_id: Option<u64>, steps: Vec<StepView>,
+  annotations: Vec<Annotation>, file_annotations_sent: usize,
+  started_at, completed_at, last_seq: u64, github_token:
   Option<String>, heartbeat_written_at: u64 }`).
+
+```rust
+/// Everything the object's single alarm waits for.
+pub struct Deadlines { pub escalate_at: Option<u64>, pub upload_retry_at: Option<u64>,
+    pub purge_at: Option<u64> }
+pub(crate) fn next_alarm(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) -> Option<u64>; // earliest of all
+pub(crate) fn github_context(info: &RunInfo, event: &Value, api: &str) -> Value;   // graph's github_ctx
+pub(crate) fn github_struct(info: &RunInfo, api: &str, token: &str) -> Github;     // JobDocument.github
+```
+
+  A Durable Object has one alarm. Every handler and `alarm()` end by
+  setting it to `next_alarm(..)` (or deleting it when `None`).
+  `alarm()` runs, in order, each part whose time has come: the outbox
+  flush, cancel escalation (`escalate_at`), R2 upload retries (Task 10)
+  and the purge.
 
   Behaviour:
   - `/start` stores everything, marks every job in the outbox (creates
-    its check run), runs `advance` with the `github` context built from
-    `RunInfo` and executes the actions.
+    its check run), calls `store::run_started`, runs `advance` with
+    `github_context(..)` and executes the actions. The same value is
+    passed to every graph call.
   - `Launch(job)` → `store::set_job(job, "queued")` and
     `CI_LAUNCHES.send({"job_id": job})`.
   - `Finished` → `store::finish_job` (steps JSON, log key from Task 10),
     mark the outbox, revoke the job's GitHub token if one is held.
-  - `RunDone` → `store::finish_run`.
+  - `RunDone` → `store::finish_run`, then, once no job has a pending
+    upload (Task 10) and the outbox is empty, the object writes
+    `{info, graph, event}` to R2 at `state/<tenant>/<run>.json` and sets
+    `purge_at` to now; the purge deletes all storage
+    (`storage.delete_all()`). A later route on an empty object (only
+    `/rerun` and `/state` can arrive) first loads that snapshot back.
+    The reconciler's 30 day sweep calls `/purge` as a backstop.
   - `/claim` builds the `JobDocument`: `run_id` = `run_id` as text,
     `job` = the node's `PlannedJob`, `needs` = `graph.needs(job)`,
     `secrets`/`vars`/`timings` empty, `cache: None`, `github` from
     `RunInfo` with `server_url` `https://github.com`, `api_url` and
     `graphql_url` from `Settings.github_api`, `token` = the body's
-    token (kept in `job:<id>`). It moves the node to `Running`, writes
-    `running` and `started_at`, marks the outbox.
+    token (kept in `job:<id>`), with `github = github_struct(..)`. It
+    moves the node to `Running` and calls `store::start_job`, which sets
+    `started_at` and `heartbeat_at`. It does not mark the outbox: the
+    check run shows `in_progress` from the first step end, which keeps
+    GitHub calls to the per-step budget.
   - `/events` (step part): `StepStarted`/`StepFinished` update
     `steps`, and `StepFinished` marks the outbox; `Annotation` appends.
-    Batches with `seq <= last_seq` are ignored and answered with the
-    current cancel count. `store::heartbeat` is written at most every
+    Batches for a node that is not `Running` answer `409`. Batches with
+    `seq <= last_seq` are ignored and answered with the current cancel
+    count. `store::heartbeat` is written at most every
     30 s per job. The `Line` part is Task 10's.
   - `/result` → `graph.finished`; `/failed` → `graph.failed`; `/cancel`
-    → `graph.cancel` and an alarm in 5 minutes that calls `escalate`;
-    `/rerun` → `graph.rerun`, new check runs for the reset jobs.
-  - The alarm flushes the outbox: for each due job, render and send
-    (`create_check_run` when no id, else `update_check_run`, with only
-    annotations not sent yet) using the installation token from
-    `Tokens`. A throttled answer calls `Outbox::throttled` with
-    `github::throttle`'s wait and stops the flush. Every route that
-    marks the outbox sets the alarm to now. The alarm is set again to
-    `next_alarm`.
+    → `graph.cancel` and `escalate_at = now + 5 min`, whose alarm calls
+    `escalate`.
+  - `/rerun` → `graph.rerun`. For each reset job the object replaces
+    `job:<id>` with a fresh `JobState` (so `last_seq` is 0,
+    `check_run_id` is `None`, steps and annotations are empty, the old
+    token is revoked first), deletes its `LogWriter` and `log:<id>:*`
+    chunks, and calls `store::reset_job` with the new attempt. It calls
+    `store::reopen_run` and stores the returned `run_attempt` in
+    `info`. The new attempt's log overwrites the old R2 object at the
+    same key; earlier attempts' logs are not kept. The outbox marks the
+    reset jobs, so each gets a new check run.
+  - The outbox flush: for each due job, render (Task 8) and send
+    `create_check_run` when there is no id, else `update_check_run`,
+    using the installation token from `Tokens`, then store the returned
+    `file_annotations_sent`. A throttled answer calls
+    `Outbox::throttled` with `github::throttle(response, now,
+    outbox.attempt())` and stops the flush.
 
 - [ ] **Step 1: Write the failing tests.** The object itself only runs
   in a Worker; its decisions are plain functions in `run.rs` tested
   natively:
 
 ```rust
-#[test] fn github_context_for_a_push()      // github_context(&info, &event) has ref, sha, event_name, repository, event
-#[test] fn job_document_for_a_claim()       // job_document(&info, &graph, job, event, token, api) needs and token set, secrets empty
+#[test] fn github_context_for_a_push()      // github_context(&info, &event, api) has ref, sha, event_name, repository, event, no token
+#[test] fn github_struct_carries_the_token() // github_struct(&info, api, "t").token == "t"
+#[test] fn job_document_for_a_claim()       // job_document(&info, &graph, job, token, api) needs and token set, secrets empty
+#[test] fn next_alarm_is_the_earliest_deadline() // outbox due at 50, escalate 40, upload 60 -> Some(40); all None -> None
+#[test] fn fresh_state_after_rerun_takes_seq_one() // apply_steps on a reset JobState with seq 1 is applied
 #[test] fn repeated_batch_does_not_finish_a_step_twice() // apply_steps(state, batch seq 3) twice -> one StepFinished applied
 #[test] fn heartbeat_written_every_thirty_seconds()       // should_write_heartbeat(last, now)
 ```
@@ -1186,7 +1311,8 @@ Run: `cargo test -p hatchrun-ci run`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement** `env.rs` and `run.rs` (`github_context`,
-  `job_document`, `apply_steps`, `should_write_heartbeat` as `pub(crate)`
+  `github_struct`, `next_alarm`, `job_document`, `apply_steps`,
+  `should_write_heartbeat` as `pub(crate)`
   functions, the object on top).
 
 - [ ] **Step 4: Run the tests and the wasm build**
@@ -1251,7 +1377,9 @@ pub fn tail(text: &str, from: u64, lines: usize) -> Vec<String>;   // last lines
   deletes the `log:<job>:*` keys, and passes `log_key` to
   `store::finish_job`. The failed tail for the check run (Task 8) comes
   from `tail` over the failed step. When the R2 write fails the chunks
-  stay, `upload_pending` is set in `job:<id>`, and the alarm retries.
+  stay, `upload_pending` is set in `job:<id>`, and
+  `Deadlines.upload_retry_at` is set to now + 30 s; the alarm (Task 9's
+  `next_alarm`) retries every pending upload then.
 
 - [ ] **Step 1: Write the failing tests** in `logs.rs`
 
@@ -1269,7 +1397,7 @@ pub fn tail(text: &str, from: u64, lines: usize) -> Vec<String>;   // last lines
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test -p hatchrun-ci logs run`
+Run: `cargo test -p hatchrun-ci`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement** `logs.rs` and the object's log routes.
@@ -1313,7 +1441,11 @@ pub async fn create(env: &Env, db: &Db, settings: &Settings, tokens: &Tokens<'_,
     req: &Request<'_>, now: u64) -> worker::Result<Vec<u64>>;   // run ids created
 ```
 
-  `create` reads the config at `sha` (no config: no runs), selects the
+  `create` first checks the tenant: missing or `ci_enabled = false`
+  returns no runs and logs `hatchrun CI is not enabled for tenant <id>`.
+  The webhook, the schedules (Task 15) and dispatch (Task 16) all start
+  runs through `create`, so the check holds for each. It then reads the
+  config at `sha` (no config: no runs), selects the
   plans, and for `Invalid` creates one completed check run named
   `hatchrun / config` with conclusion `failure`, the diagnostics as
   annotations on `.hatchrun/config.yml` (line and column from the
@@ -1327,8 +1459,11 @@ pub async fn create(env: &Env, db: &Db, settings: &Settings, tokens: &Tokens<'_,
   1. `401` unless `webhook::verify` passes with `GITHUB_WEBHOOK_SECRET`;
   2. `200 {"duplicate": guid}` when `store::delivery_seen`;
   3. `intake::parse`; `Ignored(reason)` answers `200 {"ignored": reason}`;
-  4. the tenant by installation; missing or `ci_enabled = false` answers
-     `200 {"ignored": "hatchrun CI is not enabled for this organization"}`;
+  4. the tenant by installation; missing answers
+     `200 {"ignored": "no tenant for this installation"}`, and
+     `ci_enabled = false` answers
+     `200 {"ignored": "hatchrun CI is not enabled for this organization"}`
+     (an early answer; `create` checks again);
   5. `store::upsert_repo`;
   6. Push: `create` with `Event::Push { ref, changed }`, `compile_ref` =
      ref. When the ref is `refs/heads/<default_branch>`,
@@ -1337,7 +1472,9 @@ pub async fn create(env: &Env, db: &Db, settings: &Settings, tokens: &Tokens<'_,
      `pull_files` (`MAX_CHANGED` = 300), `Event::PullRequest`,
      `compile_ref` = `refs/heads/<base_ref>`, `sha` = head sha,
      `git_ref` = `refs/pull/<n>/merge`. Rerequested: `POST /rerun` on the
-     job's run object (job and run looked up with `store::job`);
+     job's run object (job and run looked up with `store::job` and
+     `store::run`), only when the run's `repo_id` equals the event's
+     repository id, else `Ignored("check run of another repository")`;
   7. `store::record_delivery`, then `202 {"runs": [ids]}`.
   Any error answers `500`, so GitHub records a failed delivery.
 
@@ -1365,7 +1502,7 @@ pub async fn create(env: &Env, db: &Db, settings: &Settings, tokens: &Tokens<'_,
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test -p hatchrun-ci runs webhook && cargo test -p hatchrun-cloud forwards`
+Run: `cargo test -p hatchrun-ci && cargo test -p hatchrun-cloud forwards`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement** `runs.rs`, `webhook.rs`, the
@@ -1449,7 +1586,8 @@ pub fn user_data(broker_url: &str, ticket: &str) -> String;
   base64url of 32 random bytes; job token with `token::sign` and
   `lifetime_secs(timeout_minutes)`; `Backend::launch` with name
   `ci-<job>-<launch_attempts>`; store
-  `{"config": BootDocument JSON, "expiresIn": 900}` at
+  `{"config": <serde_json::to_string(&BootDocument)>, "expiresIn": 900}`
+  (the broker's `config` is a string and it refuses unknown fields) at
   `PUT {BROKER_URL}/v1/tickets/{ticket}` with `Authorization: Bearer
   BROKER_TOKEN` (terminate the instance when that fails);
   `store::launched`. A failure with `Cause::NoCapacity` or
@@ -1457,7 +1595,13 @@ pub fn user_data(broker_url: &str, ticket: &str) -> String;
   `store::launch_failed(retry_at = now + 30 s)` and back to `queued`;
   any other failure, or the third, posts `/failed` to the run object
   with the failure's message. The dead-letter consumer posts `/failed`
-  with `the launch did not finish`.
+  with `the launch did not finish`. The decision is
+
+```rust
+pub enum Next { Retry { at_ms: u64 }, Fail }
+pub fn next_step(cause: &Cause, launch_attempts: u32, now_ms: u64) -> Next;
+    // NoCapacity | Unreachable with launch_attempts < 3 -> Retry { now_ms + 30_000 }; else Fail
+```
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1468,12 +1612,14 @@ pub fn user_data(broker_url: &str, ticket: &str) -> String;
 #[test] fn user_data_selects_the_ci_path()    // JSON has mode "ci", broker, ticket
 #[test] fn the_profile_is_two_vcpu_amd64_on_demand()
     // choose(&built_in(PROFILE).unwrap(), "us-east-1", ...) -> vcpus 2, memory_gib 8, arch Amd64
-#[test] fn retries_capacity_twice_then_fails() // next_step(Cause::NoCapacity, attempts 1/2/3)
+#[test] fn retries_capacity_twice_then_fails()
+    // next_step(&Cause::NoCapacity, 1, 0) == Retry { at_ms: 30_000 }; (.., 2, ..) Retry; (.., 3, ..) Fail
+#[test] fn broker_body_holds_the_document_as_text() // broker_body(&doc)["config"] is a string that parses as BootDocument
 ```
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test -p hatchrun-ci launcher launches`
+Run: `cargo test -p hatchrun-ci`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement** both modules and the `#[event(queue)]`
@@ -1512,8 +1658,11 @@ git commit -S -s -m "feat(ci): launch job instances from a queue in the ci accou
   for `CLAIM_PATH`, `EVENTS_PATH` and `RESULT_PATH`:
   - every route: `401` unless the bearer token verifies with
     `CI_TOKEN_KEY` at the current time;
-  - claim: the job row must be `launched` or `running` with an
-    instance, else `409`. Call `metadata_off`, then poll
+  - claim: a row in `launching` (the instance can boot before
+    `store::launched` runs, and always does with the local launcher)
+    or in `queued` answers `503`; `launched` or `running` with an
+    instance goes on; `waiting` or `completed` answers `409`. Call
+    `metadata_off`, then poll
     `metadata_applied` every 500 ms for up to 10 s; still pending
     answers `503`. Then mint a token with `scoped_token` and pass it to
     the object's `/claim`, answering its document;
@@ -1522,6 +1671,11 @@ git commit -S -s -m "feat(ci): launch job instances from a queue in the ci accou
   - `pub(crate) fn claim_step(applied: bool, waited_ms: u64) -> ClaimStep`
     with `enum ClaimStep { Ready, Wait, Retry }` holds the poll decision
     (`Wait` below 10 000 ms, `Retry` at or past it).
+  - `pub(crate) fn authorize(header: Option<&str>, key: &[u8], now_secs: u64) -> Result<Claims, TokenError>`
+    reads `Bearer <token>` and calls `token::verify`.
+  - `pub(crate) fn claim_answer(row: &JobRow, claims: &Claims) -> ClaimAnswer`
+    with `enum ClaimAnswer { Go, Retry, Ended, Refused }` (`Refused`
+    when `claims.run != row.run_id`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1529,7 +1683,8 @@ git commit -S -s -m "feat(ci): launch job instances from a queue in the ci accou
 #[test] fn claim_waits_until_metadata_is_applied()
     // claim_step(false, 0) == Wait; claim_step(false, 10_000) == Retry; claim_step(true, 0) == Ready
 #[test] fn bad_token_is_unauthorized()   // authorize("Bearer x", key, now) is Err
-#[test] fn job_of_another_run_is_refused() // claims.run != row.run_id -> Err
+#[test] fn job_of_another_run_is_refused() // claim_answer(row run 1, claims run 2) == Refused
+#[test] fn launching_job_is_retried()      // claim_answer(status launching) == Retry; completed == Ended
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -1588,6 +1743,10 @@ git commit -S -s -m "feat(ci): hand jobs to agents once instance metadata is off
     capped at 8 MiB; past it `Line`s are dropped and counted, and the
     next batch starts with `Line { text: "[hatchrun] <n> lines were dropped while the control plane was unreachable" }`.
     Step and annotation events are never dropped.
+  - `pub struct CiOptions { pub exec: exec::Options, pub claim_timeout: Duration }`
+    built from the `Ci` flags. The flusher stops sending on `409` (the
+    job ended or was reset) and on `401`, and the job is then cancelled
+    through the watch (count 2).
   - `ci::run(user_data: Vec<u8>, opts: CiOptions) -> Result<i32>`:
     ticket → `HttpBroker::claim` loop → `BootDocument` → `Client::claim`
     → `run_job` with the `HttpSink` → `Flusher::close` →
@@ -1606,6 +1765,7 @@ git commit -S -s -m "feat(ci): hand jobs to agents once instance metadata is off
 #[tokio::test] async fn retries_with_the_same_seq()      // first POST 500, second has seq 1 and the same events
 #[tokio::test] async fn cancel_from_reply_reaches_the_watch() // reply {"cancel":1} -> watch == 1
 #[tokio::test] async fn heartbeat_when_idle()            // no events for 10 s -> empty batch posted
+#[tokio::test] async fn unauthorized_stops_the_job()     // events answered 401 -> watch == 2, no more POSTs
 #[tokio::test] async fn drops_lines_past_the_cap_and_says_so()
 #[tokio::test] async fn claim_retries_until_ready()      // 503, 503, 200 -> Job
 #[tokio::test] async fn ended_job_is_not_run()           // 409 -> Claim::Ended
@@ -1670,7 +1830,8 @@ impl Cron {
   1. **Schedules.** For each minute after `last_minute` up to the
      current one (at most 5), every `ci_schedules` row whose `Cron`
      matches starts a run through `runs::create` with event name
-     `schedule`, `Event::Schedule { cron }`, ref and sha of the default
+     `schedule`, `Event::Schedule { cron }`, event payload
+     `{"schedule": cron, "repository": {"full_name": ..}}`, ref and sha of the default
      branch head (`commit_sha`), delivery
      `schedule:<repo>:<workflow>:<cron>:<minute ms>`; at most 200 per
      pass. Then `last_minute` advances.
@@ -1680,12 +1841,17 @@ impl Cron {
      `the launch did not finish`. `launched` with
      `updated_at < now - 600 s`: terminate and `/failed` with
      `the runner did not start`.
-  3. **Lost runners.** `running` with `heartbeat_at < now - 120 s`:
+  3. **Lost runners.** `running` with
+     `COALESCE(heartbeat_at, started_at) < now - 120 s` (`start_job`
+     sets both at claim):
      terminate and `/failed` with `lost contact with the runner`.
   4. **Orphans.** `Backend::instances()`: terminate each instance whose
      job is unknown, completed more than 180 s ago, or whose launch time
-     is more than 7 hours ago.
-  5. **Retention.** `store::sweep`.
+     is more than 7 hours ago. `Described.launch_time` is read with
+     `hatchrun_cloud::parse_rfc3339` (Task 1); one that does not parse
+     counts as old.
+  5. **Retention.** `store::sweep`, then `POST /purge` on the object of
+     each run id it returns.
   Each step's decisions are a pure function over rows and `now`
   (`stalled(&[JobRow], now) -> Vec<Fix>`, `orphans(&[Described], &[JobRow], now) -> Vec<String>`)
   with `enum Fix { Requeue(u64), Fail(u64, &'static str), TerminateAndFail(u64, String, &'static str) }`.
@@ -1784,7 +1950,7 @@ git commit -S -s -m "feat(ci): fire schedules and reconcile launches, runners an
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test -p hatchrun-ci api access && cargo test -p hatchrun-cloud forwards_ci`
+Run: `cargo test -p hatchrun-ci && cargo test -p hatchrun-cloud forwards_ci`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement** both modules, the routes in `lib.rs` and
@@ -1882,8 +2048,8 @@ git commit -S -s -m "feat(app): show orchestrator runs and live job logs"
   applies `r2-lifecycle.json` with
   `wrangler r2 bucket lifecycle set hatchrun-ci-logs --file r2-lifecycle.json`,
   sets the `CI_*` vars from repository variables, and deploys
-  `crates/ci`. `r2-lifecycle.json` expires objects under `logs/` after
-  30 days.
+  `crates/ci`. `r2-lifecycle.json` expires objects under `logs/` and
+  `state/` after 30 days.
 
 - [ ] **Step 1: Write the stack** and lint it.
 
@@ -1941,7 +2107,9 @@ the workflow's first run.
     `DIR/<id>/user-data.json` and starts
     `PATH ci --user-data <file> --work-dir DIR/<id>/work --runner-user "" --state-dir DIR/<id>/state --env-file /dev/null`;
     `DELETE` kills the process group; `GET /_events` lists
-    `launch <id>`, `metadata-off <id>`, `exit <id> <code>` in order.
+    `launch <id>`, `metadata-off <id>`, `metadata-read <id>` (each
+    `GET /instances/{id}` that answered `applied`) and
+    `exit <id> <code>` in the order they happened.
 - Produces: `crates/ci/scripts/e2e.sh`, run from the repository root
   with no arguments on Linux:
   1. Postgres: `E2E_DATABASE_URL`, else start `postgres:17` in Docker
@@ -1970,7 +2138,11 @@ the workflow's first run.
      annotation; `GET /api/ci/runs/<run>` lists both jobs `completed`;
      `GET /api/ci/jobs/<build job>/log` contains `hello from e2e`;
      its `/log/index` names the step `say hello`; the launcher's events
-     show `metadata-off <id>` for every launched instance and each
+     show, for every launched instance, `metadata-off <id>` before
+     `metadata-read <id>` (a `GET /instances/{id}` answered `applied`)
+     and both before `exit <id> 0`. The claim needs an `applied` answer
+     before it returns the document, so this order shows the job ran
+     with metadata off; each
      agent exited 0. Print `e2e passed` and exit 0; on failure print
      the `wrangler dev` and launcher logs and exit 1.
 
