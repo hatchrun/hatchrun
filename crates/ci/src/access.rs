@@ -75,16 +75,24 @@ pub enum Verdict {
     Retry(u64),
     /// GitHub failed (5xx).
     Broken(u16),
+    /// GitHub's repository of that name is not the stored one: the name
+    /// was renamed away or taken over. No access.
+    Moved,
 }
 
-/// Classifies the answer of [`github::user_repo`] at `now_secs`.
+/// Classifies the answer of [`github::user_repo`] for repository
+/// `repo_id` at `now_secs`. A name can come to mean another repository,
+/// so a 200 that names a different id (or none) is [`Verdict::Moved`].
 #[must_use]
-pub fn classify(response: &hatchrun_cloud::http::Response, now_secs: u64) -> Verdict {
+pub fn classify(response: &hatchrun_cloud::http::Response, repo_id: u64, now_secs: u64) -> Verdict {
     if let Some(wait) = github::throttle(response, now_secs, 0) {
         return Verdict::Retry(wait);
     }
     if response.status >= 500 {
         return Verdict::Broken(response.status);
+    }
+    if response.status == 200 && github::repo_id(response) != Some(repo_id) {
+        return Verdict::Moved;
     }
     Verdict::Known(github::permissions(response))
 }
@@ -169,11 +177,12 @@ pub async fn resolve(
             repo.full_name
         )))
     })?;
-    match classify(&response, now / 1000) {
+    match classify(&response, repo.id, now / 1000) {
         Verdict::Known(p) => {
             remember(key, p, now);
             Ok(from_permissions(repo.private, Some(p)))
         }
+        Verdict::Moved => Ok(Access::None),
         Verdict::Retry(wait) => Err(Failure::Retry(wait)),
         Verdict::Broken(status) => Err(Failure::Worker(worker::Error::RustError(format!(
             "{}: GitHub answered {status}",
@@ -290,38 +299,54 @@ mod tests {
             ],
             "",
         );
-        assert_eq!(classify(&limited, 1000), Verdict::Retry(90));
-        assert_eq!(classify(&answer(429, &[], ""), 1000), Verdict::Retry(60));
+        assert_eq!(classify(&limited, 1, 1000), Verdict::Retry(90));
+        assert_eq!(classify(&answer(429, &[], ""), 1, 1000), Verdict::Retry(60));
         let secondary = answer(403, &[], "You have exceeded a secondary rate limit");
-        assert_eq!(classify(&secondary, 1000), Verdict::Retry(60));
+        assert_eq!(classify(&secondary, 1, 1000), Verdict::Retry(60));
     }
 
     #[test]
     fn other_answers_are_permissions_or_a_failure() {
-        assert_eq!(classify(&answer(502, &[], ""), 0), Verdict::Broken(502));
+        assert_eq!(classify(&answer(502, &[], ""), 1, 0), Verdict::Broken(502));
         let none = Verdict::Known(Permissions {
             read: false,
             write: false,
             admin: false,
         });
-        assert_eq!(classify(&answer(404, &[], ""), 0), none);
+        assert_eq!(classify(&answer(404, &[], ""), 1, 0), none);
         assert_eq!(
-            classify(&answer(403, &[], "Resource not accessible"), 0),
+            classify(&answer(403, &[], "Resource not accessible"), 1, 0),
             none
         );
         let ok = answer(
             200,
             &[],
-            r#"{"private": true, "permissions": {"pull": true, "push": true}}"#,
+            r#"{"id": 1, "private": true, "permissions": {"pull": true, "push": true}}"#,
         );
         assert_eq!(
-            classify(&ok, 0),
+            classify(&ok, 1, 0),
             Verdict::Known(Permissions {
                 read: true,
                 write: true,
                 admin: false
             })
         );
+    }
+
+    #[test]
+    fn another_repository_under_the_name_gets_no_access() {
+        let admin = |id: &str| {
+            answer(
+                200,
+                &[],
+                &format!(
+                    r#"{{{id}"private": false, "permissions": {{"pull": true, "push": true, "admin": true}}}}"#
+                ),
+            )
+        };
+        assert!(matches!(classify(&admin(r#""id": 1,"#), 1, 0), Verdict::Known(p) if p.admin));
+        assert_eq!(classify(&admin(r#""id": 2,"#), 1, 0), Verdict::Moved);
+        assert_eq!(classify(&admin(""), 1, 0), Verdict::Moved);
     }
 
     #[test]

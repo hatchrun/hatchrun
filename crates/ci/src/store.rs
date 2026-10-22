@@ -804,6 +804,16 @@ async fn mark_usage(
 pub async fn upsert_repo(db: &Db, repo: &RepoRow, now: u64) -> Result<()> {
     db.batch(&[
         (FREE_REPO_NAME, params![repo.id, &repo.full_name]),
+        // A repository that changes tenant leaves its secrets and vars
+        // behind, as GitHub does on transfer.
+        (
+            "DELETE FROM ci_secrets WHERE repo_id = $1 AND tenant_id <> $2",
+            params![repo.id, &repo.tenant_id],
+        ),
+        (
+            "DELETE FROM ci_vars WHERE repo_id = $1 AND tenant_id <> $2",
+            params![repo.id, &repo.tenant_id],
+        ),
         (
             UPSERT_REPO,
             params![
@@ -1915,6 +1925,38 @@ mod tests {
         // The old run is still there, under its own tenant.
         let old = db.wait(run(db.db(), before.id)).unwrap().unwrap();
         assert_eq!(old.tenant_id, "t1");
+    }
+
+    #[test]
+    fn a_transferred_repo_leaves_its_secrets_and_vars_behind() {
+        let db = setup();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 100, 0, 0)",
+            &[],
+        );
+        put_secret_ok(&db, Some(7), "REPO_S", "k", "s1");
+        put_secret_ok(&db, None, "ORG_S", "k", "s2");
+        put_var_ok(&db, Some(7), "REPO_V", "1");
+        put_var_ok(&db, None, "ORG_V", "2");
+        // Re-registering the repository under its own tenant keeps them.
+        let mut same = db.wait(repo(db.db(), 7)).unwrap().unwrap();
+        db.wait(upsert_repo(db.db(), &same, 6)).unwrap();
+        assert_eq!(
+            db.wait(secret_names(db.db(), "t1", Some(7))).unwrap().len(),
+            1
+        );
+        same.tenant_id = "t2".into();
+        same.installation_id = 100;
+        db.wait(upsert_repo(db.db(), &same, 7)).unwrap();
+        assert_eq!(
+            db.wait(secret_names(db.db(), "t1", Some(7))).unwrap().len(),
+            0
+        );
+        assert_eq!(db.wait(vars(db.db(), "t1", Some(7))).unwrap().len(), 0);
+        // The old organization's own rows stay.
+        assert_eq!(db.wait(secret_names(db.db(), "t1", None)).unwrap().len(), 1);
+        assert_eq!(db.wait(vars(db.db(), "t1", None)).unwrap().len(), 1);
     }
 
     #[test]

@@ -329,6 +329,22 @@ pub struct Permissions {
     pub admin: bool,
 }
 
+/// The id GitHub's answer to [`user_repo`] gives the repository, `None`
+/// for any answer but a 200 with an id.
+#[must_use]
+pub fn repo_id(response: &Response) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Repo {
+        id: u64,
+    }
+    if response.status != 200 {
+        return None;
+    }
+    serde_json::from_slice::<Repo>(&response.body)
+        .ok()
+        .map(|repo| repo.id)
+}
+
 /// What the answer of [`user_repo`] says. Any answer but 200 gives no
 /// permissions; a public repository can be read by anyone.
 #[must_use]
@@ -721,6 +737,16 @@ mod tests {
         };
         assert!(permissions(&body(r#"{"pull":true,"push":true,"admin":true}"#)).admin);
         assert!(!permissions(&body(r#"{"pull":true,"push":true,"maintain":true}"#)).admin);
+    }
+
+    #[test]
+    fn the_answer_names_the_repository_by_id() {
+        assert_eq!(
+            repo_id(&answer(200, &[], r#"{"id":7,"private":false}"#)),
+            Some(7)
+        );
+        assert_eq!(repo_id(&answer(200, &[], r#"{"private":false}"#)), None);
+        assert_eq!(repo_id(&answer(404, &[], r#"{"id":7}"#)), None);
     }
 
     #[test]
