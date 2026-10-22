@@ -5,8 +5,8 @@
 //! Sealed CI secrets.
 //!
 //! A value is sealed with AES-256-GCM under a fresh 96-bit nonce. The
-//! associated data names the tenant, the scope (a repository id, or the
-//! organization), the kind (always a secret: vars are not sealed) and
+//! associated data names the tenant, the scope (a repository id, an
+//! environment of a repository, or the organization), the kind (always a secret: vars are not sealed) and
 //! the name, so a ciphertext copied to another tenant, repository or
 //! name does not open. The row keeps the id of the key that sealed it;
 //! [`Keyring`] holds the current key and, while a rotation runs, the
@@ -22,7 +22,7 @@ use base64::engine::general_purpose::STANDARD;
 use hatchrun_workflow::SecretRefs;
 use worker::Env;
 
-use crate::store::SealedRow;
+use crate::store::{Owner, SealedRow};
 
 /// The most bytes a secret or var value may have.
 pub const MAX_VALUE_BYTES: usize = 48 * 1024;
@@ -120,17 +120,22 @@ fn parse_key(text: &str) -> Option<[u8; 32]> {
 pub struct Aad<'a> {
     /// The tenant.
     pub tenant: &'a str,
-    /// The repository, or `None` for the organization.
-    pub repo_id: Option<u64>,
+    /// Whose row it is.
+    pub owner: Owner,
     /// The secret's name, already uppercased.
     pub name: &'a str,
 }
 
 impl Aad<'_> {
     fn bytes(&self) -> Vec<u8> {
-        let scope = self
-            .repo_id
-            .map_or_else(|| "org".to_owned(), |id| id.to_string());
+        let scope = match self.owner {
+            Owner::Org => "org".to_owned(),
+            Owner::Repo(id) => id.to_string(),
+            Owner::Environment {
+                repo_id,
+                environment_id,
+            } => format!("{repo_id}/env/{environment_id}"),
+        };
         format!(
             "hatchrun-ci-secret\0{}\0{scope}\0{}",
             self.tenant, self.name
@@ -235,8 +240,8 @@ pub fn reseal(
 }
 
 /// The values `refs` names (all of them when `refs.all`), from the
-/// organization's and the repository's rows; a repository row wins over
-/// an organization row of the same name. A name with no row is left out.
+/// organization's, the repository's and the environment's rows; the
+/// most specific row of a name wins. A name with no row is left out.
 ///
 /// # Errors
 ///
@@ -248,13 +253,12 @@ pub fn job_secrets(
     keyring: &Keyring,
     tenant: &str,
 ) -> Result<BTreeMap<String, String>, (String, SecretError)> {
-    // Organization rows first, so the repository's replace them.
+    // Organization rows first, then the repository's, then the
+    // environment's, so each replaces the one before.
     let mut chosen: BTreeMap<&str, &SealedRow> = BTreeMap::new();
-    for row in rows
-        .iter()
-        .filter(|row| row.repo_id.is_none())
-        .chain(rows.iter().filter(|row| row.repo_id.is_some()))
-    {
+    let mut ordered: Vec<&SealedRow> = rows.iter().collect();
+    ordered.sort_by_key(|row| specificity(row.owner()));
+    for row in ordered {
         if refs.all || refs.names.contains(&row.name) {
             chosen.insert(&row.name, row);
         }
@@ -263,7 +267,7 @@ pub fn job_secrets(
     for (name, row) in chosen {
         let aad = Aad {
             tenant,
-            repo_id: row.repo_id,
+            owner: row.owner(),
             name,
         };
         let value =
@@ -271,6 +275,15 @@ pub fn job_secrets(
         out.insert(name.to_owned(), value);
     }
     Ok(out)
+}
+
+/// 0 for the organization, 1 for a repository, 2 for an environment.
+fn specificity(owner: Owner) -> u8 {
+    match owner {
+        Owner::Org => 0,
+        Owner::Repo(_) => 1,
+        Owner::Environment { .. } => 2,
+    }
 }
 
 /// A random nonce from the Web Crypto RNG.
@@ -343,7 +356,7 @@ mod tests {
     fn aad(name: &str) -> Aad<'_> {
         Aad {
             tenant: "t1",
-            repo_id: Some(7),
+            owner: Owner::Repo(7),
             name,
         }
     }
@@ -367,11 +380,11 @@ mod tests {
                 ..aad("A")
             },
             Aad {
-                repo_id: Some(8),
+                owner: Owner::Repo(8),
                 ..aad("A")
             },
             Aad {
-                repo_id: None,
+                owner: Owner::Org,
                 ..aad("A")
             },
         ];
@@ -515,15 +528,16 @@ mod tests {
         assert_eq!(parse_key("%%"), None);
     }
 
-    fn row(repo_id: Option<u64>, name: &str, value: &str) -> SealedRow {
+    fn row(owner: Owner, name: &str, value: &str) -> SealedRow {
         let ring = ring();
         let aad = Aad {
             tenant: "t1",
-            repo_id,
+            owner,
             name,
         };
         SealedRow {
-            repo_id,
+            repo_id: owner.repo_id(),
+            environment_id: owner.environment_id(),
             name: name.into(),
             key_id: ring.current.id.clone(),
             sealed: seal(&ring.current, &aad, random_nonce(), value),
@@ -540,23 +554,66 @@ mod tests {
     #[test]
     fn repo_value_wins() {
         let rows = [
-            row(None, "NPM_TOKEN", "org"),
-            row(Some(7), "NPM_TOKEN", "repo"),
+            row(Owner::Org, "NPM_TOKEN", "org"),
+            row(Owner::Repo(7), "NPM_TOKEN", "repo"),
         ];
         let got = job_secrets(&refs(false, &["NPM_TOKEN"]), &rows, &ring(), "t1").unwrap();
         assert_eq!(got, BTreeMap::from([("NPM_TOKEN".into(), "repo".into())]));
     }
 
     #[test]
+    fn the_most_specific_row_wins() {
+        let env = Owner::Environment {
+            repo_id: 7,
+            environment_id: 1,
+        };
+        // Handed over in no particular order.
+        let rows = [
+            row(env, "T", "env"),
+            row(Owner::Org, "T", "org"),
+            row(Owner::Repo(7), "T", "repo"),
+        ];
+        let got = job_secrets(&refs(false, &["T"]), &rows, &ring(), "t1").unwrap();
+        assert_eq!(got, BTreeMap::from([("T".into(), "env".into())]));
+    }
+
+    #[test]
+    fn environment_values_are_bound_to_their_environment() {
+        let ring = ring();
+        let env = |environment_id| Owner::Environment {
+            repo_id: 7,
+            environment_id,
+        };
+        let at = |owner| Aad {
+            tenant: "t1",
+            owner,
+            name: "A",
+        };
+        let sealed = seal(&ring.current, &at(env(1)), random_nonce(), PLAIN);
+        assert_eq!(open(&ring, "2026-10", &at(env(1)), &sealed).unwrap(), PLAIN);
+        for other in [env(2), Owner::Repo(7), Owner::Org] {
+            assert_eq!(
+                open(&ring, "2026-10", &at(other), &sealed),
+                Err(SecretError::Corrupt)
+            );
+        }
+        // Organization and repository values open as before.
+        for owner in [Owner::Org, Owner::Repo(7)] {
+            let sealed = seal(&ring.current, &at(owner), random_nonce(), PLAIN);
+            assert_eq!(open(&ring, "2026-10", &at(owner), &sealed).unwrap(), PLAIN);
+        }
+    }
+
+    #[test]
     fn only_named_secrets_go() {
-        let rows = [row(Some(7), "A", "a"), row(Some(7), "B", "b")];
+        let rows = [row(Owner::Repo(7), "A", "a"), row(Owner::Repo(7), "B", "b")];
         let got = job_secrets(&refs(false, &["A"]), &rows, &ring(), "t1").unwrap();
         assert_eq!(got, BTreeMap::from([("A".into(), "a".into())]));
     }
 
     #[test]
     fn all_refs_send_every_secret() {
-        let rows = [row(Some(7), "A", "a"), row(None, "B", "b")];
+        let rows = [row(Owner::Repo(7), "A", "a"), row(Owner::Org, "B", "b")];
         let got = job_secrets(&refs(true, &[]), &rows, &ring(), "t1").unwrap();
         assert_eq!(got.len(), 2);
     }
@@ -569,7 +626,7 @@ mod tests {
 
     #[test]
     fn unreadable_secret_names_itself() {
-        let mut bad = row(Some(7), "A", "a");
+        let mut bad = row(Owner::Repo(7), "A", "a");
         bad.key_id = "retired".into();
         let err = job_secrets(&refs(false, &["A"]), &[bad], &ring(), "t1").unwrap_err();
         assert_eq!(err, ("A".into(), SecretError::UnknownKey("retired".into())));

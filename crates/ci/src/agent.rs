@@ -419,12 +419,12 @@ async fn read_values(
         serde_json::from_value(row.secret_refs.clone()).map_err(|e| unavailable(&e))?;
     let names: Vec<String> = refs.names.iter().cloned().collect();
     let rows = if refs.all {
-        store::sealed_secrets(db, &repo.tenant_id, repo.id, None).await
+        store::sealed_secrets(db, &repo.tenant_id, repo.id, None, None).await
     } else {
-        store::sealed_secrets(db, &repo.tenant_id, repo.id, Some(&names)).await
+        store::sealed_secrets(db, &repo.tenant_id, repo.id, None, Some(&names)).await
     }
     .map_err(|e| unavailable(&e))?;
-    let vars = store::job_vars(db, &repo.tenant_id, repo.id)
+    let vars = store::job_vars(db, &repo.tenant_id, repo.id, None)
         .await
         .map_err(|e| unavailable(&e))?;
     if rows.is_empty() {
@@ -584,6 +584,11 @@ mod tests {
             token_permissions: serde_json::json!({}),
             secret_refs: serde_json::json!({ "all": false, "names": [] }),
             held: None,
+            environment: None,
+            approval_attempt: None,
+            approval_decision: None,
+            approval_by: None,
+            approval_at: None,
         }
     }
 

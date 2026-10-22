@@ -32,7 +32,7 @@ use crate::api::{Cx, Served, Stop, body_cap, name, no_content, now_ms, reply, st
 use crate::billing;
 use crate::launches;
 use crate::secrets::{self, Aad, Keyring};
-use crate::store::{self, Put, TenantRow};
+use crate::store::{self, Owner, Put, TenantRow};
 
 /// Where a secret or variable lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,8 +276,7 @@ impl Kind {
 /// Whose rows a request reads or changes.
 struct Target {
     tenant: String,
-    /// `None` for the organization's own rows.
-    repo_id: Option<u64>,
+    owner: Owner,
     /// The organization login or `owner/repo`, for messages.
     label: String,
 }
@@ -289,7 +288,7 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
     match scope {
         Scope::Org(org) => Ok(admin_tenant(cx, org).await?.map(|tenant| Target {
             tenant: tenant.id,
-            repo_id: None,
+            owner: Owner::Org,
             label: tenant.org_login,
         })),
         Scope::Repo { owner, repo } => {
@@ -298,7 +297,7 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
                 .await?
                 .map(|repo| Target {
                     tenant: repo.tenant_id,
-                    repo_id: Some(repo.id),
+                    owner: Owner::Repo(repo.id),
                     label: repo.full_name,
                 }))
         }
@@ -354,7 +353,7 @@ async fn list_secrets(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
         Ok(target) => target,
         Err(stop) => return Ok(Err(stop)),
     };
-    let rows = store::secret_names(cx.db, &target.tenant, target.repo_id).await?;
+    let rows = store::secret_names(cx.db, &target.tenant, target.owner).await?;
     let list: Vec<_> = rows
         .into_iter()
         .map(|(name, updated)| json!({ "name": name, "updatedAt": updated }))
@@ -367,7 +366,7 @@ async fn list_vars(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
         Ok(target) => target,
         Err(stop) => return Ok(Err(stop)),
     };
-    let rows = store::vars(cx.db, &target.tenant, target.repo_id).await?;
+    let rows = store::vars(cx.db, &target.tenant, target.owner).await?;
     let list: Vec<_> = rows
         .into_iter()
         .map(|(name, value, updated)| json!({ "name": name, "value": value, "updatedAt": updated }))
@@ -402,15 +401,15 @@ async fn put_secret(
     let nonce = secrets::fresh_nonce().map_err(worker::Error::RustError)?;
     let aad = Aad {
         tenant: &target.tenant,
-        repo_id: target.repo_id,
+        owner: target.owner,
         name: &name,
     };
     let sealed = secrets::seal(&keyring.current, &aad, nonce, &value);
-    let max = limit(target.repo_id.is_some());
+    let max = limit(target.owner != Owner::Org);
     let put = store::put_secret(
         cx.db,
         &target.tenant,
-        target.repo_id,
+        target.owner,
         &name,
         &keyring.current.id,
         &sealed,
@@ -440,11 +439,11 @@ async fn put_var(
         Ok(value) => value,
         Err(stop) => return Ok(Err(stop)),
     };
-    let max = limit(target.repo_id.is_some());
+    let max = limit(target.owner != Owner::Org);
     let put = store::put_var(
         cx.db,
         &target.tenant,
-        target.repo_id,
+        target.owner,
         &name,
         &value,
         max,
@@ -471,8 +470,8 @@ async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result
         Err(stop) => return Ok(Err(stop)),
     };
     let existed = match kind {
-        Kind::Secrets => store::delete_secret(cx.db, &target.tenant, target.repo_id, &name).await?,
-        Kind::Vars => store::delete_var(cx.db, &target.tenant, target.repo_id, &name).await?,
+        Kind::Secrets => store::delete_secret(cx.db, &target.tenant, target.owner, &name).await?,
+        Kind::Vars => store::delete_var(cx.db, &target.tenant, target.owner, &name).await?,
     };
     if existed {
         no_content().map(Ok)

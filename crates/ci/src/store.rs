@@ -144,6 +144,8 @@ pub struct NewJob {
     pub token_permissions: BTreeMap<String, Level>,
     /// The secrets the job reads.
     pub secret_refs: SecretRefs,
+    /// The environment the job names.
+    pub environment: Option<String>,
 }
 
 /// A recorded job.
@@ -194,9 +196,19 @@ pub struct JobRow {
     /// The secrets the job reads, a JSON object.
     #[serde(deserialize_with = "json_text")]
     pub secret_refs: serde_json::Value,
-    /// Why the queued job waits for a launch: `card`, `spend_cap` or
-    /// `concurrency`.
+    /// Why the queued job waits for a launch: `card`, `spend_cap`,
+    /// `concurrency` or `approval`.
     pub held: Option<String>,
+    /// The environment the job names.
+    pub environment: Option<String>,
+    /// The attempt the approval below is for.
+    pub approval_attempt: Option<u32>,
+    /// `approved` or `rejected`.
+    pub approval_decision: Option<String>,
+    /// The GitHub login of whoever decided.
+    pub approval_by: Option<String>,
+    /// When they decided.
+    pub approval_at: Option<u64>,
 }
 
 /// A schedule of a workflow.
@@ -225,7 +237,8 @@ const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, work
 const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instance_id, attempt, \
      launch_attempts, next_launch_at, timeout_minutes, updated_at, heartbeat_at, started_at, \
      completed_at, steps::text AS steps, log_key, template, \
-     token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held";
+     token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held, \
+     environment, approval_attempt, approval_decision, approval_by, approval_at";
 
 /// The columns of a [`TenantRow`]. `ci_billing` is `active` for an
 /// active or trialing subscription, `lapsed` for another one, `never`
@@ -816,14 +829,18 @@ async fn mark_usage(
 pub async fn upsert_repo(db: &Db, repo: &RepoRow, now: u64) -> Result<()> {
     db.batch(&[
         (FREE_REPO_NAME, params![repo.id, &repo.full_name]),
-        // A repository that changes tenant leaves its secrets and vars
-        // behind, as GitHub does on transfer.
+        // A repository that changes tenant leaves its secrets, vars and
+        // environments behind, as GitHub does on transfer.
         (
             "DELETE FROM ci_secrets WHERE repo_id = $1 AND tenant_id <> $2",
             params![repo.id, &repo.tenant_id],
         ),
         (
             "DELETE FROM ci_vars WHERE repo_id = $1 AND tenant_id <> $2",
+            params![repo.id, &repo.tenant_id],
+        ),
+        (
+            "DELETE FROM ci_environments WHERE repo_id = $1 AND tenant_id <> $2",
             params![repo.id, &repo.tenant_id],
         ),
         (
@@ -929,15 +946,16 @@ pub async fn insert_jobs(
     let mut values = Vec::new();
     let mut bound = params![run_id, now];
     for (i, job) in jobs.iter().enumerate() {
-        let base = 3 + i * 6;
+        let base = 3 + i * 7;
         values.push(format!(
-            "($1, ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, 'waiting', $2, $2)",
+            "($1, ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, ${}, 'waiting', $2, $2)",
             base,
             base + 1,
             base + 2,
             base + 3,
             base + 4,
-            base + 5
+            base + 5,
+            base + 6
         ));
         bound.push(Param::from(&job.plan_id));
         bound.push(Param::from(&job.name));
@@ -949,10 +967,11 @@ pub async fn insert_jobs(
         bound.push(Param::from(
             serde_json::to_string(&job.secret_refs).map_err(worker::Error::from)?,
         ));
+        bound.push(Param::from(job.environment.as_deref()));
     }
     let sql = format!(
         "INSERT INTO ci_jobs (run_id, plan_id, name, timeout_minutes, template, \
-         token_permissions, secret_refs, status, created_at, updated_at) \
+         token_permissions, secret_refs, environment, status, created_at, updated_at) \
          VALUES {} RETURNING plan_id, id",
         values.join(", ")
     );
@@ -1570,7 +1589,56 @@ pub async fn claims_by_bucket(db: &Db, since: u64) -> Result<Vec<(String, u64, u
 }
 
 // Secrets and vars. A secret's value is sealed (see `crate::secrets`);
-// a var's is plain text. `repo_id` None is the organization's row.
+// a var's is plain text. An [`Owner`] says whose row it is.
+
+/// Where a secret or var row lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    /// The organization.
+    Org,
+    /// A repository.
+    Repo(u64),
+    /// An environment of a repository.
+    Environment {
+        /// The environment's repository.
+        repo_id: u64,
+        /// The environment.
+        environment_id: u64,
+    },
+}
+
+impl Owner {
+    /// The repository, `None` for the organization.
+    #[must_use]
+    pub fn repo_id(self) -> Option<u64> {
+        match self {
+            Owner::Org => None,
+            Owner::Repo(repo_id) | Owner::Environment { repo_id, .. } => Some(repo_id),
+        }
+    }
+
+    /// The environment, if the row is an environment's.
+    #[must_use]
+    pub fn environment_id(self) -> Option<u64> {
+        match self {
+            Owner::Environment { environment_id, .. } => Some(environment_id),
+            _ => None,
+        }
+    }
+
+    /// From a row's columns: an environment row also has its repository.
+    #[must_use]
+    pub fn of(repo_id: Option<u64>, environment_id: Option<u64>) -> Owner {
+        match (repo_id, environment_id) {
+            (Some(repo_id), Some(environment_id)) => Owner::Environment {
+                repo_id,
+                environment_id,
+            },
+            (Some(repo_id), None) => Owner::Repo(repo_id),
+            (None, _) => Owner::Org,
+        }
+    }
+}
 
 /// Whether a secret or var was stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1581,29 +1649,35 @@ pub enum Put {
     TooMany,
 }
 
-/// Stores secret `$3` of tenant `$1` and scope `$2` ($6 is the limit,
-/// $7 the time). A new name is refused at the limit; replacing one
-/// never is. Returns a row when it stored.
-const PUT_SECRET: &str = "INSERT INTO ci_secrets (tenant_id, repo_id, name, key_id, sealed, updated_at) \
-     SELECT $1, $2::bigint, $3, $4, $5, $7 \
+/// Stores secret `$4` of tenant `$1`, repository `$2` and environment
+/// `$3` ($7 is the limit, $8 the time). A new name is refused at the
+/// limit; replacing one never is. Returns a row when it stored.
+const PUT_SECRET: &str = "INSERT INTO ci_secrets \
+       (tenant_id, repo_id, environment_id, name, key_id, sealed, updated_at) \
+     SELECT $1, $2::bigint, $3::bigint, $4, $5, $6, $8 \
      WHERE EXISTS (SELECT 1 FROM ci_secrets WHERE tenant_id = $1 \
-         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3) \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint \
+         AND environment_id IS NOT DISTINCT FROM $3::bigint AND name = $4) \
        OR (SELECT count(*) FROM ci_secrets WHERE tenant_id = $1 \
-         AND repo_id IS NOT DISTINCT FROM $2::bigint) < $6 \
-     ON CONFLICT (tenant_id, repo_id, name) DO UPDATE SET key_id = EXCLUDED.key_id, \
-       sealed = EXCLUDED.sealed, updated_at = EXCLUDED.updated_at \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint \
+         AND environment_id IS NOT DISTINCT FROM $3::bigint) < $7 \
+     ON CONFLICT (tenant_id, repo_id, environment_id, name) DO UPDATE SET \
+       key_id = EXCLUDED.key_id, sealed = EXCLUDED.sealed, updated_at = EXCLUDED.updated_at \
      RETURNING 1 AS saved";
 
-/// As [`PUT_SECRET`], for a var with value `$4`; `$5` is the limit and
-/// `$6` the time.
-const PUT_VAR: &str = "INSERT INTO ci_vars (tenant_id, repo_id, name, value, updated_at) \
-     SELECT $1, $2::bigint, $3, $4, $6 \
+/// As [`PUT_SECRET`], for a var with value `$5`; `$6` is the limit and
+/// `$7` the time.
+const PUT_VAR: &str = "INSERT INTO ci_vars \
+       (tenant_id, repo_id, environment_id, name, value, updated_at) \
+     SELECT $1, $2::bigint, $3::bigint, $4, $5, $7 \
      WHERE EXISTS (SELECT 1 FROM ci_vars WHERE tenant_id = $1 \
-         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3) \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint \
+         AND environment_id IS NOT DISTINCT FROM $3::bigint AND name = $4) \
        OR (SELECT count(*) FROM ci_vars WHERE tenant_id = $1 \
-         AND repo_id IS NOT DISTINCT FROM $2::bigint) < $5 \
-     ON CONFLICT (tenant_id, repo_id, name) DO UPDATE SET value = EXCLUDED.value, \
-       updated_at = EXCLUDED.updated_at \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint \
+         AND environment_id IS NOT DISTINCT FROM $3::bigint) < $6 \
+     ON CONFLICT (tenant_id, repo_id, environment_id, name) DO UPDATE SET \
+       value = EXCLUDED.value, updated_at = EXCLUDED.updated_at \
      RETURNING 1 AS saved";
 
 /// What [`PUT_SECRET`] and [`PUT_VAR`] return.
@@ -1633,7 +1707,7 @@ async fn put(db: &Db, tenant: &str, sql: &str, bound: &[Param]) -> Result<Put> {
 pub async fn put_secret(
     db: &Db,
     tenant: &str,
-    repo_id: Option<u64>,
+    owner: Owner,
     name: &str,
     key_id: &str,
     sealed: &str,
@@ -1644,7 +1718,16 @@ pub async fn put_secret(
         db,
         tenant,
         PUT_SECRET,
-        &params![tenant, repo_id, name, key_id, sealed, limit, now],
+        &params![
+            tenant,
+            owner.repo_id(),
+            owner.environment_id(),
+            name,
+            key_id,
+            sealed,
+            limit,
+            now
+        ],
     )
     .await
 }
@@ -1654,16 +1737,12 @@ pub async fn put_secret(
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn delete_secret(
-    db: &Db,
-    tenant: &str,
-    repo_id: Option<u64>,
-    name: &str,
-) -> Result<bool> {
+pub async fn delete_secret(db: &Db, tenant: &str, owner: Owner, name: &str) -> Result<bool> {
     db.run(
         "DELETE FROM ci_secrets WHERE tenant_id = $1 \
-         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3",
-        &params![tenant, repo_id, name],
+         AND repo_id IS NOT DISTINCT FROM $2::bigint \
+         AND environment_id IS NOT DISTINCT FROM $3::bigint AND name = $4",
+        &params![tenant, owner.repo_id(), owner.environment_id(), name],
     )
     .await
     .map(|n| n > 0)
@@ -1681,16 +1760,13 @@ struct NameRow {
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn secret_names(
-    db: &Db,
-    tenant: &str,
-    repo_id: Option<u64>,
-) -> Result<Vec<(String, u64)>> {
+pub async fn secret_names(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<(String, u64)>> {
     let rows: Vec<NameRow> = db
         .all(
             "SELECT name, updated_at FROM ci_secrets WHERE tenant_id = $1 \
-             AND repo_id IS NOT DISTINCT FROM $2::bigint ORDER BY name",
-            &params![tenant, repo_id],
+             AND repo_id IS NOT DISTINCT FROM $2::bigint \
+             AND environment_id IS NOT DISTINCT FROM $3::bigint ORDER BY name",
+            &params![tenant, owner.repo_id(), owner.environment_id()],
         )
         .await?;
     Ok(rows.into_iter().map(|r| (r.name, r.updated_at)).collect())
@@ -1701,6 +1777,8 @@ pub async fn secret_names(
 pub struct SealedRow {
     /// The repository, or `None` for the organization.
     pub repo_id: Option<u64>,
+    /// The environment, or `None` for the organization and a repository.
+    pub environment_id: Option<u64>,
     /// The name.
     pub name: String,
     /// The key that sealed it.
@@ -1709,20 +1787,30 @@ pub struct SealedRow {
     pub sealed: String,
 }
 
+impl SealedRow {
+    /// Whose row it is.
+    #[must_use]
+    pub fn owner(&self) -> Owner {
+        Owner::of(self.repo_id, self.environment_id)
+    }
+}
+
 impl std::fmt::Debug for SealedRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SealedRow")
             .field("repo_id", &self.repo_id)
+            .field("environment_id", &self.environment_id)
             .field("name", &self.name)
             .field("key_id", &self.key_id)
             .finish_non_exhaustive()
     }
 }
 
-/// The organization's sealed secrets and repository `repo_id`'s, named
-/// in `names` or all of them when `None`. Both rows are returned when a
-/// name is in both scopes, the organization's first, so a caller that
-/// inserts them in order lets the repository's win.
+/// The organization's, repository `repo_id`'s and (when set) environment
+/// `environment_id`'s sealed secrets, named in `names` or all of them
+/// when `None`, ordered by name, then organization, repository,
+/// environment. Every row of a name is returned, so a caller that
+/// inserts them in order lets the most specific win.
 ///
 /// # Errors
 ///
@@ -1731,21 +1819,23 @@ pub async fn sealed_secrets(
     db: &Db,
     tenant: &str,
     repo_id: u64,
+    environment_id: Option<u64>,
     names: Option<&[String]>,
 ) -> Result<Vec<SealedRow>> {
-    let mut sql = "SELECT repo_id, name, key_id, sealed FROM ci_secrets \
-                   WHERE tenant_id = $1 AND (repo_id IS NULL OR repo_id = $2)"
+    let mut sql = "SELECT repo_id, environment_id, name, key_id, sealed FROM ci_secrets \
+                   WHERE tenant_id = $1 AND (repo_id IS NULL OR (repo_id = $2 \
+                   AND (environment_id IS NULL OR environment_id = $3::bigint)))"
         .to_owned();
-    let mut bound = params![tenant, repo_id];
+    let mut bound = params![tenant, repo_id, environment_id];
     if let Some(names) = names {
         if names.is_empty() {
             return Ok(Vec::new());
         }
-        let marks: Vec<String> = (3..3 + names.len()).map(|n| format!("${n}")).collect();
+        let marks: Vec<String> = (4..4 + names.len()).map(|n| format!("${n}")).collect();
         sql = format!("{sql} AND name IN ({})", marks.join(", "));
         bound.extend(names.iter().map(|name| Param::from(name.as_str())));
     }
-    sql.push_str(" ORDER BY name, repo_id NULLS FIRST");
+    sql.push_str(" ORDER BY name, repo_id NULLS FIRST, environment_id NULLS FIRST");
     db.all(&sql, &bound).await
 }
 
@@ -1758,7 +1848,7 @@ pub async fn sealed_secrets(
 pub async fn put_var(
     db: &Db,
     tenant: &str,
-    repo_id: Option<u64>,
+    owner: Owner,
     name: &str,
     value: &str,
     limit: u32,
@@ -1768,7 +1858,15 @@ pub async fn put_var(
         db,
         tenant,
         PUT_VAR,
-        &params![tenant, repo_id, name, value, limit, now],
+        &params![
+            tenant,
+            owner.repo_id(),
+            owner.environment_id(),
+            name,
+            value,
+            limit,
+            now
+        ],
     )
     .await
 }
@@ -1778,11 +1876,12 @@ pub async fn put_var(
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn delete_var(db: &Db, tenant: &str, repo_id: Option<u64>, name: &str) -> Result<bool> {
+pub async fn delete_var(db: &Db, tenant: &str, owner: Owner, name: &str) -> Result<bool> {
     db.run(
         "DELETE FROM ci_vars WHERE tenant_id = $1 \
-         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3",
-        &params![tenant, repo_id, name],
+         AND repo_id IS NOT DISTINCT FROM $2::bigint \
+         AND environment_id IS NOT DISTINCT FROM $3::bigint AND name = $4",
+        &params![tenant, owner.repo_id(), owner.environment_id(), name],
     )
     .await
     .map(|n| n > 0)
@@ -1800,16 +1899,13 @@ struct VarRow {
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn vars(
-    db: &Db,
-    tenant: &str,
-    repo_id: Option<u64>,
-) -> Result<Vec<(String, String, u64)>> {
+pub async fn vars(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<(String, String, u64)>> {
     let rows: Vec<VarRow> = db
         .all(
             "SELECT name, value, updated_at FROM ci_vars WHERE tenant_id = $1 \
-             AND repo_id IS NOT DISTINCT FROM $2::bigint ORDER BY name",
-            &params![tenant, repo_id],
+             AND repo_id IS NOT DISTINCT FROM $2::bigint \
+             AND environment_id IS NOT DISTINCT FROM $3::bigint ORDER BY name",
+            &params![tenant, owner.repo_id(), owner.environment_id()],
         )
         .await?;
     Ok(rows
@@ -1818,17 +1914,25 @@ pub async fn vars(
         .collect())
 }
 
-/// The organization's vars overlaid with repository `repo_id`'s.
+/// The organization's vars overlaid with repository `repo_id`'s, then
+/// with environment `environment_id`'s.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn job_vars(db: &Db, tenant: &str, repo_id: u64) -> Result<BTreeMap<String, String>> {
+pub async fn job_vars(
+    db: &Db,
+    tenant: &str,
+    repo_id: u64,
+    environment_id: Option<u64>,
+) -> Result<BTreeMap<String, String>> {
     let rows: Vec<VarRow> = db
         .all(
             "SELECT name, value, updated_at FROM ci_vars WHERE tenant_id = $1 \
-             AND (repo_id IS NULL OR repo_id = $2) ORDER BY repo_id NULLS FIRST",
-            &params![tenant, repo_id],
+             AND (repo_id IS NULL OR (repo_id = $2 \
+               AND (environment_id IS NULL OR environment_id = $3::bigint))) \
+             ORDER BY repo_id NULLS FIRST, environment_id NULLS FIRST",
+            &params![tenant, repo_id, environment_id],
         )
         .await?;
     Ok(rows.into_iter().map(|r| (r.name, r.value)).collect())
@@ -1841,6 +1945,8 @@ pub struct StaleRow {
     pub tenant: String,
     /// The repository, or `None` for the organization.
     pub repo_id: Option<u64>,
+    /// The environment, or `None` for the organization and a repository.
+    pub environment_id: Option<u64>,
     /// The name.
     pub name: String,
     /// The key that sealed it.
@@ -1849,11 +1955,20 @@ pub struct StaleRow {
     pub sealed: String,
 }
 
+impl StaleRow {
+    /// Whose row it is.
+    #[must_use]
+    pub fn owner(&self) -> Owner {
+        Owner::of(self.repo_id, self.environment_id)
+    }
+}
+
 impl std::fmt::Debug for StaleRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StaleRow")
             .field("tenant", &self.tenant)
             .field("repo_id", &self.repo_id)
+            .field("environment_id", &self.environment_id)
             .field("name", &self.name)
             .field("key_id", &self.key_id)
             .finish_non_exhaustive()
@@ -1868,8 +1983,8 @@ impl std::fmt::Debug for StaleRow {
 /// Postgres refused the statement.
 pub async fn stale_secrets(db: &Db, current_key_id: &str, limit: u32) -> Result<Vec<StaleRow>> {
     db.all(
-        "SELECT tenant_id AS tenant, repo_id, name, key_id, sealed FROM ci_secrets \
-         WHERE key_id <> $1 ORDER BY random() LIMIT $2",
+        "SELECT tenant_id AS tenant, repo_id, environment_id, name, key_id, sealed \
+         FROM ci_secrets WHERE key_id <> $1 ORDER BY random() LIMIT $2",
         &params![current_key_id, limit],
     )
     .await
@@ -1884,12 +1999,14 @@ pub async fn stale_secrets(db: &Db, current_key_id: &str, limit: u32) -> Result<
 /// Postgres refused the statement.
 pub async fn reseal(db: &Db, row: &StaleRow, key_id: &str, sealed: &str) -> Result<bool> {
     db.run(
-        "UPDATE ci_secrets SET key_id = $5, sealed = $6 WHERE tenant_id = $1 \
-         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3 AND key_id = $4 \
-         AND sealed = $7",
+        "UPDATE ci_secrets SET key_id = $6, sealed = $7 WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint \
+         AND environment_id IS NOT DISTINCT FROM $3::bigint AND name = $4 AND key_id = $5 \
+         AND sealed = $8",
         &params![
             row.tenant.as_str(),
             row.repo_id,
+            row.environment_id,
             row.name.as_str(),
             row.key_id.as_str(),
             key_id,
@@ -1899,6 +2016,246 @@ pub async fn reseal(db: &Db, row: &StaleRow, key_id: &str, sealed: &str) -> Resu
     )
     .await
     .map(|n| n > 0)
+}
+
+// Environments.
+
+/// Reads a JSON array of strings that the row carries as text.
+fn json_strings<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
+    let text = String::deserialize(d)?;
+    serde_json::from_str(&text).map_err(D::Error::custom)
+}
+
+/// An environment of a repository.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct EnvironmentRow {
+    /// The environment's identity.
+    pub id: u64,
+    /// Its repository.
+    pub repo_id: u64,
+    /// The name, in the case it was first saved with.
+    pub name: String,
+    /// The branch patterns a run's ref must match; empty allows any.
+    #[serde(deserialize_with = "json_strings")]
+    pub branches: Vec<String>,
+    /// Whether a job that names it waits for an approval.
+    pub approval: bool,
+    /// When it last changed.
+    pub updated_at: u64,
+}
+
+/// The columns of an [`EnvironmentRow`].
+const ENVIRONMENT_COLUMNS: &str =
+    "id, repo_id, name, branches::text AS branches, approval, updated_at";
+
+/// What [`put_environment`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutEnvironment {
+    /// Stored: created, or updated.
+    Saved(EnvironmentRow),
+    /// A new name over the repository's limit.
+    TooMany,
+}
+
+/// The environments of `repo_id`, by name ignoring case.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn environments(db: &Db, repo_id: u64) -> Result<Vec<EnvironmentRow>> {
+    db.all(
+        &format!(
+            "SELECT {ENVIRONMENT_COLUMNS} FROM ci_environments WHERE repo_id = $1 \
+             ORDER BY lower(name), name"
+        ),
+        &params![repo_id],
+    )
+    .await
+}
+
+/// The environment of `repo_id` called `name`, ignoring case.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn environment(db: &Db, repo_id: u64, name: &str) -> Result<Option<EnvironmentRow>> {
+    db.first(
+        &format!(
+            "SELECT {ENVIRONMENT_COLUMNS} FROM ci_environments \
+             WHERE repo_id = $1 AND lower(name) = lower($2)"
+        ),
+        &params![repo_id, name],
+    )
+    .await
+}
+
+/// Creates the environment, or updates the branches and approval of the
+/// row of that name in any case (its stored name stays). A new name is
+/// refused with [`PutEnvironment::TooMany`] when the repository already
+/// holds `limit`. Runs with the tenant row locked, so two puts cannot
+/// both take the last place.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+#[allow(clippy::too_many_arguments)] // one column each
+pub async fn put_environment(
+    db: &Db,
+    tenant: &str,
+    repo_id: u64,
+    name: &str,
+    branches: &[String],
+    approval: bool,
+    limit: u32,
+    now: u64,
+) -> Result<PutEnvironment> {
+    let branches = serde_json::to_string(branches).map_err(worker::Error::from)?;
+    let sql = format!(
+        "WITH updated AS (UPDATE ci_environments SET branches = $4::jsonb, approval = $5, \
+           updated_at = $7 WHERE repo_id = $2 AND lower(name) = lower($3) \
+           RETURNING {ENVIRONMENT_COLUMNS}), \
+         inserted AS (INSERT INTO ci_environments \
+           (tenant_id, repo_id, name, branches, approval, updated_at) \
+           SELECT $1, $2::bigint, $3, $4::jsonb, $5, $7 \
+           WHERE NOT EXISTS (SELECT 1 FROM updated) \
+             AND (SELECT count(*) FROM ci_environments WHERE repo_id = $2) < $6 \
+           RETURNING {ENVIRONMENT_COLUMNS}) \
+         SELECT * FROM updated UNION ALL SELECT * FROM inserted"
+    );
+    let lock = params![tenant];
+    let saved: Option<EnvironmentRow> = db
+        .first_locked(
+            (LOCK_TENANT, &lock),
+            &sql,
+            &params![tenant, repo_id, name, branches, approval, limit, now],
+        )
+        .await?;
+    Ok(saved.map_or(PutEnvironment::TooMany, PutEnvironment::Saved))
+}
+
+/// Deletes the environment of `repo_id` called `name`, ignoring case,
+/// with its secrets and vars. Returns whether it existed.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn delete_environment(db: &Db, repo_id: u64, name: &str) -> Result<bool> {
+    db.run(
+        "DELETE FROM ci_environments WHERE repo_id = $1 AND lower(name) = lower($2)",
+        &params![repo_id, name],
+    )
+    .await
+    .map(|n| n > 0)
+}
+
+/// What the launch consumer and the claim need about a job's environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobEnvironment {
+    /// The job's run.
+    pub run_id: u64,
+    /// The run's repository.
+    pub repo_id: u64,
+    /// `owner/repo`.
+    pub full_name: String,
+    /// The event that started the run.
+    pub event: String,
+    /// The run's ref.
+    pub git_ref: String,
+    /// The environment the job names, `None` when the repository has
+    /// none of that name.
+    pub environment: Option<EnvironmentRow>,
+}
+
+/// The columns [`job_environment`] reads; the environment's are null
+/// when the repository has none of the job's name.
+#[derive(Deserialize)]
+struct JobEnvironmentRow {
+    run_id: u64,
+    repo_id: u64,
+    full_name: String,
+    event: String,
+    git_ref: String,
+    environment_id: Option<u64>,
+    environment_name: Option<String>,
+    branches: Option<String>,
+    approval: Option<bool>,
+    environment_updated_at: Option<u64>,
+}
+
+/// The run of job `job_id` and the environment it names.
+///
+/// # Errors
+///
+/// Postgres refused the statement, or a stored `branches` is not a JSON
+/// array of strings.
+pub async fn job_environment(db: &Db, job_id: u64) -> Result<Option<JobEnvironment>> {
+    let row: Option<JobEnvironmentRow> = db
+        .first(
+            "SELECT ci_runs.id AS run_id, ci_runs.repo_id, ci_repos.full_name, ci_runs.event, \
+               ci_runs.ref AS git_ref, e.id AS environment_id, e.name AS environment_name, \
+               e.branches::text AS branches, e.approval, e.updated_at AS environment_updated_at \
+             FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
+               JOIN ci_repos ON ci_repos.id = ci_runs.repo_id \
+               LEFT JOIN ci_environments e ON e.repo_id = ci_runs.repo_id \
+                 AND lower(e.name) = lower(ci_jobs.environment) \
+             WHERE ci_jobs.id = $1",
+            &params![job_id],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let environment = match (
+        row.environment_id,
+        row.environment_name,
+        row.branches,
+        row.approval,
+        row.environment_updated_at,
+    ) {
+        (Some(id), Some(name), Some(branches), Some(approval), Some(updated_at)) => {
+            Some(EnvironmentRow {
+                id,
+                repo_id: row.repo_id,
+                name,
+                branches: serde_json::from_str(&branches).map_err(worker::Error::from)?,
+                approval,
+                updated_at,
+            })
+        }
+        _ => None,
+    };
+    Ok(Some(JobEnvironment {
+        run_id: row.run_id,
+        repo_id: row.repo_id,
+        full_name: row.full_name,
+        event: row.event,
+        git_ref: row.git_ref,
+        environment,
+    }))
+}
+
+/// Clears the approval holds of queued jobs in repository `repo_id` that
+/// name environment `name` (ignoring case), due at `now`, and returns
+/// them for the launch queue.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn release_approval_holds(
+    db: &Db,
+    repo_id: u64,
+    name: &str,
+    now: u64,
+) -> Result<Vec<hatchrun_cloud::ci_wake::Woken>> {
+    db.all(
+        "UPDATE ci_jobs SET held = NULL, next_launch_at = $3, updated_at = $3 FROM ci_runs \
+         WHERE ci_runs.id = ci_jobs.run_id AND ci_runs.repo_id = $1 \
+           AND lower(ci_jobs.environment) = lower($2) \
+           AND ci_jobs.status = 'queued' AND ci_jobs.held = 'approval' \
+         RETURNING ci_jobs.id AS job_id, ci_jobs.attempt",
+        &params![repo_id, name, now],
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1961,6 +2318,7 @@ mod tests {
             template: Some("ubuntu-latest".into()),
             token_permissions: BTreeMap::from([("metadata".to_owned(), Level::Read)]),
             secret_refs: SecretRefs::default(),
+            environment: None,
         }
     }
 
@@ -2318,28 +2676,40 @@ mod tests {
              VALUES ('t2', 2, 'other', 100, 0, 0)",
             &[],
         );
-        put_secret_ok(&db, Some(7), "REPO_S", "k", "s1");
-        put_secret_ok(&db, None, "ORG_S", "k", "s2");
-        put_var_ok(&db, Some(7), "REPO_V", "1");
-        put_var_ok(&db, None, "ORG_V", "2");
+        put_secret_ok(&db, Owner::Repo(7), "REPO_S", "k", "s1");
+        put_secret_ok(&db, Owner::Org, "ORG_S", "k", "s2");
+        put_var_ok(&db, Owner::Repo(7), "REPO_V", "1");
+        put_var_ok(&db, Owner::Org, "ORG_V", "2");
         // Re-registering the repository under its own tenant keeps them.
         let mut same = db.wait(repo(db.db(), 7)).unwrap().unwrap();
         db.wait(upsert_repo(db.db(), &same, 6)).unwrap();
         assert_eq!(
-            db.wait(secret_names(db.db(), "t1", Some(7))).unwrap().len(),
+            db.wait(secret_names(db.db(), "t1", Owner::Repo(7)))
+                .unwrap()
+                .len(),
             1
         );
         same.tenant_id = "t2".into();
         same.installation_id = 100;
         db.wait(upsert_repo(db.db(), &same, 7)).unwrap();
         assert_eq!(
-            db.wait(secret_names(db.db(), "t1", Some(7))).unwrap().len(),
+            db.wait(secret_names(db.db(), "t1", Owner::Repo(7)))
+                .unwrap()
+                .len(),
             0
         );
-        assert_eq!(db.wait(vars(db.db(), "t1", Some(7))).unwrap().len(), 0);
+        assert_eq!(
+            db.wait(vars(db.db(), "t1", Owner::Repo(7))).unwrap().len(),
+            0
+        );
         // The old organization's own rows stay.
-        assert_eq!(db.wait(secret_names(db.db(), "t1", None)).unwrap().len(), 1);
-        assert_eq!(db.wait(vars(db.db(), "t1", None)).unwrap().len(), 1);
+        assert_eq!(
+            db.wait(secret_names(db.db(), "t1", Owner::Org))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.wait(vars(db.db(), "t1", Owner::Org)).unwrap().len(), 1);
     }
 
     #[test]
@@ -3723,16 +4093,16 @@ mod tests {
         assert_eq!(sent[0]["sent_at"].as_u64(), Some(99));
     }
 
-    fn put_var_ok(db: &TestDb, repo: Option<u64>, name: &str, value: &str) {
+    fn put_var_ok(db: &TestDb, owner: Owner, name: &str, value: &str) {
         let put = db
-            .wait(put_var(db.db(), "t1", repo, name, value, 100, 5))
+            .wait(put_var(db.db(), "t1", owner, name, value, 100, 5))
             .unwrap();
         assert_eq!(put, Put::Saved);
     }
 
-    fn put_secret_ok(db: &TestDb, repo: Option<u64>, name: &str, key: &str, sealed: &str) {
+    fn put_secret_ok(db: &TestDb, owner: Owner, name: &str, key: &str, sealed: &str) {
         let put = db
-            .wait(put_secret(db.db(), "t1", repo, name, key, sealed, 100, 5))
+            .wait(put_secret(db.db(), "t1", owner, name, key, sealed, 100, 5))
             .unwrap();
         assert_eq!(put, Put::Saved);
     }
@@ -3740,48 +4110,72 @@ mod tests {
     #[test]
     fn repo_value_overrides_org() {
         let db = setup();
-        put_var_ok(&db, None, "A", "1");
-        put_var_ok(&db, None, "B", "2");
-        put_var_ok(&db, Some(7), "A", "3");
-        let vars = db.wait(job_vars(db.db(), "t1", 7)).unwrap();
+        put_var_ok(&db, Owner::Org, "A", "1");
+        put_var_ok(&db, Owner::Org, "B", "2");
+        put_var_ok(&db, Owner::Repo(7), "A", "3");
+        let vars = db.wait(job_vars(db.db(), "t1", 7, None)).unwrap();
         assert_eq!(
             vars,
             BTreeMap::from([("A".into(), "3".into()), ("B".into(), "2".into())])
         );
-        let org = db.wait(vars_of(db.db(), None)).unwrap();
+        let org = db.wait(vars_of(db.db(), Owner::Org)).unwrap();
         assert_eq!(org.len(), 2);
-        assert!(db.wait(delete_var(db.db(), "t1", Some(7), "A")).unwrap());
-        assert!(!db.wait(delete_var(db.db(), "t1", Some(7), "A")).unwrap());
-        let vars = db.wait(job_vars(db.db(), "t1", 7)).unwrap();
+        assert!(
+            db.wait(delete_var(db.db(), "t1", Owner::Repo(7), "A"))
+                .unwrap()
+        );
+        assert!(
+            !db.wait(delete_var(db.db(), "t1", Owner::Repo(7), "A"))
+                .unwrap()
+        );
+        let vars = db.wait(job_vars(db.db(), "t1", 7, None)).unwrap();
         assert_eq!(vars["A"], "1");
     }
 
-    async fn vars_of(db: &Db, repo: Option<u64>) -> Result<Vec<(String, String, u64)>> {
-        vars(db, "t1", repo).await
+    async fn vars_of(db: &Db, owner: Owner) -> Result<Vec<(String, String, u64)>> {
+        vars(db, "t1", owner).await
     }
 
     #[test]
     fn put_counts_against_the_limit() {
         let db = setup();
         let put = |name: &str, limit| {
-            db.wait(put_secret(db.db(), "t1", None, name, "k", "s", limit, 5))
-                .unwrap()
+            db.wait(put_secret(
+                db.db(),
+                "t1",
+                Owner::Org,
+                name,
+                "k",
+                "s",
+                limit,
+                5,
+            ))
+            .unwrap()
         };
         assert_eq!(put("A", 2), Put::Saved);
         assert_eq!(put("B", 2), Put::Saved);
         assert_eq!(put("C", 2), Put::TooMany);
         // Overwriting a name at the limit is allowed.
         assert_eq!(put("A", 2), Put::Saved);
-        let names = db.wait(secret_names(db.db(), "t1", None)).unwrap();
+        let names = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
         assert_eq!(names.len(), 2);
         // The limit is per scope.
         let repo = db
-            .wait(put_secret(db.db(), "t1", Some(7), "C", "k", "s", 2, 5))
+            .wait(put_secret(
+                db.db(),
+                "t1",
+                Owner::Repo(7),
+                "C",
+                "k",
+                "s",
+                2,
+                5,
+            ))
             .unwrap();
         assert_eq!(repo, Put::Saved);
         // And the same for vars.
         let var = |name: &str| {
-            db.wait(put_var(db.db(), "t1", None, name, "v", 1, 5))
+            db.wait(put_var(db.db(), "t1", Owner::Org, name, "v", 1, 5))
                 .unwrap()
         };
         assert_eq!(var("A"), Put::Saved);
@@ -3792,15 +4186,17 @@ mod tests {
     #[test]
     fn sealed_secrets_filters_by_name() {
         let db = setup();
-        put_secret_ok(&db, None, "A", "k", "org-a");
-        put_secret_ok(&db, Some(7), "A", "k", "repo-a");
-        put_secret_ok(&db, Some(7), "B", "k", "repo-b");
-        put_secret_ok(&db, None, "C", "k", "org-c");
-        let all = db.wait(sealed_secrets(db.db(), "t1", 7, None)).unwrap();
+        put_secret_ok(&db, Owner::Org, "A", "k", "org-a");
+        put_secret_ok(&db, Owner::Repo(7), "A", "k", "repo-a");
+        put_secret_ok(&db, Owner::Repo(7), "B", "k", "repo-b");
+        put_secret_ok(&db, Owner::Org, "C", "k", "org-c");
+        let all = db
+            .wait(sealed_secrets(db.db(), "t1", 7, None, None))
+            .unwrap();
         assert_eq!(all.len(), 4);
         let names = ["A".to_owned(), "C".to_owned()];
         let some = db
-            .wait(sealed_secrets(db.db(), "t1", 7, Some(&names)))
+            .wait(sealed_secrets(db.db(), "t1", 7, None, Some(&names)))
             .unwrap();
         let got: Vec<_> = some
             .iter()
@@ -3815,11 +4211,13 @@ mod tests {
             ]
         );
         let none = db
-            .wait(sealed_secrets(db.db(), "t1", 7, Some(&[])))
+            .wait(sealed_secrets(db.db(), "t1", 7, None, Some(&[])))
             .unwrap();
         assert_eq!(none.len(), 0);
         // Another repository sees only the organization's rows.
-        let other = db.wait(sealed_secrets(db.db(), "t1", 8, None)).unwrap();
+        let other = db
+            .wait(sealed_secrets(db.db(), "t1", 8, None, None))
+            .unwrap();
         assert_eq!(other.len(), 2);
         assert!(!format!("{:?}", all[0]).contains("org-a"));
     }
@@ -3827,14 +4225,14 @@ mod tests {
     #[test]
     fn reseal_skips_a_row_that_changed() {
         let db = setup();
-        put_secret_ok(&db, Some(7), "A", "old", "s1");
-        put_secret_ok(&db, None, "B", "new", "s2");
+        put_secret_ok(&db, Owner::Repo(7), "A", "old", "s1");
+        put_secret_ok(&db, Owner::Org, "B", "new", "s2");
         let stale = db.wait(stale_secrets(db.db(), "new", 10)).unwrap();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].name, "A");
         assert!(!format!("{:?}", stale[0]).contains("s1"));
         // The secret is set again between the read and the re-seal.
-        put_secret_ok(&db, Some(7), "A", "old", "s1-changed");
+        put_secret_ok(&db, Owner::Repo(7), "A", "old", "s1-changed");
         assert!(
             !db.wait(reseal(db.db(), &stale[0], "new", "s1-resealed"))
                 .unwrap()
@@ -3852,7 +4250,7 @@ mod tests {
     fn stale_secrets_is_bounded() {
         let db = setup();
         for name in ["A", "B", "C"] {
-            put_secret_ok(&db, None, name, "old", "s");
+            put_secret_ok(&db, Owner::Org, name, "old", "s");
         }
         assert_eq!(db.wait(stale_secrets(db.db(), "new", 2)).unwrap().len(), 2);
     }
@@ -3860,12 +4258,309 @@ mod tests {
     #[test]
     fn deleting_a_repo_or_tenant_removes_its_secrets() {
         let db = setup();
-        put_secret_ok(&db, Some(7), "A", "k", "s");
-        assert!(db.wait(delete_secret(db.db(), "t1", Some(7), "A")).unwrap());
-        assert!(!db.wait(delete_secret(db.db(), "t1", Some(7), "A")).unwrap());
-        put_secret_ok(&db, Some(7), "A", "k", "s");
+        put_secret_ok(&db, Owner::Repo(7), "A", "k", "s");
+        assert!(
+            db.wait(delete_secret(db.db(), "t1", Owner::Repo(7), "A"))
+                .unwrap()
+        );
+        assert!(
+            !db.wait(delete_secret(db.db(), "t1", Owner::Repo(7), "A"))
+                .unwrap()
+        );
+        put_secret_ok(&db, Owner::Repo(7), "A", "k", "s");
         db.run("DELETE FROM tenants WHERE id = 't1'", &[]);
         let left = db.rows("SELECT 1 FROM ci_secrets", &[]).unwrap();
         assert_eq!(left.len(), 0);
+    }
+
+    fn save_environment(
+        db: &TestDb,
+        name: &str,
+        branches: &[&str],
+        approval: bool,
+    ) -> EnvironmentRow {
+        let branches: Vec<String> = branches.iter().map(|b| (*b).to_owned()).collect();
+        match db
+            .wait(put_environment(
+                db.db(),
+                "t1",
+                7,
+                name,
+                &branches,
+                approval,
+                10,
+                5,
+            ))
+            .unwrap()
+        {
+            PutEnvironment::Saved(row) => row,
+            PutEnvironment::TooMany => panic!("too many"),
+        }
+    }
+
+    fn job_naming(db: &TestDb, delivery: &str, environment: Option<&str>) -> u64 {
+        let run = db
+            .wait(insert_run(db.db(), &new_run(delivery, "ci", 1_000)))
+            .unwrap()
+            .unwrap();
+        let job = NewJob {
+            environment: environment.map(str::to_owned),
+            ..new_job("deploy")
+        };
+        db.wait(insert_jobs(db.db(), run.id, &[job], 1_000))
+            .unwrap()[0]
+            .1
+    }
+
+    #[test]
+    fn environments_are_unique_per_repo_ignoring_case() {
+        let db = setup();
+        save_environment(&db, "Production", &["release"], false);
+        let again = save_environment(&db, "production", &["main"], true);
+        assert_eq!(again.name, "Production");
+        assert_eq!(again.branches, ["main"]);
+        assert!(again.approval);
+        let all = db.wait(environments(db.db(), 7)).unwrap();
+        assert_eq!(all, [again]);
+        // The index refuses a second row that differs only in case.
+        let tried = db.try_run(
+            "INSERT INTO ci_environments (tenant_id, repo_id, name, branches, approval, updated_at) \
+             VALUES ('t1', 7, 'PRODUCTION', '[]', false, 0)",
+            &[],
+        );
+        assert!(tried.is_err());
+    }
+
+    #[test]
+    fn environment_lookup_ignores_case() {
+        let db = setup();
+        let made = save_environment(&db, "Production", &["main"], true);
+        let found = db.wait(environment(db.db(), 7, "PRODUCTION")).unwrap();
+        assert_eq!(found, Some(made.clone()));
+        assert_eq!(db.wait(environment(db.db(), 7, "staging")).unwrap(), None);
+        assert_eq!(
+            db.wait(environment(db.db(), 8, "production")).unwrap(),
+            None
+        );
+
+        let named = job_naming(&db, "d1", Some("production"));
+        let got = db.wait(job_environment(db.db(), named)).unwrap().unwrap();
+        assert_eq!(got.environment, Some(made));
+        assert_eq!(got.repo_id, 7);
+        assert_eq!(got.full_name, "acme/app");
+        assert_eq!(got.event, "push");
+        assert_eq!(got.git_ref, "refs/heads/main");
+        let missing = job_naming(&db, "d2", Some("nope"));
+        let got = db.wait(job_environment(db.db(), missing)).unwrap().unwrap();
+        assert_eq!(got.environment, None);
+        let none = job_naming(&db, "d3", None);
+        let got = db.wait(job_environment(db.db(), none)).unwrap().unwrap();
+        assert_eq!(got.environment, None);
+        assert_eq!(db.wait(job_environment(db.db(), 999_999)).unwrap(), None);
+    }
+
+    #[test]
+    fn put_environment_counts_against_the_limit() {
+        let db = setup();
+        let put = |name: &str| {
+            db.wait(put_environment(db.db(), "t1", 7, name, &[], false, 2, 5))
+                .unwrap()
+        };
+        assert!(matches!(put("a"), PutEnvironment::Saved(_)));
+        assert!(matches!(put("b"), PutEnvironment::Saved(_)));
+        assert_eq!(put("c"), PutEnvironment::TooMany);
+        assert!(matches!(put("A"), PutEnvironment::Saved(_)));
+        assert_eq!(db.wait(environments(db.db(), 7)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deleting_an_environment_deletes_its_secrets_and_vars() {
+        let db = setup();
+        let env = save_environment(&db, "Production", &[], false);
+        let owner = Owner::Environment {
+            repo_id: 7,
+            environment_id: env.id,
+        };
+        put_secret_ok(&db, owner, "S", "k", "s");
+        put_var_ok(&db, owner, "V", "1");
+        put_secret_ok(&db, Owner::Repo(7), "S", "k", "repo");
+        assert!(
+            db.wait(delete_environment(db.db(), 7, "production"))
+                .unwrap()
+        );
+        assert!(
+            !db.wait(delete_environment(db.db(), 7, "production"))
+                .unwrap()
+        );
+        let left = db
+            .rows(
+                "SELECT 1 FROM ci_secrets WHERE environment_id IS NOT NULL",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(left.len(), 0);
+        let left = db
+            .rows(
+                "SELECT 1 FROM ci_vars WHERE environment_id IS NOT NULL",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(left.len(), 0);
+        assert_eq!(
+            db.wait(secret_names(db.db(), "t1", Owner::Repo(7)))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn environment_values_win_over_repo_and_org() {
+        let db = setup();
+        let env = save_environment(&db, "e", &[], false);
+        let owner = Owner::Environment {
+            repo_id: 7,
+            environment_id: env.id,
+        };
+        put_var_ok(&db, Owner::Org, "X", "o");
+        put_var_ok(&db, Owner::Repo(7), "X", "r");
+        put_var_ok(&db, owner, "X", "e");
+        let with = db.wait(job_vars(db.db(), "t1", 7, Some(env.id))).unwrap();
+        assert_eq!(with, BTreeMap::from([("X".into(), "e".into())]));
+        let without = db.wait(job_vars(db.db(), "t1", 7, None)).unwrap();
+        assert_eq!(without, BTreeMap::from([("X".into(), "r".into())]));
+
+        put_secret_ok(&db, owner, "S", "k", "env");
+        put_secret_ok(&db, Owner::Org, "S", "k", "org");
+        put_secret_ok(&db, Owner::Repo(7), "S", "k", "repo");
+        let rows = db
+            .wait(sealed_secrets(db.db(), "t1", 7, Some(env.id), None))
+            .unwrap();
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.owner(), r.sealed.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Owner::Org, "org"),
+                (Owner::Repo(7), "repo"),
+                (owner, "env")
+            ]
+        );
+        let rows = db
+            .wait(sealed_secrets(db.db(), "t1", 7, None, None))
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.environment_id.is_none()));
+    }
+
+    #[test]
+    fn another_environment_stays_out() {
+        let db = setup();
+        let e = save_environment(&db, "e", &[], false);
+        let f = save_environment(&db, "f", &[], false);
+        let of_f = Owner::Environment {
+            repo_id: 7,
+            environment_id: f.id,
+        };
+        put_secret_ok(&db, of_f, "S", "k", "f");
+        put_var_ok(&db, of_f, "V", "f");
+        let rows = db
+            .wait(sealed_secrets(db.db(), "t1", 7, Some(e.id), None))
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+        assert!(
+            db.wait(job_vars(db.db(), "t1", 7, Some(e.id)))
+                .unwrap()
+                .is_empty()
+        );
+        // Scopes count their own rows: the repository's limit ignores them.
+        let put = db
+            .wait(put_secret(
+                db.db(),
+                "t1",
+                Owner::Repo(7),
+                "R",
+                "k",
+                "s",
+                1,
+                5,
+            ))
+            .unwrap();
+        assert_eq!(put, Put::Saved);
+        assert_eq!(db.wait(secret_names(db.db(), "t1", of_f)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn release_approval_holds_frees_the_jobs() {
+        let db = setup();
+        let hold = |job: u64, reason: &str| {
+            db.run(
+                "UPDATE ci_jobs SET status = 'queued', held = $2, updated_at = 1 WHERE id = $1",
+                &params![job, reason],
+            );
+        };
+        let a = job_naming(&db, "a", Some("Production"));
+        let b = job_naming(&db, "b", Some("production"));
+        let card = job_naming(&db, "c", Some("production"));
+        let other = job_naming(&db, "d", Some("staging"));
+        hold(a, "approval");
+        hold(b, "approval");
+        hold(card, "card");
+        hold(other, "approval");
+        let woken = db
+            .wait(release_approval_holds(db.db(), 7, "PRODUCTION", 50))
+            .unwrap();
+        assert_eq!(woken_ids(woken.clone()), [a, b]);
+        assert!(woken.iter().all(|w| w.attempt == 1));
+        for job in [a, b] {
+            assert_eq!(held_of(&db, job), None);
+            let at: Option<u64> = db
+                .column(
+                    "SELECT next_launch_at AS n FROM ci_jobs WHERE id = $1",
+                    &params![job],
+                    "n",
+                )
+                .unwrap();
+            assert_eq!(at, Some(50));
+        }
+        assert_eq!(held_of(&db, card).as_deref(), Some("card"));
+        assert_eq!(held_of(&db, other).as_deref(), Some("approval"));
+    }
+
+    #[test]
+    fn a_transferred_repo_leaves_its_environments() {
+        let db = setup();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 100, 0, 0)",
+            &[],
+        );
+        save_environment(&db, "Production", &[], false);
+        let mut same = db.wait(repo(db.db(), 7)).unwrap().unwrap();
+        db.wait(upsert_repo(db.db(), &same, 6)).unwrap();
+        assert_eq!(db.wait(environments(db.db(), 7)).unwrap().len(), 1);
+        same.tenant_id = "t2".into();
+        same.installation_id = 100;
+        db.wait(upsert_repo(db.db(), &same, 7)).unwrap();
+        assert_eq!(db.wait(environments(db.db(), 7)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn job_rows_carry_environment() {
+        let db = setup();
+        let id = job_naming(&db, "d", Some("production"));
+        let row = db.wait(job(db.db(), id)).unwrap().unwrap();
+        assert_eq!(row.environment.as_deref(), Some("production"));
+        assert_eq!(row.approval_attempt, None);
+        assert_eq!(row.approval_decision, None);
+        assert_eq!(row.approval_by, None);
+        assert_eq!(row.approval_at, None);
+        let id = job_naming(&db, "e", None);
+        assert_eq!(
+            db.wait(job(db.db(), id)).unwrap().unwrap().environment,
+            None
+        );
     }
 }

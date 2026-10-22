@@ -1267,7 +1267,7 @@ async fn reseal_secrets(env: &Env, db: &Db, budget: &Budget) -> Result<(), Strin
         }
         let aad = secrets::Aad {
             tenant: &row.tenant,
-            repo_id: row.repo_id,
+            owner: row.owner(),
             name: &row.name,
         };
         let sealed = secrets::fresh_nonce().and_then(|nonce| {

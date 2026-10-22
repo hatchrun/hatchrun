@@ -450,6 +450,7 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
                 },
                 token_permissions: job.token_permissions.clone(),
                 secret_refs: job.secret_refs(),
+                environment: job.environment.clone(),
             })
             .collect();
         store::insert_jobs(db, run.id, &jobs, now).await?;
@@ -650,6 +651,7 @@ mod tests {
             template: Some("ubuntu-latest".into()),
             token_permissions: BTreeMap::new(),
             secret_refs: SecretRefs::default(),
+            environment: None,
         }];
         let ids = db
             .wait(store::insert_jobs(db.db(), run.id, &jobs, 1))
