@@ -38,9 +38,13 @@
 //! [`PoolState::Ready`]; [`Scaler::plan`] hands ready ones to new runners
 //! and launches replacements.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use hatchrun_scaleset::{JobMessageKind, Message};
+
+pub mod pool;
+
+use pool::{Backoff, Names, Pool, PoolConfig};
 
 /// Scaling limits and timeouts. Times are in seconds.
 #[derive(Clone, Debug)]
@@ -214,6 +218,9 @@ pub enum JobEvent<'a> {
     },
 }
 
+/// Wait unit of the launch backoff.
+const BASE_BACKOFF: u64 = 5;
+
 /// Longest wait between launch attempts after failures.
 const MAX_BACKOFF: u64 = 5 * 60;
 
@@ -222,14 +229,11 @@ const MAX_BACKOFF: u64 = 5 * 60;
 pub struct Scaler {
     config: Config,
     runners: BTreeMap<String, Runner>,
-    /// Pool instances by instance id.
-    pool: BTreeMap<String, PoolInstance>,
-    /// Names of pool instances being launched.
-    pool_launching: BTreeSet<String>,
+    pool: Pool,
+    names: Names,
+    /// Launch failures, shared by runners and the pool.
+    backoff: Backoff,
     assigned_jobs: u32,
-    launched: u64,
-    launch_failures: u32,
-    launch_after: u64,
 }
 
 impl Scaler {
@@ -237,14 +241,20 @@ impl Scaler {
     #[must_use]
     pub fn new(config: Config) -> Self {
         Self {
+            pool: Pool::new(PoolConfig {
+                size: config.pool_size,
+                warmup: config.pool_warmup,
+                max_age: config.pool_max_age,
+                inventory_grace: config.inventory_grace,
+            }),
+            names: Names {
+                prefix: config.name_prefix.clone(),
+                launched: 0,
+            },
+            backoff: Backoff::new(BASE_BACKOFF, MAX_BACKOFF),
             config,
             runners: BTreeMap::new(),
-            pool: BTreeMap::new(),
-            pool_launching: BTreeSet::new(),
             assigned_jobs: 0,
-            launched: 0,
-            launch_failures: 0,
-            launch_after: 0,
         }
     }
 
@@ -257,7 +267,7 @@ impl Scaler {
     /// Returns the pool instances by instance id.
     #[must_use]
     pub fn pool(&self) -> &BTreeMap<String, PoolInstance> {
-        &self.pool
+        self.pool.instances()
     }
 
     /// Returns the most runners the scale set can run, for the message
@@ -319,7 +329,7 @@ impl Scaler {
     /// outlived their job, and the upkeep of the warm pool.
     pub fn plan(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
-        self.plan_pool_upkeep(now, &mut actions);
+        actions.extend(self.pool.upkeep(now));
 
         let idle_timeout = self.config.idle_timeout;
         let finish_grace = self.config.finish_grace;
@@ -353,7 +363,7 @@ impl Scaler {
             self.runners.remove(&name);
         }
 
-        if now >= self.launch_after {
+        if self.backoff.ready(now) {
             let active = self
                 .runners
                 .values()
@@ -363,8 +373,8 @@ impl Scaler {
                 .count();
             let active = u32::try_from(active).unwrap_or(u32::MAX);
             for _ in active..self.target() {
-                let name = self.next_name(now);
-                let pooled = self.take_ready();
+                let name = self.names.runner(now);
+                let pooled = self.pool.take_ready();
                 self.runners.insert(
                     name.clone(),
                     Runner {
@@ -380,91 +390,25 @@ impl Scaler {
                 actions.push(Action::Launch { name, pooled });
             }
 
-            let pooled = self.pool.len() + self.pool_launching.len();
-            let pooled = u32::try_from(pooled).unwrap_or(u32::MAX);
-            for _ in pooled..self.config.pool_size {
-                let name = self.next_pool_name(now);
-                self.pool_launching.insert(name.clone());
-                actions.push(Action::LaunchPool { name });
-            }
+            actions.extend(self.pool.refill(now, &self.backoff, &mut self.names));
         }
         actions
     }
 
-    /// Stops pool instances that have warmed up and replaces old ones.
-    fn plan_pool_upkeep(&mut self, now: u64, actions: &mut Vec<Action>) {
-        let mut expired = Vec::new();
-        for (instance_id, instance) in &mut self.pool {
-            if now.saturating_sub(instance.launched_at) >= self.config.pool_max_age {
-                expired.push(instance_id.clone());
-            } else if instance.state == PoolState::Warming
-                && now.saturating_sub(instance.since) >= self.config.pool_warmup
-            {
-                instance.state = PoolState::Stopping;
-                instance.since = now;
-                actions.push(Action::Stop {
-                    instance_id: instance_id.clone(),
-                });
-            }
-        }
-        // A pool larger than configured, after the size was lowered,
-        // gives up its oldest instances.
-        let excess = self
-            .pool
-            .len()
-            .saturating_sub(self.config.pool_size as usize)
-            .saturating_sub(expired.len());
-        let mut by_age: Vec<_> = self
-            .pool
-            .iter()
-            .filter(|(id, _)| !expired.contains(id))
-            .map(|(id, instance)| (instance.launched_at, id.clone()))
-            .collect();
-        by_age.sort();
-        expired.extend(by_age.into_iter().take(excess).map(|(_, id)| id));
-        for instance_id in expired {
-            self.pool.remove(&instance_id);
-            actions.push(Action::Terminate { instance_id });
-        }
-    }
-
-    /// Takes the oldest ready pool instance, so the pool turns over.
-    fn take_ready(&mut self) -> Option<String> {
-        let instance_id = self
-            .pool
-            .iter()
-            .filter(|(_, instance)| instance.state == PoolState::Ready)
-            .min_by_key(|(_, instance)| instance.launched_at)
-            .map(|(id, _)| id.clone())?;
-        self.pool.remove(&instance_id);
-        Some(instance_id)
-    }
-
     /// Records a launched pool instance.
     pub fn pool_launched(&mut self, name: &str, instance_id: String, now: u64) {
-        self.launch_failures = 0;
-        self.launch_after = 0;
-        self.pool_launching.remove(name);
-        self.pool.insert(
-            instance_id,
-            PoolInstance {
-                state: PoolState::Warming,
-                launched_at: now,
-                since: now,
-            },
-        );
+        self.pool
+            .launched(name, instance_id, now, &mut self.backoff);
     }
 
     /// Records a failed pool launch and backs off further launches.
     pub fn pool_launch_failed(&mut self, name: &str, now: u64) {
-        self.pool_launching.remove(name);
-        self.back_off(now);
+        self.pool.launch_failed(name, now, &mut self.backoff);
     }
 
     /// Records a started instance.
     pub fn launched(&mut self, name: &str, runner_id: u64, instance_id: String, now: u64) {
-        self.launch_failures = 0;
-        self.launch_after = 0;
+        self.backoff.succeeded();
         if let Some(runner) = self.runners.get_mut(name) {
             runner.runner_id = Some(runner_id);
             runner.instance_id = Some(instance_id);
@@ -484,7 +428,7 @@ impl Scaler {
         runner_id: Option<u64>,
         now: u64,
     ) -> Option<Action> {
-        self.back_off(now);
+        self.backoff.failed(now);
         let Some(runner_id) = runner_id else {
             self.runners.remove(name);
             return None;
@@ -534,25 +478,24 @@ impl Scaler {
     pub fn reconcile(&mut self, instances: &[Instance], now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
         for instance in instances {
-            match &instance.runner_name {
-                Some(runner_name) => {
-                    self.runners
-                        .entry(runner_name.clone())
-                        .or_insert_with(|| Runner {
-                            phase: Phase::Idle,
-                            runner_id: instance.runner_id,
-                            instance_id: Some(instance.id.clone()),
-                            since: instance.launched_at,
-                        });
-                }
-                None => self.reconcile_pool_instance(instance, now),
+            if let Some(runner_name) = &instance.runner_name {
+                self.runners
+                    .entry(runner_name.clone())
+                    .or_insert_with(|| Runner {
+                        phase: Phase::Idle,
+                        runner_id: instance.runner_id,
+                        instance_id: Some(instance.id.clone()),
+                        since: instance.launched_at,
+                    });
             }
         }
-        let grace = self.config.inventory_grace;
-        self.pool.retain(|id, pooled| {
-            instances.iter().any(|instance| &instance.id == id)
-                || now.saturating_sub(pooled.since) < grace
-        });
+        let runners = &self.runners;
+        let handed = |id: &str| {
+            runners
+                .values()
+                .any(|runner| runner.instance_id.as_deref() == Some(id))
+        };
+        self.pool.reconcile(instances, &handed, now);
 
         let grace = self.config.inventory_grace;
         let mut gone = Vec::new();
@@ -585,41 +528,6 @@ impl Scaler {
         actions
     }
 
-    fn reconcile_pool_instance(&mut self, instance: &Instance, now: u64) {
-        // Handed to a runner but not yet tagged as one.
-        if self
-            .runners
-            .values()
-            .any(|runner| runner.instance_id.as_deref() == Some(instance.id.as_str()))
-        {
-            return;
-        }
-        let pooled = self
-            .pool
-            .entry(instance.id.clone())
-            .or_insert_with(|| PoolInstance {
-                state: if instance.stopped {
-                    PoolState::Ready
-                } else {
-                    PoolState::Warming
-                },
-                launched_at: instance.launched_at,
-                since: instance.launched_at,
-            });
-        if instance.stopped && pooled.state != PoolState::Ready {
-            pooled.state = PoolState::Ready;
-            pooled.since = now;
-        }
-    }
-
-    fn back_off(&mut self, now: u64) {
-        self.launch_failures = self.launch_failures.saturating_add(1);
-        let backoff = 5u64
-            .saturating_mul(1 << self.launch_failures.min(16))
-            .min(MAX_BACKOFF);
-        self.launch_after = now.saturating_add(backoff);
-    }
-
     fn target(&self) -> u32 {
         self.config
             .min_runners
@@ -632,19 +540,6 @@ impl Scaler {
             runner.phase = phase;
             runner.since = now;
         }
-    }
-
-    /// Names are unique across restarts as long as two scalers for the
-    /// same scale set never start within the same second, which the single
-    /// message session already rules out.
-    fn next_name(&mut self, now: u64) -> String {
-        self.launched += 1;
-        format!("{}-{now:x}-{}", self.config.name_prefix, self.launched)
-    }
-
-    fn next_pool_name(&mut self, now: u64) -> String {
-        self.launched += 1;
-        format!("{}-pool-{now:x}-{}", self.config.name_prefix, self.launched)
     }
 }
 
