@@ -277,6 +277,17 @@ const REOPEN_RUN: &str = "UPDATE ci_runs SET status = 'in_progress', conclusion 
      completed_at = NULL, run_attempt = run_attempt + 1, updated_at = $2 WHERE id = $1 \
      RETURNING run_attempt";
 
+/// Queues attempt `$2` of job `$1` at `$3`. Only a job of that attempt
+/// that is waiting, or already queued, changes: one that is launching
+/// or launched is left alone, so repeating the call launches nothing
+/// twice.
+const QUEUE_JOB: &str = "UPDATE ci_jobs SET status = 'queued', updated_at = $3 \
+     WHERE id = $1 AND attempt = $2 AND status IN ('waiting', 'queued')";
+
+/// Opens run `$1` for attempt `$2` at `$3`.
+const REOPEN_RUN_AT: &str = "UPDATE ci_runs SET status = 'in_progress', conclusion = NULL, \
+     completed_at = NULL, run_attempt = $2, updated_at = $3 WHERE id = $1";
+
 /// Sets job `$1` to status `$2` and conclusion `$3` at `$4`. A
 /// completed job takes the time as its completion.
 const SET_JOB: &str = "UPDATE ci_jobs SET status = $2, conclusion = $3, updated_at = $4, \
@@ -620,6 +631,30 @@ pub async fn reopen_run(db: &Db, run_id: u64, now: u64) -> Result<u32> {
     attempt
         .map(|row| row.run_attempt)
         .ok_or_else(|| worker::Error::RustError(format!("no run {run_id}")))
+}
+
+/// Queues attempt `attempt` of job `job_id`, unless the job moved on:
+/// returns whether the job is queued for that attempt now. Repeating
+/// the call is safe; a job already launching or launched stays so and
+/// the answer is `false`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn queue_job(db: &Db, job_id: u64, attempt: u32, now: u64) -> Result<bool> {
+    Ok(db.run(QUEUE_JOB, &params![job_id, attempt, now]).await? == 1)
+}
+
+/// Opens run `run_id` for `attempt`. Unlike [`reopen_run`] it can be
+/// repeated.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn reopen_run_at(db: &Db, run_id: u64, attempt: u32, now: u64) -> Result<()> {
+    db.run(REOPEN_RUN_AT, &params![run_id, attempt, now])
+        .await?;
+    Ok(())
 }
 
 /// Sets the status and conclusion of job `job_id`. Completing a job
@@ -1211,6 +1246,34 @@ mod tests {
         db.wait(heartbeat(db.db(), job_id, 90)).unwrap();
         let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
         assert_eq!((row.heartbeat_at, row.started_at), (Some(90), Some(77)));
+    }
+
+    #[test]
+    fn queue_job_only_moves_a_waiting_job_of_that_attempt() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "waiting");
+        assert!(!db.wait(queue_job(db.db(), job_id, 2, 5)).unwrap());
+        assert!(db.wait(queue_job(db.db(), job_id, 1, 5)).unwrap());
+        assert!(db.wait(queue_job(db.db(), job_id, 1, 6)).unwrap());
+        db.wait(set_job(db.db(), job_id, "launching", None, 7))
+            .unwrap();
+        assert!(!db.wait(queue_job(db.db(), job_id, 1, 8)).unwrap());
+        let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+        assert_eq!(row.status, "launching");
+    }
+
+    #[test]
+    fn reopen_run_at_sets_the_attempt_and_repeats() {
+        let db = setup();
+        let (run_row, _) = run_with_job(&db, "queued");
+        db.wait(finish_run(db.db(), run_row.id, "failure", 6))
+            .unwrap();
+        for _ in 0..2 {
+            db.wait(reopen_run_at(db.db(), run_row.id, 2, 7)).unwrap();
+            let row = db.wait(run(db.db(), run_row.id)).unwrap().unwrap();
+            assert_eq!((row.run_attempt, row.status.as_str()), (2, "in_progress"));
+            assert_eq!(row.conclusion, None);
+        }
     }
 
     #[test]

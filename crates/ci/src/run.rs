@@ -34,6 +34,7 @@
 use std::cell::OnceCell;
 use std::time::Duration;
 
+use async_lock::Mutex;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::{Counted, Sender};
 use hatchrun_cloud::http::Response as HttpResponse;
@@ -49,7 +50,7 @@ use crate::checks::{
 };
 use crate::env::Settings;
 use crate::github::{
-    self, CheckRun, check_run_id, create_check_run, revoke_token, update_check_run,
+    self, CheckRun, Output, check_run_id, create_check_run, revoke_token, update_check_run,
 };
 use crate::graph::{Action, Graph, Node, State as NodeState};
 use crate::intake::Repo;
@@ -73,12 +74,24 @@ const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_STORED_ANNOTATIONS: usize = 1000;
 /// The most steps kept for one job attempt.
 const MAX_STEPS: usize = 1000;
+/// Check run requests of a job that may fail in a row before its update
+/// is dropped.
+const MAX_SEND_TRIES: u32 = 5;
+/// How long side effects that were not done wait before the alarm tries
+/// them, in milliseconds.
+const TODO_RETRY_MS: u64 = 30 * 1000;
+/// How long an object whose alarm failed to plan waits, in milliseconds.
+const ALARM_FALLBACK_MS: u64 = 60 * 1000;
+/// How long an object restored for a read or a rerun waits before it
+/// purges itself, in milliseconds.
+const RESTORED_KEEP_MS: u64 = 10 * 60 * 1000;
 /// Storage keys.
 const INFO: &str = "info";
 const GRAPH: &str = "graph";
 const OUTBOX: &str = "outbox";
 const DEADLINES: &str = "deadlines";
 const EVENT: &str = "event";
+const TODO: &str = "todo";
 
 fn job_key(job: u64) -> String {
     format!("job:{job}")
@@ -157,6 +170,8 @@ pub struct JobState {
     pub github_token: Option<String>,
     /// When the heartbeat last reached Postgres, in Unix milliseconds.
     pub heartbeat_written_at: u64,
+    /// Check run requests for this attempt that failed in a row.
+    pub send_failures: u32,
 }
 
 /// Everything the object's single alarm waits for, in Unix
@@ -170,6 +185,140 @@ pub struct Deadlines {
     pub upload_retry_at: Option<u64>,
     /// When the object deletes its storage.
     pub purge_at: Option<u64>,
+    /// When the side effects still in the [`Todo`] list are tried
+    /// again.
+    pub todo_retry_at: Option<u64>,
+    /// Alarms in a row in which a part failed; sets the backoff.
+    pub failures: u32,
+}
+
+/// A side effect on Postgres or the launch queue. Each one can be
+/// repeated: the object stores the list before it acts, drops an item
+/// when it is done and tries the rest again after a failure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Work {
+    /// The run's row leaves `queued`.
+    StartRun,
+    /// Queue attempt `attempt` of the job, and its launch, unless the
+    /// job already moved on.
+    QueueLaunch {
+        /// The job.
+        job: u64,
+        /// The attempt.
+        attempt: u32,
+    },
+    /// The job's row ends.
+    FinishJob {
+        /// The job.
+        job: u64,
+        /// How it ended.
+        conclusion: Conclusion,
+        /// The steps that ended, as the row keeps them.
+        steps: Value,
+    },
+    /// The run's row ends.
+    FinishRun {
+        /// How it ended.
+        conclusion: Conclusion,
+    },
+    /// The job's row is set up for `attempt`.
+    ResetJob {
+        /// The job.
+        job: u64,
+        /// The new attempt.
+        attempt: u32,
+    },
+    /// The run's row opens for `attempt`.
+    ReopenRun {
+        /// The new attempt.
+        attempt: u32,
+    },
+}
+
+/// One item of the [`Todo`] list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pending {
+    /// Names the item, so that finishing one never drops another.
+    pub id: u64,
+    /// What to do.
+    pub work: Work,
+}
+
+/// The side effects still to do, in order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Todo {
+    next: u64,
+    /// The items, oldest first.
+    pub items: Vec<Pending>,
+}
+
+impl Todo {
+    /// Adds `work` at the end.
+    pub fn push(&mut self, work: Work) {
+        self.next += 1;
+        self.items.push(Pending {
+            id: self.next,
+            work,
+        });
+    }
+
+    /// Drops the item `id`, if it is still there.
+    pub fn remove(&mut self, id: u64) {
+        self.items.retain(|item| item.id != id);
+    }
+
+    /// Whether nothing is left to do.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// Sets or clears the retry deadline of the todo list: items that are
+/// left need a wake-up in case the request that added them never got to
+/// do them.
+pub(crate) fn arm_todo(deadlines: &mut Deadlines, todo: &Todo, now_ms: u64) {
+    if todo.is_empty() {
+        deadlines.todo_retry_at = None;
+    } else if deadlines.todo_retry_at.is_none() {
+        deadlines.todo_retry_at = Some(now_ms + TODO_RETRY_MS);
+    }
+}
+
+/// What a request from an agent finds when it names a job and the
+/// attempt its token was made for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gate {
+    /// The run has no such job.
+    Missing,
+    /// The token is for another attempt.
+    Stale,
+    /// The job is not waiting for an agent or running.
+    Ended,
+    /// A launch is queued, no agent has the job.
+    Queued,
+    /// An agent has the job.
+    Running,
+}
+
+pub(crate) fn gate(node: Option<&Node>, attempt: u32) -> Gate {
+    let Some(node) = node else {
+        return Gate::Missing;
+    };
+    if node.attempt != attempt {
+        return Gate::Stale;
+    }
+    match node.state {
+        NodeState::Queued => Gate::Queued,
+        NodeState::Running => Gate::Running,
+        NodeState::Waiting | NodeState::Done(_) => Gate::Ended,
+    }
+}
+
+/// Whether the row of a job that `start_job` did not move is already
+/// running for `attempt`, which is what a repeated claim finds.
+pub(crate) fn running_for(status: &str, row_attempt: u32, attempt: u32) -> bool {
+    status == "running" && row_attempt == attempt
 }
 
 /// One job in a [`RunState`].
@@ -292,6 +441,7 @@ pub(crate) fn next_alarm(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) ->
         deadlines.escalate_at,
         deadlines.upload_retry_at,
         deadlines.purge_at,
+        deadlines.todo_retry_at,
         outbox.next_alarm(now_ms),
     ]
     .into_iter()
@@ -307,6 +457,7 @@ pub(crate) struct Due {
     pub(crate) escalate: bool,
     pub(crate) upload: bool,
     pub(crate) purge: bool,
+    pub(crate) todo: bool,
 }
 
 pub(crate) fn due(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) -> Due {
@@ -316,6 +467,7 @@ pub(crate) fn due(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) -> Due {
         escalate: reached(deadlines.escalate_at),
         upload: reached(deadlines.upload_retry_at),
         purge: reached(deadlines.purge_at),
+        todo: reached(deadlines.todo_retry_at),
     }
 }
 
@@ -382,17 +534,19 @@ pub(crate) fn apply_steps(state: &mut JobState, batch: &Batch) -> Applied {
 /// Takes what the agent's final report says about steps and, when no
 /// annotation streamed in, its annotations.
 pub(crate) fn apply_result(state: &mut JobState, result: &JobResult) {
-    state.steps = result
-        .steps
-        .iter()
-        .take(MAX_STEPS)
-        .enumerate()
-        .map(|(index, summary)| StepView {
-            index,
-            name: summary.name.clone(),
-            summary: Some(summary.clone()),
-        })
-        .collect();
+    if !result.steps.is_empty() {
+        state.steps = result
+            .steps
+            .iter()
+            .take(MAX_STEPS)
+            .enumerate()
+            .map(|(index, summary)| StepView {
+                index,
+                name: summary.name.clone(),
+                summary: Some(summary.clone()),
+            })
+            .collect();
+    }
     if state.annotations.is_empty() {
         state.annotations = result
             .annotations
@@ -442,10 +596,17 @@ pub(crate) fn reset_jobs(before: &[(u64, u32)], graph: &Graph) -> Vec<(u64, u32)
 }
 
 /// Whether the ended run may be written to R2 and purged: it ended,
-/// every check run is sent, no upload waits and no purge is set.
-pub(crate) fn snapshot_ready(graph: &Graph, outbox: &Outbox, deadlines: &Deadlines) -> bool {
+/// every check run is sent, no side effect or upload waits and no purge
+/// is set.
+pub(crate) fn snapshot_ready(
+    graph: &Graph,
+    outbox: &Outbox,
+    deadlines: &Deadlines,
+    todo: &Todo,
+) -> bool {
     graph.conclusion().is_some()
         && outbox.is_empty()
+        && todo.is_empty()
         && deadlines.upload_retry_at.is_none()
         && deadlines.purge_at.is_none()
 }
@@ -455,10 +616,13 @@ pub(crate) fn snapshot_ready(graph: &Graph, outbox: &Outbox, deadlines: &Deadlin
 pub(crate) enum Delivery {
     /// It went through.
     Done,
-    /// Try again after this many seconds.
+    /// GitHub throttles: try again after this many seconds.
     Wait(u64),
-    /// Trying again cannot help (a request GitHub rejects).
-    Drop,
+    /// GitHub refuses the request (a 4xx that is not throttling). A
+    /// smaller request may go through.
+    Rejected,
+    /// A server error, a refused token or no answer.
+    Failed,
 }
 
 /// Seconds to wait after `attempt` failed sends in a row: 60, doubling,
@@ -475,9 +639,148 @@ pub(crate) fn delivery(response: &HttpResponse, now_ms: u64, attempt: u32) -> De
         return Delivery::Wait(wait);
     }
     if response.status >= 500 || response.status == 401 {
-        return Delivery::Wait(backoff(attempt));
+        return Delivery::Failed;
     }
-    Delivery::Drop
+    Delivery::Rejected
+}
+
+/// The characters of the summary a minimal update keeps.
+const MINIMAL_SUMMARY_CHARS: usize = 500;
+
+/// `check` with only what ends a check run: its status, conclusion and
+/// times, a short summary and no annotations. Sent once when GitHub
+/// refuses the whole request, so a check run does not stay
+/// `in_progress` for a bad annotation or an oversized body.
+pub(crate) fn minimal_check(check: &CheckRun) -> CheckRun {
+    CheckRun {
+        output: check.output.as_ref().map(|output| Output {
+            title: output.title.clone(),
+            summary: output.summary.chars().take(MINIMAL_SUMMARY_CHARS).collect(),
+            text: None,
+            annotations: Vec::new(),
+        }),
+        ..check.clone()
+    }
+}
+
+/// What came of sending one job's check run request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Flushed {
+    /// It went through. `new_check_run` is the id when it was a create;
+    /// `annotations_sent` is the count of annotations with a file that
+    /// GitHub has now.
+    Sent {
+        new_check_run: Option<u64>,
+        annotations_sent: usize,
+    },
+    /// GitHub throttles us for this many seconds.
+    Throttled(u64),
+    /// The request did not go through, however it was tried.
+    Failed,
+}
+
+/// Records what happened to the request of `job`, made for the mark of
+/// `generation`. Returns whether the flush goes on with the next job.
+///
+/// A failure keeps the mark and backs off. After [`MAX_SEND_TRIES`]
+/// failures in a row the mark is dropped, which the caller logs.
+pub(crate) fn record_flush(
+    state: &mut JobState,
+    outbox: &mut Outbox,
+    job: u64,
+    generation: u64,
+    flushed: &Flushed,
+    now_ms: u64,
+) -> bool {
+    match flushed {
+        Flushed::Sent {
+            new_check_run,
+            annotations_sent,
+        } => {
+            if let Some(id) = new_check_run {
+                state.check_run_id = Some(*id);
+            }
+            state.file_annotations_sent = *annotations_sent;
+            state.send_failures = 0;
+            outbox.sent(job, generation);
+            // More annotations wait for the next request.
+            if *annotations_sent < file_annotations(state) {
+                outbox.mark(job);
+            }
+            true
+        }
+        Flushed::Throttled(seconds) => {
+            outbox.throttled(now_ms, *seconds);
+            false
+        }
+        Flushed::Failed => {
+            state.send_failures += 1;
+            if state.send_failures >= MAX_SEND_TRIES {
+                state.send_failures = 0;
+                outbox.sent(job, generation);
+            } else {
+                // Blocks every job's updates for a while, which is what
+                // a GitHub that fails for one is likely doing for all.
+                outbox.throttled(now_ms, backoff(state.send_failures - 1));
+            }
+            true
+        }
+    }
+}
+
+/// How many annotations with a file the job's check run can get.
+pub(crate) fn file_annotations(state: &JobState) -> usize {
+    state
+        .annotations
+        .iter()
+        .filter(|a| a.file.is_some())
+        .count()
+        .min(MAX_TOTAL_ANNOTATIONS)
+}
+
+/// Which parts of the alarm failed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct Failed {
+    pub(crate) flush: bool,
+    pub(crate) escalate: bool,
+    pub(crate) upload: bool,
+    pub(crate) todo: bool,
+    pub(crate) purge: bool,
+}
+
+/// Sets the deadlines of the parts that failed to `backoff` from now
+/// and counts the failure; an alarm in which nothing failed resets the
+/// count.
+pub(crate) fn reschedule(
+    deadlines: &mut Deadlines,
+    outbox: &mut Outbox,
+    failed: Failed,
+    now_ms: u64,
+) {
+    let any = failed.flush || failed.escalate || failed.upload || failed.todo || failed.purge;
+    if !any {
+        deadlines.failures = 0;
+        return;
+    }
+    let wait = backoff(deadlines.failures);
+    let at = now_ms + wait * 1000;
+    if failed.escalate {
+        deadlines.escalate_at = Some(at);
+    }
+    if failed.upload {
+        deadlines.upload_retry_at = Some(at);
+    }
+    if failed.todo {
+        deadlines.todo_retry_at = Some(at);
+    }
+    if failed.purge {
+        deadlines.purge_at = Some(at);
+    }
+    if failed.flush {
+        outbox.throttled(now_ms, wait);
+    }
+    deadlines.failures += 1;
 }
 
 /// The graph and the steps of every job, as `GET /state` answers.
@@ -522,6 +825,7 @@ fn answer(status: u16) -> Result<Response> {
 #[derive(Serialize)]
 struct LaunchMessage {
     job_id: u64,
+    attempt: u32,
 }
 
 #[derive(Deserialize)]
@@ -534,15 +838,15 @@ struct FailedBody {
     message: String,
 }
 
-/// What a handler works on: the four pieces of state every handler
-/// reads, and which of them it changed.
+/// What a handler works on: the pieces of state every handler reads,
+/// and which of them it changed.
 struct Loaded {
     info: RunInfo,
     graph: Graph,
     outbox: Outbox,
     deadlines: Deadlines,
-    dirty: [bool; 4],
-    restored: bool,
+    todo: Todo,
+    dirty: [bool; 5],
 }
 
 impl Loaded {
@@ -565,25 +869,48 @@ impl Loaded {
         self.dirty[3] = true;
         &mut self.deadlines
     }
+
+    fn todo_mut(&mut self) -> &mut Todo {
+        self.dirty[4] = true;
+        &mut self.todo
+    }
 }
 
 // The macro that exports the object generates methods without docs.
 mod object {
     #![allow(missing_docs)]
 
+    use std::cell::OnceCell;
+
     use async_lock::Mutex;
     use worker::{DurableObject, Env, Request, Response, Result, State, durable_object};
 
-    use super::Cx;
+    use super::{Cx, Settings, fail};
 
     /// One run.
     #[durable_object]
     pub struct RunObject {
         state: State,
         env: Env,
-        /// Handlers wait for GitHub and Postgres, and storage reads let
-        /// another request in meanwhile; this makes them take turns.
+        /// Handlers take turns on the state in storage. The lock is
+        /// held to read and change it and never across a call to
+        /// GitHub, Postgres or the queue.
         turn: Mutex<()>,
+        settings: OnceCell<Settings>,
+    }
+
+    impl RunObject {
+        fn cx(&self) -> Result<Cx<'_>> {
+            if self.settings.get().is_none() {
+                let settings = Settings::read(&self.env).map_err(fail)?;
+                let _ = self.settings.set(settings);
+            }
+            let settings = self
+                .settings
+                .get()
+                .ok_or_else(|| fail("settings are not read"))?;
+            Ok(Cx::new(&self.state, &self.env, &self.turn, settings))
+        }
     }
 
     impl DurableObject for RunObject {
@@ -592,24 +919,30 @@ mod object {
                 state,
                 env,
                 turn: Mutex::new(()),
+                settings: OnceCell::new(),
             }
         }
 
         async fn fetch(&self, mut req: Request) -> Result<Response> {
-            let _turn = self.turn.lock().await;
             let url = req.url()?;
-            let job = url
-                .query_pairs()
-                .find(|(key, _)| key == "job")
-                .and_then(|(_, value)| value.parse::<u64>().ok());
-            let cx = Cx::new(&self.state, &self.env)?;
-            cx.route(&mut req, url.path(), job).await
+            let number = |name: &str| {
+                url.query_pairs()
+                    .find(|(key, _)| key == name)
+                    .and_then(|(_, value)| value.parse::<u64>().ok())
+            };
+            let (job, attempt) = (number("job"), number("attempt"));
+            self.cx()?
+                .route(
+                    &mut req,
+                    url.path(),
+                    job,
+                    attempt.and_then(|a| u32::try_from(a).ok()),
+                )
+                .await
         }
 
         async fn alarm(&self) -> Result<Response> {
-            let _turn = self.turn.lock().await;
-            let cx = Cx::new(&self.state, &self.env)?;
-            cx.alarm().await?;
+            self.cx()?.alarm().await;
             Response::empty()
         }
     }
@@ -618,143 +951,271 @@ mod object {
 pub use object::RunObject;
 
 /// One request or alarm: the clock, the settings and the connections.
-struct Cx {
+struct Cx<'a> {
     storage: Storage,
     env: Env,
+    turn: &'a Mutex<()>,
     /// The object's name, which is the run's id as text.
     name: Option<String>,
-    settings: Settings,
+    settings: &'a Settings,
     now: u64,
     db: OnceCell<Db>,
     github: Counted,
 }
 
-impl Cx {
-    fn new(state: &State, env: &Env) -> Result<Self> {
-        Ok(Self {
+/// One check run request, decided under the lock and sent without it.
+struct Planned {
+    job: u64,
+    generation: u64,
+    check: CheckRun,
+    /// The count of annotations with a file GitHub has once the whole
+    /// request is sent.
+    sent_count: usize,
+    /// The count it has once a minimal request is sent.
+    file_total: usize,
+    check_run_id: Option<u64>,
+    installation: u64,
+    repo: String,
+    attempt: u32,
+}
+
+impl<'a> Cx<'a> {
+    fn new(state: &State, env: &Env, turn: &'a Mutex<()>, settings: &'a Settings) -> Self {
+        Self {
             storage: state.storage(),
             env: env.clone(),
+            turn,
             name: state.id().name(),
-            settings: Settings::read(env).map_err(fail)?,
+            settings,
             now: now_ms(),
             db: OnceCell::new(),
             github: Counted::default(),
-        })
+        }
     }
 
     async fn db(&self) -> Result<&Db> {
         if self.db.get().is_none() {
             let db = Db::connect(&self.env).await?;
-            // Nothing else sets it: handlers take turns.
+            // Nothing else sets it: this request is the only user.
             let _ = self.db.set(db);
         }
         self.db.get().ok_or_else(|| fail("no database"))
     }
 
-    async fn route(&self, req: &mut Request, path: &str, job: Option<u64>) -> Result<Response> {
-        match (req.method(), path) {
+    async fn route(
+        &self,
+        req: &mut Request,
+        path: &str,
+        job: Option<u64>,
+        attempt: Option<u32>,
+    ) -> Result<Response> {
+        let method = req.method();
+        match (&method, path) {
             (Method::Post, "/start") => {
-                let Ok(start) = req.json::<Start>().await else {
-                    return Response::error("bad start", 400);
+                return match req.json::<Start>().await {
+                    Ok(start) => self.start(start).await,
+                    Err(_) => Response::error("bad start", 400),
                 };
-                return self.start(start).await;
             }
             (Method::Post, "/purge") => return self.purge().await,
+            (Method::Post, "/cancel") => return self.cancel().await,
+            (Method::Get, "/state") => {
+                return if self.restore_if_needed().await? {
+                    self.state().await
+                } else {
+                    answer(404)
+                };
+            }
             _ => {}
         }
-        let (restore, gone) = match path {
-            "/rerun" | "/state" => (true, 404),
-            "/claim" | "/events" => (false, 409),
-            _ => (false, 204),
+        let Some(job) = job else {
+            return Response::error("a job is needed", 400);
         };
-        let Some(mut run) = self.loaded(restore).await? else {
-            return answer(gone);
-        };
-        let response = match (req.method(), path, job) {
-            (Method::Get, "/state", _) => {
-                let mut states = Vec::new();
-                for node in &run.graph.jobs {
-                    states.push((node.id, self.job_state(node.id).await?));
-                }
-                Response::from_json(&run_state(&run.info, &run.graph, &states))
-            }
-            (Method::Post, "/cancel", _) => self.cancel(&mut run).await.and_then(|()| answer(204)),
-            (Method::Post, "/claim", Some(job)) => match req.json::<ClaimBody>().await {
-                Ok(body) => self.claim(&mut run, job, body.token).await,
-                Err(_) => Response::error("bad claim", 400),
-            },
-            (Method::Post, "/events", Some(job)) => match req.json::<Batch>().await {
-                Ok(batch) => self.events(&mut run, job, &batch).await,
-                Err(_) => Response::error("bad batch", 400),
-            },
-            (Method::Post, "/result", Some(job)) => match req.json::<JobResult>().await {
-                Ok(result) => self.result(&mut run, job, result).await,
-                Err(_) => Response::error("bad result", 400),
-            },
-            (Method::Post, "/failed", Some(job)) => match req.json::<FailedBody>().await {
-                Ok(body) => self.failed(&mut run, job, body.message).await,
+        match (&method, path) {
+            (Method::Post, "/failed") => match req.json::<FailedBody>().await {
+                Ok(body) => self.failed(job, body.message).await,
                 Err(_) => Response::error("bad failure", 400),
             },
-            (Method::Post, "/rerun", Some(job)) => {
-                self.rerun(&mut run, job).await.and_then(|()| answer(204))
+            (Method::Post, "/rerun") => {
+                if self.restore_if_needed().await? {
+                    self.rerun(job).await
+                } else {
+                    answer(404)
+                }
+            }
+            (Method::Post, "/claim" | "/events" | "/result") => {
+                let Some(attempt) = attempt else {
+                    return Response::error("an attempt is needed", 400);
+                };
+                match path {
+                    "/claim" => match req.json::<ClaimBody>().await {
+                        Ok(body) => self.claim(job, attempt, body.token).await,
+                        Err(_) => Response::error("bad claim", 400),
+                    },
+                    "/events" => match req.json::<Batch>().await {
+                        Ok(batch) => self.events(job, attempt, &batch).await,
+                        Err(_) => Response::error("bad batch", 400),
+                    },
+                    _ => match req.json::<JobResult>().await {
+                        Ok(result) => self.result(job, attempt, result).await,
+                        Err(_) => Response::error("bad result", 400),
+                    },
+                }
             }
             _ => Response::error("not found", 404),
-        }?;
-        if run.dirty.iter().any(|d| *d) || run.restored {
-            self.commit(&mut run).await?;
         }
-        Ok(response)
     }
 
-    async fn alarm(&self) -> Result<()> {
-        let Some(mut run) = self.loaded(false).await? else {
-            return self.storage.delete_alarm().await;
-        };
-        let due = due(&run.deadlines, &run.outbox, self.now);
-        if due.purge {
-            return self.purge().await.map(|_| ());
+    /// Runs each due part of the alarm in its own scope, then sets the
+    /// alarm for what is left. A part that fails is tried again after a
+    /// backoff; planning the next alarm falls back to a fixed wait when
+    /// even that fails.
+    async fn alarm(&self) {
+        if let Err(err) = self.run_alarm().await {
+            worker::console_error!("alarm: {err}");
+            if let Err(err) = self
+                .storage
+                .set_alarm(Duration::from_millis(ALARM_FALLBACK_MS))
+                .await
+            {
+                worker::console_error!("alarm: fallback: {err}");
+            }
         }
-        if due.flush {
-            self.flush(&mut run).await?;
+    }
+
+    async fn run_alarm(&self) -> Result<()> {
+        let due = {
+            let _turn = self.turn.lock().await;
+            let Some(run) = self.loaded().await? else {
+                return self.storage.delete_alarm().await;
+            };
+            due(&run.deadlines, &run.outbox, self.now)
+        };
+        let mut failed = Failed::default();
+        if due.purge {
+            match self.purge_due().await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(err) => {
+                    worker::console_error!("alarm: purge: {err}");
+                    failed.purge = true;
+                }
+            }
+        }
+        if due.flush
+            && let Err(err) = self.flush().await
+        {
+            worker::console_error!("alarm: check runs: {err}");
+            failed.flush = true;
         }
         if due.escalate {
-            run.deadlines_mut().escalate_at = None;
-            // The reply to the agent's next batch carries the new count.
-            run.graph_mut().escalate();
+            let done = self
+                .update(|run| {
+                    run.deadlines_mut().escalate_at = None;
+                    // The reply to the agent's next batch carries the
+                    // new count.
+                    run.graph_mut().escalate();
+                })
+                .await;
+            if let Err(err) = done {
+                worker::console_error!("alarm: escalate: {err}");
+                failed.escalate = true;
+            }
+        }
+        if due.todo
+            && let Err(err) = self.drain().await
+        {
+            worker::console_error!("alarm: side effects: {err}");
+            failed.todo = true;
         }
         if due.upload {
             // Uploads of finished logs retry here (Task 10); a state
             // snapshot that failed is retried by `settle`.
-            run.deadlines_mut().upload_retry_at = None;
+            let done = self
+                .update(|run| run.deadlines_mut().upload_retry_at = None)
+                .await;
+            if let Err(err) = done {
+                worker::console_error!("alarm: uploads: {err}");
+                failed.upload = true;
+            }
         }
+        let now = self.now;
+        self.update(|run| {
+            let Loaded {
+                deadlines, outbox, ..
+            } = run;
+            reschedule(deadlines, outbox, failed, now);
+            run.dirty[2] = true;
+            run.dirty[3] = true;
+        })
+        .await
+    }
+
+    /// Reads the state, lets `change` change it and writes it, with the
+    /// lock held throughout.
+    async fn update(&self, change: impl FnOnce(&mut Loaded)) -> Result<()> {
+        let _turn = self.turn.lock().await;
+        let Some(mut run) = self.loaded().await? else {
+            return Ok(());
+        };
+        change(&mut run);
         self.commit(&mut run).await
     }
 
-    async fn loaded(&self, restore: bool) -> Result<Option<Loaded>> {
+    /// Reads the state. The caller holds the lock.
+    async fn loaded(&self) -> Result<Option<Loaded>> {
         let storage = &self.storage;
         let (Some(info), Some(graph)) = (
             storage.get::<RunInfo>(INFO).await?,
             storage.get::<Graph>(GRAPH).await?,
         ) else {
-            return if restore {
-                self.restore().await
-            } else {
-                Ok(None)
-            };
+            return Ok(None);
         };
         Ok(Some(Loaded {
             info,
             graph,
             outbox: storage.get(OUTBOX).await?.unwrap_or_default(),
             deadlines: storage.get(DEADLINES).await?.unwrap_or_default(),
-            dirty: [false; 4],
-            restored: false,
+            todo: storage.get(TODO).await?.unwrap_or_default(),
+            dirty: [false; 5],
         }))
     }
 
     /// Reads the snapshot of an ended run back into an object that was
-    /// purged. The run's id is the object's name.
-    async fn restore(&self) -> Result<Option<Loaded>> {
+    /// purged, unless it holds the run. The run's id is the object's
+    /// name. Postgres and R2 are read without the lock. Answers whether
+    /// the object holds a run.
+    async fn restore_if_needed(&self) -> Result<bool> {
+        {
+            let _turn = self.turn.lock().await;
+            if self.storage.get::<Graph>(GRAPH).await?.is_some() {
+                return Ok(true);
+            }
+        }
+        let Some(snapshot) = self.fetch_snapshot().await? else {
+            return Ok(false);
+        };
+        let _turn = self.turn.lock().await;
+        if self.storage.get::<Graph>(GRAPH).await?.is_some() {
+            return Ok(true);
+        }
+        self.storage.put(EVENT, &snapshot.event).await?;
+        let mut run = Loaded {
+            info: snapshot.info,
+            graph: snapshot.graph,
+            outbox: Outbox::default(),
+            deadlines: Deadlines {
+                purge_at: Some(self.now + RESTORED_KEEP_MS),
+                ..Deadlines::default()
+            },
+            todo: Todo::default(),
+            dirty: [true; 5],
+        };
+        self.commit(&mut run).await?;
+        Ok(true)
+    }
+
+    async fn fetch_snapshot(&self) -> Result<Option<Snapshot>> {
         let Some(run_id) = self
             .name
             .as_deref()
@@ -776,25 +1237,18 @@ impl Cx {
         let Some(body) = object.body() else {
             return Ok(None);
         };
-        let snapshot: Snapshot = serde_json::from_slice(&body.bytes().await?)
+        let snapshot = serde_json::from_slice(&body.bytes().await?)
             .map_err(|err| fail(format!("run {run_id}: snapshot: {err}")))?;
-        self.storage.put(INFO, &snapshot.info).await?;
-        self.storage.put(GRAPH, &snapshot.graph).await?;
-        self.storage.put(EVENT, &snapshot.event).await?;
-        Ok(Some(Loaded {
-            info: snapshot.info,
-            graph: snapshot.graph,
-            outbox: Outbox::default(),
-            deadlines: Deadlines::default(),
-            dirty: [false; 4],
-            restored: true,
-        }))
+        Ok(Some(snapshot))
     }
 
     /// Writes what the handler changed, snapshots an ended run and sets
-    /// the alarm.
+    /// the alarm. The caller holds the lock.
     async fn commit(&self, run: &mut Loaded) -> Result<()> {
-        self.settle(run).await;
+        arm_todo(&mut run.deadlines, &run.todo, self.now);
+        if run.dirty.iter().any(|dirty| *dirty) {
+            self.settle(run).await;
+        }
         let storage = &self.storage;
         if run.dirty[0] {
             storage.put(INFO, &run.info).await?;
@@ -805,10 +1259,12 @@ impl Cx {
         if run.dirty[2] {
             storage.put(OUTBOX, &run.outbox).await?;
         }
-        if run.dirty[3] {
-            storage.put(DEADLINES, &run.deadlines).await?;
+        if run.dirty[4] {
+            storage.put(TODO, &run.todo).await?;
         }
-        run.dirty = [false; 4];
+        // Not conditional: `arm_todo` and `settle` change the deadlines.
+        storage.put(DEADLINES, &run.deadlines).await?;
+        run.dirty = [false; 5];
         match next_alarm(&run.deadlines, &run.outbox, self.now) {
             Some(at) => {
                 let wait = Duration::from_millis(at.saturating_sub(self.now));
@@ -821,14 +1277,14 @@ impl Cx {
     /// An ended run with nothing left to send is written to R2 and then
     /// purged. A snapshot that fails is tried again after a minute.
     async fn settle(&self, run: &mut Loaded) {
-        if !snapshot_ready(&run.graph, &run.outbox, &run.deadlines) {
+        if !snapshot_ready(&run.graph, &run.outbox, &run.deadlines, &run.todo) {
             return;
         }
         match self.snapshot(run).await {
-            Ok(()) => run.deadlines_mut().purge_at = Some(self.now),
+            Ok(()) => run.deadlines.purge_at = Some(self.now),
             Err(err) => {
                 worker::console_error!("run {}: snapshot: {err}", run.info.run_id);
-                run.deadlines_mut().upload_retry_at = Some(self.now + SNAPSHOT_RETRY_MS);
+                run.deadlines.upload_retry_at = Some(self.now + SNAPSHOT_RETRY_MS);
             }
         }
     }
@@ -849,9 +1305,22 @@ impl Cx {
     }
 
     async fn purge(&self) -> Result<Response> {
+        let _turn = self.turn.lock().await;
         self.storage.delete_alarm().await?;
         self.storage.delete_all().await?;
         answer(204)
+    }
+
+    /// Purges when the deadline is still there. Answers whether it did.
+    async fn purge_due(&self) -> Result<bool> {
+        let _turn = self.turn.lock().await;
+        let deadlines: Deadlines = self.storage.get(DEADLINES).await?.unwrap_or_default();
+        if deadlines.purge_at.is_none_or(|at| at > self.now) {
+            return Ok(false);
+        }
+        self.storage.delete_alarm().await?;
+        self.storage.delete_all().await?;
+        Ok(true)
     }
 
     async fn event(&self) -> Result<Value> {
@@ -874,156 +1343,371 @@ impl Cx {
         self.storage.put(&job_key(job), state).await
     }
 
-    async fn start(&self, start: Start) -> Result<Response> {
-        // The graph is written last, so a start that failed halfway
-        // runs again.
-        if self.storage.get::<Graph>(GRAPH).await?.is_some() {
-            // Delivered again; the run is already held.
-            return answer(204);
+    async fn state(&self) -> Result<Response> {
+        let _turn = self.turn.lock().await;
+        let Some(run) = self.loaded().await? else {
+            return answer(404);
+        };
+        let mut states = Vec::new();
+        for node in &run.graph.jobs {
+            states.push((node.id, self.job_state(node.id).await?));
         }
+        Response::from_json(&run_state(&run.info, &run.graph, &states))
+    }
+
+    /// Does what the todo list says and drops each item once done. The
+    /// lock is taken to read and to drop an item, not while one runs.
+    async fn drain(&self) -> Result<()> {
+        loop {
+            let (info, pending) = {
+                let _turn = self.turn.lock().await;
+                let todo: Todo = self.storage.get(TODO).await?.unwrap_or_default();
+                let Some(first) = todo.items.first().cloned() else {
+                    return Ok(());
+                };
+                let info: RunInfo = self
+                    .storage
+                    .get(INFO)
+                    .await?
+                    .ok_or_else(|| fail("side effects without a run"))?;
+                (info, first)
+            };
+            self.perform(&info, &pending.work).await?;
+            self.update(|run| run.todo_mut().remove(pending.id)).await?;
+        }
+    }
+
+    /// Does one side effect. Each can be repeated.
+    async fn perform(&self, info: &RunInfo, work: &Work) -> Result<()> {
+        let db = self.db().await?;
+        match work {
+            Work::StartRun => store::run_started(db, info.run_id, self.now).await,
+            Work::QueueLaunch { job, attempt } => {
+                // A job that is launching or launched is not queued
+                // again, and no second launch is sent for it.
+                if store::queue_job(db, *job, *attempt, self.now).await? {
+                    self.env
+                        .queue(LAUNCHES)?
+                        .send(LaunchMessage {
+                            job_id: *job,
+                            attempt: *attempt,
+                        })
+                        .await?;
+                }
+                Ok(())
+            }
+            Work::FinishJob {
+                job,
+                conclusion,
+                steps,
+            } => {
+                // The key of the finished log comes with the uploads
+                // (Task 10).
+                store::finish_job(
+                    db,
+                    *job,
+                    conclusion_word(*conclusion),
+                    steps,
+                    None,
+                    self.now,
+                )
+                .await
+                .map(|_| ())
+            }
+            Work::FinishRun { conclusion } => {
+                store::finish_run(db, info.run_id, conclusion_word(*conclusion), self.now).await
+            }
+            Work::ResetJob { job, attempt } => store::reset_job(db, *job, *attempt, self.now).await,
+            Work::ReopenRun { attempt } => {
+                store::reopen_run_at(db, info.run_id, *attempt, self.now).await
+            }
+        }
+    }
+
+    /// Turns what the graph decided into storage changes now and side
+    /// effects on the todo list, and returns the GitHub tokens to
+    /// revoke once the lock is released. The caller holds the lock.
+    async fn apply_actions(&self, run: &mut Loaded, actions: Vec<Action>) -> Result<Vec<String>> {
+        let mut revoke = Vec::new();
+        for action in actions {
+            match action {
+                Action::Launch(job) => {
+                    let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
+                    run.todo_mut().push(Work::QueueLaunch { job, attempt });
+                }
+                Action::Finished { job, conclusion } => {
+                    let mut state = self.job_state(job).await?;
+                    state.completed_at = Some(self.now);
+                    let steps = steps_json(&state.steps);
+                    revoke.extend(state.github_token.take());
+                    self.put_job(job, &state).await?;
+                    run.outbox_mut().mark(job);
+                    run.todo_mut().push(Work::FinishJob {
+                        job,
+                        conclusion,
+                        steps,
+                    });
+                }
+                // The agent learns of a cancel from the reply to its
+                // next batch.
+                Action::Cancel { .. } => {}
+                Action::RunDone(conclusion) => {
+                    run.todo_mut().push(Work::FinishRun { conclusion });
+                }
+            }
+        }
+        Ok(revoke)
+    }
+
+    /// Carries out what a handler decided, after it released the lock:
+    /// the side effects, then the revokes. A failure is logged; the
+    /// todo list keeps what is left and the alarm comes back to it.
+    async fn after(&self, revoke: Vec<String>) {
+        if let Err(err) = self.drain().await {
+            worker::console_error!("side effects: {err}");
+        }
+        for token in revoke {
+            self.revoke(&token).await;
+        }
+    }
+
+    async fn start(&self, start: Start) -> Result<Response> {
         let Start {
             run: info,
             jobs,
             event,
         } = start;
-        let mut run = Loaded {
-            graph: Graph::new(jobs),
-            outbox: Outbox::default(),
-            deadlines: Deadlines::default(),
-            info,
-            dirty: [true; 4],
-            restored: false,
+        let revoke = {
+            let _turn = self.turn.lock().await;
+            // The graph is written last, so a start that failed halfway
+            // runs again.
+            if self.storage.get::<Graph>(GRAPH).await?.is_some() {
+                return answer(204);
+            }
+            let mut run = Loaded {
+                graph: Graph::new(jobs),
+                outbox: Outbox::default(),
+                deadlines: Deadlines::default(),
+                todo: Todo::default(),
+                info,
+                dirty: [true; 5],
+            };
+            let ids: Vec<u64> = run.graph.jobs.iter().map(|n| n.id).collect();
+            for id in ids {
+                run.outbox.mark(id);
+            }
+            self.storage.put(EVENT, &bounded_event(event)).await?;
+            let ctx = self.github_ctx(&run.info).await?;
+            let actions = run.graph.advance(&ctx);
+            run.todo.push(Work::StartRun);
+            let revoke = self.apply_actions(&mut run, actions).await?;
+            self.commit(&mut run).await?;
+            revoke
         };
-        let ids: Vec<u64> = run.graph.jobs.iter().map(|n| n.id).collect();
-        for id in ids {
-            run.outbox.mark(id);
-        }
-        self.storage.put(EVENT, &bounded_event(event)).await?;
-        store::run_started(self.db().await?, run.info.run_id, self.now).await?;
-        let ctx = self.github_ctx(&run.info).await?;
-        let actions = run.graph.advance(&ctx);
-        self.execute(&mut run, actions).await?;
-        self.commit(&mut run).await?;
+        self.after(revoke).await;
         answer(204)
     }
 
-    async fn claim(&self, run: &mut Loaded, job: u64, token: String) -> Result<Response> {
-        let Some(node) = run.graph.node(job) else {
-            return Response::error("no such job", 404);
+    async fn claim(&self, job: u64, attempt: u32, token: String) -> Result<Response> {
+        let first = {
+            let _turn = self.turn.lock().await;
+            let Some(run) = self.loaded().await? else {
+                return answer(409);
+            };
+            gate(run.graph.node(job), attempt)
         };
-        let was = node.state;
-        if !matches!(was, NodeState::Queued | NodeState::Running) {
-            return answer(409);
+        match first {
+            Gate::Missing => return Response::error("no such job", 404),
+            Gate::Stale | Gate::Ended => return answer(409),
+            Gate::Queued => {
+                // The row moves first; a claim that comes again finds it
+                // running for this attempt.
+                let db = self.db().await?;
+                if !store::start_job(db, job, self.now).await? {
+                    let running = store::job(db, job)
+                        .await?
+                        .is_some_and(|row| running_for(&row.status, row.attempt, attempt));
+                    if !running {
+                        return answer(409);
+                    }
+                }
+            }
+            Gate::Running => {}
         }
-        if was == NodeState::Queued && !store::start_job(self.db().await?, job, self.now).await? {
-            return answer(409);
-        }
-        let mut state = self.job_state(job).await?;
-        if let Some(old) = state.github_token.replace(token.clone()) {
+        let (document, old) = {
+            let _turn = self.turn.lock().await;
+            let Some(mut run) = self.loaded().await? else {
+                return answer(409);
+            };
+            let was = run.graph.node(job).map(|node| node.state);
+            match gate(run.graph.node(job), attempt) {
+                Gate::Queued | Gate::Running => {}
+                Gate::Missing => return Response::error("no such job", 404),
+                Gate::Stale | Gate::Ended => return answer(409),
+            }
+            run.graph_mut().running(job);
+            let mut state = self.job_state(job).await?;
+            let old = state.github_token.replace(token.clone());
+            if was == Some(NodeState::Queued) || state.started_at.is_none() {
+                state.started_at = Some(self.now);
+                state.heartbeat_written_at = self.now;
+            }
+            self.put_job(job, &state).await?;
+            let document = job_document(
+                &run.info,
+                &self.event().await?,
+                &run.graph,
+                job,
+                &token,
+                &self.settings.github_api,
+            )
+            .ok_or_else(|| fail("job vanished"))?;
+            self.commit(&mut run).await?;
+            (document, old)
+        };
+        if let Some(old) = old {
             self.revoke(&old).await;
         }
-        if was == NodeState::Queued {
-            state.started_at = Some(self.now);
-            state.heartbeat_written_at = self.now;
-        }
-        self.put_job(job, &state).await?;
-        run.graph_mut().running(job);
-        let document = job_document(
-            &run.info,
-            &self.event().await?,
-            &run.graph,
-            job,
-            &token,
-            &self.settings.github_api,
-        )
-        .ok_or_else(|| fail("job vanished"))?;
         Response::from_json(&document)
     }
 
-    async fn events(&self, run: &mut Loaded, job: u64, batch: &Batch) -> Result<Response> {
-        let Some(node) = run.graph.node(job) else {
-            return Response::error("no such job", 404);
+    async fn events(&self, job: u64, attempt: u32, batch: &Batch) -> Result<Response> {
+        let (reply, heartbeat) = {
+            let _turn = self.turn.lock().await;
+            let Some(mut run) = self.loaded().await? else {
+                return answer(409);
+            };
+            match gate(run.graph.node(job), attempt) {
+                Gate::Running => {}
+                Gate::Missing => return Response::error("no such job", 404),
+                _ => return answer(409),
+            }
+            let cancel = run.graph.node(job).map_or(0, |node| node.cancel);
+            let mut state = self.job_state(job).await?;
+            let applied = apply_steps(&mut state, batch);
+            let mut changed = applied.fresh;
+            if applied.steps_finished > 0 {
+                run.outbox_mut().mark(job);
+            }
+            let heartbeat = should_write_heartbeat(state.heartbeat_written_at, self.now);
+            if heartbeat {
+                state.heartbeat_written_at = self.now;
+                changed = true;
+            }
+            if changed {
+                self.put_job(job, &state).await?;
+            }
+            if run.dirty.iter().any(|dirty| *dirty) {
+                self.commit(&mut run).await?;
+            }
+            (BatchReply { cancel }, heartbeat)
         };
-        if node.state != NodeState::Running {
-            return answer(409);
-        }
-        let reply = BatchReply {
-            cancel: node.cancel,
-        };
-        let mut state = self.job_state(job).await?;
-        let applied = apply_steps(&mut state, batch);
-        let mut changed = applied.fresh;
-        if applied.steps_finished > 0 {
-            run.outbox_mut().mark(job);
-        }
-        if should_write_heartbeat(state.heartbeat_written_at, self.now) {
-            store::heartbeat(self.db().await?, job, self.now).await?;
-            state.heartbeat_written_at = self.now;
-            changed = true;
-        }
-        if changed {
-            self.put_job(job, &state).await?;
+        if heartbeat {
+            // The next one is 30 s away; a miss is not worth failing
+            // the batch.
+            let written = async { store::heartbeat(self.db().await?, job, self.now).await }.await;
+            if let Err(err) = written {
+                worker::console_warn!("job {job}: heartbeat: {err}");
+            }
         }
         Response::from_json(&reply)
     }
 
-    async fn result(&self, run: &mut Loaded, job: u64, result: JobResult) -> Result<Response> {
-        let mut state = self.job_state(job).await?;
-        apply_result(&mut state, &result);
-        let ctx = self.github_ctx(&run.info).await?;
-        let actions = run.graph_mut().finished(job, result, &ctx);
-        if !actions.is_empty() {
+    async fn result(&self, job: u64, attempt: u32, result: JobResult) -> Result<Response> {
+        let revoke = {
+            let _turn = self.turn.lock().await;
+            let Some(mut run) = self.loaded().await? else {
+                return answer(409);
+            };
+            match gate(run.graph.node(job), attempt) {
+                Gate::Queued | Gate::Running => {}
+                Gate::Missing => return Response::error("no such job", 404),
+                _ => return answer(409),
+            }
+            let mut state = self.job_state(job).await?;
+            apply_result(&mut state, &result);
             self.put_job(job, &state).await?;
-        }
-        self.execute(run, actions).await?;
+            let ctx = self.github_ctx(&run.info).await?;
+            let actions = run.graph_mut().finished(job, result, &ctx);
+            let revoke = self.apply_actions(&mut run, actions).await?;
+            self.commit(&mut run).await?;
+            revoke
+        };
+        self.after(revoke).await;
         answer(204)
     }
 
-    async fn failed(&self, run: &mut Loaded, job: u64, message: String) -> Result<Response> {
-        let ctx = self.github_ctx(&run.info).await?;
-        let actions = run.graph_mut().failed(job, message, &ctx);
-        self.execute(run, actions).await?;
+    async fn failed(&self, job: u64, message: String) -> Result<Response> {
+        let revoke = {
+            let _turn = self.turn.lock().await;
+            let Some(mut run) = self.loaded().await? else {
+                return answer(204);
+            };
+            let ctx = self.github_ctx(&run.info).await?;
+            let actions = run.graph_mut().failed(job, message, &ctx);
+            let revoke = self.apply_actions(&mut run, actions).await?;
+            self.commit(&mut run).await?;
+            revoke
+        };
+        self.after(revoke).await;
         answer(204)
     }
 
-    async fn cancel(&self, run: &mut Loaded) -> Result<()> {
-        let ctx = self.github_ctx(&run.info).await?;
-        let actions = run.graph_mut().cancel(&ctx);
-        if run.graph.conclusion().is_none() {
-            run.deadlines_mut()
-                .escalate_at
-                .get_or_insert(self.now + ESCALATE_AFTER_MS);
-        }
-        self.execute(run, actions).await
+    async fn cancel(&self) -> Result<Response> {
+        let revoke = {
+            let _turn = self.turn.lock().await;
+            let Some(mut run) = self.loaded().await? else {
+                return answer(204);
+            };
+            let ctx = self.github_ctx(&run.info).await?;
+            let actions = run.graph_mut().cancel(&ctx);
+            if run.graph.conclusion().is_none() {
+                let at = self.now + ESCALATE_AFTER_MS;
+                run.deadlines_mut().escalate_at.get_or_insert(at);
+            }
+            let revoke = self.apply_actions(&mut run, actions).await?;
+            self.commit(&mut run).await?;
+            revoke
+        };
+        self.after(revoke).await;
+        answer(204)
     }
 
     /// A rerun starts every reset job's attempt from nothing: a new
     /// state (so its batches count from 1 again), its old token revoked,
     /// its log chunks dropped and its row set up for the new attempt.
-    async fn rerun(&self, run: &mut Loaded, job: u64) -> Result<()> {
-        let ctx = self.github_ctx(&run.info).await?;
-        let before = attempts(&run.graph);
-        let actions = run.graph_mut().rerun(job, &ctx);
-        let reset = reset_jobs(&before, &run.graph);
-        if reset.is_empty() {
-            return Ok(());
-        }
-        let db = self.db().await?;
-        for (id, attempt) in reset {
-            if let Some(token) = self.job_state(id).await?.github_token {
-                self.revoke(&token).await;
+    async fn rerun(&self, job: u64) -> Result<Response> {
+        let mut revoke = Vec::new();
+        {
+            let _turn = self.turn.lock().await;
+            let Some(mut run) = self.loaded().await? else {
+                return answer(404);
+            };
+            let ctx = self.github_ctx(&run.info).await?;
+            let before = attempts(&run.graph);
+            let actions = run.graph_mut().rerun(job, &ctx);
+            let reset = reset_jobs(&before, &run.graph);
+            if reset.is_empty() {
+                return answer(204);
             }
-            self.put_job(id, &JobState::default()).await?;
-            self.delete_prefix(&log_prefix(id)).await?;
-            store::reset_job(db, id, attempt, self.now).await?;
-            run.outbox_mut().mark(id);
+            for (id, attempt) in reset {
+                revoke.extend(self.job_state(id).await?.github_token);
+                self.put_job(id, &JobState::default()).await?;
+                self.delete_prefix(&log_prefix(id)).await?;
+                run.todo_mut().push(Work::ResetJob { job: id, attempt });
+                run.outbox_mut().mark(id);
+            }
+            let attempt = run.info.run_attempt + 1;
+            run.todo_mut().push(Work::ReopenRun { attempt });
+            run.info_mut().run_attempt = attempt;
+            let deadlines = run.deadlines_mut();
+            deadlines.purge_at = None;
+            deadlines.escalate_at = None;
+            revoke.extend(self.apply_actions(&mut run, actions).await?);
+            self.commit(&mut run).await?;
         }
-        let attempt = store::reopen_run(db, run.info.run_id, self.now).await?;
-        run.info_mut().run_attempt = attempt;
-        let deadlines = run.deadlines_mut();
-        deadlines.purge_at = None;
-        deadlines.escalate_at = None;
-        self.execute(run, actions).await
+        self.after(revoke).await;
+        answer(204)
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<()> {
@@ -1044,60 +1728,6 @@ impl Cx {
         }
     }
 
-    async fn execute(&self, run: &mut Loaded, actions: Vec<Action>) -> Result<()> {
-        for action in actions {
-            match action {
-                Action::Launch(job) => self.launch(job).await?,
-                Action::Finished { job, conclusion } => {
-                    self.finish_job(run, job, conclusion).await?;
-                }
-                // The agent learns of a cancel from the reply to its
-                // next batch.
-                Action::Cancel { .. } => {}
-                Action::RunDone(conclusion) => {
-                    store::finish_run(
-                        self.db().await?,
-                        run.info.run_id,
-                        conclusion_word(conclusion),
-                        self.now,
-                    )
-                    .await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn launch(&self, job: u64) -> Result<()> {
-        store::set_job(self.db().await?, job, "queued", None, self.now).await?;
-        self.env
-            .queue(LAUNCHES)?
-            .send(LaunchMessage { job_id: job })
-            .await
-    }
-
-    async fn finish_job(&self, run: &mut Loaded, job: u64, conclusion: Conclusion) -> Result<()> {
-        let mut state = self.job_state(job).await?;
-        state.completed_at = Some(self.now);
-        let steps = steps_json(&state.steps);
-        // The key of the finished log comes with the uploads (Task 10).
-        store::finish_job(
-            self.db().await?,
-            job,
-            conclusion_word(conclusion),
-            &steps,
-            None,
-            self.now,
-        )
-        .await?;
-        if let Some(token) = state.github_token.take() {
-            self.revoke(&token).await;
-        }
-        self.put_job(job, &state).await?;
-        run.outbox_mut().mark(job);
-        Ok(())
-    }
-
     /// Revokes a job's GitHub token. A token that stays valid expires
     /// within the hour, so a failure is logged and not retried.
     async fn revoke(&self, token: &str) {
@@ -1112,9 +1742,22 @@ impl Cx {
     }
 
     /// Sends the check run update of each job that is due, one request
-    /// per job. Stops when GitHub throttles.
-    async fn flush(&self, run: &mut Loaded) -> Result<()> {
-        let settings = &self.settings;
+    /// per job. The requests are planned under the lock, sent without
+    /// it, and each answer is recorded under it again. Stops when GitHub
+    /// throttles.
+    async fn flush(&self) -> Result<()> {
+        let plans = {
+            let _turn = self.turn.lock().await;
+            let Some(mut run) = self.loaded().await? else {
+                return Ok(());
+            };
+            let plans = self.plan_flush(&mut run).await?;
+            if run.dirty.iter().any(|dirty| *dirty) {
+                self.commit(&mut run).await?;
+            }
+            plans
+        };
+        let settings = self.settings;
         let tokens = Tokens::new(
             Kv::new(&self.env),
             App::new(
@@ -1125,129 +1768,175 @@ impl Cx {
             &self.github,
             self.now,
         );
-        for job in run.outbox.due(self.now) {
-            let Some(generation) = run.outbox.generation(job) else {
-                continue;
-            };
-            let mut state = self.job_state(job).await?;
-            let Some((check, sent_count)) = self.render_job(run, job, &state) else {
-                run.outbox_mut().sent(job, generation);
-                continue;
-            };
-            match self.deliver(&tokens, run, job, &mut state, &check).await {
-                Delivery::Done => {
-                    state.file_annotations_sent = sent_count;
-                    let with_file = state
-                        .annotations
-                        .iter()
-                        .filter(|a| a.file.is_some())
-                        .count()
-                        .min(MAX_TOTAL_ANNOTATIONS);
-                    self.put_job(job, &state).await?;
-                    let outbox = run.outbox_mut();
-                    outbox.sent(job, generation);
-                    // More annotations wait for the next request.
-                    if sent_count < with_file {
-                        outbox.mark(job);
-                    }
+        for plan in plans {
+            let flushed = self.send(&tokens, &plan).await;
+            let go_on = {
+                let _turn = self.turn.lock().await;
+                let Some(mut run) = self.loaded().await? else {
+                    return Ok(());
+                };
+                let mut state = self.job_state(plan.job).await?;
+                if matches!(flushed, Flushed::Failed) && state.send_failures + 1 >= MAX_SEND_TRIES {
+                    worker::console_error!(
+                        "run {}: check run of job {}: update dropped after {MAX_SEND_TRIES} tries",
+                        run.info.run_id,
+                        plan.job
+                    );
                 }
-                Delivery::Wait(seconds) => {
-                    run.outbox_mut().throttled(self.now, seconds);
-                    break;
-                }
-                Delivery::Drop => run.outbox_mut().sent(job, generation),
+                let now = self.now;
+                let go_on = record_flush(
+                    &mut state,
+                    run.outbox_mut(),
+                    plan.job,
+                    plan.generation,
+                    &flushed,
+                    now,
+                );
+                self.put_job(plan.job, &state).await?;
+                self.commit(&mut run).await?;
+                go_on
+            };
+            if !go_on {
+                break;
             }
         }
         Ok(())
     }
 
-    /// The check run request for `job` and the count of annotations
-    /// with a file GitHub has once it is sent.
-    fn render_job(&self, run: &Loaded, job: u64, state: &JobState) -> Option<(CheckRun, usize)> {
-        let node = run.graph.node(job)?;
-        let view = JobView {
-            workflow: &run.info.workflow,
-            node,
-            head_sha: &run.info.sha,
-            details_url: details_url(
-                &self.settings.app_url,
-                &run.info.repo.full_name,
-                run.info.run_id,
+    /// The request of each job that is due. A job the graph does not
+    /// know has nothing to send and its mark goes.
+    async fn plan_flush(&self, run: &mut Loaded) -> Result<Vec<Planned>> {
+        let mut plans = Vec::new();
+        for job in run.outbox.due(self.now) {
+            let Some(generation) = run.outbox.generation(job) else {
+                continue;
+            };
+            let state = self.job_state(job).await?;
+            let Some(node) = run.graph.node(job) else {
+                run.outbox_mut().sent(job, generation);
+                continue;
+            };
+            let view = JobView {
+                workflow: &run.info.workflow,
+                node,
+                head_sha: &run.info.sha,
+                details_url: details_url(
+                    &self.settings.app_url,
+                    &run.info.repo.full_name,
+                    run.info.run_id,
+                    job,
+                ),
+                steps: &state.steps,
+                annotations: &state.annotations,
+                file_annotations_sent: state.file_annotations_sent,
+                failed_tail: None,
+                started_at: state.started_at,
+                completed_at: state.completed_at,
+            };
+            let (check, sent_count) = render(&view);
+            plans.push(Planned {
                 job,
-            ),
-            steps: &state.steps,
-            annotations: &state.annotations,
-            file_annotations_sent: state.file_annotations_sent,
-            failed_tail: None,
-            started_at: state.started_at,
-            completed_at: state.completed_at,
-        };
-        Some(render(&view))
+                generation,
+                check,
+                sent_count,
+                file_total: file_annotations(&state),
+                check_run_id: state.check_run_id,
+                installation: run.info.installation_id,
+                repo: run.info.repo.full_name.clone(),
+                attempt: run.outbox.attempt(),
+            });
+        }
+        Ok(plans)
     }
 
-    /// Creates or updates the job's check run, and keeps the id GitHub
-    /// answers with in `state`.
-    async fn deliver(
+    /// Sends the request of `plan`. GitHub refusing it is answered with
+    /// a minimal request once.
+    async fn send(&self, tokens: &Tokens<'_, Kv, App, Counted>, plan: &Planned) -> Flushed {
+        let Some(response) = self.request(tokens, plan, &plan.check).await else {
+            return Flushed::Failed;
+        };
+        match delivery(&response, self.now, plan.attempt) {
+            Delivery::Done => Self::sent(plan, &response, plan.sent_count),
+            Delivery::Wait(seconds) => Flushed::Throttled(seconds),
+            Delivery::Failed => Flushed::Failed,
+            Delivery::Rejected => {
+                worker::console_warn!(
+                    "check run of job {}: GitHub answered {}: {}",
+                    plan.job,
+                    response.status,
+                    response.text()
+                );
+                let minimal = minimal_check(&plan.check);
+                let Some(response) = self.request(tokens, plan, &minimal).await else {
+                    return Flushed::Failed;
+                };
+                match delivery(&response, self.now, plan.attempt) {
+                    Delivery::Done => Self::sent(plan, &response, plan.file_total),
+                    Delivery::Wait(seconds) => Flushed::Throttled(seconds),
+                    Delivery::Failed | Delivery::Rejected => Flushed::Failed,
+                }
+            }
+        }
+    }
+
+    /// A request that went through: the id of a check run just made
+    /// must be readable, or the next request would make another.
+    fn sent(plan: &Planned, response: &HttpResponse, annotations_sent: usize) -> Flushed {
+        if plan.check_run_id.is_some() {
+            return Flushed::Sent {
+                new_check_run: None,
+                annotations_sent,
+            };
+        }
+        match check_run_id(response) {
+            Ok(id) => Flushed::Sent {
+                new_check_run: Some(id),
+                annotations_sent,
+            },
+            Err(err) => {
+                worker::console_error!("check run of job {}: {err}", plan.job);
+                Flushed::Failed
+            }
+        }
+    }
+
+    /// Creates or updates the job's check run. `None` when no answer
+    /// came.
+    async fn request(
         &self,
         tokens: &Tokens<'_, Kv, App, Counted>,
-        run: &Loaded,
-        job: u64,
-        state: &mut JobState,
+        plan: &Planned,
         check: &CheckRun,
-    ) -> Delivery {
+    ) -> Option<HttpResponse> {
         let api = &self.settings.github_api;
-        let repo = &run.info.repo.full_name;
-        let installation = run.info.installation_id;
-        let response = match state.check_run_id {
+        let repo = &plan.repo;
+        let response = match plan.check_run_id {
             None => {
                 tokens
-                    .send(installation, |t| create_check_run(api, repo, t, check))
+                    .send(plan.installation, |t| create_check_run(api, repo, t, check))
                     .await
             }
             Some(id) => {
                 tokens
-                    .send(installation, |t| update_check_run(api, repo, id, t, check))
+                    .send(plan.installation, |t| {
+                        update_check_run(api, repo, id, t, check)
+                    })
                     .await
             }
         };
-        let attempt = run.outbox.attempt();
-        let response = match response {
-            Ok(response) => response,
+        match response {
+            Ok(response) => Some(response),
             Err(err) => {
-                worker::console_warn!("run {}: check run of job {job}: {err}", run.info.run_id);
-                return Delivery::Wait(backoff(attempt));
+                worker::console_warn!("check run of job {}: {err}", plan.job);
+                None
             }
-        };
-        match delivery(&response, self.now, attempt) {
-            Delivery::Done if state.check_run_id.is_none() => match check_run_id(&response) {
-                Ok(id) => {
-                    state.check_run_id = Some(id);
-                    Delivery::Done
-                }
-                Err(err) => {
-                    worker::console_error!(
-                        "run {}: check run of job {job}: {err}",
-                        run.info.run_id
-                    );
-                    Delivery::Drop
-                }
-            },
-            Delivery::Drop => {
-                worker::console_error!(
-                    "run {}: check run of job {job}: GitHub answered {}: {}",
-                    run.info.run_id,
-                    response.status,
-                    response.text()
-                );
-                Delivery::Drop
-            }
-            other => other,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::github::GhAnnotation;
     use hatchrun_workflow::agent::AgentEvent;
     use hatchrun_workflow::{AnnotationLevel, StepSummary, compile, parse};
 
@@ -1364,7 +2053,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         let deadlines = Deadlines {
             escalate_at: Some(40_000),
             upload_retry_at: Some(60_000),
-            purge_at: None,
+            ..Deadlines::default()
         };
         assert_eq!(next_alarm(&deadlines, &outbox, 0), Some(40_000));
         let later = Deadlines {
@@ -1386,6 +2075,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             escalate_at: Some(100),
             upload_retry_at: Some(200),
             purge_at: Some(300),
+            ..Deadlines::default()
         };
         let due = due(&deadlines, &outbox, 150);
         assert!(due.flush && due.escalate && !due.upload && !due.purge);
@@ -1521,22 +2211,27 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         let ctx = json!({ "ref": "refs/heads/main", "event": {} });
         let _ = g.advance(&ctx);
         let quiet = (Outbox::default(), Deadlines::default());
-        assert!(!snapshot_ready(&g, &quiet.0, &quiet.1), "jobs still run");
+        let no_todo = Todo::default();
+        let ready = |g: &Graph, o: &Outbox, d: &Deadlines| snapshot_ready(g, o, d, &no_todo);
+        assert!(!ready(&g, &quiet.0, &quiet.1), "jobs still run");
         let failed = |g: &mut Graph, id: u64| {
             let _ = g.failed(id, "m".to_owned(), &ctx);
         };
         failed(&mut g, 1);
         failed(&mut g, 2);
         assert!(g.conclusion().is_some());
-        assert!(snapshot_ready(&g, &quiet.0, &quiet.1));
+        assert!(ready(&g, &quiet.0, &quiet.1));
         let mut marked = Outbox::default();
         marked.mark(1);
-        assert!(!snapshot_ready(&g, &marked, &quiet.1));
+        assert!(!ready(&g, &marked, &quiet.1));
         let pending = Deadlines {
             upload_retry_at: Some(1),
             ..Deadlines::default()
         };
-        assert!(!snapshot_ready(&g, &quiet.0, &pending));
+        assert!(!ready(&g, &quiet.0, &pending));
+        let mut busy = Todo::default();
+        busy.push(Work::StartRun);
+        assert!(!snapshot_ready(&g, &quiet.0, &quiet.1, &busy));
     }
 
     #[test]
@@ -1554,9 +2249,266 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             delivery(&answer(429, &[("retry-after", "7")]), 0, 0),
             Delivery::Wait(7)
         );
-        assert_eq!(delivery(&answer(502, &[]), 0, 0), Delivery::Wait(60));
-        assert_eq!(delivery(&answer(502, &[]), 0, 1), Delivery::Wait(120));
-        assert_eq!(delivery(&answer(422, &[]), 0, 0), Delivery::Drop);
+        assert_eq!(delivery(&answer(502, &[]), 0, 0), Delivery::Failed);
+        assert_eq!(delivery(&answer(401, &[]), 0, 0), Delivery::Failed);
+        assert_eq!(delivery(&answer(422, &[]), 0, 0), Delivery::Rejected);
+    }
+
+    fn marked(job: u64) -> (JobState, Outbox, u64) {
+        let mut outbox = Outbox::default();
+        outbox.mark(job);
+        let generation = outbox.generation(job).unwrap();
+        (JobState::default(), outbox, generation)
+    }
+
+    fn file_annotation() -> Annotation {
+        Annotation {
+            level: AnnotationLevel::Error,
+            message: "m".to_owned(),
+            title: None,
+            file: Some("a.rs".to_owned()),
+            line: Some(1),
+            end_line: None,
+            col: None,
+            end_column: None,
+        }
+    }
+
+    #[test]
+    fn a_rejected_update_is_sent_again_without_annotations() {
+        let check = CheckRun {
+            name: "n".to_owned(),
+            head_sha: "s".to_owned(),
+            external_id: "e".to_owned(),
+            details_url: "u".to_owned(),
+            status: "completed".to_owned(),
+            started_at: None,
+            conclusion: Some("failure".to_owned()),
+            completed_at: Some("t".to_owned()),
+            output: Some(Output {
+                title: "Failed".to_owned(),
+                summary: "x".repeat(5000),
+                text: Some("tail".to_owned()),
+                annotations: vec![GhAnnotation {
+                    path: "a".to_owned(),
+                    start_line: 1,
+                    end_line: 1,
+                    start_column: None,
+                    end_column: None,
+                    annotation_level: "failure".to_owned(),
+                    message: "m".to_owned(),
+                    title: None,
+                }],
+            }),
+        };
+        let minimal = minimal_check(&check);
+        assert_eq!(minimal.status, "completed");
+        assert_eq!(minimal.conclusion.as_deref(), Some("failure"));
+        let output = minimal.output.unwrap();
+        assert_eq!(output.summary.chars().count(), MINIMAL_SUMMARY_CHARS);
+        assert_eq!((output.text, output.annotations), (None, vec![]));
+    }
+
+    #[test]
+    fn a_failed_send_keeps_the_mark_and_backs_off_until_the_fifth_try() {
+        let (mut state, mut outbox, generation) = marked(1);
+        for tries in 1..MAX_SEND_TRIES {
+            assert!(record_flush(
+                &mut state,
+                &mut outbox,
+                1,
+                generation,
+                &Flushed::Failed,
+                0
+            ));
+            assert_eq!(state.send_failures, tries);
+            assert_eq!(outbox.generation(1), Some(generation), "the mark stays");
+            assert!(outbox.due(0).is_empty(), "and the outbox backs off");
+        }
+        assert!(record_flush(
+            &mut state,
+            &mut outbox,
+            1,
+            generation,
+            &Flushed::Failed,
+            0
+        ));
+        assert!(outbox.is_empty(), "the fifth failure drops the mark");
+        assert_eq!(state.send_failures, 0);
+    }
+
+    #[test]
+    fn a_sent_update_records_the_check_run_and_marks_again_while_annotations_wait() {
+        let (mut state, mut outbox, generation) = marked(1);
+        state.annotations = vec![file_annotation(); 60];
+        state.send_failures = 3;
+        let sent = Flushed::Sent {
+            new_check_run: Some(77),
+            annotations_sent: 50,
+        };
+        assert!(record_flush(
+            &mut state,
+            &mut outbox,
+            1,
+            generation,
+            &sent,
+            0
+        ));
+        assert_eq!(state.check_run_id, Some(77));
+        assert_eq!((state.file_annotations_sent, state.send_failures), (50, 0));
+        assert!(outbox.generation(1).is_some_and(|g| g != generation));
+        let last = Flushed::Sent {
+            new_check_run: None,
+            annotations_sent: 60,
+        };
+        let generation = outbox.generation(1).unwrap();
+        record_flush(&mut state, &mut outbox, 1, generation, &last, 0);
+        assert!(outbox.is_empty());
+        assert_eq!(state.check_run_id, Some(77));
+    }
+
+    #[test]
+    fn a_throttled_send_stops_the_flush() {
+        let (mut state, mut outbox, generation) = marked(1);
+        let go_on = record_flush(
+            &mut state,
+            &mut outbox,
+            1,
+            generation,
+            &Flushed::Throttled(30),
+            1_000,
+        );
+        assert!(!go_on);
+        assert_eq!(outbox.generation(1), Some(generation));
+        assert_eq!(outbox.next_alarm(1_000), Some(31_000));
+    }
+
+    #[test]
+    fn a_claim_or_batch_must_name_the_current_attempt() {
+        let mut g = graph();
+        let ctx = json!({ "ref": "refs/heads/main", "event": {} });
+        let _ = g.advance(&ctx);
+        assert_eq!(gate(g.node(1), 1), Gate::Queued);
+        assert_eq!(gate(g.node(1), 2), Gate::Stale);
+        assert_eq!(gate(g.node(404), 1), Gate::Missing);
+        assert_eq!(gate(g.node(2), 1), Gate::Ended, "still waiting");
+        g.running(1);
+        assert_eq!(gate(g.node(1), 1), Gate::Running);
+        let _ = g.finished(
+            1,
+            JobResult {
+                conclusion: Conclusion::Failure,
+                outputs: std::collections::BTreeMap::new(),
+                steps: vec![],
+                annotations: vec![],
+            },
+            &ctx,
+        );
+        assert_eq!(gate(g.node(1), 1), Gate::Ended);
+        // After a rerun the old attempt's token no longer fits.
+        let _ = g.rerun(1, &ctx);
+        assert_eq!(gate(g.node(1), 1), Gate::Stale);
+        assert_eq!(gate(g.node(1), 2), Gate::Queued);
+    }
+
+    #[test]
+    fn a_repeated_claim_finds_the_row_running_for_its_attempt() {
+        assert!(running_for("running", 2, 2));
+        assert!(!running_for("running", 1, 2));
+        assert!(!running_for("completed", 2, 2));
+    }
+
+    #[test]
+    fn the_todo_list_keeps_order_and_drops_by_id() {
+        let mut todo = Todo::default();
+        todo.push(Work::StartRun);
+        todo.push(Work::QueueLaunch { job: 1, attempt: 1 });
+        let first = todo.items[0].id;
+        todo.remove(first);
+        todo.remove(first);
+        assert_eq!(todo.items.len(), 1);
+        todo.push(Work::ReopenRun { attempt: 2 });
+        assert_ne!(todo.items[0].id, todo.items[1].id);
+        assert_eq!(todo.items[0].work, Work::QueueLaunch { job: 1, attempt: 1 });
+    }
+
+    #[test]
+    fn side_effects_left_over_arm_a_retry() {
+        let mut deadlines = Deadlines::default();
+        let mut todo = Todo::default();
+        arm_todo(&mut deadlines, &todo, 5);
+        assert_eq!(deadlines.todo_retry_at, None);
+        todo.push(Work::StartRun);
+        arm_todo(&mut deadlines, &todo, 1_000);
+        assert_eq!(deadlines.todo_retry_at, Some(1_000 + TODO_RETRY_MS));
+        arm_todo(&mut deadlines, &todo, 9_000);
+        assert_eq!(deadlines.todo_retry_at, Some(1_000 + TODO_RETRY_MS));
+        todo.remove(todo.items[0].id);
+        arm_todo(&mut deadlines, &todo, 9_000);
+        assert_eq!(deadlines.todo_retry_at, None);
+    }
+
+    #[test]
+    fn a_failed_part_is_rescheduled_with_backoff_and_the_rest_is_not() {
+        let mut deadlines = Deadlines {
+            escalate_at: Some(1),
+            purge_at: Some(2),
+            ..Deadlines::default()
+        };
+        let mut outbox = Outbox::default();
+        let failed = Failed {
+            escalate: true,
+            todo: true,
+            ..Failed::default()
+        };
+        reschedule(&mut deadlines, &mut outbox, failed, 10_000);
+        assert_eq!(deadlines.escalate_at, Some(70_000));
+        assert_eq!(deadlines.todo_retry_at, Some(70_000));
+        assert_eq!(deadlines.purge_at, Some(2));
+        assert_eq!(deadlines.failures, 1);
+        reschedule(&mut deadlines, &mut outbox, failed, 10_000);
+        assert_eq!(deadlines.escalate_at, Some(130_000));
+        assert_eq!(
+            next_alarm(&deadlines, &outbox, 10_000),
+            Some(2),
+            "the earliest deadline still wins"
+        );
+        reschedule(&mut deadlines, &mut outbox, Failed::default(), 10_000);
+        assert_eq!(deadlines.failures, 0);
+    }
+
+    #[test]
+    fn a_failed_flush_blocks_the_outbox_for_the_backoff() {
+        let mut deadlines = Deadlines::default();
+        let mut outbox = Outbox::default();
+        outbox.mark(1);
+        let failed = Failed {
+            flush: true,
+            ..Failed::default()
+        };
+        reschedule(&mut deadlines, &mut outbox, failed, 0);
+        assert_eq!(outbox.due(59_999), Vec::<u64>::new());
+        assert_eq!(outbox.due(60_000), vec![1]);
+    }
+
+    #[test]
+    fn a_result_without_steps_keeps_the_streamed_ones() {
+        let mut state = JobState {
+            steps: vec![StepView {
+                index: 0,
+                name: "s".to_owned(),
+                summary: None,
+            }],
+            ..JobState::default()
+        };
+        let result = JobResult {
+            conclusion: Conclusion::Success,
+            outputs: std::collections::BTreeMap::new(),
+            steps: vec![],
+            annotations: vec![],
+        };
+        apply_result(&mut state, &result);
+        assert_eq!(state.steps.len(), 1);
     }
 
     #[test]
