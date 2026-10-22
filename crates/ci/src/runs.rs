@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Diagnostic, Event, JobKind, Plan};
+use hatchrun_workflow::{Diagnostic, Event, FREE_UNITS, JobKind, Plan};
 use serde_json::Value;
 use worker::{Env, Method, RequestInit, Result};
 
@@ -20,10 +20,13 @@ use crate::github::{self, CONFIG_PATH, CheckRun, GhAnnotation, Output};
 use crate::intake::{PullRequest, Repo};
 use crate::planning::{self, Failed, Selected};
 use crate::run::{RunInfo, Start};
-use crate::store::{self, JobRow, NewJob, NewRun, RunRow};
+use crate::store::{self, CiBilling, JobRow, NewJob, NewRun, RunRow};
 
 /// The name of the check run that reports an unusable config.
 pub const CONFIG_CHECK: &str = "hatchrun / config";
+
+/// The name of the check run that asks a lapsed tenant for a card.
+pub const CARD_CHECK: &str = "hatchrun / billing";
 
 /// GitHub takes at most this many annotations in one request.
 const MAX_ANNOTATIONS: usize = 50;
@@ -210,13 +213,63 @@ fn failed_check_run(
     }
 }
 
+/// The completed check run that asks `org` for a card: its workflows
+/// would have run, and a tenant without a card runs none.
+#[must_use]
+pub fn no_card_check_run(sha: &str, org: &str, app_url: &str) -> CheckRun {
+    let page = format!("{app_url}/o/{org}/ci");
+    CheckRun {
+        name: CARD_CHECK.to_owned(),
+        head_sha: sha.to_owned(),
+        external_id: String::new(),
+        details_url: page.clone(),
+        status: "completed".to_owned(),
+        started_at: None,
+        conclusion: Some("action_required".to_owned()),
+        completed_at: None,
+        output: Some(Output {
+            title: "hatchrun needs a card".to_owned(),
+            summary: format!(
+                "Add a card for {org} at {page} to run this commit's workflows. \
+                 Each organization gets {FREE_UNITS} free minutes a month."
+            ),
+            text: None,
+            annotations: Vec::new(),
+        }),
+    }
+}
+
+/// What a tenant's billing state does with the workflows of an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Billing {
+    /// Start the runs.
+    Run,
+    /// Start nothing and ask for a card.
+    AskForCard,
+    /// Start nothing and say nothing.
+    Nothing,
+}
+
+/// The tenant with a card runs its `plans`; the one whose subscription
+/// lapsed is asked for a card when a workflow would have run; the one
+/// that never subscribed gets nothing.
+fn billing_decision(billing: CiBilling, plans: usize) -> Billing {
+    match billing {
+        CiBilling::Active => Billing::Run,
+        CiBilling::Lapsed if plans > 0 => Billing::AskForCard,
+        CiBilling::Lapsed | CiBilling::Never => Billing::Nothing,
+    }
+}
+
 /// Starts the runs `req` calls for and returns their ids. `config` is
 /// the config at `req.sha`, which the caller read with [`read_config`]
 /// (the webhook also needs it for schedules and path filters).
 ///
-/// Nothing starts for a tenant that is missing or has CI off, or for a
-/// commit without a config. A config that does not parse or compile
-/// gets one failed check run. Each planned workflow becomes a run with
+/// Nothing starts for a commit without a config, a missing tenant, or a
+/// tenant that never had a CI subscription. A tenant whose subscription
+/// lapsed gets one `action_required` card check run when a workflow
+/// would run, and nothing otherwise. For a tenant with a card, a config
+/// that does not parse or compile gets one failed check run. Each planned workflow becomes a run with
 /// its jobs waiting, and its object is told to start. The same
 /// delivery again finds the runs it made and starts those that did
 /// not start.
@@ -234,18 +287,21 @@ pub async fn create(
     config: &Config,
     now: u64,
 ) -> Result<Vec<u64>> {
-    match store::tenant(db, req.tenant_id).await? {
-        Some(tenant) if tenant.ci_enabled => {}
-        _ => {
-            worker::console_log!("hatchrun CI is not enabled for tenant {}", req.tenant_id);
-            return Ok(Vec::new());
-        }
+    if matches!(config, Config::Missing) {
+        return Ok(Vec::new());
     }
+    let Some(tenant) = store::tenant(db, req.tenant_id).await? else {
+        worker::console_log!("no tenant {} for a CI run", req.tenant_id);
+        return Ok(Vec::new());
+    };
+    let card = tenant.ci_billing == CiBilling::Active;
     let source = match config {
         Config::Missing => return Ok(Vec::new()),
         Config::Text(Ok(source)) => source,
         Config::Text(Err(diagnostic)) => {
-            report_invalid(tokens, settings, req, std::slice::from_ref(diagnostic)).await?;
+            if card {
+                report_invalid(tokens, settings, req, std::slice::from_ref(diagnostic)).await?;
+            }
             return Ok(Vec::new());
         }
     };
@@ -255,10 +311,21 @@ pub async fn create(
             only_failed(failed, req.workflow),
         ),
         Selected::Invalid(diagnostics) => {
-            report_invalid(tokens, settings, req, &diagnostics).await?;
+            if card {
+                report_invalid(tokens, settings, req, &diagnostics).await?;
+            }
             return Ok(Vec::new());
         }
     };
+    match billing_decision(tenant.ci_billing, plans.len()) {
+        Billing::Run => {}
+        Billing::AskForCard => {
+            let check = no_card_check_run(req.sha, &tenant.org_login, &settings.app_url);
+            report_once(tokens, settings, req, &check).await?;
+            return Ok(Vec::new());
+        }
+        Billing::Nothing => return Ok(Vec::new()),
+    }
     for workflow in &failed {
         let check = invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, req.sha);
         report_once(tokens, settings, req, &check).await?;
@@ -465,6 +532,34 @@ mod tests {
         assert!(output.summary.contains("workflow `bad` did not start"));
         assert!(output.summary.contains("names no runner template"));
         assert_eq!(output.annotations.len(), 1);
+    }
+
+    #[test]
+    fn no_card_check_run_asks_for_a_card() {
+        let run = no_card_check_run("abc", "acme", "https://app.example");
+        assert_eq!(run.name, "hatchrun / billing");
+        assert_eq!(CARD_CHECK, run.name);
+        assert_eq!(run.head_sha, "abc");
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.conclusion.as_deref(), Some("action_required"));
+        assert_eq!(run.details_url, "https://app.example/o/acme/ci");
+        let output = run.output.unwrap();
+        assert_eq!(output.title, "hatchrun needs a card");
+        assert_eq!(
+            output.summary,
+            "Add a card for acme at https://app.example/o/acme/ci to run this commit's \
+             workflows. Each organization gets 500 free minutes a month."
+        );
+        assert_eq!(output.annotations.len(), 0);
+    }
+
+    #[test]
+    fn lapsed_without_a_triggered_workflow_reports_nothing() {
+        assert_eq!(billing_decision(CiBilling::Lapsed, 0), Billing::Nothing);
+        assert_eq!(billing_decision(CiBilling::Lapsed, 2), Billing::AskForCard);
+        assert_eq!(billing_decision(CiBilling::Never, 2), Billing::Nothing);
+        assert_eq!(billing_decision(CiBilling::Active, 0), Billing::Run);
+        assert_eq!(billing_decision(CiBilling::Active, 2), Billing::Run);
     }
 
     #[test]

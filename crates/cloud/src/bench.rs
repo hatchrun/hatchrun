@@ -248,8 +248,8 @@ fn seed_people(now: u64) -> Vec<String> {
         ),
         format!(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             current_period_end, cancel_at_period_end, modified_at, updated_at) \
-             SELECT 'sub_' || id, id, 'active', 'cus_' || id, 'prod_hatchrun', \
+             product, current_period_end, cancel_at_period_end, modified_at, updated_at) \
+             SELECT 'sub_' || id, id, 'active', 'cus_' || id, 'prod_hatchrun', 'runners', \
              '2026-12-01T00:00:00Z', false, '2026-10-01T00:00:00Z', {now} FROM tenants \
              WHERE id = '{TENANT}' OR org_id - 9000000 BETWEEN 11 AND 20"
         ),
@@ -420,7 +420,8 @@ fn seed_jobs_after(now: u64) -> Vec<String> {
              CASE WHEN billed AND jobs.completed_at < {now} - 300000 \
                THEN jobs.completed_at + 120000 END \
              FROM jobs JOIN (SELECT id, installation_id, NOT beta AND EXISTS \
-               (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id) \
+               (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
+               AND subscriptions.product = 'runners') \
                AS billed FROM tenants) AS tenants \
              ON tenants.installation_id = jobs.installation_id \
              WHERE jobs.status = 'completed' AND jobs.ran_on IS NOT NULL \

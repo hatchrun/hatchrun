@@ -18,7 +18,7 @@ use crate::github;
 use crate::intake::{self, PullRequest, Push, Rerequested, Trigger};
 use crate::planning;
 use crate::runs::{self, Config};
-use crate::store::{self, RepoRow, TenantRow};
+use crate::store::{self, CiBilling, RepoRow, TenantRow};
 
 /// Secret holding the App's webhook secret.
 const WEBHOOK_SECRET: &str = "GITHUB_WEBHOOK_SECRET";
@@ -29,7 +29,7 @@ const FILE_PAGES: u32 = 3;
 /// Files GitHub lists on a full page.
 const PAGE_SIZE: usize = 100;
 
-const NOT_ENABLED: &str = "hatchrun CI is not enabled for this organization";
+const NEVER_SUBSCRIBED: &str = "this organization has no hatchrun CI subscription";
 
 fn now_ms() -> u64 {
     worker::Date::now().as_millis()
@@ -49,11 +49,14 @@ enum Outcome {
     Retry,
 }
 
-/// The tenant of a delivery, or why the delivery is ignored.
+/// The tenant of a delivery, or why the delivery is ignored. A tenant
+/// that never had a CI subscription is ignored before anything reads
+/// its config; one whose subscription lapsed passes, and
+/// [`runs::create`] answers it with the card check run.
 fn gate(tenant: Option<TenantRow>) -> std::result::Result<TenantRow, &'static str> {
     match tenant {
         None => Err("no tenant for this installation"),
-        Some(tenant) if !tenant.ci_enabled => Err(NOT_ENABLED),
+        Some(tenant) if tenant.ci_billing == CiBilling::Never => Err(NEVER_SUBSCRIBED),
         Some(tenant) => Ok(tenant),
     }
 }
@@ -128,7 +131,7 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         Trigger::Repository(r) => (r.installation_id, &r.repo),
     };
     let found = store::tenant_for_installation(&db, installation_id).await?;
-    // A visibility change is recorded even for a tenant with CI off: the
+    // A visibility change is recorded even for a tenant without CI: the
     // read API shows runs left from before, by the recorded visibility.
     let tenant = match (&trigger, found) {
         (Trigger::Repository(_), Some(tenant)) => tenant,
@@ -367,33 +370,57 @@ mod tests {
 
     use super::*;
 
-    fn tenant_db(ci_enabled: bool) -> TestDb {
+    fn tenant_db() -> TestDb {
         let db = TestDb::new();
         db.run(
-            "INSERT INTO tenants (id, org_id, org_login, installation_id, ci_enabled, \
-             created_at, updated_at) VALUES ('t1', 1, 'acme', 99, $1, 0, 0)",
-            &params![ci_enabled],
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, \
+             updated_at) VALUES ('t1', 1, 'acme', 99, 0, 0)",
+            &[],
         );
         db
     }
 
-    #[test]
-    fn disabled_tenant_is_ignored() {
-        let db = tenant_db(false);
-        let found = db
-            .wait(store::tenant_for_installation(db.db(), 99))
-            .unwrap();
-        assert_eq!(gate(found).unwrap_err(), NOT_ENABLED);
+    fn subscribe(db: &TestDb, status: &str) {
+        db.run(
+            "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
+             product, cancel_at_period_end, modified_at, updated_at) \
+             VALUES ('s1', 't1', $1, 'c', 'p', 'ci', false, 't', 0)",
+            &params![status],
+        );
+    }
+
+    fn found(db: &TestDb) -> Option<TenantRow> {
+        db.wait(store::tenant_for_installation(db.db(), 99))
+            .unwrap()
     }
 
     #[test]
-    fn enabled_tenant_passes_and_unknown_installation_is_ignored() {
-        let db = tenant_db(true);
-        let found = db
-            .wait(store::tenant_for_installation(db.db(), 99))
-            .unwrap();
-        assert_eq!(gate(found).unwrap().id, "t1");
+    fn unknown_installation_is_ignored() {
+        let db = tenant_db();
         let none = db.wait(store::tenant_for_installation(db.db(), 1)).unwrap();
         assert_eq!(gate(none).unwrap_err(), "no tenant for this installation");
+    }
+
+    #[test]
+    fn never_subscribed_tenant_is_ignored_before_the_config() {
+        let db = tenant_db();
+        assert_eq!(gate(found(&db)).unwrap_err(), NEVER_SUBSCRIBED);
+        // A runners subscription is not a CI one.
+        db.run(
+            "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
+             product, cancel_at_period_end, modified_at, updated_at) \
+             VALUES ('r1', 't1', 'active', 'c', 'p', 'runners', false, 't', 0)",
+            &[],
+        );
+        assert_eq!(gate(found(&db)).unwrap_err(), NEVER_SUBSCRIBED);
+    }
+
+    #[test]
+    fn subscribed_and_lapsed_tenants_pass_the_gate() {
+        let db = tenant_db();
+        subscribe(&db, "active");
+        assert_eq!(gate(found(&db)).unwrap().ci_billing, CiBilling::Active);
+        db.run("UPDATE subscriptions SET status = 'canceled'", &[]);
+        assert_eq!(gate(found(&db)).unwrap().ci_billing, CiBilling::Lapsed);
     }
 }

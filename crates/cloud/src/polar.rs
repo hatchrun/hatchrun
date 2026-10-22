@@ -52,6 +52,16 @@ pub fn product_ids(list: &str) -> Vec<String> {
         .collect()
 }
 
+/// `ci` for the CI product, `runners` for anything else.
+#[must_use]
+pub fn product_kind(product_id: &str, ci_product_id: &str) -> &'static str {
+    if !ci_product_id.is_empty() && product_id == ci_product_id {
+        "ci"
+    } else {
+        "runners"
+    }
+}
+
 /// Asks for the product `id`.
 #[must_use]
 pub fn product(api: &str, token: &str, id: &str) -> Request {
@@ -676,6 +686,14 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn product_kind_names_the_ci_product() {
+        assert_eq!(product_kind("p-ci", "p-ci"), "ci");
+        assert_eq!(product_kind("p-run", "p-ci"), "runners");
+        assert_eq!(product_kind("p-run", ""), "runners");
+        assert_eq!(product_kind("", ""), "runners");
     }
 
     #[test]

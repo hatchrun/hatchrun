@@ -197,8 +197,12 @@ DATABASE_MIGRATE_URL="$migrate_url" crates/cloud/scripts/migrate.sh >"$logs/migr
   die "migrations failed: $(cat "$logs/migrate.log")"
 now_ms=$(($(date +%s) * 1000))
 psql_run <<SQL
-INSERT INTO tenants (id, org_id, org_login, installation_id, ci_enabled, created_at, updated_at)
-VALUES ('$TENANT', 1, 'e2e', $INSTALLATION, true, $now_ms, $now_ms);
+INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at)
+VALUES ('$TENANT', 1, 'e2e', $INSTALLATION, $now_ms, $now_ms);
+INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, product,
+                           cancel_at_period_end, modified_at, updated_at)
+VALUES ('sub-e2e', '$TENANT', 'active', 'cus-e2e', 'prod-ci-e2e', 'ci', false,
+        '2026-01-01T00:00:00Z', $now_ms);
 SQL
 
 # 2. Binaries and keys.
