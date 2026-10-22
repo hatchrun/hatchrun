@@ -14,13 +14,16 @@
 //! - `POST /v1/agent/{claim,events,result}` is what the runner agent on
 //!   a launched instance calls: its job document, log batches and
 //!   heartbeats, and its result.
-//! - `/api/*` serves runs, jobs and logs to the app.
+//! - `/api/ci/*` serves runs, jobs and logs to the app and takes its
+//!   dispatch and cancel requests; `hatchrun-cloud` forwards them.
 //!
 //! A Cron Trigger runs the reconciler every minute (stuck jobs,
 //! schedules, expiry), and the `hatchrun-ci-launches` queue starts the
 //! instances. Every other path answers 404.
 
+pub mod access;
 pub mod agent;
+pub mod api;
 pub mod checks;
 pub mod env;
 pub mod github;
@@ -46,6 +49,9 @@ use worker::{
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if req.method() == Method::Post && req.path() == "/github/webhook" {
         return webhook::handle(req, &env).await;
+    }
+    if req.path().starts_with("/api/ci/") {
+        return api::handle(req, &env).await;
     }
     if req.path().starts_with("/v1/agent/") {
         return agent::handle(req, &env).await;

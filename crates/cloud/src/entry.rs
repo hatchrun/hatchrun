@@ -48,6 +48,20 @@ fn forwarded(event: &str) -> bool {
     matches!(event, "push" | "pull_request" | "check_run")
 }
 
+/// Whether `hatchrun-ci` serves `path`: the CI API of the app.
+fn forwards_api(path: &str) -> bool {
+    path.starts_with("/api/ci/")
+}
+
+/// Sends a request under `/api/ci/` to `hatchrun-ci` as it came, cookies
+/// and WebSocket upgrade included. `hatchrun-ci` reads the session
+/// cookie from the shared database, so no identity travels in a header
+/// that a caller could set.
+async fn forward_api(env: &Env, req: Request) -> Result<Response> {
+    let ci = env.service(CI)?;
+    ci.fetch_request(req).await
+}
+
 /// Sends the delivery on to `hatchrun-ci` as it came: the same body and
 /// the signature, event and delivery headers. Its answer goes back
 /// unchanged, so a failure there is a failed delivery that GitHub or the
@@ -88,6 +102,9 @@ async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response>
         let mut response = cache::serve::handle(req, env).await?;
         response.headers_mut().set("Cache-Control", "no-store")?;
         return Ok(response);
+    }
+    if forwards_api(&path) {
+        return forward_api(&env, req).await;
     }
     if path == "/api" || path.starts_with("/api/") {
         let mut response = app::handle(req, env).await?;
@@ -355,6 +372,16 @@ mod tests {
         assert!(!forwarded("workflow_job"));
         assert!(!forwarded("installation"));
         assert!(!forwarded(""));
+    }
+
+    #[test]
+    fn forwards_ci_api_paths() {
+        assert!(forwards_api("/api/ci/runs/1"));
+        assert!(forwards_api("/api/ci/jobs/2/live"));
+        assert!(!forwards_api("/api/session"));
+        assert!(!forwards_api("/api/ci"));
+        assert!(!forwards_api("/api/cinema"));
+        assert!(!forwards_api("/v1/cache/x"));
     }
 
     const NOW: u64 = 1_792_140_000_000;
