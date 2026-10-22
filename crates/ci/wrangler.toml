@@ -74,6 +74,16 @@ max_batch_size = 10
 max_batch_timeout = 5
 max_retries = 3
 
+# The key that seals CI secrets, from the account's Secrets Store. To
+# rotate: add the new secret to the store, point CI_SECRETS_KEY at it
+# with a new CI_SECRETS_KEY_ID, move the old one to CI_SECRETS_KEY_OLD
+# and CI_SECRETS_KEY_OLD_ID, deploy, and drop the old binding once no
+# ci_secrets row has the old key_id.
+[[secrets_store_secrets]]
+binding = "CI_SECRETS_KEY"
+store_id = "<the account's store id: wrangler secrets-store store list>"
+secret_name = "ci-secrets-key-2026-10"
+
 # Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY,
 # OIDC_SIGNING_KEY (signs the token for AssumeRoleWithWebIdentity),
 # BROKER_TOKEN (shared with hatchrun-broker), CI_TOKEN_KEY (the HMAC
@@ -112,3 +122,7 @@ CI_SUBNET_IDS = ""
 # POLAR_API_URL points the Worker at Polar's sandbox
 # (https://sandbox-api.polar.sh).
 POLAR_CI_PRODUCT_ID = ""
+# The id of the key behind CI_SECRETS_KEY, stored with every sealed
+# value, and of the one behind CI_SECRETS_KEY_OLD (empty when none).
+CI_SECRETS_KEY_ID = "2026-10"
+CI_SECRETS_KEY_OLD_ID = ""

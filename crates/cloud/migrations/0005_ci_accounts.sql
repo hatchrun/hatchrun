@@ -47,3 +47,27 @@ CREATE TABLE ci_spend_caps (
 -- Why a queued job waits for a launch: no card, the spend cap, or the
 -- concurrency cap. Cleared when the job is claimed or re-run.
 ALTER TABLE ci_jobs ADD COLUMN held text CHECK (held IN ('card', 'spend_cap', 'concurrency'));
+
+-- Secrets are sealed (AES-256-GCM) with a key that rotates: key_id names
+-- the key that sealed the row, and the associated data binds the value
+-- to its tenant, scope and name. repo_id NULL is an organization value.
+CREATE TABLE ci_secrets (
+  tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+  repo_id bigint REFERENCES ci_repos (id) ON DELETE CASCADE,
+  name text NOT NULL,
+  key_id text NOT NULL,
+  sealed text NOT NULL,                    -- base64 of nonce || ciphertext
+  updated_at bigint NOT NULL,
+  UNIQUE NULLS NOT DISTINCT (tenant_id, repo_id, name)
+);
+CREATE INDEX ci_secrets_key ON ci_secrets (key_id);
+
+-- Vars are plain text, same scoping.
+CREATE TABLE ci_vars (
+  tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+  repo_id bigint REFERENCES ci_repos (id) ON DELETE CASCADE,
+  name text NOT NULL,
+  value text NOT NULL,
+  updated_at bigint NOT NULL,
+  UNIQUE NULLS NOT DISTINCT (tenant_id, repo_id, name)
+);

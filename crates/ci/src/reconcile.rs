@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The reconciler, which the Cron Trigger runs every minute under a
-//! lease on `ci_reconciler` (see [`run`]). A pass does six things, in
+//! lease on `ci_reconciler` (see [`run`]). A pass does seven things, in
 //! order, and an error in one is logged and does not stop the next:
 //!
 //! 1. fires the `on: schedule` workflows of the minutes since the last
@@ -13,7 +13,8 @@
 //! 3. fails the jobs whose runner went quiet;
 //! 4. terminates instances that no job needs;
 //! 5. deletes expired runs and purges their objects;
-//! 6. sends metered usage to Polar.
+//! 6. sends metered usage to Polar;
+//! 7. re-seals secrets that an old key still seals.
 //!
 //! Each step decides over rows and the clock with a pure function
 //! ([`minutes`], [`fires`], [`stalled`], [`orphans`]) and then acts.
@@ -53,6 +54,7 @@ use crate::launcher::Backend;
 use crate::launches::{self, EndAction, LaunchMessage};
 use crate::run::LAUNCHES;
 use crate::runs::{self, Config};
+use crate::secrets;
 use crate::store::{self, CiBilling, JobRow, ScheduleRow};
 
 /// How long the lease holds, in milliseconds.
@@ -435,6 +437,9 @@ pub async fn run(env: Env) {
     }
     if let Err(err) = report_usage(&db, &settings, &Budget::new(share.usage), now).await {
         console_error!("reconcile: usage: {err}");
+    }
+    if let Err(err) = reseal_secrets(&env, &db, &Budget::new(share.reseal)).await {
+        console_error!("reconcile: reseal: {err}");
     }
 }
 
@@ -956,6 +961,49 @@ async fn report_usage(
                         .map_err(|e| e.to_string())?;
                 }
             },
+        }
+    }
+    Ok(())
+}
+
+/// Step 7. Takes up to the budget's worth of secrets that are not
+/// sealed with the current key (one unit per row), opens each with the
+/// keyring and seals it again with the current key. A row that does not
+/// open is logged by name and key id, never by value, and stays for an
+/// operator; a row set again meanwhile is left as it is.
+async fn reseal_secrets(env: &Env, db: &Db, budget: &Budget) -> Result<(), String> {
+    if budget.left() == 0 {
+        return Ok(());
+    }
+    let keyring = secrets::Keyring::load(env).await?;
+    let rows = store::stale_secrets(db, &keyring.current.id, budget.left())
+        .await
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        if !budget.take(1) {
+            break;
+        }
+        let aad = secrets::Aad {
+            tenant: &row.tenant,
+            repo_id: row.repo_id,
+            name: &row.name,
+        };
+        let sealed = secrets::fresh_nonce().and_then(|nonce| {
+            secrets::reseal(&keyring, &row.key_id, &aad, &row.sealed, nonce)
+                .map_err(|err| err.to_string())
+        });
+        match sealed {
+            Ok(sealed) => {
+                store::reseal(db, &row, &keyring.current.id, &sealed)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Err(err) => console_error!(
+                "reconcile: secret {} of tenant {} (key {}) not re-sealed: {err}",
+                row.name,
+                row.tenant,
+                row.key_id
+            ),
         }
     }
     Ok(())
