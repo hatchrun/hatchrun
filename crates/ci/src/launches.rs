@@ -282,7 +282,7 @@ async fn launch_claimed(
     let instance_id = backend.launch(db, &spec).await?;
     if let Err(err) = store_ticket(settings, &ticket, &document).await {
         backend.terminate(&instance_id).await;
-        return Err(Failure::new(Cause::Broker, err));
+        return Err(err);
     }
     match store::launched(db, job.id, &instance_id, now_ms()).await {
         Ok(true) => {
@@ -306,7 +306,7 @@ async fn store_ticket(
     settings: &Settings,
     ticket: &str,
     document: &BootDocument,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     let request = Request::new(
         "PUT",
         format!("{}/v1/tickets/{ticket}", settings.broker_url),
@@ -314,17 +314,30 @@ async fn store_ticket(
     .header("Authorization", format!("Bearer {}", settings.broker_token))
     .header("Content-Type", "application/json")
     .body(broker_body(document).to_string());
-    let response = send(&request)
-        .await
-        .map_err(|err| format!("store boot document: {err}"))?;
+    let response = send(&request).await.map_err(|err| {
+        Failure::new(Cause::Unreachable, format!("store boot document: {err}"))
+    })?;
     if response.ok() {
         Ok(())
     } else {
-        Err(format!(
-            "store boot document: broker answered {}: {}",
-            response.status,
-            response.text()
+        Err(Failure::new(
+            broker_cause(response.status),
+            format!(
+                "store boot document: broker answered {}: {}",
+                response.status,
+                response.text()
+            ),
         ))
+    }
+}
+
+/// A broker that is throttling or failing is worth another launch; a
+/// 4xx answer means the Worker is misconfigured.
+pub(crate) fn broker_cause(status: u16) -> Cause {
+    if status == 429 || status >= 500 {
+        Cause::Unreachable
+    } else {
+        Cause::Broker
     }
 }
 
@@ -556,6 +569,21 @@ mod tests {
             dead_letter_action(&quiet_row("running", 1, 0), 1, now),
             DeadLetter::Leave
         );
+    }
+
+    #[test]
+    fn a_broker_that_throttles_or_fails_is_retried() {
+        for status in [429, 500, 502, 503, 504] {
+            assert_eq!(broker_cause(status), Cause::Unreachable, "{status}");
+            assert_eq!(
+                next_step(&broker_cause(status), 1, 0),
+                Next::Retry { at_ms: 30_000 }
+            );
+        }
+        for status in [400, 401, 403, 404, 409] {
+            assert_eq!(broker_cause(status), Cause::Broker, "{status}");
+            assert_eq!(next_step(&broker_cause(status), 1, 0), Next::Fail);
+        }
     }
 
     #[test]
