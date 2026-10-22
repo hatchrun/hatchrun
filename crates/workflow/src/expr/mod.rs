@@ -173,7 +173,10 @@ pub fn checks_status(cond: &str) -> Result<bool, ExprError> {
 /// Whether a step's or job's `if:` holds. No condition means
 /// `success()`. A condition that calls no status function runs as
 /// `success() && (cond)`, as on GitHub. A `${{ }}` wrapper around the
-/// whole condition is stripped.
+/// whole condition is stripped. A condition that has `${{ }}` but is
+/// not one whole expression, such as `${{ a }} && ${{ b }}`, is a string
+/// template, which is truthy, as on GitHub; its status functions still
+/// decide whether `success()` is implied.
 ///
 /// # Errors
 ///
@@ -187,11 +190,15 @@ pub fn job_condition(
         return Ok(funcs.status() == JobStatus::Success);
     };
     let trimmed = cond.trim();
-    let inner = trimmed
+    let whole = trimmed
         .strip_prefix("${{")
         .and_then(|rest| rest.strip_suffix("}}"))
-        .filter(|inner| !inner.contains("${{"))
-        .map_or(trimmed, str::trim);
+        .filter(|inner| !inner.contains("${{"));
+    if whole.is_none() && find_open(trimmed).is_some() {
+        // The same check as validation: every segment must parse.
+        return Ok(checks_status(trimmed)? || funcs.status() == JobStatus::Success);
+    }
+    let inner = whole.map_or(trimmed, str::trim);
     let wrapped;
     let run = if checks_status(inner)? {
         inner

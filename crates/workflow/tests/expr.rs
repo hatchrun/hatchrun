@@ -620,3 +620,24 @@ fn job_condition_wraps_without_status_calls() {
     assert!(job_condition(Some("${{ 1 == 1 }}"), &ctx, &ok).unwrap());
     assert!(job_condition(Some("(("), &ctx, &ok).is_err());
 }
+
+#[test]
+fn job_condition_mixed_template_is_a_truthy_string() {
+    let ctx = json!({ "github": { "ref": "refs/heads/main" } });
+    let ok = Files(JobStatus::Success);
+    let failed = Files(JobStatus::Failure);
+    let mixed = "${{ github.ref == 'x' }} && ${{ github.ref == 'y' }}";
+    // Both segments are false, the string is not: truthy on GitHub.
+    assert!(job_condition(Some(mixed), &ctx, &ok).unwrap());
+    // success() is still implied when no segment calls a status function.
+    assert!(!job_condition(Some(mixed), &ctx, &failed).unwrap());
+    let always = "${{ always() }} && ${{ false }}";
+    assert!(job_condition(Some(always), &ctx, &failed).unwrap());
+    // Validation and evaluation agree: a bad segment fails both.
+    assert!(job_condition(Some("${{ 1 + }} && ${{ true }}"), &ctx, &ok).is_err());
+    assert!(job_condition(Some("${{ true }} && ${{ false"), &ctx, &ok).is_err());
+    // A text prefix or suffix makes it a template too.
+    assert!(job_condition(Some("x ${{ false }}"), &ctx, &ok).unwrap());
+    // One whole wrapper still evaluates.
+    assert!(!job_condition(Some("${{ false }}"), &ctx, &ok).unwrap());
+}
