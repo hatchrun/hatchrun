@@ -219,6 +219,14 @@ pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, V
 #[must_use]
 pub fn validate(config: &Config) -> Vec<Diagnostic> {
     let mut errors = config_errors(config);
+    for (name, executor) in &config.executors {
+        if template(&executor.runs_on).is_none() {
+            errors.push(unknown_template(
+                &format!("executor `{name}`"),
+                &executor.runs_on,
+            ));
+        }
+    }
     standalone_errors(config, &mut errors);
     let mut budget = Budget::new();
     for (name, wf) in &config.workflows {
@@ -230,22 +238,18 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
     dedup(errors)
 }
 
-/// Problems that belong to the config as a whole, not one workflow.
-fn config_errors(config: &Config) -> Vec<Diagnostic> {
+/// Problems of the config as a whole (command names, filters, crons).
+/// An executor's unknown label is no longer one of them: compile reports
+/// it for a workflow whose job uses the executor, and `validate` still
+/// reports it for every executor.
+#[must_use]
+pub fn config_errors(config: &Config) -> Vec<Diagnostic> {
     let mut errors = Vec::new();
     for name in config.commands.keys() {
         if STEP_KEYS.contains(&name.as_str()) {
             errors.push(Diagnostic::new(format!(
                 "command `{name}` has the name of a step key; rename it"
             )));
-        }
-    }
-    for (name, executor) in &config.executors {
-        if template(&executor.runs_on).is_none() {
-            errors.push(unknown_template(
-                &format!("executor `{name}`"),
-                &executor.runs_on,
-            ));
         }
     }
     filter_errors(config, &mut errors);
@@ -1319,14 +1323,20 @@ fn resolve_template(
             None
         }
         (Some(name), None) => {
-            // An executor's label is checked once, in `config_errors`.
-            let found = config.executors.get(name).map(|e| template(&e.runs_on));
-            if found.is_none() {
+            let Some(executor) = config.executors.get(name) else {
                 errors.push(Diagnostic::new(format!(
                     "{owner} uses executor `{name}`, which is not defined in `executors:`"
                 )));
+                return None;
+            };
+            let found = template(&executor.runs_on);
+            if found.is_none() {
+                errors.push(unknown_template(
+                    &format!("executor `{name}`"),
+                    &executor.runs_on,
+                ));
             }
-            found.flatten()
+            found
         }
         (None, Some(label)) => {
             let found = template(label);

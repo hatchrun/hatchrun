@@ -31,6 +31,7 @@ use hatchrun_cloud::http::Request;
 use hatchrun_cloud::start::{Cause, Failure};
 use hatchrun_cloud::{jwt, webcrypto};
 use hatchrun_workflow::agent::{BootDocument, CiBoot};
+use hatchrun_workflow::{Template, template};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use worker::{
@@ -58,6 +59,8 @@ const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 const TICKET_EXPIRES_IN: u64 = token::BOOT_SECS;
 /// The message that ends a job whose launch message ran out of retries.
 const DEAD_LETTER_MESSAGE: &str = "the launch did not finish";
+/// The message that ends a job whose row names no runner template.
+const NO_TEMPLATE: &str = "job has no runner template";
 /// The message that ends a job that used all its launch attempts.
 const OUT_OF_ATTEMPTS: &str = "the launch did not finish in 3 attempts";
 
@@ -197,7 +200,10 @@ async fn launch(
     if delivery == Delivery::GiveUp {
         return end_job(env, &db, &job, OUT_OF_ATTEMPTS).await;
     }
-    match launch_claimed(&db, settings, backend, &job).await {
+    let Some(template) = runner_template(&job) else {
+        return end_job(env, &db, &job, NO_TEMPLATE).await;
+    };
+    match launch_claimed(&db, settings, backend, &job, template).await {
         Ok(Launched::Started | Launched::MovedOn) => Ok(()),
         Err(failure) => {
             console_error!(
@@ -209,6 +215,11 @@ async fn launch(
             record_failure(env, &db, &job, &failure).await
         }
     }
+}
+
+/// The runner template the job's row names, if it names a known one.
+fn runner_template(job: &JobRow) -> Option<&'static Template> {
+    job.template.as_deref().and_then(template)
 }
 
 /// What a delivered message asks of the consumer.
@@ -254,6 +265,7 @@ async fn launch_claimed(
     settings: &Settings,
     backend: &Backend,
     job: &JobRow,
+    template: &'static Template,
 ) -> Result<Launched, Failure> {
     let internal = |err: String| Failure::new(Cause::Internal, err);
     let now = now_ms();
@@ -278,6 +290,7 @@ async fn launch_claimed(
         job_id: job.id,
         name: crate::reconcile::runner_name(job.id, job.attempt, job.launch_attempts),
         user_data: user_data(&settings.broker_url, &ticket),
+        template,
     };
     let instance_id = backend.launch(db, &spec).await?;
     if let Err(err) = store_ticket(settings, &ticket, &document).await {
@@ -628,8 +641,26 @@ mod tests {
             "launch_attempts": launch_attempts, "next_launch_at": null,
             "timeout_minutes": 10, "updated_at": 0, "heartbeat_at": null,
             "started_at": null, "completed_at": null, "steps": "[]", "log_key": null,
+            "template": "ubuntu-latest", "token_permissions": "{}",
+            "secret_refs": "{\"all\":false,\"names\":[]}",
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_row_without_a_known_template_has_no_runner_template() {
+        let mut job = row("queued", 1, 0);
+        assert_eq!(
+            runner_template(&job).map(|t| t.vcpu),
+            Some(2),
+            "ubuntu-latest"
+        );
+        job.template = Some("ubuntu-26.04-16core-arm".into());
+        assert_eq!(runner_template(&job).map(|t| t.vcpu), Some(16));
+        job.template = Some("ubuntu-24.04".into());
+        assert_eq!(runner_template(&job), None);
+        job.template = None;
+        assert_eq!(runner_template(&job), None);
     }
 
     #[test]

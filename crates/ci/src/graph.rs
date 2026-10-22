@@ -18,8 +18,6 @@ use hatchrun_workflow::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::planning::launchable;
-
 /// The message of an approval job, which ends as skipped for now.
 const APPROVAL_MESSAGE: &str = "Approval jobs come in a later release.";
 
@@ -438,22 +436,14 @@ impl Graph {
 
     /// Decides what becomes of a waiting job whose requirements ended.
     fn start_or_end(&mut self, at: usize, github_ctx: &Value, actions: &mut Vec<Action>) {
-        match self.jobs[at].job.kind {
-            JobKind::Approval => {
-                self.end(
-                    at,
-                    Conclusion::Skipped,
-                    Some(APPROVAL_MESSAGE.to_owned()),
-                    actions,
-                );
-                return;
-            }
-            JobKind::Run { template } => {
-                if let Err(message) = launchable(template) {
-                    self.end(at, Conclusion::Failure, Some(message), actions);
-                    return;
-                }
-            }
+        if matches!(self.jobs[at].job.kind, JobKind::Approval) {
+            self.end(
+                at,
+                Conclusion::Skipped,
+                Some(APPROVAL_MESSAGE.to_owned()),
+                actions,
+            );
+            return;
         }
         match self.decide(at, github_ctx) {
             Ok(true) => {
@@ -520,7 +510,7 @@ mod tests {
 jobs:
   t: { runs-on: ubuntu-latest, steps: [] }
   t2: { runs-on: ubuntu-latest, steps: [], if: always() }
-  big: { runs-on: ubuntu-26.04-4core, steps: [] }
+  huge: { runs-on: ubuntu-26.04-16core-arm, steps: [] }
 ";
 
     fn graph_of(workflow_jobs: &str) -> Graph {
@@ -705,23 +695,10 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { m: { requires: [t] } }] } }
     }
 
     #[test]
-    fn unsupported_template_fails_before_launch() {
-        let mut g = graph_of("[big]");
-        let b = g.jobs[0].id;
-        let actions = g.advance(&ctx());
-        assert_eq!(
-            actions[0],
-            Action::Finished {
-                job: b,
-                conclusion: Conclusion::Failure
-            }
-        );
-        assert_eq!(
-            g.node(b).unwrap().message.as_deref(),
-            Some(
-                "`ubuntu-26.04-4core` runners come in a later release; use ubuntu-latest or ubuntu-26.04"
-            )
-        );
+    fn every_template_launches() {
+        let mut g = graph_of("[huge]");
+        let job = g.jobs[0].id;
+        assert_eq!(g.advance(&ctx()), [Action::Launch(job)]);
     }
 
     #[test]
