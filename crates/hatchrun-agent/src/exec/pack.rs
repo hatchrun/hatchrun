@@ -86,6 +86,46 @@ impl<R: Read> Read for CancelRead<'_, R> {
     }
 }
 
+/// Reads exactly `len` bytes of `inner` and no more. The tar writer pads
+/// an entry by the bytes it copied, so a file that shrinks after its
+/// header was written would leave the archive misaligned: a short read
+/// is an error instead.
+struct Exact<R> {
+    inner: R,
+    left: u64,
+    path: PathBuf,
+}
+
+impl<R: Read> Exact<R> {
+    fn new(inner: R, len: u64, path: &Path) -> Self {
+        Self {
+            inner,
+            left: len,
+            path: path.to_owned(),
+        }
+    }
+}
+
+impl<R: Read> Read for Exact<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.left == 0 {
+            return Ok(0);
+        }
+        let want = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(io::Error::other(format!(
+                "{} shrank while it was archived",
+                self.path.display()
+            )));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
 /// Writes a gzipped tar of `paths` below `root` to `dest` and returns
 /// how many files and links it holds. A path with no components means
 /// everything in `root`. Archive names are the paths as given.
@@ -202,7 +242,7 @@ impl<W: Write> Packer<'_, W> {
                 let mut header = Header::new_gnu();
                 header.set_metadata(&meta);
                 let data = CancelRead {
-                    inner: file.take(meta.len()),
+                    inner: Exact::new(file, meta.len(), archive),
                     cancel: self.cancel,
                 };
                 self.builder
@@ -315,6 +355,19 @@ mod tests {
         let mut a = Archive::new(GzDecoder::new(&out[..]));
         let e = a.entries().unwrap().next().unwrap().unwrap();
         assert_eq!(e.header().entry_type(), EntryType::Symlink);
+    }
+
+    #[test]
+    fn a_file_that_shrinks_fails_the_entry() {
+        let mut short = Exact::new(&b"abc"[..], 10, Path::new("d/f"));
+        let mut out = Vec::new();
+        let err = io::copy(&mut short, &mut out).unwrap_err();
+        assert_eq!(err.to_string(), "d/f shrank while it was archived");
+        // A reader that holds all of its bytes is read to the end.
+        let mut whole = Exact::new(&b"abcdef"[..], 3, Path::new("d/f"));
+        let mut out = Vec::new();
+        io::copy(&mut whole, &mut out).unwrap();
+        assert_eq!(out, b"abc");
     }
 
     #[test]
