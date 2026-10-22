@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use hatchrun_cloud::db::{Db, Param, params};
-use hatchrun_workflow::{Level, SecretRefs};
+use hatchrun_workflow::{Level, SecretRefs, templates};
 use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
 use worker::Result;
@@ -420,16 +420,20 @@ const FINISH_RUN: &str = "UPDATE ci_runs SET status = 'completed', conclusion = 
 /// from the row as the update before it left it: nothing is written
 /// when that update did not apply (another attempt, or a job completed
 /// already), or the job never started or has no template. Minutes run
-/// from start to completion, rounded up, at least one.
+/// from start to completion, rounded up, at least one. `$4` is the JSON map of label to price
+/// per minute and `$5` the price of one unit, so the units are those of the
+/// price when the job ended; a label the map lacks records nothing.
 const RECORD_USAGE: &str = "INSERT INTO ci_usage \
-       (job_id, attempt, tenant_id, template, minutes, ended_at) \
+       (job_id, attempt, tenant_id, template, minutes, units, ended_at) \
      SELECT ci_jobs.id, ci_jobs.attempt, ci_runs.tenant_id, ci_jobs.template, \
-       GREATEST(1, CEIL((ci_jobs.completed_at - ci_jobs.started_at) / 60000.0))::bigint, \
+       m.minutes, m.minutes * ($4::jsonb ->> ci_jobs.template)::bigint / $5, \
        ci_jobs.completed_at \
      FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
+       CROSS JOIN LATERAL (SELECT GREATEST(1, \
+         CEIL((ci_jobs.completed_at - ci_jobs.started_at) / 60000.0))::bigint AS minutes) m \
      WHERE ci_jobs.id = $1 AND ci_jobs.attempt = $3 AND ci_jobs.status = 'completed' \
        AND ci_jobs.completed_at = $2 AND ci_jobs.started_at IS NOT NULL \
-       AND ci_jobs.template IS NOT NULL \
+       AND ($4::jsonb ->> ci_jobs.template) IS NOT NULL \
      ON CONFLICT DO NOTHING";
 
 /// The billing state of a tenant, usage since `$2`, cap default `$3`;
@@ -456,18 +460,21 @@ const OWNER_OF_JOB: &str = "tenants.id = (SELECT ci_runs.tenant_id FROM ci_jobs 
 /// [`STANDING`]'s `{owner}` for tenant `$1`.
 const OWNER_IS_TENANT: &str = "tenants.id = $1::text";
 
-/// The tenant of organization `$1`, compared in lower case, where
-/// `{columns}` is [`TENANT_COLUMNS`].
-const TENANT_BY_ORG: &str = "SELECT {columns} FROM tenants WHERE lower(org_login) = lower($1)";
+/// The tenant of GitHub organization id `$1`, where `{columns}` is
+/// [`TENANT_COLUMNS`]. The id is unique and survives renames; the login
+/// is neither.
+const TENANT_BY_ORG: &str = "SELECT {columns} FROM tenants WHERE org_id = $1";
 
 /// Sets the spend cap of tenant `$1` to `$2` micros at `$3`.
 const SET_SPEND_CAP: &str = "INSERT INTO ci_spend_caps (tenant_id, cap_micros, updated_at) \
      VALUES ($1, $2, $3) \
      ON CONFLICT (tenant_id) DO UPDATE SET cap_micros = $2, updated_at = $3";
 
-/// Usage Polar has not taken, oldest first, at most `$1`.
-const UNSENT_USAGE: &str = "SELECT job_id, attempt, tenant_id, template, minutes, ended_at \
-     FROM ci_usage WHERE sent_at IS NULL ORDER BY ended_at, job_id, attempt LIMIT $1";
+/// Usage Polar has not taken and has not refused, oldest first, at
+/// most `$1`.
+const UNSENT_USAGE: &str = "SELECT job_id, attempt, tenant_id, template, minutes, units, ended_at \
+     FROM ci_usage WHERE sent_at IS NULL AND rejected_at IS NULL \
+     ORDER BY ended_at, job_id, attempt LIMIT $1";
 
 /// Drops the schedules of repository `$1`.
 const DELETE_SCHEDULES: &str = "DELETE FROM ci_schedules WHERE repo_id = $1";
@@ -535,7 +542,7 @@ pub const SWEEP_LIMIT: u32 = 100;
 const SWEEP_DELIVERIES: &str = "DELETE FROM ci_deliveries WHERE received_at < $1";
 
 /// Deletes usage Polar took before `$1`.
-const SWEEP_USAGE: &str = "DELETE FROM ci_usage WHERE sent_at < $1";
+const SWEEP_USAGE: &str = "DELETE FROM ci_usage WHERE sent_at < $1 OR rejected_at < $1";
 
 /// How long sent usage rows are kept, in milliseconds.
 const USAGE_RETENTION_MS: u64 = 90 * 86_400_000;
@@ -680,15 +687,15 @@ pub async fn tenant_standing(
         .transpose()
 }
 
-/// The tenant of organization `org`, however its login is cased.
+/// The tenant of the GitHub organization with id `org_id`.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn tenant_by_org(db: &Db, org: &str) -> Result<Option<TenantRow>> {
+pub async fn tenant_by_org_id(db: &Db, org_id: u64) -> Result<Option<TenantRow>> {
     db.first(
         &TENANT_BY_ORG.replace("{columns}", TENANT_COLUMNS),
-        &params![org],
+        &params![org_id],
     )
     .await
 }
@@ -717,6 +724,8 @@ pub struct UnsentUsage {
     pub template: String,
     /// The minutes the attempt ran.
     pub minutes: u64,
+    /// The billing units, priced when the attempt completed.
+    pub units: u64,
     /// When the attempt completed, in milliseconds.
     pub ended_at: u64,
 }
@@ -737,18 +746,49 @@ pub async fn unsent_usage(db: &Db, limit: u32) -> Result<Vec<UnsentUsage>> {
 ///
 /// Postgres refused the statement.
 pub async fn usage_sent(db: &Db, keys: &[(u64, u32)], now: u64) -> Result<()> {
+    mark_usage("sent_at = $1", &[], keys, now, db).await
+}
+
+/// Quarantines the usage of the `(job, attempt)` pairs in `keys`:
+/// Polar refused it for good, so it is never sent again.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn usage_rejected(db: &Db, keys: &[(u64, u32)], reason: &str, now: u64) -> Result<()> {
+    mark_usage(
+        "rejected_at = $1, reject_reason = $2",
+        &[Param::from(reason)],
+        keys,
+        now,
+        db,
+    )
+    .await
+}
+
+/// Sets `assignments` on the open usage rows of `keys`. `$1` is `now`
+/// and `extra` binds `$2` on.
+async fn mark_usage(
+    assignments: &str,
+    extra: &[Param],
+    keys: &[(u64, u32)],
+    now: u64,
+    db: &Db,
+) -> Result<()> {
     if keys.is_empty() {
         return Ok(());
     }
+    let first = extra.len() + 2;
     let pairs: Vec<String> = (0..keys.len())
-        .map(|n| format!("(${}, ${})", 2 * n + 2, 2 * n + 3))
+        .map(|n| format!("(${}, ${})", first + 2 * n, first + 2 * n + 1))
         .collect();
     let sql = format!(
-        "UPDATE ci_usage SET sent_at = $1 WHERE sent_at IS NULL \
+        "UPDATE ci_usage SET {assignments} WHERE sent_at IS NULL AND rejected_at IS NULL \
          AND (job_id, attempt) IN ({})",
         pairs.join(", ")
     );
     let mut bound: Vec<Param> = vec![Param::from(now)];
+    bound.extend(extra.iter().cloned());
     for (job, attempt) in keys {
         bound.push(Param::from(*job));
         bound.push(Param::from(*attempt));
@@ -1208,10 +1248,32 @@ pub async fn finish_job(
                 FINISH_JOB,
                 params![job_id, conclusion, steps.to_string(), log_key, now, attempt],
             ),
-            (RECORD_USAGE, params![job_id, now, attempt]),
+            (
+                RECORD_USAGE,
+                params![
+                    job_id,
+                    now,
+                    attempt,
+                    template_prices(),
+                    templates::UNIT_PRICE_MICROS
+                ],
+            ),
         ])
         .await?;
     Ok(changes.first() == Some(&1))
+}
+
+/// The price per minute of every template label, as JSON text.
+fn template_prices() -> String {
+    let prices: BTreeMap<&str, u64> = templates::TEMPLATES
+        .iter()
+        .flat_map(|t| {
+            t.labels
+                .iter()
+                .map(|label| (*label, t.price_micros_per_minute))
+        })
+        .collect();
+    serde_json::to_string(&prices).unwrap_or_default()
 }
 
 /// Completes attempt `attempt` of run `run_id` with its `conclusion`; a
@@ -2665,6 +2727,17 @@ mod tests {
             );
         }
         assert_eq!(got, [1, 1, 1, 2]);
+        // 2 vCPU: one unit a minute, priced when the job ended.
+        assert!(usage_rows(&db).iter().all(|r| {
+            r.3 == db
+                .rows(
+                    "SELECT units FROM ci_usage WHERE job_id = $1",
+                    &params![r.0],
+                )
+                .unwrap()[0]["units"]
+                .as_u64()
+                .unwrap()
+        }));
     }
 
     #[test]
@@ -2683,8 +2756,8 @@ mod tests {
             (4, "t2", "ubuntu-latest", 100, month + DAY),
         ] {
             db.run(
-                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, ended_at) \
-                 VALUES ($1, 1, $2, $3, $4, $5)",
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
+                 ended_at) VALUES ($1, 1, $2, $3, $4, $4, $5)",
                 &params![job, tenant, template, minutes, ended],
             );
         }
@@ -2778,11 +2851,16 @@ mod tests {
             (3, None),
         ] {
             db.run(
-                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, ended_at, \
-                 sent_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 1, 0, $2)",
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
+                 ended_at, sent_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 1, 1, 0, $2)",
                 &params![job, sent],
             );
         }
+        db.run(
+            "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
+             ended_at, rejected_at) VALUES (4, 1, 't1', 'ubuntu-latest', 1, 1, 0, $1)",
+            &params![now - 91 * DAY],
+        );
         db.wait(sweep(db.db(), now)).unwrap();
         assert_eq!(
             usage_rows(&db).iter().map(|r| r.0).collect::<Vec<_>>(),
@@ -2809,9 +2887,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(s.cap_micros, 60_000_000);
-        let t = db.wait(tenant_by_org(db.db(), "ACME")).unwrap().unwrap();
+        let t = db.wait(tenant_by_org_id(db.db(), 1)).unwrap().unwrap();
         assert_eq!(t.id, "t1");
-        assert!(db.wait(tenant_by_org(db.db(), "nobody")).unwrap().is_none());
+        assert!(db.wait(tenant_by_org_id(db.db(), 2)).unwrap().is_none());
     }
 
     #[test]
@@ -2819,8 +2897,8 @@ mod tests {
         let db = setup();
         for (job, attempt, ended) in [(3, 1, 30), (1, 1, 10), (1, 2, 20), (2, 1, 20)] {
             db.run(
-                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, ended_at) \
-                 VALUES ($1, $2, 't1', 'ubuntu-latest', 4, $3)",
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
+                 ended_at) VALUES ($1, $2, 't1', 'ubuntu-latest', 4, 4, $3)",
                 &params![job, attempt, ended],
             );
         }
@@ -2831,12 +2909,29 @@ mod tests {
         assert_eq!(keys(&all), [(1, 1), (1, 2), (2, 1), (3, 1)]);
         assert_eq!(all[0].tenant_id, "t1");
         assert_eq!(all[0].minutes, 4);
+        assert_eq!(all[0].units, 4);
         let two = db.wait(unsent_usage(db.db(), 2)).unwrap();
         assert_eq!(keys(&two), [(1, 1), (1, 2)]);
         db.wait(usage_sent(db.db(), &keys(&two), 99)).unwrap();
         db.wait(usage_sent(db.db(), &[], 99)).unwrap();
         let rest = db.wait(unsent_usage(db.db(), 10)).unwrap();
         assert_eq!(keys(&rest), [(2, 1), (3, 1)]);
+        // A quarantined row is never listed again, nor marked sent.
+        db.wait(usage_rejected(db.db(), &[(2, 1)], "no such customer", 150))
+            .unwrap();
+        db.wait(usage_sent(db.db(), &[(2, 1)], 160)).unwrap();
+        let rest = db.wait(unsent_usage(db.db(), 10)).unwrap();
+        assert_eq!(keys(&rest), [(3, 1)]);
+        let row = db
+            .rows(
+                "SELECT sent_at, rejected_at, reject_reason FROM ci_usage \
+                 WHERE job_id = 2",
+                &[],
+            )
+            .unwrap();
+        assert!(row[0]["sent_at"].is_null());
+        assert_eq!(row[0]["rejected_at"].as_u64(), Some(150));
+        assert_eq!(row[0]["reject_reason"].as_str(), Some("no such customer"));
         // A second mark does not move the time.
         db.wait(usage_sent(db.db(), &[(1, 1)], 200)).unwrap();
         let sent = db

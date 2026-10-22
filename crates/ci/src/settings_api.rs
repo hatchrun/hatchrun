@@ -177,24 +177,29 @@ pub(crate) async fn handle(
     }
 }
 
-/// The tenant of `org`, when the caller is an admin of the
-/// organization. Anyone else sees a `404`.
+/// The tenant of `org`, when the caller is an admin of the GitHub
+/// organization. The tenant is found by the organization's id from
+/// GitHub, never by the login, which a renamed organization leaves
+/// behind and another can take. Anyone else sees a `404`.
 async fn admin_tenant(cx: &Cx<'_>, org: &str) -> Result<Served<TenantRow>> {
     let Some(session) = cx.session else {
         return Ok(stop(401, "sign in to manage billing"));
     };
-    let Some(tenant) = store::tenant_by_org(cx.db, org).await? else {
-        return Ok(stop(404, "not found"));
+    let org_id = match access::org_admin(cx.settings, session, org).await {
+        Ok(Some(org_id)) => org_id,
+        Ok(None) => return Ok(stop(404, "not found")),
+        Err(Failure::Retry(wait)) => {
+            return Ok(Err(Stop(
+                503,
+                "GitHub is rate limiting; try again shortly".to_owned(),
+                Some(wait),
+            )));
+        }
+        Err(Failure::Worker(err)) => return Err(err),
     };
-    match access::org_admin(cx.settings, session, org).await {
-        Ok(true) => Ok(Ok(tenant)),
-        Ok(false) => Ok(stop(404, "not found")),
-        Err(Failure::Retry(wait)) => Ok(Err(Stop(
-            503,
-            "GitHub is rate limiting; try again shortly".to_owned(),
-            Some(wait),
-        ))),
-        Err(Failure::Worker(err)) => Err(err),
+    match store::tenant_by_org_id(cx.db, org_id).await? {
+        Some(tenant) => Ok(Ok(tenant)),
+        None => Ok(stop(404, "not found")),
     }
 }
 

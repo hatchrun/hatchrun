@@ -276,6 +276,11 @@ pub fn ingest(api: &str, token: &str, events: &[Minutes<'_>]) -> Request {
 /// CI usage meter sums their `units`.
 pub const CI_USAGE_EVENT: &str = "ci.usage";
 
+/// Most CI usage events in one ingest call. Polar documents no limit,
+/// so this stays small: a batch with one refused event splits down to
+/// it in about 2 * log2(100) calls.
+pub const CI_INGEST_BATCH: usize = 100;
+
 /// One CI job attempt's usage, as Polar's meter takes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiUsage<'a> {
