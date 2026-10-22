@@ -35,8 +35,9 @@ on:
 permissions: {}
 
 concurrency:
-  # One group for both: each runs migrate.sh, and the runs must not overlap.
-  group: deploy-database-migrations
+  # migrate.sh locks schema_migrations, so this and the other deploy that
+  # runs it can overlap.
+  group: deploy-ci
   cancel-in-progress: false
 
 env:

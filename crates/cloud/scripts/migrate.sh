@@ -5,8 +5,15 @@
 
 # Applies crates/cloud/migrations to the Postgres in DATABASE_MIGRATE_URL,
 # in file name order, each file once. schema_migrations records the ones
-# applied. Each file runs in its own transaction with its record, so a
-# failing file changes nothing and the next run starts from it.
+# applied.
+#
+# The whole pass runs in one transaction that first takes an ACCESS
+# EXCLUSIVE lock on schema_migrations. Two runners at once (deploy-cloud
+# and deploy-ci) therefore take turns: the second waits for the lock,
+# then sees the first one's migrations as applied. PlanetScale Postgres
+# has no advisory locks, so the table lock does that job. A failing file
+# rolls the whole pass back and the next run starts again from the
+# first unapplied file.
 #
 # The deploy workflow runs this as the migrate role before the Worker
 # deploys. Locally:
@@ -23,23 +30,37 @@ psql() {
   command psql "$DATABASE_MIGRATE_URL" --no-psqlrc --quiet -v ON_ERROR_STOP=1 "$@"
 }
 
-psql -c "SET client_min_messages = warning;
+# Two runners that find the table missing can both try to create it, and
+# the loser fails on a catalog unique index. It finds the table on the
+# second try.
+for try in 1 2 3; do
+  if psql -c "SET client_min_messages = warning;
 CREATE TABLE IF NOT EXISTS schema_migrations (
   name text PRIMARY KEY,
   applied_at timestamptz NOT NULL DEFAULT now()
-)"
-
-for file in "$dir"/*.sql; do
-  name="$(basename "$file")"
-  applied="$(psql -At -v name="$name" <<'SQL'
-SELECT 1 FROM schema_migrations WHERE name = :'name'
-SQL
-)"
-  if [[ -n "$applied" ]]; then
-    continue
+)"; then
+    break
+  elif [[ "$try" == 3 ]]; then
+    exit 1
   fi
-  echo "Applying $name"
-  psql --single-transaction -v name="$name" -f "$file" -f - <<'SQL'
-INSERT INTO schema_migrations (name) VALUES (:'name');
-SQL
+  sleep 1
 done
+
+# One psql session reads this script from stdin. \gset and \if choose,
+# after the lock is held, which files still need to run.
+{
+  echo "BEGIN;"
+  echo "LOCK TABLE schema_migrations IN ACCESS EXCLUSIVE MODE;"
+  for file in "$dir"/*.sql; do
+    name="$(basename "$file")"
+    echo "\\set name '$name'"
+    echo "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE name = :'name') AS applied \\gset"
+    echo "\\if :applied"
+    echo "\\else"
+    echo "\\echo Applying $name"
+    echo "\\i $file"
+    echo "INSERT INTO schema_migrations (name) VALUES (:'name');"
+    echo "\\endif"
+  done
+  echo "COMMIT;"
+} | psql
