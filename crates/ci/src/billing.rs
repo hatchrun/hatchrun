@@ -45,6 +45,67 @@ pub fn spend_micros(standing: &Standing) -> u64 {
     templates::spend_micros(units(standing))
 }
 
+/// How long a held job waits before its caps are checked again, in
+/// milliseconds.
+pub const HOLD_RECHECK_MS: u64 = 30_000;
+
+/// Why a queued job does not launch yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// The tenant has no card.
+    Card,
+    /// This month's spend reached the tenant's cap.
+    SpendCap,
+    /// The tenant already runs [`templates::MAX_RUNNING_JOBS`] jobs.
+    Concurrency,
+}
+
+impl Hold {
+    /// The word the `ci_jobs.held` column stores.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Card => "card",
+            Self::SpendCap => "spend_cap",
+            Self::Concurrency => "concurrency",
+        }
+    }
+
+    /// What the job's check run tells the user.
+    #[must_use]
+    pub fn message(self, org: &str, app_url: &str, cap_micros: u64) -> String {
+        match self {
+            Self::Card => {
+                format!("Waiting for a card. Add one for {org} at {app_url}/o/{org}/ci.")
+            }
+            Self::SpendCap => format!(
+                "Waiting: {org} reached its {} monthly spend cap. Raise it at {app_url}/o/{org}/ci.",
+                templates::dollars(cap_micros)
+            ),
+            Self::Concurrency => format!(
+                "Waiting: {org} has {} jobs running, the most at once. \
+                 This job starts when one of them ends.",
+                templates::MAX_RUNNING_JOBS
+            ),
+        }
+    }
+}
+
+/// The first binding cap, in this order: card, spend cap (spend at or
+/// past the cap), concurrency.
+#[must_use]
+pub fn admission(standing: &Standing) -> Option<Hold> {
+    if !standing.card {
+        Some(Hold::Card)
+    } else if spend_micros(standing) >= standing.cap_micros {
+        Some(Hold::SpendCap)
+    } else if standing.running >= templates::MAX_RUNNING_JOBS {
+        Some(Hold::Concurrency)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +136,43 @@ mod tests {
         assert_eq!(spend_micros(&s), 200_000);
         assert_eq!(spend_micros(&standing(&[("ubuntu-latest", 500)])), 0);
         assert_eq!(units(&standing(&[("no-such", 9)])), 0);
+    }
+
+    #[test]
+    fn admission_order() {
+        let mut s = standing(&[("ubuntu-latest", 100_000)]);
+        s.card = false;
+        s.running = 5;
+        assert_eq!(admission(&s), Some(Hold::Card));
+        s.card = true;
+        s.minutes_by_template = vec![("ubuntu-latest".into(), 25_500)];
+        assert_eq!(spend_micros(&s), templates::DEFAULT_SPEND_CAP_MICROS);
+        assert_eq!(admission(&s), Some(Hold::SpendCap));
+        s.minutes_by_template = vec![("ubuntu-latest".into(), 600)];
+        assert_eq!(admission(&s), Some(Hold::Concurrency));
+        s.running = 4;
+        assert_eq!(admission(&s), None);
+    }
+
+    #[test]
+    fn hold_messages() {
+        let app = "https://app.hatchrun.io";
+        assert_eq!(
+            Hold::Card.message("acme", app, 50_000_000),
+            "Waiting for a card. Add one for acme at https://app.hatchrun.io/o/acme/ci."
+        );
+        assert_eq!(
+            Hold::SpendCap.message("acme", app, 50_000_000),
+            "Waiting: acme reached its $50.00 monthly spend cap. Raise it at \
+             https://app.hatchrun.io/o/acme/ci."
+        );
+        assert_eq!(
+            Hold::Concurrency.message("acme", app, 50_000_000),
+            "Waiting: acme has 5 jobs running, the most at once. \
+             This job starts when one of them ends."
+        );
+        assert_eq!(Hold::Card.as_str(), "card");
+        assert_eq!(Hold::SpendCap.as_str(), "spend_cap");
+        assert_eq!(Hold::Concurrency.as_str(), "concurrency");
     }
 }

@@ -776,6 +776,17 @@ mod tests {
     }
 
     #[test]
+    fn held_job_is_requeued_when_due() {
+        let mut held = row("queued");
+        held.next_launch_at = Some(NOW + 30_000);
+        assert_eq!(stalled(&[held.clone()], NOW), []);
+        assert_eq!(stalled(&[held.clone()], NOW + 29_999), []);
+        assert_eq!(stalled(&[held.clone()], NOW + 30_000), [Fix::Requeue(1)]);
+        held.updated_at = NOW + 30_000;
+        assert_eq!(stalled(&[held], NOW + 60_000), [Fix::Requeue(1)]);
+    }
+
+    #[test]
     fn requeues_a_quiet_queued_job() {
         let mut quiet = row("queued");
         quiet.updated_at = NOW - 61_000;

@@ -40,3 +40,7 @@ CREATE TABLE ci_spend_caps (
   cap_micros bigint NOT NULL CHECK (cap_micros > 0),
   updated_at bigint NOT NULL
 );
+
+-- Why a queued job waits for a launch: no card, the spend cap, or the
+-- concurrency cap. Cleared when the job is claimed or re-run.
+ALTER TABLE ci_jobs ADD COLUMN held text CHECK (held IN ('card', 'spend_cap', 'concurrency'));
