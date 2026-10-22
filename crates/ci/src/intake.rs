@@ -247,13 +247,11 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
             if c.action != "rerequested" {
                 return Ok(ignored("check_run action is not rerequested"));
             }
-            // Task 8 replaces this with `checks::parse_external_id`.
             let job_id = c
                 .check_run
                 .external_id
                 .as_deref()
-                .and_then(|id| id.strip_prefix("hatchrun-ci:"))
-                .and_then(|id| id.parse::<u64>().ok());
+                .and_then(crate::checks::parse_external_id);
             match job_id {
                 Some(job_id) => Ok(Trigger::Rerequested(Rerequested {
                     installation_id,

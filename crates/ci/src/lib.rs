@@ -19,6 +19,7 @@
 //! schedules, expiry), and the `hatchrun-ci-launches` queue starts the
 //! instances. Every other path answers 404.
 
+pub mod checks;
 pub mod github;
 pub mod graph;
 pub mod intake;
