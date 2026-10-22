@@ -37,8 +37,8 @@ use hatchrun_workflow::{Config, Event, Parameter, ParameterKind, parse};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use worker::{
-    Env, Headers, Method, Request, RequestInit, Response, ResponseBuilder, Result, console_error,
-    console_warn,
+    EncodeBody, Env, Headers, Method, Request, RequestInit, Response, ResponseBuilder, Result,
+    console_error, console_warn,
 };
 
 use crate::access::{self, Access};
@@ -384,6 +384,17 @@ fn run_answer(run: &RunRow, repo: &RepoRow, jobs: &[JobRow], state: Option<&RunS
     })
 }
 
+/// How the runtime treats the body of a stored object it serves. An
+/// object stored compressed already is what its `Content-Encoding`
+/// says; left automatic, the runtime would compress it a second time.
+fn encode_body(content_encoding: Option<&str>) -> EncodeBody {
+    if content_encoding.is_some_and(|encoding| !encoding.is_empty()) {
+        EncodeBody::Manual
+    } else {
+        EncodeBody::Automatic
+    }
+}
+
 fn fail(message: impl Into<String>) -> worker::Error {
     worker::Error::RustError(message.into())
 }
@@ -661,9 +672,11 @@ impl Cx<'_> {
         let headers = Headers::new();
         object.write_http_metadata(Headers(headers.0.clone()))?;
         headers.set("ETag", &object.http_etag())?;
+        let encoding = object.http_metadata().content_encoding;
         Ok(Some(
             ResponseBuilder::new()
                 .with_headers(headers)
+                .with_encode_body(encode_body(encoding.as_deref()))
                 .body(body.response_body()?),
         ))
     }
@@ -895,6 +908,13 @@ mod tests {
     use hatchrun_workflow::parse;
 
     use super::*;
+
+    #[test]
+    fn a_stored_gzip_log_is_served_as_stored() {
+        assert!(matches!(encode_body(Some("gzip")), EncodeBody::Manual));
+        assert!(matches!(encode_body(None), EncodeBody::Automatic));
+        assert!(matches!(encode_body(Some("")), EncodeBody::Automatic));
+    }
     use crate::logs;
 
     #[test]
