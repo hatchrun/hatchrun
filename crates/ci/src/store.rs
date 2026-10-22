@@ -194,6 +194,12 @@ const TENANT: &str = "SELECT id, ci_enabled FROM tenants WHERE id = $1";
 const RUN_FOR_DELIVERY: &str =
     "SELECT {columns} FROM ci_runs WHERE delivery = $1 AND workflow = $2";
 
+/// Frees the name `$2` from a repository other than `$1`. That one was
+/// deleted or renamed, and the name is the new owner's now. The row
+/// stays, under a name GitHub cannot issue, so its runs stay too.
+const FREE_REPO_NAME: &str = "UPDATE ci_repos SET full_name = full_name || '#gone-' || id \
+     WHERE lower(full_name) = lower($2) AND id <> $1";
+
 /// Records repository `$1` of tenant `$2`, installation `$3`, named
 /// `$4` with default branch `$5`, private `$6`, at `$7`; again when it
 /// was renamed or changed.
@@ -432,18 +438,21 @@ pub async fn tenant(db: &Db, tenant_id: &str) -> Result<Option<TenantRow>> {
 ///
 /// Postgres refused the statement.
 pub async fn upsert_repo(db: &Db, repo: &RepoRow, now: u64) -> Result<()> {
-    db.run(
-        UPSERT_REPO,
-        &params![
-            repo.id,
-            &repo.tenant_id,
-            repo.installation_id,
-            &repo.full_name,
-            &repo.default_branch,
-            repo.private,
-            now
-        ],
-    )
+    db.batch(&[
+        (FREE_REPO_NAME, params![repo.id, &repo.full_name]),
+        (
+            UPSERT_REPO,
+            params![
+                repo.id,
+                &repo.tenant_id,
+                repo.installation_id,
+                &repo.full_name,
+                &repo.default_branch,
+                repo.private,
+                now
+            ],
+        ),
+    ])
     .await?;
     Ok(())
 }
@@ -1080,6 +1089,57 @@ mod tests {
         // The old run is still there, under its own tenant.
         let old = db.wait(run(db.db(), before.id)).unwrap().unwrap();
         assert_eq!(old.tenant_id, "t1");
+    }
+
+    #[test]
+    fn a_recreated_repository_takes_the_name_and_the_old_runs_stay() {
+        let db = setup();
+        let old = db
+            .wait(insert_run(db.db(), &new_run("d1", "ci", 2)))
+            .unwrap()
+            .unwrap();
+        let fresh = RepoRow {
+            id: 8,
+            tenant_id: "t1".into(),
+            installation_id: 99,
+            full_name: "Acme/App".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        db.wait(upsert_repo(db.db(), &fresh, 3)).unwrap();
+        let by_name = db.wait(repo_by_name(db.db(), "acme/app")).unwrap().unwrap();
+        assert_eq!(by_name.id, 8);
+        let stale = db.wait(repo(db.db(), 7)).unwrap().unwrap();
+        assert_eq!(stale.full_name, "acme/app#gone-7");
+        assert!(db.wait(run(db.db(), old.id)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_rename_swap_keeps_both_repositories() {
+        let db = setup();
+        let other = RepoRow {
+            id: 8,
+            tenant_id: "t1".into(),
+            installation_id: 99,
+            full_name: "acme/lib".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        db.wait(upsert_repo(db.db(), &other, 2)).unwrap();
+        let name = |id| db.wait(repo(db.db(), id)).unwrap().unwrap().full_name;
+        // app and lib swap names. The event for app arrives first, while
+        // lib still holds its new name.
+        let mut app = db.wait(repo(db.db(), 7)).unwrap().unwrap();
+        app.full_name = "acme/lib".into();
+        db.wait(upsert_repo(db.db(), &app, 3)).unwrap();
+        assert_eq!(name(7), "acme/lib");
+        assert_eq!(name(8), "acme/lib#gone-8");
+        // Then the event for lib.
+        let mut lib = db.wait(repo(db.db(), 8)).unwrap().unwrap();
+        lib.full_name = "acme/app".into();
+        db.wait(upsert_repo(db.db(), &lib, 4)).unwrap();
+        assert_eq!(name(7), "acme/lib");
+        assert_eq!(name(8), "acme/app");
     }
 
     #[test]
