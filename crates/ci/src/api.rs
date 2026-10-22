@@ -168,6 +168,12 @@ fn needs(have: Access, want: Access, signed_in: bool) -> std::result::Result<(),
         Ok(())
     } else if have == Access::None {
         stop(404, "not found")
+    } else if want == Access::Admin {
+        if signed_in {
+            stop(403, "you need admin access to this repository")
+        } else {
+            stop(401, "sign in to manage settings")
+        }
     } else if signed_in {
         stop(403, "you need write access to this repository")
     } else {
@@ -591,7 +597,12 @@ impl Cx<'_> {
     }
 
     /// The repository, when the caller may use it as `want`.
-    async fn repo(&self, owner: &str, name: &str, want: Access) -> Result<Served<RepoRow>> {
+    pub(crate) async fn repo(
+        &self,
+        owner: &str,
+        name: &str,
+        want: Access,
+    ) -> Result<Served<RepoRow>> {
         let Some(repo) = store::repo_by_name(self.db, &format!("{owner}/{name}")).await? else {
             return Ok(stop(404, "not found"));
         };

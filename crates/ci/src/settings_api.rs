@@ -11,6 +11,13 @@
 //! | `POST /api/ci/orgs/{org}/billing/checkout` | org admin, CSRF | `{"url": ...}` |
 //! | `POST /api/ci/orgs/{org}/billing/portal` | org admin, CSRF | `{"url": ...}` |
 //! | `PUT /api/ci/orgs/{org}/billing/cap` | org admin, CSRF | `204` |
+//! | `GET /api/ci/orgs/{org}/secrets` | org admin | `[{"name", "updatedAt"}]` |
+//! | `PUT, DELETE /api/ci/orgs/{org}/secrets/{name}` | org admin, CSRF | `204` |
+//! | `GET /api/ci/orgs/{org}/vars` | org admin | `[{"name", "value", "updatedAt"}]` |
+//! | `PUT, DELETE /api/ci/orgs/{org}/vars/{name}` | org admin, CSRF | `204` |
+//!
+//! The same four under `/api/ci/repos/{owner}/{repo}/` need admin
+//! access to the repository. No route answers a secret's value.
 //!
 //! An organization with no tenant, and a user who is not an active
 //! admin of it, both get `404`. `api::serve` runs the Origin, CSRF and
@@ -24,11 +31,12 @@ use serde::Deserialize;
 use serde_json::json;
 use worker::{Method, Request, Result, console_error};
 
-use crate::access::{self, Failure};
+use crate::access::{self, Access, Failure};
 use crate::api::{Cx, Served, Stop, body_cap, name, no_content, now_ms, reply, stop};
 use crate::billing::{self, Hold};
 use crate::launches;
-use crate::store::{self, CiBilling, TenantRow};
+use crate::secrets::{self, Aad, Keyring};
+use crate::store::{self, CiBilling, Put, TenantRow};
 
 /// Where a secret or variable lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,11 +177,22 @@ pub(crate) async fn handle(
         SettingsRoute::Checkout { org } => checkout(cx, org).await,
         SettingsRoute::Portal { org } => portal(cx, org).await,
         SettingsRoute::Cap { org } => cap(cx, org, req, body_cap(&route)).await,
-        // The secrets and variables answer once their store does.
-        SettingsRoute::Secrets(_)
-        | SettingsRoute::Secret(..)
-        | SettingsRoute::Vars(_)
-        | SettingsRoute::Var(..) => Ok(stop(404, "not found")),
+        SettingsRoute::Secrets(scope) => list_secrets(cx, scope).await,
+        SettingsRoute::Vars(scope) => list_vars(cx, scope).await,
+        SettingsRoute::Secret(scope, item) => {
+            if req.method() == Method::Put {
+                put_secret(cx, scope, item, req, body_cap(&route)).await
+            } else {
+                delete(cx, scope, Kind::Secrets, item).await
+            }
+        }
+        SettingsRoute::Var(scope, item) => {
+            if req.method() == Method::Put {
+                put_var(cx, scope, item, req, body_cap(&route)).await
+            } else {
+                delete(cx, scope, Kind::Vars, item).await
+            }
+        }
     }
 }
 
@@ -348,6 +367,230 @@ async fn cap(cx: &Cx<'_>, org: &str, req: &mut Request, max_body: usize) -> Resu
     no_content().map(Ok)
 }
 
+/// Secrets or variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Secrets,
+    Vars,
+}
+
+impl Kind {
+    const fn word(self) -> &'static str {
+        match self {
+            Kind::Secrets => "secrets",
+            Kind::Vars => "vars",
+        }
+    }
+}
+
+/// Whose rows a request reads or changes.
+struct Target {
+    tenant: String,
+    /// `None` for the organization's own rows.
+    repo_id: Option<u64>,
+    /// The organization login or `owner/repo`, for messages.
+    label: String,
+}
+
+/// The rows `scope` names, when the caller may manage them: an admin of
+/// the organization, or of the repository. A repository's rows belong
+/// to the tenant that owns the repository, and are keyed by its id.
+async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
+    match scope {
+        Scope::Org(org) => Ok(admin_tenant(cx, org).await?.map(|tenant| Target {
+            tenant: tenant.id,
+            repo_id: None,
+            label: tenant.org_login,
+        })),
+        Scope::Repo { owner, repo } => {
+            Ok(cx
+                .repo(owner, repo, Access::Admin)
+                .await?
+                .map(|repo| Target {
+                    tenant: repo.tenant_id,
+                    repo_id: Some(repo.id),
+                    label: repo.full_name,
+                }))
+        }
+    }
+}
+
+/// The message of a `409`: `label` already holds `limit` rows of `kind`.
+fn too_many_message(label: &str, kind: Kind, limit: u32) -> String {
+    format!("{label} has {limit} {}, the most allowed", kind.word())
+}
+
+/// The most rows of one kind a repository or an organization holds.
+const fn limit(repo: bool) -> u32 {
+    if repo {
+        secrets::MAX_PER_REPO
+    } else {
+        secrets::MAX_PER_ORG
+    }
+}
+
+/// The body of a secret or variable `PUT`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValueBody {
+    value: String,
+}
+
+/// The value in a `PUT` body of at most `max_body` bytes. Nothing of
+/// the body goes into an error.
+fn parse_value(body: &[u8], max_body: usize) -> std::result::Result<String, Stop> {
+    if body.len() > max_body {
+        return stop(413, "the request is too large");
+    }
+    let Ok(ValueBody { value }) = serde_json::from_slice(body) else {
+        return stop(400, "expected {\"value\": \"...\"}");
+    };
+    if value.is_empty() {
+        return stop(400, "Values cannot be empty");
+    }
+    if value.len() > secrets::MAX_VALUE_BYTES {
+        return stop(413, "Values are at most 48 KB");
+    }
+    Ok(value)
+}
+
+/// The uppercased name, or the `400` that says what is wrong with it.
+fn item_name(item: &str) -> std::result::Result<String, Stop> {
+    secrets::valid_name(item).or_else(|message| stop(400, message))
+}
+
+async fn list_secrets(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
+    let target = match target(cx, scope).await? {
+        Ok(target) => target,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let rows = store::secret_names(cx.db, &target.tenant, target.repo_id).await?;
+    let list: Vec<_> = rows
+        .into_iter()
+        .map(|(name, updated)| json!({ "name": name, "updatedAt": updated }))
+        .collect();
+    reply(200, &json!(list)).map(Ok)
+}
+
+async fn list_vars(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
+    let target = match target(cx, scope).await? {
+        Ok(target) => target,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let rows = store::vars(cx.db, &target.tenant, target.repo_id).await?;
+    let list: Vec<_> = rows
+        .into_iter()
+        .map(|(name, value, updated)| json!({ "name": name, "value": value, "updatedAt": updated }))
+        .collect();
+    reply(200, &json!(list)).map(Ok)
+}
+
+async fn put_secret(
+    cx: &Cx<'_>,
+    scope: Scope<'_>,
+    item: &str,
+    req: &mut Request,
+    max_body: usize,
+) -> Result<Served> {
+    let target = match target(cx, scope).await? {
+        Ok(target) => target,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let name = match item_name(item) {
+        Ok(name) => name,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let value = match parse_value(&req.bytes().await?, max_body) {
+        Ok(value) => value,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    // A keyring that does not load is the Worker's fault: 500, with the
+    // binding named in the log and no key anywhere.
+    let keyring = Keyring::load(cx.env)
+        .await
+        .map_err(worker::Error::RustError)?;
+    let nonce = secrets::fresh_nonce().map_err(worker::Error::RustError)?;
+    let aad = Aad {
+        tenant: &target.tenant,
+        repo_id: target.repo_id,
+        name: &name,
+    };
+    let sealed = secrets::seal(&keyring.current, &aad, nonce, &value);
+    let max = limit(target.repo_id.is_some());
+    let put = store::put_secret(
+        cx.db,
+        &target.tenant,
+        target.repo_id,
+        &name,
+        &keyring.current.id,
+        &sealed,
+        max,
+        now_ms(),
+    )
+    .await?;
+    saved(put, &target, Kind::Secrets, max)
+}
+
+async fn put_var(
+    cx: &Cx<'_>,
+    scope: Scope<'_>,
+    item: &str,
+    req: &mut Request,
+    max_body: usize,
+) -> Result<Served> {
+    let target = match target(cx, scope).await? {
+        Ok(target) => target,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let name = match item_name(item) {
+        Ok(name) => name,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let value = match parse_value(&req.bytes().await?, max_body) {
+        Ok(value) => value,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let max = limit(target.repo_id.is_some());
+    let put = store::put_var(
+        cx.db,
+        &target.tenant,
+        target.repo_id,
+        &name,
+        &value,
+        max,
+        now_ms(),
+    )
+    .await?;
+    saved(put, &target, Kind::Vars, max)
+}
+
+fn saved(put: Put, target: &Target, kind: Kind, max: u32) -> Result<Served> {
+    match put {
+        Put::Saved => no_content().map(Ok),
+        Put::TooMany => Ok(stop(409, too_many_message(&target.label, kind, max))),
+    }
+}
+
+async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result<Served> {
+    let target = match target(cx, scope).await? {
+        Ok(target) => target,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let name = match item_name(item) {
+        Ok(name) => name,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let existed = match kind {
+        Kind::Secrets => store::delete_secret(cx.db, &target.tenant, target.repo_id, &name).await?,
+        Kind::Vars => store::delete_var(cx.db, &target.tenant, target.repo_id, &name).await?,
+    };
+    if existed {
+        no_content().map(Ok)
+    } else {
+        Ok(stop(404, "not found"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +657,68 @@ mod tests {
         }
         // The path matches, so the caller can answer 405.
         assert!(find("orgs/acme/billing/cap").is_some());
+    }
+
+    #[test]
+    fn value_too_large() {
+        let body = format!(r#"{{"value":"{}"}}"#, "a".repeat(49_153));
+        let Err(Stop(status, message, _)) = parse_value(body.as_bytes(), 128 << 10) else {
+            panic!("accepted");
+        };
+        assert_eq!(
+            (status, message.as_str()),
+            (413, "Values are at most 48 KB")
+        );
+        let body = format!(r#"{{"value":"{}"}}"#, "a".repeat(48 * 1024));
+        assert!(parse_value(body.as_bytes(), 128 << 10).is_ok());
+    }
+
+    #[test]
+    fn escaped_value_fits() {
+        // Each quote is two bytes in JSON: about 96 KiB on the wire.
+        let body = format!(r#"{{"value":"{}"}}"#, "\\\"".repeat(48 * 1024));
+        assert!(body.len() > 96 * 1024 && body.len() <= 128 << 10);
+        let value = parse_value(body.as_bytes(), 128 << 10).unwrap();
+        assert_eq!(value.len(), 48 * 1024);
+    }
+
+    #[test]
+    fn bad_bodies_are_refused_without_echoing_them() {
+        for body in [
+            &br#"{"value":""}"#[..],
+            b"nope",
+            br#"{"value":"x","extra":1}"#,
+        ] {
+            let Err(Stop(status, message, _)) = parse_value(body, 128 << 10) else {
+                panic!("accepted");
+            };
+            assert_eq!(status, 400);
+            assert!(message.starts_with("expected") || message == "Values cannot be empty");
+        }
+        let Err(Stop(status, ..)) = parse_value(&[b' '; 200], 100) else {
+            panic!("accepted");
+        };
+        assert_eq!(status, 413);
+    }
+
+    #[test]
+    fn too_many_message_names_the_scope_and_limit() {
+        assert_eq!(
+            too_many_message("acme", Kind::Secrets, 1000),
+            "acme has 1000 secrets, the most allowed"
+        );
+        assert_eq!(
+            too_many_message("acme/api", Kind::Vars, 100),
+            "acme/api has 100 vars, the most allowed"
+        );
+        assert_eq!(limit(true), 100);
+        assert_eq!(limit(false), 1000);
+    }
+
+    #[test]
+    fn names_are_uppercased_or_refused() {
+        assert_eq!(item_name("token_1").unwrap(), "TOKEN_1");
+        assert!(matches!(item_name("1TOKEN"), Err(Stop(400, ..))));
+        assert!(matches!(item_name("GITHUB_X"), Err(Stop(400, ..))));
     }
 }

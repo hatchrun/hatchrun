@@ -32,6 +32,8 @@ pub enum Access {
     Read,
     /// Also dispatch, cancel and re-run.
     Write,
+    /// Also the repository's secrets and variables.
+    Admin,
 }
 
 /// The access GitHub's answer gives. `p` is `None` when nobody is
@@ -41,6 +43,7 @@ pub enum Access {
 pub fn from_permissions(private: bool, p: Option<Permissions>) -> Access {
     let public = if private { Access::None } else { Access::Read };
     match p {
+        Some(p) if p.admin => Access::Admin,
         Some(p) if p.write => Access::Write,
         Some(p) if p.read => Access::Read,
         _ => public,
@@ -235,7 +238,11 @@ mod tests {
 
     #[allow(clippy::unnecessary_wraps)] // The argument of `from_permissions`.
     const fn p(read: bool, write: bool) -> Option<Permissions> {
-        Some(Permissions { read, write })
+        Some(Permissions {
+            read,
+            write,
+            admin: false,
+        })
     }
 
     #[test]
@@ -295,6 +302,7 @@ mod tests {
         let none = Verdict::Known(Permissions {
             read: false,
             write: false,
+            admin: false,
         });
         assert_eq!(classify(&answer(404, &[], ""), 0), none);
         assert_eq!(
@@ -310,7 +318,8 @@ mod tests {
             classify(&ok, 0),
             Verdict::Known(Permissions {
                 read: true,
-                write: true
+                write: true,
+                admin: false
             })
         );
     }
@@ -322,6 +331,7 @@ mod tests {
         let p = Permissions {
             read: true,
             write: false,
+            admin: false,
         };
         remember(key, p, 1000);
         assert_eq!(cached(key, 1000 + CACHE_MS - 1), Some(p));
@@ -332,6 +342,20 @@ mod tests {
     #[test]
     fn access_is_ordered() {
         assert!(Access::None < Access::Read && Access::Read < Access::Write);
+        assert!(Access::Write < Access::Admin);
+    }
+
+    #[test]
+    fn admin_needs_the_admin_permission() {
+        let admin = Some(Permissions {
+            read: true,
+            write: true,
+            admin: true,
+        });
+        assert_eq!(from_permissions(true, admin), Access::Admin);
+        assert_eq!(from_permissions(false, admin), Access::Admin);
+        assert_eq!(from_permissions(true, p(true, true)), Access::Write);
+        assert_eq!(from_permissions(false, None), Access::Read);
     }
 
     #[test]

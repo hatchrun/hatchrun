@@ -325,6 +325,8 @@ pub struct Permissions {
     pub read: bool,
     /// May push to it.
     pub write: bool,
+    /// May administer it, secrets and variables included.
+    pub admin: bool,
 }
 
 /// What the answer of [`user_repo`] says. Any answer but 200 gives no
@@ -343,6 +345,7 @@ pub fn permissions(response: &Response) -> Permissions {
     let none = Permissions {
         read: false,
         write: false,
+        admin: false,
     };
     if response.status != 200 {
         return none;
@@ -358,6 +361,7 @@ pub fn permissions(response: &Response) -> Permissions {
     Permissions {
         read: !repo.private || has(&["pull", "push", "maintain", "admin"]),
         write: has(&["push", "maintain", "admin"]),
+        admin: has(&["admin"]),
     }
 }
 
@@ -665,7 +669,8 @@ mod tests {
             permissions(&public),
             Permissions {
                 read: true,
-                write: false
+                write: false,
+                admin: false
             }
         );
     }
@@ -683,23 +688,39 @@ mod tests {
             permissions(&body(r#"{"pull":true,"push":false}"#)),
             Permissions {
                 read: true,
-                write: false
+                write: false,
+                admin: false
             }
         );
         assert_eq!(
             permissions(&body(r#"{"pull":true,"push":true}"#)),
             Permissions {
                 read: true,
-                write: true
+                write: true,
+                admin: false
             }
         );
         assert_eq!(
             permissions(&answer(200, &[], r#"{"private":true}"#)),
             Permissions {
                 read: false,
-                write: false
+                write: false,
+                admin: false
             }
         );
+    }
+
+    #[test]
+    fn only_the_admin_permission_administers() {
+        let body = |p: &str| {
+            answer(
+                200,
+                &[],
+                &format!(r#"{{"private":true,"permissions":{p}}}"#),
+            )
+        };
+        assert!(permissions(&body(r#"{"pull":true,"push":true,"admin":true}"#)).admin);
+        assert!(!permissions(&body(r#"{"pull":true,"push":true,"maintain":true}"#)).admin);
     }
 
     #[test]
@@ -707,6 +728,7 @@ mod tests {
         let none = Permissions {
             read: false,
             write: false,
+            admin: false,
         };
         assert_eq!(permissions(&answer(404, &[], "{}")), none);
         assert_eq!(permissions(&answer(200, &[], "nope")), none);
