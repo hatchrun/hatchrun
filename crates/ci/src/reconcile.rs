@@ -1115,7 +1115,8 @@ enum Ingest {
 
 /// Reads the answer to a batch of `sent` events. A 2xx that took fewer
 /// events than were sent counts as a refusal. A 4xx is a refusal
-/// except 401, 403, 408 and 429, which are about the caller.
+/// except 401, 403, 404, 405, 408 and 429, which are about the caller
+/// or the endpoint (a wrong URL answers 404 or 405 for every batch).
 fn judge(answer: &Result<Response, String>, sent: usize) -> Ingest {
     let response = match answer {
         Ok(response) => response,
@@ -1127,7 +1128,9 @@ fn judge(answer: &Result<Response, String>, sent: usize) -> Ingest {
             Ok(taken) => Ingest::Refused(format!("Polar took {taken} of {sent} events")),
             Err(err) => Ingest::Refused(err),
         },
-        401 | 403 | 408 | 429 => Ingest::Retry(format!("Polar answered {}", response.status)),
+        401 | 403 | 404 | 405 | 408 | 429 => {
+            Ingest::Retry(format!("Polar answered {}", response.status))
+        }
         400..=499 => Ingest::Refused(format!(
             "Polar answered {}: {}",
             response.status,
@@ -1615,13 +1618,13 @@ mod tests {
         let taken = answer(200, r#"{"inserted":2,"duplicates":1}"#);
         assert_eq!(judge(&taken, 3), Ingest::Taken);
         assert!(matches!(judge(&taken, 4), Ingest::Refused(_)));
-        for status in [400, 404, 409, 413, 422] {
+        for status in [400, 409, 413, 422] {
             assert!(
                 matches!(judge(&answer(status, "bad"), 3), Ingest::Refused(_)),
                 "{status}"
             );
         }
-        for status in [401, 403, 408, 429, 500, 502, 503] {
+        for status in [401, 403, 404, 405, 408, 429, 500, 502, 503] {
             assert!(
                 matches!(judge(&answer(status, ""), 3), Ingest::Retry(_)),
                 "{status}"
