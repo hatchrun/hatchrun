@@ -63,7 +63,7 @@ pub fn details_url(app_url: &str, repo: &str, run_id: u64, job_id: u64) -> Strin
 }
 
 /// One step of a job, with its result once it has one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepView {
     /// Position in the job, from 0.
     pub index: usize,
@@ -98,7 +98,7 @@ pub struct JobView<'a> {
     pub completed_at: Option<u64>,
 }
 
-fn conclusion_word(c: Conclusion) -> &'static str {
+pub(crate) fn conclusion_word(c: Conclusion) -> &'static str {
     match c {
         Conclusion::Success => "success",
         Conclusion::Failure => "failure",
@@ -291,6 +291,12 @@ impl Outbox {
     pub fn mark(&mut self, job: u64) {
         self.counter += 1;
         self.marked.insert(job, self.counter);
+    }
+
+    /// Whether no job waits for an update.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.marked.is_empty()
     }
 
     /// The jobs to send now. Empty while GitHub has us blocked.

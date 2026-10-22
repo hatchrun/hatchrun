@@ -20,10 +20,12 @@
 //! instances. Every other path answers 404.
 
 pub mod checks;
+pub mod env;
 pub mod github;
 pub mod graph;
 pub mod intake;
 pub mod planning;
+pub mod run;
 pub mod store;
 pub mod token;
 

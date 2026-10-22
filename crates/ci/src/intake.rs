@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The most commits a push delivery lists. A push this long may have
@@ -14,7 +14,7 @@ use serde_json::Value;
 pub const PUSH_COMMIT_LIMIT: usize = 20;
 
 /// The repository a delivery is about.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Repo {
     /// GitHub's repository id, which survives renames.
     pub id: u64,
