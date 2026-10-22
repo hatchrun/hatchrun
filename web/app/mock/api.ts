@@ -66,7 +66,7 @@ function tenantView(tenant: MockTenant) {
         monthStart: monthStart.toISOString(),
         monthEnd: monthEnd.toISOString(),
         seconds,
-        spendCents: licensed && !tenant.beta ? Math.floor((seconds * 1_000) / 60 / 10_000) : 0,
+        spendCents: licensed && !tenant.beta ? Math.floor(Math.floor((seconds * 1_000) / 60) / 10_000) : 0,
         priceMicrosPerMinute: 1_000,
         mayLaunch: licensed,
       },

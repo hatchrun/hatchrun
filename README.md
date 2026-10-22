@@ -427,8 +427,8 @@ type catalog in the database through a tenant role there: every current
 generation amd64 and arm64 type with the zones that offer it
 (`DescribeInstanceTypes`, `DescribeInstanceTypeOfferings`), its Linux
 on-demand price from AWS's public price list and its lowest Spot price
-(`DescribeSpotPriceHistory`). It sends job minutes to Polar, and
-deletes expired sessions, and
+(`DescribeSpotPriceHistory`). It sends runner usage to Polar as
+`job.seconds` (whole seconds), deletes expired sessions, and
 jobs and runs past their tenant's retention (`tenants.retention_days`,
 30 days unless set, up to 90). The timeouts are the `RECONCILE_*` variables in
 `wrangler.toml`. Each pass logs one summary line and keeps it in the

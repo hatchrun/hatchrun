@@ -1468,8 +1468,8 @@ impl Pass<'_> {
 
     /// Step 6: records the runner seconds of jobs that completed in the
     /// last [`SWEEP_WINDOW`] with none recorded, then sends the seconds
-    /// Polar has not taken yet, oldest first, one batch a pass. Without Polar's token nothing is sent and the
-    /// events wait.
+    /// Polar has not taken yet, oldest first, one batch a pass. Without
+    /// Polar's token nothing is sent and the events wait.
     async fn meter(&self) -> Fallible<Summary> {
         let swept = usage::sweep(
             &self.db,
