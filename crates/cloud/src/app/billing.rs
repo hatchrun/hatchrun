@@ -315,10 +315,23 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
         }
     };
     let db = Db::connect(env).await?;
-    let product = polar::product_kind(
+    let runner_ids = get(env, PRODUCT_ID)
+        .map(|list| polar::product_ids(&list))
+        .unwrap_or_default();
+    let Some(product) = polar::product_kind(
         &subscription.product_id,
+        &runner_ids,
         &get(env, CI_PRODUCT_ID).unwrap_or_default(),
-    );
+    ) else {
+        // A product nobody configured: filing it as runners would
+        // license hatchrun.io for a CI plan, so the row is not written.
+        console_error!(
+            "polar webhook: subscription {} is for product {}, in neither POLAR_PRODUCT_ID nor POLAR_CI_PRODUCT_ID",
+            subscription.id,
+            subscription.product_id
+        );
+        return Ok(Response::empty()?.with_status(202));
+    };
     let changed = db
         .run(
             UPSERT_SUBSCRIPTION,
@@ -478,7 +491,7 @@ mod tests {
             false,
             "2026-10-16T10:00:00Z",
             NOW,
-            polar::product_kind(product_id, "p-ci"),
+            polar::product_kind(product_id, &["p-run".to_owned()], "p-ci").unwrap_or("none"),
         ]
     }
 
