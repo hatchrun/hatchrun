@@ -94,7 +94,9 @@ function sgr(style: Style, params: string): Style {
  * progress bar overwrote.
  */
 export function segments(line: string): Segment[] {
-  const text = line.includes("\r") ? line.slice(line.lastIndexOf("\r") + 1) : line;
+  // A trailing \r (CRLF output) overwrites nothing.
+  const ended = line.replace(/\r+$/, "");
+  const text = ended.includes("\r") ? ended.slice(ended.lastIndexOf("\r") + 1) : ended;
   if (!text.includes("\u001b")) {
     return [{ text: clean(text), className: "" }];
   }
