@@ -326,13 +326,21 @@ pub async fn create(
         }
         Billing::Nothing => return Ok(Vec::new()),
     }
-    for workflow in &failed {
-        let check = invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, req.sha);
-        report_once(tokens, settings, req, &check).await?;
-    }
     let mut ids = Vec::new();
     for plan in &plans {
         ids.push(start_plan(env, db, req, plan, now).await?);
+    }
+    // The good workflows run first: a GitHub error on a failed
+    // workflow's check run must not keep them from starting.
+    for workflow in &failed {
+        let check = invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, req.sha);
+        if let Err(err) = report_once(tokens, settings, req, &check).await {
+            worker::console_error!(
+                "{}: check run for the invalid workflow {}: {err}",
+                req.repo.full_name,
+                workflow.workflow
+            );
+        }
     }
     Ok(ids)
 }
