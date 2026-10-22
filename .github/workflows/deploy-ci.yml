@@ -19,6 +19,12 @@ name: deploy-ci
 # Its CI_ROLE_ARN, CI_LAUNCH_TEMPLATE_ID and CI_SUBNET_IDS repository
 # variables are the RoleArn, LaunchTemplateId and SubnetIds outputs of
 # the stack in deploy/cloudformation/ci-account.yaml.
+#
+# Polar setting the CI checkout depends on: turn on "Allow multiple
+# subscriptions per customer" in the Polar organization's settings
+# (sandbox and production) before the first deploy. A tenant is one Polar
+# customer for both products, and without the setting an organization that
+# pays for hatchrun.io runners cannot complete the CI checkout.
 
 on:
   push:
