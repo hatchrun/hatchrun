@@ -91,9 +91,29 @@ pub enum Trigger {
     PullRequest(PullRequest),
     /// A re-run of one job.
     Rerequested(Rerequested),
+    /// A repository changed visibility, name, owner or default branch.
+    Repository(RepositoryChange),
     /// Nothing to do, and why.
     Ignored(String),
 }
+
+/// A `repository` event that changes what CI records of a repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryChange {
+    /// The App installation the delivery came through.
+    pub installation_id: u64,
+    /// The repository as it is now.
+    pub repo: Repo,
+}
+
+/// The `repository` actions that change a field of [`Repo`].
+const REPOSITORY_ACTIONS: [&str; 5] = [
+    "publicized",
+    "privatized",
+    "renamed",
+    "transferred",
+    "edited",
+];
 
 #[derive(Deserialize)]
 struct Installation {
@@ -156,6 +176,12 @@ struct SideRepo {
 }
 
 #[derive(Deserialize)]
+struct RepositoryBody {
+    action: String,
+    repository: Repo,
+}
+
+#[derive(Deserialize)]
 struct CheckRunBody {
     action: String,
     check_run: CheckRun,
@@ -180,7 +206,7 @@ fn ignored(reason: &str) -> Trigger {
 /// Returns the JSON error when the body is not the payload GitHub sends
 /// for an event this crate uses.
 pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
-    if !matches!(event, "push" | "pull_request" | "check_run") {
+    if !matches!(event, "push" | "pull_request" | "check_run" | "repository") {
         return Ok(Trigger::Ignored(format!("{event} events are not used")));
     }
     let payload: Value = serde_json::from_slice(body)?;
@@ -242,6 +268,16 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
                 payload,
             }))
         }
+        "repository" => {
+            let r = RepositoryBody::deserialize(&payload)?;
+            if !REPOSITORY_ACTIONS.contains(&r.action.as_str()) {
+                return Ok(ignored("repository action changes nothing recorded"));
+            }
+            Ok(Trigger::Repository(RepositoryChange {
+                installation_id,
+                repo: r.repository,
+            }))
+        }
         _ => {
             let c = CheckRunBody::deserialize(&payload)?;
             if c.action != "rerequested" {
@@ -277,6 +313,37 @@ mod tests {
         let mut v: Value = serde_json::from_str(body).unwrap();
         f(&mut v);
         serde_json::to_vec(&v).unwrap()
+    }
+
+    #[test]
+    fn repository_events_that_change_the_record_are_read() {
+        let body = |action: &str, private: bool| {
+            edited(PUSH, |v| {
+                v.as_object_mut().unwrap().remove("commits");
+                v["action"] = action.into();
+                v["repository"]["private"] = private.into();
+            })
+        };
+        let Trigger::Repository(c) = parse("repository", &body("publicized", false)).unwrap()
+        else {
+            panic!("not a repository change");
+        };
+        assert_eq!(
+            (c.installation_id, c.repo.id, c.repo.private),
+            (777, 4242, false)
+        );
+        for action in ["privatized", "renamed", "transferred", "edited"] {
+            assert!(matches!(
+                parse("repository", &body(action, true)).unwrap(),
+                Trigger::Repository(_)
+            ));
+        }
+        for action in ["created", "deleted", "archived"] {
+            assert!(matches!(
+                parse("repository", &body(action, true)).unwrap(),
+                Trigger::Ignored(_)
+            ));
+        }
     }
 
     #[test]

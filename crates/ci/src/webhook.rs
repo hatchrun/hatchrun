@@ -116,10 +116,17 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         Trigger::Push(p) => (p.installation_id, &p.repo),
         Trigger::PullRequest(p) => (p.installation_id, &p.repo),
         Trigger::Rerequested(r) => (r.installation_id, &r.repo),
+        Trigger::Repository(r) => (r.installation_id, &r.repo),
     };
-    let tenant = match gate(store::tenant_for_installation(&db, installation_id).await?) {
-        Ok(tenant) => tenant,
-        Err(reason) => return reply(&Outcome::Ignored(reason.to_owned())),
+    let found = store::tenant_for_installation(&db, installation_id).await?;
+    // A visibility change is recorded even for a tenant with CI off: the
+    // read API shows runs left from before, by the recorded visibility.
+    let tenant = match (&trigger, found) {
+        (Trigger::Repository(_), Some(tenant)) => tenant,
+        (_, found) => match gate(found) {
+            Ok(tenant) => tenant,
+            Err(reason) => return reply(&Outcome::Ignored(reason.to_owned())),
+        },
     };
     let now = now_ms();
     store::upsert_repo(
@@ -160,6 +167,9 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         Trigger::Push(push) => cx.push(push).await?,
         Trigger::PullRequest(pr) => cx.pull_request(pr).await?,
         Trigger::Rerequested(rerun) => cx.rerun(rerun).await?,
+        // The row was updated above, with the tenant's other repository
+        // writes; nothing runs.
+        Trigger::Repository(_) => Outcome::Done(Vec::new()),
         Trigger::Ignored(reason) => Outcome::Ignored(reason.clone()),
     };
     if !matches!(outcome, Outcome::Retry) {

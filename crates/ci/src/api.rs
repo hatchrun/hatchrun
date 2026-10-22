@@ -33,7 +33,7 @@ use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::session::hex;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
 use hatchrun_cloud::webcrypto;
-use hatchrun_workflow::{Config, Event, parse};
+use hatchrun_workflow::{Config, Event, Parameter, ParameterKind, parse};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use worker::{
@@ -143,10 +143,11 @@ pub fn route(path: &str) -> Option<Route<'_>> {
 
 /// Why a request ends before it does its work.
 #[derive(Debug, PartialEq, Eq)]
-struct Stop(u16, String);
+/// The status, the message and, for a 503, the seconds to wait.
+struct Stop(u16, String, Option<u64>);
 
 fn stop<T>(status: u16, message: impl Into<String>) -> std::result::Result<T, Stop> {
-    Err(Stop(status, message.into()))
+    Err(Stop(status, message.into(), None))
 }
 
 /// What the answer to a request that may not go on is, by access: a
@@ -215,22 +216,79 @@ fn ref_names(input: &str, default_branch: &str) -> std::result::Result<(String, 
     }
 }
 
-/// Whether `workflow` can be started by hand.
+/// The `workflow_dispatch` trigger of `workflow`.
 ///
 /// # Errors
 ///
 /// The message for the person who asked: the workflow is not in the
 /// config, or its `on:` has no `workflow_dispatch`.
-pub fn dispatchable(config: &Config, workflow: &str) -> std::result::Result<(), String> {
+pub fn dispatchable<'a>(
+    config: &'a Config,
+    workflow: &str,
+) -> std::result::Result<&'a hatchrun_workflow::Dispatch, String> {
     let Some(found) = config.workflows.get(workflow) else {
         return Err(format!("the config has no workflow `{workflow}`"));
     };
-    if found.on.workflow_dispatch.is_none() {
-        return Err(format!(
-            "workflow `{workflow}` has no `workflow_dispatch` under `on:`"
-        ));
+    found
+        .on
+        .workflow_dispatch
+        .as_ref()
+        .ok_or_else(|| format!("workflow `{workflow}` has no `workflow_dispatch` under `on:`"))
+}
+
+/// The longest string input, in bytes.
+const MAX_INPUT: usize = 4096;
+
+/// The inputs a run starts with: what the caller gave, checked against
+/// the declared ones, with declared defaults for the rest.
+///
+/// # Errors
+///
+/// The message that names the input: not declared, missing with no
+/// default, the wrong type, too long, or not one of the choices.
+pub fn resolve_inputs(
+    declared: &BTreeMap<String, Parameter>,
+    given: &Map<String, Value>,
+) -> std::result::Result<Map<String, Value>, String> {
+    if let Some(unknown) = given.keys().find(|key| !declared.contains_key(*key)) {
+        return Err(format!("input `{unknown}` is not declared by the workflow"));
     }
-    Ok(())
+    let mut out = Map::new();
+    for (name, parameter) in declared {
+        let Some(value) = given.get(name).or(parameter.default.as_ref()) else {
+            return Err(format!("input `{name}` is required"));
+        };
+        let ok = match (&parameter.kind, value) {
+            (ParameterKind::String, Value::String(text)) => {
+                if text.len() > MAX_INPUT {
+                    return Err(format!("input `{name}` is longer than {MAX_INPUT} bytes"));
+                }
+                true
+            }
+            (ParameterKind::Boolean, Value::Bool(_)) => true,
+            (ParameterKind::Integer, Value::Number(number)) => number.is_i64(),
+            (ParameterKind::Enum(choices), Value::String(text)) => {
+                if !choices.contains(text) {
+                    return Err(format!(
+                        "input `{name}` must be one of: {}",
+                        choices.join(", ")
+                    ));
+                }
+                true
+            }
+            _ => false,
+        };
+        if !ok {
+            return Err(format!("input `{name}` has the wrong type"));
+        }
+        out.insert(name.clone(), value.clone());
+    }
+    Ok(out)
+}
+
+/// Whether a request's `Origin` is the app's. A missing one is not.
+fn origin_ok(origin: Option<&str>, app_url: &str) -> bool {
+    origin.is_some_and(|origin| origin == app_url.trim_end_matches('/'))
 }
 
 /// The event payload of a dispatched run.
@@ -350,7 +408,15 @@ fn now_ms() -> u64 {
 pub async fn handle(req: Request, env: &Env) -> Result<Response> {
     let mut response = match serve(req, env).await {
         Ok(Ok(response)) => response,
-        Ok(Err(Stop(status, message))) => reply(status, &json!({ "error": message }))?,
+        Ok(Err(Stop(status, message, retry))) => {
+            let mut response = reply(status, &json!({ "error": message }))?;
+            if let Some(seconds) = retry {
+                response
+                    .headers_mut()
+                    .set("Retry-After", &seconds.to_string())?;
+            }
+            response
+        }
         Err(err) => {
             console_error!("api: {err}");
             reply(500, &json!({ "error": "internal error" }))?
@@ -372,6 +438,13 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
         return Ok(stop(405, "method not allowed"));
     }
     let settings = Settings::read(env).map_err(fail)?;
+    // Every change, and the socket, come from the app's own pages.
+    if matches!(route, Route::Live(_)) || route.method() == Method::Post {
+        let origin = req.headers().get("Origin")?;
+        if !origin_ok(origin.as_deref(), &settings.app_url) {
+            return Ok(stop(403, "wrong origin"));
+        }
+    }
     let db = Db::connect(env).await?;
     let session = Session::find(&req, &db).await?;
     let cx = Cx {
@@ -381,17 +454,28 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
         session: session.as_ref(),
     };
     let query = req.url()?.query().map(str::to_owned);
+    if route.method() == Method::Post {
+        // Before any call to GitHub, so a cross-site request costs the
+        // victim nothing.
+        if let Err(stop) = cx.csrf(&req) {
+            return Ok(Err(stop));
+        }
+        let length = req
+            .headers()
+            .get("Content-Length")?
+            .and_then(|value| value.trim().parse::<usize>().ok());
+        if length.is_some_and(|length| length > MAX_BODY) {
+            return Ok(stop(413, "the request is too large"));
+        }
+    }
     match route {
         Route::Runs { owner, repo } => cx.runs(owner, repo, query.as_deref()).await,
         Route::Run(run) => cx.run(run).await,
         Route::Log(job) => cx.log(job, offset_query(query.as_deref())).await,
         Route::LogIndex(job) => cx.log_index(job).await,
         Route::Live(job) => cx.live(job, &req).await,
-        Route::Cancel(run) => cx.cancel(run, &req).await,
-        Route::Dispatch { owner, repo } => {
-            let body = req.bytes().await?;
-            cx.dispatch(owner, repo, &req, &body).await
-        }
+        Route::Cancel(run) => cx.cancel(run).await,
+        Route::Dispatch { owner, repo } => cx.dispatch(owner, repo, &mut req).await,
     }
 }
 
@@ -409,8 +493,17 @@ struct Found {
 }
 
 impl Cx<'_> {
-    async fn access(&self, repo: &RepoRow) -> Result<Access> {
-        access::resolve(self.session, self.settings, repo).await
+    /// The caller's access, or the answer that asks to try again.
+    async fn access(&self, repo: &RepoRow) -> Result<Served<Access>> {
+        match access::resolve(self.session, self.settings, repo).await {
+            Ok(have) => Ok(Ok(have)),
+            Err(access::Failure::Retry(wait)) => Ok(Err(Stop(
+                503,
+                "GitHub is rate limiting; try again shortly".to_owned(),
+                Some(wait),
+            ))),
+            Err(access::Failure::Worker(err)) => Err(err),
+        }
     }
 
     /// The repository, when the caller may use it as `want`.
@@ -422,8 +515,10 @@ impl Cx<'_> {
     }
 
     async fn allowed(&self, repo: &RepoRow, want: Access) -> Result<Served<()>> {
-        let have = self.access(repo).await?;
-        Ok(needs(have, want, self.session.is_some()))
+        match self.access(repo).await? {
+            Ok(have) => Ok(needs(have, want, self.session.is_some())),
+            Err(stop) => Ok(Err(stop)),
+        }
     }
 
     /// The run, with its repository, when the caller may use it as
@@ -515,10 +610,15 @@ impl Cx<'_> {
         };
         if job.status == "completed"
             && let Some(key) = job.log_key.as_deref()
-            && owns_key(key, &found.run.tenant_id, found.repo.id, found.run.id)
-            && let Some(response) = self.stored(key).await?
         {
-            return Ok(Ok(response));
+            if !owns_key(key, &found.run.tenant_id, found.repo.id, found.run.id) {
+                console_error!(
+                    "job {job_id}: log key {key} is outside run {}",
+                    found.run.id
+                );
+            } else if let Some(response) = self.stored(key).await? {
+                return Ok(Ok(response));
+            }
         }
         // Running, or finished and not uploaded yet.
         let path = match offset {
@@ -580,6 +680,9 @@ impl Cx<'_> {
         if job.status == "completed" {
             return Ok(stop(409, "the job ended; read its log"));
         }
+        // The socket is checked once, when it opens: a reader whose access
+        // ends keeps it until the job ends, which is bounded by the
+        // job's timeout.
         let headers = Headers::new();
         headers.set("Upgrade", "websocket")?;
         let mut init = RequestInit::new();
@@ -591,14 +694,11 @@ impl Cx<'_> {
         Ok(Ok(response))
     }
 
-    async fn cancel(&self, run_id: u64, req: &Request) -> Result<Served> {
+    async fn cancel(&self, run_id: u64) -> Result<Served> {
         let found = match self.found(run_id, Access::Write).await? {
             Ok(found) => found,
             Err(stop) => return Ok(Err(stop)),
         };
-        if let Err(stop) = self.csrf(req) {
-            return Ok(Err(stop));
-        }
         let response = call(self.env, found.run.id, Method::Post, "/cancel").await?;
         if !(200..300).contains(&response.status_code()) {
             return Err(fail(format!(
@@ -611,33 +711,27 @@ impl Cx<'_> {
 
     fn csrf(&self, req: &Request) -> std::result::Result<(), Stop> {
         match self.session.map(|session| session.csrf_ok(req)) {
+            None => stop(401, "sign in to change runs"),
             Some(Ok(true)) => Ok(()),
-            _ => stop(403, "missing or wrong CSRF token"),
+            Some(_) => stop(403, "missing or wrong CSRF token"),
         }
     }
 
     #[allow(clippy::too_many_lines)] // One request, read top to bottom.
-    async fn dispatch(
-        &self,
-        owner: &str,
-        name: &str,
-        req: &Request,
-        body: &[u8],
-    ) -> Result<Served> {
+    async fn dispatch(&self, owner: &str, name: &str, req: &mut Request) -> Result<Served> {
         let repo = match self.repo(owner, name, Access::Write).await? {
             Ok(repo) => repo,
             Err(stop) => return Ok(Err(stop)),
         };
-        if let Err(stop) = self.csrf(req) {
-            return Ok(Err(stop));
-        }
         let Some(session) = self.session else {
             return Ok(stop(401, "sign in to change runs"));
         };
+        // Only a writer's body is read, and a chunked one is bounded here.
+        let body = req.bytes().await?;
         if body.len() > MAX_BODY {
             return Ok(stop(413, "the request is too large"));
         }
-        let Ok(asked) = serde_json::from_slice::<Dispatch>(body) else {
+        let Ok(asked) = serde_json::from_slice::<Dispatch>(&body) else {
             return Ok(stop(400, "expected {\"workflow\", \"ref\", \"inputs\"}"));
         };
         let (git_ref, api_ref) = match ref_names(&asked.r#ref, &repo.default_branch) {
@@ -699,12 +793,15 @@ impl Cx<'_> {
                 return Ok(stop(422, message));
             }
         };
-        if let Err(message) = dispatchable(&parsed, &asked.workflow) {
-            return Ok(stop(422, message));
-        }
+        let inputs = match dispatchable(&parsed, &asked.workflow)
+            .and_then(|trigger| resolve_inputs(&trigger.inputs, &asked.inputs))
+        {
+            Ok(inputs) => inputs,
+            Err(message) => return Ok(stop(422, message)),
+        };
         let event = dispatch_event(
             &git_ref,
-            &asked.inputs,
+            &inputs,
             &asked.workflow,
             &repo.full_name,
             &session.user.login,
@@ -871,11 +968,11 @@ mod tests {
         );
         assert!(matches!(
             needs(Access::Read, Access::Write, true),
-            Err(Stop(403, _))
+            Err(Stop(403, _, _))
         ));
         assert!(matches!(
             needs(Access::Read, Access::Write, false),
-            Err(Stop(401, _))
+            Err(Stop(401, _, _))
         ));
     }
 
@@ -929,9 +1026,62 @@ workflows:
         let config = parse(CONFIG).unwrap();
         let err = dispatchable(&config, "ci").unwrap_err();
         assert!(err.contains("workflow_dispatch"), "{err}");
-        assert_eq!(dispatchable(&config, "manual"), Ok(()));
+        assert!(dispatchable(&config, "manual").is_ok());
         let err = dispatchable(&config, "nope").unwrap_err();
         assert!(err.contains("no workflow `nope`"), "{err}");
+    }
+
+    const INPUTS: &str = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  manual:
+    on:
+      workflow_dispatch:
+        inputs:
+          env: { type: enum, enum: [staging, prod], default: staging }
+          note: { type: string }
+          dry: { type: boolean, default: false }
+          count: { type: integer, default: 3 }
+    jobs: [t]
+";
+
+    fn resolved(given: &Value) -> std::result::Result<Map<String, Value>, String> {
+        let config = parse(INPUTS).unwrap();
+        let trigger = dispatchable(&config, "manual").unwrap();
+        resolve_inputs(&trigger.inputs, given.as_object().unwrap())
+    }
+
+    #[test]
+    fn inputs_get_their_defaults() {
+        let out = resolved(&json!({ "note": "hi", "env": "prod" })).unwrap();
+        assert_eq!(
+            Value::Object(out),
+            json!({ "env": "prod", "note": "hi", "dry": false, "count": 3 })
+        );
+    }
+
+    #[test]
+    fn inputs_that_do_not_fit_are_named() {
+        let err = |given| resolved(&given).unwrap_err();
+        assert!(err(json!({})).contains("`note` is required"));
+        assert!(err(json!({ "note": "x", "zzz": 1 })).contains("`zzz` is not declared"));
+        assert!(err(json!({ "note": "x", "env": "dev" })).contains("`env` must be one of"));
+        assert!(err(json!({ "note": 5 })).contains("`note` has the wrong type"));
+        assert!(err(json!({ "note": "x", "dry": "true" })).contains("`dry` has the wrong type"));
+        assert!(err(json!({ "note": "x", "count": 1.5 })).contains("`count` has the wrong type"));
+        assert!(err(json!({ "note": "x", "count": [1] })).contains("`count`"));
+        assert!(err(json!({ "note": "y".repeat(5000) })).contains("`note` is longer than"));
+    }
+
+    #[test]
+    fn only_the_apps_origin_may_change_things() {
+        let app = "https://app.hatchrun.io/";
+        assert!(origin_ok(Some("https://app.hatchrun.io"), app));
+        assert!(!origin_ok(Some("https://evil.hatchrun.io"), app));
+        assert!(!origin_ok(Some("https://app.hatchrun.io.evil.test"), app));
+        assert!(!origin_ok(Some("null"), app));
+        assert!(!origin_ok(None, app));
     }
 
     #[test]

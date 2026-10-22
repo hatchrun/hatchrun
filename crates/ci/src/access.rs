@@ -11,6 +11,9 @@
 //! the session's own token asks for the repository, so a user whose
 //! access ends loses it on the next request, with nothing cached here.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use hatchrun_cloud::Session;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::send;
@@ -44,18 +47,95 @@ pub fn from_permissions(private: bool, p: Option<Permissions>) -> Access {
     }
 }
 
+/// Why access could not be decided.
+#[derive(Debug)]
+pub enum Failure {
+    /// GitHub is rate limiting the user's token: ask again in this many
+    /// seconds. Never "no access".
+    Retry(u64),
+    /// The session lookup or the call failed.
+    Worker(worker::Error),
+}
+
+impl From<worker::Error> for Failure {
+    fn from(err: worker::Error) -> Self {
+        Self::Worker(err)
+    }
+}
+
+/// What GitHub's answer to the permissions call means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The user's permissions.
+    Known(Permissions),
+    /// Rate limited: wait this many seconds.
+    Retry(u64),
+    /// GitHub failed (5xx).
+    Broken(u16),
+}
+
+/// Classifies the answer of [`github::user_repo`] at `now_secs`.
+#[must_use]
+pub fn classify(response: &hatchrun_cloud::http::Response, now_secs: u64) -> Verdict {
+    if let Some(wait) = github::throttle(response, now_secs, 0) {
+        return Verdict::Retry(wait);
+    }
+    if response.status >= 500 {
+        return Verdict::Broken(response.status);
+    }
+    Verdict::Known(github::permissions(response))
+}
+
+/// How long a user's permissions on a repository are kept, in
+/// milliseconds. Polling readers would otherwise spend the user's
+/// GitHub quota.
+pub const CACHE_MS: u64 = 60_000;
+
+/// Entries kept before the cache is emptied.
+const CACHE_CAP: usize = 2048;
+
+type Key = (u64, u64);
+
+thread_local! {
+    static CACHE: RefCell<HashMap<Key, (u64, Permissions)>> = RefCell::new(HashMap::new());
+}
+
+fn cached(key: Key, now: u64) -> Option<Permissions> {
+    CACHE.with(|cache| {
+        let cache = cache.borrow();
+        cache
+            .get(&key)
+            .filter(|(until, _)| *until > now)
+            .map(|(_, p)| *p)
+    })
+}
+
+fn remember(key: Key, p: Permissions, now: u64) {
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= CACHE_CAP {
+            cache.retain(|_, (until, _)| *until > now);
+            if cache.len() >= CACHE_CAP {
+                cache.clear();
+            }
+        }
+        cache.insert(key, (now + CACHE_MS, p));
+    });
+}
+
 /// The access the request has to `repo`.
 ///
 /// # Errors
 ///
-/// The session lookup or the call to GitHub failed. The caller answers
-/// 500, never a guess in either direction.
+/// The session lookup or the call to GitHub failed, or GitHub asks to
+/// wait. The caller answers 500 or 503, never a guess in either
+/// direction.
 pub async fn check(
     req: &Request,
     db: &Db,
     settings: &Settings,
     repo: &RepoRow,
-) -> worker::Result<Access> {
+) -> Result<Access, Failure> {
     let session = Session::find(req, db).await?;
     resolve(session.as_ref(), settings, repo).await
 }
@@ -65,31 +145,38 @@ pub async fn check(
 ///
 /// # Errors
 ///
-/// The call to GitHub failed.
+/// As [`check`].
 pub async fn resolve(
     session: Option<&Session>,
     settings: &Settings,
     repo: &RepoRow,
-) -> worker::Result<Access> {
+) -> Result<Access, Failure> {
     let Some(session) = session else {
         return Ok(from_permissions(repo.private, None));
     };
-    let request = github::user_repo(&settings.github_api, &repo.full_name, &session.token);
-    let response = send(&request)
-        .await
-        .map_err(|err| worker::Error::RustError(format!("{}: {err}", repo.full_name)))?;
-    // GitHub failing is not "no access": a private repository would flip
-    // to hidden and a signed-in reader would see it vanish.
-    if response.status >= 500 {
-        return Err(worker::Error::RustError(format!(
-            "{}: GitHub answered {}",
-            repo.full_name, response.status
-        )));
+    let now = worker::Date::now().as_millis();
+    let key = (session.user.id, repo.id);
+    if let Some(p) = cached(key, now) {
+        return Ok(from_permissions(repo.private, Some(p)));
     }
-    Ok(from_permissions(
-        repo.private,
-        Some(github::permissions(&response)),
-    ))
+    let request = github::user_repo(&settings.github_api, &repo.full_name, &session.token);
+    let response = send(&request).await.map_err(|err| {
+        Failure::Worker(worker::Error::RustError(format!(
+            "{}: {err}",
+            repo.full_name
+        )))
+    })?;
+    match classify(&response, now / 1000) {
+        Verdict::Known(p) => {
+            remember(key, p, now);
+            Ok(from_permissions(repo.private, Some(p)))
+        }
+        Verdict::Retry(wait) => Err(Failure::Retry(wait)),
+        Verdict::Broken(status) => Err(Failure::Worker(worker::Error::RustError(format!(
+            "{}: GitHub answered {status}",
+            repo.full_name
+        )))),
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +210,73 @@ mod tests {
     fn a_public_repo_stays_readable_when_github_gives_the_user_nothing() {
         // An expired or revoked user token answers 401: no permissions.
         assert_eq!(from_permissions(false, p(false, false)), Access::Read);
+    }
+
+    fn answer(status: u16, headers: &[(&str, &str)], body: &str) -> hatchrun_cloud::http::Response {
+        hatchrun_cloud::http::Response {
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn rate_limits_are_retried_not_denied() {
+        let limited = answer(
+            403,
+            &[
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", "1090"),
+            ],
+            "",
+        );
+        assert_eq!(classify(&limited, 1000), Verdict::Retry(90));
+        assert_eq!(classify(&answer(429, &[], ""), 1000), Verdict::Retry(60));
+        let secondary = answer(403, &[], "You have exceeded a secondary rate limit");
+        assert_eq!(classify(&secondary, 1000), Verdict::Retry(60));
+    }
+
+    #[test]
+    fn other_answers_are_permissions_or_a_failure() {
+        assert_eq!(classify(&answer(502, &[], ""), 0), Verdict::Broken(502));
+        let none = Verdict::Known(Permissions {
+            read: false,
+            write: false,
+        });
+        assert_eq!(classify(&answer(404, &[], ""), 0), none);
+        assert_eq!(
+            classify(&answer(403, &[], "Resource not accessible"), 0),
+            none
+        );
+        let ok = answer(
+            200,
+            &[],
+            r#"{"private": true, "permissions": {"pull": true, "push": true}}"#,
+        );
+        assert_eq!(
+            classify(&ok, 0),
+            Verdict::Known(Permissions {
+                read: true,
+                write: true
+            })
+        );
+    }
+
+    #[test]
+    fn permissions_are_kept_for_a_minute() {
+        let key = (900_001, 900_002);
+        assert_eq!(cached(key, 1000), None);
+        let p = Permissions {
+            read: true,
+            write: false,
+        };
+        remember(key, p, 1000);
+        assert_eq!(cached(key, 1000 + CACHE_MS - 1), Some(p));
+        assert_eq!(cached(key, 1000 + CACHE_MS), None);
+        assert_eq!(cached((900_001, 5), 1000), None);
     }
 
     #[test]

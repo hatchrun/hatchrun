@@ -45,12 +45,20 @@ const CI: &str = "CI";
 
 /// Whether `hatchrun-ci` handles deliveries of `event`.
 fn forwarded(event: &str) -> bool {
-    matches!(event, "push" | "pull_request" | "check_run")
+    matches!(event, "push" | "pull_request" | "check_run" | "repository")
 }
 
-/// Whether `hatchrun-ci` serves `path`: the CI API of the app.
-fn forwards_api(path: &str) -> bool {
-    path.starts_with("/api/ci/")
+/// Whether `hatchrun-ci` serves this request: a path of the CI API on
+/// the app's own host. Any other host that reaches this Worker gets the
+/// app's answer, which is a 404 for these paths.
+fn forwards_api(path: &str, host: Option<&str>, app_host: Option<&str>) -> bool {
+    path.starts_with("/api/ci/") && host.is_some() && host == app_host
+}
+
+/// The host of the `APP_URL` variable.
+fn app_host(env: &Env) -> Option<String> {
+    let url = env.secret("APP_URL").ok()?.to_string();
+    worker::Url::parse(&url).ok()?.host_str().map(str::to_owned)
 }
 
 /// Sends a request under `/api/ci/` to `hatchrun-ci` as it came, cookies
@@ -103,7 +111,8 @@ async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response>
         response.headers_mut().set("Cache-Control", "no-store")?;
         return Ok(response);
     }
-    if forwards_api(&path) {
+    let host = req.url()?.host_str().map(str::to_owned);
+    if forwards_api(&path, host.as_deref(), app_host(&env).as_deref()) {
         return forward_api(&env, req).await;
     }
     if path == "/api" || path.starts_with("/api/") {
@@ -369,6 +378,7 @@ mod tests {
         assert!(forwarded("push"));
         assert!(forwarded("pull_request"));
         assert!(forwarded("check_run"));
+        assert!(forwarded("repository"));
         assert!(!forwarded("workflow_job"));
         assert!(!forwarded("installation"));
         assert!(!forwarded(""));
@@ -376,12 +386,26 @@ mod tests {
 
     #[test]
     fn forwards_ci_api_paths() {
-        assert!(forwards_api("/api/ci/runs/1"));
-        assert!(forwards_api("/api/ci/jobs/2/live"));
-        assert!(!forwards_api("/api/session"));
-        assert!(!forwards_api("/api/ci"));
-        assert!(!forwards_api("/api/cinema"));
-        assert!(!forwards_api("/v1/cache/x"));
+        let app = Some("app.hatchrun.io");
+        assert!(forwards_api("/api/ci/runs/1", app, app));
+        assert!(forwards_api("/api/ci/jobs/2/live", app, app));
+        assert!(!forwards_api("/api/session", app, app));
+        assert!(!forwards_api("/api/ci", app, app));
+        assert!(!forwards_api("/api/cinema", app, app));
+        assert!(!forwards_api("/v1/cache/x", app, app));
+    }
+
+    #[test]
+    fn forwards_ci_api_only_on_the_app_host() {
+        let app = Some("app.hatchrun.io");
+        assert!(!forwards_api(
+            "/api/ci/runs/1",
+            Some("other.hatchrun.io"),
+            app
+        ));
+        assert!(!forwards_api("/api/ci/runs/1", None, app));
+        assert!(!forwards_api("/api/ci/runs/1", app, None));
+        assert!(!forwards_api("/api/ci/runs/1", None, None));
     }
 
     const NOW: u64 = 1_792_140_000_000;
