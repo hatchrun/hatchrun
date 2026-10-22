@@ -14,9 +14,15 @@
 //! | `GET /api/ci/orgs/{org}/vars` | org admin | `[{"name", "value", "updatedAt", "repositories"}]` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/vars/{name}` | org admin, CSRF | `204` |
 //! | `GET /api/ci/orgs/{org}/repositories` | org admin | `[{"name"}]` |
+//! | `GET /api/ci/repos/{owner}/{repo}/environments` | repo admin | `[{"name", "branches", "approval", "updatedAt"}]` |
+//! | `PUT /api/ci/repos/{owner}/{repo}/environments/{env}` | repo admin, CSRF | the environment |
+//! | `DELETE /api/ci/repos/{owner}/{repo}/environments/{env}` | repo admin, CSRF | `204` |
+//! | `GET /api/ci/repos/{owner}/{repo}/environments/{env}/(secrets\|vars)` | repo admin | as for an organization |
+//! | `PUT, DELETE /api/ci/repos/{owner}/{repo}/environments/{env}/(secrets\|vars)/{name}` | repo admin, CSRF | `204` |
 //!
-//! The same four under `/api/ci/repos/{owner}/{repo}/` need admin
-//! access to the repository. No route answers a secret's value.
+//! The secret and variable routes under `/api/ci/repos/{owner}/{repo}/`
+//! need admin access to the repository, as do the environment routes.
+//! No route answers a secret's value.
 //!
 //! An organization secret or variable reaches every repository
 //! (`repositories` is `null`) or the repositories named in the list.
@@ -26,8 +32,10 @@
 //! admin of it, both get `404`. `api::serve` runs the Origin, CSRF and
 //! body checks of every mutating method before it calls [`handle`].
 
-use hatchrun_cloud::ci_wake;
+use hatchrun_cloud::ci_wake::{self, Woken};
+use hatchrun_cloud::db::Db;
 use hatchrun_cloud::tenant::valid_login;
+use hatchrun_workflow::valid_environment_name;
 use serde::Deserialize;
 use serde_json::json;
 use worker::{Method, Request, Result, console_error};
@@ -35,6 +43,7 @@ use worker::{Method, Request, Result, console_error};
 use crate::access::{self, Access, Failure};
 use crate::api::{Cx, Served, Stop, body_cap, name, no_content, now_ms, reply, stop};
 use crate::billing;
+use crate::environments::{self, environment_json};
 use crate::launches;
 use crate::secrets::{self, Aad, Keyring};
 use crate::store::{self, Owner, Put, TenantRow};
@@ -50,6 +59,15 @@ pub enum Scope<'a> {
         owner: &'a str,
         /// The repository.
         repo: &'a str,
+    },
+    /// One environment of a repository.
+    Environment {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+        /// The environment.
+        environment: &'a str,
     },
 }
 
@@ -80,6 +98,22 @@ pub enum SettingsRoute<'a> {
         /// The organization.
         org: &'a str,
     },
+    /// The environments of a repository.
+    Environments {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+    },
+    /// Set or delete one environment.
+    Environment {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+        /// The environment.
+        name: &'a str,
+    },
 }
 
 impl SettingsRoute<'_> {
@@ -90,9 +124,12 @@ impl SettingsRoute<'_> {
             SettingsRoute::Billing { .. }
             | SettingsRoute::Secrets(_)
             | SettingsRoute::Vars(_)
-            | SettingsRoute::Repositories { .. } => *method == Method::Get,
+            | SettingsRoute::Repositories { .. }
+            | SettingsRoute::Environments { .. } => *method == Method::Get,
             SettingsRoute::Cap { .. } => *method == Method::Put,
-            SettingsRoute::Secret(..) | SettingsRoute::Var(..) => {
+            SettingsRoute::Secret(..)
+            | SettingsRoute::Var(..)
+            | SettingsRoute::Environment { .. } => {
                 matches!(method, Method::Put | Method::Delete)
             }
         }
@@ -137,8 +174,56 @@ pub fn find(path: &str) -> Option<SettingsRoute<'_>> {
             };
             Some(item_route(kind, scope, name(item)?))
         }
+        ["repos", owner, repo, "environments"] => Some(SettingsRoute::Environments {
+            owner: name(owner)?,
+            repo: name(repo)?,
+        }),
+        ["repos", owner, repo, "environments", env] => Some(SettingsRoute::Environment {
+            owner: name(owner)?,
+            repo: name(repo)?,
+            name: environment_name(env)?,
+        }),
+        [
+            "repos",
+            owner,
+            repo,
+            "environments",
+            env,
+            kind @ ("secrets" | "vars"),
+        ] => {
+            let scope = environment_scope(owner, repo, env)?;
+            Some(if *kind == "secrets" {
+                SettingsRoute::Secrets(scope)
+            } else {
+                SettingsRoute::Vars(scope)
+            })
+        }
+        [
+            "repos",
+            owner,
+            repo,
+            "environments",
+            env,
+            kind @ ("secrets" | "vars"),
+            item,
+        ] => {
+            let scope = environment_scope(owner, repo, env)?;
+            Some(item_route(kind, scope, name(item)?))
+        }
         _ => None,
     }
+}
+
+fn environment_name(env: &str) -> Option<&str> {
+    valid_environment_name(env).is_ok().then_some(env)
+}
+
+fn environment_scope<'a>(owner: &'a str, repo: &'a str, env: &'a str) -> Option<Scope<'a>> {
+    Some(Scope::Environment {
+        owner: name(owner)?,
+        repo: name(repo)?,
+        environment: environment_name(env)?,
+    })
 }
 
 fn item_route<'a>(kind: &str, scope: Scope<'a>, item: &'a str) -> SettingsRoute<'a> {
@@ -170,6 +255,14 @@ pub(crate) async fn handle(
         SettingsRoute::Billing { org } => billing_view(cx, org).await,
         SettingsRoute::Cap { org } => cap(cx, org, req, body_cap(&route)).await,
         SettingsRoute::Repositories { org } => repositories(cx, org).await,
+        SettingsRoute::Environments { owner, repo } => list_environments(cx, owner, repo).await,
+        SettingsRoute::Environment { owner, repo, name } => {
+            if req.method() == Method::Put {
+                put_environment(cx, owner, repo, name, req, body_cap(&route)).await
+            } else {
+                delete_environment(cx, owner, repo, name).await
+            }
+        }
         SettingsRoute::Secrets(scope) => list_secrets(cx, scope).await,
         SettingsRoute::Vars(scope) => list_vars(cx, scope).await,
         SettingsRoute::Secret(scope, item) => {
@@ -314,6 +407,27 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
                     owner: Owner::Repo(repo.id),
                     label: repo.full_name,
                 }))
+        }
+        Scope::Environment {
+            owner,
+            repo,
+            environment,
+        } => {
+            let repo = match cx.repo(owner, repo, Access::Admin).await? {
+                Ok(repo) => repo,
+                Err(stop) => return Ok(Err(stop)),
+            };
+            let Some(found) = store::environment(cx.db, repo.id, environment).await? else {
+                return Ok(stop(404, "not found"));
+            };
+            Ok(Ok(Target {
+                tenant: repo.tenant_id,
+                owner: Owner::Environment {
+                    repo_id: repo.id,
+                    environment_id: found.id,
+                },
+                label: format!("{} environment {}", repo.full_name, found.name),
+            }))
         }
     }
 }
@@ -571,6 +685,144 @@ async fn put_var(
     saved(put, &target, Kind::Vars, max)
 }
 
+async fn list_environments(cx: &Cx<'_>, owner: &str, repo: &str) -> Result<Served> {
+    let repo = match cx.repo(owner, repo, Access::Admin).await? {
+        Ok(repo) => repo,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let rows = store::environments(cx.db, repo.id).await?;
+    let list: Vec<_> = rows.iter().map(environment_json).collect();
+    reply(200, &json!(list)).map(Ok)
+}
+
+/// The body of `PUT .../environments/{env}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentBody {
+    branches: Vec<String>,
+    approval: bool,
+}
+
+/// The body of an environment `PUT` of at most `max_body` bytes.
+fn parse_environment_body(
+    body: &[u8],
+    max_body: usize,
+) -> std::result::Result<EnvironmentBody, Stop> {
+    if body.len() > max_body {
+        return stop(413, "the request is too large");
+    }
+    let Ok(parsed) = serde_json::from_slice::<EnvironmentBody>(body) else {
+        return stop(400, "expected {\"branches\": [...], \"approval\": false}");
+    };
+    if let Err(message) = environments::valid_branches(&parsed.branches) {
+        return stop(422, message);
+    }
+    Ok(parsed)
+}
+
+async fn put_environment(
+    cx: &Cx<'_>,
+    owner: &str,
+    repo: &str,
+    name: &str,
+    req: &mut Request,
+    max_body: usize,
+) -> Result<Served> {
+    let repo = match cx.repo(owner, repo, Access::Admin).await? {
+        Ok(repo) => repo,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let body = match parse_environment_body(&req.bytes().await?, max_body) {
+        Ok(body) => body,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let now = now_ms();
+    let saved = store::put_environment(
+        cx.db,
+        &repo.tenant_id,
+        repo.id,
+        name,
+        &body.branches,
+        body.approval,
+        environments::MAX_PER_REPO,
+        now,
+    )
+    .await?;
+    let row = match saved {
+        store::PutEnvironment::Saved(row) => row,
+        store::PutEnvironment::TooMany => {
+            return Ok(stop(
+                409,
+                format!(
+                    "{} has {} environments, the most allowed",
+                    repo.full_name,
+                    environments::MAX_PER_REPO
+                ),
+            ));
+        }
+    };
+    release_and_wake(cx, repo.id, &row.name, row.approval, false, now).await;
+    reply(200, &environment_json(&row)).map(Ok)
+}
+
+async fn delete_environment(cx: &Cx<'_>, owner: &str, repo: &str, name: &str) -> Result<Served> {
+    let repo = match cx.repo(owner, repo, Access::Admin).await? {
+        Ok(repo) => repo,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    if !store::delete_environment(cx.db, repo.id, name).await? {
+        return Ok(stop(404, "not found"));
+    }
+    release_and_wake(cx, repo.id, name, false, true, now_ms()).await;
+    no_content().map(Ok)
+}
+
+/// Whether a change to an environment frees the jobs that wait for its
+/// approval: deleting it does, and so does turning approval off.
+const fn releases(approval_after: bool, deleted: bool) -> bool {
+    deleted || !approval_after
+}
+
+/// The jobs a change to environment `name` frees, with their holds
+/// cleared; none when the change keeps the approval rule.
+pub(crate) async fn release_holds(
+    db: &Db,
+    repo_id: u64,
+    name: &str,
+    approval_after: bool,
+    deleted: bool,
+    now: u64,
+) -> Result<Vec<Woken>> {
+    if !releases(approval_after, deleted) {
+        return Ok(Vec::new());
+    }
+    store::release_approval_holds(db, repo_id, name, now).await
+}
+
+/// Frees the jobs a change to environment `name` leaves without an
+/// approval rule and sends them to the launch queue. The change is
+/// saved already, so a failure is logged and the reconciler's backstop
+/// picks the jobs up.
+async fn release_and_wake(
+    cx: &Cx<'_>,
+    repo_id: u64,
+    name: &str,
+    approval_after: bool,
+    deleted: bool,
+    now: u64,
+) {
+    let woken = match release_holds(cx.db, repo_id, name, approval_after, deleted, now).await {
+        Ok(woken) => woken,
+        Err(err) => {
+            console_error!("repo {repo_id}: release approval holds of {name}: {err}");
+            return;
+        }
+    };
+    if let Err(err) = launches::send_wakes(cx.env, &woken).await {
+        console_error!("repo {repo_id}: wake jobs held for {name}: {err}");
+    }
+}
+
 fn saved(put: Put, target: &Target, kind: Kind, max: u32) -> Result<Served> {
     match put {
         Put::Saved => no_content().map(Ok),
@@ -714,6 +966,106 @@ mod tests {
             settings_route("repos/acme/api/vars", &Method::Get),
             Some(SettingsRoute::Vars(repo))
         );
+    }
+
+    #[test]
+    fn environment_routes_parse() {
+        assert_eq!(
+            settings_route("repos/acme/api/environments", &Method::Get),
+            Some(SettingsRoute::Environments {
+                owner: "acme",
+                repo: "api"
+            })
+        );
+        for method in [Method::Put, Method::Delete] {
+            assert_eq!(
+                settings_route("repos/acme/api/environments/production", &method),
+                Some(SettingsRoute::Environment {
+                    owner: "acme",
+                    repo: "api",
+                    name: "production"
+                })
+            );
+        }
+        let scope = Scope::Environment {
+            owner: "acme",
+            repo: "api",
+            environment: "production",
+        };
+        assert_eq!(
+            settings_route(
+                "repos/acme/api/environments/production/secrets",
+                &Method::Get
+            ),
+            Some(SettingsRoute::Secrets(scope))
+        );
+        assert_eq!(
+            settings_route(
+                "repos/acme/api/environments/production/vars/X",
+                &Method::Put
+            ),
+            Some(SettingsRoute::Var(scope, "X"))
+        );
+        assert_eq!(
+            settings_route(
+                "repos/acme/api/environments/production/secrets/X",
+                &Method::Delete
+            ),
+            Some(SettingsRoute::Secret(scope, "X"))
+        );
+    }
+
+    #[test]
+    fn bad_environment_paths_have_no_route() {
+        for (path, method) in [
+            ("repos/acme/api/environments/prod%20eu", Method::Put),
+            ("repos/acme/api/environments/", Method::Put),
+            ("repos/acme/api/environments/production", Method::Get),
+            ("repos/acme/api/environments", Method::Post),
+            ("repos/acme/api/environments/production/other", Method::Get),
+            ("repos/acme/api/environments/prod%20eu/secrets", Method::Get),
+            (
+                "repos/acme/api/environments/production/secrets/A/B",
+                Method::Put,
+            ),
+        ] {
+            assert_eq!(settings_route(path, &method), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn changes_that_release_holds() {
+        assert!(releases(false, false));
+        assert!(releases(true, true));
+        assert!(releases(false, true));
+        assert!(!releases(true, false));
+    }
+
+    #[test]
+    fn environment_bodies() {
+        let parse = |body: &str| parse_environment_body(body.as_bytes(), 8 << 10);
+        let ok = parse(r#"{"branches":["main"],"approval":true}"#).unwrap();
+        assert_eq!((ok.branches, ok.approval), (vec!["main".to_owned()], true));
+        for body in [
+            "nope",
+            r#"{"branches":["main"]}"#,
+            r#"{"approval":false}"#,
+            r#"{"branches":[],"approval":false,"x":1}"#,
+        ] {
+            let (status, message) = refused(parse(body));
+            assert_eq!(status, 400);
+            assert_eq!(
+                message,
+                "expected {\"branches\": [...], \"approval\": false}"
+            );
+        }
+        let (status, message) = refused(parse(r#"{"branches":[""],"approval":false}"#));
+        assert_eq!(
+            (status, message.as_str()),
+            (422, "Branch patterns cannot be empty")
+        );
+        let (status, _) = refused(parse_environment_body(&[b' '; 200], 100));
+        assert_eq!(status, 413);
     }
 
     #[test]

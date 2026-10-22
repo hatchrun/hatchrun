@@ -4692,6 +4692,55 @@ mod tests {
     }
 
     #[test]
+    fn environment_changes_release_holds_through_the_handler_path() {
+        use crate::settings_api::release_holds;
+
+        let db = setup();
+        let hold = |job: u64| {
+            db.run(
+                "UPDATE ci_jobs SET status = 'queued', held = 'approval', updated_at = 1 \
+                 WHERE id = $1",
+                &params![job],
+            );
+        };
+        let release = |approval: bool, deleted: bool, now: u64| {
+            db.wait(release_holds(
+                db.db(),
+                7,
+                "production",
+                approval,
+                deleted,
+                now,
+            ))
+            .unwrap()
+        };
+        let job = job_naming(&db, "a", Some("Production"));
+        hold(job);
+
+        // A save that keeps approval on frees nothing.
+        save_environment(&db, "Production", &["main"], true);
+        assert_eq!(woken_ids(release(true, false, 10)), Vec::<u64>::new());
+        assert_eq!(held_of(&db, job).as_deref(), Some("approval"));
+
+        // Turning approval off frees the job and schedules its launch.
+        let row = save_environment(&db, "Production", &["main"], false);
+        let woken = release(row.approval, false, 20);
+        assert_eq!(woken_ids(woken), [job]);
+        assert_eq!(held_of(&db, job), None);
+
+        // Deleting the environment frees a job held on it.
+        let later = job_naming(&db, "b", Some("Production"));
+        hold(later);
+        save_environment(&db, "Production", &[], true);
+        assert!(
+            db.wait(delete_environment(db.db(), 7, "production"))
+                .unwrap()
+        );
+        assert_eq!(woken_ids(release(false, true, 30)), [later]);
+        assert_eq!(held_of(&db, later), None);
+    }
+
+    #[test]
     fn a_transferred_repo_leaves_its_environments() {
         let db = setup();
         db.run(

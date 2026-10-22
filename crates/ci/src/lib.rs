@@ -27,6 +27,7 @@ pub mod api;
 pub mod billing;
 pub mod checks;
 pub mod env;
+pub mod environments;
 pub mod github;
 pub mod graph;
 pub mod intake;
