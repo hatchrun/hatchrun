@@ -62,6 +62,10 @@ pub struct BillingView {
     pub spend_cents: u64,
     /// The monthly spend cap, in whole dollars.
     pub cap_dollars: u64,
+    /// The least the cap can be set to, in whole dollars.
+    pub min_cap_dollars: u64,
+    /// The most the cap can be set to, in whole dollars.
+    pub max_cap_dollars: u64,
     /// Jobs running now.
     pub running: u32,
     /// The most jobs that run at once.
@@ -78,6 +82,8 @@ pub fn view(standing: &Standing) -> BillingView {
         free_units: templates::FREE_UNITS,
         spend_cents: spend_micros(standing) / MICROS_PER_CENT,
         cap_dollars: standing.cap_micros / MICROS_PER_DOLLAR,
+        min_cap_dollars: templates::MIN_SPEND_CAP_MICROS / MICROS_PER_DOLLAR,
+        max_cap_dollars: templates::MAX_SPEND_CAP_MICROS / MICROS_PER_DOLLAR,
         running: standing.running,
         max_running: templates::MAX_RUNNING_JOBS,
     }
@@ -209,6 +215,8 @@ mod tests {
                 free_units: 500,
                 spend_cents: 20,
                 cap_dollars: 50,
+                min_cap_dollars: 50,
+                max_cap_dollars: 10_000,
                 running: 0,
                 max_running: 5,
             }
@@ -217,6 +225,8 @@ mod tests {
         assert_eq!(json["spendCents"], 20);
         assert_eq!(json["freeUnits"], 500);
         assert_eq!(json["maxRunning"], 5);
+        assert_eq!(json["minCapDollars"], 50);
+        assert_eq!(json["maxCapDollars"], 10_000);
     }
 
     #[test]
