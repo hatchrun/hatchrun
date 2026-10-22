@@ -134,12 +134,24 @@ pub fn open_stage(state_dir: &Path) -> anyhow::Result<OwnedFd> {
     Ok(dir)
 }
 
+// `mode_t` is u32 on Linux and u16 on macOS, where the agent is only
+// built for development.
+#[allow(clippy::useless_conversion)]
+fn mode_bits(mode: nix::libc::mode_t) -> u32 {
+    u32::from(mode)
+}
+
+#[allow(clippy::useless_conversion)]
+fn to_mode(bits: u32) -> Mode {
+    Mode::from_bits_truncate(bits.try_into().unwrap_or(0o755))
+}
+
 /// Requires `dir` to belong to the agent or root, and to be closed to
 /// group and others (a sticky directory may be writable: others cannot
 /// rename what they do not own). `strict` closes it to reading as well.
 fn check_private(dir: &OwnedFd, path: &Path, strict: bool) -> anyhow::Result<()> {
     let stat = fstat(dir)?;
-    let mode = u32::from(stat.st_mode);
+    let mode = mode_bits(stat.st_mode);
     let sticky = mode & 0o1000 != 0;
     let writable_by_others = mode & 0o022 != 0 && !sticky;
     let owner_ok = stat.st_uid == geteuid().as_raw() || stat.st_uid == 0;
@@ -869,7 +881,7 @@ fn enter(
             _ => return Err(format!("{} is not a directory", shown.display())),
         },
         Err(Errno::ENOENT) => {
-            let mode = Mode::from_bits_truncate(mode.try_into().unwrap_or(0o755));
+            let mode = to_mode(mode);
             mkdirat(parent, name, mode).map_err(|e| format!("create {}: {e}", shown.display()))?;
             chown_link(parent, name, owner, shown)?;
         }
@@ -913,7 +925,7 @@ fn merge(
             .map_err(|e| format!("stat {}: {e}", shown.display()))?;
         match kind_of(stat.st_mode) {
             SFlag::S_IFDIR => {
-                let child_dst = enter(dst, &name, u32::from(stat.st_mode & 0o777), owner, &shown)?;
+                let child_dst = enter(dst, &name, mode_bits(stat.st_mode & 0o777), owner, &shown)?;
                 let child_src =
                     open_dir(src, &name).map_err(|e| format!("open {}: {e}", shown.display()))?;
                 merge(&child_src, &child_dst, &shown, owner, cancel)?;
