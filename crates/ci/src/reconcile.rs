@@ -18,13 +18,17 @@
 //! ([`minutes`], [`fires`], [`stalled`], [`orphans`]) and then acts.
 //!
 //! A pass is bounded so it stays inside the Worker's CPU time and
-//! subrequest limits: at most [`MAX_MINUTES`] minutes and [`MAX_FIRES`]
-//! scheduled runs, [`SCHEDULE_ROWS`] schedule rows, [`MAX_FIXES`] stalled
-//! jobs, [`MAX_TERMINATIONS`] terminated instances and
-//! [`store::SWEEP_LIMIT`] purged runs. What is over the bound waits for
-//! the next pass, except scheduled runs past [`MAX_FIRES`], which are
+//! subrequest limits. It counts the outbound calls it makes (GitHub,
+//! run objects, queue, AWS) against [`BUDGET`], split by [`shares`]:
+//! 500 for schedules, 200 for stalled jobs, 100 for orphans and 100 for
+//! retention. A step whose share runs out stops and resumes in the next
+//! pass. Rows and runs are bounded too: [`MAX_MINUTES`] minutes,
+//! [`SCHEDULE_ROWS`] schedule rows, [`MAX_FIXES`] stalled jobs,
+//! [`MAX_TERMINATIONS`] terminated instances and [`store::SWEEP_LIMIT`]
+//! purged runs. Scheduled runs past [`MAX_FIRES`] in one pass are
 //! skipped and logged.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use futures_util::future::join_all;
@@ -73,6 +77,102 @@ const MAX_AGE_MS: u64 = 7 * 3_600_000;
 const LAUNCH_DID_NOT_FINISH: &str = "the launch did not finish";
 const RUNNER_DID_NOT_START: &str = "the runner did not start";
 const LOST_CONTACT: &str = "lost contact with the runner";
+
+/// The subrequests one pass plans to make, below the Worker's limit of
+/// 1000 so that DNS, KV and Postgres setup have room.
+pub const BUDGET: u32 = 900;
+
+/// What each step of a pass may spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shares {
+    /// Schedules.
+    pub schedules: u32,
+    /// Stalled launches and lost runners.
+    pub stalled: u32,
+    /// Orphan instances.
+    pub orphans: u32,
+    /// Retention.
+    pub retention: u32,
+}
+
+/// Splits `total`: schedules take 5/9 of it, at most 500, and the rest
+/// goes half to stalled jobs, a quarter to orphans and a quarter to
+/// retention. Schedules cannot take what the other steps need.
+#[must_use]
+pub fn shares(total: u32) -> Shares {
+    let schedules = (total / 9 * 5).min(500);
+    let rest = total - schedules;
+    let stalled = rest / 2;
+    let orphans = rest / 4;
+    Shares {
+        schedules,
+        stalled,
+        orphans,
+        retention: rest - stalled - orphans,
+    }
+}
+
+/// What a step has left to spend.
+#[derive(Debug)]
+pub struct Budget(Cell<u32>);
+
+impl Budget {
+    /// A budget of `n` subrequests.
+    #[must_use]
+    pub fn new(n: u32) -> Budget {
+        Budget(Cell::new(n))
+    }
+
+    /// Spends `n`, or nothing when less is left. Returns whether it did.
+    pub fn take(&self, n: u32) -> bool {
+        match self.0.get().checked_sub(n) {
+            Some(left) => {
+                self.0.set(left);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// What is left.
+    #[must_use]
+    pub fn left(&self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// Subrequests of reading a repository's head and config: a token (its
+/// cache and GitHub), the commit and the file.
+const HEAD_COST: u32 = 4;
+/// Of starting a run: its object, and the two GitHub calls of a config
+/// report.
+const START_COST: u32 = 3;
+/// Of ending a job: its object.
+const FAIL_COST: u32 = 1;
+/// Of sending a launch message.
+const REQUEUE_COST: u32 = 1;
+/// Of terminating an instance: credentials and the call.
+const TERMINATE_COST: u32 = 2;
+/// Of listing instances: credentials and the first page.
+const LIST_COST: u32 = 2;
+/// Of purging a run's object.
+const PURGE_COST: u32 = 1;
+
+/// The name of the runner of launch `launch` of attempt `attempt` of job
+/// `job`, which is also the instance's `hatchrun:runner-name` tag.
+#[must_use]
+pub fn runner_name(job: u64, attempt: u32, launch: u32) -> String {
+    format!("ci-{job}-{attempt}-{launch}")
+}
+
+/// The attempt and launch a [`runner_name`] holds.
+fn runner_position(name: &str) -> Option<(u32, u32)> {
+    let mut parts = name.strip_prefix("ci-")?.splitn(3, '-');
+    parts.next()?.parse::<u64>().ok()?;
+    let attempt = parts.next()?.parse().ok()?;
+    let launch = parts.next()?.parse().ok()?;
+    Some((attempt, launch))
+}
 
 /// What to do about a stalled job.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,8 +229,9 @@ fn terminate_and_fail(row: &JobRow, message: &'static str) -> Fix {
 
 /// The ids of the instances in `described` that no job needs: the job is
 /// unknown (no tag, or no row in `rows`), ended more than 180 s before
-/// `now`, or the instance started more than 7 hours ago. A launch time
-/// that does not parse counts as old.
+/// `now`, a later attempt or launch of the job replaced the instance
+/// (its runner name says which it is), or the instance started more
+/// than 7 hours ago. A launch time that does not parse counts as old.
 #[must_use]
 pub fn orphans(described: &[Described], rows: &[JobRow], now: u64) -> Vec<String> {
     let jobs: HashMap<u64, &JobRow> = rows.iter().map(|row| (row.id, row)).collect();
@@ -150,7 +251,17 @@ pub fn orphans(described: &[Described], rows: &[JobRow], now: u64) -> Vec<String
                         .completed_at
                         .is_none_or(|at| at < now.saturating_sub(ORPHAN_GRACE_MS))
             };
-            old || row.is_none_or(|row| finished(row))
+            let superseded = |row: &JobRow| {
+                instance
+                    .runner_name
+                    .as_deref()
+                    .and_then(runner_position)
+                    .is_some_and(|(attempt, launch)| {
+                        attempt < row.attempt
+                            || (attempt == row.attempt && launch < row.launch_attempts)
+                    })
+            };
+            old || row.is_none_or(|row| finished(row) || superseded(row))
         })
         .map(|instance| instance.id.clone())
         .collect()
@@ -260,22 +371,32 @@ pub async fn run(env: Env) {
             return;
         }
     };
-    if let Err(err) = fire_schedules(&env, &db, &settings, now).await {
+    let share = shares(BUDGET);
+    if let Err(err) = fire_schedules(&env, &db, &settings, &Budget::new(share.schedules), now).await
+    {
         console_error!("reconcile: schedules: {err}");
     }
     let backend = Backend::new(&settings).await;
     if let Err(err) = &backend {
         console_error!("reconcile: no launcher backend: {err}");
     }
-    if let Err(err) = fix_stalled(&env, &db, backend.as_ref().ok(), now).await {
+    if let Err(err) = fix_stalled(
+        &env,
+        &db,
+        backend.as_ref().ok(),
+        &Budget::new(share.stalled),
+        now,
+    )
+    .await
+    {
         console_error!("reconcile: stalled jobs: {err}");
     }
     if let Ok(backend) = &backend
-        && let Err(err) = end_orphans(&db, backend, now).await
+        && let Err(err) = end_orphans(&db, backend, &Budget::new(share.orphans), now).await
     {
         console_error!("reconcile: orphans: {err}");
     }
-    if let Err(err) = retain(&env, &db, now).await {
+    if let Err(err) = retain(&env, &db, &Budget::new(share.retention), now).await {
         console_error!("reconcile: retention: {err}");
     }
 }
@@ -291,8 +412,16 @@ struct Head {
     config: Config,
 }
 
-/// Step 1.
-async fn fire_schedules(env: &Env, db: &Db, settings: &Settings, now: u64) -> Result<(), String> {
+/// Step 1. When `budget` runs out the pass stops before the first fire it
+/// cannot pay for; the next pass starts again from that minute, and the
+/// runs already made are skipped without cost.
+async fn fire_schedules(
+    env: &Env,
+    db: &Db,
+    settings: &Settings,
+    budget: &Budget,
+    now: u64,
+) -> Result<(), String> {
     let last = store::last_minute(db).await.map_err(|e| e.to_string())?;
     let due = minutes(last, now);
     let Some(&newest) = due.last() else {
@@ -321,8 +450,13 @@ async fn fire_schedules(env: &Env, db: &Db, settings: &Settings, now: u64) -> Re
     );
     // The repository, its head and its config are read once per pass.
     let mut heads: HashMap<u64, Option<Head>> = HashMap::new();
+    let mut stopped_at = None;
     for fire in &fired {
         if let std::collections::hash_map::Entry::Vacant(slot) = heads.entry(fire.repo_id) {
+            if !budget.take(HEAD_COST) {
+                stopped_at = Some(fire.minute_ms);
+                break;
+            }
             let head = match head(db, settings, &tokens, fire.repo_id).await {
                 Ok(head) => head,
                 Err(err) => {
@@ -335,6 +469,16 @@ async fn fire_schedules(env: &Env, db: &Db, settings: &Settings, now: u64) -> Re
         let Some(Some(head)) = heads.get(&fire.repo_id) else {
             continue;
         };
+        let made = store::run_for_delivery(db, &fire.delivery(), &fire.workflow)
+            .await
+            .map_err(|e| e.to_string())?;
+        if made.is_some_and(|run| run.status != "queued") {
+            continue;
+        }
+        if !budget.take(START_COST) {
+            stopped_at = Some(fire.minute_ms);
+            break;
+        }
         if let Err(err) = start(env, db, settings, &tokens, head, fire, now).await {
             console_error!(
                 "reconcile: schedule {} of {}: {err}",
@@ -343,7 +487,14 @@ async fn fire_schedules(env: &Env, db: &Db, settings: &Settings, now: u64) -> Re
             );
         }
     }
-    store::set_last_minute(db, newest)
+    let done = match stopped_at {
+        Some(minute) => {
+            console_error!("reconcile: schedule budget spent, resuming at minute {minute}");
+            minute - 60_000
+        }
+        None => newest,
+    };
+    store::set_last_minute(db, done)
         .await
         .map_err(|e| e.to_string())
 }
@@ -433,6 +584,7 @@ async fn start(
             actor: "schedule",
             head_ref: "",
             base_ref: "",
+            workflow: Some(&fire.workflow),
         },
         &head.config,
         now,
@@ -449,11 +601,13 @@ async fn start(
     Ok(())
 }
 
-/// Steps 2 and 3.
+/// Steps 2 and 3. Stops when `budget` cannot pay for the next fix; the
+/// rest are still stalled next pass.
 async fn fix_stalled(
     env: &Env,
     db: &Db,
     backend: Option<&Backend>,
+    budget: &Budget,
     now: u64,
 ) -> Result<(), String> {
     let rows = store::stalled_jobs(db, now, MAX_FIXES)
@@ -461,6 +615,15 @@ async fn fix_stalled(
         .map_err(|e| e.to_string())?;
     let by_id: HashMap<u64, &JobRow> = rows.iter().map(|row| (row.id, row)).collect();
     for fix in stalled(&rows, now) {
+        let cost = match &fix {
+            Fix::Requeue(_) => REQUEUE_COST,
+            Fix::Fail(..) => FAIL_COST,
+            Fix::TerminateAndFail(..) => TERMINATE_COST + FAIL_COST,
+        };
+        if !budget.take(cost) {
+            console_error!("reconcile: stalled-job budget spent, the rest wait");
+            break;
+        }
         let (id, result) = match fix {
             Fix::Requeue(id) => (id, requeue(env, by_id[&id]).await),
             Fix::Fail(id, message) => (id, fail_job(env, db, by_id[&id], message, now).await),
@@ -525,8 +688,11 @@ async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> 
     }
 }
 
-/// Step 4.
-async fn end_orphans(db: &Db, backend: &Backend, now: u64) -> Result<(), String> {
+/// Step 4. Terminates as many orphans as `budget` pays for.
+async fn end_orphans(db: &Db, backend: &Backend, budget: &Budget, now: u64) -> Result<(), String> {
+    if !budget.take(LIST_COST) {
+        return Ok(());
+    }
     let described = backend.instances().await?;
     if described.is_empty() {
         return Ok(());
@@ -539,13 +705,16 @@ async fn end_orphans(db: &Db, backend: &Backend, now: u64) -> Result<(), String>
         .await
         .map_err(|e| e.to_string())?;
     let mut doomed = orphans(&described, &rows, now);
-    if doomed.len() > MAX_TERMINATIONS {
+    let affordable = (budget.left() / TERMINATE_COST) as usize;
+    let now_count = MAX_TERMINATIONS.min(affordable);
+    if doomed.len() > now_count {
         console_log!(
-            "reconcile: {} orphans, terminating {MAX_TERMINATIONS} now",
+            "reconcile: {} orphans, terminating {now_count} now",
             doomed.len()
         );
-        doomed.truncate(MAX_TERMINATIONS);
+        doomed.truncate(now_count);
     }
+    budget.take(TERMINATE_COST * u32::try_from(doomed.len()).unwrap_or(0));
     join_all(doomed.iter().map(|id| async move {
         console_log!("reconcile: terminating orphan {id}");
         backend.terminate(id).await;
@@ -554,9 +723,14 @@ async fn end_orphans(db: &Db, backend: &Backend, now: u64) -> Result<(), String>
     Ok(())
 }
 
-/// Step 5.
-async fn retain(env: &Env, db: &Db, now: u64) -> Result<(), String> {
+/// Step 5. A sweep takes at most [`store::SWEEP_LIMIT`] runs and one
+/// subrequest each purges them, which `budget` covers.
+async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
+    if budget.left() < store::SWEEP_LIMIT * PURGE_COST {
+        return Ok(());
+    }
     let expired = store::sweep(db, now).await.map_err(|e| e.to_string())?;
+    budget.take(PURGE_COST * u32::try_from(expired.len()).unwrap_or(0));
     join_all(expired.iter().map(|&run_id| async move {
         if let Err(err) = purge(env, run_id).await {
             console_error!("reconcile: purge run {run_id}: {err}");
@@ -670,12 +844,16 @@ mod tests {
     }
 
     fn instance(id: &str, job: Option<&str>, launched: &str) -> Described {
+        named(id, job, launched, None)
+    }
+
+    fn named(id: &str, job: Option<&str>, launched: &str, runner: Option<&str>) -> Described {
         Described {
             id: id.into(),
             state: "running".into(),
             launch_time: launched.into(),
             job_id: job.map(str::to_owned),
-            runner_name: None,
+            runner_name: runner.map(str::to_owned),
         }
     }
 
@@ -766,5 +944,66 @@ mod tests {
         assert_eq!(fired.len(), 200);
         assert_eq!(skipped, 60);
         assert!(fired[..130].iter().all(|f| f.minute_ms == NOW - MIN));
+    }
+
+    #[test]
+    fn terminates_instances_a_later_launch_or_attempt_replaced() {
+        let fresh = "2026-10-22T13:40:00Z";
+        let mut running = row("running");
+        running.id = 5;
+        running.attempt = 2;
+        running.launch_attempts = 2;
+        let described = [
+            named("i-current", Some("5"), fresh, Some("ci-5-2-2")),
+            named("i-old-launch", Some("5"), fresh, Some("ci-5-2-1")),
+            named("i-old-attempt", Some("5"), fresh, Some("ci-5-1-3")),
+            named("i-newer", Some("5"), fresh, Some("ci-5-3-1")),
+            named("i-odd-name", Some("5"), fresh, Some("custom")),
+            named("i-no-name", Some("5"), fresh, None),
+        ];
+        assert_eq!(
+            orphans(&described, &[running], NOW),
+            ["i-old-launch", "i-old-attempt"]
+        );
+        assert_eq!(runner_name(5, 2, 1), "ci-5-2-1");
+        assert_eq!(runner_position("ci-5-2-1"), Some((2, 1)));
+        assert_eq!(runner_position("ci-5-x-1"), None);
+    }
+
+    #[test]
+    fn schedules_cannot_starve_the_other_steps() {
+        let share = shares(BUDGET);
+        assert_eq!(
+            share,
+            Shares {
+                schedules: 500,
+                stalled: 200,
+                orphans: 100,
+                retention: 100
+            }
+        );
+        assert_eq!(
+            share.schedules + share.stalled + share.orphans + share.retention,
+            BUDGET
+        );
+        assert!(share.retention >= store::SWEEP_LIMIT);
+        for total in [0, 1, 8, 100, 900, 5_000] {
+            let share = shares(total);
+            assert_eq!(
+                share.schedules + share.stalled + share.orphans + share.retention,
+                total
+            );
+            assert!(share.schedules <= 500);
+        }
+    }
+
+    #[test]
+    fn a_budget_spends_all_or_nothing() {
+        let budget = Budget::new(5);
+        assert!(budget.take(3));
+        assert!(!budget.take(3));
+        assert_eq!(budget.left(), 2);
+        assert!(budget.take(2));
+        assert!(!budget.take(1));
     }
 }

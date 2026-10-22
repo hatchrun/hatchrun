@@ -60,6 +60,9 @@ pub struct Request<'a> {
     pub head_ref: &'a str,
     /// The pull request's base branch, empty otherwise.
     pub base_ref: &'a str,
+    /// Start only this workflow's plan. A schedule names its workflow;
+    /// the other workflows that share its cron have their own entries.
+    pub workflow: Option<&'a str>,
 }
 
 fn fail(message: impl Into<String>) -> worker::Error {
@@ -211,7 +214,7 @@ pub async fn create(
         }
     };
     let plans = match planning::select(source, req.trigger, req.compile_ref) {
-        Selected::Plans(plans) => plans,
+        Selected::Plans(plans) => only_workflow(plans, req.workflow),
         Selected::Invalid(diagnostics) => {
             report_invalid(tokens, settings, req, &diagnostics).await?;
             return Ok(Vec::new());
@@ -222,6 +225,14 @@ pub async fn create(
         ids.push(start_plan(env, db, req, plan, now).await?);
     }
     Ok(ids)
+}
+
+/// The plans of `workflow` when one is named, all of them otherwise.
+fn only_workflow(mut plans: Vec<Plan>, workflow: Option<&str>) -> Vec<Plan> {
+    if let Some(workflow) = workflow {
+        plans.retain(|plan| plan.workflow == workflow);
+    }
+    plans
 }
 
 async fn report_invalid(
@@ -464,6 +475,34 @@ mod tests {
             .unwrap();
         let (r, rows) = load(&db);
         assert!(!unstarted(&r, &rows), "a job was queued");
+    }
+
+    #[test]
+    fn workflows_sharing_a_cron_each_start_once() {
+        let source = "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  a: { on: { schedule: [{ cron: '0 3 * * *' }] }, jobs: [t] }
+  b: { on: { schedule: [{ cron: '0 3 * * *' }] }, jobs: [t] }
+  c: { on: { schedule: [{ cron: '5 3 * * *' }] }, jobs: [t] }
+";
+        let event = Event::Schedule {
+            cron: "0 3 * * *".into(),
+        };
+        let Selected::Plans(plans) = planning::select(source, &event, "refs/heads/main") else {
+            panic!("invalid");
+        };
+        assert_eq!(plans.len(), 2, "both share the cron");
+        let names = |workflow| {
+            only_workflow(plans.clone(), workflow)
+                .into_iter()
+                .map(|plan| plan.workflow)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(Some("a")), ["a"]);
+        assert_eq!(names(Some("b")), ["b"]);
+        assert_eq!(names(Some("c")), [] as [String; 0]);
+        assert_eq!(names(None), ["a", "b"]);
     }
 
     #[test]

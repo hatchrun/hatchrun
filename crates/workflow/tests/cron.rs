@@ -112,7 +112,6 @@ fn rejects_bad_fields() {
         "5-1 * * * *",
         "1,,2 * * * *",
         "* * * FOO *",
-        "* * * * 5/2",
         "",
     ] {
         assert!(Cron::parse(bad).is_err(), "{bad:?} parsed");
@@ -137,4 +136,28 @@ workflows:
         messages,
         [r#"invalid cron "0 25 * * *": hour 25 is out of range 0-23"#]
     );
+}
+
+#[test]
+fn a_step_from_a_start_runs_to_the_end_of_the_field() {
+    assert_eq!(
+        Cron::parse("0/15 * * * *").unwrap(),
+        Cron::parse("0-59/15 * * * *").unwrap()
+    );
+    assert_eq!(
+        Cron::parse("10/20 2/6 * * *").unwrap(),
+        Cron::parse("10-59/20 2-23/6 * * *").unwrap()
+    );
+    assert!(matches("30/15 * * * *", 1_792_676_700));
+    assert!(!matches("50/15 * * * *", 1_792_676_700));
+    assert_eq!(
+        Cron::parse("0 0 * * 1/2").unwrap(),
+        Cron::parse("0 0 * * 1-7/2").unwrap()
+    );
+}
+
+#[test]
+fn huge_steps_do_not_overflow() {
+    let huge = Cron::parse("* * 1/4294967295 1/4294967295 *").unwrap();
+    assert_eq!(huge, Cron::parse("* * 1 1 *").unwrap());
 }

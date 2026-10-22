@@ -6,7 +6,8 @@
 //!
 //! Minute `0-59`, hour `0-23`, day of month `1-31`, month `1-12` or
 //! `JAN-DEC`, day of week `0-7` or `SUN-SAT` (0 and 7 are Sunday). Each
-//! field is `*` or a comma list of `n`, `a-b`, `*/s` and `a-b/s`. A day
+//! field is `*` or a comma list of `n`, `a-b`, `*/s`, `a-b/s` and `n/s`
+//! (`n-max/s`). A day
 //! field that starts with `*` is unrestricted; when both day fields are
 //! restricted a time matches if either day field matches, as in Vixie
 //! cron.
@@ -199,14 +200,10 @@ fn item_bits(item: &str, spec: &Spec) -> Result<u64, String> {
             return Err(format!("{} range {range} runs backwards", spec.label));
         }
         (a, b)
-    } else if step.is_some() {
-        return Err(format!(
-            "{} step needs `*` or a range, found `{range}`",
-            spec.label
-        ));
     } else {
         let n = value(range, spec)?;
-        (n, n)
+        // `n/s` runs from n to the top of the field.
+        (n, if step.is_some() { spec.hi } else { n })
     };
     let step = match step {
         None => 1,
@@ -220,7 +217,10 @@ fn item_bits(item: &str, spec: &Spec) -> Result<u64, String> {
     let mut n = lo;
     while n <= hi {
         bits |= 1 << n;
-        n += step;
+        match n.checked_add(step) {
+            Some(next) => n = next,
+            None => break,
+        }
     }
     Ok(bits)
 }

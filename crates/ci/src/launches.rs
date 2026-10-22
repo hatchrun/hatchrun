@@ -271,7 +271,7 @@ async fn launch_claimed(
     };
     let spec = LaunchSpec {
         job_id: job.id,
-        name: format!("ci-{}-{}", job.id, job.launch_attempts),
+        name: crate::reconcile::runner_name(job.id, job.attempt, job.launch_attempts),
         user_data: user_data(&settings.broker_url, &ticket),
     };
     let instance_id = backend.launch(db, &spec).await?;
