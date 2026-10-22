@@ -46,15 +46,16 @@ use std::time::Duration;
 use serde::Deserialize;
 use worker::{Env, Result, console_error, console_log, console_warn};
 
-use crate::aws::{self, Credentials, ec2, sts};
+use crate::aws::{self, Credentials, ec2};
 use crate::db::{Db, params};
 use crate::fetch::{Counted, send};
 use crate::http::Request;
 use crate::instance::{Choice, Limits};
 use crate::labels::Arch;
-use crate::offerings::{self, Candidate, Unavailable};
 use crate::profiles::{self, store};
-use crate::reconcile::retry::{Cause, Failure};
+use crate::start::{
+    Cause, Failure, Instance, Target, role_credentials, start_instance, terminate_instance,
+};
 use crate::tokens::{self, App, Kv, Tokens};
 use crate::webhook::QueuedJob;
 use crate::{
@@ -467,354 +468,59 @@ async fn start(
         .zip(cache_token.as_deref())
         .map(|(url, token)| telemetry::Cache { url, token });
     let boot = telemetry::boot_document(config, &settings.telemetry_url, &token, cache);
-    let launch = Launch {
-        job_id: job.id.to_string(),
-        tenant,
-        name,
-        choice,
-        image,
-        credentials,
+    let user_data =
+        serde_json::json!({ "broker": settings.broker_url, "ticket": ticket }).to_string();
+    let job_id = job.id.to_string();
+    let log_id = format!("job {job_id}");
+    let tags = [
+        (ec2::TAG_TENANT, tenant.id.as_str()),
+        (ec2::TAG_JOB_ID, job_id.as_str()),
+        (ec2::TAG_RUNNER_NAME, name),
+        ("Name", name),
+    ];
+    let subnets: Vec<Option<&str>> = tenant.subnets().into_iter().map(Some).collect();
+    let target = Target {
+        region: &tenant.region,
         endpoint: aws::endpoint("ec2", &tenant.region, settings.aws_endpoint.as_deref()),
-        user_data: serde_json::json!({ "broker": settings.broker_url, "ticket": ticket })
-            .to_string(),
-    };
-    let started = if tenant.fleet {
-        fleet(db, &launch).await
-    } else {
-        run_instances(&launch).await
-    };
-    let instance_id = started.map_err(|failure| match &failure.cause {
-        Cause::Aws(code) if code == connect::NOT_SUBSCRIBED => Failure::new(
-            failure.cause.clone(),
-            connect::subscribe_message(choice.arch.as_str(), settings.marketplace_url(choice.arch)),
-        ),
-        _ => failure,
-    })?;
-    if let Err(err) = store_config(settings, &ticket, &boot).await {
-        // Without its config the instance would wait out the agent's
-        // timeout before powering off.
-        terminate(&launch.endpoint, credentials, &tenant.region, &instance_id).await;
-        return Err(err);
-    }
-    Ok(instance_id)
-}
-
-/// What starting one runner's instance takes.
-struct Launch<'a> {
-    job_id: String,
-    tenant: &'a Tenant,
-    name: &'a str,
-    choice: &'a Choice,
-    image: &'a Image,
-    credentials: &'a Credentials,
-    endpoint: String,
-    user_data: String,
-}
-
-impl Launch<'_> {
-    fn tags(&self) -> [(&str, &str); 4] {
-        [
-            (ec2::TAG_TENANT, self.tenant.id.as_str()),
-            (ec2::TAG_JOB_ID, self.job_id.as_str()),
-            (ec2::TAG_RUNNER_NAME, self.name),
-            ("Name", self.name),
-        ]
-    }
-
-    /// The tenant's subnets in order, or the template's network.
-    fn subnets(&self) -> Vec<Option<&str>> {
-        let subnets: Vec<Option<&str>> = self.tenant.subnets().into_iter().map(Some).collect();
-        if subnets.is_empty() {
+        credentials,
+        launch_template_id: &tenant.launch_template_id,
+        subnets: if subnets.is_empty() {
             vec![None]
         } else {
             subnets
-        }
-    }
-
-    /// The markets to try in order, `true` for Spot.
-    fn markets(&self) -> &'static [bool] {
-        self.choice.capacity.markets()
-    }
-
-    fn root_volume(&self) -> Option<(&str, u16)> {
-        self.choice
-            .root_volume
-            .map(|size| (self.image.root_device.as_str(), size))
-    }
-
-    /// Signs and sends an EC2 request.
-    async fn send(
-        &self,
-        mut request: Request,
-    ) -> std::result::Result<crate::http::Response, Failure> {
-        aws::sign_v4(
-            &mut request,
-            self.credentials,
-            &self.tenant.region,
-            "ec2",
-            now_ms(),
-        )
-        .map_err(|err| Failure::new(Cause::Internal, err))?;
-        send(&request)
-            .await
-            .map_err(|err| Failure::new(Cause::Unreachable, err))
-    }
-}
-
-/// Starts the instance with `RunInstances`, for a stack that does not
-/// allow EC2 Fleet: each instance type in each subnet in turn, Spot
-/// before on-demand for a Spot profile, while EC2 has no capacity.
-async fn run_instances(launch: &Launch<'_>) -> std::result::Result<String, Failure> {
-    let subnets = launch.subnets();
-    let tags = launch.tags();
-    let subnets = &subnets;
-    let attempts = launch.markets().iter().flat_map(|spot| {
-        launch
-            .choice
-            .instance_types
-            .iter()
-            .flat_map(move |instance_type| {
-                subnets
-                    .iter()
-                    .map(move |subnet| (*spot, instance_type.as_str(), *subnet))
-            })
-    });
-    let mut last_error = None;
-    for (index, (spot, instance_type, subnet)) in attempts.enumerate() {
-        let client_token = format!("{}-{index}", launch.name);
-        let request = ec2::RunInstances {
-            launch_template_id: &launch.tenant.launch_template_id,
-            image_id: &launch.image.image_id,
-            instance_type,
-            subnet_id: subnet,
-            user_data: &launch.user_data,
-            client_token: &client_token,
-            tags: &tags,
-            spot,
-            root_volume: launch.root_volume(),
-        }
-        .request(&launch.endpoint);
-        match ec2::instance_id(&launch.send(request).await?) {
-            Ok(id) => return Ok(id),
-            Err(err) if ec2::CAPACITY_ERRORS.contains(&err.code.as_str()) => {
-                console_warn!(
-                    "job {}: {instance_type}{} in {}: {err}",
-                    launch.job_id,
-                    if spot { " Spot" } else { "" },
-                    subnet.unwrap_or("template network")
-                );
-                last_error = Some(err);
-            }
-            Err(err) => {
-                return Err(Failure::new(
-                    Cause::Aws(err.code.clone()),
-                    format!("RunInstances {instance_type}: {err}"),
-                ));
-            }
-        }
-    }
-    Err(match last_error {
-        Some(err) => Failure::new(
-            Cause::NoCapacity,
-            format!(
-                "no capacity for {} in any subnet: {err}",
-                launch.choice.instance_types.join(", ")
-            ),
-        ),
-        None => Failure::new(Cause::Internal, "no subnet to launch in"),
-    })
-}
-
-/// The offerings a fleet refused for capacity, to skip for a while, or
-/// the failure when it refused one for anything else. `last` keeps the
-/// latest reason for the job's error.
-fn refusals(
-    launch: &Launch<'_>,
-    spot: bool,
-    refused: Vec<aws::fleet::Refused>,
-    last: &mut Option<String>,
-) -> std::result::Result<Vec<(Unavailable, String)>, Failure> {
-    let until = now_ms() + offerings::UNAVAILABLE_FOR;
-    let mut skipped = Vec::new();
-    for no in refused {
-        if !offerings::is_capacity(&no.code) {
-            return Err(Failure::new(
-                Cause::Aws(no.code.clone()),
-                format!(
-                    "CreateFleet {}: {}: {}",
-                    no.instance_type, no.code, no.message
-                ),
-            ));
-        }
-        console_warn!(
-            "job {}: {}{} in {}: {}: {}",
-            launch.job_id,
-            no.instance_type,
-            if spot { " Spot" } else { "" },
-            no.subnet_id.as_deref().unwrap_or("template network"),
-            no.code,
-            no.message
-        );
-        *last = Some(format!("{}: {}", no.code, no.message));
-        skipped.push((
-            Unavailable {
-                instance_type: no.instance_type,
-                subnet_id: no.subnet_id,
-                spot,
-                until,
-            },
-            no.code,
-        ));
-    }
-    if skipped.is_empty() {
-        return Err(Failure::new(
-            Cause::NoCapacity,
-            "CreateFleet started no instance and gave no reason",
-        ));
-    }
-    Ok(skipped)
-}
-
-/// Fleets one launch may create: a generation or two on Spot, then on
-/// on-demand.
-const FLEETS_PER_LAUNCH: u32 = 4;
-
-/// Starts the instance with EC2 Fleet from a launch template version
-/// made for it, which is deleted after (see [`crate::aws::fleet`] and
-/// [`crate::offerings`]).
-async fn fleet(db: &Db, launch: &Launch<'_>) -> std::result::Result<String, Failure> {
-    let client_token = format!("{}-v", launch.name);
-    let created = launch
-        .send(
-            aws::fleet::TemplateVersion {
-                launch_template_id: &launch.tenant.launch_template_id,
-                runner_name: launch.name,
-                image_id: &launch.image.image_id,
-                user_data: &launch.user_data,
-                root_volume: launch.root_volume(),
-                tags: &launch.tags(),
-                client_token: &client_token,
-            }
-            .request(&launch.endpoint),
-        )
-        .await?;
-    let version = aws::fleet::version_number(&created).map_err(|err| {
-        Failure::new(
-            Cause::Aws(err.code.clone()),
-            format!("CreateLaunchTemplateVersion: {err}"),
-        )
-    })?;
-    let result = fleets(db, launch, version).await;
-    let deleted = launch
-        .send(aws::fleet::delete_version(
-            &launch.endpoint,
-            &launch.tenant.launch_template_id,
-            version,
-        ))
-        .await;
-    match deleted {
-        Ok(response) if response.ok() => {}
-        Ok(response) => console_warn!(
-            "delete launch template version {version}: EC2 answered {}: {}",
-            response.status,
-            response.text()
-        ),
-        Err(err) => console_warn!("delete launch template version {version}: {err}"),
-    }
-    result
-}
-
-/// Creates fleets from template `version` until one starts the
-/// instance, remembering the offerings EC2 refuses for capacity.
-async fn fleets(
-    db: &Db,
-    launch: &Launch<'_>,
-    version: u64,
-) -> std::result::Result<String, Failure> {
-    let tenant = &launch.tenant.id;
-    let mut unavailable = offerings::store::current(db, tenant, now_ms())
-        .await
-        .map_err(internal)?;
-    let candidates: Vec<Candidate> = launch
-        .choice
-        .instance_types
-        .iter()
-        .map(|name| Candidate {
-            generation: instance_types::split(name)
-                .and_then(|parts| parts.generation)
-                .unwrap_or(0),
-            instance_type: name.clone(),
-        })
-        .collect();
-    let subnets = launch.subnets();
-    let mut created = 0;
-    let mut last = None;
-    for &spot in launch.markets() {
-        while created < FLEETS_PER_LAUNCH {
-            let chosen = offerings::overrides(&candidates, &subnets, spot, &unavailable, now_ms());
-            if chosen.is_empty() {
-                break;
-            }
-            created += 1;
-            let client_token = format!("{}-f{created}", launch.name);
-            let request = aws::fleet::Fleet {
-                launch_template_id: &launch.tenant.launch_template_id,
-                version,
-                overrides: &chosen,
-                spot,
-                client_token: &client_token,
-            }
-            .request(&launch.endpoint);
-            let done = aws::fleet::launched(&launch.send(request).await?).map_err(|err| {
-                Failure::new(Cause::Aws(err.code.clone()), format!("CreateFleet: {err}"))
-            })?;
-            if let Some((id, instance_type, subnet)) = done.instance {
-                console_log!(
-                    "job {}: {instance_type}{} in {}",
-                    launch.job_id,
-                    if spot { " Spot" } else { "" },
-                    subnet.as_deref().unwrap_or("template network")
-                );
-                return Ok(id);
-            }
-            let refused = refusals(launch, spot, done.refused, &mut last)?;
-            offerings::store::remember(db, tenant, &refused)
-                .await
-                .map_err(internal)?;
-            unavailable.extend(refused.into_iter().map(|(gone, _)| gone));
-        }
-    }
-    let back = offerings::back_at(
-        &candidates,
-        &subnets,
-        launch.markets(),
-        &unavailable,
-        now_ms(),
-    );
-    Err(Failure::new(
-        Cause::NoCapacity,
-        format!(
-            "no capacity for {} in any subnet{}",
-            launch.choice.instance_types.join(", "),
-            last.map(|last| format!(": {last}")).unwrap_or_default()
-        ),
-    )
-    .not_before(back))
-}
-
-/// Terminates an instance that will not run, logging a failure.
-async fn terminate(endpoint: &str, credentials: &Credentials, region: &str, instance_id: &str) {
-    let mut request = ec2::terminate_instances(endpoint, instance_id);
-    let terminated = match aws::sign_v4(&mut request, credentials, region, "ec2", now_ms()) {
-        Ok(()) => match send(&request).await {
-            Ok(response) => ec2::terminated(&response).map_err(|err| err.to_string()),
-            Err(err) => Err(err),
         },
-        Err(err) => Err(err),
+        fleet: tenant.fleet,
+        offerings_scope: &tenant.id,
     };
-    if let Err(err) = terminated {
-        console_warn!("terminate {instance_id}: {err}");
+    let instance = Instance {
+        name,
+        choice,
+        image_id: &image.image_id,
+        root_device: &image.root_device,
+        user_data: &user_data,
+        tags: &tags,
+        log_id: &log_id,
+    };
+    let instance_id =
+        start_instance(db, &target, &instance)
+            .await
+            .map_err(|failure| match &failure.cause {
+                Cause::Aws(code) if code == connect::NOT_SUBSCRIBED => Failure::new(
+                    failure.cause.clone(),
+                    connect::subscribe_message(
+                        choice.arch.as_str(),
+                        settings.marketplace_url(choice.arch),
+                    ),
+                ),
+                _ => failure,
+            })?;
+    if let Err(err) = store_config(settings, &ticket, &boot).await {
+        // Without its config the instance would wait out the agent's
+        // timeout before powering off.
+        terminate_instance(&target, &instance_id).await;
+        return Err(err);
     }
+    Ok(instance_id)
 }
 
 async fn assume_role(
@@ -822,7 +528,7 @@ async fn assume_role(
     job: &QueuedJob,
     tenant: &Tenant,
 ) -> std::result::Result<Credentials, Failure> {
-    tenant_credentials(
+    role_credentials(
         &settings.oidc_key,
         &settings.oidc_kid,
         settings.aws_endpoint.as_deref(),
@@ -838,44 +544,6 @@ async fn assume_role(
             format!("AssumeRoleWithWebIdentity {}: {err}", tenant.role_arn),
         )
     })
-}
-
-/// Credentials of `role_arn` in `region`, for a token that names
-/// `tenant`. `session` shows in the customer's `CloudTrail`.
-///
-/// # Errors
-///
-/// STS's error, or a signing failure as an [`aws::Error`] with code
-/// `SigningFailed`.
-pub(crate) async fn tenant_credentials(
-    oidc_key: &[u8],
-    oidc_kid: &str,
-    aws_endpoint: Option<&str>,
-    tenant: &str,
-    role_arn: &str,
-    region: &str,
-    session: &str,
-) -> std::result::Result<Credentials, aws::Error> {
-    let input = oidc::signing_input(oidc_kid, tenant, now_ms() / 1000);
-    let signature = webcrypto::sign_rs256(oidc_key, input.as_bytes())
-        .await
-        .map_err(|err| aws::Error {
-            status: 0,
-            code: "SigningFailed".to_owned(),
-            message: format!("sign tenant token: {err}"),
-        })?;
-    let request = sts::assume_role_with_web_identity(
-        &aws::endpoint("sts", region, aws_endpoint),
-        role_arn,
-        session,
-        &jwt::token(&input, &signature),
-    );
-    let response = send(&request).await.map_err(|err| aws::Error {
-        status: 0,
-        code: "Unreachable".to_owned(),
-        message: err,
-    })?;
-    sts::credentials(&response)
 }
 
 /// A launch failure for a token GitHub would not mint.
@@ -942,15 +610,6 @@ async fn cache_token(
     let signature = webcrypto::sign_ed25519(&settings.telemetry_key, input.as_bytes())
         .await
         .map_err(|err| Failure::new(Cause::Settings, format!("sign cache token: {err}")))?;
-    Ok(jwt::token(&input, &signature))
-}
-
-/// The App's JWT, signed with its private key in PKCS#8 DER.
-pub(crate) async fn app_jwt(app_id: &str, pkcs8: &[u8]) -> std::result::Result<String, String> {
-    let input = github::app_jwt_signing_input(app_id, now_ms() / 1000);
-    let signature = webcrypto::sign_rs256(pkcs8, input.as_bytes())
-        .await
-        .map_err(|err| format!("sign App JWT: {err}"))?;
     Ok(jwt::token(&input, &signature))
 }
 

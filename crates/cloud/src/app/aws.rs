@@ -18,7 +18,8 @@ use super::{Answer, Ctx, Failure, get, need};
 use crate::aws::{self, Credentials, ec2, ssm};
 use crate::db::params;
 use crate::fetch::send;
-use crate::launch::{AWS_ENDPOINT_URL, tenant_credentials};
+use crate::launch::AWS_ENDPOINT_URL;
+use crate::start::role_credentials;
 use crate::{connect, jwt, now_ms, oidc, settings};
 
 /// Variable with the public URL of the rendered connect.yaml.
@@ -116,7 +117,7 @@ pub(crate) async fn verify(ctx: &Ctx<'_>, org: &str, body: Connect) -> Answer {
     let oidc_kid = need(ctx.env, oidc::KEY_ID)?;
     let endpoint_override = get(ctx.env, AWS_ENDPOINT_URL);
 
-    let credentials = tenant_credentials(
+    let credentials = role_credentials(
         &oidc_key,
         &oidc_kid,
         endpoint_override.as_deref(),

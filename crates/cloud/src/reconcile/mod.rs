@@ -60,6 +60,7 @@ use crate::fetch::{Counted, send, send_reading};
 use crate::instance_types::{self, store as catalog};
 use crate::jobs::{self, LaunchChange};
 use crate::launch::{self, APP_KEY, AWS_ENDPOINT_URL};
+use crate::start;
 use crate::tokens::{App, Kv, Tokens};
 use crate::webhook::{Outcome, QueuedJob, Status};
 use crate::{github, jwt, labels, now_ms, oidc, polar, runs, usage};
@@ -473,7 +474,7 @@ impl Pass<'_> {
 
     async fn app_jwt(&self) -> Fallible<String> {
         let app_id = get(self.env, APP_ID).ok_or_else(|| format!("{APP_ID} is not set"))?;
-        launch::app_jwt(&app_id, &self.secret_der(APP_KEY)?).await
+        start::app_jwt(&app_id, &self.secret_der(APP_KEY)?).await
     }
 
     /// Installation tokens for one step, kept in KV across passes (see
@@ -1084,7 +1085,7 @@ impl Pass<'_> {
         if !self.spend(2) {
             return Err("out of requests for this pass".to_owned());
         }
-        let credentials = launch::tenant_credentials(
+        let credentials = start::role_credentials(
             oidc_key,
             oidc_kid,
             self.aws_endpoint.as_deref(),
@@ -1381,7 +1382,7 @@ impl Pass<'_> {
         let key = self.secret_der(oidc::SIGNING_KEY)?;
         let kid =
             get(self.env, oidc::KEY_ID).ok_or_else(|| format!("{} is not set", oidc::KEY_ID))?;
-        let credentials = launch::tenant_credentials(
+        let credentials = start::role_credentials(
             &key,
             &kid,
             self.aws_endpoint.as_deref(),

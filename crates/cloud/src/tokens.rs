@@ -22,8 +22,9 @@ use worker::{Env, KvStore, console_warn};
 
 use crate::fetch::Sender;
 use crate::http::{Request, Response};
-use crate::launch::{APP_ID, APP_KEY, GITHUB_API_URL, app_jwt};
+use crate::launch::{APP_ID, APP_KEY, GITHUB_API_URL};
 use crate::reconcile::time;
+use crate::start::app_jwt;
 use crate::{github, jwt};
 
 /// The KV namespace that holds the tokens.

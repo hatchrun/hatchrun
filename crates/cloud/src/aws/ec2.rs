@@ -167,6 +167,62 @@ pub fn terminated(response: &Response) -> Result<(), Error> {
     }
 }
 
+/// The unsigned request that turns an instance's metadata endpoint off.
+#[must_use]
+pub fn metadata_off(endpoint: &str, instance_id: &str) -> Request {
+    query(
+        endpoint,
+        "ModifyInstanceMetadataOptions",
+        VERSION,
+        &[
+            ("InstanceId".to_owned(), instance_id.to_owned()),
+            ("HttpEndpoint".to_owned(), "disabled".to_owned()),
+        ],
+    )
+}
+
+/// The unsigned request that describes one instance.
+#[must_use]
+pub fn describe_metadata(endpoint: &str, instance_id: &str) -> Request {
+    query(
+        endpoint,
+        "DescribeInstances",
+        VERSION,
+        &[("InstanceId.1".to_owned(), instance_id.to_owned())],
+    )
+}
+
+/// An instance's metadata options as EC2 reports them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataState {
+    /// `pending` while a change is being applied, then `applied`.
+    pub state: String,
+    /// `enabled` or `disabled`.
+    pub http_endpoint: String,
+}
+
+/// Reads the metadata options of the instance out of a
+/// `DescribeInstances` answer; `None` when it lists no instance.
+///
+/// # Errors
+///
+/// EC2's error, or a malformed answer.
+pub fn metadata_state(response: &Response) -> Result<Option<MetadataState>, Error> {
+    let doc = document(response)?;
+    let Some(options) = doc
+        .descendants()
+        .find(|node| node.tag_name().name() == "metadataOptions")
+    else {
+        return Ok(None);
+    };
+    Ok(Some(MetadataState {
+        state: child_text(options, "state").unwrap_or_default().to_owned(),
+        http_endpoint: child_text(options, "httpEndpoint")
+            .unwrap_or_default()
+            .to_owned(),
+    }))
+}
+
 /// The subnets named `ids`.
 #[must_use]
 pub fn describe_subnets(endpoint: &str, ids: &[String]) -> Request {
@@ -442,5 +498,55 @@ mod tests {
             subnets(&missing).unwrap_err().code,
             "InvalidSubnetID.NotFound"
         );
+    }
+
+    #[test]
+    fn metadata_off_disables_the_endpoint() {
+        let req = metadata_off("https://ec2.us-east-1.amazonaws.com", "i-1");
+        let body = String::from_utf8(req.body).unwrap();
+        assert!(body.contains("Action=ModifyInstanceMetadataOptions"));
+        assert!(body.contains("Version=2016-11-15"));
+        assert!(body.contains("InstanceId=i-1"));
+        assert!(body.contains("HttpEndpoint=disabled"));
+    }
+
+    #[test]
+    fn reads_metadata_state() {
+        let request = describe_metadata("https://ec2.us-east-1.amazonaws.com", "i-1");
+        let body = String::from_utf8(request.body).unwrap();
+        assert!(body.contains("Action=DescribeInstances"));
+        assert!(body.ends_with("&InstanceId.1=i-1"));
+        let listed = Response {
+            headers: Vec::new(),
+            status: 200,
+            body: b"<DescribeInstancesResponse><reservationSet><item><instancesSet><item>\
+                    <instanceId>i-1</instanceId><metadataOptions><state>applied</state>\
+                    <httpTokens>required</httpTokens><httpEndpoint>disabled</httpEndpoint>\
+                    </metadataOptions></item></instancesSet></item></reservationSet>\
+                    </DescribeInstancesResponse>"
+                .to_vec(),
+        };
+        assert_eq!(
+            metadata_state(&listed).unwrap(),
+            Some(MetadataState {
+                state: "applied".to_owned(),
+                http_endpoint: "disabled".to_owned(),
+            })
+        );
+        let empty = Response {
+            headers: Vec::new(),
+            status: 200,
+            body: b"<DescribeInstancesResponse><reservationSet/></DescribeInstancesResponse>"
+                .to_vec(),
+        };
+        assert_eq!(metadata_state(&empty).unwrap(), None);
+        let denied = Response {
+            headers: Vec::new(),
+            status: 403,
+            body: b"<Response><Errors><Error><Code>UnauthorizedOperation</Code>\
+                    <Message>no</Message></Error></Errors></Response>"
+                .to_vec(),
+        };
+        assert!(metadata_state(&denied).is_err());
     }
 }

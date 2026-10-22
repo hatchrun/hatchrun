@@ -67,6 +67,7 @@ pub mod session;
 pub mod settings;
 pub mod signin;
 mod stack;
+pub mod start;
 pub mod telemetry;
 pub mod tenant;
 #[cfg(all(not(target_arch = "wasm32"), any(test, feature = "testdb")))]
