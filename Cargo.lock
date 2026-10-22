@@ -1548,6 +1548,7 @@ dependencies = [
 name = "hatchrun-ci"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "async-lock",
  "base64 0.23.1",
  "flate2",

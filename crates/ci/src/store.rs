@@ -1383,6 +1383,338 @@ pub async fn sweep(db: &Db, now: u64) -> Result<Vec<u64>> {
     Ok(runs.into_iter().map(|row| row.id).collect())
 }
 
+// Secrets and vars. A secret's value is sealed (see `crate::secrets`);
+// a var's is plain text. `repo_id` None is the organization's row.
+
+/// Whether a secret or var was stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Put {
+    /// Stored, or replaced.
+    Saved,
+    /// A new name over the scope's limit.
+    TooMany,
+}
+
+/// Stores secret `$3` of tenant `$1` and scope `$2` ($6 is the limit,
+/// $7 the time). A new name is refused at the limit; replacing one
+/// never is. Returns a row when it stored.
+const PUT_SECRET: &str = "INSERT INTO ci_secrets (tenant_id, repo_id, name, key_id, sealed, updated_at) \
+     SELECT $1, $2::bigint, $3, $4, $5, $7 \
+     WHERE EXISTS (SELECT 1 FROM ci_secrets WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3) \
+       OR (SELECT count(*) FROM ci_secrets WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint) < $6 \
+     ON CONFLICT (tenant_id, repo_id, name) DO UPDATE SET key_id = EXCLUDED.key_id, \
+       sealed = EXCLUDED.sealed, updated_at = EXCLUDED.updated_at \
+     RETURNING 1 AS saved";
+
+/// As [`PUT_SECRET`], for a var with value `$4`; `$5` is the limit and
+/// `$6` the time.
+const PUT_VAR: &str = "INSERT INTO ci_vars (tenant_id, repo_id, name, value, updated_at) \
+     SELECT $1, $2::bigint, $3, $4, $6 \
+     WHERE EXISTS (SELECT 1 FROM ci_vars WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3) \
+       OR (SELECT count(*) FROM ci_vars WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint) < $5 \
+     ON CONFLICT (tenant_id, repo_id, name) DO UPDATE SET value = EXCLUDED.value, \
+       updated_at = EXCLUDED.updated_at \
+     RETURNING 1 AS saved";
+
+/// What [`PUT_SECRET`] and [`PUT_VAR`] return.
+#[derive(Deserialize)]
+struct Saved {}
+
+/// Runs a put statement with the tenant row locked, so two puts cannot
+/// both take the last place.
+async fn put(db: &Db, tenant: &str, sql: &str, bound: &[Param]) -> Result<Put> {
+    let lock = params![tenant];
+    let saved: Option<Saved> = db.first_locked((LOCK_TENANT, &lock), sql, bound).await?;
+    Ok(if saved.is_some() {
+        Put::Saved
+    } else {
+        Put::TooMany
+    })
+}
+
+/// Stores the sealed value of secret `name`, replacing the old one.
+/// A new name is refused with [`Put::TooMany`] when the scope already
+/// holds `limit` secrets.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+#[allow(clippy::too_many_arguments)] // one column each
+pub async fn put_secret(
+    db: &Db,
+    tenant: &str,
+    repo_id: Option<u64>,
+    name: &str,
+    key_id: &str,
+    sealed: &str,
+    limit: u32,
+    now: u64,
+) -> Result<Put> {
+    put(
+        db,
+        tenant,
+        PUT_SECRET,
+        &params![tenant, repo_id, name, key_id, sealed, limit, now],
+    )
+    .await
+}
+
+/// Deletes secret `name`. Returns whether it existed.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn delete_secret(
+    db: &Db,
+    tenant: &str,
+    repo_id: Option<u64>,
+    name: &str,
+) -> Result<bool> {
+    db.run(
+        "DELETE FROM ci_secrets WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3",
+        &params![tenant, repo_id, name],
+    )
+    .await
+    .map(|n| n > 0)
+}
+
+/// A secret's name and when it was last set. Never the value.
+#[derive(Deserialize)]
+struct NameRow {
+    name: String,
+    updated_at: u64,
+}
+
+/// The names of a scope's secrets, with the time each was set.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn secret_names(
+    db: &Db,
+    tenant: &str,
+    repo_id: Option<u64>,
+) -> Result<Vec<(String, u64)>> {
+    let rows: Vec<NameRow> = db
+        .all(
+            "SELECT name, updated_at FROM ci_secrets WHERE tenant_id = $1 \
+             AND repo_id IS NOT DISTINCT FROM $2::bigint ORDER BY name",
+            &params![tenant, repo_id],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| (r.name, r.updated_at)).collect())
+}
+
+/// A sealed secret as stored.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct SealedRow {
+    /// The repository, or `None` for the organization.
+    pub repo_id: Option<u64>,
+    /// The name.
+    pub name: String,
+    /// The key that sealed it.
+    pub key_id: String,
+    /// Base64 of nonce and ciphertext.
+    pub sealed: String,
+}
+
+impl std::fmt::Debug for SealedRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedRow")
+            .field("repo_id", &self.repo_id)
+            .field("name", &self.name)
+            .field("key_id", &self.key_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The organization's sealed secrets and repository `repo_id`'s, named
+/// in `names` or all of them when `None`. Both rows are returned when a
+/// name is in both scopes, the organization's first, so a caller that
+/// inserts them in order lets the repository's win.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn sealed_secrets(
+    db: &Db,
+    tenant: &str,
+    repo_id: u64,
+    names: Option<&[String]>,
+) -> Result<Vec<SealedRow>> {
+    let mut sql = "SELECT repo_id, name, key_id, sealed FROM ci_secrets \
+                   WHERE tenant_id = $1 AND (repo_id IS NULL OR repo_id = $2)"
+        .to_owned();
+    let mut bound = params![tenant, repo_id];
+    if let Some(names) = names {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks: Vec<String> = (3..3 + names.len()).map(|n| format!("${n}")).collect();
+        sql = format!("{sql} AND name IN ({})", marks.join(", "));
+        bound.extend(names.iter().map(|name| Param::from(name.as_str())));
+    }
+    sql.push_str(" ORDER BY name, repo_id NULLS FIRST");
+    db.all(&sql, &bound).await
+}
+
+/// Stores var `name`, replacing the old value. A new name is refused
+/// with [`Put::TooMany`] when the scope already holds `limit` vars.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn put_var(
+    db: &Db,
+    tenant: &str,
+    repo_id: Option<u64>,
+    name: &str,
+    value: &str,
+    limit: u32,
+    now: u64,
+) -> Result<Put> {
+    put(
+        db,
+        tenant,
+        PUT_VAR,
+        &params![tenant, repo_id, name, value, limit, now],
+    )
+    .await
+}
+
+/// Deletes var `name`. Returns whether it existed.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn delete_var(db: &Db, tenant: &str, repo_id: Option<u64>, name: &str) -> Result<bool> {
+    db.run(
+        "DELETE FROM ci_vars WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3",
+        &params![tenant, repo_id, name],
+    )
+    .await
+    .map(|n| n > 0)
+}
+
+#[derive(Deserialize)]
+struct VarRow {
+    name: String,
+    value: String,
+    updated_at: u64,
+}
+
+/// The vars of a scope: name, value and when each was set, by name.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn vars(
+    db: &Db,
+    tenant: &str,
+    repo_id: Option<u64>,
+) -> Result<Vec<(String, String, u64)>> {
+    let rows: Vec<VarRow> = db
+        .all(
+            "SELECT name, value, updated_at FROM ci_vars WHERE tenant_id = $1 \
+             AND repo_id IS NOT DISTINCT FROM $2::bigint ORDER BY name",
+            &params![tenant, repo_id],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.name, r.value, r.updated_at))
+        .collect())
+}
+
+/// The organization's vars overlaid with repository `repo_id`'s.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn job_vars(db: &Db, tenant: &str, repo_id: u64) -> Result<BTreeMap<String, String>> {
+    let rows: Vec<VarRow> = db
+        .all(
+            "SELECT name, value, updated_at FROM ci_vars WHERE tenant_id = $1 \
+             AND (repo_id IS NULL OR repo_id = $2) ORDER BY repo_id NULLS FIRST",
+            &params![tenant, repo_id],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| (r.name, r.value)).collect())
+}
+
+/// A secret sealed with a key other than the current one.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct StaleRow {
+    /// The tenant.
+    pub tenant: String,
+    /// The repository, or `None` for the organization.
+    pub repo_id: Option<u64>,
+    /// The name.
+    pub name: String,
+    /// The key that sealed it.
+    pub key_id: String,
+    /// Base64 of nonce and ciphertext.
+    pub sealed: String,
+}
+
+impl std::fmt::Debug for StaleRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaleRow")
+            .field("tenant", &self.tenant)
+            .field("repo_id", &self.repo_id)
+            .field("name", &self.name)
+            .field("key_id", &self.key_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Up to `limit` secrets not sealed with `current_key_id`. The pick is
+/// random, so rows that cannot be opened do not starve the others.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn stale_secrets(db: &Db, current_key_id: &str, limit: u32) -> Result<Vec<StaleRow>> {
+    db.all(
+        "SELECT tenant_id AS tenant, repo_id, name, key_id, sealed FROM ci_secrets \
+         WHERE key_id <> $1 ORDER BY random() LIMIT $2",
+        &params![current_key_id, limit],
+    )
+    .await
+}
+
+/// Replaces the value of `row` with `sealed` under `key_id`, only while
+/// the row still holds the key id and sealed text of `row`. Returns
+/// whether it did: `false` means the secret changed meanwhile.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn reseal(db: &Db, row: &StaleRow, key_id: &str, sealed: &str) -> Result<bool> {
+    db.run(
+        "UPDATE ci_secrets SET key_id = $5, sealed = $6 WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3 AND key_id = $4 \
+         AND sealed = $7",
+        &params![
+            row.tenant.as_str(),
+            row.repo_id,
+            row.name.as_str(),
+            row.key_id.as_str(),
+            key_id,
+            sealed,
+            row.sealed.as_str()
+        ],
+    )
+    .await
+    .map(|n| n > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use hatchrun_cloud::testdb::Db as TestDb;
@@ -2941,5 +3273,151 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sent[0]["sent_at"].as_u64(), Some(99));
+    }
+
+    fn put_var_ok(db: &TestDb, repo: Option<u64>, name: &str, value: &str) {
+        let put = db
+            .wait(put_var(db.db(), "t1", repo, name, value, 100, 5))
+            .unwrap();
+        assert_eq!(put, Put::Saved);
+    }
+
+    fn put_secret_ok(db: &TestDb, repo: Option<u64>, name: &str, key: &str, sealed: &str) {
+        let put = db
+            .wait(put_secret(db.db(), "t1", repo, name, key, sealed, 100, 5))
+            .unwrap();
+        assert_eq!(put, Put::Saved);
+    }
+
+    #[test]
+    fn repo_value_overrides_org() {
+        let db = setup();
+        put_var_ok(&db, None, "A", "1");
+        put_var_ok(&db, None, "B", "2");
+        put_var_ok(&db, Some(7), "A", "3");
+        let vars = db.wait(job_vars(db.db(), "t1", 7)).unwrap();
+        assert_eq!(
+            vars,
+            BTreeMap::from([("A".into(), "3".into()), ("B".into(), "2".into())])
+        );
+        let org = db.wait(vars_of(db.db(), None)).unwrap();
+        assert_eq!(org.len(), 2);
+        assert!(db.wait(delete_var(db.db(), "t1", Some(7), "A")).unwrap());
+        assert!(!db.wait(delete_var(db.db(), "t1", Some(7), "A")).unwrap());
+        let vars = db.wait(job_vars(db.db(), "t1", 7)).unwrap();
+        assert_eq!(vars["A"], "1");
+    }
+
+    async fn vars_of(db: &Db, repo: Option<u64>) -> Result<Vec<(String, String, u64)>> {
+        vars(db, "t1", repo).await
+    }
+
+    #[test]
+    fn put_counts_against_the_limit() {
+        let db = setup();
+        let put = |name: &str, limit| {
+            db.wait(put_secret(db.db(), "t1", None, name, "k", "s", limit, 5))
+                .unwrap()
+        };
+        assert_eq!(put("A", 2), Put::Saved);
+        assert_eq!(put("B", 2), Put::Saved);
+        assert_eq!(put("C", 2), Put::TooMany);
+        // Overwriting a name at the limit is allowed.
+        assert_eq!(put("A", 2), Put::Saved);
+        let names = db.wait(secret_names(db.db(), "t1", None)).unwrap();
+        assert_eq!(names.len(), 2);
+        // The limit is per scope.
+        let repo = db
+            .wait(put_secret(db.db(), "t1", Some(7), "C", "k", "s", 2, 5))
+            .unwrap();
+        assert_eq!(repo, Put::Saved);
+        // And the same for vars.
+        let var = |name: &str| {
+            db.wait(put_var(db.db(), "t1", None, name, "v", 1, 5))
+                .unwrap()
+        };
+        assert_eq!(var("A"), Put::Saved);
+        assert_eq!(var("B"), Put::TooMany);
+        assert_eq!(var("A"), Put::Saved);
+    }
+
+    #[test]
+    fn sealed_secrets_filters_by_name() {
+        let db = setup();
+        put_secret_ok(&db, None, "A", "k", "org-a");
+        put_secret_ok(&db, Some(7), "A", "k", "repo-a");
+        put_secret_ok(&db, Some(7), "B", "k", "repo-b");
+        put_secret_ok(&db, None, "C", "k", "org-c");
+        let all = db.wait(sealed_secrets(db.db(), "t1", 7, None)).unwrap();
+        assert_eq!(all.len(), 4);
+        let names = ["A".to_owned(), "C".to_owned()];
+        let some = db
+            .wait(sealed_secrets(db.db(), "t1", 7, Some(&names)))
+            .unwrap();
+        let got: Vec<_> = some
+            .iter()
+            .map(|r| (r.name.as_str(), r.repo_id, r.sealed.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("A", None, "org-a"),
+                ("A", Some(7), "repo-a"),
+                ("C", None, "org-c")
+            ]
+        );
+        let none = db
+            .wait(sealed_secrets(db.db(), "t1", 7, Some(&[])))
+            .unwrap();
+        assert_eq!(none.len(), 0);
+        // Another repository sees only the organization's rows.
+        let other = db.wait(sealed_secrets(db.db(), "t1", 8, None)).unwrap();
+        assert_eq!(other.len(), 2);
+        assert!(!format!("{:?}", all[0]).contains("org-a"));
+    }
+
+    #[test]
+    fn reseal_skips_a_row_that_changed() {
+        let db = setup();
+        put_secret_ok(&db, Some(7), "A", "old", "s1");
+        put_secret_ok(&db, None, "B", "new", "s2");
+        let stale = db.wait(stale_secrets(db.db(), "new", 10)).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].name, "A");
+        assert!(!format!("{:?}", stale[0]).contains("s1"));
+        // The secret is set again between the read and the re-seal.
+        put_secret_ok(&db, Some(7), "A", "old", "s1-changed");
+        assert!(
+            !db.wait(reseal(db.db(), &stale[0], "new", "s1-resealed"))
+                .unwrap()
+        );
+        let now = db.wait(stale_secrets(db.db(), "new", 10)).unwrap();
+        assert_eq!(now[0].sealed, "s1-changed");
+        assert!(
+            db.wait(reseal(db.db(), &now[0], "new", "s1-resealed"))
+                .unwrap()
+        );
+        assert_eq!(db.wait(stale_secrets(db.db(), "new", 10)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn stale_secrets_is_bounded() {
+        let db = setup();
+        for name in ["A", "B", "C"] {
+            put_secret_ok(&db, None, name, "old", "s");
+        }
+        assert_eq!(db.wait(stale_secrets(db.db(), "new", 2)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_repo_or_tenant_removes_its_secrets() {
+        let db = setup();
+        put_secret_ok(&db, Some(7), "A", "k", "s");
+        assert!(db.wait(delete_secret(db.db(), "t1", Some(7), "A")).unwrap());
+        assert!(!db.wait(delete_secret(db.db(), "t1", Some(7), "A")).unwrap());
+        put_secret_ok(&db, Some(7), "A", "k", "s");
+        db.run("DELETE FROM tenants WHERE id = 't1'", &[]);
+        let left = db.rows("SELECT 1 FROM ci_secrets", &[]).unwrap();
+        assert_eq!(left.len(), 0);
     }
 }

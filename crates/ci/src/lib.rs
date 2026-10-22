@@ -37,6 +37,7 @@ pub mod planning;
 pub mod reconcile;
 pub mod run;
 pub mod runs;
+pub mod secrets;
 pub mod settings_api;
 pub mod store;
 pub mod token;
