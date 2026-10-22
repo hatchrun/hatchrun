@@ -168,6 +168,9 @@ where
 
         let result = loop {
             tokio::select! {
+                // Shutdown first: a poll that fails at once would otherwise
+                // win the draw again and again and end the loop in an error.
+                biased;
                 () = &mut shutdown => break Ok(()),
                 _ = tick.tick() => {
                     if let Err(err) = self.reconcile().await {
