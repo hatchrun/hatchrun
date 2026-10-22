@@ -1149,6 +1149,15 @@ enum Split {
     Bad(usize),
 }
 
+/// Rows Polar refused one by one in a pass are quarantined only when it
+/// took some other request in the same pass. When it refused every
+/// request, the fault is in the request as a whole (a schema change, a
+/// wrong account), so nothing is quarantined and the next pass tries
+/// again.
+fn quarantine(refused: Vec<(usize, String)>, took_any: bool) -> Vec<(usize, String)> {
+    if took_any { refused } else { Vec::new() }
+}
+
 fn split(rows: &std::ops::Range<usize>) -> Split {
     if rows.len() <= 1 {
         return Split::Bad(rows.start);
@@ -1186,6 +1195,8 @@ async fn report_usage(
     };
     let mut pending = std::iter::once(0..rows.len()).collect::<Vec<_>>();
     let mut first = true;
+    let mut took_any = false;
+    let mut refused = Vec::new();
     while let Some(range) = pending.pop() {
         if range.is_empty() {
             continue;
@@ -1201,29 +1212,38 @@ async fn report_usage(
         ))
         .await;
         match judge(&answer, range.len()) {
-            Ingest::Taken => store::usage_sent(db, &keys(&range), now)
-                .await
-                .map_err(|e| e.to_string())?,
+            Ingest::Taken => {
+                took_any = true;
+                store::usage_sent(db, &keys(&range), now)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             Ingest::Retry(err) => return Err(err),
             Ingest::Refused(reason) => match split(&range) {
                 Split::Halves(left, right) => {
                     pending.push(right);
                     pending.push(left);
                 }
-                Split::Bad(at) => {
-                    let row = &rows[at];
-                    console_error!(
-                        "reconcile: usage of job {} attempt {} (tenant {}) quarantined: {reason}",
-                        row.job_id,
-                        row.attempt,
-                        row.tenant_id
-                    );
-                    store::usage_rejected(db, &[(row.job_id, row.attempt)], &reason, now)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
+                Split::Bad(at) => refused.push((at, reason)),
             },
         }
+    }
+    if !took_any && !refused.is_empty() {
+        console_error!(
+            "reconcile: Polar refused every usage event this pass; none quarantined, retrying"
+        );
+    }
+    for (at, reason) in quarantine(refused, took_any) {
+        let row = &rows[at];
+        console_error!(
+            "reconcile: usage of job {} attempt {} (tenant {}) quarantined: {reason}",
+            row.job_id,
+            row.attempt,
+            row.tenant_id
+        );
+        store::usage_rejected(db, &[(row.job_id, row.attempt)], &reason, now)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1611,6 +1631,15 @@ mod tests {
             headers: Vec::new(),
             body: body.as_bytes().to_vec(),
         })
+    }
+
+    #[test]
+    fn a_refusal_of_every_request_quarantines_nothing() {
+        let refused = vec![(0, "422".to_owned()), (1, "422".to_owned())];
+        // A schema-level 422 refuses every single-row request: retry.
+        assert_eq!(quarantine(refused.clone(), false), Vec::new());
+        // Polar took other rows, so these two are bad on their own.
+        assert_eq!(quarantine(refused.clone(), true), refused);
     }
 
     #[test]
