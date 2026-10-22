@@ -389,6 +389,9 @@ mod tests {
             completed_at: None,
             steps: serde_json::json!([]),
             log_key: None,
+            template: Some("ubuntu-latest".into()),
+            token_permissions: serde_json::json!({}),
+            secret_refs: serde_json::json!({ "all": false, "names": [] }),
         }
     }
 

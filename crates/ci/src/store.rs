@@ -8,9 +8,13 @@
 //! jobs, the agent's calls move them along, the app lists them, and the
 //! reconciler checks, restarts and expires them. Times are Unix
 //! milliseconds. A job's `steps` column is `jsonb`, which rows do not
-//! carry, so every statement reads it as text and [`JobRow`] parses it.
+//! carry, so every statement reads it as text and [`JobRow`] parses it;
+//! so are `token_permissions` and `secret_refs`.
+
+use std::collections::BTreeMap;
 
 use hatchrun_cloud::db::{Db, Param, params};
+use hatchrun_workflow::{Level, SecretRefs};
 use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
 use worker::Result;
@@ -113,6 +117,13 @@ pub struct NewJob {
     pub name: String,
     /// The most minutes it may run.
     pub timeout_minutes: u32,
+    /// The first `runs-on` label of the job's runner template; `None`
+    /// for an approval job.
+    pub template: Option<String>,
+    /// The App permissions of the job's token.
+    pub token_permissions: BTreeMap<String, Level>,
+    /// The secrets the job reads.
+    pub secret_refs: SecretRefs,
 }
 
 /// A recorded job.
@@ -154,6 +165,15 @@ pub struct JobRow {
     pub steps: serde_json::Value,
     /// The R2 key of the finished log.
     pub log_key: Option<String>,
+    /// The first `runs-on` label of the job's runner template; `None`
+    /// for an approval job.
+    pub template: Option<String>,
+    /// The App permissions of the job's token, a JSON object.
+    #[serde(deserialize_with = "json_text")]
+    pub token_permissions: serde_json::Value,
+    /// The secrets the job reads, a JSON object.
+    #[serde(deserialize_with = "json_text")]
+    pub secret_refs: serde_json::Value,
 }
 
 /// A schedule of a workflow.
@@ -180,7 +200,8 @@ const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, work
 /// The columns of a [`JobRow`].
 const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instance_id, attempt, \
      launch_attempts, next_launch_at, timeout_minutes, updated_at, heartbeat_at, started_at, \
-     completed_at, steps::text AS steps, log_key";
+     completed_at, steps::text AS steps, log_key, template, \
+     token_permissions::text AS token_permissions, secret_refs::text AS secret_refs";
 
 /// The tenant of installation `$1`.
 const TENANT_FOR_INSTALLATION: &str =
@@ -544,20 +565,31 @@ pub async fn insert_jobs(
     let mut values = Vec::new();
     let mut bound = params![run_id, now];
     for (i, job) in jobs.iter().enumerate() {
-        let base = 3 + i * 3;
+        let base = 3 + i * 6;
         values.push(format!(
-            "($1, ${}, ${}, ${}, 'waiting', $2, $2)",
+            "($1, ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, 'waiting', $2, $2)",
             base,
             base + 1,
-            base + 2
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5
         ));
         bound.push(Param::from(&job.plan_id));
         bound.push(Param::from(&job.name));
         bound.push(Param::from(job.timeout_minutes));
+        bound.push(Param::from(job.template.as_deref()));
+        bound.push(Param::from(
+            serde_json::to_string(&job.token_permissions).map_err(worker::Error::from)?,
+        ));
+        bound.push(Param::from(
+            serde_json::to_string(&job.secret_refs).map_err(worker::Error::from)?,
+        ));
     }
     let sql = format!(
-        "INSERT INTO ci_jobs (run_id, plan_id, name, timeout_minutes, status, created_at, \
-         updated_at) VALUES {} RETURNING plan_id, id",
+        "INSERT INTO ci_jobs (run_id, plan_id, name, timeout_minutes, template, \
+         token_permissions, secret_refs, status, created_at, updated_at) \
+         VALUES {} RETURNING plan_id, id",
         values.join(", ")
     );
     let mut inserted: Vec<Inserted> = db.all(&sql, &bound).await?;
@@ -964,6 +996,9 @@ mod tests {
             plan_id: plan_id.into(),
             name: plan_id.into(),
             timeout_minutes: 360,
+            template: Some("ubuntu-latest".into()),
+            token_permissions: BTreeMap::from([("metadata".to_owned(), Level::Read)]),
+            secret_refs: SecretRefs::default(),
         }
     }
 
@@ -1167,6 +1202,50 @@ mod tests {
                 .all(|job| job.status == "waiting" && job.attempt == 1)
         );
         assert_eq!(jobs[0].steps, serde_json::json!([]));
+    }
+
+    #[test]
+    fn insert_jobs_keeps_template_permissions_and_refs() {
+        let db = setup();
+        let run = db
+            .wait(insert_run(db.db(), &new_run("d", "ci", 1)))
+            .unwrap()
+            .unwrap();
+        let build = NewJob {
+            template: Some("ubuntu-26.04-8core-arm".into()),
+            token_permissions: BTreeMap::from([
+                ("contents".to_owned(), Level::Write),
+                ("metadata".to_owned(), Level::Read),
+            ]),
+            secret_refs: SecretRefs {
+                all: false,
+                names: ["NPM_TOKEN".to_owned()].into(),
+            },
+            ..new_job("build")
+        };
+        let approve = NewJob {
+            template: None,
+            ..new_job("approve")
+        };
+        db.wait(insert_jobs(db.db(), run.id, &[build, approve], 2))
+            .unwrap();
+        let jobs = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
+        assert_eq!(jobs[0].template.as_deref(), Some("ubuntu-26.04-8core-arm"));
+        assert_eq!(
+            jobs[0].token_permissions,
+            serde_json::json!({ "contents": "write", "metadata": "read" })
+        );
+        assert_eq!(
+            jobs[0].secret_refs,
+            serde_json::json!({ "all": false, "names": ["NPM_TOKEN"] })
+        );
+        let one = db.wait(job(db.db(), jobs[0].id)).unwrap().unwrap();
+        assert_eq!(one, jobs[0]);
+        assert_eq!(jobs[1].template, None);
+        assert_eq!(
+            jobs[1].secret_refs,
+            serde_json::json!({ "all": false, "names": [] })
+        );
     }
 
     #[test]

@@ -11,14 +11,14 @@ use std::fmt::Write as _;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Diagnostic, Event, Plan};
+use hatchrun_workflow::{Diagnostic, Event, JobKind, Plan};
 use serde_json::Value;
 use worker::{Env, Method, RequestInit, Result};
 
 use crate::env::{Settings, run_stub};
 use crate::github::{self, CONFIG_PATH, CheckRun, GhAnnotation, Output};
 use crate::intake::{PullRequest, Repo};
-use crate::planning::{self, Selected};
+use crate::planning::{self, Failed, Selected};
 use crate::run::{RunInfo, Start};
 use crate::store::{self, JobRow, NewJob, NewRun, RunRow};
 
@@ -116,13 +116,49 @@ pub async fn read_config(
 /// config file.
 #[must_use]
 pub fn invalid_config_check_run(diagnostics: &[Diagnostic], sha: &str) -> CheckRun {
+    failed_check_run(
+        CONFIG_CHECK,
+        "Invalid hatchrun config",
+        "so no workflow started",
+        diagnostics,
+        sha,
+    )
+}
+
+/// The failed check run of a workflow that did not compile, named
+/// `<workflow> / config`. The other workflows of the event still run.
+#[must_use]
+pub fn invalid_workflow_check_run(
+    workflow: &str,
+    diagnostics: &[Diagnostic],
+    sha: &str,
+) -> CheckRun {
+    failed_check_run(
+        &format!("{workflow} / config"),
+        "Invalid workflow",
+        &format!("so workflow `{workflow}` did not start"),
+        diagnostics,
+        sha,
+    )
+}
+
+/// A completed, failed check run `name` that lists `diagnostics` in its
+/// summary, `consequence` ending the first line, and annotates the
+/// config file with them.
+fn failed_check_run(
+    name: &str,
+    title: &str,
+    consequence: &str,
+    diagnostics: &[Diagnostic],
+    sha: &str,
+) -> CheckRun {
     let line = |d: &Diagnostic| match (d.line, d.column) {
         (Some(line), Some(column)) => format!("- line {line}, column {column}: {}", d.message),
         (Some(line), None) => format!("- line {line}: {}", d.message),
         _ => format!("- {}", d.message),
     };
     let mut summary = format!(
-        "`{CONFIG_PATH}` has {} problem{}, so no workflow started:\n\n",
+        "`{CONFIG_PATH}` has {} problem{}, {consequence}:\n\n",
         diagnostics.len(),
         if diagnostics.len() == 1 { "" } else { "s" }
     );
@@ -157,7 +193,7 @@ pub fn invalid_config_check_run(diagnostics: &[Diagnostic], sha: &str) -> CheckR
         })
         .collect();
     CheckRun {
-        name: CONFIG_CHECK.to_owned(),
+        name: name.to_owned(),
         head_sha: sha.to_owned(),
         external_id: String::new(),
         details_url: String::new(),
@@ -166,7 +202,7 @@ pub fn invalid_config_check_run(diagnostics: &[Diagnostic], sha: &str) -> CheckR
         conclusion: Some("failure".to_owned()),
         completed_at: None,
         output: Some(Output {
-            title: "Invalid hatchrun config".to_owned(),
+            title: title.to_owned(),
             summary,
             text: None,
             annotations,
@@ -213,13 +249,20 @@ pub async fn create(
             return Ok(Vec::new());
         }
     };
-    let plans = match planning::select(source, req.trigger, req.compile_ref) {
-        Selected::Plans(plans) => only_workflow(plans, req.workflow),
+    let (plans, failed) = match planning::select(source, req.trigger, req.compile_ref) {
+        Selected::Plans { plans, failed } => (
+            only_workflow(plans, req.workflow),
+            only_failed(failed, req.workflow),
+        ),
         Selected::Invalid(diagnostics) => {
             report_invalid(tokens, settings, req, &diagnostics).await?;
             return Ok(Vec::new());
         }
     };
+    for workflow in &failed {
+        let check = invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, req.sha);
+        report_once(tokens, settings, req, &check).await?;
+    }
     let mut ids = Vec::new();
     for plan in &plans {
         ids.push(start_plan(env, db, req, plan, now).await?);
@@ -235,11 +278,32 @@ fn only_workflow(mut plans: Vec<Plan>, workflow: Option<&str>) -> Vec<Plan> {
     plans
 }
 
+/// The failed workflows of `workflow` when one is named, all of them
+/// otherwise.
+fn only_failed(mut failed: Vec<Failed>, workflow: Option<&str>) -> Vec<Failed> {
+    if let Some(workflow) = workflow {
+        failed.retain(|failed| failed.workflow == workflow);
+    }
+    failed
+}
+
 async fn report_invalid(
     tokens: &Tokens<'_, Kv, App, Counted>,
     settings: &Settings,
     req: &Request<'_>,
     diagnostics: &[Diagnostic],
+) -> Result<()> {
+    let check = invalid_config_check_run(diagnostics, req.sha);
+    report_once(tokens, settings, req, &check).await
+}
+
+/// Creates `check` on the commit unless a check run of its name is
+/// there already.
+async fn report_once(
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    settings: &Settings,
+    req: &Request<'_>,
+    check: &CheckRun,
 ) -> Result<()> {
     // A delivery repeated after a later failure finds its report.
     let listed = tokens
@@ -248,7 +312,7 @@ async fn report_invalid(
                 &settings.github_api,
                 &req.repo.full_name,
                 req.sha,
-                CONFIG_CHECK,
+                &check.name,
                 token,
             )
         })
@@ -257,10 +321,9 @@ async fn report_invalid(
     if github::check_run_total(&listed).map_err(fail)? > 0 {
         return Ok(());
     }
-    let check = invalid_config_check_run(diagnostics, req.sha);
     let response = tokens
         .send(req.installation_id, |token| {
-            github::create_check_run(&settings.github_api, &req.repo.full_name, token, &check)
+            github::create_check_run(&settings.github_api, &req.repo.full_name, token, check)
         })
         .await
         .map_err(|err| fail(err.to_string()))?;
@@ -306,6 +369,12 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
                 plan_id: job.id.clone(),
                 name: job.name.clone(),
                 timeout_minutes: job.timeout_minutes,
+                template: match job.kind {
+                    JobKind::Run { template } => Some(template.labels[0].to_owned()),
+                    JobKind::Approval => None,
+                },
+                token_permissions: job.token_permissions.clone(),
+                secret_refs: job.secret_refs(),
             })
             .collect();
         store::insert_jobs(db, run.id, &jobs, now).await?;
@@ -374,8 +443,29 @@ async fn post_start(env: &Env, run_id: u64, start: &Start) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use hatchrun_workflow::SecretRefs;
+
     use super::*;
     use crate::intake::{Trigger, parse};
+
+    #[test]
+    fn invalid_workflow_check_run_names_the_workflow() {
+        let diagnostics = [Diagnostic::new(
+            "job `t` has `runs-on: ubuntu-24.04`, which names no runner template",
+        )];
+        let run = invalid_workflow_check_run("bad", &diagnostics, "abc");
+        assert_eq!(run.name, "bad / config");
+        assert_eq!(run.head_sha, "abc");
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.conclusion.as_deref(), Some("failure"));
+        let output = run.output.unwrap();
+        assert_eq!(output.title, "Invalid workflow");
+        assert!(output.summary.contains("workflow `bad` did not start"));
+        assert!(output.summary.contains("names no runner template"));
+        assert_eq!(output.annotations.len(), 1);
+    }
 
     #[test]
     fn config_failure_check_run_lists_diagnostics() {
@@ -453,6 +543,9 @@ mod tests {
             plan_id: "build".into(),
             name: "build".into(),
             timeout_minutes: 10,
+            template: Some("ubuntu-latest".into()),
+            token_permissions: BTreeMap::new(),
+            secret_refs: SecretRefs::default(),
         }];
         let ids = db
             .wait(store::insert_jobs(db.db(), run.id, &jobs, 1))
@@ -489,7 +582,8 @@ workflows:
         let event = Event::Schedule {
             cron: "0 3 * * *".into(),
         };
-        let Selected::Plans(plans) = planning::select(source, &event, "refs/heads/main") else {
+        let Selected::Plans { plans, .. } = planning::select(source, &event, "refs/heads/main")
+        else {
             panic!("invalid");
         };
         assert_eq!(plans.len(), 2, "both share the cron");

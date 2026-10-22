@@ -37,7 +37,7 @@ pub use job::{
     StepSummary,
 };
 pub use permissions::{DEFAULT_SCOPES, Level, Permissions, SCOPES, token_scopes};
-pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, validate};
+pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, config_errors, validate};
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;
 pub use templates::{

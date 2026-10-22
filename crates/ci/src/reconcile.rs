@@ -767,6 +767,8 @@ mod tests {
             "launch_attempts": 1, "next_launch_at": null,
             "timeout_minutes": 10, "updated_at": NOW, "heartbeat_at": null,
             "started_at": null, "completed_at": null, "steps": "[]", "log_key": null,
+            "template": "ubuntu-latest", "token_permissions": "{}",
+            "secret_refs": "{\"all\":false,\"names\":[]}",
         }))
         .unwrap();
         row.updated_at = NOW;

@@ -500,7 +500,7 @@ curl -fsS "$LAUNCHER/_events" >"$tmp/events.json"
 jq -e '
   def at($e): (index([$e]) // -1);
   . as $ev
-  | [$ev[] | select(startswith("launch ")) | ltrimstr("launch ")] as $ids
+  | [$ev[] | select(startswith("launch ")) | split(" ")[1]] as $ids
   | ($ids | length) > 0
     and all($ids[]; . as $id
       | ($ev | at("metadata-off " + $id)) as $off

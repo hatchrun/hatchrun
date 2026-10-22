@@ -7,8 +7,8 @@
 //! [`Backend::Ec2`] starts them in the CI AWS account through the same
 //! code hatchrun.io uses for a tenant's account: it assumes the CI role
 //! with an `oidc.hatchrun.io` token whose subject is `tenant:hatchrun-ci`
-//! and starts instances of the built-in profile [`PROFILE`], one fresh
-//! on-demand instance per job.
+//! and starts instances of the built-in profile of the job's runner
+//! template (see [`profile_for`]), one fresh on-demand instance per job.
 //!
 //! [`Backend::Local`] calls a launcher daemon on the developer's machine
 //! (`hatchrun-ci-dev launcher`), since a Worker cannot start processes.
@@ -22,10 +22,12 @@ use hatchrun_cloud::db::{Db, params};
 use hatchrun_cloud::fetch::send;
 use hatchrun_cloud::http::{Request, Response};
 use hatchrun_cloud::instance::{Limits, choose, static_offerings};
-use hatchrun_cloud::profiles::built_in;
+use hatchrun_cloud::profiles::{Profile, built_in};
 use hatchrun_cloud::start::{
     Cause, Failure, Instance, Target, role_credentials, start_instance, terminate_instance,
 };
+use hatchrun_workflow::Template;
+use hatchrun_workflow::templates::Arch as TemplateArch;
 use serde::Deserialize;
 use worker::console_warn;
 
@@ -34,9 +36,23 @@ use crate::env::Settings;
 /// The OIDC subject tenant and the `hatchrun:tenant` tag of CI
 /// instances.
 pub const TENANT: &str = "hatchrun-ci";
-/// The built-in hatchrun.io profile every job launches: general purpose,
-/// 2 vCPU, 8 GiB, amd64, on demand.
-pub const PROFILE: &str = "hatchrun-2cpu";
+
+/// The built-in hatchrun.io profile `template` launches:
+/// `hatchrun-<vcpu>cpu`, with `-arm64` on arm64. General purpose, 4 GiB
+/// per vCPU, on demand.
+///
+/// # Panics
+///
+/// Never for a template of [`hatchrun_workflow::templates::TEMPLATES`]:
+/// every one has a built-in profile.
+#[must_use]
+pub fn profile_for(template: &Template) -> Profile {
+    let name = match template.arch {
+        TemplateArch::Amd64 => format!("hatchrun-{}cpu", template.vcpu),
+        TemplateArch::Arm64 => format!("hatchrun-{}cpu-arm64", template.vcpu),
+    };
+    built_in(&name).unwrap_or_else(|| panic!("no built-in profile {name}"))
+}
 
 /// The runner image of region `$1` and architecture `$2`.
 const IMAGE: &str = "SELECT image_id, root_device FROM images WHERE region = $1 AND arch = $2";
@@ -50,6 +66,8 @@ pub struct LaunchSpec {
     pub name: String,
     /// The instance's user data (see [`user_data`]).
     pub user_data: String,
+    /// The runner template the job asked for.
+    pub template: &'static Template,
 }
 
 /// How instances start.
@@ -320,8 +338,7 @@ impl Ec2 {
 
     async fn launch(&self, db: &Db, spec: &LaunchSpec) -> Result<String, Failure> {
         let region = self.settings.ci_region.as_str();
-        let profile = built_in(PROFILE)
-            .ok_or_else(|| Failure::new(Cause::Internal, format!("no profile {PROFILE}")))?;
+        let profile = profile_for(spec.template);
         let choice = choose(
             &profile,
             region,
@@ -492,6 +509,7 @@ impl Local {
         let body = serde_json::json!({
             "name": spec.name,
             "job_id": spec.job_id,
+            "template": spec.template.labels[0],
             "user_data": spec.user_data,
         });
         let request = Request::new("POST", format!("{}/instances", self.url))
@@ -561,6 +579,8 @@ impl Local {
 #[cfg(test)]
 mod tests {
     use hatchrun_cloud::labels::Arch;
+    use hatchrun_cloud::profiles::Capacity;
+    use hatchrun_workflow::templates::{TEMPLATES, template};
 
     use super::*;
 
@@ -623,18 +643,43 @@ mod tests {
     }
 
     #[test]
-    fn the_profile_is_two_vcpu_amd64_on_demand() {
-        let profile = built_in(PROFILE).unwrap();
-        let choice = choose(
-            &profile,
-            "us-east-1",
-            &static_offerings("us-east-1"),
-            &Limits::from_columns(None, None, None, None),
-        )
-        .unwrap();
-        assert_eq!(choice.vcpus, 2);
-        assert_eq!(choice.memory_gib, 8);
-        assert_eq!(choice.arch, Arch::Amd64);
-        assert_eq!(choice.capacity.markets(), [false]);
+    fn every_template_has_a_built_in_profile() {
+        for t in TEMPLATES {
+            let p = profile_for(t);
+            let arch = match t.arch {
+                TemplateArch::Amd64 => Arch::Amd64,
+                TemplateArch::Arm64 => Arch::Arm64,
+            };
+            assert_eq!(p.arch, arch, "{}", t.labels[0]);
+            assert_eq!(p.cpu_min, u16::try_from(t.vcpu).unwrap());
+            assert_eq!(p.cpu_max, Some(u16::try_from(t.vcpu).unwrap()));
+            assert_eq!(p.memory_min, u16::try_from(t.memory_gib).unwrap());
+            assert_eq!(p.capacity, Capacity::OnDemand);
+            assert_eq!(p.categories, ["m"]);
+        }
+    }
+
+    #[test]
+    fn arm_names_the_arm64_profile() {
+        let t = template("ubuntu-26.04-8core-arm").unwrap();
+        assert_eq!(profile_for(t).name, "hatchrun-8cpu-arm64");
+        let t = template("ubuntu-latest").unwrap();
+        assert_eq!(profile_for(t).name, "hatchrun-2cpu");
+    }
+
+    #[test]
+    fn every_template_picks_an_instance_of_its_size() {
+        for t in TEMPLATES {
+            let choice = choose(
+                &profile_for(t),
+                "us-east-1",
+                &static_offerings("us-east-1"),
+                &Limits::from_columns(None, None, None, None),
+            )
+            .unwrap_or_else(|err| panic!("{}: {err}", t.labels[0]));
+            assert_eq!(u32::from(choice.vcpus), t.vcpu, "{}", t.labels[0]);
+            assert_eq!(choice.memory_gib, t.memory_gib, "{}", t.labels[0]);
+            assert_eq!(choice.capacity.markets(), [false]);
+        }
     }
 }
