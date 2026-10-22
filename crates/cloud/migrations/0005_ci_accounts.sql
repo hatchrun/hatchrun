@@ -10,3 +10,11 @@ ALTER TABLE ci_jobs ADD COLUMN token_permissions jsonb NOT NULL DEFAULT '{"metad
 ALTER TABLE ci_jobs ALTER COLUMN token_permissions DROP DEFAULT;
 ALTER TABLE ci_jobs ADD COLUMN secret_refs jsonb NOT NULL DEFAULT '{"all":false,"names":[]}';
 ALTER TABLE ci_jobs ALTER COLUMN secret_refs DROP DEFAULT;
+
+-- A card is the gate: an active or trialing subscription to the CI
+-- product. Tenants no longer carry a switch.
+ALTER TABLE tenants DROP COLUMN ci_enabled;
+-- A CI subscription never licenses hatchrun.io runners, and the reverse.
+ALTER TABLE subscriptions ADD COLUMN product text NOT NULL DEFAULT 'runners'
+  CHECK (product IN ('runners', 'ci'));
+ALTER TABLE subscriptions ALTER COLUMN product DROP DEFAULT;

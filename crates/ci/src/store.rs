@@ -23,13 +23,28 @@ use worker::Result;
 /// milliseconds.
 const RETENTION_MS: u64 = 30 * 86_400_000;
 
-/// A tenant, as far as CI needs it.
+/// Where a tenant stands with the CI product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiBilling {
+    /// No CI subscription row ever: a hatchrun.io-only tenant.
+    Never,
+    /// A CI subscription exists but none is active or trialing.
+    Lapsed,
+    /// An active or trialing CI subscription: a card on file.
+    Active,
+}
+
+/// A tenant, as far as CI needs it. The billing state is read in the
+/// same statement as the tenant, so the gate costs no extra query.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TenantRow {
     /// The tenant id.
     pub id: String,
-    /// Whether CI runs for this tenant.
-    pub ci_enabled: bool,
+    /// The organization's login.
+    pub org_login: String,
+    /// Whether the tenant has a card for CI.
+    pub ci_billing: CiBilling,
 }
 
 /// A repository CI has seen.
@@ -203,12 +218,27 @@ const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instan
      completed_at, steps::text AS steps, log_key, template, \
      token_permissions::text AS token_permissions, secret_refs::text AS secret_refs";
 
-/// The tenant of installation `$1`.
-const TENANT_FOR_INSTALLATION: &str =
-    "SELECT id, ci_enabled FROM tenants WHERE installation_id = $1";
+/// The columns of a [`TenantRow`]. `ci_billing` is `active` for an
+/// active or trialing CI subscription, `lapsed` for another CI
+/// subscription, `never` for none.
+const TENANT_COLUMNS: &str = "id, org_login, CASE \
+     WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
+     AND subscriptions.product = 'ci' AND subscriptions.status IN ('active', 'trialing')) \
+     THEN 'active' \
+     WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
+     AND subscriptions.product = 'ci') THEN 'lapsed' \
+     ELSE 'never' END AS ci_billing";
 
-/// Tenant `$1`.
-const TENANT: &str = "SELECT id, ci_enabled FROM tenants WHERE id = $1";
+/// The tenant of installation `$1`, where `{columns}` is
+/// [`TENANT_COLUMNS`].
+const TENANT_FOR_INSTALLATION: &str = "SELECT {columns} FROM tenants WHERE installation_id = $1";
+
+/// Tenant `$1`, where `{columns}` is [`TENANT_COLUMNS`].
+const TENANT: &str = "SELECT {columns} FROM tenants WHERE id = $1";
+
+/// Whether tenant `$1` has an active or trialing CI subscription.
+const HAS_CARD: &str = "SELECT EXISTS (SELECT 1 FROM subscriptions WHERE tenant_id = $1 \
+     AND product = 'ci' AND status IN ('active', 'trialing')) AS card";
 
 /// The run of delivery `$1` and workflow `$2`, where `{columns}` is
 /// [`RUN_COLUMNS`].
@@ -440,8 +470,11 @@ async fn exists(db: &Db, sql: &str, params: &[Param]) -> Result<bool> {
 ///
 /// Postgres refused the statement.
 pub async fn tenant_for_installation(db: &Db, installation_id: u64) -> Result<Option<TenantRow>> {
-    db.first(TENANT_FOR_INSTALLATION, &params![installation_id])
-        .await
+    db.first(
+        &TENANT_FOR_INSTALLATION.replace("{columns}", TENANT_COLUMNS),
+        &params![installation_id],
+    )
+    .await
 }
 
 /// Tenant `tenant_id`.
@@ -450,7 +483,28 @@ pub async fn tenant_for_installation(db: &Db, installation_id: u64) -> Result<Op
 ///
 /// Postgres refused the statement.
 pub async fn tenant(db: &Db, tenant_id: &str) -> Result<Option<TenantRow>> {
-    db.first(TENANT, &params![tenant_id]).await
+    db.first(
+        &TENANT.replace("{columns}", TENANT_COLUMNS),
+        &params![tenant_id],
+    )
+    .await
+}
+
+/// Whether tenant `tenant_id` has an active or trialing subscription to
+/// the CI product.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn has_card(db: &Db, tenant_id: &str) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct Card {
+        card: bool,
+    }
+    Ok(db
+        .first::<Card>(HAS_CARD, &params![tenant_id])
+        .await?
+        .is_some_and(|row| row.card))
 }
 
 /// Records `repo`, or updates it after a rename or a change.
@@ -1659,7 +1713,14 @@ mod tests {
             .wait(tenant_for_installation(db.db(), 99))
             .unwrap()
             .unwrap();
-        assert_eq!((tenant.id.as_str(), tenant.ci_enabled), ("t1", false));
+        assert_eq!(
+            (
+                tenant.id.as_str(),
+                tenant.org_login.as_str(),
+                tenant.ci_billing
+            ),
+            ("t1", "acme", CiBilling::Never)
+        );
         assert!(
             db.wait(tenant_for_installation(db.db(), 1))
                 .unwrap()
@@ -1698,6 +1759,66 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn subscribe(db: &TestDb, id: &str, product: &str, status: &str) {
+        db.run(
+            "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
+             product, cancel_at_period_end, modified_at, updated_at) \
+             VALUES ($1, 't1', $3, 'c', 'p', $2, false, 't', 0)",
+            &params![id, product, status],
+        );
+    }
+
+    #[test]
+    fn has_card_needs_an_active_ci_subscription() {
+        let db = setup();
+        let card = |db: &TestDb| db.wait(has_card(db.db(), "t1")).unwrap();
+        assert!(!card(&db), "no subscription");
+        subscribe(&db, "s1", "runners", "active");
+        assert!(!card(&db), "a runners subscription is no card for CI");
+        subscribe(&db, "s2", "ci", "canceled");
+        assert!(!card(&db), "canceled");
+        subscribe(&db, "s3", "ci", "active");
+        assert!(card(&db));
+        db.run(
+            "UPDATE subscriptions SET status = 'trialing' WHERE id = 's3'",
+            &[],
+        );
+        assert!(card(&db), "trialing");
+        assert!(!db.wait(has_card(db.db(), "nope")).unwrap());
+    }
+
+    #[test]
+    fn tenant_row_reads_the_ci_billing_state() {
+        let db = setup();
+        let state = |db: &TestDb| {
+            let by_id = db.wait(tenant(db.db(), "t1")).unwrap().unwrap().ci_billing;
+            let by_installation = db
+                .wait(tenant_for_installation(db.db(), 99))
+                .unwrap()
+                .unwrap()
+                .ci_billing;
+            assert_eq!(by_id, by_installation);
+            by_id
+        };
+        assert_eq!(state(&db), CiBilling::Never);
+        subscribe(&db, "s1", "runners", "active");
+        assert_eq!(state(&db), CiBilling::Never, "a runners subscription");
+        subscribe(&db, "s2", "ci", "canceled");
+        assert_eq!(state(&db), CiBilling::Lapsed);
+        subscribe(&db, "s3", "ci", "active");
+        assert_eq!(state(&db), CiBilling::Active);
+        db.run(
+            "UPDATE subscriptions SET status = 'canceled' WHERE id = 's3'",
+            &[],
+        );
+        assert_eq!(state(&db), CiBilling::Lapsed);
+        db.run(
+            "UPDATE subscriptions SET status = 'trialing' WHERE id = 's3'",
+            &[],
+        );
+        assert_eq!(state(&db), CiBilling::Active);
     }
 
     #[test]

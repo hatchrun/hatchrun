@@ -48,7 +48,7 @@ use crate::launcher::Backend;
 use crate::launches::{self, EndAction, LaunchMessage};
 use crate::run::LAUNCHES;
 use crate::runs::{self, Config};
-use crate::store::{self, JobRow, ScheduleRow};
+use crate::store::{self, CiBilling, JobRow, ScheduleRow};
 
 /// How long the lease holds, in milliseconds.
 const LEASE_MS: u64 = 55_000;
@@ -515,7 +515,7 @@ async fn head(
         .await
         .map_err(|e| e.to_string())?
     {
-        Some(tenant) if tenant.ci_enabled => {}
+        Some(tenant) if tenant.ci_billing == CiBilling::Active => {}
         _ => return Ok(None),
     }
     let response = tokens
