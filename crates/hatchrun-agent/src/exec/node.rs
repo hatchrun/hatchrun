@@ -199,7 +199,7 @@ impl Job<'_> {
         r: &ActionRef,
         sink: &mut dyn Sink,
     ) {
-        match self.runs(Some(hook.condition.unwrap_or("always()"))) {
+        match self.hook_runs(Some(hook.condition.unwrap_or("always()"))) {
             Ok(true) => {}
             Ok(false) => return,
             Err(err) => {
@@ -234,7 +234,7 @@ impl Job<'_> {
                 self.posts.clear();
                 break;
             }
-            match self.runs(Some(post.condition.as_deref().unwrap_or("always()"))) {
+            match self.hook_runs(Some(post.condition.as_deref().unwrap_or("always()"))) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(err) => {

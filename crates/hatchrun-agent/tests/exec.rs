@@ -728,6 +728,31 @@ fn post_if_decides_and_skipped_main_queues_no_post() {
 }
 
 #[test]
+fn action_hook_conditions_see_no_secrets() {
+    if !has_node() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "peek",
+        "name: peek\nruns:\n  using: node20\n  pre: pre.js\n  pre-if: secrets.K == 's3cr3t'\n  main: main.js\n  post: post.js\n  post-if: secrets.K == 's3cr3t'\n",
+        &[
+            ("pre.js", "console.log('pre-ran');\n"),
+            ("main.js", "console.log('main-ran');\n"),
+            ("post.js", "console.log('post-ran');\n"),
+        ],
+    );
+    let mut doc = make::document(vec![PlannedStep::Uses(make::uses("p", "./peek"))]);
+    doc.secrets.insert("K".to_owned(), "s3cr3t".to_owned());
+    let out = exec(dir.path(), &json(&doc));
+    let text = lines(&out);
+    assert!(text.contains(&"main-ran".to_owned()), "{text:?}");
+    assert!(!text.contains(&"pre-ran".to_owned()), "{text:?}");
+    assert!(!text.contains(&"post-ran".to_owned()), "{text:?}");
+}
+
+#[test]
 fn failing_node_action_fails_the_step() {
     if !has_node() {
         return;

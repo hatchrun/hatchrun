@@ -223,6 +223,19 @@ impl Contexts {
         self.value["job"]["status"] = json!(text);
     }
 
+    /// These contexts with an empty `secrets`: what an action's own
+    /// `pre-if` and `post-if` see, since an action reads secrets only
+    /// through `with` and `env`.
+    #[must_use]
+    pub fn without_secrets(&self) -> Contexts {
+        let mut value = self.value.clone();
+        value["secrets"] = json!({});
+        Contexts {
+            value,
+            cancel: self.cancel.clone(),
+        }
+    }
+
     /// The contexts a step of `action` sees. The action has its own
     /// `steps` and `inputs` and cannot read the caller's secrets.
     #[must_use]
