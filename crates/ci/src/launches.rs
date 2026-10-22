@@ -398,11 +398,14 @@ async fn launch_claimed(
         user_data: user_data(&settings.broker_url, &ticket),
         template,
     };
-    let instance_id = backend.launch(db, &spec).await?;
-    if let Err(err) = store_ticket(settings, &ticket, &document).await {
-        backend.terminate(&instance_id).await;
-        return Err(err);
-    }
+    // The ticket is stored before any instance starts, so a pool instance
+    // that boots at once finds it, and a broker that is down launches
+    // nothing.
+    store_ticket(settings, &ticket, &document).await?;
+    let instance_id = match from_pool(db, backend, &spec).await {
+        Some(instance_id) => instance_id,
+        None => backend.launch(db, &spec).await?,
+    };
     match store::launched(db, job.id, &instance_id, now_ms()).await {
         Ok(true) => {
             console_log!("job {}: launched {instance_id}", job.id);
@@ -416,6 +419,41 @@ async fn launch_claimed(
         Err(err) => {
             backend.terminate(&instance_id).await;
             Err(internal(err.to_string()))
+        }
+    }
+}
+
+/// Hands the oldest ready instance of the job's template from the warm
+/// pool to the job and starts it, or returns `None` for a fresh launch:
+/// the pool has none, could not be read, or the instance did not take
+/// the job's user data (it is terminated, as an instance in an unknown
+/// state must not run a job).
+async fn from_pool(db: &Db, backend: &Backend, spec: &LaunchSpec) -> Option<String> {
+    let template = spec.template.labels[0];
+    let instance_id = match store::take_pool(db, template).await {
+        Ok(Some(instance_id)) => instance_id,
+        Ok(None) => return None,
+        Err(err) => {
+            console_error!(
+                "job {}: take a {template} pool instance: {err}",
+                spec.job_id
+            );
+            return None;
+        }
+    };
+    match backend.start_pooled(&instance_id, spec).await {
+        Ok(()) => {
+            console_log!("job {}: started pool instance {instance_id}", spec.job_id);
+            Some(instance_id)
+        }
+        Err(failure) => {
+            console_error!(
+                "job {}: start pool instance {instance_id}: {}",
+                spec.job_id,
+                failure.message
+            );
+            backend.terminate(&instance_id).await;
+            None
         }
     }
 }

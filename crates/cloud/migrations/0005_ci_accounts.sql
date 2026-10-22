@@ -71,3 +71,19 @@ CREATE TABLE ci_vars (
   updated_at bigint NOT NULL,
   UNIQUE NULLS NOT DISTINCT (tenant_id, repo_id, name)
 );
+
+-- The warm pool: stopped instances that booted once and wait for a job,
+-- one pool per runner template (the template's first label). Times are
+-- Unix milliseconds. A job takes the oldest ready row; the reconciler
+-- keeps the rest.
+CREATE TABLE ci_pool (
+  instance_id text PRIMARY KEY,
+  template text NOT NULL,
+  state text NOT NULL CHECK (state IN ('warming', 'stopping', 'ready')),
+  launched_at bigint NOT NULL,                 -- Unix ms
+  since bigint NOT NULL                        -- Unix ms
+);
+CREATE INDEX ci_pool_ready ON ci_pool (template, launched_at) WHERE state = 'ready';
+
+-- The pool's size follows the claims of the last hour.
+CREATE INDEX ci_jobs_started ON ci_jobs (started_at) WHERE started_at IS NOT NULL;

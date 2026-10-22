@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The reconciler, which the Cron Trigger runs every minute under a
-//! lease on `ci_reconciler` (see [`run`]). A pass does seven things, in
+//! lease on `ci_reconciler` (see [`run`]). A pass does eight things, in
 //! order, and an error in one is logged and does not stop the next:
 //!
 //! 1. fires the `on: schedule` workflows of the minutes since the last
@@ -12,9 +12,11 @@
 //!    never finished;
 //! 3. fails the jobs whose runner went quiet;
 //! 4. terminates instances that no job needs;
-//! 5. deletes expired runs and purges their objects;
-//! 6. sends metered usage to Polar;
-//! 7. re-seals secrets that an old key still seals.
+//! 5. keeps the warm pool of each runner template at the size the last
+//!    hour's claims ask for ([`crate::pool`]);
+//! 6. deletes expired runs and purges their objects;
+//! 7. sends metered usage to Polar;
+//! 8. re-seals secrets that an old key still seals.
 //!
 //! Each step decides over rows and the clock with a pure function
 //! ([`minutes`], [`fires`], [`stalled`], [`orphans`]) and then acts.
@@ -43,7 +45,10 @@ use hatchrun_cloud::http::Response;
 use hatchrun_cloud::parse_rfc3339;
 use hatchrun_cloud::polar::{CI_INGEST_BATCH, CiUsage, ci_ingest, ingested};
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, UtcMinute};
+use hatchrun_scaler_core::pool::{Backoff, Pool};
+use hatchrun_scaler_core::{Action, Instance, PoolInstance, PoolState};
+use hatchrun_workflow::templates::TEMPLATES;
+use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, Template, UtcMinute};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
@@ -52,10 +57,11 @@ use crate::github;
 use crate::intake::Repo;
 use crate::launcher::Backend;
 use crate::launches::{self, EndAction, LaunchMessage};
+use crate::pool::{self, WINDOW_MS, pool_target};
 use crate::run::LAUNCHES;
 use crate::runs::{self, Config};
 use crate::secrets;
-use crate::store::{self, CiBilling, JobRow, ScheduleRow};
+use crate::store::{self, CiBilling, JobRow, PoolRow, ScheduleRow};
 
 /// How long the lease holds, in milliseconds.
 const LEASE_MS: u64 = 55_000;
@@ -186,6 +192,11 @@ const TERMINATE_COST: u32 = 2;
 const LIST_COST: u32 = 2;
 /// Of purging a run's object.
 const PURGE_COST: u32 = 1;
+/// Of stopping a pool instance: credentials and the call.
+const STOP_COST: u32 = 2;
+/// Of launching a pool instance: a launch template version, a fleet or
+/// two, and the version's deletion.
+const POOL_LAUNCH_COST: u32 = 5;
 
 /// The name of the runner of launch `launch` of attempt `attempt` of job
 /// `job`, which is also the instance's `hatchrun:runner-name` tag.
@@ -263,11 +274,13 @@ fn terminate_and_fail(row: &JobRow, message: &'static str) -> Fix {
 /// `now`, a later attempt or launch of the job replaced the instance
 /// (its runner name says which it is), or the instance started more
 /// than 7 hours ago. A launch time that does not parse counts as old.
+/// An instance with a pool tag belongs to the warm pool, which keeps it.
 #[must_use]
 pub fn orphans(described: &[Described], rows: &[JobRow], now: u64) -> Vec<String> {
     let jobs: HashMap<u64, &JobRow> = rows.iter().map(|row| (row.id, row)).collect();
     described
         .iter()
+        .filter(|instance| instance.pool.is_none())
         .filter(|instance| {
             let old = parse_rfc3339(&instance.launch_time)
                 .is_none_or(|at| at < now.saturating_sub(MAX_AGE_MS));
@@ -431,6 +444,11 @@ pub async fn run(env: Env) {
         && let Err(err) = end_orphans(&db, backend, &Budget::new(share.orphans), now).await
     {
         console_error!("reconcile: orphans: {err}");
+    }
+    if let Ok(backend) = &backend
+        && let Err(err) = keep_pool(&db, backend, &Budget::new(share.pool), now).await
+    {
+        console_error!("reconcile: warm pool: {err}");
     }
     if let Err(err) = retain(&env, &db, &Budget::new(share.retention), now).await {
         console_error!("reconcile: retention: {err}");
@@ -806,7 +824,243 @@ async fn end_orphans(db: &Db, backend: &Backend, budget: &Budget, now: u64) -> R
     Ok(())
 }
 
-/// Step 5. A sweep takes at most [`store::SWEEP_LIMIT`] runs and one
+/// Step 5. Keeps the warm pool of each runner template at the size its
+/// claims in the last hour ask for (see [`crate::pool`]). Skipped for a
+/// backend without a pool. One list of the pool instances serves every
+/// template; an error in one template's pool is logged and does not stop
+/// the next. What `budget` does not pay for waits for the next pass.
+async fn keep_pool(db: &Db, backend: &Backend, budget: &Budget, now: u64) -> Result<(), String> {
+    if !backend.has_pool() || !budget.take(LIST_COST) {
+        return Ok(());
+    }
+    let described = backend.pool_instances().await?;
+    let claims = store::claims_by_bucket(db, now.saturating_sub(WINDOW_MS))
+        .await
+        .map_err(|err| err.to_string())?;
+    let demand = pool::demand(&claims);
+    let mut pass = PoolPass {
+        db,
+        backend,
+        budget,
+        now,
+        // Launch failures back off across the templates of one pass.
+        backoff: pool::backoff(),
+    };
+    for template in TEMPLATES {
+        let size = demand
+            .get(template.labels[0])
+            .map_or(0, |claims| pool_target(claims));
+        let held = pool::inventory(&described, template);
+        if let Err(err) = pass.keep(template, size, &held).await {
+            console_error!("reconcile: pool {}: {err}", template.labels[0]);
+        }
+    }
+    Ok(())
+}
+
+/// What the pools share in one pass.
+struct PoolPass<'a> {
+    db: &'a Db,
+    backend: &'a Backend,
+    budget: &'a Budget,
+    now: u64,
+    backoff: Backoff,
+}
+
+fn sql(err: &worker::Error) -> String {
+    err.to_string()
+}
+
+impl PoolPass<'_> {
+    /// One template's pool: restores it from its rows and what EC2
+    /// lists, resizes it, ends and stops what it says, launches what it
+    /// lacks, and saves it. An instance a job took meanwhile has lost its
+    /// row (and soon its pool tag): a row that cannot be deleted or moved
+    /// means it is the job's, and it is left alone.
+    async fn keep(
+        &mut self,
+        template: &'static Template,
+        size: u32,
+        held: &[Instance],
+    ) -> Result<(), String> {
+        let label = template.labels[0];
+        let now = self.now;
+        let rows = store::pool_rows(self.db, label)
+            .await
+            .map_err(|err| sql(&err))?;
+        if size == 0 && rows.is_empty() && held.is_empty() {
+            return Ok(());
+        }
+        let mut pool = Pool::restore(
+            pool::config(template, size),
+            rows.iter().filter_map(pool::instance),
+        );
+        pool.reconcile(held, &|_| false, now);
+        self.settle(template, &rows, held, &pool).await?;
+        let mut unchanged = Vec::new();
+        let starved = self.act(&mut pool, &mut unchanged).await?;
+        // A pool short of its size launches, unless something it was to
+        // end or stop is still there.
+        if !starved {
+            self.fill(template, &mut pool).await?;
+        }
+        let changed: Vec<_> = pool
+            .instances()
+            .iter()
+            .filter(|(id, _)| !unchanged.contains(id))
+            .map(|(id, pooled)| pool::row(template, id, pooled))
+            .filter(|row| !rows.contains(row))
+            .collect();
+        store::save_pool(self.db, label, &changed, &[])
+            .await
+            .map_err(|err| sql(&err))
+    }
+
+    /// Reconciles the rows with what EC2 lists: drops the rows whose
+    /// instance is gone, records a running instance no row knows (a lost
+    /// row), and ends a stopped one that is too old to be a job's.
+    async fn settle(
+        &self,
+        template: &'static Template,
+        rows: &[PoolRow],
+        held: &[Instance],
+        pool: &Pool,
+    ) -> Result<(), String> {
+        let label = template.labels[0];
+        for row in rows {
+            if !pool.instances().contains_key(&row.instance_id) {
+                store::drop_pool(self.db, &row.instance_id)
+                    .await
+                    .map_err(|err| sql(&err))?;
+            }
+        }
+        let recorded = |id: &str| rows.iter().any(|row| row.instance_id == id);
+        let unrecorded = pool::unrecorded(held, &recorded, self.now);
+        let adopted: Vec<_> = unrecorded
+            .running
+            .iter()
+            .map(|(id, launched_at)| {
+                let pooled = PoolInstance {
+                    state: PoolState::Warming,
+                    launched_at: *launched_at,
+                    since: *launched_at,
+                };
+                pool::row(template, id, &pooled)
+            })
+            .collect();
+        if !adopted.is_empty() {
+            store::save_pool(self.db, label, &[], &adopted)
+                .await
+                .map_err(|err| sql(&err))?;
+        }
+        for id in &unrecorded.stale {
+            if self.budget.take(TERMINATE_COST) {
+                console_log!("reconcile: terminating stale pool instance {id}");
+                self.backend.terminate(id).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends and stops what the pool's upkeep says. Each is done only when
+    /// the row says the instance is still the pool's. The ids of stops
+    /// that did not happen go to `unchanged`, so their rows are not
+    /// updated. Returns whether the budget left something undone.
+    async fn act(&self, pool: &mut Pool, unchanged: &mut Vec<String>) -> Result<bool, String> {
+        let mut starved = false;
+        for action in pool.upkeep(self.now) {
+            match action {
+                Action::Terminate { instance_id } => {
+                    if !self.budget.take(TERMINATE_COST) {
+                        starved = true;
+                    } else if store::drop_pool(self.db, &instance_id)
+                        .await
+                        .map_err(|err| sql(&err))?
+                    {
+                        console_log!("reconcile: ending pool instance {instance_id}");
+                        self.backend.terminate(&instance_id).await;
+                    } else {
+                        console_log!("reconcile: pool instance {instance_id} went to a job");
+                    }
+                }
+                Action::Stop { instance_id } => {
+                    unchanged.push(instance_id.clone());
+                    if !self.budget.take(STOP_COST) {
+                        starved = true;
+                    } else if self.stop(&instance_id).await? {
+                        unchanged.retain(|id| id != &instance_id);
+                    }
+                }
+                Action::Launch { .. } | Action::LaunchPool { .. } | Action::RemoveRunner { .. } => {
+                }
+            }
+        }
+        Ok(starved)
+    }
+
+    /// Stops a warmed-up instance. Returns whether it was stopped; the
+    /// row goes back to warming when EC2 refused, and is left alone when
+    /// the instance is not the pool's any more.
+    async fn stop(&self, instance_id: &str) -> Result<bool, String> {
+        let now = self.now;
+        if !store::move_pool(self.db, instance_id, "warming", "stopping", now)
+            .await
+            .map_err(|err| sql(&err))?
+        {
+            return Ok(false);
+        }
+        match self.backend.stop(instance_id).await {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                console_error!("reconcile: stop pool instance {instance_id}: {err}");
+                store::move_pool(self.db, instance_id, "stopping", "warming", now)
+                    .await
+                    .map_err(|err| sql(&err))?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Launches the instances a pool lacks, each saved as it starts. A
+    /// failed launch ends the pass for the pool: the rest would fail the
+    /// same way, and the next pass tries again.
+    async fn fill(&mut self, template: &'static Template, pool: &mut Pool) -> Result<(), String> {
+        let label = template.labels[0];
+        let now = self.now;
+        let mut names = pool::names(template);
+        for action in pool.refill(now, &self.backoff, &mut names) {
+            let Action::LaunchPool { name } = action else {
+                continue;
+            };
+            if !self.budget.take(POOL_LAUNCH_COST) {
+                break;
+            }
+            match self.backend.launch_pool(self.db, template, &name).await {
+                Ok(instance_id) => {
+                    pool.launched(&name, instance_id.clone(), now, &mut self.backoff);
+                    console_log!("reconcile: launched pool instance {instance_id} for {label}");
+                    if let Some(pooled) = pool.instances().get(&instance_id) {
+                        let launched = pool::row(template, &instance_id, pooled);
+                        store::save_pool(self.db, label, &[], &[launched])
+                            .await
+                            .map_err(|err| sql(&err))?;
+                    }
+                }
+                Err(failure) => {
+                    console_error!(
+                        "reconcile: launch pool instance {name}: {}",
+                        failure.message
+                    );
+                    pool.launch_failed(&name, now, &mut self.backoff);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Step 6. A sweep takes at most [`store::SWEEP_LIMIT`] runs and one
 /// subrequest each purges them, which `budget` covers.
 async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
     if budget.left() < store::SWEEP_LIMIT * PURGE_COST {
@@ -1164,6 +1418,7 @@ mod tests {
             launch_time: launched.into(),
             job_id: job.map(str::to_owned),
             runner_name: runner.map(str::to_owned),
+            pool: None,
         }
     }
 
@@ -1201,6 +1456,14 @@ mod tests {
                 "i-bad-time"
             ]
         );
+    }
+
+    #[test]
+    fn orphans_skip_pool_instances() {
+        let mut pooled = instance("i-pool", None, "2020-01-01T00:00:00Z");
+        pooled.pool = Some("ubuntu-latest".into());
+        let described = [pooled, instance("i-untagged", None, "2026-10-22T13:40:00Z")];
+        assert_eq!(orphans(&described, &[], NOW), ["i-untagged"]);
     }
 
     #[test]

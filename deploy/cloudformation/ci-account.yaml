@@ -250,16 +250,38 @@ Resources:
                 Condition:
                   StringEquals:
                     ec2:CreateAction: [RunInstances, CreateFleet]
-              # Ending a job's instance and turning its metadata off.
+              # Ending a job's instance, turning its metadata off, and
+              # the warm pool: stopping a warmed-up instance and, when a
+              # job takes it, setting its user data and starting it.
               - Sid: ManageOwnInstances
                 Effect: Allow
                 Action:
                   - ec2:TerminateInstances
                   - ec2:ModifyInstanceMetadataOptions
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:ModifyInstanceAttribute
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
                 Condition:
                   StringEquals:
                     aws:ResourceTag/hatchrun:tenant: hatchrun-ci
+              # A pool instance gets its job's tags and loses its pool tag
+              # when a job takes it. No other key can be set or removed.
+              - Sid: TagOwnInstances
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/hatchrun:tenant: hatchrun-ci
+                  ForAllValues:StringEquals:
+                    aws:TagKeys:
+                      - Name
+                      - hatchrun:job-id
+                      - hatchrun:runner-name
+                      - hatchrun:pool
 
 Outputs:
   RoleArn:

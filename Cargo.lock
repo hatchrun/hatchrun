@@ -1554,6 +1554,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hatchrun-cloud",
+ "hatchrun-scaler-core",
  "hatchrun-workflow",
  "hmac",
  "js-sys",
