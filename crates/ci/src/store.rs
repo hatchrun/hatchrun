@@ -210,12 +210,17 @@ const DELIVERY_SEEN: &str = "SELECT 1 AS seen FROM ci_deliveries WHERE guid = $1
 const RECORD_DELIVERY: &str = "INSERT INTO ci_deliveries (guid, event, received_at) \
      VALUES ($1, $2, $3) ON CONFLICT (guid) DO NOTHING";
 
-/// Records a run and takes its number in one statement. Binds
-/// `$1` tenant, `$2` repository, `$3` workflow, `$4` delivery, `$5`
-/// event, `$6` ref, `$7` sha, `$8` actor, `$9` now and `$10` the expiry.
-/// The number is taken only when no run of this delivery and workflow
-/// exists, so a duplicate leaves the counter alone, and the statement
-/// returns no row for it.
+/// Locks the row of repository `$1`, so runs of one repository are
+/// numbered one at a time. The statement after it in the transaction
+/// reads what the holder before it committed.
+const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE";
+
+/// Records a run and takes its number in one statement, run after
+/// [`LOCK_REPO`]. Binds `$1` tenant, `$2` repository, `$3` workflow,
+/// `$4` delivery, `$5` event, `$6` ref, `$7` sha, `$8` actor, `$9` now
+/// and `$10` the expiry. The number is taken only when no run of this
+/// delivery and workflow exists, so a duplicate leaves the counter
+/// alone, and the statement returns no row for it.
 const INSERT_RUN: &str = "WITH n AS (\
        INSERT INTO ci_run_numbers (repo_id, workflow, last) \
        SELECT $2, $3, 1 \
@@ -225,20 +230,20 @@ const INSERT_RUN: &str = "WITH n AS (\
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
        actor, status, created_at, updated_at, expires_at) \
      SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, 'queued', $9, $9, $10 FROM n \
-     ON CONFLICT (delivery, workflow) DO NOTHING \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
        ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at";
-
-/// Whether a run of delivery `$1` and workflow `$2` exists.
-const RUN_EXISTS: &str = "SELECT 1 AS seen FROM ci_runs WHERE delivery = $1 AND workflow = $2";
 
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
 
 /// Runs of repository `$1` newest first, those with an id below `$2`
-/// when it is set, at most `$3`.
+/// when it is set, at most `$3`. Only runs of the tenant that owns the
+/// repository now: after a transfer, the history stays with the tenant
+/// that owned the repository when the run happened.
 const RUNS_FOR_REPO: &str = "SELECT {columns} FROM ci_runs \
-     WHERE repo_id = $1 AND ($2::bigint IS NULL OR id < $2::bigint) \
+     WHERE repo_id = $1 \
+     AND tenant_id = (SELECT tenant_id FROM ci_repos WHERE id = $1) \
+     AND ($2::bigint IS NULL OR id < $2::bigint) \
      ORDER BY id DESC LIMIT $3";
 
 /// The jobs of run `$1` in plan order.
@@ -254,7 +259,8 @@ const JOB: &str = "SELECT {columns} FROM ci_jobs WHERE id = $1";
 
 /// Starts running job `$1` at `$2`, which is also its first heartbeat.
 const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2, \
-     heartbeat_at = $2, updated_at = $2 WHERE id = $1";
+     heartbeat_at = $2, updated_at = $2 \
+     WHERE id = $1 AND status IN ('launching', 'launched')";
 
 /// Sets job `$1` up for attempt `$2` at `$3`: nothing of the earlier
 /// attempt is left.
@@ -283,16 +289,19 @@ const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', \
 
 /// Records the instance `$2` of job `$1` at `$3`.
 const LAUNCHED: &str = "UPDATE ci_jobs SET status = 'launched', instance_id = $2, \
-     launch_error = NULL, next_launch_at = NULL, updated_at = $3 WHERE id = $1";
+     launch_error = NULL, next_launch_at = NULL, updated_at = $3 \
+     WHERE id = $1 AND status = 'launching'";
 
 /// Queues job `$1` again after a failed launch: error `$2`, not before
 /// `$3`, at `$4`.
 const LAUNCH_RETRY: &str = "UPDATE ci_jobs SET status = 'queued', launch_error = $2, \
-     next_launch_at = $3, updated_at = $4 WHERE id = $1";
+     next_launch_at = $3, updated_at = $4 \
+     WHERE id = $1 AND status = 'launching'";
 
 /// Fails job `$1` for good after a failed launch: error `$2`, at `$3`.
 const LAUNCH_GAVE_UP: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = 'failure', \
-     launch_error = $2, next_launch_at = NULL, completed_at = $3, updated_at = $3 WHERE id = $1";
+     launch_error = $2, next_launch_at = NULL, completed_at = $3, updated_at = $3 \
+     WHERE id = $1 AND status = 'launching'";
 
 /// Records the agent's heartbeat for job `$1` at `$2`.
 const HEARTBEAT: &str = "UPDATE ci_jobs SET heartbeat_at = $2, updated_at = $2 \
@@ -301,7 +310,8 @@ const HEARTBEAT: &str = "UPDATE ci_jobs SET heartbeat_at = $2, updated_at = $2 \
 /// Completes job `$1` with conclusion `$2`, steps `$3` (JSON text) and
 /// log key `$4` at `$5`.
 const FINISH_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = $2, \
-     steps = $3::jsonb, log_key = $4, completed_at = $5, updated_at = $5 WHERE id = $1";
+     steps = $3::jsonb, log_key = $4, completed_at = $5, updated_at = $5 \
+     WHERE id = $1 AND status <> 'completed'";
 
 /// Completes run `$1` with conclusion `$2` at `$3`.
 const FINISH_RUN: &str = "UPDATE ci_runs SET status = 'completed', conclusion = $2, \
@@ -420,28 +430,23 @@ pub async fn record_delivery(db: &Db, guid: &str, event: &str, now: u64) -> Resu
 ///
 /// Postgres refused the statement.
 pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>> {
-    let recorded = db
-        .first(
-            INSERT_RUN,
-            &params![
-                &run.tenant_id,
-                run.repo_id,
-                &run.workflow,
-                &run.delivery,
-                &run.event,
-                &run.git_ref,
-                &run.sha,
-                &run.actor,
-                run.now,
-                run.now + RETENTION_MS
-            ],
-        )
-        .await;
-    match recorded {
-        // Two deliveries of one event raced: the other one won.
-        Err(_) if exists(db, RUN_EXISTS, &params![&run.delivery, &run.workflow]).await? => Ok(None),
-        recorded => recorded,
-    }
+    db.first_locked(
+        (LOCK_REPO, &params![run.repo_id]),
+        INSERT_RUN,
+        &params![
+            &run.tenant_id,
+            run.repo_id,
+            &run.workflow,
+            &run.delivery,
+            &run.event,
+            &run.git_ref,
+            &run.sha,
+            &run.actor,
+            run.now,
+            run.now + RETENTION_MS
+        ],
+    )
+    .await
 }
 
 /// Records `jobs` of run `run_id` as waiting and returns each one's
@@ -570,14 +575,14 @@ pub async fn job(db: &Db, job_id: u64) -> Result<Option<JobRow>> {
 }
 
 /// Starts job `job_id`: running, with `now` as its start and first
-/// heartbeat.
+/// heartbeat. Only a job that is launching or launched starts; returns
+/// whether it did.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn start_job(db: &Db, job_id: u64, now: u64) -> Result<()> {
-    db.run(START_JOB, &params![job_id, now]).await?;
-    Ok(())
+pub async fn start_job(db: &Db, job_id: u64, now: u64) -> Result<bool> {
+    Ok(db.run(START_JOB, &params![job_id, now]).await? == 1)
 }
 
 /// Sets job `job_id` up for `attempt`: waiting, with nothing left of
@@ -649,19 +654,19 @@ pub async fn claim_launch(db: &Db, job_id: u64, now: u64) -> Result<Option<JobRo
     .await
 }
 
-/// Records the instance of job `job_id`: launched.
+/// Records the instance of job `job_id`: launched. Only a launching
+/// job takes it; returns whether it did.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn launched(db: &Db, job_id: u64, instance_id: &str, now: u64) -> Result<()> {
-    db.run(LAUNCHED, &params![job_id, instance_id, now]).await?;
-    Ok(())
+pub async fn launched(db: &Db, job_id: u64, instance_id: &str, now: u64) -> Result<bool> {
+    Ok(db.run(LAUNCHED, &params![job_id, instance_id, now]).await? == 1)
 }
 
 /// Records that a launch of job `job_id` failed with `error`. With
 /// `retry_at` the job is queued again, not before then; without it the
-/// job fails.
+/// job fails. Only a launching job changes; returns whether it did.
 ///
 /// # Errors
 ///
@@ -672,15 +677,15 @@ pub async fn launch_failed(
     error: &str,
     retry_at: Option<u64>,
     now: u64,
-) -> Result<()> {
-    match retry_at {
+) -> Result<bool> {
+    let changed = match retry_at {
         Some(at) => {
             db.run(LAUNCH_RETRY, &params![job_id, error, at, now])
                 .await?
         }
         None => db.run(LAUNCH_GAVE_UP, &params![job_id, error, now]).await?,
     };
-    Ok(())
+    Ok(changed == 1)
 }
 
 /// Records the agent's heartbeat for job `job_id`.
@@ -694,7 +699,8 @@ pub async fn heartbeat(db: &Db, job_id: u64, now: u64) -> Result<()> {
 }
 
 /// Completes job `job_id` with its `conclusion`, `steps` and the key of
-/// its finished log.
+/// its finished log. A completed job keeps what it has; returns whether
+/// this call completed it.
 ///
 /// # Errors
 ///
@@ -706,13 +712,14 @@ pub async fn finish_job(
     steps: &serde_json::Value,
     log_key: Option<&str>,
     now: u64,
-) -> Result<()> {
-    db.run(
-        FINISH_JOB,
-        &params![job_id, conclusion, steps.to_string(), log_key, now],
-    )
-    .await?;
-    Ok(())
+) -> Result<bool> {
+    let changed = db
+        .run(
+            FINISH_JOB,
+            &params![job_id, conclusion, steps.to_string(), log_key, now],
+        )
+        .await?;
+    Ok(changed == 1)
 }
 
 /// Completes run `run_id` with its `conclusion`.
@@ -933,6 +940,55 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_duplicates_use_up_one_number() {
+        let db = setup();
+        let config: tokio_postgres::Config = hatchrun_cloud::testdb::url().parse().unwrap();
+        let second = db.connect(&config);
+        let first = new_run("same", "ci", 5);
+        let other = new_run("same", "ci", 5);
+        let (a, b) = db.wait(async {
+            futures_util::join!(insert_run(db.db(), &first), insert_run(&second, &other))
+        });
+        let recorded = [a.unwrap(), b.unwrap()];
+        assert_eq!(recorded.iter().flatten().count(), 1);
+        let next = db
+            .wait(insert_run(db.db(), &new_run("next", "ci", 6)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.run_number, 2);
+    }
+
+    #[test]
+    fn a_transferred_repo_keeps_its_history_with_the_old_tenant() {
+        let db = setup();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 100, 0, 0)",
+            &[],
+        );
+        let before = db
+            .wait(insert_run(db.db(), &new_run("old", "ci", 5)))
+            .unwrap()
+            .unwrap();
+        let mut moved = db.wait(repo(db.db(), 7)).unwrap().unwrap();
+        moved.tenant_id = "t2".into();
+        moved.installation_id = 100;
+        db.wait(upsert_repo(db.db(), &moved, 6)).unwrap();
+        assert_eq!(
+            db.wait(runs_for_repo(db.db(), 7, None, 10)).unwrap().len(),
+            0
+        );
+        let mut mine = new_run("new", "ci", 7);
+        mine.tenant_id = "t2".into();
+        let after = db.wait(insert_run(db.db(), &mine)).unwrap().unwrap();
+        let seen = db.wait(runs_for_repo(db.db(), 7, None, 10)).unwrap();
+        assert_eq!(seen.iter().map(|r| r.id).collect::<Vec<_>>(), [after.id]);
+        // The old run is still there, under its own tenant.
+        let old = db.wait(run(db.db(), before.id)).unwrap().unwrap();
+        assert_eq!(old.tenant_id, "t1");
+    }
+
+    #[test]
     fn jobs_come_back_in_plan_order() {
         let db = setup();
         let run = db
@@ -993,6 +1049,75 @@ mod tests {
         assert_eq!(job_row.status, "completed");
         assert_eq!(job_row.conclusion.as_deref(), Some("failure"));
         assert_eq!(job_row.completed_at, Some(40));
+    }
+
+    #[test]
+    fn late_calls_leave_a_completed_job_alone() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "queued");
+        db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        assert!(db.wait(launched(db.db(), job_id, "i-1", 11)).unwrap());
+        assert!(db.wait(start_job(db.db(), job_id, 12)).unwrap());
+        let steps = serde_json::json!([{"name": "first"}]);
+        assert!(
+            db.wait(finish_job(
+                db.db(),
+                job_id,
+                "success",
+                &steps,
+                Some("k1"),
+                20
+            ))
+            .unwrap()
+        );
+        let late = serde_json::json!([{"name": "late"}]);
+        assert!(
+            !db.wait(finish_job(
+                db.db(),
+                job_id,
+                "failure",
+                &late,
+                Some("k2"),
+                30
+            ))
+            .unwrap()
+        );
+        assert!(!db.wait(start_job(db.db(), job_id, 31)).unwrap());
+        assert!(!db.wait(launched(db.db(), job_id, "i-2", 32)).unwrap());
+        assert!(
+            !db.wait(launch_failed(db.db(), job_id, "late", Some(900), 33))
+                .unwrap()
+        );
+        assert!(
+            !db.wait(launch_failed(db.db(), job_id, "late", None, 34))
+                .unwrap()
+        );
+        db.wait(heartbeat(db.db(), job_id, 40)).unwrap();
+        let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.conclusion.as_deref(), Some("success"));
+        assert_eq!(row.steps, steps);
+        assert_eq!(row.log_key.as_deref(), Some("k1"));
+        assert_eq!(row.instance_id.as_deref(), Some("i-1"));
+        assert_eq!(
+            (row.completed_at, row.heartbeat_at, row.next_launch_at),
+            (Some(20), Some(12), None)
+        );
+        assert_eq!(db.wait(open_jobs(db.db(), 10)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_launch_result_for_a_job_that_is_not_launching_changes_nothing() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "queued");
+        assert!(!db.wait(launched(db.db(), job_id, "i-1", 11)).unwrap());
+        assert!(
+            !db.wait(launch_failed(db.db(), job_id, "e", None, 12))
+                .unwrap()
+        );
+        assert!(!db.wait(start_job(db.db(), job_id, 13)).unwrap());
+        let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+        assert_eq!(row.status, "queued");
     }
 
     #[test]
