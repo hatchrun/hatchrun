@@ -3,7 +3,7 @@ name: deploy-ci
 # Deploys crates/ci, the hatchrun-ci Worker at ci.hatchrun.io that runs
 # hatchrun CI jobs, from main. It shares the database with hatchrun-cloud,
 # so this workflow applies the migrations too, as the owner role in
-# DATABASE_MIGRATE_URL, and it sets the 30 day retention of the
+# DATABASE_MIGRATE_URL, and it sets the 30 and 90 day retention of the
 # hatchrun-ci-logs bucket. The account comes from the
 # CLOUDFLARE_ACCOUNT_ID secret.
 #
@@ -19,6 +19,12 @@ name: deploy-ci
 # Its CI_ROLE_ARN, CI_LAUNCH_TEMPLATE_ID and CI_SUBNET_IDS repository
 # variables are the RoleArn, LaunchTemplateId and SubnetIds outputs of
 # the stack in deploy/cloudformation/ci-account.yaml.
+#
+# Polar setting the CI checkout depends on: turn on "Allow multiple
+# subscriptions per customer" in the Polar organization's settings
+# (sandbox and production) before the first deploy. A tenant is one Polar
+# customer for both products, and without the setting an organization that
+# pays for hatchrun.io runners cannot complete the CI checkout.
 
 on:
   push:
@@ -119,7 +125,8 @@ jobs:
           test -n "$DATABASE_MIGRATE_URL"
           ../cloud/scripts/migrate.sh
 
-      # Objects under logs/ and state/ expire after 30 days. The rules
+      # Objects under logs/ and state/ expire after 30 or 90 days, by the
+      # prefix of the tenant's tier (logs/30d/, logs/90d/). The rules
       # replace the bucket's whole lifecycle, so r2-lifecycle.json is
       # all of it.
       - name: Set the log retention
@@ -141,6 +148,7 @@ jobs:
           OIDC_SIGNING_KEY: ${{ secrets.OIDC_SIGNING_KEY }}
           BROKER_TOKEN: ${{ secrets.BROKER_TOKEN }}
           CI_TOKEN_KEY: ${{ secrets.CI_TOKEN_KEY }}
+          POLAR_ACCESS_TOKEN: ${{ secrets.POLAR_ACCESS_TOKEN }}
           CI_ROLE_ARN: ${{ vars.CI_ROLE_ARN }}
           CI_LAUNCH_TEMPLATE_ID: ${{ vars.CI_LAUNCH_TEMPLATE_ID }}
           CI_SUBNET_IDS: ${{ vars.CI_SUBNET_IDS }}
@@ -149,7 +157,7 @@ jobs:
           trap 'rm -f "$secrets"' EXIT
           (umask 077 && jq -n 'env | with_entries(select(
               (.key | IN("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_PRIVATE_KEY", "OIDC_SIGNING_KEY",
-                         "BROKER_TOKEN", "CI_TOKEN_KEY"))
+                         "BROKER_TOKEN", "CI_TOKEN_KEY", "POLAR_ACCESS_TOKEN"))
               and .value != ""))' > "$secrets")
           echo "Uploading secrets: $(jq -r 'keys | join(", ")' "$secrets")"
           npx --yes "$WRANGLER" deploy --secrets-file "$secrets" \

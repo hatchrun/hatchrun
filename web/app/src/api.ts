@@ -665,3 +665,74 @@ export interface DispatchRequest {
 /** Starts a workflow by hand; answers the ids of the runs it started. */
 export const dispatchWorkflow = (owner: string, repo: string, body: DispatchRequest) =>
   post<{ runs: number[] }>(`${repoPath(owner, repo)}/dispatch`, body);
+
+/** What /api/ci/orgs/:org/billing answers. */
+export interface CiBilling {
+  /** Whether a card is on file. */
+  card: boolean;
+  /** Runner minutes used this month, of every template. */
+  minutes: number;
+  /** Billing units used this month; a 2 vCPU minute is one unit. */
+  units: number;
+  freeUnits: number;
+  /** This month's cost past the free units, in cents. */
+  spendCents: number;
+  /** The monthly spend cap, in whole dollars. */
+  capDollars: number;
+  /** The range the cap can be set within, in whole dollars. */
+  minCapDollars: number;
+  maxCapDollars: number;
+  running: number;
+  maxRunning: number;
+}
+
+const orgCiPath = (org: string) => `/api/ci/orgs/${encodeURIComponent(org)}`;
+
+/** The settings routes answer 404 to a caller who is no admin; say so. */
+const NOT_ADMIN = "Only organization or repository admins can change these settings.";
+
+async function adminOnly<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) {
+      throw new ApiError(404, NOT_ADMIN);
+    }
+    throw err;
+  }
+}
+
+export const getCiBilling = (org: string) => adminOnly(() => get<CiBilling>(`${orgCiPath(org)}/billing`));
+export const startCiCheckout = (org: string) =>
+  adminOnly(() => post<{ url: string }>(`${orgCiPath(org)}/billing/checkout`));
+export const openCiPortal = (org: string) =>
+  adminOnly(() => post<{ url: string }>(`${orgCiPath(org)}/billing/portal`));
+export const setCiCap = (org: string, capDollars: number) =>
+  adminOnly(() => put<undefined>(`${orgCiPath(org)}/billing/cap`, { capDollars }));
+
+/** Whose secrets and variables: an organization's, or one repository's. */
+export type CiScope = { org: string } | { owner: string; repo: string };
+
+export type CiItemKind = "secrets" | "vars";
+
+const scopePath = (scope: CiScope) => ("org" in scope ? orgCiPath(scope.org) : repoPath(scope.owner, scope.repo));
+
+/** A secret as listed: never its value. Times are Unix milliseconds. */
+export interface CiSecret {
+  name: string;
+  updatedAt: number;
+}
+
+export interface CiVar extends CiSecret {
+  value: string;
+}
+
+export const listCiSecrets = (scope: CiScope) => adminOnly(() => get<CiSecret[]>(`${scopePath(scope)}/secrets`));
+export const listCiVars = (scope: CiScope) => adminOnly(() => get<CiVar[]>(`${scopePath(scope)}/vars`));
+
+/** Sets or replaces one secret or variable; the API uppercases the name. */
+export const putCiItem = (scope: CiScope, kind: CiItemKind, name: string, value: string) =>
+  adminOnly(() => put<undefined>(`${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`, { value }));
+
+export const deleteCiItem = (scope: CiScope, kind: CiItemKind, name: string) =>
+  adminOnly(() => request<undefined>("DELETE", `${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`));

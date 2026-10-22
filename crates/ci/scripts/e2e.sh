@@ -12,15 +12,36 @@
 # What it starts, all on 127.0.0.1:
 #
 # - Postgres 17 in Docker on 55432 (E2E_PG_PORT), unless E2E_DATABASE_URL names one;
-# - hatchrun-ci-dev fake-github on 9101 and launcher on 9102;
+# - hatchrun-ci-dev fake-github on 9101, which also answers Polar's
+#   calls, and launcher on 9102;
 # - wrangler dev for crates/broker on 8789 and for crates/ci on 8788,
-#   the latter built with the local launcher.
+#   the latter built with the local launcher and run from a copy of its
+#   wrangler.toml, crates/ci/wrangler.e2e.toml, whose Secrets Store
+#   binding names a local store that holds the key for CI secrets.
 #
-# Scenarios: a push to main runs build then test, both pass, and the
-# log and step index land in R2; a push to fail runs a job that fails;
-# a push to slow runs a job the script cancels; a re-run request for
-# the failed job runs it again. Every instance must have had its
-# metadata turned off, and the change seen applied, before its job ran.
+# Scenarios, in order:
+#
+# - a push to main runs build then test, both pass, and the log and
+#   step index land in R2;
+# - a push to fail runs a job that fails;
+# - a re-run request for the failed job runs it again;
+# - a push to slow runs a job the script cancels;
+# - a repository secret is set through the API, then a push to arm runs
+#   a job on the ubuntu-26.04-arm template that echoes it;
+# - that job's log in R2 shows the secret masked, and its value is in
+#   no R2 object, Durable Object, KV entry, Worker log or fake GitHub
+#   state, nor in the sealed row;
+# - a push to bad fails the workflow whose runs-on names no template,
+#   with a check run that says so, and runs the other workflow;
+# - a push to wide runs six jobs: five at once, the sixth held with a
+#   check run that says why until one ends; the fake Polar then holds a
+#   usage event for each;
+# - a tenant whose CI subscription was canceled gets one billing check
+#   run and no run, and can start a checkout; a tenant that never
+#   subscribed gets nothing, and its config is not read.
+#
+# Every instance must have had its metadata turned off, and the change
+# seen applied, before its job ran.
 #
 # Needs docker (or E2E_DATABASE_URL and psql), cargo, node 22 or later,
 # openssl, curl and jq. Everything started is stopped on exit. On
@@ -45,6 +66,14 @@ BROKER="http://127.0.0.1:${BROKER_PORT}"
 APP_URL="http://127.0.0.1:5173"
 TENANT="e2etenant0000001"
 INSTALLATION=42
+# Installation 43: a tenant whose CI subscription was canceled.
+# Installation 44: a tenant that never subscribed to CI.
+LAPSED_TENANT="e2etenant0000002"
+NEVER_TENANT="e2etenant0000003"
+POLAR_TOKEN="e2e-polar-token"
+CI_PRODUCT="e2e-ci-product"
+# The local Secrets Store that holds the key behind CI_SECRETS_KEY.
+STORE_ID="e2e00000000000000000000000000000"
 WEBHOOK_SECRET="e2e-webhook-secret"
 BROKER_TOKEN="e2e-broker-token"
 TOKEN_KEY="e2e-job-token-key"
@@ -60,6 +89,7 @@ logs="$tmp/logs"
 mkdir -p "$logs"
 pids=()
 container=""
+e2e_config="$root/crates/ci/wrangler.e2e.toml"
 
 log() { echo "e2e: $*" >&2; }
 
@@ -120,6 +150,7 @@ cleanup() {
     done
   fi
   rm -rf "$tmp"
+  rm -f "$e2e_config"
   if [[ $status -ne 0 ]]; then
     exit 1
   fi
@@ -197,8 +228,16 @@ DATABASE_MIGRATE_URL="$migrate_url" crates/cloud/scripts/migrate.sh >"$logs/migr
   die "migrations failed: $(cat "$logs/migrate.log")"
 now_ms=$(($(date +%s) * 1000))
 psql_run <<SQL
-INSERT INTO tenants (id, org_id, org_login, installation_id, ci_enabled, created_at, updated_at)
-VALUES ('$TENANT', 1, 'e2e', $INSTALLATION, true, $now_ms, $now_ms);
+INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at)
+VALUES ('$TENANT', 1, 'e2e', $INSTALLATION, $now_ms, $now_ms),
+       ('$LAPSED_TENANT', 2, 'e2e2', 43, $now_ms, $now_ms),
+       ('$NEVER_TENANT', 3, 'e2e3', 44, $now_ms, $now_ms);
+INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, product,
+                           cancel_at_period_end, modified_at, updated_at)
+VALUES ('sub-e2e', '$TENANT', 'active', 'cus-e2e', '$CI_PRODUCT', 'ci', false,
+        '2026-01-01T00:00:00Z', $now_ms),
+       ('sub-e2e2', '$LAPSED_TENANT', 'canceled', 'cus-e2e2', '$CI_PRODUCT', 'ci', false,
+        '2026-01-01T00:00:00Z', $now_ms);
 SQL
 
 # 2. Binaries and keys.
@@ -239,7 +278,23 @@ start launcher env RUST_LOG="${RUST_LOG:-info,hatchrun_agent=debug}" "$dev" laun
   echo "CI_TOKEN_KEY=\"$TOKEN_KEY\""
   printf 'GITHUB_APP_PRIVATE_KEY="%s"\n' "$key"
   printf 'OIDC_SIGNING_KEY="%s"\n' "$key"
+  echo "POLAR_ACCESS_TOKEN=\"$POLAR_TOKEN\""
 } >"$tmp/ci.env"
+
+# The key behind the CI_SECRETS_KEY binding. crates/ci/wrangler.toml
+# names the account's store, which the owner fills in; the copy names a
+# fixed local store instead, and the key goes in wrangler's local
+# Secrets Store under that id and the binding's secret name, in the
+# state directory hatchrun-ci's wrangler dev is given with --persist-to.
+secret_name="$(sed -n 's/^secret_name = "\(.*\)"$/\1/p' "$root/crates/ci/wrangler.toml")"
+[[ -n "$secret_name" ]] || die "no secrets store binding in crates/ci/wrangler.toml"
+sed "s/^store_id = \".*\"$/store_id = \"$STORE_ID\"/" "$root/crates/ci/wrangler.toml" >"$e2e_config"
+grep -q "^store_id = \"$STORE_ID\"$" "$e2e_config" || die "no store_id in crates/ci/wrangler.toml"
+log "creating the local secrets store key"
+(cd "$root/crates/ci" && npx --yes "$WRANGLER" secrets-store secret create "$STORE_ID" \
+  --name "$secret_name" --value "$(openssl rand -base64 32)" --scopes workers \
+  --persist-to "$tmp/ci-state") >"$logs/secrets-store.log" 2>&1 ||
+  die "creating the local secrets store key failed: $(cat "$logs/secrets-store.log")"
 
 log "starting wrangler dev for the broker and hatchrun-ci (the first build takes a while)"
 start broker env -C "$root/crates/broker" npx --yes "$WRANGLER" dev --local \
@@ -251,7 +306,7 @@ start ci env -C "$root/crates/ci" \
   RUSTFLAGS="--cfg hatchrun_local_launcher" \
   CARGO_TARGET_DIR="$target_dir/e2e" \
   CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="$database_url" \
-  npx --yes "$WRANGLER" dev --local \
+  npx --yes "$WRANGLER" dev -c wrangler.e2e.toml --local \
   --ip 127.0.0.1 --port "$CI_PORT" --inspector-port 9231 \
   --persist-to "$tmp/ci-state" --env-file "$tmp/ci.env" --show-interactive-dev-session=false \
   --test-scheduled \
@@ -263,7 +318,11 @@ start ci env -C "$root/crates/ci" \
   --var CI_URL:"$CI" \
   --var APP_URL:"$APP_URL" \
   --var GITHUB_APP_ID:Iv1e2e \
-  --var OIDC_KEY_ID:e2e
+  --var OIDC_KEY_ID:e2e \
+  --var POLAR_API_URL:"$GITHUB" \
+  --var POLAR_CI_PRODUCT_ID:"$CI_PRODUCT" \
+  --var CI_SECRETS_KEY_ID:e2e \
+  --var CI_SECRETS_KEY_OLD_ID:""
 
 wait_http "$GITHUB/_state" 30 "fake-github"
 wait_http "$LAUNCHER/_events" 30 "the launcher"
@@ -485,10 +544,183 @@ live_type events | jq -se 'map(.events[]) | any(.type == "step_finished")' >/dev
   die "the live socket got no step end: $(cat "$logs/live.log")"
 log "cancel: the job was cancelled"
 
-# Five instances: build, test, broken twice and sleeper. Wait for the
-# last agent to exit.
+# A request from the app, signed in, with the CSRF token. Prints the
+# status; the body goes to $tmp/answer. $3, when set, is the body.
+app_call() {
+  local method=$1 path=$2 body=${3-}
+  local args=(-sS -o "$tmp/answer" -w '%{http_code}' -X "$method" "$CI/api/ci/$path"
+    -H "Origin: $APP_URL"
+    -H "Cookie: __Host-hatchrun_session=$cookie"
+    -H "X-CSRF-Token: $csrf")
+  if [[ -n "$body" ]]; then
+    printf '%s' "$body" | curl "${args[@]}" -H "Content-Type: application/json" --data-binary @-
+  else
+    curl "${args[@]}"
+  fi
+}
+
+# Waits until job $2 of run $1 has its log in R2 and prints the log.
+r2_log() {
+  local run=$1 name=$2 job deadline
+  job="$(job_id "$run" "$name")"
+  deadline=$((SECONDS + 60))
+  until curl -fsS -o /dev/null "$CI/api/ci/jobs/$job/log/index" 2>/dev/null; do
+    ((SECONDS < deadline)) || die "job $job ($name) has no log index"
+    sleep 1
+  done
+  curl -fsS --compressed "$CI/api/ci/jobs/$job/log"
+}
+
+# Scenario: a repository secret is set, then a push to arm runs a job
+# on the arm64 template that echoes it.
+secret="e2e-secret-$(openssl rand -hex 8)"
+status="$(app_call PUT repos/e2e/demo/secrets/E2E_SECRET "$(jq -nc --arg value "$secret" '{value: $value}')")"
+[[ "$status" == 204 ]] || die "setting the secret answered $status: $(cat "$tmp/answer")"
+arm_sha="$(printf 'd%.0s' $(seq 40))"
+arm_run="$(push arm "$arm_sha")"
+log "push to arm started run $arm_run"
+wait_checks "$arm_sha" 1 'all(.status == "completed")'
+arm="$(check_of "$arm_sha" "arm / arm-hello")"
+[[ "$(jq -r .conclusion <<<"$arm")" == success ]] || die "arm / arm-hello: $arm"
+curl -fsS "$LAUNCHER/_events" | jq -e 'any(.[]; startswith("launch ") and endswith(" ubuntu-26.04-arm"))' >/dev/null ||
+  die "no launch on ubuntu-26.04-arm: $(curl -fsS "$LAUNCHER/_events")"
+log "arm: the job ran on ubuntu-26.04-arm and passed"
+
+# Scenario: the secret is masked in the log and stored nowhere in the
+# clear. R2 keeps logs gzipped, so gzipped files are searched unpacked.
+r2_log "$arm_run" arm-hello >"$tmp/arm.log"
+grep -qxF 'secret is ***' "$tmp/arm.log" || die "the log lacks the masked secret: $(head -c 2000 "$tmp/arm.log")"
+curl -fsS "$GITHUB/_state" >"$logs/github-state.json"
+if grep -rlF -- "$secret" "$tmp/ci-state" "$logs" "$tmp/arm.log" >&2; then
+  die "the secret's value is in the files above"
+fi
+while IFS= read -r -d '' file; do
+  if [[ "$(head -c 2 "$file" | od -An -tx1 | tr -d ' \n')" == 1f8b ]] &&
+    gzip -dc <"$file" 2>/dev/null | grep -qF -- "$secret"; then
+    die "the secret's value is in $file, gzipped"
+  fi
+done < <(find "$tmp/ci-state" -type f -print0)
+sealed="$(psql_run -At <<SQL
+SELECT count(*) FILTER (WHERE strpos(sealed, '$secret') > 0) || ' ' || count(*)
+FROM ci_secrets WHERE tenant_id = '$TENANT' AND repo_id = 1001 AND name = 'E2E_SECRET';
+SQL
+)"
+[[ "$sealed" == "0 1" ]] || die "the sealed secret row: $sealed (rows holding the value, rows)"
+log "secret: masked in the log, in the clear nowhere"
+
+# Scenario: a push to bad fails the workflow whose runs-on names no
+# template and runs the other one.
+bad_sha="$(printf 'e%.0s' $(seq 40))"
+bad_run="$(push bad "$bad_sha")"
+log "push to bad started run $bad_run"
+wait_checks "$bad_sha" 2 'all(.status == "completed")'
+bad="$(check_of "$bad_sha" "bad / config")"
+[[ "$(jq -r .conclusion <<<"$bad")" == failure ]] || die "bad / config: $bad"
+jq -e '.summary // "" | contains("names no runner template; use one of ubuntu-latest")' <<<"$bad" >/dev/null ||
+  die "bad / config does not name the templates: $bad"
+bad_ok="$(check_of "$bad_sha" "bad-ok / bad-ok-hello")"
+[[ "$(jq -r .conclusion <<<"$bad_ok")" == success ]] || die "bad-ok / bad-ok-hello: $bad_ok"
+log "bad: the bad label failed its workflow, the other one passed"
+
+# Scenario: a push to wide runs six jobs, one more than run at once.
+# The sixth waits with a check run that says why, and starts once one
+# of the five ends and the reconciler wakes it.
+wide_sha="$(printf 'f%.0s' $(seq 40))"
+wide_run="$(push wide "$wide_sha")"
+log "push to wide started run $wide_run"
+deadline=$((SECONDS + POLL_SECS))
+until api "runs/$wide_run" >"$tmp/wide.json" && jq -e '
+  [.jobs[] | select(.status == "launching" or .status == "launched" or .status == "running")] | length == 5
+' "$tmp/wide.json" >/dev/null; do
+  ((SECONDS < deadline)) || die "wide never had five jobs running: $(api "runs/$wide_run")"
+  sleep 1
+done
+jq -e '[.jobs[] | select(.status == "queued")] | length == 1' "$tmp/wide.json" >/dev/null ||
+  die "wide should have one job queued: $(cat "$tmp/wide.json")"
+held="$(jq -r '.jobs[] | select(.status == "queued") | .plan_id' "$tmp/wide.json")"
 deadline=$((SECONDS + 60))
-until curl -fsS "$LAUNCHER/_events" | jq -e '[.[] | select(startswith("exit "))] | length >= 5' >/dev/null; do
+until check_of "$wide_sha" "wide / $held" |
+  jq -e '.summary // "" | contains("has 5 jobs running, the most at once")' >/dev/null; do
+  ((SECONDS < deadline)) || die "the held job's check run does not say why: $(check_of "$wide_sha" "wide / $held")"
+  sleep 1
+done
+log "wide: five jobs run, $held waits"
+deadline=$((SECONDS + POLL_SECS))
+until api "runs/$wide_run" | jq -e --arg id "$held" \
+  '.jobs[] | select(.plan_id == $id) | .status == "running" or .status == "completed"' >/dev/null; do
+  ((SECONDS < deadline)) || die "$held never ran: $(api "runs/$wide_run")"
+  curl -fsS -o /dev/null "$CI/__scheduled?cron=*+*+*+*+*" || die "the reconciler pass failed"
+  sleep 3
+done
+wait_checks "$wide_sha" 6 'all(.status == "completed" and .conclusion == "success")'
+log "wide: all six passed"
+# Each completed job's minutes go to Polar, keyed by job and attempt,
+# on a reconciler pass.
+usage_ids="$(api "runs/$wide_run" | jq -c '[.jobs[] | "ci:\(.id):1"]')"
+deadline=$((SECONDS + 60))
+until curl -fsS "$GITHUB/_state" | jq -e --argjson ids "$usage_ids" --arg tenant "$TENANT" '
+  [.polar_events[] | select(.name == "ci.usage" and .external_customer_id == $tenant
+    and .metadata.template == "ubuntu-latest" and .metadata.units >= 1) | .external_id] as $sent
+  | all($ids[]; . as $id | $sent | index([$id]))
+' >/dev/null; do
+  ((SECONDS < deadline)) || die "Polar lacks usage for $usage_ids: $(curl -fsS "$GITHUB/_state" | jq -c .polar_events)"
+  curl -fsS -o /dev/null "$CI/__scheduled?cron=*+*+*+*+*" || die "the reconciler pass failed"
+  sleep 2
+done
+log "wide: Polar has the usage of all six"
+
+# Scenario: a tenant whose CI subscription was canceled gets one billing
+# check run for a push and nothing runs; a tenant that never subscribed
+# gets nothing at all, not even a config read.
+tenant_push() {
+  local installation=$1 org=$2 org_id=$3 repo_id=$4 sha=$5
+  jq -c --arg sha "$sha" --arg org "$org" \
+    --argjson installation "$installation" --argjson org_id "$org_id" --argjson repo_id "$repo_id" '
+    .after = $sha
+    | .installation.id = $installation
+    | .repository.id = $repo_id
+    | .repository.full_name = "\($org)/demo"
+    | .repository.owner = { login: $org, id: $org_id }
+  ' "$fixtures/push.json"
+}
+lapsed_sha="$(printf '1%.0s' $(seq 40))"
+deliver push "$(tenant_push 43 e2e2 2 2001 "$lapsed_sha")" 202 | jq -e '.runs == []' >/dev/null ||
+  die "the lapsed tenant's push started a run: $(cat "$tmp/answer")"
+wait_checks "$lapsed_sha" 1 \
+  'all(.name == "hatchrun / billing" and .status == "completed" and .conclusion == "action_required")'
+runs_2001="$(psql_run -At -c "SELECT count(*) FROM ci_runs WHERE repo_id = 2001")"
+[[ "$runs_2001" == 0 ]] || die "the lapsed tenant has $runs_2001 runs"
+never_sha="$(printf '2%.0s' $(seq 40))"
+deliver push "$(tenant_push 44 e2e3 3 3001 "$never_sha")" 200 | jq -e '.ignored' >/dev/null ||
+  die "the never subscribed tenant's push was not ignored: $(cat "$tmp/answer")"
+curl -fsS "$GITHUB/_state" >"$tmp/state.json"
+jq -e --arg sha "$never_sha" '[.check_runs[] | select(.head_sha == $sha)] | length == 0' "$tmp/state.json" >/dev/null ||
+  die "the never subscribed tenant got check runs: $(checks "$never_sha")"
+jq -e '(.contents | index("e2e3/demo")) == null and (.contents | index("e2e2/demo")) != null' \
+  "$tmp/state.json" >/dev/null || die "config reads: $(jq -c .contents "$tmp/state.json")"
+# The card state as the billing page reads it, and a checkout for the
+# lapsed tenant, from the fake Polar.
+# Whether the last app_call answered status $1 with a body that jq
+# filter $2 holds for.
+answered() {
+  local want=$1
+  shift
+  [[ "$status" == "$want" ]] && jq -e "$@" "$tmp/answer" >/dev/null
+}
+status="$(app_call GET orgs/e2e/billing)"
+answered 200 '.card == true' || die "the billing view of e2e answered $status: $(cat "$tmp/answer")"
+status="$(app_call GET orgs/e2e2/billing)"
+answered 200 '.card == false' || die "the billing view of e2e2 answered $status: $(cat "$tmp/answer")"
+status="$(app_call POST orgs/e2e2/billing/checkout)"
+answered 200 ".url == \"https://polar.invalid/checkout/$LAPSED_TENANT\"" ||
+  die "the checkout of e2e2 answered $status: $(cat "$tmp/answer")"
+log "billing: the lapsed tenant was asked for a card, the other one ignored"
+
+# Thirteen instances: build, test, broken twice, sleeper, arm-hello,
+# bad-ok-hello and the six naps. Wait for the last agent to exit.
+launches=13
+deadline=$((SECONDS + 60))
+until curl -fsS "$LAUNCHER/_events" | jq -e --argjson n "$launches" '[.[] | select(startswith("exit "))] | length >= $n' >/dev/null; do
   ((SECONDS < deadline)) || die "agents still running: $(curl -fsS "$LAUNCHER/_events")"
   sleep 1
 done
@@ -500,7 +732,7 @@ curl -fsS "$LAUNCHER/_events" >"$tmp/events.json"
 jq -e '
   def at($e): (index([$e]) // -1);
   . as $ev
-  | [$ev[] | select(startswith("launch ")) | ltrimstr("launch ")] as $ids
+  | [$ev[] | select(startswith("launch ")) | split(" ")[1]] as $ids
   | ($ids | length) > 0
     and all($ids[]; . as $id
       | ($ev | at("metadata-off " + $id)) as $off
@@ -511,10 +743,14 @@ jq -e '
 # Exit codes: 0 for passing jobs, 1 for the failed and cancelled ones.
 jq -e '[.[] | select(startswith("exit ")) | split(" ")[2]] | all(. == "0" or . == "1")' \
   "$tmp/events.json" >/dev/null || die "an agent exited badly: $(cat "$tmp/events.json")"
-[[ "$(jq '[.[] | select(startswith("launch "))] | length' "$tmp/events.json")" == 5 ]] ||
-  die "expected 5 launches: $(cat "$tmp/events.json")"
-jq -e '[.[] | select(endswith(" 0") and startswith("exit "))] | length == 2' "$tmp/events.json" >/dev/null ||
-  die "expected the two main jobs to exit 0: $(cat "$tmp/events.json")"
+[[ "$(jq '[.[] | select(startswith("launch "))] | length' "$tmp/events.json")" == "$launches" ]] ||
+  die "expected $launches launches: $(cat "$tmp/events.json")"
+jq -e '[.[] | select(endswith(" 0") and startswith("exit "))] | length == 10' "$tmp/events.json" >/dev/null ||
+  die "expected the ten passing jobs to exit 0: $(cat "$tmp/events.json")"
+# The App's permissions are read once per installation and kept in KV,
+# so the claims did not each read them.
+reads="$(curl -fsS "$GITHUB/_state" | jq '[.installation_reads[] | select(. == 42)] | length')"
+((reads >= 1 && reads < launches)) || die "installation 42 was read $reads times for $launches claims"
 
 # One reconciler pass over what the scenarios left: nothing is stuck,
 # so it has nothing to fix, and it must not fail.

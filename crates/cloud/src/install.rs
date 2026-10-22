@@ -119,6 +119,7 @@ mod tests {
                 kind: kind.to_owned(),
             },
             suspended_at: None,
+            permissions: std::collections::BTreeMap::new(),
         }
     }
 

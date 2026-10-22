@@ -17,11 +17,13 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 async-lock = "3.4.1"
 base64 = "0.23.1"
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 hatchrun-cloud = { path = "../cloud", default-features = false }
+hatchrun-scaler-core = { path = "../scaler-core" }
 hatchrun-workflow = { path = "../workflow" }
 hmac = "0.13.0"
 js-sys = "0.3.106"

@@ -221,16 +221,38 @@ impl LogWriter {
     }
 }
 
-/// The key of the log of attempt `attempt` of a job in the logs bucket.
+/// Whether `days` is a retention tier: 30, or 90 for enterprise tenants.
+/// The R2 lifecycle rules of `r2-lifecycle.json` are one per tier.
 #[must_use]
-pub fn log_key(tenant: &str, repo_id: u64, run_id: u64, job_id: u64, attempt: u32) -> String {
-    format!("logs/{tenant}/{repo_id}/{run_id}/{job_id}/{attempt}.log.gz")
+pub fn is_tier(days: u32) -> bool {
+    matches!(days, 30 | 90)
+}
+
+/// The key of the log of attempt `attempt` of a job in the logs bucket,
+/// under the tier of the tenant's retention `days`.
+#[must_use]
+pub fn log_key(
+    days: u32,
+    tenant: &str,
+    repo_id: u64,
+    run_id: u64,
+    job_id: u64,
+    attempt: u32,
+) -> String {
+    format!("logs/{days}d/{tenant}/{repo_id}/{run_id}/{job_id}/{attempt}.log.gz")
 }
 
 /// The key of the index of that log.
 #[must_use]
-pub fn index_key(tenant: &str, repo_id: u64, run_id: u64, job_id: u64, attempt: u32) -> String {
-    format!("logs/{tenant}/{repo_id}/{run_id}/{job_id}/{attempt}.index.json")
+pub fn index_key(
+    days: u32,
+    tenant: &str,
+    repo_id: u64,
+    run_id: u64,
+    job_id: u64,
+    attempt: u32,
+) -> String {
+    format!("logs/{days}d/{tenant}/{repo_id}/{run_id}/{job_id}/{attempt}.index.json")
 }
 
 /// Gzips text as it comes, so a log of many chunks is never held whole
@@ -491,9 +513,12 @@ mod tests {
 
     #[test]
     fn keys_follow_the_layout() {
-        assert_eq!(log_key("t1", 9, 7, 3, 2), "logs/t1/9/7/3/2.log.gz");
-        assert_eq!(index_key("t1", 9, 7, 3, 2), "logs/t1/9/7/3/2.index.json");
-        assert_ne!(log_key("t1", 9, 7, 3, 1), log_key("t1", 9, 7, 3, 2));
+        assert_eq!(log_key(30, "t1", 9, 7, 3, 2), "logs/30d/t1/9/7/3/2.log.gz");
+        assert_eq!(
+            index_key(90, "t1", 9, 7, 3, 2),
+            "logs/90d/t1/9/7/3/2.index.json"
+        );
+        assert_ne!(log_key(30, "t1", 9, 7, 3, 1), log_key(30, "t1", 9, 7, 3, 2));
     }
 
     #[test]

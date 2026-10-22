@@ -36,6 +36,9 @@ pub const TAG_TENANT: &str = "hatchrun:tenant";
 pub const TAG_JOB_ID: &str = "hatchrun:job-id";
 /// Tag with the runner name.
 pub const TAG_RUNNER_NAME: &str = "hatchrun:runner-name";
+/// Tag on a warm pool instance: the template it is kept for. A job's
+/// start deletes it.
+pub const TAG_POOL: &str = "hatchrun:pool";
 
 /// One runner instance to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +87,10 @@ impl RunInstances<'_> {
         .collect();
         let mut add = |key: String, value: &str| params.push((key, value.to_owned()));
 
-        add("UserData".to_owned(), &STANDARD.encode(self.user_data));
+        // A warm pool instance has none: its agent finds nothing to run.
+        if !self.user_data.is_empty() {
+            add("UserData".to_owned(), &STANDARD.encode(self.user_data));
+        }
         if let Some(subnet) = self.subnet_id {
             add("SubnetId".to_owned(), subnet);
         }
@@ -165,6 +171,65 @@ pub fn terminated(response: &Response) -> Result<(), Error> {
         Err(err) if err.code == "InvalidInstanceID.NotFound" => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+/// The unsigned request to start a stopped instance.
+#[must_use]
+pub fn start_instances(endpoint: &str, instance_id: &str) -> Request {
+    query(
+        endpoint,
+        "StartInstances",
+        VERSION,
+        &[("InstanceId.1".to_owned(), instance_id.to_owned())],
+    )
+}
+
+/// The unsigned request to stop a running instance.
+#[must_use]
+pub fn stop_instances(endpoint: &str, instance_id: &str) -> Request {
+    query(
+        endpoint,
+        "StopInstances",
+        VERSION,
+        &[("InstanceId.1".to_owned(), instance_id.to_owned())],
+    )
+}
+
+/// The unsigned request that replaces a stopped instance's user data.
+/// EC2 takes the value base64 encoded.
+#[must_use]
+pub fn set_user_data(endpoint: &str, instance_id: &str, user_data: &str) -> Request {
+    query(
+        endpoint,
+        "ModifyInstanceAttribute",
+        VERSION,
+        &[
+            ("InstanceId".to_owned(), instance_id.to_owned()),
+            ("UserData.Value".to_owned(), STANDARD.encode(user_data)),
+        ],
+    )
+}
+
+/// The unsigned request that sets `tags` on an instance.
+#[must_use]
+pub fn create_tags(endpoint: &str, instance_id: &str, tags: &[(&str, &str)]) -> Request {
+    let mut params = vec![("ResourceId.1".to_owned(), instance_id.to_owned())];
+    for (at, (key, value)) in tags.iter().enumerate() {
+        params.push((format!("Tag.{}.Key", at + 1), (*key).to_owned()));
+        params.push((format!("Tag.{}.Value", at + 1), (*value).to_owned()));
+    }
+    query(endpoint, "CreateTags", VERSION, &params)
+}
+
+/// The unsigned request that deletes the tags `keys` from an instance,
+/// whatever their values.
+#[must_use]
+pub fn delete_tags(endpoint: &str, instance_id: &str, keys: &[&str]) -> Request {
+    let mut params = vec![("ResourceId.1".to_owned(), instance_id.to_owned())];
+    for (at, key) in keys.iter().enumerate() {
+        params.push((format!("Tag.{}.Key", at + 1), (*key).to_owned()));
+    }
+    query(endpoint, "DeleteTags", VERSION, &params)
 }
 
 /// The unsigned request that turns an instance's metadata endpoint off.
@@ -548,5 +613,67 @@ mod tests {
                 .to_vec(),
         };
         assert!(metadata_state(&denied).is_err());
+    }
+
+    fn body(request: &Request) -> String {
+        String::from_utf8(request.body.clone()).unwrap()
+    }
+
+    #[test]
+    fn starts_and_stops_one_instance() {
+        assert_eq!(
+            body(&start_instances("https://ec2/", "i-1")),
+            "Action=StartInstances&Version=2016-11-15&InstanceId.1=i-1"
+        );
+        assert_eq!(
+            body(&stop_instances("https://ec2/", "i-1")),
+            "Action=StopInstances&Version=2016-11-15&InstanceId.1=i-1"
+        );
+    }
+
+    #[test]
+    fn set_user_data_is_base64() {
+        assert_eq!(
+            body(&set_user_data("https://ec2/", "i-1", "{}")),
+            "Action=ModifyInstanceAttribute&Version=2016-11-15&InstanceId=i-1&UserData.Value=e30%3D"
+        );
+    }
+
+    #[test]
+    fn create_tags_pairs_keys_and_values() {
+        assert_eq!(
+            body(&create_tags(
+                "https://ec2/",
+                "i-1",
+                &[("hatchrun:job-id", "7"), ("Name", "ci-7")]
+            )),
+            "Action=CreateTags&Version=2016-11-15&ResourceId.1=i-1\
+             &Tag.1.Key=hatchrun%3Ajob-id&Tag.1.Value=7&Tag.2.Key=Name&Tag.2.Value=ci-7"
+        );
+    }
+
+    #[test]
+    fn delete_tags_names_the_keys() {
+        assert_eq!(
+            body(&delete_tags("https://ec2/", "i-1", &[TAG_POOL])),
+            "Action=DeleteTags&Version=2016-11-15&ResourceId.1=i-1&Tag.1.Key=hatchrun%3Apool"
+        );
+    }
+
+    #[test]
+    fn a_launch_without_user_data_sends_none() {
+        let params = RunInstances {
+            launch_template_id: "lt-1",
+            image_id: "ami-1",
+            instance_type: "m7i.large",
+            subnet_id: None,
+            user_data: "",
+            client_token: "t",
+            tags: &[],
+            spot: false,
+            root_volume: None,
+        }
+        .params();
+        assert!(params.iter().all(|(key, _)| key != "UserData"));
     }
 }

@@ -22,6 +22,11 @@
 //! | `POST /api/ci/repos/{owner}/{repo}/dispatch` | write, CSRF | `202` `{"runs": [..]}` |
 //! | `POST /api/ci/runs/{run}/cancel` | write, CSRF | `204` |
 //!
+//! The organization and repository settings routes are in
+//! [`crate::settings_api`]; they go through the same guard. Every
+//! method but `GET` needs the app's `Origin`, the session's CSRF token
+//! and a body within [`body_cap`].
+//!
 //! A repository the caller may not read answers `404`, as one that does
 //! not exist. Every answer carries `Cache-Control: no-store`.
 
@@ -47,7 +52,8 @@ use crate::github;
 use crate::intake::Repo;
 use crate::run::RunState;
 use crate::runs::{self, Config as Loaded};
-use crate::store::{self, JobRow, RepoRow, RunRow};
+use crate::settings_api::{self, SettingsRoute};
+use crate::store::{self, CiBilling, JobRow, RepoRow, RunRow};
 
 /// The logs bucket.
 const BUCKET: &str = "LOGS";
@@ -55,8 +61,12 @@ const BUCKET: &str = "LOGS";
 /// Runs in one page of a repository's list.
 const PAGE: u32 = 50;
 
-/// The most bytes of a dispatch body.
+/// The most bytes of a body, dispatch and settings alike.
 const MAX_BODY: usize = 64 << 10;
+
+/// The most bytes of a secret or variable body: a 48 KB value is more
+/// after JSON escaping.
+const MAX_VALUE_BODY: usize = 128 << 10;
 
 /// The longest ref a dispatch names.
 const MAX_REF: usize = 255;
@@ -109,7 +119,7 @@ fn id(segment: &str) -> Option<u64> {
 }
 
 /// GitHub's characters for owners and repositories.
-fn name(segment: &str) -> Option<&str> {
+pub(crate) fn name(segment: &str) -> Option<&str> {
     let ok = !segment.is_empty()
         && segment.len() <= 100
         && segment
@@ -144,9 +154,9 @@ pub fn route(path: &str) -> Option<Route<'_>> {
 /// Why a request ends before it does its work.
 #[derive(Debug, PartialEq, Eq)]
 /// The status, the message and, for a 503, the seconds to wait.
-struct Stop(u16, String, Option<u64>);
+pub(crate) struct Stop(pub(crate) u16, pub(crate) String, pub(crate) Option<u64>);
 
-fn stop<T>(status: u16, message: impl Into<String>) -> std::result::Result<T, Stop> {
+pub(crate) fn stop<T>(status: u16, message: impl Into<String>) -> std::result::Result<T, Stop> {
     Err(Stop(status, message.into(), None))
 }
 
@@ -158,6 +168,12 @@ fn needs(have: Access, want: Access, signed_in: bool) -> std::result::Result<(),
         Ok(())
     } else if have == Access::None {
         stop(404, "not found")
+    } else if want == Access::Admin {
+        if signed_in {
+            stop(403, "you need admin access to this repository")
+        } else {
+            stop(401, "sign in to manage settings")
+        }
     } else if signed_in {
         stop(403, "you need write access to this repository")
     } else {
@@ -291,6 +307,45 @@ fn origin_ok(origin: Option<&str>, app_url: &str) -> bool {
     origin.is_some_and(|origin| origin == app_url.trim_end_matches('/'))
 }
 
+/// Whether a request of `method` changes something: Origin, CSRF and
+/// the body cap apply to every method but `GET`.
+#[must_use]
+pub(crate) fn guarded(method: &Method) -> bool {
+    *method != Method::Get
+}
+
+/// The most bytes of the body of a settings request.
+#[must_use]
+pub(crate) fn body_cap(route: &SettingsRoute<'_>) -> usize {
+    match route {
+        SettingsRoute::Secret(..) | SettingsRoute::Var(..) => MAX_VALUE_BODY,
+        _ => MAX_BODY,
+    }
+}
+
+/// The `Origin` check: changes, and the socket (`live`), come from the
+/// app's own pages.
+fn origin_guard(
+    method: &Method,
+    live: bool,
+    origin: Option<&str>,
+    app_url: &str,
+) -> std::result::Result<(), Stop> {
+    if (live || guarded(method)) && !origin_ok(origin, app_url) {
+        return stop(403, "wrong origin");
+    }
+    Ok(())
+}
+
+/// The CSRF check of a request whose session has id `session_id`.
+fn csrf_guard(session_id: Option<&[u8]>, given: Option<&str>) -> std::result::Result<(), Stop> {
+    match session_id {
+        None => stop(401, "sign in to change things"),
+        Some(id) if hatchrun_cloud::session::check_csrf(id, given) => Ok(()),
+        Some(_) => stop(403, "missing or wrong CSRF token"),
+    }
+}
+
 /// The event payload of a dispatched run.
 fn dispatch_event(
     git_ref: &str,
@@ -310,8 +365,8 @@ fn dispatch_event(
 
 /// Whether a log or index key belongs to this run, so a row can never
 /// lead the Worker to another tenant's object.
-fn owns_key(key: &str, tenant: &str, repo_id: u64, run_id: u64) -> bool {
-    key.starts_with(&format!("logs/{tenant}/{repo_id}/{run_id}/")) && !key.contains("..")
+fn owns_key(key: &str, days: u32, tenant: &str, repo_id: u64, run_id: u64) -> bool {
+    key.starts_with(&format!("logs/{days}d/{tenant}/{repo_id}/{run_id}/")) && !key.contains("..")
 }
 
 /// The index that belongs to a log key.
@@ -399,15 +454,15 @@ fn fail(message: impl Into<String>) -> worker::Error {
     worker::Error::RustError(message.into())
 }
 
-fn reply(status: u16, body: &Value) -> Result<Response> {
+pub(crate) fn reply(status: u16, body: &Value) -> Result<Response> {
     Ok(Response::from_json(body)?.with_status(status))
 }
 
-fn no_content() -> Result<Response> {
+pub(crate) fn no_content() -> Result<Response> {
     Ok(Response::empty()?.with_status(204))
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     worker::Date::now().as_millis()
 }
 
@@ -438,23 +493,38 @@ pub async fn handle(req: Request, env: &Env) -> Result<Response> {
     Ok(response)
 }
 
-type Served<T = Response> = std::result::Result<T, Stop>;
+pub(crate) type Served<T = Response> = std::result::Result<T, Stop>;
+
+/// What an `/api/ci/` path is: one of the run routes or a settings
+/// route.
+enum Target<'a> {
+    Ci(Route<'a>),
+    Settings(SettingsRoute<'a>),
+}
 
 async fn serve(mut req: Request, env: &Env) -> Result<Served> {
     let path = req.path();
-    let Some(route) = route(&path) else {
-        return Ok(stop(404, "not found"));
+    let target = match (route(&path), path.strip_prefix("/api/ci/")) {
+        (Some(route), _) => Target::Ci(route),
+        (None, Some(rest)) => match settings_api::find(rest) {
+            Some(route) => Target::Settings(route),
+            None => return Ok(stop(404, "not found")),
+        },
+        (None, None) => return Ok(stop(404, "not found")),
     };
-    if req.method() != route.method() {
+    let method = req.method();
+    let allowed = match &target {
+        Target::Ci(route) => route.method() == method,
+        Target::Settings(route) => route.allows(&method),
+    };
+    if !allowed {
         return Ok(stop(405, "method not allowed"));
     }
     let settings = Settings::read(env).map_err(fail)?;
-    // Every change, and the socket, come from the app's own pages.
-    if matches!(route, Route::Live(_)) || route.method() == Method::Post {
-        let origin = req.headers().get("Origin")?;
-        if !origin_ok(origin.as_deref(), &settings.app_url) {
-            return Ok(stop(403, "wrong origin"));
-        }
+    let live = matches!(target, Target::Ci(Route::Live(_)));
+    let origin = req.headers().get("Origin")?;
+    if let Err(stop) = origin_guard(&method, live, origin.as_deref(), &settings.app_url) {
+        return Ok(Err(stop));
     }
     let db = Db::connect(env).await?;
     let session = Session::find(&req, &db).await?;
@@ -465,20 +535,29 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
         session: session.as_ref(),
     };
     let query = req.url()?.query().map(str::to_owned);
-    if route.method() == Method::Post {
+    if guarded(&method) {
         // Before any call to GitHub, so a cross-site request costs the
         // victim nothing.
-        if let Err(stop) = cx.csrf(&req) {
+        let given = req.headers().get(hatchrun_cloud::session::CSRF_HEADER)?;
+        if let Err(stop) = csrf_guard(cx.session.map(|s| s.id.as_slice()), given.as_deref()) {
             return Ok(Err(stop));
         }
+        let cap = match &target {
+            Target::Ci(_) => MAX_BODY,
+            Target::Settings(route) => body_cap(route),
+        };
         let length = req
             .headers()
             .get("Content-Length")?
             .and_then(|value| value.trim().parse::<usize>().ok());
-        if length.is_some_and(|length| length > MAX_BODY) {
+        if length.is_some_and(|length| length > cap) {
             return Ok(stop(413, "the request is too large"));
         }
     }
+    let route = match target {
+        Target::Ci(route) => route,
+        Target::Settings(route) => return settings_api::handle(&cx, route, &mut req).await,
+    };
     match route {
         Route::Runs { owner, repo } => cx.runs(owner, repo, query.as_deref()).await,
         Route::Run(run) => cx.run(run).await,
@@ -490,11 +569,11 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
     }
 }
 
-struct Cx<'a> {
-    env: &'a Env,
-    db: &'a Db,
-    settings: &'a Settings,
-    session: Option<&'a Session>,
+pub(crate) struct Cx<'a> {
+    pub(crate) env: &'a Env,
+    pub(crate) db: &'a Db,
+    pub(crate) settings: &'a Settings,
+    pub(crate) session: Option<&'a Session>,
 }
 
 /// A run with the repository it belongs to.
@@ -518,7 +597,12 @@ impl Cx<'_> {
     }
 
     /// The repository, when the caller may use it as `want`.
-    async fn repo(&self, owner: &str, name: &str, want: Access) -> Result<Served<RepoRow>> {
+    pub(crate) async fn repo(
+        &self,
+        owner: &str,
+        name: &str,
+        want: Access,
+    ) -> Result<Served<RepoRow>> {
         let Some(repo) = store::repo_by_name(self.db, &format!("{owner}/{name}")).await? else {
             return Ok(stop(404, "not found"));
         };
@@ -594,7 +678,10 @@ impl Cx<'_> {
     /// The run's object's view of it. A run that is not held, or an
     /// object that does not answer, leaves the rows to speak.
     async fn state(&self, run: &RunRow) -> Option<RunState> {
-        let path = format!("/state?run={}&tenant={}", run.id, run.tenant_id);
+        let path = format!(
+            "/state?run={}&tenant={}&days={}",
+            run.id, run.tenant_id, run.retention_days
+        );
         let mut response = match call(self.env, run.id, Method::Get, &path).await {
             Ok(response) => response,
             Err(err) => {
@@ -622,7 +709,13 @@ impl Cx<'_> {
         if job.status == "completed"
             && let Some(key) = job.log_key.as_deref()
         {
-            if !owns_key(key, &found.run.tenant_id, found.repo.id, found.run.id) {
+            if !owns_key(
+                key,
+                found.run.retention_days,
+                &found.run.tenant_id,
+                found.repo.id,
+                found.run.id,
+            ) {
                 console_error!(
                     "job {job_id}: log key {key} is outside run {}",
                     found.run.id
@@ -650,7 +743,15 @@ impl Cx<'_> {
             .as_deref()
             .filter(|_| job.status == "completed")
             .and_then(index_of)
-            .filter(|key| owns_key(key, &found.run.tenant_id, found.repo.id, found.run.id));
+            .filter(|key| {
+                owns_key(
+                    key,
+                    found.run.retention_days,
+                    &found.run.tenant_id,
+                    found.repo.id,
+                    found.run.id,
+                )
+            });
         let Some(key) = key else {
             return Ok(stop(404, "no index"));
         };
@@ -720,14 +821,6 @@ impl Cx<'_> {
             )));
         }
         no_content().map(Ok)
-    }
-
-    fn csrf(&self, req: &Request) -> std::result::Result<(), Stop> {
-        match self.session.map(|session| session.csrf_ok(req)) {
-            None => stop(401, "sign in to change runs"),
-            Some(Ok(true)) => Ok(()),
-            Some(_) => stop(403, "missing or wrong CSRF token"),
-        }
     }
 
     #[allow(clippy::too_many_lines)] // One request, read top to bottom.
@@ -819,6 +912,18 @@ impl Cx<'_> {
             &repo.full_name,
             &session.user.login,
         );
+        if let Some(tenant) = store::tenant(self.db, &repo.tenant_id).await?
+            && tenant.ci_billing != CiBilling::Active
+        {
+            return Ok(stop(
+                402,
+                format!(
+                    "Add a card for {org} at {app}/o/{org}/ci to run workflows.",
+                    org = tenant.org_login,
+                    app = settings.app_url
+                ),
+            ));
+        }
         let delivery = format!("dispatch:{}", hex(&webcrypto::random_bytes(16)?));
         let started = Repo {
             id: repo.id,
@@ -854,8 +959,7 @@ impl Cx<'_> {
         if ids.is_empty() {
             return Ok(stop(
                 422,
-                "no run started: CI is off for this organization, or the workflow \
-                 has no job for this ref",
+                "no run started: the workflow has no job for this ref",
             ));
         }
         reply(202, &json!({ "runs": ids })).map(Ok)
@@ -1104,6 +1208,60 @@ workflows:
         assert!(!origin_ok(None, app));
     }
 
+    const APP: &str = "https://app.hatchrun.io";
+
+    #[test]
+    fn every_mutating_method_is_guarded() {
+        assert!(guarded(&Method::Post));
+        assert!(guarded(&Method::Put));
+        assert!(guarded(&Method::Delete));
+        assert!(!guarded(&Method::Get));
+    }
+
+    #[test]
+    fn put_without_csrf_is_refused() {
+        let id = crate::token::tests::random_key();
+        let token = hatchrun_cloud::session::csrf_token(&id);
+        assert_eq!(
+            csrf_guard(Some(&id), None),
+            Err(Stop(403, "missing or wrong CSRF token".into(), None))
+        );
+        assert_eq!(csrf_guard(Some(&id), Some("wrong")).unwrap_err().0, 403);
+        assert_eq!(csrf_guard(None, Some(&token)).unwrap_err().0, 401);
+        assert_eq!(csrf_guard(Some(&id), Some(&token)), Ok(()));
+    }
+
+    #[test]
+    fn delete_from_another_origin_is_refused() {
+        let evil = Some("https://evil.example");
+        for method in [Method::Delete, Method::Put, Method::Post] {
+            assert_eq!(
+                origin_guard(&method, false, evil, APP),
+                Err(Stop(403, "wrong origin".into(), None))
+            );
+            assert_eq!(origin_guard(&method, false, None, APP).unwrap_err().0, 403);
+            assert_eq!(
+                origin_guard(&method, false, Some("https://app.hatchrun.io"), APP),
+                Ok(())
+            );
+        }
+        // A plain read needs no origin, the socket does.
+        assert_eq!(origin_guard(&Method::Get, false, evil, APP), Ok(()));
+        assert_eq!(
+            origin_guard(&Method::Get, true, evil, APP).unwrap_err().0,
+            403
+        );
+    }
+
+    #[test]
+    fn secret_bodies_get_more_room() {
+        let scope = settings_api::Scope::Org("acme");
+        assert_eq!(body_cap(&SettingsRoute::Secret(scope, "TOKEN")), 128 << 10);
+        assert_eq!(body_cap(&SettingsRoute::Var(scope, "NAME")), 128 << 10);
+        assert_eq!(body_cap(&SettingsRoute::Cap { org: "acme" }), 64 << 10);
+        assert_eq!(body_cap(&SettingsRoute::Secrets(scope)), 64 << 10);
+    }
+
     #[test]
     fn the_dispatch_event_names_who_and_what() {
         let mut inputs = Map::new();
@@ -1121,15 +1279,30 @@ workflows:
     }
 
     #[test]
+    fn log_keys_have_the_tier() {
+        assert_eq!(
+            logs::log_key(30, "t1", 5, 7, 9, 1),
+            "logs/30d/t1/5/7/9/1.log.gz"
+        );
+    }
+
+    #[test]
     fn log_keys_stay_inside_the_run() {
-        let key = logs::log_key("t1", 5, 7, 9, 2);
-        assert!(owns_key(&key, "t1", 5, 7));
-        assert!(!owns_key(&key, "t2", 5, 7));
-        assert!(!owns_key(&key, "t1", 6, 7));
-        assert!(!owns_key(&key, "t1", 5, 70));
-        assert!(!owns_key("logs/t1/5/7/../../8/9/1.log.gz", "t1", 5, 7));
-        assert_eq!(index_of(&key), Some(logs::index_key("t1", 5, 7, 9, 2)));
-        assert_eq!(index_of("logs/t1/5/7/9/2.index.json"), None);
+        let key = logs::log_key(30, "t1", 5, 7, 9, 2);
+        assert!(owns_key(&key, 30, "t1", 5, 7));
+        assert!(!owns_key(&key, 90, "t1", 5, 7));
+        assert!(!owns_key(&key, 30, "t2", 5, 7));
+        assert!(!owns_key(&key, 30, "t1", 6, 7));
+        assert!(!owns_key(&key, 30, "t1", 5, 70));
+        assert!(!owns_key(
+            "logs/30d/t1/5/7/../../8/9/1.log.gz",
+            30,
+            "t1",
+            5,
+            7
+        ));
+        assert_eq!(index_of(&key), Some(logs::index_key(30, "t1", 5, 7, 9, 2)));
+        assert_eq!(index_of("logs/30d/t1/5/7/9/2.index.json"), None);
     }
 
     fn row(id: u64, status: &str, steps: &Value) -> JobRow {
@@ -1138,7 +1311,8 @@ workflows:
             "conclusion": null, "instance_id": null, "attempt": 1, "launch_attempts": 0,
             "next_launch_at": null, "timeout_minutes": 10, "updated_at": 0,
             "heartbeat_at": null, "started_at": null, "completed_at": null,
-            "steps": steps.to_string(), "log_key": null
+            "steps": steps.to_string(), "log_key": null, "template": "ubuntu-latest",
+            "token_permissions": "{}", "secret_refs": "{\"all\":false,\"names\":[]}"
         }))
         .unwrap()
     }

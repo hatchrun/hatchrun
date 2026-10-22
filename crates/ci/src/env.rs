@@ -5,7 +5,7 @@
 //! The Worker's variables and secrets, and the handle on a run's
 //! Durable Object.
 
-use hatchrun_cloud::{github, jwt, oidc};
+use hatchrun_cloud::{github, jwt, oidc, polar};
 use worker::{Env, Result, Stub};
 
 /// The Durable Object namespace of runs.
@@ -51,6 +51,13 @@ pub struct Settings {
     pub oidc_kid: String,
     /// Replaces the STS and EC2 endpoints, for development.
     pub aws_endpoint: Option<String>,
+    /// The Polar API root, without a trailing slash.
+    pub polar_api: String,
+    /// Polar's access token. Empty until billing is set up.
+    pub polar_token: String,
+    /// The Polar product of hatchrun CI. Empty until it exists, and no
+    /// checkout starts while it is.
+    pub polar_ci_product_id: String,
 }
 
 impl Settings {
@@ -107,6 +114,12 @@ impl Settings {
             oidc_key: key(oidc::SIGNING_KEY)?,
             oidc_kid: need(oidc::KEY_ID)?,
             aws_endpoint: get("AWS_ENDPOINT_URL"),
+            polar_api: get("POLAR_API_URL")
+                .unwrap_or_else(|| polar::API.to_owned())
+                .trim_end_matches('/')
+                .to_owned(),
+            polar_token: get("POLAR_ACCESS_TOKEN").unwrap_or_default(),
+            polar_ci_product_id: get("POLAR_CI_PRODUCT_ID").unwrap_or_default(),
         })
     }
 }
@@ -161,6 +174,9 @@ mod tests {
         assert_eq!(settings.ci_subnet_ids, [] as [String; 0]);
         assert_eq!(settings.aws_endpoint, None);
         assert_eq!(settings.local_launcher_url, None);
+        assert_eq!(settings.polar_api, polar::API);
+        assert_eq!(settings.polar_token, "");
+        assert_eq!(settings.polar_ci_product_id, "");
     }
 
     #[test]
@@ -169,7 +185,11 @@ mod tests {
         v.insert("GITHUB_API_URL", "http://localhost:9000/".to_owned());
         v.insert("AWS_ENDPOINT_URL", "http://localhost:4566".to_owned());
         v.insert("CI_SUBNET_IDS", "subnet-a, subnet-b,".to_owned());
+        v.insert("POLAR_API_URL", "https://sandbox-api.polar.sh/".to_owned());
+        v.insert("POLAR_CI_PRODUCT_ID", "prod".to_owned());
         let settings = read(&v).unwrap();
+        assert_eq!(settings.polar_api, "https://sandbox-api.polar.sh");
+        assert_eq!(settings.polar_ci_product_id, "prod");
         assert_eq!(settings.github_api, "http://localhost:9000");
         assert_eq!(
             settings.aws_endpoint.as_deref(),

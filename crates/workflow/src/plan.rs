@@ -23,6 +23,7 @@ use crate::config::{
 use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
 use crate::expr::{self, ExprError};
+use crate::permissions::{Level, token_scopes};
 use crate::templates::{Template, template, template_labels};
 use crate::trigger::{Filter, MAX_GLOBS, MAX_PATTERNS, Triggers};
 
@@ -126,6 +127,9 @@ pub struct PlannedJob {
     pub timeout_minutes: u32,
     /// Values later jobs can read.
     pub outputs: BTreeMap<String, String>,
+    /// GitHub App permissions for the job's token, from its
+    /// `permissions:`, else its workflow's, else the read default.
+    pub token_permissions: BTreeMap<String, Level>,
     /// The steps, with commands expanded.
     pub steps: Vec<PlannedStep>,
 }
@@ -215,6 +219,14 @@ pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, V
 #[must_use]
 pub fn validate(config: &Config) -> Vec<Diagnostic> {
     let mut errors = config_errors(config);
+    for (name, executor) in &config.executors {
+        if template(&executor.runs_on).is_none() {
+            errors.push(unknown_template(
+                &format!("executor `{name}`"),
+                &executor.runs_on,
+            ));
+        }
+    }
     standalone_errors(config, &mut errors);
     let mut budget = Budget::new();
     for (name, wf) in &config.workflows {
@@ -226,22 +238,18 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
     dedup(errors)
 }
 
-/// Problems that belong to the config as a whole, not one workflow.
-fn config_errors(config: &Config) -> Vec<Diagnostic> {
+/// Problems of the config as a whole (command names, filters, crons).
+/// An executor's unknown label is no longer one of them: compile reports
+/// it for a workflow whose job uses the executor, and `validate` still
+/// reports it for every executor.
+#[must_use]
+pub fn config_errors(config: &Config) -> Vec<Diagnostic> {
     let mut errors = Vec::new();
     for name in config.commands.keys() {
         if STEP_KEYS.contains(&name.as_str()) {
             errors.push(Diagnostic::new(format!(
                 "command `{name}` has the name of a step key; rename it"
             )));
-        }
-    }
-    for (name, executor) in &config.executors {
-        if template(&executor.runs_on).is_none() {
-            errors.push(unknown_template(
-                &format!("executor `{name}`"),
-                &executor.runs_on,
-            ));
         }
     }
     filter_errors(config, &mut errors);
@@ -728,7 +736,7 @@ fn compile_workflow(
         .jobs
         .iter()
         .zip(&ids)
-        .map(|(entry, id)| expand_entry(config, name, entry, id, budget, &mut planned, errors))
+        .map(|(entry, id)| expand_entry(config, wf, name, entry, id, budget, &mut planned, errors))
         .collect();
     if budget.spent {
         return None;
@@ -956,8 +964,10 @@ fn ref_allows(entry: &WorkflowJob, git_ref: &str) -> bool {
 
 /// Expands one workflow entry into its matrix entries and parallel
 /// nodes, with `requires` left empty.
+#[allow(clippy::too_many_arguments)]
 fn expand_entry(
     config: &Config,
+    wf: &Workflow,
     workflow: &str,
     entry: &WorkflowJob,
     id: &str,
@@ -1029,6 +1039,9 @@ fn expand_entry(
             break;
         };
         base.kind = JobKind::Run { template };
+        if job.permissions.is_none() {
+            base.token_permissions = token_scopes(wf.permissions.as_ref());
+        }
         let Some(jobs) = copy_job(base, combo, id, nodes, &mut walk, errors) else {
             break;
         };
@@ -1284,6 +1297,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         if_: None,
         timeout_minutes: DEFAULT_TIMEOUT_MINUTES,
         outputs: BTreeMap::new(),
+        token_permissions: BTreeMap::new(),
         steps: Vec::new(),
     }]
 }
@@ -1309,14 +1323,20 @@ fn resolve_template(
             None
         }
         (Some(name), None) => {
-            // An executor's label is checked once, in `config_errors`.
-            let found = config.executors.get(name).map(|e| template(&e.runs_on));
-            if found.is_none() {
+            let Some(executor) = config.executors.get(name) else {
                 errors.push(Diagnostic::new(format!(
                     "{owner} uses executor `{name}`, which is not defined in `executors:`"
                 )));
+                return None;
+            };
+            let found = template(&executor.runs_on);
+            if found.is_none() {
+                errors.push(unknown_template(
+                    &format!("executor `{name}`"),
+                    &executor.runs_on,
+                ));
             }
-            found.flatten()
+            found
         }
         (None, Some(label)) => {
             let found = template(label);
@@ -1371,6 +1391,7 @@ fn expand_job(
         if_,
         timeout_minutes: job.timeout_minutes.unwrap_or(DEFAULT_TIMEOUT_MINUTES),
         outputs,
+        token_permissions: token_scopes(job.permissions.as_ref()),
         steps,
     })
 }

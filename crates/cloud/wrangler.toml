@@ -64,6 +64,13 @@ service = "hatchrun-ci"
 binding = "LAUNCHES"
 queue = "hatchrun-launches"
 
+# The CI Worker's launch queue. The Polar webhook sends the held jobs of a
+# tenant whose card came back here (crates/cloud/src/ci_wake.rs); the CI
+# Worker consumes it.
+[[queues.producers]]
+binding = "CI_LAUNCHES"
+queue = "hatchrun-ci-launches"
+
 # Small batches, sent after a second at most, so a runner's start does
 # not wait for other jobs. max_concurrency caps the batches launching at
 # once, and with max_batch_size the launches in flight: 10 batches of 5,
@@ -139,6 +146,12 @@ MARKETPLACE_ARM64_URL = "https://aws.amazon.com/marketplace/pp/prodview-nchg6i6u
 # while the list is empty. POLAR_API_URL points the Worker at Polar's
 # sandbox (https://sandbox-api.polar.sh).
 POLAR_PRODUCT_ID = "a2dfff6e-1a3a-40fe-b576-70fccd81f694"
+# The Polar product of hatchrun CI: the id of the "hatchrun CI" product
+# (Products, then the product's ID), the same value as hatchrun-ci's
+# POLAR_CI_PRODUCT_ID. An active or trialing subscription to it is the
+# card a tenant needs before its CI jobs run; it never licenses
+# hatchrun.io runners. Unset, no subscription counts as CI.
+POLAR_CI_PRODUCT_ID = ""
 # hatchrun-broker (crates/broker), where launches store runner configs.
 # Both Workers share BROKER_TOKEN.
 BROKER_URL = "https://broker.hatchrun.io"

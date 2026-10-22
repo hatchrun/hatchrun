@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use hatchrun_workflow::{Annotation, AnnotationLevel, Conclusion, StepSummary};
 use serde::{Deserialize, Serialize};
 
-use crate::github::{CheckRun, GhAnnotation, Output, rfc3339};
+use crate::github::{Capped, CheckRun, GhAnnotation, Output, rfc3339};
 use crate::graph::{Node, State};
 
 /// The most annotations with a file in one request (GitHub's limit).
@@ -92,6 +92,10 @@ pub struct JobView<'a> {
     pub file_annotations_sent: usize,
     /// The last lines of the log, for a failed job.
     pub failed_tail: Option<&'a [String]>,
+    /// Why the queued job waits for a launch.
+    pub held: Option<&'a str>,
+    /// Token scopes the App holds less of than the job asked.
+    pub capped: &'a [Capped],
     /// Unix milliseconds.
     pub started_at: Option<u64>,
     /// Unix milliseconds.
@@ -160,6 +164,19 @@ pub fn annotation(a: &Annotation) -> Option<GhAnnotation> {
     })
 }
 
+/// One paragraph for each scope the App holds less of than the job asked.
+fn capped_lines(capped: &[Capped]) -> String {
+    let mut out = String::new();
+    for c in capped {
+        let _ = writeln!(
+            out,
+            "The token's `{}` permission is {}: the job asked for {} and the hatchrun App holds no more.\n",
+            c.scope, c.got, c.asked
+        );
+    }
+    out
+}
+
 /// The check run request for a job, and the new count of annotations
 /// with a file that GitHub has once the request is sent.
 ///
@@ -173,7 +190,9 @@ pub fn annotation(a: &Annotation) -> Option<GhAnnotation> {
 /// past that. Summary and text are cut to [`MAX_OUTPUT_CHARS`].
 #[must_use]
 pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
+    let held = view.held.filter(|_| view.node.state == State::Queued);
     let (status, conclusion, title) = match view.node.state {
+        State::Queued if held.is_some() => ("queued", None, "Waiting"),
         State::Waiting | State::Queued => ("queued", None, "Queued"),
         State::Running => ("in_progress", None, "Running"),
         State::Done(c) => (
@@ -195,6 +214,11 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
     };
 
     let mut summary = String::new();
+    if let Some(message) = held {
+        summary.push_str(message);
+        summary.push_str("\n\n");
+    }
+    summary.push_str(&capped_lines(view.capped));
     if let Some(message) = &view.node.message {
         summary.push_str(message);
         summary.push_str("\n\n");
@@ -372,6 +396,7 @@ mod tests {
                 if_: None,
                 timeout_minutes: 30,
                 outputs: BTreeMap::new(),
+                token_permissions: BTreeMap::new(),
                 steps: vec![],
             },
             state,
@@ -392,6 +417,8 @@ mod tests {
             annotations: notes,
             file_annotations_sent: 0,
             failed_tail: None,
+            held: None,
+            capped: &[],
             started_at: None,
             completed_at: None,
         }
@@ -446,6 +473,50 @@ mod tests {
             assert_eq!(run.output.unwrap().title, "Queued");
             assert_eq!(run.conclusion, None);
         }
+    }
+
+    #[test]
+    fn capped_scopes_are_named() {
+        let n = node(State::Running, None);
+        let capped = [Capped {
+            scope: "contents".into(),
+            asked: "write".into(),
+            got: "read".into(),
+        }];
+        let mut v = view(&n, &[], &[]);
+        v.capped = &capped;
+        let (run, _) = render(&v);
+        assert_eq!(
+            run.output.unwrap().summary,
+            "The token's `contents` permission is read: the job asked for write and the hatchrun App holds no more."
+        );
+    }
+
+    #[test]
+    fn held_job_says_why() {
+        let n = node(State::Queued, None);
+        let mut v = view(&n, &[], &[]);
+        v.held = Some("Waiting for a card. Add one for acme at https://app/o/acme/ci.");
+        let (run, _) = render(&v);
+        assert_eq!(run.status, "queued");
+        assert_eq!(run.conclusion, None);
+        let out = run.output.unwrap();
+        assert_eq!(out.title, "Waiting");
+        assert!(
+            out.summary
+                .starts_with("Waiting for a card. Add one for acme at https://app/o/acme/ci.")
+        );
+    }
+
+    #[test]
+    fn running_job_drops_the_hold() {
+        let n = node(State::Running, None);
+        let mut v = view(&n, &[], &[]);
+        v.held = Some("Waiting for a card.");
+        let (run, _) = render(&v);
+        let out = run.output.unwrap();
+        assert_eq!(out.title, "Running");
+        assert_eq!(out.summary, "");
     }
 
     #[test]

@@ -32,6 +32,8 @@ pub enum Access {
     Read,
     /// Also dispatch, cancel and re-run.
     Write,
+    /// Also the repository's secrets and variables.
+    Admin,
 }
 
 /// The access GitHub's answer gives. `p` is `None` when nobody is
@@ -41,6 +43,7 @@ pub enum Access {
 pub fn from_permissions(private: bool, p: Option<Permissions>) -> Access {
     let public = if private { Access::None } else { Access::Read };
     match p {
+        Some(p) if p.admin => Access::Admin,
         Some(p) if p.write => Access::Write,
         Some(p) if p.read => Access::Read,
         _ => public,
@@ -72,16 +75,24 @@ pub enum Verdict {
     Retry(u64),
     /// GitHub failed (5xx).
     Broken(u16),
+    /// GitHub's repository of that name is not the stored one: the name
+    /// was renamed away or taken over. No access.
+    Moved,
 }
 
-/// Classifies the answer of [`github::user_repo`] at `now_secs`.
+/// Classifies the answer of [`github::user_repo`] for repository
+/// `repo_id` at `now_secs`. A name can come to mean another repository,
+/// so a 200 that names a different id (or none) is [`Verdict::Moved`].
 #[must_use]
-pub fn classify(response: &hatchrun_cloud::http::Response, now_secs: u64) -> Verdict {
+pub fn classify(response: &hatchrun_cloud::http::Response, repo_id: u64, now_secs: u64) -> Verdict {
     if let Some(wait) = github::throttle(response, now_secs, 0) {
         return Verdict::Retry(wait);
     }
     if response.status >= 500 {
         return Verdict::Broken(response.status);
+    }
+    if response.status == 200 && github::repo_id(response) != Some(repo_id) {
+        return Verdict::Moved;
     }
     Verdict::Known(github::permissions(response))
 }
@@ -166,11 +177,12 @@ pub async fn resolve(
             repo.full_name
         )))
     })?;
-    match classify(&response, now / 1000) {
+    match classify(&response, repo.id, now / 1000) {
         Verdict::Known(p) => {
             remember(key, p, now);
             Ok(from_permissions(repo.private, Some(p)))
         }
+        Verdict::Moved => Ok(Access::None),
         Verdict::Retry(wait) => Err(Failure::Retry(wait)),
         Verdict::Broken(status) => Err(Failure::Worker(worker::Error::RustError(format!(
             "{}: GitHub answered {status}",
@@ -179,13 +191,67 @@ pub async fn resolve(
     }
 }
 
+/// What GitHub's answer to the membership call means at `now_secs`:
+/// the id of the organization when the user is an active admin of it.
+///
+/// # Errors
+///
+/// GitHub rate limits the user's token, or failed.
+pub fn admin_verdict(
+    response: &hatchrun_cloud::http::Response,
+    now_secs: u64,
+) -> Result<Option<u64>, Failure> {
+    if let Some(wait) = github::throttle(response, now_secs, 0) {
+        return Err(Failure::Retry(wait));
+    }
+    // 403: the token or the App cannot see the organization's members.
+    // Neither says the user is an admin.
+    if response.status == 403 {
+        return Ok(None);
+    }
+    hatchrun_cloud::github::parse_membership(response)
+        .map(|membership| {
+            membership
+                .filter(hatchrun_cloud::github::Membership::is_admin)
+                .map(|m| m.organization.id)
+        })
+        .map_err(|err| Failure::Worker(worker::Error::RustError(format!("membership: {err}"))))
+}
+
+/// The id of the GitHub organization `org` when the session's user is
+/// an active admin of it, by GitHub's word on every call. A login can
+/// name another organization than a tenant once knew, so callers find
+/// the tenant by this id and never by the login.
+///
+/// # Errors
+///
+/// The call to GitHub failed, or GitHub asks to wait. The caller never
+/// reads that as "not an admin".
+pub async fn org_admin(
+    settings: &Settings,
+    session: &Session,
+    org: &str,
+) -> Result<Option<u64>, Failure> {
+    let request = hatchrun_cloud::github::membership(&settings.github_api, &session.token, org);
+    let response = send(&request).await.map_err(|err| {
+        Failure::Worker(worker::Error::RustError(format!(
+            "membership of {org}: {err}"
+        )))
+    })?;
+    admin_verdict(&response, worker::Date::now().as_millis() / 1000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[allow(clippy::unnecessary_wraps)] // The argument of `from_permissions`.
     const fn p(read: bool, write: bool) -> Option<Permissions> {
-        Some(Permissions { read, write })
+        Some(Permissions {
+            read,
+            write,
+            admin: false,
+        })
     }
 
     #[test]
@@ -233,36 +299,54 @@ mod tests {
             ],
             "",
         );
-        assert_eq!(classify(&limited, 1000), Verdict::Retry(90));
-        assert_eq!(classify(&answer(429, &[], ""), 1000), Verdict::Retry(60));
+        assert_eq!(classify(&limited, 1, 1000), Verdict::Retry(90));
+        assert_eq!(classify(&answer(429, &[], ""), 1, 1000), Verdict::Retry(60));
         let secondary = answer(403, &[], "You have exceeded a secondary rate limit");
-        assert_eq!(classify(&secondary, 1000), Verdict::Retry(60));
+        assert_eq!(classify(&secondary, 1, 1000), Verdict::Retry(60));
     }
 
     #[test]
     fn other_answers_are_permissions_or_a_failure() {
-        assert_eq!(classify(&answer(502, &[], ""), 0), Verdict::Broken(502));
+        assert_eq!(classify(&answer(502, &[], ""), 1, 0), Verdict::Broken(502));
         let none = Verdict::Known(Permissions {
             read: false,
             write: false,
+            admin: false,
         });
-        assert_eq!(classify(&answer(404, &[], ""), 0), none);
+        assert_eq!(classify(&answer(404, &[], ""), 1, 0), none);
         assert_eq!(
-            classify(&answer(403, &[], "Resource not accessible"), 0),
+            classify(&answer(403, &[], "Resource not accessible"), 1, 0),
             none
         );
         let ok = answer(
             200,
             &[],
-            r#"{"private": true, "permissions": {"pull": true, "push": true}}"#,
+            r#"{"id": 1, "private": true, "permissions": {"pull": true, "push": true}}"#,
         );
         assert_eq!(
-            classify(&ok, 0),
+            classify(&ok, 1, 0),
             Verdict::Known(Permissions {
                 read: true,
-                write: true
+                write: true,
+                admin: false
             })
         );
+    }
+
+    #[test]
+    fn another_repository_under_the_name_gets_no_access() {
+        let admin = |id: &str| {
+            answer(
+                200,
+                &[],
+                &format!(
+                    r#"{{{id}"private": false, "permissions": {{"pull": true, "push": true, "admin": true}}}}"#
+                ),
+            )
+        };
+        assert!(matches!(classify(&admin(r#""id": 1,"#), 1, 0), Verdict::Known(p) if p.admin));
+        assert_eq!(classify(&admin(r#""id": 2,"#), 1, 0), Verdict::Moved);
+        assert_eq!(classify(&admin(""), 1, 0), Verdict::Moved);
     }
 
     #[test]
@@ -272,6 +356,7 @@ mod tests {
         let p = Permissions {
             read: true,
             write: false,
+            admin: false,
         };
         remember(key, p, 1000);
         assert_eq!(cached(key, 1000 + CACHE_MS - 1), Some(p));
@@ -282,5 +367,57 @@ mod tests {
     #[test]
     fn access_is_ordered() {
         assert!(Access::None < Access::Read && Access::Read < Access::Write);
+        assert!(Access::Write < Access::Admin);
+    }
+
+    #[test]
+    fn admin_needs_the_admin_permission() {
+        let admin = Some(Permissions {
+            read: true,
+            write: true,
+            admin: true,
+        });
+        assert_eq!(from_permissions(true, admin), Access::Admin);
+        assert_eq!(from_permissions(false, admin), Access::Admin);
+        assert_eq!(from_permissions(true, p(true, true)), Access::Write);
+        assert_eq!(from_permissions(false, None), Access::Read);
+    }
+
+    #[test]
+    fn only_an_active_admin_passes_and_names_the_organization() {
+        let ok = |role: &str, state: &str, id: u64| {
+            answer(
+                200,
+                &[],
+                &format!(
+                    r#"{{"role":"{role}","state":"{state}","organization":{{"id":{id},"login":"acme","avatar_url":""}}}}"#
+                ),
+            )
+        };
+        assert_eq!(
+            admin_verdict(&ok("admin", "active", 42), 0).unwrap(),
+            Some(42)
+        );
+        // A new organization that reuses a login has another id, so it
+        // cannot match the tenant of the old one.
+        assert_ne!(
+            admin_verdict(&ok("admin", "active", 43), 0).unwrap(),
+            Some(42)
+        );
+        assert_eq!(admin_verdict(&ok("member", "active", 42), 0).unwrap(), None);
+        assert_eq!(admin_verdict(&ok("admin", "pending", 42), 0).unwrap(), None);
+        assert_eq!(admin_verdict(&answer(404, &[], ""), 0).unwrap(), None);
+        assert_eq!(
+            admin_verdict(&answer(403, &[], "Resource not accessible"), 0).unwrap(),
+            None
+        );
+        assert!(matches!(
+            admin_verdict(&answer(429, &[], ""), 1000),
+            Err(Failure::Retry(60))
+        ));
+        assert!(matches!(
+            admin_verdict(&answer(502, &[], ""), 0),
+            Err(Failure::Worker(_))
+        ));
     }
 }

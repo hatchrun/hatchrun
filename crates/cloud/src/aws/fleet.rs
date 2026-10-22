@@ -66,10 +66,13 @@ impl TemplateVersion<'_> {
         add("ClientToken", self.client_token);
         let data = "LaunchTemplateData";
         add(&format!("{data}.ImageId"), self.image_id);
-        add(
-            &format!("{data}.UserData"),
-            &STANDARD.encode(self.user_data),
-        );
+        // A warm pool instance has none: its agent finds nothing to run.
+        if !self.user_data.is_empty() {
+            add(
+                &format!("{data}.UserData"),
+                &STANDARD.encode(self.user_data),
+            );
+        }
         add(
             &format!("{data}.InstanceInitiatedShutdownBehavior"),
             "terminate",
@@ -680,5 +683,19 @@ mod tests {
                 .to_vec(),
         };
         assert_eq!(launched(&none), Ok(Launched::default()));
+    }
+
+    #[test]
+    fn a_version_without_user_data_sends_none() {
+        let version = TemplateVersion {
+            launch_template_id: "lt-1",
+            runner_name: "ci-pool-x",
+            image_id: "ami-1",
+            user_data: "",
+            root_volume: None,
+            tags: &[],
+            client_token: "t",
+        };
+        assert!(!body(&version.request("https://ec2/")).contains("UserData"));
     }
 }

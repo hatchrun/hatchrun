@@ -7,7 +7,7 @@
 //! for the reconciler. The tenant role may describe every instance and
 //! terminate only tagged ones (deploy/cloudformation/connect.yaml).
 
-use super::ec2::{TAG_JOB_ID, TAG_RUNNER_NAME, TAG_TENANT};
+use super::ec2::{TAG_JOB_ID, TAG_POOL, TAG_RUNNER_NAME, TAG_TENANT};
 use super::{Error, document, query};
 use crate::http::{Request, Response};
 
@@ -36,12 +36,38 @@ pub fn describe(endpoint: &str, tenant: &str, next_token: Option<&str>) -> Reque
     query(endpoint, "DescribeInstances", VERSION, &params)
 }
 
+/// `tenant`'s warm pool instances, running or stopped: those with a
+/// `hatchrun:pool` tag, a page at a time.
+#[must_use]
+pub fn describe_pool(endpoint: &str, tenant: &str, next_token: Option<&str>) -> Request {
+    let mut params: Vec<(String, String)> = [
+        ("Filter.1.Name", format!("tag:{TAG_TENANT}")),
+        ("Filter.1.Value.1", tenant.to_owned()),
+        ("Filter.2.Name", "tag-key".to_owned()),
+        ("Filter.2.Value.1", TAG_POOL.to_owned()),
+        ("Filter.3.Name", "instance-state-name".to_owned()),
+        ("Filter.3.Value.1", "pending".to_owned()),
+        ("Filter.3.Value.2", "running".to_owned()),
+        ("Filter.3.Value.3", "stopping".to_owned()),
+        ("Filter.3.Value.4", "stopped".to_owned()),
+        ("MaxResults", PAGE_SIZE.to_owned()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value))
+    .collect();
+    if let Some(token) = next_token {
+        params.push(("NextToken".to_owned(), token.to_owned()));
+    }
+    query(endpoint, "DescribeInstances", VERSION, &params)
+}
+
 /// A runner instance as EC2 describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Described {
     /// `i-...`
     pub id: String,
-    /// `pending` or `running`.
+    /// `pending`, `running`, or for a pool instance also `stopping` or
+    /// `stopped`.
     pub state: String,
     /// When it started, RFC 3339.
     pub launch_time: String,
@@ -49,6 +75,9 @@ pub struct Described {
     pub job_id: Option<String>,
     /// Its `hatchrun:runner-name` tag.
     pub runner_name: Option<String>,
+    /// Its `hatchrun:pool` tag: the template a warm pool instance is
+    /// kept for.
+    pub pool: Option<String>,
 }
 
 /// Reads a page of instances and the next page's token.
@@ -88,6 +117,7 @@ pub fn described(response: &Response) -> Result<(Vec<Described>, Option<String>)
                     .to_owned(),
                 job_id: tag(TAG_JOB_ID),
                 runner_name: tag(TAG_RUNNER_NAME),
+                pool: tag(TAG_POOL),
             })
         })
         .collect::<Result<_, Error>>()?;
@@ -170,6 +200,9 @@ mod tests {
           <instanceId>i-2</instanceId>
           <instanceState><code>0</code><name>pending</name></instanceState>
           <launchTime>2026-10-14T10:01:00.000Z</launchTime>
+          <tagSet>
+            <item><key>hatchrun:pool</key><value>ubuntu-latest</value></item>
+          </tagSet>
         </item>
       </instancesSet>
     </item>
@@ -189,6 +222,7 @@ mod tests {
                     launch_time: "2026-10-14T10:00:00.000Z".to_owned(),
                     job_id: Some("7".to_owned()),
                     runner_name: Some("hatchrun-7-ab".to_owned()),
+                    pool: None,
                 },
                 Described {
                     id: "i-2".to_owned(),
@@ -196,6 +230,7 @@ mod tests {
                     launch_time: "2026-10-14T10:01:00.000Z".to_owned(),
                     job_id: None,
                     runner_name: None,
+                    pool: Some("ubuntu-latest".to_owned()),
                 },
             ]
         );
@@ -209,6 +244,44 @@ mod tests {
                 .to_vec(),
         };
         assert_eq!(described(&answer).unwrap(), (Vec::new(), None));
+    }
+
+    #[test]
+    fn described_reads_the_pool_tag() {
+        let answer = Response {
+            headers: Vec::new(),
+            status: 200,
+            body: b"<DescribeInstancesResponse><reservationSet><item><instancesSet><item>\
+                <instanceId>i-9</instanceId>\
+                <instanceState><name>stopped</name></instanceState>\
+                <tagSet><item><key>hatchrun:pool</key><value>ubuntu-26.04-4core</value></item></tagSet>\
+                </item></instancesSet></item></reservationSet></DescribeInstancesResponse>"
+                .to_vec(),
+        };
+        let (instances, _) = described(&answer).unwrap();
+        assert_eq!(instances[0].state, "stopped");
+        assert_eq!(instances[0].pool.as_deref(), Some("ubuntu-26.04-4core"));
+        assert_eq!(instances[0].runner_name, None);
+    }
+
+    #[test]
+    fn describe_pool_lists_stopped_instances() {
+        let request = describe_pool("https://ec2/", "hatchrun-ci", None);
+        assert_eq!(
+            String::from_utf8(request.body).unwrap(),
+            "Action=DescribeInstances&Version=2016-11-15\
+             &Filter.1.Name=tag%3Ahatchrun%3Atenant&Filter.1.Value.1=hatchrun-ci\
+             &Filter.2.Name=tag-key&Filter.2.Value.1=hatchrun%3Apool\
+             &Filter.3.Name=instance-state-name&Filter.3.Value.1=pending\
+             &Filter.3.Value.2=running&Filter.3.Value.3=stopping&Filter.3.Value.4=stopped\
+             &MaxResults=1000"
+        );
+        let next = describe_pool("https://ec2/", "hatchrun-ci", Some("tok"));
+        assert!(
+            String::from_utf8(next.body)
+                .unwrap()
+                .ends_with("&NextToken=tok")
+        );
     }
 
     #[test]

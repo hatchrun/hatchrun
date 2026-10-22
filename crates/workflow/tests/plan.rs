@@ -5,7 +5,8 @@
 //! Compiling a workflow into a job plan.
 
 use hatchrun_workflow::{
-    Diagnostic, JobKind, Plan, PlannedJob, PlannedStep, compile, parse, template, validate,
+    Diagnostic, JobKind, Level, Plan, PlannedJob, PlannedStep, compile, config_errors, parse,
+    template, validate,
 };
 
 const CYCLE: &str = "
@@ -186,6 +187,40 @@ workflows: { ci: { on: { push: {} }, jobs: [t] } }
 fn unknown_template_lists_templates() {
     let err = validate(&parse("jobs: { t: { runs-on: ubuntu-24.04, steps: [] } }\nworkflows: { ci: { on: { push: {} }, jobs: [t] } }").unwrap());
     assert!(err[0].message.contains("ubuntu-24.04") && err[0].message.contains("ubuntu-26.04-arm"));
+}
+
+#[test]
+fn unused_executor_with_a_bad_label_compiles() {
+    let yaml = "
+executors: { old: { runs-on: ubuntu-24.04 } }
+jobs: { t: { runs-on: ubuntu-latest, steps: [] }, u: { executor: old, steps: [] } }
+workflows:
+  ci: { on: { push: {} }, jobs: [t] }
+  other: { on: { push: {} }, jobs: [u] }
+";
+    let config = parse(yaml).unwrap();
+    assert!(compile(&config, "ci", "refs/heads/main").is_ok());
+    let err = compile(&config, "other", "refs/heads/main").unwrap_err();
+    assert!(
+        err[0].message.contains("executor `old`") && err[0].message.contains("ubuntu-24.04"),
+        "{err:?}"
+    );
+    let all = validate(&config);
+    assert!(
+        all.iter().any(|d| d.message.contains("executor `old`")),
+        "{all:?}"
+    );
+    let unused = parse(
+        "executors: { old: { runs-on: ubuntu-24.04 } }\njobs: { t: { runs-on: ubuntu-latest, steps: [] } }\nworkflows: { ci: { on: { push: {} }, jobs: [t] } }",
+    )
+    .unwrap();
+    assert!(compile(&unused, "ci", "refs/heads/main").is_ok());
+    assert!(
+        validate(&unused)
+            .iter()
+            .any(|d| d.message.contains("executor `old`"))
+    );
+    assert_eq!(config_errors(&unused), []);
 }
 
 #[test]
@@ -1118,4 +1153,93 @@ fn filters_are_capped() {
     // Plain text, `text**` and `**text` match as text and do not count.
     let plain = many_patterns(20, 250, |i| format!("'docs/{i}/**'"));
     assert_eq!(errors(&plain), Vec::new());
+}
+
+fn token(yaml: &str) -> std::collections::BTreeMap<String, Level> {
+    plan(yaml).jobs[0].token_permissions.clone()
+}
+
+fn levels(entries: &[(&str, Level)]) -> std::collections::BTreeMap<String, Level> {
+    entries.iter().map(|(k, l)| ((*k).to_owned(), *l)).collect()
+}
+
+#[test]
+fn no_permissions_gives_the_read_default() {
+    let got = token(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci: { on: { push: {} }, jobs: [t] }
+",
+    );
+    assert_eq!(
+        got,
+        levels(&[
+            ("checks", Level::Read),
+            ("contents", Level::Read),
+            ("metadata", Level::Read),
+            ("pull_requests", Level::Read),
+        ])
+    );
+}
+
+#[test]
+fn job_permissions_replace_the_workflow_ones() {
+    let got = token(
+        "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    permissions: { pull-requests: write }
+    steps: []
+workflows:
+  ci:
+    on: { push: {} }
+    permissions: { contents: write, issues: write }
+    jobs: [t]
+",
+    );
+    assert_eq!(
+        got,
+        levels(&[("metadata", Level::Read), ("pull_requests", Level::Write)])
+    );
+}
+
+#[test]
+fn workflow_permissions_apply_to_jobs_without_their_own() {
+    let got = token(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    permissions: { contents: write, issues: write }
+    jobs: [t]
+",
+    );
+    assert_eq!(
+        got,
+        levels(&[
+            ("contents", Level::Write),
+            ("issues", Level::Write),
+            ("metadata", Level::Read),
+        ])
+    );
+}
+
+#[test]
+fn bad_permissions_fail_the_parse() {
+    let err = parse(
+        "
+jobs: { t: { runs-on: ubuntu-latest, permissions: { id-token: write }, steps: [] } }
+workflows: {}
+",
+    )
+    .unwrap_err();
+    assert!(
+        err[0]
+            .message
+            .contains("`id-token` permission: OIDC tokens come in a later release"),
+        "{err:?}"
+    );
 }

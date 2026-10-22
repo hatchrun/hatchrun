@@ -14,12 +14,15 @@
 //!
 //! A claim hands the job over in this order: the row must be launched,
 //! the instance's metadata endpoint is turned off, a poll sees the
-//! change applied, and only then is a GitHub token scoped to the job's
-//! repository minted and passed to the run object, whose job document is
-//! the answer. Events and results go to the run object unchanged, for the token's run, job
+//! change applied, the job's secrets and vars are opened here, and only
+//! then is a GitHub token scoped to the job's repository (and capped to
+//! what the App holds) minted and passed to the run object. The object
+//! answers a job document with no secrets or vars; this Worker fills
+//! them in on the way out, so no value enters the object or its storage. Events and results go to the run object unchanged, for the token's run, job
 //! and attempt; the object checks the job is in its run, the attempt and that
 //! the job is running.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -27,11 +30,18 @@ use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::send;
 use hatchrun_cloud::start::app_jwt;
 use hatchrun_workflow::agent::{CLAIM_PATH, EVENTS_PATH, RESULT_PATH};
+use hatchrun_workflow::{JobDocument, SecretRefs};
 use serde_json::json;
-use worker::{Delay, Env, Method, Request, RequestInit, Response, Result, console_error};
+use worker::{
+    Delay, Env, Method, Request, RequestInit, Response, Result, console_error, console_log,
+    console_warn,
+};
 
 use crate::env::{Settings, run_stub};
+use crate::github;
 use crate::launcher::Backend;
+use crate::launches::{self, EndAnswer};
+use crate::secrets::{Keyring, SecretError, job_secrets};
 use crate::store::{self, JobRow, RepoRow, RunRow};
 use crate::token::{self, Claims, TokenError};
 
@@ -296,15 +306,181 @@ async fn claim(
             return retry();
         }
     }
-    let github_token = match mint(settings, &repo).await {
-        Ok(token) => token,
+    // Secrets and vars are opened before the object claims, so a
+    // failure that may pass leaves nothing claimed or metered.
+    let (secrets, vars) = match open_values(env, db, row, &repo).await {
+        Opened::Ready(secrets, vars) => (secrets, vars),
+        Opened::Retry => return retry(),
+        Opened::EndJob(message) => {
+            let answer = launches::post_failed(env, db, row, &message).await;
+            if !matches!(answer, EndAnswer::Status(200..=299 | 409)) {
+                console_error!("job {}: post failed: {answer:?}", row.id);
+            }
+            return status(409);
+        }
+    };
+    let (github_token, capped) = match mint(env, settings, row, &repo).await {
+        Ok(minted) => minted,
         Err(err) => {
             console_error!("job {}: installation token: {err}", row.id);
             return retry();
         }
     };
-    let body = json!({ "token": github_token }).to_string().into_bytes();
-    to_run(env, run.id, "claim", row.id, row.attempt, body).await
+    for c in &capped {
+        console_log!(
+            "job {}: token scope {} capped to {}",
+            row.id,
+            c.scope,
+            c.got
+        );
+    }
+    let body = json!({ "token": github_token, "capped": capped })
+        .to_string()
+        .into_bytes();
+    let mut response = to_run(env, run.id, "claim", row.id, row.attempt, body).await?;
+    if response.status_code() != 200 {
+        return Ok(response);
+    }
+    let mut document = response.json::<JobDocument>().await?;
+    fill(&mut document, secrets, vars);
+    Response::from_json(&document)
+}
+
+/// Puts the job's secrets and vars in the document the run object
+/// answered with.
+pub(crate) fn fill(
+    doc: &mut JobDocument,
+    secrets: BTreeMap<String, String>,
+    vars: BTreeMap<String, String>,
+) {
+    doc.secrets = secrets;
+    doc.vars = vars;
+}
+
+/// A job's secrets and its vars.
+type Values = (BTreeMap<String, String>, BTreeMap<String, String>);
+
+/// What opening a job's secrets and vars came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Opened {
+    /// The values, to go in the document.
+    Ready(BTreeMap<String, String>, BTreeMap<String, String>),
+    /// Postgres or the keyring failed; a retry may pass.
+    Retry,
+    /// A secret will never open: end the job with this message.
+    EndJob(String),
+}
+
+/// What went wrong reading or opening a job's values.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OpenFailure {
+    /// The database or the keyring could not be read.
+    Unavailable(String),
+    /// The secret of this name does not open.
+    Unreadable(String, SecretError),
+}
+
+/// Decides from the outcome of reading the values. Only a secret that
+/// cannot open ends the job: it will not open on a retry either.
+pub(crate) fn opened(outcome: Result<Values, OpenFailure>) -> Opened {
+    match outcome {
+        Ok((secrets, vars)) => Opened::Ready(secrets, vars),
+        Err(OpenFailure::Unavailable(_)) => Opened::Retry,
+        Err(OpenFailure::Unreadable(name, _)) => Opened::EndJob(format!(
+            "Secret `{name}` cannot be read. Set it again in the hatchrun app."
+        )),
+    }
+}
+
+/// Reads and opens the secrets the job references and the repository's
+/// vars.
+async fn open_values(env: &Env, db: &Db, row: &JobRow, repo: &RepoRow) -> Opened {
+    let outcome = read_values(env, db, row, repo).await;
+    match &outcome {
+        Err(OpenFailure::Unavailable(err)) => {
+            console_error!("job {}: secrets: {err}", row.id);
+        }
+        Err(OpenFailure::Unreadable(name, err)) => {
+            console_error!("job {}: secret {name}: {err:?}", row.id);
+        }
+        Ok(_) => {}
+    }
+    opened(outcome)
+}
+
+async fn read_values(
+    env: &Env,
+    db: &Db,
+    row: &JobRow,
+    repo: &RepoRow,
+) -> Result<Values, OpenFailure> {
+    let unavailable = |err: &dyn std::fmt::Display| OpenFailure::Unavailable(err.to_string());
+    let refs: SecretRefs =
+        serde_json::from_value(row.secret_refs.clone()).map_err(|e| unavailable(&e))?;
+    let names: Vec<String> = refs.names.iter().cloned().collect();
+    let rows = if refs.all {
+        store::sealed_secrets(db, &repo.tenant_id, repo.id, None).await
+    } else {
+        store::sealed_secrets(db, &repo.tenant_id, repo.id, Some(&names)).await
+    }
+    .map_err(|e| unavailable(&e))?;
+    let vars = store::job_vars(db, &repo.tenant_id, repo.id)
+        .await
+        .map_err(|e| unavailable(&e))?;
+    if rows.is_empty() {
+        return Ok((BTreeMap::new(), vars));
+    }
+    let keyring = Keyring::load(env).await.map_err(|e| unavailable(&e))?;
+    let secrets = job_secrets(&refs, &rows, &keyring, &repo.tenant_id)
+        .map_err(|(name, err)| OpenFailure::Unreadable(name, err))?;
+    Ok((secrets, vars))
+}
+
+/// The KV key of an installation's permissions.
+fn permissions_key(installation_id: u64) -> String {
+    format!("ci:installation-permissions:{installation_id}")
+}
+
+/// How long an installation's permissions are cached, in seconds.
+const PERMISSIONS_TTL_SECS: u64 = 600;
+
+/// What the App holds on the installation: from KV, else from GitHub
+/// with the App JWT, and kept for [`PERMISSIONS_TTL_SECS`].
+async fn held_permissions(
+    env: &Env,
+    settings: &Settings,
+    jwt: &str,
+    installation_id: u64,
+) -> std::result::Result<BTreeMap<String, String>, String> {
+    let kv = env.kv("TOKENS").ok();
+    let key = permissions_key(installation_id);
+    if let Some(kv) = &kv {
+        match kv.get(&key).json::<BTreeMap<String, String>>().await {
+            Ok(Some(held)) => return Ok(held),
+            Ok(None) => {}
+            Err(err) => console_warn!("installation {installation_id}: permissions cache: {err}"),
+        }
+    }
+    let request = hatchrun_cloud::github::installation(&settings.github_api, jwt, installation_id);
+    let response = send(&request).await?;
+    let held = hatchrun_cloud::github::parse_installation(&response)?.permissions;
+    if let Some(kv) = &kv {
+        let stored = match serde_json::to_string(&held) {
+            Ok(value) => match kv.put(&key, value) {
+                Ok(put) => put
+                    .expiration_ttl(PERMISSIONS_TTL_SECS)
+                    .execute()
+                    .await
+                    .map_err(|err| err.to_string()),
+                Err(err) => Err(err.to_string()),
+            },
+            Err(err) => Err(err.to_string()),
+        };
+        if let Err(err) = stored {
+            console_warn!("installation {installation_id}: cache permissions: {err}");
+        }
+    }
+    Ok(held)
 }
 
 fn retry() -> Result<Response> {
@@ -333,13 +509,28 @@ async fn metadata_off(settings: &Settings, instance_id: &str) -> std::result::Re
     }
 }
 
-/// A GitHub token for the job's repository.
-async fn mint(settings: &Settings, repo: &RepoRow) -> std::result::Result<String, String> {
+/// A GitHub token for the job's repository with the job's permissions
+/// at the levels the App holds, and the scopes that were capped.
+async fn mint(
+    env: &Env,
+    settings: &Settings,
+    row: &JobRow,
+    repo: &RepoRow,
+) -> std::result::Result<(String, Vec<github::Capped>), String> {
+    let asked: BTreeMap<String, String> = serde_json::from_value(row.token_permissions.clone())
+        .map_err(|err| format!("token permissions: {err}"))?;
     let jwt = app_jwt(&settings.app_id, &settings.app_key).await?;
-    let request =
-        crate::github::scoped_token(&settings.github_api, repo.installation_id, &jwt, repo.id);
+    let held = held_permissions(env, settings, &jwt, repo.installation_id).await?;
+    let (permissions, capped) = github::cap_permissions(&asked, &held);
+    let request = github::scoped_token(
+        &settings.github_api,
+        repo.installation_id,
+        &jwt,
+        repo.id,
+        &permissions,
+    );
     let response = send(&request).await?;
-    crate::github::installation_token(&response)
+    Ok((github::installation_token(&response)?, capped))
 }
 
 /// Passes `body` to `route` of the run's object for the token's job and
@@ -389,6 +580,10 @@ mod tests {
             completed_at: None,
             steps: serde_json::json!([]),
             log_key: None,
+            template: Some("ubuntu-latest".into()),
+            token_permissions: serde_json::json!({}),
+            secret_refs: serde_json::json!({ "all": false, "names": [] }),
+            held: None,
         }
     }
 
@@ -406,7 +601,8 @@ mod tests {
             "id": 1, "run_number": 1, "run_attempt": 1, "tenant_id": tenant,
             "repo_id": repo, "workflow": "ci.yml", "delivery": "d", "event": "push",
             "git_ref": "refs/heads/main", "sha": "abc", "actor": "a",
-            "status": "queued", "conclusion": null, "created_at": 0, "completed_at": null
+            "status": "queued", "conclusion": null, "created_at": 0, "completed_at": null,
+            "retention_days": 30
         }))
         .expect("a run row")
     }
@@ -547,5 +743,93 @@ mod tests {
     fn bodies_over_one_mebibyte_are_too_large() {
         assert!(!too_large(MAX_BODY_BYTES));
         assert!(too_large(MAX_BODY_BYTES + 1));
+    }
+
+    fn document() -> JobDocument {
+        use hatchrun_workflow::{Github, JobKind, PlannedJob, template};
+        JobDocument {
+            run_id: "7".into(),
+            run_number: 3,
+            run_attempt: 1,
+            workflow: "ci".into(),
+            job: PlannedJob {
+                id: "build".into(),
+                name: "build".into(),
+                requires: Vec::new(),
+                kind: JobKind::Run {
+                    template: template("ubuntu-latest").unwrap(),
+                },
+                matrix: BTreeMap::new(),
+                node: None,
+                env: BTreeMap::new(),
+                if_: None,
+                timeout_minutes: 10,
+                outputs: BTreeMap::new(),
+                token_permissions: BTreeMap::new(),
+                steps: Vec::new(),
+            },
+            event_name: "push".into(),
+            event: serde_json::json!({}),
+            github: Github {
+                repository: "acme/repo".into(),
+                repository_owner: "acme".into(),
+                sha: "abc".into(),
+                ref_: "refs/heads/main".into(),
+                ref_name: "main".into(),
+                ref_type: "branch".into(),
+                head_ref: String::new(),
+                base_ref: String::new(),
+                actor: "octo".into(),
+                server_url: "https://github.com".into(),
+                api_url: "https://api.github.com".into(),
+                graphql_url: "https://api.github.com/graphql".into(),
+                token: "tok".into(),
+            },
+            needs: BTreeMap::new(),
+            secrets: BTreeMap::new(),
+            vars: BTreeMap::new(),
+            timings: BTreeMap::new(),
+            cache: None,
+        }
+    }
+
+    #[test]
+    fn fill_sets_secrets_and_vars() {
+        let mut doc = document();
+        let before = document();
+        fill(
+            &mut doc,
+            BTreeMap::from([("A".into(), "s".into())]),
+            BTreeMap::from([("V".into(), "v".into())]),
+        );
+        assert_eq!(doc.secrets, BTreeMap::from([("A".into(), "s".into())]));
+        assert_eq!(doc.vars, BTreeMap::from([("V".into(), "v".into())]));
+        let (mut doc, mut before) = (doc, before);
+        doc.secrets.clear();
+        doc.vars.clear();
+        before.secrets.clear();
+        before.vars.clear();
+        assert!(doc == before, "fill changed another field");
+    }
+
+    #[test]
+    fn unreadable_secret_ends_the_job() {
+        let secrets = BTreeMap::from([("A".to_owned(), "s".to_owned())]);
+        assert_eq!(
+            opened(Ok((secrets.clone(), BTreeMap::new()))),
+            Opened::Ready(secrets, BTreeMap::new())
+        );
+        for err in [SecretError::UnknownKey("old".into()), SecretError::Corrupt] {
+            assert_eq!(
+                opened(Err(OpenFailure::Unreadable("NPM_TOKEN".into(), err))),
+                Opened::EndJob(
+                    "Secret `NPM_TOKEN` cannot be read. Set it again in the hatchrun app.".into()
+                )
+            );
+        }
+        assert_eq!(
+            opened(Err(OpenFailure::Unavailable("db down".into()))),
+            Opened::Retry
+        );
     }
 }

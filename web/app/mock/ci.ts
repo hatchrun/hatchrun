@@ -15,6 +15,7 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 
 import type { LogIndex } from "../src/api.ts";
+import { handleCiSettings } from "./ci-settings.ts";
 
 interface Step {
   index: number;
@@ -209,6 +210,10 @@ export async function handleCi(
   const path = url.pathname.replace(/^\/api\/ci\//, "");
   const hidden = () => json(res, 404, { error: "not found" });
   let found: RegExpExecArray | null;
+
+  if (handleCiSettings(req, res, path, session, body)) {
+    return;
+  }
 
   if ((found = /^repos\/([^/]+)\/([^/]+)\/runs$/.exec(path))) {
     const repository = `${found[1]}/${found[2]}`;

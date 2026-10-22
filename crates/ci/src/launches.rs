@@ -8,7 +8,11 @@
 //! A message names a job and the attempt it was queued for. The
 //! consumer loads the job and does nothing when the attempt differs
 //! (the job was re-run since) or the job is not queued any more. Then
-//! it claims the launch, which only one consumer can, and:
+//! it checks the tenant's caps (see [`crate::billing::admission`]): a
+//! tenant without a card, at its spend cap or running its most jobs
+//! has the job held, queued with its reason and looked at again 30 s
+//! later (see [`hold_job`]). Otherwise it claims the launch, which only
+//! one consumer can, and:
 //!
 //! 1. signs the job token and a one-use ticket;
 //! 2. starts the instance with the ticket in its user data (see
@@ -25,12 +29,14 @@
 //! jobs whose messages ran out of retries.
 
 use futures_util::future::join_all;
+use hatchrun_cloud::ci_wake::{self, Woken};
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::send;
 use hatchrun_cloud::http::Request;
 use hatchrun_cloud::start::{Cause, Failure};
 use hatchrun_cloud::{jwt, webcrypto};
 use hatchrun_workflow::agent::{BootDocument, CiBoot};
+use hatchrun_workflow::{DEFAULT_SPEND_CAP_MICROS, MAX_RUNNING_JOBS, Template, template};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use worker::{
@@ -38,10 +44,12 @@ use worker::{
     RequestInit, console_error, console_log,
 };
 
+use crate::billing::{self, HOLD_RECHECK_MS, Hold};
 use crate::env::{Settings, run_stub};
 use crate::launcher::{Backend, LaunchSpec, user_data};
 use crate::reconcile::LAUNCH_QUIET_MS;
-use crate::store::{self, JobRow};
+use crate::run::LAUNCHES;
+use crate::store::{self, Claim, JobRow, Standing};
 use crate::token::{self, Claims};
 
 /// The dead-letter queue in `wrangler.toml`.
@@ -58,6 +66,8 @@ const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 const TICKET_EXPIRES_IN: u64 = token::BOOT_SECS;
 /// The message that ends a job whose launch message ran out of retries.
 const DEAD_LETTER_MESSAGE: &str = "the launch did not finish";
+/// The message that ends a job whose row names no runner template.
+const NO_TEMPLATE: &str = "job has no runner template";
 /// The message that ends a job that used all its launch attempts.
 const OUT_OF_ATTEMPTS: &str = "the launch did not finish in 3 attempts";
 
@@ -188,16 +198,46 @@ async fn launch(
         }
         Delivery::Launch | Delivery::GiveUp => {}
     }
-    let Some(job) = store::claim_launch(&db, message.job_id, now_ms())
+    let now = now_ms();
+    let standing = match store::standing(
+        &db,
+        message.job_id,
+        billing::month_start(now),
+        DEFAULT_SPEND_CAP_MICROS,
+    )
+    .await
+    {
+        Ok(Some(standing)) => standing,
+        Ok(None) => return Ok(()),
+        Err(err) => return Err(err.to_string()),
+    };
+    // A job that is out of launch attempts is ended, not launched, so no
+    // cap applies to it.
+    let max_running = if delivery == Delivery::GiveUp {
+        u32::MAX
+    } else {
+        if let Some(reason) = billing::admission(&standing) {
+            return hold_job(env, settings, &db, &job, &standing, reason, now).await;
+        }
+        MAX_RUNNING_JOBS
+    };
+    let job = match store::claim_launch(&db, message.job_id, &standing.tenant_id, max_running, now)
         .await
         .map_err(|err| err.to_string())?
-    else {
-        return Ok(());
+    {
+        Claim::Claimed(job) => job,
+        Claim::Busy => {
+            return hold_job(env, settings, &db, &job, &standing, Hold::Concurrency, now).await;
+        }
+        Claim::Gone => return Ok(()),
     };
     if delivery == Delivery::GiveUp {
         return end_job(env, &db, &job, OUT_OF_ATTEMPTS).await;
     }
-    match launch_claimed(&db, settings, backend, &job).await {
+    let Some(template) = runner_template(&job) else {
+        return end_job(env, &db, &job, NO_TEMPLATE).await;
+    };
+    match launch_claimed(&db, settings, backend, &job, template).await {
         Ok(Launched::Started | Launched::MovedOn) => Ok(()),
         Err(failure) => {
             console_error!(
@@ -209,6 +249,83 @@ async fn launch(
             record_failure(env, &db, &job, &failure).await
         }
     }
+}
+
+/// Keeps the queued job held for `reason`, to be looked at again after
+/// [`HOLD_RECHECK_MS`], and tells the run's object the reason every
+/// time, changed or not: a post that fails is made again when the
+/// reconciler requeues the job. The message is acked either way, so an
+/// error is only a database one.
+async fn hold_job(
+    env: &Env,
+    settings: &Settings,
+    db: &Db,
+    job: &JobRow,
+    standing: &Standing,
+    reason: Hold,
+    now: u64,
+) -> Result<(), String> {
+    let changed = store::hold(
+        db,
+        job.id,
+        job.attempt,
+        reason.as_str(),
+        now + HOLD_RECHECK_MS,
+        now,
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    if changed {
+        console_log!("job {}: held, {}", job.id, reason.as_str());
+    }
+    let message = reason.message(&standing.org_login, &settings.app_url, standing.cap_micros);
+    let answer = post_to_run(env, db, job, "held", &message).await;
+    if !matches!(answer, EndAnswer::Status(200..=299 | 409)) {
+        console_error!("job {}: post held: {answer:?}", job.id);
+    }
+    Ok(())
+}
+
+/// Sends a launch message for each of `woken`: the consumer checks the
+/// caps again.
+///
+/// # Errors
+///
+/// The queue did not take a message; the ones before it were sent.
+pub(crate) async fn send_wakes(env: &Env, woken: &[Woken]) -> Result<(), String> {
+    let queue = env.queue(LAUNCHES).map_err(|e| e.to_string())?;
+    for job in woken {
+        queue
+            .send(LaunchMessage {
+                job_id: job.job_id,
+                attempt: job.attempt,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// A job of `tenant_id` ended: wakes its oldest job held for the
+/// concurrency cap, which the freed place is for. A failure is logged
+/// and left to the reconciler's backstop, since the job's end is
+/// recorded already.
+pub(crate) async fn wake_oldest(env: &Env, db: &Db, tenant_id: &str) {
+    let woken = match ci_wake::held(db, tenant_id, Hold::Concurrency.as_str(), 1).await {
+        Ok(woken) => woken,
+        Err(err) => {
+            console_error!("tenant {tenant_id}: find the held job: {err}");
+            return;
+        }
+    };
+    if let Err(err) = send_wakes(env, &woken).await {
+        console_error!("tenant {tenant_id}: wake the held job: {err}");
+    }
+}
+
+/// The runner template the job's row names, if it names a known one.
+fn runner_template(job: &JobRow) -> Option<&'static Template> {
+    job.template.as_deref().and_then(template)
 }
 
 /// What a delivered message asks of the consumer.
@@ -254,6 +371,7 @@ async fn launch_claimed(
     settings: &Settings,
     backend: &Backend,
     job: &JobRow,
+    template: &'static Template,
 ) -> Result<Launched, Failure> {
     let internal = |err: String| Failure::new(Cause::Internal, err);
     let now = now_ms();
@@ -278,12 +396,16 @@ async fn launch_claimed(
         job_id: job.id,
         name: crate::reconcile::runner_name(job.id, job.attempt, job.launch_attempts),
         user_data: user_data(&settings.broker_url, &ticket),
+        template,
     };
-    let instance_id = backend.launch(db, &spec).await?;
-    if let Err(err) = store_ticket(settings, &ticket, &document).await {
-        backend.terminate(&instance_id).await;
-        return Err(err);
-    }
+    // The ticket is stored before any instance starts, so a pool instance
+    // that boots at once finds it, and a broker that is down launches
+    // nothing.
+    store_ticket(settings, &ticket, &document).await?;
+    let instance_id = match from_pool(db, backend, &spec).await {
+        Some(instance_id) => instance_id,
+        None => backend.launch(db, &spec).await?,
+    };
     match store::launched(db, job.id, &instance_id, now_ms()).await {
         Ok(true) => {
             console_log!("job {}: launched {instance_id}", job.id);
@@ -297,6 +419,41 @@ async fn launch_claimed(
         Err(err) => {
             backend.terminate(&instance_id).await;
             Err(internal(err.to_string()))
+        }
+    }
+}
+
+/// Hands the oldest ready instance of the job's template from the warm
+/// pool to the job and starts it, or returns `None` for a fresh launch:
+/// the pool has none, could not be read, or the instance did not take
+/// the job's user data (it is terminated, as an instance in an unknown
+/// state must not run a job).
+async fn from_pool(db: &Db, backend: &Backend, spec: &LaunchSpec) -> Option<String> {
+    let template = spec.template.labels[0];
+    let instance_id = match store::take_pool(db, template).await {
+        Ok(Some(instance_id)) => instance_id,
+        Ok(None) => return None,
+        Err(err) => {
+            console_error!(
+                "job {}: take a {template} pool instance: {err}",
+                spec.job_id
+            );
+            return None;
+        }
+    };
+    match backend.start_pooled(&instance_id, spec).await {
+        Ok(()) => {
+            console_log!("job {}: started pool instance {instance_id}", spec.job_id);
+            Some(instance_id)
+        }
+        Err(failure) => {
+            console_error!(
+                "job {}: start pool instance {instance_id}: {}",
+                spec.job_id,
+                failure.message
+            );
+            backend.terminate(&instance_id).await;
+            None
         }
     }
 }
@@ -390,6 +547,12 @@ pub(crate) fn end_action(answer: &EndAnswer) -> EndAction {
 
 /// Asks the run's object to end attempt `job.attempt` as failed.
 pub(crate) async fn post_failed(env: &Env, db: &Db, job: &JobRow, message: &str) -> EndAnswer {
+    post_to_run(env, db, job, "failed", message).await
+}
+
+/// Posts `{"message": message}` to route `route` of the object of the
+/// job's run, for the job's current attempt.
+async fn post_to_run(env: &Env, db: &Db, job: &JobRow, route: &str, message: &str) -> EndAnswer {
     let run = match store::run(db, job.run_id).await {
         Ok(Some(run)) => run,
         Ok(None) => return EndAnswer::RunMissing,
@@ -402,8 +565,8 @@ pub(crate) async fn post_failed(env: &Env, db: &Db, job: &JobRow, message: &str)
     init.with_method(Method::Post)
         .with_body(Some(json!({ "message": message }).to_string().into()));
     let url = format!(
-        "https://run/failed?job={}&attempt={}&run={}&tenant={}",
-        job.id, job.attempt, run.id, run.tenant_id
+        "https://run/{route}?job={}&attempt={}&run={}&tenant={}&days={}",
+        job.id, job.attempt, run.id, run.tenant_id, run.retention_days
     );
     let sent = async {
         let request = worker::Request::new_with_init(&url, &init)?;
@@ -412,7 +575,7 @@ pub(crate) async fn post_failed(env: &Env, db: &Db, job: &JobRow, message: &str)
     match sent.await {
         Ok(response) => EndAnswer::Status(response.status_code()),
         Err(err) => {
-            console_error!("job {}: post failed: {err}", job.id);
+            console_error!("job {}: post {route}: {err}", job.id);
             EndAnswer::Error
         }
     }
@@ -628,8 +791,26 @@ mod tests {
             "launch_attempts": launch_attempts, "next_launch_at": null,
             "timeout_minutes": 10, "updated_at": 0, "heartbeat_at": null,
             "started_at": null, "completed_at": null, "steps": "[]", "log_key": null,
+            "template": "ubuntu-latest", "token_permissions": "{}",
+            "secret_refs": "{\"all\":false,\"names\":[]}",
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_row_without_a_known_template_has_no_runner_template() {
+        let mut job = row("queued", 1, 0);
+        assert_eq!(
+            runner_template(&job).map(|t| t.vcpu),
+            Some(2),
+            "ubuntu-latest"
+        );
+        job.template = Some("ubuntu-26.04-16core-arm".into());
+        assert_eq!(runner_template(&job).map(|t| t.vcpu), Some(16));
+        job.template = Some("ubuntu-24.04".into());
+        assert_eq!(runner_template(&job), None);
+        job.template = None;
+        assert_eq!(runner_template(&job), None);
     }
 
     #[test]

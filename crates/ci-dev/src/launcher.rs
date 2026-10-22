@@ -6,7 +6,8 @@
 //! "instance" is a `hatchrun-agent ci` process in a process group of
 //! its own.
 //!
-//! - `POST /instances` `{"name", "job_id", "user_data"}` writes the user
+//! - `POST /instances` `{"name", "job_id", "template", "user_data"}`
+//!   (`template` is the job's first `runs-on` label) writes the user
 //!   data to `<work-root>/<id>/user-data.json`, starts the agent and
 //!   answers `{"instance_id": id}`.
 //! - `POST /instances/{id}/metadata-off` turns the metadata endpoint
@@ -16,7 +17,7 @@
 //! - `DELETE /instances/{id}` sends the process group `SIGTERM`, as a
 //!   shutdown does, and `SIGKILL` 10 s later.
 //! - `GET /instances` lists the instances still running.
-//! - `GET /_events` lists, in order, `launch <id>`, `metadata-off <id>`,
+//! - `GET /_events` lists, in order, `launch <id> <template>`, `metadata-off <id>`,
 //!   `metadata-read <id>` (a read that answered `applied`),
 //!   `terminate <id>` and `exit <id> <code>`. A process killed by signal
 //!   `n` exits with `128 + n`.
@@ -49,6 +50,8 @@ pub struct Launch {
     pub name: String,
     /// The job.
     pub job_id: u64,
+    /// The runner template the job asked for, by its first label.
+    pub template: String,
     /// The user data, as text.
     pub user_data: String,
 }
@@ -182,7 +185,9 @@ async fn launch(State(launcher): State<Launcher>, Json(launch): Json<Launch>) ->
             );
         }
     };
-    inner.events.push(format!("launch {id}"));
+    inner
+        .events
+        .push(format!("launch {id} {}", launch.template));
     inner.instances.insert(
         id.clone(),
         Instance {
@@ -346,7 +351,12 @@ mod tests {
             &app,
             "POST",
             "/instances",
-            Some(json!({ "name": "ci-1-1-1", "job_id": 1, "user_data": "{\"mode\":\"ci\"}" })),
+            Some(json!({
+                "name": "ci-1-1-1",
+                "job_id": 1,
+                "template": "ubuntu-26.04-8core-arm",
+                "user_data": "{\"mode\":\"ci\"}",
+            })),
         )
         .await;
         assert_eq!(status, 200);
@@ -376,7 +386,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let position = |event: &str| events.iter().position(|e| e == event);
-        let launch = position(&format!("launch {id}")).unwrap();
+        let launch = position(&format!("launch {id} ubuntu-26.04-8core-arm")).unwrap();
         let off = position(&format!("metadata-off {id}")).unwrap();
         let read = position(&format!("metadata-read {id}")).unwrap();
         assert!(launch < off && off < read, "{events:?}");

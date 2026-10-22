@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The reconciler, which the Cron Trigger runs every minute under a
-//! lease on `ci_reconciler` (see [`run`]). A pass does five things, in
+//! lease on `ci_reconciler` (see [`run`]). A pass does eight things, in
 //! order, and an error in one is logged and does not stop the next:
 //!
 //! 1. fires the `on: schedule` workflows of the minutes since the last
@@ -12,16 +12,21 @@
 //!    never finished;
 //! 3. fails the jobs whose runner went quiet;
 //! 4. terminates instances that no job needs;
-//! 5. deletes expired runs and purges their objects.
+//! 5. keeps the warm pool of each runner template at the size the last
+//!    hour's claims ask for ([`crate::pool`]);
+//! 6. deletes expired runs and purges their objects;
+//! 7. sends metered usage to Polar;
+//! 8. re-seals secrets that an old key still seals.
 //!
 //! Each step decides over rows and the clock with a pure function
 //! ([`minutes`], [`fires`], [`stalled`], [`orphans`]) and then acts.
 //!
 //! A pass is bounded so it stays inside the Worker's CPU time and
 //! subrequest limits. It counts the outbound calls it makes (GitHub,
-//! run objects, queue, AWS) against [`BUDGET`], split by [`shares`]:
-//! 500 for schedules, 200 for stalled jobs, 100 for orphans and 100 for
-//! retention. A step whose share runs out stops and resumes in the next
+//! run objects, queue, AWS, Polar) against [`BUDGET`], split by
+//! [`shares`]: 500 for schedules, then of the rest 3/8 for stalled
+//! jobs, 1/8 each for orphans and the warm pool, 1/16 each for usage and
+//! re-sealing, and the remainder (100 at [`BUDGET`]) for retention. A step whose share runs out stops and resumes in the next
 //! pass. Rows and runs are bounded too: [`MAX_MINUTES`] minutes,
 //! [`SCHEDULE_ROWS`] schedule rows, [`MAX_FIXES`] stalled jobs,
 //! [`MAX_TERMINATIONS`] terminated instances and [`store::SWEEP_LIMIT`]
@@ -33,11 +38,17 @@ use std::collections::HashMap;
 
 use futures_util::future::join_all;
 use hatchrun_cloud::aws::instances::Described;
+use hatchrun_cloud::ci_wake::{self, Woken};
 use hatchrun_cloud::db::Db;
-use hatchrun_cloud::fetch::Counted;
+use hatchrun_cloud::fetch::{Counted, send};
+use hatchrun_cloud::http::Response;
 use hatchrun_cloud::parse_rfc3339;
+use hatchrun_cloud::polar::{CI_INGEST_BATCH, CiUsage, ci_ingest, ingested};
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Cron, Event, UtcMinute};
+use hatchrun_scaler_core::pool::{Backoff, Pool};
+use hatchrun_scaler_core::{Action, Instance, PoolInstance, PoolState};
+use hatchrun_workflow::templates::TEMPLATES;
+use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, Template, UtcMinute};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
@@ -46,9 +57,11 @@ use crate::github;
 use crate::intake::Repo;
 use crate::launcher::Backend;
 use crate::launches::{self, EndAction, LaunchMessage};
+use crate::pool::{self, WINDOW_MS, pool_target};
 use crate::run::LAUNCHES;
 use crate::runs::{self, Config};
-use crate::store::{self, JobRow, ScheduleRow};
+use crate::secrets;
+use crate::store::{self, CiBilling, JobRow, PoolRow, ScheduleRow};
 
 /// How long the lease holds, in milliseconds.
 const LEASE_MS: u64 = 55_000;
@@ -60,6 +73,14 @@ pub const MAX_FIRES: usize = 200;
 pub const SCHEDULE_ROWS: u32 = 1_000;
 /// The most stalled jobs one pass handles.
 pub const MAX_FIXES: u32 = 50;
+/// The subrequests the held-job backstop may spend in the passes that
+/// run it, on top of [`BUDGET`] and apart from the stalled-job share.
+pub const HELD_BUDGET: u32 = 40;
+/// The backstop runs in the passes of every 15th minute.
+const HELD_EVERY_MINUTES: u64 = 15;
+/// The backstop leaves a held job alone for this long after its last
+/// hold.
+pub const HELD_QUIET_MS: u64 = 10 * 60_000;
 /// The most instances one pass terminates as orphans.
 pub const MAX_TERMINATIONS: usize = 50;
 
@@ -91,24 +112,38 @@ pub struct Shares {
     pub stalled: u32,
     /// Orphan instances.
     pub orphans: u32,
+    /// The warm pool.
+    pub pool: u32,
+    /// Usage sent to Polar.
+    pub usage: u32,
+    /// Re-sealing secrets under the current key.
+    pub reseal: u32,
     /// Retention.
     pub retention: u32,
 }
 
-/// Splits `total`: schedules take 5/9 of it, at most 500, and the rest
-/// goes half to stalled jobs, a quarter to orphans and a quarter to
-/// retention. Schedules cannot take what the other steps need.
+/// Splits `total`: schedules take 5/9 of it, at most 500. Of the rest
+/// stalled jobs take 3/8, orphans and the pool 1/8 each, usage and
+/// re-sealing 1/16 each, rounded down, and retention the remainder.
+/// Schedules cannot take what the other steps need, and retention keeps
+/// at least `SWEEP_LIMIT * PURGE_COST` at [`BUDGET`].
 #[must_use]
 pub fn shares(total: u32) -> Shares {
     let schedules = (total / 9 * 5).min(500);
     let rest = total - schedules;
-    let stalled = rest / 2;
-    let orphans = rest / 4;
+    let stalled = rest / 8 * 3 + rest % 8 * 3 / 8;
+    let orphans = rest / 8;
+    let pool = rest / 8;
+    let usage = rest / 16;
+    let reseal = rest / 16;
     Shares {
         schedules,
         stalled,
         orphans,
-        retention: rest - stalled - orphans,
+        pool,
+        usage,
+        reseal,
+        retention: rest - stalled - orphans - pool - usage - reseal,
     }
 }
 
@@ -157,6 +192,11 @@ const TERMINATE_COST: u32 = 2;
 const LIST_COST: u32 = 2;
 /// Of purging a run's object.
 const PURGE_COST: u32 = 1;
+/// Of stopping a pool instance: credentials and the call.
+const STOP_COST: u32 = 2;
+/// Of launching a pool instance: a launch template version, a fleet or
+/// two, and the version's deletion.
+const POOL_LAUNCH_COST: u32 = 5;
 
 /// The name of the runner of launch `launch` of attempt `attempt` of job
 /// `job`, which is also the instance's `hatchrun:runner-name` tag.
@@ -194,9 +234,11 @@ pub fn stalled(rows: &[JobRow], now: u64) -> Vec<Fix> {
 fn fix(row: &JobRow, now: u64) -> Option<Fix> {
     let quiet_since = |since: u64, limit: u64| since < now.saturating_sub(limit);
     match row.status.as_str() {
+        // A held job is woken, not requeued: see [`wake_held`].
         "queued"
-            if row.next_launch_at.is_some_and(|at| at <= now)
-                || quiet_since(row.updated_at, QUEUED_QUIET_MS) =>
+            if row.held.is_none()
+                && (row.next_launch_at.is_some_and(|at| at <= now)
+                    || quiet_since(row.updated_at, QUEUED_QUIET_MS)) =>
         {
             Some(Fix::Requeue(row.id))
         }
@@ -232,11 +274,13 @@ fn terminate_and_fail(row: &JobRow, message: &'static str) -> Fix {
 /// `now`, a later attempt or launch of the job replaced the instance
 /// (its runner name says which it is), or the instance started more
 /// than 7 hours ago. A launch time that does not parse counts as old.
+/// An instance with a pool tag belongs to the warm pool, which keeps it.
 #[must_use]
 pub fn orphans(described: &[Described], rows: &[JobRow], now: u64) -> Vec<String> {
     let jobs: HashMap<u64, &JobRow> = rows.iter().map(|row| (row.id, row)).collect();
     described
         .iter()
+        .filter(|instance| instance.pool.is_none())
         .filter(|instance| {
             let old = parse_rfc3339(&instance.launch_time)
                 .is_none_or(|at| at < now.saturating_sub(MAX_AGE_MS));
@@ -391,13 +435,29 @@ pub async fn run(env: Env) {
     {
         console_error!("reconcile: stalled jobs: {err}");
     }
+    if held_backstop_due(now)
+        && let Err(err) = wake_held(&env, &db, &Budget::new(HELD_BUDGET), now).await
+    {
+        console_error!("reconcile: held jobs: {err}");
+    }
     if let Ok(backend) = &backend
         && let Err(err) = end_orphans(&db, backend, &Budget::new(share.orphans), now).await
     {
         console_error!("reconcile: orphans: {err}");
     }
+    if let Ok(backend) = &backend
+        && let Err(err) = keep_pool(&db, backend, &Budget::new(share.pool), now).await
+    {
+        console_error!("reconcile: warm pool: {err}");
+    }
     if let Err(err) = retain(&env, &db, &Budget::new(share.retention), now).await {
         console_error!("reconcile: retention: {err}");
+    }
+    if let Err(err) = report_usage(&db, &settings, &Budget::new(share.usage), now).await {
+        console_error!("reconcile: usage: {err}");
+    }
+    if let Err(err) = reseal_secrets(&env, &db, &Budget::new(share.reseal)).await {
+        console_error!("reconcile: reseal: {err}");
     }
 }
 
@@ -515,7 +575,7 @@ async fn head(
         .await
         .map_err(|e| e.to_string())?
     {
-        Some(tenant) if tenant.ci_enabled => {}
+        Some(tenant) if tenant.ci_billing == CiBilling::Active => {}
         _ => return Ok(None),
     }
     let response = tokens
@@ -641,6 +701,51 @@ async fn fix_stalled(
     Ok(())
 }
 
+/// Whether the pass at `now_ms` runs the held-job backstop.
+#[must_use]
+pub fn held_backstop_due(now_ms: u64) -> bool {
+    (now_ms / 60_000).is_multiple_of(HELD_EVERY_MINUTES)
+}
+
+/// The jobs of `woken` that `budget` pays a message for, in order.
+#[must_use]
+pub fn paid_wakes(woken: &[Woken], budget: &Budget) -> Vec<Woken> {
+    woken
+        .iter()
+        .copied()
+        .take_while(|_| budget.take(REQUEUE_COST))
+        .collect()
+}
+
+/// The slow backstop for held jobs, which the stalled-job step leaves
+/// alone. Wakes come from the Polar webhook (card), the end of a job
+/// (concurrency) and the owner raising the cap; this catches a wake that
+/// was lost, and releases spend-cap holds when the month turns. It sends
+/// the oldest held jobs of each tenant, at most [`MAX_RUNNING_JOBS`]
+/// each, that nobody looked at for [`HELD_QUIET_MS`], paid from its own
+/// `budget`. The consumer checks the caps again and holds a job that
+/// still waits.
+async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
+    // A spend-cap hold may have ended with the month: let it drain in
+    // order through the concurrency path.
+    ci_wake::release_spend_caps(db, now.saturating_sub(HELD_QUIET_MS))
+        .await
+        .map_err(|e| e.to_string())?;
+    let stale = ci_wake::stale(
+        db,
+        now.saturating_sub(HELD_QUIET_MS),
+        MAX_RUNNING_JOBS,
+        HELD_BUDGET,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let wakes = paid_wakes(&stale, budget);
+    if wakes.len() < stale.len() {
+        console_error!("reconcile: held-job budget spent, the rest wait");
+    }
+    launches::send_wakes(env, &wakes).await
+}
+
 async fn requeue(env: &Env, row: &JobRow) -> Result<(), String> {
     env.queue(LAUNCHES)
         .map_err(|e| e.to_string())?
@@ -675,6 +780,7 @@ async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> 
             else {
                 return Ok(());
             };
+            launches::wake_oldest(env, db, &run.tenant_id).await;
             let jobs = store::jobs_for_run(db, run.id)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -723,7 +829,243 @@ async fn end_orphans(db: &Db, backend: &Backend, budget: &Budget, now: u64) -> R
     Ok(())
 }
 
-/// Step 5. A sweep takes at most [`store::SWEEP_LIMIT`] runs and one
+/// Step 5. Keeps the warm pool of each runner template at the size its
+/// claims in the last hour ask for (see [`crate::pool`]). Skipped for a
+/// backend without a pool. One list of the pool instances serves every
+/// template; an error in one template's pool is logged and does not stop
+/// the next. What `budget` does not pay for waits for the next pass.
+async fn keep_pool(db: &Db, backend: &Backend, budget: &Budget, now: u64) -> Result<(), String> {
+    if !backend.has_pool() || !budget.take(LIST_COST) {
+        return Ok(());
+    }
+    let described = backend.pool_instances().await?;
+    let claims = store::claims_by_bucket(db, now.saturating_sub(WINDOW_MS))
+        .await
+        .map_err(|err| err.to_string())?;
+    let demand = pool::demand(&claims);
+    let mut pass = PoolPass {
+        db,
+        backend,
+        budget,
+        now,
+        // Launch failures back off across the templates of one pass.
+        backoff: pool::backoff(),
+    };
+    for template in TEMPLATES {
+        let size = demand
+            .get(template.labels[0])
+            .map_or(0, |claims| pool_target(claims));
+        let held = pool::inventory(&described, template);
+        if let Err(err) = pass.keep(template, size, &held).await {
+            console_error!("reconcile: pool {}: {err}", template.labels[0]);
+        }
+    }
+    Ok(())
+}
+
+/// What the pools share in one pass.
+struct PoolPass<'a> {
+    db: &'a Db,
+    backend: &'a Backend,
+    budget: &'a Budget,
+    now: u64,
+    backoff: Backoff,
+}
+
+fn sql(err: &worker::Error) -> String {
+    err.to_string()
+}
+
+impl PoolPass<'_> {
+    /// One template's pool: restores it from its rows and what EC2
+    /// lists, resizes it, ends and stops what it says, launches what it
+    /// lacks, and saves it. An instance a job took meanwhile has lost its
+    /// row (and soon its pool tag): a row that cannot be deleted or moved
+    /// means it is the job's, and it is left alone.
+    async fn keep(
+        &mut self,
+        template: &'static Template,
+        size: u32,
+        held: &[Instance],
+    ) -> Result<(), String> {
+        let label = template.labels[0];
+        let now = self.now;
+        let rows = store::pool_rows(self.db, label)
+            .await
+            .map_err(|err| sql(&err))?;
+        if size == 0 && rows.is_empty() && held.is_empty() {
+            return Ok(());
+        }
+        let mut pool = Pool::restore(
+            pool::config(template, size),
+            rows.iter().filter_map(pool::instance),
+        );
+        pool.reconcile(held, &|_| false, now);
+        self.settle(template, &rows, held, &pool).await?;
+        let mut unchanged = Vec::new();
+        let starved = self.act(&mut pool, &mut unchanged).await?;
+        // A pool short of its size launches, unless something it was to
+        // end or stop is still there.
+        if !starved {
+            self.fill(template, &mut pool).await?;
+        }
+        let changed: Vec<_> = pool
+            .instances()
+            .iter()
+            .filter(|(id, _)| !unchanged.contains(id))
+            .map(|(id, pooled)| pool::row(template, id, pooled))
+            .filter(|row| !rows.contains(row))
+            .collect();
+        store::save_pool(self.db, label, &changed, &[])
+            .await
+            .map_err(|err| sql(&err))
+    }
+
+    /// Reconciles the rows with what EC2 lists: drops the rows whose
+    /// instance is gone, records a running instance no row knows (a lost
+    /// row), and ends a stopped one that is too old to be a job's.
+    async fn settle(
+        &self,
+        template: &'static Template,
+        rows: &[PoolRow],
+        held: &[Instance],
+        pool: &Pool,
+    ) -> Result<(), String> {
+        let label = template.labels[0];
+        for row in rows {
+            if !pool.instances().contains_key(&row.instance_id) {
+                store::drop_pool(self.db, &row.instance_id)
+                    .await
+                    .map_err(|err| sql(&err))?;
+            }
+        }
+        let recorded = |id: &str| rows.iter().any(|row| row.instance_id == id);
+        let unrecorded = pool::unrecorded(held, &recorded, self.now);
+        let adopted: Vec<_> = unrecorded
+            .running
+            .iter()
+            .map(|(id, launched_at)| {
+                let pooled = PoolInstance {
+                    state: PoolState::Warming,
+                    launched_at: *launched_at,
+                    since: *launched_at,
+                };
+                pool::row(template, id, &pooled)
+            })
+            .collect();
+        if !adopted.is_empty() {
+            store::save_pool(self.db, label, &[], &adopted)
+                .await
+                .map_err(|err| sql(&err))?;
+        }
+        for id in &unrecorded.stale {
+            if self.budget.take(TERMINATE_COST) {
+                console_log!("reconcile: terminating stale pool instance {id}");
+                self.backend.terminate(id).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends and stops what the pool's upkeep says. Each is done only when
+    /// the row says the instance is still the pool's. The ids of stops
+    /// that did not happen go to `unchanged`, so their rows are not
+    /// updated. Returns whether the budget left something undone.
+    async fn act(&self, pool: &mut Pool, unchanged: &mut Vec<String>) -> Result<bool, String> {
+        let mut starved = false;
+        for action in pool.upkeep(self.now) {
+            match action {
+                Action::Terminate { instance_id } => {
+                    if !self.budget.take(TERMINATE_COST) {
+                        starved = true;
+                    } else if store::drop_pool(self.db, &instance_id)
+                        .await
+                        .map_err(|err| sql(&err))?
+                    {
+                        console_log!("reconcile: ending pool instance {instance_id}");
+                        self.backend.terminate(&instance_id).await;
+                    } else {
+                        console_log!("reconcile: pool instance {instance_id} went to a job");
+                    }
+                }
+                Action::Stop { instance_id } => {
+                    unchanged.push(instance_id.clone());
+                    if !self.budget.take(STOP_COST) {
+                        starved = true;
+                    } else if self.stop(&instance_id).await? {
+                        unchanged.retain(|id| id != &instance_id);
+                    }
+                }
+                Action::Launch { .. } | Action::LaunchPool { .. } | Action::RemoveRunner { .. } => {
+                }
+            }
+        }
+        Ok(starved)
+    }
+
+    /// Stops a warmed-up instance. Returns whether it was stopped; the
+    /// row goes back to warming when EC2 refused, and is left alone when
+    /// the instance is not the pool's any more.
+    async fn stop(&self, instance_id: &str) -> Result<bool, String> {
+        let now = self.now;
+        if !store::move_pool(self.db, instance_id, "warming", "stopping", now)
+            .await
+            .map_err(|err| sql(&err))?
+        {
+            return Ok(false);
+        }
+        match self.backend.stop(instance_id).await {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                console_error!("reconcile: stop pool instance {instance_id}: {err}");
+                store::move_pool(self.db, instance_id, "stopping", "warming", now)
+                    .await
+                    .map_err(|err| sql(&err))?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Launches the instances a pool lacks, each saved as it starts. A
+    /// failed launch ends the pass for the pool: the rest would fail the
+    /// same way, and the next pass tries again.
+    async fn fill(&mut self, template: &'static Template, pool: &mut Pool) -> Result<(), String> {
+        let label = template.labels[0];
+        let now = self.now;
+        let mut names = pool::names(template);
+        for action in pool.refill(now, &self.backoff, &mut names) {
+            let Action::LaunchPool { name } = action else {
+                continue;
+            };
+            if !self.budget.take(POOL_LAUNCH_COST) {
+                break;
+            }
+            match self.backend.launch_pool(self.db, template, &name).await {
+                Ok(instance_id) => {
+                    pool.launched(&name, instance_id.clone(), now, &mut self.backoff);
+                    console_log!("reconcile: launched pool instance {instance_id} for {label}");
+                    if let Some(pooled) = pool.instances().get(&instance_id) {
+                        let launched = pool::row(template, &instance_id, pooled);
+                        store::save_pool(self.db, label, &[], &[launched])
+                            .await
+                            .map_err(|err| sql(&err))?;
+                    }
+                }
+                Err(failure) => {
+                    console_error!(
+                        "reconcile: launch pool instance {name}: {}",
+                        failure.message
+                    );
+                    pool.launch_failed(&name, now, &mut self.backoff);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Step 6. A sweep takes at most [`store::SWEEP_LIMIT`] runs and one
 /// subrequest each purges them, which `budget` covers.
 async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
     if budget.left() < store::SWEEP_LIMIT * PURGE_COST {
@@ -737,6 +1079,215 @@ async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), Str
         }
     }))
     .await;
+    Ok(())
+}
+
+/// Of one ingest call to Polar.
+const INGEST_COST: u32 = 1;
+
+/// The events of `rows`, in their order, with the units priced when the
+/// attempt completed.
+fn usage_events(rows: &[store::UnsentUsage]) -> Vec<CiUsage<'_>> {
+    rows.iter()
+        .map(|row| CiUsage {
+            job_id: row.job_id,
+            attempt: row.attempt,
+            tenant: &row.tenant_id,
+            template: &row.template,
+            minutes: row.minutes,
+            units: row.units,
+            at: hatchrun_cloud::format_rfc3339(row.ended_at),
+        })
+        .collect()
+}
+
+/// What Polar's answer to a batch of `sent` events means.
+#[derive(Debug, PartialEq, Eq)]
+enum Ingest {
+    /// Polar took every event, new or duplicate.
+    Taken,
+    /// Polar refused the batch for what is in it: split it.
+    Refused(String),
+    /// Nothing says the events are at fault (a transport error, a 429,
+    /// a 5xx, or the token): send the same batch again later.
+    Retry(String),
+}
+
+/// Reads the answer to a batch of `sent` events. A 2xx that took fewer
+/// events than were sent counts as a refusal. A 4xx is a refusal
+/// except 401, 403, 404, 405, 408 and 429, which are about the caller
+/// or the endpoint (a wrong URL answers 404 or 405 for every batch).
+fn judge(answer: &Result<Response, String>, sent: usize) -> Ingest {
+    let response = match answer {
+        Ok(response) => response,
+        Err(err) => return Ingest::Retry(err.clone()),
+    };
+    match response.status {
+        200..=299 => match ingested(response) {
+            Ok(taken) if usize::try_from(taken).ok() == Some(sent) => Ingest::Taken,
+            Ok(taken) => Ingest::Refused(format!("Polar took {taken} of {sent} events")),
+            Err(err) => Ingest::Refused(err),
+        },
+        401 | 403 | 404 | 405 | 408 | 429 => {
+            Ingest::Retry(format!("Polar answered {}", response.status))
+        }
+        400..=499 => Ingest::Refused(format!(
+            "Polar answered {}: {}",
+            response.status,
+            response.text().chars().take(300).collect::<String>()
+        )),
+        status => Ingest::Retry(format!("Polar answered {status}")),
+    }
+}
+
+/// What to do with a refused batch of `rows`.
+#[derive(Debug, PartialEq, Eq)]
+enum Split {
+    /// Send each half on its own.
+    Halves(std::ops::Range<usize>, std::ops::Range<usize>),
+    /// A single row is the one Polar refuses.
+    Bad(usize),
+}
+
+/// Rows Polar refused one by one in a pass are quarantined only when it
+/// took some other request in the same pass. When it refused every
+/// request, the fault is in the request as a whole (a schema change, a
+/// wrong account), so nothing is quarantined and the next pass tries
+/// again.
+fn quarantine(refused: Vec<(usize, String)>, took_any: bool) -> Vec<(usize, String)> {
+    if took_any { refused } else { Vec::new() }
+}
+
+fn split(rows: &std::ops::Range<usize>) -> Split {
+    if rows.len() <= 1 {
+        return Split::Bad(rows.start);
+    }
+    let middle = rows.start + rows.len() / 2;
+    Split::Halves(rows.start..middle, middle..rows.end)
+}
+
+/// Step 6. Sends up to [`CI_INGEST_BATCH`] unsent usage rows to Polar
+/// and marks them sent only when Polar took them. Each event is keyed
+/// by job and attempt, so a batch sent again after a lost answer is
+/// counted once. A batch Polar refuses for its content is split until
+/// the refused rows are alone; those are quarantined with Polar's
+/// reason and never sent again. A transport error, a 429 or a 5xx ends
+/// the step and the next pass sends the rest again. Without a Polar
+/// token nothing is sent.
+async fn report_usage(
+    db: &Db,
+    settings: &Settings,
+    budget: &Budget,
+    now: u64,
+) -> Result<(), String> {
+    if settings.polar_token.is_empty() || !budget.take(INGEST_COST) {
+        return Ok(());
+    }
+    let limit = u32::try_from(CI_INGEST_BATCH).unwrap_or(u32::MAX);
+    let rows = store::unsent_usage(db, limit)
+        .await
+        .map_err(|e| e.to_string())?;
+    let keys = |range: &std::ops::Range<usize>| -> Vec<(u64, u32)> {
+        rows[range.clone()]
+            .iter()
+            .map(|r| (r.job_id, r.attempt))
+            .collect()
+    };
+    let mut pending = std::iter::once(0..rows.len()).collect::<Vec<_>>();
+    let mut first = true;
+    let mut took_any = false;
+    let mut refused = Vec::new();
+    while let Some(range) = pending.pop() {
+        if range.is_empty() {
+            continue;
+        }
+        if !std::mem::take(&mut first) && !budget.take(INGEST_COST) {
+            break;
+        }
+        let events = usage_events(&rows[range.clone()]);
+        let answer = send(&ci_ingest(
+            &settings.polar_api,
+            &settings.polar_token,
+            &events,
+        ))
+        .await;
+        match judge(&answer, range.len()) {
+            Ingest::Taken => {
+                took_any = true;
+                store::usage_sent(db, &keys(&range), now)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Ingest::Retry(err) => return Err(err),
+            Ingest::Refused(reason) => match split(&range) {
+                Split::Halves(left, right) => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+                Split::Bad(at) => refused.push((at, reason)),
+            },
+        }
+    }
+    if !took_any && !refused.is_empty() {
+        console_error!(
+            "reconcile: Polar refused every usage event this pass; none quarantined, retrying"
+        );
+    }
+    for (at, reason) in quarantine(refused, took_any) {
+        let row = &rows[at];
+        console_error!(
+            "reconcile: usage of job {} attempt {} (tenant {}) quarantined: {reason}",
+            row.job_id,
+            row.attempt,
+            row.tenant_id
+        );
+        store::usage_rejected(db, &[(row.job_id, row.attempt)], &reason, now)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Step 7. Takes up to the budget's worth of secrets that are not
+/// sealed with the current key (one unit per row), opens each with the
+/// keyring and seals it again with the current key. A row that does not
+/// open is logged by name and key id, never by value, and stays for an
+/// operator; a row set again meanwhile is left as it is.
+async fn reseal_secrets(env: &Env, db: &Db, budget: &Budget) -> Result<(), String> {
+    if budget.left() == 0 {
+        return Ok(());
+    }
+    let keyring = secrets::Keyring::load(env).await?;
+    let rows = store::stale_secrets(db, &keyring.current.id, budget.left())
+        .await
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        if !budget.take(1) {
+            break;
+        }
+        let aad = secrets::Aad {
+            tenant: &row.tenant,
+            repo_id: row.repo_id,
+            name: &row.name,
+        };
+        let sealed = secrets::fresh_nonce().and_then(|nonce| {
+            secrets::reseal(&keyring, &row.key_id, &aad, &row.sealed, nonce)
+                .map_err(|err| err.to_string())
+        });
+        match sealed {
+            Ok(sealed) => {
+                store::reseal(db, &row, &keyring.current.id, &sealed)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Err(err) => console_error!(
+                "reconcile: secret {} of tenant {} (key {}) not re-sealed: {err}",
+                row.name,
+                row.tenant,
+                row.key_id
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -767,10 +1318,51 @@ mod tests {
             "launch_attempts": 1, "next_launch_at": null,
             "timeout_minutes": 10, "updated_at": NOW, "heartbeat_at": null,
             "started_at": null, "completed_at": null, "steps": "[]", "log_key": null,
+            "template": "ubuntu-latest", "token_permissions": "{}",
+            "secret_refs": "{\"all\":false,\"names\":[]}",
         }))
         .unwrap();
         row.updated_at = NOW;
         row
+    }
+
+    #[test]
+    fn a_held_job_is_woken_not_requeued() {
+        let mut held = row("queued");
+        held.held = Some("concurrency".into());
+        held.next_launch_at = Some(NOW - 1);
+        held.updated_at = NOW - 3_600_000;
+        assert_eq!(stalled(&[held.clone()], NOW), []);
+        held.held = None;
+        assert_eq!(stalled(&[held], NOW), [Fix::Requeue(1)]);
+    }
+
+    #[test]
+    fn the_backstop_has_its_own_small_budget() {
+        let woken: Vec<Woken> = (1..=100)
+            .map(|job_id| Woken { job_id, attempt: 1 })
+            .collect();
+        // A stalled-job budget that ran out leaves the backstop's alone.
+        let stalled_budget = Budget::new(shares(BUDGET).stalled);
+        assert!(stalled_budget.take(shares(BUDGET).stalled));
+        assert!(!stalled_budget.take(1));
+        let held_budget = Budget::new(HELD_BUDGET);
+        let paid = paid_wakes(&woken, &held_budget);
+        assert_eq!(paid.len(), HELD_BUDGET as usize);
+        assert_eq!(paid[0].job_id, 1, "oldest first");
+        assert_eq!(held_budget.left(), 0);
+        assert_eq!(paid_wakes(&woken, &held_budget), []);
+        const { assert!(HELD_BUDGET + BUDGET < 1_000) }
+    }
+
+    #[test]
+    fn the_backstop_runs_every_fifteen_minutes() {
+        let minute = |m: u64| m * 60_000;
+        assert!(held_backstop_due(minute(60)));
+        assert!(held_backstop_due(minute(75) + 59_999));
+        assert!(!held_backstop_due(minute(76)));
+        assert!(!held_backstop_due(minute(89)));
+        assert_eq!((0..60).filter(|m| held_backstop_due(minute(*m))).count(), 4);
     }
 
     #[test]
@@ -854,6 +1446,7 @@ mod tests {
             launch_time: launched.into(),
             job_id: job.map(str::to_owned),
             runner_name: runner.map(str::to_owned),
+            pool: None,
         }
     }
 
@@ -891,6 +1484,14 @@ mod tests {
                 "i-bad-time"
             ]
         );
+    }
+
+    #[test]
+    fn orphans_skip_pool_instances() {
+        let mut pooled = instance("i-pool", None, "2020-01-01T00:00:00Z");
+        pooled.pool = Some("ubuntu-latest".into());
+        let described = [pooled, instance("i-untagged", None, "2026-10-22T13:40:00Z")];
+        assert_eq!(orphans(&described, &[], NOW), ["i-untagged"]);
     }
 
     #[test]
@@ -971,30 +1572,129 @@ mod tests {
     }
 
     #[test]
-    fn schedules_cannot_starve_the_other_steps() {
+    fn shares_split_the_budget() {
+        let sum = |s: Shares| {
+            s.schedules + s.stalled + s.orphans + s.pool + s.usage + s.reseal + s.retention
+        };
         let share = shares(BUDGET);
         assert_eq!(
             share,
             Shares {
                 schedules: 500,
-                stalled: 200,
-                orphans: 100,
-                retention: 100
+                stalled: 150,
+                orphans: 50,
+                pool: 50,
+                usage: 25,
+                reseal: 25,
+                retention: 100,
             }
         );
-        assert_eq!(
-            share.schedules + share.stalled + share.orphans + share.retention,
-            BUDGET
-        );
-        assert!(share.retention >= store::SWEEP_LIMIT);
+        assert_eq!(sum(share), BUDGET);
+        assert!(share.retention >= store::SWEEP_LIMIT * PURGE_COST);
+        assert!(share.reseal > 0 && share.usage > 0);
         for total in [0, 1, 8, 100, 900, 5_000] {
             let share = shares(total);
-            assert_eq!(
-                share.schedules + share.stalled + share.orphans + share.retention,
-                total
-            );
+            assert_eq!(sum(share), total, "{total}");
             assert!(share.schedules <= 500);
         }
+    }
+
+    fn usage_row(job_id: u64, template: &str, minutes: u64, units: u64) -> store::UnsentUsage {
+        store::UnsentUsage {
+            job_id,
+            attempt: 2,
+            tenant_id: "t1".into(),
+            template: template.into(),
+            minutes,
+            units,
+            ended_at: NOW,
+        }
+    }
+
+    #[test]
+    fn usage_events_carry_the_units_recorded_at_completion() {
+        let rows = [
+            usage_row(7, "ubuntu-26.04-8core", 5, 20),
+            usage_row(8, "retired", 3, 3),
+        ];
+        let events = usage_events(&rows);
+        assert_eq!((events[0].job_id, events[0].attempt), (7, 2));
+        assert_eq!(events[0].units, 20);
+        assert_eq!(events[0].at, "2026-10-22T13:45:00Z");
+        assert_eq!(events[1].units, 3);
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // The argument of `judge`.
+    fn answer(status: u16, body: &str) -> Result<Response, String> {
+        Ok(Response {
+            status,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        })
+    }
+
+    #[test]
+    fn a_refusal_of_every_request_quarantines_nothing() {
+        let refused = vec![(0, "422".to_owned()), (1, "422".to_owned())];
+        // A schema-level 422 refuses every single-row request: retry.
+        assert_eq!(quarantine(refused.clone(), false), Vec::new());
+        // Polar took other rows, so these two are bad on their own.
+        assert_eq!(quarantine(refused.clone(), true), refused);
+    }
+
+    #[test]
+    fn polars_answer_decides_between_split_and_retry() {
+        let taken = answer(200, r#"{"inserted":2,"duplicates":1}"#);
+        assert_eq!(judge(&taken, 3), Ingest::Taken);
+        assert!(matches!(judge(&taken, 4), Ingest::Refused(_)));
+        for status in [400, 409, 413, 422] {
+            assert!(
+                matches!(judge(&answer(status, "bad"), 3), Ingest::Refused(_)),
+                "{status}"
+            );
+        }
+        for status in [401, 403, 404, 405, 408, 429, 500, 502, 503] {
+            assert!(
+                matches!(judge(&answer(status, ""), 3), Ingest::Retry(_)),
+                "{status}"
+            );
+        }
+        assert!(matches!(
+            judge(&Err("connection reset".into()), 3),
+            Ingest::Retry(_)
+        ));
+    }
+
+    #[test]
+    fn a_refused_batch_splits_down_to_the_bad_row() {
+        assert_eq!(split(&(0..5)), Split::Halves(0..2, 2..5));
+        assert_eq!(split(&(2..4)), Split::Halves(2..3, 3..4));
+        assert_eq!(split(&(3..4)), Split::Bad(3));
+        // Polar refuses any batch that holds row 6 of 8: the search
+        // isolates it and takes the rest.
+        let bad = 6;
+        let (mut taken, mut quarantined, mut calls) = (Vec::new(), Vec::new(), 0);
+        let mut pending = std::iter::once(0..8).collect::<Vec<_>>();
+        while let Some(range) = pending.pop() {
+            calls += 1;
+            if range.contains(&bad) {
+                match split(&range) {
+                    Split::Halves(left, right) => {
+                        pending.push(right);
+                        pending.push(left);
+                    }
+                    Split::Bad(at) => quarantined.push(at),
+                }
+            } else {
+                taken.extend(range);
+            }
+        }
+        taken.sort_unstable();
+        assert_eq!(taken, [0, 1, 2, 3, 4, 5, 7]);
+        assert_eq!(quarantined, [6]);
+        assert!(calls <= 2 * 3 + 1, "{calls}");
+        // A full batch with one bad row fits the usage share.
+        assert!(2 * 7 < shares(BUDGET).usage);
     }
 
     #[test]

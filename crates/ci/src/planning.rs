@@ -4,29 +4,51 @@
 
 //! Picks the workflows a GitHub event starts.
 
-use hatchrun_workflow::{Diagnostic, Event, Plan, Template, compile, parse, triggered};
+use hatchrun_workflow::{Diagnostic, Event, Plan, compile, config_errors, parse, triggered};
+
+/// A triggered workflow that did not compile.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Failed {
+    /// The workflow's name.
+    pub workflow: String,
+    /// What is wrong with it.
+    pub diagnostics: Vec<Diagnostic>,
+}
 
 /// The workflows an event starts, or why the config cannot be used.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Selected {
-    /// A plan for each started workflow, in workflow name order.
-    Plans(Vec<Plan>),
-    /// The config does not parse or compile.
+    /// Plans of the triggered workflows that compiled, in workflow name
+    /// order, and those that did not.
+    Plans {
+        /// The workflows to run.
+        plans: Vec<Plan>,
+        /// The workflows that fail on their own, such as one that
+        /// names no runner template.
+        failed: Vec<Failed>,
+    },
+    /// The config does not parse, or `config_errors` found something.
     Invalid(Vec<Diagnostic>),
 }
 
 /// Parses `source`, keeps the workflows whose `on:` `event` triggers
 /// (in name order) and compiles each against `compile_ref`. Plans with
-/// no jobs are dropped. Any parse or compile error makes the whole
-/// result `Invalid`.
+/// no jobs are dropped. A config that does not parse, or has a problem
+/// of its own (see [`config_errors`]), makes the whole result `Invalid`.
+/// A workflow that does not compile fails alone, and the others still
+/// run.
 #[must_use]
 pub fn select(source: &str, event: &Event, compile_ref: &str) -> Selected {
     let config = match parse(source) {
         Ok(config) => config,
         Err(diagnostics) => return Selected::Invalid(diagnostics),
     };
+    let errors = config_errors(&config);
+    if !errors.is_empty() {
+        return Selected::Invalid(errors);
+    }
     let mut plans = Vec::new();
-    let mut errors: Vec<Diagnostic> = Vec::new();
+    let mut failed = Vec::new();
     for (name, workflow) in &config.workflows {
         if !triggered(&workflow.on, event) {
             continue;
@@ -34,21 +56,13 @@ pub fn select(source: &str, event: &Event, compile_ref: &str) -> Selected {
         match compile(&config, name, compile_ref) {
             Ok(plan) if plan.jobs.is_empty() => {}
             Ok(plan) => plans.push(plan),
-            Err(diagnostics) => {
-                // Config-wide problems are reported by every compile.
-                for d in diagnostics {
-                    if !errors.contains(&d) {
-                        errors.push(d);
-                    }
-                }
-            }
+            Err(diagnostics) => failed.push(Failed {
+                workflow: name.clone(),
+                diagnostics,
+            }),
         }
     }
-    if errors.is_empty() {
-        Selected::Plans(plans)
-    } else {
-        Selected::Invalid(errors)
-    }
+    Selected::Plans { plans, failed }
 }
 
 /// Whether a pull request `action` against `base_ref` starts a workflow
@@ -93,26 +107,9 @@ pub fn schedules(source: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Whether jobs on `template` can launch yet. Only `ubuntu-latest` can.
-///
-/// # Errors
-///
-/// Returns the message to fail the job with.
-pub fn launchable(template: &Template) -> Result<(), String> {
-    let label = template.labels[0];
-    if label == "ubuntu-latest" {
-        Ok(())
-    } else {
-        Err(format!(
-            "`{label}` runners come in a later release; use ubuntu-latest or ubuntu-26.04"
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hatchrun_workflow::template;
 
     const CONFIG: &str = "
 jobs:
@@ -153,13 +150,15 @@ workflows:
 
     #[test]
     fn selects_triggered_workflows_only() {
-        let Selected::Plans(plans) = select(CONFIG, &push("refs/heads/main"), "refs/heads/main")
+        let Selected::Plans { plans, .. } =
+            select(CONFIG, &push("refs/heads/main"), "refs/heads/main")
         else {
             panic!("invalid");
         };
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].workflow, "ci");
-        let Selected::Plans(none) = select(CONFIG, &push("refs/heads/dev"), "refs/heads/dev")
+        let Selected::Plans { plans: none, .. } =
+            select(CONFIG, &push("refs/heads/dev"), "refs/heads/dev")
         else {
             panic!("invalid");
         };
@@ -167,22 +166,103 @@ workflows:
     }
 
     #[test]
-    fn compile_errors_make_the_result_invalid() {
+    fn a_workflow_that_does_not_compile_fails_alone() {
         let source = "
 jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
 workflows:
   ci:
     on: { push: {} }
     jobs: [{ t: { requires: [nope] } }]
+  fine:
+    on: { push: {} }
+    jobs: [t]
 ";
-        assert!(matches!(
-            select(source, &push("refs/heads/main"), "refs/heads/main"),
-            Selected::Invalid(d) if !d.is_empty()
-        ));
+        let Selected::Plans { plans, failed } =
+            select(source, &push("refs/heads/main"), "refs/heads/main")
+        else {
+            panic!("invalid");
+        };
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].workflow, "fine");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].workflow, "ci");
+        assert_eq!(failed[0].diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn a_config_that_does_not_parse_is_invalid() {
         assert!(matches!(
             select("jobs: [", &push("refs/heads/main"), "refs/heads/main"),
             Selected::Invalid(d) if !d.is_empty()
         ));
+    }
+
+    #[test]
+    fn config_wide_error_is_still_invalid() {
+        let source = "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci: { on: { push: {}, schedule: [{ cron: 'not a cron' }] }, jobs: [t] }
+";
+        assert!(matches!(
+            select(source, &push("refs/heads/main"), "refs/heads/main"),
+            Selected::Invalid(d) if d.iter().any(|d| d.message.contains("invalid cron"))
+        ));
+    }
+
+    const TEMPLATE_LIST: &str = "ubuntu-latest, ubuntu-26.04, ubuntu-26.04-arm, \
+        ubuntu-26.04-4core, ubuntu-26.04-4core-arm, ubuntu-26.04-8core, \
+        ubuntu-26.04-8core-arm, ubuntu-26.04-16core, ubuntu-26.04-16core-arm";
+
+    #[test]
+    fn bad_label_fails_only_its_workflow() {
+        let source = "
+jobs:
+  good: { runs-on: ubuntu-latest, steps: [] }
+  bad: { runs-on: ubuntu-24.04, steps: [] }
+workflows:
+  ci: { on: { push: {} }, jobs: [good] }
+  bad: { on: { push: {} }, jobs: [bad] }
+";
+        let Selected::Plans { plans, failed } =
+            select(source, &push("refs/heads/main"), "refs/heads/main")
+        else {
+            panic!("invalid");
+        };
+        let names: Vec<_> = plans.iter().map(|plan| plan.workflow.as_str()).collect();
+        assert_eq!(names, ["ci"]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].workflow, "bad");
+        let message = &failed[0].diagnostics[0].message;
+        assert!(
+            message.contains(&format!(
+                "names no runner template; use one of {TEMPLATE_LIST}"
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn bad_executor_fails_only_the_workflows_that_use_it() {
+        let source = "
+executors: { old: { runs-on: ubuntu-24.04 } }
+jobs:
+  good: { runs-on: ubuntu-latest, steps: [] }
+  legacy: { executor: old, steps: [] }
+workflows:
+  ci: { on: { push: {} }, jobs: [good] }
+  legacy: { on: { push: {} }, jobs: [legacy] }
+";
+        let Selected::Plans { plans, failed } =
+            select(source, &push("refs/heads/main"), "refs/heads/main")
+        else {
+            panic!("invalid");
+        };
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].workflow, "ci");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].workflow, "legacy");
+        assert!(failed[0].diagnostics[0].message.contains("executor `old`"));
     }
 
     #[test]
@@ -195,23 +275,13 @@ workflows:
     jobs:
       - t: { branches: [release] }
 ";
-        let Selected::Plans(plans) = select(source, &push("refs/heads/main"), "refs/heads/main")
+        let Selected::Plans { plans, failed } =
+            select(source, &push("refs/heads/main"), "refs/heads/main")
         else {
             panic!("invalid");
         };
         assert_eq!(plans, Vec::<hatchrun_workflow::Plan>::new());
-    }
-
-    #[test]
-    fn other_templates_are_not_launchable() {
-        assert!(launchable(template("ubuntu-latest").unwrap()).is_ok());
-        assert!(launchable(template("ubuntu-26.04").unwrap()).is_ok());
-        let err = launchable(template("ubuntu-26.04-arm").unwrap()).unwrap_err();
-        assert!(
-            err.contains("`ubuntu-26.04-arm` runners come in a later release"),
-            "{err}"
-        );
-        assert!(err.ends_with("use ubuntu-latest or ubuntu-26.04"), "{err}");
+        assert_eq!(failed.len(), 0);
     }
 
     #[test]

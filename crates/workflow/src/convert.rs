@@ -24,6 +24,7 @@ use crate::config::{
 };
 use crate::diagnostic::Diagnostic;
 use crate::expr::{self, ExprError};
+use crate::permissions::{Level, Permissions, SCOPES};
 use crate::plan;
 use crate::templates::{template, template_labels};
 use crate::trigger::{Dispatch, PullRequestTrigger, PushTrigger, Schedule, Triggers};
@@ -344,7 +345,6 @@ impl Cx {
     fn workflow(&mut self, file: &str, stem: &str, gh: GhWorkflow) {
         for (key, set) in [
             ("run-name", gh.run_name.is_some()),
-            ("permissions", gh.permissions.is_some()),
             ("concurrency", gh.concurrency.is_some()),
         ] {
             if set {
@@ -356,6 +356,7 @@ impl Cx {
         for key in gh.unknown.keys() {
             self.warn(format!("`{file}`: unknown key `{key}` was dropped"));
         }
+        let permissions = self.permissions(&format!("`{file}`"), gh.permissions.as_ref(), false);
         let on = self.triggers(file, &gh.on);
         let shared_env = self.env(&format!("`{file}`"), "env", gh.env.as_ref());
         let shared_defaults = self.defaults(&format!("`{file}`"), gh.defaults.as_ref());
@@ -436,9 +437,62 @@ impl Cx {
         if entries.is_empty() && failed {
             return;
         }
-        self.config
-            .workflows
-            .insert(stem.to_owned(), Workflow { on, jobs: entries });
+        self.config.workflows.insert(
+            stem.to_owned(),
+            Workflow {
+                on,
+                permissions,
+                jobs: entries,
+            },
+        );
+    }
+
+    /// Converts a `permissions:` value. `id-token`, scopes hatchrun does
+    /// not know and levels it does not know are dropped with a warning.
+    /// A value of another shape is dropped too; a job that said it
+    /// then gets no permissions at all, never the workflow's, which
+    /// could be wider than the author meant.
+    fn permissions(&mut self, at: &str, value: Option<&Value>, job: bool) -> Option<Permissions> {
+        match value? {
+            Value::String(text) if text == "read-all" => Some(Permissions::ReadAll),
+            Value::String(text) if text == "write-all" => Some(Permissions::WriteAll),
+            Value::Object(map) => {
+                let mut scopes = BTreeMap::new();
+                for (key, level) in map {
+                    if key == "id-token" {
+                        self.warn(format!("{at}: `id-token` is not supported and was dropped"));
+                        continue;
+                    }
+                    if !SCOPES.iter().any(|(k, _)| k == key) {
+                        self.warn(format!(
+                            "{at}: `permissions.{key}` is not supported and was dropped"
+                        ));
+                        continue;
+                    }
+                    let level = match level.as_str() {
+                        Some("read") => Level::Read,
+                        Some("write") => Level::Write,
+                        Some("none") => Level::None,
+                        _ => {
+                            self.warn(format!(
+                                "{at}: `permissions.{key}` is `{}`, not read, write or none, and was dropped",
+                                show(level)
+                            ));
+                            continue;
+                        }
+                    };
+                    scopes.insert(key.clone(), level);
+                }
+                Some(Permissions::Scopes(scopes))
+            }
+            other => {
+                self.warn(format!(
+                    "{at}: `permissions: {}` is not read-all, write-all or a map and was dropped",
+                    show(other)
+                ));
+                job.then(|| Permissions::Scopes(BTreeMap::new()))
+            }
+        }
     }
 
     /// Converts `on:`, which GitHub accepts as an event name, a list of
@@ -601,7 +655,6 @@ impl Cx {
             ("services", gh.services.is_some(), LATER),
             ("container", gh.container.is_some(), LATER),
             ("concurrency", gh.concurrency.is_some(), ""),
-            ("permissions", gh.permissions.is_some(), ""),
             ("environment", gh.environment.is_some(), ""),
             ("continue-on-error", gh.continue_on_error.is_some(), ""),
         ] {
@@ -639,6 +692,7 @@ impl Cx {
         let outputs = self.env(at, "outputs", gh.outputs.as_ref());
         let env = self.env(at, "env", gh.env.as_ref());
         let defaults = self.defaults(at, gh.defaults.as_ref());
+        let permissions = self.permissions(at, gh.permissions.as_ref(), true);
         let mut steps: Vec<Step> = gh
             .steps
             .unwrap_or_default()
@@ -656,6 +710,7 @@ impl Cx {
             if_: gh.if_.as_ref().and_then(scalar),
             timeout_minutes,
             outputs,
+            permissions,
             steps,
             ..Job::default()
         };

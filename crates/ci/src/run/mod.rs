@@ -26,6 +26,7 @@
 //! | `POST /events?job=ID` | `Batch` | `200` batch reply, `409` ended |
 //! | `POST /result?job=ID` | `JobResult` | `204` |
 //! | `POST /failed?job=ID` | `{ "message": "..." }` | `204` |
+//! | `POST /held?job=ID` | `{ "message": "..." }` | `204`, `409` not queued |
 //! | `POST /cancel` | none | `204` |
 //! | `POST /rerun?job=ID` | none | `204` |
 //! | `POST /purge` | none | `204` |
@@ -50,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::checks::StepView;
+use crate::github::Capped;
 use crate::graph::Node;
 use crate::intake::Repo;
 use crate::logs::LogIndex;
@@ -105,18 +107,22 @@ fn job_key(job: u64) -> String {
     format!("job:{job}")
 }
 
-/// Where the state of an ended run is kept in R2.
+/// Where the state of an ended run is kept in R2. `days` is the
+/// tenant's retention, which names the tier an R2 lifecycle rule
+/// expires.
 #[must_use]
-pub fn snapshot_key(tenant: &str, run_id: u64) -> String {
-    format!("state/{tenant}/{run_id}.json")
+pub fn snapshot_key(days: u32, tenant: &str, run_id: u64) -> String {
+    format!("state/{days}d/{tenant}/{run_id}.json")
 }
 
-/// The R2 key of the state of run `run`, `None` for a tenant id that
-/// is empty or could name another key.
+/// The R2 key of the state of run `run` kept `days` days, `None` for a
+/// tenant id that is empty or could name another key, or a retention
+/// that is no tier.
 #[must_use]
-pub fn restore_key(run: Option<u64>, tenant: Option<&str>) -> Option<String> {
+pub fn restore_key(run: Option<u64>, tenant: Option<&str>, days: Option<u32>) -> Option<String> {
     let tenant = tenant.filter(|t| !t.is_empty() && !t.contains(['/', '.']))?;
-    Some(snapshot_key(tenant, run?))
+    let days = days.filter(|d| crate::logs::is_tier(*d))?;
+    Some(snapshot_key(days, tenant, run?))
 }
 
 /// Whether `info` is run `run` of `tenant`.
@@ -135,6 +141,9 @@ pub struct RunInfo {
     pub run_attempt: u32,
     /// The tenant that owns the repository.
     pub tenant_id: String,
+    /// How many days the run's logs and state are kept: 30 or 90, as the
+    /// tenant's retention was when the run was recorded.
+    pub retention_days: u32,
     /// The GitHub App installation.
     pub installation_id: u64,
     /// The repository.
@@ -192,6 +201,10 @@ pub struct JobState {
     /// The finished log is not in R2 yet. Its chunks and [`Sealed`] stay
     /// in storage until it is.
     pub upload_pending: bool,
+    /// Why the queued job waits for a launch, until an agent claims it.
+    pub held: Option<String>,
+    /// The token scopes the App holds less of than the job asked.
+    pub capped: Vec<Capped>,
 }
 
 /// A finished job's log as it waits for the upload.
@@ -371,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn the_snapshot_key_names_tenant_and_run() {
-        assert_eq!(snapshot_key("abc", 12), "state/abc/12.json");
+    fn snapshot_key_has_the_tier() {
+        assert_eq!(snapshot_key(90, "abc", 12), "state/90d/abc/12.json");
     }
 }

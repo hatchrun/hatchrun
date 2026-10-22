@@ -25,16 +25,18 @@ use worker::{
 
 use crate::checks::{JobView, Outbox, conclusion_word, details_url, render};
 use crate::env::Settings;
-use crate::github::{CheckRun, check_run_id, create_check_run, revoke_token, update_check_run};
+use crate::github::{
+    Capped, CheckRun, check_run_id, create_check_run, revoke_token, update_check_run,
+};
 use crate::graph::{Action, Graph, State as NodeState};
-use crate::launches::LaunchMessage;
+use crate::launches::{self, LaunchMessage};
 use crate::store;
 
 use super::decide::{
-    Delivery, Failed, Flushed, Gate, apply_batch, apply_result, arm_todo, attempts, bounded_event,
-    delivery, due, file_annotations, gate, github_context, job_document, minimal_check, next_alarm,
-    plan_is_current, record_flush, reschedule, reset_jobs, run_state, running_for,
-    should_write_heartbeat, snapshot_ready, steps_json, take_drain,
+    Delivery, Failed, Flushed, Gate, apply_batch, apply_held, apply_result, arm_todo, attempts,
+    bounded_event, delivery, due, file_annotations, gate, github_context, job_document,
+    minimal_check, next_alarm, plan_is_current, record_flush, reschedule, reset_jobs, run_state,
+    running_for, should_write_heartbeat, snapshot_ready, steps_json, take_drain,
 };
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
@@ -48,13 +50,19 @@ use super::{
 struct Ident {
     run: u64,
     tenant: String,
+    /// The retention tier the run's snapshot is under.
+    days: u32,
 }
 
 impl Ident {
-    fn from_query(run: Option<u64>, tenant: Option<String>) -> Option<Self> {
+    fn from_query(run: Option<u64>, tenant: Option<String>, days: Option<u32>) -> Option<Self> {
         let tenant = tenant?;
-        restore_key(run, Some(&tenant))?;
-        Some(Self { run: run?, tenant })
+        restore_key(run, Some(&tenant), days)?;
+        Some(Self {
+            run: run?,
+            tenant,
+            days: days?,
+        })
     }
 }
 
@@ -92,10 +100,11 @@ pub(super) fn answer(status: u16) -> Result<Response> {
 #[derive(Deserialize)]
 struct ClaimBody {
     token: String,
+    capped: Vec<Capped>,
 }
 
 #[derive(Deserialize)]
-struct FailedBody {
+struct MessageBody {
     message: String,
 }
 
@@ -194,6 +203,7 @@ impl DurableObject for RunObject {
                 .and_then(|(_, value)| value.parse::<u64>().ok())
         };
         let (job, attempt) = (number("job"), number("attempt"));
+        let days = number("days").and_then(|d| u32::try_from(d).ok());
         let tenant = url
             .query_pairs()
             .find(|(key, _)| key == "tenant")
@@ -204,7 +214,7 @@ impl DurableObject for RunObject {
                 url.path(),
                 job,
                 attempt.and_then(|a| u32::try_from(a).ok()),
-                Ident::from_query(number("run"), tenant),
+                Ident::from_query(number("run"), tenant, days),
                 number("offset"),
             )
             .await
@@ -356,7 +366,16 @@ impl<'a> Cx<'a> {
             return Response::error("a job is needed", 400);
         };
         match (&method, path) {
-            (Method::Post, "/failed") => match req.json::<FailedBody>().await {
+            (Method::Post, "/held") => match req.json::<MessageBody>().await {
+                Ok(body) => {
+                    let Some(attempt) = attempt else {
+                        return Response::error("an attempt is needed", 400);
+                    };
+                    self.held(job, attempt, &body.message).await
+                }
+                Err(_) => Response::error("bad hold", 400),
+            },
+            (Method::Post, "/failed") => match req.json::<MessageBody>().await {
                 Ok(body) => {
                     let Some(attempt) = attempt else {
                         return Response::error("an attempt is needed", 400);
@@ -381,7 +400,7 @@ impl<'a> Cx<'a> {
                 };
                 match path {
                     "/claim" => match req.json::<ClaimBody>().await {
-                        Ok(body) => self.claim(job, attempt, body.token).await,
+                        Ok(body) => self.claim(job, attempt, body.token, body.capped).await,
                         Err(_) => Response::error("bad claim", 400),
                     },
                     "/events" => match req.json::<Batch>().await {
@@ -558,7 +577,7 @@ impl<'a> Cx<'a> {
     }
 
     async fn fetch_snapshot(&self, ident: &Ident) -> Result<Option<Snapshot>> {
-        let Some(key) = restore_key(Some(ident.run), Some(&ident.tenant)) else {
+        let Some(key) = restore_key(Some(ident.run), Some(&ident.tenant), Some(ident.days)) else {
             return Ok(None);
         };
         let Some(object) = self.env.bucket(BUCKET)?.get(key).execute().await? else {
@@ -625,7 +644,11 @@ impl<'a> Cx<'a> {
             };
             let body = serde_json::to_vec(&snapshot).map_err(|err| fail(err.to_string()))?;
             (
-                snapshot_key(&snapshot.info.tenant_id, snapshot.info.run_id),
+                snapshot_key(
+                    snapshot.info.retention_days,
+                    &snapshot.info.tenant_id,
+                    snapshot.info.run_id,
+                ),
                 body,
                 snapshot.info.run_attempt,
             )
@@ -767,17 +790,23 @@ impl<'a> Cx<'a> {
                 conclusion,
                 steps,
                 log_key,
-            } => store::finish_job(
-                db,
-                *job,
-                *attempt,
-                conclusion_word(*conclusion),
-                steps,
-                log_key.as_deref(),
-                self.now,
-            )
-            .await
-            .map(|_| ()),
+            } => {
+                let ended = store::finish_job(
+                    db,
+                    *job,
+                    *attempt,
+                    conclusion_word(*conclusion),
+                    steps,
+                    log_key.as_deref(),
+                    self.now,
+                )
+                .await?;
+                if ended {
+                    // The freed place goes to the oldest held job.
+                    launches::wake_oldest(&self.env, db, &info.tenant_id).await;
+                }
+                Ok(())
+            }
             Work::FinishRun {
                 attempt,
                 conclusion,
@@ -910,7 +939,13 @@ impl<'a> Cx<'a> {
         answer(204)
     }
 
-    async fn claim(&self, job: u64, attempt: u32, token: String) -> Result<Response> {
+    async fn claim(
+        &self,
+        job: u64,
+        attempt: u32,
+        token: String,
+        capped: Vec<Capped>,
+    ) -> Result<Response> {
         let first = {
             let _turn = self.turn.lock().await;
             let Some(run) = self.loaded().await? else {
@@ -949,6 +984,10 @@ impl<'a> Cx<'a> {
             }
             run.graph_mut().running(job);
             let mut state = self.job_state(job).await?;
+            if state.held.take().is_some() || (!capped.is_empty() && state.capped != capped) {
+                run.outbox_mut().mark(job);
+            }
+            state.capped = capped;
             let old = state
                 .github_token
                 .replace(token.clone())
@@ -1070,6 +1109,28 @@ impl<'a> Cx<'a> {
             revoke
         };
         self.after(revoke).await;
+        answer(204)
+    }
+
+    /// Stores why the queued job waits for a launch. The check run is
+    /// updated only when the message differs from the one stored: the
+    /// launch consumer posts it again at every recheck.
+    async fn held(&self, job: u64, attempt: u32, message: &str) -> Result<Response> {
+        let _turn = self.turn.lock().await;
+        let Some(mut run) = self.loaded().await? else {
+            return answer(409);
+        };
+        match gate(run.graph.node(job), attempt) {
+            Gate::Queued => {}
+            Gate::Missing => return Response::error("no such job", 404),
+            Gate::Stale | Gate::Ended | Gate::Running => return answer(409),
+        }
+        let mut state = self.job_state(job).await?;
+        if apply_held(&mut state, message) {
+            self.put_job(job, &state).await?;
+            run.outbox_mut().mark(job);
+            self.commit(&mut run).await?;
+        }
         answer(204)
     }
 
@@ -1262,6 +1323,8 @@ impl<'a> Cx<'a> {
                 annotations: &state.annotations,
                 file_annotations_sent: state.file_annotations_sent,
                 failed_tail: tail.as_deref(),
+                held: state.held.as_deref(),
+                capped: &state.capped,
                 started_at: state.started_at,
                 completed_at: state.completed_at,
             };
@@ -1374,16 +1437,26 @@ mod tests {
     #[test]
     fn the_restore_key_is_built_from_the_run_and_tenant_of_the_request() {
         assert_eq!(
-            restore_key(Some(12), Some("abc")).as_deref(),
-            Some("state/abc/12.json")
+            restore_key(Some(12), Some("abc"), Some(90)).as_deref(),
+            Some("state/90d/abc/12.json")
         );
-        assert_eq!(restore_key(None, Some("abc")), None);
-        assert_eq!(restore_key(Some(12), None), None);
-        assert_eq!(restore_key(Some(12), Some("")), None);
-        assert_eq!(restore_key(Some(12), Some("a/../b")), None);
-        assert_eq!(Ident::from_query(Some(1), Some("t".into())).unwrap().run, 1);
-        assert_eq!(Ident::from_query(Some(1), Some("x/y".into())), None);
-        assert_eq!(Ident::from_query(None, Some("t".into())), None);
+        assert_eq!(restore_key(None, Some("abc"), Some(30)), None);
+        assert_eq!(restore_key(Some(12), None, Some(30)), None);
+        assert_eq!(restore_key(Some(12), Some("abc"), Some(60)), None);
+        assert_eq!(restore_key(Some(12), Some("abc"), None), None);
+        assert_eq!(restore_key(Some(12), Some(""), Some(30)), None);
+        assert_eq!(restore_key(Some(12), Some("a/../b"), Some(30)), None);
+        assert_eq!(
+            Ident::from_query(Some(1), Some("t".into()), Some(30))
+                .unwrap()
+                .run,
+            1
+        );
+        assert_eq!(
+            Ident::from_query(Some(1), Some("x/y".into()), Some(30)),
+            None
+        );
+        assert_eq!(Ident::from_query(None, Some("t".into()), Some(30)), None);
     }
 }
 

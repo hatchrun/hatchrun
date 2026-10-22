@@ -8,9 +8,13 @@
 //! jobs, the agent's calls move them along, the app lists them, and the
 //! reconciler checks, restarts and expires them. Times are Unix
 //! milliseconds. A job's `steps` column is `jsonb`, which rows do not
-//! carry, so every statement reads it as text and [`JobRow`] parses it.
+//! carry, so every statement reads it as text and [`JobRow`] parses it;
+//! so are `token_permissions` and `secret_refs`.
+
+use std::collections::BTreeMap;
 
 use hatchrun_cloud::db::{Db, Param, params};
+use hatchrun_workflow::{Level, SecretRefs, templates};
 use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
 use worker::Result;
@@ -19,13 +23,30 @@ use worker::Result;
 /// milliseconds.
 const RETENTION_MS: u64 = 30 * 86_400_000;
 
-/// A tenant, as far as CI needs it.
+/// Where a tenant stands with the CI product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiBilling {
+    /// No CI subscription row ever: a hatchrun.io-only tenant.
+    Never,
+    /// A CI subscription exists but none is active or trialing.
+    Lapsed,
+    /// An active or trialing CI subscription: a card on file.
+    Active,
+}
+
+/// A tenant, as far as CI needs it. The billing state is read in the
+/// same statement as the tenant, so the gate costs no extra query.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TenantRow {
     /// The tenant id.
     pub id: String,
-    /// Whether CI runs for this tenant.
-    pub ci_enabled: bool,
+    /// The organization's login.
+    pub org_login: String,
+    /// Whether the tenant has a card for CI.
+    pub ci_billing: CiBilling,
+    /// How many days the tenant's runs, logs and state are kept: 30 or 90.
+    pub retention_days: u32,
 }
 
 /// A repository CI has seen.
@@ -102,6 +123,9 @@ pub struct RunRow {
     pub created_at: u64,
     /// When the run finished.
     pub completed_at: Option<u64>,
+    /// How many days the run is kept, as its tenant's retention was when
+    /// the run was recorded. It names the tier of the run's R2 keys.
+    pub retention_days: u32,
 }
 
 /// A job to record, from a planned job.
@@ -113,6 +137,13 @@ pub struct NewJob {
     pub name: String,
     /// The most minutes it may run.
     pub timeout_minutes: u32,
+    /// The first `runs-on` label of the job's runner template; `None`
+    /// for an approval job.
+    pub template: Option<String>,
+    /// The App permissions of the job's token.
+    pub token_permissions: BTreeMap<String, Level>,
+    /// The secrets the job reads.
+    pub secret_refs: SecretRefs,
 }
 
 /// A recorded job.
@@ -154,6 +185,18 @@ pub struct JobRow {
     pub steps: serde_json::Value,
     /// The R2 key of the finished log.
     pub log_key: Option<String>,
+    /// The first `runs-on` label of the job's runner template; `None`
+    /// for an approval job.
+    pub template: Option<String>,
+    /// The App permissions of the job's token, a JSON object.
+    #[serde(deserialize_with = "json_text")]
+    pub token_permissions: serde_json::Value,
+    /// The secrets the job reads, a JSON object.
+    #[serde(deserialize_with = "json_text")]
+    pub secret_refs: serde_json::Value,
+    /// Why the queued job waits for a launch: `card`, `spend_cap` or
+    /// `concurrency`.
+    pub held: Option<String>,
 }
 
 /// A schedule of a workflow.
@@ -175,19 +218,40 @@ fn json_text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<serde_json:
 
 /// The columns of a [`RunRow`].
 const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, \
-     event, ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at";
+     event, ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at, \
+     (expires_at - created_at) / 86400000 AS retention_days";
 
 /// The columns of a [`JobRow`].
 const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instance_id, attempt, \
      launch_attempts, next_launch_at, timeout_minutes, updated_at, heartbeat_at, started_at, \
-     completed_at, steps::text AS steps, log_key";
+     completed_at, steps::text AS steps, log_key, template, \
+     token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held";
 
-/// The tenant of installation `$1`.
-const TENANT_FOR_INSTALLATION: &str =
-    "SELECT id, ci_enabled FROM tenants WHERE installation_id = $1";
+/// The columns of a [`TenantRow`]. `ci_billing` is `active` for an
+/// active or trialing CI subscription, `lapsed` for another CI
+/// subscription, `never` for none. `retention_days` is the tier: 30, or 90
+/// for a tenant whose `retention_days` (shared with hatchrun.io, 1 to 90)
+/// is above 30. R2 lifecycle rules exist per tier, so CI keeps for 30 or
+/// 90 days and nothing between.
+const TENANT_COLUMNS: &str = "id, org_login, CASE \
+     WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
+     AND subscriptions.product = 'ci' AND subscriptions.status IN ('active', 'trialing')) \
+     THEN 'active' \
+     WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
+     AND subscriptions.product = 'ci') THEN 'lapsed' \
+     ELSE 'never' END AS ci_billing, \
+     CASE WHEN retention_days > 30 THEN 90 ELSE 30 END AS retention_days";
 
-/// Tenant `$1`.
-const TENANT: &str = "SELECT id, ci_enabled FROM tenants WHERE id = $1";
+/// The tenant of installation `$1`, where `{columns}` is
+/// [`TENANT_COLUMNS`].
+const TENANT_FOR_INSTALLATION: &str = "SELECT {columns} FROM tenants WHERE installation_id = $1";
+
+/// Tenant `$1`, where `{columns}` is [`TENANT_COLUMNS`].
+const TENANT: &str = "SELECT {columns} FROM tenants WHERE id = $1";
+
+/// Whether tenant `$1` has an active or trialing CI subscription.
+const HAS_CARD: &str = "SELECT EXISTS (SELECT 1 FROM subscriptions WHERE tenant_id = $1 \
+     AND product = 'ci' AND status IN ('active', 'trialing')) AS card";
 
 /// The run of delivery `$1` and workflow `$2`, where `{columns}` is
 /// [`RUN_COLUMNS`].
@@ -231,8 +295,9 @@ const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE
 
 /// Records a run and takes its number in one statement, run after
 /// [`LOCK_REPO`]. Binds `$1` tenant, `$2` repository, `$3` workflow,
-/// `$4` delivery, `$5` event, `$6` ref, `$7` sha, `$8` actor, `$9` now
-/// and `$10` the expiry. The number is taken only when no run of this
+/// `$4` delivery, `$5` event, `$6` ref, `$7` sha, `$8` actor and `$9`
+/// now. The run expires after its tenant's retention tier (30 or 90 days), read
+/// in the same statement. The number is taken only when no run of this
 /// delivery and workflow exists, so a duplicate leaves the counter
 /// alone, and the statement returns no row for it.
 const INSERT_RUN: &str = "WITH n AS (\
@@ -243,9 +308,12 @@ const INSERT_RUN: &str = "WITH n AS (\
        RETURNING last) \
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
        actor, status, created_at, updated_at, expires_at) \
-     SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, 'queued', $9, $9, $10 FROM n \
+     SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, 'queued', $9, $9, \
+       $9 + (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END * 86400000::bigint \
+         FROM tenants WHERE id = $1) FROM n \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
-       ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at";
+       ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at, \
+       (expires_at - created_at) / 86400000 AS retention_days";
 
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
@@ -282,7 +350,7 @@ const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2,
 const RESET_JOB: &str = "UPDATE ci_jobs SET status = 'waiting', attempt = $2, launch_attempts = 0, \
      conclusion = NULL, instance_id = NULL, launch_error = NULL, next_launch_at = NULL, \
      heartbeat_at = NULL, started_at = NULL, completed_at = NULL, log_key = NULL, \
-     steps = '[]', updated_at = $3 WHERE id = $1 AND attempt < $2";
+     held = NULL, steps = '[]', updated_at = $3 WHERE id = $1 AND attempt < $2";
 
 /// Moves run `$1` from queued to in progress at `$2`.
 const RUN_STARTED: &str = "UPDATE ci_runs SET status = 'in_progress', updated_at = $2 WHERE id = $1 AND status = 'queued'";
@@ -303,10 +371,34 @@ const REOPEN_RUN_AT: &str = "UPDATE ci_runs SET status = 'in_progress', conclusi
 const SET_JOB: &str = "UPDATE ci_jobs SET status = $2, conclusion = $3, updated_at = $4, \
      completed_at = CASE WHEN $2 = 'completed' THEN $4 ELSE completed_at END WHERE id = $1";
 
-/// Takes the launch of job `$1` at `$2`, if it is queued.
-const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', \
+/// Locks the row of tenant `$1`, so the launches of one tenant are
+/// counted against the concurrency cap one at a time.
+const LOCK_TENANT: &str = "SELECT id FROM tenants WHERE id = $1 FOR UPDATE";
+
+/// Takes the launch of job `$1` at `$2`, if it is queued and fewer than
+/// `$4` jobs of tenant `$3` are launching, launched or running, and no
+/// older job of the tenant waits for a place (held for `concurrency`),
+/// so new jobs do not jump the line; run after [`LOCK_TENANT`]. The
+/// hold is over.
+const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL, \
      launch_attempts = launch_attempts + 1, updated_at = $2 \
-     WHERE id = $1 AND status = 'queued' RETURNING {columns}";
+     WHERE id = $1 AND status = 'queued' \
+     AND (SELECT count(*) FROM ci_jobs other JOIN ci_runs ON ci_runs.id = other.run_id \
+          WHERE ci_runs.tenant_id = $3 \
+          AND other.status IN ('launching', 'launched', 'running')) < $4 \
+     AND NOT EXISTS (SELECT 1 FROM ci_jobs older JOIN ci_runs older_run \
+          ON older_run.id = older.run_id \
+          WHERE older_run.tenant_id = $3 AND older.status = 'queued' \
+          AND older.held = 'concurrency' AND older.id < ci_jobs.id) \
+     RETURNING {columns}";
+
+/// Keeps attempt `$2` of queued job `$1` held for reason `$3` until
+/// `$4`, at `$5`. Returns whether the reason changed.
+const HOLD: &str = "WITH prior AS (SELECT held FROM ci_jobs \
+       WHERE id = $1 AND attempt = $2 AND status = 'queued' FOR UPDATE) \
+     UPDATE ci_jobs SET held = $3::text, next_launch_at = $4, updated_at = $5 \
+     FROM prior WHERE ci_jobs.id = $1 \
+     RETURNING (prior.held IS DISTINCT FROM $3::text) AS changed";
 
 /// Records the instance `$2` of job `$1` at `$3`.
 const LAUNCHED: &str = "UPDATE ci_jobs SET status = 'launched', instance_id = $2, \
@@ -337,6 +429,66 @@ const FINISH_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = 
 /// Completes attempt `$4` of run `$1` with conclusion `$2` at `$3`.
 const FINISH_RUN: &str = "UPDATE ci_runs SET status = 'completed', conclusion = $2, \
      completed_at = $3, updated_at = $3 WHERE id = $1 AND run_attempt = $4";
+
+/// Records the usage of attempt `$3` of job `$1`, completed at `$2`,
+/// from the row as the update before it left it: nothing is written
+/// when that update did not apply (another attempt, or a job completed
+/// already), or the job never started or has no template. Minutes run
+/// from start to completion, rounded up, at least one. `$4` is the JSON map of label to price
+/// per minute and `$5` the price of one unit, so the units are those of the
+/// price when the job ended; a label the map lacks records nothing.
+const RECORD_USAGE: &str = "INSERT INTO ci_usage \
+       (job_id, attempt, tenant_id, template, minutes, units, ended_at) \
+     SELECT ci_jobs.id, ci_jobs.attempt, ci_runs.tenant_id, ci_jobs.template, \
+       m.minutes, m.minutes * ($4::jsonb ->> ci_jobs.template)::bigint / $5, \
+       ci_jobs.completed_at \
+     FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
+       CROSS JOIN LATERAL (SELECT GREATEST(1, \
+         CEIL((ci_jobs.completed_at - ci_jobs.started_at) / 60000.0))::bigint AS minutes) m \
+     WHERE ci_jobs.id = $1 AND ci_jobs.attempt = $3 AND ci_jobs.status = 'completed' \
+       AND ci_jobs.completed_at = $2 AND ci_jobs.started_at IS NOT NULL \
+       AND ($4::jsonb ->> ci_jobs.template) IS NOT NULL \
+     ON CONFLICT DO NOTHING";
+
+/// The billing state of a tenant, usage since `$2`, cap default `$3`;
+/// `{owner}` picks the tenant by `$1`.
+const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
+       EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
+         AND subscriptions.product = 'ci' \
+         AND subscriptions.status IN ('active', 'trialing')) AS card, \
+       COALESCE((SELECT cap_micros FROM ci_spend_caps WHERE tenant_id = tenants.id), $3) \
+         AS cap_micros, \
+       COALESCE((SELECT json_agg(json_build_object('template', u.template, 'minutes', u.minutes)) \
+         FROM (SELECT template, SUM(minutes)::bigint AS minutes FROM ci_usage \
+           WHERE tenant_id = tenants.id AND ended_at >= $2 GROUP BY template) u), \
+         '[]'::json)::text AS minutes_by_template, \
+       (SELECT count(*) FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
+         WHERE ci_runs.tenant_id = tenants.id \
+         AND ci_jobs.status IN ('launching', 'launched', 'running'))::bigint AS running \
+     FROM tenants WHERE {owner}";
+
+/// [`STANDING`]'s `{owner}` for the tenant of job `$1`.
+const OWNER_OF_JOB: &str = "tenants.id = (SELECT ci_runs.tenant_id FROM ci_jobs \
+     JOIN ci_runs ON ci_runs.id = ci_jobs.run_id WHERE ci_jobs.id = $1)";
+
+/// [`STANDING`]'s `{owner}` for tenant `$1`.
+const OWNER_IS_TENANT: &str = "tenants.id = $1::text";
+
+/// The tenant of GitHub organization id `$1`, where `{columns}` is
+/// [`TENANT_COLUMNS`]. The id is unique and survives renames; the login
+/// is neither.
+const TENANT_BY_ORG: &str = "SELECT {columns} FROM tenants WHERE org_id = $1";
+
+/// Sets the spend cap of tenant `$1` to `$2` micros at `$3`.
+const SET_SPEND_CAP: &str = "INSERT INTO ci_spend_caps (tenant_id, cap_micros, updated_at) \
+     VALUES ($1, $2, $3) \
+     ON CONFLICT (tenant_id) DO UPDATE SET cap_micros = $2, updated_at = $3";
+
+/// Usage Polar has not taken and has not refused, oldest first, at
+/// most `$1`.
+const UNSENT_USAGE: &str = "SELECT job_id, attempt, tenant_id, template, minutes, units, ended_at \
+     FROM ci_usage WHERE sent_at IS NULL AND rejected_at IS NULL \
+     ORDER BY ended_at, job_id, attempt LIMIT $1";
 
 /// Drops the schedules of repository `$1`.
 const DELETE_SCHEDULES: &str = "DELETE FROM ci_schedules WHERE repo_id = $1";
@@ -386,7 +538,7 @@ const SET_LAST_MINUTE: &str = "UPDATE ci_reconciler SET last_minute = $1 WHERE i
 /// the heartbeat is missing. [`crate::reconcile::stalled`] makes the
 /// same decisions over the rows.
 const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
-     (status = 'queued' AND (next_launch_at <= $1 OR updated_at < $2)) \
+     (status = 'queued' AND held IS NULL AND (next_launch_at <= $1 OR updated_at < $2)) \
      OR (status IN ('launching', 'launched') AND updated_at < $3) \
      OR (status = 'running' AND COALESCE(heartbeat_at, started_at, updated_at) < $4) \
      ORDER BY updated_at, id LIMIT $5";
@@ -402,6 +554,12 @@ pub const SWEEP_LIMIT: u32 = 100;
 
 /// Deletes delivery ids received before `$1`.
 const SWEEP_DELIVERIES: &str = "DELETE FROM ci_deliveries WHERE received_at < $1";
+
+/// Deletes usage Polar took before `$1`.
+const SWEEP_USAGE: &str = "DELETE FROM ci_usage WHERE sent_at < $1 OR rejected_at < $1";
+
+/// How long sent usage rows are kept, in milliseconds.
+const USAGE_RETENTION_MS: u64 = 90 * 86_400_000;
 
 /// `sql` with its `{columns}` filled in.
 fn with_columns(sql: &str, columns: &str) -> String {
@@ -419,8 +577,11 @@ async fn exists(db: &Db, sql: &str, params: &[Param]) -> Result<bool> {
 ///
 /// Postgres refused the statement.
 pub async fn tenant_for_installation(db: &Db, installation_id: u64) -> Result<Option<TenantRow>> {
-    db.first(TENANT_FOR_INSTALLATION, &params![installation_id])
-        .await
+    db.first(
+        &TENANT_FOR_INSTALLATION.replace("{columns}", TENANT_COLUMNS),
+        &params![installation_id],
+    )
+    .await
 }
 
 /// Tenant `tenant_id`.
@@ -429,7 +590,224 @@ pub async fn tenant_for_installation(db: &Db, installation_id: u64) -> Result<Op
 ///
 /// Postgres refused the statement.
 pub async fn tenant(db: &Db, tenant_id: &str) -> Result<Option<TenantRow>> {
-    db.first(TENANT, &params![tenant_id]).await
+    db.first(
+        &TENANT.replace("{columns}", TENANT_COLUMNS),
+        &params![tenant_id],
+    )
+    .await
+}
+
+/// Whether tenant `tenant_id` has an active or trialing subscription to
+/// the CI product.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn has_card(db: &Db, tenant_id: &str) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct Card {
+        card: bool,
+    }
+    Ok(db
+        .first::<Card>(HAS_CARD, &params![tenant_id])
+        .await?
+        .is_some_and(|row| row.card))
+}
+
+/// A tenant's billing state this month.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Standing {
+    /// The tenant.
+    pub tenant_id: String,
+    /// The organization's login, for messages.
+    pub org_login: String,
+    /// Whether an active or trialing CI subscription exists.
+    pub card: bool,
+    /// The monthly spend cap in micros: the tenant's own or the default.
+    pub cap_micros: u64,
+    /// Minutes metered this month, per template label.
+    pub minutes_by_template: Vec<(String, u64)>,
+    /// Jobs launching, launched or running now.
+    pub running: u32,
+}
+
+/// What [`STANDING`] returns; the minutes arrive as JSON text.
+#[derive(Deserialize)]
+struct StandingRow {
+    tenant_id: String,
+    org_login: String,
+    card: bool,
+    cap_micros: u64,
+    minutes_by_template: String,
+    running: u32,
+}
+
+impl StandingRow {
+    fn into_standing(self) -> Result<Standing> {
+        #[derive(Deserialize)]
+        struct Minutes {
+            template: String,
+            minutes: u64,
+        }
+        let minutes: Vec<Minutes> = serde_json::from_str(&self.minutes_by_template)?;
+        Ok(Standing {
+            tenant_id: self.tenant_id,
+            org_login: self.org_login,
+            card: self.card,
+            cap_micros: self.cap_micros,
+            minutes_by_template: minutes
+                .into_iter()
+                .map(|m| (m.template, m.minutes))
+                .collect(),
+            running: self.running,
+        })
+    }
+}
+
+/// The billing state of the tenant of job `job_id`: usage since
+/// `month_start`, and `default_cap` for a tenant with no cap row.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn standing(
+    db: &Db,
+    job_id: u64,
+    month_start: u64,
+    default_cap: u64,
+) -> Result<Option<Standing>> {
+    let sql = STANDING.replace("{owner}", OWNER_OF_JOB);
+    db.first::<StandingRow>(&sql, &params![job_id, month_start, default_cap])
+        .await?
+        .map(StandingRow::into_standing)
+        .transpose()
+}
+
+/// As [`standing`], for tenant `tenant_id`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn tenant_standing(
+    db: &Db,
+    tenant_id: &str,
+    month_start: u64,
+    default_cap: u64,
+) -> Result<Option<Standing>> {
+    let sql = STANDING.replace("{owner}", OWNER_IS_TENANT);
+    db.first::<StandingRow>(&sql, &params![tenant_id, month_start, default_cap])
+        .await?
+        .map(StandingRow::into_standing)
+        .transpose()
+}
+
+/// The tenant of the GitHub organization with id `org_id`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn tenant_by_org_id(db: &Db, org_id: u64) -> Result<Option<TenantRow>> {
+    db.first(
+        &TENANT_BY_ORG.replace("{columns}", TENANT_COLUMNS),
+        &params![org_id],
+    )
+    .await
+}
+
+/// Sets tenant `tenant_id`'s monthly spend cap to `cap_micros`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn set_spend_cap(db: &Db, tenant_id: &str, cap_micros: u64, now: u64) -> Result<()> {
+    db.run(SET_SPEND_CAP, &params![tenant_id, cap_micros, now])
+        .await
+        .map(|_| ())
+}
+
+/// One attempt's usage that Polar has not taken yet.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UnsentUsage {
+    /// The job.
+    pub job_id: u64,
+    /// The attempt.
+    pub attempt: u32,
+    /// The tenant, Polar's external customer id.
+    pub tenant_id: String,
+    /// The template's label.
+    pub template: String,
+    /// The minutes the attempt ran.
+    pub minutes: u64,
+    /// The billing units, priced when the attempt completed.
+    pub units: u64,
+    /// When the attempt completed, in milliseconds.
+    pub ended_at: u64,
+}
+
+/// The oldest `limit` usage rows Polar has not taken.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn unsent_usage(db: &Db, limit: u32) -> Result<Vec<UnsentUsage>> {
+    db.all(UNSENT_USAGE, &params![limit]).await
+}
+
+/// Marks the usage of the `(job, attempt)` pairs in `keys` as taken by
+/// Polar at `now`. A row already marked keeps its time.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn usage_sent(db: &Db, keys: &[(u64, u32)], now: u64) -> Result<()> {
+    mark_usage("sent_at = $1", &[], keys, now, db).await
+}
+
+/// Quarantines the usage of the `(job, attempt)` pairs in `keys`:
+/// Polar refused it for good, so it is never sent again.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn usage_rejected(db: &Db, keys: &[(u64, u32)], reason: &str, now: u64) -> Result<()> {
+    mark_usage(
+        "rejected_at = $1, reject_reason = $2",
+        &[Param::from(reason)],
+        keys,
+        now,
+        db,
+    )
+    .await
+}
+
+/// Sets `assignments` on the open usage rows of `keys`. `$1` is `now`
+/// and `extra` binds `$2` on.
+async fn mark_usage(
+    assignments: &str,
+    extra: &[Param],
+    keys: &[(u64, u32)],
+    now: u64,
+    db: &Db,
+) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let first = extra.len() + 2;
+    let pairs: Vec<String> = (0..keys.len())
+        .map(|n| format!("(${}, ${})", first + 2 * n, first + 2 * n + 1))
+        .collect();
+    let sql = format!(
+        "UPDATE ci_usage SET {assignments} WHERE sent_at IS NULL AND rejected_at IS NULL \
+         AND (job_id, attempt) IN ({})",
+        pairs.join(", ")
+    );
+    let mut bound: Vec<Param> = vec![Param::from(now)];
+    bound.extend(extra.iter().cloned());
+    for (job, attempt) in keys {
+        bound.push(Param::from(*job));
+        bound.push(Param::from(*attempt));
+    }
+    db.run(&sql, &bound).await.map(|_| ())
 }
 
 /// Records `repo`, or updates it after a rename or a change.
@@ -440,6 +818,16 @@ pub async fn tenant(db: &Db, tenant_id: &str) -> Result<Option<TenantRow>> {
 pub async fn upsert_repo(db: &Db, repo: &RepoRow, now: u64) -> Result<()> {
     db.batch(&[
         (FREE_REPO_NAME, params![repo.id, &repo.full_name]),
+        // A repository that changes tenant leaves its secrets and vars
+        // behind, as GitHub does on transfer.
+        (
+            "DELETE FROM ci_secrets WHERE repo_id = $1 AND tenant_id <> $2",
+            params![repo.id, &repo.tenant_id],
+        ),
+        (
+            "DELETE FROM ci_vars WHERE repo_id = $1 AND tenant_id <> $2",
+            params![repo.id, &repo.tenant_id],
+        ),
         (
             UPSERT_REPO,
             params![
@@ -514,8 +902,7 @@ pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>> {
             &run.git_ref,
             &run.sha,
             &run.actor,
-            run.now,
-            run.now + RETENTION_MS
+            run.now
         ],
     )
     .await
@@ -544,20 +931,31 @@ pub async fn insert_jobs(
     let mut values = Vec::new();
     let mut bound = params![run_id, now];
     for (i, job) in jobs.iter().enumerate() {
-        let base = 3 + i * 3;
+        let base = 3 + i * 6;
         values.push(format!(
-            "($1, ${}, ${}, ${}, 'waiting', $2, $2)",
+            "($1, ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, 'waiting', $2, $2)",
             base,
             base + 1,
-            base + 2
+            base + 2,
+            base + 3,
+            base + 4,
+            base + 5
         ));
         bound.push(Param::from(&job.plan_id));
         bound.push(Param::from(&job.name));
         bound.push(Param::from(job.timeout_minutes));
+        bound.push(Param::from(job.template.as_deref()));
+        bound.push(Param::from(
+            serde_json::to_string(&job.token_permissions).map_err(worker::Error::from)?,
+        ));
+        bound.push(Param::from(
+            serde_json::to_string(&job.secret_refs).map_err(worker::Error::from)?,
+        ));
     }
     let sql = format!(
-        "INSERT INTO ci_jobs (run_id, plan_id, name, timeout_minutes, status, created_at, \
-         updated_at) VALUES {} RETURNING plan_id, id",
+        "INSERT INTO ci_jobs (run_id, plan_id, name, timeout_minutes, template, \
+         token_permissions, secret_refs, status, created_at, updated_at) \
+         VALUES {} RETURNING plan_id, id",
         values.join(", ")
     );
     let mut inserted: Vec<Inserted> = db.all(&sql, &bound).await?;
@@ -733,18 +1131,76 @@ pub async fn set_job(
     Ok(())
 }
 
-/// Takes the launch of job `job_id` if it is queued: launching, one
-/// more launch attempt. `None` when somebody else took it.
+/// What [`claim_launch`] found.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // one value per launch, never stored
+pub enum Claim {
+    /// The job is launching now, one more launch attempt.
+    Claimed(JobRow),
+    /// The job is queued, but the tenant runs its most jobs already.
+    Busy,
+    /// Somebody else took the launch, or the job moved on.
+    Gone,
+}
+
+/// Takes the launch of job `job_id` of tenant `tenant_id` if it is
+/// queued: launching, one more launch attempt, no hold. The tenant's
+/// row is locked first, so two consumers cannot both take the last of
+/// `max_running` places: the job is claimed only while fewer than
+/// `max_running` of the tenant's jobs are launching, launched or
+/// running.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn claim_launch(db: &Db, job_id: u64, now: u64) -> Result<Option<JobRow>> {
-    db.first(
-        &with_columns(CLAIM_LAUNCH, JOB_COLUMNS),
-        &params![job_id, now],
-    )
-    .await
+pub async fn claim_launch(
+    db: &Db,
+    job_id: u64,
+    tenant_id: &str,
+    max_running: u32,
+    now: u64,
+) -> Result<Claim> {
+    let lock = params![tenant_id];
+    let claimed: Option<JobRow> = db
+        .first_locked(
+            (LOCK_TENANT, &lock),
+            &with_columns(CLAIM_LAUNCH, JOB_COLUMNS),
+            &params![job_id, now, tenant_id, max_running],
+        )
+        .await?;
+    if let Some(job) = claimed {
+        return Ok(Claim::Claimed(job));
+    }
+    Ok(match job(db, job_id).await? {
+        Some(row) if row.status == "queued" => Claim::Busy,
+        _ => Claim::Gone,
+    })
+}
+
+/// Keeps attempt `attempt` of job `job_id` queued with reason `hold`
+/// until `retry_at`, and bumps its `updated_at`. Returns whether the
+/// reason changed; another attempt, or a job that is not queued, is
+/// left alone and the answer is `false`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn hold(
+    db: &Db,
+    job_id: u64,
+    attempt: u32,
+    hold: &str,
+    retry_at: u64,
+    now: u64,
+) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct Changed {
+        changed: bool,
+    }
+    Ok(db
+        .first::<Changed>(HOLD, &params![job_id, attempt, hold, retry_at, now])
+        .await?
+        .is_some_and(|row| row.changed))
 }
 
 /// Records the instance of job `job_id`: launched. Only a launching
@@ -794,7 +1250,8 @@ pub async fn heartbeat(db: &Db, job_id: u64, now: u64) -> Result<()> {
 /// Completes attempt `attempt` of job `job_id` with its `conclusion`,
 /// `steps` and the key of its finished log. A completed job, and a job
 /// of another attempt, keep what they have; returns whether this call
-/// completed it.
+/// completed it. In the same transaction a job that was claimed gets
+/// its minutes recorded for this attempt, once.
 ///
 /// # Errors
 ///
@@ -808,13 +1265,38 @@ pub async fn finish_job(
     log_key: Option<&str>,
     now: u64,
 ) -> Result<bool> {
-    let changed = db
-        .run(
-            FINISH_JOB,
-            &params![job_id, conclusion, steps.to_string(), log_key, now, attempt],
-        )
+    let changes = db
+        .batch(&[
+            (
+                FINISH_JOB,
+                params![job_id, conclusion, steps.to_string(), log_key, now, attempt],
+            ),
+            (
+                RECORD_USAGE,
+                params![
+                    job_id,
+                    now,
+                    attempt,
+                    template_prices(),
+                    templates::UNIT_PRICE_MICROS
+                ],
+            ),
+        ])
         .await?;
-    Ok(changed == 1)
+    Ok(changes.first() == Some(&1))
+}
+
+/// The price per minute of every template label, as JSON text.
+fn template_prices() -> String {
+    let prices: BTreeMap<&str, u64> = templates::TEMPLATES
+        .iter()
+        .flat_map(|t| {
+            t.labels
+                .iter()
+                .map(|label| (*label, t.price_micros_per_minute))
+        })
+        .collect();
+    serde_json::to_string(&prices).unwrap_or_default()
 }
 
 /// Completes attempt `attempt` of run `run_id` with its `conclusion`; a
@@ -900,7 +1382,8 @@ pub async fn set_last_minute(db: &Db, minute_ms: u64) -> Result<()> {
 }
 
 /// Deletes runs that expired before `now`, with their jobs, and
-/// delivery ids older than 30 days. At most [`SWEEP_LIMIT`] runs go in
+/// delivery ids older than 30 days, and usage rows Polar took more
+/// than 90 days ago. At most [`SWEEP_LIMIT`] runs go in
 /// one call, oldest first, and the rest the next time. Returns the ids
 /// of the runs, so their logs can be purged.
 ///
@@ -915,7 +1398,509 @@ pub async fn sweep(db: &Db, now: u64) -> Result<Vec<u64>> {
     let runs: Vec<Deleted> = db.all(SWEEP_RUNS, &params![now, SWEEP_LIMIT]).await?;
     db.run(SWEEP_DELIVERIES, &params![now.saturating_sub(RETENTION_MS)])
         .await?;
+    db.run(
+        SWEEP_USAGE,
+        &params![now.saturating_sub(USAGE_RETENTION_MS)],
+    )
+    .await?;
     Ok(runs.into_iter().map(|row| row.id).collect())
+}
+
+// The warm pool (see `crate::pool`). Times are Unix milliseconds.
+
+/// The pool rows of template `$1`.
+const POOL_ROWS: &str = "SELECT instance_id, template, state, launched_at, since \
+     FROM ci_pool WHERE template = $1 ORDER BY launched_at, instance_id";
+
+/// Deletes the oldest ready row of template `$1` and returns its
+/// instance. A row another statement holds is skipped, so two jobs never
+/// take the same instance.
+const TAKE_POOL: &str = "DELETE FROM ci_pool WHERE instance_id = (\
+       SELECT instance_id FROM ci_pool WHERE template = $1 AND state = 'ready' \
+       ORDER BY launched_at, instance_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
+     RETURNING instance_id";
+
+/// Deletes the row of instance `$1`.
+const DROP_POOL: &str = "DELETE FROM ci_pool WHERE instance_id = $1";
+
+/// Moves instance `$1` from state `$2` to `$3` at `$4`.
+const MOVE_POOL: &str =
+    "UPDATE ci_pool SET state = $3, since = $4 WHERE instance_id = $1 AND state = $2";
+
+/// Sets the state of an existing row of instance `$1` to `$2`, since `$3`,
+/// in the pool of template `$4`.
+const UPDATE_POOL: &str =
+    "UPDATE ci_pool SET state = $2, since = $3 WHERE instance_id = $1 AND template = $4";
+
+/// Adds a launched instance.
+const INSERT_POOL: &str = "INSERT INTO ci_pool (instance_id, template, state, launched_at, since) \
+     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (instance_id) DO NOTHING";
+
+/// Jobs claimed since `$1`, by template and bucket of `$2` milliseconds.
+const CLAIMS_BY_BUCKET: &str = "SELECT template, started_at / $2 * $2 AS bucket, count(*) AS jobs \
+     FROM ci_jobs WHERE started_at >= $1 AND template IS NOT NULL \
+     GROUP BY template, started_at / $2";
+
+/// An instance of the warm pool.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PoolRow {
+    /// The EC2 instance id.
+    pub instance_id: String,
+    /// The template the instance is kept for, its first label.
+    pub template: String,
+    /// `warming`, `stopping` or `ready`.
+    pub state: String,
+    /// When it launched, in Unix milliseconds.
+    pub launched_at: u64,
+    /// When it entered its state, in Unix milliseconds.
+    pub since: u64,
+}
+
+/// The pool rows of `template`, oldest first.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn pool_rows(db: &Db, template: &str) -> Result<Vec<PoolRow>> {
+    db.all(POOL_ROWS, &params![template]).await
+}
+
+/// Deletes the oldest ready row of `template` and returns its instance:
+/// the job that took it owns it. `None` when none is ready.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn take_pool(db: &Db, template: &str) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Taken {
+        instance_id: String,
+    }
+    Ok(db
+        .first::<Taken>(TAKE_POOL, &params![template])
+        .await?
+        .map(|row| row.instance_id))
+}
+
+/// Deletes the row of `instance_id`. Returns whether it was there: when
+/// not, a job took the instance first and it is not the pool's to end.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn drop_pool(db: &Db, instance_id: &str) -> Result<bool> {
+    Ok(db.run(DROP_POOL, &params![instance_id]).await? == 1)
+}
+
+/// Moves the row of `instance_id` from state `from` to `to`. Returns
+/// whether it was in `from`: when not, a job took the instance first.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn move_pool(db: &Db, instance_id: &str, from: &str, to: &str, now: u64) -> Result<bool> {
+    Ok(db
+        .run(MOVE_POOL, &params![instance_id, from, to, now])
+        .await?
+        == 1)
+}
+
+/// Saves the pool of `template` after a pass: `rows` update the rows that
+/// still exist, and `launched` are added. A row a job took meanwhile is
+/// not brought back.
+///
+/// # Errors
+///
+/// Postgres refused a statement; none of them applies.
+pub async fn save_pool(
+    db: &Db,
+    template: &str,
+    rows: &[PoolRow],
+    launched: &[PoolRow],
+) -> Result<()> {
+    let mut statements: Vec<(&str, Vec<Param>)> = Vec::new();
+    for row in rows {
+        statements.push((
+            UPDATE_POOL,
+            params![
+                row.instance_id.as_str(),
+                row.state.as_str(),
+                row.since,
+                template
+            ],
+        ));
+    }
+    for row in launched {
+        statements.push((
+            INSERT_POOL,
+            params![
+                row.instance_id.as_str(),
+                template,
+                row.state.as_str(),
+                row.launched_at,
+                row.since
+            ],
+        ));
+    }
+    if !statements.is_empty() {
+        db.batch(&statements).await?;
+    }
+    Ok(())
+}
+
+/// Jobs claimed at or after `since`, as (template, start of the bucket,
+/// claims), the buckets [`crate::pool::BUCKET_MS`] long. A template is
+/// the label the job named, which may be any of its template's labels.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn claims_by_bucket(db: &Db, since: u64) -> Result<Vec<(String, u64, u64)>> {
+    #[derive(Deserialize)]
+    struct Count {
+        template: String,
+        bucket: u64,
+        jobs: u64,
+    }
+    let rows: Vec<Count> = db
+        .all(CLAIMS_BY_BUCKET, &params![since, crate::pool::BUCKET_MS])
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.template, row.bucket, row.jobs))
+        .collect())
+}
+
+// Secrets and vars. A secret's value is sealed (see `crate::secrets`);
+// a var's is plain text. `repo_id` None is the organization's row.
+
+/// Whether a secret or var was stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Put {
+    /// Stored, or replaced.
+    Saved,
+    /// A new name over the scope's limit.
+    TooMany,
+}
+
+/// Stores secret `$3` of tenant `$1` and scope `$2` ($6 is the limit,
+/// $7 the time). A new name is refused at the limit; replacing one
+/// never is. Returns a row when it stored.
+const PUT_SECRET: &str = "INSERT INTO ci_secrets (tenant_id, repo_id, name, key_id, sealed, updated_at) \
+     SELECT $1, $2::bigint, $3, $4, $5, $7 \
+     WHERE EXISTS (SELECT 1 FROM ci_secrets WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3) \
+       OR (SELECT count(*) FROM ci_secrets WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint) < $6 \
+     ON CONFLICT (tenant_id, repo_id, name) DO UPDATE SET key_id = EXCLUDED.key_id, \
+       sealed = EXCLUDED.sealed, updated_at = EXCLUDED.updated_at \
+     RETURNING 1 AS saved";
+
+/// As [`PUT_SECRET`], for a var with value `$4`; `$5` is the limit and
+/// `$6` the time.
+const PUT_VAR: &str = "INSERT INTO ci_vars (tenant_id, repo_id, name, value, updated_at) \
+     SELECT $1, $2::bigint, $3, $4, $6 \
+     WHERE EXISTS (SELECT 1 FROM ci_vars WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3) \
+       OR (SELECT count(*) FROM ci_vars WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint) < $5 \
+     ON CONFLICT (tenant_id, repo_id, name) DO UPDATE SET value = EXCLUDED.value, \
+       updated_at = EXCLUDED.updated_at \
+     RETURNING 1 AS saved";
+
+/// What [`PUT_SECRET`] and [`PUT_VAR`] return.
+#[derive(Deserialize)]
+struct Saved {}
+
+/// Runs a put statement with the tenant row locked, so two puts cannot
+/// both take the last place.
+async fn put(db: &Db, tenant: &str, sql: &str, bound: &[Param]) -> Result<Put> {
+    let lock = params![tenant];
+    let saved: Option<Saved> = db.first_locked((LOCK_TENANT, &lock), sql, bound).await?;
+    Ok(if saved.is_some() {
+        Put::Saved
+    } else {
+        Put::TooMany
+    })
+}
+
+/// Stores the sealed value of secret `name`, replacing the old one.
+/// A new name is refused with [`Put::TooMany`] when the scope already
+/// holds `limit` secrets.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+#[allow(clippy::too_many_arguments)] // one column each
+pub async fn put_secret(
+    db: &Db,
+    tenant: &str,
+    repo_id: Option<u64>,
+    name: &str,
+    key_id: &str,
+    sealed: &str,
+    limit: u32,
+    now: u64,
+) -> Result<Put> {
+    put(
+        db,
+        tenant,
+        PUT_SECRET,
+        &params![tenant, repo_id, name, key_id, sealed, limit, now],
+    )
+    .await
+}
+
+/// Deletes secret `name`. Returns whether it existed.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn delete_secret(
+    db: &Db,
+    tenant: &str,
+    repo_id: Option<u64>,
+    name: &str,
+) -> Result<bool> {
+    db.run(
+        "DELETE FROM ci_secrets WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3",
+        &params![tenant, repo_id, name],
+    )
+    .await
+    .map(|n| n > 0)
+}
+
+/// A secret's name and when it was last set. Never the value.
+#[derive(Deserialize)]
+struct NameRow {
+    name: String,
+    updated_at: u64,
+}
+
+/// The names of a scope's secrets, with the time each was set.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn secret_names(
+    db: &Db,
+    tenant: &str,
+    repo_id: Option<u64>,
+) -> Result<Vec<(String, u64)>> {
+    let rows: Vec<NameRow> = db
+        .all(
+            "SELECT name, updated_at FROM ci_secrets WHERE tenant_id = $1 \
+             AND repo_id IS NOT DISTINCT FROM $2::bigint ORDER BY name",
+            &params![tenant, repo_id],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| (r.name, r.updated_at)).collect())
+}
+
+/// A sealed secret as stored.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct SealedRow {
+    /// The repository, or `None` for the organization.
+    pub repo_id: Option<u64>,
+    /// The name.
+    pub name: String,
+    /// The key that sealed it.
+    pub key_id: String,
+    /// Base64 of nonce and ciphertext.
+    pub sealed: String,
+}
+
+impl std::fmt::Debug for SealedRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedRow")
+            .field("repo_id", &self.repo_id)
+            .field("name", &self.name)
+            .field("key_id", &self.key_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The organization's sealed secrets and repository `repo_id`'s, named
+/// in `names` or all of them when `None`. Both rows are returned when a
+/// name is in both scopes, the organization's first, so a caller that
+/// inserts them in order lets the repository's win.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn sealed_secrets(
+    db: &Db,
+    tenant: &str,
+    repo_id: u64,
+    names: Option<&[String]>,
+) -> Result<Vec<SealedRow>> {
+    let mut sql = "SELECT repo_id, name, key_id, sealed FROM ci_secrets \
+                   WHERE tenant_id = $1 AND (repo_id IS NULL OR repo_id = $2)"
+        .to_owned();
+    let mut bound = params![tenant, repo_id];
+    if let Some(names) = names {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks: Vec<String> = (3..3 + names.len()).map(|n| format!("${n}")).collect();
+        sql = format!("{sql} AND name IN ({})", marks.join(", "));
+        bound.extend(names.iter().map(|name| Param::from(name.as_str())));
+    }
+    sql.push_str(" ORDER BY name, repo_id NULLS FIRST");
+    db.all(&sql, &bound).await
+}
+
+/// Stores var `name`, replacing the old value. A new name is refused
+/// with [`Put::TooMany`] when the scope already holds `limit` vars.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn put_var(
+    db: &Db,
+    tenant: &str,
+    repo_id: Option<u64>,
+    name: &str,
+    value: &str,
+    limit: u32,
+    now: u64,
+) -> Result<Put> {
+    put(
+        db,
+        tenant,
+        PUT_VAR,
+        &params![tenant, repo_id, name, value, limit, now],
+    )
+    .await
+}
+
+/// Deletes var `name`. Returns whether it existed.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn delete_var(db: &Db, tenant: &str, repo_id: Option<u64>, name: &str) -> Result<bool> {
+    db.run(
+        "DELETE FROM ci_vars WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3",
+        &params![tenant, repo_id, name],
+    )
+    .await
+    .map(|n| n > 0)
+}
+
+#[derive(Deserialize)]
+struct VarRow {
+    name: String,
+    value: String,
+    updated_at: u64,
+}
+
+/// The vars of a scope: name, value and when each was set, by name.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn vars(
+    db: &Db,
+    tenant: &str,
+    repo_id: Option<u64>,
+) -> Result<Vec<(String, String, u64)>> {
+    let rows: Vec<VarRow> = db
+        .all(
+            "SELECT name, value, updated_at FROM ci_vars WHERE tenant_id = $1 \
+             AND repo_id IS NOT DISTINCT FROM $2::bigint ORDER BY name",
+            &params![tenant, repo_id],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.name, r.value, r.updated_at))
+        .collect())
+}
+
+/// The organization's vars overlaid with repository `repo_id`'s.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn job_vars(db: &Db, tenant: &str, repo_id: u64) -> Result<BTreeMap<String, String>> {
+    let rows: Vec<VarRow> = db
+        .all(
+            "SELECT name, value, updated_at FROM ci_vars WHERE tenant_id = $1 \
+             AND (repo_id IS NULL OR repo_id = $2) ORDER BY repo_id NULLS FIRST",
+            &params![tenant, repo_id],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| (r.name, r.value)).collect())
+}
+
+/// A secret sealed with a key other than the current one.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct StaleRow {
+    /// The tenant.
+    pub tenant: String,
+    /// The repository, or `None` for the organization.
+    pub repo_id: Option<u64>,
+    /// The name.
+    pub name: String,
+    /// The key that sealed it.
+    pub key_id: String,
+    /// Base64 of nonce and ciphertext.
+    pub sealed: String,
+}
+
+impl std::fmt::Debug for StaleRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaleRow")
+            .field("tenant", &self.tenant)
+            .field("repo_id", &self.repo_id)
+            .field("name", &self.name)
+            .field("key_id", &self.key_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Up to `limit` secrets not sealed with `current_key_id`. The pick is
+/// random, so rows that cannot be opened do not starve the others.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn stale_secrets(db: &Db, current_key_id: &str, limit: u32) -> Result<Vec<StaleRow>> {
+    db.all(
+        "SELECT tenant_id AS tenant, repo_id, name, key_id, sealed FROM ci_secrets \
+         WHERE key_id <> $1 ORDER BY random() LIMIT $2",
+        &params![current_key_id, limit],
+    )
+    .await
+}
+
+/// Replaces the value of `row` with `sealed` under `key_id`, only while
+/// the row still holds the key id and sealed text of `row`. Returns
+/// whether it did: `false` means the secret changed meanwhile.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn reseal(db: &Db, row: &StaleRow, key_id: &str, sealed: &str) -> Result<bool> {
+    db.run(
+        "UPDATE ci_secrets SET key_id = $5, sealed = $6 WHERE tenant_id = $1 \
+         AND repo_id IS NOT DISTINCT FROM $2::bigint AND name = $3 AND key_id = $4 \
+         AND sealed = $7",
+        &params![
+            row.tenant.as_str(),
+            row.repo_id,
+            row.name.as_str(),
+            row.key_id.as_str(),
+            key_id,
+            sealed,
+            row.sealed.as_str()
+        ],
+    )
+    .await
+    .map(|n| n > 0)
 }
 
 #[cfg(test)]
@@ -945,6 +1930,17 @@ mod tests {
         db
     }
 
+    /// Claims job `job_id` of tenant t1, which must succeed.
+    fn claim(db: &TestDb, job_id: u64, now: u64) -> JobRow {
+        match db
+            .wait(claim_launch(db.db(), job_id, "t1", 5, now))
+            .unwrap()
+        {
+            Claim::Claimed(job) => job,
+            other => panic!("not claimed: {other:?}"),
+        }
+    }
+
     fn new_run(delivery: &str, workflow: &str, now: u64) -> NewRun {
         NewRun {
             tenant_id: "t1".into(),
@@ -964,6 +1960,9 @@ mod tests {
             plan_id: plan_id.into(),
             name: plan_id.into(),
             timeout_minutes: 360,
+            template: Some("ubuntu-latest".into()),
+            token_permissions: BTreeMap::from([("metadata".to_owned(), Level::Read)]),
+            secret_refs: SecretRefs::default(),
         }
     }
 
@@ -980,6 +1979,178 @@ mod tests {
         db.wait(set_job(db.db(), job_id, status, None, 1_001))
             .unwrap();
         (run, job_id)
+    }
+
+    /// As [`run_with_job`], for a run of delivery `delivery`.
+    fn run_with_job_named(db: &TestDb, delivery: &str, status: &str) -> (RunRow, u64) {
+        let run = db
+            .wait(insert_run(db.db(), &new_run(delivery, "ci", 1_000)))
+            .unwrap()
+            .unwrap();
+        let ids = db
+            .wait(insert_jobs(db.db(), run.id, &[new_job("build")], 1_000))
+            .unwrap();
+        let job_id = ids[0].1;
+        db.wait(set_job(db.db(), job_id, status, None, 1_001))
+            .unwrap();
+        (run, job_id)
+    }
+
+    fn pool_row(id: &str, template: &str, state: &str, launched_at: u64) -> PoolRow {
+        PoolRow {
+            instance_id: id.into(),
+            template: template.into(),
+            state: state.into(),
+            launched_at,
+            since: launched_at,
+        }
+    }
+
+    fn save(db: &TestDb, template: &str, rows: &[PoolRow], launched: &[PoolRow]) {
+        db.wait(save_pool(db.db(), template, rows, launched))
+            .unwrap();
+    }
+
+    #[test]
+    fn take_pool_takes_ready_only() {
+        let db = setup();
+        save(
+            &db,
+            "ubuntu-latest",
+            &[],
+            &[pool_row("i-warm", "ubuntu-latest", "warming", 1)],
+        );
+        assert_eq!(
+            db.wait(take_pool(db.db(), "ubuntu-latest")).unwrap(),
+            None,
+            "a warming row is not ready"
+        );
+        save(
+            &db,
+            "ubuntu-latest",
+            &[],
+            &[
+                pool_row("i-b", "ubuntu-latest", "ready", 20),
+                pool_row("i-a", "ubuntu-latest", "ready", 10),
+            ],
+        );
+        save(
+            &db,
+            "ubuntu-26.04-8core",
+            &[],
+            &[pool_row("i-other", "ubuntu-26.04-8core", "ready", 1)],
+        );
+        let taken = |db: &TestDb| db.wait(take_pool(db.db(), "ubuntu-latest")).unwrap();
+        assert_eq!(taken(&db).as_deref(), Some("i-a"));
+        assert_eq!(taken(&db).as_deref(), Some("i-b"));
+        assert_eq!(taken(&db), None);
+        let left = db.wait(pool_rows(db.db(), "ubuntu-latest")).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].instance_id, "i-warm");
+    }
+
+    #[test]
+    fn trim_skips_a_taken_instance() {
+        let db = setup();
+        save(
+            &db,
+            "ubuntu-latest",
+            &[],
+            &[pool_row("i-1", "ubuntu-latest", "ready", 1)],
+        );
+        assert_eq!(
+            db.wait(take_pool(db.db(), "ubuntu-latest"))
+                .unwrap()
+                .as_deref(),
+            Some("i-1")
+        );
+        assert!(!db.wait(drop_pool(db.db(), "i-1")).unwrap());
+    }
+
+    #[test]
+    fn a_warming_row_moves_to_stopping_once() {
+        let db = setup();
+        save(
+            &db,
+            "ubuntu-latest",
+            &[],
+            &[pool_row("i-1", "ubuntu-latest", "warming", 1)],
+        );
+        let to_stopping = |db: &TestDb| {
+            db.wait(move_pool(db.db(), "i-1", "warming", "stopping", 9))
+                .unwrap()
+        };
+        assert!(to_stopping(&db));
+        assert!(!to_stopping(&db));
+        let rows = db.wait(pool_rows(db.db(), "ubuntu-latest")).unwrap();
+        assert_eq!((rows[0].state.as_str(), rows[0].since), ("stopping", 9));
+    }
+
+    #[test]
+    fn save_pool_never_brings_back_a_taken_row() {
+        let db = setup();
+        save(
+            &db,
+            "ubuntu-latest",
+            &[],
+            &[
+                pool_row("i-1", "ubuntu-latest", "ready", 1),
+                pool_row("i-2", "ubuntu-latest", "warming", 2),
+            ],
+        );
+        let before = db.wait(pool_rows(db.db(), "ubuntu-latest")).unwrap();
+        assert_eq!(before.len(), 2);
+        // A job takes i-1 while the pass works on its copy.
+        assert_eq!(
+            db.wait(take_pool(db.db(), "ubuntu-latest"))
+                .unwrap()
+                .as_deref(),
+            Some("i-1")
+        );
+        let mut stopping = pool_row("i-2", "ubuntu-latest", "stopping", 2);
+        stopping.since = 50;
+        save(
+            &db,
+            "ubuntu-latest",
+            &[pool_row("i-1", "ubuntu-latest", "ready", 1), stopping],
+            &[pool_row("i-3", "ubuntu-latest", "warming", 60)],
+        );
+        let rows = db.wait(pool_rows(db.db(), "ubuntu-latest")).unwrap();
+        let ids: Vec<_> = rows.iter().map(|row| row.instance_id.as_str()).collect();
+        assert_eq!(ids, ["i-2", "i-3"], "i-1 stays gone");
+        assert_eq!((rows[0].state.as_str(), rows[0].since), ("stopping", 50));
+    }
+
+    #[test]
+    fn claims_by_bucket_groups_by_template() {
+        let db = setup();
+        let claimed = |delivery: &str, template: &str, started_at: u64| {
+            let (_, job) = run_with_job_named(&db, delivery, "queued");
+            db.run(
+                "UPDATE ci_jobs SET template = $2, started_at = $3 WHERE id = $1",
+                &params![job, template, started_at],
+            );
+        };
+        claimed("a", "ubuntu-latest", 600_001);
+        claimed("b", "ubuntu-latest", 899_999);
+        claimed("c", "ubuntu-latest", 900_000);
+        claimed("d", "ubuntu-26.04-8core", 650_000);
+        claimed("e", "ubuntu-latest", 100_000);
+        let (_, never) = run_with_job_named(&db, "f", "queued");
+        db.run(
+            "UPDATE ci_jobs SET template = 'ubuntu-latest' WHERE id = $1",
+            &params![never],
+        );
+        let mut found = db.wait(claims_by_bucket(db.db(), 600_000)).unwrap();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("ubuntu-26.04-8core".to_owned(), 600_000, 1),
+                ("ubuntu-latest".to_owned(), 600_000, 2),
+                ("ubuntu-latest".to_owned(), 900_000, 1),
+            ]
+        );
     }
 
     #[test]
@@ -1008,6 +2179,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expires, 5 + 30 * DAY);
+    }
+
+    #[test]
+    fn expiry_follows_the_tenant() {
+        let db = setup();
+        let expires = |run: &RunRow| -> u64 {
+            db.column(
+                "SELECT expires_at AS n FROM ci_runs WHERE id = $1",
+                &params![run.id],
+                "n",
+            )
+            .unwrap()
+        };
+        let short = db
+            .wait(insert_run(db.db(), &new_run("a", "ci", 5)))
+            .unwrap()
+            .unwrap();
+        assert_eq!((expires(&short), short.retention_days), (5 + 30 * DAY, 30));
+        db.run(
+            "UPDATE tenants SET retention_days = 90 WHERE id = 't1'",
+            &[],
+        );
+        let long = db
+            .wait(insert_run(db.db(), &new_run("b", "ci", 5)))
+            .unwrap()
+            .unwrap();
+        assert_eq!((expires(&long), long.retention_days), (5 + 90 * DAY, 90));
+        let found = db.wait(run(db.db(), long.id)).unwrap().unwrap();
+        assert_eq!(found.retention_days, 90);
+        let tenant = db.wait(tenant(db.db(), "t1")).unwrap().unwrap();
+        assert_eq!(tenant.retention_days, 90);
+    }
+
+    #[test]
+    fn retention_days_is_30_or_90() {
+        let db = setup();
+        // hatchrun.io lets a tenant keep 1 to 90 days; CI has two tiers.
+        for (set, tier) in [(1, 30), (30, 30), (31, 90), (60, 90), (90, 90)] {
+            db.run(
+                "UPDATE tenants SET retention_days = $1 WHERE id = 't1'",
+                &params![set],
+            );
+            let tenant = db.wait(tenant(db.db(), "t1")).unwrap().unwrap();
+            assert_eq!(tenant.retention_days, tier, "{set} days");
+            let made = db
+                .wait(insert_run(db.db(), &new_run(&format!("r{set}"), "ci", 5)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(made.retention_days, tier, "{set} days");
+        }
     }
 
     #[test]
@@ -1092,6 +2313,38 @@ mod tests {
     }
 
     #[test]
+    fn a_transferred_repo_leaves_its_secrets_and_vars_behind() {
+        let db = setup();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 100, 0, 0)",
+            &[],
+        );
+        put_secret_ok(&db, Some(7), "REPO_S", "k", "s1");
+        put_secret_ok(&db, None, "ORG_S", "k", "s2");
+        put_var_ok(&db, Some(7), "REPO_V", "1");
+        put_var_ok(&db, None, "ORG_V", "2");
+        // Re-registering the repository under its own tenant keeps them.
+        let mut same = db.wait(repo(db.db(), 7)).unwrap().unwrap();
+        db.wait(upsert_repo(db.db(), &same, 6)).unwrap();
+        assert_eq!(
+            db.wait(secret_names(db.db(), "t1", Some(7))).unwrap().len(),
+            1
+        );
+        same.tenant_id = "t2".into();
+        same.installation_id = 100;
+        db.wait(upsert_repo(db.db(), &same, 7)).unwrap();
+        assert_eq!(
+            db.wait(secret_names(db.db(), "t1", Some(7))).unwrap().len(),
+            0
+        );
+        assert_eq!(db.wait(vars(db.db(), "t1", Some(7))).unwrap().len(), 0);
+        // The old organization's own rows stay.
+        assert_eq!(db.wait(secret_names(db.db(), "t1", None)).unwrap().len(), 1);
+        assert_eq!(db.wait(vars(db.db(), "t1", None)).unwrap().len(), 1);
+    }
+
+    #[test]
     fn a_recreated_repository_takes_the_name_and_the_old_runs_stay() {
         let db = setup();
         let old = db
@@ -1170,25 +2423,407 @@ mod tests {
     }
 
     #[test]
+    fn insert_jobs_keeps_template_permissions_and_refs() {
+        let db = setup();
+        let run = db
+            .wait(insert_run(db.db(), &new_run("d", "ci", 1)))
+            .unwrap()
+            .unwrap();
+        let build = NewJob {
+            template: Some("ubuntu-26.04-8core-arm".into()),
+            token_permissions: BTreeMap::from([
+                ("contents".to_owned(), Level::Write),
+                ("metadata".to_owned(), Level::Read),
+            ]),
+            secret_refs: SecretRefs {
+                all: false,
+                names: ["NPM_TOKEN".to_owned()].into(),
+            },
+            ..new_job("build")
+        };
+        let approve = NewJob {
+            template: None,
+            ..new_job("approve")
+        };
+        db.wait(insert_jobs(db.db(), run.id, &[build, approve], 2))
+            .unwrap();
+        let jobs = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
+        assert_eq!(jobs[0].template.as_deref(), Some("ubuntu-26.04-8core-arm"));
+        assert_eq!(
+            jobs[0].token_permissions,
+            serde_json::json!({ "contents": "write", "metadata": "read" })
+        );
+        assert_eq!(
+            jobs[0].secret_refs,
+            serde_json::json!({ "all": false, "names": ["NPM_TOKEN"] })
+        );
+        let one = db.wait(job(db.db(), jobs[0].id)).unwrap().unwrap();
+        assert_eq!(one, jobs[0]);
+        assert_eq!(jobs[1].template, None);
+        assert_eq!(
+            jobs[1].secret_refs,
+            serde_json::json!({ "all": false, "names": [] })
+        );
+    }
+
+    #[test]
     fn claim_launch_only_once() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "queued");
-        let first = db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        let first = claim(&db, job_id, 10);
         assert_eq!(first.launch_attempts, 1);
-        assert!(
-            db.wait(claim_launch(db.db(), job_id, 11))
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            db.wait(claim_launch(db.db(), job_id, "t1", 5, 11)).unwrap(),
+            Claim::Gone
         );
         let job = db.wait(job(db.db(), job_id)).unwrap().unwrap();
         assert_eq!(job.status, "launching");
+    }
+
+    fn held_of(db: &TestDb, job_id: u64) -> Option<String> {
+        db.column(
+            "SELECT held AS h FROM ci_jobs WHERE id = $1",
+            &params![job_id],
+            "h",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn claim_launch_holds_the_sixth_job() {
+        let db = setup();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 98, 0, 0)",
+            &[],
+        );
+        db.run(
+            "INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+             private, updated_at) VALUES (8, 't2', 98, 'other/app', 'main', false, 1)",
+            &[],
+        );
+        let other = db
+            .wait(insert_run(
+                db.db(),
+                &NewRun {
+                    tenant_id: "t2".into(),
+                    repo_id: 8,
+                    ..new_run("o", "ci", 1_000)
+                },
+            ))
+            .unwrap()
+            .unwrap();
+        let other_jobs: Vec<NewJob> = (0..5).map(|n| new_job(&format!("o{n}"))).collect();
+        for (_, id) in db
+            .wait(insert_jobs(db.db(), other.id, &other_jobs, 1_000))
+            .unwrap()
+        {
+            db.wait(set_job(db.db(), id, "running", None, 1_001))
+                .unwrap();
+        }
+        let statuses = ["launching", "launched", "running", "running", "launching"];
+        for (n, status) in statuses.into_iter().enumerate() {
+            run_with_job_named(&db, &format!("d{n}"), status);
+        }
+        let (_, sixth) = run_with_job_named(&db, "d9", "queued");
+        assert_eq!(
+            db.wait(claim_launch(db.db(), sixth, "t1", 5, 10)).unwrap(),
+            Claim::Busy
+        );
+        let row = db.wait(job(db.db(), sixth)).unwrap().unwrap();
+        assert_eq!((row.status.as_str(), row.launch_attempts), ("queued", 0));
+        // A completed job frees a place.
+        let first = db
+            .wait(insert_run(db.db(), &new_run("free", "ci", 1_000)))
+            .unwrap()
+            .unwrap();
+        let done = db
+            .wait(insert_jobs(db.db(), first.id, &[new_job("done")], 1_000))
+            .unwrap()[0]
+            .1;
+        db.wait(set_job(db.db(), done, "completed", Some("success"), 1_002))
+            .unwrap();
+        assert_eq!(
+            db.wait(claim_launch(db.db(), sixth, "t1", 5, 11)).unwrap(),
+            Claim::Busy,
+            "completed jobs do not count, but five still run"
+        );
+        let running: u64 = db
+            .column(
+                "SELECT id AS n FROM ci_jobs WHERE status = 'launching' ORDER BY id LIMIT 1",
+                &[],
+                "n",
+            )
+            .unwrap();
+        db.wait(set_job(
+            db.db(),
+            running,
+            "completed",
+            Some("success"),
+            1_003,
+        ))
+        .unwrap();
+        assert!(matches!(
+            db.wait(claim_launch(db.db(), sixth, "t1", 5, 12)).unwrap(),
+            Claim::Claimed(_)
+        ));
+        let gone = db
+            .wait(claim_launch(db.db(), 999_999, "t1", 5, 13))
+            .unwrap();
+        assert_eq!(gone, Claim::Gone);
+    }
+
+    /// Sets the hold of a job directly, the way `hold` leaves it.
+    fn set_held(db: &TestDb, job_id: u64, reason: &str, updated: u64) {
+        db.run(
+            "UPDATE ci_jobs SET held = $2, updated_at = $3 WHERE id = $1",
+            &params![job_id, reason, updated],
+        );
+    }
+
+    fn woken_ids(woken: Vec<hatchrun_cloud::ci_wake::Woken>) -> Vec<u64> {
+        woken.into_iter().map(|w| w.job_id).collect()
+    }
+
+    #[test]
+    fn a_new_job_does_not_jump_a_held_one() {
+        let db = setup();
+        for (n, status) in ["running", "running", "running", "running"]
+            .into_iter()
+            .enumerate()
+        {
+            run_with_job_named(&db, &format!("r{n}"), status);
+        }
+        let (_, older) = run_with_job_named(&db, "older", "queued");
+        let (_, newer) = run_with_job_named(&db, "newer", "queued");
+        set_held(&db, older, "concurrency", 5);
+        // One place is free, and the older job waits for it.
+        assert_eq!(
+            db.wait(claim_launch(db.db(), newer, "t1", 5, 10)).unwrap(),
+            Claim::Busy
+        );
+        assert!(matches!(
+            db.wait(claim_launch(db.db(), older, "t1", 5, 11)).unwrap(),
+            Claim::Claimed(_)
+        ));
+        assert_eq!(
+            db.wait(claim_launch(db.db(), newer, "t1", 5, 12)).unwrap(),
+            Claim::Busy,
+            "the tenant is full again"
+        );
+    }
+
+    #[test]
+    fn a_held_job_of_another_reason_or_tenant_blocks_nobody() {
+        let db = setup();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 98, 0, 0)",
+            &[],
+        );
+        db.run(
+            "INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+             private, updated_at) VALUES (8, 't2', 98, 'other/app', 'main', false, 1)",
+            &[],
+        );
+        let other = db
+            .wait(insert_run(
+                db.db(),
+                &NewRun {
+                    tenant_id: "t2".into(),
+                    repo_id: 8,
+                    ..new_run("o", "ci", 1_000)
+                },
+            ))
+            .unwrap()
+            .unwrap();
+        let held_elsewhere = db
+            .wait(insert_jobs(db.db(), other.id, &[new_job("o")], 1_000))
+            .unwrap()[0]
+            .1;
+        db.wait(set_job(db.db(), held_elsewhere, "queued", None, 1_001))
+            .unwrap();
+        set_held(&db, held_elsewhere, "concurrency", 5);
+        let (_, capped) = run_with_job_named(&db, "capped", "queued");
+        set_held(&db, capped, "spend_cap", 5);
+        let (_, newer) = run_with_job_named(&db, "newer", "queued");
+        assert!(matches!(
+            db.wait(claim_launch(db.db(), newer, "t1", 5, 10)).unwrap(),
+            Claim::Claimed(_)
+        ));
+    }
+
+    #[test]
+    fn the_oldest_held_job_wakes_first() {
+        use hatchrun_cloud::ci_wake;
+        let db = setup();
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let (_, id) = run_with_job_named(&db, &format!("d{n}"), "queued");
+            // The newest was held longest ago: age is the job id.
+            set_held(&db, id, "concurrency", 100 - n);
+            ids.push(id);
+        }
+        let (_, running) = run_with_job_named(&db, "run", "running");
+        set_held(&db, running, "concurrency", 1);
+        let (_, card) = run_with_job_named(&db, "card", "queued");
+        set_held(&db, card, "card", 1);
+        let one = db
+            .wait(ci_wake::held(db.db(), "t1", "concurrency", 1))
+            .unwrap();
+        assert_eq!(woken_ids(one), [ids[0]]);
+        let all = db
+            .wait(ci_wake::held(db.db(), "t1", "concurrency", 5))
+            .unwrap();
+        assert_eq!(woken_ids(all), ids);
+        let other = db
+            .wait(ci_wake::held(db.db(), "t2", "concurrency", 5))
+            .unwrap();
+        assert_eq!(woken_ids(other), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn a_returned_card_turns_the_holds_into_concurrency_holds_and_wakes_five() {
+        use hatchrun_cloud::ci_wake;
+        assert_eq!(ci_wake::WAKE_LIMIT, hatchrun_workflow::MAX_RUNNING_JOBS);
+        let db = setup();
+        let mut card = Vec::new();
+        for n in 0..7 {
+            let (_, id) = run_with_job_named(&db, &format!("c{n}"), "queued");
+            set_held(&db, id, "card", 5);
+            card.push(id);
+        }
+        let (_, capped) = run_with_job_named(&db, "cap", "queued");
+        set_held(&db, capped, "spend_cap", 5);
+        let (_, other) = run_with_job_named(&db, "plain", "queued");
+        subscribe(&db, "s1", "ci", "active");
+        let woken = db.wait(ci_wake::card_returned(db.db(), "t1")).unwrap();
+        assert_eq!(woken_ids(woken), card[..5]);
+        for id in card.iter().chain([&capped]) {
+            assert_eq!(held_of(&db, *id).as_deref(), Some("concurrency"));
+        }
+        assert_eq!(held_of(&db, other), None, "an unheld job stays unheld");
+        // A finishing job wakes the next one in order.
+        let next = db
+            .wait(ci_wake::held(db.db(), "t1", "concurrency", 1))
+            .unwrap();
+        assert_eq!(woken_ids(next), card[..1]);
+    }
+
+    #[test]
+    fn a_new_month_turns_old_spend_cap_holds_into_concurrency_holds() {
+        use hatchrun_cloud::ci_wake;
+        let db = setup();
+        let (_, old) = run_with_job_named(&db, "old", "queued");
+        set_held(&db, old, "spend_cap", 100);
+        let (_, recent) = run_with_job_named(&db, "recent", "queued");
+        set_held(&db, recent, "spend_cap", 10_000);
+        let (_, card) = run_with_job_named(&db, "card", "queued");
+        set_held(&db, card, "card", 100);
+        db.wait(ci_wake::release_spend_caps(db.db(), 5_000))
+            .unwrap();
+        assert_eq!(held_of(&db, old).as_deref(), Some("concurrency"));
+        assert_eq!(held_of(&db, recent).as_deref(), Some("spend_cap"));
+        assert_eq!(held_of(&db, card).as_deref(), Some("card"));
+    }
+
+    #[test]
+    fn the_backstop_picks_quiet_held_jobs_per_tenant() {
+        use hatchrun_cloud::ci_wake;
+        let db = setup();
+        let mut ids = Vec::new();
+        for n in 0..8 {
+            let (_, id) = run_with_job_named(&db, &format!("h{n}"), "queued");
+            set_held(&db, id, if n % 2 == 0 { "card" } else { "spend_cap" }, 100);
+            ids.push(id);
+        }
+        let (_, recent) = run_with_job_named(&db, "recent", "queued");
+        set_held(&db, recent, "card", 10_000);
+        let (_, plain) = run_with_job_named(&db, "plain", "queued");
+        let _ = plain;
+        let picked = db.wait(ci_wake::stale(db.db(), 5_000, 5, 40)).unwrap();
+        assert_eq!(woken_ids(picked), ids[..5], "5 per tenant, oldest first");
+        let capped = db.wait(ci_wake::stale(db.db(), 5_000, 5, 2)).unwrap();
+        assert_eq!(woken_ids(capped), ids[..2], "at most the limit");
+        let none = db.wait(ci_wake::stale(db.db(), 50, 5, 40)).unwrap();
+        assert!(none.is_empty(), "nothing is quiet that long");
+    }
+
+    #[test]
+    fn held_jobs_are_not_stalled() {
+        let db = setup();
+        let (_, held) = run_with_job_named(&db, "held", "queued");
+        db.run(
+            "UPDATE ci_jobs SET held = 'card', next_launch_at = 1, updated_at = 1 WHERE id = $1",
+            &params![held],
+        );
+        let (_, plain) = run_with_job_named(&db, "plain", "queued");
+        db.run(
+            "UPDATE ci_jobs SET next_launch_at = 1, updated_at = 1 WHERE id = $1",
+            &params![plain],
+        );
+        let rows = db.wait(stalled_jobs(db.db(), 10_000_000, 50)).unwrap();
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [plain]);
+    }
+
+    #[test]
+    fn claim_clears_the_hold() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "queued");
+        assert!(db.wait(hold(db.db(), job_id, 1, "card", 50, 5)).unwrap());
+        assert_eq!(held_of(&db, job_id).as_deref(), Some("card"));
+        claim(&db, job_id, 10);
+        assert_eq!(held_of(&db, job_id), None);
+    }
+
+    #[test]
+    fn hold_reports_a_change_once() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "queued");
+        assert!(db.wait(hold(db.db(), job_id, 1, "card", 500, 5)).unwrap());
+        assert!(!db.wait(hold(db.db(), job_id, 1, "card", 530, 6)).unwrap());
+        let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+        assert_eq!((row.next_launch_at, row.updated_at), (Some(530), 6));
+        assert!(
+            db.wait(hold(db.db(), job_id, 1, "concurrency", 560, 7))
+                .unwrap()
+        );
+        assert_eq!(held_of(&db, job_id).as_deref(), Some("concurrency"));
+        let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+        assert_eq!(row.next_launch_at, Some(560));
+    }
+
+    #[test]
+    fn hold_leaves_another_attempt_alone() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "queued");
+        assert!(!db.wait(hold(db.db(), job_id, 2, "card", 500, 5)).unwrap());
+        assert_eq!(held_of(&db, job_id), None);
+        let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+        assert_eq!((row.next_launch_at, row.updated_at), (None, 1_001));
+        let (_, launching) = run_with_job_named(&db, "d2", "launching");
+        assert!(
+            !db.wait(hold(db.db(), launching, 1, "card", 500, 5))
+                .unwrap()
+        );
+        assert_eq!(held_of(&db, launching), None);
+    }
+
+    #[test]
+    fn a_rerun_clears_the_hold() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "queued");
+        db.wait(hold(db.db(), job_id, 1, "spend_cap", 50, 5))
+            .unwrap();
+        db.wait(reset_job(db.db(), job_id, 2, 40)).unwrap();
+        assert_eq!(held_of(&db, job_id), None);
     }
 
     #[test]
     fn a_failed_launch_retries_or_fails_the_job() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "queued");
-        db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        claim(&db, job_id, 10);
         db.wait(launch_failed(db.db(), job_id, "no capacity", Some(500), 20))
             .unwrap();
         let job_row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
@@ -1196,7 +2831,7 @@ mod tests {
             (job_row.status.as_str(), job_row.next_launch_at),
             ("queued", Some(500))
         );
-        db.wait(claim_launch(db.db(), job_id, 30)).unwrap().unwrap();
+        claim(&db, job_id, 30);
         db.wait(launch_failed(db.db(), job_id, "no capacity", None, 40))
             .unwrap();
         let job_row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
@@ -1209,7 +2844,7 @@ mod tests {
     fn late_calls_leave_a_completed_job_alone() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "queued");
-        db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        claim(&db, job_id, 10);
         assert!(db.wait(launched(db.db(), job_id, "i-1", 11)).unwrap());
         assert!(db.wait(start_job(db.db(), job_id, 12)).unwrap());
         let steps = serde_json::json!([{"name": "first"}]);
@@ -1280,7 +2915,7 @@ mod tests {
     fn launched_records_the_instance() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "queued");
-        db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        claim(&db, job_id, 10);
         db.wait(launched(db.db(), job_id, "i-123", 11)).unwrap();
         let job_row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
         assert_eq!(job_row.status, "launched");
@@ -1417,7 +3052,7 @@ mod tests {
     fn reset_job_clears_the_attempt() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "queued");
-        db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        claim(&db, job_id, 10);
         db.wait(start_job(db.db(), job_id, 20)).unwrap();
         let steps = serde_json::json!([{"name": "build"}]);
         db.wait(finish_job(
@@ -1580,7 +3215,14 @@ mod tests {
             .wait(tenant_for_installation(db.db(), 99))
             .unwrap()
             .unwrap();
-        assert_eq!((tenant.id.as_str(), tenant.ci_enabled), ("t1", false));
+        assert_eq!(
+            (
+                tenant.id.as_str(),
+                tenant.org_login.as_str(),
+                tenant.ci_billing
+            ),
+            ("t1", "acme", CiBilling::Never)
+        );
         assert!(
             db.wait(tenant_for_installation(db.db(), 1))
                 .unwrap()
@@ -1619,6 +3261,66 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn subscribe(db: &TestDb, id: &str, product: &str, status: &str) {
+        db.run(
+            "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
+             product, cancel_at_period_end, modified_at, updated_at) \
+             VALUES ($1, 't1', $3, 'c', 'p', $2, false, 't', 0)",
+            &params![id, product, status],
+        );
+    }
+
+    #[test]
+    fn has_card_needs_an_active_ci_subscription() {
+        let db = setup();
+        let card = |db: &TestDb| db.wait(has_card(db.db(), "t1")).unwrap();
+        assert!(!card(&db), "no subscription");
+        subscribe(&db, "s1", "runners", "active");
+        assert!(!card(&db), "a runners subscription is no card for CI");
+        subscribe(&db, "s2", "ci", "canceled");
+        assert!(!card(&db), "canceled");
+        subscribe(&db, "s3", "ci", "active");
+        assert!(card(&db));
+        db.run(
+            "UPDATE subscriptions SET status = 'trialing' WHERE id = 's3'",
+            &[],
+        );
+        assert!(card(&db), "trialing");
+        assert!(!db.wait(has_card(db.db(), "nope")).unwrap());
+    }
+
+    #[test]
+    fn tenant_row_reads_the_ci_billing_state() {
+        let db = setup();
+        let state = |db: &TestDb| {
+            let by_id = db.wait(tenant(db.db(), "t1")).unwrap().unwrap().ci_billing;
+            let by_installation = db
+                .wait(tenant_for_installation(db.db(), 99))
+                .unwrap()
+                .unwrap()
+                .ci_billing;
+            assert_eq!(by_id, by_installation);
+            by_id
+        };
+        assert_eq!(state(&db), CiBilling::Never);
+        subscribe(&db, "s1", "runners", "active");
+        assert_eq!(state(&db), CiBilling::Never, "a runners subscription");
+        subscribe(&db, "s2", "ci", "canceled");
+        assert_eq!(state(&db), CiBilling::Lapsed);
+        subscribe(&db, "s3", "ci", "active");
+        assert_eq!(state(&db), CiBilling::Active);
+        db.run(
+            "UPDATE subscriptions SET status = 'canceled' WHERE id = 's3'",
+            &[],
+        );
+        assert_eq!(state(&db), CiBilling::Lapsed);
+        db.run(
+            "UPDATE subscriptions SET status = 'trialing' WHERE id = 's3'",
+            &[],
+        );
+        assert_eq!(state(&db), CiBilling::Active);
     }
 
     #[test]
@@ -1689,5 +3391,487 @@ mod tests {
         assert_eq!(db.wait(jobs_by_ids(db.db(), &[])).unwrap().len(), 0);
         let done = db.wait(job(db.db(), ids[2].1)).unwrap().unwrap();
         assert_eq!(done.completed_at, Some(400));
+    }
+
+    fn usage_rows(db: &TestDb) -> Vec<(u64, u64, String, u64, u64)> {
+        db.rows(
+            "SELECT job_id, attempt, template, minutes, ended_at FROM ci_usage \
+             ORDER BY job_id, attempt",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row["job_id"].as_u64().unwrap(),
+                row["attempt"].as_u64().unwrap(),
+                row["template"].as_str().unwrap().to_owned(),
+                row["minutes"].as_u64().unwrap(),
+                row["ended_at"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    fn finish(db: &TestDb, job_id: u64, attempt: u32, now: u64) -> bool {
+        db.wait(finish_job(
+            db.db(),
+            job_id,
+            attempt,
+            "success",
+            &serde_json::json!([]),
+            None,
+            now,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn finish_job_records_minutes_from_claim() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "launching");
+        assert!(db.wait(start_job(db.db(), job_id, 10_000)).unwrap());
+        assert!(finish(&db, job_id, 1, 71_000));
+        assert_eq!(
+            usage_rows(&db),
+            [(job_id, 1, "ubuntu-latest".to_owned(), 2, 71_000)]
+        );
+    }
+
+    #[test]
+    fn a_job_never_claimed_is_not_metered() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "launched");
+        assert!(finish(&db, job_id, 1, 71_000));
+        assert_eq!(usage_rows(&db).len(), 0);
+    }
+
+    #[test]
+    fn finishing_twice_records_once() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "launching");
+        db.wait(start_job(db.db(), job_id, 10_000)).unwrap();
+        assert!(finish(&db, job_id, 1, 71_000));
+        assert!(!finish(&db, job_id, 1, 71_000), "same time");
+        assert!(!finish(&db, job_id, 1, 500_000), "later");
+        assert_eq!(usage_rows(&db).len(), 1);
+        assert_eq!(usage_rows(&db)[0].4, 71_000);
+    }
+
+    #[test]
+    fn each_attempt_is_metered() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "launching");
+        db.wait(start_job(db.db(), job_id, 10_000)).unwrap();
+        assert!(finish(&db, job_id, 1, 20_000));
+        db.wait(reset_job(db.db(), job_id, 2, 30_000)).unwrap();
+        db.wait(set_job(db.db(), job_id, "launching", None, 30_001))
+            .unwrap();
+        db.wait(start_job(db.db(), job_id, 31_000)).unwrap();
+        assert!(finish(&db, job_id, 2, 100_000));
+        let rows = usage_rows(&db);
+        assert_eq!(
+            rows.iter().map(|r| (r.1, r.3)).collect::<Vec<_>>(),
+            [(1, 1), (2, 2)]
+        );
+    }
+
+    #[test]
+    fn stale_result_is_not_metered() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "launching");
+        db.wait(start_job(db.db(), job_id, 10_000)).unwrap();
+        db.wait(reset_job(db.db(), job_id, 2, 20_000)).unwrap();
+        db.wait(set_job(db.db(), job_id, "launching", None, 20_001))
+            .unwrap();
+        db.wait(start_job(db.db(), job_id, 21_000)).unwrap();
+        assert!(!finish(&db, job_id, 1, 90_000));
+        assert_eq!(usage_rows(&db).len(), 0);
+    }
+
+    #[test]
+    fn minutes_round_up_like_usage_minutes() {
+        let db = setup();
+        let mut got = Vec::new();
+        for (n, ms) in [0_u64, 1, 60_000, 60_001].into_iter().enumerate() {
+            let run = db
+                .wait(insert_run(db.db(), &new_run(&format!("d{n}"), "ci", 1)))
+                .unwrap()
+                .unwrap();
+            let ids = db
+                .wait(insert_jobs(db.db(), run.id, &[new_job("build")], 1))
+                .unwrap();
+            let job_id = ids[0].1;
+            db.wait(set_job(db.db(), job_id, "launching", None, 2))
+                .unwrap();
+            db.wait(start_job(db.db(), job_id, 1_000)).unwrap();
+            assert!(finish(&db, job_id, 1, 1_000 + ms));
+            got.push(usage_rows(&db).last().unwrap().3);
+            assert_eq!(
+                got.last().copied().unwrap(),
+                u64::from(hatchrun_cloud::usage::minutes(1_000, 1_000 + ms))
+            );
+        }
+        assert_eq!(got, [1, 1, 1, 2]);
+        // 2 vCPU: one unit a minute, priced when the job ended.
+        assert!(usage_rows(&db).iter().all(|r| {
+            r.3 == db
+                .rows(
+                    "SELECT units FROM ci_usage WHERE job_id = $1",
+                    &params![r.0],
+                )
+                .unwrap()[0]["units"]
+                .as_u64()
+                .unwrap()
+        }));
+    }
+
+    #[test]
+    fn standing_counts_this_month_and_running_jobs() {
+        let db = setup();
+        let month = 1_790_812_800_000_u64;
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 98, 0, 0)",
+            &[],
+        );
+        for (job, tenant, template, minutes, ended) in [
+            (1, "t1", "ubuntu-latest", 7, month - 1),
+            (2, "t1", "ubuntu-latest", 5, month + DAY),
+            (3, "t1", "ubuntu-26.04-4core", 3, month + 2 * DAY),
+            (4, "t2", "ubuntu-latest", 100, month + DAY),
+        ] {
+            db.run(
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
+                 ended_at) VALUES ($1, 1, $2, $3, $4, $4, $5)",
+                &params![job, tenant, template, minutes, ended],
+            );
+        }
+        let (_, first) = run_with_job(&db, "running");
+        let (_, second) = run_with_job_named(&db, "d2", "launching");
+        let (_, _done) = run_with_job_named(&db, "d3", "completed");
+        let (_, _queued) = run_with_job_named(&db, "d4", "queued");
+        let default_cap = 50_000_000;
+        let mut standing_t1 = db
+            .wait(standing(db.db(), first, month, default_cap))
+            .unwrap()
+            .unwrap();
+        standing_t1.minutes_by_template.sort();
+        assert_eq!(
+            standing_t1,
+            Standing {
+                tenant_id: "t1".into(),
+                org_login: "acme".into(),
+                card: false,
+                cap_micros: default_cap,
+                minutes_by_template: vec![
+                    ("ubuntu-26.04-4core".into(), 3),
+                    ("ubuntu-latest".into(), 5)
+                ],
+                running: 2,
+            }
+        );
+        let by_tenant = db
+            .wait(tenant_standing(db.db(), "t1", month, default_cap))
+            .unwrap()
+            .unwrap();
+        let by_second_job = db
+            .wait(standing(db.db(), second, month, default_cap))
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_tenant.running, 2);
+        assert_eq!(by_second_job.tenant_id, "t1");
+        // Another tenant: its own rows, no jobs, and a cap row wins.
+        db.run(
+            "INSERT INTO ci_spend_caps (tenant_id, cap_micros, updated_at) \
+             VALUES ('t2', 70000000, 0)",
+            &[],
+        );
+        subscribe(&db, "s1", "ci", "active");
+        let other = db
+            .wait(tenant_standing(db.db(), "t2", month, default_cap))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            other.minutes_by_template,
+            [("ubuntu-latest".to_owned(), 100)]
+        );
+        assert_eq!(
+            (other.running, other.cap_micros, other.card),
+            (0, 70_000_000, false)
+        );
+        let first_again = db
+            .wait(tenant_standing(db.db(), "t1", month, default_cap))
+            .unwrap()
+            .unwrap();
+        assert!(first_again.card);
+        assert!(
+            db.wait(tenant_standing(db.db(), "nope", month, default_cap))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.wait(standing(db.db(), 999_999, month, default_cap))
+                .unwrap()
+                .is_none()
+        );
+        let empty = db
+            .wait(tenant_standing(
+                db.db(),
+                "t1",
+                month + 40 * DAY,
+                default_cap,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.minutes_by_template.len(), 0);
+    }
+
+    #[test]
+    fn sweep_deletes_usage_sent_long_ago() {
+        let db = setup();
+        let now = 200 * DAY;
+        for (job, sent) in [
+            (1, Some(now - 91 * DAY)),
+            (2, Some(now - 89 * DAY)),
+            (3, None),
+        ] {
+            db.run(
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
+                 ended_at, sent_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 1, 1, 0, $2)",
+                &params![job, sent],
+            );
+        }
+        db.run(
+            "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
+             ended_at, rejected_at) VALUES (4, 1, 't1', 'ubuntu-latest', 1, 1, 0, $1)",
+            &params![now - 91 * DAY],
+        );
+        db.wait(sweep(db.db(), now)).unwrap();
+        assert_eq!(
+            usage_rows(&db).iter().map(|r| r.0).collect::<Vec<_>>(),
+            [2, 3]
+        );
+    }
+
+    #[test]
+    fn caps_are_set_and_replaced() {
+        let db = setup();
+        let month = 1_790_812_800_000_u64;
+        let default_cap = 50_000_000;
+        db.wait(set_spend_cap(db.db(), "t1", 75_000_000, 5))
+            .unwrap();
+        let s = db
+            .wait(tenant_standing(db.db(), "t1", month, default_cap))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.cap_micros, 75_000_000);
+        db.wait(set_spend_cap(db.db(), "t1", 60_000_000, 6))
+            .unwrap();
+        let s = db
+            .wait(tenant_standing(db.db(), "t1", month, default_cap))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.cap_micros, 60_000_000);
+        let t = db.wait(tenant_by_org_id(db.db(), 1)).unwrap().unwrap();
+        assert_eq!(t.id, "t1");
+        assert!(db.wait(tenant_by_org_id(db.db(), 2)).unwrap().is_none());
+    }
+
+    #[test]
+    fn usage_goes_to_polar_oldest_first_and_once() {
+        let db = setup();
+        for (job, attempt, ended) in [(3, 1, 30), (1, 1, 10), (1, 2, 20), (2, 1, 20)] {
+            db.run(
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
+                 ended_at) VALUES ($1, $2, 't1', 'ubuntu-latest', 4, 4, $3)",
+                &params![job, attempt, ended],
+            );
+        }
+        let keys = |rows: &[UnsentUsage]| -> Vec<(u64, u32)> {
+            rows.iter().map(|r| (r.job_id, r.attempt)).collect()
+        };
+        let all = db.wait(unsent_usage(db.db(), 10)).unwrap();
+        assert_eq!(keys(&all), [(1, 1), (1, 2), (2, 1), (3, 1)]);
+        assert_eq!(all[0].tenant_id, "t1");
+        assert_eq!(all[0].minutes, 4);
+        assert_eq!(all[0].units, 4);
+        let two = db.wait(unsent_usage(db.db(), 2)).unwrap();
+        assert_eq!(keys(&two), [(1, 1), (1, 2)]);
+        db.wait(usage_sent(db.db(), &keys(&two), 99)).unwrap();
+        db.wait(usage_sent(db.db(), &[], 99)).unwrap();
+        let rest = db.wait(unsent_usage(db.db(), 10)).unwrap();
+        assert_eq!(keys(&rest), [(2, 1), (3, 1)]);
+        // A quarantined row is never listed again, nor marked sent.
+        db.wait(usage_rejected(db.db(), &[(2, 1)], "no such customer", 150))
+            .unwrap();
+        db.wait(usage_sent(db.db(), &[(2, 1)], 160)).unwrap();
+        let rest = db.wait(unsent_usage(db.db(), 10)).unwrap();
+        assert_eq!(keys(&rest), [(3, 1)]);
+        let row = db
+            .rows(
+                "SELECT sent_at, rejected_at, reject_reason FROM ci_usage \
+                 WHERE job_id = 2",
+                &[],
+            )
+            .unwrap();
+        assert!(row[0]["sent_at"].is_null());
+        assert_eq!(row[0]["rejected_at"].as_u64(), Some(150));
+        assert_eq!(row[0]["reject_reason"].as_str(), Some("no such customer"));
+        // A second mark does not move the time.
+        db.wait(usage_sent(db.db(), &[(1, 1)], 200)).unwrap();
+        let sent = db
+            .rows(
+                "SELECT sent_at FROM ci_usage WHERE job_id = 1 AND attempt = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(sent[0]["sent_at"].as_u64(), Some(99));
+    }
+
+    fn put_var_ok(db: &TestDb, repo: Option<u64>, name: &str, value: &str) {
+        let put = db
+            .wait(put_var(db.db(), "t1", repo, name, value, 100, 5))
+            .unwrap();
+        assert_eq!(put, Put::Saved);
+    }
+
+    fn put_secret_ok(db: &TestDb, repo: Option<u64>, name: &str, key: &str, sealed: &str) {
+        let put = db
+            .wait(put_secret(db.db(), "t1", repo, name, key, sealed, 100, 5))
+            .unwrap();
+        assert_eq!(put, Put::Saved);
+    }
+
+    #[test]
+    fn repo_value_overrides_org() {
+        let db = setup();
+        put_var_ok(&db, None, "A", "1");
+        put_var_ok(&db, None, "B", "2");
+        put_var_ok(&db, Some(7), "A", "3");
+        let vars = db.wait(job_vars(db.db(), "t1", 7)).unwrap();
+        assert_eq!(
+            vars,
+            BTreeMap::from([("A".into(), "3".into()), ("B".into(), "2".into())])
+        );
+        let org = db.wait(vars_of(db.db(), None)).unwrap();
+        assert_eq!(org.len(), 2);
+        assert!(db.wait(delete_var(db.db(), "t1", Some(7), "A")).unwrap());
+        assert!(!db.wait(delete_var(db.db(), "t1", Some(7), "A")).unwrap());
+        let vars = db.wait(job_vars(db.db(), "t1", 7)).unwrap();
+        assert_eq!(vars["A"], "1");
+    }
+
+    async fn vars_of(db: &Db, repo: Option<u64>) -> Result<Vec<(String, String, u64)>> {
+        vars(db, "t1", repo).await
+    }
+
+    #[test]
+    fn put_counts_against_the_limit() {
+        let db = setup();
+        let put = |name: &str, limit| {
+            db.wait(put_secret(db.db(), "t1", None, name, "k", "s", limit, 5))
+                .unwrap()
+        };
+        assert_eq!(put("A", 2), Put::Saved);
+        assert_eq!(put("B", 2), Put::Saved);
+        assert_eq!(put("C", 2), Put::TooMany);
+        // Overwriting a name at the limit is allowed.
+        assert_eq!(put("A", 2), Put::Saved);
+        let names = db.wait(secret_names(db.db(), "t1", None)).unwrap();
+        assert_eq!(names.len(), 2);
+        // The limit is per scope.
+        let repo = db
+            .wait(put_secret(db.db(), "t1", Some(7), "C", "k", "s", 2, 5))
+            .unwrap();
+        assert_eq!(repo, Put::Saved);
+        // And the same for vars.
+        let var = |name: &str| {
+            db.wait(put_var(db.db(), "t1", None, name, "v", 1, 5))
+                .unwrap()
+        };
+        assert_eq!(var("A"), Put::Saved);
+        assert_eq!(var("B"), Put::TooMany);
+        assert_eq!(var("A"), Put::Saved);
+    }
+
+    #[test]
+    fn sealed_secrets_filters_by_name() {
+        let db = setup();
+        put_secret_ok(&db, None, "A", "k", "org-a");
+        put_secret_ok(&db, Some(7), "A", "k", "repo-a");
+        put_secret_ok(&db, Some(7), "B", "k", "repo-b");
+        put_secret_ok(&db, None, "C", "k", "org-c");
+        let all = db.wait(sealed_secrets(db.db(), "t1", 7, None)).unwrap();
+        assert_eq!(all.len(), 4);
+        let names = ["A".to_owned(), "C".to_owned()];
+        let some = db
+            .wait(sealed_secrets(db.db(), "t1", 7, Some(&names)))
+            .unwrap();
+        let got: Vec<_> = some
+            .iter()
+            .map(|r| (r.name.as_str(), r.repo_id, r.sealed.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("A", None, "org-a"),
+                ("A", Some(7), "repo-a"),
+                ("C", None, "org-c")
+            ]
+        );
+        let none = db
+            .wait(sealed_secrets(db.db(), "t1", 7, Some(&[])))
+            .unwrap();
+        assert_eq!(none.len(), 0);
+        // Another repository sees only the organization's rows.
+        let other = db.wait(sealed_secrets(db.db(), "t1", 8, None)).unwrap();
+        assert_eq!(other.len(), 2);
+        assert!(!format!("{:?}", all[0]).contains("org-a"));
+    }
+
+    #[test]
+    fn reseal_skips_a_row_that_changed() {
+        let db = setup();
+        put_secret_ok(&db, Some(7), "A", "old", "s1");
+        put_secret_ok(&db, None, "B", "new", "s2");
+        let stale = db.wait(stale_secrets(db.db(), "new", 10)).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].name, "A");
+        assert!(!format!("{:?}", stale[0]).contains("s1"));
+        // The secret is set again between the read and the re-seal.
+        put_secret_ok(&db, Some(7), "A", "old", "s1-changed");
+        assert!(
+            !db.wait(reseal(db.db(), &stale[0], "new", "s1-resealed"))
+                .unwrap()
+        );
+        let now = db.wait(stale_secrets(db.db(), "new", 10)).unwrap();
+        assert_eq!(now[0].sealed, "s1-changed");
+        assert!(
+            db.wait(reseal(db.db(), &now[0], "new", "s1-resealed"))
+                .unwrap()
+        );
+        assert_eq!(db.wait(stale_secrets(db.db(), "new", 10)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn stale_secrets_is_bounded() {
+        let db = setup();
+        for name in ["A", "B", "C"] {
+            put_secret_ok(&db, None, name, "old", "s");
+        }
+        assert_eq!(db.wait(stale_secrets(db.db(), "new", 2)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_repo_or_tenant_removes_its_secrets() {
+        let db = setup();
+        put_secret_ok(&db, Some(7), "A", "k", "s");
+        assert!(db.wait(delete_secret(db.db(), "t1", Some(7), "A")).unwrap());
+        assert!(!db.wait(delete_secret(db.db(), "t1", Some(7), "A")).unwrap());
+        put_secret_ok(&db, Some(7), "A", "k", "s");
+        db.run("DELETE FROM tenants WHERE id = 't1'", &[]);
+        let left = db.rows("SELECT 1 FROM ci_secrets", &[]).unwrap();
+        assert_eq!(left.len(), 0);
     }
 }

@@ -14,7 +14,9 @@ pub mod cron;
 pub mod diagnostic;
 pub mod expr;
 pub mod job;
+pub mod permissions;
 pub mod plan;
+pub mod secrets;
 pub mod split;
 pub mod templates;
 pub mod trigger;
@@ -27,15 +29,22 @@ pub use convert::{Conversion, convert, to_yaml};
 pub use cron::{Cron, UtcMinute};
 pub use diagnostic::Diagnostic;
 pub use expr::{
-    ExprError, Functions, JobStatus, checks_status, evaluate, interpolate, job_condition, truthy,
+    ExprError, Functions, JobStatus, checks_status, evaluate, interpolate, job_condition,
+    secret_refs, truthy,
 };
 pub use job::{
     Annotation, AnnotationLevel, CacheService, Conclusion, Github, JobDocument, JobResult, Need,
     StepSummary,
 };
-pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, validate};
+pub use permissions::{DEFAULT_SCOPES, Level, Permissions, SCOPES, token_scopes};
+pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, config_errors, validate};
+pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;
-pub use templates::{Arch, TEMPLATES, Template, template, template_labels};
+pub use templates::{
+    Arch, DEFAULT_SPEND_CAP_MICROS, FREE_UNITS, MAX_RUNNING_JOBS, MAX_SPEND_CAP_MICROS,
+    MIN_SPEND_CAP_MICROS, TEMPLATES, Template, UNIT_PRICE_MICROS, dollars, spend_micros, template,
+    template_labels,
+};
 pub use trigger::{
     Dispatch, Event, Filter, MAX_CHANGED, MAX_GLOBS, MAX_PATTERNS, PullRequestTrigger, PushTrigger,
     Schedule, Triggers, triggered,

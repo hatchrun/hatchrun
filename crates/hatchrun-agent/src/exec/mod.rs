@@ -587,6 +587,18 @@ impl Job<'_> {
         condition(if_, &self.ctx, &rt)
     }
 
+    /// Whether an action's own `pre-if` or `post-if` lets its hook run.
+    /// The condition comes from the action's `action.yml`, so it sees no
+    /// secrets.
+    fn hook_runs(&self, if_: Option<&str>) -> Result<bool, ExprError> {
+        let rt = Runtime {
+            workspace: &self.layout.workspace,
+            status: self.status,
+            cancel: self.ctx.cancel(),
+        };
+        condition(if_, &self.ctx.without_secrets(), &rt)
+    }
+
     async fn run_step(
         &mut self,
         index: usize,

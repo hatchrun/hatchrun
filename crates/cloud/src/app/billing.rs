@@ -18,21 +18,24 @@
 
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
-use worker::{Env, Request, Response, Result, console_log, console_warn};
+use worker::{Env, Request, Response, Result, console_error, console_log, console_warn};
 
 use super::tenants::authorize;
 use super::{Answer, Ctx, Failure, get, json_error, need};
 use crate::db::{Db, params};
 use crate::fetch::send;
-use crate::polar::{self, Event, Signed};
+use crate::polar::{self, Event, Signed, Subscription};
 use crate::reconcile::time;
-use crate::{now_ms, session, usage};
+use crate::{ci_wake, now_ms, session, usage};
 
 /// Variable that replaces Polar's API URL, such as Polar's sandbox.
 const POLAR_API_URL: &str = "POLAR_API_URL";
 /// Variable with the Polar products of the licence, separated by
 /// commas: one per billing interval.
 const PRODUCT_ID: &str = "POLAR_PRODUCT_ID";
+/// Variable with the Polar product of hatchrun CI. A subscription to it
+/// is a card on file for CI and does not license runners.
+const CI_PRODUCT_ID: &str = "POLAR_CI_PRODUCT_ID";
 /// Secret with Polar's organization access token.
 const ACCESS_TOKEN: &str = "POLAR_ACCESS_TOKEN";
 /// Secret with the webhook endpoint's secret.
@@ -105,9 +108,10 @@ struct SubscriptionRow {
     cancel_at_period_end: bool,
 }
 
-/// The tenant's licensed subscription if there is one, else its latest.
+/// The tenant's licensed runners subscription if there is one, else its
+/// latest. A CI subscription is not shown here.
 const SUBSCRIPTION: &str = "SELECT status, current_period_end, cancel_at_period_end \
-    FROM subscriptions WHERE tenant_id = $1 \
+    FROM subscriptions WHERE tenant_id = $1 AND product = 'runners' \
     ORDER BY status IN ('active', 'trialing') DESC, modified_at DESC LIMIT 1";
 
 /// The licence of tenant `id`, which is in the beta when `beta`.
@@ -268,13 +272,16 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
 /// Writes a subscription of an existing tenant, unless the row holds a
 /// newer delivery. Binds the subscription id, tenant, status, customer,
 /// product, period end or NULL, cancel at period end, Polar's modified
-/// time and the time in milliseconds.
+/// time, the time in milliseconds and the product kind (`runners` or
+/// `ci`, see [`polar::product_kind`]).
 const UPSERT_SUBSCRIPTION: &str = "INSERT INTO subscriptions (id, tenant_id, status, \
-    customer_id, product_id, current_period_end, cancel_at_period_end, modified_at, updated_at) \
+    customer_id, product_id, current_period_end, cancel_at_period_end, modified_at, updated_at, \
+    product) \
     SELECT $1::text, id, $3::text, $4::text, $5::text, $6::text, $7::boolean, $8::text, \
-    $9::bigint FROM tenants WHERE id = $2 \
+    $9::bigint, $10::text FROM tenants WHERE id = $2 \
     ON CONFLICT (id) DO UPDATE SET status = excluded.status, \
     customer_id = excluded.customer_id, product_id = excluded.product_id, \
+    product = excluded.product, \
     current_period_end = excluded.current_period_end, \
     cancel_at_period_end = excluded.cancel_at_period_end, \
     modified_at = excluded.modified_at, updated_at = excluded.updated_at \
@@ -308,6 +315,23 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
         }
     };
     let db = Db::connect(env).await?;
+    let runner_ids = get(env, PRODUCT_ID)
+        .map(|list| polar::product_ids(&list))
+        .unwrap_or_default();
+    let Some(product) = polar::product_kind(
+        &subscription.product_id,
+        &runner_ids,
+        &get(env, CI_PRODUCT_ID).unwrap_or_default(),
+    ) else {
+        // A product nobody configured: filing it as runners would
+        // license hatchrun.io for a CI plan, so the row is not written.
+        console_error!(
+            "polar webhook: subscription {} is for product {}, in neither POLAR_PRODUCT_ID nor POLAR_CI_PRODUCT_ID",
+            subscription.id,
+            subscription.product_id
+        );
+        return Ok(Response::empty()?.with_status(202));
+    };
     let changed = db
         .run(
             UPSERT_SUBSCRIPTION,
@@ -321,9 +345,53 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
                 subscription.cancel_at_period_end,
                 subscription.modified_at.as_str(),
                 now_ms(),
+                product,
             ],
         )
         .await?;
+    let woken = settle(&db, &subscription, product, changed).await?;
+    wake(env, &woken).await;
+    Ok(Response::empty()?.with_status(202))
+}
+
+/// Sends a launch message to the CI Worker's queue for each woken job.
+/// A message that does not go is left to the CI reconciler's backstop,
+/// so it is logged and not retried here: Polar must get its answer.
+async fn wake(env: &Env, woken: &[ci_wake::Woken]) {
+    if woken.is_empty() {
+        return;
+    }
+    let queue = match env.queue(ci_wake::QUEUE) {
+        Ok(queue) => queue,
+        Err(err) => {
+            console_error!("ci wake: no queue: {err}");
+            return;
+        }
+    };
+    for job in woken {
+        if let Err(err) = queue.send(*job).await {
+            console_error!("ci wake: job {}: {err}", job.job_id);
+        }
+    }
+}
+
+/// What a stored subscription changes. A `runners` one clears or starts
+/// the tenant's grace period and rechecks waiting jobs. A `ci` one
+/// leaves the runners alone; one that is licensed returns the tenant's
+/// oldest jobs held for the card, for the caller to send to the CI
+/// launch queue.
+async fn settle(
+    db: &Db,
+    subscription: &Subscription,
+    product: &str,
+    changed: u64,
+) -> Result<Vec<ci_wake::Woken>> {
+    if product == "ci" {
+        if changed > 0 && polar::LICENSED.contains(&subscription.status.as_str()) {
+            return ci_wake::card_returned(db, &subscription.tenant).await;
+        }
+        return Ok(Vec::new());
+    }
     if changed == 0 {
         console_warn!(
             "subscription {} for tenant {}: no such tenant, or an older delivery",
@@ -331,16 +399,16 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
             subscription.tenant
         );
     } else if polar::LICENSED.contains(&subscription.status.as_str()) {
-        usage::clear_grace(&db, &subscription.tenant).await?;
-        crate::launch::recheck(&db, &subscription.tenant).await?;
-    } else if usage::start_grace(&db, &subscription.tenant, now_ms()).await? {
+        usage::clear_grace(db, &subscription.tenant).await?;
+        crate::launch::recheck(db, &subscription.tenant).await?;
+    } else if usage::start_grace(db, &subscription.tenant, now_ms()).await? {
         console_log!(
             "tenant {}: subscription {} ended past the free minutes, grace period started",
             subscription.tenant,
             subscription.id
         );
     }
-    Ok(Response::empty()?.with_status(202))
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -377,6 +445,7 @@ mod tests {
             cancel,
             modified_at,
             NOW,
+            "runners",
         ]
     }
 
@@ -408,6 +477,103 @@ mod tests {
         );
         assert!(row.cancel_at_period_end);
         assert!(subscription(&db, "t2").is_none());
+    }
+
+    /// The values the webhook binds for a delivery of `product_id`.
+    fn product_delivery(id: &str, product_id: &str, status: &str) -> Vec<Param> {
+        params![
+            id,
+            "t1",
+            status,
+            "cus_1",
+            product_id,
+            None::<&str>,
+            false,
+            "2026-10-16T10:00:00Z",
+            NOW,
+            polar::product_kind(product_id, &["p-run".to_owned()], "p-ci").unwrap_or("none"),
+        ]
+    }
+
+    fn stored_product(db: &Db, id: &str) -> serde_json::Value {
+        db.rows(
+            "SELECT product FROM subscriptions WHERE id = $1",
+            &params![id],
+        )
+        .unwrap()[0]["product"]
+            .clone()
+    }
+
+    #[test]
+    fn webhook_stores_the_product() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        db.run(
+            UPSERT_SUBSCRIPTION,
+            &product_delivery("s_ci", "p-ci", "active"),
+        );
+        db.run(
+            UPSERT_SUBSCRIPTION,
+            &product_delivery("s_run", "p-run", "active"),
+        );
+        assert_eq!(stored_product(&db, "s_ci"), "ci");
+        assert_eq!(stored_product(&db, "s_run"), "runners");
+    }
+
+    #[test]
+    fn ci_subscription_leaves_the_grace_alone() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        // Past the free minutes, unpaid.
+        db.run(
+            "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
+             queued_at, updated_at, ran_on) VALUES (1, 1, 'acme/app', 7, 'hatchrun', \
+             'completed', 1, 1, 'hatchrun-1-ab')",
+            &[],
+        );
+        db.run(
+            "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed) \
+             VALUES (1, 't1', 4000, $1, false)",
+            &params![NOW + 1_000_000_000_000u64],
+        );
+        db.run(
+            UPSERT_SUBSCRIPTION,
+            &product_delivery("s_ci", "p-ci", "canceled"),
+        );
+        let subscription = Subscription {
+            id: "s_ci".into(),
+            tenant: "t1".into(),
+            status: "canceled".into(),
+            customer_id: "cus_1".into(),
+            product_id: "p-ci".into(),
+            current_period_end: None,
+            cancel_at_period_end: false,
+            modified_at: "2026-10-16T10:00:00Z".into(),
+        };
+        db.wait(settle(db.db(), &subscription, "ci", 1)).unwrap();
+        let rows = db
+            .rows("SELECT free_used_up_at FROM tenants WHERE id = 't1'", &[])
+            .unwrap();
+        assert!(rows[0]["free_used_up_at"].is_null());
+    }
+
+    #[test]
+    fn ci_only_tenant_shows_no_runners_subscription() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        db.run(
+            UPSERT_SUBSCRIPTION,
+            &product_delivery("s_ci", "p-ci", "active"),
+        );
+        assert!(subscription(&db, "t1").is_none());
+        let licensed = subscription(&db, "t1")
+            .is_some_and(|row| polar::LICENSED.contains(&row.status.as_str()));
+        assert!(!licensed);
+        db.run(
+            UPSERT_SUBSCRIPTION,
+            &product_delivery("s_run", "p-run", "active"),
+        );
+        assert_eq!(subscription(&db, "t1").unwrap().status, "active");
     }
 
     #[test]

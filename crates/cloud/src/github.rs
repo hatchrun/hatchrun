@@ -7,6 +7,8 @@
 //! instance does not start; and, with a signed-in user's token, who the
 //! user is.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 use crate::http::{Request, Response};
@@ -300,6 +302,9 @@ pub struct Installation {
     /// they lift the suspension.
     #[serde(default)]
     pub suspended_at: Option<String>,
+    /// What the App holds on this installation, by permission name
+    /// (`contents`) to level (`read` or `write`).
+    pub permissions: BTreeMap<String, String>,
 }
 
 /// The user or organization an installation belongs to.
@@ -662,7 +667,7 @@ mod tests {
         );
         let answer = Response { headers: Vec::new(),
             status: 200,
-            body: br#"{"id":5,"account":{"login":"acme","id":9,"type":"Organization"},"app_slug":"hatchrun"}"#.to_vec(),
+            body: br#"{"id":5,"account":{"login":"acme","id":9,"type":"Organization"},"app_slug":"hatchrun","permissions":{"contents":"write","metadata":"read"}}"#.to_vec(),
         };
         assert_eq!(
             parse_installation(&answer).unwrap(),
@@ -674,6 +679,10 @@ mod tests {
                     kind: "Organization".to_owned(),
                 },
                 suspended_at: None,
+                permissions: BTreeMap::from([
+                    ("contents".to_owned(), "write".to_owned()),
+                    ("metadata".to_owned(), "read".to_owned()),
+                ]),
             }
         );
         assert_eq!(
@@ -682,7 +691,7 @@ mod tests {
         );
         let mine = Response { headers: Vec::new(),
             status: 200,
-            body: br#"{"total_count":2,"installations":[{"id":5,"account":{"login":"acme","id":9,"type":"Organization"},"suspended_at":null},{"id":6,"account":{"login":"octo","id":1,"type":"User"},"suspended_at":"2026-10-01T00:00:00Z"}]}"#.to_vec(),
+            body: br#"{"total_count":2,"installations":[{"id":5,"account":{"login":"acme","id":9,"type":"Organization"},"suspended_at":null,"permissions":{}},{"id":6,"account":{"login":"octo","id":1,"type":"User"},"suspended_at":"2026-10-01T00:00:00Z","permissions":{}}]}"#.to_vec(),
         };
         let list = parse_user_installations(&mine).unwrap();
         assert_eq!(list.len(), 2);

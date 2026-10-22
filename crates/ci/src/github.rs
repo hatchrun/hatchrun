@@ -5,6 +5,8 @@
 //! The GitHub requests the control plane sends, as data (see
 //! `hatchrun_cloud::github`), and readers for the answers.
 
+use std::collections::BTreeMap;
+
 use hatchrun_cloud::http::{Request, Response, encode};
 use hatchrun_workflow::MAX_SOURCE;
 use serde::{Deserialize, Serialize};
@@ -135,10 +137,67 @@ pub fn sha_of(response: &Response) -> Result<String, String> {
     decode::<Commit>(response, "commit").map(|c| c.sha)
 }
 
-/// Trades the App's JWT for a token of one installation limited to one
-/// repository and to read access.
+/// One scope the App holds less of than the job asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capped {
+    /// The permission name, such as `contents`.
+    pub scope: String,
+    /// The level the job asked for.
+    pub asked: String,
+    /// The level the token gets; `none` when the App holds none.
+    pub got: String,
+}
+
+fn rank(level: &str) -> u8 {
+    match level {
+        "read" => 1,
+        "write" => 2,
+        "admin" => 3,
+        _ => 0,
+    }
+}
+
+/// Each asked scope at the lower of the asked and held level. Scopes
+/// the App does not hold are left out and listed as capped to `none`.
+/// `metadata: read` is always kept.
 #[must_use]
-pub fn scoped_token(api: &str, installation_id: u64, app_jwt: &str, repo_id: u64) -> Request {
+pub fn cap_permissions(
+    asked: &BTreeMap<String, String>,
+    held: &BTreeMap<String, String>,
+) -> (BTreeMap<String, String>, Vec<Capped>) {
+    let mut out = BTreeMap::from([("metadata".to_owned(), "read".to_owned())]);
+    let mut capped = Vec::new();
+    for (scope, level) in asked {
+        if scope == "metadata" {
+            continue;
+        }
+        let have = held.get(scope).map_or("", String::as_str);
+        if rank(have) >= rank(level) {
+            out.insert(scope.clone(), level.clone());
+        } else {
+            if rank(have) > 0 {
+                out.insert(scope.clone(), have.to_owned());
+            }
+            capped.push(Capped {
+                scope: scope.clone(),
+                asked: level.clone(),
+                got: if rank(have) > 0 { have } else { "none" }.to_owned(),
+            });
+        }
+    }
+    (out, capped)
+}
+
+/// Trades the App's JWT for a token of one installation limited to one
+/// repository and to `permissions` (see [`cap_permissions`]).
+#[must_use]
+pub fn scoped_token(
+    api: &str,
+    installation_id: u64,
+    app_jwt: &str,
+    repo_id: u64,
+    permissions: &BTreeMap<String, String>,
+) -> Request {
     json_body(
         rest(
             "POST",
@@ -147,12 +206,7 @@ pub fn scoped_token(api: &str, installation_id: u64, app_jwt: &str, repo_id: u64
         ),
         &serde_json::json!({
             "repository_ids": [repo_id],
-            "permissions": {
-                "contents": "read",
-                "metadata": "read",
-                "checks": "read",
-                "pull_requests": "read",
-            },
+            "permissions": permissions,
         }),
     )
 }
@@ -325,6 +379,24 @@ pub struct Permissions {
     pub read: bool,
     /// May push to it.
     pub write: bool,
+    /// May administer it, secrets and variables included.
+    pub admin: bool,
+}
+
+/// The id GitHub's answer to [`user_repo`] gives the repository, `None`
+/// for any answer but a 200 with an id.
+#[must_use]
+pub fn repo_id(response: &Response) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Repo {
+        id: u64,
+    }
+    if response.status != 200 {
+        return None;
+    }
+    serde_json::from_slice::<Repo>(&response.body)
+        .ok()
+        .map(|repo| repo.id)
 }
 
 /// What the answer of [`user_repo`] says. Any answer but 200 gives no
@@ -343,6 +415,7 @@ pub fn permissions(response: &Response) -> Permissions {
     let none = Permissions {
         read: false,
         write: false,
+        admin: false,
     };
     if response.status != 200 {
         return none;
@@ -358,6 +431,7 @@ pub fn permissions(response: &Response) -> Permissions {
     Permissions {
         read: !repo.private || has(&["pull", "push", "maintain", "admin"]),
         write: has(&["push", "maintain", "admin"]),
+        admin: has(&["admin"]),
     }
 }
 
@@ -501,9 +575,50 @@ mod tests {
         assert!(sha_of(&answer(404, &[], "{}")).is_err());
     }
 
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
     #[test]
-    fn scoped_token_names_one_repository() {
-        let r = scoped_token("https://api.github.com", 777, "jwt", 4242);
+    fn cap_keeps_what_the_app_holds() {
+        let asked = map(&[
+            ("contents", "write"),
+            ("issues", "write"),
+            ("metadata", "read"),
+        ]);
+        let held = map(&[
+            ("contents", "read"),
+            ("metadata", "read"),
+            ("checks", "write"),
+        ]);
+        let (got, capped) = cap_permissions(&asked, &held);
+        assert_eq!(got, map(&[("contents", "read"), ("metadata", "read")]));
+        let capped_to = |scope: &str, got: &str| Capped {
+            scope: scope.into(),
+            asked: "write".into(),
+            got: got.into(),
+        };
+        assert_eq!(
+            capped,
+            vec![capped_to("contents", "read"), capped_to("issues", "none")]
+        );
+    }
+
+    #[test]
+    fn cap_always_keeps_metadata_and_never_raises() {
+        let (got, capped) =
+            cap_permissions(&map(&[("checks", "read")]), &map(&[("checks", "write")]));
+        assert_eq!(got, map(&[("checks", "read"), ("metadata", "read")]));
+        assert_eq!(capped, Vec::<Capped>::new());
+    }
+
+    #[test]
+    fn scoped_token_asks_for_the_capped_scopes() {
+        let permissions = map(&[("contents", "read"), ("metadata", "read")]);
+        let r = scoped_token("https://api.github.com", 777, "jwt", 4242, &permissions);
         assert_eq!(r.method, "POST");
         assert_eq!(
             r.url,
@@ -514,12 +629,7 @@ mod tests {
             json(&r),
             serde_json::json!({
                 "repository_ids": [4242],
-                "permissions": {
-                    "contents": "read",
-                    "metadata": "read",
-                    "checks": "read",
-                    "pull_requests": "read"
-                }
+                "permissions": { "contents": "read", "metadata": "read" }
             })
         );
     }
@@ -665,7 +775,8 @@ mod tests {
             permissions(&public),
             Permissions {
                 read: true,
-                write: false
+                write: false,
+                admin: false
             }
         );
     }
@@ -683,23 +794,49 @@ mod tests {
             permissions(&body(r#"{"pull":true,"push":false}"#)),
             Permissions {
                 read: true,
-                write: false
+                write: false,
+                admin: false
             }
         );
         assert_eq!(
             permissions(&body(r#"{"pull":true,"push":true}"#)),
             Permissions {
                 read: true,
-                write: true
+                write: true,
+                admin: false
             }
         );
         assert_eq!(
             permissions(&answer(200, &[], r#"{"private":true}"#)),
             Permissions {
                 read: false,
-                write: false
+                write: false,
+                admin: false
             }
         );
+    }
+
+    #[test]
+    fn only_the_admin_permission_administers() {
+        let body = |p: &str| {
+            answer(
+                200,
+                &[],
+                &format!(r#"{{"private":true,"permissions":{p}}}"#),
+            )
+        };
+        assert!(permissions(&body(r#"{"pull":true,"push":true,"admin":true}"#)).admin);
+        assert!(!permissions(&body(r#"{"pull":true,"push":true,"maintain":true}"#)).admin);
+    }
+
+    #[test]
+    fn the_answer_names_the_repository_by_id() {
+        assert_eq!(
+            repo_id(&answer(200, &[], r#"{"id":7,"private":false}"#)),
+            Some(7)
+        );
+        assert_eq!(repo_id(&answer(200, &[], r#"{"private":false}"#)), None);
+        assert_eq!(repo_id(&answer(404, &[], r#"{"id":7}"#)), None);
     }
 
     #[test]
@@ -707,6 +844,7 @@ mod tests {
         let none = Permissions {
             read: false,
             write: false,
+            admin: false,
         };
         assert_eq!(permissions(&answer(404, &[], "{}")), none);
         assert_eq!(permissions(&answer(200, &[], "nope")), none);

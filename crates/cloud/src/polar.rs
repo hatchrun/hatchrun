@@ -52,6 +52,25 @@ pub fn product_ids(list: &str) -> Vec<String> {
         .collect()
 }
 
+/// `runners` for a product in `runner_ids`, `ci` for the CI product,
+/// `None` for any other product.
+#[must_use]
+pub fn product_kind(
+    product_id: &str,
+    runner_ids: &[String],
+    ci_product_id: &str,
+) -> Option<&'static str> {
+    if product_id.is_empty() {
+        None
+    } else if runner_ids.iter().any(|id| id == product_id) {
+        Some("runners")
+    } else if product_id == ci_product_id {
+        Some("ci")
+    } else {
+        None
+    }
+}
+
 /// Asks for the product `id`.
 #[must_use]
 pub fn product(api: &str, token: &str, id: &str) -> Request {
@@ -255,6 +274,59 @@ pub fn ingest(api: &str, token: &str, events: &[Minutes<'_>]) -> Request {
                 "external_id": format!("job:{}", event.job_id),
                 "timestamp": event.at,
                 "metadata": { "minutes": event.minutes, "job_id": event.job_id.to_string() },
+            })
+        })
+        .collect();
+    call("POST", format!("{api}/v1/events/ingest"), token)
+        .body(serde_json::json!({ "events": events }).to_string())
+}
+
+/// Name of the events that carry a CI job attempt's billing units. The
+/// CI usage meter sums their `units`.
+pub const CI_USAGE_EVENT: &str = "ci.usage";
+
+/// Most CI usage events in one ingest call. Polar documents no limit,
+/// so this stays small: a batch with one refused event splits down to
+/// it in about 2 * log2(100) calls.
+pub const CI_INGEST_BATCH: usize = 100;
+
+/// One CI job attempt's usage, as Polar's meter takes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiUsage<'a> {
+    /// The job.
+    pub job_id: u64,
+    /// The attempt, so a re-run counts apart from the first run.
+    pub attempt: u32,
+    /// The tenant, Polar's external customer id.
+    pub tenant: &'a str,
+    /// The runner template's label.
+    pub template: &'a str,
+    /// The minutes the attempt ran.
+    pub minutes: u64,
+    /// The billing units: the minutes weighted by the template.
+    pub units: u64,
+    /// When it completed, ISO 8601.
+    pub at: String,
+}
+
+/// Sends CI usage to Polar. Each event's `external_id` names the job and
+/// the attempt, so an event sent again after a lost answer is skipped
+/// as a duplicate and never counted twice.
+#[must_use]
+pub fn ci_ingest(api: &str, token: &str, events: &[CiUsage<'_>]) -> Request {
+    let events: Vec<_> = events
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "name": CI_USAGE_EVENT,
+                "external_customer_id": event.tenant,
+                "external_id": format!("ci:{}:{}", event.job_id, event.attempt),
+                "timestamp": event.at,
+                "metadata": {
+                    "units": event.units,
+                    "minutes": event.minutes,
+                    "template": event.template,
+                },
             })
         })
         .collect();
@@ -676,6 +748,46 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn ci_ingest_names_job_and_attempt() {
+        let request = ci_ingest(
+            API,
+            "t",
+            &[CiUsage {
+                job_id: 7,
+                attempt: 2,
+                tenant: "abcdefgh12345678",
+                template: "ubuntu-26.04-8core",
+                minutes: 5,
+                units: 20,
+                at: "2026-10-14T10:09:30Z".to_owned(),
+            }],
+        );
+        assert_eq!(request.url, "https://api.polar.sh/v1/events/ingest");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "events": [{
+                "name": "ci.usage",
+                "external_customer_id": "abcdefgh12345678",
+                "external_id": "ci:7:2",
+                "timestamp": "2026-10-14T10:09:30Z",
+                "metadata": { "units": 20, "minutes": 5, "template": "ubuntu-26.04-8core" },
+            }] })
+        );
+    }
+
+    #[test]
+    fn product_kind_names_the_ci_product() {
+        let runners = product_ids("p-run, p-run2");
+        assert_eq!(product_kind("p-ci", &runners, "p-ci"), Some("ci"));
+        assert_eq!(product_kind("p-run", &runners, "p-ci"), Some("runners"));
+        assert_eq!(product_kind("p-run2", &runners, ""), Some("runners"));
+        assert_eq!(product_kind("p-ci", &runners, ""), None);
+        assert_eq!(product_kind("p-other", &runners, "p-ci"), None);
+        assert_eq!(product_kind("", &[], ""), None);
     }
 
     #[test]
