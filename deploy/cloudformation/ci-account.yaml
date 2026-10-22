@@ -1,0 +1,273 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  The hatchrun-owned AWS account that runs hatchrun CI jobs, one EC2
+  instance per job. Deploy it once in us-east-1; hatchrun-ci reads its
+  outputs (RoleArn, LaunchTemplateId, SubnetIds).
+
+Resources:
+  # hatchrun-ci signs a short-lived token with subject tenant:hatchrun-ci
+  # and trades it for the role's credentials with
+  # AssumeRoleWithWebIdentity. The account is new, so the stack owns the
+  # account's one provider for this URL.
+  OidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://oidc.hatchrun.io
+      ClientIdList: [sts.amazonaws.com]
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.40.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: hatchrun-ci }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: hatchrun-ci }
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: hatchrun-ci }
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Public subnets in three zones: no NAT gateway to pay for, and the
+  # launcher tries the next subnet when a zone has no capacity.
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.0.0/18
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: hatchrun-ci-a }
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.64.0/18
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: hatchrun-ci-b }
+
+  SubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.128.0/18
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: hatchrun-ci-c }
+
+  SubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetA
+      RouteTableId: !Ref RouteTable
+
+  SubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetB
+      RouteTableId: !Ref RouteTable
+
+  SubnetCRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetC
+      RouteTableId: !Ref RouteTable
+
+  # No inbound traffic. Outbound port 25 is blocked so a job cannot send
+  # mail from our address space. A security group can only allow, and
+  # once it lists any egress rule it drops the allow-all default, so the
+  # blocked port is the gap between 0-24 and 26-65535. A network ACL
+  # would also work but is stateless and applies to the whole subnet,
+  # so it needs ephemeral port rules for return traffic; the group
+  # follows the instance and keeps connection tracking.
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "hatchrun CI runners: no inbound traffic, no outbound port 25"
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 0, ToPort: 24, CidrIp: 0.0.0.0/0, Description: TCP below port 25 }
+        - { IpProtocol: tcp, FromPort: 26, ToPort: 65535, CidrIp: 0.0.0.0/0, Description: TCP above port 25 }
+        - { IpProtocol: udp, FromPort: 0, ToPort: 65535, CidrIp: 0.0.0.0/0, Description: All UDP }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 0.0.0.0/0, Description: All ICMP }
+      Tags:
+        - { Key: Name, Value: hatchrun-ci-runners }
+
+  # The image and instance type come with each launch. Runners get no
+  # instance profile. IMDSv2 is required at launch with a hop limit of
+  # 1; hatchrun-ci turns the metadata endpoint off before it hands the
+  # job its document.
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - { Key: "hatchrun:tenant", Value: hatchrun-ci }
+      LaunchTemplateData:
+        SecurityGroupIds: [!Ref RunnerSecurityGroup]
+        InstanceInitiatedShutdownBehavior: terminate
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 30
+              Encrypted: true
+              DeleteOnTermination: true
+
+  # What hatchrun-ci may do here: launch Marketplace images from this
+  # template into this VPC and end the instances it tagged. There is no
+  # iam:PassRole, so no instance can get a role.
+  LauncherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: hatchrun-ci launches and removes CI runner instances
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref OidcProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                oidc.hatchrun.io:aud: sts.amazonaws.com
+                oidc.hatchrun.io:sub: tenant:hatchrun-ci
+      Policies:
+        - PolicyName: run-ci-jobs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # EC2 allows describing only on "*".
+              - Sid: List
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:DescribeSubnets
+                Resource: "*"
+              - Sid: LaunchInstances
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/hatchrun:tenant: hatchrun-ci
+                    ec2:LaunchTemplate: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplate}"
+                    ec2:MetadataHttpTokens: required
+                  NumericLessThanEquals:
+                    ec2:MetadataHttpPutResponseHopLimit: 1
+              - Sid: LaunchVolumes
+                Effect: Allow
+                Action: [ec2:RunInstances, ec2:CreateFleet]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                Condition:
+                  Bool:
+                    ec2:Encrypted: "true"
+              # Marketplace images, which the account subscribes to.
+              - Sid: LaunchImages
+                Effect: Allow
+                Action: [ec2:RunInstances, ec2:CreateFleet]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
+                Condition:
+                  StringEquals:
+                    ec2:Owner: aws-marketplace
+              - Sid: LaunchNetwork
+                Effect: Allow
+                Action: [ec2:RunInstances, ec2:CreateFleet]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                Condition:
+                  StringEquals:
+                    ec2:Vpc: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${Vpc}"
+              - Sid: LaunchFromTemplate
+                Effect: Allow
+                Action: [ec2:RunInstances, ec2:CreateFleet]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplate}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${RunnerSecurityGroup}"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+              # Each launch is an instant EC2 Fleet of one. The instance
+              # it starts is held to LaunchInstances.
+              - Sid: LaunchFleet
+                Effect: Allow
+                Action: ec2:CreateFleet
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:fleet/*"
+              # A fleet takes no user data or instance tags of its own,
+              # so each launch adds a version of the template with them
+              # and deletes it after.
+              - Sid: RunnerTemplateVersions
+                Effect: Allow
+                Action:
+                  - ec2:CreateLaunchTemplateVersion
+                  - ec2:DeleteLaunchTemplateVersions
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${LaunchTemplate}"
+              - Sid: TagAtLaunch
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:spot-instances-request/*"
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction: [RunInstances, CreateFleet]
+              # Ending a job's instance and turning its metadata off.
+              - Sid: ManageOwnInstances
+                Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                  - ec2:ModifyInstanceMetadataOptions
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/hatchrun:tenant: hatchrun-ci
+
+Outputs:
+  RoleArn:
+    Description: CI_ROLE_ARN of hatchrun-ci
+    Value: !GetAtt LauncherRole.Arn
+  LaunchTemplateId:
+    Description: CI_LAUNCH_TEMPLATE_ID of hatchrun-ci
+    Value: !Ref LaunchTemplate
+  SubnetIds:
+    Description: CI_SUBNET_IDS of hatchrun-ci, comma separated
+    Value: !Join [",", [!Ref SubnetA, !Ref SubnetB, !Ref SubnetC]]

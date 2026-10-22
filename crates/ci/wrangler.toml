@@ -44,6 +44,8 @@ new_sqlite_classes = ["RunObject"]
 
 # Finished logs, kept 30 days:
 # logs/<tenant>/<repo_id>/<run>/<job>.log.gz and its .index.json.
+# Created by hand once; deploy-ci.yml applies r2-lifecycle.json, which
+# expires logs/ and state/ after 30 days.
 [[r2_buckets]]
 binding = "LOGS"
 bucket_name = "hatchrun-ci-logs"
@@ -95,9 +97,12 @@ GITHUB_APP_ID = "Iv23liMh4C066YyxQB7R"
 OIDC_KEY_ID = "2026-10-14"
 # The region of the CI AWS account, where jobs run.
 CI_REGION = "us-east-1"
-# Set by the deploy workflow from the CI account stack's outputs: the
-# role the Worker assumes, the launch template and the subnets (comma
-# separated) it launches into.
+# Set by deploy-ci.yml from the CI_ROLE_ARN, CI_LAUNCH_TEMPLATE_ID and
+# CI_SUBNET_IDS repository variables, which hold the RoleArn,
+# LaunchTemplateId and SubnetIds outputs of the stack in
+# deploy/cloudformation/ci-account.yaml (us-east-1, the hatchrun CI
+# account): the role the Worker assumes, the launch template and the
+# subnets (comma separated) it launches into.
 CI_ROLE_ARN = ""
 CI_LAUNCH_TEMPLATE_ID = ""
 CI_SUBNET_IDS = ""
