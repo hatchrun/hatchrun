@@ -587,6 +587,12 @@ export interface CiJob {
   completed_at: number | null;
   steps: CiStep[];
   has_log: boolean;
+  /** "approval" while the job waits for an organization admin to approve or reject it. */
+  held: string | null;
+  /** The environment the job deploys to, when it has one. */
+  environment: string | null;
+  /** The admin's decision on a job held for approval; null until one is made. Times are Unix milliseconds. */
+  approval: { decision: "approved" | "rejected"; by: string; at: number } | null;
 }
 
 export interface CiRunDetail {
@@ -634,6 +640,12 @@ export const listCiRuns = (owner: string, repo: string, before?: number) =>
 export const getCiRun = (id: string | number) => retrying(() => get<CiRunDetail>(`/api/ci/runs/${id}`));
 
 export const cancelCiRun = (id: number) => post<undefined>(`/api/ci/runs/${id}/cancel`);
+
+/** Lets a job held for approval run. Answers 409 when the job is not waiting. */
+export const approveCiJob = (id: number) => post<undefined>(`/api/ci/jobs/${id}/approve`);
+
+/** Fails a job held for approval. Answers 409 when the job is not waiting. */
+export const rejectCiJob = (id: number) => post<undefined>(`/api/ci/jobs/${id}/reject`);
 
 /** The job's log: the stored one once it ended, else the newest text the run holds. */
 export const getCiLog = (job: string | number) =>
