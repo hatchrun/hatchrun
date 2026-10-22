@@ -14,7 +14,8 @@
 # - Postgres 17 in Docker on 55432 (E2E_PG_PORT), unless E2E_DATABASE_URL names one;
 # - hatchrun-ci-dev fake-github on 9101 and launcher on 9102;
 # - wrangler dev for crates/broker on 8789 and for crates/ci on 8788,
-#   the latter built with the local launcher.
+#   the latter built with the local launcher and given a local Secrets
+#   Store key for CI secrets.
 #
 # Scenarios: a push to main runs build then test, both pass, and the
 # log and step index land in R2; a push to fail runs a job that fails;
@@ -245,6 +246,20 @@ start launcher env RUST_LOG="${RUST_LOG:-info,hatchrun_agent=debug}" "$dev" laun
   printf 'OIDC_SIGNING_KEY="%s"\n' "$key"
 } >"$tmp/ci.env"
 
+# The key behind the CI_SECRETS_KEY binding, in wrangler's local
+# Secrets Store under the store id and secret name crates/ci/wrangler.toml
+# binds. It lands in the state directory hatchrun-ci's wrangler dev is
+# given with --persist-to. Without it the reconciler's re-seal step
+# cannot read its key.
+store_id="$(sed -n 's/^store_id = "\(.*\)"$/\1/p' "$root/crates/ci/wrangler.toml")"
+secret_name="$(sed -n 's/^secret_name = "\(.*\)"$/\1/p' "$root/crates/ci/wrangler.toml")"
+[[ -n "$store_id" && -n "$secret_name" ]] || die "no secrets store binding in crates/ci/wrangler.toml"
+log "creating the local secrets store key"
+npx --yes "$WRANGLER" secrets-store secret create "$store_id" \
+  --name "$secret_name" --value "$(openssl rand -base64 32)" --scopes workers \
+  --persist-to "$tmp/ci-state" >"$logs/secrets-store.log" 2>&1 ||
+  die "creating the local secrets store key failed: $(cat "$logs/secrets-store.log")"
+
 log "starting wrangler dev for the broker and hatchrun-ci (the first build takes a while)"
 start broker env -C "$root/crates/broker" npx --yes "$WRANGLER" dev --local \
   --ip 127.0.0.1 --port "$BROKER_PORT" --inspector-port 9230 \
@@ -267,7 +282,9 @@ start ci env -C "$root/crates/ci" \
   --var CI_URL:"$CI" \
   --var APP_URL:"$APP_URL" \
   --var GITHUB_APP_ID:Iv1e2e \
-  --var OIDC_KEY_ID:e2e
+  --var OIDC_KEY_ID:e2e \
+  --var CI_SECRETS_KEY_ID:e2e \
+  --var CI_SECRETS_KEY_OLD_ID:""
 
 wait_http "$GITHUB/_state" 30 "fake-github"
 wait_http "$LAUNCHER/_events" 30 "the launcher"

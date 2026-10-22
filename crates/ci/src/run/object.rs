@@ -25,7 +25,9 @@ use worker::{
 
 use crate::checks::{JobView, Outbox, conclusion_word, details_url, render};
 use crate::env::Settings;
-use crate::github::{CheckRun, check_run_id, create_check_run, revoke_token, update_check_run};
+use crate::github::{
+    Capped, CheckRun, check_run_id, create_check_run, revoke_token, update_check_run,
+};
 use crate::graph::{Action, Graph, State as NodeState};
 use crate::launches::{self, LaunchMessage};
 use crate::store;
@@ -92,6 +94,7 @@ pub(super) fn answer(status: u16) -> Result<Response> {
 #[derive(Deserialize)]
 struct ClaimBody {
     token: String,
+    capped: Vec<Capped>,
 }
 
 #[derive(Deserialize)]
@@ -390,7 +393,7 @@ impl<'a> Cx<'a> {
                 };
                 match path {
                     "/claim" => match req.json::<ClaimBody>().await {
-                        Ok(body) => self.claim(job, attempt, body.token).await,
+                        Ok(body) => self.claim(job, attempt, body.token, body.capped).await,
                         Err(_) => Response::error("bad claim", 400),
                     },
                     "/events" => match req.json::<Batch>().await {
@@ -925,7 +928,13 @@ impl<'a> Cx<'a> {
         answer(204)
     }
 
-    async fn claim(&self, job: u64, attempt: u32, token: String) -> Result<Response> {
+    async fn claim(
+        &self,
+        job: u64,
+        attempt: u32,
+        token: String,
+        capped: Vec<Capped>,
+    ) -> Result<Response> {
         let first = {
             let _turn = self.turn.lock().await;
             let Some(run) = self.loaded().await? else {
@@ -964,9 +973,10 @@ impl<'a> Cx<'a> {
             }
             run.graph_mut().running(job);
             let mut state = self.job_state(job).await?;
-            if state.held.take().is_some() {
+            if state.held.take().is_some() || (!capped.is_empty() && state.capped != capped) {
                 run.outbox_mut().mark(job);
             }
+            state.capped = capped;
             let old = state
                 .github_token
                 .replace(token.clone())
@@ -1303,6 +1313,7 @@ impl<'a> Cx<'a> {
                 file_annotations_sent: state.file_annotations_sent,
                 failed_tail: tail.as_deref(),
                 held: state.held.as_deref(),
+                capped: &state.capped,
                 started_at: state.started_at,
                 completed_at: state.completed_at,
             };

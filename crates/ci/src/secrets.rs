@@ -13,11 +13,16 @@
 //! previous one. Nothing here puts a value in an error or in `Debug`
 //! output.
 
+use std::collections::BTreeMap;
+
 use aes_gcm::aead::{Aead, KeyInit as _, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use hatchrun_workflow::SecretRefs;
 use worker::Env;
+
+use crate::store::SealedRow;
 
 /// The most bytes a secret or var value may have.
 pub const MAX_VALUE_BYTES: usize = 48 * 1024;
@@ -227,6 +232,45 @@ pub fn reseal(
 ) -> Result<String, SecretError> {
     let value = open(keyring, key_id, aad, sealed)?;
     Ok(seal(&keyring.current, aad, nonce, &value))
+}
+
+/// The values `refs` names (all of them when `refs.all`), from the
+/// organization's and the repository's rows; a repository row wins over
+/// an organization row of the same name. A name with no row is left out.
+///
+/// # Errors
+///
+/// The first secret that does not open, with the reason. The name is
+/// the secret's; the error never carries a value.
+pub fn job_secrets(
+    refs: &SecretRefs,
+    rows: &[SealedRow],
+    keyring: &Keyring,
+    tenant: &str,
+) -> Result<BTreeMap<String, String>, (String, SecretError)> {
+    // Organization rows first, so the repository's replace them.
+    let mut chosen: BTreeMap<&str, &SealedRow> = BTreeMap::new();
+    for row in rows
+        .iter()
+        .filter(|row| row.repo_id.is_none())
+        .chain(rows.iter().filter(|row| row.repo_id.is_some()))
+    {
+        if refs.all || refs.names.contains(&row.name) {
+            chosen.insert(&row.name, row);
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (name, row) in chosen {
+        let aad = Aad {
+            tenant,
+            repo_id: row.repo_id,
+            name,
+        };
+        let value =
+            open(keyring, &row.key_id, &aad, &row.sealed).map_err(|err| (name.to_owned(), err))?;
+        out.insert(name.to_owned(), value);
+    }
+    Ok(out)
 }
 
 /// A random nonce from the Web Crypto RNG.
@@ -460,5 +504,65 @@ mod tests {
         assert_eq!(parse_key(&STANDARD.encode([5u8; 32])), Some([5; 32]));
         assert_eq!(parse_key(&STANDARD.encode([5u8; 31])), None);
         assert_eq!(parse_key("%%"), None);
+    }
+
+    fn row(repo_id: Option<u64>, name: &str, value: &str) -> SealedRow {
+        let ring = ring();
+        let aad = Aad {
+            tenant: "t1",
+            repo_id,
+            name,
+        };
+        SealedRow {
+            repo_id,
+            name: name.into(),
+            key_id: ring.current.id.clone(),
+            sealed: seal(&ring.current, &aad, [3; 12], value),
+        }
+    }
+
+    fn refs(all: bool, names: &[&str]) -> SecretRefs {
+        SecretRefs {
+            all,
+            names: names.iter().map(|n| (*n).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn repo_value_wins() {
+        let rows = [
+            row(None, "NPM_TOKEN", "org"),
+            row(Some(7), "NPM_TOKEN", "repo"),
+        ];
+        let got = job_secrets(&refs(false, &["NPM_TOKEN"]), &rows, &ring(), "t1").unwrap();
+        assert_eq!(got, BTreeMap::from([("NPM_TOKEN".into(), "repo".into())]));
+    }
+
+    #[test]
+    fn only_named_secrets_go() {
+        let rows = [row(Some(7), "A", "a"), row(Some(7), "B", "b")];
+        let got = job_secrets(&refs(false, &["A"]), &rows, &ring(), "t1").unwrap();
+        assert_eq!(got, BTreeMap::from([("A".into(), "a".into())]));
+    }
+
+    #[test]
+    fn all_refs_send_every_secret() {
+        let rows = [row(Some(7), "A", "a"), row(None, "B", "b")];
+        let got = job_secrets(&refs(true, &[]), &rows, &ring(), "t1").unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn missing_secret_is_left_out() {
+        let got = job_secrets(&refs(false, &["A"]), &[], &ring(), "t1").unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn unreadable_secret_names_itself() {
+        let mut bad = row(Some(7), "A", "a");
+        bad.key_id = "retired".into();
+        let err = job_secrets(&refs(false, &["A"]), &[bad], &ring(), "t1").unwrap_err();
+        assert_eq!(err, ("A".into(), SecretError::UnknownKey("retired".into())));
     }
 }

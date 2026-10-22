@@ -52,6 +52,8 @@ pub struct CheckRun {
 #[derive(Default)]
 struct Inner {
     tokens: u64,
+    /// The `permissions` of every access token request, in order.
+    token_permissions: Vec<Value>,
     check_runs: BTreeMap<u64, CheckRun>,
 }
 
@@ -82,6 +84,7 @@ impl Fake {
 /// The fake's routes.
 pub fn router(fake: Fake) -> Router {
     Router::new()
+        .route("/app/installations/{id}", get(installation))
         .route("/app/installations/{id}/access_tokens", post(access_token))
         .route("/installation/token", axum::routing::delete(revoke))
         .route("/repos/{owner}/{repo}", get(repository))
@@ -129,10 +132,35 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-async fn access_token(State(fake): State<Fake>, Path(_id): Path<u64>) -> Response {
+/// The installation, as Plan 3's fields say, holding the permissions
+/// the hatchrun App has.
+async fn installation(Path(id): Path<u64>) -> Json<Value> {
+    Json(json!({
+        "id": id,
+        "account": { "id": 1, "login": "e2e", "type": "Organization" },
+        "suspended_at": null,
+        "permissions": {
+            "contents": "write",
+            "metadata": "read",
+            "checks": "write",
+            "pull_requests": "write",
+        },
+    }))
+}
+
+async fn access_token(
+    State(fake): State<Fake>,
+    Path(_id): Path<u64>,
+    body: axum::body::Bytes,
+) -> Response {
+    // The webhook's token request has no body; a job's has permissions.
+    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let n = {
         let mut inner = fake.lock();
         inner.tokens += 1;
+        inner
+            .token_permissions
+            .push(body.get("permissions").cloned().unwrap_or(Value::Null));
         inner.tokens
     };
     (
@@ -293,8 +321,9 @@ async fn update_check_run(
 }
 
 async fn state(State(fake): State<Fake>) -> Json<Value> {
-    let runs: Vec<CheckRun> = fake.lock().check_runs.values().cloned().collect();
-    Json(json!({ "check_runs": runs }))
+    let inner = fake.lock();
+    let runs: Vec<&CheckRun> = inner.check_runs.values().collect();
+    Json(json!({ "check_runs": runs, "token_permissions": inner.token_permissions }))
 }
 
 #[cfg(test)]
@@ -350,12 +379,17 @@ mod tests {
             &app,
             "POST",
             "/app/installations/42/access_tokens",
-            Some(json!({})),
+            Some(json!({ "permissions": { "contents": "read" } })),
         )
         .await;
         assert_eq!(status, 201);
         let token: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(token["token"], "ghs_e2e_1");
+
+        let (status, body) = call(&app, "GET", "/app/installations/42", None).await;
+        assert_eq!(status, 200);
+        let installation: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(installation["permissions"]["contents"], "write");
 
         let create = json!({
             "name": "ci / build",
@@ -393,6 +427,7 @@ mod tests {
         assert_eq!(run["conclusion"], "success");
         assert_eq!(run["annotations"], 1);
         assert_eq!(run["external_id"], "hatchrun-ci:7");
+        assert_eq!(state["token_permissions"], json!([{ "contents": "read" }]));
     }
 
     #[test]

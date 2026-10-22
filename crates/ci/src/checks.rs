@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use hatchrun_workflow::{Annotation, AnnotationLevel, Conclusion, StepSummary};
 use serde::{Deserialize, Serialize};
 
-use crate::github::{CheckRun, GhAnnotation, Output, rfc3339};
+use crate::github::{Capped, CheckRun, GhAnnotation, Output, rfc3339};
 use crate::graph::{Node, State};
 
 /// The most annotations with a file in one request (GitHub's limit).
@@ -94,6 +94,8 @@ pub struct JobView<'a> {
     pub failed_tail: Option<&'a [String]>,
     /// Why the queued job waits for a launch.
     pub held: Option<&'a str>,
+    /// Token scopes the App holds less of than the job asked.
+    pub capped: &'a [Capped],
     /// Unix milliseconds.
     pub started_at: Option<u64>,
     /// Unix milliseconds.
@@ -162,6 +164,19 @@ pub fn annotation(a: &Annotation) -> Option<GhAnnotation> {
     })
 }
 
+/// One paragraph for each scope the App holds less of than the job asked.
+fn capped_lines(capped: &[Capped]) -> String {
+    let mut out = String::new();
+    for c in capped {
+        let _ = writeln!(
+            out,
+            "The token's `{}` permission is {}: the job asked for {} and the hatchrun App holds no more.\n",
+            c.scope, c.got, c.asked
+        );
+    }
+    out
+}
+
 /// The check run request for a job, and the new count of annotations
 /// with a file that GitHub has once the request is sent.
 ///
@@ -203,6 +218,7 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
         summary.push_str(message);
         summary.push_str("\n\n");
     }
+    summary.push_str(&capped_lines(view.capped));
     if let Some(message) = &view.node.message {
         summary.push_str(message);
         summary.push_str("\n\n");
@@ -402,6 +418,7 @@ mod tests {
             file_annotations_sent: 0,
             failed_tail: None,
             held: None,
+            capped: &[],
             started_at: None,
             completed_at: None,
         }
@@ -456,6 +473,23 @@ mod tests {
             assert_eq!(run.output.unwrap().title, "Queued");
             assert_eq!(run.conclusion, None);
         }
+    }
+
+    #[test]
+    fn capped_scopes_are_named() {
+        let n = node(State::Running, None);
+        let capped = [Capped {
+            scope: "contents".into(),
+            asked: "write".into(),
+            got: "read".into(),
+        }];
+        let mut v = view(&n, &[], &[]);
+        v.capped = &capped;
+        let (run, _) = render(&v);
+        assert_eq!(
+            run.output.unwrap().summary,
+            "The token's `contents` permission is read: the job asked for write and the hatchrun App holds no more."
+        );
     }
 
     #[test]
