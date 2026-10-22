@@ -81,8 +81,10 @@ jobs:
           npm ci
           npm run build
 
-      # Migrations only add tables and columns, so the running Worker
-      # keeps working against the new schema until the deploy lands.
+      # A migration may change columns the running Worker reads, and the
+      # old Worker can fail requests between the migration and the
+      # deploy. Merge a release with such a migration when traffic is
+      # low and watch both deploys.
       # psql comes with the runner image.
       - name: Apply migrations
         env:
