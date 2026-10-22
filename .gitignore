@@ -7,6 +7,8 @@
 /crates/broker/build
 /crates/broker/.wrangler
 .dev.vars
+/crates/ci/build
+/crates/ci/.wrangler
 /crates/cloud/build
 /crates/cloud/.wrangler
 /crates/telemetry/build

@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "hatchrun-ci-dev"
+version = "0.1.0"
+description = "A fake GitHub and a local instance launcher for running hatchrun-ci end to end"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "hatchrun-ci-dev"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive"] }
+getrandom = "0.4.3"
+hatchrun-cloud = { path = "../cloud", default-features = false }
+nix = { version = "0.31.3", features = ["signal"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "process", "sync", "time", "fs"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
+
+[lints]
+workspace = true

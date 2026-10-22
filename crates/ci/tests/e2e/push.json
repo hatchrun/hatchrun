@@ -1,0 +1,19 @@
+{
+  "ref": "refs/heads/main",
+  "before": "0000000000000000000000000000000000000000",
+  "after": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "deleted": false,
+  "commits": [
+    { "added": [], "removed": [], "modified": ["README.md"] }
+  ],
+  "sender": { "login": "e2e" },
+  "repository": {
+    "id": 1001,
+    "name": "demo",
+    "full_name": "e2e/demo",
+    "owner": { "login": "e2e", "id": 1 },
+    "default_branch": "main",
+    "private": false
+  },
+  "installation": { "id": 42 }
+}

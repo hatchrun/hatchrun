@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# The repository crates/ci/scripts/e2e.sh pushes to. Each branch starts
+# one workflow: main the passing pair, fail a failing job, slow a job
+# the script cancels.
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: say hello
+        run: |
+          echo "hello from e2e"
+          echo "::error file=README.md,line=1::e2e annotation"
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "build said ${{ needs.build.result }}"
+  broken:
+    runs-on: ubuntu-latest
+    steps:
+      - name: fail on purpose
+        run: |
+          echo "about to fail"
+          exit 3
+  sleeper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: wait for the cancel
+        run: |
+          echo "waiting"
+          sleep 300
+workflows:
+  ci:
+    on: { push: { branches: [main] } }
+    jobs:
+      - build
+      - test: { requires: [build] }
+  failing:
+    on: { push: { branches: [fail] } }
+    jobs:
+      - broken
+  slow:
+    on: { push: { branches: [slow] } }
+    jobs:
+      - sleeper
