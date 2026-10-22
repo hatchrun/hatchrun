@@ -4,6 +4,7 @@
 
 //! Converting GitHub Actions workflows into a hatchrun config.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use hatchrun_workflow::{
@@ -347,6 +348,31 @@ jobs:
         Some(Permissions::WriteAll)
     );
     round_trips(&out);
+}
+
+#[test]
+fn an_invalid_job_permissions_value_gives_the_narrowest_set() {
+    let out = ok("
+on: push
+permissions: write-all
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: read
+    steps:
+      - run: x
+");
+    assert_eq!(
+        out.config.jobs["ci-build"].permissions,
+        Some(Permissions::Scopes(BTreeMap::new()))
+    );
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.message.contains("permissions: read")),
+        "{:?}",
+        out.warnings
+    );
 }
 
 #[test]
