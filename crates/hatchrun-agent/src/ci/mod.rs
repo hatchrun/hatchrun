@@ -19,9 +19,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use hatchrun_workflow::agent::BootDocument;
 use hatchrun_workflow::{Conclusion, JobKind, JobResult};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::time::Instant;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use self::client::{Claim, Client};
 use self::sink::HttpSink;
@@ -94,8 +95,9 @@ async fn run_claimed(client: &Client, exec: &exec::Options) -> Result<i32> {
     }
     masker.add(&doc.github.token);
 
-    let (cancel, cancelled) = watch::channel(0u32);
-    let (mut sink, flusher) = HttpSink::start(client.clone(), cancel);
+    let (from_flusher_tx, from_flusher) = watch::channel(0u32);
+    let cancelled = forward_cancels(from_flusher);
+    let (mut sink, flusher) = HttpSink::start(client.clone(), from_flusher_tx);
     let result = if matches!(doc.job.kind, JobKind::Approval) {
         sink.line("[hatchrun] approval jobs do not run on a runner");
         failure()
@@ -118,6 +120,56 @@ async fn run_claimed(client: &Client, exec: &exec::Options) -> Result<i32> {
     }
     client.result(&result).await?;
     Ok(i32::from(result.conclusion != Conclusion::Success))
+}
+
+/// Merges the flusher's cancel count with SIGTERMs into the count the
+/// job watches: the larger of the two, so the first SIGTERM cancels the
+/// job (grace, then the result is reported) and the second aborts it.
+fn forward_cancels(mut flushed: watch::Receiver<u32>) -> watch::Receiver<u32> {
+    let (merged, job) = watch::channel(0u32);
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => Some(terminate),
+        Err(err) => {
+            warn!("listen for SIGTERM: {err}");
+            None
+        }
+    };
+    tokio::spawn(async move {
+        let mut signals = 0u32;
+        let mut flusher_gone = false;
+        loop {
+            tokio::select! {
+                changed = flushed.changed(), if !flusher_gone => {
+                    flusher_gone = changed.is_err();
+                }
+                got = async {
+                    match terminate.as_mut() {
+                        Some(terminate) => terminate.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if got.is_none() {
+                        terminate = None;
+                    } else {
+                        signals += 1;
+                    }
+                }
+            }
+            let count = (*flushed.borrow()).max(signals);
+            merged.send_if_modified(|current| {
+                if *current < count {
+                    *current = count;
+                    true
+                } else {
+                    false
+                }
+            });
+            if merged.is_closed() {
+                break;
+            }
+        }
+    });
+    job
 }
 
 fn failure() -> JobResult {

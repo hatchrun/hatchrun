@@ -45,6 +45,10 @@ use crate::source::Resolver;
 use crate::ssm::Ssm;
 use crate::telemetry::{Machine, Reporter};
 
+/// Defaults shared by the `ci` subcommand and the boot path.
+const DEFAULT_WORK_DIR: &str = "/home/runner/work";
+const DEFAULT_STATE_DIR: &str = "/var/lib/hatchrun-agent";
+
 #[derive(Parser)]
 #[command(version = env!("HATCHRUN_VERSION"), about)]
 struct Args {
@@ -135,7 +139,7 @@ enum Command {
         #[arg(long)]
         user_data: Option<PathBuf>,
         /// Work directory, laid out like GitHub's hosted runners.
-        #[arg(long, default_value = "/home/runner/work")]
+        #[arg(long, default_value = DEFAULT_WORK_DIR)]
         work_dir: PathBuf,
         /// User steps run as. Pass an empty value to keep the agent's user.
         #[arg(long, default_value = "runner")]
@@ -143,11 +147,12 @@ enum Command {
         /// KEY=VALUE file that becomes the steps' environment.
         #[arg(long, default_value = "/etc/environment")]
         env_file: PathBuf,
-        /// Node binary that runs JavaScript actions.
+        /// Node binary that runs JavaScript actions. Without it the
+        /// executor finds node the way `exec` does.
         #[arg(long)]
         node: Option<PathBuf>,
         /// Where the agent keeps what the runner user must not reach.
-        #[arg(long, default_value = "/var/lib/hatchrun-agent")]
+        #[arg(long, default_value = DEFAULT_STATE_DIR)]
         state_dir: PathBuf,
         /// How long to wait for the boot document and for the job to be
         /// ready, each.
@@ -290,6 +295,20 @@ fn ci_options(
     }
 }
 
+/// Options for a CI launch started with no subcommand: the `ci`
+/// subcommand's defaults, with the top-level flags that share a name.
+/// `node` stays unset, as it does for `ci`, so the executor finds it.
+fn boot_ci_options(args: &Args) -> ci::CiOptions {
+    ci_options(
+        Path::new(DEFAULT_WORK_DIR),
+        &args.runner_user,
+        &args.env_file,
+        None,
+        Path::new(DEFAULT_STATE_DIR),
+        args.config_timeout,
+    )
+}
+
 async fn read_user_data(imds_endpoint: &str) -> Result<Vec<u8>> {
     let metadata = Imds::new(imds_endpoint)?;
     metadata
@@ -429,14 +448,7 @@ async fn run(args: Args) -> Result<()> {
     // A launch by the control plane's CI says so in its user data.
     let user_data = metadata.user_data().await.context("read user data")?;
     if source::ci_ticket(user_data.as_deref().unwrap_or_default())?.is_some() {
-        let opts = ci_options(
-            Path::new("/home/runner/work"),
-            &args.runner_user,
-            &args.env_file,
-            None,
-            Path::new("/var/lib/hatchrun-agent"),
-            args.config_timeout,
-        );
+        let opts = boot_ci_options(&args);
         exit_with(ci::run(user_data.unwrap_or_default(), opts).await);
     }
     let region = metadata.region().await?;
@@ -568,5 +580,47 @@ async fn start_reporter(metadata: &Imds, telemetry: source::Telemetry) -> Option
             warn!("not reporting metrics: {err:#}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The boot path and `hatchrun-agent ci` build the same options.
+    #[test]
+    fn boot_path_options_match_the_ci_subcommand() {
+        let boot = boot_ci_options(&Args::parse_from(["hatchrun-agent"]));
+        let args = Args::parse_from(["hatchrun-agent", "ci"]);
+        let Some(Command::Ci {
+            work_dir,
+            runner_user,
+            env_file,
+            node,
+            state_dir,
+            claim_timeout,
+            ..
+        }) = args.command
+        else {
+            panic!("not the ci subcommand");
+        };
+        let ci = ci_options(
+            &work_dir,
+            &runner_user,
+            &env_file,
+            node.as_ref(),
+            &state_dir,
+            claim_timeout,
+        );
+        assert_eq!(boot.claim_timeout, ci.claim_timeout);
+        let (b, c) = (boot.exec, ci.exec);
+        assert_eq!(b.work_dir, c.work_dir);
+        assert_eq!(b.runner_user, c.runner_user);
+        assert_eq!(b.env_file, c.env_file);
+        assert_eq!(b.node, c.node);
+        assert_eq!(b.store, c.store);
+        assert_eq!(b.state_dir, c.state_dir);
+        assert_eq!(b.tool_cache, c.tool_cache);
+        assert_eq!(b.minute, c.minute);
     }
 }

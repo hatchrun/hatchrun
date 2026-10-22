@@ -164,3 +164,55 @@ async fn the_agent_leaves_the_job_level_if_to_the_control_plane() {
     let lines = texts(&posted(&server, EVENTS_PATH).await);
     assert!(lines.iter().any(|line| line == "still-ran"), "{lines:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_cancels_the_job_and_still_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = make::document(vec![make::step("echo ready; sleep 30")]);
+    let server = control_plane(job(&doc)).await;
+    let user_data = dir.path().join("user-data.json");
+    let ticket = json!({"mode": "ci", "broker": server.uri(), "ticket": "t"});
+    std::fs::write(&user_data, ticket.to_string()).unwrap();
+    let env = dir.path().join("environment");
+    std::fs::write(&env, "PATH=/usr/bin:/bin\n").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hatchrun-agent"))
+        .arg("ci")
+        .arg("--user-data")
+        .arg(&user_data)
+        .arg("--work-dir")
+        .arg(dir.path().join("work"))
+        .arg("--state-dir")
+        .arg(dir.path().canonicalize().unwrap().join("state"))
+        .args(["--runner-user", "", "--claim-timeout", "20s"])
+        .arg("--env-file")
+        .arg(&env)
+        .spawn()
+        .unwrap();
+    let mut ready = false;
+    for _ in 0..300 {
+        ready = texts(&posted(&server, EVENTS_PATH).await)
+            .iter()
+            .any(|line| line == "ready");
+        if ready {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(ready, "the step never started");
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let started = std::time::Instant::now();
+    let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
+        .await
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert_eq!(status.code(), Some(1));
+    let results: Vec<JobResult> = posted(&server, RESULT_PATH).await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].conclusion, Conclusion::Cancelled);
+}
