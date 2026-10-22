@@ -387,4 +387,11 @@ Decided by the owner on 2026-10-20.
 - How jobs reach the cache and artifact services that
   `actions/cache` and `actions/upload-artifact` expect. The hatchrun.io
   cache proxy on the runner is the starting point.
-
+- **Organization secrets and vars** (2026-10-24). An organization's
+  secrets and vars reach all of its repositories or a selected list of
+  them.
+- **Environments** (2026-10-24). A repository defines environments
+  with branch patterns and, optionally, admin approval for each attempt
+  of a job that names one. Environments hold their own secrets and
+  vars, which win over repository values, which win over organization
+  values.
