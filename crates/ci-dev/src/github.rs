@@ -8,7 +8,17 @@
 //! so a script may change it between pushes. Check runs are kept in
 //! memory, with the latest name, status and conclusion of each and the
 //! count of annotations sent to it over all its updates. `GET /_state`
-//! lists them.
+//! lists them, with the installations and the repositories whose
+//! config was read and the Polar events.
+//!
+//! Installations 42, 43 and 44 are on organizations `e2e`, `e2e2` and
+//! `e2e3` (ids 1, 2 and 3), and the signed-in user is an admin of each.
+//!
+//! The fake also answers the Polar calls `hatchrun-ci` makes, so
+//! `POLAR_API_URL` may point at it: `POST /v1/events/ingest` keeps the
+//! events (an `external_id` seen before counts as a duplicate, as Polar
+//! does), and `POST /v1/checkouts/` and `POST /v1/customer-sessions/`
+//! answer a URL. Each wants the bearer token [`POLAR_TOKEN`].
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,7 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -25,6 +36,13 @@ use serde_json::{Value, json};
 
 /// A sha the fake answers for any ref: 40 times `e`.
 pub const SHA: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+/// The Polar access token the fake takes.
+pub const POLAR_TOKEN: &str = "e2e-polar-token";
+
+/// The organizations the App is installed on: installation id,
+/// organization id and login.
+const ACCOUNTS: [(u64, u64, &str); 3] = [(42, 1, "e2e"), (43, 2, "e2e2"), (44, 3, "e2e3")];
 
 /// A check run as its last create or update left it.
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +59,8 @@ pub struct CheckRun {
     pub status: String,
     /// Set once completed.
     pub conclusion: Option<String>,
+    /// The last output's summary.
+    pub summary: Option<String>,
     /// The last output's text, where a failed job's log tail goes.
     pub text: Option<String>,
     /// Annotations sent over all updates.
@@ -55,6 +75,12 @@ struct Inner {
     /// The `permissions` of every access token request, in order.
     token_permissions: Vec<Value>,
     check_runs: BTreeMap<u64, CheckRun>,
+    /// The id of every installation read, in order.
+    installation_reads: Vec<u64>,
+    /// `owner/repo` of every config read, in order.
+    contents: Vec<String>,
+    /// The Polar events taken, in order.
+    polar_events: Vec<Value>,
 }
 
 /// The fake's state.
@@ -85,6 +111,7 @@ impl Fake {
 pub fn router(fake: Fake) -> Router {
     Router::new()
         .route("/app/installations/{id}", get(installation))
+        .route("/user/memberships/orgs/{org}", get(membership))
         .route("/app/installations/{id}/access_tokens", post(access_token))
         .route("/installation/token", axum::routing::delete(revoke))
         .route("/repos/{owner}/{repo}", get(repository))
@@ -99,6 +126,9 @@ pub fn router(fake: Fake) -> Router {
             "/repos/{owner}/{repo}/check-runs/{id}",
             patch(update_check_run),
         )
+        .route("/v1/events/ingest", post(polar_ingest))
+        .route("/v1/checkouts/", post(polar_checkout))
+        .route("/v1/customer-sessions/", post(polar_customer_session))
         .route("/_state", get(state))
         .with_state(fake)
 }
@@ -134,10 +164,17 @@ fn now_secs() -> u64 {
 
 /// The installation, as Plan 3's fields say, holding the permissions
 /// the hatchrun App has.
-async fn installation(Path(id): Path<u64>) -> Json<Value> {
+async fn installation(State(fake): State<Fake>, Path(id): Path<u64>) -> Response {
+    fake.lock().installation_reads.push(id);
+    let Some(&(_, org_id, login)) = ACCOUNTS
+        .iter()
+        .find(|(installation, ..)| *installation == id)
+    else {
+        return not_found();
+    };
     Json(json!({
         "id": id,
-        "account": { "id": 1, "login": "e2e", "type": "Organization" },
+        "account": { "id": org_id, "login": login, "type": "Organization" },
         "suspended_at": null,
         "permissions": {
             "contents": "write",
@@ -146,6 +183,33 @@ async fn installation(Path(id): Path<u64>) -> Json<Value> {
             "pull_requests": "write",
         },
     }))
+    .into_response()
+}
+
+/// The signed-in user's membership: an active admin of every
+/// organization in [`ACCOUNTS`].
+async fn membership(Path(org): Path<String>) -> Response {
+    let Some(&(_, org_id, login)) = ACCOUNTS.iter().find(|(.., login)| *login == org) else {
+        return not_found();
+    };
+    Json(json!({
+        "role": "admin",
+        "state": "active",
+        "organization": {
+            "id": org_id,
+            "login": login,
+            "avatar_url": "https://example.invalid/o.png",
+        },
+    }))
+    .into_response()
+}
+
+fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "message": "Not Found" })),
+    )
+        .into_response()
 }
 
 async fn access_token(
@@ -183,7 +247,8 @@ async fn repository() -> Json<Value> {
     )
 }
 
-async fn config(State(fake): State<Fake>) -> Response {
+async fn config(State(fake): State<Fake>, Path((owner, repo)): Path<(String, String)>) -> Response {
+    fake.lock().contents.push(format!("{owner}/{repo}"));
     match tokio::fs::read(fake.repo_dir.join(".hatchrun/config.yml")).await {
         Ok(body) => (
             [(
@@ -193,11 +258,7 @@ async fn config(State(fake): State<Fake>) -> Response {
             body,
         )
             .into_response(),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "message": "Not Found" })),
-        )
-            .into_response(),
+        Err(_) => not_found(),
     }
 }
 
@@ -273,6 +334,9 @@ fn apply(run: &mut CheckRun, body: &Value) {
     if let Some(conclusion) = body.get("conclusion").and_then(Value::as_str) {
         run.conclusion = Some(conclusion.to_owned());
     }
+    if let Some(summary) = body.pointer("/output/summary").and_then(Value::as_str) {
+        run.summary = Some(summary.to_owned());
+    }
     if let Some(text) = body.pointer("/output/text").and_then(Value::as_str) {
         run.text = Some(text.to_owned());
     }
@@ -294,6 +358,7 @@ async fn create_check_run(State(fake): State<Fake>, Json(body): Json<Value>) -> 
         external_id: String::new(),
         status: "queued".to_owned(),
         conclusion: None,
+        summary: None,
         text: None,
         annotations: 0,
         writes: 0,
@@ -310,20 +375,105 @@ async fn update_check_run(
 ) -> Response {
     let mut inner = fake.lock();
     let Some(run) = inner.check_runs.get_mut(&id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "message": "Not Found" })),
-        )
-            .into_response();
+        return not_found();
     };
     apply(run, &body);
     Json(json!({ "id": id })).into_response()
 }
 
+/// Whether the request carries Polar's token.
+fn polar_authorized(headers: &HeaderMap) -> bool {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        == Some(POLAR_TOKEN)
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "detail": "Unauthorized" })),
+    )
+        .into_response()
+}
+
+/// Polar's event ingest: keeps each new event and counts one whose
+/// `external_id` it has as a duplicate.
+async fn polar_ingest(
+    State(fake): State<Fake>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !polar_authorized(&headers) {
+        return unauthorized();
+    }
+    let events = body
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut inner = fake.lock();
+    let (mut inserted, mut duplicates) = (0_u32, 0_u32);
+    for event in events {
+        let id = event.get("external_id");
+        let seen = id.is_some()
+            && inner
+                .polar_events
+                .iter()
+                .any(|kept| kept.get("external_id") == id);
+        if seen {
+            duplicates += 1;
+        } else {
+            inserted += 1;
+            inner.polar_events.push(event);
+        }
+    }
+    Json(json!({ "inserted": inserted, "duplicates": duplicates })).into_response()
+}
+
+/// A checkout for the tenant the body names.
+async fn polar_checkout(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if !polar_authorized(&headers) {
+        return unauthorized();
+    }
+    let tenant = body
+        .get("external_customer_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    (
+        StatusCode::CREATED,
+        Json(json!({ "url": format!("https://polar.invalid/checkout/{tenant}") })),
+    )
+        .into_response()
+}
+
+/// A customer portal session for the tenant the body names.
+async fn polar_customer_session(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if !polar_authorized(&headers) {
+        return unauthorized();
+    }
+    let tenant = body
+        .get("external_customer_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    (
+        StatusCode::CREATED,
+        Json(json!({ "customer_portal_url": format!("https://polar.invalid/portal/{tenant}") })),
+    )
+        .into_response()
+}
+
 async fn state(State(fake): State<Fake>) -> Json<Value> {
     let inner = fake.lock();
     let runs: Vec<&CheckRun> = inner.check_runs.values().collect();
-    Json(json!({ "check_runs": runs, "token_permissions": inner.token_permissions }))
+    Json(json!({
+        "check_runs": runs,
+        "token_permissions": inner.token_permissions,
+        "installation_reads": inner.installation_reads,
+        "contents": inner.contents,
+        "polar_events": inner.polar_events,
+    }))
 }
 
 #[cfg(test)]
@@ -427,7 +577,77 @@ mod tests {
         assert_eq!(run["conclusion"], "success");
         assert_eq!(run["annotations"], 1);
         assert_eq!(run["external_id"], "hatchrun-ci:7");
+        assert_eq!(run["summary"], "s");
+        assert_eq!(state["contents"], json!(["e2e/demo"]));
+        assert_eq!(state["installation_reads"], json!([42]));
         assert_eq!(state["token_permissions"], json!([{ "contents": "read" }]));
+    }
+
+    async fn polar(app: &Router, uri: &str, token: &str, body: Value) -> (u16, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn installations_name_their_organizations() {
+        let app = router(Fake::new(PathBuf::new()));
+        let (_, body) = call(&app, "GET", "/app/installations/43", None).await;
+        let installation: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(installation["account"]["login"], "e2e2");
+        assert_eq!(installation["account"]["id"], 2);
+        let (status, _) = call(&app, "GET", "/app/installations/45", None).await;
+        assert_eq!(status, 404);
+
+        let (_, body) = call(&app, "GET", "/user/memberships/orgs/e2e3", None).await;
+        let membership: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(membership["role"], "admin");
+        assert_eq!(membership["organization"]["id"], 3);
+        let (status, _) = call(&app, "GET", "/user/memberships/orgs/other", None).await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn fake_polar_keeps_events_once_and_wants_the_token() {
+        let app = router(Fake::new(PathBuf::new()));
+        let event = |id: &str| json!({ "name": "ci.usage", "external_id": id });
+        let body = json!({ "events": [event("ci:1:1"), event("ci:2:1")] });
+        let (status, _) = polar(&app, "/v1/events/ingest", "wrong", body.clone()).await;
+        assert_eq!(status, 401);
+        let (status, answer) = polar(&app, "/v1/events/ingest", POLAR_TOKEN, body).await;
+        assert_eq!(status, 200);
+        assert_eq!(answer, json!({ "inserted": 2, "duplicates": 0 }));
+        let again = json!({ "events": [event("ci:2:1"), event("ci:3:1")] });
+        let (_, answer) = polar(&app, "/v1/events/ingest", POLAR_TOKEN, again).await;
+        assert_eq!(answer, json!({ "inserted": 1, "duplicates": 1 }));
+
+        let customer = json!({ "external_customer_id": "t2" });
+        let (status, answer) = polar(&app, "/v1/checkouts/", POLAR_TOKEN, customer.clone()).await;
+        assert_eq!(status, 201);
+        assert_eq!(answer["url"], "https://polar.invalid/checkout/t2");
+        let (_, answer) = polar(&app, "/v1/customer-sessions/", POLAR_TOKEN, customer).await;
+        assert_eq!(
+            answer["customer_portal_url"],
+            "https://polar.invalid/portal/t2"
+        );
+
+        let (_, body) = call(&app, "GET", "/_state", None).await;
+        let state: Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<_> = state["polar_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["external_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["ci:1:1", "ci:2:1", "ci:3:1"]);
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! `hatchrun-ci-dev`: what `hatchrun-ci` needs around it to run on a
 //! developer's machine, used by `crates/ci/scripts/e2e.sh`.
 //!
-//! - `fake-github` answers the GitHub API calls the Worker makes (see
-//!   [`github`]).
+//! - `fake-github` answers the GitHub and Polar API calls the Worker
+//!   makes (see [`github`]).
 //! - `launcher` starts `hatchrun-agent ci` for each instance the
 //!   Worker's `Local` backend asks for (see [`launcher`]).
 //! - `session` prints a new app session, for a script to store in the
@@ -31,7 +31,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve a fake GitHub API.
+    /// Serve a fake GitHub API, which also answers Polar's calls.
     FakeGithub {
         /// The port on 127.0.0.1.
         #[arg(long, default_value_t = 9101)]
