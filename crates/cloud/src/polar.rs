@@ -52,13 +52,22 @@ pub fn product_ids(list: &str) -> Vec<String> {
         .collect()
 }
 
-/// `ci` for the CI product, `runners` for anything else.
+/// `runners` for a product in `runner_ids`, `ci` for the CI product,
+/// `None` for any other product.
 #[must_use]
-pub fn product_kind(product_id: &str, ci_product_id: &str) -> &'static str {
-    if !ci_product_id.is_empty() && product_id == ci_product_id {
-        "ci"
+pub fn product_kind(
+    product_id: &str,
+    runner_ids: &[String],
+    ci_product_id: &str,
+) -> Option<&'static str> {
+    if product_id.is_empty() {
+        None
+    } else if runner_ids.iter().any(|id| id == product_id) {
+        Some("runners")
+    } else if product_id == ci_product_id {
+        Some("ci")
     } else {
-        "runners"
+        None
     }
 }
 
@@ -772,10 +781,13 @@ mod tests {
 
     #[test]
     fn product_kind_names_the_ci_product() {
-        assert_eq!(product_kind("p-ci", "p-ci"), "ci");
-        assert_eq!(product_kind("p-run", "p-ci"), "runners");
-        assert_eq!(product_kind("p-run", ""), "runners");
-        assert_eq!(product_kind("", ""), "runners");
+        let runners = product_ids("p-run, p-run2");
+        assert_eq!(product_kind("p-ci", &runners, "p-ci"), Some("ci"));
+        assert_eq!(product_kind("p-run", &runners, "p-ci"), Some("runners"));
+        assert_eq!(product_kind("p-run2", &runners, ""), Some("runners"));
+        assert_eq!(product_kind("p-ci", &runners, ""), None);
+        assert_eq!(product_kind("p-other", &runners, "p-ci"), None);
+        assert_eq!(product_kind("", &[], ""), None);
     }
 
     #[test]
