@@ -366,13 +366,17 @@ Decided by the owner on 2026-10-20.
   ends, never per log line, and backs off on `403`/`429` with
   `retry-after`.
 - **Billing and abuse.** A card is required before the first job.
-  Each organization gets 500 free minutes a month, at most 5 jobs
-  running at once to start, and a $50 monthly spend cap the customer
-  can raise. Launches past a cap wait in the queue and the check run
+  At most 5 jobs running at once to start, and a $50 monthly spend cap
+  the customer can raise. Launches past a cap wait in the queue and the check run
   says why. The card is the hatchrun.io subscription: CI minutes are
   billed on the same Polar product as runner minutes, through a metered
-  price on the meter that sums the `units` of `ci.usage` events, with
-  500 free units a month as a meter credit. Decided 2026-10-24.
+  price on the meter that sums the `units` of `ci.usage` events.
+  Decided 2026-10-24.
+- **Per-second billing.** Every CI job attempt and every hatchrun.io
+  runner job is billed its seconds rounded up, at least 60. A CI unit
+  is one 2 vCPU second, so 4, 8 and 16 vCPU templates count 2, 4 and 8
+  units a second at $0.002 per 2 vCPU minute; runner time costs $0.001
+  a minute. There is no free allowance. Decided 2026-10-24.
 
 ## Left to the builder
 

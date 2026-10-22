@@ -143,9 +143,9 @@ MARKETPLACE_ARM64_URL = "https://aws.amazon.com/marketplace/pp/prodview-nchg6i6u
 # src/usage.rs. Several products may be listed,
 # separated by commas; checkout offers all of them and answers 503
 # while the list is empty. The product also carries a metered price of
-# $0.002 per unit on the "CI usage" meter (the sum of metadata.units of
-# the "ci.usage" events) and a meter credit of 500 units a month, which
-# bill hatchrun CI on the same subscription. POLAR_API_URL points the
+# 0.003333333333 cents per unit on the "CI usage" meter (the sum of
+# metadata.units of the "ci.usage" events; a unit is one 2 vCPU second),
+# with no meter credit, which bills hatchrun CI on the same subscription. POLAR_API_URL points the
 # Worker at Polar's sandbox (https://sandbox-api.polar.sh).
 POLAR_PRODUCT_ID = "a2dfff6e-1a3a-40fe-b576-70fccd81f694"
 # hatchrun-broker (crates/broker), where launches store runner configs.

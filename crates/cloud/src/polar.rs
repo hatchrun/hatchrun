@@ -172,9 +172,10 @@ pub struct CiUsage<'a> {
     pub tenant: &'a str,
     /// The runner template's label.
     pub template: &'a str,
-    /// The minutes the attempt ran.
-    pub minutes: u64,
-    /// The billing units: the minutes weighted by the template.
+    /// The billed seconds of the attempt, at least 60.
+    pub seconds: u64,
+    /// The billing units: the seconds weighted by the template, one
+    /// unit per 2 vCPU second.
     pub units: u64,
     /// When it completed, ISO 8601.
     pub at: String,
@@ -195,7 +196,7 @@ pub fn ci_ingest(api: &str, token: &str, events: &[CiUsage<'_>]) -> Request {
                 "timestamp": event.at,
                 "metadata": {
                     "units": event.units,
-                    "minutes": event.minutes,
+                    "seconds": event.seconds,
                     "template": event.template,
                 },
             })
@@ -631,8 +632,8 @@ mod tests {
                 attempt: 2,
                 tenant: "abcdefgh12345678",
                 template: "ubuntu-26.04-8core",
-                minutes: 5,
-                units: 20,
+                seconds: 90,
+                units: 360,
                 at: "2026-10-14T10:09:30Z".to_owned(),
             }],
         );
@@ -645,7 +646,7 @@ mod tests {
                 "external_customer_id": "abcdefgh12345678",
                 "external_id": "ci:7:2",
                 "timestamp": "2026-10-14T10:09:30Z",
-                "metadata": { "units": 20, "minutes": 5, "template": "ubuntu-26.04-8core" },
+                "metadata": { "units": 360, "seconds": 90, "template": "ubuntu-26.04-8core" },
             }] })
         );
     }

@@ -659,13 +659,13 @@ until api "runs/$wide_run" | jq -e --arg id "$held" \
 done
 wait_checks "$wide_sha" 6 'all(.status == "completed" and .conclusion == "success")'
 log "wide: all six passed"
-# Each completed job's minutes go to Polar, keyed by job and attempt,
+# Each completed job's billed seconds go to Polar, keyed by job and attempt,
 # on a reconciler pass.
 usage_ids="$(api "runs/$wide_run" | jq -c '[.jobs[] | "ci:\(.id):1"]')"
 deadline=$((SECONDS + 60))
 until curl -fsS "$GITHUB/_state" | jq -e --argjson ids "$usage_ids" --arg tenant "$TENANT" '
   [.polar_events[] | select(.name == "ci.usage" and .external_customer_id == $tenant
-    and .metadata.template == "ubuntu-latest" and .metadata.units >= 1) | .external_id] as $sent
+    and .metadata.template == "ubuntu-latest" and .metadata.seconds >= 60 and .metadata.units == .metadata.seconds) | .external_id] as $sent
   | all($ids[]; . as $id | $sent | index([$id]))
 ' >/dev/null; do
   ((SECONDS < deadline)) || die "Polar lacks usage for $usage_ids: $(curl -fsS "$GITHUB/_state" | jq -c .polar_events)"

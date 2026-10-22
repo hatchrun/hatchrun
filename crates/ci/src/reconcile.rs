@@ -1108,7 +1108,7 @@ fn usage_events(rows: &[store::UnsentUsage]) -> Vec<CiUsage<'_>> {
             attempt: row.attempt,
             tenant: &row.tenant_id,
             template: &row.template,
-            minutes: row.minutes,
+            seconds: row.seconds,
             units: row.units,
             at: hatchrun_cloud::format_rfc3339(row.ended_at),
         })
@@ -1613,13 +1613,13 @@ mod tests {
         }
     }
 
-    fn usage_row(job_id: u64, template: &str, minutes: u64, units: u64) -> store::UnsentUsage {
+    fn usage_row(job_id: u64, template: &str, seconds: u64, units: u64) -> store::UnsentUsage {
         store::UnsentUsage {
             job_id,
             attempt: 2,
             tenant_id: "t1".into(),
             template: template.into(),
-            minutes,
+            seconds,
             units,
             ended_at: NOW,
         }
@@ -1628,14 +1628,15 @@ mod tests {
     #[test]
     fn usage_events_carry_the_units_recorded_at_completion() {
         let rows = [
-            usage_row(7, "ubuntu-26.04-8core", 5, 20),
-            usage_row(8, "retired", 3, 3),
+            usage_row(7, "ubuntu-26.04-8core", 300, 1_200),
+            usage_row(8, "retired", 180, 180),
         ];
         let events = usage_events(&rows);
         assert_eq!((events[0].job_id, events[0].attempt), (7, 2));
-        assert_eq!(events[0].units, 20);
+        assert_eq!(events[0].units, 1_200);
+        assert_eq!(events[0].seconds, 300);
         assert_eq!(events[0].at, "2026-10-22T13:45:00Z");
-        assert_eq!(events[1].units, 3);
+        assert_eq!(events[1].units, 180);
     }
 
     #[allow(clippy::unnecessary_wraps)] // The argument of `judge`.

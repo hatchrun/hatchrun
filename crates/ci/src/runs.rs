@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Diagnostic, Event, FREE_UNITS, JobKind, Plan};
+use hatchrun_workflow::{Diagnostic, Event, JobKind, Plan};
 use serde_json::Value;
 use worker::{Env, Method, RequestInit, Result};
 
@@ -229,10 +229,7 @@ pub fn no_card_check_run(sha: &str, org: &str, app_url: &str) -> CheckRun {
         completed_at: None,
         output: Some(Output {
             title: "hatchrun needs a card".to_owned(),
-            summary: format!(
-                "Add a card for {org} at {page} to run this commit's workflows. \
-                 Each organization gets {FREE_UNITS} free minutes a month."
-            ),
+            summary: format!("Add a card for {org} at {page} to run this commit's workflows."),
             text: None,
             annotations: Vec::new(),
         }),
@@ -557,8 +554,7 @@ mod tests {
         assert_eq!(output.title, "hatchrun needs a card");
         assert_eq!(
             output.summary,
-            "Add a card for acme at https://app.example/o/acme/ci to run this commit's \
-             workflows. Each organization gets 500 free minutes a month."
+            "Add a card for acme at https://app.example/o/acme/ci to run this commit's workflows."
         );
         assert_eq!(output.annotations.len(), 0);
     }

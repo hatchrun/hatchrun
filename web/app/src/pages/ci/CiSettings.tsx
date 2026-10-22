@@ -15,6 +15,7 @@ import {
 } from "@/api";
 import { Await } from "@/components/Status";
 import { useLoad } from "@/load";
+import { runnerTime } from "@/lib/utils";
 import { SecretsTable } from "./SecretsTable";
 
 const dollars = (cents: number) =>
@@ -74,8 +75,8 @@ function BillingCard({ org, billing, onChange }: { org: string; billing: CiBilli
         </p>
       )}
       <dl className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <Figure label="Free minutes used" title={`${billing.minutes.toLocaleString()} runner minutes; larger runners count more`}>
-          {billing.units.toLocaleString()} of {billing.freeUnits.toLocaleString()}
+        <Figure label="Runner time this month" title={`${billing.units.toLocaleString()} units; one unit is one 2 vCPU second`}>
+          {runnerTime(billing.seconds)}
         </Figure>
         <Figure label="Spend this month">{dollars(billing.spendCents)}</Figure>
         <Figure label="Jobs running">

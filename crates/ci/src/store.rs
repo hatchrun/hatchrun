@@ -454,18 +454,19 @@ const FINISH_RUN: &str = "UPDATE ci_runs SET status = 'completed', conclusion = 
 /// Records the usage of attempt `$3` of job `$1`, completed at `$2`,
 /// from the row as the update before it left it: nothing is written
 /// when that update did not apply (another attempt, or a job completed
-/// already), or the job never started or has no template. Minutes run
-/// from start to completion, rounded up, at least one. `$4` is the JSON map of label to price
-/// per minute and `$5` the price of one unit, so the units are those of the
-/// price when the job ended; a label the map lacks records nothing.
+/// already), or the job never started or has no template. Seconds run
+/// from start to completion, rounded up, at least 60. `$4` is the JSON
+/// map of label to price per minute and `$5` the price of one 2 vCPU
+/// minute, so the units (one 2 vCPU second each) are those of the price
+/// when the job ended; a label the map lacks records nothing.
 const RECORD_USAGE: &str = "INSERT INTO ci_usage \
-       (job_id, attempt, tenant_id, template, minutes, units, ended_at) \
+       (job_id, attempt, tenant_id, template, seconds, units, ended_at) \
      SELECT ci_jobs.id, ci_jobs.attempt, ci_runs.tenant_id, ci_jobs.template, \
-       m.minutes, m.minutes * ($4::jsonb ->> ci_jobs.template)::bigint / $5, \
+       s.seconds, s.seconds * ($4::jsonb ->> ci_jobs.template)::bigint / $5, \
        ci_jobs.completed_at \
      FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
-       CROSS JOIN LATERAL (SELECT GREATEST(1, \
-         CEIL((ci_jobs.completed_at - ci_jobs.started_at) / 60000.0))::bigint AS minutes) m \
+       CROSS JOIN LATERAL (SELECT GREATEST(60, \
+         CEIL((ci_jobs.completed_at - ci_jobs.started_at) / 1000.0))::bigint AS seconds) s \
      WHERE ci_jobs.id = $1 AND ci_jobs.attempt = $3 AND ci_jobs.status = 'completed' \
        AND ci_jobs.completed_at = $2 AND ci_jobs.started_at IS NOT NULL \
        AND ($4::jsonb ->> ci_jobs.template) IS NOT NULL \
@@ -478,10 +479,10 @@ const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
          AND subscriptions.status IN ('active', 'trialing')) AS card, \
        COALESCE((SELECT cap_micros FROM ci_spend_caps WHERE tenant_id = tenants.id), $3) \
          AS cap_micros, \
-       COALESCE((SELECT json_agg(json_build_object('template', u.template, 'minutes', u.minutes)) \
-         FROM (SELECT template, SUM(minutes)::bigint AS minutes FROM ci_usage \
+       COALESCE((SELECT json_agg(json_build_object('template', u.template, 'seconds', u.seconds)) \
+         FROM (SELECT template, SUM(seconds)::bigint AS seconds FROM ci_usage \
            WHERE tenant_id = tenants.id AND ended_at >= $2 GROUP BY template) u), \
-         '[]'::json)::text AS minutes_by_template, \
+         '[]'::json)::text AS seconds_by_template, \
        (SELECT count(*) FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
          WHERE ci_runs.tenant_id = tenants.id \
          AND ci_jobs.status IN ('launching', 'launched', 'running'))::bigint AS running \
@@ -506,7 +507,7 @@ const SET_SPEND_CAP: &str = "INSERT INTO ci_spend_caps (tenant_id, cap_micros, u
 
 /// Usage Polar has not taken and has not refused, oldest first, at
 /// most `$1`.
-const UNSENT_USAGE: &str = "SELECT job_id, attempt, tenant_id, template, minutes, units, ended_at \
+const UNSENT_USAGE: &str = "SELECT job_id, attempt, tenant_id, template, seconds, units, ended_at \
      FROM ci_usage WHERE sent_at IS NULL AND rejected_at IS NULL \
      ORDER BY ended_at, job_id, attempt LIMIT $1";
 
@@ -644,39 +645,39 @@ pub struct Standing {
     pub card: bool,
     /// The monthly spend cap in micros: the tenant's own or the default.
     pub cap_micros: u64,
-    /// Minutes metered this month, per template label.
-    pub minutes_by_template: Vec<(String, u64)>,
+    /// Billed seconds metered this month, per template label.
+    pub seconds_by_template: Vec<(String, u64)>,
     /// Jobs launching, launched or running now.
     pub running: u32,
 }
 
-/// What [`STANDING`] returns; the minutes arrive as JSON text.
+/// What [`STANDING`] returns; the seconds arrive as JSON text.
 #[derive(Deserialize)]
 struct StandingRow {
     tenant_id: String,
     org_login: String,
     card: bool,
     cap_micros: u64,
-    minutes_by_template: String,
+    seconds_by_template: String,
     running: u32,
 }
 
 impl StandingRow {
     fn into_standing(self) -> Result<Standing> {
         #[derive(Deserialize)]
-        struct Minutes {
+        struct Seconds {
             template: String,
-            minutes: u64,
+            seconds: u64,
         }
-        let minutes: Vec<Minutes> = serde_json::from_str(&self.minutes_by_template)?;
+        let seconds: Vec<Seconds> = serde_json::from_str(&self.seconds_by_template)?;
         Ok(Standing {
             tenant_id: self.tenant_id,
             org_login: self.org_login,
             card: self.card,
             cap_micros: self.cap_micros,
-            minutes_by_template: minutes
+            seconds_by_template: seconds
                 .into_iter()
-                .map(|m| (m.template, m.minutes))
+                .map(|s| (s.template, s.seconds))
                 .collect(),
             running: self.running,
         })
@@ -755,8 +756,8 @@ pub struct UnsentUsage {
     pub tenant_id: String,
     /// The template's label.
     pub template: String,
-    /// The minutes the attempt ran.
-    pub minutes: u64,
+    /// The billed seconds of the attempt, at least 60.
+    pub seconds: u64,
     /// The billing units, priced when the attempt completed.
     pub units: u64,
     /// When the attempt completed, in milliseconds.
@@ -1289,7 +1290,7 @@ pub async fn heartbeat(db: &Db, job_id: u64, now: u64) -> Result<()> {
 /// `steps` and the key of its finished log. A completed job, and a job
 /// of another attempt, keep what they have; returns whether this call
 /// completed it. In the same transaction a job that was claimed gets
-/// its minutes recorded for this attempt, once.
+/// its seconds recorded for this attempt, once.
 ///
 /// # Errors
 ///
@@ -1316,7 +1317,7 @@ pub async fn finish_job(
                     now,
                     attempt,
                     template_prices(),
-                    templates::UNIT_PRICE_MICROS
+                    templates::UNIT_PRICE_MICROS_PER_MINUTE
                 ],
             ),
         ])
@@ -4145,7 +4146,7 @@ mod tests {
 
     fn usage_rows(db: &TestDb) -> Vec<(u64, u64, String, u64, u64)> {
         db.rows(
-            "SELECT job_id, attempt, template, minutes, ended_at FROM ci_usage \
+            "SELECT job_id, attempt, template, seconds, ended_at FROM ci_usage \
              ORDER BY job_id, attempt",
             &[],
         )
@@ -4156,7 +4157,7 @@ mod tests {
                 row["job_id"].as_u64().unwrap(),
                 row["attempt"].as_u64().unwrap(),
                 row["template"].as_str().unwrap().to_owned(),
-                row["minutes"].as_u64().unwrap(),
+                row["seconds"].as_u64().unwrap(),
                 row["ended_at"].as_u64().unwrap(),
             )
         })
@@ -4177,14 +4178,14 @@ mod tests {
     }
 
     #[test]
-    fn finish_job_records_minutes_from_claim() {
+    fn finish_job_records_seconds_from_claim() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "launching");
         assert!(db.wait(start_job(db.db(), job_id, 10_000)).unwrap());
         assert!(finish(&db, job_id, 1, 71_000));
         assert_eq!(
             usage_rows(&db),
-            [(job_id, 1, "ubuntu-latest".to_owned(), 2, 71_000)]
+            [(job_id, 1, "ubuntu-latest".to_owned(), 61, 71_000)]
         );
     }
 
@@ -4222,7 +4223,7 @@ mod tests {
         let rows = usage_rows(&db);
         assert_eq!(
             rows.iter().map(|r| (r.1, r.3)).collect::<Vec<_>>(),
-            [(1, 1), (2, 2)]
+            [(1, 60), (2, 69)]
         );
     }
 
@@ -4240,10 +4241,19 @@ mod tests {
     }
 
     #[test]
-    fn minutes_round_up_like_usage_minutes() {
+    fn seconds_round_up_with_a_minute_minimum() {
         let db = setup();
+        let units_of = |job_id: u64| -> u64 {
+            db.rows(
+                "SELECT units FROM ci_usage WHERE job_id = $1",
+                &params![job_id],
+            )
+            .unwrap()[0]["units"]
+                .as_u64()
+                .unwrap()
+        };
         let mut got = Vec::new();
-        for (n, ms) in [0_u64, 1, 60_000, 60_001].into_iter().enumerate() {
+        let finished = |n: usize, ms: u64, template: Option<&str>| {
             let run = db
                 .wait(insert_run(db.db(), &new_run(&format!("d{n}"), "ci", 1)))
                 .unwrap()
@@ -4252,28 +4262,31 @@ mod tests {
                 .wait(insert_jobs(db.db(), run.id, &[new_job("build")], 1))
                 .unwrap();
             let job_id = ids[0].1;
+            if let Some(template) = template {
+                db.run(
+                    "UPDATE ci_jobs SET template = $2 WHERE id = $1",
+                    &params![job_id, template],
+                );
+            }
             db.wait(set_job(db.db(), job_id, "launching", None, 2))
                 .unwrap();
             db.wait(start_job(db.db(), job_id, 1_000)).unwrap();
             assert!(finish(&db, job_id, 1, 1_000 + ms));
-            got.push(usage_rows(&db).last().unwrap().3);
+            (job_id, usage_rows(&db).last().unwrap().3)
+        };
+        for (n, ms) in [0_u64, 1, 60_000, 60_001, 61_500].into_iter().enumerate() {
+            let (job_id, seconds) = finished(n, ms, None);
             assert_eq!(
-                got.last().copied().unwrap(),
-                ms.div_ceil(60_000).max(1)
+                seconds,
+                hatchrun_cloud::usage::job_seconds(1_000, 1_000 + ms)
             );
+            // 2 vCPU: one unit a second.
+            assert_eq!(units_of(job_id), seconds);
+            got.push(seconds);
         }
-        assert_eq!(got, [1, 1, 1, 2]);
-        // 2 vCPU: one unit a minute, priced when the job ended.
-        assert!(usage_rows(&db).iter().all(|r| {
-            r.3 == db
-                .rows(
-                    "SELECT units FROM ci_usage WHERE job_id = $1",
-                    &params![r.0],
-                )
-                .unwrap()[0]["units"]
-                .as_u64()
-                .unwrap()
-        }));
+        assert_eq!(got, [60, 60, 60, 61, 62]);
+        let (job_id, seconds) = finished(9, 90_500, Some("ubuntu-26.04-8core"));
+        assert_eq!((seconds, units_of(job_id)), (91, 364));
     }
 
     #[test]
@@ -4285,16 +4298,16 @@ mod tests {
              VALUES ('t2', 2, 'other', 98, 0, 0)",
             &[],
         );
-        for (job, tenant, template, minutes, ended) in [
-            (1, "t1", "ubuntu-latest", 7, month - 1),
-            (2, "t1", "ubuntu-latest", 5, month + DAY),
-            (3, "t1", "ubuntu-26.04-4core", 3, month + 2 * DAY),
-            (4, "t2", "ubuntu-latest", 100, month + DAY),
+        for (job, tenant, template, seconds, ended) in [
+            (1, "t1", "ubuntu-latest", 420, month - 1),
+            (2, "t1", "ubuntu-latest", 300, month + DAY),
+            (3, "t1", "ubuntu-26.04-4core", 180, month + 2 * DAY),
+            (4, "t2", "ubuntu-latest", 6_000, month + DAY),
         ] {
             db.run(
-                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
                  ended_at) VALUES ($1, 1, $2, $3, $4, $4, $5)",
-                &params![job, tenant, template, minutes, ended],
+                &params![job, tenant, template, seconds, ended],
             );
         }
         let (_, first) = run_with_job(&db, "running");
@@ -4306,7 +4319,7 @@ mod tests {
             .wait(standing(db.db(), first, month, default_cap))
             .unwrap()
             .unwrap();
-        standing_t1.minutes_by_template.sort();
+        standing_t1.seconds_by_template.sort();
         assert_eq!(
             standing_t1,
             Standing {
@@ -4314,9 +4327,9 @@ mod tests {
                 org_login: "acme".into(),
                 card: false,
                 cap_micros: default_cap,
-                minutes_by_template: vec![
-                    ("ubuntu-26.04-4core".into(), 3),
-                    ("ubuntu-latest".into(), 5)
+                seconds_by_template: vec![
+                    ("ubuntu-26.04-4core".into(), 180),
+                    ("ubuntu-latest".into(), 300)
                 ],
                 running: 2,
             }
@@ -4343,8 +4356,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            other.minutes_by_template,
-            [("ubuntu-latest".to_owned(), 100)]
+            other.seconds_by_template,
+            [("ubuntu-latest".to_owned(), 6_000)]
         );
         assert_eq!(
             (other.running, other.cap_micros, other.card),
@@ -4374,7 +4387,7 @@ mod tests {
             ))
             .unwrap()
             .unwrap();
-        assert_eq!(empty.minutes_by_template.len(), 0);
+        assert_eq!(empty.seconds_by_template.len(), 0);
     }
 
     #[test]
@@ -4387,14 +4400,14 @@ mod tests {
             (3, None),
         ] {
             db.run(
-                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
-                 ended_at, sent_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 1, 1, 0, $2)",
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
+                 ended_at, sent_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 60, 60, 0, $2)",
                 &params![job, sent],
             );
         }
         db.run(
-            "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
-             ended_at, rejected_at) VALUES (4, 1, 't1', 'ubuntu-latest', 1, 1, 0, $1)",
+            "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
+             ended_at, rejected_at) VALUES (4, 1, 't1', 'ubuntu-latest', 60, 60, 0, $1)",
             &params![now - 91 * DAY],
         );
         db.wait(sweep(db.db(), now)).unwrap();
@@ -4433,8 +4446,8 @@ mod tests {
         let db = setup();
         for (job, attempt, ended) in [(3, 1, 30), (1, 1, 10), (1, 2, 20), (2, 1, 20)] {
             db.run(
-                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, units, \
-                 ended_at) VALUES ($1, $2, 't1', 'ubuntu-latest', 4, 4, $3)",
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
+                 ended_at) VALUES ($1, $2, 't1', 'ubuntu-latest', 240, 240, $3)",
                 &params![job, attempt, ended],
             );
         }
@@ -4444,8 +4457,8 @@ mod tests {
         let all = db.wait(unsent_usage(db.db(), 10)).unwrap();
         assert_eq!(keys(&all), [(1, 1), (1, 2), (2, 1), (3, 1)]);
         assert_eq!(all[0].tenant_id, "t1");
-        assert_eq!(all[0].minutes, 4);
-        assert_eq!(all[0].units, 4);
+        assert_eq!(all[0].seconds, 240);
+        assert_eq!(all[0].units, 240);
         let two = db.wait(unsent_usage(db.db(), 2)).unwrap();
         assert_eq!(keys(&two), [(1, 1), (1, 2)]);
         db.wait(usage_sent(db.db(), &keys(&two), 99)).unwrap();

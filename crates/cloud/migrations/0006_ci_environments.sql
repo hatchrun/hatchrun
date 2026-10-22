@@ -61,3 +61,11 @@ ALTER TABLE usage_events DROP CONSTRAINT usage_events_minutes_check;
 UPDATE usage_events SET seconds = seconds * 60;
 ALTER TABLE usage_events ADD CONSTRAINT usage_events_seconds_check CHECK (seconds >= 60);
 ALTER TABLE tenants DROP COLUMN free_used_up_at;
+
+-- CI attempts are billed per second, at least 60 seconds an attempt;
+-- a unit is one 2 vCPU second. Recorded minutes and units become
+-- seconds.
+ALTER TABLE ci_usage RENAME COLUMN minutes TO seconds;
+ALTER TABLE ci_usage DROP CONSTRAINT ci_usage_minutes_check;
+UPDATE ci_usage SET seconds = seconds * 60, units = units * 60;
+ALTER TABLE ci_usage ADD CONSTRAINT ci_usage_seconds_check CHECK (seconds >= 60);

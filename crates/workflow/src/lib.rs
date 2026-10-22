@@ -43,8 +43,8 @@ pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, config_errors, v
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;
 pub use templates::{
-    Arch, DEFAULT_SPEND_CAP_MICROS, FREE_UNITS, MAX_RUNNING_JOBS, MAX_SPEND_CAP_MICROS,
-    MIN_SPEND_CAP_MICROS, TEMPLATES, Template, UNIT_PRICE_MICROS, dollars, spend_micros, template,
+    Arch, DEFAULT_SPEND_CAP_MICROS, MAX_RUNNING_JOBS, MAX_SPEND_CAP_MICROS, MIN_SPEND_CAP_MICROS,
+    TEMPLATES, Template, UNIT_PRICE_MICROS_PER_MINUTE, dollars, spend_micros, template,
     template_labels,
 };
 pub use trigger::{

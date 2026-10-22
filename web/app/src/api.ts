@@ -664,12 +664,11 @@ export const dispatchWorkflow = (owner: string, repo: string, body: DispatchRequ
 export interface CiBilling {
   /** Whether a card is on file. */
   card: boolean;
-  /** Runner minutes used this month, of every template. */
-  minutes: number;
-  /** Billing units used this month; a 2 vCPU minute is one unit. */
+  /** Billed runner seconds this month, every attempt at least 60. */
+  seconds: number;
+  /** Billing units this month; one unit is one 2 vCPU second. */
   units: number;
-  freeUnits: number;
-  /** This month's cost past the free units, in cents. */
+  /** This month's cost, in cents. */
   spendCents: number;
   /** The monthly spend cap, in whole dollars. */
   capDollars: number;

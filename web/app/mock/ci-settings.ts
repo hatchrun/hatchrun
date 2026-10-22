@@ -8,7 +8,7 @@
 // each reaches), a repository or one of its environments, and a
 // repository's environments.
 // Any organization of the mock tenants answers, and so does the
-// repository demo of each. Billing has a card (the mock Polar checkout adds one), 320 minutes and a $50
+// repository demo of each. Billing has a card (the mock Polar checkout adds one), 19,200 seconds and a $50
 // cap; MOCK_CARD=off drops the card. Values are kept in memory and a
 // secret's is never answered.
 
@@ -85,7 +85,6 @@ function seed(key: string, kind: "secrets" | "vars"): Table {
 
 export const billing = { card: process.env.MOCK_CARD !== "off", capDollars: 50 };
 
-const FREE_UNITS = 500;
 const MAX_BYTES = 48 * 1024;
 const NAME_MAX = 100;
 
@@ -204,13 +203,11 @@ export function handleCiSettings(
   if (what.startsWith("billing")) {
     const sub = what.slice("billing/".length);
     if (what === "billing" && method === "GET") {
-      const minutes = 320;
       json(res, 200, {
         card: billing.card,
-        minutes,
-        units: minutes,
-        freeUnits: FREE_UNITS,
-        spendCents: Math.max(0, minutes - FREE_UNITS) * 0.2,
+        seconds: 19_200,
+        units: 19_200,
+        spendCents: Math.floor((19_200 * 2_000) / 60 / 10_000),
         capDollars: billing.capDollars,
         minCapDollars: 50,
         maxCapDollars: 10_000,
