@@ -29,7 +29,7 @@ const FILE_PAGES: u32 = 3;
 /// Files GitHub lists on a full page.
 const PAGE_SIZE: usize = 100;
 
-const NEVER_SUBSCRIBED: &str = "this organization has no hatchrun CI subscription";
+const NEVER_SUBSCRIBED: &str = "this organization has no card on file for hatchrun";
 
 fn now_ms() -> u64 {
     worker::Date::now().as_millis()
