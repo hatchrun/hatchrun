@@ -82,6 +82,9 @@ export function Environments({ owner, repo }: { owner: string; repo: string }) {
       if (open === row.name) {
         setOpen(null);
       }
+      if (editing && name === row.name) {
+        reset();
+      }
       reload();
     } catch (err) {
       fail(err);
@@ -142,7 +145,8 @@ export function Environments({ owner, repo }: { owner: string; repo: string }) {
         }
       </Await>
       {open !== null && (
-        <div className="flex flex-col gap-6 rounded-md border border-rivet p-4">
+        // Keyed by the environment so a half-typed secret does not carry over to another one.
+        <div key={open} className="flex flex-col gap-6 rounded-md border border-rivet p-4">
           <h3 className="display text-lg">
             <span className="font-mono">{open}</span>
           </h3>

@@ -9,6 +9,32 @@ import { listCiOrgRepos } from "@/api";
 import { Await } from "@/components/Status";
 import { useLoad } from "@/load";
 
+/** The org's repositories as checkboxes. Mounted only while a list is chosen, so the read waits for that. */
+function RepoChecks({ org, value, onChange }: { org: string; value: string[]; onChange: (value: string[]) => void }) {
+  const [repos, reload] = useLoad(() => listCiOrgRepos(org), `${org}/repositories`);
+  const toggle = (name: string) =>
+    onChange(value.includes(name) ? value.filter((seen) => seen !== name) : [...value, name]);
+
+  return (
+    <Await loaded={repos} retry={reload}>
+      {(list) =>
+        list.length === 0 ? (
+          <p className="muted">No repositories have run CI yet.</p>
+        ) : (
+          <div className="check-grid">
+            {list.map((repo) => (
+              <label key={repo.name} className="check">
+                <input type="checkbox" checked={value.includes(repo.name)} onChange={() => toggle(repo.name)} />
+                <span className="font-mono text-sm">{repo.name}</span>
+              </label>
+            ))}
+          </div>
+        )
+      }
+    </Await>
+  );
+}
+
 export function RepoAccess({
   org,
   value,
@@ -22,9 +48,6 @@ export function RepoAccess({
   id?: string;
 }) {
   const selected = value !== null;
-  const [repos, reload] = useLoad(() => listCiOrgRepos(org), `${org}/repositories`);
-  const toggle = (name: string) =>
-    onChange(value === null ? [name] : value.includes(name) ? value.filter((seen) => seen !== name) : [...value, name]);
 
   return (
     <fieldset className="field">
@@ -37,23 +60,9 @@ export function RepoAccess({
         <input type="radio" name={`${id}-scope`} checked={selected} onChange={() => onChange(value ?? [])} />
         Selected repositories
       </label>
-      {selected && (
-        <Await loaded={repos} retry={reload}>
-          {(list) =>
-            list.length === 0 ? (
-              <p className="muted">No repositories have run CI yet.</p>
-            ) : (
-              <div className="check-grid">
-                {list.map((repo) => (
-                  <label key={repo.name} className="check">
-                    <input type="checkbox" checked={value.includes(repo.name)} onChange={() => toggle(repo.name)} />
-                    <span className="font-mono text-sm">{repo.name}</span>
-                  </label>
-                ))}
-              </div>
-            )
-          }
-        </Await>
+      {value !== null && <RepoChecks org={org} value={value} onChange={onChange} />}
+      {value !== null && value.length === 0 && (
+        <p className="field-help">No repository can use this until you select one.</p>
       )}
     </fieldset>
   );

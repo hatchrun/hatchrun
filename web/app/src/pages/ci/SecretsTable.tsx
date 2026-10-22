@@ -49,6 +49,8 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
   const [name, setName] = useState("");
   const [value, setValue] = useState("");
   const [repositories, setRepositories] = useState<string[] | null>(null);
+  // "Selected repositories" with nothing ticked would store a value no repository can use.
+  const noRepository = repositories !== null && repositories.length === 0;
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<Problem | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
@@ -215,7 +217,7 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
           </p>
         )}
         <div>
-          <button type="submit" className="button button-primary" disabled={busy}>
+          <button type="submit" className="button button-primary" disabled={busy || noRepository}>
             {busy ? "Saving" : `Save ${noun}`}
           </button>
         </div>
