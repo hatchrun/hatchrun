@@ -7,6 +7,7 @@
 //! The crate does no I/O and never reads the clock, so the same code runs
 //! in a Cloudflare Worker, the runner agent and the CLI.
 
+pub mod agent;
 pub mod config;
 pub mod convert;
 pub mod diagnostic;

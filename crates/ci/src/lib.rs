@@ -20,6 +20,7 @@
 //! instances. Every other path answers 404.
 
 pub mod store;
+pub mod token;
 
 use worker::{Context, Env, Request, Response, Result, event};
 
