@@ -1880,8 +1880,9 @@ impl std::fmt::Debug for SealedRow {
 /// The organization's (those reaching the repository), repository
 /// `repo_id`'s and (when set) environment `environment_id`'s sealed
 /// secrets, named in `names` or all of them when `None`, ordered by
-/// name, then organization, repository, environment. Every row of a name is returned, so a caller that
-/// inserts them in order lets the most specific win.
+/// name, then organization, repository, environment. Every row of a
+/// name is returned, so a caller that inserts them in order lets the
+/// most specific win.
 ///
 /// # Errors
 ///
