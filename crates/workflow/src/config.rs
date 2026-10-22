@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::diagnostic::Diagnostic;
+use crate::permissions::Permissions;
 use crate::trigger::{Filter, Triggers};
 
 /// Parses a `.hatchrun/config.yml` file.
@@ -239,6 +240,9 @@ pub struct Job {
     /// Values later jobs can read.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub outputs: BTreeMap<String, String>,
+    /// What the job's token may do; replaces the workflow's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Permissions>,
     /// The steps.
     pub steps: Vec<Step>,
 }
@@ -255,6 +259,7 @@ struct JobDe {
     if_: Option<String>,
     timeout_minutes: Option<u32>,
     outputs: BTreeMap<String, String>,
+    permissions: Option<Permissions>,
     steps: Vec<Step>,
     #[serde(rename = "services", deserialize_with = "later_services")]
     _services: (),
@@ -274,6 +279,7 @@ impl Default for JobDe {
             if_: job.if_,
             timeout_minutes: job.timeout_minutes,
             outputs: job.outputs,
+            permissions: job.permissions,
             steps: job.steps,
             _services: (),
             _container: (),
@@ -292,6 +298,7 @@ impl From<JobDe> for Job {
             if_: de.if_,
             timeout_minutes: de.timeout_minutes,
             outputs: de.outputs,
+            permissions: de.permissions,
             steps: de.steps,
         }
     }
@@ -599,6 +606,9 @@ fn single_entry<S: Serializer, V: Serialize + ?Sized>(
 pub struct Workflow {
     /// The events that start the workflow.
     pub on: Triggers,
+    /// What the token of every job without its own `permissions` may do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Permissions>,
     /// The jobs, wired together with `requires`.
     pub jobs: Vec<WorkflowJob>,
 }

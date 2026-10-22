@@ -23,6 +23,7 @@ use crate::config::{
 use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
 use crate::expr::{self, ExprError};
+use crate::permissions::{Level, token_scopes};
 use crate::templates::{Template, template, template_labels};
 use crate::trigger::{Filter, MAX_GLOBS, MAX_PATTERNS, Triggers};
 
@@ -126,6 +127,9 @@ pub struct PlannedJob {
     pub timeout_minutes: u32,
     /// Values later jobs can read.
     pub outputs: BTreeMap<String, String>,
+    /// GitHub App permissions for the job's token, from its
+    /// `permissions:`, else its workflow's, else the read default.
+    pub token_permissions: BTreeMap<String, Level>,
     /// The steps, with commands expanded.
     pub steps: Vec<PlannedStep>,
 }
@@ -728,7 +732,7 @@ fn compile_workflow(
         .jobs
         .iter()
         .zip(&ids)
-        .map(|(entry, id)| expand_entry(config, name, entry, id, budget, &mut planned, errors))
+        .map(|(entry, id)| expand_entry(config, wf, name, entry, id, budget, &mut planned, errors))
         .collect();
     if budget.spent {
         return None;
@@ -956,8 +960,10 @@ fn ref_allows(entry: &WorkflowJob, git_ref: &str) -> bool {
 
 /// Expands one workflow entry into its matrix entries and parallel
 /// nodes, with `requires` left empty.
+#[allow(clippy::too_many_arguments)]
 fn expand_entry(
     config: &Config,
+    wf: &Workflow,
     workflow: &str,
     entry: &WorkflowJob,
     id: &str,
@@ -1029,6 +1035,9 @@ fn expand_entry(
             break;
         };
         base.kind = JobKind::Run { template };
+        if job.permissions.is_none() {
+            base.token_permissions = token_scopes(wf.permissions.as_ref());
+        }
         let Some(jobs) = copy_job(base, combo, id, nodes, &mut walk, errors) else {
             break;
         };
@@ -1284,6 +1293,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         if_: None,
         timeout_minutes: DEFAULT_TIMEOUT_MINUTES,
         outputs: BTreeMap::new(),
+        token_permissions: BTreeMap::new(),
         steps: Vec::new(),
     }]
 }
@@ -1371,6 +1381,7 @@ fn expand_job(
         if_,
         timeout_minutes: job.timeout_minutes.unwrap_or(DEFAULT_TIMEOUT_MINUTES),
         outputs,
+        token_permissions: token_scopes(job.permissions.as_ref()),
         steps,
     })
 }

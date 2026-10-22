@@ -372,6 +372,7 @@ mod tests {
                 if_: None,
                 timeout_minutes: 30,
                 outputs: BTreeMap::new(),
+                token_permissions: BTreeMap::new(),
                 steps: vec![],
             },
             state,

@@ -7,7 +7,8 @@
 use std::fmt::Write as _;
 
 use hatchrun_workflow::{
-    Conversion, Diagnostic, Filter, ParameterKind, Step, convert, parse, to_yaml, validate,
+    Conversion, Diagnostic, Filter, Level, ParameterKind, Permissions, Step, convert, parse,
+    to_yaml, validate,
 };
 use serde_json::{Value, json};
 
@@ -284,7 +285,6 @@ jobs:
     for key in [
         "container",
         "concurrency",
-        "permissions",
         "environment",
         "include",
         "exclude",
@@ -296,17 +296,84 @@ jobs:
             out.warnings
         );
     }
-    for key in ["permissions", "concurrency"] {
-        assert!(
-            out.warnings.iter().any(|w| w.message.contains("ci.yml")
-                && !w.message.contains("build")
-                && w.message.contains(key)),
-            "{key}: {:?}",
-            out.warnings
-        );
-    }
+    assert!(
+        out.warnings.iter().any(|w| w.message.contains("ci.yml")
+            && !w.message.contains("build")
+            && w.message.contains("concurrency")),
+        "{:?}",
+        out.warnings
+    );
     let entry = &out.config.workflows["ci"].jobs[0];
     assert_eq!(entry.matrix["node"], [json!(20), json!(22)]);
+    round_trips(&out);
+}
+
+#[test]
+fn permissions_carry_over() {
+    let out = ok("
+on: push
+permissions: read-all
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - run: x
+  other:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - run: x
+");
+    assert_eq!(out.warnings, Vec::new());
+    assert_eq!(
+        out.config.workflows["ci"].permissions,
+        Some(Permissions::ReadAll)
+    );
+    assert_eq!(
+        out.config.jobs["ci-build"].permissions,
+        Some(Permissions::Scopes(
+            [
+                ("contents".to_owned(), Level::Read),
+                ("pull-requests".to_owned(), Level::Write)
+            ]
+            .into()
+        ))
+    );
+    assert_eq!(
+        out.config.jobs["ci-other"].permissions,
+        Some(Permissions::WriteAll)
+    );
+    round_trips(&out);
+}
+
+#[test]
+fn id_token_is_dropped_with_a_warning() {
+    let out = ok("
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - run: x
+");
+    assert!(
+        has(
+            &out.warnings,
+            &["build", "`id-token` is not supported and was dropped"]
+        ),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(
+        out.config.jobs["ci-build"].permissions,
+        Some(Permissions::Scopes(
+            [("contents".to_owned(), Level::Read)].into()
+        ))
+    );
     round_trips(&out);
 }
 
