@@ -40,6 +40,40 @@ const SECURITY_HEADERS: [(&str, &str); 5] = [
 ];
 /// Secret holding the App's webhook secret.
 const WEBHOOK_SECRET: &str = "GITHUB_WEBHOOK_SECRET";
+/// Service binding to `hatchrun-ci`.
+const CI: &str = "CI";
+
+/// Whether `hatchrun-ci` handles deliveries of `event`.
+fn forwarded(event: &str) -> bool {
+    matches!(event, "push" | "pull_request" | "check_run")
+}
+
+/// Sends the delivery on to `hatchrun-ci` as it came: the same body and
+/// the signature, event and delivery headers. Its answer goes back
+/// unchanged, so a failure there is a failed delivery that GitHub or the
+/// redelivery pass asks for again.
+async fn forward(env: &Env, req: &mut Request) -> Result<Response> {
+    let Ok(ci) = env.service(CI) else {
+        return Ok(
+            Response::from_json(&serde_json::json!({ "ignored": "no CI service" }))?
+                .with_status(202),
+        );
+    };
+    let headers = Headers::new();
+    for name in ["X-Hub-Signature-256", "X-GitHub-Event", "X-GitHub-Delivery"] {
+        if let Some(value) = req.headers().get(name)? {
+            headers.set(name, &value)?;
+        }
+    }
+    headers.set("Content-Type", "application/json")?;
+    let body = req.bytes().await?;
+    let mut init = worker::RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
+    let request = Request::new_with_init("https://ci/github/webhook", &init)?;
+    ci.fetch_request(request).await
+}
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response> {
@@ -163,6 +197,9 @@ async fn record_queued(
 }
 
 async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Result<Response> {
+    if forwarded(&req.headers().get("X-GitHub-Event")?.unwrap_or_default()) {
+        return forward(&env, &mut req).await;
+    }
     let secret = env
         .secret(WEBHOOK_SECRET)
         .map(|secret| secret.to_string())
@@ -309,6 +346,16 @@ fn error(message: &str, status: u16) -> Result<Response> {
 mod tests {
     use super::*;
     use crate::testdb::Db;
+
+    #[test]
+    fn forwards_orchestrator_events() {
+        assert!(forwarded("push"));
+        assert!(forwarded("pull_request"));
+        assert!(forwarded("check_run"));
+        assert!(!forwarded("workflow_job"));
+        assert!(!forwarded("installation"));
+        assert!(!forwarded(""));
+    }
 
     const NOW: u64 = 1_792_140_000_000;
 

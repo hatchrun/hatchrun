@@ -172,9 +172,12 @@ pub struct CheckRun {
     /// which [`update_check_run`] does.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub head_sha: String,
-    /// Names the job again when GitHub sends a re-run request.
+    /// Names the job again when GitHub sends a re-run request. Left out
+    /// of the body when empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub external_id: String,
-    /// Where the app shows the job.
+    /// Where the app shows the job. Left out of the body when empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub details_url: String,
     /// `queued`, `in_progress` or `completed`.
     pub status: String,

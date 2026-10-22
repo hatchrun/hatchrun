@@ -1,0 +1,389 @@
+// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Starts the runs of an event. The webhook, the schedules and manual
+//! dispatch all go through [`create`], so the tenant check holds for
+//! each of them.
+
+use std::fmt::Write as _;
+
+use hatchrun_cloud::db::Db;
+use hatchrun_cloud::fetch::Counted;
+use hatchrun_cloud::tokens::{App, Kv, Tokens};
+use hatchrun_workflow::{Diagnostic, Event, Plan};
+use serde_json::Value;
+use worker::{Env, Method, RequestInit, Result};
+
+use crate::env::{Settings, run_stub};
+use crate::github::{self, CONFIG_PATH, CheckRun, GhAnnotation, Output};
+use crate::intake::{PullRequest, Repo};
+use crate::planning::{self, Selected};
+use crate::run::{RunInfo, Start};
+use crate::store::{self, JobRow, NewJob, NewRun, RunRow};
+
+/// The name of the check run that reports an unusable config.
+pub const CONFIG_CHECK: &str = "hatchrun / config";
+
+/// GitHub takes at most this many annotations in one request.
+const MAX_ANNOTATIONS: usize = 50;
+
+/// Diagnostics beyond this many are left out of the summary.
+const MAX_LISTED: usize = 100;
+
+/// What starts runs.
+pub struct Request<'a> {
+    /// The tenant that owns the repository.
+    pub tenant_id: &'a str,
+    /// The App installation that reaches the repository.
+    pub installation_id: u64,
+    /// The repository.
+    pub repo: &'a Repo,
+    /// The delivery id, or a `schedule:` or `dispatch:` key. A run of
+    /// one delivery and workflow is made once.
+    pub delivery: &'a str,
+    /// `push`, `pull_request`, `schedule` or `workflow_dispatch`.
+    pub event_name: &'a str,
+    /// The webhook payload.
+    pub event: &'a Value,
+    /// What workflows match their triggers against.
+    pub trigger: &'a Event,
+    /// The ref the config is compiled against.
+    pub compile_ref: &'a str,
+    /// The ref the run shows.
+    pub git_ref: &'a str,
+    /// The commit the config is read at and the checks are on.
+    pub sha: &'a str,
+    /// The login that caused the event.
+    pub actor: &'a str,
+    /// The pull request's head branch, empty otherwise.
+    pub head_ref: &'a str,
+    /// The pull request's base branch, empty otherwise.
+    pub base_ref: &'a str,
+}
+
+fn fail(message: impl Into<String>) -> worker::Error {
+    worker::Error::RustError(message.into())
+}
+
+/// The ref a pull request's workflows compile against: its base branch.
+#[must_use]
+pub fn compile_ref_for(pr: &PullRequest) -> String {
+    format!("refs/heads/{}", pr.base_ref)
+}
+
+/// The config at a commit.
+pub enum Config {
+    /// The repository has no config file there.
+    Missing,
+    /// The file, or the reason it cannot be used.
+    Text(std::result::Result<String, Diagnostic>),
+}
+
+/// Reads the config of `repo` at `sha`.
+///
+/// # Errors
+///
+/// No token, GitHub unreachable, or GitHub did not answer with the file
+/// or a 404.
+pub async fn read_config(
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    settings: &Settings,
+    installation_id: u64,
+    repo: &str,
+    sha: &str,
+) -> Result<Config> {
+    let response = tokens
+        .send(installation_id, |token| {
+            github::config_file(&settings.github_api, repo, sha, token)
+        })
+        .await
+        .map_err(|err| fail(err.to_string()))?;
+    match github::config_text(&response) {
+        Ok(None) => Ok(Config::Missing),
+        Ok(Some(text)) => Ok(Config::Text(Ok(text))),
+        // A file GitHub gave us that we cannot use is the author's to fix.
+        Err(message) if response.ok() => Ok(Config::Text(Err(Diagnostic::new(message)))),
+        Err(message) => Err(fail(message)),
+    }
+}
+
+/// The completed check run that reports a config that does not parse or
+/// compile: the diagnostics are its summary and annotations on the
+/// config file.
+#[must_use]
+pub fn invalid_config_check_run(diagnostics: &[Diagnostic], sha: &str) -> CheckRun {
+    let line = |d: &Diagnostic| match (d.line, d.column) {
+        (Some(line), Some(column)) => format!("- line {line}, column {column}: {}", d.message),
+        (Some(line), None) => format!("- line {line}: {}", d.message),
+        _ => format!("- {}", d.message),
+    };
+    let mut summary = format!(
+        "`{CONFIG_PATH}` has {} problem{}, so no workflow started:\n\n",
+        diagnostics.len(),
+        if diagnostics.len() == 1 { "" } else { "s" }
+    );
+    for d in diagnostics.iter().take(MAX_LISTED) {
+        summary.push_str(&line(d));
+        summary.push('\n');
+    }
+    if diagnostics.len() > MAX_LISTED {
+        let _ = writeln!(summary, "- and {} more", diagnostics.len() - MAX_LISTED);
+    }
+    let annotations = diagnostics
+        .iter()
+        .take(MAX_ANNOTATIONS)
+        .map(|d| {
+            let start = u32::try_from(d.line.unwrap_or(1))
+                .unwrap_or(u32::MAX)
+                .max(1);
+            let column = d
+                .line
+                .and(d.column)
+                .map(|c| u32::try_from(c).unwrap_or(u32::MAX).max(1));
+            GhAnnotation {
+                path: CONFIG_PATH.to_owned(),
+                start_line: start,
+                end_line: start,
+                start_column: column,
+                end_column: column,
+                annotation_level: "failure".to_owned(),
+                message: d.message.clone(),
+                title: None,
+            }
+        })
+        .collect();
+    CheckRun {
+        name: CONFIG_CHECK.to_owned(),
+        head_sha: sha.to_owned(),
+        external_id: String::new(),
+        details_url: String::new(),
+        status: "completed".to_owned(),
+        started_at: None,
+        conclusion: Some("failure".to_owned()),
+        completed_at: None,
+        output: Some(Output {
+            title: "Invalid hatchrun config".to_owned(),
+            summary,
+            text: None,
+            annotations,
+        }),
+    }
+}
+
+/// Starts the runs `req` calls for and returns their ids.
+///
+/// Nothing starts for a tenant that is missing or has CI off, or for a
+/// commit without a config. A config that does not parse or compile
+/// gets one failed check run. Each planned workflow becomes a run with
+/// its jobs waiting, and its object is told to start. The same
+/// delivery again finds the runs it made and starts those that did
+/// not start.
+///
+/// # Errors
+///
+/// Postgres, GitHub or the run's object failed; the caller answers 500
+/// and GitHub delivers again.
+pub async fn create(
+    env: &Env,
+    db: &Db,
+    settings: &Settings,
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    req: &Request<'_>,
+    now: u64,
+) -> Result<Vec<u64>> {
+    match store::tenant(db, req.tenant_id).await? {
+        Some(tenant) if tenant.ci_enabled => {}
+        _ => {
+            worker::console_log!("hatchrun CI is not enabled for tenant {}", req.tenant_id);
+            return Ok(Vec::new());
+        }
+    }
+    let source = match read_config(
+        tokens,
+        settings,
+        req.installation_id,
+        &req.repo.full_name,
+        req.sha,
+    )
+    .await?
+    {
+        Config::Missing => return Ok(Vec::new()),
+        Config::Text(Ok(source)) => source,
+        Config::Text(Err(diagnostic)) => {
+            report_invalid(tokens, settings, req, &[diagnostic]).await?;
+            return Ok(Vec::new());
+        }
+    };
+    let plans = match planning::select(&source, req.trigger, req.compile_ref) {
+        Selected::Plans(plans) => plans,
+        Selected::Invalid(diagnostics) => {
+            report_invalid(tokens, settings, req, &diagnostics).await?;
+            return Ok(Vec::new());
+        }
+    };
+    let mut ids = Vec::new();
+    for plan in &plans {
+        ids.push(start_plan(env, db, req, plan, now).await?);
+    }
+    Ok(ids)
+}
+
+async fn report_invalid(
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    settings: &Settings,
+    req: &Request<'_>,
+    diagnostics: &[Diagnostic],
+) -> Result<()> {
+    let check = invalid_config_check_run(diagnostics, req.sha);
+    let response = tokens
+        .send(req.installation_id, |token| {
+            github::create_check_run(&settings.github_api, &req.repo.full_name, token, &check)
+        })
+        .await
+        .map_err(|err| fail(err.to_string()))?;
+    github::check_run_id(&response).map_err(fail)?;
+    Ok(())
+}
+
+/// Records the run of `plan`, with its jobs, and has its object start.
+async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64) -> Result<u64> {
+    let new = NewRun {
+        tenant_id: req.tenant_id.to_owned(),
+        repo_id: req.repo.id,
+        workflow: plan.workflow.clone(),
+        delivery: req.delivery.to_owned(),
+        event: req.event_name.to_owned(),
+        git_ref: req.git_ref.to_owned(),
+        sha: req.sha.to_owned(),
+        actor: req.actor.to_owned(),
+        now,
+    };
+    let run = match store::insert_run(db, &new).await? {
+        Some(run) => run,
+        // An earlier delivery stopped after it recorded the run.
+        None => store::run_for_delivery(db, req.delivery, &plan.workflow)
+            .await?
+            .ok_or_else(|| fail("a run of this delivery vanished"))?,
+    };
+    if run.tenant_id != req.tenant_id || run.repo_id != req.repo.id {
+        return Err(fail(format!(
+            "delivery {} already made run {} for another repository",
+            req.delivery, run.id
+        )));
+    }
+    let mut rows = store::jobs_for_run(db, run.id).await?;
+    if rows.is_empty() {
+        let jobs: Vec<NewJob> = plan
+            .jobs
+            .iter()
+            .map(|job| NewJob {
+                plan_id: job.id.clone(),
+                name: job.name.clone(),
+                timeout_minutes: job.timeout_minutes,
+            })
+            .collect();
+        store::insert_jobs(db, run.id, &jobs, now).await?;
+        rows = store::jobs_for_run(db, run.id).await?;
+    }
+    let start = start_body(req, &run, &rows, plan)?;
+    post_start(env, run.id, &start).await?;
+    Ok(run.id)
+}
+
+/// The body of `POST /start`: each planned job with its row id.
+fn start_body(req: &Request<'_>, run: &RunRow, rows: &[JobRow], plan: &Plan) -> Result<Start> {
+    let jobs = plan
+        .jobs
+        .iter()
+        .map(|job| {
+            rows.iter()
+                .find(|row| row.plan_id == job.id)
+                .map(|row| (row.id, job.clone()))
+                .ok_or_else(|| fail(format!("run {} has no row for job {}", run.id, job.id)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Start {
+        run: RunInfo {
+            run_id: run.id,
+            run_number: run.run_number,
+            run_attempt: run.run_attempt,
+            tenant_id: run.tenant_id.clone(),
+            installation_id: req.installation_id,
+            repo: req.repo.clone(),
+            workflow: run.workflow.clone(),
+            event_name: req.event_name.to_owned(),
+            git_ref: run.git_ref.clone(),
+            sha: run.sha.clone(),
+            actor: run.actor.clone(),
+            head_ref: req.head_ref.to_owned(),
+            base_ref: req.base_ref.to_owned(),
+        },
+        jobs,
+        event: req.event.clone(),
+    })
+}
+
+async fn post_start(env: &Env, run_id: u64, start: &Start) -> Result<()> {
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_body(Some(serde_json::to_string(start)?.into()));
+    let request = worker::Request::new_with_init("https://run/start", &init)?;
+    let response = run_stub(env, run_id)?.fetch_with_request(request).await?;
+    match response.status_code() {
+        200..=299 => Ok(()),
+        status => Err(fail(format!("run {run_id}: start answered {status}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intake::{Trigger, parse};
+
+    #[test]
+    fn config_failure_check_run_lists_diagnostics() {
+        let diagnostics = [
+            Diagnostic {
+                message: "unknown job `x`".into(),
+                file: None,
+                line: Some(3),
+                column: Some(5),
+            },
+            Diagnostic::new("no workflows"),
+        ];
+        let run = invalid_config_check_run(&diagnostics, "abc");
+        assert_eq!(run.name, "hatchrun / config");
+        assert_eq!(run.head_sha, "abc");
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.conclusion.as_deref(), Some("failure"));
+        let output = run.output.unwrap();
+        assert!(output.summary.contains("line 3, column 5: unknown job `x`"));
+        assert!(output.summary.contains("- no workflows"));
+        assert_eq!(output.annotations.len(), 2);
+        let first = &output.annotations[0];
+        assert_eq!(first.path, ".hatchrun/config.yml");
+        assert_eq!((first.start_line, first.end_line), (3, 3));
+        assert_eq!((first.start_column, first.end_column), (Some(5), Some(5)));
+        assert_eq!(first.annotation_level, "failure");
+        let second = &output.annotations[1];
+        assert_eq!((second.start_line, second.start_column), (1, None));
+    }
+
+    #[test]
+    fn config_failure_annotations_stay_within_githubs_limit() {
+        let many: Vec<Diagnostic> = (0..120).map(|i| Diagnostic::new(format!("p{i}"))).collect();
+        let output = invalid_config_check_run(&many, "abc").output.unwrap();
+        assert_eq!(output.annotations.len(), 50);
+        assert!(output.summary.contains("and 20 more"));
+    }
+
+    #[test]
+    fn pull_request_compiles_against_the_base_branch() {
+        let body = include_str!("../testdata/pull_request.json");
+        let Trigger::PullRequest(pr) = parse("pull_request", body.as_bytes()).unwrap() else {
+            panic!("not a pull request");
+        };
+        assert_eq!(compile_ref_for(&pr), "refs/heads/main");
+    }
+}

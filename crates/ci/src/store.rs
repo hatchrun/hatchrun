@@ -186,6 +186,14 @@ const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instan
 const TENANT_FOR_INSTALLATION: &str =
     "SELECT id, ci_enabled FROM tenants WHERE installation_id = $1";
 
+/// Tenant `$1`.
+const TENANT: &str = "SELECT id, ci_enabled FROM tenants WHERE id = $1";
+
+/// The run of delivery `$1` and workflow `$2`, where `{columns}` is
+/// [`RUN_COLUMNS`].
+const RUN_FOR_DELIVERY: &str =
+    "SELECT {columns} FROM ci_runs WHERE delivery = $1 AND workflow = $2";
+
 /// Records repository `$1` of tenant `$2`, installation `$3`, named
 /// `$4` with default branch `$5`, private `$6`, at `$7`; again when it
 /// was renamed or changed.
@@ -375,6 +383,15 @@ pub async fn tenant_for_installation(db: &Db, installation_id: u64) -> Result<Op
         .await
 }
 
+/// Tenant `tenant_id`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn tenant(db: &Db, tenant_id: &str) -> Result<Option<TenantRow>> {
+    db.first(TENANT, &params![tenant_id]).await
+}
+
 /// Records `repo`, or updates it after a rename or a change.
 ///
 /// # Errors
@@ -506,6 +523,20 @@ pub async fn insert_jobs(
         .into_iter()
         .map(|row| (row.plan_id, row.id))
         .collect())
+}
+
+/// The run that `delivery` made for `workflow`, which a redelivery
+/// finds again when the first one stopped before the run started.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn run_for_delivery(db: &Db, delivery: &str, workflow: &str) -> Result<Option<RunRow>> {
+    db.first(
+        &with_columns(RUN_FOR_DELIVERY, RUN_COLUMNS),
+        &params![delivery, workflow],
+    )
+    .await
 }
 
 /// Run `run_id`.
@@ -1394,6 +1425,28 @@ mod tests {
         assert_eq!(
             (again.full_name.as_str(), again.private),
             ("acme/renamed", true)
+        );
+    }
+
+    #[test]
+    fn tenants_are_found_by_id_and_runs_by_delivery() {
+        let db = setup();
+        let found = db.wait(tenant(db.db(), "t1")).unwrap().unwrap();
+        assert_eq!(found.id, "t1");
+        assert!(db.wait(tenant(db.db(), "nope")).unwrap().is_none());
+        let run = db
+            .wait(insert_run(db.db(), &new_run("d1", "ci", 5)))
+            .unwrap()
+            .unwrap();
+        let found = db
+            .wait(run_for_delivery(db.db(), "d1", "ci"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, run.id);
+        assert!(
+            db.wait(run_for_delivery(db.db(), "d1", "lint"))
+                .unwrap()
+                .is_none()
         );
     }
 

@@ -27,12 +27,17 @@ pub mod intake;
 pub mod logs;
 pub mod planning;
 pub mod run;
+pub mod runs;
 pub mod store;
 pub mod token;
+pub mod webhook;
 
-use worker::{Context, Env, Request, Response, Result, event};
+use worker::{Context, Env, Method, Request, Response, Result, event};
 
 #[event(fetch)]
-async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    if req.method() == Method::Post && req.path() == "/github/webhook" {
+        return webhook::handle(req, &env).await;
+    }
     Response::error("not found", 404)
 }

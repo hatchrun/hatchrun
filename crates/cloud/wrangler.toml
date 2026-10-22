@@ -50,6 +50,12 @@ localConnectionString = "postgres://postgres:postgres@localhost:5432/postgres"
 binding = "TOKENS"
 id = "local"
 
+# hatchrun-ci takes the push, pull_request and check_run deliveries
+# (crates/cloud/src/entry.rs forwards them as they came).
+[[services]]
+binding = "CI"
+service = "hatchrun-ci"
+
 # Launches. The webhook sends each queued job here and this Worker's
 # consumer launches it (crates/cloud/src/launches.rs), so a launch
 # outlives the webhook request. Messages that fail max_retries times go
