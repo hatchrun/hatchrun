@@ -392,6 +392,7 @@ mod tests {
             template: Some("ubuntu-latest".into()),
             token_permissions: serde_json::json!({}),
             secret_refs: serde_json::json!({ "all": false, "names": [] }),
+            held: None,
         }
     }
 

@@ -64,6 +64,13 @@ service = "hatchrun-ci"
 binding = "LAUNCHES"
 queue = "hatchrun-launches"
 
+# The CI Worker's launch queue. The Polar webhook sends the held jobs of a
+# tenant whose card came back here (crates/cloud/src/ci_wake.rs); the CI
+# Worker consumes it.
+[[queues.producers]]
+binding = "CI_LAUNCHES"
+queue = "hatchrun-ci-launches"
+
 # Small batches, sent after a second at most, so a runner's start does
 # not wait for other jobs. max_concurrency caps the batches launching at
 # once, and with max_batch_size the launches in flight: 10 batches of 5,

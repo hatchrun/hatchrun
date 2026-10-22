@@ -29,6 +29,7 @@
 //! jobs whose messages ran out of retries.
 
 use futures_util::future::join_all;
+use hatchrun_cloud::ci_wake::{self, Woken};
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::send;
 use hatchrun_cloud::http::Request;
@@ -47,6 +48,7 @@ use crate::billing::{self, HOLD_RECHECK_MS, Hold};
 use crate::env::{Settings, run_stub};
 use crate::launcher::{Backend, LaunchSpec, user_data};
 use crate::reconcile::LAUNCH_QUIET_MS;
+use crate::run::LAUNCHES;
 use crate::store::{self, Claim, JobRow, Standing};
 use crate::token::{self, Claims};
 
@@ -282,6 +284,43 @@ async fn hold_job(
         console_error!("job {}: post held: {answer:?}", job.id);
     }
     Ok(())
+}
+
+/// Sends a launch message for each of `woken`: the consumer checks the
+/// caps again.
+///
+/// # Errors
+///
+/// The queue did not take a message; the ones before it were sent.
+pub(crate) async fn send_wakes(env: &Env, woken: &[Woken]) -> Result<(), String> {
+    let queue = env.queue(LAUNCHES).map_err(|e| e.to_string())?;
+    for job in woken {
+        queue
+            .send(LaunchMessage {
+                job_id: job.job_id,
+                attempt: job.attempt,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// A job of `tenant_id` ended: wakes its oldest job held for the
+/// concurrency cap, which the freed place is for. A failure is logged
+/// and left to the reconciler's backstop, since the job's end is
+/// recorded already.
+pub(crate) async fn wake_oldest(env: &Env, db: &Db, tenant_id: &str) {
+    let woken = match ci_wake::held(db, tenant_id, Hold::Concurrency.as_str(), 1).await {
+        Ok(woken) => woken,
+        Err(err) => {
+            console_error!("tenant {tenant_id}: find the held job: {err}");
+            return;
+        }
+    };
+    if let Err(err) = send_wakes(env, &woken).await {
+        console_error!("tenant {tenant_id}: wake the held job: {err}");
+    }
 }
 
 /// The runner template the job's row names, if it names a known one.
