@@ -369,7 +369,10 @@ Decided by the owner on 2026-10-20.
   Each organization gets 500 free minutes a month, at most 5 jobs
   running at once to start, and a $50 monthly spend cap the customer
   can raise. Launches past a cap wait in the queue and the check run
-  says why.
+  says why. The card is the hatchrun.io subscription: CI minutes are
+  billed on the same Polar product as runner minutes, through a metered
+  price on the meter that sums the `units` of `ci.usage` events, with
+  500 free units a month as a meter credit. Decided 2026-10-24.
 
 ## Left to the builder
 

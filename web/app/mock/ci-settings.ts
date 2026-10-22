@@ -6,7 +6,7 @@
 // shapes of crates/ci/src/settings_api.rs: an organization's billing
 // and the secrets and variables of an organization or a repository.
 // Any organization of the mock tenants answers, and so does the
-// repository demo of each. Billing has a card, 320 minutes and a $50
+// repository demo of each. Billing has a card (the mock Polar checkout adds one), 320 minutes and a $50
 // cap; MOCK_CARD=off drops the card. Values are kept in memory and a
 // secret's is never answered.
 
@@ -48,7 +48,7 @@ function seed(key: string, kind: "secrets" | "vars"): Table {
   return found;
 }
 
-const billing = { card: process.env.MOCK_CARD !== "off", capDollars: 50 };
+export const billing = { card: process.env.MOCK_CARD !== "off", capDollars: 50 };
 
 const FREE_UNITS = 500;
 const MAX_BYTES = 48 * 1024;
@@ -87,7 +87,7 @@ export function handleCiSettings(
   body: unknown,
 ): boolean {
   const found =
-    /^orgs\/([^/]+)\/(billing(?:\/(?:checkout|portal|cap))?|secrets|vars)(?:\/([^/]+))?$/.exec(path) ??
+    /^orgs\/([^/]+)\/(billing(?:\/cap)?|secrets|vars)(?:\/([^/]+))?$/.exec(path) ??
     /^repos\/([^/]+)\/([^/]+)\/(secrets|vars)(?:\/([^/]+))?$/.exec(path);
   if (!found) {
     return false;
@@ -130,15 +130,6 @@ export function handleCiSettings(
         running: 2,
         maxRunning: 5,
       });
-    } else if (sub === "checkout" && method === "POST") {
-      if (billing.card) {
-        json(res, 409, { error: `${owner} already has a CI subscription; change the card or cancel it in the billing portal` });
-      } else {
-        billing.card = true;
-        json(res, 200, { url: `/o/${owner}/ci?checkout=mock` });
-      }
-    } else if (sub === "portal" && method === "POST") {
-      json(res, 200, { url: `/o/${owner}/ci?portal=mock` });
     } else if (sub === "cap" && method === "PUT") {
       const asked = (body as { capDollars?: unknown } | undefined)?.capDollars;
       if (typeof asked !== "number" || !Number.isInteger(asked)) {

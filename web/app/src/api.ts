@@ -209,8 +209,11 @@ export const createTenant = (installationId: number) => post<Tenant>("/api/tenan
 
 const tenantPath = (org: string) => `/api/tenants/${encodeURIComponent(org)}`;
 export const getPlan = () => get<Plans>("/api/plan");
-export const startCheckout = (org: string) => post<{ url: string }>(`${tenantPath(org)}/checkout`);
-export const openPortal = (org: string) => post<{ url: string }>(`${tenantPath(org)}/portal`);
+// `back` sends Polar's return to the CI page instead of Settings.
+export const startCheckout = (org: string, back?: "ci") =>
+  post<{ url: string }>(`${tenantPath(org)}/checkout${back ? "?return=ci" : ""}`);
+export const openPortal = (org: string, back?: "ci") =>
+  post<{ url: string }>(`${tenantPath(org)}/portal${back ? "?return=ci" : ""}`);
 export const redeemInvite = (org: string, code: string) => post<Tenant>(`${tenantPath(org)}/beta`, { code });
 
 export interface AwsRegion {
@@ -703,10 +706,6 @@ async function adminOnly<T>(call: () => Promise<T>): Promise<T> {
 }
 
 export const getCiBilling = (org: string) => adminOnly(() => get<CiBilling>(`${orgCiPath(org)}/billing`));
-export const startCiCheckout = (org: string) =>
-  adminOnly(() => post<{ url: string }>(`${orgCiPath(org)}/billing/checkout`));
-export const openCiPortal = (org: string) =>
-  adminOnly(() => post<{ url: string }>(`${orgCiPath(org)}/billing/portal`));
 export const setCiCap = (org: string, capDollars: number) =>
   adminOnly(() => put<undefined>(`${orgCiPath(org)}/billing/cap`, { capDollars }));
 

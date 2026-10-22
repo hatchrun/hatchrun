@@ -8,9 +8,9 @@ import { useState, type FormEvent } from "react";
 
 import {
   getCiBilling,
-  openCiPortal,
+  openPortal,
   setCiCap,
-  startCiCheckout,
+  startCheckout,
   type CiBilling,
 } from "@/api";
 import { Await } from "@/components/Status";
@@ -40,7 +40,7 @@ function BillingCard({ org, billing, onChange }: { org: string; billing: CiBilli
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Both buttons leave for Polar, which returns to this page.
+  // Both buttons leave for the hatchrun.io checkout or portal, which return to this page.
   const go = async (open: (org: string) => Promise<{ url: string }>) => {
     setBusy(true);
     setError(null);
@@ -56,14 +56,14 @@ function BillingCard({ org, billing, onChange }: { org: string; billing: CiBilli
     <div className="card panel flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p>
-          {billing.card ? "A card is on file." : "No card on file. Jobs wait until you add one."}
+          {billing.card ? "A card is on file." : "Add a card to run CI jobs. Jobs wait until you do."}
         </p>
         {billing.card ? (
-          <button type="button" className="button" disabled={busy} onClick={() => void go(openCiPortal)}>
+          <button type="button" className="button" disabled={busy} onClick={() => void go((o) => openPortal(o, "ci"))}>
             Manage billing
           </button>
         ) : (
-          <button type="button" className="button button-primary" disabled={busy} onClick={() => void go(startCiCheckout)}>
+          <button type="button" className="button button-primary" disabled={busy} onClick={() => void go((o) => startCheckout(o, "ci"))}>
             Add a card
           </button>
         )}

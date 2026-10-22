@@ -11,6 +11,7 @@ import type { Plugin } from "vite";
 
 import type { Job, ListedRun, Run } from "../src/api.ts";
 import { handleCi, serveLiveSockets } from "./ci.ts";
+import { billing as ciBilling } from "./ci-settings.ts";
 import * as profiles from "./runners.ts";
 
 interface MockTenant {
@@ -164,7 +165,7 @@ const routes: Record<string, Handler> = {
         ],
   "POST /api/tenants/:org/checkout": (_req, url) => {
     const org = url.pathname.split("/")[3] ?? "";
-    return [200, { url: `/api/mock/polar?org=${org}` }];
+    return [200, { url: `/api/mock/polar?org=${org}${url.searchParams.get("return") === "ci" ? "&return=ci" : ""}` }];
   },
   "GET /api/mock/polar": (_req, url) => {
     const org = url.searchParams.get("org") ?? "";
@@ -175,9 +176,16 @@ const routes: Record<string, Handler> = {
         tenant.subscription = { status: "active", currentPeriodEnd: end, cancelAtPeriodEnd: false };
       }, 4000);
     }
+    if (url.searchParams.get("return") === "ci") {
+      ciBilling.card = true;
+      return `/o/${org}/ci?checkout=mock`;
+    }
     return `/o/${org}/settings?checkout=mock`;
   },
-  "POST /api/tenants/:org/portal": (_req, url) => [200, { url: `/o/${url.pathname.split("/")[3]}?portal=mock` }],
+  "POST /api/tenants/:org/portal": (_req, url) => {
+    const org = url.pathname.split("/")[3];
+    return [200, { url: url.searchParams.get("return") === "ci" ? `/o/${org}/ci?portal=mock` : `/o/${org}?portal=mock` }];
+  },
   "POST /api/tenants/:org/beta": (_req, url, body) => {
     const tenant = findTenant(url.pathname.split("/")[3] ?? "");
     if (!tenant) {
