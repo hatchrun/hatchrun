@@ -27,12 +27,15 @@ CREATE TABLE ci_usage (
   tenant_id text NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
   template text NOT NULL,
   minutes bigint NOT NULL CHECK (minutes > 0),
+  units bigint NOT NULL CHECK (units >= 0), -- priced when the job completed
   ended_at bigint NOT NULL,
   sent_at bigint,                          -- when Polar took it
+  rejected_at bigint,                      -- when Polar refused it for good
+  reject_reason text,
   PRIMARY KEY (job_id, attempt)
 );
 CREATE INDEX ci_usage_month ON ci_usage (tenant_id, ended_at);
-CREATE INDEX ci_usage_unsent ON ci_usage (ended_at) WHERE sent_at IS NULL;
+CREATE INDEX ci_usage_unsent ON ci_usage (ended_at) WHERE sent_at IS NULL AND rejected_at IS NULL;
 
 -- The monthly spend cap an owner raised above the default.
 CREATE TABLE ci_spend_caps (

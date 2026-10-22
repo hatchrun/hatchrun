@@ -38,10 +38,11 @@ use hatchrun_cloud::aws::instances::Described;
 use hatchrun_cloud::ci_wake::{self, Woken};
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::{Counted, send};
+use hatchrun_cloud::http::Response;
 use hatchrun_cloud::parse_rfc3339;
-use hatchrun_cloud::polar::{CiUsage, INGEST_BATCH, ci_ingest, ingested};
+use hatchrun_cloud::polar::{CI_INGEST_BATCH, CiUsage, ci_ingest, ingested};
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, UtcMinute, templates};
+use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, UtcMinute};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
@@ -820,8 +821,8 @@ async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), Str
 /// Of one ingest call to Polar.
 const INGEST_COST: u32 = 1;
 
-/// The events of `rows`, in their order. A label that names no template
-/// carries no units.
+/// The events of `rows`, in their order, with the units priced when the
+/// attempt completed.
 fn usage_events(rows: &[store::UnsentUsage]) -> Vec<CiUsage<'_>> {
     rows.iter()
         .map(|row| CiUsage {
@@ -830,16 +831,73 @@ fn usage_events(rows: &[store::UnsentUsage]) -> Vec<CiUsage<'_>> {
             tenant: &row.tenant_id,
             template: &row.template,
             minutes: row.minutes,
-            units: templates::template(&row.template).map_or(0, |t| t.units(row.minutes)),
+            units: row.units,
             at: hatchrun_cloud::format_rfc3339(row.ended_at),
         })
         .collect()
 }
 
-/// Step 6. Sends up to [`INGEST_BATCH`] unsent usage rows to Polar in
-/// one call, and marks them sent only when Polar took every event. Each
-/// event is keyed by job and attempt, so a batch sent again after a
-/// lost answer is counted once. Without a Polar token nothing is sent.
+/// What Polar's answer to a batch of `sent` events means.
+#[derive(Debug, PartialEq, Eq)]
+enum Ingest {
+    /// Polar took every event, new or duplicate.
+    Taken,
+    /// Polar refused the batch for what is in it: split it.
+    Refused(String),
+    /// Nothing says the events are at fault (a transport error, a 429,
+    /// a 5xx, or the token): send the same batch again later.
+    Retry(String),
+}
+
+/// Reads the answer to a batch of `sent` events. A 2xx that took fewer
+/// events than were sent counts as a refusal. A 4xx is a refusal
+/// except 401, 403, 408 and 429, which are about the caller.
+fn judge(answer: &Result<Response, String>, sent: usize) -> Ingest {
+    let response = match answer {
+        Ok(response) => response,
+        Err(err) => return Ingest::Retry(err.clone()),
+    };
+    match response.status {
+        200..=299 => match ingested(response) {
+            Ok(taken) if usize::try_from(taken).ok() == Some(sent) => Ingest::Taken,
+            Ok(taken) => Ingest::Refused(format!("Polar took {taken} of {sent} events")),
+            Err(err) => Ingest::Refused(err),
+        },
+        401 | 403 | 408 | 429 => Ingest::Retry(format!("Polar answered {}", response.status)),
+        400..=499 => Ingest::Refused(format!(
+            "Polar answered {}: {}",
+            response.status,
+            response.text().chars().take(300).collect::<String>()
+        )),
+        status => Ingest::Retry(format!("Polar answered {status}")),
+    }
+}
+
+/// What to do with a refused batch of `rows`.
+#[derive(Debug, PartialEq, Eq)]
+enum Split {
+    /// Send each half on its own.
+    Halves(std::ops::Range<usize>, std::ops::Range<usize>),
+    /// A single row is the one Polar refuses.
+    Bad(usize),
+}
+
+fn split(rows: &std::ops::Range<usize>) -> Split {
+    if rows.len() <= 1 {
+        return Split::Bad(rows.start);
+    }
+    let middle = rows.start + rows.len() / 2;
+    Split::Halves(rows.start..middle, middle..rows.end)
+}
+
+/// Step 6. Sends up to [`CI_INGEST_BATCH`] unsent usage rows to Polar
+/// and marks them sent only when Polar took them. Each event is keyed
+/// by job and attempt, so a batch sent again after a lost answer is
+/// counted once. A batch Polar refuses for its content is split until
+/// the refused rows are alone; those are quarantined with Polar's
+/// reason and never sent again. A transport error, a 429 or a 5xx ends
+/// the step and the next pass sends the rest again. Without a Polar
+/// token nothing is sent.
 async fn report_usage(
     db: &Db,
     settings: &Settings,
@@ -849,28 +907,58 @@ async fn report_usage(
     if settings.polar_token.is_empty() || !budget.take(INGEST_COST) {
         return Ok(());
     }
-    let limit = u32::try_from(INGEST_BATCH).unwrap_or(u32::MAX);
+    let limit = u32::try_from(CI_INGEST_BATCH).unwrap_or(u32::MAX);
     let rows = store::unsent_usage(db, limit)
         .await
         .map_err(|e| e.to_string())?;
-    if rows.is_empty() {
-        return Ok(());
+    let keys = |range: &std::ops::Range<usize>| -> Vec<(u64, u32)> {
+        rows[range.clone()]
+            .iter()
+            .map(|r| (r.job_id, r.attempt))
+            .collect()
+    };
+    let mut pending = std::iter::once(0..rows.len()).collect::<Vec<_>>();
+    let mut first = true;
+    while let Some(range) = pending.pop() {
+        if range.is_empty() {
+            continue;
+        }
+        if !std::mem::take(&mut first) && !budget.take(INGEST_COST) {
+            break;
+        }
+        let events = usage_events(&rows[range.clone()]);
+        let answer = send(&ci_ingest(
+            &settings.polar_api,
+            &settings.polar_token,
+            &events,
+        ))
+        .await;
+        match judge(&answer, range.len()) {
+            Ingest::Taken => store::usage_sent(db, &keys(&range), now)
+                .await
+                .map_err(|e| e.to_string())?,
+            Ingest::Retry(err) => return Err(err),
+            Ingest::Refused(reason) => match split(&range) {
+                Split::Halves(left, right) => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+                Split::Bad(at) => {
+                    let row = &rows[at];
+                    console_error!(
+                        "reconcile: usage of job {} attempt {} (tenant {}) quarantined: {reason}",
+                        row.job_id,
+                        row.attempt,
+                        row.tenant_id
+                    );
+                    store::usage_rejected(db, &[(row.job_id, row.attempt)], &reason, now)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            },
+        }
     }
-    let events = usage_events(&rows);
-    let response = send(&ci_ingest(
-        &settings.polar_api,
-        &settings.polar_token,
-        &events,
-    ))
-    .await?;
-    let taken = ingested(&response)?;
-    if usize::try_from(taken).ok() != Some(rows.len()) {
-        return Err(format!("Polar took {taken} of {} usage events", rows.len()));
-    }
-    let keys: Vec<(u64, u32)> = rows.iter().map(|r| (r.job_id, r.attempt)).collect();
-    store::usage_sent(db, &keys, now)
-        .await
-        .map_err(|e| e.to_string())
+    Ok(())
 }
 
 async fn purge(env: &Env, run_id: u64) -> worker::Result<()> {
@@ -1172,31 +1260,93 @@ mod tests {
         }
     }
 
+    fn usage_row(job_id: u64, template: &str, minutes: u64, units: u64) -> store::UnsentUsage {
+        store::UnsentUsage {
+            job_id,
+            attempt: 2,
+            tenant_id: "t1".into(),
+            template: template.into(),
+            minutes,
+            units,
+            ended_at: NOW,
+        }
+    }
+
     #[test]
-    fn usage_events_carry_units() {
+    fn usage_events_carry_the_units_recorded_at_completion() {
         let rows = [
-            store::UnsentUsage {
-                job_id: 7,
-                attempt: 2,
-                tenant_id: "t1".into(),
-                template: "ubuntu-26.04-8core".into(),
-                minutes: 5,
-                ended_at: NOW,
-            },
-            store::UnsentUsage {
-                job_id: 8,
-                attempt: 1,
-                tenant_id: "t1".into(),
-                template: "retired".into(),
-                minutes: 3,
-                ended_at: NOW,
-            },
+            usage_row(7, "ubuntu-26.04-8core", 5, 20),
+            usage_row(8, "retired", 3, 3),
         ];
         let events = usage_events(&rows);
         assert_eq!((events[0].job_id, events[0].attempt), (7, 2));
         assert_eq!(events[0].units, 20);
         assert_eq!(events[0].at, "2026-10-22T13:45:00Z");
-        assert_eq!(events[1].units, 0);
+        assert_eq!(events[1].units, 3);
+    }
+
+    #[allow(clippy::unnecessary_wraps)] // The argument of `judge`.
+    fn answer(status: u16, body: &str) -> Result<Response, String> {
+        Ok(Response {
+            status,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        })
+    }
+
+    #[test]
+    fn polars_answer_decides_between_split_and_retry() {
+        let taken = answer(200, r#"{"inserted":2,"duplicates":1}"#);
+        assert_eq!(judge(&taken, 3), Ingest::Taken);
+        assert!(matches!(judge(&taken, 4), Ingest::Refused(_)));
+        for status in [400, 404, 409, 413, 422] {
+            assert!(
+                matches!(judge(&answer(status, "bad"), 3), Ingest::Refused(_)),
+                "{status}"
+            );
+        }
+        for status in [401, 403, 408, 429, 500, 502, 503] {
+            assert!(
+                matches!(judge(&answer(status, ""), 3), Ingest::Retry(_)),
+                "{status}"
+            );
+        }
+        assert!(matches!(
+            judge(&Err("connection reset".into()), 3),
+            Ingest::Retry(_)
+        ));
+    }
+
+    #[test]
+    fn a_refused_batch_splits_down_to_the_bad_row() {
+        assert_eq!(split(&(0..5)), Split::Halves(0..2, 2..5));
+        assert_eq!(split(&(2..4)), Split::Halves(2..3, 3..4));
+        assert_eq!(split(&(3..4)), Split::Bad(3));
+        // Polar refuses any batch that holds row 6 of 8: the search
+        // isolates it and takes the rest.
+        let bad = 6;
+        let (mut taken, mut quarantined, mut calls) = (Vec::new(), Vec::new(), 0);
+        let mut pending = std::iter::once(0..8).collect::<Vec<_>>();
+        while let Some(range) = pending.pop() {
+            calls += 1;
+            if range.contains(&bad) {
+                match split(&range) {
+                    Split::Halves(left, right) => {
+                        pending.push(right);
+                        pending.push(left);
+                    }
+                    Split::Bad(at) => quarantined.push(at),
+                }
+            } else {
+                taken.extend(range);
+            }
+        }
+        taken.sort_unstable();
+        assert_eq!(taken, [0, 1, 2, 3, 4, 5, 7]);
+        assert_eq!(quarantined, [6]);
+        assert!(calls <= 2 * 3 + 1, "{calls}");
+        // A full batch with one bad row fits the usage share.
+        assert!(2 * 7 < shares(BUDGET).usage);
     }
 
     #[test]

@@ -179,8 +179,8 @@ pub async fn resolve(
     }
 }
 
-/// What GitHub's answer to the membership call means for an admin
-/// check at `now_secs`.
+/// What GitHub's answer to the membership call means at `now_secs`:
+/// the id of the organization when the user is an active admin of it.
 ///
 /// # Errors
 ///
@@ -188,28 +188,38 @@ pub async fn resolve(
 pub fn admin_verdict(
     response: &hatchrun_cloud::http::Response,
     now_secs: u64,
-) -> Result<bool, Failure> {
+) -> Result<Option<u64>, Failure> {
     if let Some(wait) = github::throttle(response, now_secs, 0) {
         return Err(Failure::Retry(wait));
     }
     // 403: the token or the App cannot see the organization's members.
     // Neither says the user is an admin.
     if response.status == 403 {
-        return Ok(false);
+        return Ok(None);
     }
     hatchrun_cloud::github::parse_membership(response)
-        .map(|membership| membership.is_some_and(|m| m.is_admin()))
+        .map(|membership| {
+            membership
+                .filter(hatchrun_cloud::github::Membership::is_admin)
+                .map(|m| m.organization.id)
+        })
         .map_err(|err| Failure::Worker(worker::Error::RustError(format!("membership: {err}"))))
 }
 
-/// Whether the session's user is an active admin of `org`, by GitHub's
-/// word on every call.
+/// The id of the GitHub organization `org` when the session's user is
+/// an active admin of it, by GitHub's word on every call. A login can
+/// name another organization than a tenant once knew, so callers find
+/// the tenant by this id and never by the login.
 ///
 /// # Errors
 ///
 /// The call to GitHub failed, or GitHub asks to wait. The caller never
 /// reads that as "not an admin".
-pub async fn org_admin(settings: &Settings, session: &Session, org: &str) -> Result<bool, Failure> {
+pub async fn org_admin(
+    settings: &Settings,
+    session: &Session,
+    org: &str,
+) -> Result<Option<u64>, Failure> {
     let request = hatchrun_cloud::github::membership(&settings.github_api, &session.token, org);
     let response = send(&request).await.map_err(|err| {
         Failure::Worker(worker::Error::RustError(format!(
@@ -325,21 +335,33 @@ mod tests {
     }
 
     #[test]
-    fn only_an_active_admin_passes() {
-        let ok = |role: &str, state: &str| {
+    fn only_an_active_admin_passes_and_names_the_organization() {
+        let ok = |role: &str, state: &str, id: u64| {
             answer(
                 200,
                 &[],
                 &format!(
-                    r#"{{"role":"{role}","state":"{state}","organization":{{"id":1,"login":"acme","avatar_url":""}}}}"#
+                    r#"{{"role":"{role}","state":"{state}","organization":{{"id":{id},"login":"acme","avatar_url":""}}}}"#
                 ),
             )
         };
-        assert!(admin_verdict(&ok("admin", "active"), 0).unwrap());
-        assert!(!admin_verdict(&ok("member", "active"), 0).unwrap());
-        assert!(!admin_verdict(&ok("admin", "pending"), 0).unwrap());
-        assert!(!admin_verdict(&answer(404, &[], ""), 0).unwrap());
-        assert!(!admin_verdict(&answer(403, &[], "Resource not accessible"), 0).unwrap());
+        assert_eq!(
+            admin_verdict(&ok("admin", "active", 42), 0).unwrap(),
+            Some(42)
+        );
+        // A new organization that reuses a login has another id, so it
+        // cannot match the tenant of the old one.
+        assert_ne!(
+            admin_verdict(&ok("admin", "active", 43), 0).unwrap(),
+            Some(42)
+        );
+        assert_eq!(admin_verdict(&ok("member", "active", 42), 0).unwrap(), None);
+        assert_eq!(admin_verdict(&ok("admin", "pending", 42), 0).unwrap(), None);
+        assert_eq!(admin_verdict(&answer(404, &[], ""), 0).unwrap(), None);
+        assert_eq!(
+            admin_verdict(&answer(403, &[], "Resource not accessible"), 0).unwrap(),
+            None
+        );
         assert!(matches!(
             admin_verdict(&answer(429, &[], ""), 1000),
             Err(Failure::Retry(60))
