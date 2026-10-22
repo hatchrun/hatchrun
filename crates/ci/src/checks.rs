@@ -11,7 +11,7 @@
 //! queue of states: a job marked many times while GitHub throttles us
 //! sends its latest state once.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use hatchrun_workflow::{Annotation, AnnotationLevel, Conclusion, StepSummary};
@@ -20,8 +20,17 @@ use serde::{Deserialize, Serialize};
 use crate::github::{CheckRun, GhAnnotation, Output, rfc3339};
 use crate::graph::{Node, State};
 
-/// The most annotations with a file sent for one job attempt.
+/// The most annotations with a file in one request (GitHub's limit).
 pub const MAX_ANNOTATIONS: usize = 50;
+
+/// The most annotations with a file sent for one job attempt, which
+/// bounds the API calls a noisy job can cause.
+pub const MAX_TOTAL_ANNOTATIONS: usize = 500;
+
+/// GitHub's limit on `output.summary` and `output.text`, in characters.
+pub const MAX_OUTPUT_CHARS: usize = 65_535;
+
+const TRUNCATED: &str = "\n\n(truncated)";
 
 /// The last lines of a failed job shown in the check run.
 pub const TAIL_LINES: usize = 50;
@@ -103,8 +112,20 @@ fn duration(ms: u64) -> String {
     format!("{}m {}s", secs / 60, secs % 60)
 }
 
+/// `text` cut to `max` characters, ending in a marker when it was cut.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let keep = max.saturating_sub(TRUNCATED.chars().count());
+    let end = text.char_indices().nth(keep).map_or(text.len(), |(i, _)| i);
+    format!("{}{TRUNCATED}", &text[..end])
+}
+
 fn cell(text: &str) -> String {
-    text.replace('|', "\\|").replace(['\n', '\r'], " ")
+    text.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\n', '\r'], " ")
 }
 
 fn level_word(level: AnnotationLevel) -> &'static str {
@@ -119,8 +140,8 @@ fn level_word(level: AnnotationLevel) -> &'static str {
 #[must_use]
 pub fn annotation(a: &Annotation) -> Option<GhAnnotation> {
     let path = a.file.clone()?;
-    let start_line = a.line.unwrap_or(1);
-    let end_line = a.end_line.unwrap_or(start_line);
+    let start_line = a.line.unwrap_or(1).max(1);
+    let end_line = a.end_line.unwrap_or(start_line).max(start_line);
     let one_line = start_line == end_line;
     Some(GhAnnotation {
         path,
@@ -145,8 +166,11 @@ pub fn annotation(a: &Annotation) -> Option<GhAnnotation> {
 /// Each PATCH replaces `output.summary`, so annotations without a file
 /// are listed in it every time. GitHub appends the annotations of each
 /// request to the ones it has, so only those with a file past
-/// `file_annotations_sent` go in `output.annotations`, and no more than
-/// [`MAX_ANNOTATIONS`] are ever sent.
+/// `file_annotations_sent` go in `output.annotations`, at most
+/// [`MAX_ANNOTATIONS`] per request. The caller sends again while the
+/// returned count is below the number of annotations with a file, up to
+/// [`MAX_TOTAL_ANNOTATIONS`]; the summary says how many were left out
+/// past that. Summary and text are cut to [`MAX_OUTPUT_CHARS`].
 #[must_use]
 pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
     let (status, conclusion, title) = match view.node.state {
@@ -191,7 +215,9 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
         .iter()
         .filter(|a| a.file.is_none())
         .collect();
-    if !loose.is_empty() {
+    let with_file: Vec<GhAnnotation> = view.annotations.iter().filter_map(annotation).collect();
+    let left_out = with_file.len().saturating_sub(MAX_TOTAL_ANNOTATIONS);
+    if !loose.is_empty() || left_out > 0 {
         for a in loose {
             let _ = writeln!(
                 summary,
@@ -200,19 +226,33 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
                 a.message.replace(['\n', '\r'], " ")
             );
         }
+        if left_out > 0 {
+            let _ = writeln!(
+                summary,
+                "- {left_out} more annotations with a file were left out (limit {MAX_TOTAL_ANNOTATIONS})."
+            );
+        }
         summary.push('\n');
     }
-    let summary = summary.trim_end().to_owned();
+    // The annotation list is last, so cutting the end cuts it first.
+    let summary = truncate(summary.trim_end(), MAX_OUTPUT_CHARS);
 
-    let with_file: Vec<GhAnnotation> = view.annotations.iter().filter_map(annotation).collect();
-    let cap = with_file.len().min(MAX_ANNOTATIONS);
-    let sent = view.file_annotations_sent.min(cap);
-    let fresh = with_file[sent..cap].to_vec();
+    let total = with_file.len().min(MAX_TOTAL_ANNOTATIONS);
+    let sent = view.file_annotations_sent.min(total);
+    let end = total.min(sent + MAX_ANNOTATIONS);
+    let fresh = with_file[sent..end].to_vec();
+    let fresh_len = fresh.len();
 
     let text = view
         .failed_tail
         .filter(|tail| !tail.is_empty())
-        .map(|tail| format!("```\n{}\n```", tail.join("\n")));
+        .map(|tail| {
+            let body = tail.join("\n");
+            let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+            let fence = "`".repeat(longest.max(2) + 1);
+            let room = MAX_OUTPUT_CHARS - 2 * fence.len() - 2;
+            format!("{fence}\n{}\n{fence}", truncate(&body, room))
+        });
 
     let run = CheckRun {
         name: check_name(view.workflow, &view.node.job.id),
@@ -230,23 +270,27 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
             annotations: fresh,
         }),
     };
-    (run, view.file_annotations_sent.max(cap))
+    (run, sent + fresh_len)
 }
 
 /// The jobs whose check run is behind, and when GitHub lets us send
 /// again.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outbox {
-    marked: BTreeSet<u64>,
+    /// Marked jobs and the generation of their latest mark.
+    marked: BTreeMap<u64, u64>,
+    counter: u64,
     blocked_until_ms: u64,
     attempts: u32,
 }
 
 impl Outbox {
     /// The job's check run needs an update. Marking again changes
-    /// nothing: the update sent is the one for the state at send time.
+    /// nothing a sender sees, except the generation: the update sent is
+    /// the one for the state at send time.
     pub fn mark(&mut self, job: u64) {
-        self.marked.insert(job);
+        self.counter += 1;
+        self.marked.insert(job, self.counter);
     }
 
     /// The jobs to send now. Empty while GitHub has us blocked.
@@ -255,19 +299,31 @@ impl Outbox {
         if now_ms < self.blocked_until_ms {
             return Vec::new();
         }
-        self.marked.iter().copied().collect()
+        self.marked.keys().copied().collect()
     }
 
-    /// The job's update went through: forget the mark and the attempts.
-    pub fn sent(&mut self, job: u64) {
-        self.marked.remove(&job);
+    /// The generation of the job's latest mark. A sender reads it
+    /// before it renders and hands it back to [`Outbox::sent`].
+    #[must_use]
+    pub fn generation(&self, job: u64) -> Option<u64> {
+        self.marked.get(&job).copied()
+    }
+
+    /// The job's update for `generation` went through. The mark goes
+    /// only when no newer mark arrived while the request was in flight;
+    /// the attempt count resets either way.
+    pub fn sent(&mut self, job: u64, generation: u64) {
+        if self.marked.get(&job) == Some(&generation) {
+            self.marked.remove(&job);
+        }
         self.attempts = 0;
     }
 
-    /// GitHub throttled a send: block for `wait_secs` and count the
-    /// attempt.
+    /// GitHub throttled a send: block for `wait_secs` (never shortening
+    /// a block that is already longer) and count the attempt.
     pub fn throttled(&mut self, now_ms: u64, wait_secs: u64) {
-        self.blocked_until_ms = now_ms.saturating_add(wait_secs.saturating_mul(1000));
+        let until = now_ms.saturating_add(wait_secs.saturating_mul(1000));
+        self.blocked_until_ms = self.blocked_until_ms.max(until);
         self.attempts = self.attempts.saturating_add(1);
     }
 
@@ -502,23 +558,107 @@ mod tests {
         assert!(annotation(&notes[0]).is_none());
     }
 
-    #[test]
-    fn caps_annotations_at_fifty() {
-        let n = node(State::Running, None);
-        let notes: Vec<Annotation> = (0..60)
+    fn many(n: usize) -> Vec<Annotation> {
+        (0..n)
             .map(|i| note(AnnotationLevel::Notice, &format!("n{i}"), Some("f")))
-            .collect();
-        let (run, sent) = render(&view(&n, &[], &notes));
-        let sent_now = run.output.unwrap().annotations;
-        assert_eq!(sent_now.len(), MAX_ANNOTATIONS);
-        assert_eq!(sent_now[49].message, "n49");
-        assert_eq!(sent, MAX_ANNOTATIONS);
+            .collect()
+    }
 
+    #[test]
+    fn pages_annotations_fifty_to_a_request() {
+        let n = node(State::Running, None);
+        let notes = many(120);
+        let mut sent = 0;
+        let mut pages = vec![];
+        loop {
+            let mut v = view(&n, &[], &notes);
+            v.file_annotations_sent = sent;
+            let (run, next) = render(&v);
+            let page = run.output.unwrap().annotations;
+            if page.is_empty() {
+                assert_eq!(next, sent);
+                break;
+            }
+            assert_eq!(page[0].message, format!("n{sent}"));
+            assert_eq!(next, sent + page.len());
+            pages.push(page.len());
+            sent = next;
+        }
+        assert_eq!(pages, vec![50, 50, 20]);
+        assert_eq!(sent, 120);
+    }
+
+    #[test]
+    fn stops_at_five_hundred_and_says_how_many_were_left_out() {
+        let n = node(State::Running, None);
+        let notes = many(520);
         let mut v = view(&n, &[], &notes);
-        v.file_annotations_sent = MAX_ANNOTATIONS;
+        v.file_annotations_sent = 480;
+        let (run, sent) = render(&v);
+        let out = run.output.unwrap();
+        assert_eq!(out.annotations.len(), 20);
+        assert_eq!(sent, MAX_TOTAL_ANNOTATIONS);
+        assert!(out.summary.contains("20 more annotations"));
+
+        v.file_annotations_sent = MAX_TOTAL_ANNOTATIONS;
         let (run, sent) = render(&v);
         assert_eq!(run.output.unwrap().annotations, Vec::new());
-        assert_eq!(sent, MAX_ANNOTATIONS);
+        assert_eq!(sent, MAX_TOTAL_ANNOTATIONS);
+    }
+
+    #[test]
+    fn clamps_lines() {
+        let mut a = note(AnnotationLevel::Error, "x", Some("f"));
+        a.line = Some(0);
+        a.end_line = Some(0);
+        let g = annotation(&a).unwrap();
+        assert_eq!((g.start_line, g.end_line), (1, 1));
+        a.line = Some(9);
+        a.end_line = Some(4);
+        let g = annotation(&a).unwrap();
+        assert_eq!((g.start_line, g.end_line), (9, 9));
+    }
+
+    #[test]
+    fn long_summary_is_cut_on_a_char_boundary_annotations_first() {
+        let n = node(State::Running, Some("msg"));
+        let notes: Vec<Annotation> = (0..3)
+            .map(|_| note(AnnotationLevel::Error, &"\u{e9}".repeat(30_000), None))
+            .collect();
+        let out = render(&view(&n, &[], &notes)).0.output.unwrap();
+        assert_eq!(out.summary.chars().count(), MAX_OUTPUT_CHARS);
+        assert!(out.summary.starts_with("msg\n\n- **error**"));
+        assert!(out.summary.ends_with("(truncated)"));
+    }
+
+    #[test]
+    fn long_tail_is_cut_and_the_fence_closes() {
+        let n = node(State::Done(Conclusion::Failure), None);
+        let tail = vec!["`".repeat(5), "\u{e9}".repeat(70_000)];
+        let mut v = view(&n, &[], &[]);
+        v.failed_tail = Some(&tail);
+        let text = render(&v).0.output.unwrap().text.unwrap();
+        assert!(text.chars().count() <= MAX_OUTPUT_CHARS);
+        assert!(text.starts_with("``````\n"));
+        assert!(text.ends_with("(truncated)\n``````"));
+    }
+
+    #[test]
+    fn a_fence_in_the_tail_does_not_close_the_block() {
+        let n = node(State::Done(Conclusion::Failure), None);
+        let tail = vec!["```".to_owned(), "after".to_owned()];
+        let mut v = view(&n, &[], &[]);
+        v.failed_tail = Some(&tail);
+        let text = render(&v).0.output.unwrap().text.unwrap();
+        assert_eq!(text, "````\n```\nafter\n````");
+    }
+
+    #[test]
+    fn backslashes_in_cells_are_escaped() {
+        let n = node(State::Running, None);
+        let steps = [step(0, "a\\|b", None)];
+        let out = render(&view(&n, &steps, &[])).0.output.unwrap();
+        assert!(out.summary.contains("| a\\\\\\|b | pending |"));
     }
 
     #[test]
@@ -572,9 +712,33 @@ mod tests {
         assert_eq!(o.due(now + 59_000), Vec::<u64>::new());
         assert_eq!(o.due(now + 60_000), vec![1]);
         assert_eq!(o.attempt(), 1);
-        o.sent(1);
+        let g = o.generation(1).unwrap();
+        o.sent(1, g);
         assert_eq!(o.due(now + 60_000), Vec::<u64>::new());
         assert_eq!(o.attempt(), 0);
+    }
+
+    #[test]
+    fn a_mark_during_a_send_survives_it() {
+        let mut o = Outbox::default();
+        o.mark(1);
+        let g = o.generation(1).unwrap();
+        o.mark(1);
+        o.sent(1, g);
+        assert_eq!(o.due(0), vec![1]);
+        let g = o.generation(1).unwrap();
+        o.sent(1, g);
+        assert_eq!(o.due(0), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn a_shorter_throttle_does_not_shorten_a_block() {
+        let mut o = Outbox::default();
+        o.mark(1);
+        o.throttled(0, 100);
+        o.throttled(10_000, 5);
+        assert_eq!(o.next_alarm(0), Some(100_000));
+        assert_eq!(o.attempt(), 2);
     }
 
     #[test]
@@ -587,7 +751,8 @@ mod tests {
         o.throttled(now, 60);
         assert_eq!(o.next_alarm(now), Some(now + 60_000));
         assert_eq!(o.next_alarm(now + 90_000), Some(now + 90_000));
-        o.sent(7);
+        let g = o.generation(7).unwrap();
+        o.sent(7, g);
         assert_eq!(o.next_alarm(now), None);
     }
 
