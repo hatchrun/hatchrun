@@ -53,6 +53,9 @@ fn select(args: Vec<String>) -> Result<Vec<String>> {
     let Some((index, total)) = node else {
         return Ok(items);
     };
+    // At most `MAX_ITEMS` (1,000,000) items get here, and the node total
+    // may be any nonzero u32: the split only works for as many nodes as
+    // there are items, so a huge total costs no more than a small one.
     let timings = timings()?;
     let refs: Vec<&str> = items.iter().map(String::as_str).collect();
     Ok(hatchrun_workflow::split(&refs, &timings, index, total)

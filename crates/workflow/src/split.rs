@@ -4,15 +4,16 @@
 
 //! Splits a list of tests across parallel nodes by recorded timing.
 
-use std::collections::BTreeMap;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BinaryHeap};
 
 /// Returns the items that node `index` of `total` should run.
 ///
 /// Every node computes the same assignment from the same inputs, so the
 /// shares never overlap and together cover every item. Items with a
 /// known timing keep it. Items without one get the median of the known
-/// timings (1.0 when none are known). Negative or non-finite timings
-/// count as unknown. Items are placed longest first, ties by name, each
+/// timings (1.0 when none are known). Zero, negative and non-finite
+/// timings count as unknown, so a file of zeros balances by count. Items are placed longest first, ties by name, each
 /// on the node with the smallest total so far (ties to the lowest node).
 /// The result keeps the input order. Duplicate items are separate items.
 /// `total == 0` or `index >= total` gives an empty list.
@@ -37,7 +38,7 @@ pub fn split<'a>(
             timings
                 .get(*item)
                 .copied()
-                .filter(|t| t.is_finite() && *t >= 0.0)
+                .filter(|t| t.is_finite() && *t > 0.0)
         })
         .collect();
     let fallback = median(&known);
@@ -51,23 +52,41 @@ pub fn split<'a>(
             .then_with(|| a.cmp(&b))
     });
 
-    let mut sums = vec![0.0_f64; nodes];
+    // Smallest load first, ties to the lowest node.
+    let mut heap: BinaryHeap<Reverse<(Load, usize)>> =
+        (0..nodes).map(|node| Reverse((Load(0.0), node))).collect();
     let mut mine = vec![false; items.len()];
     for i in order {
-        let mut best = 0;
-        for (node, sum) in sums.iter().enumerate() {
-            if sum.total_cmp(&sums[best]).is_lt() {
-                best = node;
-            }
-        }
-        sums[best] += weights[i];
-        mine[i] = best == index as usize;
+        let Some(Reverse((Load(sum), node))) = heap.pop() else {
+            break;
+        };
+        heap.push(Reverse((Load(sum + weights[i]), node)));
+        mine[i] = node == index as usize;
     }
     items
         .iter()
         .zip(mine)
         .filter_map(|(item, keep)| keep.then_some(*item))
         .collect()
+}
+
+/// A node's total time so far. Loads are sums of finite, positive
+/// weights, so the total order never has to rank a NaN.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Load(f64);
+
+impl Eq for Load {}
+
+impl PartialOrd for Load {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Load {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
 }
 
 /// Median of the known timings, 1.0 when there are none.
@@ -135,6 +154,24 @@ mod tests {
         let items = ["a", "b", "c", "d"];
         let lens: Vec<usize> = (0..2).map(|i| split(&items, &bad, i, 2).len()).collect();
         assert_eq!(lens, [2, 2]);
+    }
+
+    #[test]
+    fn all_zero_timings_count_as_unknown() {
+        let items = ["a", "b", "c", "d"];
+        let zeros: BTreeMap<String, f64> = items.iter().map(|i| ((*i).into(), 0.0)).collect();
+        let lens: Vec<usize> = (0..2).map(|i| split(&items, &zeros, i, 2).len()).collect();
+        assert_eq!(lens, [2, 2]);
+    }
+
+    #[test]
+    fn a_big_split_is_fast() {
+        let names: Vec<String> = (0..200_000).map(|i| format!("t{i}")).collect();
+        let items: Vec<&str> = names.iter().map(String::as_str).collect();
+        let start = std::time::Instant::now();
+        let mine = split(&items, &BTreeMap::new(), 7, 200_000);
+        assert_eq!(mine.len(), 1);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
