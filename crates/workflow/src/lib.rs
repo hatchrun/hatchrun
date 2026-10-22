@@ -14,6 +14,7 @@ pub mod cron;
 pub mod diagnostic;
 pub mod expr;
 pub mod job;
+pub mod permissions;
 pub mod plan;
 pub mod split;
 pub mod templates;
@@ -33,6 +34,7 @@ pub use job::{
     Annotation, AnnotationLevel, CacheService, Conclusion, Github, JobDocument, JobResult, Need,
     StepSummary,
 };
+pub use permissions::{DEFAULT_SCOPES, Level, Permissions, SCOPES, token_scopes};
 pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, validate};
 pub use split::split;
 pub use templates::{
