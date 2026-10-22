@@ -389,6 +389,46 @@ const FINISH_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = 
 const FINISH_RUN: &str = "UPDATE ci_runs SET status = 'completed', conclusion = $2, \
      completed_at = $3, updated_at = $3 WHERE id = $1 AND run_attempt = $4";
 
+/// Records the usage of attempt `$3` of job `$1`, completed at `$2`,
+/// from the row as the update before it left it: nothing is written
+/// when that update did not apply (another attempt, or a job completed
+/// already), or the job never started or has no template. Minutes run
+/// from start to completion, rounded up, at least one.
+const RECORD_USAGE: &str = "INSERT INTO ci_usage \
+       (job_id, attempt, tenant_id, template, minutes, ended_at) \
+     SELECT ci_jobs.id, ci_jobs.attempt, ci_runs.tenant_id, ci_jobs.template, \
+       GREATEST(1, CEIL((ci_jobs.completed_at - ci_jobs.started_at) / 60000.0))::bigint, \
+       ci_jobs.completed_at \
+     FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
+     WHERE ci_jobs.id = $1 AND ci_jobs.attempt = $3 AND ci_jobs.status = 'completed' \
+       AND ci_jobs.completed_at = $2 AND ci_jobs.started_at IS NOT NULL \
+       AND ci_jobs.template IS NOT NULL \
+     ON CONFLICT DO NOTHING";
+
+/// The billing state of a tenant, usage since `$2`, cap default `$3`;
+/// `{owner}` picks the tenant by `$1`.
+const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
+       EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
+         AND subscriptions.product = 'ci' \
+         AND subscriptions.status IN ('active', 'trialing')) AS card, \
+       COALESCE((SELECT cap_micros FROM ci_spend_caps WHERE tenant_id = tenants.id), $3) \
+         AS cap_micros, \
+       COALESCE((SELECT json_agg(json_build_object('template', u.template, 'minutes', u.minutes)) \
+         FROM (SELECT template, SUM(minutes)::bigint AS minutes FROM ci_usage \
+           WHERE tenant_id = tenants.id AND ended_at >= $2 GROUP BY template) u), \
+         '[]'::json)::text AS minutes_by_template, \
+       (SELECT count(*) FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
+         WHERE ci_runs.tenant_id = tenants.id \
+         AND ci_jobs.status IN ('launching', 'launched', 'running'))::bigint AS running \
+     FROM tenants WHERE {owner}";
+
+/// [`STANDING`]'s `{owner}` for the tenant of job `$1`.
+const OWNER_OF_JOB: &str = "tenants.id = (SELECT ci_runs.tenant_id FROM ci_jobs \
+     JOIN ci_runs ON ci_runs.id = ci_jobs.run_id WHERE ci_jobs.id = $1)";
+
+/// [`STANDING`]'s `{owner}` for tenant `$1`.
+const OWNER_IS_TENANT: &str = "tenants.id = $1::text";
+
 /// Drops the schedules of repository `$1`.
 const DELETE_SCHEDULES: &str = "DELETE FROM ci_schedules WHERE repo_id = $1";
 
@@ -454,6 +494,12 @@ pub const SWEEP_LIMIT: u32 = 100;
 /// Deletes delivery ids received before `$1`.
 const SWEEP_DELIVERIES: &str = "DELETE FROM ci_deliveries WHERE received_at < $1";
 
+/// Deletes usage Polar took before `$1`.
+const SWEEP_USAGE: &str = "DELETE FROM ci_usage WHERE sent_at < $1";
+
+/// How long sent usage rows are kept, in milliseconds.
+const USAGE_RETENTION_MS: u64 = 90 * 86_400_000;
+
 /// `sql` with its `{columns}` filled in.
 fn with_columns(sql: &str, columns: &str) -> String {
     sql.replace("{columns}", columns)
@@ -505,6 +551,93 @@ pub async fn has_card(db: &Db, tenant_id: &str) -> Result<bool> {
         .first::<Card>(HAS_CARD, &params![tenant_id])
         .await?
         .is_some_and(|row| row.card))
+}
+
+/// A tenant's billing state this month.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Standing {
+    /// The tenant.
+    pub tenant_id: String,
+    /// The organization's login, for messages.
+    pub org_login: String,
+    /// Whether an active or trialing CI subscription exists.
+    pub card: bool,
+    /// The monthly spend cap in micros: the tenant's own or the default.
+    pub cap_micros: u64,
+    /// Minutes metered this month, per template label.
+    pub minutes_by_template: Vec<(String, u64)>,
+    /// Jobs launching, launched or running now.
+    pub running: u32,
+}
+
+/// What [`STANDING`] returns; the minutes arrive as JSON text.
+#[derive(Deserialize)]
+struct StandingRow {
+    tenant_id: String,
+    org_login: String,
+    card: bool,
+    cap_micros: u64,
+    minutes_by_template: String,
+    running: u32,
+}
+
+impl StandingRow {
+    fn into_standing(self) -> Result<Standing> {
+        #[derive(Deserialize)]
+        struct Minutes {
+            template: String,
+            minutes: u64,
+        }
+        let minutes: Vec<Minutes> = serde_json::from_str(&self.minutes_by_template)?;
+        Ok(Standing {
+            tenant_id: self.tenant_id,
+            org_login: self.org_login,
+            card: self.card,
+            cap_micros: self.cap_micros,
+            minutes_by_template: minutes
+                .into_iter()
+                .map(|m| (m.template, m.minutes))
+                .collect(),
+            running: self.running,
+        })
+    }
+}
+
+/// The billing state of the tenant of job `job_id`: usage since
+/// `month_start`, and `default_cap` for a tenant with no cap row.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn standing(
+    db: &Db,
+    job_id: u64,
+    month_start: u64,
+    default_cap: u64,
+) -> Result<Option<Standing>> {
+    let sql = STANDING.replace("{owner}", OWNER_OF_JOB);
+    db.first::<StandingRow>(&sql, &params![job_id, month_start, default_cap])
+        .await?
+        .map(StandingRow::into_standing)
+        .transpose()
+}
+
+/// As [`standing`], for tenant `tenant_id`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn tenant_standing(
+    db: &Db,
+    tenant_id: &str,
+    month_start: u64,
+    default_cap: u64,
+) -> Result<Option<Standing>> {
+    let sql = STANDING.replace("{owner}", OWNER_IS_TENANT);
+    db.first::<StandingRow>(&sql, &params![tenant_id, month_start, default_cap])
+        .await?
+        .map(StandingRow::into_standing)
+        .transpose()
 }
 
 /// Records `repo`, or updates it after a rename or a change.
@@ -880,7 +1013,8 @@ pub async fn heartbeat(db: &Db, job_id: u64, now: u64) -> Result<()> {
 /// Completes attempt `attempt` of job `job_id` with its `conclusion`,
 /// `steps` and the key of its finished log. A completed job, and a job
 /// of another attempt, keep what they have; returns whether this call
-/// completed it.
+/// completed it. In the same transaction a job that was claimed gets
+/// its minutes recorded for this attempt, once.
 ///
 /// # Errors
 ///
@@ -894,13 +1028,16 @@ pub async fn finish_job(
     log_key: Option<&str>,
     now: u64,
 ) -> Result<bool> {
-    let changed = db
-        .run(
-            FINISH_JOB,
-            &params![job_id, conclusion, steps.to_string(), log_key, now, attempt],
-        )
+    let changes = db
+        .batch(&[
+            (
+                FINISH_JOB,
+                params![job_id, conclusion, steps.to_string(), log_key, now, attempt],
+            ),
+            (RECORD_USAGE, params![job_id, now, attempt]),
+        ])
         .await?;
-    Ok(changed == 1)
+    Ok(changes.first() == Some(&1))
 }
 
 /// Completes attempt `attempt` of run `run_id` with its `conclusion`; a
@@ -986,7 +1123,8 @@ pub async fn set_last_minute(db: &Db, minute_ms: u64) -> Result<()> {
 }
 
 /// Deletes runs that expired before `now`, with their jobs, and
-/// delivery ids older than 30 days. At most [`SWEEP_LIMIT`] runs go in
+/// delivery ids older than 30 days, and usage rows Polar took more
+/// than 90 days ago. At most [`SWEEP_LIMIT`] runs go in
 /// one call, oldest first, and the rest the next time. Returns the ids
 /// of the runs, so their logs can be purged.
 ///
@@ -1001,6 +1139,11 @@ pub async fn sweep(db: &Db, now: u64) -> Result<Vec<u64>> {
     let runs: Vec<Deleted> = db.all(SWEEP_RUNS, &params![now, SWEEP_LIMIT]).await?;
     db.run(SWEEP_DELIVERIES, &params![now.saturating_sub(RETENTION_MS)])
         .await?;
+    db.run(
+        SWEEP_USAGE,
+        &params![now.saturating_sub(USAGE_RETENTION_MS)],
+    )
+    .await?;
     Ok(runs.into_iter().map(|row| row.id).collect())
 }
 
@@ -1060,6 +1203,21 @@ mod tests {
     fn run_with_job(db: &TestDb, status: &str) -> (RunRow, u64) {
         let run = db
             .wait(insert_run(db.db(), &new_run("d", "ci", 1_000)))
+            .unwrap()
+            .unwrap();
+        let ids = db
+            .wait(insert_jobs(db.db(), run.id, &[new_job("build")], 1_000))
+            .unwrap();
+        let job_id = ids[0].1;
+        db.wait(set_job(db.db(), job_id, status, None, 1_001))
+            .unwrap();
+        (run, job_id)
+    }
+
+    /// As [`run_with_job`], for a run of delivery `delivery`.
+    fn run_with_job_named(db: &TestDb, delivery: &str, status: &str) -> (RunRow, u64) {
+        let run = db
+            .wait(insert_run(db.db(), &new_run(delivery, "ci", 1_000)))
             .unwrap()
             .unwrap();
         let ids = db
@@ -1889,5 +2047,250 @@ mod tests {
         assert_eq!(db.wait(jobs_by_ids(db.db(), &[])).unwrap().len(), 0);
         let done = db.wait(job(db.db(), ids[2].1)).unwrap().unwrap();
         assert_eq!(done.completed_at, Some(400));
+    }
+
+    fn usage_rows(db: &TestDb) -> Vec<(u64, u64, String, u64, u64)> {
+        db.rows(
+            "SELECT job_id, attempt, template, minutes, ended_at FROM ci_usage \
+             ORDER BY job_id, attempt",
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row["job_id"].as_u64().unwrap(),
+                row["attempt"].as_u64().unwrap(),
+                row["template"].as_str().unwrap().to_owned(),
+                row["minutes"].as_u64().unwrap(),
+                row["ended_at"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    fn finish(db: &TestDb, job_id: u64, attempt: u32, now: u64) -> bool {
+        db.wait(finish_job(
+            db.db(),
+            job_id,
+            attempt,
+            "success",
+            &serde_json::json!([]),
+            None,
+            now,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn finish_job_records_minutes_from_claim() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "launching");
+        assert!(db.wait(start_job(db.db(), job_id, 10_000)).unwrap());
+        assert!(finish(&db, job_id, 1, 71_000));
+        assert_eq!(
+            usage_rows(&db),
+            [(job_id, 1, "ubuntu-latest".to_owned(), 2, 71_000)]
+        );
+    }
+
+    #[test]
+    fn a_job_never_claimed_is_not_metered() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "launched");
+        assert!(finish(&db, job_id, 1, 71_000));
+        assert_eq!(usage_rows(&db).len(), 0);
+    }
+
+    #[test]
+    fn finishing_twice_records_once() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "launching");
+        db.wait(start_job(db.db(), job_id, 10_000)).unwrap();
+        assert!(finish(&db, job_id, 1, 71_000));
+        assert!(!finish(&db, job_id, 1, 71_000), "same time");
+        assert!(!finish(&db, job_id, 1, 500_000), "later");
+        assert_eq!(usage_rows(&db).len(), 1);
+        assert_eq!(usage_rows(&db)[0].4, 71_000);
+    }
+
+    #[test]
+    fn each_attempt_is_metered() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "launching");
+        db.wait(start_job(db.db(), job_id, 10_000)).unwrap();
+        assert!(finish(&db, job_id, 1, 20_000));
+        db.wait(reset_job(db.db(), job_id, 2, 30_000)).unwrap();
+        db.wait(set_job(db.db(), job_id, "launching", None, 30_001))
+            .unwrap();
+        db.wait(start_job(db.db(), job_id, 31_000)).unwrap();
+        assert!(finish(&db, job_id, 2, 100_000));
+        let rows = usage_rows(&db);
+        assert_eq!(
+            rows.iter().map(|r| (r.1, r.3)).collect::<Vec<_>>(),
+            [(1, 1), (2, 2)]
+        );
+    }
+
+    #[test]
+    fn stale_result_is_not_metered() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "launching");
+        db.wait(start_job(db.db(), job_id, 10_000)).unwrap();
+        db.wait(reset_job(db.db(), job_id, 2, 20_000)).unwrap();
+        db.wait(set_job(db.db(), job_id, "launching", None, 20_001))
+            .unwrap();
+        db.wait(start_job(db.db(), job_id, 21_000)).unwrap();
+        assert!(!finish(&db, job_id, 1, 90_000));
+        assert_eq!(usage_rows(&db).len(), 0);
+    }
+
+    #[test]
+    fn minutes_round_up_like_usage_minutes() {
+        let db = setup();
+        let mut got = Vec::new();
+        for (n, ms) in [0_u64, 1, 60_000, 60_001].into_iter().enumerate() {
+            let run = db
+                .wait(insert_run(db.db(), &new_run(&format!("d{n}"), "ci", 1)))
+                .unwrap()
+                .unwrap();
+            let ids = db
+                .wait(insert_jobs(db.db(), run.id, &[new_job("build")], 1))
+                .unwrap();
+            let job_id = ids[0].1;
+            db.wait(set_job(db.db(), job_id, "launching", None, 2))
+                .unwrap();
+            db.wait(start_job(db.db(), job_id, 1_000)).unwrap();
+            assert!(finish(&db, job_id, 1, 1_000 + ms));
+            got.push(usage_rows(&db).last().unwrap().3);
+            assert_eq!(
+                got.last().copied().unwrap(),
+                u64::from(hatchrun_cloud::usage::minutes(1_000, 1_000 + ms))
+            );
+        }
+        assert_eq!(got, [1, 1, 1, 2]);
+    }
+
+    #[test]
+    fn standing_counts_this_month_and_running_jobs() {
+        let db = setup();
+        let month = 1_790_812_800_000_u64;
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 98, 0, 0)",
+            &[],
+        );
+        for (job, tenant, template, minutes, ended) in [
+            (1, "t1", "ubuntu-latest", 7, month - 1),
+            (2, "t1", "ubuntu-latest", 5, month + DAY),
+            (3, "t1", "ubuntu-26.04-4core", 3, month + 2 * DAY),
+            (4, "t2", "ubuntu-latest", 100, month + DAY),
+        ] {
+            db.run(
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, ended_at) \
+                 VALUES ($1, 1, $2, $3, $4, $5)",
+                &params![job, tenant, template, minutes, ended],
+            );
+        }
+        let (_, first) = run_with_job(&db, "running");
+        let (_, second) = run_with_job_named(&db, "d2", "launching");
+        let (_, _done) = run_with_job_named(&db, "d3", "completed");
+        let (_, _queued) = run_with_job_named(&db, "d4", "queued");
+        let default_cap = 50_000_000;
+        let mut standing_t1 = db
+            .wait(standing(db.db(), first, month, default_cap))
+            .unwrap()
+            .unwrap();
+        standing_t1.minutes_by_template.sort();
+        assert_eq!(
+            standing_t1,
+            Standing {
+                tenant_id: "t1".into(),
+                org_login: "acme".into(),
+                card: false,
+                cap_micros: default_cap,
+                minutes_by_template: vec![
+                    ("ubuntu-26.04-4core".into(), 3),
+                    ("ubuntu-latest".into(), 5)
+                ],
+                running: 2,
+            }
+        );
+        let by_tenant = db
+            .wait(tenant_standing(db.db(), "t1", month, default_cap))
+            .unwrap()
+            .unwrap();
+        let by_second_job = db
+            .wait(standing(db.db(), second, month, default_cap))
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_tenant.running, 2);
+        assert_eq!(by_second_job.tenant_id, "t1");
+        // Another tenant: its own rows, no jobs, and a cap row wins.
+        db.run(
+            "INSERT INTO ci_spend_caps (tenant_id, cap_micros, updated_at) \
+             VALUES ('t2', 70000000, 0)",
+            &[],
+        );
+        subscribe(&db, "s1", "ci", "active");
+        let other = db
+            .wait(tenant_standing(db.db(), "t2", month, default_cap))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            other.minutes_by_template,
+            [("ubuntu-latest".to_owned(), 100)]
+        );
+        assert_eq!(
+            (other.running, other.cap_micros, other.card),
+            (0, 70_000_000, false)
+        );
+        let first_again = db
+            .wait(tenant_standing(db.db(), "t1", month, default_cap))
+            .unwrap()
+            .unwrap();
+        assert!(first_again.card);
+        assert!(
+            db.wait(tenant_standing(db.db(), "nope", month, default_cap))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.wait(standing(db.db(), 999_999, month, default_cap))
+                .unwrap()
+                .is_none()
+        );
+        let empty = db
+            .wait(tenant_standing(
+                db.db(),
+                "t1",
+                month + 40 * DAY,
+                default_cap,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.minutes_by_template.len(), 0);
+    }
+
+    #[test]
+    fn sweep_deletes_usage_sent_long_ago() {
+        let db = setup();
+        let now = 200 * DAY;
+        for (job, sent) in [
+            (1, Some(now - 91 * DAY)),
+            (2, Some(now - 89 * DAY)),
+            (3, None),
+        ] {
+            db.run(
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, ended_at, \
+                 sent_at) VALUES ($1, 1, 't1', 'ubuntu-latest', 1, 0, $2)",
+                &params![job, sent],
+            );
+        }
+        db.wait(sweep(db.db(), now)).unwrap();
+        assert_eq!(
+            usage_rows(&db).iter().map(|r| r.0).collect::<Vec<_>>(),
+            [2, 3]
+        );
     }
 }

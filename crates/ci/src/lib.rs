@@ -24,6 +24,7 @@
 pub mod access;
 pub mod agent;
 pub mod api;
+pub mod billing;
 pub mod checks;
 pub mod env;
 pub mod github;
