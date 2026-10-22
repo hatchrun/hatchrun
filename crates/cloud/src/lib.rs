@@ -61,6 +61,7 @@ pub mod oidc;
 pub mod polar;
 pub mod profiles;
 mod reconcile;
+pub use reconcile::time::format as format_rfc3339;
 pub use reconcile::time::parse as parse_rfc3339;
 pub mod runs;
 pub mod session;

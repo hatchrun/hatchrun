@@ -321,7 +321,7 @@ pub fn permissions(response: &Response) -> Permissions {
 /// Seconds to wait before sending the request again, when `response`
 /// is GitHub throttling it: a `429`, or a `403` with `retry-after`,
 /// with `x-ratelimit-remaining: 0` or whose body mentions the rate
-/// limit. The wait is `retry-after`, else the time until
+/// limit. The wait, kept within 1 to 900 s, is `retry-after`, else the time until
 /// `x-ratelimit-reset` when nothing is left, else 60 s doubling per
 /// `attempt` up to 900 s. Any other answer is `None`.
 #[must_use]
@@ -337,44 +337,23 @@ pub fn throttle(response: &Response, now_secs: u64, attempt: u32) -> Option<u64>
     if !throttled {
         return None;
     }
-    if let Some(seconds) = retry_after {
-        return Some(seconds);
-    }
-    if remaining == Some(0)
+    let wait = if let Some(seconds) = retry_after {
+        seconds
+    } else if remaining == Some(0)
         && let Some(reset) = number("x-ratelimit-reset")
     {
-        return Some(reset.saturating_sub(now_secs));
-    }
-    Some((60_u64 << attempt.min(10)).min(MAX_BACKOFF_SECS))
+        reset.saturating_sub(now_secs)
+    } else {
+        60_u64 << attempt.min(10)
+    };
+    Some(wait.clamp(1, MAX_BACKOFF_SECS))
 }
 
 /// `ms` (Unix milliseconds) as RFC 3339 UTC, such as
 /// `2026-10-22T13:45:00Z`, in whole seconds.
 #[must_use]
 pub fn rfc3339(ms: u64) -> String {
-    let seconds = ms / 1000;
-    let (year, month, day) = civil(seconds / 86_400);
-    let time = seconds % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        time / 3600,
-        time / 60 % 60,
-        time % 60
-    )
-}
-
-/// The calendar date of `days` since 1970-01-01 (Hinnant's algorithm).
-fn civil(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z % 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
-    (year, month, day)
+    hatchrun_cloud::format_rfc3339(ms)
 }
 
 #[cfg(test)]
@@ -585,6 +564,20 @@ mod tests {
             "",
         );
         assert_eq!(throttle(&r, 1000, 0), Some(90));
+    }
+
+    #[test]
+    fn throttle_wait_stays_between_one_and_900_seconds() {
+        let past = answer(
+            403,
+            &[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "900")],
+            "",
+        );
+        assert_eq!(throttle(&past, 1000, 0), Some(1));
+        let huge = answer(429, &[("retry-after", "86400")], "");
+        assert_eq!(throttle(&huge, 1000, 0), Some(900));
+        let zero = answer(429, &[("retry-after", "0")], "");
+        assert_eq!(throttle(&zero, 1000, 0), Some(1));
     }
 
     #[test]
