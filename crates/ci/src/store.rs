@@ -840,6 +840,22 @@ pub async fn upsert_repo(db: &Db, repo: &RepoRow, now: u64) -> Result<()> {
         (FREE_REPO_NAME, params![repo.id, &repo.full_name]),
         // A repository that changes tenant leaves its secrets, vars and
         // environments behind, as GitHub does on transfer.
+        // Org secrets and vars of the old tenant forget the repository
+        // too, so it does not regain access if it transfers back.
+        (
+            "UPDATE ci_secrets SET repositories = array_remove(repositories, $1::bigint) \
+             WHERE repositories IS NOT NULL AND $1::bigint = ANY (repositories) \
+             AND tenant_id <> $2 \
+             AND tenant_id = (SELECT tenant_id FROM ci_repos WHERE id = $1)",
+            params![repo.id, &repo.tenant_id],
+        ),
+        (
+            "UPDATE ci_vars SET repositories = array_remove(repositories, $1::bigint) \
+             WHERE repositories IS NOT NULL AND $1::bigint = ANY (repositories) \
+             AND tenant_id <> $2 \
+             AND tenant_id = (SELECT tenant_id FROM ci_repos WHERE id = $1)",
+            params![repo.id, &repo.tenant_id],
+        ),
         (
             "DELETE FROM ci_secrets WHERE repo_id = $1 AND tenant_id <> $2",
             params![repo.id, &repo.tenant_id],
@@ -5102,6 +5118,30 @@ mod tests {
             .wait(sealed_secrets(db.db(), "t1", 7, None, Some(&names)))
             .unwrap();
         assert_eq!(rows, []);
+    }
+
+    #[test]
+    fn a_transfer_drops_the_repo_from_the_old_orgs_selections() {
+        let db = with_repos();
+        put_selected(&db, "secret", "A", Some(&[8, 9]));
+        put_selected(&db, "var", "A", Some(&[8, 9]));
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 100, 0, 0)",
+            &[],
+        );
+        let mut moved = db.wait(repo(db.db(), 8)).unwrap().unwrap();
+        moved.tenant_id = "t2".into();
+        moved.installation_id = 100;
+        db.wait(upsert_repo(db.db(), &moved, 3)).unwrap();
+        // It transfers back: the old selection no longer names it.
+        moved.tenant_id = "t1".into();
+        moved.installation_id = 99;
+        db.wait(upsert_repo(db.db(), &moved, 4)).unwrap();
+        assert_eq!(secret_values(&db, 8), Vec::<String>::new());
+        assert_eq!(var_names(&db, 8), Vec::<String>::new());
+        assert_eq!(secret_values(&db, 9), ["A"]);
+        assert_eq!(var_names(&db, 9), ["A"]);
     }
 
     #[test]

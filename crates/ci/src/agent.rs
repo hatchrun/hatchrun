@@ -160,6 +160,17 @@ pub(crate) fn consistent(job: &JobRow, run: &RunRow, repo: &RepoRow) -> bool {
     job.run_id == run.id && run.repo_id == repo.id && run.tenant_id == repo.tenant_id
 }
 
+/// Whether the repository changed tenant after the run was created: the
+/// job is still the old owner's, but the repository's secrets and vars
+/// now belong to the new one.
+pub(crate) fn transferred(job: &JobRow, run: &RunRow, repo: &RepoRow) -> bool {
+    job.run_id == run.id && run.repo_id == repo.id && run.tenant_id != repo.tenant_id
+}
+
+/// Why a job of a transferred repository ends at the claim.
+const TRANSFERRED_MESSAGE: &str = "The repository moved to another owner while the job was queued. \
+     Run the workflow again.";
+
 /// A request body collected up to [`MAX_BODY_BYTES`].
 #[derive(Default)]
 pub(crate) struct Capped {
@@ -295,6 +306,13 @@ async fn claim(
     let Some(repo) = store::repo(db, run.repo_id).await? else {
         return status(409);
     };
+    if transferred(row, &run, &repo) {
+        let answer = launches::post_failed(env, db, row, TRANSFERRED_MESSAGE).await;
+        if !matches!(answer, EndAnswer::Status(200..=299 | 409)) {
+            console_error!("job {}: post failed: {answer:?}", row.id);
+        }
+        return status(409);
+    }
     if !consistent(row, &run, &repo) {
         console_error!("job {}: run and repository disagree on the tenant", row.id);
         return text("unauthorized", 401);
@@ -782,6 +800,23 @@ mod tests {
             &run_row("t1", 9),
             &repo_row("t1", 9)
         ));
+    }
+
+    #[test]
+    fn a_transferred_repository_ends_the_claim() {
+        let job = row("launched");
+        assert!(transferred(&job, &run_row("t1", 9), &repo_row("t2", 9)));
+        assert!(!transferred(&job, &run_row("t1", 9), &repo_row("t1", 9)));
+        // A mismatch of ids is a forged claim, not a transfer.
+        assert!(!transferred(&job, &run_row("t1", 9), &repo_row("t2", 10)));
+        let mut elsewhere = row("launched");
+        elsewhere.run_id = 2;
+        assert!(!transferred(
+            &elsewhere,
+            &run_row("t1", 9),
+            &repo_row("t2", 9)
+        ));
+        assert!(TRANSFERRED_MESSAGE.contains("moved to another owner"));
     }
 
     #[test]
