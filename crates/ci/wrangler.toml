@@ -18,19 +18,17 @@ command = "cargo install --locked worker-build --version 0.8.7 && worker-build -
 crons = ["* * * * *"]
 
 # The same Postgres as hatchrun-cloud, through Hyperdrive; the ci_
-# tables are in crates/cloud/migrations/0004_ci.sql. The deploy workflow
-# sets id from the CLOUDFLARE_HYPERDRIVE_ID secret; wrangler dev connects
-# to localConnectionString instead.
+# tables are in crates/cloud/migrations/0004_ci.sql. wrangler dev
+# connects to localConnectionString instead.
 [[hyperdrive]]
 binding = "HYPERDRIVE"
-id = "hyperdrive-local"
+id = "f52a1b8002e845c695362157863436fb"
 localConnectionString = "postgres://postgres:postgres@localhost:5432/postgres"
 
-# Installation tokens, shared with hatchrun-cloud. The deploy workflow
-# sets id from the CLOUDFLARE_KV_TOKENS_ID secret.
+# Installation tokens, shared with hatchrun-cloud.
 [[kv_namespaces]]
 binding = "TOKENS"
-id = "local"
+id = "92b81a8052544d3387c16535ee2a4fa2"
 
 # One RunObject per run, which orders the run's job events and log
 # batches.
@@ -76,10 +74,8 @@ max_batch_size = 10
 max_batch_timeout = 5
 max_retries = 3
 
-# The key that seals CI secrets, from the account's Secrets Store. The
-# deploy workflow sets store_id from the CLOUDFLARE_SECRETS_STORE_ID
-# secret, the account's store from `npx wrangler secrets-store store
-# list`; e2e.sh points it at a local store. secret_name is a secret in
+# The key that seals CI secrets, from the account's Secrets Store;
+# e2e.sh points store_id at a local store. secret_name is a secret in
 # that store with scope workers, holding base64 of 32 random bytes
 # (`openssl rand -base64 32`). To rotate: add the new secret to the
 # store, point CI_SECRETS_KEY at it with a new CI_SECRETS_KEY_ID, move
@@ -87,14 +83,18 @@ max_retries = 3
 # and drop the old binding once no ci_secrets row has the old key_id.
 [[secrets_store_secrets]]
 binding = "CI_SECRETS_KEY"
-store_id = "local"
+store_id = "05338d0fc1d04ad6853ad8b9874b3fc4"
 secret_name = "ci-secrets-key-2026-10"
 
 # Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY,
 # OIDC_SIGNING_KEY (signs the token for AssumeRoleWithWebIdentity),
 # BROKER_TOKEN (shared with hatchrun-broker), CI_TOKEN_KEY (the HMAC
 # key of job tokens) and POLAR_ACCESS_TOKEN (checkout, portal and the
-# usage events; the same token hatchrun-cloud holds).
+# usage events; the same token hatchrun-cloud holds), uploaded by
+# deploy-ci.yml, and CI_ROLE_ARN, set once on the Worker by hand: the
+# RoleArn output of deploy/cloudformation/ci-account.yaml, the role
+# the Worker assumes in the CI AWS account. The Worker finds the
+# launch template and subnets there by name and tag.
 # Variables: those below.
 [vars]
 # production, staging or dev. The local launcher backend is refused in
@@ -114,15 +114,6 @@ GITHUB_APP_ID = "Iv23liMh4C066YyxQB7R"
 OIDC_KEY_ID = "2026-10-14"
 # The region of the CI AWS account, where jobs run.
 CI_REGION = "us-east-1"
-# Set by deploy-ci.yml from the CI_ROLE_ARN, CI_LAUNCH_TEMPLATE_ID and
-# CI_SUBNET_IDS repository variables, which hold the RoleArn,
-# LaunchTemplateId and SubnetIds outputs of the stack in
-# deploy/cloudformation/ci-account.yaml (us-east-1, the hatchrun CI
-# account): the role the Worker assumes, the launch template and the
-# subnets (comma separated) it launches into.
-CI_ROLE_ARN = ""
-CI_LAUNCH_TEMPLATE_ID = ""
-CI_SUBNET_IDS = ""
 # The id of the "hatchrun CI" product in Polar (Products, then the
 # product's ID), the same value as hatchrun-cloud's POLAR_CI_PRODUCT_ID.
 # Checkout answers 503 while it is empty.
