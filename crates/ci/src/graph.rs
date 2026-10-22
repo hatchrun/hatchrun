@@ -240,12 +240,16 @@ impl Graph {
     }
 
     /// Runs the job again, and every job that requires it, directly or
-    /// not. A job that has not ended is left alone.
+    /// not. Does nothing until the run has a conclusion. Jobs outside the
+    /// reset set keep their result, so a cancelled job must be rerun too
+    /// for the run to stop ending as cancelled.
     pub fn rerun(&mut self, job: u64, github_ctx: &Value) -> Vec<Action> {
         let Some(root) = self.position(job) else {
             return Vec::new();
         };
-        if !matches!(self.jobs[root].state, State::Done(_)) {
+        // Like GitHub, only a run that has ended can be rerun: a running
+        // dependent would otherwise run twice.
+        if self.conclusion().is_none() {
             return Vec::new();
         }
         let mut reset = vec![false; self.jobs.len()];
@@ -377,16 +381,45 @@ impl Graph {
             .collect()
     }
 
+    /// The status `success()` and `failure()` see: over every ancestor
+    /// through `requires`, not only the direct ones. `Failure` when any
+    /// ancestor failed (or was cancelled in a run that is not cancelled),
+    /// `Success` when all succeeded, else `Skipped`.
+    fn ancestor_status(&self, at: usize) -> JobStatus {
+        let mut seen = vec![false; self.jobs.len()];
+        let mut stack = vec![at];
+        let mut skipped = false;
+        while let Some(i) = stack.pop() {
+            for r in &self.jobs[i].job.requires {
+                let Some(p) = self.position_of(r) else {
+                    continue;
+                };
+                if std::mem::replace(&mut seen[p], true) {
+                    continue;
+                }
+                match self.jobs[p].state {
+                    State::Done(Conclusion::Success) => {}
+                    State::Done(Conclusion::Skipped) => skipped = true,
+                    _ => return JobStatus::Failure,
+                }
+                stack.push(p);
+            }
+        }
+        if skipped {
+            JobStatus::Skipped
+        } else {
+            JobStatus::Success
+        }
+    }
+
     /// Whether the job at `at` may run, by its `if:`.
     fn decide(&self, at: usize, github_ctx: &Value) -> Result<bool, ExprError> {
         let node = &self.jobs[at];
         let needs = self.needs_at(at);
         let status = if self.cancelled {
             JobStatus::Cancelled
-        } else if needs.values().all(|n| n.result == Conclusion::Success) {
-            JobStatus::Success
         } else {
-            JobStatus::Failure
+            self.ancestor_status(at)
         };
         let inputs = github_ctx
             .get("event")
@@ -792,7 +825,15 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { m: { requires: [t] } }] } }
     }
 
     #[test]
-    fn rerun_ignores_a_job_that_has_not_ended() {
+    fn rerun_waits_for_the_run_to_end() {
+        let mut g = graph_of("[t, { t: { name: b, requires: [t] } }]");
+        let (a, b) = (id(&g, "t"), id(&g, "b"));
+        g.advance(&ctx());
+        g.finished(a, ok(), &ctx());
+        run(&mut g, b);
+        assert_eq!(g.rerun(a, &ctx()), Vec::<Action>::new());
+        assert_eq!(g.node(b).unwrap().state, State::Running);
+        assert_eq!(g.node(a).unwrap().attempt, 1);
         let mut g = graph_of("[t]");
         let a = g.jobs[0].id;
         g.advance(&ctx());
@@ -831,7 +872,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { m: { requires: [t] } }] } }
     #[test]
     fn a_bad_if_fails_the_job_with_the_error() {
         let yaml = "
-jobs: { t: { runs-on: ubuntu-latest, if: 'github.ref ==', steps: [] } }
+jobs: { t: { runs-on: ubuntu-latest, if: 'true', steps: [] } }
 workflows: { ci: { on: { push: {} }, jobs: [t] } }
 ";
         // The compiler rejects it; build the node by hand to reach the
@@ -854,5 +895,61 @@ workflows: { ci: { on: { push: {} }, jobs: [t] } }
                 .unwrap()
                 .starts_with("if: ")
         );
+    }
+
+    #[test]
+    fn failure_does_not_see_a_skipped_need() {
+        // deploy is skipped by its if:, notify runs only on failure().
+        let yaml = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+  deploy: { runs-on: ubuntu-latest, if: github.ref == 'refs/heads/main', steps: [] }
+  notify: { runs-on: ubuntu-latest, if: failure(), steps: [] }
+workflows: { ci: { on: { push: {} }, jobs: [t, { deploy: { requires: [t] } }, { notify: { requires: [deploy] } }] } }
+";
+        let plan = compile(&parse(yaml).unwrap(), "ci", "r").unwrap();
+        let mut g = Graph::new(
+            plan.jobs
+                .into_iter()
+                .zip(1u64..)
+                .map(|(j, i)| (i, j))
+                .collect(),
+        );
+        g.advance(&ctx());
+        let actions = g.finished(1, ok(), &ctx());
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+        assert_eq!(g.node(3).unwrap().state, State::Done(Conclusion::Skipped));
+        assert_eq!(actions.last(), Some(&Action::RunDone(Conclusion::Success)));
+    }
+
+    #[test]
+    fn failure_sees_a_failed_grandparent_behind_an_always_job() {
+        let mut g = graph_of("[t, { t2: { requires: [t] } }, { t: { name: c, requires: [t2], } }]");
+        // c has no if: so it needs every ancestor to succeed.
+        let (a, b, c) = (id(&g, "t"), id(&g, "t2"), id(&g, "c"));
+        g.advance(&ctx());
+        g.finished(a, done(Conclusion::Failure, &[]), &ctx());
+        g.finished(b, ok(), &ctx());
+        assert_eq!(g.node(c).unwrap().state, State::Done(Conclusion::Skipped));
+
+        let yaml = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+  mid: { runs-on: ubuntu-latest, if: always(), steps: [] }
+  last: { runs-on: ubuntu-latest, if: failure(), steps: [] }
+workflows: { ci: { on: { push: {} }, jobs: [t, { mid: { requires: [t] } }, { last: { requires: [mid] } }] } }
+";
+        let plan = compile(&parse(yaml).unwrap(), "ci", "r").unwrap();
+        let mut g = Graph::new(
+            plan.jobs
+                .into_iter()
+                .zip(1u64..)
+                .map(|(j, i)| (i, j))
+                .collect(),
+        );
+        g.advance(&ctx());
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        let actions = g.finished(2, ok(), &ctx());
+        assert_eq!(actions.last(), Some(&Action::Launch(3)));
     }
 }

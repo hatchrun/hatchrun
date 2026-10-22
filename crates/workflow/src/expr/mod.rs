@@ -92,6 +92,9 @@ pub enum JobStatus {
     Failure,
     /// The run was cancelled.
     Cancelled,
+    /// A job this one depends on was skipped and none failed: neither
+    /// `success()` nor `failure()` holds.
+    Skipped,
 }
 
 /// The functions whose answer depends on where the expression runs.

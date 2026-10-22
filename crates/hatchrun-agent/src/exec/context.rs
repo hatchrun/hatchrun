@@ -218,6 +218,7 @@ impl Contexts {
             JobStatus::Success => "success",
             JobStatus::Failure => "failure",
             JobStatus::Cancelled => "cancelled",
+            JobStatus::Skipped => "skipped",
         };
         self.value["job"]["status"] = json!(text);
     }

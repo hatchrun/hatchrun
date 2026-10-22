@@ -247,6 +247,7 @@ async fn finish(
         JobStatus::Failure => Conclusion::Failure,
         JobStatus::Cancelled if timed_out => Conclusion::Failure,
         JobStatus::Cancelled => Conclusion::Cancelled,
+        JobStatus::Skipped => Conclusion::Skipped,
     };
     job.result(conclusion, outputs, summaries)
 }
