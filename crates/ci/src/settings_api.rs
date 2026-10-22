@@ -33,7 +33,7 @@ use worker::{Method, Request, Result, console_error};
 
 use crate::access::{self, Access, Failure};
 use crate::api::{Cx, Served, Stop, body_cap, name, no_content, now_ms, reply, stop};
-use crate::billing::{self, Hold};
+use crate::billing;
 use crate::launches;
 use crate::secrets::{self, Aad, Keyring};
 use crate::store::{self, CiBilling, Put, TenantRow};
@@ -334,9 +334,6 @@ struct CapBody {
     cap_dollars: u64,
 }
 
-/// How many spend-cap holds a cap change wakes at once.
-const WAKE_HELD: u32 = 5;
-
 async fn cap(cx: &Cx<'_>, org: &str, req: &mut Request, max_body: usize) -> Result<Served> {
     let tenant = match admin_tenant(cx, org).await? {
         Ok(tenant) => tenant,
@@ -354,9 +351,10 @@ async fn cap(cx: &Cx<'_>, org: &str, req: &mut Request, max_body: usize) -> Resu
         Err(message) => return Ok(stop(422, message)),
     };
     store::set_spend_cap(cx.db, &tenant.id, micros, now_ms()).await?;
-    // The jobs waiting on the old cap re-check it now. A failure here
-    // leaves them to the reconciler's backstop: the cap is saved.
-    match ci_wake::held(cx.db, &tenant.id, Hold::SpendCap.as_str(), WAKE_HELD).await {
+    // The jobs waiting on the old cap re-check it now, the rest drain in
+    // order as jobs end. A failure here leaves them to the reconciler's
+    // backstop: the cap is saved.
+    match ci_wake::standing_improved(cx.db, &tenant.id).await {
         Ok(woken) => {
             if let Err(err) = launches::send_wakes(cx.env, &woken).await {
                 console_error!("tenant {}: wake held jobs: {err}", tenant.id);

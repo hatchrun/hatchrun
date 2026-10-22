@@ -2683,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn a_returned_card_wakes_the_oldest_card_holds_up_to_the_cap() {
+    fn a_returned_card_turns_the_holds_into_concurrency_holds_and_wakes_five() {
         use hatchrun_cloud::ci_wake;
         assert_eq!(ci_wake::WAKE_LIMIT, hatchrun_workflow::MAX_RUNNING_JOBS);
         let db = setup();
@@ -2695,9 +2695,36 @@ mod tests {
         }
         let (_, capped) = run_with_job_named(&db, "cap", "queued");
         set_held(&db, capped, "spend_cap", 5);
+        let (_, other) = run_with_job_named(&db, "plain", "queued");
         subscribe(&db, "s1", "ci", "active");
         let woken = db.wait(ci_wake::card_returned(db.db(), "t1")).unwrap();
         assert_eq!(woken_ids(woken), card[..5]);
+        for id in card.iter().chain([&capped]) {
+            assert_eq!(held_of(&db, *id).as_deref(), Some("concurrency"));
+        }
+        assert_eq!(held_of(&db, other), None, "an unheld job stays unheld");
+        // A finishing job wakes the next one in order.
+        let next = db
+            .wait(ci_wake::held(db.db(), "t1", "concurrency", 1))
+            .unwrap();
+        assert_eq!(woken_ids(next), card[..1]);
+    }
+
+    #[test]
+    fn a_new_month_turns_old_spend_cap_holds_into_concurrency_holds() {
+        use hatchrun_cloud::ci_wake;
+        let db = setup();
+        let (_, old) = run_with_job_named(&db, "old", "queued");
+        set_held(&db, old, "spend_cap", 100);
+        let (_, recent) = run_with_job_named(&db, "recent", "queued");
+        set_held(&db, recent, "spend_cap", 10_000);
+        let (_, card) = run_with_job_named(&db, "card", "queued");
+        set_held(&db, card, "card", 100);
+        db.wait(ci_wake::release_spend_caps(db.db(), 5_000))
+            .unwrap();
+        assert_eq!(held_of(&db, old).as_deref(), Some("concurrency"));
+        assert_eq!(held_of(&db, recent).as_deref(), Some("spend_cap"));
+        assert_eq!(held_of(&db, card).as_deref(), Some("card"));
     }
 
     #[test]
