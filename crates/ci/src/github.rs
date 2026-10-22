@@ -157,6 +157,19 @@ pub fn scoped_token(api: &str, installation_id: u64, app_jwt: &str, repo_id: u64
     )
 }
 
+/// The token [`scoped_token`] asked for.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a token.
+pub fn installation_token(response: &Response) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Minted {
+        token: String,
+    }
+    decode::<Minted>(response, "installation token").map(|m| m.token)
+}
+
 /// Revokes the installation token it is sent with.
 #[must_use]
 pub fn revoke_token(api: &str, token: &str) -> Request {
@@ -509,6 +522,15 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn installation_token_reads_the_minted_token() {
+        assert_eq!(
+            installation_token(&answer(201, &[], r#"{"token":"ghs_x","expires_at":"z"}"#)),
+            Ok("ghs_x".into())
+        );
+        assert!(installation_token(&answer(401, &[], "{}")).is_err());
     }
 
     #[test]

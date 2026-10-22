@@ -11,14 +11,16 @@
 //!
 //! - `POST /github/webhook` takes the `push`, `pull_request` and
 //!   `check_run` deliveries that `hatchrun-cloud` forwards.
-//! - `/v1/jobs/*` is what the runner agent on a launched instance
-//!   calls: its job document, log batches, heartbeats and its result.
+//! - `POST /v1/agent/{claim,events,result}` is what the runner agent on
+//!   a launched instance calls: its job document, log batches and
+//!   heartbeats, and its result.
 //! - `/api/*` serves runs, jobs and logs to the app.
 //!
 //! A Cron Trigger runs the reconciler every minute (stuck jobs,
 //! schedules, expiry), and the `hatchrun-ci-launches` queue starts the
 //! instances. Every other path answers 404.
 
+pub mod agent;
 pub mod checks;
 pub mod env;
 pub mod github;
@@ -40,6 +42,9 @@ use worker::{Context, Env, MessageBatch, Method, Request, Response, Result, even
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if req.method() == Method::Post && req.path() == "/github/webhook" {
         return webhook::handle(req, &env).await;
+    }
+    if req.path().starts_with("/v1/agent/") {
+        return agent::handle(req, &env).await;
     }
     Response::error("not found", 404)
 }
