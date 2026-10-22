@@ -636,6 +636,12 @@ fn job_condition_mixed_template_is_a_truthy_string() {
     // Validation and evaluation agree: a bad segment fails both.
     assert!(job_condition(Some("${{ 1 + }} && ${{ true }}"), &ctx, &ok).is_err());
     assert!(job_condition(Some("${{ true }} && ${{ false"), &ctx, &ok).is_err());
+    // A status call does not excuse a later segment that does not parse.
+    assert!(job_condition(Some("${{ always() }} && ${{ 1 + }}"), &ctx, &ok).is_err());
+    assert!(hatchrun_workflow::checks_status("${{ always() }} && ${{ 1 + }}").is_err());
+    // Quoted `${{` inside one whole expression keeps it one expression.
+    let quoted = "${{ contains(github.ref, '${{') }}";
+    assert!(!job_condition(Some(quoted), &ctx, &ok).unwrap());
     // A text prefix or suffix makes it a template too.
     assert!(job_condition(Some("x ${{ false }}"), &ctx, &ok).unwrap());
     // One whole wrapper still evaluates.

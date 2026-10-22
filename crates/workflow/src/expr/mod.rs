@@ -158,16 +158,16 @@ pub fn checks_status(cond: &str) -> Result<bool, ExprError> {
     } else {
         vec![(0, cond)]
     };
+    // Every segment must parse, so keep going after a status call.
+    let mut calls = false;
     for (start, inner) in found {
         let ast = tree(inner).map_err(|e| ExprError {
             message: e.message,
             offset: e.offset + start,
         })?;
-        if eval::calls_status(&ast) {
-            return Ok(true);
-        }
+        calls |= eval::calls_status(&ast);
     }
-    Ok(false)
+    Ok(calls)
 }
 
 /// Whether a step's or job's `if:` holds. No condition means
@@ -190,17 +190,28 @@ pub fn job_condition(
         return Ok(funcs.status() == JobStatus::Success);
     };
     let trimmed = cond.trim();
-    let whole = trimmed
-        .strip_prefix("${{")
-        .and_then(|rest| rest.strip_suffix("}}"))
-        .filter(|inner| !inner.contains("${{"));
-    if whole.is_none() && find_open(trimmed).is_some() {
+    // One `${{ }}` whose closing `}}` ends the condition is a whole
+    // expression, even when a string inside it spells `${{`.
+    let segments = if find_open(trimmed).is_some() {
+        expressions(trimmed)?
+    } else {
+        Vec::new()
+    };
+    let whole = match segments.as_slice() {
+        [(3, inner)] if trimmed.starts_with("${{") && 3 + inner.len() + 2 == trimmed.len() => {
+            Some(*inner)
+        }
+        _ => None,
+    };
+    if whole.is_none() && !segments.is_empty() {
         // The same check as validation: every segment must parse.
         return Ok(checks_status(trimmed)? || funcs.status() == JobStatus::Success);
     }
     let inner = whole.map_or(trimmed, str::trim);
+    // One expression: parse it as is, since a quoted `${{` in it is text.
+    let calls = eval::calls_status(&tree(inner)?);
     let wrapped;
-    let run = if checks_status(inner)? {
+    let run = if calls {
         inner
     } else {
         wrapped = format!("success() && ({inner})");
