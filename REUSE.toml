@@ -14,6 +14,7 @@ path = [
   ".github/**",
   ".gitignore",
   "Cargo.lock",
+  "crates/ci/testdata/*.json",
   "crates/cli/tests/fixtures/e2e/**/*.json",
   "crates/cli/tests/fixtures/this-repository/**",
   "NOTICE",

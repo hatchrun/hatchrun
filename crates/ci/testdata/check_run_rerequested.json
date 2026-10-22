@@ -1,0 +1,16 @@
+{
+  "action": "rerequested",
+  "check_run": {
+    "id": 555,
+    "external_id": "hatchrun-ci:42",
+    "head_sha": "2222222222222222222222222222222222222222"
+  },
+  "sender": { "login": "octocat" },
+  "installation": { "id": 777 },
+  "repository": {
+    "id": 4242,
+    "full_name": "octo/widgets",
+    "default_branch": "main",
+    "private": true
+  }
+}

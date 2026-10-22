@@ -1,0 +1,25 @@
+{
+  "action": "opened",
+  "number": 7,
+  "pull_request": {
+    "number": 7,
+    "head": {
+      "ref": "feature",
+      "sha": "3333333333333333333333333333333333333333",
+      "repo": { "id": 4242, "full_name": "octo/widgets" }
+    },
+    "base": {
+      "ref": "main",
+      "sha": "1111111111111111111111111111111111111111",
+      "repo": { "id": 4242, "full_name": "octo/widgets" }
+    }
+  },
+  "sender": { "login": "octocat" },
+  "installation": { "id": 777 },
+  "repository": {
+    "id": 4242,
+    "full_name": "octo/widgets",
+    "default_branch": "main",
+    "private": false
+  }
+}
