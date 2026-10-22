@@ -356,7 +356,7 @@ impl Cx {
         for key in gh.unknown.keys() {
             self.warn(format!("`{file}`: unknown key `{key}` was dropped"));
         }
-        let permissions = self.permissions(&format!("`{file}`"), gh.permissions.as_ref());
+        let permissions = self.permissions(&format!("`{file}`"), gh.permissions.as_ref(), false);
         let on = self.triggers(file, &gh.on);
         let shared_env = self.env(&format!("`{file}`"), "env", gh.env.as_ref());
         let shared_defaults = self.defaults(&format!("`{file}`"), gh.defaults.as_ref());
@@ -449,7 +449,10 @@ impl Cx {
 
     /// Converts a `permissions:` value. `id-token`, scopes hatchrun does
     /// not know and levels it does not know are dropped with a warning.
-    fn permissions(&mut self, at: &str, value: Option<&Value>) -> Option<Permissions> {
+    /// A value of another shape is dropped too; a job that said it
+    /// then gets no permissions at all, never the workflow's, which
+    /// could be wider than the author meant.
+    fn permissions(&mut self, at: &str, value: Option<&Value>, job: bool) -> Option<Permissions> {
         match value? {
             Value::String(text) if text == "read-all" => Some(Permissions::ReadAll),
             Value::String(text) if text == "write-all" => Some(Permissions::WriteAll),
@@ -487,7 +490,7 @@ impl Cx {
                     "{at}: `permissions: {}` is not read-all, write-all or a map and was dropped",
                     show(other)
                 ));
-                None
+                job.then(|| Permissions::Scopes(BTreeMap::new()))
             }
         }
     }
@@ -689,7 +692,7 @@ impl Cx {
         let outputs = self.env(at, "outputs", gh.outputs.as_ref());
         let env = self.env(at, "env", gh.env.as_ref());
         let defaults = self.defaults(at, gh.defaults.as_ref());
-        let permissions = self.permissions(at, gh.permissions.as_ref());
+        let permissions = self.permissions(at, gh.permissions.as_ref(), true);
         let mut steps: Vec<Step> = gh
             .steps
             .unwrap_or_default()
