@@ -96,7 +96,7 @@ export function CiPages({ session, route }: { session: Session | null; route: Ci
 
 function RepoRuns({ session, route }: { session: Session | null; route: CiRoute }) {
   const { owner, repo } = route;
-  const [first, reload] = useLoad(() => listCiRuns(owner, repo), `${owner}/${repo}`);
+  const [first, reload] = useLoad(() => listCiRuns(owner, repo), `${owner}/${repo}`, true);
   // Runs of later pages, appended by "Load more".
   const [more, setMore] = useState<CiRun[]>([]);
   const [moreError, setMoreError] = useState<Error | null>(null);
@@ -230,7 +230,7 @@ function Crumbs({ route, children }: { route: CiRoute; children: ReactNode }) {
 
 /** The run and its jobs, read again while any of them is unfinished. */
 function useRun(id: string): [ReturnType<typeof useLoad<CiRunDetail>>[0], () => void] {
-  const [detail, reload] = useLoad(() => getCiRun(id), id);
+  const [detail, reload] = useLoad(() => getCiRun(id), id, true);
   const quiet = useCallback(() => reload(), [reload]);
   useRefresh(detail.state === "ready" && detail.data.jobs.some((job) => job.status !== "completed"), quiet);
   return [detail, reload];
@@ -347,6 +347,11 @@ function JobView({
       {detail.state === "loading" && <Spinner />}
       {detail.state === "error" && <Denied error={detail.error} session={session} retry={reload} />}
       {detail.state === "ready" && found === undefined && <p className="muted">This run has no such job.</p>}
+      {detail.state === "ready" && detail.stale && (
+        <p className="font-mono text-xs text-fog" role="status">
+          Could not refresh: {detail.stale.message}. Showing the last result.
+        </p>
+      )}
       {found && <JobHeader job={found} />}
       {found && <JobLog key={found.id} job={found} onCheck={reload} />}
     </Frame>

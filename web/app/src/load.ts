@@ -2,24 +2,48 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+
+import { ApiError } from "./api";
 
 export type Loaded<T> =
   | { state: "loading" }
   | { state: "error"; error: Error }
-  | { state: "ready"; data: T };
+  | { state: "ready"; data: T; /** The last read failed; `data` is from an earlier one. */ stale?: Error };
 
-/** Runs `load` when `key` changes; `reload` runs it again. */
-export function useLoad<T>(load: () => Promise<T>, key: string): [Loaded<T>, () => void] {
+/**
+ * Runs `load` when `key` changes; `reload` runs it again. With `keep`, a
+ * failed read after a good one for the same `key` keeps the good data
+ * and reports the error as `stale`, so a page that refreshes itself does
+ * not lose what it shows to one failed refresh. A refusal (401, 403 or
+ * 404) is never kept: the viewer lost access.
+ */
+export function useLoad<T>(load: () => Promise<T>, key: string, keep = false): [Loaded<T>, () => void] {
   const [result, setResult] = useState<Loaded<T>>({ state: "loading" });
+  const readKey = useRef<string | null>(null);
   const [round, setRound] = useState(0);
 
   useEffect(() => {
     let current = true;
     load().then(
-      (data) => current && setResult({ state: "ready", data }),
-      (error: unknown) =>
-        current && setResult({ state: "error", error: error instanceof Error ? error : new Error(String(error)) }),
+      (data) => {
+        if (current) {
+          readKey.current = key;
+          setResult({ state: "ready", data });
+        }
+      },
+      (failure: unknown) => {
+        if (!current) {
+          return;
+        }
+        const error = failure instanceof Error ? failure : new Error(String(failure));
+        const refused = error instanceof ApiError && [401, 403, 404].includes(error.status);
+        setResult((last) =>
+          keep && !refused && last.state === "ready" && readKey.current === key
+            ? { state: "ready", data: last.data, stale: error }
+            : { state: "error", error },
+        );
+      },
     );
     return () => {
       current = false;

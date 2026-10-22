@@ -42,5 +42,14 @@ export function Await<T>({
   if (loaded.state === "error") {
     return <LoadError error={loaded.error} retry={retry} />;
   }
-  return <>{children(loaded.data)}</>;
+  return (
+    <>
+      {loaded.stale && (
+        <p className="font-mono text-xs text-fog" role="status">
+          Could not refresh: {loaded.stale.message}. Showing the last result.
+        </p>
+      )}
+      {children(loaded.data)}
+    </>
+  );
 }
