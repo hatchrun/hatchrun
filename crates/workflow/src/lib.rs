@@ -11,6 +11,7 @@ pub mod config;
 pub mod convert;
 pub mod diagnostic;
 pub mod expr;
+pub mod job;
 pub mod plan;
 pub mod split;
 pub mod templates;
@@ -23,6 +24,10 @@ pub use config::{
 pub use convert::{Conversion, convert, to_yaml};
 pub use diagnostic::Diagnostic;
 pub use expr::{ExprError, Functions, JobStatus, checks_status, evaluate, interpolate, truthy};
+pub use job::{
+    Annotation, AnnotationLevel, CacheService, Conclusion, Github, JobDocument, JobResult, Need,
+    StepSummary,
+};
 pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, validate};
 pub use split::split;
 pub use templates::{Arch, TEMPLATES, Template, template, template_labels};

@@ -13,10 +13,12 @@
 mod broker;
 mod cache;
 mod envfile;
+mod exec;
 mod imds;
 mod metrics;
 mod runner;
 mod source;
+mod split;
 mod ssm;
 mod telemetry;
 
@@ -83,9 +85,67 @@ enum Command {
         #[arg(long, default_value = "/run/hatchrun/launch")]
         mark: PathBuf,
     },
+    /// Run one job from a job document, without GitHub's runner.
+    ///
+    /// Exits 0 when the job succeeds, 1 when it does not, and 2 when the
+    /// document cannot be read or describes an approval job.
+    Exec {
+        /// The job document, as JSON.
+        job_file: PathBuf,
+        /// Work directory, laid out like GitHub's hosted runners.
+        #[arg(long, default_value = "/home/runner/work")]
+        work_dir: PathBuf,
+        /// User steps run as. Pass an empty value to keep the agent's user.
+        #[arg(long, default_value = "runner")]
+        runner_user: String,
+        /// KEY=VALUE file that becomes the steps' environment.
+        #[arg(long, default_value = "/etc/environment")]
+        env_file: PathBuf,
+        /// Node binary that runs JavaScript actions.
+        #[arg(long)]
+        node: Option<PathBuf>,
+        /// Directory that holds the archives of cache, workspace and
+        /// test result steps.
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Where the agent keeps what the runner user must not reach,
+        /// such as the staging area for cache and workspace archives.
+        /// Created if missing; every directory on the path must belong
+        /// to the agent or root and be closed to others.
+        #[arg(long, default_value = "/var/lib/hatchrun-agent")]
+        state_dir: PathBuf,
+        /// Where to write the job result, as JSON.
+        #[arg(long)]
+        result: Option<PathBuf>,
+        /// How long one `timeout-minutes` minute lasts. Tests shorten it.
+        #[arg(long, default_value = "60s", value_parser = humantime::parse_duration, hide = true)]
+        minute: Duration,
+    },
+    /// Print this parallel node's share of a list of tests.
+    ///
+    /// Reads `HATCHRUN_NODE_INDEX`, `HATCHRUN_NODE_TOTAL` and
+    /// `HATCHRUN_TIMINGS`, which `exec` sets for a parallel job. Items
+    /// come from the arguments, or from stdin one per line. Outside a
+    /// parallel job every item is printed. Exits 2 on unusable input.
+    Split {
+        /// How to split. Only `timings` is supported.
+        #[arg(long, value_enum)]
+        by: SplitBy,
+        /// The items to split. Without any, stdin is read.
+        items: Vec<String>,
+    },
 }
 
-#[tokio::main(flavor = "current_thread")]
+/// How `split` divides the items.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SplitBy {
+    /// By the timings recorded for earlier runs.
+    Timings,
+}
+
+// A second thread keeps the SIGTERM listener and the job timer running
+// while a long `hashFiles` call holds the main one.
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -97,6 +157,42 @@ async fn main() -> ExitCode {
     let args = Args::parse();
     let result = match &args.command {
         Some(Command::Detect { mark }) => detect(&args.imds_endpoint, mark).await,
+        Some(Command::Exec {
+            job_file,
+            work_dir,
+            runner_user,
+            env_file,
+            node,
+            store,
+            state_dir,
+            result,
+            minute,
+        }) => {
+            let opts = exec::Options {
+                work_dir: work_dir.clone(),
+                runner_user: Some(runner_user.clone()).filter(|user| !user.is_empty()),
+                env_file: env_file.clone(),
+                node: node.clone(),
+                store: store.clone(),
+                state_dir: state_dir.clone(),
+                tool_cache: PathBuf::from("/opt/hostedtoolcache"),
+                minute: *minute,
+            };
+            let code = exec_command(job_file, &opts, result.as_deref()).await;
+            // A blocking task that outlived the job, such as an archive
+            // still being read, must not keep the process up once the
+            // result is written.
+            {
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+            }
+            std::process::exit(code);
+        }
+        Some(Command::Split {
+            by: SplitBy::Timings,
+            items,
+        }) => return split::run(items.clone()),
         None => run(args).await,
     };
     match result {
@@ -106,6 +202,90 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Runs the job file and returns the exit code: 0 success, 1 the job
+/// did not succeed or the run failed, 2 the document cannot be used.
+/// With `result`, every exit leaves a result file behind.
+async fn exec_command(job_file: &Path, opts: &exec::Options, result: Option<&Path>) -> i32 {
+    let doc = match std::fs::read(job_file)
+        .with_context(|| format!("read {}", job_file.display()))
+        .and_then(|bytes| {
+            serde_json::from_slice::<hatchrun_workflow::JobDocument>(&bytes)
+                .with_context(|| format!("parse {}", job_file.display()))
+        }) {
+        Ok(doc) => doc,
+        Err(err) => {
+            error!("{err:#}");
+            return failed(result, 2, &exec::mask::Masker::default());
+        }
+    };
+    let mut masker = exec::mask::Masker::default();
+    for secret in doc.secrets.values() {
+        masker.add(secret);
+    }
+    masker.add(&doc.github.token);
+    if matches!(doc.job.kind, hatchrun_workflow::JobKind::Approval) {
+        error!("approval jobs do not run on a runner");
+        return failed(result, 2, &masker);
+    }
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(err) => {
+            error!("listen for SIGTERM: {err}");
+            return failed(result, 1, &masker);
+        }
+    };
+    // Each SIGTERM bumps the count. The first cancels the job, the
+    // second stops it for good.
+    let (requests, cancel) = tokio::sync::watch::channel(0u32);
+    tokio::spawn(async move {
+        while terminate.recv().await.is_some() {
+            requests.send_modify(|n| *n += 1);
+        }
+    });
+    let mut sink = exec::sink::TextSink::new(std::io::stdout());
+    let outcome = exec::run_job(doc, opts, &mut sink, cancel).await;
+    let job = match outcome {
+        Ok(job) => job,
+        Err(err) => {
+            // The job could not start, but the control plane still gets
+            // a result to read. The message can name a secret that a
+            // path or a user name happens to hold.
+            error!("{}", masker.mask(&format!("{err:#}")));
+            return failed(result, 1, &masker);
+        }
+    };
+    if let Some(path) = result
+        && let Err(err) = write_result(path, &job)
+    {
+        error!("{err:#}");
+        return 1;
+    }
+    i32::from(job.conclusion != hatchrun_workflow::Conclusion::Success)
+}
+
+/// Writes a failed result to `result`, if there is a path, and returns
+/// `code`.
+fn failed(result: Option<&Path>, code: i32, masker: &exec::mask::Masker) -> i32 {
+    let failure = hatchrun_workflow::JobResult {
+        conclusion: hatchrun_workflow::Conclusion::Failure,
+        outputs: std::collections::BTreeMap::new(),
+        steps: Vec::new(),
+        annotations: Vec::new(),
+    };
+    if let Some(path) = result
+        && let Err(err) = write_result(path, &failure)
+    {
+        error!("{}", masker.mask(&format!("{err:#}")));
+    }
+    code
+}
+
+/// Writes the job result as JSON.
+fn write_result(path: &Path, job: &hatchrun_workflow::JobResult) -> Result<()> {
+    let bytes = serde_json::to_vec(job).context("serialize the result")?;
+    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
 }
 
 async fn detect(imds_endpoint: &str, mark: &Path) -> Result<()> {

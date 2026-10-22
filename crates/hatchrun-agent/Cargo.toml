@@ -12,6 +12,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aho-corasick = "1.1.5"
 anyhow = "1.0.104"
 aws-config = { version = "1.12.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { version = "1.128.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
@@ -23,13 +24,19 @@ getrandom = "0.4.3"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
 humantime = "2.4.0"
+hatchrun-workflow = { path = "../workflow" }
 hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
-nix = { version = "0.31.3", features = ["fs", "user", "process", "signal"] }
+nix = { version = "0.31.3", features = ["dir", "fs", "user", "process", "signal"] }
+percent-encoding = "2.3.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = "2.0.0"
 serde_json = "1.0.154"
-tokio = { version = "1.53.2", features = ["rt", "macros", "time", "process", "signal", "io-util", "net", "sync"] }
+sha2 = "0.11.0"
+tokio = { version = "1.53.2", features = ["rt", "rt-multi-thread", "macros", "time", "process", "signal", "io-util", "net", "sync"] }
+tempfile = "3.27.0"
+tar = { version = "0.4.45", default-features = false }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
@@ -37,6 +44,5 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 workspace = true
 
 [dev-dependencies]
-tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["rt", "macros", "time", "process", "signal", "io-util", "test-util"] }
 wiremock = "0.6.5"

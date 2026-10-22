@@ -11,6 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 
+use serde::de::{self, Deserializer};
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{
@@ -87,7 +90,7 @@ const STEP_KEYS: &[&str] = &[
 const ENTRY_KEYS: &[&str] = &["name", "requires", "type", "branches", "tags", "matrix"];
 
 /// The jobs one workflow runs for one ref.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Plan {
     /// The workflow's name.
     pub workflow: String,
@@ -97,7 +100,7 @@ pub struct Plan {
 
 /// One job of a plan: one matrix entry and one parallel node of a
 /// workflow job.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PlannedJob {
     /// Unique in the plan: the entry's id, then `(<v1>, <v2>)` for a
     /// matrix entry and `[<i+1>/<n>]` for a parallel node.
@@ -127,20 +130,33 @@ pub struct PlannedJob {
 }
 
 /// What a planned job does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JobKind {
     /// Runs steps on a runner made from the template.
     Run {
-        /// The runner template.
+        /// The runner template. Serialized as its first label.
+        #[serde(serialize_with = "ser_template", deserialize_with = "de_template")]
         template: &'static Template,
     },
     /// Waits for a person to approve.
     Approval,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn ser_template<S: Serializer>(template: &&'static Template, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(template.labels[0])
+}
+
+fn de_template<'de, D: Deserializer<'de>>(d: D) -> Result<&'static Template, D::Error> {
+    let label = String::deserialize(d)?;
+    template(&label).ok_or_else(|| de::Error::custom(format!("unknown template `{label}`")))
+}
+
 /// One step of a planned job. Commands are expanded, so there is no
 /// command step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PlannedStep {
     /// A shell command.
     Run(RunStep),

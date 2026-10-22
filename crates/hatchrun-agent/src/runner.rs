@@ -17,7 +17,8 @@ use tracing::{info, warn};
 
 use crate::envfile;
 
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub(crate) const DEFAULT_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// The runner runs this script before "Initialize containers" in every
 /// job and applies what it writes to `$GITHUB_ENV`.
@@ -189,7 +190,7 @@ fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn home_of(name: &str) -> Result<String> {
+pub(crate) fn home_of(name: &str) -> Result<String> {
     let user = nix::unistd::User::from_name(name)
         .with_context(|| format!("look up user {name}"))?
         .with_context(|| format!("user {name} does not exist"))?;
@@ -200,7 +201,7 @@ fn home_of(name: &str) -> Result<String> {
 /// `uid()` drops supplementary groups, which would take away `docker`.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn run_as(command: &mut Command, name: &str) -> Result<()> {
+pub(crate) fn run_as(command: &mut Command, name: &str) -> Result<()> {
     use std::ffi::CString;
 
     use nix::unistd::{User, getgrouplist, setgid, setgroups, setuid};
@@ -227,7 +228,7 @@ fn run_as(command: &mut Command, name: &str) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_as(_: &mut Command, _: &str) -> Result<()> {
+pub(crate) fn run_as(_: &mut Command, _: &str) -> Result<()> {
     anyhow::bail!("running the runner as another user is only supported on Linux")
 }
 
