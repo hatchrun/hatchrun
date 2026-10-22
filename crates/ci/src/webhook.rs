@@ -110,7 +110,16 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
     if store::delivery_seen(&db, guid).await? {
         return Response::from_json(&json!({ "duplicate": guid }));
     }
-    let trigger = intake::parse(kind, body).map_err(|err| fail(format!("bad payload: {err}")))?;
+    let trigger = match intake::parse(kind, body) {
+        Ok(trigger) => trigger,
+        Err(err) => {
+            // The payload is signed but unreadable, and a redelivery
+            // would be the same bytes: record it and answer 400.
+            worker::console_error!("webhook {kind} {guid}: bad payload: {err}");
+            store::record_delivery(&db, guid, kind, now_ms()).await?;
+            return Response::error("bad payload", 400);
+        }
+    };
     let (installation_id, repo) = match &trigger {
         Trigger::Ignored(reason) => return reply(&Outcome::Ignored(reason.clone())),
         Trigger::Push(p) => (p.installation_id, &p.repo),
