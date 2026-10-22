@@ -29,7 +29,8 @@ on:
 permissions: {}
 
 concurrency:
-  group: deploy-cloud
+  # One group for both: each runs migrate.sh, and the runs must not overlap.
+  group: deploy-database-migrations
   cancel-in-progress: false
 
 env:

@@ -7,12 +7,18 @@ name: deploy-ci
 # hatchrun-ci-logs bucket. The account comes from the
 # CLOUDFLARE_ACCOUNT_ID secret.
 #
-# The API token cannot create Workers, so the first deploy of hatchrun-ci
-# is by hand: create the R2 bucket, the hatchrun-ci-launches queue and
-# its -dlq, deploy once with `npx wrangler deploy` from crates/ci, then
-# let this workflow take over. Its CI_ROLE_ARN, CI_LAUNCH_TEMPLATE_ID and CI_SUBNET_IDS
-# repository variables are the RoleArn, LaunchTemplateId and SubnetIds
-# outputs of the stack in deploy/cloudformation/ci-account.yaml.
+# The API token cannot create Workers, and deploy-cloud.yml binds to
+# hatchrun-ci, so the first deploy is by hand, in this order, before the
+# change that adds this workflow merges:
+#   1. Create the R2 bucket hatchrun-ci-logs and the queues
+#      hatchrun-ci-launches and hatchrun-ci-launches-dlq.
+#   2. Apply the lifecycle: `npx wrangler r2 bucket lifecycle set
+#      hatchrun-ci-logs --file r2-lifecycle.json` from crates/ci.
+#   3. Deploy the Worker once: `npx wrangler deploy` from crates/ci.
+#   4. Merge. This workflow takes over from then on.
+# Its CI_ROLE_ARN, CI_LAUNCH_TEMPLATE_ID and CI_SUBNET_IDS repository
+# variables are the RoleArn, LaunchTemplateId and SubnetIds outputs of
+# the stack in deploy/cloudformation/ci-account.yaml.
 
 on:
   push:
@@ -29,7 +35,8 @@ on:
 permissions: {}
 
 concurrency:
-  group: deploy-ci
+  # One group for both: each runs migrate.sh, and the runs must not overlap.
+  group: deploy-database-migrations
   cancel-in-progress: false
 
 env:
