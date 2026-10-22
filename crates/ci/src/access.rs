@@ -179,6 +179,46 @@ pub async fn resolve(
     }
 }
 
+/// What GitHub's answer to the membership call means for an admin
+/// check at `now_secs`.
+///
+/// # Errors
+///
+/// GitHub rate limits the user's token, or failed.
+pub fn admin_verdict(
+    response: &hatchrun_cloud::http::Response,
+    now_secs: u64,
+) -> Result<bool, Failure> {
+    if let Some(wait) = github::throttle(response, now_secs, 0) {
+        return Err(Failure::Retry(wait));
+    }
+    // 403: the token or the App cannot see the organization's members.
+    // Neither says the user is an admin.
+    if response.status == 403 {
+        return Ok(false);
+    }
+    hatchrun_cloud::github::parse_membership(response)
+        .map(|membership| membership.is_some_and(|m| m.is_admin()))
+        .map_err(|err| Failure::Worker(worker::Error::RustError(format!("membership: {err}"))))
+}
+
+/// Whether the session's user is an active admin of `org`, by GitHub's
+/// word on every call.
+///
+/// # Errors
+///
+/// The call to GitHub failed, or GitHub asks to wait. The caller never
+/// reads that as "not an admin".
+pub async fn org_admin(settings: &Settings, session: &Session, org: &str) -> Result<bool, Failure> {
+    let request = hatchrun_cloud::github::membership(&settings.github_api, &session.token, org);
+    let response = send(&request).await.map_err(|err| {
+        Failure::Worker(worker::Error::RustError(format!(
+            "membership of {org}: {err}"
+        )))
+    })?;
+    admin_verdict(&response, worker::Date::now().as_millis() / 1000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +322,31 @@ mod tests {
     #[test]
     fn access_is_ordered() {
         assert!(Access::None < Access::Read && Access::Read < Access::Write);
+    }
+
+    #[test]
+    fn only_an_active_admin_passes() {
+        let ok = |role: &str, state: &str| {
+            answer(
+                200,
+                &[],
+                &format!(
+                    r#"{{"role":"{role}","state":"{state}","organization":{{"id":1,"login":"acme","avatar_url":""}}}}"#
+                ),
+            )
+        };
+        assert!(admin_verdict(&ok("admin", "active"), 0).unwrap());
+        assert!(!admin_verdict(&ok("member", "active"), 0).unwrap());
+        assert!(!admin_verdict(&ok("admin", "pending"), 0).unwrap());
+        assert!(!admin_verdict(&answer(404, &[], ""), 0).unwrap());
+        assert!(!admin_verdict(&answer(403, &[], "Resource not accessible"), 0).unwrap());
+        assert!(matches!(
+            admin_verdict(&answer(429, &[], ""), 1000),
+            Err(Failure::Retry(60))
+        ));
+        assert!(matches!(
+            admin_verdict(&answer(502, &[], ""), 0),
+            Err(Failure::Worker(_))
+        ));
     }
 }

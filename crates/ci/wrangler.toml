@@ -76,8 +76,9 @@ max_retries = 3
 
 # Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY,
 # OIDC_SIGNING_KEY (signs the token for AssumeRoleWithWebIdentity),
-# BROKER_TOKEN (shared with hatchrun-broker) and CI_TOKEN_KEY (the HMAC
-# key of job tokens).
+# BROKER_TOKEN (shared with hatchrun-broker), CI_TOKEN_KEY (the HMAC
+# key of job tokens) and POLAR_ACCESS_TOKEN (checkout, portal and the
+# usage events; the same token hatchrun-cloud holds).
 # Variables: those below.
 [vars]
 # production, staging or dev. The local launcher backend is refused in
@@ -106,3 +107,8 @@ CI_REGION = "us-east-1"
 CI_ROLE_ARN = ""
 CI_LAUNCH_TEMPLATE_ID = ""
 CI_SUBNET_IDS = ""
+# The Polar product of hatchrun CI, the same id as hatchrun-cloud's
+# POLAR_CI_PRODUCT_ID. Checkout answers 503 while it is empty.
+# POLAR_API_URL points the Worker at Polar's sandbox
+# (https://sandbox-api.polar.sh).
+POLAR_CI_PRODUCT_ID = ""

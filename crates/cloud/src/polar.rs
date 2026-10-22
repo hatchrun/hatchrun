@@ -272,6 +272,54 @@ pub fn ingest(api: &str, token: &str, events: &[Minutes<'_>]) -> Request {
         .body(serde_json::json!({ "events": events }).to_string())
 }
 
+/// Name of the events that carry a CI job attempt's billing units. The
+/// CI usage meter sums their `units`.
+pub const CI_USAGE_EVENT: &str = "ci.usage";
+
+/// One CI job attempt's usage, as Polar's meter takes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiUsage<'a> {
+    /// The job.
+    pub job_id: u64,
+    /// The attempt, so a re-run counts apart from the first run.
+    pub attempt: u32,
+    /// The tenant, Polar's external customer id.
+    pub tenant: &'a str,
+    /// The runner template's label.
+    pub template: &'a str,
+    /// The minutes the attempt ran.
+    pub minutes: u64,
+    /// The billing units: the minutes weighted by the template.
+    pub units: u64,
+    /// When it completed, ISO 8601.
+    pub at: String,
+}
+
+/// Sends CI usage to Polar. Each event's `external_id` names the job and
+/// the attempt, so an event sent again after a lost answer is skipped
+/// as a duplicate and never counted twice.
+#[must_use]
+pub fn ci_ingest(api: &str, token: &str, events: &[CiUsage<'_>]) -> Request {
+    let events: Vec<_> = events
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "name": CI_USAGE_EVENT,
+                "external_customer_id": event.tenant,
+                "external_id": format!("ci:{}:{}", event.job_id, event.attempt),
+                "timestamp": event.at,
+                "metadata": {
+                    "units": event.units,
+                    "minutes": event.minutes,
+                    "template": event.template,
+                },
+            })
+        })
+        .collect();
+    call("POST", format!("{api}/v1/events/ingest"), token)
+        .body(serde_json::json!({ "events": events }).to_string())
+}
+
 #[derive(Deserialize)]
 struct Ingested {
     inserted: u32,
@@ -685,6 +733,35 @@ mod tests {
                 body: br#"{"detail":[]}"#.to_vec(),
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn ci_ingest_names_job_and_attempt() {
+        let request = ci_ingest(
+            API,
+            "t",
+            &[CiUsage {
+                job_id: 7,
+                attempt: 2,
+                tenant: "abcdefgh12345678",
+                template: "ubuntu-26.04-8core",
+                minutes: 5,
+                units: 20,
+                at: "2026-10-14T10:09:30Z".to_owned(),
+            }],
+        );
+        assert_eq!(request.url, "https://api.polar.sh/v1/events/ingest");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "events": [{
+                "name": "ci.usage",
+                "external_customer_id": "abcdefgh12345678",
+                "external_id": "ci:7:2",
+                "timestamp": "2026-10-14T10:09:30Z",
+                "metadata": { "units": 20, "minutes": 5, "template": "ubuntu-26.04-8core" },
+            }] })
         );
     }
 
