@@ -74,6 +74,8 @@ pub struct LogWriter {
     dropped_lines: u64,
     /// The number the next chunk gets.
     chunks: u32,
+    /// The size in bytes of each numbered chunk, in order.
+    sizes: Vec<u32>,
     #[serde(skip)]
     open: String,
 }
@@ -111,6 +113,12 @@ impl LogWriter {
         self.bytes
     }
 
+    /// The size in bytes of each numbered chunk.
+    #[must_use]
+    pub fn chunk_sizes(&self) -> &[u32] {
+        &self.sizes
+    }
+
     /// How many numbered chunks exist, which is also the number the
     /// next one gets.
     #[must_use]
@@ -125,10 +133,18 @@ impl LogWriter {
     }
 
     /// Starts step `index`: writes `== {name}` and records where it is.
-    /// A header is always written, whatever the size of the log.
+    /// Past [`MAX_LOG_BYTES`] it only counts a drop, like a line.
     pub fn step_started(&mut self, index: usize, name: &str) {
+        self.step_started_within(index, name, MAX_LOG_BYTES);
+    }
+
+    fn step_started_within(&mut self, index: usize, name: &str, cap: u64) {
         let name = clip(name, MAX_NAME_BYTES);
         let offset = self.bytes;
+        if self.bytes + "== ".len() as u64 + name.len() as u64 + 1 > cap {
+            self.dropped_lines += 1;
+            return;
+        }
         self.push(&format!("== {name}"));
         if self.steps.len() < MAX_MARKS {
             self.steps.push(StepMark {
@@ -168,6 +184,8 @@ impl LogWriter {
             let end = start + CHUNK_BYTES + newline;
             chunks.push((self.chunks, self.open[start..end].to_owned()));
             self.chunks += 1;
+            self.sizes
+                .push(u32::try_from(end - start).unwrap_or(u32::MAX));
             start = end;
         }
         self.open.drain(..start);
@@ -190,6 +208,8 @@ impl LogWriter {
         } else {
             let number = self.chunks;
             self.chunks += 1;
+            self.sizes
+                .push(u32::try_from(self.open.len()).unwrap_or(u32::MAX));
             Some((number, std::mem::take(&mut self.open)))
         };
         let index = LogIndex {
@@ -201,16 +221,16 @@ impl LogWriter {
     }
 }
 
-/// The key of a finished log in the logs bucket.
+/// The key of the log of attempt `attempt` of a job in the logs bucket.
 #[must_use]
-pub fn log_key(tenant: &str, repo_id: u64, run_id: u64, job_id: u64) -> String {
-    format!("logs/{tenant}/{repo_id}/{run_id}/{job_id}.log.gz")
+pub fn log_key(tenant: &str, repo_id: u64, run_id: u64, job_id: u64, attempt: u32) -> String {
+    format!("logs/{tenant}/{repo_id}/{run_id}/{job_id}/{attempt}.log.gz")
 }
 
-/// The key of a finished log's index in the logs bucket.
+/// The key of the index of that log.
 #[must_use]
-pub fn index_key(tenant: &str, repo_id: u64, run_id: u64, job_id: u64) -> String {
-    format!("logs/{tenant}/{repo_id}/{run_id}/{job_id}.index.json")
+pub fn index_key(tenant: &str, repo_id: u64, run_id: u64, job_id: u64, attempt: u32) -> String {
+    format!("logs/{tenant}/{repo_id}/{run_id}/{job_id}/{attempt}.index.json")
 }
 
 /// Gzips text as it comes, so a log of many chunks is never held whole
@@ -363,6 +383,57 @@ mod tests {
     }
 
     #[test]
+    fn step_headers_count_against_the_cap() {
+        let mut w = LogWriter::default();
+        w.step_started_within(0, "a", 11);
+        w.step_started_within(1, "b", 11);
+        w.step_started_within(2, "c", 11);
+        w.line_within("x", 11);
+        let (text, index) = whole(&mut w);
+        assert_eq!(index.steps.len(), 2);
+        assert_eq!(index.dropped_lines, 2);
+        assert_eq!(
+            text,
+            "== a\n== b\n[hatchrun] 2 lines were dropped: the log is over 32 MiB\n"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_headers_stays_under_the_cap_and_the_note() {
+        let mut w = LogWriter::default();
+        let mut taken = 0_u64;
+        for i in 0..400_000 {
+            w.step_started(i, &"n".repeat(MAX_NAME_BYTES));
+            for (_, chunk) in w.take_full_chunks() {
+                taken += chunk.len() as u64;
+            }
+        }
+        let (last, index) = w.finish();
+        taken += last.map_or(0, |(_, c)| c.len() as u64);
+        assert!(index.dropped_lines > 0);
+        assert!(taken <= MAX_LOG_BYTES + 100);
+        assert_eq!(taken, index.bytes);
+    }
+
+    #[test]
+    fn chunk_sizes_add_up_to_the_stored_text() {
+        let mut w = LogWriter::default();
+        for _ in 0..200 {
+            w.line(&"x".repeat(999));
+        }
+        let mut total = 0;
+        for (_, chunk) in w.take_full_chunks() {
+            total += chunk.len();
+        }
+        let (last, index) = w.finish();
+        total += last.unwrap().1.len();
+        let sizes: Vec<usize> = w.chunk_sizes().iter().map(|s| *s as usize).collect();
+        assert_eq!(u32::try_from(sizes.len()).unwrap(), w.chunk_count());
+        assert_eq!(sizes.iter().sum::<usize>(), total);
+        assert_eq!(total as u64, index.bytes);
+    }
+
+    #[test]
     fn a_log_under_the_cap_has_no_note() {
         let mut w = LogWriter::default();
         w.line("ok");
@@ -420,8 +491,9 @@ mod tests {
 
     #[test]
     fn keys_follow_the_layout() {
-        assert_eq!(log_key("t1", 9, 7, 3), "logs/t1/9/7/3.log.gz");
-        assert_eq!(index_key("t1", 9, 7, 3), "logs/t1/9/7/3.index.json");
+        assert_eq!(log_key("t1", 9, 7, 3, 2), "logs/t1/9/7/3/2.log.gz");
+        assert_eq!(index_key("t1", 9, 7, 3, 2), "logs/t1/9/7/3/2.index.json");
+        assert_ne!(log_key("t1", 9, 7, 3, 1), log_key("t1", 9, 7, 3, 2));
     }
 
     #[test]

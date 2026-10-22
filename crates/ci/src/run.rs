@@ -31,7 +31,7 @@
 //! | `POST /purge` | none | `204` |
 //! | `GET /state` | none | `200` [`RunState`] |
 //! | `GET /live?job=ID` | WebSocket upgrade | `101`, `409` ended |
-//! | `GET /log?job=ID` | none | `200` the newest text, `404` none |
+//! | `GET /log?job=ID[&offset=N]` | none | `200` text, `404` none |
 //!
 //! `Line` events of a batch go to the job's [`LogWriter`]: each full
 //! chunk is stored as `log:<job>:<n:08>` and the rest of the writer
@@ -281,6 +281,10 @@ pub struct Sealed {
     pub index: LogIndex,
     /// How many numbered chunks hold the text, from 0.
     pub chunks: u32,
+    /// The size of each chunk in bytes.
+    pub sizes: Vec<u32>,
+    /// The job attempt the log belongs to.
+    pub attempt: u32,
 }
 
 /// Everything the object's single alarm waits for, in Unix
@@ -750,6 +754,54 @@ pub(crate) fn mark_upload_due(deadlines: &mut Deadlines, now_ms: u64) {
     );
 }
 
+/// Whether the uploads may start: their time came, or `force`.
+pub(crate) fn upload_claimable(deadlines: &Deadlines, now_ms: u64, force: bool) -> bool {
+    deadlines
+        .upload_retry_at
+        .is_some_and(|at| force || at <= now_ms)
+}
+
+/// Where the data of byte offset `from` is among chunks of `sizes`
+/// bytes: the first chunk that ends after it (the count of chunks when
+/// `from` lies in the open chunk) and the offset where that chunk
+/// starts.
+pub(crate) fn chunks_from(sizes: &[u32], from: u64) -> (u32, u64) {
+    let mut start = 0_u64;
+    for (number, size) in sizes.iter().enumerate() {
+        let end = start + u64::from(*size);
+        if end > from {
+            return (u32::try_from(number).unwrap_or(u32::MAX), start);
+        }
+        start = end;
+    }
+    (u32::try_from(sizes.len()).unwrap_or(u32::MAX), start)
+}
+
+/// `text` (which starts at byte offset `start`) from byte offset
+/// `from`, at most `max` bytes: the offset the answer starts at and the
+/// text. It starts at a character boundary and ends at a line end when
+/// the cut is inside a line.
+pub(crate) fn page_of(text: &str, start: u64, from: u64, max: usize) -> (u64, &str) {
+    let mut skip = usize::try_from(from.saturating_sub(start))
+        .unwrap_or(usize::MAX)
+        .min(text.len());
+    while !text.is_char_boundary(skip) {
+        skip += 1;
+    }
+    let rest = &text[skip..];
+    let mut end = max.min(rest.len());
+    if end < rest.len() {
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        // A cut inside a line moves back to the last line end.
+        if let Some(at) = rest[..end].rfind('\n') {
+            end = at + 1;
+        }
+    }
+    (start + skip as u64, &rest[..end])
+}
+
 /// When uploads that are still pending are tried again.
 pub(crate) fn upload_deadline(pending: bool, now_ms: u64) -> Option<u64> {
     pending.then_some(now_ms + UPLOAD_RETRY_MS)
@@ -1168,6 +1220,8 @@ mod object {
         settings: OnceCell<Settings>,
         /// Whether a request or the alarm is running the todo list.
         draining: Cell<bool>,
+        /// Whether a request or the alarm is uploading finished logs.
+        uploading: Cell<bool>,
     }
 
     impl RunObject {
@@ -1185,6 +1239,7 @@ mod object {
                 &self.env,
                 &self.turn,
                 &self.draining,
+                &self.uploading,
                 settings,
             ))
         }
@@ -1198,6 +1253,7 @@ mod object {
                 turn: Mutex::new(()),
                 settings: OnceCell::new(),
                 draining: Cell::new(false),
+                uploading: Cell::new(false),
             }
         }
 
@@ -1220,6 +1276,7 @@ mod object {
                     job,
                     attempt.and_then(|a| u32::try_from(a).ok()),
                     Ident::from_query(number("run"), tenant),
+                    number("offset"),
                 )
                 .await
         }
@@ -1271,6 +1328,7 @@ struct Cx<'a> {
     env: Env,
     turn: &'a Mutex<()>,
     draining: &'a Cell<bool>,
+    uploading: &'a Cell<bool>,
     settings: &'a Settings,
     now: u64,
     db: OnceCell<Db>,
@@ -1301,6 +1359,7 @@ impl<'a> Cx<'a> {
         env: &Env,
         turn: &'a Mutex<()>,
         draining: &'a Cell<bool>,
+        uploading: &'a Cell<bool>,
         settings: &'a Settings,
     ) -> Self {
         Self {
@@ -1309,6 +1368,7 @@ impl<'a> Cx<'a> {
             env: env.clone(),
             turn,
             draining,
+            uploading,
             settings,
             now: now_ms(),
             db: OnceCell::new(),
@@ -1332,6 +1392,7 @@ impl<'a> Cx<'a> {
         job: Option<u64>,
         attempt: Option<u32>,
         ident: Option<Ident>,
+        offset: Option<u64>,
     ) -> Result<Response> {
         let method = req.method();
         match (&method, path) {
@@ -1350,7 +1411,7 @@ impl<'a> Cx<'a> {
                 return if path == "/live" {
                     self.live(req, job).await
                 } else {
-                    self.log(job).await
+                    self.log(job, offset).await
                 };
             }
             (Method::Get, "/state") => {
@@ -1480,7 +1541,7 @@ impl<'a> Cx<'a> {
             failed.snapshot = true;
         }
         if due.upload
-            && let Err(err) = self.upload_logs().await
+            && let Err(err) = self.upload_logs(false).await
         {
             worker::console_error!("alarm: uploads: {err}");
             failed.upload = true;
@@ -1829,7 +1890,10 @@ impl<'a> Cx<'a> {
                     state.completed_at = Some(self.now);
                     let steps = steps_json(&state.steps);
                     revoke.extend(state.github_token.take());
-                    let log_key = self.seal_log(&run.info, job, conclusion, &state).await?;
+                    let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
+                    let log_key = self
+                        .seal_log(&run.info, job, attempt, conclusion, &state)
+                        .await?;
                     if log_key.is_some() {
                         state.upload_pending = true;
                         mark_upload_due(run.deadlines_mut(), self.now);
@@ -1837,7 +1901,6 @@ impl<'a> Cx<'a> {
                     self.end_sockets(job, conclusion);
                     self.put_job(job, &state).await?;
                     run.outbox_mut().mark(job);
-                    let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
                     run.todo_mut().push(Work::FinishJob {
                         job,
                         attempt,
@@ -1868,7 +1931,7 @@ impl<'a> Cx<'a> {
         if let Err(err) = self.drain().await {
             worker::console_error!("side effects: {err}");
         }
-        if let Err(err) = self.upload_logs().await {
+        if let Err(err) = self.upload_logs(false).await {
             worker::console_error!("uploads: {err}");
         }
         if let Err(err) = self.snapshot_now().await {
@@ -2110,6 +2173,11 @@ impl<'a> Cx<'a> {
     /// state (so its batches count from 1 again), its old token revoked,
     /// its log chunks dropped and its row set up for the new attempt.
     async fn rerun(&self, job: u64) -> Result<Response> {
+        // A log that is not in R2 yet is uploaded first: the reset
+        // deletes its chunks and its job row names its key.
+        if let Err(err) = self.upload_logs(true).await {
+            worker::console_error!("rerun: uploads: {err}");
+        }
         let mut revoke = Vec::new();
         {
             let _turn = self.turn.lock().await;
@@ -2122,6 +2190,12 @@ impl<'a> Cx<'a> {
             let reset = reset_jobs(&before, &run.graph);
             if reset.is_empty() {
                 return answer(204);
+            }
+            for (id, _) in &reset {
+                if self.job_state(*id).await?.upload_pending {
+                    // Nothing is written yet; the caller asks again.
+                    return answer(409);
+                }
             }
             for (id, attempt) in reset {
                 revoke.extend(self.job_state(id).await?.github_token);
@@ -2293,6 +2367,41 @@ impl<'a> Cx<'a> {
         Ok(Some((base + skipped as u64, kept.to_owned())))
     }
 
+    /// Up to [`BACKLOG_BYTES`] of a job's stored log from byte offset
+    /// `from` on and the offset it starts at (the next page starts at
+    /// that offset plus the text's length). `None` when the job has no
+    /// log in storage.
+    async fn page(&self, job: u64, from: u64) -> Result<Option<(u64, String)>> {
+        let (sizes, open) = if let Some(writer) = self.load_writer(job).await? {
+            (writer.chunk_sizes().to_vec(), writer.open_text().to_owned())
+        } else if let Some(sealed) = self.sealed(job).await? {
+            (sealed.sizes, String::new())
+        } else {
+            return Ok(None);
+        };
+        let max = usize::try_from(BACKLOG_BYTES).unwrap_or(usize::MAX);
+        let (first, start) = chunks_from(&sizes, from);
+        let mut text = String::new();
+        let mut next = first;
+        let count = u32::try_from(sizes.len()).unwrap_or(u32::MAX);
+        'read: while next < count && text.len() < max {
+            let last = (next + 4).min(count);
+            let keys: Vec<String> = (next..last).map(|n| chunk_key(job, n)).collect();
+            for bytes in self.raw_get(&keys).await? {
+                let Some(bytes) = bytes else {
+                    break 'read;
+                };
+                text.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            next = last;
+        }
+        if next >= count {
+            text.push_str(&open);
+        }
+        let (at, page) = page_of(&text, start, from, max);
+        Ok(Some((at, page.to_owned())))
+    }
+
     /// `GET /live`: a WebSocket that gets the newest stored text, then
     /// every applied batch. The backlog is read and the socket accepted
     /// under one lock, so no batch falls between them.
@@ -2318,9 +2427,11 @@ impl<'a> Cx<'a> {
         Response::from_websocket(pair.client)
     }
 
-    /// `GET /log`: the newest stored text of a job's log. The offset it
-    /// starts at is in `x-log-offset`.
-    async fn log(&self, job: u64) -> Result<Response> {
+    /// `GET /log`: up to 2 MiB of the stored text of a job's log, from
+    /// `?offset=` when given and else the newest. `x-log-offset` is
+    /// where the text starts and `x-log-next` where the next page
+    /// starts, so a viewer can page through the whole stored text.
+    async fn log(&self, job: u64, offset: Option<u64>) -> Result<Response> {
         let _turn = self.turn.lock().await;
         let Some(run) = self.loaded().await? else {
             return answer(404);
@@ -2328,18 +2439,27 @@ impl<'a> Cx<'a> {
         let Some(node) = run.graph.node(job) else {
             return answer(404);
         };
-        let (offset, text) = match self.newest(job).await? {
+        let found = match offset {
+            Some(from) => self.page(job, from).await?,
+            None => self.newest(job).await?,
+        };
+        let (offset, text) = match found {
             Some(found) => found,
             None if matches!(node.state, NodeState::Done(_)) => return answer(404),
             None => (0, String::new()),
         };
+        let text_len = text.len() as u64;
         let mut response = Response::ok(text)?;
         response
             .headers_mut()
             .set("content-type", "text/plain; charset=utf-8")?;
+        let next = offset + text_len;
         response
             .headers_mut()
             .set("x-log-offset", &offset.to_string())?;
+        response
+            .headers_mut()
+            .set("x-log-next", &next.to_string())?;
         Ok(response)
     }
 
@@ -2376,6 +2496,7 @@ impl<'a> Cx<'a> {
         &self,
         info: &RunInfo,
         job: u64,
+        attempt: u32,
         conclusion: Conclusion,
         state: &JobState,
     ) -> Result<Option<String>> {
@@ -2384,6 +2505,8 @@ impl<'a> Cx<'a> {
             let sealed = Sealed {
                 index,
                 chunks: writer.chunk_count(),
+                sizes: writer.chunk_sizes().to_vec(),
+                attempt,
             };
             let object = js_sys::Object::new();
             if let Some((number, text)) = &last {
@@ -2415,21 +2538,33 @@ impl<'a> Cx<'a> {
             info.repo.id,
             info.run_id,
             job,
+            attempt,
         )))
     }
 
-    /// Uploads every finished log that is not in R2 yet. Each upload is
-    /// planned under the lock, done without it and recorded under it
-    /// again. A log that fails stays pending and the alarm tries it in
-    /// 30 s; an error is only a storage failure.
-    async fn upload_logs(&self) -> Result<()> {
+    /// Uploads every finished log that is not in R2 yet, when the
+    /// retry time has come (`force` skips that check). One caller at a
+    /// time: a second one finds the work claimed and returns. Each
+    /// upload is planned under the lock, done without it and recorded
+    /// under it again. A log that fails stays pending and is tried again
+    /// in 30 s; an error is only a storage failure.
+    async fn upload_logs(&self, force: bool) -> Result<()> {
+        if !take_drain(self.uploading) {
+            return Ok(());
+        }
+        let done = self.upload_pending(force).await;
+        self.uploading.set(false);
+        done
+    }
+
+    async fn upload_pending(&self, force: bool) -> Result<()> {
         let (info, jobs) = {
             let _turn = self.turn.lock().await;
             let deadlines: Deadlines = self.storage.get(DEADLINES).await?.unwrap_or_default();
-            if deadlines.upload_retry_at.is_none() {
+            if !upload_claimable(&deadlines, self.now, force) {
                 return Ok(());
             }
-            let Some(run) = self.loaded().await? else {
+            let Some(mut run) = self.loaded().await? else {
                 return Ok(());
             };
             let mut jobs = Vec::new();
@@ -2437,6 +2572,12 @@ impl<'a> Cx<'a> {
                 if self.job_state(node.id).await?.upload_pending {
                     jobs.push((node.id, node.attempt, self.sealed(node.id).await?));
                 }
+            }
+            // Claimed: the next caller finds the time in the future.
+            run.deadlines_mut().upload_retry_at = upload_deadline(!jobs.is_empty(), self.now);
+            self.commit(&mut run).await?;
+            if jobs.is_empty() {
+                return Ok(());
             }
             (run.info, jobs)
         };
@@ -2505,7 +2646,13 @@ impl<'a> Cx<'a> {
         let bucket = self.env.bucket(BUCKET)?;
         bucket
             .put(
-                log_key(&info.tenant_id, info.repo.id, info.run_id, job),
+                log_key(
+                    &info.tenant_id,
+                    info.repo.id,
+                    info.run_id,
+                    job,
+                    sealed.attempt,
+                ),
                 gzip.finish(),
             )
             .http_metadata(HttpMetadata {
@@ -2518,7 +2665,13 @@ impl<'a> Cx<'a> {
         let index = serde_json::to_vec(&sealed.index).map_err(|err| fail(err.to_string()))?;
         bucket
             .put(
-                index_key(&info.tenant_id, info.repo.id, info.run_id, job),
+                index_key(
+                    &info.tenant_id,
+                    info.repo.id,
+                    info.run_id,
+                    job,
+                    sealed.attempt,
+                ),
                 index,
             )
             .http_metadata(HttpMetadata {
@@ -3609,5 +3762,82 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             assert!(!key.starts_with(&log_prefix(4)), "{key}");
         }
         assert!(!chunk_key(14, 0).starts_with(&log_prefix(4)));
+    }
+
+    #[test]
+    fn uploads_start_when_their_time_came_or_when_forced() {
+        let at = |at| Deadlines {
+            upload_retry_at: at,
+            ..Deadlines::default()
+        };
+        assert!(!upload_claimable(&at(None), 100, false));
+        assert!(!upload_claimable(&at(None), 100, true));
+        assert!(upload_claimable(&at(Some(100)), 100, false));
+        assert!(!upload_claimable(&at(Some(101)), 100, false));
+        assert!(upload_claimable(&at(Some(101)), 100, true));
+    }
+
+    #[test]
+    fn one_upload_runs_at_a_time() {
+        let flag = Cell::new(false);
+        assert!(take_drain(&flag));
+        assert!(!take_drain(&flag));
+        flag.set(false);
+        assert!(take_drain(&flag));
+    }
+
+    #[test]
+    fn a_claimed_upload_waits_for_the_retry_time() {
+        let mut deadlines = Deadlines::default();
+        mark_upload_due(&mut deadlines, 1_000);
+        assert!(upload_claimable(&deadlines, 1_000, false));
+        deadlines.upload_retry_at = upload_deadline(true, 1_000);
+        assert!(!upload_claimable(&deadlines, 1_000, false));
+        assert!(!upload_claimable(&deadlines, 30_999, false));
+        assert!(upload_claimable(&deadlines, 31_000, false));
+    }
+
+    #[test]
+    fn chunks_from_finds_the_chunk_of_an_offset() {
+        let sizes = [10, 20, 5];
+        assert_eq!(chunks_from(&sizes, 0), (0, 0));
+        assert_eq!(chunks_from(&sizes, 9), (0, 0));
+        assert_eq!(chunks_from(&sizes, 10), (1, 10));
+        assert_eq!(chunks_from(&sizes, 34), (2, 30));
+        // In the open chunk, and past the end.
+        assert_eq!(chunks_from(&sizes, 35), (3, 35));
+        assert_eq!(chunks_from(&sizes, 99), (3, 35));
+        assert_eq!(chunks_from(&[], 4), (0, 0));
+    }
+
+    #[test]
+    fn pages_walk_the_whole_text() {
+        let text = "aaaa\nbbbb\ncccc\ndd\n";
+        let mut from = 0;
+        let mut pages = Vec::new();
+        loop {
+            let (at, page) = page_of(text, 0, from, 7);
+            assert_eq!(at, from);
+            if page.is_empty() {
+                break;
+            }
+            pages.push(page);
+            from = at + page.len() as u64;
+        }
+        assert_eq!(pages, ["aaaa\n", "bbbb\n", "cccc\n", "dd\n"]);
+        assert_eq!(pages.concat(), text);
+    }
+
+    #[test]
+    fn a_page_starts_inside_a_chunk_and_on_a_character() {
+        // The text starts at byte 100; offset 103 is inside "\u{e9}".
+        let text = "x\u{e9}y\nz\n";
+        let (at, page) = page_of(text, 100, 102, 100);
+        assert_eq!(at, 103);
+        assert_eq!(page, "y\nz\n");
+        // One line longer than the page is cut at a character.
+        let (at, page) = page_of("\u{e9}\u{e9}\u{e9}", 0, 0, 3);
+        assert_eq!((at, page), (0, "\u{e9}"));
+        assert_eq!(page_of("ab", 0, 50, 10), (2, ""));
     }
 }
