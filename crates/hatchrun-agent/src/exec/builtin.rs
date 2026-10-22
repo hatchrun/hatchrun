@@ -137,12 +137,12 @@ pub fn open_stage(state_dir: &Path) -> anyhow::Result<OwnedFd> {
 // `mode_t` is u32 on Linux and u16 on macOS, where the agent is only
 // built for development.
 #[allow(clippy::useless_conversion)]
-fn mode_bits(mode: nix::libc::mode_t) -> u32 {
+pub(super) fn mode_bits(mode: nix::libc::mode_t) -> u32 {
     u32::from(mode)
 }
 
 #[allow(clippy::useless_conversion)]
-fn to_mode(bits: u32) -> Mode {
+pub(super) fn to_mode(bits: u32) -> Mode {
     Mode::from_bits_truncate(bits.try_into().unwrap_or(0o755))
 }
 
@@ -340,7 +340,7 @@ impl Drop for RemoveDir {
     }
 }
 
-fn remove_tree(parent: &OwnedFd, name: &OsStr) {
+pub(super) fn remove_tree(parent: &OwnedFd, name: &OsStr) {
     if let Ok(dir) = open_dir(parent, name)
         && let Ok(mut listing) = Dir::openat(
             &dir,

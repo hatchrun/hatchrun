@@ -5,8 +5,11 @@
 //! Fetching actions and reading their `action.yml`.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
+use std::hash::{BuildHasher, Hasher};
 use std::io::Read;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,7 +22,9 @@ use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
 use super::archive::extract_tar_gz;
+use super::builtin::{remove_tree, to_mode};
 use super::layout::Layout;
+use super::pack::{kind_of, open_dir};
 
 /// Where an action comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,20 +228,130 @@ fn is_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// The action cache, `<work>/_actions`, opened once when the job starts
+/// and held for the whole job.
+///
+/// The work directory belongs to the runner user, so a step can rename
+/// `_actions` or plant links next to it. Nothing under `_actions` is
+/// handed to the runner except each extracted `tree`, and every
+/// cache operation goes through descriptors with `O_NOFOLLOW` instead of
+/// paths, so a link a step plants cannot send a later fetch elsewhere.
+pub struct ActionCache {
+    root: CacheDir,
+}
+
+/// A cache directory: its descriptor, and its path for display and for
+/// the steps, which run in it.
+#[derive(Clone)]
+struct CacheDir {
+    fd: Arc<OwnedFd>,
+    path: PathBuf,
+}
+
+impl CacheDir {
+    /// A path that reaches `name` in this directory through its
+    /// descriptor where the platform has one, so extraction keeps
+    /// writing here even if the directory is renamed meanwhile.
+    fn path_of(&self, name: &str) -> PathBuf {
+        if cfg!(target_os = "linux") {
+            PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd())).join(name)
+        } else {
+            self.path.join(name)
+        }
+    }
+
+    /// Opens the root-owned directory `name` below this one, creating
+    /// it when missing. A link or file in its place is removed, never
+    /// followed. The second value says whether it was created.
+    fn child(&self, name: &str) -> Result<(CacheDir, bool)> {
+        use nix::errno::Errno;
+        let path = self.path.join(name);
+        for _ in 0..2 {
+            let created = match nix::sys::stat::mkdirat(&*self.fd, name, to_mode(0o755)) {
+                Ok(()) => true,
+                Err(Errno::EEXIST) => false,
+                Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+            };
+            match open_dir(&*self.fd, name) {
+                Ok(fd) => {
+                    // The steps run as another user and need to enter it.
+                    nix::sys::stat::fchmod(&fd, to_mode(0o755))
+                        .with_context(|| format!("set mode on {}", path.display()))?;
+                    return Ok((
+                        CacheDir {
+                            fd: Arc::new(fd),
+                            path,
+                        },
+                        created,
+                    ));
+                }
+                Err(Errno::ELOOP | Errno::ENOTDIR) if !created => {
+                    nix::unistd::unlinkat(&*self.fd, name, nix::unistd::UnlinkatFlags::NoRemoveDir)
+                        .with_context(|| format!("replace {}", path.display()))?;
+                }
+                Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+            }
+        }
+        bail!("{} keeps changing", path.display())
+    }
+
+    /// Whether the finished-extraction marker is here as a regular file.
+    fn is_complete(&self) -> bool {
+        nix::sys::stat::fstatat(
+            &*self.fd,
+            COMPLETE,
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .is_ok_and(|st| kind_of(st.st_mode) == nix::sys::stat::SFlag::S_IFREG)
+    }
+}
+
+impl ActionCache {
+    /// Opens `path`, creating it when missing. It must be a directory
+    /// the agent owns that no one else can write, which it makes sure of.
+    ///
+    /// # Errors
+    ///
+    /// When `path` is a link, is not a directory, or belongs to someone
+    /// else.
+    pub fn open(path: &Path) -> Result<Self> {
+        std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+        let fd = open_dir(&nix::fcntl::AT_FDCWD, path).with_context(|| {
+            format!(
+                "open {}, which must be a directory and not a link",
+                path.display()
+            )
+        })?;
+        let stat = nix::sys::stat::fstat(&fd)?;
+        if stat.st_uid != nix::unistd::geteuid().as_raw() {
+            bail!("{} must belong to the agent", path.display());
+        }
+        nix::sys::stat::fchmod(&fd, to_mode(0o755))
+            .with_context(|| format!("set mode on {}", path.display()))?;
+        Ok(Self {
+            root: CacheDir {
+                fd: Arc::new(fd),
+                path: path.to_owned(),
+            },
+        })
+    }
+}
+
 /// Fetches the action, downloading it unless it is already cached.
 pub async fn fetch_with(
     r: &ActionRef,
     github: &Github,
     layout: &Layout,
+    cache: &ActionCache,
     limits: Limits,
 ) -> Result<Action> {
-    let (root, rel);
-    let dir = match r {
+    match r {
         ActionRef::Local(p) => {
             let dir = local_dir(&layout.workspace, p)?;
-            root = layout.workspace.canonicalize()?;
-            rel = dir.strip_prefix(&root).unwrap_or(Path::new("")).to_owned();
-            dir
+            let root = layout.workspace.canonicalize()?;
+            let rel = dir.strip_prefix(&root).unwrap_or(Path::new("")).to_owned();
+            let meta = read_metadata_in(&root, &rel)?;
+            Ok(Action { dir, meta })
         }
         ActionRef::Remote {
             owner,
@@ -244,21 +359,29 @@ pub async fn fetch_with(
             path,
             git_ref,
         } => {
-            let cached = layout
-                .actions
-                .join(owner)
-                .join(repo)
-                .join(cache_key(git_ref));
-            if !cached.join(COMPLETE).is_file() {
-                download(github, owner, repo, git_ref, &cached, limits).await?;
+            let key = cache_key(git_ref);
+            let (owner_dir, _) = cache.root.child(owner)?;
+            let (repo_dir, _) = owner_dir.child(repo)?;
+            let (key_dir, created) = repo_dir.child(&key)?;
+            if !key_dir.is_complete()
+                && let Err(e) = download(github, owner, repo, git_ref, &key_dir, limits).await
+            {
+                if created {
+                    remove_tree(&repo_dir.fd, OsStr::new(&key));
+                }
+                return Err(e);
             }
-            root = cached.join(TREE);
-            rel = PathBuf::from(path);
-            root.join(path)
+            let root = key_dir.path.join(TREE);
+            let tree =
+                open_dir(&*key_dir.fd, TREE).with_context(|| format!("open {}", root.display()))?;
+            let rel = PathBuf::from(path);
+            let meta = read_metadata_at(tree, &rel, &root.join(&rel))?;
+            Ok(Action {
+                dir: root.join(path),
+                meta,
+            })
         }
-    };
-    let meta = read_metadata_in(&root, &rel)?;
-    Ok(Action { dir, meta })
+    }
 }
 
 /// The directory of a local action, which must be inside the workspace.
@@ -291,42 +414,70 @@ fn cache_key(git_ref: &str) -> String {
     key
 }
 
-/// Downloads `owner/repo@git_ref` and extracts it to `root`. The
-/// extraction happens in a fresh temp directory next to it that is
-/// renamed into place, so a half-extracted action is never reused.
+/// Downloads `owner/repo@git_ref` into the cache entry `key`. The
+/// extraction happens in a fresh temp directory inside `key` and the
+/// extracted tree is renamed into place, so a half-extracted action is
+/// never reused. `key` is root's: no directory above the temp one is
+/// ever handed to the runner user.
 async fn download(
     github: &Github,
     owner: &str,
     repo: &str,
     git_ref: &str,
-    root: &Path,
+    key: &CacheDir,
     limits: Limits,
 ) -> Result<()> {
-    let parent = root.parent().context("action cache path has no parent")?;
-    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    // `<owner>/<repo>` is root's to create; the steps only need to pass through.
-    for dir in [Some(parent), parent.parent()].into_iter().flatten() {
-        // Open the directory itself, never through a link a step planted.
-        let flags = nix::fcntl::OFlag::O_RDONLY
-            | nix::fcntl::OFlag::O_DIRECTORY
-            | nix::fcntl::OFlag::O_NOFOLLOW
-            | nix::fcntl::OFlag::O_CLOEXEC;
-        let Ok(fd) = nix::fcntl::open(dir, flags, nix::sys::stat::Mode::empty()) else {
-            continue;
-        };
-        nix::sys::stat::fchmod(&fd, nix::sys::stat::Mode::from_bits_truncate(0o755))
-            .with_context(|| format!("set mode on {}", dir.display()))?;
+    let (name, tmp) = make_temp(key)?;
+    let result = fill(github, owner, repo, git_ref, key, &tmp, limits).await;
+    remove_tree(&key.fd, OsStr::new(&name));
+    result
+}
+
+/// Creates a directory in `key` that no cache key can be named like:
+/// keys never start with `%tmp`.
+fn make_temp(key: &CacheDir) -> Result<(String, CacheDir)> {
+    use nix::errno::Errno;
+    for _ in 0..16 {
+        let name = format!(
+            "%tmp-{:016x}",
+            std::hash::RandomState::new().build_hasher().finish()
+        );
+        match nix::sys::stat::mkdirat(&*key.fd, name.as_str(), to_mode(0o755)) {
+            Ok(()) => {}
+            Err(Errno::EEXIST) => continue,
+            Err(e) => return Err(e).context("create temp directory"),
+        }
+        let fd = open_dir(&*key.fd, name.as_str()).context("open temp directory")?;
+        // The steps run as another user and need to read the tree.
+        nix::sys::stat::fchmod(&fd, to_mode(0o755)).context("set mode on temp directory")?;
+        let path = key.path.join(&name);
+        return Ok((
+            name,
+            CacheDir {
+                fd: Arc::new(fd),
+                path,
+            },
+        ));
     }
-    // A name no cache key can have: keys never start with `%tmp`.
-    let tmp = tempfile::Builder::new()
-        .prefix("%tmp-")
-        .tempdir_in(parent)
-        .context("create temp directory")?;
-    // The steps run as another user and need to read the tree.
-    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))?;
+    bail!(
+        "could not create a temp directory in {}",
+        key.path.display()
+    )
+}
+
+/// Downloads and extracts into `tmp`, then moves the tree to `key`.
+async fn fill(
+    github: &Github,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+    key: &CacheDir,
+    tmp: &CacheDir,
+    limits: Limits,
+) -> Result<()> {
     let label = format!("{owner}/{repo}@{git_ref}");
-    let archive = tmp.path().join("download.tgz");
-    let tree = tmp.path().join(TREE);
+    let archive = tmp.path_of("download.tgz");
+    let tree = tmp.path_of(TREE);
 
     let url = format!(
         "{}/repos/{owner}/{repo}/tarball/{git_ref}",
@@ -358,14 +509,19 @@ async fn download(
 
     let (archive_path, expanded, owner) = (archive.clone(), limits.expanded, limits.owner);
     let extract_into = tree.clone();
+    // The task may outlive this future, and the paths name the temp
+    // directory by descriptor number: keep the descriptor open for it.
+    let hold = Arc::clone(&tmp.fd);
     // Dropping this future, as a cancelled job does, stops the blocking
     // extraction too.
     let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
     let flag = Arc::clone(&stop.0);
     tokio::task::spawn_blocking(move || {
+        let _hold = hold;
         let file = std::fs::File::open(&archive_path)?;
         extract_tar_gz(file, &extract_into, 1, expanded, &flag)?;
         open_for_reading(&extract_into)?;
+        // Only the tree goes to the runner user, never a directory above it.
         if let Some(owner) = owner {
             chown_tree(&extract_into, owner)?;
         }
@@ -375,17 +531,26 @@ async fn download(
     .context("extract task")?
     .with_context(|| format!("extract {label}"))?;
     std::fs::remove_file(&archive)?;
-    std::fs::write(tmp.path().join(COMPLETE), b"")?;
 
     // A leftover without the marker is incomplete: replace it. One with
     // the marker was finished by a concurrent job.
-    if !root.join(COMPLETE).is_file() {
-        match std::fs::remove_dir_all(root) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("clear {}", root.display())),
+    if !key.is_complete() {
+        remove_tree(&key.fd, OsStr::new(TREE));
+        nix::fcntl::renameat(&*tmp.fd, TREE, &*key.fd, TREE)
+            .with_context(|| format!("move {label} into place"))?;
+        match nix::fcntl::openat(
+            &*key.fd,
+            COMPLETE,
+            nix::fcntl::OFlag::O_WRONLY
+                | nix::fcntl::OFlag::O_CREAT
+                | nix::fcntl::OFlag::O_EXCL
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            to_mode(0o644),
+        ) {
+            Ok(_) | Err(nix::errno::Errno::EEXIST) => {}
+            Err(e) => return Err(e).context("write the completion marker"),
         }
-        std::fs::rename(tmp.path(), root).with_context(|| format!("move {label} into place"))?;
     }
     Ok(())
 }
@@ -512,17 +677,19 @@ pub fn read_metadata(dir: &Path) -> Result<Metadata> {
 /// a step that swaps either for a link or a FIFO after the action was
 /// resolved cannot make the agent read or block on something else.
 pub fn read_metadata_in(root: &Path, rel: &Path) -> Result<Metadata> {
+    let dir = open_dir(&nix::fcntl::AT_FDCWD, root)
+        .with_context(|| format!("open {}", root.display()))?;
+    read_metadata_at(dir, rel, &root.join(rel))
+}
+
+/// [`read_metadata_in`] from a directory that is already open; `shown`
+/// names `root/rel` in messages.
+fn read_metadata_at(root: OwnedFd, rel: &Path, shown: &Path) -> Result<Metadata> {
     use nix::errno::Errno;
-    use nix::fcntl::{OFlag, open, openat};
+    use nix::fcntl::{OFlag, openat};
     use nix::sys::stat::Mode;
 
-    let shown = root.join(rel);
-    let mut dir = open(
-        root,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .with_context(|| format!("open {}", root.display()))?;
+    let mut dir = root;
     for part in rel.components() {
         match part {
             std::path::Component::Normal(name) => {
@@ -812,6 +979,10 @@ mod tests {
         }
     }
 
+    fn cache(layout: &Layout) -> ActionCache {
+        ActionCache::open(&layout.actions).unwrap()
+    }
+
     fn fast() -> Limits {
         Limits {
             backoff: Duration::from_millis(1),
@@ -866,13 +1037,17 @@ mod tests {
         let gh = github(&server.uri());
         let r = remote("o", "r", "", "v1");
 
-        let a = fetch_with(&r, &gh, &layout, fast()).await.unwrap();
+        let a = fetch_with(&r, &gh, &layout, &cache(&layout), fast())
+            .await
+            .unwrap();
         assert_eq!(a.dir, layout.actions.join("o/r/v1/tree"));
         assert!(a.dir.join("dist/index.js").is_file());
         assert!(matches!(a.meta.runs, Runs::Node { .. }));
 
         // The second fetch hits the cache (the mock expects one request).
-        let b = fetch_with(&r, &gh, &layout, fast()).await.unwrap();
+        let b = fetch_with(&r, &gh, &layout, &cache(&layout), fast())
+            .await
+            .unwrap();
         assert_eq!(a, b);
         // No temp leftovers beside the cache entry.
         let names: Vec<_> = fs::read_dir(layout.actions.join("o/r"))
@@ -905,6 +1080,7 @@ mod tests {
             &remote("o", "r", "init", "v2"),
             &github(&server.uri()),
             &layout,
+            &cache(&layout),
             fast(),
         )
         .await
@@ -934,6 +1110,7 @@ mod tests {
             &remote("o", "r", "", "feat/x"),
             &github(&server.uri()),
             &layout,
+            &cache(&layout),
             fast(),
         )
         .await
@@ -973,7 +1150,7 @@ mod tests {
         let layout = Layout::new(work.path(), "o/r", Path::new("/tc"));
         let r = remote("o", "r", "", "bad");
         assert!(
-            fetch_with(&r, &github(&server.uri()), &layout, fast())
+            fetch_with(&r, &github(&server.uri()), &layout, &cache(&layout), fast())
                 .await
                 .is_err()
         );
@@ -996,6 +1173,7 @@ mod tests {
             &remote("o", "r", "", "nope"),
             &github(&server.uri()),
             &layout,
+            &cache(&layout),
             fast(),
         )
         .await
@@ -1021,12 +1199,66 @@ mod tests {
             &remote("o", "r", "", "big"),
             &github(&server.uri()),
             &layout,
+            &cache(&layout),
             limits,
         )
         .await
         .unwrap_err();
         assert!(format!("{err:#}").contains("100 byte limit"), "{err:#}");
         assert!(!layout.actions.join("o/r/big").exists());
+    }
+
+    async fn planted_link_fetch(link_at: &str) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball(&[("o-r-abc/action.yml", NODE_YML)])),
+            )
+            .mount(&server)
+            .await;
+        let work = tempfile::tempdir().unwrap();
+        let layout = Layout::new(work.path(), "o/r", Path::new("/tc"));
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("keep"), "keep").unwrap();
+        fs::create_dir_all(layout.actions.join(link_at).parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), layout.actions.join(link_at)).unwrap();
+        let a = fetch_with(
+            &remote("o", "r", "", "v1"),
+            &github(&server.uri()),
+            &layout,
+            &cache(&layout),
+            fast(),
+        )
+        .await;
+        // The fetch may fail or replace the link, but nothing lands behind it.
+        let names: Vec<_> = fs::read_dir(outside.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("keep")], "{a:?}");
+        assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"keep");
+        assert!(a.is_ok(), "{a:?}");
+        assert!(
+            !fs::symlink_metadata(layout.actions.join(link_at))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_planted_owner_link_is_not_followed() {
+        planted_link_fetch("o").await;
+    }
+
+    #[tokio::test]
+    async fn a_planted_repo_link_is_not_followed() {
+        planted_link_fetch("o/r").await;
+    }
+
+    #[tokio::test]
+    async fn a_planted_key_link_is_not_followed() {
+        planted_link_fetch("o/r/v1").await;
     }
 
     #[tokio::test]
@@ -1041,14 +1273,21 @@ mod tests {
             &ActionRef::Local("./.github/act".into()),
             &gh,
             &layout,
+            &cache(&layout),
             fast(),
         )
         .await
         .unwrap();
         assert_eq!(a.dir, act.canonicalize().unwrap());
-        let err = fetch_with(&ActionRef::Local("./../../..".into()), &gh, &layout, fast())
-            .await
-            .unwrap_err();
+        let err = fetch_with(
+            &ActionRef::Local("./../../..".into()),
+            &gh,
+            &layout,
+            &cache(&layout),
+            fast(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("outside the workspace"), "{err}");
     }
 

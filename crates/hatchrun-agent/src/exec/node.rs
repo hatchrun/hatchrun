@@ -173,7 +173,7 @@ impl Job<'_> {
         let first = self.grace_until.is_none();
         let deadline = self.grace_until;
         let mut stop = super::wait_for(self.cancel_requests.clone(), if first { 1 } else { 2 });
-        let fetch = action::fetch_with(r, &self.doc.github, &self.layout, limits);
+        let fetch = action::fetch_with(r, &self.doc.github, &self.layout, &self.actions, limits);
         let fetched = tokio::select! {
             found = fetch => Some(found),
             () = &mut stop => None,

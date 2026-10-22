@@ -70,6 +70,24 @@ pub struct Options {
     pub minute: Duration,
 }
 
+/// The directories the runner user owns while the job runs. The action
+/// cache is not one of them: its entries are made by the agent as root,
+/// and only each extracted tree goes to the runner.
+fn runner_dirs(layout: &Layout, event: &Path) -> Vec<PathBuf> {
+    vec![
+        layout.work.clone(),
+        layout
+            .workspace
+            .parent()
+            .unwrap_or(&layout.workspace)
+            .to_owned(),
+        layout.workspace.clone(),
+        layout.temp.clone(),
+        layout.temp.join("_github_workflow"),
+        event.to_owned(),
+    ]
+}
+
 /// Runs the document's job and reports how it went. `cancel` counts the
 /// requests to stop: the first cancels the job, which then has
 /// [`GRACE_MINUTES`] minutes left for what still runs, and a second
@@ -92,21 +110,14 @@ pub async fn run_job(
     write_timings(&layout, &doc)?;
     StepFiles::reset(&layout.temp)?;
     let owner = opts.runner_user.as_deref().map(owner_of).transpose()?;
+    // Opened before any step runs and never handed to the runner user.
+    let actions = action::ActionCache::open(&layout.actions)?;
     if let Some(owner) = owner {
-        let dirs = [
-            &layout.work,
-            layout.workspace.parent().unwrap_or(&layout.workspace),
-            &layout.workspace,
-            &layout.temp,
-            &layout.actions,
-            &layout.temp.join("_github_workflow"),
-            &event,
-        ];
-        for path in dirs {
+        for path in runner_dirs(&layout, &event) {
             // The link itself, never what it points at.
             nix::unistd::fchownat(
                 nix::fcntl::AT_FDCWD,
-                path,
+                &path,
                 Some(owner.0),
                 Some(owner.1),
                 nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
@@ -151,6 +162,7 @@ pub async fn run_job(
         doc: &doc,
         opts,
         layout,
+        actions,
         event,
         masker,
         annotations: Vec::new(),
@@ -336,6 +348,8 @@ struct Job<'a> {
     doc: &'a JobDocument,
     opts: &'a Options,
     layout: Layout,
+    /// `<work>/_actions`, held open since the job started.
+    actions: action::ActionCache,
     event: PathBuf,
     ctx: Contexts,
     masker: Masker,
@@ -1025,4 +1039,20 @@ fn random_name() -> Result<String, String> {
         let _ = write!(name, "{byte:02x}");
     }
     Ok(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_action_cache_is_not_handed_to_the_runner() {
+        let layout = Layout::new(Path::new("/w"), "acme/repo", Path::new("/tc"));
+        let dirs = runner_dirs(&layout, Path::new("/w/_temp/_github_workflow/event"));
+        assert!(dirs.contains(&layout.workspace));
+        assert!(
+            dirs.iter().all(|d| !d.starts_with(&layout.actions)),
+            "{dirs:?}"
+        );
+    }
 }
