@@ -6,7 +6,9 @@
 instead of a product of its own, organization secrets and vars can be
 limited to selected repositories, and jobs can name a repository
 environment that restricts branches, asks an organization admin to
-approve each job attempt, and carries its own secrets and vars.
+approve each job attempt, and carries its own secrets and vars. Both
+CI and hatchrun.io runners bill per second with a 60 second minimum
+and no free allowance.
 
 **Architecture:** The CI card check reads any active or trialing row of
 `subscriptions`, which after this plan holds only hatchrun.io product
@@ -30,7 +32,7 @@ globs, React 19 app in `web/app`, the e2e harness in
 **Spec:** `docs/superpowers/specs/2026-10-19-orchestrator-design.md`
 (section "Secrets, the GitHub App and billing"), extended by the
 decisions below. Where the spec and the decisions differ, the decisions
-win; Task 2 and Task 11 write them into the spec.
+win; Tasks 2, 11 and 13 write them into the spec.
 
 ## Decisions (the spec for this plan)
 
@@ -50,8 +52,8 @@ Made by the owner on 2026-10-24.
    on file." and "Add a card to run CI jobs. Jobs wait until you do."
    No operator wording reaches customers; when Polar is unconfigured the
    button shows the server's message, as today (an operator-only path).
-   Usage stays per minute (`RECORD_USAGE`: whole minutes per attempt,
-   rounded up, at least one).
+   Tasks 1 and 2 kept usage per minute with 500 free units; decision 5
+   replaces both, in Task 13.
 2. **Organization secret and var repository access, as on GitHub.** An
    organization row has `repositories`: all (the default) or a selected
    list of the tenant's repositories, stored as a nullable `bigint[]`
@@ -91,6 +93,39 @@ Made by the owner on 2026-10-24.
 4. **Out of scope:** wait timers, required reviewers other than
    organization admins, deployment history, environment URLs, fork pull
    request handling.
+5. **Per-second billing with a 60 second minimum, like EC2, and no free
+   allowance, for both products on the one hatchrun.io subscription.**
+   A hatchrun runner job (hatchrun.io) and a hatchrun CI job attempt are
+   each billed `max(60, ceil(duration in seconds))` seconds: runners from
+   GitHub's `started_at` to `completed_at`, CI from the attempt's start
+   to its result. Each product keeps its price: runners a flat $0.001 a
+   minute, CI $0.002 per 2 vCPU minute scaled by the template (2, 4, 8
+   and 16 vCPU count 1, 2, 4 and 8 times). Meter units are integers:
+   one runner unit is one billed second; one CI unit is one 2 vCPU
+   second, so a CI attempt's units are its billed seconds times vCPUs / 2.
+   The 3,000 free runner minutes, the seven day grace period after them,
+   and CI's 500 free units go from code, UI, docs, check runs and tests:
+   a tenant launches runners only in the beta or with an active or
+   trialing subscription. Usage figures show time in minutes with one
+   decimal under an hour and as `Hh MMm` from an hour on, and spend in
+   dollars. Recorded rows are converted (minutes times 60), no
+   compatibility paths. Polar, set up by the operator before the deploy,
+   on every product in `POLAR_PRODUCT_ID`:
+   - Meter "Runner seconds": filter event name equals `job.seconds`,
+     aggregation Sum of property `seconds`.
+   - Meter "CI usage": filter event name equals `ci.usage`, aggregation
+     Sum of property `units` (the existing meter, if it is set up so,
+     stays; its unit is now a 2 vCPU second).
+   - Prices: archive the "Job minutes" metered price ($0.001 a minute)
+     and the "CI usage" price of $0.002 per unit, and remove both meter
+     credit benefits (3,000 minutes, 500 units). Add metered unit prices,
+     no cap: "Runner seconds" at `unit_amount` `"0.001666666666"` (cents,
+     $0.00001666666666 a second) and "CI usage" at `"0.003333333333"`
+     (cents, $0.00003333333333 a unit). Existing subscriptions must end
+     up on the new prices; confirm each in the dashboard.
+   - The old "Job minutes" meter can go once the deploy has sent its
+     last `job.minutes` event (the reconciler sends only `job.seconds`
+     after it).
 
 ## Rulings
 
@@ -167,6 +202,40 @@ Made while writing this plan; the plan keeps them.
     environment (`secrets::MAX_PER_REPO`).
 14. **A repository transfer leaves its environments behind**, as it
     already leaves its secrets and vars (`upsert_repo`).
+15. **Runners have one flat rate, $0.001 a minute, and it moves into
+    code.** Today it lives only in Polar (README: "0.1 cents a minute on
+    the Job minutes meter"; spec: "$0.001 per job minute") and the app
+    read it through `GET /api/plan`, which takes the product's first
+    metered price. With two metered prices on the product that answer
+    is ambiguous, so `hatchrun_cloud::usage::PRICE_MICROS_PER_MINUTE`
+    (`1_000`) holds the runner price as `hatchrun_workflow::templates`
+    holds CI's, the server computes the spend, and `GET /api/plan`,
+    `polar::plan`, `Plan`, `sort` and `product` go with the app's
+    `getPlan`.
+16. **Per-second prices of these per-minute rates have no exact decimal
+    form** (one runner second is 1/600 of a cent, one CI unit 1/300).
+    The code stays exact: spend is `units * price_per_minute / 60` on the
+    month's total, rounded down to a micro once, so
+    `spend_micros(units) >= cap` holds exactly when
+    `units * price_per_minute >= cap * 60`. Polar takes 12 decimals of a
+    cent; the operator's prices are truncated to them, so Polar never
+    bills more than the stated rate and bills under a millionth of a cent
+    less per million units.
+17. **The grace period goes with the free minutes.** It let an unpaid
+    tenant keep launching for seven days after its free minutes, and
+    after a subscription ended past them; with no free allowance it is
+    free runner time. `tenants.free_used_up_at`, `GRACE_MS`, the grace
+    SQL and the app's grace banner go. `MAY_LAUNCH` is
+    `tenants.beta OR` an active or trialing subscription.
+18. **Runner events change name, CI events keep theirs.** Runner usage
+    goes to Polar as `job.seconds` with metadata `{seconds, job_id}`
+    (external id `job:{id}` as before), so the old minutes meter cannot
+    price seconds. CI keeps `ci.usage` with metadata
+    `{units, seconds, template}` and external id `ci:{job}:{attempt}`:
+    no CI event reached production Polar yet.
+19. **The runner spend the app shows counts billed rows only**
+    (`usage_events.billed`), the rows Polar receives, so beta time and
+    time after a subscription ended show as time, not spend.
 
 ## Global Constraints
 
@@ -180,10 +249,21 @@ Made while writing this plan; the plan keeps them.
   `hatchrun-workflow` build for `wasm32-unknown-unknown`.
 - No backward compatibility code paths: new columns are required where
   it makes sense, everything deploys together, no data migration shims.
-  There are no production CI rows yet.
+  There are no production CI rows yet. Recorded runner usage rows exist
+  and are converted in place (Task 12).
 - Schema changes go in one new file,
   `crates/cloud/migrations/0006_ci_environments.sql`. Task 1 creates it;
-  Tasks 4 and 5 append to it. Add-only is not required.
+  Tasks 4, 5, 12 and 13 append to it, each under a comment heading of
+  its own. Add-only is not required.
+- Billed time (decision 5): every runner job and every CI attempt is
+  billed `max(60, ceil(seconds))` seconds. No free allowance anywhere.
+  CI prices live only in `hatchrun_workflow::templates`, the runner
+  price only in `hatchrun_cloud::usage::PRICE_MICROS_PER_MINUTE`; Polar
+  carries the same prices per second (decision 5's operator steps).
+  Spend is computed on a month's total units, rounded down to a micro
+  once (ruling 16).
+- Time shown to users: minutes with one decimal under an hour
+  (`12.5 min`), `Hh MMm` from an hour on (`3h 07m`); spend in dollars.
 - Comments, docs, UI copy and messages are plain English. No em-dash or
   en-dash characters anywhere (code, comments, docs, commit messages).
 - Secret values never appear in logs, errors, check runs, `Debug`
@@ -221,6 +301,20 @@ Made while writing this plan; the plan keeps them.
    tenant not to receive the old tenant's secret. Pinned in Task 5
    (`an_empty_selection_reaches_no_repo`,
    `selection_never_crosses_tenants`).
+6. **A job shorter than a minute, or one whose clock runs backwards.**
+   The user expects a 10 second job, and a job whose `completed_at` is
+   before its `started_at`, to bill exactly 60 seconds, and a 60.5
+   second job 61. Pinned in Task 12 (`job_seconds_bill_at_least_a_minute`)
+   and Task 13 (`seconds_round_up_with_a_minute_minimum`).
+7. **Spend exactly at the cap after per-second rounding.** The user
+   expects CI to hold at the first unit that reaches the cap and not one
+   unit early or late. Pinned in Task 13 (`admission_order`, with
+   1,500,000 and 1,499,999 units).
+8. **A hatchrun.io tenant with no card and no beta.** Without free
+   minutes it launches nothing; the user expects the launch refusal and
+   the app to say a card is needed, not to mention free minutes or a
+   grace period. Pinned in Task 12 (`only_beta_and_paid_tenants_launch`,
+   `a_connected_tenant_reads`).
 
 ## File map
 
@@ -237,6 +331,11 @@ Made while writing this plan; the plan keeps them.
 | `crates/ci/src/api.rs` | approve and reject, job JSON |
 | `web/app/src/pages/ci/Environments.tsx` | the environments section |
 | `web/app/src/pages/ci/RepoAccess.tsx` | all or selected repositories |
+| `crates/cloud/src/usage.rs` | billed runner seconds, the runner price, who may launch |
+| `crates/cloud/src/polar.rs` | `job.seconds` and `ci.usage` events |
+| `crates/workflow/src/templates.rs` | CI units per second and CI spend |
+| `web/app/src/lib/utils.ts` | `runnerTime`, the shared time format |
+| `web/app/src/pages/Billing.tsx` | runner time and spend, no free minutes |
 
 ---
 
@@ -1451,7 +1550,517 @@ git commit -S -s -m "test(ci): cover environments and repository access in e2e"
 
 ---
 
-### Task 12 [cheap]: Full checks
+### Task 12 [standard]: Bill runner time per second with no free minutes
+
+**Files:**
+- Modify: `crates/cloud/migrations/0006_ci_environments.sql` (append),
+  `crates/cloud/src/usage.rs` (all of it: constants 23-28, `MAY_LAUNCH`
+  46-63, `minutes` 65-73, `insert_sql` 75-86, `used_up_sql` 88-98,
+  `month_sql` 100-108, `grace_sql` 110-121, `sweep_sql` 123-140,
+  `CLEAR_GRACE` 142-145, `UNSENT` 147-149, `LOCK_TENANT` 156-158,
+  `record` 160-191, `start_grace` 193-201, `sweep` 203-220,
+  `clear_grace` 222-228, `Month`/`MonthRow`/`month` 230-263, `Unsent`
+  265-276, tests 291-614),
+  `crates/cloud/src/polar.rs` (module doc 5-18, `product` 55-62,
+  `Plan`/`Product`/`Price`/`plan`/`sort` 64-163, `MINUTES_EVENT`,
+  `Minutes` and `ingest` 224-263, tests `sends_job_minutes` 693 and
+  `reads_plans` 774 to the end of the module),
+  `crates/cloud/src/app/billing.rs` (module doc 5-17, `UsageView` 76-91,
+  `billing` 115-143, `plan` 163-178, `settle` 384-408),
+  `crates/cloud/src/app/mod.rs` (doc line 23, route line 295),
+  `crates/cloud/src/launch.rs` (doc 8-10, refusal 233-241, test
+  `a_connected_tenant_reads` 721-765), `crates/cloud/src/entry.rs:285`,
+  `crates/cloud/src/reconcile/mod.rs` (comments 118, 438, 1469-1473,
+  1522; `usage::record` call 740; `meter` 1474-1515),
+  `crates/cloud/src/bench.rs` (insert 414-425, `usage_cases` 1329-1360,
+  1810, 1933), `crates/cloud/wrangler.toml:139-149`, `README.md:289-310`,
+  `crates/ci/src/store.rs` (test `minutes_round_up_like_usage_minutes`
+  only: it calls `hatchrun_cloud::usage::minutes`),
+  `web/app/src/lib/utils.ts`, `web/app/src/api.ts` (`Usage` 78-90,
+  `Plan` and `Plans` 92-110, `getPlan` 211),
+  `web/app/src/pages/Billing.tsx`, `web/app/src/pages/Home.tsx:144`,
+  `web/app/mock/api.ts` (30-82, the `GET /api/plan` route 145-165, the
+  tenant seed at 458)
+
+**Interfaces:**
+- Produces, appended to the migration:
+
+```sql
+-- Runner time is billed per second, at least 60 seconds a job, with no
+-- free minutes and no grace period after them. Recorded minutes become
+-- seconds.
+ALTER TABLE usage_events RENAME COLUMN minutes TO seconds;
+ALTER TABLE usage_events DROP CONSTRAINT usage_events_minutes_check;
+UPDATE usage_events SET seconds = seconds * 60;
+ALTER TABLE usage_events ADD CONSTRAINT usage_events_seconds_check CHECK (seconds >= 60);
+ALTER TABLE tenants DROP COLUMN free_used_up_at;
+```
+
+- `hatchrun_cloud::usage` (Task 13 uses `job_seconds` in a test):
+
+```rust
+/// The least a job is billed: one minute.
+pub const MIN_BILLED_SECONDS: u64 = 60;
+/// The runner price, $0.001 a minute, billed per second, in millionths
+/// of a dollar. Polar's price on the "Runner seconds" meter is this
+/// divided by 60.
+pub const PRICE_MICROS_PER_MINUTE: u64 = 1_000;
+/// Billed seconds of a job that ran from `started` to `completed` (Unix
+/// ms): whole seconds, rounded up, at least MIN_BILLED_SECONDS.
+pub fn job_seconds(started: u64, completed: u64) -> u64;
+/// What `seconds` of runner time cost, in micros, rounded down once.
+pub fn spend_micros(seconds: u64) -> u64; // seconds * PRICE_MICROS_PER_MINUTE / 60
+/// In the beta or paid. Spelled out, a const &str cannot be formatted.
+pub(crate) const MAY_LAUNCH: &str = "(tenants.beta OR EXISTS (SELECT 1 FROM subscriptions \
+     WHERE subscriptions.tenant_id = tenants.id \
+     AND subscriptions.status IN ('active', 'trialing')))";
+/// Records job `id`'s billed seconds once, if a runner took it.
+pub(crate) async fn record(db: &Db, id: u64, started: u64, completed: u64) -> Result<bool>;
+/// Returns how many jobs it recorded.
+pub(crate) async fn sweep(db: &Db, since: u64, limit: u32) -> Result<usize>;
+pub struct Month { pub seconds: u64, pub billed_seconds: u64, pub may_launch: bool }
+pub struct Unsent { pub job_id: u64, pub tenant_id: String, pub seconds: u64, pub ended_at: u64 }
+```
+
+  Removed: `FREE_MINUTES`, `GRACE_MS`, `minutes`, `used_up_sql`,
+  `grace_sql`, `CLEAR_GRACE`, `LOCK_TENANT`, `start_grace`,
+  `clear_grace`. `USED` sums `usage_events.seconds`; a new `BILLED` is
+  the same sum with `AND usage_events.billed`. `month_sql` is
+  `SELECT {USED} AS seconds, {BILLED} AS billed_seconds, {MAY_LAUNCH} AS may_launch FROM tenants WHERE id = $1`;
+  `month` answers `Month { seconds: 0, billed_seconds: 0, may_launch: false }`
+  for no row. `insert_sql` writes `seconds` (`$2`). `sweep_sql` writes
+  `GREATEST(60, (jobs.completed_at - jobs.started_at + 999) / 1000)`
+  and drops `RETURNING tenant_id`; `sweep` returns `db.run`'s count.
+  `UNSENT` selects `seconds`. `record` runs `insert_sql` alone with
+  `job_seconds(started, completed)`. Module doc: per second, at least
+  a minute, beta or paid launches, beta seconds are counted and not
+  billed.
+- `hatchrun_cloud::polar`:
+
+```rust
+/// Name of the events that carry a job's billed seconds. The "Runner
+/// seconds" meter sums their `seconds`.
+pub const SECONDS_EVENT: &str = "job.seconds";
+pub struct JobSeconds<'a> { pub job_id: u64, pub tenant: &'a str, pub seconds: u64, pub at: String }
+/// external_id `job:{id}`, metadata `{ "seconds": n, "job_id": "<id>" }`.
+pub fn ingest(api: &str, token: &str, events: &[JobSeconds<'_>]) -> Request;
+```
+
+  Removed (ruling 15): `product`, `Plan`, `Product`, `Price`, `plan`,
+  `sort`, `billing::plan` and the `(Method::Get, ["plan"])` route.
+- `app::billing::UsageView` (JSON camelCase):
+
+```rust
+pub(crate) struct UsageView {
+    month_start: String,
+    month_end: String,
+    /// Runner seconds this month, every job at least 60.
+    seconds: u64,
+    /// What this month's billed seconds cost, in cents, rounded down.
+    spend_cents: u64,             // usage::spend_micros(month.billed_seconds) / 10_000
+    /// The runner price per minute, in millionths of a dollar.
+    price_micros_per_minute: u64, // usage::PRICE_MICROS_PER_MINUTE
+    pub may_launch: bool,
+}
+```
+
+  `settle` for a changed licensed subscription rechecks launches and
+  returns `ci_wake::card_returned`; any other changed subscription
+  returns no jobs and logs nothing more (no grace).
+- `launch.rs` refuses an unlicensed tenant with
+  `format!("tenant {} has no card on file: add one in the app to launch runners", tenant.id)`.
+- `web/app/src/lib/utils.ts`:
+
+```ts
+/** Runner time: "12.5 min" under an hour, "3h 07m" from an hour on. */
+export function runnerTime(seconds: number): string;
+```
+
+- `api.ts` `Usage`: `{ monthStart; monthEnd; seconds; spendCents; priceMicrosPerMinute; mayLaunch }`.
+  `Plan`, `Plans` and `getPlan` go.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+// crates/cloud/src/usage.rs, mod tests
+#[test] fn job_seconds_bill_at_least_a_minute() {
+    assert_eq!(job_seconds(0, 0), 60);
+    assert_eq!(job_seconds(0, 10_000), 60);
+    assert_eq!(job_seconds(0, 60_000), 60);
+    assert_eq!(job_seconds(0, 60_001), 61);
+    assert_eq!(job_seconds(1_000, 61_500), 61);
+    assert_eq!(job_seconds(0, 600_000), 600);
+    assert_eq!(job_seconds(5_000, 1_000), 60); // a clock that runs backwards
+}
+#[test] fn spend_is_per_second_and_rounds_down_once() {
+    assert_eq!(spend_micros(0), 0);
+    assert_eq!(spend_micros(60), 1_000);
+    assert_eq!(spend_micros(61), 1_016);
+    assert_eq!(spend_micros(3_600), 60_000);
+}
+#[test] fn the_launch_rule_matches_the_constants() {
+    assert_eq!(MAY_LAUNCH, format!("(tenants.beta OR {PAID})"));
+}
+// Replaces rounds_jobs_up_to_whole_minutes.
+
+// crates/cloud/src/usage.rs, mod sql. seed() names its unpaid tenant
+// "unpaid" instead of "free"; record(db, id, installation, secs, ago, ran)
+// inserts the job and runs insert_sql with (id, secs, now - ago).
+#[test] fn only_beta_and_paid_tenants_launch()
+    // month("unpaid").may_launch false with no usage; "paid" and "beta" true;
+    // subscription 'sub' canceled -> "paid" false; trialing -> true
+#[test] fn a_job_counts_once_and_only_on_a_runner()
+    // record 600 s -> 1; insert again -> 0; a job no runner took -> 0;
+    // month("unpaid").seconds == 600
+#[test] fn last_month_does_not_count()          // 240_000 s, 40 days ago -> seconds 0
+#[test] fn paid_seconds_go_to_polar_and_beta_ones_do_not()
+    // paid job 1 of 90 s, beta job 2 of 300 s: UNSENT is one row
+    // (1, "paid", seconds 90); after SENT of [1], UNSENT is empty
+#[test] fn the_month_spends_billed_seconds_only()
+    // paid job 1 of 36_000 s; beta job 2 of 600 s; 'sub' canceled; paid job 3 of 61 s:
+    // month("paid") == (seconds 36_061, billed_seconds 36_000);
+    // month("beta") == (600, 0)
+#[test] fn the_sweep_records_what_no_webhook_did()
+    // as today; job 5 recorded first with insert_sql seconds 60;
+    // the sweep's run count is 1, then 0; rows
+    // {job_id 1, seconds 601, billed false}, {job_id 5, seconds 60, billed false}
+// queries_use_the_indexes stays. Delete jobs_completing_together_start_the_grace_period,
+// free_minutes_then_grace_then_stop, grace_starts_when_a_subscription_ends,
+// a_subscription_that_ends_gets_a_fresh_grace_period and the statements/send helpers.
+
+// crates/cloud/src/polar.rs
+#[test] fn sends_job_seconds()  // replaces sends_job_minutes
+    // JobSeconds { job_id: 29679449, tenant: "t1", seconds: 600, at } ->
+    // name "job.seconds", external_id "job:29679449",
+    // metadata { "seconds": 600, "job_id": "29679449" }
+// Delete reads_plans.
+
+// crates/cloud/src/app/billing.rs (Postgres, like a_licensed_subscription_wakes_jobs_held_for_the_card)
+#[test] fn the_usage_view_bills_paid_seconds_only()
+    // tenant t1 with an active subscription; usage_events (1, t1, 36_000, now, billed true)
+    // and (2, t1, 61, now, billed false): billing(db, "t1", false).usage has
+    // seconds 36_061, spend_cents 60, price_micros_per_minute 1_000, may_launch true;
+    // its JSON has "spendCents" and no "freeMinutes", "freeUsedUpAt" or "graceEndsAt"
+
+// crates/cloud/src/launch.rs
+#[test] fn a_connected_tenant_reads()
+    // seed(false, 2): !tenant.licensed (no card, not beta); after the
+    // subscription insert, tenant.licensed. The usage_events and
+    // free_used_up_at statements go.
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `cargo test -p hatchrun-cloud -- usage polar billing launch`
+Expected: FAIL to compile: `job_seconds`, `spend_micros`, `JobSeconds` not defined.
+
+- [ ] **Step 3: Implement** the migration, `usage.rs`, `polar.rs`,
+  `app/billing.rs` and `app/mod.rs` as above. Callers:
+  `entry.rs:285` and `reconcile/mod.rs:740` call
+  `usage::record(db, id, started, completed)`; `meter` calls
+  `usage::sweep(&self.db, self.now.saturating_sub(SWEEP_WINDOW), DELETE_BATCH)`,
+  logs `"reconcile: recorded the runner time of {swept} jobs no webhook recorded"`
+  and builds `polar::JobSeconds { seconds: event.seconds, .. }`;
+  comments at 118, 438, 1469-1473 and 1522 say "runner seconds" for
+  "job minutes". `bench.rs`: the usage insert writes `seconds` with
+  `GREATEST(60, (jobs.completed_at - jobs.started_at + 999) / 1000)`;
+  `usage_cases` uses `usage::job_seconds` and drops the
+  `"usage used_up_sql"` case; line 1810 calls
+  `usage::record(db, id, now - 9 * MINUTE, now)` and line 1933
+  `usage::sweep(db, now - DAY, DELETE_BATCH)`. `launch.rs` doc: tenants
+  "in the beta or paid" launch. In `crates/ci/src/store.rs`, test
+  `minutes_round_up_like_usage_minutes` compares with
+  `ms.div_ceil(60_000).max(1)` instead of `usage::minutes` (Task 13
+  rewrites it).
+  `wrangler.toml` comment on `POLAR_PRODUCT_ID`: the product's runner
+  price is a metered price of `0.001666666666` cents per unit on the
+  "Runner seconds" meter (the sum of `metadata.seconds` of the
+  `job.seconds` events the reconciler sends), no cap and no meter
+  credit, which matches `PRICE_MICROS_PER_MINUTE` in `src/usage.rs`;
+  the CI sentence stays until Task 13.
+  `README.md:289-310` becomes: billing is per second of runner time, at
+  least one minute a job (GitHub's `started_at` to `completed_at`,
+  rounded up to whole seconds), one `usage_events` row per job; there
+  are no free minutes, so runners launch only for tenants in the beta or
+  with an active or trialing subscription; `PRICE_MICROS_PER_MINUTE`
+  and `MIN_BILLED_SECONDS` in `usage.rs` set the rate and the minimum;
+  the Polar product carries the metered price of decision 5 on the
+  "Runner seconds" meter; seconds of jobs that completed while the
+  tenant paid go to Polar as `job.seconds` events (up to 500 a minute,
+  `external_id` `job:{id}`); the 0.1 cents a minute, "Job minutes"
+  meter and 3,000 minute credit text goes.
+
+- [ ] **Step 4: Run the Rust tests**
+
+Run: `cargo test -p hatchrun-cloud && cargo test -p hatchrun-ci store && cargo check -p hatchrun-cloud --target wasm32-unknown-unknown`
+Expected: PASS.
+
+- [ ] **Step 5: The app.** `lib/utils.ts` gains `runnerTime`
+  (`0` -> `"0.0 min"`, `750` -> `"12.5 min"`, `11_220` -> `"3h 07m"`;
+  hours use `toLocaleString()`). `api.ts` as above. `Billing.tsx`:
+  `pricing`, `estimate`, the `minutes` helper, `getPlan` and the `Plan`
+  import go; `rate` is `money(usage.priceMicrosPerMinute / 10_000, "usd")`
+  (`"$0.001"`). Copy:
+  - `UsageMeter({ tenant })`, no meter bar: head
+    `<strong className="mono">{runnerTime(usage.seconds)}</strong> of runner time in {month}`,
+    and for a licensed non-beta tenant `{money(usage.spendCents, "usd")} so far`
+    on the right; then `Not billed in the beta.` for beta, else
+    `Billed per second, at least a minute per job, at {rate} a minute.`,
+    then for a licensed non-beta tenant
+    `Polar invoices by your billing period, so the invoice can differ.`,
+    then `The count starts again on {date}.`
+  - `UsageNotice`: nothing when licensed; otherwise one
+    `notice notice-accent usage-notice` (`role="status"`):
+    `Runners launch once {org} adds a card. hatchrun costs {rate} a minute, billed per second.`
+    with `<AddCard org={org} primary />`.
+  - `BillingPanel` unpaid text:
+    `Runners launch once you add a card. hatchrun costs {rate} a minute of runner time, billed per second with a one minute minimum per job. Runners run in your cloud account, so your provider bills compute directly, with no markup.`;
+    after checkout `Card added. {org} pays per second of runner time.`;
+    beta `In the invite-only beta. Runner time is counted and nothing is billed.`
+  - `PlanSummary`: `Card on file, paying per second of runner time.`
+  `Home.tsx:144` ends `Runners launch once you add a card.` instead of
+  the free minutes sentence. `mock/api.ts`: `MockTenant.minutes` becomes
+  `seconds` (seed `1240` -> `74_400`); `FREE_MINUTES`, `GRACE_MS`,
+  `MOCK_USAGE` and the `GET /api/plan` route go; `usage` is
+  `{ monthStart, monthEnd, seconds, spendCents: licensed && !beta ? Math.floor((seconds * 1_000) / 60 / 10_000) : 0, priceMicrosPerMinute: 1_000, mayLaunch: licensed }`.
+
+Run: `cd web/app && npm run typecheck && npm run lint && npm run build && cd ../.. && ! git grep -n "FREE_MINUTES\|GRACE_MS\|free_used_up_at\|freeMinutes\|freeUsedUpAt\|graceEndsAt\|job\.minutes\|MINUTES_EVENT\|getPlan\|/api/plan\|free minutes" -- crates/cloud/src crates/cloud/wrangler.toml web/app/src web/app/mock README.md`
+Expected: no errors, the grep prints nothing.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/cloud crates/ci/src/store.rs README.md web/app
+git commit -S -s -m "feat(billing): bill runner time per second with no free minutes"
+```
+
+---
+
+### Task 13 [standard]: Bill CI per second with no free units
+
+**Files:**
+- Modify: `crates/cloud/migrations/0006_ci_environments.sql` (append),
+  `crates/workflow/src/templates.rs` (constants 10-13, `Template` 43-53,
+  `spend_micros` 130-134, tests 208-231), `crates/workflow/src/lib.rs:46-47`,
+  `crates/ci/src/billing.rs` (32-90, tests 180-263),
+  `crates/ci/src/store.rs` (`RECORD_USAGE`, `STANDING`, `UNSENT_USAGE`,
+  `Standing`, `StandingRow`, `UnsentUsage`, `finish_job`,
+  `template_prices` and the usage tests named below; Task 4 moved its
+  lines, so find them by name), `crates/ci/src/runs.rs` (the import,
+  `no_card_check_run`, test `no_card_check_run_asks_for_a_card`),
+  `crates/ci/src/reconcile.rs` (`usage_events`, `usage_row`, test
+  `usage_events_carry_the_units_recorded_at_completion`),
+  `crates/cloud/src/polar.rs` (`CiUsage`, `ci_ingest`, test
+  `ci_ingest_names_job_and_attempt`), `crates/cloud/wrangler.toml` (the
+  CI sentence of the `POLAR_PRODUCT_ID` comment),
+  `crates/ci/scripts/e2e.sh` (the "wide" scenario's Polar check, about
+  line 655-662), `web/app/src/api.ts` (`CiBilling` 672-690),
+  `web/app/src/pages/ci/CiSettings.tsx:77-79`,
+  `web/app/mock/ci-settings.ts` (header line 9, `FREE_UNITS` 53, the
+  billing answer 118-127),
+  `docs/superpowers/specs/2026-10-19-orchestrator-design.md` ("Billing
+  and abuse" bullet, about line 368-374)
+
+**Interfaces:**
+- Consumes: Task 12 (`hatchrun_cloud::usage::job_seconds`).
+- Produces, appended to the migration:
+
+```sql
+-- CI attempts are billed per second, at least 60 seconds an attempt;
+-- a unit is one 2 vCPU second. Recorded minutes and units become
+-- seconds.
+ALTER TABLE ci_usage RENAME COLUMN minutes TO seconds;
+ALTER TABLE ci_usage DROP CONSTRAINT ci_usage_minutes_check;
+UPDATE ci_usage SET seconds = seconds * 60, units = units * 60;
+ALTER TABLE ci_usage ADD CONSTRAINT ci_usage_seconds_check CHECK (seconds >= 60);
+```
+
+- `hatchrun_workflow::templates` (re-exported as today):
+
+```rust
+/// The billing unit is one 2 vCPU second. The price of one 2 vCPU
+/// minute (60 units), in millionths of a dollar.
+pub const UNIT_PRICE_MICROS_PER_MINUTE: u64 = 2_000;
+impl Template {
+    /// Billing units of `seconds` on this template: seconds times vCPUs / 2.
+    pub fn units(&self, seconds: u64) -> u64; // seconds * price_micros_per_minute / UNIT_PRICE_MICROS_PER_MINUTE
+}
+/// What a month of `units` costs, in micros, rounded down once.
+pub fn spend_micros(units: u64) -> u64; // units * UNIT_PRICE_MICROS_PER_MINUTE / 60
+```
+
+  Removed: `UNIT_PRICE_MICROS`, `FREE_UNITS`. `price_micros_per_minute`
+  and the template table stay.
+- `hatchrun_ci::billing`: `units(&Standing)` sums
+  `template.units(seconds)` over `seconds_by_template`;
+  `BillingView { card, seconds, units, spend_cents, cap_dollars, min_cap_dollars, max_cap_dollars, running, max_running }`
+  (`minutes` and `free_units` go; `seconds` is the sum of
+  `seconds_by_template`). `admission` is unchanged in shape and compares
+  `spend_micros(standing) >= standing.cap_micros`, which is exact
+  (ruling 16).
+- `hatchrun_ci::store`: `Standing.seconds_by_template: Vec<(String, u64)>`
+  replaces `minutes_by_template` (and `StandingRow`'s text column of
+  that name); `STANDING` sums `SUM(seconds)::bigint AS seconds` and
+  builds `json_build_object('template', u.template, 'seconds', u.seconds)`
+  `AS seconds_by_template`. `UnsentUsage.seconds: u64` replaces
+  `minutes`; `UNSENT_USAGE` selects `seconds`. `finish_job` passes
+  `templates::UNIT_PRICE_MICROS_PER_MINUTE` as `$5`. `RECORD_USAGE`:
+
+```sql
+INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, ended_at)
+SELECT ci_jobs.id, ci_jobs.attempt, ci_runs.tenant_id, ci_jobs.template,
+  s.seconds, s.seconds * ($4::jsonb ->> ci_jobs.template)::bigint / $5,
+  ci_jobs.completed_at
+FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id
+  CROSS JOIN LATERAL (SELECT GREATEST(60,
+    CEIL((ci_jobs.completed_at - ci_jobs.started_at) / 1000.0))::bigint AS seconds) s
+-- WHERE and ON CONFLICT as today
+```
+
+- `hatchrun_cloud::polar::CiUsage.seconds: u64` replaces `minutes`;
+  `ci_ingest` metadata is `{ "units", "seconds", "template" }`; the
+  event name stays `ci.usage` (ruling 18).
+- `no_card_check_run` summary:
+  `"Add a card for {org} at {page} to run this commit's workflows."`
+  (`FREE_UNITS` leaves the import).
+- `api.ts`:
+
+```ts
+export interface CiBilling {
+  card: boolean;
+  /** Billed runner seconds this month, every attempt at least 60. */
+  seconds: number;
+  /** Billing units this month; one unit is one 2 vCPU second. */
+  units: number;
+  /** This month's cost, in cents. */
+  spendCents: number;
+  // capDollars, minCapDollars, maxCapDollars, running, maxRunning as today
+}
+```
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+// crates/workflow/src/templates.rs
+#[test] fn units_are_two_vcpu_seconds() { // replaces units_scale_with_price
+    assert_eq!(template("ubuntu-latest").unwrap().units(61), 61);
+    assert_eq!(template("ubuntu-26.04-4core-arm").unwrap().units(60), 120);
+    assert_eq!(template("ubuntu-26.04-8core").unwrap().units(90), 360);
+    assert_eq!(template("ubuntu-26.04-16core").unwrap().units(90), 720);
+}
+#[test] fn spend_is_exact_with_no_free_units() { // replaces spend_starts_after_the_free_units
+    assert_eq!(spend_micros(0), 0);
+    assert_eq!(spend_micros(1), 33);
+    assert_eq!(spend_micros(3), 100);
+    assert_eq!(spend_micros(60), 2_000);
+    assert_eq!(spend_micros(1_500_000), 50_000_000);
+}
+// prices_follow_vcpus compares with u64::from(t.vcpu) * UNIT_PRICE_MICROS_PER_MINUTE / 2.
+
+// crates/ci/src/billing.rs; standing(seconds: &[(&str, u64)]) fills seconds_by_template
+#[test] fn view_from_standing() {
+    let v = view(&standing(&[("ubuntu-latest", 24_000), ("ubuntu-26.04-4core", 6_000)]));
+    // == BillingView { card: true, seconds: 30_000, units: 36_000, spend_cents: 120,
+    //    cap_dollars: 50, min_cap_dollars: 50, max_cap_dollars: 10_000, running: 0, max_running: 5 }
+    // JSON: json["seconds"] == 30_000, json["spendCents"] == 120,
+    // json.get("freeUnits").is_none(), json.get("minutes").is_none(); the other asserts stay
+}
+#[test] fn spend_counts_every_unit() { // replaces spend_counts_after_free_units
+    let s = standing(&[("ubuntu-latest", 24_000), ("ubuntu-26.04-4core", 6_000)]);
+    assert_eq!(units(&s), 36_000);
+    assert_eq!(spend_micros(&s), 1_200_000);
+    assert_eq!(spend_micros(&standing(&[("ubuntu-latest", 60)])), 2_000);
+    assert_eq!(units(&standing(&[("no-such", 9)])), 0);
+}
+#[test] fn admission_order() {
+    // as today, with s.running = 5 after the card step, then:
+    // seconds_by_template [("ubuntu-latest", 1_500_000)]: spend_micros == DEFAULT_SPEND_CAP_MICROS, Some(SpendCap)
+    // [("ubuntu-latest", 1_499_999)]: spend_micros == 49_999_966, Some(Concurrency)
+    // running 4: None
+}
+
+// crates/ci/src/store.rs (usage_rows reads `seconds`)
+#[test] fn finish_job_records_seconds_from_claim() // renamed; start 10_000, finish 71_000
+    // -> [(job_id, 1, "ubuntu-latest", 61, 71_000)]
+#[test] fn each_attempt_is_metered()               // -> [(1, 60), (2, 69)]
+#[test] fn seconds_round_up_with_a_minute_minimum() // replaces minutes_round_up_like_usage_minutes
+    // ms [0, 1, 60_000, 60_001, 61_500] from start 1_000 -> seconds [60, 60, 60, 61, 62],
+    // each == hatchrun_cloud::usage::job_seconds(1_000, 1_000 + ms), units == seconds;
+    // one more job with `UPDATE ci_jobs SET template = 'ubuntu-26.04-8core'` before
+    // finishing after 90_500 ms -> seconds 91, units 364
+#[test] fn standing_counts_this_month_and_running_jobs()
+    // inserts seconds 420, 300, 180, 6_000 (units equal) where it had minutes 7, 5, 3, 100;
+    // seconds_by_template [("ubuntu-26.04-4core", 180), ("ubuntu-latest", 300)];
+    // t2: [("ubuntu-latest", 6_000)]
+// sweep_deletes_usage_sent_long_ago and usage_goes_to_polar_oldest_first_and_once
+// insert `seconds` 60 and 240 (units equal), not minutes 1 and 4;
+// the latter asserts all[0].seconds == 240 and all[0].units == 240.
+
+// crates/ci/src/reconcile.rs; usage_row(job_id, template, seconds, units)
+#[test] fn usage_events_carry_the_units_recorded_at_completion()
+    // rows (7, "ubuntu-26.04-8core", 300, 1_200), (8, "retired", 180, 180):
+    // events[0].units == 1_200, events[0].seconds == 300, events[1].units == 180
+
+// crates/ci/src/runs.rs
+#[test] fn no_card_check_run_asks_for_a_card()
+    // summary == "Add a card for acme at https://app.example/o/acme/ci to run this commit's workflows."
+
+// crates/cloud/src/polar.rs
+#[test] fn ci_ingest_names_job_and_attempt()
+    // CiUsage { seconds: 90, units: 360, template: "ubuntu-26.04-8core", .. } ->
+    // metadata { "units": 360, "seconds": 90, "template": "ubuntu-26.04-8core" }
+```
+
+- [ ] **Step 2: Run them to see them fail**
+
+Run: `cargo test -p hatchrun-workflow templates && cargo test -p hatchrun-ci -- billing store runs reconcile`
+Expected: FAIL to compile: `UNIT_PRICE_MICROS_PER_MINUTE`, `seconds_by_template` not defined.
+
+- [ ] **Step 3: Implement** the migration and the code above. Doc
+  comments that say minutes, free units or "past the free units" say
+  seconds and units (`billing.rs` module and `BillingView`, `store.rs`
+  `RECORD_USAGE`, `Standing`, `UnsentUsage`, `polar.rs` `CiUsage`).
+  `wrangler.toml`: the CI sentence becomes a metered price of
+  `0.003333333333` cents per unit on the "CI usage" meter (the sum of
+  `metadata.units` of the `ci.usage` events; a unit is one 2 vCPU
+  second), with no meter credit. `e2e.sh`: the comment reads "Each
+  completed job's billed seconds go to Polar, keyed by job and attempt,
+  on a reconciler pass." and the jq test `.metadata.units >= 1` becomes
+  `.metadata.seconds >= 60 and .metadata.units == .metadata.seconds`.
+  The spec's "Billing and abuse" bullet drops "Each organization gets
+  500 free minutes a month," (it reads "A card is required before the
+  first job. At most 5 jobs run at once to start, ...") and ", with
+  500 free units a month as a meter credit"; after it a new bullet:
+  "**Per-second billing.** Every CI job attempt and every hatchrun.io
+  runner job is billed its seconds rounded up, at least 60. A CI unit
+  is one 2 vCPU second, so 4, 8 and 16 vCPU templates count 2, 4 and 8
+  units a second at $0.002 per 2 vCPU minute; runner time costs $0.001
+  a minute. There is no free allowance. Decided 2026-10-24."
+
+- [ ] **Step 4: The app.** `api.ts` as above. `CiSettings.tsx` replaces
+  the "Free minutes used" figure with
+  `<Figure label="Runner time this month" title={`${billing.units.toLocaleString()} units; one unit is one 2 vCPU second`}>{runnerTime(billing.seconds)}</Figure>`
+  (`runnerTime` from `@/lib/utils`, Task 12). `mock/ci-settings.ts`:
+  `FREE_UNITS` goes; the billing answer has `seconds: 19_200`,
+  `units: 19_200`, `spendCents: Math.floor((19_200 * 2_000) / 60 / 10_000)`
+  (64); the header says 19,200 seconds where it said 320 minutes.
+
+- [ ] **Step 5: Run the tests, the app and e2e**
+
+Run: `cargo test -p hatchrun-workflow && cargo test -p hatchrun-ci && cargo test -p hatchrun-cloud && cargo check -p hatchrun-ci -p hatchrun-cloud --target wasm32-unknown-unknown && (cd web/app && npm run typecheck && npm run lint && npm run build) && E2E_PG_PORT=55433 bash crates/ci/scripts/e2e.sh && ! git grep -n -i "FREE_UNITS\|freeUnits\|free_units\|free minutes\|free units\|UNIT_PRICE_MICROS[^_]\|minutes_by_template" -- crates web/app/src web/app/mock docs/superpowers/specs README.md ':!crates/cloud/migrations'`
+Expected: PASS, `e2e passed`, and the grep prints nothing (old
+migrations keep their history and are left out).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/cloud crates/workflow crates/ci web/app docs/superpowers/specs/2026-10-19-orchestrator-design.md
+git commit -S -s -m "feat(ci): bill ci per second with no free units"
+```
+
+---
+
+### Task 14 [cheap]: Full checks
 
 **Files:**
 - Modify: whatever the checks below ask to fix, in the task that owns
@@ -1479,9 +2088,10 @@ Expected: `e2e passed`.
 
 - [ ] **Step 5: Dashes and leftovers**
 
-Run: `git diff origin/main -- . | grep -nP "^\+.*(\x{2014}|\x{2013})"; git grep -n "POLAR_CI_PRODUCT_ID\|product = 'ci'\|startCiCheckout\|openCiPortal" -- crates web docs/superpowers/specs`
-Expected: both print nothing (the migration's `DELETE FROM subscriptions
-WHERE product = 'ci'` is the one allowed match of the second).
+Run: `git diff origin/main -- . | grep -nP "^\+.*(\x{2014}|\x{2013})"; git grep -n "POLAR_CI_PRODUCT_ID\|product = 'ci'\|startCiCheckout\|openCiPortal\|FREE_UNITS\|FREE_MINUTES\|free_used_up_at\|freeMinutes\|freeUnits\|graceEndsAt\|job\.minutes\|getPlan\|/api/plan" -- crates web docs/superpowers/specs README.md`
+Expected: both print nothing, except old migrations: `free_used_up_at`
+in `0001_schema.sql` and the `0006` lines that drop it, and any
+`product = 'ci'` in `0006`.
 
 - [ ] **Step 6: Commit** any fixes as
   `fix(<scope>): <what>` with `git commit -S -s`.
