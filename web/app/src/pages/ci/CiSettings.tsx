@@ -7,8 +7,6 @@
 import { useState, type FormEvent } from "react";
 
 import {
-  CAP_MAX_DOLLARS,
-  CAP_MIN_DOLLARS,
   getCiBilling,
   openCiPortal,
   setCiCap,
@@ -84,7 +82,7 @@ function BillingCard({ org, billing, onChange }: { org: string; billing: CiBilli
           {billing.running} of {billing.maxRunning}
         </Figure>
       </dl>
-      <CapForm org={org} current={billing.capDollars} onSaved={onChange} />
+      <CapForm org={org} current={billing.capDollars} min={billing.minCapDollars} max={billing.maxCapDollars} onSaved={onChange} />
     </div>
   );
 }
@@ -98,7 +96,7 @@ function Figure({ label, title, children }: { label: string; title?: string; chi
   );
 }
 
-function CapForm({ org, current, onSaved }: { org: string; current: number; onSaved: () => void }) {
+function CapForm({ org, current, min, max, onSaved }: { org: string; current: number; min: number; max: number; onSaved: () => void }) {
   const [cap, setCap] = useState(String(current));
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
@@ -108,8 +106,8 @@ function CapForm({ org, current, onSaved }: { org: string; current: number; onSa
     event.preventDefault();
     setSaved(false);
     const dollars = Number(cap);
-    if (cap.trim() === "" || !Number.isInteger(dollars) || dollars < CAP_MIN_DOLLARS || dollars > CAP_MAX_DOLLARS) {
-      setProblem(`Set a cap in whole dollars from $${CAP_MIN_DOLLARS} to $${CAP_MAX_DOLLARS.toLocaleString()}`);
+    if (cap.trim() === "" || !Number.isInteger(dollars) || dollars < min || dollars > max) {
+      setProblem(`Set a cap in whole dollars from $${min} to $${max.toLocaleString()}`);
       return;
     }
     setBusy(true);
@@ -137,8 +135,8 @@ function CapForm({ org, current, onSaved }: { org: string; current: number; onSa
           type="number"
           inputMode="numeric"
           step={1}
-          min={CAP_MIN_DOLLARS}
-          max={CAP_MAX_DOLLARS}
+          min={min}
+          max={max}
           value={cap}
           onChange={(event) => setCap(event.target.value)}
           aria-invalid={problem !== null}

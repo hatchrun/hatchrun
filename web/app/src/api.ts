@@ -679,17 +679,12 @@ export interface CiBilling {
   spendCents: number;
   /** The monthly spend cap, in whole dollars. */
   capDollars: number;
+  /** The range the cap can be set within, in whole dollars. */
+  minCapDollars: number;
+  maxCapDollars: number;
   running: number;
   maxRunning: number;
 }
-
-/**
- * The range of the spend cap in whole dollars. The API enforces it and
- * answers 422 outside it, but does not report it; these are the
- * MIN_SPEND_CAP_MICROS and MAX_SPEND_CAP_MICROS of crates/workflow.
- */
-export const CAP_MIN_DOLLARS = 50;
-export const CAP_MAX_DOLLARS = 10_000;
 
 const orgCiPath = (org: string) => `/api/ci/orgs/${encodeURIComponent(org)}`;
 

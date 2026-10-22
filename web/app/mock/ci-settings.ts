@@ -125,6 +125,8 @@ export function handleCiSettings(
         freeUnits: FREE_UNITS,
         spendCents: Math.max(0, minutes - FREE_UNITS) * 0.2,
         capDollars: billing.capDollars,
+        minCapDollars: 50,
+        maxCapDollars: 10_000,
         running: 2,
         maxRunning: 5,
       });
