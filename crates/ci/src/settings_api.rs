@@ -368,38 +368,61 @@ async fn selection(
     target: &Target,
     names: Option<&[String]>,
 ) -> Result<Served<Option<Vec<u64>>>> {
-    let Some(names) = names else {
-        return Ok(Ok(None));
+    let names = match check_selection(target.owner, names) {
+        Ok(Some(names)) => names,
+        Ok(None) => return Ok(Ok(None)),
+        Err(stop) => return Ok(Err(stop)),
     };
-    if target.owner != Owner::Org {
-        return Ok(stop(
+    let found = store::repo_ids(cx.db, &target.tenant, names).await?;
+    Ok(resolve_selection(names, &found).map(Some))
+}
+
+/// The checks that need no database: no names at all means every
+/// repository, only an organization row may select, and at most
+/// `MAX_SELECTED_REPOS` names.
+fn check_selection(
+    owner: Owner,
+    names: Option<&[String]>,
+) -> std::result::Result<Option<&[String]>, Stop> {
+    let Some(names) = names else {
+        return Ok(None);
+    };
+    if owner != Owner::Org {
+        return stop(
             400,
             "Only organization secrets and variables have repository access",
-        ));
+        );
     }
     if names.len() > secrets::MAX_SELECTED_REPOS {
-        return Ok(stop(422, "Select at most 1000 repositories"));
+        return stop(422, "Select at most 1000 repositories");
     }
-    let found = store::repo_ids(cx.db, &target.tenant, names).await?;
-    let unknown: Vec<&str> = names
-        .iter()
-        .map(String::as_str)
-        .filter(|name| {
-            !found
-                .iter()
-                .any(|(known, _)| known.eq_ignore_ascii_case(name))
-        })
-        .collect();
+    Ok(Some(names))
+}
+
+/// The sorted, distinct ids of `names` among the tenant's repositories
+/// `found` (name as stored, id). A name that is not there is a `422`
+/// that lists each such name once, in the order given.
+fn resolve_selection(
+    names: &[String],
+    found: &[(String, u64)],
+) -> std::result::Result<Vec<u64>, Stop> {
+    let mut unknown: Vec<&str> = Vec::new();
+    for name in names {
+        let known = found
+            .iter()
+            .any(|(stored, _)| stored.eq_ignore_ascii_case(name));
+        let listed = unknown.iter().any(|seen| seen.eq_ignore_ascii_case(name));
+        if !known && !listed {
+            unknown.push(name);
+        }
+    }
     if !unknown.is_empty() {
-        return Ok(stop(
-            422,
-            format!("Unknown repositories: {}", unknown.join(", ")),
-        ));
+        return stop(422, format!("Unknown repositories: {}", unknown.join(", ")));
     }
-    let mut ids: Vec<u64> = found.into_iter().map(|(_, id)| id).collect();
+    let mut ids: Vec<u64> = found.iter().map(|(_, id)| *id).collect();
     ids.sort_unstable();
     ids.dedup();
-    Ok(Ok(Some(ids)))
+    Ok(ids)
 }
 
 /// The uppercased name, or the `400` that says what is wrong with it.
@@ -578,6 +601,82 @@ async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    fn refused<T: std::fmt::Debug>(result: std::result::Result<T, Stop>) -> (u16, String) {
+        let Stop(status, message, _) = result.unwrap_err();
+        (status, message)
+    }
+
+    #[test]
+    fn only_an_org_row_may_select() {
+        for owner in [
+            Owner::Repo(7),
+            Owner::Environment {
+                repo_id: 7,
+                environment_id: 3,
+            },
+        ] {
+            let (status, _) = refused(check_selection(owner, Some(&names(&["acme/app"]))));
+            assert_eq!(status, 400);
+        }
+        let asked = names(&["acme/app"]);
+        assert_eq!(
+            check_selection(Owner::Org, Some(&asked)).unwrap(),
+            Some(asked.as_slice())
+        );
+        // An empty list is a selection of nothing, not a refusal.
+        assert_eq!(
+            check_selection(Owner::Org, Some(&[])).unwrap(),
+            Some(&[][..])
+        );
+    }
+
+    #[test]
+    fn no_list_means_all_repositories() {
+        for owner in [Owner::Org, Owner::Repo(7)] {
+            assert_eq!(check_selection(owner, None).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn more_than_the_limit_is_refused() {
+        let at_limit: Vec<String> = (0..secrets::MAX_SELECTED_REPOS)
+            .map(|n| format!("acme/r{n}"))
+            .collect();
+        assert!(check_selection(Owner::Org, Some(&at_limit)).is_ok());
+        let mut over = at_limit;
+        over.push("acme/extra".to_owned());
+        let (status, message) = refused(check_selection(Owner::Org, Some(&over)));
+        assert_eq!(
+            (status, message.as_str()),
+            (422, "Select at most 1000 repositories")
+        );
+    }
+
+    #[test]
+    fn unknown_names_are_listed_once_in_order() {
+        let found = [("acme/app".to_owned(), 7)];
+        let asked = names(&["zed/b", "acme/app", "acme/a", "ZED/B", "zed/b"]);
+        let (status, message) = refused(resolve_selection(&asked, &found));
+        assert_eq!(status, 422);
+        assert_eq!(message, "Unknown repositories: zed/b, acme/a");
+    }
+
+    #[test]
+    fn known_names_resolve_to_sorted_distinct_ids() {
+        let found = [("acme/web".to_owned(), 9), ("acme/app".to_owned(), 7)];
+        let asked = names(&["ACME/WEB", "acme/app", "acme/web"]);
+        assert_eq!(resolve_selection(&asked, &found).unwrap(), [7, 9]);
+    }
+
+    #[test]
+    fn an_empty_list_reaches_none() {
+        assert_eq!(resolve_selection(&[], &[]).unwrap(), Vec::<u64>::new());
+    }
 
     #[test]
     fn routes_parse() {

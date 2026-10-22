@@ -1766,10 +1766,14 @@ pub async fn delete_secret(db: &Db, tenant: &str, owner: Owner, name: &str) -> R
 
 /// The names of the repositories an organization row reaches: a JSON
 /// array of `ci_repos.full_name`, or NULL when it reaches all of them.
-/// For a query that aliases the secrets or vars table as `s`.
+/// Repositories renamed to `#gone-` (deleted or transferred) are left
+/// out, so a list read back and sent in a `PUT` names only repositories
+/// that still exist. For a query that aliases the secrets or vars table
+/// as `s`.
 const REPOSITORY_NAMES: &str = "CASE WHEN s.repositories IS NULL THEN NULL ELSE \
        COALESCE((SELECT json_agg(r.full_name ORDER BY lower(r.full_name)) FROM ci_repos r \
-         WHERE r.id = ANY (s.repositories) AND r.tenant_id = s.tenant_id), \
+         WHERE r.id = ANY (s.repositories) AND r.tenant_id = s.tenant_id \
+         AND position('#gone-' in r.full_name) = 0), \
          '[]'::json)::text END AS repositories";
 
 /// A listed secret: never its value.
@@ -1874,9 +1878,9 @@ impl std::fmt::Debug for SealedRow {
 }
 
 /// The organization's (those reaching the repository), repository
-/// `repo_id`'s and (when set) environment `environment_id`'s sealed secrets, named in `names` or all of them
-/// when `None`, ordered by name, then organization, repository,
-/// environment. Every row of a name is returned, so a caller that
+/// `repo_id`'s and (when set) environment `environment_id`'s sealed
+/// secrets, named in `names` or all of them when `None`, ordered by
+/// name, then organization, repository, environment. Every row of a name is returned, so a caller that
 /// inserts them in order lets the most specific win.
 ///
 /// # Errors
@@ -4864,6 +4868,30 @@ mod tests {
         put_selected(&db, "secret", "A", None);
         let secrets = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
         assert_eq!(secrets[0].repositories, None);
+    }
+
+    #[test]
+    fn listing_leaves_out_gone_repos() {
+        let db = with_repos();
+        put_selected(&db, "secret", "A", Some(&[7, 8]));
+        put_selected(&db, "var", "A", Some(&[7, 8]));
+        // Repo 7 is renamed away when a new repository takes its name.
+        let fresh = RepoRow {
+            id: 10,
+            tenant_id: "t1".into(),
+            installation_id: 99,
+            full_name: "acme/app".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        db.wait(upsert_repo(db.db(), &fresh, 3)).unwrap();
+        let only_web = Some(vec!["acme/web".to_owned()]);
+        let secrets = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
+        assert_eq!(secrets[0].repositories, only_web);
+        let listed = db.wait(vars(db.db(), "t1", Owner::Org)).unwrap();
+        assert_eq!(listed[0].repositories, only_web);
+        let names = db.wait(tenant_repos(db.db(), "t1")).unwrap();
+        assert!(names.iter().all(|name| !name.contains("#gone-")));
     }
 
     #[test]
