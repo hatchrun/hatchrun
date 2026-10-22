@@ -21,7 +21,7 @@
 //!    through a tenant role there (see [`crate::instance_types`]);
 //! 5. fail the lost launches of installations with no AWS connected,
 //!    which `launch` does without calling anyone;
-//! 6. send the minutes of completed jobs of paying tenants to Polar's
+//! 6. send the seconds of completed jobs of paying tenants to Polar's
 //!    meter (see [`crate::usage`]);
 //! 7. delete expired sessions and rows past the retention;
 //! 8. check the pass and the database and email the alerts that are due
@@ -115,10 +115,10 @@ const REDELIVERY_MEMORY: u64 = 4 * 24 * 60 * 60 * 1000;
 /// How long a cache upload nobody finished keeps its row: the longest a
 /// runner instance runs, and then some.
 const CACHE_UPLOAD_MEMORY: u64 = 24 * 60 * 60 * 1000;
-/// How long job minutes are kept once Polar has them or never needed
+/// How long runner seconds are kept once Polar has them or never needed
 /// them: past a year, so last year's month can be compared.
 const USAGE_MEMORY: u64 = 400 * 24 * 60 * 60 * 1000;
-/// How far back the meter step looks for completed jobs whose minutes
+/// How far back the meter step looks for completed jobs whose seconds
 /// nothing recorded: a day, longer than GitHub retries a webhook and the
 /// sync takes to notice a job.
 const SWEEP_WINDOW: u64 = 24 * 60 * 60 * 1000;
@@ -199,7 +199,7 @@ struct Summary {
     sessions_deleted: u32,
     /// Jobs past the retention deleted.
     jobs_deleted: u32,
-    /// Jobs whose minutes Polar took.
+    /// Jobs whose seconds Polar took.
     metered: u32,
     /// Runs left without jobs, deleted.
     runs_deleted: u32,
@@ -435,7 +435,7 @@ pub(crate) const DELETE_REDELIVERIES: &str = "DELETE FROM redeliveries WHERE gui
 /// Deletes unavailable offerings that lapsed before `$1`.
 pub(crate) const DELETE_OFFERINGS: &str = "DELETE FROM unavailable_offerings WHERE until < $1";
 
-/// Deletes up to `$2` job minutes that completed before `$1` and that
+/// Deletes up to `$2` runner seconds that completed before `$1` and that
 /// Polar has, or never needed.
 pub(crate) const DELETE_USAGE: &str = "DELETE FROM usage_events WHERE job_id IN \
      (SELECT job_id FROM usage_events WHERE ended_at < $1 \
@@ -737,7 +737,7 @@ impl Pass<'_> {
                 ..
             }) = seen
             {
-                usage::record(&self.db, job.id, *started, *completed, self.now)
+                usage::record(&self.db, job.id, *started, *completed)
                     .await
                     .map_err(text)?;
             }
@@ -1466,22 +1466,20 @@ impl Pass<'_> {
         Ok(done)
     }
 
-    /// Step 6: records the minutes of jobs that completed in the last
-    /// [`SWEEP_WINDOW`] with none recorded, then sends the minutes Polar
-    /// has not taken yet, oldest first,
-    /// one batch a pass. Without Polar's token nothing is sent and the
+    /// Step 6: records the runner seconds of jobs that completed in the
+    /// last [`SWEEP_WINDOW`] with none recorded, then sends the seconds
+    /// Polar has not taken yet, oldest first, one batch a pass. Without Polar's token nothing is sent and the
     /// events wait.
     async fn meter(&self) -> Fallible<Summary> {
         let swept = usage::sweep(
             &self.db,
             self.now.saturating_sub(SWEEP_WINDOW),
             DELETE_BATCH,
-            self.now,
         )
         .await
         .map_err(text)?;
         if swept > 0 {
-            console_log!("reconcile: recorded the minutes of {swept} jobs no webhook recorded");
+            console_log!("reconcile: recorded the runner time of {swept} jobs no webhook recorded");
         }
         let Some(token) = get(self.env, POLAR_ACCESS_TOKEN) else {
             return Ok(Summary::default());
@@ -1495,12 +1493,12 @@ impl Pass<'_> {
             .unwrap_or_else(|| polar::API.to_owned())
             .trim_end_matches('/')
             .to_owned();
-        let events: Vec<polar::Minutes<'_>> = unsent
+        let events: Vec<polar::JobSeconds<'_>> = unsent
             .iter()
-            .map(|event| polar::Minutes {
+            .map(|event| polar::JobSeconds {
                 job_id: event.job_id,
                 tenant: &event.tenant_id,
-                minutes: event.minutes,
+                seconds: event.seconds,
                 at: time::format(event.ended_at),
             })
             .collect();
@@ -1519,7 +1517,7 @@ impl Pass<'_> {
     /// Step 7: deletes expired sessions, jobs past the retention,
     /// redeliveries GitHub no longer lists, lapsed unavailable offerings,
     /// cache uploads nobody finished, whose parts S3's lifecycle rule
-    /// removes after a day, job minutes older than [`USAGE_MEMORY`]
+    /// removes after a day, runner seconds older than [`USAGE_MEMORY`]
     /// that Polar has or never needed, and old failed launches and rate
     /// limits.
     async fn retention(&self) -> Fallible<Summary> {

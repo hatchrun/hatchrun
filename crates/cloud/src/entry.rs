@@ -282,7 +282,7 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
             if status == webhook::Status::Completed
                 && let (Some(started), Some(completed)) = (outcome.started_at, outcome.completed_at)
             {
-                usage::record(&db, id, started, completed, now_ms()).await?;
+                usage::record(&db, id, started, completed).await?;
             }
             Ok(Response::empty()?.with_status(204))
         }

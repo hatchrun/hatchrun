@@ -286,30 +286,28 @@ organization permission Members (read). The `installation` webhook
 unlinks a tenant when the App is uninstalled or suspended and links it
 again when the App comes back.
 
-Billing is per job minute. A job that ran on a hatchrun runner counts
-GitHub's `started_at` to `completed_at`, rounded up to whole minutes,
-once, when its `completed` webhook (or the reconciler's sync) lands; the
-`usage_events` table keeps one row per job. Every organization gets
-3,000 free minutes each UTC calendar month with no card. An unpaid
-tenant past them keeps launching for seven days, then launches nothing
-until it adds a card or the next month starts; the app shows the count
-and a banner from 80% on. `FREE_MINUTES` and `GRACE_MS` in
-[`usage.rs`](crates/cloud/src/usage.rs) set both.
+Billing is per second of runner time, at least one minute a job. A job
+that ran on a hatchrun runner counts GitHub's `started_at` to
+`completed_at`, rounded up to whole seconds, once, when its `completed`
+webhook (or the reconciler's sync) lands; the `usage_events` table keeps
+one row per job. There is no free tier: runners launch only for
+tenants in the beta or with an active or trialing subscription.
+`PRICE_MICROS_PER_MINUTE` and `MIN_BILLED_SECONDS` in
+[`usage.rs`](crates/cloud/src/usage.rs) set the rate and the minimum.
 
 Adding a card is a Polar subscription to the `POLAR_PRODUCT_ID`
-product: a metered price of 0.1 cents a minute on the "Job minutes"
-meter with no monthly cap, and a meter credit benefit of 3,000 minutes
-per billing period, which matches `FREE_MINUTES`. The app opens
-Polar's checkout with the tenant id as the external customer id, and
-Polar's webhooks, at `https://app.hatchrun.io/api/polar/webhook` and
-checked against `POLAR_WEBHOOK_SECRET`, keep the `subscriptions` table
-current. Minutes of jobs that completed while the tenant paid go to
-Polar as `job.minutes` events, which the meter sums: the reconciler
-sends up to 500 a minute, with the job as each event's `external_id`,
-so an event sent twice counts once. `POLAR_ACCESS_TOKEN` needs the
-`events:write` scope for that.
+product, which carries a metered price of 0.001666666666 cents a second
+on the "Runner seconds" meter, with no monthly cap and no credit. The
+app opens Polar's checkout with the tenant id as the external customer
+id, and Polar's webhooks, at `https://app.hatchrun.io/api/polar/webhook`
+and checked against `POLAR_WEBHOOK_SECRET`, keep the `subscriptions`
+table current. Seconds of jobs that completed while the tenant paid go
+to Polar as `job.seconds` events, which the meter sums: the reconciler
+sends up to 500 a minute, with the job as each event's `external_id`
+(`job:{id}`), so an event sent twice counts once. `POLAR_ACCESS_TOKEN`
+needs the `events:write` scope for that.
 
-Tenants in the invite-only beta count minutes and pay nothing. An owner
+Tenants in the invite-only beta count seconds and pay nothing. An owner
 redeems an invite code, or the operator lists the organization:
 
 ```sh

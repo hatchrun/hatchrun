@@ -4259,7 +4259,7 @@ mod tests {
             got.push(usage_rows(&db).last().unwrap().3);
             assert_eq!(
                 got.last().copied().unwrap(),
-                u64::from(hatchrun_cloud::usage::minutes(1_000, 1_000 + ms))
+                ms.div_ceil(60_000).max(1)
             );
         }
         assert_eq!(got, [1, 1, 1, 2]);

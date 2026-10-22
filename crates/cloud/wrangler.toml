@@ -136,10 +136,11 @@ CONNECT_TEMPLATE_URL = "https://hatchrun-templates.s3.us-east-1.amazonaws.com/co
 # launch it.
 MARKETPLACE_AMD64_URL = "https://aws.amazon.com/marketplace/pp/prodview-znhn62372z6jq"
 MARKETPLACE_ARM64_URL = "https://aws.amazon.com/marketplace/pp/prodview-nchg6i6uzlfr2"
-# The Polar product an organization subscribes to: a metered price on
-# the job minutes meter (the "job.minutes" events the reconciler sends)
-# with no cap, and a meter credit benefit for the free minutes, which
-# matches FREE_MINUTES in src/usage.rs. Several products may be listed,
+# The Polar product an organization subscribes to: a metered price of
+# 0.001666666666 cents per unit on the "Runner seconds" meter (the sum
+# of metadata.seconds of the "job.seconds" events the reconciler sends),
+# no cap and no meter credit, which matches PRICE_MICROS_PER_MINUTE in
+# src/usage.rs. Several products may be listed,
 # separated by commas; checkout offers all of them and answers 503
 # while the list is empty. The product also carries a metered price of
 # $0.002 per unit on the "CI usage" meter (the sum of metadata.units of

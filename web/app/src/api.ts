@@ -75,38 +75,18 @@ export interface Billing {
   usage: Usage;
 }
 
-/** Job minutes this calendar month (UTC). */
+/** Runner time this calendar month (UTC). */
 export interface Usage {
   monthStart: string;
   monthEnd: string;
-  minutes: number;
-  freeMinutes: number;
-  /** When the free minutes ran out this month. */
-  freeUsedUpAt: string | null;
-  /** When runners stop launching without a card. */
-  graceEndsAt: string | null;
+  /** Runner seconds, every job at least 60. */
+  seconds: number;
+  /** What the month's billed seconds cost, in cents. */
+  spendCents: number;
+  /** The runner price per minute, in millionths of a dollar. */
+  priceMicrosPerMinute: number;
   /** Whether runners launch now. */
   mayLaunch: boolean;
-}
-
-/** The metered Polar product. */
-export interface Plan {
-  id: string;
-  name: string;
-  description: string | null;
-  /** Smallest currency unit, such as cents. */
-  amount: number | null;
-  currency: string | null;
-  interval: string | null;
-  /** Price per minute in the smallest currency unit, a decimal string such as "0.1". */
-  unitAmount: string | null;
-  /** Most a billing period costs, in the smallest currency unit. */
-  capAmount: number | null;
-}
-
-export interface Plans {
-  /** Shortest billing interval first. */
-  plans: Plan[];
 }
 
 export interface Steps {
@@ -208,7 +188,6 @@ export const getTenant = (org: string) => get<Tenant>(`/api/tenants/${encodeURIC
 export const createTenant = (installationId: number) => post<Tenant>("/api/tenants", { installationId });
 
 const tenantPath = (org: string) => `/api/tenants/${encodeURIComponent(org)}`;
-export const getPlan = () => get<Plans>("/api/plan");
 // `back` sends Polar's return to the CI page instead of Settings.
 export const startCheckout = (org: string, back?: "ci") =>
   post<{ url: string }>(`${tenantPath(org)}/checkout${back ? "?return=ci" : ""}`);

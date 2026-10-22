@@ -52,3 +52,12 @@ ALTER TABLE ci_secrets ADD COLUMN repositories bigint[]
   CHECK (repositories IS NULL OR (repo_id IS NULL AND cardinality(repositories) <= 1000));
 ALTER TABLE ci_vars ADD COLUMN repositories bigint[]
   CHECK (repositories IS NULL OR (repo_id IS NULL AND cardinality(repositories) <= 1000));
+
+-- Runner time is billed per second, at least 60 seconds a job, with no
+-- free minutes and no grace period after them. Recorded minutes become
+-- seconds.
+ALTER TABLE usage_events RENAME COLUMN minutes TO seconds;
+ALTER TABLE usage_events DROP CONSTRAINT usage_events_minutes_check;
+UPDATE usage_events SET seconds = seconds * 60;
+ALTER TABLE usage_events ADD CONSTRAINT usage_events_seconds_check CHECK (seconds >= 60);
+ALTER TABLE tenants DROP COLUMN free_used_up_at;

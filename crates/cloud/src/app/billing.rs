@@ -2,21 +2,18 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! An organization's billing: its job minutes this month, Polar
+//! An organization's billing: its runner seconds this month, Polar
 //! checkout, the customer portal, Polar's webhooks, and the beta, which
-//! needs no payment. See [`crate::usage`] for the free minutes and who
-//! may launch.
+//! needs no payment. See [`crate::usage`] for the price and who may
+//! launch.
 //!
-//! - `GET /api/plan` describes the metered product and the free
-//!   minutes.
 //! - `POST /api/tenants/<org>/checkout` opens a Polar checkout, which
-//!   adds the card that pays per minute past the free ones.
+//!   adds the card that pays per second of runner time.
 //! - `POST /api/tenants/<org>/portal` opens Polar's customer portal.
 //! - `POST /api/tenants/<org>/beta` with `{"code": ...}` redeems a beta
 //!   invite code.
 //! - `POST /api/polar/webhook` takes Polar's deliveries.
 
-use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use worker::{Env, Request, Response, Result, console_error, console_log, console_warn};
 
@@ -73,19 +70,19 @@ pub(crate) struct Billing {
     pub usage: UsageView,
 }
 
-/// A tenant's job minutes this month.
+/// A tenant's runner seconds this month.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UsageView {
     /// The month's first and the next month's first instant, ISO 8601.
     month_start: String,
     month_end: String,
-    minutes: u64,
-    free_minutes: u32,
-    /// When it used up the free minutes this month, ISO 8601.
-    free_used_up_at: Option<String>,
-    /// When runners stop launching without a card, ISO 8601.
-    grace_ends_at: Option<String>,
+    /// Runner seconds this month, every job at least 60.
+    seconds: u64,
+    /// What this month's billed seconds cost, in cents, rounded down.
+    spend_cents: u64,
+    /// The runner price per minute, in millionths of a dollar.
+    price_micros_per_minute: u64,
     /// Whether runners launch now.
     pub may_launch: bool,
 }
@@ -123,7 +120,6 @@ pub(crate) async fn billing(db: &Db, id: &str, beta: bool) -> Result<Billing> {
         .is_some_and(|subscription| polar::LICENSED.contains(&subscription.status.as_str()));
     let month = usage::month(db, id).await?;
     let (start, end) = time::month(now_ms());
-    let unpaid = !beta && !paid;
     Ok(Billing {
         beta,
         licensed: beta || paid,
@@ -131,13 +127,9 @@ pub(crate) async fn billing(db: &Db, id: &str, beta: bool) -> Result<Billing> {
         usage: UsageView {
             month_start: time::format(start),
             month_end: time::format(end),
-            minutes: month.minutes,
-            free_minutes: usage::FREE_MINUTES,
-            free_used_up_at: month.free_used_up_at.map(time::format),
-            grace_ends_at: month
-                .free_used_up_at
-                .filter(|_| unpaid)
-                .map(|at| time::format(at + usage::GRACE_MS)),
+            seconds: month.seconds,
+            spend_cents: usage::spend_micros(month.billed_seconds) / 10_000,
+            price_micros_per_minute: usage::PRICE_MICROS_PER_MINUTE,
             may_launch: month.may_launch,
         },
     })
@@ -158,24 +150,6 @@ pub(crate) async fn join_listed_beta(db: &Db, id: &str) -> Result<()> {
         crate::launch::recheck(db, id).await?;
     }
     Ok(())
-}
-
-/// `GET /api/plan`: every product of the licence, shortest billing
-/// interval first.
-pub(crate) async fn plan(ctx: &Ctx<'_>) -> Answer {
-    let polar = Polar::read(ctx.env)?;
-    let requests: Vec<_> = polar
-        .product_ids
-        .iter()
-        .map(|id| polar::product(&polar.api, &polar.token, id))
-        .collect();
-    let answers = join_all(requests.iter().map(send)).await;
-    let mut plans = Vec::with_capacity(answers.len());
-    for answer in answers {
-        plans.push(polar::plan(&answer?).map_err(|err| Failure::new(502, err))?);
-    }
-    polar::sort(&mut plans);
-    Ok(Response::from_json(&serde_json::json!({ "plans": plans }))?)
 }
 
 /// Whether a checkout or portal request asked to come back to the CI
@@ -382,11 +356,9 @@ async fn wake(env: &Env, woken: &[ci_wake::Woken]) {
     }
 }
 
-/// What a stored subscription changes. A licensed one clears the
-/// tenant's grace period, rechecks waiting runner launches and returns
-/// the tenant's oldest CI jobs held for the card, for the caller to send
-/// to the CI launch queue. One that ended past the free minutes starts
-/// the grace period.
+/// What a stored subscription changes. A licensed one rechecks waiting
+/// runner launches and returns the tenant's oldest CI jobs held for the
+/// card, for the caller to send to the CI launch queue.
 async fn settle(db: &Db, subscription: &Subscription, changed: u64) -> Result<Vec<ci_wake::Woken>> {
     if changed == 0 {
         console_warn!(
@@ -395,15 +367,8 @@ async fn settle(db: &Db, subscription: &Subscription, changed: u64) -> Result<Ve
             subscription.tenant
         );
     } else if polar::LICENSED.contains(&subscription.status.as_str()) {
-        usage::clear_grace(db, &subscription.tenant).await?;
         crate::launch::recheck(db, &subscription.tenant).await?;
         return ci_wake::card_returned(db, &subscription.tenant).await;
-    } else if usage::start_grace(db, &subscription.tenant, now_ms()).await? {
-        console_log!(
-            "tenant {}: subscription {} ended past the free minutes, grace period started",
-            subscription.tenant,
-            subscription.id
-        );
     }
     Ok(Vec::new())
 }
@@ -543,6 +508,34 @@ mod tests {
         let jobs: Vec<u64> = woken.iter().map(|job| job.job_id).collect();
         assert_eq!(jobs, ids);
         assert_eq!(held(&db), ["concurrency", "concurrency"]);
+    }
+
+    #[test]
+    fn the_usage_view_bills_paid_seconds_only() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        db.run(
+            UPSERT_SUBSCRIPTION,
+            &delivery("sub_1", "t1", "active", None, false, "2026-10-16T10:00:00Z"),
+        );
+        for (job, seconds, billed) in [(1u64, 36_000u64, true), (2, 61, false)] {
+            db.run(
+                "INSERT INTO usage_events (job_id, tenant_id, seconds, ended_at, billed) \
+                 VALUES ($1, 't1', $2, $3, $4)",
+                &params![job, seconds, now_ms(), billed],
+            );
+        }
+        let billing = db.wait(billing(db.db(), "t1", false)).unwrap();
+        let usage = &billing.usage;
+        assert_eq!(usage.seconds, 36_061);
+        assert_eq!(usage.spend_cents, 60);
+        assert_eq!(usage.price_micros_per_minute, 1_000);
+        assert!(usage.may_launch);
+        let json = serde_json::to_value(usage).unwrap();
+        assert!(json.get("spendCents").is_some());
+        for gone in ["freeMinutes", "freeUsedUpAt", "graceEndsAt"] {
+            assert!(json.get(gone).is_none(), "{gone}");
+        }
     }
 
     #[test]
