@@ -33,11 +33,12 @@ use std::collections::HashMap;
 
 use futures_util::future::join_all;
 use hatchrun_cloud::aws::instances::Described;
+use hatchrun_cloud::ci_wake::{self, Woken};
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::parse_rfc3339;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Cron, Event, UtcMinute};
+use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, UtcMinute};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
@@ -60,6 +61,14 @@ pub const MAX_FIRES: usize = 200;
 pub const SCHEDULE_ROWS: u32 = 1_000;
 /// The most stalled jobs one pass handles.
 pub const MAX_FIXES: u32 = 50;
+/// The subrequests the held-job backstop may spend in the passes that
+/// run it, on top of [`BUDGET`] and apart from the stalled-job share.
+pub const HELD_BUDGET: u32 = 40;
+/// The backstop runs in the passes of every 15th minute.
+const HELD_EVERY_MINUTES: u64 = 15;
+/// The backstop leaves a held job alone for this long after its last
+/// hold.
+pub const HELD_QUIET_MS: u64 = 10 * 60_000;
 /// The most instances one pass terminates as orphans.
 pub const MAX_TERMINATIONS: usize = 50;
 
@@ -194,9 +203,11 @@ pub fn stalled(rows: &[JobRow], now: u64) -> Vec<Fix> {
 fn fix(row: &JobRow, now: u64) -> Option<Fix> {
     let quiet_since = |since: u64, limit: u64| since < now.saturating_sub(limit);
     match row.status.as_str() {
+        // A held job is woken, not requeued: see [`wake_held`].
         "queued"
-            if row.next_launch_at.is_some_and(|at| at <= now)
-                || quiet_since(row.updated_at, QUEUED_QUIET_MS) =>
+            if row.held.is_none()
+                && (row.next_launch_at.is_some_and(|at| at <= now)
+                    || quiet_since(row.updated_at, QUEUED_QUIET_MS)) =>
         {
             Some(Fix::Requeue(row.id))
         }
@@ -390,6 +401,11 @@ pub async fn run(env: Env) {
     .await
     {
         console_error!("reconcile: stalled jobs: {err}");
+    }
+    if held_backstop_due(now)
+        && let Err(err) = wake_held(&env, &db, &Budget::new(HELD_BUDGET), now).await
+    {
+        console_error!("reconcile: held jobs: {err}");
     }
     if let Ok(backend) = &backend
         && let Err(err) = end_orphans(&db, backend, &Budget::new(share.orphans), now).await
@@ -641,6 +657,46 @@ async fn fix_stalled(
     Ok(())
 }
 
+/// Whether the pass at `now_ms` runs the held-job backstop.
+#[must_use]
+pub fn held_backstop_due(now_ms: u64) -> bool {
+    (now_ms / 60_000).is_multiple_of(HELD_EVERY_MINUTES)
+}
+
+/// The jobs of `woken` that `budget` pays a message for, in order.
+#[must_use]
+pub fn paid_wakes(woken: &[Woken], budget: &Budget) -> Vec<Woken> {
+    woken
+        .iter()
+        .copied()
+        .take_while(|_| budget.take(REQUEUE_COST))
+        .collect()
+}
+
+/// The slow backstop for held jobs, which the stalled-job step leaves
+/// alone. Wakes come from the Polar webhook (card), the end of a job
+/// (concurrency) and the owner raising the cap; this catches a wake that
+/// was lost, and releases spend-cap holds when the month turns. It sends
+/// the oldest held jobs of each tenant, at most [`MAX_RUNNING_JOBS`]
+/// each, that nobody looked at for [`HELD_QUIET_MS`], paid from its own
+/// `budget`. The consumer checks the caps again and holds a job that
+/// still waits.
+async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
+    let stale = ci_wake::stale(
+        db,
+        now.saturating_sub(HELD_QUIET_MS),
+        MAX_RUNNING_JOBS,
+        HELD_BUDGET,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let wakes = paid_wakes(&stale, budget);
+    if wakes.len() < stale.len() {
+        console_error!("reconcile: held-job budget spent, the rest wait");
+    }
+    launches::send_wakes(env, &wakes).await
+}
+
 async fn requeue(env: &Env, row: &JobRow) -> Result<(), String> {
     env.queue(LAUNCHES)
         .map_err(|e| e.to_string())?
@@ -675,6 +731,7 @@ async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> 
             else {
                 return Ok(());
             };
+            launches::wake_oldest(env, db, &run.tenant_id).await;
             let jobs = store::jobs_for_run(db, run.id)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -776,14 +833,42 @@ mod tests {
     }
 
     #[test]
-    fn held_job_is_requeued_when_due() {
+    fn a_held_job_is_woken_not_requeued() {
         let mut held = row("queued");
-        held.next_launch_at = Some(NOW + 30_000);
+        held.held = Some("concurrency".into());
+        held.next_launch_at = Some(NOW - 1);
+        held.updated_at = NOW - 3_600_000;
         assert_eq!(stalled(&[held.clone()], NOW), []);
-        assert_eq!(stalled(&[held.clone()], NOW + 29_999), []);
-        assert_eq!(stalled(&[held.clone()], NOW + 30_000), [Fix::Requeue(1)]);
-        held.updated_at = NOW + 30_000;
-        assert_eq!(stalled(&[held], NOW + 60_000), [Fix::Requeue(1)]);
+        held.held = None;
+        assert_eq!(stalled(&[held], NOW), [Fix::Requeue(1)]);
+    }
+
+    #[test]
+    fn the_backstop_has_its_own_small_budget() {
+        let woken: Vec<Woken> = (1..=100)
+            .map(|job_id| Woken { job_id, attempt: 1 })
+            .collect();
+        // A stalled-job budget that ran out leaves the backstop's alone.
+        let stalled_budget = Budget::new(shares(BUDGET).stalled);
+        assert!(stalled_budget.take(shares(BUDGET).stalled));
+        assert!(!stalled_budget.take(1));
+        let held_budget = Budget::new(HELD_BUDGET);
+        let paid = paid_wakes(&woken, &held_budget);
+        assert_eq!(paid.len(), HELD_BUDGET as usize);
+        assert_eq!(paid[0].job_id, 1, "oldest first");
+        assert_eq!(held_budget.left(), 0);
+        assert_eq!(paid_wakes(&woken, &held_budget), []);
+        const { assert!(HELD_BUDGET + BUDGET < 1_000) }
+    }
+
+    #[test]
+    fn the_backstop_runs_every_fifteen_minutes() {
+        let minute = |m: u64| m * 60_000;
+        assert!(held_backstop_due(minute(60)));
+        assert!(held_backstop_due(minute(75) + 59_999));
+        assert!(!held_backstop_due(minute(76)));
+        assert!(!held_backstop_due(minute(89)));
+        assert_eq!((0..60).filter(|m| held_backstop_due(minute(*m))).count(), 4);
     }
 
     #[test]

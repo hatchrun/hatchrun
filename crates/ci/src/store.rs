@@ -189,6 +189,9 @@ pub struct JobRow {
     /// The secrets the job reads, a JSON object.
     #[serde(deserialize_with = "json_text")]
     pub secret_refs: serde_json::Value,
+    /// Why the queued job waits for a launch: `card`, `spend_cap` or
+    /// `concurrency`.
+    pub held: Option<String>,
 }
 
 /// A schedule of a workflow.
@@ -216,7 +219,7 @@ const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, work
 const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instance_id, attempt, \
      launch_attempts, next_launch_at, timeout_minutes, updated_at, heartbeat_at, started_at, \
      completed_at, steps::text AS steps, log_key, template, \
-     token_permissions::text AS token_permissions, secret_refs::text AS secret_refs";
+     token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held";
 
 /// The columns of a [`TenantRow`]. `ci_billing` is `active` for an
 /// active or trialing CI subscription, `lapsed` for another CI
@@ -359,14 +362,20 @@ const SET_JOB: &str = "UPDATE ci_jobs SET status = $2, conclusion = $3, updated_
 const LOCK_TENANT: &str = "SELECT id FROM tenants WHERE id = $1 FOR UPDATE";
 
 /// Takes the launch of job `$1` at `$2`, if it is queued and fewer than
-/// `$4` jobs of tenant `$3` are launching, launched or running; run
-/// after [`LOCK_TENANT`]. The hold is over.
+/// `$4` jobs of tenant `$3` are launching, launched or running, and no
+/// older job of the tenant waits for a place (held for `concurrency`),
+/// so new jobs do not jump the line; run after [`LOCK_TENANT`]. The
+/// hold is over.
 const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL, \
      launch_attempts = launch_attempts + 1, updated_at = $2 \
      WHERE id = $1 AND status = 'queued' \
      AND (SELECT count(*) FROM ci_jobs other JOIN ci_runs ON ci_runs.id = other.run_id \
           WHERE ci_runs.tenant_id = $3 \
           AND other.status IN ('launching', 'launched', 'running')) < $4 \
+     AND NOT EXISTS (SELECT 1 FROM ci_jobs older JOIN ci_runs older_run \
+          ON older_run.id = older.run_id \
+          WHERE older_run.tenant_id = $3 AND older.status = 'queued' \
+          AND older.held = 'concurrency' AND older.id < ci_jobs.id) \
      RETURNING {columns}";
 
 /// Keeps attempt `$2` of queued job `$1` held for reason `$3` until
@@ -495,7 +504,7 @@ const SET_LAST_MINUTE: &str = "UPDATE ci_reconciler SET last_minute = $1 WHERE i
 /// the heartbeat is missing. [`crate::reconcile::stalled`] makes the
 /// same decisions over the rows.
 const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
-     (status = 'queued' AND (next_launch_at <= $1 OR updated_at < $2)) \
+     (status = 'queued' AND held IS NULL AND (next_launch_at <= $1 OR updated_at < $2)) \
      OR (status IN ('launching', 'launched') AND updated_at < $3) \
      OR (status = 'running' AND COALESCE(heartbeat_at, started_at, updated_at) < $4) \
      ORDER BY updated_at, id LIMIT $5";
@@ -1652,6 +1661,172 @@ mod tests {
             .wait(claim_launch(db.db(), 999_999, "t1", 5, 13))
             .unwrap();
         assert_eq!(gone, Claim::Gone);
+    }
+
+    /// Sets the hold of a job directly, the way `hold` leaves it.
+    fn set_held(db: &TestDb, job_id: u64, reason: &str, updated: u64) {
+        db.run(
+            "UPDATE ci_jobs SET held = $2, updated_at = $3 WHERE id = $1",
+            &params![job_id, reason, updated],
+        );
+    }
+
+    fn woken_ids(woken: Vec<hatchrun_cloud::ci_wake::Woken>) -> Vec<u64> {
+        woken.into_iter().map(|w| w.job_id).collect()
+    }
+
+    #[test]
+    fn a_new_job_does_not_jump_a_held_one() {
+        let db = setup();
+        for (n, status) in ["running", "running", "running", "running"]
+            .into_iter()
+            .enumerate()
+        {
+            run_with_job_named(&db, &format!("r{n}"), status);
+        }
+        let (_, older) = run_with_job_named(&db, "older", "queued");
+        let (_, newer) = run_with_job_named(&db, "newer", "queued");
+        set_held(&db, older, "concurrency", 5);
+        // One place is free, and the older job waits for it.
+        assert_eq!(
+            db.wait(claim_launch(db.db(), newer, "t1", 5, 10)).unwrap(),
+            Claim::Busy
+        );
+        assert!(matches!(
+            db.wait(claim_launch(db.db(), older, "t1", 5, 11)).unwrap(),
+            Claim::Claimed(_)
+        ));
+        assert_eq!(
+            db.wait(claim_launch(db.db(), newer, "t1", 5, 12)).unwrap(),
+            Claim::Busy,
+            "the tenant is full again"
+        );
+    }
+
+    #[test]
+    fn a_held_job_of_another_reason_or_tenant_blocks_nobody() {
+        let db = setup();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 98, 0, 0)",
+            &[],
+        );
+        db.run(
+            "INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+             private, updated_at) VALUES (8, 't2', 98, 'other/app', 'main', false, 1)",
+            &[],
+        );
+        let other = db
+            .wait(insert_run(
+                db.db(),
+                &NewRun {
+                    tenant_id: "t2".into(),
+                    repo_id: 8,
+                    ..new_run("o", "ci", 1_000)
+                },
+            ))
+            .unwrap()
+            .unwrap();
+        let held_elsewhere = db
+            .wait(insert_jobs(db.db(), other.id, &[new_job("o")], 1_000))
+            .unwrap()[0]
+            .1;
+        db.wait(set_job(db.db(), held_elsewhere, "queued", None, 1_001))
+            .unwrap();
+        set_held(&db, held_elsewhere, "concurrency", 5);
+        let (_, capped) = run_with_job_named(&db, "capped", "queued");
+        set_held(&db, capped, "spend_cap", 5);
+        let (_, newer) = run_with_job_named(&db, "newer", "queued");
+        assert!(matches!(
+            db.wait(claim_launch(db.db(), newer, "t1", 5, 10)).unwrap(),
+            Claim::Claimed(_)
+        ));
+    }
+
+    #[test]
+    fn the_oldest_held_job_wakes_first() {
+        use hatchrun_cloud::ci_wake;
+        let db = setup();
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let (_, id) = run_with_job_named(&db, &format!("d{n}"), "queued");
+            // The newest was held longest ago: age is the job id.
+            set_held(&db, id, "concurrency", 100 - n);
+            ids.push(id);
+        }
+        let (_, running) = run_with_job_named(&db, "run", "running");
+        set_held(&db, running, "concurrency", 1);
+        let (_, card) = run_with_job_named(&db, "card", "queued");
+        set_held(&db, card, "card", 1);
+        let one = db
+            .wait(ci_wake::held(db.db(), "t1", "concurrency", 1))
+            .unwrap();
+        assert_eq!(woken_ids(one), [ids[0]]);
+        let all = db
+            .wait(ci_wake::held(db.db(), "t1", "concurrency", 5))
+            .unwrap();
+        assert_eq!(woken_ids(all), ids);
+        let other = db
+            .wait(ci_wake::held(db.db(), "t2", "concurrency", 5))
+            .unwrap();
+        assert_eq!(woken_ids(other), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn a_returned_card_wakes_the_oldest_card_holds_up_to_the_cap() {
+        use hatchrun_cloud::ci_wake;
+        assert_eq!(ci_wake::WAKE_LIMIT, hatchrun_workflow::MAX_RUNNING_JOBS);
+        let db = setup();
+        let mut card = Vec::new();
+        for n in 0..7 {
+            let (_, id) = run_with_job_named(&db, &format!("c{n}"), "queued");
+            set_held(&db, id, "card", 5);
+            card.push(id);
+        }
+        let (_, capped) = run_with_job_named(&db, "cap", "queued");
+        set_held(&db, capped, "spend_cap", 5);
+        subscribe(&db, "s1", "ci", "active");
+        let woken = db.wait(ci_wake::card_returned(db.db(), "t1")).unwrap();
+        assert_eq!(woken_ids(woken), card[..5]);
+    }
+
+    #[test]
+    fn the_backstop_picks_quiet_held_jobs_per_tenant() {
+        use hatchrun_cloud::ci_wake;
+        let db = setup();
+        let mut ids = Vec::new();
+        for n in 0..8 {
+            let (_, id) = run_with_job_named(&db, &format!("h{n}"), "queued");
+            set_held(&db, id, if n % 2 == 0 { "card" } else { "spend_cap" }, 100);
+            ids.push(id);
+        }
+        let (_, recent) = run_with_job_named(&db, "recent", "queued");
+        set_held(&db, recent, "card", 10_000);
+        let (_, plain) = run_with_job_named(&db, "plain", "queued");
+        let _ = plain;
+        let picked = db.wait(ci_wake::stale(db.db(), 5_000, 5, 40)).unwrap();
+        assert_eq!(woken_ids(picked), ids[..5], "5 per tenant, oldest first");
+        let capped = db.wait(ci_wake::stale(db.db(), 5_000, 5, 2)).unwrap();
+        assert_eq!(woken_ids(capped), ids[..2], "at most the limit");
+        let none = db.wait(ci_wake::stale(db.db(), 50, 5, 40)).unwrap();
+        assert!(none.is_empty(), "nothing is quiet that long");
+    }
+
+    #[test]
+    fn held_jobs_are_not_stalled() {
+        let db = setup();
+        let (_, held) = run_with_job_named(&db, "held", "queued");
+        db.run(
+            "UPDATE ci_jobs SET held = 'card', next_launch_at = 1, updated_at = 1 WHERE id = $1",
+            &params![held],
+        );
+        let (_, plain) = run_with_job_named(&db, "plain", "queued");
+        db.run(
+            "UPDATE ci_jobs SET next_launch_at = 1, updated_at = 1 WHERE id = $1",
+            &params![plain],
+        );
+        let rows = db.wait(stalled_jobs(db.db(), 10_000_000, 50)).unwrap();
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [plain]);
     }
 
     #[test]

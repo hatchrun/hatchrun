@@ -42,6 +42,7 @@ pub mod aws;
 mod bench;
 pub mod cache;
 pub mod catalog;
+pub mod ci_wake;
 pub mod connect;
 pub mod db;
 pub mod fetch;

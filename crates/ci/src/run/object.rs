@@ -27,7 +27,7 @@ use crate::checks::{JobView, Outbox, conclusion_word, details_url, render};
 use crate::env::Settings;
 use crate::github::{CheckRun, check_run_id, create_check_run, revoke_token, update_check_run};
 use crate::graph::{Action, Graph, State as NodeState};
-use crate::launches::LaunchMessage;
+use crate::launches::{self, LaunchMessage};
 use crate::store;
 
 use super::decide::{
@@ -776,17 +776,23 @@ impl<'a> Cx<'a> {
                 conclusion,
                 steps,
                 log_key,
-            } => store::finish_job(
-                db,
-                *job,
-                *attempt,
-                conclusion_word(*conclusion),
-                steps,
-                log_key.as_deref(),
-                self.now,
-            )
-            .await
-            .map(|_| ()),
+            } => {
+                let ended = store::finish_job(
+                    db,
+                    *job,
+                    *attempt,
+                    conclusion_word(*conclusion),
+                    steps,
+                    log_key.as_deref(),
+                    self.now,
+                )
+                .await?;
+                if ended {
+                    // The freed place goes to the oldest held job.
+                    launches::wake_oldest(&self.env, db, &info.tenant_id).await;
+                }
+                Ok(())
+            }
             Work::FinishRun {
                 attempt,
                 conclusion,
