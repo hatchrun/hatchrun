@@ -50,6 +50,18 @@ const STALE_HELD: &str = "SELECT job_id, attempt FROM (\
          AND ci_jobs.updated_at < $1) ranked \
      WHERE place <= $2 ORDER BY job_id LIMIT $3";
 
+/// Turns the card and spend-cap holds of tenant `$1` into concurrency
+/// holds, which a finishing job wakes one by one in order. Rows keep
+/// their `updated_at`.
+const RELEASE_TENANT: &str = "UPDATE ci_jobs SET held = 'concurrency' FROM ci_runs \
+     WHERE ci_runs.id = ci_jobs.run_id AND ci_runs.tenant_id = $1 \
+       AND ci_jobs.status = 'queued' AND ci_jobs.held IN ('card', 'spend_cap')";
+
+/// The same for the spend-cap holds of every tenant that nobody looked
+/// at since `$1`: the month turned, or the cap changed unseen.
+const RELEASE_SPEND_CAPS: &str = "UPDATE ci_jobs SET held = 'concurrency' \
+     WHERE status = 'queued' AND held = 'spend_cap' AND updated_at < $1";
+
 /// The oldest `limit` queued jobs of `tenant` held for `reason` (`card`,
 /// `spend_cap` or `concurrency`).
 ///
@@ -60,14 +72,38 @@ pub async fn held(db: &Db, tenant: &str, reason: &str, limit: u32) -> worker::Re
     db.all(HELD, &params![tenant, reason, limit]).await
 }
 
-/// The jobs to wake when tenant `tenant`'s card is back: its oldest
-/// jobs held for the card, up to [`WAKE_LIMIT`].
+/// The jobs to wake when the standing of `tenant` improved (the card is
+/// back or the cap is higher): its remaining card and spend-cap holds
+/// become concurrency holds, so the end of each job wakes the next in
+/// order, and the oldest [`WAKE_LIMIT`] are returned to wake now.
+///
+/// # Errors
+///
+/// Postgres refused a statement.
+pub async fn standing_improved(db: &Db, tenant: &str) -> worker::Result<Vec<Woken>> {
+    db.run(RELEASE_TENANT, &params![tenant]).await?;
+    held(db, tenant, "concurrency", WAKE_LIMIT).await
+}
+
+/// The jobs to wake when tenant `tenant`'s card is back.
+///
+/// # Errors
+///
+/// Postgres refused a statement.
+pub async fn card_returned(db: &Db, tenant: &str) -> worker::Result<Vec<Woken>> {
+    standing_improved(db, tenant).await
+}
+
+/// Turns the spend-cap holds nobody looked at since `quiet_before` into
+/// concurrency holds, for the month turn. The backstop wakes the oldest
+/// of them and the end of each job wakes the next.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn card_returned(db: &Db, tenant: &str) -> worker::Result<Vec<Woken>> {
-    held(db, tenant, "card", WAKE_LIMIT).await
+pub async fn release_spend_caps(db: &Db, quiet_before: u64) -> worker::Result<()> {
+    db.run(RELEASE_SPEND_CAPS, &params![quiet_before]).await?;
+    Ok(())
 }
 
 /// The jobs the slow backstop wakes: held jobs nobody has looked at

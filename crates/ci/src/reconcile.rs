@@ -726,6 +726,11 @@ pub fn paid_wakes(woken: &[Woken], budget: &Budget) -> Vec<Woken> {
 /// `budget`. The consumer checks the caps again and holds a job that
 /// still waits.
 async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
+    // A spend-cap hold may have ended with the month: let it drain in
+    // order through the concurrency path.
+    ci_wake::release_spend_caps(db, now.saturating_sub(HELD_QUIET_MS))
+        .await
+        .map_err(|e| e.to_string())?;
     let stale = ci_wake::stale(
         db,
         now.saturating_sub(HELD_QUIET_MS),
