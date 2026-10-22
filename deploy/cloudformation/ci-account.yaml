@@ -5,20 +5,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   The hatchrun-owned AWS account that runs hatchrun CI jobs, one EC2
-  instance per job. Deploy it once in us-east-1; hatchrun-ci reads its
-  outputs (RoleArn, LaunchTemplateId, SubnetIds).
+  instance per job. Deploy it once in us-east-1. hatchrun-ci takes the
+  RoleArn output as its CI_ROLE_ARN secret and finds the launch template
+  by name and the subnets by their hatchrun:tenant tag.
 
 Resources:
-  # hatchrun-ci signs a short-lived token with subject tenant:hatchrun-ci
-  # and trades it for the role's credentials with
-  # AssumeRoleWithWebIdentity. The account is new, so the stack owns the
-  # account's one provider for this URL.
-  OidcProvider:
-    Type: AWS::IAM::OIDCProvider
-    Properties:
-      Url: https://oidc.hatchrun.io
-      ClientIdList: [sts.amazonaws.com]
-
   Vpc:
     Type: AWS::EC2::VPC
     Properties:
@@ -66,6 +57,7 @@ Resources:
       MapPublicIpOnLaunch: true
       Tags:
         - { Key: Name, Value: hatchrun-ci-a }
+        - { Key: "hatchrun:tenant", Value: hatchrun-ci }
 
   SubnetB:
     Type: AWS::EC2::Subnet
@@ -76,6 +68,7 @@ Resources:
       MapPublicIpOnLaunch: true
       Tags:
         - { Key: Name, Value: hatchrun-ci-b }
+        - { Key: "hatchrun:tenant", Value: hatchrun-ci }
 
   SubnetC:
     Type: AWS::EC2::Subnet
@@ -86,6 +79,7 @@ Resources:
       MapPublicIpOnLaunch: true
       Tags:
         - { Key: Name, Value: hatchrun-ci-c }
+        - { Key: "hatchrun:tenant", Value: hatchrun-ci }
 
   SubnetARoutes:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -125,13 +119,15 @@ Resources:
       Tags:
         - { Key: Name, Value: hatchrun-ci-runners }
 
-  # The image and instance type come with each launch. Runners get no
+  # hatchrun-ci finds the template by this name. The image and instance
+  # type come with each launch. Runners get no
   # instance profile. IMDSv2 is required at launch with a hop limit of
   # 1; hatchrun-ci turns the metadata endpoint off before it hands the
   # job its document.
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
+      LaunchTemplateName: hatchrun-ci-runner
       TagSpecifications:
         - ResourceType: launch-template
           Tags:
@@ -153,7 +149,12 @@ Resources:
 
   # What hatchrun-ci may do here: launch Marketplace images from this
   # template into this VPC and end the instances it tagged. There is no
-  # iam:PassRole, so no instance can get a role.
+  # iam:PassRole, so no instance can get a role. hatchrun-ci signs a
+  # short-lived token with subject tenant:hatchrun-ci and trades it for
+  # the role's credentials through the account's IAM provider for
+  # oidc.hatchrun.io. An account has one provider per URL, so the stack
+  # uses the existing one: create it first, with audience
+  # sts.amazonaws.com, where no connect.yaml stack made it.
   LauncherRole:
     Type: AWS::IAM::Role
     Properties:
@@ -164,7 +165,7 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Federated: !Ref OidcProvider
+              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/oidc.hatchrun.io"
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
               StringEquals:
@@ -180,6 +181,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - ec2:DescribeInstances
+                  - ec2:DescribeLaunchTemplates
                   - ec2:DescribeLaunchTemplateVersions
                   - ec2:DescribeSubnets
                 Resource: "*"
@@ -312,11 +314,5 @@ Resources:
 
 Outputs:
   RoleArn:
-    Description: CI_ROLE_ARN of hatchrun-ci
+    Description: The CI_ROLE_ARN secret of hatchrun-ci
     Value: !GetAtt LauncherRole.Arn
-  LaunchTemplateId:
-    Description: CI_LAUNCH_TEMPLATE_ID of hatchrun-ci
-    Value: !Ref LaunchTemplate
-  SubnetIds:
-    Description: CI_SUBNET_IDS of hatchrun-ci, comma separated
-    Value: !Join [",", [!Ref SubnetA, !Ref SubnetB, !Ref SubnetC]]
