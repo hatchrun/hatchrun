@@ -146,9 +146,11 @@ MARKETPLACE_ARM64_URL = "https://aws.amazon.com/marketplace/pp/prodview-nchg6i6u
 # while the list is empty. POLAR_API_URL points the Worker at Polar's
 # sandbox (https://sandbox-api.polar.sh).
 POLAR_PRODUCT_ID = "a2dfff6e-1a3a-40fe-b576-70fccd81f694"
-# The Polar product of hatchrun CI. An active or trialing subscription
-# to it is the card a tenant needs before its CI jobs run; it never
-# licenses hatchrun.io runners. Unset, no subscription counts as CI.
+# The Polar product of hatchrun CI: the id of the "hatchrun CI" product
+# (Products, then the product's ID), the same value as hatchrun-ci's
+# POLAR_CI_PRODUCT_ID. An active or trialing subscription to it is the
+# card a tenant needs before its CI jobs run; it never licenses
+# hatchrun.io runners. Unset, no subscription counts as CI.
 POLAR_CI_PRODUCT_ID = ""
 # hatchrun-broker (crates/broker), where launches store runner configs.
 # Both Workers share BROKER_TOKEN.
