@@ -62,16 +62,20 @@ const RELEASE_TENANT: &str = "UPDATE ci_jobs SET held = 'concurrency' FROM ci_ru
 const RELEASE_SPEND_CAPS: &str = "UPDATE ci_jobs SET held = 'concurrency' \
      WHERE status = 'queued' AND held = 'spend_cap' AND updated_at < $1";
 
-/// Frees the approval holds nobody looked at since `$1` whose
-/// environment no longer exists or no longer asks for approval, due at
-/// `$2`, and returns them. The consumer checks such a job again: it runs,
+/// Frees up to `$3` approval holds nobody looked at since `$1` whose
+/// environment no longer exists or no longer asks for approval, or whose
+/// attempt has a decision already (an approval that raced the hold), due
+/// at `$2`, and returns them. The consumer checks such a job again: it runs,
 /// or fails when the environment is gone.
 const RELEASE_ORPHAN_APPROVALS: &str = "UPDATE ci_jobs SET held = NULL, next_launch_at = $2, \
-       updated_at = $2 FROM ci_runs \
-     WHERE ci_runs.id = ci_jobs.run_id AND ci_jobs.status = 'queued' \
+       updated_at = $2 WHERE id IN (\
+       SELECT ci_jobs.id FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
+       WHERE ci_jobs.status = 'queued' \
        AND ci_jobs.held = 'approval' AND ci_jobs.updated_at < $1 \
-       AND NOT EXISTS (SELECT 1 FROM ci_environments e WHERE e.repo_id = ci_runs.repo_id \
-         AND lower(e.name) = lower(ci_jobs.environment) AND e.approval) \
+       AND ((ci_jobs.approval_attempt = ci_jobs.attempt AND ci_jobs.approval_decision IS NOT NULL) \
+         OR NOT EXISTS (SELECT 1 FROM ci_environments e WHERE e.repo_id = ci_runs.repo_id \
+           AND lower(e.name) = lower(ci_jobs.environment) AND e.approval)) \
+       ORDER BY ci_jobs.id LIMIT $3) \
      RETURNING ci_jobs.id AS job_id, ci_jobs.attempt";
 
 /// The oldest `limit` queued jobs of `tenant` held for `reason` (`card`,
@@ -130,8 +134,9 @@ pub async fn release_orphan_approvals(
     db: &Db,
     quiet_before: u64,
     now: u64,
+    limit: u32,
 ) -> worker::Result<Vec<Woken>> {
-    db.all(RELEASE_ORPHAN_APPROVALS, &params![quiet_before, now])
+    db.all(RELEASE_ORPHAN_APPROVALS, &params![quiet_before, now, limit])
         .await
 }
 

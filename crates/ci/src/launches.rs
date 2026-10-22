@@ -50,7 +50,7 @@ use crate::environments::{self, Gate};
 use crate::launcher::{Backend, LaunchSpec, user_data};
 use crate::reconcile::{self, LAUNCH_QUIET_MS};
 use crate::run::LAUNCHES;
-use crate::store::{self, Claim, JobRow};
+use crate::store::{self, Claim, JobRow, Standing};
 use crate::token::{self, Claims};
 
 /// The dead-letter queue in `wrangler.toml`.
@@ -239,9 +239,7 @@ async fn launch(
         u32::MAX
     } else {
         if let Some(reason) = billing::admission(&standing) {
-            let message =
-                reason.message(&standing.org_login, &settings.app_url, standing.cap_micros);
-            return hold_job(env, &db, &job, reason.as_str(), &message, now).await;
+            return hold_for(env, &db, &job, reason, &standing, settings, now).await;
         }
         MAX_RUNNING_JOBS
     };
@@ -251,10 +249,7 @@ async fn launch(
     {
         Claim::Claimed(job) => job,
         Claim::Busy => {
-            let reason = Hold::Concurrency;
-            let message =
-                reason.message(&standing.org_login, &settings.app_url, standing.cap_micros);
-            return hold_job(env, &db, &job, reason.as_str(), &message, now).await;
+            return hold_for(env, &db, &job, Hold::Concurrency, &standing, settings, now).await;
         }
         Claim::Gone => return Ok(()),
     };
@@ -276,6 +271,21 @@ async fn launch(
             record_failure(env, &db, &job, &failure).await
         }
     }
+}
+
+/// Holds the job for a billing or concurrency `reason`, with the
+/// message the check run shows.
+async fn hold_for(
+    env: &Env,
+    db: &Db,
+    job: &JobRow,
+    reason: Hold,
+    standing: &Standing,
+    settings: &Settings,
+    now: u64,
+) -> Result<(), String> {
+    let message = reason.message(&standing.org_login, &settings.app_url, standing.cap_micros);
+    hold_job(env, db, job, reason.as_str(), &message, now).await
 }
 
 /// Keeps the queued job held for `reason` (the word `ci_jobs.held`
@@ -617,6 +627,10 @@ pub(crate) async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> 
             }
             // Not claimed: the job is still queued (an environment check
             // ended it), and launch_failed only changes a launching one.
+            // Keep the reason on the row, since the run has none.
+            store::note_queued_error(db, job.id, message, now)
+                .await
+                .map_err(|err| err.to_string())?;
             reconcile::fail_row(env, db, job, now).await
         }
         EndAction::Retry => Err(format!("could not end job {}: {answer:?}", job.id)),

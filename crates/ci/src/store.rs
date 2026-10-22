@@ -406,12 +406,20 @@ const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL
      RETURNING {columns}";
 
 /// Keeps attempt `$2` of queued job `$1` held for reason `$3` until
-/// `$4`, at `$5`. Returns whether the reason changed.
+/// `$4`, at `$5`. Returns whether the reason changed. An approval hold
+/// never lands on an attempt that has a decision already: the consumer
+/// may have read the job before the admin answered.
 const HOLD: &str = "WITH prior AS (SELECT held FROM ci_jobs \
-       WHERE id = $1 AND attempt = $2 AND status = 'queued' FOR UPDATE) \
+       WHERE id = $1 AND attempt = $2 AND status = 'queued' \
+       AND NOT ($3::text = 'approval' AND approval_attempt = attempt \
+                AND approval_decision IS NOT NULL) FOR UPDATE) \
      UPDATE ci_jobs SET held = $3::text, next_launch_at = $4, updated_at = $5 \
      FROM prior WHERE ci_jobs.id = $1 \
      RETURNING (prior.held IS DISTINCT FROM $3::text) AS changed";
+
+/// Records `$2` as the launch error of job `$1` while it is queued, at `$3`.
+const NOTE_QUEUED_ERROR: &str = "UPDATE ci_jobs SET launch_error = $2, updated_at = $3 \
+     WHERE id = $1 AND status = 'queued'";
 
 /// Records the instance `$2` of job `$1` at `$3`.
 const LAUNCHED: &str = "UPDATE ci_jobs SET status = 'launched', instance_id = $2, \
@@ -1218,6 +1226,19 @@ pub async fn hold(
         .first::<Changed>(HOLD, &params![job_id, attempt, hold, retry_at, now])
         .await?
         .is_some_and(|row| row.changed))
+}
+
+/// Records `error` as the launch error of job `job_id` while it is
+/// still queued; returns whether it was.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn note_queued_error(db: &Db, job_id: u64, error: &str, now: u64) -> Result<bool> {
+    Ok(db
+        .run(NOTE_QUEUED_ERROR, &params![job_id, error, now])
+        .await?
+        == 1)
 }
 
 /// Records the instance of job `job_id`: launched. Only a launching
@@ -3296,6 +3317,93 @@ mod tests {
         assert_eq!(standing.running, 1, "the launching job, not the held one");
     }
 
+    fn decide(db: &TestDb, job_id: u64, attempt_of_decision: u32) {
+        db.run(
+            "UPDATE ci_jobs SET approval_attempt = $2, approval_decision = 'approved', \
+             approval_by = 'octo', approval_at = 1 WHERE id = $1",
+            &params![job_id, attempt_of_decision],
+        );
+    }
+
+    #[test]
+    fn an_approval_hold_does_not_land_on_a_decided_attempt() {
+        let db = setup();
+        let (_, job) = run_with_job_named(&db, "raced", "queued");
+        let attempt: u32 = 1;
+        decide(&db, job, attempt);
+        assert!(
+            !db.wait(hold(db.db(), job, attempt, "approval", 9_000, 2_000))
+                .unwrap()
+        );
+        assert_eq!(held_of(&db, job), None);
+        // A billing hold still lands on an approved attempt.
+        assert!(
+            db.wait(hold(db.db(), job, attempt, "card", 9_000, 2_000))
+                .unwrap()
+        );
+        assert_eq!(held_of(&db, job).as_deref(), Some("card"));
+        // A decision of an earlier attempt does not count.
+        let (_, other) = run_with_job_named(&db, "rerun", "queued");
+        decide(&db, other, 0);
+        assert!(
+            db.wait(hold(db.db(), other, attempt, "approval", 9_000, 2_000))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn the_backstop_frees_decided_approval_holds_up_to_the_limit() {
+        use hatchrun_cloud::ci_wake;
+        let db = setup();
+        save_environment(&db, "Guarded", &[], true);
+        let mut decided = Vec::new();
+        for n in 0..3 {
+            let id = job_naming(&db, &format!("d{n}"), Some("guarded"));
+            db.run(
+                "UPDATE ci_jobs SET status = 'queued', held = 'approval', updated_at = 100 \
+                 WHERE id = $1",
+                &params![id],
+            );
+            decided.push(id);
+        }
+        decide(&db, decided[0], 1);
+        decide(&db, decided[1], 1);
+        let freed = woken_ids(
+            db.wait(ci_wake::release_orphan_approvals(db.db(), 5_000, 6_000, 1))
+                .unwrap(),
+        );
+        assert_eq!(freed, [decided[0]], "limit of one, oldest first");
+        let freed = woken_ids(
+            db.wait(ci_wake::release_orphan_approvals(db.db(), 5_000, 6_000, 10))
+                .unwrap(),
+        );
+        assert_eq!(freed, [decided[1]]);
+        assert_eq!(held_of(&db, decided[2]).as_deref(), Some("approval"));
+    }
+
+    #[test]
+    fn a_queued_job_keeps_the_reason_it_was_ended_for() {
+        let db = setup();
+        let (_, job) = run_with_job_named(&db, "q", "queued");
+        assert!(
+            db.wait(note_queued_error(db.db(), job, "no such environment", 5))
+                .unwrap()
+        );
+        let error: Option<String> = db
+            .column(
+                "SELECT launch_error AS e FROM ci_jobs WHERE id = $1",
+                &params![job],
+                "e",
+            )
+            .unwrap();
+        assert_eq!(error.as_deref(), Some("no such environment"));
+        let (_, running) = run_with_job_named(&db, "r", "running");
+        assert!(
+            !db.wait(note_queued_error(db.db(), running, "x", 5))
+                .unwrap()
+        );
+    }
+
     #[test]
     fn the_backstop_frees_approval_holds_without_a_rule() {
         use hatchrun_cloud::ci_wake;
@@ -3316,7 +3424,7 @@ mod tests {
         let guarded = held("guarded", "guarded", 100);
         let recent = held("recent", "deleted", 9_000);
         let mut freed = woken_ids(
-            db.wait(ci_wake::release_orphan_approvals(db.db(), 5_000, 6_000))
+            db.wait(ci_wake::release_orphan_approvals(db.db(), 5_000, 6_000, 10))
                 .unwrap(),
         );
         freed.sort_unstable();

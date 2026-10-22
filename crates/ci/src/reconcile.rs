@@ -731,12 +731,13 @@ async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), 
     ci_wake::release_spend_caps(db, now.saturating_sub(HELD_QUIET_MS))
         .await
         .map_err(|e| e.to_string())?;
-    // An approval hold whose environment is gone or has approval off
-    // has nobody to wait for; the change that freed it may have failed to
-    // wake it.
-    let mut stale = ci_wake::release_orphan_approvals(db, now.saturating_sub(HELD_QUIET_MS), now)
-        .await
-        .map_err(|e| e.to_string())?;
+    // An approval hold whose environment is gone or has approval off, or
+    // whose attempt was decided, has nobody to wait for; the change that
+    // freed it may have failed to wake it.
+    let mut stale =
+        ci_wake::release_orphan_approvals(db, now.saturating_sub(HELD_QUIET_MS), now, HELD_BUDGET)
+            .await
+            .map_err(|e| e.to_string())?;
     stale.extend(
         ci_wake::stale(
             db,
