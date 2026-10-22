@@ -36,9 +36,9 @@
 # - a push to wide runs six jobs: five at once, the sixth held with a
 #   check run that says why until one ends; the fake Polar then holds a
 #   usage event for each;
-# - a tenant whose CI subscription was canceled gets one billing check
-#   run and no run, and can start a checkout; a tenant that never
-#   subscribed gets nothing, and its config is not read.
+# - a tenant whose subscription was canceled gets one billing check
+#   run and no run; a tenant that never subscribed gets nothing, and its
+#   config is not read.
 #
 # Every instance must have had its metadata turned off, and the change
 # seen applied, before its job ran.
@@ -66,12 +66,11 @@ BROKER="http://127.0.0.1:${BROKER_PORT}"
 APP_URL="http://127.0.0.1:5173"
 TENANT="e2etenant0000001"
 INSTALLATION=42
-# Installation 43: a tenant whose CI subscription was canceled.
-# Installation 44: a tenant that never subscribed to CI.
+# Installation 43: a tenant whose subscription was canceled.
+# Installation 44: a tenant that never subscribed.
 LAPSED_TENANT="e2etenant0000002"
 NEVER_TENANT="e2etenant0000003"
 POLAR_TOKEN="e2e-polar-token"
-CI_PRODUCT="e2e-ci-product"
 # The local Secrets Store that holds the key behind CI_SECRETS_KEY.
 STORE_ID="e2e00000000000000000000000000000"
 WEBHOOK_SECRET="e2e-webhook-secret"
@@ -232,11 +231,11 @@ INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated
 VALUES ('$TENANT', 1, 'e2e', $INSTALLATION, $now_ms, $now_ms),
        ('$LAPSED_TENANT', 2, 'e2e2', 43, $now_ms, $now_ms),
        ('$NEVER_TENANT', 3, 'e2e3', 44, $now_ms, $now_ms);
-INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, product,
+INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id,
                            cancel_at_period_end, modified_at, updated_at)
-VALUES ('sub-e2e', '$TENANT', 'active', 'cus-e2e', '$CI_PRODUCT', 'ci', false,
+VALUES ('sub-e2e', '$TENANT', 'active', 'cus-e2e', 'e2e-product', false,
         '2026-01-01T00:00:00Z', $now_ms),
-       ('sub-e2e2', '$LAPSED_TENANT', 'canceled', 'cus-e2e2', '$CI_PRODUCT', 'ci', false,
+       ('sub-e2e2', '$LAPSED_TENANT', 'canceled', 'cus-e2e2', 'e2e-product', false,
         '2026-01-01T00:00:00Z', $now_ms);
 SQL
 
@@ -320,7 +319,6 @@ start ci env -C "$root/crates/ci" \
   --var GITHUB_APP_ID:Iv1e2e \
   --var OIDC_KEY_ID:e2e \
   --var POLAR_API_URL:"$GITHUB" \
-  --var POLAR_CI_PRODUCT_ID:"$CI_PRODUCT" \
   --var CI_SECRETS_KEY_ID:e2e \
   --var CI_SECRETS_KEY_OLD_ID:""
 
@@ -669,7 +667,7 @@ until curl -fsS "$GITHUB/_state" | jq -e --argjson ids "$usage_ids" --arg tenant
 done
 log "wide: Polar has the usage of all six"
 
-# Scenario: a tenant whose CI subscription was canceled gets one billing
+# Scenario: a tenant whose subscription was canceled gets one billing
 # check run for a push and nothing runs; a tenant that never subscribed
 # gets nothing at all, not even a config read.
 tenant_push() {
@@ -698,8 +696,7 @@ jq -e --arg sha "$never_sha" '[.check_runs[] | select(.head_sha == $sha)] | leng
   die "the never subscribed tenant got check runs: $(checks "$never_sha")"
 jq -e '(.contents | index("e2e3/demo")) == null and (.contents | index("e2e2/demo")) != null' \
   "$tmp/state.json" >/dev/null || die "config reads: $(jq -c .contents "$tmp/state.json")"
-# The card state as the billing page reads it, and a checkout for the
-# lapsed tenant, from the fake Polar.
+# The card state as the billing page reads it.
 # Whether the last app_call answered status $1 with a body that jq
 # filter $2 holds for.
 answered() {
@@ -711,10 +708,7 @@ status="$(app_call GET orgs/e2e/billing)"
 answered 200 '.card == true' || die "the billing view of e2e answered $status: $(cat "$tmp/answer")"
 status="$(app_call GET orgs/e2e2/billing)"
 answered 200 '.card == false' || die "the billing view of e2e2 answered $status: $(cat "$tmp/answer")"
-status="$(app_call POST orgs/e2e2/billing/checkout)"
-answered 200 ".url == \"https://polar.invalid/checkout/$LAPSED_TENANT\"" ||
-  die "the checkout of e2e2 answered $status: $(cat "$tmp/answer")"
-log "billing: the lapsed tenant was asked for a card, the other one ignored"
+log "billing: the card state of both tenants read as expected"
 
 # Thirteen instances: build, test, broken twice, sleeper, arm-hello,
 # bad-ok-hello and the six naps. Wait for the last agent to exit.

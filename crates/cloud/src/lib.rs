@@ -82,6 +82,18 @@ pub mod webhook;
 #[cfg(feature = "worker")]
 mod entry;
 
+#[cfg(not(test))]
 pub(crate) fn now_ms() -> u64 {
     worker::Date::now().as_millis()
+}
+
+/// Tests run natively, where `worker::Date` cannot be called.
+#[cfg(test)]
+pub(crate) fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }

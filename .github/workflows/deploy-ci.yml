@@ -20,12 +20,6 @@ name: deploy-ci
 #   6. Set the Worker's CI_ROLE_ARN secret to the stack's RoleArn
 #      output: `npx wrangler secret put CI_ROLE_ARN` from crates/ci.
 #      Deploys leave it alone. This workflow takes over from then on.
-#
-# Polar setting the CI checkout depends on: turn on "Allow multiple
-# subscriptions per customer" in the Polar organization's settings
-# (sandbox and production) before the first deploy. A tenant is one Polar
-# customer for both products, and without the setting an organization that
-# pays for hatchrun.io runners cannot complete the CI checkout.
 
 on:
   push:

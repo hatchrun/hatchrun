@@ -52,25 +52,6 @@ pub fn product_ids(list: &str) -> Vec<String> {
         .collect()
 }
 
-/// `runners` for a product in `runner_ids`, `ci` for the CI product,
-/// `None` for any other product.
-#[must_use]
-pub fn product_kind(
-    product_id: &str,
-    runner_ids: &[String],
-    ci_product_id: &str,
-) -> Option<&'static str> {
-    if product_id.is_empty() {
-        None
-    } else if runner_ids.iter().any(|id| id == product_id) {
-        Some("runners")
-    } else if product_id == ci_product_id {
-        Some("ci")
-    } else {
-        None
-    }
-}
-
 /// Asks for the product `id`.
 #[must_use]
 pub fn product(api: &str, token: &str, id: &str) -> Request {
@@ -777,17 +758,6 @@ mod tests {
                 "metadata": { "units": 20, "minutes": 5, "template": "ubuntu-26.04-8core" },
             }] })
         );
-    }
-
-    #[test]
-    fn product_kind_names_the_ci_product() {
-        let runners = product_ids("p-run, p-run2");
-        assert_eq!(product_kind("p-ci", &runners, "p-ci"), Some("ci"));
-        assert_eq!(product_kind("p-run", &runners, "p-ci"), Some("runners"));
-        assert_eq!(product_kind("p-run2", &runners, ""), Some("runners"));
-        assert_eq!(product_kind("p-ci", &runners, ""), None);
-        assert_eq!(product_kind("p-other", &runners, "p-ci"), None);
-        assert_eq!(product_kind("", &[], ""), None);
     }
 
     #[test]

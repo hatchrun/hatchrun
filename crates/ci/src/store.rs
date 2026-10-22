@@ -23,15 +23,15 @@ use worker::Result;
 /// milliseconds.
 const RETENTION_MS: u64 = 30 * 86_400_000;
 
-/// Where a tenant stands with the CI product.
+/// Where a tenant stands with its subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CiBilling {
-    /// No CI subscription row ever: a hatchrun.io-only tenant.
+    /// No subscription row ever.
     Never,
-    /// A CI subscription exists but none is active or trialing.
+    /// A subscription exists but none is active or trialing.
     Lapsed,
-    /// An active or trialing CI subscription: a card on file.
+    /// An active or trialing subscription: a card on file.
     Active,
 }
 
@@ -228,17 +228,17 @@ const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instan
      token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held";
 
 /// The columns of a [`TenantRow`]. `ci_billing` is `active` for an
-/// active or trialing CI subscription, `lapsed` for another CI
-/// subscription, `never` for none. `retention_days` is the tier: 30, or 90
+/// active or trialing subscription, `lapsed` for another one, `never`
+/// for none. `retention_days` is the tier: 30, or 90
 /// for a tenant whose `retention_days` (shared with hatchrun.io, 1 to 90)
 /// is above 30. R2 lifecycle rules exist per tier, so CI keeps for 30 or
 /// 90 days and nothing between.
 const TENANT_COLUMNS: &str = "id, org_login, CASE \
      WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
-     AND subscriptions.product = 'ci' AND subscriptions.status IN ('active', 'trialing')) \
+     AND subscriptions.status IN ('active', 'trialing')) \
      THEN 'active' \
-     WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
-     AND subscriptions.product = 'ci') THEN 'lapsed' \
+     WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id) \
+     THEN 'lapsed' \
      ELSE 'never' END AS ci_billing, \
      CASE WHEN retention_days > 30 THEN 90 ELSE 30 END AS retention_days";
 
@@ -249,9 +249,9 @@ const TENANT_FOR_INSTALLATION: &str = "SELECT {columns} FROM tenants WHERE insta
 /// Tenant `$1`, where `{columns}` is [`TENANT_COLUMNS`].
 const TENANT: &str = "SELECT {columns} FROM tenants WHERE id = $1";
 
-/// Whether tenant `$1` has an active or trialing CI subscription.
+/// Whether tenant `$1` has an active or trialing subscription.
 const HAS_CARD: &str = "SELECT EXISTS (SELECT 1 FROM subscriptions WHERE tenant_id = $1 \
-     AND product = 'ci' AND status IN ('active', 'trialing')) AS card";
+     AND status IN ('active', 'trialing')) AS card";
 
 /// The run of delivery `$1` and workflow `$2`, where `{columns}` is
 /// [`RUN_COLUMNS`].
@@ -454,7 +454,6 @@ const RECORD_USAGE: &str = "INSERT INTO ci_usage \
 /// `{owner}` picks the tenant by `$1`.
 const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
        EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
-         AND subscriptions.product = 'ci' \
          AND subscriptions.status IN ('active', 'trialing')) AS card, \
        COALESCE((SELECT cap_micros FROM ci_spend_caps WHERE tenant_id = tenants.id), $3) \
          AS cap_micros, \
@@ -597,8 +596,7 @@ pub async fn tenant(db: &Db, tenant_id: &str) -> Result<Option<TenantRow>> {
     .await
 }
 
-/// Whether tenant `tenant_id` has an active or trialing subscription to
-/// the CI product.
+/// Whether tenant `tenant_id` has an active or trialing subscription.
 ///
 /// # Errors
 ///
@@ -621,7 +619,7 @@ pub struct Standing {
     pub tenant_id: String,
     /// The organization's login, for messages.
     pub org_login: String,
-    /// Whether an active or trialing CI subscription exists.
+    /// Whether an active or trialing subscription exists.
     pub card: bool,
     /// The monthly spend cap in micros: the tenant's own or the default.
     pub cap_micros: u64,
@@ -2696,7 +2694,7 @@ mod tests {
         let (_, capped) = run_with_job_named(&db, "cap", "queued");
         set_held(&db, capped, "spend_cap", 5);
         let (_, other) = run_with_job_named(&db, "plain", "queued");
-        subscribe(&db, "s1", "ci", "active");
+        subscribe(&db, "s1", "active");
         let woken = db.wait(ci_wake::card_returned(db.db(), "t1")).unwrap();
         assert_eq!(woken_ids(woken), card[..5]);
         for id in card.iter().chain([&capped]) {
@@ -3263,28 +3261,26 @@ mod tests {
         );
     }
 
-    fn subscribe(db: &TestDb, id: &str, product: &str, status: &str) {
+    fn subscribe(db: &TestDb, id: &str, status: &str) {
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             product, cancel_at_period_end, modified_at, updated_at) \
-             VALUES ($1, 't1', $3, 'c', 'p', $2, false, 't', 0)",
-            &params![id, product, status],
+             cancel_at_period_end, modified_at, updated_at) \
+             VALUES ($1, 't1', $2, 'c', 'p', false, 't', 0)",
+            &params![id, status],
         );
     }
 
     #[test]
-    fn has_card_needs_an_active_ci_subscription() {
+    fn has_card_needs_an_active_subscription() {
         let db = setup();
         let card = |db: &TestDb| db.wait(has_card(db.db(), "t1")).unwrap();
         assert!(!card(&db), "no subscription");
-        subscribe(&db, "s1", "runners", "active");
-        assert!(!card(&db), "a runners subscription is no card for CI");
-        subscribe(&db, "s2", "ci", "canceled");
+        subscribe(&db, "s1", "canceled");
         assert!(!card(&db), "canceled");
-        subscribe(&db, "s3", "ci", "active");
+        subscribe(&db, "s2", "active");
         assert!(card(&db));
         db.run(
-            "UPDATE subscriptions SET status = 'trialing' WHERE id = 's3'",
+            "UPDATE subscriptions SET status = 'trialing' WHERE id = 's2'",
             &[],
         );
         assert!(card(&db), "trialing");
@@ -3292,7 +3288,7 @@ mod tests {
     }
 
     #[test]
-    fn tenant_row_reads_the_ci_billing_state() {
+    fn tenant_row_reads_the_billing_state() {
         let db = setup();
         let state = |db: &TestDb| {
             let by_id = db.wait(tenant(db.db(), "t1")).unwrap().unwrap().ci_billing;
@@ -3305,19 +3301,17 @@ mod tests {
             by_id
         };
         assert_eq!(state(&db), CiBilling::Never);
-        subscribe(&db, "s1", "runners", "active");
-        assert_eq!(state(&db), CiBilling::Never, "a runners subscription");
-        subscribe(&db, "s2", "ci", "canceled");
+        subscribe(&db, "s1", "canceled");
         assert_eq!(state(&db), CiBilling::Lapsed);
-        subscribe(&db, "s3", "ci", "active");
+        subscribe(&db, "s2", "active");
         assert_eq!(state(&db), CiBilling::Active);
         db.run(
-            "UPDATE subscriptions SET status = 'canceled' WHERE id = 's3'",
+            "UPDATE subscriptions SET status = 'canceled' WHERE id = 's2'",
             &[],
         );
         assert_eq!(state(&db), CiBilling::Lapsed);
         db.run(
-            "UPDATE subscriptions SET status = 'trialing' WHERE id = 's3'",
+            "UPDATE subscriptions SET status = 'trialing' WHERE id = 's2'",
             &[],
         );
         assert_eq!(state(&db), CiBilling::Active);
@@ -3587,7 +3581,7 @@ mod tests {
              VALUES ('t2', 70000000, 0)",
             &[],
         );
-        subscribe(&db, "s1", "ci", "active");
+        subscribe(&db, "s1", "active");
         let other = db
             .wait(tenant_standing(db.db(), "t2", month, default_cap))
             .unwrap()

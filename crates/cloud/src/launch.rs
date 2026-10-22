@@ -752,8 +752,8 @@ mod tests {
 
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             product, cancel_at_period_end, modified_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, 'runners', $6, $7, $8)",
+             cancel_at_period_end, modified_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             &params!["s1", "t1", "active", "c1", "p1", false, "2026-10-01", NOW],
         );
         let tenant: Tenant = db.first(&tenant_query(), &params![INSTALLATION]).unwrap();

@@ -27,12 +27,10 @@ pub const FREE_MINUTES: u32 = 3000;
 /// minutes: seven days.
 pub const GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
-/// SQL that is true for a `tenants` row with a Polar subscription to
-/// the runners product that holds a licence. A CI subscription does not
-/// count.
+/// SQL that is true for a `tenants` row with a Polar subscription that
+/// holds a licence.
 pub(crate) const PAID: &str = "EXISTS (SELECT 1 FROM subscriptions \
      WHERE subscriptions.tenant_id = tenants.id \
-     AND subscriptions.product = 'runners' \
      AND subscriptions.status IN ('active', 'trialing'))";
 
 /// SQL for the start of the current UTC month, Unix ms.
@@ -53,7 +51,6 @@ pub(crate) const USED: &str = "(SELECT COALESCE(SUM(usage_events.minutes), 0)::b
 pub(crate) const MAY_LAUNCH: &str = "(CASE WHEN tenants.beta \
      OR EXISTS (SELECT 1 FROM subscriptions \
      WHERE subscriptions.tenant_id = tenants.id \
-     AND subscriptions.product = 'runners' \
      AND subscriptions.status IN ('active', 'trialing')) \
      OR (tenants.free_used_up_at >= \
      (extract(epoch from date_trunc('month', now() AT TIME ZONE 'UTC'))::bigint * 1000) \
@@ -311,7 +308,7 @@ mod tests {
         // MAY_LAUNCH spells out PAID, USED, FREE_MINUTES and GRACE_MS,
         // since a const &str cannot be formatted.
         assert!(MAY_LAUNCH.contains(PAID));
-        assert!(PAID.contains("product = 'runners'"));
+        assert!(!MAY_LAUNCH.contains("product"));
         assert!(MAY_LAUNCH.contains(&format!("{USED} < {FREE_MINUTES}")));
         assert!(MAY_LAUNCH.contains(&format!(
             "(floor(extract(epoch from now()))::bigint * 1000) - {GRACE_MS}"
@@ -353,8 +350,8 @@ mod sql {
         }
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             product, cancel_at_period_end, modified_at, updated_at) \
-             VALUES ('sub', 'paid', 'active', 'c', 'p', 'runners', false, 't', 1)",
+             cancel_at_period_end, modified_at, updated_at) \
+             VALUES ('sub', 'paid', 'active', 'c', 'p', false, 't', 1)",
             &[],
         );
         db
@@ -513,30 +510,6 @@ mod sql {
     }
 
     #[test]
-    fn a_ci_subscription_does_not_license_runners() {
-        let db = seed();
-        db.run(
-            "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             product, cancel_at_period_end, modified_at, updated_at) \
-             VALUES ('ci', 'free', 'active', 'c', 'p-ci', 'ci', false, 't', 1)",
-            &[],
-        );
-        // Past the free minutes with only a CI subscription.
-        record(&db, 1, 1, 3500, 0, true);
-        let row = month(&db, "free");
-        assert!(row.free_used_up_at.is_some(), "the free minutes ran out");
-        db.run(
-            "UPDATE tenants SET free_used_up_at = $1 WHERE id = 'free'",
-            &params![now() - 10 * DAY],
-        );
-        assert!(!month(&db, "free").may_launch);
-        // The usage row is not billed to the CI card.
-        let billed: Vec<serde_json::Value> =
-            db.all("SELECT billed FROM usage_events WHERE job_id = 1", &[]);
-        assert_eq!(billed, [serde_json::json!({ "billed": false })]);
-    }
-
-    #[test]
     fn grace_starts_when_a_subscription_ends() {
         let db = seed();
         // Past the free minutes while paid: no grace period yet.
@@ -575,8 +548,8 @@ mod sql {
         // Adds a card, which clears it, then the subscription ends.
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             product, cancel_at_period_end, modified_at, updated_at) \
-             VALUES ('sub2', 'free', 'active', 'c', 'p', 'runners', false, 't', 1)",
+             cancel_at_period_end, modified_at, updated_at) \
+             VALUES ('sub2', 'free', 'active', 'c', 'p', false, 't', 1)",
             &[],
         );
         assert_eq!(db.run(CLEAR_GRACE, &params!["free"]), 1);

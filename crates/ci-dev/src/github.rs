@@ -17,8 +17,7 @@
 //! The fake also answers the Polar calls `hatchrun-ci` makes, so
 //! `POLAR_API_URL` may point at it: `POST /v1/events/ingest` keeps the
 //! events (an `external_id` seen before counts as a duplicate, as Polar
-//! does), and `POST /v1/checkouts/` and `POST /v1/customer-sessions/`
-//! answer a URL. Each wants the bearer token [`POLAR_TOKEN`].
+//! does). It wants the bearer token [`POLAR_TOKEN`].
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -127,8 +126,6 @@ pub fn router(fake: Fake) -> Router {
             patch(update_check_run),
         )
         .route("/v1/events/ingest", post(polar_ingest))
-        .route("/v1/checkouts/", post(polar_checkout))
-        .route("/v1/customer-sessions/", post(polar_customer_session))
         .route("/_state", get(state))
         .with_state(fake)
 }
@@ -432,38 +429,6 @@ async fn polar_ingest(
     Json(json!({ "inserted": inserted, "duplicates": duplicates })).into_response()
 }
 
-/// A checkout for the tenant the body names.
-async fn polar_checkout(headers: HeaderMap, Json(body): Json<Value>) -> Response {
-    if !polar_authorized(&headers) {
-        return unauthorized();
-    }
-    let tenant = body
-        .get("external_customer_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    (
-        StatusCode::CREATED,
-        Json(json!({ "url": format!("https://polar.invalid/checkout/{tenant}") })),
-    )
-        .into_response()
-}
-
-/// A customer portal session for the tenant the body names.
-async fn polar_customer_session(headers: HeaderMap, Json(body): Json<Value>) -> Response {
-    if !polar_authorized(&headers) {
-        return unauthorized();
-    }
-    let tenant = body
-        .get("external_customer_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    (
-        StatusCode::CREATED,
-        Json(json!({ "customer_portal_url": format!("https://polar.invalid/portal/{tenant}") })),
-    )
-        .into_response()
-}
-
 async fn state(State(fake): State<Fake>) -> Json<Value> {
     let inner = fake.lock();
     let runs: Vec<&CheckRun> = inner.check_runs.values().collect();
@@ -628,16 +593,6 @@ mod tests {
         let again = json!({ "events": [event("ci:2:1"), event("ci:3:1")] });
         let (_, answer) = polar(&app, "/v1/events/ingest", POLAR_TOKEN, again).await;
         assert_eq!(answer, json!({ "inserted": 1, "duplicates": 1 }));
-
-        let customer = json!({ "external_customer_id": "t2" });
-        let (status, answer) = polar(&app, "/v1/checkouts/", POLAR_TOKEN, customer.clone()).await;
-        assert_eq!(status, 201);
-        assert_eq!(answer["url"], "https://polar.invalid/checkout/t2");
-        let (_, answer) = polar(&app, "/v1/customer-sessions/", POLAR_TOKEN, customer).await;
-        assert_eq!(
-            answer["customer_portal_url"],
-            "https://polar.invalid/portal/t2"
-        );
 
         let (_, body) = call(&app, "GET", "/_state", None).await;
         let state: Value = serde_json::from_slice(&body).unwrap();

@@ -8,8 +8,6 @@
 //! | Route | Needs | Answer |
 //! | --- | --- | --- |
 //! | `GET /api/ci/orgs/{org}/billing` | org admin | [`BillingView`](crate::billing::BillingView) |
-//! | `POST /api/ci/orgs/{org}/billing/checkout` | org admin, CSRF | `{"url": ...}` |
-//! | `POST /api/ci/orgs/{org}/billing/portal` | org admin, CSRF | `{"url": ...}` |
 //! | `PUT /api/ci/orgs/{org}/billing/cap` | org admin, CSRF | `204` |
 //! | `GET /api/ci/orgs/{org}/secrets` | org admin | `[{"name", "updatedAt"}]` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/secrets/{name}` | org admin, CSRF | `204` |
@@ -24,8 +22,6 @@
 //! body checks of every mutating method before it calls [`handle`].
 
 use hatchrun_cloud::ci_wake;
-use hatchrun_cloud::fetch::send;
-use hatchrun_cloud::polar;
 use hatchrun_cloud::tenant::valid_login;
 use serde::Deserialize;
 use serde_json::json;
@@ -36,7 +32,7 @@ use crate::api::{Cx, Served, Stop, body_cap, name, no_content, now_ms, reply, st
 use crate::billing;
 use crate::launches;
 use crate::secrets::{self, Aad, Keyring};
-use crate::store::{self, CiBilling, Put, TenantRow};
+use crate::store::{self, Put, TenantRow};
 
 /// Where a secret or variable lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,16 +53,6 @@ pub enum Scope<'a> {
 pub enum SettingsRoute<'a> {
     /// What the organization has used and may spend.
     Billing {
-        /// The organization.
-        org: &'a str,
-    },
-    /// Start a checkout for the CI product.
-    Checkout {
-        /// The organization.
-        org: &'a str,
-    },
-    /// Open the customer portal.
-    Portal {
         /// The organization.
         org: &'a str,
     },
@@ -93,9 +79,6 @@ impl SettingsRoute<'_> {
             SettingsRoute::Billing { .. } | SettingsRoute::Secrets(_) | SettingsRoute::Vars(_) => {
                 *method == Method::Get
             }
-            SettingsRoute::Checkout { .. } | SettingsRoute::Portal { .. } => {
-                *method == Method::Post
-            }
             SettingsRoute::Cap { .. } => *method == Method::Put,
             SettingsRoute::Secret(..) | SettingsRoute::Var(..) => {
                 matches!(method, Method::Put | Method::Delete)
@@ -111,8 +94,6 @@ pub fn find(path: &str) -> Option<SettingsRoute<'_>> {
     let parts: Vec<&str> = path.split('/').collect();
     match parts.as_slice() {
         ["orgs", org, "billing"] => Some(SettingsRoute::Billing { org: login(org)? }),
-        ["orgs", org, "billing", "checkout"] => Some(SettingsRoute::Checkout { org: login(org)? }),
-        ["orgs", org, "billing", "portal"] => Some(SettingsRoute::Portal { org: login(org)? }),
         ["orgs", org, "billing", "cap"] => Some(SettingsRoute::Cap { org: login(org)? }),
         ["orgs", org, kind @ ("secrets" | "vars")] => {
             let scope = Scope::Org(login(org)?);
@@ -174,8 +155,6 @@ pub(crate) async fn handle(
 ) -> Result<Served> {
     match route {
         SettingsRoute::Billing { org } => billing_view(cx, org).await,
-        SettingsRoute::Checkout { org } => checkout(cx, org).await,
-        SettingsRoute::Portal { org } => portal(cx, org).await,
         SettingsRoute::Cap { org } => cap(cx, org, req, body_cap(&route)).await,
         SettingsRoute::Secrets(scope) => list_secrets(cx, scope).await,
         SettingsRoute::Vars(scope) => list_vars(cx, scope).await,
@@ -238,102 +217,6 @@ async fn billing_view(cx: &Cx<'_>, org: &str) -> Result<Served> {
         return Ok(stop(404, "not found"));
     };
     reply(200, &serde_json::to_value(billing::view(&standing))?).map(Ok)
-}
-
-/// Polar's token and the CI product, or the `503` that says billing is
-/// not set up. No checkout starts while the product id is empty.
-fn polar_ready(cx: &Cx<'_>) -> Served<()> {
-    if cx.settings.polar_token.is_empty() || cx.settings.polar_ci_product_id.is_empty() {
-        return stop(503, "billing is not set up yet");
-    }
-    Ok(())
-}
-
-/// Polar's answer as an error the caller sees, with the detail kept in
-/// the log.
-fn polar_failed(what: &str, err: &str) -> Stop {
-    console_error!("settings: {what}: {err}");
-    Stop(
-        502,
-        "Polar did not answer; try again shortly".to_owned(),
-        None,
-    )
-}
-
-/// Why no checkout may start for `tenant`: it has an active or trialing
-/// CI subscription already, and a second would charge the same meter
-/// twice.
-fn checkout_refusal(tenant: &TenantRow) -> Option<String> {
-    (tenant.ci_billing == CiBilling::Active).then(|| {
-        format!(
-            "{} already has a CI subscription; change the card or cancel it in the billing portal",
-            tenant.org_login
-        )
-    })
-}
-
-async fn checkout(cx: &Cx<'_>, org: &str) -> Result<Served> {
-    let tenant = match admin_tenant(cx, org).await? {
-        Ok(tenant) => tenant,
-        Err(stop) => return Ok(Err(stop)),
-    };
-    if let Err(stop) = polar_ready(cx) {
-        return Ok(Err(stop));
-    }
-    if let Some(message) = checkout_refusal(&tenant) {
-        return Ok(stop(409, message));
-    }
-    let settings = cx.settings;
-    let page = format!("{}/o/{}/ci", settings.app_url, tenant.org_login);
-    let request = polar::checkout(
-        &settings.polar_api,
-        &settings.polar_token,
-        std::slice::from_ref(&settings.polar_ci_product_id),
-        &tenant.id,
-        &tenant.org_login,
-        &page,
-        &page,
-    );
-    let url = match send(&request).await {
-        Ok(response) => polar::checkout_url(&response),
-        Err(err) => Err(err),
-    };
-    match url {
-        Ok(url) => reply(200, &json!({ "url": url })).map(Ok),
-        Err(err) => Ok(Err(polar_failed("checkout", &err))),
-    }
-}
-
-async fn portal(cx: &Cx<'_>, org: &str) -> Result<Served> {
-    let tenant = match admin_tenant(cx, org).await? {
-        Ok(tenant) => tenant,
-        Err(stop) => return Ok(Err(stop)),
-    };
-    if cx.settings.polar_token.is_empty() {
-        return Ok(stop(503, "billing is not set up yet"));
-    }
-    if tenant.ci_billing == CiBilling::Never {
-        return Ok(stop(
-            409,
-            format!("{} has no CI subscription", tenant.org_login),
-        ));
-    }
-    let settings = cx.settings;
-    let page = format!("{}/o/{}/ci", settings.app_url, tenant.org_login);
-    let request = polar::customer_session(
-        &settings.polar_api,
-        &settings.polar_token,
-        &tenant.id,
-        &page,
-    );
-    let url = match send(&request).await {
-        Ok(response) => polar::portal_url(&response),
-        Err(err) => Err(err),
-    };
-    match url {
-        Ok(url) => reply(200, &json!({ "url": url })).map(Ok),
-        Err(err) => Ok(Err(polar_failed("portal", &err))),
-    }
 }
 
 /// The body of `PUT .../billing/cap`.
@@ -603,33 +486,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_checkout_is_refused_while_a_ci_subscription_is_active() {
-        let tenant = |ci_billing| TenantRow {
-            id: "t1".into(),
-            org_login: "acme".into(),
-            ci_billing,
-            retention_days: 30,
-        };
-        let message = checkout_refusal(&tenant(CiBilling::Active)).unwrap();
-        assert!(message.contains("acme already has a CI subscription"));
-        assert_eq!(checkout_refusal(&tenant(CiBilling::Never)), None);
-        assert_eq!(checkout_refusal(&tenant(CiBilling::Lapsed)), None);
-    }
-
-    #[test]
     fn routes_parse() {
         let org = "acme";
         assert_eq!(
             settings_route("orgs/acme/billing", &Method::Get),
             Some(SettingsRoute::Billing { org })
-        );
-        assert_eq!(
-            settings_route("orgs/acme/billing/checkout", &Method::Post),
-            Some(SettingsRoute::Checkout { org })
-        );
-        assert_eq!(
-            settings_route("orgs/acme/billing/portal", &Method::Post),
-            Some(SettingsRoute::Portal { org })
         );
         assert_eq!(
             settings_route("orgs/acme/billing/cap", &Method::Put),
@@ -662,7 +523,8 @@ mod tests {
     fn other_paths_and_methods_have_no_route() {
         for (path, method) in [
             ("orgs/acme/billing", Method::Post),
-            ("orgs/acme/billing/checkout", Method::Get),
+            ("orgs/acme/billing/checkout", Method::Post),
+            ("orgs/acme/billing/portal", Method::Post),
             ("orgs/acme/billing/cap", Method::Post),
             ("orgs/acme/billing/cap", Method::Delete),
             ("orgs/acme/billing/other", Method::Get),
@@ -678,6 +540,7 @@ mod tests {
         }
         // The path matches, so the caller can answer 405.
         assert!(find("orgs/acme/billing/cap").is_some());
+        assert!(find("orgs/acme/billing/checkout").is_none());
     }
 
     #[test]

@@ -50,7 +50,7 @@ enum Outcome {
 }
 
 /// The tenant of a delivery, or why the delivery is ignored. A tenant
-/// that never had a CI subscription is ignored before anything reads
+/// that never had a subscription is ignored before anything reads
 /// its config; one whose subscription lapsed passes, and
 /// [`runs::create`] answers it with the card check run.
 fn gate(tenant: Option<TenantRow>) -> std::result::Result<TenantRow, &'static str> {
@@ -383,8 +383,8 @@ mod tests {
     fn subscribe(db: &TestDb, status: &str) {
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             product, cancel_at_period_end, modified_at, updated_at) \
-             VALUES ('s1', 't1', $1, 'c', 'p', 'ci', false, 't', 0)",
+             cancel_at_period_end, modified_at, updated_at) \
+             VALUES ('s1', 't1', $1, 'c', 'p', false, 't', 0)",
             &params![status],
         );
     }
@@ -404,14 +404,6 @@ mod tests {
     #[test]
     fn never_subscribed_tenant_is_ignored_before_the_config() {
         let db = tenant_db();
-        assert_eq!(gate(found(&db)).unwrap_err(), NEVER_SUBSCRIBED);
-        // A runners subscription is not a CI one.
-        db.run(
-            "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             product, cancel_at_period_end, modified_at, updated_at) \
-             VALUES ('r1', 't1', 'active', 'c', 'p', 'runners', false, 't', 0)",
-            &[],
-        );
         assert_eq!(gate(found(&db)).unwrap_err(), NEVER_SUBSCRIBED);
     }
 

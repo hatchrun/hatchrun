@@ -51,9 +51,6 @@ pub struct Settings {
     pub polar_api: String,
     /// Polar's access token. Empty until billing is set up.
     pub polar_token: String,
-    /// The Polar product of hatchrun CI. Empty until it exists, and no
-    /// checkout starts while it is.
-    pub polar_ci_product_id: String,
 }
 
 impl Settings {
@@ -107,7 +104,6 @@ impl Settings {
                 .trim_end_matches('/')
                 .to_owned(),
             polar_token: get("POLAR_ACCESS_TOKEN").unwrap_or_default(),
-            polar_ci_product_id: get("POLAR_CI_PRODUCT_ID").unwrap_or_default(),
         })
     }
 }
@@ -163,7 +159,6 @@ mod tests {
         assert_eq!(settings.local_launcher_url, None);
         assert_eq!(settings.polar_api, polar::API);
         assert_eq!(settings.polar_token, "");
-        assert_eq!(settings.polar_ci_product_id, "");
     }
 
     #[test]
@@ -172,10 +167,8 @@ mod tests {
         v.insert("GITHUB_API_URL", "http://localhost:9000/".to_owned());
         v.insert("AWS_ENDPOINT_URL", "http://localhost:4566".to_owned());
         v.insert("POLAR_API_URL", "https://sandbox-api.polar.sh/".to_owned());
-        v.insert("POLAR_CI_PRODUCT_ID", "prod".to_owned());
         let settings = read(&v).unwrap();
         assert_eq!(settings.polar_api, "https://sandbox-api.polar.sh");
-        assert_eq!(settings.polar_ci_product_id, "prod");
         assert_eq!(settings.github_api, "http://localhost:9000");
         assert_eq!(
             settings.aws_endpoint.as_deref(),

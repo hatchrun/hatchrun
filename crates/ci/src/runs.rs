@@ -266,7 +266,7 @@ fn billing_decision(billing: CiBilling, plans: usize) -> Billing {
 /// (the webhook also needs it for schedules and path filters).
 ///
 /// Nothing starts for a commit without a config, a missing tenant, or a
-/// tenant that never had a CI subscription. A tenant whose subscription
+/// tenant that never had a subscription. A tenant whose subscription
 /// lapsed gets one `action_required` card check run when a workflow
 /// would run, and nothing otherwise. For a tenant with a card, a config
 /// that does not parse or compile gets one failed check run. Each planned workflow becomes a run with
