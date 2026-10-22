@@ -571,7 +571,10 @@ mod tests {
         assert!(credentials_fresh(start, start + 839_999));
         assert!(!credentials_fresh(start, start + 840_000), "900 s - 60 s");
         assert!(!credentials_fresh(start, start + 900_000));
-        assert!(!credentials_fresh(start, start - 1), "a clock that went back");
+        assert!(
+            !credentials_fresh(start, start - 1),
+            "a clock that went back"
+        );
     }
 
     #[test]

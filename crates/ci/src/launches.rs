@@ -34,13 +34,13 @@ use hatchrun_workflow::agent::{BootDocument, CiBoot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use worker::{
-    Env, MessageBatch, MessageExt, Method, QueueRetryOptions, QueueRetryOptionsBuilder, RequestInit, console_error,
-    console_log,
+    Env, MessageBatch, MessageExt, Method, QueueRetryOptions, QueueRetryOptionsBuilder,
+    RequestInit, console_error, console_log,
 };
 
 use crate::env::{Settings, run_stub};
-use crate::reconcile::LAUNCH_QUIET_MS;
 use crate::launcher::{Backend, LaunchSpec, user_data};
+use crate::reconcile::LAUNCH_QUIET_MS;
 use crate::store::{self, JobRow};
 use crate::token::{self, Claims};
 
@@ -314,9 +314,9 @@ async fn store_ticket(
     .header("Authorization", format!("Bearer {}", settings.broker_token))
     .header("Content-Type", "application/json")
     .body(broker_body(document).to_string());
-    let response = send(&request).await.map_err(|err| {
-        Failure::new(Cause::Unreachable, format!("store boot document: {err}"))
-    })?;
+    let response = send(&request)
+        .await
+        .map_err(|err| Failure::new(Cause::Unreachable, format!("store boot document: {err}")))?;
     if response.ok() {
         Ok(())
     } else {
@@ -557,7 +557,11 @@ mod tests {
             DeadLetter::Leave
         );
         assert_eq!(
-            dead_letter_action(&quiet_row("launching", 1, now - LAUNCH_QUIET_MS - 1), 1, now),
+            dead_letter_action(
+                &quiet_row("launching", 1, now - LAUNCH_QUIET_MS - 1),
+                1,
+                now
+            ),
             DeadLetter::End
         );
         assert_eq!(
