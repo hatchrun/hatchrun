@@ -22,12 +22,19 @@ pub const BOOT_SECS: u64 = 15 * 60;
 pub const GRACE_SECS: u64 = 10 * 60;
 
 /// What a job token says.
+///
+/// A signature proves only that the control plane issued the token.
+/// Callers must check `job`, `run` and `attempt` against the job row
+/// before they act on a token. A rerun gives the job a new attempt, so an
+/// instance from an earlier attempt holds a token that no longer matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claims {
     /// The job's id.
     pub job: u64,
     /// The run's id.
     pub run: u64,
+    /// Which attempt of the job the token was minted for, from 1.
+    pub attempt: i32,
     /// When the token stops working, in Unix seconds.
     pub exp: u64,
 }
@@ -49,11 +56,13 @@ pub fn lifetime_secs(timeout_minutes: u32) -> u64 {
     u64::from(timeout_minutes) * 60 + BOOT_SECS + GRACE_SECS
 }
 
-/// Signs `claims` with `key`.
+/// Signs `claims` with `key`. The claims carry the attempt, so a token
+/// minted for one attempt fails the check against the next.
 ///
 /// # Panics
 ///
-/// Never. The claims are plain integers, so they always serialize.
+/// Panics if the claims fail to serialize, which plain integer fields
+/// never do.
 #[must_use]
 pub fn sign(key: &[u8], claims: &Claims) -> String {
     let payload = URL_SAFE_NO_PAD.encode(
@@ -65,6 +74,9 @@ pub fn sign(key: &[u8], claims: &Claims) -> String {
 }
 
 /// Checks a token's signature and expiry, and returns its claims.
+///
+/// The caller must still compare `job`, `run` and `attempt` with the job
+/// row. This function does not know the row.
 ///
 /// # Errors
 ///
@@ -100,10 +112,6 @@ fn mac(key: &[u8], signing: &str) -> Hmac<Sha256> {
     mac
 }
 
-// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
-//
-// SPDX-License-Identifier: AGPL-3.0-only
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,8 +122,20 @@ mod tests {
         Claims {
             job: 7,
             run: 3,
+            attempt: 1,
             exp: 1_000,
         }
+    }
+
+    /// Splits a token into its signing input and its signature part.
+    fn split_signature(token: &str) -> (&str, &str) {
+        token.rsplit_once('.').expect("a signed token has dots")
+    }
+
+    /// Returns the token with its signature replaced.
+    fn with_signature(token: &str, signature: &str) -> String {
+        let (signing, _) = split_signature(token);
+        format!("{signing}.{signature}")
     }
 
     #[test]
@@ -153,6 +173,68 @@ mod tests {
     fn rejects_malformed_tokens() {
         assert_eq!(verify(KEY, "v1.abc", 0), Err(TokenError::Malformed));
         assert_eq!(verify(KEY, "v2.abc.def", 0), Err(TokenError::Malformed));
+    }
+
+    #[test]
+    fn carries_the_attempt() {
+        let token = sign(
+            KEY,
+            &Claims {
+                attempt: 1,
+                ..claims()
+            },
+        );
+        let decoded = verify(KEY, &token, 999).unwrap();
+        assert_eq!(decoded.attempt, 1);
+    }
+
+    #[test]
+    fn rejects_a_changed_attempt() {
+        // An attempt-1 signature cannot be moved onto an attempt-2 payload.
+        let first = sign(
+            KEY,
+            &Claims {
+                attempt: 1,
+                ..claims()
+            },
+        );
+        let rerun = sign(
+            KEY,
+            &Claims {
+                attempt: 2,
+                ..claims()
+            },
+        );
+        let (rerun_signing, _) = split_signature(&rerun);
+        let (_, first_signature) = split_signature(&first);
+        let forged = format!("{rerun_signing}.{first_signature}");
+        assert_eq!(verify(KEY, &forged, 999), Err(TokenError::BadSignature));
+    }
+
+    #[test]
+    fn rejects_an_empty_signature() {
+        let token = sign(KEY, &claims());
+        let forged = with_signature(&token, "");
+        assert_eq!(verify(KEY, &forged, 999), Err(TokenError::BadSignature));
+    }
+
+    #[test]
+    fn rejects_a_truncated_signature() {
+        let token = sign(KEY, &claims());
+        let (_, signature) = split_signature(&token);
+        // 40 characters decode to 30 bytes, a clean but short signature.
+        let forged = with_signature(&token, &signature[..40]);
+        assert_eq!(verify(KEY, &forged, 999), Err(TokenError::BadSignature));
+    }
+
+    #[test]
+    fn rejects_a_flipped_signature_bit() {
+        let token = sign(KEY, &claims());
+        let (_, signature) = split_signature(&token);
+        let mut bytes = URL_SAFE_NO_PAD.decode(signature).unwrap();
+        bytes[0] ^= 0x01;
+        let forged = with_signature(&token, &URL_SAFE_NO_PAD.encode(bytes));
+        assert_eq!(verify(KEY, &forged, 999), Err(TokenError::BadSignature));
     }
 
     #[test]
