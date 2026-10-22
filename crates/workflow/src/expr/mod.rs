@@ -20,6 +20,8 @@ use serde_json::Value;
 
 pub use eval::truthy;
 
+use crate::secrets::SecretRefs;
+
 /// Context names an expression may read even when the context object
 /// leaves them out. Any other name must be a key of the context object.
 pub(crate) const CONTEXTS: &[&str] = &[
@@ -168,6 +170,80 @@ pub fn checks_status(cond: &str) -> Result<bool, ExprError> {
         calls |= eval::calls_status(&ast);
     }
     Ok(calls)
+}
+
+/// The secrets one text reads. `bare` reads the whole text as one
+/// expression (an `if:`); otherwise only `${{ }}` segments count. A bare
+/// text that holds `${{ }}` is read by its segments, as
+/// [`checks_status`] does.
+///
+/// A name is read from `secrets.NAME` or `secrets['NAME']`, uppercased.
+/// Any other use of the `secrets` context, such as a computed index or
+/// `toJSON(secrets)`, needs every secret. `GITHUB_TOKEN` is the job
+/// token and is never named.
+///
+/// # Errors
+///
+/// When a segment does not parse or a `${{` is not closed.
+pub fn secret_refs(text: &str, bare: bool) -> Result<SecretRefs, ExprError> {
+    let found = if !bare || find_open(text).is_some() {
+        expressions(text)?
+    } else {
+        vec![(0, text)]
+    };
+    let mut refs = SecretRefs::default();
+    for (start, inner) in found {
+        let ast = tree(inner).map_err(|e| ExprError {
+            message: e.message,
+            offset: e.offset + start,
+        })?;
+        collect_secrets(&ast, &mut refs);
+    }
+    Ok(refs)
+}
+
+/// Adds what `expr` reads of the `secrets` context to `refs`.
+fn collect_secrets(expr: &parser::Expr<'_>, refs: &mut SecretRefs) {
+    use parser::{Expr, Step};
+    match expr {
+        Expr::Literal(_) => {}
+        Expr::Context { name, .. } => {
+            if name.eq_ignore_ascii_case("secrets") {
+                refs.all = true;
+            }
+        }
+        Expr::Not(inner) => collect_secrets(inner, refs),
+        Expr::Access { base, path } => {
+            let on_secrets = matches!(&**base, Expr::Context { name, .. } if name.eq_ignore_ascii_case("secrets"));
+            if on_secrets {
+                match path.first() {
+                    Some(Step::Property(name)) => refs.add(name),
+                    Some(Step::Index(Expr::Literal(Value::String(name)))) => refs.add(name),
+                    _ => refs.all = true,
+                }
+            } else {
+                collect_secrets(base, refs);
+            }
+            for step in path {
+                if let Step::Index(index) = step
+                    && !matches!(index, Expr::Literal(_))
+                {
+                    collect_secrets(index, refs);
+                }
+            }
+        }
+        Expr::Call { args, .. } | Expr::And(args) | Expr::Or(args) => {
+            for arg in args {
+                collect_secrets(arg, refs);
+            }
+        }
+        Expr::Compare { first, rest } => {
+            collect_secrets(first, refs);
+            for (_, e) in rest {
+                collect_secrets(e, refs);
+            }
+        }
+    }
 }
 
 /// Whether a step's or job's `if:` holds. No condition means
