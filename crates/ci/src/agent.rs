@@ -16,10 +16,13 @@
 //! the instance's metadata endpoint is turned off, a poll sees the
 //! change applied, and only then is a GitHub token scoped to the job's
 //! repository minted and passed to the run object, whose job document is
-//! the answer. Events and results go to the run object unchanged.
+//! the answer. Events and results go to the run object unchanged, for the token's run, job
+//! and attempt; the object checks the job is in its run, the attempt and that
+//! the job is running.
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::send;
 use hatchrun_cloud::start::app_jwt;
@@ -130,33 +133,33 @@ pub(crate) fn claim_answer(row: &JobRow, claims: &Claims) -> ClaimAnswer {
     }
 }
 
-/// What events and results find in the job row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ForwardAnswer {
-    /// Pass the call to the run object.
-    Go,
-    /// The attempt ended, was replaced or has not been claimed: `409`.
-    Ended,
-    /// The token is for another job or run: `401`.
-    Refused,
-}
-
-/// Decides whether an events or result call with `claims` reaches the
-/// run object. Only a job the claim started, which is `running`, takes
-/// them.
-pub(crate) fn forward_answer(row: &JobRow, claims: &Claims) -> ForwardAnswer {
-    match identity(row, claims) {
-        Identity::Refused => ForwardAnswer::Refused,
-        Identity::Match if row.status == "running" => ForwardAnswer::Go,
-        Identity::Stale | Identity::Match => ForwardAnswer::Ended,
-    }
-}
-
 /// Whether the run, its repository and the job belong together. The
 /// store looks runs and repositories up by id alone, so the tenant of
 /// each is compared here before an installation token is minted.
 pub(crate) fn consistent(job: &JobRow, run: &RunRow, repo: &RepoRow) -> bool {
     job.run_id == run.id && run.repo_id == repo.id && run.tenant_id == repo.tenant_id
+}
+
+/// A request body collected up to [`MAX_BODY_BYTES`].
+#[derive(Default)]
+pub(crate) struct Capped {
+    bytes: Vec<u8>,
+}
+
+impl Capped {
+    /// Adds a chunk. Returns `false`, keeping nothing of the chunk,
+    /// when it would take the body past the limit.
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> bool {
+        if self.bytes.len() + chunk.len() > MAX_BODY_BYTES {
+            return false;
+        }
+        self.bytes.extend_from_slice(chunk);
+        true
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 /// Whether a body of `len` bytes is too big to forward.
@@ -209,38 +212,44 @@ pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
         if declared.is_some_and(too_large) {
             return text("body too large", 413);
         }
-        let bytes = req.bytes().await?;
-        if too_large(bytes.len()) {
-            return text("body too large", 413);
-        }
-        bytes
-    };
-    let db = match Db::connect(env).await {
-        Ok(db) => db,
-        Err(err) => {
-            console_error!("agent api: database: {err}");
-            return text("unavailable", 503);
-        }
-    };
-    let Some(row) = store::job(&db, claims.job).await? else {
-        return status(409);
-    };
-    if path == CLAIM_PATH {
-        claim(env, &settings, &db, &row, &claims).await
-    } else {
-        match forward_answer(&row, &claims) {
-            ForwardAnswer::Refused => text("unauthorized", 401),
-            ForwardAnswer::Ended => status(409),
-            ForwardAnswer::Go => {
-                let route = if path == EVENTS_PATH {
-                    "events"
-                } else {
-                    "result"
-                };
-                to_run(env, row.run_id, route, &row, body).await
+        let mut stream = req.stream()?;
+        let mut capped = Capped::default();
+        while let Some(chunk) = stream.next().await {
+            if !capped.push(&chunk?) {
+                return text("body too large", 413);
             }
         }
+        capped.into_bytes()
+    };
+    if path == CLAIM_PATH {
+        let db = match Db::connect(env).await {
+            Ok(db) => db,
+            Err(err) => {
+                console_error!("agent api: database: {err}");
+                return text("unavailable", 503);
+            }
+        };
+        let row = match store::job(&db, claims.job).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return status(409),
+            Err(err) => {
+                console_error!("agent api: job {}: {err}", claims.job);
+                return text("unavailable", 503);
+            }
+        };
+        return claim(env, &settings, &db, &row, &claims).await;
     }
+    // The run object checks that the job is in its run, the attempt and
+    // that the job is running.
+    let Ok(attempt) = u32::try_from(claims.attempt) else {
+        return text("unauthorized", 401);
+    };
+    let route = if path == EVENTS_PATH {
+        "events"
+    } else {
+        "result"
+    };
+    to_run(env, claims.run, route, claims.job, attempt, body).await
 }
 
 /// Hands the job over, as the module docs describe.
@@ -286,7 +295,7 @@ async fn claim(
         }
     };
     let body = json!({ "token": github_token }).to_string().into_bytes();
-    to_run(env, run.id, "claim", row, body).await
+    to_run(env, run.id, "claim", row.id, row.attempt, body).await
 }
 
 fn retry() -> Result<Response> {
@@ -326,13 +335,14 @@ async fn to_run(
     env: &Env,
     run_id: u64,
     route: &str,
-    row: &JobRow,
+    job: u64,
+    attempt: u32,
     body: Vec<u8>,
 ) -> Result<Response> {
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_body(Some(js_sys::Uint8Array::from(body.as_slice()).into()));
-    let url = format!("https://run/{route}?job={}&attempt={}", row.id, row.attempt);
+    let url = format!("https://run/{route}?job={job}&attempt={attempt}");
     let request = Request::new_with_init(&url, &init)?;
     run_stub(env, run_id)?.fetch_with_request(request).await
 }
@@ -436,10 +446,6 @@ mod tests {
             claim_answer(&row("running"), &other_job),
             ClaimAnswer::Refused
         );
-        assert_eq!(
-            forward_answer(&row("running"), &other_run),
-            ForwardAnswer::Refused
-        );
     }
 
     #[test]
@@ -449,7 +455,6 @@ mod tests {
             ..claims()
         };
         assert_eq!(claim_answer(&row("launched"), &old), ClaimAnswer::Ended);
-        assert_eq!(forward_answer(&row("running"), &old), ForwardAnswer::Ended);
         let negative = Claims {
             attempt: -1,
             ..claims()
@@ -484,21 +489,6 @@ mod tests {
     }
 
     #[test]
-    fn events_reach_only_a_running_job() {
-        assert_eq!(
-            forward_answer(&row("running"), &claims()),
-            ForwardAnswer::Go
-        );
-        for status in ["waiting", "queued", "launching", "launched", "completed"] {
-            assert_eq!(
-                forward_answer(&row(status), &claims()),
-                ForwardAnswer::Ended,
-                "{status}"
-            );
-        }
-    }
-
-    #[test]
     fn run_repository_and_job_must_share_a_tenant() {
         let job = row("launched");
         assert!(consistent(&job, &run_row("t1", 9), &repo_row("t1", 9)));
@@ -511,6 +501,19 @@ mod tests {
             &run_row("t1", 9),
             &repo_row("t1", 9)
         ));
+    }
+
+    #[test]
+    fn chunks_stop_at_the_limit() {
+        let mut capped = Capped::default();
+        assert!(capped.push(&vec![0; MAX_BODY_BYTES - 1]));
+        assert!(capped.push(&[1]));
+        assert!(!capped.push(&[2]));
+        assert_eq!(capped.into_bytes().len(), MAX_BODY_BYTES);
+        // One chunk past the limit is refused whole.
+        let mut big = Capped::default();
+        assert!(!big.push(&vec![0; MAX_BODY_BYTES + 1]));
+        assert_eq!(big.into_bytes(), [] as [u8; 0]);
     }
 
     #[test]
