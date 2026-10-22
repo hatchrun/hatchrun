@@ -709,17 +709,27 @@ export const getCiBilling = (org: string) => adminOnly(() => get<CiBilling>(`${o
 export const setCiCap = (org: string, capDollars: number) =>
   adminOnly(() => put<undefined>(`${orgCiPath(org)}/billing/cap`, { capDollars }));
 
-/** Whose secrets and variables: an organization's, or one repository's. */
-export type CiScope = { org: string } | { owner: string; repo: string };
+/** Whose secrets and variables: an organization's, a repository's, or one of its environments'. */
+export type CiScope = { org: string } | { owner: string; repo: string } | { owner: string; repo: string; environment: string };
 
 export type CiItemKind = "secrets" | "vars";
 
-const scopePath = (scope: CiScope) => ("org" in scope ? orgCiPath(scope.org) : repoPath(scope.owner, scope.repo));
+const scopePath = (scope: CiScope) =>
+  "org" in scope
+    ? orgCiPath(scope.org)
+    : "environment" in scope
+      ? `${repoPath(scope.owner, scope.repo)}/environments/${encodeURIComponent(scope.environment)}`
+      : repoPath(scope.owner, scope.repo);
 
-/** A secret as listed: never its value. Times are Unix milliseconds. */
+/**
+ * A secret as listed: never its value. Times are Unix milliseconds.
+ * `repositories` is the `owner/repo` names an organization item
+ * reaches, or null for all of them; other scopes always answer null.
+ */
 export interface CiSecret {
   name: string;
   updatedAt: number;
+  repositories: string[] | null;
 }
 
 export interface CiVar extends CiSecret {
@@ -729,9 +739,40 @@ export interface CiVar extends CiSecret {
 export const listCiSecrets = (scope: CiScope) => adminOnly(() => get<CiSecret[]>(`${scopePath(scope)}/secrets`));
 export const listCiVars = (scope: CiScope) => adminOnly(() => get<CiVar[]>(`${scopePath(scope)}/vars`));
 
-/** Sets or replaces one secret or variable; the API uppercases the name. */
-export const putCiItem = (scope: CiScope, kind: CiItemKind, name: string, value: string) =>
-  adminOnly(() => put<undefined>(`${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`, { value }));
+/**
+ * Sets or replaces one secret or variable; the API uppercases the
+ * name. Org scope sends `repositories` (null for all); other scopes
+ * never send it.
+ */
+export const putCiItem = (scope: CiScope, kind: CiItemKind, name: string, value: string, repositories?: string[] | null) =>
+  adminOnly(() =>
+    put<undefined>(
+      `${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`,
+      "org" in scope ? { value, repositories: repositories ?? null } : { value },
+    ),
+  );
 
 export const deleteCiItem = (scope: CiScope, kind: CiItemKind, name: string) =>
   adminOnly(() => request<undefined>("DELETE", `${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`));
+
+/** The repositories of an organization that have run CI, to choose who an item reaches. */
+export const listCiOrgRepos = (org: string) => adminOnly(() => get<{ name: string }[]>(`${orgCiPath(org)}/repositories`));
+
+/** A deployment environment of a repository. No branches means any branch. */
+export interface CiEnvironment {
+  name: string;
+  branches: string[];
+  approval: boolean;
+  updatedAt: number;
+}
+
+const environmentsPath = (owner: string, repo: string) => `${repoPath(owner, repo)}/environments`;
+
+export const listCiEnvironments = (owner: string, repo: string) =>
+  adminOnly(() => get<CiEnvironment[]>(environmentsPath(owner, repo)));
+
+export const putCiEnvironment = (owner: string, repo: string, name: string, body: { branches: string[]; approval: boolean }) =>
+  adminOnly(() => put<CiEnvironment>(`${environmentsPath(owner, repo)}/${encodeURIComponent(name)}`, body));
+
+export const deleteCiEnvironment = (owner: string, repo: string, name: string) =>
+  adminOnly(() => request<undefined>("DELETE", `${environmentsPath(owner, repo)}/${encodeURIComponent(name)}`));

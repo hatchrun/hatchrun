@@ -20,13 +20,15 @@ import {
   type CiSecret,
   type CiVar,
 } from "@/api";
+import { RepoAccess } from "./RepoAccess";
 import { Await } from "@/components/Status";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useLoad } from "@/load";
 
 type Row = CiSecret | CiVar;
 
-const scopeKey = (scope: CiScope) => ("org" in scope ? scope.org : `${scope.owner}/${scope.repo}`);
+const scopeKey = (scope: CiScope) =>
+  "org" in scope ? scope.org : "environment" in scope ? `${scope.owner}/${scope.repo}/env/${scope.environment}` : `${scope.owner}/${scope.repo}`;
 
 /** Which field a 400 is about: the API's name messages all speak of names. */
 const aboutName = (message: string) => /\bnames?\b/i.test(message);
@@ -43,8 +45,10 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
     () => (secret ? listCiSecrets(scope) : listCiVars(scope)),
     `${scopeKey(scope)}/${kind}`,
   );
+  const orgScope = "org" in scope ? scope.org : null;
   const [name, setName] = useState("");
   const [value, setValue] = useState("");
+  const [repositories, setRepositories] = useState<string[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<Problem | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
@@ -57,10 +61,11 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
     setSaved(null);
     const given = name.trim();
     try {
-      await putCiItem(scope, kind, given, value);
+      await putCiItem(scope, kind, given, value, repositories);
       // The value leaves the page as soon as it is stored.
       setValue("");
       setName("");
+      setRepositories(null);
       setSaved(given.toUpperCase());
       reload();
     } catch (err) {
@@ -92,6 +97,7 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
   const replace = (row: Row) => {
     setName(row.name);
     setValue("value" in row ? row.value : "");
+    setRepositories(row.repositories);
     setProblem(null);
     setSaved(null);
     valueField.current?.focus();
@@ -112,6 +118,7 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
                   <TableRow>
                     <TableHead>Name</TableHead>
                     {!secret && <TableHead>Value</TableHead>}
+                    {orgScope !== null && <TableHead>Repositories</TableHead>}
                     <TableHead>Updated</TableHead>
                     <TableHead className="text-right">
                       <span className="sr-only">Actions</span>
@@ -123,6 +130,11 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
                     <TableRow key={row.name}>
                       <TableCell className="font-mono text-sm">{row.name}</TableCell>
                       {!secret && "value" in row && <TableCell className="font-mono text-sm break-all">{row.value}</TableCell>}
+                      {orgScope !== null && (
+                        <TableCell className="text-sm" title={row.repositories?.join(", ")}>
+                          {row.repositories === null ? "All" : `${row.repositories.length} selected`}
+                        </TableCell>
+                      )}
                       <TableCell className="font-mono text-xs text-fog" title={new Date(row.updatedAt).toLocaleString()}>
                         {new Date(row.updatedAt).toLocaleDateString()}
                       </TableCell>
@@ -190,6 +202,7 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
             )}
           </div>
         </div>
+        {orgScope !== null && <RepoAccess org={orgScope} value={repositories} onChange={setRepositories} id={id} />}
         {secret && <p className="field-help">Values are write-only. Saving a name that exists replaces its value.</p>}
         {problem?.field === "form" && (
           <p className="notice notice-error" role="alert">
