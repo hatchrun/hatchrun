@@ -2428,6 +2428,36 @@ pub async fn release_approval_holds(
     .await
 }
 
+/// Records the decision on attempt `attempt` of job `job_id` while it
+/// is queued and held for approval: the hold is cleared and the job is
+/// due at `now`. Returns whether it applied; a job that was decided
+/// already, is held for another reason or is on another attempt is left
+/// as it is.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn decide_approval(
+    db: &Db,
+    job_id: u64,
+    attempt: u32,
+    approved: bool,
+    login: &str,
+    now: u64,
+) -> Result<bool> {
+    let decision = if approved { "approved" } else { "rejected" };
+    Ok(db
+        .run(
+            "UPDATE ci_jobs SET approval_attempt = $2, approval_decision = $3, \
+             approval_by = $4, approval_at = $5, held = NULL, next_launch_at = $5, \
+             updated_at = $5 \
+             WHERE id = $1 AND attempt = $2 AND status = 'queued' AND held = 'approval'",
+            &params![job_id, attempt, decision, login, now],
+        )
+        .await?
+        == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use hatchrun_cloud::testdb::Db as TestDb;
@@ -3322,6 +3352,43 @@ mod tests {
             "UPDATE ci_jobs SET approval_attempt = $2, approval_decision = 'approved', \
              approval_by = 'octo', approval_at = 1 WHERE id = $1",
             &params![job_id, attempt_of_decision],
+        );
+    }
+
+    #[test]
+    fn a_decision_applies_once() {
+        let db = setup();
+        let (_, job) = run_with_job_named(&db, "decide", "queued");
+        set_held(&db, job, "approval", 5);
+        assert!(
+            !db.wait(decide_approval(db.db(), job, 2, true, "octo", 70))
+                .unwrap(),
+            "another attempt"
+        );
+        assert!(
+            db.wait(decide_approval(db.db(), job, 1, true, "octo", 70))
+                .unwrap()
+        );
+        assert_eq!(held_of(&db, job), None);
+        let row = db.wait(super::job(db.db(), job)).unwrap().unwrap();
+        assert_eq!(row.approval_attempt, Some(1));
+        assert_eq!(row.approval_decision.as_deref(), Some("approved"));
+        assert_eq!(row.approval_by.as_deref(), Some("octo"));
+        assert_eq!(row.approval_at, Some(70));
+        assert_eq!(row.next_launch_at, Some(70));
+        assert_eq!(row.updated_at, 70);
+        assert!(
+            !db.wait(decide_approval(db.db(), job, 1, false, "mona", 80))
+                .unwrap(),
+            "a second decision"
+        );
+        let row = db.wait(super::job(db.db(), job)).unwrap().unwrap();
+        assert_eq!(row.approval_by.as_deref(), Some("octo"));
+        let (_, card) = run_with_job_named(&db, "card", "queued");
+        set_held(&db, card, "card", 5);
+        assert!(
+            !db.wait(decide_approval(db.db(), card, 1, true, "octo", 70))
+                .unwrap()
         );
     }
 

@@ -21,6 +21,8 @@
 //! | `GET /api/ci/jobs/{job}/live` | read | WebSocket |
 //! | `POST /api/ci/repos/{owner}/{repo}/dispatch` | write, CSRF | `202` `{"runs": [..]}` |
 //! | `POST /api/ci/runs/{run}/cancel` | write, CSRF | `204` |
+//! | `POST /api/ci/jobs/{job}/approve` | org admin, CSRF | `204` |
+//! | `POST /api/ci/jobs/{job}/reject` | org admin, CSRF | `204` |
 //!
 //! The organization and repository settings routes are in
 //! [`crate::settings_api`]; they go through the same guard. Every
@@ -48,8 +50,10 @@ use worker::{
 
 use crate::access::{self, Access};
 use crate::env::{Settings, run_stub};
+use crate::environments::{self, Decision};
 use crate::github;
 use crate::intake::Repo;
+use crate::launches;
 use crate::run::RunState;
 use crate::runs::{self, Config as Loaded};
 use crate::settings_api::{self, SettingsRoute};
@@ -92,6 +96,10 @@ pub enum Route<'a> {
     Run(u64),
     /// Stop a run.
     Cancel(u64),
+    /// Let a job held for approval run.
+    Approve(u64),
+    /// Fail a job held for approval.
+    Reject(u64),
     /// A job's log.
     Log(u64),
     /// A job's log index.
@@ -105,7 +113,9 @@ impl Route<'_> {
     #[must_use]
     pub fn method(&self) -> Method {
         match self {
-            Route::Dispatch { .. } | Route::Cancel(_) => Method::Post,
+            Route::Dispatch { .. } | Route::Cancel(_) | Route::Approve(_) | Route::Reject(_) => {
+                Method::Post
+            }
             _ => Method::Get,
         }
     }
@@ -144,6 +154,8 @@ pub fn route(path: &str) -> Option<Route<'_>> {
         }),
         ["runs", run] => id(run).map(Route::Run),
         ["runs", run, "cancel"] => id(run).map(Route::Cancel),
+        ["jobs", job, "approve"] => id(job).map(Route::Approve),
+        ["jobs", job, "reject"] => id(job).map(Route::Reject),
         ["jobs", job, "log"] => id(job).map(Route::Log),
         ["jobs", job, "log", "index"] => id(job).map(Route::LogIndex),
         ["jobs", job, "live"] => id(job).map(Route::Live),
@@ -427,6 +439,15 @@ fn job_json(row: &JobRow, live: &BTreeMap<u64, Value>) -> Value {
         "completed_at": row.completed_at,
         "steps": live.get(&row.id).unwrap_or(&row.steps),
         "has_log": row.log_key.is_some(),
+        "held": row.held,
+        "environment": row.environment,
+        "approval": environments::decision(row).map(|decision| {
+            let (verdict, by) = match decision {
+                Decision::Approved(by) => ("approved", by),
+                Decision::Rejected(by) => ("rejected", by),
+            };
+            json!({ "decision": verdict, "by": by, "at": row.approval_at })
+        }),
     })
 }
 
@@ -565,6 +586,8 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
         Route::LogIndex(job) => cx.log_index(job).await,
         Route::Live(job) => cx.live(job, &req).await,
         Route::Cancel(run) => cx.cancel(run).await,
+        Route::Approve(job) => cx.decide(job, true).await,
+        Route::Reject(job) => cx.decide(job, false).await,
         Route::Dispatch { owner, repo } => cx.dispatch(owner, repo, &mut req).await,
     }
 }
@@ -823,6 +846,68 @@ impl Cx<'_> {
         no_content().map(Ok)
     }
 
+    /// Records an organization admin's decision on a job held for
+    /// approval. The decision applies to the attempt the job is on and
+    /// only once; a repeat answers `409`. Waking or ending the job can
+    /// fail after the decision is saved: that is logged and the answer
+    /// stays `204`, since the reconciler brings the job back.
+    async fn decide(&self, job_id: u64, approved: bool) -> Result<Served> {
+        let Some(session) = self.session else {
+            return Ok(stop(401, "sign in to approve or reject jobs"));
+        };
+        let (job, found) = match self.job(job_id).await? {
+            Ok(pair) => pair,
+            Err(stop) => return Ok(Err(stop)),
+        };
+        let org_login = found.repo.full_name.split('/').next().unwrap_or_default();
+        let org_id = match access::org_admin(self.settings, session, org_login).await {
+            Ok(org_id) => org_id,
+            Err(access::Failure::Retry(wait)) => {
+                return Ok(Err(Stop(
+                    503,
+                    "GitHub is rate limiting; try again shortly".to_owned(),
+                    Some(wait),
+                )));
+            }
+            Err(access::Failure::Worker(err)) => return Err(err),
+        };
+        let admin = match org_id {
+            Some(org_id) => store::tenant_by_org_id(self.db, org_id)
+                .await?
+                .is_some_and(|tenant| tenant.id == found.repo.tenant_id),
+            None => false,
+        };
+        if !admin {
+            return Ok(stop(
+                403,
+                format!("Only admins of {org_login} can approve or reject jobs"),
+            ));
+        }
+        let login = session.user.login.as_str();
+        if !store::decide_approval(self.db, job.id, job.attempt, approved, login, now_ms()).await? {
+            return Ok(stop(409, "This job is not waiting for approval"));
+        }
+        let ended = if approved {
+            let woken = [hatchrun_cloud::ci_wake::Woken {
+                job_id: job.id,
+                attempt: job.attempt,
+            }];
+            launches::send_wakes(self.env, &woken).await
+        } else {
+            launches::end_job(
+                self.env,
+                self.db,
+                &job,
+                &environments::rejected_message(login),
+            )
+            .await
+        };
+        if let Err(err) = ended {
+            console_error!("job {}: after the decision: {err}", job.id);
+        }
+        no_content().map(Ok)
+    }
+
     #[allow(clippy::too_many_lines)] // One request, read top to bottom.
     async fn dispatch(&self, owner: &str, name: &str, req: &mut Request) -> Result<Served> {
         let repo = match self.repo(owner, name, Access::Write).await? {
@@ -1028,6 +1113,8 @@ mod tests {
         assert_eq!(route("/api/ci/jobs/7/live"), Some(Route::Live(7)));
         assert_eq!(route("/api/ci/runs/12"), Some(Route::Run(12)));
         assert_eq!(route("/api/ci/runs/12/cancel"), Some(Route::Cancel(12)));
+        assert_eq!(route("/api/ci/jobs/5/approve"), Some(Route::Approve(5)));
+        assert_eq!(route("/api/ci/jobs/5/reject"), Some(Route::Reject(5)));
         assert_eq!(
             route("/api/ci/repos/acme/app.git-x/runs"),
             Some(Route::Runs {
@@ -1065,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn only_dispatch_and_cancel_post() {
+    fn posts_are_dispatch_cancel_and_decisions() {
         assert_eq!(
             route("/api/ci/runs/1/cancel").unwrap().method(),
             Method::Post
@@ -1074,6 +1161,9 @@ mod tests {
             route("/api/ci/repos/a/b/dispatch").unwrap().method(),
             Method::Post
         );
+        for path in ["/api/ci/jobs/1/approve", "/api/ci/jobs/1/reject"] {
+            assert_eq!(route(path).unwrap().method(), Method::Post);
+        }
         assert_eq!(route("/api/ci/runs/1").unwrap().method(), Method::Get);
         assert_eq!(route("/api/ci/jobs/1/live").unwrap().method(), Method::Get);
     }
@@ -1315,6 +1405,27 @@ workflows:
             "token_permissions": "{}", "secret_refs": "{\"all\":false,\"names\":[]}"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn job_json_shows_the_approval() {
+        let mut job = row(1, "queued", &json!([]));
+        job.held = Some("approval".into());
+        job.environment = Some("production".into());
+        let shown = job_json(&job, &BTreeMap::new());
+        assert_eq!(shown["held"], "approval");
+        assert_eq!(shown["environment"], "production");
+        assert_eq!(shown["approval"], Value::Null);
+        job.approval_attempt = Some(1);
+        job.approval_decision = Some("approved".into());
+        job.approval_by = Some("octo".into());
+        job.approval_at = Some(70);
+        assert_eq!(
+            job_json(&job, &BTreeMap::new())["approval"],
+            json!({ "decision": "approved", "by": "octo", "at": 70 })
+        );
+        job.approval_attempt = Some(0);
+        assert_eq!(job_json(&job, &BTreeMap::new())["approval"], Value::Null);
     }
 
     #[test]
