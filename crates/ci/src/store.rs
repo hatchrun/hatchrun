@@ -1393,6 +1393,171 @@ pub async fn sweep(db: &Db, now: u64) -> Result<Vec<u64>> {
     Ok(runs.into_iter().map(|row| row.id).collect())
 }
 
+// The warm pool (see `crate::pool`). Times are Unix milliseconds.
+
+/// The pool rows of template `$1`.
+const POOL_ROWS: &str = "SELECT instance_id, template, state, launched_at, since \
+     FROM ci_pool WHERE template = $1 ORDER BY launched_at, instance_id";
+
+/// Deletes the oldest ready row of template `$1` and returns its
+/// instance. A row another statement holds is skipped, so two jobs never
+/// take the same instance.
+const TAKE_POOL: &str = "DELETE FROM ci_pool WHERE instance_id = (\
+       SELECT instance_id FROM ci_pool WHERE template = $1 AND state = 'ready' \
+       ORDER BY launched_at, instance_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
+     RETURNING instance_id";
+
+/// Deletes the row of instance `$1`.
+const DROP_POOL: &str = "DELETE FROM ci_pool WHERE instance_id = $1";
+
+/// Moves instance `$1` from state `$2` to `$3` at `$4`.
+const MOVE_POOL: &str =
+    "UPDATE ci_pool SET state = $3, since = $4 WHERE instance_id = $1 AND state = $2";
+
+/// Sets the state of an existing row of instance `$1` to `$2`, since `$3`,
+/// in the pool of template `$4`.
+const UPDATE_POOL: &str =
+    "UPDATE ci_pool SET state = $2, since = $3 WHERE instance_id = $1 AND template = $4";
+
+/// Adds a launched instance.
+const INSERT_POOL: &str = "INSERT INTO ci_pool (instance_id, template, state, launched_at, since) \
+     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (instance_id) DO NOTHING";
+
+/// Jobs claimed since `$1`, by template and bucket of `$2` milliseconds.
+const CLAIMS_BY_BUCKET: &str = "SELECT template, started_at / $2 * $2 AS bucket, count(*) AS jobs \
+     FROM ci_jobs WHERE started_at >= $1 AND template IS NOT NULL \
+     GROUP BY template, started_at / $2";
+
+/// An instance of the warm pool.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PoolRow {
+    /// The EC2 instance id.
+    pub instance_id: String,
+    /// The template the instance is kept for, its first label.
+    pub template: String,
+    /// `warming`, `stopping` or `ready`.
+    pub state: String,
+    /// When it launched, in Unix milliseconds.
+    pub launched_at: u64,
+    /// When it entered its state, in Unix milliseconds.
+    pub since: u64,
+}
+
+/// The pool rows of `template`, oldest first.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn pool_rows(db: &Db, template: &str) -> Result<Vec<PoolRow>> {
+    db.all(POOL_ROWS, &params![template]).await
+}
+
+/// Deletes the oldest ready row of `template` and returns its instance:
+/// the job that took it owns it. `None` when none is ready.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn take_pool(db: &Db, template: &str) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Taken {
+        instance_id: String,
+    }
+    Ok(db
+        .first::<Taken>(TAKE_POOL, &params![template])
+        .await?
+        .map(|row| row.instance_id))
+}
+
+/// Deletes the row of `instance_id`. Returns whether it was there: when
+/// not, a job took the instance first and it is not the pool's to end.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn drop_pool(db: &Db, instance_id: &str) -> Result<bool> {
+    Ok(db.run(DROP_POOL, &params![instance_id]).await? == 1)
+}
+
+/// Moves the row of `instance_id` from state `from` to `to`. Returns
+/// whether it was in `from`: when not, a job took the instance first.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn move_pool(db: &Db, instance_id: &str, from: &str, to: &str, now: u64) -> Result<bool> {
+    Ok(db
+        .run(MOVE_POOL, &params![instance_id, from, to, now])
+        .await?
+        == 1)
+}
+
+/// Saves the pool of `template` after a pass: `rows` update the rows that
+/// still exist, and `launched` are added. A row a job took meanwhile is
+/// not brought back.
+///
+/// # Errors
+///
+/// Postgres refused a statement; none of them applies.
+pub async fn save_pool(
+    db: &Db,
+    template: &str,
+    rows: &[PoolRow],
+    launched: &[PoolRow],
+) -> Result<()> {
+    let mut statements: Vec<(&str, Vec<Param>)> = Vec::new();
+    for row in rows {
+        statements.push((
+            UPDATE_POOL,
+            params![
+                row.instance_id.as_str(),
+                row.state.as_str(),
+                row.since,
+                template
+            ],
+        ));
+    }
+    for row in launched {
+        statements.push((
+            INSERT_POOL,
+            params![
+                row.instance_id.as_str(),
+                template,
+                row.state.as_str(),
+                row.launched_at,
+                row.since
+            ],
+        ));
+    }
+    if !statements.is_empty() {
+        db.batch(&statements).await?;
+    }
+    Ok(())
+}
+
+/// Jobs claimed at or after `since`, as (template, start of the bucket,
+/// claims), the buckets [`crate::pool::BUCKET_MS`] long. A template is
+/// the label the job named, which may be any of its template's labels.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn claims_by_bucket(db: &Db, since: u64) -> Result<Vec<(String, u64, u64)>> {
+    #[derive(Deserialize)]
+    struct Count {
+        template: String,
+        bucket: u64,
+        jobs: u64,
+    }
+    let rows: Vec<Count> = db
+        .all(CLAIMS_BY_BUCKET, &params![since, crate::pool::BUCKET_MS])
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.template, row.bucket, row.jobs))
+        .collect())
+}
+
 // Secrets and vars. A secret's value is sealed (see `crate::secrets`);
 // a var's is plain text. `repo_id` None is the organization's row.
 
@@ -1816,6 +1981,163 @@ mod tests {
         db.wait(set_job(db.db(), job_id, status, None, 1_001))
             .unwrap();
         (run, job_id)
+    }
+
+    fn pool_row(id: &str, template: &str, state: &str, launched_at: u64) -> PoolRow {
+        PoolRow {
+            instance_id: id.into(),
+            template: template.into(),
+            state: state.into(),
+            launched_at,
+            since: launched_at,
+        }
+    }
+
+    fn save(db: &TestDb, template: &str, rows: &[PoolRow], launched: &[PoolRow]) {
+        db.wait(save_pool(db.db(), template, rows, launched))
+            .unwrap();
+    }
+
+    #[test]
+    fn take_pool_takes_ready_only() {
+        let db = setup();
+        save(
+            &db,
+            "ubuntu-latest",
+            &[],
+            &[pool_row("i-warm", "ubuntu-latest", "warming", 1)],
+        );
+        assert_eq!(
+            db.wait(take_pool(db.db(), "ubuntu-latest")).unwrap(),
+            None,
+            "a warming row is not ready"
+        );
+        save(
+            &db,
+            "ubuntu-latest",
+            &[],
+            &[
+                pool_row("i-b", "ubuntu-latest", "ready", 20),
+                pool_row("i-a", "ubuntu-latest", "ready", 10),
+            ],
+        );
+        save(
+            &db,
+            "ubuntu-26.04-8core",
+            &[],
+            &[pool_row("i-other", "ubuntu-26.04-8core", "ready", 1)],
+        );
+        let taken = |db: &TestDb| db.wait(take_pool(db.db(), "ubuntu-latest")).unwrap();
+        assert_eq!(taken(&db).as_deref(), Some("i-a"));
+        assert_eq!(taken(&db).as_deref(), Some("i-b"));
+        assert_eq!(taken(&db), None);
+        let left = db.wait(pool_rows(db.db(), "ubuntu-latest")).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].instance_id, "i-warm");
+    }
+
+    #[test]
+    fn trim_skips_a_taken_instance() {
+        let db = setup();
+        save(
+            &db,
+            "ubuntu-latest",
+            &[],
+            &[pool_row("i-1", "ubuntu-latest", "ready", 1)],
+        );
+        assert_eq!(
+            db.wait(take_pool(db.db(), "ubuntu-latest"))
+                .unwrap()
+                .as_deref(),
+            Some("i-1")
+        );
+        assert!(!db.wait(drop_pool(db.db(), "i-1")).unwrap());
+    }
+
+    #[test]
+    fn a_warming_row_moves_to_stopping_once() {
+        let db = setup();
+        save(
+            &db,
+            "ubuntu-latest",
+            &[],
+            &[pool_row("i-1", "ubuntu-latest", "warming", 1)],
+        );
+        let to_stopping = |db: &TestDb| {
+            db.wait(move_pool(db.db(), "i-1", "warming", "stopping", 9))
+                .unwrap()
+        };
+        assert!(to_stopping(&db));
+        assert!(!to_stopping(&db));
+        let rows = db.wait(pool_rows(db.db(), "ubuntu-latest")).unwrap();
+        assert_eq!((rows[0].state.as_str(), rows[0].since), ("stopping", 9));
+    }
+
+    #[test]
+    fn save_pool_never_brings_back_a_taken_row() {
+        let db = setup();
+        save(
+            &db,
+            "ubuntu-latest",
+            &[],
+            &[
+                pool_row("i-1", "ubuntu-latest", "ready", 1),
+                pool_row("i-2", "ubuntu-latest", "warming", 2),
+            ],
+        );
+        let before = db.wait(pool_rows(db.db(), "ubuntu-latest")).unwrap();
+        assert_eq!(before.len(), 2);
+        // A job takes i-1 while the pass works on its copy.
+        assert_eq!(
+            db.wait(take_pool(db.db(), "ubuntu-latest"))
+                .unwrap()
+                .as_deref(),
+            Some("i-1")
+        );
+        let mut stopping = pool_row("i-2", "ubuntu-latest", "stopping", 2);
+        stopping.since = 50;
+        save(
+            &db,
+            "ubuntu-latest",
+            &[pool_row("i-1", "ubuntu-latest", "ready", 1), stopping],
+            &[pool_row("i-3", "ubuntu-latest", "warming", 60)],
+        );
+        let rows = db.wait(pool_rows(db.db(), "ubuntu-latest")).unwrap();
+        let ids: Vec<_> = rows.iter().map(|row| row.instance_id.as_str()).collect();
+        assert_eq!(ids, ["i-2", "i-3"], "i-1 stays gone");
+        assert_eq!((rows[0].state.as_str(), rows[0].since), ("stopping", 50));
+    }
+
+    #[test]
+    fn claims_by_bucket_groups_by_template() {
+        let db = setup();
+        let claimed = |delivery: &str, template: &str, started_at: u64| {
+            let (_, job) = run_with_job_named(&db, delivery, "queued");
+            db.run(
+                "UPDATE ci_jobs SET template = $2, started_at = $3 WHERE id = $1",
+                &params![job, template, started_at],
+            );
+        };
+        claimed("a", "ubuntu-latest", 600_001);
+        claimed("b", "ubuntu-latest", 899_999);
+        claimed("c", "ubuntu-latest", 900_000);
+        claimed("d", "ubuntu-26.04-8core", 650_000);
+        claimed("e", "ubuntu-latest", 100_000);
+        let (_, never) = run_with_job_named(&db, "f", "queued");
+        db.run(
+            "UPDATE ci_jobs SET template = 'ubuntu-latest' WHERE id = $1",
+            &params![never],
+        );
+        let mut found = db.wait(claims_by_bucket(db.db(), 600_000)).unwrap();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("ubuntu-26.04-8core".to_owned(), 600_000, 1),
+                ("ubuntu-latest".to_owned(), 600_000, 2),
+                ("ubuntu-latest".to_owned(), 900_000, 1),
+            ]
+        );
     }
 
     #[test]

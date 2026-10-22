@@ -9,6 +9,9 @@
 //! with an `oidc.hatchrun.io` token whose subject is `tenant:hatchrun-ci`
 //! and starts instances of the built-in profile of the job's runner
 //! template (see [`profile_for`]), one fresh on-demand instance per job.
+//! A job may instead take a stopped instance of the warm pool
+//! ([`crate::pool`]), which [`Backend::start_pooled`] hands the job's
+//! user data and tags and starts.
 //!
 //! [`Backend::Local`] calls a launcher daemon on the developer's machine
 //! (`hatchrun-ci-dev launcher`), since a Worker cannot start processes.
@@ -106,6 +109,10 @@ fn kind_for(launcher: &str, deploy_env: &str, has_local: bool) -> Result<Kind, S
     }
 }
 
+/// What the local launcher answers to every pool call.
+#[cfg(any(test, hatchrun_local_launcher))]
+const NO_LOCAL_POOL: &str = "the local launcher has no pool";
+
 /// A way to start instances.
 pub enum Backend {
     /// The CI AWS account.
@@ -143,6 +150,75 @@ impl Backend {
             #[cfg(any(test, hatchrun_local_launcher))]
             Backend::Local(local) => local.launch(spec).await,
         }
+    }
+
+    /// Starts a warm pool instance of `template` with no user data and
+    /// tags it as a pool instance, so its agent finds nothing to run. It
+    /// holds no job and no ticket until [`Backend::start_pooled`].
+    ///
+    /// # Errors
+    ///
+    /// A [`Failure`] with the cause the retry rules act on. The local
+    /// launcher has no pool and always fails.
+    pub async fn launch_pool(
+        &self,
+        db: &Db,
+        template: &'static Template,
+        name: &str,
+    ) -> Result<String, Failure> {
+        match self {
+            Backend::Ec2(ec2) => ec2.launch_pool(db, template, name).await,
+            #[cfg(any(test, hatchrun_local_launcher))]
+            Backend::Local(_) => Err(Failure::new(Cause::Internal, NO_LOCAL_POOL)),
+        }
+    }
+
+    /// Hands the stopped pool instance `instance_id` to the job of
+    /// `spec` and starts it: the job's user data and tags are set while
+    /// it is stopped, and its pool tag is deleted.
+    ///
+    /// # Errors
+    ///
+    /// The step that failed and what EC2 answered, as a [`Failure`]. The
+    /// instance is in an unknown state and the caller terminates it.
+    pub async fn start_pooled(&self, instance_id: &str, spec: &LaunchSpec) -> Result<(), Failure> {
+        match self {
+            Backend::Ec2(ec2) => ec2.start_pooled(instance_id, spec).await,
+            #[cfg(any(test, hatchrun_local_launcher))]
+            Backend::Local(_) => Err(Failure::new(Cause::Internal, NO_LOCAL_POOL)),
+        }
+    }
+
+    /// Stops the instance.
+    ///
+    /// # Errors
+    ///
+    /// What the backend answered.
+    pub async fn stop(&self, instance_id: &str) -> Result<(), String> {
+        match self {
+            Backend::Ec2(ec2) => ec2.stop(instance_id).await,
+            #[cfg(any(test, hatchrun_local_launcher))]
+            Backend::Local(_) => Err(NO_LOCAL_POOL.to_owned()),
+        }
+    }
+
+    /// The warm pool instances, running or stopped, of every template.
+    ///
+    /// # Errors
+    ///
+    /// What the backend answered.
+    pub async fn pool_instances(&self) -> Result<Vec<instances::Described>, String> {
+        match self {
+            Backend::Ec2(ec2) => ec2.pool_instances().await,
+            #[cfg(any(test, hatchrun_local_launcher))]
+            Backend::Local(_) => Err(NO_LOCAL_POOL.to_owned()),
+        }
+    }
+
+    /// Whether this backend keeps a warm pool.
+    #[must_use]
+    pub fn has_pool(&self) -> bool {
+        matches!(self, Backend::Ec2(_))
     }
 
     /// Turns the instance's metadata endpoint off.
@@ -227,6 +303,15 @@ struct CachedCredentials {
 thread_local! {
     static CREDENTIALS: std::cell::RefCell<Option<CachedCredentials>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// One instance to start.
+struct Start<'a> {
+    template: &'static Template,
+    name: &'a str,
+    user_data: &'a str,
+    tags: &'a [(&'a str, &'a str)],
+    log_id: &'a str,
 }
 
 /// Instances in the CI AWS account.
@@ -336,9 +421,87 @@ impl Ec2 {
         send(&request).await
     }
 
+    /// The failure for credentials the CI role could not be assumed with.
+    fn credentials_failure(&self, err: &aws::Error) -> Failure {
+        let cause = if err.code == "Unreachable" {
+            Cause::Unreachable
+        } else {
+            Cause::Aws(err.code.clone())
+        };
+        Failure::new(
+            cause,
+            format!(
+                "AssumeRoleWithWebIdentity {}: {err}",
+                self.settings.ci_role_arn
+            ),
+        )
+    }
+
     async fn launch(&self, db: &Db, spec: &LaunchSpec) -> Result<String, Failure> {
+        let credentials = self
+            .credentials(&format!("hatchrun-ci-{}", spec.job_id))
+            .await
+            .map_err(|err| self.credentials_failure(&err))?;
+        let job_id = spec.job_id.to_string();
+        let tags = [
+            (ec2::TAG_TENANT, TENANT),
+            (ec2::TAG_JOB_ID, job_id.as_str()),
+            (ec2::TAG_RUNNER_NAME, spec.name.as_str()),
+        ];
+        self.start(
+            db,
+            &credentials,
+            Start {
+                template: spec.template,
+                name: &spec.name,
+                user_data: &spec.user_data,
+                tags: &tags,
+                log_id: &format!("job {job_id}"),
+            },
+        )
+        .await
+    }
+
+    async fn launch_pool(
+        &self,
+        db: &Db,
+        template: &'static Template,
+        name: &str,
+    ) -> Result<String, Failure> {
+        // Pool launches are not for one job: they share the isolate's
+        // credentials and cost no token exchange each.
+        let credentials = self
+            .shared_credentials()
+            .await
+            .map_err(|err| self.credentials_failure(&err))?;
+        let tags = [
+            (ec2::TAG_TENANT, TENANT),
+            (ec2::TAG_POOL, template.labels[0]),
+            ("Name", name),
+        ];
+        self.start(
+            db,
+            &credentials,
+            Start {
+                template,
+                name,
+                user_data: "",
+                tags: &tags,
+                log_id: &format!("pool {name}"),
+            },
+        )
+        .await
+    }
+
+    /// Starts an instance of `start.template`'s profile.
+    async fn start(
+        &self,
+        db: &Db,
+        credentials: &Credentials,
+        start: Start<'_>,
+    ) -> Result<String, Failure> {
         let region = self.settings.ci_region.as_str();
-        let profile = profile_for(spec.template);
+        let profile = profile_for(start.template);
         let choice = choose(
             &profile,
             region,
@@ -352,44 +515,103 @@ impl Ec2 {
             .await
             .map_err(|err| Failure::new(Cause::Internal, err.to_string()))?
             .ok_or_else(|| Failure::new(Cause::NoImage, format!("no {arch} image in {region}")))?;
-        let credentials = self
-            .credentials(&format!("hatchrun-ci-{}", spec.job_id))
-            .await
-            .map_err(|err| {
-                let cause = if err.code == "Unreachable" {
-                    Cause::Unreachable
-                } else {
-                    Cause::Aws(err.code.clone())
-                };
-                Failure::new(
-                    cause,
-                    format!(
-                        "AssumeRoleWithWebIdentity {}: {err}",
-                        self.settings.ci_role_arn
-                    ),
-                )
-            })?;
-        let job_id = spec.job_id.to_string();
-        let log_id = format!("job {job_id}");
-        let tags = [
-            (ec2::TAG_TENANT, TENANT),
-            (ec2::TAG_JOB_ID, job_id.as_str()),
-            (ec2::TAG_RUNNER_NAME, spec.name.as_str()),
-        ];
         start_instance(
             db,
-            &self.target(&credentials),
+            &self.target(credentials),
             &Instance {
-                name: &spec.name,
+                name: start.name,
                 choice: &choice,
                 image_id: &image.image_id,
                 root_device: &image.root_device,
-                user_data: &spec.user_data,
-                tags: &tags,
-                log_id: &log_id,
+                user_data: start.user_data,
+                tags: start.tags,
+                log_id: start.log_id,
             },
         )
         .await
+    }
+
+    /// Sends one EC2 call and turns a refusal into the failure of `step`.
+    async fn step(
+        &self,
+        credentials: &Credentials,
+        step: &str,
+        request: Request,
+    ) -> Result<(), Failure> {
+        let response = self
+            .call(credentials, request)
+            .await
+            .map_err(|err| Failure::new(Cause::Unreachable, format!("{step}: {err}")))?;
+        if response.ok() {
+            Ok(())
+        } else {
+            Err(Failure::new(
+                Cause::Internal,
+                format!(
+                    "{step}: EC2 answered {}: {}",
+                    response.status,
+                    response.text()
+                ),
+            ))
+        }
+    }
+
+    async fn start_pooled(&self, instance_id: &str, spec: &LaunchSpec) -> Result<(), Failure> {
+        let credentials = self
+            .shared_credentials()
+            .await
+            .map_err(|err| self.credentials_failure(&err))?;
+        let endpoint = self.endpoint();
+        let job_id = spec.job_id.to_string();
+        // User data and tags change while the instance is stopped; the
+        // pool tag goes before the start so no pass takes the instance
+        // for the pool again.
+        self.step(
+            &credentials,
+            "ModifyInstanceAttribute",
+            ec2::set_user_data(&endpoint, instance_id, &spec.user_data),
+        )
+        .await?;
+        self.step(
+            &credentials,
+            "CreateTags",
+            ec2::create_tags(
+                &endpoint,
+                instance_id,
+                &[
+                    (ec2::TAG_JOB_ID, job_id.as_str()),
+                    (ec2::TAG_RUNNER_NAME, spec.name.as_str()),
+                    ("Name", spec.name.as_str()),
+                ],
+            ),
+        )
+        .await?;
+        self.step(
+            &credentials,
+            "DeleteTags",
+            ec2::delete_tags(&endpoint, instance_id, &[ec2::TAG_POOL]),
+        )
+        .await?;
+        self.step(
+            &credentials,
+            "StartInstances",
+            ec2::start_instances(&endpoint, instance_id),
+        )
+        .await
+    }
+
+    async fn stop(&self, instance_id: &str) -> Result<(), String> {
+        let credentials = self
+            .shared_credentials()
+            .await
+            .map_err(|err| err.to_string())?;
+        self.step(
+            &credentials,
+            "StopInstances",
+            ec2::stop_instances(&self.endpoint(), instance_id),
+        )
+        .await
+        .map_err(|failure| failure.message)
     }
 
     async fn metadata_off(&self, instance_id: &str) -> Result<(), String> {
@@ -448,6 +670,18 @@ impl Ec2 {
     }
 
     async fn instances(&self) -> Result<Vec<instances::Described>, String> {
+        self.describe_all(instances::describe).await
+    }
+
+    async fn pool_instances(&self) -> Result<Vec<instances::Described>, String> {
+        self.describe_all(instances::describe_pool).await
+    }
+
+    /// Every page of the instances `describe` asks for.
+    async fn describe_all(
+        &self,
+        describe: fn(&str, &str, Option<&str>) -> Request,
+    ) -> Result<Vec<instances::Described>, String> {
         let credentials = self
             .shared_credentials()
             .await
@@ -457,10 +691,7 @@ impl Ec2 {
         let mut next = None;
         loop {
             let response = self
-                .call(
-                    &credentials,
-                    instances::describe(&endpoint, TENANT, next.as_deref()),
-                )
+                .call(&credentials, describe(&endpoint, TENANT, next.as_deref()))
                 .await?;
             let (page, token) = instances::described(&response).map_err(|err| err.to_string())?;
             all.extend(page);
@@ -571,6 +802,7 @@ impl Local {
                 launch_time: item.launch_time,
                 job_id: item.job_id,
                 runner_name: item.runner_name,
+                pool: None,
             })
             .collect())
     }

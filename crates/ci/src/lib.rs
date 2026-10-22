@@ -34,6 +34,7 @@ pub mod launcher;
 pub mod launches;
 pub mod logs;
 pub mod planning;
+pub mod pool;
 pub mod reconcile;
 pub mod run;
 pub mod runs;
