@@ -111,7 +111,7 @@ pub async fn run_job(
     StepFiles::reset(&layout.temp)?;
     let owner = opts.runner_user.as_deref().map(owner_of).transpose()?;
     // Opened before any step runs and never handed to the runner user.
-    let actions = action::ActionCache::open(&layout.actions)?;
+    let actions = action::ActionCache::open(&layout.actions, &opts.state_dir)?;
     if let Some(owner) = owner {
         for path in runner_dirs(&layout, &event) {
             // The link itself, never what it points at.

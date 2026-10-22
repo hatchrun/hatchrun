@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::hash::{BuildHasher, Hasher};
 use std::io::Read;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
 use super::archive::extract_tar_gz;
-use super::builtin::{remove_tree, to_mode};
+use super::builtin::{mode_bits, remove_tree, to_mode};
 use super::layout::Layout;
 use super::pack::{kind_of, open_dir};
 
@@ -238,6 +238,9 @@ fn is_name(s: &str) -> bool {
 /// paths, so a link a step plants cannot send a later fetch elsewhere.
 pub struct ActionCache {
     root: CacheDir,
+    /// `<state dir>/stage`, where archives are downloaded and extracted.
+    /// Every directory down to it is closed to the runner user.
+    stage: CacheDir,
 }
 
 /// A cache directory: its descriptor, and its path for display and for
@@ -249,17 +252,6 @@ struct CacheDir {
 }
 
 impl CacheDir {
-    /// A path that reaches `name` in this directory through its
-    /// descriptor where the platform has one, so extraction keeps
-    /// writing here even if the directory is renamed meanwhile.
-    fn path_of(&self, name: &str) -> PathBuf {
-        if cfg!(target_os = "linux") {
-            PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd())).join(name)
-        } else {
-            self.path.join(name)
-        }
-    }
-
     /// Opens the root-owned directory `name` below this one, creating
     /// it when missing. A link or file in its place is removed, never
     /// followed. The second value says whether it was created.
@@ -307,14 +299,19 @@ impl CacheDir {
 }
 
 impl ActionCache {
-    /// Opens `path`, creating it when missing. It must be a directory
-    /// the agent owns that no one else can write, which it makes sure of.
+    /// Opens `path`, creating it when missing, and the stage below
+    /// `state_dir`. `path` must be a directory the agent owns that no one
+    /// else can write, which it makes sure of.
     ///
     /// # Errors
     ///
     /// When `path` is a link, is not a directory, or belongs to someone
-    /// else.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// else, or the stage cannot be opened.
+    pub fn open(path: &Path, state_dir: &Path) -> Result<Self> {
+        let stage = CacheDir {
+            fd: Arc::new(super::builtin::open_stage(state_dir)?),
+            path: state_dir.join("stage"),
+        };
         std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
         let fd = open_dir(&nix::fcntl::AT_FDCWD, path).with_context(|| {
             format!(
@@ -333,6 +330,7 @@ impl ActionCache {
                 fd: Arc::new(fd),
                 path: path.to_owned(),
             },
+            stage,
         })
     }
 }
@@ -364,7 +362,8 @@ pub async fn fetch_with(
             let (repo_dir, _) = owner_dir.child(repo)?;
             let (key_dir, created) = repo_dir.child(&key)?;
             if !key_dir.is_complete()
-                && let Err(e) = download(github, owner, repo, git_ref, &key_dir, limits).await
+                && let Err(e) =
+                    download(github, owner, repo, git_ref, &key_dir, &cache.stage, limits).await
             {
                 if created {
                     remove_tree(&repo_dir.fd, OsStr::new(&key));
@@ -415,69 +414,46 @@ fn cache_key(git_ref: &str) -> String {
 }
 
 /// Downloads `owner/repo@git_ref` into the cache entry `key`. The
-/// extraction happens in a fresh temp directory inside `key` and the
-/// extracted tree is renamed into place, so a half-extracted action is
-/// never reused. `key` is root's: no directory above the temp one is
-/// ever handed to the runner user.
+/// archive is downloaded and extracted in the stage, which only the
+/// agent can write, and the extracted tree is moved into `key` by
+/// descriptor, so a half-extracted action is never reused and no path
+/// under the work directory is ever used to write. `key` is root's: no
+/// directory above the tree is ever handed to the runner user.
 async fn download(
     github: &Github,
     owner: &str,
     repo: &str,
     git_ref: &str,
     key: &CacheDir,
+    stage: &CacheDir,
     limits: Limits,
 ) -> Result<()> {
-    let (name, tmp) = make_temp(key)?;
-    let result = fill(github, owner, repo, git_ref, key, &tmp, limits).await;
-    remove_tree(&key.fd, OsStr::new(&name));
+    let name = format!("action-{}", super::random_name().map_err(|e| anyhow!(e))?);
+    nix::sys::stat::mkdirat(&*stage.fd, name.as_str(), to_mode(0o700))
+        .with_context(|| format!("create a directory in {}", stage.path.display()))?;
+    let result = fill(github, owner, repo, git_ref, key, stage, &name, limits).await;
+    remove_tree(&stage.fd, OsStr::new(&name));
     result
 }
 
-/// Creates a directory in `key` that no cache key can be named like:
-/// keys never start with `%tmp`.
-fn make_temp(key: &CacheDir) -> Result<(String, CacheDir)> {
-    use nix::errno::Errno;
-    for _ in 0..16 {
-        let name = format!(
-            "%tmp-{:016x}",
-            std::hash::RandomState::new().build_hasher().finish()
-        );
-        match nix::sys::stat::mkdirat(&*key.fd, name.as_str(), to_mode(0o755)) {
-            Ok(()) => {}
-            Err(Errno::EEXIST) => continue,
-            Err(e) => return Err(e).context("create temp directory"),
-        }
-        let fd = open_dir(&*key.fd, name.as_str()).context("open temp directory")?;
-        // The steps run as another user and need to read the tree.
-        nix::sys::stat::fchmod(&fd, to_mode(0o755)).context("set mode on temp directory")?;
-        let path = key.path.join(&name);
-        return Ok((
-            name,
-            CacheDir {
-                fd: Arc::new(fd),
-                path,
-            },
-        ));
-    }
-    bail!(
-        "could not create a temp directory in {}",
-        key.path.display()
-    )
-}
-
-/// Downloads and extracts into `tmp`, then moves the tree to `key`.
+/// Downloads and extracts into the stage directory `name`, then moves
+/// the tree to `key`.
+#[allow(clippy::too_many_arguments)]
 async fn fill(
     github: &Github,
     owner: &str,
     repo: &str,
     git_ref: &str,
     key: &CacheDir,
-    tmp: &CacheDir,
+    stage: &CacheDir,
+    name: &str,
     limits: Limits,
 ) -> Result<()> {
     let label = format!("{owner}/{repo}@{git_ref}");
-    let archive = tmp.path_of("download.tgz");
-    let tree = tmp.path_of(TREE);
+    let work = stage.path.join(name);
+    let held = open_dir(&*stage.fd, name).context("open the stage directory")?;
+    let archive = work.join("download.tgz");
+    let tree = work.join(TREE);
 
     let url = format!(
         "{}/repos/{owner}/{repo}/tarball/{git_ref}",
@@ -507,24 +483,16 @@ async fn fill(
         }
     }
 
-    let (archive_path, expanded, owner) = (archive.clone(), limits.expanded, limits.owner);
+    let (archive_path, expanded) = (archive.clone(), limits.expanded);
     let extract_into = tree.clone();
-    // The task may outlive this future, and the paths name the temp
-    // directory by descriptor number: keep the descriptor open for it.
-    let hold = Arc::clone(&tmp.fd);
     // Dropping this future, as a cancelled job does, stops the blocking
     // extraction too.
     let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
     let flag = Arc::clone(&stop.0);
     tokio::task::spawn_blocking(move || {
-        let _hold = hold;
         let file = std::fs::File::open(&archive_path)?;
         extract_tar_gz(file, &extract_into, 1, expanded, &flag)?;
         open_for_reading(&extract_into)?;
-        // Only the tree goes to the runner user, never a directory above it.
-        if let Some(owner) = owner {
-            chown_tree(&extract_into, owner)?;
-        }
         anyhow::Ok(())
     })
     .await
@@ -536,8 +504,12 @@ async fn fill(
     // the marker was finished by a concurrent job.
     if !key.is_complete() {
         remove_tree(&key.fd, OsStr::new(TREE));
-        nix::fcntl::renameat(&*tmp.fd, TREE, &*key.fd, TREE)
-            .with_context(|| format!("move {label} into place"))?;
+        move_tree(&held, &key.fd).with_context(|| format!("move {label} into place"))?;
+        // Only the tree goes to the runner user, never a directory above it.
+        if let Some(owner) = limits.owner {
+            let tree_fd = open_dir(&*key.fd, TREE)?;
+            chown_tree(&tree_fd, owner).with_context(|| format!("chown {label}"))?;
+        }
         match nix::fcntl::openat(
             &*key.fd,
             COMPLETE,
@@ -550,6 +522,81 @@ async fn fill(
         ) {
             Ok(_) | Err(nix::errno::Errno::EEXIST) => {}
             Err(e) => return Err(e).context("write the completion marker"),
+        }
+    }
+    Ok(())
+}
+
+/// Moves the `tree` directory of `from` to `tree` in `to`. When the two
+/// are on different filesystems it copies by descriptor instead.
+fn move_tree(from: &OwnedFd, to: &OwnedFd) -> Result<()> {
+    match nix::fcntl::renameat(from, TREE, to, TREE) {
+        Ok(()) => Ok(()),
+        Err(nix::errno::Errno::EXDEV) => {
+            let src = open_dir(from, TREE)?;
+            nix::sys::stat::mkdirat(to, TREE, to_mode(0o755))?;
+            let dst = open_dir(to, TREE)?;
+            copy_tree(&src, &dst)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Copies everything in `src` into `dst`, both open directories, one
+/// name at a time with `O_NOFOLLOW`. Links are copied as links.
+fn copy_tree(src: &OwnedFd, dst: &OwnedFd) -> Result<()> {
+    use nix::fcntl::{AtFlags, OFlag, openat, readlinkat};
+    use nix::sys::stat::{SFlag, fchmod, fstat, fstatat, mkdirat};
+
+    fchmod(dst, to_mode(mode_bits(fstat(src)?.st_mode & 0o7777)))?;
+    let mut listing = nix::dir::Dir::openat(
+        src,
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )?;
+    let mut names = Vec::new();
+    for entry in listing.iter() {
+        let name = entry?.file_name().to_bytes().to_vec();
+        if name != b"." && name != b".." {
+            names.push(OsStr::from_bytes(&name).to_owned());
+        }
+    }
+    for name in names {
+        let stat = fstatat(src, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
+        match kind_of(stat.st_mode) {
+            SFlag::S_IFDIR => {
+                mkdirat(dst, name.as_os_str(), to_mode(0o755))?;
+                copy_tree(&open_dir(src, &name)?, &open_dir(dst, &name)?)?;
+            }
+            SFlag::S_IFREG => {
+                let from = openat(
+                    src,
+                    name.as_os_str(),
+                    OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::empty(),
+                )?;
+                let to = openat(
+                    dst,
+                    name.as_os_str(),
+                    OFlag::O_WRONLY
+                        | OFlag::O_CREAT
+                        | OFlag::O_EXCL
+                        | OFlag::O_NOFOLLOW
+                        | OFlag::O_CLOEXEC,
+                    to_mode(0o600),
+                )?;
+                fchmod(&to, to_mode(mode_bits(stat.st_mode & 0o7777)))?;
+                std::io::copy(&mut std::fs::File::from(from), &mut std::fs::File::from(to))?;
+            }
+            SFlag::S_IFLNK => {
+                let target = readlinkat(src, name.as_os_str())?;
+                nix::unistd::symlinkat(target.as_os_str(), dst, name.as_os_str())?;
+            }
+            _ => bail!(
+                "{} is not a file, directory or link",
+                Path::new(&name).display()
+            ),
         }
     }
     Ok(())
@@ -580,26 +627,50 @@ fn open_for_reading(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Hands `dir` and everything under it to `owner`. Links are handed over
+/// Hands the open directory `dir` and everything under it to `owner`.
+/// The walk goes one name at a time through descriptors with
+/// `O_NOFOLLOW`, so a runner process that swaps a subdirectory for a
+/// link while it runs cannot redirect it. Links are handed over
 /// themselves, never what they point at, and are not walked into.
-fn chown_tree(dir: &Path, owner: (nix::unistd::Uid, nix::unistd::Gid)) -> Result<()> {
-    let give = |path: &Path| {
+fn chown_tree(dir: &OwnedFd, owner: (nix::unistd::Uid, nix::unistd::Gid)) -> Result<()> {
+    use nix::fcntl::{AtFlags, OFlag};
+    use nix::sys::stat::{Mode, SFlag, fstatat};
+
+    let give = |parent: &OwnedFd, name: &OsStr| {
         nix::unistd::fchownat(
-            nix::fcntl::AT_FDCWD,
-            path,
+            parent,
+            name,
             Some(owner.0),
             Some(owner.1),
-            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            AtFlags::AT_SYMLINK_NOFOLLOW,
         )
-        .with_context(|| format!("chown {}", path.display()))
+        .with_context(|| format!("chown {}", Path::new(name).display()))
     };
-    give(dir)?;
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            chown_tree(&entry.path(), owner)?;
+    nix::unistd::fchown(dir, Some(owner.0), Some(owner.1)).context("chown the tree")?;
+    let mut listing = nix::dir::Dir::openat(
+        dir,
+        ".",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .context("read the tree")?;
+    let mut names = Vec::new();
+    for entry in listing.iter() {
+        let name = entry?.file_name().to_bytes().to_vec();
+        if name != b"." && name != b".." {
+            names.push(OsStr::from_bytes(&name).to_owned());
+        }
+    }
+    for name in names {
+        let stat = fstatat(dir, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
+        if kind_of(stat.st_mode) == SFlag::S_IFDIR {
+            // Fails when the name no longer is a directory, which is
+            // all a swap can achieve.
+            let child = open_dir(dir, &name)
+                .with_context(|| format!("open {}", Path::new(&name).display()))?;
+            chown_tree(&child, owner)?;
         } else {
-            give(&entry.path())?;
+            give(dir, &name)?;
         }
     }
     Ok(())
@@ -945,7 +1016,7 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent/target", tree.join("dangling")).unwrap();
         std::os::unix::fs::symlink(dir.path(), tree.join("a/up")).unwrap();
         let me = (nix::unistd::getuid(), nix::unistd::getgid());
-        chown_tree(&tree, me).unwrap();
+        chown_tree(&open_dir(&nix::fcntl::AT_FDCWD, &tree).unwrap(), me).unwrap();
         // Still the same tree, links intact.
         assert!(
             fs::symlink_metadata(tree.join("dangling"))
@@ -980,7 +1051,9 @@ mod tests {
     }
 
     fn cache(layout: &Layout) -> ActionCache {
-        ActionCache::open(&layout.actions).unwrap()
+        // The stage path must hold no links, which macOS temp dirs do.
+        let state = layout.work.canonicalize().unwrap().join("state");
+        ActionCache::open(&layout.actions, &state).unwrap()
     }
 
     fn fast() -> Limits {
@@ -1243,6 +1316,66 @@ mod tests {
             !fs::symlink_metadata(layout.actions.join(link_at))
                 .unwrap()
                 .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_swapped_cache_directory_does_not_redirect_a_fetch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball(&[("o-r-abc/action.yml", NODE_YML)])),
+            )
+            .mount(&server)
+            .await;
+        let work = tempfile::tempdir().unwrap();
+        let layout = Layout::new(work.path(), "o/r", Path::new("/tc"));
+        let held = cache(&layout);
+        // A step moves the cache away and puts a link in its place.
+        let outside = tempfile::tempdir().unwrap();
+        let moved = work.path().join("moved");
+        fs::rename(&layout.actions, &moved).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &layout.actions).unwrap();
+        fetch_with(
+            &remote("o", "r", "", "v1"),
+            &github(&server.uri()),
+            &layout,
+            &held,
+            fast(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(moved.join("o/r/v1/tree/action.yml").is_file());
+        // Nothing is left in the stage.
+        assert_eq!(
+            fs::read_dir(work.path().join("state/stage"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn copy_tree_copies_by_descriptor_and_keeps_links() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        fs::create_dir_all(a.join("d")).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("d/f"), "x").unwrap();
+        fs::set_permissions(a.join("d/f"), fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", a.join("link")).unwrap();
+        let open = |p: &Path| open_dir(&nix::fcntl::AT_FDCWD, p).unwrap();
+        copy_tree(&open(&a), &open(&b)).unwrap();
+        assert_eq!(fs::read_to_string(b.join("d/f")).unwrap(), "x");
+        assert_eq!(
+            fs::metadata(b.join("d/f")).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read_link(b.join("link")).unwrap(),
+            Path::new("/nonexistent")
         );
     }
 
