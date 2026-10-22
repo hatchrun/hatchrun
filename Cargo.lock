@@ -1493,6 +1493,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hatchrun-ci"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "flate2",
+ "futures-util",
+ "hatchrun-cloud",
+ "hatchrun-workflow",
+ "hmac",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-postgres",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "worker",
+]
+
+[[package]]
 name = "hatchrun-cli"
 version = "0.1.0"
 dependencies = [
