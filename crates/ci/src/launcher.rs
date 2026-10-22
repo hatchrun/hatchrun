@@ -190,6 +190,27 @@ struct Image {
     root_device: String,
 }
 
+/// How long before they expire cached credentials stop being used.
+const CREDENTIALS_MARGIN_MS: u64 = 60_000;
+
+/// Whether credentials fetched at `fetched_ms` are still good at `now_ms`:
+/// until a minute before the session STS granted ends.
+pub(crate) fn credentials_fresh(fetched_ms: u64, now_ms: u64) -> bool {
+    let lifetime_ms = u64::from(hatchrun_cloud::aws::sts::DURATION_SECONDS) * 1000;
+    now_ms >= fetched_ms && now_ms < fetched_ms + lifetime_ms - CREDENTIALS_MARGIN_MS
+}
+
+struct CachedCredentials {
+    role: String,
+    fetched_ms: u64,
+    credentials: Credentials,
+}
+
+thread_local! {
+    static CREDENTIALS: std::cell::RefCell<Option<CachedCredentials>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Instances in the CI AWS account.
 pub struct Ec2 {
     settings: Settings,
@@ -206,6 +227,31 @@ impl Ec2 {
         Ok(Self {
             settings: settings.clone(),
         })
+    }
+
+    /// The CI role's credentials for reads and terminations, shared by
+    /// every call in the isolate until shortly before they expire.
+    async fn shared_credentials(&self) -> Result<Credentials, aws::Error> {
+        let role = self.settings.ci_role_arn.as_str();
+        let now = worker::Date::now().as_millis();
+        let cached = CREDENTIALS.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .filter(|cached| cached.role == role && credentials_fresh(cached.fetched_ms, now))
+                .map(|cached| cached.credentials.clone())
+        });
+        if let Some(credentials) = cached {
+            return Ok(credentials);
+        }
+        let credentials = self.credentials("hatchrun-ci").await?;
+        CREDENTIALS.with(|cell| {
+            *cell.borrow_mut() = Some(CachedCredentials {
+                role: role.to_owned(),
+                fetched_ms: now,
+                credentials: credentials.clone(),
+            });
+        });
+        Ok(credentials)
     }
 
     /// The CI role's credentials; `session` shows in `CloudTrail`.
@@ -331,7 +377,7 @@ impl Ec2 {
 
     async fn metadata_off(&self, instance_id: &str) -> Result<(), String> {
         let credentials = self
-            .credentials("hatchrun-ci")
+            .shared_credentials()
             .await
             .map_err(|err| err.to_string())?;
         let response = self
@@ -353,7 +399,7 @@ impl Ec2 {
 
     async fn metadata_applied(&self, instance_id: &str) -> Result<bool, String> {
         let credentials = self
-            .credentials("hatchrun-ci")
+            .shared_credentials()
             .await
             .map_err(|err| err.to_string())?;
         let response = self
@@ -362,7 +408,13 @@ impl Ec2 {
                 ec2::describe_metadata(&self.endpoint(), instance_id),
             )
             .await?;
-        let state = ec2::metadata_state(&response).map_err(|err| err.to_string())?;
+        let state = match ec2::metadata_state(&response) {
+            Ok(state) => state,
+            // Describe is throttled: the change is not seen yet, so the
+            // claim polls again after its pause.
+            Err(err) if err.code == "RequestLimitExceeded" => return Ok(false),
+            Err(err) => return Err(err.to_string()),
+        };
         Ok(
             state
                 .is_some_and(|state| state.state == "applied" && state.http_endpoint == "disabled"),
@@ -370,7 +422,7 @@ impl Ec2 {
     }
 
     async fn terminate(&self, instance_id: &str) {
-        match self.credentials("hatchrun-ci").await {
+        match self.shared_credentials().await {
             Ok(credentials) => {
                 terminate_instance(&self.target(&credentials), instance_id).await;
             }
@@ -380,7 +432,7 @@ impl Ec2 {
 
     async fn instances(&self) -> Result<Vec<instances::Described>, String> {
         let credentials = self
-            .credentials("hatchrun-ci")
+            .shared_credentials()
             .await
             .map_err(|err| err.to_string())?;
         let endpoint = self.endpoint();
@@ -511,6 +563,16 @@ mod tests {
     use hatchrun_cloud::labels::Arch;
 
     use super::*;
+
+    #[test]
+    fn cached_credentials_are_used_until_a_minute_before_they_expire() {
+        let start = 1_000_000;
+        assert!(credentials_fresh(start, start));
+        assert!(credentials_fresh(start, start + 839_999));
+        assert!(!credentials_fresh(start, start + 840_000), "900 s - 60 s");
+        assert!(!credentials_fresh(start, start + 900_000));
+        assert!(!credentials_fresh(start, start - 1), "a clock that went back");
+    }
 
     #[test]
     fn local_is_refused_in_production() {

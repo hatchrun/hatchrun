@@ -12,7 +12,7 @@ use crate::http::{Request, Response};
 /// STS API version.
 const VERSION: &str = "2011-06-15";
 /// The shortest session STS grants, ample for one launch.
-const DURATION_SECONDS: u32 = 900;
+pub const DURATION_SECONDS: u32 = 900;
 
 /// The request for `role_arn`'s credentials. `session_name` shows in the
 /// customer's `CloudTrail` next to every call made with them.

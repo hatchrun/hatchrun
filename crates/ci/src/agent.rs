@@ -40,8 +40,17 @@ pub const MAX_BODY_BYTES: usize = 1 << 20;
 /// How long a claim waits for the metadata change to apply, in
 /// milliseconds.
 pub const CLAIM_WAIT_MS: u64 = 10_000;
-/// The pause between polls of the metadata change, in milliseconds.
-pub const POLL_INTERVAL_MS: u64 = 500;
+/// The pause before the first repeat poll of the metadata change, in
+/// milliseconds. It doubles up to [`POLL_MAX_MS`].
+pub const POLL_FIRST_MS: u64 = 1_000;
+/// The longest pause between polls, in milliseconds.
+pub const POLL_MAX_MS: u64 = 5_000;
+
+/// The pause after the `polls`-th poll (from 0) found the change not
+/// applied: 1 s, 2 s, 4 s, then 5 s.
+pub(crate) fn poll_pause_ms(polls: u32) -> u64 {
+    (POLL_FIRST_MS << polls.min(8)).min(POLL_MAX_MS)
+}
 
 /// What the claim does next while it waits for the metadata change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,12 +319,16 @@ async fn metadata_off(settings: &Settings, instance_id: &str) -> std::result::Re
     let backend = Backend::new(settings).await?;
     backend.metadata_off(instance_id).await?;
     let start = now_ms();
+    let mut polls = 0_u32;
     loop {
         let applied = backend.metadata_applied(instance_id).await?;
         match claim_step(applied, now_ms().saturating_sub(start)) {
             ClaimStep::Ready => return Ok(true),
             ClaimStep::Retry => return Ok(false),
-            ClaimStep::Wait => Delay::from(Duration::from_millis(POLL_INTERVAL_MS)).await,
+            ClaimStep::Wait => {
+                Delay::from(Duration::from_millis(poll_pause_ms(polls))).await;
+                polls += 1;
+            }
         }
     }
 }
@@ -403,6 +416,13 @@ mod tests {
             default_branch: "main".into(),
             private: false,
         }
+    }
+
+    #[test]
+    fn the_poll_pause_doubles_up_to_the_cap() {
+        let pauses: Vec<u64> = (0..6).map(poll_pause_ms).collect();
+        assert_eq!(pauses, [1_000, 2_000, 4_000, 5_000, 5_000, 5_000]);
+        assert_eq!(poll_pause_ms(u32::MAX), 5_000);
     }
 
     #[test]
