@@ -66,6 +66,7 @@ use crate::github::{
 };
 use crate::graph::{Action, Graph, Node, State as NodeState};
 use crate::intake::Repo;
+use crate::launches::LaunchMessage;
 use crate::logs::{BACKLOG_BYTES, Compressor, LogIndex, LogWriter, index_key, log_key, tail};
 use crate::store;
 
@@ -1138,12 +1139,6 @@ fn fail(message: impl Into<String>) -> worker::Error {
 
 fn answer(status: u16) -> Result<Response> {
     Ok(Response::empty()?.with_status(status))
-}
-
-#[derive(Serialize)]
-struct LaunchMessage {
-    job_id: u64,
-    attempt: u32,
 }
 
 #[derive(Deserialize)]

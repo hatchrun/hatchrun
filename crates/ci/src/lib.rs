@@ -24,6 +24,8 @@ pub mod env;
 pub mod github;
 pub mod graph;
 pub mod intake;
+pub mod launcher;
+pub mod launches;
 pub mod logs;
 pub mod planning;
 pub mod run;
@@ -32,7 +34,7 @@ pub mod store;
 pub mod token;
 pub mod webhook;
 
-use worker::{Context, Env, Method, Request, Response, Result, event};
+use worker::{Context, Env, MessageBatch, Method, Request, Response, Result, event};
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -40,4 +42,19 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return webhook::handle(req, &env).await;
     }
     Response::error("not found", 404)
+}
+
+/// The launch queue and its dead-letter queue (see [`launches`]).
+#[event(queue)]
+async fn queue(
+    batch: MessageBatch<launches::LaunchMessage>,
+    env: Env,
+    _ctx: Context,
+) -> Result<()> {
+    if batch.queue() == launches::DEAD_LETTERS {
+        launches::dead_letters(batch, env).await;
+    } else {
+        launches::consume(batch, env).await;
+    }
+    Ok(())
 }
