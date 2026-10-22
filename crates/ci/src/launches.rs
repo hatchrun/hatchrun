@@ -33,7 +33,10 @@ use hatchrun_cloud::{jwt, webcrypto};
 use hatchrun_workflow::agent::{BootDocument, CiBoot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use worker::{Env, MessageBatch, MessageExt, Method, RequestInit, console_error, console_log};
+use worker::{
+    Env, MessageBatch, MessageExt, Method, QueueRetryOptionsBuilder, RequestInit, console_error,
+    console_log,
+};
 
 use crate::env::{Settings, run_stub};
 use crate::launcher::{Backend, LaunchSpec, user_data};
@@ -45,6 +48,8 @@ pub const DEAD_LETTERS: &str = "hatchrun-ci-launches-dlq";
 
 /// How long a launch that found no capacity waits, in milliseconds.
 const RETRY_AFTER_MS: u64 = 30_000;
+/// How long a message waits before it is delivered again, in seconds.
+const REDELIVER_AFTER_SECS: u32 = 15;
 /// Launch attempts a job gets.
 const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 /// How long the broker keeps a boot document for its instance, in
@@ -52,6 +57,8 @@ const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 const TICKET_EXPIRES_IN: u64 = token::BOOT_SECS;
 /// The message that ends a job whose launch message ran out of retries.
 const DEAD_LETTER_MESSAGE: &str = "the launch did not finish";
+/// The message that ends a job that used all its launch attempts.
+const OUT_OF_ATTEMPTS: &str = "the launch did not finish in 3 attempts";
 
 /// The queue's message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,12 +140,15 @@ pub async fn consume(batch: MessageBatch<LaunchMessage>, env: Env) {
             .map(|message| launch(&env, &settings, &backend, *message.body())),
     )
     .await;
+    let delay = QueueRetryOptionsBuilder::new()
+        .with_delay_seconds(REDELIVER_AFTER_SECS)
+        .build();
     for (message, result) in messages.iter().zip(results) {
         match result {
             Ok(()) => message.ack(),
             Err(err) => {
                 console_error!("launch queue: job {}: {err}", message.body().job_id);
-                message.retry();
+                message.retry_with_options(&delay);
             }
         }
     }
@@ -165,8 +175,13 @@ async fn launch(
     else {
         return Ok(());
     };
-    if job.attempt != message.attempt || job.status != "queued" {
-        return Ok(());
+    let delivery = delivery(&job, message.attempt);
+    match delivery {
+        Delivery::Skip => return Ok(()),
+        Delivery::Wait => {
+            return Err("the job is still launching or its end is not recorded".to_owned());
+        }
+        Delivery::Launch | Delivery::GiveUp => {}
     }
     let Some(job) = store::claim_launch(&db, message.job_id, now_ms())
         .await
@@ -174,6 +189,9 @@ async fn launch(
     else {
         return Ok(());
     };
+    if delivery == Delivery::GiveUp {
+        return end_job(env, &db, &job, OUT_OF_ATTEMPTS).await;
+    }
     match launch_claimed(&db, settings, backend, &job).await {
         Ok(Launched::Started | Launched::MovedOn) => Ok(()),
         Err(failure) => {
@@ -185,6 +203,34 @@ async fn launch(
             );
             record_failure(env, &db, &job, &failure).await
         }
+    }
+}
+
+/// What a delivered message asks of the consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Nothing: the job moved on, was re-run, or is gone.
+    Skip,
+    /// Claim and start an instance.
+    Launch,
+    /// Claim and end the job: it used its launch attempts.
+    GiveUp,
+    /// The job is launching, or its failure is not recorded yet. The
+    /// message is retried; the dead-letter consumer ends the job when
+    /// nothing else did.
+    Wait,
+}
+
+/// Decides what the message for `attempt` does to `job`.
+fn delivery(job: &JobRow, attempt: u32) -> Delivery {
+    if job.attempt != attempt {
+        return Delivery::Skip;
+    }
+    match job.status.as_str() {
+        "queued" if job.launch_attempts >= MAX_LAUNCH_ATTEMPTS => Delivery::GiveUp,
+        "queued" => Delivery::Launch,
+        "launching" => Delivery::Wait,
+        _ => Delivery::Skip,
     }
 }
 
@@ -288,34 +334,52 @@ async fn record_failure(env: &Env, db: &Db, job: &JobRow, failure: &Failure) -> 
                 .map_err(|err| err.to_string())?;
             Ok(())
         }
-        Next::Fail => {
-            if let Err(err) = end_job(env, db, job, &failure.message).await {
-                // The job stays launching and no message is left for it.
-                // Queue it again so the reconciler launches it, and the
-                // next failure ends it here.
-                console_error!("job {}: could not end it: {err}", job.id);
-                store::launch_failed(
-                    db,
-                    job.id,
-                    &failure.message,
-                    Some(now + RETRY_AFTER_MS),
-                    now,
-                )
-                .await
-                .map_err(|err| err.to_string())?;
-            }
-            Ok(())
-        }
+        Next::Fail => end_job(env, db, job, &failure.message).await,
     }
 }
 
-/// Ends attempt `job.attempt` of the job as failed, through the run's
-/// object.
-async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> Result<(), String> {
-    let run = store::run(db, job.run_id)
-        .await
-        .map_err(|err| err.to_string())?
-        .ok_or_else(|| format!("run {} is gone", job.run_id))?;
+/// What the run object, or its absence, answered to ending a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EndAnswer {
+    /// The object answered with this status.
+    Status(u16),
+    /// The job's run has no row.
+    RunMissing,
+    /// The object could not be asked.
+    Error,
+}
+
+/// What to do about the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndAction {
+    /// The object ended the job, or it was already over.
+    Done,
+    /// Nobody owns the job: complete its row here.
+    GiveUp,
+    /// Try again: retry the message.
+    Retry,
+}
+
+/// Decides what follows `answer`. A `409` means the attempt ended or
+/// was replaced; a `404` or a missing run means no object holds the job.
+fn end_action(answer: &EndAnswer) -> EndAction {
+    match answer {
+        EndAnswer::Status(200..=299 | 409) => EndAction::Done,
+        EndAnswer::Status(404) | EndAnswer::RunMissing => EndAction::GiveUp,
+        EndAnswer::Status(_) | EndAnswer::Error => EndAction::Retry,
+    }
+}
+
+/// Asks the run's object to end attempt `job.attempt` as failed.
+async fn post_failed(env: &Env, db: &Db, job: &JobRow, message: &str) -> EndAnswer {
+    let run = match store::run(db, job.run_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return EndAnswer::RunMissing,
+        Err(err) => {
+            console_error!("job {}: read run: {err}", job.id);
+            return EndAnswer::Error;
+        }
+    };
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_body(Some(json!({ "message": message }).to_string().into()));
@@ -323,16 +387,33 @@ async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> Result<(), 
         "https://run/failed?job={}&attempt={}&run={}&tenant={}",
         job.id, job.attempt, run.id, run.tenant_id
     );
-    let request = worker::Request::new_with_init(&url, &init).map_err(|err| err.to_string())?;
-    let response = run_stub(env, run.id)
-        .map_err(|err| err.to_string())?
-        .fetch_with_request(request)
-        .await
-        .map_err(|err| err.to_string())?;
-    match response.status_code() {
-        // 409: the attempt ended or was replaced; nothing left to end.
-        200..=299 | 409 => Ok(()),
-        status => Err(format!("run {}: failed answered {status}", run.id)),
+    let sent = async {
+        let request = worker::Request::new_with_init(&url, &init)?;
+        run_stub(env, run.id)?.fetch_with_request(request).await
+    };
+    match sent.await {
+        Ok(response) => EndAnswer::Status(response.status_code()),
+        Err(err) => {
+            console_error!("job {}: post failed: {err}", job.id);
+            EndAnswer::Error
+        }
+    }
+}
+
+/// Ends the job through the run's object. When nobody owns it, its row
+/// is completed here. An error asks for the message to be retried.
+async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> Result<(), String> {
+    let answer = post_failed(env, db, job, message).await;
+    match end_action(&answer) {
+        EndAction::Done => Ok(()),
+        EndAction::GiveUp => {
+            console_error!("job {}: no run object holds it, failing the row", job.id);
+            store::launch_failed(db, job.id, message, None, now_ms())
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        }
+        EndAction::Retry => Err(format!("could not end job {}: {answer:?}", job.id)),
     }
 }
 
@@ -373,7 +454,7 @@ async fn dead_letter(env: &Env, message: LaunchMessage) -> Result<(), String> {
     else {
         return Ok(());
     };
-    if job.attempt != message.attempt || job.status == "completed" {
+    if job.attempt != message.attempt || !matches!(job.status.as_str(), "queued" | "launching") {
         return Ok(());
     }
     end_job(env, &db, &job, DEAD_LETTER_MESSAGE).await
@@ -430,6 +511,43 @@ mod tests {
         );
         assert_eq!(body["expiresIn"], 900);
         assert_eq!(body.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ending_a_job_follows_the_answer() {
+        for status in [200, 204, 409] {
+            assert_eq!(end_action(&EndAnswer::Status(status)), EndAction::Done);
+        }
+        assert_eq!(end_action(&EndAnswer::Status(404)), EndAction::GiveUp);
+        assert_eq!(end_action(&EndAnswer::RunMissing), EndAction::GiveUp);
+        for status in [400, 500, 503] {
+            assert_eq!(end_action(&EndAnswer::Status(status)), EndAction::Retry);
+        }
+        assert_eq!(end_action(&EndAnswer::Error), EndAction::Retry);
+    }
+
+    fn row(status: &str, attempt: u32, launch_attempts: u32) -> JobRow {
+        serde_json::from_value(json!({
+            "id": 1, "run_id": 2, "plan_id": "a", "name": "a", "status": status,
+            "conclusion": null, "instance_id": null, "attempt": attempt,
+            "launch_attempts": launch_attempts, "next_launch_at": null,
+            "timeout_minutes": 10, "updated_at": 0, "heartbeat_at": null,
+            "started_at": null, "completed_at": null, "steps": "[]", "log_key": null,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_delivery_launches_only_a_queued_job_with_attempts_left() {
+        assert_eq!(delivery(&row("queued", 1, 0), 1), Delivery::Launch);
+        assert_eq!(delivery(&row("queued", 1, 2), 1), Delivery::Launch);
+        assert_eq!(delivery(&row("queued", 1, 3), 1), Delivery::GiveUp);
+        assert_eq!(delivery(&row("queued", 1, 5), 1), Delivery::GiveUp);
+        assert_eq!(delivery(&row("queued", 2, 0), 1), Delivery::Skip);
+        assert_eq!(delivery(&row("launching", 1, 1), 1), Delivery::Wait);
+        for status in ["launched", "running", "completed", "waiting"] {
+            assert_eq!(delivery(&row(status, 1, 1), 1), Delivery::Skip, "{status}");
+        }
     }
 
     #[test]

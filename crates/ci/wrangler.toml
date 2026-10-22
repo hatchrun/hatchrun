@@ -56,7 +56,7 @@ queue = "hatchrun-ci-launches"
 
 # Small batches, sent after a second at most, so a job's start does not
 # wait for other jobs. Messages that fail max_retries times go to the
-# dead-letter queue; the reconciler launches their jobs again.
+# dead-letter queue, whose consumer fails their jobs.
 [[queues.consumers]]
 queue = "hatchrun-ci-launches"
 max_batch_size = 5
