@@ -51,6 +51,29 @@ pub fn select(source: &str, event: &Event, compile_ref: &str) -> Selected {
     }
 }
 
+/// Whether a pull request `action` against `base_ref` starts a workflow
+/// that filters on changed paths, so the files are worth fetching.
+/// False when the config does not parse (it is reported without them).
+#[must_use]
+pub fn needs_pull_request_paths(source: &str, action: &str, base_ref: &str) -> bool {
+    let Ok(config) = parse(source) else {
+        return false;
+    };
+    let event = Event::PullRequest {
+        action: action.to_owned(),
+        base_ref: base_ref.to_owned(),
+        changed: Vec::new(),
+    };
+    config.workflows.values().any(|wf| {
+        triggered(&wf.on, &event)
+            && wf
+                .on
+                .pull_request
+                .as_ref()
+                .is_some_and(|pr| pr.paths.is_some() || pr.paths_ignore.is_some())
+    })
+}
+
 /// Every `(workflow, cron)` pair of `on: schedule`, in workflow name
 /// order. Empty when the config does not parse.
 #[must_use]
@@ -108,6 +131,24 @@ workflows:
             r#ref: r.into(),
             changed: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pull_request_paths_are_needed_only_for_a_listening_path_filter() {
+        let config = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  plain:
+    on: { pull_request: { branches: [main] } }
+    jobs: [t]
+  docs:
+    on: { pull_request: { types: [labeled], paths: ['docs/**'] } }
+    jobs: [t]
+";
+        assert!(needs_pull_request_paths(config, "labeled", "main"));
+        assert!(!needs_pull_request_paths(config, "opened", "main"));
+        assert!(!needs_pull_request_paths("not: [valid", "labeled", "main"));
     }
 
     #[test]

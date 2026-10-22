@@ -184,6 +184,14 @@ impl Cx<'_> {
             r#ref: push.r#ref.clone(),
             changed: push.changed.clone(),
         };
+        let config = runs::read_config(
+            self.tokens,
+            self.settings,
+            push.installation_id,
+            &push.repo.full_name,
+            &push.after,
+        )
+        .await?;
         let ids = runs::create(
             self.env,
             self.db,
@@ -204,21 +212,22 @@ impl Cx<'_> {
                 head_ref: "",
                 base_ref: "",
             },
+            &config,
             self.now,
         )
         .await?;
         if push.r#ref == format!("refs/heads/{}", push.repo.default_branch) {
-            let schedules = match runs::read_config(
-                self.tokens,
-                self.settings,
-                push.installation_id,
-                &push.repo.full_name,
-                &push.after,
-            )
-            .await?
-            {
-                Config::Text(Ok(source)) => planning::schedules(&source),
-                Config::Missing | Config::Text(Err(_)) => Vec::new(),
+            let schedules = match &config {
+                Config::Text(Ok(source)) => planning::schedules(source),
+                Config::Missing => Vec::new(),
+                Config::Text(Err(err)) => {
+                    worker::console_warn!(
+                        "{}: schedules cleared, the config is unusable: {}",
+                        push.repo.full_name,
+                        err.message
+                    );
+                    Vec::new()
+                }
             };
             store::replace_schedules(self.db, push.repo.id, &schedules).await?;
         }
@@ -226,36 +235,50 @@ impl Cx<'_> {
     }
 
     async fn pull_request(&self, pr: &PullRequest) -> Result<Outcome> {
+        let config = runs::read_config(
+            self.tokens,
+            self.settings,
+            pr.installation_id,
+            &pr.repo.full_name,
+            &pr.head_sha,
+        )
+        .await?;
+        let compile_ref = runs::compile_ref_for(pr);
+        // Files cost up to three calls, so they are read only for a
+        // workflow that listens to this action and filters on paths.
+        let wants_paths = matches!(&config, Config::Text(Ok(source))
+            if planning::needs_pull_request_paths(source, &pr.action, &pr.base_ref));
         let mut changed = Vec::new();
-        for page in 1..=FILE_PAGES {
-            let response = self
-                .tokens
-                .send(pr.installation_id, |token| {
-                    github::pull_files(
-                        &self.settings.github_api,
-                        &pr.repo.full_name,
-                        pr.number,
-                        page,
-                        token,
-                    )
-                })
-                .await
-                .map_err(|err| fail(err.to_string()))?;
-            let names = github::pull_file_names(&response).map_err(fail)?;
-            let full = names.len() >= PAGE_SIZE;
-            changed.extend(names);
-            if !full || changed.len() >= MAX_CHANGED {
-                break;
+        if wants_paths {
+            for page in 1..=FILE_PAGES {
+                let response = self
+                    .tokens
+                    .send(pr.installation_id, |token| {
+                        github::pull_files(
+                            &self.settings.github_api,
+                            &pr.repo.full_name,
+                            pr.number,
+                            page,
+                            token,
+                        )
+                    })
+                    .await
+                    .map_err(|err| fail(err.to_string()))?;
+                let names = github::pull_file_names(&response).map_err(fail)?;
+                let full = names.len() >= PAGE_SIZE;
+                changed.extend(names);
+                if !full || changed.len() >= MAX_CHANGED {
+                    break;
+                }
             }
+            changed.truncate(MAX_CHANGED);
         }
-        changed.truncate(MAX_CHANGED);
         let trigger = Event::PullRequest {
             action: pr.action.clone(),
             base_ref: pr.base_ref.clone(),
             changed,
         };
         let git_ref = format!("refs/pull/{}/merge", pr.number);
-        let compile_ref = runs::compile_ref_for(pr);
         let ids = runs::create(
             self.env,
             self.db,
@@ -276,6 +299,7 @@ impl Cx<'_> {
                 head_ref: &pr.head_ref,
                 base_ref: &pr.base_ref,
             },
+            &config,
             self.now,
         )
         .await?;

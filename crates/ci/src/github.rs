@@ -233,6 +233,33 @@ pub struct GhAnnotation {
     pub title: Option<String>,
 }
 
+/// The check runs named `name` on commit `sha`.
+#[must_use]
+pub fn check_runs_named(api: &str, repo: &str, sha: &str, name: &str, token: &str) -> Request {
+    rest(
+        "GET",
+        format!(
+            "{api}/repos/{repo}/commits/{}/check-runs?check_name={}&per_page=1",
+            encode(sha),
+            encode(name)
+        ),
+        token,
+    )
+}
+
+/// How many check runs [`check_runs_named`] found.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a check run list.
+pub fn check_run_total(response: &Response) -> Result<u64, String> {
+    #[derive(Deserialize)]
+    struct Listed {
+        total_count: u64,
+    }
+    decode::<Listed>(response, "check runs").map(|l| l.total_count)
+}
+
 /// Creates a check run.
 #[must_use]
 pub fn create_check_run(api: &str, repo: &str, token: &str, run: &CheckRun) -> Request {

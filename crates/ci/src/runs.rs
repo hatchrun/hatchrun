@@ -171,7 +171,9 @@ pub fn invalid_config_check_run(diagnostics: &[Diagnostic], sha: &str) -> CheckR
     }
 }
 
-/// Starts the runs `req` calls for and returns their ids.
+/// Starts the runs `req` calls for and returns their ids. `config` is
+/// the config at `req.sha`, which the caller read with [`read_config`]
+/// (the webhook also needs it for schedules and path filters).
 ///
 /// Nothing starts for a tenant that is missing or has CI off, or for a
 /// commit without a config. A config that does not parse or compile
@@ -190,6 +192,7 @@ pub async fn create(
     settings: &Settings,
     tokens: &Tokens<'_, Kv, App, Counted>,
     req: &Request<'_>,
+    config: &Config,
     now: u64,
 ) -> Result<Vec<u64>> {
     match store::tenant(db, req.tenant_id).await? {
@@ -199,23 +202,15 @@ pub async fn create(
             return Ok(Vec::new());
         }
     }
-    let source = match read_config(
-        tokens,
-        settings,
-        req.installation_id,
-        &req.repo.full_name,
-        req.sha,
-    )
-    .await?
-    {
+    let source = match config {
         Config::Missing => return Ok(Vec::new()),
         Config::Text(Ok(source)) => source,
         Config::Text(Err(diagnostic)) => {
-            report_invalid(tokens, settings, req, &[diagnostic]).await?;
+            report_invalid(tokens, settings, req, std::slice::from_ref(diagnostic)).await?;
             return Ok(Vec::new());
         }
     };
-    let plans = match planning::select(&source, req.trigger, req.compile_ref) {
+    let plans = match planning::select(source, req.trigger, req.compile_ref) {
         Selected::Plans(plans) => plans,
         Selected::Invalid(diagnostics) => {
             report_invalid(tokens, settings, req, &diagnostics).await?;
@@ -235,6 +230,22 @@ async fn report_invalid(
     req: &Request<'_>,
     diagnostics: &[Diagnostic],
 ) -> Result<()> {
+    // A delivery repeated after a later failure finds its report.
+    let listed = tokens
+        .send(req.installation_id, |token| {
+            github::check_runs_named(
+                &settings.github_api,
+                &req.repo.full_name,
+                req.sha,
+                CONFIG_CHECK,
+                token,
+            )
+        })
+        .await
+        .map_err(|err| fail(err.to_string()))?;
+    if github::check_run_total(&listed).map_err(fail)? > 0 {
+        return Ok(());
+    }
     let check = invalid_config_check_run(diagnostics, req.sha);
     let response = tokens
         .send(req.installation_id, |token| {
@@ -259,12 +270,15 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
         actor: req.actor.to_owned(),
         now,
     };
-    let run = match store::insert_run(db, &new).await? {
-        Some(run) => run,
+    let (run, fresh) = match store::insert_run(db, &new).await? {
+        Some(run) => (run, true),
         // An earlier delivery stopped after it recorded the run.
-        None => store::run_for_delivery(db, req.delivery, &plan.workflow)
-            .await?
-            .ok_or_else(|| fail("a run of this delivery vanished"))?,
+        None => (
+            store::run_for_delivery(db, req.delivery, &plan.workflow)
+                .await?
+                .ok_or_else(|| fail("a run of this delivery vanished"))?,
+            false,
+        ),
     };
     if run.tenant_id != req.tenant_id || run.repo_id != req.repo.id {
         return Err(fail(format!(
@@ -285,10 +299,21 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
             .collect();
         store::insert_jobs(db, run.id, &jobs, now).await?;
         rows = store::jobs_for_run(db, run.id).await?;
+    } else if !fresh && !unstarted(&run, &rows) {
+        // The run went on after its first delivery; it may even have
+        // finished and been purged, and a second start would run it again.
+        return Ok(run.id);
     }
     let start = start_body(req, &run, &rows, plan)?;
     post_start(env, run.id, &start).await?;
     Ok(run.id)
+}
+
+/// Whether a recorded run has not started: it is queued and no job has
+/// moved past waiting, so no launch or start happened.
+#[must_use]
+pub fn unstarted(run: &RunRow, rows: &[JobRow]) -> bool {
+    run.status == "queued" && rows.iter().all(|row| row.status == "waiting")
 }
 
 /// The body of `POST /start`: each planned job with its row id.
@@ -376,6 +401,69 @@ mod tests {
         let output = invalid_config_check_run(&many, "abc").output.unwrap();
         assert_eq!(output.annotations.len(), 50);
         assert!(output.summary.contains("and 20 more"));
+    }
+
+    #[test]
+    fn only_a_run_that_has_not_started_is_started_again() {
+        use hatchrun_cloud::testdb::Db as TestDb;
+        let db = TestDb::new();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, \
+             updated_at) VALUES ('t1', 1, 'acme', 99, 0, 0)",
+            &[],
+        );
+        let repo = store::RepoRow {
+            id: 7,
+            tenant_id: "t1".into(),
+            installation_id: 99,
+            full_name: "acme/app".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        db.wait(store::upsert_repo(db.db(), &repo, 1)).unwrap();
+        let run = db
+            .wait(store::insert_run(
+                db.db(),
+                &NewRun {
+                    tenant_id: "t1".into(),
+                    repo_id: 7,
+                    workflow: "ci".into(),
+                    delivery: "d".into(),
+                    event: "push".into(),
+                    git_ref: "refs/heads/main".into(),
+                    sha: "abc".into(),
+                    actor: "octocat".into(),
+                    now: 1,
+                },
+            ))
+            .unwrap()
+            .unwrap();
+        let jobs = [NewJob {
+            plan_id: "build".into(),
+            name: "build".into(),
+            timeout_minutes: 10,
+        }];
+        let ids = db
+            .wait(store::insert_jobs(db.db(), run.id, &jobs, 1))
+            .unwrap();
+        let load = |db: &TestDb| {
+            let run = db.wait(store::run(db.db(), run.id)).unwrap().unwrap();
+            let rows = db.wait(store::jobs_for_run(db.db(), run.id)).unwrap();
+            (run, rows)
+        };
+        let (r, rows) = load(&db);
+        assert!(unstarted(&r, &rows));
+        db.wait(store::run_started(db.db(), run.id, 2)).unwrap();
+        let (r, rows) = load(&db);
+        assert!(!unstarted(&r, &rows), "run is in progress");
+        db.run(
+            "UPDATE ci_runs SET status = 'queued' WHERE id = $1",
+            &hatchrun_cloud::db::params![run.id],
+        );
+        db.wait(store::set_job(db.db(), ids[0].1, "queued", None, 3))
+            .unwrap();
+        let (r, rows) = load(&db);
+        assert!(!unstarted(&r, &rows), "a job was queued");
     }
 
     #[test]
