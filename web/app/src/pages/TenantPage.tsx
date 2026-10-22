@@ -12,6 +12,7 @@ import { Link, useQuery } from "../router";
 import { UsageNotice } from "./Billing";
 import { AwsSummary, ConnectAws } from "./ConnectAws";
 import { Dashboard } from "./Dashboard";
+import { CiSettings } from "./ci/CiSettings";
 import { JobPage } from "./JobPage";
 import { RunPage } from "./RunPage";
 import { RunnersPage } from "./Runners";
@@ -38,6 +39,7 @@ export function TenantPage({
   const tabs = [
     { href: `/o/${org}`, label: ready ? "Jobs" : "Setup", current: section === undefined || section === "jobs" || section === "runs" },
     { href: `/o/${org}/runners`, label: "Runners", current: section === "runners" },
+    { href: `/o/${org}/ci`, label: "CI", current: section === "ci" },
     { href: `/o/${org}/settings`, label: "Settings", current: section === "settings" },
   ];
   return (
@@ -58,6 +60,10 @@ export function TenantPage({
       ) : section === "runners" ? (
         <Narrow>
           <RunnersPage tenant={tenant} item={item} />
+        </Narrow>
+      ) : section === "ci" ? (
+        <Narrow>
+          <CiSettings org={org} />
         </Narrow>
       ) : section === "settings" ? (
         <Narrow>
