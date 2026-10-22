@@ -20,6 +20,7 @@ use crate::config::{
     CacheStep, Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow,
     WorkflowJob, WorkspaceStep,
 };
+use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
 use crate::expr::{self, ExprError};
 use crate::templates::{Template, template, template_labels};
@@ -244,7 +245,22 @@ fn config_errors(config: &Config) -> Vec<Diagnostic> {
         }
     }
     filter_errors(config, &mut errors);
+    cron_errors(config, &mut errors);
     errors
+}
+
+/// Reports the `on.schedule` entries that are not cron expressions.
+fn cron_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
+    for wf in config.workflows.values() {
+        for schedule in &wf.on.schedule {
+            if let Err(reason) = Cron::parse(&schedule.cron) {
+                errors.push(Diagnostic::new(format!(
+                    "invalid cron \"{}\": {reason}",
+                    schedule.cron
+                )));
+            }
+        }
+    }
 }
 
 /// Reports a filter with more than `MAX_PATTERNS` patterns, and a config

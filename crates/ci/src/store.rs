@@ -348,6 +348,27 @@ const INSERT_SCHEDULE: &str = "INSERT INTO ci_schedules (repo_id, workflow, cron
 const SCHEDULES: &str = "SELECT repo_id, workflow, cron FROM ci_schedules \
      ORDER BY repo_id, workflow, cron LIMIT $1";
 
+/// The jobs a reconciler pass may have to act on, at most `limit`:
+/// queued, launching, launched and running jobs that are overdue
+/// against the limits of `now`. See [`crate::reconcile::stalled`].
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn stalled_jobs(db: &Db, now: u64, limit: u32) -> Result<Vec<JobRow>> {
+    db.all(
+        &with_columns(STALLED_JOBS, JOB_COLUMNS),
+        &params![
+            now,
+            now.saturating_sub(crate::reconcile::QUEUED_QUIET_MS),
+            now.saturating_sub(crate::reconcile::LAUNCH_QUIET_MS),
+            now.saturating_sub(crate::reconcile::RUNNER_QUIET_MS),
+            limit
+        ],
+    )
+    .await
+}
+
 /// Takes the reconciler's lease until `$2` when it ran out before `$1`.
 const LEASE: &str = "UPDATE ci_reconciler SET lease_until = $2 WHERE id = 1 AND lease_until < $1";
 
@@ -357,8 +378,26 @@ const LAST_MINUTE: &str = "SELECT last_minute FROM ci_reconciler WHERE id = 1";
 /// Sets the last schedule minute fired to `$1`.
 const SET_LAST_MINUTE: &str = "UPDATE ci_reconciler SET last_minute = $1 WHERE id = 1";
 
-/// Deletes the runs that expired before `$1`; their jobs go with them.
-const SWEEP_RUNS: &str = "DELETE FROM ci_runs WHERE expires_at < $1 RETURNING id";
+/// Jobs a reconciler pass looks at, the least recently changed first, at
+/// most `$5`: queued ones due for a launch (`$1` now) or quiet since
+/// `$2`, launching or launched ones quiet since `$3`, and running ones
+/// without a heartbeat since `$4`, or without a start or any change when
+/// the heartbeat is missing. [`crate::reconcile::stalled`] makes the
+/// same decisions over the rows.
+const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
+     (status = 'queued' AND (next_launch_at <= $1 OR updated_at < $2)) \
+     OR (status IN ('launching', 'launched') AND updated_at < $3) \
+     OR (status = 'running' AND COALESCE(heartbeat_at, started_at, updated_at) < $4) \
+     ORDER BY updated_at, id LIMIT $5";
+
+/// Deletes the runs that expired before `$1`, at most `$2` of them;
+/// their jobs go with them. The oldest go first.
+const SWEEP_RUNS: &str = "DELETE FROM ci_runs WHERE id IN (\
+       SELECT id FROM ci_runs WHERE expires_at < $1 ORDER BY expires_at, id LIMIT $2) \
+     RETURNING id";
+
+/// The most runs one [`sweep`] deletes.
+pub const SWEEP_LIMIT: u32 = 100;
 
 /// Deletes delivery ids received before `$1`.
 const SWEEP_DELIVERIES: &str = "DELETE FROM ci_deliveries WHERE received_at < $1";
@@ -874,8 +913,9 @@ pub async fn set_last_minute(db: &Db, minute_ms: u64) -> Result<()> {
 }
 
 /// Deletes runs that expired before `now`, with their jobs, and
-/// delivery ids older than 30 days. Returns the ids of the runs, so
-/// their logs can be purged.
+/// delivery ids older than 30 days. At most [`SWEEP_LIMIT`] runs go in
+/// one call, oldest first, and the rest the next time. Returns the ids
+/// of the runs, so their logs can be purged.
 ///
 /// # Errors
 ///
@@ -885,7 +925,7 @@ pub async fn sweep(db: &Db, now: u64) -> Result<Vec<u64>> {
     struct Deleted {
         id: u64,
     }
-    let runs: Vec<Deleted> = db.all(SWEEP_RUNS, &params![now]).await?;
+    let runs: Vec<Deleted> = db.all(SWEEP_RUNS, &params![now, SWEEP_LIMIT]).await?;
     db.run(SWEEP_DELIVERIES, &params![now.saturating_sub(RETENTION_MS)])
         .await?;
     Ok(runs.into_iter().map(|row| row.id).collect())
@@ -1240,6 +1280,99 @@ mod tests {
         assert_eq!(jobs, 0);
         assert!(!db.wait(delivery_seen(db.db(), "old")).unwrap());
         assert!(db.wait(delivery_seen(db.db(), "fresh")).unwrap());
+    }
+
+    #[test]
+    fn sweep_deletes_the_oldest_hundred_at_a_time() {
+        let db = setup();
+        for n in 0..(SWEEP_LIMIT + 5) {
+            db.wait(insert_run(db.db(), &new_run(&format!("d{n}"), "ci", 1_000)))
+                .unwrap()
+                .unwrap();
+        }
+        let now = 1_000 + 31 * DAY;
+        assert_eq!(db.wait(sweep(db.db(), now)).unwrap().len(), 100);
+        assert_eq!(db.wait(sweep(db.db(), now)).unwrap().len(), 5);
+        assert_eq!(db.wait(sweep(db.db(), now)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn stalled_jobs_match_the_reconcilers_decisions() {
+        use crate::reconcile::{Fix, stalled};
+        let db = setup();
+        let run = db
+            .wait(insert_run(db.db(), &new_run("d", "ci", 1)))
+            .unwrap()
+            .unwrap();
+        let names = [
+            "fresh-queued",
+            "quiet-queued",
+            "due-queued",
+            "old-launching",
+            "old-launched",
+            "silent-running",
+            "beating-running",
+            "old-waiting",
+            "old-completed",
+        ];
+        let jobs: Vec<NewJob> = names.iter().map(|name| new_job(name)).collect();
+        let ids = db.wait(insert_jobs(db.db(), run.id, &jobs, 1)).unwrap();
+        let now = 10_000_000u64;
+        let set =
+            |name: &str, status: &str, updated: u64, heartbeat: Option<u64>, due: Option<u64>| {
+                let id = ids.iter().find(|(plan, _)| plan == name).unwrap().1;
+                db.run(
+                    "UPDATE ci_jobs SET status = $2, updated_at = $3, heartbeat_at = $4, \
+                 started_at = $3, next_launch_at = $5 WHERE id = $1",
+                    &params![id, status, updated, heartbeat, due],
+                );
+            };
+        set("fresh-queued", "queued", now - 1_000, None, None);
+        set("quiet-queued", "queued", now - 61_000, None, None);
+        set("due-queued", "queued", now - 1_000, None, Some(now - 1));
+        set("old-launching", "launching", now - 601_000, None, None);
+        set("old-launched", "launched", now - 601_000, None, None);
+        set(
+            "silent-running",
+            "running",
+            now - 1_000,
+            Some(now - 121_000),
+            None,
+        );
+        set(
+            "beating-running",
+            "running",
+            now - 1_000,
+            Some(now - 5_000),
+            None,
+        );
+        set("old-waiting", "waiting", 0, None, None);
+        set("old-completed", "completed", 0, None, None);
+        let rows = db.wait(stalled_jobs(db.db(), now, 50)).unwrap();
+        let mut from_sql: Vec<String> = rows.iter().map(|row| row.plan_id.clone()).collect();
+        from_sql.sort();
+        assert_eq!(
+            from_sql,
+            [
+                "due-queued",
+                "old-launched",
+                "old-launching",
+                "quiet-queued",
+                "silent-running"
+            ]
+        );
+        let all = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
+        let mut from_rust: Vec<u64> = stalled(&all, now)
+            .into_iter()
+            .map(|fix| match fix {
+                Fix::Requeue(id) | Fix::Fail(id, _) | Fix::TerminateAndFail(id, ..) => id,
+            })
+            .collect();
+        from_rust.sort_unstable();
+        let mut sql_ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
+        sql_ids.sort_unstable();
+        assert_eq!(from_rust, sql_ids);
+        assert_eq!(db.wait(stalled_jobs(db.db(), now, 2)).unwrap().len(), 2);
     }
 
     #[test]

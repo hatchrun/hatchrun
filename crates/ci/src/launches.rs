@@ -340,7 +340,7 @@ async fn record_failure(env: &Env, db: &Db, job: &JobRow, failure: &Failure) -> 
 
 /// What the run object, or its absence, answered to ending a job.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum EndAnswer {
+pub(crate) enum EndAnswer {
     /// The object answered with this status.
     Status(u16),
     /// The job's run has no row.
@@ -351,7 +351,7 @@ enum EndAnswer {
 
 /// What to do about the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EndAction {
+pub(crate) enum EndAction {
     /// The object ended the job, or it was already over.
     Done,
     /// Nobody owns the job: complete its row here.
@@ -362,7 +362,7 @@ enum EndAction {
 
 /// Decides what follows `answer`. A `409` means the attempt ended or
 /// was replaced; a `404` or a missing run means no object holds the job.
-fn end_action(answer: &EndAnswer) -> EndAction {
+pub(crate) fn end_action(answer: &EndAnswer) -> EndAction {
     match answer {
         EndAnswer::Status(200..=299 | 409) => EndAction::Done,
         EndAnswer::Status(404) | EndAnswer::RunMissing => EndAction::GiveUp,
@@ -371,7 +371,7 @@ fn end_action(answer: &EndAnswer) -> EndAction {
 }
 
 /// Asks the run's object to end attempt `job.attempt` as failed.
-async fn post_failed(env: &Env, db: &Db, job: &JobRow, message: &str) -> EndAnswer {
+pub(crate) async fn post_failed(env: &Env, db: &Db, job: &JobRow, message: &str) -> EndAnswer {
     let run = match store::run(db, job.run_id).await {
         Ok(Some(run)) => run,
         Ok(None) => return EndAnswer::RunMissing,

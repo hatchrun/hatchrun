@@ -71,7 +71,7 @@ use crate::logs::{BACKLOG_BYTES, Compressor, LogIndex, LogWriter, index_key, log
 use crate::store;
 
 /// The queue that launches instances.
-const LAUNCHES: &str = "CI_LAUNCHES";
+pub(crate) const LAUNCHES: &str = "CI_LAUNCHES";
 /// The R2 bucket of logs, which also keeps the state of ended runs.
 const BUCKET: &str = "LOGS";
 /// How often a job's heartbeat reaches Postgres, in milliseconds.

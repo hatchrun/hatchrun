@@ -30,13 +30,17 @@ pub mod launcher;
 pub mod launches;
 pub mod logs;
 pub mod planning;
+pub mod reconcile;
 pub mod run;
 pub mod runs;
 pub mod store;
 pub mod token;
 pub mod webhook;
 
-use worker::{Context, Env, MessageBatch, Method, Request, Response, Result, event};
+use worker::{
+    Context, Env, MessageBatch, Method, Request, Response, Result, ScheduleContext, ScheduledEvent,
+    event,
+};
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -62,4 +66,10 @@ async fn queue(
         launches::consume(batch, env).await;
     }
     Ok(())
+}
+
+/// The Cron Trigger, every minute: see [`reconcile`].
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    reconcile::run(env).await;
 }
