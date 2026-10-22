@@ -315,19 +315,27 @@ pub fn valid_name(name: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::token::tests::{random_key, random_nonce};
+    use std::sync::LazyLock;
 
     const PLAIN: &str = "hunter2-token";
 
-    fn key(id: &str, fill: u8) -> Key {
+    /// The current key for this test run, shared by `ring()` calls.
+    static CURRENT: LazyLock<[u8; 32]> = LazyLock::new(random_key);
+
+    fn key(id: &str) -> Key {
         Key {
             id: id.into(),
-            bytes: [fill; 32],
+            bytes: random_key(),
         }
     }
 
     fn ring() -> Keyring {
         Keyring {
-            current: key("2026-10", 1),
+            current: Key {
+                id: "2026-10".into(),
+                bytes: *CURRENT,
+            },
             previous: None,
         }
     }
@@ -343,7 +351,7 @@ mod tests {
     #[test]
     fn round_trips() {
         let ring = ring();
-        let sealed = seal(&ring.current, &aad("A"), [9; 12], PLAIN);
+        let sealed = seal(&ring.current, &aad("A"), random_nonce(), PLAIN);
         assert!(!sealed.contains(PLAIN));
         assert_eq!(open(&ring, "2026-10", &aad("A"), &sealed).unwrap(), PLAIN);
     }
@@ -351,7 +359,7 @@ mod tests {
     #[test]
     fn another_row_cannot_open_it() {
         let ring = ring();
-        let sealed = seal(&ring.current, &aad("A"), [9; 12], PLAIN);
+        let sealed = seal(&ring.current, &aad("A"), random_nonce(), PLAIN);
         let other = [
             aad("B"),
             Aad {
@@ -382,9 +390,9 @@ mod tests {
     #[test]
     fn a_wrong_key_or_damaged_text_fails() {
         let ring = ring();
-        let sealed = seal(&ring.current, &aad("A"), [9; 12], PLAIN);
+        let sealed = seal(&ring.current, &aad("A"), random_nonce(), PLAIN);
         let wrong = Keyring {
-            current: key("2026-10", 2),
+            current: key("2026-10"),
             previous: None,
         };
         assert_eq!(
@@ -409,19 +417,19 @@ mod tests {
 
     #[test]
     fn a_nonce_makes_a_different_ciphertext() {
-        let k = key("k", 1);
+        let k = key("k");
         assert_ne!(
-            seal(&k, &aad("A"), [1; 12], PLAIN),
-            seal(&k, &aad("A"), [2; 12], PLAIN)
+            seal(&k, &aad("A"), random_nonce(), PLAIN),
+            seal(&k, &aad("A"), random_nonce(), PLAIN)
         );
     }
 
     #[test]
     fn opens_a_value_sealed_with_the_previous_key() {
-        let old = key("2025-01", 3);
-        let sealed = seal(&old, &aad("A"), [9; 12], PLAIN);
+        let old = key("2025-01");
+        let sealed = seal(&old, &aad("A"), random_nonce(), PLAIN);
         let ring = Keyring {
-            current: key("2026-10", 1),
+            current: ring().current,
             previous: Some(old),
         };
         assert_eq!(open(&ring, "2025-01", &aad("A"), &sealed).unwrap(), PLAIN);
@@ -429,7 +437,7 @@ mod tests {
 
     #[test]
     fn unknown_key_id_is_an_error() {
-        let sealed = seal(&ring().current, &aad("A"), [9; 12], PLAIN);
+        let sealed = seal(&ring().current, &aad("A"), random_nonce(), PLAIN);
         assert_eq!(
             open(&ring(), "2025-01", &aad("A"), &sealed),
             Err(SecretError::UnknownKey("2025-01".into()))
@@ -438,13 +446,13 @@ mod tests {
 
     #[test]
     fn reseal_moves_a_value_to_the_current_key() {
-        let old = key("2025-01", 3);
-        let sealed = seal(&old, &aad("A"), [9; 12], PLAIN);
+        let old = key("2025-01");
+        let sealed = seal(&old, &aad("A"), random_nonce(), PLAIN);
         let ring = Keyring {
-            current: key("2026-10", 1),
+            current: ring().current,
             previous: Some(old),
         };
-        let again = reseal(&ring, "2025-01", &aad("A"), &sealed, [4; 12]).unwrap();
+        let again = reseal(&ring, "2025-01", &aad("A"), &sealed, random_nonce()).unwrap();
         let only_current = Keyring {
             current: ring.current.clone(),
             previous: None,
@@ -458,7 +466,7 @@ mod tests {
     #[test]
     fn errors_never_hold_the_value() {
         let ring = ring();
-        let sealed = seal(&ring.current, &aad("A"), [9; 12], PLAIN);
+        let sealed = seal(&ring.current, &aad("A"), random_nonce(), PLAIN);
         let errors = [
             open(&ring, "2026-10", &aad("B"), &sealed).unwrap_err(),
             open(&ring, "2025-01", &aad("A"), &sealed).unwrap_err(),
@@ -468,7 +476,7 @@ mod tests {
             assert!(!err.to_string().contains(PLAIN));
         }
         let shown = format!("{ring:?}");
-        assert!(!shown.contains("[1, 1"));
+        assert!(!shown.contains(&format!("{:?}", ring.current.bytes)));
         assert!(shown.contains("<hidden>"));
     }
 
@@ -501,8 +509,9 @@ mod tests {
 
     #[test]
     fn keys_parse_from_base64() {
-        assert_eq!(parse_key(&STANDARD.encode([5u8; 32])), Some([5; 32]));
-        assert_eq!(parse_key(&STANDARD.encode([5u8; 31])), None);
+        let k = random_key();
+        assert_eq!(parse_key(&STANDARD.encode(k)), Some(k));
+        assert_eq!(parse_key(&STANDARD.encode(&k[..31])), None);
         assert_eq!(parse_key("%%"), None);
     }
 
@@ -517,7 +526,7 @@ mod tests {
             repo_id,
             name: name.into(),
             key_id: ring.current.id.clone(),
-            sealed: seal(&ring.current, &aad, [3; 12], value),
+            sealed: seal(&ring.current, &aad, random_nonce(), value),
         }
     }
 

@@ -128,6 +128,12 @@ pub(crate) mod tests {
         std::array::from_fn(|at| state.hash_one(at).to_le_bytes()[0])
     }
 
+    /// Fresh random nonce bytes.
+    pub(crate) fn random_nonce() -> [u8; 12] {
+        let state = RandomState::new();
+        std::array::from_fn(|at| state.hash_one(at).to_le_bytes()[0])
+    }
+
     fn claims() -> Claims {
         Claims {
             job: 7,

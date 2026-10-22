@@ -1220,7 +1220,7 @@ workflows:
 
     #[test]
     fn put_without_csrf_is_refused() {
-        let id = [7_u8; 32];
+        let id = crate::token::tests::random_key();
         let token = hatchrun_cloud::session::csrf_token(&id);
         assert_eq!(
             csrf_guard(Some(&id), None),
