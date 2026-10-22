@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::checks::StepView;
+use crate::github::Capped;
 use crate::graph::Node;
 use crate::intake::Repo;
 use crate::logs::LogIndex;
@@ -195,6 +196,8 @@ pub struct JobState {
     pub upload_pending: bool,
     /// Why the queued job waits for a launch, until an agent claims it.
     pub held: Option<String>,
+    /// The token scopes the App holds less of than the job asked.
+    pub capped: Vec<Capped>,
 }
 
 /// A finished job's log as it waits for the upload.
