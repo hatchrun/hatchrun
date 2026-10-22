@@ -53,7 +53,7 @@ use crate::intake::Repo;
 use crate::run::RunState;
 use crate::runs::{self, Config as Loaded};
 use crate::settings_api::{self, SettingsRoute};
-use crate::store::{self, JobRow, RepoRow, RunRow};
+use crate::store::{self, CiBilling, JobRow, RepoRow, RunRow};
 
 /// The logs bucket.
 const BUCKET: &str = "LOGS";
@@ -912,6 +912,18 @@ impl Cx<'_> {
             &repo.full_name,
             &session.user.login,
         );
+        if let Some(tenant) = store::tenant(self.db, &repo.tenant_id).await?
+            && tenant.ci_billing != CiBilling::Active
+        {
+            return Ok(stop(
+                402,
+                format!(
+                    "Add a card for {org} at {app}/o/{org}/ci to run workflows.",
+                    org = tenant.org_login,
+                    app = settings.app_url
+                ),
+            ));
+        }
         let delivery = format!("dispatch:{}", hex(&webcrypto::random_bytes(16)?));
         let started = Repo {
             id: repo.id,
@@ -947,8 +959,7 @@ impl Cx<'_> {
         if ids.is_empty() {
             return Ok(stop(
                 422,
-                "no run started: CI is off for this organization, or the workflow \
-                 has no job for this ref",
+                "no run started: the workflow has no job for this ref",
             ));
         }
         reply(202, &json!({ "runs": ids })).map(Ok)
