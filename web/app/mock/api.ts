@@ -6,10 +6,11 @@
 // its state in memory, so screens can be worked on without GitHub,
 // Polar or AWS. It answers the same shapes as crates/cloud/src/app.rs.
 
-import type { IncomingMessage, ServerResponse } from "node:http";
+import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
 import type { Job, ListedRun, Run } from "../src/api.ts";
+import { handleCi, serveLiveSockets } from "./ci.ts";
 import * as profiles from "./runners.ts";
 
 interface MockTenant {
@@ -492,10 +493,18 @@ export function mockApi(): Plugin {
   return {
     name: "hatchrun-mock-api",
     configureServer(server) {
+      if (server.httpServer) {
+        // The mock server is plain HTTP.
+        serveLiveSockets(server.httpServer as unknown as Server);
+      }
       server.middlewares.use(async (req, res, next) => {
         const url = new URL(req.url ?? "/", "http://localhost");
         if (!url.pathname.startsWith("/api/")) {
           next();
+          return;
+        }
+        if (url.pathname.startsWith("/api/ci/")) {
+          await handleCi(req, res, url, { signedIn: state.signedIn, csrf: "mock" }, await readBody(req));
           return;
         }
         const key = `${req.method} ${url.pathname}`;

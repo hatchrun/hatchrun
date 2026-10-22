@@ -7,8 +7,10 @@
 //! The crate does no I/O and never reads the clock, so the same code runs
 //! in a Cloudflare Worker, the runner agent and the CLI.
 
+pub mod agent;
 pub mod config;
 pub mod convert;
+pub mod cron;
 pub mod diagnostic;
 pub mod expr;
 pub mod job;
@@ -22,8 +24,11 @@ pub use config::{
     UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
 };
 pub use convert::{Conversion, convert, to_yaml};
+pub use cron::{Cron, UtcMinute};
 pub use diagnostic::Diagnostic;
-pub use expr::{ExprError, Functions, JobStatus, checks_status, evaluate, interpolate, truthy};
+pub use expr::{
+    ExprError, Functions, JobStatus, checks_status, evaluate, interpolate, job_condition, truthy,
+};
 pub use job::{
     Annotation, AnnotationLevel, CacheService, Conclusion, Github, JobDocument, JobResult, Need,
     StepSummary,

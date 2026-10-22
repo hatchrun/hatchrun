@@ -5,7 +5,9 @@
 //! GitHub-style `${{ }}` expressions.
 
 use hatchrun_workflow::expr::check;
-use hatchrun_workflow::{ExprError, Functions, JobStatus, evaluate, interpolate, truthy};
+use hatchrun_workflow::{
+    ExprError, Functions, JobStatus, evaluate, interpolate, job_condition, truthy,
+};
 use serde_json::{Value, json};
 
 struct NoFiles;
@@ -588,4 +590,61 @@ fn checks_status_finds_status_calls_in_the_parsed_expression() {
     }
     assert!(checks_status("${{ 1 + }}").is_err());
     assert!(checks_status("${{ success()").is_err());
+}
+
+#[test]
+fn job_condition_defaults_to_success() {
+    let ctx = json!({});
+    assert!(job_condition(None, &ctx, &Files(JobStatus::Success)).unwrap());
+    assert!(!job_condition(None, &ctx, &Files(JobStatus::Failure)).unwrap());
+    assert!(!job_condition(None, &ctx, &Files(JobStatus::Cancelled)).unwrap());
+    assert!(!job_condition(None, &ctx, &Files(JobStatus::Skipped)).unwrap());
+}
+
+#[test]
+fn job_condition_wraps_without_status_calls() {
+    let ctx = json!({ "github": { "ref": "refs/heads/main" } });
+    let ok = Files(JobStatus::Success);
+    let failed = Files(JobStatus::Failure);
+    assert!(job_condition(Some("github.ref == 'refs/heads/main'"), &ctx, &ok).unwrap());
+    assert!(!job_condition(Some("github.ref == 'refs/heads/main'"), &ctx, &failed).unwrap());
+    assert!(job_condition(Some("${{ always() }}"), &ctx, &failed).unwrap());
+    assert!(
+        job_condition(
+            Some("failure() && github.ref == 'refs/heads/main'"),
+            &ctx,
+            &failed
+        )
+        .unwrap()
+    );
+    assert!(!job_condition(Some("cancelled()"), &ctx, &ok).unwrap());
+    assert!(job_condition(Some("${{ 1 == 1 }}"), &ctx, &ok).unwrap());
+    assert!(job_condition(Some("(("), &ctx, &ok).is_err());
+}
+
+#[test]
+fn job_condition_mixed_template_is_a_truthy_string() {
+    let ctx = json!({ "github": { "ref": "refs/heads/main" } });
+    let ok = Files(JobStatus::Success);
+    let failed = Files(JobStatus::Failure);
+    let mixed = "${{ github.ref == 'x' }} && ${{ github.ref == 'y' }}";
+    // Both segments are false, the string is not: truthy on GitHub.
+    assert!(job_condition(Some(mixed), &ctx, &ok).unwrap());
+    // success() is still implied when no segment calls a status function.
+    assert!(!job_condition(Some(mixed), &ctx, &failed).unwrap());
+    let always = "${{ always() }} && ${{ false }}";
+    assert!(job_condition(Some(always), &ctx, &failed).unwrap());
+    // Validation and evaluation agree: a bad segment fails both.
+    assert!(job_condition(Some("${{ 1 + }} && ${{ true }}"), &ctx, &ok).is_err());
+    assert!(job_condition(Some("${{ true }} && ${{ false"), &ctx, &ok).is_err());
+    // A status call does not excuse a later segment that does not parse.
+    assert!(job_condition(Some("${{ always() }} && ${{ 1 + }}"), &ctx, &ok).is_err());
+    assert!(hatchrun_workflow::checks_status("${{ always() }} && ${{ 1 + }}").is_err());
+    // Quoted `${{` inside one whole expression keeps it one expression.
+    let quoted = "${{ contains(github.ref, '${{') }}";
+    assert!(!job_condition(Some(quoted), &ctx, &ok).unwrap());
+    // A text prefix or suffix makes it a template too.
+    assert!(job_condition(Some("x ${{ false }}"), &ctx, &ok).unwrap());
+    // One whole wrapper still evaluates.
+    assert!(!job_condition(Some("${{ false }}"), &ctx, &ok).unwrap());
 }

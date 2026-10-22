@@ -36,7 +36,8 @@ use crate::db::params;
 use crate::fetch::send;
 use crate::github::{self, Installation, Membership};
 use crate::install::{self, Refusal};
-use crate::launch::{APP_KEY, app_jwt};
+use crate::launch::APP_KEY;
+use crate::start::app_jwt;
 use crate::{connect, jwt, now_ms, session, settings, tenant, webcrypto};
 
 /// A tenant row.

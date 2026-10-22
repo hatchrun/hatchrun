@@ -12,7 +12,8 @@ import { useLoad } from "./load";
 import { Home } from "./pages/Home";
 import { SignIn } from "./pages/SignIn";
 import { TenantPage } from "./pages/TenantPage";
-import { navigate, useLocation } from "./router";
+import { CiPages } from "./pages/ci/RunPage";
+import { matchCi, navigate, useLocation } from "./router";
 
 type State = { kind: "loading" } | { kind: "error"; message: string } | { kind: "ready"; session: Session | null };
 
@@ -51,6 +52,11 @@ export function App() {
         </div>
       </main>
     );
+  }
+  // Runs of public repositories read without signing in.
+  const ci = matchCi(path);
+  if (ci) {
+    return <CiPages session={state.session} route={ci} />;
   }
   if (state.session === null) {
     return <SignIn returnTo={path === "/signin" ? "/" : location} />;

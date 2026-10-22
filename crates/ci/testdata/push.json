@@ -1,0 +1,19 @@
+{
+  "ref": "refs/heads/main",
+  "before": "1111111111111111111111111111111111111111",
+  "after": "2222222222222222222222222222222222222222",
+  "deleted": false,
+  "commits": [
+    { "id": "a1", "added": ["src/a.rs"], "removed": [], "modified": ["README.md"] },
+    { "id": "a2", "added": [], "removed": [], "modified": ["src/a.rs", "README.md"] }
+  ],
+  "pusher": { "name": "octocat" },
+  "sender": { "login": "octocat" },
+  "installation": { "id": 777 },
+  "repository": {
+    "id": 4242,
+    "full_name": "octo/widgets",
+    "default_branch": "main",
+    "private": true
+  }
+}

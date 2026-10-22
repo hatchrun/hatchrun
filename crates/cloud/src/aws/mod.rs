@@ -305,6 +305,7 @@ mod tests {
     #[test]
     fn reads_both_error_shapes() {
         let ec2 = Response {
+            headers: Vec::new(),
             status: 400,
             body: b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response><Errors><Error>\
                     <Code>InsufficientInstanceCapacity</Code><Message>none &amp; more</Message>\
@@ -319,17 +320,19 @@ mod tests {
                 message: "none & more".to_owned(),
             }
         );
-        let sts = Response {
+        let sts = Response { headers: Vec::new(),
             status: 403,
             body: br#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>Not authorized</Message></Error><RequestId>r</RequestId></ErrorResponse>"#.to_vec(),
         };
         assert_eq!(document(&sts).unwrap_err().code, "AccessDenied");
         let html = Response {
+            headers: Vec::new(),
             status: 503,
             body: b"<html>busy".to_vec(),
         };
         assert_eq!(document(&html).unwrap_err().code, "HTTP503");
         let garbage = Response {
+            headers: Vec::new(),
             status: 200,
             body: b"{}".to_vec(),
         };

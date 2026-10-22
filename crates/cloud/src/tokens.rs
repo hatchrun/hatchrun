@@ -22,8 +22,9 @@ use worker::{Env, KvStore, console_warn};
 
 use crate::fetch::Sender;
 use crate::http::{Request, Response};
-use crate::launch::{APP_ID, APP_KEY, GITHUB_API_URL, app_jwt};
+use crate::launch::{APP_ID, APP_KEY, GITHUB_API_URL};
 use crate::reconcile::time;
+use crate::start::app_jwt;
 use crate::{github, jwt};
 
 /// The KV namespace that holds the tokens.
@@ -36,9 +37,11 @@ const MIN_TTL: u64 = 60;
 
 /// A token and when it expires, Unix ms.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Token {
-    pub(crate) token: String,
-    pub(crate) expires_at: u64,
+pub struct Token {
+    /// The token's value.
+    pub token: String,
+    /// Unix ms.
+    pub expires_at: u64,
 }
 
 impl fmt::Debug for Token {
@@ -51,20 +54,26 @@ impl fmt::Debug for Token {
 
 impl Token {
     /// Whether the token is good for use at `now`.
-    pub(crate) fn fresh(&self, now: u64) -> bool {
+    #[must_use]
+    pub fn fresh(&self, now: u64) -> bool {
         now.saturating_add(REFRESH_BEFORE) < self.expires_at
     }
 }
 
 /// Why there is no token, or no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Error {
+pub enum Error {
     /// The App's id or key is missing or will not sign.
     Settings(String),
     /// GitHub could not be reached.
     Unreachable(String),
     /// GitHub refused to mint a token.
-    GitHub { status: u16, message: String },
+    GitHub {
+        /// GitHub's status.
+        status: u16,
+        /// What GitHub said.
+        message: String,
+    },
     /// GitHub's answer was not a token.
     Answer(String),
 }
@@ -81,7 +90,8 @@ impl fmt::Display for Error {
 }
 
 /// Where tokens are kept between requests.
-pub(crate) trait Store {
+#[allow(async_fn_in_trait)] // Workers run one thread; no `Send` is needed.
+pub trait Store {
     /// The installation's token, if one is kept.
     async fn read(&self, installation_id: u64) -> Option<Token>;
     /// Keeps `token` for the installation, replacing any other.
@@ -99,17 +109,20 @@ impl<S: Store> Store for &S {
 }
 
 /// Makes new tokens.
-pub(crate) trait Mint {
+#[allow(async_fn_in_trait)] // Workers run one thread; no `Send` is needed.
+pub trait Mint {
     /// A new token of the installation, asked for through `github`.
     async fn mint<G: Sender>(&self, github: &G, installation_id: u64) -> Result<Token, Error>;
 }
 
 /// The `TOKENS` namespace. Without the binding nothing is kept and
 /// every call mints.
-pub(crate) struct Kv(Option<KvStore>);
+pub struct Kv(Option<KvStore>);
 
 impl Kv {
-    pub(crate) fn new(env: &Env) -> Self {
+    /// The namespace bound in `env`.
+    #[must_use]
+    pub fn new(env: &Env) -> Self {
         match env.kv(BINDING) {
             Ok(store) => Self(Some(store)),
             Err(err) => {
@@ -162,7 +175,7 @@ impl Store for Kv {
 }
 
 /// The App, which trades a JWT signed with its key for a token.
-pub(crate) struct App {
+pub struct App {
     /// The REST API.
     pub(crate) api: String,
     id: String,
@@ -172,12 +185,17 @@ pub(crate) struct App {
 impl App {
     /// The App at `api`, with client id `app_id` and its private key in
     /// PKCS#8 DER.
-    pub(crate) fn new(api: String, id: String, key: Vec<u8>) -> Self {
+    #[must_use]
+    pub fn new(api: String, id: String, key: Vec<u8>) -> Self {
         Self { api, id, key }
     }
 
     /// The App from the Worker's variables and secrets.
-    pub(crate) fn read(env: &Env) -> Result<Self, String> {
+    ///
+    /// # Errors
+    ///
+    /// A setting is missing or the key does not parse.
+    pub fn read(env: &Env) -> Result<Self, String> {
         let get = |name: &str| {
             env.secret(name)
                 .map(|value| value.to_string())
@@ -234,7 +252,7 @@ impl Mint for App {
 
 /// Installation tokens for one request or pass: from what it already
 /// holds, then the store, then minted.
-pub(crate) struct Tokens<'a, S, M, G> {
+pub struct Tokens<'a, S, M, G> {
     store: S,
     mint: M,
     github: &'a G,
@@ -245,7 +263,7 @@ pub(crate) struct Tokens<'a, S, M, G> {
 impl<'a, S: Store, M: Mint, G: Sender> Tokens<'a, S, M, G> {
     /// Tokens kept in `store`, minted by `mint`, for calls through
     /// `github` made around `now`.
-    pub(crate) fn new(store: S, mint: M, github: &'a G, now: u64) -> Self {
+    pub fn new(store: S, mint: M, github: &'a G, now: u64) -> Self {
         Self {
             store,
             mint,
@@ -260,7 +278,7 @@ impl<'a, S: Store, M: Mint, G: Sender> Tokens<'a, S, M, G> {
     /// # Errors
     ///
     /// Why none could be minted.
-    pub(crate) async fn token(&self, installation_id: u64) -> Result<String, Error> {
+    pub async fn token(&self, installation_id: u64) -> Result<String, Error> {
         self.find(installation_id).await.map(|(token, _)| token)
     }
 
@@ -304,7 +322,7 @@ impl<'a, S: Store, M: Mint, G: Sender> Tokens<'a, S, M, G> {
     ///
     /// Why there is no token, or GitHub could not be reached. GitHub's
     /// own answer, error or not, is the `Ok` value.
-    pub(crate) async fn send(
+    pub async fn send(
         &self,
         installation_id: u64,
         build: impl Fn(&str) -> Request,
@@ -394,6 +412,7 @@ pub(crate) mod tests {
 
     pub(crate) fn answer(status: u16, body: &str) -> Response {
         Response {
+            headers: Vec::new(),
             status,
             body: body.as_bytes().to_vec(),
         }

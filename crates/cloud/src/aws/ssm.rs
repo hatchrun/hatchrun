@@ -88,19 +88,21 @@ mod tests {
 
     #[test]
     fn reads_the_value_and_errors() {
-        let found = Response {
+        let found = Response { headers: Vec::new(),
             status: 200,
             body: br#"{"Parameter":{"Name":"/hatchrun/connect/abc","Type":"String","Value":"{\"version\":4}","Version":2}}"#.to_vec(),
         };
         assert_eq!(value(&found).unwrap(), r#"{"version":4}"#);
 
         let missing = Response {
+            headers: Vec::new(),
             status: 400,
             body: br#"{"__type":"com.amazonaws.ssm#ParameterNotFound","message":""}"#.to_vec(),
         };
         assert_eq!(value(&missing).unwrap_err().code, "ParameterNotFound");
 
         let denied = Response {
+            headers: Vec::new(),
             status: 400,
             body: br#"{"__type":"AccessDeniedException","Message":"not allowed"}"#.to_vec(),
         };

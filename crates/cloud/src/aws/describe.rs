@@ -282,6 +282,7 @@ mod tests {
 
     fn ok(body: &str) -> Response {
         Response {
+            headers: Vec::new(),
             status: 200,
             body: body.as_bytes().to_vec(),
         }
@@ -405,6 +406,7 @@ mod tests {
     #[test]
     fn refuses_errors() {
         let denied = Response {
+            headers: Vec::new(),
             status: 403,
             body: b"<Response><Errors><Error><Code>UnauthorizedOperation</Code>\
                 <Message>no</Message></Error></Errors></Response>"

@@ -1,0 +1,108 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name = "hatchrun-ci"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-09-01"
+
+# The webhook forwarded by hatchrun-cloud, the runner agent's API, the
+# app's CI API and the logs all live on this hostname.
+routes = [{ pattern = "ci.hatchrun.io", custom_domain = true }]
+
+[build]
+command = "cargo install --locked worker-build --version 0.8.7 && worker-build --release"
+
+# The reconciler every minute: stuck jobs, schedules and expiry.
+[triggers]
+crons = ["* * * * *"]
+
+# The same Postgres as hatchrun-cloud, through Hyperdrive; the ci_
+# tables are in crates/cloud/migrations/0004_ci.sql. The deploy workflow
+# sets id from the CLOUDFLARE_HYPERDRIVE_ID secret; wrangler dev connects
+# to localConnectionString instead.
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "hyperdrive-local"
+localConnectionString = "postgres://postgres:postgres@localhost:5432/postgres"
+
+# Installation tokens, shared with hatchrun-cloud. The deploy workflow
+# sets id from the CLOUDFLARE_KV_TOKENS_ID secret.
+[[kv_namespaces]]
+binding = "TOKENS"
+id = "local"
+
+# One RunObject per run, which orders the run's job events and log
+# batches.
+[[durable_objects.bindings]]
+name = "RUNS"
+class_name = "RunObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RunObject"]
+
+# Finished logs, kept 30 days:
+# logs/<tenant>/<repo_id>/<run>/<job>.log.gz and its .index.json.
+# Created by hand once; deploy-ci.yml applies r2-lifecycle.json, which
+# expires logs/ and state/ after 30 days.
+[[r2_buckets]]
+binding = "LOGS"
+bucket_name = "hatchrun-ci-logs"
+
+# Launches. The webhook and the reconciler send each job that is ready
+# here and this Worker's consumer starts its instance.
+[[queues.producers]]
+binding = "CI_LAUNCHES"
+queue = "hatchrun-ci-launches"
+
+# Small batches, sent after a second at most, so a job's start does not
+# wait for other jobs. Messages that fail max_retries times go to the
+# dead-letter queue, whose consumer fails their jobs.
+[[queues.consumers]]
+queue = "hatchrun-ci-launches"
+max_batch_size = 5
+max_batch_timeout = 1
+max_retries = 3
+max_concurrency = 10
+dead_letter_queue = "hatchrun-ci-launches-dlq"
+
+# Launch messages that ran out of retries.
+[[queues.consumers]]
+queue = "hatchrun-ci-launches-dlq"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+
+# Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY,
+# OIDC_SIGNING_KEY (signs the token for AssumeRoleWithWebIdentity),
+# BROKER_TOKEN (shared with hatchrun-broker) and CI_TOKEN_KEY (the HMAC
+# key of job tokens).
+# Variables: those below.
+[vars]
+# production, staging or dev. The local launcher backend is refused in
+# production.
+DEPLOY_ENV = "production"
+# How instances start: ec2.
+LAUNCHER = "ec2"
+# The app's origin, for links in check runs.
+APP_URL = "https://app.hatchrun.io"
+# This Worker's origin, which runner agents call.
+CI_URL = "https://ci.hatchrun.io"
+# hatchrun-broker, shared with hatchrun-cloud.
+BROKER_URL = "https://broker.hatchrun.io"
+# Client id of the hatchrun GitHub App (github.com/apps/hatchrun).
+GITHUB_APP_ID = "Iv23liMh4C066YyxQB7R"
+# kid of OIDC_SIGNING_KEY in oidc.hatchrun.io's JWKS.
+OIDC_KEY_ID = "2026-10-14"
+# The region of the CI AWS account, where jobs run.
+CI_REGION = "us-east-1"
+# Set by deploy-ci.yml from the CI_ROLE_ARN, CI_LAUNCH_TEMPLATE_ID and
+# CI_SUBNET_IDS repository variables, which hold the RoleArn,
+# LaunchTemplateId and SubnetIds outputs of the stack in
+# deploy/cloudformation/ci-account.yaml (us-east-1, the hatchrun CI
+# account): the role the Worker assumes, the launch template and the
+# subnets (comma separated) it launches into.
+CI_ROLE_ARN = ""
+CI_LAUNCH_TEMPLATE_ID = ""
+CI_SUBNET_IDS = ""

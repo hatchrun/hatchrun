@@ -1,0 +1,158 @@
+name: deploy-ci
+
+# Deploys crates/ci, the hatchrun-ci Worker at ci.hatchrun.io that runs
+# hatchrun CI jobs, from main. It shares the database with hatchrun-cloud,
+# so this workflow applies the migrations too, as the owner role in
+# DATABASE_MIGRATE_URL, and it sets the 30 day retention of the
+# hatchrun-ci-logs bucket. The account comes from the
+# CLOUDFLARE_ACCOUNT_ID secret.
+#
+# The API token cannot create Workers, and deploy-cloud.yml binds to
+# hatchrun-ci, so the first deploy is by hand, in this order, before the
+# change that adds this workflow merges:
+#   1. Create the R2 bucket hatchrun-ci-logs and the queues
+#      hatchrun-ci-launches and hatchrun-ci-launches-dlq.
+#   2. Apply the lifecycle: `npx wrangler r2 bucket lifecycle set
+#      hatchrun-ci-logs --file r2-lifecycle.json` from crates/ci.
+#   3. Deploy the Worker once: `npx wrangler deploy` from crates/ci.
+#   4. Merge. This workflow takes over from then on.
+# Its CI_ROLE_ARN, CI_LAUNCH_TEMPLATE_ID and CI_SUBNET_IDS repository
+# variables are the RoleArn, LaunchTemplateId and SubnetIds outputs of
+# the stack in deploy/cloudformation/ci-account.yaml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/ci/**
+      - crates/cloud/**
+      - crates/workflow/**
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/deploy-ci.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # migrate.sh locks schema_migrations, so this and the other deploy that
+  # runs it can overlap.
+  group: deploy-ci
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  WRANGLER: wrangler@4.145.0
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: crates/ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # worker-build is installed by the build command in wrangler.toml;
+      # caching it saves compiling it on every deploy. cargo install needs
+      # its own record of the install too, or it refuses to overwrite the
+      # binary it finds.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/worker-build
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: deploy-ci-v1-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      # rustup installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup show active-toolchain
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Point at the production database
+        env:
+          HYPERDRIVE_ID: ${{ secrets.CLOUDFLARE_HYPERDRIVE_ID }}
+        run: |
+          test -n "$HYPERDRIVE_ID"
+          sed -i "s/^id = \"hyperdrive-local\"$/id = \"${HYPERDRIVE_ID}\"/" wrangler.toml
+          grep -qx "id = \"${HYPERDRIVE_ID}\"" wrangler.toml
+
+      - name: Point at the production token namespace
+        env:
+          NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_TOKENS_ID }}
+        run: |
+          test -n "$NAMESPACE_ID"
+          sed -i "s/^id = \"local\"$/id = \"${NAMESPACE_ID}\"/" wrangler.toml
+          grep -qx "id = \"${NAMESPACE_ID}\"" wrangler.toml
+
+      # The CI account stack's outputs, kept as repository variables.
+      # wrangler.toml leaves them empty, and an empty one would deploy a
+      # Worker that cannot launch.
+      - name: Check the CI account variables
+        env:
+          CI_ROLE_ARN: ${{ vars.CI_ROLE_ARN }}
+          CI_LAUNCH_TEMPLATE_ID: ${{ vars.CI_LAUNCH_TEMPLATE_ID }}
+          CI_SUBNET_IDS: ${{ vars.CI_SUBNET_IDS }}
+        run: |
+          test -n "$CI_ROLE_ARN"
+          test -n "$CI_LAUNCH_TEMPLATE_ID"
+          test -n "$CI_SUBNET_IDS"
+
+      # Migrations only add tables and columns, so the running Worker
+      # keeps working against the new schema until the deploy lands.
+      # psql comes with the runner image.
+      - name: Apply migrations
+        env:
+          DATABASE_MIGRATE_URL: ${{ secrets.DATABASE_MIGRATE_URL }}
+        run: |
+          test -n "$DATABASE_MIGRATE_URL"
+          ../cloud/scripts/migrate.sh
+
+      # Objects under logs/ and state/ expire after 30 days. The rules
+      # replace the bucket's whole lifecycle, so r2-lifecycle.json is
+      # all of it.
+      - name: Set the log retention
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes "$WRANGLER" r2 bucket lifecycle set hatchrun-ci-logs --file r2-lifecycle.json
+
+      # Secrets set in the environment are uploaded with the deploy;
+      # those left empty keep their current value on the Worker. GitHub
+      # refuses secret names that start with GITHUB_, so the App's are
+      # stored as APP_* and uploaded under the Worker's names.
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GITHUB_WEBHOOK_SECRET: ${{ secrets.APP_WEBHOOK_SECRET }}
+          GITHUB_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          OIDC_SIGNING_KEY: ${{ secrets.OIDC_SIGNING_KEY }}
+          BROKER_TOKEN: ${{ secrets.BROKER_TOKEN }}
+          CI_TOKEN_KEY: ${{ secrets.CI_TOKEN_KEY }}
+          CI_ROLE_ARN: ${{ vars.CI_ROLE_ARN }}
+          CI_LAUNCH_TEMPLATE_ID: ${{ vars.CI_LAUNCH_TEMPLATE_ID }}
+          CI_SUBNET_IDS: ${{ vars.CI_SUBNET_IDS }}
+        run: |
+          secrets="$RUNNER_TEMP/worker-secrets.json"
+          trap 'rm -f "$secrets"' EXIT
+          (umask 077 && jq -n 'env | with_entries(select(
+              (.key | IN("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_PRIVATE_KEY", "OIDC_SIGNING_KEY",
+                         "BROKER_TOKEN", "CI_TOKEN_KEY"))
+              and .value != ""))' > "$secrets")
+          echo "Uploading secrets: $(jq -r 'keys | join(", ")' "$secrets")"
+          npx --yes "$WRANGLER" deploy --secrets-file "$secrets" \
+            --var "CI_ROLE_ARN:$CI_ROLE_ARN" \
+            --var "CI_LAUNCH_TEMPLATE_ID:$CI_LAUNCH_TEMPLATE_ID" \
+            --var "CI_SUBNET_IDS:$CI_SUBNET_IDS"

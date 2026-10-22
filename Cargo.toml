@@ -31,6 +31,9 @@ strip = true
 [profile.release.package.hatchrun-broker]
 strip = "debuginfo"
 
+[profile.release.package.hatchrun-ci]
+strip = "debuginfo"
+
 [profile.release.package.hatchrun-cloud]
 strip = "debuginfo"
 

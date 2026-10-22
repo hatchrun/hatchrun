@@ -131,6 +131,9 @@ struct UserData {
     /// Ticket to claim the config with.
     #[serde(default)]
     ticket: String,
+    /// `ci` for a launch by the control plane's CI. Empty otherwise.
+    #[serde(default)]
+    mode: String,
 }
 
 /// Where user data says the config is.
@@ -237,6 +240,29 @@ pub async fn is_runner_launch(metadata: &impl Metadata) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// The broker and ticket of a CI launch, when user data says `"mode":
+/// "ci"`. Any other user data, including a runner's, gives `None`.
+///
+/// # Errors
+///
+/// When user data names the CI mode but not both a broker and a ticket,
+/// or cannot be parsed as JSON.
+pub(crate) fn ci_ticket(raw: &[u8]) -> Result<Option<(String, String)>> {
+    let raw = decompress(raw)?;
+    let raw = raw.trim_ascii();
+    if raw.first() != Some(&b'{') {
+        return Ok(None);
+    }
+    let doc: UserData = serde_json::from_slice(raw).context("parse user data")?;
+    if doc.mode != "ci" {
+        return Ok(None);
+    }
+    if doc.broker.is_empty() || doc.ticket.is_empty() {
+        bail!("CI user data must set both broker and ticket");
+    }
+    Ok(Some((doc.broker, doc.ticket)))
 }
 
 fn from_user_data(raw: &[u8]) -> Result<Option<FromUserData>> {
@@ -377,6 +403,29 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(data).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn ci_mode_user_data_names_the_ticket() {
+        let raw = br#"{"mode":"ci","broker":"https://b","ticket":"t"}"#;
+        assert_eq!(
+            ci_ticket(raw).unwrap(),
+            Some(("https://b".to_owned(), "t".to_owned()))
+        );
+        assert_eq!(ci_ticket(&gzip(raw)).unwrap(), ci_ticket(raw).unwrap());
+        assert!(ci_ticket(br#"{"mode":"ci","broker":"https://b"}"#).is_err());
+    }
+
+    #[test]
+    fn runner_user_data_is_not_ci() {
+        for raw in [
+            &br#"{"broker":"https://b","ticket":"t"}"#[..],
+            br#"{"jitConfig":"jit"}"#,
+            b"#!/bin/sh\necho hi\n",
+            b"",
+        ] {
+            assert_eq!(ci_ticket(raw).unwrap(), None);
+        }
     }
 
     #[tokio::test]

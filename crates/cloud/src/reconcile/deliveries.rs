@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn reads_a_page() {
-        let answer = Response {
+        let answer = Response { headers: Vec::new(),
             status: 200,
             body: br#"[{"id":12345678,"guid":"0b989ba4","delivered_at":"2026-10-14T10:00:00Z","redelivery":false,"duration":0.27,"status":"Invalid HTTP Response: 503","status_code":503,"event":"workflow_job","action":"queued","installation_id":7,"repository_id":9,"throttled_at":null}]"#.to_vec(),
         };
@@ -194,6 +194,7 @@ mod tests {
             )]
         );
         let denied = Response {
+            headers: Vec::new(),
             status: 401,
             body: br#"{"message":"A JSON web token could not be decoded"}"#.to_vec(),
         };

@@ -129,11 +129,28 @@ export interface Tenant {
 
 export class ApiError extends Error {
   readonly status: number;
+  /** Seconds the server asked to wait before trying again (503). */
+  readonly retryAfter: number | null;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, retryAfter: number | null = null) {
     super(message.charAt(0).toUpperCase() + message.slice(1));
     this.status = status;
+    this.retryAfter = retryAfter;
   }
+}
+
+async function failure(response: Response): Promise<ApiError> {
+  let message = `${response.status} ${response.statusText}`;
+  try {
+    const answer = (await response.json()) as { error?: string };
+    if (answer.error) {
+      message = answer.error;
+    }
+  } catch {
+    // Not JSON: keep the status line.
+  }
+  const wait = Number(response.headers.get("Retry-After"));
+  return new ApiError(response.status, message, Number.isFinite(wait) && wait > 0 ? wait : null);
 }
 
 let csrfToken = "";
@@ -153,16 +170,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     credentials: "same-origin",
   });
   if (!response.ok) {
-    let message = `${response.status} ${response.statusText}`;
-    try {
-      const answer = (await response.json()) as { error?: string };
-      if (answer.error) {
-        message = answer.error;
-      }
-    } catch {
-      // Not JSON: keep the status line.
-    }
-    throw new ApiError(response.status, message);
+    throw await failure(response);
   }
   if (response.status === 204) {
     return undefined as T;
@@ -535,3 +543,125 @@ export const replaceProfile = (org: string, name: string, profile: Profile) =>
   put<Runners>(`${runnersPath(org)}/${encodeURIComponent(name)}`, profile);
 export const deleteProfile = (org: string, name: string) =>
   request<Runners>("DELETE", `${runnersPath(org)}/${encodeURIComponent(name)}`);
+
+/** A run of the orchestrator, as /api/ci answers. Times are Unix milliseconds. */
+export interface CiRun {
+  id: number;
+  run_number: number;
+  run_attempt: number;
+  /** owner/name. */
+  repository: string;
+  workflow: string;
+  event: string;
+  /** The full ref, such as refs/heads/main. */
+  ref: string;
+  sha: string;
+  actor: string;
+  status: string;
+  conclusion: string | null;
+  created_at: number;
+  completed_at: number | null;
+}
+
+/** A step of a job. A running job's steps have a summary once they end. */
+export interface CiStep {
+  index?: number;
+  name: string;
+  summary?: { conclusion: string; duration_ms: number } | null;
+  /** A finished job's steps are stored as summaries. */
+  conclusion?: string;
+  duration_ms?: number;
+}
+
+export interface CiJob {
+  id: number;
+  plan_id: string;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  attempt: number;
+  started_at: number | null;
+  completed_at: number | null;
+  steps: CiStep[];
+  has_log: boolean;
+}
+
+export interface CiRunDetail {
+  run: CiRun;
+  jobs: CiJob[];
+}
+
+/** Where a step starts in a finished log. */
+export interface LogIndex {
+  bytes: number;
+  steps: { index: number; name: string; offset: number }[];
+  dropped_lines: number;
+}
+
+export interface CiLog {
+  text: string;
+  /** Where the text starts in the whole log; null when the answer is a finished, stored log. */
+  offset: number | null;
+}
+
+const MOST_WAIT_MS = 30_000;
+
+/** Runs `call`; on 503 waits for the Retry-After it names, twice at most. */
+async function retrying<T>(call: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call();
+    } catch (err) {
+      if (!(err instanceof ApiError) || err.status !== 503 || attempt >= 2) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min((err.retryAfter ?? 2) * 1000, MOST_WAIT_MS)));
+    }
+  }
+}
+
+const repoPath = (owner: string, repo: string) => `/api/ci/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+
+/** A repository's runs, newest first, 50 at a time; `before` is the id of the last run shown. */
+export const listCiRuns = (owner: string, repo: string, before?: number) =>
+  retrying(() =>
+    get<{ runs: CiRun[] }>(`${repoPath(owner, repo)}/runs${before === undefined ? "" : `?before=${before}`}`),
+  );
+
+export const getCiRun = (id: string | number) => retrying(() => get<CiRunDetail>(`/api/ci/runs/${id}`));
+
+export const cancelCiRun = (id: number) => post<undefined>(`/api/ci/runs/${id}/cancel`);
+
+/** The job's log: the stored one once it ended, else the newest text the run holds. */
+export const getCiLog = (job: string | number) =>
+  retrying(async (): Promise<CiLog> => {
+    const response = await fetch(`/api/ci/jobs/${job}/log`, { credentials: "same-origin" });
+    if (!response.ok) {
+      throw await failure(response);
+    }
+    const offset = response.headers.get("x-log-offset");
+    return { text: await response.text(), offset: offset === null ? null : Number(offset) };
+  });
+
+/** The index of a finished log; null when there is none (the job runs, or the log is not stored yet). */
+export const getCiLogIndex = async (job: string | number): Promise<LogIndex | null> => {
+  try {
+    return await retrying(() => get<LogIndex>(`/api/ci/jobs/${job}/log/index`));
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) {
+      return null;
+    }
+    throw err;
+  }
+};
+
+export interface DispatchRequest {
+  workflow: string;
+  /** A branch, a tag or a full ref; empty for the default branch. */
+  ref: string;
+  inputs: Record<string, string | boolean | number>;
+}
+
+/** Starts a workflow by hand; answers the ids of the runs it started. */
+export const dispatchWorkflow = (owner: string, repo: string, body: DispatchRequest) =>
+  post<{ runs: number[] }>(`${repoPath(owner, repo)}/dispatch`, body);

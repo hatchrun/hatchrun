@@ -339,6 +339,7 @@ mod tests {
 
     fn response(status: u16, body: &str) -> Response {
         Response {
+            headers: Vec::new(),
             status,
             body: body.as_bytes().to_vec(),
         }

@@ -42,7 +42,8 @@ use crate::db::Db;
 use crate::fetch::{Counted, Sender, send};
 use crate::http::Request as Outgoing;
 use crate::jobs::{self, Upload};
-use crate::launch::{AWS_ENDPOINT_URL, tenant_credentials};
+use crate::launch::AWS_ENDPOINT_URL;
+use crate::start::role_credentials;
 use crate::tokens::{self, App, Kv, Mint, Store, Tokens};
 use crate::{github, jwt, now_ms, oidc, telemetry, webcrypto};
 
@@ -423,7 +424,7 @@ async fn credentials(ctx: &Context<'_>) -> std::result::Result<Credentials, Refu
     };
     let key = jwt::pkcs8_der(&secret(oidc::SIGNING_KEY)?)
         .map_err(|err| Refusal::new(500, format!("{}: {err}", oidc::SIGNING_KEY)))?;
-    let credentials = tenant_credentials(
+    let credentials = role_credentials(
         &key,
         &secret(oidc::KEY_ID)?,
         ctx.aws_endpoint.as_deref(),

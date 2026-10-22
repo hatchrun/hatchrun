@@ -1,0 +1,20 @@
+{
+  "rules": [
+    {
+      "id": "expire-logs",
+      "enabled": true,
+      "conditions": { "prefix": "logs/" },
+      "deleteObjectsTransition": {
+        "condition": { "type": "Age", "maxAge": 2592000 }
+      }
+    },
+    {
+      "id": "expire-state",
+      "enabled": true,
+      "conditions": { "prefix": "state/" },
+      "deleteObjectsTransition": {
+        "condition": { "type": "Age", "maxAge": 2592000 }
+      }
+    }
+  ]
+}

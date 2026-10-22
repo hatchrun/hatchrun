@@ -14,7 +14,8 @@ use crate::http::{Request, Response};
 
 /// Sends requests. [`Counted`] sends them with `fetch`; tests answer
 /// them in place.
-pub(crate) trait Sender {
+#[allow(async_fn_in_trait)] // Workers run one thread; no `Send` is needed.
+pub trait Sender {
     /// Sends `request`.
     async fn send(&self, request: &Request) -> std::result::Result<Response, String>;
 
@@ -34,20 +35,20 @@ pub(crate) trait Sender {
 /// installation's answers showed, for the alerts (see
 /// [`crate::alerts`]).
 #[derive(Default)]
-pub(crate) struct Counted {
+pub struct Counted {
     sent: Cell<u32>,
     limits: RefCell<BTreeMap<u64, RateLimit>>,
 }
 
 impl Counted {
     /// Requests sent so far.
-    pub(crate) fn sent(&self) -> u32 {
+    pub fn sent(&self) -> u32 {
         self.sent.get()
     }
 
     /// The installations whose answers had little left or were refused
     /// for the rate limit, with the lowest each showed.
-    pub(crate) fn low(&self) -> Vec<(u64, RateLimit)> {
+    pub fn low(&self) -> Vec<(u64, RateLimit)> {
         self.limits
             .borrow()
             .iter()
@@ -82,6 +83,10 @@ impl Sender for Counted {
 }
 
 /// Sends a request with the runtime's `fetch`.
+///
+/// # Errors
+///
+/// The request could not be sent or its answer not read.
 pub async fn send(request: &Request) -> std::result::Result<Response, String> {
     send_reading(request, None)
         .await
@@ -90,6 +95,10 @@ pub async fn send(request: &Request) -> std::result::Result<Response, String> {
 
 /// Sends a request and returns the answer with the value of its
 /// `header`, such as GitHub's `Link`.
+///
+/// # Errors
+///
+/// The request could not be sent or its answer not read.
 pub async fn send_reading(
     request: &Request,
     header: Option<&str>,
@@ -114,9 +123,15 @@ pub async fn send_reading(
             Some(name) => response.headers().get(name)?,
             None => None,
         };
+        let headers = response
+            .headers()
+            .entries()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value))
+            .collect();
         Ok::<_, worker::Error>((
             Response {
                 status: response.status_code(),
+                headers,
                 body: response.bytes().await?,
             },
             value,

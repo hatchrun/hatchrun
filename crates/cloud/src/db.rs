@@ -34,13 +34,14 @@ const HYPERDRIVE: &str = "HYPERDRIVE";
 
 /// A value bound to a statement.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Param {
+pub enum Param {
     /// An integer, sent as `bigint`.
     Int(i64),
     /// An integer past `i64::MAX`, which no column holds.
     TooLarge(u64),
     /// Sent as `double precision`.
     Float(f64),
+    /// Sent as `boolean`.
     Bool(bool),
     /// Sent as `text`; `$1::json` and the like cast it.
     Text(String),
@@ -155,13 +156,14 @@ impl ToSql for Param {
 }
 
 /// The values of one statement. Each converts with [`Param::from`].
+#[macro_export]
 macro_rules! params {
     () => { Vec::<$crate::db::Param>::new() };
     ($($value:expr),+ $(,)?) => {
         <[$crate::db::Param]>::into_vec(Box::new([$($crate::db::Param::from($value)),+]))
     };
 }
-pub(crate) use params;
+pub use crate::params;
 
 impl Param {
     /// The type the statement declares for this value. NULL goes out
@@ -178,7 +180,7 @@ impl Param {
 }
 
 /// An open connection.
-pub(crate) struct Db {
+pub struct Db {
     client: Client,
     /// Shared by single statements, held alone by a transaction.
     turn: RwLock<()>,
@@ -200,7 +202,8 @@ fn typed(params: &[Param]) -> Typed<'_> {
 impl Db {
     /// Wraps a client whose connection something else drives.
     #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
-    pub(crate) fn new(client: Client) -> Self {
+    #[must_use]
+    pub fn new(client: Client) -> Self {
         Db {
             client,
             turn: RwLock::new(()),
@@ -214,7 +217,7 @@ impl Db {
     ///
     /// No binding, or Hyperdrive refused the connection.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) async fn connect(env: &worker::Env) -> worker::Result<Db> {
+    pub async fn connect(env: &worker::Env) -> worker::Result<Db> {
         use worker::postgres_tls::PassthroughTls;
         use worker::{SecureTransport, Socket};
 
@@ -241,7 +244,7 @@ impl Db {
     /// Not reachable outside a Worker; tests connect with
     /// `testdb::Db`.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn connect(_env: &worker::Env) -> impl Future<Output = worker::Result<Db>> + use<> {
+    pub fn connect(_env: &worker::Env) -> impl Future<Output = worker::Result<Db>> + use<> {
         std::future::ready(Err(error("no Hyperdrive outside a Worker")))
     }
 
@@ -250,7 +253,7 @@ impl Db {
     /// # Errors
     ///
     /// Postgres refused the statement or a value.
-    pub(crate) async fn run(&self, sql: &str, params: &[Param]) -> worker::Result<u64> {
+    pub async fn run(&self, sql: &str, params: &[Param]) -> worker::Result<u64> {
         let _turn = self.turn.read().await;
         self.client
             .execute_typed(sql, &typed(params))
@@ -263,7 +266,7 @@ impl Db {
     /// # Errors
     ///
     /// Postgres refused the statement, or a row does not fit `T`.
-    pub(crate) async fn all<T: DeserializeOwned>(
+    pub async fn all<T: DeserializeOwned>(
         &self,
         sql: &str,
         params: &[Param],
@@ -280,7 +283,7 @@ impl Db {
     /// # Errors
     ///
     /// As [`Db::all`].
-    pub(crate) async fn first<T: DeserializeOwned>(
+    pub async fn first<T: DeserializeOwned>(
         &self,
         sql: &str,
         params: &[Param],
@@ -299,7 +302,7 @@ impl Db {
     ///
     /// Postgres refused the statement, or a column has a type rows do
     /// not carry.
-    pub(crate) async fn rows(
+    pub async fn rows(
         &self,
         sql: &str,
         params: &[Param],
@@ -325,7 +328,7 @@ impl Db {
     /// # Errors
     ///
     /// As [`Db::all`]; the transaction rolls back.
-    pub(crate) async fn first_locked<T: DeserializeOwned>(
+    pub async fn first_locked<T: DeserializeOwned>(
         &self,
         lock: (&str, &[Param]),
         sql: &str,
@@ -346,10 +349,7 @@ impl Db {
     /// # Errors
     ///
     /// The first statement that failed.
-    pub(crate) async fn batch(
-        &self,
-        statements: &[(&str, Vec<Param>)],
-    ) -> worker::Result<Vec<u64>> {
+    pub async fn batch(&self, statements: &[(&str, Vec<Param>)]) -> worker::Result<Vec<u64>> {
         let statements: Vec<(&str, &[Param])> = statements
             .iter()
             .map(|(sql, params)| (*sql, params.as_slice()))

@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn reads_tokens_and_errors() {
-        let ok = Response {
+        let ok = Response { headers: Vec::new(),
             status: 200,
             body: br#"{"access_token":"ghu_x","expires_in":28800,"refresh_token":"ghr_y","token_type":"bearer","scope":""}"#.to_vec(),
         };
@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(token.access_token, "ghu_x");
         assert_eq!(token.expires_in, Some(28800));
         assert!(!format!("{token:?}").contains("ghu_x"));
-        let bad = Response {
+        let bad = Response { headers: Vec::new(),
             status: 200,
             body: br#"{"error":"bad_verification_code","error_description":"The code passed is incorrect or expired."}"#.to_vec(),
         };
@@ -306,6 +306,7 @@ mod tests {
             "bad_verification_code: The code passed is incorrect or expired."
         );
         let down = Response {
+            headers: Vec::new(),
             status: 502,
             body: Vec::new(),
         };

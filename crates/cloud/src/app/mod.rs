@@ -104,10 +104,14 @@ pub(crate) fn need(env: &Env, name: &str) -> Result<String> {
 
 /// A signed-in user, as the `users` table has them.
 #[derive(Debug, Deserialize)]
-pub(crate) struct UserRow {
+pub struct UserRow {
+    /// The GitHub user id.
     pub id: u64,
+    /// The GitHub login.
     pub login: String,
+    /// The display name, if the user has one.
     pub name: Option<String>,
+    /// The avatar's URL.
     pub avatar_url: String,
 }
 
@@ -144,16 +148,22 @@ const START_SESSION: &str = "INSERT INTO sessions (key, user_id, github_token, c
 const SWEEP_SESSIONS: &str = "DELETE FROM sessions WHERE expires_at < $1";
 
 /// The session a request's cookie names, while it lasts.
-pub(crate) struct Session {
+pub struct Session {
     /// The session id from the cookie.
     pub id: Vec<u8>,
+    /// Who signed in.
     pub user: UserRow,
     /// The user's GitHub token.
     pub token: String,
 }
 
 impl Session {
-    pub(crate) async fn find(req: &Request, db: &Db) -> Result<Option<Self>> {
+    /// The session of the request's cookie, if there is a live one.
+    ///
+    /// # Errors
+    ///
+    /// The cookie header is unreadable or the database failed.
+    pub async fn find(req: &Request, db: &Db) -> Result<Option<Self>> {
         let cookies = req.headers().get("Cookie")?;
         let Some(id) =
             session::cookie(cookies.as_deref(), session::COOKIE).and_then(session::decode_id)
@@ -179,7 +189,11 @@ impl Session {
     }
 
     /// Whether the request carries this session's CSRF token.
-    pub(crate) fn csrf_ok(&self, req: &Request) -> Result<bool> {
+    ///
+    /// # Errors
+    ///
+    /// The request's headers are unreadable.
+    pub fn csrf_ok(&self, req: &Request) -> Result<bool> {
         let given = req.headers().get(session::CSRF_HEADER)?;
         Ok(session::check_csrf(&self.id, given.as_deref()))
     }

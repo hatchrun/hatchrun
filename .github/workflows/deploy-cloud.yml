@@ -8,6 +8,12 @@ name: deploy-cloud
 # CLOUDFLARE_ACCOUNT_ID secret. DATABASE_MIGRATE_URL, the migrate
 # role's connection string, is for the migrations step alone; the
 # Worker reaches the database through Hyperdrive.
+#
+# This Worker forwards push, pull_request, check_run and repository
+# deliveries to hatchrun-ci over the CI service binding, so hatchrun-ci has to exist
+# before this deploy lands. Deploy hatchrun-ci first (deploy-ci.yml,
+# by hand the first time); until then a deploy here fails on the
+# missing binding target.
 
 on:
   push:
@@ -23,6 +29,8 @@ on:
 permissions: {}
 
 concurrency:
+  # migrate.sh locks schema_migrations, so this and the other deploy that
+  # runs it can overlap.
   group: deploy-cloud
   cancel-in-progress: false
 
