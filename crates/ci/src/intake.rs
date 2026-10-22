@@ -9,6 +9,10 @@ use std::collections::BTreeSet;
 use serde::Deserialize;
 use serde_json::Value;
 
+/// The most commits a push delivery lists. A push this long may have
+/// more, so its changed paths are not known.
+pub const PUSH_COMMIT_LIMIT: usize = 20;
+
 /// The repository a delivery is about.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Repo {
@@ -36,7 +40,9 @@ pub struct Push {
     /// The login of the user who pushed.
     pub actor: String,
     /// Sorted paths touched by the pushed commits. Empty when the
-    /// delivery lists no commits.
+    /// delivery lists no commits or [`PUSH_COMMIT_LIMIT`] of them, whose
+    /// paths are partial: `paths:` filters then count the push as
+    /// matching.
     pub changed: Vec<String>,
     /// The delivery body.
     pub payload: Value,
@@ -193,11 +199,16 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
             if p.deleted {
                 return Ok(ignored("ref deleted"));
             }
-            let changed: BTreeSet<String> = p
-                .commits
-                .into_iter()
-                .flat_map(|c| c.added.into_iter().chain(c.removed).chain(c.modified))
-                .collect();
+            // A delivery lists at most 20 commits, so with that many the
+            // paths are partial. An empty list makes path filters pass.
+            let changed: BTreeSet<String> = if p.commits.len() >= PUSH_COMMIT_LIMIT {
+                BTreeSet::new()
+            } else {
+                p.commits
+                    .into_iter()
+                    .flat_map(|c| c.added.into_iter().chain(c.removed).chain(c.modified))
+                    .collect()
+            };
             Ok(Trigger::Push(Push {
                 installation_id,
                 repo: p.repository,
@@ -293,6 +304,20 @@ mod tests {
             panic!("not a push");
         };
         assert_eq!(p.changed, Vec::<String>::new());
+    }
+
+    #[test]
+    fn push_with_twenty_commits_has_unknown_changed_paths() {
+        let commit = |n: usize| serde_json::json!({ "modified": [format!("f{n}.rs")] });
+        for (count, known) in [(19, true), (20, false), (25, false)] {
+            let body = edited(PUSH, |v| {
+                v["commits"] = (0..count).map(commit).collect();
+            });
+            let Trigger::Push(p) = parse("push", &body).unwrap() else {
+                panic!("not a push");
+            };
+            assert_eq!(!p.changed.is_empty(), known, "{count} commits");
+        }
     }
 
     #[test]
