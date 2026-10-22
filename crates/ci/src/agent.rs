@@ -364,7 +364,11 @@ async fn to_run(
 mod tests {
     use super::*;
 
-    const KEY: &[u8] = b"agent key";
+    use crate::token::tests::random_key;
+    use std::sync::LazyLock;
+
+    /// The key for this test run, drawn fresh every run.
+    static KEY: LazyLock<[u8; 32]> = LazyLock::new(random_key);
 
     fn row(status: &str) -> JobRow {
         JobRow {
@@ -436,20 +440,23 @@ mod tests {
 
     #[test]
     fn bad_token_is_unauthorized() {
-        assert!(authorize(Some("Bearer x"), KEY, 0).is_err());
-        assert!(authorize(None, KEY, 0).is_err());
-        let signed = token::sign(KEY, &claims());
-        assert_eq!(authorize(Some(&signed), KEY, 0), Err(TokenError::Malformed));
+        assert!(authorize(Some("Bearer x"), &*KEY, 0).is_err());
+        assert!(authorize(None, &*KEY, 0).is_err());
+        let signed = token::sign(&*KEY, &claims());
         assert_eq!(
-            authorize(Some(&format!("Bearer {signed}")), b"other", 0),
+            authorize(Some(&signed), &*KEY, 0),
+            Err(TokenError::Malformed)
+        );
+        assert_eq!(
+            authorize(Some(&format!("Bearer {signed}")), &random_key(), 0),
             Err(TokenError::BadSignature)
         );
         assert_eq!(
-            authorize(Some(&format!("Bearer {signed}")), KEY, 1_000),
+            authorize(Some(&format!("Bearer {signed}")), &*KEY, 1_000),
             Err(TokenError::Expired)
         );
         assert_eq!(
-            authorize(Some(&format!("Bearer {signed}")), KEY, 999),
+            authorize(Some(&format!("Bearer {signed}")), &*KEY, 999),
             Ok(claims())
         );
     }

@@ -113,10 +113,20 @@ fn mac(key: &[u8], signing: &str) -> Hmac<Sha256> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::hash::{BuildHasher, RandomState};
+    use std::sync::LazyLock;
 
-    const KEY: &[u8] = b"test key";
+    /// The key for this test run. Every run draws a fresh one, so no key
+    /// in the tests is fixed.
+    static KEY: LazyLock<[u8; 32]> = LazyLock::new(random_key);
+
+    /// Fresh random key bytes.
+    pub(crate) fn random_key() -> [u8; 32] {
+        let state = RandomState::new();
+        std::array::from_fn(|at| state.hash_one(at).to_le_bytes()[0])
+    }
 
     fn claims() -> Claims {
         Claims {
@@ -140,51 +150,51 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let token = sign(KEY, &claims());
-        assert_eq!(verify(KEY, &token, 999), Ok(claims()));
+        let token = sign(&*KEY, &claims());
+        assert_eq!(verify(&*KEY, &token, 999), Ok(claims()));
     }
 
     #[test]
     fn rejects_expired() {
-        let token = sign(KEY, &claims());
-        assert_eq!(verify(KEY, &token, 1_000), Err(TokenError::Expired));
+        let token = sign(&*KEY, &claims());
+        assert_eq!(verify(&*KEY, &token, 1_000), Err(TokenError::Expired));
     }
 
     #[test]
     fn rejects_a_changed_claim() {
-        let token = sign(KEY, &claims());
-        let other = sign(KEY, &Claims { job: 8, ..claims() });
+        let token = sign(&*KEY, &claims());
+        let other = sign(&*KEY, &Claims { job: 8, ..claims() });
         let parts: Vec<&str> = token.split('.').collect();
         let swapped: Vec<&str> = other.split('.').collect();
         let forged = format!("{}.{}.{}", parts[0], swapped[1], parts[2]);
-        assert_eq!(verify(KEY, &forged, 999), Err(TokenError::BadSignature));
+        assert_eq!(verify(&*KEY, &forged, 999), Err(TokenError::BadSignature));
     }
 
     #[test]
     fn rejects_another_key() {
-        let token = sign(KEY, &claims());
+        let token = sign(&*KEY, &claims());
         assert_eq!(
-            verify(b"another key", &token, 999),
+            verify(&random_key(), &token, 999),
             Err(TokenError::BadSignature)
         );
     }
 
     #[test]
     fn rejects_malformed_tokens() {
-        assert_eq!(verify(KEY, "v1.abc", 0), Err(TokenError::Malformed));
-        assert_eq!(verify(KEY, "v2.abc.def", 0), Err(TokenError::Malformed));
+        assert_eq!(verify(&*KEY, "v1.abc", 0), Err(TokenError::Malformed));
+        assert_eq!(verify(&*KEY, "v2.abc.def", 0), Err(TokenError::Malformed));
     }
 
     #[test]
     fn carries_the_attempt() {
         let token = sign(
-            KEY,
+            &*KEY,
             &Claims {
                 attempt: 1,
                 ..claims()
             },
         );
-        let decoded = verify(KEY, &token, 999).unwrap();
+        let decoded = verify(&*KEY, &token, 999).unwrap();
         assert_eq!(decoded.attempt, 1);
     }
 
@@ -192,14 +202,14 @@ mod tests {
     fn rejects_a_changed_attempt() {
         // An attempt-1 signature cannot be moved onto an attempt-2 payload.
         let first = sign(
-            KEY,
+            &*KEY,
             &Claims {
                 attempt: 1,
                 ..claims()
             },
         );
         let rerun = sign(
-            KEY,
+            &*KEY,
             &Claims {
                 attempt: 2,
                 ..claims()
@@ -208,33 +218,33 @@ mod tests {
         let (rerun_signing, _) = split_signature(&rerun);
         let (_, first_signature) = split_signature(&first);
         let forged = format!("{rerun_signing}.{first_signature}");
-        assert_eq!(verify(KEY, &forged, 999), Err(TokenError::BadSignature));
+        assert_eq!(verify(&*KEY, &forged, 999), Err(TokenError::BadSignature));
     }
 
     #[test]
     fn rejects_an_empty_signature() {
-        let token = sign(KEY, &claims());
+        let token = sign(&*KEY, &claims());
         let forged = with_signature(&token, "");
-        assert_eq!(verify(KEY, &forged, 999), Err(TokenError::BadSignature));
+        assert_eq!(verify(&*KEY, &forged, 999), Err(TokenError::BadSignature));
     }
 
     #[test]
     fn rejects_a_truncated_signature() {
-        let token = sign(KEY, &claims());
+        let token = sign(&*KEY, &claims());
         let (_, signature) = split_signature(&token);
         // 40 characters decode to 30 bytes, a clean but short signature.
         let forged = with_signature(&token, &signature[..40]);
-        assert_eq!(verify(KEY, &forged, 999), Err(TokenError::BadSignature));
+        assert_eq!(verify(&*KEY, &forged, 999), Err(TokenError::BadSignature));
     }
 
     #[test]
     fn rejects_a_flipped_signature_bit() {
-        let token = sign(KEY, &claims());
+        let token = sign(&*KEY, &claims());
         let (_, signature) = split_signature(&token);
         let mut bytes = URL_SAFE_NO_PAD.decode(signature).unwrap();
         bytes[0] ^= 0x01;
         let forged = with_signature(&token, &URL_SAFE_NO_PAD.encode(bytes));
-        assert_eq!(verify(KEY, &forged, 999), Err(TokenError::BadSignature));
+        assert_eq!(verify(&*KEY, &forged, 999), Err(TokenError::BadSignature));
     }
 
     #[test]
