@@ -606,6 +606,7 @@ mod tests {
         assert_eq!(body["metadata"]["tenant_id"], "abcdefgh12345678");
         assert_eq!(
             checkout_url(&Response {
+                headers: Vec::new(),
                 status: 201,
                 body: br#"{"id":"c","url":"https://buy.polar.sh/c"}"#.to_vec(),
             })
@@ -617,6 +618,7 @@ mod tests {
         assert_eq!(request.url, "https://api.polar.sh/v1/customer-sessions/");
         assert_eq!(
             portal_url(&Response {
+                headers: Vec::new(),
                 status: 201,
                 body: br#"{"token":"x","customer_portal_url":"https://polar.sh/portal"}"#.to_vec(),
             })
@@ -625,6 +627,7 @@ mod tests {
         );
         assert_eq!(
             portal_url(&Response {
+                headers: Vec::new(),
                 status: 404,
                 body: b"{}".to_vec(),
             })
@@ -659,6 +662,7 @@ mod tests {
         );
         assert_eq!(
             ingested(&Response {
+                headers: Vec::new(),
                 status: 200,
                 body: br#"{"inserted":2,"duplicates":1}"#.to_vec(),
             }),
@@ -666,6 +670,7 @@ mod tests {
         );
         assert!(
             ingested(&Response {
+                headers: Vec::new(),
                 status: 422,
                 body: br#"{"detail":[]}"#.to_vec(),
             })
@@ -690,6 +695,7 @@ mod tests {
         assert_eq!(request.url, "https://api.polar.sh/v1/products/prod_1");
 
         let yearly = plan(&Response {
+            headers: Vec::new(),
             status: 200,
             body: br#"{"id":"prod_year","name":"hatchrun yearly","description":null,
                 "recurring_interval":"year","prices":[
@@ -715,6 +721,7 @@ mod tests {
         // The interval may be on the price only, and a product may
         // have no fixed price.
         let monthly = plan(&Response {
+            headers: Vec::new(),
             status: 200,
             body: br#"{"id":"prod_month","name":"hatchrun monthly","description":"d",
                 "prices":[{"amount_type":"fixed","price_amount":4900,
@@ -724,6 +731,7 @@ mod tests {
         .unwrap();
         assert_eq!(monthly.interval.as_deref(), Some("month"));
         let custom = plan(&Response {
+            headers: Vec::new(),
             status: 200,
             body: br#"{"id":"prod_c","name":"c","description":null,"prices":[]}"#.to_vec(),
         })
@@ -731,6 +739,7 @@ mod tests {
         assert_eq!((custom.amount, custom.interval.as_deref()), (None, None));
         assert_eq!(
             plan(&Response {
+                headers: Vec::new(),
                 status: 404,
                 body: b"{}".to_vec(),
             })
@@ -743,6 +752,7 @@ mod tests {
             (None, None)
         );
         let metered = plan(&Response {
+            headers: Vec::new(),
             status: 200,
             body: br#"{"id":"prod_m","name":"hatchrun","description":null,
                 "recurring_interval":"month","prices":[

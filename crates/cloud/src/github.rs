@@ -510,6 +510,7 @@ mod tests {
         );
         assert!(request.header_value("user-agent").is_some());
         let answer = Response {
+            headers: Vec::new(),
             status: 201,
             body: br#"{"token":"ghs_x","expires_at":"2026-10-13T13:00:00Z"}"#.to_vec(),
         };
@@ -521,6 +522,7 @@ mod tests {
     #[test]
     fn reads_the_rate_limit() {
         let answer = |status: u16, body: &str| Response {
+            headers: Vec::new(),
             status,
             body: body.as_bytes().to_vec(),
         };
@@ -579,7 +581,7 @@ mod tests {
                 "work_folder": "_work",
             })
         );
-        let answer = Response {
+        let answer = Response { headers: Vec::new(),
             status: 201,
             body: br#"{"runner":{"id":23,"name":"hatchrun-7-ab12","os":"unknown","status":"offline","busy":false,"labels":[]},"encoded_jit_config":"abc"}"#.to_vec(),
         };
@@ -592,6 +594,7 @@ mod tests {
     #[test]
     fn says_what_github_answered() {
         let answer = Response {
+            headers: Vec::new(),
             status: 403,
             body: br#"{"message":"Resource not accessible by integration"}"#.to_vec(),
         };
@@ -610,6 +613,7 @@ mod tests {
     fn reads_the_signed_in_user() {
         assert_eq!(user(API, "ghu_x").url, "https://api.github.com/user");
         let answer = Response {
+            headers: Vec::new(),
             status: 200,
             body:
                 br#"{"login":"octo","id":1,"avatar_url":"https://a/1","name":null,"type":"User"}"#
@@ -632,17 +636,18 @@ mod tests {
             membership(API, "t", "acme").url,
             "https://api.github.com/user/memberships/orgs/acme"
         );
-        let owner = Response {
+        let owner = Response { headers: Vec::new(),
             status: 200,
             body: br#"{"url":"u","state":"active","role":"admin","organization":{"login":"acme","id":9,"avatar_url":"https://a/9"}}"#.to_vec(),
         };
         assert!(parse_membership(&owner).unwrap().unwrap().is_admin());
-        let pending = Response {
+        let pending = Response { headers: Vec::new(),
             status: 200,
             body: br#"{"state":"pending","role":"admin","organization":{"login":"acme","id":9,"avatar_url":"https://a/9"}}"#.to_vec(),
         };
         assert!(!parse_membership(&pending).unwrap().unwrap().is_admin());
         let gone = Response {
+            headers: Vec::new(),
             status: 404,
             body: Vec::new(),
         };
@@ -655,7 +660,7 @@ mod tests {
             installation(API, "jwt", 5).url,
             "https://api.github.com/app/installations/5"
         );
-        let answer = Response {
+        let answer = Response { headers: Vec::new(),
             status: 200,
             body: br#"{"id":5,"account":{"login":"acme","id":9,"type":"Organization"},"app_slug":"hatchrun"}"#.to_vec(),
         };
@@ -675,7 +680,7 @@ mod tests {
             user_installations(API, "ghu_x").url,
             "https://api.github.com/user/installations?per_page=100"
         );
-        let mine = Response {
+        let mine = Response { headers: Vec::new(),
             status: 200,
             body: br#"{"total_count":2,"installations":[{"id":5,"account":{"login":"acme","id":9,"type":"Organization"},"suspended_at":null},{"id":6,"account":{"login":"octo","id":1,"type":"User"},"suspended_at":"2026-10-01T00:00:00Z"}]}"#.to_vec(),
         };
@@ -694,6 +699,7 @@ mod tests {
     #[test]
     fn finds_whether_a_commit_is_on_a_branch() {
         let answer = |status: u16, body: &str| Response {
+            headers: Vec::new(),
             status,
             body: body.as_bytes().to_vec(),
         };

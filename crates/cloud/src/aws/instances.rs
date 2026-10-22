@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn reads_instances_and_their_tags() {
-        let answer = Response {
+        let answer = Response { headers: Vec::new(),
             status: 200,
             body: br#"<?xml version="1.0" encoding="UTF-8"?>
 <DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn an_empty_answer_has_no_instances() {
-        let answer = Response {
+        let answer = Response { headers: Vec::new(),
             status: 200,
             body: b"<DescribeInstancesResponse><requestId>r</requestId><reservationSet/></DescribeInstancesResponse>"
                 .to_vec(),

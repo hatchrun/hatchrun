@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn reads_credentials() {
-        let response = Response {
+        let response = Response { headers: Vec::new(),
             status: 200,
             body: br#"<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
   <AssumeRoleWithWebIdentityResult>
@@ -116,6 +116,7 @@ mod tests {
     #[test]
     fn missing_fields_are_errors() {
         let response = Response {
+            headers: Vec::new(),
             status: 200,
             body: b"<AssumeRoleWithWebIdentityResponse/>".to_vec(),
         };

@@ -347,6 +347,7 @@ mod tests {
     #[test]
     fn reads_the_instance_id() {
         let response = Response {
+            headers: Vec::new(),
             status: 200,
             body: br#"<?xml version="1.0" encoding="UTF-8"?>
 <RunInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
@@ -370,6 +371,7 @@ mod tests {
     #[test]
     fn capacity_errors_come_back_by_code() {
         let response = Response {
+            headers: Vec::new(),
             status: 500,
             body: b"<Response><Errors><Error><Code>InsufficientInstanceCapacity</Code>\
                     <Message>We currently do not have sufficient capacity</Message>\
@@ -389,6 +391,7 @@ mod tests {
                 .ends_with("&InstanceId.1=i-1")
         );
         let gone = Response {
+            headers: Vec::new(),
             status: 400,
             body: b"<Response><Errors><Error><Code>InvalidInstanceID.NotFound</Code>\
                     <Message>gone</Message></Error></Errors></Response>"
@@ -396,6 +399,7 @@ mod tests {
         };
         assert!(terminated(&gone).is_ok());
         let denied = Response {
+            headers: Vec::new(),
             status: 403,
             body: b"<Response><Errors><Error><Code>UnauthorizedOperation</Code>\
                     <Message>no</Message></Error></Errors></Response>"
@@ -416,6 +420,7 @@ mod tests {
                 .ends_with("&SubnetId.1=subnet-a&SubnetId.2=subnet-b")
         );
         let answer = Response {
+            headers: Vec::new(),
             status: 200,
             body: b"<DescribeSubnetsResponse><subnetSet><item><subnetId>subnet-a</subnetId>\
                     <vpcId>vpc-1</vpcId><availabilityZone>eu-west-1a</availabilityZone></item>\
@@ -429,7 +434,7 @@ mod tests {
                 availability_zone: "eu-west-1a".to_owned(),
             }]
         );
-        let missing = Response {
+        let missing = Response { headers: Vec::new(),
             status: 400,
             body: b"<Response><Errors><Error><Code>InvalidSubnetID.NotFound</Code><Message>The subnet ID 'subnet-b' does not exist</Message></Error></Errors></Response>".to_vec(),
         };

@@ -452,6 +452,7 @@ mod tests {
             assert!(sent.contains(part), "{part} in {sent}");
         }
         let created = Response {
+            headers: Vec::new(),
             status: 200,
             body: b"<CreateLaunchTemplateVersionResponse><launchTemplateVersion>\
                 <launchTemplateId>lt-1</launchTemplateId><versionNumber>12</versionNumber>\
@@ -477,7 +478,7 @@ mod tests {
         let next = body(&describe_versions("https://ec2/", "lt-1", Some("t/2")));
         assert!(next.ends_with("&MaxResults=200&NextToken=t%2F2"), "{next}");
 
-        let page = Response {
+        let page = Response { headers: Vec::new(),
             status: 200,
             body: br"<DescribeLaunchTemplateVersionsResponse>
   <launchTemplateVersionSet>
@@ -519,6 +520,7 @@ mod tests {
             ]
         );
         let last = Response {
+            headers: Vec::new(),
             status: 200,
             body: b"<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet/>\
                 <nextToken/></DescribeLaunchTemplateVersionsResponse>"
@@ -526,6 +528,7 @@ mod tests {
         };
         assert_eq!(versions(&last), Ok((Vec::new(), None)));
         let denied = Response {
+            headers: Vec::new(),
             status: 403,
             body: b"<Response><Errors><Error><Code>UnauthorizedOperation</Code>\
                 <Message>no</Message></Error></Errors></Response>"
@@ -538,7 +541,7 @@ mod tests {
             "Action=DeleteLaunchTemplateVersions&Version=2016-11-15\
              &LaunchTemplateId=lt-1&LaunchTemplateVersion.1=4&LaunchTemplateVersion.2=9"
         );
-        let answer = Response {
+        let answer = Response { headers: Vec::new(),
             status: 200,
             body: br"<DeleteLaunchTemplateVersionsResponse>
   <successfullyDeletedLaunchTemplateVersionSet>
@@ -629,7 +632,7 @@ mod tests {
 
     #[test]
     fn reads_the_instance_and_refusals() {
-        let answer = Response {
+        let answer = Response { headers: Vec::new(),
             status: 200,
             body: br"<CreateFleetResponse>
   <fleetId>fleet-1</fleetId>
@@ -671,7 +674,7 @@ mod tests {
                 message: "none".to_owned(),
             }]
         );
-        let none = Response {
+        let none = Response { headers: Vec::new(),
             status: 200,
             body: b"<CreateFleetResponse><fleetId>f</fleetId><fleetInstanceSet/></CreateFleetResponse>"
                 .to_vec(),

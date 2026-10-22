@@ -14,6 +14,12 @@
 //! production. [`Db`] waits on each one, for tests written as plain
 //! functions.
 
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::new_without_default
+)]
+
 use std::path::Path;
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,20 +30,21 @@ use serde::de::DeserializeOwned;
 use serde_json::Map;
 use tokio::runtime::Runtime;
 
-pub(crate) use crate::db::{Param, params};
+pub use crate::db::{Param, params};
 
 const DEFAULT_URL: &str = "postgres://postgres:postgres@localhost:5432/postgres";
 
 /// A schema of its own on the test server, with every migration
 /// applied.
-pub(crate) struct Db {
+pub struct Db {
     runtime: Runtime,
     inner: crate::db::Db,
     schema: String,
 }
 
 /// The test server's URL.
-pub(crate) fn url() -> String {
+#[must_use]
+pub fn url() -> String {
     std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned())
 }
 
@@ -59,7 +66,7 @@ fn migrations() -> Vec<String> {
 
 impl Db {
     /// A fresh schema, migrated.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         // Tests migrate one at a time: a migration may change the
         // database itself, which two sessions cannot do at once.
@@ -107,7 +114,7 @@ impl Db {
     /// Another client on this schema, through `config`, such as one
     /// that reaches the server by another address. Its connection runs
     /// on this runtime.
-    pub(crate) fn connect(&self, config: &tokio_postgres::Config) -> crate::db::Db {
+    pub fn connect(&self, config: &tokio_postgres::Config) -> crate::db::Db {
         let client = self.runtime.block_on(async {
             let (client, connection) = config
                 .connect(tokio_postgres::NoTls)
@@ -124,23 +131,23 @@ impl Db {
     }
 
     /// The Worker's client, for the functions that take one.
-    pub(crate) fn db(&self) -> &crate::db::Db {
+    pub fn db(&self) -> &crate::db::Db {
         &self.inner
     }
 
     /// Waits for `future`, which may use [`Db::db`].
-    pub(crate) fn wait<F: Future>(&self, future: F) -> F::Output {
+    pub fn wait<F: Future>(&self, future: F) -> F::Output {
         self.runtime.block_on(future)
     }
 
     /// Runs a statement for its effect and returns the rows it changed.
-    pub(crate) fn run(&self, sql: &str, params: &[Param]) -> usize {
+    pub fn run(&self, sql: &str, params: &[Param]) -> usize {
         self.try_run(sql, params)
             .unwrap_or_else(|err| panic!("{err}\n{sql}"))
     }
 
     /// As [`Db::run`], with the error instead of a panic.
-    pub(crate) fn try_run(&self, sql: &str, params: &[Param]) -> Result<usize, String> {
+    pub fn try_run(&self, sql: &str, params: &[Param]) -> Result<usize, String> {
         self.wait(self.inner.run(sql, params))
             .map(|n| usize::try_from(n).expect("changes fit usize"))
             .map_err(|err| err.to_string())
@@ -148,7 +155,7 @@ impl Db {
 
     /// Runs statements in one transaction: one failing rolls them all
     /// back. Returns the rows each statement changed.
-    pub(crate) fn batch(&self, statements: &[(&str, Vec<Param>)]) -> Result<Vec<usize>, String> {
+    pub fn batch(&self, statements: &[(&str, Vec<Param>)]) -> Result<Vec<usize>, String> {
         self.wait(self.inner.batch(statements))
             .map(|changes| {
                 changes
@@ -160,7 +167,7 @@ impl Db {
     }
 
     /// Every row as an object by column name.
-    pub(crate) fn rows(
+    pub fn rows(
         &self,
         sql: &str,
         params: &[Param],
@@ -170,7 +177,7 @@ impl Db {
     }
 
     /// Every row deserialized into `T`.
-    pub(crate) fn try_all<T: DeserializeOwned>(
+    pub fn try_all<T: DeserializeOwned>(
         &self,
         sql: &str,
         params: &[Param],
@@ -180,18 +187,18 @@ impl Db {
     }
 
     /// As [`Db::try_all`], failing the test on an error.
-    pub(crate) fn all<T: DeserializeOwned>(&self, sql: &str, params: &[Param]) -> Vec<T> {
+    pub fn all<T: DeserializeOwned>(&self, sql: &str, params: &[Param]) -> Vec<T> {
         self.try_all(sql, params)
             .unwrap_or_else(|err| panic!("{err}\n{sql}"))
     }
 
     /// The first row deserialized into `T`.
-    pub(crate) fn first<T: DeserializeOwned>(&self, sql: &str, params: &[Param]) -> Option<T> {
+    pub fn first<T: DeserializeOwned>(&self, sql: &str, params: &[Param]) -> Option<T> {
         self.all(sql, params).into_iter().next()
     }
 
     /// One column of the first row.
-    pub(crate) fn column<T: DeserializeOwned>(
+    pub fn column<T: DeserializeOwned>(
         &self,
         sql: &str,
         params: &[Param],
@@ -214,7 +221,7 @@ impl Db {
     /// jobs`. Test tables are small enough that the planner would
     /// otherwise scan every one; with scans off it shows which index a
     /// large table would use, or a `Seq Scan` where none fits.
-    pub(crate) fn plan(&self, sql: &str, params: &[Param]) -> String {
+    pub fn plan(&self, sql: &str, params: &[Param]) -> String {
         self.run("SET enable_seqscan = off", &[]);
         let plan = self
             .rows(&format!("EXPLAIN (COSTS OFF) {sql}"), params)
@@ -243,7 +250,7 @@ impl Drop for Db {
 
 /// Runs `future` to its end on this thread. The tests' stand-ins for
 /// GitHub and KV answer at once, so it never waits.
-pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
+pub fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = pin!(future);
     let mut cx = Context::from_waker(Waker::noop());
     loop {

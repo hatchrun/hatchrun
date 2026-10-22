@@ -55,11 +55,13 @@ impl Request {
     }
 }
 
-/// An answer: status and body.
+/// An answer: status, headers and body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     /// HTTP status.
     pub status: u16,
+    /// Headers, names lowercased.
+    pub headers: Vec<(String, String)>,
     /// Body.
     pub body: Vec<u8>,
 }
@@ -69,6 +71,15 @@ impl Response {
     #[must_use]
     pub fn ok(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// The value of a header, by case-insensitive name.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
 
     /// The body as text, for error messages.
@@ -115,6 +126,17 @@ mod tests {
             form(&[("Action", "RunInstances"), ("Tag.1.Value", "a b")]),
             "Action=RunInstances&Tag.1.Value=a%20b"
         );
+    }
+
+    #[test]
+    fn header_lookup_ignores_case() {
+        let response = Response {
+            status: 429,
+            headers: vec![("retry-after".to_owned(), "30".to_owned())],
+            body: Vec::new(),
+        };
+        assert_eq!(response.header("Retry-After"), Some("30"));
+        assert_eq!(response.header("etag"), None);
     }
 
     #[test]
