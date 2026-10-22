@@ -993,13 +993,17 @@ pub(crate) fn plan_is_current(node: Option<&Node>, planned: u32) -> bool {
 /// not after a throttle or a failure that backs off.
 ///
 /// A failure keeps the mark and backs off. After [`MAX_SEND_TRIES`]
-/// failures in a row the mark is dropped, which the caller logs.
+/// failures in a row the mark is dropped, which the caller logs, unless
+/// the update is `terminal` (the job is done): that one is the update
+/// that completes the check run, so it keeps retrying at the backoff
+/// cap and the run is not purged while it waits.
 pub(crate) fn record_flush(
     state: &mut JobState,
     outbox: &mut Outbox,
     job: u64,
     generation: u64,
     flushed: &Flushed,
+    terminal: bool,
     now_ms: u64,
 ) -> bool {
     match flushed {
@@ -1024,8 +1028,8 @@ pub(crate) fn record_flush(
             false
         }
         Flushed::Failed => {
-            state.send_failures += 1;
-            if state.send_failures >= MAX_SEND_TRIES {
+            state.send_failures = state.send_failures.saturating_add(1);
+            if !terminal && state.send_failures >= MAX_SEND_TRIES {
                 state.send_failures = 0;
                 outbox.sent(job, generation);
                 return true;
@@ -2731,7 +2735,14 @@ impl<'a> Cx<'a> {
                     continue;
                 }
                 let mut state = self.job_state(plan.job).await?;
-                if matches!(flushed, Flushed::Failed) && state.send_failures + 1 >= MAX_SEND_TRIES {
+                let terminal = matches!(
+                    run.graph.node(plan.job).map(|node| &node.state),
+                    Some(NodeState::Done(_))
+                );
+                if matches!(flushed, Flushed::Failed)
+                    && !terminal
+                    && state.send_failures + 1 >= MAX_SEND_TRIES
+                {
                     worker::console_error!(
                         "run {}: check run of job {}: update dropped after {MAX_SEND_TRIES} tries",
                         run.info.run_id,
@@ -2745,6 +2756,7 @@ impl<'a> Cx<'a> {
                     plan.job,
                     plan.generation,
                     &flushed,
+                    terminal,
                     now,
                 );
                 self.put_job(plan.job, &state).await?;
@@ -3280,6 +3292,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
                 1,
                 generation,
                 &Flushed::Failed,
+                false,
                 0
             ));
             assert_eq!(state.send_failures, tries);
@@ -3292,10 +3305,31 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             1,
             generation,
             &Flushed::Failed,
+            false,
             0
         ));
         assert!(outbox.is_empty(), "the fifth failure drops the mark");
         assert_eq!(state.send_failures, 0);
+    }
+
+    #[test]
+    fn a_terminal_update_is_never_dropped_and_backs_off_at_the_cap() {
+        let (mut state, mut outbox, generation) = marked(1);
+        for tries in 1..=(MAX_SEND_TRIES * 4) {
+            assert!(!record_flush(
+                &mut state,
+                &mut outbox,
+                1,
+                generation,
+                &Flushed::Failed,
+                true,
+                0
+            ));
+            assert_eq!(state.send_failures, tries);
+            assert_eq!(outbox.generation(1), Some(generation), "the mark stays");
+        }
+        assert_eq!(outbox.next_alarm(0), Some(900_000), "at the 900 s cap");
+        assert!(!outbox.is_empty(), "so the run is not purged");
     }
 
     #[test]
@@ -3313,6 +3347,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             1,
             generation,
             &sent,
+            false,
             0
         ));
         assert_eq!(state.check_run_id, Some(77));
@@ -3323,7 +3358,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             annotations_sent: 60,
         };
         let generation = outbox.generation(1).unwrap();
-        record_flush(&mut state, &mut outbox, 1, generation, &last, 0);
+        record_flush(&mut state, &mut outbox, 1, generation, &last, false, 0);
         assert!(outbox.is_empty());
         assert_eq!(state.check_run_id, Some(77));
     }
@@ -3337,6 +3372,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             1,
             generation,
             &Flushed::Throttled(30),
+            false,
             1_000,
         );
         assert!(!go_on);
