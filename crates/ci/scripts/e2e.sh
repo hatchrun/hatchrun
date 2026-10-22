@@ -11,7 +11,7 @@
 #
 # What it starts, all on 127.0.0.1:
 #
-# - Postgres 17 in Docker on 55432, unless E2E_DATABASE_URL names one;
+# - Postgres 17 in Docker on 55432 (E2E_PG_PORT), unless E2E_DATABASE_URL names one;
 # - hatchrun-ci-dev fake-github on 9101 and launcher on 9102;
 # - wrangler dev for crates/broker on 8789 and for crates/ci on 8788,
 #   the latter built with the local launcher.
@@ -33,7 +33,7 @@ set -euo pipefail
 set -m
 
 WRANGLER="wrangler@4.145.0"
-PG_PORT=55432
+PG_PORT=${E2E_PG_PORT:-55432}
 GITHUB_PORT=9101
 LAUNCHER_PORT=9102
 CI_PORT=8788
