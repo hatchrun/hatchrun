@@ -802,7 +802,7 @@ pub(crate) async fn release_holds(
 /// Frees the jobs a change to environment `name` leaves without an
 /// approval rule and sends them to the launch queue. The change is
 /// saved already, so a failure is logged and the reconciler's backstop
-/// picks the jobs up.
+/// frees the jobs whose environment is gone or has approval off.
 async fn release_and_wake(
     cx: &Cx<'_>,
     repo_id: u64,

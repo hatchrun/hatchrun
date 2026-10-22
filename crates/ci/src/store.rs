@@ -3267,6 +3267,68 @@ mod tests {
     }
 
     #[test]
+    fn the_backstop_skips_approval_holds() {
+        use hatchrun_cloud::ci_wake;
+        let db = setup();
+        let (_, approval) = run_with_job_named(&db, "a", "queued");
+        set_held(&db, approval, "approval", 100);
+        let (_, card) = run_with_job_named(&db, "c", "queued");
+        set_held(&db, card, "card", 100);
+        let picked = db.wait(ci_wake::stale(db.db(), 5_000, 5, 40)).unwrap();
+        assert_eq!(woken_ids(picked), [card]);
+    }
+
+    #[test]
+    fn an_approval_hold_blocks_nobody() {
+        let db = setup();
+        let (_, older) = run_with_job_named(&db, "older", "queued");
+        set_held(&db, older, "approval", 5);
+        let (_, newer) = run_with_job_named(&db, "newer", "queued");
+        assert!(matches!(
+            db.wait(claim_launch(db.db(), newer, "t1", 5, 10)).unwrap(),
+            Claim::Claimed(_)
+        ));
+        let month = 1_790_812_800_000_u64;
+        let standing = db
+            .wait(standing(db.db(), older, month, 1_000_000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(standing.running, 1, "the launching job, not the held one");
+    }
+
+    #[test]
+    fn the_backstop_frees_approval_holds_without_a_rule() {
+        use hatchrun_cloud::ci_wake;
+        let db = setup();
+        let held = |name: &str, environment: &str, updated: u64| {
+            let id = job_naming(&db, name, Some(environment));
+            db.run(
+                "UPDATE ci_jobs SET status = 'queued', held = 'approval', updated_at = $2 \
+                 WHERE id = $1",
+                &params![id, updated],
+            );
+            id
+        };
+        save_environment(&db, "Guarded", &[], true);
+        save_environment(&db, "Open", &[], false);
+        let gone = held("gone", "deleted", 100);
+        let off = held("off", "open", 100);
+        let guarded = held("guarded", "guarded", 100);
+        let recent = held("recent", "deleted", 9_000);
+        let mut freed = woken_ids(
+            db.wait(ci_wake::release_orphan_approvals(db.db(), 5_000, 6_000))
+                .unwrap(),
+        );
+        freed.sort_unstable();
+        assert_eq!(freed, [gone, off]);
+        for job in [gone, off] {
+            assert_eq!(held_of(&db, job), None);
+        }
+        assert_eq!(held_of(&db, guarded).as_deref(), Some("approval"));
+        assert_eq!(held_of(&db, recent).as_deref(), Some("approval"));
+    }
+
+    #[test]
     fn held_jobs_are_not_stalled() {
         let db = setup();
         let (_, held) = run_with_job_named(&db, "held", "queued");

@@ -731,14 +731,22 @@ async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), 
     ci_wake::release_spend_caps(db, now.saturating_sub(HELD_QUIET_MS))
         .await
         .map_err(|e| e.to_string())?;
-    let stale = ci_wake::stale(
-        db,
-        now.saturating_sub(HELD_QUIET_MS),
-        MAX_RUNNING_JOBS,
-        HELD_BUDGET,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    // An approval hold whose environment is gone or has approval off
+    // has nobody to wait for; the change that freed it may have failed to
+    // wake it.
+    let mut stale = ci_wake::release_orphan_approvals(db, now.saturating_sub(HELD_QUIET_MS), now)
+        .await
+        .map_err(|e| e.to_string())?;
+    stale.extend(
+        ci_wake::stale(
+            db,
+            now.saturating_sub(HELD_QUIET_MS),
+            MAX_RUNNING_JOBS,
+            HELD_BUDGET,
+        )
+        .await
+        .map_err(|e| e.to_string())?,
+    );
     let wakes = paid_wakes(&stale, budget);
     if wakes.len() < stale.len() {
         console_error!("reconcile: held-job budget spent, the rest wait");
@@ -767,31 +775,36 @@ async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> 
         EndAction::Retry => Err(format!("could not end it: {answer:?}")),
         EndAction::GiveUp => {
             console_error!("reconcile: job {}: no run object, failing the row", row.id);
-            let ended =
-                store::finish_job(db, row.id, row.attempt, "failure", &row.steps, None, now)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            if !ended {
-                return Ok(());
-            }
-            let Some(run) = store::run(db, row.run_id)
-                .await
-                .map_err(|e| e.to_string())?
-            else {
-                return Ok(());
-            };
-            launches::wake_oldest(env, db, &run.tenant_id).await;
-            let jobs = store::jobs_for_run(db, run.id)
-                .await
-                .map_err(|e| e.to_string())?;
-            if jobs.iter().all(|job| job.status == "completed") {
-                store::finish_run(db, run.id, run.run_attempt, "failure", now)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(())
+            fail_row(env, db, row, now).await
         }
     }
+}
+
+/// Completes the attempt of `row` as failed in the database, for a job
+/// no run object holds, and the run with it once every job is over.
+pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Result<(), String> {
+    let ended = store::finish_job(db, row.id, row.attempt, "failure", &row.steps, None, now)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !ended {
+        return Ok(());
+    }
+    let Some(run) = store::run(db, row.run_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    launches::wake_oldest(env, db, &run.tenant_id).await;
+    let jobs = store::jobs_for_run(db, run.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if jobs.iter().all(|job| job.status == "completed") {
+        store::finish_run(db, run.id, run.run_attempt, "failure", now)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Step 4. Terminates as many orphans as `budget` pays for.

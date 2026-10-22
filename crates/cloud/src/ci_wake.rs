@@ -47,7 +47,7 @@ const STALE_HELD: &str = "SELECT job_id, attempt FROM (\
          row_number() OVER (PARTITION BY ci_runs.tenant_id ORDER BY ci_jobs.id) AS place \
        FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
        WHERE ci_jobs.status = 'queued' AND ci_jobs.held IS NOT NULL \
-         AND ci_jobs.updated_at < $1) ranked \
+         AND ci_jobs.held <> 'approval' AND ci_jobs.updated_at < $1) ranked \
      WHERE place <= $2 ORDER BY job_id LIMIT $3";
 
 /// Turns the card and spend-cap holds of tenant `$1` into concurrency
@@ -61,6 +61,18 @@ const RELEASE_TENANT: &str = "UPDATE ci_jobs SET held = 'concurrency' FROM ci_ru
 /// at since `$1`: the month turned, or the cap changed unseen.
 const RELEASE_SPEND_CAPS: &str = "UPDATE ci_jobs SET held = 'concurrency' \
      WHERE status = 'queued' AND held = 'spend_cap' AND updated_at < $1";
+
+/// Frees the approval holds nobody looked at since `$1` whose
+/// environment no longer exists or no longer asks for approval, due at
+/// `$2`, and returns them. The consumer checks such a job again: it runs,
+/// or fails when the environment is gone.
+const RELEASE_ORPHAN_APPROVALS: &str = "UPDATE ci_jobs SET held = NULL, next_launch_at = $2, \
+       updated_at = $2 FROM ci_runs \
+     WHERE ci_runs.id = ci_jobs.run_id AND ci_jobs.status = 'queued' \
+       AND ci_jobs.held = 'approval' AND ci_jobs.updated_at < $1 \
+       AND NOT EXISTS (SELECT 1 FROM ci_environments e WHERE e.repo_id = ci_runs.repo_id \
+         AND lower(e.name) = lower(ci_jobs.environment) AND e.approval) \
+     RETURNING ci_jobs.id AS job_id, ci_jobs.attempt";
 
 /// The oldest `limit` queued jobs of `tenant` held for `reason` (`card`,
 /// `spend_cap` or `concurrency`).
@@ -106,8 +118,26 @@ pub async fn release_spend_caps(db: &Db, quiet_before: u64) -> worker::Result<()
     Ok(())
 }
 
+/// Frees the approval holds whose environment is gone or has approval
+/// off and that nobody looked at since `quiet_before`, so a release
+/// that failed when the environment changed never strands a job. The
+/// jobs come back to be sent to the launch queue.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn release_orphan_approvals(
+    db: &Db,
+    quiet_before: u64,
+    now: u64,
+) -> worker::Result<Vec<Woken>> {
+    db.all(RELEASE_ORPHAN_APPROVALS, &params![quiet_before, now])
+        .await
+}
+
 /// The jobs the slow backstop wakes: held jobs nobody has looked at
-/// since `quiet_before`, at most `per_tenant` of each tenant and
+/// since `quiet_before` (approval holds wait for a person, see
+/// [`release_orphan_approvals`]), at most `per_tenant` of each tenant and
 /// `limit` in all, oldest first.
 ///
 /// # Errors

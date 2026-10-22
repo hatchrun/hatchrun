@@ -38,6 +38,7 @@ use worker::{
 };
 
 use crate::env::{Settings, run_stub};
+use crate::environments;
 use crate::github;
 use crate::launcher::Backend;
 use crate::launches::{self, EndAnswer};
@@ -378,6 +379,8 @@ pub(crate) enum OpenFailure {
     Unavailable(String),
     /// The secret of this name does not open.
     Unreadable(String, SecretError),
+    /// The environment the job names was deleted since the launch.
+    EnvironmentGone(String),
 }
 
 /// Decides from the outcome of reading the values. Only a secret that
@@ -389,6 +392,9 @@ pub(crate) fn opened(outcome: Result<Values, OpenFailure>) -> Opened {
         Err(OpenFailure::Unreadable(name, _)) => Opened::EndJob(format!(
             "Secret `{name}` cannot be read. Set it again in the hatchrun app."
         )),
+        Err(OpenFailure::EnvironmentGone(name)) => {
+            Opened::EndJob(environments::gone_message(&name))
+        }
     }
 }
 
@@ -402,6 +408,9 @@ async fn open_values(env: &Env, db: &Db, row: &JobRow, repo: &RepoRow) -> Opened
         }
         Err(OpenFailure::Unreadable(name, err)) => {
             console_error!("job {}: secret {name}: {err:?}", row.id);
+        }
+        Err(OpenFailure::EnvironmentGone(name)) => {
+            console_error!("job {}: environment {name} is gone", row.id);
         }
         Ok(_) => {}
     }
@@ -418,13 +427,24 @@ async fn read_values(
     let refs: SecretRefs =
         serde_json::from_value(row.secret_refs.clone()).map_err(|e| unavailable(&e))?;
     let names: Vec<String> = refs.names.iter().cloned().collect();
+    let environment_id = match &row.environment {
+        None => None,
+        Some(asked) => {
+            let found = store::job_environment(db, row.id)
+                .await
+                .map_err(|e| unavailable(&e))?
+                .and_then(|found| found.environment)
+                .ok_or_else(|| OpenFailure::EnvironmentGone(asked.clone()))?;
+            Some(found.id)
+        }
+    };
     let rows = if refs.all {
-        store::sealed_secrets(db, &repo.tenant_id, repo.id, None, None).await
+        store::sealed_secrets(db, &repo.tenant_id, repo.id, environment_id, None).await
     } else {
-        store::sealed_secrets(db, &repo.tenant_id, repo.id, None, Some(&names)).await
+        store::sealed_secrets(db, &repo.tenant_id, repo.id, environment_id, Some(&names)).await
     }
     .map_err(|e| unavailable(&e))?;
-    let vars = store::job_vars(db, &repo.tenant_id, repo.id, None)
+    let vars = store::job_vars(db, &repo.tenant_id, repo.id, environment_id)
         .await
         .map_err(|e| unavailable(&e))?;
     if rows.is_empty() {
@@ -836,6 +856,14 @@ mod tests {
         assert_eq!(
             opened(Err(OpenFailure::Unavailable("db down".into()))),
             Opened::Retry
+        );
+    }
+
+    #[test]
+    fn a_gone_environment_ends_the_job() {
+        assert_eq!(
+            opened(Err(OpenFailure::EnvironmentGone("production".into()))),
+            Opened::EndJob("Environment `production` was deleted before the job started.".into())
         );
     }
 }
