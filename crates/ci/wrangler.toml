@@ -125,9 +125,8 @@ CI_SUBNET_IDS = ""
 # product's ID), the same value as hatchrun-cloud's POLAR_CI_PRODUCT_ID.
 # Checkout answers 503 while it is empty.
 POLAR_CI_PRODUCT_ID = ""
-# Polar's API for checkout, the portal and the usage events, currently
-# the sandbox. Unset, the Worker uses https://api.polar.sh.
-POLAR_API_URL = "https://sandbox-api.polar.sh"
+# POLAR_API_URL is left unset, so checkout, the portal and the usage
+# events go to https://api.polar.sh, the same Polar as hatchrun-cloud.
 # The id of the key behind CI_SECRETS_KEY, stored with every sealed
 # value, and of the one behind CI_SECRETS_KEY_OLD (empty when none).
 CI_SECRETS_KEY_ID = "2026-10"
