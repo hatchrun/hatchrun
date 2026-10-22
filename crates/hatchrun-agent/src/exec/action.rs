@@ -431,9 +431,13 @@ async fn download(
     let name = format!("action-{}", super::random_name().map_err(|e| anyhow!(e))?);
     nix::sys::stat::mkdirat(&*stage.fd, name.as_str(), to_mode(0o700))
         .with_context(|| format!("create a directory in {}", stage.path.display()))?;
-    let result = fill(github, owner, repo, git_ref, key, stage, &name, limits).await;
-    remove_tree(&stage.fd, OsStr::new(&name));
-    result
+    // Declared before the fetch, so that a dropped fetch has stopped its
+    // extraction by the time this removes the entry.
+    let _cleanup = super::builtin::RemoveDir {
+        stage: Arc::clone(&stage.fd),
+        name: name.clone(),
+    };
+    fill(github, owner, repo, git_ref, key, stage, &name, limits).await
 }
 
 /// Downloads and extracts into the stage directory `name`, then moves
@@ -1349,6 +1353,36 @@ mod tests {
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
         assert!(moved.join("o/r/v1/tree/action.yml").is_file());
         // Nothing is left in the stage.
+        assert_eq!(
+            fs::read_dir(work.path().join("state/stage"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_fetch_cleans_the_stage() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball(&[("o-r-abc/action.yml", NODE_YML)]))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let work = tempfile::tempdir().unwrap();
+        let layout = Layout::new(work.path(), "o/r", Path::new("/tc"));
+        let held = cache(&layout);
+        let gh = github(&server.uri());
+        let r = remote("o", "r", "", "v1");
+        let fetch = fetch_with(&r, &gh, &layout, &held, fast());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), fetch)
+                .await
+                .is_err()
+        );
         assert_eq!(
             fs::read_dir(work.path().join("state/stage"))
                 .unwrap()

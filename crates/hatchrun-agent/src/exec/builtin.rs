@@ -328,15 +328,31 @@ impl Fs {
 }
 
 /// Removes a directory of the stage when dropped, relative to the
-/// stage descriptor. Links are removed, never followed.
-struct RemoveDir {
-    stage: Arc<OwnedFd>,
-    name: String,
+/// stage descriptor. Links are removed, never followed. A blocking task
+/// that was told to stop may still be writing into it, so the removal
+/// repeats briefly until the directory is gone.
+pub(super) struct RemoveDir {
+    pub(super) stage: Arc<OwnedFd>,
+    pub(super) name: String,
 }
 
 impl Drop for RemoveDir {
     fn drop(&mut self) {
-        remove_tree(&self.stage, OsStr::new(&self.name));
+        for _ in 0..40 {
+            remove_tree(&self.stage, OsStr::new(&self.name));
+            let gone = matches!(
+                fstatat(
+                    &*self.stage,
+                    self.name.as_str(),
+                    AtFlags::AT_SYMLINK_NOFOLLOW
+                ),
+                Err(Errno::ENOENT)
+            );
+            if gone {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
 }
 
