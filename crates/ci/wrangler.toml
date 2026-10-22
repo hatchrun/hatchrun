@@ -77,17 +77,17 @@ max_batch_timeout = 5
 max_retries = 3
 
 # The key that seals CI secrets, from the account's Secrets Store. The
-# store_id is the account's store, from `npx wrangler secrets-store
-# store list`, written here by hand before the first deploy; the
-# deploy workflow does not set it. secret_name is a secret in that
-# store with scope workers, holding base64 of 32 random bytes
+# deploy workflow sets store_id from the CLOUDFLARE_SECRETS_STORE_ID
+# secret, the account's store from `npx wrangler secrets-store store
+# list`; e2e.sh points it at a local store. secret_name is a secret in
+# that store with scope workers, holding base64 of 32 random bytes
 # (`openssl rand -base64 32`). To rotate: add the new secret to the
 # store, point CI_SECRETS_KEY at it with a new CI_SECRETS_KEY_ID, move
 # the old one to CI_SECRETS_KEY_OLD and CI_SECRETS_KEY_OLD_ID, deploy,
 # and drop the old binding once no ci_secrets row has the old key_id.
 [[secrets_store_secrets]]
 binding = "CI_SECRETS_KEY"
-store_id = "<the account's store id: wrangler secrets-store store list>"
+store_id = "local"
 secret_name = "ci-secrets-key-2026-10"
 
 # Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY,

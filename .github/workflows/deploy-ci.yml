@@ -14,8 +14,13 @@ name: deploy-ci
 #      hatchrun-ci-launches and hatchrun-ci-launches-dlq.
 #   2. Apply the lifecycle: `npx wrangler r2 bucket lifecycle set
 #      hatchrun-ci-logs --file r2-lifecycle.json` from crates/ci.
-#   3. Deploy the Worker once: `npx wrangler deploy` from crates/ci.
-#   4. Merge. This workflow takes over from then on.
+#   3. Add the secret ci-secrets-key-2026-10 (scope workers, base64 of
+#      32 random bytes) to the account's Secrets Store, and put the
+#      store's id in the CLOUDFLARE_SECRETS_STORE_ID secret.
+#   4. Deploy the Worker once: `npx wrangler deploy` from crates/ci,
+#      with the store, Hyperdrive and KV ids set in wrangler.toml the
+#      way the steps below set them.
+#   5. Merge. This workflow takes over from then on.
 # Its CI_ROLE_ARN, CI_LAUNCH_TEMPLATE_ID and CI_SUBNET_IDS repository
 # variables are the RoleArn, LaunchTemplateId and SubnetIds outputs of
 # the stack in deploy/cloudformation/ci-account.yaml.
@@ -101,6 +106,14 @@ jobs:
           test -n "$NAMESPACE_ID"
           sed -i "s/^id = \"local\"$/id = \"${NAMESPACE_ID}\"/" wrangler.toml
           grep -qx "id = \"${NAMESPACE_ID}\"" wrangler.toml
+
+      - name: Point at the production secrets store
+        env:
+          STORE_ID: ${{ secrets.CLOUDFLARE_SECRETS_STORE_ID }}
+        run: |
+          test -n "$STORE_ID"
+          sed -i "s/^store_id = \"local\"$/store_id = \"${STORE_ID}\"/" wrangler.toml
+          grep -qx "store_id = \"${STORE_ID}\"" wrangler.toml
 
       # The CI account stack's outputs, kept as repository variables.
       # wrangler.toml leaves them empty, and an empty one would deploy a
