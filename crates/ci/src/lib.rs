@@ -24,6 +24,7 @@ pub mod env;
 pub mod github;
 pub mod graph;
 pub mod intake;
+pub mod logs;
 pub mod planning;
 pub mod run;
 pub mod store;

@@ -30,6 +30,16 @@
 //! | `POST /rerun?job=ID` | none | `204` |
 //! | `POST /purge` | none | `204` |
 //! | `GET /state` | none | `200` [`RunState`] |
+//! | `GET /live?job=ID` | WebSocket upgrade | `101`, `409` ended |
+//! | `GET /log?job=ID` | none | `200` the newest text, `404` none |
+//!
+//! `Line` events of a batch go to the job's [`LogWriter`]: each full
+//! chunk is stored as `log:<job>:<n:08>` and the rest of the writer
+//! under `logw:<job>` and `logo:<job>`. A job's sockets (hibernating
+//! `WebSockets` tagged with the job id) get every applied batch. When the
+//! job ends the writer is sealed (`logx:<job>`), the sockets get the end
+//! and close, and the log is gzipped to R2 outside the lock; a failed
+//! upload stays pending in `job:<id>` and the alarm retries it.
 
 use std::cell::{Cell, OnceCell};
 use std::time::Duration;
@@ -43,10 +53,12 @@ use hatchrun_workflow::agent::{AgentEvent, Batch, BatchReply};
 use hatchrun_workflow::{Annotation, Conclusion, Github, JobDocument, JobResult, PlannedJob};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use worker::{Env, Method, Request, Response, Result, State, Storage};
+use wasm_bindgen::JsValue;
+use worker::{Env, HttpMetadata, Method, Request, Response, Result, State, Storage, WebSocketPair};
 
 use crate::checks::{
-    JobView, MAX_TOTAL_ANNOTATIONS, Outbox, StepView, conclusion_word, details_url, render,
+    JobView, MAX_TOTAL_ANNOTATIONS, Outbox, StepView, TAIL_LINES, conclusion_word, details_url,
+    render,
 };
 use crate::env::Settings;
 use crate::github::{
@@ -54,6 +66,7 @@ use crate::github::{
 };
 use crate::graph::{Action, Graph, Node, State as NodeState};
 use crate::intake::Repo;
+use crate::logs::{BACKLOG_BYTES, Compressor, LogIndex, LogWriter, index_key, log_key, tail};
 use crate::store;
 
 /// The queue that launches instances.
@@ -82,6 +95,16 @@ const MAX_SEND_TRIES: u32 = 5;
 const TODO_RETRY_MS: u64 = 30 * 1000;
 /// How long an object whose alarm failed to plan waits, in milliseconds.
 const ALARM_FALLBACK_MS: u64 = 60 * 1000;
+/// How long a failed log upload waits before the next try, in
+/// milliseconds.
+const UPLOAD_RETRY_MS: u64 = 30 * 1000;
+/// How much text before the end of the failed step is read to find the
+/// tail for a check run, in bytes.
+const TAIL_SCAN_BYTES: u64 = 64 << 10;
+/// The most bytes the failed tail of a check run keeps.
+const TAIL_BYTES: usize = 24 << 10;
+/// How many chunk values are read in one call.
+const READ_CHUNKS: u32 = 32;
 /// How long an object restored for a read or a rerun waits before it
 /// purges itself, in milliseconds.
 const RESTORED_KEEP_MS: u64 = 10 * 60 * 1000;
@@ -97,8 +120,44 @@ fn job_key(job: u64) -> String {
     format!("job:{job}")
 }
 
+/// The prefix of a job's numbered chunks.
 fn log_prefix(job: u64) -> String {
     format!("log:{job}:")
+}
+
+fn chunk_key(job: u64, number: u32) -> String {
+    format!("log:{job}:{number:08}")
+}
+
+/// The job's [`LogWriter`] without its open chunk.
+fn writer_key(job: u64) -> String {
+    format!("logw:{job}")
+}
+
+/// The open chunk of the job's writer, as bytes.
+fn open_key(job: u64) -> String {
+    format!("logo:{job}")
+}
+
+/// What the object keeps of a job's log from the end of the job until
+/// the upload is done: the [`Sealed`] value.
+fn sealed_key(job: u64) -> String {
+    format!("logx:{job}")
+}
+
+/// The failed tail of a job's check run.
+fn tail_key(job: u64) -> String {
+    format!("tail:{job}")
+}
+
+/// The keys of a job's log other than its chunks.
+fn log_keys(job: u64) -> Vec<String> {
+    vec![
+        writer_key(job),
+        open_key(job),
+        sealed_key(job),
+        tail_key(job),
+    ]
 }
 
 /// Where the state of an ended run is kept in R2.
@@ -210,6 +269,18 @@ pub struct JobState {
     pub heartbeat_written_at: u64,
     /// Check run requests for this attempt that failed in a row.
     pub send_failures: u32,
+    /// The finished log is not in R2 yet. Its chunks and [`Sealed`] stay
+    /// in storage until it is.
+    pub upload_pending: bool,
+}
+
+/// A finished job's log as it waits for the upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sealed {
+    /// The index that goes beside the log.
+    pub index: LogIndex,
+    /// How many numbered chunks hold the text, from 0.
+    pub chunks: u32,
 }
 
 /// Everything the object's single alarm waits for, in Unix
@@ -256,6 +327,9 @@ pub enum Work {
         conclusion: Conclusion,
         /// The steps that ended, as the row keeps them.
         steps: Value,
+        /// Where the job's log will be in R2, `None` when the job
+        /// wrote none.
+        log_key: Option<String>,
     },
     /// The run's row ends.
     FinishRun {
@@ -601,6 +675,131 @@ pub(crate) fn apply_result(state: &mut JobState, result: &JobResult) {
             .cloned()
             .collect();
     }
+}
+
+/// Writes the step starts and lines of `batch` to the job's log and
+/// answers whether it wrote anything.
+pub(crate) fn apply_log(writer: &mut LogWriter, batch: &Batch) -> bool {
+    let mut wrote = false;
+    for event in &batch.events {
+        match event {
+            AgentEvent::StepStarted { index, name } => {
+                writer.step_started(*index, name);
+                wrote = true;
+            }
+            AgentEvent::Line { text } => {
+                writer.line(text);
+                wrote = true;
+            }
+            _ => {}
+        }
+    }
+    wrote
+}
+
+/// Applies a batch to the job's state and its log. A batch at or below
+/// the last sequence number is ignored whole, so its lines are written
+/// once. Answers what [`apply_steps`] did and whether the log changed.
+pub(crate) fn apply_batch(
+    state: &mut JobState,
+    writer: &mut LogWriter,
+    batch: &Batch,
+) -> (Applied, bool) {
+    let applied = apply_steps(state, batch);
+    let wrote = applied.fresh && apply_log(writer, batch);
+    (applied, wrote)
+}
+
+/// What the job's sockets get for an applied batch.
+pub(crate) fn events_message(batch: &Batch) -> String {
+    json!({ "type": "events", "events": batch.events }).to_string()
+}
+
+/// What the job's sockets get when the job ends.
+pub(crate) fn end_message(conclusion: Conclusion) -> String {
+    json!({ "type": "end", "conclusion": conclusion_word(conclusion) }).to_string()
+}
+
+/// What a new socket gets first.
+pub(crate) fn backlog_message(text: &str) -> String {
+    json!({ "type": "backlog", "text": text }).to_string()
+}
+
+/// `text` without its first lines until at most `max` bytes are left,
+/// and how many bytes that cut. The cut falls on a line start.
+pub(crate) fn trim_front(text: &str, max: usize) -> (usize, &str) {
+    if text.len() <= max {
+        return (0, text);
+    }
+    let cut = text.len() - max;
+    // The line that holds byte `cut` is partly gone, so its start is
+    // not in the text any more: begin after its end.
+    let start = text.as_bytes()[cut - 1..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(text.len(), |at| cut + at);
+    (start, &text[start..])
+}
+
+/// Makes the upload wake the alarm now, unless it wakes sooner.
+pub(crate) fn mark_upload_due(deadlines: &mut Deadlines, now_ms: u64) {
+    deadlines.upload_retry_at = Some(
+        deadlines
+            .upload_retry_at
+            .map_or(now_ms, |at| at.min(now_ms)),
+    );
+}
+
+/// When uploads that are still pending are tried again.
+pub(crate) fn upload_deadline(pending: bool, now_ms: u64) -> Option<u64> {
+    pending.then_some(now_ms + UPLOAD_RETRY_MS)
+}
+
+/// Where the lines for a failed job's check run lie in its log: the
+/// start (`None` when no step is marked failed) and the end. The span is
+/// the first failed step, or the whole log.
+pub(crate) fn tail_span(index: &LogIndex, steps: &[StepView]) -> (Option<u64>, u64) {
+    let failed = steps
+        .iter()
+        .find(|step| {
+            step.summary
+                .as_ref()
+                .is_some_and(|s| s.conclusion == Conclusion::Failure)
+        })
+        .and_then(|step| index.steps.iter().position(|mark| mark.index == step.index));
+    match failed {
+        Some(at) => (
+            Some(index.steps[at].offset),
+            index.steps.get(at + 1).map_or(index.bytes, |m| m.offset),
+        ),
+        None => (None, index.bytes),
+    }
+}
+
+/// The lines of a failed job's log for its check run. `text` is the log
+/// from byte `base` on, up to at least the end of the span of
+/// [`tail_span`]. At most [`TAIL_LINES`] lines and [`TAIL_BYTES`]
+/// bytes.
+pub(crate) fn failed_tail(
+    index: &LogIndex,
+    steps: &[StepView],
+    base: u64,
+    text: &str,
+) -> Vec<String> {
+    let (from, to) = tail_span(index, steps);
+    let relative = |at: u64| {
+        usize::try_from(at.saturating_sub(base)).map_or(text.len(), |at| at.min(text.len()))
+    };
+    let within = text.get(..relative(to)).unwrap_or(text);
+    let mut lines = tail(within, relative(from.unwrap_or(base)) as u64, TAIL_LINES);
+    let mut size: usize = lines.iter().map(|line| line.len() + 1).sum();
+    let mut cut = 0;
+    while size > TAIL_BYTES && cut < lines.len() {
+        size -= lines[cut].len() + 1;
+        cut += 1;
+    }
+    lines.drain(..cut);
+    lines
 }
 
 /// Takes the right to drain the todo list: `true` for the first caller,
@@ -950,7 +1149,10 @@ mod object {
     use std::cell::{Cell, OnceCell};
 
     use async_lock::Mutex;
-    use worker::{DurableObject, Env, Request, Response, Result, State, durable_object};
+    use worker::{
+        DurableObject, Env, Request, Response, Result, State, WebSocket, WebSocketIncomingMessage,
+        durable_object,
+    };
 
     use super::{Cx, Ident, Settings, fail};
 
@@ -1026,6 +1228,37 @@ mod object {
             self.cx()?.alarm().await;
             Response::empty()
         }
+
+        /// Viewers only listen; whatever they send is ignored.
+        #[allow(clippy::unused_async_trait_impl)]
+        async fn websocket_message(
+            &self,
+            _ws: WebSocket,
+            _message: WebSocketIncomingMessage,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        #[allow(clippy::unused_async_trait_impl)]
+        async fn websocket_close(
+            &self,
+            ws: WebSocket,
+            code: usize,
+            _reason: String,
+            _was_clean: bool,
+        ) -> Result<()> {
+            // Answers the close, so the connection ends cleanly. A
+            // reserved code cannot be sent back.
+            let code = u16::try_from(code)
+                .ok()
+                .filter(|code| (1000..=4999).contains(code) && ![1005, 1006, 1015].contains(code));
+            ws.close(code, Some("closed"))
+        }
+
+        #[allow(clippy::unused_async_trait_impl)]
+        async fn websocket_error(&self, _ws: WebSocket, _error: worker::Error) -> Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -1033,6 +1266,7 @@ pub use object::RunObject;
 
 /// One request or alarm: the clock, the settings and the connections.
 struct Cx<'a> {
+    state: &'a State,
     storage: Storage,
     env: Env,
     turn: &'a Mutex<()>,
@@ -1063,13 +1297,14 @@ struct Planned {
 
 impl<'a> Cx<'a> {
     fn new(
-        state: &State,
+        state: &'a State,
         env: &Env,
         turn: &'a Mutex<()>,
         draining: &'a Cell<bool>,
         settings: &'a Settings,
     ) -> Self {
         Self {
+            state,
             storage: state.storage(),
             env: env.clone(),
             turn,
@@ -1108,6 +1343,16 @@ impl<'a> Cx<'a> {
             }
             (Method::Post, "/purge") => return self.purge().await,
             (Method::Post, "/cancel") => return self.cancel().await,
+            (Method::Get, "/live" | "/log") => {
+                let Some(job) = job else {
+                    return Response::error("a job is needed", 400);
+                };
+                return if path == "/live" {
+                    self.live(req, job).await
+                } else {
+                    self.log(job).await
+                };
+            }
             (Method::Get, "/state") => {
                 let Some(ident) = ident else {
                     return Response::error("a run and a tenant are needed", 400);
@@ -1234,15 +1479,11 @@ impl<'a> Cx<'a> {
             worker::console_error!("alarm: snapshot: {err}");
             failed.snapshot = true;
         }
-        if due.upload {
-            // Uploads of finished logs retry here (Task 10).
-            let done = self
-                .update(|run| run.deadlines_mut().upload_retry_at = None)
-                .await;
-            if let Err(err) = done {
-                worker::console_error!("alarm: uploads: {err}");
-                failed.upload = true;
-            }
+        if due.upload
+            && let Err(err) = self.upload_logs().await
+        {
+            worker::console_error!("alarm: uploads: {err}");
+            failed.upload = true;
         }
         let now = self.now;
         self.update(|run| {
@@ -1540,21 +1781,18 @@ impl<'a> Cx<'a> {
                 attempt,
                 conclusion,
                 steps,
-            } => {
-                // The key of the finished log comes with the uploads
-                // (Task 10).
-                store::finish_job(
-                    db,
-                    *job,
-                    *attempt,
-                    conclusion_word(*conclusion),
-                    steps,
-                    None,
-                    self.now,
-                )
-                .await
-                .map(|_| ())
-            }
+                log_key,
+            } => store::finish_job(
+                db,
+                *job,
+                *attempt,
+                conclusion_word(*conclusion),
+                steps,
+                log_key.as_deref(),
+                self.now,
+            )
+            .await
+            .map(|_| ()),
             Work::FinishRun {
                 attempt,
                 conclusion,
@@ -1591,6 +1829,12 @@ impl<'a> Cx<'a> {
                     state.completed_at = Some(self.now);
                     let steps = steps_json(&state.steps);
                     revoke.extend(state.github_token.take());
+                    let log_key = self.seal_log(&run.info, job, conclusion, &state).await?;
+                    if log_key.is_some() {
+                        state.upload_pending = true;
+                        mark_upload_due(run.deadlines_mut(), self.now);
+                    }
+                    self.end_sockets(job, conclusion);
                     self.put_job(job, &state).await?;
                     run.outbox_mut().mark(job);
                     let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
@@ -1599,6 +1843,7 @@ impl<'a> Cx<'a> {
                         attempt,
                         conclusion,
                         steps,
+                        log_key,
                     });
                 }
                 // The agent learns of a cancel from the reply to its
@@ -1622,6 +1867,9 @@ impl<'a> Cx<'a> {
     async fn after(&self, revoke: Vec<String>) {
         if let Err(err) = self.drain().await {
             worker::console_error!("side effects: {err}");
+        }
+        if let Err(err) = self.upload_logs().await {
+            worker::console_error!("uploads: {err}");
         }
         if let Err(err) = self.snapshot_now().await {
             worker::console_error!("snapshot: {err}");
@@ -1754,10 +2002,17 @@ impl<'a> Cx<'a> {
             }
             let cancel = run.graph.node(job).map_or(0, |node| node.cancel);
             let mut state = self.job_state(job).await?;
-            let applied = apply_steps(&mut state, batch);
+            let mut writer = self.load_writer(job).await?.unwrap_or_default();
+            let (applied, wrote) = apply_batch(&mut state, &mut writer, batch);
             let mut changed = applied.fresh;
             if applied.steps_finished > 0 {
                 run.outbox_mut().mark(job);
+            }
+            if wrote {
+                // The log first: a crash before the state is written
+                // repeats lines, which beats losing them.
+                let chunks = writer.take_full_chunks();
+                self.save_log(job, &writer, &chunks).await?;
             }
             let heartbeat = should_write_heartbeat(state.heartbeat_written_at, self.now);
             if heartbeat {
@@ -1766,6 +2021,9 @@ impl<'a> Cx<'a> {
             }
             if changed {
                 self.put_job(job, &state).await?;
+            }
+            if applied.fresh {
+                self.send_sockets(job, || events_message(batch));
             }
             if run.dirty.iter().any(|dirty| *dirty) {
                 self.commit(&mut run).await?;
@@ -1869,6 +2127,7 @@ impl<'a> Cx<'a> {
                 revoke.extend(self.job_state(id).await?.github_token);
                 self.put_job(id, &JobState::default()).await?;
                 self.delete_prefix(&log_prefix(id)).await?;
+                self.storage.delete_multiple(log_keys(id)).await?;
                 run.todo_mut().push(Work::ResetJob { job: id, attempt });
                 run.outbox_mut().mark(id);
             }
@@ -1901,6 +2160,374 @@ impl<'a> Cx<'a> {
             }
             self.storage.delete_multiple(keys).await?;
         }
+    }
+
+    fn raw_set(object: &js_sys::Object, key: &str, bytes: &[u8]) -> Result<()> {
+        let value = js_sys::Uint8Array::from(bytes);
+        js_sys::Reflect::set(object, &JsValue::from_str(key), &value)
+            .map(|_| ())
+            .map_err(|err| fail(format!("{key}: {err:?}")))
+    }
+
+    /// Reads values stored as bytes, in the order of `keys`.
+    async fn raw_get(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
+        let found = self
+            .storage
+            .get_multiple(keys.iter().map(String::as_str).collect::<Vec<_>>())
+            .await?;
+        Ok(keys
+            .iter()
+            .map(|key| {
+                let value = found.get(&JsValue::from_str(key));
+                (!value.is_undefined()).then(|| js_sys::Uint8Array::new(&value).to_vec())
+            })
+            .collect())
+    }
+
+    /// The job's log writer. Log text is stored as bytes: a text value
+    /// takes two bytes per character once one character is outside
+    /// Latin-1, which would break the 128 KiB limit of a value.
+    async fn load_writer(&self, job: u64) -> Result<Option<LogWriter>> {
+        let mut found = self
+            .raw_get(&[writer_key(job), open_key(job)])
+            .await?
+            .into_iter();
+        let (Some(Some(meta)), open) = (found.next(), found.next().flatten()) else {
+            return Ok(None);
+        };
+        let writer: LogWriter = serde_json::from_slice(&meta)
+            .map_err(|err| fail(format!("job {job}: log writer: {err}")))?;
+        let open = open.map_or_else(String::new, |bytes| {
+            String::from_utf8_lossy(&bytes).into_owned()
+        });
+        Ok(Some(writer.with_open(open)))
+    }
+
+    /// Writes the full chunks the writer gave up and what it still
+    /// holds, in one write.
+    async fn save_log(&self, job: u64, writer: &LogWriter, chunks: &[(u32, String)]) -> Result<()> {
+        let object = js_sys::Object::new();
+        for (number, text) in chunks {
+            Self::raw_set(&object, &chunk_key(job, *number), text.as_bytes())?;
+        }
+        let meta = serde_json::to_vec(writer).map_err(|err| fail(err.to_string()))?;
+        Self::raw_set(&object, &writer_key(job), &meta)?;
+        Self::raw_set(&object, &open_key(job), writer.open_text().as_bytes())?;
+        self.storage.put_multiple_raw(object).await
+    }
+
+    async fn sealed(&self, job: u64) -> Result<Option<Sealed>> {
+        let Some(Some(bytes)) = self.raw_get(&[sealed_key(job)]).await?.pop() else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|err| fail(format!("job {job}: sealed log: {err}")))
+    }
+
+    /// The text of the log between `from_needed` and `to`, read from the
+    /// newest chunk back, and the byte offset it starts at. The chunks
+    /// hold `chunk_bytes` bytes together; a chunk that starts at or
+    /// after `to` is read past and not kept. Stops at a chunk that is
+    /// gone.
+    async fn read_window(
+        &self,
+        job: u64,
+        chunks: u32,
+        chunk_bytes: u64,
+        to: u64,
+        from_needed: u64,
+    ) -> Result<(u64, String)> {
+        let mut base = chunk_bytes;
+        let mut parts = Vec::new();
+        let mut next = chunks;
+        'read: while next > 0 && base > from_needed {
+            let first = next.saturating_sub(4);
+            let keys: Vec<String> = (first..next).map(|n| chunk_key(job, n)).collect();
+            for bytes in self.raw_get(&keys).await?.into_iter().rev() {
+                let Some(bytes) = bytes else {
+                    break 'read;
+                };
+                base = base.saturating_sub(bytes.len() as u64);
+                if base >= to {
+                    continue;
+                }
+                parts.push(String::from_utf8_lossy(&bytes).into_owned());
+                if base <= from_needed {
+                    break 'read;
+                }
+            }
+            next = first;
+        }
+        parts.reverse();
+        Ok((base, parts.concat()))
+    }
+
+    /// Up to [`BACKLOG_BYTES`] of the newest text of a job's log and the
+    /// offset it starts at, `None` when the job has no log in storage.
+    async fn newest(&self, job: u64) -> Result<Option<(u64, String)>> {
+        let (total, chunks, open) = if let Some(writer) = self.load_writer(job).await? {
+            (
+                writer.bytes(),
+                writer.chunk_count(),
+                writer.open_text().to_owned(),
+            )
+        } else if let Some(sealed) = self.sealed(job).await? {
+            (sealed.index.bytes, sealed.chunks, String::new())
+        } else {
+            return Ok(None);
+        };
+        let in_chunks = total.saturating_sub(open.len() as u64);
+        let (base, mut text) = self
+            .read_window(
+                job,
+                chunks,
+                in_chunks,
+                u64::MAX,
+                total.saturating_sub(BACKLOG_BYTES),
+            )
+            .await?;
+        text.push_str(&open);
+        let (skipped, kept) =
+            trim_front(&text, usize::try_from(BACKLOG_BYTES).unwrap_or(usize::MAX));
+        Ok(Some((base + skipped as u64, kept.to_owned())))
+    }
+
+    /// `GET /live`: a WebSocket that gets the newest stored text, then
+    /// every applied batch. The backlog is read and the socket accepted
+    /// under one lock, so no batch falls between them.
+    async fn live(&self, req: &Request, job: u64) -> Result<Response> {
+        let upgrade = req.headers().get("Upgrade")?;
+        if !upgrade.is_some_and(|value| value.eq_ignore_ascii_case("websocket")) {
+            return Response::error("a WebSocket upgrade is needed", 426);
+        }
+        let _turn = self.turn.lock().await;
+        let Some(run) = self.loaded().await? else {
+            return answer(404);
+        };
+        match run.graph.node(job) {
+            None => return answer(404),
+            Some(node) if matches!(node.state, NodeState::Done(_)) => return answer(409),
+            Some(_) => {}
+        }
+        let (_, text) = self.newest(job).await?.unwrap_or_default();
+        let pair = WebSocketPair::new()?;
+        self.state
+            .accept_websocket_with_tags(&pair.server, &[&job.to_string()]);
+        pair.server.send_with_str(backlog_message(&text))?;
+        Response::from_websocket(pair.client)
+    }
+
+    /// `GET /log`: the newest stored text of a job's log. The offset it
+    /// starts at is in `x-log-offset`.
+    async fn log(&self, job: u64) -> Result<Response> {
+        let _turn = self.turn.lock().await;
+        let Some(run) = self.loaded().await? else {
+            return answer(404);
+        };
+        let Some(node) = run.graph.node(job) else {
+            return answer(404);
+        };
+        let (offset, text) = match self.newest(job).await? {
+            Some(found) => found,
+            None if matches!(node.state, NodeState::Done(_)) => return answer(404),
+            None => (0, String::new()),
+        };
+        let mut response = Response::ok(text)?;
+        response
+            .headers_mut()
+            .set("content-type", "text/plain; charset=utf-8")?;
+        response
+            .headers_mut()
+            .set("x-log-offset", &offset.to_string())?;
+        Ok(response)
+    }
+
+    /// Sends `message()` to the job's sockets, when it has any.
+    fn send_sockets(&self, job: u64, message: impl FnOnce() -> String) {
+        let sockets = self.state.get_websockets_with_tag(&job.to_string());
+        if sockets.is_empty() {
+            return;
+        }
+        let message = message();
+        for socket in sockets {
+            if let Err(err) = socket.send_with_str(&message) {
+                worker::console_warn!("job {job}: socket: {err}");
+            }
+        }
+    }
+
+    /// Tells the job's sockets how it ended and closes them.
+    fn end_sockets(&self, job: u64, conclusion: Conclusion) {
+        self.send_sockets(job, || end_message(conclusion));
+        for socket in self.state.get_websockets_with_tag(&job.to_string()) {
+            if let Err(err) = socket.close(Some(1000), Some("job ended")) {
+                worker::console_warn!("job {job}: close: {err}");
+            }
+        }
+    }
+
+    /// Ends the job's log: the last chunk and the index are stored with
+    /// the rest of the log kept for the upload, and for a failed job
+    /// the tail of its check run is read. Answers the key the log will
+    /// have in R2, `None` when the job wrote none. Sealing twice gives
+    /// the same answer. The caller holds the lock.
+    async fn seal_log(
+        &self,
+        info: &RunInfo,
+        job: u64,
+        conclusion: Conclusion,
+        state: &JobState,
+    ) -> Result<Option<String>> {
+        let sealed = if let Some(mut writer) = self.load_writer(job).await? {
+            let (last, index) = writer.finish();
+            let sealed = Sealed {
+                index,
+                chunks: writer.chunk_count(),
+            };
+            let object = js_sys::Object::new();
+            if let Some((number, text)) = &last {
+                Self::raw_set(&object, &chunk_key(job, *number), text.as_bytes())?;
+            }
+            let bytes = serde_json::to_vec(&sealed).map_err(|err| fail(err.to_string()))?;
+            Self::raw_set(&object, &sealed_key(job), &bytes)?;
+            self.storage.put_multiple_raw(object).await?;
+            self.storage
+                .delete_multiple(vec![writer_key(job), open_key(job)])
+                .await?;
+            sealed
+        } else if let Some(sealed) = self.sealed(job).await? {
+            sealed
+        } else {
+            return Ok(None);
+        };
+        if conclusion == Conclusion::Failure {
+            let (from, to) = tail_span(&sealed.index, &state.steps);
+            let needed = to.saturating_sub(TAIL_SCAN_BYTES).max(from.unwrap_or(0));
+            let (base, text) = self
+                .read_window(job, sealed.chunks, sealed.index.bytes, to, needed)
+                .await?;
+            let lines = failed_tail(&sealed.index, &state.steps, base, &text);
+            self.storage.put(&tail_key(job), &lines).await?;
+        }
+        Ok(Some(log_key(
+            &info.tenant_id,
+            info.repo.id,
+            info.run_id,
+            job,
+        )))
+    }
+
+    /// Uploads every finished log that is not in R2 yet. Each upload is
+    /// planned under the lock, done without it and recorded under it
+    /// again. A log that fails stays pending and the alarm tries it in
+    /// 30 s; an error is only a storage failure.
+    async fn upload_logs(&self) -> Result<()> {
+        let (info, jobs) = {
+            let _turn = self.turn.lock().await;
+            let deadlines: Deadlines = self.storage.get(DEADLINES).await?.unwrap_or_default();
+            if deadlines.upload_retry_at.is_none() {
+                return Ok(());
+            }
+            let Some(run) = self.loaded().await? else {
+                return Ok(());
+            };
+            let mut jobs = Vec::new();
+            for node in &run.graph.jobs {
+                if self.job_state(node.id).await?.upload_pending {
+                    jobs.push((node.id, node.attempt, self.sealed(node.id).await?));
+                }
+            }
+            (run.info, jobs)
+        };
+        for (job, attempt, sealed) in jobs {
+            let uploaded = match &sealed {
+                Some(sealed) => self.upload_one(&info, job, sealed).await,
+                None => Ok(()),
+            };
+            match uploaded {
+                Ok(()) => self.uploaded(job, attempt, sealed.as_ref()).await?,
+                Err(err) => worker::console_error!("job {job}: log upload: {err}"),
+            }
+        }
+        let now = self.now;
+        let _turn = self.turn.lock().await;
+        let Some(mut run) = self.loaded().await? else {
+            return Ok(());
+        };
+        let mut pending = false;
+        for node in &run.graph.jobs {
+            pending |= self.job_state(node.id).await?.upload_pending;
+        }
+        run.deadlines_mut().upload_retry_at = upload_deadline(pending, now);
+        self.commit(&mut run).await
+    }
+
+    /// Records a finished upload: the chunks and what goes with them
+    /// are deleted, unless a rerun made them stale meanwhile.
+    async fn uploaded(&self, job: u64, attempt: u32, sealed: Option<&Sealed>) -> Result<()> {
+        let _turn = self.turn.lock().await;
+        let Some(run) = self.loaded().await? else {
+            return Ok(());
+        };
+        if !plan_is_current(run.graph.node(job), attempt) {
+            return Ok(());
+        }
+        let mut state = self.job_state(job).await?;
+        if !state.upload_pending {
+            return Ok(());
+        }
+        state.upload_pending = false;
+        self.put_job(job, &state).await?;
+        if let Some(sealed) = sealed {
+            for first in (0..sealed.chunks).step_by(READ_CHUNKS as usize) {
+                let last = (first + READ_CHUNKS).min(sealed.chunks);
+                let keys: Vec<String> = (first..last).map(|n| chunk_key(job, n)).collect();
+                self.storage.delete_multiple(keys).await?;
+            }
+        }
+        self.storage.delete(&sealed_key(job)).await?;
+        Ok(())
+    }
+
+    /// Writes one job's gzipped log and its index to R2. The chunks are
+    /// read a few at a time, so the text is never held whole.
+    async fn upload_one(&self, info: &RunInfo, job: u64, sealed: &Sealed) -> Result<()> {
+        let mut gzip = Compressor::new();
+        for first in (0..sealed.chunks).step_by(READ_CHUNKS as usize) {
+            let last = (first + READ_CHUNKS).min(sealed.chunks);
+            let keys: Vec<String> = (first..last).map(|n| chunk_key(job, n)).collect();
+            for (key, bytes) in keys.iter().zip(self.raw_get(&keys).await?) {
+                let bytes = bytes.ok_or_else(|| fail(format!("chunk {key} is gone")))?;
+                gzip.push(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        let bucket = self.env.bucket(BUCKET)?;
+        bucket
+            .put(
+                log_key(&info.tenant_id, info.repo.id, info.run_id, job),
+                gzip.finish(),
+            )
+            .http_metadata(HttpMetadata {
+                content_type: Some("text/plain; charset=utf-8".to_owned()),
+                content_encoding: Some("gzip".to_owned()),
+                ..HttpMetadata::default()
+            })
+            .execute()
+            .await?;
+        let index = serde_json::to_vec(&sealed.index).map_err(|err| fail(err.to_string()))?;
+        bucket
+            .put(
+                index_key(&info.tenant_id, info.repo.id, info.run_id, job),
+                index,
+            )
+            .http_metadata(HttpMetadata {
+                content_type: Some("application/json".to_owned()),
+                ..HttpMetadata::default()
+            })
+            .execute()
+            .await?;
+        Ok(())
     }
 
     /// Revokes a job's GitHub token. A token that stays valid expires
@@ -1996,6 +2623,11 @@ impl<'a> Cx<'a> {
                 run.outbox_mut().sent(job, generation);
                 continue;
             };
+            let tail = if node.state == NodeState::Done(Conclusion::Failure) {
+                self.storage.get::<Vec<String>>(&tail_key(job)).await?
+            } else {
+                None
+            };
             let view = JobView {
                 workflow: &run.info.workflow,
                 node,
@@ -2009,7 +2641,7 @@ impl<'a> Cx<'a> {
                 steps: &state.steps,
                 annotations: &state.annotations,
                 file_annotations_sent: state.file_annotations_sent,
-                failed_tail: None,
+                failed_tail: tail.as_deref(),
                 started_at: state.started_at,
                 completed_at: state.completed_at,
             };
@@ -2791,5 +3423,191 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
     #[test]
     fn the_snapshot_key_names_tenant_and_run() {
         assert_eq!(snapshot_key("abc", 12), "state/abc/12.json");
+    }
+
+    fn line(text: &str) -> AgentEvent {
+        AgentEvent::Line {
+            text: text.to_owned(),
+        }
+    }
+
+    fn written(writer: &mut LogWriter) -> String {
+        let mut text = String::new();
+        for (_, chunk) in writer.take_full_chunks() {
+            text.push_str(&chunk);
+        }
+        let (last, _) = writer.finish();
+        text.push_str(&last.map(|(_, chunk)| chunk).unwrap_or_default());
+        text
+    }
+
+    #[test]
+    fn repeated_seq_is_ignored() {
+        let mut state = JobState::default();
+        let mut writer = LogWriter::default();
+        let events = vec![
+            AgentEvent::StepStarted {
+                index: 0,
+                name: "build".to_owned(),
+            },
+            line("one"),
+            line("two"),
+        ];
+        let (first, wrote) = apply_batch(&mut state, &mut writer, &batch(1, events.clone()));
+        assert!(first.fresh && wrote);
+        let (again, wrote) = apply_batch(&mut state, &mut writer, &batch(1, events));
+        assert!(!again.fresh && !wrote);
+        let (next, wrote) = apply_batch(&mut state, &mut writer, &batch(2, vec![line("three")]));
+        assert!(next.fresh && wrote);
+        assert_eq!(written(&mut writer), "== build\none\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn a_batch_of_annotations_writes_no_log() {
+        let mut state = JobState::default();
+        let mut writer = LogWriter::default();
+        let (applied, wrote) = apply_batch(
+            &mut state,
+            &mut writer,
+            &batch(
+                1,
+                vec![AgentEvent::StepFinished {
+                    index: 0,
+                    summary: summary("a"),
+                }],
+            ),
+        );
+        assert!(applied.fresh && !wrote);
+        assert_eq!(writer.bytes(), 0);
+    }
+
+    #[test]
+    fn sockets_get_batches_and_the_end_as_json() {
+        let message: Value =
+            serde_json::from_str(&events_message(&batch(1, vec![line("hi")]))).unwrap();
+        assert_eq!(message["type"], "events");
+        assert_eq!(message["events"][0]["type"], "line");
+        assert_eq!(message["events"][0]["text"], "hi");
+        let end: Value = serde_json::from_str(&end_message(Conclusion::Failure)).unwrap();
+        assert_eq!(end, json!({ "type": "end", "conclusion": "failure" }));
+        let backlog: Value = serde_json::from_str(&backlog_message("a\nb")).unwrap();
+        assert_eq!(backlog, json!({ "type": "backlog", "text": "a\nb" }));
+    }
+
+    #[test]
+    fn trim_front_cuts_on_a_line_start() {
+        assert_eq!(trim_front("a\nb\n", 10), (0, "a\nb\n"));
+        // Exactly the last line is left when it fits.
+        assert_eq!(trim_front("aaa\nbb\n", 3), (4, "bb\n"));
+        // A cut inside a line drops that line.
+        assert_eq!(trim_front("aaa\nbbbb\ncc\n", 7), (9, "cc\n"));
+        // A cut right at a line start keeps the line.
+        assert_eq!(trim_front("aaa\nbbb\n", 4), (4, "bbb\n"));
+        assert_eq!(trim_front("aaaaaa", 3), (6, ""));
+    }
+
+    #[test]
+    fn a_log_that_ends_arms_the_upload_and_a_pending_one_retries() {
+        let mut deadlines = Deadlines::default();
+        mark_upload_due(&mut deadlines, 500);
+        assert_eq!(deadlines.upload_retry_at, Some(500));
+        mark_upload_due(&mut deadlines, 900);
+        assert_eq!(deadlines.upload_retry_at, Some(500));
+        assert_eq!(upload_deadline(true, 1_000), Some(31_000));
+        assert_eq!(upload_deadline(false, 1_000), None);
+        let mut ended = graph();
+        ended.cancel(&json!({}));
+        let ready = |deadlines: &Deadlines| {
+            snapshot_ready(&ended, &Outbox::default(), deadlines, &Todo::default())
+        };
+        assert!(ready(&Deadlines::default()));
+        assert!(!ready(&deadlines));
+    }
+
+    fn log_of_two_steps() -> (LogIndex, String) {
+        let mut writer = LogWriter::default();
+        writer.step_started(0, "setup");
+        writer.line("ok");
+        writer.step_started(1, "test");
+        writer.line("a");
+        writer.line("error: boom");
+        writer.step_started(2, "cleanup");
+        writer.line("done");
+        let (last, index) = writer.finish();
+        (index, last.unwrap().1)
+    }
+
+    fn step_view(index: usize, conclusion: Conclusion) -> StepView {
+        let mut step = summary("x");
+        step.conclusion = conclusion;
+        StepView {
+            index,
+            name: "x".to_owned(),
+            summary: Some(step),
+        }
+    }
+
+    #[test]
+    fn the_failed_tail_is_the_end_of_the_failed_step() {
+        let (index, text) = log_of_two_steps();
+        let steps = [
+            step_view(0, Conclusion::Success),
+            step_view(1, Conclusion::Failure),
+            step_view(2, Conclusion::Success),
+        ];
+        assert_eq!(
+            failed_tail(&index, &steps, 0, &text),
+            vec!["== test", "a", "error: boom"]
+        );
+        // The same from a window that starts inside the step.
+        let base = text.find("a\nerror").unwrap();
+        assert_eq!(
+            failed_tail(&index, &steps, base as u64, &text[base..]),
+            vec!["a", "error: boom"]
+        );
+    }
+
+    #[test]
+    fn without_a_failed_step_the_tail_is_the_end_of_the_log() {
+        let (index, text) = log_of_two_steps();
+        let steps = [step_view(0, Conclusion::Success)];
+        assert_eq!(tail_span(&index, &steps), (None, index.bytes));
+        assert_eq!(
+            failed_tail(&index, &steps, 0, &text),
+            vec![
+                "== setup",
+                "ok",
+                "== test",
+                "a",
+                "error: boom",
+                "== cleanup",
+                "done"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_failed_tail_is_bounded() {
+        let mut writer = LogWriter::default();
+        writer.step_started(0, "t");
+        for i in 0..100 {
+            writer.line(&format!("{i:0>4000}"));
+        }
+        let (last, index) = writer.finish();
+        let text = last.unwrap().1;
+        let lines = failed_tail(&index, &[step_view(0, Conclusion::Failure)], 0, &text);
+        assert!(lines.len() <= TAIL_LINES);
+        assert!(lines.iter().map(|l| l.len() + 1).sum::<usize>() <= TAIL_BYTES);
+        assert_eq!(lines.last().unwrap(), &format!("{:0>4000}", 99));
+    }
+
+    #[test]
+    fn log_keys_do_not_overlap_the_chunk_prefix() {
+        assert_eq!(chunk_key(4, 7), "log:4:00000007");
+        assert!(chunk_key(4, 7).starts_with(&log_prefix(4)));
+        for key in log_keys(4) {
+            assert!(!key.starts_with(&log_prefix(4)), "{key}");
+        }
+        assert!(!chunk_key(14, 0).starts_with(&log_prefix(4)));
     }
 }
