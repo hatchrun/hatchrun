@@ -263,11 +263,12 @@ const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2,
      WHERE id = $1 AND status IN ('launching', 'launched')";
 
 /// Sets job `$1` up for attempt `$2` at `$3`: nothing of the earlier
-/// attempt is left.
+/// attempt is left. A job already at that attempt or later is left
+/// alone, so a late repeat does nothing.
 const RESET_JOB: &str = "UPDATE ci_jobs SET status = 'waiting', attempt = $2, launch_attempts = 0, \
      conclusion = NULL, instance_id = NULL, launch_error = NULL, next_launch_at = NULL, \
      heartbeat_at = NULL, started_at = NULL, completed_at = NULL, log_key = NULL, \
-     steps = '[]', updated_at = $3 WHERE id = $1";
+     steps = '[]', updated_at = $3 WHERE id = $1 AND attempt < $2";
 
 /// Moves run `$1` from queued to in progress at `$2`.
 const RUN_STARTED: &str = "UPDATE ci_runs SET status = 'in_progress', updated_at = $2 WHERE id = $1 AND status = 'queued'";
@@ -318,15 +319,15 @@ const LAUNCH_GAVE_UP: &str = "UPDATE ci_jobs SET status = 'completed', conclusio
 const HEARTBEAT: &str = "UPDATE ci_jobs SET heartbeat_at = $2, updated_at = $2 \
      WHERE id = $1 AND status <> 'completed'";
 
-/// Completes job `$1` with conclusion `$2`, steps `$3` (JSON text) and
-/// log key `$4` at `$5`.
+/// Completes attempt `$6` of job `$1` with conclusion `$2`, steps `$3`
+/// (JSON text) and log key `$4` at `$5`.
 const FINISH_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = $2, \
      steps = $3::jsonb, log_key = $4, completed_at = $5, updated_at = $5 \
-     WHERE id = $1 AND status <> 'completed'";
+     WHERE id = $1 AND status <> 'completed' AND attempt = $6";
 
-/// Completes run `$1` with conclusion `$2` at `$3`.
+/// Completes attempt `$4` of run `$1` with conclusion `$2` at `$3`.
 const FINISH_RUN: &str = "UPDATE ci_runs SET status = 'completed', conclusion = $2, \
-     completed_at = $3, updated_at = $3 WHERE id = $1";
+     completed_at = $3, updated_at = $3 WHERE id = $1 AND run_attempt = $4";
 
 /// Drops the schedules of repository `$1`.
 const DELETE_SCHEDULES: &str = "DELETE FROM ci_schedules WHERE repo_id = $1";
@@ -733,9 +734,10 @@ pub async fn heartbeat(db: &Db, job_id: u64, now: u64) -> Result<()> {
     Ok(())
 }
 
-/// Completes job `job_id` with its `conclusion`, `steps` and the key of
-/// its finished log. A completed job keeps what it has; returns whether
-/// this call completed it.
+/// Completes attempt `attempt` of job `job_id` with its `conclusion`,
+/// `steps` and the key of its finished log. A completed job, and a job
+/// of another attempt, keep what they have; returns whether this call
+/// completed it.
 ///
 /// # Errors
 ///
@@ -743,6 +745,7 @@ pub async fn heartbeat(db: &Db, job_id: u64, now: u64) -> Result<()> {
 pub async fn finish_job(
     db: &Db,
     job_id: u64,
+    attempt: u32,
     conclusion: &str,
     steps: &serde_json::Value,
     log_key: Option<&str>,
@@ -751,19 +754,26 @@ pub async fn finish_job(
     let changed = db
         .run(
             FINISH_JOB,
-            &params![job_id, conclusion, steps.to_string(), log_key, now],
+            &params![job_id, conclusion, steps.to_string(), log_key, now, attempt],
         )
         .await?;
     Ok(changed == 1)
 }
 
-/// Completes run `run_id` with its `conclusion`.
+/// Completes attempt `attempt` of run `run_id` with its `conclusion`; a
+/// run of another attempt is left alone.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn finish_run(db: &Db, run_id: u64, conclusion: &str, now: u64) -> Result<()> {
-    db.run(FINISH_RUN, &params![run_id, conclusion, now])
+pub async fn finish_run(
+    db: &Db,
+    run_id: u64,
+    attempt: u32,
+    conclusion: &str,
+    now: u64,
+) -> Result<()> {
+    db.run(FINISH_RUN, &params![run_id, conclusion, now, attempt])
         .await?;
     Ok(())
 }
@@ -1098,6 +1108,7 @@ mod tests {
             db.wait(finish_job(
                 db.db(),
                 job_id,
+                1,
                 "success",
                 &steps,
                 Some("k1"),
@@ -1110,6 +1121,7 @@ mod tests {
             !db.wait(finish_job(
                 db.db(),
                 job_id,
+                1,
                 "failure",
                 &late,
                 Some("k2"),
@@ -1209,6 +1221,7 @@ mod tests {
         db.wait(finish_job(
             db.db(),
             job_id,
+            1,
             "failure",
             &steps,
             Some("logs/x"),
@@ -1249,6 +1262,35 @@ mod tests {
     }
 
     #[test]
+    fn late_repeats_of_side_effects_change_nothing() {
+        let db = setup();
+        let (run_row, job_id) = run_with_job(&db, "queued");
+        let steps = serde_json::json!([]);
+        db.wait(reset_job(db.db(), job_id, 2, 5)).unwrap();
+        db.wait(set_job(db.db(), job_id, "launching", None, 6))
+            .unwrap();
+        // The same reset again, and a finish of attempt 1, both late.
+        db.wait(reset_job(db.db(), job_id, 2, 7)).unwrap();
+        assert_eq!(
+            db.wait(job(db.db(), job_id)).unwrap().unwrap().status,
+            "launching"
+        );
+        assert!(
+            !db.wait(finish_job(db.db(), job_id, 1, "failure", &steps, None, 8))
+                .unwrap()
+        );
+        db.wait(reopen_run_at(db.db(), run_row.id, 2, 9)).unwrap();
+        db.wait(finish_run(db.db(), run_row.id, 1, "failure", 10))
+            .unwrap();
+        let row = db.wait(run(db.db(), run_row.id)).unwrap().unwrap();
+        assert_eq!((row.status.as_str(), row.conclusion), ("in_progress", None));
+        assert!(
+            db.wait(finish_job(db.db(), job_id, 2, "success", &steps, None, 11))
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn queue_job_only_moves_a_waiting_job_of_that_attempt() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "waiting");
@@ -1266,7 +1308,7 @@ mod tests {
     fn reopen_run_at_sets_the_attempt_and_repeats() {
         let db = setup();
         let (run_row, _) = run_with_job(&db, "queued");
-        db.wait(finish_run(db.db(), run_row.id, "failure", 6))
+        db.wait(finish_run(db.db(), run_row.id, 1, "failure", 6))
             .unwrap();
         for _ in 0..2 {
             db.wait(reopen_run_at(db.db(), run_row.id, 2, 7)).unwrap();
@@ -1283,7 +1325,7 @@ mod tests {
         db.wait(run_started(db.db(), run_row.id, 5)).unwrap();
         let started = db.wait(run(db.db(), run_row.id)).unwrap().unwrap();
         assert_eq!(started.status, "in_progress");
-        db.wait(finish_run(db.db(), run_row.id, "failure", 6))
+        db.wait(finish_run(db.db(), run_row.id, 1, "failure", 6))
             .unwrap();
         let finished = db.wait(run(db.db(), run_row.id)).unwrap().unwrap();
         assert_eq!(finished.status, "completed");

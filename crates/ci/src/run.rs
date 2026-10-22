@@ -31,7 +31,7 @@
 //! | `POST /purge` | none | `204` |
 //! | `GET /state` | none | `200` [`RunState`] |
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::time::Duration;
 
 use async_lock::Mutex;
@@ -250,6 +250,8 @@ pub enum Work {
     FinishJob {
         /// The job.
         job: u64,
+        /// The attempt that ended.
+        attempt: u32,
         /// How it ended.
         conclusion: Conclusion,
         /// The steps that ended, as the row keeps them.
@@ -257,6 +259,8 @@ pub enum Work {
     },
     /// The run's row ends.
     FinishRun {
+        /// The attempt that ended.
+        attempt: u32,
         /// How it ended.
         conclusion: Conclusion,
     },
@@ -599,6 +603,12 @@ pub(crate) fn apply_result(state: &mut JobState, result: &JobResult) {
     }
 }
 
+/// Takes the right to drain the todo list: `true` for the first caller,
+/// `false` while another holds it.
+pub(crate) fn take_drain(flag: &Cell<bool>) -> bool {
+    !flag.replace(true)
+}
+
 /// Whether a heartbeat written at `last` is old enough to write again
 /// at `now`, both in Unix milliseconds.
 pub(crate) fn should_write_heartbeat(last: u64, now: u64) -> bool {
@@ -721,8 +731,14 @@ pub(crate) enum Flushed {
     Failed,
 }
 
+/// Whether the job is still at the attempt a request was planned for.
+pub(crate) fn plan_is_current(node: Option<&Node>, planned: u32) -> bool {
+    node.is_some_and(|node| node.attempt == planned)
+}
+
 /// Records what happened to the request of `job`, made for the mark of
-/// `generation`. Returns whether the flush goes on with the next job.
+/// `generation`. Returns whether the flush goes on with the next job:
+/// not after a throttle or a failure that backs off.
 ///
 /// A failure keeps the mark and backs off. After [`MAX_SEND_TRIES`]
 /// failures in a row the mark is dropped, which the caller logs.
@@ -760,12 +776,12 @@ pub(crate) fn record_flush(
             if state.send_failures >= MAX_SEND_TRIES {
                 state.send_failures = 0;
                 outbox.sent(job, generation);
-            } else {
-                // Blocks every job's updates for a while, which is what
-                // a GitHub that fails for one is likely doing for all.
-                outbox.throttled(now_ms, backoff(state.send_failures - 1));
+                return true;
             }
-            true
+            // Blocks every job's updates for a while, which is what a
+            // GitHub that fails for one is likely doing for all.
+            outbox.throttled(now_ms, backoff(state.send_failures - 1));
+            false
         }
     }
 }
@@ -789,6 +805,7 @@ pub(crate) struct Failed {
     pub(crate) upload: bool,
     pub(crate) todo: bool,
     pub(crate) purge: bool,
+    pub(crate) snapshot: bool,
 }
 
 /// Sets the deadlines of the parts that failed to `backoff` from now
@@ -800,7 +817,12 @@ pub(crate) fn reschedule(
     failed: Failed,
     now_ms: u64,
 ) {
-    let any = failed.flush || failed.escalate || failed.upload || failed.todo || failed.purge;
+    let any = failed.flush
+        || failed.escalate
+        || failed.upload
+        || failed.todo
+        || failed.purge
+        || failed.snapshot;
     if !any {
         deadlines.failures = 0;
         return;
@@ -818,6 +840,9 @@ pub(crate) fn reschedule(
     }
     if failed.purge {
         deadlines.purge_at = Some(at);
+    }
+    if failed.snapshot {
+        deadlines.snapshot_at = Some(at);
     }
     if failed.flush {
         outbox.throttled(now_ms, wait);
@@ -922,7 +947,7 @@ impl Loaded {
 mod object {
     #![allow(missing_docs)]
 
-    use std::cell::OnceCell;
+    use std::cell::{Cell, OnceCell};
 
     use async_lock::Mutex;
     use worker::{DurableObject, Env, Request, Response, Result, State, durable_object};
@@ -939,6 +964,8 @@ mod object {
         /// GitHub, Postgres or the queue.
         turn: Mutex<()>,
         settings: OnceCell<Settings>,
+        /// Whether a request or the alarm is running the todo list.
+        draining: Cell<bool>,
     }
 
     impl RunObject {
@@ -951,7 +978,13 @@ mod object {
                 .settings
                 .get()
                 .ok_or_else(|| fail("settings are not read"))?;
-            Ok(Cx::new(&self.state, &self.env, &self.turn, settings))
+            Ok(Cx::new(
+                &self.state,
+                &self.env,
+                &self.turn,
+                &self.draining,
+                settings,
+            ))
         }
     }
 
@@ -962,6 +995,7 @@ mod object {
                 env,
                 turn: Mutex::new(()),
                 settings: OnceCell::new(),
+                draining: Cell::new(false),
             }
         }
 
@@ -1002,6 +1036,7 @@ struct Cx<'a> {
     storage: Storage,
     env: Env,
     turn: &'a Mutex<()>,
+    draining: &'a Cell<bool>,
     settings: &'a Settings,
     now: u64,
     db: OnceCell<Db>,
@@ -1019,17 +1054,26 @@ struct Planned {
     /// The count it has once a minimal request is sent.
     file_total: usize,
     check_run_id: Option<u64>,
+    /// The job's attempt when the request was planned.
+    node_attempt: u32,
     installation: u64,
     repo: String,
     attempt: u32,
 }
 
 impl<'a> Cx<'a> {
-    fn new(state: &State, env: &Env, turn: &'a Mutex<()>, settings: &'a Settings) -> Self {
+    fn new(
+        state: &State,
+        env: &Env,
+        turn: &'a Mutex<()>,
+        draining: &'a Cell<bool>,
+        settings: &'a Settings,
+    ) -> Self {
         Self {
             storage: state.storage(),
             env: env.clone(),
             turn,
+            draining,
             settings,
             now: now_ms(),
             db: OnceCell::new(),
@@ -1081,7 +1125,12 @@ impl<'a> Cx<'a> {
         };
         match (&method, path) {
             (Method::Post, "/failed") => match req.json::<FailedBody>().await {
-                Ok(body) => self.failed(job, body.message).await,
+                Ok(body) => {
+                    let Some(attempt) = attempt else {
+                        return Response::error("an attempt is needed", 400);
+                    };
+                    self.failed(job, attempt, body.message).await
+                }
                 Err(_) => Response::error("bad failure", 400),
             },
             (Method::Post, "/rerun") => {
@@ -1183,6 +1232,7 @@ impl<'a> Cx<'a> {
             && let Err(err) = self.snapshot_now().await
         {
             worker::console_error!("alarm: snapshot: {err}");
+            failed.snapshot = true;
         }
         if due.upload {
             // Uploads of finished logs retry here (Task 10).
@@ -1332,7 +1382,7 @@ impl<'a> Cx<'a> {
     /// state is read under the lock, written without it and recorded
     /// under it again. A write that fails is tried again after a minute.
     async fn snapshot_now(&self) -> Result<()> {
-        let (key, body) = {
+        let (key, body, attempt) = {
             let _turn = self.turn.lock().await;
             let Some(run) = self.loaded().await? else {
                 return Ok(());
@@ -1351,6 +1401,7 @@ impl<'a> Cx<'a> {
             (
                 snapshot_key(&snapshot.info.tenant_id, snapshot.info.run_id),
                 body,
+                snapshot.info.run_attempt,
             )
         };
         let written = async { self.env.bucket(BUCKET)?.put(key, body).execute().await }.await;
@@ -1358,8 +1409,9 @@ impl<'a> Cx<'a> {
         match written {
             Ok(_) => {
                 self.update(|run| {
-                    // A rerun that came meanwhile has cleared the need.
-                    if run.graph.conclusion().is_some() {
+                    // A rerun that came meanwhile, even one that ended
+                    // again, made this snapshot stale.
+                    if run.graph.conclusion().is_some() && run.info.run_attempt == attempt {
                         let deadlines = run.deadlines_mut();
                         deadlines.snapshot_at = None;
                         deadlines.purge_at = Some(now);
@@ -1428,12 +1480,28 @@ impl<'a> Cx<'a> {
 
     /// Does what the todo list says and drops each item once done. The
     /// lock is taken to read and to drop an item, not while one runs.
+    ///
+    /// One drain runs at a time. A caller that finds one running does
+    /// nothing: the running one loops until the list is empty, and the
+    /// alarm comes back to anything it missed.
     async fn drain(&self) -> Result<()> {
+        if !take_drain(self.draining) {
+            return Ok(());
+        }
+        let done = self.drain_all().await;
+        self.draining.set(false);
+        done
+    }
+
+    async fn drain_all(&self) -> Result<()> {
         loop {
             let (info, pending) = {
                 let _turn = self.turn.lock().await;
                 let todo: Todo = self.storage.get(TODO).await?.unwrap_or_default();
                 let Some(first) = todo.items.first().cloned() else {
+                    // Under the lock, so an item added after this check
+                    // finds the flag clear.
+                    self.draining.set(false);
                     return Ok(());
                 };
                 let info: RunInfo = self
@@ -1469,6 +1537,7 @@ impl<'a> Cx<'a> {
             }
             Work::FinishJob {
                 job,
+                attempt,
                 conclusion,
                 steps,
             } => {
@@ -1477,6 +1546,7 @@ impl<'a> Cx<'a> {
                 store::finish_job(
                     db,
                     *job,
+                    *attempt,
                     conclusion_word(*conclusion),
                     steps,
                     None,
@@ -1485,8 +1555,18 @@ impl<'a> Cx<'a> {
                 .await
                 .map(|_| ())
             }
-            Work::FinishRun { conclusion } => {
-                store::finish_run(db, info.run_id, conclusion_word(*conclusion), self.now).await
+            Work::FinishRun {
+                attempt,
+                conclusion,
+            } => {
+                store::finish_run(
+                    db,
+                    info.run_id,
+                    *attempt,
+                    conclusion_word(*conclusion),
+                    self.now,
+                )
+                .await
             }
             Work::ResetJob { job, attempt } => store::reset_job(db, *job, *attempt, self.now).await,
             Work::ReopenRun { attempt } => {
@@ -1513,8 +1593,10 @@ impl<'a> Cx<'a> {
                     revoke.extend(state.github_token.take());
                     self.put_job(job, &state).await?;
                     run.outbox_mut().mark(job);
+                    let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
                     run.todo_mut().push(Work::FinishJob {
                         job,
+                        attempt,
                         conclusion,
                         steps,
                     });
@@ -1523,7 +1605,11 @@ impl<'a> Cx<'a> {
                 // next batch.
                 Action::Cancel { .. } => {}
                 Action::RunDone(conclusion) => {
-                    run.todo_mut().push(Work::FinishRun { conclusion });
+                    let attempt = run.info.run_attempt;
+                    run.todo_mut().push(Work::FinishRun {
+                        attempt,
+                        conclusion,
+                    });
                 }
             }
         }
@@ -1628,7 +1714,10 @@ impl<'a> Cx<'a> {
             }
             run.graph_mut().running(job);
             let mut state = self.job_state(job).await?;
-            let old = state.github_token.replace(token.clone());
+            let old = state
+                .github_token
+                .replace(token.clone())
+                .filter(|old| *old != token);
             if was == Some(NodeState::Queued) || state.started_at.is_none() {
                 state.started_at = Some(self.now);
                 state.heartbeat_written_at = self.now;
@@ -1718,12 +1807,17 @@ impl<'a> Cx<'a> {
         answer(204)
     }
 
-    async fn failed(&self, job: u64, message: String) -> Result<Response> {
+    async fn failed(&self, job: u64, attempt: u32, message: String) -> Result<Response> {
         let revoke = {
             let _turn = self.turn.lock().await;
             let Some(mut run) = self.loaded().await? else {
                 return answer(204);
             };
+            match gate(run.graph.node(job), attempt) {
+                Gate::Queued | Gate::Running => {}
+                Gate::Missing => return Response::error("no such job", 404),
+                Gate::Stale | Gate::Ended => return answer(409),
+            }
             let ctx = self.github_ctx(&run.info).await?;
             let actions = run.graph_mut().failed(job, message, &ctx);
             let revoke = self.apply_actions(&mut run, actions).await?;
@@ -1856,6 +1950,11 @@ impl<'a> Cx<'a> {
                 let Some(mut run) = self.loaded().await? else {
                     return Ok(());
                 };
+                // A rerun that came while the request was out has a
+                // new state and its own mark; this answer is not its.
+                if !plan_is_current(run.graph.node(plan.job), plan.node_attempt) {
+                    continue;
+                }
                 let mut state = self.job_state(plan.job).await?;
                 if matches!(flushed, Flushed::Failed) && state.send_failures + 1 >= MAX_SEND_TRIES {
                     worker::console_error!(
@@ -1922,6 +2021,7 @@ impl<'a> Cx<'a> {
                 sent_count,
                 file_total: file_annotations(&state),
                 check_run_id: state.check_run_id,
+                node_attempt: node.attempt,
                 installation: run.info.installation_id,
                 repo: run.info.repo.full_name.clone(),
                 attempt: run.outbox.attempt(),
@@ -2394,7 +2494,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
     fn a_failed_send_keeps_the_mark_and_backs_off_until_the_fifth_try() {
         let (mut state, mut outbox, generation) = marked(1);
         for tries in 1..MAX_SEND_TRIES {
-            assert!(record_flush(
+            assert!(!record_flush(
                 &mut state,
                 &mut outbox,
                 1,
@@ -2624,6 +2724,49 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         assert_eq!(Ident::from_query(Some(1), Some("t".into())).unwrap().run, 1);
         assert_eq!(Ident::from_query(Some(1), Some("x/y".into())), None);
         assert_eq!(Ident::from_query(None, Some("t".into())), None);
+    }
+
+    #[test]
+    fn a_flush_answer_belongs_to_the_attempt_it_was_planned_for() {
+        let mut g = graph();
+        let ctx = json!({ "ref": "refs/heads/main", "event": {} });
+        let _ = g.advance(&ctx);
+        assert!(plan_is_current(g.node(1), 1));
+        g.running(1);
+        let result = JobResult {
+            conclusion: Conclusion::Failure,
+            outputs: std::collections::BTreeMap::new(),
+            steps: vec![],
+            annotations: vec![],
+        };
+        let _ = g.finished(1, result, &ctx);
+        let _ = g.rerun(1, &ctx);
+        assert!(!plan_is_current(g.node(1), 1), "the rerun moved on");
+        assert!(plan_is_current(g.node(1), 2));
+        assert!(!plan_is_current(g.node(404), 1));
+    }
+
+    #[test]
+    fn only_one_caller_drains_the_todo_list_at_a_time() {
+        let flag = Cell::new(false);
+        assert!(take_drain(&flag));
+        assert!(!take_drain(&flag));
+        flag.set(false);
+        assert!(take_drain(&flag));
+    }
+
+    #[test]
+    fn a_failed_snapshot_is_rescheduled_with_backoff() {
+        let mut deadlines = Deadlines {
+            snapshot_at: Some(1),
+            ..Deadlines::default()
+        };
+        let failed = Failed {
+            snapshot: true,
+            ..Failed::default()
+        };
+        reschedule(&mut deadlines, &mut Outbox::default(), failed, 1_000);
+        assert_eq!(deadlines.snapshot_at, Some(61_000));
     }
 
     #[test]
