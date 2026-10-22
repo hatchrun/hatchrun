@@ -34,11 +34,12 @@ use hatchrun_workflow::agent::{BootDocument, CiBoot};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use worker::{
-    Env, MessageBatch, MessageExt, Method, QueueRetryOptionsBuilder, RequestInit, console_error,
+    Env, MessageBatch, MessageExt, Method, QueueRetryOptions, QueueRetryOptionsBuilder, RequestInit, console_error,
     console_log,
 };
 
 use crate::env::{Settings, run_stub};
+use crate::reconcile::LAUNCH_QUIET_MS;
 use crate::launcher::{Backend, LaunchSpec, user_data};
 use crate::store::{self, JobRow};
 use crate::token::{self, Claims};
@@ -122,7 +123,7 @@ pub async fn consume(batch: MessageBatch<LaunchMessage>, env: Env) {
         Ok(messages) => messages,
         Err(err) => {
             console_error!("launch queue: unreadable batch: {err}");
-            batch.retry_all();
+            batch.retry_all_with_options(&redeliver_delay());
             return;
         }
     };
@@ -130,7 +131,7 @@ pub async fn consume(batch: MessageBatch<LaunchMessage>, env: Env) {
         Ok(started) => started,
         Err(err) => {
             console_error!("launch queue: {err}");
-            batch.retry_all();
+            batch.retry_all_with_options(&redeliver_delay());
             return;
         }
     };
@@ -140,9 +141,7 @@ pub async fn consume(batch: MessageBatch<LaunchMessage>, env: Env) {
             .map(|message| launch(&env, &settings, &backend, *message.body())),
     )
     .await;
-    let delay = QueueRetryOptionsBuilder::new()
-        .with_delay_seconds(REDELIVER_AFTER_SECS)
-        .build();
+    let delay = redeliver_delay();
     for (message, result) in messages.iter().zip(results) {
         match result {
             Ok(()) => message.ack(),
@@ -152,6 +151,12 @@ pub async fn consume(batch: MessageBatch<LaunchMessage>, env: Env) {
             }
         }
     }
+}
+
+fn redeliver_delay() -> QueueRetryOptions {
+    QueueRetryOptionsBuilder::new()
+        .with_delay_seconds(REDELIVER_AFTER_SECS)
+        .build()
 }
 
 async fn start(env: &Env) -> Result<(Settings, Backend), String> {
@@ -454,10 +459,35 @@ async fn dead_letter(env: &Env, message: LaunchMessage) -> Result<(), String> {
     else {
         return Ok(());
     };
-    if job.attempt != message.attempt || !matches!(job.status.as_str(), "queued" | "launching") {
-        return Ok(());
+    match dead_letter_action(&job, message.attempt, now_ms()) {
+        DeadLetter::Leave => Ok(()),
+        DeadLetter::End => end_job(env, &db, &job, DEAD_LETTER_MESSAGE).await,
     }
-    end_job(env, &db, &job, DEAD_LETTER_MESSAGE).await
+}
+
+/// What the dead-letter consumer does with a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadLetter {
+    /// Nothing: the job moved on, or the reconciler decides.
+    Leave,
+    /// End the job as failed.
+    End,
+}
+
+/// A `queued` job is left to the reconciler, which sends it again (a
+/// database blip is the usual reason the message ran out of retries). A
+/// `launching` job is ended only once it has been quiet for the
+/// reconciler's [`LAUNCH_QUIET_MS`]; before that another consumer may
+/// still be inside its launch.
+pub(crate) fn dead_letter_action(job: &JobRow, message_attempt: u32, now: u64) -> DeadLetter {
+    if job.attempt == message_attempt
+        && job.status == "launching"
+        && job.updated_at < now.saturating_sub(LAUNCH_QUIET_MS)
+    {
+        DeadLetter::End
+    } else {
+        DeadLetter::Leave
+    }
 }
 
 #[cfg(test)]
@@ -493,6 +523,39 @@ mod tests {
         ] {
             assert_eq!(next_step(&cause, 1, 0), Next::Fail, "{cause:?}");
         }
+    }
+
+    fn quiet_row(status: &str, attempt: u32, updated_at: u64) -> JobRow {
+        JobRow {
+            updated_at,
+            ..row(status, attempt, 1)
+        }
+    }
+
+    #[test]
+    fn the_dead_letter_consumer_leaves_queued_and_fresh_launching_jobs() {
+        let now = 10_000_000;
+        assert_eq!(
+            dead_letter_action(&quiet_row("queued", 1, 0), 1, now),
+            DeadLetter::Leave
+        );
+        assert_eq!(
+            dead_letter_action(&quiet_row("launching", 1, now - 1_000), 1, now),
+            DeadLetter::Leave
+        );
+        assert_eq!(
+            dead_letter_action(&quiet_row("launching", 1, now - LAUNCH_QUIET_MS - 1), 1, now),
+            DeadLetter::End
+        );
+        assert_eq!(
+            dead_letter_action(&quiet_row("launching", 2, 0), 1, now),
+            DeadLetter::Leave,
+            "another attempt"
+        );
+        assert_eq!(
+            dead_letter_action(&quiet_row("running", 1, 0), 1, now),
+            DeadLetter::Leave
+        );
     }
 
     #[test]
