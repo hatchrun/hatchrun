@@ -1243,3 +1243,71 @@ workflows: {}
         "{err:?}"
     );
 }
+
+#[test]
+fn environment_reaches_the_planned_job() {
+    let plan = plan(
+        "
+jobs:
+  deploy: { runs-on: ubuntu-latest, environment: production, steps: [] }
+  test: { runs-on: ubuntu-latest, steps: [] }
+workflows: { ci: { on: { push: {} }, jobs: [deploy, test] } }
+",
+    );
+    assert_eq!(plan.jobs[0].environment.as_deref(), Some("production"));
+    assert_eq!(plan.jobs[1].environment, None);
+}
+
+#[test]
+fn environment_takes_parameters() {
+    let plan = plan(
+        r#"
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    parameters: { target: { type: string } }
+    environment: "${{ parameters.target }}"
+    steps: []
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - deploy: { matrix: { target: [staging, production] } }
+"#,
+    );
+    assert_eq!(plan.jobs[0].environment.as_deref(), Some("staging"));
+    assert_eq!(plan.jobs[1].environment.as_deref(), Some("production"));
+}
+
+#[test]
+fn environment_with_a_run_time_expression_is_an_error() {
+    assert_error(
+        r#"
+jobs: { deploy: { runs-on: ubuntu-latest, environment: "${{ github.ref_name }}", steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
+"#,
+        &["`environment` can use only parameters"],
+    );
+}
+
+#[test]
+fn environment_with_a_bad_name_is_an_error() {
+    assert_error(
+        r#"
+jobs: { deploy: { runs-on: ubuntu-latest, environment: "prod eu", steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
+"#,
+        &["Use letters, digits, -, _ and . in environment names"],
+    );
+}
+
+#[test]
+fn approval_jobs_have_no_environment() {
+    let plan = plan(
+        "
+jobs: { t: { runs-on: ubuntu-latest, environment: production, steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [t, { hold: { type: approval, requires: [t] } }] } }
+",
+    );
+    assert_eq!(plan.jobs[1].environment, None);
+}

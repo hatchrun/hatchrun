@@ -23,6 +23,7 @@ use crate::config::{
     WorkflowJob, too_big, yaml_options,
 };
 use crate::diagnostic::Diagnostic;
+use crate::environment::valid_environment_name;
 use crate::expr::{self, ExprError};
 use crate::permissions::{Level, Permissions, SCOPES};
 use crate::plan;
@@ -640,6 +641,53 @@ impl Cx {
         }
     }
 
+    /// Reads a job's `environment`: a name, or a map whose `name` is the
+    /// name. Records an error for anything hatchrun cannot read as written.
+    fn environment(&mut self, at: &str, value: Option<&Value>) -> Option<String> {
+        let value = value?;
+        let name = match value {
+            Value::String(name) => name,
+            Value::Object(map) => {
+                for key in map.keys() {
+                    match key.as_str() {
+                        "name" => {}
+                        "url" => self.warn(format!(
+                            "{at}: `environment.url` is not supported and was dropped"
+                        )),
+                        other => self.warn(format!(
+                            "{at}: unknown key `environment.{other}` was dropped"
+                        )),
+                    }
+                }
+                if let Some(Value::String(name)) = map.get("name") {
+                    name
+                } else {
+                    self.error(format!(
+                        "{at}: `environment` must be a name or a map with `name`"
+                    ));
+                    return None;
+                }
+            }
+            _ => {
+                self.error(format!(
+                    "{at}: `environment` must be a name or a map with `name`"
+                ));
+                return None;
+            }
+        };
+        if name.contains("${{") {
+            self.error(format!(
+                "{at}: `environment` uses an expression; hatchrun reads environment names as written"
+            ));
+            return None;
+        }
+        if let Err(rule) = valid_environment_name(name) {
+            self.error(format!("{at}: `environment` `{name}`: {rule}"));
+            return None;
+        }
+        Some(name.clone())
+    }
+
     /// Converts one job into the job and its workflow entry. `None` when
     /// the job has errors, which are recorded.
     fn job(
@@ -655,7 +703,6 @@ impl Cx {
             ("services", gh.services.is_some(), LATER),
             ("container", gh.container.is_some(), LATER),
             ("concurrency", gh.concurrency.is_some(), ""),
-            ("environment", gh.environment.is_some(), ""),
             ("continue-on-error", gh.continue_on_error.is_some(), ""),
         ] {
             if set {
@@ -664,6 +711,7 @@ impl Cx {
                 ));
             }
         }
+        let environment = self.environment(at, gh.environment.as_ref());
         let mut matrix = self.strategy(at, gh.strategy);
         let runs_on = self.runs_on(at, gh.runs_on.as_ref(), &mut matrix);
         let requires = match gh.needs {
@@ -711,6 +759,7 @@ impl Cx {
             timeout_minutes,
             outputs,
             permissions,
+            environment,
             steps,
             ..Job::default()
         };

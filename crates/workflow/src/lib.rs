@@ -12,6 +12,7 @@ pub mod config;
 pub mod convert;
 pub mod cron;
 pub mod diagnostic;
+pub mod environment;
 pub mod expr;
 pub mod job;
 pub mod permissions;
@@ -28,6 +29,7 @@ pub use config::{
 pub use convert::{Conversion, convert, to_yaml};
 pub use cron::{Cron, UtcMinute};
 pub use diagnostic::Diagnostic;
+pub use environment::{ENVIRONMENT_NAME_MAX, valid_environment_name};
 pub use expr::{
     ExprError, Functions, JobStatus, checks_status, evaluate, interpolate, job_condition,
     secret_refs, truthy,

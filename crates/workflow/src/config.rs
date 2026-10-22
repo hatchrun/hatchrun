@@ -243,6 +243,9 @@ pub struct Job {
     /// What the job's token may do; replaces the workflow's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Permissions>,
+    /// The environment the job deploys to; it can read `${{ parameters.x }}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
     /// The steps.
     pub steps: Vec<Step>,
 }
@@ -260,6 +263,7 @@ struct JobDe {
     timeout_minutes: Option<u32>,
     outputs: BTreeMap<String, String>,
     permissions: Option<Permissions>,
+    environment: Option<String>,
     steps: Vec<Step>,
     #[serde(rename = "services", deserialize_with = "later_services")]
     _services: (),
@@ -280,6 +284,7 @@ impl Default for JobDe {
             timeout_minutes: job.timeout_minutes,
             outputs: job.outputs,
             permissions: job.permissions,
+            environment: job.environment,
             steps: job.steps,
             _services: (),
             _container: (),
@@ -299,6 +304,7 @@ impl From<JobDe> for Job {
             timeout_minutes: de.timeout_minutes,
             outputs: de.outputs,
             permissions: de.permissions,
+            environment: de.environment,
             steps: de.steps,
         }
     }
