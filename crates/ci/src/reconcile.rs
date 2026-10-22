@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The reconciler, which the Cron Trigger runs every minute under a
-//! lease on `ci_reconciler` (see [`run`]). A pass does five things, in
+//! lease on `ci_reconciler` (see [`run`]). A pass does six things, in
 //! order, and an error in one is logged and does not stop the next:
 //!
 //! 1. fires the `on: schedule` workflows of the minutes since the last
@@ -12,16 +12,18 @@
 //!    never finished;
 //! 3. fails the jobs whose runner went quiet;
 //! 4. terminates instances that no job needs;
-//! 5. deletes expired runs and purges their objects.
+//! 5. deletes expired runs and purges their objects;
+//! 6. sends metered usage to Polar.
 //!
 //! Each step decides over rows and the clock with a pure function
 //! ([`minutes`], [`fires`], [`stalled`], [`orphans`]) and then acts.
 //!
 //! A pass is bounded so it stays inside the Worker's CPU time and
 //! subrequest limits. It counts the outbound calls it makes (GitHub,
-//! run objects, queue, AWS) against [`BUDGET`], split by [`shares`]:
-//! 500 for schedules, 200 for stalled jobs, 100 for orphans and 100 for
-//! retention. A step whose share runs out stops and resumes in the next
+//! run objects, queue, AWS, Polar) against [`BUDGET`], split by
+//! [`shares`]: 500 for schedules, then of the rest 3/8 for stalled
+//! jobs, 1/8 each for orphans and the warm pool, 1/16 each for usage and
+//! re-sealing, and the remainder (100 at [`BUDGET`]) for retention. A step whose share runs out stops and resumes in the next
 //! pass. Rows and runs are bounded too: [`MAX_MINUTES`] minutes,
 //! [`SCHEDULE_ROWS`] schedule rows, [`MAX_FIXES`] stalled jobs,
 //! [`MAX_TERMINATIONS`] terminated instances and [`store::SWEEP_LIMIT`]
@@ -35,10 +37,11 @@ use futures_util::future::join_all;
 use hatchrun_cloud::aws::instances::Described;
 use hatchrun_cloud::ci_wake::{self, Woken};
 use hatchrun_cloud::db::Db;
-use hatchrun_cloud::fetch::Counted;
+use hatchrun_cloud::fetch::{Counted, send};
 use hatchrun_cloud::parse_rfc3339;
+use hatchrun_cloud::polar::{CiUsage, INGEST_BATCH, ci_ingest, ingested};
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, UtcMinute};
+use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, UtcMinute, templates};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
@@ -100,24 +103,38 @@ pub struct Shares {
     pub stalled: u32,
     /// Orphan instances.
     pub orphans: u32,
+    /// The warm pool.
+    pub pool: u32,
+    /// Usage sent to Polar.
+    pub usage: u32,
+    /// Re-sealing secrets under the current key.
+    pub reseal: u32,
     /// Retention.
     pub retention: u32,
 }
 
-/// Splits `total`: schedules take 5/9 of it, at most 500, and the rest
-/// goes half to stalled jobs, a quarter to orphans and a quarter to
-/// retention. Schedules cannot take what the other steps need.
+/// Splits `total`: schedules take 5/9 of it, at most 500. Of the rest
+/// stalled jobs take 3/8, orphans and the pool 1/8 each, usage and
+/// re-sealing 1/16 each, rounded down, and retention the remainder.
+/// Schedules cannot take what the other steps need, and retention keeps
+/// at least `SWEEP_LIMIT * PURGE_COST` at [`BUDGET`].
 #[must_use]
 pub fn shares(total: u32) -> Shares {
     let schedules = (total / 9 * 5).min(500);
     let rest = total - schedules;
-    let stalled = rest / 2;
-    let orphans = rest / 4;
+    let stalled = rest / 8 * 3 + rest % 8 * 3 / 8;
+    let orphans = rest / 8;
+    let pool = rest / 8;
+    let usage = rest / 16;
+    let reseal = rest / 16;
     Shares {
         schedules,
         stalled,
         orphans,
-        retention: rest - stalled - orphans,
+        pool,
+        usage,
+        reseal,
+        retention: rest - stalled - orphans - pool - usage - reseal,
     }
 }
 
@@ -414,6 +431,9 @@ pub async fn run(env: Env) {
     }
     if let Err(err) = retain(&env, &db, &Budget::new(share.retention), now).await {
         console_error!("reconcile: retention: {err}");
+    }
+    if let Err(err) = report_usage(&db, &settings, &Budget::new(share.usage), now).await {
+        console_error!("reconcile: usage: {err}");
     }
 }
 
@@ -797,6 +817,62 @@ async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), Str
     Ok(())
 }
 
+/// Of one ingest call to Polar.
+const INGEST_COST: u32 = 1;
+
+/// The events of `rows`, in their order. A label that names no template
+/// carries no units.
+fn usage_events(rows: &[store::UnsentUsage]) -> Vec<CiUsage<'_>> {
+    rows.iter()
+        .map(|row| CiUsage {
+            job_id: row.job_id,
+            attempt: row.attempt,
+            tenant: &row.tenant_id,
+            template: &row.template,
+            minutes: row.minutes,
+            units: templates::template(&row.template).map_or(0, |t| t.units(row.minutes)),
+            at: hatchrun_cloud::format_rfc3339(row.ended_at),
+        })
+        .collect()
+}
+
+/// Step 6. Sends up to [`INGEST_BATCH`] unsent usage rows to Polar in
+/// one call, and marks them sent only when Polar took every event. Each
+/// event is keyed by job and attempt, so a batch sent again after a
+/// lost answer is counted once. Without a Polar token nothing is sent.
+async fn report_usage(
+    db: &Db,
+    settings: &Settings,
+    budget: &Budget,
+    now: u64,
+) -> Result<(), String> {
+    if settings.polar_token.is_empty() || !budget.take(INGEST_COST) {
+        return Ok(());
+    }
+    let limit = u32::try_from(INGEST_BATCH).unwrap_or(u32::MAX);
+    let rows = store::unsent_usage(db, limit)
+        .await
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let events = usage_events(&rows);
+    let response = send(&ci_ingest(
+        &settings.polar_api,
+        &settings.polar_token,
+        &events,
+    ))
+    .await?;
+    let taken = ingested(&response)?;
+    if usize::try_from(taken).ok() != Some(rows.len()) {
+        return Err(format!("Polar took {taken} of {} usage events", rows.len()));
+    }
+    let keys: Vec<(u64, u32)> = rows.iter().map(|r| (r.job_id, r.attempt)).collect();
+    store::usage_sent(db, &keys, now)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 async fn purge(env: &Env, run_id: u64) -> worker::Result<()> {
     let mut init = RequestInit::new();
     init.with_method(Method::Post);
@@ -1069,30 +1145,58 @@ mod tests {
     }
 
     #[test]
-    fn schedules_cannot_starve_the_other_steps() {
+    fn shares_split_the_budget() {
+        let sum = |s: Shares| {
+            s.schedules + s.stalled + s.orphans + s.pool + s.usage + s.reseal + s.retention
+        };
         let share = shares(BUDGET);
         assert_eq!(
             share,
             Shares {
                 schedules: 500,
-                stalled: 200,
-                orphans: 100,
-                retention: 100
+                stalled: 150,
+                orphans: 50,
+                pool: 50,
+                usage: 25,
+                reseal: 25,
+                retention: 100,
             }
         );
-        assert_eq!(
-            share.schedules + share.stalled + share.orphans + share.retention,
-            BUDGET
-        );
-        assert!(share.retention >= store::SWEEP_LIMIT);
+        assert_eq!(sum(share), BUDGET);
+        assert!(share.retention >= store::SWEEP_LIMIT * PURGE_COST);
+        assert!(share.reseal > 0 && share.usage > 0);
         for total in [0, 1, 8, 100, 900, 5_000] {
             let share = shares(total);
-            assert_eq!(
-                share.schedules + share.stalled + share.orphans + share.retention,
-                total
-            );
+            assert_eq!(sum(share), total, "{total}");
             assert!(share.schedules <= 500);
         }
+    }
+
+    #[test]
+    fn usage_events_carry_units() {
+        let rows = [
+            store::UnsentUsage {
+                job_id: 7,
+                attempt: 2,
+                tenant_id: "t1".into(),
+                template: "ubuntu-26.04-8core".into(),
+                minutes: 5,
+                ended_at: NOW,
+            },
+            store::UnsentUsage {
+                job_id: 8,
+                attempt: 1,
+                tenant_id: "t1".into(),
+                template: "retired".into(),
+                minutes: 3,
+                ended_at: NOW,
+            },
+        ];
+        let events = usage_events(&rows);
+        assert_eq!((events[0].job_id, events[0].attempt), (7, 2));
+        assert_eq!(events[0].units, 20);
+        assert_eq!(events[0].at, "2026-10-22T13:45:00Z");
+        assert_eq!(events[1].units, 0);
     }
 
     #[test]

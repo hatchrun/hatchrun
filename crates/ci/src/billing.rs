@@ -7,6 +7,7 @@
 //! `hatchrun_workflow::templates`.
 
 use hatchrun_workflow::templates;
+use serde::Serialize;
 
 use crate::store::Standing;
 
@@ -43,6 +44,66 @@ pub fn units(standing: &Standing) -> u64 {
 #[must_use]
 pub fn spend_micros(standing: &Standing) -> u64 {
     templates::spend_micros(units(standing))
+}
+
+/// What the billing page shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingView {
+    /// Whether a card is on file.
+    pub card: bool,
+    /// Runner minutes used this month, of every template.
+    pub minutes: u64,
+    /// Billing units used this month.
+    pub units: u64,
+    /// Units free each month.
+    pub free_units: u64,
+    /// What this month's usage costs past the free units, in cents.
+    pub spend_cents: u64,
+    /// The monthly spend cap, in whole dollars.
+    pub cap_dollars: u64,
+    /// Jobs running now.
+    pub running: u32,
+    /// The most jobs that run at once.
+    pub max_running: u32,
+}
+
+/// The billing page of `standing`.
+#[must_use]
+pub fn view(standing: &Standing) -> BillingView {
+    BillingView {
+        card: standing.card,
+        minutes: standing.minutes_by_template.iter().map(|(_, m)| m).sum(),
+        units: units(standing),
+        free_units: templates::FREE_UNITS,
+        spend_cents: spend_micros(standing) / MICROS_PER_CENT,
+        cap_dollars: standing.cap_micros / MICROS_PER_DOLLAR,
+        running: standing.running,
+        max_running: templates::MAX_RUNNING_JOBS,
+    }
+}
+
+const MICROS_PER_CENT: u64 = 10_000;
+const MICROS_PER_DOLLAR: u64 = 1_000_000;
+
+/// The spend cap in micros for whole `dollars`.
+///
+/// # Errors
+///
+/// The amount is outside the cap range; the message says the range.
+pub fn cap_micros(dollars: u64) -> Result<u64, String> {
+    dollars
+        .checked_mul(MICROS_PER_DOLLAR)
+        .filter(|micros| {
+            (templates::MIN_SPEND_CAP_MICROS..=templates::MAX_SPEND_CAP_MICROS).contains(micros)
+        })
+        .ok_or_else(|| {
+            format!(
+                "Set a cap from {} to {}",
+                templates::dollars(templates::MIN_SPEND_CAP_MICROS),
+                templates::dollars(templates::MAX_SPEND_CAP_MICROS)
+            )
+        })
 }
 
 /// How long a held job waits before its caps are checked again, in
@@ -119,6 +180,43 @@ mod tests {
             minutes_by_template: minutes.iter().map(|(l, m)| ((*l).into(), *m)).collect(),
             running: 0,
         }
+    }
+
+    #[test]
+    fn cap_bounds() {
+        assert_eq!(
+            cap_micros(49),
+            Err("Set a cap from $50.00 to $10000.00".to_owned())
+        );
+        assert_eq!(cap_micros(50), Ok(50_000_000));
+        assert_eq!(cap_micros(10_000), Ok(10_000_000_000));
+        assert!(cap_micros(10_001).is_err());
+        assert!(cap_micros(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn view_from_standing() {
+        let v = view(&standing(&[
+            ("ubuntu-latest", 400),
+            ("ubuntu-26.04-4core", 100),
+        ]));
+        assert_eq!(
+            v,
+            BillingView {
+                card: true,
+                minutes: 500,
+                units: 600,
+                free_units: 500,
+                spend_cents: 20,
+                cap_dollars: 50,
+                running: 0,
+                max_running: 5,
+            }
+        );
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["spendCents"], 20);
+        assert_eq!(json["freeUnits"], 500);
+        assert_eq!(json["maxRunning"], 5);
     }
 
     #[test]

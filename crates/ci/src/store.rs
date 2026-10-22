@@ -456,6 +456,19 @@ const OWNER_OF_JOB: &str = "tenants.id = (SELECT ci_runs.tenant_id FROM ci_jobs 
 /// [`STANDING`]'s `{owner}` for tenant `$1`.
 const OWNER_IS_TENANT: &str = "tenants.id = $1::text";
 
+/// The tenant of organization `$1`, compared in lower case, where
+/// `{columns}` is [`TENANT_COLUMNS`].
+const TENANT_BY_ORG: &str = "SELECT {columns} FROM tenants WHERE lower(org_login) = lower($1)";
+
+/// Sets the spend cap of tenant `$1` to `$2` micros at `$3`.
+const SET_SPEND_CAP: &str = "INSERT INTO ci_spend_caps (tenant_id, cap_micros, updated_at) \
+     VALUES ($1, $2, $3) \
+     ON CONFLICT (tenant_id) DO UPDATE SET cap_micros = $2, updated_at = $3";
+
+/// Usage Polar has not taken, oldest first, at most `$1`.
+const UNSENT_USAGE: &str = "SELECT job_id, attempt, tenant_id, template, minutes, ended_at \
+     FROM ci_usage WHERE sent_at IS NULL ORDER BY ended_at, job_id, attempt LIMIT $1";
+
 /// Drops the schedules of repository `$1`.
 const DELETE_SCHEDULES: &str = "DELETE FROM ci_schedules WHERE repo_id = $1";
 
@@ -665,6 +678,82 @@ pub async fn tenant_standing(
         .await?
         .map(StandingRow::into_standing)
         .transpose()
+}
+
+/// The tenant of organization `org`, however its login is cased.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn tenant_by_org(db: &Db, org: &str) -> Result<Option<TenantRow>> {
+    db.first(
+        &TENANT_BY_ORG.replace("{columns}", TENANT_COLUMNS),
+        &params![org],
+    )
+    .await
+}
+
+/// Sets tenant `tenant_id`'s monthly spend cap to `cap_micros`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn set_spend_cap(db: &Db, tenant_id: &str, cap_micros: u64, now: u64) -> Result<()> {
+    db.run(SET_SPEND_CAP, &params![tenant_id, cap_micros, now])
+        .await
+        .map(|_| ())
+}
+
+/// One attempt's usage that Polar has not taken yet.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UnsentUsage {
+    /// The job.
+    pub job_id: u64,
+    /// The attempt.
+    pub attempt: u32,
+    /// The tenant, Polar's external customer id.
+    pub tenant_id: String,
+    /// The template's label.
+    pub template: String,
+    /// The minutes the attempt ran.
+    pub minutes: u64,
+    /// When the attempt completed, in milliseconds.
+    pub ended_at: u64,
+}
+
+/// The oldest `limit` usage rows Polar has not taken.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn unsent_usage(db: &Db, limit: u32) -> Result<Vec<UnsentUsage>> {
+    db.all(UNSENT_USAGE, &params![limit]).await
+}
+
+/// Marks the usage of the `(job, attempt)` pairs in `keys` as taken by
+/// Polar at `now`. A row already marked keeps its time.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn usage_sent(db: &Db, keys: &[(u64, u32)], now: u64) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let pairs: Vec<String> = (0..keys.len())
+        .map(|n| format!("(${}, ${})", 2 * n + 2, 2 * n + 3))
+        .collect();
+    let sql = format!(
+        "UPDATE ci_usage SET sent_at = $1 WHERE sent_at IS NULL \
+         AND (job_id, attempt) IN ({})",
+        pairs.join(", ")
+    );
+    let mut bound: Vec<Param> = vec![Param::from(now)];
+    for (job, attempt) in keys {
+        bound.push(Param::from(*job));
+        bound.push(Param::from(*attempt));
+    }
+    db.run(&sql, &bound).await.map(|_| ())
 }
 
 /// Records `repo`, or updates it after a rename or a change.
@@ -2699,5 +2788,63 @@ mod tests {
             usage_rows(&db).iter().map(|r| r.0).collect::<Vec<_>>(),
             [2, 3]
         );
+    }
+
+    #[test]
+    fn caps_are_set_and_replaced() {
+        let db = setup();
+        let month = 1_790_812_800_000_u64;
+        let default_cap = 50_000_000;
+        db.wait(set_spend_cap(db.db(), "t1", 75_000_000, 5))
+            .unwrap();
+        let s = db
+            .wait(tenant_standing(db.db(), "t1", month, default_cap))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.cap_micros, 75_000_000);
+        db.wait(set_spend_cap(db.db(), "t1", 60_000_000, 6))
+            .unwrap();
+        let s = db
+            .wait(tenant_standing(db.db(), "t1", month, default_cap))
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.cap_micros, 60_000_000);
+        let t = db.wait(tenant_by_org(db.db(), "ACME")).unwrap().unwrap();
+        assert_eq!(t.id, "t1");
+        assert!(db.wait(tenant_by_org(db.db(), "nobody")).unwrap().is_none());
+    }
+
+    #[test]
+    fn usage_goes_to_polar_oldest_first_and_once() {
+        let db = setup();
+        for (job, attempt, ended) in [(3, 1, 30), (1, 1, 10), (1, 2, 20), (2, 1, 20)] {
+            db.run(
+                "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, minutes, ended_at) \
+                 VALUES ($1, $2, 't1', 'ubuntu-latest', 4, $3)",
+                &params![job, attempt, ended],
+            );
+        }
+        let keys = |rows: &[UnsentUsage]| -> Vec<(u64, u32)> {
+            rows.iter().map(|r| (r.job_id, r.attempt)).collect()
+        };
+        let all = db.wait(unsent_usage(db.db(), 10)).unwrap();
+        assert_eq!(keys(&all), [(1, 1), (1, 2), (2, 1), (3, 1)]);
+        assert_eq!(all[0].tenant_id, "t1");
+        assert_eq!(all[0].minutes, 4);
+        let two = db.wait(unsent_usage(db.db(), 2)).unwrap();
+        assert_eq!(keys(&two), [(1, 1), (1, 2)]);
+        db.wait(usage_sent(db.db(), &keys(&two), 99)).unwrap();
+        db.wait(usage_sent(db.db(), &[], 99)).unwrap();
+        let rest = db.wait(unsent_usage(db.db(), 10)).unwrap();
+        assert_eq!(keys(&rest), [(2, 1), (3, 1)]);
+        // A second mark does not move the time.
+        db.wait(usage_sent(db.db(), &[(1, 1)], 200)).unwrap();
+        let sent = db
+            .rows(
+                "SELECT sent_at FROM ci_usage WHERE job_id = 1 AND attempt = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(sent[0]["sent_at"].as_u64(), Some(99));
     }
 }
