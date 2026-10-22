@@ -35,7 +35,11 @@ pub use job::{
 };
 pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, validate};
 pub use split::split;
-pub use templates::{Arch, TEMPLATES, Template, template, template_labels};
+pub use templates::{
+    Arch, DEFAULT_SPEND_CAP_MICROS, FREE_UNITS, MAX_RUNNING_JOBS, MAX_SPEND_CAP_MICROS,
+    MIN_SPEND_CAP_MICROS, TEMPLATES, Template, UNIT_PRICE_MICROS, dollars, spend_micros, template,
+    template_labels,
+};
 pub use trigger::{
     Dispatch, Event, Filter, MAX_CHANGED, MAX_GLOBS, MAX_PATTERNS, PullRequestTrigger, PushTrigger,
     Schedule, Triggers, triggered,
