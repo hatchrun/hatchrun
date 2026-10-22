@@ -150,7 +150,7 @@ async fn revoke() -> StatusCode {
 }
 
 async fn repository() -> Json<Value> {
-    Json(json!({ "private": false, "permissions": { "pull": true, "push": true } }))
+    Json(json!({ "private": false, "permissions": { "pull": true, "push": true, "admin": true } }))
 }
 
 async fn config(State(fake): State<Fake>) -> Response {
