@@ -2,15 +2,14 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// The settings routes of /api/ci under `npm run dev:mock`, in the
-// shapes of crates/ci/src/settings_api.rs: an organization's billing
-// the secrets and variables of an organization (with the repositories
-// each reaches), a repository or one of its environments, and a
-// repository's environments.
-// Any organization of the mock tenants answers, and so does the
-// repository demo of each. Billing has a card (the mock Polar checkout adds one), 19,200 seconds and a $50
-// cap; MOCK_CARD=off drops the card. Values are kept in memory and a
-// secret's is never answered.
+// The settings routes of /api/ci under `npm run dev:mock`, in the shapes of
+// crates/ci/src/settings_api.rs: an organization's billing the secrets and
+// variables of an organization (with the repositories each reaches), a
+// repository or one of its environments, and a repository's environments.
+// Any organization of the mock tenants answers, and so does the repository
+// demo of each. Billing has a card (the mock Polar checkout adds one),
+// 19,200 seconds and a $50 cap; MOCK_CARD=off drops the card. Values are
+// kept in memory and a secret's is never answered.
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 

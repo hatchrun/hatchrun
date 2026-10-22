@@ -137,16 +137,16 @@ CONNECT_TEMPLATE_URL = "https://hatchrun-templates.s3.us-east-1.amazonaws.com/co
 MARKETPLACE_AMD64_URL = "https://aws.amazon.com/marketplace/pp/prodview-znhn62372z6jq"
 MARKETPLACE_ARM64_URL = "https://aws.amazon.com/marketplace/pp/prodview-nchg6i6uzlfr2"
 # The Polar product an organization subscribes to: a metered price of
-# 0.001666666666 cents per unit on the "Runner seconds" meter (the sum
-# of metadata.seconds of the "job.seconds" events the reconciler sends),
-# no cap and no meter credit, which matches PRICE_MICROS_PER_MINUTE in
-# src/usage.rs. Several products may be listed,
-# separated by commas; checkout offers all of them and answers 503
-# while the list is empty. The product also carries a metered price of
-# 0.003333333333 cents per unit on the "CI usage" meter (the sum of
-# metadata.units of the "ci.usage" events; a unit is one 2 vCPU second),
-# with no meter credit, which bills hatchrun CI on the same subscription. POLAR_API_URL points the
-# Worker at Polar's sandbox (https://sandbox-api.polar.sh).
+# 0.001666666666 cents per unit on the "Runner seconds" meter (the sum of
+# metadata.seconds of the "job.seconds" events the reconciler sends), no cap
+# and no meter credit, which matches PRICE_MICROS_PER_MINUTE in
+# src/usage.rs. Several products may be listed, separated by commas;
+# checkout offers all of them and answers 503 while the list is empty. The
+# product also carries a metered price of 0.003333333333 cents per unit on
+# the "CI usage" meter (the sum of metadata.units of the "ci.usage" events;
+# a unit is one 2 vCPU second), with no meter credit, which bills hatchrun
+# CI on the same subscription. POLAR_API_URL points the Worker at Polar's
+# sandbox (https://sandbox-api.polar.sh).
 POLAR_PRODUCT_ID = "a2dfff6e-1a3a-40fe-b576-70fccd81f694"
 # hatchrun-broker (crates/broker), where launches store runner configs.
 # Both Workers share BROKER_TOKEN.
