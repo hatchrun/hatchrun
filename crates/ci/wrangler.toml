@@ -42,10 +42,12 @@ class_name = "RunObject"
 tag = "v1"
 new_sqlite_classes = ["RunObject"]
 
-# Finished logs, kept 30 days:
-# logs/<tenant>/<repo_id>/<run>/<job>.log.gz and its .index.json.
+# Finished logs, kept for the tenant's retention (30 days, 90 for
+# enterprise tenants):
+# logs/<days>d/<tenant>/<repo_id>/<run>/<job>/<attempt>.log.gz and its
+# .index.json, and state/<days>d/<tenant>/<run>.json.
 # Created by hand once; deploy-ci.yml applies r2-lifecycle.json, which
-# expires logs/ and state/ after 30 days.
+# has one rule per tier and prefix.
 [[r2_buckets]]
 binding = "LOGS"
 bucket_name = "hatchrun-ci-logs"

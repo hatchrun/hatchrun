@@ -343,8 +343,8 @@ impl Cx<'_> {
             ));
         }
         let url = format!(
-            "https://run/rerun?job={}&run={}&tenant={}",
-            job.id, run.id, run.tenant_id
+            "https://run/rerun?job={}&run={}&tenant={}&days={}",
+            job.id, run.id, run.tenant_id, run.retention_days
         );
         let mut init = RequestInit::new();
         init.with_method(Method::Post);

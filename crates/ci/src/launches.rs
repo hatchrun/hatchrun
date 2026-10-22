@@ -565,8 +565,8 @@ async fn post_to_run(env: &Env, db: &Db, job: &JobRow, route: &str, message: &st
     init.with_method(Method::Post)
         .with_body(Some(json!({ "message": message }).to_string().into()));
     let url = format!(
-        "https://run/{route}?job={}&attempt={}&run={}&tenant={}",
-        job.id, job.attempt, run.id, run.tenant_id
+        "https://run/{route}?job={}&attempt={}&run={}&tenant={}&days={}",
+        job.id, job.attempt, run.id, run.tenant_id, run.retention_days
     );
     let sent = async {
         let request = worker::Request::new_with_init(&url, &init)?;

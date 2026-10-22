@@ -481,6 +481,7 @@ fn start_body(req: &Request<'_>, run: &RunRow, rows: &[JobRow], plan: &Plan) -> 
             run_number: run.run_number,
             run_attempt: run.run_attempt,
             tenant_id: run.tenant_id.clone(),
+            retention_days: run.retention_days,
             installation_id: req.installation_id,
             repo: req.repo.clone(),
             workflow: run.workflow.clone(),
