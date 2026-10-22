@@ -99,6 +99,8 @@ function RepoRuns({ session, route }: { session: Session | null; route: CiRoute 
   const [first, reload] = useLoad(() => listCiRuns(owner, repo), `${owner}/${repo}`, true);
   // Runs of later pages, appended by "Load more".
   const [more, setMore] = useState<CiRun[]>([]);
+  // Runs on the last page "Load more" fetched; null before the first click.
+  const [lastPage, setLastPage] = useState<number | null>(null);
   const [moreError, setMoreError] = useState<Error | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [dispatching, setDispatching] = useState(false);
@@ -114,6 +116,7 @@ function RepoRuns({ session, route }: { session: Session | null; route: CiRoute 
     try {
       const page = await listCiRuns(owner, repo, before);
       setMore((current) => [...current, ...page.runs]);
+      setLastPage(page.runs.length);
     } catch (err) {
       setMoreError(err instanceof Error ? err : new Error(String(err)));
     } finally {
@@ -135,7 +138,7 @@ function RepoRuns({ session, route }: { session: Session | null; route: CiRoute 
           const all = [...runs, ...more.filter((run) => !runs.some((seen) => seen.id === run.id))];
           const last = all[all.length - 1];
           // A full page means there may be older runs.
-          const maybeMore = (more.length === 0 ? runs.length : more.length) >= 50;
+          const maybeMore = (lastPage ?? runs.length) >= 50;
           return all.length === 0 ? (
             <p className="muted">No runs yet.</p>
           ) : (
