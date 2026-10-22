@@ -33,22 +33,20 @@ command = "cargo install --locked worker-build --version 0.8.7 && worker-build -
 # The database: PlanetScale Postgres in us-east-1, through Hyperdrive
 # (crates/cloud/src/db.rs), which logs in as a role that reads and
 # writes data and nothing else. Caching is off, so every query reaches
-# Postgres. The deploy workflow sets id from the
-# CLOUDFLARE_HYPERDRIVE_ID secret and applies migrations/ before it
-# deploys; wrangler dev connects to localConnectionString instead, a
+# Postgres. The deploy workflow applies migrations/ before it deploys;
+# wrangler dev connects to localConnectionString instead, a
 # Postgres on this machine with the migrations applied
 # (scripts/migrate.sh).
 [[hyperdrive]]
 binding = "HYPERDRIVE"
-id = "hyperdrive-local"
+id = "f52a1b8002e845c695362157863436fb"
 localConnectionString = "postgres://postgres:postgres@localhost:5432/postgres"
 
 # Installation tokens, reused until shortly before they expire
-# (crates/cloud/src/tokens.rs). The deploy workflow sets id from the
-# CLOUDFLARE_KV_TOKENS_ID secret.
+# (crates/cloud/src/tokens.rs).
 [[kv_namespaces]]
 binding = "TOKENS"
-id = "local"
+id = "92b81a8052544d3387c16535ee2a4fa2"
 
 # hatchrun-ci takes the push, pull_request and check_run deliveries
 # (crates/cloud/src/entry.rs forwards them as they came).

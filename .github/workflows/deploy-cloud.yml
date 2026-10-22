@@ -81,22 +81,6 @@ jobs:
           npm ci
           npm run build
 
-      - name: Point at the production database
-        env:
-          HYPERDRIVE_ID: ${{ secrets.CLOUDFLARE_HYPERDRIVE_ID }}
-        run: |
-          test -n "$HYPERDRIVE_ID"
-          sed -i "s/^id = \"hyperdrive-local\"$/id = \"${HYPERDRIVE_ID}\"/" wrangler.toml
-          grep -qx "id = \"${HYPERDRIVE_ID}\"" wrangler.toml
-
-      - name: Point at the production token namespace
-        env:
-          NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_TOKENS_ID }}
-        run: |
-          test -n "$NAMESPACE_ID"
-          sed -i "s/^id = \"local\"$/id = \"${NAMESPACE_ID}\"/" wrangler.toml
-          grep -qx "id = \"${NAMESPACE_ID}\"" wrangler.toml
-
       # Migrations only add tables and columns, so the running Worker
       # keeps working against the new schema until the deploy lands.
       # psql comes with the runner image.

@@ -336,6 +336,47 @@ pub fn subnets(response: &Response) -> Result<Vec<Subnet>, Error> {
         .collect())
 }
 
+/// The subnets tagged `key` = `value`. [`subnets`] reads the answer.
+#[must_use]
+pub fn describe_tagged_subnets(endpoint: &str, key: &str, value: &str) -> Request {
+    query(
+        endpoint,
+        "DescribeSubnets",
+        VERSION,
+        &[
+            ("Filter.1.Name".to_owned(), format!("tag:{key}")),
+            ("Filter.1.Value.1".to_owned(), value.to_owned()),
+        ],
+    )
+}
+
+/// The launch template named `name`.
+#[must_use]
+pub fn describe_launch_template(endpoint: &str, name: &str) -> Request {
+    query(
+        endpoint,
+        "DescribeLaunchTemplates",
+        VERSION,
+        &[("LaunchTemplateName.1".to_owned(), name.to_owned())],
+    )
+}
+
+/// Reads the template's id, `lt-...`, out of a `DescribeLaunchTemplates`
+/// answer. A name that does not exist makes EC2 answer
+/// `InvalidLaunchTemplateName.NotFoundException`.
+///
+/// # Errors
+///
+/// EC2's error, or an answer with no template.
+pub fn launch_template_id(response: &Response) -> Result<String, Error> {
+    let doc = document(response)?;
+    doc.descendants()
+        .find(|node| node.tag_name().name() == "launchTemplateId")
+        .and_then(|node| node.text())
+        .map(str::to_owned)
+        .ok_or_else(|| Error::malformed("no launchTemplateId in DescribeLaunchTemplates"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +603,51 @@ mod tests {
         assert_eq!(
             subnets(&missing).unwrap_err().code,
             "InvalidSubnetID.NotFound"
+        );
+    }
+
+    #[test]
+    fn finds_subnets_by_tag() {
+        let request = describe_tagged_subnets(
+            "https://ec2.us-east-1.amazonaws.com/",
+            TAG_TENANT,
+            "hatchrun-ci",
+        );
+        assert!(
+            String::from_utf8(request.body)
+                .unwrap()
+                .ends_with("&Filter.1.Name=tag%3Ahatchrun%3Atenant&Filter.1.Value.1=hatchrun-ci")
+        );
+    }
+
+    #[test]
+    fn finds_a_launch_template_by_name() {
+        let request =
+            describe_launch_template("https://ec2.us-east-1.amazonaws.com/", "hatchrun-ci-runner");
+        let body = String::from_utf8(request.body).unwrap();
+        assert!(body.contains("Action=DescribeLaunchTemplates"));
+        assert!(body.ends_with("&LaunchTemplateName.1=hatchrun-ci-runner"));
+        let found = Response {
+            headers: Vec::new(),
+            status: 200,
+            body: b"<DescribeLaunchTemplatesResponse><launchTemplates><item>\
+                    <launchTemplateId>lt-0abc</launchTemplateId>\
+                    <launchTemplateName>hatchrun-ci-runner</launchTemplateName></item>\
+                    </launchTemplates></DescribeLaunchTemplatesResponse>"
+                .to_vec(),
+        };
+        assert_eq!(launch_template_id(&found).unwrap(), "lt-0abc");
+        let missing = Response {
+            headers: Vec::new(),
+            status: 400,
+            body: b"<Response><Errors><Error>\
+                    <Code>InvalidLaunchTemplateName.NotFoundException</Code>\
+                    <Message>no</Message></Error></Errors></Response>"
+                .to_vec(),
+        };
+        assert_eq!(
+            launch_template_id(&missing).unwrap_err().code,
+            "InvalidLaunchTemplateName.NotFoundException"
         );
     }
 

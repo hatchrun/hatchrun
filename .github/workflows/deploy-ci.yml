@@ -8,17 +8,18 @@ name: deploy-ci
 # CLOUDFLARE_ACCOUNT_ID secret.
 #
 # The API token cannot create Workers, and deploy-cloud.yml binds to
-# hatchrun-ci, so the first deploy is by hand, in this order, before the
-# change that adds this workflow merges:
+# hatchrun-ci, so the first deploy is by hand, in this order:
 #   1. Create the R2 bucket hatchrun-ci-logs and the queues
 #      hatchrun-ci-launches and hatchrun-ci-launches-dlq.
 #   2. Apply the lifecycle: `npx wrangler r2 bucket lifecycle set
 #      hatchrun-ci-logs --file r2-lifecycle.json` from crates/ci.
-#   3. Deploy the Worker once: `npx wrangler deploy` from crates/ci.
-#   4. Merge. This workflow takes over from then on.
-# Its CI_ROLE_ARN, CI_LAUNCH_TEMPLATE_ID and CI_SUBNET_IDS repository
-# variables are the RoleArn, LaunchTemplateId and SubnetIds outputs of
-# the stack in deploy/cloudformation/ci-account.yaml.
+#   3. Add the secret ci-secrets-key-2026-10 (scope workers, base64 of
+#      32 random bytes) to the account's Secrets Store.
+#   4. Create the stack in deploy/cloudformation/ci-account.yaml.
+#   5. Deploy the Worker once: `npx wrangler deploy` from crates/ci.
+#   6. Set the Worker's CI_ROLE_ARN secret to the stack's RoleArn
+#      output: `npx wrangler secret put CI_ROLE_ARN` from crates/ci.
+#      Deploys leave it alone. This workflow takes over from then on.
 #
 # Polar setting the CI checkout depends on: turn on "Allow multiple
 # subscriptions per customer" in the Polar organization's settings
@@ -86,35 +87,6 @@ jobs:
         with:
           node-version: 22
 
-      - name: Point at the production database
-        env:
-          HYPERDRIVE_ID: ${{ secrets.CLOUDFLARE_HYPERDRIVE_ID }}
-        run: |
-          test -n "$HYPERDRIVE_ID"
-          sed -i "s/^id = \"hyperdrive-local\"$/id = \"${HYPERDRIVE_ID}\"/" wrangler.toml
-          grep -qx "id = \"${HYPERDRIVE_ID}\"" wrangler.toml
-
-      - name: Point at the production token namespace
-        env:
-          NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_TOKENS_ID }}
-        run: |
-          test -n "$NAMESPACE_ID"
-          sed -i "s/^id = \"local\"$/id = \"${NAMESPACE_ID}\"/" wrangler.toml
-          grep -qx "id = \"${NAMESPACE_ID}\"" wrangler.toml
-
-      # The CI account stack's outputs, kept as repository variables.
-      # wrangler.toml leaves them empty, and an empty one would deploy a
-      # Worker that cannot launch.
-      - name: Check the CI account variables
-        env:
-          CI_ROLE_ARN: ${{ vars.CI_ROLE_ARN }}
-          CI_LAUNCH_TEMPLATE_ID: ${{ vars.CI_LAUNCH_TEMPLATE_ID }}
-          CI_SUBNET_IDS: ${{ vars.CI_SUBNET_IDS }}
-        run: |
-          test -n "$CI_ROLE_ARN"
-          test -n "$CI_LAUNCH_TEMPLATE_ID"
-          test -n "$CI_SUBNET_IDS"
-
       # Migrations only add tables and columns, so the running Worker
       # keeps working against the new schema until the deploy lands.
       # psql comes with the runner image.
@@ -149,9 +121,6 @@ jobs:
           BROKER_TOKEN: ${{ secrets.BROKER_TOKEN }}
           CI_TOKEN_KEY: ${{ secrets.CI_TOKEN_KEY }}
           POLAR_ACCESS_TOKEN: ${{ secrets.POLAR_ACCESS_TOKEN }}
-          CI_ROLE_ARN: ${{ vars.CI_ROLE_ARN }}
-          CI_LAUNCH_TEMPLATE_ID: ${{ vars.CI_LAUNCH_TEMPLATE_ID }}
-          CI_SUBNET_IDS: ${{ vars.CI_SUBNET_IDS }}
         run: |
           secrets="$RUNNER_TEMP/worker-secrets.json"
           trap 'rm -f "$secrets"' EXIT
@@ -160,7 +129,4 @@ jobs:
                          "BROKER_TOKEN", "CI_TOKEN_KEY", "POLAR_ACCESS_TOKEN"))
               and .value != ""))' > "$secrets")
           echo "Uploading secrets: $(jq -r 'keys | join(", ")' "$secrets")"
-          npx --yes "$WRANGLER" deploy --secrets-file "$secrets" \
-            --var "CI_ROLE_ARN:$CI_ROLE_ARN" \
-            --var "CI_LAUNCH_TEMPLATE_ID:$CI_LAUNCH_TEMPLATE_ID" \
-            --var "CI_SUBNET_IDS:$CI_SUBNET_IDS"
+          npx --yes "$WRANGLER" deploy --secrets-file "$secrets"

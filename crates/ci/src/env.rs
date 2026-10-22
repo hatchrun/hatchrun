@@ -40,10 +40,6 @@ pub struct Settings {
     pub ci_region: String,
     /// The role the Worker assumes. Empty until the CI account exists.
     pub ci_role_arn: String,
-    /// The launch template. Empty until the CI account exists.
-    pub ci_launch_template_id: String,
-    /// The subnets jobs launch into. Empty until the CI account exists.
-    pub ci_subnet_ids: Vec<String>,
     /// The key that signs the token for `AssumeRoleWithWebIdentity`,
     /// PKCS#8 DER.
     pub oidc_key: Vec<u8>,
@@ -103,14 +99,6 @@ impl Settings {
                 .map(|url| url.trim_end_matches('/').to_owned()),
             ci_region: need("CI_REGION")?,
             ci_role_arn: get("CI_ROLE_ARN").unwrap_or_default(),
-            ci_launch_template_id: get("CI_LAUNCH_TEMPLATE_ID").unwrap_or_default(),
-            ci_subnet_ids: get("CI_SUBNET_IDS")
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|subnet| !subnet.is_empty())
-                .map(str::to_owned)
-                .collect(),
             oidc_key: key(oidc::SIGNING_KEY)?,
             oidc_kid: need(oidc::KEY_ID)?,
             aws_endpoint: get("AWS_ENDPOINT_URL"),
@@ -171,7 +159,6 @@ mod tests {
         assert_eq!(settings.github_api, github::API);
         assert_eq!(settings.token_key, b"k");
         assert_eq!(settings.ci_role_arn, "");
-        assert_eq!(settings.ci_subnet_ids, [] as [String; 0]);
         assert_eq!(settings.aws_endpoint, None);
         assert_eq!(settings.local_launcher_url, None);
         assert_eq!(settings.polar_api, polar::API);
@@ -180,11 +167,10 @@ mod tests {
     }
 
     #[test]
-    fn development_overrides_and_subnets_are_read() {
+    fn development_overrides_are_read() {
         let mut v = values();
         v.insert("GITHUB_API_URL", "http://localhost:9000/".to_owned());
         v.insert("AWS_ENDPOINT_URL", "http://localhost:4566".to_owned());
-        v.insert("CI_SUBNET_IDS", "subnet-a, subnet-b,".to_owned());
         v.insert("POLAR_API_URL", "https://sandbox-api.polar.sh/".to_owned());
         v.insert("POLAR_CI_PRODUCT_ID", "prod".to_owned());
         let settings = read(&v).unwrap();
@@ -195,7 +181,6 @@ mod tests {
             settings.aws_endpoint.as_deref(),
             Some("http://localhost:4566")
         );
-        assert_eq!(settings.ci_subnet_ids, ["subnet-a", "subnet-b"]);
     }
 
     #[test]

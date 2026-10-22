@@ -26,9 +26,7 @@ use hatchrun_cloud::fetch::send;
 use hatchrun_cloud::http::{Request, Response};
 use hatchrun_cloud::instance::{Limits, choose, static_offerings};
 use hatchrun_cloud::profiles::{Profile, built_in};
-use hatchrun_cloud::start::{
-    Cause, Failure, Instance, Target, role_credentials, start_instance, terminate_instance,
-};
+use hatchrun_cloud::start::{Cause, Failure, Instance, Target, role_credentials, start_instance};
 use hatchrun_workflow::Template;
 use hatchrun_workflow::templates::Arch as TemplateArch;
 use serde::Deserialize;
@@ -37,8 +35,12 @@ use worker::console_warn;
 use crate::env::Settings;
 
 /// The OIDC subject tenant and the `hatchrun:tenant` tag of CI
-/// instances.
+/// instances and of the subnets they start in.
 pub const TENANT: &str = "hatchrun-ci";
+
+/// The launch template of CI instances, named by
+/// deploy/cloudformation/ci-account.yaml.
+pub const LAUNCH_TEMPLATE: &str = "hatchrun-ci-runner";
 
 /// The built-in hatchrun.io profile `template` launches:
 /// `hatchrun-<vcpu>cpu`, with `-arm64` on arm64. General purpose, 4 GiB
@@ -300,8 +302,27 @@ struct CachedCredentials {
     credentials: Credentials,
 }
 
+/// How long a looked up [`Network`] is used before it is looked up
+/// again, so a recreated stack is picked up without a deploy.
+const NETWORK_TTL_MS: u64 = 10 * 60_000;
+
+/// Where CI instances start: the stack's launch template and subnets,
+/// found by name and tag.
+#[derive(Debug, Clone)]
+struct Network {
+    launch_template_id: String,
+    subnets: Vec<String>,
+}
+
+struct CachedNetwork {
+    fetched_ms: u64,
+    network: Network,
+}
+
 thread_local! {
     static CREDENTIALS: std::cell::RefCell<Option<CachedCredentials>> =
+        const { std::cell::RefCell::new(None) };
+    static NETWORK: std::cell::RefCell<Option<CachedNetwork>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -323,9 +344,6 @@ impl Ec2 {
     fn new(settings: &Settings) -> Result<Self, String> {
         if settings.ci_role_arn.is_empty() {
             return Err("CI_ROLE_ARN is not set".to_owned());
-        }
-        if settings.ci_launch_template_id.is_empty() {
-            return Err("CI_LAUNCH_TEMPLATE_ID is not set".to_owned());
         }
         Ok(Self {
             settings: settings.clone(),
@@ -380,26 +398,85 @@ impl Ec2 {
         )
     }
 
-    /// The target of a start with `credentials`.
-    fn target<'a>(&'a self, credentials: &'a Credentials) -> Target<'a> {
-        let subnets: Vec<Option<&str>> = self
-            .settings
-            .ci_subnet_ids
-            .iter()
-            .map(|subnet| Some(subnet.as_str()))
+    /// The launch template named [`LAUNCH_TEMPLATE`] and the subnets
+    /// tagged `hatchrun:tenant` = [`TENANT`], shared by every start in
+    /// the isolate for [`NETWORK_TTL_MS`].
+    async fn network(&self, credentials: &Credentials) -> Result<Network, Failure> {
+        let now = worker::Date::now().as_millis();
+        let cached = NETWORK.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .filter(|cached| {
+                    now >= cached.fetched_ms && now < cached.fetched_ms + NETWORK_TTL_MS
+                })
+                .map(|cached| cached.network.clone())
+        });
+        if let Some(network) = cached {
+            return Ok(network);
+        }
+        let endpoint = self.endpoint();
+        let lookup =
+            |step: &str, err: String| Failure::new(Cause::Internal, format!("{step}: {err}"));
+        let response = self
+            .call(
+                credentials,
+                ec2::describe_launch_template(&endpoint, LAUNCH_TEMPLATE),
+            )
+            .await
+            .map_err(|err| {
+                Failure::new(
+                    Cause::Unreachable,
+                    format!("DescribeLaunchTemplates: {err}"),
+                )
+            })?;
+        let launch_template_id = ec2::launch_template_id(&response)
+            .map_err(|err| lookup("DescribeLaunchTemplates", err.to_string()))?;
+        let response = self
+            .call(
+                credentials,
+                ec2::describe_tagged_subnets(&endpoint, ec2::TAG_TENANT, TENANT),
+            )
+            .await
+            .map_err(|err| Failure::new(Cause::Unreachable, format!("DescribeSubnets: {err}")))?;
+        let mut subnets: Vec<String> = ec2::subnets(&response)
+            .map_err(|err| lookup("DescribeSubnets", err.to_string()))?
+            .into_iter()
+            .map(|subnet| subnet.id)
             .collect();
+        // Instances run customer code, so they never fall back to the
+        // account's default network.
+        if subnets.is_empty() {
+            return Err(lookup(
+                "DescribeSubnets",
+                format!("no subnet tagged {}={TENANT}", ec2::TAG_TENANT),
+            ));
+        }
+        subnets.sort();
+        let network = Network {
+            launch_template_id,
+            subnets,
+        };
+        NETWORK.with(|cell| {
+            *cell.borrow_mut() = Some(CachedNetwork {
+                fetched_ms: now,
+                network: network.clone(),
+            });
+        });
+        Ok(network)
+    }
+
+    /// The target of a start with `credentials` in `network`.
+    fn target<'a>(&'a self, credentials: &'a Credentials, network: &'a Network) -> Target<'a> {
         Target {
             region: &self.settings.ci_region,
             endpoint: self.endpoint(),
             credentials,
-            launch_template_id: &self.settings.ci_launch_template_id,
-            // `start_instance` needs a subnet to try; `None` is the
-            // template's own network.
-            subnets: if subnets.is_empty() {
-                vec![None]
-            } else {
-                subnets
-            },
+            launch_template_id: &network.launch_template_id,
+            subnets: network
+                .subnets
+                .iter()
+                .map(|subnet| Some(subnet.as_str()))
+                .collect(),
             fleet: true,
             offerings_scope: TENANT,
         }
@@ -515,9 +592,10 @@ impl Ec2 {
             .await
             .map_err(|err| Failure::new(Cause::Internal, err.to_string()))?
             .ok_or_else(|| Failure::new(Cause::NoImage, format!("no {arch} image in {region}")))?;
+        let network = self.network(credentials).await?;
         start_instance(
             db,
-            &self.target(credentials),
+            &self.target(credentials, &network),
             &Instance {
                 name: start.name,
                 choice: &choice,
@@ -663,7 +741,14 @@ impl Ec2 {
     async fn terminate(&self, instance_id: &str) {
         match self.shared_credentials().await {
             Ok(credentials) => {
-                terminate_instance(&self.target(&credentials), instance_id).await;
+                let request = ec2::terminate_instances(&self.endpoint(), instance_id);
+                let terminated = match self.call(&credentials, request).await {
+                    Ok(response) => ec2::terminated(&response).map_err(|err| err.to_string()),
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = terminated {
+                    console_warn!("terminate {instance_id}: {err}");
+                }
             }
             Err(err) => console_warn!("terminate {instance_id}: {err}"),
         }
