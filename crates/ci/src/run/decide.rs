@@ -246,6 +246,17 @@ pub(crate) fn apply_steps(state: &mut JobState, batch: &Batch) -> Applied {
     }
 }
 
+/// Records why the queued job waits, from the launch consumer. Returns
+/// whether the message is new, which is when the check run needs an
+/// update.
+pub(crate) fn apply_held(state: &mut JobState, message: &str) -> bool {
+    if state.held.as_deref() == Some(message) {
+        return false;
+    }
+    state.held = Some(message.to_owned());
+    true
+}
+
 /// Takes what the agent's final report says about steps and, when no
 /// annotation streamed in, its annotations.
 pub(crate) fn apply_result(state: &mut JobState, result: &JobResult) {
@@ -746,6 +757,18 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         };
         let due = due(&deadlines, &outbox, 150);
         assert!(due.flush && due.escalate && !due.upload && !due.purge);
+    }
+
+    #[test]
+    fn held_message_marks_the_outbox_once() {
+        let mut state = JobState::default();
+        assert!(apply_held(&mut state, "Waiting for a card."));
+        assert!(!apply_held(&mut state, "Waiting for a card."));
+        assert!(apply_held(&mut state, "Waiting: acme has 5 jobs running."));
+        assert_eq!(
+            state.held.as_deref(),
+            Some("Waiting: acme has 5 jobs running.")
+        );
     }
 
     #[test]

@@ -31,10 +31,10 @@ use crate::launches::LaunchMessage;
 use crate::store;
 
 use super::decide::{
-    Delivery, Failed, Flushed, Gate, apply_batch, apply_result, arm_todo, attempts, bounded_event,
-    delivery, due, file_annotations, gate, github_context, job_document, minimal_check, next_alarm,
-    plan_is_current, record_flush, reschedule, reset_jobs, run_state, running_for,
-    should_write_heartbeat, snapshot_ready, steps_json, take_drain,
+    Delivery, Failed, Flushed, Gate, apply_batch, apply_held, apply_result, arm_todo, attempts,
+    bounded_event, delivery, due, file_annotations, gate, github_context, job_document,
+    minimal_check, next_alarm, plan_is_current, record_flush, reschedule, reset_jobs, run_state,
+    running_for, should_write_heartbeat, snapshot_ready, steps_json, take_drain,
 };
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
@@ -95,7 +95,7 @@ struct ClaimBody {
 }
 
 #[derive(Deserialize)]
-struct FailedBody {
+struct MessageBody {
     message: String,
 }
 
@@ -356,7 +356,16 @@ impl<'a> Cx<'a> {
             return Response::error("a job is needed", 400);
         };
         match (&method, path) {
-            (Method::Post, "/failed") => match req.json::<FailedBody>().await {
+            (Method::Post, "/held") => match req.json::<MessageBody>().await {
+                Ok(body) => {
+                    let Some(attempt) = attempt else {
+                        return Response::error("an attempt is needed", 400);
+                    };
+                    self.held(job, attempt, &body.message).await
+                }
+                Err(_) => Response::error("bad hold", 400),
+            },
+            (Method::Post, "/failed") => match req.json::<MessageBody>().await {
                 Ok(body) => {
                     let Some(attempt) = attempt else {
                         return Response::error("an attempt is needed", 400);
@@ -949,6 +958,9 @@ impl<'a> Cx<'a> {
             }
             run.graph_mut().running(job);
             let mut state = self.job_state(job).await?;
+            if state.held.take().is_some() {
+                run.outbox_mut().mark(job);
+            }
             let old = state
                 .github_token
                 .replace(token.clone())
@@ -1070,6 +1082,28 @@ impl<'a> Cx<'a> {
             revoke
         };
         self.after(revoke).await;
+        answer(204)
+    }
+
+    /// Stores why the queued job waits for a launch. The check run is
+    /// updated only when the message differs from the one stored: the
+    /// launch consumer posts it again at every recheck.
+    async fn held(&self, job: u64, attempt: u32, message: &str) -> Result<Response> {
+        let _turn = self.turn.lock().await;
+        let Some(mut run) = self.loaded().await? else {
+            return answer(409);
+        };
+        match gate(run.graph.node(job), attempt) {
+            Gate::Queued => {}
+            Gate::Missing => return Response::error("no such job", 404),
+            Gate::Stale | Gate::Ended | Gate::Running => return answer(409),
+        }
+        let mut state = self.job_state(job).await?;
+        if apply_held(&mut state, message) {
+            self.put_job(job, &state).await?;
+            run.outbox_mut().mark(job);
+            self.commit(&mut run).await?;
+        }
         answer(204)
     }
 
@@ -1262,6 +1296,7 @@ impl<'a> Cx<'a> {
                 annotations: &state.annotations,
                 file_annotations_sent: state.file_annotations_sent,
                 failed_tail: tail.as_deref(),
+                held: state.held.as_deref(),
                 started_at: state.started_at,
                 completed_at: state.completed_at,
             };

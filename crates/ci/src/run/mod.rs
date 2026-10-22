@@ -26,6 +26,7 @@
 //! | `POST /events?job=ID` | `Batch` | `200` batch reply, `409` ended |
 //! | `POST /result?job=ID` | `JobResult` | `204` |
 //! | `POST /failed?job=ID` | `{ "message": "..." }` | `204` |
+//! | `POST /held?job=ID` | `{ "message": "..." }` | `204`, `409` not queued |
 //! | `POST /cancel` | none | `204` |
 //! | `POST /rerun?job=ID` | none | `204` |
 //! | `POST /purge` | none | `204` |
@@ -192,6 +193,8 @@ pub struct JobState {
     /// The finished log is not in R2 yet. Its chunks and [`Sealed`] stay
     /// in storage until it is.
     pub upload_pending: bool,
+    /// Why the queued job waits for a launch, until an agent claims it.
+    pub held: Option<String>,
 }
 
 /// A finished job's log as it waits for the upload.

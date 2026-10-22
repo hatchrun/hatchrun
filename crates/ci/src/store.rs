@@ -333,7 +333,7 @@ const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2,
 const RESET_JOB: &str = "UPDATE ci_jobs SET status = 'waiting', attempt = $2, launch_attempts = 0, \
      conclusion = NULL, instance_id = NULL, launch_error = NULL, next_launch_at = NULL, \
      heartbeat_at = NULL, started_at = NULL, completed_at = NULL, log_key = NULL, \
-     steps = '[]', updated_at = $3 WHERE id = $1 AND attempt < $2";
+     held = NULL, steps = '[]', updated_at = $3 WHERE id = $1 AND attempt < $2";
 
 /// Moves run `$1` from queued to in progress at `$2`.
 const RUN_STARTED: &str = "UPDATE ci_runs SET status = 'in_progress', updated_at = $2 WHERE id = $1 AND status = 'queued'";
@@ -354,10 +354,28 @@ const REOPEN_RUN_AT: &str = "UPDATE ci_runs SET status = 'in_progress', conclusi
 const SET_JOB: &str = "UPDATE ci_jobs SET status = $2, conclusion = $3, updated_at = $4, \
      completed_at = CASE WHEN $2 = 'completed' THEN $4 ELSE completed_at END WHERE id = $1";
 
-/// Takes the launch of job `$1` at `$2`, if it is queued.
-const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', \
+/// Locks the row of tenant `$1`, so the launches of one tenant are
+/// counted against the concurrency cap one at a time.
+const LOCK_TENANT: &str = "SELECT id FROM tenants WHERE id = $1 FOR UPDATE";
+
+/// Takes the launch of job `$1` at `$2`, if it is queued and fewer than
+/// `$4` jobs of tenant `$3` are launching, launched or running; run
+/// after [`LOCK_TENANT`]. The hold is over.
+const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL, \
      launch_attempts = launch_attempts + 1, updated_at = $2 \
-     WHERE id = $1 AND status = 'queued' RETURNING {columns}";
+     WHERE id = $1 AND status = 'queued' \
+     AND (SELECT count(*) FROM ci_jobs other JOIN ci_runs ON ci_runs.id = other.run_id \
+          WHERE ci_runs.tenant_id = $3 \
+          AND other.status IN ('launching', 'launched', 'running')) < $4 \
+     RETURNING {columns}";
+
+/// Keeps attempt `$2` of queued job `$1` held for reason `$3` until
+/// `$4`, at `$5`. Returns whether the reason changed.
+const HOLD: &str = "WITH prior AS (SELECT held FROM ci_jobs \
+       WHERE id = $1 AND attempt = $2 AND status = 'queued' FOR UPDATE) \
+     UPDATE ci_jobs SET held = $3::text, next_launch_at = $4, updated_at = $5 \
+     FROM prior WHERE ci_jobs.id = $1 \
+     RETURNING (prior.held IS DISTINCT FROM $3::text) AS changed";
 
 /// Records the instance `$2` of job `$1` at `$3`.
 const LAUNCHED: &str = "UPDATE ci_jobs SET status = 'launched', instance_id = $2, \
@@ -952,18 +970,76 @@ pub async fn set_job(
     Ok(())
 }
 
-/// Takes the launch of job `job_id` if it is queued: launching, one
-/// more launch attempt. `None` when somebody else took it.
+/// What [`claim_launch`] found.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // one value per launch, never stored
+pub enum Claim {
+    /// The job is launching now, one more launch attempt.
+    Claimed(JobRow),
+    /// The job is queued, but the tenant runs its most jobs already.
+    Busy,
+    /// Somebody else took the launch, or the job moved on.
+    Gone,
+}
+
+/// Takes the launch of job `job_id` of tenant `tenant_id` if it is
+/// queued: launching, one more launch attempt, no hold. The tenant's
+/// row is locked first, so two consumers cannot both take the last of
+/// `max_running` places: the job is claimed only while fewer than
+/// `max_running` of the tenant's jobs are launching, launched or
+/// running.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn claim_launch(db: &Db, job_id: u64, now: u64) -> Result<Option<JobRow>> {
-    db.first(
-        &with_columns(CLAIM_LAUNCH, JOB_COLUMNS),
-        &params![job_id, now],
-    )
-    .await
+pub async fn claim_launch(
+    db: &Db,
+    job_id: u64,
+    tenant_id: &str,
+    max_running: u32,
+    now: u64,
+) -> Result<Claim> {
+    let lock = params![tenant_id];
+    let claimed: Option<JobRow> = db
+        .first_locked(
+            (LOCK_TENANT, &lock),
+            &with_columns(CLAIM_LAUNCH, JOB_COLUMNS),
+            &params![job_id, now, tenant_id, max_running],
+        )
+        .await?;
+    if let Some(job) = claimed {
+        return Ok(Claim::Claimed(job));
+    }
+    Ok(match job(db, job_id).await? {
+        Some(row) if row.status == "queued" => Claim::Busy,
+        _ => Claim::Gone,
+    })
+}
+
+/// Keeps attempt `attempt` of job `job_id` queued with reason `hold`
+/// until `retry_at`, and bumps its `updated_at`. Returns whether the
+/// reason changed; another attempt, or a job that is not queued, is
+/// left alone and the answer is `false`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn hold(
+    db: &Db,
+    job_id: u64,
+    attempt: u32,
+    hold: &str,
+    retry_at: u64,
+    now: u64,
+) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct Changed {
+        changed: bool,
+    }
+    Ok(db
+        .first::<Changed>(HOLD, &params![job_id, attempt, hold, retry_at, now])
+        .await?
+        .is_some_and(|row| row.changed))
 }
 
 /// Records the instance of job `job_id`: launched. Only a launching
@@ -1172,6 +1248,17 @@ mod tests {
         };
         db.wait(upsert_repo(db.db(), &repo, 1)).unwrap();
         db
+    }
+
+    /// Claims job `job_id` of tenant t1, which must succeed.
+    fn claim(db: &TestDb, job_id: u64, now: u64) -> JobRow {
+        match db
+            .wait(claim_launch(db.db(), job_id, "t1", 5, now))
+            .unwrap()
+        {
+            Claim::Claimed(job) => job,
+            other => panic!("not claimed: {other:?}"),
+        }
     }
 
     fn new_run(delivery: &str, workflow: &str, now: u64) -> NewRun {
@@ -1464,22 +1551,167 @@ mod tests {
     fn claim_launch_only_once() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "queued");
-        let first = db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        let first = claim(&db, job_id, 10);
         assert_eq!(first.launch_attempts, 1);
-        assert!(
-            db.wait(claim_launch(db.db(), job_id, 11))
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            db.wait(claim_launch(db.db(), job_id, "t1", 5, 11)).unwrap(),
+            Claim::Gone
         );
         let job = db.wait(job(db.db(), job_id)).unwrap().unwrap();
         assert_eq!(job.status, "launching");
+    }
+
+    fn held_of(db: &TestDb, job_id: u64) -> Option<String> {
+        db.column(
+            "SELECT held AS h FROM ci_jobs WHERE id = $1",
+            &params![job_id],
+            "h",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn claim_launch_holds_the_sixth_job() {
+        let db = setup();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 98, 0, 0)",
+            &[],
+        );
+        db.run(
+            "INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+             private, updated_at) VALUES (8, 't2', 98, 'other/app', 'main', false, 1)",
+            &[],
+        );
+        let other = db
+            .wait(insert_run(
+                db.db(),
+                &NewRun {
+                    tenant_id: "t2".into(),
+                    repo_id: 8,
+                    ..new_run("o", "ci", 1_000)
+                },
+            ))
+            .unwrap()
+            .unwrap();
+        let other_jobs: Vec<NewJob> = (0..5).map(|n| new_job(&format!("o{n}"))).collect();
+        for (_, id) in db
+            .wait(insert_jobs(db.db(), other.id, &other_jobs, 1_000))
+            .unwrap()
+        {
+            db.wait(set_job(db.db(), id, "running", None, 1_001))
+                .unwrap();
+        }
+        let statuses = ["launching", "launched", "running", "running", "launching"];
+        for (n, status) in statuses.into_iter().enumerate() {
+            run_with_job_named(&db, &format!("d{n}"), status);
+        }
+        let (_, sixth) = run_with_job_named(&db, "d9", "queued");
+        assert_eq!(
+            db.wait(claim_launch(db.db(), sixth, "t1", 5, 10)).unwrap(),
+            Claim::Busy
+        );
+        let row = db.wait(job(db.db(), sixth)).unwrap().unwrap();
+        assert_eq!((row.status.as_str(), row.launch_attempts), ("queued", 0));
+        // A completed job frees a place.
+        let first = db
+            .wait(insert_run(db.db(), &new_run("free", "ci", 1_000)))
+            .unwrap()
+            .unwrap();
+        let done = db
+            .wait(insert_jobs(db.db(), first.id, &[new_job("done")], 1_000))
+            .unwrap()[0]
+            .1;
+        db.wait(set_job(db.db(), done, "completed", Some("success"), 1_002))
+            .unwrap();
+        assert_eq!(
+            db.wait(claim_launch(db.db(), sixth, "t1", 5, 11)).unwrap(),
+            Claim::Busy,
+            "completed jobs do not count, but five still run"
+        );
+        let running: u64 = db
+            .column(
+                "SELECT id AS n FROM ci_jobs WHERE status = 'launching' ORDER BY id LIMIT 1",
+                &[],
+                "n",
+            )
+            .unwrap();
+        db.wait(set_job(
+            db.db(),
+            running,
+            "completed",
+            Some("success"),
+            1_003,
+        ))
+        .unwrap();
+        assert!(matches!(
+            db.wait(claim_launch(db.db(), sixth, "t1", 5, 12)).unwrap(),
+            Claim::Claimed(_)
+        ));
+        let gone = db
+            .wait(claim_launch(db.db(), 999_999, "t1", 5, 13))
+            .unwrap();
+        assert_eq!(gone, Claim::Gone);
+    }
+
+    #[test]
+    fn claim_clears_the_hold() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "queued");
+        assert!(db.wait(hold(db.db(), job_id, 1, "card", 50, 5)).unwrap());
+        assert_eq!(held_of(&db, job_id).as_deref(), Some("card"));
+        claim(&db, job_id, 10);
+        assert_eq!(held_of(&db, job_id), None);
+    }
+
+    #[test]
+    fn hold_reports_a_change_once() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "queued");
+        assert!(db.wait(hold(db.db(), job_id, 1, "card", 500, 5)).unwrap());
+        assert!(!db.wait(hold(db.db(), job_id, 1, "card", 530, 6)).unwrap());
+        let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+        assert_eq!((row.next_launch_at, row.updated_at), (Some(530), 6));
+        assert!(
+            db.wait(hold(db.db(), job_id, 1, "concurrency", 560, 7))
+                .unwrap()
+        );
+        assert_eq!(held_of(&db, job_id).as_deref(), Some("concurrency"));
+        let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+        assert_eq!(row.next_launch_at, Some(560));
+    }
+
+    #[test]
+    fn hold_leaves_another_attempt_alone() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "queued");
+        assert!(!db.wait(hold(db.db(), job_id, 2, "card", 500, 5)).unwrap());
+        assert_eq!(held_of(&db, job_id), None);
+        let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+        assert_eq!((row.next_launch_at, row.updated_at), (None, 1_001));
+        let (_, launching) = run_with_job_named(&db, "d2", "launching");
+        assert!(
+            !db.wait(hold(db.db(), launching, 1, "card", 500, 5))
+                .unwrap()
+        );
+        assert_eq!(held_of(&db, launching), None);
+    }
+
+    #[test]
+    fn a_rerun_clears_the_hold() {
+        let db = setup();
+        let (_, job_id) = run_with_job(&db, "queued");
+        db.wait(hold(db.db(), job_id, 1, "spend_cap", 50, 5))
+            .unwrap();
+        db.wait(reset_job(db.db(), job_id, 2, 40)).unwrap();
+        assert_eq!(held_of(&db, job_id), None);
     }
 
     #[test]
     fn a_failed_launch_retries_or_fails_the_job() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "queued");
-        db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        claim(&db, job_id, 10);
         db.wait(launch_failed(db.db(), job_id, "no capacity", Some(500), 20))
             .unwrap();
         let job_row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
@@ -1487,7 +1719,7 @@ mod tests {
             (job_row.status.as_str(), job_row.next_launch_at),
             ("queued", Some(500))
         );
-        db.wait(claim_launch(db.db(), job_id, 30)).unwrap().unwrap();
+        claim(&db, job_id, 30);
         db.wait(launch_failed(db.db(), job_id, "no capacity", None, 40))
             .unwrap();
         let job_row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
@@ -1500,7 +1732,7 @@ mod tests {
     fn late_calls_leave_a_completed_job_alone() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "queued");
-        db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        claim(&db, job_id, 10);
         assert!(db.wait(launched(db.db(), job_id, "i-1", 11)).unwrap());
         assert!(db.wait(start_job(db.db(), job_id, 12)).unwrap());
         let steps = serde_json::json!([{"name": "first"}]);
@@ -1571,7 +1803,7 @@ mod tests {
     fn launched_records_the_instance() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "queued");
-        db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        claim(&db, job_id, 10);
         db.wait(launched(db.db(), job_id, "i-123", 11)).unwrap();
         let job_row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
         assert_eq!(job_row.status, "launched");
@@ -1708,7 +1940,7 @@ mod tests {
     fn reset_job_clears_the_attempt() {
         let db = setup();
         let (_, job_id) = run_with_job(&db, "queued");
-        db.wait(claim_launch(db.db(), job_id, 10)).unwrap().unwrap();
+        claim(&db, job_id, 10);
         db.wait(start_job(db.db(), job_id, 20)).unwrap();
         let steps = serde_json::json!([{"name": "build"}]);
         db.wait(finish_job(
