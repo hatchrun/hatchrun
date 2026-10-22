@@ -107,6 +107,44 @@ pub fn snapshot_key(tenant: &str, run_id: u64) -> String {
     format!("state/{tenant}/{run_id}.json")
 }
 
+/// The R2 key of the state of run `run`, `None` for a tenant id that
+/// is empty or could name another key.
+#[must_use]
+pub fn restore_key(run: Option<u64>, tenant: Option<&str>) -> Option<String> {
+    let tenant = tenant.filter(|t| !t.is_empty() && !t.contains(['/', '.']))?;
+    Some(snapshot_key(tenant, run?))
+}
+
+/// Whether `info` is run `run` of `tenant`.
+pub(crate) fn is_run(info: &RunInfo, run: u64, tenant: &str) -> bool {
+    info.run_id == run && info.tenant_id == tenant
+}
+
+/// The run and tenant a request that can reach an empty object names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ident {
+    run: u64,
+    tenant: String,
+}
+
+impl Ident {
+    fn from_query(run: Option<u64>, tenant: Option<String>) -> Option<Self> {
+        let tenant = tenant?;
+        restore_key(run, Some(&tenant))?;
+        Some(Self { run: run?, tenant })
+    }
+}
+
+/// What an object holds when a request names a run.
+enum Held {
+    /// This run, or its snapshot loaded back.
+    Run,
+    /// Neither state nor snapshot.
+    Missing,
+    /// Another run.
+    Other,
+}
+
 /// The run, as recorded when it starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunInfo {
@@ -180,9 +218,10 @@ pub struct JobState {
 pub struct Deadlines {
     /// When cancelled jobs that have not stopped are told to stop hard.
     pub escalate_at: Option<u64>,
-    /// When uploads that failed, and the state snapshot, are tried
-    /// again.
+    /// When uploads that failed are tried again.
     pub upload_retry_at: Option<u64>,
+    /// When the ended run's state is written to R2.
+    pub snapshot_at: Option<u64>,
     /// When the object deletes its storage.
     pub purge_at: Option<u64>,
     /// When the side effects still in the [`Todo`] list are tried
@@ -440,6 +479,7 @@ pub(crate) fn next_alarm(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) ->
     [
         deadlines.escalate_at,
         deadlines.upload_retry_at,
+        deadlines.snapshot_at,
         deadlines.purge_at,
         deadlines.todo_retry_at,
         outbox.next_alarm(now_ms),
@@ -456,6 +496,7 @@ pub(crate) struct Due {
     pub(crate) flush: bool,
     pub(crate) escalate: bool,
     pub(crate) upload: bool,
+    pub(crate) snapshot: bool,
     pub(crate) purge: bool,
     pub(crate) todo: bool,
 }
@@ -466,6 +507,7 @@ pub(crate) fn due(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) -> Due {
         flush: !outbox.due(now_ms).is_empty(),
         escalate: reached(deadlines.escalate_at),
         upload: reached(deadlines.upload_retry_at),
+        snapshot: reached(deadlines.snapshot_at),
         purge: reached(deadlines.purge_at),
         todo: reached(deadlines.todo_retry_at),
     }
@@ -885,7 +927,7 @@ mod object {
     use async_lock::Mutex;
     use worker::{DurableObject, Env, Request, Response, Result, State, durable_object};
 
-    use super::{Cx, Settings, fail};
+    use super::{Cx, Ident, Settings, fail};
 
     /// One run.
     #[durable_object]
@@ -931,12 +973,17 @@ mod object {
                     .and_then(|(_, value)| value.parse::<u64>().ok())
             };
             let (job, attempt) = (number("job"), number("attempt"));
+            let tenant = url
+                .query_pairs()
+                .find(|(key, _)| key == "tenant")
+                .map(|(_, value)| value.into_owned());
             self.cx()?
                 .route(
                     &mut req,
                     url.path(),
                     job,
                     attempt.and_then(|a| u32::try_from(a).ok()),
+                    Ident::from_query(number("run"), tenant),
                 )
                 .await
         }
@@ -955,8 +1002,6 @@ struct Cx<'a> {
     storage: Storage,
     env: Env,
     turn: &'a Mutex<()>,
-    /// The object's name, which is the run's id as text.
-    name: Option<String>,
     settings: &'a Settings,
     now: u64,
     db: OnceCell<Db>,
@@ -985,7 +1030,6 @@ impl<'a> Cx<'a> {
             storage: state.storage(),
             env: env.clone(),
             turn,
-            name: state.id().name(),
             settings,
             now: now_ms(),
             db: OnceCell::new(),
@@ -1008,6 +1052,7 @@ impl<'a> Cx<'a> {
         path: &str,
         job: Option<u64>,
         attempt: Option<u32>,
+        ident: Option<Ident>,
     ) -> Result<Response> {
         let method = req.method();
         match (&method, path) {
@@ -1020,10 +1065,13 @@ impl<'a> Cx<'a> {
             (Method::Post, "/purge") => return self.purge().await,
             (Method::Post, "/cancel") => return self.cancel().await,
             (Method::Get, "/state") => {
-                return if self.restore_if_needed().await? {
-                    self.state().await
-                } else {
-                    answer(404)
+                let Some(ident) = ident else {
+                    return Response::error("a run and a tenant are needed", 400);
+                };
+                return match self.restore_if_needed(&ident).await? {
+                    Held::Run => self.state().await,
+                    Held::Missing => answer(404),
+                    Held::Other => answer(409),
                 };
             }
             _ => {}
@@ -1037,10 +1085,13 @@ impl<'a> Cx<'a> {
                 Err(_) => Response::error("bad failure", 400),
             },
             (Method::Post, "/rerun") => {
-                if self.restore_if_needed().await? {
-                    self.rerun(job).await
-                } else {
-                    answer(404)
+                let Some(ident) = ident else {
+                    return Response::error("a run and a tenant are needed", 400);
+                };
+                match self.restore_if_needed(&ident).await? {
+                    Held::Run => self.rerun(job).await,
+                    Held::Missing => answer(404),
+                    Held::Other => answer(409),
                 }
             }
             (Method::Post, "/claim" | "/events" | "/result") => {
@@ -1128,9 +1179,13 @@ impl<'a> Cx<'a> {
             worker::console_error!("alarm: side effects: {err}");
             failed.todo = true;
         }
+        if due.snapshot
+            && let Err(err) = self.snapshot_now().await
+        {
+            worker::console_error!("alarm: snapshot: {err}");
+        }
         if due.upload {
-            // Uploads of finished logs retry here (Task 10); a state
-            // snapshot that failed is retried by `settle`.
+            // Uploads of finished logs retry here (Task 10).
             let done = self
                 .update(|run| run.deadlines_mut().upload_retry_at = None)
                 .await;
@@ -1182,22 +1237,31 @@ impl<'a> Cx<'a> {
     }
 
     /// Reads the snapshot of an ended run back into an object that was
-    /// purged, unless it holds the run. The run's id is the object's
-    /// name. Postgres and R2 are read without the lock. Answers whether
-    /// the object holds a run.
-    async fn restore_if_needed(&self) -> Result<bool> {
+    /// purged, unless it holds the run. `ident` comes with the request;
+    /// the snapshot is read from R2 without the lock, and what the
+    /// object holds, or the snapshot, must be that run.
+    async fn restore_if_needed(&self, ident: &Ident) -> Result<Held> {
         {
             let _turn = self.turn.lock().await;
-            if self.storage.get::<Graph>(GRAPH).await?.is_some() {
-                return Ok(true);
+            if let Some(info) = self.storage.get::<RunInfo>(INFO).await?
+                && self.storage.get::<Graph>(GRAPH).await?.is_some()
+            {
+                return Ok(if is_run(&info, ident.run, &ident.tenant) {
+                    Held::Run
+                } else {
+                    Held::Other
+                });
             }
         }
-        let Some(snapshot) = self.fetch_snapshot().await? else {
-            return Ok(false);
+        let Some(snapshot) = self.fetch_snapshot(ident).await? else {
+            return Ok(Held::Missing);
         };
+        if !is_run(&snapshot.info, ident.run, &ident.tenant) {
+            return Ok(Held::Other);
+        }
         let _turn = self.turn.lock().await;
         if self.storage.get::<Graph>(GRAPH).await?.is_some() {
-            return Ok(true);
+            return Ok(Held::Run);
         }
         self.storage.put(EVENT, &snapshot.event).await?;
         let mut run = Loaded {
@@ -1212,42 +1276,32 @@ impl<'a> Cx<'a> {
             dirty: [true; 5],
         };
         self.commit(&mut run).await?;
-        Ok(true)
+        Ok(Held::Run)
     }
 
-    async fn fetch_snapshot(&self) -> Result<Option<Snapshot>> {
-        let Some(run_id) = self
-            .name
-            .as_deref()
-            .and_then(|name| name.parse::<u64>().ok())
-        else {
+    async fn fetch_snapshot(&self, ident: &Ident) -> Result<Option<Snapshot>> {
+        let Some(key) = restore_key(Some(ident.run), Some(&ident.tenant)) else {
             return Ok(None);
         };
-        let Some(row) = store::run(self.db().await?, run_id).await? else {
-            return Ok(None);
-        };
-        let bucket = self.env.bucket(BUCKET)?;
-        let Some(object) = bucket
-            .get(snapshot_key(&row.tenant_id, run_id))
-            .execute()
-            .await?
-        else {
+        let Some(object) = self.env.bucket(BUCKET)?.get(key).execute().await? else {
             return Ok(None);
         };
         let Some(body) = object.body() else {
             return Ok(None);
         };
         let snapshot = serde_json::from_slice(&body.bytes().await?)
-            .map_err(|err| fail(format!("run {run_id}: snapshot: {err}")))?;
+            .map_err(|err| fail(format!("run {}: snapshot: {err}", ident.run)))?;
         Ok(Some(snapshot))
     }
 
-    /// Writes what the handler changed, snapshots an ended run and sets
-    /// the alarm. The caller holds the lock.
+    /// Writes what the handler changed and sets the alarm, which also
+    /// wakes the object to snapshot an ended run. The caller holds the lock.
     async fn commit(&self, run: &mut Loaded) -> Result<()> {
         arm_todo(&mut run.deadlines, &run.todo, self.now);
-        if run.dirty.iter().any(|dirty| *dirty) {
-            self.settle(run).await;
+        if run.deadlines.snapshot_at.is_none()
+            && snapshot_ready(&run.graph, &run.outbox, &run.deadlines, &run.todo)
+        {
+            run.deadlines.snapshot_at = Some(self.now);
         }
         let storage = &self.storage;
         if run.dirty[0] {
@@ -1262,7 +1316,7 @@ impl<'a> Cx<'a> {
         if run.dirty[4] {
             storage.put(TODO, &run.todo).await?;
         }
-        // Not conditional: `arm_todo` and `settle` change the deadlines.
+        // Not conditional: the code above changes the deadlines.
         storage.put(DEADLINES, &run.deadlines).await?;
         run.dirty = [false; 5];
         match next_alarm(&run.deadlines, &run.outbox, self.now) {
@@ -1274,34 +1328,51 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// An ended run with nothing left to send is written to R2 and then
-    /// purged. A snapshot that fails is tried again after a minute.
-    async fn settle(&self, run: &mut Loaded) {
-        if !snapshot_ready(&run.graph, &run.outbox, &run.deadlines, &run.todo) {
-            return;
-        }
-        match self.snapshot(run).await {
-            Ok(()) => run.deadlines.purge_at = Some(self.now),
+    /// Writes the state of an ended run to R2 and sets the purge. The
+    /// state is read under the lock, written without it and recorded
+    /// under it again. A write that fails is tried again after a minute.
+    async fn snapshot_now(&self) -> Result<()> {
+        let (key, body) = {
+            let _turn = self.turn.lock().await;
+            let Some(run) = self.loaded().await? else {
+                return Ok(());
+            };
+            if run.deadlines.snapshot_at.is_none()
+                || !snapshot_ready(&run.graph, &run.outbox, &run.deadlines, &run.todo)
+            {
+                return Ok(());
+            }
+            let snapshot = Snapshot {
+                info: run.info,
+                graph: run.graph,
+                event: self.event().await?,
+            };
+            let body = serde_json::to_vec(&snapshot).map_err(|err| fail(err.to_string()))?;
+            (
+                snapshot_key(&snapshot.info.tenant_id, snapshot.info.run_id),
+                body,
+            )
+        };
+        let written = async { self.env.bucket(BUCKET)?.put(key, body).execute().await }.await;
+        let now = self.now;
+        match written {
+            Ok(_) => {
+                self.update(|run| {
+                    // A rerun that came meanwhile has cleared the need.
+                    if run.graph.conclusion().is_some() {
+                        let deadlines = run.deadlines_mut();
+                        deadlines.snapshot_at = None;
+                        deadlines.purge_at = Some(now);
+                    }
+                })
+                .await
+            }
             Err(err) => {
-                worker::console_error!("run {}: snapshot: {err}", run.info.run_id);
-                run.deadlines.upload_retry_at = Some(self.now + SNAPSHOT_RETRY_MS);
+                worker::console_error!("snapshot: {err}");
+                self.update(|run| run.deadlines_mut().snapshot_at = Some(now + SNAPSHOT_RETRY_MS))
+                    .await
             }
         }
-    }
-
-    async fn snapshot(&self, run: &Loaded) -> Result<()> {
-        let snapshot = Snapshot {
-            info: run.info.clone(),
-            graph: run.graph.clone(),
-            event: self.event().await?,
-        };
-        let body = serde_json::to_vec(&snapshot).map_err(|err| fail(err.to_string()))?;
-        self.env
-            .bucket(BUCKET)?
-            .put(snapshot_key(&run.info.tenant_id, run.info.run_id), body)
-            .execute()
-            .await?;
-        Ok(())
     }
 
     async fn purge(&self) -> Result<Response> {
@@ -1466,6 +1537,9 @@ impl<'a> Cx<'a> {
         if let Err(err) = self.drain().await {
             worker::console_error!("side effects: {err}");
         }
+        if let Err(err) = self.snapshot_now().await {
+            worker::console_error!("snapshot: {err}");
+        }
         for token in revoke {
             self.revoke(&token).await;
         }
@@ -1482,7 +1556,14 @@ impl<'a> Cx<'a> {
             // The graph is written last, so a start that failed halfway
             // runs again.
             if self.storage.get::<Graph>(GRAPH).await?.is_some() {
-                return answer(204);
+                let held = self.storage.get::<RunInfo>(INFO).await?;
+                return answer(
+                    if held.is_some_and(|held| is_run(&held, info.run_id, &info.tenant_id)) {
+                        204
+                    } else {
+                        409
+                    },
+                );
             }
             let mut run = Loaded {
                 graph: Graph::new(jobs),
@@ -2528,6 +2609,40 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         assert_eq!(all.jobs[0].check_run_id, Some(44));
         assert_eq!(all.jobs[0].steps.len(), 1);
         assert_eq!(all.jobs[1].steps, []);
+    }
+
+    #[test]
+    fn the_restore_key_is_built_from_the_run_and_tenant_of_the_request() {
+        assert_eq!(
+            restore_key(Some(12), Some("abc")).as_deref(),
+            Some("state/abc/12.json")
+        );
+        assert_eq!(restore_key(None, Some("abc")), None);
+        assert_eq!(restore_key(Some(12), None), None);
+        assert_eq!(restore_key(Some(12), Some("")), None);
+        assert_eq!(restore_key(Some(12), Some("a/../b")), None);
+        assert_eq!(Ident::from_query(Some(1), Some("t".into())).unwrap().run, 1);
+        assert_eq!(Ident::from_query(Some(1), Some("x/y".into())), None);
+        assert_eq!(Ident::from_query(None, Some("t".into())), None);
+    }
+
+    #[test]
+    fn a_request_must_name_the_run_the_object_holds() {
+        let held = info();
+        assert!(is_run(&held, 7, &held.tenant_id));
+        assert!(!is_run(&held, 8, &held.tenant_id));
+        assert!(!is_run(&held, 7, "other"));
+    }
+
+    #[test]
+    fn the_snapshot_deadline_wakes_the_alarm() {
+        let deadlines = Deadlines {
+            snapshot_at: Some(5),
+            ..Deadlines::default()
+        };
+        assert_eq!(next_alarm(&deadlines, &Outbox::default(), 9), Some(5));
+        assert!(due(&deadlines, &Outbox::default(), 5).snapshot);
+        assert!(!due(&deadlines, &Outbox::default(), 4).snapshot);
     }
 
     #[test]
