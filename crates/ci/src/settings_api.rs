@@ -9,13 +9,18 @@
 //! | --- | --- | --- |
 //! | `GET /api/ci/orgs/{org}/billing` | org admin | [`BillingView`](crate::billing::BillingView) |
 //! | `PUT /api/ci/orgs/{org}/billing/cap` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/secrets` | org admin | `[{"name", "updatedAt"}]` |
+//! | `GET /api/ci/orgs/{org}/secrets` | org admin | `[{"name", "updatedAt", "repositories"}]` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/secrets/{name}` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/vars` | org admin | `[{"name", "value", "updatedAt"}]` |
+//! | `GET /api/ci/orgs/{org}/vars` | org admin | `[{"name", "value", "updatedAt", "repositories"}]` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/vars/{name}` | org admin, CSRF | `204` |
+//! | `GET /api/ci/orgs/{org}/repositories` | org admin | `[{"name"}]` |
 //!
 //! The same four under `/api/ci/repos/{owner}/{repo}/` need admin
 //! access to the repository. No route answers a secret's value.
+//!
+//! An organization secret or variable reaches every repository
+//! (`repositories` is `null`) or the repositories named in the list.
+//! Repository and environment rows have no such list.
 //!
 //! An organization with no tenant, and a user who is not an active
 //! admin of it, both get `404`. `api::serve` runs the Origin, CSRF and
@@ -69,6 +74,12 @@ pub enum SettingsRoute<'a> {
     Vars(Scope<'a>),
     /// Set or delete one variable.
     Var(Scope<'a>, &'a str),
+    /// The organization's repositories, for choosing who a secret
+    /// reaches.
+    Repositories {
+        /// The organization.
+        org: &'a str,
+    },
 }
 
 impl SettingsRoute<'_> {
@@ -76,9 +87,10 @@ impl SettingsRoute<'_> {
     #[must_use]
     pub fn allows(&self, method: &Method) -> bool {
         match self {
-            SettingsRoute::Billing { .. } | SettingsRoute::Secrets(_) | SettingsRoute::Vars(_) => {
-                *method == Method::Get
-            }
+            SettingsRoute::Billing { .. }
+            | SettingsRoute::Secrets(_)
+            | SettingsRoute::Vars(_)
+            | SettingsRoute::Repositories { .. } => *method == Method::Get,
             SettingsRoute::Cap { .. } => *method == Method::Put,
             SettingsRoute::Secret(..) | SettingsRoute::Var(..) => {
                 matches!(method, Method::Put | Method::Delete)
@@ -95,6 +107,7 @@ pub fn find(path: &str) -> Option<SettingsRoute<'_>> {
     match parts.as_slice() {
         ["orgs", org, "billing"] => Some(SettingsRoute::Billing { org: login(org)? }),
         ["orgs", org, "billing", "cap"] => Some(SettingsRoute::Cap { org: login(org)? }),
+        ["orgs", org, "repositories"] => Some(SettingsRoute::Repositories { org: login(org)? }),
         ["orgs", org, kind @ ("secrets" | "vars")] => {
             let scope = Scope::Org(login(org)?);
             Some(if *kind == "secrets" {
@@ -156,6 +169,7 @@ pub(crate) async fn handle(
     match route {
         SettingsRoute::Billing { org } => billing_view(cx, org).await,
         SettingsRoute::Cap { org } => cap(cx, org, req, body_cap(&route)).await,
+        SettingsRoute::Repositories { org } => repositories(cx, org).await,
         SettingsRoute::Secrets(scope) => list_secrets(cx, scope).await,
         SettingsRoute::Vars(scope) => list_vars(cx, scope).await,
         SettingsRoute::Secret(scope, item) => {
@@ -323,29 +337,87 @@ const fn limit(repo: bool) -> u32 {
 #[serde(deny_unknown_fields)]
 struct ValueBody {
     value: String,
+    /// The repositories an organization row reaches, by name; `None`
+    /// for all of them.
+    #[serde(default)]
+    repositories: Option<Vec<String>>,
 }
 
-/// The value in a `PUT` body of at most `max_body` bytes. Nothing of
-/// the body goes into an error.
-fn parse_value(body: &[u8], max_body: usize) -> std::result::Result<String, Stop> {
+/// The body of a `PUT` of at most `max_body` bytes. Nothing of the body
+/// goes into an error.
+fn parse_body(body: &[u8], max_body: usize) -> std::result::Result<ValueBody, Stop> {
     if body.len() > max_body {
         return stop(413, "the request is too large");
     }
-    let Ok(ValueBody { value }) = serde_json::from_slice(body) else {
+    let Ok(parsed) = serde_json::from_slice::<ValueBody>(body) else {
         return stop(400, "expected {\"value\": \"...\"}");
     };
-    if value.is_empty() {
+    if parsed.value.is_empty() {
         return stop(400, "Values cannot be empty");
     }
-    if value.len() > secrets::MAX_VALUE_BYTES {
+    if parsed.value.len() > secrets::MAX_VALUE_BYTES {
         return stop(413, "Values are at most 48 KB");
     }
-    Ok(value)
+    Ok(parsed)
+}
+
+/// The `ci_repos` ids a `PUT` selects for its row. `None` stores NULL,
+/// every repository. Only an organization row may select.
+async fn selection(
+    cx: &Cx<'_>,
+    target: &Target,
+    names: Option<&[String]>,
+) -> Result<Served<Option<Vec<u64>>>> {
+    let Some(names) = names else {
+        return Ok(Ok(None));
+    };
+    if target.owner != Owner::Org {
+        return Ok(stop(
+            400,
+            "Only organization secrets and variables have repository access",
+        ));
+    }
+    if names.len() > secrets::MAX_SELECTED_REPOS {
+        return Ok(stop(422, "Select at most 1000 repositories"));
+    }
+    let found = store::repo_ids(cx.db, &target.tenant, names).await?;
+    let unknown: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            !found
+                .iter()
+                .any(|(known, _)| known.eq_ignore_ascii_case(name))
+        })
+        .collect();
+    if !unknown.is_empty() {
+        return Ok(stop(
+            422,
+            format!("Unknown repositories: {}", unknown.join(", ")),
+        ));
+    }
+    let mut ids: Vec<u64> = found.into_iter().map(|(_, id)| id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(Ok(Some(ids)))
 }
 
 /// The uppercased name, or the `400` that says what is wrong with it.
 fn item_name(item: &str) -> std::result::Result<String, Stop> {
     secrets::valid_name(item).or_else(|message| stop(400, message))
+}
+
+async fn repositories(cx: &Cx<'_>, org: &str) -> Result<Served> {
+    let tenant = match admin_tenant(cx, org).await? {
+        Ok(tenant) => tenant,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let names = store::tenant_repos(cx.db, &tenant.id).await?;
+    let list: Vec<_> = names
+        .into_iter()
+        .map(|name| json!({ "name": name }))
+        .collect();
+    reply(200, &json!(list)).map(Ok)
 }
 
 async fn list_secrets(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
@@ -356,7 +428,13 @@ async fn list_secrets(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
     let rows = store::secret_names(cx.db, &target.tenant, target.owner).await?;
     let list: Vec<_> = rows
         .into_iter()
-        .map(|(name, updated)| json!({ "name": name, "updatedAt": updated }))
+        .map(|item| {
+            json!({
+                "name": item.name,
+                "updatedAt": item.updated_at,
+                "repositories": item.repositories,
+            })
+        })
         .collect();
     reply(200, &json!(list)).map(Ok)
 }
@@ -369,7 +447,14 @@ async fn list_vars(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
     let rows = store::vars(cx.db, &target.tenant, target.owner).await?;
     let list: Vec<_> = rows
         .into_iter()
-        .map(|(name, value, updated)| json!({ "name": name, "value": value, "updatedAt": updated }))
+        .map(|item| {
+            json!({
+                "name": item.name,
+                "value": item.value,
+                "updatedAt": item.updated_at,
+                "repositories": item.repositories,
+            })
+        })
         .collect();
     reply(200, &json!(list)).map(Ok)
 }
@@ -389,8 +474,12 @@ async fn put_secret(
         Ok(name) => name,
         Err(stop) => return Ok(Err(stop)),
     };
-    let value = match parse_value(&req.bytes().await?, max_body) {
-        Ok(value) => value,
+    let body = match parse_body(&req.bytes().await?, max_body) {
+        Ok(body) => body,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let repositories = match selection(cx, &target, body.repositories.as_deref()).await? {
+        Ok(repositories) => repositories,
         Err(stop) => return Ok(Err(stop)),
     };
     // A keyring that does not load is the Worker's fault: 500, with the
@@ -404,12 +493,13 @@ async fn put_secret(
         owner: target.owner,
         name: &name,
     };
-    let sealed = secrets::seal(&keyring.current, &aad, nonce, &value);
+    let sealed = secrets::seal(&keyring.current, &aad, nonce, &body.value);
     let max = limit(target.owner != Owner::Org);
     let put = store::put_secret(
         cx.db,
         &target.tenant,
         target.owner,
+        repositories.as_deref(),
         &name,
         &keyring.current.id,
         &sealed,
@@ -435,8 +525,12 @@ async fn put_var(
         Ok(name) => name,
         Err(stop) => return Ok(Err(stop)),
     };
-    let value = match parse_value(&req.bytes().await?, max_body) {
-        Ok(value) => value,
+    let body = match parse_body(&req.bytes().await?, max_body) {
+        Ok(body) => body,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let repositories = match selection(cx, &target, body.repositories.as_deref()).await? {
+        Ok(repositories) => repositories,
         Err(stop) => return Ok(Err(stop)),
     };
     let max = limit(target.owner != Owner::Org);
@@ -444,8 +538,9 @@ async fn put_var(
         cx.db,
         &target.tenant,
         target.owner,
+        repositories.as_deref(),
         &name,
-        &value,
+        &body.value,
         max,
         now_ms(),
     )
@@ -504,6 +599,10 @@ mod tests {
             settings_route("orgs/acme/vars", &Method::Get),
             Some(SettingsRoute::Vars(scope))
         );
+        assert_eq!(
+            settings_route("orgs/acme/repositories", &Method::Get),
+            Some(SettingsRoute::Repositories { org })
+        );
         let repo = Scope::Repo {
             owner: "acme",
             repo: "api",
@@ -522,6 +621,7 @@ mod tests {
     fn other_paths_and_methods_have_no_route() {
         for (path, method) in [
             ("orgs/acme/billing", Method::Post),
+            ("orgs/acme/repositories", Method::Put),
             ("orgs/acme/billing/checkout", Method::Post),
             ("orgs/acme/billing/portal", Method::Post),
             ("orgs/acme/billing/cap", Method::Post),
@@ -545,7 +645,7 @@ mod tests {
     #[test]
     fn value_too_large() {
         let body = format!(r#"{{"value":"{}"}}"#, "a".repeat(49_153));
-        let Err(Stop(status, message, _)) = parse_value(body.as_bytes(), 128 << 10) else {
+        let Err(Stop(status, message, _)) = parse_body(body.as_bytes(), 128 << 10) else {
             panic!("accepted");
         };
         assert_eq!(
@@ -553,7 +653,7 @@ mod tests {
             (413, "Values are at most 48 KB")
         );
         let body = format!(r#"{{"value":"{}"}}"#, "a".repeat(48 * 1024));
-        assert!(parse_value(body.as_bytes(), 128 << 10).is_ok());
+        assert!(parse_body(body.as_bytes(), 128 << 10).is_ok());
     }
 
     #[test]
@@ -561,8 +661,8 @@ mod tests {
         // Each quote is two bytes in JSON: about 96 KiB on the wire.
         let body = format!(r#"{{"value":"{}"}}"#, "\\\"".repeat(48 * 1024));
         assert!(body.len() > 96 * 1024 && body.len() <= 128 << 10);
-        let value = parse_value(body.as_bytes(), 128 << 10).unwrap();
-        assert_eq!(value.len(), 48 * 1024);
+        let parsed = parse_body(body.as_bytes(), 128 << 10).unwrap();
+        assert_eq!(parsed.value.len(), 48 * 1024);
     }
 
     #[test]
@@ -572,16 +672,39 @@ mod tests {
             b"nope",
             br#"{"value":"x","extra":1}"#,
         ] {
-            let Err(Stop(status, message, _)) = parse_value(body, 128 << 10) else {
+            let Err(Stop(status, message, _)) = parse_body(body, 128 << 10) else {
                 panic!("accepted");
             };
             assert_eq!(status, 400);
             assert!(message.starts_with("expected") || message == "Values cannot be empty");
         }
-        let Err(Stop(status, ..)) = parse_value(&[b' '; 200], 100) else {
+        let Err(Stop(status, ..)) = parse_body(&[b' '; 200], 100) else {
             panic!("accepted");
         };
         assert_eq!(status, 413);
+    }
+
+    #[test]
+    fn bodies_with_repositories() {
+        let parse = |body: &str| parse_body(body.as_bytes(), 128 << 10);
+        assert_eq!(
+            parse(r#"{"value":"x","repositories":["a/b"]}"#)
+                .unwrap()
+                .repositories,
+            Some(vec!["a/b".to_owned()])
+        );
+        assert_eq!(
+            parse(r#"{"value":"x","repositories":null}"#)
+                .unwrap()
+                .repositories,
+            None
+        );
+        assert_eq!(parse(r#"{"value":"x"}"#).unwrap().repositories, None);
+        let Err(Stop(status, message, _)) = parse(r#"{"value":"x","repositories":"a/b"}"#) else {
+            panic!("accepted");
+        };
+        assert_eq!(status, 400);
+        assert!(message.starts_with("expected"));
     }
 
     #[test]

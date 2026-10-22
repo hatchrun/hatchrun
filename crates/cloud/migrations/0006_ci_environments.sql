@@ -45,3 +45,10 @@ ALTER TABLE ci_jobs
 ALTER TABLE ci_jobs DROP CONSTRAINT ci_jobs_held_check,
   ADD CONSTRAINT ci_jobs_held_check
     CHECK (held IN ('card', 'spend_cap', 'concurrency', 'approval'));
+
+-- An organization secret or var reaches every repository (NULL) or the
+-- ci_repos ids listed.
+ALTER TABLE ci_secrets ADD COLUMN repositories bigint[]
+  CHECK (repositories IS NULL OR (repo_id IS NULL AND cardinality(repositories) <= 1000));
+ALTER TABLE ci_vars ADD COLUMN repositories bigint[]
+  CHECK (repositories IS NULL OR (repo_id IS NULL AND cardinality(repositories) <= 1000));

@@ -1650,11 +1650,13 @@ pub enum Put {
 }
 
 /// Stores secret `$4` of tenant `$1`, repository `$2` and environment
-/// `$3` ($7 is the limit, $8 the time). A new name is refused at the
-/// limit; replacing one never is. Returns a row when it stored.
+/// `$3` ($7 is the limit, $8 the time, $9 the repositories an
+/// organization secret reaches as text like `{1,2}`, or NULL for all). A
+/// new name is refused at the limit; replacing one never is. Returns a
+/// row when it stored.
 const PUT_SECRET: &str = "INSERT INTO ci_secrets \
-       (tenant_id, repo_id, environment_id, name, key_id, sealed, updated_at) \
-     SELECT $1, $2::bigint, $3::bigint, $4, $5, $6, $8 \
+       (tenant_id, repo_id, environment_id, name, key_id, sealed, updated_at, repositories) \
+     SELECT $1, $2::bigint, $3::bigint, $4, $5, $6, $8, $9::bigint[] \
      WHERE EXISTS (SELECT 1 FROM ci_secrets WHERE tenant_id = $1 \
          AND repo_id IS NOT DISTINCT FROM $2::bigint \
          AND environment_id IS NOT DISTINCT FROM $3::bigint AND name = $4) \
@@ -1662,14 +1664,15 @@ const PUT_SECRET: &str = "INSERT INTO ci_secrets \
          AND repo_id IS NOT DISTINCT FROM $2::bigint \
          AND environment_id IS NOT DISTINCT FROM $3::bigint) < $7 \
      ON CONFLICT (tenant_id, repo_id, environment_id, name) DO UPDATE SET \
-       key_id = EXCLUDED.key_id, sealed = EXCLUDED.sealed, updated_at = EXCLUDED.updated_at \
+       key_id = EXCLUDED.key_id, sealed = EXCLUDED.sealed, updated_at = EXCLUDED.updated_at, \
+       repositories = EXCLUDED.repositories \
      RETURNING 1 AS saved";
 
-/// As [`PUT_SECRET`], for a var with value `$5`; `$6` is the limit and
-/// `$7` the time.
+/// As [`PUT_SECRET`], for a var with value `$5`; `$6` is the limit,
+/// `$7` the time and `$8` the repositories.
 const PUT_VAR: &str = "INSERT INTO ci_vars \
-       (tenant_id, repo_id, environment_id, name, value, updated_at) \
-     SELECT $1, $2::bigint, $3::bigint, $4, $5, $7 \
+       (tenant_id, repo_id, environment_id, name, value, updated_at, repositories) \
+     SELECT $1, $2::bigint, $3::bigint, $4, $5, $7, $8::bigint[] \
      WHERE EXISTS (SELECT 1 FROM ci_vars WHERE tenant_id = $1 \
          AND repo_id IS NOT DISTINCT FROM $2::bigint \
          AND environment_id IS NOT DISTINCT FROM $3::bigint AND name = $4) \
@@ -1677,7 +1680,8 @@ const PUT_VAR: &str = "INSERT INTO ci_vars \
          AND repo_id IS NOT DISTINCT FROM $2::bigint \
          AND environment_id IS NOT DISTINCT FROM $3::bigint) < $6 \
      ON CONFLICT (tenant_id, repo_id, environment_id, name) DO UPDATE SET \
-       value = EXCLUDED.value, updated_at = EXCLUDED.updated_at \
+       value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, \
+       repositories = EXCLUDED.repositories \
      RETURNING 1 AS saved";
 
 /// What [`PUT_SECRET`] and [`PUT_VAR`] return.
@@ -1696,9 +1700,19 @@ async fn put(db: &Db, tenant: &str, sql: &str, bound: &[Param]) -> Result<Put> {
     })
 }
 
+/// `repositories` as the text of a Postgres array, `None` for NULL.
+fn array_text(repositories: Option<&[u64]>) -> Option<String> {
+    repositories.map(|ids| {
+        let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
+        format!("{{{}}}", ids.join(","))
+    })
+}
+
 /// Stores the sealed value of secret `name`, replacing the old one.
 /// A new name is refused with [`Put::TooMany`] when the scope already
-/// holds `limit` secrets.
+/// holds `limit` secrets. `repositories` limits an organization secret
+/// to those `ci_repos` ids; `None` reaches every repository. Only an
+/// organization row may have it (the table refuses the rest).
 ///
 /// # Errors
 ///
@@ -1708,6 +1722,7 @@ pub async fn put_secret(
     db: &Db,
     tenant: &str,
     owner: Owner,
+    repositories: Option<&[u64]>,
     name: &str,
     key_id: &str,
     sealed: &str,
@@ -1726,7 +1741,8 @@ pub async fn put_secret(
             key_id,
             sealed,
             limit,
-            now
+            now,
+            array_text(repositories)
         ],
     )
     .await
@@ -1748,28 +1764,79 @@ pub async fn delete_secret(db: &Db, tenant: &str, owner: Owner, name: &str) -> R
     .map(|n| n > 0)
 }
 
-/// A secret's name and when it was last set. Never the value.
+/// The names of the repositories an organization row reaches: a JSON
+/// array of `ci_repos.full_name`, or NULL when it reaches all of them.
+/// For a query that aliases the secrets or vars table as `s`.
+const REPOSITORY_NAMES: &str = "CASE WHEN s.repositories IS NULL THEN NULL ELSE \
+       COALESCE((SELECT json_agg(r.full_name ORDER BY lower(r.full_name)) FROM ci_repos r \
+         WHERE r.id = ANY (s.repositories) AND r.tenant_id = s.tenant_id), \
+         '[]'::json)::text END AS repositories";
+
+/// A listed secret: never its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretItem {
+    /// The name.
+    pub name: String,
+    /// When it was last set.
+    pub updated_at: u64,
+    /// The repositories an organization secret reaches, `None` for all.
+    pub repositories: Option<Vec<String>>,
+}
+
+/// A listed var.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarItem {
+    /// The name.
+    pub name: String,
+    /// The value.
+    pub value: String,
+    /// When it was last set.
+    pub updated_at: u64,
+    /// The repositories an organization var reaches, `None` for all.
+    pub repositories: Option<Vec<String>>,
+}
+
+/// The names in a row's `repositories` column.
+fn repository_list(text: Option<&str>) -> Result<Option<Vec<String>>> {
+    Ok(match text {
+        Some(text) => Some(serde_json::from_str(text)?),
+        None => None,
+    })
+}
+
 #[derive(Deserialize)]
 struct NameRow {
     name: String,
     updated_at: u64,
+    repositories: Option<String>,
 }
 
-/// The names of a scope's secrets, with the time each was set.
+/// A scope's secrets: names and times, never values.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn secret_names(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<(String, u64)>> {
+pub async fn secret_names(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<SecretItem>> {
+    let sql = format!(
+        "SELECT s.name, s.updated_at, {REPOSITORY_NAMES} FROM ci_secrets s \
+         WHERE s.tenant_id = $1 AND s.repo_id IS NOT DISTINCT FROM $2::bigint \
+         AND s.environment_id IS NOT DISTINCT FROM $3::bigint ORDER BY s.name"
+    );
     let rows: Vec<NameRow> = db
         .all(
-            "SELECT name, updated_at FROM ci_secrets WHERE tenant_id = $1 \
-             AND repo_id IS NOT DISTINCT FROM $2::bigint \
-             AND environment_id IS NOT DISTINCT FROM $3::bigint ORDER BY name",
+            &sql,
             &params![tenant, owner.repo_id(), owner.environment_id()],
         )
         .await?;
-    Ok(rows.into_iter().map(|r| (r.name, r.updated_at)).collect())
+    rows.into_iter()
+        .map(|r| {
+            Ok(SecretItem {
+                name: r.name,
+                updated_at: r.updated_at,
+                repositories: repository_list(r.repositories.as_deref())?,
+            })
+        })
+        .collect()
 }
 
 /// A sealed secret as stored.
@@ -1806,8 +1873,8 @@ impl std::fmt::Debug for SealedRow {
     }
 }
 
-/// The organization's, repository `repo_id`'s and (when set) environment
-/// `environment_id`'s sealed secrets, named in `names` or all of them
+/// The organization's (those reaching the repository), repository
+/// `repo_id`'s and (when set) environment `environment_id`'s sealed secrets, named in `names` or all of them
 /// when `None`, ordered by name, then organization, repository,
 /// environment. Every row of a name is returned, so a caller that
 /// inserts them in order lets the most specific win.
@@ -1823,7 +1890,9 @@ pub async fn sealed_secrets(
     names: Option<&[String]>,
 ) -> Result<Vec<SealedRow>> {
     let mut sql = "SELECT repo_id, environment_id, name, key_id, sealed FROM ci_secrets \
-                   WHERE tenant_id = $1 AND (repo_id IS NULL OR (repo_id = $2 \
+                   WHERE tenant_id = $1 AND ((repo_id IS NULL \
+                   AND (repositories IS NULL OR $2::bigint = ANY (repositories))) \
+                   OR (repo_id = $2 \
                    AND (environment_id IS NULL OR environment_id = $3::bigint)))"
         .to_owned();
     let mut bound = params![tenant, repo_id, environment_id];
@@ -1841,14 +1910,17 @@ pub async fn sealed_secrets(
 
 /// Stores var `name`, replacing the old value. A new name is refused
 /// with [`Put::TooMany`] when the scope already holds `limit` vars.
+/// `repositories` is as for [`put_secret`].
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
+#[allow(clippy::too_many_arguments)] // one column each
 pub async fn put_var(
     db: &Db,
     tenant: &str,
     owner: Owner,
+    repositories: Option<&[u64]>,
     name: &str,
     value: &str,
     limit: u32,
@@ -1865,7 +1937,8 @@ pub async fn put_var(
             name,
             value,
             limit,
-            now
+            now,
+            array_text(repositories)
         ],
     )
     .await
@@ -1892,30 +1965,46 @@ struct VarRow {
     name: String,
     value: String,
     updated_at: u64,
+    repositories: Option<String>,
 }
 
-/// The vars of a scope: name, value and when each was set, by name.
+/// The vars of a scope, by name.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn vars(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<(String, String, u64)>> {
+pub async fn vars(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<VarItem>> {
+    let sql = format!(
+        "SELECT s.name, s.value, s.updated_at, {REPOSITORY_NAMES} FROM ci_vars s \
+         WHERE s.tenant_id = $1 AND s.repo_id IS NOT DISTINCT FROM $2::bigint \
+         AND s.environment_id IS NOT DISTINCT FROM $3::bigint ORDER BY s.name"
+    );
     let rows: Vec<VarRow> = db
         .all(
-            "SELECT name, value, updated_at FROM ci_vars WHERE tenant_id = $1 \
-             AND repo_id IS NOT DISTINCT FROM $2::bigint \
-             AND environment_id IS NOT DISTINCT FROM $3::bigint ORDER BY name",
+            &sql,
             &params![tenant, owner.repo_id(), owner.environment_id()],
         )
         .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| (r.name, r.value, r.updated_at))
-        .collect())
+    rows.into_iter()
+        .map(|r| {
+            Ok(VarItem {
+                name: r.name,
+                value: r.value,
+                updated_at: r.updated_at,
+                repositories: repository_list(r.repositories.as_deref())?,
+            })
+        })
+        .collect()
 }
 
-/// The organization's vars overlaid with repository `repo_id`'s, then
-/// with environment `environment_id`'s.
+#[derive(Deserialize)]
+struct JobVar {
+    name: String,
+    value: String,
+}
+
+/// The organization's vars that reach repository `repo_id`, overlaid
+/// with the repository's, then with environment `environment_id`'s.
 ///
 /// # Errors
 ///
@@ -1926,16 +2015,71 @@ pub async fn job_vars(
     repo_id: u64,
     environment_id: Option<u64>,
 ) -> Result<BTreeMap<String, String>> {
-    let rows: Vec<VarRow> = db
+    let rows: Vec<JobVar> = db
         .all(
-            "SELECT name, value, updated_at FROM ci_vars WHERE tenant_id = $1 \
-             AND (repo_id IS NULL OR (repo_id = $2 \
+            "SELECT name, value FROM ci_vars WHERE tenant_id = $1 \
+             AND ((repo_id IS NULL \
+               AND (repositories IS NULL OR $2::bigint = ANY (repositories))) \
+               OR (repo_id = $2 \
                AND (environment_id IS NULL OR environment_id = $3::bigint))) \
              ORDER BY repo_id NULLS FIRST, environment_id NULLS FIRST",
             &params![tenant, repo_id, environment_id],
         )
         .await?;
     Ok(rows.into_iter().map(|r| (r.name, r.value)).collect())
+}
+
+#[derive(Deserialize)]
+struct RepoName {
+    full_name: String,
+}
+
+#[derive(Deserialize)]
+struct RepoId {
+    full_name: String,
+    id: u64,
+}
+
+/// The tenant's repositories CI has seen, by `lower(full_name)`, without
+/// names that hold `#gone-`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn tenant_repos(db: &Db, tenant: &str) -> Result<Vec<String>> {
+    let rows: Vec<RepoName> = db
+        .all(
+            "SELECT full_name FROM ci_repos WHERE tenant_id = $1 \
+             AND position('#gone-' in full_name) = 0 ORDER BY lower(full_name)",
+            &params![tenant],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| r.full_name).collect())
+}
+
+/// The ids of the tenant's repositories named in `names` (ignoring case),
+/// as (name as stored, id).
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn repo_ids(db: &Db, tenant: &str, names: &[String]) -> Result<Vec<(String, u64)>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let marks: Vec<String> = (2..2 + names.len())
+        .map(|n| format!("lower(${n})"))
+        .collect();
+    let sql = format!(
+        "SELECT full_name, id FROM ci_repos WHERE tenant_id = $1 \
+         AND lower(full_name) IN ({}) AND position('#gone-' in full_name) = 0 \
+         ORDER BY lower(full_name)",
+        marks.join(", ")
+    );
+    let mut bound = params![tenant];
+    bound.extend(names.iter().map(|name| Param::from(name.as_str())));
+    let rows: Vec<RepoId> = db.all(&sql, &bound).await?;
+    Ok(rows.into_iter().map(|r| (r.full_name, r.id)).collect())
 }
 
 /// A secret sealed with a key other than the current one.
@@ -4095,14 +4239,24 @@ mod tests {
 
     fn put_var_ok(db: &TestDb, owner: Owner, name: &str, value: &str) {
         let put = db
-            .wait(put_var(db.db(), "t1", owner, name, value, 100, 5))
+            .wait(put_var(db.db(), "t1", owner, None, name, value, 100, 5))
             .unwrap();
         assert_eq!(put, Put::Saved);
     }
 
     fn put_secret_ok(db: &TestDb, owner: Owner, name: &str, key: &str, sealed: &str) {
         let put = db
-            .wait(put_secret(db.db(), "t1", owner, name, key, sealed, 100, 5))
+            .wait(put_secret(
+                db.db(),
+                "t1",
+                owner,
+                None,
+                name,
+                key,
+                sealed,
+                100,
+                5,
+            ))
             .unwrap();
         assert_eq!(put, Put::Saved);
     }
@@ -4132,7 +4286,7 @@ mod tests {
         assert_eq!(vars["A"], "1");
     }
 
-    async fn vars_of(db: &Db, owner: Owner) -> Result<Vec<(String, String, u64)>> {
+    async fn vars_of(db: &Db, owner: Owner) -> Result<Vec<VarItem>> {
         vars(db, "t1", owner).await
     }
 
@@ -4144,6 +4298,7 @@ mod tests {
                 db.db(),
                 "t1",
                 Owner::Org,
+                None,
                 name,
                 "k",
                 "s",
@@ -4165,6 +4320,7 @@ mod tests {
                 db.db(),
                 "t1",
                 Owner::Repo(7),
+                None,
                 "C",
                 "k",
                 "s",
@@ -4175,7 +4331,7 @@ mod tests {
         assert_eq!(repo, Put::Saved);
         // And the same for vars.
         let var = |name: &str| {
-            db.wait(put_var(db.db(), "t1", Owner::Org, name, "v", 1, 5))
+            db.wait(put_var(db.db(), "t1", Owner::Org, None, name, "v", 1, 5))
                 .unwrap()
         };
         assert_eq!(var("A"), Put::Saved);
@@ -4481,6 +4637,7 @@ mod tests {
                 db.db(),
                 "t1",
                 Owner::Repo(7),
+                None,
                 "R",
                 "k",
                 "s",
@@ -4562,5 +4719,208 @@ mod tests {
             db.wait(job(db.db(), id)).unwrap().unwrap().environment,
             None
         );
+    }
+
+    /// Repositories 8 (acme/web) and 9 (acme/lib) join repo 7 (acme/app).
+    fn with_repos() -> TestDb {
+        let db = setup();
+        for (id, name) in [(8, "acme/web"), (9, "acme/lib")] {
+            let repo = RepoRow {
+                id,
+                tenant_id: "t1".into(),
+                installation_id: 99,
+                full_name: name.into(),
+                default_branch: "main".into(),
+                private: false,
+            };
+            db.wait(upsert_repo(db.db(), &repo, 2)).unwrap();
+        }
+        db
+    }
+
+    fn put_selected(db: &TestDb, kind: &str, name: &str, repos: Option<&[u64]>) {
+        let put = if kind == "secret" {
+            db.wait(put_secret(
+                db.db(),
+                "t1",
+                Owner::Org,
+                repos,
+                name,
+                "k",
+                name,
+                100,
+                5,
+            ))
+        } else {
+            db.wait(put_var(
+                db.db(),
+                "t1",
+                Owner::Org,
+                repos,
+                name,
+                name,
+                100,
+                5,
+            ))
+        };
+        assert_eq!(put.unwrap(), Put::Saved);
+    }
+
+    fn secret_values(db: &TestDb, repo_id: u64) -> Vec<String> {
+        db.wait(sealed_secrets(db.db(), "t1", repo_id, None, None))
+            .unwrap()
+            .into_iter()
+            .map(|row| row.sealed)
+            .collect()
+    }
+
+    fn var_names(db: &TestDb, repo_id: u64) -> Vec<String> {
+        db.wait(job_vars(db.db(), "t1", repo_id, None))
+            .unwrap()
+            .into_keys()
+            .collect()
+    }
+
+    #[test]
+    fn selected_org_rows_reach_only_their_repos() {
+        let db = with_repos();
+        for kind in ["secret", "var"] {
+            put_selected(&db, kind, "A", Some(&[8]));
+            put_selected(&db, kind, "B", None);
+        }
+        assert_eq!(secret_values(&db, 7), ["B"]);
+        assert_eq!(secret_values(&db, 8), ["A", "B"]);
+        assert_eq!(var_names(&db, 7), ["B"]);
+        assert_eq!(var_names(&db, 8), ["A", "B"]);
+        // The names filter goes through the same rule.
+        let names = vec!["A".to_owned()];
+        let rows = db
+            .wait(sealed_secrets(db.db(), "t1", 7, None, Some(&names)))
+            .unwrap();
+        assert_eq!(rows, []);
+    }
+
+    #[test]
+    fn an_empty_selection_reaches_no_repo() {
+        let db = with_repos();
+        put_selected(&db, "secret", "A", Some(&[]));
+        put_selected(&db, "var", "A", Some(&[]));
+        for repo_id in [7, 8] {
+            assert_eq!(secret_values(&db, repo_id), Vec::<String>::new());
+            assert_eq!(var_names(&db, repo_id), Vec::<String>::new());
+        }
+        let listed = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
+        assert_eq!(listed[0].repositories, Some(Vec::new()));
+    }
+
+    #[test]
+    fn selection_never_crosses_tenants() {
+        let db = setup();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 100, 0, 0)",
+            &[],
+        );
+        let foreign = RepoRow {
+            id: 9,
+            tenant_id: "t2".into(),
+            installation_id: 100,
+            full_name: "other/x".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        db.wait(upsert_repo(db.db(), &foreign, 2)).unwrap();
+        put_selected(&db, "secret", "A", Some(&[9]));
+        put_selected(&db, "var", "A", Some(&[9]));
+        let rows = db
+            .wait(sealed_secrets(db.db(), "t2", 9, None, None))
+            .unwrap();
+        assert_eq!(rows, []);
+        assert_eq!(
+            db.wait(job_vars(db.db(), "t2", 9, None)).unwrap(),
+            BTreeMap::new()
+        );
+        let listed = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
+        assert_eq!(listed[0].repositories, Some(Vec::new()));
+        let listed = db.wait(vars(db.db(), "t1", Owner::Org)).unwrap();
+        assert_eq!(listed[0].repositories, Some(Vec::new()));
+    }
+
+    #[test]
+    fn listing_names_the_selected_repos() {
+        let db = with_repos();
+        put_selected(&db, "secret", "A", Some(&[8, 7]));
+        put_selected(&db, "secret", "B", None);
+        put_selected(&db, "var", "A", Some(&[8, 7]));
+        put_selected(&db, "var", "B", None);
+        let both = Some(vec!["acme/app".to_owned(), "acme/web".to_owned()]);
+        let secrets = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
+        assert_eq!(secrets[0].repositories, both);
+        assert_eq!(secrets[1].repositories, None);
+        let listed = db.wait(vars(db.db(), "t1", Owner::Org)).unwrap();
+        assert_eq!(listed[0].repositories, both);
+        assert_eq!(listed[1].repositories, None);
+        // A replacing put can widen the selection again.
+        put_selected(&db, "secret", "A", None);
+        let secrets = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
+        assert_eq!(secrets[0].repositories, None);
+    }
+
+    #[test]
+    fn a_repo_row_cannot_select_repos() {
+        let db = with_repos();
+        for table in ["ci_secrets", "ci_vars"] {
+            let sql = if table == "ci_secrets" {
+                "INSERT INTO ci_secrets (tenant_id, repo_id, name, key_id, sealed, updated_at, \
+                 repositories) VALUES ('t1', 7, 'A', 'k', 's', 1, '{7}')"
+            } else {
+                "INSERT INTO ci_vars (tenant_id, repo_id, name, value, updated_at, \
+                 repositories) VALUES ('t1', 7, 'A', 'v', 1, '{7}')"
+            };
+            assert!(db.try_run(sql, &[]).is_err(), "{table}");
+        }
+        // Through the store too: an environment row is a repo_id row.
+        let put = db.wait(put_var(
+            db.db(),
+            "t1",
+            Owner::Repo(7),
+            Some(&[8]),
+            "A",
+            "v",
+            100,
+            5,
+        ));
+        assert!(put.is_err());
+    }
+
+    #[test]
+    fn tenant_repos_leaves_out_gone_names() {
+        let db = with_repos();
+        // Repo 7 takes the name of a new repository 10, and 7 is renamed away.
+        let fresh = RepoRow {
+            id: 10,
+            tenant_id: "t1".into(),
+            installation_id: 99,
+            full_name: "acme/app".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        db.wait(upsert_repo(db.db(), &fresh, 3)).unwrap();
+        let names = db.wait(tenant_repos(db.db(), "t1")).unwrap();
+        assert_eq!(names, ["acme/app", "acme/lib", "acme/web"]);
+        assert_eq!(
+            db.wait(tenant_repos(db.db(), "t2")).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn repo_ids_ignore_case() {
+        let db = with_repos();
+        let names = vec!["ACME/APP".to_owned(), "acme/nope".to_owned()];
+        let found = db.wait(repo_ids(db.db(), "t1", &names)).unwrap();
+        assert_eq!(found, [("acme/app".to_owned(), 7)]);
+        assert_eq!(db.wait(repo_ids(db.db(), "t1", &[])).unwrap(), []);
+        assert_eq!(db.wait(repo_ids(db.db(), "t2", &names)).unwrap(), []);
     }
 }

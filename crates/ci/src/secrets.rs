@@ -30,6 +30,8 @@ pub const MAX_VALUE_BYTES: usize = 48 * 1024;
 pub const MAX_PER_REPO: u32 = 100;
 /// The most secrets, and the most vars, one organization holds.
 pub const MAX_PER_ORG: u32 = 1_000;
+/// The most repositories an organization secret or variable may select.
+pub const MAX_SELECTED_REPOS: usize = 1_000;
 /// The longest name.
 pub const NAME_MAX: usize = 100;
 /// Bytes of an AES-GCM nonce.
