@@ -45,6 +45,8 @@ pub struct TenantRow {
     pub org_login: String,
     /// Whether the tenant has a card for CI.
     pub ci_billing: CiBilling,
+    /// How many days the tenant's runs, logs and state are kept: 30 or 90.
+    pub retention_days: u32,
 }
 
 /// A repository CI has seen.
@@ -121,6 +123,9 @@ pub struct RunRow {
     pub created_at: u64,
     /// When the run finished.
     pub completed_at: Option<u64>,
+    /// How many days the run is kept, as its tenant's retention was when
+    /// the run was recorded. It names the tier of the run's R2 keys.
+    pub retention_days: u32,
 }
 
 /// A job to record, from a planned job.
@@ -213,7 +218,8 @@ fn json_text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<serde_json:
 
 /// The columns of a [`RunRow`].
 const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, \
-     event, ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at";
+     event, ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at, \
+     (expires_at - created_at) / 86400000 AS retention_days";
 
 /// The columns of a [`JobRow`].
 const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instance_id, attempt, \
@@ -223,14 +229,18 @@ const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instan
 
 /// The columns of a [`TenantRow`]. `ci_billing` is `active` for an
 /// active or trialing CI subscription, `lapsed` for another CI
-/// subscription, `never` for none.
+/// subscription, `never` for none. `retention_days` is the tier: 30, or 90
+/// for a tenant whose `retention_days` (shared with hatchrun.io, 1 to 90)
+/// is above 30. R2 lifecycle rules exist per tier, so CI keeps for 30 or
+/// 90 days and nothing between.
 const TENANT_COLUMNS: &str = "id, org_login, CASE \
      WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
      AND subscriptions.product = 'ci' AND subscriptions.status IN ('active', 'trialing')) \
      THEN 'active' \
      WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
      AND subscriptions.product = 'ci') THEN 'lapsed' \
-     ELSE 'never' END AS ci_billing";
+     ELSE 'never' END AS ci_billing, \
+     CASE WHEN retention_days > 30 THEN 90 ELSE 30 END AS retention_days";
 
 /// The tenant of installation `$1`, where `{columns}` is
 /// [`TENANT_COLUMNS`].
@@ -285,8 +295,9 @@ const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE
 
 /// Records a run and takes its number in one statement, run after
 /// [`LOCK_REPO`]. Binds `$1` tenant, `$2` repository, `$3` workflow,
-/// `$4` delivery, `$5` event, `$6` ref, `$7` sha, `$8` actor, `$9` now
-/// and `$10` the expiry. The number is taken only when no run of this
+/// `$4` delivery, `$5` event, `$6` ref, `$7` sha, `$8` actor and `$9`
+/// now. The run expires after its tenant's retention tier (30 or 90 days), read
+/// in the same statement. The number is taken only when no run of this
 /// delivery and workflow exists, so a duplicate leaves the counter
 /// alone, and the statement returns no row for it.
 const INSERT_RUN: &str = "WITH n AS (\
@@ -297,9 +308,12 @@ const INSERT_RUN: &str = "WITH n AS (\
        RETURNING last) \
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
        actor, status, created_at, updated_at, expires_at) \
-     SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, 'queued', $9, $9, $10 FROM n \
+     SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, 'queued', $9, $9, \
+       $9 + (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END * 86400000::bigint \
+         FROM tenants WHERE id = $1) FROM n \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
-       ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at";
+       ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at, \
+       (expires_at - created_at) / 86400000 AS retention_days";
 
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
@@ -888,8 +902,7 @@ pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>> {
             &run.git_ref,
             &run.sha,
             &run.actor,
-            run.now,
-            run.now + RETENTION_MS
+            run.now
         ],
     )
     .await
@@ -2166,6 +2179,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expires, 5 + 30 * DAY);
+    }
+
+    #[test]
+    fn expiry_follows_the_tenant() {
+        let db = setup();
+        let expires = |run: &RunRow| -> u64 {
+            db.column(
+                "SELECT expires_at AS n FROM ci_runs WHERE id = $1",
+                &params![run.id],
+                "n",
+            )
+            .unwrap()
+        };
+        let short = db
+            .wait(insert_run(db.db(), &new_run("a", "ci", 5)))
+            .unwrap()
+            .unwrap();
+        assert_eq!((expires(&short), short.retention_days), (5 + 30 * DAY, 30));
+        db.run(
+            "UPDATE tenants SET retention_days = 90 WHERE id = 't1'",
+            &[],
+        );
+        let long = db
+            .wait(insert_run(db.db(), &new_run("b", "ci", 5)))
+            .unwrap()
+            .unwrap();
+        assert_eq!((expires(&long), long.retention_days), (5 + 90 * DAY, 90));
+        let found = db.wait(run(db.db(), long.id)).unwrap().unwrap();
+        assert_eq!(found.retention_days, 90);
+        let tenant = db.wait(tenant(db.db(), "t1")).unwrap().unwrap();
+        assert_eq!(tenant.retention_days, 90);
+    }
+
+    #[test]
+    fn retention_days_is_30_or_90() {
+        let db = setup();
+        // hatchrun.io lets a tenant keep 1 to 90 days; CI has two tiers.
+        for (set, tier) in [(1, 30), (30, 30), (31, 90), (60, 90), (90, 90)] {
+            db.run(
+                "UPDATE tenants SET retention_days = $1 WHERE id = 't1'",
+                &params![set],
+            );
+            let tenant = db.wait(tenant(db.db(), "t1")).unwrap().unwrap();
+            assert_eq!(tenant.retention_days, tier, "{set} days");
+            let made = db
+                .wait(insert_run(db.db(), &new_run(&format!("r{set}"), "ci", 5)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(made.retention_days, tier, "{set} days");
+        }
     }
 
     #[test]

@@ -365,8 +365,8 @@ fn dispatch_event(
 
 /// Whether a log or index key belongs to this run, so a row can never
 /// lead the Worker to another tenant's object.
-fn owns_key(key: &str, tenant: &str, repo_id: u64, run_id: u64) -> bool {
-    key.starts_with(&format!("logs/{tenant}/{repo_id}/{run_id}/")) && !key.contains("..")
+fn owns_key(key: &str, days: u32, tenant: &str, repo_id: u64, run_id: u64) -> bool {
+    key.starts_with(&format!("logs/{days}d/{tenant}/{repo_id}/{run_id}/")) && !key.contains("..")
 }
 
 /// The index that belongs to a log key.
@@ -678,7 +678,10 @@ impl Cx<'_> {
     /// The run's object's view of it. A run that is not held, or an
     /// object that does not answer, leaves the rows to speak.
     async fn state(&self, run: &RunRow) -> Option<RunState> {
-        let path = format!("/state?run={}&tenant={}", run.id, run.tenant_id);
+        let path = format!(
+            "/state?run={}&tenant={}&days={}",
+            run.id, run.tenant_id, run.retention_days
+        );
         let mut response = match call(self.env, run.id, Method::Get, &path).await {
             Ok(response) => response,
             Err(err) => {
@@ -706,7 +709,13 @@ impl Cx<'_> {
         if job.status == "completed"
             && let Some(key) = job.log_key.as_deref()
         {
-            if !owns_key(key, &found.run.tenant_id, found.repo.id, found.run.id) {
+            if !owns_key(
+                key,
+                found.run.retention_days,
+                &found.run.tenant_id,
+                found.repo.id,
+                found.run.id,
+            ) {
                 console_error!(
                     "job {job_id}: log key {key} is outside run {}",
                     found.run.id
@@ -734,7 +743,15 @@ impl Cx<'_> {
             .as_deref()
             .filter(|_| job.status == "completed")
             .and_then(index_of)
-            .filter(|key| owns_key(key, &found.run.tenant_id, found.repo.id, found.run.id));
+            .filter(|key| {
+                owns_key(
+                    key,
+                    found.run.retention_days,
+                    &found.run.tenant_id,
+                    found.repo.id,
+                    found.run.id,
+                )
+            });
         let Some(key) = key else {
             return Ok(stop(404, "no index"));
         };
@@ -1251,15 +1268,30 @@ workflows:
     }
 
     #[test]
+    fn log_keys_have_the_tier() {
+        assert_eq!(
+            logs::log_key(30, "t1", 5, 7, 9, 1),
+            "logs/30d/t1/5/7/9/1.log.gz"
+        );
+    }
+
+    #[test]
     fn log_keys_stay_inside_the_run() {
-        let key = logs::log_key("t1", 5, 7, 9, 2);
-        assert!(owns_key(&key, "t1", 5, 7));
-        assert!(!owns_key(&key, "t2", 5, 7));
-        assert!(!owns_key(&key, "t1", 6, 7));
-        assert!(!owns_key(&key, "t1", 5, 70));
-        assert!(!owns_key("logs/t1/5/7/../../8/9/1.log.gz", "t1", 5, 7));
-        assert_eq!(index_of(&key), Some(logs::index_key("t1", 5, 7, 9, 2)));
-        assert_eq!(index_of("logs/t1/5/7/9/2.index.json"), None);
+        let key = logs::log_key(30, "t1", 5, 7, 9, 2);
+        assert!(owns_key(&key, 30, "t1", 5, 7));
+        assert!(!owns_key(&key, 90, "t1", 5, 7));
+        assert!(!owns_key(&key, 30, "t2", 5, 7));
+        assert!(!owns_key(&key, 30, "t1", 6, 7));
+        assert!(!owns_key(&key, 30, "t1", 5, 70));
+        assert!(!owns_key(
+            "logs/30d/t1/5/7/../../8/9/1.log.gz",
+            30,
+            "t1",
+            5,
+            7
+        ));
+        assert_eq!(index_of(&key), Some(logs::index_key(30, "t1", 5, 7, 9, 2)));
+        assert_eq!(index_of("logs/30d/t1/5/7/9/2.index.json"), None);
     }
 
     fn row(id: u64, status: &str, steps: &Value) -> JobRow {

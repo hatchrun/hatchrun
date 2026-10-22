@@ -524,6 +524,7 @@ impl Cx<'_> {
             self.storage.put(&tail_key(job), &lines).await?;
         }
         Ok(Some(log_key(
+            info.retention_days,
             &info.tenant_id,
             info.repo.id,
             info.run_id,
@@ -642,6 +643,7 @@ impl Cx<'_> {
         bucket
             .put(
                 log_key(
+                    info.retention_days,
                     &info.tenant_id,
                     info.repo.id,
                     info.run_id,
@@ -661,6 +663,7 @@ impl Cx<'_> {
         bucket
             .put(
                 index_key(
+                    info.retention_days,
                     &info.tenant_id,
                     info.repo.id,
                     info.run_id,

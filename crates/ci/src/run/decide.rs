@@ -612,6 +612,7 @@ pub(super) mod tests {
             run_number: 3,
             run_attempt: 1,
             tenant_id: "t".repeat(16),
+            retention_days: 30,
             installation_id: 99,
             repo: Repo {
                 id: 5,

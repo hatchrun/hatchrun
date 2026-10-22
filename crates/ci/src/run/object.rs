@@ -50,13 +50,19 @@ use super::{
 struct Ident {
     run: u64,
     tenant: String,
+    /// The retention tier the run's snapshot is under.
+    days: u32,
 }
 
 impl Ident {
-    fn from_query(run: Option<u64>, tenant: Option<String>) -> Option<Self> {
+    fn from_query(run: Option<u64>, tenant: Option<String>, days: Option<u32>) -> Option<Self> {
         let tenant = tenant?;
-        restore_key(run, Some(&tenant))?;
-        Some(Self { run: run?, tenant })
+        restore_key(run, Some(&tenant), days)?;
+        Some(Self {
+            run: run?,
+            tenant,
+            days: days?,
+        })
     }
 }
 
@@ -197,6 +203,7 @@ impl DurableObject for RunObject {
                 .and_then(|(_, value)| value.parse::<u64>().ok())
         };
         let (job, attempt) = (number("job"), number("attempt"));
+        let days = number("days").and_then(|d| u32::try_from(d).ok());
         let tenant = url
             .query_pairs()
             .find(|(key, _)| key == "tenant")
@@ -207,7 +214,7 @@ impl DurableObject for RunObject {
                 url.path(),
                 job,
                 attempt.and_then(|a| u32::try_from(a).ok()),
-                Ident::from_query(number("run"), tenant),
+                Ident::from_query(number("run"), tenant, days),
                 number("offset"),
             )
             .await
@@ -570,7 +577,7 @@ impl<'a> Cx<'a> {
     }
 
     async fn fetch_snapshot(&self, ident: &Ident) -> Result<Option<Snapshot>> {
-        let Some(key) = restore_key(Some(ident.run), Some(&ident.tenant)) else {
+        let Some(key) = restore_key(Some(ident.run), Some(&ident.tenant), Some(ident.days)) else {
             return Ok(None);
         };
         let Some(object) = self.env.bucket(BUCKET)?.get(key).execute().await? else {
@@ -637,7 +644,11 @@ impl<'a> Cx<'a> {
             };
             let body = serde_json::to_vec(&snapshot).map_err(|err| fail(err.to_string()))?;
             (
-                snapshot_key(&snapshot.info.tenant_id, snapshot.info.run_id),
+                snapshot_key(
+                    snapshot.info.retention_days,
+                    &snapshot.info.tenant_id,
+                    snapshot.info.run_id,
+                ),
                 body,
                 snapshot.info.run_attempt,
             )
@@ -1426,16 +1437,26 @@ mod tests {
     #[test]
     fn the_restore_key_is_built_from_the_run_and_tenant_of_the_request() {
         assert_eq!(
-            restore_key(Some(12), Some("abc")).as_deref(),
-            Some("state/abc/12.json")
+            restore_key(Some(12), Some("abc"), Some(90)).as_deref(),
+            Some("state/90d/abc/12.json")
         );
-        assert_eq!(restore_key(None, Some("abc")), None);
-        assert_eq!(restore_key(Some(12), None), None);
-        assert_eq!(restore_key(Some(12), Some("")), None);
-        assert_eq!(restore_key(Some(12), Some("a/../b")), None);
-        assert_eq!(Ident::from_query(Some(1), Some("t".into())).unwrap().run, 1);
-        assert_eq!(Ident::from_query(Some(1), Some("x/y".into())), None);
-        assert_eq!(Ident::from_query(None, Some("t".into())), None);
+        assert_eq!(restore_key(None, Some("abc"), Some(30)), None);
+        assert_eq!(restore_key(Some(12), None, Some(30)), None);
+        assert_eq!(restore_key(Some(12), Some("abc"), Some(60)), None);
+        assert_eq!(restore_key(Some(12), Some("abc"), None), None);
+        assert_eq!(restore_key(Some(12), Some(""), Some(30)), None);
+        assert_eq!(restore_key(Some(12), Some("a/../b"), Some(30)), None);
+        assert_eq!(
+            Ident::from_query(Some(1), Some("t".into()), Some(30))
+                .unwrap()
+                .run,
+            1
+        );
+        assert_eq!(
+            Ident::from_query(Some(1), Some("x/y".into()), Some(30)),
+            None
+        );
+        assert_eq!(Ident::from_query(None, Some("t".into()), Some(30)), None);
     }
 }
 

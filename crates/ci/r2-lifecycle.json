@@ -1,19 +1,35 @@
 {
   "rules": [
     {
-      "id": "expire-logs",
+      "id": "expire-logs-30d",
       "enabled": true,
-      "conditions": { "prefix": "logs/" },
+      "conditions": { "prefix": "logs/30d/" },
       "deleteObjectsTransition": {
         "condition": { "type": "Age", "maxAge": 2592000 }
       }
     },
     {
-      "id": "expire-state",
+      "id": "expire-state-30d",
       "enabled": true,
-      "conditions": { "prefix": "state/" },
+      "conditions": { "prefix": "state/30d/" },
       "deleteObjectsTransition": {
         "condition": { "type": "Age", "maxAge": 2592000 }
+      }
+    },
+    {
+      "id": "expire-logs-90d",
+      "enabled": true,
+      "conditions": { "prefix": "logs/90d/" },
+      "deleteObjectsTransition": {
+        "condition": { "type": "Age", "maxAge": 7776000 }
+      }
+    },
+    {
+      "id": "expire-state-90d",
+      "enabled": true,
+      "conditions": { "prefix": "state/90d/" },
+      "deleteObjectsTransition": {
+        "condition": { "type": "Age", "maxAge": 7776000 }
       }
     }
   ]

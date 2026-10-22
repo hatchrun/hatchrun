@@ -601,7 +601,8 @@ mod tests {
             "id": 1, "run_number": 1, "run_attempt": 1, "tenant_id": tenant,
             "repo_id": repo, "workflow": "ci.yml", "delivery": "d", "event": "push",
             "git_ref": "refs/heads/main", "sha": "abc", "actor": "a",
-            "status": "queued", "conclusion": null, "created_at": 0, "completed_at": null
+            "status": "queued", "conclusion": null, "created_at": 0, "completed_at": null,
+            "retention_days": 30
         }))
         .expect("a run row")
     }
