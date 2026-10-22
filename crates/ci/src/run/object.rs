@@ -582,20 +582,18 @@ impl<'a> Cx<'a> {
             run.deadlines.snapshot_at = Some(self.now);
         }
         let storage = &self.storage;
-        if run.dirty[0] {
-            storage.put(INFO, &run.info).await?;
-        }
-        if run.dirty[1] {
-            storage.put(GRAPH, &run.graph).await?;
-        }
-        if run.dirty[2] {
-            storage.put(OUTBOX, &run.outbox).await?;
-        }
-        if run.dirty[4] {
-            storage.put(TODO, &run.todo).await?;
-        }
-        // Not conditional: the code above changes the deadlines.
-        storage.put(DEADLINES, &run.deadlines).await?;
+        // One call, so the keys land together: `start` treats a stored
+        // graph as a completed start.
+        storage
+            .put_multiple(Commit {
+                info: run.dirty[0].then_some(&run.info),
+                graph: run.dirty[1].then_some(&run.graph),
+                outbox: run.dirty[2].then_some(&run.outbox),
+                todo: run.dirty[4].then_some(&run.todo),
+                // Not conditional: the code above changes the deadlines.
+                deadlines: &run.deadlines,
+            })
+            .await?;
         run.dirty = [false; 5];
         match next_alarm(&run.deadlines, &run.outbox, self.now) {
             Some(at) => {
@@ -1387,4 +1385,20 @@ mod tests {
         assert_eq!(Ident::from_query(Some(1), Some("x/y".into())), None);
         assert_eq!(Ident::from_query(None, Some("t".into())), None);
     }
+}
+
+/// The keys one [`Loaded::commit`] writes, as the fields of a struct for
+/// `put_multiple`; the field names are the storage keys. Keys that did
+/// not change are left out.
+#[derive(serde::Serialize)]
+struct Commit<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    info: Option<&'a RunInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graph: Option<&'a Graph>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outbox: Option<&'a Outbox>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    todo: Option<&'a Todo>,
+    deadlines: &'a Deadlines,
 }
