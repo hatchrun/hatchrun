@@ -139,6 +139,9 @@ pub struct Masker {
     recent: BTreeSet<String>,
     max_len: usize,
     matcher: OnceLock<Option<Matcher>>,
+    /// How many times `recent` was folded into the automaton.
+    #[cfg(test)]
+    folds: usize,
 }
 
 impl Masker {
@@ -165,6 +168,10 @@ impl Masker {
         if self.recent.len() > RECENT_MAX.max(self.patterns.len() / 8) {
             self.patterns.append(&mut self.recent);
             self.matcher = OnceLock::new();
+            #[cfg(test)]
+            {
+                self.folds += 1;
+            }
         }
     }
 
@@ -405,16 +412,17 @@ mod tests {
 
     #[test]
     fn many_adds_between_output_stay_fast() {
-        let started = std::time::Instant::now();
         let mut m = Masker::default();
         for i in 0..1000 {
             m.add(&format!("secret-value-{i:04}-{}", "x".repeat(64)));
             assert_eq!(m.mask("plain"), "plain");
         }
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "{:?}",
-            started.elapsed()
+        // Folding grows with the set, so 1,000 adds rebuild the automaton
+        // a few dozen times, not once per add.
+        assert!(m.folds < 100, "{} folds", m.folds);
+        assert_eq!(
+            m.mask(&format!("a secret-value-0999-{}", "x".repeat(64))),
+            "a ***"
         );
     }
 
