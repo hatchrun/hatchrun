@@ -3,8 +3,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 # The repository crates/ci/scripts/e2e.sh pushes to. Each branch starts
-# one workflow: main the passing pair, fail a failing job, slow a job
-# the script cancels.
+# one workflow, except bad: main the passing pair, fail a failing job,
+# slow a job the script cancels, arm a job on the arm64 template that
+# echoes a secret, bad a workflow with a runs-on that names no template
+# and one that runs, and wide six jobs at once, one more than the cap.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -31,6 +33,24 @@ jobs:
         run: |
           echo "waiting"
           sleep 300
+  arm-hello:
+    runs-on: ubuntu-26.04-arm
+    steps:
+      - name: say the secret
+        run: echo "secret is ${{ secrets.E2E_SECRET }}"
+  old-label:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "never runs"
+  bad-ok-hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "the other workflow ran"
+  nap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: nap
+        run: sleep 20
 workflows:
   ci:
     on: { push: { branches: [main] } }
@@ -45,3 +65,19 @@ workflows:
     on: { push: { branches: [slow] } }
     jobs:
       - sleeper
+  arm:
+    on: { push: { branches: [arm] } }
+    jobs:
+      - arm-hello
+  bad:
+    on: { push: { branches: [bad] } }
+    jobs:
+      - old-label
+  bad-ok:
+    on: { push: { branches: [bad] } }
+    jobs:
+      - bad-ok-hello
+  wide:
+    on: { push: { branches: [wide] } }
+    jobs:
+      - nap: { matrix: { n: [1, 2, 3, 4, 5, 6] } }
