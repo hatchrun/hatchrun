@@ -167,6 +167,38 @@ pub fn checks_status(cond: &str) -> Result<bool, ExprError> {
     Ok(false)
 }
 
+/// Whether a step's or job's `if:` holds. No condition means
+/// `success()`. A condition that calls no status function runs as
+/// `success() && (cond)`, as on GitHub. A `${{ }}` wrapper around the
+/// whole condition is stripped.
+///
+/// # Errors
+///
+/// When the expression does not parse or fails to evaluate.
+pub fn job_condition(
+    cond: Option<&str>,
+    ctx: &Value,
+    funcs: &dyn Functions,
+) -> Result<bool, ExprError> {
+    let Some(cond) = cond else {
+        return Ok(funcs.status() == JobStatus::Success);
+    };
+    let trimmed = cond.trim();
+    let inner = trimmed
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .filter(|inner| !inner.contains("${{"))
+        .map_or(trimmed, str::trim);
+    let wrapped;
+    let run = if checks_status(inner)? {
+        inner
+    } else {
+        wrapped = format!("success() && ({inner})");
+        &wrapped
+    };
+    Ok(truthy(&evaluate(run, ctx, funcs)?))
+}
+
 /// Checks one expression without evaluating it: it must parse, call
 /// only known functions with the right number of arguments and read
 /// only known contexts.

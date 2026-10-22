@@ -5,7 +5,9 @@
 //! GitHub-style `${{ }}` expressions.
 
 use hatchrun_workflow::expr::check;
-use hatchrun_workflow::{ExprError, Functions, JobStatus, evaluate, interpolate, truthy};
+use hatchrun_workflow::{
+    ExprError, Functions, JobStatus, evaluate, interpolate, job_condition, truthy,
+};
 use serde_json::{Value, json};
 
 struct NoFiles;
@@ -588,4 +590,33 @@ fn checks_status_finds_status_calls_in_the_parsed_expression() {
     }
     assert!(checks_status("${{ 1 + }}").is_err());
     assert!(checks_status("${{ success()").is_err());
+}
+
+#[test]
+fn job_condition_defaults_to_success() {
+    let ctx = json!({});
+    assert!(job_condition(None, &ctx, &Files(JobStatus::Success)).unwrap());
+    assert!(!job_condition(None, &ctx, &Files(JobStatus::Failure)).unwrap());
+    assert!(!job_condition(None, &ctx, &Files(JobStatus::Cancelled)).unwrap());
+}
+
+#[test]
+fn job_condition_wraps_without_status_calls() {
+    let ctx = json!({ "github": { "ref": "refs/heads/main" } });
+    let ok = Files(JobStatus::Success);
+    let failed = Files(JobStatus::Failure);
+    assert!(job_condition(Some("github.ref == 'refs/heads/main'"), &ctx, &ok).unwrap());
+    assert!(!job_condition(Some("github.ref == 'refs/heads/main'"), &ctx, &failed).unwrap());
+    assert!(job_condition(Some("${{ always() }}"), &ctx, &failed).unwrap());
+    assert!(
+        job_condition(
+            Some("failure() && github.ref == 'refs/heads/main'"),
+            &ctx,
+            &failed
+        )
+        .unwrap()
+    );
+    assert!(!job_condition(Some("cancelled()"), &ctx, &ok).unwrap());
+    assert!(job_condition(Some("${{ 1 == 1 }}"), &ctx, &ok).unwrap());
+    assert!(job_condition(Some("(("), &ctx, &ok).is_err());
 }

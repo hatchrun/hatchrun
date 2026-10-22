@@ -14,8 +14,7 @@ use std::time::{Duration, Instant};
 
 use hatchrun_workflow::trigger::Filter;
 use hatchrun_workflow::{
-    Arch, Conclusion, ExprError, Functions, JobDocument, JobKind, JobStatus, checks_status,
-    evaluate, truthy,
+    Arch, Conclusion, ExprError, Functions, JobDocument, JobKind, JobStatus, job_condition,
 };
 use nix::fcntl::OFlag;
 use serde_json::{Map, Value, json};
@@ -282,23 +281,7 @@ impl Functions for Runtime<'_> {
 ///
 /// When the expression does not parse or fails to evaluate.
 pub fn condition(expr: Option<&str>, ctx: &Contexts, rt: &Runtime) -> Result<bool, ExprError> {
-    let Some(expr) = expr else {
-        return Ok(rt.status == JobStatus::Success);
-    };
-    let trimmed = expr.trim();
-    let inner = trimmed
-        .strip_prefix("${{")
-        .and_then(|rest| rest.strip_suffix("}}"))
-        .filter(|inner| !inner.contains("${{"))
-        .map_or(trimmed, str::trim);
-    let wrapped;
-    let run = if checks_status(inner)? {
-        inner
-    } else {
-        wrapped = format!("success() && ({inner})");
-        &wrapped
-    };
-    Ok(truthy(&evaluate(run, ctx.value(), rt)?))
+    job_condition(expr, ctx.value(), rt)
 }
 
 fn fail(message: impl Into<String>) -> ExprError {

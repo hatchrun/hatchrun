@@ -24,7 +24,9 @@ pub use config::{
 };
 pub use convert::{Conversion, convert, to_yaml};
 pub use diagnostic::Diagnostic;
-pub use expr::{ExprError, Functions, JobStatus, checks_status, evaluate, interpolate, truthy};
+pub use expr::{
+    ExprError, Functions, JobStatus, checks_status, evaluate, interpolate, job_condition, truthy,
+};
 pub use job::{
     Annotation, AnnotationLevel, CacheService, Conclusion, Github, JobDocument, JobResult, Need,
     StepSummary,
