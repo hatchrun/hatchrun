@@ -74,7 +74,7 @@ const RELEASE_ORPHAN_APPROVALS: &str = "UPDATE ci_jobs SET held = NULL, next_lau
        AND ci_jobs.held = 'approval' AND ci_jobs.updated_at < $1 \
        AND ((ci_jobs.approval_attempt = ci_jobs.attempt AND ci_jobs.approval_decision IS NOT NULL) \
          OR NOT EXISTS (SELECT 1 FROM ci_environments e WHERE e.repo_id = ci_runs.repo_id \
-           AND lower(e.name) = lower(ci_jobs.environment) AND e.approval)) \
+           AND e.tenant_id = ci_runs.tenant_id AND lower(e.name) = lower(ci_jobs.environment) AND e.approval)) \
        ORDER BY ci_jobs.id LIMIT $3) \
      RETURNING ci_jobs.id AS job_id, ci_jobs.attempt";
 

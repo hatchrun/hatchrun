@@ -2384,6 +2384,7 @@ pub async fn job_environment(db: &Db, job_id: u64) -> Result<Option<JobEnvironme
              FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
                JOIN ci_repos ON ci_repos.id = ci_runs.repo_id \
                LEFT JOIN ci_environments e ON e.repo_id = ci_runs.repo_id \
+                 AND e.tenant_id = ci_runs.tenant_id \
                  AND lower(e.name) = lower(ci_jobs.environment) \
              WHERE ci_jobs.id = $1",
             &params![job_id],
@@ -2437,6 +2438,7 @@ pub async fn release_approval_holds(
     db.all(
         "UPDATE ci_jobs SET held = NULL, next_launch_at = $3, updated_at = $3 FROM ci_runs \
          WHERE ci_runs.id = ci_jobs.run_id AND ci_runs.repo_id = $1 \
+           AND ci_runs.tenant_id = (SELECT tenant_id FROM ci_repos WHERE id = $1) \
            AND lower(ci_jobs.environment) = lower($2) \
            AND ci_jobs.status = 'queued' AND ci_jobs.held = 'approval' \
          RETURNING ci_jobs.id AS job_id, ci_jobs.attempt",
@@ -5118,6 +5120,37 @@ mod tests {
             .wait(sealed_secrets(db.db(), "t1", 7, None, Some(&names)))
             .unwrap();
         assert_eq!(rows, []);
+    }
+
+    #[test]
+    fn a_new_owners_environment_does_not_apply_to_the_old_owners_jobs() {
+        let db = setup();
+        let job = job_naming(&db, "a", Some("production"));
+        db.run(
+            "UPDATE ci_jobs SET status = 'queued', held = 'approval', updated_at = 1 \
+             WHERE id = $1",
+            &params![job],
+        );
+        // The repository moves to t2, which makes its own production
+        // without approval.
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated_at) \
+             VALUES ('t2', 2, 'other', 100, 0, 0)",
+            &[],
+        );
+        db.run("UPDATE ci_repos SET tenant_id = 't2' WHERE id = 7", &[]);
+        db.run(
+            "INSERT INTO ci_environments (tenant_id, repo_id, name, branches, approval, updated_at) \
+             VALUES ('t2', 7, 'production', '[]', false, 5)",
+            &[],
+        );
+        let got = db.wait(job_environment(db.db(), job)).unwrap().unwrap();
+        assert_eq!(got.environment, None);
+        let woken = db
+            .wait(release_approval_holds(db.db(), 7, "production", 9))
+            .unwrap();
+        assert_eq!(woken_ids(woken), Vec::<u64>::new());
+        assert_eq!(held_of(&db, job).as_deref(), Some("approval"));
     }
 
     #[test]

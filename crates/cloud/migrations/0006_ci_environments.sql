@@ -7,7 +7,9 @@
 -- environments plan append here.
 
 -- CI is billed on the hatchrun.io product, so a subscription is a
--- subscription and the product column goes.
+-- subscription and the product column goes. A row of the retired CI
+-- product would license runners once the column is gone.
+DELETE FROM subscriptions WHERE product = 'ci';
 ALTER TABLE subscriptions DROP COLUMN product;
 
 -- Environments of a repository. Names are unique per repository,
