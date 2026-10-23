@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// A repository's CI secrets and variables, at /ci/:owner/:repo/settings.
+// A repository's CI secrets, variables and environments, at /ci/:owner/:repo/settings.
 // They need admin access to the repository: anyone else gets a 404.
 
 import { type Session } from "@/api";
@@ -10,6 +10,7 @@ import { ChevronLeftIcon } from "@/components/icons";
 import { Shell } from "@/components/Shell";
 import { Link } from "@/router";
 import { SignIn } from "../SignIn";
+import { Environments } from "./Environments";
 import { SecretsTable } from "./SecretsTable";
 
 export function RepoSettings({ session, owner, repo }: { session: Session | null; owner: string; repo: string }) {
@@ -33,10 +34,11 @@ export function RepoSettings({ session, owner, repo }: { session: Session | null
             Runs
           </Link>
           <h1 className="display text-[26px] leading-[1.05]">Settings</h1>
-          <p className="muted">Secrets and variables for {owner}/{repo}. Repository admins only.</p>
+          <p className="muted">Secrets, variables and environments for {owner}/{repo}. Repository admins only.</p>
         </div>
         <SecretsTable scope={scope} kind="secrets" />
         <SecretsTable scope={scope} kind="vars" />
+        <Environments owner={owner} repo={repo} />
       </div>
     </Shell>
   );

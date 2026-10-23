@@ -718,24 +718,6 @@ label {
   margin-bottom: 0.6rem;
 }
 
-.usage-bar {
-  height: 8px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--app-border);
-}
-
-.usage-bar > span {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: var(--app-accent);
-}
-
-.usage-bar-over > span {
-  background: var(--app-danger);
-}
-
 .usage > p {
   margin: 0.6rem 0 0;
 }

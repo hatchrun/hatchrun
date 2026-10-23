@@ -6,7 +6,9 @@
 # one workflow, except bad: main the passing pair, fail a failing job,
 # slow a job the script cancels, arm a job on the arm64 template that
 # echoes a secret, bad a workflow with a runs-on that names no template
-# and one that runs, and wide six jobs at once, one more than the cap.
+# and one that runs, wide six jobs at once, one more than the cap,
+# guard a job whose environment allows other branches, and deploy two
+# jobs on an environment that needs approval.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -51,6 +53,25 @@ jobs:
     steps:
       - name: nap
         run: sleep 20
+  guarded:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - run: echo "never runs"
+  deploy-a:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: show the values
+        run: |
+          printf '%s' "${{ secrets.ENV_SECRET }}" | openssl dgst -sha256 -r | cut -d' ' -f1
+          echo "var is ${{ vars.ENV_VAR }}"
+          echo "org only is [${{ secrets.ORG_ONLY }}]"
+  deploy-b:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo "never runs"
 workflows:
   ci:
     on: { push: { branches: [main] } }
@@ -81,3 +102,12 @@ workflows:
     on: { push: { branches: [wide] } }
     jobs:
       - nap: { matrix: { n: [1, 2, 3, 4, 5, 6] } }
+  guard:
+    on: { push: { branches: [guard] } }
+    jobs:
+      - guarded
+  deploy:
+    on: { push: { branches: [deploy] } }
+    jobs:
+      - deploy-a
+      - deploy-b

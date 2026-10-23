@@ -46,8 +46,9 @@ use worker::{
 
 use crate::billing::{self, HOLD_RECHECK_MS, Hold};
 use crate::env::{Settings, run_stub};
+use crate::environments::{self, Gate};
 use crate::launcher::{Backend, LaunchSpec, user_data};
-use crate::reconcile::LAUNCH_QUIET_MS;
+use crate::reconcile::{self, LAUNCH_QUIET_MS};
 use crate::run::LAUNCHES;
 use crate::store::{self, Claim, JobRow, Standing};
 use crate::token::{self, Claims};
@@ -199,6 +200,27 @@ async fn launch(
         Delivery::Launch | Delivery::GiveUp => {}
     }
     let now = now_ms();
+    if delivery == Delivery::Launch && job.environment.is_some() {
+        let Some(found) = store::job_environment(&db, job.id)
+            .await
+            .map_err(|err| err.to_string())?
+        else {
+            return Ok(());
+        };
+        let asked = job.environment.as_deref().unwrap_or_default();
+        match environments::gate(
+            asked,
+            &found,
+            environments::decision(&job),
+            &settings.app_url,
+        ) {
+            Gate::Pass => {}
+            Gate::Fail(message) => return end_job(env, &db, &job, &message).await,
+            Gate::Approval(message) => {
+                return hold_job(env, &db, &job, "approval", &message, now).await;
+            }
+        }
+    }
     let standing = match store::standing(
         &db,
         message.job_id,
@@ -217,7 +239,7 @@ async fn launch(
         u32::MAX
     } else {
         if let Some(reason) = billing::admission(&standing) {
-            return hold_job(env, settings, &db, &job, &standing, reason, now).await;
+            return hold_for(env, &db, &job, reason, &standing, settings, now).await;
         }
         MAX_RUNNING_JOBS
     };
@@ -227,7 +249,7 @@ async fn launch(
     {
         Claim::Claimed(job) => job,
         Claim::Busy => {
-            return hold_job(env, settings, &db, &job, &standing, Hold::Concurrency, now).await;
+            return hold_for(env, &db, &job, Hold::Concurrency, &standing, settings, now).await;
         }
         Claim::Gone => return Ok(()),
     };
@@ -251,35 +273,41 @@ async fn launch(
     }
 }
 
-/// Keeps the queued job held for `reason`, to be looked at again after
-/// [`HOLD_RECHECK_MS`], and tells the run's object the reason every
-/// time, changed or not: a post that fails is made again when the
-/// reconciler requeues the job. The message is acked either way, so an
-/// error is only a database one.
-async fn hold_job(
+/// Holds the job for a billing or concurrency `reason`, with the
+/// message the check run shows.
+async fn hold_for(
     env: &Env,
-    settings: &Settings,
     db: &Db,
     job: &JobRow,
-    standing: &Standing,
     reason: Hold,
+    standing: &Standing,
+    settings: &Settings,
     now: u64,
 ) -> Result<(), String> {
-    let changed = store::hold(
-        db,
-        job.id,
-        job.attempt,
-        reason.as_str(),
-        now + HOLD_RECHECK_MS,
-        now,
-    )
-    .await
-    .map_err(|err| err.to_string())?;
-    if changed {
-        console_log!("job {}: held, {}", job.id, reason.as_str());
-    }
     let message = reason.message(&standing.org_login, &settings.app_url, standing.cap_micros);
-    let answer = post_to_run(env, db, job, "held", &message).await;
+    hold_job(env, db, job, reason.as_str(), &message, now).await
+}
+
+/// Keeps the queued job held for `reason` (the word `ci_jobs.held`
+/// stores), to be looked at again after [`HOLD_RECHECK_MS`], and tells
+/// the run's object `message` every time, changed or not: a post that
+/// fails is made again when the reconciler requeues the job. The message
+/// is acked either way, so an error is only a database one.
+async fn hold_job(
+    env: &Env,
+    db: &Db,
+    job: &JobRow,
+    reason: &str,
+    message: &str,
+    now: u64,
+) -> Result<(), String> {
+    let changed = store::hold(db, job.id, job.attempt, reason, now + HOLD_RECHECK_MS, now)
+        .await
+        .map_err(|err| err.to_string())?;
+    if changed {
+        console_log!("job {}: held, {reason}", job.id);
+    }
+    let answer = post_to_run(env, db, job, "held", message).await;
     if !matches!(answer, EndAnswer::Status(200..=299 | 409)) {
         console_error!("job {}: post held: {answer:?}", job.id);
     }
@@ -582,17 +610,28 @@ async fn post_to_run(env: &Env, db: &Db, job: &JobRow, route: &str, message: &st
 }
 
 /// Ends the job through the run's object. When nobody owns it, its row
-/// is completed here. An error asks for the message to be retried.
-async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> Result<(), String> {
+/// is completed here, whether it was claimed (launching) or still
+/// queued. An error asks for the message to be retried.
+pub(crate) async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> Result<(), String> {
     let answer = post_failed(env, db, job, message).await;
     match end_action(&answer) {
         EndAction::Done => Ok(()),
         EndAction::GiveUp => {
             console_error!("job {}: no run object holds it, failing the row", job.id);
-            store::launch_failed(db, job.id, message, None, now_ms())
+            let now = now_ms();
+            let claimed = store::launch_failed(db, job.id, message, None, now)
                 .await
-                .map(|_| ())
-                .map_err(|err| err.to_string())
+                .map_err(|err| err.to_string())?;
+            if claimed {
+                return Ok(());
+            }
+            // Not claimed: the job is still queued (an environment check
+            // ended it), and launch_failed only changes a launching one.
+            // Keep the reason on the row, since the run has none.
+            store::note_queued_error(db, job.id, message, now)
+                .await
+                .map_err(|err| err.to_string())?;
+            reconcile::fail_row(env, db, job, now).await
         }
         EndAction::Retry => Err(format!("could not end job {}: {answer:?}", job.id)),
     }

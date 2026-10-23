@@ -5,9 +5,8 @@
 //! Launches a runner instance for a recorded job, from the launch queue
 //! the webhook sends it to (see [`crate::launches`]).
 //!
-//! Only tenants with AWS connected that may launch (in the beta, paid,
-//! or within their free minutes, see [`crate::usage`]) launch; jobs of
-//! any other are marked `failed`.
+//! Only tenants with AWS connected that may launch (in the beta or paid,
+//! see [`crate::usage`]) launch; jobs of any other are marked `failed`.
 //!
 //! The Worker takes the job by moving it from no launch state to
 //! `launching`, which only one request can do, and only while the tenant
@@ -234,10 +233,8 @@ pub(crate) async fn try_launch(env: &Env, job: &QueuedJob) -> Result<()> {
                     tenant.id, tenant.region
                 ),
                 Some(tenant) => format!(
-                    "tenant {} used its {} free minutes this month and the grace period \
-                     after them: add a card in the app to keep launching",
-                    tenant.id,
-                    crate::usage::FREE_MINUTES
+                    "tenant {} has no card on file: add one in the app to launch runners",
+                    tenant.id
                 ),
                 None => format!(
                     "installation {} has no tenant with AWS connected",
@@ -723,37 +720,17 @@ mod tests {
         let tenant: Tenant = db.first(&tenant_query(), &params![INSTALLATION]).unwrap();
         assert_eq!(tenant.id, "t1");
         assert_eq!(tenant.max_runners, 2);
-        // Unpaid, within its free minutes.
-        assert!(tenant.licensed);
+        // No card, not in the beta.
+        assert!(!tenant.licensed);
         assert_eq!(tenant.volume_size_limit, Some(200));
         assert_eq!(tenant.root_volume_size, Some(30));
         assert!(tenant.fleet);
         assert!(tenant.instance_types.is_none());
 
-        // Past them and the grace period after them.
-        let now = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap();
-        db.run(
-            "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed) \
-             VALUES (1, 't1', $1, $2, false)",
-            &params![crate::usage::FREE_MINUTES, now],
-        );
-        db.run(
-            "UPDATE tenants SET free_used_up_at = $1 WHERE id = 't1'",
-            &params![now - crate::usage::GRACE_MS - 60_000],
-        );
-        let tenant: Tenant = db.first(&tenant_query(), &params![INSTALLATION]).unwrap();
-        assert!(!tenant.licensed);
-
         db.run(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             product, cancel_at_period_end, modified_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, 'runners', $6, $7, $8)",
+             cancel_at_period_end, modified_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             &params!["s1", "t1", "active", "c1", "p1", false, "2026-10-01", NOW],
         );
         let tenant: Tenant = db.first(&tenant_query(), &params![INSTALLATION]).unwrap();

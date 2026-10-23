@@ -7,7 +7,6 @@
 # shows A/B: runs while the job passes / runs after an earlier step failed.
 
 convert: exit 0
-  `release.yml` job `publish`: `environment` is not supported and was dropped
 validate: exit 0
 event push-main (compile refs/heads/main)
   release: not triggered

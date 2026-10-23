@@ -141,7 +141,7 @@ function Install({ installUrl }: { installUrl: string }) {
       <h1>Add hatchrun to your GitHub organization</h1>
       <p className="muted">
         Start by installing the hatchrun app. GitHub asks which organization, then brings you back
-        here to connect AWS. The first 3,000 job minutes each month are free.
+        here to connect AWS. Runners launch once you add a card.
       </p>
       <ul className="card start-points">
         <li>

@@ -38,6 +38,7 @@ use worker::{
 };
 
 use crate::env::{Settings, run_stub};
+use crate::environments;
 use crate::github;
 use crate::launcher::Backend;
 use crate::launches::{self, EndAnswer};
@@ -158,6 +159,17 @@ pub(crate) fn claim_answer(row: &JobRow, claims: &Claims) -> ClaimAnswer {
 pub(crate) fn consistent(job: &JobRow, run: &RunRow, repo: &RepoRow) -> bool {
     job.run_id == run.id && run.repo_id == repo.id && run.tenant_id == repo.tenant_id
 }
+
+/// Whether the repository changed tenant after the run was created: the
+/// job is still the old owner's, but the repository's secrets and vars
+/// now belong to the new one.
+pub(crate) fn transferred(job: &JobRow, run: &RunRow, repo: &RepoRow) -> bool {
+    job.run_id == run.id && run.repo_id == repo.id && run.tenant_id != repo.tenant_id
+}
+
+/// Why a job of a transferred repository ends at the claim.
+const TRANSFERRED_MESSAGE: &str = "The repository moved to another owner while the job was queued. \
+     Run the workflow again.";
 
 /// A request body collected up to [`MAX_BODY_BYTES`].
 #[derive(Default)]
@@ -294,6 +306,13 @@ async fn claim(
     let Some(repo) = store::repo(db, run.repo_id).await? else {
         return status(409);
     };
+    if transferred(row, &run, &repo) {
+        let answer = launches::post_failed(env, db, row, TRANSFERRED_MESSAGE).await;
+        if !matches!(answer, EndAnswer::Status(200..=299 | 409)) {
+            console_error!("job {}: post failed: {answer:?}", row.id);
+        }
+        return status(409);
+    }
     if !consistent(row, &run, &repo) {
         console_error!("job {}: run and repository disagree on the tenant", row.id);
         return text("unauthorized", 401);
@@ -308,7 +327,7 @@ async fn claim(
     }
     // Secrets and vars are opened before the object claims, so a
     // failure that may pass leaves nothing claimed or metered.
-    let (secrets, vars) = match open_values(env, db, row, &repo).await {
+    let (secrets, vars) = match open_values(env, db, row, &repo, &settings.app_url).await {
         Opened::Ready(secrets, vars) => (secrets, vars),
         Opened::Retry => return retry(),
         Opened::EndJob(message) => {
@@ -378,6 +397,33 @@ pub(crate) enum OpenFailure {
     Unavailable(String),
     /// The secret of this name does not open.
     Unreadable(String, SecretError),
+    /// The environment the job names was deleted since the launch.
+    EnvironmentGone(String),
+    /// The job row is gone.
+    JobGone,
+    /// The environment's rules no longer let the job in: end it with
+    /// this message.
+    Refused(String),
+}
+
+/// The environment id the job may use, checked again at claim against
+/// the rules as they are now: it exists, the run's ref is allowed, and
+/// an approval environment has an approval of this attempt.
+pub(crate) fn claim_environment(
+    asked: &str,
+    found: &store::JobEnvironment,
+    row: &JobRow,
+    app_url: &str,
+) -> Result<u64, OpenFailure> {
+    let Some(environment) = &found.environment else {
+        return Err(OpenFailure::EnvironmentGone(asked.to_owned()));
+    };
+    match environments::gate(asked, found, environments::decision(row), app_url) {
+        environments::Gate::Pass => Ok(environment.id),
+        environments::Gate::Fail(message) | environments::Gate::Approval(message) => {
+            Err(OpenFailure::Refused(message))
+        }
+    }
 }
 
 /// Decides from the outcome of reading the values. Only a secret that
@@ -389,19 +435,33 @@ pub(crate) fn opened(outcome: Result<Values, OpenFailure>) -> Opened {
         Err(OpenFailure::Unreadable(name, _)) => Opened::EndJob(format!(
             "Secret `{name}` cannot be read. Set it again in the hatchrun app."
         )),
+        Err(OpenFailure::EnvironmentGone(name)) => {
+            Opened::EndJob(environments::gone_message(&name))
+        }
+        Err(OpenFailure::JobGone) => Opened::EndJob("The job no longer exists.".to_owned()),
+        Err(OpenFailure::Refused(message)) => Opened::EndJob(message),
     }
 }
 
 /// Reads and opens the secrets the job references and the repository's
 /// vars.
-async fn open_values(env: &Env, db: &Db, row: &JobRow, repo: &RepoRow) -> Opened {
-    let outcome = read_values(env, db, row, repo).await;
+async fn open_values(env: &Env, db: &Db, row: &JobRow, repo: &RepoRow, app_url: &str) -> Opened {
+    let outcome = read_values(env, db, row, repo, app_url).await;
     match &outcome {
         Err(OpenFailure::Unavailable(err)) => {
             console_error!("job {}: secrets: {err}", row.id);
         }
         Err(OpenFailure::Unreadable(name, err)) => {
             console_error!("job {}: secret {name}: {err:?}", row.id);
+        }
+        Err(OpenFailure::EnvironmentGone(name)) => {
+            console_error!("job {}: environment {name} is gone", row.id);
+        }
+        Err(OpenFailure::JobGone) => {
+            console_error!("job {}: no job row", row.id);
+        }
+        Err(OpenFailure::Refused(message)) => {
+            console_error!("job {}: environment refused at claim: {message}", row.id);
         }
         Ok(_) => {}
     }
@@ -413,18 +473,29 @@ async fn read_values(
     db: &Db,
     row: &JobRow,
     repo: &RepoRow,
+    app_url: &str,
 ) -> Result<Values, OpenFailure> {
     let unavailable = |err: &dyn std::fmt::Display| OpenFailure::Unavailable(err.to_string());
     let refs: SecretRefs =
         serde_json::from_value(row.secret_refs.clone()).map_err(|e| unavailable(&e))?;
     let names: Vec<String> = refs.names.iter().cloned().collect();
+    let environment_id = match &row.environment {
+        None => None,
+        Some(asked) => {
+            let found = store::job_environment(db, row.id)
+                .await
+                .map_err(|e| unavailable(&e))?
+                .ok_or(OpenFailure::JobGone)?;
+            Some(claim_environment(asked, &found, row, app_url)?)
+        }
+    };
     let rows = if refs.all {
-        store::sealed_secrets(db, &repo.tenant_id, repo.id, None).await
+        store::sealed_secrets(db, &repo.tenant_id, repo.id, environment_id, None).await
     } else {
-        store::sealed_secrets(db, &repo.tenant_id, repo.id, Some(&names)).await
+        store::sealed_secrets(db, &repo.tenant_id, repo.id, environment_id, Some(&names)).await
     }
     .map_err(|e| unavailable(&e))?;
-    let vars = store::job_vars(db, &repo.tenant_id, repo.id)
+    let vars = store::job_vars(db, &repo.tenant_id, repo.id, environment_id)
         .await
         .map_err(|e| unavailable(&e))?;
     if rows.is_empty() {
@@ -584,6 +655,11 @@ mod tests {
             token_permissions: serde_json::json!({}),
             secret_refs: serde_json::json!({ "all": false, "names": [] }),
             held: None,
+            environment: None,
+            approval_attempt: None,
+            approval_decision: None,
+            approval_by: None,
+            approval_at: None,
         }
     }
 
@@ -727,6 +803,23 @@ mod tests {
     }
 
     #[test]
+    fn a_transferred_repository_ends_the_claim() {
+        let job = row("launched");
+        assert!(transferred(&job, &run_row("t1", 9), &repo_row("t2", 9)));
+        assert!(!transferred(&job, &run_row("t1", 9), &repo_row("t1", 9)));
+        // A mismatch of ids is a forged claim, not a transfer.
+        assert!(!transferred(&job, &run_row("t1", 9), &repo_row("t2", 10)));
+        let mut elsewhere = row("launched");
+        elsewhere.run_id = 2;
+        assert!(!transferred(
+            &elsewhere,
+            &run_row("t1", 9),
+            &repo_row("t2", 9)
+        ));
+        assert!(TRANSFERRED_MESSAGE.contains("moved to another owner"));
+    }
+
+    #[test]
     fn chunks_stop_at_the_limit() {
         let mut capped = Capped::default();
         assert!(capped.push(&vec![0; MAX_BODY_BYTES - 1]));
@@ -766,6 +859,7 @@ mod tests {
                 timeout_minutes: 10,
                 outputs: BTreeMap::new(),
                 token_permissions: BTreeMap::new(),
+                environment: None,
                 steps: Vec::new(),
             },
             event_name: "push".into(),
@@ -830,6 +924,82 @@ mod tests {
         assert_eq!(
             opened(Err(OpenFailure::Unavailable("db down".into()))),
             Opened::Retry
+        );
+    }
+
+    #[test]
+    fn a_gone_environment_ends_the_job() {
+        assert_eq!(
+            opened(Err(OpenFailure::EnvironmentGone("production".into()))),
+            Opened::EndJob("Environment `production` was deleted before the job started.".into())
+        );
+    }
+
+    fn found(branches: &[&str], approval: bool) -> store::JobEnvironment {
+        store::JobEnvironment {
+            run_id: 1,
+            repo_id: 7,
+            full_name: "octo/app".into(),
+            event: "push".into(),
+            git_ref: "refs/heads/main".into(),
+            environment: Some(store::EnvironmentRow {
+                id: 3,
+                repo_id: 7,
+                name: "production".into(),
+                branches: branches.iter().map(|b| (*b).to_owned()).collect(),
+                approval,
+                updated_at: 1,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_claim_checks_the_environment_again() {
+        let mut job = row("launched");
+        job.environment = Some("production".into());
+        let url = "https://app.example";
+        assert_eq!(
+            claim_environment("production", &found(&[], false), &job, url),
+            Ok(3)
+        );
+        assert!(matches!(
+            claim_environment("production", &found(&["release"], false), &job, url),
+            Err(OpenFailure::Refused(m)) if m.contains("allows only branches release")
+        ));
+        // Approval was switched on after the launch: no decision, no secrets.
+        assert!(matches!(
+            claim_environment("production", &found(&[], true), &job, url),
+            Err(OpenFailure::Refused(m)) if m.contains("Waiting for approval")
+        ));
+        job.approval_attempt = Some(job.attempt);
+        job.approval_decision = Some("approved".into());
+        job.approval_by = Some("octo".into());
+        assert_eq!(
+            claim_environment("production", &found(&[], true), &job, url),
+            Ok(3)
+        );
+        job.approval_decision = Some("rejected".into());
+        assert!(matches!(
+            claim_environment("production", &found(&[], true), &job, url),
+            Err(OpenFailure::Refused(_))
+        ));
+        let mut gone = found(&[], false);
+        gone.environment = None;
+        assert_eq!(
+            claim_environment("production", &gone, &job, url),
+            Err(OpenFailure::EnvironmentGone("production".into()))
+        );
+    }
+
+    #[test]
+    fn a_refused_claim_ends_the_job_with_the_message() {
+        assert_eq!(
+            opened(Err(OpenFailure::Refused("no".into()))),
+            Opened::EndJob("no".into())
+        );
+        assert_eq!(
+            opened(Err(OpenFailure::JobGone)),
+            Opened::EndJob("The job no longer exists.".into())
         );
     }
 }

@@ -22,6 +22,7 @@ use crate::config::{
 };
 use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
+use crate::environment::valid_environment_name;
 use crate::expr::{self, ExprError};
 use crate::permissions::{Level, token_scopes};
 use crate::templates::{Template, template, template_labels};
@@ -130,6 +131,9 @@ pub struct PlannedJob {
     /// GitHub App permissions for the job's token, from its
     /// `permissions:`, else its workflow's, else the read default.
     pub token_permissions: BTreeMap<String, Level>,
+    /// The environment the job deploys to, after parameter substitution.
+    /// `None` for approval jobs and jobs without one.
+    pub environment: Option<String>,
     /// The steps, with commands expanded.
     pub steps: Vec<PlannedStep>,
 }
@@ -1298,6 +1302,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         timeout_minutes: DEFAULT_TIMEOUT_MINUTES,
         outputs: BTreeMap::new(),
         token_permissions: BTreeMap::new(),
+        environment: None,
         steps: Vec::new(),
     }]
 }
@@ -1377,6 +1382,18 @@ fn expand_job(
     let env = sub.map(&job.env);
     let if_ = sub.opt(job.if_.as_deref());
     let outputs = sub.map(&job.outputs);
+    let environment = sub.opt(job.environment.as_deref());
+    if let Some(name) = &environment {
+        if name.contains("${{") {
+            errors.push(Diagnostic::new(format!(
+                "{owner}: `environment` can use only parameters; found `{name}`"
+            )));
+        } else if let Err(rule) = valid_environment_name(name) {
+            errors.push(Diagnostic::new(format!(
+                "{owner}: `environment` `{name}`: {rule}"
+            )));
+        }
+    }
     if errors.len() > before || walk.budget.spent {
         return None;
     }
@@ -1392,6 +1409,7 @@ fn expand_job(
         timeout_minutes: job.timeout_minutes.unwrap_or(DEFAULT_TIMEOUT_MINUTES),
         outputs,
         token_permissions: token_scopes(job.permissions.as_ref()),
+        environment,
         steps,
     })
 }

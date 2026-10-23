@@ -2,21 +2,18 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! An organization's billing: its job minutes this month, Polar
+//! An organization's billing: its runner seconds this month, Polar
 //! checkout, the customer portal, Polar's webhooks, and the beta, which
-//! needs no payment. See [`crate::usage`] for the free minutes and who
-//! may launch.
+//! needs no payment. See [`crate::usage`] for the price and who may
+//! launch.
 //!
-//! - `GET /api/plan` describes the metered product and the free
-//!   minutes.
 //! - `POST /api/tenants/<org>/checkout` opens a Polar checkout, which
-//!   adds the card that pays per minute past the free ones.
+//!   adds the card that pays per second of runner time.
 //! - `POST /api/tenants/<org>/portal` opens Polar's customer portal.
 //! - `POST /api/tenants/<org>/beta` with `{"code": ...}` redeems a beta
 //!   invite code.
 //! - `POST /api/polar/webhook` takes Polar's deliveries.
 
-use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use worker::{Env, Request, Response, Result, console_error, console_log, console_warn};
 
@@ -33,9 +30,6 @@ const POLAR_API_URL: &str = "POLAR_API_URL";
 /// Variable with the Polar products of the licence, separated by
 /// commas: one per billing interval.
 const PRODUCT_ID: &str = "POLAR_PRODUCT_ID";
-/// Variable with the Polar product of hatchrun CI. A subscription to it
-/// is a card on file for CI and does not license runners.
-const CI_PRODUCT_ID: &str = "POLAR_CI_PRODUCT_ID";
 /// Secret with Polar's organization access token.
 const ACCESS_TOKEN: &str = "POLAR_ACCESS_TOKEN";
 /// Secret with the webhook endpoint's secret.
@@ -76,19 +70,19 @@ pub(crate) struct Billing {
     pub usage: UsageView,
 }
 
-/// A tenant's job minutes this month.
+/// A tenant's runner seconds this month.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UsageView {
     /// The month's first and the next month's first instant, ISO 8601.
     month_start: String,
     month_end: String,
-    minutes: u64,
-    free_minutes: u32,
-    /// When it used up the free minutes this month, ISO 8601.
-    free_used_up_at: Option<String>,
-    /// When runners stop launching without a card, ISO 8601.
-    grace_ends_at: Option<String>,
+    /// Runner seconds this month, every job at least 60.
+    seconds: u64,
+    /// What this month's billed seconds cost, in cents, rounded down.
+    spend_cents: u64,
+    /// The runner price per minute, in millionths of a dollar.
+    price_micros_per_minute: u64,
     /// Whether runners launch now.
     pub may_launch: bool,
 }
@@ -108,10 +102,9 @@ struct SubscriptionRow {
     cancel_at_period_end: bool,
 }
 
-/// The tenant's licensed runners subscription if there is one, else its
-/// latest. A CI subscription is not shown here.
+/// The tenant's licensed subscription if there is one, else its latest.
 const SUBSCRIPTION: &str = "SELECT status, current_period_end, cancel_at_period_end \
-    FROM subscriptions WHERE tenant_id = $1 AND product = 'runners' \
+    FROM subscriptions WHERE tenant_id = $1 \
     ORDER BY status IN ('active', 'trialing') DESC, modified_at DESC LIMIT 1";
 
 /// The licence of tenant `id`, which is in the beta when `beta`.
@@ -127,7 +120,6 @@ pub(crate) async fn billing(db: &Db, id: &str, beta: bool) -> Result<Billing> {
         .is_some_and(|subscription| polar::LICENSED.contains(&subscription.status.as_str()));
     let month = usage::month(db, id).await?;
     let (start, end) = time::month(now_ms());
-    let unpaid = !beta && !paid;
     Ok(Billing {
         beta,
         licensed: beta || paid,
@@ -135,13 +127,9 @@ pub(crate) async fn billing(db: &Db, id: &str, beta: bool) -> Result<Billing> {
         usage: UsageView {
             month_start: time::format(start),
             month_end: time::format(end),
-            minutes: month.minutes,
-            free_minutes: usage::FREE_MINUTES,
-            free_used_up_at: month.free_used_up_at.map(time::format),
-            grace_ends_at: month
-                .free_used_up_at
-                .filter(|_| unpaid)
-                .map(|at| time::format(at + usage::GRACE_MS)),
+            seconds: month.seconds,
+            spend_cents: usage::spend_micros(month.billed_seconds) / 10_000,
+            price_micros_per_minute: usage::PRICE_MICROS_PER_MINUTE,
             may_launch: month.may_launch,
         },
     })
@@ -164,35 +152,32 @@ pub(crate) async fn join_listed_beta(db: &Db, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `GET /api/plan`: every product of the licence, shortest billing
-/// interval first.
-pub(crate) async fn plan(ctx: &Ctx<'_>) -> Answer {
-    let polar = Polar::read(ctx.env)?;
-    let requests: Vec<_> = polar
-        .product_ids
-        .iter()
-        .map(|id| polar::product(&polar.api, &polar.token, id))
-        .collect();
-    let answers = join_all(requests.iter().map(send)).await;
-    let mut plans = Vec::with_capacity(answers.len());
-    for answer in answers {
-        plans.push(polar::plan(&answer?).map_err(|err| Failure::new(502, err))?);
-    }
-    polar::sort(&mut plans);
-    Ok(Response::from_json(&serde_json::json!({ "plans": plans }))?)
+/// Whether a checkout or portal request asked to come back to the CI
+/// page: its query holds `return=ci`.
+pub(crate) fn back_to_ci(query: Option<&str>) -> bool {
+    query.is_some_and(|query| query.split('&').any(|pair| pair == "return=ci"))
 }
 
 /// `POST /api/tenants/<org>/checkout`
-pub(crate) async fn checkout(ctx: &Ctx<'_>, org: &str) -> Answer {
+pub(crate) async fn checkout(ctx: &Ctx<'_>, org: &str, back_to_ci: bool) -> Answer {
     let row = authorize(ctx, org).await?;
     let polar = Polar::read(ctx.env)?;
-    if billing(ctx.db, &row.id, row.beta).await?.licensed {
+    let card = ctx
+        .db
+        .first::<SubscriptionRow>(SUBSCRIPTION, &params![row.id.as_str()])
+        .await?
+        .is_some_and(|row| polar::LICENSED.contains(&row.status.as_str()));
+    if card {
         return Err(Failure::new(
             409,
-            format!("{} already has a licence", row.org_login),
+            format!("{} already has a card on file", row.org_login),
         ));
     }
-    let page = format!("{}/o/{}/settings", ctx.config.app_url, row.org_login);
+    let page = if back_to_ci {
+        format!("{}/o/{}/ci", ctx.config.app_url, row.org_login)
+    } else {
+        format!("{}/o/{}/settings", ctx.config.app_url, row.org_login)
+    };
     let url = polar::checkout_url(
         &send(&polar::checkout(
             &polar.api,
@@ -209,10 +194,14 @@ pub(crate) async fn checkout(ctx: &Ctx<'_>, org: &str) -> Answer {
 }
 
 /// `POST /api/tenants/<org>/portal`
-pub(crate) async fn portal(ctx: &Ctx<'_>, org: &str) -> Answer {
+pub(crate) async fn portal(ctx: &Ctx<'_>, org: &str, back_to_ci: bool) -> Answer {
     let row = authorize(ctx, org).await?;
     let polar = Polar::read(ctx.env)?;
-    let page = format!("{}/o/{}", ctx.config.app_url, row.org_login);
+    let page = if back_to_ci {
+        format!("{}/o/{}/ci", ctx.config.app_url, row.org_login)
+    } else {
+        format!("{}/o/{}", ctx.config.app_url, row.org_login)
+    };
     let url = polar::portal_url(
         &send(&polar::customer_session(
             &polar.api,
@@ -272,16 +261,13 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
 /// Writes a subscription of an existing tenant, unless the row holds a
 /// newer delivery. Binds the subscription id, tenant, status, customer,
 /// product, period end or NULL, cancel at period end, Polar's modified
-/// time, the time in milliseconds and the product kind (`runners` or
-/// `ci`, see [`polar::product_kind`]).
+/// time and the time in milliseconds.
 const UPSERT_SUBSCRIPTION: &str = "INSERT INTO subscriptions (id, tenant_id, status, \
-    customer_id, product_id, current_period_end, cancel_at_period_end, modified_at, updated_at, \
-    product) \
+    customer_id, product_id, current_period_end, cancel_at_period_end, modified_at, updated_at) \
     SELECT $1::text, id, $3::text, $4::text, $5::text, $6::text, $7::boolean, $8::text, \
-    $9::bigint, $10::text FROM tenants WHERE id = $2 \
+    $9::bigint FROM tenants WHERE id = $2 \
     ON CONFLICT (id) DO UPDATE SET status = excluded.status, \
     customer_id = excluded.customer_id, product_id = excluded.product_id, \
-    product = excluded.product, \
     current_period_end = excluded.current_period_end, \
     cancel_at_period_end = excluded.cancel_at_period_end, \
     modified_at = excluded.modified_at, updated_at = excluded.updated_at \
@@ -318,20 +304,16 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
     let runner_ids = get(env, PRODUCT_ID)
         .map(|list| polar::product_ids(&list))
         .unwrap_or_default();
-    let Some(product) = polar::product_kind(
-        &subscription.product_id,
-        &runner_ids,
-        &get(env, CI_PRODUCT_ID).unwrap_or_default(),
-    ) else {
-        // A product nobody configured: filing it as runners would
-        // license hatchrun.io for a CI plan, so the row is not written.
+    if !runner_ids.contains(&subscription.product_id) {
+        // A product nobody configured must not license anything, so the
+        // row is not written.
         console_error!(
-            "polar webhook: subscription {} is for product {}, in neither POLAR_PRODUCT_ID nor POLAR_CI_PRODUCT_ID",
+            "polar webhook: subscription {} is for product {}, not in POLAR_PRODUCT_ID",
             subscription.id,
             subscription.product_id
         );
         return Ok(Response::empty()?.with_status(202));
-    };
+    }
     let changed = db
         .run(
             UPSERT_SUBSCRIPTION,
@@ -345,11 +327,10 @@ pub(crate) async fn webhook(mut req: Request, env: &Env) -> Result<Response> {
                 subscription.cancel_at_period_end,
                 subscription.modified_at.as_str(),
                 now_ms(),
-                product,
             ],
         )
         .await?;
-    let woken = settle(&db, &subscription, product, changed).await?;
+    let woken = settle(&db, &subscription, changed).await?;
     wake(env, &woken).await;
     Ok(Response::empty()?.with_status(202))
 }
@@ -375,23 +356,10 @@ async fn wake(env: &Env, woken: &[ci_wake::Woken]) {
     }
 }
 
-/// What a stored subscription changes. A `runners` one clears or starts
-/// the tenant's grace period and rechecks waiting jobs. A `ci` one
-/// leaves the runners alone; one that is licensed returns the tenant's
-/// oldest jobs held for the card, for the caller to send to the CI
-/// launch queue.
-async fn settle(
-    db: &Db,
-    subscription: &Subscription,
-    product: &str,
-    changed: u64,
-) -> Result<Vec<ci_wake::Woken>> {
-    if product == "ci" {
-        if changed > 0 && polar::LICENSED.contains(&subscription.status.as_str()) {
-            return ci_wake::card_returned(db, &subscription.tenant).await;
-        }
-        return Ok(Vec::new());
-    }
+/// What a stored subscription changes. A licensed one rechecks waiting
+/// runner launches and returns the tenant's oldest CI jobs held for the
+/// card, for the caller to send to the CI launch queue.
+async fn settle(db: &Db, subscription: &Subscription, changed: u64) -> Result<Vec<ci_wake::Woken>> {
     if changed == 0 {
         console_warn!(
             "subscription {} for tenant {}: no such tenant, or an older delivery",
@@ -399,14 +367,8 @@ async fn settle(
             subscription.tenant
         );
     } else if polar::LICENSED.contains(&subscription.status.as_str()) {
-        usage::clear_grace(db, &subscription.tenant).await?;
         crate::launch::recheck(db, &subscription.tenant).await?;
-    } else if usage::start_grace(db, &subscription.tenant, now_ms()).await? {
-        console_log!(
-            "tenant {}: subscription {} ended past the free minutes, grace period started",
-            subscription.tenant,
-            subscription.id
-        );
+        return ci_wake::card_returned(db, &subscription.tenant).await;
     }
     Ok(Vec::new())
 }
@@ -445,7 +407,6 @@ mod tests {
             cancel,
             modified_at,
             NOW,
-            "runners",
         ]
     }
 
@@ -479,101 +440,102 @@ mod tests {
         assert!(subscription(&db, "t2").is_none());
     }
 
-    /// The values the webhook binds for a delivery of `product_id`.
-    fn product_delivery(id: &str, product_id: &str, status: &str) -> Vec<Param> {
-        params![
-            id,
-            "t1",
-            status,
-            "cus_1",
-            product_id,
-            None::<&str>,
-            false,
-            "2026-10-16T10:00:00Z",
-            NOW,
-            polar::product_kind(product_id, &["p-run".to_owned()], "p-ci").unwrap_or("none"),
-        ]
-    }
-
-    fn stored_product(db: &Db, id: &str) -> serde_json::Value {
-        db.rows(
-            "SELECT product FROM subscriptions WHERE id = $1",
-            &params![id],
-        )
-        .unwrap()[0]["product"]
-            .clone()
-    }
-
     #[test]
-    fn webhook_stores_the_product() {
-        let db = Db::new();
-        tenant(&db, "t1", 11, "acme");
-        db.run(
-            UPSERT_SUBSCRIPTION,
-            &product_delivery("s_ci", "p-ci", "active"),
-        );
-        db.run(
-            UPSERT_SUBSCRIPTION,
-            &product_delivery("s_run", "p-run", "active"),
-        );
-        assert_eq!(stored_product(&db, "s_ci"), "ci");
-        assert_eq!(stored_product(&db, "s_run"), "runners");
+    fn back_to_ci_reads_the_query() {
+        assert!(back_to_ci(Some("return=ci")));
+        assert!(back_to_ci(Some("a=1&return=ci")));
+        assert!(!back_to_ci(Some("return=settings")));
+        assert!(!back_to_ci(None));
     }
 
-    #[test]
-    fn ci_subscription_leaves_the_grace_alone() {
-        let db = Db::new();
-        tenant(&db, "t1", 11, "acme");
-        // Past the free minutes, unpaid.
-        db.run(
-            "INSERT INTO jobs (id, installation_id, repository, run_id, label, status, \
-             queued_at, updated_at, ran_on) VALUES (1, 1, 'acme/app', 7, 'hatchrun', \
-             'completed', 1, 1, 'hatchrun-1-ab')",
-            &[],
-        );
-        db.run(
-            "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed) \
-             VALUES (1, 't1', 4000, $1, false)",
-            &params![NOW + 1_000_000_000_000u64],
-        );
-        db.run(
-            UPSERT_SUBSCRIPTION,
-            &product_delivery("s_ci", "p-ci", "canceled"),
-        );
-        let subscription = Subscription {
-            id: "s_ci".into(),
-            tenant: "t1".into(),
-            status: "canceled".into(),
+    fn subscription_of(id: &str, tenant: &str, status: &str) -> Subscription {
+        Subscription {
+            id: id.into(),
+            tenant: tenant.into(),
+            status: status.into(),
             customer_id: "cus_1".into(),
-            product_id: "p-ci".into(),
+            product_id: "prod_1".into(),
             current_period_end: None,
             cancel_at_period_end: false,
             modified_at: "2026-10-16T10:00:00Z".into(),
-        };
-        db.wait(settle(db.db(), &subscription, "ci", 1)).unwrap();
-        let rows = db
-            .rows("SELECT free_used_up_at FROM tenants WHERE id = 't1'", &[])
-            .unwrap();
-        assert!(rows[0]["free_used_up_at"].is_null());
+        }
+    }
+
+    fn held(db: &Db) -> Vec<serde_json::Value> {
+        db.rows("SELECT held FROM ci_jobs ORDER BY id", &[])
+            .unwrap()
+            .into_iter()
+            .map(|row| row["held"].clone())
+            .collect()
     }
 
     #[test]
-    fn ci_only_tenant_shows_no_runners_subscription() {
+    fn a_licensed_subscription_wakes_jobs_held_for_the_card() {
+        let db = Db::new();
+        tenant(&db, "t1", 11, "acme");
+        db.run(
+            "INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, \
+             private, updated_at) VALUES (7, 't1', 1, 'acme/app', 'main', false, 1)",
+            &[],
+        );
+        db.run(
+            "INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, \
+             ref, sha, actor, status, created_at, updated_at, expires_at) \
+             VALUES ('t1', 7, 'ci', 1, 'd1', 'push', 'refs/heads/main', 'abc', 'octocat', \
+             'queued', 1, 1, 2)",
+            &[],
+        );
+        for plan in ["a", "b"] {
+            db.run(
+                "INSERT INTO ci_jobs (run_id, plan_id, name, status, timeout_minutes, held, \
+                 created_at, updated_at, template, token_permissions, secret_refs) \
+                 SELECT id, $1, $1, 'queued', 10, 'card', 1, 1, 'hatchrun', '{}', '{}' \
+                 FROM ci_runs",
+                &params![plan],
+            );
+        }
+        let ids: Vec<u64> = db
+            .rows("SELECT id FROM ci_jobs ORDER BY id", &[])
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_u64().unwrap())
+            .collect();
+        let canceled = subscription_of("sub_1", "t1", "canceled");
+        assert_eq!(db.wait(settle(db.db(), &canceled, 1)).unwrap(), []);
+        assert_eq!(held(&db), ["card", "card"]);
+        let active = subscription_of("sub_1", "t1", "active");
+        let woken = db.wait(settle(db.db(), &active, 1)).unwrap();
+        let jobs: Vec<u64> = woken.iter().map(|job| job.job_id).collect();
+        assert_eq!(jobs, ids);
+        assert_eq!(held(&db), ["concurrency", "concurrency"]);
+    }
+
+    #[test]
+    fn the_usage_view_bills_paid_seconds_only() {
         let db = Db::new();
         tenant(&db, "t1", 11, "acme");
         db.run(
             UPSERT_SUBSCRIPTION,
-            &product_delivery("s_ci", "p-ci", "active"),
+            &delivery("sub_1", "t1", "active", None, false, "2026-10-16T10:00:00Z"),
         );
-        assert!(subscription(&db, "t1").is_none());
-        let licensed = subscription(&db, "t1")
-            .is_some_and(|row| polar::LICENSED.contains(&row.status.as_str()));
-        assert!(!licensed);
-        db.run(
-            UPSERT_SUBSCRIPTION,
-            &product_delivery("s_run", "p-run", "active"),
-        );
-        assert_eq!(subscription(&db, "t1").unwrap().status, "active");
+        for (job, seconds, billed) in [(1u64, 36_000u64, true), (2, 61, false)] {
+            db.run(
+                "INSERT INTO usage_events (job_id, tenant_id, seconds, ended_at, billed) \
+                 VALUES ($1, 't1', $2, $3, $4)",
+                &params![job, seconds, now_ms(), billed],
+            );
+        }
+        let billing = db.wait(billing(db.db(), "t1", false)).unwrap();
+        let usage = &billing.usage;
+        assert_eq!(usage.seconds, 36_061);
+        assert_eq!(usage.spend_cents, 60);
+        assert_eq!(usage.price_micros_per_minute, 1_000);
+        assert!(usage.may_launch);
+        let json = serde_json::to_value(usage).unwrap();
+        assert!(json.get("spendCents").is_some());
+        for gone in ["freeMinutes", "freeUsedUpAt", "graceEndsAt"] {
+            assert!(json.get(gone).is_none(), "{gone}");
+        }
     }
 
     #[test]

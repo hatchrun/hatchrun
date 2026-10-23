@@ -11,6 +11,7 @@ import type { Plugin } from "vite";
 
 import type { Job, ListedRun, Run } from "../src/api.ts";
 import { handleCi, serveLiveSockets } from "./ci.ts";
+import { billing as ciBilling } from "./ci-settings.ts";
 import * as profiles from "./runners.ts";
 
 interface MockTenant {
@@ -28,12 +29,9 @@ interface MockTenant {
   allowedRegions: string[] | null;
   beta: boolean;
   subscription: null | { status: string; currentPeriodEnd: string | null; cancelAtPeriodEnd: boolean };
-  /** Job minutes this month. */
-  minutes: number;
+  /** Runner seconds this month. */
+  seconds: number;
 }
-
-const FREE_MINUTES = 3000;
-const GRACE_MS = 7 * 24 * 3600 * 1000;
 
 interface State {
   signedIn: boolean;
@@ -57,13 +55,7 @@ function tenantView(tenant: MockTenant) {
   const now = new Date();
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   const monthEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
-  // MOCK_USAGE=near, grace or stopped puts unpaid tenants at that point.
-  const minutes = { near: 2600, grace: 3400, stopped: 3900 }[process.env.MOCK_USAGE ?? ""] ?? tenant.minutes;
-  const usedUpAt =
-    minutes >= FREE_MINUTES
-      ? new Date(Date.now() - (process.env.MOCK_USAGE === "stopped" ? 8 : 2) * 24 * 3600 * 1000)
-      : null;
-  const graceEndsAt = usedUpAt && !licensed ? new Date(usedUpAt.getTime() + GRACE_MS) : null;
+  const { seconds } = tenant;
   return {
     ...tenant,
     billing: {
@@ -73,11 +65,10 @@ function tenantView(tenant: MockTenant) {
       usage: {
         monthStart: monthStart.toISOString(),
         monthEnd: monthEnd.toISOString(),
-        minutes,
-        freeMinutes: FREE_MINUTES,
-        freeUsedUpAt: usedUpAt?.toISOString() ?? null,
-        graceEndsAt: graceEndsAt?.toISOString() ?? null,
-        mayLaunch: licensed || graceEndsAt === null || graceEndsAt.getTime() > Date.now(),
+        seconds,
+        spendCents: licensed && !tenant.beta ? Math.floor(Math.floor((seconds * 1_000) / 60) / 10_000) : 0,
+        priceMicrosPerMinute: 1_000,
+        mayLaunch: licensed,
       },
     },
     steps: { app: tenant.installationId !== null, aws: tenant.aws !== null },
@@ -141,30 +132,9 @@ const routes: Record<string, Handler> = {
     const tenant = findTenant(url.pathname.split("/")[3] ?? "");
     return tenant ? [200, tenantView(tenant)] : [404, { error: "no organization here" }];
   },
-  "GET /api/plan": () =>
-    // MOCK_BILLING=off answers like a Worker without a Polar product.
-    process.env.MOCK_BILLING === "off"
-      ? [503, { error: "billing is not set up yet" }]
-      : [
-          200,
-          {
-            plans: [
-              {
-                id: "prod_metered",
-                name: "hatchrun",
-                description: "Per job minute past 3,000 free minutes a month",
-                amount: null,
-                currency: "usd",
-                interval: "month",
-                unitAmount: "0.1",
-                capAmount: null,
-              },
-            ],
-          },
-        ],
   "POST /api/tenants/:org/checkout": (_req, url) => {
     const org = url.pathname.split("/")[3] ?? "";
-    return [200, { url: `/api/mock/polar?org=${org}` }];
+    return [200, { url: `/api/mock/polar?org=${org}${url.searchParams.get("return") === "ci" ? "&return=ci" : ""}` }];
   },
   "GET /api/mock/polar": (_req, url) => {
     const org = url.searchParams.get("org") ?? "";
@@ -175,9 +145,16 @@ const routes: Record<string, Handler> = {
         tenant.subscription = { status: "active", currentPeriodEnd: end, cancelAtPeriodEnd: false };
       }, 4000);
     }
+    if (url.searchParams.get("return") === "ci") {
+      ciBilling.card = true;
+      return `/o/${org}/ci?checkout=mock`;
+    }
     return `/o/${org}/settings?checkout=mock`;
   },
-  "POST /api/tenants/:org/portal": (_req, url) => [200, { url: `/o/${url.pathname.split("/")[3]}?portal=mock` }],
+  "POST /api/tenants/:org/portal": (_req, url) => {
+    const org = url.pathname.split("/")[3];
+    return [200, { url: url.searchParams.get("return") === "ci" ? `/o/${org}/ci?portal=mock` : `/o/${org}?portal=mock` }];
+  },
   "POST /api/tenants/:org/beta": (_req, url, body) => {
     const tenant = findTenant(url.pathname.split("/")[3] ?? "");
     if (!tenant) {
@@ -447,7 +424,7 @@ function adopt(installationId: number): MockTenant | null {
       allowedRegions: null,
       beta: false,
       subscription: null,
-      minutes: 1240,
+      seconds: 74_400,
     };
     state.tenants.push(tenant);
   }

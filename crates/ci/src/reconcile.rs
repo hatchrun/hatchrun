@@ -731,14 +731,23 @@ async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), 
     ci_wake::release_spend_caps(db, now.saturating_sub(HELD_QUIET_MS))
         .await
         .map_err(|e| e.to_string())?;
-    let stale = ci_wake::stale(
-        db,
-        now.saturating_sub(HELD_QUIET_MS),
-        MAX_RUNNING_JOBS,
-        HELD_BUDGET,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    // An approval hold whose environment is gone or has approval off, or
+    // whose attempt was decided, has nobody to wait for; the change that
+    // freed it may have failed to wake it.
+    let mut stale =
+        ci_wake::release_orphan_approvals(db, now.saturating_sub(HELD_QUIET_MS), now, HELD_BUDGET)
+            .await
+            .map_err(|e| e.to_string())?;
+    stale.extend(
+        ci_wake::stale(
+            db,
+            now.saturating_sub(HELD_QUIET_MS),
+            MAX_RUNNING_JOBS,
+            HELD_BUDGET,
+        )
+        .await
+        .map_err(|e| e.to_string())?,
+    );
     let wakes = paid_wakes(&stale, budget);
     if wakes.len() < stale.len() {
         console_error!("reconcile: held-job budget spent, the rest wait");
@@ -767,31 +776,36 @@ async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> 
         EndAction::Retry => Err(format!("could not end it: {answer:?}")),
         EndAction::GiveUp => {
             console_error!("reconcile: job {}: no run object, failing the row", row.id);
-            let ended =
-                store::finish_job(db, row.id, row.attempt, "failure", &row.steps, None, now)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            if !ended {
-                return Ok(());
-            }
-            let Some(run) = store::run(db, row.run_id)
-                .await
-                .map_err(|e| e.to_string())?
-            else {
-                return Ok(());
-            };
-            launches::wake_oldest(env, db, &run.tenant_id).await;
-            let jobs = store::jobs_for_run(db, run.id)
-                .await
-                .map_err(|e| e.to_string())?;
-            if jobs.iter().all(|job| job.status == "completed") {
-                store::finish_run(db, run.id, run.run_attempt, "failure", now)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(())
+            fail_row(env, db, row, now).await
         }
     }
+}
+
+/// Completes the attempt of `row` as failed in the database, for a job
+/// no run object holds, and the run with it once every job is over.
+pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Result<(), String> {
+    let ended = store::finish_job(db, row.id, row.attempt, "failure", &row.steps, None, now)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !ended {
+        return Ok(());
+    }
+    let Some(run) = store::run(db, row.run_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    launches::wake_oldest(env, db, &run.tenant_id).await;
+    let jobs = store::jobs_for_run(db, run.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if jobs.iter().all(|job| job.status == "completed") {
+        store::finish_run(db, run.id, run.run_attempt, "failure", now)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Step 4. Terminates as many orphans as `budget` pays for.
@@ -1094,7 +1108,7 @@ fn usage_events(rows: &[store::UnsentUsage]) -> Vec<CiUsage<'_>> {
             attempt: row.attempt,
             tenant: &row.tenant_id,
             template: &row.template,
-            minutes: row.minutes,
+            seconds: row.seconds,
             units: row.units,
             at: hatchrun_cloud::format_rfc3339(row.ended_at),
         })
@@ -1267,7 +1281,7 @@ async fn reseal_secrets(env: &Env, db: &Db, budget: &Budget) -> Result<(), Strin
         }
         let aad = secrets::Aad {
             tenant: &row.tenant,
-            repo_id: row.repo_id,
+            owner: row.owner(),
             name: &row.name,
         };
         let sealed = secrets::fresh_nonce().and_then(|nonce| {
@@ -1599,13 +1613,13 @@ mod tests {
         }
     }
 
-    fn usage_row(job_id: u64, template: &str, minutes: u64, units: u64) -> store::UnsentUsage {
+    fn usage_row(job_id: u64, template: &str, seconds: u64, units: u64) -> store::UnsentUsage {
         store::UnsentUsage {
             job_id,
             attempt: 2,
             tenant_id: "t1".into(),
             template: template.into(),
-            minutes,
+            seconds,
             units,
             ended_at: NOW,
         }
@@ -1614,14 +1628,15 @@ mod tests {
     #[test]
     fn usage_events_carry_the_units_recorded_at_completion() {
         let rows = [
-            usage_row(7, "ubuntu-26.04-8core", 5, 20),
-            usage_row(8, "retired", 3, 3),
+            usage_row(7, "ubuntu-26.04-8core", 300, 1_200),
+            usage_row(8, "retired", 180, 180),
         ];
         let events = usage_events(&rows);
         assert_eq!((events[0].job_id, events[0].attempt), (7, 2));
-        assert_eq!(events[0].units, 20);
+        assert_eq!(events[0].units, 1_200);
+        assert_eq!(events[0].seconds, 300);
         assert_eq!(events[0].at, "2026-10-22T13:45:00Z");
-        assert_eq!(events[1].units, 3);
+        assert_eq!(events[1].units, 180);
     }
 
     #[allow(clippy::unnecessary_wraps)] // The argument of `judge`.

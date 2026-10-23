@@ -34,13 +34,13 @@ pub fn month_start(now_ms: u64) -> u64 {
 #[must_use]
 pub fn units(standing: &Standing) -> u64 {
     standing
-        .minutes_by_template
+        .seconds_by_template
         .iter()
-        .filter_map(|(label, minutes)| templates::template(label).map(|t| t.units(*minutes)))
+        .filter_map(|(label, seconds)| templates::template(label).map(|t| t.units(*seconds)))
         .sum()
 }
 
-/// What this month's usage costs past the free units, in micros.
+/// What this month's usage costs, in micros.
 #[must_use]
 pub fn spend_micros(standing: &Standing) -> u64 {
     templates::spend_micros(units(standing))
@@ -52,13 +52,12 @@ pub fn spend_micros(standing: &Standing) -> u64 {
 pub struct BillingView {
     /// Whether a card is on file.
     pub card: bool,
-    /// Runner minutes used this month, of every template.
-    pub minutes: u64,
-    /// Billing units used this month.
+    /// Billed runner seconds this month, of every template; every
+    /// attempt counts at least 60.
+    pub seconds: u64,
+    /// Billing units used this month; one unit is one 2 vCPU second.
     pub units: u64,
-    /// Units free each month.
-    pub free_units: u64,
-    /// What this month's usage costs past the free units, in cents.
+    /// What this month's usage costs, in cents.
     pub spend_cents: u64,
     /// The monthly spend cap, in whole dollars.
     pub cap_dollars: u64,
@@ -77,9 +76,8 @@ pub struct BillingView {
 pub fn view(standing: &Standing) -> BillingView {
     BillingView {
         card: standing.card,
-        minutes: standing.minutes_by_template.iter().map(|(_, m)| m).sum(),
+        seconds: standing.seconds_by_template.iter().map(|(_, s)| s).sum(),
         units: units(standing),
-        free_units: templates::FREE_UNITS,
         spend_cents: spend_micros(standing) / MICROS_PER_CENT,
         cap_dollars: standing.cap_micros / MICROS_PER_DOLLAR,
         min_cap_dollars: templates::MIN_SPEND_CAP_MICROS / MICROS_PER_DOLLAR,
@@ -177,13 +175,13 @@ pub fn admission(standing: &Standing) -> Option<Hold> {
 mod tests {
     use super::*;
 
-    fn standing(minutes: &[(&str, u64)]) -> Standing {
+    fn standing(seconds: &[(&str, u64)]) -> Standing {
         Standing {
             tenant_id: "t1".into(),
             org_login: "acme".into(),
             card: true,
             cap_micros: templates::DEFAULT_SPEND_CAP_MICROS,
-            minutes_by_template: minutes.iter().map(|(l, m)| ((*l).into(), *m)).collect(),
+            seconds_by_template: seconds.iter().map(|(l, s)| ((*l).into(), *s)).collect(),
             running: 0,
         }
     }
@@ -203,17 +201,16 @@ mod tests {
     #[test]
     fn view_from_standing() {
         let v = view(&standing(&[
-            ("ubuntu-latest", 400),
-            ("ubuntu-26.04-4core", 100),
+            ("ubuntu-latest", 24_000),
+            ("ubuntu-26.04-4core", 6_000),
         ]));
         assert_eq!(
             v,
             BillingView {
                 card: true,
-                minutes: 500,
-                units: 600,
-                free_units: 500,
-                spend_cents: 20,
+                seconds: 30_000,
+                units: 36_000,
+                spend_cents: 120,
                 cap_dollars: 50,
                 min_cap_dollars: 50,
                 max_cap_dollars: 10_000,
@@ -222,8 +219,10 @@ mod tests {
             }
         );
         let json = serde_json::to_value(&v).unwrap();
-        assert_eq!(json["spendCents"], 20);
-        assert_eq!(json["freeUnits"], 500);
+        assert_eq!(json["seconds"], 30_000);
+        assert_eq!(json["spendCents"], 120);
+        assert!(json.get("freeUnits").is_none());
+        assert!(json.get("minutes").is_none());
         assert_eq!(json["maxRunning"], 5);
         assert_eq!(json["minCapDollars"], 50);
         assert_eq!(json["maxCapDollars"], 10_000);
@@ -238,25 +237,26 @@ mod tests {
     }
 
     #[test]
-    fn spend_counts_after_free_units() {
-        let s = standing(&[("ubuntu-latest", 400), ("ubuntu-26.04-4core", 100)]);
-        assert_eq!(units(&s), 600);
-        assert_eq!(spend_micros(&s), 200_000);
-        assert_eq!(spend_micros(&standing(&[("ubuntu-latest", 500)])), 0);
+    fn spend_counts_every_unit() {
+        let s = standing(&[("ubuntu-latest", 24_000), ("ubuntu-26.04-4core", 6_000)]);
+        assert_eq!(units(&s), 36_000);
+        assert_eq!(spend_micros(&s), 1_200_000);
+        assert_eq!(spend_micros(&standing(&[("ubuntu-latest", 60)])), 2_000);
         assert_eq!(units(&standing(&[("no-such", 9)])), 0);
     }
 
     #[test]
     fn admission_order() {
-        let mut s = standing(&[("ubuntu-latest", 100_000)]);
+        let mut s = standing(&[("ubuntu-latest", 6_000_000)]);
         s.card = false;
         s.running = 5;
         assert_eq!(admission(&s), Some(Hold::Card));
         s.card = true;
-        s.minutes_by_template = vec![("ubuntu-latest".into(), 25_500)];
+        s.seconds_by_template = vec![("ubuntu-latest".into(), 1_500_000)];
         assert_eq!(spend_micros(&s), templates::DEFAULT_SPEND_CAP_MICROS);
         assert_eq!(admission(&s), Some(Hold::SpendCap));
-        s.minutes_by_template = vec![("ubuntu-latest".into(), 600)];
+        s.seconds_by_template = vec![("ubuntu-latest".into(), 1_499_999)];
+        assert_eq!(spend_micros(&s), 49_999_966);
         assert_eq!(admission(&s), Some(Hold::Concurrency));
         s.running = 4;
         assert_eq!(admission(&s), None);

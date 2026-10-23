@@ -103,22 +103,33 @@ const liveMessages: unknown[] = [
 const now = Date.now();
 const minute = 60_000;
 
+/** The user the mock session signs in as (mock/api.ts). */
+const approver = "octocat";
+
 interface Job {
   id: number;
+  /** The run the job belongs to. */
+  run: number;
   name: string;
-  status: "in_progress" | "completed";
+  status: "queued" | "in_progress" | "completed";
   conclusion: string | null;
-  started_at: number;
+  started_at: number | null;
   completed_at: number | null;
   steps: Step[];
+  held: string | null;
+  environment: string | null;
+  approval: { decision: "approved" | "rejected"; by: string; at: number } | null;
 }
 
 const jobs: Job[] = [
-  { id: 1, name: "build (host)", status: "completed", conclusion: "failure", started_at: now - 9 * minute, completed_at: now - 8 * minute, steps: finishedSteps },
-  { id: 2, name: "test (host)", status: "in_progress", conclusion: null, started_at: now - 30_000, completed_at: null, steps: liveSteps },
+  { id: 1, run: 1, name: "build (host)", status: "completed", conclusion: "failure", started_at: now - 9 * minute, completed_at: now - 8 * minute, steps: finishedSteps, held: null, environment: null, approval: null },
+  { id: 2, run: 1, name: "test (host)", status: "in_progress", conclusion: null, started_at: now - 30_000, completed_at: null, steps: liveSteps, held: null, environment: null, approval: null },
+  // Waits for an organization admin: Approve runs it, Reject fails it.
+  { id: 3, run: 3, name: "deploy", status: "queued", conclusion: null, started_at: null, completed_at: null, steps: [], held: "approval", environment: "production", approval: null },
 ];
 
 const runs = [
+  run(3, 3, "deploy", "workflow_dispatch", "refs/heads/main", "queued", null, now - minute, null),
   run(2, 2, "ci", "push", "refs/heads/main", "completed", "success", now - 3 * 60 * minute, now - 3 * 60 * minute + 4 * minute),
   run(1, 1, "ci", "workflow_dispatch", "refs/heads/main", "in_progress", null, now - 10 * minute, null),
 ];
@@ -156,6 +167,9 @@ const jobJson = (job: Job) => ({
       ? job.steps.map(summary)
       : job.steps.slice(0, 2).map((step) => ({ index: step.index, name: step.name, summary: step.index < 1 ? summary(step) : null })),
   has_log: job.status === "completed",
+  held: job.held,
+  environment: job.environment,
+  approval: job.approval,
 });
 
 /** The dispatch inputs the mock workflow `ci` declares. */
@@ -261,7 +275,40 @@ export async function handleCi(
     if (!wanted) {
       return hidden();
     }
-    return json(res, 200, { run: wanted, jobs: wanted.id === 1 ? jobs.map(jobJson) : [] });
+    return json(res, 200, { run: wanted, jobs: jobs.filter((job) => job.run === wanted.id).map(jobJson) });
+  }
+
+  if ((found = /^jobs\/(\d+)\/(approve|reject)$/.exec(path))) {
+    const job = jobs.find((candidate) => candidate.id === Number(found?.[1]));
+    if (req.method !== "POST" || !job) {
+      return hidden();
+    }
+    if (!session.signedIn) {
+      return json(res, 401, { error: "sign in to approve or reject jobs" });
+    }
+    if (req.headers["x-csrf-token"] !== session.csrf) {
+      return json(res, 403, { error: "missing or wrong CSRF token" });
+    }
+    if (job.held !== "approval") {
+      return json(res, 409, { error: "This job is not waiting for approval" });
+    }
+    const at = Date.now();
+    job.held = null;
+    if (found[2] === "approve") {
+      job.approval = { decision: "approved", by: approver, at };
+    } else {
+      job.approval = { decision: "rejected", by: approver, at };
+      job.status = "completed";
+      job.conclusion = "failure";
+      job.completed_at = at;
+      const owner = runs.find((candidate) => candidate.id === job.run);
+      if (owner) {
+        owner.status = "completed";
+        owner.conclusion = "failure";
+        owner.completed_at = at;
+      }
+    }
+    return void res.writeHead(204).end();
   }
 
   if ((found = /^jobs\/(\d+)\/(log|log\/index)$/.exec(path))) {
@@ -273,7 +320,7 @@ export async function handleCi(
     if (found[2] === "log/index") {
       return finished ? json(res, 200, indexOf(job.steps)) : json(res, 404, { error: "no index" });
     }
-    const whole = finished ? text(job.steps) : backlog;
+    const whole = finished ? text(job.steps) : job.status === "queued" ? "" : backlog;
     res.statusCode = 200;
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     if (!finished) {
@@ -319,7 +366,7 @@ export function serveLiveSockets(server: Server) {
     if (!job || typeof key !== "string") {
       return refuse("404 Not Found");
     }
-    if (job.status === "completed") {
+    if (job.status !== "in_progress") {
       return refuse("409 Conflict");
     }
     const accept = createHash("sha1").update(key + GUID).digest("base64");

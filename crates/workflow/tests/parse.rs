@@ -219,3 +219,21 @@ fn files_past_the_parser_limits_get_a_plain_message() {
         );
     }
 }
+
+#[test]
+fn job_environment_round_trips() {
+    let config = parse(
+        "
+jobs: { deploy: { runs-on: ubuntu-latest, environment: production, steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
+",
+    )
+    .unwrap();
+    assert_eq!(
+        config.jobs["deploy"].environment.as_deref(),
+        Some("production")
+    );
+    let yaml = hatchrun_workflow::to_yaml(&config);
+    assert!(yaml.contains("environment: production"), "{yaml}");
+    assert_eq!(parse(&yaml).unwrap(), config);
+}

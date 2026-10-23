@@ -365,11 +365,17 @@ Decided by the owner on 2026-10-20.
   therefore creates one check run per job and updates it when a step
   ends, never per log line, and backs off on `403`/`429` with
   `retry-after`.
-- **Billing and abuse.** A card is required before the first job.
-  Each organization gets 500 free minutes a month, at most 5 jobs
-  running at once to start, and a $50 monthly spend cap the customer
-  can raise. Launches past a cap wait in the queue and the check run
-  says why.
+- **Billing and abuse.** A card is required before the first job. At most 5
+  jobs running at once to start, and a $50 monthly spend cap the customer
+  can raise. Launches past a cap wait in the queue and the check run says
+  why. The card is the hatchrun.io subscription: CI minutes are billed on
+  the same Polar product as runner minutes, through a metered price on the
+  meter that sums the `units` of `ci.usage` events. Decided 2026-10-24.
+- **Per-second billing.** Every CI job attempt and every hatchrun.io
+  runner job is billed its seconds rounded up, at least 60. A CI unit
+  is one 2 vCPU second, so 4, 8 and 16 vCPU templates count 2, 4 and 8
+  units a second at $0.002 per 2 vCPU minute; runner time costs $0.001
+  a minute. There is no free allowance. Decided 2026-10-24.
 
 ## Left to the builder
 
@@ -384,4 +390,11 @@ Decided by the owner on 2026-10-20.
 - How jobs reach the cache and artifact services that
   `actions/cache` and `actions/upload-artifact` expect. The hatchrun.io
   cache proxy on the runner is the starting point.
-
+- **Organization secrets and vars** (2026-10-24). An organization's
+  secrets and vars reach all of its repositories or a selected list of
+  them.
+- **Environments** (2026-10-24). A repository defines environments
+  with branch patterns and, optionally, admin approval for each attempt
+  of a job that names one. Environments hold their own secrets and
+  vars, which win over repository values, which win over organization
+  values.
