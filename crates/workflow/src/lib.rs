@@ -12,6 +12,7 @@ pub mod config;
 pub mod convert;
 pub mod cron;
 pub mod diagnostic;
+pub mod environment;
 pub mod expr;
 pub mod job;
 pub mod permissions;
@@ -28,6 +29,7 @@ pub use config::{
 pub use convert::{Conversion, convert, to_yaml};
 pub use cron::{Cron, UtcMinute};
 pub use diagnostic::Diagnostic;
+pub use environment::{ENVIRONMENT_NAME_MAX, valid_environment_name};
 pub use expr::{
     ExprError, Functions, JobStatus, checks_status, evaluate, interpolate, job_condition,
     secret_refs, truthy,
@@ -41,8 +43,8 @@ pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, config_errors, v
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;
 pub use templates::{
-    Arch, DEFAULT_SPEND_CAP_MICROS, FREE_UNITS, MAX_RUNNING_JOBS, MAX_SPEND_CAP_MICROS,
-    MIN_SPEND_CAP_MICROS, TEMPLATES, Template, UNIT_PRICE_MICROS, dollars, spend_micros, template,
+    Arch, DEFAULT_SPEND_CAP_MICROS, MAX_RUNNING_JOBS, MAX_SPEND_CAP_MICROS, MIN_SPEND_CAP_MICROS,
+    TEMPLATES, Template, UNIT_PRICE_MICROS_PER_MINUTE, dollars, spend_micros, template,
     template_labels,
 };
 pub use trigger::{

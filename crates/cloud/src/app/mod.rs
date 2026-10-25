@@ -20,7 +20,7 @@
 //!   job's CPU and memory (see [`metrics`]).
 //! - `/api/tenants/<org>/runners` manages runner profiles (see
 //!   [`runners`]).
-//! - `/api/plan`, `/api/tenants/<org>/{checkout,portal,beta}` and
+//! - `/api/tenants/<org>/{checkout,portal,beta}` and
 //!   `/api/polar/webhook` handle the licence (see [`billing`]).
 //! - `POST /api/internal/images` takes runner image releases from the
 //!   images build (see [`images`]).
@@ -273,6 +273,8 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         session: &current,
     };
     let segments: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
+    let query = req.url()?.query().map(str::to_owned);
+    let back_to_ci = billing::back_to_ci(query.as_deref());
     let answer = match (method, segments.as_slice()) {
         (Method::Get, ["session"]) => session_json(&current),
         (Method::Get, ["installations"]) => tenants::installations(&ctx).await,
@@ -290,9 +292,10 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         (method, ["tenants", org, "runners", rest @ ..]) => {
             runners::route(&ctx, org, method, rest, &mut req).await
         }
-        (Method::Get, ["plan"]) => billing::plan(&ctx).await,
-        (Method::Post, ["tenants", org, "checkout"]) => billing::checkout(&ctx, org).await,
-        (Method::Post, ["tenants", org, "portal"]) => billing::portal(&ctx, org).await,
+        (Method::Post, ["tenants", org, "checkout"]) => {
+            billing::checkout(&ctx, org, back_to_ci).await
+        }
+        (Method::Post, ["tenants", org, "portal"]) => billing::portal(&ctx, org, back_to_ci).await,
         (Method::Post, ["tenants", org, "beta"]) => {
             billing::redeem(&ctx, org, req.json().await?).await
         }

@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Diagnostic, Event, FREE_UNITS, JobKind, Plan};
+use hatchrun_workflow::{Diagnostic, Event, JobKind, Plan};
 use serde_json::Value;
 use worker::{Env, Method, RequestInit, Result};
 
@@ -229,10 +229,7 @@ pub fn no_card_check_run(sha: &str, org: &str, app_url: &str) -> CheckRun {
         completed_at: None,
         output: Some(Output {
             title: "hatchrun needs a card".to_owned(),
-            summary: format!(
-                "Add a card for {org} at {page} to run this commit's workflows. \
-                 Each organization gets {FREE_UNITS} free minutes a month."
-            ),
+            summary: format!("Add a card for {org} at {page} to run this commit's workflows."),
             text: None,
             annotations: Vec::new(),
         }),
@@ -266,7 +263,7 @@ fn billing_decision(billing: CiBilling, plans: usize) -> Billing {
 /// (the webhook also needs it for schedules and path filters).
 ///
 /// Nothing starts for a commit without a config, a missing tenant, or a
-/// tenant that never had a CI subscription. A tenant whose subscription
+/// tenant that never had a subscription. A tenant whose subscription
 /// lapsed gets one `action_required` card check run when a workflow
 /// would run, and nothing otherwise. For a tenant with a card, a config
 /// that does not parse or compile gets one failed check run. Each planned workflow becomes a run with
@@ -450,6 +447,7 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
                 },
                 token_permissions: job.token_permissions.clone(),
                 secret_refs: job.secret_refs(),
+                environment: job.environment.clone(),
             })
             .collect();
         store::insert_jobs(db, run.id, &jobs, now).await?;
@@ -556,8 +554,7 @@ mod tests {
         assert_eq!(output.title, "hatchrun needs a card");
         assert_eq!(
             output.summary,
-            "Add a card for acme at https://app.example/o/acme/ci to run this commit's \
-             workflows. Each organization gets 500 free minutes a month."
+            "Add a card for acme at https://app.example/o/acme/ci to run this commit's workflows."
         );
         assert_eq!(output.annotations.len(), 0);
     }
@@ -650,6 +647,7 @@ mod tests {
             template: Some("ubuntu-latest".into()),
             token_permissions: BTreeMap::new(),
             secret_refs: SecretRefs::default(),
+            environment: None,
         }];
         let ids = db
             .wait(store::insert_jobs(db.db(), run.id, &jobs, 1))

@@ -248,8 +248,8 @@ fn seed_people(now: u64) -> Vec<String> {
         ),
         format!(
             "INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, \
-             product, current_period_end, cancel_at_period_end, modified_at, updated_at) \
-             SELECT 'sub_' || id, id, 'active', 'cus_' || id, 'prod_hatchrun', 'runners', \
+             current_period_end, cancel_at_period_end, modified_at, updated_at) \
+             SELECT 'sub_' || id, id, 'active', 'cus_' || id, 'prod_hatchrun', \
              '2026-12-01T00:00:00Z', false, '2026-10-01T00:00:00Z', {now} FROM tenants \
              WHERE id = '{TENANT}' OR org_id - 9000000 BETWEEN 11 AND 20"
         ),
@@ -389,7 +389,7 @@ fn jobs_sql(last: u64, now: u64) -> String {
     )
 }
 
-/// Lost launches, each run's end, and the minutes of the jobs that ran.
+/// Lost launches, each run's end, and the runner seconds of the jobs that ran.
 fn seed_jobs_after(now: u64) -> Vec<String> {
     vec![
         // Installation 1045's tenant is not verified; 9999 has none.
@@ -410,18 +410,17 @@ fn seed_jobs_after(now: u64) -> Vec<String> {
            WHERE current GROUP BY run_id HAVING bool_and(status = 'completed')) AS ends \
          WHERE runs.id = ends.run_id"
             .to_owned(),
-        // One in a thousand jobs has no minutes, and a few more in the last
+        // One in a thousand jobs has no seconds, and a few more in the last
         // day, for the sweep.
         format!(
-            "INSERT INTO usage_events (job_id, tenant_id, minutes, ended_at, billed, sent_at) \
+            "INSERT INTO usage_events (job_id, tenant_id, seconds, ended_at, billed, sent_at) \
              SELECT jobs.id, tenants.id, \
-             GREATEST(1, (jobs.completed_at - jobs.started_at + 59999) / 60000), \
+             GREATEST(60, (jobs.completed_at - jobs.started_at + 999) / 1000), \
              jobs.completed_at, billed, \
              CASE WHEN billed AND jobs.completed_at < {now} - 300000 \
                THEN jobs.completed_at + 120000 END \
              FROM jobs JOIN (SELECT id, installation_id, NOT beta AND EXISTS \
-               (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
-               AND subscriptions.product = 'runners') \
+               (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id) \
                AS billed FROM tenants) AS tenants \
              ON tenants.installation_id = jobs.installation_id \
              WHERE jobs.status = 'completed' AND jobs.ran_on IS NOT NULL \
@@ -516,7 +515,7 @@ struct Fixture {
     finished: Vec<(u64, String)>,
     /// A completed job half way back.
     old_job: u64,
-    /// A job that ran and completed in the last day without minutes:
+    /// A job that ran and completed in the last day without seconds:
     /// id, start and end.
     unrecorded: (u64, u64, u64),
     /// A run still going, and its attempt.
@@ -579,7 +578,7 @@ impl Fixture {
                  ORDER BY completed_at DESC LIMIT 1"
             ),
         );
-        let unrecorded = unrecorded.first().expect("a job without minutes");
+        let unrecorded = unrecorded.first().expect("a job without seconds");
         let open_run = select(
             td,
             &format!("SELECT id, attempt FROM runs WHERE {main} AND ended_at IS NULL LIMIT 1"),
@@ -1330,20 +1329,14 @@ fn retention_cases(now: u64) -> Vec<Case> {
 fn usage_cases(fx: &Fixture) -> Vec<Case> {
     let now = fx.now;
     let (job, started, completed) = fx.unrecorded;
-    let minutes = usage::minutes(started, completed);
+    let seconds = usage::job_seconds(started, completed);
     vec![
         read("usage month_sql", usage::month_sql(), params![TENANT]),
         write(
             "usage insert_sql",
             usage::insert_sql(),
-            params![job, minutes, completed],
+            params![job, seconds, completed],
         ),
-        write(
-            "usage used_up_sql",
-            usage::used_up_sql(),
-            params![job, now, usage::FREE_MINUTES],
-        )
-        .after(usage::insert_sql(), params![job, minutes, completed]),
         write(
             "usage sweep_sql",
             usage::sweep_sql(),
@@ -1784,7 +1777,7 @@ fn round_trips(td: &testdb::Db, s: &Settings, fx: &Fixture) -> Vec<Trip> {
     trips
 }
 
-/// A running job moving to completed, and its minutes.
+/// A running job moving to completed, and its runner seconds.
 async fn progress_once(fast: &Db, db: &Db, fx: &Fixture, id: u64) -> Result<Duration, String> {
     let now = fx.now;
     fresh_job(fast, id, fx.open_run.0, now - 10 * MINUTE).await?;
@@ -1808,7 +1801,7 @@ async fn progress_once(fast: &Db, db: &Db, fx: &Fixture, id: u64) -> Result<Dura
     jobs::progress(db, id, "completed", Some(&runner), &outcome, now)
         .await
         .map_err(text)?;
-    usage::record(db, id, now - 9 * MINUTE, now, now)
+    usage::record(db, id, now - 9 * MINUTE, now)
         .await
         .map_err(text)?;
     Ok(started.elapsed())
@@ -1931,7 +1924,7 @@ async fn reconcile_pass(db: &Db, fx: &Fixture) -> Result<(), String> {
     jobs::unconnected::<Value>(db, now - limits.queued_grace, UNCONNECTED_PER_PASS)
         .await
         .map_err(text)?;
-    usage::sweep(db, now - DAY, DELETE_BATCH, now)
+    usage::sweep(db, now - DAY, DELETE_BATCH)
         .await
         .map_err(text)?;
     usage::unsent(db, 500).await.map_err(text)?;

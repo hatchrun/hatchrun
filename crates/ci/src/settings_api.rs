@@ -8,25 +8,34 @@
 //! | Route | Needs | Answer |
 //! | --- | --- | --- |
 //! | `GET /api/ci/orgs/{org}/billing` | org admin | [`BillingView`](crate::billing::BillingView) |
-//! | `POST /api/ci/orgs/{org}/billing/checkout` | org admin, CSRF | `{"url": ...}` |
-//! | `POST /api/ci/orgs/{org}/billing/portal` | org admin, CSRF | `{"url": ...}` |
 //! | `PUT /api/ci/orgs/{org}/billing/cap` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/secrets` | org admin | `[{"name", "updatedAt"}]` |
+//! | `GET /api/ci/orgs/{org}/secrets` | org admin | `[{"name", "updatedAt", "repositories"}]` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/secrets/{name}` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/vars` | org admin | `[{"name", "value", "updatedAt"}]` |
+//! | `GET /api/ci/orgs/{org}/vars` | org admin | `[{"name", "value", "updatedAt", "repositories"}]` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/vars/{name}` | org admin, CSRF | `204` |
+//! | `GET /api/ci/orgs/{org}/repositories` | org admin | `[{"name"}]` |
+//! | `GET /api/ci/repos/{owner}/{repo}/environments` | repo admin | `[{"name", "branches", "approval", "updatedAt"}]` |
+//! | `PUT /api/ci/repos/{owner}/{repo}/environments/{env}` | repo admin, CSRF | the environment |
+//! | `DELETE /api/ci/repos/{owner}/{repo}/environments/{env}` | repo admin, CSRF | `204` |
+//! | `GET /api/ci/repos/{owner}/{repo}/environments/{env}/(secrets\|vars)` | repo admin | as for an organization |
+//! | `PUT, DELETE /api/ci/repos/{owner}/{repo}/environments/{env}/(secrets\|vars)/{name}` | repo admin, CSRF | `204` |
 //!
-//! The same four under `/api/ci/repos/{owner}/{repo}/` need admin
-//! access to the repository. No route answers a secret's value.
+//! The secret and variable routes under `/api/ci/repos/{owner}/{repo}/`
+//! need admin access to the repository, as do the environment routes.
+//! No route answers a secret's value.
+//!
+//! An organization secret or variable reaches every repository
+//! (`repositories` is `null`) or the repositories named in the list.
+//! Repository and environment rows have no such list.
 //!
 //! An organization with no tenant, and a user who is not an active
 //! admin of it, both get `404`. `api::serve` runs the Origin, CSRF and
 //! body checks of every mutating method before it calls [`handle`].
 
-use hatchrun_cloud::ci_wake;
-use hatchrun_cloud::fetch::send;
-use hatchrun_cloud::polar;
+use hatchrun_cloud::ci_wake::{self, Woken};
+use hatchrun_cloud::db::Db;
 use hatchrun_cloud::tenant::valid_login;
+use hatchrun_workflow::valid_environment_name;
 use serde::Deserialize;
 use serde_json::json;
 use worker::{Method, Request, Result, console_error};
@@ -34,9 +43,10 @@ use worker::{Method, Request, Result, console_error};
 use crate::access::{self, Access, Failure};
 use crate::api::{Cx, Served, Stop, body_cap, name, no_content, now_ms, reply, stop};
 use crate::billing;
+use crate::environments::{self, environment_json};
 use crate::launches;
 use crate::secrets::{self, Aad, Keyring};
-use crate::store::{self, CiBilling, Put, TenantRow};
+use crate::store::{self, Owner, Put, TenantRow};
 
 /// Where a secret or variable lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +60,15 @@ pub enum Scope<'a> {
         /// The repository.
         repo: &'a str,
     },
+    /// One environment of a repository.
+    Environment {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+        /// The environment.
+        environment: &'a str,
+    },
 }
 
 /// Where a settings path goes.
@@ -57,16 +76,6 @@ pub enum Scope<'a> {
 pub enum SettingsRoute<'a> {
     /// What the organization has used and may spend.
     Billing {
-        /// The organization.
-        org: &'a str,
-    },
-    /// Start a checkout for the CI product.
-    Checkout {
-        /// The organization.
-        org: &'a str,
-    },
-    /// Open the customer portal.
-    Portal {
         /// The organization.
         org: &'a str,
     },
@@ -83,6 +92,28 @@ pub enum SettingsRoute<'a> {
     Vars(Scope<'a>),
     /// Set or delete one variable.
     Var(Scope<'a>, &'a str),
+    /// The organization's repositories, for choosing who a secret
+    /// reaches.
+    Repositories {
+        /// The organization.
+        org: &'a str,
+    },
+    /// The environments of a repository.
+    Environments {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+    },
+    /// Set or delete one environment.
+    Environment {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+        /// The environment.
+        name: &'a str,
+    },
 }
 
 impl SettingsRoute<'_> {
@@ -90,14 +121,15 @@ impl SettingsRoute<'_> {
     #[must_use]
     pub fn allows(&self, method: &Method) -> bool {
         match self {
-            SettingsRoute::Billing { .. } | SettingsRoute::Secrets(_) | SettingsRoute::Vars(_) => {
-                *method == Method::Get
-            }
-            SettingsRoute::Checkout { .. } | SettingsRoute::Portal { .. } => {
-                *method == Method::Post
-            }
+            SettingsRoute::Billing { .. }
+            | SettingsRoute::Secrets(_)
+            | SettingsRoute::Vars(_)
+            | SettingsRoute::Repositories { .. }
+            | SettingsRoute::Environments { .. } => *method == Method::Get,
             SettingsRoute::Cap { .. } => *method == Method::Put,
-            SettingsRoute::Secret(..) | SettingsRoute::Var(..) => {
+            SettingsRoute::Secret(..)
+            | SettingsRoute::Var(..)
+            | SettingsRoute::Environment { .. } => {
                 matches!(method, Method::Put | Method::Delete)
             }
         }
@@ -111,9 +143,8 @@ pub fn find(path: &str) -> Option<SettingsRoute<'_>> {
     let parts: Vec<&str> = path.split('/').collect();
     match parts.as_slice() {
         ["orgs", org, "billing"] => Some(SettingsRoute::Billing { org: login(org)? }),
-        ["orgs", org, "billing", "checkout"] => Some(SettingsRoute::Checkout { org: login(org)? }),
-        ["orgs", org, "billing", "portal"] => Some(SettingsRoute::Portal { org: login(org)? }),
         ["orgs", org, "billing", "cap"] => Some(SettingsRoute::Cap { org: login(org)? }),
+        ["orgs", org, "repositories"] => Some(SettingsRoute::Repositories { org: login(org)? }),
         ["orgs", org, kind @ ("secrets" | "vars")] => {
             let scope = Scope::Org(login(org)?);
             Some(if *kind == "secrets" {
@@ -143,8 +174,56 @@ pub fn find(path: &str) -> Option<SettingsRoute<'_>> {
             };
             Some(item_route(kind, scope, name(item)?))
         }
+        ["repos", owner, repo, "environments"] => Some(SettingsRoute::Environments {
+            owner: name(owner)?,
+            repo: name(repo)?,
+        }),
+        ["repos", owner, repo, "environments", env] => Some(SettingsRoute::Environment {
+            owner: name(owner)?,
+            repo: name(repo)?,
+            name: environment_name(env)?,
+        }),
+        [
+            "repos",
+            owner,
+            repo,
+            "environments",
+            env,
+            kind @ ("secrets" | "vars"),
+        ] => {
+            let scope = environment_scope(owner, repo, env)?;
+            Some(if *kind == "secrets" {
+                SettingsRoute::Secrets(scope)
+            } else {
+                SettingsRoute::Vars(scope)
+            })
+        }
+        [
+            "repos",
+            owner,
+            repo,
+            "environments",
+            env,
+            kind @ ("secrets" | "vars"),
+            item,
+        ] => {
+            let scope = environment_scope(owner, repo, env)?;
+            Some(item_route(kind, scope, name(item)?))
+        }
         _ => None,
     }
+}
+
+fn environment_name(env: &str) -> Option<&str> {
+    valid_environment_name(env).is_ok().then_some(env)
+}
+
+fn environment_scope<'a>(owner: &'a str, repo: &'a str, env: &'a str) -> Option<Scope<'a>> {
+    Some(Scope::Environment {
+        owner: name(owner)?,
+        repo: name(repo)?,
+        environment: environment_name(env)?,
+    })
 }
 
 fn item_route<'a>(kind: &str, scope: Scope<'a>, item: &'a str) -> SettingsRoute<'a> {
@@ -174,9 +253,16 @@ pub(crate) async fn handle(
 ) -> Result<Served> {
     match route {
         SettingsRoute::Billing { org } => billing_view(cx, org).await,
-        SettingsRoute::Checkout { org } => checkout(cx, org).await,
-        SettingsRoute::Portal { org } => portal(cx, org).await,
         SettingsRoute::Cap { org } => cap(cx, org, req, body_cap(&route)).await,
+        SettingsRoute::Repositories { org } => repositories(cx, org).await,
+        SettingsRoute::Environments { owner, repo } => list_environments(cx, owner, repo).await,
+        SettingsRoute::Environment { owner, repo, name } => {
+            if req.method() == Method::Put {
+                put_environment(cx, owner, repo, name, req, body_cap(&route)).await
+            } else {
+                delete_environment(cx, owner, repo, name).await
+            }
+        }
         SettingsRoute::Secrets(scope) => list_secrets(cx, scope).await,
         SettingsRoute::Vars(scope) => list_vars(cx, scope).await,
         SettingsRoute::Secret(scope, item) => {
@@ -240,102 +326,6 @@ async fn billing_view(cx: &Cx<'_>, org: &str) -> Result<Served> {
     reply(200, &serde_json::to_value(billing::view(&standing))?).map(Ok)
 }
 
-/// Polar's token and the CI product, or the `503` that says billing is
-/// not set up. No checkout starts while the product id is empty.
-fn polar_ready(cx: &Cx<'_>) -> Served<()> {
-    if cx.settings.polar_token.is_empty() || cx.settings.polar_ci_product_id.is_empty() {
-        return stop(503, "billing is not set up yet");
-    }
-    Ok(())
-}
-
-/// Polar's answer as an error the caller sees, with the detail kept in
-/// the log.
-fn polar_failed(what: &str, err: &str) -> Stop {
-    console_error!("settings: {what}: {err}");
-    Stop(
-        502,
-        "Polar did not answer; try again shortly".to_owned(),
-        None,
-    )
-}
-
-/// Why no checkout may start for `tenant`: it has an active or trialing
-/// CI subscription already, and a second would charge the same meter
-/// twice.
-fn checkout_refusal(tenant: &TenantRow) -> Option<String> {
-    (tenant.ci_billing == CiBilling::Active).then(|| {
-        format!(
-            "{} already has a CI subscription; change the card or cancel it in the billing portal",
-            tenant.org_login
-        )
-    })
-}
-
-async fn checkout(cx: &Cx<'_>, org: &str) -> Result<Served> {
-    let tenant = match admin_tenant(cx, org).await? {
-        Ok(tenant) => tenant,
-        Err(stop) => return Ok(Err(stop)),
-    };
-    if let Err(stop) = polar_ready(cx) {
-        return Ok(Err(stop));
-    }
-    if let Some(message) = checkout_refusal(&tenant) {
-        return Ok(stop(409, message));
-    }
-    let settings = cx.settings;
-    let page = format!("{}/o/{}/ci", settings.app_url, tenant.org_login);
-    let request = polar::checkout(
-        &settings.polar_api,
-        &settings.polar_token,
-        std::slice::from_ref(&settings.polar_ci_product_id),
-        &tenant.id,
-        &tenant.org_login,
-        &page,
-        &page,
-    );
-    let url = match send(&request).await {
-        Ok(response) => polar::checkout_url(&response),
-        Err(err) => Err(err),
-    };
-    match url {
-        Ok(url) => reply(200, &json!({ "url": url })).map(Ok),
-        Err(err) => Ok(Err(polar_failed("checkout", &err))),
-    }
-}
-
-async fn portal(cx: &Cx<'_>, org: &str) -> Result<Served> {
-    let tenant = match admin_tenant(cx, org).await? {
-        Ok(tenant) => tenant,
-        Err(stop) => return Ok(Err(stop)),
-    };
-    if cx.settings.polar_token.is_empty() {
-        return Ok(stop(503, "billing is not set up yet"));
-    }
-    if tenant.ci_billing == CiBilling::Never {
-        return Ok(stop(
-            409,
-            format!("{} has no CI subscription", tenant.org_login),
-        ));
-    }
-    let settings = cx.settings;
-    let page = format!("{}/o/{}/ci", settings.app_url, tenant.org_login);
-    let request = polar::customer_session(
-        &settings.polar_api,
-        &settings.polar_token,
-        &tenant.id,
-        &page,
-    );
-    let url = match send(&request).await {
-        Ok(response) => polar::portal_url(&response),
-        Err(err) => Err(err),
-    };
-    match url {
-        Ok(url) => reply(200, &json!({ "url": url })).map(Ok),
-        Err(err) => Ok(Err(polar_failed("portal", &err))),
-    }
-}
-
 /// The body of `PUT .../billing/cap`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -393,8 +383,7 @@ impl Kind {
 /// Whose rows a request reads or changes.
 struct Target {
     tenant: String,
-    /// `None` for the organization's own rows.
-    repo_id: Option<u64>,
+    owner: Owner,
     /// The organization login or `owner/repo`, for messages.
     label: String,
 }
@@ -406,7 +395,7 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
     match scope {
         Scope::Org(org) => Ok(admin_tenant(cx, org).await?.map(|tenant| Target {
             tenant: tenant.id,
-            repo_id: None,
+            owner: Owner::Org,
             label: tenant.org_login,
         })),
         Scope::Repo { owner, repo } => {
@@ -415,9 +404,30 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
                 .await?
                 .map(|repo| Target {
                     tenant: repo.tenant_id,
-                    repo_id: Some(repo.id),
+                    owner: Owner::Repo(repo.id),
                     label: repo.full_name,
                 }))
+        }
+        Scope::Environment {
+            owner,
+            repo,
+            environment,
+        } => {
+            let repo = match cx.repo(owner, repo, Access::Admin).await? {
+                Ok(repo) => repo,
+                Err(stop) => return Ok(Err(stop)),
+            };
+            let Some(found) = store::environment(cx.db, repo.id, environment).await? else {
+                return Ok(stop(404, "not found"));
+            };
+            Ok(Ok(Target {
+                tenant: repo.tenant_id,
+                owner: Owner::Environment {
+                    repo_id: repo.id,
+                    environment_id: found.id,
+                },
+                label: format!("{} environment {}", repo.full_name, found.name),
+            }))
         }
     }
 }
@@ -441,24 +451,92 @@ const fn limit(repo: bool) -> u32 {
 #[serde(deny_unknown_fields)]
 struct ValueBody {
     value: String,
+    /// The repositories an organization row reaches, by name; `None`
+    /// for all of them.
+    #[serde(default)]
+    repositories: Option<Vec<String>>,
 }
 
-/// The value in a `PUT` body of at most `max_body` bytes. Nothing of
-/// the body goes into an error.
-fn parse_value(body: &[u8], max_body: usize) -> std::result::Result<String, Stop> {
+/// The body of a `PUT` of at most `max_body` bytes. Nothing of the body
+/// goes into an error.
+fn parse_body(body: &[u8], max_body: usize) -> std::result::Result<ValueBody, Stop> {
     if body.len() > max_body {
         return stop(413, "the request is too large");
     }
-    let Ok(ValueBody { value }) = serde_json::from_slice(body) else {
+    let Ok(parsed) = serde_json::from_slice::<ValueBody>(body) else {
         return stop(400, "expected {\"value\": \"...\"}");
     };
-    if value.is_empty() {
+    if parsed.value.is_empty() {
         return stop(400, "Values cannot be empty");
     }
-    if value.len() > secrets::MAX_VALUE_BYTES {
+    if parsed.value.len() > secrets::MAX_VALUE_BYTES {
         return stop(413, "Values are at most 48 KB");
     }
-    Ok(value)
+    Ok(parsed)
+}
+
+/// The `ci_repos` ids a `PUT` selects for its row. `None` stores NULL,
+/// every repository. Only an organization row may select.
+async fn selection(
+    cx: &Cx<'_>,
+    target: &Target,
+    names: Option<&[String]>,
+) -> Result<Served<Option<Vec<u64>>>> {
+    let names = match check_selection(target.owner, names) {
+        Ok(Some(names)) => names,
+        Ok(None) => return Ok(Ok(None)),
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let found = store::repo_ids(cx.db, &target.tenant, names).await?;
+    Ok(resolve_selection(names, &found).map(Some))
+}
+
+/// The checks that need no database: no names at all means every
+/// repository, only an organization row may select, and at most
+/// `MAX_SELECTED_REPOS` names.
+fn check_selection(
+    owner: Owner,
+    names: Option<&[String]>,
+) -> std::result::Result<Option<&[String]>, Stop> {
+    let Some(names) = names else {
+        return Ok(None);
+    };
+    if owner != Owner::Org {
+        return stop(
+            400,
+            "Only organization secrets and variables have repository access",
+        );
+    }
+    if names.len() > secrets::MAX_SELECTED_REPOS {
+        return stop(422, "Select at most 1000 repositories");
+    }
+    Ok(Some(names))
+}
+
+/// The sorted, distinct ids of `names` among the tenant's repositories
+/// `found` (name as stored, id). A name that is not there is a `422`
+/// that lists each such name once, in the order given.
+fn resolve_selection(
+    names: &[String],
+    found: &[(String, u64)],
+) -> std::result::Result<Vec<u64>, Stop> {
+    let mut unknown: Vec<&str> = Vec::new();
+    for name in names {
+        let known = found
+            .iter()
+            .any(|(stored, _)| stored.eq_ignore_ascii_case(name));
+        let listed = unknown.iter().any(|seen| seen.eq_ignore_ascii_case(name));
+        if !known && !listed {
+            unknown.push(name);
+        }
+    }
+    if !unknown.is_empty() {
+        return stop(422, format!("Unknown repositories: {}", unknown.join(", ")));
+    }
+    let mut ids: Vec<u64> = found.iter().map(|(_, id)| *id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }
 
 /// The uppercased name, or the `400` that says what is wrong with it.
@@ -466,15 +544,34 @@ fn item_name(item: &str) -> std::result::Result<String, Stop> {
     secrets::valid_name(item).or_else(|message| stop(400, message))
 }
 
+async fn repositories(cx: &Cx<'_>, org: &str) -> Result<Served> {
+    let tenant = match admin_tenant(cx, org).await? {
+        Ok(tenant) => tenant,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let names = store::tenant_repos(cx.db, &tenant.id).await?;
+    let list: Vec<_> = names
+        .into_iter()
+        .map(|name| json!({ "name": name }))
+        .collect();
+    reply(200, &json!(list)).map(Ok)
+}
+
 async fn list_secrets(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
     let target = match target(cx, scope).await? {
         Ok(target) => target,
         Err(stop) => return Ok(Err(stop)),
     };
-    let rows = store::secret_names(cx.db, &target.tenant, target.repo_id).await?;
+    let rows = store::secret_names(cx.db, &target.tenant, target.owner).await?;
     let list: Vec<_> = rows
         .into_iter()
-        .map(|(name, updated)| json!({ "name": name, "updatedAt": updated }))
+        .map(|item| {
+            json!({
+                "name": item.name,
+                "updatedAt": item.updated_at,
+                "repositories": item.repositories,
+            })
+        })
         .collect();
     reply(200, &json!(list)).map(Ok)
 }
@@ -484,10 +581,17 @@ async fn list_vars(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
         Ok(target) => target,
         Err(stop) => return Ok(Err(stop)),
     };
-    let rows = store::vars(cx.db, &target.tenant, target.repo_id).await?;
+    let rows = store::vars(cx.db, &target.tenant, target.owner).await?;
     let list: Vec<_> = rows
         .into_iter()
-        .map(|(name, value, updated)| json!({ "name": name, "value": value, "updatedAt": updated }))
+        .map(|item| {
+            json!({
+                "name": item.name,
+                "value": item.value,
+                "updatedAt": item.updated_at,
+                "repositories": item.repositories,
+            })
+        })
         .collect();
     reply(200, &json!(list)).map(Ok)
 }
@@ -507,8 +611,12 @@ async fn put_secret(
         Ok(name) => name,
         Err(stop) => return Ok(Err(stop)),
     };
-    let value = match parse_value(&req.bytes().await?, max_body) {
-        Ok(value) => value,
+    let body = match parse_body(&req.bytes().await?, max_body) {
+        Ok(body) => body,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let repositories = match selection(cx, &target, body.repositories.as_deref()).await? {
+        Ok(repositories) => repositories,
         Err(stop) => return Ok(Err(stop)),
     };
     // A keyring that does not load is the Worker's fault: 500, with the
@@ -519,15 +627,16 @@ async fn put_secret(
     let nonce = secrets::fresh_nonce().map_err(worker::Error::RustError)?;
     let aad = Aad {
         tenant: &target.tenant,
-        repo_id: target.repo_id,
+        owner: target.owner,
         name: &name,
     };
-    let sealed = secrets::seal(&keyring.current, &aad, nonce, &value);
-    let max = limit(target.repo_id.is_some());
+    let sealed = secrets::seal(&keyring.current, &aad, nonce, &body.value);
+    let max = limit(target.owner != Owner::Org);
     let put = store::put_secret(
         cx.db,
         &target.tenant,
-        target.repo_id,
+        target.owner,
+        repositories.as_deref(),
         &name,
         &keyring.current.id,
         &sealed,
@@ -553,22 +662,165 @@ async fn put_var(
         Ok(name) => name,
         Err(stop) => return Ok(Err(stop)),
     };
-    let value = match parse_value(&req.bytes().await?, max_body) {
-        Ok(value) => value,
+    let body = match parse_body(&req.bytes().await?, max_body) {
+        Ok(body) => body,
         Err(stop) => return Ok(Err(stop)),
     };
-    let max = limit(target.repo_id.is_some());
+    let repositories = match selection(cx, &target, body.repositories.as_deref()).await? {
+        Ok(repositories) => repositories,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let max = limit(target.owner != Owner::Org);
     let put = store::put_var(
         cx.db,
         &target.tenant,
-        target.repo_id,
+        target.owner,
+        repositories.as_deref(),
         &name,
-        &value,
+        &body.value,
         max,
         now_ms(),
     )
     .await?;
     saved(put, &target, Kind::Vars, max)
+}
+
+async fn list_environments(cx: &Cx<'_>, owner: &str, repo: &str) -> Result<Served> {
+    let repo = match cx.repo(owner, repo, Access::Admin).await? {
+        Ok(repo) => repo,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let rows = store::environments(cx.db, repo.id).await?;
+    let list: Vec<_> = rows.iter().map(environment_json).collect();
+    reply(200, &json!(list)).map(Ok)
+}
+
+/// The body of `PUT .../environments/{env}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvironmentBody {
+    branches: Vec<String>,
+    approval: bool,
+}
+
+/// The body of an environment `PUT` of at most `max_body` bytes.
+fn parse_environment_body(
+    body: &[u8],
+    max_body: usize,
+) -> std::result::Result<EnvironmentBody, Stop> {
+    if body.len() > max_body {
+        return stop(413, "the request is too large");
+    }
+    let Ok(parsed) = serde_json::from_slice::<EnvironmentBody>(body) else {
+        return stop(400, "expected {\"branches\": [...], \"approval\": false}");
+    };
+    if let Err(message) = environments::valid_branches(&parsed.branches) {
+        return stop(422, message);
+    }
+    Ok(parsed)
+}
+
+async fn put_environment(
+    cx: &Cx<'_>,
+    owner: &str,
+    repo: &str,
+    name: &str,
+    req: &mut Request,
+    max_body: usize,
+) -> Result<Served> {
+    let repo = match cx.repo(owner, repo, Access::Admin).await? {
+        Ok(repo) => repo,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let body = match parse_environment_body(&req.bytes().await?, max_body) {
+        Ok(body) => body,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let now = now_ms();
+    let saved = store::put_environment(
+        cx.db,
+        &repo.tenant_id,
+        repo.id,
+        name,
+        &body.branches,
+        body.approval,
+        environments::MAX_PER_REPO,
+        now,
+    )
+    .await?;
+    let row = match saved {
+        store::PutEnvironment::Saved(row) => row,
+        store::PutEnvironment::TooMany => {
+            return Ok(stop(
+                409,
+                format!(
+                    "{} has {} environments, the most allowed",
+                    repo.full_name,
+                    environments::MAX_PER_REPO
+                ),
+            ));
+        }
+    };
+    release_and_wake(cx, repo.id, &row.name, row.approval, false, now).await;
+    reply(200, &environment_json(&row)).map(Ok)
+}
+
+async fn delete_environment(cx: &Cx<'_>, owner: &str, repo: &str, name: &str) -> Result<Served> {
+    let repo = match cx.repo(owner, repo, Access::Admin).await? {
+        Ok(repo) => repo,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    if !store::delete_environment(cx.db, repo.id, name).await? {
+        return Ok(stop(404, "not found"));
+    }
+    release_and_wake(cx, repo.id, name, false, true, now_ms()).await;
+    no_content().map(Ok)
+}
+
+/// Whether a change to an environment frees the jobs that wait for its
+/// approval: deleting it does, and so does turning approval off.
+const fn releases(approval_after: bool, deleted: bool) -> bool {
+    deleted || !approval_after
+}
+
+/// The jobs a change to environment `name` frees, with their holds
+/// cleared; none when the change keeps the approval rule.
+pub(crate) async fn release_holds(
+    db: &Db,
+    repo_id: u64,
+    name: &str,
+    approval_after: bool,
+    deleted: bool,
+    now: u64,
+) -> Result<Vec<Woken>> {
+    if !releases(approval_after, deleted) {
+        return Ok(Vec::new());
+    }
+    store::release_approval_holds(db, repo_id, name, now).await
+}
+
+/// Frees the jobs a change to environment `name` leaves without an
+/// approval rule and sends them to the launch queue. The change is
+/// saved already, so a failure is logged and the reconciler's backstop
+/// frees the jobs whose environment is gone or has approval off.
+async fn release_and_wake(
+    cx: &Cx<'_>,
+    repo_id: u64,
+    name: &str,
+    approval_after: bool,
+    deleted: bool,
+    now: u64,
+) {
+    let woken = match release_holds(cx.db, repo_id, name, approval_after, deleted, now).await {
+        Ok(woken) => woken,
+        Err(err) => {
+            console_error!("repo {repo_id}: release approval holds of {name}: {err}");
+            return;
+        }
+    };
+    if let Err(err) = launches::send_wakes(cx.env, &woken).await {
+        console_error!("repo {repo_id}: wake jobs held for {name}: {err}");
+    }
 }
 
 fn saved(put: Put, target: &Target, kind: Kind, max: u32) -> Result<Served> {
@@ -588,8 +840,8 @@ async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result
         Err(stop) => return Ok(Err(stop)),
     };
     let existed = match kind {
-        Kind::Secrets => store::delete_secret(cx.db, &target.tenant, target.repo_id, &name).await?,
-        Kind::Vars => store::delete_var(cx.db, &target.tenant, target.repo_id, &name).await?,
+        Kind::Secrets => store::delete_secret(cx.db, &target.tenant, target.owner, &name).await?,
+        Kind::Vars => store::delete_var(cx.db, &target.tenant, target.owner, &name).await?,
     };
     if existed {
         no_content().map(Ok)
@@ -602,18 +854,80 @@ async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result
 mod tests {
     use super::*;
 
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    fn refused<T: std::fmt::Debug>(result: std::result::Result<T, Stop>) -> (u16, String) {
+        let Stop(status, message, _) = result.unwrap_err();
+        (status, message)
+    }
+
     #[test]
-    fn a_checkout_is_refused_while_a_ci_subscription_is_active() {
-        let tenant = |ci_billing| TenantRow {
-            id: "t1".into(),
-            org_login: "acme".into(),
-            ci_billing,
-            retention_days: 30,
-        };
-        let message = checkout_refusal(&tenant(CiBilling::Active)).unwrap();
-        assert!(message.contains("acme already has a CI subscription"));
-        assert_eq!(checkout_refusal(&tenant(CiBilling::Never)), None);
-        assert_eq!(checkout_refusal(&tenant(CiBilling::Lapsed)), None);
+    fn only_an_org_row_may_select() {
+        for owner in [
+            Owner::Repo(7),
+            Owner::Environment {
+                repo_id: 7,
+                environment_id: 3,
+            },
+        ] {
+            let (status, _) = refused(check_selection(owner, Some(&names(&["acme/app"]))));
+            assert_eq!(status, 400);
+        }
+        let asked = names(&["acme/app"]);
+        assert_eq!(
+            check_selection(Owner::Org, Some(&asked)).unwrap(),
+            Some(asked.as_slice())
+        );
+        // An empty list is a selection of nothing, not a refusal.
+        assert_eq!(
+            check_selection(Owner::Org, Some(&[])).unwrap(),
+            Some(&[][..])
+        );
+    }
+
+    #[test]
+    fn no_list_means_all_repositories() {
+        for owner in [Owner::Org, Owner::Repo(7)] {
+            assert_eq!(check_selection(owner, None).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn more_than_the_limit_is_refused() {
+        let at_limit: Vec<String> = (0..secrets::MAX_SELECTED_REPOS)
+            .map(|n| format!("acme/r{n}"))
+            .collect();
+        assert!(check_selection(Owner::Org, Some(&at_limit)).is_ok());
+        let mut over = at_limit;
+        over.push("acme/extra".to_owned());
+        let (status, message) = refused(check_selection(Owner::Org, Some(&over)));
+        assert_eq!(
+            (status, message.as_str()),
+            (422, "Select at most 1000 repositories")
+        );
+    }
+
+    #[test]
+    fn unknown_names_are_listed_once_in_order() {
+        let found = [("acme/app".to_owned(), 7)];
+        let asked = names(&["zed/b", "acme/app", "acme/a", "ZED/B", "zed/b"]);
+        let (status, message) = refused(resolve_selection(&asked, &found));
+        assert_eq!(status, 422);
+        assert_eq!(message, "Unknown repositories: zed/b, acme/a");
+    }
+
+    #[test]
+    fn known_names_resolve_to_sorted_distinct_ids() {
+        let found = [("acme/web".to_owned(), 9), ("acme/app".to_owned(), 7)];
+        let asked = names(&["ACME/WEB", "acme/app", "acme/web"]);
+        assert_eq!(resolve_selection(&asked, &found).unwrap(), [7, 9]);
+    }
+
+    #[test]
+    fn an_empty_list_reaches_none() {
+        assert_eq!(resolve_selection(&[], &[]).unwrap(), Vec::<u64>::new());
     }
 
     #[test]
@@ -622,14 +936,6 @@ mod tests {
         assert_eq!(
             settings_route("orgs/acme/billing", &Method::Get),
             Some(SettingsRoute::Billing { org })
-        );
-        assert_eq!(
-            settings_route("orgs/acme/billing/checkout", &Method::Post),
-            Some(SettingsRoute::Checkout { org })
-        );
-        assert_eq!(
-            settings_route("orgs/acme/billing/portal", &Method::Post),
-            Some(SettingsRoute::Portal { org })
         );
         assert_eq!(
             settings_route("orgs/acme/billing/cap", &Method::Put),
@@ -643,6 +949,10 @@ mod tests {
         assert_eq!(
             settings_route("orgs/acme/vars", &Method::Get),
             Some(SettingsRoute::Vars(scope))
+        );
+        assert_eq!(
+            settings_route("orgs/acme/repositories", &Method::Get),
+            Some(SettingsRoute::Repositories { org })
         );
         let repo = Scope::Repo {
             owner: "acme",
@@ -659,10 +969,112 @@ mod tests {
     }
 
     #[test]
+    fn environment_routes_parse() {
+        assert_eq!(
+            settings_route("repos/acme/api/environments", &Method::Get),
+            Some(SettingsRoute::Environments {
+                owner: "acme",
+                repo: "api"
+            })
+        );
+        for method in [Method::Put, Method::Delete] {
+            assert_eq!(
+                settings_route("repos/acme/api/environments/production", &method),
+                Some(SettingsRoute::Environment {
+                    owner: "acme",
+                    repo: "api",
+                    name: "production"
+                })
+            );
+        }
+        let scope = Scope::Environment {
+            owner: "acme",
+            repo: "api",
+            environment: "production",
+        };
+        assert_eq!(
+            settings_route(
+                "repos/acme/api/environments/production/secrets",
+                &Method::Get
+            ),
+            Some(SettingsRoute::Secrets(scope))
+        );
+        assert_eq!(
+            settings_route(
+                "repos/acme/api/environments/production/vars/X",
+                &Method::Put
+            ),
+            Some(SettingsRoute::Var(scope, "X"))
+        );
+        assert_eq!(
+            settings_route(
+                "repos/acme/api/environments/production/secrets/X",
+                &Method::Delete
+            ),
+            Some(SettingsRoute::Secret(scope, "X"))
+        );
+    }
+
+    #[test]
+    fn bad_environment_paths_have_no_route() {
+        for (path, method) in [
+            ("repos/acme/api/environments/prod%20eu", Method::Put),
+            ("repos/acme/api/environments/", Method::Put),
+            ("repos/acme/api/environments/production", Method::Get),
+            ("repos/acme/api/environments", Method::Post),
+            ("repos/acme/api/environments/production/other", Method::Get),
+            ("repos/acme/api/environments/prod%20eu/secrets", Method::Get),
+            (
+                "repos/acme/api/environments/production/secrets/A/B",
+                Method::Put,
+            ),
+        ] {
+            assert_eq!(settings_route(path, &method), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn changes_that_release_holds() {
+        assert!(releases(false, false));
+        assert!(releases(true, true));
+        assert!(releases(false, true));
+        assert!(!releases(true, false));
+    }
+
+    #[test]
+    fn environment_bodies() {
+        let parse = |body: &str| parse_environment_body(body.as_bytes(), 8 << 10);
+        let ok = parse(r#"{"branches":["main"],"approval":true}"#).unwrap();
+        assert_eq!((ok.branches, ok.approval), (vec!["main".to_owned()], true));
+        for body in [
+            "nope",
+            r#"{"branches":["main"]}"#,
+            r#"{"approval":false}"#,
+            r#"{"branches":[],"approval":false,"x":1}"#,
+        ] {
+            let (status, message) = refused(parse(body));
+            assert_eq!(status, 400);
+            assert_eq!(
+                message,
+                "expected {\"branches\": [...], \"approval\": false}"
+            );
+        }
+        let (status, message) = refused(parse(r#"{"branches":[""],"approval":false}"#));
+        assert_eq!(
+            (status, message.as_str()),
+            (422, "Branch patterns cannot be empty")
+        );
+        let (status, _) = refused(parse_environment_body(&[b' '; 200], 100));
+        assert_eq!(status, 413);
+    }
+
+    #[test]
     fn other_paths_and_methods_have_no_route() {
         for (path, method) in [
             ("orgs/acme/billing", Method::Post),
-            ("orgs/acme/billing/checkout", Method::Get),
+            ("orgs/acme/repositories", Method::Put),
+            ("orgs/acme/billing/checkout", Method::Post),
+            ("orgs/acme/billing/portal", Method::Post),
             ("orgs/acme/billing/cap", Method::Post),
             ("orgs/acme/billing/cap", Method::Delete),
             ("orgs/acme/billing/other", Method::Get),
@@ -678,12 +1090,13 @@ mod tests {
         }
         // The path matches, so the caller can answer 405.
         assert!(find("orgs/acme/billing/cap").is_some());
+        assert!(find("orgs/acme/billing/checkout").is_none());
     }
 
     #[test]
     fn value_too_large() {
         let body = format!(r#"{{"value":"{}"}}"#, "a".repeat(49_153));
-        let Err(Stop(status, message, _)) = parse_value(body.as_bytes(), 128 << 10) else {
+        let Err(Stop(status, message, _)) = parse_body(body.as_bytes(), 128 << 10) else {
             panic!("accepted");
         };
         assert_eq!(
@@ -691,7 +1104,7 @@ mod tests {
             (413, "Values are at most 48 KB")
         );
         let body = format!(r#"{{"value":"{}"}}"#, "a".repeat(48 * 1024));
-        assert!(parse_value(body.as_bytes(), 128 << 10).is_ok());
+        assert!(parse_body(body.as_bytes(), 128 << 10).is_ok());
     }
 
     #[test]
@@ -699,8 +1112,8 @@ mod tests {
         // Each quote is two bytes in JSON: about 96 KiB on the wire.
         let body = format!(r#"{{"value":"{}"}}"#, "\\\"".repeat(48 * 1024));
         assert!(body.len() > 96 * 1024 && body.len() <= 128 << 10);
-        let value = parse_value(body.as_bytes(), 128 << 10).unwrap();
-        assert_eq!(value.len(), 48 * 1024);
+        let parsed = parse_body(body.as_bytes(), 128 << 10).unwrap();
+        assert_eq!(parsed.value.len(), 48 * 1024);
     }
 
     #[test]
@@ -710,16 +1123,39 @@ mod tests {
             b"nope",
             br#"{"value":"x","extra":1}"#,
         ] {
-            let Err(Stop(status, message, _)) = parse_value(body, 128 << 10) else {
+            let Err(Stop(status, message, _)) = parse_body(body, 128 << 10) else {
                 panic!("accepted");
             };
             assert_eq!(status, 400);
             assert!(message.starts_with("expected") || message == "Values cannot be empty");
         }
-        let Err(Stop(status, ..)) = parse_value(&[b' '; 200], 100) else {
+        let Err(Stop(status, ..)) = parse_body(&[b' '; 200], 100) else {
             panic!("accepted");
         };
         assert_eq!(status, 413);
+    }
+
+    #[test]
+    fn bodies_with_repositories() {
+        let parse = |body: &str| parse_body(body.as_bytes(), 128 << 10);
+        assert_eq!(
+            parse(r#"{"value":"x","repositories":["a/b"]}"#)
+                .unwrap()
+                .repositories,
+            Some(vec!["a/b".to_owned()])
+        );
+        assert_eq!(
+            parse(r#"{"value":"x","repositories":null}"#)
+                .unwrap()
+                .repositories,
+            None
+        );
+        assert_eq!(parse(r#"{"value":"x"}"#).unwrap().repositories, None);
+        let Err(Stop(status, message, _)) = parse(r#"{"value":"x","repositories":"a/b"}"#) else {
+            panic!("accepted");
+        };
+        assert_eq!(status, 400);
+        assert!(message.starts_with("expected"));
     }
 
     #[test]

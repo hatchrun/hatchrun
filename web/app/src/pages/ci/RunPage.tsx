@@ -7,12 +7,14 @@
 // in; a viewer the API turns away (401, or 404 while signed out) gets
 // the sign-in prompt.
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useState, type ReactNode } from "react";
 
 import {
   ApiError,
+  approveCiJob,
   getCiRun,
   listCiRuns,
+  rejectCiJob,
   type CiJob,
   type CiRun,
   type CiRunDetail,
@@ -263,14 +265,24 @@ function RunView({ session, route, run }: { session: Session | null; route: CiRo
         <Denied error={detail.error} session={session} retry={reload} />
       ) : (
         <Await loaded={detail} retry={reload}>
-          {(data) => <RunDetailView route={route} data={data} />}
+          {(data) => <RunDetailView route={route} data={data} session={session} reload={reload} />}
         </Await>
       )}
     </Frame>
   );
 }
 
-function RunDetailView({ route, data }: { route: CiRoute; data: CiRunDetail }) {
+function RunDetailView({
+  route,
+  data,
+  session,
+  reload,
+}: {
+  route: CiRoute;
+  data: CiRunDetail;
+  session: Session | null;
+  reload: () => void;
+}) {
   const { run, jobs } = data;
   const now = useNow(1000);
   return (
@@ -302,28 +314,83 @@ function RunDetailView({ route, data }: { route: CiRoute; data: CiRunDetail }) {
           </TableHeader>
           <TableBody>
             {jobs.map((job) => (
-              <TableRow key={job.id}>
-                <TableCell>
-                  <StatusMark shown={shown(job.status, job.conclusion)} />
-                </TableCell>
-                <TableCell>
-                  <Link
-                    href={`/ci/${route.owner}/${route.repo}/runs/${run.id}/jobs/${job.id}`}
-                    className="font-semibold text-bone hover:text-chick"
-                  >
-                    {job.name}
-                  </Link>
-                </TableCell>
-                <TableCell className="text-right font-mono text-xs">
-                  {job.started_at === null ? "not yet" : new Date(job.started_at).toLocaleTimeString()}
-                </TableCell>
-                <TableCell className="text-right font-mono text-xs">{jobTook(job, now)}</TableCell>
-              </TableRow>
+              <Fragment key={job.id}>
+                <TableRow>
+                  <TableCell>
+                    <StatusMark shown={shown(job.status, job.conclusion)} />
+                  </TableCell>
+                  <TableCell>
+                    <Link
+                      href={`/ci/${route.owner}/${route.repo}/runs/${run.id}/jobs/${job.id}`}
+                      className="font-semibold text-bone hover:text-chick"
+                    >
+                      {job.name}
+                    </Link>
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-xs">
+                    {job.started_at === null ? "not yet" : new Date(job.started_at).toLocaleTimeString()}
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-xs">{jobTook(job, now)}</TableCell>
+                </TableRow>
+                {(job.held === "approval" || job.approval?.decision === "approved") && (
+                  <TableRow>
+                    <TableCell colSpan={4}>
+                      <Approval job={job} session={session} reload={reload} />
+                    </TableCell>
+                  </TableRow>
+                )}
+              </Fragment>
             ))}
           </TableBody>
         </Table>
       </section>
     </>
+  );
+}
+
+/** A job held for approval, with Approve and Reject for a signed-in viewer; or who approved it. */
+function Approval({ job, session, reload }: { job: CiJob; session: Session | null; reload: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const decide = async (approve: boolean) => {
+    if (!approve && !window.confirm(`Reject ${job.name}? The job fails.`)) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await (approve ? approveCiJob(job.id) : rejectCiJob(job.id));
+      reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (job.held !== "approval") {
+    return <p className="text-sm text-fog">Approved by {job.approval?.by}</p>;
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-3 text-sm">
+      <span>Waiting for approval to use {job.environment}</span>
+      {session && (
+        <>
+          <button type="button" className="button button-primary" disabled={busy} onClick={() => void decide(true)}>
+            Approve
+          </button>
+          <button type="button" className="button" disabled={busy} onClick={() => void decide(false)}>
+            Reject
+          </button>
+        </>
+      )}
+      {error !== null && (
+        <span role="alert" className="text-[var(--app-danger)]">
+          {error}
+        </span>
+      )}
+    </div>
   );
 }
 

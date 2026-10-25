@@ -36,9 +36,16 @@
 # - a push to wide runs six jobs: five at once, the sixth held with a
 #   check run that says why until one ends; the fake Polar then holds a
 #   usage event for each;
-# - a tenant whose CI subscription was canceled gets one billing check
-#   run and no run, and can start a checkout; a tenant that never
-#   subscribed gets nothing, and its config is not read.
+# - a tenant whose subscription was canceled gets one billing check
+#   run and no run; a tenant that never subscribed gets nothing, and its
+#   config is not read;
+# - environments, after wide: environment settings, secrets and vars at
+#   three levels, and an organization secret limited to other
+#   repositories are set through the API; a push to guard fails its job
+#   on a branch pattern without a launch; a push to deploy holds both
+#   jobs for approval with no launch; one job is approved and runs with
+#   the environment's secret and var and without the org-only secret,
+#   the other is rejected; a second approval answers 409.
 #
 # Every instance must have had its metadata turned off, and the change
 # seen applied, before its job ran.
@@ -66,12 +73,11 @@ BROKER="http://127.0.0.1:${BROKER_PORT}"
 APP_URL="http://127.0.0.1:5173"
 TENANT="e2etenant0000001"
 INSTALLATION=42
-# Installation 43: a tenant whose CI subscription was canceled.
-# Installation 44: a tenant that never subscribed to CI.
+# Installation 43: a tenant whose subscription was canceled.
+# Installation 44: a tenant that never subscribed.
 LAPSED_TENANT="e2etenant0000002"
 NEVER_TENANT="e2etenant0000003"
 POLAR_TOKEN="e2e-polar-token"
-CI_PRODUCT="e2e-ci-product"
 # The local Secrets Store that holds the key behind CI_SECRETS_KEY.
 STORE_ID="e2e00000000000000000000000000000"
 WEBHOOK_SECRET="e2e-webhook-secret"
@@ -232,11 +238,11 @@ INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, updated
 VALUES ('$TENANT', 1, 'e2e', $INSTALLATION, $now_ms, $now_ms),
        ('$LAPSED_TENANT', 2, 'e2e2', 43, $now_ms, $now_ms),
        ('$NEVER_TENANT', 3, 'e2e3', 44, $now_ms, $now_ms);
-INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id, product,
+INSERT INTO subscriptions (id, tenant_id, status, customer_id, product_id,
                            cancel_at_period_end, modified_at, updated_at)
-VALUES ('sub-e2e', '$TENANT', 'active', 'cus-e2e', '$CI_PRODUCT', 'ci', false,
+VALUES ('sub-e2e', '$TENANT', 'active', 'cus-e2e', 'e2e-product', false,
         '2026-01-01T00:00:00Z', $now_ms),
-       ('sub-e2e2', '$LAPSED_TENANT', 'canceled', 'cus-e2e2', '$CI_PRODUCT', 'ci', false,
+       ('sub-e2e2', '$LAPSED_TENANT', 'canceled', 'cus-e2e2', 'e2e-product', false,
         '2026-01-01T00:00:00Z', $now_ms);
 SQL
 
@@ -320,7 +326,6 @@ start ci env -C "$root/crates/ci" \
   --var GITHUB_APP_ID:Iv1e2e \
   --var OIDC_KEY_ID:e2e \
   --var POLAR_API_URL:"$GITHUB" \
-  --var POLAR_CI_PRODUCT_ID:"$CI_PRODUCT" \
   --var CI_SECRETS_KEY_ID:e2e \
   --var CI_SECRETS_KEY_OLD_ID:""
 
@@ -654,13 +659,13 @@ until api "runs/$wide_run" | jq -e --arg id "$held" \
 done
 wait_checks "$wide_sha" 6 'all(.status == "completed" and .conclusion == "success")'
 log "wide: all six passed"
-# Each completed job's minutes go to Polar, keyed by job and attempt,
+# Each completed job's billed seconds go to Polar, keyed by job and attempt,
 # on a reconciler pass.
 usage_ids="$(api "runs/$wide_run" | jq -c '[.jobs[] | "ci:\(.id):1"]')"
 deadline=$((SECONDS + 60))
 until curl -fsS "$GITHUB/_state" | jq -e --argjson ids "$usage_ids" --arg tenant "$TENANT" '
   [.polar_events[] | select(.name == "ci.usage" and .external_customer_id == $tenant
-    and .metadata.template == "ubuntu-latest" and .metadata.units >= 1) | .external_id] as $sent
+    and .metadata.template == "ubuntu-latest" and .metadata.seconds >= 60 and .metadata.units == .metadata.seconds) | .external_id] as $sent
   | all($ids[]; . as $id | $sent | index([$id]))
 ' >/dev/null; do
   ((SECONDS < deadline)) || die "Polar lacks usage for $usage_ids: $(curl -fsS "$GITHUB/_state" | jq -c .polar_events)"
@@ -669,7 +674,113 @@ until curl -fsS "$GITHUB/_state" | jq -e --argjson ids "$usage_ids" --arg tenant
 done
 log "wide: Polar has the usage of all six"
 
-# Scenario: a tenant whose CI subscription was canceled gets one billing
+# Whether the last app_call answered status $1 with a body that jq
+# filter $2 holds for.
+answered() {
+  local want=$1
+  shift
+  [[ "$status" == "$want" ]] && jq -e "$@" "$tmp/answer" >/dev/null
+}
+
+# Scenario: environments. Setup first: a second repository of the
+# tenant, the environments, and values at the three levels.
+psql_run <<SQL
+INSERT INTO ci_repos (id, tenant_id, installation_id, full_name, default_branch, private, updated_at)
+VALUES (1002, '$TENANT', $INSTALLATION, 'e2e/other', 'main', false, $now_ms);
+SQL
+put_ok() {
+  local want=$1 path=$2 body=$3
+  status="$(app_call PUT "$path" "$body")"
+  [[ "$status" == "$want" ]] || die "PUT $path answered $status, not $want: $(cat "$tmp/answer")"
+}
+put_ok 200 repos/e2e/demo/environments/staging '{"branches":["release/*"],"approval":false}'
+put_ok 200 repos/e2e/demo/environments/production '{"branches":[],"approval":true}'
+env_hex="$(openssl rand -hex 8)"
+env_secret="env-$env_hex"
+put_ok 204 orgs/e2e/secrets/ENV_SECRET "$(jq -nc --arg v "org-$(openssl rand -hex 8)" '{value: $v}')"
+put_ok 204 repos/e2e/demo/secrets/ENV_SECRET "$(jq -nc --arg v "repo-$(openssl rand -hex 8)" '{value: $v}')"
+put_ok 204 repos/e2e/demo/environments/production/secrets/ENV_SECRET "$(jq -nc --arg v "$env_secret" '{value: $v}')"
+put_ok 204 orgs/e2e/vars/ENV_VAR '{"value":"org"}'
+put_ok 204 repos/e2e/demo/vars/ENV_VAR '{"value":"repo"}'
+put_ok 204 repos/e2e/demo/environments/production/vars/ENV_VAR '{"value":"env"}'
+only_value="only-$(openssl rand -hex 8)"
+status="$(app_call PUT orgs/e2e/secrets/ORG_ONLY "$(jq -nc --arg v "$only_value" '{value: $v, repositories: ["e2e/nope"]}')")"
+[[ "$status" == 422 ]] && jq -e '.error | contains("e2e/nope")' "$tmp/answer" >/dev/null ||
+  die "an unknown repository answered $status: $(cat "$tmp/answer")"
+put_ok 204 orgs/e2e/secrets/ORG_ONLY "$(jq -nc --arg v "$only_value" '{value: $v, repositories: ["e2e/other"]}')"
+status="$(app_call GET orgs/e2e/secrets)"
+answered 200 --arg name ORG_ONLY '[.[] | select(.name == $name)] | length == 1 and .[0].repositories == ["e2e/other"]' ||
+  die "ORG_ONLY is not listed for e2e/other: $status $(cat "$tmp/answer")"
+log "environments: set up"
+
+# A push to guard: the staging environment allows release/* only.
+guard_sha="$(printf '3%.0s' $(seq 40))"
+launches_before="$(curl -fsS "$LAUNCHER/_events" | jq '[.[] | select(startswith("launch "))] | length')"
+guard_run="$(push guard "$guard_sha")"
+log "push to guard started run $guard_run"
+wait_checks "$guard_sha" 1 'all(.status == "completed")'
+guard="$(check_of "$guard_sha" "guard / guarded")"
+[[ "$(jq -r .conclusion <<<"$guard")" == failure ]] || die "guard / guarded: $guard"
+jq -e '((.summary // "") + (.text // "")) | contains("Environment `staging` allows only branches release/*; this run is on refs/heads/guard.")' \
+  <<<"$guard" >/dev/null || die "guard / guarded lacks the branch message: $guard"
+[[ "$(curl -fsS "$LAUNCHER/_events" | jq '[.[] | select(startswith("launch "))] | length')" == "$launches_before" ]] ||
+  die "the refused job launched an instance"
+log "guard: the branch pattern refused the job"
+
+# A push to deploy: both jobs wait for approval, nothing launches.
+deploy_sha="$(printf '4%.0s' $(seq 40))"
+launches_before="$(curl -fsS "$LAUNCHER/_events" | jq '[.[] | select(startswith("launch "))] | length')"
+deploy_run="$(push deploy "$deploy_sha")"
+log "push to deploy started run $deploy_run"
+deadline=$((SECONDS + POLL_SECS))
+until api "runs/$deploy_run" | jq -e '[.jobs[] | select(.status == "queued" and .held == "approval")] | length == 2' >/dev/null; do
+  ((SECONDS < deadline)) || die "the deploy jobs are not held for approval: $(api "runs/$deploy_run")"
+  sleep 1
+done
+deadline=$((SECONDS + 60))
+until check_of "$deploy_sha" "deploy / deploy-a" |
+  jq -e '.summary // "" | contains("Waiting for approval to use environment `production`.")' >/dev/null; do
+  ((SECONDS < deadline)) || die "deploy-a's check run does not ask for approval: $(check_of "$deploy_sha" "deploy / deploy-a")"
+  sleep 1
+done
+sleep 10
+[[ "$(curl -fsS "$LAUNCHER/_events" | jq '[.[] | select(startswith("launch "))] | length')" == "$launches_before" ]] ||
+  die "a held job launched an instance"
+log "deploy: both jobs wait for approval, nothing launched"
+
+# Approve one job and reject the other.
+deploy_a="$(job_id "$deploy_run" deploy-a)"
+deploy_b="$(job_id "$deploy_run" deploy-b)"
+status="$(app_call POST "jobs/$deploy_a/approve")"
+[[ "$status" == 204 ]] || die "approve answered $status: $(cat "$tmp/answer")"
+status="$(app_call POST "jobs/$deploy_b/reject")"
+[[ "$status" == 204 ]] || die "reject answered $status: $(cat "$tmp/answer")"
+status="$(app_call POST "jobs/$deploy_a/approve")"
+[[ "$status" == 409 ]] || die "a second approve answered $status, not 409: $(cat "$tmp/answer")"
+wait_checks "$deploy_sha" "$(checks "$deploy_sha" | jq length)" \
+  '(map(select(.name == "deploy / deploy-a")) | last | .status == "completed")
+   and (map(select(.name == "deploy / deploy-b")) | last | .status == "completed")'
+deploy_a_check="$(check_of "$deploy_sha" "deploy / deploy-a")"
+[[ "$(jq -r .conclusion <<<"$deploy_a_check")" == success ]] || die "deploy / deploy-a: $deploy_a_check"
+deploy_b_check="$(check_of "$deploy_sha" "deploy / deploy-b")"
+[[ "$(jq -r .conclusion <<<"$deploy_b_check")" == failure ]] || die "deploy / deploy-b: $deploy_b_check"
+jq -e '((.summary // "") + (.text // "")) | contains("Rejected by e2e")' <<<"$deploy_b_check" >/dev/null ||
+  die "deploy / deploy-b lacks the rejection: $deploy_b_check"
+api "runs/$deploy_run" | jq -e '.jobs[] | select(.name == "deploy-a")
+  | .approval.by == "e2e" and .approval.decision == "approved"' >/dev/null ||
+  die "deploy-a has no approval: $(api "runs/$deploy_run")"
+log "deploy: deploy-a approved and passed, deploy-b rejected"
+
+# The approved job saw the environment's secret and var, and not the
+# organization secret limited to another repository.
+r2_log "$deploy_run" deploy-a >"$tmp/deploy-a.log"
+want_hash="$(printf '%s' "$env_secret" | openssl dgst -sha256 -r | cut -d' ' -f1)"
+grep -qxF "$want_hash" "$tmp/deploy-a.log" || die "deploy-a lacks the environment secret's hash: $(head -c 2000 "$tmp/deploy-a.log")"
+grep -qxF 'var is env' "$tmp/deploy-a.log" || die "deploy-a lacks the environment var: $(head -c 2000 "$tmp/deploy-a.log")"
+grep -qxF 'org only is []' "$tmp/deploy-a.log" || die "deploy-a saw the org-only secret: $(head -c 2000 "$tmp/deploy-a.log")"
+log "environments: the environment's values won, the org-only secret stayed out"
+
+# Scenario: a tenant whose subscription was canceled gets one billing
 # check run for a push and nothing runs; a tenant that never subscribed
 # gets nothing at all, not even a config read.
 tenant_push() {
@@ -698,27 +809,16 @@ jq -e --arg sha "$never_sha" '[.check_runs[] | select(.head_sha == $sha)] | leng
   die "the never subscribed tenant got check runs: $(checks "$never_sha")"
 jq -e '(.contents | index("e2e3/demo")) == null and (.contents | index("e2e2/demo")) != null' \
   "$tmp/state.json" >/dev/null || die "config reads: $(jq -c .contents "$tmp/state.json")"
-# The card state as the billing page reads it, and a checkout for the
-# lapsed tenant, from the fake Polar.
-# Whether the last app_call answered status $1 with a body that jq
-# filter $2 holds for.
-answered() {
-  local want=$1
-  shift
-  [[ "$status" == "$want" ]] && jq -e "$@" "$tmp/answer" >/dev/null
-}
+# The card state as the billing page reads it.
 status="$(app_call GET orgs/e2e/billing)"
 answered 200 '.card == true' || die "the billing view of e2e answered $status: $(cat "$tmp/answer")"
 status="$(app_call GET orgs/e2e2/billing)"
 answered 200 '.card == false' || die "the billing view of e2e2 answered $status: $(cat "$tmp/answer")"
-status="$(app_call POST orgs/e2e2/billing/checkout)"
-answered 200 ".url == \"https://polar.invalid/checkout/$LAPSED_TENANT\"" ||
-  die "the checkout of e2e2 answered $status: $(cat "$tmp/answer")"
-log "billing: the lapsed tenant was asked for a card, the other one ignored"
+log "billing: the card state of both tenants read as expected"
 
-# Thirteen instances: build, test, broken twice, sleeper, arm-hello,
-# bad-ok-hello and the six naps. Wait for the last agent to exit.
-launches=13
+# Fourteen instances: build, test, broken twice, sleeper, arm-hello,
+# bad-ok-hello, the six naps and deploy-a. Wait for the last agent to exit.
+launches=14
 deadline=$((SECONDS + 60))
 until curl -fsS "$LAUNCHER/_events" | jq -e --argjson n "$launches" '[.[] | select(startswith("exit "))] | length >= $n' >/dev/null; do
   ((SECONDS < deadline)) || die "agents still running: $(curl -fsS "$LAUNCHER/_events")"
@@ -745,8 +845,8 @@ jq -e '[.[] | select(startswith("exit ")) | split(" ")[2]] | all(. == "0" or . =
   "$tmp/events.json" >/dev/null || die "an agent exited badly: $(cat "$tmp/events.json")"
 [[ "$(jq '[.[] | select(startswith("launch "))] | length' "$tmp/events.json")" == "$launches" ]] ||
   die "expected $launches launches: $(cat "$tmp/events.json")"
-jq -e '[.[] | select(endswith(" 0") and startswith("exit "))] | length == 10' "$tmp/events.json" >/dev/null ||
-  die "expected the ten passing jobs to exit 0: $(cat "$tmp/events.json")"
+jq -e '[.[] | select(endswith(" 0") and startswith("exit "))] | length == 11' "$tmp/events.json" >/dev/null ||
+  die "expected the eleven passing jobs to exit 0: $(cat "$tmp/events.json")"
 # The App's permissions are read once per installation and kept in KV,
 # so the claims did not each read them.
 reads="$(curl -fsS "$GITHUB/_state" | jq '[.installation_reads[] | select(. == 42)] | length')"

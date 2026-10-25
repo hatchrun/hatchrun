@@ -237,6 +237,7 @@ mod tests {
                 timeout_minutes: 10,
                 outputs: BTreeMap::new(),
                 token_permissions: BTreeMap::new(),
+                environment: None,
                 steps: Vec::new(),
             },
             event_name: "push".into(),

@@ -286,7 +286,6 @@ jobs:
     for key in [
         "container",
         "concurrency",
-        "environment",
         "include",
         "exclude",
         "fail-fast",
@@ -1185,4 +1184,132 @@ fn a_converted_config_over_one_mebibyte_is_an_error() {
         "{:?}",
         out.errors
     );
+}
+
+#[test]
+fn environment_carries_over() {
+    let out = ok("
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    environment: production
+    steps: [{ run: a }]
+  b:
+    runs-on: ubuntu-latest
+    environment: { name: staging, url: 'https://x' }
+    steps: [{ run: b }]
+");
+    assert_eq!(
+        out.config.jobs["ci-a"].environment.as_deref(),
+        Some("production")
+    );
+    assert_eq!(
+        out.config.jobs["ci-b"].environment.as_deref(),
+        Some("staging")
+    );
+    assert!(
+        has(
+            &out.warnings,
+            &["`environment.url` is not supported and was dropped"]
+        ),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        !has(&out.warnings, &["`environment` is not supported"]),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(
+        out.warnings
+            .iter()
+            .filter(|w| w.message.contains("environment"))
+            .count(),
+        1,
+        "{:?}",
+        out.warnings
+    );
+    round_trips(&out);
+}
+
+#[test]
+fn environment_expressions_drop_the_job() {
+    let out = convert(&[(
+        "ci.yml".into(),
+        "
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.env }}
+    steps: [{ run: d }]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{ run: l }]
+"
+        .into(),
+    )])
+    .unwrap();
+    assert!(
+        has(&out.errors, &["`environment` uses an expression"]),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-deploy"));
+}
+
+#[test]
+fn environment_of_another_shape_drops_the_job() {
+    for value in ["[a]", "{ url: 'https://x' }", "{ name: [a] }"] {
+        let yaml = format!(
+            "
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: {value}
+    steps: [{{ run: d }}]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{{ run: l }}]
+"
+        );
+        let out = convert(&[("ci.yml".into(), yaml)]).unwrap();
+        assert!(
+            has(&out.errors, &["must be a name or a map with `name`"]),
+            "{value}: {:?}",
+            out.errors
+        );
+        assert!(!out.config.jobs.contains_key("ci-deploy"), "{value}");
+    }
+}
+
+#[test]
+fn environment_with_a_bad_name_drops_the_job() {
+    let out = convert(&[(
+        "ci.yml".into(),
+        "
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: prod eu
+    steps: [{ run: d }]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{ run: l }]
+"
+        .into(),
+    )])
+    .unwrap();
+    assert!(
+        has(
+            &out.errors,
+            &["`environment` `prod eu`", "Use letters, digits"]
+        ),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-deploy"));
 }

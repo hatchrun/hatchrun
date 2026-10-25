@@ -75,38 +75,18 @@ export interface Billing {
   usage: Usage;
 }
 
-/** Job minutes this calendar month (UTC). */
+/** Runner time this calendar month (UTC). */
 export interface Usage {
   monthStart: string;
   monthEnd: string;
-  minutes: number;
-  freeMinutes: number;
-  /** When the free minutes ran out this month. */
-  freeUsedUpAt: string | null;
-  /** When runners stop launching without a card. */
-  graceEndsAt: string | null;
+  /** Runner seconds, every job at least 60. */
+  seconds: number;
+  /** What the month's billed seconds cost, in cents. */
+  spendCents: number;
+  /** The runner price per minute, in millionths of a dollar. */
+  priceMicrosPerMinute: number;
   /** Whether runners launch now. */
   mayLaunch: boolean;
-}
-
-/** The metered Polar product. */
-export interface Plan {
-  id: string;
-  name: string;
-  description: string | null;
-  /** Smallest currency unit, such as cents. */
-  amount: number | null;
-  currency: string | null;
-  interval: string | null;
-  /** Price per minute in the smallest currency unit, a decimal string such as "0.1". */
-  unitAmount: string | null;
-  /** Most a billing period costs, in the smallest currency unit. */
-  capAmount: number | null;
-}
-
-export interface Plans {
-  /** Shortest billing interval first. */
-  plans: Plan[];
 }
 
 export interface Steps {
@@ -208,9 +188,11 @@ export const getTenant = (org: string) => get<Tenant>(`/api/tenants/${encodeURIC
 export const createTenant = (installationId: number) => post<Tenant>("/api/tenants", { installationId });
 
 const tenantPath = (org: string) => `/api/tenants/${encodeURIComponent(org)}`;
-export const getPlan = () => get<Plans>("/api/plan");
-export const startCheckout = (org: string) => post<{ url: string }>(`${tenantPath(org)}/checkout`);
-export const openPortal = (org: string) => post<{ url: string }>(`${tenantPath(org)}/portal`);
+// `back` sends Polar's return to the CI page instead of Settings.
+export const startCheckout = (org: string, back?: "ci") =>
+  post<{ url: string }>(`${tenantPath(org)}/checkout${back ? "?return=ci" : ""}`);
+export const openPortal = (org: string, back?: "ci") =>
+  post<{ url: string }>(`${tenantPath(org)}/portal${back ? "?return=ci" : ""}`);
 export const redeemInvite = (org: string, code: string) => post<Tenant>(`${tenantPath(org)}/beta`, { code });
 
 export interface AwsRegion {
@@ -584,6 +566,12 @@ export interface CiJob {
   completed_at: number | null;
   steps: CiStep[];
   has_log: boolean;
+  /** "approval" while the job waits for an organization admin to approve or reject it. */
+  held: string | null;
+  /** The environment the job deploys to, when it has one. */
+  environment: string | null;
+  /** The admin's decision on a job held for approval; null until one is made. Times are Unix milliseconds. */
+  approval: { decision: "approved" | "rejected"; by: string; at: number } | null;
 }
 
 export interface CiRunDetail {
@@ -632,6 +620,12 @@ export const getCiRun = (id: string | number) => retrying(() => get<CiRunDetail>
 
 export const cancelCiRun = (id: number) => post<undefined>(`/api/ci/runs/${id}/cancel`);
 
+/** Lets a job held for approval run. Answers 409 when the job is not waiting. */
+export const approveCiJob = (id: number) => post<undefined>(`/api/ci/jobs/${id}/approve`);
+
+/** Fails a job held for approval. Answers 409 when the job is not waiting. */
+export const rejectCiJob = (id: number) => post<undefined>(`/api/ci/jobs/${id}/reject`);
+
 /** The job's log: the stored one once it ended, else the newest text the run holds. */
 export const getCiLog = (job: string | number) =>
   retrying(async (): Promise<CiLog> => {
@@ -670,12 +664,11 @@ export const dispatchWorkflow = (owner: string, repo: string, body: DispatchRequ
 export interface CiBilling {
   /** Whether a card is on file. */
   card: boolean;
-  /** Runner minutes used this month, of every template. */
-  minutes: number;
-  /** Billing units used this month; a 2 vCPU minute is one unit. */
+  /** Billed runner seconds this month, every attempt at least 60. */
+  seconds: number;
+  /** Billing units this month; one unit is one 2 vCPU second. */
   units: number;
-  freeUnits: number;
-  /** This month's cost past the free units, in cents. */
+  /** This month's cost, in cents. */
   spendCents: number;
   /** The monthly spend cap, in whole dollars. */
   capDollars: number;
@@ -703,24 +696,30 @@ async function adminOnly<T>(call: () => Promise<T>): Promise<T> {
 }
 
 export const getCiBilling = (org: string) => adminOnly(() => get<CiBilling>(`${orgCiPath(org)}/billing`));
-export const startCiCheckout = (org: string) =>
-  adminOnly(() => post<{ url: string }>(`${orgCiPath(org)}/billing/checkout`));
-export const openCiPortal = (org: string) =>
-  adminOnly(() => post<{ url: string }>(`${orgCiPath(org)}/billing/portal`));
 export const setCiCap = (org: string, capDollars: number) =>
   adminOnly(() => put<undefined>(`${orgCiPath(org)}/billing/cap`, { capDollars }));
 
-/** Whose secrets and variables: an organization's, or one repository's. */
-export type CiScope = { org: string } | { owner: string; repo: string };
+/** Whose secrets and variables: an organization's, a repository's, or one of its environments'. */
+export type CiScope = { org: string } | { owner: string; repo: string } | { owner: string; repo: string; environment: string };
 
 export type CiItemKind = "secrets" | "vars";
 
-const scopePath = (scope: CiScope) => ("org" in scope ? orgCiPath(scope.org) : repoPath(scope.owner, scope.repo));
+const scopePath = (scope: CiScope) =>
+  "org" in scope
+    ? orgCiPath(scope.org)
+    : "environment" in scope
+      ? `${repoPath(scope.owner, scope.repo)}/environments/${encodeURIComponent(scope.environment)}`
+      : repoPath(scope.owner, scope.repo);
 
-/** A secret as listed: never its value. Times are Unix milliseconds. */
+/**
+ * A secret as listed: never its value. Times are Unix milliseconds.
+ * `repositories` is the `owner/repo` names an organization item
+ * reaches, or null for all of them; other scopes always answer null.
+ */
 export interface CiSecret {
   name: string;
   updatedAt: number;
+  repositories: string[] | null;
 }
 
 export interface CiVar extends CiSecret {
@@ -730,9 +729,40 @@ export interface CiVar extends CiSecret {
 export const listCiSecrets = (scope: CiScope) => adminOnly(() => get<CiSecret[]>(`${scopePath(scope)}/secrets`));
 export const listCiVars = (scope: CiScope) => adminOnly(() => get<CiVar[]>(`${scopePath(scope)}/vars`));
 
-/** Sets or replaces one secret or variable; the API uppercases the name. */
-export const putCiItem = (scope: CiScope, kind: CiItemKind, name: string, value: string) =>
-  adminOnly(() => put<undefined>(`${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`, { value }));
+/**
+ * Sets or replaces one secret or variable; the API uppercases the
+ * name. Org scope sends `repositories` (null for all); other scopes
+ * never send it.
+ */
+export const putCiItem = (scope: CiScope, kind: CiItemKind, name: string, value: string, repositories?: string[] | null) =>
+  adminOnly(() =>
+    put<undefined>(
+      `${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`,
+      "org" in scope ? { value, repositories: repositories ?? null } : { value },
+    ),
+  );
 
 export const deleteCiItem = (scope: CiScope, kind: CiItemKind, name: string) =>
   adminOnly(() => request<undefined>("DELETE", `${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`));
+
+/** The repositories of an organization that have run CI, to choose who an item reaches. */
+export const listCiOrgRepos = (org: string) => adminOnly(() => get<{ name: string }[]>(`${orgCiPath(org)}/repositories`));
+
+/** A deployment environment of a repository. No branches means any branch. */
+export interface CiEnvironment {
+  name: string;
+  branches: string[];
+  approval: boolean;
+  updatedAt: number;
+}
+
+const environmentsPath = (owner: string, repo: string) => `${repoPath(owner, repo)}/environments`;
+
+export const listCiEnvironments = (owner: string, repo: string) =>
+  adminOnly(() => get<CiEnvironment[]>(environmentsPath(owner, repo)));
+
+export const putCiEnvironment = (owner: string, repo: string, name: string, body: { branches: string[]; approval: boolean }) =>
+  adminOnly(() => put<CiEnvironment>(`${environmentsPath(owner, repo)}/${encodeURIComponent(name)}`, body));
+
+export const deleteCiEnvironment = (owner: string, repo: string, name: string) =>
+  adminOnly(() => request<undefined>("DELETE", `${environmentsPath(owner, repo)}/${encodeURIComponent(name)}`));
