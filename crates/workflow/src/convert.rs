@@ -662,7 +662,10 @@ impl Cx {
                     .or_insert_with(|| value.clone());
             }
             // validate rejects these, so the job could not run.
-            let (contexts, bad) = expression_problems(&converted);
+            let (contexts, mut bad) = expression_problems(&converted);
+            if let Some(inputs) = &scope.inputs {
+                bad.extend(bind_literals(&mut converted, inputs));
+            }
             if !contexts.is_empty() || !bad.is_empty() {
                 for context in contexts {
                     self.error(format!(
@@ -865,6 +868,7 @@ impl Cx {
         // The inputs of the called file and the values the call gives.
         let body = workflow_call(&wf.on).unwrap_or(Value::Null);
         let params = self.dispatch(&file, &body).inputs;
+        self.reserved_inputs(at, &file, &params);
         let with = self.call_with(scope, at, &file, gh, &params);
         let mut inputs: BTreeMap<String, Value> = params
             .iter()
@@ -939,7 +943,8 @@ impl Cx {
             .collect();
         let outputs = self.call_outputs(at, &inner, &level, &body, &mut ends);
 
-        self.attach(scope, at, gh, &needs, &mut level);
+        let given = inner.inputs.clone().unwrap_or_default();
+        self.attach(scope, at, gh, &needs, &given, &mut level);
         Call::Done(Called {
             entries: level.entries,
             expansion: Expansion {
@@ -947,6 +952,20 @@ impl Cx {
                 outputs,
             },
         })
+    }
+
+    /// An input a workflow entry reads as its own key, such as `name`, is
+    /// an error: the called jobs would take it as a parameter that no
+    /// entry could set.
+    fn reserved_inputs(&mut self, at: &str, file: &str, params: &BTreeMap<String, Parameter>) {
+        for name in params
+            .keys()
+            .filter(|n| plan::ENTRY_KEYS.contains(&n.as_str()))
+        {
+            self.error(format!(
+                "{at} calls `{file}`, whose input `{name}` would be a job parameter that a workflow entry reads as its own key; rename the input; the job was dropped"
+            ));
+        }
     }
 
     /// The values a call gives the inputs of the file it calls, as the
@@ -1038,6 +1057,7 @@ impl Cx {
         at: &str,
         gh: &GhJob,
         needs: &[String],
+        given: &BTreeMap<String, Value>,
         level: &mut Converted,
     ) {
         let roots: BTreeSet<String> = level
@@ -1077,7 +1097,24 @@ impl Cx {
             let Some(job) = self.config.jobs.get_mut(key) else {
                 continue;
             };
-            if let Some(and) = both(&condition, job.if_.as_deref()) {
+            // `parameters` can be read only by a whole `${{ }}`, and the
+            // combined condition is not one: use the value the call gave.
+            if let Some(current) = &job.if_
+                && current.contains("parameters.")
+            {
+                let bare = !current.contains("${{");
+                job.if_ = Some(rewrite(current, bare, &mut |parts| match parts {
+                    ["parameters", name, ..] => Some((2, expr_text(literal_input(given, name)?))),
+                    _ => None,
+                }));
+            }
+            if job
+                .if_
+                .as_deref()
+                .is_some_and(|c| c.contains("parameters."))
+            {
+                kept = true;
+            } else if let Some(and) = both(&condition, job.if_.as_deref()) {
                 job.if_ = Some(and);
             } else {
                 kept = true;
@@ -2749,54 +2786,128 @@ fn rewrite_expr(expr: &str, names: &mut Names<'_>) -> String {
     out
 }
 
+/// Rewrites one text, which is a bare expression when the flag is set.
+type Texts<'a> = dyn FnMut(&str, bool) -> String + 'a;
+
 /// Rewrites the expressions of a value's strings, at any depth.
 fn rewrite_value(value: &mut Value, names: &mut Names<'_>) {
+    walk_value(value, &mut |text, bare| rewrite(text, bare, names));
+}
+
+/// [`rewrite_value`] with a rewriter of whole texts.
+fn walk_value(value: &mut Value, texts: &mut Texts<'_>) {
     match value {
-        Value::String(text) => *text = rewrite(text, false, names),
-        Value::Array(items) => items.iter_mut().for_each(|v| rewrite_value(v, names)),
-        Value::Object(map) => map.values_mut().for_each(|v| rewrite_value(v, names)),
+        Value::String(text) => *text = texts(text, false),
+        Value::Array(items) => items.iter_mut().for_each(|v| walk_value(v, texts)),
+        Value::Object(map) => map.values_mut().for_each(|v| walk_value(v, texts)),
         _ => {}
     }
 }
 
 /// Rewrites every expression of a converted job.
 fn map_job(job: &mut Job, names: &mut Names<'_>) {
-    fn text(text: &mut String, names: &mut Names<'_>) {
-        *text = rewrite(text, false, names);
+    walk_job(job, &mut |text, bare| rewrite(text, bare, names));
+}
+
+/// [`map_job`] with a rewriter of whole texts.
+fn walk_job(job: &mut Job, texts: &mut Texts<'_>) {
+    fn text(text: &mut String, texts: &mut Texts<'_>) {
+        *text = texts(text, false);
     }
-    fn opt(text: &mut Option<String>, names: &mut Names<'_>) {
+    fn opt(text: &mut Option<String>, texts: &mut Texts<'_>) {
         if let Some(t) = text {
-            *t = rewrite(t, false, names);
+            *t = texts(t, false);
         }
     }
-    fn cond(text: &mut Option<String>, names: &mut Names<'_>) {
+    fn cond(text: &mut Option<String>, texts: &mut Texts<'_>) {
         if let Some(t) = text {
-            *t = rewrite(t, !t.contains("${{"), names);
+            *t = texts(t, !t.contains("${{"));
         }
     }
-    job.env.values_mut().for_each(|v| text(v, names));
-    job.outputs.values_mut().for_each(|v| text(v, names));
-    opt(&mut job.runs_on, names);
-    cond(&mut job.if_, names);
+    job.env.values_mut().for_each(|v| text(v, texts));
+    job.outputs.values_mut().for_each(|v| text(v, texts));
+    opt(&mut job.runs_on, texts);
+    cond(&mut job.if_, texts);
     for step in &mut job.steps {
         match step {
             Step::Run(run) => {
-                opt(&mut run.name, names);
-                text(&mut run.run, names);
-                opt(&mut run.shell, names);
-                opt(&mut run.working_directory, names);
-                run.env.values_mut().for_each(|v| text(v, names));
-                cond(&mut run.if_, names);
+                opt(&mut run.name, texts);
+                text(&mut run.run, texts);
+                opt(&mut run.shell, texts);
+                opt(&mut run.working_directory, texts);
+                run.env.values_mut().for_each(|v| text(v, texts));
+                cond(&mut run.if_, texts);
             }
             Step::Uses(uses) => {
-                opt(&mut uses.name, names);
-                uses.with.values_mut().for_each(|v| rewrite_value(v, names));
-                uses.env.values_mut().for_each(|v| text(v, names));
-                cond(&mut uses.if_, names);
+                opt(&mut uses.name, texts);
+                uses.with.values_mut().for_each(|v| walk_value(v, texts));
+                uses.env.values_mut().for_each(|v| text(v, texts));
+                cond(&mut uses.if_, texts);
             }
             _ => {}
         }
     }
+}
+
+/// The value a call gives an input, when it is a literal: not a list, a
+/// map or text with an expression in it.
+fn literal_input<'v>(inputs: &'v BTreeMap<String, Value>, name: &str) -> Option<&'v Value> {
+    inputs.get(name).filter(|v| match v {
+        Value::String(s) => !s.contains("${{"),
+        Value::Array(_) | Value::Object(_) => false,
+        _ => true,
+    })
+}
+
+/// Makes the reads of `inputs.NAME` that are not a whole `${{ }}` into
+/// the value the call gave, which `parameters` cannot do: they are
+/// evaluated at run time, where parameters are not. A read of an input
+/// whose value is not a literal stays, and the result is a message for
+/// each such input.
+fn bind_literals(job: &mut Job, inputs: &BTreeMap<String, Value>) -> Vec<String> {
+    let literal = |name: &str| literal_input(inputs, name);
+    let mut stuck = BTreeSet::new();
+    let mut expr = |inner: &str| {
+        rewrite_expr(inner, &mut |parts| match parts {
+            ["inputs", name, ..] => {
+                let value = literal(name);
+                if value.is_none() {
+                    stuck.insert((*name).to_owned());
+                }
+                value.map(|v| (2, expr_text(v)))
+            }
+            _ => None,
+        })
+    };
+    walk_job(job, &mut |text, bare| {
+        if bare {
+            return expr(text);
+        }
+        let Ok(found) = expr::expressions(text) else {
+            return text.to_owned();
+        };
+        let mut out = text.to_owned();
+        for (start, inner) in found.into_iter().rev() {
+            // `parameters` can be read as `${{ parameters.NAME }}` and
+            // nothing else.
+            let plain = inner
+                .trim()
+                .strip_prefix("inputs.")
+                .is_some_and(|name| simple(name) && !name.contains('.'));
+            if !plain {
+                out.replace_range(start..start + inner.len(), &expr(inner));
+            }
+        }
+        out
+    });
+    stuck
+        .into_iter()
+        .map(|name| {
+            format!(
+                "reads `inputs.{name}` inside an expression, and the call does not give it a literal; only a whole `${{{{ inputs.{name} }}}}` can be passed on"
+            )
+        })
+        .collect()
 }
 
 /// Answers reads of `inputs.NAME` with the value the call gave it.

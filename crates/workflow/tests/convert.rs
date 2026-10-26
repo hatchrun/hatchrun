@@ -2169,3 +2169,147 @@ jobs:
     assert!(has(&out.errors, &["cycle"]));
     assert!(!out.config.jobs.keys().any(|k| k.starts_with("ci-z")));
 }
+
+const FLAGGED: &str = "
+on:
+  workflow_call:
+    inputs:
+      prerelease: { type: boolean, default: false }
+      tag: { type: string, default: '' }
+jobs:
+  notify:
+    if: ${{ !inputs.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ inputs.tag }}
+      - if: inputs.tag != '' && !inputs.prerelease
+        run: echo ${{ inputs.tag || github.ref }}
+";
+
+#[test]
+fn inputs_inside_an_expression_become_the_literal_the_call_gives() {
+    let ci = "
+on: push
+jobs:
+  a:
+    uses: ./.github/workflows/flagged.yml
+    with: { prerelease: true, tag: v1 }
+";
+    let out = many(&[("ci.yml", ci), ("flagged.yml", FLAGGED)]);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let job = &out.config.jobs["ci-a-notify"];
+    assert_eq!(job.if_.as_deref(), Some("${{ !true }}"));
+    let Step::Run(first) = &job.steps[0] else {
+        panic!()
+    };
+    assert_eq!(first.run, "echo ${{ parameters.tag }}");
+    let Step::Run(second) = &job.steps[1] else {
+        panic!()
+    };
+    assert_eq!(second.if_.as_deref(), Some("'v1' != '' && !true"));
+    assert_eq!(second.run, "echo ${{ 'v1' || github.ref }}");
+    round_trips(&out);
+}
+
+#[test]
+fn an_input_inside_an_expression_with_no_literal_drops_the_job() {
+    let ci = "
+on: push
+jobs:
+  pre:
+    runs-on: ubuntu-latest
+    outputs: { tag: x }
+    steps: [{ run: x }]
+  a:
+    needs: pre
+    uses: ./.github/workflows/flagged.yml
+    with: { prerelease: '${{ needs.pre.outputs.tag }}' }
+  b: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+";
+    let out = many(&[("ci.yml", ci), ("flagged.yml", FLAGGED)]);
+    assert!(
+        has(
+            &out.errors,
+            &["`inputs.prerelease`", "inside an expression"]
+        ),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-a-notify"));
+    assert!(out.config.jobs.contains_key("ci-b"));
+    round_trips(&out);
+}
+
+#[test]
+fn an_input_named_like_an_entry_key_drops_the_call() {
+    let named = "
+on:
+  workflow_call:
+    inputs:
+      name: { type: string, default: x }
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [{ run: 'echo ${{ inputs.name }}' }] }
+";
+    let ci = "
+on: push
+jobs:
+  a:
+    uses: ./.github/workflows/named.yml
+    with: { name: y }
+  b: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+";
+    let out = many(&[("ci.yml", ci), ("named.yml", named)]);
+    assert!(
+        has(&out.errors, &["input `name`", "entry reads as its own key"])
+            || has(&out.errors, &["input `name`", "its own key"]),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-a-build"));
+    round_trips(&out);
+}
+
+#[test]
+fn a_call_condition_combines_with_a_called_job_condition_that_reads_an_input() {
+    let gated = "
+on:
+  workflow_call:
+    inputs:
+      affected: { type: boolean, default: false }
+jobs:
+  test:
+    if: ${{ inputs.affected }}
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+";
+    let ci = "
+on: push
+jobs:
+  pre:
+    runs-on: ubuntu-latest
+    outputs: { hit: x }
+    steps: [{ run: x }]
+  lit:
+    needs: pre
+    if: always()
+    uses: ./.github/workflows/gated.yml
+    with: { affected: true }
+  dyn:
+    needs: pre
+    if: always()
+    uses: ./.github/workflows/gated.yml
+    with: { affected: '${{ needs.pre.outputs.hit }}' }
+";
+    let out = many(&[("ci.yml", ci), ("gated.yml", gated)]);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert_eq!(
+        out.config.jobs["ci-lit-test"].if_.as_deref(),
+        Some("(always()) && (true)")
+    );
+    assert_eq!(
+        out.config.jobs["ci-dyn-test"].if_.as_deref(),
+        Some("${{ parameters.affected }}")
+    );
+    assert!(has(&out.warnings, &["could not be combined"]));
+    round_trips(&out);
+}
