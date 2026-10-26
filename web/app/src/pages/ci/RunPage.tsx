@@ -7,7 +7,7 @@
 // in; a viewer the API turns away (401, or 404 while signed out) gets
 // the sign-in prompt.
 
-import { Fragment, useCallback, useEffect, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import {
   ApiError,
@@ -110,6 +110,7 @@ function RepoRuns({ session, route }: { session: Session | null; route: CiRoute 
   const [moreError, setMoreError] = useState<Error | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [dispatching, setDispatching] = useState(false);
+  const dispatchButton = useRef<HTMLButtonElement>(null);
   const active = first.state === "ready" && first.data.runs.some((run) => run.status !== "completed");
   useRefresh(active, reload);
 
@@ -138,7 +139,12 @@ function RepoRuns({ session, route }: { session: Session | null; route: CiRoute 
             <Link href={`/ci/${owner}/${repo}/settings`} className="button">
               Settings
             </Link>
-            <button type="button" className="button button-primary" onClick={() => setDispatching(true)}>
+            <button
+              ref={dispatchButton}
+              type="button"
+              className="button button-primary"
+              onClick={() => setDispatching(true)}
+            >
               Run workflow
             </button>
           </div>
@@ -178,6 +184,7 @@ function RepoRuns({ session, route }: { session: Session | null; route: CiRoute 
           repo={repo}
           open={dispatching}
           onOpenChange={setDispatching}
+          returnFocus={dispatchButton}
           onStarted={(id) => navigate(`/ci/${owner}/${repo}/runs/${id}`)}
         />
       )}

@@ -42,10 +42,14 @@ export function Environments({ owner, repo }: { owner: string; repo: string }) {
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
+    const given = name.trim();
+    if (given === "") {
+      setError("Environment names cannot be empty");
+      return;
+    }
     setBusy(true);
     setError(null);
     setSaved(null);
-    const given = name.trim();
     try {
       const stored = await putCiEnvironment(owner, repo, given, { branches: patterns(branches), approval });
       reset();
@@ -100,7 +104,7 @@ export function Environments({ owner, repo }: { owner: string; repo: string }) {
           list.length === 0 ? (
             <p className="muted">No environments yet.</p>
           ) : (
-            <div className="overflow-hidden rounded-md border border-rivet">
+            <div className="overflow-x-auto rounded-md border border-rivet">
               <Table>
                 <TableHeader>
                   <TableRow>

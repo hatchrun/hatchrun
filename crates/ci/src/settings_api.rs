@@ -540,8 +540,12 @@ fn resolve_selection(
 }
 
 /// The uppercased name, or the `400` that says what is wrong with it.
-fn item_name(item: &str) -> std::result::Result<String, Stop> {
-    secrets::valid_name(item).or_else(|message| stop(400, message))
+fn item_name(item: &str, kind: Kind) -> std::result::Result<String, Stop> {
+    let noun = match kind {
+        Kind::Secrets => "secret",
+        Kind::Vars => "variable",
+    };
+    secrets::valid_name(item, noun).or_else(|message| stop(400, message))
 }
 
 async fn repositories(cx: &Cx<'_>, org: &str) -> Result<Served> {
@@ -607,7 +611,7 @@ async fn put_secret(
         Ok(target) => target,
         Err(stop) => return Ok(Err(stop)),
     };
-    let name = match item_name(item) {
+    let name = match item_name(item, Kind::Secrets) {
         Ok(name) => name,
         Err(stop) => return Ok(Err(stop)),
     };
@@ -658,7 +662,7 @@ async fn put_var(
         Ok(target) => target,
         Err(stop) => return Ok(Err(stop)),
     };
-    let name = match item_name(item) {
+    let name = match item_name(item, Kind::Vars) {
         Ok(name) => name,
         Err(stop) => return Ok(Err(stop)),
     };
@@ -835,7 +839,7 @@ async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result
         Ok(target) => target,
         Err(stop) => return Ok(Err(stop)),
     };
-    let name = match item_name(item) {
+    let name = match item_name(item, kind) {
         Ok(name) => name,
         Err(stop) => return Ok(Err(stop)),
     };
@@ -1174,8 +1178,14 @@ mod tests {
 
     #[test]
     fn names_are_uppercased_or_refused() {
-        assert_eq!(item_name("token_1").unwrap(), "TOKEN_1");
-        assert!(matches!(item_name("1TOKEN"), Err(Stop(400, ..))));
-        assert!(matches!(item_name("GITHUB_X"), Err(Stop(400, ..))));
+        assert_eq!(item_name("token_1", Kind::Secrets).unwrap(), "TOKEN_1");
+        assert!(matches!(
+            item_name("1TOKEN", Kind::Secrets),
+            Err(Stop(400, ..))
+        ));
+        assert!(matches!(
+            item_name("GITHUB_X", Kind::Vars),
+            Err(Stop(400, ..))
+        ));
     }
 }

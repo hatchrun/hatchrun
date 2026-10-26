@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, type RefObject } from "react";
 import { Dialog } from "radix-ui";
 
 import { ApiError, dispatchWorkflow, type DispatchRequest } from "@/api";
@@ -92,6 +92,7 @@ export function DispatchDialog({
   open,
   onOpenChange,
   onStarted,
+  returnFocus,
 }: {
   owner: string;
   repo: string;
@@ -99,6 +100,8 @@ export function DispatchDialog({
   onOpenChange: (open: boolean) => void;
   /** Called with the id of the first run started. */
   onStarted: (run: number) => void;
+  /** Focused when the dialog closes; the dialog has no trigger of its own. */
+  returnFocus?: RefObject<HTMLElement | null>;
 }) {
   const [workflow, setWorkflow] = useState("");
   const [ref, setRef] = useState("");
@@ -154,7 +157,14 @@ export function DispatchDialog({
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-40 bg-black/60" />
-        <Dialog.Content className="fixed top-1/2 left-1/2 z-50 max-h-[90vh] w-[min(520px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-md border border-rivet bg-graphite p-5">
+        <Dialog.Content
+          onCloseAutoFocus={(event) => {
+            if (returnFocus?.current) {
+              event.preventDefault();
+              returnFocus.current.focus();
+            }
+          }}
+          className="fixed top-1/2 left-1/2 z-50 max-h-[90vh] w-[min(520px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-md border border-rivet bg-graphite p-5">
           <Dialog.Title className="display text-xl">Run workflow</Dialog.Title>
           <Dialog.Description className="muted mb-4">
             Starts a workflow of {owner}/{repo} that has a <code>workflow_dispatch</code> trigger.
