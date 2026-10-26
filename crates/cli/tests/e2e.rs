@@ -813,7 +813,7 @@ fn nightly_schedule() {
 }
 
 #[test]
-fn reusable_workflow_calls_drop_their_dependents() {
+fn local_reusable_workflows_are_inlined_and_remote_ones_dropped() {
     scenario("reusable");
 }
 

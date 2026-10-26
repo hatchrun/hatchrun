@@ -63,6 +63,14 @@ pub struct Conversion {
 /// on, such as one that runs only on `issues`, is dropped with its jobs
 /// and a warning.
 ///
+/// A job with `uses: ./.github/workflows/x.yml` (or a `.forgejo` or
+/// `.gitea` path) whose file is among the files is replaced by the jobs
+/// of that file, `<stem>-<job>-<called job>`, with the file's
+/// `on.workflow_call.inputs` as parameters; calls nest four levels deep.
+/// A file whose only event is `workflow_call` and that some file calls is
+/// not reported as dropped. A call of a file in another repository, or
+/// one that was not given, is dropped with a warning.
+///
 /// `on.workflow_run` names workflows as GitHub does, by their `name:`,
 /// or by their file name when they have none. Each name becomes the stem of
 /// the file that has it; a name no converted file has is dropped with a
@@ -105,6 +113,19 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
                 let mut diag = Diagnostic::from(&err);
                 diag.file = Some(file.clone());
                 cx.errors.push(diag);
+            }
+        }
+    }
+    for (file, _, gh) in &parsed {
+        if calls_workflow(&gh.on) {
+            cx.library.insert((*file).clone(), gh.clone());
+        }
+    }
+    for (_, _, gh) in &parsed {
+        for (_, job) in &gh.jobs.0 {
+            let called = job.get("uses").and_then(Value::as_str);
+            if let Some(file) = called.and_then(|uses| cx.callee(uses)) {
+                cx.called.insert(file);
             }
         }
     }
@@ -217,7 +238,7 @@ const EVENTS: &str = "push, pull_request, schedule, workflow_dispatch, workflow_
 const GITHUB_ONLY: &[&str] = &["pull_request_target", "issues", "issue_comment"];
 
 /// The part of a GitHub workflow file the converter reads.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "kebab-case")]
 struct GhWorkflow {
     #[serde(default)]
@@ -263,9 +284,8 @@ struct GhJob {
     services: Option<Value>,
     uses: Option<Value>,
     #[serde(rename = "with")]
-    _with: Option<Value>,
-    #[serde(rename = "secrets")]
-    _secrets: Option<Value>,
+    with_: Option<Value>,
+    secrets: Option<Value>,
 }
 
 /// A GitHub step.
@@ -373,6 +393,7 @@ struct GhRelease {
 }
 
 /// A map that keeps the order its keys were written in.
+#[derive(Clone)]
 struct Ordered<T>(Vec<(String, T)>);
 
 impl<T> Default for Ordered<T> {
@@ -409,6 +430,106 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Ordered<T> {
     }
 }
 
+/// How deep reusable workflows may call each other.
+const MAX_CALL_DEPTH: usize = 4;
+
+/// The directories workflow files, and so local calls, live in.
+const WORKFLOW_DIRS: &[&str] = &[
+    ".github/workflows/",
+    ".forgejo/workflows/",
+    ".gitea/workflows/",
+];
+
+/// Where a set of jobs is converted: a workflow file, or a file that a
+/// job of another one calls.
+struct Scope {
+    /// The file, quoted, for messages.
+    label: String,
+    /// What the messages add about the call that brought the file in.
+    from: String,
+    /// The stem of the file at the root of the calls.
+    stem: String,
+    /// The ids of the calls that led here, joined with `-`; empty for a
+    /// file that no call brought in.
+    prefix: String,
+    /// How many calls led here.
+    depth: usize,
+    /// The files of the calls that led here, the root's first.
+    stack: Vec<String>,
+    /// The values of the inputs the file was called with, defaults
+    /// included.
+    inputs: Option<BTreeMap<String, Value>>,
+}
+
+impl Scope {
+    /// Where a job of the file is named in messages.
+    fn at(&self, id: &str) -> String {
+        format!("{} job `{id}`{}", self.label, self.from)
+    }
+
+    /// The id of a job in the workflow: its own in the root file, else
+    /// the stem and the calls in front of it, so that ids of files
+    /// called twice differ.
+    fn full(&self, id: &str) -> String {
+        if self.prefix.is_empty() {
+            id.to_owned()
+        } else {
+            format!("{}-{}-{id}", self.stem, self.prefix)
+        }
+    }
+
+    /// The key of a job in `jobs:`.
+    fn key(&self, id: &str) -> String {
+        if self.prefix.is_empty() {
+            format!("{}-{id}", self.stem)
+        } else {
+            self.full(id)
+        }
+    }
+}
+
+/// The jobs converted from one file.
+#[derive(Default)]
+struct Converted {
+    /// Each converted job's id and its workflow entries.
+    entries: Vec<(String, Vec<WorkflowJob>)>,
+    /// Jobs left out, with what happened to each, worded to follow
+    /// "which".
+    dropped: BTreeMap<String, String>,
+    /// A job had an error.
+    failed: bool,
+    /// The keys of the jobs the file has itself, not through calls.
+    plain: BTreeSet<String>,
+    /// The ids those jobs have in the file.
+    local: BTreeSet<String>,
+    /// The calls, by the id of the job that made each.
+    calls: BTreeMap<String, Expansion>,
+}
+
+/// What a job that called a workflow stands for.
+struct Expansion {
+    /// The ids of the jobs that jobs needing the call require.
+    requires: Vec<String>,
+    /// What reads of each output of the call become, as an expression;
+    /// `None` for an output that cannot be mapped.
+    outputs: BTreeMap<String, Option<String>>,
+}
+
+/// A call that was inlined.
+struct Called {
+    entries: Vec<(String, Vec<WorkflowJob>)>,
+    expansion: Expansion,
+}
+
+/// What became of a job that calls a reusable workflow.
+enum Call {
+    Done(Called),
+    /// Left out with a warning.
+    Dropped,
+    /// Left out with an error.
+    Failed,
+}
+
 /// What the conversion has built so far.
 #[derive(Default)]
 struct Cx {
@@ -417,6 +538,10 @@ struct Cx {
     errors: Vec<Diagnostic>,
     /// The stems of the files that have each GitHub workflow name.
     names: BTreeMap<String, Vec<String>>,
+    /// The files with `on.workflow_call`, which jobs can call.
+    library: BTreeMap<String, GhWorkflow>,
+    /// The files some file calls with a local `uses`.
+    called: BTreeSet<String>,
 }
 
 impl Cx {
@@ -450,43 +575,87 @@ impl Cx {
         let shared_env = self.env(&format!("`{file}`"), "env", gh.env.as_ref());
         let shared_defaults = self.defaults(&format!("`{file}`"), gh.defaults.as_ref());
 
-        let ids: BTreeSet<String> = gh.jobs.0.iter().map(|(id, _)| id.clone()).collect();
-        // Jobs left out, with what happened to each, worded to follow
-        // "which".
-        let mut dropped: BTreeMap<String, String> = BTreeMap::new();
-        let mut failed = false;
-        // Each converted job's id and its workflow entries.
-        let mut entries: Vec<(String, Vec<WorkflowJob>)> = Vec::new();
-        for (id, job) in gh.jobs.0 {
-            let at = format!("`{file}` job `{id}`");
+        let scope = Scope {
+            label: format!("`{file}`"),
+            from: String::new(),
+            stem: stem.to_owned(),
+            prefix: String::new(),
+            depth: 0,
+            stack: vec![file.to_owned()],
+            inputs: None,
+        };
+        let Converted {
+            entries, failed, ..
+        } = self.jobs(&scope, gh.jobs.0, &shared_env, &shared_defaults);
+        // A file whose every job failed converts to nothing.
+        if entries.is_empty() && failed {
+            return;
+        }
+        let jobs = flatten(entries);
+        self.config.workflows.insert(
+            stem.to_owned(),
+            Workflow {
+                on,
+                permissions,
+                jobs,
+            },
+        );
+    }
+
+    /// Converts the jobs of a workflow file, or of a file it calls.
+    /// A job that calls a local reusable workflow becomes the jobs of the
+    /// called file; see [`Cx::call`]. A job that needs a dropped job
+    /// would run without it, so it is dropped too, and so on down the
+    /// chain. The entries of one job share their `requires`.
+    fn jobs(
+        &mut self,
+        scope: &Scope,
+        jobs: Vec<(String, Value)>,
+        shared_env: &BTreeMap<String, String>,
+        shared_defaults: &RunDefaults,
+    ) -> Converted {
+        let ids: BTreeSet<String> = jobs.iter().map(|(id, _)| id.clone()).collect();
+        let mut level = Converted::default();
+        for (id, job) in jobs {
+            let at = scope.at(&id);
+            let fid = scope.full(&id);
             let Some(job) = self.gh_job(&at, &job) else {
-                dropped.insert(id, FAILED.to_owned());
-                failed = true;
+                level.dropped.insert(fid, FAILED.to_owned());
+                level.failed = true;
                 continue;
             };
             if job.uses.is_some() {
-                self.warn(format!(
-                    "{at} calls a reusable workflow, which is not supported; the job was dropped"
-                ));
-                dropped.insert(id, REUSABLE.to_owned());
+                match self.call(scope, &at, &id, &ids, &job) {
+                    Call::Done(done) => {
+                        level.entries.extend(done.entries);
+                        level.calls.insert(id, done.expansion);
+                    }
+                    Call::Dropped => {
+                        level.dropped.insert(fid, REUSABLE.to_owned());
+                    }
+                    Call::Failed => {
+                        level.dropped.insert(fid, FAILED.to_owned());
+                        level.failed = true;
+                    }
+                }
                 continue;
             }
-            let key = format!("{stem}-{id}");
+            let key = scope.key(&id);
             if self.config.jobs.contains_key(&key) {
                 self.error(format!(
                     "{at} becomes job `{key}`, which another workflow already uses; rename one of them"
                 ));
-                dropped.insert(id, FAILED.to_owned());
-                failed = true;
+                level.dropped.insert(fid, FAILED.to_owned());
+                level.failed = true;
                 continue;
             }
-            let Some((mut converted, expanded)) = self.job(&at, &id, &key, &ids, job) else {
-                dropped.insert(id, FAILED.to_owned());
-                failed = true;
+            let Some((mut converted, mut expanded)) = self.job(&at, &id, &key, &ids, job) else {
+                level.dropped.insert(fid, FAILED.to_owned());
+                level.failed = true;
                 continue;
             };
             shared_defaults.apply(&mut converted.steps);
-            for (name, value) in &shared_env {
+            for (name, value) in shared_env {
                 converted
                     .env
                     .entry(name.clone())
@@ -503,42 +672,542 @@ impl Cx {
                 for problem in bad {
                     self.error(format!("{at} {problem}; the job was dropped"));
                 }
-                dropped.insert(id, FAILED.to_owned());
-                failed = true;
+                level.dropped.insert(fid, FAILED.to_owned());
+                level.failed = true;
                 continue;
             }
+            for entry in &mut expanded {
+                entry.name = entry.name.take().map(|n| scope.full(&n));
+                for require in &mut entry.requires {
+                    require.job = scope.full(&require.job);
+                }
+            }
             self.config.jobs.insert(key.clone(), converted);
-            entries.push((id, expanded));
+            level.plain.insert(key);
+            level.local.insert(id);
+            level.entries.push((fid, expanded));
         }
-        // A job that needs a dropped job would run without it, so it is
-        // dropped too, and so on down the chain. The entries of one job
-        // share their `requires`.
-        while let Some((i, need)) = entries.iter().enumerate().find_map(|(i, (_, e))| {
+        self.link_calls(scope, &mut level);
+        while let Some((i, need)) = level.entries.iter().enumerate().find_map(|(i, (_, e))| {
             let need = e[0]
                 .requires
                 .iter()
-                .find(|r| dropped.contains_key(&r.job))?;
+                .find(|r| level.dropped.contains_key(&r.job))?;
             Some((i, need.job.clone()))
         }) {
-            let (id, expanded) = entries.remove(i);
+            let (id, expanded) = level.entries.remove(i);
             self.config.jobs.remove(&expanded[0].job);
-            let why = format!("needs `{need}`, which {}", dropped[&need]);
-            self.warn(format!("`{file}` job `{id}` was dropped: it {why}"));
-            dropped.insert(id, why);
+            let why = format!("needs `{need}`, which {}", level.dropped[&need]);
+            self.warn(format!(
+                "{} job `{id}`{} was dropped: it {why}",
+                scope.label, scope.from
+            ));
+            level.dropped.insert(id, why);
         }
-        // A file whose every job failed converts to nothing.
-        if entries.is_empty() && failed {
+        level
+    }
+
+    /// Points what reads a job that called a workflow at the jobs the
+    /// call became: `needs: caller` becomes a `requires` of each job the
+    /// call ended with, and `needs.caller.outputs.X` becomes what the
+    /// called workflow's `on.workflow_call.outputs.X` says. Jobs of a
+    /// called file get their ids with the call in front, so that
+    /// `needs.x` still names them.
+    fn link_calls(&mut self, scope: &Scope, level: &mut Converted) {
+        let mut warned = Vec::new();
+        if !scope.prefix.is_empty() || !level.calls.is_empty() {
+            let mut map = needs_mapper(scope, &level.local, &level.calls, "needs", &mut warned);
+            for key in &level.plain {
+                if let Some(job) = self.config.jobs.get_mut(key) {
+                    map_job(job, &mut map);
+                }
+            }
+        }
+        warned.sort();
+        warned.dedup();
+        for message in warned {
+            self.warn(format!("{}{}: {message}", scope.label, scope.from));
+        }
+        let ends: BTreeMap<String, Vec<String>> = level
+            .calls
+            .iter()
+            .map(|(id, call)| (scope.full(id), call.requires.clone()))
+            .collect();
+        if ends.is_empty() {
             return;
         }
-        let jobs = flatten(entries);
-        self.config.workflows.insert(
-            stem.to_owned(),
-            Workflow {
-                on,
-                permissions,
-                jobs,
+        for (_, entries) in &mut level.entries {
+            for entry in entries {
+                let mut seen = BTreeSet::new();
+                entry.requires = entry
+                    .requires
+                    .iter()
+                    .flat_map(|r| match ends.get(&r.job) {
+                        Some(jobs) => jobs
+                            .iter()
+                            .map(|job| Require {
+                                job: job.clone(),
+                                statuses: r.statuses,
+                            })
+                            .collect(),
+                        None => vec![r.clone()],
+                    })
+                    .filter(|r| seen.insert(r.job.clone()))
+                    .collect();
+            }
+        }
+    }
+
+    /// The file `uses: ./path` names, among the files with
+    /// `on.workflow_call`. The path may be under `.github`, `.forgejo` or
+    /// `.gitea`; a file is found under any of them.
+    fn callee(&self, uses: &str) -> Option<String> {
+        let want = uses.strip_prefix("./")?.trim_start_matches("./");
+        let name = WORKFLOW_DIRS
+            .iter()
+            .find_map(|dir| want.strip_prefix(dir))
+            .unwrap_or(want);
+        let at = |file: &str, path: &str| file == path || file.ends_with(&format!("/{path}"));
+        self.library
+            .keys()
+            .find(|file| {
+                let file = file.trim_start_matches("./");
+                at(file, want)
+                    || file == name
+                    || WORKFLOW_DIRS
+                        .iter()
+                        .any(|dir| at(file, &format!("{dir}{name}")))
+            })
+            .cloned()
+    }
+
+    /// The `uses` of a call and the file it names. `Err` says what became
+    /// of a call that cannot be inlined: a remote one, one of a file that
+    /// was not given, a cycle or one nested too deep.
+    fn resolve(&mut self, scope: &Scope, at: &str, gh: &GhJob) -> Result<(String, String), Call> {
+        let Some(uses) = gh.uses.as_ref().and_then(Value::as_str) else {
+            self.warn(format!(
+                "{at} calls a reusable workflow, which is not supported; the job was dropped"
+            ));
+            return Err(Call::Dropped);
+        };
+        if !uses.starts_with("./") {
+            let path = uses.split('@').next().unwrap_or(uses);
+            let name = path.rsplit('/').next().unwrap_or(path);
+            self.warn(format!(
+                "{at} calls `{uses}`, a reusable workflow in another repository, which is not supported; copy `{name}` into this repository and call it as `./.github/workflows/{name}`; the job was dropped"
+            ));
+            return Err(Call::Dropped);
+        }
+        let Some(file) = self.callee(uses) else {
+            self.warn(format!(
+                "{at} calls `{uses}`, which is not among the converted files or has no `on: workflow_call`; the job was dropped"
+            ));
+            return Err(Call::Dropped);
+        };
+        if scope.stack.contains(&file) {
+            let chain: Vec<String> = scope
+                .stack
+                .iter()
+                .chain([&file])
+                .map(|f| format!("`{f}`"))
+                .collect();
+            self.error(format!(
+                "{at} calls `{uses}`, which makes a cycle ({}); the job was dropped",
+                chain.join(" calls ")
+            ));
+            return Err(Call::Failed);
+        }
+        if scope.depth >= MAX_CALL_DEPTH {
+            self.error(format!(
+                "{at} calls `{uses}` more than {MAX_CALL_DEPTH} levels deep; the job was dropped"
+            ));
+            return Err(Call::Failed);
+        }
+        Ok((uses.to_owned(), file))
+    }
+
+    /// Converts a job that calls a reusable workflow. A call of a file
+    /// among the converted ones is inlined: each job of the called file
+    /// becomes the job `<stem>-<caller>-<job>`, with the `inputs` of
+    /// `on.workflow_call` as `parameters` and the call's `with:` as the
+    /// entries' `with`. A remote call, or one of a file that was not
+    /// given, is dropped with a warning; a cycle, a call nested more
+    /// than [`MAX_CALL_DEPTH`] levels deep or a call that does not
+    /// convert is an error.
+    fn call(
+        &mut self,
+        scope: &Scope,
+        at: &str,
+        id: &str,
+        ids: &BTreeSet<String>,
+        gh: &GhJob,
+    ) -> Call {
+        let (uses, file) = match self.resolve(scope, at, gh) {
+            Ok(found) => found,
+            Err(call) => return call,
+        };
+        let wf = self.library[&file].clone();
+        let before = self.errors.len();
+        for (key, set) in [
+            ("strategy", gh.strategy.is_some()),
+            ("concurrency", gh.concurrency.is_some()),
+        ] {
+            if set {
+                self.warn(format!(
+                    "{at}: `{key}` on a job that calls a reusable workflow is not supported and was dropped"
+                ));
+            }
+        }
+        let caller_permissions = self.permissions(at, gh.permissions.as_ref(), true);
+        let needs = self.needs(at, gh.needs.clone(), ids);
+
+        // The inputs of the called file and the values the call gives.
+        let body = workflow_call(&wf.on).unwrap_or(Value::Null);
+        let params = self.dispatch(&file, &body).inputs;
+        let with = self.call_with(scope, at, &file, gh, &params);
+        let mut inputs: BTreeMap<String, Value> = params
+            .iter()
+            .filter_map(|(name, p)| Some((name.clone(), p.default.clone()?)))
+            .collect();
+        inputs.extend(with.clone());
+        if self.errors.len() > before {
+            return Call::Failed;
+        }
+
+        let label = format!("`{file}`");
+        let env = self.env(&label, "env", wf.env.as_ref());
+        let defaults = self.defaults(&label, wf.defaults.as_ref());
+        let wf_permissions = self.permissions(&label, wf.permissions.as_ref(), false);
+        let inner = Scope {
+            label,
+            from: format!(" (called by {at})"),
+            stem: scope.stem.clone(),
+            prefix: if scope.prefix.is_empty() {
+                id.to_owned()
+            } else {
+                format!("{}-{id}", scope.prefix)
             },
-        );
+            depth: scope.depth + 1,
+            stack: scope.stack.iter().cloned().chain([file.clone()]).collect(),
+            inputs: Some(inputs),
+        };
+        let mut level = self.jobs(&inner, wf.jobs.0, &env, &defaults);
+        if level.failed || level.entries.is_empty() {
+            for (_, entries) in &level.entries {
+                for entry in entries {
+                    self.config.jobs.remove(&entry.job);
+                }
+            }
+            if level.failed {
+                return Call::Failed;
+            }
+            self.warn(format!(
+                "{at} calls `{uses}`, which has no job left to run; the job was dropped"
+            ));
+            return Call::Dropped;
+        }
+
+        // What the called jobs read as `inputs` and `secrets`.
+        let all: BTreeSet<String> = level
+            .entries
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|e| e.job.clone()))
+            .collect();
+        self.bind_inputs(&mut level, &params, &with, wf_permissions.as_ref());
+        self.pass_secrets(at, &file, gh.secrets.as_ref(), &body, &all);
+        if let Some(permissions) = &caller_permissions {
+            for key in &all {
+                if let Some(job) = self.config.jobs.get_mut(key) {
+                    job.permissions.get_or_insert_with(|| permissions.clone());
+                }
+            }
+        }
+
+        // What jobs that need the call read, and wait for.
+        let required: BTreeSet<&str> = level
+            .entries
+            .iter()
+            .flat_map(|(_, e)| e[0].requires.iter().map(|r| r.job.as_str()))
+            .collect();
+        let mut ends: Vec<String> = level
+            .entries
+            .iter()
+            .map(|(id, _)| id)
+            .filter(|id| !required.contains(id.as_str()))
+            .cloned()
+            .collect();
+        let outputs = self.call_outputs(at, &inner, &level, &body, &mut ends);
+
+        self.attach(scope, at, gh, &needs, &mut level);
+        Call::Done(Called {
+            entries: level.entries,
+            expansion: Expansion {
+                requires: ends,
+                outputs,
+            },
+        })
+    }
+
+    /// The values a call gives the inputs of the file it calls, as the
+    /// entries' `with`: those of inputs the file does not have are dropped
+    /// with a warning, and an input with no default that the call does
+    /// not give is an error.
+    fn call_with(
+        &mut self,
+        scope: &Scope,
+        at: &str,
+        file: &str,
+        gh: &GhJob,
+        params: &BTreeMap<String, Parameter>,
+    ) -> BTreeMap<String, Value> {
+        let mut with = BTreeMap::new();
+        let given = match &gh.with_ {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Object(map)) => map.iter().collect(),
+            Some(other) => {
+                self.warn(format!(
+                    "{at}: `with: {}` is not a map and was dropped",
+                    show(other)
+                ));
+                Vec::new()
+            }
+        };
+        for (name, value) in given {
+            let Some(param) = params.get(name) else {
+                self.warn(format!(
+                    "{at}: `with.{name}` is not an input of `{file}` and was dropped"
+                ));
+                continue;
+            };
+            let value = match &scope.inputs {
+                Some(inputs) => substitute(value, inputs),
+                None => value.clone(),
+            };
+            let value = fit_default(&param.kind, &value).unwrap_or(value);
+            with.insert(name.clone(), value);
+        }
+        for (name, param) in params {
+            if param.default.is_none() && !with.contains_key(name) {
+                self.error(format!(
+                    "{at}: input `{name}` of `{file}` is required and the call does not give it"
+                ));
+            }
+        }
+        with
+    }
+
+    /// Gives the jobs a called file has itself the file's inputs as
+    /// parameters and the call's values as the `with` of their entries;
+    /// what they read as `inputs` becomes `parameters`.
+    fn bind_inputs(
+        &mut self,
+        level: &mut Converted,
+        params: &BTreeMap<String, Parameter>,
+        with: &BTreeMap<String, Value>,
+        permissions: Option<&Permissions>,
+    ) {
+        for key in &level.plain {
+            if let Some(job) = self.config.jobs.get_mut(key) {
+                for (name, param) in params {
+                    job.parameters
+                        .entry(name.clone())
+                        .or_insert_with(|| param.clone());
+                }
+                job.permissions = job.permissions.take().or_else(|| permissions.cloned());
+                map_job(job, &mut |seg| {
+                    (seg.len() >= 2 && seg[0] == "inputs")
+                        .then(|| (2, format!("parameters.{}", seg[1])))
+                });
+            }
+        }
+        for (_, entries) in &mut level.entries {
+            for entry in entries {
+                if level.plain.contains(&entry.job) {
+                    entry.with.extend(with.clone());
+                }
+            }
+        }
+    }
+
+    /// Puts the call's `needs` and `if` on the jobs of the called file
+    /// that need nothing inside it.
+    fn attach(
+        &mut self,
+        scope: &Scope,
+        at: &str,
+        gh: &GhJob,
+        needs: &[String],
+        level: &mut Converted,
+    ) {
+        let roots: BTreeSet<String> = level
+            .entries
+            .iter()
+            .filter(|(_, e)| e[0].requires.is_empty())
+            .flat_map(|(_, e)| e.iter().map(|e| e.job.clone()))
+            .collect();
+        for (_, entries) in &mut level.entries {
+            if entries[0].requires.is_empty() {
+                for entry in entries {
+                    entry.requires = needs
+                        .iter()
+                        .map(|need| Require::new(scope.full(need)))
+                        .collect();
+                }
+            }
+        }
+        let condition = gh
+            .if_
+            .as_ref()
+            .and_then(scalar)
+            .filter(|c| !c.trim().is_empty());
+        let Some(condition) = condition else {
+            return;
+        };
+        let condition = match &scope.inputs {
+            Some(inputs) => rewrite(
+                &condition,
+                !condition.contains("${{"),
+                &mut input_mapper(inputs),
+            ),
+            None => condition,
+        };
+        let mut kept = false;
+        for key in &roots {
+            let Some(job) = self.config.jobs.get_mut(key) else {
+                continue;
+            };
+            if let Some(and) = both(&condition, job.if_.as_deref()) {
+                job.if_ = Some(and);
+            } else {
+                kept = true;
+            }
+        }
+        if kept {
+            self.warn(format!(
+                "{at}: `if` could not be combined with the `if` of the called jobs and was dropped for them"
+            ));
+        }
+    }
+
+    /// Passes the call's `secrets` to the called jobs: `inherit` passes
+    /// every secret on, and a map renames the reads of each name to what
+    /// the call gives it. A secret the called file declares and the call
+    /// does not give is a warning.
+    fn pass_secrets(
+        &mut self,
+        at: &str,
+        file: &str,
+        secrets: Option<&Value>,
+        body: &Value,
+        jobs: &BTreeSet<String>,
+    ) {
+        let mut renames: BTreeMap<String, String> = BTreeMap::new();
+        let inherit = matches!(secrets, Some(Value::String(s)) if s == "inherit");
+        match secrets {
+            Some(Value::Object(map)) => {
+                for (name, value) in map {
+                    renames.insert(name.to_ascii_uppercase(), expr_text(value));
+                }
+            }
+            Some(_) if !inherit => self.warn(format!(
+                "{at}: `secrets` is not `inherit` or a map and was dropped"
+            )),
+            _ => {}
+        }
+        if !inherit && let Some(Value::Object(declared)) = body.get("secrets") {
+            for name in declared.keys() {
+                if !renames.contains_key(&name.to_ascii_uppercase()) {
+                    self.warn(format!(
+                        "{at}: `{file}` declares secret `{name}`, which the call does not pass"
+                    ));
+                }
+            }
+        }
+        if renames.is_empty() {
+            return;
+        }
+        let mut map = |seg: &[&str]| {
+            let found = renames.get(&seg.get(1)?.to_ascii_uppercase())?;
+            (seg[0] == "secrets").then(|| (2, found.clone()))
+        };
+        for key in jobs {
+            if let Some(job) = self.config.jobs.get_mut(key) {
+                map_job(job, &mut map);
+            }
+        }
+    }
+
+    /// Maps `on.workflow_call.outputs` of a called file to the
+    /// expressions `needs.<call>.outputs.<name>` stands for in the jobs
+    /// that need the call. An output whose value is not an expression
+    /// over `jobs.<job>.outputs.<name>` of the file's jobs maps to
+    /// `None` and is dropped with a warning. The jobs the outputs read
+    /// are added to `ends`, so that those that need the call can read
+    /// them as `needs`.
+    fn call_outputs(
+        &mut self,
+        at: &str,
+        inner: &Scope,
+        level: &Converted,
+        body: &Value,
+        ends: &mut Vec<String>,
+    ) -> BTreeMap<String, Option<String>> {
+        let mut outputs = BTreeMap::new();
+        let Some(Value::Object(declared)) = body.get("outputs") else {
+            return outputs;
+        };
+        let mut warned = Vec::new();
+        let mut map = needs_mapper(inner, &level.local, &level.calls, "jobs", &mut warned);
+        let mut dropped = Vec::new();
+        for (name, output) in declared {
+            let text = output.get("value").and_then(Value::as_str);
+            let mapped = text.and_then(|text| match whole(text) {
+                Some(expr) => Some(rewrite(expr, true, &mut map)),
+                None if !text.contains("${{") => Some(expr_text(&Value::String(text.to_owned()))),
+                None => None,
+            });
+            let mapped = mapped.and_then(|expr| {
+                let mut ok = true;
+                let mut read = Vec::new();
+                rewrite(&expr, true, &mut |seg| {
+                    match seg {
+                        ["jobs", ..] => ok = false,
+                        ["needs", job, ..] => read.push((*job).to_owned()),
+                        _ => {}
+                    }
+                    None
+                });
+                for job in read {
+                    if level.entries.iter().any(|(id, _)| *id == job) && !ends.contains(&job) {
+                        ends.push(job);
+                    }
+                }
+                ok.then(|| {
+                    if simple(&expr) {
+                        expr
+                    } else {
+                        format!("({expr})")
+                    }
+                })
+            });
+            if mapped.is_none() {
+                dropped.push(name.clone());
+            }
+            outputs.insert(name.clone(), mapped);
+        }
+        drop(map);
+        for name in dropped {
+            self.warn(format!(
+                "{at}: output `{name}` of the called workflow is not an expression over `jobs.<job>.outputs.<name>` of its own jobs; reads of it were dropped"
+            ));
+        }
+        warned.sort();
+        warned.dedup();
+        for message in warned {
+            self.warn(format!("{at}: {message}"));
+        }
+        outputs
     }
 
     /// Converts a `permissions:` value. `id-token`, scopes hatchrun does
@@ -700,6 +1369,9 @@ impl Cx {
     /// events it had that hatchrun does not run on.
     fn no_events(&mut self, file: &str, unsupported: &[String]) {
         if !unsupported.is_empty() && unsupported.iter().all(|e| e == "workflow_call") {
+            if self.called.contains(file) {
+                return;
+            }
             self.warn(format!(
                 "`{file}` was dropped: it is a reusable workflow (`on: workflow_call`), which is not supported"
             ));
@@ -1038,28 +1710,7 @@ impl Cx {
             .and_then(runs_on_text)
             .and_then(matrix_key);
         let matrices = self.include(at, matrix, leg_key);
-        let requires = match gh.needs {
-            None => Vec::new(),
-            Some(Value::String(need)) => vec![need],
-            Some(Value::Array(needs)) => needs.iter().filter_map(scalar).collect(),
-            Some(other) => {
-                self.error(format!(
-                    "{at} has `needs: {other}`; it must be a job id or a list"
-                ));
-                Vec::new()
-            }
-        };
-        let mut requires_unique: Vec<String> = Vec::new();
-        for need in requires {
-            if !ids.contains(&need) {
-                self.error(format!(
-                    "{at} needs `{need}`, which is not a job of the workflow"
-                ));
-            } else if !requires_unique.contains(&need) {
-                requires_unique.push(need);
-            }
-        }
-        let requires = requires_unique;
+        let requires = self.needs(at, gh.needs, ids);
         let timeout_minutes = self.minutes(at, "timeout-minutes", gh.timeout_minutes.as_ref());
         let outputs = self.env(at, "outputs", gh.outputs.as_ref());
         let env = self.env(at, "env", gh.env.as_ref());
@@ -1090,6 +1741,33 @@ impl Cx {
             ..Job::default()
         };
         Some((job, entries(id, key, ids, &requires, matrices)))
+    }
+
+    /// Reads `needs`: a job id or a list. An id that is not a job of
+    /// the workflow is an error; repeats are dropped.
+    fn needs(&mut self, at: &str, needs: Option<Value>, ids: &BTreeSet<String>) -> Vec<String> {
+        let requires = match needs {
+            None => Vec::new(),
+            Some(Value::String(need)) => vec![need],
+            Some(Value::Array(needs)) => needs.iter().filter_map(scalar).collect(),
+            Some(other) => {
+                self.error(format!(
+                    "{at} has `needs: {other}`; it must be a job id or a list"
+                ));
+                Vec::new()
+            }
+        };
+        let mut unique: Vec<String> = Vec::new();
+        for need in requires {
+            if !ids.contains(&need) {
+                self.error(format!(
+                    "{at} needs `{need}`, which is not a job of the workflow"
+                ));
+            } else if !unique.contains(&need) {
+                unique.push(need);
+            }
+        }
+        unique
     }
 
     /// Maps `runs-on` to a runner template label. A third-party label,
@@ -1938,6 +2616,264 @@ fn strings<'v>(value: &'v Value, out: &mut Vec<&'v str>) {
 
 /// The reason Docker-phase keys are dropped.
 const LATER: &str = "; Docker services and containers come in a later release";
+
+/// What `on.workflow_call` is in an `on:` value, when it has one: its
+/// map, or null.
+fn workflow_call(on: &Value) -> Option<Value> {
+    match on {
+        Value::String(name) if name == "workflow_call" => Some(Value::Null),
+        Value::Array(names) if names.iter().any(|n| n.as_str() == Some("workflow_call")) => {
+            Some(Value::Null)
+        }
+        Value::Object(events) => events.get("workflow_call").cloned(),
+        _ => None,
+    }
+}
+
+/// Whether an `on:` value has `workflow_call`.
+fn calls_workflow(on: &Value) -> bool {
+    workflow_call(on).is_some()
+}
+
+/// A reader of the dotted names in an expression: given the parts of
+/// one, such as `["inputs", "target"]`, it returns how many parts it
+/// replaces and what with.
+type Names<'a> = dyn FnMut(&[&str]) -> Option<(usize, String)> + 'a;
+
+/// The inside of a text that is one `${{ }}` and nothing else.
+fn whole(text: &str) -> Option<&str> {
+    let inner = text.trim().strip_prefix("${{")?.strip_suffix("}}")?;
+    (!inner.contains("${{") && !inner.contains("}}")).then_some(inner.trim())
+}
+
+/// Whether an expression is a plain name, which needs no parentheses.
+fn simple(expr: &str) -> bool {
+    !expr.is_empty()
+        && expr
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// A value as an expression: an expression that was its whole text
+/// stays, anything else is a literal.
+fn expr_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => match whole(text) {
+            Some(expr) if simple(expr) => expr.to_owned(),
+            Some(expr) => format!("({expr})"),
+            None => format!("'{}'", text.replace('\'', "''")),
+        },
+        Value::Null => "''".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// A text with each dotted name `names` answers replaced. Quoted strings
+/// and the parts of longer names are left alone. `bare` says the text is
+/// an expression; otherwise the expressions are the `${{ }}` in it.
+fn rewrite(text: &str, bare: bool, names: &mut Names<'_>) -> String {
+    if bare {
+        return rewrite_expr(text, names);
+    }
+    let Ok(found) = expr::expressions(text) else {
+        return text.to_owned();
+    };
+    let mut out = text.to_owned();
+    for (start, inner) in found.into_iter().rev() {
+        out.replace_range(start..start + inner.len(), &rewrite_expr(inner, names));
+    }
+    out
+}
+
+/// [`rewrite`] of one expression.
+fn rewrite_expr(expr: &str, names: &mut Names<'_>) -> String {
+    let bytes = expr.as_bytes();
+    let part = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    let start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' {
+            let mut end = i + 1;
+            while end < bytes.len() {
+                if bytes[end] == b'\'' {
+                    if bytes.get(end + 1) == Some(&b'\'') {
+                        end += 2;
+                        continue;
+                    }
+                    break;
+                }
+                end += 1;
+            }
+            let end = (end + 1).min(bytes.len());
+            out.push_str(&expr[i..end]);
+            i = end;
+        } else if start(b) && (i == 0 || !(part(bytes[i - 1]) || bytes[i - 1] == b'.')) {
+            let mut ends = Vec::new();
+            let mut end = i;
+            loop {
+                while end < bytes.len() && part(bytes[end]) {
+                    end += 1;
+                }
+                ends.push(end);
+                if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(|b| start(*b)) {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            let mut from = i;
+            let parts: Vec<&str> = ends
+                .iter()
+                .map(|&to| {
+                    let name = &expr[from..to];
+                    from = to + 1;
+                    name
+                })
+                .collect();
+            let call = bytes.get(end) == Some(&b'(');
+            if let Some((n, replacement)) = names(&parts).filter(|_| !call) {
+                out.push_str(&replacement);
+                i = ends[n - 1];
+            } else {
+                out.push_str(&expr[i..end]);
+                i = end;
+            }
+        } else {
+            let ch = expr[i..].chars().next().unwrap_or_default();
+            out.push(ch);
+            i += ch.len_utf8().max(1);
+        }
+    }
+    out
+}
+
+/// Rewrites the expressions of a value's strings, at any depth.
+fn rewrite_value(value: &mut Value, names: &mut Names<'_>) {
+    match value {
+        Value::String(text) => *text = rewrite(text, false, names),
+        Value::Array(items) => items.iter_mut().for_each(|v| rewrite_value(v, names)),
+        Value::Object(map) => map.values_mut().for_each(|v| rewrite_value(v, names)),
+        _ => {}
+    }
+}
+
+/// Rewrites every expression of a converted job.
+fn map_job(job: &mut Job, names: &mut Names<'_>) {
+    fn text(text: &mut String, names: &mut Names<'_>) {
+        *text = rewrite(text, false, names);
+    }
+    fn opt(text: &mut Option<String>, names: &mut Names<'_>) {
+        if let Some(t) = text {
+            *t = rewrite(t, false, names);
+        }
+    }
+    fn cond(text: &mut Option<String>, names: &mut Names<'_>) {
+        if let Some(t) = text {
+            *t = rewrite(t, !t.contains("${{"), names);
+        }
+    }
+    job.env.values_mut().for_each(|v| text(v, names));
+    job.outputs.values_mut().for_each(|v| text(v, names));
+    opt(&mut job.runs_on, names);
+    cond(&mut job.if_, names);
+    for step in &mut job.steps {
+        match step {
+            Step::Run(run) => {
+                opt(&mut run.name, names);
+                text(&mut run.run, names);
+                opt(&mut run.shell, names);
+                opt(&mut run.working_directory, names);
+                run.env.values_mut().for_each(|v| text(v, names));
+                cond(&mut run.if_, names);
+            }
+            Step::Uses(uses) => {
+                opt(&mut uses.name, names);
+                uses.with.values_mut().for_each(|v| rewrite_value(v, names));
+                uses.env.values_mut().for_each(|v| text(v, names));
+                cond(&mut uses.if_, names);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Answers reads of `inputs.NAME` with the value the call gave it.
+fn input_mapper(
+    inputs: &BTreeMap<String, Value>,
+) -> impl FnMut(&[&str]) -> Option<(usize, String)> {
+    move |parts| match parts {
+        ["inputs", name, ..] => Some((2, expr_text(inputs.get(*name)?))),
+        _ => None,
+    }
+}
+
+/// A value with the reads of `inputs.NAME` in it replaced by the values
+/// the call gave. A text that is only such a read becomes the value.
+fn substitute(value: &Value, inputs: &BTreeMap<String, Value>) -> Value {
+    if let Value::String(text) = value
+        && let Some(name) = whole(text).and_then(|e| e.strip_prefix("inputs."))
+        && let Some(found) = inputs.get(name)
+    {
+        return found.clone();
+    }
+    let mut value = value.clone();
+    rewrite_value(&mut value, &mut input_mapper(inputs));
+    value
+}
+
+/// Answers reads of `context.JOB.outputs.NAME`, `context` being `needs`
+/// in the jobs of a file and `jobs` in the outputs of a called file: a
+/// job of a called file by its id in the workflow, and a job that made a
+/// call by what the call says. A read of a call's output that has no
+/// expression is replaced by an empty string, and a warning is added.
+fn needs_mapper<'a>(
+    scope: &'a Scope,
+    plain: &'a BTreeSet<String>,
+    calls: &'a BTreeMap<String, Expansion>,
+    context: &'a str,
+    warned: &'a mut Vec<String>,
+) -> impl FnMut(&[&str]) -> Option<(usize, String)> + 'a {
+    move |parts| {
+        let [first, job, rest @ ..] = parts else {
+            return None;
+        };
+        if *first != context {
+            return None;
+        }
+        if plain.contains(*job) {
+            let renamed = context == "jobs" || !scope.prefix.is_empty();
+            return renamed.then(|| (2, format!("needs.{}", scope.full(job))));
+        }
+        let call = calls.get(*job)?;
+        if let ["outputs", name, ..] = rest
+            && let Some(Some(expr)) = call.outputs.get(*name)
+        {
+            return Some((4, expr.clone()));
+        }
+        let used = parts.len().min(4);
+        warned.push(format!(
+            "`{}` was dropped: the called workflow gives no such output",
+            parts[..used].join(".")
+        ));
+        Some((used, "''".to_owned()))
+    }
+}
+
+/// `a && b` for two conditions, each bare or one `${{ }}`. `None` when
+/// one of them is text with expressions in it.
+fn both(call: &str, job: Option<&str>) -> Option<String> {
+    let bare = |c: &str| match whole(c) {
+        Some(expr) => Some(expr.to_owned()),
+        None => (!c.contains("${{")).then(|| c.trim().to_owned()),
+    };
+    let call = bare(call)?;
+    match job {
+        None => Some(call),
+        Some(job) => Some(format!("({call}) && ({})", bare(job)?)),
+    }
+}
 
 /// A string, number or boolean as text. `None` for lists and maps; null
 /// is the empty string.
