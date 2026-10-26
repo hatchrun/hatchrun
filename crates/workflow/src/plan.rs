@@ -128,6 +128,7 @@ pub struct PlannedJob {
     /// planned jobs), the end states its ancestry must reach for this
     /// job to start. [`ready`] reads it; an entry left out asks for
     /// [`Statuses::SUCCESS`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub statuses: BTreeMap<String, Statuses>,
     /// What the job does.
     pub kind: JobKind,

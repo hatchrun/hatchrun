@@ -1783,3 +1783,25 @@ fn the_hatchrun_context_is_known() {
     );
     assert_eq!(errors(&ok), []);
 }
+
+#[test]
+fn planned_jobs_stored_without_statuses_still_load() {
+    let yaml = "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { name: a }
+      - t: { name: b, requires: [a] }
+";
+    let mut job = plan(yaml).jobs.pop().unwrap();
+    let mut stored = serde_json::to_value(&job).unwrap();
+    // A graph saved before `statuses` existed has no such key; an empty
+    // map asks every required entry for success, as before.
+    stored.as_object_mut().unwrap().remove("statuses");
+    let loaded: PlannedJob = serde_json::from_value(stored).unwrap();
+    assert!(loaded.statuses.is_empty());
+    job.statuses.clear();
+    assert_eq!(loaded, job);
+}

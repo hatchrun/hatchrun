@@ -60,6 +60,7 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
     event.preventDefault();
     const given = name.trim();
     if (given === "") {
+      setSaved(null);
       setProblem({ field: "name", message: `${secret ? "Secret" : "Variable"} names cannot be empty` });
       return;
     }

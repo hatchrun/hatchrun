@@ -44,6 +44,7 @@ export function Environments({ owner, repo }: { owner: string; repo: string }) {
     event.preventDefault();
     const given = name.trim();
     if (given === "") {
+      setSaved(null);
       setError("Environment names cannot be empty");
       return;
     }
