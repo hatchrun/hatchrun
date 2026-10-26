@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use hatchrun_workflow::trigger::Filter;
 use hatchrun_workflow::{
-    Arch, Conclusion, ExprError, Functions, JobDocument, JobKind, JobStatus, job_condition,
+    Arch, Conclusion, ExprError, Functions, JobDocument, JobKind, JobStatus, hatchrun_context,
+    job_condition,
 };
 use nix::fcntl::OFlag;
 use serde_json::{Map, Value, json};
@@ -155,6 +156,7 @@ impl Contexts {
         secrets.insert("GITHUB_TOKEN".to_owned(), g.token.clone());
 
         let value = json!({
+            "hatchrun": hatchrun_context(&github),
             "github": github,
             "env": {},
             "matrix": doc.job.matrix,
@@ -615,6 +617,19 @@ mod tests {
         assert_eq!(eval(&ctx, "github.event_name"), json!("pull_request"));
         assert_eq!(eval(&ctx, "secrets.GITHUB_TOKEN"), json!("tok"));
         assert_eq!(eval(&ctx, "secrets.NPM"), json!("s3"));
+    }
+
+    #[test]
+    fn hatchrun_context_mirrors_github() {
+        let ctx = Contexts::new(&doc("ubuntu-latest"), &layout());
+        for key in hatchrun_workflow::HATCHRUN_KEYS {
+            assert_eq!(
+                eval(&ctx, &format!("hatchrun.{key}")),
+                eval(&ctx, &format!("github.{key}")),
+                "{key}"
+            );
+        }
+        assert_eq!(eval(&ctx, "hatchrun.event_name"), json!("pull_request"));
     }
 
     #[test]

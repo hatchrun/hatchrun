@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use hatchrun_workflow::{
     Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Need, Outcome, Plan,
-    PlannedJob, Ready, Statuses, checks_status, job_condition, ready,
+    PlannedJob, Ready, Statuses, checks_status, hatchrun_context, job_condition, ready,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -459,6 +459,7 @@ impl Graph {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let ctx = json!({
+            "hatchrun": hatchrun_context(github_ctx),
             "github": github_ctx,
             "needs": needs,
             "matrix": node.job.matrix,
@@ -701,6 +702,32 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { m: { requires: [t] } }] } }
         let main = json!({ "ref": "refs/heads/main", "event": {} });
         g.advance(&main);
         assert_eq!(g.finished(1, ok(), &main).last(), Some(&Action::Launch(2)));
+    }
+
+    #[test]
+    fn job_if_reads_hatchrun() {
+        let yaml = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+  m: { runs-on: ubuntu-latest, if: hatchrun.event_name == 'push', steps: [] }
+workflows: { ci: { on: { push: {} }, jobs: [t, { m: { requires: [t] } }] } }
+";
+        let graph = |event: &str| {
+            let mut g = Graph::new(
+                compile(&parse(yaml).unwrap(), "ci", "refs/heads/main")
+                    .unwrap()
+                    .jobs
+                    .into_iter()
+                    .zip(1u64..)
+                    .map(|(j, i)| (i, j))
+                    .collect(),
+            );
+            let github = json!({ "ref": "refs/heads/main", "event_name": event, "event": {} });
+            g.advance(&github);
+            g.finished(1, ok(), &github)
+        };
+        assert_eq!(graph("push").last(), Some(&Action::Launch(2)));
+        assert!(!graph("schedule").contains(&Action::Launch(2)));
     }
 
     #[test]

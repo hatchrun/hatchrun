@@ -59,6 +59,20 @@ pub const HATCHRUN_KEYS: &[&str] = &[
     "workflow",
 ];
 
+/// The `hatchrun` context taken from a `github` context: each of the
+/// [`HATCHRUN_KEYS`], as a string, empty when `github` lacks it.
+#[must_use]
+pub fn hatchrun_context(github: &Value) -> Value {
+    let fields = HATCHRUN_KEYS
+        .iter()
+        .map(|key| {
+            let value = github.get(*key).cloned().unwrap_or_else(|| Value::from(""));
+            ((*key).to_owned(), value)
+        })
+        .collect();
+    Value::Object(fields)
+}
+
 /// The longest expression, in bytes, that [`evaluate`] accepts.
 const MAX_LEN: usize = 4096;
 

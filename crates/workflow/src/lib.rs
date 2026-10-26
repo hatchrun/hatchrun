@@ -32,8 +32,8 @@ pub use cron::{Cron, UtcMinute};
 pub use diagnostic::Diagnostic;
 pub use environment::{ENVIRONMENT_NAME_MAX, valid_environment_name};
 pub use expr::{
-    ExprError, Functions, HATCHRUN_KEYS, JobStatus, checks_status, evaluate, interpolate,
-    job_condition, secret_refs, truthy,
+    ExprError, Functions, HATCHRUN_KEYS, JobStatus, checks_status, evaluate, hatchrun_context,
+    interpolate, job_condition, secret_refs, truthy,
 };
 pub use job::{
     Annotation, AnnotationLevel, CacheService, Conclusion, Github, JobDocument, JobResult, Need,
