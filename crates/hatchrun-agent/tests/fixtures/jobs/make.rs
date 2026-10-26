@@ -25,6 +25,7 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
             id: "build".to_owned(),
             name: "build".to_owned(),
             requires: Vec::new(),
+            statuses: std::collections::BTreeMap::new(),
             kind: JobKind::Run {
                 template: template("ubuntu-latest").expect("ubuntu-latest exists"),
             },

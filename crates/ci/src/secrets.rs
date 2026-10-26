@@ -302,27 +302,30 @@ pub fn fresh_nonce() -> Result<[u8; NONCE_BYTES], String> {
 
 /// The uppercased name, if it is a valid secret or var name: letters,
 /// digits and `_`, not starting with a digit or `GITHUB_`, at most
-/// [`NAME_MAX`] characters.
+/// [`NAME_MAX`] characters. `noun` is `"secret"` or `"variable"` and
+/// names the kind in the message.
 ///
 /// # Errors
 ///
 /// The message to show the user.
-pub fn valid_name(name: &str) -> Result<String, String> {
+pub fn valid_name(name: &str, noun: &str) -> Result<String, String> {
     let name = name.to_ascii_uppercase();
+    let mut title = noun.to_owned();
+    title[..1].make_ascii_uppercase();
     if name.is_empty() {
-        return Err("Secret names cannot be empty".to_owned());
+        return Err(format!("{title} names cannot be empty"));
     }
     if name.chars().count() > NAME_MAX {
-        return Err(format!("Secret names are at most {NAME_MAX} characters"));
+        return Err(format!("{title} names are at most {NAME_MAX} characters"));
     }
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err("Use letters, digits and _ in secret names".to_owned());
+        return Err(format!("Use letters, digits and _ in {noun} names"));
     }
     if name.starts_with(|c: char| c.is_ascii_digit()) {
-        return Err("Secret names cannot start with a digit".to_owned());
+        return Err(format!("{title} names cannot start with a digit"));
     }
     if name.starts_with("GITHUB_") {
-        return Err("Secret names cannot start with GITHUB_".to_owned());
+        return Err(format!("{title} names cannot start with GITHUB_"));
     }
     Ok(name)
 }
@@ -497,29 +500,41 @@ mod tests {
 
     #[test]
     fn names_are_uppercased() {
-        assert_eq!(valid_name("npm_token").unwrap(), "NPM_TOKEN");
+        assert_eq!(valid_name("npm_token", "secret").unwrap(), "NPM_TOKEN");
     }
 
     #[test]
     fn bad_names_are_refused() {
         assert_eq!(
-            valid_name("GITHUB_X").unwrap_err(),
+            valid_name("GITHUB_X", "secret").unwrap_err(),
             "Secret names cannot start with GITHUB_"
         );
         assert_eq!(
-            valid_name("1A").unwrap_err(),
+            valid_name("1A", "secret").unwrap_err(),
             "Secret names cannot start with a digit"
         );
         assert_eq!(
-            valid_name("A-B").unwrap_err(),
+            valid_name("A-B", "secret").unwrap_err(),
             "Use letters, digits and _ in secret names"
         );
         assert_eq!(
-            valid_name(&"A".repeat(101)).unwrap_err(),
+            valid_name(&"A".repeat(101), "secret").unwrap_err(),
             "Secret names are at most 100 characters"
         );
-        assert!(valid_name(&"A".repeat(100)).is_ok());
-        assert!(valid_name("").is_err());
+        assert!(valid_name(&"A".repeat(100), "secret").is_ok());
+        assert!(valid_name("", "secret").is_err());
+    }
+
+    #[test]
+    fn variable_names_are_called_variables() {
+        assert_eq!(
+            valid_name("GITHUB_X", "variable").unwrap_err(),
+            "Variable names cannot start with GITHUB_"
+        );
+        assert_eq!(
+            valid_name("A-B", "variable").unwrap_err(),
+            "Use letters, digits and _ in variable names"
+        );
     }
 
     #[test]

@@ -12,8 +12,8 @@
 use std::collections::BTreeMap;
 
 use hatchrun_workflow::{
-    Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Need, PlannedJob,
-    job_condition,
+    Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Need, Outcome, Plan,
+    PlannedJob, Ready, Statuses, checks_status, hatchrun_context, job_condition, ready,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -210,7 +210,7 @@ impl Graph {
                         count: 1,
                     });
                 }
-                State::Queued => match self.decide(at, github_ctx) {
+                State::Queued => match self.decide(at, github_ctx, false) {
                     Ok(true) => {}
                     Ok(false) => self.end(at, Conclusion::Cancelled, None, &mut actions),
                     Err(e) => self.end(at, Conclusion::Failure, Some(if_error(&e)), &mut actions),
@@ -410,12 +410,46 @@ impl Graph {
         }
     }
 
-    /// Whether the job at `at` may run, by its `if:`.
-    fn decide(&self, at: usize, github_ctx: &Value) -> Result<bool, ExprError> {
+    /// How the job with this plan id ended, as a `requires` entry sees
+    /// it, or `None` while it has not.
+    fn outcome_of(&self, id: &str) -> Option<Outcome> {
+        match self.jobs[self.position_of(id)?].state {
+            State::Done(Conclusion::Success) => Some(Outcome::Success),
+            State::Done(Conclusion::Skipped) => Some(Outcome::NotRun),
+            State::Done(Conclusion::Failure) => Some(Outcome::Failed),
+            State::Done(Conclusion::Cancelled) => Some(Outcome::Canceled),
+            _ => None,
+        }
+    }
+
+    /// Whether the job at `at` can start by its `requires` statuses. A
+    /// job whose statuses are all the default, `success`, always can:
+    /// its `if:` decides alone, so that `always()` and `failure()` keep
+    /// working there.
+    fn ready_at(&self, at: usize) -> Ready {
+        let job = &self.jobs[at].job;
+        if job.statuses.values().all(|s| *s == Statuses::SUCCESS) {
+            return Ready::Start;
+        }
+        let plan = Plan {
+            workflow: String::new(),
+            jobs: self.jobs.iter().map(|n| n.job.clone()).collect(),
+        };
+        let job = &plan.jobs[at];
+        ready(&plan, job, |id| self.outcome_of(id))
+    }
+
+    /// Whether the job at `at` may run, by its `if:`. `statuses_ok`: its
+    /// `requires` statuses were met and are not the default, so they
+    /// stand in for the implied `success()` of an `if:` that calls no
+    /// status function.
+    fn decide(&self, at: usize, github_ctx: &Value, statuses_ok: bool) -> Result<bool, ExprError> {
         let node = &self.jobs[at];
         let needs = self.needs_at(at);
         let status = if self.cancelled {
             JobStatus::Cancelled
+        } else if statuses_ok && !node.job.if_.as_deref().map_or(Ok(false), checks_status)? {
+            JobStatus::Success
         } else {
             self.ancestor_status(at)
         };
@@ -425,6 +459,7 @@ impl Graph {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let ctx = json!({
+            "hatchrun": hatchrun_context(github_ctx),
             "github": github_ctx,
             "needs": needs,
             "matrix": node.job.matrix,
@@ -445,7 +480,22 @@ impl Graph {
             );
             return;
         }
-        match self.decide(at, github_ctx) {
+        let wait = self.ready_at(at);
+        if wait == Ready::NotRun {
+            let conclusion = if self.cancelled {
+                Conclusion::Cancelled
+            } else {
+                Conclusion::Skipped
+            };
+            self.end(at, conclusion, None, actions);
+            return;
+        }
+        let statuses_ok = self.jobs[at]
+            .job
+            .statuses
+            .values()
+            .any(|s| *s != Statuses::SUCCESS);
+        match self.decide(at, github_ctx, statuses_ok) {
             Ok(true) => {
                 self.jobs[at].state = State::Queued;
                 actions.push(Action::Launch(self.jobs[at].id));
@@ -511,6 +561,7 @@ jobs:
   t: { runs-on: ubuntu-latest, steps: [] }
   t2: { runs-on: ubuntu-latest, steps: [], if: always() }
   huge: { runs-on: ubuntu-26.04-16core-arm, steps: [] }
+  never: { runs-on: ubuntu-latest, steps: [], if: 'false' }
 ";
 
     fn graph_of(workflow_jobs: &str) -> Graph {
@@ -651,6 +702,32 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { m: { requires: [t] } }] } }
         let main = json!({ "ref": "refs/heads/main", "event": {} });
         g.advance(&main);
         assert_eq!(g.finished(1, ok(), &main).last(), Some(&Action::Launch(2)));
+    }
+
+    #[test]
+    fn job_if_reads_hatchrun() {
+        let yaml = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+  m: { runs-on: ubuntu-latest, if: hatchrun.event_name == 'push', steps: [] }
+workflows: { ci: { on: { push: {} }, jobs: [t, { m: { requires: [t] } }] } }
+";
+        let graph = |event: &str| {
+            let mut g = Graph::new(
+                compile(&parse(yaml).unwrap(), "ci", "refs/heads/main")
+                    .unwrap()
+                    .jobs
+                    .into_iter()
+                    .zip(1u64..)
+                    .map(|(j, i)| (i, j))
+                    .collect(),
+            );
+            let github = json!({ "ref": "refs/heads/main", "event_name": event, "event": {} });
+            g.advance(&github);
+            g.finished(1, ok(), &github)
+        };
+        assert_eq!(graph("push").last(), Some(&Action::Launch(2)));
+        assert!(!graph("schedule").contains(&Action::Launch(2)));
     }
 
     #[test]
@@ -928,5 +1005,101 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { mid: { requires: [t] } }, { las
         g.finished(1, done(Conclusion::Failure, &[]), &ctx());
         let actions = g.finished(2, ok(), &ctx());
         assert_eq!(actions.last(), Some(&Action::Launch(3)));
+    }
+
+    /// A graph of `a`, `b` (requires `a`) and `c` (requires `b` with
+    /// `statuses`), rows 1 to 3.
+    fn chain(statuses: &str) -> Graph {
+        graph_of(&format!(
+            "[{{ t: {{ name: a }} }}, {{ t: {{ name: b, requires: [a] }} }}, \
+             {{ t: {{ name: c, requires: [{{ b: {statuses} }}] }} }}]"
+        ))
+    }
+
+    fn state_of(g: &Graph, row: u64) -> State {
+        g.node(row).unwrap().state
+    }
+
+    #[test]
+    fn requires_default_status_is_success() {
+        let mut g = chain("success");
+        g.advance(&ctx());
+        g.finished(1, ok(), &ctx());
+        g.finished(2, ok(), &ctx());
+        assert_eq!(state_of(&g, 3), State::Queued);
+
+        let mut g = chain("success");
+        g.advance(&ctx());
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(state_of(&g, 2), State::Done(Conclusion::Skipped));
+        assert_eq!(state_of(&g, 3), State::Done(Conclusion::Skipped));
+    }
+
+    #[test]
+    fn requires_failed_runs_after_an_ancestor_fails() {
+        // B fails itself.
+        let mut g = chain("failed");
+        g.advance(&ctx());
+        g.finished(1, ok(), &ctx());
+        g.finished(2, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(state_of(&g, 3), State::Queued);
+
+        // A fails, B does not run: B's ancestry is still failed.
+        let mut g = chain("failed");
+        g.advance(&ctx());
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(state_of(&g, 3), State::Queued);
+
+        // Everything passed: C has nothing to run after.
+        let mut g = chain("failed");
+        g.advance(&ctx());
+        g.finished(1, ok(), &ctx());
+        g.finished(2, ok(), &ctx());
+        assert_eq!(state_of(&g, 3), State::Done(Conclusion::Skipped));
+        assert_eq!(g.conclusion(), Some(Conclusion::Success));
+    }
+
+    #[test]
+    fn requires_terminal_always_runs() {
+        for first in [Conclusion::Success, Conclusion::Failure] {
+            let mut g = chain("terminal");
+            g.advance(&ctx());
+            g.finished(1, done(first, &[]), &ctx());
+            g.finished(2, ok(), &ctx());
+            assert_eq!(state_of(&g, 3), State::Queued, "{first:?}");
+        }
+    }
+
+    #[test]
+    fn requires_not_run_follows_a_skipped_ancestor() {
+        let mut g = graph_of(
+            "[{ never: { name: a } }, { t: { name: b, requires: [a] } }, \
+             { t: { name: c, requires: [{ b: not_run }] } }]",
+        );
+        g.advance(&ctx());
+        // A does not run, so B does not either, and C starts on that.
+        assert_eq!(state_of(&g, 1), State::Done(Conclusion::Skipped));
+        assert_eq!(state_of(&g, 2), State::Done(Conclusion::Skipped));
+        assert_eq!(state_of(&g, 3), State::Queued);
+
+        // C needs success where B ran: not_run does not match.
+        let mut g = chain("not_run");
+        g.advance(&ctx());
+        g.finished(1, ok(), &ctx());
+        g.finished(2, ok(), &ctx());
+        assert_eq!(state_of(&g, 3), State::Done(Conclusion::Skipped));
+    }
+
+    #[test]
+    fn requires_statuses_keep_an_explicit_if() {
+        let mut g = graph_of(
+            "[{ t: { name: a } }, { t2: { name: b, requires: [{ a: failed }] } }, \
+             { never: { name: c, requires: [{ a: failed }] } }]",
+        );
+        g.advance(&ctx());
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        // t2 has `if: always()`; c's own `if:` still decides.
+        assert_eq!(state_of(&g, 2), State::Queued);
+        assert_eq!(state_of(&g, 3), State::Done(Conclusion::Skipped));
     }
 }

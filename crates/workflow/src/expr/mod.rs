@@ -24,7 +24,13 @@ use crate::secrets::SecretRefs;
 
 /// Context names an expression may read even when the context object
 /// leaves them out. Any other name must be a key of the context object.
+///
+/// `hatchrun` holds the [`HATCHRUN_KEYS`] and reads the same on every
+/// host: each host adapter fills it from its own event. The GitHub and
+/// Forgejo adapters also fill `github`, so converted workflows keep
+/// working.
 pub(crate) const CONTEXTS: &[&str] = &[
+    "hatchrun",
     "github",
     "env",
     "matrix",
@@ -37,6 +43,35 @@ pub(crate) const CONTEXTS: &[&str] = &[
     "vars",
     "inputs",
 ];
+
+/// The keys of the `hatchrun` context, as GitHub names them in `github`:
+/// the full ref, its short name, the commit, who caused the event, the
+/// event's name, the repository as `owner/name`, the host's base URL
+/// and the workflow's key.
+pub const HATCHRUN_KEYS: &[&str] = &[
+    "ref",
+    "ref_name",
+    "sha",
+    "actor",
+    "event_name",
+    "repository",
+    "server_url",
+    "workflow",
+];
+
+/// The `hatchrun` context taken from a `github` context: each of the
+/// [`HATCHRUN_KEYS`], as a string, empty when `github` lacks it.
+#[must_use]
+pub fn hatchrun_context(github: &Value) -> Value {
+    let fields = HATCHRUN_KEYS
+        .iter()
+        .map(|key| {
+            let value = github.get(*key).cloned().unwrap_or_else(|| Value::from(""));
+            ((*key).to_owned(), value)
+        })
+        .collect();
+    Value::Object(fields)
+}
 
 /// The longest expression, in bytes, that [`evaluate`] accepts.
 const MAX_LEN: usize = 4096;

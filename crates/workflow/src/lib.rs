@@ -23,23 +23,26 @@ pub mod templates;
 pub mod trigger;
 
 pub use config::{
-    CacheStep, Command, Config, Executor, Job, MAX_SOURCE, Parameter, ParameterKind, RunStep, Step,
-    UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
+    CacheStep, CheckoutStep, Command, Config, Executor, Job, MAX_SOURCE, Matrix, Outcome,
+    Parameter, ParameterKind, Require, RunStep, Statuses, Step, Submodules, UsesStep, Workflow,
+    WorkflowJob, WorkspaceStep, parse,
 };
 pub use convert::{Conversion, convert, to_yaml};
 pub use cron::{Cron, UtcMinute};
 pub use diagnostic::Diagnostic;
 pub use environment::{ENVIRONMENT_NAME_MAX, valid_environment_name};
 pub use expr::{
-    ExprError, Functions, JobStatus, checks_status, evaluate, interpolate, job_condition,
-    secret_refs, truthy,
+    ExprError, Functions, HATCHRUN_KEYS, JobStatus, checks_status, evaluate, hatchrun_context,
+    interpolate, job_condition, secret_refs, truthy,
 };
 pub use job::{
     Annotation, AnnotationLevel, CacheService, Conclusion, Github, JobDocument, JobResult, Need,
     StepSummary,
 };
 pub use permissions::{DEFAULT_SCOPES, Level, Permissions, SCOPES, token_scopes};
-pub use plan::{JobKind, Plan, PlannedJob, PlannedStep, compile, config_errors, validate};
+pub use plan::{
+    JobKind, Plan, PlannedJob, PlannedStep, Ready, compile, config_errors, ready, validate,
+};
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;
 pub use templates::{
@@ -49,5 +52,6 @@ pub use templates::{
 };
 pub use trigger::{
     Dispatch, Event, Filter, MAX_CHANGED, MAX_GLOBS, MAX_PATTERNS, PullRequestTrigger, PushTrigger,
-    Schedule, Triggers, triggered,
+    RELEASE_TYPES, ReleaseTrigger, Schedule, Triggers, WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
+    triggered,
 };

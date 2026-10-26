@@ -389,6 +389,7 @@ mod tests {
                 id: "build".into(),
                 name: "build".into(),
                 requires: vec![],
+                statuses: std::collections::BTreeMap::new(),
                 kind: JobKind::Approval,
                 matrix: BTreeMap::new(),
                 node: None,

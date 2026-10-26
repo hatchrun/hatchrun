@@ -133,6 +133,10 @@ impl SecretRefs {
             }
             PlannedStep::Workspace(WorkspaceStep::Attach { at }) => self.scan(at, false),
             PlannedStep::TestResults { path } => self.scan(path, false),
+            PlannedStep::Checkout(checkout) => {
+                self.scan_opt(checkout.r#ref.as_deref(), false);
+                self.scan_opt(checkout.path.as_deref(), false);
+            }
         }
     }
 }
@@ -232,6 +236,7 @@ mod tests {
             id: "j".into(),
             name: "j".into(),
             requires: vec![],
+            statuses: BTreeMap::new(),
             kind: crate::plan::JobKind::Run {
                 template: &TEMPLATES[0],
             },
@@ -250,5 +255,16 @@ mod tests {
         let mut want = set(&["ONE", "TWO", "THREE"]);
         want.extend(DEBUG_SECRETS.iter().map(|s| (*s).to_string()));
         assert_eq!(refs.names, want);
+    }
+
+    #[test]
+    fn a_checkout_step_is_scanned_for_secrets() {
+        let mut refs = SecretRefs::default();
+        refs.scan_step(&PlannedStep::Checkout(crate::config::CheckoutStep {
+            r#ref: Some("${{ secrets.REF }}".into()),
+            path: Some("${{ secrets.DIR }}".into()),
+            ..crate::config::CheckoutStep::default()
+        }));
+        assert_eq!(refs.names, set(&["REF", "DIR"]));
     }
 }

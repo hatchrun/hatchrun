@@ -58,10 +58,15 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
+    const given = name.trim();
+    if (given === "") {
+      setSaved(null);
+      setProblem({ field: "name", message: `${secret ? "Secret" : "Variable"} names cannot be empty` });
+      return;
+    }
     setBusy(true);
     setProblem(null);
     setSaved(null);
-    const given = name.trim();
     try {
       await putCiItem(scope, kind, given, value, repositories);
       // The value leaves the page as soon as it is stored.
@@ -114,7 +119,7 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
           list.length === 0 ? (
             <p className="muted">No {secret ? "secrets" : "variables"} yet.</p>
           ) : (
-            <div className="overflow-hidden rounded-md border border-rivet">
+            <div className="overflow-x-auto rounded-md border border-rivet">
               <Table>
                 <TableHeader>
                   <TableRow>

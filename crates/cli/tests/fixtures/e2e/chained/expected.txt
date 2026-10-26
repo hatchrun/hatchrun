@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# What crates/cli/tests/e2e.rs expects for this scenario. ok/fail: does
+# the job run when every job before it passed, or failed. A step `if`
+# shows A/B: runs while the job passes / runs after an earlier step failed.
+
+convert: exit 0
+  `ci.yml`: `on.issue_comment` is not supported and was dropped; hatchrun runs on push, pull_request, schedule, workflow_dispatch, workflow_run and release; keep `on.issue_comment` on GitHub Actions
+  `deploy.yml`: `on.workflow_run` names workflow `Lint`, which none of the converted files is; it was dropped
+  `deploy.yml`: `on.workflow_run`: types `requested` are not supported and were dropped; hatchrun runs on completed
+  `publish.yml`: `on.release`: types `edited` are not supported and were dropped; hatchrun runs on published, created, released, prereleased
+validate: exit 0
+event push-main (compile refs/heads/main)
+  ci: triggered
+    job test on ubuntu-latest: ok=run fail=run
+      step actions/checkout@v5
+      step run: cargo test
+  deploy: not triggered
+  publish: not triggered
+event push-feature (compile refs/heads/feature/login)
+  ci: not triggered
+  deploy: not triggered
+  publish: not triggered
+event push-tag (compile refs/tags/v1.4.0)
+  ci: not triggered
+  deploy: not triggered
+  publish: not triggered
+event pull_request-opened (compile refs/heads/main)
+  ci: not triggered
+  deploy: not triggered
+  publish: not triggered
+event pull_request-synchronize (compile refs/heads/main)
+  ci: not triggered
+  deploy: not triggered
+  publish: not triggered
+event pull_request-closed (compile refs/heads/main)
+  ci: not triggered
+  deploy: not triggered
+  publish: not triggered
+event workflow_dispatch (compile refs/heads/main)
+  ci: not triggered
+  deploy: not triggered
+  publish: not triggered
+event workflow_run 'ci' (compile refs/heads/main)
+  ci: not triggered
+  deploy: triggered
+    job deploy on ubuntu-latest: ok=run fail=run
+      if github.event.workflow_run.conclusion == 'success'
+      step actions/checkout@v5
+      step run: ./deploy.sh "${{ hatchrun.ref_name }}"
+  publish: not triggered
+event release-published (compile refs/tags/v1.4.0)
+  ci: not triggered
+  deploy: not triggered
+  publish: triggered
+    job upload on ubuntu-latest: ok=run fail=run
+      step actions/checkout@v5
+      step Upload the assets for ${{ github.ref_name }}
+      step Check out the docs
