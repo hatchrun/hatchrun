@@ -16,7 +16,7 @@ validate: exit 0
 event push-main (compile refs/heads/main)
   ci: triggered
     job test on ubuntu-latest: ok=run fail=run
-      step checkout
+      step actions/checkout@v5
       step run: npm ci && npm test
 event push-feature (compile refs/heads/feature/login)
   ci: not triggered
@@ -25,12 +25,12 @@ event push-tag (compile refs/tags/v1.4.0)
 event pull_request-opened (compile refs/heads/main)
   ci: triggered
     job test on ubuntu-latest: ok=run fail=run
-      step checkout
+      step actions/checkout@v5
       step run: npm ci && npm test
 event pull_request-synchronize (compile refs/heads/main)
   ci: triggered
     job test on ubuntu-latest: ok=run fail=run
-      step checkout
+      step actions/checkout@v5
       step run: npm ci && npm test
 event pull_request-closed (compile refs/heads/main)
   ci: not triggered

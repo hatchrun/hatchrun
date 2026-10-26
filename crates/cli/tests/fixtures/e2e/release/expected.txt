@@ -16,16 +16,16 @@ event push-tag (compile refs/tags/v1.4.0)
   release: triggered
     job version on ubuntu-latest: ok=run fail=run
       outputs prerelease=false version=1.4.0
-      step checkout
+      step actions/checkout@v5
       step Work out the version
     job build (x86_64-unknown-linux-gnu) on ubuntu-26.04-8core after version: ok=run fail=skip
       matrix target="x86_64-unknown-linux-gnu"
-      step checkout
+      step actions/checkout@v5
       step run: cargo build --release --target ${{ matrix.target }}
       step actions/upload-artifact@v4
     job build (aarch64-unknown-linux-gnu) on ubuntu-26.04-8core after version: ok=run fail=skip
       matrix target="aarch64-unknown-linux-gnu"
-      step checkout
+      step actions/checkout@v5
       step run: cargo build --release --target ${{ matrix.target }}
       step actions/upload-artifact@v4
     job publish on ubuntu-latest after version + build (x86_64-unknown-linux-gnu) + build (aarch64-unknown-linux-gnu): ok=run fail=skip
@@ -49,16 +49,16 @@ event workflow_dispatch (compile refs/heads/main)
   release: triggered
     job version on ubuntu-latest: ok=run fail=run
       outputs prerelease=true version=1.5.0-rc.1
-      step checkout
+      step actions/checkout@v5
       step Work out the version
     job build (x86_64-unknown-linux-gnu) on ubuntu-26.04-8core after version: ok=run fail=skip
       matrix target="x86_64-unknown-linux-gnu"
-      step checkout
+      step actions/checkout@v5
       step run: cargo build --release --target ${{ matrix.target }}
       step actions/upload-artifact@v4
     job build (aarch64-unknown-linux-gnu) on ubuntu-26.04-8core after version: ok=run fail=skip
       matrix target="aarch64-unknown-linux-gnu"
-      step checkout
+      step actions/checkout@v5
       step run: cargo build --release --target ${{ matrix.target }}
       step actions/upload-artifact@v4
     job publish on ubuntu-latest after version + build (x86_64-unknown-linux-gnu) + build (aarch64-unknown-linux-gnu): ok=run fail=skip

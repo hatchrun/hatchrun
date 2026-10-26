@@ -8,7 +8,6 @@
 
 convert: exit 0
   `ci.yml`: `on.issue_comment` is not supported and was dropped; hatchrun runs on push, pull_request, schedule, workflow_dispatch, workflow_run and release; keep `on.issue_comment` on GitHub Actions
-  `ci.yml` job `test` step 1: `actions/checkout@v5` became the built-in checkout step; inputs `persist-credentials` are not supported and were dropped
   `deploy.yml`: `on.workflow_run` names workflow `Lint`, which none of the converted files is; it was dropped
   `deploy.yml`: `on.workflow_run`: types `requested` are not supported and were dropped; hatchrun runs on completed
   `publish.yml`: `on.release`: types `edited` are not supported and were dropped; hatchrun runs on published, created, released, prereleased
@@ -16,7 +15,7 @@ validate: exit 0
 event push-main (compile refs/heads/main)
   ci: triggered
     job test on ubuntu-latest: ok=run fail=run
-      step checkout fetch-depth=0 submodules=recursive
+      step actions/checkout@v5
       step run: cargo test
   deploy: not triggered
   publish: not triggered
@@ -49,7 +48,7 @@ event workflow_run 'ci' (compile refs/heads/main)
   deploy: triggered
     job deploy on ubuntu-latest: ok=run fail=run
       if github.event.workflow_run.conclusion == 'success'
-      step checkout ref=${{ github.event.workflow_run.head_sha }}
+      step actions/checkout@v5
       step run: ./deploy.sh "${{ hatchrun.ref_name }}"
   publish: not triggered
 event release-published (compile refs/tags/v1.4.0)
@@ -57,6 +56,6 @@ event release-published (compile refs/tags/v1.4.0)
   deploy: not triggered
   publish: triggered
     job upload on ubuntu-latest: ok=run fail=run
-      step checkout lfs
+      step actions/checkout@v5
       step Upload the assets for ${{ github.ref_name }}
       step Check out the docs

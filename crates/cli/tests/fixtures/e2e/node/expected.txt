@@ -13,24 +13,24 @@ event push-main (compile refs/heads/main)
   node: triggered
     job lint on ubuntu-latest: ok=run fail=run
       if !contains(github.event.head_commit.message, '[skip ci]')
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm run lint
     job test (20, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
       matrix node=20 os="ubuntu-latest"
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm test
     job test (22, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
       matrix node=22 os="ubuntu-latest"
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm test
     job build on ubuntu-latest after lint: ok=run fail=skip
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm run build
@@ -42,24 +42,24 @@ event push-feature (compile refs/heads/feature/login)
   node: triggered
     job lint on ubuntu-latest: ok=skip fail=skip
       if !contains(github.event.head_commit.message, '[skip ci]')
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm run lint
     job test (20, ubuntu-latest) on ubuntu-latest after lint: ok=skip fail=skip
       matrix node=20 os="ubuntu-latest"
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm test
     job test (22, ubuntu-latest) on ubuntu-latest after lint: ok=skip fail=skip
       matrix node=22 os="ubuntu-latest"
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm test
     job build on ubuntu-latest after lint: ok=skip fail=skip
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm run build
@@ -71,24 +71,24 @@ event push-tag (compile refs/tags/v1.4.0)
   node: triggered
     job lint on ubuntu-latest: ok=run fail=run
       if !contains(github.event.head_commit.message, '[skip ci]')
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm run lint
     job test (20, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
       matrix node=20 os="ubuntu-latest"
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm test
     job test (22, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
       matrix node=22 os="ubuntu-latest"
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm test
     job build on ubuntu-latest after lint: ok=run fail=skip
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm run build
@@ -100,24 +100,24 @@ event pull_request-opened (compile refs/heads/main)
   node: triggered
     job lint on ubuntu-latest: ok=run fail=run
       if !contains(github.event.head_commit.message, '[skip ci]')
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm run lint
     job test (20, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
       matrix node=20 os="ubuntu-latest"
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm test
     job test (22, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
       matrix node=22 os="ubuntu-latest"
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm test
     job build on ubuntu-latest after lint: ok=run fail=skip
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm run build
@@ -129,24 +129,24 @@ event pull_request-synchronize (compile refs/heads/main)
   node: triggered
     job lint on ubuntu-latest: ok=run fail=run
       if !contains(github.event.head_commit.message, '[skip ci]')
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm run lint
     job test (20, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
       matrix node=20 os="ubuntu-latest"
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm test
     job test (22, ubuntu-latest) on ubuntu-latest after lint: ok=run fail=skip
       matrix node=22 os="ubuntu-latest"
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm test
     job build on ubuntu-latest after lint: ok=run fail=skip
-      step checkout
+      step actions/checkout@v5
       step actions/setup-node@v4
       step run: npm ci
       step run: npm run build

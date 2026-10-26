@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use hatchrun_workflow::{
-    CheckoutStep, Conversion, Diagnostic, Filter, JobKind, Level, ParameterKind, Permissions,
-    Require, Step, Submodules, convert, parse, to_yaml, validate,
+    Conversion, Diagnostic, Filter, JobKind, Level, ParameterKind, Permissions, Require, Step,
+    convert, parse, to_yaml, validate,
 };
 use serde_json::{Value, json};
 
@@ -1900,91 +1900,33 @@ fn converted_steps(steps: &str) -> Conversion {
 }
 
 #[test]
-fn checkout_becomes_the_built_in_step() {
+fn checkout_stays_a_uses_step_at_its_ref() {
     let out = converted_steps(
         "
-      - uses: actions/checkout@v5
-      - name: Check out
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
-          submodules: recursive
-          lfs: true
-          path: src
-          token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          persist-credentials: false
-          clean: false
       - uses: https://code.forgejo.org/actions/checkout@v4
-        with: { submodules: 'true', fetch-depth: '2' }
 ",
     );
-    let steps = &out.config.jobs["ci-t"].steps;
-    assert_eq!(steps[0], Step::Checkout(CheckoutStep::default()));
-    assert_eq!(
-        steps[1],
-        Step::Checkout(CheckoutStep {
-            r#ref: Some("${{ github.head_ref }}".into()),
-            fetch_depth: 0,
-            submodules: Submodules::Recursive,
-            lfs: true,
-            path: Some("src".into()),
+    let uses: Vec<_> = out.config.jobs["ci-t"]
+        .steps
+        .iter()
+        .map(|s| match s {
+            Step::Uses(u) => u.uses.as_str(),
+            other => panic!("not a uses step: {other:?}"),
         })
-    );
+        .collect();
     assert_eq!(
-        steps[2],
-        Step::Checkout(CheckoutStep {
-            fetch_depth: 2,
-            submodules: Submodules::Top,
-            ..CheckoutStep::default()
-        })
-    );
-    assert!(has(
-        &out.warnings,
-        &[
-            "step `Check out`",
-            "built-in checkout",
-            "`clean`, `persist-credentials`"
+        uses,
+        [
+            "actions/checkout@v4",
+            "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+            "https://code.forgejo.org/actions/checkout@v4",
         ]
-    ));
-    assert!(!has(&out.warnings, &["`token`"]));
+    );
+    assert!(!has(&out.warnings, &["built-in checkout"]));
     round_trips(&out);
-}
-
-#[test]
-fn checkout_that_needs_more_stays_a_uses_step() {
-    for with in [
-        "{ repository: acme/docs }",
-        "{ token: \"${{ secrets.PAT }}\" }",
-        "{ ssh-key: \"${{ secrets.KEY }}\" }",
-        "{ fetch-depth: \"${{ inputs.depth }}\" }",
-        "{ submodules: \"${{ inputs.subs }}\" }",
-        "{ lfs: maybe }",
-        "{ path: ../elsewhere }",
-    ] {
-        let out = converted_steps(&format!(
-            "      - uses: actions/checkout@v5\n        with: {with}\n"
-        ));
-        assert!(
-            matches!(&out.config.jobs["ci-t"].steps[0], Step::Uses(u) if u.uses == "actions/checkout@v5"),
-            "{with}"
-        );
-        assert!(!has(&out.warnings, &["built-in checkout"]), "{with}");
-    }
-    for extra in [
-        "        if: github.event_name == 'push'\n",
-        "        id: co\n",
-        "        env: { A: b }\n",
-        "        continue-on-error: true\n",
-    ] {
-        let out = converted_steps(&format!("      - uses: actions/checkout@v5\n{extra}"));
-        assert!(
-            matches!(&out.config.jobs["ci-t"].steps[0], Step::Uses(_)),
-            "{extra}"
-        );
-    }
-    // Another action with a similar name is left alone.
-    let out = converted_steps("      - uses: actions/checkout-extra@v1\n");
-    assert!(matches!(&out.config.jobs["ci-t"].steps[0], Step::Uses(_)));
 }

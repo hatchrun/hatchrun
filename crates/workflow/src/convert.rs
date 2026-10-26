@@ -6,8 +6,8 @@
 //!
 //! Each workflow file becomes one entry of `workflows:`, keyed by the file
 //! stem, and each of its jobs becomes `jobs.<stem>-<job>`. `actions/checkout`
-//! becomes the built-in checkout step. Keys hatchrun has no place for are
-//! dropped with a warning. Docker steps and runner labels
+//! stays a `uses:` step at the ref it was written with. Keys hatchrun has
+//! no place for are dropped with a warning. Docker steps and runner labels
 //! that name no template are errors; the job is dropped and the rest of
 //! the files still convert.
 
@@ -20,8 +20,8 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::config::{
-    CheckoutStep, Config, Job, MAX_SOURCE, Matrix, Parameter, ParameterKind, Require, RunStep,
-    Step, Submodules, UsesStep, Workflow, WorkflowJob, too_big, yaml_options,
+    Config, Job, MAX_SOURCE, Matrix, Parameter, ParameterKind, Require, RunStep, Step, UsesStep,
+    Workflow, WorkflowJob, too_big, yaml_options,
 };
 use crate::diagnostic::Diagnostic;
 use crate::environment::valid_environment_name;
@@ -215,10 +215,6 @@ const EVENTS: &str = "push, pull_request, schedule, workflow_dispatch, workflow_
 /// Events that only GitHub can deliver, as they act on GitHub's own
 /// issues and pull requests with the base repository's secrets.
 const GITHUB_ONLY: &[&str] = &["pull_request_target", "issues", "issue_comment"];
-
-/// Inputs of `actions/checkout` that check out another repository or
-/// use other credentials. A step with one stays a `uses:` step.
-const CHECKOUT_KEEPS: &[&str] = &["repository", "token", "ssh-key", "github-server-url"];
 
 /// The part of a GitHub workflow file the converter reads.
 #[derive(Deserialize)]
@@ -1601,10 +1597,7 @@ impl Cx {
                     if_,
                     continue_on_error,
                 };
-                match self.checkout(&at, &step) {
-                    Some(checkout) => Some(Step::Checkout(checkout)),
-                    None => Some(Step::Uses(step)),
-                }
+                Some(Step::Uses(step))
             }
             (Some(_), Some(_)) => {
                 self.error(format!("{at} has both `run` and `uses`"));
@@ -1616,92 +1609,6 @@ impl Cx {
             }
         }
     }
-
-    /// `actions/checkout` as the built-in checkout step, with `ref`,
-    /// `fetch-depth`, `submodules`, `lfs` and `path` carried over and
-    /// other inputs dropped with a warning; the step's name is dropped.
-    /// `None` when the step stays a `uses:` step: it is another action,
-    /// has an `id`, `if`, `env` or `continue-on-error`, checks out
-    /// another repository or with other credentials, or sets an option
-    /// to something the step cannot hold, such as an expression.
-    fn checkout(&mut self, at: &str, step: &UsesStep) -> Option<CheckoutStep> {
-        if !is_checkout(&step.uses)
-            || step.id.is_some()
-            || step.if_.is_some()
-            || !step.env.is_empty()
-            || step.continue_on_error
-        {
-            return None;
-        }
-        let mut checkout = CheckoutStep::default();
-        let mut dropped = Vec::new();
-        for (key, value) in &step.with {
-            let text = scalar(value);
-            match key.as_str() {
-                "repository"
-                    if text
-                        .as_deref()
-                        .is_some_and(|t| is_expr(t, "github.repository")) => {}
-                "token"
-                    if text.as_deref().is_some_and(|t| {
-                        is_expr(t, "github.token") || is_expr(t, "secrets.GITHUB_TOKEN")
-                    }) => {}
-                key if CHECKOUT_KEEPS.contains(&key) => return None,
-                "ref" => checkout.r#ref = Some(text?).filter(|t| !t.is_empty()),
-                "fetch-depth" => checkout.fetch_depth = text?.trim().parse().ok()?,
-                "submodules" => {
-                    checkout.submodules = match text?.as_str() {
-                        "false" => Submodules::None,
-                        "true" => Submodules::Top,
-                        "recursive" => Submodules::Recursive,
-                        _ => return None,
-                    }
-                }
-                "lfs" => {
-                    checkout.lfs = match text?.as_str() {
-                        "false" => false,
-                        "true" => true,
-                        _ => return None,
-                    }
-                }
-                "path" => {
-                    let path = text?;
-                    if path.starts_with('/') || path.split(['/', '\\']).any(|p| p == "..") {
-                        return None;
-                    }
-                    checkout.path = Some(path).filter(|p| !p.is_empty());
-                }
-                other => dropped.push(format!("`{other}`")),
-            }
-        }
-        if !dropped.is_empty() {
-            self.warn(format!(
-                "{at}: `{}` became the built-in checkout step; inputs {} are not supported and were dropped",
-                step.uses,
-                dropped.join(", ")
-            ));
-        }
-        Some(checkout)
-    }
-}
-
-/// Whether `uses` is `actions/checkout` at any ref, also by URL as
-/// Forgejo writes it (`https://code.forgejo.org/actions/checkout@v4`).
-fn is_checkout(uses: &str) -> bool {
-    let path = match uses.strip_prefix("https://") {
-        Some(rest) => rest.split_once('/').map_or(rest, |(_, path)| path),
-        None => uses,
-    };
-    path.split_once('@')
-        .is_some_and(|(action, _)| action.eq_ignore_ascii_case("actions/checkout"))
-}
-
-/// Whether `text` is the whole expression `${{ name }}`, in any case.
-fn is_expr(text: &str, name: &str) -> bool {
-    text.trim()
-        .strip_prefix("${{")
-        .and_then(|t| t.strip_suffix("}}"))
-        .is_some_and(|inner| inner.trim().eq_ignore_ascii_case(name))
 }
 
 /// One combination of matrix keys and values.
