@@ -106,7 +106,7 @@ pub(crate) fn github_struct(info: &RunInfo, api: &str, token: &str) -> Github {
 }
 
 /// The `github` context the graph's `if:` conditions read: the same
-/// fields as the job document's, plus `event_name` and `event`, and no
+/// fields as the job document's, plus `event_name`, `workflow` and `event`, and no
 /// token.
 pub(crate) fn github_context(info: &RunInfo, event: &Value, api: &str) -> Value {
     let mut context = serde_json::to_value(github_struct(info, api, ""))
@@ -114,6 +114,7 @@ pub(crate) fn github_context(info: &RunInfo, event: &Value, api: &str) -> Value 
     if let Some(fields) = context.as_object_mut() {
         fields.remove("token");
         fields.insert("event_name".to_owned(), json!(info.event_name));
+        fields.insert("workflow".to_owned(), json!(info.workflow));
         fields.insert("event".to_owned(), event.clone());
     }
     context

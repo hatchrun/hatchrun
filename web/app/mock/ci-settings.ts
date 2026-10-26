@@ -98,13 +98,14 @@ const json = (res: ServerResponse, status: number, body?: unknown) => {
 };
 
 /** The same checks as secrets::valid_name; the name uppercased, or the message. */
-function validName(raw: string): string | { error: string } {
+function validName(raw: string, noun: "secret" | "variable"): string | { error: string } {
   const name = raw.toUpperCase();
-  if (name === "") return { error: "Secret names cannot be empty" };
-  if (name.length > NAME_MAX) return { error: `Secret names are at most ${NAME_MAX} characters` };
-  if (!/^[A-Z0-9_]+$/.test(name)) return { error: "Use letters, digits and _ in secret names" };
-  if (/^[0-9]/.test(name)) return { error: "Secret names cannot start with a digit" };
-  if (name.startsWith("GITHUB_")) return { error: "Secret names cannot start with GITHUB_" };
+  const title = noun === "secret" ? "Secret" : "Variable";
+  if (name === "") return { error: `${title} names cannot be empty` };
+  if (name.length > NAME_MAX) return { error: `${title} names are at most ${NAME_MAX} characters` };
+  if (!/^[A-Z0-9_]+$/.test(name)) return { error: `Use letters, digits and _ in ${noun} names` };
+  if (/^[0-9]/.test(name)) return { error: `${title} names cannot start with a digit` };
+  if (name.startsWith("GITHUB_")) return { error: `${title} names cannot start with GITHUB_` };
   return name;
 }
 
@@ -259,7 +260,7 @@ export function handleCiSettings(
     json(res, 200, list);
     return true;
   }
-  const name = validName(item);
+  const name = validName(item, kind === "secrets" ? "secret" : "variable");
   if (item === "" || typeof name !== "string") {
     json(res, 400, typeof name === "string" ? { error: "not found" } : name);
     return true;

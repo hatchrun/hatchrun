@@ -29,9 +29,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use hatchrun_workflow::{
-    Arch, Config, Event, ExprError, Functions, JobKind, JobStatus, ParameterKind, Plan, PlannedJob,
-    PlannedStep, Workflow, checks_status, compile, evaluate, interpolate, parse, to_yaml,
-    triggered, truthy,
+    Arch, Config, Event, ExprError, Functions, HATCHRUN_KEYS, JobKind, JobStatus, ParameterKind,
+    Plan, PlannedJob, PlannedStep, Submodules, Workflow, compile, interpolate, job_condition,
+    parse, to_yaml, triggered,
 };
 use serde_json::{Map, Value, json};
 
@@ -96,7 +96,9 @@ struct Delivery {
 }
 
 /// The deliveries the scenarios are played against. A schedule is
-/// delivered once per cron any workflow of the config lists.
+/// delivered once per cron any workflow of the config lists, a finished
+/// run once per workflow any `workflow_run` names, and a release only
+/// when a workflow runs on one.
 fn deliveries(config: &Config) -> Vec<Delivery> {
     let dir = fixtures().join("events");
     let mut out = Vec::new();
@@ -133,6 +135,28 @@ fn deliveries(config: &Config) -> Vec<Delivery> {
         event: "workflow_dispatch",
         payload: read_json(&dir.join("workflow_dispatch.json")),
     });
+    let finished: BTreeSet<&str> = config
+        .workflows
+        .values()
+        .filter_map(|wf| wf.on.workflow_run.as_ref())
+        .flat_map(|run| run.workflows.iter().map(String::as_str))
+        .collect();
+    for workflow in finished {
+        let mut payload = read_json(&dir.join("workflow_run-completed.json"));
+        payload["workflow"] = json!(workflow);
+        out.push(Delivery {
+            label: format!("workflow_run '{workflow}'"),
+            event: "workflow_run",
+            payload,
+        });
+    }
+    if config.workflows.values().any(|wf| wf.on.release.is_some()) {
+        out.push(Delivery {
+            label: "release-published".to_owned(),
+            event: "release",
+            payload: read_json(&dir.join("release-published.json")),
+        });
+    }
     out
 }
 
@@ -174,6 +198,15 @@ fn trigger_event(d: &Delivery) -> Event {
         "schedule" => Event::Schedule {
             cron: text(&d.payload["schedule"]).to_owned(),
         },
+        "workflow_run" => Event::WorkflowRun {
+            action: text(&d.payload["action"]).to_owned(),
+            workflow: text(&d.payload["workflow"]).to_owned(),
+            branch: text(&d.payload["workflow_run"]["head_branch"]).to_owned(),
+        },
+        "release" => Event::Release {
+            action: text(&d.payload["action"]).to_owned(),
+            tag: text(&d.payload["release"]["tag_name"]).to_owned(),
+        },
         _ => Event::Dispatch,
     }
 }
@@ -186,6 +219,7 @@ fn compile_ref(d: &Delivery) -> String {
             "refs/heads/{}",
             text(&d.payload["pull_request"]["base"]["ref"])
         ),
+        "release" => format!("refs/tags/{}", text(&d.payload["release"]["tag_name"])),
         _ => format!(
             "refs/heads/{}",
             text(&d.payload["repository"]["default_branch"])
@@ -323,21 +357,9 @@ impl Upstream {
     }
 }
 
-/// Evaluates an `if:` as GitHub does: a condition that calls no status
-/// function runs only on success, and a whole `${{ }}` is unwrapped.
+/// Evaluates an `if:` with the job's status as `status`.
 fn condition(cond: &str, ctx: &Value, status: JobStatus) -> Result<bool, ExprError> {
-    let trimmed = cond.trim();
-    let inner = trimmed
-        .strip_prefix("${{")
-        .and_then(|rest| rest.strip_suffix("}}"))
-        .filter(|inner| !inner.contains("${{"));
-    let funcs = Status(status);
-    let value = match inner {
-        Some(inner) => evaluate(inner, ctx, &funcs)?,
-        None if trimmed.contains("${{") => Value::String(interpolate(trimmed, ctx, &funcs)?),
-        None => evaluate(trimmed, ctx, &funcs)?,
-    };
-    Ok(truthy(&value) && (checks_status(trimmed)? || status == JobStatus::Success))
+    job_condition(Some(cond), ctx, &Status(status))
 }
 
 fn shown(result: Result<bool, ExprError>) -> String {
@@ -373,6 +395,27 @@ fn step_parts(step: &PlannedStep) -> (String, Option<&str>, Option<&str>) {
             uses.id.as_deref(),
             uses.if_.as_deref(),
         ),
+        PlannedStep::Checkout(checkout) => {
+            let mut label = "checkout".to_owned();
+            if let Some(r) = &checkout.r#ref {
+                write!(label, " ref={r}").unwrap();
+            }
+            if checkout.fetch_depth != 1 {
+                write!(label, " fetch-depth={}", checkout.fetch_depth).unwrap();
+            }
+            match checkout.submodules {
+                Submodules::None => {}
+                Submodules::Top => label.push_str(" submodules"),
+                Submodules::Recursive => label.push_str(" submodules=recursive"),
+            }
+            if checkout.lfs {
+                label.push_str(" lfs");
+            }
+            if let Some(path) = &checkout.path {
+                write!(label, " path={path}").unwrap();
+            }
+            (label, None, None)
+        }
         other => (format!("{other:?}"), None, None),
     }
 }
@@ -551,8 +594,16 @@ fn play(config: &Config, d: &Delivery, outputs: &Value, out: &mut String) {
         assert_eq!(plan.workflow, *name);
         writeln!(out, "  {name}: triggered").unwrap();
         let inputs = inputs(d, wf);
+        let github = github(d, name, &inputs);
+        // The host-neutral context, which the GitHub adapter fills from
+        // the same values.
+        let hatchrun: Map<String, Value> = HATCHRUN_KEYS
+            .iter()
+            .map(|k| ((*k).to_owned(), github[*k].clone()))
+            .collect();
         let base = json!({
-            "github": github(d, name, &inputs),
+            "hatchrun": hatchrun,
+            "github": github,
             "vars": vars(),
             "inputs": inputs,
         });
@@ -762,8 +813,13 @@ fn nightly_schedule() {
 }
 
 #[test]
-fn reusable_workflow_calls_drop_their_dependents() {
+fn local_reusable_workflows_are_inlined_and_remote_ones_dropped() {
     scenario("reusable");
+}
+
+#[test]
+fn workflows_chained_by_workflow_run_and_a_release() {
+    scenario("chained");
 }
 
 /// A developer adds `parallelism` to a converted job: each matrix leg
@@ -804,25 +860,22 @@ fn parallelism_added_after_converting() {
 
 /// This repository's own workflows, as a snapshot in
 /// `tests/fixtures/this-repository` so the test does not change when
-/// they do: everything converts but the release build matrix, which
-/// names its runner through `matrix.runner`, so the release workflow
-/// keeps only `version` and `sbom`.
+/// they do: everything converts. The release build matrix names its
+/// runner through `matrix.runner` in two `include` entries, so it
+/// becomes two entries that each run on their own template.
 #[test]
 fn this_repository() {
     let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/this-repository");
     let dir = repository("self", &workflows);
     let (code, stdout, stderr) = hatchrun(&dir, &["convert", "-o", ".hatchrun/config.yml"]);
-    assert_eq!(code, 1, "{stderr}");
+    assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, "");
     assert!(
-        stderr.contains("`release.yml` job `build` has `runs-on: ${{ matrix.runner }}`"),
+        stderr.contains(
+            "`release.yml` job `build`: `runs-on: ubuntu-24.04-arm` became `ubuntu-26.04-arm`"
+        ),
         "{stderr}"
     );
-    let errors: Vec<&str> = stderr
-        .lines()
-        .filter(|l| l.contains("names no runner template"))
-        .collect();
-    assert_eq!(errors.len(), 1, "{stderr}");
     let (code, stdout, stderr) = hatchrun(&dir, &["validate"]);
     assert_eq!((code, stdout.as_str(), stderr.as_str()), (0, "", ""));
 
@@ -833,7 +886,10 @@ fn this_repository() {
         .iter()
         .map(|j| j.name.as_deref().unwrap_or(&j.job))
         .collect();
-    assert_eq!(release, ["version", "sbom"]);
+    assert_eq!(
+        release,
+        ["version", "build", "build-2", "sbom", "image", "release"]
+    );
     let mut planned = 0;
     for d in deliveries(&config) {
         let event = trigger_event(&d);
@@ -856,6 +912,28 @@ fn this_repository() {
         &trigger_event(&push)
     ));
     let plan = compile(&config, "release", &compile_ref(&push)).unwrap();
-    let ids: Vec<&str> = plan.jobs.iter().map(|j| j.id.as_str()).collect();
-    assert_eq!(ids, ["version", "sbom"]);
+    let names: Vec<&str> = plan.jobs.iter().map(|j| j.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["version", "build", "build-2", "sbom", "image", "release"]
+    );
+    let arches: Vec<Arch> = plan.jobs[1..3]
+        .iter()
+        .map(|j| match j.kind {
+            JobKind::Run { template } => template.arch,
+            JobKind::Approval => panic!("{j:?}"),
+        })
+        .collect();
+    assert_eq!(arches, [Arch::Amd64, Arch::Arm64]);
+    assert_eq!(plan.jobs[2].matrix["target"], "aarch64-unknown-linux-musl");
+    // `needs: [version, build]` waits for both build entries.
+    let image = &plan.jobs[4];
+    assert_eq!(
+        image.requires,
+        [
+            plan.jobs[0].id.as_str(),
+            plan.jobs[1].id.as_str(),
+            plan.jobs[2].id.as_str()
+        ]
+    );
 }

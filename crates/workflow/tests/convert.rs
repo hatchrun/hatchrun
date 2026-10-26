@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use hatchrun_workflow::{
-    Conversion, Diagnostic, Filter, Level, ParameterKind, Permissions, Step, convert, parse,
-    to_yaml, validate,
+    Conversion, Diagnostic, Filter, JobKind, Level, ParameterKind, Permissions, Require, Step,
+    convert, parse, to_yaml, validate,
 };
 use serde_json::{Value, json};
 
@@ -51,7 +51,7 @@ fn converts_a_typical_ci_workflow() {
             .find(|j| j.job == "ci-lint")
             .unwrap()
             .requires,
-        Vec::<String>::new()
+        Vec::<Require>::new()
     );
     assert!(out.warnings.iter().any(|w| w.message.contains("services")));
     // round trip: the YAML we write parses and validates clean
@@ -72,7 +72,7 @@ fn the_ci_fixture_maps_every_part() {
     assert!(wf.on.push.is_some());
     assert!(wf.on.pull_request.is_some());
     let test = wf.jobs.iter().find(|j| j.job == "ci-test").unwrap();
-    assert_eq!(test.requires, ["lint"]);
+    assert_eq!(test.requires, [Require::new("lint")]);
     assert_eq!(test.name.as_deref(), Some("test"));
     assert_eq!(test.matrix["toolchain"], [json!("stable"), json!("beta")]);
     assert!(test.with.is_empty());
@@ -246,8 +246,10 @@ on:
 jobs:
   t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
 ");
-    assert!(out.config.workflows["ci"].on.push.is_some());
-    assert!(has(&out.warnings, &["ci.yml", "release"]));
+    let on = &out.config.workflows["ci"].on;
+    assert!(on.push.is_some());
+    assert_eq!(on.release.as_ref().unwrap().types, ["published"]);
+    assert!(!has(&out.warnings, &["`on.release`"]));
     assert!(has(&out.warnings, &["ci.yml", "pull_request_target"]));
     round_trips(&out);
 }
@@ -283,13 +285,7 @@ jobs:
     steps:
       - run: npm test
 ");
-    for key in [
-        "container",
-        "concurrency",
-        "include",
-        "exclude",
-        "fail-fast",
-    ] {
+    for key in ["container", "concurrency", "fail-fast"] {
         assert!(
             has(&out.warnings, &["ci.yml", "build", key]),
             "{key}: {:?}",
@@ -303,9 +299,20 @@ jobs:
         "{:?}",
         out.warnings
     );
-    let entry = &out.config.workflows["ci"].jobs[0];
-    assert_eq!(entry.matrix["node"], [json!(20), json!(22)]);
+    // `exclude` passes through; the `include` entry matches no
+    // combination, so it runs as an entry of its own.
+    let jobs = &out.config.workflows["ci"].jobs;
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].matrix["node"], [json!(20), json!(22)]);
+    assert_eq!(jobs[0].matrix.exclude, [matrix_map(json!({"node": 20}))]);
+    assert_eq!(jobs[1].name.as_deref(), Some("build-2"));
+    assert_eq!(jobs[1].matrix["node"], [json!(23)]);
     round_trips(&out);
+}
+
+/// A JSON object as an `exclude` entry.
+fn matrix_map(value: Value) -> BTreeMap<String, Value> {
+    serde_json::from_value(value).unwrap()
 }
 
 #[test]
@@ -592,6 +599,118 @@ fn arm_labels_become_the_26_04_arm_template() {
 }
 
 #[test]
+fn third_party_labels_become_the_template_of_their_size() {
+    for (label, want, words) in [
+        (
+            "ubuntu-slim",
+            "ubuntu-latest",
+            "asks for 1 vCPUs, rounded up to 2",
+        ),
+        ("blacksmith-4vcpu-ubuntu-2404", "ubuntu-26.04-4core", ""),
+        ("blacksmith-2vcpu-ubuntu-2404-arm", "ubuntu-26.04-arm", ""),
+        ("buildjet-8vcpu-ubuntu-2204", "ubuntu-26.04-8core", ""),
+        (
+            "buildjet-4vcpu-ubuntu-2204-arm",
+            "ubuntu-26.04-4core-arm",
+            "",
+        ),
+        ("depot-ubuntu-24.04", "ubuntu-latest", ""),
+        ("depot-ubuntu-24.04-arm-8", "ubuntu-26.04-8core-arm", ""),
+        (
+            "namespace-profile-default-6x12",
+            "ubuntu-26.04-8core",
+            "asks for 6 vCPUs, rounded up to 8",
+        ),
+        ("namespace-profile-ci", "ubuntu-latest", ""),
+        ("ubicloud-standard-4", "ubuntu-26.04-4core", ""),
+        (
+            "ubicloud-standard-30-arm",
+            "ubuntu-26.04-16core-arm",
+            "asks for 30 vCPUs and the largest template has 16",
+        ),
+        ("warp-ubuntu-latest-x64-16x", "ubuntu-26.04-16core", ""),
+        ("warp-ubuntu-2404-arm64-2x", "ubuntu-26.04-arm", ""),
+    ] {
+        let out = ok(&format!(
+            "on: push\njobs:\n  b:\n    runs-on: {label}\n    steps: [{{ run: make }}]\n"
+        ));
+        assert_eq!(out.config.jobs["ci-b"].runs_on.as_deref(), Some(want));
+        assert!(
+            has(
+                &out.warnings,
+                &["`b`", &format!("`runs-on: {label}` became `{want}`"), words]
+            ),
+            "{label}: {:?}",
+            out.warnings
+        );
+        round_trips(&out);
+    }
+}
+
+#[test]
+fn runs_on_labels_maps_read_their_label_and_groups_are_errors() {
+    for runs_on in [
+        "{ labels: depot-ubuntu-24.04-4 }",
+        "{ labels: [depot-ubuntu-24.04-4] }",
+    ] {
+        let out = ok(&format!(
+            "on: push\njobs:\n  b:\n    runs-on: {runs_on}\n    steps: [{{ run: make }}]\n"
+        ));
+        assert_eq!(
+            out.config.jobs["ci-b"].runs_on.as_deref(),
+            Some("ubuntu-26.04-4core")
+        );
+        round_trips(&out);
+    }
+    for runs_on in [
+        "{ group: large }",
+        "{ group: large, labels: ubuntu-latest }",
+    ] {
+        let errs = one(
+            "ci.yml",
+            &format!(
+                "on: push\njobs:\n  b:\n    runs-on: {runs_on}\n    steps: [{{ run: make }}]\n"
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            has(
+                &errs,
+                &["`b`", "group: large", "runner groups are not supported"]
+            ),
+            "{errs:?}"
+        );
+    }
+    let errs = one(
+        "ci.yml",
+        "on: push\njobs:\n  b:\n    runs-on: { labels: [a, b] }\n    steps: [{ run: make }]\n",
+    )
+    .unwrap_err();
+    assert!(has(&errs, &["`b`", "names no runner template"]), "{errs:?}");
+}
+
+#[test]
+fn a_runs_on_matrix_maps_third_party_labels() {
+    let out = ok("on: push
+jobs:
+  t:
+    runs-on: ${{ matrix.os }}
+    strategy: { matrix: { os: [blacksmith-4vcpu-ubuntu-2404, windows-latest] } }
+    steps: [{ run: make }]
+");
+    assert_eq!(out.errors, Vec::new());
+    assert_eq!(
+        out.config.jobs["ci-t"].runs_on.as_deref(),
+        Some("ubuntu-26.04-4core")
+    );
+    assert!(has(
+        &out.warnings,
+        &["`runs-on: blacksmith-4vcpu-ubuntu-2404` became `ubuntu-26.04-4core`"]
+    ));
+    round_trips(&out);
+}
+
+#[test]
 fn a_job_that_reads_strategy_or_jobs_is_dropped() {
     // hatchrun provides neither context, so validate would reject the
     // job; convert leaves it out instead and its output validates.
@@ -726,7 +845,10 @@ fn needs_must_name_a_job_and_repeats_collapse() {
     let out = ok(
         "on: push\njobs:\n  a: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n  b: { needs: [a, a], runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
     );
-    assert_eq!(out.config.workflows["ci"].jobs[1].requires, ["a"]);
+    assert_eq!(
+        out.config.workflows["ci"].jobs[1].requires,
+        [Require::new("a")]
+    );
 }
 
 #[test]
@@ -961,32 +1083,248 @@ jobs:
 }
 
 #[test]
-fn a_runs_on_matrix_without_one_template_is_an_error() {
-    for (os, words) in [
-        (
-            "[macos-latest, windows-latest]",
-            &["names no runner template"][..],
-        ),
-        (
-            "[ubuntu-latest, ubuntu-26.04-arm]",
-            &["`ubuntu-latest`, `ubuntu-26.04-arm`", "one runner template"][..],
-        ),
-    ] {
-        let out = ok(&format!(
-            "on: push
+fn a_runs_on_matrix_without_a_template_is_an_error() {
+    let out = ok("on: push
 jobs:
   test:
-    runs-on: ${{{{ matrix.os }}}}
-    strategy: {{ matrix: {{ os: {os} }} }}
-    steps: [{{ run: make }}]
+    runs-on: ${{ matrix.os }}
+    strategy: { matrix: { os: [macos-latest, windows-latest] } }
+    steps: [{ run: make }]
   lint:
     runs-on: ubuntu-latest
-    steps: [{{ run: lint }}]
-"
-        ));
-        assert!(has(&out.errors, words), "{os}: {:?}", out.errors);
-        assert!(!out.config.jobs.contains_key("ci-test"));
+    steps: [{ run: lint }]
+");
+    assert!(
+        has(&out.errors, &["names no runner template"]),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-test"));
+}
+
+/// Compiles the converted config, read back from YAML, for a push to
+/// main.
+fn compiled(out: &Conversion) -> hatchrun_workflow::Plan {
+    let config = parse(&to_yaml(&out.config)).unwrap();
+    hatchrun_workflow::compile(&config, "ci", "refs/heads/main").unwrap()
+}
+
+/// Each planned job's id and the first label of its template.
+fn legs(plan: &hatchrun_workflow::Plan) -> Vec<(String, &'static str)> {
+    plan.jobs
+        .iter()
+        .map(|j| match j.kind {
+            JobKind::Run { template } => (j.id.clone(), template.labels[0]),
+            JobKind::Approval => (j.id.clone(), "approval"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_runs_on_matrix_over_two_templates_runs_each_leg_on_its_own() {
+    let out = ok("on: push
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04-arm, macos-latest]
+        node: [20, 22]
+        exclude:
+          - os: ubuntu-24.04-arm
+            node: 20
+          - os: macos-latest
+    steps: [{ run: 'echo ${{ matrix.os }}' }]
+");
+    assert_eq!(out.errors, Vec::new());
+    let job = &out.config.jobs["ci-test"];
+    assert_eq!(job.runs_on.as_deref(), Some("${{ parameters.os }}"));
+    assert_eq!(job.parameters["os"].kind, ParameterKind::String);
+    let entry = &out.config.workflows["ci"].jobs[0];
+    assert_eq!(
+        entry.matrix["os"],
+        [json!("ubuntu-latest"), json!("ubuntu-26.04-arm")]
+    );
+    // The exclude of a dropped leg is gone; the other names the new label.
+    assert_eq!(
+        entry.matrix.exclude,
+        [matrix_map(json!({"os": "ubuntu-26.04-arm", "node": 20}))]
+    );
+    for (old, new) in [
+        ("ubuntu-22.04", "ubuntu-latest"),
+        ("ubuntu-24.04-arm", "ubuntu-26.04-arm"),
+    ] {
+        assert!(
+            has(
+                &out.warnings,
+                &[&format!("`runs-on: {old}` became `{new}`")]
+            ),
+            "{:?}",
+            out.warnings
+        );
     }
+    round_trips(&out);
+    assert_eq!(
+        legs(&compiled(&out)),
+        [
+            ("test (20, ubuntu-latest)".into(), "ubuntu-latest"),
+            ("test (22, ubuntu-latest)".into(), "ubuntu-latest"),
+            ("test (22, ubuntu-26.04-arm)".into(), "ubuntu-26.04-arm"),
+        ]
+    );
+}
+
+#[test]
+fn include_extends_matching_combinations_and_adds_the_rest() {
+    // GitHub's documented example: six jobs.
+    let out = ok("on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        fruit: [apple, pear]
+        animal: [cat, dog]
+        include:
+          - color: green
+          - color: pink
+            animal: cat
+          - fruit: apple
+            shape: circle
+          - fruit: banana
+          - fruit: banana
+            animal: cat
+    steps: [{ run: 'echo ${{ matrix.fruit }}' }]
+  after:
+    needs: t
+    runs-on: ubuntu-latest
+    steps: [{ run: done }]
+");
+    assert_eq!(out.errors, Vec::new());
+    round_trips(&out);
+    let plan = compiled(&out);
+    let mut got: Vec<Value> = plan.jobs[..6].iter().map(|j| json!(j.matrix)).collect();
+    got.sort_by_key(Value::to_string);
+    let mut want = vec![
+        json!({"fruit": "apple", "animal": "cat", "color": "pink", "shape": "circle"}),
+        json!({"fruit": "apple", "animal": "dog", "color": "green", "shape": "circle"}),
+        json!({"fruit": "pear", "animal": "cat", "color": "pink"}),
+        json!({"fruit": "pear", "animal": "dog", "color": "green"}),
+        json!({"fruit": "banana"}),
+        json!({"fruit": "banana", "animal": "cat"}),
+    ];
+    want.sort_by_key(Value::to_string);
+    assert_eq!(got, want);
+    // `needs: t` waits for every entry `t` became.
+    let entries = &out.config.workflows["ci"].jobs;
+    let names: Vec<&str> = entries[..6]
+        .iter()
+        .map(|e| e.name.as_deref().unwrap())
+        .collect();
+    assert_eq!(names, ["t", "t-2", "t-3", "t-4", "t-5", "t-6"]);
+    let needed: Vec<&str> = entries[6].requires.iter().map(|r| r.job.as_str()).collect();
+    assert_eq!(needed, names);
+    let ids: Vec<&str> = plan.jobs[..6].iter().map(|j| j.id.as_str()).collect();
+    assert_eq!(plan.jobs[6].requires, ids);
+}
+
+#[test]
+fn include_that_extends_every_combination_alike_keeps_one_entry() {
+    let out = ok("on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+        include: [{ npm: 10 }]
+    steps: [{ run: x }]
+");
+    let entries = &out.config.workflows["ci"].jobs;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].matrix["npm"], [json!(10)]);
+    round_trips(&out);
+    assert_eq!(compiled(&out).jobs.len(), 2);
+}
+
+#[test]
+fn an_include_only_matrix_runs_each_entry_on_its_runner() {
+    // The shape of this repository's release build.
+    let out = ok("on: push
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64 }
+          - { runner: macos-latest, target: darwin }
+          - { target: none }
+    steps: [{ run: 'cargo build --target ${{ matrix.target }}' }]
+  build-2:
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+  publish:
+    needs: [build, build-2]
+    runs-on: ubuntu-latest
+    steps: [{ run: publish }]
+");
+    assert_eq!(out.errors, Vec::new());
+    assert!(has(&out.warnings, &["`macos-latest`", "dropped"]));
+    assert!(has(
+        &out.warnings,
+        &["without `runner`", "`runs-on` reads", "dropped"]
+    ));
+    let entries = &out.config.workflows["ci"].jobs;
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_deref().unwrap()).collect();
+    // `build-2` is a job of its own, so the second entry skips it.
+    assert_eq!(names, ["build", "build-3", "build-2", "publish"]);
+    let needed: Vec<&str> = entries[3].requires.iter().map(|r| r.job.as_str()).collect();
+    assert_eq!(needed, ["build", "build-3", "build-2"]);
+    round_trips(&out);
+    assert_eq!(
+        legs(&compiled(&out))[..2],
+        [
+            ("build (ubuntu-latest, x86_64)".into(), "ubuntu-latest"),
+            (
+                "build-3 (ubuntu-26.04-arm, aarch64)".into(),
+                "ubuntu-26.04-arm"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn bad_include_and_exclude_entries_are_dropped_with_a_warning() {
+    let out = ok("on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+        os: ${{ fromJSON(needs.setup.outputs.os) }}
+        include: ${{ fromJSON(needs.setup.outputs.include) }}
+        exclude:
+          - os: linux
+          - 7
+    steps: [{ run: x }]
+");
+    for words in [
+        &["matrix key `os`", "not a list"][..],
+        &["`strategy.matrix.include`", "not a list of maps"],
+        &["`strategy.matrix.exclude` entry `7`", "not a map"],
+        &[
+            "`strategy.matrix.exclude` entry names `os`",
+            "not a matrix key",
+        ],
+    ] {
+        assert!(has(&out.warnings, words), "{words:?}: {:?}", out.warnings);
+    }
+    let entry = &out.config.workflows["ci"].jobs[0];
+    assert_eq!(entry.matrix.exclude, Vec::<BTreeMap<String, Value>>::new());
+    round_trips(&out);
 }
 
 #[test]
@@ -1312,4 +1650,666 @@ jobs:
         out.errors
     );
     assert!(!out.config.jobs.contains_key("ci-deploy"));
+}
+
+#[test]
+fn workflows_with_no_events_left_are_dropped() {
+    let out = convert(&[
+        (
+            "triage.yml".into(),
+            "
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+jobs:
+  label: { runs-on: windows-latest, steps: [{ run: x }] }
+"
+            .into(),
+        ),
+        (
+            "ci.yml".into(),
+            "on: push\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n".into(),
+        ),
+    ])
+    .unwrap();
+    assert!(has(
+        &out.warnings,
+        &[
+            "triage.yml",
+            "dropped",
+            "`issues`",
+            "`issue_comment`",
+            "GitHub Actions"
+        ]
+    ));
+    // One warning for the file, none per event, and its jobs are not
+    // converted, so the Windows runner is not an error.
+    assert_eq!(
+        out.warnings
+            .iter()
+            .filter(|w| w.message.contains("triage.yml"))
+            .count(),
+        1,
+        "{:?}",
+        out.warnings
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert!(!out.config.workflows.contains_key("triage"));
+    assert!(!out.config.jobs.contains_key("triage-label"));
+    assert!(out.config.workflows.contains_key("ci"));
+    round_trips(&out);
+}
+
+#[test]
+fn reusable_workflow_files_are_dropped() {
+    let out = ok("
+on:
+  workflow_call:
+    inputs:
+      target: { type: string }
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert!(has(
+        &out.warnings,
+        &["ci.yml", "reusable workflow", "workflow_call"]
+    ));
+    assert!(out.config.workflows.is_empty());
+    assert!(out.config.jobs.is_empty());
+}
+
+#[test]
+fn a_workflow_whose_events_all_fail_is_dropped() {
+    let out = one(
+        "ci.yml",
+        "on:\n  push:\n    branches: 3\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+    )
+    .unwrap_err();
+    assert!(has(&out, &["ci.yml", "on.push"]), "{out:?}");
+}
+
+#[test]
+fn github_only_events_say_to_stay_on_github_actions() {
+    for event in ["pull_request_target", "issues", "issue_comment"] {
+        let out = ok(&format!(
+            "on: [push, {event}]\njobs:\n  t: {{ runs-on: ubuntu-latest, steps: [{{ run: x }}] }}\n"
+        ));
+        assert!(
+            has(
+                &out.warnings,
+                &[
+                    &format!("`on.{event}` is not supported"),
+                    "keep",
+                    "GitHub Actions"
+                ]
+            ),
+            "{event}: {:?}",
+            out.warnings
+        );
+    }
+    // Others do not.
+    let out =
+        ok("on: [push, watch]\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n");
+    assert!(has(&out.warnings, &["`on.watch` is not supported"]));
+    assert!(!has(&out.warnings, &["GitHub Actions"]));
+}
+
+/// Converts several files at once.
+fn many(files: &[(&str, &str)]) -> Conversion {
+    let files: Vec<(String, String)> = files
+        .iter()
+        .map(|(n, s)| ((*n).to_owned(), (*s).to_owned()))
+        .collect();
+    convert(&files).unwrap()
+}
+
+const CI: &str =
+    "name: CI\non: push\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n";
+
+#[test]
+fn workflow_run_names_workflows_by_their_stem() {
+    let out = many(&[
+        ("ci.yml", CI),
+        (
+            "unnamed.yml",
+            "on: push\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+        (
+            "deploy.yml",
+            "
+on:
+  workflow_run:
+    workflows: [CI, unnamed.yml, Missing, Deploy]
+    types: [completed, requested]
+    branches: [main]
+name: Deploy
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+",
+        ),
+    ]);
+    let run = out.config.workflows["deploy"]
+        .on
+        .workflow_run
+        .as_ref()
+        .unwrap();
+    assert_eq!(run.workflows, ["ci", "unnamed"]);
+    assert_eq!(run.types, ["completed"]);
+    assert_eq!(run.branches, Some(Filter::new(vec!["main".into()])));
+    assert!(has(&out.warnings, &["deploy.yml", "`Missing`", "dropped"]));
+    assert!(has(&out.warnings, &["deploy.yml", "`Deploy`", "this file"]));
+    assert!(has(
+        &out.warnings,
+        &["deploy.yml", "`requested`", "dropped"]
+    ));
+    assert_eq!(out.errors, []);
+    round_trips(&out);
+}
+
+#[test]
+fn workflow_run_with_no_known_workflow_is_dropped() {
+    let out = many(&[
+        ("ci.yml", CI),
+        (
+            "deploy.yml",
+            "on:\n  push:\n  workflow_run: { workflows: [Nope] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+        (
+            "only.yml",
+            "on:\n  workflow_run: { workflows: [CI], types: [requested] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+    ]);
+    let deploy = &out.config.workflows["deploy"].on;
+    assert!(deploy.workflow_run.is_none() && deploy.push.is_some());
+    assert!(has(
+        &out.warnings,
+        &["deploy.yml", "`on.workflow_run` was dropped"]
+    ));
+    // A workflow left with no event is dropped with its jobs.
+    assert!(!out.config.workflows.contains_key("only"));
+    assert!(!out.config.jobs.contains_key("only-t"));
+    assert!(has(&out.warnings, &["only.yml", "`requested`"]));
+    round_trips(&out);
+}
+
+#[test]
+fn workflow_run_after_a_workflow_that_did_not_convert() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "name: CI\non: issues\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+        (
+            "deploy.yml",
+            "name: Deploy\non:\n  workflow_run: { workflows: [CI] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+        (
+            "notify.yml",
+            "on:\n  workflow_run: { workflows: [Deploy] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+    ]);
+    // ci is dropped, so deploy is, and so notify is.
+    assert!(
+        out.config.workflows.is_empty(),
+        "{:?}",
+        out.config.workflows
+    );
+    assert!(out.config.jobs.is_empty());
+    assert!(has(
+        &out.warnings,
+        &["deploy.yml", "`ci`", "did not convert"]
+    ));
+    assert!(has(&out.warnings, &["notify.yml` was dropped"]));
+}
+
+#[test]
+fn release_types_convert() {
+    let out = ok(
+        "on:\n  release:\n    types: [published, created, edited]\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+    );
+    let release = out.config.workflows["ci"].on.release.as_ref().unwrap();
+    assert_eq!(release.types, ["published", "created"]);
+    assert!(has(&out.warnings, &["`on.release`", "`edited`", "dropped"]));
+    round_trips(&out);
+
+    let out = ok("on: release\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n");
+    let release = out.config.workflows["ci"].on.release.as_ref().unwrap();
+    assert_eq!(release.types, ["published"]);
+    assert!(has(
+        &out.warnings,
+        &["`on.release` has no `types`", "`published`"]
+    ));
+    round_trips(&out);
+
+    let out = ok(
+        "on:\n  push:\n  release: { types: deleted }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+    );
+    assert!(out.config.workflows["ci"].on.release.is_none());
+    assert!(has(
+        &out.warnings,
+        &["`on.release` was dropped", "`deleted`"]
+    ));
+}
+
+/// The steps of the one job of a converted one-step workflow.
+fn converted_steps(steps: &str) -> Conversion {
+    ok(&format!(
+        "on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n{steps}"
+    ))
+}
+
+#[test]
+fn checkout_stays_a_uses_step_at_its_ref() {
+    let out = converted_steps(
+        "
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - uses: https://code.forgejo.org/actions/checkout@v4
+",
+    );
+    let uses: Vec<_> = out.config.jobs["ci-t"]
+        .steps
+        .iter()
+        .map(|s| match s {
+            Step::Uses(u) => u.uses.as_str(),
+            other => panic!("not a uses step: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        uses,
+        [
+            "actions/checkout@v4",
+            "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+            "https://code.forgejo.org/actions/checkout@v4",
+        ]
+    );
+    assert!(!has(&out.warnings, &["built-in checkout"]));
+    round_trips(&out);
+}
+
+const BUILD: &str = "
+on:
+  workflow_call:
+    inputs:
+      target: { type: string, required: true }
+      fast: { type: boolean, default: false }
+    outputs:
+      artifact: { value: '${{ jobs.pack.outputs.name }}' }
+    secrets:
+      TOKEN: { required: true }
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make ${{ inputs.target }}
+        env:
+          T: ${{ secrets.TOKEN }}
+  pack:
+    needs: compile
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.n.outputs.name }}
+    steps:
+      - id: n
+        run: echo name=x >> $GITHUB_OUTPUT
+";
+
+const CALLER: &str = "
+on: push
+jobs:
+  setup: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+  build:
+    needs: setup
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/build.yml
+    with:
+      target: web
+    secrets:
+      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+  ship:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ needs.build.outputs.artifact }}
+";
+
+#[test]
+fn a_local_reusable_workflow_is_inlined() {
+    let out = many(&[
+        (".github/workflows/ci.yml", CALLER),
+        (".github/workflows/build.yml", BUILD),
+    ]);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert!(
+        !out.warnings.iter().any(|w| w.message.contains("dropped")),
+        "{:?}",
+        out.warnings
+    );
+    let compile = &out.config.jobs["ci-build-compile"];
+    let Step::Run(run) = &compile.steps[0] else {
+        panic!()
+    };
+    assert_eq!(run.run, "make ${{ parameters.target }}");
+    assert_eq!(run.env["T"], "${{ secrets.DEPLOY_TOKEN }}");
+    assert_eq!(compile.parameters["target"].kind, ParameterKind::String);
+    assert_eq!(compile.parameters["fast"].default, Some(json!(false)));
+    assert_eq!(
+        compile.if_.as_deref(),
+        Some("github.ref == 'refs/heads/main'")
+    );
+    let wf = &out.config.workflows["ci"];
+    let entry = |job: &str| wf.jobs.iter().find(|j| j.job == job).unwrap();
+    assert_eq!(entry("ci-build-compile").with["target"], json!("web"));
+    assert_eq!(
+        entry("ci-build-compile").requires,
+        vec![Require::new("setup")]
+    );
+    assert_eq!(
+        entry("ci-build-pack").requires,
+        vec![Require::new("ci-build-compile")]
+    );
+    // A job that needs the caller requires the leaf, which the outputs read.
+    assert_eq!(
+        entry("ci-ship").requires,
+        vec![Require::new("ci-build-pack")]
+    );
+    let Step::Run(run) = &out.config.jobs["ci-ship"].steps[0] else {
+        panic!()
+    };
+    assert_eq!(run.run, "echo ${{ needs.ci-build-pack.outputs.name }}");
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|w| w.message.contains("workflow_call"))
+    );
+    assert!(!out.config.workflows.contains_key("build"));
+    round_trips(&out);
+}
+
+#[test]
+fn a_reusable_workflow_file_nobody_calls_keeps_its_warning() {
+    let ci = "on: push\njobs:\n  a: { runs-on: ubuntu-latest, steps: [{ run: x }] }";
+    let out = many(&[(".github/workflows/ci.yml", ci), ("build.yml", BUILD)]);
+    assert!(has(
+        &out.warnings,
+        &["build.yml", "reusable workflow", "workflow_call"]
+    ));
+}
+
+#[test]
+fn forgejo_paths_secrets_and_missing_files() {
+    let ci = "
+on: push
+jobs:
+  a:
+    uses: ./.forgejo/workflows/build.yml
+    with: { target: x }
+    secrets: inherit
+  b:
+    uses: ./.github/workflows/missing.yml
+  c:
+    needs: b
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+";
+    let out = many(&[("ci.yml", ci), ("build.yml", BUILD)]);
+    let compile = &out.config.jobs["ci-a-compile"];
+    let Step::Run(run) = &compile.steps[0] else {
+        panic!()
+    };
+    assert_eq!(run.env["T"], "${{ secrets.TOKEN }}");
+    assert!(has(
+        &out.warnings,
+        &["ci.yml", "job `b`", "missing.yml", "dropped"]
+    ));
+    assert!(!out.config.jobs.contains_key("ci-c"));
+    // Nothing is left unpassed with inherit; without it there is a warning.
+    assert!(!has(&out.warnings, &["declares secret"]));
+    let ci = ci.replace("secrets: inherit", "");
+    let out = many(&[("ci.yml", &ci), ("build.yml", BUILD)]);
+    assert!(has(
+        &out.warnings,
+        &["declares secret `TOKEN`", "does not pass"]
+    ));
+}
+
+#[test]
+fn remote_calls_name_the_callee() {
+    let out = ok("
+on: push
+jobs:
+  lint:
+    uses: acme/shared/.github/workflows/lint.yml@v3
+");
+    assert!(has(
+        &out.warnings,
+        &["lint.yml", "another repository", "copy"]
+    ));
+}
+
+#[test]
+fn a_matrix_on_a_caller_is_dropped() {
+    let ci = "
+on: push
+jobs:
+  a:
+    strategy: { matrix: { x: [1, 2] } }
+    uses: ./.github/workflows/build.yml
+    with: { target: x }
+";
+    let out = many(&[("ci.yml", ci), ("build.yml", BUILD)]);
+    assert!(has(&out.warnings, &["strategy", "not supported"]));
+    assert_eq!(out.config.workflows["ci"].jobs.len(), 2);
+}
+
+#[test]
+fn a_missing_required_input_is_an_error() {
+    let ci = "
+on: push
+jobs:
+  a:
+    uses: ./.github/workflows/build.yml
+  b: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+";
+    let out = many(&[("ci.yml", ci), ("build.yml", BUILD)]);
+    assert!(has(&out.errors, &["input `target`", "required"]));
+    assert!(!out.config.jobs.contains_key("ci-a-compile"));
+}
+
+#[test]
+fn calls_nest_and_cycles_are_errors() {
+    let leaf = "
+on:
+  workflow_call:
+    inputs:
+      v: { type: string }
+jobs:
+  j: { runs-on: ubuntu-latest, steps: [{ run: 'echo ${{ inputs.v }}' }] }
+";
+    let mid = "
+on:
+  workflow_call:
+    inputs:
+      w: { type: string }
+jobs:
+  m:
+    uses: ./.github/workflows/leaf.yml
+    with: { v: '${{ inputs.w }}-x' }
+";
+    let ci = "
+on: push
+jobs:
+  top:
+    uses: ./.github/workflows/mid.yml
+    with: { w: hi }
+  after:
+    needs: top
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+";
+    let out = many(&[("ci.yml", ci), ("mid.yml", mid), ("leaf.yml", leaf)]);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let job = &out.config.jobs["ci-top-m-j"];
+    let wf = &out.config.workflows["ci"];
+    let e = wf.jobs.iter().find(|j| j.job == "ci-top-m-j").unwrap();
+    assert_eq!(e.with["v"], json!("${{ 'hi' }}-x"));
+    assert!(job.parameters.contains_key("v"));
+    let after = wf.jobs.iter().find(|j| j.job == "ci-after").unwrap();
+    assert_eq!(after.requires, vec![Require::new("ci-top-m-j")]);
+    round_trips(&out);
+
+    let a = "on:\n  workflow_call:\njobs:\n  x:\n    uses: ./.github/workflows/b.yml\n";
+    let b = "on:\n  workflow_call:\njobs:\n  y:\n    uses: ./.github/workflows/a.yml\n";
+    let ci = "on: push\njobs:\n  z:\n    uses: ./.github/workflows/a.yml\n  k: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n";
+    let out = many(&[("ci.yml", ci), ("a.yml", a), ("b.yml", b)]);
+    assert!(has(&out.errors, &["cycle"]));
+    assert!(!out.config.jobs.keys().any(|k| k.starts_with("ci-z")));
+}
+
+const FLAGGED: &str = "
+on:
+  workflow_call:
+    inputs:
+      prerelease: { type: boolean, default: false }
+      tag: { type: string, default: '' }
+jobs:
+  notify:
+    if: ${{ !inputs.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ inputs.tag }}
+      - if: inputs.tag != '' && !inputs.prerelease
+        run: echo ${{ inputs.tag || github.ref }}
+";
+
+#[test]
+fn inputs_inside_an_expression_become_the_literal_the_call_gives() {
+    let ci = "
+on: push
+jobs:
+  a:
+    uses: ./.github/workflows/flagged.yml
+    with: { prerelease: true, tag: v1 }
+";
+    let out = many(&[("ci.yml", ci), ("flagged.yml", FLAGGED)]);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let job = &out.config.jobs["ci-a-notify"];
+    assert_eq!(job.if_.as_deref(), Some("${{ !true }}"));
+    let Step::Run(first) = &job.steps[0] else {
+        panic!()
+    };
+    assert_eq!(first.run, "echo ${{ parameters.tag }}");
+    let Step::Run(second) = &job.steps[1] else {
+        panic!()
+    };
+    assert_eq!(second.if_.as_deref(), Some("'v1' != '' && !true"));
+    assert_eq!(second.run, "echo ${{ 'v1' || github.ref }}");
+    round_trips(&out);
+}
+
+#[test]
+fn an_input_inside_an_expression_with_no_literal_drops_the_job() {
+    let ci = "
+on: push
+jobs:
+  pre:
+    runs-on: ubuntu-latest
+    outputs: { tag: x }
+    steps: [{ run: x }]
+  a:
+    needs: pre
+    uses: ./.github/workflows/flagged.yml
+    with: { prerelease: '${{ needs.pre.outputs.tag }}' }
+  b: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+";
+    let out = many(&[("ci.yml", ci), ("flagged.yml", FLAGGED)]);
+    assert!(
+        has(
+            &out.errors,
+            &["`inputs.prerelease`", "inside an expression"]
+        ),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-a-notify"));
+    assert!(out.config.jobs.contains_key("ci-b"));
+    round_trips(&out);
+}
+
+#[test]
+fn an_input_named_like_an_entry_key_drops_the_call() {
+    let named = "
+on:
+  workflow_call:
+    inputs:
+      name: { type: string, default: x }
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [{ run: 'echo ${{ inputs.name }}' }] }
+";
+    let ci = "
+on: push
+jobs:
+  a:
+    uses: ./.github/workflows/named.yml
+    with: { name: y }
+  b: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+";
+    let out = many(&[("ci.yml", ci), ("named.yml", named)]);
+    assert!(
+        has(&out.errors, &["input `name`", "entry reads as its own key"])
+            || has(&out.errors, &["input `name`", "its own key"]),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-a-build"));
+    round_trips(&out);
+}
+
+#[test]
+fn a_call_condition_combines_with_a_called_job_condition_that_reads_an_input() {
+    let gated = "
+on:
+  workflow_call:
+    inputs:
+      affected: { type: boolean, default: false }
+jobs:
+  test:
+    if: ${{ inputs.affected }}
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+";
+    let ci = "
+on: push
+jobs:
+  pre:
+    runs-on: ubuntu-latest
+    outputs: { hit: x }
+    steps: [{ run: x }]
+  lit:
+    needs: pre
+    if: always()
+    uses: ./.github/workflows/gated.yml
+    with: { affected: true }
+  dyn:
+    needs: pre
+    if: always()
+    uses: ./.github/workflows/gated.yml
+    with: { affected: '${{ needs.pre.outputs.hit }}' }
+";
+    let out = many(&[("ci.yml", ci), ("gated.yml", gated)]);
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert_eq!(
+        out.config.jobs["ci-lit-test"].if_.as_deref(),
+        Some("(always()) && (true)")
+    );
+    assert_eq!(
+        out.config.jobs["ci-dyn-test"].if_.as_deref(),
+        Some("${{ parameters.affected }}")
+    );
+    assert!(has(&out.warnings, &["could not be combined"]));
+    round_trips(&out);
 }

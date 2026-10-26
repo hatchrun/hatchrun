@@ -4,9 +4,11 @@
 
 //! Compiling a workflow into a job plan.
 
+use std::collections::BTreeMap;
+
 use hatchrun_workflow::{
-    Diagnostic, JobKind, Level, Plan, PlannedJob, PlannedStep, compile, config_errors, parse,
-    template, validate,
+    CheckoutStep, Diagnostic, JobKind, Level, Outcome, Plan, PlannedJob, PlannedStep, Ready,
+    Statuses, compile, config_errors, parse, ready, template, validate,
 };
 
 const CYCLE: &str = "
@@ -1310,4 +1312,496 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { hold: { type: approval, require
 ",
     );
     assert_eq!(plan.jobs[1].environment, None);
+}
+
+/// A, B after A, C after B, with C's statuses on B as given.
+fn chain(statuses: &str) -> Plan {
+    plan(&format!(
+        "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs:
+      - t: {{ name: a }}
+      - t: {{ name: b, requires: [a] }}
+      - t: {{ name: c, requires: [{{ b: {statuses} }}] }}
+"
+    ))
+}
+
+/// What `ready` says for the plan's last job, given how A and B ended.
+fn decide(plan: &Plan, a: Option<Outcome>, b: Option<Outcome>) -> Ready {
+    let ended: BTreeMap<&str, Outcome> = [("a", a), ("b", b)]
+        .into_iter()
+        .filter_map(|(id, o)| Some((id, o?)))
+        .collect();
+    ready(plan, plan.jobs.last().unwrap(), |id| ended.get(id).copied())
+}
+
+#[test]
+fn compile_carries_requires_statuses() {
+    let plan = chain("[failed, not_run]");
+    assert_eq!(
+        plan.jobs[2].statuses,
+        BTreeMap::from([("b".to_owned(), Statuses::FAILED.union(Statuses::NOT_RUN))])
+    );
+    assert_eq!(
+        plan.jobs[1].statuses,
+        BTreeMap::from([("a".to_owned(), Statuses::SUCCESS)])
+    );
+}
+
+#[test]
+fn ready_checks_statuses_over_every_ancestor() {
+    use Outcome::{Canceled, Failed, NotRun, Success};
+    // (statuses of C on B, how A ended, how B ended, what C does)
+    let table = [
+        ("success", Success, Success, Ready::Start),
+        ("success", Success, Failed, Ready::NotRun),
+        ("success", Failed, NotRun, Ready::NotRun),
+        // A failed and B did not run: B's ancestry failed.
+        ("failed", Failed, NotRun, Ready::Start),
+        ("failed", Success, Failed, Ready::Start),
+        ("failed", Success, Success, Ready::NotRun),
+        ("failed", Success, NotRun, Ready::NotRun),
+        ("failed", Canceled, NotRun, Ready::NotRun),
+        ("not_run", Success, NotRun, Ready::Start),
+        ("not_run", Failed, NotRun, Ready::NotRun),
+        ("canceled", Canceled, NotRun, Ready::Start),
+        ("canceled", Failed, Canceled, Ready::Start),
+        ("[success, failed, not_run]", Failed, NotRun, Ready::Start),
+        ("[success, failed, not_run]", Success, Success, Ready::Start),
+        (
+            "[success, failed, not_run]",
+            Success,
+            Canceled,
+            Ready::NotRun,
+        ),
+        (
+            "[success, failed, not_run]",
+            Canceled,
+            NotRun,
+            Ready::NotRun,
+        ),
+        ("terminal", Canceled, NotRun, Ready::Start),
+        ("terminal", Success, Failed, Ready::Start),
+    ];
+    for (statuses, a, b, want) in table {
+        let plan = chain(statuses);
+        assert_eq!(
+            decide(&plan, Some(a), Some(b)),
+            want,
+            "{statuses} after a={a:?} b={b:?}"
+        );
+    }
+}
+
+#[test]
+fn ready_waits_for_every_ancestor() {
+    let plan = chain("terminal");
+    assert_eq!(decide(&plan, None, None), Ready::Wait);
+    assert_eq!(decide(&plan, Some(Outcome::Success), None), Ready::Wait);
+    // B cannot end before A; if it did, C would still wait for A.
+    assert_eq!(decide(&plan, None, Some(Outcome::Failed)), Ready::Wait);
+    // A job that requires nothing starts at once.
+    assert_eq!(ready(&plan, &plan.jobs[0], |_| None), Ready::Start);
+}
+
+#[test]
+fn ready_reads_every_matrix_leg_and_each_entry_on_its_own() {
+    use Outcome::{Failed, Success};
+
+    let plan = plan(
+        "
+jobs: { t: { runs-on: ubuntu-latest, parameters: { v: { type: integer } }, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { name: m, matrix: { v: [1, 2] } }
+      - t: { name: other, v: 0 }
+      - t: { name: last, v: 0, requires: [{ m: failed }, other] }
+",
+    );
+    let last = plan.jobs.last().unwrap();
+    assert_eq!(last.requires, ["m (1)", "m (2)", "other"]);
+    let check = |legs: [Outcome; 3]| {
+        let ended: BTreeMap<&str, Outcome> =
+            ["m (1)", "m (2)", "other"].into_iter().zip(legs).collect();
+        ready(&plan, last, |id| ended.get(id).copied())
+    };
+    // One failed leg makes the entry failed.
+    assert_eq!(check([Success, Failed, Success]), Ready::Start);
+    assert_eq!(check([Success, Success, Success]), Ready::NotRun);
+    // `other` asks for success on its own.
+    assert_eq!(check([Failed, Failed, Failed]), Ready::NotRun);
+}
+
+#[test]
+fn an_entry_required_twice_meets_both_lists() {
+    let plan = plan(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { name: a }
+      - t: { name: b, requires: [{ a: [failed, success] }, { a: [failed, canceled] }] }
+",
+    );
+    assert_eq!(plan.jobs[1].requires, ["a"]);
+    assert_eq!(plan.jobs[1].statuses["a"], Statuses::FAILED);
+}
+
+#[test]
+fn exclude_leaves_out_matching_combinations() {
+    let yaml = "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t:
+          matrix:
+            os: [a, b]
+            n: [1, 2, 3]
+            exclude:
+              - { os: a, n: 2 }
+              - { n: 3 }
+      - t: { name: after, requires: [t] }
+";
+    let plan = plan(yaml);
+    let ids: Vec<_> = plan.jobs.iter().map(|j| j.id.as_str()).collect();
+    assert_eq!(ids, ["t (1, a)", "t (1, b)", "t (2, b)", "after"]);
+    assert_eq!(plan.jobs[3].requires, &ids[..3]);
+}
+
+/// A config whose one workflow runs `t` with `matrix`.
+fn with_matrix(matrix: &str) -> String {
+    format!(
+        "jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}\nworkflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ matrix: {matrix} }} }}] }} }}\n"
+    )
+}
+
+#[test]
+fn exclude_must_name_matrix_keys_and_leave_a_combination() {
+    assert_error(
+        &with_matrix("{ os: [a], exclude: [{ arch: x }] }"),
+        &["`t`", "`exclude` key `arch`", "not a key of the matrix"],
+    );
+    assert_error(
+        &with_matrix("{ os: [a], exclude: [{}] }"),
+        &["`t`", "empty matrix `exclude` entry"],
+    );
+    assert_error(
+        &with_matrix("{ os: [a, b], exclude: [{ os: a }, { os: b }] }"),
+        &["`t`", "leaves no combination"],
+    );
+    assert_error(
+        &with_matrix("{ os: [a], exclude: [{ os: '${{ parameters.x }}' }] }"),
+        &["`t`", "reads `parameters`"],
+    );
+    assert_eq!(
+        errors(&with_matrix("{ os: [a], exclude: [{ os: b }] }")),
+        Vec::new()
+    );
+    // An approval has no matrix, `exclude` included.
+    assert_error(
+        "workflows: { ci: { on: { push: {} }, jobs: [{ ok: { type: approval, matrix: { exclude: [{ a: 1 }] } } }] } }",
+        &["approval `ok`", "cannot have a matrix"],
+    );
+}
+
+#[test]
+fn the_matrix_limit_counts_after_exclude() {
+    let list = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+    let m = list(17);
+    // 17x17 is 289; leaving out `a: 0` and `a: 1` leaves 255.
+    assert_eq!(
+        plan(&with_matrix(&format!(
+            "{{ a: [{m}], b: [{m}], exclude: [{{ a: 0 }}, {{ a: 1 }}] }}"
+        )))
+        .jobs
+        .len(),
+        255
+    );
+    assert_error(
+        &with_matrix(&format!("{{ a: [{m}], b: [{m}], exclude: [{{ a: 0 }}] }}")),
+        &["`t`", "272 entries", "256"],
+    );
+    // Too many combinations to check, whatever `exclude` leaves.
+    let big = list(65);
+    assert_error(
+        &with_matrix(&format!(
+            "{{ a: [{big}], b: [{big}], exclude: [{{ a: 0 }}] }}"
+        )),
+        &["`t`", "4225 combinations before `exclude`", "4096"],
+    );
+    let many: Vec<String> = (0..257).map(|i| format!("{{ a: {i} }}")).collect();
+    assert_error(
+        &with_matrix(&format!("{{ a: [{m}], exclude: [{}] }}", many.join(", "))),
+        &["`t`", "257 matrix `exclude` entries", "256"],
+    );
+}
+
+#[test]
+fn exclude_round_trips() {
+    let config = parse(&with_matrix("{ os: [a, b], exclude: [{ os: a }] }")).unwrap();
+    let entry = &config.workflows["ci"].jobs[0];
+    assert_eq!(entry.matrix["os"].len(), 2);
+    assert_eq!(entry.matrix.exclude.len(), 1);
+    let yaml = hatchrun_workflow::to_yaml(&config);
+    assert!(yaml.contains("exclude"), "{yaml}");
+    assert_eq!(parse(&yaml).unwrap(), config);
+}
+
+const PER_LEG: &str = "
+jobs:
+  t:
+    runs-on: ${{ parameters.os }}
+    parameters: { os: { type: string } }
+    steps: [{ run: 'echo ${{ parameters.os }}' }]
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { matrix: { os: [ubuntu-latest, ubuntu-26.04-16core-arm] } }
+";
+
+#[test]
+fn runs_on_a_parameter_picks_each_legs_template() {
+    let plan = plan(PER_LEG);
+    let picked: Vec<_> = plan
+        .jobs
+        .iter()
+        .map(|j| match j.kind {
+            JobKind::Run { template } => (j.id.as_str(), template),
+            JobKind::Approval => panic!("{j:?}"),
+        })
+        .collect();
+    assert_eq!(
+        picked,
+        [
+            ("t (ubuntu-latest)", template("ubuntu-latest").unwrap()),
+            (
+                "t (ubuntu-26.04-16core-arm)",
+                template("ubuntu-26.04-16core-arm").unwrap()
+            ),
+        ]
+    );
+    assert_eq!(runs(&plan.jobs[1]), ["echo ubuntu-26.04-16core-arm"]);
+}
+
+#[test]
+fn runs_on_a_parameter_must_name_templates() {
+    assert_error(
+        &PER_LEG.replace("ubuntu-26.04-16core-arm]", "macos-latest]"),
+        &[
+            "job `t`",
+            "`runs-on: ${{ parameters.os }}`",
+            "`macos-latest` for `t (macos-latest)`",
+            "names no runner template",
+        ],
+    );
+    assert_error(
+        &PER_LEG.replace("parameters: { os: { type: string } }", "parameters: {}"),
+        &["job `t`", "declares no parameter `os`"],
+    );
+    assert_error(
+        &PER_LEG.replace("{ type: string }", "{ type: integer }"),
+        &["job `t`", "parameter `os`", "string or an enum"],
+    );
+    assert_error(
+        &PER_LEG.replace("{ type: string }", "{ type: string, default: macos-14 }"),
+        &["job `t` parameter `os`", "`runs-on: macos-14`"],
+    );
+    assert_error(
+        &PER_LEG.replace(
+            "{ type: string }",
+            "{ type: enum, enum: [ubuntu-latest, windows-latest] }",
+        ),
+        &["job `t` parameter `os`", "`runs-on: windows-latest`"],
+    );
+    // With a default, an entry without a matrix runs on it.
+    let yaml = PER_LEG
+        .replace(
+            "{ type: string }",
+            "{ type: string, default: ubuntu-26.04-arm }",
+        )
+        .replace(
+            "- t: { matrix: { os: [ubuntu-latest, ubuntu-26.04-16core-arm] } }",
+            "- t",
+        );
+    assert_eq!(
+        plan(&yaml).jobs[0].kind,
+        JobKind::Run {
+            template: template("ubuntu-26.04-arm").unwrap()
+        }
+    );
+}
+
+/// A config with workflow `ci` and workflow `deploy`, whose `on:` is
+/// `on`.
+fn chained(on: &str) -> String {
+    format!(
+        "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs: [t]
+  deploy:
+    on: {on}
+    jobs: [t]
+"
+    )
+}
+
+#[test]
+fn workflow_run_names_another_workflow_of_the_config() {
+    assert_eq!(
+        errors(&chained("{ workflow_run: { workflows: [ci] } }")),
+        []
+    );
+    assert_error(
+        &chained("{ workflow_run: { workflows: [ci, nosuch] } }"),
+        &[
+            "workflow `deploy`",
+            "`on.workflow_run` names workflow `nosuch`",
+            "not defined",
+        ],
+    );
+    assert_error(
+        &chained("{ workflow_run: { workflows: [deploy] } }"),
+        &["workflow `deploy`", "names the workflow itself"],
+    );
+    assert_error(
+        &chained("{ workflow_run: { workflows: [] } }"),
+        &["`on.workflow_run` names no workflow"],
+    );
+    assert_error(
+        &chained("{ workflow_run: { workflows: [ci], types: [requested] } }"),
+        &[
+            "`on.workflow_run` type `requested` is not supported",
+            "completed",
+        ],
+    );
+    assert_error(
+        &chained("{ workflow_run: { workflows: [ci], branches: [a], branches-ignore: [b] } }"),
+        &["`on.workflow_run` has both `branches` and `branches-ignore`"],
+    );
+}
+
+#[test]
+fn release_types_and_tags_are_checked() {
+    assert_eq!(
+        errors(&chained(
+            "{ release: { types: [published, created, released, prereleased] } }"
+        )),
+        []
+    );
+    assert_error(
+        &chained("{ release: { types: [published, edited] } }"),
+        &["`on.release` type `edited` is not supported"],
+    );
+    assert_error(
+        &chained("{ release: { types: [] } }"),
+        &["`on.release.types` is empty"],
+    );
+    assert_error(
+        &chained("{ release: { tags: [a], tags-ignore: [b] } }"),
+        &["`on.release` has both `tags` and `tags-ignore`"],
+    );
+}
+
+#[test]
+fn checkout_steps_are_planned_and_checked() {
+    let config = "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    parameters: { at: { type: string, default: v1 } }
+    steps:
+      - checkout
+      - checkout: { ref: \"${{ parameters.at }}\", fetch-depth: 0, path: \"src/${{ parameters.at }}\" }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [t]
+";
+    assert_eq!(errors(config), []);
+    let plan = plan(config);
+    let steps = &plan.jobs[0].steps;
+    assert_eq!(steps[0], PlannedStep::Checkout(CheckoutStep::default()));
+    assert_eq!(
+        steps[1],
+        PlannedStep::Checkout(CheckoutStep {
+            r#ref: Some("v1".into()),
+            fetch_depth: 0,
+            path: Some("src/v1".into()),
+            ..CheckoutStep::default()
+        })
+    );
+    for (step, words) in [
+        (
+            "{ checkout: { ref: \"${{ nosuch.x }}\" } }",
+            &["step 1 `checkout.ref`", "unknown context 'nosuch'"][..],
+        ),
+        (
+            "{ checkout: { path: /etc } }",
+            &[
+                "step 1 `checkout.path` is `/etc`",
+                "inside the working directory",
+            ],
+        ),
+        (
+            "{ checkout: { path: a/../../b } }",
+            &["`checkout.path`", "inside the working directory"],
+        ),
+    ] {
+        assert_error(
+            &one_job(&format!("    runs-on: ubuntu-latest\n    steps: [{step}]")),
+            words,
+        );
+    }
+}
+
+#[test]
+fn a_command_cannot_be_named_checkout() {
+    assert_error(
+        "commands: { checkout: { steps: [] } }",
+        &["command `checkout` has the name of a step key"],
+    );
+}
+
+#[test]
+fn the_hatchrun_context_is_known() {
+    let ok = one_job(
+        "    runs-on: ubuntu-latest\n    if: hatchrun.event_name == 'push'\n    steps: [{ run: \"echo ${{ hatchrun.ref_name }} ${{ hatchrun.sha }}\" }]",
+    );
+    assert_eq!(errors(&ok), []);
+}
+
+#[test]
+fn planned_jobs_stored_without_statuses_still_load() {
+    let yaml = "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { name: a }
+      - t: { name: b, requires: [a] }
+";
+    let mut job = plan(yaml).jobs.pop().unwrap();
+    let mut stored = serde_json::to_value(&job).unwrap();
+    // A graph saved before `statuses` existed has no such key; an empty
+    // map asks every required entry for success, as before.
+    stored.as_object_mut().unwrap().remove("statuses");
+    let loaded: PlannedJob = serde_json::from_value(stored).unwrap();
+    assert!(loaded.statuses.is_empty());
+    job.statuses.clear();
+    assert_eq!(loaded, job);
 }

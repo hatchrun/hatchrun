@@ -227,6 +227,7 @@ mod tests {
                 id: "build".into(),
                 name: "build".into(),
                 requires: Vec::new(),
+                statuses: std::collections::BTreeMap::new(),
                 kind: JobKind::Run {
                     template: template("ubuntu-latest").unwrap(),
                 },

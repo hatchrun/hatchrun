@@ -1,0 +1,13 @@
+{
+  "action": "completed",
+  "workflow_run": {
+    "name": "CI",
+    "head_branch": "main",
+    "head_sha": "7d2f9c1e4b6a8d0f3e5c7a9b1d3f5e7a9c1b3d5f",
+    "event": "push",
+    "status": "completed",
+    "conclusion": "success"
+  },
+  "repository": { "full_name": "acme/widgets", "name": "widgets", "owner": { "login": "acme" }, "default_branch": "main", "private": false },
+  "sender": { "login": "octocat" }
+}

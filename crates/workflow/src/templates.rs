@@ -139,6 +139,89 @@ pub fn dollars(micros: u64) -> String {
     format!("${}.{:02}", cents / 100, cents % 100)
 }
 
+/// Reads a third-party runner label as the template with its arch and at
+/// least its vCPUs: the smallest that fits, or the largest when none
+/// does. Returns the template and the vCPUs the label asks for.
+///
+/// Knows `blacksmith-<N>vcpu-ubuntu-<ver>[-arm]`,
+/// `buildjet-<N>vcpu-ubuntu-<ver>[-arm]`, `depot-ubuntu-<ver>[-arm][-<N>]`,
+/// `namespace-profile-<name>` (sized by a `<cpu>x<mem>` part, else two
+/// vCPUs), `ubicloud-standard-<N>[-arm]`,
+/// `warp-ubuntu-<ver>-<x64|arm64>-<N>x` and GitHub's one-vCPU
+/// `ubuntu-slim`.
+pub(crate) fn vendor_template(label: &str) -> Option<(&'static Template, u32)> {
+    let (arch, vcpu) = vendor_size(label)?;
+    if vcpu == 0 {
+        return None;
+    }
+    let fits = TEMPLATES
+        .iter()
+        .filter(|t| t.arch == arch && t.vcpu >= vcpu)
+        .min_by_key(|t| t.vcpu);
+    let template = fits.or_else(|| {
+        TEMPLATES
+            .iter()
+            .filter(|t| t.arch == arch)
+            .max_by_key(|t| t.vcpu)
+    })?;
+    Some((template, vcpu))
+}
+
+/// The arch and vCPUs a third-party label asks for.
+fn vendor_size(label: &str) -> Option<(Arch, u32)> {
+    let arch = |arm: bool| if arm { Arch::Arm64 } else { Arch::Amd64 };
+    if label == "ubuntu-slim" {
+        return Some((Arch::Amd64, 1));
+    }
+    for vendor in ["blacksmith-", "buildjet-"] {
+        if let Some(rest) = label.strip_prefix(vendor) {
+            let (vcpu, os) = rest.split_once("vcpu-ubuntu-")?;
+            let arm = os.strip_suffix("-arm").is_some();
+            return Some((arch(arm), vcpu.parse().ok()?));
+        }
+    }
+    if let Some(rest) = label.strip_prefix("depot-ubuntu-") {
+        let mut parts = rest.split('-').skip(1).peekable();
+        let arm = parts.next_if_eq(&"arm").is_some();
+        let vcpu = match parts.next() {
+            Some(n) => n.parse().ok()?,
+            None => 2,
+        };
+        return parts.next().is_none().then_some((arch(arm), vcpu));
+    }
+    if let Some(rest) = label.strip_prefix("namespace-profile-") {
+        let arm = rest.split('-').any(|p| p.starts_with("arm"));
+        let vcpu = rest
+            .split('-')
+            .find_map(|p| {
+                let (cpu, mem) = p.split_once('x')?;
+                mem.parse::<u32>().ok()?;
+                cpu.parse().ok()
+            })
+            .unwrap_or(2);
+        return Some((arch(arm), vcpu));
+    }
+    if let Some(rest) = label.strip_prefix("ubicloud-standard-") {
+        let (vcpu, arm) = match rest.split_once('-') {
+            Some((vcpu, "arm")) => (vcpu, true),
+            Some(_) => return None,
+            None => (rest, false),
+        };
+        return Some((arch(arm), vcpu.parse().ok()?));
+    }
+    if let Some(rest) = label.strip_prefix("warp-ubuntu-") {
+        let mut parts = rest.split('-').skip(1);
+        let arm = match parts.next()? {
+            "x64" => false,
+            "arm64" => true,
+            _ => return None,
+        };
+        let vcpu = parts.next()?.strip_suffix('x')?.parse().ok()?;
+        return parts.next().is_none().then_some((arch(arm), vcpu));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +298,49 @@ mod tests {
         }
     }
 
+    /// The first label of the template a vendor label maps to, and the
+    /// vCPUs it asks for.
+    fn vendor(label: &str) -> Option<(&'static str, u32)> {
+        vendor_template(label).map(|(t, vcpu)| (t.labels[0], vcpu))
+    }
+
+    #[test]
+    fn vendor_labels_round_up_to_a_template() {
+        for (label, want) in [
+            ("ubuntu-slim", ("ubuntu-latest", 1)),
+            ("blacksmith-4vcpu-ubuntu-2404", ("ubuntu-26.04-4core", 4)),
+            (
+                "blacksmith-8vcpu-ubuntu-2204-arm",
+                ("ubuntu-26.04-8core-arm", 8),
+            ),
+            ("blacksmith-6vcpu-ubuntu-2404", ("ubuntu-26.04-8core", 6)),
+            ("buildjet-2vcpu-ubuntu-2204", ("ubuntu-latest", 2)),
+            (
+                "buildjet-16vcpu-ubuntu-2204-arm",
+                ("ubuntu-26.04-16core-arm", 16),
+            ),
+            ("depot-ubuntu-24.04", ("ubuntu-latest", 2)),
+            ("depot-ubuntu-latest-arm", ("ubuntu-26.04-arm", 2)),
+            ("depot-ubuntu-22.04-4", ("ubuntu-26.04-4core", 4)),
+            ("depot-ubuntu-24.04-arm-16", ("ubuntu-26.04-16core-arm", 16)),
+            ("namespace-profile-linux-8x16", ("ubuntu-26.04-8core", 8)),
+            (
+                "namespace-profile-ci-4x8-ubuntu-24.04-arm64",
+                ("ubuntu-26.04-4core-arm", 4),
+            ),
+            ("namespace-profile-default", ("ubuntu-latest", 2)),
+            ("ubicloud-standard-2", ("ubuntu-latest", 2)),
+            ("ubicloud-standard-30-arm", ("ubuntu-26.04-16core-arm", 30)),
+            ("warp-ubuntu-latest-x64-4x", ("ubuntu-26.04-4core", 4)),
+            (
+                "warp-ubuntu-2404-arm64-32x",
+                ("ubuntu-26.04-16core-arm", 32),
+            ),
+        ] {
+            assert_eq!(vendor(label), Some(want), "{label}");
+        }
+    }
+
     #[test]
     fn units_are_two_vcpu_seconds() {
         assert_eq!(template("ubuntu-latest").unwrap().units(61), 61);
@@ -236,5 +362,22 @@ mod tests {
     fn dollars_has_cents() {
         assert_eq!(dollars(50_000_000), "$50.00");
         assert_eq!(dollars(200_000), "$0.20");
+    }
+
+    #[test]
+    fn unknown_vendor_labels() {
+        for label in [
+            "ubuntu-latest",
+            "macos-latest",
+            "blacksmith-ubuntu-2404",
+            "blacksmith-0vcpu-ubuntu-2404",
+            "depot-macos-latest",
+            "depot-ubuntu-24.04-x-4",
+            "ubicloud-standard-2-x",
+            "warp-ubuntu-latest-mips-4x",
+            "warp-macos-latest-arm64-6x",
+        ] {
+            assert_eq!(vendor(label), None, "{label}");
+        }
     }
 }

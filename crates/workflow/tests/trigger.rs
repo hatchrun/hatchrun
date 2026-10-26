@@ -285,3 +285,82 @@ fn ordinary_path_filters_decide_within_the_work_cap() {
         assert!(triggered(&on, &event(&changed)), "{n} patterns");
     }
 }
+
+fn run(workflow: &str, branch: &str) -> Event {
+    Event::WorkflowRun {
+        action: "completed".into(),
+        workflow: workflow.into(),
+        branch: branch.into(),
+    }
+}
+
+fn release(action: &str, tag: &str) -> Event {
+    Event::Release {
+        action: action.into(),
+        tag: tag.into(),
+    }
+}
+
+#[test]
+fn workflow_run_matches_the_named_workflow_and_branch() {
+    let t = on("workflow_run: { workflows: [ci, lint], branches: [main] }");
+    assert_eq!(t.workflow_run.as_ref().unwrap().types, ["completed"]);
+    assert!(triggered(&t, &run("ci", "main")));
+    assert!(triggered(&t, &run("lint", "main")));
+    assert!(!triggered(&t, &run("docs", "main")));
+    assert!(!triggered(&t, &run("ci", "feature/a")));
+    let requested = Event::WorkflowRun {
+        action: "requested".into(),
+        workflow: "ci".into(),
+        branch: "main".into(),
+    };
+    assert!(!triggered(&t, &requested));
+    let t = on("workflow_run: { workflows: ci, branches-ignore: ['feature/**'] }");
+    assert!(triggered(&t, &run("ci", "main")) && !triggered(&t, &run("ci", "feature/a")));
+    // Other events do not start it, and it does not start on them.
+    assert!(!triggered(&t, &Event::Dispatch));
+    assert!(!triggered(&on("push: {}"), &run("ci", "main")));
+}
+
+#[test]
+fn workflow_run_needs_its_workflows() {
+    assert!(serde_saphyr::from_str::<Triggers>("workflow_run: {}").is_err());
+    assert!(serde_saphyr::from_str::<Triggers>("workflow_run:").is_err());
+}
+
+#[test]
+fn release_matches_types_and_tags() {
+    let t = on("release:");
+    assert_eq!(t.release.as_ref().unwrap().types, ["published"]);
+    assert!(triggered(&t, &release("published", "v1.0.0")));
+    assert!(!triggered(&t, &release("created", "v1.0.0")));
+    let t = on("release: { types: [created, prereleased], tags: ['v*'] }");
+    assert!(triggered(&t, &release("created", "v1.0.0")));
+    assert!(triggered(&t, &release("prereleased", "v2.0.0-rc.1")));
+    assert!(!triggered(&t, &release("published", "v1.0.0")));
+    assert!(!triggered(&t, &release("created", "nightly")));
+    let t = on("release: { types: published, tags-ignore: ['*-rc*'] }");
+    assert!(triggered(&t, &release("published", "v1.0.0")));
+    assert!(!triggered(&t, &release("published", "v1.0.0-rc1")));
+    assert!(!triggered(
+        &on("push: { tags: ['v*'] }"),
+        &release("published", "v1")
+    ));
+}
+
+#[test]
+fn new_triggers_round_trip() {
+    for yaml in [
+        "workflow_run: { workflows: [ci], types: [completed], branches: [main] }",
+        "workflow_run: { workflows: [ci, lint], branches-ignore: [wip] }",
+        "release: { types: [published, released], tags: ['v*'] }",
+        "release:",
+    ] {
+        let t = on(yaml);
+        let written = serde_saphyr::to_string(&t).unwrap();
+        assert_eq!(on(&written), t, "{yaml}\n{written}");
+    }
+    // The default type is left out when written.
+    let written = serde_saphyr::to_string(&on("workflow_run: { workflows: [ci] }")).unwrap();
+    assert!(!written.contains("types"), "{written}");
+}

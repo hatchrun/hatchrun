@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{
-    CacheStep, Config, Job, Parameter, ParameterKind, RunStep, Step, UsesStep, Workflow,
-    WorkflowJob, WorkspaceStep,
+    CacheStep, CheckoutStep, Config, Job, Matrix, Outcome, Parameter, ParameterKind, RunStep,
+    Statuses, Step, UsesStep, Workflow, WorkflowJob, WorkspaceStep,
 };
 use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
@@ -26,7 +26,9 @@ use crate::environment::valid_environment_name;
 use crate::expr::{self, ExprError};
 use crate::permissions::{Level, token_scopes};
 use crate::templates::{Template, template, template_labels};
-use crate::trigger::{Filter, MAX_GLOBS, MAX_PATTERNS, Triggers};
+use crate::trigger::{
+    Filter, MAX_GLOBS, MAX_PATTERNS, RELEASE_TYPES, Triggers, WORKFLOW_RUN_TYPES,
+};
 
 /// The timeout of a job that sets none.
 pub const DEFAULT_TIMEOUT_MINUTES: u32 = 360;
@@ -36,6 +38,14 @@ const MAX_PARALLELISM: u32 = 64;
 
 /// The most entries one matrix can expand to.
 const MAX_MATRIX: usize = 256;
+
+/// The most combinations a matrix with `exclude` may have before the
+/// excluded ones are taken out. Each is checked against every `exclude`
+/// entry.
+pub(crate) const MAX_COMBINATIONS: usize = 4096;
+
+/// The most `exclude` entries one matrix may have.
+pub(crate) const MAX_EXCLUDE: usize = 256;
 
 /// The work one `compile` or `validate` call may do, in units. Every
 /// step and command call visited costs one, and so does every step
@@ -80,6 +90,7 @@ const STEP_KEYS: &[&str] = &[
     "shell",
     "run",
     "uses",
+    "checkout",
     "cache",
     "workspace",
     "test-results",
@@ -90,7 +101,7 @@ const STEP_KEYS: &[&str] = &[
 
 /// Keys of a workflow entry. A job parameter with one of these names
 /// could never be set from a workflow: the entry reads the key itself.
-const ENTRY_KEYS: &[&str] = &["name", "requires", "type", "branches", "tags", "matrix"];
+pub(crate) const ENTRY_KEYS: &[&str] = &["name", "requires", "type", "branches", "tags", "matrix"];
 
 /// The jobs one workflow runs for one ref.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -113,6 +124,12 @@ pub struct PlannedJob {
     pub name: String,
     /// Ids of the jobs that must finish first.
     pub requires: Vec<String>,
+    /// For each workflow entry required, by its id (the `name` of its
+    /// planned jobs), the end states its ancestry must reach for this
+    /// job to start. [`ready`] reads it; an entry left out asks for
+    /// [`Statuses::SUCCESS`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub statuses: BTreeMap<String, Statuses>,
     /// What the job does.
     pub kind: JobKind,
     /// This job's matrix entry, read as `${{ matrix.x }}` at run time.
@@ -171,6 +188,8 @@ pub enum PlannedStep {
     Run(RunStep),
     /// A GitHub action.
     Uses(UsesStep),
+    /// Check out the repository at the event's commit.
+    Checkout(CheckoutStep),
     /// Restore a cache now, save it when the job ends.
     Cache(CacheStep),
     /// Pass files to later jobs of the workflow.
@@ -184,12 +203,14 @@ pub enum PlannedStep {
 
 /// Compiles `workflow` for one event. `branches:` and `tags:` on
 /// workflow jobs are matched against `git_ref`; a job that does not
-/// match is dropped, and so is every job that requires it.
+/// match is dropped, and so is every job that requires it, whatever
+/// statuses it lists.
 ///
 /// `git_ref` is the pushed ref for a push (`refs/heads/main`,
 /// `refs/tags/v1`), the base branch for a pull request
-/// (`refs/heads/<base>`), and the default branch for a schedule or the
-/// dispatched ref for a manual run.
+/// (`refs/heads/<base>`), the default branch for a schedule or a
+/// finished workflow run, the release's tag (`refs/tags/<tag>`) for a
+/// release, and the dispatched ref for a manual run.
 ///
 /// # Errors
 ///
@@ -240,6 +261,79 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
         }
     }
     dedup(errors)
+}
+
+/// Whether a planned job can start, as [`ready`] decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ready {
+    /// A job it requires, or a job before that one, has not ended yet.
+    Wait,
+    /// Every required entry reached one of its statuses. The job's `if:`
+    /// decides next whether it runs.
+    Start,
+    /// A required entry ended in a state its statuses do not list. The
+    /// job does not run: it ends as [`Outcome::NotRun`].
+    NotRun,
+}
+
+/// Decides whether `job`, a job of `plan`, can start. `outcome` tells
+/// how a job of the plan ended, by id, or `None` while it has not.
+///
+/// The job waits until every job before it has ended. It then starts
+/// when, for each workflow entry it requires, the aggregate outcome of
+/// that entry's ancestry (all of the entry's planned jobs and every job
+/// before them) is one of the statuses `job.statuses` lists for the
+/// entry, or [`Statuses::SUCCESS`] when it lists none. [`Statuses`]
+/// describes how outcomes aggregate. A job that requires nothing starts
+/// at once. Ids the plan does not hold count only through `outcome`.
+pub fn ready<'a, F>(plan: &'a Plan, job: &'a PlannedJob, outcome: F) -> Ready
+where
+    F: Fn(&str) -> Option<Outcome>,
+{
+    let by_id: BTreeMap<&str, &PlannedJob> = plan.jobs.iter().map(|j| (j.id.as_str(), j)).collect();
+    let entry = |id: &'a str| -> &'a str { by_id.get(id).map_or(id, |j| j.name.as_str()) };
+    let mut entries: Vec<&str> = Vec::new();
+    for id in &job.requires {
+        let name = entry(id);
+        if !entries.contains(&name) {
+            entries.push(name);
+        }
+    }
+    let mut start = true;
+    for name in entries {
+        let roots = job.requires.iter().filter(|id| entry(id) == name);
+        let Some(state) = ancestry(roots, &by_id, &outcome) else {
+            return Ready::Wait;
+        };
+        let wanted = job.statuses.get(name).copied().unwrap_or_default();
+        start &= wanted.contains(state);
+    }
+    if start { Ready::Start } else { Ready::NotRun }
+}
+
+/// The aggregate outcome of `roots` and every job before them: the
+/// strongest of their outcomes. `None` while one of them has not ended.
+fn ancestry<'a, F>(
+    roots: impl Iterator<Item = &'a String>,
+    by_id: &BTreeMap<&str, &'a PlannedJob>,
+    outcome: &F,
+) -> Option<Outcome>
+where
+    F: Fn(&str) -> Option<Outcome>,
+{
+    let mut seen = BTreeSet::new();
+    let mut todo: Vec<&str> = roots.map(String::as_str).collect();
+    let mut strongest = Outcome::Success;
+    while let Some(id) = todo.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        strongest = strongest.max(outcome(id)?);
+        if let Some(job) = by_id.get(id) {
+            todo.extend(job.requires.iter().map(String::as_str));
+        }
+    }
+    Some(strongest)
 }
 
 /// Problems of the config as a whole (command names, filters, crons).
@@ -319,6 +413,22 @@ fn filter_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
                 pr.paths_ignore.as_ref(),
             );
         }
+        if let Some(run) = &wf.on.workflow_run {
+            check(&owner, "on.workflow_run.branches", run.branches.as_ref());
+            check(
+                &owner,
+                "on.workflow_run.branches-ignore",
+                run.branches_ignore.as_ref(),
+            );
+        }
+        if let Some(release) = &wf.on.release {
+            check(&owner, "on.release.tags", release.tags.as_ref());
+            check(
+                &owner,
+                "on.release.tags-ignore",
+                release.tags_ignore.as_ref(),
+            );
+        }
         for entry in &wf.jobs {
             let id = entry.name.as_deref().unwrap_or(&entry.job);
             let owner = format!("workflow `{name}` entry `{id}`");
@@ -352,7 +462,7 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
                 )));
             }
         }
-        resolve_template(config, &owner, job, errors);
+        resolve_runner(config, &owner, job, errors);
         let nodes = job.parallelism.unwrap_or(1);
         if !(1..=MAX_PARALLELISM).contains(&nodes) {
             errors.push(Diagnostic::new(format!(
@@ -405,14 +515,19 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
                     }
                 });
             }
-            for (key, values) in &entry.matrix {
-                for value in values {
-                    check.value(&format_args!("`{key}`"), value, &mut |c, field, text| {
-                        if c.text(field, text) {
-                            c.errors.push(no_parameters_here(id, key));
-                        }
-                    });
-                }
+            let excluded = entry.matrix.exclude.iter().flatten();
+            for (key, value) in entry
+                .matrix
+                .values
+                .iter()
+                .flat_map(|(key, values)| values.iter().map(move |v| (key, v)))
+                .chain(excluded)
+            {
+                check.value(&format_args!("`{key}`"), value, &mut |c, field, text| {
+                    if c.text(field, text) {
+                        c.errors.push(no_parameters_here(id, key));
+                    }
+                });
             }
         }
     }
@@ -484,6 +599,19 @@ impl Check<'_> {
                     self.env(i + 1, &uses.env);
                     if let Some(cond) = &uses.if_ {
                         self.cond(&at("if"), cond);
+                    }
+                }
+                Step::Checkout(checkout) => {
+                    self.opt(&at("checkout.ref"), checkout.r#ref.as_deref());
+                    if let Some(path) = &checkout.path {
+                        self.text(&at("checkout.path"), path);
+                        if path.starts_with('/') || path.split(['/', '\\']).any(|p| p == "..") {
+                            self.errors.push(Diagnostic::new(format!(
+                                "{} {} is `{path}`; it must stay inside the working directory",
+                                self.owner,
+                                at("checkout.path")
+                            )));
+                        }
                     }
                 }
                 Step::Cache(cache) => {
@@ -701,7 +829,7 @@ fn compile_workflow(
     errors: &mut Vec<Diagnostic>,
 ) -> Option<Plan> {
     let before = errors.len();
-    trigger_errors(name, &wf.on, errors);
+    trigger_errors(config, name, &wf.on, errors);
 
     let ids: Vec<String> = wf
         .jobs
@@ -720,20 +848,7 @@ fn compile_workflow(
         }
     }
 
-    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(ids.len());
-    for (entry, id) in wf.jobs.iter().zip(&ids) {
-        let mut own = Vec::new();
-        for req in &entry.requires {
-            match index.get(req.as_str()) {
-                Some(&d) if !own.contains(&d) => own.push(d),
-                Some(_) => {}
-                None => errors.push(Diagnostic::new(format!(
-                    "job `{id}` in workflow `{name}` requires `{req}`, which is not a job of the workflow"
-                ))),
-            }
-        }
-        deps.push(own);
-    }
+    let (deps, wanted) = dependencies(name, wf, &ids, &index, errors);
 
     let mut planned = 0;
     let expansions: Vec<Vec<PlannedJob>> = wf
@@ -774,6 +889,7 @@ fn compile_workflow(
         let requires_bytes: usize = deps[i]
             .iter()
             .flat_map(|&d| expanded_ids[d].iter().map(|id| id.len() + ENTRY_OVERHEAD))
+            .chain(deps[i].iter().map(|&d| ids[d].len() + ENTRY_OVERHEAD))
             .sum();
         // One list, then a clone of it per planned job.
         if !budget.charge_bytes(
@@ -787,8 +903,14 @@ fn compile_workflow(
             .iter()
             .flat_map(|&d| expanded_ids[d].iter().cloned())
             .collect();
+        let statuses: BTreeMap<String, Statuses> = deps[i]
+            .iter()
+            .zip(&wanted[i])
+            .map(|(&d, &s)| (ids[d].clone(), s))
+            .collect();
         for mut job in std::mem::take(&mut expansions[i]) {
             job.requires.clone_from(&requires);
+            job.statuses.clone_from(&statuses);
             jobs.push(job);
         }
     }
@@ -796,6 +918,42 @@ fn compile_workflow(
         workflow: name.to_owned(),
         jobs,
     })
+}
+
+/// The entries each entry requires, as indexes into `ids`, once each,
+/// and the statuses each must reach. An entry required twice must meet
+/// both lists. Reports a requires that names no entry.
+fn dependencies(
+    name: &str,
+    wf: &Workflow,
+    ids: &[String],
+    index: &BTreeMap<&str, usize>,
+    errors: &mut Vec<Diagnostic>,
+) -> (Vec<Vec<usize>>, Vec<Vec<Statuses>>) {
+    let mut deps = Vec::with_capacity(ids.len());
+    let mut wanted = Vec::with_capacity(ids.len());
+    for (entry, id) in wf.jobs.iter().zip(ids) {
+        let mut own: Vec<usize> = Vec::new();
+        let mut own_wanted: Vec<Statuses> = Vec::new();
+        for req in &entry.requires {
+            let Some(&d) = index.get(req.job.as_str()) else {
+                errors.push(Diagnostic::new(format!(
+                    "job `{id}` in workflow `{name}` requires `{}`, which is not a job of the workflow",
+                    req.job
+                )));
+                continue;
+            };
+            if let Some(at) = own.iter().position(|&o| o == d) {
+                own_wanted[at] = own_wanted[at].intersection(req.statuses);
+            } else {
+                own.push(d);
+                own_wanted.push(req.statuses);
+            }
+        }
+        deps.push(own);
+        wanted.push(own_wanted);
+    }
+    (deps, wanted)
 }
 
 /// The ids of each entry's planned jobs, charged before they are copied.
@@ -848,9 +1006,10 @@ fn id_collisions(
 }
 
 /// Reports a trigger that has both an include and an ignore filter of
-/// one kind, which GitHub rejects, and a manual input whose default does
-/// not fit its type.
-fn trigger_errors(name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
+/// one kind, which GitHub rejects, a manual input whose default does
+/// not fit its type, an activity type hatchrun does not run on, and a
+/// `workflow_run` that names no other workflow of the config.
+fn trigger_errors(config: &Config, name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
     if let Some(dispatch) = &on.workflow_dispatch {
         for (input, param) in &dispatch.inputs {
             let Some(default) = &param.default else {
@@ -903,6 +1062,67 @@ fn trigger_errors(name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
             pr.paths.as_ref(),
             pr.paths_ignore.as_ref(),
         );
+    }
+    if let Some(run) = &on.workflow_run {
+        both(
+            "workflow_run",
+            "branches",
+            run.branches.as_ref(),
+            run.branches_ignore.as_ref(),
+        );
+    }
+    if let Some(release) = &on.release {
+        both(
+            "release",
+            "tags",
+            release.tags.as_ref(),
+            release.tags_ignore.as_ref(),
+        );
+    }
+    if let Some(run) = &on.workflow_run {
+        types_errors(name, "workflow_run", &run.types, WORKFLOW_RUN_TYPES, errors);
+        if run.workflows.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "workflow `{name}`: `on.workflow_run` names no workflow"
+            )));
+        }
+        for other in &run.workflows {
+            if other == name {
+                errors.push(Diagnostic::new(format!(
+                    "workflow `{name}`: `on.workflow_run` names the workflow itself"
+                )));
+            } else if !config.workflows.contains_key(other) {
+                errors.push(Diagnostic::new(format!(
+                    "workflow `{name}`: `on.workflow_run` names workflow `{other}`, which is not defined in `workflows:`"
+                )));
+            }
+        }
+    }
+    if let Some(release) = &on.release {
+        types_errors(name, "release", &release.types, RELEASE_TYPES, errors);
+    }
+}
+
+/// Reports an empty `types` list and a type outside `known`.
+fn types_errors(
+    name: &str,
+    event: &str,
+    types: &[String],
+    known: &[&str],
+    errors: &mut Vec<Diagnostic>,
+) {
+    if types.is_empty() {
+        errors.push(Diagnostic::new(format!(
+            "workflow `{name}`: `on.{event}.types` is empty"
+        )));
+    }
+    for kind in types {
+        if !known.contains(&kind.as_str()) {
+            errors.push(Diagnostic::new(format!(
+                "workflow `{name}`: `on.{event}` type `{kind}` is not supported; use {}",
+                known.join(", ")
+            )));
+        }
     }
 }
 
@@ -998,7 +1218,7 @@ fn expand_entry(
     };
     let before = errors.len();
     let owner = format!("job `{}`", entry.job);
-    let template = resolve_template(config, &owner, job, errors);
+    let runner = resolve_runner(config, &owner, job, errors);
 
     let nodes = job.parallelism.unwrap_or(1);
     if !(1..=MAX_PARALLELISM).contains(&nodes) {
@@ -1006,26 +1226,29 @@ fn expand_entry(
             "{owner} has parallelism {nodes}; it must be 1 to {MAX_PARALLELISM}"
         )));
     }
-    let size = entry_value_errors(entry, id, errors);
+    let combinations = entry_value_errors(entry, id, errors);
     if errors.len() > before {
         return Vec::new();
     }
-    let Some(template) = template else {
+    let Some(runner) = runner else {
         return Vec::new();
     };
-    let copies = nodes as usize;
-    if !reserve_jobs(workflow, planned, size * copies, errors) {
-        return Vec::new();
-    }
-
     let mut walk = Walk {
         workflow,
         stack: Vec::new(),
         budget,
     };
+    let Some(kept) = kept_combinations(&entry.matrix, combinations, id, &mut walk, errors) else {
+        return Vec::new();
+    };
+    let copies = nodes as usize;
+    if !reserve_jobs(workflow, planned, kept.len() * copies, errors) {
+        return Vec::new();
+    }
+
     let mut out = Vec::new();
-    for index in 0..size {
-        let Some(combo) = combination(&entry.matrix, index, &mut walk, errors) else {
+    for index in kept {
+        let Some(combo) = combination(&entry.matrix.values, index, &mut walk, errors) else {
             break;
         };
         let Some(args) = entry_args(entry, job, &combo, &mut walk, errors) else {
@@ -1038,6 +1261,13 @@ fn expand_entry(
             continue;
         };
         drop(args);
+        let leg = (id, &combo);
+        let Some(template) = leg_template(&runner, &values, &owner, leg, &mut walk, errors) else {
+            if walk.budget.spent {
+                break;
+            }
+            continue;
+        };
         // Steps fail the same way for every combination; stop at the first.
         let Some(mut base) = expand_job(config, job, &owner, &values, &mut walk, errors) else {
             break;
@@ -1052,6 +1282,92 @@ fn expand_entry(
         out.extend(jobs);
     }
     out
+}
+
+/// The id of one matrix entry's job: the entry id, then `(<v1>, <v2>)`
+/// when there is a matrix.
+fn matrix_id(id: &str, combo: &BTreeMap<String, Value>) -> String {
+    if combo.is_empty() {
+        id.to_owned()
+    } else {
+        let shown: Vec<String> = combo.values().map(render).collect();
+        format!("{id} ({})", shown.join(", "))
+    }
+}
+
+/// The indexes of the combinations `exclude` leaves in, out of
+/// `combinations`. Each combination checked costs one unit, and the
+/// list is charged before it is made. `None` after reporting a matrix
+/// left over `MAX_MATRIX` or with nothing, or a spent budget.
+fn kept_combinations(
+    matrix: &Matrix,
+    combinations: usize,
+    id: &str,
+    walk: &mut Walk<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<Vec<usize>> {
+    if !matrix.exclude.is_empty() && !walk.budget.charge(combinations, walk.workflow, errors) {
+        return None;
+    }
+    let kept: Vec<usize> = (0..combinations)
+        .filter(|&i| !excluded(matrix, i))
+        .collect();
+    if !walk.bytes(kept.len() * size_of::<usize>(), errors) {
+        return None;
+    }
+    if kept.is_empty() {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has a matrix whose `exclude` leaves no combination"
+        )));
+        return None;
+    }
+    if kept.len() > MAX_MATRIX {
+        errors.push(too_big_matrix(id, kept.len()));
+        return None;
+    }
+    Some(kept)
+}
+
+/// Whether the combination at `index` matches every key of one
+/// `exclude` entry.
+pub(crate) fn excluded(matrix: &Matrix, index: usize) -> bool {
+    if matrix.exclude.is_empty() {
+        return false;
+    }
+    let mut picked: Vec<(&str, &Value)> = Vec::with_capacity(matrix.values.len());
+    let mut rest = index;
+    for (key, values) in matrix.values.iter().rev() {
+        picked.push((key, &values[rest % values.len()]));
+        rest /= values.len();
+    }
+    matrix.exclude.iter().any(|entry| {
+        entry.iter().all(|(key, want)| {
+            picked
+                .iter()
+                .any(|(k, value)| *k == key.as_str() && *value == want)
+        })
+    })
+}
+
+/// The number of combinations a matrix runs: every combination of its
+/// values without those `exclude` leaves out. When there are more than
+/// `MAX_COMBINATIONS` to check, all of them, which is over the limit
+/// either way.
+fn matrix_size(matrix: &Matrix) -> usize {
+    let all = matrix
+        .values
+        .values()
+        .fold(1usize, |n, values| n.saturating_mul(values.len()));
+    if matrix.exclude.is_empty() || all > MAX_COMBINATIONS {
+        return all;
+    }
+    (0..all).filter(|&i| !excluded(matrix, i)).count()
+}
+
+fn too_big_matrix(id: &str, size: usize) -> Diagnostic {
+    Diagnostic::new(format!(
+        "`{id}` has a matrix of {size} entries; the limit is {MAX_MATRIX}"
+    ))
 }
 
 /// The matrix entry at `index`, charged before it is made. The first key
@@ -1139,12 +1455,7 @@ fn copy_job(
     {
         return None;
     }
-    let matrix_id = if combo.is_empty() {
-        id.to_owned()
-    } else {
-        let shown: Vec<String> = combo.values().map(render).collect();
-        format!("{id} ({})", shown.join(", "))
-    };
+    let matrix_id = matrix_id(id, &combo);
     let mut base = Some(base);
     let mut combo = Some(combo);
     let mut out = Vec::with_capacity(copies);
@@ -1181,10 +1492,7 @@ pub(crate) fn planned_jobs(config: &Config, wf: &Workflow) -> usize {
     wf.jobs
         .iter()
         .map(|entry| {
-            let size = entry
-                .matrix
-                .values()
-                .fold(1usize, |n, values| n.saturating_mul(values.len()));
+            let size = matrix_size(&entry.matrix);
             let nodes = config
                 .jobs
                 .get(&entry.job)
@@ -1227,15 +1535,42 @@ fn reserve_jobs(
 
 /// Checks the values a workflow entry sets: none may read `parameters`,
 /// and the matrix must have values, list none twice, not repeat a `with`
-/// key and stay within `MAX_MATRIX` entries. Returns the matrix size.
+/// key and stay within `MAX_MATRIX` entries. Each `exclude` entry must
+/// name only matrix keys, and with `exclude` there may be at most
+/// `MAX_COMBINATIONS` combinations to check. Returns the number of
+/// combinations before `exclude`.
 fn entry_value_errors(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> usize {
     for (key, value) in &entry.with {
         if reads_parameters(value) {
             errors.push(no_parameters_here(id, key));
         }
     }
+    let matrix = &entry.matrix;
+    if matrix.exclude.len() > MAX_EXCLUDE {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has {} matrix `exclude` entries; the limit is {MAX_EXCLUDE}",
+            matrix.exclude.len()
+        )));
+    }
+    for exclude in &matrix.exclude {
+        if exclude.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has an empty matrix `exclude` entry, which would leave out every combination"
+            )));
+        }
+        for (key, value) in exclude {
+            if !matrix.values.contains_key(key) {
+                errors.push(Diagnostic::new(format!(
+                    "`{id}` has matrix `exclude` key `{key}`, which is not a key of the matrix"
+                )));
+            }
+            if reads_parameters(value) {
+                errors.push(no_parameters_here(id, key));
+            }
+        }
+    }
     let mut size: usize = 1;
-    for (key, values) in &entry.matrix {
+    for (key, values) in &matrix.values {
         if values.is_empty() {
             errors.push(Diagnostic::new(format!(
                 "`{id}` has matrix key `{key}` with no values"
@@ -1260,9 +1595,13 @@ fn entry_value_errors(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic
             }
         }
     }
-    if size > MAX_MATRIX {
+    if matrix.exclude.is_empty() {
+        if size > MAX_MATRIX {
+            errors.push(too_big_matrix(id, size));
+        }
+    } else if size > MAX_COMBINATIONS {
         errors.push(Diagnostic::new(format!(
-            "`{id}` has a matrix of {size} entries; the limit is {MAX_MATRIX}"
+            "`{id}` has a matrix of {size} combinations before `exclude`; the limit is {MAX_COMBINATIONS}"
         )));
     }
     size
@@ -1294,6 +1633,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         id: id.to_owned(),
         name: id.to_owned(),
         requires: Vec::new(),
+        statuses: BTreeMap::new(),
         kind: JobKind::Approval,
         matrix: BTreeMap::new(),
         node: None,
@@ -1307,7 +1647,91 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
     }]
 }
 
-/// Finds the template a job runs on.
+/// What a job runs on: one template, or the template a parameter names,
+/// which can differ for each matrix entry.
+enum Runner<'j> {
+    /// Every planned job of the entry runs on this template.
+    Fixed(&'static Template),
+    /// `runs-on: ${{ parameters.NAME }}`: each planned job runs on the
+    /// template its value of `NAME` names.
+    Parameter(&'j str),
+}
+
+/// Finds what a job runs on. A `runs-on` that is one whole
+/// `${{ parameters.NAME }}` must name a declared string or enum
+/// parameter, and its default and enum values must name templates; the
+/// value each planned job gets is checked when it is planned.
+fn resolve_runner<'j>(
+    config: &Config,
+    owner: &str,
+    job: &'j Job,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<Runner<'j>> {
+    let Some(name) = job.runs_on.as_deref().and_then(sole_parameter) else {
+        return resolve_template(config, owner, job, errors).map(Runner::Fixed);
+    };
+    if job.executor.is_some() {
+        return resolve_template(config, owner, job, errors).map(Runner::Fixed);
+    }
+    let Some(param) = job.parameters.get(name) else {
+        errors.push(Diagnostic::new(format!(
+            "{owner} has `runs-on: ${{{{ parameters.{name} }}}}` but declares no parameter `{name}`"
+        )));
+        return None;
+    };
+    let before = errors.len();
+    let mut labels: Vec<&str> = Vec::new();
+    match &param.kind {
+        ParameterKind::String => {}
+        ParameterKind::Enum(options) => labels.extend(options.iter().map(String::as_str)),
+        _ => errors.push(Diagnostic::new(format!(
+            "{owner} runs on parameter `{name}`, which must be a string or an enum"
+        ))),
+    }
+    labels.extend(param.default.as_ref().and_then(Value::as_str));
+    for label in labels {
+        if template(label).is_none() {
+            errors.push(unknown_template(
+                &format!("{owner} parameter `{name}`"),
+                label,
+            ));
+        }
+    }
+    (errors.len() == before).then_some(Runner::Parameter(name))
+}
+
+/// The template the planned job of one matrix entry runs on, given the
+/// entry id and the combination, or `None` after reporting a parameter
+/// value that names none.
+fn leg_template(
+    runner: &Runner<'_>,
+    values: &BTreeMap<String, Value>,
+    owner: &str,
+    (id, combo): (&str, &BTreeMap<String, Value>),
+    walk: &mut Walk<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<&'static Template> {
+    let name = match runner {
+        Runner::Fixed(template) => return Some(template),
+        Runner::Parameter(name) => *name,
+    };
+    let found = values.get(name).and_then(Value::as_str).and_then(template);
+    if found.is_none() {
+        let value = values.get(name).map_or_else(String::new, render);
+        walk.report(
+            format!(
+                "{owner} has `runs-on: ${{{{ parameters.{name} }}}}`, which is `{value}` for `{}` and names no runner template; use one of {}",
+                matrix_id(id, combo),
+                template_labels().join(", ")
+            ),
+            errors,
+        );
+    }
+    found
+}
+
+/// Finds the template of a job that names one, through `executor` or a
+/// `runs-on` label.
 fn resolve_template(
     config: &Config,
     owner: &str,
@@ -1401,6 +1825,7 @@ fn expand_job(
         id: String::new(),
         name: String::new(),
         requires: Vec::new(),
+        statuses: BTreeMap::new(),
         kind: JobKind::Approval,
         matrix: BTreeMap::new(),
         node: None,
@@ -1696,6 +2121,13 @@ fn plan_step(
             }
             PlannedStep::Uses(planned)
         }
+        Step::Checkout(checkout) => PlannedStep::Checkout(CheckoutStep {
+            r#ref: sub.opt(checkout.r#ref.as_deref()),
+            fetch_depth: checkout.fetch_depth,
+            submodules: checkout.submodules,
+            lfs: checkout.lfs,
+            path: sub.opt(checkout.path.as_deref()),
+        }),
         Step::Cache(cache) => PlannedStep::Cache(CacheStep {
             key: sub.text(&cache.key),
             restore_keys: sub.list(&cache.restore_keys),
@@ -2050,6 +2482,7 @@ fn step_bytes(step: &PlannedStep) -> usize {
                     + map_bytes(&u.env)
                     + opt(&u.if_)
             }
+            PlannedStep::Checkout(c) => opt(&c.r#ref) + opt(&c.path),
             PlannedStep::Cache(c) => {
                 c.key.len() + list_bytes(&c.restore_keys) + list_bytes(&c.paths)
             }

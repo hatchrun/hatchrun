@@ -4,7 +4,10 @@
 
 //! Parsing `.hatchrun/config.yml`.
 
-use hatchrun_workflow::{MAX_SOURCE, ParameterKind, Step, WorkspaceStep, parse};
+use hatchrun_workflow::{
+    CheckoutStep, MAX_SOURCE, Outcome, ParameterKind, Require, Statuses, Step, Submodules,
+    WorkspaceStep, parse, to_yaml,
+};
 
 #[test]
 fn parses_the_spec_example() {
@@ -13,8 +16,8 @@ fn parses_the_spec_example() {
     assert_eq!(config.jobs["test"].parallelism, Some(4));
     assert!(matches!(&config.jobs["test"].steps[0], Step::Command { name, .. } if name == "setup"));
     let ci = &config.workflows["ci"].jobs;
-    assert!(ci[1].approval && ci[1].requires == ["test"]);
-    assert_eq!(ci[2].requires, ["hold"]);
+    assert!(ci[1].approval && ci[1].requires == [Require::new("test")]);
+    assert_eq!(ci[2].requires, [Require::new("hold")]);
 }
 
 #[test]
@@ -236,4 +239,139 @@ workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
     let yaml = hatchrun_workflow::to_yaml(&config);
     assert!(yaml.contains("environment: production"), "{yaml}");
     assert_eq!(parse(&yaml).unwrap(), config);
+}
+
+#[test]
+fn requires_entries_carry_statuses() {
+    let config = parse(
+        "jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { name: build }
+      - t: { name: test, requires: [build] }
+      - t: { name: lint, requires: [build] }
+      - t:
+          name: report
+          requires: [build, { test: [failed, not_run] }, { lint: terminal }, { x: failed }, { w: [success] }, { z: [canceled, terminal] }]
+",
+    )
+    .unwrap();
+    let requires = &config.workflows["ci"].jobs[3].requires;
+    let statuses: Vec<(&str, Statuses)> = requires
+        .iter()
+        .map(|r| (r.job.as_str(), r.statuses))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            ("build", Statuses::SUCCESS),
+            ("test", Statuses::FAILED.union(Statuses::NOT_RUN)),
+            ("lint", Statuses::TERMINAL),
+            ("x", Statuses::FAILED),
+            ("w", Statuses::SUCCESS),
+            ("z", Statuses::TERMINAL),
+        ]
+    );
+    assert!(Statuses::TERMINAL.outcomes().eq(Outcome::ALL));
+
+    // Written back in the shortest form, and read back the same.
+    let yaml = to_yaml(&config);
+    for form in [
+        "- build\n",
+        "- test:\n",
+        "- not_run\n",
+        "- failed\n",
+        "- lint: terminal\n",
+        "- x: failed\n",
+        "- w\n",
+        "- z: terminal\n",
+    ] {
+        assert!(yaml.contains(form), "{form:?} in\n{yaml}");
+    }
+    assert_eq!(parse(&yaml).unwrap(), config);
+}
+
+#[test]
+fn rejects_bad_requires_statuses() {
+    for (entry, word) in [
+        ("{ build: failure }", "unknown status `failure`"),
+        ("{ build: [] }", "lists no statuses"),
+        ("{ build: failed, test: failed }", "one key"),
+        ("{ build: { a: b } }", "a status"),
+    ] {
+        let yaml = format!(
+            "workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ t: {{ requires: [{entry}] }} }}] }} }}"
+        );
+        let err = parse(&yaml).unwrap_err();
+        assert!(err[0].message.contains(word), "{entry}: {err:?}");
+    }
+}
+
+fn steps(yaml_steps: &str) -> Vec<Step> {
+    let config = parse(&format!(
+        "jobs: {{ t: {{ runs-on: ubuntu-latest, steps: {yaml_steps} }} }}"
+    ))
+    .unwrap();
+    config.jobs["t"].steps.clone()
+}
+
+#[test]
+fn parses_checkout_steps() {
+    let parsed = steps("[checkout, { checkout: }, { checkout: {} }]");
+    for step in &parsed {
+        assert_eq!(*step, Step::Checkout(CheckoutStep::default()));
+    }
+    assert_eq!(CheckoutStep::default().fetch_depth, 1);
+    let parsed = steps(
+        "[{ checkout: { ref: \"${{ github.head_ref }}\", fetch-depth: 0, submodules: recursive, lfs: true, path: src } }]",
+    );
+    assert_eq!(
+        parsed[0],
+        Step::Checkout(CheckoutStep {
+            r#ref: Some("${{ github.head_ref }}".into()),
+            fetch_depth: 0,
+            submodules: Submodules::Recursive,
+            lfs: true,
+            path: Some("src".into()),
+        })
+    );
+    for (yaml, want) in [
+        ("true", Submodules::Top),
+        ("false", Submodules::None),
+        ("recursive", Submodules::Recursive),
+    ] {
+        let parsed = steps(&format!("[{{ checkout: {{ submodules: {yaml} }} }}]"));
+        let Step::Checkout(c) = &parsed[0] else {
+            panic!("{parsed:?}")
+        };
+        assert_eq!(c.submodules, want);
+    }
+}
+
+#[test]
+fn rejects_bad_checkout_steps() {
+    for (yaml, word) in [
+        ("[{ checkout: { submodules: deep } }]", "recursive"),
+        ("[{ checkout: { token: x } }]", "token"),
+        ("[{ checkout: {}, name: Checkout }]", "no other keys"),
+        ("[{ checkout: { fetch-depth: -1 } }]", ""),
+    ] {
+        let err = parse(&format!(
+            "jobs: {{ t: {{ runs-on: ubuntu-latest, steps: {yaml} }} }}"
+        ))
+        .unwrap_err();
+        assert!(err[0].message.contains(word), "{yaml}: {err:?}");
+    }
+}
+
+#[test]
+fn checkout_steps_round_trip() {
+    let source = "jobs: { t: { runs-on: ubuntu-latest, steps: [checkout, { checkout: { fetch-depth: 0, submodules: true, lfs: true, path: a, ref: main } }] } }";
+    let config = parse(source).unwrap();
+    let written = to_yaml(&config);
+    assert_eq!(parse(&written).unwrap(), config, "{written}");
+    // A checkout with no options is written as the bare name.
+    assert!(written.contains("- checkout\n"), "{written}");
 }
