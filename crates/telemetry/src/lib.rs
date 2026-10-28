@@ -62,8 +62,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: worker::Context) -> Result<Resp
         .headers()
         .get("Content-Length")?
         .and_then(|length| length.parse::<usize>().ok());
-    if declared.is_some_and(|length| length > MAX_BODY) {
-        return error("body too large", 413);
+    // A body without a declared length would be read whole before any
+    // size check.
+    match declared {
+        None => return error("content-length required", 411),
+        Some(length) if length > MAX_BODY => return error("body too large", 413),
+        Some(_) => {}
     }
     let report = match Report::parse(&req.bytes().await?, now) {
         Ok(report) => report,

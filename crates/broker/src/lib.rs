@@ -49,6 +49,19 @@ async fn fetch(mut req: Request, env: Env, _ctx: worker::Context) -> Result<Resp
             if !protocol::authorized(req.headers().get("Authorization")?.as_deref(), &token) {
                 return error("unauthorized", 401);
             }
+            // A body without a declared length would be read whole before
+            // any size check.
+            match req
+                .headers()
+                .get("Content-Length")?
+                .and_then(|length| length.parse::<usize>().ok())
+            {
+                None => return error("content-length required", 411),
+                Some(length) if length > protocol::MAX_BODY => {
+                    return error("body too large", 413);
+                }
+                Some(_) => {}
+            }
             (ticket, "store", Some(req.bytes().await?))
         }
         Route::Claim(ticket) => (ticket, "claim", None),

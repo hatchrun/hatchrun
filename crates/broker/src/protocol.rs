@@ -13,6 +13,8 @@ use subtle::ConstantTimeEq;
 pub const TICKET_LEN: usize = 43;
 /// Largest config the broker keeps. JIT configs are a few kilobytes.
 pub const MAX_CONFIG: usize = 64 * 1024;
+/// Largest request body: the config plus its JSON envelope.
+pub const MAX_BODY: usize = MAX_CONFIG + 1024;
 /// How long a config waits for its instance when the scaler does not say.
 pub const DEFAULT_TTL: u64 = 15 * 60;
 /// Shortest and longest wait the scaler may ask for, in seconds.
@@ -101,7 +103,7 @@ impl StoreRequest {
     ///
     /// A message for the scaler when the body is not acceptable.
     pub fn parse(body: &[u8], now_ms: u64) -> Result<Record, String> {
-        if body.len() > MAX_CONFIG + 1024 {
+        if body.len() > MAX_BODY {
             return Err("body too large".into());
         }
         let request: Self =
