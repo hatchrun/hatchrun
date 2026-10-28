@@ -678,7 +678,7 @@ impl Job<'_> {
             )
             .await;
         // The script may hold secrets. Nothing needs it after the run.
-        let _ = std::fs::remove_file(&prepared.script);
+        remove_script(&prepared.script);
         (common, ran.outcome, ran.outputs)
     }
 
@@ -943,9 +943,19 @@ fn write_script(
             None => Ok(()),
         });
     if written.is_err() {
-        let _ = std::fs::remove_file(path);
+        remove_script(path);
     }
     written
+}
+
+/// Removes a script file. It may hold expanded secrets, so a failure is
+/// logged. A file that is already gone is fine.
+fn remove_script(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("remove {}: {err}", path.display());
+    }
 }
 
 /// `GITHUB_ACTION` of a `run:` step: its id, else a generated name.

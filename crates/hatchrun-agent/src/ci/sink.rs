@@ -108,7 +108,9 @@ impl Buffer {
             if !events.is_empty() && size + next > MAX_BATCH_BYTES {
                 break;
             }
-            let (event, next) = self.queue.pop_front().expect("front exists");
+            let Some((event, next)) = self.queue.pop_front() else {
+                break;
+            };
             size += next;
             freed += next;
             events.push(event);
@@ -306,7 +308,10 @@ impl Task {
                 freed,
             ));
         }
-        let (batch, freed) = self.inflight.as_ref().expect("a batch is in flight");
+        // Set above when it was empty.
+        let Some((batch, freed)) = self.inflight.as_ref() else {
+            return Flush::Idle;
+        };
         match self.client.events(batch).await {
             Ok(reply) => {
                 let freed = *freed;

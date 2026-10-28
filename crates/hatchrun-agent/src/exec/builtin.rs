@@ -286,6 +286,7 @@ impl Fs {
         let _cleanup = RemoveDir {
             stage: self.stage_fd.clone(),
             name: name.clone(),
+            background: false,
         };
         let held = open_dir(&*self.stage_fd, &name)
             .map_err(|e| format!("open the restore directory: {e}"))?;
@@ -334,25 +335,45 @@ impl Fs {
 pub(super) struct RemoveDir {
     pub(super) stage: Arc<OwnedFd>,
     pub(super) name: String,
+    /// Set by async callers: a drop then hands the removal to a blocking
+    /// thread instead of sleeping on the calling one.
+    pub(super) background: bool,
 }
 
 impl Drop for RemoveDir {
     fn drop(&mut self) {
-        for _ in 0..40 {
-            remove_tree(&self.stage, OsStr::new(&self.name));
-            let gone = matches!(
-                fstatat(
-                    &*self.stage,
-                    self.name.as_str(),
-                    AtFlags::AT_SYMLINK_NOFOLLOW
-                ),
-                Err(Errno::ENOENT)
-            );
-            if gone {
+        if self.background
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            // Dropped on an async worker. The first pass runs here, so the
+            // entry is usually gone when the drop returns; only the retry
+            // sleeps move to a blocking thread, off the runtime.
+            if remove_dir_once(&self.stage, &self.name) {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            let (stage, name) = (Arc::clone(&self.stage), std::mem::take(&mut self.name));
+            drop(handle.spawn_blocking(move || remove_dir_repeatedly(&stage, &name)));
+            return;
         }
+        remove_dir_repeatedly(&self.stage, &self.name);
+    }
+}
+
+/// Removes the entry `name` and says whether it is gone.
+fn remove_dir_once(stage: &OwnedFd, name: &str) -> bool {
+    remove_tree(stage, OsStr::new(name));
+    matches!(
+        fstatat(stage, name, AtFlags::AT_SYMLINK_NOFOLLOW),
+        Err(Errno::ENOENT)
+    )
+}
+
+fn remove_dir_repeatedly(stage: &OwnedFd, name: &str) {
+    for _ in 0..40 {
+        if remove_dir_once(stage, name) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 

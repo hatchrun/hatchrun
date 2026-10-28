@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -164,9 +164,15 @@ struct UploadState {
     failed: bool,
 }
 
+/// Locks `m`, taking the data back from a poisoned lock. One panicking
+/// request must not make every later request panic.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl Upload {
-    fn lock(&self) -> std::sync::MutexGuard<'_, UploadState> {
-        self.state.lock().expect("upload lock")
+    fn lock(&self) -> MutexGuard<'_, UploadState> {
+        lock(&self.state)
     }
 }
 
@@ -243,15 +249,7 @@ impl Proxy {
     /// finalized.
     pub async fn stop(self) {
         self.server.abort();
-        let ids: Vec<String> = self
-            .state
-            .uploads
-            .lock()
-            .expect("uploads lock")
-            .by_id
-            .keys()
-            .cloned()
-            .collect();
+        let ids: Vec<String> = lock(&self.state.uploads).by_id.keys().cloned().collect();
         for id in ids {
             match tokio::time::timeout(Duration::from_secs(3), self.state.cloud.abort(&id)).await {
                 Ok(Ok(())) => debug!(upload = id, "abandoned unfinished cache upload"),
@@ -433,7 +431,7 @@ async fn lookup(state: &State, request: twirp::LookupRequest) -> Reply {
             match download_token() {
                 Ok(token) => {
                     let url = format!("{}{DOWNLOAD_PATH}{token}", state.base);
-                    state.downloads.lock().expect("downloads lock").insert(
+                    lock(&state.downloads).insert(
                         token,
                         Download {
                             url: hit.url,
@@ -488,7 +486,7 @@ async fn create(state: &State, request: twirp::CreateRequest) -> Reply {
         }
     };
     let url = format!("{}{UPLOAD_PATH}{id}", state.base);
-    let mut uploads = state.uploads.lock().expect("uploads lock");
+    let mut uploads = lock(&state.uploads);
     if let Some(old) = uploads
         .by_entry
         .insert((request.key.clone(), request.version.clone()), id.clone())
@@ -513,7 +511,7 @@ async fn create(state: &State, request: twirp::CreateRequest) -> Reply {
 async fn finalize(state: &State, request: twirp::FinalizeRequest) -> Reply {
     let entry = (request.key.clone(), request.version.clone());
     let upload = {
-        let mut uploads = state.uploads.lock().expect("uploads lock");
+        let mut uploads = lock(&state.uploads);
         uploads
             .by_entry
             .remove(&entry)
@@ -574,10 +572,7 @@ async fn abandon(state: &State, id: &str) {
 
 /// The presigned GET and size of the entry behind a download token.
 fn entry(state: &State, token: &str) -> Option<(String, u64)> {
-    state
-        .downloads
-        .lock()
-        .expect("downloads lock")
+    lock(&state.downloads)
         .get(token)
         .map(|download| (download.url.clone(), download.size))
 }
@@ -648,13 +643,7 @@ fn head(state: &State, token: &str) -> Reply {
 }
 
 async fn put(state: &State, id: &str, req: Request<Incoming>) -> Reply {
-    let upload = state
-        .uploads
-        .lock()
-        .expect("uploads lock")
-        .by_id
-        .get(id)
-        .cloned();
+    let upload = lock(&state.uploads).by_id.get(id).cloned();
     let Some(upload) = upload else {
         return azure_error(
             state,

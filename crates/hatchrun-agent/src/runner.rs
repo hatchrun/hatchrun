@@ -10,7 +10,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -70,7 +70,11 @@ impl Runner {
             .env_clear()
             .envs(self.environment(&extra)?)
             .env("ACTIONS_RUNNER_INPUT_JITCONFIG", jit_config)
-            .stdin(Stdio::null());
+            .stdin(Stdio::null())
+            // Own process group, so a runner that ignores SIGTERM is
+            // killed together with the listener and the jobs under it.
+            .process_group(0)
+            .kill_on_drop(true);
         if let Some(user) = &self.user {
             run_as(&mut command, user)?;
         }
@@ -82,8 +86,11 @@ impl Runner {
             status = child.wait() => status.context("wait for runner"),
             () = shutdown => {
                 info!("stopping runner");
-                if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok())
-                    && let Err(err) = kill(Pid::from_raw(pid), Signal::SIGTERM)
+                // SIGTERM goes to run.sh alone, as the runner's own service
+                // unit does, so the listener can cancel the job cleanly.
+                let group = child.id().and_then(|id| i32::try_from(id).ok()).map(Pid::from_raw);
+                if let Some(pid) = group
+                    && let Err(err) = kill(pid, Signal::SIGTERM)
                 {
                     warn!("signal runner: {err}");
                 }
@@ -91,6 +98,10 @@ impl Runner {
                     return status.context("wait for runner");
                 }
                 warn!("runner did not exit after {:?}, killing it", self.stop_timeout);
+                if let Some(pid) = group {
+                    // Whatever the runner left behind goes with it.
+                    let _ = killpg(pid, Signal::SIGKILL);
+                }
                 child.kill().await.context("kill runner")?;
                 child.wait().await.context("wait for runner")
             }
@@ -215,7 +226,9 @@ pub(crate) fn run_as(command: &mut Command, name: &str) -> Result<()> {
 
     // SAFETY: the closure runs in the forked child before exec. It only
     // calls setgroups, setgid and setuid, which are async-signal-safe, and
-    // does not allocate.
+    // does not allocate: `?` turns a nix Errno into an io::Error with
+    // from_raw_os_error, which does not allocate either. `groups` is moved
+    // into the closure and only freed in the parent.
     unsafe {
         command.pre_exec(move || {
             setgroups(&groups)?;

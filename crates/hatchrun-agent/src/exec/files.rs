@@ -145,7 +145,11 @@ impl StepFiles {
             });
             if removed.is_none() {
                 // Best effort: the directory is cleared at the next job.
-                let _ = fs::remove_file(path);
+                if let Err(err) = fs::remove_file(path)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!("remove {}: {err}", path.display());
+                }
             }
         }
     }

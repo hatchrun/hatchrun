@@ -433,11 +433,21 @@ async fn download(
         .with_context(|| format!("create a directory in {}", stage.path.display()))?;
     // Declared before the fetch, so that a dropped fetch has stopped its
     // extraction by the time this removes the entry.
-    let _cleanup = super::builtin::RemoveDir {
+    let cleanup = super::builtin::RemoveDir {
         stage: Arc::clone(&stage.fd),
         name: name.clone(),
+        background: true,
     };
-    fill(github, owner, repo, git_ref, key, stage, &name, limits).await
+    let filled = fill(github, owner, repo, git_ref, key, stage, &name, limits).await;
+    // Both outcomes clean up on a blocking thread. A dropped fetch falls
+    // back to the guard's own drop, which also keeps off the worker.
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut cleanup = cleanup;
+        cleanup.background = false;
+        drop(cleanup);
+    })
+    .await;
+    filled
 }
 
 /// Downloads and extracts into the stage directory `name`, then moves
