@@ -70,8 +70,12 @@ impl Filter {
             let text = body(&self.patterns[i]);
             let matched = match self.shapes[i] {
                 Shape::Literal => text == value,
-                Shape::Prefix => value.starts_with(&text[..text.len() - 2]),
-                Shape::Suffix => value.ends_with(&text[2..]),
+                Shape::Prefix => text
+                    .strip_suffix("**")
+                    .is_some_and(|head| value.starts_with(head)),
+                Shape::Suffix => text
+                    .strip_prefix("**")
+                    .is_some_and(|tail| value.ends_with(tail)),
                 // A pattern whose leading text the value does not start
                 // with cannot match; that takes no work.
                 Shape::Glob if prefix_differs(text, value) => false,
@@ -301,18 +305,17 @@ fn compile(pattern: &str) -> Vec<Tok> {
                 }
                 None => Tok::Lit('['),
             },
-            '+' | '?'
-                if toks
-                    .last()
-                    .is_some_and(|t| matches!(t, Tok::Lit(_) | Tok::Class { .. })) =>
-            {
-                let prev = Box::new(toks.pop().expect("checked by the guard"));
-                if c == '+' {
-                    Tok::Plus(prev)
-                } else {
-                    Tok::Opt(prev)
+            '+' | '?' => match toks.pop() {
+                Some(prev @ (Tok::Lit(_) | Tok::Class { .. })) if c == '+' => {
+                    Tok::Plus(Box::new(prev))
                 }
-            }
+                Some(prev @ (Tok::Lit(_) | Tok::Class { .. })) => Tok::Opt(Box::new(prev)),
+                Some(other) => {
+                    toks.push(other);
+                    Tok::Lit(c)
+                }
+                None => Tok::Lit(c),
+            },
             other => Tok::Lit(other),
         };
         toks.push(tok);
