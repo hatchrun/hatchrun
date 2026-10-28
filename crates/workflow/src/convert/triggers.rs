@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Permissions, triggers and `workflow_dispatch` inputs.
 
 use super::calls::{scalar, show};

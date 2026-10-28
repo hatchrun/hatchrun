@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Reusable workflow calls: inlining called files and binding their inputs, secrets and outputs.
 
 use super::jobs::fit_default;

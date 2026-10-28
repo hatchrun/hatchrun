@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! Expression checks and rewriting of `${{ }}` text inside jobs.
 
 use super::{BTreeSet, ExprError, Job, Step, UNSUPPORTED_CONTEXTS, Value, expr};
