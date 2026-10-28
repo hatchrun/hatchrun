@@ -108,11 +108,14 @@ hatchrun-scaler \
 ```
 
 Every flag also reads from a `HATCHRUN_*` environment variable, listed
-in `--help`; pass the broker token as `HATCHRUN_BROKER_TOKEN`. Authenticate with a GitHub App (`--github-app-client-id`,
-`--github-app-installation-id`, `--github-app-private-key`) with read
-and write access to the organization's self-hosted runners (repository
-administration for a repository scale set), or with a personal access
-token (`--github-token`). AWS credentials come from the usual
+in `--help`. Secrets are read from the environment only, so they stay
+out of the process list: `HATCHRUN_BROKER_TOKEN` for the broker token.
+Authenticate with a GitHub App (`--github-app-client-id`,
+`--github-app-installation-id` and the PEM key in
+`HATCHRUN_GITHUB_APP_PRIVATE_KEY`) with read and write access to the
+organization's self-hosted runners (repository administration for a
+repository scale set), or with a personal access token in
+`HATCHRUN_GITHUB_TOKEN`. AWS credentials come from the usual
 SDK chain. The scaler needs `ec2:RunInstances`, `ec2:CreateTags`,
 `ec2:DescribeInstances` and `ec2:TerminateInstances`, plus
 `iam:PassRole` when the launch template sets an instance profile.

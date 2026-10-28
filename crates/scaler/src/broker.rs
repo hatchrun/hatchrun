@@ -57,7 +57,15 @@ impl Broker {
         })
     }
 
-    async fn try_store(&self, ticket: &str, config: &Secret) -> Result<Option<StatusCode>> {
+    /// One attempt at storing. `retry` is set after an attempt with an
+    /// unknown outcome: the first PUT may have landed, so the broker's
+    /// 409 for an already stored ticket counts as stored.
+    async fn try_store(
+        &self,
+        ticket: &str,
+        config: &Secret,
+        retry: bool,
+    ) -> Result<Option<StatusCode>> {
         let response = self
             .http
             .put(format!("{}/v1/tickets/{ticket}", self.url))
@@ -71,10 +79,11 @@ impl Broker {
         let response = match response {
             Ok(response) => response,
             Err(err) if err.is_connect() || err.is_timeout() => {
-                warn!("broker unreachable: {err}");
+                // The URL carries the ticket, so it stays out of the log.
+                warn!("broker unreachable: {}", err.without_url());
                 return Ok(None);
             }
-            Err(err) => return Err(err).context("store runner config"),
+            Err(err) => return Err(err.without_url()).context("store runner config"),
         };
         let status = response.status();
         if status.is_success() {
@@ -84,7 +93,13 @@ impl Broker {
             warn!(%status, "broker busy");
             return Ok(None);
         }
-        let body = response.text().await.unwrap_or_default();
+        if retry && status == StatusCode::CONFLICT {
+            return Ok(Some(status));
+        }
+        let body = response.text().await.unwrap_or_else(|err| {
+            warn!("read broker response: {}", err.without_url());
+            String::new()
+        });
         bail!("store runner config: broker answered {status}: {body}");
     }
 }
@@ -96,7 +111,7 @@ impl ConfigStore for Broker {
 
     async fn store(&self, ticket: &str, config: &Secret) -> Result<()> {
         for attempt in 1..=ATTEMPTS {
-            if self.try_store(ticket, config).await?.is_some() {
+            if self.try_store(ticket, config, attempt > 1).await?.is_some() {
                 return Ok(());
             }
             if attempt < ATTEMPTS {

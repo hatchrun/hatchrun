@@ -14,7 +14,7 @@ mod github;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use aws_config::BehaviorVersion;
 use clap::Parser;
 use hatchrun_scaler_core::{Config, Scaler};
@@ -28,44 +28,35 @@ use crate::driver::{Driver, ensure_scale_set};
 use crate::ec2::Ec2;
 use crate::github::{Credentials, GitHub, Http};
 
+/// Secrets come from the environment only, so they stay out of `ps`:
+/// `HATCHRUN_GITHUB_TOKEN` (a personal access token, or use a GitHub App
+/// instead), `HATCHRUN_GITHUB_APP_PRIVATE_KEY` (PEM) and
+/// `HATCHRUN_BROKER_TOKEN` (the `BROKER_TOKEN` the broker was deployed
+/// with).
 #[derive(Parser)]
-#[command(version = env!("HATCHRUN_VERSION"), about)]
+#[command(version = env!("HATCHRUN_VERSION"), about, after_help = "Secrets are read from the environment: HATCHRUN_GITHUB_TOKEN or HATCHRUN_GITHUB_APP_PRIVATE_KEY, and HATCHRUN_BROKER_TOKEN.")]
 struct Args {
     /// Where runners register: `https://github.com/{org}`,
     /// `https://github.com/{owner}/{repo}` or
     /// `https://github.com/enterprises/{enterprise}`.
     #[arg(long, env = "HATCHRUN_GITHUB_URL")]
     github_url: ConfigUrl,
-    /// Personal access token. Use a GitHub App instead where possible.
-    #[arg(
-        long,
-        env = "HATCHRUN_GITHUB_TOKEN",
-        hide_env_values = true,
-        conflicts_with = "github_app_client_id",
-        required_unless_present = "github_app_client_id"
-    )]
-    github_token: Option<String>,
-    /// GitHub App client id (or App id).
+    /// GitHub App client id (or App id). The private key is read from
+    /// `HATCHRUN_GITHUB_APP_PRIVATE_KEY`.
     #[arg(
         long,
         env = "HATCHRUN_GITHUB_APP_CLIENT_ID",
-        requires_all = ["github_app_installation_id", "github_app_private_key"]
+        requires = "github_app_installation_id"
     )]
     github_app_client_id: Option<String>,
     /// GitHub App installation id.
     #[arg(long, env = "HATCHRUN_GITHUB_APP_INSTALLATION_ID")]
     github_app_installation_id: Option<u64>,
-    /// GitHub App private key in PEM.
-    #[arg(long, env = "HATCHRUN_GITHUB_APP_PRIVATE_KEY", hide_env_values = true)]
-    github_app_private_key: Option<String>,
 
     /// hatchrun-broker URL. Instances claim their runner config there, so
     /// it never sits in user data.
     #[arg(long, env = "HATCHRUN_BROKER_URL")]
     broker_url: String,
-    /// The `BROKER_TOKEN` the broker was deployed with.
-    #[arg(long, env = "HATCHRUN_BROKER_TOKEN", hide_env_values = true)]
-    broker_token: String,
 
     /// Scale set name, which is also the `runs-on` label.
     #[arg(long, env = "HATCHRUN_SCALE_SET")]
@@ -141,12 +132,28 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Reads a secret that is not accepted as a flag.
+fn optional_secret_env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Ok(Some(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("{name} is not valid UTF-8"),
+    }
+}
+
+fn secret_env(name: &str) -> Result<String> {
+    optional_secret_env(name)?.with_context(|| format!("{name} is required"))
+}
+
 async fn run(args: Args) -> Result<()> {
     driver::validate(args.min_runners, args.max_runners)?;
     if args.warm_pool > 0 && args.warm_pool_max_age <= args.warm_pool_warmup {
         anyhow::bail!("--warm-pool-max-age must be longer than --warm-pool-warmup");
     }
-    let store = Broker::new(&args.broker_url, Secret::new(args.broker_token))?;
+    let store = Broker::new(
+        &args.broker_url,
+        Secret::new(secret_env("HATCHRUN_BROKER_TOKEN")?),
+    )?;
     let mut terminate = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("listen for SIGINT")?;
     let shutdown = async move {
@@ -156,14 +163,18 @@ async fn run(args: Args) -> Result<()> {
         }
     };
 
-    let credentials = match (args.github_token, args.github_app_client_id) {
-        (Some(token), _) => Credentials::Token(Secret::new(token)),
+    let token = optional_secret_env("HATCHRUN_GITHUB_TOKEN")?;
+    let credentials = match (token, args.github_app_client_id) {
+        (Some(_), Some(_)) => {
+            bail!("HATCHRUN_GITHUB_TOKEN conflicts with --github-app-client-id")
+        }
+        (Some(token), None) => Credentials::Token(Secret::new(token)),
         (None, Some(client_id)) => Credentials::app(
             client_id,
             args.github_app_installation_id.unwrap_or_default(),
-            args.github_app_private_key.as_deref().unwrap_or_default(),
+            &secret_env("HATCHRUN_GITHUB_APP_PRIVATE_KEY")?,
         )?,
-        (None, None) => unreachable!("clap requires a token or an App"),
+        (None, None) => bail!("set HATCHRUN_GITHUB_TOKEN or --github-app-client-id"),
     };
     let github = GitHub::new(Http::new()?, args.github_url, credentials);
     let actions = github.connect(driver::now()).await?;

@@ -51,8 +51,14 @@ impl ConfigUrl {
         // service does not match it with a trailing slash.
         let url =
             Url::parse(input.trim().trim_end_matches('/')).map_err(|_| invalid("not a URL"))?;
-        if url.host_str().is_none() {
+        let Some(host) = url.host_str() else {
             return Err(invalid("no host"));
+        };
+        // Tokens and signed JWTs go to this host, so plain HTTP is only
+        // for a local test server.
+        let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
+        if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+            return Err(invalid("must use https"));
         }
         let parts: Vec<&str> = url
             .path_segments()
@@ -140,6 +146,14 @@ mod tests {
             .api_url("/orgs/x")
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn requires_https_except_loopback() {
+        assert!(ConfigUrl::parse("http://github.com/hatchrun").is_err());
+        assert!(ConfigUrl::parse("ftp://github.com/hatchrun").is_err());
+        ConfigUrl::parse("http://127.0.0.1:8080/hatchrun").unwrap();
+        ConfigUrl::parse("http://localhost/hatchrun").unwrap();
     }
 
     #[test]
