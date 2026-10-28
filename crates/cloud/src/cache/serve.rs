@@ -320,12 +320,17 @@ async fn complete(ctx: &Context<'_>, id: &str, request: CompleteRequest) -> Answ
         Completed::Exists => {
             // The parts are of no use now; the lifecycle rule would
             // remove them in a day, this does it at once.
-            let _ = signed(
+            // Best effort: a failed abort only leaves parts to the
+            // lifecycle rule, so it is logged and the 409 still goes out.
+            if let Err(err) = signed(
                 ctx,
                 &credentials,
                 s3::abort_multipart_upload(&url, &upload.upload_id),
             )
-            .await;
+            .await
+            {
+                console_warn!("cache: abort upload {id} after lost race: {}", err.message);
+            }
             Err(Refusal::new(409, "another job saved the entry first"))
         }
     }
