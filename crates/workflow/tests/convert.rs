@@ -2077,6 +2077,89 @@ jobs:
     ));
 }
 
+const READS: &str = "
+on:
+  workflow_call:
+    secrets:
+      PASSED: { required: false }
+jobs:
+  use:
+    runs-on: ubuntu-latest
+    steps:
+      - if: secrets.DEPLOY_KEY != ''
+        run: echo deploy
+      - run: echo
+        env:
+          P: ${{ secrets.PASSED }}
+          K: ${{ secrets.DEPLOY_KEY }}
+          G: ${{ secrets.GITHUB_TOKEN }}
+";
+
+fn secret_call(secrets: &str) -> Conversion {
+    let ci = format!(
+        "
+on: push
+jobs:
+  a:
+    uses: ./.github/workflows/reads.yml
+{secrets}
+"
+    );
+    many(&[("ci.yml", &ci), ("reads.yml", READS)])
+}
+
+fn reads(out: &Conversion) -> (Option<String>, BTreeMap<String, String>) {
+    let job = &out.config.jobs["ci-a-use"];
+    let Step::Run(first) = &job.steps[0] else {
+        panic!()
+    };
+    let Step::Run(second) = &job.steps[1] else {
+        panic!()
+    };
+    (first.if_.clone(), second.env.clone())
+}
+
+#[test]
+fn secrets_the_call_leaves_out_read_as_empty() {
+    for secrets in ["", "    secrets: { OTHER: x }"] {
+        let out = secret_call(secrets);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let (cond, env) = reads(&out);
+        assert_eq!(cond.as_deref(), Some("'' != ''"));
+        assert_eq!(env["K"], "${{ '' }}");
+        assert_eq!(env["P"], "${{ '' }}");
+        assert_eq!(env["G"], "${{ secrets.GITHUB_TOKEN }}");
+    }
+}
+
+#[test]
+fn a_passed_secret_is_renamed_and_the_rest_are_empty() {
+    let out = secret_call("    secrets: { PASSED: '${{ secrets.REAL }}' }");
+    let (cond, env) = reads(&out);
+    assert_eq!(cond.as_deref(), Some("'' != ''"));
+    assert_eq!(env["P"], "${{ secrets.REAL }}");
+    assert_eq!(env["K"], "${{ '' }}");
+    assert_eq!(env["G"], "${{ secrets.GITHUB_TOKEN }}");
+}
+
+#[test]
+fn inherit_leaves_secret_reads_alone() {
+    let out = secret_call("    secrets: inherit");
+    let (cond, env) = reads(&out);
+    assert_eq!(cond.as_deref(), Some("secrets.DEPLOY_KEY != ''"));
+    assert_eq!(env["K"], "${{ secrets.DEPLOY_KEY }}");
+    assert_eq!(env["P"], "${{ secrets.PASSED }}");
+    assert!(!has(&out.warnings, &["whole `secrets` context"]));
+}
+
+#[test]
+fn the_whole_secrets_context_without_inherit_warns() {
+    let reads = READS.replace("echo deploy", "echo ${{ toJSON(secrets) }}");
+    let ci = "on: push\njobs:\n  a:\n    uses: ./.github/workflows/reads.yml\n";
+    let out = many(&[("ci.yml", ci), ("reads.yml", &reads)]);
+    assert!(has(&out.warnings, &["whole `secrets` context", "inherit"]));
+}
+
 #[test]
 fn remote_calls_name_the_callee() {
     let out = ok("

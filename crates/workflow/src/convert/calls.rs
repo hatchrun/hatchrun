@@ -444,7 +444,8 @@ impl Cx {
 
     /// Passes the call's `secrets` to the called jobs: `inherit` passes
     /// every secret on, and a map renames the reads of each name to what
-    /// the call gives it. A secret the called file declares and the call
+    /// the call gives it. Any other name reads as `''`, since GitHub
+    /// passes nothing the call leaves out. A secret the called file declares and the call
     /// does not give is a warning.
     pub(super) fn pass_secrets(
         &mut self,
@@ -476,12 +477,38 @@ impl Cx {
                 }
             }
         }
-        if renames.is_empty() {
+        if inherit {
             return;
         }
+        // Without `inherit` the called jobs read only what the call
+        // passes: any other `secrets.X` is empty, as on GitHub.
+        // `GITHUB_TOKEN` is always available.
+        let mut reads_all = false;
+        for key in jobs {
+            if let Some(job) = self.config.jobs.get_mut(key) {
+                walk_job(job, &mut |text, bare| {
+                    if expr::secret_refs(text, bare).is_ok_and(|refs| refs.all) {
+                        reads_all = true;
+                    }
+                    text.to_owned()
+                });
+            }
+        }
+        if reads_all {
+            self.warn(format!(
+                "{at}: `{file}` reads the whole `secrets` context or a computed secret name, which the call does not pass with `inherit`; the read is left as is"
+            ));
+        }
         let mut map = |seg: &[&str]| {
-            let found = renames.get(&seg.get(1)?.to_ascii_uppercase())?;
-            (seg[0] == "secrets").then(|| (2, found.clone()))
+            if seg[0] != "secrets" {
+                return None;
+            }
+            let name = seg.get(1)?.to_ascii_uppercase();
+            if name == "GITHUB_TOKEN" {
+                return None;
+            }
+            let found = renames.get(&name).cloned();
+            Some((2, found.unwrap_or_else(|| "''".to_owned())))
         };
         for key in jobs {
             if let Some(job) = self.config.jobs.get_mut(key) {
