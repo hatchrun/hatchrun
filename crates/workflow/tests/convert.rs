@@ -2095,14 +2095,14 @@ jobs:
           G: ${{ secrets.GITHUB_TOKEN }}
 ";
 
-fn secret_call(secrets: &str) -> Conversion {
+fn reads_call(with: &str) -> Conversion {
     let ci = format!(
         "
 on: push
 jobs:
   a:
     uses: ./.github/workflows/reads.yml
-{secrets}
+{with}
 "
     );
     many(&[("ci.yml", &ci), ("reads.yml", READS)])
@@ -2121,8 +2121,8 @@ fn reads(out: &Conversion) -> (Option<String>, BTreeMap<String, String>) {
 
 #[test]
 fn secrets_the_call_leaves_out_read_as_empty() {
-    for secrets in ["", "    secrets: { OTHER: x }"] {
-        let out = secret_call(secrets);
+    for with in ["", "    secrets: { OTHER: x }"] {
+        let out = reads_call(with);
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         let (cond, env) = reads(&out);
         assert_eq!(cond.as_deref(), Some("'' != ''"));
@@ -2134,7 +2134,7 @@ fn secrets_the_call_leaves_out_read_as_empty() {
 
 #[test]
 fn a_passed_secret_is_renamed_and_the_rest_are_empty() {
-    let out = secret_call("    secrets: { PASSED: '${{ secrets.REAL }}' }");
+    let out = reads_call("    secrets: { PASSED: '${{ secrets.REAL }}' }");
     let (cond, env) = reads(&out);
     assert_eq!(cond.as_deref(), Some("'' != ''"));
     assert_eq!(env["P"], "${{ secrets.REAL }}");
@@ -2144,7 +2144,7 @@ fn a_passed_secret_is_renamed_and_the_rest_are_empty() {
 
 #[test]
 fn inherit_leaves_secret_reads_alone() {
-    let out = secret_call("    secrets: inherit");
+    let out = reads_call("    secrets: inherit");
     let (cond, env) = reads(&out);
     assert_eq!(cond.as_deref(), Some("secrets.DEPLOY_KEY != ''"));
     assert_eq!(env["K"], "${{ secrets.DEPLOY_KEY }}");
