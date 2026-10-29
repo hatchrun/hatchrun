@@ -29,15 +29,11 @@ pub fn month_start(now_ms: u64) -> u64 {
     u64::try_from(first).unwrap_or(0) * DAY_MS
 }
 
-/// Billing units used this month: the sum of each template's units.
-/// A label that names no template counts nothing.
+/// Billing units used this month, as priced when each job completed.
+/// A later price change or a removed template does not alter them.
 #[must_use]
 pub fn units(standing: &Standing) -> u64 {
-    standing
-        .seconds_by_template
-        .iter()
-        .filter_map(|(label, seconds)| templates::template(label).map(|t| t.units(*seconds)))
-        .sum()
+    standing.units
 }
 
 /// What this month's usage costs, in micros.
@@ -176,12 +172,17 @@ mod tests {
     use super::*;
 
     fn standing(seconds: &[(&str, u64)]) -> Standing {
+        let units = seconds
+            .iter()
+            .filter_map(|(l, s)| templates::template(l).map(|t| t.units(*s)))
+            .sum();
         Standing {
             tenant_id: "t1".into(),
             org_login: "acme".into(),
             card: true,
             cap_micros: templates::DEFAULT_SPEND_CAP_MICROS,
             seconds_by_template: seconds.iter().map(|(l, s)| ((*l).into(), *s)).collect(),
+            units,
             running: 0,
         }
     }
@@ -242,7 +243,12 @@ mod tests {
         assert_eq!(units(&s), 36_000);
         assert_eq!(spend_micros(&s), 1_200_000);
         assert_eq!(spend_micros(&standing(&[("ubuntu-latest", 60)])), 2_000);
-        assert_eq!(units(&standing(&[("no-such", 9)])), 0);
+        // Recorded units win over what the catalog would compute.
+        let mut s = standing(&[("no-such", 9)]);
+        assert_eq!(units(&s), 0);
+        s.units = 36_000;
+        assert_eq!(units(&s), 36_000);
+        assert_eq!(spend_micros(&s), 1_200_000);
     }
 
     #[test]
@@ -252,10 +258,10 @@ mod tests {
         s.running = 5;
         assert_eq!(admission(&s), Some(Hold::Card));
         s.card = true;
-        s.seconds_by_template = vec![("ubuntu-latest".into(), 1_500_000)];
+        s.units = 1_500_000;
         assert_eq!(spend_micros(&s), templates::DEFAULT_SPEND_CAP_MICROS);
         assert_eq!(admission(&s), Some(Hold::SpendCap));
-        s.seconds_by_template = vec![("ubuntu-latest".into(), 1_499_999)];
+        s.units = 1_499_999;
         assert_eq!(spend_micros(&s), 49_999_966);
         assert_eq!(admission(&s), Some(Hold::Concurrency));
         s.running = 4;

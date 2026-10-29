@@ -19,6 +19,8 @@ const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
          FROM (SELECT template, SUM(seconds)::bigint AS seconds FROM ci_usage \
            WHERE tenant_id = tenants.id AND ended_at >= $2 GROUP BY template) u), \
          '[]'::json)::text AS seconds_by_template, \
+       (SELECT COALESCE(SUM(units), 0)::bigint FROM ci_usage \
+         WHERE tenant_id = tenants.id AND ended_at >= $2) AS units, \
        (SELECT count(*) FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
          WHERE ci_runs.tenant_id = tenants.id \
          AND ci_jobs.status IN ('launching', 'launched', 'running'))::bigint AS running \
@@ -55,6 +57,9 @@ pub struct Standing {
     pub cap_micros: u64,
     /// Billed seconds metered this month, per template label.
     pub seconds_by_template: Vec<(String, u64)>,
+    /// Billing units metered this month, as priced when each job
+    /// completed.
+    pub units: u64,
     /// Jobs launching, launched or running now.
     pub running: u32,
 }
@@ -67,6 +72,7 @@ struct StandingRow {
     card: bool,
     cap_micros: u64,
     seconds_by_template: String,
+    units: u64,
     running: u32,
 }
 
@@ -87,6 +93,7 @@ impl StandingRow {
                 .into_iter()
                 .map(|s| (s.template, s.seconds))
                 .collect(),
+            units: self.units,
             running: self.running,
         })
     }

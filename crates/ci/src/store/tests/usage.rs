@@ -728,16 +728,19 @@ fn standing_counts_this_month_and_running_jobs() {
          VALUES ('t2', 2, 'other', 98, 0, 0)",
         &[],
     );
-    for (job, tenant, template, seconds, ended) in [
-        (1, "t1", "ubuntu-latest", 420, month - 1),
-        (2, "t1", "ubuntu-latest", 300, month + DAY),
-        (3, "t1", "ubuntu-26.04-4core", 180, month + 2 * DAY),
-        (4, "t2", "ubuntu-latest", 6_000, month + DAY),
+    // Units are what was recorded at completion: job 2 was priced before
+    // a price change, job 5 has a template the catalog no longer has.
+    for (job, tenant, template, seconds, ended, units) in [
+        (1, "t1", "ubuntu-latest", 420, month - 1, 420),
+        (2, "t1", "ubuntu-latest", 300, month + DAY, 1_000),
+        (3, "t1", "ubuntu-26.04-4core", 180, month + 2 * DAY, 180),
+        (4, "t2", "ubuntu-latest", 6_000, month + DAY, 6_000),
+        (5, "t1", "removed-label", 60, month + 3 * DAY, 77),
     ] {
         db.run(
             "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
-             ended_at) VALUES ($1, 1, $2, $3, $4, $4, $5)",
-            &params![job, tenant, template, seconds, ended],
+             ended_at) VALUES ($1, 1, $2, $3, $4, $6, $5)",
+            &params![job, tenant, template, seconds, ended, units],
         );
     }
     let (_, first) = run_with_job(&db, "running");
@@ -758,9 +761,11 @@ fn standing_counts_this_month_and_running_jobs() {
             card: false,
             cap_micros: default_cap,
             seconds_by_template: vec![
+                ("removed-label".into(), 60),
                 ("ubuntu-26.04-4core".into(), 180),
                 ("ubuntu-latest".into(), 300)
             ],
+            units: 1_257,
             running: 2,
         }
     );
@@ -818,6 +823,7 @@ fn standing_counts_this_month_and_running_jobs() {
         .unwrap()
         .unwrap();
     assert_eq!(empty.seconds_by_template.len(), 0);
+    assert_eq!(empty.units, 0);
 }
 
 #[test]
