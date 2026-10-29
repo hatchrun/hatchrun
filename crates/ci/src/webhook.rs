@@ -82,10 +82,13 @@ fn reply(outcome: &Outcome) -> Result<Response> {
 ///
 /// The body cannot be read at all.
 pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
-    let secret = env
-        .secret(WEBHOOK_SECRET)
-        .map(|secret| secret.to_string())
-        .unwrap_or_default();
+    let secret = match env.secret(WEBHOOK_SECRET) {
+        Ok(secret) => secret.to_string(),
+        Err(err) => {
+            worker::console_error!("webhook: {WEBHOOK_SECRET}: {err}");
+            String::new()
+        }
+    };
     if secret.is_empty() {
         return Response::error("no GITHUB_WEBHOOK_SECRET", 500);
     }

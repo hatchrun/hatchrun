@@ -28,7 +28,7 @@
 //! jobs, 1/8 each for orphans and the warm pool, 1/16 each for usage and
 //! re-sealing, and the remainder (100 at [`BUDGET`]) for retention. A step whose share runs out stops and resumes in the next
 //! pass. Rows and runs are bounded too: [`MAX_MINUTES`] minutes,
-//! [`SCHEDULE_ROWS`] schedule rows, [`MAX_FIXES`] stalled jobs,
+//! [`MAX_FIXES`] stalled jobs,
 //! [`MAX_TERMINATIONS`] terminated instances and [`store::SWEEP_LIMIT`]
 //! purged runs. Scheduled runs past [`MAX_FIRES`] in one pass are
 //! skipped and logged.
@@ -69,7 +69,8 @@ const LEASE_MS: u64 = 55_000;
 pub const MAX_MINUTES: usize = 5;
 /// The most scheduled runs one pass starts.
 pub const MAX_FIRES: usize = 200;
-/// The most schedule rows one pass reads.
+/// The schedule rows read in one query; a pass reads as many pages as it
+/// needs.
 pub const SCHEDULE_ROWS: u32 = 1_000;
 /// The most stalled jobs one pass handles.
 pub const MAX_FIXES: u32 = 50;
@@ -472,9 +473,11 @@ struct Head {
     config: Config,
 }
 
-/// Step 1. When `budget` runs out the pass stops before the first fire it
-/// cannot pay for; the next pass starts again from that minute, and the
-/// runs already made are skipped without cost.
+/// Step 1. Schedules are read [`SCHEDULE_ROWS`] at a time until none are
+/// left. When `budget` runs out the pass stops before the first fire it
+/// cannot pay for; the next pass starts again from that minute (from the
+/// oldest one when schedules were left unread), and the runs already
+/// made are skipped without cost.
 async fn fire_schedules(
     env: &Env,
     db: &Db,
@@ -487,16 +490,6 @@ async fn fire_schedules(
     let Some(&newest) = due.last() else {
         return Ok(());
     };
-    let rows = store::schedules(db, SCHEDULE_ROWS)
-        .await
-        .map_err(|e| e.to_string())?;
-    if rows.len() >= SCHEDULE_ROWS as usize {
-        console_error!("reconcile: more than {SCHEDULE_ROWS} schedules, the rest do not fire");
-    }
-    let (fired, skipped) = fires(&rows, &due);
-    if skipped > 0 {
-        console_error!("reconcile: {skipped} scheduled runs over the limit of {MAX_FIRES} skipped");
-    }
     let github = Counted::default();
     let tokens = Tokens::new(
         Kv::new(env),
@@ -511,41 +504,76 @@ async fn fire_schedules(
     // The repository, its head and its config are read once per pass.
     let mut heads: HashMap<u64, Option<Head>> = HashMap::new();
     let mut stopped_at = None;
-    for fire in &fired {
-        if let std::collections::hash_map::Entry::Vacant(slot) = heads.entry(fire.repo_id) {
-            if !budget.take(HEAD_COST) {
-                stopped_at = Some(fire.minute_ms);
-                break;
-            }
-            let head = match head(db, settings, &tokens, fire.repo_id).await {
-                Ok(head) => head,
-                Err(err) => {
-                    console_error!("reconcile: repository {}: {err}", fire.repo_id);
-                    None
-                }
-            };
-            slot.insert(head);
-        }
-        let Some(Some(head)) = heads.get(&fire.repo_id) else {
-            continue;
-        };
-        let made = store::run_for_delivery(db, &fire.delivery(), &fire.workflow)
+    let mut fired_total = 0;
+    let mut skipped = 0;
+    let mut cursor: Option<ScheduleRow> = None;
+    // Schedules are read a page at a time, in key order after the last
+    // row of the page before.
+    'pages: loop {
+        let rows = store::schedules_after(db, cursor.as_ref(), SCHEDULE_ROWS)
             .await
             .map_err(|e| e.to_string())?;
-        if made.is_some_and(|run| run.status != "queued") {
-            continue;
+        let last_page = rows.len() < SCHEDULE_ROWS as usize;
+        cursor = rows.last().cloned();
+        let (mut fired, over) = fires(&rows, &due);
+        skipped += over;
+        let room = MAX_FIRES - fired_total;
+        if fired.len() > room {
+            skipped += fired.len() - room;
+            fired.truncate(room);
         }
-        if !budget.take(START_COST) {
-            stopped_at = Some(fire.minute_ms);
+        fired_total += fired.len();
+        for fire in &fired {
+            let made = store::run_for_delivery(db, &fire.delivery(), &fire.workflow)
+                .await
+                .map_err(|e| e.to_string())?;
+            if made.is_some_and(|run| run.status != "queued") {
+                continue;
+            }
+            // Pages not read yet have fired no minute, so the pass
+            // resumes at the oldest one.
+            let resume = if last_page { fire.minute_ms } else { due[0] };
+            if let std::collections::hash_map::Entry::Vacant(slot) = heads.entry(fire.repo_id) {
+                if !budget.take(HEAD_COST) {
+                    stopped_at = Some(resume);
+                    break 'pages;
+                }
+                let head = match head(db, settings, &tokens, fire.repo_id).await {
+                    Ok(head) => head,
+                    Err(err) => {
+                        console_error!("reconcile: repository {}: {err}", fire.repo_id);
+                        None
+                    }
+                };
+                slot.insert(head);
+            }
+            let Some(Some(head)) = heads.get(&fire.repo_id) else {
+                continue;
+            };
+            if !budget.take(START_COST) {
+                stopped_at = Some(resume);
+                break 'pages;
+            }
+            if let Err(err) = start(env, db, settings, &tokens, head, fire, now).await {
+                console_error!(
+                    "reconcile: schedule {} of {}: {err}",
+                    fire.cron,
+                    head.repo.full_name
+                );
+            }
+        }
+        if last_page {
             break;
         }
-        if let Err(err) = start(env, db, settings, &tokens, head, fire, now).await {
+        if fired_total >= MAX_FIRES {
             console_error!(
-                "reconcile: schedule {} of {}: {err}",
-                fire.cron,
-                head.repo.full_name
+                "reconcile: schedules past the limit of {MAX_FIRES} scheduled runs skipped"
             );
+            break;
         }
+    }
+    if skipped > 0 {
+        console_error!("reconcile: {skipped} scheduled runs over the limit of {MAX_FIRES} skipped");
     }
     let done = match stopped_at {
         Some(minute) => {
@@ -1080,20 +1108,31 @@ impl PoolPass<'_> {
 }
 
 /// Step 6. A sweep takes at most [`store::SWEEP_LIMIT`] runs and one
-/// subrequest each purges them, which `budget` covers.
+/// subrequest each purges them, which `budget` covers. A run is deleted
+/// once its purge succeeded.
 async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
     if budget.left() < store::SWEEP_LIMIT * PURGE_COST {
         return Ok(());
     }
     let expired = store::sweep(db, now).await.map_err(|e| e.to_string())?;
     budget.take(PURGE_COST * u32::try_from(expired.len()).unwrap_or(0));
-    join_all(expired.iter().map(|&run_id| async move {
-        if let Err(err) = purge(env, run_id).await {
-            console_error!("reconcile: purge run {run_id}: {err}");
+    let purged: Vec<u64> = join_all(expired.iter().map(|&run_id| async move {
+        match purge(env, run_id).await {
+            Ok(()) => Some(run_id),
+            Err(err) => {
+                console_error!("reconcile: purge run {run_id}: {err}");
+                None
+            }
         }
     }))
-    .await;
-    Ok(())
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    // A run whose purge failed stays, and the next sweep returns it.
+    store::delete_runs(db, &purged)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Of one ingest call to Polar.

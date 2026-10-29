@@ -86,13 +86,35 @@ impl Limits {
 }
 
 /// IAM's `StringLike`: `*` is any run of characters, `?` any one.
+///
+/// Only the last `*` needs to be revisited when a match fails, so the
+/// scan is O(pattern * text) in the worst case.
 fn matches(pattern: &[u8], text: &[u8]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some((b'*', rest)) => (0..=text.len()).any(|skip| matches(rest, &text[skip..])),
-        Some((b'?', rest)) => !text.is_empty() && matches(rest, &text[1..]),
-        Some((byte, rest)) => text.first() == Some(byte) && matches(rest, &text[1..]),
+    let (mut p, mut t) = (0, 0);
+    // The last `*` seen, and the text position it currently absorbs up to.
+    let mut star = None;
+    let mut resume = 0;
+    while t < text.len() {
+        if pattern.get(p) == Some(&b'*') {
+            star = Some(p);
+            resume = t;
+            p += 1;
+        } else if pattern
+            .get(p)
+            .is_some_and(|&byte| byte == b'?' || byte == text[t])
+        {
+            p += 1;
+            t += 1;
+        } else if let Some(at) = star {
+            // Let the last `*` absorb one more character and retry.
+            p = at + 1;
+            resume += 1;
+            t = resume;
+        } else {
+            return false;
+        }
     }
+    pattern[p..].iter().all(|&byte| byte == b'*')
 }
 
 /// The size name with `vcpus` vCPUs, as in `large` or `4xlarge`.
@@ -505,5 +527,34 @@ mod tests {
         assert_eq!(size_name(1), "medium");
         assert_eq!(size_name(16), "4xlarge");
         assert_eq!(size_name(384), "96xlarge");
+    }
+
+    #[test]
+    fn wildcards_match_in_every_position() {
+        assert!(matches(b"m7g.large", b"m7g.large"));
+        assert!(!matches(b"m7g.large", b"m7g.larg"));
+        assert!(matches(b"*.large", b"m7g.large"));
+        assert!(matches(b"m7*", b"m7g.large"));
+        assert!(matches(b"m7*large", b"m7g.large"));
+        assert!(!matches(b"m7*xlarge", b"m7g.large"));
+        assert!(matches(b"*g*l*", b"m7g.large"));
+        assert!(matches(b"**", b"m7g.large"));
+        assert!(matches(b"*", b"a"));
+        assert!(matches(b"", b""));
+        assert!(!matches(b"", b"a"));
+        assert!(!matches(b"a", b""));
+        assert!(!matches(b"?", b""));
+        assert!(matches(b"*?", b"a"));
+        assert!(!matches(b"*a", b"ab"));
+        assert!(matches(b"*ab", b"aab"));
+        assert!(matches(b"a*b*c", b"axxbyyc"));
+        assert!(!matches(b"a*b*c", b"axxbyy"));
+    }
+
+    #[test]
+    fn pathological_wildcards_finish_fast() {
+        let text = "a".repeat(40);
+        assert!(!matches(b"*a*a*a*a*a*a*a*a*a*a*b", text.as_bytes()));
+        assert!(matches(b"*a*a*a*a*a*a*a*a*a*a*", text.as_bytes()));
     }
 }

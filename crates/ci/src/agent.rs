@@ -523,7 +523,13 @@ async fn held_permissions(
     jwt: &str,
     installation_id: u64,
 ) -> std::result::Result<BTreeMap<String, String>, String> {
-    let kv = env.kv("TOKENS").ok();
+    let kv = match env.kv("TOKENS") {
+        Ok(kv) => Some(kv),
+        Err(err) => {
+            console_warn!("installation {installation_id}: TOKENS binding: {err}");
+            None
+        }
+    };
     let key = permissions_key(installation_id);
     if let Some(kv) = &kv {
         match kv.get(&key).json::<BTreeMap<String, String>>().await {

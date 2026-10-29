@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use hatchrun_scaler_core::{Action, Scaler};
 use hatchrun_scaleset::{
     Actions, CallError, Error, ErrorKind, Message, NewScaleSet, Operation, ScaleSet, Session,
-    Transport,
+    Statistics, Transport,
 };
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -125,7 +125,10 @@ where
                 Err(err) => return Err(err).context("open message session"),
             }
         };
-        let statistics = session.statistics.unwrap_or_default();
+        let statistics = session.statistics.unwrap_or_else(|| {
+            warn!("message session has no statistics, assuming no assigned jobs");
+            Statistics::default()
+        });
         info!(
             session = session.id,
             assigned_jobs = statistics.total_assigned_jobs,

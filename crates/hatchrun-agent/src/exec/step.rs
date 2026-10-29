@@ -341,7 +341,11 @@ impl Drop for GroupGuard {
 
 fn signal_group(pid: Pid, signal: Signal) {
     // The group may already be gone.
-    let _ = killpg(pid, signal);
+    if let Err(err) = killpg(pid, signal)
+        && err != nix::errno::Errno::ESRCH
+    {
+        tracing::debug!("signal process group {pid}: {err}");
+    }
 }
 
 /// The most bytes of background output one job prints. Output past it
@@ -542,6 +546,7 @@ pub async fn spawn(
         .and_then(|id| i32::try_from(id).ok())
         .map(Pid::from_raw)
     else {
+        // No pid means the child already exited.
         let _ = child.start_kill();
         anyhow::bail!("read process id");
     };
