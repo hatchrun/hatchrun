@@ -38,8 +38,8 @@ pub use self::pool::{
     PoolRow, claims_by_bucket, drop_pool, move_pool, pool_rows, save_pool, take_pool,
 };
 pub use self::reconciler::{
-    SWEEP_LIMIT, ScheduleRow, last_minute, lease, replace_schedules, schedules, set_last_minute,
-    stalled_jobs, sweep,
+    SWEEP_LIMIT, ScheduleRow, delete_runs, last_minute, lease, replace_schedules, schedules,
+    schedules_after, set_last_minute, stalled_jobs, sweep,
 };
 pub use self::repos::{RepoRow, delivery_seen, record_delivery, repo, repo_by_name, upsert_repo};
 pub use self::runs::{

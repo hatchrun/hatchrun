@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 mod jobs;
+mod reconciler;
 mod secrets;
 mod usage;
 

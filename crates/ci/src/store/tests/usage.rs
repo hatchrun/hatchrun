@@ -131,6 +131,7 @@ fn sweep_deletes_expired_runs_and_old_deliveries() {
         .unwrap();
     let gone = db.wait(sweep(db.db(), now)).unwrap();
     assert_eq!(gone, vec![old.id]);
+    db.wait(delete_runs(db.db(), &gone)).unwrap();
     assert!(db.wait(run(db.db(), old.id)).unwrap().is_none());
     assert!(db.wait(run(db.db(), fresh.id)).unwrap().is_some());
     let jobs: i64 = db
@@ -139,20 +140,6 @@ fn sweep_deletes_expired_runs_and_old_deliveries() {
     assert_eq!(jobs, 0);
     assert!(!db.wait(delivery_seen(db.db(), "old")).unwrap());
     assert!(db.wait(delivery_seen(db.db(), "fresh")).unwrap());
-}
-
-#[test]
-fn sweep_deletes_the_oldest_hundred_at_a_time() {
-    let db = setup();
-    for n in 0..(SWEEP_LIMIT + 5) {
-        db.wait(insert_run(db.db(), &new_run(&format!("d{n}"), "ci", 1_000)))
-            .unwrap()
-            .unwrap();
-    }
-    let now = 1_000 + 31 * DAY;
-    assert_eq!(db.wait(sweep(db.db(), now)).unwrap().len(), 100);
-    assert_eq!(db.wait(sweep(db.db(), now)).unwrap().len(), 5);
-    assert_eq!(db.wait(sweep(db.db(), now)).unwrap().len(), 0);
 }
 
 #[test]

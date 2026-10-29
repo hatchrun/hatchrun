@@ -38,6 +38,12 @@ const INSERT_SCHEDULE: &str = "INSERT INTO ci_schedules (repo_id, workflow, cron
 const SCHEDULES: &str = "SELECT repo_id, workflow, cron FROM ci_schedules \
      ORDER BY repo_id, workflow, cron LIMIT $1";
 
+/// Schedules after repository `$1`, workflow `$2` and cron `$3`, at
+/// most `$4`.
+const SCHEDULES_AFTER: &str = "SELECT repo_id, workflow, cron FROM ci_schedules \
+     WHERE (repo_id, workflow, cron) > ($1, $2, $3) \
+     ORDER BY repo_id, workflow, cron LIMIT $4";
+
 /// The jobs a reconciler pass may have to act on, at most `limit`:
 /// queued, launching, launched and running jobs that are overdue
 /// against the limits of `now`. See [`crate::reconcile::stalled`].
@@ -80,13 +86,15 @@ const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
      OR (status = 'running' AND COALESCE(heartbeat_at, started_at, updated_at) < $4) \
      ORDER BY updated_at, id LIMIT $5";
 
-/// Deletes the runs that expired before `$1`, at most `$2` of them;
-/// their jobs go with them. The oldest go first.
-const SWEEP_RUNS: &str = "DELETE FROM ci_runs WHERE id IN (\
-       SELECT id FROM ci_runs WHERE expires_at < $1 ORDER BY expires_at, id LIMIT $2) \
-     RETURNING id";
+/// The runs that expired before `$1`, at most `$2` of them, the oldest
+/// first.
+const SWEEP_RUNS: &str = "SELECT id FROM ci_runs WHERE expires_at < $1 \
+     ORDER BY expires_at, id LIMIT $2";
 
-/// The most runs one [`sweep`] deletes.
+/// Deletes run `$1`; its jobs go with it.
+const DELETE_RUN: &str = "DELETE FROM ci_runs WHERE id = $1";
+
+/// The most runs one [`sweep`] returns.
 pub const SWEEP_LIMIT: u32 = 100;
 
 /// Deletes delivery ids received before `$1`.
@@ -123,7 +131,31 @@ pub async fn replace_schedules(
 ///
 /// Postgres refused the statement.
 pub async fn schedules(db: &Db, limit: u32) -> Result<Vec<ScheduleRow>> {
-    db.all(SCHEDULES, &params![limit]).await
+    schedules_after(db, None, limit).await
+}
+
+/// Schedules after `after` in the order of repository, workflow and
+/// cron, at most `limit`; from the first one when `after` is `None`.
+/// Passing the last row of a page reads the next page.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn schedules_after(
+    db: &Db,
+    after: Option<&ScheduleRow>,
+    limit: u32,
+) -> Result<Vec<ScheduleRow>> {
+    match after {
+        None => db.all(SCHEDULES, &params![limit]).await,
+        Some(row) => {
+            db.all(
+                SCHEDULES_AFTER,
+                &params![row.repo_id, &row.workflow, &row.cron, limit],
+            )
+            .await
+        }
+    }
 }
 
 /// Takes the reconciler's lease until `until` when it ran out before
@@ -162,21 +194,21 @@ pub async fn set_last_minute(db: &Db, minute_ms: u64) -> Result<()> {
     Ok(())
 }
 
-/// Deletes runs that expired before `now`, with their jobs, and
-/// delivery ids older than 30 days, and usage rows Polar took more
-/// than 90 days ago. At most [`SWEEP_LIMIT`] runs go in
-/// one call, oldest first, and the rest the next time. Returns the ids
-/// of the runs, so their logs can be purged.
+/// Deletes delivery ids older than 30 days and usage rows Polar took
+/// more than 90 days ago, and returns the ids of the runs that expired
+/// before `now`, at most [`SWEEP_LIMIT`], oldest first. The runs stay
+/// until [`delete_runs`], so a run whose logs could not be purged is
+/// returned again by the next sweep.
 ///
 /// # Errors
 ///
 /// Postgres refused a statement.
 pub async fn sweep(db: &Db, now: u64) -> Result<Vec<u64>> {
     #[derive(Deserialize)]
-    struct Deleted {
+    struct Expired {
         id: u64,
     }
-    let runs: Vec<Deleted> = db.all(SWEEP_RUNS, &params![now, SWEEP_LIMIT]).await?;
+    let runs: Vec<Expired> = db.all(SWEEP_RUNS, &params![now, SWEEP_LIMIT]).await?;
     db.run(SWEEP_DELIVERIES, &params![now.saturating_sub(RETENTION_MS)])
         .await?;
     db.run(
@@ -185,4 +217,18 @@ pub async fn sweep(db: &Db, now: u64) -> Result<Vec<u64>> {
     )
     .await?;
     Ok(runs.into_iter().map(|row| row.id).collect())
+}
+
+/// Deletes the runs `ids`, with their jobs, in one transaction.
+///
+/// # Errors
+///
+/// Postgres refused a statement; nothing changes.
+pub async fn delete_runs(db: &Db, ids: &[u64]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let statements: Vec<_> = ids.iter().map(|&id| (DELETE_RUN, params![id])).collect();
+    db.batch(&statements).await?;
+    Ok(())
 }
