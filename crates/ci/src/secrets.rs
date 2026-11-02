@@ -179,7 +179,7 @@ pub fn seal(key: &Key, aad: &Aad<'_>, nonce: [u8; NONCE_BYTES], value: &str) -> 
     let cipher = Aes256Gcm::new(&key.bytes.into());
     let sealed = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: value.as_bytes(),
                 aad: &aad.bytes(),
@@ -212,9 +212,10 @@ pub fn open(
         return Err(SecretError::Corrupt);
     }
     let (nonce, data) = bytes.split_at(NONCE_BYTES);
+    let nonce = Nonce::try_from(nonce).map_err(|_| SecretError::Corrupt)?;
     let plain = Aes256Gcm::new(&key.bytes.into())
         .decrypt(
-            Nonce::from_slice(nonce),
+            &nonce,
             Payload {
                 msg: data,
                 aad: &aad.bytes(),
