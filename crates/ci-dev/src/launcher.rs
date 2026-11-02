@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -38,7 +38,7 @@ use nix::unistd::Pid;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::github::rfc3339;
+use crate::github::{now_secs, rfc3339};
 
 /// How long a terminated process gets before `SIGKILL`.
 const KILL_AFTER: Duration = Duration::from_secs(10);
@@ -124,12 +124,6 @@ pub fn router(launcher: Launcher) -> Router {
         .route("/instances/{id}/metadata-off", post(metadata_off))
         .route("/_events", get(events))
         .with_state(launcher)
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 fn error(status: StatusCode, message: impl std::fmt::Display) -> Response {
