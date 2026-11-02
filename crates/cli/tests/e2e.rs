@@ -730,7 +730,7 @@ fn transcript(name: &str, dir: &Path) -> (String, Config) {
     let source = std::fs::read_to_string(dir.join(".hatchrun/config.yml")).unwrap();
     let config = parse(&source).unwrap_or_else(|e| panic!("{name}: {e:?}\n{source}"));
     assert_eq!(
-        parse(&to_yaml(&config)).unwrap(),
+        parse(&to_yaml(&config).unwrap()).unwrap(),
         config,
         "{name}: round trip"
     );
@@ -832,7 +832,7 @@ fn parallelism_added_after_converting() {
     let path = dir.join(".hatchrun/config.yml");
     let mut config = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
     config.jobs.get_mut("ci-test").unwrap().parallelism = Some(2);
-    std::fs::write(&path, to_yaml(&config)).unwrap();
+    std::fs::write(&path, to_yaml(&config).unwrap()).unwrap();
     let (code, stdout, _) = hatchrun(&dir, &["validate"]);
     assert_eq!((code, stdout.as_str()), (0, ""));
 

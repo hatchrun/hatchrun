@@ -159,7 +159,7 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
     for error in &conversion.errors {
         eprintln!("{}", shown(error));
     }
-    let yaml = to_yaml(&conversion.config);
+    let yaml = to_yaml(&conversion.config).map_err(|e| anyhow::anyhow!(shown(&e)))?;
     match output {
         Some(dest) => {
             // `-o .hatchrun/config.yml` in a repository that has no

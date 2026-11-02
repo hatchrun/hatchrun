@@ -178,6 +178,17 @@ pub(super) fn rewrite(text: &str, bare: bool, names: &mut Names<'_>) -> String {
     out
 }
 
+/// The name in a literal string index `['name']` at `at`, with the
+/// offset after the `]`. Spaces around the string are allowed.
+fn literal_index(expr: &str, at: usize) -> Option<(&str, usize)> {
+    let rest = expr[at..].trim_start().strip_prefix('[')?;
+    let rest = rest.trim_start().strip_prefix('\'')?;
+    let len = rest.find('\'')?;
+    let name = &rest[..len];
+    let tail = rest[len + 1..].trim_start().strip_prefix(']')?;
+    (!name.is_empty()).then_some((name, expr.len() - tail.len()))
+}
+
 /// [`rewrite`] of one expression.
 pub(super) fn rewrite_expr(expr: &str, names: &mut Names<'_>) -> String {
     let bytes = expr.as_bytes();
@@ -216,8 +227,12 @@ pub(super) fn rewrite_expr(expr: &str, names: &mut Names<'_>) -> String {
                     break;
                 }
             }
+            // `secrets['NAME']` reads like `secrets.NAME`.
+            let literal = (ends.len() == 1 && &expr[i..end] == "secrets")
+                .then(|| literal_index(expr, end))
+                .flatten();
             let mut from = i;
-            let parts: Vec<&str> = ends
+            let mut parts: Vec<&str> = ends
                 .iter()
                 .map(|&to| {
                     let name = &expr[from..to];
@@ -225,6 +240,10 @@ pub(super) fn rewrite_expr(expr: &str, names: &mut Names<'_>) -> String {
                     name
                 })
                 .collect();
+            if let Some((name, after)) = literal {
+                parts.push(name);
+                ends.push(after);
+            }
             let call = bytes.get(end) == Some(&b'(');
             if let Some((n, replacement)) = names(&parts).filter(|_| !call) {
                 out.push_str(&replacement);

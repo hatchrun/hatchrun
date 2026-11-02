@@ -236,7 +236,7 @@ workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
         config.jobs["deploy"].environment.as_deref(),
         Some("production")
     );
-    let yaml = hatchrun_workflow::to_yaml(&config);
+    let yaml = hatchrun_workflow::to_yaml(&config).unwrap();
     assert!(yaml.contains("environment: production"), "{yaml}");
     assert_eq!(parse(&yaml).unwrap(), config);
 }
@@ -277,7 +277,7 @@ workflows:
     assert!(Statuses::TERMINAL.outcomes().eq(Outcome::ALL));
 
     // Written back in the shortest form, and read back the same.
-    let yaml = to_yaml(&config);
+    let yaml = to_yaml(&config).unwrap();
     for form in [
         "- build\n",
         "- test:\n",
@@ -370,7 +370,7 @@ fn rejects_bad_checkout_steps() {
 fn checkout_steps_round_trip() {
     let source = "jobs: { t: { runs-on: ubuntu-latest, steps: [checkout, { checkout: { fetch-depth: 0, submodules: true, lfs: true, path: a, ref: main } }] } }";
     let config = parse(source).unwrap();
-    let written = to_yaml(&config);
+    let written = to_yaml(&config).unwrap();
     assert_eq!(parse(&written).unwrap(), config, "{written}");
     // A checkout with no options is written as the bare name.
     assert!(written.contains("- checkout\n"), "{written}");

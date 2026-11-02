@@ -34,37 +34,46 @@ impl UtcMinute {
     #[must_use]
     pub fn from_unix(secs: u64) -> UtcMinute {
         // Howard Hinnant's civil-from-days, on the days since 1970-01-01.
-        let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX / 2);
+        // Under 2^58, so the sums below cannot overflow.
+        let days = secs / 86_400;
         let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z.rem_euclid(146_097);
+        let era = z / 146_097;
+        let doe = z % 146_097;
         let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
         let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
         let mp = (5 * doy + 2) / 153;
         let day = doy - (153 * mp + 2) / 5 + 1;
         let month = if mp < 10 { mp + 3 } else { mp - 9 };
-        let year = yoe + era * 400 + i64::from(month <= 2);
+        let year = yoe + era * 400 + u64::from(month <= 2);
         let of_day = secs % 86_400;
         UtcMinute {
+            // Beyond year 2^31 the year saturates.
             year: i32::try_from(year).unwrap_or(i32::MAX),
-            month: u32::try_from(month).unwrap_or(0),
-            day: u32::try_from(day).unwrap_or(0),
-            hour: u32::try_from(of_day / 3600).unwrap_or(0),
-            minute: u32::try_from(of_day / 60 % 60).unwrap_or(0),
+            month: low32(month),
+            day: low32(day),
+            hour: low32(of_day / 3600),
+            minute: low32(of_day / 60 % 60),
             // 1970-01-01 was a Thursday.
-            weekday: u32::try_from((days + 4).rem_euclid(7)).unwrap_or(0),
+            weekday: low32((days + 4) % 7),
         }
     }
+}
+
+/// The low 32 bits of `n`. Every caller passes a calendar field, which
+/// is below 2^32, so nothing is lost.
+fn low32(n: u64) -> u32 {
+    let [_, _, _, _, low @ ..] = n.to_be_bytes();
+    u32::from_be_bytes(low)
 }
 
 /// A parsed cron expression: one bit set per allowed value of a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cron {
     minutes: u64,
-    hours: u32,
-    days: u32,
-    months: u16,
-    weekdays: u8,
+    hours: u64,
+    days: u64,
+    months: u64,
+    weekdays: u64,
     days_restricted: bool,
     weekdays_restricted: bool,
 }
@@ -145,10 +154,10 @@ impl Cron {
         }
         Ok(Cron {
             minutes,
-            hours: bits32(hours),
-            days: bits32(days),
-            months: u16::try_from(months).unwrap_or(0),
-            weekdays: u8::try_from(weekdays).unwrap_or(0),
+            hours,
+            days,
+            months,
+            weekdays,
             days_restricted: !day.starts_with('*'),
             weekdays_restricted: !weekday.starts_with('*'),
         })
@@ -169,10 +178,6 @@ impl Cron {
             && self.months & (1 << t.month) != 0
             && days
     }
-}
-
-fn bits32(bits: u64) -> u32 {
-    u32::try_from(bits).unwrap_or(0)
 }
 
 /// The bits a comma list sets.
@@ -228,12 +233,11 @@ fn item_bits(item: &str, spec: &Spec) -> Result<u64, String> {
 fn value(text: &str, spec: &Spec) -> Result<u32, String> {
     let n = if let Ok(n) = text.parse::<u32>() {
         n
-    } else if let Some(i) = spec
-        .names
-        .iter()
-        .position(|name| name.eq_ignore_ascii_case(text))
+    } else if let Some((n, _)) = (spec.lo..)
+        .zip(spec.names)
+        .find(|(_, name)| name.eq_ignore_ascii_case(text))
     {
-        spec.lo + u32::try_from(i).unwrap_or(0)
+        n
     } else {
         return Err(format!("{} `{text}` is not a value or name", spec.label));
     };

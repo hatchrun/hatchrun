@@ -186,14 +186,14 @@ fn configs() -> Vec<(String, String)> {
         .map(|(name, files)| {
             (
                 format!("e2e/{name}"),
-                to_yaml(&convert(&files).unwrap().config),
+                to_yaml(&convert(&files).unwrap().config).unwrap(),
             )
         })
         .collect();
     let large = vec![("ci.yml".to_owned(), large_workflow(52))];
     out.push((
         "large/52-jobs".to_owned(),
-        to_yaml(&convert(&large).unwrap().config),
+        to_yaml(&convert(&large).unwrap().config).unwrap(),
     ));
     out
 }

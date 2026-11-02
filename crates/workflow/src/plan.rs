@@ -1947,7 +1947,7 @@ fn expand_steps(
             if walk.budget.spent {
                 return;
             }
-            out.push(planned);
+            out.extend(planned);
             continue;
         };
         let Some(command) = config.commands.get(name) else {
@@ -2074,21 +2074,22 @@ fn kind_mismatch(kind: &ParameterKind, value: &Value) -> Option<String> {
 }
 
 /// Substitutes parameters in every string field of a step. Every string,
-/// entry and value is charged before it is made.
+/// entry and value is charged before it is made. A command has no
+/// planned form of its own and gives `None`.
 fn plan_step(
     step: &Step,
     values: &BTreeMap<String, Value>,
     scope: &str,
     walk: &mut Walk<'_>,
     errors: &mut Vec<Diagnostic>,
-) -> PlannedStep {
+) -> Option<PlannedStep> {
     let mut sub = Sub {
         values,
         scope,
         walk,
         errors,
     };
-    match step {
+    Some(match step {
         Step::Run(run) => PlannedStep::Run(RunStep {
             name: sub.opt(run.name.as_deref()),
             id: sub.copy(run.id.as_deref()),
@@ -2145,8 +2146,8 @@ fn plan_step(
         Step::TestResults { path } => PlannedStep::TestResults {
             path: sub.text(path),
         },
-        Step::Command { .. } => unreachable!("commands are expanded by expand_steps"),
-    }
+        Step::Command { .. } => return None,
+    })
 }
 
 /// Substitutes the parameters of one scope into strings and values,
