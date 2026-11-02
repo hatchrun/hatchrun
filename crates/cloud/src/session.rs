@@ -17,7 +17,7 @@
 //! cookie, but cannot read the token, which the app fetches from
 //! `/api/session` and which is derived from the session id.
 
-use aes_gcm::aead::{Aead, KeyInit as _};
+use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -148,7 +148,7 @@ pub fn check_install_state(id: &[u8], state: &str) -> bool {
 pub fn seal(id: &[u8], nonce: &[u8; NONCE_BYTES], plain: &str) -> String {
     let cipher = Aes256Gcm::new(&derive(id, "hatchrun github token").into());
     let sealed = cipher
-        .encrypt(Nonce::from_slice(nonce), plain.as_bytes())
+        .encrypt(&Nonce::from(*nonce), plain.as_bytes())
         .expect("AES-GCM seals any length a token has");
     let mut out = nonce.to_vec();
     out.extend_from_slice(&sealed);
@@ -164,7 +164,8 @@ pub fn open(id: &[u8], sealed: &str) -> Option<String> {
     }
     let (nonce, data) = bytes.split_at(NONCE_BYTES);
     let cipher = Aes256Gcm::new(&derive(id, "hatchrun github token").into());
-    let plain = cipher.decrypt(Nonce::from_slice(nonce), data).ok()?;
+    let nonce = Nonce::try_from(nonce).ok()?;
+    let plain = cipher.decrypt(&nonce, data).ok()?;
     String::from_utf8(plain).ok()
 }
 
