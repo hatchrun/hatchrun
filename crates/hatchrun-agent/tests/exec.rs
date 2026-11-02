@@ -14,8 +14,11 @@ use std::time::{Duration, Instant};
 use hatchrun_workflow::{Conclusion, JobDocument, JobResult, PlannedStep};
 
 /// A state directory the test owns. The path is canonical, since the
-/// agent refuses links on the way to it.
+/// agent refuses links on the way to it. `dir` is closed to everyone
+/// else, as the agent requires, whatever the caller's umask.
 fn state_dir(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     dir.canonicalize().unwrap().join("state")
 }
 
