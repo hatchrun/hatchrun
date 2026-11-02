@@ -65,6 +65,8 @@ const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 /// How long the broker keeps a boot document for its instance, in
 /// seconds.
 const TICKET_EXPIRES_IN: u64 = token::BOOT_SECS;
+/// Why a delivery is retried while another one is launching the job.
+const STILL_LAUNCHING: &str = "the job is still launching or its end is not recorded";
 /// The message that ends a job whose launch message ran out of retries.
 const DEAD_LETTER_MESSAGE: &str = "the launch did not finish";
 /// The message that ends a job whose row names no runner template.
@@ -156,6 +158,13 @@ pub async fn consume(batch: MessageBatch<LaunchMessage>, env: Env) {
     for (message, result) in messages.iter().zip(results) {
         match result {
             Ok(()) => message.ack(),
+            // A second message for a job that is mid-launch is normal: a
+            // wake and the original, or a reconciler requeue. It waits
+            // its turn and is not an error.
+            Err(err) if err == STILL_LAUNCHING => {
+                console_log!("launch queue: job {}: {err}", message.body().job_id);
+                message.retry_with_options(&delay);
+            }
             Err(err) => {
                 console_error!("launch queue: job {}: {err}", message.body().job_id);
                 message.retry_with_options(&delay);
@@ -195,7 +204,7 @@ async fn launch(
     match delivery {
         Delivery::Skip => return Ok(()),
         Delivery::Wait => {
-            return Err("the job is still launching or its end is not recorded".to_owned());
+            return Err(STILL_LAUNCHING.to_owned());
         }
         Delivery::Launch | Delivery::GiveUp => {}
     }
