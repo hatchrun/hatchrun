@@ -382,7 +382,7 @@ pub fn fires(schedules: &[ScheduleRow], minutes: &[u64]) -> Vec<Fire> {
 
 /// Counts the firings of one pass that start a run, against
 /// [`MAX_FIRES`]. A firing whose run an earlier pass made, or whose
-/// repository has no head, is not counted. A start that fails is: the
+/// repository has no head, takes no slot. A start that fails is: the
 /// attempt was made and paid for.
 #[derive(Default)]
 struct FireCap {
@@ -396,7 +396,8 @@ impl FireCap {
         self.started += 1;
     }
 
-    /// Counts `n` firings left unread because the cap is full.
+    /// Counts `n` firings left unchecked because the cap is full. Some
+    /// of them may already have their run, so this is an upper bound.
     fn skip(&mut self, n: usize) {
         self.skipped += n;
     }
@@ -596,7 +597,7 @@ async fn fire_schedules(
     }
     if cap.skipped > 0 {
         console_error!(
-            "reconcile: {} scheduled runs over the limit of {MAX_FIRES} skipped",
+            "reconcile: up to {} scheduled runs over the limit of {MAX_FIRES} skipped",
             cap.skipped
         );
     }
