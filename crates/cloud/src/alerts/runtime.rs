@@ -4,6 +4,8 @@
 
 //! Storage, email and the entry points the Worker calls.
 
+use std::time::Duration;
+
 use serde::Deserialize;
 use worker::{Env, SendEmail, SendEmailBuilder, console_error};
 
@@ -22,18 +24,47 @@ use crate::github::RateLimit;
 /// Every alert.
 const ALERTS: &str = "SELECT key, state, detail, fired_at, resolved_at, sent FROM alerts";
 
-/// Writes an alert's row.
+/// Writes an alert's row if it is still the row `$8`, `$9`, `$10` and
+/// `$11` (state, `fired_at`, sent and detail) describe. A row another pass inserted or
+/// changed in between is left alone.
 const SAVE: &str = "INSERT INTO alerts (key, state, detail, fired_at, resolved_at, sent, \
      updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
      ON CONFLICT (key) DO UPDATE SET state = excluded.state, detail = excluded.detail, \
      fired_at = excluded.fired_at, resolved_at = excluded.resolved_at, sent = excluded.sent, \
-     updated_at = excluded.updated_at";
+     updated_at = excluded.updated_at \
+     WHERE alerts.state = $8 AND alerts.fired_at = $9 \
+     AND alerts.sent IS NOT DISTINCT FROM $10 AND alerts.detail IS NOT DISTINCT FROM $11";
+
+/// Claims the email saying `$2` for the incident of `$1` that fired at
+/// `$5`, until `$4`: the row must still be that incident, due the email
+/// (see `Alert::due`), and carry no claim that lasts past `$3`.
+const CLAIM: &str = "UPDATE alerts SET sending_until = $4 \
+     WHERE key = $1 AND state = $2 AND fired_at = $5 AND sent IS DISTINCT FROM $2 \
+     AND NOT ($2 = 'resolved' AND sent IS NULL) \
+     AND (sending_until IS NULL OR sending_until <= $3)";
+
+/// Notes that the email saying `$2` went out for the incident of `$1`
+/// that fired at `$5`, and ends the claim `$4`. The row's state is not
+/// matched: a firing email that was in flight when the alert resolved is
+/// still noted, so the resolution follows it. Matches nothing when the
+/// claim ran out and the row moved on.
+const SENT: &str = "UPDATE alerts SET sent = $2, sending_until = NULL, updated_at = $3 \
+     WHERE key = $1 AND fired_at = $5 AND sending_until = $4";
+
+/// Ends the claim `$2` on `$1`, if it is still the row's.
+const RELEASE: &str =
+    "UPDATE alerts SET sending_until = NULL WHERE key = $1 AND sending_until = $2";
 
 /// When the last digest went out.
 const DIGEST_AT: &str = "SELECT digest_at FROM reconciler WHERE id = 1";
 
-/// Notes that a digest went out at `$1`.
-const DIGESTED: &str = "UPDATE reconciler SET digest_at = $1 WHERE id = 1";
+/// Records a digest at `$1` if the last one is still `$2`.
+const DIGEST_CLAIM: &str =
+    "UPDATE reconciler SET digest_at = $1 WHERE id = 1 AND digest_at IS NOT DISTINCT FROM $2";
+
+/// Takes back the digest at `$1`, restoring `$2`, unless another came
+/// after it.
+const DIGEST_UNDO: &str = "UPDATE reconciler SET digest_at = $2 WHERE id = 1 AND digest_at = $1";
 
 /// Alerts kept in the database.
 pub(crate) struct Kept<'a>(pub &'a Db);
@@ -43,20 +74,82 @@ impl Store for Kept<'_> {
         self.0.all(ALERTS, &[]).await.map_err(text)
     }
 
-    async fn save(&self, alert: &Alert, now: u64) -> Result<(), String> {
-        self.0
+    async fn save(&self, prev: Option<&Alert>, next: &Alert, now: u64) -> Result<bool, String> {
+        // A new alert has no row to match, so a row found is another pass's.
+        let changed = self
+            .0
             .run(
                 SAVE,
                 &params![
-                    alert.key.as_str(),
-                    alert.state.as_str(),
-                    alert.detail.as_str(),
-                    alert.fired_at,
-                    alert.resolved_at,
-                    alert.sent.map(State::as_str),
+                    next.key.as_str(),
+                    next.state.as_str(),
+                    next.detail.as_str(),
+                    next.fired_at,
+                    next.resolved_at,
+                    next.sent.map(State::as_str),
                     now,
+                    prev.map(|prev| prev.state.as_str()),
+                    prev.map(|prev| prev.fired_at),
+                    prev.and_then(|prev| prev.sent).map(State::as_str),
+                    prev.map(|prev| prev.detail.as_str()),
                 ],
             )
+            .await
+            .map_err(text)?;
+        Ok(changed > 0)
+    }
+
+    async fn claim(
+        &self,
+        alert: &Alert,
+        state: State,
+        now: u64,
+        until: u64,
+    ) -> Result<bool, String> {
+        let changed = self
+            .0
+            .run(
+                CLAIM,
+                &params![
+                    alert.key.as_str(),
+                    state.as_str(),
+                    now,
+                    until,
+                    alert.fired_at
+                ],
+            )
+            .await
+            .map_err(text)?;
+        Ok(changed > 0)
+    }
+
+    async fn sent(
+        &self,
+        alert: &Alert,
+        state: State,
+        until: u64,
+        now: u64,
+    ) -> Result<bool, String> {
+        let changed = self
+            .0
+            .run(
+                SENT,
+                &params![
+                    alert.key.as_str(),
+                    state.as_str(),
+                    now,
+                    until,
+                    alert.fired_at
+                ],
+            )
+            .await
+            .map_err(text)?;
+        Ok(changed > 0)
+    }
+
+    async fn release(&self, key: &str, until: u64) -> Result<(), String> {
+        self.0
+            .run(RELEASE, &params![key, until])
             .await
             .map_err(text)?;
         Ok(())
@@ -75,8 +168,20 @@ impl Store for Kept<'_> {
             .and_then(|row| row.digest_at))
     }
 
-    async fn digested(&self, at: u64) -> Result<(), String> {
-        self.0.run(DIGESTED, &params![at]).await.map_err(text)?;
+    async fn digest_claim(&self, last: Option<u64>, at: u64) -> Result<bool, String> {
+        let changed = self
+            .0
+            .run(DIGEST_CLAIM, &params![at, last])
+            .await
+            .map_err(text)?;
+        Ok(changed > 0)
+    }
+
+    async fn digest_undo(&self, last: Option<u64>, at: u64) -> Result<(), String> {
+        self.0
+            .run(DIGEST_UNDO, &params![at, last])
+            .await
+            .map_err(text)?;
         Ok(())
     }
 }
@@ -116,6 +221,14 @@ impl Mail for Inbox {
                     .and_then(|message| message.as_string())
                     .unwrap_or_else(|| "send failed".to_owned())
             })
+    }
+
+    fn now(&self) -> u64 {
+        crate::now_ms()
+    }
+
+    async fn sleep(&self, ms: u64) {
+        worker::Delay::from(Duration::from_millis(ms)).await;
     }
 }
 

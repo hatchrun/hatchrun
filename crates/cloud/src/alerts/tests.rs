@@ -15,25 +15,71 @@ const NOW: u64 = 1_800_000_000_000;
 const HOUR: u64 = 60 * MINUTE;
 const NONE: [&str; 0] = [];
 
-/// Collects emails, or fails them while `down`.
+/// Collects emails, or fails them while `down`. Keeps its own clock,
+/// which a send moves on by `lag` and each reading of it by `step`.
+/// While `stall` is set a send never completes and the time bound on it
+/// runs out at once; while `hold` is set a send waits for the test.
+/// `bound` is the last time bound a send was given.
 #[derive(Default)]
 struct Outbox {
     sent: RefCell<Vec<Email>>,
     down: Cell<bool>,
+    stall: Cell<bool>,
+    hold: Cell<bool>,
+    entered: Cell<bool>,
+    clock: Cell<u64>,
+    lag: Cell<u64>,
+    step: Cell<u64>,
+    bound: Cell<Option<u64>>,
 }
 
 #[allow(clippy::unused_async_trait_impl)]
 impl Mail for Outbox {
     async fn send(&self, email: &Email) -> Result<(), String> {
+        self.clock.set(self.clock.get() + self.lag.get());
+        if self.stall.get() {
+            std::future::pending::<()>().await;
+        }
+        if self.hold.get() {
+            self.entered.set(true);
+            std::future::poll_fn(|cx| {
+                if self.hold.get() {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(())
+                }
+            })
+            .await;
+        }
         if self.down.get() {
             return Err("Email Service unavailable".to_owned());
         }
         self.sent.borrow_mut().push(email.clone());
         Ok(())
     }
+
+    fn now(&self) -> u64 {
+        let now = self.clock.get();
+        self.clock.set(now + self.step.get());
+        now
+    }
+
+    async fn sleep(&self, ms: u64) {
+        self.bound.set(Some(ms));
+        if !self.stall.get() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 impl Outbox {
+    /// Sets the clock to `now`.
+    fn at(&self, now: u64) -> &Self {
+        self.clock.set(now);
+        self
+    }
+
     /// The subjects sent since the last call.
     fn take(&self) -> Vec<String> {
         self.sent
@@ -44,10 +90,26 @@ impl Outbox {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct Claim {
+    sending_until: Option<u64>,
+}
+
+fn claimed_until(db: &Db, key: Key) -> Option<u64> {
+    db.first::<Claim>(
+        "SELECT sending_until FROM alerts WHERE key = $1",
+        &params![key.as_str()],
+    )
+    .unwrap()
+    .sending_until
+}
+
 /// A store that fails to save the row of one alert.
 struct Unsaved<'a> {
     kept: Kept<'a>,
     key: Key,
+    /// Digest undos that fail before one works.
+    undo_fails: Cell<u32>,
 }
 
 impl Store for Unsaved<'_> {
@@ -55,24 +117,56 @@ impl Store for Unsaved<'_> {
         self.kept.alerts().await
     }
 
-    async fn save(&self, alert: &Alert, now: u64) -> Result<(), String> {
-        if alert.key == self.key.as_str() {
+    async fn save(&self, prev: Option<&Alert>, next: &Alert, now: u64) -> Result<bool, String> {
+        if next.key == self.key.as_str() {
             return Err("database unavailable".to_owned());
         }
-        self.kept.save(alert, now).await
+        self.kept.save(prev, next, now).await
+    }
+
+    async fn claim(
+        &self,
+        alert: &Alert,
+        state: State,
+        now: u64,
+        until: u64,
+    ) -> Result<bool, String> {
+        self.kept.claim(alert, state, now, until).await
+    }
+
+    async fn sent(
+        &self,
+        alert: &Alert,
+        state: State,
+        until: u64,
+        now: u64,
+    ) -> Result<bool, String> {
+        self.kept.sent(alert, state, until, now).await
+    }
+
+    async fn release(&self, key: &str, until: u64) -> Result<(), String> {
+        self.kept.release(key, until).await
     }
 
     async fn digest_at(&self) -> Result<Option<u64>, String> {
         self.kept.digest_at().await
     }
 
-    async fn digested(&self, at: u64) -> Result<(), String> {
-        self.kept.digested(at).await
+    async fn digest_claim(&self, last: Option<u64>, at: u64) -> Result<bool, String> {
+        self.kept.digest_claim(last, at).await
+    }
+
+    async fn digest_undo(&self, last: Option<u64>, at: u64) -> Result<(), String> {
+        if self.undo_fails.get() > 0 {
+            self.undo_fails.set(self.undo_fails.get() - 1);
+            return Err("database unavailable".to_owned());
+        }
+        self.kept.digest_undo(last, at).await
     }
 }
 
 fn pass(db: &Db, outbox: &Outbox, now: u64, seen: &[(Key, Seen)]) -> Vec<String> {
-    db.wait(settle(&Kept(db.db()), outbox, now, seen, true))
+    db.wait(settle(&Kept(db.db()), outbox.at(now), now, seen, true))
 }
 
 fn firing(detail: &str) -> Seen {
@@ -335,6 +429,201 @@ fn a_failed_send_is_tried_on_the_next_pass() {
 }
 
 #[test]
+fn a_racing_pass_cannot_send_an_email_another_pass_claimed() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    outbox.down.set(true);
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    outbox.down.set(false);
+
+    // The other pass claimed the email and is sending it.
+    let row = alert(&db, key);
+    let other = Kept(db.db());
+    let at = NOW + MINUTE;
+    assert!(
+        db.wait(other.claim(&row, State::Firing, at, at + CLAIM_FOR))
+            .unwrap()
+    );
+    assert_eq!(pass(&db, &outbox, at, &[(key, Seen::Unknown)]), NONE);
+    assert_eq!(outbox.take(), NONE);
+    assert!(
+        !db.wait(other.claim(&row, State::Firing, at, at + CLAIM_FOR))
+            .unwrap()
+    );
+
+    // It crashed: the claim ends and the next pass sends, once.
+    let later = at + CLAIM_FOR;
+    assert_eq!(pass(&db, &outbox, later, &[(key, Seen::Unknown)]), NONE);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
+    assert_eq!(alert(&db, key).sent, Some(State::Firing));
+    assert!(
+        !db.wait(other.claim(&row, State::Firing, later, later + CLAIM_FOR))
+            .unwrap()
+    );
+    assert_eq!(pass(&db, &outbox, later + MINUTE, &[]), NONE);
+    assert_eq!(outbox.take(), NONE);
+}
+
+#[test]
+fn a_failed_send_ends_the_claim() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    outbox.down.set(true);
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    outbox.down.set(false);
+    // The retry comes well inside the claim's time.
+    assert_eq!(pass(&db, &outbox, NOW + 1, &[]), NONE);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
+}
+
+#[test]
+fn a_late_sent_or_release_leaves_another_passs_claim_alone() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    outbox.down.set(true);
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    outbox.down.set(false);
+    let row = alert(&db, key);
+    let kept = Kept(db.db());
+
+    // The first pass claims and stalls past its claim; a second pass
+    // claims after it ran out.
+    let first = NOW + MINUTE;
+    let second = first + CLAIM_FOR;
+    assert!(
+        db.wait(kept.claim(&row, State::Firing, first, first + CLAIM_FOR))
+            .unwrap()
+    );
+    assert!(
+        db.wait(kept.claim(&row, State::Firing, second, second + CLAIM_FOR))
+            .unwrap()
+    );
+    // The first pass wakes up and finishes. Neither call touches the
+    // second pass's claim.
+    db.wait(kept.sent(&row, State::Firing, first + CLAIM_FOR, second))
+        .unwrap();
+    assert_eq!(alert(&db, key).sent, None);
+    db.wait(kept.release(key.as_str(), first + CLAIM_FOR))
+        .unwrap();
+    assert_eq!(pass(&db, &outbox, second + 1, &[]), NONE);
+    assert_eq!(outbox.take(), NONE);
+
+    // Once the second claim ends the email goes out, once.
+    assert_eq!(pass(&db, &outbox, second + CLAIM_FOR, &[]), NONE);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
+}
+
+#[test]
+fn a_late_sent_for_an_old_incident_leaves_the_new_one_unannounced() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    outbox.down.set(true);
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    outbox.down.set(false);
+    let old = alert(&db, key);
+    let kept = Kept(db.db());
+    let at = NOW + MINUTE;
+    let until = at + CLAIM_FOR;
+    assert!(db.wait(kept.claim(&old, State::Firing, at, until)).unwrap());
+
+    // The alert resolved and fired again while that pass was sending.
+    let new = Alert {
+        detail: "job 6".to_owned(),
+        fired_at: NOW + 2 * MINUTE,
+        ..old.clone()
+    };
+    assert!(db.wait(kept.save(Some(&old), &new, at)).unwrap());
+    db.wait(kept.sent(&old, State::Firing, until, at)).unwrap();
+    assert_eq!(alert(&db, key).sent, None);
+
+    assert_eq!(pass(&db, &outbox, until, &[(key, Seen::Unknown)]), NONE);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
+    assert_eq!(alert(&db, key).sent, Some(State::Firing));
+}
+
+#[test]
+fn a_stale_snapshot_cannot_claim_a_newer_incident() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    outbox.down.set(true);
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    let stale = alert(&db, key);
+    let kept = Kept(db.db());
+    let new = Alert {
+        fired_at: NOW + MINUTE,
+        ..stale.clone()
+    };
+    assert!(
+        db.wait(kept.save(Some(&stale), &new, NOW + MINUTE))
+            .unwrap()
+    );
+    let at = NOW + 2 * MINUTE;
+    assert!(
+        !db.wait(kept.claim(&stale, State::Firing, at, at + CLAIM_FOR))
+            .unwrap()
+    );
+    assert!(
+        db.wait(kept.claim(&new, State::Firing, at, at + CLAIM_FOR))
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_stale_detail_cannot_overwrite_a_newer_one() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    let stale = alert(&db, key);
+    pass(&db, &outbox, NOW + MINUTE, &[(key, firing("job 6"))]);
+    assert_eq!(alert(&db, key).detail, "job 6");
+
+    let next = Alert {
+        detail: "job 7".to_owned(),
+        ..stale.clone()
+    };
+    let kept = Kept(db.db());
+    assert!(
+        !db.wait(kept.save(Some(&stale), &next, NOW + MINUTE))
+            .unwrap()
+    );
+    assert_eq!(alert(&db, key).detail, "job 6");
+}
+
+#[test]
+fn a_stale_snapshot_cannot_overwrite_a_newer_row() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    let stale = alert(&db, key);
+    assert_eq!(stale.sent, Some(State::Firing));
+    pass(&db, &outbox, NOW + HOUR, &[(key, Seen::Clear)]);
+    assert_eq!(alert(&db, key).sent, Some(State::Resolved));
+
+    // A pass that read the row before it resolved has a new detail.
+    let kept = Kept(db.db());
+    let next = Alert {
+        detail: "job 6".to_owned(),
+        ..stale.clone()
+    };
+    assert!(!db.wait(kept.save(Some(&stale), &next, NOW + HOUR)).unwrap());
+    // And one that found no row when another pass had inserted it.
+    assert!(!db.wait(kept.save(None, &next, NOW + HOUR)).unwrap());
+    let row = alert(&db, key);
+    assert_eq!(
+        (row.state, row.sent),
+        (State::Resolved, Some(State::Resolved))
+    );
+    assert_eq!(row.detail, "job 5");
+}
+
+#[test]
 fn an_alert_that_fires_again_after_a_failed_resolution_email_is_announced() {
     let db = Db::new();
     let outbox = Outbox::default();
@@ -368,10 +657,11 @@ fn an_alert_whose_row_fails_to_save_sends_nothing_that_pass() {
     let store = Unsaved {
         kept: Kept(db.db()),
         key,
+        undo_fails: Cell::new(0),
     };
     let errors = db.wait(settle(
         &store,
-        &outbox,
+        outbox.at(NOW + MINUTE),
         NOW + MINUTE,
         &[(key, Seen::Clear)],
         true,
@@ -396,10 +686,11 @@ fn a_failed_save_of_a_new_detail_still_announces_the_alert() {
     let store = Unsaved {
         kept: Kept(db.db()),
         key,
+        undo_fails: Cell::new(0),
     };
     db.wait(settle(
         &store,
-        &outbox,
+        outbox.at(NOW + MINUTE),
         NOW + MINUTE,
         &[(key, firing("job 6"))],
         true,
@@ -598,7 +889,7 @@ fn the_dead_letter_queue_records_each_launch_once() {
     let fire = |now| {
         db.wait(settle(
             &Kept(db.db()),
-            &outbox,
+            outbox.at(now),
             now,
             &[(Key::LaunchFailed, seen.clone())],
             false,
@@ -671,4 +962,257 @@ fn the_database_reads_its_connections_and_size() {
         "{database:?}"
     );
     assert!(database.bytes > 0, "{database:?}");
+}
+
+#[test]
+fn a_claim_starts_when_it_is_made() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let (first, second) = (Key::LaunchFailed, Key::JobsWaiting);
+    // Each send takes three minutes and never finishes, so both claims
+    // stay on their rows.
+    outbox.lag.set(3 * MINUTE);
+    outbox.stall.set(true);
+    let errors = pass(
+        &db,
+        &outbox,
+        NOW,
+        &[(first, firing("job 5")), (second, firing("job 6"))],
+    );
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    let mut until = [claimed_until(&db, first), claimed_until(&db, second)];
+    until.sort();
+    assert_eq!(
+        until,
+        [Some(NOW + CLAIM_FOR), Some(NOW + 3 * MINUTE + CLAIM_FOR)]
+    );
+}
+
+#[test]
+fn a_firing_email_in_flight_when_the_alert_resolves_is_followed_by_the_resolution() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    outbox.down.set(true);
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    outbox.down.set(false);
+    let row = alert(&db, key);
+    let kept = Kept(db.db());
+    let at = NOW + MINUTE;
+
+    // The firing email waits in flight while the check saves a clear
+    // observation, then goes out.
+    outbox.hold.set(true);
+    let resolve = async {
+        let start = std::time::Instant::now();
+        while !outbox.entered.get() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "the firing send never started"
+            );
+            tokio::task::yield_now().await;
+        }
+        let resolved = Alert {
+            state: State::Resolved,
+            resolved_at: Some(at),
+            ..row.clone()
+        };
+        assert!(kept.save(Some(&row), &resolved, at).await.unwrap());
+        outbox.hold.set(false);
+    };
+    let (errors, ()) = db.wait(futures_util::future::join(
+        settle(&kept, outbox.at(at), at, &[], true),
+        resolve,
+    ));
+    assert_eq!(errors, NONE);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
+    let stored = alert(&db, key);
+    assert_eq!(
+        (stored.state, stored.sent),
+        (State::Resolved, Some(State::Firing))
+    );
+
+    assert_eq!(pass(&db, &outbox, at + 1, &[]), NONE);
+    assert_eq!(
+        outbox.take(),
+        ["[hatchrun] Resolved: Launch failed for good"]
+    );
+}
+
+#[test]
+fn a_claim_too_close_to_its_end_is_given_back_unsent() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    // Reading the clock after the claim finds it just too late to send
+    // and record the email inside the claim.
+    outbox.step.set(CLAIM_FOR - SEND_FOR - RECORD_FOR + 1);
+    let errors = pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("too close"), "{errors:?}");
+    assert_eq!(outbox.take(), NONE);
+    assert_eq!(claimed_until(&db, key), None);
+
+    outbox.step.set(0);
+    assert_eq!(pass(&db, &outbox, NOW + MINUTE, &[]), NONE);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
+}
+
+#[test]
+fn two_passes_send_one_digest() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    pass(&db, &outbox, NOW, &[]);
+    pass(
+        &db,
+        &outbox,
+        NOW + HOUR,
+        &[(Key::JobsWaiting, firing("acme"))],
+    );
+    assert_eq!(outbox.take().len(), 1);
+
+    // Both passes read the same last digest before either claims.
+    let kept = Kept(db.db());
+    let firing = [alert(&db, Key::JobsWaiting)];
+    let at = NOW + DAY;
+    let results = db.wait(futures_util::future::join(
+        send_digest(&kept, outbox.at(at), at, &firing),
+        send_digest(&kept, outbox.at(at), at, &firing),
+    ));
+    assert_eq!(results, (Ok(()), Ok(())));
+    assert_eq!(outbox.take(), ["[hatchrun] Still firing: 1 alerts"]);
+}
+
+#[test]
+fn a_new_incident_never_reuses_the_time_the_last_one_fired() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    let old = alert(&db, key);
+    pass(&db, &outbox, NOW, &[(key, Seen::Clear)]);
+    pass(&db, &outbox, NOW, &[(key, firing("job 6"))]);
+    let new = alert(&db, key);
+    assert_eq!((old.fired_at, new.fired_at), (NOW, NOW + 1));
+    outbox.take();
+
+    // A claim on the old incident's snapshot finds the new incident.
+    let kept = Kept(db.db());
+    let at = NOW + MINUTE;
+    assert!(
+        !db.wait(kept.claim(&old, State::Firing, at, at + CLAIM_FOR))
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_send_that_outlasts_its_time_keeps_the_claim() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    outbox.stall.set(true);
+    let errors = pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("no answer"), "{errors:?}");
+    assert_eq!(outbox.bound.get(), Some(SEND_FOR));
+    assert_eq!(claimed_until(&db, key), Some(NOW + CLAIM_FOR));
+    assert_eq!(alert(&db, key).sent, None);
+
+    // Another pass inside the claim sends nothing, the stalled one
+    // included.
+    outbox.stall.set(false);
+    assert_eq!(pass(&db, &outbox, NOW + MINUTE, &[]), NONE);
+    assert_eq!(outbox.take(), NONE);
+
+    // After the claim ran out the email goes out.
+    assert_eq!(pass(&db, &outbox, NOW + CLAIM_FOR, &[]), NONE);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
+    assert_eq!(alert(&db, key).sent, Some(State::Firing));
+}
+
+#[test]
+fn a_failed_digest_send_reports_the_mail_error_and_undoes_its_claim() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    pass(&db, &outbox, NOW, &[]);
+    pass(
+        &db,
+        &outbox,
+        NOW + HOUR,
+        &[(Key::JobsWaiting, firing("acme"))],
+    );
+    outbox.take();
+    let firing = [alert(&db, Key::JobsWaiting)];
+    let store = Unsaved {
+        kept: Kept(db.db()),
+        key: Key::RateLimit,
+        undo_fails: Cell::new(1),
+    };
+    let digest_at = || db.wait(Kept(db.db()).digest_at()).unwrap();
+
+    // The undo works on its second try.
+    outbox.down.set(true);
+    let at = NOW + DAY;
+    let err = db
+        .wait(send_digest(&store, outbox.at(at), at, &firing))
+        .unwrap_err();
+    assert_eq!(err, "Email Service unavailable");
+    assert_eq!(digest_at(), Some(NOW));
+
+    // Both fail: the claim stays and the error says so.
+    store.undo_fails.set(2);
+    let at = NOW + 2 * DAY;
+    let err = db
+        .wait(send_digest(&store, outbox.at(at), at, &firing))
+        .unwrap_err();
+    assert!(err.starts_with("Email Service unavailable;"), "{err}");
+    assert!(err.contains("database unavailable"), "{err}");
+    assert_eq!(digest_at(), Some(at));
+}
+
+#[test]
+fn a_digest_waits_for_the_pass_that_reads_every_firing_alert() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let (stale, other) = (Key::LaunchFailed, Key::JobsWaiting);
+    pass(&db, &outbox, NOW, &[]);
+    pass(
+        &db,
+        &outbox,
+        NOW + HOUR,
+        &[(stale, firing("job 5")), (other, firing("acme"))],
+    );
+    assert_eq!(outbox.take().len(), 2);
+
+    // One alert's row is stale after a lost save, so the digest is held
+    // back and the day stays unclaimed.
+    let store = Unsaved {
+        kept: Kept(db.db()),
+        key: stale,
+        undo_fails: Cell::new(0),
+    };
+    let at = NOW + DAY;
+    let errors = db.wait(settle(
+        &store,
+        outbox.at(at),
+        at,
+        &[(stale, Seen::Clear)],
+        true,
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(outbox.take(), NONE);
+    assert_eq!(db.wait(Kept(db.db()).digest_at()), Ok(Some(NOW)));
+
+    // The next pass sends it with the stored rows.
+    assert_eq!(
+        pass(&db, &outbox, at + MINUTE, &[(stale, Seen::Clear)]),
+        NONE
+    );
+    assert_eq!(
+        outbox.take(),
+        [
+            "[hatchrun] Resolved: Launch failed for good",
+            "[hatchrun] Still firing: 1 alerts"
+        ]
+    );
 }
