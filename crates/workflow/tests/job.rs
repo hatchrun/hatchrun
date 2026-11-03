@@ -62,6 +62,7 @@ fn document(job: PlannedJob) -> JobDocument {
             url: "https://ci.example/v1/oidc/token?api-version=2.0".into(),
             token: "i_tok".into(),
         }),
+        artifacts: None,
     }
 }
 

@@ -104,7 +104,10 @@ secret_name = "ci-secrets-key-2026-10"
 # deploy-ci.yml, and CI_ROLE_ARN, set once on the Worker by hand: the
 # RoleArn output of deploy/cloudformation/ci-account.yaml, the role
 # the Worker assumes in the CI AWS account. The Worker finds the
-# launch template and subnets there by name and tag.
+# launch template and subnets there by name and tag. ARTIFACTS_BUCKET is
+# set by hand the same way: the ArtifactsBucket output of that stack, the
+# S3 bucket of artifacts (the agent gets the artifact service only once
+# it is set).
 # Variables: those below.
 [vars]
 # production, staging or dev. The local launcher backend is refused in

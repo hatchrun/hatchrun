@@ -590,6 +590,7 @@ mod tests {
             timings: BTreeMap::new(),
             cache: None,
             id_token: None,
+            artifacts: None,
         }
     }
 

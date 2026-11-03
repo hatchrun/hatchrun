@@ -146,6 +146,7 @@ pub(crate) fn job_document(
         timings: std::collections::BTreeMap::new(),
         cache: None,
         id_token: None,
+        artifacts: None,
     })
 }
 

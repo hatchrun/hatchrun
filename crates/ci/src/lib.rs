@@ -17,6 +17,8 @@
 //! - `GET /v1/oidc/token` gives a job with `id-token: write` its OIDC
 //!   token (see [`oidc`]); the same Worker serves the issuer's discovery
 //!   document and JWKS on `token.ci.hatchrun.io`.
+//! - `/v1/agent/artifacts/*` is the artifact service behind
+//!   `actions/upload-artifact` and `download-artifact` (see [`artifacts`]).
 //! - `/api/ci/*` serves runs, jobs and logs to the app and takes its
 //!   dispatch and cancel requests; `hatchrun-cloud` forwards them.
 //!
@@ -27,6 +29,7 @@
 pub mod access;
 pub mod agent;
 pub mod api;
+pub mod artifacts;
 pub mod billing;
 pub mod checks;
 pub mod concurrency;

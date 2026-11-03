@@ -112,6 +112,13 @@ pub fn get_object(url: &str) -> Request {
     Request::new("GET", url)
 }
 
+/// Deletes the object at `url`. S3 answers 204 for a key that is not
+/// there too.
+#[must_use]
+pub fn delete_object(url: &str) -> Request {
+    Request::new("DELETE", url)
+}
+
 /// Lists up to 1,000 keys in the bucket at `bucket_url` that start with
 /// `prefix`, after `continuation` when set.
 #[must_use]

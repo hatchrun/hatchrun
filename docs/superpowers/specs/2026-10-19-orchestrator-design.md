@@ -208,7 +208,12 @@ and the minute reconciler. The orchestrator follows the same patterns.
   index of where each step starts, and the Durable Object drops its
   copy.
 - **Cache and artifacts in S3** in the runners' region, through a VPC
-  gateway endpoint, so the bytes never leave AWS. Artifacts download
+  gateway endpoint, so the bytes never leave AWS. The agent serves the
+  artifact service of `actions/upload-artifact` and
+  `download-artifact` (v4 and up) and the control plane keeps one S3
+  object per artifact under
+  `artifacts/<days>d/<tenant>/<repo id>/<run id>/`, readable only by
+  jobs of the same run, earlier attempts included. Artifacts download
   through presigned URLs.
 - **GitHub gets the summary.** Each job's check run carries its status,
   a summary, the tail of a failed step and a link to the full log in

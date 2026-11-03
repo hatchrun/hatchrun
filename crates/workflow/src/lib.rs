@@ -8,6 +8,7 @@
 //! in a Cloudflare Worker, the runner agent and the CLI.
 
 pub mod agent;
+pub mod artifacts;
 pub mod concurrency;
 pub mod config;
 pub mod convert;
@@ -38,8 +39,8 @@ pub use expr::{
     hatchrun_context, interpolate, job_condition, secret_refs, truthy,
 };
 pub use job::{
-    Annotation, AnnotationLevel, CacheService, Conclusion, Github, IdTokenRequest, JobDocument,
-    JobResult, Need, StepSummary,
+    Annotation, AnnotationLevel, ArtifactService, CacheService, Conclusion, Github, IdTokenRequest,
+    JobDocument, JobResult, Need, StepSummary,
 };
 pub use permissions::{
     DEFAULT_SCOPES, ID_TOKEN, ID_TOKEN_SCOPE, Level, Permissions, SCOPES, token_scopes,

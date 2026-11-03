@@ -46,6 +46,9 @@ pub struct JobDocument {
     /// Where the job asks for OIDC tokens. `None` unless the job has
     /// `id-token: write`.
     pub id_token: Option<IdTokenRequest>,
+    /// The artifact service, when the control plane has one. The agent
+    /// serves `actions/upload-artifact` and `download-artifact` from it.
+    pub artifacts: Option<ArtifactService>,
 }
 
 impl fmt::Debug for JobDocument {
@@ -67,6 +70,7 @@ impl fmt::Debug for JobDocument {
             .field("timings", &self.timings)
             .field("cache", &self.cache)
             .field("id_token", &self.id_token)
+            .field("artifacts", &self.artifacts)
             .finish()
     }
 }
@@ -169,6 +173,27 @@ pub struct IdTokenRequest {
 impl fmt::Debug for IdTokenRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IdTokenRequest")
+            .field("url", &self.url)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Where and how to reach the artifact service of the control plane.
+/// The token is the job's own; the service answers only for the job's
+/// run.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ArtifactService {
+    /// The service's base URL.
+    pub url: String,
+    /// The bearer token.
+    pub token: String,
+}
+
+impl fmt::Debug for ArtifactService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArtifactService")
             .field("url", &self.url)
             .field("token", &"[redacted]")
             .finish()
