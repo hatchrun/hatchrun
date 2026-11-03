@@ -42,7 +42,15 @@ async fn control_plane(claim: ResponseTemplate) -> MockServer {
     server
 }
 
+/// The agent refuses a state path other users could write to, and a
+/// temp dir takes its mode from the caller's umask.
+fn close_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 async fn agent(server: &MockServer, dir: &Path) -> Option<i32> {
+    close_dir(dir);
     let user_data = dir.join("user-data.json");
     let doc = json!({"mode": "ci", "broker": server.uri(), "ticket": "t"});
     std::fs::write(&user_data, doc.to_string()).unwrap();
@@ -168,6 +176,7 @@ async fn the_agent_leaves_the_job_level_if_to_the_control_plane() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_cancels_the_job_and_still_reports() {
     let dir = tempfile::tempdir().unwrap();
+    close_dir(dir.path());
     let doc = make::document(vec![make::step("echo ready; sleep 30")]);
     let server = control_plane(job(&doc)).await;
     let user_data = dir.path().join("user-data.json");

@@ -30,8 +30,8 @@
 //! pass. Rows and runs are bounded too: [`MAX_MINUTES`] minutes,
 //! [`MAX_FIXES`] stalled jobs,
 //! [`MAX_TERMINATIONS`] terminated instances and [`store::SWEEP_LIMIT`]
-//! purged runs. Scheduled runs past [`MAX_FIRES`] in one pass are
-//! skipped and logged.
+//! purged runs. Scheduled runs past [`MAX_FIRES`] started in one pass
+//! are skipped and logged.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -352,36 +352,59 @@ impl Fire {
     }
 }
 
-/// The firings of `schedules` in `minutes`, oldest minute first, at most
-/// [`MAX_FIRES`]; the second answer is how many were left out. A cron
-/// that does not parse never fires.
+/// The firings of `schedules` in `minutes`, oldest minute first. A cron
+/// that does not parse never fires. The cap of [`MAX_FIRES`] is not
+/// applied here: a firing whose run already exists costs nothing, so
+/// [`FireCap`] counts the ones that start a run.
 #[must_use]
-pub fn fires(schedules: &[ScheduleRow], minutes: &[u64]) -> (Vec<Fire>, usize) {
+pub fn fires(schedules: &[ScheduleRow], minutes: &[u64]) -> Vec<Fire> {
     let parsed: Vec<(&ScheduleRow, Cron)> = schedules
         .iter()
         .filter_map(|row| Some((row, Cron::parse(&row.cron).ok()?)))
         .collect();
     let mut fired = Vec::new();
-    let mut skipped = 0;
     for &minute_ms in minutes {
         let at = UtcMinute::from_unix(minute_ms / 1000);
         for (row, cron) in &parsed {
             if !cron.matches(&at) {
                 continue;
             }
-            if fired.len() < MAX_FIRES {
-                fired.push(Fire {
-                    repo_id: row.repo_id,
-                    workflow: row.workflow.clone(),
-                    cron: row.cron.clone(),
-                    minute_ms,
-                });
-            } else {
-                skipped += 1;
-            }
+            fired.push(Fire {
+                repo_id: row.repo_id,
+                workflow: row.workflow.clone(),
+                cron: row.cron.clone(),
+                minute_ms,
+            });
         }
     }
-    (fired, skipped)
+    fired
+}
+
+/// Counts the firings of one pass that start a run, against
+/// [`MAX_FIRES`]. A firing whose run an earlier pass made, or whose
+/// repository has no head, takes no slot. A start that fails is: the
+/// attempt was made and paid for.
+#[derive(Default)]
+struct FireCap {
+    started: usize,
+    skipped: usize,
+}
+
+impl FireCap {
+    /// Counts a firing that is about to start a run.
+    fn start(&mut self) {
+        self.started += 1;
+    }
+
+    /// Counts `n` firings left unchecked because the cap is full. Some
+    /// of them may already have their run, so this is an upper bound.
+    fn skip(&mut self, n: usize) {
+        self.skipped += n;
+    }
+
+    fn full(&self) -> bool {
+        self.started >= MAX_FIRES
+    }
 }
 
 fn now_ms() -> u64 {
@@ -504,8 +527,7 @@ async fn fire_schedules(
     // The repository, its head and its config are read once per pass.
     let mut heads: HashMap<u64, Option<Head>> = HashMap::new();
     let mut stopped_at = None;
-    let mut fired_total = 0;
-    let mut skipped = 0;
+    let mut cap = FireCap::default();
     let mut cursor: Option<ScheduleRow> = None;
     // Schedules are read a page at a time, in key order after the last
     // row of the page before.
@@ -515,15 +537,14 @@ async fn fire_schedules(
             .map_err(|e| e.to_string())?;
         let last_page = rows.len() < SCHEDULE_ROWS as usize;
         cursor = rows.last().cloned();
-        let (mut fired, over) = fires(&rows, &due);
-        skipped += over;
-        let room = MAX_FIRES - fired_total;
-        if fired.len() > room {
-            skipped += fired.len() - room;
-            fired.truncate(room);
-        }
-        fired_total += fired.len();
-        for fire in &fired {
+        let page = fires(&rows, &due);
+        for (i, fire) in page.iter().enumerate() {
+            // Once the cap is full the rest of the page starts nothing,
+            // so it is counted as skipped without looking up its runs.
+            if cap.full() {
+                cap.skip(page.len() - i);
+                break;
+            }
             let made = store::run_for_delivery(db, &fire.delivery(), &fire.workflow)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -554,6 +575,8 @@ async fn fire_schedules(
                 stopped_at = Some(resume);
                 break 'pages;
             }
+            // A slot is used only here, by a firing that gets to start.
+            cap.start();
             if let Err(err) = start(env, db, settings, &tokens, head, fire, now).await {
                 console_error!(
                     "reconcile: schedule {} of {}: {err}",
@@ -565,15 +588,18 @@ async fn fire_schedules(
         if last_page {
             break;
         }
-        if fired_total >= MAX_FIRES {
+        if cap.full() {
             console_error!(
                 "reconcile: schedules past the limit of {MAX_FIRES} scheduled runs skipped"
             );
             break;
         }
     }
-    if skipped > 0 {
-        console_error!("reconcile: {skipped} scheduled runs over the limit of {MAX_FIRES} skipped");
+    if cap.skipped > 0 {
+        console_error!(
+            "reconcile: up to {} scheduled runs over the limit of {MAX_FIRES} skipped",
+            cap.skipped
+        );
     }
     let done = match stopped_at {
         Some(minute) => {
@@ -1116,21 +1142,32 @@ async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), Str
     }
     let expired = store::sweep(db, now).await.map_err(|e| e.to_string())?;
     budget.take(PURGE_COST * u32::try_from(expired.len()).unwrap_or(0));
-    let purged: Vec<u64> = join_all(expired.iter().map(|&run_id| async move {
+    let (purged, failed): (Vec<_>, Vec<_>) = join_all(expired.iter().map(|&run_id| async move {
         match purge(env, run_id).await {
-            Ok(()) => Some(run_id),
+            Ok(()) => (run_id, true),
             Err(err) => {
                 console_error!("reconcile: purge run {run_id}: {err}");
-                None
+                (run_id, false)
             }
         }
     }))
     .await
     .into_iter()
-    .flatten()
-    .collect();
-    // A run whose purge failed stays, and the next sweep returns it.
-    store::delete_runs(db, &purged)
+    .partition(|&(_, ok)| ok);
+    let ids = |runs: Vec<(u64, bool)>| runs.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    // A run whose purge failed stays, deferred an hour so it cannot keep
+    // newer expired runs out of the batch.
+    let failed = ids(failed);
+    if !failed.is_empty() {
+        console_error!(
+            "reconcile: {} runs not purged, retrying later",
+            failed.len()
+        );
+    }
+    store::defer_runs(db, &failed, now)
+        .await
+        .map_err(|e| e.to_string())?;
+    store::delete_runs(db, &ids(purged))
         .await
         .map_err(|e| e.to_string())
 }
@@ -1570,8 +1607,7 @@ mod tests {
             every("nonsense", "bad"),
         ];
         let due = minutes(Some(NOW - 8 * MIN), NOW);
-        let (fired, skipped) = fires(&rows, &due);
-        assert_eq!(skipped, 0);
+        let fired = fires(&rows, &due);
         // 13:41 to 13:45: every minute for ci, and :45 for slow.
         assert_eq!(fired.iter().filter(|f| f.workflow == "ci").count(), 5);
         let slow: Vec<_> = fired.iter().filter(|f| f.workflow == "slow").collect();
@@ -1585,7 +1621,21 @@ mod tests {
     }
 
     #[test]
-    fn firings_stop_at_the_limit() {
+    fn the_cap_counts_only_runs_that_start() {
+        let mut cap = FireCap::default();
+        // Firings whose run exists never reach the cap.
+        for _ in 0..MAX_FIRES - 1 {
+            cap.start();
+        }
+        assert!(!cap.full());
+        cap.start();
+        assert!(cap.full());
+        cap.skip(2);
+        assert_eq!((cap.started, cap.skipped), (MAX_FIRES, 2));
+    }
+
+    #[test]
+    fn firings_are_not_capped_before_the_run_check() {
         let rows: Vec<ScheduleRow> = (0..130)
             .map(|repo_id| ScheduleRow {
                 repo_id,
@@ -1594,9 +1644,8 @@ mod tests {
             })
             .collect();
         let due = minutes(Some(NOW - 2 * MIN), NOW);
-        let (fired, skipped) = fires(&rows, &due);
-        assert_eq!(fired.len(), 200);
-        assert_eq!(skipped, 60);
+        let fired = fires(&rows, &due);
+        assert_eq!(fired.len(), 260);
         assert!(fired[..130].iter().all(|f| f.minute_ms == NOW - MIN));
     }
 

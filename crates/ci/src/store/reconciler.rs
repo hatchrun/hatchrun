@@ -94,6 +94,13 @@ const SWEEP_RUNS: &str = "SELECT id FROM ci_runs WHERE expires_at < $1 \
 /// Deletes run `$1`; its jobs go with it.
 const DELETE_RUN: &str = "DELETE FROM ci_runs WHERE id = $1";
 
+/// Moves the expiry of run `$1` to `$2`.
+const DEFER_RUN: &str = "UPDATE ci_runs SET expires_at = $2 WHERE id = $1";
+
+/// How long a run whose purge failed waits before the sweep returns it
+/// again, in milliseconds.
+const PURGE_RETRY_MS: u64 = 3_600_000;
+
 /// The most runs one [`sweep`] returns.
 pub const SWEEP_LIMIT: u32 = 100;
 
@@ -197,8 +204,9 @@ pub async fn set_last_minute(db: &Db, minute_ms: u64) -> Result<()> {
 /// Deletes delivery ids older than 30 days and usage rows Polar took
 /// more than 90 days ago, and returns the ids of the runs that expired
 /// before `now`, at most [`SWEEP_LIMIT`], oldest first. The runs stay
-/// until [`delete_runs`], so a run whose logs could not be purged is
-/// returned again by the next sweep.
+/// until [`delete_runs`]; a run whose logs could not be purged goes
+/// through [`defer_runs`], which puts it behind the runs that expire
+/// later.
 ///
 /// # Errors
 ///
@@ -217,6 +225,26 @@ pub async fn sweep(db: &Db, now: u64) -> Result<Vec<u64>> {
     )
     .await?;
     Ok(runs.into_iter().map(|row| row.id).collect())
+}
+
+/// Moves the expiry of the runs `ids` to an hour after `now`, so a run
+/// whose purge keeps failing cannot fill every sweep and hold back the
+/// newer expired runs. The sweep returns them again once the hour is up.
+///
+/// # Errors
+///
+/// Postgres refused a statement; nothing changes.
+pub async fn defer_runs(db: &Db, ids: &[u64], now: u64) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let retry_at = now.saturating_add(PURGE_RETRY_MS);
+    let statements: Vec<_> = ids
+        .iter()
+        .map(|&id| (DEFER_RUN, params![id, retry_at]))
+        .collect();
+    db.batch(&statements).await?;
+    Ok(())
 }
 
 /// Deletes the runs `ids`, with their jobs, in one transaction.

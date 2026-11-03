@@ -1552,7 +1552,7 @@ fn exclude_round_trips() {
     let entry = &config.workflows["ci"].jobs[0];
     assert_eq!(entry.matrix["os"].len(), 2);
     assert_eq!(entry.matrix.exclude.len(), 1);
-    let yaml = hatchrun_workflow::to_yaml(&config);
+    let yaml = hatchrun_workflow::to_yaml(&config).unwrap();
     assert!(yaml.contains("exclude"), "{yaml}");
     assert_eq!(parse(&yaml).unwrap(), config);
 }

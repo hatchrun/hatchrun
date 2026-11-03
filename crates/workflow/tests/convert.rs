@@ -29,7 +29,7 @@ fn has(diags: &[Diagnostic], words: &[&str]) -> bool {
 
 /// The YAML we write parses back to the same config and validates clean.
 fn round_trips(out: &Conversion) {
-    let yaml = to_yaml(&out.config);
+    let yaml = to_yaml(&out.config).unwrap();
     let reparsed = parse(&yaml).unwrap_or_else(|e| panic!("{e:?}\n{yaml}"));
     assert_eq!(reparsed, out.config, "{yaml}");
     assert_eq!(validate(&reparsed), Vec::new(), "{yaml}");
@@ -55,7 +55,7 @@ fn converts_a_typical_ci_workflow() {
     );
     assert!(out.warnings.iter().any(|w| w.message.contains("services")));
     // round trip: the YAML we write parses and validates clean
-    let reparsed = parse(&to_yaml(&out.config)).unwrap();
+    let reparsed = parse(&to_yaml(&out.config).unwrap()).unwrap();
     assert_eq!(validate(&reparsed), Vec::<Diagnostic>::new());
 }
 
@@ -1041,7 +1041,7 @@ jobs:
     );
     round_trips(&out);
     let plan = hatchrun_workflow::compile(
-        &parse(&to_yaml(&out.config)).unwrap(),
+        &parse(&to_yaml(&out.config).unwrap()).unwrap(),
         "ci",
         "refs/heads/main",
     )
@@ -1074,7 +1074,7 @@ jobs:
     ));
     round_trips(&out);
     let plan = hatchrun_workflow::compile(
-        &parse(&to_yaml(&out.config)).unwrap(),
+        &parse(&to_yaml(&out.config).unwrap()).unwrap(),
         "ci",
         "refs/heads/main",
     )
@@ -1105,7 +1105,7 @@ jobs:
 /// Compiles the converted config, read back from YAML, for a push to
 /// main.
 fn compiled(out: &Conversion) -> hatchrun_workflow::Plan {
-    let config = parse(&to_yaml(&out.config)).unwrap();
+    let config = parse(&to_yaml(&out.config).unwrap()).unwrap();
     hatchrun_workflow::compile(&config, "ci", "refs/heads/main").unwrap()
 }
 
@@ -1510,7 +1510,7 @@ fn a_converted_config_over_one_mebibyte_is_an_error() {
         .collect();
     assert!(files.iter().all(|(_, f)| f.len() < 200_000));
     let out = convert(&files).unwrap();
-    let written = to_yaml(&out.config).len();
+    let written = to_yaml(&out.config).unwrap().len();
     assert!(written > 1 << 20);
     assert!(
         has(
@@ -2096,6 +2096,18 @@ jobs:
 ";
 
 fn reads_call(with: &str) -> Conversion {
+    reads_call_of(READS, with)
+}
+
+/// [`READS`] with every read written as a literal bracket index.
+fn bracket_reads() -> String {
+    READS
+        .replace("secrets.DEPLOY_KEY", "secrets['DEPLOY_KEY']")
+        .replace("secrets.PASSED", "secrets[ 'PASSED' ]")
+        .replace("secrets.GITHUB_TOKEN", "secrets['GITHUB_TOKEN']")
+}
+
+fn reads_call_of(reads: &str, with: &str) -> Conversion {
     let ci = format!(
         "
 on: push
@@ -2105,7 +2117,7 @@ jobs:
 {with}
 "
     );
-    many(&[("ci.yml", &ci), ("reads.yml", READS)])
+    many(&[("ci.yml", &ci), ("reads.yml", reads)])
 }
 
 fn reads(out: &Conversion) -> (Option<String>, BTreeMap<String, String>) {
@@ -2140,6 +2152,34 @@ fn a_passed_secret_is_renamed_and_the_rest_are_empty() {
     assert_eq!(env["P"], "${{ secrets.REAL }}");
     assert_eq!(env["K"], "${{ '' }}");
     assert_eq!(env["G"], "${{ secrets.GITHUB_TOKEN }}");
+}
+
+#[test]
+fn bracket_secret_reads_follow_the_dotted_ones() {
+    let source = bracket_reads();
+    for with in ["", "    secrets: { OTHER: x }"] {
+        let out = reads_call_of(&source, with);
+        let (cond, env) = reads(&out);
+        assert_eq!(cond.as_deref(), Some("'' != ''"));
+        assert_eq!(env["K"], "${{ '' }}");
+        assert_eq!(env["P"], "${{ '' }}");
+        assert_eq!(env["G"], "${{ secrets['GITHUB_TOKEN'] }}");
+    }
+    let out = reads_call_of(&source, "    secrets: { PASSED: '${{ secrets.REAL }}' }");
+    let (cond, env) = reads(&out);
+    assert_eq!(cond.as_deref(), Some("'' != ''"));
+    assert_eq!(env["P"], "${{ secrets.REAL }}");
+    assert_eq!(env["K"], "${{ '' }}");
+    assert_eq!(env["G"], "${{ secrets['GITHUB_TOKEN'] }}");
+}
+
+#[test]
+fn inherit_leaves_bracket_secret_reads_alone() {
+    let out = reads_call_of(&bracket_reads(), "    secrets: inherit");
+    let (cond, env) = reads(&out);
+    assert_eq!(cond.as_deref(), Some("secrets['DEPLOY_KEY'] != ''"));
+    assert_eq!(env["K"], "${{ secrets['DEPLOY_KEY'] }}");
+    assert_eq!(env["P"], "${{ secrets[ 'PASSED' ] }}");
 }
 
 #[test]

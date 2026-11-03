@@ -88,7 +88,7 @@ fn sweep_returns_expired_runs_and_keeps_them_until_deleted() {
         .unwrap();
     db.wait(record_delivery(db.db(), "fresh", "push", now - DAY))
         .unwrap();
-    // A failed purge leaves the run, and the sweep returns it again.
+    // A run nobody deleted is returned again.
     for _ in 0..2 {
         assert_eq!(db.wait(sweep(db.db(), now)).unwrap(), vec![old.id]);
         assert!(db.wait(run(db.db(), old.id)).unwrap().is_some());
@@ -121,4 +121,39 @@ fn sweep_returns_the_oldest_hundred_at_a_time() {
     assert_eq!(rest.len(), 5);
     db.wait(delete_runs(db.db(), &rest)).unwrap();
     assert_eq!(db.wait(sweep(db.db(), now)).unwrap().len(), 0);
+}
+
+#[test]
+fn deferred_runs_wait_behind_newer_expired_runs() {
+    let db = setup();
+    let mut stuck = Vec::new();
+    for n in 0..SWEEP_LIMIT {
+        let row = db
+            .wait(insert_run(db.db(), &new_run(&format!("s{n}"), "ci", 1_000)))
+            .unwrap()
+            .unwrap();
+        stuck.push(row.id);
+    }
+    let newer = db
+        .wait(insert_run(db.db(), &new_run("newer", "ci", 2_000)))
+        .unwrap()
+        .unwrap();
+    let now = 1_000 + 31 * DAY;
+    // The oldest hundred fill the batch and hide the newer run.
+    let first = db.wait(sweep(db.db(), now)).unwrap();
+    assert_eq!(first, stuck);
+    // Their purge failed: they are deferred and the newer run comes up.
+    db.wait(defer_runs(db.db(), &first, now)).unwrap();
+    assert_eq!(db.wait(sweep(db.db(), now)).unwrap(), vec![newer.id]);
+    // The deferred runs stay until the hour is up, then return.
+    assert!(db.wait(run(db.db(), stuck[0])).unwrap().is_some());
+    db.wait(delete_runs(db.db(), &[newer.id])).unwrap();
+    assert_eq!(db.wait(sweep(db.db(), now + 3_599_000)).unwrap().len(), 0);
+    assert_eq!(db.wait(sweep(db.db(), now + 3_600_001)).unwrap(), stuck);
+}
+
+#[test]
+fn deferring_no_runs_changes_nothing() {
+    let db = setup();
+    db.wait(defer_runs(db.db(), &[], 5)).unwrap();
 }

@@ -143,11 +143,13 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
             cx.errors.push(Diagnostic::new(plan::too_many_jobs(name)));
         }
     }
-    let written = to_yaml(&cx.config).len();
-    if written > MAX_SOURCE {
-        cx.errors.push(Diagnostic::new(format!(
-            "the converted config is {written} bytes; the limit is {MAX_SOURCE}"
-        )));
+    match to_yaml(&cx.config) {
+        Ok(yaml) if yaml.len() > MAX_SOURCE => cx.errors.push(Diagnostic::new(format!(
+            "the converted config is {} bytes; the limit is {MAX_SOURCE}",
+            yaml.len()
+        ))),
+        Ok(_) => {}
+        Err(e) => cx.errors.push(e),
     }
     Ok(Conversion {
         config: cx.config,
@@ -158,12 +160,13 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
 
 /// Writes a config as YAML that [`parse`](crate::parse) reads back.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Never in practice: every part of a config serializes.
-#[must_use]
-pub fn to_yaml(config: &Config) -> String {
-    serde_saphyr::to_string(config).expect("a config always serializes")
+/// When the serializer rejects the config, which no config that
+/// [`convert`] or [`parse`](crate::parse) produces should cause.
+pub fn to_yaml(config: &Config) -> Result<String, Diagnostic> {
+    serde_saphyr::to_string(config)
+        .map_err(|e| Diagnostic::new(format!("the config does not serialize: {e}")))
 }
 
 /// The file name without its directories and its `.yml` or `.yaml`, in
