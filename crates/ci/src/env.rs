@@ -40,6 +40,9 @@ pub struct Settings {
     pub ci_region: String,
     /// The role the Worker assumes. Empty until the CI account exists.
     pub ci_role_arn: String,
+    /// The S3 bucket of artifacts in the CI account. Empty until the
+    /// bucket exists, and then jobs get no artifact service.
+    pub artifacts_bucket: String,
     /// The key that signs the token for `AssumeRoleWithWebIdentity`,
     /// PKCS#8 DER.
     pub oidc_key: Vec<u8>,
@@ -96,6 +99,7 @@ impl Settings {
                 .map(|url| url.trim_end_matches('/').to_owned()),
             ci_region: need("CI_REGION")?,
             ci_role_arn: get("CI_ROLE_ARN").unwrap_or_default(),
+            artifacts_bucket: get("ARTIFACTS_BUCKET").unwrap_or_default(),
             oidc_key: key(oidc::SIGNING_KEY)?,
             oidc_kid: need(oidc::KEY_ID)?,
             aws_endpoint: get("AWS_ENDPOINT_URL"),
@@ -155,6 +159,7 @@ mod tests {
         assert_eq!(settings.github_api, github::API);
         assert_eq!(settings.token_key, b"k");
         assert_eq!(settings.ci_role_arn, "");
+        assert_eq!(settings.artifacts_bucket, "");
         assert_eq!(settings.aws_endpoint, None);
         assert_eq!(settings.local_launcher_url, None);
         assert_eq!(settings.polar_api, polar::API);

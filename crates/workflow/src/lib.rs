@@ -8,6 +8,7 @@
 //! in a Cloudflare Worker, the runner agent and the CLI.
 
 pub mod agent;
+pub mod artifacts;
 pub mod config;
 pub mod convert;
 pub mod cron;
@@ -36,8 +37,8 @@ pub use expr::{
     interpolate, job_condition, secret_refs, truthy,
 };
 pub use job::{
-    Annotation, AnnotationLevel, CacheService, Conclusion, Github, JobDocument, JobResult, Need,
-    StepSummary,
+    Annotation, AnnotationLevel, ArtifactService, CacheService, Conclusion, Github, JobDocument,
+    JobResult, Need, StepSummary,
 };
 pub use permissions::{DEFAULT_SCOPES, Level, Permissions, SCOPES, token_scopes};
 pub use plan::{

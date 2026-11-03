@@ -61,6 +61,7 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
         vars: BTreeMap::new(),
         timings: BTreeMap::new(),
         cache: None::<CacheService>,
+        artifacts: None,
     }
 }
 

@@ -30,7 +30,8 @@ use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::send;
 use hatchrun_cloud::start::app_jwt;
 use hatchrun_workflow::agent::{CLAIM_PATH, EVENTS_PATH, RESULT_PATH};
-use hatchrun_workflow::{JobDocument, SecretRefs};
+use hatchrun_workflow::artifacts::PATH as ARTIFACTS_PATH;
+use hatchrun_workflow::{ArtifactService, JobDocument, SecretRefs};
 use serde_json::json;
 use worker::{
     Delay, Env, Method, Request, RequestInit, Response, Result, console_error, console_log,
@@ -217,7 +218,11 @@ fn text(message: &str, code: u16) -> Result<Response> {
 /// The Worker runtime failed to build a response.
 pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
     let path = req.path();
-    if req.method() != Method::Post || ![CLAIM_PATH, EVENTS_PATH, RESULT_PATH].contains(&&*path) {
+    let artifacts = path == ARTIFACTS_PATH || path.starts_with(&format!("{ARTIFACTS_PATH}/"));
+    if !artifacts
+        && (req.method() != Method::Post
+            || ![CLAIM_PATH, EVENTS_PATH, RESULT_PATH].contains(&&*path))
+    {
         return text("not found", 404);
     }
     let settings = match Settings::read(env) {
@@ -231,6 +236,9 @@ pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
     let Ok(claims) = authorize(header.as_deref(), &settings.token_key, now_ms() / 1000) else {
         return text("unauthorized", 401);
     };
+    if artifacts {
+        return crate::artifacts::handle(req, env, &settings, claims).await;
+    }
     let body = if path == CLAIM_PATH {
         Vec::new()
     } else {
@@ -268,7 +276,11 @@ pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
                 return text("unavailable", 503);
             }
         };
-        return claim(env, &settings, &db, &row, &claims).await;
+        let job_token = header
+            .as_deref()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default();
+        return claim(env, &settings, &db, &row, &claims, job_token).await;
     }
     // The run object checks that the job is in its run, the attempt and
     // that the job is running.
@@ -290,6 +302,7 @@ async fn claim(
     db: &Db,
     row: &JobRow,
     claims: &Claims,
+    job_token: &str,
 ) -> Result<Response> {
     match claim_answer(row, claims) {
         ClaimAnswer::Refused => return text("unauthorized", 401),
@@ -362,6 +375,7 @@ async fn claim(
     }
     let mut document = response.json::<JobDocument>().await?;
     fill(&mut document, secrets, vars);
+    document.artifacts = artifact_service(settings, job_token);
     Response::from_json(&document)
 }
 
@@ -374,6 +388,18 @@ pub(crate) fn fill(
 ) {
     doc.secrets = secrets;
     doc.vars = vars;
+}
+
+/// The artifact service a job gets: this Worker, with the job's own
+/// token. `None` while the artifacts bucket is not set up.
+pub(crate) fn artifact_service(settings: &Settings, job_token: &str) -> Option<ArtifactService> {
+    if settings.artifacts_bucket.is_empty() || job_token.is_empty() {
+        return None;
+    }
+    Some(ArtifactService {
+        url: format!("{}{ARTIFACTS_PATH}", settings.ci_url),
+        token: job_token.to_owned(),
+    })
 }
 
 /// A job's secrets and its vars.
@@ -630,6 +656,37 @@ async fn to_run(
 
 #[cfg(test)]
 mod tests {
+
+    fn settings(bucket: &str) -> Settings {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMAA=\n-----END PRIVATE KEY-----";
+        Settings::from_lookup(|name| {
+            let value = match name {
+                "GITHUB_APP_ID" => "Iv1",
+                "GITHUB_APP_PRIVATE_KEY" | "OIDC_SIGNING_KEY" => pem,
+                "APP_URL" => "https://app.example",
+                "CI_URL" => "https://ci.example/",
+                "BROKER_URL" => "https://broker.example",
+                "BROKER_TOKEN" | "CI_TOKEN_KEY" => "k",
+                "DEPLOY_ENV" => "dev",
+                "LAUNCHER" => "ec2",
+                "CI_REGION" => "us-east-1",
+                "OIDC_KEY_ID" => "kid",
+                "ARTIFACTS_BUCKET" if !bucket.is_empty() => bucket,
+                _ => return None,
+            };
+            Some(value.to_owned())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_artifact_service_is_this_worker_with_the_job_token() {
+        let service = artifact_service(&settings("bucket"), "v1.a.b").unwrap();
+        assert_eq!(service.url, "https://ci.example/v1/agent/artifacts");
+        assert_eq!(service.token, "v1.a.b");
+        assert!(artifact_service(&settings(""), "v1.a.b").is_none());
+        assert!(artifact_service(&settings("bucket"), "").is_none());
+    }
     use super::*;
 
     use crate::token::tests::random_key;
@@ -891,6 +948,7 @@ mod tests {
             vars: BTreeMap::new(),
             timings: BTreeMap::new(),
             cache: None,
+            artifacts: None,
         }
     }
 

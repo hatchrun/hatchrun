@@ -263,6 +263,7 @@ mod tests {
             vars: BTreeMap::new(),
             timings: BTreeMap::new(),
             cache: None,
+            artifacts: None,
         };
         serde_json::to_value(doc).unwrap()
     }

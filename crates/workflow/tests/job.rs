@@ -58,6 +58,7 @@ fn document(job: PlannedJob) -> JobDocument {
             url: "https://cache.example/".into(),
             token: "c_tok".into(),
         }),
+        artifacts: None,
     }
 }
 

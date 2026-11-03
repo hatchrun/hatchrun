@@ -11,6 +11,7 @@
 //! carry, so every statement reads it as text and [`JobRow`] parses it;
 //! so are `token_permissions` and `secret_refs`.
 
+mod artifacts;
 mod billing;
 mod environments;
 mod jobs;
@@ -21,6 +22,10 @@ mod runs;
 mod secrets;
 mod tenants;
 
+pub use self::artifacts::{
+    ArtifactRow, Finalized, artifact_by_name, artifact_count, artifacts, delete_artifact,
+    drop_pending_artifact, finalize_artifact, pending_artifact, start_artifact,
+};
 pub use self::billing::{
     Standing, UnsentUsage, set_spend_cap, standing, tenant_standing, unsent_usage, usage_rejected,
     usage_sent,
