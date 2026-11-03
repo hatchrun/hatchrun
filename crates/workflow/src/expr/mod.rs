@@ -38,6 +38,7 @@ pub(crate) const CONTEXTS: &[&str] = &[
     "steps",
     "secrets",
     "parameters",
+    "strategy",
     "runner",
     "job",
     "vars",
@@ -329,6 +330,31 @@ pub fn job_condition(
         &wrapped
     };
     Ok(truthy(&evaluate(run, ctx, funcs)?))
+}
+
+/// Whether a job's `continue-on-error` holds. `spec` is a bare
+/// expression, or text with `${{ }}` that is replaced by its values and
+/// read as `true` or not. A string result counts only when it spells
+/// `true`.
+///
+/// # Errors
+///
+/// When the expression does not parse or fails to evaluate.
+pub fn continue_on_error(
+    spec: &str,
+    ctx: &Value,
+    funcs: &dyn Functions,
+) -> Result<bool, ExprError> {
+    let spec = spec.trim();
+    if find_open(spec).is_some() {
+        return Ok(interpolate(spec, ctx, funcs)?
+            .trim()
+            .eq_ignore_ascii_case("true"));
+    }
+    Ok(match evaluate(spec, ctx, funcs)? {
+        Value::String(text) => text.eq_ignore_ascii_case("true"),
+        other => truthy(&other),
+    })
 }
 
 /// Checks one expression without evaluating it: it must parse, call

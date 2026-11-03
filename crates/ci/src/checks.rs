@@ -396,6 +396,8 @@ mod tests {
                 env: BTreeMap::new(),
                 if_: None,
                 timeout_minutes: 30,
+                continue_on_error: None,
+                strategy: None,
                 outputs: BTreeMap::new(),
                 token_permissions: BTreeMap::new(),
                 environment: None,
