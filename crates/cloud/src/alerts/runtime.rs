@@ -58,8 +58,13 @@ const RELEASE: &str =
 /// When the last digest went out.
 const DIGEST_AT: &str = "SELECT digest_at FROM reconciler WHERE id = 1";
 
-/// Notes that a digest went out at `$1`.
-const DIGESTED: &str = "UPDATE reconciler SET digest_at = $1 WHERE id = 1";
+/// Records a digest at `$1` if the last one is still `$2`.
+const DIGEST_CLAIM: &str =
+    "UPDATE reconciler SET digest_at = $1 WHERE id = 1 AND digest_at IS NOT DISTINCT FROM $2";
+
+/// Takes back the digest at `$1`, restoring `$2`, unless another came
+/// after it.
+const DIGEST_UNDO: &str = "UPDATE reconciler SET digest_at = $2 WHERE id = 1 AND digest_at = $1";
 
 /// Alerts kept in the database.
 pub(crate) struct Kept<'a>(pub &'a Db);
@@ -163,8 +168,20 @@ impl Store for Kept<'_> {
             .and_then(|row| row.digest_at))
     }
 
-    async fn digested(&self, at: u64) -> Result<(), String> {
-        self.0.run(DIGESTED, &params![at]).await.map_err(text)?;
+    async fn digest_claim(&self, last: Option<u64>, at: u64) -> Result<bool, String> {
+        let changed = self
+            .0
+            .run(DIGEST_CLAIM, &params![at, last])
+            .await
+            .map_err(text)?;
+        Ok(changed > 0)
+    }
+
+    async fn digest_undo(&self, last: Option<u64>, at: u64) -> Result<(), String> {
+        self.0
+            .run(DIGEST_UNDO, &params![at, last])
+            .await
+            .map_err(text)?;
         Ok(())
     }
 }

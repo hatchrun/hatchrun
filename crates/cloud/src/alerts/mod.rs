@@ -318,8 +318,14 @@ pub(crate) trait Store {
     async fn release(&self, key: &str, until: u64) -> Result<(), String>;
     /// When the last digest went out.
     async fn digest_at(&self) -> Result<Option<u64>, String>;
-    /// Notes that a digest went out at `at`.
-    async fn digested(&self, at: u64) -> Result<(), String>;
+    /// Records a digest at `at` if the last one is still `last`, the
+    /// value [`Store::digest_at`] gave. Returns `false` when another
+    /// pass recorded one first.
+    async fn digest_claim(&self, last: Option<u64>, at: u64) -> Result<bool, String>;
+    /// Takes back the digest recorded at `at`, so the one before it,
+    /// `last`, stands again. Does nothing when another has been recorded
+    /// since.
+    async fn digest_undo(&self, last: Option<u64>, at: u64) -> Result<(), String>;
 }
 
 /// Where emails go, and the clock and timer that bound a send: the
@@ -411,43 +417,7 @@ pub(crate) async fn settle(
                 continue;
             }
         }
-        let email = notice(alert, state, now);
-        let delivery = pin!(mail.send(&email));
-        let result = match select(delivery, pin!(mail.sleep(SEND_FOR))).await {
-            Either::Left((result, _)) => result,
-            Either::Right(((), _)) => {
-                // The email may have gone out. The claim is left to run
-                // out, so no pass sends it while this one still could.
-                errors.push(format!(
-                    "alert {}: email: no answer in {} s, claim left to run out",
-                    alert.key,
-                    SEND_FOR / 1000
-                ));
-                continue;
-            }
-        };
-        if let Err(err) = result {
-            errors.push(format!("alert {}: email: {err}", alert.key));
-            if let Err(err) = store.release(&alert.key, until).await {
-                errors.push(format!("alert {}: {err}", alert.key));
-            }
-            continue;
-        }
-        // The email is out. If both writes fail the claim runs out and
-        // the email goes again: delivery is at-least-once here.
-        let at = mail.now();
-        let noted = match store.sent(alert, state, until, at).await {
-            Ok(noted) => Ok(noted),
-            Err(_) => store.sent(alert, state, until, at).await,
-        };
-        match noted {
-            Ok(true) => {}
-            Ok(false) => errors.push(format!(
-                "alert {}: email sent after its claim was lost, it may go out again",
-                alert.key
-            )),
-            Err(err) => errors.push(format!("alert {}: {err}", alert.key)),
-        }
+        send_claimed(store, mail, alert, state, now, until, &mut errors).await;
     }
     if digest && let Err(err) = send_digest(store, mail, now, &still).await {
         errors.push(format!("digest: {err}"));
@@ -455,22 +425,104 @@ pub(crate) async fn settle(
     errors
 }
 
+/// Sends the email saying `state` for `alert`, whose claim `until` the
+/// pass holds, and records it. Errors are added to `errors`.
+async fn send_claimed(
+    store: &impl Store,
+    mail: &impl Mail,
+    alert: &Alert,
+    state: State,
+    now: u64,
+    until: u64,
+    errors: &mut Vec<String>,
+) {
+    // Claiming took time. With too little of the claim left to
+    // bound the send, give it back for the next pass.
+    if until.saturating_sub(mail.now()) < SEND_FOR {
+        errors.push(format!(
+            "alert {}: claim too close to its end to send",
+            alert.key
+        ));
+        if let Err(err) = store.release(&alert.key, until).await {
+            errors.push(format!("alert {}: {err}", alert.key));
+        }
+        return;
+    }
+    let Some(result) = send_bounded(mail, &notice(alert, state, now)).await else {
+        // The email may have gone out. The claim is left to run
+        // out, so no pass sends it while this one still could.
+        errors.push(format!(
+            "alert {}: email: no answer in {} s, claim left to run out",
+            alert.key,
+            SEND_FOR / 1000
+        ));
+        return;
+    };
+    if let Err(err) = result {
+        errors.push(format!("alert {}: email: {err}", alert.key));
+        if let Err(err) = store.release(&alert.key, until).await {
+            errors.push(format!("alert {}: {err}", alert.key));
+        }
+        return;
+    }
+    // The email is out. If both writes fail the claim runs out and
+    // the email goes again: delivery is at-least-once here.
+    let at = mail.now();
+    let (noted, retried) = match store.sent(alert, state, until, at).await {
+        Ok(noted) => (Ok(noted), false),
+        Err(_) => (store.sent(alert, state, until, at).await, true),
+    };
+    match noted {
+        Ok(true) => {}
+        // The first write may have committed before it errored, and
+        // then there is no claim left for the retry to find.
+        Ok(false) if retried => errors.push(format!(
+            "alert {}: first write of the record failed, the retry found the claim ended",
+            alert.key
+        )),
+        Ok(false) => errors.push(format!(
+            "alert {}: email sent after its claim was lost, it may go out again",
+            alert.key
+        )),
+        Err(err) => errors.push(format!("alert {}: {err}", alert.key)),
+    }
+}
+
+/// Sends `email`, or returns `None` when it is not answered within
+/// [`SEND_FOR`].
+async fn send_bounded(mail: &impl Mail, email: &Email) -> Option<Result<(), String>> {
+    match select(pin!(mail.send(email)), pin!(mail.sleep(SEND_FOR))).await {
+        Either::Left((result, _)) => Some(result),
+        Either::Right(((), _)) => None,
+    }
+}
+
 /// Sends the digest of `firing` once a day. With nothing firing the day
 /// starts again, so an alert that fires later waits up to a day for its
 /// first digest rather than getting one minutes after its own email.
+/// The day is claimed before the send, so only one pass sends; a failed
+/// send gives it back, one that got no answer keeps it.
 async fn send_digest(
     store: &impl Store,
     mail: &impl Mail,
     now: u64,
     firing: &[Alert],
 ) -> Result<(), String> {
-    let at = store.digest_at().await?;
-    if at.is_some_and(|at| now < at + DAY) {
+    let last = store.digest_at().await?;
+    if last.is_some_and(|last| now < last + DAY) {
         return Ok(());
     }
-    if at.is_some() && !firing.is_empty() {
-        let firing: Vec<&Alert> = firing.iter().collect();
-        mail.send(&digest(&firing, now)).await?;
+    let claimed = store.digest_claim(last, now).await?;
+    if !claimed || last.is_none() || firing.is_empty() {
+        return Ok(());
     }
-    store.digested(now).await
+    let firing: Vec<&Alert> = firing.iter().collect();
+    match send_bounded(mail, &digest(&firing, now)).await {
+        Some(Ok(())) => Ok(()),
+        Some(Err(err)) => {
+            store.digest_undo(last, now).await?;
+            Err(err)
+        }
+        None => Err(format!("no answer in {} s", SEND_FOR / 1000)),
+    }
 }

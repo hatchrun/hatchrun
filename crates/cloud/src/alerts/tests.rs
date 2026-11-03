@@ -16,15 +16,21 @@ const HOUR: u64 = 60 * MINUTE;
 const NONE: [&str; 0] = [];
 
 /// Collects emails, or fails them while `down`. Keeps its own clock,
-/// which a send moves on by `lag`. While `stall` is set a send never
-/// completes and the time bound on it runs out at once.
+/// which a send moves on by `lag` and each reading of it by `step`.
+/// While `stall` is set a send never completes and the time bound on it
+/// runs out at once; while `hold` is set a send waits for the test.
+/// `bound` is the last time bound a send was given.
 #[derive(Default)]
 struct Outbox {
     sent: RefCell<Vec<Email>>,
     down: Cell<bool>,
     stall: Cell<bool>,
+    hold: Cell<bool>,
+    entered: Cell<bool>,
     clock: Cell<u64>,
     lag: Cell<u64>,
+    step: Cell<u64>,
+    bound: Cell<Option<u64>>,
 }
 
 #[allow(clippy::unused_async_trait_impl)]
@@ -34,6 +40,18 @@ impl Mail for Outbox {
         if self.stall.get() {
             std::future::pending::<()>().await;
         }
+        if self.hold.get() {
+            self.entered.set(true);
+            std::future::poll_fn(|cx| {
+                if self.hold.get() {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                } else {
+                    std::task::Poll::Ready(())
+                }
+            })
+            .await;
+        }
         if self.down.get() {
             return Err("Email Service unavailable".to_owned());
         }
@@ -42,10 +60,13 @@ impl Mail for Outbox {
     }
 
     fn now(&self) -> u64 {
-        self.clock.get()
+        let now = self.clock.get();
+        self.clock.set(now + self.step.get());
+        now
     }
 
-    async fn sleep(&self, _ms: u64) {
+    async fn sleep(&self, ms: u64) {
+        self.bound.set(Some(ms));
         if !self.stall.get() {
             std::future::pending::<()>().await;
         }
@@ -129,8 +150,12 @@ impl Store for Unsaved<'_> {
         self.kept.digest_at().await
     }
 
-    async fn digested(&self, at: u64) -> Result<(), String> {
-        self.kept.digested(at).await
+    async fn digest_claim(&self, last: Option<u64>, at: u64) -> Result<bool, String> {
+        self.kept.digest_claim(last, at).await
+    }
+
+    async fn digest_undo(&self, last: Option<u64>, at: u64) -> Result<(), String> {
+        self.kept.digest_undo(last, at).await
     }
 }
 
@@ -966,17 +991,28 @@ fn a_firing_email_in_flight_when_the_alert_resolves_is_followed_by_the_resolutio
     let row = alert(&db, key);
     let kept = Kept(db.db());
     let at = NOW + MINUTE;
-    let until = at + CLAIM_FOR;
-    assert!(db.wait(kept.claim(&row, State::Firing, at, until)).unwrap());
 
-    // The check saves a clear observation while the email is in flight.
-    let resolved = Alert {
-        state: State::Resolved,
-        resolved_at: Some(at),
-        ..row.clone()
+    // The firing email waits in flight while the check saves a clear
+    // observation, then goes out.
+    outbox.hold.set(true);
+    let resolve = async {
+        while !outbox.entered.get() {
+            tokio::task::yield_now().await;
+        }
+        let resolved = Alert {
+            state: State::Resolved,
+            resolved_at: Some(at),
+            ..row.clone()
+        };
+        assert!(kept.save(Some(&row), &resolved, at).await.unwrap());
+        outbox.hold.set(false);
     };
-    assert!(db.wait(kept.save(Some(&row), &resolved, at)).unwrap());
-    assert!(db.wait(kept.sent(&row, State::Firing, until, at)).unwrap());
+    let (errors, ()) = db.wait(futures_util::future::join(
+        settle(&kept, outbox.at(at), at, &[], true),
+        resolve,
+    ));
+    assert_eq!(errors, NONE);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
     let stored = alert(&db, key);
     assert_eq!(
         (stored.state, stored.sent),
@@ -988,6 +1024,49 @@ fn a_firing_email_in_flight_when_the_alert_resolves_is_followed_by_the_resolutio
         outbox.take(),
         ["[hatchrun] Resolved: Launch failed for good"]
     );
+}
+
+#[test]
+fn a_claim_too_close_to_its_end_is_given_back_unsent() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    // Reading the clock after the claim finds it 90 s on, leaving 30 s.
+    outbox.step.set(90_000);
+    let errors = pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("too close"), "{errors:?}");
+    assert_eq!(outbox.take(), NONE);
+    assert_eq!(claimed_until(&db, key), None);
+
+    outbox.step.set(0);
+    assert_eq!(pass(&db, &outbox, NOW + MINUTE, &[]), NONE);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
+}
+
+#[test]
+fn two_passes_send_one_digest() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    pass(&db, &outbox, NOW, &[]);
+    pass(
+        &db,
+        &outbox,
+        NOW + HOUR,
+        &[(Key::JobsWaiting, firing("acme"))],
+    );
+    assert_eq!(outbox.take().len(), 1);
+
+    // Both passes read the same last digest before either claims.
+    let kept = Kept(db.db());
+    let firing = [alert(&db, Key::JobsWaiting)];
+    let at = NOW + DAY;
+    let results = db.wait(futures_util::future::join(
+        send_digest(&kept, outbox.at(at), at, &firing),
+        send_digest(&kept, outbox.at(at), at, &firing),
+    ));
+    assert_eq!(results, (Ok(()), Ok(())));
+    assert_eq!(outbox.take(), ["[hatchrun] Still firing: 1 alerts"]);
 }
 
 #[test]
@@ -1021,6 +1100,7 @@ fn a_send_that_outlasts_its_time_keeps_the_claim() {
     let errors = pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("no answer"), "{errors:?}");
+    assert!(outbox.bound.get().is_some_and(|bound| bound < CLAIM_FOR));
     assert_eq!(claimed_until(&db, key), Some(NOW + CLAIM_FOR));
     assert_eq!(alert(&db, key).sent, None);
 
