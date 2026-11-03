@@ -24,14 +24,19 @@
 //! - the Azure upload to that URL goes to S3 as parts (see [`blob`]).
 //! - a finalize completes the multipart upload.
 //!
-//! Every other Twirp call under `ACTIONS_RESULTS_URL`, such as the
-//! artifact service `actions/upload-artifact` uses, is passed through to
-//! GitHub's results service.
+//! A job of hatchrun CI also gets the artifact service
+//! `actions/upload-artifact` and `download-artifact` use (see
+//! [`artifact`]): the same Azure Blob upload and download URLs, backed by
+//! the control plane's `/v1/agent/artifacts`. Without an artifact
+//! service, as on a hosted runner, every other Twirp call under
+//! `ACTIONS_RESULTS_URL` is passed through to GitHub's results service.
 //!
 //! The runner is pointed here by [`patch`]. A lookup that fails is a
 //! miss, and a save that fails is an error the client turns into a
 //! warning.
 
+mod artifact;
+mod artifact_twirp;
 mod blob;
 mod cloud;
 mod download;
@@ -101,15 +106,37 @@ const DOWNLOAD_PATH: &str = "/cache/download/";
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Reply = Response<BoxBody<Bytes, BoxError>>;
 
+/// The services a proxy fronts.
+pub struct Services {
+    /// The job cache, when the job has one.
+    pub cache: Option<source::Cache>,
+    /// The artifact service, when the job has one.
+    pub artifacts: Option<ArtifactConfig>,
+}
+
+/// The artifact service of a job.
+pub struct ArtifactConfig {
+    /// The control plane's artifact URL and the job token.
+    pub service: source::Cache,
+    /// The run's id, which the runtime token names.
+    pub run_id: String,
+    /// The job's id, which the runtime token names.
+    pub job_id: String,
+}
+
 /// A running proxy.
 pub struct Proxy {
     state: Arc<State>,
     url: String,
+    runtime_token: Option<String>,
     server: tokio::task::JoinHandle<()>,
 }
 
 struct State {
-    cloud: Cloud,
+    /// The cache service, when the job has one.
+    cloud: Option<Cloud>,
+    /// The artifact service, when the job has one.
+    artifacts: Option<Artifacts>,
     /// `http://<ip>:<port>`.
     base: String,
     /// Where Twirp calls the proxy does not serve go.
@@ -123,7 +150,22 @@ struct State {
     counter: AtomicU64,
 }
 
+/// The artifact service of the control plane and the token the runner's
+/// steps present to the proxy.
+struct Artifacts {
+    cloud: Cloud,
+    /// `ACTIONS_RUNTIME_TOKEN`.
+    token: String,
+}
+
 impl State {
+    /// A client for presigned S3 downloads: either service's.
+    fn s3(&self) -> Option<&Cloud> {
+        self.cloud
+            .as_ref()
+            .or_else(|| self.artifacts.as_ref().map(|artifacts| &artifacts.cloud))
+    }
+
     fn next(&self) -> u64 {
         self.counter.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -155,6 +197,8 @@ struct Uploads {
 
 struct Upload {
     id: String,
+    /// The service the upload goes to.
+    cloud: Cloud,
     state: Mutex<UploadState>,
 }
 
@@ -188,11 +232,45 @@ impl Proxy {
     ///
     /// When the cache URL is unusable or the port cannot be bound.
     pub async fn start(cache: source::Cache, ip: IpAddr) -> Result<Self> {
-        Self::start_on(cache, SocketAddr::new(ip, PORT), RESULTS_URL).await
+        let services = Services {
+            cache: Some(cache),
+            artifacts: None,
+        };
+        Self::start_with(services, SocketAddr::new(ip, PORT), RESULTS_URL).await
     }
 
+    /// Starts the proxy on `ip` for the services a job's document
+    /// names: the cache, the artifacts, or both.
+    ///
+    /// # Errors
+    ///
+    /// When a service URL is unusable or the port cannot be bound.
+    pub async fn start_services(services: Services, ip: IpAddr) -> Result<Self> {
+        Self::start_with(services, SocketAddr::new(ip, PORT), RESULTS_URL).await
+    }
+
+    #[cfg(test)]
     async fn start_on(cache: source::Cache, addr: SocketAddr, results: &str) -> Result<Self> {
-        let cloud = Cloud::new(cache)?;
+        let services = Services {
+            cache: Some(cache),
+            artifacts: None,
+        };
+        Self::start_with(services, addr, results).await
+    }
+
+    async fn start_with(services: Services, addr: SocketAddr, results: &str) -> Result<Self> {
+        let cloud = services.cache.map(Cloud::new).transpose()?;
+        let (artifacts, runtime_token) = match services.artifacts {
+            Some(config) => {
+                let token = artifact_twirp::runtime_token(&config.run_id, &config.job_id)?;
+                let artifacts = Artifacts {
+                    cloud: Cloud::new(config.service)?,
+                    token: token.clone(),
+                };
+                (Some(artifacts), Some(token))
+            }
+            None => (None, None),
+        };
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("listen on {addr}"))?;
@@ -200,6 +278,7 @@ impl Proxy {
         let base = format!("http://{addr}");
         let state = Arc::new(State {
             cloud,
+            artifacts,
             base: base.clone(),
             results: results.to_owned(),
             http: reqwest::Client::builder()
@@ -216,8 +295,18 @@ impl Proxy {
         Ok(Self {
             state,
             url: format!("{base}/"),
+            runtime_token,
             server,
         })
+    }
+
+    /// The `ACTIONS_RUNTIME_TOKEN` the artifact toolkit needs: a JWT
+    /// whose `scp` claim names the run and job. The toolkit only reads
+    /// the claim, and the proxy accepts the token on artifact calls.
+    /// `None` when the proxy serves no artifacts.
+    #[must_use]
+    pub fn runtime_token(&self) -> Option<&str> {
+        self.runtime_token.as_deref()
     }
 
     /// The URL the runner passes as `ACTIONS_RESULTS_URL`.
@@ -254,9 +343,13 @@ impl Proxy {
     /// finalized.
     pub async fn stop(self) {
         self.server.abort();
-        let ids: Vec<String> = lock(&self.state.uploads).by_id.keys().cloned().collect();
-        for id in ids {
-            match tokio::time::timeout(Duration::from_secs(3), self.state.cloud.abort(&id)).await {
+        let uploads: Vec<(String, Cloud)> = lock(&self.state.uploads)
+            .by_id
+            .values()
+            .map(|upload| (upload.id.clone(), upload.cloud.clone()))
+            .collect();
+        for (id, cloud) in uploads {
+            match tokio::time::timeout(Duration::from_secs(3), cloud.abort(&id)).await {
                 Ok(Ok(())) => debug!(upload = id, "abandoned unfinished cache upload"),
                 Ok(Err(err)) => debug!(upload = id, "abandon cache upload: {err:#}"),
                 Err(_) => return,
@@ -317,6 +410,11 @@ async fn handle(state: &State, req: Request<Incoming>) -> Reply {
                 Err(msg) => malformed(msg),
             },
         };
+    }
+    if let Some(artifacts) = &state.artifacts
+        && let Some(rpc) = artifact_twirp::Rpc::from_path(&path)
+    {
+        return artifact::serve(state, artifacts, rpc, req).await;
     }
     if let Some(id) = path.strip_prefix(UPLOAD_PATH) {
         let id = id.to_owned();
@@ -396,7 +494,10 @@ fn passthrough(upstream: reqwest::Response, names: &[header::HeaderName]) -> Rep
 /// The proxy answers, and the cloud takes the token: a lookup that
 /// misses is as good as one that hits.
 async fn health(state: &State) -> Reply {
-    match state.cloud.lookup("hatchrun-health", &[], "health").await {
+    let Some(cloud) = &state.cloud else {
+        return reply(StatusCode::OK, "text/plain", "ok");
+    };
+    match cloud.lookup("hatchrun-health", &[], "health").await {
         Ok(_) => reply(StatusCode::OK, "text/plain", "ok"),
         Err(err) => reply(
             StatusCode::SERVICE_UNAVAILABLE,
