@@ -7,8 +7,10 @@
 # slow a job the script cancels, arm a job on the arm64 template that
 # echoes a secret, bad a workflow with a runs-on that names no template
 # and one that runs, wide six jobs at once, one more than the cap,
-# guard a job whose environment allows other branches, and deploy two
-# jobs on an environment that needs approval.
+# guard a job whose environment allows other branches, deploy two
+# jobs on an environment that needs approval, queue a workflow that
+# shares a concurrency group between its runs, and replace one whose
+# group cancels the run in progress.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -72,6 +74,13 @@ jobs:
     environment: production
     steps:
       - run: echo "never runs"
+  sit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: wait for the cancel
+        run: |
+          echo "sitting"
+          sleep 300
 workflows:
   ci:
     on: { push: { branches: [main] } }
@@ -111,3 +120,15 @@ workflows:
     jobs:
       - deploy-a
       - deploy-b
+  queue:
+    on: { push: { branches: [queue] } }
+    concurrency: e2e-${{ github.workflow }}
+    jobs:
+      - sit
+  replace:
+    on: { push: { branches: [replace] } }
+    concurrency:
+      group: e2e-${{ github.workflow }}
+      cancel-in-progress: true
+    jobs:
+      - sit

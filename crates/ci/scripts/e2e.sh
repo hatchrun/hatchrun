@@ -36,6 +36,10 @@
 # - a push to wide runs six jobs: five at once, the sixth held with a
 #   check run that says why until one ends; the fake Polar then holds a
 #   usage event for each;
+# - pushes to queue share a concurrency group: one run goes, the
+#   next waits with a check run that says why, a third replaces it
+#   (cancelled, with the reason) and starts when the first is cancelled;
+# - a push to replace cancels the run in progress of its group;
 # - a tenant whose subscription was canceled, and one that never
 #   subscribed, each get one billing check run and no run;
 # - environments, after wide: environment settings, secrets and vars at
@@ -813,9 +817,69 @@ status="$(app_call GET orgs/e2e2/billing)"
 answered 200 '.card == false' || die "the billing view of e2e2 answered $status: $(cat "$tmp/answer")"
 log "billing: the card state of both tenants read as expected"
 
-# Fourteen instances: build, test, broken twice, sleeper, arm-hello,
-# bad-ok-hello, the six naps and deploy-a. Wait for the last agent to exit.
-launches=14
+# Cancels run $1 as the app would, signed in.
+cancel_run() {
+  local code
+  code="$(curl -sS -o "$tmp/answer" -w '%{http_code}' -X POST "$CI/api/ci/runs/$1/cancel" \
+    -H "Origin: $APP_URL" \
+    -H "Cookie: __Host-hatchrun_session=$cookie" \
+    -H "X-CSRF-Token: $csrf")"
+  [[ "$code" == 204 ]] || die "cancel of run $1 answered $code: $(cat "$tmp/answer")"
+}
+
+# Waits until the check run $2 of commit $1 has a summary that contains $3.
+wait_summary() {
+  local sha=$1 name=$2 text=$3
+  local deadline=$((SECONDS + 60))
+  until check_of "$sha" "$name" | jq -e --arg text "$text" '.summary // "" | contains($text)' >/dev/null; do
+    ((SECONDS < deadline)) || die "$name on $sha never said '$text': $(check_of "$sha" "$name")"
+    sleep 1
+  done
+}
+
+# Scenario: a concurrency group lets one run go and keeps one waiting. A
+# third run replaces the one that waits, which ends cancelled; when the
+# first run is cancelled the third one starts.
+q1_sha="$(printf '5%.0s' $(seq 40))"
+q2_sha="$(printf '6%.0s' $(seq 40))"
+q3_sha="$(printf '7%.0s' $(seq 40))"
+q1_run="$(push queue "$q1_sha")"
+wait_job "$q1_run" sit running
+q2_run="$(push queue "$q2_sha")"
+wait_summary "$q2_sha" "queue / sit" 'Waiting for concurrency group `e2e-queue`: run #'
+api "runs/$q2_run" | jq -e '.jobs[] | select(.name == "sit") | .status == "queued" and .held == "group"' >/dev/null ||
+  die "the second run's job is not held for the group: $(api "runs/$q2_run")"
+q3_run="$(push queue "$q3_sha")"
+wait_summary "$q2_sha" "queue / sit" 'a newer run replaced it while it waited for concurrency group `e2e-queue`'
+[[ "$(check_of "$q2_sha" "queue / sit" | jq -r .conclusion)" == cancelled ]] ||
+  die "the replaced run did not end cancelled: $(check_of "$q2_sha" "queue / sit")"
+wait_summary "$q3_sha" "queue / sit" 'Waiting for concurrency group `e2e-queue`'
+wait_job "$q1_run" sit running
+log "concurrency: one run goes, the newest waits, the middle one was replaced"
+cancel_run "$q1_run"
+wait_job "$q3_run" sit running
+cancel_run "$q3_run"
+wait_checks "$q3_sha" 1 'all(.status == "completed" and .conclusion == "cancelled")'
+log "concurrency: the waiting run started when the first one was cancelled"
+
+# Scenario: cancel-in-progress cancels the run that goes and starts the
+# new one.
+r1_sha="$(printf '8%.0s' $(seq 40))"
+r2_sha="$(printf '9%.0s' $(seq 40))"
+r1_run="$(push replace "$r1_sha")"
+wait_job "$r1_run" sit running
+r2_run="$(push replace "$r2_sha")"
+wait_summary "$r1_sha" "replace / sit" 'set cancel-in-progress'
+wait_checks "$r1_sha" 1 'all(.status == "completed" and .conclusion == "cancelled")'
+wait_job "$r2_run" sit running
+cancel_run "$r2_run"
+wait_checks "$r2_sha" 1 'all(.status == "completed" and .conclusion == "cancelled")'
+log "concurrency: cancel-in-progress cancelled the running run and the new one started"
+
+# Eighteen instances: build, test, broken twice, sleeper, arm-hello,
+# bad-ok-hello, the six naps, deploy-a, and the four sits that ran. Wait
+# for the last agent to exit.
+launches=18
 deadline=$((SECONDS + 60))
 until curl -fsS "$LAUNCHER/_events" | jq -e --argjson n "$launches" '[.[] | select(startswith("exit "))] | length >= $n' >/dev/null; do
   ((SECONDS < deadline)) || die "agents still running: $(curl -fsS "$LAUNCHER/_events")"

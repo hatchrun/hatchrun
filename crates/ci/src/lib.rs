@@ -26,6 +26,7 @@ pub mod agent;
 pub mod api;
 pub mod billing;
 pub mod checks;
+pub mod concurrency;
 pub mod env;
 pub mod environments;
 pub mod github;

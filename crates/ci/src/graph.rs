@@ -222,6 +222,91 @@ impl Graph {
         actions
     }
 
+    /// Cancels the run because of a concurrency group, and says why on
+    /// every job it stops. Without `outright` this is [`Graph::cancel`]:
+    /// jobs whose `if:` still holds (`always()`) run on. With it the run
+    /// never started, so every job that has not started ends as
+    /// cancelled whatever its `if:`.
+    pub fn cancel_for_group(
+        &mut self,
+        message: &str,
+        outright: bool,
+        github_ctx: &Value,
+    ) -> Vec<Action> {
+        let open: Vec<bool> = self
+            .jobs
+            .iter()
+            .map(|n| !matches!(n.state, State::Done(_)))
+            .collect();
+        let mut actions = Vec::new();
+        if outright {
+            self.cancelled = true;
+            for at in 0..self.jobs.len() {
+                match self.jobs[at].state {
+                    State::Running if self.jobs[at].cancel == 0 => {
+                        self.jobs[at].cancel = 1;
+                        actions.push(Action::Cancel {
+                            job: self.jobs[at].id,
+                            count: 1,
+                        });
+                    }
+                    State::Waiting | State::Queued => {
+                        self.end(at, Conclusion::Cancelled, None, &mut actions);
+                    }
+                    _ => {}
+                }
+            }
+            actions.extend(self.advance(github_ctx));
+        } else {
+            actions = self.cancel(github_ctx);
+        }
+        for (node, was_open) in self.jobs.iter_mut().zip(open) {
+            let stopped = node.cancel > 0 || node.state == State::Done(Conclusion::Cancelled);
+            if was_open && stopped && node.message.is_none() {
+                node.message = Some(message.to_owned());
+            }
+        }
+        actions
+    }
+
+    /// Cancels one job because of a concurrency group, and says why. A
+    /// job that waits for a launch ends as cancelled at once; a running
+    /// one is asked to stop. Another attempt, or a job that ended, is
+    /// left alone.
+    pub fn cancel_job(
+        &mut self,
+        job: u64,
+        attempt: u32,
+        message: &str,
+        github_ctx: &Value,
+    ) -> Vec<Action> {
+        let Some(at) = self.position(job) else {
+            return Vec::new();
+        };
+        if self.jobs[at].attempt != attempt {
+            return Vec::new();
+        }
+        let mut actions = Vec::new();
+        match self.jobs[at].state {
+            State::Running if self.jobs[at].cancel == 0 => {
+                self.jobs[at].cancel = 1;
+                self.jobs[at].message = Some(message.to_owned());
+                actions.push(Action::Cancel { job, count: 1 });
+            }
+            State::Waiting | State::Queued => {
+                self.end(
+                    at,
+                    Conclusion::Cancelled,
+                    Some(message.to_owned()),
+                    &mut actions,
+                );
+                actions.extend(self.advance(github_ctx));
+            }
+            _ => {}
+        }
+        actions
+    }
+
     /// Raises `cancel` from 1 to 2 on running jobs.
     pub fn escalate(&mut self) -> Vec<Action> {
         self.jobs
@@ -433,6 +518,7 @@ impl Graph {
         }
         let plan = Plan {
             workflow: String::new(),
+            concurrency: None,
             jobs: self.jobs.iter().map(|n| n.job.clone()).collect(),
         };
         let job = &plan.jobs[at];
@@ -1101,5 +1187,55 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { mid: { requires: [t] } }, { las
         // t2 has `if: always()`; c's own `if:` still decides.
         assert_eq!(state_of(&g, 2), State::Queued);
         assert_eq!(state_of(&g, 3), State::Done(Conclusion::Skipped));
+    }
+
+    #[test]
+    fn a_pending_run_cancelled_outright_ends_whatever_its_if() {
+        let mut g = graph_of("[t, { t2: { name: b, requires: [t] } }]");
+        g.advance(&ctx());
+        let actions = g.cancel_for_group("replaced", true, &ctx());
+        assert_eq!(state_of(&g, 1), State::Done(Conclusion::Cancelled));
+        // `if: always()` does not keep it: the run never started.
+        assert_eq!(state_of(&g, 2), State::Done(Conclusion::Cancelled));
+        assert_eq!(g.node(2).unwrap().message.as_deref(), Some("replaced"));
+        assert!(actions.contains(&Action::RunDone(Conclusion::Cancelled)));
+    }
+
+    #[test]
+    fn cancelling_a_running_run_for_a_group_keeps_always_jobs() {
+        let mut g = graph_of("[t, { t2: { name: b, requires: [t] } }]");
+        g.advance(&ctx());
+        run(&mut g, 1);
+        let actions = g.cancel_for_group("newer run", false, &ctx());
+        assert!(actions.contains(&Action::Cancel { job: 1, count: 1 }));
+        assert_eq!(g.node(1).unwrap().message.as_deref(), Some("newer run"));
+        g.finished(1, done(Conclusion::Cancelled, &[]), &ctx());
+        // The job with `if: always()` still runs after the cancel.
+        assert_eq!(state_of(&g, 2), State::Queued);
+        assert_eq!(g.node(1).unwrap().message.as_deref(), Some("newer run"));
+    }
+
+    #[test]
+    fn cancel_job_ends_a_queued_job_and_asks_a_running_one_to_stop() {
+        let mut g = graph_of("[t, { t: { name: b } }]");
+        g.advance(&ctx());
+        run(&mut g, 1);
+        assert!(
+            g.cancel_job(1, 2, "x", &ctx()).is_empty(),
+            "another attempt"
+        );
+        assert_eq!(
+            g.cancel_job(1, 1, "x", &ctx()),
+            [Action::Cancel { job: 1, count: 1 }]
+        );
+        assert!(g.cancel_job(1, 1, "x", &ctx()).is_empty(), "once");
+        let actions = g.cancel_job(2, 1, "newer job", &ctx());
+        assert!(actions.contains(&Action::Finished {
+            job: 2,
+            conclusion: Conclusion::Cancelled
+        }));
+        assert_eq!(g.node(2).unwrap().message.as_deref(), Some("newer job"));
+        // The run goes on until job 1 stops.
+        assert_eq!(g.conclusion(), None);
     }
 }

@@ -45,6 +45,7 @@ use worker::{
 };
 
 use crate::billing::{self, HOLD_RECHECK_MS, Hold};
+use crate::concurrency::{self, Gate as GroupGate};
 use crate::env::{Settings, run_stub};
 use crate::environments::{self, Gate};
 use crate::launcher::{Backend, LaunchSpec, user_data};
@@ -228,6 +229,17 @@ async fn launch(
             Gate::Approval(message) => {
                 return hold_job(env, &db, &job, "approval", &message, now).await;
             }
+        }
+    }
+    if delivery == Delivery::Launch {
+        match concurrency::gate(env, &db, job.run_id, job.id, job.attempt).await? {
+            GroupGate::Pass => {}
+            GroupGate::Hold(message) => {
+                return hold_job(env, &db, &job, concurrency::HOLD, &message, now).await;
+            }
+            GroupGate::Fail(message) => return end_job(env, &db, &job, &message).await,
+            // The run's object ends the job, with the reason.
+            GroupGate::Cancelled => return Ok(()),
         }
     }
     let standing = match store::standing(
@@ -632,7 +644,11 @@ pub(crate) async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> 
                 .await
                 .map_err(|err| err.to_string())?;
             if claimed {
-                return Ok(());
+                // The job's row is over without its object: its group
+                // is free.
+                return concurrency::release(env, db, job.run_id, Some(job.id))
+                    .await
+                    .map_err(|err| err.to_string());
             }
             // Not claimed: the job is still queued (an environment check
             // ended it), and launch_failed only changes a launching one.

@@ -37,6 +37,7 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
             outputs: BTreeMap::new(),
             token_permissions: BTreeMap::new(),
             environment: None,
+            concurrency: None,
             steps,
         },
         event_name: "push".to_owned(),

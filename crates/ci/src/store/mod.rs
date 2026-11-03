@@ -12,6 +12,7 @@
 //! so are `token_permissions` and `secret_refs`.
 
 mod billing;
+mod concurrency;
 mod environments;
 mod jobs;
 mod pool;
@@ -24,6 +25,9 @@ mod tenants;
 pub use self::billing::{
     Standing, UnsentUsage, set_spend_cap, standing, tenant_standing, unsent_usage, usage_rejected,
     usage_sent,
+};
+pub use self::concurrency::{
+    Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, victims, wake_targets,
 };
 pub use self::environments::{
     EnvironmentRow, JobEnvironment, PutEnvironment, decide_approval, delete_environment,

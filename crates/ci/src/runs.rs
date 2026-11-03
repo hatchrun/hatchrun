@@ -496,6 +496,7 @@ fn start_body(req: &Request<'_>, run: &RunRow, rows: &[JobRow], plan: &Plan) -> 
             actor: run.actor.clone(),
             head_ref: req.head_ref.to_owned(),
             base_ref: req.base_ref.to_owned(),
+            concurrency: plan.concurrency.clone(),
         },
         jobs,
         event: req.event.clone(),
