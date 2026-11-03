@@ -7,10 +7,10 @@
 use super::calls::{scalar, show};
 use super::rewrite::LATER;
 use super::{
-    BTreeMap, BTreeSet, ContinueOnError, Cx, Deserialize, GhJob, GhMatrix, GhStep, JOB_KEYS, Job,
-    Matrix, OLD_UBUNTU, ParameterKind, Require, RunStep, RunsOn, STEP_KEYS, Step, Strategy,
-    UsesStep, Value, WorkflowJob, plan, template, template_labels, valid_environment_name,
-    vendor_template,
+    BTreeMap, BTreeSet, Cancel, Concurrency, ContinueOnError, Cx, Deserialize, GhJob, GhMatrix,
+    GhStep, JOB_KEYS, Job, Matrix, OLD_UBUNTU, ParameterKind, Require, RunStep, RunsOn, STEP_KEYS,
+    Step, Strategy, UsesStep, Value, WorkflowJob, plan, template, template_labels,
+    valid_environment_name, vendor_template,
 };
 
 impl Cx {
@@ -30,6 +30,56 @@ impl Cx {
                 None
             }
         }
+    }
+
+    /// Reads a `concurrency` key of a workflow or a job: a group, or a
+    /// map with `group` and `cancel-in-progress`. Records an error for
+    /// anything hatchrun cannot read as written.
+    pub(super) fn concurrency(&mut self, at: &str, value: Option<&Value>) -> Option<Concurrency> {
+        let value = value?;
+        let (group, cancel) = match value {
+            Value::String(group) => (group.clone(), None),
+            Value::Object(map) => {
+                for key in map
+                    .keys()
+                    .filter(|k| !matches!(k.as_str(), "group" | "cancel-in-progress"))
+                {
+                    self.warn(format!("{at}: unknown key `concurrency.{key}` was dropped"));
+                }
+                let Some(group) = map.get("group").and_then(scalar) else {
+                    self.error(format!("{at}: `concurrency` needs a `group`"));
+                    return None;
+                };
+                (group, map.get("cancel-in-progress"))
+            }
+            _ => {
+                self.error(format!(
+                    "{at}: `concurrency` must be a group or a map with `group`"
+                ));
+                return None;
+            }
+        };
+        if group.trim().is_empty() {
+            self.error(format!("{at}: `concurrency` group is empty"));
+            return None;
+        }
+        let cancel_in_progress = match cancel {
+            None | Some(Value::Bool(false)) => Cancel::No,
+            Some(Value::Bool(true)) => Cancel::Yes,
+            Some(Value::String(text)) if text.trim() == "true" => Cancel::Yes,
+            Some(Value::String(text)) if text.trim() == "false" => Cancel::No,
+            Some(Value::String(text)) => Cancel::When(text.clone()),
+            Some(other) => {
+                self.error(format!(
+                    "{at}: `concurrency.cancel-in-progress` is {other}; it must be a boolean or an expression"
+                ));
+                return None;
+            }
+        };
+        Some(Concurrency {
+            group,
+            cancel_in_progress,
+        })
     }
 
     /// Reads a job's `environment`: a name, or a map whose `name` is the
@@ -94,7 +144,6 @@ impl Cx {
         for (name, set, why) in [
             ("services", gh.services.is_some(), LATER),
             ("container", gh.container.is_some(), LATER),
-            ("concurrency", gh.concurrency.is_some(), ""),
         ] {
             if set {
                 self.warn(format!(
@@ -104,6 +153,7 @@ impl Cx {
         }
         let environment = self.environment(at, gh.environment.as_ref());
         let continue_on_error = self.continue_on_error(at, gh.continue_on_error.as_ref());
+        let concurrency = self.concurrency(at, gh.concurrency.as_ref());
         let (mut matrix, settings) = self.strategy(at, gh.strategy);
         let runs_on = self.runs_on(at, gh.runs_on.as_ref(), &mut matrix);
         let leg_key = gh
@@ -140,6 +190,7 @@ impl Cx {
             outputs,
             permissions,
             environment,
+            concurrency,
             steps,
             ..Job::default()
         };

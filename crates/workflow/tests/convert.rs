@@ -285,19 +285,33 @@ jobs:
     steps:
       - run: npm test
 ");
-    for key in ["container", "concurrency"] {
-        assert!(
-            has(&out.warnings, &["ci.yml", "build", key]),
-            "{key}: {:?}",
-            out.warnings
-        );
-    }
     assert!(
-        out.warnings.iter().any(|w| w.message.contains("ci.yml")
-            && !w.message.contains("build")
-            && w.message.contains("concurrency")),
+        has(&out.warnings, &["ci.yml", "build", "container"]),
+        "container: {:?}",
+        out.warnings
+    );
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|w| w.message.contains("concurrency")),
         "{:?}",
         out.warnings
+    );
+    assert_eq!(
+        out.config.workflows["ci"]
+            .concurrency
+            .as_ref()
+            .unwrap()
+            .group,
+        "ci"
+    );
+    assert_eq!(
+        out.config.jobs["ci-build"]
+            .concurrency
+            .as_ref()
+            .unwrap()
+            .group,
+        "build"
     );
     // `exclude` passes through; the `include` entry matches no
     // combination, so it runs as an entry of its own.

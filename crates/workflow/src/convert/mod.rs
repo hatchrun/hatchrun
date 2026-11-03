@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
+use crate::concurrency::{Cancel, Concurrency};
 use crate::config::{
     Config, ContinueOnError, Job, MAX_SOURCE, Matrix, Parameter, ParameterKind, Require, RunStep,
     Step, Strategy, UsesStep, Workflow, WorkflowJob, too_big, yaml_options,
@@ -558,10 +559,7 @@ impl Cx {
 
     /// Converts one workflow file.
     fn workflow(&mut self, file: &str, stem: &str, gh: GhWorkflow) {
-        for (key, set) in [
-            ("run-name", gh.run_name.is_some()),
-            ("concurrency", gh.concurrency.is_some()),
-        ] {
+        for (key, set) in [("run-name", gh.run_name.is_some())] {
             if set {
                 self.warn(format!(
                     "`{file}`: `{key}` is not supported and was dropped"
@@ -575,6 +573,7 @@ impl Cx {
             return;
         };
         let permissions = self.permissions(&format!("`{file}`"), gh.permissions.as_ref(), false);
+        let concurrency = self.concurrency(&format!("`{file}`"), gh.concurrency.as_ref());
         let shared_env = self.env(&format!("`{file}`"), "env", gh.env.as_ref());
         let shared_defaults = self.defaults(&format!("`{file}`"), gh.defaults.as_ref());
 
@@ -600,6 +599,7 @@ impl Cx {
             Workflow {
                 on,
                 permissions,
+                concurrency,
                 jobs,
             },
         );
