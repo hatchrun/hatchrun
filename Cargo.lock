@@ -1512,6 +1512,7 @@ dependencies = [
  "clap",
  "flate2",
  "getrandom 0.4.3",
+ "hatchrun-common",
  "hatchrun-workflow",
  "http-body-util",
  "httpdate",
@@ -1537,6 +1538,7 @@ dependencies = [
 name = "hatchrun-broker"
 version = "0.1.0"
 dependencies = [
+ "hatchrun-common",
  "serde",
  "serde_json",
  "sha2",
@@ -1578,6 +1580,7 @@ dependencies = [
  "clap",
  "getrandom 0.4.3",
  "hatchrun-cloud",
+ "hatchrun-common",
  "http-body-util",
  "nix",
  "serde",
@@ -1626,6 +1629,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hatchrun-common"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "worker",
+]
+
+[[package]]
 name = "hatchrun-scaler"
 version = "0.1.0"
 dependencies = [
@@ -1636,6 +1647,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "futures-util",
+ "hatchrun-common",
  "hatchrun-scaler-core",
  "hatchrun-scaleset",
  "http",
@@ -1675,6 +1687,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
+ "hatchrun-common",
  "serde",
  "serde_json",
  "wasm-bindgen",

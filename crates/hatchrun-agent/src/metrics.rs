@@ -12,7 +12,6 @@
 //! cgroup controller costs one number, not the window.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -134,14 +133,14 @@ impl Sampler {
     /// Takes a reading. Returns the window it completes, if any.
     pub fn sample(&mut self) -> Option<Window> {
         let reading = self.read();
-        self.add(unix_now(), reading)
+        self.add(hatchrun_common::now_secs(), reading)
     }
 
     /// Ends the window early, as the runner exits. Returns it when it
     /// holds at least one second.
     pub fn finish(&mut self) -> Option<Window> {
         let reading = self.read();
-        let now = unix_now();
+        let now = hatchrun_common::now_secs();
         self.add(now, reading).or_else(|| self.close(now))
     }
 
@@ -213,12 +212,6 @@ impl Sampler {
             net_tx,
         }
     }
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
 }
 
 /// The `cpu` line of `/proc/stat`: user, nice, system, idle, iowait,

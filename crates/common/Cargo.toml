@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "hatchrun-common"
+version = "0.1.0"
+description = "Small helpers shared by the hatchrun crates"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# The JSON error response helper for Cloudflare Workers.
+worker = ["dep:serde_json", "dep:worker"]
+
+[dependencies]
+serde_json = { version = "1.0.154", optional = true }
+worker = { version = "0.8.7", optional = true }
+
+[lints]
+workspace = true

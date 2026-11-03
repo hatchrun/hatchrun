@@ -38,7 +38,7 @@ use nix::unistd::Pid;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::github::{now_secs, rfc3339};
+use crate::github::rfc3339;
 
 /// How long a terminated process gets before `SIGKILL`.
 const KILL_AFTER: Duration = Duration::from_secs(10);
@@ -187,7 +187,7 @@ async fn launch(State(launcher): State<Launcher>, Json(launch): Json<Launch>) ->
         Instance {
             name: launch.name,
             job_id: launch.job_id,
-            launched: now_secs(),
+            launched: hatchrun_common::now_secs(),
             pid: child.id(),
             exited: false,
             metadata: Metadata::Enabled,

@@ -21,6 +21,7 @@ aws-sdk-ec2 = { version = "1.265.0", default-features = false, features = ["defa
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+hatchrun-common = { path = "../common" }
 hatchrun-scaler-core = { path = "../scaler-core" }
 hatchrun-scaleset = { path = "../scaleset" }
 http = "1.5.0"

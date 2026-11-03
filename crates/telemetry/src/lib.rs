@@ -24,6 +24,7 @@
 
 pub mod protocol;
 
+use hatchrun_common::error;
 use worker::{Env, Method, Request, Response, Result, event};
 
 use crate::protocol::{MAX_BODY, Report};
@@ -85,8 +86,4 @@ async fn fetch(mut req: Request, env: Env, _ctx: worker::Context) -> Result<Resp
             .write_to(&dataset)?;
     }
     Ok(Response::empty()?.with_status(204))
-}
-
-fn error(message: &str, status: u16) -> Result<Response> {
-    Ok(Response::from_json(&serde_json::json!({ "error": message }))?.with_status(status))
 }

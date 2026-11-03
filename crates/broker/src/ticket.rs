@@ -6,10 +6,11 @@
 
 use std::time::Duration;
 
+use hatchrun_common::error;
 use worker::{DurableObject, Env, Request, Response, Result, State, durable_object};
 
+use crate::now_ms;
 use crate::protocol::{ClaimResponse, Record, StoreRequest};
-use crate::{error, now_ms};
 
 /// Storage key of the record.
 const RECORD: &str = "record";

@@ -25,6 +25,7 @@
 pub mod protocol;
 mod ticket;
 
+use hatchrun_common::error;
 use worker::{Env, Method, Request, RequestInit, Response, Result, event};
 
 use crate::protocol::Route;
@@ -79,10 +80,6 @@ async fn fetch(mut req: Request, env: Env, _ctx: worker::Context) -> Result<Resp
         .get_stub()?
         .fetch_with_request(request)
         .await
-}
-
-pub(crate) fn error(message: &str, status: u16) -> Result<Response> {
-    Ok(Response::from_json(&serde_json::json!({ "error": message }))?.with_status(status))
 }
 
 pub(crate) fn now_ms() -> u64 {
