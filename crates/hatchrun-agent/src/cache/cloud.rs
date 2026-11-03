@@ -124,7 +124,7 @@ impl Cloud {
         })
     }
 
-    fn endpoint(&self, path: &[&str]) -> Url {
+    pub(super) fn endpoint(&self, path: &[&str]) -> Url {
         let mut url = self.url.clone();
         url.path_segments_mut()
             .expect("checked in new")
@@ -133,7 +133,11 @@ impl Cloud {
         url
     }
 
-    async fn post(&self, path: &[&str], body: &impl Serialize) -> Result<reqwest::Response> {
+    pub(super) async fn post(
+        &self,
+        path: &[&str],
+        body: &impl Serialize,
+    ) -> Result<reqwest::Response> {
         let what = path.join("/");
         self.http
             .post(self.endpoint(path))
@@ -251,7 +255,7 @@ impl Cloud {
 
 /// The response when it succeeded, else an error with its status and
 /// the start of its body.
-async fn answer(response: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+pub(super) async fn answer(response: reqwest::Response, what: &str) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);

@@ -29,9 +29,9 @@ pub(super) async fn put(state: &State, id: &str, req: Request<Incoming>) -> Repl
             "InternalError",
             "an earlier part of this upload failed",
         )),
-        Ok(Operation::Blob) => put_blob(state, &upload, req.into_body()).await,
+        Ok(Operation::Blob) => put_blob(&upload, req.into_body()).await,
         Ok(Operation::Block { id }) => put_block(state, &upload, &id, req.into_body()).await,
-        Ok(Operation::BlockList) => put_block_list(state, &upload, req.into_body()).await,
+        Ok(Operation::BlockList) => put_block_list(&upload, req.into_body()).await,
         Err(err) => Err(err),
     };
     match result {
@@ -44,13 +44,8 @@ pub(super) async fn put(state: &State, id: &str, req: Request<Incoming>) -> Repl
 }
 
 /// Uploads a part, marking the upload failed when it does not arrive.
-async fn put_part(
-    state: &State,
-    upload: &Upload,
-    number: u16,
-    bytes: Bytes,
-) -> Result<Part, blob::Error> {
-    match state.cloud.put_part(&upload.id, number, bytes).await {
+async fn put_part(upload: &Upload, number: u16, bytes: Bytes) -> Result<Part, blob::Error> {
+    match upload.cloud.put_part(&upload.id, number, bytes).await {
         Ok(etag) => Ok(Part { number, etag }),
         Err(err) => {
             upload.lock().failed = true;
@@ -61,7 +56,7 @@ async fn put_part(
 
 /// Streams the body to S3 in [`blob::PART_SIZE`] parts, one part
 /// uploading while the next arrives.
-async fn put_blob(state: &State, upload: &Upload, mut body: Incoming) -> Result<(), blob::Error> {
+async fn put_blob(upload: &Upload, mut body: Incoming) -> Result<(), blob::Error> {
     let mut chunker = Chunker::new(blob::PART_SIZE);
     let mut parts = Vec::new();
     let mut sending: Option<tokio::task::JoinHandle<Result<Part>>> = None;
@@ -74,7 +69,7 @@ async fn put_blob(state: &State, upload: &Upload, mut body: Incoming) -> Result<
         for chunk in chunker.push(data) {
             parts.extend(finish_part(upload, sending.take()).await?);
             number = next_part(number)?;
-            let (cloud, id, this) = (state.cloud.clone(), upload.id.clone(), number);
+            let (cloud, id, this) = (upload.cloud.clone(), upload.id.clone(), number);
             sending = Some(tokio::spawn(async move {
                 let etag = cloud.put_part(&id, this, chunk).await?;
                 Ok(Part { number: this, etag })
@@ -84,7 +79,7 @@ async fn put_blob(state: &State, upload: &Upload, mut body: Incoming) -> Result<
     parts.extend(finish_part(upload, sending.take()).await?);
     if let Some(last) = chunker.finish(number == 0) {
         number = next_part(number)?;
-        parts.push(put_part(state, upload, number, last).await?);
+        parts.push(put_part(upload, number, last).await?);
     }
     upload.lock().committed = Some(parts);
     Ok(())
@@ -143,13 +138,13 @@ async fn put_block(
         .to_bytes();
     match placement {
         Placement::Part(number) => {
-            let part = put_part(state, upload, number, bytes).await?;
+            let part = put_part(upload, number, bytes).await?;
             upload.lock().blocks.uploaded(block, part);
         }
         Placement::Append => {
             let full = upload.lock().blocks.append(block, bytes)?;
             for (number, bytes) in full {
-                let part = put_part(state, upload, number, bytes).await?;
+                let part = put_part(upload, number, bytes).await?;
                 upload.lock().blocks.joined(part);
             }
         }
@@ -157,7 +152,7 @@ async fn put_block(
     Ok(())
 }
 
-async fn put_block_list(state: &State, upload: &Upload, body: Incoming) -> Result<(), blob::Error> {
+async fn put_block_list(upload: &Upload, body: Incoming) -> Result<(), blob::Error> {
     let bytes = Limited::new(body, MAX_SMALL_BODY)
         .collect()
         .await
@@ -168,7 +163,7 @@ async fn put_block_list(state: &State, upload: &Upload, body: Incoming) -> Resul
     let ids = blob::block_list(xml)?;
     let blob::Commit { mut parts, tail } = upload.lock().blocks.commit(&ids)?;
     if let Some((number, bytes)) = tail {
-        parts.push(put_part(state, upload, number, bytes).await?);
+        parts.push(put_part(upload, number, bytes).await?);
     }
     upload.lock().committed = Some(parts);
     Ok(())

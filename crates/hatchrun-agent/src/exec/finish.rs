@@ -15,7 +15,7 @@ use tracing::warn;
 use super::context::Runtime;
 use super::sink::Sink;
 use super::{GRACE_MINUTES, Job, Line, interp};
-use crate::cache::Proxy;
+use crate::cache::{ArtifactConfig, Proxy, Services};
 use crate::source;
 
 /// Most outputs a job reports.
@@ -46,19 +46,37 @@ impl Job<'_> {
         super::context::condition(self.doc.job.if_.as_deref(), &self.ctx, &rt)
     }
 
-    /// Starts the cache proxy when the document has a cache service and
-    /// points the steps at it. Without it, or when it does not come up,
-    /// steps run with no cache.
+    /// Starts the cache proxy when the document has a cache or an
+    /// artifact service and points the steps at it. Without one, or
+    /// when it does not come up, steps run with neither.
     pub(super) async fn start_cache(&mut self, sink: &mut dyn Sink) -> Option<Proxy> {
-        let service = self.doc.cache.as_ref()?;
-        // The service token is the agent's own credential; an error text
-        // that quotes it must not print.
-        self.masker.add(&service.token);
-        let cache = source::Cache {
+        if self.doc.cache.is_none() && self.doc.artifacts.is_none() {
+            return None;
+        }
+        // The service tokens are the agent's own credentials; an error
+        // text that quotes one must not print.
+        let cache = self.doc.cache.as_ref().map(|service| source::Cache {
             url: service.url.clone(),
             token: service.token.clone(),
-        };
-        let proxy = match Proxy::start(cache, IpAddr::V4(Ipv4Addr::LOCALHOST)).await {
+        });
+        let artifacts = self.doc.artifacts.as_ref().map(|service| ArtifactConfig {
+            service: source::Cache {
+                url: service.url.clone(),
+                token: service.token.clone(),
+            },
+            run_id: self.doc.run_id.clone(),
+            job_id: self.doc.job.id.clone(),
+        });
+        for token in cache
+            .iter()
+            .chain(artifacts.iter().map(|config| &config.service))
+            .map(|service| service.token.clone())
+            .collect::<Vec<_>>()
+        {
+            self.masker.add(&token);
+        }
+        let services = Services { cache, artifacts };
+        let proxy = match Proxy::start_services(services, IpAddr::V4(Ipv4Addr::LOCALHOST)).await {
             Ok(proxy) => proxy,
             Err(err) => {
                 self.cache_unavailable(sink, &err);
@@ -70,13 +88,16 @@ impl Job<'_> {
             proxy.stop().await;
             return None;
         }
-        let token = match super::random_name() {
-            Ok(token) => token,
-            Err(message) => {
-                self.cache_unavailable(sink, &anyhow::anyhow!(message));
-                proxy.stop().await;
-                return None;
-            }
+        let token = match proxy.runtime_token().map(str::to_owned) {
+            Some(token) => token,
+            None => match super::random_name() {
+                Ok(token) => token,
+                Err(message) => {
+                    self.cache_unavailable(sink, &anyhow::anyhow!(message));
+                    proxy.stop().await;
+                    return None;
+                }
+            },
         };
         self.masker.add(&token);
         self.cache_env = BTreeMap::from([
