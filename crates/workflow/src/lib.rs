@@ -8,6 +8,7 @@
 //! in a Cloudflare Worker, the runner agent and the CLI.
 
 pub mod agent;
+pub mod concurrency;
 pub mod config;
 pub mod convert;
 pub mod cron;
@@ -22,6 +23,7 @@ pub mod split;
 pub mod templates;
 pub mod trigger;
 
+pub use concurrency::{Cancel, Concurrency, Resolved};
 pub use config::{
     CacheStep, CheckoutStep, Command, Config, Executor, Job, MAX_SOURCE, Matrix, Outcome,
     Parameter, ParameterKind, Require, RunStep, Statuses, Step, Submodules, UsesStep, Workflow,

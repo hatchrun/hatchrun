@@ -15,6 +15,7 @@ use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::concurrency::Concurrency;
 use crate::diagnostic::Diagnostic;
 use crate::permissions::Permissions;
 use crate::trigger::{Filter, Triggers};
@@ -246,6 +247,9 @@ pub struct Job {
     /// The environment the job deploys to; it can read `${{ parameters.x }}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// At most one job of a group runs in the repository, one waits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<Concurrency>,
     /// The steps.
     pub steps: Vec<Step>,
 }
@@ -264,6 +268,7 @@ struct JobDe {
     outputs: BTreeMap<String, String>,
     permissions: Option<Permissions>,
     environment: Option<String>,
+    concurrency: Option<Concurrency>,
     steps: Vec<Step>,
     #[serde(rename = "services", deserialize_with = "later_services")]
     _services: (),
@@ -285,6 +290,7 @@ impl Default for JobDe {
             outputs: job.outputs,
             permissions: job.permissions,
             environment: job.environment,
+            concurrency: job.concurrency,
             steps: job.steps,
             _services: (),
             _container: (),
@@ -305,6 +311,7 @@ impl From<JobDe> for Job {
             outputs: de.outputs,
             permissions: de.permissions,
             environment: de.environment,
+            concurrency: de.concurrency,
             steps: de.steps,
         }
     }
@@ -727,6 +734,9 @@ pub struct Workflow {
     /// What the token of every job without its own `permissions` may do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Permissions>,
+    /// At most one run of a group runs in the repository, one waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<Concurrency>,
     /// The jobs, wired together with `requires`.
     pub jobs: Vec<WorkflowJob>,
 }

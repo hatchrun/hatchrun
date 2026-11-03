@@ -16,6 +16,7 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::concurrency::{Cancel, Concurrency, JOB_CONTEXTS, WORKFLOW_CONTEXTS};
 use crate::config::{
     CacheStep, CheckoutStep, Config, Job, Matrix, Outcome, Parameter, ParameterKind, RunStep,
     Statuses, Step, UsesStep, Workflow, WorkflowJob, WorkspaceStep,
@@ -108,6 +109,9 @@ pub(crate) const ENTRY_KEYS: &[&str] = &["name", "requires", "type", "branches",
 pub struct Plan {
     /// The workflow's name.
     pub workflow: String,
+    /// The workflow's `concurrency`, unevaluated: the host reads it
+    /// against the event when the run is about to start.
+    pub concurrency: Option<Concurrency>,
     /// The jobs. Every job comes after the jobs it requires.
     pub jobs: Vec<PlannedJob>,
 }
@@ -151,6 +155,9 @@ pub struct PlannedJob {
     /// The environment the job deploys to, after parameter substitution.
     /// `None` for approval jobs and jobs without one.
     pub environment: Option<String>,
+    /// The job's `concurrency`, parameters substituted, the rest left
+    /// for the host to evaluate when the job is about to start.
+    pub concurrency: Option<Concurrency>,
     /// The steps, with commands expanded.
     pub steps: Vec<PlannedStep>,
 }
@@ -485,6 +492,9 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
         for (key, value) in &job.outputs {
             check.text(&format_args!("`outputs.{key}`"), value);
         }
+        if let Some(c) = &job.concurrency {
+            check.concurrency(c, JOB_CONTEXTS);
+        }
         check.steps(&job.steps);
     }
     for (name, command) in &config.commands {
@@ -499,6 +509,16 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
         .steps(&command.steps);
     }
     for (workflow, wf) in &config.workflows {
+        if let Some(c) = &wf.concurrency {
+            let owner = format!("workflow `{workflow}`");
+            Check {
+                config,
+                owner: &owner,
+                params: None,
+                errors,
+            }
+            .concurrency(c, WORKFLOW_CONTEXTS);
+        }
         for entry in &wf.jobs {
             let id = entry.name.as_deref().unwrap_or(&entry.job);
             let owner = format!("workflow `{workflow}` entry `{id}`");
@@ -636,6 +656,45 @@ impl Check<'_> {
                     self.text(&at("test-results"), path);
                 }
                 Step::Command { name, with } => self.call(&at(name), name, with),
+            }
+        }
+    }
+
+    /// Checks a `concurrency` key: its expressions parse and read only
+    /// the contexts in `allowed`, and it reads no parameter where none
+    /// can be substituted.
+    fn concurrency(&mut self, c: &Concurrency, allowed: &[&str]) {
+        for (field, text, bare) in c.texts() {
+            let label = format!("`concurrency.{field}`");
+            let wrapped;
+            let text = if bare && expr::find_open(text).is_none() {
+                wrapped = format!("${{{{ {text} }}}}");
+                wrapped.as_str()
+            } else {
+                text
+            };
+            if self.text(&label, text) {
+                self.errors.push(Diagnostic::new(format!(
+                    "{} {label} reads `parameters`, which it cannot here",
+                    self.owner
+                )));
+            }
+            let Ok(found) = expr::expressions(text) else {
+                continue;
+            };
+            for (_, inner) in found {
+                if parameter_name(inner).is_some() {
+                    continue;
+                }
+                for (name, _) in expr::contexts(inner).unwrap_or_default() {
+                    if !allowed.contains(&name.as_ref()) && name != "parameters" {
+                        self.errors.push(Diagnostic::new(format!(
+                            "{} {label} reads `{name}`; it can read only {}",
+                            self.owner,
+                            allowed.join(", ")
+                        )));
+                    }
+                }
             }
         }
     }
@@ -916,6 +975,7 @@ fn compile_workflow(
     }
     Some(Plan {
         workflow: name.to_owned(),
+        concurrency: wf.concurrency.clone(),
         jobs,
     })
 }
@@ -1643,6 +1703,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         outputs: BTreeMap::new(),
         token_permissions: BTreeMap::new(),
         environment: None,
+        concurrency: None,
         steps: Vec::new(),
     }]
 }
@@ -1806,6 +1867,13 @@ fn expand_job(
     let env = sub.map(&job.env);
     let if_ = sub.opt(job.if_.as_deref());
     let outputs = sub.map(&job.outputs);
+    let concurrency = job.concurrency.as_ref().map(|c| Concurrency {
+        group: sub.text(&c.group),
+        cancel_in_progress: match &c.cancel_in_progress {
+            Cancel::When(text) => Cancel::When(sub.text(text)),
+            other => other.clone(),
+        },
+    });
     let environment = sub.opt(job.environment.as_deref());
     if let Some(name) = &environment {
         if name.contains("${{") {
@@ -1835,6 +1903,7 @@ fn expand_job(
         outputs,
         token_permissions: token_scopes(job.permissions.as_ref()),
         environment,
+        concurrency,
         steps,
     })
 }
