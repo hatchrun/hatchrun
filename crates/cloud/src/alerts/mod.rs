@@ -61,6 +61,9 @@ const CLAIM_FOR: u64 = 2 * MINUTE;
 /// How long a send may take. Well inside [`CLAIM_FOR`], so a send that
 /// is still running has not lost its claim.
 const SEND_FOR: u64 = MINUTE;
+/// Time a claim keeps in reserve, after the send, to record it.
+const RECORD_FOR: u64 = MINUTE / 2;
+const _: () = assert!(SEND_FOR + RECORD_FOR < CLAIM_FOR);
 /// Bytes in a gigabyte.
 const GB: u64 = 1_000_000_000;
 /// The share of the database's connections in use, in percent, at which
@@ -388,15 +391,19 @@ pub(crate) async fn settle(
 
     // Alerts the inbox already heard fire; one that fires now has its
     // own email.
+    let heard = |alert: &&Alert| alert.state == State::Firing && alert.sent == Some(State::Firing);
     let still: Vec<Alert> = alerts
         .iter()
-        .filter(|alert| {
-            alert.state == State::Firing
-                && alert.sent == Some(State::Firing)
-                && !unsaved.contains(&alert.key.as_str())
-        })
+        .filter(heard)
+        .filter(|alert| !unsaved.contains(&alert.key.as_str()))
         .cloned()
         .collect();
+    // A digest without an alert whose row is stale would claim the day
+    // and miss it until tomorrow, so the next pass sends it instead.
+    let held_back = alerts
+        .iter()
+        .filter(heard)
+        .any(|alert| unsaved.contains(&alert.key.as_str()));
     for alert in &alerts {
         if unsaved.contains(&alert.key.as_str()) {
             continue;
@@ -419,7 +426,10 @@ pub(crate) async fn settle(
         }
         send_claimed(store, mail, alert, state, now, until, &mut errors).await;
     }
-    if digest && let Err(err) = send_digest(store, mail, now, &still).await {
+    if digest
+        && !held_back
+        && let Err(err) = send_digest(store, mail, now, &still).await
+    {
         errors.push(format!("digest: {err}"));
     }
     errors
@@ -436,9 +446,9 @@ async fn send_claimed(
     until: u64,
     errors: &mut Vec<String>,
 ) {
-    // Claiming took time. With too little of the claim left to
-    // bound the send, give it back for the next pass.
-    if until.saturating_sub(mail.now()) < SEND_FOR {
+    // Claiming took time. With too little of the claim left for the
+    // send and for recording it, give it back for the next pass.
+    if until.saturating_sub(mail.now()) < SEND_FOR + RECORD_FOR {
         errors.push(format!(
             "alert {}: claim too close to its end to send",
             alert.key
@@ -520,8 +530,15 @@ async fn send_digest(
     match send_bounded(mail, &digest(&firing, now)).await {
         Some(Ok(())) => Ok(()),
         Some(Err(err)) => {
-            store.digest_undo(last, now).await?;
-            Err(err)
+            // A claim left in place holds the digest back for a day.
+            let undone = match store.digest_undo(last, now).await {
+                Err(_) => store.digest_undo(last, now).await,
+                undone => undone,
+            };
+            Err(match undone {
+                Ok(()) => err,
+                Err(undo) => format!("{err}; the digest claim could not be undone: {undo}"),
+            })
         }
         None => Err(format!("no answer in {} s", SEND_FOR / 1000)),
     }
