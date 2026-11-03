@@ -851,6 +851,7 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
         return Ok(());
     };
     launches::wake_oldest(env, db, &run.tenant_id).await;
+    launches::wake_group(env, db, row.id).await;
     let jobs = store::jobs_for_run(db, run.id)
         .await
         .map_err(|e| e.to_string())?;

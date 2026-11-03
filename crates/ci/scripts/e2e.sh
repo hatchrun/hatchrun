@@ -38,6 +38,12 @@
 #   usage event for each;
 # - a tenant whose subscription was canceled, and one that never
 #   subscribed, each get one billing check run and no run;
+# - a push to serial runs a three-leg matrix with max-parallel 1: one
+#   leg runs and fails, the other two wait with a check run that says
+#   why, and end as cancelled by fail-fast;
+# - a push to soft runs a job that fails with continue-on-error set from
+#   its matrix entry: it counts as a success and the job that needs it
+#   runs and reads success;
 # - environments, after wide: environment settings, secrets and vars at
 #   three levels, and an organization secret limited to other
 #   repositories are set through the API; a push to guard fails its job
@@ -703,6 +709,61 @@ until curl -fsS "$GITHUB/_state" | jq -e --argjson ids "$usage_ids" --arg tenant
   sleep 2
 done
 log "wide: Polar has the usage of all six"
+
+# Scenario: a push to serial runs a matrix of three legs with
+# max-parallel 1 and fail-fast. One leg runs and fails; the other two
+# wait with a check run that says why, and end as cancelled when the
+# first one fails.
+serial_sha="$(printf '1%.0s' $(seq 40))"
+serial_run="$(push serial "$serial_sha")"
+log "push to serial started run $serial_run"
+deadline=$((SECONDS + POLL_SECS))
+until api "runs/$serial_run" >"$tmp/serial.json" && jq -e '
+  ([.jobs[] | select(.status == "launching" or .status == "launched" or .status == "running")] | length == 1)
+  and ([.jobs[] | select(.status == "queued")] | length == 2)
+' "$tmp/serial.json" >/dev/null; do
+  ((SECONDS < deadline)) || die "serial never had one leg running and two waiting: $(api "runs/$serial_run")"
+  sleep 1
+done
+mapfile -t waiting < <(jq -r '.jobs[] | select(.status == "queued") | .plan_id' "$tmp/serial.json")
+for plan_id in "${waiting[@]}"; do
+  deadline=$((SECONDS + 60))
+  until check_of "$serial_sha" "serial / $plan_id" |
+    jq -e '.summary // "" | contains("already runs 1 job at once")' >/dev/null; do
+    ((SECONDS < deadline)) || die "the waiting leg's check run does not say why: $(check_of "$serial_sha" "serial / $plan_id")"
+    sleep 1
+  done
+done
+log "serial: one leg runs, the others wait for max-parallel"
+wait_checks "$serial_sha" 3 'all(.status == "completed")'
+checks "$serial_sha" | jq -e '
+  ([.[] | select(.conclusion == "failure")] | length == 1)
+  and ([.[] | select(.conclusion == "cancelled")] | length == 2)
+' >/dev/null || die "serial should have one failed leg and two cancelled: $(checks "$serial_sha")"
+for plan_id in "${waiting[@]}"; do
+  check_of "$serial_sha" "serial / $plan_id" |
+    jq -e '.summary // "" | contains("fail-fast")' >/dev/null ||
+    die "the cancelled leg does not say why: $(check_of "$serial_sha" "serial / $plan_id")"
+done
+log "serial: the failed leg cancelled the two waiting ones"
+
+# Scenario: a push to soft runs a job whose continue-on-error reads its
+# matrix entry. It fails, counts as a success, and the job that needs
+# it runs and sees success.
+soft_sha="$(printf '2%.0s' $(seq 40))"
+soft_run="$(push soft "$soft_sha")"
+log "push to soft started run $soft_run"
+wait_checks "$soft_sha" 2 'all(.status == "completed" and .conclusion == "success")'
+lenient_job="$(job_id "$soft_run" lenient)"
+curl -fsS --compressed "$CI/api/ci/jobs/$lenient_job/log" | grep -qx "about to fail softly" ||
+  die "the lenient job did not run its step"
+after_job="$(job_id "$soft_run" after-lenient)"
+deadline=$((SECONDS + 60))
+until curl -fsS --compressed "$CI/api/ci/jobs/$after_job/log" 2>/dev/null | grep -qx "lenient said success"; do
+  ((SECONDS < deadline)) || die "the job after lenient did not see success"
+  sleep 1
+done
+log "soft: a failed job with continue-on-error counted as a success"
 
 # Whether the last app_call answered status $1 with a body that jq
 # filter $2 holds for.

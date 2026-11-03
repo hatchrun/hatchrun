@@ -8,7 +8,6 @@
 
 convert: exit 0
   `ci.yml`: `concurrency` is not supported and was dropped
-  `ci.yml` job `test`: `strategy.fail-fast` is not supported and was dropped
 validate: exit 0
 event push-main (compile refs/heads/main)
   ci: triggered

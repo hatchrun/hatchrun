@@ -802,8 +802,11 @@ impl<'a> Cx<'a> {
                 )
                 .await?;
                 if ended {
-                    // The freed place goes to the oldest held job.
+                    // The freed place goes to the oldest held job, and
+                    // to the oldest job of its matrix held for
+                    // max-parallel.
                     launches::wake_oldest(&self.env, db, &info.tenant_id).await;
+                    launches::wake_group(&self.env, db, *job).await;
                 }
                 Ok(())
             }

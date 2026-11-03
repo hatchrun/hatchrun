@@ -252,13 +252,24 @@ async fn launch(
         }
         MAX_RUNNING_JOBS
     };
-    let job = match store::claim_launch(&db, message.job_id, &standing.tenant_id, max_running, now)
-        .await
-        .map_err(|err| err.to_string())?
-    {
+    let claim = store::claim_launch(
+        &db,
+        message.job_id,
+        &standing.tenant_id,
+        max_running,
+        delivery != Delivery::GiveUp,
+        now,
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    let job = match claim {
         Claim::Claimed(job) => job,
         Claim::Busy => {
             return hold_for(env, &db, &job, Hold::Concurrency, &standing, settings, now).await;
+        }
+        Claim::Capped { max_parallel } => {
+            let message = parallel_message(&job.name, max_parallel);
+            return hold_job(env, &db, &job, MAX_PARALLEL_HOLD, &message, now).await;
         }
         Claim::Gone => return Ok(()),
     };
@@ -358,6 +369,37 @@ pub(crate) async fn wake_oldest(env: &Env, db: &Db, tenant_id: &str) {
     if let Err(err) = send_wakes(env, &woken).await {
         console_error!("tenant {tenant_id}: wake the held job: {err}");
     }
+}
+
+/// A job ended: wakes the oldest job of its matrix that waits for a
+/// place under `max-parallel`, which the freed place is for. A failure
+/// is logged and left to the reconciler's backstop, since the job's end
+/// is recorded already.
+pub(crate) async fn wake_group(env: &Env, db: &Db, job_id: u64) {
+    let woken = match store::held_siblings(db, job_id).await {
+        Ok(woken) => woken,
+        Err(err) => {
+            console_error!("job {job_id}: find the held job of its matrix: {err}");
+            return;
+        }
+    };
+    if let Err(err) = send_wakes(env, &woken).await {
+        console_error!("job {job_id}: wake the held job of its matrix: {err}");
+    }
+}
+
+/// The word `ci_jobs.held` stores for a job over its matrix's
+/// `max-parallel`.
+const MAX_PARALLEL_HOLD: &str = "max_parallel";
+
+/// What the check run tells the user about a job over its matrix's
+/// `max-parallel`.
+fn parallel_message(name: &str, max_parallel: u32) -> String {
+    format!(
+        "Waiting: `{name}` already runs {max_parallel} {} at once, the most its strategy \
+         allows. This job starts when one of them ends.",
+        if max_parallel == 1 { "job" } else { "jobs" }
+    )
 }
 
 /// The runner template the job's row names, if it names a known one.

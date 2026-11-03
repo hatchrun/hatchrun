@@ -39,7 +39,7 @@ pub(super) fn setup() -> TestDb {
 /// Claims job `job_id` of tenant t1, which must succeed.
 pub(super) fn claim(db: &TestDb, job_id: u64, now: u64) -> JobRow {
     match db
-        .wait(claim_launch(db.db(), job_id, "t1", 5, now))
+        .wait(claim_launch(db.db(), job_id, "t1", 5, true, now))
         .unwrap()
     {
         Claim::Claimed(job) => job,
@@ -70,6 +70,8 @@ pub(super) fn new_job(plan_id: &str) -> NewJob {
         token_permissions: BTreeMap::from([("metadata".to_owned(), Level::Read)]),
         secret_refs: SecretRefs::default(),
         environment: None,
+        strategy_group: None,
+        max_parallel: None,
     }
 }
 
