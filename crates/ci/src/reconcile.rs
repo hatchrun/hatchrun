@@ -381,8 +381,9 @@ pub fn fires(schedules: &[ScheduleRow], minutes: &[u64]) -> Vec<Fire> {
 }
 
 /// Counts the firings of one pass that start a run, against
-/// [`MAX_FIRES`]. A firing whose run an earlier pass made is not
-/// counted.
+/// [`MAX_FIRES`]. A firing whose run an earlier pass made, or whose
+/// repository has no head, is not counted. A start that fails is: the
+/// attempt was made and paid for.
 #[derive(Default)]
 struct FireCap {
     started: usize,
@@ -390,15 +391,14 @@ struct FireCap {
 }
 
 impl FireCap {
-    /// Whether one more run may start; a refusal is counted as skipped.
-    fn admit(&mut self) -> bool {
-        if self.started < MAX_FIRES {
-            self.started += 1;
-            true
-        } else {
-            self.skipped += 1;
-            false
-        }
+    /// Counts a firing that is about to start a run.
+    fn start(&mut self) {
+        self.started += 1;
+    }
+
+    /// Counts `n` firings left unread because the cap is full.
+    fn skip(&mut self, n: usize) {
+        self.skipped += n;
     }
 
     fn full(&self) -> bool {
@@ -536,14 +536,18 @@ async fn fire_schedules(
             .map_err(|e| e.to_string())?;
         let last_page = rows.len() < SCHEDULE_ROWS as usize;
         cursor = rows.last().cloned();
-        for fire in &fires(&rows, &due) {
+        let page = fires(&rows, &due);
+        for (i, fire) in page.iter().enumerate() {
+            // Once the cap is full the rest of the page starts nothing,
+            // so it is counted as skipped without looking up its runs.
+            if cap.full() {
+                cap.skip(page.len() - i);
+                break;
+            }
             let made = store::run_for_delivery(db, &fire.delivery(), &fire.workflow)
                 .await
                 .map_err(|e| e.to_string())?;
             if made.is_some_and(|run| run.status != "queued") {
-                continue;
-            }
-            if !cap.admit() {
                 continue;
             }
             // Pages not read yet have fired no minute, so the pass
@@ -570,6 +574,8 @@ async fn fire_schedules(
                 stopped_at = Some(resume);
                 break 'pages;
             }
+            // A slot is used only here, by a firing that gets to start.
+            cap.start();
             if let Err(err) = start(env, db, settings, &tokens, head, fire, now).await {
                 console_error!(
                     "reconcile: schedule {} of {}: {err}",
@@ -1617,12 +1623,13 @@ mod tests {
     fn the_cap_counts_only_runs_that_start() {
         let mut cap = FireCap::default();
         // Firings whose run exists never reach the cap.
-        for _ in 0..MAX_FIRES {
-            assert!(cap.admit());
+        for _ in 0..MAX_FIRES - 1 {
+            cap.start();
         }
+        assert!(!cap.full());
+        cap.start();
         assert!(cap.full());
-        assert!(!cap.admit());
-        assert!(!cap.admit());
+        cap.skip(2);
         assert_eq!((cap.started, cap.skipped), (MAX_FIRES, 2));
     }
 
