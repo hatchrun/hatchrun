@@ -22,12 +22,29 @@ use crate::github::RateLimit;
 /// Every alert.
 const ALERTS: &str = "SELECT key, state, detail, fired_at, resolved_at, sent FROM alerts";
 
-/// Writes an alert's row.
+/// Writes an alert's row if it is still the row `$8`, `$9` and `$10`
+/// (state, `fired_at` and sent) describe. A row another pass inserted or
+/// changed in between is left alone.
 const SAVE: &str = "INSERT INTO alerts (key, state, detail, fired_at, resolved_at, sent, \
      updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
      ON CONFLICT (key) DO UPDATE SET state = excluded.state, detail = excluded.detail, \
      fired_at = excluded.fired_at, resolved_at = excluded.resolved_at, sent = excluded.sent, \
-     updated_at = excluded.updated_at";
+     updated_at = excluded.updated_at \
+     WHERE alerts.state = $8 AND alerts.fired_at = $9 AND alerts.sent IS NOT DISTINCT FROM $10";
+
+/// Claims the email saying `$2` for `$1` until `$4`: the row must still
+/// be due it (see `Alert::due`) and carry no claim that lasts past `$3`.
+const CLAIM: &str = "UPDATE alerts SET sending_until = $4 \
+     WHERE key = $1 AND state = $2 AND sent IS DISTINCT FROM $2 \
+     AND NOT ($2 = 'resolved' AND sent IS NULL) \
+     AND (sending_until IS NULL OR sending_until <= $3)";
+
+/// Notes that the email saying `$2` went out and ends the claim.
+const SENT: &str =
+    "UPDATE alerts SET sent = $2, sending_until = NULL, updated_at = $3 WHERE key = $1";
+
+/// Ends the claim on `$1`.
+const RELEASE: &str = "UPDATE alerts SET sending_until = NULL WHERE key = $1";
 
 /// When the last digest went out.
 const DIGEST_AT: &str = "SELECT digest_at FROM reconciler WHERE id = 1";
@@ -43,22 +60,49 @@ impl Store for Kept<'_> {
         self.0.all(ALERTS, &[]).await.map_err(text)
     }
 
-    async fn save(&self, alert: &Alert, now: u64) -> Result<(), String> {
-        self.0
+    async fn save(&self, prev: Option<&Alert>, next: &Alert, now: u64) -> Result<bool, String> {
+        // A new alert has no row to match, so a row found is another pass's.
+        let changed = self
+            .0
             .run(
                 SAVE,
                 &params![
-                    alert.key.as_str(),
-                    alert.state.as_str(),
-                    alert.detail.as_str(),
-                    alert.fired_at,
-                    alert.resolved_at,
-                    alert.sent.map(State::as_str),
+                    next.key.as_str(),
+                    next.state.as_str(),
+                    next.detail.as_str(),
+                    next.fired_at,
+                    next.resolved_at,
+                    next.sent.map(State::as_str),
                     now,
+                    prev.map(|prev| prev.state.as_str()),
+                    prev.map(|prev| prev.fired_at),
+                    prev.and_then(|prev| prev.sent).map(State::as_str),
                 ],
             )
             .await
             .map_err(text)?;
+        Ok(changed > 0)
+    }
+
+    async fn claim(&self, key: &str, state: State, now: u64, until: u64) -> Result<bool, String> {
+        let changed = self
+            .0
+            .run(CLAIM, &params![key, state.as_str(), now, until])
+            .await
+            .map_err(text)?;
+        Ok(changed > 0)
+    }
+
+    async fn sent(&self, key: &str, state: State, now: u64) -> Result<(), String> {
+        self.0
+            .run(SENT, &params![key, state.as_str(), now])
+            .await
+            .map_err(text)?;
+        Ok(())
+    }
+
+    async fn release(&self, key: &str) -> Result<(), String> {
+        self.0.run(RELEASE, &params![key]).await.map_err(text)?;
         Ok(())
     }
 

@@ -53,6 +53,9 @@ const FROM: &str = "alerts@notify.hatchrun.io";
 
 const MINUTE: u64 = 60 * 1000;
 const DAY: u64 = 24 * 60 * MINUTE;
+/// How long a pass holds the claim on an email. One that crashes while
+/// sending blocks the retry this long.
+const CLAIM_FOR: u64 = 2 * MINUTE;
 /// Bytes in a gigabyte.
 const GB: u64 = 1_000_000_000;
 /// The share of the database's connections in use, in percent, at which
@@ -282,8 +285,18 @@ fn duration(ms: u64) -> String {
 pub(crate) trait Store {
     /// Every alert.
     async fn alerts(&self) -> Result<Vec<Alert>, String>;
-    /// Writes an alert's row.
-    async fn save(&self, alert: &Alert, now: u64) -> Result<(), String>;
+    /// Writes the row `next`, which `prev` (`None` for a new alert)
+    /// became after a check. Writes nothing and returns `false` when the
+    /// stored row is no longer `prev`, because another pass changed it.
+    async fn save(&self, prev: Option<&Alert>, next: &Alert, now: u64) -> Result<bool, String>;
+    /// Claims the email saying `state` for the alert `key` until
+    /// `until`. Returns `false` when the row is not due that email any
+    /// more, or another pass holds a claim that has not ended at `now`.
+    async fn claim(&self, key: &str, state: State, now: u64, until: u64) -> Result<bool, String>;
+    /// Notes that the email saying `state` went out and ends the claim.
+    async fn sent(&self, key: &str, state: State, now: u64) -> Result<(), String>;
+    /// Ends the claim after an email that failed to send.
+    async fn release(&self, key: &str) -> Result<(), String>;
     /// When the last digest went out.
     async fn digest_at(&self) -> Result<Option<u64>, String>;
     /// Notes that a digest went out at `at`.
@@ -317,14 +330,25 @@ pub(crate) async fn settle(
         let Some(next) = observe(at.map(|at| &alerts[at]), *key, seen, now) else {
             continue;
         };
-        if let Err(err) = store.save(&next, now).await {
-            errors.push(format!("alert {}: {err}", key.as_str()));
-            // A stored row in another state is stale until the next pass
-            // observes it again. One that only lost a new detail is not.
-            if at.is_none_or(|at| alerts[at].state != next.state) {
+        let prev = at.map(|at| &alerts[at]);
+        match store.save(prev, &next, now).await {
+            Ok(true) => {}
+            // Another pass changed the row after this one read it. Its
+            // snapshot is stale until the next pass reads it again.
+            Ok(false) => {
                 unsaved.push(key.as_str());
+                continue;
             }
-            continue;
+            Err(err) => {
+                errors.push(format!("alert {}: {err}", key.as_str()));
+                // A stored row in another state is stale until the next
+                // pass observes it again. One that only lost a new
+                // detail is not.
+                if at.is_none_or(|at| alerts[at].state != next.state) {
+                    unsaved.push(key.as_str());
+                }
+                continue;
+            }
         }
         match at {
             Some(at) => alerts[at] = next,
@@ -343,19 +367,31 @@ pub(crate) async fn settle(
         })
         .cloned()
         .collect();
-    for alert in &mut alerts {
+    for alert in &alerts {
         if unsaved.contains(&alert.key.as_str()) {
             continue;
         }
         let Some(state) = alert.due() else {
             continue;
         };
+        // Only the pass that wins the claim sends, so a pass racing this
+        // one cannot send the same email.
+        match store.claim(&alert.key, state, now, now + CLAIM_FOR).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(err) => {
+                errors.push(format!("alert {}: {err}", alert.key));
+                continue;
+            }
+        }
         if let Err(err) = mail.send(&notice(alert, state, now)).await {
             errors.push(format!("alert {}: email: {err}", alert.key));
+            if let Err(err) = store.release(&alert.key).await {
+                errors.push(format!("alert {}: {err}", alert.key));
+            }
             continue;
         }
-        alert.sent = Some(state);
-        if let Err(err) = store.save(alert, now).await {
+        if let Err(err) = store.sent(&alert.key, state, now).await {
             errors.push(format!("alert {}: {err}", alert.key));
         }
     }
