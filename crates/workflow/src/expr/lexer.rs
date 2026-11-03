@@ -81,6 +81,12 @@ pub(crate) fn lex(src: &str) -> Result<Vec<Token<'_>>, ExprError> {
                 });
                 continue;
             }
+            b'"' => {
+                return Err(ExprError::new(
+                    "double-quoted strings are not valid in expressions, use single quotes ('...') and write a quote inside as ''",
+                    start,
+                ));
+            }
             b'0'..=b'9' | b'-' => {
                 let (n, end) = number(src, start)?;
                 i = end;

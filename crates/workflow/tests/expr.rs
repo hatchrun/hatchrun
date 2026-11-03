@@ -571,6 +571,27 @@ fn check_parses_without_evaluating() {
 }
 
 #[test]
+fn double_quoted_strings_are_rejected_with_a_fix() {
+    for (bad, offset) in [
+        ("\"abc\"", 0),
+        ("secrets[\"X\"]", 8),
+        ("github.ref == \"main\"", 14),
+    ] {
+        let e = check(bad).unwrap_err();
+        assert!(
+            e.message.contains("use single quotes"),
+            "{bad}: {}",
+            e.message
+        );
+        assert_eq!(e.offset, offset, "{bad}");
+    }
+    assert_eq!(
+        evaluate("'it''s'", &json!({}), &NoFiles).unwrap(),
+        json!("it's")
+    );
+}
+
+#[test]
 fn checks_status_finds_status_calls_in_the_parsed_expression() {
     use hatchrun_workflow::checks_status;
     for (cond, want) in [
