@@ -383,6 +383,31 @@ fn an_alert_whose_row_fails_to_save_sends_nothing_that_pass() {
 }
 
 #[test]
+fn a_failed_save_of_a_new_detail_still_announces_the_alert() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    outbox.down.set(true);
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    outbox.down.set(false);
+
+    // Still firing with a new detail; the row keeps its state, so the
+    // unsent firing email goes out.
+    let store = Unsaved {
+        kept: Kept(db.db()),
+        key,
+    };
+    db.wait(settle(
+        &store,
+        &outbox,
+        NOW + MINUTE,
+        &[(key, firing("job 6"))],
+        true,
+    ));
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Launch failed for good"]);
+}
+
+#[test]
 fn an_alert_that_resolves_before_its_email_sends_nothing() {
     let db = Db::new();
     let outbox = Outbox::default();

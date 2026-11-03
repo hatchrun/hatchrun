@@ -319,8 +319,11 @@ pub(crate) async fn settle(
         };
         if let Err(err) = store.save(&next, now).await {
             errors.push(format!("alert {}: {err}", key.as_str()));
-            // The stored row is stale; the next pass observes it again.
-            unsaved.push(key.as_str());
+            // A stored row in another state is stale until the next pass
+            // observes it again. One that only lost a new detail is not.
+            if at.is_none_or(|at| alerts[at].state != next.state) {
+                unsaved.push(key.as_str());
+            }
             continue;
         }
         match at {
