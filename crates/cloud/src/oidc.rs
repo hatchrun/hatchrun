@@ -122,6 +122,35 @@ pub fn jwks(keys: &[(String, PublicKey)]) -> serde_json::Value {
     serde_json::json!({ "keys": keys })
 }
 
+/// The public keys of the `slots` that have a `kid`, as (`kid`, key)
+/// pairs, and a message for each slot whose key is missing or unreadable.
+/// Such a slot is left out of the keys, so a bad next key cannot take the
+/// signing key's JWKS down with it. `get` answers `None` for a name that
+/// is not set or is empty. [`SLOTS`] is the slot list of this issuer;
+/// other issuers pass their own.
+pub fn public_keys(
+    slots: &[(&str, &str)],
+    get: impl Fn(&str) -> Option<String>,
+) -> (Vec<(String, PublicKey)>, Vec<String>) {
+    let mut keys = Vec::new();
+    let mut problems = Vec::new();
+    for (key, kid) in slots {
+        let Some(kid) = get(kid) else { continue };
+        let public = get(key)
+            .ok_or_else(|| "is not set".to_owned())
+            .and_then(|pem| {
+                jwt::pkcs8_der(&pem)
+                    .and_then(|der| jwt::public_key(&der))
+                    .map_err(|err| err.to_string())
+            });
+        match public {
+            Ok(public) => keys.push((kid, public)),
+            Err(err) => problems.push(format!("{key} (kid {kid}): {err}")),
+        }
+    }
+    (keys, problems)
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine;
@@ -168,6 +197,20 @@ mod tests {
                 "claims_supported": ["iss", "sub", "aud", "iat", "nbf", "exp"],
             })
         );
+    }
+
+    #[test]
+    fn a_slot_without_a_kid_or_with_a_bad_key_is_left_out() {
+        let get = |name: &str| match name {
+            "OIDC_SIGNING_KEY" => Some("not a key".to_owned()),
+            "OIDC_KEY_ID" => Some("2026-10".to_owned()),
+            "OIDC_NEXT_SIGNING_KEY" => Some("whatever".to_owned()),
+            _ => None,
+        };
+        let (keys, problems) = public_keys(&SLOTS, get);
+        assert_eq!(keys.len(), 0);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].starts_with("OIDC_SIGNING_KEY (kid 2026-10): "));
     }
 
     #[test]
