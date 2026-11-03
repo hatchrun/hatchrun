@@ -11,8 +11,9 @@ use worker::Result;
 /// The billing state of a tenant, usage since `$2`, cap default `$3`;
 /// `{owner}` picks the tenant by `$1`.
 const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
-       EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
-         AND subscriptions.status IN ('active', 'trialing')) AS card, \
+       (tenants.beta OR EXISTS (SELECT 1 FROM subscriptions \
+         WHERE subscriptions.tenant_id = tenants.id \
+         AND subscriptions.status IN ('active', 'trialing'))) AS card, \
        COALESCE((SELECT cap_micros FROM ci_spend_caps WHERE tenant_id = tenants.id), $3) \
          AS cap_micros, \
        COALESCE((SELECT json_agg(json_build_object('template', u.template, 'seconds', u.seconds)) \
@@ -51,7 +52,8 @@ pub struct Standing {
     pub tenant_id: String,
     /// The organization's login, for messages.
     pub org_login: String,
-    /// Whether an active or trialing subscription exists.
+    /// Whether the tenant is in the beta or has an active or trialing
+    /// subscription.
     pub card: bool,
     /// The monthly spend cap in micros: the tenant's own or the default.
     pub cap_micros: u64,

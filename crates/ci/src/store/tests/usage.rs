@@ -462,6 +462,33 @@ fn has_card_needs_an_active_subscription() {
 }
 
 #[test]
+fn beta_tenant_has_a_card_without_a_subscription() {
+    let db = setup();
+    let card = |db: &TestDb| db.wait(has_card(db.db(), "t1")).unwrap();
+    assert!(!card(&db));
+    db.run("UPDATE tenants SET beta = true WHERE id = 't1'", &[]);
+    assert!(card(&db));
+    assert_eq!(
+        db.wait(tenant(db.db(), "t1")).unwrap().unwrap().ci_billing,
+        CiBilling::Active
+    );
+    assert_eq!(
+        db.wait(tenant_for_installation(db.db(), 99))
+            .unwrap()
+            .unwrap()
+            .ci_billing,
+        CiBilling::Active
+    );
+    let standing = db
+        .wait(tenant_standing(db.db(), "t1", 0, 50_000_000))
+        .unwrap()
+        .unwrap();
+    assert!(standing.card);
+    db.run("UPDATE tenants SET beta = false WHERE id = 't1'", &[]);
+    assert!(!card(&db));
+}
+
+#[test]
 fn tenant_row_reads_the_billing_state() {
     let db = setup();
     let state = |db: &TestDb| {
@@ -603,6 +630,25 @@ fn finish_job_records_seconds_from_claim() {
     assert_eq!(
         usage_rows(&db),
         [(job_id, 1, "ubuntu-latest".to_owned(), 61, 71_000)]
+    );
+}
+
+#[test]
+fn beta_usage_is_metered_but_never_sent_to_polar() {
+    let db = setup();
+    let (_, paid) = run_with_job(&db, "launching");
+    db.wait(start_job(db.db(), paid, 10_000)).unwrap();
+    assert!(finish(&db, paid, 1, 71_000));
+    db.run("UPDATE tenants SET beta = true WHERE id = 't1'", &[]);
+    let (_, beta) = run_with_job_named(&db, "d2", "launching");
+    db.wait(start_job(db.db(), beta, 10_000)).unwrap();
+    assert!(finish(&db, beta, 1, 71_000));
+    assert_eq!(usage_rows(&db).len(), 2, "both are metered");
+    let unsent = db.wait(unsent_usage(db.db(), 10)).unwrap();
+    assert_eq!(
+        unsent.iter().map(|r| r.job_id).collect::<Vec<_>>(),
+        [paid],
+        "only the non-beta row goes to Polar"
     );
 }
 
