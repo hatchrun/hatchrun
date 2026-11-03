@@ -283,6 +283,7 @@ start launcher env RUST_LOG="${RUST_LOG:-info,hatchrun_agent=debug}" "$dev" laun
   echo "CI_TOKEN_KEY=\"$TOKEN_KEY\""
   printf 'GITHUB_APP_PRIVATE_KEY="%s"\n' "$key"
   printf 'OIDC_SIGNING_KEY="%s"\n' "$key"
+  printf 'CI_OIDC_SIGNING_KEY="%s"\n' "$key"
   echo "POLAR_ACCESS_TOKEN=\"$POLAR_TOKEN\""
 } >"$tmp/ci.env"
 
@@ -324,6 +325,7 @@ start ci env -C "$root/crates/ci" \
   --var APP_URL:"$APP_URL" \
   --var GITHUB_APP_ID:Iv1e2e \
   --var OIDC_KEY_ID:e2e \
+  --var CI_OIDC_KEY_ID:e2e-ci \
   --var POLAR_API_URL:"$GITHUB" \
   --var CI_SECRETS_KEY_ID:e2e \
   --var CI_SECRETS_KEY_OLD_ID:""
@@ -466,6 +468,35 @@ broken="$(check_of "$fail_sha" "failing / broken")"
 jq -e '.text // "" | contains("about to fail")' <<<"$broken" >/dev/null ||
   die "the failed check run lacks the log tail: $broken"
 log "fail: the job failed"
+
+# Scenario: a job with id-token: write gets an OIDC token, one without it
+# gets no request variables.
+oidc_sha="$(printf 'd%.0s' $(seq 40))"
+oidc_run="$(push oidc "$oidc_sha")"
+log "push to oidc started run $oidc_run"
+wait_checks "$oidc_sha" 2 'all(.status == "completed" and .conclusion == "success")'
+oidc_log() {
+  local job deadline=$((SECONDS + 60))
+  job="$(job_id "$oidc_run" "$1")"
+  until curl -fsS --compressed "$CI/api/ci/jobs/$job/log" >"$tmp/oidc-$1.log" 2>/dev/null &&
+    grep -q "$2" "$tmp/oidc-$1.log"; do
+    ((SECONDS < deadline)) || die "the $1 job's log lacks $2: $(cat "$tmp/oidc-$1.log" 2>/dev/null)"
+    sleep 1
+  done
+  cp "$tmp/oidc-$1.log" "$logs/"
+}
+oidc_log mint '^parts='
+grep -qx 'parts=3' "$tmp/oidc-mint.log" || die "the token is not a JWT: $(cat "$tmp/oidc-mint.log")"
+grep -q '"iss":"https://token.ci.hatchrun.io"' "$tmp/oidc-mint.log" ||
+  die "wrong issuer: $(cat "$tmp/oidc-mint.log")"
+grep -q '"aud":"sts.e2e.example"' "$tmp/oidc-mint.log" ||
+  die "wrong audience: $(cat "$tmp/oidc-mint.log")"
+grep -q '"sub":"repo:[^"]*:ref:refs/heads/oidc"' "$tmp/oidc-mint.log" ||
+  die "wrong subject: $(cat "$tmp/oidc-mint.log")"
+oidc_log plain '^request='
+grep -qx 'request=\[unset\]' "$tmp/oidc-plain.log" ||
+  die "a job without id-token: write got a request: $(cat "$tmp/oidc-plain.log")"
+log "oidc: the granted job got a token and the other got none"
 
 # Scenario: a re-run request for the failed job runs it again. GitHub
 # sends back the check run's external id.

@@ -382,7 +382,7 @@ jobs:
 }
 
 #[test]
-fn id_token_is_dropped_with_a_warning() {
+fn id_token_write_is_kept() {
     let out = ok("
 on: push
 jobs:
@@ -392,10 +392,38 @@ jobs:
     steps:
       - run: x
 ");
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert_eq!(
+        out.config.jobs["ci-build"].permissions,
+        Some(Permissions::Scopes(
+            [
+                ("contents".to_owned(), Level::Read),
+                ("id-token".to_owned(), Level::Write),
+            ]
+            .into()
+        ))
+    );
+    round_trips(&out);
+}
+
+#[test]
+fn id_token_read_is_dropped_with_a_warning() {
+    let out = ok("
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: { id-token: read, contents: read }
+    steps:
+      - run: x
+");
     assert!(
         has(
             &out.warnings,
-            &["build", "`id-token` is not supported and was dropped"]
+            &[
+                "build",
+                "`permissions.id-token` is `read`, not write or none"
+            ]
         ),
         "{:?}",
         out.warnings
@@ -406,7 +434,6 @@ jobs:
             [("contents".to_owned(), Level::Read)].into()
         ))
     );
-    round_trips(&out);
 }
 
 #[test]

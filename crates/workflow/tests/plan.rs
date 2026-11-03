@@ -1230,10 +1230,27 @@ workflows:
 }
 
 #[test]
+fn id_token_write_reaches_the_planned_job() {
+    let got = token(
+        "
+jobs: { t: { runs-on: ubuntu-latest, permissions: { id-token: write }, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [t]
+",
+    );
+    assert_eq!(
+        got,
+        levels(&[("id_token", Level::Write), ("metadata", Level::Read)])
+    );
+}
+
+#[test]
 fn bad_permissions_fail_the_parse() {
     let err = parse(
         "
-jobs: { t: { runs-on: ubuntu-latest, permissions: { id-token: write }, steps: [] } }
+jobs: { t: { runs-on: ubuntu-latest, permissions: { id-token: read }, steps: [] } }
 workflows: {}
 ",
     )
@@ -1241,7 +1258,7 @@ workflows: {}
     assert!(
         err[0]
             .message
-            .contains("`id-token` permission: OIDC tokens come in a later release"),
+            .contains("`permissions.id-token` is `read`; use write or none"),
         "{err:?}"
     );
 }

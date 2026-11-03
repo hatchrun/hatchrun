@@ -585,6 +585,7 @@ mod tests {
             vars: BTreeMap::new(),
             timings: BTreeMap::new(),
             cache: None,
+            id_token: None,
         }
     }
 

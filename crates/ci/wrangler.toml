@@ -7,8 +7,13 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-01"
 
 # The webhook forwarded by hatchrun-cloud, the runner agent's API, the
-# app's CI API and the logs all live on this hostname.
-routes = [{ pattern = "ci.hatchrun.io", custom_domain = true }]
+# app's CI API and the logs all live on ci.hatchrun.io. token.ci.hatchrun.io
+# is the issuer of the OIDC tokens jobs with id-token: write get; the
+# Worker serves its discovery document and JWKS there.
+routes = [
+  { pattern = "ci.hatchrun.io", custom_domain = true },
+  { pattern = "token.ci.hatchrun.io", custom_domain = true },
+]
 
 [build]
 command = "cargo install --locked worker-build --version 0.8.7 && worker-build --release"
@@ -88,6 +93,11 @@ secret_name = "ci-secrets-key-2026-10"
 
 # Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY,
 # OIDC_SIGNING_KEY (signs the token for AssumeRoleWithWebIdentity),
+# CI_OIDC_SIGNING_KEY (RSA private key in PEM, signs the OIDC tokens of
+# jobs; a key of its own, never OIDC_SIGNING_KEY, which customer AWS
+# accounts trust for the control plane; generate with
+# `openssl genrsa 2048`, the PEM must be PKCS#8: add `| openssl pkcs8
+# -topk8 -nocrypt`),
 # BROKER_TOKEN (shared with hatchrun-broker), CI_TOKEN_KEY (the HMAC
 # key of job tokens) and POLAR_ACCESS_TOKEN (the usage events only; the
 # same token hatchrun-cloud holds), uploaded by
@@ -112,6 +122,12 @@ BROKER_URL = "https://broker.hatchrun.io"
 GITHUB_APP_ID = "Iv23liMh4C066YyxQB7R"
 # kid of OIDC_SIGNING_KEY in oidc.hatchrun.io's JWKS.
 OIDC_KEY_ID = "2026-10-14"
+# kid of CI_OIDC_SIGNING_KEY in token.ci.hatchrun.io's JWKS. The JWKS
+# also lists CI_OIDC_NEXT_SIGNING_KEY and CI_OIDC_PREVIOUS_SIGNING_KEY
+# while CI_OIDC_NEXT_KEY_ID and CI_OIDC_PREVIOUS_KEY_ID are set here:
+# publish the next key, wait an hour for caches, then move it to
+# CI_OIDC_SIGNING_KEY with a new CI_OIDC_KEY_ID.
+CI_OIDC_KEY_ID = "2026-11-03"
 # The region of the CI AWS account, where jobs run.
 CI_REGION = "us-east-1"
 # POLAR_API_URL is left unset, so the usage events go to

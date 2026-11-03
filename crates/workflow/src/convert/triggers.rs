@@ -13,8 +13,9 @@ use super::{
 };
 
 impl Cx {
-    /// Converts a `permissions:` value. `id-token`, scopes hatchrun does
-    /// not know and levels it does not know are dropped with a warning.
+    /// Converts a `permissions:` value. Scopes hatchrun does not know and
+    /// levels it does not know are dropped with a warning. `id-token:
+    /// read` is dropped too: only `write` and `none` mean anything.
     /// A value of another shape is dropped too; a job that said it
     /// then gets no permissions at all, never the workflow's, which
     /// could be wider than the author meant.
@@ -31,7 +32,18 @@ impl Cx {
                 let mut scopes = BTreeMap::new();
                 for (key, level) in map {
                     if key == "id-token" {
-                        self.warn(format!("{at}: `id-token` is not supported and was dropped"));
+                        match level.as_str() {
+                            Some("write") => {
+                                scopes.insert(key.clone(), Level::Write);
+                            }
+                            Some("none") => {
+                                scopes.insert(key.clone(), Level::None);
+                            }
+                            _ => self.warn(format!(
+                                "{at}: `permissions.id-token` is `{}`, not write or none, and was dropped",
+                                show(level)
+                            )),
+                        }
                         continue;
                     }
                     if !SCOPES.iter().any(|(k, _)| k == key) {

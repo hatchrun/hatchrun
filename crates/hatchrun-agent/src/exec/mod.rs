@@ -145,6 +145,9 @@ pub async fn run_job(
         masker.add(secret);
     }
     masker.add(&doc.github.token);
+    if let Some(request) = &doc.id_token {
+        masker.add(&request.token);
+    }
 
     // The job's own timeout cancels it like a request to stop does.
     let external = cancel;
@@ -1049,6 +1052,18 @@ fn base_env(
         path(&layout.temp.join(TIMINGS_FILE)),
     );
     env.extend(job.cache_env.clone());
+    // Only a job granted `id-token: write` has a request, so only it
+    // gets the variables `core.getIDToken` reads.
+    if let Some(request) = &doc.id_token {
+        env.insert(
+            "ACTIONS_ID_TOKEN_REQUEST_URL".to_owned(),
+            request.url.clone(),
+        );
+        env.insert(
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN".to_owned(),
+            request.token.clone(),
+        );
+    }
     if let Some((index, total)) = doc.job.node {
         env.insert("HATCHRUN_NODE_INDEX".to_owned(), index.to_string());
         env.insert("HATCHRUN_NODE_TOTAL".to_owned(), total.to_string());

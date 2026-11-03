@@ -14,6 +14,9 @@
 //! - `POST /v1/agent/{claim,events,result}` is what the runner agent on
 //!   a launched instance calls: its job document, log batches and
 //!   heartbeats, and its result.
+//! - `GET /v1/oidc/token` gives a job with `id-token: write` its OIDC
+//!   token (see [`oidc`]); the same Worker serves the issuer's discovery
+//!   document and JWKS on `token.ci.hatchrun.io`.
 //! - `/api/ci/*` serves runs, jobs and logs to the app and takes its
 //!   dispatch and cancel requests; `hatchrun-cloud` forwards them.
 //!
@@ -34,6 +37,7 @@ pub mod intake;
 pub mod launcher;
 pub mod launches;
 pub mod logs;
+pub mod oidc;
 pub mod planning;
 pub mod pool;
 pub mod reconcile;
@@ -52,11 +56,17 @@ use worker::{
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    if req.url()?.host_str() == Some(oidc::HOST) {
+        return oidc::issuer(&req, &env);
+    }
     if req.method() == Method::Post && req.path() == "/github/webhook" {
         return webhook::handle(req, &env).await;
     }
     if req.path().starts_with("/api/ci/") {
         return api::handle(req, &env).await;
+    }
+    if req.path().starts_with("/v1/oidc/") {
+        return oidc::handle(req, &env).await;
     }
     if req.path().starts_with("/v1/agent/") {
         return agent::handle(req, &env).await;

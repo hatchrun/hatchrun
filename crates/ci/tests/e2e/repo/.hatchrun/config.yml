@@ -8,7 +8,8 @@
 # echoes a secret, bad a workflow with a runs-on that names no template
 # and one that runs, wide six jobs at once, one more than the cap,
 # guard a job whose environment allows other branches, and deploy two
-# jobs on an environment that needs approval.
+# jobs on an environment that needs approval, and oidc one job with
+# id-token: write that asks for a token and one without it.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -72,6 +73,25 @@ jobs:
     environment: production
     steps:
       - run: echo "never runs"
+  mint:
+    runs-on: ubuntu-latest
+    permissions: { id-token: write }
+    steps:
+      - name: ask for a token
+        run: |
+          answer="$(curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.e2e.example")"
+          jwt="$(printf '%s' "$answer" | sed 's/.*"value":"\([^"]*\)".*/\1/')"
+          payload="$(printf '%s' "$jwt" | cut -d. -f2 | tr '_-' '/+')"
+          case $((${#payload} % 4)) in 2) payload="$payload==";; 3) payload="$payload=";; esac
+          printf '%s' "$payload" | base64 -d | tr ',' '\n'
+          echo
+          echo "parts=$(printf '%s' "$jwt" | tr '.' '\n' | wc -l)"
+  plain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: look for the request
+        run: echo "request=[${ACTIONS_ID_TOKEN_REQUEST_URL-unset}]"
 workflows:
   ci:
     on: { push: { branches: [main] } }
@@ -111,3 +131,8 @@ workflows:
     jobs:
       - deploy-a
       - deploy-b
+  oidc:
+    on: { push: { branches: [oidc] } }
+    jobs:
+      - mint
+      - plain

@@ -71,6 +71,14 @@ pub const SCOPES: &[(&str, &str)] = &[
     ("statuses", "statuses"),
 ];
 
+/// The workflow key of the OIDC permission. It is not a GitHub App
+/// permission, so it is not in [`SCOPES`].
+pub const ID_TOKEN: &str = "id-token";
+
+/// The key [`token_scopes`] uses for `id-token: write`. It is kept out
+/// of the permissions asked of GitHub.
+pub const ID_TOKEN_SCOPE: &str = "id_token";
+
 /// The token without any `permissions:`: Plan 3's read set.
 pub const DEFAULT_SCOPES: &[(&str, Level)] = &[
     ("checks", Level::Read),
@@ -80,7 +88,9 @@ pub const DEFAULT_SCOPES: &[(&str, Level)] = &[
 ];
 
 /// App permission names and levels for a job's token. Always holds
-/// `metadata: read`; `none` levels are left out.
+/// `metadata: read`; `none` levels are left out. `id-token: write`
+/// (and `write-all`) adds [`ID_TOKEN_SCOPE`], which is not an App
+/// permission: it says the job may ask for OIDC tokens.
 #[must_use]
 pub fn token_scopes(p: Option<&Permissions>) -> BTreeMap<String, Level> {
     let mut out = BTreeMap::new();
@@ -101,10 +111,15 @@ pub fn token_scopes(p: Option<&Permissions>) -> BTreeMap<String, Level> {
                     .iter()
                     .map(|(_, app)| ((*app).to_owned(), Level::Write)),
             );
+            out.insert(ID_TOKEN_SCOPE.to_owned(), Level::Write);
         }
         Some(Permissions::Scopes(map)) => {
             for (key, level) in map {
                 if *level == Level::None {
+                    continue;
+                }
+                if key == ID_TOKEN {
+                    out.insert(ID_TOKEN_SCOPE.to_owned(), *level);
                     continue;
                 }
                 if let Some((_, app)) = SCOPES.iter().find(|(k, _)| k == key) {
@@ -165,10 +180,22 @@ impl<'de> Deserialize<'de> for Permissions {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Permissions, A::Error> {
                 let mut out = BTreeMap::new();
                 while let Some((key, level)) = map.next_entry::<String, String>()? {
-                    if key == "id-token" {
-                        return Err(de::Error::custom(
-                            "`id-token` permission: OIDC tokens come in a later release",
-                        ));
+                    if key == ID_TOKEN {
+                        let level = match Level::parse(&level) {
+                            Some(Level::Read) => {
+                                return Err(de::Error::custom(
+                                    "`permissions.id-token` is `read`; use write or none",
+                                ));
+                            }
+                            Some(parsed) => parsed,
+                            None => {
+                                return Err(de::Error::custom(format!(
+                                    "`permissions.id-token` is `{level}`; use write or none"
+                                )));
+                            }
+                        };
+                        out.insert(key, level);
+                        continue;
                     }
                     if !SCOPES.iter().any(|(k, _)| *k == key) {
                         return Err(de::Error::custom(format!(
@@ -230,9 +257,10 @@ mod tests {
     #[test]
     fn write_all_writes_every_scope() {
         let got = scopes("write-all");
-        assert_eq!(got.len(), 14);
+        assert_eq!(got.len(), 15);
         assert_eq!(got["metadata"], Level::Read);
-        assert_eq!(got.values().filter(|l| **l == Level::Write).count(), 13);
+        assert_eq!(got["id_token"], Level::Write);
+        assert_eq!(got.values().filter(|l| **l == Level::Write).count(), 14);
     }
 
     #[test]
@@ -276,12 +304,33 @@ mod tests {
     }
 
     #[test]
-    fn id_token_comes_later() {
-        let err = parse("id-token: write").unwrap_err();
+    fn id_token_write_grants_oidc_tokens() {
+        let got = scopes("id-token: write\ncontents: read");
+        assert_eq!(got.get("id_token"), Some(&Level::Write));
+        assert_eq!(got.get("contents"), Some(&Level::Read));
+        assert!(!scopes("id-token: none").contains_key("id_token"));
+        assert!(!scopes("contents: read").contains_key("id_token"));
+    }
+
+    #[test]
+    fn write_all_grants_oidc_tokens_and_read_all_does_not() {
+        assert_eq!(
+            token_scopes(Some(&Permissions::WriteAll)).get("id_token"),
+            Some(&Level::Write)
+        );
+        assert!(!token_scopes(Some(&Permissions::ReadAll)).contains_key("id_token"));
+        assert!(!token_scopes(None).contains_key("id_token"));
+    }
+
+    #[test]
+    fn id_token_read_is_refused() {
+        let err = parse("id-token: read").unwrap_err();
         assert!(
-            err.contains("`id-token` permission: OIDC tokens come in a later release"),
+            err.contains("`permissions.id-token` is `read`; use write or none"),
             "{err}"
         );
+        let err = parse("id-token: admin").unwrap_err();
+        assert!(err.contains("`permissions.id-token` is `admin`"), "{err}");
     }
 
     #[test]

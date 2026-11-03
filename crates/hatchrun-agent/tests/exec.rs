@@ -2248,6 +2248,31 @@ async fn cache_service_starts_the_proxy() {
     assert!(b.lines().any(|l| l == "url=unset v2=unset tok="), "{b}");
 }
 
+#[test]
+fn id_token_request_reaches_only_the_job_that_has_one() {
+    let script = "echo \"url=${ACTIONS_ID_TOKEN_REQUEST_URL-unset} \
+                  tok=${ACTIONS_ID_TOKEN_REQUEST_TOKEN-unset}\"";
+    let mut doc = make::document(vec![make::step(script)]);
+    doc.id_token = Some(hatchrun_workflow::IdTokenRequest {
+        url: "https://ci.example/v1/oidc/x?api-version=2.0".to_owned(),
+        token: "rq-9f3a".to_owned(),
+    });
+    let with = json(&doc);
+    doc.id_token = None;
+    let without = json(&doc);
+    let one = tempfile::tempdir().unwrap();
+    let on = stdout(&exec(one.path(), &with));
+    let two = tempfile::tempdir().unwrap();
+    let off = stdout(&exec(two.path(), &without));
+    // The token is masked in the log, but the step sees it.
+    assert!(
+        on.lines()
+            .any(|l| l == "url=https://ci.example/v1/oidc/x?api-version=2.0 tok=***"),
+        "{on}"
+    );
+    assert!(off.lines().any(|l| l == "url=unset tok=unset"), "{off}");
+}
+
 // Fixes from the whole-branch review.
 
 #[test]
