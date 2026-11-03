@@ -30,9 +30,9 @@ pub use self::environments::{
     environment, environments, job_environment, put_environment, release_approval_holds,
 };
 pub use self::jobs::{
-    Claim, JobRow, NewJob, claim_launch, finish_job, heartbeat, hold, insert_jobs, job,
-    jobs_by_ids, jobs_for_run, launch_failed, launched, note_queued_error, open_jobs, queue_job,
-    reset_job, set_job, start_job,
+    Claim, JobRow, NewJob, claim_launch, finish_job, heartbeat, held_siblings, hold, insert_jobs,
+    job, jobs_by_ids, jobs_for_run, launch_failed, launched, note_queued_error, open_jobs,
+    queue_job, reset_job, set_job, start_job,
 };
 pub use self::pool::{
     PoolRow, claims_by_bucket, drop_pool, move_pool, pool_rows, save_pool, take_pool,

@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use hatchrun_cloud::ci_wake::Woken;
 use hatchrun_cloud::db::{Db, Param, params};
 use hatchrun_workflow::{Level, SecretRefs, templates};
 use serde::Deserialize;
@@ -32,6 +33,10 @@ pub struct NewJob {
     pub secret_refs: SecretRefs,
     /// The environment the job names.
     pub environment: Option<String>,
+    /// The matrix the job belongs to, shared by its jobs within a run.
+    pub strategy_group: Option<String>,
+    /// The most jobs of the group that run at once.
+    pub max_parallel: Option<u32>,
 }
 
 /// A recorded job.
@@ -83,7 +88,7 @@ pub struct JobRow {
     #[serde(deserialize_with = "json_text")]
     pub secret_refs: serde_json::Value,
     /// Why the queued job waits for a launch: `card`, `spend_cap`,
-    /// `concurrency` or `approval`.
+    /// `concurrency`, `approval` or `max_parallel`.
     pub held: Option<String>,
     /// The environment the job names.
     pub environment: Option<String>,
@@ -154,7 +159,9 @@ pub(super) const LOCK_TENANT: &str = "SELECT id FROM tenants WHERE id = $1 FOR U
 /// `$4` jobs of tenant `$3` are launching, launched or running, and no
 /// older job of the tenant waits for a place (held for `concurrency`),
 /// so new jobs do not jump the line; run after [`LOCK_TENANT`]. The
-/// hold is over.
+/// hold is over. With `$5` a job with a `max_parallel` also needs fewer
+/// than that many launching, launched or running jobs in its group, and
+/// no older job of the group held for `max_parallel`.
 const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL, \
      launch_attempts = launch_attempts + 1, updated_at = $2 \
      WHERE id = $1 AND status = 'queued' \
@@ -165,7 +172,41 @@ const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL
           ON older_run.id = older.run_id \
           WHERE older_run.tenant_id = $3 AND older.status = 'queued' \
           AND older.held = 'concurrency' AND older.id < ci_jobs.id) \
+     AND (NOT $5::boolean OR ci_jobs.max_parallel IS NULL OR \
+          ((SELECT count(*) FROM ci_jobs sibling \
+            WHERE sibling.run_id = ci_jobs.run_id \
+            AND sibling.strategy_group = ci_jobs.strategy_group \
+            AND sibling.status IN ('launching', 'launched', 'running')) < ci_jobs.max_parallel \
+           AND NOT EXISTS (SELECT 1 FROM ci_jobs older_sibling \
+            WHERE older_sibling.run_id = ci_jobs.run_id \
+            AND older_sibling.strategy_group = ci_jobs.strategy_group \
+            AND older_sibling.status = 'queued' AND older_sibling.held = 'max_parallel' \
+            AND older_sibling.id < ci_jobs.id))) \
      RETURNING {columns}";
+
+/// Whether queued job `$1` is over its group's limit now, and the limit:
+/// the same test as [`CLAIM_LAUNCH`], for telling a held group from a
+/// full tenant.
+const GROUP_FULL: &str = "SELECT ci_jobs.max_parallel AS max_parallel FROM ci_jobs \
+     WHERE ci_jobs.id = $1 AND ci_jobs.max_parallel IS NOT NULL \
+     AND ((SELECT count(*) FROM ci_jobs sibling \
+           WHERE sibling.run_id = ci_jobs.run_id \
+           AND sibling.strategy_group = ci_jobs.strategy_group \
+           AND sibling.status IN ('launching', 'launched', 'running')) >= ci_jobs.max_parallel \
+          OR EXISTS (SELECT 1 FROM ci_jobs older_sibling \
+           WHERE older_sibling.run_id = ci_jobs.run_id \
+           AND older_sibling.strategy_group = ci_jobs.strategy_group \
+           AND older_sibling.status = 'queued' AND older_sibling.held = 'max_parallel' \
+           AND older_sibling.id < ci_jobs.id))";
+
+/// The oldest queued job held for `max_parallel` in the group of job
+/// `$1`, at most `$2`: what a job of the group ending makes room for.
+const HELD_SIBLINGS: &str = "SELECT held.id AS job_id, held.attempt FROM ci_jobs ended \
+     JOIN ci_jobs held ON held.run_id = ended.run_id \
+       AND held.strategy_group = ended.strategy_group \
+     WHERE ended.id = $1 AND ended.strategy_group IS NOT NULL \
+     AND held.status = 'queued' AND held.held = 'max_parallel' \
+     ORDER BY held.id LIMIT $2";
 
 /// Keeps attempt `$2` of queued job `$1` held for reason `$3` until
 /// `$4`, at `$5`. Returns whether the reason changed. An approval hold
@@ -259,17 +300,19 @@ pub async fn insert_jobs(
     let mut bound = params![run_id, now];
     let mut highest = 0;
     for (i, job) in jobs.iter().enumerate() {
-        let base = 3 + i * 7;
-        highest = base + 6;
+        let base = 3 + i * 9;
+        highest = base + 8;
         values.push(format!(
-            "($1, ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, ${}, 'waiting', $2, $2)",
+            "($1, ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, ${}, ${}, ${}, 'waiting', $2, $2)",
             base,
             base + 1,
             base + 2,
             base + 3,
             base + 4,
             base + 5,
-            base + 6
+            base + 6,
+            base + 7,
+            base + 8
         ));
         bound.push(Param::from(&job.plan_id));
         bound.push(Param::from(&job.name));
@@ -282,11 +325,14 @@ pub async fn insert_jobs(
             serde_json::to_string(&job.secret_refs).map_err(worker::Error::from)?,
         ));
         bound.push(Param::from(job.environment.as_deref()));
+        bound.push(Param::from(job.strategy_group.as_deref()));
+        bound.push(Param::from(job.max_parallel));
     }
     debug_assert_eq!(bound.len(), highest);
     let sql = format!(
         "INSERT INTO ci_jobs (run_id, plan_id, name, timeout_minutes, template, \
-         token_permissions, secret_refs, environment, status, created_at, updated_at) \
+         token_permissions, secret_refs, environment, strategy_group, max_parallel, status, \
+         created_at, updated_at) \
          VALUES {} RETURNING plan_id, id",
         values.join(", ")
     );
@@ -407,6 +453,12 @@ pub enum Claim {
     Claimed(JobRow),
     /// The job is queued, but the tenant runs its most jobs already.
     Busy,
+    /// The job is queued, but its matrix runs `max_parallel` jobs
+    /// already, or an older job of it waits for a place.
+    Capped {
+        /// The group's limit.
+        max_parallel: u32,
+    },
     /// Somebody else took the launch, or the job moved on.
     Gone,
 }
@@ -416,7 +468,9 @@ pub enum Claim {
 /// row is locked first, so two consumers cannot both take the last of
 /// `max_running` places: the job is claimed only while fewer than
 /// `max_running` of the tenant's jobs are launching, launched or
-/// running.
+/// running. With `groups` a job of a matrix with `max-parallel` also
+/// waits for a place in its group: see [`Claim::Capped`]. A job that is
+/// only being ended takes no place and passes `false`.
 ///
 /// # Errors
 ///
@@ -426,23 +480,46 @@ pub async fn claim_launch(
     job_id: u64,
     tenant_id: &str,
     max_running: u32,
+    groups: bool,
     now: u64,
 ) -> Result<Claim> {
+    #[derive(Deserialize)]
+    struct Full {
+        max_parallel: u32,
+    }
     let lock = params![tenant_id];
     let claimed: Option<JobRow> = db
         .first_locked(
             (LOCK_TENANT, &lock),
             &with_columns(CLAIM_LAUNCH, JOB_COLUMNS),
-            &params![job_id, now, tenant_id, max_running],
+            &params![job_id, now, tenant_id, max_running, groups],
         )
         .await?;
     if let Some(job) = claimed {
         return Ok(Claim::Claimed(job));
     }
-    Ok(match job(db, job_id).await? {
-        Some(row) if row.status == "queued" => Claim::Busy,
-        _ => Claim::Gone,
-    })
+    let Some(row) = job(db, job_id).await? else {
+        return Ok(Claim::Gone);
+    };
+    if row.status != "queued" {
+        return Ok(Claim::Gone);
+    }
+    if groups && let Some(full) = db.first::<Full>(GROUP_FULL, &params![job_id]).await? {
+        return Ok(Claim::Capped {
+            max_parallel: full.max_parallel,
+        });
+    }
+    Ok(Claim::Busy)
+}
+
+/// The oldest queued job held for `max_parallel` in the group of job
+/// `job_id`, to wake when `job_id` ends and leaves a place.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn held_siblings(db: &Db, job_id: u64) -> Result<Vec<Woken>> {
+    db.all(HELD_SIBLINGS, &params![job_id, 1_u32]).await
 }
 
 /// Keeps attempt `attempt` of job `job_id` queued with reason `hold`

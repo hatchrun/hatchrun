@@ -481,7 +481,8 @@ fn claim_launch_only_once() {
     let first = claim(&db, job_id, 10);
     assert_eq!(first.launch_attempts, 1);
     assert_eq!(
-        db.wait(claim_launch(db.db(), job_id, "t1", 5, 11)).unwrap(),
+        db.wait(claim_launch(db.db(), job_id, "t1", 5, true, 11))
+            .unwrap(),
         Claim::Gone
     );
     let job = db.wait(job(db.db(), job_id)).unwrap().unwrap();
@@ -535,7 +536,8 @@ fn claim_launch_holds_the_sixth_job() {
     }
     let (_, sixth) = run_with_job_named(&db, "d9", "queued");
     assert_eq!(
-        db.wait(claim_launch(db.db(), sixth, "t1", 5, 10)).unwrap(),
+        db.wait(claim_launch(db.db(), sixth, "t1", 5, true, 10))
+            .unwrap(),
         Claim::Busy
     );
     let row = db.wait(job(db.db(), sixth)).unwrap().unwrap();
@@ -552,7 +554,8 @@ fn claim_launch_holds_the_sixth_job() {
     db.wait(set_job(db.db(), done, "completed", Some("success"), 1_002))
         .unwrap();
     assert_eq!(
-        db.wait(claim_launch(db.db(), sixth, "t1", 5, 11)).unwrap(),
+        db.wait(claim_launch(db.db(), sixth, "t1", 5, true, 11))
+            .unwrap(),
         Claim::Busy,
         "completed jobs do not count, but five still run"
     );
@@ -572,11 +575,12 @@ fn claim_launch_holds_the_sixth_job() {
     ))
     .unwrap();
     assert!(matches!(
-        db.wait(claim_launch(db.db(), sixth, "t1", 5, 12)).unwrap(),
+        db.wait(claim_launch(db.db(), sixth, "t1", 5, true, 12))
+            .unwrap(),
         Claim::Claimed(_)
     ));
     let gone = db
-        .wait(claim_launch(db.db(), 999_999, "t1", 5, 13))
+        .wait(claim_launch(db.db(), 999_999, "t1", 5, true, 13))
         .unwrap();
     assert_eq!(gone, Claim::Gone);
 }
@@ -607,15 +611,18 @@ fn a_new_job_does_not_jump_a_held_one() {
     set_held(&db, older, "concurrency", 5);
     // One place is free, and the older job waits for it.
     assert_eq!(
-        db.wait(claim_launch(db.db(), newer, "t1", 5, 10)).unwrap(),
+        db.wait(claim_launch(db.db(), newer, "t1", 5, true, 10))
+            .unwrap(),
         Claim::Busy
     );
     assert!(matches!(
-        db.wait(claim_launch(db.db(), older, "t1", 5, 11)).unwrap(),
+        db.wait(claim_launch(db.db(), older, "t1", 5, true, 11))
+            .unwrap(),
         Claim::Claimed(_)
     ));
     assert_eq!(
-        db.wait(claim_launch(db.db(), newer, "t1", 5, 12)).unwrap(),
+        db.wait(claim_launch(db.db(), newer, "t1", 5, true, 12))
+            .unwrap(),
         Claim::Busy,
         "the tenant is full again"
     );
@@ -656,7 +663,8 @@ fn a_held_job_of_another_reason_or_tenant_blocks_nobody() {
     set_held(&db, capped, "spend_cap", 5);
     let (_, newer) = run_with_job_named(&db, "newer", "queued");
     assert!(matches!(
-        db.wait(claim_launch(db.db(), newer, "t1", 5, 10)).unwrap(),
+        db.wait(claim_launch(db.db(), newer, "t1", 5, true, 10))
+            .unwrap(),
         Claim::Claimed(_)
     ));
 }
@@ -776,7 +784,8 @@ fn an_approval_hold_blocks_nobody() {
     set_held(&db, older, "approval", 5);
     let (_, newer) = run_with_job_named(&db, "newer", "queued");
     assert!(matches!(
-        db.wait(claim_launch(db.db(), newer, "t1", 5, 10)).unwrap(),
+        db.wait(claim_launch(db.db(), newer, "t1", 5, true, 10))
+            .unwrap(),
         Claim::Claimed(_)
     ));
     let month = 1_790_812_800_000_u64;
@@ -1011,4 +1020,199 @@ fn a_rerun_clears_the_hold() {
         .unwrap();
     db.wait(reset_job(db.db(), job_id, 2, 40)).unwrap();
     assert_eq!(held_of(&db, job_id), None);
+}
+
+/// A run with `count` queued jobs of one matrix group limited to
+/// `limit`, and the ids of the jobs in plan order.
+fn matrix_run(db: &TestDb, delivery: &str, count: usize, limit: Option<u32>) -> Vec<u64> {
+    let run = db
+        .wait(insert_run(db.db(), &new_run(delivery, "ci", 1_000)))
+        .unwrap()
+        .unwrap();
+    let jobs: Vec<NewJob> = (0..count)
+        .map(|n| NewJob {
+            name: "test".into(),
+            strategy_group: Some("test".into()),
+            max_parallel: limit,
+            ..new_job(&format!("test ({n})"))
+        })
+        .collect();
+    let ids: Vec<u64> = db
+        .wait(insert_jobs(db.db(), run.id, &jobs, 1_000))
+        .unwrap()
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    for id in &ids {
+        db.wait(set_job(db.db(), *id, "queued", None, 1_001))
+            .unwrap();
+    }
+    ids
+}
+
+fn claim_group(db: &TestDb, job_id: u64, groups: bool, now: u64) -> Claim {
+    db.wait(claim_launch(db.db(), job_id, "t1", 5, groups, now))
+        .unwrap()
+}
+
+#[test]
+fn max_parallel_keeps_the_rest_of_a_matrix_queued() {
+    let db = setup();
+    let ids = matrix_run(&db, "m", 4, Some(2));
+    assert!(matches!(
+        claim_group(&db, ids[0], true, 10),
+        Claim::Claimed(_)
+    ));
+    assert!(matches!(
+        claim_group(&db, ids[1], true, 11),
+        Claim::Claimed(_)
+    ));
+    assert_eq!(
+        claim_group(&db, ids[2], true, 12),
+        Claim::Capped { max_parallel: 2 }
+    );
+    let row = db.wait(job(db.db(), ids[2])).unwrap().unwrap();
+    assert_eq!((row.status.as_str(), row.launch_attempts), ("queued", 0));
+    // A job that ended frees a place for the next one, not before.
+    db.wait(set_job(db.db(), ids[0], "completed", Some("success"), 13))
+        .unwrap();
+    assert!(matches!(
+        claim_group(&db, ids[2], true, 14),
+        Claim::Claimed(_)
+    ));
+    assert_eq!(
+        claim_group(&db, ids[3], true, 15),
+        Claim::Capped { max_parallel: 2 }
+    );
+}
+
+#[test]
+fn max_parallel_counts_each_matrix_alone() {
+    let db = setup();
+    let first = matrix_run(&db, "a", 3, Some(1));
+    let second = matrix_run(&db, "b", 3, Some(1));
+    assert!(matches!(
+        claim_group(&db, first[0], true, 10),
+        Claim::Claimed(_)
+    ));
+    assert_eq!(
+        claim_group(&db, first[1], true, 11),
+        Claim::Capped { max_parallel: 1 }
+    );
+    assert!(
+        matches!(claim_group(&db, second[0], true, 12), Claim::Claimed(_)),
+        "another run's matrix has its own places"
+    );
+}
+
+#[test]
+fn a_matrix_without_a_limit_only_meets_the_tenant_cap() {
+    let db = setup();
+    let ids = matrix_run(&db, "free", 3, None);
+    for (n, id) in ids.iter().enumerate() {
+        assert!(matches!(
+            claim_group(&db, *id, true, 10 + n as u64),
+            Claim::Claimed(_)
+        ));
+    }
+}
+
+#[test]
+fn a_new_job_does_not_jump_an_older_one_held_for_max_parallel() {
+    let db = setup();
+    let ids = matrix_run(&db, "line", 3, Some(1));
+    assert!(matches!(
+        claim_group(&db, ids[0], true, 10),
+        Claim::Claimed(_)
+    ));
+    assert!(
+        db.wait(hold(db.db(), ids[1], 1, "max_parallel", 40, 11))
+            .unwrap()
+    );
+    db.wait(set_job(db.db(), ids[0], "completed", Some("success"), 12))
+        .unwrap();
+    assert_eq!(
+        claim_group(&db, ids[2], true, 13),
+        Claim::Capped { max_parallel: 1 },
+        "the older held job goes first"
+    );
+    assert!(matches!(
+        claim_group(&db, ids[1], true, 14),
+        Claim::Claimed(_)
+    ));
+}
+
+#[test]
+fn a_job_being_ended_ignores_the_matrix_limit() {
+    let db = setup();
+    let ids = matrix_run(&db, "give-up", 2, Some(1));
+    assert!(matches!(
+        claim_group(&db, ids[0], true, 10),
+        Claim::Claimed(_)
+    ));
+    assert!(matches!(
+        claim_group(&db, ids[1], false, 11),
+        Claim::Claimed(_)
+    ));
+}
+
+#[test]
+fn an_ending_job_wakes_the_oldest_held_job_of_its_matrix() {
+    let db = setup();
+    let ids = matrix_run(&db, "wake", 4, Some(1));
+    let other = matrix_run(&db, "elsewhere", 2, Some(1));
+    assert!(matches!(
+        claim_group(&db, ids[0], true, 10),
+        Claim::Claimed(_)
+    ));
+    for id in [ids[2], ids[1], other[1]] {
+        db.wait(hold(db.db(), id, 1, "max_parallel", 40, 11))
+            .unwrap();
+    }
+    db.wait(hold(db.db(), ids[3], 1, "concurrency", 40, 11))
+        .unwrap();
+    let woken = db.wait(held_siblings(db.db(), ids[0])).unwrap();
+    assert_eq!(
+        woken_ids(woken),
+        [ids[1]],
+        "one place, the oldest of this matrix"
+    );
+    assert_eq!(
+        woken_ids(db.wait(held_siblings(db.db(), other[0])).unwrap()),
+        [other[1]]
+    );
+}
+
+#[test]
+fn a_job_outside_a_matrix_wakes_nothing() {
+    let db = setup();
+    let (_, id) = run_with_job_named(&db, "plain", "queued");
+    assert_eq!(
+        woken_ids(db.wait(held_siblings(db.db(), id)).unwrap()),
+        Vec::<u64>::new()
+    );
+}
+
+#[test]
+fn insert_jobs_keeps_the_strategy() {
+    let db = setup();
+    let ids = matrix_run(&db, "kept", 2, Some(3));
+    let rows = db.wait(jobs_for_run(db.db(), 1)).unwrap();
+    assert_eq!(rows.len(), ids.len());
+    let group: String = db
+        .column(
+            "SELECT strategy_group AS g FROM ci_jobs WHERE id = $1",
+            &params![ids[0]],
+            "g",
+        )
+        .unwrap();
+    assert_eq!(group, "test");
+    let limit: i64 = db
+        .column(
+            "SELECT max_parallel::bigint AS n FROM ci_jobs WHERE id = $1",
+            &params![ids[1]],
+            "n",
+        )
+        .unwrap();
+    assert_eq!(limit, 3);
 }

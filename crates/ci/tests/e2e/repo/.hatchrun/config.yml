@@ -7,8 +7,10 @@
 # slow a job the script cancels, arm a job on the arm64 template that
 # echoes a secret, bad a workflow with a runs-on that names no template
 # and one that runs, wide six jobs at once, one more than the cap,
-# guard a job whose environment allows other branches, and deploy two
-# jobs on an environment that needs approval.
+# serial a matrix of failing legs that run one at a time, soft a failing
+# job that continue-on-error counts as a success, guard a job whose
+# environment allows other branches, and deploy two jobs on an
+# environment that needs approval.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -53,6 +55,25 @@ jobs:
     steps:
       - name: nap
         run: sleep 20
+  leg:
+    runs-on: ubuntu-latest
+    steps:
+      - name: fail after a while
+        run: |
+          echo "leg ${{ matrix.n }}"
+          sleep 10
+          exit 1
+  lenient:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.soft }}
+    steps:
+      - run: |
+          echo "about to fail softly"
+          exit 1
+  after-lenient:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "lenient said ${{ needs.lenient.result }}"
   guarded:
     runs-on: ubuntu-latest
     environment: staging
@@ -102,6 +123,15 @@ workflows:
     on: { push: { branches: [wide] } }
     jobs:
       - nap: { matrix: { n: [1, 2, 3, 4, 5, 6] } }
+  serial:
+    on: { push: { branches: [serial] } }
+    jobs:
+      - leg: { name: serial, matrix: { n: [1, 2, 3] }, strategy: { max-parallel: 1 } }
+  soft:
+    on: { push: { branches: [soft] } }
+    jobs:
+      - lenient: { matrix: { soft: [true] } }
+      - after-lenient: { requires: [lenient] }
   guard:
     on: { push: { branches: [guard] } }
     jobs:
