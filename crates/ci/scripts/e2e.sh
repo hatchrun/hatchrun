@@ -36,9 +36,8 @@
 # - a push to wide runs six jobs: five at once, the sixth held with a
 #   check run that says why until one ends; the fake Polar then holds a
 #   usage event for each;
-# - a tenant whose subscription was canceled gets one billing check
-#   run and no run; a tenant that never subscribed gets nothing, and its
-#   config is not read;
+# - a tenant whose subscription was canceled, and one that never
+#   subscribed, each get one billing check run and no run;
 # - environments, after wide: environment settings, secrets and vars at
 #   three levels, and an organization secret limited to other
 #   repositories are set through the API; a push to guard fails its job
@@ -780,9 +779,8 @@ grep -qxF 'var is env' "$tmp/deploy-a.log" || die "deploy-a lacks the environmen
 grep -qxF 'org only is []' "$tmp/deploy-a.log" || die "deploy-a saw the org-only secret: $(head -c 2000 "$tmp/deploy-a.log")"
 log "environments: the environment's values won, the org-only secret stayed out"
 
-# Scenario: a tenant whose subscription was canceled gets one billing
-# check run for a push and nothing runs; a tenant that never subscribed
-# gets nothing at all, not even a config read.
+# Scenario: a tenant whose subscription was canceled, and one that never
+# subscribed, each get one billing check run for a push and nothing runs.
 tenant_push() {
   local installation=$1 org=$2 org_id=$3 repo_id=$4 sha=$5
   jq -c --arg sha "$sha" --arg org "$org" \
@@ -802,13 +800,12 @@ wait_checks "$lapsed_sha" 1 \
 runs_2001="$(psql_run -At -c "SELECT count(*) FROM ci_runs WHERE repo_id = 2001")"
 [[ "$runs_2001" == 0 ]] || die "the lapsed tenant has $runs_2001 runs"
 never_sha="$(printf '2%.0s' $(seq 40))"
-deliver push "$(tenant_push 44 e2e3 3 3001 "$never_sha")" 200 | jq -e '.ignored' >/dev/null ||
-  die "the never subscribed tenant's push was not ignored: $(cat "$tmp/answer")"
-curl -fsS "$GITHUB/_state" >"$tmp/state.json"
-jq -e --arg sha "$never_sha" '[.check_runs[] | select(.head_sha == $sha)] | length == 0' "$tmp/state.json" >/dev/null ||
-  die "the never subscribed tenant got check runs: $(checks "$never_sha")"
-jq -e '(.contents | index("e2e3/demo")) == null and (.contents | index("e2e2/demo")) != null' \
-  "$tmp/state.json" >/dev/null || die "config reads: $(jq -c .contents "$tmp/state.json")"
+deliver push "$(tenant_push 44 e2e3 3 3001 "$never_sha")" 202 | jq -e '.runs == []' >/dev/null ||
+  die "the never subscribed tenant's push started a run: $(cat "$tmp/answer")"
+wait_checks "$never_sha" 1 \
+  'all(.name == "hatchrun / billing" and .status == "completed" and .conclusion == "action_required")'
+runs_3001="$(psql_run -At -c "SELECT count(*) FROM ci_runs WHERE repo_id = 3001")"
+[[ "$runs_3001" == 0 ]] || die "the never subscribed tenant has $runs_3001 runs"
 # The card state as the billing page reads it.
 status="$(app_call GET orgs/e2e/billing)"
 answered 200 '.card == true' || die "the billing view of e2e answered $status: $(cat "$tmp/answer")"
