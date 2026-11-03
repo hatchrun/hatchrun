@@ -16,7 +16,8 @@ pub enum CiBilling {
     Never,
     /// A subscription exists but none is active or trialing.
     Lapsed,
-    /// An active or trialing subscription: a card on file.
+    /// An active or trialing subscription (a card on file), or a beta
+    /// tenant, which runs without one and is never billed.
     Active,
 }
 
@@ -34,14 +35,15 @@ pub struct TenantRow {
     pub retention_days: u32,
 }
 
-/// The columns of a [`TenantRow`]. `ci_billing` is `active` for an
-/// active or trialing subscription, `lapsed` for another one, `never`
+/// The columns of a [`TenantRow`]. `ci_billing` is `active` for a beta
+/// tenant or an active or trialing subscription, `lapsed` for another one, `never`
 /// for none. `retention_days` is the tier: 30, or 90
 /// for a tenant whose `retention_days` (shared with hatchrun.io, 1 to 90)
 /// is above 30. R2 lifecycle rules exist per tier, so CI keeps for 30 or
 /// 90 days and nothing between.
 const TENANT_COLUMNS: &str = "id, org_login, CASE \
-     WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id \
+     WHEN tenants.beta OR EXISTS (SELECT 1 FROM subscriptions \
+     WHERE subscriptions.tenant_id = tenants.id \
      AND subscriptions.status IN ('active', 'trialing')) \
      THEN 'active' \
      WHEN EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.tenant_id = tenants.id) \
@@ -56,9 +58,11 @@ const TENANT_FOR_INSTALLATION: &str = "SELECT {columns} FROM tenants WHERE insta
 /// Tenant `$1`, where `{columns}` is [`TENANT_COLUMNS`].
 const TENANT: &str = "SELECT {columns} FROM tenants WHERE id = $1";
 
-/// Whether tenant `$1` has an active or trialing subscription.
-const HAS_CARD: &str = "SELECT EXISTS (SELECT 1 FROM subscriptions WHERE tenant_id = $1 \
-     AND status IN ('active', 'trialing')) AS card";
+/// Whether tenant `$1` is in the beta or has an active or trialing
+/// subscription.
+const HAS_CARD: &str = "SELECT (beta OR EXISTS (SELECT 1 FROM subscriptions \
+     WHERE tenant_id = tenants.id AND status IN ('active', 'trialing'))) AS card \
+     FROM tenants WHERE id = $1";
 
 /// The tenant of GitHub organization id `$1`, where `{columns}` is
 /// [`TENANT_COLUMNS`]. The id is unique and survives renames; the login
@@ -91,7 +95,8 @@ pub async fn tenant(db: &Db, tenant_id: &str) -> Result<Option<TenantRow>> {
     .await
 }
 
-/// Whether tenant `tenant_id` has an active or trialing subscription.
+/// Whether tenant `tenant_id` is in the beta or has an active or
+/// trialing subscription.
 ///
 /// # Errors
 ///

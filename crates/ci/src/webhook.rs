@@ -18,7 +18,7 @@ use crate::github;
 use crate::intake::{self, PullRequest, Push, Rerequested, Trigger};
 use crate::planning;
 use crate::runs::{self, Config};
-use crate::store::{self, CiBilling, RepoRow, TenantRow};
+use crate::store::{self, RepoRow, TenantRow};
 
 /// Secret holding the App's webhook secret.
 const WEBHOOK_SECRET: &str = "GITHUB_WEBHOOK_SECRET";
@@ -28,8 +28,6 @@ const FILE_PAGES: u32 = 3;
 
 /// Files GitHub lists on a full page.
 const PAGE_SIZE: usize = 100;
-
-const NEVER_SUBSCRIBED: &str = "this organization has no card on file for hatchrun";
 
 fn now_ms() -> u64 {
     worker::Date::now().as_millis()
@@ -50,13 +48,11 @@ enum Outcome {
 }
 
 /// The tenant of a delivery, or why the delivery is ignored. A tenant
-/// that never had a subscription is ignored before anything reads
-/// its config; one whose subscription lapsed passes, and
-/// [`runs::create`] answers it with the card check run.
+/// without a card passes, and [`runs::create`] answers it with the card
+/// check run.
 fn gate(tenant: Option<TenantRow>) -> std::result::Result<TenantRow, &'static str> {
     match tenant {
         None => Err("no tenant for this installation"),
-        Some(tenant) if tenant.ci_billing == CiBilling::Never => Err(NEVER_SUBSCRIBED),
         Some(tenant) => Ok(tenant),
     }
 }
@@ -372,6 +368,7 @@ mod tests {
     use hatchrun_cloud::testdb::Db as TestDb;
 
     use super::*;
+    use crate::store::CiBilling;
 
     fn tenant_db() -> TestDb {
         let db = TestDb::new();
@@ -405,9 +402,16 @@ mod tests {
     }
 
     #[test]
-    fn never_subscribed_tenant_is_ignored_before_the_config() {
+    fn never_subscribed_tenant_passes_to_get_the_card_check_run() {
         let db = tenant_db();
-        assert_eq!(gate(found(&db)).unwrap_err(), NEVER_SUBSCRIBED);
+        assert_eq!(gate(found(&db)).unwrap().ci_billing, CiBilling::Never);
+    }
+
+    #[test]
+    fn beta_tenant_passes_the_gate_as_active() {
+        let db = tenant_db();
+        db.run("UPDATE tenants SET beta = true", &[]);
+        assert_eq!(gate(found(&db)).unwrap().ci_billing, CiBilling::Active);
     }
 
     #[test]

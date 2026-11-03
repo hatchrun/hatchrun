@@ -212,17 +212,22 @@ const FINISH_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = 
 /// Records the usage of attempt `$3` of job `$1`, completed at `$2`,
 /// from the row as the update before it left it: nothing is written
 /// when that update did not apply (another attempt, or a job completed
-/// already), or the job never started or has no template. Seconds run
+/// already), or the job never started or has no template. A beta
+/// tenant's row is written already rejected, so Polar never gets it. Seconds run
 /// from start to completion, rounded up, at least 60. `$4` is the JSON
 /// map of label to price per minute and `$5` the price of one 2 vCPU
 /// minute, so the units (one 2 vCPU second each) are those of the price
 /// when the job ended; a label the map lacks records nothing.
 const RECORD_USAGE: &str = "INSERT INTO ci_usage \
-       (job_id, attempt, tenant_id, template, seconds, units, ended_at) \
+       (job_id, attempt, tenant_id, template, seconds, units, ended_at, \
+        rejected_at, reject_reason) \
      SELECT ci_jobs.id, ci_jobs.attempt, ci_runs.tenant_id, ci_jobs.template, \
        s.seconds, s.seconds * ($4::jsonb ->> ci_jobs.template)::bigint / $5, \
-       ci_jobs.completed_at \
+       ci_jobs.completed_at, \
+       CASE WHEN tenants.beta THEN ci_jobs.completed_at END, \
+       CASE WHEN tenants.beta THEN 'beta tenant, not billed' END \
      FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
+       JOIN tenants ON tenants.id = ci_runs.tenant_id \
        CROSS JOIN LATERAL (SELECT GREATEST(60, \
          CEIL((ci_jobs.completed_at - ci_jobs.started_at) / 1000.0))::bigint AS seconds) s \
      WHERE ci_jobs.id = $1 AND ci_jobs.attempt = $3 AND ci_jobs.status = 'completed' \

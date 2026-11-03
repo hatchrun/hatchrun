@@ -247,13 +247,13 @@ enum Billing {
     Nothing,
 }
 
-/// The tenant with a card runs its `plans`; the one whose subscription
-/// lapsed is asked for a card when a workflow would have run; the one
-/// that never subscribed gets nothing.
+/// The tenant with a card runs its `plans`; the one without a card (never
+/// subscribed, or lapsed) is asked for one when a workflow would have
+/// run.
 fn billing_decision(billing: CiBilling, plans: usize) -> Billing {
     match billing {
         CiBilling::Active => Billing::Run,
-        CiBilling::Lapsed if plans > 0 => Billing::AskForCard,
+        CiBilling::Lapsed | CiBilling::Never if plans > 0 => Billing::AskForCard,
         CiBilling::Lapsed | CiBilling::Never => Billing::Nothing,
     }
 }
@@ -262,9 +262,8 @@ fn billing_decision(billing: CiBilling, plans: usize) -> Billing {
 /// the config at `req.sha`, which the caller read with [`read_config`]
 /// (the webhook also needs it for schedules and path filters).
 ///
-/// Nothing starts for a commit without a config, a missing tenant, or a
-/// tenant that never had a subscription. A tenant whose subscription
-/// lapsed gets one `action_required` card check run when a workflow
+/// Nothing starts for a commit without a config or a missing tenant. A
+/// tenant without a card (a beta tenant has one) gets one `action_required` card check run when a workflow
 /// would run, and nothing otherwise. For a tenant with a card, a config
 /// that does not parse or compile gets one failed check run. Each planned workflow becomes a run with
 /// its jobs waiting, and its object is told to start. The same
@@ -560,10 +559,11 @@ mod tests {
     }
 
     #[test]
-    fn lapsed_without_a_triggered_workflow_reports_nothing() {
+    fn no_card_without_a_triggered_workflow_reports_nothing() {
         assert_eq!(billing_decision(CiBilling::Lapsed, 0), Billing::Nothing);
+        assert_eq!(billing_decision(CiBilling::Never, 0), Billing::Nothing);
         assert_eq!(billing_decision(CiBilling::Lapsed, 2), Billing::AskForCard);
-        assert_eq!(billing_decision(CiBilling::Never, 2), Billing::Nothing);
+        assert_eq!(billing_decision(CiBilling::Never, 2), Billing::AskForCard);
         assert_eq!(billing_decision(CiBilling::Active, 0), Billing::Run);
         assert_eq!(billing_decision(CiBilling::Active, 2), Billing::Run);
     }
