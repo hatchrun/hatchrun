@@ -66,9 +66,17 @@ fn many() -> Db {
 
 /// Every run of a list, read two at a time through the cursor.
 fn walk(db: &Db, group: Option<Group>, order: (Sort, Direction), q: Option<&str>) -> Vec<u64> {
+    let rows: usize = db
+        .column("SELECT COUNT(*) AS n FROM runs", &[], "n")
+        .unwrap();
     let mut seen = Vec::new();
     let mut before = None;
     loop {
+        // A cursor that does not advance would page forever.
+        assert!(
+            seen.len() <= rows,
+            "{order:?} paged past the {rows} runs: {seen:?}"
+        );
         let got = sorted(db, group, order, q, before.as_ref(), 2);
         let Some(last) = got.last() else {
             return seen;

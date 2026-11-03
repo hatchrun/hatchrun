@@ -196,7 +196,11 @@ fn observe(alert: Option<&Alert>, key: Key, seen: &Seen, now: u64) -> Option<Ale
             detail: detail.clone(),
             fired_at: now,
             resolved_at: None,
-            sent: alert.and_then(|alert| alert.sent),
+            // A resolution email that failed leaves `Firing` here, and
+            // the new incident has not been announced.
+            sent: alert
+                .and_then(|alert| alert.sent)
+                .filter(|sent| *sent != State::Firing),
         }),
         (Some(alert), Seen::Clear) if alert.state == State::Firing => Some(Alert {
             state: State::Resolved,
@@ -303,6 +307,7 @@ pub(crate) async fn settle(
     digest: bool,
 ) -> Vec<String> {
     let mut errors = Vec::new();
+    let mut unsaved: Vec<&str> = Vec::new();
     let mut alerts = match store.alerts().await {
         Ok(alerts) => alerts,
         Err(err) => return vec![format!("alerts: {err}")],
@@ -314,6 +319,8 @@ pub(crate) async fn settle(
         };
         if let Err(err) = store.save(&next, now).await {
             errors.push(format!("alert {}: {err}", key.as_str()));
+            // The stored row is stale; the next pass observes it again.
+            unsaved.push(key.as_str());
             continue;
         }
         match at {
@@ -326,10 +333,17 @@ pub(crate) async fn settle(
     // own email.
     let still: Vec<Alert> = alerts
         .iter()
-        .filter(|alert| alert.state == State::Firing && alert.sent == Some(State::Firing))
+        .filter(|alert| {
+            alert.state == State::Firing
+                && alert.sent == Some(State::Firing)
+                && !unsaved.contains(&alert.key.as_str())
+        })
         .cloned()
         .collect();
     for alert in &mut alerts {
+        if unsaved.contains(&alert.key.as_str()) {
+            continue;
+        }
         let Some(state) = alert.due() else {
             continue;
         };

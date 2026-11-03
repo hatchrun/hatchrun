@@ -44,6 +44,33 @@ impl Outbox {
     }
 }
 
+/// A store that fails to save the row of one alert.
+struct Unsaved<'a> {
+    kept: Kept<'a>,
+    key: Key,
+}
+
+impl Store for Unsaved<'_> {
+    async fn alerts(&self) -> Result<Vec<Alert>, String> {
+        self.kept.alerts().await
+    }
+
+    async fn save(&self, alert: &Alert, now: u64) -> Result<(), String> {
+        if alert.key == self.key.as_str() {
+            return Err("database unavailable".to_owned());
+        }
+        self.kept.save(alert, now).await
+    }
+
+    async fn digest_at(&self) -> Result<Option<u64>, String> {
+        self.kept.digest_at().await
+    }
+
+    async fn digested(&self, at: u64) -> Result<(), String> {
+        self.kept.digested(at).await
+    }
+}
+
 fn pass(db: &Db, outbox: &Outbox, now: u64, seen: &[(Key, Seen)]) -> Vec<String> {
     db.wait(settle(&Kept(db.db()), outbox, now, seen, true))
 }
@@ -305,6 +332,54 @@ fn a_failed_send_is_tried_on_the_next_pass() {
         outbox.take(),
         ["[hatchrun] Resolved: Launch failed for good"]
     );
+}
+
+#[test]
+fn an_alert_that_fires_again_after_a_failed_resolution_email_is_announced() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::ReconcilerFailing;
+    pass(&db, &outbox, NOW, &[(key, firing("errors"))]);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Reconciler failing"]);
+    outbox.down.set(true);
+    pass(&db, &outbox, NOW + HOUR, &[(key, Seen::Clear)]);
+    let row = alert(&db, key);
+    assert_eq!(
+        (row.state, row.sent),
+        (State::Resolved, Some(State::Firing))
+    );
+
+    outbox.down.set(false);
+    pass(&db, &outbox, NOW + 2 * HOUR, &[(key, firing("errors"))]);
+    assert_eq!(outbox.take(), ["[hatchrun] Firing: Reconciler failing"]);
+    assert_eq!(alert(&db, key).sent, Some(State::Firing));
+}
+
+#[test]
+fn an_alert_whose_row_fails_to_save_sends_nothing_that_pass() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    outbox.down.set(true);
+    pass(&db, &outbox, NOW, &[(key, firing("job 5"))]);
+    outbox.down.set(false);
+
+    // Observed clear, but the stored row still says firing and unsent.
+    let store = Unsaved {
+        kept: Kept(db.db()),
+        key,
+    };
+    let errors = db.wait(settle(
+        &store,
+        &outbox,
+        NOW + MINUTE,
+        &[(key, Seen::Clear)],
+        true,
+    ));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("database unavailable"), "{errors:?}");
+    assert_eq!(outbox.take(), NONE);
+    assert_eq!(alert(&db, key).sent, None);
 }
 
 #[test]
