@@ -289,14 +289,24 @@ pub(crate) trait Store {
     /// became after a check. Writes nothing and returns `false` when the
     /// stored row is no longer `prev`, because another pass changed it.
     async fn save(&self, prev: Option<&Alert>, next: &Alert, now: u64) -> Result<bool, String>;
-    /// Claims the email saying `state` for the alert `key` until
-    /// `until`. Returns `false` when the row is not due that email any
-    /// more, or another pass holds a claim that has not ended at `now`.
-    async fn claim(&self, key: &str, state: State, now: u64, until: u64) -> Result<bool, String>;
-    /// Notes that the email saying `state` went out and ends the claim.
-    async fn sent(&self, key: &str, state: State, now: u64) -> Result<(), String>;
-    /// Ends the claim after an email that failed to send.
-    async fn release(&self, key: &str) -> Result<(), String>;
+    /// Claims the email saying `state` for the incident `alert` holds
+    /// until `until`. Returns `false` when the row is not that incident
+    /// or not due that email any more, or another pass holds a claim
+    /// that has not ended at `now`.
+    async fn claim(
+        &self,
+        alert: &Alert,
+        state: State,
+        now: u64,
+        until: u64,
+    ) -> Result<bool, String>;
+    /// Notes that the email saying `state` went out for the incident
+    /// `alert` holds and ends the claim `until`. Does nothing when the
+    /// row no longer carries that claim or incident.
+    async fn sent(&self, alert: &Alert, state: State, until: u64, now: u64) -> Result<(), String>;
+    /// Ends the claim `until` on `key` after an email that failed to
+    /// send. Does nothing when the row no longer carries that claim.
+    async fn release(&self, key: &str, until: u64) -> Result<(), String>;
     /// When the last digest went out.
     async fn digest_at(&self) -> Result<Option<u64>, String>;
     /// Notes that a digest went out at `at`.
@@ -327,10 +337,10 @@ pub(crate) async fn settle(
     };
     for (key, seen) in seen {
         let at = alerts.iter().position(|alert| alert.key == key.as_str());
-        let Some(next) = observe(at.map(|at| &alerts[at]), *key, seen, now) else {
+        let prev = at.map(|at| &alerts[at]);
+        let Some(next) = observe(prev, *key, seen, now) else {
             continue;
         };
-        let prev = at.map(|at| &alerts[at]);
         match store.save(prev, &next, now).await {
             Ok(true) => {}
             // Another pass changed the row after this one read it. Its
@@ -376,7 +386,8 @@ pub(crate) async fn settle(
         };
         // Only the pass that wins the claim sends, so a pass racing this
         // one cannot send the same email.
-        match store.claim(&alert.key, state, now, now + CLAIM_FOR).await {
+        let until = now + CLAIM_FOR;
+        match store.claim(alert, state, now, until).await {
             Ok(true) => {}
             Ok(false) => continue,
             Err(err) => {
@@ -386,12 +397,16 @@ pub(crate) async fn settle(
         }
         if let Err(err) = mail.send(&notice(alert, state, now)).await {
             errors.push(format!("alert {}: email: {err}", alert.key));
-            if let Err(err) = store.release(&alert.key).await {
+            if let Err(err) = store.release(&alert.key, until).await {
                 errors.push(format!("alert {}: {err}", alert.key));
             }
             continue;
         }
-        if let Err(err) = store.sent(&alert.key, state, now).await {
+        // The email is out. If both writes fail the claim runs out and
+        // the email goes again: delivery is at-least-once here.
+        if store.sent(alert, state, until, now).await.is_err()
+            && let Err(err) = store.sent(alert, state, until, now).await
+        {
             errors.push(format!("alert {}: {err}", alert.key));
         }
     }
