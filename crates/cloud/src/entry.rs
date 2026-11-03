@@ -15,8 +15,8 @@ use crate::db::{Db, params};
 use crate::jwt::PublicKey;
 use crate::webhook::{Event, Placement, QueuedJob};
 use crate::{
-    alerts, app, cache, jobs, jwt, labels, launches, now_ms, oidc, profiles, reconcile, runs,
-    usage, webhook,
+    alerts, app, cache, jobs, labels, launches, now_ms, oidc, profiles, reconcile, runs, usage,
+    webhook,
 };
 
 /// Static assets binding in `wrangler.toml`.
@@ -336,32 +336,16 @@ fn issuer(req: &Request, env: &Env) -> Result<Response> {
 /// key is missing or unreadable is left out and logged, so a bad next
 /// key cannot take the signing key's JWKS down with it.
 fn published_keys(env: &Env) -> Vec<(String, PublicKey)> {
-    let get = |name: &str| {
+    let (keys, problems) = oidc::public_keys(&oidc::SLOTS, |name| {
         env.secret(name)
             .map(|value| value.to_string())
             .ok()
             .filter(|value| !value.is_empty())
-    };
-    oidc::SLOTS
-        .iter()
-        .filter_map(|(key, kid)| {
-            let kid = get(kid)?;
-            let public = get(key)
-                .ok_or_else(|| "is not set".to_owned())
-                .and_then(|pem| {
-                    jwt::pkcs8_der(&pem)
-                        .and_then(|der| jwt::public_key(&der))
-                        .map_err(|err| err.to_string())
-                });
-            match public {
-                Ok(public) => Some((kid, public)),
-                Err(err) => {
-                    console_error!("{key} (kid {kid}): {err}");
-                    None
-                }
-            }
-        })
-        .collect()
+    });
+    for problem in problems {
+        console_error!("{problem}");
+    }
+    keys
 }
 
 fn error(message: &str, status: u16) -> Result<Response> {
