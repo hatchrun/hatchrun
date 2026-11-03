@@ -1448,6 +1448,7 @@ jobs:
         "{:?}",
         out.errors
     );
+    assert!(!out.config.jobs.contains_key("ci-a"), "{:?}", out.errors);
     assert!(out.config.jobs.contains_key("ci-ok"), "{:?}", out.errors);
 }
 
