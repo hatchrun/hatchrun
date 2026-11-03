@@ -1427,6 +1427,32 @@ fn a_file_over_one_mebibyte_is_skipped() {
 }
 
 #[test]
+fn a_double_quoted_string_is_reported_with_its_location() {
+    let out = ok(r#"
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ secrets["X"] }}
+  ok:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ secrets['it''s'] }}
+"#);
+    assert!(
+        has(
+            &out.errors,
+            &["job `a`", "use single quotes", "at byte", "dropped"]
+        ),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-a"), "{:?}", out.errors);
+    assert!(out.config.jobs.contains_key("ci-ok"), "{:?}", out.errors);
+}
+
+#[test]
 fn a_job_with_a_bad_expression_is_dropped() {
     let out = ok(r"
 on: push
