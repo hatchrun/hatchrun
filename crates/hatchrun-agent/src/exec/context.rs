@@ -160,6 +160,7 @@ impl Contexts {
             "github": github,
             "env": {},
             "matrix": doc.job.matrix,
+            "strategy": doc.job.strategy_context(),
             "needs": needs,
             "steps": {},
             "secrets": secrets,
@@ -549,6 +550,8 @@ mod tests {
             env: BTreeMap::new(),
             if_: None,
             timeout_minutes: 10,
+            continue_on_error: None,
+            strategy: None,
             outputs: BTreeMap::new(),
             token_permissions: BTreeMap::new(),
             environment: None,
@@ -618,6 +621,31 @@ mod tests {
         assert_eq!(eval(&ctx, "github.event_name"), json!("pull_request"));
         assert_eq!(eval(&ctx, "secrets.GITHUB_TOKEN"), json!("tok"));
         assert_eq!(eval(&ctx, "secrets.NPM"), json!("s3"));
+    }
+
+    #[test]
+    fn strategy_context_reads_the_jobs_place_in_its_matrix() {
+        let mut d = doc("ubuntu-latest");
+        let ctx = Contexts::new(&d, &layout());
+        assert_eq!(eval(&ctx, "strategy.fail-fast"), json!(true));
+        assert_eq!(eval(&ctx, "strategy.job-index"), json!(0));
+        assert_eq!(eval(&ctx, "strategy.job-total"), json!(1));
+        assert_eq!(eval(&ctx, "strategy.max-parallel"), json!(1));
+        d.job.strategy = Some(hatchrun_workflow::PlannedStrategy {
+            group: "build".into(),
+            fail_fast: false,
+            max_parallel: Some(2),
+            job_index: 3,
+            job_total: 5,
+        });
+        let ctx = Contexts::new(&d, &layout());
+        assert_eq!(eval(&ctx, "strategy.fail-fast"), json!(false));
+        assert_eq!(eval(&ctx, "strategy.job-index"), json!(3));
+        assert_eq!(eval(&ctx, "strategy.job-total"), json!(5));
+        assert_eq!(eval(&ctx, "strategy.max-parallel"), json!(2));
+        d.job.strategy.as_mut().unwrap().max_parallel = None;
+        let ctx = Contexts::new(&d, &layout());
+        assert_eq!(eval(&ctx, "strategy.max-parallel"), json!(5));
     }
 
     #[test]
