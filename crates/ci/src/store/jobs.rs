@@ -88,7 +88,8 @@ pub struct JobRow {
     #[serde(deserialize_with = "json_text")]
     pub secret_refs: serde_json::Value,
     /// Why the queued job waits for a launch: `card`, `spend_cap`,
-    /// `concurrency`, `approval` or `max_parallel`.
+    /// `concurrency` (the tenant's running jobs), `approval`, `group` (a
+    /// concurrency group of the workflow or job) or `max_parallel`.
     pub held: Option<String>,
     /// The environment the job names.
     pub environment: Option<String>,

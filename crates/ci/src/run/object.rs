@@ -24,6 +24,7 @@ use worker::{
 };
 
 use crate::checks::{JobView, Outbox, conclusion_word, details_url, render};
+use crate::concurrency;
 use crate::env::Settings;
 use crate::github::{
     Capped, CheckRun, check_run_id, create_check_run, revoke_token, update_check_run,
@@ -106,6 +107,16 @@ struct ClaimBody {
 #[derive(Deserialize)]
 struct MessageBody {
     message: String,
+}
+
+/// The optional body of `POST /cancel`: why a concurrency group
+/// cancels the run, and whether the run never started, so its jobs end
+/// whatever their `if:`.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CancelBody {
+    message: Option<String>,
+    outright: bool,
 }
 
 /// What a handler works on: the pieces of state every handler reads,
@@ -339,7 +350,10 @@ impl<'a> Cx<'a> {
                 };
             }
             (Method::Post, "/purge") => return self.purge().await,
-            (Method::Post, "/cancel") => return self.cancel().await,
+            (Method::Post, "/cancel") => {
+                let body = req.json::<CancelBody>().await.unwrap_or_default();
+                return self.cancel(job, attempt, body).await;
+            }
             (Method::Get, "/live" | "/log") => {
                 let Some(job) = job else {
                     return Response::error("a job is needed", 400);
@@ -771,6 +785,7 @@ impl<'a> Cx<'a> {
         match work {
             Work::StartRun => store::run_started(db, info.run_id, self.now).await,
             Work::QueueLaunch { job, attempt } => {
+                self.register_concurrency(db, info, *job, *attempt).await?;
                 // A job that is launching or launched is not queued
                 // again, and no second launch is sent for it.
                 if store::queue_job(db, *job, *attempt, self.now).await? {
@@ -808,7 +823,7 @@ impl<'a> Cx<'a> {
                     launches::wake_oldest(&self.env, db, &info.tenant_id).await;
                     launches::wake_group(&self.env, db, *job).await;
                 }
-                Ok(())
+                concurrency::release(&self.env, db, info.run_id, Some(*job)).await
             }
             Work::FinishRun {
                 attempt,
@@ -821,13 +836,43 @@ impl<'a> Cx<'a> {
                     conclusion_word(*conclusion),
                     self.now,
                 )
-                .await
+                .await?;
+                concurrency::release(&self.env, db, info.run_id, None).await
             }
             Work::ResetJob { job, attempt } => store::reset_job(db, *job, *attempt, self.now).await,
             Work::ReopenRun { attempt } => {
                 store::reopen_run_at(db, info.run_id, *attempt, self.now).await
             }
         }
+    }
+
+    /// Records the concurrency groups of the job about to be queued, for
+    /// the launch consumer to put in line. Nothing is recorded for a
+    /// job of another attempt, or when neither the workflow nor the job
+    /// names a group.
+    async fn register_concurrency(
+        &self,
+        db: &Db,
+        info: &RunInfo,
+        job: u64,
+        attempt: u32,
+    ) -> Result<()> {
+        let Some(graph) = self.storage.get::<Graph>(GRAPH).await? else {
+            return Ok(());
+        };
+        let Some(node) = graph.node(job) else {
+            return Ok(());
+        };
+        if node.attempt != attempt || (info.concurrency.is_none() && node.job.concurrency.is_none())
+        {
+            return Ok(());
+        }
+        let ctx = self.github_ctx(info).await?;
+        let vars = store::job_vars(db, &info.tenant_id, info.repo.id, None).await?;
+        for slot in concurrency::claims(info, node, graph.needs(job), &ctx, &vars, self.now) {
+            store::register(db, &slot).await?;
+        }
+        Ok(())
     }
 
     /// Turns what the graph decided into storage changes now and side
@@ -1137,14 +1182,34 @@ impl<'a> Cx<'a> {
         answer(204)
     }
 
-    async fn cancel(&self) -> Result<Response> {
+    /// Cancels the run, or with `job` that job only. A `message` is why
+    /// a concurrency group cancels it; the check runs show it.
+    async fn cancel(
+        &self,
+        job: Option<u64>,
+        attempt: Option<u32>,
+        body: CancelBody,
+    ) -> Result<Response> {
         let revoke = {
             let _turn = self.turn.lock().await;
             let Some(mut run) = self.loaded().await? else {
                 return answer(204);
             };
             let ctx = self.github_ctx(&run.info).await?;
-            let actions = run.graph_mut().cancel(&ctx);
+            let actions = match (job, &body.message) {
+                (Some(job), message) => {
+                    let Some(attempt) = attempt else {
+                        return Response::error("an attempt is needed", 400);
+                    };
+                    let message = message.as_deref().unwrap_or("Cancelled.");
+                    run.graph_mut().cancel_job(job, attempt, message, &ctx)
+                }
+                (None, Some(message)) => {
+                    run.graph_mut()
+                        .cancel_for_group(message, body.outright, &ctx)
+                }
+                (None, None) => run.graph_mut().cancel(&ctx),
+            };
             if run.graph.conclusion().is_none() {
                 let at = self.now + ESCALATE_AFTER_MS;
                 run.deadlines_mut().escalate_at.get_or_insert(at);

@@ -629,6 +629,7 @@ pub(super) mod tests {
             actor: "octocat".to_owned(),
             head_ref: String::new(),
             base_ref: String::new(),
+            concurrency: None,
         }
     }
 

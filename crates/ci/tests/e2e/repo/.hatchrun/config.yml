@@ -9,9 +9,11 @@
 # and one that runs, wide six jobs at once, one more than the cap,
 # serial a matrix of failing legs that run one at a time, soft a failing
 # job that continue-on-error counts as a success, guard a job whose
-# environment allows other branches, and deploy two jobs on an
-# environment that needs approval, and oidc one job with id-token: write
-# that asks for a token and one without it.
+# environment allows other branches, deploy two jobs on an environment
+# that needs approval, oidc one job with id-token: write that asks for a
+# token and one without it, queue a workflow that shares a concurrency
+# group between its runs, and replace one whose group cancels the run in
+# progress.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -113,6 +115,13 @@ jobs:
     steps:
       - name: look for the request
         run: echo "request=[${ACTIONS_ID_TOKEN_REQUEST_URL-unset}]"
+  sit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: wait for the cancel
+        run: |
+          echo "sitting"
+          sleep 300
 workflows:
   ci:
     on: { push: { branches: [main] } }
@@ -166,3 +175,15 @@ workflows:
     jobs:
       - mint
       - plain
+  queue:
+    on: { push: { branches: [queue] } }
+    concurrency: e2e-${{ github.workflow }}
+    jobs:
+      - sit
+  replace:
+    on: { push: { branches: [replace] } }
+    concurrency:
+      group: e2e-${{ github.workflow }}
+      cancel-in-progress: true
+    jobs:
+      - sit

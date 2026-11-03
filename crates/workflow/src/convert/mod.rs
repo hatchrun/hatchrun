@@ -559,12 +559,10 @@ impl Cx {
 
     /// Converts one workflow file.
     fn workflow(&mut self, file: &str, stem: &str, gh: GhWorkflow) {
-        for (key, set) in [("run-name", gh.run_name.is_some())] {
-            if set {
-                self.warn(format!(
-                    "`{file}`: `{key}` is not supported and was dropped"
-                ));
-            }
+        if gh.run_name.is_some() {
+            self.warn(format!(
+                "`{file}`: `run-name` is not supported and was dropped"
+            ));
         }
         for key in gh.unknown.keys() {
             self.warn(format!("`{file}`: unknown key `{key}` was dropped"));

@@ -45,6 +45,7 @@ use worker::{
 };
 
 use crate::billing::{self, HOLD_RECHECK_MS, Hold};
+use crate::concurrency::{self, Gate as GroupGate};
 use crate::env::{Settings, run_stub};
 use crate::environments::{self, Gate};
 use crate::launcher::{Backend, LaunchSpec, user_data};
@@ -185,6 +186,36 @@ async fn start(env: &Env) -> Result<(Settings, Backend), String> {
     Ok((settings, backend))
 }
 
+/// Asks the job's concurrency groups whether it may go on. A `false`
+/// means the job was held, ended or cancelled and nothing is left to do.
+async fn group_open(env: &Env, db: &Db, job: &JobRow, now: u64) -> Result<bool, String> {
+    match concurrency::gate(env, db, job.run_id, job.id, job.attempt).await? {
+        GroupGate::Pass => Ok(true),
+        GroupGate::Hold(message) => {
+            hold_job(env, db, job, concurrency::HOLD, &message, now).await?;
+            Ok(false)
+        }
+        GroupGate::Fail(message) => {
+            end_job(env, db, job, &message).await?;
+            Ok(false)
+        }
+        // The run's object ends the job, with the reason.
+        GroupGate::Cancelled => Ok(false),
+    }
+}
+
+/// Holds a job whose matrix already has `max_parallel` legs in flight.
+async fn hold_capped(
+    env: &Env,
+    db: &Db,
+    job: &JobRow,
+    max_parallel: u32,
+    now: u64,
+) -> Result<(), String> {
+    let message = parallel_message(&job.name, max_parallel);
+    hold_job(env, db, job, MAX_PARALLEL_HOLD, &message, now).await
+}
+
 /// Launches the job of one message. An error means nothing was decided
 /// and the message may be delivered again.
 async fn launch(
@@ -230,6 +261,9 @@ async fn launch(
             }
         }
     }
+    if delivery == Delivery::Launch && !group_open(env, &db, &job, now).await? {
+        return Ok(());
+    }
     let standing = match store::standing(
         &db,
         message.job_id,
@@ -268,8 +302,7 @@ async fn launch(
             return hold_for(env, &db, &job, Hold::Concurrency, &standing, settings, now).await;
         }
         Claim::Capped { max_parallel } => {
-            let message = parallel_message(&job.name, max_parallel);
-            return hold_job(env, &db, &job, MAX_PARALLEL_HOLD, &message, now).await;
+            return hold_capped(env, &db, &job, max_parallel, now).await;
         }
         Claim::Gone => return Ok(()),
     };
@@ -674,7 +707,11 @@ pub(crate) async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> 
                 .await
                 .map_err(|err| err.to_string())?;
             if claimed {
-                return Ok(());
+                // The job's row is over without its object: its group
+                // is free.
+                return concurrency::release(env, db, job.run_id, Some(job.id))
+                    .await
+                    .map_err(|err| err.to_string());
             }
             // Not claimed: the job is still queued (an environment check
             // ended it), and launch_failed only changes a launching one.

@@ -107,7 +107,7 @@ workflows:
 
 #[test]
 fn job_concurrency_reads_matrix_and_needs_but_not_steps() {
-    assert!(
+    assert_eq!(
         errors(
             "
 jobs:
@@ -118,8 +118,8 @@ jobs:
 workflows:
   ci: { on: { push: {} }, jobs: [t] }
 "
-        )
-        .is_empty()
+        ),
+        Vec::new()
     );
     assert_error(
         "

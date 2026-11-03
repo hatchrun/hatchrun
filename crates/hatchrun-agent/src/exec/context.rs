@@ -555,6 +555,7 @@ mod tests {
             outputs: BTreeMap::new(),
             token_permissions: BTreeMap::new(),
             environment: None,
+            concurrency: None,
             steps: Vec::new(),
         }
     }
