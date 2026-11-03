@@ -22,7 +22,9 @@
 //! Cloudflare to poll (see [`health`]).
 
 use std::fmt::Write;
+use std::pin::pin;
 
+use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
 
 use crate::reconcile::time;
@@ -56,6 +58,9 @@ const DAY: u64 = 24 * 60 * MINUTE;
 /// How long a pass holds the claim on an email. One that crashes while
 /// sending blocks the retry this long.
 const CLAIM_FOR: u64 = 2 * MINUTE;
+/// How long a send may take. Well inside [`CLAIM_FOR`], so a send that
+/// is still running has not lost its claim.
+const SEND_FOR: u64 = MINUTE;
 /// Bytes in a gigabyte.
 const GB: u64 = 1_000_000_000;
 /// The share of the database's connections in use, in percent, at which
@@ -197,7 +202,9 @@ fn observe(alert: Option<&Alert>, key: Key, seen: &Seen, now: u64) -> Option<Ale
             key: key.as_str().to_owned(),
             state: State::Firing,
             detail: detail.clone(),
-            fired_at: now,
+            // Strictly later than the incident before, so `fired_at`
+            // tells the incidents of a key apart.
+            fired_at: alert.map_or(now, |alert| now.max(alert.fired_at + 1)),
             resolved_at: None,
             // A resolution email that failed leaves `Firing` here, and
             // the new incident has not been announced.
@@ -301,9 +308,11 @@ pub(crate) trait Store {
         until: u64,
     ) -> Result<bool, String>;
     /// Notes that the email saying `state` went out for the incident
-    /// `alert` holds and ends the claim `until`. Does nothing when the
-    /// row no longer carries that claim or incident.
-    async fn sent(&self, alert: &Alert, state: State, until: u64, now: u64) -> Result<(), String>;
+    /// `alert` holds and ends the claim `until`, whatever state the row
+    /// is in by now. Returns `false`, and writes nothing, when the row no
+    /// longer carries that claim or incident.
+    async fn sent(&self, alert: &Alert, state: State, until: u64, now: u64)
+    -> Result<bool, String>;
     /// Ends the claim `until` on `key` after an email that failed to
     /// send. Does nothing when the row no longer carries that claim.
     async fn release(&self, key: &str, until: u64) -> Result<(), String>;
@@ -313,10 +322,15 @@ pub(crate) trait Store {
     async fn digested(&self, at: u64) -> Result<(), String>;
 }
 
-/// Where emails go: the `send_email` binding, or a list in tests.
+/// Where emails go, and the clock and timer that bound a send: the
+/// `send_email` binding and the Worker's, or a list and a fake in tests.
 pub(crate) trait Mail {
     /// Sends `email` to the alert inbox.
     async fn send(&self, email: &Email) -> Result<(), String>;
+    /// The time now, in milliseconds.
+    fn now(&self) -> u64;
+    /// Completes after `ms` milliseconds.
+    async fn sleep(&self, ms: u64);
 }
 
 /// Applies what the checks in `seen` found at `now` and sends the
@@ -385,9 +399,11 @@ pub(crate) async fn settle(
             continue;
         };
         // Only the pass that wins the claim sends, so a pass racing this
-        // one cannot send the same email.
-        let until = now + CLAIM_FOR;
-        match store.claim(alert, state, now, until).await {
+        // one cannot send the same email. The claim starts when it is
+        // made, not when the pass did: earlier sends may have taken time.
+        let at = mail.now();
+        let until = at + CLAIM_FOR;
+        match store.claim(alert, state, at, until).await {
             Ok(true) => {}
             Ok(false) => continue,
             Err(err) => {
@@ -395,7 +411,22 @@ pub(crate) async fn settle(
                 continue;
             }
         }
-        if let Err(err) = mail.send(&notice(alert, state, now)).await {
+        let email = notice(alert, state, now);
+        let delivery = pin!(mail.send(&email));
+        let result = match select(delivery, pin!(mail.sleep(SEND_FOR))).await {
+            Either::Left((result, _)) => result,
+            Either::Right(((), _)) => {
+                // The email may have gone out. The claim is left to run
+                // out, so no pass sends it while this one still could.
+                errors.push(format!(
+                    "alert {}: email: no answer in {} s, claim left to run out",
+                    alert.key,
+                    SEND_FOR / 1000
+                ));
+                continue;
+            }
+        };
+        if let Err(err) = result {
             errors.push(format!("alert {}: email: {err}", alert.key));
             if let Err(err) = store.release(&alert.key, until).await {
                 errors.push(format!("alert {}: {err}", alert.key));
@@ -404,10 +435,18 @@ pub(crate) async fn settle(
         }
         // The email is out. If both writes fail the claim runs out and
         // the email goes again: delivery is at-least-once here.
-        if store.sent(alert, state, until, now).await.is_err()
-            && let Err(err) = store.sent(alert, state, until, now).await
-        {
-            errors.push(format!("alert {}: {err}", alert.key));
+        let at = mail.now();
+        let noted = match store.sent(alert, state, until, at).await {
+            Ok(noted) => Ok(noted),
+            Err(_) => store.sent(alert, state, until, at).await,
+        };
+        match noted {
+            Ok(true) => {}
+            Ok(false) => errors.push(format!(
+                "alert {}: email sent after its claim was lost, it may go out again",
+                alert.key
+            )),
+            Err(err) => errors.push(format!("alert {}: {err}", alert.key)),
         }
     }
     if digest && let Err(err) = send_digest(store, mail, now, &still).await {

@@ -5,5 +5,6 @@
 -- Two passes of the alerts (the reconciler's and the dead-letter queue's)
 -- could both send the email an alert is due. A pass now claims the email
 -- first: sending_until is when its claim ends, NULL while nobody is
--- sending. A pass that crashes mid-send leaves the claim to expire.
+-- sending. A pass that crashes mid-send, or whose send outlasts its time
+-- bound, leaves the claim to expire.
 ALTER TABLE alerts ADD COLUMN sending_until bigint;

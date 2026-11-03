@@ -4,6 +4,8 @@
 
 //! Storage, email and the entry points the Worker calls.
 
+use std::time::Duration;
+
 use serde::Deserialize;
 use worker::{Env, SendEmail, SendEmailBuilder, console_error};
 
@@ -42,10 +44,12 @@ const CLAIM: &str = "UPDATE alerts SET sending_until = $4 \
      AND (sending_until IS NULL OR sending_until <= $3)";
 
 /// Notes that the email saying `$2` went out for the incident of `$1`
-/// that fired at `$5`, and ends the claim `$4`. Matches nothing when the
+/// that fired at `$5`, and ends the claim `$4`. The row's state is not
+/// matched: a firing email that was in flight when the alert resolved is
+/// still noted, so the resolution follows it. Matches nothing when the
 /// claim ran out and the row moved on.
 const SENT: &str = "UPDATE alerts SET sent = $2, sending_until = NULL, updated_at = $3 \
-     WHERE key = $1 AND state = $2 AND fired_at = $5 AND sending_until = $4";
+     WHERE key = $1 AND fired_at = $5 AND sending_until = $4";
 
 /// Ends the claim `$2` on `$1`, if it is still the row's.
 const RELEASE: &str =
@@ -114,8 +118,15 @@ impl Store for Kept<'_> {
         Ok(changed > 0)
     }
 
-    async fn sent(&self, alert: &Alert, state: State, until: u64, now: u64) -> Result<(), String> {
-        self.0
+    async fn sent(
+        &self,
+        alert: &Alert,
+        state: State,
+        until: u64,
+        now: u64,
+    ) -> Result<bool, String> {
+        let changed = self
+            .0
             .run(
                 SENT,
                 &params![
@@ -128,7 +139,7 @@ impl Store for Kept<'_> {
             )
             .await
             .map_err(text)?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     async fn release(&self, key: &str, until: u64) -> Result<(), String> {
@@ -193,6 +204,14 @@ impl Mail for Inbox {
                     .and_then(|message| message.as_string())
                     .unwrap_or_else(|| "send failed".to_owned())
             })
+    }
+
+    fn now(&self) -> u64 {
+        crate::now_ms()
+    }
+
+    async fn sleep(&self, ms: u64) {
+        worker::Delay::from(Duration::from_millis(ms)).await;
     }
 }
 
