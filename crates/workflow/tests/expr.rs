@@ -6,7 +6,8 @@
 
 use hatchrun_workflow::expr::check;
 use hatchrun_workflow::{
-    ExprError, Functions, JobStatus, evaluate, interpolate, job_condition, truthy,
+    ExprError, Functions, JobStatus, continue_on_error, evaluate, interpolate, job_condition,
+    truthy,
 };
 use serde_json::{Value, json};
 
@@ -550,17 +551,15 @@ fn check_parses_without_evaluating() {
         "hashFiles('**/Cargo.lock')",
         "parameters.x",
         "needs.build.outputs.v",
+        "strategy.job-index == 0",
+        "strategy.max-parallel",
     ] {
         assert_eq!(check(ok), Ok(()), "{ok}");
     }
     for (bad, words, offset) in [
         ("github.ref ==", "after", 11),
         ("nosuch.x", "unknown context 'nosuch'", 0),
-        (
-            "false && strategy.job-index",
-            "unknown context 'strategy'",
-            9,
-        ),
+        ("false && nosuch.job-index", "unknown context 'nosuch'", 9),
         ("nosuch(1)", "unknown function", 0),
         ("contains('a')", "takes 2", 0),
     ] {
@@ -647,4 +646,29 @@ fn job_condition_mixed_template_is_a_truthy_string() {
     assert!(job_condition(Some("x ${{ false }}"), &ctx, &ok).unwrap());
     // One whole wrapper still evaluates.
     assert!(!job_condition(Some("${{ false }}"), &ctx, &ok).unwrap());
+}
+
+#[test]
+fn continue_on_error_reads_a_bool_or_an_expression() {
+    let ctx = json!({
+        "matrix": { "experimental": true, "stable": false, "text": "true" },
+        "strategy": { "job-index": 0 },
+    });
+    for (spec, want) in [
+        ("true", true),
+        ("false", false),
+        ("${{ matrix.experimental }}", true),
+        ("${{ matrix.stable }}", false),
+        ("${{ matrix.text }}", true),
+        ("matrix.experimental", true),
+        ("matrix.text", true),
+        ("matrix.missing", false),
+        ("strategy.job-index == 0 && matrix.experimental", true),
+        ("${{ strategy.job-index == 1 }}", false),
+        ("  ${{ matrix.experimental }}  ", true),
+    ] {
+        assert_eq!(continue_on_error(spec, &ctx, &NoFiles), Ok(want), "{spec}");
+    }
+    assert!(continue_on_error("nosuch.x", &ctx, &NoFiles).is_err());
+    assert!(continue_on_error("${{ matrix.", &ctx, &NoFiles).is_err());
 }

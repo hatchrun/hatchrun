@@ -20,8 +20,8 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::config::{
-    Config, Job, MAX_SOURCE, Matrix, Parameter, ParameterKind, Require, RunStep, Step, UsesStep,
-    Workflow, WorkflowJob, too_big, yaml_options,
+    Config, ContinueOnError, Job, MAX_SOURCE, Matrix, Parameter, ParameterKind, Require, RunStep,
+    Step, Strategy, UsesStep, Workflow, WorkflowJob, too_big, yaml_options,
 };
 use crate::diagnostic::Diagnostic;
 use crate::environment::valid_environment_name;
@@ -53,7 +53,7 @@ pub struct Conversion {
 ///
 /// A job with a problem (a `runs-on` that names no runner template, a
 /// `docker://` step, a `needs` that names no job, a job key another file
-/// already uses, a read of the `strategy` or `jobs` context) is dropped,
+/// already uses, a read of the `jobs` context) is dropped,
 /// like a reusable workflow call. Every job that needs a dropped job,
 /// directly or through others, is dropped too, with a warning naming the
 /// chain of jobs it needed. A file over [`MAX_SOURCE`](crate::MAX_SOURCE)
@@ -231,7 +231,7 @@ const OLD_UBUNTU: &[(&str, &str)] = &[
 ];
 
 /// GitHub contexts hatchrun does not provide.
-const UNSUPPORTED_CONTEXTS: &[&str] = &["strategy", "jobs"];
+const UNSUPPORTED_CONTEXTS: &[&str] = &["jobs"];
 
 /// The events hatchrun can start a workflow on.
 const EVENTS: &str = "push, pull_request, schedule, workflow_dispatch, workflow_run and release";

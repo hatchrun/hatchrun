@@ -5,8 +5,8 @@
 //! Parsing `.hatchrun/config.yml`.
 
 use hatchrun_workflow::{
-    CheckoutStep, MAX_SOURCE, Outcome, ParameterKind, Require, Statuses, Step, Submodules,
-    WorkspaceStep, parse, to_yaml,
+    CheckoutStep, ContinueOnError, MAX_SOURCE, Outcome, ParameterKind, Require, Statuses, Step,
+    Strategy, Submodules, WorkspaceStep, parse, to_yaml,
 };
 
 #[test]
@@ -374,4 +374,54 @@ fn checkout_steps_round_trip() {
     assert_eq!(parse(&written).unwrap(), config, "{written}");
     // A checkout with no options is written as the bare name.
     assert!(written.contains("- checkout\n"), "{written}");
+}
+
+#[test]
+fn strategy_and_continue_on_error_round_trip() {
+    let yaml = "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    steps: []
+  u:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps: []
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t:
+          matrix: { x: [1, 2] }
+          strategy: { fail-fast: false, max-parallel: 2, group: g }
+      - u:
+          strategy: {}
+";
+    let config = parse(yaml).unwrap();
+    assert_eq!(
+        config.jobs["t"].continue_on_error,
+        Some(ContinueOnError::When("${{ matrix.experimental }}".into()))
+    );
+    assert_eq!(
+        config.jobs["u"].continue_on_error,
+        Some(ContinueOnError::Always(true))
+    );
+    let entries = &config.workflows["ci"].jobs;
+    let strategy = entries[0].strategy.as_ref().unwrap();
+    assert!(!strategy.fail_fast);
+    assert_eq!(strategy.max_parallel, Some(2));
+    assert_eq!(strategy.group.as_deref(), Some("g"));
+    assert_eq!(entries[1].strategy, Some(Strategy::default()));
+    let again = parse(&to_yaml(&config).unwrap()).unwrap();
+    assert_eq!(again, config);
+}
+
+#[test]
+fn an_unknown_strategy_key_is_an_error() {
+    let err = parse(
+        "workflows: { ci: { on: { push: {} }, jobs: [{ t: { strategy: { fail_fast: false } } }] } }",
+    )
+    .unwrap_err();
+    assert!(err[0].message.contains("fail_fast"), "{err:?}");
 }

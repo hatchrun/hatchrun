@@ -998,8 +998,8 @@ fn validate_checks_every_expression() {
             ],
         ),
         (
-            "    runs-on: ubuntu-latest\n    if: \"${{ strategy.job-index }}\"\n    steps: []",
-            &["`if`", "unknown context 'strategy'"],
+            "    runs-on: ubuntu-latest\n    if: \"${{ nosuch.job-index }}\"\n    steps: []",
+            &["`if`", "unknown context 'nosuch'"],
         ),
         (
             "    runs-on: ubuntu-latest\n    steps: [{ uses: a/b@v1, with: { x: [\"${{ 1 +\" ] } }]",
@@ -1804,4 +1804,187 @@ workflows:
     assert!(loaded.statuses.is_empty());
     job.statuses.clear();
     assert_eq!(loaded, job);
+}
+
+const STRATEGY_JOBS: &str = "
+jobs:
+  t: { runs-on: ubuntu-latest, continue-on-error: '${{ matrix.experimental }}', steps: [] }
+  u: { runs-on: ubuntu-latest, continue-on-error: true, steps: [] }
+  v: { runs-on: ubuntu-latest, continue-on-error: false, steps: [] }
+";
+
+#[test]
+fn matrix_jobs_get_a_strategy_numbered_in_plan_order() {
+    let p = plan(&format!(
+        "{STRATEGY_JOBS}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs:
+      - t:
+          matrix: {{ os: [a, b, c] }}
+          strategy: {{ fail-fast: false, max-parallel: 2 }}
+      - u
+"
+    ));
+    assert_eq!(p.jobs.len(), 4);
+    for (i, job) in p.jobs[..3].iter().enumerate() {
+        let s = job.strategy.as_ref().unwrap();
+        assert_eq!(s.group, "t");
+        assert!(!s.fail_fast);
+        assert_eq!(s.max_parallel, Some(2));
+        assert_eq!((s.job_index, s.job_total), (u32::try_from(i).unwrap(), 3));
+    }
+    assert_eq!(p.jobs[3].strategy, None);
+    let ctx = p.jobs[1].strategy_context();
+    assert_eq!(ctx["job-index"], 1);
+    assert_eq!(ctx["job-total"], 3);
+    assert_eq!(ctx["max-parallel"], 2);
+    assert_eq!(ctx["fail-fast"], false);
+    let alone = p.jobs[3].strategy_context();
+    assert_eq!(alone["fail-fast"], true);
+    assert_eq!(alone["job-index"], 0);
+    assert_eq!(alone["job-total"], 1);
+}
+
+#[test]
+fn a_matrix_defaults_to_fail_fast_with_no_limit() {
+    let p = plan(&format!(
+        "{STRATEGY_JOBS}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs:
+      - t: {{ matrix: {{ experimental: [true, false] }} }}
+"
+    ));
+    let s = p.jobs[0].strategy.as_ref().unwrap();
+    assert!(s.fail_fast);
+    assert_eq!(s.max_parallel, None);
+    assert_eq!(p.jobs[0].strategy_context()["max-parallel"], 2);
+}
+
+#[test]
+fn entries_of_one_group_share_numbers() {
+    let p = plan(&format!(
+        "{STRATEGY_JOBS}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs:
+      - t: {{ name: a, matrix: {{ x: [1, 2] }}, strategy: {{ group: g }} }}
+      - t: {{ name: b, matrix: {{ x: [3] }}, strategy: {{ group: g }} }}
+"
+    ));
+    let seen: Vec<(&str, u32, u32)> = p
+        .jobs
+        .iter()
+        .map(|j| {
+            let s = j.strategy.as_ref().unwrap();
+            (s.group.as_str(), s.job_index, s.job_total)
+        })
+        .collect();
+    assert_eq!(seen, [("g", 0, 3), ("g", 1, 3), ("g", 2, 3)]);
+}
+
+#[test]
+fn a_job_without_matrix_or_strategy_has_none() {
+    let p = plan(&format!(
+        "{STRATEGY_JOBS}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs: [u]
+"
+    ));
+    assert_eq!(p.jobs[0].strategy, None);
+}
+
+#[test]
+fn continue_on_error_reaches_the_plan() {
+    let p = plan(&format!(
+        "{STRATEGY_JOBS}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs: [t, u, v]
+"
+    ));
+    assert_eq!(
+        p.jobs[0].continue_on_error.as_deref(),
+        Some("${{ matrix.experimental }}")
+    );
+    assert_eq!(p.jobs[1].continue_on_error.as_deref(), Some("true"));
+    assert_eq!(p.jobs[2].continue_on_error, None);
+}
+
+#[test]
+fn continue_on_error_substitutes_parameters() {
+    let p = plan(
+        "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    parameters: { soft: { type: boolean, default: true } }
+    continue-on-error: ${{ parameters.soft }}
+    steps: []
+workflows:
+  ci: { on: { push: {} }, jobs: [t] }
+",
+    );
+    assert_eq!(p.jobs[0].continue_on_error.as_deref(), Some("true"));
+}
+
+#[test]
+fn rejects_a_bad_strategy() {
+    let wf = |entries: &str| {
+        format!(
+            "{STRATEGY_JOBS}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs: {entries}
+"
+        )
+    };
+    assert_error(
+        &wf("[{ t: { matrix: { x: [1] }, strategy: { max-parallel: 0 } } }]"),
+        &["max-parallel: 0", "1 or more"],
+    );
+    assert_error(
+        &wf("[{ t: { matrix: { x: [1] }, strategy: { group: '' } } }]"),
+        &["empty", "strategy.group"],
+    );
+    assert_error(
+        &wf(
+            "[{ t: { name: a, strategy: { group: g } } }, { t: { name: b, strategy: { group: g, fail-fast: false } } }]",
+        ),
+        &["`a` and `b`", "group `g`", "differ"],
+    );
+    assert_error(
+        &wf("[{ hold: { type: approval, strategy: { fail-fast: false } } }]"),
+        &["approval `hold`", "strategy"],
+    );
+}
+
+#[test]
+fn rejects_a_continue_on_error_that_reads_an_unknown_context() {
+    assert_error(
+        "
+jobs: { t: { runs-on: ubuntu-latest, continue-on-error: '${{ nosuch.x }}', steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+        &["continue-on-error", "unknown context 'nosuch'"],
+    );
+}
+
+#[test]
+fn a_job_parameter_cannot_be_named_strategy() {
+    assert_error(
+        "
+jobs: { t: { runs-on: ubuntu-latest, parameters: { strategy: { type: string } }, steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+        &["parameter `strategy`"],
+    );
 }
