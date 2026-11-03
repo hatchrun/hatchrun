@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 
 use hatchrun_workflow::{
-    CacheService, Conclusion, Github, JobDocument, JobKind, Need, PlannedJob, compile, parse,
-    template,
+    CacheService, Conclusion, Github, IdTokenRequest, JobDocument, JobKind, Need, PlannedJob,
+    compile, parse, template,
 };
 use serde_json::json;
 
@@ -58,6 +58,10 @@ fn document(job: PlannedJob) -> JobDocument {
             url: "https://cache.example/".into(),
             token: "c_tok".into(),
         }),
+        id_token: Some(IdTokenRequest {
+            url: "https://ci.example/v1/oidc/token?api-version=2.0".into(),
+            token: "i_tok".into(),
+        }),
     }
 }
 
@@ -102,7 +106,7 @@ fn debug_hides_secrets() {
     let mut doc = document(first_job());
     doc.secrets.insert("K".into(), "s3cr3t".into());
     let text = format!("{doc:?}");
-    for hidden in ["s3cr3t", "ghs_x", "c_tok", "commits"] {
+    for hidden in ["s3cr3t", "ghs_x", "c_tok", "i_tok", "commits"] {
         assert!(!text.contains(hidden), "{hidden} leaked: {text}");
     }
     assert!(text.contains("[redacted]"));

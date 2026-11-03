@@ -36,10 +36,12 @@ pub use expr::{
     interpolate, job_condition, secret_refs, truthy,
 };
 pub use job::{
-    Annotation, AnnotationLevel, CacheService, Conclusion, Github, JobDocument, JobResult, Need,
-    StepSummary,
+    Annotation, AnnotationLevel, CacheService, Conclusion, Github, IdTokenRequest, JobDocument,
+    JobResult, Need, StepSummary,
 };
-pub use permissions::{DEFAULT_SCOPES, Level, Permissions, SCOPES, token_scopes};
+pub use permissions::{
+    DEFAULT_SCOPES, ID_TOKEN, ID_TOKEN_SCOPE, Level, Permissions, SCOPES, token_scopes,
+};
 pub use plan::{
     JobKind, Plan, PlannedJob, PlannedStep, Ready, compile, config_errors, ready, validate,
 };
