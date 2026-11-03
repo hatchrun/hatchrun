@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use hatchrun_common::now_secs;
 use hatchrun_scaler_core::{Action, Scaler};
 use hatchrun_scaleset::{
     Actions, CallError, Error, ErrorKind, Message, NewScaleSet, Operation, ScaleSet, Session,
@@ -30,13 +31,6 @@ const MAX_FAILURES: u32 = 10;
 const SESSION_ATTEMPTS: u32 = 10;
 /// Runner work directory, relative to the runner's home.
 const WORK_FOLDER: &str = "_work";
-
-/// Returns the time in seconds since the Unix epoch.
-pub fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
-}
 
 /// Finds the scale set, creating it when missing and updating its labels
 /// and settings when present.
@@ -134,7 +128,7 @@ where
             assigned_jobs = statistics.total_assigned_jobs,
             "message session open"
         );
-        scaler.handle_jobs([], Some(statistics.total_assigned_jobs), now());
+        scaler.handle_jobs([], Some(statistics.total_assigned_jobs), now_secs());
         Ok(Self {
             github: Rc::new(github),
             cloud,
@@ -144,7 +138,7 @@ where
             actions,
             session,
             last_message_id: 0,
-            clock: now,
+            clock: now_secs,
         })
     }
 

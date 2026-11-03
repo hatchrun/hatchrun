@@ -177,7 +177,7 @@ async fn run(args: Args) -> Result<()> {
         (None, None) => bail!("set HATCHRUN_GITHUB_TOKEN or --github-app-client-id"),
     };
     let github = GitHub::new(Http::new()?, args.github_url, credentials);
-    let actions = github.connect(driver::now()).await?;
+    let actions = github.connect(hatchrun_common::now_secs()).await?;
 
     let scale_set = ensure_scale_set(
         &github,

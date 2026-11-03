@@ -17,6 +17,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+hatchrun-common = { path = "../common", features = ["worker"] }
 base64 = "0.23.1"
 ed25519-dalek = { version = "3.0.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }

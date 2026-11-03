@@ -152,12 +152,6 @@ pub fn rfc3339(secs: u64) -> String {
     )
 }
 
-pub(crate) fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// The installation, as Plan 3's fields say, holding the permissions
 /// the hatchrun App has.
 async fn installation(State(fake): State<Fake>, Path(id): Path<u64>) -> Response {
@@ -227,7 +221,7 @@ async fn access_token(
         StatusCode::CREATED,
         Json(json!({
             "token": format!("ghs_e2e_{n}"),
-            "expires_at": rfc3339(now_secs() + 3600),
+            "expires_at": rfc3339(hatchrun_common::now_secs() + 3600),
         })),
     )
         .into_response()
