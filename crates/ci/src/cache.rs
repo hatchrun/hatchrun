@@ -59,9 +59,6 @@ pub const IDLE_DAYS: u64 = 7;
 pub const STALE_UPLOAD_MS: u64 = 86_400_000;
 /// Entries one reconciler pass evicts at most.
 pub const EVICT_LIMIT: u32 = 20;
-/// What an eviction pass may spend in subrequests: credentials and one
-/// delete per entry.
-pub const EVICT_COST: u32 = EVICT_LIMIT + 1;
 
 /// What one repository may keep, as on GitHub: 10 GB. Past it the least
 /// recently used entries are evicted.
@@ -216,51 +213,47 @@ async fn lookup(ctx: &Context<'_>, request: LookupRequest) -> Answer {
         ctx.run.base_ref.as_deref(),
         default_branch.as_deref(),
     );
-    let wanted: Vec<(&str, bool)> = std::iter::once((request.key.as_str(), true))
-        .chain(request.restore_keys.iter().map(|key| (key.as_str(), false)))
-        .collect();
-    for scope in &scopes {
-        let owner = CacheOwner {
-            scope,
-            ..ctx.owner()
-        };
-        for &(key, exact) in &wanted {
-            let Some(found) =
-                store::cache_entry(&ctx.db, owner, &request.version, key, exact).await?
-            else {
-                continue;
-            };
-            if !in_repo(&found.object_key, &ctx.run.tenant_id, ctx.run.repo_id) {
-                return Err(Refusal::new(500, "the entry has a foreign key"));
-            }
-            let credentials = credentials(ctx.settings).await?;
-            let url = s3::presign(
-                &s3::get_object(&object_url(ctx, &found.object_key)),
-                &credentials,
-                &ctx.settings.ci_region,
-                now_ms(),
-                std::time::Duration::from_secs(URL_SECS),
-            )
-            .map_err(|err| Refusal::new(500, err))?;
-            store::touch_cache_entry(&ctx.db, found.id, &ctx.run.tenant_id, now_ms()).await?;
-            return json(
-                &LookupResponse {
-                    key: found.key,
-                    url,
-                    size: found.size.unwrap_or(0),
-                },
-                200,
-            );
-        }
+    let Some(found) = store::lookup_cache_entry(
+        &ctx.db,
+        &ctx.run.tenant_id,
+        ctx.run.repo_id,
+        &request.version,
+        &scopes,
+        &request.key,
+        &request.restore_keys,
+    )
+    .await?
+    else {
+        return Err(Refusal::new(404, "no entry"));
+    };
+    if !in_repo(&found.object_key, &ctx.run.tenant_id, ctx.run.repo_id) {
+        return Err(Refusal::new(500, "the entry has a foreign key"));
     }
-    Err(Refusal::new(404, "no entry"))
+    let credentials = credentials(ctx.settings).await?;
+    let url = s3::presign(
+        &s3::get_object(&object_url(ctx, &found.object_key)),
+        &credentials,
+        &ctx.settings.ci_region,
+        now_ms(),
+        std::time::Duration::from_secs(URL_SECS),
+    )
+    .map_err(|err| Refusal::new(500, err))?;
+    store::touch_cache_entry(&ctx.db, found.id, &ctx.run.tenant_id, now_ms()).await?;
+    json(
+        &LookupResponse {
+            key: found.key,
+            url,
+            size: found.size.unwrap_or(0),
+        },
+        200,
+    )
 }
 
 async fn start(ctx: &Context<'_>, request: UploadRequest) -> Answer {
     check_entry(&request.version, &request.key)?;
     // Saves the upload when the entry exists; finalizing still settles
     // a race between two jobs.
-    if store::cache_entry(&ctx.db, ctx.owner(), &request.version, &request.key, true)
+    if store::cache_entry(&ctx.db, ctx.owner(), &request.version, &request.key)
         .await?
         .is_some()
     {
@@ -359,6 +352,16 @@ async fn complete(ctx: &Context<'_>, id: &str, request: CompleteRequest) -> Answ
     .await?;
     let written = s3::completed(&response).map_err(aws_failure("CompleteMultipartUpload"))?;
     if written == s3::Completed::Exists {
+        // The parts are of no use now, and nothing else would delete
+        // them or the object that stopped the upload.
+        for request in [
+            s3::abort_multipart_upload(&url, &upload_id),
+            s3::delete_object(&url),
+        ] {
+            if let Err(err) = signed(ctx, &credentials, request).await {
+                console_warn!("cache: clean up upload {}: {}", row.id, err.message);
+            }
+        }
         store::drop_pending_cache_entry(&ctx.db, row.id, ctx.owner()).await?;
         return Err(Refusal::new(409, "another job saved the entry first"));
     }
@@ -406,55 +409,77 @@ async fn abort(ctx: &Context<'_>, id: &str) -> Answer {
 
 /// Deletes the least recently used entries of the run's repository while
 /// it holds more than [`MAX_REPO_BYTES`], at most [`EVICT_LIMIT`] per
-/// call, object first and row after. What is left over goes at the next
-/// save.
+/// call. The rows go first and their objects after. What is left over
+/// goes at the next save.
 async fn enforce_quota(
     ctx: &Context<'_>,
     credentials: &Credentials,
 ) -> std::result::Result<(), String> {
-    let tenant = &ctx.run.tenant_id;
-    let repo = ctx.run.repo_id;
-    let rows = store::over_quota_cache_entries(&ctx.db, tenant, repo, MAX_REPO_BYTES, EVICT_LIMIT)
-        .await
-        .map_err(|err| err.to_string())?;
+    let rows = store::evict_over_quota_cache_entries(
+        &ctx.db,
+        &ctx.run.tenant_id,
+        ctx.run.repo_id,
+        MAX_REPO_BYTES,
+        EVICT_LIMIT,
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    delete_objects(ctx.settings, credentials, &rows).await;
+    Ok(())
+}
+
+/// Deletes the objects of evicted `rows`, which are already gone from
+/// the table, so no lookup can find one whose object is gone. An object
+/// S3 no longer has counts as deleted. One that could not be deleted is
+/// logged by key. Returns how many were deleted.
+async fn delete_objects(
+    settings: &Settings,
+    credentials: &Credentials,
+    rows: &[CacheRow],
+) -> usize {
     let results = futures_util::future::join_all(rows.iter().map(|row| async move {
-        if !in_repo(&row.object_key, tenant, repo) {
+        // Rows are trusted no further than the requests that made them:
+        // only keys under cache/ are deleted here.
+        if !in_repo(&row.object_key, &row.tenant_id, row.repo_id) {
             return Err(format!("entry {} has a foreign key", row.id));
         }
-        let url = object_url(ctx, &row.object_key);
-        let response = signed(ctx, credentials, s3::delete_object(&url))
+        let url = s3::object_url(
+            &settings.artifacts_bucket,
+            &settings.ci_region,
+            settings.aws_endpoint.as_deref(),
+            &row.object_key,
+        );
+        let response = sign_send(settings, credentials, s3::delete_object(&url))
             .await
             .map_err(|err| err.message)?;
+        if response.status == 404 {
+            return Ok(());
+        }
         s3::ok(&response).map_err(|err| err.to_string())
     }))
     .await;
-    let mut gone = Vec::new();
+    let mut deleted = 0;
     for (row, result) in rows.iter().zip(results) {
         match result {
-            Ok(()) => gone.push(row.id),
-            Err(err) => worker::console_error!("cache: evict {}: {err}", row.id),
+            Ok(()) => deleted += 1,
+            Err(err) => worker::console_error!(
+                "cache: delete object {} of evicted entry {}: {err}",
+                row.object_key,
+                row.id
+            ),
         }
     }
-    store::delete_cache_entries(&ctx.db, tenant, repo, &gone)
-        .await
-        .map_err(|err| err.to_string())
+    deleted
 }
 
-/// The size of the object at `key`, from a listing of that prefix.
+/// The size of the object at `key`.
 async fn object_size(
     ctx: &Context<'_>,
     credentials: &Credentials,
     key: &str,
 ) -> std::result::Result<u64, Refusal> {
-    let request = s3::list_objects(&object_url(ctx, ""), key, None);
-    let listing = s3::listing(&signed(ctx, credentials, request).await?)
-        .map_err(aws_failure("ListObjectsV2"))?;
-    listing
-        .objects
-        .iter()
-        .find(|object| object.key == key)
-        .map(|object| object.size)
-        .ok_or_else(|| Refusal::new(502, "the completed upload is not in the bucket"))
+    let response = signed(ctx, credentials, s3::head_object(&object_url(ctx, key))).await?;
+    s3::content_length(&response).map_err(aws_failure("HeadObject"))
 }
 
 fn object_url(ctx: &Context<'_>, key: &str) -> String {
@@ -475,20 +500,24 @@ async fn signed(
 }
 
 /// Deletes the entries nobody restored for [`IDLE_DAYS`] days and the
-/// uploads that never finished, at most [`EVICT_LIMIT`] of them, and
-/// returns how many went. Each object goes first and its row after, so
-/// a failed delete leaves the row for the next pass. A pass costs at most
-/// [`EVICT_COST`] subrequests.
+/// uploads that never finished, at most `limit` of them, and returns how
+/// many were deleted. The rows go first and the objects after. A pass
+/// costs at most `limit + 1` subrequests.
 ///
 /// # Errors
 ///
 /// What went wrong, for the log: Postgres, or the CI role.
-pub async fn evict(settings: &Settings, db: &Db, now: u64) -> std::result::Result<usize, String> {
-    if settings.artifacts_bucket.is_empty() {
+pub async fn evict(
+    settings: &Settings,
+    db: &Db,
+    now: u64,
+    limit: u32,
+) -> std::result::Result<usize, String> {
+    if settings.artifacts_bucket.is_empty() || limit == 0 {
         return Ok(0);
     }
     let idle_ms = IDLE_DAYS * 86_400_000;
-    let rows = store::idle_cache_entries(db, now, idle_ms, STALE_UPLOAD_MS, EVICT_LIMIT)
+    let rows = store::evict_idle_cache_entries(db, now, idle_ms, STALE_UPLOAD_MS, limit)
         .await
         .map_err(|err| err.to_string())?;
     if rows.is_empty() {
@@ -497,38 +526,7 @@ pub async fn evict(settings: &Settings, db: &Db, now: u64) -> std::result::Resul
     let credentials = credentials(settings)
         .await
         .map_err(|err| err.message.clone())?;
-    let results = futures_util::future::join_all(rows.iter().map(|row| {
-        let url = s3::object_url(
-            &settings.artifacts_bucket,
-            &settings.ci_region,
-            settings.aws_endpoint.as_deref(),
-            &row.object_key,
-        );
-        let credentials = &credentials;
-        async move {
-            // Rows are trusted no further than the requests that made
-            // them: only keys under cache/ are deleted here.
-            if !in_repo(&row.object_key, &row.tenant_id, row.repo_id) {
-                return Err(format!("entry {} has a foreign key", row.id));
-            }
-            let response = sign_send(settings, credentials, s3::delete_object(&url))
-                .await
-                .map_err(|err| err.message)?;
-            s3::ok(&response).map_err(|err| err.to_string())
-        }
-    }))
-    .await;
-    let mut gone = Vec::new();
-    for (row, result) in rows.iter().zip(results) {
-        match result {
-            Ok(()) => gone.push(row.id),
-            Err(err) => worker::console_error!("cache: evict {}: {err}", row.id),
-        }
-    }
-    store::delete_idle_cache_entries(db, &gone, now, idle_ms)
-        .await
-        .map_err(|err| err.to_string())?;
-    Ok(gone.len())
+    Ok(delete_objects(settings, &credentials, &rows).await)
 }
 
 #[cfg(test)]

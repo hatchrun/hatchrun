@@ -330,7 +330,8 @@ Resources:
                   - s3:DeleteObject
                   - s3:AbortMultipartUpload
                 Resource: !Sub "${ArtifactsBucket.Arn}/artifacts/*"
-              # The job cache: the same calls on cache/ objects, and the
+              # The job cache: the same calls on cache/ objects (HeadObject reads the
+              # size of a saved entry, and needs GetObject), and the
               # reconciler's deletes of evicted entries.
               - Sid: CacheObjects
                 Effect: Allow
@@ -340,15 +341,6 @@ Resources:
                   - s3:DeleteObject
                   - s3:AbortMultipartUpload
                 Resource: !Sub "${ArtifactsBucket.Arn}/cache/*"
-              # Completing a cache upload reads the size of its object
-              # from a listing of its key.
-              - Sid: CacheList
-                Effect: Allow
-                Action: s3:ListBucket
-                Resource: !GetAtt ArtifactsBucket.Arn
-                Condition:
-                  StringLike:
-                    s3:prefix: "cache/*"
               # Ending a job's instance, turning its metadata off, and
               # starting a pool instance a job took.
               - Sid: ManageOwnInstances

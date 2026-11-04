@@ -25,7 +25,8 @@
 //! A pass is bounded so it stays inside the Worker's CPU time and
 //! subrequest limits. It counts the outbound calls it makes (GitHub,
 //! run objects, queue, AWS, Polar) against [`BUDGET`], split by
-//! [`shares`]: 500 for schedules, then of the rest 3/8 for stalled
+//! [`shares`]: 1/40 for evicting cache entries, then 5/9 of the rest
+//! (at most 500) for schedules, then of the rest 3/8 for stalled
 //! jobs, 1/8 each for orphans and the warm pool, 1/16 each for usage and
 //! re-sealing, and the remainder (100 at [`BUDGET`]) for retention. A step whose share runs out stops and resumes in the next
 //! pass. Rows and runs are bounded too: [`MAX_MINUTES`] minutes,
@@ -127,15 +128,19 @@ pub struct Shares {
     pub reseal: u32,
     /// Retention.
     pub retention: u32,
+    /// Evicting job cache entries.
+    pub cache: u32,
 }
 
-/// Splits `total`: schedules take 5/9 of it, at most 500. Of the rest
-/// stalled jobs take 3/8, orphans and the pool 1/8 each, usage and
+/// Splits `total`: cache eviction takes 1/40 of it. Of the remainder
+/// schedules take 5/9, at most 500. Of the rest stalled jobs take 3/8, orphans and the pool 1/8 each, usage and
 /// re-sealing 1/16 each, rounded down, and retention the remainder.
 /// Schedules cannot take what the other steps need, and retention keeps
 /// at least `SWEEP_LIMIT * PURGE_COST` at [`BUDGET`].
 #[must_use]
 pub fn shares(total: u32) -> Shares {
+    let cache = total / 40;
+    let total = total - cache;
     let schedules = (total / 9 * 5).min(500);
     let rest = total - schedules;
     let stalled = rest / 8 * 3 + rest % 8 * 3 / 8;
@@ -151,6 +156,7 @@ pub fn shares(total: u32) -> Shares {
         usage,
         reseal,
         retention: rest - stalled - orphans - pool - usage - reseal,
+        cache,
     }
 }
 
@@ -489,9 +495,7 @@ pub async fn run(env: Env) {
     if let Err(err) = retain(&env, &db, &Budget::new(share.retention), now).await {
         console_error!("reconcile: retention: {err}");
     }
-    // Part of retention, with a budget of its own in the headroom below
-    // the Worker's limit: it must not wait behind a backlog of runs.
-    if let Err(err) = evict_cache(&settings, &db, &Budget::new(cache::EVICT_COST), now).await {
+    if let Err(err) = evict_cache(&settings, &db, &Budget::new(share.cache), now).await {
         console_error!("reconcile: cache eviction: {err}");
     }
     if let Err(err) = report_usage(&db, &settings, &Budget::new(share.usage), now).await {
@@ -1220,11 +1224,16 @@ async fn evict_cache(
     budget: &Budget,
     now: u64,
 ) -> Result<(), String> {
-    if budget.left() < cache::EVICT_COST {
+    // One subrequest for the role's credentials, the rest one delete
+    // per entry.
+    let limit = budget.left().saturating_sub(1).min(cache::EVICT_LIMIT);
+    if limit == 0 {
         return Ok(());
     }
-    let evicted = cache::evict(settings, db, now).await?;
-    budget.take(u32::try_from(evicted).unwrap_or(cache::EVICT_LIMIT) + 1);
+    let evicted = cache::evict(settings, db, now, limit).await?;
+    if evicted > 0 {
+        budget.take(u32::try_from(evicted).unwrap_or(limit) + 1);
+    }
     Ok(())
 }
 
@@ -1743,24 +1752,33 @@ mod tests {
     #[test]
     fn shares_split_the_budget() {
         let sum = |s: Shares| {
-            s.schedules + s.stalled + s.orphans + s.pool + s.usage + s.reseal + s.retention
+            s.schedules
+                + s.stalled
+                + s.orphans
+                + s.pool
+                + s.usage
+                + s.reseal
+                + s.retention
+                + s.cache
         };
         let share = shares(BUDGET);
         assert_eq!(
             share,
             Shares {
-                schedules: 500,
-                stalled: 150,
-                orphans: 50,
-                pool: 50,
-                usage: 25,
-                reseal: 25,
+                schedules: 485,
+                stalled: 147,
+                orphans: 49,
+                pool: 49,
+                usage: 24,
+                reseal: 24,
                 retention: 100,
+                cache: 22,
             }
         );
         assert_eq!(sum(share), BUDGET);
         assert!(share.retention >= store::SWEEP_LIMIT * PURGE_COST);
         assert!(share.reseal > 0 && share.usage > 0);
+        assert!(share.cache > cache::EVICT_LIMIT);
         for total in [0, 1, 8, 100, 900, 5_000] {
             let share = shares(total);
             assert_eq!(sum(share), total, "{total}");

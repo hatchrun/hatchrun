@@ -112,6 +112,35 @@ pub fn get_object(url: &str) -> Request {
     Request::new("GET", url)
 }
 
+/// Reads the metadata of the object at `url`, with no body.
+#[must_use]
+pub fn head_object(url: &str) -> Request {
+    Request::new("HEAD", url)
+}
+
+/// The size of the object a [`head_object`] answered for.
+///
+/// # Errors
+///
+/// A status other than 2xx, or no `Content-Length`.
+pub fn content_length(response: &Response) -> Result<u64, Error> {
+    if !response.ok() {
+        return Err(Error {
+            status: response.status,
+            code: if response.status == 404 {
+                "NotFound".to_owned()
+            } else {
+                "HeadObjectFailed".to_owned()
+            },
+            message: format!("HeadObject answered {}", response.status),
+        });
+    }
+    response
+        .header("content-length")
+        .and_then(|value| value.trim().parse().ok())
+        .ok_or_else(|| Error::malformed("no Content-Length in HeadObject"))
+}
+
 /// Deletes the object at `url`. S3 answers 204 for a key that is not
 /// there too.
 #[must_use]
@@ -350,6 +379,18 @@ mod tests {
             status,
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn reads_the_size_of_a_head_answer() {
+        let mut found = response(200, "");
+        assert!(content_length(&found).is_err());
+        found.headers.push(("content-length".into(), "1234".into()));
+        assert_eq!(content_length(&found), Ok(1234));
+        let missing = response(404, "");
+        let err = content_length(&missing).unwrap_err();
+        assert_eq!((err.status, err.code.as_str()), (404, "NotFound"));
+        assert_eq!(head_object("https://b/k").method, "HEAD");
     }
 
     #[test]

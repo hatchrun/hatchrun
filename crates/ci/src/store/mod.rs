@@ -33,9 +33,9 @@ pub use self::billing::{
     usage_sent,
 };
 pub use self::cache::{
-    CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, delete_cache_entries,
-    delete_idle_cache_entries, drop_pending_cache_entry, finalize_cache_entry, idle_cache_entries,
-    over_quota_cache_entries, pending_cache_entry, start_cache_entry, touch_cache_entry,
+    CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, drop_pending_cache_entry,
+    evict_idle_cache_entries, evict_over_quota_cache_entries, finalize_cache_entry,
+    lookup_cache_entry, pending_cache_entry, start_cache_entry, touch_cache_entry,
 };
 pub use self::concurrency::{
     Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, unfinished_superseded,

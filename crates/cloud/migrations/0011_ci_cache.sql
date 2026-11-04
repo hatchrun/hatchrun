@@ -6,10 +6,12 @@
 -- actions/cache. The bytes are one S3 object each, under object_key,
 -- which names the tenant and repository and a random token. S3 does not
 -- know when an entry was last restored, so the reconciler deletes the
--- entries nobody restored for 7 days, object first and row after.
+-- entries nobody restored for 7 days: the row goes first, so a lookup
+-- never finds a row whose object is gone, and the object after.
 --
 -- scope is the git ref the saving run had. A run writes to its own
--- scope and reads its own and the default branch's. There are no
+-- scope and reads its own, then (for a pull request) its base branch's,
+-- then the default branch's. There are no
 -- foreign keys: a repository or tenant that goes away must not drop the
 -- rows that name objects still in the bucket; the sweep removes both.
 --

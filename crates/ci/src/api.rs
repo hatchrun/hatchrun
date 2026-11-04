@@ -438,15 +438,16 @@ fn run_json(run: &RunRow, repo: &RepoRow) -> Value {
 /// How long a presigned artifact download holds, in seconds.
 const DOWNLOAD_SECS: u64 = 300;
 
-/// An artifact as the run page lists it.
-fn artifact_json(row: &store::ArtifactRow, retention_days: u32) -> Value {
+/// An artifact as the run page lists it. It goes when its run does, at
+/// the run's creation plus its retention.
+fn artifact_json(row: &store::ArtifactRow, run: &RunRow) -> Value {
     let uploaded = row.finalized_at.unwrap_or(row.created_at);
     json!({
         "id": row.id,
         "name": row.name,
         "size": row.size.unwrap_or(0),
         "created_at": uploaded,
-        "expires_at": uploaded + u64::from(retention_days) * 86_400_000,
+        "expires_at": run.created_at + u64::from(run.retention_days) * 86_400_000,
     })
 }
 
@@ -772,7 +773,7 @@ impl Cx<'_> {
     }
 
     /// The run's finalized artifacts, oldest first. An artifact goes with
-    /// the run's retention, counted from when it was uploaded.
+    /// the run, when the run's retention ends.
     async fn artifacts(&self, run_id: u64) -> Result<Served> {
         let found = match self.found(run_id, Access::Read).await? {
             Ok(found) => found,
@@ -781,7 +782,7 @@ impl Cx<'_> {
         let rows = store::artifacts(self.db, run_id, None, None).await?;
         let artifacts: Vec<Value> = rows
             .iter()
-            .map(|row| artifact_json(row, found.run.retention_days))
+            .map(|row| artifact_json(row, &found.run))
             .collect();
         Ok(Ok(Response::from_json(&json!({ "artifacts": artifacts }))?))
     }
@@ -1515,11 +1516,26 @@ workflows:
             created_at: 100,
             finalized_at: Some(200),
         };
+        // Uploaded a day into the run, which expires 30 days after it
+        // was created.
+        let run: RunRow = serde_json::from_value(json!({
+            "id": 9, "run_number": 1, "run_attempt": 1, "tenant_id": "t1",
+            "repo_id": 7, "workflow": "ci", "delivery": "d", "event": "push",
+            "git_ref": "refs/heads/main", "sha": "abc", "actor": "a",
+            "status": "completed", "conclusion": "success", "created_at": 1000,
+            "completed_at": null, "retention_days": 30
+        }))
+        .unwrap();
+        let row = store::ArtifactRow {
+            created_at: 1000 + 86_400_000,
+            finalized_at: Some(1000 + 86_400_000),
+            ..row
+        };
         assert_eq!(
-            artifact_json(&row, 30),
+            artifact_json(&row, &run),
             json!({
-                "id": 3, "name": "dist", "size": 12, "created_at": 200,
-                "expires_at": 200 + 30 * 86_400_000_u64,
+                "id": 3, "name": "dist", "size": 12, "created_at": 1000 + 86_400_000_u64,
+                "expires_at": 1000 + 30 * 86_400_000_u64,
             })
         );
     }

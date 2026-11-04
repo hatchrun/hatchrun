@@ -4,8 +4,12 @@
 
 //! Cache entries: the rows behind `actions/cache`. Every statement
 //! names the tenant, the repository and the scope (the git ref), so a
-//! job reaches the entries of its own ref and the default branch's and
-//! no others.
+//! job reaches the entries of its own ref, its pull request's base
+//! branch and the default branch, and no others.
+//!
+//! Evicting an entry deletes its row first and returns it, so the caller
+//! deletes the object of a row that is already gone. A lookup cannot
+//! then find a row whose object went, and a save is never blocked by one.
 
 use hatchrun_cloud::db::{Db, params};
 use serde::Deserialize;
@@ -56,12 +60,21 @@ const EXACT: &str = "SELECT {columns} FROM ci_cache_entries \
      WHERE tenant_id = $1 AND repo_id = $2 AND scope = $3 AND version = $4 AND key = $5 \
      AND finalized_at IS NOT NULL";
 
-/// The newest finalized entry of the same scope and version whose key
-/// starts with `$5`.
-const PREFIX: &str = "SELECT {columns} FROM ci_cache_entries \
-     WHERE tenant_id = $1 AND repo_id = $2 AND scope = $3 AND version = $4 \
-     AND starts_with(key, $5) AND finalized_at IS NOT NULL \
-     ORDER BY finalized_at DESC, id DESC LIMIT 1";
+/// The entry a restore finds in repository `$2` of tenant `$1` at
+/// version `$3`: of the scopes in the JSON array `$4`, in order, the
+/// first with an entry; within it the key `$5` exactly, then the keys of
+/// the JSON array `$6` as prefixes in order, the newest entry of a
+/// prefix first.
+const LOOKUP: &str = "SELECT {columns} FROM ci_cache_entries \
+     JOIN jsonb_array_elements_text($4::jsonb) WITH ORDINALITY AS s(sc, si) \
+       ON scope = s.sc \
+     JOIN (SELECT $5::text AS pat, true AS exact, 0::bigint AS ki \
+           UNION ALL \
+           SELECT k.pat, false, k.ki FROM jsonb_array_elements_text($6::jsonb) \
+             WITH ORDINALITY AS k(pat, ki)) AS w \
+       ON (w.exact AND key = w.pat) OR (NOT w.exact AND starts_with(key, w.pat)) \
+     WHERE tenant_id = $1 AND repo_id = $2 AND version = $3 AND finalized_at IS NOT NULL \
+     ORDER BY s.si, w.ki, finalized_at DESC, id DESC LIMIT 1";
 
 /// Marks entry `$1` of tenant `$2` as accessed at `$3`, when its last
 /// access is before `$4`.
@@ -81,7 +94,9 @@ const PENDING: &str = "SELECT {columns} FROM ci_cache_entries \
      WHERE id = $1 AND tenant_id = $2 AND repo_id = $3 AND scope = $4 AND finalized_at IS NULL";
 
 /// Finalizes upload `$1` of the same owner as [`PENDING`] at `$5` with
-/// `$6` bytes, unless a finalized entry holds its version and key.
+/// `$6` bytes, unless a finalized entry holds its version and key. Two
+/// finalizes at once can both pass the check; the unique index stops the
+/// second, which [`finalize_cache_entry`] reads as a refusal.
 const FINALIZE: &str = "UPDATE ci_cache_entries SET finalized_at = $5, last_accessed_at = $5, \
      size = $6, upload_id = NULL \
      WHERE id = $1 AND tenant_id = $2 AND repo_id = $3 AND scope = $4 AND finalized_at IS NULL \
@@ -94,31 +109,31 @@ const FINALIZE: &str = "UPDATE ci_cache_entries SET finalized_at = $5, last_acce
 const DROP_PENDING: &str = "DELETE FROM ci_cache_entries \
      WHERE id = $1 AND tenant_id = $2 AND repo_id = $3 AND scope = $4 AND finalized_at IS NULL";
 
-/// Entries not accessed since `$1`, and uploads started before `$2`
-/// that never finished, oldest first, at most `$3`.
-const IDLE: &str = "SELECT {columns} FROM ci_cache_entries \
-     WHERE (finalized_at IS NOT NULL AND last_accessed_at < $1) \
-     OR (finalized_at IS NULL AND created_at < $2) \
-     ORDER BY last_accessed_at, id LIMIT $3";
+/// Deletes and returns the entries not accessed since `$1` and the
+/// uploads started before `$2` that never finished, oldest first, at
+/// most `$3`. The idleness is checked again by the delete, so an entry a
+/// restore touched since the choice stays.
+const EVICT_IDLE: &str = "DELETE FROM ci_cache_entries WHERE id IN (\
+       SELECT id FROM ci_cache_entries \
+       WHERE (finalized_at IS NOT NULL AND last_accessed_at < $1) \
+          OR (finalized_at IS NULL AND created_at < $2) \
+       ORDER BY last_accessed_at, id LIMIT $3) \
+     AND ((finalized_at IS NOT NULL AND last_accessed_at < $1) \
+          OR (finalized_at IS NULL AND created_at < $2)) \
+     RETURNING {columns}";
 
-/// Deletes entry `$1`, which [`IDLE`] returned, unless a restore touched
-/// it since `$2`.
-const DELETE_IDLE: &str = "DELETE FROM ci_cache_entries \
-     WHERE id = $1 AND (last_accessed_at < $2 OR finalized_at IS NULL)";
-
-/// The finalized entries of repository `$2` of tenant `$1` that do not
-/// fit in `$3` bytes when the most recently used are kept first, least
-/// recently used first, at most `$4`. An entry larger than the cap
-/// does not fit alone.
-const OVER_QUOTA: &str = "SELECT {columns} FROM (\
-       SELECT {columns}, sum(size) OVER (ORDER BY last_accessed_at DESC, id DESC) AS kept \
-       FROM ci_cache_entries \
-       WHERE tenant_id = $1 AND repo_id = $2 AND finalized_at IS NOT NULL) AS ranked \
-     WHERE kept > $3 ORDER BY last_accessed_at, id LIMIT $4";
-
-/// Deletes entry `$1` of repository `$3` of tenant `$2`.
-const DELETE_ENTRY: &str =
-    "DELETE FROM ci_cache_entries WHERE id = $1 AND tenant_id = $2 AND repo_id = $3";
+/// Deletes and returns the finalized entries of repository `$2` of
+/// tenant `$1` that do not fit in `$3` bytes when the most recently used
+/// are kept first, the least recently used first, at most `$4`. An entry
+/// larger than the cap does not fit alone.
+const EVICT_OVER_QUOTA: &str = "DELETE FROM ci_cache_entries WHERE id IN (\
+       SELECT id FROM (\
+         SELECT id, last_accessed_at, \
+           sum(size) OVER (ORDER BY last_accessed_at DESC, id DESC) AS kept \
+         FROM ci_cache_entries \
+         WHERE tenant_id = $1 AND repo_id = $2 AND finalized_at IS NOT NULL) AS ranked \
+       WHERE kept > $3 ORDER BY last_accessed_at, id LIMIT $4) \
+     RETURNING {columns}";
 
 /// Who owns an entry: where a call looks for it.
 #[derive(Debug, Clone, Copy)]
@@ -131,8 +146,7 @@ pub struct CacheOwner<'a> {
     pub scope: &'a str,
 }
 
-/// The finalized entry in `owner`'s scope at `version`: the one named
-/// `key` when `exact`, else the newest whose key starts with `key`.
+/// The finalized entry in `owner`'s scope at `version` named `key`.
 ///
 /// # Errors
 ///
@@ -142,12 +156,42 @@ pub async fn cache_entry(
     owner: CacheOwner<'_>,
     version: &str,
     key: &str,
-    exact: bool,
 ) -> Result<Option<CacheRow>> {
-    let sql = if exact { EXACT } else { PREFIX };
     db.first(
-        &with_columns(sql, CACHE_COLUMNS),
+        &with_columns(EXACT, CACHE_COLUMNS),
         &params![owner.tenant_id, owner.repo_id, owner.scope, version, key],
+    )
+    .await
+}
+
+/// The entry a restore finds in repository `repo_id` of `tenant_id` at
+/// `version`, in one query: the first of `scopes` that has one, and in
+/// it `key` exactly, else the newest entry of the first of
+/// `restore_keys` that is a prefix of one.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn lookup_cache_entry(
+    db: &Db,
+    tenant_id: &str,
+    repo_id: u64,
+    version: &str,
+    scopes: &[String],
+    key: &str,
+    restore_keys: &[String],
+) -> Result<Option<CacheRow>> {
+    let list = |items: &[String]| serde_json::to_string(items).unwrap_or_else(|_| "[]".into());
+    db.first(
+        &with_columns(LOOKUP, CACHE_COLUMNS),
+        &params![
+            tenant_id,
+            repo_id,
+            version,
+            list(scopes),
+            key,
+            list(restore_keys)
+        ],
     )
     .await
 }
@@ -227,12 +271,18 @@ pub async fn finalize_cache_entry(
     size: u64,
     now: u64,
 ) -> Result<Finalized> {
-    let changes = db
+    let changes = match db
         .run(
             FINALIZE,
             &params![id, owner.tenant_id, owner.repo_id, owner.scope, now, size],
         )
-        .await?;
+        .await
+    {
+        Ok(changes) => changes,
+        // The index that settles two finalizes of one entry at once.
+        Err(err) if err.to_string().contains("ci_cache_entries_key") => 0,
+        Err(err) => return Err(err),
+    };
     Ok(if changes == 1 {
         Finalized::Done
     } else {
@@ -254,14 +304,14 @@ pub async fn drop_pending_cache_entry(db: &Db, id: u64, owner: CacheOwner<'_>) -
     Ok(())
 }
 
-/// The entries to evict at `now`: finalized ones not accessed for
-/// `idle_ms`, and uploads older than `stale_ms`, at most `limit`. Their
-/// rows stay until [`delete_idle_cache_entries`].
+/// Deletes and returns the entries to evict at `now`: finalized ones not
+/// accessed for `idle_ms`, and uploads older than `stale_ms`, at most
+/// `limit`. The caller deletes their objects.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn idle_cache_entries(
+pub async fn evict_idle_cache_entries(
     db: &Db,
     now: u64,
     idle_ms: u64,
@@ -269,7 +319,7 @@ pub async fn idle_cache_entries(
     limit: u32,
 ) -> Result<Vec<CacheRow>> {
     db.all(
-        &with_columns(IDLE, CACHE_COLUMNS),
+        &with_columns(EVICT_IDLE, CACHE_COLUMNS),
         &params![
             now.saturating_sub(idle_ms),
             now.saturating_sub(stale_ms),
@@ -279,33 +329,14 @@ pub async fn idle_cache_entries(
     .await
 }
 
-/// Deletes the rows of `ids`, whose objects are gone. An entry restored
-/// since `now - idle_ms` stays.
-///
-/// # Errors
-///
-/// Postgres refused a statement; nothing changes.
-pub async fn delete_idle_cache_entries(db: &Db, ids: &[u64], now: u64, idle_ms: u64) -> Result<()> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let cutoff = now.saturating_sub(idle_ms);
-    let statements: Vec<_> = ids
-        .iter()
-        .map(|&id| (DELETE_IDLE, params![id, cutoff]))
-        .collect();
-    db.batch(&statements).await?;
-    Ok(())
-}
-
-/// The entries of repository `repo_id` of `tenant_id` that push it past
-/// `cap` bytes: the least recently used, at most `limit`. Their rows stay
-/// until [`delete_cache_entries`].
+/// Deletes and returns the entries of repository `repo_id` of
+/// `tenant_id` that push it past `cap` bytes: the least recently used,
+/// at most `limit`. The caller deletes their objects.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn over_quota_cache_entries(
+pub async fn evict_over_quota_cache_entries(
     db: &Db,
     tenant_id: &str,
     repo_id: u64,
@@ -313,31 +344,8 @@ pub async fn over_quota_cache_entries(
     limit: u32,
 ) -> Result<Vec<CacheRow>> {
     db.all(
-        &with_columns(OVER_QUOTA, CACHE_COLUMNS),
+        &with_columns(EVICT_OVER_QUOTA, CACHE_COLUMNS),
         &params![tenant_id, repo_id, cap, limit],
     )
     .await
-}
-
-/// Deletes the rows of `ids` of repository `repo_id` of `tenant_id`,
-/// whose objects are gone.
-///
-/// # Errors
-///
-/// Postgres refused a statement; nothing changes.
-pub async fn delete_cache_entries(
-    db: &Db,
-    tenant_id: &str,
-    repo_id: u64,
-    ids: &[u64],
-) -> Result<()> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let statements: Vec<_> = ids
-        .iter()
-        .map(|&id| (DELETE_ENTRY, params![id, tenant_id, repo_id]))
-        .collect();
-    db.batch(&statements).await?;
-    Ok(())
 }
