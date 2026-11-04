@@ -127,6 +127,11 @@ jobs:
             echo "::error::CI_OIDC_SIGNING_KEY is not set in the production environment"
             exit 1
           fi
+          # The Worker answers 500 to every webhook without the secret.
+          if [ -z "$GITHUB_WEBHOOK_SECRET" ]; then
+            echo "::error::APP_WEBHOOK_SECRET is not set in the production environment"
+            exit 1
+          fi
           secrets="$RUNNER_TEMP/worker-secrets.json"
           trap 'rm -f "$secrets"' EXIT
           (umask 077 && jq -n 'env | with_entries(select(
