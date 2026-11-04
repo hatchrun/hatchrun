@@ -845,6 +845,11 @@ async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> 
     }
 }
 
+/// Whether `current` is `attempt` of a job that has completed.
+fn attempt_ended(current: Option<&JobRow>, attempt: u32) -> bool {
+    current.is_some_and(|job| job.attempt == attempt && job.status == "completed")
+}
+
 /// Completes the attempt of `row` as failed in the database, for a job
 /// no run object holds, and the run with it once every job is over.
 pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Result<(), String> {
@@ -852,6 +857,15 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
         .await
         .map_err(|e| e.to_string())?;
     if !ended {
+        // An earlier call may have completed the row and failed before
+        // it gave up the place. Release it when this attempt is the one
+        // that ended; a later attempt holds its own place.
+        let now_row = store::job(db, row.id).await.map_err(|e| e.to_string())?;
+        if attempt_ended(now_row.as_ref(), row.attempt) {
+            concurrency::release(env, db, row.run_id, Some(row.id))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         return Ok(());
     }
     // The job is over, so its place in a concurrency group is free.
@@ -1418,6 +1432,17 @@ mod tests {
 
     const MIN: u64 = 60_000;
     const NOW: u64 = 1_792_676_700_000; // 2026-10-22 13:45:00 UTC
+
+    #[test]
+    fn only_the_attempt_that_ended_gives_up_its_place() {
+        let mut done = row("completed");
+        assert!(attempt_ended(Some(&done), 1));
+        assert!(!attempt_ended(Some(&done), 2));
+        done.attempt = 2;
+        done.status = "queued".into();
+        assert!(!attempt_ended(Some(&done), 2));
+        assert!(!attempt_ended(None, 1));
+    }
 
     fn row(status: &str) -> JobRow {
         let mut row: JobRow = serde_json::from_value(json!({
