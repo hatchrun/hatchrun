@@ -148,10 +148,29 @@ pub async fn commit(
 pub fn commit_of(
     response: &hatchrun_cloud::http::Response,
 ) -> std::result::Result<Option<String>, String> {
+    if response.status == 422 && is_throttled(response) {
+        // A secondary rate limit answers 422 too, and it passes.
+        return Err(format!(
+            "commit: GitHub throttled the request: {}",
+            response.text()
+        ));
+    }
     if matches!(response.status, 404 | 409 | 422) {
         return Ok(None);
     }
     github::sha_of(response).map(Some)
+}
+
+/// Whether an answer is a rate or abuse limit, which GitHub marks with
+/// a `Retry-After` header or in its message.
+fn is_throttled(response: &hatchrun_cloud::http::Response) -> bool {
+    if response.header("retry-after").is_some() {
+        return true;
+    }
+    let text = response.text().to_ascii_lowercase();
+    ["rate limit", "abuse", "secondary"]
+        .iter()
+        .any(|word| text.contains(word))
 }
 
 /// The head of a repository's default branch and its config there.
@@ -608,6 +627,16 @@ mod tests {
             Ok(Some("abc".to_owned()))
         );
         assert!(commit_of(&answer(500, "boom")).is_err());
+        let limited = answer(
+            422,
+            r#"{"message":"You have exceeded a secondary rate limit."}"#,
+        );
+        assert!(commit_of(&limited).is_err());
+        let mut waiting = answer(422, "{}");
+        waiting.headers.push(("retry-after".into(), "60".into()));
+        assert!(commit_of(&waiting).is_err());
+        let unresolvable = answer(422, r#"{"message":"No commit found for SHA: x"}"#);
+        assert_eq!(commit_of(&unresolvable), Ok(None));
         assert!(commit_of(&answer(403, "rate limited")).is_err());
     }
 

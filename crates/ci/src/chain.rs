@@ -15,8 +15,10 @@ use serde_json::{Value, json};
 use worker::Result;
 
 use crate::env::Settings;
+use crate::intake::Repo;
 use crate::run::RunInfo;
 use crate::runs;
+use crate::store::{self, RepoRow};
 
 /// The deepest a chain of `workflow_run` runs goes, as on GitHub: a
 /// workflow started by a workflow started by a workflow started by a
@@ -121,6 +123,23 @@ pub fn payload(info: &RunInfo, change: &Change<'_>, chain_depth: u32) -> Value {
     })
 }
 
+/// The repository as it is now and the installation that reaches it,
+/// from its row. `None` when the repository is gone or belongs to
+/// another tenant now, which leaves the run's changes nowhere to go.
+#[must_use]
+pub fn current_repo(info: &RunInfo, row: Option<RepoRow>) -> Option<(Repo, u64)> {
+    let row = row.filter(|row| row.tenant_id == info.tenant_id)?;
+    Some((
+        Repo {
+            id: row.id,
+            full_name: row.full_name,
+            default_branch: row.default_branch,
+            private: row.private,
+        },
+        row.installation_id,
+    ))
+}
+
 /// Starts the workflows that listen for `changes` of the run `info`, on
 /// the head of the default branch, and returns the new runs' ids. Starts
 /// nothing for a run that is [`MAX_DEPTH`] hops down a chain. `event` is
@@ -147,11 +166,16 @@ pub async fn fire(
     if parent >= MAX_DEPTH || changes.is_empty() {
         return Ok(Vec::new());
     }
-    let git_ref = format!("refs/heads/{}", info.repo.default_branch);
+    // The run's own copy of the repository is from when it started; a
+    // rename or a new default branch since then is in the row.
+    let row = store::repo(db, info.repo.id).await?;
+    let Some((repo, installation_id)) = current_repo(info, row) else {
+        return Ok(Vec::new());
+    };
+    let git_ref = format!("refs/heads/{}", repo.default_branch);
     // A repository with no commit on its default branch has nothing to
     // start; asking again later would not change that.
-    let Some((sha, config)) =
-        runs::default_head(tokens, settings, info.installation_id, &info.repo).await?
+    let Some((sha, config)) = runs::default_head(tokens, settings, installation_id, &repo).await?
     else {
         return Ok(Vec::new());
     };
@@ -172,8 +196,8 @@ pub async fn fire(
                 tokens,
                 &runs::Request {
                     tenant_id: &info.tenant_id,
-                    installation_id: info.installation_id,
-                    repo: &info.repo,
+                    installation_id,
+                    repo: &repo,
                     delivery: &delivery,
                     event_name: "workflow_run",
                     event: &event,
@@ -223,6 +247,26 @@ mod tests {
             base_ref: String::new(),
             concurrency: None,
         }
+    }
+
+    #[test]
+    fn a_renamed_repository_is_read_from_its_row() {
+        let run = info("refs/heads/main", "");
+        let row = |tenant: &str| RepoRow {
+            id: 4242,
+            tenant_id: tenant.into(),
+            installation_id: 10,
+            full_name: "octo/gadgets".into(),
+            default_branch: "trunk".into(),
+            private: true,
+        };
+        let (repo, installation) = current_repo(&run, Some(row("t1"))).unwrap();
+        assert_eq!(repo.full_name, "octo/gadgets");
+        assert_eq!(repo.default_branch, "trunk");
+        assert!(repo.private);
+        assert_eq!(installation, 10);
+        assert!(current_repo(&run, None).is_none());
+        assert!(current_repo(&run, Some(row("other"))).is_none());
     }
 
     #[test]

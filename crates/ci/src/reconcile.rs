@@ -886,6 +886,11 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
         .await
         .map_err(|e| e.to_string())?;
     if jobs.iter().all(|job| job.status == "completed") {
+        // No `workflow_run` change is recorded for this run. A run here
+        // has no object (it was purged or never held), so there is no
+        // event payload to read the chain depth from and nowhere to keep
+        // the change until it is sent; this row finishes only once, so
+        // a failed send would not be tried again.
         store::finish_run(db, run.id, run.run_attempt, "failure", now)
             .await
             .map_err(|e| e.to_string())?;

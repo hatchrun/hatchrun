@@ -817,8 +817,7 @@ impl<'a> Cx<'a> {
             Work::StartRun => {
                 store::run_started(db, info.run_id, self.now).await?;
                 self.chain(info.run_attempt, &["requested", "in_progress"], None)
-                    .await;
-                Ok(())
+                    .await
             }
             Work::QueueLaunch { job, attempt } => {
                 self.register_concurrency(db, info, *job, *attempt).await?;
@@ -875,15 +874,13 @@ impl<'a> Cx<'a> {
                 .await?;
                 concurrency::release(&self.env, db, info.run_id, None).await?;
                 self.chain(*attempt, &["completed"], Some(conclusion_word(*conclusion)))
-                    .await;
-                Ok(())
+                    .await
             }
             Work::ResetJob { job, attempt } => store::reset_job(db, *job, *attempt, self.now).await,
             Work::ReopenRun { attempt } => {
                 store::reopen_run_at(db, info.run_id, *attempt, self.now).await?;
                 self.chain(*attempt, &["requested", "in_progress"], None)
-                    .await;
-                Ok(())
+                    .await
             }
         }
     }
@@ -894,18 +891,19 @@ impl<'a> Cx<'a> {
     /// calls never delay the side effects that follow in the todo list.
     /// The record is kept apart from the todo items, so a failure to
     /// send never holds them up either.
-    async fn chain(&self, attempt: u32, actions: &[&str], conclusion: Option<&str>) {
+    ///
+    /// # Errors
+    ///
+    /// Storage failed. The todo item then stays and is done again, so
+    /// the record is not lost.
+    async fn chain(&self, attempt: u32, actions: &[&str], conclusion: Option<&str>) -> Result<()> {
         let now = self.now;
-        let recorded = self
-            .update(|run| {
-                for action in actions {
-                    run.todo_mut().push_chain(attempt, action, conclusion, now);
-                }
-            })
-            .await;
-        if let Err(err) = recorded {
-            worker::console_error!("workflow_run: not recorded: {err}");
-        }
+        self.update(|run| {
+            for action in actions {
+                run.todo_mut().push_chain(attempt, action, conclusion, now);
+            }
+        })
+        .await
     }
 
     /// Sends each recorded `workflow_run` change that is due, the
