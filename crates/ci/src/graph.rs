@@ -708,7 +708,12 @@ impl Graph {
             Ok(false) if self.cancelled => self.end(at, Conclusion::Cancelled, None, actions),
             Ok(false) => self.end(at, Conclusion::Skipped, None, actions),
             Err(e) => {
-                self.end(at, Conclusion::Failure, Some(if_error(&e)), actions);
+                let (conclusion, note) = self.forgive(at, Conclusion::Failure, github_ctx);
+                let message = match note {
+                    Some(note) => format!("{} {note}", if_error(&e)),
+                    None => if_error(&e),
+                };
+                self.end(at, conclusion, Some(message), actions);
                 self.fail_fast(at, actions);
             }
         }
@@ -1521,6 +1526,35 @@ jobs:
         assert_eq!(asked_to_stop(&actions), Vec::<u64>::new());
         g.finished(2, ok(), &ctx());
         assert_eq!(g.conclusion(), Some(Conclusion::Success));
+    }
+
+    #[test]
+    fn a_forgiven_if_error_does_not_trigger_fail_fast() {
+        let mut plan = compile(
+            &parse(&format!(
+                "{STRATEGY_JOBS}workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ maybe: {{ matrix: {{ experimental: [true, false] }} }} }}] }} }}\n"
+            ))
+            .unwrap(),
+            "ci",
+            "refs/heads/main",
+        )
+        .unwrap();
+        // The compiler rejects a bad `if:`; set it by hand on the
+        // experimental leg to reach the evaluation error.
+        plan.jobs[0].if_ = Some("github.ref ==".into());
+        let mut g = Graph::new(
+            plan.jobs
+                .into_iter()
+                .enumerate()
+                .map(|(i, j)| (i as u64 + 1, j))
+                .collect(),
+        );
+        let actions = g.advance(&ctx());
+        assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Success));
+        let message = g.node(1).unwrap().message.clone().unwrap();
+        assert!(message.starts_with("if: ") && message.contains("continue-on-error"));
+        assert_eq!(cancelled(&actions), Vec::<u64>::new());
+        assert_eq!(g.node(2).unwrap().state, State::Queued);
     }
 
     #[test]
