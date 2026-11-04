@@ -317,19 +317,36 @@ pub async fn handle(req: Request, env: &Env) -> Result<Response> {
             return error("unavailable", 503);
         }
     };
-    let Some(job) = store::job(&db, request.job).await? else {
-        return error("unauthorized", 401);
+    // A query that fails is retried by the toolkit on a 503 and not on
+    // a 500.
+    let job = match store::job(&db, request.job).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return error("unauthorized", 401),
+        Err(err) => {
+            console_error!("oidc: job: {err}");
+            return error("unavailable", 503);
+        }
     };
     match answer(&job, &request) {
         Answer::Go => {}
         Answer::Refused => return error("unauthorized", 401),
         Answer::Forbidden => return error("id-token: write is not granted", 403),
     }
-    let Some(run) = store::run(&db, job.run_id).await? else {
-        return error("unauthorized", 401);
+    let run = match store::run(&db, job.run_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return error("unauthorized", 401),
+        Err(err) => {
+            console_error!("oidc: run: {err}");
+            return error("unavailable", 503);
+        }
     };
-    let Some(repo) = store::repo(&db, run.repo_id).await? else {
-        return error("unauthorized", 401);
+    let repo = match store::repo(&db, run.repo_id).await {
+        Ok(Some(repo)) => repo,
+        Ok(None) => return error("unauthorized", 401),
+        Err(err) => {
+            console_error!("oidc: repo: {err}");
+            return error("unavailable", 503);
+        }
     };
     if !crate::agent::consistent(&job, &run, &repo) {
         return error("unauthorized", 401);

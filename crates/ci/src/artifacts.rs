@@ -21,6 +21,7 @@
 
 use std::cell::RefCell;
 
+use futures_util::StreamExt;
 use hatchrun_cloud::aws::{self, Credentials, s3};
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::send;
@@ -34,7 +35,7 @@ use hatchrun_workflow::artifacts::{
 use serde::Deserialize;
 use worker::{Env, Method, Request, Response, Result, console_error, console_warn};
 
-use crate::agent::running_attempt;
+use crate::agent::{Capped, running_attempt, too_large};
 use crate::env::Settings;
 use crate::launcher::TENANT;
 use crate::logs::is_tier;
@@ -249,10 +250,24 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
 }
 
 async fn body<T: for<'de> Deserialize<'de>>(req: &mut Request) -> std::result::Result<T, Refusal> {
-    let bytes = req.bytes().await?;
-    if bytes.len() > 1 << 20 {
+    let declared = req
+        .headers()
+        .get("Content-Length")
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<usize>().ok());
+    if declared.is_some_and(too_large) {
         return Err(Refusal::new(413, "body too large"));
     }
+    // Stop reading at the cap: the isolate never holds more than that.
+    let mut stream = req.stream()?;
+    let mut capped = Capped::default();
+    while let Some(chunk) = stream.next().await {
+        if !capped.push(&chunk?) {
+            return Err(Refusal::new(413, "body too large"));
+        }
+    }
+    let bytes = capped.into_bytes();
     serde_json::from_slice(&bytes).map_err(|err| Refusal::new(400, format!("bad request: {err}")))
 }
 
