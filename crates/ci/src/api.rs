@@ -1581,7 +1581,7 @@ workflows:
     fn row(id: u64, status: &str, steps: &Value) -> JobRow {
         serde_json::from_value(json!({
             "id": id, "run_id": 7, "plan_id": "t", "name": "t", "status": status,
-            "conclusion": null, "instance_id": null, "attempt": 1, "launch_attempts": 0,
+            "conclusion": null, "instance_id": null, "attempt": 1, "launch_attempts": 0, "capacity_attempts": 0, "capacity_since": null,
             "next_launch_at": null, "timeout_minutes": 10, "updated_at": 0,
             "heartbeat_at": null, "started_at": null, "completed_at": null,
             "steps": steps.to_string(), "log_key": null, "template": "ubuntu-latest",
