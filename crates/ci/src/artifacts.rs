@@ -34,11 +34,15 @@ use hatchrun_workflow::artifacts::{
 use serde::Deserialize;
 use worker::{Env, Method, Request, Response, Result, console_error, console_warn};
 
+use crate::agent::running_attempt;
 use crate::env::Settings;
 use crate::launcher::TENANT;
 use crate::logs::is_tier;
 use crate::store::{self, ArtifactRow, Finalized, JobRow, RunRow};
 use crate::token::Claims;
+
+/// What a call from a job that is no longer running is told.
+const JOB_ENDED: &str = "the job is not running";
 
 /// How long a presigned URL holds, in seconds.
 const URL_SECS: u64 = 600;
@@ -82,14 +86,15 @@ type Answer = std::result::Result<Response, Refusal>;
 
 /// Whether `job` may call the service with `claims`: the token is for
 /// this job, run and attempt, and the job is running.
+///
+/// A job that is not running at the token's attempt gets `410`, which
+/// the agent tells apart from the `409` of a name that is taken.
 pub(crate) fn check_job(row: &JobRow, claims: &Claims) -> std::result::Result<(), Refusal> {
-    if claims.job != row.id || claims.run != row.run_id {
-        return Err(Refusal::new(401, "unauthorized"));
+    if running_attempt(row, claims) {
+        Ok(())
+    } else {
+        Err(Refusal::new(410, JOB_ENDED))
     }
-    if u32::try_from(claims.attempt) != Ok(row.attempt) || row.status != "running" {
-        return Err(Refusal::new(409, "the job is not running"));
-    }
-    Ok(())
 }
 
 /// The S3 key of an artifact of run `run` in the tier of `days`, named
@@ -219,11 +224,11 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
     let db = Db::connect(env).await?;
     let job = store::job(&db, claims.job)
         .await?
-        .ok_or_else(|| Refusal::new(409, "no such job"))?;
+        .ok_or_else(|| Refusal::new(410, JOB_ENDED))?;
     check_job(&job, &claims)?;
     let run = store::run(&db, job.run_id)
         .await?
-        .ok_or_else(|| Refusal::new(409, "no such run"))?;
+        .ok_or_else(|| Refusal::new(410, JOB_ENDED))?;
     let ctx = Context {
         settings,
         db,
@@ -385,6 +390,7 @@ async fn complete(ctx: &Context<'_>, id: &str, request: serde_json::Value) -> An
     )
     .await?;
     s3::completed(&response).map_err(aws_failure("CompleteMultipartUpload"))?;
+    let replaced = store::replaced_artifact(&ctx.db, row.id, ctx.run.id).await?;
     let done = store::finalize_artifact(
         &ctx.db,
         row.id,
@@ -395,7 +401,17 @@ async fn complete(ctx: &Context<'_>, id: &str, request: serde_json::Value) -> An
     )
     .await?;
     match done {
-        Finalized::Done => json(&serde_json::json!({ "id": row.id }), 200),
+        Finalized::Done => {
+            // The row of the earlier attempt's artifact went with the
+            // finalize; its object goes now, as in `delete`.
+            if let Some(old) = replaced {
+                let url = object_url(ctx, &old.object_key);
+                if let Err(err) = signed(ctx, &credentials, s3::delete_object(&url)).await {
+                    console_warn!("artifacts: delete replaced {}: {}", old.id, err.message);
+                }
+            }
+            json(&serde_json::json!({ "id": row.id }), 200)
+        }
         Finalized::Refused => {
             // Another artifact took the name first. The object is of no
             // use; the lifecycle rule would remove it, this does it now.
@@ -584,21 +600,14 @@ mod tests {
     fn only_the_running_attempt_of_the_job_may_call() {
         let running = job("running", 2);
         assert_eq!(check_job(&running, &claims(5, 9, 2)), Ok(()));
-        assert_eq!(
-            check_job(&running, &claims(6, 9, 2)).unwrap_err().status,
-            401
-        );
-        assert_eq!(
-            check_job(&running, &claims(5, 8, 2)).unwrap_err().status,
-            401
-        );
-        assert_eq!(
-            check_job(&running, &claims(5, 9, 1)).unwrap_err().status,
-            409
-        );
+        // Every refusal is a 410, never the 409 of a taken name.
+        for stale in [claims(6, 9, 2), claims(5, 8, 2), claims(5, 9, 1)] {
+            let err = check_job(&running, &stale).unwrap_err();
+            assert_eq!((err.status, err.message.as_str()), (410, JOB_ENDED));
+        }
         for status in ["launched", "completed", "queued"] {
             let row = job(status, 2);
-            assert_eq!(check_job(&row, &claims(5, 9, 2)).unwrap_err().status, 409);
+            assert_eq!(check_job(&row, &claims(5, 9, 2)).unwrap_err().status, 410);
         }
     }
 

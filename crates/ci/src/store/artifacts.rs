@@ -63,8 +63,18 @@ const LIST: &str = "SELECT {columns} FROM ci_artifacts \
      AND ($2::text IS NULL OR name = $2::text) \
      AND ($3::bigint IS NULL OR id = $3::bigint) ORDER BY id";
 
-/// How many artifacts and uploads run `$1` has.
-const COUNT: &str = "SELECT count(*) AS n FROM ci_artifacts WHERE run_id = $1";
+/// How many finalized artifacts run `$1` has. Uploads that are not
+/// finalized do not count: a client that never finishes them is bounded
+/// by the retention sweep, and they would otherwise eat the limit.
+const COUNT: &str =
+    "SELECT count(*) AS n FROM ci_artifacts WHERE run_id = $1 AND finalized_at IS NOT NULL";
+
+/// The artifact that [`REPLACE`] deletes for upload `$1` of run `$2`.
+const REPLACED: &str = "SELECT {columns} FROM ci_artifacts AS old \
+     WHERE old.run_id = $2 AND old.finalized_at IS NOT NULL AND old.id <> $1 \
+     AND EXISTS (SELECT 1 FROM ci_artifacts AS new WHERE new.id = $1 AND new.run_id = $2 \
+       AND new.finalized_at IS NULL AND old.name = new.name AND old.job_id = new.job_id \
+       AND old.attempt < new.attempt)";
 
 /// Removes the artifact an earlier attempt of the same job uploaded
 /// under the name of upload `$1` in run `$2`, so this attempt's artifact
@@ -174,7 +184,7 @@ pub async fn artifacts(
     .await
 }
 
-/// How many artifacts and unfinished uploads `run_id` has.
+/// How many finalized artifacts `run_id` has.
 ///
 /// # Errors
 ///
@@ -182,6 +192,22 @@ pub async fn artifacts(
 pub async fn artifact_count(db: &Db, run_id: u64) -> Result<u64> {
     let count: Option<Count> = db.first(COUNT, &params![run_id]).await?;
     Ok(count.map_or(0, |count| count.n))
+}
+
+/// The finalized artifact upload `id` of `run_id` replaces when it is
+/// finalized: the same name from an earlier attempt of the same job.
+/// Read it before [`finalize_artifact`], which deletes its row, to
+/// delete its S3 object after.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn replaced_artifact(db: &Db, id: u64, run_id: u64) -> Result<Option<ArtifactRow>> {
+    db.first(
+        &with_columns(REPLACED, ARTIFACT_COLUMNS),
+        &params![id, run_id],
+    )
+    .await
 }
 
 /// Finalizes upload `id` of `run_id`. The artifact an earlier attempt of

@@ -185,7 +185,10 @@ fn a_superseded_row_whose_job_is_open_is_found_for_another_cancel() {
     assert_eq!((stuck[0].run_id, stuck[0].job_id), (b, Some(job_b)));
     // The holder leaves and c is promoted: b is still found.
     db.wait(leave(db.db(), a, Some(job_a))).unwrap();
-    assert_eq!(db.wait(unfinished_superseded(db.db(), 10)).unwrap().len(), 1);
+    assert_eq!(
+        db.wait(unfinished_superseded(db.db(), 10)).unwrap().len(),
+        1
+    );
     // Once the job ended it is not sent again.
     db.wait(set_job(db.db(), job_b, "completed", Some("cancelled"), 40))
         .unwrap();

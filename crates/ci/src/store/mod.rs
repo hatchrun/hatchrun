@@ -25,14 +25,15 @@ mod tenants;
 
 pub use self::artifacts::{
     ArtifactRow, Finalized, artifact_by_name, artifact_count, artifacts, delete_artifact,
-    drop_pending_artifact, finalize_artifact, pending_artifact, start_artifact,
+    drop_pending_artifact, finalize_artifact, pending_artifact, replaced_artifact, start_artifact,
 };
 pub use self::billing::{
     Standing, UnsentUsage, set_spend_cap, standing, tenant_standing, unsent_usage, usage_rejected,
     usage_sent,
 };
 pub use self::concurrency::{
-    Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, unfinished_superseded, victims, wake_targets,
+    Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, unfinished_superseded,
+    victims, wake_targets,
 };
 pub use self::environments::{
     EnvironmentRow, JobEnvironment, PutEnvironment, decide_approval, delete_environment,

@@ -57,9 +57,11 @@ fn an_upload_is_not_listed_until_it_is_finalized() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(db.wait(artifact_count(db.db(), run.id)).unwrap(), 1);
+    // The limit counts artifacts, not uploads still in flight.
+    assert_eq!(db.wait(artifact_count(db.db(), run.id)).unwrap(), 0);
 
     let done = upload(&db, run.id, job, 1, "dist", 12);
+    assert_eq!(db.wait(artifact_count(db.db(), run.id)).unwrap(), 1);
     let found = db.wait(artifacts(db.db(), run.id, None, None)).unwrap();
     assert_eq!(names(&found), ["dist"]);
     assert_eq!(found[0].id, done.id);
@@ -173,7 +175,23 @@ fn a_later_attempt_of_the_job_replaces_its_artifact() {
     let db = setup();
     let (run, job) = run_with_job(&db, "running");
     let first = upload(&db, run.id, job, 1, "dist", 1);
-    let second = upload(&db, run.id, job, 2, "dist", 2);
+    let retry = start(&db, run.id, job, 2, "dist");
+    // The row the retry replaces is known before it goes, to delete its
+    // object.
+    let replaced = db
+        .wait(replaced_artifact(db.db(), retry.id, run.id))
+        .unwrap()
+        .expect("the first attempt's artifact");
+    assert_eq!(
+        (replaced.id, replaced.object_key),
+        (first.id, first.object_key.clone())
+    );
+    assert_eq!(
+        db.wait(finalize_artifact(db.db(), retry.id, run.id, 2, None, 60))
+            .unwrap(),
+        Finalized::Done
+    );
+    let second = retry;
     let found = db.wait(artifacts(db.db(), run.id, None, None)).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!((found[0].id, found[0].size), (second.id, Some(2)));
