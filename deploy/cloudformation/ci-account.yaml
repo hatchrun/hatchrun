@@ -7,7 +7,7 @@ Description: >-
   The hatchrun-owned AWS account that runs hatchrun CI jobs, one EC2
   instance per job. Deploy it once in us-east-1. hatchrun-ci takes the
   RoleArn output as its CI_ROLE_ARN secret and the ArtifactsBucket output
-  as its ARTIFACTS_BUCKET secret, and finds the launch template by name
+  as ARTIFACTS_BUCKET in crates/ci/wrangler.toml, and finds the launch template by name
   and the subnets by their hatchrun:tenant tag.
 
 Resources:
@@ -389,5 +389,5 @@ Outputs:
     Description: The CI_ROLE_ARN secret of hatchrun-ci
     Value: !GetAtt LauncherRole.Arn
   ArtifactsBucket:
-    Description: The ARTIFACTS_BUCKET secret of hatchrun-ci
+    Description: The ARTIFACTS_BUCKET variable of hatchrun-ci
     Value: !Ref ArtifactsBucket

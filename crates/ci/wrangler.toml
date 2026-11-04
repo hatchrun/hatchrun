@@ -104,10 +104,7 @@ secret_name = "ci-secrets-key-2026-10"
 # deploy-ci.yml, and CI_ROLE_ARN, set once on the Worker by hand: the
 # RoleArn output of deploy/cloudformation/ci-account.yaml, the role
 # the Worker assumes in the CI AWS account. The Worker finds the
-# launch template and subnets there by name and tag. ARTIFACTS_BUCKET is
-# set by hand the same way: the ArtifactsBucket output of that stack, the
-# S3 bucket of artifacts (the agent gets the artifact service only once
-# it is set).
+# launch template and subnets there by name and tag.
 # Variables: those below.
 [vars]
 # production, staging or dev. The local launcher backend is refused in
@@ -133,6 +130,11 @@ OIDC_KEY_ID = "2026-10-14"
 CI_OIDC_KEY_ID = "2026-11-03"
 # The region of the CI AWS account, where jobs run.
 CI_REGION = "us-east-1"
+# The S3 bucket of job artifacts: the ArtifactsBucket output of
+# deploy/cloudformation/ci-account.yaml. A bucket name is an id, not a
+# secret, and is committed here like the other ids in this file. The
+# agent gets the artifact service only once it is set.
+ARTIFACTS_BUCKET = ""
 # POLAR_API_URL is left unset, so the usage events go to
 # https://api.polar.sh, the same Polar as hatchrun-cloud.
 # The id of the key behind CI_SECRETS_KEY, stored with every sealed
