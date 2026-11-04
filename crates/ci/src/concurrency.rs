@@ -13,7 +13,7 @@
 //! run and wakes its held jobs.
 //!
 //! The cancel path is the run object's: a whole run through
-//! `POST /cancel`, one job through `POST /cancel?job=ID&attempt=N`, both
+//! `POST /cancel?attempt=N`, one job through `POST /cancel?job=ID&attempt=N`, both
 //! with a message that the check run shows.
 
 use std::collections::BTreeMap;
@@ -165,10 +165,14 @@ pub async fn gate(
             continue;
         }
         let slot = if slot.state == "new" {
-            match store::enter(db, &slot).await.map_err(db_err)? {
-                Some(entered) => entered,
-                None => continue,
-            }
+            let Some(entered) = store::enter(db, &slot).await.map_err(db_err)? else {
+                continue;
+            };
+            // Entering sweeps the rows of ended holders and may promote
+            // a waiting row that `release` never saw. Wake what that row
+            // holds; this job's own turn is the one running.
+            wake_promoted(env, db, &entered, job_id).await;
+            entered
         } else {
             slot
         };
@@ -190,6 +194,19 @@ pub async fn gate(
         }
     }
     Ok(Gate::Pass)
+}
+
+/// Wakes the held jobs of the group of `slot`, other than `job_id`.
+async fn wake_promoted(env: &Env, db: &Db, slot: &Slot, job_id: u64) {
+    match store::wake_targets(db, slot.repo_id, &slot.group_key).await {
+        Ok(woken) => {
+            let woken: Vec<_> = woken.into_iter().filter(|w| w.job_id != job_id).collect();
+            if let Err(err) = send_wakes(env, &woken).await {
+                console_error!("group {}: wake the promoted: {err}", slot.group_name);
+            }
+        }
+        Err(err) => console_error!("group {}: find the promoted: {err}", slot.group_name),
+    }
 }
 
 /// Cancels the rows of the group of `slot` that a newer arrival
@@ -229,9 +246,12 @@ async fn post_cancel(env: &Env, victim: &Victim) -> Result<(), String> {
         "https://run/cancel?run={}&tenant={}&days={}",
         victim.run_id, victim.tenant_id, victim.retention_days
     );
+    // The attempt of the job, or of the run when no job is named, so a
+    // cancel queued before a rerun cannot end the new attempt.
     if let Some(job) = victim.job_id {
-        let _ = write!(url, "&job={job}&attempt={}", victim.attempt);
+        let _ = write!(url, "&job={job}");
     }
+    let _ = write!(url, "&attempt={}", victim.attempt);
     let request = worker::Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
     let response = run_stub(env, victim.run_id)
         .map_err(|e| e.to_string())?

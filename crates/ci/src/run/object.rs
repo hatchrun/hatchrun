@@ -864,6 +864,26 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// Gives the graph the variables of the run's scope when the job
+    /// that ends has a `continue-on-error` to evaluate.
+    async fn load_vars(&self, run: &mut Loaded, job: u64) -> Result<()> {
+        if run
+            .graph
+            .node(job)
+            .is_some_and(|n| n.job.continue_on_error.is_some())
+        {
+            let vars = store::job_vars(
+                self.db().await?,
+                &run.info.tenant_id,
+                run.info.repo.id,
+                None,
+            )
+            .await?;
+            run.graph.set_vars(vars);
+        }
+        Ok(())
+    }
+
     /// Records the concurrency groups of the job about to be queued, for
     /// the launch consumer to put in line. Nothing is recorded for a
     /// job of another attempt, or when neither the workflow nor the job
@@ -1152,6 +1172,7 @@ impl<'a> Cx<'a> {
             apply_result(&mut state, &result);
             self.put_job(job, &state).await?;
             let ctx = self.github_ctx(&run.info).await?;
+            self.load_vars(&mut run, job).await?;
             let actions = run.graph_mut().finished(job, result, &ctx);
             let revoke = self.apply_actions(&mut run, actions).await?;
             self.commit(&mut run).await?;
@@ -1173,6 +1194,7 @@ impl<'a> Cx<'a> {
                 Gate::Stale | Gate::Ended => return answer(409),
             }
             let ctx = self.github_ctx(&run.info).await?;
+            self.load_vars(&mut run, job).await?;
             let actions = run.graph_mut().failed(job, message, &ctx);
             let revoke = self.apply_actions(&mut run, actions).await?;
             self.commit(&mut run).await?;
@@ -1217,6 +1239,10 @@ impl<'a> Cx<'a> {
             let Some(mut run) = self.loaded().await? else {
                 return answer(204);
             };
+            if job.is_none() && attempt.is_some_and(|a| a != run.info.run_attempt) {
+                // Queued for an earlier attempt, before a rerun.
+                return answer(409);
+            }
             let ctx = self.github_ctx(&run.info).await?;
             let actions = match (job, &body.message) {
                 (Some(job), message) => {

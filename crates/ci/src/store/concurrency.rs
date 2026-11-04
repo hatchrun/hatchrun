@@ -265,7 +265,8 @@ pub async fn victims(db: &Db, repo_id: u64, group_key: &str) -> Result<Vec<Victi
 
 /// The superseded rows, of any group, whose run or job has not ended:
 /// the cancel that [`victims`] promised did not get through. At most
-/// `limit`, the oldest first.
+/// `limit`, in random order, so rows whose cancel keeps failing do not
+/// starve the others.
 ///
 /// # Errors
 ///
@@ -279,7 +280,7 @@ pub async fn unfinished_superseded(db: &Db, limit: u32) -> Result<Vec<Victim>> {
          WHERE c.state = 'superseded' AND r.status <> 'completed' \
            AND ((c.job_id IS NULL AND r.run_attempt = c.attempt) \
              OR (c.job_id IS NOT NULL AND j.status <> 'completed' AND j.attempt = c.attempt)) \
-         ORDER BY c.id LIMIT $1",
+         ORDER BY random() LIMIT $1",
         &params![limit],
     )
     .await

@@ -854,6 +854,10 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
     if !ended {
         return Ok(());
     }
+    // The job is over, so its place in a concurrency group is free.
+    concurrency::release(env, db, row.run_id, Some(row.id))
+        .await
+        .map_err(|e| e.to_string())?;
     let Some(run) = store::run(db, row.run_id)
         .await
         .map_err(|e| e.to_string())?
@@ -867,6 +871,9 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
         .map_err(|e| e.to_string())?;
     if jobs.iter().all(|job| job.status == "completed") {
         store::finish_run(db, run.id, run.run_attempt, "failure", now)
+            .await
+            .map_err(|e| e.to_string())?;
+        concurrency::release(env, db, run.id, None)
             .await
             .map_err(|e| e.to_string())?;
     }

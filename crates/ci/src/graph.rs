@@ -37,6 +37,10 @@ pub struct Graph {
     pub cancelled: bool,
     /// `RunDone` was emitted and no rerun has reset it.
     run_done: bool,
+    /// The repository and organization variables `continue-on-error`
+    /// reads. Not stored; [`Graph::set_vars`] fills it before a job ends.
+    #[serde(skip)]
+    vars: BTreeMap<String, String>,
 }
 
 /// One job of a run.
@@ -134,7 +138,14 @@ impl Graph {
                 .collect(),
             cancelled: false,
             run_done: false,
+            vars: BTreeMap::new(),
         }
+    }
+
+    /// Gives the graph the variables the `continue-on-error` of a job
+    /// that ends reads as `vars.NAME`.
+    pub fn set_vars(&mut self, vars: BTreeMap<String, String>) {
+        self.vars = vars;
     }
 
     /// Starts every waiting job whose requirements ended, ends the ones
@@ -588,7 +599,7 @@ impl Graph {
             "needs": self.needs_at(at),
             "matrix": node.job.matrix,
             "strategy": node.job.strategy_context(),
-            "vars": {},
+            "vars": self.vars,
             "inputs": inputs,
         })
     }
@@ -696,7 +707,10 @@ impl Graph {
             }
             Ok(false) if self.cancelled => self.end(at, Conclusion::Cancelled, None, actions),
             Ok(false) => self.end(at, Conclusion::Skipped, None, actions),
-            Err(e) => self.end(at, Conclusion::Failure, Some(if_error(&e)), actions),
+            Err(e) => {
+                self.end(at, Conclusion::Failure, Some(if_error(&e)), actions);
+                self.fail_fast(at, actions);
+            }
         }
     }
 
@@ -1302,6 +1316,7 @@ jobs:
   m: { runs-on: ubuntu-latest, steps: [] }
   soft: { runs-on: ubuntu-latest, steps: [], continue-on-error: true }
   maybe: { runs-on: ubuntu-latest, steps: [], continue-on-error: '${{ matrix.experimental }}' }
+  varsoft: { runs-on: ubuntu-latest, steps: [], continue-on-error: '${{ vars.SOFT }}' }
   first: { runs-on: ubuntu-latest, steps: [], if: strategy.job-index == 0 }
   after: { runs-on: ubuntu-latest, steps: [] }
 ";
@@ -1481,6 +1496,19 @@ jobs:
         assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Failure));
         assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Success));
         assert_eq!(g.conclusion(), Some(Conclusion::Failure));
+    }
+
+    #[test]
+    fn continue_on_error_reads_the_variables_the_graph_was_given() {
+        let mut g = strategy_graph("[varsoft]");
+        g.advance(&ctx());
+        g.set_vars(BTreeMap::from([("SOFT".to_owned(), "true".to_owned())]));
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Success));
+        let mut g = strategy_graph("[varsoft]");
+        g.advance(&ctx());
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Failure));
     }
 
     #[test]
