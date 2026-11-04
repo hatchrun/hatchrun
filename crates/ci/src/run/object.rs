@@ -119,6 +119,16 @@ struct CancelBody {
     outright: bool,
 }
 
+/// The body of a `POST /cancel`: none is a plain cancel, anything else
+/// must parse.
+fn cancel_body(bytes: &[u8]) -> std::result::Result<CancelBody, serde_json::Error> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        Ok(CancelBody::default())
+    } else {
+        serde_json::from_slice(bytes)
+    }
+}
+
 /// What a handler works on: the pieces of state every handler reads,
 /// and which of them it changed.
 pub(super) struct Loaded {
@@ -351,8 +361,16 @@ impl<'a> Cx<'a> {
             }
             (Method::Post, "/purge") => return self.purge().await,
             (Method::Post, "/cancel") => {
-                let body = req.json::<CancelBody>().await.unwrap_or_default();
-                return self.cancel(job, attempt, body).await;
+                let bytes = req.bytes().await?;
+                return match cancel_body(&bytes) {
+                    Ok(body) => self.cancel(job, attempt, body).await,
+                    Err(err) => {
+                        // A plain cancel would run the `if: always()` jobs
+                        // of a run a group meant to end outright.
+                        worker::console_error!("cancel: bad body: {err}");
+                        Response::error("bad cancel", 400)
+                    }
+                };
             }
             (Method::Get, "/live" | "/log") => {
                 let Some(job) = job else {
@@ -1501,6 +1519,21 @@ impl<'a> Cx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancel_body_that_does_not_parse_is_refused_not_defaulted() {
+        let plain = cancel_body(b"").unwrap();
+        assert_eq!((plain.message, plain.outright), (None, false));
+        assert!(cancel_body(b" \n").is_ok());
+        let outright = cancel_body(br#"{"message":"m","outright":true}"#).unwrap();
+        assert_eq!(
+            (outright.message.as_deref(), outright.outright),
+            (Some("m"), true)
+        );
+        // A mangled body must not turn an outright cancel into a plain one.
+        assert!(cancel_body(br#"{"message":"m","outright":tru"#).is_err());
+        assert!(cancel_body(br#"{"outright":"yes"}"#).is_err());
+    }
 
     #[test]
     fn the_restore_key_is_built_from_the_run_and_tenant_of_the_request() {
