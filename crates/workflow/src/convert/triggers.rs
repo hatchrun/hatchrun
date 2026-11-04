@@ -7,9 +7,10 @@
 use super::calls::{scalar, show};
 use super::jobs::fit_default;
 use super::{
-    BTreeMap, Cx, Deserialize, Dispatch, EVENTS, GITHUB_ONLY, GhInput, GhRelease, GhWorkflowRun,
-    Level, Parameter, ParameterKind, Permissions, PullRequestTrigger, PushTrigger, RELEASE_TYPES,
-    ReleaseTrigger, SCOPES, Schedule, Triggers, Value, WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
+    BTreeMap, Cx, Deserialize, Dispatch, EVENTS, GITHUB_ONLY, GhInput, GhRef, GhRelease,
+    GhWorkflowRun, Level, Parameter, ParameterKind, Permissions, PullRequestTrigger, PushTrigger,
+    RELEASE_TYPES, RefTrigger, ReleaseTrigger, SCOPES, Schedule, Triggers, Value,
+    WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
 };
 
 impl Cx {
@@ -167,6 +168,14 @@ impl Cx {
                     let types = release.and_then(|r| r.types);
                     triggers.release = self.release(file, types.as_ref());
                 }
+                Err(err) => self.error(bad(err)),
+            },
+            "create" => match Option::<GhRef>::deserialize(body) {
+                Ok(_) => triggers.create = Some(RefTrigger {}),
+                Err(err) => self.error(bad(err)),
+            },
+            "delete" => match Option::<GhRef>::deserialize(body) {
+                Ok(_) => triggers.delete = Some(RefTrigger {}),
                 Err(err) => self.error(bad(err)),
             },
             _ => return false,
