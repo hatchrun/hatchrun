@@ -263,6 +263,28 @@ pub async fn victims(db: &Db, repo_id: u64, group_key: &str) -> Result<Vec<Victi
     .await
 }
 
+/// The superseded rows, of any group, whose run or job has not ended:
+/// the cancel that [`victims`] promised did not get through. At most
+/// `limit`, the oldest first.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn unfinished_superseded(db: &Db, limit: u32) -> Result<Vec<Victim>> {
+    db.all(
+        "SELECT c.run_id, c.job_id, c.attempt, c.state, c.group_name, r.tenant_id, \
+           (r.expires_at - r.created_at) / 86400000 AS retention_days \
+         FROM ci_concurrency c JOIN ci_runs r ON r.id = c.run_id \
+         LEFT JOIN ci_jobs j ON j.id = c.job_id \
+         WHERE c.state = 'superseded' AND r.status <> 'completed' \
+           AND ((c.job_id IS NULL AND r.run_attempt = c.attempt) \
+             OR (c.job_id IS NOT NULL AND j.status <> 'completed' AND j.attempt = c.attempt)) \
+         ORDER BY c.id LIMIT $1",
+        &params![limit],
+    )
+    .await
+}
+
 /// Who runs in a group.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Blocker {

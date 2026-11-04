@@ -227,7 +227,7 @@ async fn enforce(env: &Env, db: &Db, slot: &Slot) {
 /// Asks the object of the victim's run to cancel the run, or one job of
 /// it, with the reason. A run that never started (`superseded`) ends
 /// whatever its jobs' `if:`.
-async fn post_cancel(env: &Env, victim: &Victim) -> Result<(), String> {
+pub async fn post_cancel(env: &Env, victim: &Victim) -> Result<(), String> {
     let body = json!({
         "message": cancel_message(victim),
         "outright": victim.state == "superseded",
@@ -252,6 +252,38 @@ async fn post_cancel(env: &Env, victim: &Victim) -> Result<(), String> {
         200..=299 | 404 | 409 => Ok(()),
         other => Err(format!("the run's object answered {other}")),
     }
+}
+
+/// Sends the cancel again for superseded rows whose run or job is
+/// still open, which happens when the first cancel failed and the one
+/// that waited was promoted before anything looked at the group again.
+/// Takes `budget` for each call and stops when it is spent. Returns how
+/// many cancels it sent.
+///
+/// # Errors
+///
+/// Postgres refused the query; nothing was sent.
+pub async fn resend_cancels(
+    env: &Env,
+    db: &Db,
+    limit: u32,
+    mut take: impl FnMut() -> bool,
+) -> worker::Result<usize> {
+    let mut sent = 0;
+    for victim in store::unfinished_superseded(db, limit).await? {
+        if !take() {
+            break;
+        }
+        sent += 1;
+        if let Err(err) = post_cancel(env, &victim).await {
+            console_error!(
+                "group {}: cancel run {} again: {err}",
+                victim.group_name,
+                victim.run_id
+            );
+        }
+    }
+    Ok(sent)
 }
 
 /// A run (`job_id` is `None`) or a job ended: gives up its place in its

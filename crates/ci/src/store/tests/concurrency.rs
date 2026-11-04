@@ -169,3 +169,25 @@ fn a_group_that_failed_to_evaluate_is_recorded_as_invalid() {
     let fixed = note(&db, a, None, "ok", false);
     assert_eq!(fixed.state, "new");
 }
+
+#[test]
+fn a_superseded_row_whose_job_is_open_is_found_for_another_cancel() {
+    let db = setup();
+    let (a, job_a) = queued(&db, "a");
+    let (b, job_b) = queued(&db, "b");
+    let (c, job_c) = queued(&db, "c");
+    enter_it(&db, &note(&db, a, Some(job_a), "g", false));
+    enter_it(&db, &note(&db, b, Some(job_b), "g", false));
+    enter_it(&db, &note(&db, c, Some(job_c), "g", false));
+    // b was superseded by c; its cancel is lost.
+    let stuck = db.wait(unfinished_superseded(db.db(), 10)).unwrap();
+    assert_eq!(stuck.len(), 1);
+    assert_eq!((stuck[0].run_id, stuck[0].job_id), (b, Some(job_b)));
+    // The holder leaves and c is promoted: b is still found.
+    db.wait(leave(db.db(), a, Some(job_a))).unwrap();
+    assert_eq!(db.wait(unfinished_superseded(db.db(), 10)).unwrap().len(), 1);
+    // Once the job ended it is not sent again.
+    db.wait(set_job(db.db(), job_b, "completed", Some("cancelled"), 40))
+        .unwrap();
+    assert_eq!(db.wait(unfinished_superseded(db.db(), 10)).unwrap(), []);
+}

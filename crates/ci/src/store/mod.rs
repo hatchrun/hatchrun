@@ -32,7 +32,7 @@ pub use self::billing::{
     usage_sent,
 };
 pub use self::concurrency::{
-    Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, victims, wake_targets,
+    Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, unfinished_superseded, victims, wake_targets,
 };
 pub use self::environments::{
     EnvironmentRow, JobEnvironment, PutEnvironment, decide_approval, delete_environment,

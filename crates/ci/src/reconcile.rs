@@ -9,7 +9,7 @@
 //! 1. fires the `on: schedule` workflows of the minutes since the last
 //!    pass;
 //! 2. sends the launches that stalled again, and fails the ones that
-//!    never finished;
+//!    never finished, and sends the cancel of a superseded run again;
 //! 3. fails the jobs whose runner went quiet;
 //! 4. terminates instances that no job needs;
 //! 5. keeps the warm pool of each runner template at the size the last
@@ -52,6 +52,7 @@ use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, Template, UtcMinute};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
+use crate::concurrency;
 use crate::env::{Settings, run_stub};
 use crate::github;
 use crate::intake::Repo;
@@ -82,6 +83,9 @@ const HELD_EVERY_MINUTES: u64 = 15;
 /// The backstop leaves a held job alone for this long after its last
 /// hold.
 pub const HELD_QUIET_MS: u64 = 10 * 60_000;
+/// The most cancels of superseded runs and jobs one pass sends again,
+/// apart from [`BUDGET`].
+pub const MAX_RECANCELS: u32 = 10;
 /// The most instances one pass terminates as orphans.
 pub const MAX_TERMINATIONS: usize = 50;
 
@@ -463,6 +467,12 @@ pub async fn run(env: Env) {
         && let Err(err) = wake_held(&env, &db, &Budget::new(HELD_BUDGET), now).await
     {
         console_error!("reconcile: held jobs: {err}");
+    }
+    let cancels = Budget::new(MAX_RECANCELS);
+    if let Err(err) =
+        concurrency::resend_cancels(&env, &db, MAX_RECANCELS, || cancels.take(1)).await
+    {
+        console_error!("reconcile: superseded runs: {err}");
     }
     if let Ok(backend) = &backend
         && let Err(err) = end_orphans(&db, backend, &Budget::new(share.orphans), now).await
