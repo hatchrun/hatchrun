@@ -121,6 +121,12 @@ jobs:
           CI_TOKEN_KEY: ${{ secrets.CI_TOKEN_KEY }}
           POLAR_ACCESS_TOKEN: ${{ secrets.POLAR_ACCESS_TOKEN }}
         run: |
+          # The Worker refuses every request without the job OIDC key, so
+          # a deploy without it would take CI down rather than skip OIDC.
+          if [ -z "$CI_OIDC_SIGNING_KEY" ]; then
+            echo "::error::CI_OIDC_SIGNING_KEY is not set in the production environment"
+            exit 1
+          fi
           secrets="$RUNNER_TEMP/worker-secrets.json"
           trap 'rm -f "$secrets"' EXIT
           (umask 077 && jq -n 'env | with_entries(select(
