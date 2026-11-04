@@ -25,13 +25,16 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::cache::PATH as CACHE_PATH;
 use futures_util::StreamExt;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::send;
 use hatchrun_cloud::start::app_jwt;
 use hatchrun_workflow::agent::{CLAIM_PATH, EVENTS_PATH, RESULT_PATH};
 use hatchrun_workflow::artifacts::PATH as ARTIFACTS_PATH;
-use hatchrun_workflow::{ArtifactService, ID_TOKEN_SCOPE, IdTokenRequest, JobDocument, SecretRefs};
+use hatchrun_workflow::{
+    ArtifactService, CacheService, ID_TOKEN_SCOPE, IdTokenRequest, JobDocument, SecretRefs,
+};
 use serde_json::json;
 use worker::{
     Delay, Env, Method, Request, RequestInit, Response, Result, console_error, console_log,
@@ -231,7 +234,9 @@ fn text(message: &str, code: u16) -> Result<Response> {
 pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
     let path = req.path();
     let artifacts = path == ARTIFACTS_PATH || path.starts_with(&format!("{ARTIFACTS_PATH}/"));
+    let cache = path == CACHE_PATH || path.starts_with(&format!("{CACHE_PATH}/"));
     if !artifacts
+        && !cache
         && (req.method() != Method::Post
             || ![CLAIM_PATH, EVENTS_PATH, RESULT_PATH].contains(&&*path))
     {
@@ -250,6 +255,9 @@ pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
     };
     if artifacts {
         return crate::artifacts::handle(req, env, &settings, claims).await;
+    }
+    if cache {
+        return crate::cache::handle(req, env, &settings, claims).await;
     }
     let body = if path == CLAIM_PATH {
         Vec::new()
@@ -390,6 +398,7 @@ async fn claim(
     document.id_token =
         id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
     document.artifacts = artifact_service(settings, job_token);
+    document.cache = cache_service(settings, job_token);
     Response::from_json(&document)
 }
 
@@ -436,6 +445,19 @@ pub(crate) fn artifact_service(settings: &Settings, job_token: &str) -> Option<A
     }
     Some(ArtifactService {
         url: format!("{}{ARTIFACTS_PATH}", settings.ci_url),
+        token: job_token.to_owned(),
+    })
+}
+
+/// The cache service a job gets: this Worker, with the job's own token.
+/// `None` while the artifacts bucket, which holds the entries, is not
+/// set up.
+pub(crate) fn cache_service(settings: &Settings, job_token: &str) -> Option<CacheService> {
+    if settings.artifacts_bucket.is_empty() || job_token.is_empty() {
+        return None;
+    }
+    Some(CacheService {
+        url: format!("{}{CACHE_PATH}", settings.ci_url),
         token: job_token.to_owned(),
     })
 }
@@ -726,6 +748,15 @@ mod tests {
         assert_eq!(service.token, "v1.a.b");
         assert!(artifact_service(&settings(""), "v1.a.b").is_none());
         assert!(artifact_service(&settings("bucket"), "").is_none());
+    }
+
+    #[test]
+    fn the_cache_service_is_this_worker_with_the_job_token() {
+        let service = cache_service(&settings("bucket"), "v1.a.b").unwrap();
+        assert_eq!(service.url, "https://ci.example/v1/agent/cache");
+        assert_eq!(service.token, "v1.a.b");
+        assert!(cache_service(&settings(""), "v1.a.b").is_none());
+        assert!(cache_service(&settings("bucket"), "").is_none());
     }
     use super::*;
 

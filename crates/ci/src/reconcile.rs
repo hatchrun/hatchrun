@@ -14,7 +14,8 @@
 //! 4. terminates instances that no job needs;
 //! 5. keeps the warm pool of each runner template at the size the last
 //!    hour's claims ask for ([`crate::pool`]);
-//! 6. deletes expired runs and purges their objects;
+//! 6. deletes expired runs and purges their objects, and deletes the
+//!    cache entries nobody restored for 7 days;
 //! 7. sends metered usage to Polar;
 //! 8. re-seals secrets that an old key still seals.
 //!
@@ -52,6 +53,7 @@ use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, Template, UtcMinute};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
+use crate::cache;
 use crate::concurrency;
 use crate::env::{Settings, run_stub};
 use crate::github;
@@ -486,6 +488,11 @@ pub async fn run(env: Env) {
     }
     if let Err(err) = retain(&env, &db, &Budget::new(share.retention), now).await {
         console_error!("reconcile: retention: {err}");
+    }
+    // Part of retention, with a budget of its own in the headroom below
+    // the Worker's limit: it must not wait behind a backlog of runs.
+    if let Err(err) = evict_cache(&settings, &db, &Budget::new(cache::EVICT_COST), now).await {
+        console_error!("reconcile: cache eviction: {err}");
     }
     if let Err(err) = report_usage(&db, &settings, &Budget::new(share.usage), now).await {
         console_error!("reconcile: usage: {err}");
@@ -1202,6 +1209,23 @@ async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), Str
     store::delete_runs(db, &ids(purged))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Step 6, for the job cache: deletes the entries nobody restored for
+/// [`cache::IDLE_DAYS`] days. A pass evicts at most [`cache::EVICT_LIMIT`]
+/// entries, which `budget` covers.
+async fn evict_cache(
+    settings: &Settings,
+    db: &Db,
+    budget: &Budget,
+    now: u64,
+) -> Result<(), String> {
+    if budget.left() < cache::EVICT_COST {
+        return Ok(());
+    }
+    let evicted = cache::evict(settings, db, now).await?;
+    budget.take(u32::try_from(evicted).unwrap_or(cache::EVICT_LIMIT) + 1);
+    Ok(())
 }
 
 /// Of one ingest call to Polar.

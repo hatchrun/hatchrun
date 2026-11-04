@@ -215,6 +215,14 @@ and the minute reconciler. The orchestrator follows the same patterns.
   `artifacts/<days>d/<tenant>/<repo id>/<run id>/`, readable only by
   jobs of the same run, earlier attempts included. Artifacts download
   through presigned URLs.
+  The cache of `actions/cache` is served through the same agent proxy
+  and keeps one object per entry under `cache/<tenant>/<repo id>/` in
+  the same bucket, with its rows in `ci_cache_entries`. An entry
+  belongs to the ref of the run that saved it. A run restores from its
+  own ref, then the default branch, and saves to its own ref, so a pull
+  request cannot put an entry where `main` restores it. A key matches
+  exactly, then restore keys by prefix, newest first. The reconciler
+  deletes entries not restored for 7 days.
 - **GitHub gets the summary.** Each job's check run carries its status,
   a summary, the tail of a failed step and a link to the full log in
   the app. `::error file=...` lines become check run annotations.

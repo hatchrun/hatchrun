@@ -19,6 +19,8 @@
 //!   document and JWKS on `token.ci.hatchrun.io`.
 //! - `/v1/agent/artifacts/*` is the artifact service behind
 //!   `actions/upload-artifact` and `download-artifact` (see [`artifacts`]).
+//! - `/v1/agent/cache/*` is the cache service behind `actions/cache`, with
+//!   its entries in the same bucket (see [`cache`]).
 //! - `/api/ci/*` serves runs, jobs and logs to the app and takes its
 //!   dispatch and cancel requests; `hatchrun-cloud` forwards them.
 //!
@@ -31,6 +33,7 @@ pub mod agent;
 pub mod api;
 pub mod artifacts;
 pub mod billing;
+pub mod cache;
 pub mod checks;
 pub mod concurrency;
 pub mod env;

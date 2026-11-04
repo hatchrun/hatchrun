@@ -133,7 +133,8 @@ CI_REGION = "us-east-1"
 # The S3 bucket of job artifacts: the ArtifactsBucket output of
 # deploy/cloudformation/ci-account.yaml. A bucket name is an id, not a
 # secret, and is committed here like the other ids in this file. The
-# agent gets the artifact service only once it is set.
+# agent gets the artifact service and the job cache, which keeps its
+# entries under cache/, only once it is set.
 ARTIFACTS_BUCKET = "hatchrun-ci-artifactsbucket-flrtihmpyo4z"
 # POLAR_API_URL is left unset, so the usage events go to
 # https://api.polar.sh, the same Polar as hatchrun-cloud.

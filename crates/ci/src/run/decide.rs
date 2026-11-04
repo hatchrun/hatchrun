@@ -144,6 +144,9 @@ pub(crate) fn job_document(
         secrets: std::collections::BTreeMap::new(),
         vars: std::collections::BTreeMap::new(),
         timings: std::collections::BTreeMap::new(),
+        // The services hold the job's token, which the run object never
+        // sees: the Worker sets them on the way out (see
+        // `crate::agent`).
         cache: None,
         id_token: None,
         artifacts: None,

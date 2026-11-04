@@ -98,6 +98,12 @@ Resources:
   # tenants. hatchrun-ci is the only reader and writer; runners get
   # presigned URLs for single objects. The rules delete by tier prefix,
   # and drop uploads that never finished.
+  #
+  # The job cache lives here too, at cache/<tenant>/<repository id>/<random>.
+  # It has no expiry rule: S3 cannot expire by last use, and an object
+  # that goes before its row would make the entry hit and then fail to
+  # download. hatchrun-ci's reconciler deletes entries not restored for
+  # 7 days, object and row.
   ArtifactsBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
@@ -324,6 +330,25 @@ Resources:
                   - s3:DeleteObject
                   - s3:AbortMultipartUpload
                 Resource: !Sub "${ArtifactsBucket.Arn}/artifacts/*"
+              # The job cache: the same calls on cache/ objects, and the
+              # reconciler's deletes of evicted entries.
+              - Sid: CacheObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub "${ArtifactsBucket.Arn}/cache/*"
+              # Completing a cache upload reads the size of its object
+              # from a listing of its key.
+              - Sid: CacheList
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ArtifactsBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: "cache/*"
               # Ending a job's instance, turning its metadata off, and
               # starting a pool instance a job took.
               - Sid: ManageOwnInstances

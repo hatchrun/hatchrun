@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 mod artifacts;
+mod cache;
 mod concurrency;
 mod jobs;
 mod reconciler;
