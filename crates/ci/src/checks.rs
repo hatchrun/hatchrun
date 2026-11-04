@@ -33,7 +33,7 @@ pub const MAX_OUTPUT_CHARS: usize = 65_535;
 const TRUNCATED: &str = "\n\n(truncated)";
 
 /// The last lines of a failed job shown in the check run.
-pub const TAIL_LINES: usize = 50;
+pub const TAIL_LINES: usize = 100;
 
 const EXTERNAL_ID_PREFIX: &str = "hatchrun-ci:";
 
@@ -270,13 +270,7 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
     let text = view
         .failed_tail
         .filter(|tail| !tail.is_empty())
-        .map(|tail| {
-            let body = tail.join("\n");
-            let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-            let fence = "`".repeat(longest.max(2) + 1);
-            let room = MAX_OUTPUT_CHARS - 2 * fence.len() - 2;
-            format!("{fence}\n{}\n{fence}", truncate(&body, room))
-        });
+        .map(tail_text);
 
     let run = CheckRun {
         name: check_name(view.workflow, &view.node.job.id),
@@ -297,13 +291,26 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
     (run, sent + fresh_len)
 }
 
+/// The log lines of a failed job as a fenced `text` block under a
+/// "last N lines" note, cut from the end to fit GitHub's limit.
+fn tail_text(tail: &[String]) -> String {
+    let body = tail.join("\n");
+    let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    let note = format!("Last {} lines of the failed step:\n\n", tail.len());
+    let room = MAX_OUTPUT_CHARS - note.len() - 2 * (fence.len() + 4) - 2;
+    format!("{note}{fence}text\n{}\n{fence}", truncate(&body, room))
+}
+
 /// The jobs whose check run is behind, when each may be tried again
 /// after a failed send, and when GitHub lets us send at all again.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outbox {
     /// Marked jobs and the generation of their latest mark.
     marked: BTreeMap<u64, u64>,
-    /// When a marked job whose send failed may be tried again.
+    /// When a marked job whose send failed may be tried again. Absent
+    /// in state stored before the field existed.
+    #[serde(default)]
     retry_at_ms: BTreeMap<u64, u64>,
     counter: u64,
     /// Set only by GitHub's rate limit; it holds back every job.
@@ -604,7 +611,10 @@ mod tests {
         v.failed_tail = Some(&tail);
         let out = render(&v).0.output.unwrap();
         assert!(out.summary.starts_with("Step 2 failed."));
-        assert_eq!(out.text.as_deref(), Some("```\nerror: boom\nexit 1\n```"));
+        assert_eq!(
+            out.text.as_deref(),
+            Some("Last 2 lines of the failed step:\n\n```text\nerror: boom\nexit 1\n```")
+        );
     }
 
     #[test]
@@ -739,7 +749,7 @@ mod tests {
         v.failed_tail = Some(&tail);
         let text = render(&v).0.output.unwrap().text.unwrap();
         assert!(text.chars().count() <= MAX_OUTPUT_CHARS);
-        assert!(text.starts_with("``````\n"));
+        assert!(text.starts_with("Last 2 lines of the failed step:\n\n``````text\n"));
         assert!(text.ends_with("(truncated)\n``````"));
     }
 
@@ -750,7 +760,10 @@ mod tests {
         let mut v = view(&n, &[], &[]);
         v.failed_tail = Some(&tail);
         let text = render(&v).0.output.unwrap().text.unwrap();
-        assert_eq!(text, "````\n```\nafter\n````");
+        assert_eq!(
+            text,
+            "Last 2 lines of the failed step:\n\n````text\n```\nafter\n````"
+        );
     }
 
     #[test]
@@ -883,6 +896,14 @@ mod tests {
         o.throttled(0, 100);
         assert_eq!(o.due(50_000), Vec::<u64>::new());
         assert_eq!(o.next_alarm(0), Some(100_000));
+    }
+
+    #[test]
+    fn outbox_stored_before_per_job_retries_still_loads() {
+        let old = r#"{"marked":{"3":2},"counter":2,"blocked_until_ms":7,"attempts":1}"#;
+        let o: Outbox = serde_json::from_str(old).unwrap();
+        assert_eq!(o.generation(3), Some(2));
+        assert_eq!(o.due(7), vec![3]);
     }
 
     #[test]
