@@ -217,7 +217,7 @@ async fn enforce(env: &Env, db: &Db, slot: &Slot) {
 /// Asks the object of the victim's run to cancel the run, or one job of
 /// it, with the reason. A run that never started (`superseded`) ends
 /// whatever its jobs' `if:`.
-pub async fn post_cancel(env: &Env, victim: &Victim) -> Result<(), String> {
+async fn post_cancel(env: &Env, victim: &Victim) -> Result<(), String> {
     let body = json!({
         "message": cancel_message(victim),
         "outright": victim.state == "superseded",
