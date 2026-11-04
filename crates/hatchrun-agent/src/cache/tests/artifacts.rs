@@ -145,6 +145,51 @@ async fn a_taken_name_is_already_exists() {
 }
 
 #[tokio::test]
+async fn a_job_that_ended_is_not_a_taken_name() {
+    let server = control_plane().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/artifacts/uploads"))
+        .respond_with(ResponseTemplate::new(410).set_body_json(json!({
+            "error": "the job is not running"
+        })))
+        .mount(&server)
+        .await;
+    let proxy = artifact_proxy(&server).await;
+    let (status, body) = artifact_rpc(&proxy, "CreateArtifact", json!({ "name": "dist" })).await;
+    assert_eq!(status, 412, "{body}");
+    assert_eq!(body["code"], "failed_precondition");
+}
+
+#[tokio::test]
+async fn creating_a_name_again_aborts_the_earlier_upload() {
+    let server = control_plane().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/artifacts/uploads"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "uploadId": "7" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/artifacts/uploads"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "uploadId": "8" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/agent/artifacts/uploads/7"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let proxy = artifact_proxy(&server).await;
+    for _ in 0..2 {
+        let (status, body) =
+            artifact_rpc(&proxy, "CreateArtifact", json!({ "name": "dist" })).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    // The mock server checks the single DELETE when it drops.
+}
+
+#[tokio::test]
 async fn a_lost_name_race_finalizes_not_ok() {
     let server = control_plane().await;
     Mock::given(method("POST"))

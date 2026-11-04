@@ -253,12 +253,28 @@ impl Cloud {
     }
 }
 
+/// The control plane answered `410`: the job is not running at the
+/// token's attempt any more.
+#[derive(Debug)]
+pub(super) struct JobEnded;
+
+impl std::fmt::Display for JobEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the job is not running")
+    }
+}
+
+impl std::error::Error for JobEnded {}
+
 /// The response when it succeeded, else an error with its status and
 /// the start of its body.
 pub(super) async fn answer(response: reqwest::Response, what: &str) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
+    }
+    if status == StatusCode::GONE {
+        return Err(JobEnded.into());
     }
     let body = response.text().await.unwrap_or_default();
     let body: String = body.chars().take(300).collect();
