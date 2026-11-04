@@ -109,7 +109,7 @@ jobs:
           case $((${#payload} % 4)) in 2) payload="$payload==";; 3) payload="$payload=";; esac
           printf '%s' "$payload" | base64 -d | tr ',' '\n'
           echo
-          echo "parts=$(printf '%s' "$jwt" | tr '.' '\n' | wc -l)"
+          echo "parts=$(printf '%s\n' "$jwt" | tr '.' '\n' | wc -l)"
   plain:
     runs-on: ubuntu-latest
     steps:
