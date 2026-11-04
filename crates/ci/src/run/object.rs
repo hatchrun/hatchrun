@@ -887,7 +887,11 @@ impl<'a> Cx<'a> {
         }
         let ctx = self.github_ctx(info).await?;
         let vars = store::job_vars(db, &info.tenant_id, info.repo.id, None).await?;
-        for slot in concurrency::claims(info, node, graph.needs(job), &ctx, &vars, self.now) {
+        let workflow_ctx = concurrency::context(&ctx, &vars);
+        let Some(job_ctx) = graph.job_context(job, &ctx, &vars) else {
+            return Ok(());
+        };
+        for slot in concurrency::claims(info, node, &workflow_ctx, &job_ctx, self.now) {
             store::register(db, &slot).await?;
         }
         Ok(())

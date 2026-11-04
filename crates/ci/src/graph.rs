@@ -555,6 +555,24 @@ impl Graph {
         job_condition(node.job.if_.as_deref(), &ctx, &Status(status))
     }
 
+    /// The context of job `job`'s own expressions, as the graph builds it
+    /// (`needs`, `matrix`, `strategy`, `inputs`), with the repository
+    /// and organization variables `vars` it was not given. `None` for a
+    /// job the graph does not hold.
+    #[must_use]
+    pub fn job_context(
+        &self,
+        job: u64,
+        github_ctx: &Value,
+        vars: &BTreeMap<String, String>,
+    ) -> Option<Value> {
+        let mut ctx = self.context(self.position(job)?, github_ctx);
+        if let Some(map) = ctx.as_object_mut() {
+            map.insert("vars".to_owned(), json!(vars));
+        }
+        Some(ctx)
+    }
+
     /// The contexts the control plane gives an expression of the job at
     /// `at`: what it knows without a runner.
     fn context(&self, at: usize, github_ctx: &Value) -> Value {

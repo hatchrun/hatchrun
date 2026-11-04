@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use hatchrun_cloud::db::Db;
-use hatchrun_workflow::{Need, hatchrun_context};
+use hatchrun_workflow::hatchrun_context;
 use serde_json::{Value, json};
 use worker::{Env, Method, RequestInit, console_error};
 
@@ -33,65 +33,55 @@ use crate::store::{self, NewSlot, Slot, Victim};
 /// The word `ci_jobs.held` stores for a job that waits for a group.
 pub const HOLD: &str = "group";
 
-/// The context a group is evaluated against: what the workflow level
-/// reads (`github`, `inputs`, `vars`) and, for a job, its matrix entry
-/// and the jobs it needs.
+/// The context a workflow's group is evaluated against: what the
+/// workflow level reads (`github`, `inputs`, `vars`).
 #[must_use]
-pub fn context(
-    github_ctx: &Value,
-    vars: &BTreeMap<String, String>,
-    job: Option<(&Node, BTreeMap<String, Need>)>,
-) -> Value {
+pub fn context(github_ctx: &Value, vars: &BTreeMap<String, String>) -> Value {
     let inputs = github_ctx
         .get("event")
         .and_then(|event| event.get("inputs"))
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let mut ctx = json!({
+    json!({
         "hatchrun": hatchrun_context(github_ctx),
         "github": github_ctx,
         "vars": vars,
         "inputs": inputs,
-    });
-    if let (Some((node, needs)), Some(map)) = (job, ctx.as_object_mut()) {
-        map.insert("matrix".to_owned(), json!(node.job.matrix));
-        map.insert("needs".to_owned(), json!(needs));
-    }
-    ctx
+    })
 }
 
 /// What to record for the queued job `node` of the run: its workflow's
-/// group and its own, each evaluated or, when the evaluation failed,
-/// the reason.
+/// group, evaluated against `workflow_ctx` ([`context`]), and its own,
+/// evaluated against `job_ctx` ([`crate::graph::Graph::job_context`]),
+/// each evaluated or, when the evaluation failed, the reason.
 #[must_use]
 pub fn claims(
     info: &RunInfo,
     node: &Node,
-    needs: BTreeMap<String, Need>,
-    github_ctx: &Value,
-    vars: &BTreeMap<String, String>,
+    workflow_ctx: &Value,
+    job_ctx: &Value,
     now: u64,
 ) -> Vec<NewSlot> {
     let mut out = Vec::new();
     if let Some(c) = &info.concurrency {
-        let ctx = context(github_ctx, vars, None);
         out.push(NewSlot {
             repo_id: info.repo.id,
             run_id: info.run_id,
             job_id: None,
             attempt: info.run_attempt,
-            group: c.resolve(&ctx).map(|r| (r.group, r.cancel_in_progress)),
+            group: c
+                .resolve(workflow_ctx)
+                .map(|r| (r.group, r.cancel_in_progress)),
             now,
         });
     }
     if let Some(c) = &node.job.concurrency {
-        let ctx = context(github_ctx, vars, Some((node, needs)));
         out.push(NewSlot {
             repo_id: info.repo.id,
             run_id: info.run_id,
             job_id: Some(node.id),
             attempt: node.attempt,
-            group: c.resolve(&ctx).map(|r| (r.group, r.cancel_in_progress)),
+            group: c.resolve(job_ctx).map(|r| (r.group, r.cancel_in_progress)),
             now,
         });
     }
@@ -343,12 +333,22 @@ mod tests {
         }
     }
 
-    fn node_of(yaml: &str) -> (Node, Option<Concurrency>) {
+    fn node_of(yaml: &str) -> (Graph, Option<Concurrency>) {
         let config = parse(yaml).unwrap_or_else(|e| panic!("{e:?}"));
         let plan = compile(&config, "ci", "refs/heads/main").unwrap_or_else(|e| panic!("{e:?}"));
         let workflow = plan.concurrency.clone();
         let graph = Graph::new(plan.jobs.into_iter().map(|j| (7, j)).collect());
-        (graph.jobs[0].clone(), workflow)
+        (graph, workflow)
+    }
+
+    fn slots_of(
+        run: &RunInfo,
+        graph: &Graph,
+        gh: &Value,
+        vars: &BTreeMap<String, String>,
+    ) -> Vec<NewSlot> {
+        let job_ctx = graph.job_context(7, gh, vars).expect("job 7");
+        claims(run, &graph.jobs[0], &context(gh, vars), &job_ctx, 5)
     }
 
     const WORKFLOW: &str = "
@@ -369,7 +369,7 @@ workflows:
 
     #[test]
     fn both_levels_are_evaluated_with_their_own_contexts() {
-        let (node, workflow) = node_of(WORKFLOW);
+        let (graph, workflow) = node_of(WORKFLOW);
         let mut run = info();
         run.concurrency = workflow;
         let gh = json!({
@@ -378,7 +378,7 @@ workflows:
             "event": { "inputs": { "target": "eu" } },
         });
         let vars = BTreeMap::from([("REGION".to_owned(), "eu-1".to_owned())]);
-        let slots = claims(&run, &node, BTreeMap::new(), &gh, &vars, 5);
+        let slots = slots_of(&run, &graph, &gh, &vars);
         assert_eq!(slots.len(), 2);
         assert_eq!(slots[0].job_id, None);
         assert_eq!(slots[0].group, Ok(("ci-eu".to_owned(), true)));
@@ -387,21 +387,33 @@ workflows:
     }
 
     #[test]
+    fn a_job_group_can_read_the_strategy_context() {
+        let yaml = "
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency: { group: 'lane-${{ strategy.job-index }}-of-${{ strategy.job-total }}' }
+    steps: []
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - deploy: { matrix: { env: [a, b] } }
+";
+        let (graph, _) = node_of(yaml);
+        let slots = slots_of(&info(), &graph, &json!({}), &BTreeMap::new());
+        assert_eq!(slots[0].group, Ok(("lane-0-of-2".to_owned(), false)));
+    }
+
+    #[test]
     fn a_group_that_cannot_be_evaluated_says_why() {
-        let (node, _) = node_of(WORKFLOW);
+        let (graph, _) = node_of(WORKFLOW);
         let mut run = info();
         run.concurrency = Some(Concurrency {
             group: "${{ github.nope.deeper }}-${{ fromJSON('x') }}".into(),
             cancel_in_progress: Cancel::No,
         });
-        let slots = claims(
-            &run,
-            &node,
-            BTreeMap::new(),
-            &json!({}),
-            &BTreeMap::new(),
-            5,
-        );
+        let slots = slots_of(&run, &graph, &json!({}), &BTreeMap::new());
         let why = slots[0].group.clone().unwrap_err();
         assert!(why.contains("concurrency group"), "{why}");
     }
