@@ -515,10 +515,7 @@ impl Job<'_> {
     /// A step that does not run because the job was stopped for good.
     fn skip(&mut self, index: usize, step: &PlannedStep, sink: &mut dyn Sink) -> StepSummary {
         let name = match step {
-            PlannedStep::Run(run) => run
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("Run {}", run.run.lines().next().unwrap_or_default())),
+            PlannedStep::Run(run) => run.name.clone().unwrap_or_else(|| self.run_name(&run.run)),
             PlannedStep::Uses(uses) => uses
                 .name
                 .clone()
@@ -607,6 +604,16 @@ impl Job<'_> {
         condition(if_, &self.ctx.without_secrets(), &rt)
     }
 
+    /// The name of a `run` step without one: `Run` and the first line
+    /// of the script with its expressions evaluated, as GitHub shows
+    /// it. A script that does not evaluate keeps its raw text; the step
+    /// reports the error itself.
+    fn run_name(&self, script: &str) -> String {
+        let script = interp(script, &self.ctx, &self.layout.workspace, self.status)
+            .unwrap_or_else(|_| script.to_owned());
+        format!("Run {}", script.lines().next().unwrap_or_default())
+    }
+
     async fn run_step(
         &mut self,
         index: usize,
@@ -620,7 +627,7 @@ impl Job<'_> {
                 name_error = Some(format!("name: {err}"));
                 name.clone()
             }),
-            None => format!("Run {}", step.run.lines().next().unwrap_or_default()),
+            None => self.run_name(&step.run),
         };
         let common = Common {
             name,
