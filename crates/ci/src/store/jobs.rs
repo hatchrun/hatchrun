@@ -187,9 +187,11 @@ const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL
 
 /// Whether queued job `$1` is over its group's limit now, and the limit:
 /// the same test as [`CLAIM_LAUNCH`], for telling a held group from a
-/// full tenant.
+/// full tenant. Run in the claim's transaction, after it and under the
+/// same tenant lock, so the answer is about the state the claim saw.
 const GROUP_FULL: &str = "SELECT ci_jobs.max_parallel AS max_parallel FROM ci_jobs \
-     WHERE ci_jobs.id = $1 AND ci_jobs.max_parallel IS NOT NULL \
+     WHERE ci_jobs.id = $1 AND ci_jobs.status = 'queued' \
+     AND ci_jobs.max_parallel IS NOT NULL \
      AND ((SELECT count(*) FROM ci_jobs sibling \
            WHERE sibling.run_id = ci_jobs.run_id \
            AND sibling.strategy_group = ci_jobs.strategy_group \
@@ -489,11 +491,17 @@ pub async fn claim_launch(
         max_parallel: u32,
     }
     let lock = params![tenant_id];
-    let claimed: Option<JobRow> = db
-        .first_locked(
+    // The reason a claim fails is decided in the claim's transaction,
+    // under the tenant lock: a group count read after the lock was
+    // released could show a full group when the tenant cap was the cause.
+    let (claimed, full): (Option<JobRow>, Option<Full>) = db
+        .first_locked_then(
             (LOCK_TENANT, &lock),
-            &with_columns(CLAIM_LAUNCH, JOB_COLUMNS),
-            &params![job_id, now, tenant_id, max_running, groups],
+            (
+                &with_columns(CLAIM_LAUNCH, JOB_COLUMNS),
+                &params![job_id, now, tenant_id, max_running, groups],
+            ),
+            (GROUP_FULL, &params![job_id]),
         )
         .await?;
     if let Some(job) = claimed {
@@ -505,7 +513,7 @@ pub async fn claim_launch(
     if row.status != "queued" {
         return Ok(Claim::Gone);
     }
-    if groups && let Some(full) = db.first::<Full>(GROUP_FULL, &params![job_id]).await? {
+    if groups && let Some(full) = full {
         return Ok(Claim::Capped {
             max_parallel: full.max_parallel,
         });

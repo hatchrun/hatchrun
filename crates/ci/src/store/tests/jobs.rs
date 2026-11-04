@@ -1106,6 +1106,30 @@ fn max_parallel_counts_each_matrix_alone() {
 }
 
 #[test]
+fn a_full_tenant_is_busy_even_for_a_matrix_with_room() {
+    let db = setup();
+    let running: Vec<u64> = (0..5)
+        .map(|n| run_with_job_named(&db, &format!("busy{n}"), "running").1)
+        .collect();
+    let ids = matrix_run(&db, "roomy", 2, Some(3));
+    // The tenant cap, not the matrix, is what holds the job.
+    assert_eq!(claim_group(&db, ids[0], true, 10), Claim::Busy);
+    // With a place free in the tenant, the same job goes.
+    db.wait(set_job(
+        db.db(),
+        running[0],
+        "completed",
+        Some("success"),
+        11,
+    ))
+    .unwrap();
+    assert!(matches!(
+        claim_group(&db, ids[0], true, 12),
+        Claim::Claimed(_)
+    ));
+}
+
+#[test]
 fn a_matrix_without_a_limit_only_meets_the_tenant_cap() {
     let db = setup();
     let ids = matrix_run(&db, "free", 3, None);

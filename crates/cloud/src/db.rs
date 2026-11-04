@@ -343,6 +343,29 @@ impl Db {
             .transpose()
     }
 
+    /// Like [`Db::first_locked`], with a second query that reads in the
+    /// same transaction, after the first and still under the lock.
+    /// Returns the first row of each.
+    ///
+    /// # Errors
+    ///
+    /// As [`Db::all`]; the transaction rolls back.
+    pub async fn first_locked_then<T: DeserializeOwned, U: DeserializeOwned>(
+        &self,
+        lock: (&str, &[Param]),
+        first: (&str, &[Param]),
+        then: (&str, &[Param]),
+    ) -> worker::Result<(Option<T>, Option<U>)> {
+        let statements = [lock, first, then];
+        let mut results = self.transaction(&statements).await?;
+        let second = results.pop().and_then(|rows| rows.into_iter().next());
+        let first_row = results.pop().and_then(|rows| rows.into_iter().next());
+        Ok((
+            first_row.map(|row| decode(row, first.0)).transpose()?,
+            second.map(|row| decode(row, then.0)).transpose()?,
+        ))
+    }
+
     /// Runs statements in one transaction: one failing rolls them all
     /// back. Returns the rows each statement changed.
     ///
