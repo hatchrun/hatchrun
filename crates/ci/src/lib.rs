@@ -34,6 +34,7 @@ pub mod api;
 pub mod artifacts;
 pub mod billing;
 pub mod cache;
+pub mod chain;
 pub mod checks;
 pub mod concurrency;
 pub mod env;

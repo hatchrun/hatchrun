@@ -45,7 +45,10 @@ const CI: &str = "CI";
 
 /// Whether `hatchrun-ci` handles deliveries of `event`.
 fn forwarded(event: &str) -> bool {
-    matches!(event, "push" | "pull_request" | "check_run" | "repository")
+    matches!(
+        event,
+        "push" | "pull_request" | "check_run" | "repository" | "release" | "create" | "delete"
+    )
 }
 
 /// Whether `hatchrun-ci` serves this request: a path of the CI API on
@@ -363,6 +366,9 @@ mod tests {
         assert!(forwarded("pull_request"));
         assert!(forwarded("check_run"));
         assert!(forwarded("repository"));
+        assert!(forwarded("release"));
+        assert!(forwarded("create"));
+        assert!(forwarded("delete"));
         assert!(!forwarded("workflow_job"));
         assert!(!forwarded("installation"));
         assert!(!forwarded(""));

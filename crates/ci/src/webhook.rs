@@ -2,20 +2,21 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `POST /github/webhook`: the `push`, `pull_request` and `check_run`
-//! deliveries that `hatchrun-cloud` forwards.
+//! `POST /github/webhook`: the `push`, `pull_request`, `check_run`,
+//! `release`, `create` and `delete` deliveries that `hatchrun-cloud`
+//! forwards.
 
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
 use hatchrun_cloud::webhook::verify;
 use hatchrun_workflow::{Event, MAX_CHANGED};
-use serde_json::json;
+use serde_json::{Value, json};
 use worker::{Env, Method, Request, RequestInit, Response, Result};
 
 use crate::env::{Settings, run_stub};
 use crate::github;
-use crate::intake::{self, PullRequest, Push, Rerequested, Trigger};
+use crate::intake::{self, PullRequest, Push, RefChange, Release, Repo, Rerequested, Trigger};
 use crate::planning;
 use crate::runs::{self, Config};
 use crate::store::{self, RepoRow, TenantRow};
@@ -126,6 +127,8 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         Trigger::Ignored(reason) => return reply(&Outcome::Ignored(reason.clone())),
         Trigger::Push(p) => (p.installation_id, &p.repo),
         Trigger::PullRequest(p) => (p.installation_id, &p.repo),
+        Trigger::Release(r) => (r.installation_id, &r.repo),
+        Trigger::Create(c) | Trigger::Delete(c) => (c.installation_id, &c.repo),
         Trigger::Rerequested(r) => (r.installation_id, &r.repo),
         Trigger::Repository(r) => (r.installation_id, &r.repo),
     };
@@ -177,6 +180,9 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
     let outcome = match &trigger {
         Trigger::Push(push) => cx.push(push).await?,
         Trigger::PullRequest(pr) => cx.pull_request(pr).await?,
+        Trigger::Release(release) => cx.release(release).await?,
+        Trigger::Create(change) => cx.create(change).await?,
+        Trigger::Delete(change) => cx.delete(change).await?,
         Trigger::Rerequested(rerun) => cx.rerun(rerun).await?,
         // The row was updated above, with the tenant's other repository
         // writes; nothing runs.
@@ -187,6 +193,18 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         store::record_delivery(&db, guid, kind, now).await?;
     }
     reply(&outcome)
+}
+
+/// A delivery that starts workflows on a commit it does not name itself.
+struct Fired<'a> {
+    installation_id: u64,
+    repo: &'a Repo,
+    event_name: &'a str,
+    payload: &'a Value,
+    trigger: &'a Event,
+    git_ref: &'a str,
+    sha: &'a str,
+    actor: &'a str,
 }
 
 struct Cx<'a> {
@@ -327,6 +345,146 @@ impl Cx<'_> {
         )
         .await?;
         Ok(Outcome::Done(ids))
+    }
+
+    /// A release runs on its tag's commit. GitHub's payload names only
+    /// the tag, so the commit is read. A tag that is gone (an
+    /// unpublished or deleted release) leaves the head of the default
+    /// branch.
+    async fn release(&self, release: &Release) -> Result<Outcome> {
+        let (id, name) = (release.installation_id, &release.repo.full_name);
+        let tag = format!("tags/{}", release.tag);
+        let sha = match self.commit(id, name, &tag).await? {
+            Some(sha) => sha,
+            None => match self.default_head(id, &release.repo).await? {
+                Some(sha) => sha,
+                None => return Ok(Outcome::Ignored("the repository has no commits".to_owned())),
+            },
+        };
+        let trigger = Event::Release {
+            action: release.action.clone(),
+            tag: release.tag.clone(),
+        };
+        let git_ref = format!("refs/tags/{}", release.tag);
+        self.fire(&Fired {
+            installation_id: id,
+            repo: &release.repo,
+            event_name: "release",
+            payload: &release.payload,
+            trigger: &trigger,
+            git_ref: &git_ref,
+            sha: &sha,
+            actor: &release.actor,
+        })
+        .await
+    }
+
+    /// A created branch or tag runs on its own commit.
+    async fn create(&self, change: &RefChange) -> Result<Outcome> {
+        let id = change.installation_id;
+        let name = change.r#ref.trim_start_matches("refs/");
+        let Some(sha) = self.commit(id, &change.repo.full_name, name).await? else {
+            return Ok(Outcome::Ignored("the created ref is gone".to_owned()));
+        };
+        self.fire(&Fired {
+            installation_id: id,
+            repo: &change.repo,
+            event_name: "create",
+            payload: &change.payload,
+            trigger: &Event::Create,
+            git_ref: &change.r#ref,
+            sha: &sha,
+            actor: &change.actor,
+        })
+        .await
+    }
+
+    /// A deleted branch or tag has no commit, so as on GitHub the run is
+    /// on the head of the default branch.
+    async fn delete(&self, change: &RefChange) -> Result<Outcome> {
+        let id = change.installation_id;
+        let Some(sha) = self.default_head(id, &change.repo).await? else {
+            return Ok(Outcome::Ignored("the repository has no commits".to_owned()));
+        };
+        let git_ref = format!("refs/heads/{}", change.repo.default_branch);
+        self.fire(&Fired {
+            installation_id: id,
+            repo: &change.repo,
+            event_name: "delete",
+            payload: &change.payload,
+            trigger: &Event::Delete,
+            git_ref: &git_ref,
+            sha: &sha,
+            actor: &change.actor,
+        })
+        .await
+    }
+
+    /// Reads the config at `fired.sha` and starts the workflows that
+    /// `fired.trigger` matches, compiled for `fired.git_ref`.
+    async fn fire(&self, fired: &Fired<'_>) -> Result<Outcome> {
+        let config = runs::read_config(
+            self.tokens,
+            self.settings,
+            fired.installation_id,
+            &fired.repo.full_name,
+            fired.sha,
+        )
+        .await?;
+        let ids = runs::create(
+            self.env,
+            self.db,
+            self.settings,
+            self.tokens,
+            &runs::Request {
+                tenant_id: self.tenant,
+                installation_id: fired.installation_id,
+                repo: fired.repo,
+                delivery: self.delivery,
+                event_name: fired.event_name,
+                event: fired.payload,
+                trigger: fired.trigger,
+                compile_ref: fired.git_ref,
+                git_ref: fired.git_ref,
+                sha: fired.sha,
+                actor: fired.actor,
+                head_ref: "",
+                base_ref: "",
+                workflow: None,
+            },
+            &config,
+            self.now,
+        )
+        .await?;
+        Ok(Outcome::Done(ids))
+    }
+
+    /// The commit `reference` (`heads/main`, `tags/v1`) names, `None`
+    /// when GitHub has no such ref.
+    async fn commit(
+        &self,
+        installation_id: u64,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Option<String>> {
+        let response = self
+            .tokens
+            .send(installation_id, |token| {
+                github::commit_sha(&self.settings.github_api, repo, reference, token)
+            })
+            .await
+            .map_err(|err| fail(err.to_string()))?;
+        if matches!(response.status, 404 | 422) {
+            return Ok(None);
+        }
+        github::sha_of(&response).map(Some).map_err(fail)
+    }
+
+    /// The head of the repository's default branch.
+    async fn default_head(&self, installation_id: u64, repo: &Repo) -> Result<Option<String>> {
+        let reference = format!("heads/{}", repo.default_branch);
+        self.commit(installation_id, &repo.full_name, &reference)
+            .await
     }
 
     async fn rerun(&self, rerun: &Rerequested) -> Result<Outcome> {

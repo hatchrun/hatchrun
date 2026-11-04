@@ -23,6 +23,7 @@ use worker::{
     WebSocketIncomingMessage, durable_object,
 };
 
+use crate::chain::{self, Change};
 use crate::checks::{JobView, Outbox, conclusion_word, details_url, render};
 use crate::concurrency;
 use crate::env::Settings;
@@ -804,7 +805,24 @@ impl<'a> Cx<'a> {
     async fn perform(&self, info: &RunInfo, work: &Work) -> Result<()> {
         let db = self.db().await?;
         match work {
-            Work::StartRun => store::run_started(db, info.run_id, self.now).await,
+            Work::StartRun => {
+                store::run_started(db, info.run_id, self.now).await?;
+                self.workflow_run(
+                    info,
+                    &[
+                        Change {
+                            action: "requested",
+                            conclusion: None,
+                        },
+                        Change {
+                            action: "in_progress",
+                            conclusion: None,
+                        },
+                    ],
+                )
+                .await;
+                Ok(())
+            }
             Work::QueueLaunch { job, attempt } => {
                 self.register_concurrency(db, info, *job, *attempt).await?;
                 // A job that is launching or launched is not queued
@@ -858,12 +876,65 @@ impl<'a> Cx<'a> {
                     self.now,
                 )
                 .await?;
-                concurrency::release(&self.env, db, info.run_id, None).await
+                concurrency::release(&self.env, db, info.run_id, None).await?;
+                self.workflow_run(
+                    info,
+                    &[Change {
+                        action: "completed",
+                        conclusion: Some(conclusion_word(*conclusion)),
+                    }],
+                )
+                .await;
+                Ok(())
             }
             Work::ResetJob { job, attempt } => store::reset_job(db, *job, *attempt, self.now).await,
             Work::ReopenRun { attempt } => {
                 store::reopen_run_at(db, info.run_id, *attempt, self.now).await
             }
+        }
+    }
+
+    /// Starts the workflows that listen for `changes` of this run
+    /// (`on: workflow_run`). A failure is logged and does not hold up the
+    /// run's other side effects: the workflows that listen are not the
+    /// run's own business, and GitHub or Postgres being down for them
+    /// must not keep the run from finishing.
+    async fn workflow_run(&self, info: &RunInfo, changes: &[Change<'_>]) {
+        let started = async {
+            let db = self.db().await?;
+            let event = self.event().await?;
+            let settings = self.settings;
+            let tokens = Tokens::new(
+                Kv::new(&self.env),
+                App::new(
+                    settings.github_api.clone(),
+                    settings.app_id.clone(),
+                    settings.app_key.clone(),
+                ),
+                &self.github,
+                self.now,
+            );
+            chain::fire(
+                &chain::Services {
+                    env: &self.env,
+                    db,
+                    settings,
+                    tokens: &tokens,
+                    now: self.now,
+                },
+                info,
+                &event,
+                changes,
+            )
+            .await
+        }
+        .await;
+        match started {
+            Ok(ids) if !ids.is_empty() => {
+                worker::console_log!("run {}: workflow_run started runs {ids:?}", info.run_id);
+            }
+            Ok(_) => {}
+            Err(err) => worker::console_error!("run {}: workflow_run: {err}", info.run_id),
         }
     }
 

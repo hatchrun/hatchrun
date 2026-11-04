@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use hatchrun_workflow::RELEASE_TYPES;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -71,6 +72,38 @@ pub struct PullRequest {
     pub payload: Value,
 }
 
+/// Activity on a release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Release {
+    /// The App installation the delivery came through.
+    pub installation_id: u64,
+    /// The repository of the release.
+    pub repo: Repo,
+    /// The activity type, such as `published`.
+    pub action: String,
+    /// The release's tag, as a short name.
+    pub tag: String,
+    /// The login of the user behind the activity.
+    pub actor: String,
+    /// The delivery body.
+    pub payload: Value,
+}
+
+/// A branch or tag that was created or deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefChange {
+    /// The App installation the delivery came through.
+    pub installation_id: u64,
+    /// The repository.
+    pub repo: Repo,
+    /// The full ref, `refs/heads/<name>` or `refs/tags/<name>`.
+    pub r#ref: String,
+    /// The login of the user who made the change.
+    pub actor: String,
+    /// The delivery body.
+    pub payload: Value,
+}
+
 /// A request to run a job again, from the check run's button.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rerequested {
@@ -89,6 +122,12 @@ pub enum Trigger {
     Push(Push),
     /// A pull request from the same repository.
     PullRequest(PullRequest),
+    /// Activity on a release.
+    Release(Release),
+    /// A branch or tag was created.
+    Create(RefChange),
+    /// A branch or tag was deleted.
+    Delete(RefChange),
     /// A re-run of one job.
     Rerequested(Rerequested),
     /// A repository changed visibility, name, owner or default branch.
@@ -176,6 +215,27 @@ struct SideRepo {
 }
 
 #[derive(Deserialize)]
+struct ReleaseBody {
+    action: String,
+    release: ReleaseInfo,
+    sender: Sender,
+    repository: Repo,
+}
+
+#[derive(Deserialize)]
+struct ReleaseInfo {
+    tag_name: String,
+}
+
+#[derive(Deserialize)]
+struct RefBody {
+    r#ref: String,
+    ref_type: String,
+    sender: Sender,
+    repository: Repo,
+}
+
+#[derive(Deserialize)]
 struct RepositoryBody {
     action: String,
     repository: Repo,
@@ -198,6 +258,46 @@ fn ignored(reason: &str) -> Trigger {
     Trigger::Ignored(reason.to_owned())
 }
 
+fn release(installation_id: u64, payload: Value) -> Result<Trigger, serde_json::Error> {
+    let r = ReleaseBody::deserialize(&payload)?;
+    if !RELEASE_TYPES.contains(&r.action.as_str()) {
+        return Ok(ignored("release action is not used"));
+    }
+    Ok(Trigger::Release(Release {
+        installation_id,
+        repo: r.repository,
+        action: r.action,
+        tag: r.release.tag_name,
+        actor: r.sender.login,
+        payload,
+    }))
+}
+
+fn ref_change(
+    created: bool,
+    installation_id: u64,
+    payload: Value,
+) -> Result<Trigger, serde_json::Error> {
+    let r = RefBody::deserialize(&payload)?;
+    let prefix = match r.ref_type.as_str() {
+        "branch" => "refs/heads/",
+        "tag" => "refs/tags/",
+        _ => return Ok(ignored("not a branch or a tag")),
+    };
+    let change = RefChange {
+        installation_id,
+        repo: r.repository,
+        r#ref: format!("{prefix}{}", r.r#ref),
+        actor: r.sender.login,
+        payload,
+    };
+    Ok(if created {
+        Trigger::Create(change)
+    } else {
+        Trigger::Delete(change)
+    })
+}
+
 /// Reads one delivery. `event` is the `X-GitHub-Event` header and
 /// `body` the raw payload.
 ///
@@ -206,7 +306,10 @@ fn ignored(reason: &str) -> Trigger {
 /// Returns the JSON error when the body is not the payload GitHub sends
 /// for an event this crate uses.
 pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
-    if !matches!(event, "push" | "pull_request" | "check_run" | "repository") {
+    if !matches!(
+        event,
+        "push" | "pull_request" | "check_run" | "repository" | "release" | "create" | "delete"
+    ) {
         return Ok(Trigger::Ignored(format!("{event} events are not used")));
     }
     let payload: Value = serde_json::from_slice(body)?;
@@ -268,6 +371,8 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
                 payload,
             }))
         }
+        "release" => release(installation_id, payload),
+        "create" | "delete" => ref_change(event == "create", installation_id, payload),
         "repository" => {
             let r = RepositoryBody::deserialize(&payload)?;
             if !REPOSITORY_ACTIONS.contains(&r.action.as_str()) {
@@ -308,6 +413,8 @@ mod tests {
     const PULL_REQUEST: &str = include_str!("../testdata/pull_request.json");
     const FORK: &str = include_str!("../testdata/pull_request_fork.json");
     const RERUN: &str = include_str!("../testdata/check_run_rerequested.json");
+    const RELEASE: &str = include_str!("../testdata/release.json");
+    const CREATE: &str = include_str!("../testdata/create.json");
 
     fn edited(body: &str, f: impl FnOnce(&mut Value)) -> Vec<u8> {
         let mut v: Value = serde_json::from_str(body).unwrap();
@@ -465,10 +572,19 @@ mod tests {
 
     #[test]
     fn payload_without_installation_is_ignored() {
-        for event in ["push", "pull_request", "check_run"] {
+        for event in [
+            "push",
+            "pull_request",
+            "check_run",
+            "release",
+            "create",
+            "delete",
+        ] {
             let body = match event {
                 "push" => PUSH,
                 "pull_request" => PULL_REQUEST,
+                "release" => RELEASE,
+                "create" | "delete" => CREATE,
                 _ => RERUN,
             };
             let body = edited(body, |v| {
@@ -479,6 +595,60 @@ mod tests {
                 Trigger::Ignored("no App installation".into())
             );
         }
+    }
+
+    #[test]
+    fn release_is_read() {
+        let Trigger::Release(r) = parse("release", RELEASE.as_bytes()).unwrap() else {
+            panic!("not a release");
+        };
+        assert_eq!(r.action, "published");
+        assert_eq!(r.tag, "v1.2.0");
+        assert_eq!(r.actor, "octocat");
+        assert_eq!(r.installation_id, 777);
+        assert_eq!(r.repo.full_name, "octo/widgets");
+    }
+
+    #[test]
+    fn every_release_type_is_read_and_others_are_ignored() {
+        for action in RELEASE_TYPES {
+            let body = edited(RELEASE, |v| v["action"] = (*action).into());
+            assert!(matches!(
+                parse("release", &body).unwrap(),
+                Trigger::Release(_)
+            ));
+        }
+        let body = edited(RELEASE, |v| v["action"] = "changed".into());
+        assert_eq!(
+            parse("release", &body).unwrap(),
+            Trigger::Ignored("release action is not used".into())
+        );
+    }
+
+    #[test]
+    fn created_and_deleted_refs_are_read() {
+        let Trigger::Create(c) = parse("create", CREATE.as_bytes()).unwrap() else {
+            panic!("not a create");
+        };
+        assert_eq!(c.r#ref, "refs/tags/v1.2.0");
+        assert_eq!(c.actor, "octocat");
+        let body = edited(CREATE, |v| {
+            v["ref"] = "topic/x".into();
+            v["ref_type"] = "branch".into();
+        });
+        let Trigger::Delete(d) = parse("delete", &body).unwrap() else {
+            panic!("not a delete");
+        };
+        assert_eq!(d.r#ref, "refs/heads/topic/x");
+    }
+
+    #[test]
+    fn create_of_something_else_is_ignored() {
+        let body = edited(CREATE, |v| v["ref_type"] = "repository".into());
+        assert_eq!(
+            parse("create", &body).unwrap(),
+            Trigger::Ignored("not a branch or a tag".into())
+        );
     }
 
     #[test]
