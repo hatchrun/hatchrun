@@ -718,7 +718,7 @@ log "wide: Polar has the usage of all six"
 # max-parallel 1 and fail-fast. One leg runs and fails; the other two
 # wait with a check run that says why, and end as cancelled when the
 # first one fails.
-serial_sha="$(printf '1%.0s' $(seq 40))"
+serial_sha="$(printf 'a1%.0s' $(seq 20))"
 serial_run="$(push serial "$serial_sha")"
 log "push to serial started run $serial_run"
 deadline=$((SECONDS + POLL_SECS))
@@ -754,7 +754,7 @@ log "serial: the failed leg cancelled the two waiting ones"
 # Scenario: a push to soft runs a job whose continue-on-error reads its
 # matrix entry. It fails, counts as a success, and the job that needs
 # it runs and sees success.
-soft_sha="$(printf '2%.0s' $(seq 40))"
+soft_sha="$(printf 'b2%.0s' $(seq 20))"
 soft_run="$(push soft "$soft_sha")"
 log "push to soft started run $soft_run"
 wait_checks "$soft_sha" 2 'all(.status == "completed" and .conclusion == "success")'
