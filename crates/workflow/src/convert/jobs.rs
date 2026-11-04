@@ -200,7 +200,7 @@ impl Cx {
         if split || settings != Strategy::default() {
             for entry in &mut entries {
                 entry.strategy = Some(Strategy {
-                    group: split.then(|| id.to_owned()),
+                    group: split.then(|| key.to_owned()),
                     ..settings.clone()
                 });
             }

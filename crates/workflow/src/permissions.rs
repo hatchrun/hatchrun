@@ -133,11 +133,10 @@ pub fn token_scopes(p: Option<&Permissions>) -> BTreeMap<String, Level> {
 }
 
 fn scope_list() -> String {
-    SCOPES
-        .iter()
-        .map(|(k, _)| *k)
-        .collect::<Vec<_>>()
-        .join(", ")
+    let mut keys: Vec<&str> = SCOPES.iter().map(|(k, _)| *k).collect();
+    keys.push(ID_TOKEN);
+    keys.sort_unstable();
+    keys.join(", ")
 }
 
 impl Serialize for Permissions {
@@ -289,7 +288,7 @@ mod tests {
     fn unknown_scope_is_an_error() {
         let err = parse("foo: read").unwrap_err();
         assert!(
-            err.contains("`permissions` names unknown scope `foo`; use one of actions, attestations, checks, contents, deployments, discussions, issues, packages, pages, pull-requests, repository-projects, security-events, statuses"),
+            err.contains("`permissions` names unknown scope `foo`; use one of actions, attestations, checks, contents, deployments, discussions, id-token, issues, packages, pages, pull-requests, repository-projects, security-events, statuses"),
             "{err}"
         );
     }

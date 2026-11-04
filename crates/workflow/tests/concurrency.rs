@@ -223,3 +223,29 @@ jobs:
         out.errors
     );
 }
+
+#[test]
+fn a_bare_cancel_in_progress_parameter_is_substituted() {
+    let plan = plan(
+        "
+jobs:
+  deploy:
+    parameters: { cancel: { type: boolean } }
+    runs-on: ubuntu-latest
+    concurrency: { group: g, cancel-in-progress: parameters.cancel }
+    steps: []
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [{ deploy: { cancel: true } }]
+",
+    );
+    assert_eq!(
+        plan.jobs[0]
+            .concurrency
+            .as_ref()
+            .unwrap()
+            .cancel_in_progress,
+        Cancel::When("true".to_owned())
+    );
+}

@@ -1477,6 +1477,16 @@ fn strategy_errors(name: &str, wf: &Workflow, ids: &[String], errors: &mut Vec<D
                 "{owner} has `strategy.max-parallel: 0`; it must be 1 or more"
             )));
         }
+        // The database holds it in an integer column.
+        if strategy
+            .max_parallel
+            .is_some_and(|n| i32::try_from(n).is_err())
+        {
+            errors.push(Diagnostic::new(format!(
+                "{owner} has a `strategy.max-parallel` above {}; it must be at most that",
+                i32::MAX
+            )));
+        }
         if strategy.group.as_deref().is_some_and(str::is_empty) {
             errors.push(Diagnostic::new(format!(
                 "{owner} has an empty `strategy.group`"
@@ -2043,7 +2053,13 @@ fn expand_job(
     let concurrency = job.concurrency.as_ref().map(|c| Concurrency {
         group: sub.text(&c.group),
         cancel_in_progress: match &c.cancel_in_progress {
-            Cancel::When(text) => Cancel::When(sub.text(text)),
+            Cancel::When(text) => Cancel::When(if parameter_name(text).is_some() {
+                // A bare `parameters.NAME` is an expression without
+                // braces; its value stands in for it.
+                sub.text(&format!("${{{{ {text} }}}}"))
+            } else {
+                sub.text(text)
+            }),
             other => other.clone(),
         },
     });
@@ -2749,6 +2765,13 @@ fn job_bytes(job: &PlannedJob) -> usize {
         + job.if_.as_ref().map_or(0, String::len)
         + job.continue_on_error.as_ref().map_or(0, String::len)
         + job.strategy.as_ref().map_or(0, |s| s.group.len())
+        + job.concurrency.as_ref().map_or(0, |c| {
+            c.group.len()
+                + match &c.cancel_in_progress {
+                    Cancel::When(text) => text.len(),
+                    _ => 0,
+                }
+        })
 }
 
 /// A parameter or matrix value as text: strings as they are, whole

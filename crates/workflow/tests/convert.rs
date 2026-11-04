@@ -2554,7 +2554,7 @@ jobs:
     assert!(jobs.len() > 1, "{jobs:?}");
     for entry in jobs {
         let strategy = entry.strategy.as_ref().unwrap();
-        assert_eq!(strategy.group.as_deref(), Some("build"));
+        assert_eq!(strategy.group.as_deref(), Some("ci-build"));
         assert!(!strategy.fail_fast);
         assert_eq!(strategy.max_parallel, Some(3));
     }

@@ -1969,6 +1969,10 @@ workflows:
         &["max-parallel: 0", "1 or more"],
     );
     assert_error(
+        &wf("[{ t: { matrix: { x: [1] }, strategy: { max-parallel: 2147483648 } } }]"),
+        &["max-parallel", "2147483647"],
+    );
+    assert_error(
         &wf("[{ t: { matrix: { x: [1] }, strategy: { group: '' } } }]"),
         &["empty", "strategy.group"],
     );
