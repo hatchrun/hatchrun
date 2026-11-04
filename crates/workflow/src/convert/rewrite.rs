@@ -4,7 +4,7 @@
 
 //! Expression checks and rewriting of `${{ }}` text inside jobs.
 
-use super::{BTreeSet, ExprError, Job, Step, UNSUPPORTED_CONTEXTS, Value, expr};
+use super::{BTreeSet, ContinueOnError, ExprError, Job, Step, UNSUPPORTED_CONTEXTS, Value, expr};
 
 /// Why a job that had errors is missing from those that need it.
 /// What happened to a job that had errors, after "which".
@@ -21,6 +21,9 @@ pub(super) const REUSABLE: &str = "calls a reusable workflow";
 pub(super) fn expression_problems(job: &Job) -> (Vec<&'static str>, Vec<String>) {
     let mut texts: Vec<&str> = Vec::new();
     let mut conds: Vec<&str> = job.if_.iter().map(String::as_str).collect();
+    if let Some(ContinueOnError::When(text)) = &job.continue_on_error {
+        conds.push(text);
+    }
     texts.extend(job.env.values().map(String::as_str));
     texts.extend(job.outputs.values().map(String::as_str));
     for step in &job.steps {

@@ -6,6 +6,8 @@
 //! Durable Object.
 
 use hatchrun_cloud::{github, jwt, oidc, polar};
+
+use crate::oidc as ci_oidc;
 use worker::{Env, Result, Stub};
 
 /// The Durable Object namespace of runs.
@@ -40,11 +42,19 @@ pub struct Settings {
     pub ci_region: String,
     /// The role the Worker assumes. Empty until the CI account exists.
     pub ci_role_arn: String,
+    /// The S3 bucket of artifacts in the CI account. Empty until the
+    /// bucket exists, and then jobs get no artifact service.
+    pub artifacts_bucket: String,
     /// The key that signs the token for `AssumeRoleWithWebIdentity`,
     /// PKCS#8 DER.
     pub oidc_key: Vec<u8>,
     /// The `kid` of `oidc_key` in the JWKS.
     pub oidc_kid: String,
+    /// The key that signs the OIDC tokens of jobs (see
+    /// [`crate::oidc`]), PKCS#8 DER. Not `oidc_key`.
+    pub ci_oidc_key: Vec<u8>,
+    /// The `kid` of `ci_oidc_key` in its JWKS.
+    pub ci_oidc_kid: String,
     /// Replaces the STS and EC2 endpoints, for development.
     pub aws_endpoint: Option<String>,
     /// The Polar API root, without a trailing slash.
@@ -96,8 +106,11 @@ impl Settings {
                 .map(|url| url.trim_end_matches('/').to_owned()),
             ci_region: need("CI_REGION")?,
             ci_role_arn: get("CI_ROLE_ARN").unwrap_or_default(),
+            artifacts_bucket: get("ARTIFACTS_BUCKET").unwrap_or_default(),
             oidc_key: key(oidc::SIGNING_KEY)?,
             oidc_kid: need(oidc::KEY_ID)?,
+            ci_oidc_key: key(ci_oidc::SIGNING_KEY)?,
+            ci_oidc_kid: need(ci_oidc::KEY_ID)?,
             aws_endpoint: get("AWS_ENDPOINT_URL"),
             polar_api: get("POLAR_API_URL")
                 .unwrap_or_else(|| polar::API.to_owned())
@@ -140,6 +153,8 @@ mod tests {
             ("CI_REGION", "us-east-1".to_owned()),
             ("OIDC_SIGNING_KEY", PEM.to_owned()),
             ("OIDC_KEY_ID", "kid".to_owned()),
+            ("CI_OIDC_SIGNING_KEY", PEM.to_owned()),
+            ("CI_OIDC_KEY_ID", "ci-kid".to_owned()),
         ])
     }
 
@@ -155,6 +170,7 @@ mod tests {
         assert_eq!(settings.github_api, github::API);
         assert_eq!(settings.token_key, b"k");
         assert_eq!(settings.ci_role_arn, "");
+        assert_eq!(settings.artifacts_bucket, "");
         assert_eq!(settings.aws_endpoint, None);
         assert_eq!(settings.local_launcher_url, None);
         assert_eq!(settings.polar_api, polar::API);
@@ -174,6 +190,16 @@ mod tests {
             settings.aws_endpoint.as_deref(),
             Some("http://localhost:4566")
         );
+    }
+
+    #[test]
+    fn the_job_token_issuer_has_its_own_key() {
+        let settings = read(&values()).unwrap();
+        assert_eq!(settings.ci_oidc_kid, "ci-kid");
+        assert_eq!(settings.oidc_kid, "kid");
+        let mut v = values();
+        v.remove("CI_OIDC_SIGNING_KEY");
+        assert_eq!(read(&v).err().unwrap(), "CI_OIDC_SIGNING_KEY is not set");
     }
 
     #[test]

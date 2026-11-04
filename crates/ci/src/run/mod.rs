@@ -27,7 +27,7 @@
 //! | `POST /result?job=ID` | `JobResult` | `204` |
 //! | `POST /failed?job=ID` | `{ "message": "..." }` | `204` |
 //! | `POST /held?job=ID` | `{ "message": "..." }` | `204`, `409` not queued |
-//! | `POST /cancel` | none | `204` |
+//! | `POST /cancel[?job=ID&attempt=N]` | none, or `{ "message": "...", "outright": bool }` | `204` |
 //! | `POST /rerun?job=ID` | none | `204` |
 //! | `POST /purge` | none | `204` |
 //! | `GET /state` | none | `200` [`RunState`] |
@@ -46,7 +46,7 @@ mod decide;
 mod log;
 mod object;
 
-use hatchrun_workflow::{Annotation, Conclusion, PlannedJob};
+use hatchrun_workflow::{Annotation, Conclusion, Concurrency, PlannedJob};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -162,6 +162,8 @@ pub struct RunInfo {
     pub head_ref: String,
     /// The pull request's base branch, empty otherwise.
     pub base_ref: String,
+    /// The workflow's `concurrency`, as written.
+    pub concurrency: Option<Concurrency>,
 }
 
 /// The body of `POST /start`.

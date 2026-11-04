@@ -10,6 +10,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 
+mod artifacts;
+
 const RPC: &str = "/twirp/github.actions.results.api.v1.CacheService/";
 
 /// A cloud that hands out part URLs on itself, and an S3 that

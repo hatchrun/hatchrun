@@ -447,6 +447,8 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
                 token_permissions: job.token_permissions.clone(),
                 secret_refs: job.secret_refs(),
                 environment: job.environment.clone(),
+                strategy_group: job.strategy.as_ref().map(|s| s.group.clone()),
+                max_parallel: job.strategy.as_ref().and_then(|s| s.max_parallel),
             })
             .collect();
         store::insert_jobs(db, run.id, &jobs, now).await?;
@@ -496,6 +498,7 @@ fn start_body(req: &Request<'_>, run: &RunRow, rows: &[JobRow], plan: &Plan) -> 
             actor: run.actor.clone(),
             head_ref: req.head_ref.to_owned(),
             base_ref: req.base_ref.to_owned(),
+            concurrency: plan.concurrency.clone(),
         },
         jobs,
         event: req.event.clone(),
@@ -648,6 +651,8 @@ mod tests {
             token_permissions: BTreeMap::new(),
             secret_refs: SecretRefs::default(),
             environment: None,
+            strategy_group: None,
+            max_parallel: None,
         }];
         let ids = db
             .wait(store::insert_jobs(db.db(), run.id, &jobs, 1))

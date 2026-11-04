@@ -8,6 +8,8 @@
 //! in a Cloudflare Worker, the runner agent and the CLI.
 
 pub mod agent;
+pub mod artifacts;
+pub mod concurrency;
 pub mod config;
 pub mod convert;
 pub mod cron;
@@ -22,26 +24,30 @@ pub mod split;
 pub mod templates;
 pub mod trigger;
 
+pub use concurrency::{Cancel, Concurrency, Resolved};
 pub use config::{
-    CacheStep, CheckoutStep, Command, Config, Executor, Job, MAX_SOURCE, Matrix, Outcome,
-    Parameter, ParameterKind, Require, RunStep, Statuses, Step, Submodules, UsesStep, Workflow,
-    WorkflowJob, WorkspaceStep, parse,
+    CacheStep, CheckoutStep, Command, Config, ContinueOnError, Executor, Job, MAX_SOURCE, Matrix,
+    Outcome, Parameter, ParameterKind, Require, RunStep, Statuses, Step, Strategy, Submodules,
+    UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
 };
 pub use convert::{Conversion, convert, to_yaml};
 pub use cron::{Cron, UtcMinute};
 pub use diagnostic::Diagnostic;
 pub use environment::{ENVIRONMENT_NAME_MAX, valid_environment_name};
 pub use expr::{
-    ExprError, Functions, HATCHRUN_KEYS, JobStatus, checks_status, evaluate, hatchrun_context,
-    interpolate, job_condition, secret_refs, truthy,
+    ExprError, Functions, HATCHRUN_KEYS, JobStatus, checks_status, continue_on_error, evaluate,
+    hatchrun_context, interpolate, job_condition, secret_refs, truthy,
 };
 pub use job::{
-    Annotation, AnnotationLevel, CacheService, Conclusion, Github, JobDocument, JobResult, Need,
-    StepSummary,
+    Annotation, AnnotationLevel, ArtifactService, CacheService, Conclusion, Github, IdTokenRequest,
+    JobDocument, JobResult, Need, StepSummary,
 };
-pub use permissions::{DEFAULT_SCOPES, Level, Permissions, SCOPES, token_scopes};
+pub use permissions::{
+    DEFAULT_SCOPES, ID_TOKEN, ID_TOKEN_SCOPE, Level, Permissions, SCOPES, token_scopes,
+};
 pub use plan::{
-    JobKind, Plan, PlannedJob, PlannedStep, Ready, compile, config_errors, ready, validate,
+    JobKind, Plan, PlannedJob, PlannedStep, PlannedStrategy, Ready, compile, config_errors, ready,
+    validate,
 };
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;

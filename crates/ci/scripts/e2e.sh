@@ -36,8 +36,18 @@
 # - a push to wide runs six jobs: five at once, the sixth held with a
 #   check run that says why until one ends; the fake Polar then holds a
 #   usage event for each;
+# - pushes to queue share a concurrency group: one run goes, the
+#   next waits with a check run that says why, a third replaces it
+#   (cancelled, with the reason) and starts when the first is cancelled;
+# - a push to replace cancels the run in progress of its group;
 # - a tenant whose subscription was canceled, and one that never
 #   subscribed, each get one billing check run and no run;
+# - a push to serial runs a three-leg matrix with max-parallel 1: one
+#   leg runs and fails, the other two wait with a check run that says
+#   why, and end as cancelled by fail-fast;
+# - a push to soft runs a job that fails with continue-on-error set from
+#   its matrix entry: it counts as a success and the job that needs it
+#   runs and reads success;
 # - environments, after wide: environment settings, secrets and vars at
 #   three levels, and an organization secret limited to other
 #   repositories are set through the API; a push to guard fails its job
@@ -283,6 +293,7 @@ start launcher env RUST_LOG="${RUST_LOG:-info,hatchrun_agent=debug}" "$dev" laun
   echo "CI_TOKEN_KEY=\"$TOKEN_KEY\""
   printf 'GITHUB_APP_PRIVATE_KEY="%s"\n' "$key"
   printf 'OIDC_SIGNING_KEY="%s"\n' "$key"
+  printf 'CI_OIDC_SIGNING_KEY="%s"\n' "$key"
   echo "POLAR_ACCESS_TOKEN=\"$POLAR_TOKEN\""
 } >"$tmp/ci.env"
 
@@ -324,6 +335,7 @@ start ci env -C "$root/crates/ci" \
   --var APP_URL:"$APP_URL" \
   --var GITHUB_APP_ID:Iv1e2e \
   --var OIDC_KEY_ID:e2e \
+  --var CI_OIDC_KEY_ID:e2e-ci \
   --var POLAR_API_URL:"$GITHUB" \
   --var CI_SECRETS_KEY_ID:e2e \
   --var CI_SECRETS_KEY_OLD_ID:""
@@ -466,6 +478,35 @@ broken="$(check_of "$fail_sha" "failing / broken")"
 jq -e '.text // "" | contains("about to fail")' <<<"$broken" >/dev/null ||
   die "the failed check run lacks the log tail: $broken"
 log "fail: the job failed"
+
+# Scenario: a job with id-token: write gets an OIDC token, one without it
+# gets no request variables.
+oidc_sha="$(printf '0%.0s' $(seq 40))"
+oidc_run="$(push oidc "$oidc_sha")"
+log "push to oidc started run $oidc_run"
+wait_checks "$oidc_sha" 2 'all(.status == "completed" and .conclusion == "success")'
+oidc_log() {
+  local job deadline=$((SECONDS + 60))
+  job="$(job_id "$oidc_run" "$1")"
+  until curl -fsS --compressed "$CI/api/ci/jobs/$job/log" >"$tmp/oidc-$1.log" 2>/dev/null &&
+    grep -q "$2" "$tmp/oidc-$1.log"; do
+    ((SECONDS < deadline)) || die "the $1 job's log lacks $2: $(cat "$tmp/oidc-$1.log" 2>/dev/null)"
+    sleep 1
+  done
+  cp "$tmp/oidc-$1.log" "$logs/"
+}
+oidc_log mint '^parts='
+grep -qx 'parts=3' "$tmp/oidc-mint.log" || die "the token is not a JWT: $(cat "$tmp/oidc-mint.log")"
+grep -q '"iss":"https://token.ci.hatchrun.io"' "$tmp/oidc-mint.log" ||
+  die "wrong issuer: $(cat "$tmp/oidc-mint.log")"
+grep -q '"aud":"sts.e2e.example"' "$tmp/oidc-mint.log" ||
+  die "wrong audience: $(cat "$tmp/oidc-mint.log")"
+grep -q '"sub":"repo:[^"]*:ref:refs/heads/oidc"' "$tmp/oidc-mint.log" ||
+  die "wrong subject: $(cat "$tmp/oidc-mint.log")"
+oidc_log plain '^request='
+grep -qx 'request=\[unset\]' "$tmp/oidc-plain.log" ||
+  die "a job without id-token: write got a request: $(cat "$tmp/oidc-plain.log")"
+log "oidc: the granted job got a token and the other got none"
 
 # Scenario: a re-run request for the failed job runs it again. GitHub
 # sends back the check run's external id.
@@ -673,6 +714,61 @@ until curl -fsS "$GITHUB/_state" | jq -e --argjson ids "$usage_ids" --arg tenant
 done
 log "wide: Polar has the usage of all six"
 
+# Scenario: a push to serial runs a matrix of three legs with
+# max-parallel 1 and fail-fast. One leg runs and fails; the other two
+# wait with a check run that says why, and end as cancelled when the
+# first one fails.
+serial_sha="$(printf 'a1%.0s' $(seq 20))"
+serial_run="$(push serial "$serial_sha")"
+log "push to serial started run $serial_run"
+deadline=$((SECONDS + POLL_SECS))
+until api "runs/$serial_run" >"$tmp/serial.json" && jq -e '
+  ([.jobs[] | select(.status == "launching" or .status == "launched" or .status == "running")] | length == 1)
+  and ([.jobs[] | select(.status == "queued")] | length == 2)
+' "$tmp/serial.json" >/dev/null; do
+  ((SECONDS < deadline)) || die "serial never had one leg running and two waiting: $(api "runs/$serial_run")"
+  sleep 1
+done
+mapfile -t waiting < <(jq -r '.jobs[] | select(.status == "queued") | .plan_id' "$tmp/serial.json")
+for plan_id in "${waiting[@]}"; do
+  deadline=$((SECONDS + 60))
+  until check_of "$serial_sha" "serial / $plan_id" |
+    jq -e '.summary // "" | contains("already runs 1 job at once")' >/dev/null; do
+    ((SECONDS < deadline)) || die "the waiting leg's check run does not say why: $(check_of "$serial_sha" "serial / $plan_id")"
+    sleep 1
+  done
+done
+log "serial: one leg runs, the others wait for max-parallel"
+wait_checks "$serial_sha" 3 'all(.status == "completed")'
+checks "$serial_sha" | jq -e '
+  ([.[] | select(.conclusion == "failure")] | length == 1)
+  and ([.[] | select(.conclusion == "cancelled")] | length == 2)
+' >/dev/null || die "serial should have one failed leg and two cancelled: $(checks "$serial_sha")"
+for plan_id in "${waiting[@]}"; do
+  check_of "$serial_sha" "serial / $plan_id" |
+    jq -e '.summary // "" | contains("fail-fast")' >/dev/null ||
+    die "the cancelled leg does not say why: $(check_of "$serial_sha" "serial / $plan_id")"
+done
+log "serial: the failed leg cancelled the two waiting ones"
+
+# Scenario: a push to soft runs a job whose continue-on-error reads its
+# matrix entry. It fails, counts as a success, and the job that needs
+# it runs and sees success.
+soft_sha="$(printf 'b2%.0s' $(seq 20))"
+soft_run="$(push soft "$soft_sha")"
+log "push to soft started run $soft_run"
+wait_checks "$soft_sha" 2 'all(.status == "completed" and .conclusion == "success")'
+lenient_job="$(job_id "$soft_run" lenient)"
+curl -fsS --compressed "$CI/api/ci/jobs/$lenient_job/log" | grep -qx "about to fail softly" ||
+  die "the lenient job did not run its step"
+after_job="$(job_id "$soft_run" after-lenient)"
+deadline=$((SECONDS + 60))
+until curl -fsS --compressed "$CI/api/ci/jobs/$after_job/log" 2>/dev/null | grep -qx "lenient said success"; do
+  ((SECONDS < deadline)) || die "the job after lenient did not see success"
+  sleep 1
+done
+log "soft: a failed job with continue-on-error counted as a success"
+
 # Whether the last app_call answered status $1 with a body that jq
 # filter $2 holds for.
 answered() {
@@ -813,9 +909,70 @@ status="$(app_call GET orgs/e2e2/billing)"
 answered 200 '.card == false' || die "the billing view of e2e2 answered $status: $(cat "$tmp/answer")"
 log "billing: the card state of both tenants read as expected"
 
-# Fourteen instances: build, test, broken twice, sleeper, arm-hello,
-# bad-ok-hello, the six naps and deploy-a. Wait for the last agent to exit.
-launches=14
+# Cancels run $1 as the app would, signed in.
+cancel_run() {
+  local code
+  code="$(curl -sS -o "$tmp/answer" -w '%{http_code}' -X POST "$CI/api/ci/runs/$1/cancel" \
+    -H "Origin: $APP_URL" \
+    -H "Cookie: __Host-hatchrun_session=$cookie" \
+    -H "X-CSRF-Token: $csrf")"
+  [[ "$code" == 204 ]] || die "cancel of run $1 answered $code: $(cat "$tmp/answer")"
+}
+
+# Waits until the check run $2 of commit $1 has a summary that contains $3.
+wait_summary() {
+  local sha=$1 name=$2 text=$3
+  local deadline=$((SECONDS + 60))
+  until check_of "$sha" "$name" | jq -e --arg text "$text" '.summary // "" | contains($text)' >/dev/null; do
+    ((SECONDS < deadline)) || die "$name on $sha never said '$text': $(check_of "$sha" "$name")"
+    sleep 1
+  done
+}
+
+# Scenario: a concurrency group lets one run go and keeps one waiting. A
+# third run replaces the one that waits, which ends cancelled; when the
+# first run is cancelled the third one starts.
+q1_sha="$(printf '5%.0s' $(seq 40))"
+q2_sha="$(printf '6%.0s' $(seq 40))"
+q3_sha="$(printf '7%.0s' $(seq 40))"
+q1_run="$(push queue "$q1_sha")"
+wait_job "$q1_run" sit running
+q2_run="$(push queue "$q2_sha")"
+wait_summary "$q2_sha" "queue / sit" 'Waiting for concurrency group `e2e-queue`: run #'
+api "runs/$q2_run" | jq -e '.jobs[] | select(.name == "sit") | .status == "queued" and .held == "group"' >/dev/null ||
+  die "the second run's job is not held for the group: $(api "runs/$q2_run")"
+q3_run="$(push queue "$q3_sha")"
+wait_summary "$q2_sha" "queue / sit" 'a newer run replaced it while it waited for concurrency group `e2e-queue`'
+[[ "$(check_of "$q2_sha" "queue / sit" | jq -r .conclusion)" == cancelled ]] ||
+  die "the replaced run did not end cancelled: $(check_of "$q2_sha" "queue / sit")"
+wait_summary "$q3_sha" "queue / sit" 'Waiting for concurrency group `e2e-queue`'
+wait_job "$q1_run" sit running
+log "concurrency: one run goes, the newest waits, the middle one was replaced"
+cancel_run "$q1_run"
+wait_job "$q3_run" sit running
+cancel_run "$q3_run"
+wait_checks "$q3_sha" 1 'all(.status == "completed" and .conclusion == "cancelled")'
+log "concurrency: the waiting run started when the first one was cancelled"
+
+# Scenario: cancel-in-progress cancels the run that goes and starts the
+# new one.
+r1_sha="$(printf '8%.0s' $(seq 40))"
+r2_sha="$(printf '9%.0s' $(seq 40))"
+r1_run="$(push replace "$r1_sha")"
+wait_job "$r1_run" sit running
+r2_run="$(push replace "$r2_sha")"
+wait_summary "$r1_sha" "replace / sit" 'set cancel-in-progress'
+wait_checks "$r1_sha" 1 'all(.status == "completed" and .conclusion == "cancelled")'
+wait_job "$r2_run" sit running
+cancel_run "$r2_run"
+wait_checks "$r2_sha" 1 'all(.status == "completed" and .conclusion == "cancelled")'
+log "concurrency: cancel-in-progress cancelled the running run and the new one started"
+
+# Twenty-three instances: build, test, broken twice, sleeper, arm-hello,
+# bad-ok-hello, the six naps, deploy-a, the two oidc jobs, the serial leg
+# that ran, the two soft jobs and the four sits that ran. Wait for the
+# last agent to exit.
+launches=23
 deadline=$((SECONDS + 60))
 until curl -fsS "$LAUNCHER/_events" | jq -e --argjson n "$launches" '[.[] | select(startswith("exit "))] | length >= $n' >/dev/null; do
   ((SECONDS < deadline)) || die "agents still running: $(curl -fsS "$LAUNCHER/_events")"
@@ -842,8 +999,8 @@ jq -e '[.[] | select(startswith("exit ")) | split(" ")[2]] | all(. == "0" or . =
   "$tmp/events.json" >/dev/null || die "an agent exited badly: $(cat "$tmp/events.json")"
 [[ "$(jq '[.[] | select(startswith("launch "))] | length' "$tmp/events.json")" == "$launches" ]] ||
   die "expected $launches launches: $(cat "$tmp/events.json")"
-jq -e '[.[] | select(endswith(" 0") and startswith("exit "))] | length == 11' "$tmp/events.json" >/dev/null ||
-  die "expected the eleven passing jobs to exit 0: $(cat "$tmp/events.json")"
+jq -e '[.[] | select(endswith(" 0") and startswith("exit "))] | length == 14' "$tmp/events.json" >/dev/null ||
+  die "expected the fourteen passing jobs to exit 0: $(cat "$tmp/events.json")"
 # The App's permissions are read once per installation and kept in KV,
 # so the claims did not each read them.
 reads="$(curl -fsS "$GITHUB/_state" | jq '[.installation_reads[] | select(. == 42)] | length')"

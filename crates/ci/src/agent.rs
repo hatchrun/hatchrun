@@ -30,7 +30,8 @@ use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::send;
 use hatchrun_cloud::start::app_jwt;
 use hatchrun_workflow::agent::{CLAIM_PATH, EVENTS_PATH, RESULT_PATH};
-use hatchrun_workflow::{JobDocument, SecretRefs};
+use hatchrun_workflow::artifacts::PATH as ARTIFACTS_PATH;
+use hatchrun_workflow::{ArtifactService, ID_TOKEN_SCOPE, IdTokenRequest, JobDocument, SecretRefs};
 use serde_json::json;
 use worker::{
     Delay, Env, Method, Request, RequestInit, Response, Result, console_error, console_log,
@@ -42,6 +43,7 @@ use crate::environments;
 use crate::github;
 use crate::launcher::Backend;
 use crate::launches::{self, EndAnswer};
+use crate::oidc;
 use crate::secrets::{Keyring, SecretError, job_secrets};
 use crate::store::{self, JobRow, RepoRow, RunRow};
 use crate::token::{self, Claims, TokenError};
@@ -112,6 +114,17 @@ enum Identity {
     Stale,
     /// The token is for another job or run.
     Refused,
+}
+
+/// Whether `claims` are for the job `row` at its current attempt.
+pub(crate) fn same_attempt(row: &JobRow, claims: &Claims) -> bool {
+    identity(row, claims) == Identity::Match
+}
+
+/// Whether `claims` are for the job `row` at its current attempt and the
+/// job is running.
+pub(crate) fn running_attempt(row: &JobRow, claims: &Claims) -> bool {
+    same_attempt(row, claims) && row.status == "running"
 }
 
 fn identity(row: &JobRow, claims: &Claims) -> Identity {
@@ -217,7 +230,11 @@ fn text(message: &str, code: u16) -> Result<Response> {
 /// The Worker runtime failed to build a response.
 pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
     let path = req.path();
-    if req.method() != Method::Post || ![CLAIM_PATH, EVENTS_PATH, RESULT_PATH].contains(&&*path) {
+    let artifacts = path == ARTIFACTS_PATH || path.starts_with(&format!("{ARTIFACTS_PATH}/"));
+    if !artifacts
+        && (req.method() != Method::Post
+            || ![CLAIM_PATH, EVENTS_PATH, RESULT_PATH].contains(&&*path))
+    {
         return text("not found", 404);
     }
     let settings = match Settings::read(env) {
@@ -231,6 +248,9 @@ pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
     let Ok(claims) = authorize(header.as_deref(), &settings.token_key, now_ms() / 1000) else {
         return text("unauthorized", 401);
     };
+    if artifacts {
+        return crate::artifacts::handle(req, env, &settings, claims).await;
+    }
     let body = if path == CLAIM_PATH {
         Vec::new()
     } else {
@@ -268,7 +288,11 @@ pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
                 return text("unavailable", 503);
             }
         };
-        return claim(env, &settings, &db, &row, &claims).await;
+        let job_token = header
+            .as_deref()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default();
+        return claim(env, &settings, &db, &row, &claims, job_token).await;
     }
     // The run object checks that the job is in its run, the attempt and
     // that the job is running.
@@ -290,6 +314,7 @@ async fn claim(
     db: &Db,
     row: &JobRow,
     claims: &Claims,
+    job_token: &str,
 ) -> Result<Response> {
     match claim_answer(row, claims) {
         ClaimAnswer::Refused => return text("unauthorized", 401),
@@ -362,6 +387,9 @@ async fn claim(
     }
     let mut document = response.json::<JobDocument>().await?;
     fill(&mut document, secrets, vars);
+    document.id_token =
+        id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
+    document.artifacts = artifact_service(settings, job_token);
     Response::from_json(&document)
 }
 
@@ -374,6 +402,42 @@ pub(crate) fn fill(
 ) {
     doc.secrets = secrets;
     doc.vars = vars;
+}
+
+/// The OIDC request for the job, when its permissions grant one: the
+/// token endpoint and a request token for this attempt that lives as
+/// long as a job token does.
+pub(crate) fn id_token_request(
+    ci_url: &str,
+    key: &[u8],
+    row: &JobRow,
+    now_secs: u64,
+) -> Option<IdTokenRequest> {
+    if !oidc::granted(&row.token_permissions) {
+        return None;
+    }
+    let claims = Claims {
+        job: row.id,
+        run: row.run_id,
+        attempt: i32::try_from(row.attempt).ok()?,
+        exp: now_secs + token::lifetime_secs(row.timeout_minutes),
+    };
+    Some(IdTokenRequest {
+        url: oidc::request_url(ci_url),
+        token: token::sign_oidc(key, &claims),
+    })
+}
+
+/// The artifact service a job gets: this Worker, with the job's own
+/// token. `None` while the artifacts bucket is not set up.
+pub(crate) fn artifact_service(settings: &Settings, job_token: &str) -> Option<ArtifactService> {
+    if settings.artifacts_bucket.is_empty() || job_token.is_empty() {
+        return None;
+    }
+    Some(ArtifactService {
+        url: format!("{}{ARTIFACTS_PATH}", settings.ci_url),
+        token: job_token.to_owned(),
+    })
 }
 
 /// A job's secrets and its vars.
@@ -594,8 +658,10 @@ async fn mint(
     row: &JobRow,
     repo: &RepoRow,
 ) -> std::result::Result<(String, Vec<github::Capped>), String> {
-    let asked: BTreeMap<String, String> = serde_json::from_value(row.token_permissions.clone())
+    let mut asked: BTreeMap<String, String> = serde_json::from_value(row.token_permissions.clone())
         .map_err(|err| format!("token permissions: {err}"))?;
+    // `id_token` asks for OIDC tokens, not a GitHub permission.
+    asked.remove(ID_TOKEN_SCOPE);
     let jwt = app_jwt(&settings.app_id, &settings.app_key).await?;
     let held = held_permissions(env, settings, &jwt, repo.installation_id).await?;
     let (permissions, capped) = github::cap_permissions(&asked, &held);
@@ -630,6 +696,37 @@ async fn to_run(
 
 #[cfg(test)]
 mod tests {
+
+    fn settings(bucket: &str) -> Settings {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMAA=\n-----END PRIVATE KEY-----";
+        Settings::from_lookup(|name| {
+            let value = match name {
+                "GITHUB_APP_ID" => "Iv1",
+                "GITHUB_APP_PRIVATE_KEY" | "OIDC_SIGNING_KEY" | "CI_OIDC_SIGNING_KEY" => pem,
+                "APP_URL" => "https://app.example",
+                "CI_URL" => "https://ci.example/",
+                "BROKER_URL" => "https://broker.example",
+                "BROKER_TOKEN" | "CI_TOKEN_KEY" => "k",
+                "DEPLOY_ENV" => "dev",
+                "LAUNCHER" => "ec2",
+                "CI_REGION" => "us-east-1",
+                "OIDC_KEY_ID" | "CI_OIDC_KEY_ID" => "kid",
+                "ARTIFACTS_BUCKET" if !bucket.is_empty() => bucket,
+                _ => return None,
+            };
+            Some(value.to_owned())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn the_artifact_service_is_this_worker_with_the_job_token() {
+        let service = artifact_service(&settings("bucket"), "v1.a.b").unwrap();
+        assert_eq!(service.url, "https://ci.example/v1/agent/artifacts");
+        assert_eq!(service.token, "v1.a.b");
+        assert!(artifact_service(&settings(""), "v1.a.b").is_none());
+        assert!(artifact_service(&settings("bucket"), "").is_none());
+    }
     use super::*;
 
     use crate::token::tests::random_key;
@@ -698,6 +795,26 @@ mod tests {
             default_branch: "main".into(),
             private: false,
         }
+    }
+
+    #[test]
+    fn only_a_job_with_the_grant_gets_an_id_token_request() {
+        let mut granted = row("launched");
+        granted.token_permissions = serde_json::json!({ "id_token": "write", "metadata": "read" });
+        let got = id_token_request("https://ci.example", &*KEY, &granted, 100).unwrap();
+        assert_eq!(got.url, "https://ci.example/v1/oidc/token?api-version=2.0");
+        // The request token is for this attempt, not a job token.
+        let claims = token::verify_oidc(&*KEY, &got.token, 101).unwrap();
+        assert_eq!((claims.job, claims.run, claims.attempt), (7, 1, 2));
+        assert_eq!(claims.exp, 100 + token::lifetime_secs(10));
+        assert_eq!(
+            token::verify(&*KEY, &got.token, 101),
+            Err(TokenError::Malformed)
+        );
+        assert_eq!(
+            id_token_request("https://ci.example", &*KEY, &row("launched"), 100),
+            None
+        );
     }
 
     #[test]
@@ -864,9 +981,12 @@ mod tests {
                 env: BTreeMap::new(),
                 if_: None,
                 timeout_minutes: 10,
+                continue_on_error: None,
+                strategy: None,
                 outputs: BTreeMap::new(),
                 token_permissions: BTreeMap::new(),
                 environment: None,
+                concurrency: None,
                 steps: Vec::new(),
             },
             event_name: "push".into(),
@@ -891,6 +1011,8 @@ mod tests {
             vars: BTreeMap::new(),
             timings: BTreeMap::new(),
             cache: None,
+            id_token: None,
+            artifacts: None,
         }
     }
 

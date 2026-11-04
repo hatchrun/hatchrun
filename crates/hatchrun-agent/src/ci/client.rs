@@ -236,9 +236,12 @@ mod tests {
                 env: BTreeMap::new(),
                 if_: None,
                 timeout_minutes: 10,
+                continue_on_error: None,
+                strategy: None,
                 outputs: BTreeMap::new(),
                 token_permissions: BTreeMap::new(),
                 environment: None,
+                concurrency: None,
                 steps: Vec::new(),
             },
             event_name: "push".into(),
@@ -263,6 +266,8 @@ mod tests {
             vars: BTreeMap::new(),
             timings: BTreeMap::new(),
             cache: None,
+            id_token: None,
+            artifacts: None,
         };
         serde_json::to_value(doc).unwrap()
     }

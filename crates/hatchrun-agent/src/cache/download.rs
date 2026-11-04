@@ -38,7 +38,10 @@ pub(super) async fn download(state: &State, token: &str, headers: &HeaderMap) ->
         .get("x-ms-range")
         .or_else(|| headers.get(header::RANGE))
         .and_then(|value| value.to_str().ok());
-    let upstream = match state.cloud.download(&url, range).await {
+    let Some(cloud) = state.s3() else {
+        return no_entry(state);
+    };
+    let upstream = match cloud.download(&url, range).await {
         Ok(upstream) => upstream,
         Err(err) => {
             warn!("cache download: {err:#}");

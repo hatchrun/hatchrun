@@ -18,3 +18,6 @@
 # Test fixture: a PEM header around invalid key data, used to check
 # that parsing fails.
 c655aef85db25a00cb3fec70905dbff41b0471b7:crates/scaler/src/github.rs:private-key:301
+
+# Test fixture: an artifact object key (a storage path), not a secret.
+a62af601a1896e3eb312553ae2f1afa1167953ad:crates/ci/src/artifacts.rs:generic-api-key:608

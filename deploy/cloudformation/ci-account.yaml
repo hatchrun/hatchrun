@@ -6,8 +6,9 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   The hatchrun-owned AWS account that runs hatchrun CI jobs, one EC2
   instance per job. Deploy it once in us-east-1. hatchrun-ci takes the
-  RoleArn output as its CI_ROLE_ARN secret and finds the launch template
-  by name and the subnets by their hatchrun:tenant tag.
+  RoleArn output as its CI_ROLE_ARN secret and the ArtifactsBucket output
+  as ARTIFACTS_BUCKET in crates/ci/wrangler.toml, and finds the launch template by name
+  and the subnets by their hatchrun:tenant tag.
 
 Resources:
   Vpc:
@@ -80,6 +81,66 @@ Resources:
       Tags:
         - { Key: Name, Value: hatchrun-ci-c }
         - { Key: "hatchrun:tenant", Value: hatchrun-ci }
+
+  # Artifacts go to S3 in this region over the VPC, so the bytes of an
+  # upload or download never leave AWS.
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds: [!Ref RouteTable]
+
+  # Artifacts of CI runs, one object each at
+  # artifacts/<days>d/<tenant>/<repository id>/<run id>/<random>, where
+  # <days> is the retention tier of the run: 30, or 90 for enterprise
+  # tenants. hatchrun-ci is the only reader and writer; runners get
+  # presigned URLs for single objects. The rules delete by tier prefix,
+  # and drop uploads that never finished.
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-artifacts-30d, Status: Enabled, Prefix: "artifacts/30d/", ExpirationInDays: 30 }
+          - { Id: expire-artifacts-90d, Status: Enabled, Prefix: "artifacts/90d/", ExpirationInDays: 90 }
+          - Id: abort-unfinished-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub "${ArtifactsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
 
   SubnetARoutes:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -252,6 +313,17 @@ Resources:
                 Condition:
                   StringEquals:
                     ec2:CreateAction: [RunInstances, CreateFleet]
+              # Artifacts: hatchrun-ci presigns single-object calls for
+              # runners with this role's credentials, so the URLs can do
+              # no more than this.
+              - Sid: ArtifactObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub "${ArtifactsBucket.Arn}/artifacts/*"
               # Ending a job's instance, turning its metadata off, and
               # starting a pool instance a job took.
               - Sid: ManageOwnInstances
@@ -316,3 +388,6 @@ Outputs:
   RoleArn:
     Description: The CI_ROLE_ARN secret of hatchrun-ci
     Value: !GetAtt LauncherRole.Arn
+  ArtifactsBucket:
+    Description: The ARTIFACTS_BUCKET variable of hatchrun-ci
+    Value: !Ref ArtifactsBucket

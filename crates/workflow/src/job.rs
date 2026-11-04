@@ -43,6 +43,12 @@ pub struct JobDocument {
     pub timings: BTreeMap<String, f64>,
     /// The cache service, when the repository has one.
     pub cache: Option<CacheService>,
+    /// Where the job asks for OIDC tokens. `None` unless the job has
+    /// `id-token: write`.
+    pub id_token: Option<IdTokenRequest>,
+    /// The artifact service, when the control plane has one. The agent
+    /// serves `actions/upload-artifact` and `download-artifact` from it.
+    pub artifacts: Option<ArtifactService>,
 }
 
 impl fmt::Debug for JobDocument {
@@ -63,6 +69,8 @@ impl fmt::Debug for JobDocument {
             .field("vars", &self.vars)
             .field("timings", &self.timings)
             .field("cache", &self.cache)
+            .field("id_token", &self.id_token)
+            .field("artifacts", &self.artifacts)
             .finish()
     }
 }
@@ -143,6 +151,49 @@ pub struct CacheService {
 impl fmt::Debug for CacheService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CacheService")
+            .field("url", &self.url)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Where a job with `id-token: write` asks for OIDC tokens: the agent
+/// sets `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN`
+/// from it, only for this job.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct IdTokenRequest {
+    /// The token endpoint. It has a query string, because the toolkit
+    /// appends `&audience=` to it.
+    pub url: String,
+    /// The bearer token for the endpoint, bound to this job's attempt.
+    pub token: String,
+}
+
+impl fmt::Debug for IdTokenRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IdTokenRequest")
+            .field("url", &self.url)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Where and how to reach the artifact service of the control plane.
+/// The token is the job's own; the service answers only for the job's
+/// run.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ArtifactService {
+    /// The service's base URL.
+    pub url: String,
+    /// The bearer token.
+    pub token: String,
+}
+
+impl fmt::Debug for ArtifactService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArtifactService")
             .field("url", &self.url)
             .field("token", &"[redacted]")
             .finish()

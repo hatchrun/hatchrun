@@ -24,6 +24,7 @@ use worker::{
 };
 
 use crate::checks::{JobView, Outbox, conclusion_word, details_url, render};
+use crate::concurrency;
 use crate::env::Settings;
 use crate::github::{
     Capped, CheckRun, check_run_id, create_check_run, revoke_token, update_check_run,
@@ -106,6 +107,26 @@ struct ClaimBody {
 #[derive(Deserialize)]
 struct MessageBody {
     message: String,
+}
+
+/// The optional body of `POST /cancel`: why a concurrency group
+/// cancels the run, and whether the run never started, so its jobs end
+/// whatever their `if:`.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CancelBody {
+    message: Option<String>,
+    outright: bool,
+}
+
+/// The body of a `POST /cancel`: none is a plain cancel, anything else
+/// must parse.
+fn cancel_body(bytes: &[u8]) -> std::result::Result<CancelBody, serde_json::Error> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        Ok(CancelBody::default())
+    } else {
+        serde_json::from_slice(bytes)
+    }
 }
 
 /// What a handler works on: the pieces of state every handler reads,
@@ -339,7 +360,18 @@ impl<'a> Cx<'a> {
                 };
             }
             (Method::Post, "/purge") => return self.purge().await,
-            (Method::Post, "/cancel") => return self.cancel().await,
+            (Method::Post, "/cancel") => {
+                let bytes = req.bytes().await?;
+                return match cancel_body(&bytes) {
+                    Ok(body) => self.cancel(job, attempt, body).await,
+                    Err(err) => {
+                        // A plain cancel would run the `if: always()` jobs
+                        // of a run a group meant to end outright.
+                        worker::console_error!("cancel: bad body: {err}");
+                        Response::error("bad cancel", 400)
+                    }
+                };
+            }
             (Method::Get, "/live" | "/log") => {
                 let Some(job) = job else {
                     return Response::error("a job is needed", 400);
@@ -771,6 +803,7 @@ impl<'a> Cx<'a> {
         match work {
             Work::StartRun => store::run_started(db, info.run_id, self.now).await,
             Work::QueueLaunch { job, attempt } => {
+                self.register_concurrency(db, info, *job, *attempt).await?;
                 // A job that is launching or launched is not queued
                 // again, and no second launch is sent for it.
                 if store::queue_job(db, *job, *attempt, self.now).await? {
@@ -802,10 +835,13 @@ impl<'a> Cx<'a> {
                 )
                 .await?;
                 if ended {
-                    // The freed place goes to the oldest held job.
+                    // The freed place goes to the oldest held job, and
+                    // to the oldest job of its matrix held for
+                    // max-parallel.
                     launches::wake_oldest(&self.env, db, &info.tenant_id).await;
+                    launches::wake_group(&self.env, db, *job).await;
                 }
-                Ok(())
+                concurrency::release(&self.env, db, info.run_id, Some(*job)).await
             }
             Work::FinishRun {
                 attempt,
@@ -818,13 +854,67 @@ impl<'a> Cx<'a> {
                     conclusion_word(*conclusion),
                     self.now,
                 )
-                .await
+                .await?;
+                concurrency::release(&self.env, db, info.run_id, None).await
             }
             Work::ResetJob { job, attempt } => store::reset_job(db, *job, *attempt, self.now).await,
             Work::ReopenRun { attempt } => {
                 store::reopen_run_at(db, info.run_id, *attempt, self.now).await
             }
         }
+    }
+
+    /// Gives the graph the variables of the run's scope when the job
+    /// that ends has a `continue-on-error` to evaluate.
+    async fn load_vars(&self, run: &mut Loaded, job: u64) -> Result<()> {
+        if run
+            .graph
+            .node(job)
+            .is_some_and(|n| n.job.continue_on_error.is_some())
+        {
+            let vars = store::job_vars(
+                self.db().await?,
+                &run.info.tenant_id,
+                run.info.repo.id,
+                None,
+            )
+            .await?;
+            run.graph.set_vars(vars);
+        }
+        Ok(())
+    }
+
+    /// Records the concurrency groups of the job about to be queued, for
+    /// the launch consumer to put in line. Nothing is recorded for a
+    /// job of another attempt, or when neither the workflow nor the job
+    /// names a group.
+    async fn register_concurrency(
+        &self,
+        db: &Db,
+        info: &RunInfo,
+        job: u64,
+        attempt: u32,
+    ) -> Result<()> {
+        let Some(graph) = self.storage.get::<Graph>(GRAPH).await? else {
+            return Ok(());
+        };
+        let Some(node) = graph.node(job) else {
+            return Ok(());
+        };
+        if node.attempt != attempt || (info.concurrency.is_none() && node.job.concurrency.is_none())
+        {
+            return Ok(());
+        }
+        let ctx = self.github_ctx(info).await?;
+        let vars = store::job_vars(db, &info.tenant_id, info.repo.id, None).await?;
+        let workflow_ctx = concurrency::context(&ctx, &vars);
+        let Some(job_ctx) = graph.job_context(job, &ctx, &vars) else {
+            return Ok(());
+        };
+        for slot in concurrency::claims(info, node, &workflow_ctx, &job_ctx, self.now) {
+            store::register(db, &slot).await?;
+        }
+        Ok(())
     }
 
     /// Turns what the graph decided into storage changes now and side
@@ -1082,6 +1172,7 @@ impl<'a> Cx<'a> {
             apply_result(&mut state, &result);
             self.put_job(job, &state).await?;
             let ctx = self.github_ctx(&run.info).await?;
+            self.load_vars(&mut run, job).await?;
             let actions = run.graph_mut().finished(job, result, &ctx);
             let revoke = self.apply_actions(&mut run, actions).await?;
             self.commit(&mut run).await?;
@@ -1103,6 +1194,7 @@ impl<'a> Cx<'a> {
                 Gate::Stale | Gate::Ended => return answer(409),
             }
             let ctx = self.github_ctx(&run.info).await?;
+            self.load_vars(&mut run, job).await?;
             let actions = run.graph_mut().failed(job, message, &ctx);
             let revoke = self.apply_actions(&mut run, actions).await?;
             self.commit(&mut run).await?;
@@ -1134,14 +1226,38 @@ impl<'a> Cx<'a> {
         answer(204)
     }
 
-    async fn cancel(&self) -> Result<Response> {
+    /// Cancels the run, or with `job` that job only. A `message` is why
+    /// a concurrency group cancels it; the check runs show it.
+    async fn cancel(
+        &self,
+        job: Option<u64>,
+        attempt: Option<u32>,
+        body: CancelBody,
+    ) -> Result<Response> {
         let revoke = {
             let _turn = self.turn.lock().await;
             let Some(mut run) = self.loaded().await? else {
                 return answer(204);
             };
+            if job.is_none() && attempt.is_some_and(|a| a != run.info.run_attempt) {
+                // Queued for an earlier attempt, before a rerun.
+                return answer(409);
+            }
             let ctx = self.github_ctx(&run.info).await?;
-            let actions = run.graph_mut().cancel(&ctx);
+            let actions = match (job, &body.message) {
+                (Some(job), message) => {
+                    let Some(attempt) = attempt else {
+                        return Response::error("an attempt is needed", 400);
+                    };
+                    let message = message.as_deref().unwrap_or("Cancelled.");
+                    run.graph_mut().cancel_job(job, attempt, message, &ctx)
+                }
+                (None, Some(message)) => {
+                    run.graph_mut()
+                        .cancel_for_group(message, body.outright, &ctx)
+                }
+                (None, None) => run.graph_mut().cancel(&ctx),
+            };
             if run.graph.conclusion().is_none() {
                 let at = self.now + ESCALATE_AFTER_MS;
                 run.deadlines_mut().escalate_at.get_or_insert(at);
@@ -1433,6 +1549,21 @@ impl<'a> Cx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancel_body_that_does_not_parse_is_refused_not_defaulted() {
+        let plain = cancel_body(b"").unwrap();
+        assert_eq!((plain.message, plain.outright), (None, false));
+        assert!(cancel_body(b" \n").is_ok());
+        let outright = cancel_body(br#"{"message":"m","outright":true}"#).unwrap();
+        assert_eq!(
+            (outright.message.as_deref(), outright.outright),
+            (Some("m"), true)
+        );
+        // A mangled body must not turn an outright cancel into a plain one.
+        assert!(cancel_body(br#"{"message":"m","outright":tru"#).is_err());
+        assert!(cancel_body(br#"{"outright":"yes"}"#).is_err());
+    }
 
     #[test]
     fn the_restore_key_is_built_from_the_run_and_tenant_of_the_request() {

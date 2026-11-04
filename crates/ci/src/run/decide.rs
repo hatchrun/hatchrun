@@ -145,6 +145,8 @@ pub(crate) fn job_document(
         vars: std::collections::BTreeMap::new(),
         timings: std::collections::BTreeMap::new(),
         cache: None,
+        id_token: None,
+        artifacts: None,
     })
 }
 
@@ -628,6 +630,7 @@ pub(super) mod tests {
             actor: "octocat".to_owned(),
             head_ref: String::new(),
             base_ref: String::new(),
+            concurrency: None,
         }
     }
 

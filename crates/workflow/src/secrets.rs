@@ -245,9 +245,12 @@ mod tests {
             env: BTreeMap::from([("A".into(), "${{ secrets.ONE }}".into())]),
             if_: None,
             timeout_minutes: 10,
+            continue_on_error: None,
+            strategy: None,
             outputs: BTreeMap::new(),
             token_permissions: BTreeMap::new(),
             environment: None,
+            concurrency: None,
             steps: vec![step],
         };
         let refs = job.secret_refs();

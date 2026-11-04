@@ -16,9 +16,10 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::concurrency::{Cancel, Concurrency, JOB_CONTEXTS, WORKFLOW_CONTEXTS};
 use crate::config::{
-    CacheStep, CheckoutStep, Config, Job, Matrix, Outcome, Parameter, ParameterKind, RunStep,
-    Statuses, Step, UsesStep, Workflow, WorkflowJob, WorkspaceStep,
+    CacheStep, CheckoutStep, Config, ContinueOnError, Job, Matrix, Outcome, Parameter,
+    ParameterKind, RunStep, Statuses, Step, UsesStep, Workflow, WorkflowJob, WorkspaceStep,
 };
 use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
@@ -101,13 +102,18 @@ const STEP_KEYS: &[&str] = &[
 
 /// Keys of a workflow entry. A job parameter with one of these names
 /// could never be set from a workflow: the entry reads the key itself.
-pub(crate) const ENTRY_KEYS: &[&str] = &["name", "requires", "type", "branches", "tags", "matrix"];
+pub(crate) const ENTRY_KEYS: &[&str] = &[
+    "name", "requires", "type", "branches", "tags", "matrix", "strategy",
+];
 
 /// The jobs one workflow runs for one ref.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Plan {
     /// The workflow's name.
     pub workflow: String,
+    /// The workflow's `concurrency`, unevaluated: the host reads it
+    /// against the event when the run is about to start.
+    pub concurrency: Option<Concurrency>,
     /// The jobs. Every job comes after the jobs it requires.
     pub jobs: Vec<PlannedJob>,
 }
@@ -143,6 +149,15 @@ pub struct PlannedJob {
     pub if_: Option<String>,
     /// The job is cancelled after this many minutes.
     pub timeout_minutes: u32,
+    /// `continue-on-error` after parameter substitution: `true` or an
+    /// expression read when the job ends. A failed job counts as a
+    /// success when it holds. `None` when the job sets none or `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_on_error: Option<String>,
+    /// How this job runs with the other copies of its matrix. `None`
+    /// for a job whose entry has no matrix and no `strategy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<PlannedStrategy>,
     /// Values later jobs can read.
     pub outputs: BTreeMap<String, String>,
     /// GitHub App permissions for the job's token, from its
@@ -151,8 +166,51 @@ pub struct PlannedJob {
     /// The environment the job deploys to, after parameter substitution.
     /// `None` for approval jobs and jobs without one.
     pub environment: Option<String>,
+    /// The job's `concurrency`, parameters substituted, the rest left
+    /// for the host to evaluate when the job is about to start.
+    pub concurrency: Option<Concurrency>,
     /// The steps, with commands expanded.
     pub steps: Vec<PlannedStep>,
+}
+
+/// The `strategy` of a planned job: how it runs with the other jobs of
+/// its matrix, which share its `group`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PlannedStrategy {
+    /// The name the jobs of one matrix share. Unique to the workflow.
+    pub group: String,
+    /// A failed job cancels the others of the group that have not ended.
+    pub fail_fast: bool,
+    /// The most jobs of the group that run at once; `None` is no limit.
+    pub max_parallel: Option<u32>,
+    /// This job's place in the group, from 0, in plan order.
+    pub job_index: u32,
+    /// The jobs in the group.
+    pub job_total: u32,
+}
+
+impl PlannedJob {
+    /// The `strategy` context of the job: `fail-fast`, `job-index`,
+    /// `job-total` and `max-parallel`. A job without a strategy reads as
+    /// the only job of its matrix.
+    #[must_use]
+    pub fn strategy_context(&self) -> Value {
+        let (fail_fast, index, total, max) = match &self.strategy {
+            Some(s) => (
+                s.fail_fast,
+                s.job_index,
+                s.job_total,
+                s.max_parallel.unwrap_or(s.job_total),
+            ),
+            None => (true, 0, 1, 1),
+        };
+        serde_json::json!({
+            "fail-fast": fail_fast,
+            "job-index": index,
+            "job-total": total,
+            "max-parallel": max,
+        })
+    }
 }
 
 /// What a planned job does.
@@ -482,8 +540,14 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
         if let Some(cond) = &job.if_ {
             check.cond(&"`if`", cond);
         }
+        if let Some(ContinueOnError::When(text)) = &job.continue_on_error {
+            check.cond(&"`continue-on-error`", text);
+        }
         for (key, value) in &job.outputs {
             check.text(&format_args!("`outputs.{key}`"), value);
+        }
+        if let Some(c) = &job.concurrency {
+            check.concurrency(c, JOB_CONTEXTS);
         }
         check.steps(&job.steps);
     }
@@ -499,6 +563,16 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
         .steps(&command.steps);
     }
     for (workflow, wf) in &config.workflows {
+        if let Some(c) = &wf.concurrency {
+            let owner = format!("workflow `{workflow}`");
+            Check {
+                config,
+                owner: &owner,
+                params: None,
+                errors,
+            }
+            .concurrency(c, WORKFLOW_CONTEXTS);
+        }
         for entry in &wf.jobs {
             let id = entry.name.as_deref().unwrap_or(&entry.job);
             let owner = format!("workflow `{workflow}` entry `{id}`");
@@ -636,6 +710,45 @@ impl Check<'_> {
                     self.text(&at("test-results"), path);
                 }
                 Step::Command { name, with } => self.call(&at(name), name, with),
+            }
+        }
+    }
+
+    /// Checks a `concurrency` key: its expressions parse and read only
+    /// the contexts in `allowed`, and it reads no parameter where none
+    /// can be substituted.
+    fn concurrency(&mut self, c: &Concurrency, allowed: &[&str]) {
+        for (field, text, bare) in c.texts() {
+            let label = format!("`concurrency.{field}`");
+            let wrapped;
+            let text = if bare && expr::find_open(text).is_none() {
+                wrapped = format!("${{{{ {text} }}}}");
+                wrapped.as_str()
+            } else {
+                text
+            };
+            if self.text(&label, text) {
+                self.errors.push(Diagnostic::new(format!(
+                    "{} {label} reads `parameters`, which it cannot here",
+                    self.owner
+                )));
+            }
+            let Ok(found) = expr::expressions(text) else {
+                continue;
+            };
+            for (_, inner) in found {
+                if parameter_name(inner).is_some() {
+                    continue;
+                }
+                for (name, _) in expr::contexts(inner).unwrap_or_default() {
+                    if !allowed.contains(&name.as_ref()) && name != "parameters" {
+                        self.errors.push(Diagnostic::new(format!(
+                            "{} {label} reads `{name}`; it can read only {}",
+                            self.owner,
+                            allowed.join(", ")
+                        )));
+                    }
+                }
             }
         }
     }
@@ -849,6 +962,7 @@ fn compile_workflow(
     }
 
     let (deps, wanted) = dependencies(name, wf, &ids, &index, errors);
+    strategy_errors(name, wf, &ids, errors);
 
     let mut planned = 0;
     let expansions: Vec<Vec<PlannedJob>> = wf
@@ -914,8 +1028,10 @@ fn compile_workflow(
             jobs.push(job);
         }
     }
+    number_groups(&mut jobs);
     Some(Plan {
         workflow: name.to_owned(),
+        concurrency: wf.concurrency.clone(),
         jobs,
     })
 }
@@ -1276,12 +1392,127 @@ fn expand_entry(
         if job.permissions.is_none() {
             base.token_permissions = token_scopes(wf.permissions.as_ref());
         }
+        if !attach_strategy(&mut base, entry, id, &mut walk, errors) {
+            break;
+        }
         let Some(jobs) = copy_job(base, combo, id, nodes, &mut walk, errors) else {
             break;
         };
         out.extend(jobs);
     }
     out
+}
+
+/// The group an entry's jobs belong to: its `strategy.group`, else its
+/// id.
+fn strategy_group<'a>(entry: &'a WorkflowJob, id: &'a str) -> &'a str {
+    entry
+        .strategy
+        .as_ref()
+        .and_then(|s| s.group.as_deref())
+        .unwrap_or(id)
+}
+
+/// Gives a job its strategy when its entry has a matrix or a
+/// `strategy`. The job's place in its group is set once the whole plan
+/// is known: see [`number_groups`]. The group's name is charged before
+/// it is copied; false once the budget is spent.
+fn attach_strategy(
+    job: &mut PlannedJob,
+    entry: &WorkflowJob,
+    id: &str,
+    walk: &mut Walk<'_>,
+    errors: &mut Vec<Diagnostic>,
+) -> bool {
+    if entry.matrix.is_empty() && entry.strategy.is_none() {
+        return true;
+    }
+    let group = strategy_group(entry, id);
+    if !walk.bytes(group.len() + ENTRY_OVERHEAD, errors) {
+        return false;
+    }
+    let strategy = entry.strategy.clone().unwrap_or_default();
+    job.strategy = Some(PlannedStrategy {
+        group: group.to_owned(),
+        fail_fast: strategy.fail_fast,
+        max_parallel: strategy.max_parallel,
+        job_index: 0,
+        job_total: 1,
+    });
+    true
+}
+
+/// Numbers the jobs of each strategy group in plan order and counts
+/// them, for `strategy.job-index` and `strategy.job-total`.
+fn number_groups(jobs: &mut [PlannedJob]) {
+    let mut totals: BTreeMap<String, u32> = BTreeMap::new();
+    for strategy in jobs.iter().filter_map(|j| j.strategy.as_ref()) {
+        *totals.entry(strategy.group.clone()).or_default() += 1;
+    }
+    let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+    for strategy in jobs.iter_mut().filter_map(|j| j.strategy.as_mut()) {
+        let next = seen.entry(strategy.group.clone()).or_default();
+        strategy.job_index = *next;
+        strategy.job_total = totals[&strategy.group];
+        *next += 1;
+    }
+}
+
+/// Reports a `strategy` that cannot work: `max-parallel` of 0, an empty
+/// `group`, and entries of one group that disagree on `fail-fast` or
+/// `max-parallel`, which would make the group's behavior depend on which
+/// job ended first.
+fn strategy_errors(name: &str, wf: &Workflow, ids: &[String], errors: &mut Vec<Diagnostic>) {
+    let mut groups: BTreeMap<&str, (&str, bool, Option<u32>)> = BTreeMap::new();
+    for (entry, id) in wf.jobs.iter().zip(ids) {
+        let Some(strategy) = &entry.strategy else {
+            continue;
+        };
+        if entry.approval {
+            continue;
+        }
+        let owner = format!("workflow `{name}` entry `{id}`");
+        if strategy.max_parallel == Some(0) {
+            errors.push(Diagnostic::new(format!(
+                "{owner} has `strategy.max-parallel: 0`; it must be 1 or more"
+            )));
+        }
+        // The database holds it in an integer column.
+        if strategy
+            .max_parallel
+            .is_some_and(|n| i32::try_from(n).is_err())
+        {
+            errors.push(Diagnostic::new(format!(
+                "{owner} has a `strategy.max-parallel` above {}; it must be at most that",
+                i32::MAX
+            )));
+        }
+        if strategy.group.as_deref().is_some_and(str::is_empty) {
+            errors.push(Diagnostic::new(format!(
+                "{owner} has an empty `strategy.group`"
+            )));
+        }
+    }
+    for (entry, id) in wf.jobs.iter().zip(ids) {
+        if entry.approval || (entry.matrix.is_empty() && entry.strategy.is_none()) {
+            continue;
+        }
+        let strategy = entry.strategy.clone().unwrap_or_default();
+        let group = strategy_group(entry, id);
+        match groups.get(group) {
+            None => {
+                groups.insert(group, (id, strategy.fail_fast, strategy.max_parallel));
+            }
+            Some(&(first, fail_fast, max_parallel))
+                if fail_fast != strategy.fail_fast || max_parallel != strategy.max_parallel =>
+            {
+                errors.push(Diagnostic::new(format!(
+                    "workflow `{name}` entries `{first}` and `{id}` share strategy group `{group}` but differ in `fail-fast` or `max-parallel`; make them agree"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
 }
 
 /// The id of one matrix entry's job: the entry id, then `(<v1>, <v2>)`
@@ -1626,6 +1857,11 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
             "approval `{id}` cannot have a matrix"
         )));
     }
+    if entry.strategy.is_some() {
+        errors.push(Diagnostic::new(format!(
+            "approval `{id}` cannot have a strategy"
+        )));
+    }
     if errors.len() > before {
         return Vec::new();
     }
@@ -1640,9 +1876,12 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         env: BTreeMap::new(),
         if_: None,
         timeout_minutes: DEFAULT_TIMEOUT_MINUTES,
+        continue_on_error: None,
+        strategy: None,
         outputs: BTreeMap::new(),
         token_permissions: BTreeMap::new(),
         environment: None,
+        concurrency: None,
         steps: Vec::new(),
     }]
 }
@@ -1805,7 +2044,25 @@ fn expand_job(
     };
     let env = sub.map(&job.env);
     let if_ = sub.opt(job.if_.as_deref());
+    let continue_on_error = match &job.continue_on_error {
+        None | Some(ContinueOnError::Always(false)) => None,
+        Some(ContinueOnError::Always(true)) => Some("true".to_owned()),
+        Some(ContinueOnError::When(text)) => sub.opt(Some(text)),
+    };
     let outputs = sub.map(&job.outputs);
+    let concurrency = job.concurrency.as_ref().map(|c| Concurrency {
+        group: sub.text(&c.group),
+        cancel_in_progress: match &c.cancel_in_progress {
+            Cancel::When(text) => Cancel::When(if parameter_name(text).is_some() {
+                // A bare `parameters.NAME` is an expression without
+                // braces; its value stands in for it.
+                sub.text(&format!("${{{{ {text} }}}}"))
+            } else {
+                sub.text(text)
+            }),
+            other => other.clone(),
+        },
+    });
     let environment = sub.opt(job.environment.as_deref());
     if let Some(name) = &environment {
         if name.contains("${{") {
@@ -1832,9 +2089,12 @@ fn expand_job(
         env,
         if_,
         timeout_minutes: job.timeout_minutes.unwrap_or(DEFAULT_TIMEOUT_MINUTES),
+        continue_on_error,
+        strategy: None,
         outputs,
         token_permissions: token_scopes(job.permissions.as_ref()),
         environment,
+        concurrency,
         steps,
     })
 }
@@ -2503,6 +2763,15 @@ fn job_bytes(job: &PlannedJob) -> usize {
         + map_bytes(&job.env)
         + map_bytes(&job.outputs)
         + job.if_.as_ref().map_or(0, String::len)
+        + job.continue_on_error.as_ref().map_or(0, String::len)
+        + job.strategy.as_ref().map_or(0, |s| s.group.len())
+        + job.concurrency.as_ref().map_or(0, |c| {
+            c.group.len()
+                + match &c.cancel_in_progress {
+                    Cancel::When(text) => text.len(),
+                    _ => 0,
+                }
+        })
 }
 
 /// A parameter or matrix value as text: strings as they are, whole

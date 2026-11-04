@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use hatchrun_workflow::{
-    Conversion, Diagnostic, Filter, JobKind, Level, ParameterKind, Permissions, Require, Step,
-    convert, parse, to_yaml, validate,
+    ContinueOnError, Conversion, Diagnostic, Filter, JobKind, Level, ParameterKind, Permissions,
+    Require, Step, convert, parse, to_yaml, validate,
 };
 use serde_json::{Value, json};
 
@@ -285,19 +285,33 @@ jobs:
     steps:
       - run: npm test
 ");
-    for key in ["container", "concurrency", "fail-fast"] {
-        assert!(
-            has(&out.warnings, &["ci.yml", "build", key]),
-            "{key}: {:?}",
-            out.warnings
-        );
-    }
     assert!(
-        out.warnings.iter().any(|w| w.message.contains("ci.yml")
-            && !w.message.contains("build")
-            && w.message.contains("concurrency")),
+        has(&out.warnings, &["ci.yml", "build", "container"]),
+        "container: {:?}",
+        out.warnings
+    );
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|w| w.message.contains("concurrency")),
         "{:?}",
         out.warnings
+    );
+    assert_eq!(
+        out.config.workflows["ci"]
+            .concurrency
+            .as_ref()
+            .unwrap()
+            .group,
+        "ci"
+    );
+    assert_eq!(
+        out.config.jobs["ci-build"]
+            .concurrency
+            .as_ref()
+            .unwrap()
+            .group,
+        "build"
     );
     // `exclude` passes through; the `include` entry matches no
     // combination, so it runs as an entry of its own.
@@ -382,7 +396,7 @@ jobs:
 }
 
 #[test]
-fn id_token_is_dropped_with_a_warning() {
+fn id_token_write_is_kept() {
     let out = ok("
 on: push
 jobs:
@@ -392,10 +406,38 @@ jobs:
     steps:
       - run: x
 ");
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert_eq!(
+        out.config.jobs["ci-build"].permissions,
+        Some(Permissions::Scopes(
+            [
+                ("contents".to_owned(), Level::Read),
+                ("id-token".to_owned(), Level::Write),
+            ]
+            .into()
+        ))
+    );
+    round_trips(&out);
+}
+
+#[test]
+fn id_token_read_is_dropped_with_a_warning() {
+    let out = ok("
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: { id-token: read, contents: read }
+    steps:
+      - run: x
+");
     assert!(
         has(
             &out.warnings,
-            &["build", "`id-token` is not supported and was dropped"]
+            &[
+                "build",
+                "`permissions.id-token` is `read`, not write or none"
+            ]
         ),
         "{:?}",
         out.warnings
@@ -406,7 +448,6 @@ jobs:
             [("contents".to_owned(), Level::Read)].into()
         ))
     );
-    round_trips(&out);
 }
 
 #[test]
@@ -711,8 +752,8 @@ jobs:
 }
 
 #[test]
-fn a_job_that_reads_strategy_or_jobs_is_dropped() {
-    // hatchrun provides neither context, so validate would reject the
+fn a_job_that_reads_the_jobs_context_is_dropped() {
+    // hatchrun provides no `jobs` context, so validate would reject the
     // job; convert leaves it out instead and its output validates.
     let out = ok("
 on: push
@@ -729,11 +770,6 @@ jobs:
     runs-on: ubuntu-latest
     steps: [{ run: lint }]
 ");
-    assert!(
-        has(&out.errors, &["`b`", "`strategy` context"]),
-        "{:?}",
-        out.errors
-    );
     assert!(
         has(&out.errors, &["`b`", "`jobs` context"]),
         "{:?}",
@@ -2460,5 +2496,143 @@ jobs:
         Some("${{ parameters.affected }}")
     );
     assert!(has(&out.warnings, &["could not be combined"]));
+    round_trips(&out);
+}
+
+#[test]
+fn fail_fast_and_max_parallel_become_the_entry_strategy() {
+    let out = ok("
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: { node: [18, 20, 22] }
+    steps: [{ run: \"echo ${{ strategy.job-index }} of ${{ strategy.job-total }}\" }]
+  lint:
+    runs-on: ubuntu-latest
+    strategy: { matrix: { node: [20] } }
+    steps: [{ run: lint }]
+");
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|w| w.message.contains("fail-fast") || w.message.contains("max-parallel")),
+        "{:?}",
+        out.warnings
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    let jobs = &out.config.workflows["ci"].jobs;
+    let strategy = jobs[0].strategy.as_ref().unwrap();
+    assert!(!strategy.fail_fast);
+    assert_eq!(strategy.max_parallel, Some(2));
+    assert_eq!(strategy.group, None);
+    assert_eq!(jobs[1].strategy, None);
+    round_trips(&out);
+}
+
+#[test]
+fn include_entries_stay_one_matrix_through_a_group() {
+    let out = ok("
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        node: [18, 20]
+        include:
+          - node: 22
+            experimental: true
+    steps: [{ run: x }]
+");
+    let jobs = &out.config.workflows["ci"].jobs;
+    assert!(jobs.len() > 1, "{jobs:?}");
+    for entry in jobs {
+        let strategy = entry.strategy.as_ref().unwrap();
+        assert_eq!(strategy.group.as_deref(), Some("ci-build"));
+        assert!(!strategy.fail_fast);
+        assert_eq!(strategy.max_parallel, Some(3));
+    }
+    round_trips(&out);
+}
+
+#[test]
+fn bad_strategy_values_are_dropped_with_a_warning() {
+    let out = ok("
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: ${{ github.ref == 'x' }}
+      max-parallel: 0
+      matrix: { node: [18] }
+    steps: [{ run: x }]
+");
+    assert!(has(&out.warnings, &["build", "fail-fast", "expression"]));
+    assert!(has(&out.warnings, &["build", "max-parallel", "1 or more"]));
+    let strategy = &out.config.workflows["ci"].jobs[0].strategy;
+    assert_eq!(strategy, &None);
+    round_trips(&out);
+}
+
+#[test]
+fn job_continue_on_error_converts() {
+    let out = ok("
+on: push
+jobs:
+  soft:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps: [{ run: x }]
+  matrixed:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      matrix:
+        node: [18, 20]
+        experimental: [false]
+    steps: [{ run: x }]
+  odd:
+    runs-on: ubuntu-latest
+    continue-on-error: maybe
+    steps: [{ run: x }]
+");
+    let jobs = &out.config.jobs;
+    assert_eq!(
+        jobs["ci-soft"].continue_on_error,
+        Some(ContinueOnError::Always(true))
+    );
+    assert_eq!(
+        jobs["ci-matrixed"].continue_on_error,
+        Some(ContinueOnError::When("${{ matrix.experimental }}".into()))
+    );
+    assert_eq!(jobs["ci-odd"].continue_on_error, None);
+    assert!(has(&out.warnings, &["odd", "continue-on-error", "maybe"]));
+    assert!(
+        !has(&out.warnings, &["soft", "continue-on-error"])
+            && !has(&out.warnings, &["matrixed", "continue-on-error"])
+    );
+    round_trips(&out);
+}
+
+#[test]
+fn a_job_that_reads_the_strategy_context_converts() {
+    let out = ok("
+on: push
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    strategy: { matrix: { n: [1, 2] } }
+    if: strategy.job-index == 0
+    steps: [{ run: \"echo ${{ strategy.job-total }} ${{ strategy['max-parallel'] }}\" }]
+");
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    assert!(out.config.jobs.contains_key("ci-b"));
     round_trips(&out);
 }

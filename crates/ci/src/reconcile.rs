@@ -9,7 +9,7 @@
 //! 1. fires the `on: schedule` workflows of the minutes since the last
 //!    pass;
 //! 2. sends the launches that stalled again, and fails the ones that
-//!    never finished;
+//!    never finished, and sends the cancel of a superseded run again;
 //! 3. fails the jobs whose runner went quiet;
 //! 4. terminates instances that no job needs;
 //! 5. keeps the warm pool of each runner template at the size the last
@@ -52,6 +52,7 @@ use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, Template, UtcMinute};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
+use crate::concurrency;
 use crate::env::{Settings, run_stub};
 use crate::github;
 use crate::intake::Repo;
@@ -82,6 +83,9 @@ const HELD_EVERY_MINUTES: u64 = 15;
 /// The backstop leaves a held job alone for this long after its last
 /// hold.
 pub const HELD_QUIET_MS: u64 = 10 * 60_000;
+/// The most cancels of superseded runs and jobs one pass sends again,
+/// apart from [`BUDGET`].
+pub const MAX_RECANCELS: u32 = 10;
 /// The most instances one pass terminates as orphans.
 pub const MAX_TERMINATIONS: usize = 50;
 
@@ -464,6 +468,12 @@ pub async fn run(env: Env) {
     {
         console_error!("reconcile: held jobs: {err}");
     }
+    let cancels = Budget::new(MAX_RECANCELS);
+    if let Err(err) =
+        concurrency::resend_cancels(&env, &db, MAX_RECANCELS, || cancels.take(1)).await
+    {
+        console_error!("reconcile: superseded runs: {err}");
+    }
     if let Ok(backend) = &backend
         && let Err(err) = end_orphans(&db, backend, &Budget::new(share.orphans), now).await
     {
@@ -835,6 +845,11 @@ async fn fail_job(env: &Env, db: &Db, row: &JobRow, message: &str, now: u64) -> 
     }
 }
 
+/// Whether `current` is `attempt` of a job that has completed.
+fn attempt_ended(current: Option<&JobRow>, attempt: u32) -> bool {
+    current.is_some_and(|job| job.attempt == attempt && job.status == "completed")
+}
+
 /// Completes the attempt of `row` as failed in the database, for a job
 /// no run object holds, and the run with it once every job is over.
 pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Result<(), String> {
@@ -842,8 +857,21 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
         .await
         .map_err(|e| e.to_string())?;
     if !ended {
+        // An earlier call may have completed the row and failed before
+        // it gave up the place. Release it when this attempt is the one
+        // that ended; a later attempt holds its own place.
+        let now_row = store::job(db, row.id).await.map_err(|e| e.to_string())?;
+        if attempt_ended(now_row.as_ref(), row.attempt) {
+            concurrency::release(env, db, row.run_id, Some(row.id))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         return Ok(());
     }
+    // The job is over, so its place in a concurrency group is free.
+    concurrency::release(env, db, row.run_id, Some(row.id))
+        .await
+        .map_err(|e| e.to_string())?;
     let Some(run) = store::run(db, row.run_id)
         .await
         .map_err(|e| e.to_string())?
@@ -851,11 +879,15 @@ pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Resu
         return Ok(());
     };
     launches::wake_oldest(env, db, &run.tenant_id).await;
+    launches::wake_group(env, db, row.id).await;
     let jobs = store::jobs_for_run(db, run.id)
         .await
         .map_err(|e| e.to_string())?;
     if jobs.iter().all(|job| job.status == "completed") {
         store::finish_run(db, run.id, run.run_attempt, "failure", now)
+            .await
+            .map_err(|e| e.to_string())?;
+        concurrency::release(env, db, run.id, None)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1400,6 +1432,17 @@ mod tests {
 
     const MIN: u64 = 60_000;
     const NOW: u64 = 1_792_676_700_000; // 2026-10-22 13:45:00 UTC
+
+    #[test]
+    fn only_the_attempt_that_ended_gives_up_its_place() {
+        let mut done = row("completed");
+        assert!(attempt_ended(Some(&done), 1));
+        assert!(!attempt_ended(Some(&done), 2));
+        done.attempt = 2;
+        done.status = "queued".into();
+        assert!(!attempt_ended(Some(&done), 2));
+        assert!(!attempt_ended(None, 1));
+    }
 
     fn row(status: &str) -> JobRow {
         let mut row: JobRow = serde_json::from_value(json!({

@@ -34,8 +34,10 @@ pub(super) fn malformed(msg: String) -> Reply {
 }
 
 pub(super) async fn lookup(state: &State, request: twirp::LookupRequest) -> Reply {
-    let found = state
-        .cloud
+    let Some(cloud) = &state.cloud else {
+        return json(&twirp::LookupResponse::miss());
+    };
+    let found = cloud
         .lookup(&request.key, &request.restore_keys, &request.version)
         .await;
     let response = match found {
@@ -84,7 +86,14 @@ pub(super) async fn lookup(state: &State, request: twirp::LookupRequest) -> Repl
 }
 
 pub(super) async fn create(state: &State, request: twirp::CreateRequest) -> Reply {
-    let id = match state.cloud.start(&request.key, &request.version).await {
+    let Some(cloud) = &state.cloud else {
+        return twirp_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "this job has no cache service",
+        );
+    };
+    let id = match cloud.start(&request.key, &request.version).await {
         Ok(Some(id)) => id,
         Ok(None) => {
             info!(key = request.key, "cache entry exists, not saving");
@@ -115,6 +124,7 @@ pub(super) async fn create(state: &State, request: twirp::CreateRequest) -> Repl
         id.clone(),
         Arc::new(Upload {
             id,
+            cloud: cloud.clone(),
             state: Mutex::new(UploadState::default()),
         }),
     );
@@ -154,14 +164,14 @@ pub(super) async fn finalize(state: &State, request: twirp::FinalizeRequest) -> 
         }
     };
     let Some(parts) = parts else {
-        abandon(state, &upload.id).await;
+        abandon(&upload).await;
         warn!(
             key = request.key,
             "cache save finalized without a whole upload"
         );
         return refuse("the upload did not finish".into());
     };
-    match state.cloud.complete(&upload.id, &parts).await {
+    match upload.cloud.complete(&upload.id, &parts).await {
         Ok(true) => {
             info!(key = request.key, size = request.size_bytes, "cache saved");
             json(&twirp::FinalizeResponse {
@@ -176,14 +186,14 @@ pub(super) async fn finalize(state: &State, request: twirp::FinalizeRequest) -> 
         }
         Err(err) => {
             warn!(key = request.key, "cache save failed: {err:#}");
-            abandon(state, &upload.id).await;
+            abandon(&upload).await;
             refuse(format!("{err:#}"))
         }
     }
 }
 
-async fn abandon(state: &State, id: &str) {
-    if let Err(err) = state.cloud.abort(id).await {
-        debug!(upload = id, "abandon cache upload: {err:#}");
+pub(super) async fn abandon(upload: &Upload) {
+    if let Err(err) = upload.cloud.abort(&upload.id).await {
+        debug!(upload = upload.id, "abandon upload: {err:#}");
     }
 }

@@ -34,9 +34,12 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
             env: BTreeMap::new(),
             if_: None,
             timeout_minutes: 360,
+            continue_on_error: None,
+            strategy: None,
             outputs: BTreeMap::new(),
             token_permissions: BTreeMap::new(),
             environment: None,
+            concurrency: None,
             steps,
         },
         event_name: "push".to_owned(),
@@ -61,6 +64,8 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
         vars: BTreeMap::new(),
         timings: BTreeMap::new(),
         cache: None::<CacheService>,
+        id_token: None,
+        artifacts: None,
     }
 }
 

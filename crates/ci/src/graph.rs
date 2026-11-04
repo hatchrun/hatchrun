@@ -13,13 +13,20 @@ use std::collections::BTreeMap;
 
 use hatchrun_workflow::{
     Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Need, Outcome, Plan,
-    PlannedJob, Ready, Statuses, checks_status, hatchrun_context, job_condition, ready,
+    PlannedJob, Ready, Statuses, checks_status, continue_on_error, hatchrun_context, job_condition,
+    ready,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// The message of an approval job, which ends as skipped for now.
 const APPROVAL_MESSAGE: &str = "Approval jobs come in a later release.";
+
+/// Why a job that failed ends as a success.
+const CONTINUED: &str = "The job failed, and continue-on-error counts it as a success.";
+
+/// Why a job of a matrix ends as cancelled when another one failed.
+const FAIL_FAST: &str = "Canceled because another job of its matrix failed and fail-fast is on.";
 
 /// The jobs of a run, in plan order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +37,10 @@ pub struct Graph {
     pub cancelled: bool,
     /// `RunDone` was emitted and no rerun has reset it.
     run_done: bool,
+    /// The repository and organization variables `continue-on-error`
+    /// reads. Not stored; [`Graph::set_vars`] fills it before a job ends.
+    #[serde(skip)]
+    vars: BTreeMap<String, String>,
 }
 
 /// One job of a run.
@@ -127,7 +138,14 @@ impl Graph {
                 .collect(),
             cancelled: false,
             run_done: false,
+            vars: BTreeMap::new(),
         }
+    }
+
+    /// Gives the graph the variables the `continue-on-error` of a job
+    /// that ends reads as `vars.NAME`.
+    pub fn set_vars(&mut self, vars: BTreeMap<String, String>) {
+        self.vars = vars;
     }
 
     /// Starts every waiting job whose requirements ended, ends the ones
@@ -168,10 +186,14 @@ impl Graph {
         if !matches!(self.jobs[at].state, State::Queued | State::Running) {
             return Vec::new();
         }
-        let conclusion = result.conclusion;
+        let (conclusion, note) = self.forgive(at, result.conclusion, github_ctx);
         self.jobs[at].result = Some(result);
         self.jobs[at].state = State::Done(conclusion);
+        if note.is_some() {
+            self.jobs[at].message = note;
+        }
         let mut actions = vec![Action::Finished { job, conclusion }];
+        self.fail_fast(at, &mut actions);
         actions.extend(self.advance(github_ctx));
         actions
     }
@@ -185,12 +207,14 @@ impl Graph {
         if !matches!(self.jobs[at].state, State::Queued | State::Running) {
             return Vec::new();
         }
-        self.jobs[at].message = Some(message);
-        self.jobs[at].state = State::Done(Conclusion::Failure);
-        let mut actions = vec![Action::Finished {
-            job,
-            conclusion: Conclusion::Failure,
-        }];
+        let (conclusion, note) = self.forgive(at, Conclusion::Failure, github_ctx);
+        self.jobs[at].message = Some(match note {
+            Some(note) => format!("{message} {note}"),
+            None => message,
+        });
+        self.jobs[at].state = State::Done(conclusion);
+        let mut actions = vec![Action::Finished { job, conclusion }];
+        self.fail_fast(at, &mut actions);
         actions.extend(self.advance(github_ctx));
         actions
     }
@@ -219,6 +243,91 @@ impl Graph {
             }
         }
         actions.extend(self.advance(github_ctx));
+        actions
+    }
+
+    /// Cancels the run because of a concurrency group, and says why on
+    /// every job it stops. Without `outright` this is [`Graph::cancel`]:
+    /// jobs whose `if:` still holds (`always()`) run on. With it the run
+    /// never started, so every job that has not started ends as
+    /// cancelled whatever its `if:`.
+    pub fn cancel_for_group(
+        &mut self,
+        message: &str,
+        outright: bool,
+        github_ctx: &Value,
+    ) -> Vec<Action> {
+        let open: Vec<bool> = self
+            .jobs
+            .iter()
+            .map(|n| !matches!(n.state, State::Done(_)))
+            .collect();
+        let mut actions = Vec::new();
+        if outright {
+            self.cancelled = true;
+            for at in 0..self.jobs.len() {
+                match self.jobs[at].state {
+                    State::Running if self.jobs[at].cancel == 0 => {
+                        self.jobs[at].cancel = 1;
+                        actions.push(Action::Cancel {
+                            job: self.jobs[at].id,
+                            count: 1,
+                        });
+                    }
+                    State::Waiting | State::Queued => {
+                        self.end(at, Conclusion::Cancelled, None, &mut actions);
+                    }
+                    _ => {}
+                }
+            }
+            actions.extend(self.advance(github_ctx));
+        } else {
+            actions = self.cancel(github_ctx);
+        }
+        for (node, was_open) in self.jobs.iter_mut().zip(open) {
+            let stopped = node.cancel > 0 || node.state == State::Done(Conclusion::Cancelled);
+            if was_open && stopped && node.message.is_none() {
+                node.message = Some(message.to_owned());
+            }
+        }
+        actions
+    }
+
+    /// Cancels one job because of a concurrency group, and says why. A
+    /// job that waits for a launch ends as cancelled at once; a running
+    /// one is asked to stop. Another attempt, or a job that ended, is
+    /// left alone.
+    pub fn cancel_job(
+        &mut self,
+        job: u64,
+        attempt: u32,
+        message: &str,
+        github_ctx: &Value,
+    ) -> Vec<Action> {
+        let Some(at) = self.position(job) else {
+            return Vec::new();
+        };
+        if self.jobs[at].attempt != attempt {
+            return Vec::new();
+        }
+        let mut actions = Vec::new();
+        match self.jobs[at].state {
+            State::Running if self.jobs[at].cancel == 0 => {
+                self.jobs[at].cancel = 1;
+                self.jobs[at].message = Some(message.to_owned());
+                actions.push(Action::Cancel { job, count: 1 });
+            }
+            State::Waiting | State::Queued => {
+                self.end(
+                    at,
+                    Conclusion::Cancelled,
+                    Some(message.to_owned()),
+                    &mut actions,
+                );
+                actions.extend(self.advance(github_ctx));
+            }
+            _ => {}
+        }
         actions
     }
 
@@ -433,6 +542,7 @@ impl Graph {
         }
         let plan = Plan {
             workflow: String::new(),
+            concurrency: None,
             jobs: self.jobs.iter().map(|n| n.job.clone()).collect(),
         };
         let job = &plan.jobs[at];
@@ -445,7 +555,6 @@ impl Graph {
     /// status function.
     fn decide(&self, at: usize, github_ctx: &Value, statuses_ok: bool) -> Result<bool, ExprError> {
         let node = &self.jobs[at];
-        let needs = self.needs_at(at);
         let status = if self.cancelled {
             JobStatus::Cancelled
         } else if statuses_ok && !node.job.if_.as_deref().map_or(Ok(false), checks_status)? {
@@ -453,20 +562,116 @@ impl Graph {
         } else {
             self.ancestor_status(at)
         };
+        let ctx = self.context(at, github_ctx);
+        job_condition(node.job.if_.as_deref(), &ctx, &Status(status))
+    }
+
+    /// The context of job `job`'s own expressions, as the graph builds it
+    /// (`needs`, `matrix`, `strategy`, `inputs`), with the repository
+    /// and organization variables `vars` it was not given. `None` for a
+    /// job the graph does not hold.
+    #[must_use]
+    pub fn job_context(
+        &self,
+        job: u64,
+        github_ctx: &Value,
+        vars: &BTreeMap<String, String>,
+    ) -> Option<Value> {
+        let mut ctx = self.context(self.position(job)?, github_ctx);
+        if let Some(map) = ctx.as_object_mut() {
+            map.insert("vars".to_owned(), json!(vars));
+        }
+        Some(ctx)
+    }
+
+    /// The contexts the control plane gives an expression of the job at
+    /// `at`: what it knows without a runner.
+    fn context(&self, at: usize, github_ctx: &Value) -> Value {
+        let node = &self.jobs[at];
         let inputs = github_ctx
             .get("event")
             .and_then(|e| e.get("inputs"))
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let ctx = json!({
+        json!({
             "hatchrun": hatchrun_context(github_ctx),
             "github": github_ctx,
-            "needs": needs,
+            "needs": self.needs_at(at),
             "matrix": node.job.matrix,
-            "vars": {},
+            "strategy": node.job.strategy_context(),
+            "vars": self.vars,
             "inputs": inputs,
-        });
-        job_condition(node.job.if_.as_deref(), &ctx, &Status(status))
+        })
+    }
+
+    /// What a job that ended as `conclusion` counts as: a failed job
+    /// whose `continue-on-error` holds is a success, for the jobs that
+    /// require it and for the run. The note says so on the job, or why
+    /// the expression could not be read.
+    fn forgive(
+        &self,
+        at: usize,
+        conclusion: Conclusion,
+        github_ctx: &Value,
+    ) -> (Conclusion, Option<String>) {
+        let spec = match self.jobs[at].job.continue_on_error.as_deref() {
+            Some(spec) if conclusion == Conclusion::Failure => spec,
+            _ => return (conclusion, None),
+        };
+        let ctx = self.context(at, github_ctx);
+        match continue_on_error(spec, &ctx, &Status(JobStatus::Failure)) {
+            Ok(true) => (Conclusion::Success, Some(CONTINUED.to_owned())),
+            Ok(false) => (conclusion, None),
+            Err(e) => (conclusion, Some(format!("continue-on-error: {e}"))),
+        }
+    }
+
+    /// The job at `at` failed. When it has `fail-fast`, the jobs of its
+    /// matrix that have not ended stop: waiting and queued ones end as
+    /// cancelled, running ones are asked to stop. A job that
+    /// [`Graph::forgive`] made a success does not call this.
+    fn fail_fast(&mut self, at: usize, actions: &mut Vec<Action>) {
+        if self.jobs[at].state != State::Done(Conclusion::Failure) {
+            return;
+        }
+        let Some(group) = self.jobs[at]
+            .job
+            .strategy
+            .as_ref()
+            .filter(|s| s.fail_fast)
+            .map(|s| s.group.clone())
+        else {
+            return;
+        };
+        for other in 0..self.jobs.len() {
+            let same = self.jobs[other]
+                .job
+                .strategy
+                .as_ref()
+                .is_some_and(|s| s.group == group);
+            if other == at || !same {
+                continue;
+            }
+            match self.jobs[other].state {
+                State::Waiting | State::Queued => {
+                    self.end(
+                        other,
+                        Conclusion::Cancelled,
+                        Some(FAIL_FAST.to_owned()),
+                        actions,
+                    );
+                }
+                State::Running if self.jobs[other].cancel == 0 => {
+                    self.jobs[other].cancel = 1;
+                    self.jobs[other].message = Some(FAIL_FAST.to_owned());
+                    actions.push(Action::Cancel {
+                        job: self.jobs[other].id,
+                        count: 1,
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Decides what becomes of a waiting job whose requirements ended.
@@ -502,7 +707,15 @@ impl Graph {
             }
             Ok(false) if self.cancelled => self.end(at, Conclusion::Cancelled, None, actions),
             Ok(false) => self.end(at, Conclusion::Skipped, None, actions),
-            Err(e) => self.end(at, Conclusion::Failure, Some(if_error(&e)), actions),
+            Err(e) => {
+                let (conclusion, note) = self.forgive(at, Conclusion::Failure, github_ctx);
+                let message = match note {
+                    Some(note) => format!("{} {note}", if_error(&e)),
+                    None => if_error(&e),
+                };
+                self.end(at, conclusion, Some(message), actions);
+                self.fail_fast(at, actions);
+            }
         }
     }
 
@@ -733,7 +946,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { m: { requires: [t] } }] } }
     #[test]
     fn matrix_needs_merge_in_plan_order() {
         let mut g = graph_of(
-            "[{ t: { name: build, matrix: { n: [1, 2, 3] } } }, { t: { name: after, requires: [build] } }]",
+            "[{ t: { name: build, matrix: { n: [1, 2, 3] }, strategy: { fail-fast: false } } }, { t: { name: after, requires: [build] } }]",
         );
         let ids: Vec<u64> = g.jobs.iter().take(3).map(|n| n.id).collect();
         let after = g.jobs[3].id;
@@ -1101,5 +1314,339 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { mid: { requires: [t] } }, { las
         // t2 has `if: always()`; c's own `if:` still decides.
         assert_eq!(state_of(&g, 2), State::Queued);
         assert_eq!(state_of(&g, 3), State::Done(Conclusion::Skipped));
+    }
+
+    const STRATEGY_JOBS: &str = "
+jobs:
+  m: { runs-on: ubuntu-latest, steps: [] }
+  soft: { runs-on: ubuntu-latest, steps: [], continue-on-error: true }
+  maybe: { runs-on: ubuntu-latest, steps: [], continue-on-error: '${{ matrix.experimental }}' }
+  varsoft: { runs-on: ubuntu-latest, steps: [], continue-on-error: '${{ vars.SOFT }}' }
+  first: { runs-on: ubuntu-latest, steps: [], if: strategy.job-index == 0 }
+  after: { runs-on: ubuntu-latest, steps: [] }
+";
+
+    fn strategy_graph(workflow_jobs: &str) -> Graph {
+        let yaml = format!(
+            "{STRATEGY_JOBS}workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: {workflow_jobs} }} }}\n"
+        );
+        let config = parse(&yaml).unwrap_or_else(|e| panic!("{e:?}"));
+        let plan = compile(&config, "ci", "refs/heads/main").unwrap_or_else(|e| panic!("{e:?}"));
+        Graph::new(
+            plan.jobs
+                .into_iter()
+                .enumerate()
+                .map(|(i, j)| (i as u64 + 1, j))
+                .collect(),
+        )
+    }
+
+    fn cancelled(actions: &[Action]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Finished {
+                    job,
+                    conclusion: Conclusion::Cancelled,
+                } => Some(*job),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn asked_to_stop(actions: &[Action]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Cancel { job, count: 1 } => Some(*job),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_leg_cancels_the_rest_of_its_matrix() {
+        let mut g = strategy_graph("[{ m: { matrix: { os: [a, b, c, d] } } }]");
+        g.advance(&ctx());
+        g.running(1);
+        g.running(2);
+        let actions = g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        // Queued legs end as cancelled, the running one is asked to stop.
+        assert_eq!(cancelled(&actions), [3, 4]);
+        assert_eq!(asked_to_stop(&actions), [2]);
+        assert_eq!(g.node(2).unwrap().state, State::Running);
+        assert_eq!(g.node(3).unwrap().state, State::Done(Conclusion::Cancelled));
+        assert!(
+            g.node(3)
+                .unwrap()
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("fail-fast")
+        );
+        assert!(!actions.iter().any(|a| matches!(a, Action::RunDone(_))));
+        // The run ends once the running leg reports.
+        let actions = g.finished(2, done(Conclusion::Cancelled, &[]), &ctx());
+        assert!(actions.contains(&Action::RunDone(Conclusion::Failure)));
+    }
+
+    #[test]
+    fn a_leg_that_fails_while_another_waits_for_launch_still_ends_it() {
+        let mut g = strategy_graph("[{ m: { matrix: { os: [a, b] } } }]");
+        g.advance(&ctx());
+        g.running(1);
+        let actions = g.failed(1, "the agent went silent".into(), &ctx());
+        assert_eq!(cancelled(&actions), [2]);
+        assert!(actions.contains(&Action::RunDone(Conclusion::Failure)));
+    }
+
+    #[test]
+    fn fail_fast_false_lets_the_other_legs_run() {
+        let mut g = strategy_graph(
+            "[{ m: { matrix: { os: [a, b, c] }, strategy: { fail-fast: false } } }]",
+        );
+        g.advance(&ctx());
+        g.running(1);
+        g.running(2);
+        let actions = g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(cancelled(&actions), Vec::<u64>::new());
+        assert_eq!(asked_to_stop(&actions), Vec::<u64>::new());
+        assert_eq!(g.node(2).unwrap().state, State::Running);
+        assert_eq!(g.node(3).unwrap().state, State::Queued);
+    }
+
+    #[test]
+    fn fail_fast_does_not_reach_other_matrices_or_jobs() {
+        let mut g = strategy_graph(
+            "[{ m: { name: x, matrix: { os: [a, b] } } }, { m: { name: y, matrix: { os: [a, b] } } }, soft]",
+        );
+        g.advance(&ctx());
+        let actions = g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(cancelled(&actions), [2]);
+        for other in 3..=5 {
+            assert_eq!(g.node(other).unwrap().state, State::Queued, "{other}");
+        }
+    }
+
+    #[test]
+    fn entries_of_one_group_cancel_each_other() {
+        let mut g = strategy_graph(
+            "[{ m: { name: x, matrix: { os: [a] }, strategy: { group: g } } }, \
+              { m: { name: y, matrix: { os: [b] }, strategy: { group: g } } }]",
+        );
+        g.advance(&ctx());
+        let actions = g.finished(2, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(cancelled(&actions), [1]);
+    }
+
+    #[test]
+    fn a_waiting_leg_ends_as_cancelled_too() {
+        let mut g = strategy_graph(
+            "[{ m: { name: x, matrix: { os: [a, b] }, strategy: { group: g } } }, \
+              { m: { name: y, requires: [after], matrix: { os: [c] }, strategy: { group: g } } }, \
+              after]",
+        );
+        g.advance(&ctx());
+        assert_eq!(
+            g.node(4).unwrap().state,
+            State::Waiting,
+            "y waits for after"
+        );
+        assert_eq!(g.node(3).unwrap().state, State::Queued);
+        let actions = g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(cancelled(&actions), [2, 4]);
+    }
+
+    #[test]
+    fn a_failed_job_with_continue_on_error_counts_as_a_success() {
+        let mut g = strategy_graph("[soft, { after: { requires: [soft] } }]");
+        g.advance(&ctx());
+        let actions = g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(
+            actions[0],
+            Action::Finished {
+                job: 1,
+                conclusion: Conclusion::Success
+            }
+        );
+        assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Success));
+        assert!(
+            g.node(1)
+                .unwrap()
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("continue-on-error")
+        );
+        assert_eq!(
+            g.node(1).unwrap().result.as_ref().unwrap().conclusion,
+            Conclusion::Failure,
+            "the report is kept as the agent sent it"
+        );
+        // The job that requires it starts, and sees a success.
+        assert_eq!(state_of(&g, 2), State::Queued);
+        assert_eq!(g.needs(2)["soft"].result, Conclusion::Success);
+        g.finished(2, ok(), &ctx());
+        assert_eq!(g.conclusion(), Some(Conclusion::Success));
+    }
+
+    #[test]
+    fn continue_on_error_reads_the_matrix_entry() {
+        let mut g = strategy_graph(
+            "[{ maybe: { matrix: { experimental: [false, true] }, strategy: { fail-fast: false } } }]",
+        );
+        g.advance(&ctx());
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        g.finished(2, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Failure));
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Success));
+        assert_eq!(g.conclusion(), Some(Conclusion::Failure));
+    }
+
+    #[test]
+    fn continue_on_error_reads_the_variables_the_graph_was_given() {
+        let mut g = strategy_graph("[varsoft]");
+        g.advance(&ctx());
+        g.set_vars(BTreeMap::from([("SOFT".to_owned(), "true".to_owned())]));
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Success));
+        let mut g = strategy_graph("[varsoft]");
+        g.advance(&ctx());
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Failure));
+    }
+
+    #[test]
+    fn a_forgiven_leg_does_not_trigger_fail_fast() {
+        let mut g = strategy_graph("[{ maybe: { matrix: { experimental: [true, false] } } }]");
+        g.advance(&ctx());
+        g.running(2);
+        let actions = g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(cancelled(&actions), Vec::<u64>::new());
+        assert_eq!(asked_to_stop(&actions), Vec::<u64>::new());
+        g.finished(2, ok(), &ctx());
+        assert_eq!(g.conclusion(), Some(Conclusion::Success));
+    }
+
+    #[test]
+    fn a_forgiven_if_error_does_not_trigger_fail_fast() {
+        let mut plan = compile(
+            &parse(&format!(
+                "{STRATEGY_JOBS}workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [{{ maybe: {{ matrix: {{ experimental: [true, false] }} }} }}] }} }}\n"
+            ))
+            .unwrap(),
+            "ci",
+            "refs/heads/main",
+        )
+        .unwrap();
+        // The compiler rejects a bad `if:`; set it by hand on the
+        // experimental leg to reach the evaluation error.
+        plan.jobs[0].if_ = Some("github.ref ==".into());
+        let mut g = Graph::new(
+            plan.jobs
+                .into_iter()
+                .enumerate()
+                .map(|(i, j)| (i as u64 + 1, j))
+                .collect(),
+        );
+        let actions = g.advance(&ctx());
+        assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Success));
+        let message = g.node(1).unwrap().message.clone().unwrap();
+        assert!(message.starts_with("if: ") && message.contains("continue-on-error"));
+        assert_eq!(cancelled(&actions), Vec::<u64>::new());
+        assert_eq!(g.node(2).unwrap().state, State::Queued);
+    }
+
+    #[test]
+    fn a_job_the_control_plane_fails_can_be_forgiven_too() {
+        let mut g = strategy_graph("[soft]");
+        g.advance(&ctx());
+        g.running(1);
+        let actions = g.failed(1, "no capacity".into(), &ctx());
+        assert_eq!(
+            actions[0],
+            Action::Finished {
+                job: 1,
+                conclusion: Conclusion::Success
+            }
+        );
+        let message = g.node(1).unwrap().message.clone().unwrap();
+        assert!(message.contains("no capacity") && message.contains("continue-on-error"));
+    }
+
+    #[test]
+    fn a_cancelled_job_is_not_forgiven() {
+        let mut g = strategy_graph("[soft]");
+        g.advance(&ctx());
+        g.finished(1, done(Conclusion::Cancelled, &[]), &ctx());
+        assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Cancelled));
+    }
+
+    #[test]
+    fn a_continue_on_error_that_cannot_be_read_leaves_the_failure() {
+        let mut g = strategy_graph("[{ maybe: {} }]");
+        g.advance(&ctx());
+        // `matrix.experimental` is not set: the expression is null, not true.
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Failure));
+    }
+
+    #[test]
+    fn if_reads_the_strategy_context() {
+        let mut g = strategy_graph("[{ first: { matrix: { os: [a, b, c] } } }]");
+        g.advance(&ctx());
+        assert_eq!(g.node(1).unwrap().state, State::Queued);
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+        assert_eq!(g.node(3).unwrap().state, State::Done(Conclusion::Skipped));
+    }
+
+    #[test]
+    fn a_pending_run_cancelled_outright_ends_whatever_its_if() {
+        let mut g = graph_of("[t, { t2: { name: b, requires: [t] } }]");
+        g.advance(&ctx());
+        let actions = g.cancel_for_group("replaced", true, &ctx());
+        assert_eq!(state_of(&g, 1), State::Done(Conclusion::Cancelled));
+        // `if: always()` does not keep it: the run never started.
+        assert_eq!(state_of(&g, 2), State::Done(Conclusion::Cancelled));
+        assert_eq!(g.node(2).unwrap().message.as_deref(), Some("replaced"));
+        assert!(actions.contains(&Action::RunDone(Conclusion::Cancelled)));
+    }
+
+    #[test]
+    fn cancelling_a_running_run_for_a_group_keeps_always_jobs() {
+        let mut g = graph_of("[t, { t2: { name: b, requires: [t] } }]");
+        g.advance(&ctx());
+        run(&mut g, 1);
+        let actions = g.cancel_for_group("newer run", false, &ctx());
+        assert!(actions.contains(&Action::Cancel { job: 1, count: 1 }));
+        assert_eq!(g.node(1).unwrap().message.as_deref(), Some("newer run"));
+        g.finished(1, done(Conclusion::Cancelled, &[]), &ctx());
+        // The job with `if: always()` still runs after the cancel.
+        assert_eq!(state_of(&g, 2), State::Queued);
+        assert_eq!(g.node(1).unwrap().message.as_deref(), Some("newer run"));
+    }
+
+    #[test]
+    fn cancel_job_ends_a_queued_job_and_asks_a_running_one_to_stop() {
+        let mut g = graph_of("[t, { t: { name: b } }]");
+        g.advance(&ctx());
+        run(&mut g, 1);
+        assert!(
+            g.cancel_job(1, 2, "x", &ctx()).is_empty(),
+            "another attempt"
+        );
+        assert_eq!(
+            g.cancel_job(1, 1, "x", &ctx()),
+            [Action::Cancel { job: 1, count: 1 }]
+        );
+        assert!(g.cancel_job(1, 1, "x", &ctx()).is_empty(), "once");
+        let actions = g.cancel_job(2, 1, "newer job", &ctx());
+        assert!(actions.contains(&Action::Finished {
+            job: 2,
+            conclusion: Conclusion::Cancelled
+        }));
+        assert_eq!(g.node(2).unwrap().message.as_deref(), Some("newer job"));
+        // The run goes on until job 1 stops.
+        assert_eq!(g.conclusion(), None);
     }
 }

@@ -11,7 +11,9 @@
 //! carry, so every statement reads it as text and [`JobRow`] parses it;
 //! so are `token_permissions` and `secret_refs`.
 
+mod artifacts;
 mod billing;
+mod concurrency;
 mod environments;
 mod jobs;
 mod pool;
@@ -21,18 +23,26 @@ mod runs;
 mod secrets;
 mod tenants;
 
+pub use self::artifacts::{
+    ArtifactRow, Finalized, artifact_by_name, artifact_count, artifacts, delete_artifact,
+    drop_pending_artifact, finalize_artifact, pending_artifact, replaced_artifact, start_artifact,
+};
 pub use self::billing::{
     Standing, UnsentUsage, set_spend_cap, standing, tenant_standing, unsent_usage, usage_rejected,
     usage_sent,
+};
+pub use self::concurrency::{
+    Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, unfinished_superseded,
+    victims, wake_targets,
 };
 pub use self::environments::{
     EnvironmentRow, JobEnvironment, PutEnvironment, decide_approval, delete_environment,
     environment, environments, job_environment, put_environment, release_approval_holds,
 };
 pub use self::jobs::{
-    Claim, JobRow, NewJob, claim_launch, finish_job, heartbeat, hold, insert_jobs, job,
-    jobs_by_ids, jobs_for_run, launch_failed, launched, note_queued_error, open_jobs, queue_job,
-    reset_job, set_job, start_job,
+    Claim, JobRow, NewJob, claim_launch, finish_job, heartbeat, held_siblings, hold, insert_jobs,
+    job, jobs_by_ids, jobs_for_run, launch_failed, launched, note_queued_error, open_jobs,
+    queue_job, reset_job, set_job, start_job,
 };
 pub use self::pool::{
     PoolRow, claims_by_bucket, drop_pool, move_pool, pool_rows, save_pool, take_pool,

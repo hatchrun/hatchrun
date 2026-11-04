@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 const VERSION: &str = "v1";
+/// The version of an OIDC request token. The version is part of what the
+/// signature covers, so a job token never passes as a request token and
+/// a request token never passes as a job token.
+const OIDC_VERSION: &str = "oidc1";
 
 /// Seconds an instance may take to boot before the job starts.
 pub const BOOT_SECS: u64 = 15 * 60;
@@ -65,10 +69,28 @@ pub fn lifetime_secs(timeout_minutes: u32) -> u64 {
 /// never do.
 #[must_use]
 pub fn sign(key: &[u8], claims: &Claims) -> String {
+    sign_as(VERSION, key, claims)
+}
+
+/// Signs an OIDC request token for the job `claims` name. The agent
+/// hands it to the job's steps as `ACTIONS_ID_TOKEN_REQUEST_TOKEN`; it
+/// asks `/v1/oidc/token` for identity tokens and nothing else. Check it
+/// with [`verify_oidc`].
+///
+/// # Panics
+///
+/// Panics if the claims fail to serialize, which plain integer fields
+/// never do.
+#[must_use]
+pub fn sign_oidc(key: &[u8], claims: &Claims) -> String {
+    sign_as(OIDC_VERSION, key, claims)
+}
+
+fn sign_as(version: &str, key: &[u8], claims: &Claims) -> String {
     let payload = URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(claims).expect("claims are plain integers and always serialize"),
     );
-    let signing = format!("{VERSION}.{payload}");
+    let signing = format!("{version}.{payload}");
     let signature = URL_SAFE_NO_PAD.encode(mac(key, &signing).finalize().into_bytes());
     format!("{signing}.{signature}")
 }
@@ -84,9 +106,23 @@ pub fn sign(key: &[u8], claims: &Claims) -> String {
 /// [`TokenError::BadSignature`] when the signature fails under `key`, and
 /// [`TokenError::Expired`] once `now_secs` reaches `exp`.
 pub fn verify(key: &[u8], token: &str, now_secs: u64) -> Result<Claims, TokenError> {
+    verify_as(VERSION, key, token, now_secs)
+}
+
+/// Checks an OIDC request token as [`verify`] checks a job token. The
+/// caller must still compare `job`, `run` and `attempt` with the job row.
+///
+/// # Errors
+///
+/// As [`verify`]; a job token is [`TokenError::Malformed`] here.
+pub fn verify_oidc(key: &[u8], token: &str, now_secs: u64) -> Result<Claims, TokenError> {
+    verify_as(OIDC_VERSION, key, token, now_secs)
+}
+
+fn verify_as(expected: &str, key: &[u8], token: &str, now_secs: u64) -> Result<Claims, TokenError> {
     let (signing, signature) = token.rsplit_once('.').ok_or(TokenError::Malformed)?;
     let (version, payload) = signing.split_once('.').ok_or(TokenError::Malformed)?;
-    if version != VERSION || payload.contains('.') {
+    if version != expected || payload.contains('.') {
         return Err(TokenError::Malformed);
     }
     let signature = URL_SAFE_NO_PAD
@@ -251,6 +287,28 @@ pub(crate) mod tests {
         bytes[0] ^= 0x01;
         let forged = with_signature(&token, &URL_SAFE_NO_PAD.encode(bytes));
         assert_eq!(verify(&*KEY, &forged, 999), Err(TokenError::BadSignature));
+    }
+
+    #[test]
+    fn oidc_tokens_round_trip() {
+        let token = sign_oidc(&*KEY, &claims());
+        assert_eq!(verify_oidc(&*KEY, &token, 999), Ok(claims()));
+        assert_eq!(verify_oidc(&*KEY, &token, 1_000), Err(TokenError::Expired));
+    }
+
+    #[test]
+    fn job_and_oidc_tokens_do_not_cross() {
+        let job = sign(&*KEY, &claims());
+        let oidc = sign_oidc(&*KEY, &claims());
+        assert_eq!(verify_oidc(&*KEY, &job, 999), Err(TokenError::Malformed));
+        assert_eq!(verify(&*KEY, &oidc, 999), Err(TokenError::Malformed));
+        // Relabelling the version keeps the old signature, which no
+        // longer matches.
+        let (_, rest) = oidc.split_once('.').unwrap();
+        assert_eq!(
+            verify(&*KEY, &format!("v1.{rest}"), 999),
+            Err(TokenError::BadSignature)
+        );
     }
 
     #[test]

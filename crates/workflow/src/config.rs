@@ -15,6 +15,7 @@ use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::concurrency::Concurrency;
 use crate::diagnostic::Diagnostic;
 use crate::permissions::Permissions;
 use crate::trigger::{Filter, Triggers};
@@ -237,6 +238,11 @@ pub struct Job {
     /// The job is cancelled after this many minutes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_minutes: Option<u32>,
+    /// A failed job counts as a success for the jobs that require it and
+    /// for the run, when this is `true` or an expression that is true
+    /// when the job ends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continue_on_error: Option<ContinueOnError>,
     /// Values later jobs can read.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub outputs: BTreeMap<String, String>,
@@ -246,6 +252,9 @@ pub struct Job {
     /// The environment the job deploys to; it can read `${{ parameters.x }}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// At most one job of a group runs in the repository, one waits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<Concurrency>,
     /// The steps.
     pub steps: Vec<Step>,
 }
@@ -261,9 +270,11 @@ struct JobDe {
     #[serde(rename = "if")]
     if_: Option<String>,
     timeout_minutes: Option<u32>,
+    continue_on_error: Option<ContinueOnError>,
     outputs: BTreeMap<String, String>,
     permissions: Option<Permissions>,
     environment: Option<String>,
+    concurrency: Option<Concurrency>,
     steps: Vec<Step>,
     #[serde(rename = "services", deserialize_with = "later_services")]
     _services: (),
@@ -282,9 +293,11 @@ impl Default for JobDe {
             env: job.env,
             if_: job.if_,
             timeout_minutes: job.timeout_minutes,
+            continue_on_error: job.continue_on_error,
             outputs: job.outputs,
             permissions: job.permissions,
             environment: job.environment,
+            concurrency: job.concurrency,
             steps: job.steps,
             _services: (),
             _container: (),
@@ -302,12 +315,66 @@ impl From<JobDe> for Job {
             env: de.env,
             if_: de.if_,
             timeout_minutes: de.timeout_minutes,
+            continue_on_error: de.continue_on_error,
             outputs: de.outputs,
             permissions: de.permissions,
             environment: de.environment,
+            concurrency: de.concurrency,
             steps: de.steps,
         }
     }
+}
+
+/// The `continue-on-error` of a job: `true`, `false`, or an expression
+/// read when the job ends, such as `${{ matrix.experimental }}`. A bare
+/// expression (`matrix.experimental`) works as it does in `if:`. The
+/// expression may read the `hatchrun`, `github`, `needs`, `matrix`,
+/// `strategy`, `vars` and `inputs` contexts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ContinueOnError {
+    /// Always, or never.
+    Always(bool),
+    /// When the expression is true.
+    When(String),
+}
+
+/// How the copies of a workflow entry's matrix run together.
+///
+/// `fail-fast` (default `true`) cancels the other copies that are
+/// waiting, queued or running when one fails, unless its job has
+/// `continue-on-error`. `max-parallel` caps how many copies run at once.
+/// Entries that share a `group` count as one matrix for both, and for
+/// the `strategy` context. The entry's own name is its group unless
+/// this names another; a converted GitHub job whose `include` entries
+/// became several workflow entries uses it to stay one matrix.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Strategy {
+    /// A failed copy cancels the others.
+    #[serde(skip_serializing_if = "is_true")]
+    pub fail_fast: bool,
+    /// The most copies that run at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_parallel: Option<u32>,
+    /// The name entries share to count as one matrix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+impl Default for Strategy {
+    fn default() -> Self {
+        Self {
+            fail_fast: true,
+            max_parallel: None,
+            group: None,
+        }
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// One step of a job or a command.
@@ -727,6 +794,9 @@ pub struct Workflow {
     /// What the token of every job without its own `permissions` may do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Permissions>,
+    /// At most one run of a group runs in the repository, one waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<Concurrency>,
     /// The jobs, wired together with `requires`.
     pub jobs: Vec<WorkflowJob>,
 }
@@ -735,7 +805,7 @@ pub struct Workflow {
 ///
 /// In YAML a bare job name or a map with one key, the job name, whose
 /// value holds `requires`, `type: approval`, `branches`, `tags`,
-/// `matrix`, `name` and parameter values.
+/// `matrix`, `strategy`, `name` and parameter values.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkflowJob {
     /// The job from `jobs:`, or the approval's own name.
@@ -753,6 +823,8 @@ pub struct WorkflowJob {
     pub tags: Option<Filter>,
     /// Parameter values to run the job with, one copy per combination.
     pub matrix: Matrix,
+    /// How the copies run together; `None` is the defaults.
+    pub strategy: Option<Strategy>,
     /// Parameter values for the job.
     pub with: BTreeMap<String, Value>,
 }
@@ -1110,7 +1182,9 @@ impl<'de> Deserialize<'de> for WorkflowJobBody {
             type Value = WorkflowJobBody;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a map of requires, type, branches, tags, matrix, name and parameters")
+                f.write_str(
+                    "a map of requires, type, branches, tags, matrix, strategy, name and parameters",
+                )
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
@@ -1132,6 +1206,7 @@ impl<'de> Deserialize<'de> for WorkflowJobBody {
                         "branches" => job.branches = Some(map.next_value()?),
                         "tags" => job.tags = Some(map.next_value()?),
                         "matrix" => job.matrix = map.next_value()?,
+                        "strategy" => job.strategy = Some(map.next_value()?),
                         _ => {
                             let value: Value = map.next_value()?;
                             job.with.insert(key, value);
@@ -1206,6 +1281,7 @@ impl WorkflowJobBodyRef<'_> {
             && j.branches.is_none()
             && j.tags.is_none()
             && j.matrix.is_empty()
+            && j.strategy.is_none()
             && j.with.is_empty()
     }
 }
@@ -1231,6 +1307,9 @@ impl Serialize for WorkflowJobBodyRef<'_> {
         }
         if !j.matrix.is_empty() {
             map.serialize_entry("matrix", &j.matrix)?;
+        }
+        if let Some(strategy) = &j.strategy {
+            map.serialize_entry("strategy", strategy)?;
         }
         for (key, value) in &j.with {
             map.serialize_entry(key, value)?;
