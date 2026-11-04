@@ -121,6 +121,12 @@ pub(crate) fn same_attempt(row: &JobRow, claims: &Claims) -> bool {
     identity(row, claims) == Identity::Match
 }
 
+/// Whether `claims` are for the job `row` at its current attempt and the
+/// job is running.
+pub(crate) fn running_attempt(row: &JobRow, claims: &Claims) -> bool {
+    same_attempt(row, claims) && row.status == "running"
+}
+
 fn identity(row: &JobRow, claims: &Claims) -> Identity {
     if claims.job != row.id || claims.run != row.run_id {
         Identity::Refused

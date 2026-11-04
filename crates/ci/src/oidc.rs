@@ -31,7 +31,7 @@ use hatchrun_workflow::ID_TOKEN_SCOPE;
 use serde_json::{Value, json};
 use worker::{Env, Method, Request, Response, Result, console_error};
 
-use crate::agent::same_attempt;
+use crate::agent::running_attempt;
 use crate::env::Settings;
 use crate::github::CONFIG_PATH;
 use crate::store::{self, JobRow, RepoRow, RunRow};
@@ -228,7 +228,7 @@ pub enum Answer {
 /// Decides what the request token's `claims` get from `row`.
 #[must_use]
 pub fn answer(row: &JobRow, claims: &token::Claims) -> Answer {
-    if !same_attempt(row, claims) || row.status != "running" {
+    if !running_attempt(row, claims) {
         Answer::Refused
     } else if !granted(&row.token_permissions) {
         Answer::Forbidden
@@ -342,16 +342,10 @@ pub async fn handle(req: Request, env: &Env) -> Result<Response> {
             return error("unavailable", 503);
         }
     };
-    let Some(kid) = env
-        .secret(KEY_ID)
-        .map(|value| value.to_string())
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
-        console_error!("oidc: {KEY_ID} is not set");
-        return error("not configured", 500);
-    };
-    let input = jwt::signing_input(Some(&kid), &claims(&job, &run, &repo, &audience, now, &jti));
+    let input = jwt::signing_input(
+        Some(&settings.ci_oidc_kid),
+        &claims(&job, &run, &repo, &audience, now, &jti),
+    );
     let signature = match webcrypto::sign_rs256(&settings.ci_oidc_key, input.as_bytes()).await {
         Ok(signature) => signature,
         Err(err) => {
