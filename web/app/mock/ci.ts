@@ -152,6 +152,12 @@ function run(id: number, number: number, workflow: string, event: string, ref: s
   };
 }
 
+/** What jobs of the finished run 2 uploaded. */
+const artifacts = [
+  { id: 1, run: 2, name: "dist", size: 4_823_117, created_at: now - 3 * 60 * minute + 3 * minute, expires_at: now + 27 * 24 * 60 * minute },
+  { id: 2, run: 2, name: "test-results", size: 18_204, created_at: now - 3 * 60 * minute + 3 * minute, expires_at: now + 27 * 24 * 60 * minute },
+];
+
 const jobJson = (job: Job) => ({
   id: job.id,
   plan_id: job.name.split(" ")[0],
@@ -276,6 +282,27 @@ export async function handleCi(
       return hidden();
     }
     return json(res, 200, { run: wanted, jobs: jobs.filter((job) => job.run === wanted.id).map(jobJson) });
+  }
+
+  if ((found = /^runs\/(\d+)\/artifacts(?:\/(\d+))?$/.exec(path))) {
+    const owner = runs.find((candidate) => candidate.id === Number(found?.[1]));
+    if (!owner) {
+      return hidden();
+    }
+    const held = artifacts.filter((artifact) => artifact.run === owner.id);
+    if (found[2] === undefined) {
+      const listed = held.map(({ id, name, size, created_at, expires_at }) => ({ id, name, size, created_at, expires_at }));
+      return json(res, 200, { artifacts: listed });
+    }
+    const wanted = held.find((artifact) => artifact.id === Number(found?.[2]));
+    if (!wanted) {
+      return hidden();
+    }
+    // The Worker redirects to a presigned S3 link; the mock answers the bytes.
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${wanted.name}.zip"`);
+    return void res.end("mock artifact");
   }
 
   if ((found = /^jobs\/(\d+)\/(approve|reject)$/.exec(path))) {

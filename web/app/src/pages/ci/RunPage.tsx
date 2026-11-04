@@ -12,7 +12,9 @@ import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } fr
 import {
   ApiError,
   approveCiJob,
+  ciArtifactUrl,
   getCiRun,
+  listCiArtifacts,
   listCiRuns,
   rejectCiJob,
   type CiJob,
@@ -27,6 +29,7 @@ import { Await, LoadError, Spinner } from "@/components/Status";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useLoad, useNow } from "@/load";
 import { Link, navigate, useLocation, type CiRoute } from "@/router";
+import { bytes } from "../JobPage";
 import { SignIn } from "../SignIn";
 import { DispatchDialog } from "./DispatchDialog";
 import { JobLog } from "./JobLog";
@@ -351,7 +354,49 @@ function RunDetailView({
           </TableBody>
         </Table>
       </section>
+      <Artifacts run={run} />
     </>
+  );
+}
+
+/** The artifacts the run's jobs uploaded, each a download. Nothing shows while there are none. */
+function Artifacts({ run }: { run: CiRun }) {
+  const [loaded, reload] = useLoad(() => listCiArtifacts(run.id), `${run.id}:${run.status}`, true);
+  // Jobs upload while the run goes; read again until it ends.
+  useRefresh(run.status !== "completed", reload);
+  if (loaded.state !== "ready" || loaded.data.artifacts.length === 0) {
+    return null;
+  }
+  return (
+    <section aria-label="Artifacts" className="flex flex-col gap-2">
+      <h2 className="cap">Artifacts</h2>
+      <div className="overflow-hidden rounded-md border border-rivet">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="cap">Name</TableHead>
+              <TableHead className="cap text-right">Size</TableHead>
+              <TableHead className="cap text-right">Expires</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {loaded.data.artifacts.map((artifact) => (
+              <TableRow key={artifact.id}>
+                <TableCell>
+                  <a href={ciArtifactUrl(run.id, artifact.id)} className="font-semibold text-bone hover:text-chick">
+                    {artifact.name}
+                  </a>
+                </TableCell>
+                <TableCell className="text-right font-mono text-xs">{bytes(artifact.size)}</TableCell>
+                <TableCell className="text-right font-mono text-xs">
+                  {new Date(artifact.expires_at).toLocaleDateString()}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+    </section>
   );
 }
 
