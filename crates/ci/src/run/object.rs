@@ -46,6 +46,9 @@ use super::{
     Start, TODO, Todo, Work, is_run, job_key, restore_key, snapshot_key,
 };
 
+/// The characters of GitHub's reply body a log line keeps.
+const REPLY_LOG_CHARS: usize = 300;
+
 /// The run and tenant a request that can reach an empty object names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Ident {
@@ -525,10 +528,10 @@ impl<'a> Cx<'a> {
         }
         let now = self.now;
         self.update(|run| {
-            let Loaded {
-                deadlines, outbox, ..
-            } = run;
-            reschedule(deadlines, outbox, failed, now);
+            if due.flush && !failed.flush {
+                run.deadlines_mut().flush_retry_at = None;
+            }
+            reschedule(run.deadlines_mut(), failed, now);
             run.dirty[2] = true;
             run.dirty[3] = true;
         })
@@ -1335,7 +1338,7 @@ impl<'a> Cx<'a> {
     /// Sends the check run update of each job that is due, one request
     /// per job. The requests are planned under the lock, sent without
     /// it, and each answer is recorded under it again. Stops when GitHub
-    /// throttles.
+    /// rate limits; one job failing does not stop the rest.
     async fn flush(&self) -> Result<()> {
         let plans = {
             let _turn = self.turn.lock().await;
@@ -1470,14 +1473,12 @@ impl<'a> Cx<'a> {
         match delivery(&response, self.now, plan.attempt) {
             Delivery::Done => Self::sent(plan, &response, plan.sent_count),
             Delivery::Wait(seconds) => Flushed::Throttled(seconds),
-            Delivery::Failed => Flushed::Failed,
+            Delivery::Failed => {
+                Self::log_reply(plan, &response);
+                Flushed::Failed
+            }
             Delivery::Rejected => {
-                worker::console_warn!(
-                    "check run of job {}: GitHub answered {}: {}",
-                    plan.job,
-                    response.status,
-                    response.text()
-                );
+                Self::log_reply(plan, &response);
                 let minimal = minimal_check(&plan.check);
                 let Some(response) = self.request(tokens, plan, &minimal).await else {
                     return Flushed::Failed;
@@ -1485,10 +1486,24 @@ impl<'a> Cx<'a> {
                 match delivery(&response, self.now, plan.attempt) {
                     Delivery::Done => Self::sent(plan, &response, plan.file_total),
                     Delivery::Wait(seconds) => Flushed::Throttled(seconds),
-                    Delivery::Failed | Delivery::Rejected => Flushed::Failed,
+                    Delivery::Failed | Delivery::Rejected => {
+                        Self::log_reply(plan, &response);
+                        Flushed::Failed
+                    }
                 }
             }
         }
+    }
+
+    /// Logs GitHub's status and the start of its body for a reply that
+    /// did not go through.
+    fn log_reply(plan: &Planned, response: &HttpResponse) {
+        let body: String = response.text().chars().take(REPLY_LOG_CHARS).collect();
+        worker::console_error!(
+            "check run of job {}: GitHub answered {}: {body}",
+            plan.job,
+            response.status
+        );
     }
 
     /// A request that went through: the id of a check run just made

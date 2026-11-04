@@ -237,6 +237,9 @@ pub struct Deadlines {
     /// When the side effects still in the [`Todo`] list are tried
     /// again.
     pub todo_retry_at: Option<u64>,
+    /// When the check run flush is tried again after it failed as a
+    /// whole (storage, not GitHub).
+    pub flush_retry_at: Option<u64>,
     /// Alarms in a row in which a part failed; sets the backoff.
     pub failures: u32,
 }

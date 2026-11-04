@@ -297,13 +297,16 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
     (run, sent + fresh_len)
 }
 
-/// The jobs whose check run is behind, and when GitHub lets us send
-/// again.
+/// The jobs whose check run is behind, when each may be tried again
+/// after a failed send, and when GitHub lets us send at all again.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outbox {
     /// Marked jobs and the generation of their latest mark.
     marked: BTreeMap<u64, u64>,
+    /// When a marked job whose send failed may be tried again.
+    retry_at_ms: BTreeMap<u64, u64>,
     counter: u64,
+    /// Set only by GitHub's rate limit; it holds back every job.
     blocked_until_ms: u64,
     attempts: u32,
 }
@@ -323,13 +326,18 @@ impl Outbox {
         self.marked.is_empty()
     }
 
-    /// The jobs to send now. Empty while GitHub has us blocked.
+    /// The jobs to send now. Empty while GitHub has us blocked; a job
+    /// whose last send failed waits for its own retry time.
     #[must_use]
     pub fn due(&self, now_ms: u64) -> Vec<u64> {
         if now_ms < self.blocked_until_ms {
             return Vec::new();
         }
-        self.marked.keys().copied().collect()
+        self.marked
+            .keys()
+            .copied()
+            .filter(|job| self.retry_at_ms.get(job).is_none_or(|at| *at <= now_ms))
+            .collect()
     }
 
     /// The generation of the job's latest mark. A sender reads it
@@ -345,11 +353,19 @@ impl Outbox {
     pub fn sent(&mut self, job: u64, generation: u64) {
         if self.marked.get(&job) == Some(&generation) {
             self.marked.remove(&job);
+            self.retry_at_ms.remove(&job);
         }
         self.attempts = 0;
     }
 
-    /// GitHub throttled a send: block for `wait_secs` (never shortening
+    /// The job's send failed: leave it alone for `wait_secs`. Other
+    /// jobs are not held back.
+    pub fn retry_after(&mut self, job: u64, now_ms: u64, wait_secs: u64) {
+        let until = now_ms.saturating_add(wait_secs.saturating_mul(1000));
+        self.retry_at_ms.insert(job, until);
+    }
+
+    /// GitHub rate limited a send: block every job for `wait_secs` (never shortening
     /// a block that is already longer) and count the attempt.
     pub fn throttled(&mut self, now_ms: u64, wait_secs: u64) {
         let until = now_ms.saturating_add(wait_secs.saturating_mul(1000));
@@ -363,14 +379,16 @@ impl Outbox {
         self.attempts
     }
 
-    /// When to wake up to send: now when unblocked, the unblock time
-    /// otherwise, `None` with nothing marked.
+    /// When to wake up to send: now when a job is ready and nothing
+    /// blocks, the earliest retry or unblock time otherwise, `None`
+    /// with nothing marked.
     #[must_use]
     pub fn next_alarm(&self, now_ms: u64) -> Option<u64> {
-        if self.marked.is_empty() {
-            return None;
-        }
-        Some(self.blocked_until_ms.max(now_ms))
+        self.marked
+            .keys()
+            .map(|job| self.retry_at_ms.get(job).copied().unwrap_or(0))
+            .min()
+            .map(|at| at.max(self.blocked_until_ms).max(now_ms))
     }
 }
 
@@ -839,10 +857,40 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_job_waits_alone() {
+        let mut o = Outbox::default();
+        o.mark(1);
+        o.mark(2);
+        o.retry_after(1, 0, 60);
+        assert_eq!(o.due(0), vec![2]);
+        assert_eq!(o.due(60_000), vec![1, 2]);
+        let g = o.generation(2).unwrap();
+        o.sent(2, g);
+        assert_eq!(o.next_alarm(0), Some(60_000));
+        assert_eq!(o.next_alarm(90_000), Some(90_000));
+        let g = o.generation(1).unwrap();
+        o.sent(1, g);
+        assert_eq!(o.next_alarm(0), None);
+        o.mark(1);
+        assert_eq!(o.due(0), vec![1], "a sent job leaves no retry time");
+    }
+
+    #[test]
+    fn a_rate_limit_holds_back_a_job_past_its_retry_time() {
+        let mut o = Outbox::default();
+        o.mark(1);
+        o.retry_after(1, 0, 10);
+        o.throttled(0, 100);
+        assert_eq!(o.due(50_000), Vec::<u64>::new());
+        assert_eq!(o.next_alarm(0), Some(100_000));
+    }
+
+    #[test]
     fn outbox_round_trips_through_serde() {
         let mut o = Outbox::default();
         o.mark(3);
         o.throttled(10, 5);
+        o.retry_after(3, 10, 5);
         let back: Outbox = serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
         assert_eq!(back, o);
     }
