@@ -28,8 +28,10 @@ use hatchrun_workflow::{Template, template};
 
 use crate::store::PoolRow;
 
-/// The most instances one template's pool holds.
-pub const POOL_MAX: u32 = 10;
+/// The most instances one template's pool holds. Each pooled instance
+/// costs a warmup boot and a stopped root volume, and a busy repository
+/// launches the rest fresh, so the pool covers small bursts only.
+pub const POOL_MAX: u32 = 4;
 /// The length of a demand bucket, in milliseconds.
 pub const BUCKET_MS: u64 = 300_000;
 /// How far back the demand looks, in milliseconds.
@@ -203,9 +205,9 @@ mod tests {
     }
 
     #[test]
-    fn pool_target_caps_at_ten() {
-        assert_eq!(pool_target(&[25]), 10);
-        assert_eq!(pool_target(&[u64::MAX]), 10);
+    fn pool_target_caps_at_four() {
+        assert_eq!(pool_target(&[25]), 4);
+        assert_eq!(pool_target(&[u64::MAX]), 4);
     }
 
     #[test]
@@ -297,7 +299,7 @@ mod tests {
         assert_eq!(found["ubuntu-latest"], [5, 1]);
         assert_eq!(found["ubuntu-26.04-8core"], [4]);
         assert_eq!(found.len(), 2);
-        assert_eq!(pool_target(&found["ubuntu-latest"]), 5);
+        assert_eq!(pool_target(&found["ubuntu-latest"]), 4);
     }
 
     #[test]
