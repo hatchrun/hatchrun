@@ -26,6 +26,9 @@
 //! it. The tenant, repository and ref come from the job token's run,
 //! never from a request.
 //!
+//! A repository keeps at most [`MAX_REPO_BYTES`]: when a save takes it
+//! past that, the least recently used entries are deleted.
+//!
 //! Entries nobody restored for [`IDLE_DAYS`] days are deleted by the
 //! reconciler (see [`evict`]), which also drops uploads that never
 //! finished.
@@ -60,6 +63,9 @@ pub const EVICT_LIMIT: u32 = 20;
 /// delete per entry.
 pub const EVICT_COST: u32 = EVICT_LIMIT + 1;
 
+/// What one repository may keep, as on GitHub: 10 GB. Past it the least
+/// recently used entries are evicted.
+pub const MAX_REPO_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// How long a presigned URL holds, in seconds.
 const URL_SECS: u64 = 900;
 
@@ -77,14 +83,18 @@ pub(crate) fn in_repo(key: &str, tenant: &str, repo_id: u64) -> bool {
     key.starts_with(&format!("cache/{tenant}/{repo_id}/")) && !key.contains("..")
 }
 
-/// The refs a run on `git_ref` restores from, in order: its own, then
-/// the default branch's.
-pub(crate) fn read_scopes(git_ref: &str, default_branch: Option<&str>) -> Vec<String> {
+/// The refs a run on `git_ref` restores from, in order: its own, the
+/// base branch's when it is a pull request, then the default branch's.
+pub(crate) fn read_scopes(
+    git_ref: &str,
+    base_ref: Option<&str>,
+    default_branch: Option<&str>,
+) -> Vec<String> {
     let mut scopes = vec![git_ref.to_owned()];
-    if let Some(branch) = default_branch {
-        let default = format!("refs/heads/{branch}");
-        if default != git_ref {
-            scopes.push(default);
+    for branch in [base_ref, default_branch].into_iter().flatten() {
+        let scope = format!("refs/heads/{branch}");
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
         }
     }
     scopes
@@ -201,7 +211,11 @@ async fn lookup(ctx: &Context<'_>, request: LookupRequest) -> Answer {
     let default_branch = store::repo(&ctx.db, ctx.run.repo_id)
         .await?
         .map(|repo| repo.default_branch);
-    let scopes = read_scopes(&ctx.run.git_ref, default_branch.as_deref());
+    let scopes = read_scopes(
+        &ctx.run.git_ref,
+        ctx.run.base_ref.as_deref(),
+        default_branch.as_deref(),
+    );
     let wanted: Vec<(&str, bool)> = std::iter::once((request.key.as_str(), true))
         .chain(request.restore_keys.iter().map(|key| (key.as_str(), false)))
         .collect();
@@ -352,7 +366,13 @@ async fn complete(ctx: &Context<'_>, id: &str, request: CompleteRequest) -> Answ
     let size = object_size(ctx, &credentials, &row.object_key).await?;
     let done = store::finalize_cache_entry(&ctx.db, row.id, ctx.owner(), size, now_ms()).await?;
     match done {
-        Finalized::Done => Ok(Response::empty()?.with_status(204)),
+        Finalized::Done => {
+            // The entry is saved; a failure to trim must not fail it.
+            if let Err(err) = enforce_quota(ctx, &credentials).await {
+                console_warn!("cache: quota of repository {}: {}", ctx.run.repo_id, err);
+            }
+            Ok(Response::empty()?.with_status(204))
+        }
         Finalized::Refused => {
             // Another job finalized the same entry first: this object
             // belongs to no row.
@@ -382,6 +402,42 @@ async fn abort(ctx: &Context<'_>, id: &str) -> Answer {
     }
     store::drop_pending_cache_entry(&ctx.db, row.id, ctx.owner()).await?;
     Ok(Response::empty()?.with_status(204))
+}
+
+/// Deletes the least recently used entries of the run's repository while
+/// it holds more than [`MAX_REPO_BYTES`], at most [`EVICT_LIMIT`] per
+/// call, object first and row after. What is left over goes at the next
+/// save.
+async fn enforce_quota(
+    ctx: &Context<'_>,
+    credentials: &Credentials,
+) -> std::result::Result<(), String> {
+    let tenant = &ctx.run.tenant_id;
+    let repo = ctx.run.repo_id;
+    let rows = store::over_quota_cache_entries(&ctx.db, tenant, repo, MAX_REPO_BYTES, EVICT_LIMIT)
+        .await
+        .map_err(|err| err.to_string())?;
+    let results = futures_util::future::join_all(rows.iter().map(|row| async move {
+        if !in_repo(&row.object_key, tenant, repo) {
+            return Err(format!("entry {} has a foreign key", row.id));
+        }
+        let url = object_url(ctx, &row.object_key);
+        let response = signed(ctx, credentials, s3::delete_object(&url))
+            .await
+            .map_err(|err| err.message)?;
+        s3::ok(&response).map_err(|err| err.to_string())
+    }))
+    .await;
+    let mut gone = Vec::new();
+    for (row, result) in rows.iter().zip(results) {
+        match result {
+            Ok(()) => gone.push(row.id),
+            Err(err) => worker::console_error!("cache: evict {}: {err}", row.id),
+        }
+    }
+    store::delete_cache_entries(&ctx.db, tenant, repo, &gone)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 /// The size of the object at `key`, from a listing of that prefix.
@@ -492,20 +548,24 @@ mod tests {
     }
 
     #[test]
-    fn a_run_reads_its_own_ref_then_the_default_branch() {
+    fn a_run_reads_its_own_ref_then_the_base_then_the_default_branch() {
         assert_eq!(
-            read_scopes("refs/heads/topic", Some("main")),
+            read_scopes("refs/heads/topic", None, Some("main")),
             ["refs/heads/topic", "refs/heads/main"]
         );
         assert_eq!(
-            read_scopes("refs/pull/4/merge", Some("main")),
+            read_scopes("refs/pull/4/merge", Some("release"), Some("main")),
+            ["refs/pull/4/merge", "refs/heads/release", "refs/heads/main"]
+        );
+        assert_eq!(
+            read_scopes("refs/pull/4/merge", Some("main"), Some("main")),
             ["refs/pull/4/merge", "refs/heads/main"]
         );
         assert_eq!(
-            read_scopes("refs/heads/main", Some("main")),
+            read_scopes("refs/heads/main", None, Some("main")),
             ["refs/heads/main"]
         );
-        assert_eq!(read_scopes("refs/tags/v1", None), ["refs/tags/v1"]);
+        assert_eq!(read_scopes("refs/tags/v1", None, None), ["refs/tags/v1"]);
     }
 
     #[test]

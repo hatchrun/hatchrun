@@ -413,6 +413,7 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
         git_ref: req.git_ref.to_owned(),
         sha: req.sha.to_owned(),
         actor: req.actor.to_owned(),
+        base_ref: (req.event_name == "pull_request").then(|| req.base_ref.to_owned()),
         now,
     };
     let (run, fresh) = match store::insert_run(db, &new).await? {
@@ -638,6 +639,7 @@ mod tests {
                     git_ref: "refs/heads/main".into(),
                     sha: "abc".into(),
                     actor: "octocat".into(),
+                    base_ref: None,
                     now: 1,
                 },
             ))

@@ -30,6 +30,8 @@ pub struct NewRun {
     pub sha: String,
     /// The login that caused the event.
     pub actor: String,
+    /// The base branch of a pull request, as a short name.
+    pub base_ref: Option<String>,
     /// When the run is recorded.
     pub now: u64,
 }
@@ -59,6 +61,8 @@ pub struct RunRow {
     pub sha: String,
     /// The login that caused the event.
     pub actor: String,
+    /// The base branch of a pull request, as a short name.
+    pub base_ref: Option<String>,
     /// `queued`, `in_progress` or `completed`.
     pub status: String,
     /// `success`, `failure`, `cancelled` or `skipped`, once completed.
@@ -74,8 +78,8 @@ pub struct RunRow {
 
 /// The columns of a [`RunRow`].
 const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, \
-     event, ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at, \
-     (expires_at - created_at) / 86400000 AS retention_days";
+     event, ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
+     completed_at, (expires_at - created_at) / 86400000 AS retention_days";
 
 /// The run of delivery `$1` and workflow `$2`, where `{columns}` is
 /// [`RUN_COLUMNS`].
@@ -89,8 +93,8 @@ const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE
 
 /// Records a run and takes its number in one statement, run after
 /// [`LOCK_REPO`]. Binds `$1` tenant, `$2` repository, `$3` workflow,
-/// `$4` delivery, `$5` event, `$6` ref, `$7` sha, `$8` actor and `$9`
-/// now. The run expires after its tenant's retention tier (30 or 90 days), read
+/// `$4` delivery, `$5` event, `$6` ref, `$7` sha, `$8` actor, `$9`
+/// now and `$10` the pull request's base branch. The run expires after its tenant's retention tier (30 or 90 days), read
 /// in the same statement. The number is taken only when no run of this
 /// delivery and workflow exists, so a duplicate leaves the counter
 /// alone, and the statement returns no row for it.
@@ -101,13 +105,13 @@ const INSERT_RUN: &str = "WITH n AS (\
        ON CONFLICT (repo_id, workflow) DO UPDATE SET last = ci_run_numbers.last + 1 \
        RETURNING last) \
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
-       actor, status, created_at, updated_at, expires_at) \
-     SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, 'queued', $9, $9, \
+       actor, base_ref, status, created_at, updated_at, expires_at) \
+     SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, $10::text, 'queued', $9, $9, \
        $9 + (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END * 86400000::bigint \
          FROM tenants WHERE id = $1) FROM n \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
-       ref AS git_ref, sha, actor, status, conclusion, created_at, completed_at, \
-       (expires_at - created_at) / 86400000 AS retention_days";
+       ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
+       completed_at, (expires_at - created_at) / 86400000 AS retention_days";
 
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
@@ -153,7 +157,8 @@ pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>> {
             &run.git_ref,
             &run.sha,
             &run.actor,
-            run.now
+            run.now,
+            &run.base_ref
         ],
     )
     .await

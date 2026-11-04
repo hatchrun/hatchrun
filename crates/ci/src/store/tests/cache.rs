@@ -252,3 +252,103 @@ fn an_entry_restored_after_the_sweep_read_it_stays() {
         .unwrap();
     assert!(find(&db, MAIN, "deps", true).is_some());
 }
+
+/// Starts and finalizes an entry of `size` bytes, restored last at `at`.
+fn save_sized(db: &TestDb, owner: CacheOwner<'_>, key: &str, size: u64, at: u64) -> CacheRow {
+    let row = db
+        .wait(start_cache_entry(
+            db.db(),
+            owner,
+            "v1",
+            key,
+            &format!("cache/t1/7/{key}"),
+            "mpu",
+            at,
+        ))
+        .unwrap();
+    db.wait(finalize_cache_entry(db.db(), row.id, owner, size, at))
+        .unwrap();
+    row
+}
+
+fn over(db: &TestDb, cap: u64, limit: u32) -> Vec<String> {
+    db.wait(over_quota_cache_entries(db.db(), "t1", 7, cap, limit))
+        .unwrap()
+        .into_iter()
+        .map(|row| row.key)
+        .collect()
+}
+
+#[test]
+fn a_repository_over_its_cap_loses_the_least_recently_used_entries() {
+    let db = setup();
+    save_sized(&db, MAIN, "oldest", 40, 10);
+    save_sized(&db, on("refs/heads/topic"), "old", 40, 20);
+    save_sized(&db, MAIN, "new", 40, 30);
+    // Other repositories do not count.
+    save_sized(&db, CacheOwner { repo_id: 8, ..MAIN }, "elsewhere", 1000, 5);
+
+    assert_eq!(over(&db, 120, 10), Vec::<String>::new());
+    assert_eq!(over(&db, 119, 10), ["oldest"]);
+    assert_eq!(over(&db, 80, 10), ["oldest"]);
+    assert_eq!(over(&db, 79, 10), ["oldest", "old"]);
+    assert_eq!(over(&db, 79, 1), ["oldest"]);
+    // An entry that does not fit alone goes too, the newest included.
+    assert_eq!(over(&db, 30, 10), ["oldest", "old", "new"]);
+    // Uploads in flight do not count.
+    start(&db, "going", 40);
+    assert_eq!(over(&db, 120, 10), Vec::<String>::new());
+}
+
+#[test]
+fn a_restore_moves_an_entry_out_of_the_way_of_the_quota() {
+    let db = setup();
+    let oldest = save_sized(&db, MAIN, "oldest", 40, 10);
+    save_sized(&db, MAIN, "old", 40, 20);
+    save_sized(&db, MAIN, "new", 40, 30);
+    db.wait(touch_cache_entry(
+        db.db(),
+        oldest.id,
+        "t1",
+        2 * TOUCH_EVERY_MS,
+    ))
+    .unwrap();
+    assert_eq!(over(&db, 80, 10), ["old"]);
+
+    let rows = db
+        .wait(over_quota_cache_entries(db.db(), "t1", 7, 80, 10))
+        .unwrap();
+    let ids: Vec<u64> = rows.iter().map(|row| row.id).collect();
+    // Another repository's id deletes nothing.
+    db.wait(delete_cache_entries(db.db(), "t1", 8, &ids))
+        .unwrap();
+    assert_eq!(over(&db, 80, 10), ["old"]);
+    db.wait(delete_cache_entries(db.db(), "t1", 7, &ids))
+        .unwrap();
+    assert_eq!(over(&db, 80, 10), Vec::<String>::new());
+    db.wait(delete_cache_entries(db.db(), "t1", 7, &[]))
+        .unwrap();
+}
+
+#[test]
+fn a_pull_request_run_records_its_base_branch() {
+    let db = setup();
+    let run = db
+        .wait(insert_run(
+            db.db(),
+            &NewRun {
+                base_ref: Some("release".into()),
+                ..new_run("pr", "ci", 1)
+            },
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.base_ref.as_deref(), Some("release"));
+    let read = db.wait(super::run(db.db(), run.id)).unwrap().unwrap();
+    assert_eq!(read.base_ref.as_deref(), Some("release"));
+    let push = db
+        .wait(insert_run(db.db(), &new_run("push", "ci", 2)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(push.base_ref, None);
+}

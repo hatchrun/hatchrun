@@ -106,6 +106,20 @@ const IDLE: &str = "SELECT {columns} FROM ci_cache_entries \
 const DELETE_IDLE: &str = "DELETE FROM ci_cache_entries \
      WHERE id = $1 AND (last_accessed_at < $2 OR finalized_at IS NULL)";
 
+/// The finalized entries of repository `$2` of tenant `$1` that do not
+/// fit in `$3` bytes when the most recently used are kept first, least
+/// recently used first, at most `$4`. An entry larger than the cap
+/// does not fit alone.
+const OVER_QUOTA: &str = "SELECT {columns} FROM (\
+       SELECT {columns}, sum(size) OVER (ORDER BY last_accessed_at DESC, id DESC) AS kept \
+       FROM ci_cache_entries \
+       WHERE tenant_id = $1 AND repo_id = $2 AND finalized_at IS NOT NULL) AS ranked \
+     WHERE kept > $3 ORDER BY last_accessed_at, id LIMIT $4";
+
+/// Deletes entry `$1` of repository `$3` of tenant `$2`.
+const DELETE_ENTRY: &str =
+    "DELETE FROM ci_cache_entries WHERE id = $1 AND tenant_id = $2 AND repo_id = $3";
+
 /// Who owns an entry: where a call looks for it.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheOwner<'a> {
@@ -279,6 +293,50 @@ pub async fn delete_idle_cache_entries(db: &Db, ids: &[u64], now: u64, idle_ms: 
     let statements: Vec<_> = ids
         .iter()
         .map(|&id| (DELETE_IDLE, params![id, cutoff]))
+        .collect();
+    db.batch(&statements).await?;
+    Ok(())
+}
+
+/// The entries of repository `repo_id` of `tenant_id` that push it past
+/// `cap` bytes: the least recently used, at most `limit`. Their rows stay
+/// until [`delete_cache_entries`].
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn over_quota_cache_entries(
+    db: &Db,
+    tenant_id: &str,
+    repo_id: u64,
+    cap: u64,
+    limit: u32,
+) -> Result<Vec<CacheRow>> {
+    db.all(
+        &with_columns(OVER_QUOTA, CACHE_COLUMNS),
+        &params![tenant_id, repo_id, cap, limit],
+    )
+    .await
+}
+
+/// Deletes the rows of `ids` of repository `repo_id` of `tenant_id`,
+/// whose objects are gone.
+///
+/// # Errors
+///
+/// Postgres refused a statement; nothing changes.
+pub async fn delete_cache_entries(
+    db: &Db,
+    tenant_id: &str,
+    repo_id: u64,
+    ids: &[u64],
+) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let statements: Vec<_> = ids
+        .iter()
+        .map(|&id| (DELETE_ENTRY, params![id, tenant_id, repo_id]))
         .collect();
     db.batch(&statements).await?;
     Ok(())
