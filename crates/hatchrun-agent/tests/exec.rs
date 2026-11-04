@@ -441,6 +441,14 @@ fn unnamed_run_step_is_named_after_its_evaluated_script() {
 }
 
 #[test]
+fn a_bad_expression_after_the_first_line_does_not_touch_the_step_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_steps(dir.path(), vec![make::step("echo one\necho ${{ nope( }}")]);
+    assert!(!stdout(&out).contains("Warning: name:"), "{}", stdout(&out));
+    assert_eq!(result(dir.path()).steps[0].name, "Run echo one");
+}
+
+#[test]
 fn no_process_survives_an_exit() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_steps(

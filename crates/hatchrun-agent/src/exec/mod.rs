@@ -606,12 +606,14 @@ impl Job<'_> {
 
     /// The name of a `run` step without one: `Run` and the first line
     /// of the script with its expressions evaluated, as GitHub shows
-    /// it. A script that does not evaluate keeps its raw text; the step
-    /// reports the error itself.
+    /// it. Only that line is evaluated, so an expression further down
+    /// does not touch the name. A line that does not evaluate keeps its
+    /// raw text; the step reports the error itself.
     fn run_name(&self, script: &str) -> String {
-        let script = interp(script, &self.ctx, &self.layout.workspace, self.status)
-            .unwrap_or_else(|_| script.to_owned());
-        format!("Run {}", script.lines().next().unwrap_or_default())
+        let line = script.lines().next().unwrap_or_default();
+        let line = interp(line, &self.ctx, &self.layout.workspace, self.status)
+            .unwrap_or_else(|_| line.to_owned());
+        format!("Run {}", line.lines().next().unwrap_or_default())
     }
 
     async fn run_step(
