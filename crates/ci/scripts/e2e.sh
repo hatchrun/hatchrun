@@ -968,10 +968,11 @@ cancel_run "$r2_run"
 wait_checks "$r2_sha" 1 'all(.status == "completed" and .conclusion == "cancelled")'
 log "concurrency: cancel-in-progress cancelled the running run and the new one started"
 
-# Eighteen instances: build, test, broken twice, sleeper, arm-hello,
-# bad-ok-hello, the six naps, deploy-a, and the four sits that ran. Wait
-# for the last agent to exit.
-launches=18
+# Twenty-three instances: build, test, broken twice, sleeper, arm-hello,
+# bad-ok-hello, the six naps, deploy-a, the two oidc jobs, the serial leg
+# that ran, the two soft jobs and the four sits that ran. Wait for the
+# last agent to exit.
+launches=23
 deadline=$((SECONDS + 60))
 until curl -fsS "$LAUNCHER/_events" | jq -e --argjson n "$launches" '[.[] | select(startswith("exit "))] | length >= $n' >/dev/null; do
   ((SECONDS < deadline)) || die "agents still running: $(curl -fsS "$LAUNCHER/_events")"
@@ -998,8 +999,8 @@ jq -e '[.[] | select(startswith("exit ")) | split(" ")[2]] | all(. == "0" or . =
   "$tmp/events.json" >/dev/null || die "an agent exited badly: $(cat "$tmp/events.json")"
 [[ "$(jq '[.[] | select(startswith("launch "))] | length' "$tmp/events.json")" == "$launches" ]] ||
   die "expected $launches launches: $(cat "$tmp/events.json")"
-jq -e '[.[] | select(endswith(" 0") and startswith("exit "))] | length == 11' "$tmp/events.json" >/dev/null ||
-  die "expected the eleven passing jobs to exit 0: $(cat "$tmp/events.json")"
+jq -e '[.[] | select(endswith(" 0") and startswith("exit "))] | length == 14' "$tmp/events.json" >/dev/null ||
+  die "expected the fourteen passing jobs to exit 0: $(cat "$tmp/events.json")"
 # The App's permissions are read once per installation and kept in KV,
 # so the claims did not each read them.
 reads="$(curl -fsS "$GITHUB/_state" | jq '[.installation_reads[] | select(. == 42)] | length')"
