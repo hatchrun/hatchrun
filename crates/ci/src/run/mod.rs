@@ -241,6 +241,9 @@ pub struct Deadlines {
     /// whole (storage, not GitHub).
     #[serde(default)]
     pub flush_retry_at: Option<u64>,
+    /// When the earliest [`PendingChain`] is tried again.
+    #[serde(default)]
+    pub chain_retry_at: Option<u64>,
     /// Alarms in a row in which a part failed; sets the backoff.
     pub failures: u32,
 }
@@ -304,12 +307,45 @@ pub struct Pending {
     pub work: Work,
 }
 
+/// How long a [`PendingChain`] is retried before it is given up.
+pub const CHAIN_GIVE_UP_MS: u64 = 3_600_000;
+
+/// The longest wait between two tries of a [`PendingChain`], in
+/// milliseconds.
+const CHAIN_MAX_WAIT_MS: u64 = 300_000;
+
+/// A state change of the run that `on: workflow_run` workflows still
+/// have to be started for. Kept apart from the [`Work`] items, so a
+/// GitHub outage that fails it never holds up the run's own side
+/// effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingChain {
+    /// Names the entry.
+    pub id: u64,
+    /// The attempt of the run the change belongs to.
+    pub attempt: u32,
+    /// `requested`, `in_progress` or `completed`.
+    pub action: String,
+    /// How the attempt ended, for `completed`.
+    pub conclusion: Option<String>,
+    /// When the change was recorded.
+    pub first_at: u64,
+    /// When it is tried next.
+    pub next_at: u64,
+    /// How many tries failed.
+    pub tries: u32,
+}
+
 /// The side effects still to do, in order.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Todo {
     next: u64,
     /// The items, oldest first.
     pub items: Vec<Pending>,
+    /// The `workflow_run` changes still to send. Absent in state written
+    /// before they were kept.
+    #[serde(default)]
+    pub chains: Vec<PendingChain>,
 }
 
 impl Todo {
@@ -331,6 +367,66 @@ impl Todo {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// Records a change of attempt `attempt` for `on: workflow_run`,
+    /// due now. A change recorded already is not added again.
+    pub fn push_chain(&mut self, attempt: u32, action: &str, conclusion: Option<&str>, now: u64) {
+        if self
+            .chains
+            .iter()
+            .any(|c| c.attempt == attempt && c.action == action)
+        {
+            return;
+        }
+        self.next += 1;
+        self.chains.push(PendingChain {
+            id: self.next,
+            attempt,
+            action: action.to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+            first_at: now,
+            next_at: now,
+            tries: 0,
+        });
+    }
+
+    /// The changes whose time has come, oldest first.
+    #[must_use]
+    pub fn due_chains(&self, now: u64) -> Vec<PendingChain> {
+        self.chains
+            .iter()
+            .filter(|c| c.next_at <= now)
+            .cloned()
+            .collect()
+    }
+
+    /// Drops the change `id`, which was sent.
+    pub fn chain_sent(&mut self, id: u64) {
+        self.chains.retain(|c| c.id != id);
+    }
+
+    /// Records a failed try of the change `id`: it waits twice as long
+    /// as the try before, up to five minutes, and is dropped once it is
+    /// an hour old. Returns whether it was dropped.
+    pub fn chain_failed(&mut self, id: u64, now: u64) -> bool {
+        let Some(chain) = self.chains.iter_mut().find(|c| c.id == id) else {
+            return false;
+        };
+        chain.tries += 1;
+        if now.saturating_sub(chain.first_at) >= CHAIN_GIVE_UP_MS {
+            self.chains.retain(|c| c.id != id);
+            return true;
+        }
+        let wait = (5_000_u64 << chain.tries.min(10)).min(CHAIN_MAX_WAIT_MS);
+        chain.next_at = now + wait;
+        false
+    }
+
+    /// When the earliest change is tried, `None` with none left.
+    #[must_use]
+    pub fn next_chain_at(&self) -> Option<u64> {
+        self.chains.iter().map(|c| c.next_at).min()
     }
 }
 
@@ -387,6 +483,41 @@ mod tests {
         todo.push(Work::ReopenRun { attempt: 2 });
         assert_ne!(todo.items[0].id, todo.items[1].id);
         assert_eq!(todo.items[0].work, Work::QueueLaunch { job: 1, attempt: 1 });
+    }
+
+    #[test]
+    fn chains_are_kept_once_and_retried_with_a_capped_backoff() {
+        let mut todo = Todo::default();
+        todo.push_chain(1, "completed", Some("success"), 1_000);
+        todo.push_chain(1, "completed", Some("success"), 2_000);
+        todo.push_chain(2, "completed", Some("failure"), 2_000);
+        assert_eq!(todo.chains.len(), 2);
+        assert_eq!(todo.due_chains(1_000).len(), 1);
+        let id = todo.chains[0].id;
+        assert!(!todo.chain_failed(id, 1_000));
+        assert_eq!(todo.chains[0].next_at, 1_000 + 10_000);
+        assert!(!todo.chain_failed(id, 11_000));
+        assert_eq!(todo.chains[0].next_at, 11_000 + 20_000);
+        for _ in 0..12 {
+            todo.chain_failed(id, 31_000);
+        }
+        assert_eq!(todo.chains[0].next_at, 31_000 + 300_000);
+        assert_eq!(todo.next_chain_at(), Some(2_000));
+        assert!(todo.chain_failed(id, 1_000 + CHAIN_GIVE_UP_MS));
+        assert_eq!(todo.chains.len(), 1);
+        todo.chain_sent(todo.chains[0].id);
+        assert_eq!(todo.next_chain_at(), None);
+    }
+
+    #[test]
+    fn state_written_before_chains_still_loads() {
+        let todo: Todo = serde_json::from_str(r#"{"next":2,"items":[]}"#).unwrap();
+        assert_eq!(todo.chains.len(), 0);
+        let deadlines: Deadlines = serde_json::from_str(
+            r#"{"escalate_at":null,"upload_retry_at":null,"snapshot_at":null,"purge_at":null,"todo_retry_at":null,"failures":0}"#,
+        )
+        .unwrap();
+        assert_eq!(deadlines.chain_retry_at, None);
     }
 
     #[test]

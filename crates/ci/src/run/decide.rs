@@ -32,6 +32,12 @@ pub(crate) fn arm_todo(deadlines: &mut Deadlines, todo: &Todo, now_ms: u64) {
     }
 }
 
+/// Points the deadline of the `workflow_run` changes at the earliest
+/// one still to send.
+pub(crate) fn arm_chains(deadlines: &mut Deadlines, todo: &Todo) {
+    deadlines.chain_retry_at = todo.next_chain_at();
+}
+
 /// What a request from an agent finds when it names a job and the
 /// attempt its token was made for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +168,7 @@ pub(crate) fn next_alarm(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) ->
         deadlines.purge_at,
         deadlines.todo_retry_at,
         deadlines.flush_retry_at,
+        deadlines.chain_retry_at,
         outbox.next_alarm(now_ms),
     ]
     .into_iter()
@@ -179,6 +186,7 @@ pub(crate) struct Due {
     pub(crate) snapshot: bool,
     pub(crate) purge: bool,
     pub(crate) todo: bool,
+    pub(crate) chain: bool,
 }
 
 pub(crate) fn due(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) -> Due {
@@ -190,6 +198,7 @@ pub(crate) fn due(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) -> Due {
         snapshot: reached(deadlines.snapshot_at),
         purge: reached(deadlines.purge_at),
         todo: reached(deadlines.todo_retry_at),
+        chain: reached(deadlines.chain_retry_at),
     }
 }
 
@@ -808,10 +817,11 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             escalate_at: Some(100),
             upload_retry_at: Some(200),
             purge_at: Some(300),
+            chain_retry_at: Some(120),
             ..Deadlines::default()
         };
         let due = due(&deadlines, &outbox, 150);
-        assert!(due.flush && due.escalate && !due.upload && !due.purge);
+        assert!(due.flush && due.escalate && !due.upload && !due.purge && due.chain);
     }
 
     #[test]

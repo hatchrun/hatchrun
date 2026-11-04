@@ -35,16 +35,17 @@ use crate::launches::{self, LaunchMessage};
 use crate::store;
 
 use super::decide::{
-    Delivery, Failed, Flushed, Gate, apply_batch, apply_held, apply_result, arm_todo, attempts,
-    bounded_event, delivery, due, file_annotations, gate, github_context, gives_up, job_document,
+    Delivery, Failed, Flushed, Gate, apply_batch, apply_held, apply_result, arm_chains, arm_todo,
+    attempts, bounded_event, delivery, due, file_annotations, gate, github_context, gives_up,
+    job_document,
     minimal_check, next_alarm, plan_is_current, record_flush, reschedule, reset_jobs, run_state,
     running_for, should_write_heartbeat, snapshot_ready, steps_json, take_drain,
 };
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
     ALARM_FALLBACK_MS, BUCKET, DEADLINES, Deadlines, ESCALATE_AFTER_MS, EVENT, GRAPH, INFO,
-    JobState, LAUNCHES, OUTBOX, RESTORED_KEEP_MS, RunInfo, SNAPSHOT_RETRY_MS, Start, TODO, Todo,
-    Work, is_run, job_key, restore_key, snapshot_key,
+    JobState, LAUNCHES, OUTBOX, PendingChain, RESTORED_KEEP_MS, RunInfo, SNAPSHOT_RETRY_MS, Start,
+    TODO, Todo, Work, is_run, job_key, restore_key, snapshot_key,
 };
 
 /// The characters of GitHub's reply body a log line keeps.
@@ -515,6 +516,14 @@ impl<'a> Cx<'a> {
             worker::console_error!("alarm: side effects: {err}");
             failed.todo = true;
         }
+        if due.chain
+            && let Err(err) = self.send_chains().await
+        {
+            // The entries keep their own backoff; this only covers
+            // storage failing.
+            worker::console_error!("alarm: workflow_run: {err}");
+            failed.todo = true;
+        }
         if due.snapshot
             && let Err(err) = self.snapshot_now().await
         {
@@ -631,6 +640,7 @@ impl<'a> Cx<'a> {
     /// wakes the object to snapshot an ended run. The caller holds the lock.
     pub(super) async fn commit(&self, run: &mut Loaded) -> Result<()> {
         arm_todo(&mut run.deadlines, &run.todo, self.now);
+        arm_chains(&mut run.deadlines, &run.todo);
         if run.deadlines.snapshot_at.is_none()
             && snapshot_ready(&run.graph, &run.outbox, &run.deadlines, &run.todo)
         {
@@ -807,20 +817,8 @@ impl<'a> Cx<'a> {
         match work {
             Work::StartRun => {
                 store::run_started(db, info.run_id, self.now).await?;
-                self.workflow_run(
-                    info,
-                    &[
-                        Change {
-                            action: "requested",
-                            conclusion: None,
-                        },
-                        Change {
-                            action: "in_progress",
-                            conclusion: None,
-                        },
-                    ],
-                )
-                .await;
+                self.chain(info.run_attempt, &["requested", "in_progress"], None)
+                    .await;
                 Ok(())
             }
             Work::QueueLaunch { job, attempt } => {
@@ -877,65 +875,131 @@ impl<'a> Cx<'a> {
                 )
                 .await?;
                 concurrency::release(&self.env, db, info.run_id, None).await?;
-                self.workflow_run(
-                    info,
-                    &[Change {
-                        action: "completed",
-                        conclusion: Some(conclusion_word(*conclusion)),
-                    }],
-                )
-                .await;
+                self.chain(*attempt, &["completed"], Some(conclusion_word(*conclusion)))
+                    .await;
                 Ok(())
             }
             Work::ResetJob { job, attempt } => store::reset_job(db, *job, *attempt, self.now).await,
             Work::ReopenRun { attempt } => {
-                store::reopen_run_at(db, info.run_id, *attempt, self.now).await
+                store::reopen_run_at(db, info.run_id, *attempt, self.now).await?;
+                self.chain(*attempt, &["requested", "in_progress"], None)
+                    .await;
+                Ok(())
             }
         }
     }
 
-    /// Starts the workflows that listen for `changes` of this run
-    /// (`on: workflow_run`). A failure is logged and does not hold up the
-    /// run's other side effects: the workflows that listen are not the
-    /// run's own business, and GitHub or Postgres being down for them
-    /// must not keep the run from finishing.
-    async fn workflow_run(&self, info: &RunInfo, changes: &[Change<'_>]) {
-        let started = async {
-            let db = self.db().await?;
-            let event = self.event().await?;
-            let settings = self.settings;
-            let tokens = Tokens::new(
-                Kv::new(&self.env),
-                App::new(
-                    settings.github_api.clone(),
-                    settings.app_id.clone(),
-                    settings.app_key.clone(),
-                ),
-                &self.github,
-                self.now,
-            );
-            chain::fire(
-                &chain::Services {
-                    env: &self.env,
-                    db,
-                    settings,
-                    tokens: &tokens,
-                    now: self.now,
-                },
-                info,
-                &event,
-                changes,
-            )
-            .await
+    /// Records that `actions` of attempt `attempt` have to be sent to the
+    /// workflows that listen for them (`on: workflow_run`), and tries
+    /// to send them. The record is kept in storage apart from the todo
+    /// items, so a failure here never holds up the run's own side
+    /// effects: the alarm sends what is left, see [`Self::send_chains`].
+    async fn chain(&self, attempt: u32, actions: &[&str], conclusion: Option<&str>) {
+        let now = self.now;
+        let recorded = self
+            .update(|run| {
+                for action in actions {
+                    run.todo_mut().push_chain(attempt, action, conclusion, now);
+                }
+            })
+            .await;
+        if let Err(err) = recorded {
+            worker::console_error!("workflow_run: not recorded: {err}");
+            return;
         }
-        .await;
-        match started {
-            Ok(ids) if !ids.is_empty() => {
-                worker::console_log!("run {}: workflow_run started runs {ids:?}", info.run_id);
+        if let Err(err) = self.send_chains().await {
+            worker::console_error!("workflow_run: {err}");
+        }
+    }
+
+    /// Sends each recorded `workflow_run` change that is due. One that
+    /// fails waits longer each time, and is given up an hour after it was
+    /// recorded.
+    async fn send_chains(&self) -> Result<()> {
+        let (info, due) = {
+            let _turn = self.turn.lock().await;
+            let Some(run) = self.loaded().await? else {
+                return Ok(());
+            };
+            (run.info.clone(), run.todo.due_chains(self.now))
+        };
+        if due.is_empty() {
+            return Ok(());
+        }
+        let event = self.event().await?;
+        let mut outcomes = Vec::new();
+        for pending in &due {
+            let mut info = info.clone();
+            info.run_attempt = pending.attempt;
+            let sent = self.fire_chain(&info, &event, pending).await;
+            if let Err(err) = &sent {
+                worker::console_error!(
+                    "run {}: workflow_run {} (try {}): {err}",
+                    info.run_id,
+                    pending.action,
+                    pending.tries + 1
+                );
             }
-            Ok(_) => {}
-            Err(err) => worker::console_error!("run {}: workflow_run: {err}", info.run_id),
+            outcomes.push((pending.id, pending.action.clone(), sent.is_ok()));
         }
+        let now = self.now;
+        self.update(|run| {
+            for (id, action, sent) in &outcomes {
+                if *sent {
+                    run.todo_mut().chain_sent(*id);
+                } else if run.todo_mut().chain_failed(*id, now) {
+                    worker::console_error!(
+                        "run {}: workflow_run {action} given up after an hour",
+                        run.info.run_id
+                    );
+                }
+            }
+        })
+        .await
+    }
+
+    async fn fire_chain(
+        &self,
+        info: &RunInfo,
+        event: &Value,
+        pending: &PendingChain,
+    ) -> Result<()> {
+        let db = self.db().await?;
+        let settings = self.settings;
+        let tokens = Tokens::new(
+            Kv::new(&self.env),
+            App::new(
+                settings.github_api.clone(),
+                settings.app_id.clone(),
+                settings.app_key.clone(),
+            ),
+            &self.github,
+            self.now,
+        );
+        let ids = chain::fire(
+            &chain::Services {
+                env: &self.env,
+                db,
+                settings,
+                tokens: &tokens,
+                now: self.now,
+            },
+            info,
+            event,
+            &[Change {
+                action: &pending.action,
+                conclusion: pending.conclusion.as_deref(),
+            }],
+        )
+        .await?;
+        if !ids.is_empty() {
+            worker::console_log!(
+                "run {}: workflow_run {} started runs {ids:?}",
+                info.run_id,
+                pending.action
+            );
+        }
+        Ok(())
     }
 
     /// Gives the graph the variables of the run's scope when the job
