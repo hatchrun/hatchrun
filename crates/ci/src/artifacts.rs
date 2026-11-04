@@ -628,14 +628,14 @@ mod tests {
 
     #[test]
     fn keys_name_the_tier_tenant_repository_and_run() {
-        let key = object_key(90, "t1", 7, 9, "abc");
-        assert_eq!(key, "artifacts/90d/t1/7/9/abc");
-        assert!(in_run(&key, 90, "t1", 7, 9));
+        let path = object_key(90, "t1", 7, 9, "abc");
+        assert_eq!(path, "artifacts/90d/t1/7/9/abc");
+        assert!(in_run(&path, 90, "t1", 7, 9));
         // Another run, repository, tenant or tier is not this run's.
-        assert!(!in_run(&key, 90, "t1", 7, 10));
-        assert!(!in_run(&key, 90, "t1", 8, 9));
-        assert!(!in_run(&key, 90, "t2", 7, 9));
-        assert!(!in_run(&key, 30, "t1", 7, 9));
+        assert!(!in_run(&path, 90, "t1", 7, 10));
+        assert!(!in_run(&path, 90, "t1", 8, 9));
+        assert!(!in_run(&path, 90, "t2", 7, 9));
+        assert!(!in_run(&path, 30, "t1", 7, 9));
         assert!(!in_run("artifacts/90d/t1/7/9/../10/x", 90, "t1", 7, 9));
         // A run id that only starts with this one's.
         assert!(!in_run("artifacts/90d/t1/7/90/abc", 90, "t1", 7, 9));
