@@ -134,7 +134,7 @@ CI_REGION = "us-east-1"
 # deploy/cloudformation/ci-account.yaml. A bucket name is an id, not a
 # secret, and is committed here like the other ids in this file. The
 # agent gets the artifact service only once it is set.
-ARTIFACTS_BUCKET = ""
+ARTIFACTS_BUCKET = "hatchrun-ci-artifactsbucket-flrtihmpyo4z"
 # POLAR_API_URL is left unset, so the usage events go to
 # https://api.polar.sh, the same Polar as hatchrun-cloud.
 # The id of the key behind CI_SECRETS_KEY, stored with every sealed
