@@ -267,10 +267,15 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
     let fresh = with_file[sent..end].to_vec();
     let fresh_len = fresh.len();
 
+    let step_failed = view.steps.iter().any(|s| {
+        s.summary
+            .as_ref()
+            .is_some_and(|s| s.conclusion == Conclusion::Failure)
+    });
     let text = view
         .failed_tail
         .filter(|tail| !tail.is_empty())
-        .map(tail_text);
+        .map(|tail| tail_text(tail, step_failed));
 
     let run = CheckRun {
         name: check_name(view.workflow, &view.node.job.id),
@@ -292,14 +297,25 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
 }
 
 /// The log lines of a failed job as a fenced `text` block under a
-/// "last N lines" note, cut from the end to fit GitHub's limit.
-fn tail_text(tail: &[String]) -> String {
+/// "last N lines" note, cut from the end to fit GitHub's limit. `N` is
+/// the number of lines that stay. The lines are the failed step's, or
+/// the job's when no step is marked failed.
+fn tail_text(tail: &[String], step_failed: bool) -> String {
+    let what = if step_failed {
+        "the failed step"
+    } else {
+        "the job log"
+    };
     let body = tail.join("\n");
     let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
-    let note = format!("Last {} lines of the failed step:\n\n", tail.len());
-    let room = MAX_OUTPUT_CHARS - note.len() - 2 * (fence.len() + 4) - 2;
-    format!("{note}{fence}text\n{}\n{fence}", truncate(&body, room))
+    // The note is no longer with the final count than with `tail.len()`.
+    let widest = format!("Last {} lines of {what}:\n\n", tail.len());
+    let room = MAX_OUTPUT_CHARS - widest.len() - 2 * (fence.len() + 4) - 2;
+    let shown = truncate(&body, room);
+    let kept = shown.strip_suffix(TRUNCATED).unwrap_or(&shown);
+    let note = format!("Last {} lines of {what}:\n\n", kept.lines().count());
+    format!("{note}{fence}text\n{shown}\n{fence}")
 }
 
 /// The jobs whose check run is behind, when each may be tried again
@@ -325,6 +341,13 @@ impl Outbox {
     pub fn mark(&mut self, job: u64) {
         self.counter += 1;
         self.marked.insert(job, self.counter);
+    }
+
+    /// The job started over (a rerun): mark it and forget the backoff
+    /// of its old attempt.
+    pub fn reset(&mut self, job: u64) {
+        self.retry_at_ms.remove(&job);
+        self.mark(job);
     }
 
     /// Whether no job waits for an update.
@@ -613,7 +636,7 @@ mod tests {
         assert!(out.summary.starts_with("Step 2 failed."));
         assert_eq!(
             out.text.as_deref(),
-            Some("Last 2 lines of the failed step:\n\n```text\nerror: boom\nexit 1\n```")
+            Some("Last 2 lines of the job log:\n\n```text\nerror: boom\nexit 1\n```")
         );
     }
 
@@ -749,8 +772,39 @@ mod tests {
         v.failed_tail = Some(&tail);
         let text = render(&v).0.output.unwrap().text.unwrap();
         assert!(text.chars().count() <= MAX_OUTPUT_CHARS);
-        assert!(text.starts_with("Last 2 lines of the failed step:\n\n``````text\n"));
+        assert!(text.starts_with("Last 2 lines of the job log:\n\n``````text\n"));
         assert!(text.ends_with("(truncated)\n``````"));
+    }
+
+    #[test]
+    fn the_tail_note_names_the_failed_step_and_counts_the_lines_shown() {
+        let failed = StepSummary {
+            name: "s".to_owned(),
+            outcome: Conclusion::Failure,
+            conclusion: Conclusion::Failure,
+            duration_ms: 0,
+        };
+        let steps = [StepView {
+            index: 0,
+            name: "s".to_owned(),
+            summary: Some(failed),
+        }];
+        let n = node(State::Done(Conclusion::Failure), None);
+        let tail = vec!["a".to_owned(), "b".to_owned()];
+        let mut v = view(&n, &steps, &[]);
+        v.failed_tail = Some(&tail);
+        let text = render(&v).0.output.unwrap().text.unwrap();
+        assert!(text.starts_with("Last 2 lines of the failed step:\n\n"));
+
+        let long = vec!["x".repeat(40_000), "y".repeat(40_000), "z".to_owned()];
+        v.failed_tail = Some(&long);
+        let text = render(&v).0.output.unwrap().text.unwrap();
+        assert!(text.chars().count() <= MAX_OUTPUT_CHARS);
+        assert!(
+            text.starts_with("Last 2 lines of the failed step:\n\n"),
+            "{}",
+            &text[..60]
+        );
     }
 
     #[test]
@@ -762,7 +816,7 @@ mod tests {
         let text = render(&v).0.output.unwrap().text.unwrap();
         assert_eq!(
             text,
-            "Last 2 lines of the failed step:\n\n````text\n```\nafter\n````"
+            "Last 2 lines of the job log:\n\n````text\n```\nafter\n````"
         );
     }
 
@@ -886,6 +940,17 @@ mod tests {
         assert_eq!(o.next_alarm(0), None);
         o.mark(1);
         assert_eq!(o.due(0), vec![1], "a sent job leaves no retry time");
+    }
+
+    #[test]
+    fn a_rerun_forgets_the_backoff_of_the_old_attempt() {
+        let mut o = Outbox::default();
+        o.mark(1);
+        o.retry_after(1, 0, 600);
+        o.mark(1);
+        assert!(o.due(0).is_empty(), "a plain mark keeps the backoff");
+        o.reset(1);
+        assert_eq!(o.due(0), vec![1]);
     }
 
     #[test]
