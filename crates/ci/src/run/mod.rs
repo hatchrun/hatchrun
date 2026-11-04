@@ -244,6 +244,10 @@ pub struct Deadlines {
     /// When the earliest [`PendingChain`] is tried again.
     #[serde(default)]
     pub chain_retry_at: Option<u64>,
+    /// Until when [`PendingChain`]s wait after the object failed to read
+    /// or write its storage for them.
+    #[serde(default)]
+    pub chain_hold_until: Option<u64>,
     /// Alarms in a row in which a part failed; sets the backoff.
     pub failures: u32,
 }
@@ -313,6 +317,9 @@ pub const CHAIN_GIVE_UP_MS: u64 = 3_600_000;
 /// The longest wait between two tries of a [`PendingChain`], in
 /// milliseconds.
 const CHAIN_MAX_WAIT_MS: u64 = 300_000;
+
+/// How long a claimed [`PendingChain`] is left alone while it is sent.
+pub const CHAIN_LEASE_MS: u64 = 120_000;
 
 /// A state change of the run that `on: workflow_run` workflows still
 /// have to be started for. Kept apart from the [`Work`] items, so a
@@ -391,14 +398,18 @@ impl Todo {
         });
     }
 
-    /// The changes whose time has come, oldest first.
-    #[must_use]
-    pub fn due_chains(&self, now: u64) -> Vec<PendingChain> {
-        self.chains
-            .iter()
-            .filter(|c| c.next_at <= now)
-            .cloned()
-            .collect()
+    /// Takes the changes whose time has come, oldest first. Each is
+    /// held for `lease` milliseconds, so that nothing else sends it
+    /// meanwhile; one whose sender died is due again after that.
+    pub fn claim_chains(&mut self, now: u64, lease: u64) -> Vec<PendingChain> {
+        let mut claimed = Vec::new();
+        for chain in &mut self.chains {
+            if chain.next_at <= now {
+                claimed.push(chain.clone());
+                chain.next_at = now + lease;
+            }
+        }
+        claimed
     }
 
     /// Drops the change `id`, which was sent.
@@ -492,7 +503,6 @@ mod tests {
         todo.push_chain(1, "completed", Some("success"), 2_000);
         todo.push_chain(2, "completed", Some("failure"), 2_000);
         assert_eq!(todo.chains.len(), 2);
-        assert_eq!(todo.due_chains(1_000).len(), 1);
         let id = todo.chains[0].id;
         assert!(!todo.chain_failed(id, 1_000));
         assert_eq!(todo.chains[0].next_at, 1_000 + 10_000);
@@ -507,6 +517,18 @@ mod tests {
         assert_eq!(todo.chains.len(), 1);
         todo.chain_sent(todo.chains[0].id);
         assert_eq!(todo.next_chain_at(), None);
+    }
+
+    #[test]
+    fn a_claimed_chain_is_not_handed_out_again_until_its_lease_ends() {
+        let mut todo = Todo::default();
+        todo.push_chain(1, "completed", Some("success"), 1_000);
+        assert_eq!(todo.claim_chains(500, 50_000).len(), 0);
+        assert_eq!(todo.claim_chains(1_000, 50_000).len(), 1);
+        assert_eq!(todo.claim_chains(1_000, 50_000).len(), 0);
+        assert_eq!(todo.claim_chains(30_000, 50_000).len(), 0);
+        // A sender that died leaves the change due again.
+        assert_eq!(todo.claim_chains(51_000, 50_000).len(), 1);
     }
 
     #[test]

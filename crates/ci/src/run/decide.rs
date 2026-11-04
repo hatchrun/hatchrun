@@ -34,8 +34,16 @@ pub(crate) fn arm_todo(deadlines: &mut Deadlines, todo: &Todo, now_ms: u64) {
 
 /// Points the deadline of the `workflow_run` changes at the earliest
 /// one still to send.
-pub(crate) fn arm_chains(deadlines: &mut Deadlines, todo: &Todo) {
-    deadlines.chain_retry_at = todo.next_chain_at();
+/// A hold left by a failed alarm part delays them, but not past its end.
+pub(crate) fn arm_chains(deadlines: &mut Deadlines, todo: &Todo, now_ms: u64) {
+    if deadlines
+        .chain_hold_until
+        .is_some_and(|until| until <= now_ms)
+    {
+        deadlines.chain_hold_until = None;
+    }
+    let hold = deadlines.chain_hold_until.unwrap_or(0);
+    deadlines.chain_retry_at = todo.next_chain_at().map(|at| at.max(hold));
 }
 
 /// What a request from an agent finds when it names a job and the
@@ -388,6 +396,7 @@ pub(crate) fn snapshot_ready(
     graph.conclusion().is_some()
         && outbox.is_empty()
         && todo.is_empty()
+        && todo.chains.is_empty()
         && deadlines.upload_retry_at.is_none()
         && deadlines.purge_at.is_none()
 }
@@ -587,6 +596,7 @@ pub(crate) struct Failed {
     pub(crate) escalate: bool,
     pub(crate) upload: bool,
     pub(crate) todo: bool,
+    pub(crate) chain: bool,
     pub(crate) purge: bool,
     pub(crate) snapshot: bool,
 }
@@ -599,6 +609,7 @@ pub(crate) fn reschedule(deadlines: &mut Deadlines, failed: Failed, now_ms: u64)
         || failed.escalate
         || failed.upload
         || failed.todo
+        || failed.chain
         || failed.purge
         || failed.snapshot;
     if !any {
@@ -615,6 +626,10 @@ pub(crate) fn reschedule(deadlines: &mut Deadlines, failed: Failed, now_ms: u64)
     }
     if failed.todo {
         deadlines.todo_retry_at = Some(at);
+    }
+    if failed.chain {
+        deadlines.chain_hold_until = Some(at);
+        deadlines.chain_retry_at = Some(at);
     }
     if failed.purge {
         deadlines.purge_at = Some(at);
@@ -987,6 +1002,35 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         let mut busy = Todo::default();
         busy.push(Work::StartRun);
         assert!(!snapshot_ready(&g, &quiet.0, &quiet.1, &busy));
+        // A workflow_run change still to send keeps the run.
+        let mut chained = Todo::default();
+        chained.push_chain(1, "completed", Some("failure"), 5);
+        assert!(!snapshot_ready(&g, &quiet.0, &quiet.1, &chained));
+        chained.chain_sent(chained.chains[0].id);
+        assert!(snapshot_ready(&g, &quiet.0, &quiet.1, &chained));
+    }
+
+    #[test]
+    fn a_failed_chain_part_holds_the_chain_deadline_not_the_todo_one() {
+        let mut todo = Todo::default();
+        todo.push_chain(1, "completed", None, 100);
+        let mut deadlines = Deadlines::default();
+        arm_chains(&mut deadlines, &todo, 100);
+        assert_eq!(deadlines.chain_retry_at, Some(100));
+        let failed = Failed {
+            chain: true,
+            ..Failed::default()
+        };
+        reschedule(&mut deadlines, failed, 100);
+        assert_eq!(deadlines.todo_retry_at, None);
+        let held = deadlines.chain_retry_at.unwrap();
+        assert!(held > 100);
+        // Arming again keeps the hold, and drops it once it has passed.
+        arm_chains(&mut deadlines, &todo, 101);
+        assert_eq!(deadlines.chain_retry_at, Some(held));
+        arm_chains(&mut deadlines, &todo, held);
+        assert_eq!(deadlines.chain_hold_until, None);
+        assert_eq!(deadlines.chain_retry_at, Some(100));
     }
 
     #[test]

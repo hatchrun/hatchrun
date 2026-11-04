@@ -15,9 +15,8 @@ use serde_json::{Value, json};
 use worker::Result;
 
 use crate::env::Settings;
-use crate::github;
 use crate::run::RunInfo;
-use crate::runs::{self, Config};
+use crate::runs;
 
 /// The deepest a chain of `workflow_run` runs goes, as on GitHub: a
 /// workflow started by a workflow started by a workflow started by a
@@ -45,10 +44,6 @@ pub struct Services<'a> {
     pub tokens: &'a Tokens<'a, Kv, App, Counted>,
     /// The time of the change, in milliseconds.
     pub now: u64,
-}
-
-fn fail(message: impl Into<String>) -> worker::Error {
-    worker::Error::RustError(message.into())
 }
 
 /// How many `workflow_run` hops led to a run: 0 for a run started by
@@ -153,29 +148,13 @@ pub async fn fire(
         return Ok(Vec::new());
     }
     let git_ref = format!("refs/heads/{}", info.repo.default_branch);
-    let response = tokens
-        .send(info.installation_id, |token| {
-            github::commit_sha(
-                &settings.github_api,
-                &info.repo.full_name,
-                &format!("heads/{}", info.repo.default_branch),
-                token,
-            )
-        })
-        .await
-        .map_err(|err| fail(err.to_string()))?;
-    let sha = github::sha_of(&response).map_err(fail)?;
-    let config = runs::read_config(
-        tokens,
-        settings,
-        info.installation_id,
-        &info.repo.full_name,
-        &sha,
-    )
-    .await?;
-    if matches!(config, Config::Missing) {
+    // A repository with no commit on its default branch has nothing to
+    // start; asking again later would not change that.
+    let Some((sha, config)) =
+        runs::default_head(tokens, settings, info.installation_id, &info.repo).await?
+    else {
         return Ok(Vec::new());
-    }
+    };
     let mut ids = Vec::new();
     for change in changes {
         let trigger = Event::WorkflowRun {

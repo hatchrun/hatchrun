@@ -57,7 +57,6 @@ use worker::{Env, Method, RequestInit, console_error, console_log};
 use crate::cache;
 use crate::concurrency;
 use crate::env::{Settings, run_stub};
-use crate::github;
 use crate::intake::Repo;
 use crate::launcher::Backend;
 use crate::launches::{self, EndAction, LaunchMessage};
@@ -653,29 +652,21 @@ async fn head(
         Some(tenant) if tenant.ci_billing == CiBilling::Active => {}
         _ => return Ok(None),
     }
-    let response = tokens
-        .send(row.installation_id, |token| {
-            github::commit_sha(
-                &settings.github_api,
-                &row.full_name,
-                &format!("heads/{}", row.default_branch),
-                token,
-            )
-        })
+    let repo = Repo {
+        id: row.id,
+        full_name: row.full_name,
+        default_branch: row.default_branch,
+        private: row.private,
+    };
+    let Some((sha, config)) = runs::default_head(tokens, settings, row.installation_id, &repo)
         .await
-        .map_err(|e| e.to_string())?;
-    let sha = github::sha_of(&response)?;
-    let config = runs::read_config(tokens, settings, row.installation_id, &row.full_name, &sha)
-        .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
     Ok(Some(Head {
-        git_ref: format!("refs/heads/{}", row.default_branch),
-        repo: Repo {
-            id: row.id,
-            full_name: row.full_name,
-            default_branch: row.default_branch,
-            private: row.private,
-        },
+        git_ref: format!("refs/heads/{}", repo.default_branch),
+        repo,
         tenant_id: row.tenant_id,
         installation_id: row.installation_id,
         sha,

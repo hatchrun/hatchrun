@@ -37,15 +37,14 @@ use crate::store;
 use super::decide::{
     Delivery, Failed, Flushed, Gate, apply_batch, apply_held, apply_result, arm_chains, arm_todo,
     attempts, bounded_event, delivery, due, file_annotations, gate, github_context, gives_up,
-    job_document,
-    minimal_check, next_alarm, plan_is_current, record_flush, reschedule, reset_jobs, run_state,
-    running_for, should_write_heartbeat, snapshot_ready, steps_json, take_drain,
+    job_document, minimal_check, next_alarm, plan_is_current, record_flush, reschedule, reset_jobs,
+    run_state, running_for, should_write_heartbeat, snapshot_ready, steps_json, take_drain,
 };
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
-    ALARM_FALLBACK_MS, BUCKET, DEADLINES, Deadlines, ESCALATE_AFTER_MS, EVENT, GRAPH, INFO,
-    JobState, LAUNCHES, OUTBOX, PendingChain, RESTORED_KEEP_MS, RunInfo, SNAPSHOT_RETRY_MS, Start,
-    TODO, Todo, Work, is_run, job_key, restore_key, snapshot_key,
+    ALARM_FALLBACK_MS, BUCKET, CHAIN_LEASE_MS, DEADLINES, Deadlines, ESCALATE_AFTER_MS, EVENT,
+    GRAPH, INFO, JobState, LAUNCHES, OUTBOX, PendingChain, RESTORED_KEEP_MS, RunInfo,
+    SNAPSHOT_RETRY_MS, Start, TODO, Todo, Work, is_run, job_key, restore_key, snapshot_key,
 };
 
 /// The characters of GitHub's reply body a log line keeps.
@@ -519,10 +518,10 @@ impl<'a> Cx<'a> {
         if due.chain
             && let Err(err) = self.send_chains().await
         {
-            // The entries keep their own backoff; this only covers
-            // storage failing.
+            // The entries keep their own backoff; this covers storage
+            // failing.
             worker::console_error!("alarm: workflow_run: {err}");
-            failed.todo = true;
+            failed.chain = true;
         }
         if due.snapshot
             && let Err(err) = self.snapshot_now().await
@@ -640,7 +639,7 @@ impl<'a> Cx<'a> {
     /// wakes the object to snapshot an ended run. The caller holds the lock.
     pub(super) async fn commit(&self, run: &mut Loaded) -> Result<()> {
         arm_todo(&mut run.deadlines, &run.todo, self.now);
-        arm_chains(&mut run.deadlines, &run.todo);
+        arm_chains(&mut run.deadlines, &run.todo, self.now);
         if run.deadlines.snapshot_at.is_none()
             && snapshot_ready(&run.graph, &run.outbox, &run.deadlines, &run.todo)
         {
@@ -890,10 +889,11 @@ impl<'a> Cx<'a> {
     }
 
     /// Records that `actions` of attempt `attempt` have to be sent to the
-    /// workflows that listen for them (`on: workflow_run`), and tries
-    /// to send them. The record is kept in storage apart from the todo
-    /// items, so a failure here never holds up the run's own side
-    /// effects: the alarm sends what is left, see [`Self::send_chains`].
+    /// workflows that listen for them (`on: workflow_run`). Only the
+    /// record is made here: the alarm, set for now, sends it, so GitHub
+    /// calls never delay the side effects that follow in the todo list.
+    /// The record is kept apart from the todo items, so a failure to
+    /// send never holds them up either.
     async fn chain(&self, attempt: u32, actions: &[&str], conclusion: Option<&str>) {
         let now = self.now;
         let recorded = self
@@ -905,42 +905,51 @@ impl<'a> Cx<'a> {
             .await;
         if let Err(err) = recorded {
             worker::console_error!("workflow_run: not recorded: {err}");
-            return;
-        }
-        if let Err(err) = self.send_chains().await {
-            worker::console_error!("workflow_run: {err}");
         }
     }
 
-    /// Sends each recorded `workflow_run` change that is due. One that
-    /// fails waits longer each time, and is given up an hour after it was
-    /// recorded.
+    /// Sends each recorded `workflow_run` change that is due, the
+    /// changes of one attempt together. Called from the alarm only, and
+    /// each change is claimed under the lock before it is sent. One that
+    /// fails waits longer each time, and is given up an hour after it
+    /// was recorded.
     async fn send_chains(&self) -> Result<()> {
         let (info, due) = {
             let _turn = self.turn.lock().await;
-            let Some(run) = self.loaded().await? else {
+            let Some(mut run) = self.loaded().await? else {
                 return Ok(());
             };
-            (run.info.clone(), run.todo.due_chains(self.now))
+            let due = run.todo_mut().claim_chains(self.now, CHAIN_LEASE_MS);
+            if due.is_empty() {
+                return Ok(());
+            }
+            self.commit(&mut run).await?;
+            (run.info.clone(), due)
         };
-        if due.is_empty() {
-            return Ok(());
-        }
         let event = self.event().await?;
         let mut outcomes = Vec::new();
-        for pending in &due {
+        let mut rest = due.as_slice();
+        while let Some(first) = rest.first() {
+            let split = rest
+                .iter()
+                .position(|p| p.attempt != first.attempt)
+                .unwrap_or(rest.len());
+            let (group, later) = rest.split_at(split);
+            rest = later;
             let mut info = info.clone();
-            info.run_attempt = pending.attempt;
-            let sent = self.fire_chain(&info, &event, pending).await;
+            info.run_attempt = first.attempt;
+            let sent = self.fire_chain(&info, &event, group).await;
             if let Err(err) = &sent {
                 worker::console_error!(
-                    "run {}: workflow_run {} (try {}): {err}",
+                    "run {}: workflow_run attempt {} (try {}): {err}",
                     info.run_id,
-                    pending.action,
-                    pending.tries + 1
+                    first.attempt,
+                    first.tries + 1
                 );
             }
-            outcomes.push((pending.id, pending.action.clone(), sent.is_ok()));
+            for pending in group {
+                outcomes.push((pending.id, pending.action.clone(), sent.is_ok()));
+            }
         }
         let now = self.now;
         self.update(|run| {
@@ -962,7 +971,7 @@ impl<'a> Cx<'a> {
         &self,
         info: &RunInfo,
         event: &Value,
-        pending: &PendingChain,
+        group: &[PendingChain],
     ) -> Result<()> {
         let db = self.db().await?;
         let settings = self.settings;
@@ -976,6 +985,13 @@ impl<'a> Cx<'a> {
             &self.github,
             self.now,
         );
+        let changes: Vec<Change<'_>> = group
+            .iter()
+            .map(|pending| Change {
+                action: &pending.action,
+                conclusion: pending.conclusion.as_deref(),
+            })
+            .collect();
         let ids = chain::fire(
             &chain::Services {
                 env: &self.env,
@@ -986,18 +1002,11 @@ impl<'a> Cx<'a> {
             },
             info,
             event,
-            &[Change {
-                action: &pending.action,
-                conclusion: pending.conclusion.as_deref(),
-            }],
+            &changes,
         )
         .await?;
         if !ids.is_empty() {
-            worker::console_log!(
-                "run {}: workflow_run {} started runs {ids:?}",
-                info.run_id,
-                pending.action
-            );
+            worker::console_log!("run {}: workflow_run started runs {ids:?}", info.run_id);
         }
         Ok(())
     }
