@@ -4,7 +4,7 @@
 
 //! Trigger matching with GitHub filter rules.
 
-use hatchrun_workflow::{Event, Filter, Triggers, triggered};
+use hatchrun_workflow::{Event, Filter, RELEASE_TYPES, Triggers, triggered};
 
 fn f(patterns: &[&str]) -> Filter {
     Filter::new(patterns.iter().map(|p| (*p).to_owned()).collect())
@@ -314,7 +314,17 @@ fn workflow_run_matches_the_named_workflow_and_branch() {
         workflow: "ci".into(),
         branch: "main".into(),
     };
+    // `completed` is the default type; the others must be asked for.
     assert!(!triggered(&t, &requested));
+    let t = on("workflow_run: { workflows: [ci], types: [requested, in_progress] }");
+    assert!(triggered(&t, &requested));
+    let in_progress = Event::WorkflowRun {
+        action: "in_progress".into(),
+        workflow: "ci".into(),
+        branch: "main".into(),
+    };
+    assert!(triggered(&t, &in_progress));
+    assert!(!triggered(&t, &run("ci", "main")));
     let t = on("workflow_run: { workflows: ci, branches-ignore: ['feature/**'] }");
     assert!(triggered(&t, &run("ci", "main")) && !triggered(&t, &run("ci", "feature/a")));
     // Other events do not start it, and it does not start on them.
@@ -346,6 +356,34 @@ fn release_matches_types_and_tags() {
         &on("push: { tags: ['v*'] }"),
         &release("published", "v1")
     ));
+}
+
+#[test]
+fn release_matches_every_activity_type() {
+    for action in RELEASE_TYPES {
+        let t = on(&format!("release: {{ types: [{action}] }}"));
+        assert!(triggered(&t, &release(action, "v1")), "{action}");
+    }
+    let t = on("release: { types: [unpublished, edited, deleted] }");
+    assert!(!triggered(&t, &release("published", "v1")));
+}
+
+#[test]
+fn create_and_delete_take_no_filters() {
+    let t = on("create:");
+    assert!(t.create.is_some() && t.delete.is_none());
+    assert!(triggered(&t, &Event::Create));
+    assert!(!triggered(&t, &Event::Delete));
+    let t = on("delete: {}");
+    assert!(triggered(&t, &Event::Delete));
+    assert!(!triggered(&t, &Event::Create));
+    assert!(!triggered(&on("push: {}"), &Event::Create));
+    assert!(serde_saphyr::from_str::<Triggers>("create: { branches: [main] }").is_err());
+    for yaml in ["create:", "delete:", "create: {}\ndelete: {}"] {
+        let t = on(yaml);
+        let written = serde_saphyr::to_string(&t).unwrap();
+        assert_eq!(on(&written), t, "{yaml}\n{written}");
+    }
 }
 
 #[test]

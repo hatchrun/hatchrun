@@ -114,6 +114,103 @@ pub async fn read_config(
     }
 }
 
+/// The commit `reference` (`heads/main`, `tags/v1`) names, `None` when
+/// the repository has no such ref: GitHub answers 404 for a ref that is
+/// gone, 409 for an empty repository and 422 for a ref it cannot
+/// resolve. None of them gets better by asking again.
+///
+/// # Errors
+///
+/// No token, GitHub unreachable, or an answer that is neither a commit
+/// nor one of those.
+pub async fn commit(
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    settings: &Settings,
+    installation_id: u64,
+    repo: &str,
+    reference: &str,
+) -> Result<Option<String>> {
+    let response = tokens
+        .send(installation_id, |token| {
+            github::commit_sha(&settings.github_api, repo, reference, token)
+        })
+        .await
+        .map_err(|err| fail(err.to_string()))?;
+    commit_of(&response).map_err(fail)
+}
+
+/// The sha in GitHub's answer to a commit request, `None` for an answer
+/// that says the ref is not there (see [`commit`]).
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a commit.
+pub fn commit_of(
+    response: &hatchrun_cloud::http::Response,
+) -> std::result::Result<Option<String>, String> {
+    if response.status == 422 && is_throttled(response) {
+        // A secondary rate limit answers 422 too, and it passes.
+        return Err(format!(
+            "commit: GitHub throttled the request: {}",
+            response.text()
+        ));
+    }
+    if matches!(response.status, 404 | 409 | 422) {
+        return Ok(None);
+    }
+    github::sha_of(response).map(Some)
+}
+
+/// Whether an answer is a rate or abuse limit, which GitHub marks with
+/// a `Retry-After` header or in its message.
+fn is_throttled(response: &hatchrun_cloud::http::Response) -> bool {
+    if response.header("retry-after").is_some() {
+        return true;
+    }
+    let text = response.text().to_ascii_lowercase();
+    // A missing ref is the answer whatever its name says: a tag called
+    // `secondary-v1` is not a rate limit.
+    if text.contains("no commit found") {
+        return false;
+    }
+    [
+        "rate limit",
+        "abuse detection",
+        "secondary rate",
+        "exceeded a secondary",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
+/// The head of a repository's default branch and its config there.
+/// `None` when the repository has no commit on that branch.
+///
+/// # Errors
+///
+/// See [`commit`] and [`read_config`].
+pub async fn default_head(
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    settings: &Settings,
+    installation_id: u64,
+    repo: &Repo,
+) -> Result<Option<(String, Config)>> {
+    let reference = format!("heads/{}", repo.default_branch);
+    let Some(sha) = commit(
+        tokens,
+        settings,
+        installation_id,
+        &repo.full_name,
+        &reference,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let config = read_config(tokens, settings, installation_id, &repo.full_name, &sha).await?;
+    Ok(Some((sha, config)))
+}
+
 /// The completed check run that reports a config that does not parse or
 /// compile: the diagnostics are its summary and annotations on the
 /// config file.
@@ -520,6 +617,49 @@ async fn post_start(env: &Env, run_id: u64, start: &Start) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use hatchrun_cloud::http::Response as HttpResponse;
+
+    fn answer(status: u16, body: &str) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_missing_ref_is_none_and_not_an_error() {
+        for status in [404, 409, 422] {
+            assert_eq!(commit_of(&answer(status, "{}")), Ok(None), "{status}");
+        }
+        assert_eq!(
+            commit_of(&answer(200, r#"{"sha":"abc"}"#)),
+            Ok(Some("abc".to_owned()))
+        );
+        assert!(commit_of(&answer(500, "boom")).is_err());
+        let limited = answer(
+            422,
+            r#"{"message":"You have exceeded a secondary rate limit."}"#,
+        );
+        assert!(commit_of(&limited).is_err());
+        let mut waiting = answer(422, "{}");
+        waiting.headers.push(("retry-after".into(), "60".into()));
+        assert!(commit_of(&waiting).is_err());
+        let unresolvable = answer(422, r#"{"message":"No commit found for SHA: x"}"#);
+        assert_eq!(commit_of(&unresolvable), Ok(None));
+        let named = answer(
+            422,
+            r#"{"message":"No commit found for SHA: tags/secondary-v1"}"#,
+        );
+        assert_eq!(commit_of(&named), Ok(None));
+        let abuse = answer(
+            422,
+            r#"{"message":"You have triggered an abuse detection mechanism."}"#,
+        );
+        assert!(commit_of(&abuse).is_err());
+        assert!(commit_of(&answer(403, "rate limited")).is_err());
+    }
+
     use std::collections::BTreeMap;
 
     use hatchrun_workflow::SecretRefs;

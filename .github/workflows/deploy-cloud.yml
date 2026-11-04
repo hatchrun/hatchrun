@@ -9,7 +9,7 @@ name: deploy-cloud
 # role's connection string, is for the migrations step alone; the
 # Worker reaches the database through Hyperdrive.
 #
-# This Worker forwards push, pull_request, check_run and repository
+# This Worker forwards push, pull_request, check_run, repository, release, create and delete
 # deliveries to hatchrun-ci over the CI service binding, so hatchrun-ci has to exist
 # before this deploy lands. Deploy hatchrun-ci first (deploy-ci.yml,
 # by hand the first time); until then a deploy here fails on the

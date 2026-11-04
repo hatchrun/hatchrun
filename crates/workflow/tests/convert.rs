@@ -1843,7 +1843,7 @@ fn workflow_run_names_workflows_by_their_stem() {
 on:
   workflow_run:
     workflows: [CI, unnamed.yml, Missing, Deploy]
-    types: [completed, requested]
+    types: [completed, bogus]
     branches: [main]
 name: Deploy
 jobs:
@@ -1861,10 +1861,7 @@ jobs:
     assert_eq!(run.branches, Some(Filter::new(vec!["main".into()])));
     assert!(has(&out.warnings, &["deploy.yml", "`Missing`", "dropped"]));
     assert!(has(&out.warnings, &["deploy.yml", "`Deploy`", "this file"]));
-    assert!(has(
-        &out.warnings,
-        &["deploy.yml", "`requested`", "dropped"]
-    ));
+    assert!(has(&out.warnings, &["deploy.yml", "`bogus`", "dropped"]));
     assert_eq!(out.errors, []);
     round_trips(&out);
 }
@@ -1879,7 +1876,7 @@ fn workflow_run_with_no_known_workflow_is_dropped() {
         ),
         (
             "only.yml",
-            "on:\n  workflow_run: { workflows: [CI], types: [requested] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+            "on:\n  workflow_run: { workflows: [CI], types: [bogus] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
         ),
     ]);
     let deploy = &out.config.workflows["deploy"].on;
@@ -1891,7 +1888,7 @@ fn workflow_run_with_no_known_workflow_is_dropped() {
     // A workflow left with no event is dropped with its jobs.
     assert!(!out.config.workflows.contains_key("only"));
     assert!(!out.config.jobs.contains_key("only-t"));
-    assert!(has(&out.warnings, &["only.yml", "`requested`"]));
+    assert!(has(&out.warnings, &["only.yml", "`bogus`"]));
     round_trips(&out);
 }
 
@@ -1928,11 +1925,11 @@ fn workflow_run_after_a_workflow_that_did_not_convert() {
 #[test]
 fn release_types_convert() {
     let out = ok(
-        "on:\n  release:\n    types: [published, created, edited]\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        "on:\n  release:\n    types: [published, created, bogus]\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
     );
     let release = out.config.workflows["ci"].on.release.as_ref().unwrap();
     assert_eq!(release.types, ["published", "created"]);
-    assert!(has(&out.warnings, &["`on.release`", "`edited`", "dropped"]));
+    assert!(has(&out.warnings, &["`on.release`", "`bogus`", "dropped"]));
     round_trips(&out);
 
     let out = ok("on: release\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n");
@@ -1945,13 +1942,10 @@ fn release_types_convert() {
     round_trips(&out);
 
     let out = ok(
-        "on:\n  push:\n  release: { types: deleted }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        "on:\n  push:\n  release: { types: bogus }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
     );
     assert!(out.config.workflows["ci"].on.release.is_none());
-    assert!(has(
-        &out.warnings,
-        &["`on.release` was dropped", "`deleted`"]
-    ));
+    assert!(has(&out.warnings, &["`on.release` was dropped", "`bogus`"]));
 }
 
 /// The steps of the one job of a converted one-step workflow.
@@ -2634,5 +2628,44 @@ jobs:
 ");
     assert!(out.errors.is_empty(), "{:?}", out.errors);
     assert!(out.config.jobs.contains_key("ci-b"));
+    round_trips(&out);
+}
+
+#[test]
+fn create_and_delete_convert() {
+    let out = ok(
+        "on:\n  create:\n  delete:\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+    );
+    let on = &out.config.workflows["ci"].on;
+    assert!(on.create.is_some() && on.delete.is_some());
+    assert_eq!(out.errors, []);
+    assert_eq!(out.warnings, []);
+    round_trips(&out);
+
+    let out =
+        ok("on: [create, delete]\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n");
+    let on = &out.config.workflows["ci"].on;
+    assert!(on.create.is_some() && on.delete.is_some());
+}
+
+#[test]
+fn workflow_run_and_release_keep_their_activity_types() {
+    let out = many(&[
+        ("ci.yml", CI),
+        (
+            "after.yml",
+            "on:\n  workflow_run: { workflows: [CI], types: [requested, in_progress, completed] }\n  release: { types: [unpublished, edited, deleted] }\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+        ),
+    ]);
+    let on = &out.config.workflows["after"].on;
+    assert_eq!(
+        on.workflow_run.as_ref().unwrap().types,
+        ["requested", "in_progress", "completed"]
+    );
+    assert_eq!(
+        on.release.as_ref().unwrap().types,
+        ["unpublished", "edited", "deleted"]
+    );
+    assert_eq!(out.warnings, []);
     round_trips(&out);
 }

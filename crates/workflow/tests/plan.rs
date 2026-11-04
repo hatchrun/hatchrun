@@ -1699,9 +1699,9 @@ fn workflow_run_names_another_workflow_of_the_config() {
         &["`on.workflow_run` names no workflow"],
     );
     assert_error(
-        &chained("{ workflow_run: { workflows: [ci], types: [requested] } }"),
+        &chained("{ workflow_run: { workflows: [ci], types: [bogus] } }"),
         &[
-            "`on.workflow_run` type `requested` is not supported",
+            "`on.workflow_run` type `bogus` is not supported",
             "completed",
         ],
     );
@@ -1715,13 +1715,13 @@ fn workflow_run_names_another_workflow_of_the_config() {
 fn release_types_and_tags_are_checked() {
     assert_eq!(
         errors(&chained(
-            "{ release: { types: [published, created, released, prereleased] } }"
+            "{ release: { types: [published, unpublished, created, edited, deleted, released, prereleased] } }"
         )),
         []
     );
     assert_error(
-        &chained("{ release: { types: [published, edited] } }"),
-        &["`on.release` type `edited` is not supported"],
+        &chained("{ release: { types: [published, bogus] } }"),
+        &["`on.release` type `bogus` is not supported"],
     );
     assert_error(
         &chained("{ release: { types: [] } }"),

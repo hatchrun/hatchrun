@@ -522,7 +522,26 @@ pub struct Triggers {
         skip_serializing_if = "Option::is_none"
     )]
     pub release: Option<ReleaseTrigger>,
+    /// A branch or tag being created. GitHub has no filters for it.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub create: Option<RefTrigger>,
+    /// A branch or tag being deleted. GitHub has no filters for it.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delete: Option<RefTrigger>,
 }
+
+/// `on: create` and `on: delete`, which take no filters.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefTrigger {}
 
 /// Filters for `on: push`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -611,7 +630,8 @@ pub struct WorkflowRunTrigger {
     /// this one. One may be written as a plain string.
     #[serde(deserialize_with = "one_or_many")]
     pub workflows: Vec<String>,
-    /// Activity types; only `completed`, which is also the default.
+    /// Activity types, from [`WORKFLOW_RUN_TYPES`]; `completed` when
+    /// absent.
     #[serde(
         default = "completed",
         deserialize_with = "one_or_many",
@@ -627,7 +647,7 @@ pub struct WorkflowRunTrigger {
 }
 
 /// The activity types `on.workflow_run` accepts.
-pub const WORKFLOW_RUN_TYPES: &[&str] = &["completed"];
+pub const WORKFLOW_RUN_TYPES: &[&str] = &["requested", "in_progress", "completed"];
 
 fn completed() -> Vec<String> {
     vec!["completed".to_owned()]
@@ -653,9 +673,16 @@ pub struct ReleaseTrigger {
     pub tags_ignore: Option<Filter>,
 }
 
-/// The activity types `on.release` accepts. GitHub's `unpublished`,
-/// `edited` and `deleted` are left out.
-pub const RELEASE_TYPES: &[&str] = &["published", "created", "released", "prereleased"];
+/// The activity types `on.release` accepts.
+pub const RELEASE_TYPES: &[&str] = &[
+    "published",
+    "unpublished",
+    "created",
+    "edited",
+    "deleted",
+    "prereleased",
+    "released",
+];
 
 impl Default for ReleaseTrigger {
     fn default() -> Self {
@@ -725,7 +752,7 @@ pub enum Event {
     Dispatch,
     /// A run of another workflow of the config changing state.
     WorkflowRun {
-        /// The activity type, such as `completed`.
+        /// The activity type: `requested`, `in_progress` or `completed`.
         action: String,
         /// The key of the workflow that ran.
         workflow: String,
@@ -739,6 +766,10 @@ pub enum Event {
         /// The release's tag, as a short name.
         tag: String,
     },
+    /// A branch or tag was created.
+    Create,
+    /// A branch or tag was deleted.
+    Delete,
 }
 
 /// Whether `event` starts a workflow with the triggers `on`.
@@ -776,6 +807,8 @@ pub fn triggered(on: &Triggers, event: &Event) -> bool {
                 && ref_passes(release.tags.as_ref(), release.tags_ignore.as_ref(), tag)
                     == Some(true)
         }),
+        Event::Create => on.create.is_some(),
+        Event::Delete => on.delete.is_some(),
     }
 }
 

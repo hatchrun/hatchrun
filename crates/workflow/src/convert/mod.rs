@@ -31,8 +31,8 @@ use crate::permissions::{Level, Permissions, SCOPES};
 use crate::plan;
 use crate::templates::{template, template_labels, vendor_template};
 use crate::trigger::{
-    Dispatch, Filter, PullRequestTrigger, PushTrigger, RELEASE_TYPES, ReleaseTrigger, Schedule,
-    Triggers, WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
+    Dispatch, Filter, PullRequestTrigger, PushTrigger, RELEASE_TYPES, RefTrigger, ReleaseTrigger,
+    Schedule, Triggers, WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
 };
 
 /// The result of a conversion: the config and what was dropped on the way.
@@ -235,7 +235,8 @@ const OLD_UBUNTU: &[(&str, &str)] = &[
 const UNSUPPORTED_CONTEXTS: &[&str] = &["jobs"];
 
 /// The events hatchrun can start a workflow on.
-const EVENTS: &str = "push, pull_request, schedule, workflow_dispatch, workflow_run and release";
+const EVENTS: &str =
+    "push, pull_request, schedule, workflow_dispatch, workflow_run, release, create and delete";
 
 /// Events that only GitHub can deliver, as they act on GitHub's own
 /// issues and pull requests with the base repository's secrets.
@@ -387,6 +388,11 @@ struct GhWorkflowRun {
     #[serde(default)]
     branches_ignore: Option<Filter>,
 }
+
+/// `on.create` and `on.delete`, which take no keys.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GhRef {}
 
 /// `on.release`.
 #[derive(Deserialize)]
