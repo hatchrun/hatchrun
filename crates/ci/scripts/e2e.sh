@@ -481,7 +481,7 @@ log "fail: the job failed"
 
 # Scenario: a job with id-token: write gets an OIDC token, one without it
 # gets no request variables.
-oidc_sha="$(printf 'd%.0s' $(seq 40))"
+oidc_sha="$(printf '0%.0s' $(seq 40))"
 oidc_run="$(push oidc "$oidc_sha")"
 log "push to oidc started run $oidc_run"
 wait_checks "$oidc_sha" 2 'all(.status == "completed" and .conclusion == "success")'
