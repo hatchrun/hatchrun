@@ -237,6 +237,10 @@ pub struct Deadlines {
     /// When the side effects still in the [`Todo`] list are tried
     /// again.
     pub todo_retry_at: Option<u64>,
+    /// When the check run flush is tried again after it failed as a
+    /// whole (storage, not GitHub).
+    #[serde(default)]
+    pub flush_retry_at: Option<u64>,
     /// Alarms in a row in which a part failed; sets the backoff.
     pub failures: u32,
 }
@@ -362,6 +366,14 @@ pub use object::RunObject;
 mod tests {
     use super::decide::tests::info;
     use super::*;
+
+    #[test]
+    fn deadlines_stored_before_the_flush_retry_still_load() {
+        let old = r#"{"escalate_at":null,"upload_retry_at":5,"snapshot_at":null,"purge_at":null,"todo_retry_at":null,"failures":1}"#;
+        let deadlines: Deadlines = serde_json::from_str(old).unwrap();
+        assert_eq!(deadlines.upload_retry_at, Some(5));
+        assert_eq!(deadlines.flush_retry_at, None);
+    }
 
     #[test]
     fn the_todo_list_keeps_order_and_drops_by_id() {

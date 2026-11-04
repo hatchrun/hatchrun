@@ -158,6 +158,7 @@ pub(crate) fn next_alarm(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) ->
         deadlines.snapshot_at,
         deadlines.purge_at,
         deadlines.todo_retry_at,
+        deadlines.flush_retry_at,
         outbox.next_alarm(now_ms),
     ]
     .into_iter()
@@ -180,7 +181,7 @@ pub(crate) struct Due {
 pub(crate) fn due(deadlines: &Deadlines, outbox: &Outbox, now_ms: u64) -> Due {
     let reached = |at: Option<u64>| at.is_some_and(|at| at <= now_ms);
     Due {
-        flush: !outbox.due(now_ms).is_empty(),
+        flush: !outbox.due(now_ms).is_empty() || reached(deadlines.flush_retry_at),
         escalate: reached(deadlines.escalate_at),
         upload: reached(deadlines.upload_retry_at),
         snapshot: reached(deadlines.snapshot_at),
@@ -389,6 +390,9 @@ pub(crate) enum Delivery {
     /// GitHub refuses the request (a 4xx that is not throttling). A
     /// smaller request may go through.
     Rejected,
+    /// The check run or the repository is gone (404, 410). Nothing
+    /// will ever go through.
+    Gone,
     /// A server error, a refused token or no answer.
     Failed,
 }
@@ -399,6 +403,26 @@ fn backoff(attempt: u32) -> u64 {
     (60_u64 << attempt.min(10)).min(900)
 }
 
+/// Failed sends in a row after which a job's terminal update is given
+/// up: about six hours with [`terminal_backoff`].
+const MAX_TERMINAL_TRIES: u32 = 30;
+
+/// Seconds before the terminal update of a job is tried again after
+/// `failures` failed sends in a row: 10, 30, 60, then the normal
+/// backoff. A finished job should not show as running for long.
+fn terminal_backoff(failures: u32) -> u64 {
+    match failures {
+        0 | 1 => 10,
+        2 => 30,
+        3 => 60,
+        n => backoff(n - 3),
+    }
+}
+
+/// Seconds before a failed alarm retries the check run flush the first
+/// time; it doubles up to 900.
+const FLUSH_RETRY_SECS: u64 = 10;
+
 pub(crate) fn delivery(response: &HttpResponse, now_ms: u64, attempt: u32) -> Delivery {
     if response.ok() {
         return Delivery::Done;
@@ -408,6 +432,9 @@ pub(crate) fn delivery(response: &HttpResponse, now_ms: u64, attempt: u32) -> De
     }
     if response.status >= 500 || response.status == 401 {
         return Delivery::Failed;
+    }
+    if response.status == 404 || response.status == 410 {
+        return Delivery::Gone;
     }
     Delivery::Rejected
 }
@@ -443,8 +470,28 @@ pub(crate) enum Flushed {
     },
     /// GitHub throttles us for this many seconds.
     Throttled(u64),
-    /// The request did not go through, however it was tried.
+    /// GitHub as a whole failed us: a server error, a refused token or
+    /// no answer.
     Failed,
+    /// GitHub refused the request and the minimal one too; the fault
+    /// is this job's.
+    Rejected,
+    /// The check run or the repository is gone.
+    Gone,
+}
+
+/// Whether the update is given up after `failures` failed sends in a
+/// row, this one included. The update of a done job (`terminal`) is the
+/// one that completes its check run, so it is tried far longer, and
+/// given up at once only when nothing can work.
+pub(crate) fn gives_up(flushed: &Flushed, failures: u32, terminal: bool) -> bool {
+    match flushed {
+        Flushed::Sent { .. } | Flushed::Throttled(_) => false,
+        Flushed::Gone => true,
+        Flushed::Rejected => terminal || failures >= MAX_SEND_TRIES,
+        Flushed::Failed if terminal => failures >= MAX_TERMINAL_TRIES,
+        Flushed::Failed => failures >= MAX_SEND_TRIES,
+    }
 }
 
 /// Whether the job is still at the attempt a request was planned for.
@@ -454,13 +501,13 @@ pub(crate) fn plan_is_current(node: Option<&Node>, planned: u32) -> bool {
 
 /// Records what happened to the request of `job`, made for the mark of
 /// `generation`. Returns whether the flush goes on with the next job:
-/// not after a throttle or a failure that backs off.
+/// not after a rate limit or a failure of GitHub as a whole, which
+/// would fail the next job too.
 ///
-/// A failure keeps the mark and backs off. After [`MAX_SEND_TRIES`]
-/// failures in a row the mark is dropped, which the caller logs, unless
-/// the update is `terminal` (the job is done): that one is the update
-/// that completes the check run, so it keeps retrying at the backoff
-/// cap and the run is not purged while it waits.
+/// A failure keeps the mark and backs off that job alone, until
+/// [`gives_up`] drops the mark, which the caller logs. The update of a
+/// `terminal` job (done) retries soon and for hours, so the run is not
+/// purged while it waits, but not forever.
 pub(crate) fn record_flush(
     state: &mut JobState,
     outbox: &mut Outbox,
@@ -491,17 +538,21 @@ pub(crate) fn record_flush(
             outbox.throttled(now_ms, *seconds);
             false
         }
-        Flushed::Failed => {
+        Flushed::Failed | Flushed::Rejected | Flushed::Gone => {
             state.send_failures = state.send_failures.saturating_add(1);
-            if !terminal && state.send_failures >= MAX_SEND_TRIES {
+            if gives_up(flushed, state.send_failures, terminal) {
                 state.send_failures = 0;
                 outbox.sent(job, generation);
                 return true;
             }
-            // Blocks every job's updates for a while, which is what a
-            // GitHub that fails for one is likely doing for all.
-            outbox.throttled(now_ms, backoff(state.send_failures - 1));
-            false
+            let wait = if terminal {
+                terminal_backoff(state.send_failures)
+            } else {
+                backoff(state.send_failures - 1)
+            };
+            outbox.retry_after(job, now_ms, wait);
+            // A job's own refusal says nothing about the others.
+            *flushed == Flushed::Rejected
         }
     }
 }
@@ -531,12 +582,7 @@ pub(crate) struct Failed {
 /// Sets the deadlines of the parts that failed to `backoff` from now
 /// and counts the failure; an alarm in which nothing failed resets the
 /// count.
-pub(crate) fn reschedule(
-    deadlines: &mut Deadlines,
-    outbox: &mut Outbox,
-    failed: Failed,
-    now_ms: u64,
-) {
+pub(crate) fn reschedule(deadlines: &mut Deadlines, failed: Failed, now_ms: u64) {
     let any = failed.flush
         || failed.escalate
         || failed.upload
@@ -565,7 +611,8 @@ pub(crate) fn reschedule(
         deadlines.snapshot_at = Some(at);
     }
     if failed.flush {
-        outbox.throttled(now_ms, wait);
+        let wait = (FLUSH_RETRY_SECS << deadlines.failures.min(10)).min(900);
+        deadlines.flush_retry_at = Some(now_ms + wait * 1000);
     }
     deadlines.failures += 1;
 }
@@ -947,6 +994,8 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         assert_eq!(delivery(&answer(502, &[]), 0, 0), Delivery::Failed);
         assert_eq!(delivery(&answer(401, &[]), 0, 0), Delivery::Failed);
         assert_eq!(delivery(&answer(422, &[]), 0, 0), Delivery::Rejected);
+        assert_eq!(delivery(&answer(404, &[]), 0, 0), Delivery::Gone);
+        assert_eq!(delivery(&answer(410, &[]), 0, 0), Delivery::Gone);
     }
 
     fn marked(job: u64) -> (JobState, Outbox, u64) {
@@ -1004,54 +1053,144 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         assert_eq!((output.text, output.annotations), (None, vec![]));
     }
 
+    fn flush_once(
+        state: &mut JobState,
+        outbox: &mut Outbox,
+        generation: u64,
+        flushed: &Flushed,
+        terminal: bool,
+        now: u64,
+    ) -> bool {
+        record_flush(state, outbox, 1, generation, flushed, terminal, now)
+    }
+
     #[test]
     fn a_failed_send_keeps_the_mark_and_backs_off_until_the_fifth_try() {
         let (mut state, mut outbox, generation) = marked(1);
         for tries in 1..MAX_SEND_TRIES {
-            assert!(!record_flush(
+            let go_on = flush_once(
                 &mut state,
                 &mut outbox,
-                1,
                 generation,
                 &Flushed::Failed,
                 false,
-                0
-            ));
+                0,
+            );
+            assert!(!go_on, "GitHub as a whole failed, so the flush stops");
             assert_eq!(state.send_failures, tries);
             assert_eq!(outbox.generation(1), Some(generation), "the mark stays");
-            assert!(outbox.due(0).is_empty(), "and the outbox backs off");
+            assert!(outbox.due(0).is_empty(), "and the job backs off");
         }
-        assert!(record_flush(
+        flush_once(
             &mut state,
             &mut outbox,
-            1,
             generation,
             &Flushed::Failed,
             false,
-            0
-        ));
+            0,
+        );
         assert!(outbox.is_empty(), "the fifth failure drops the mark");
         assert_eq!(state.send_failures, 0);
     }
 
     #[test]
-    fn a_terminal_update_is_never_dropped_and_backs_off_at_the_cap() {
+    fn a_terminal_update_retries_soon_then_slower_and_is_given_up_after_hours() {
         let (mut state, mut outbox, generation) = marked(1);
-        for tries in 1..=(MAX_SEND_TRIES * 4) {
-            assert!(!record_flush(
+        let mut waits = Vec::new();
+        let mut total = 0;
+        for tries in 1..MAX_TERMINAL_TRIES {
+            flush_once(
                 &mut state,
                 &mut outbox,
-                1,
                 generation,
                 &Flushed::Failed,
                 true,
-                0
-            ));
+                0,
+            );
             assert_eq!(state.send_failures, tries);
             assert_eq!(outbox.generation(1), Some(generation), "the mark stays");
+            let wait = outbox.next_alarm(0).unwrap() / 1000;
+            total += wait;
+            waits.push(wait);
         }
-        assert_eq!(outbox.next_alarm(0), Some(900_000), "at the 900 s cap");
-        assert!(!outbox.is_empty(), "so the run is not purged");
+        assert_eq!(waits[..6], [10, 30, 60, 120, 240, 480]);
+        assert_eq!(waits.iter().max(), Some(&900));
+        assert!(
+            (5 * 3600..=7 * 3600).contains(&total),
+            "gives up after about six hours, not {total} s"
+        );
+        flush_once(
+            &mut state,
+            &mut outbox,
+            generation,
+            &Flushed::Failed,
+            true,
+            0,
+        );
+        assert!(outbox.is_empty(), "the last try drops it");
+        assert_eq!(state.send_failures, 0);
+    }
+
+    #[test]
+    fn a_gone_check_run_is_dropped_at_once() {
+        for terminal in [false, true] {
+            let (mut state, mut outbox, generation) = marked(1);
+            let go_on = flush_once(
+                &mut state,
+                &mut outbox,
+                generation,
+                &Flushed::Gone,
+                terminal,
+                0,
+            );
+            assert!(go_on);
+            assert!(outbox.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_rejected_terminal_update_is_dropped_and_a_rejected_one_backs_off() {
+        let (mut state, mut outbox, generation) = marked(1);
+        assert!(flush_once(
+            &mut state,
+            &mut outbox,
+            generation,
+            &Flushed::Rejected,
+            true,
+            0
+        ));
+        assert!(outbox.is_empty());
+        let (mut state, mut outbox, generation) = marked(1);
+        outbox.mark(2);
+        assert!(
+            flush_once(
+                &mut state,
+                &mut outbox,
+                generation,
+                &Flushed::Rejected,
+                false,
+                0
+            ),
+            "the job's own refusal does not stop the flush"
+        );
+        assert_eq!(outbox.due(0), vec![2]);
+        assert_eq!(outbox.generation(1), Some(generation));
+    }
+
+    #[test]
+    fn a_failure_of_github_stops_the_flush_for_the_alarm() {
+        let (mut state, mut outbox, generation) = marked(1);
+        outbox.mark(2);
+        assert!(!flush_once(
+            &mut state,
+            &mut outbox,
+            generation,
+            &Flushed::Failed,
+            false,
+            0
+        ));
+        assert_eq!(outbox.due(0), vec![2], "job 2 waits for the next alarm");
+        assert_eq!(outbox.due(60_000), vec![1, 2]);
     }
 
     #[test]
@@ -1086,7 +1225,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
     }
 
     #[test]
-    fn a_throttled_send_stops_the_flush() {
+    fn a_rate_limit_stops_the_flush_and_holds_back_every_job() {
         let (mut state, mut outbox, generation) = marked(1);
         let go_on = record_flush(
             &mut state,
@@ -1100,6 +1239,8 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         assert!(!go_on);
         assert_eq!(outbox.generation(1), Some(generation));
         assert_eq!(outbox.next_alarm(1_000), Some(31_000));
+        outbox.mark(2);
+        assert_eq!(outbox.due(30_999), Vec::<u64>::new());
     }
 
     #[test]
@@ -1160,30 +1301,30 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             purge_at: Some(2),
             ..Deadlines::default()
         };
-        let mut outbox = Outbox::default();
+        let outbox = Outbox::default();
         let failed = Failed {
             escalate: true,
             todo: true,
             ..Failed::default()
         };
-        reschedule(&mut deadlines, &mut outbox, failed, 10_000);
+        reschedule(&mut deadlines, failed, 10_000);
         assert_eq!(deadlines.escalate_at, Some(70_000));
         assert_eq!(deadlines.todo_retry_at, Some(70_000));
         assert_eq!(deadlines.purge_at, Some(2));
         assert_eq!(deadlines.failures, 1);
-        reschedule(&mut deadlines, &mut outbox, failed, 10_000);
+        reschedule(&mut deadlines, failed, 10_000);
         assert_eq!(deadlines.escalate_at, Some(130_000));
         assert_eq!(
             next_alarm(&deadlines, &outbox, 10_000),
             Some(2),
             "the earliest deadline still wins"
         );
-        reschedule(&mut deadlines, &mut outbox, Failed::default(), 10_000);
+        reschedule(&mut deadlines, Failed::default(), 10_000);
         assert_eq!(deadlines.failures, 0);
     }
 
     #[test]
-    fn a_failed_flush_blocks_the_outbox_for_the_backoff() {
+    fn a_failed_flush_retries_the_alarm_and_leaves_the_outbox_alone() {
         let mut deadlines = Deadlines::default();
         let mut outbox = Outbox::default();
         outbox.mark(1);
@@ -1191,9 +1332,14 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             flush: true,
             ..Failed::default()
         };
-        reschedule(&mut deadlines, &mut outbox, failed, 0);
-        assert_eq!(outbox.due(59_999), Vec::<u64>::new());
-        assert_eq!(outbox.due(60_000), vec![1]);
+        reschedule(&mut deadlines, failed, 0);
+        assert_eq!(outbox.due(0), vec![1], "no job is held back");
+        assert_eq!(deadlines.flush_retry_at, Some(FLUSH_RETRY_SECS * 1000));
+        assert!(!due(&deadlines, &Outbox::default(), 9_999).flush);
+        assert!(due(&deadlines, &Outbox::default(), 10_000).flush);
+        assert_eq!(next_alarm(&deadlines, &Outbox::default(), 0), Some(10_000));
+        reschedule(&mut deadlines, failed, 0);
+        assert_eq!(deadlines.flush_retry_at, Some(20_000), "and it grows");
     }
 
     #[test]
@@ -1274,7 +1420,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             snapshot: true,
             ..Failed::default()
         };
-        reschedule(&mut deadlines, &mut Outbox::default(), failed, 1_000);
+        reschedule(&mut deadlines, failed, 1_000);
         assert_eq!(deadlines.snapshot_at, Some(61_000));
     }
 

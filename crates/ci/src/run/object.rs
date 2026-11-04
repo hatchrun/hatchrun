@@ -35,16 +35,19 @@ use crate::store;
 
 use super::decide::{
     Delivery, Failed, Flushed, Gate, apply_batch, apply_held, apply_result, arm_todo, attempts,
-    bounded_event, delivery, due, file_annotations, gate, github_context, job_document,
+    bounded_event, delivery, due, file_annotations, gate, github_context, gives_up, job_document,
     minimal_check, next_alarm, plan_is_current, record_flush, reschedule, reset_jobs, run_state,
     running_for, should_write_heartbeat, snapshot_ready, steps_json, take_drain,
 };
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
     ALARM_FALLBACK_MS, BUCKET, DEADLINES, Deadlines, ESCALATE_AFTER_MS, EVENT, GRAPH, INFO,
-    JobState, LAUNCHES, MAX_SEND_TRIES, OUTBOX, RESTORED_KEEP_MS, RunInfo, SNAPSHOT_RETRY_MS,
-    Start, TODO, Todo, Work, is_run, job_key, restore_key, snapshot_key,
+    JobState, LAUNCHES, OUTBOX, RESTORED_KEEP_MS, RunInfo, SNAPSHOT_RETRY_MS, Start, TODO, Todo,
+    Work, is_run, job_key, restore_key, snapshot_key,
 };
+
+/// The characters of GitHub's reply body a log line keeps.
+const REPLY_LOG_CHARS: usize = 300;
 
 /// The run and tenant a request that can reach an empty object names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -525,10 +528,10 @@ impl<'a> Cx<'a> {
         }
         let now = self.now;
         self.update(|run| {
-            let Loaded {
-                deadlines, outbox, ..
-            } = run;
-            reschedule(deadlines, outbox, failed, now);
+            if due.flush && !failed.flush {
+                run.deadlines_mut().flush_retry_at = None;
+            }
+            reschedule(run.deadlines_mut(), failed, now);
             run.dirty[2] = true;
             run.dirty[3] = true;
         })
@@ -1304,7 +1307,7 @@ impl<'a> Cx<'a> {
                 self.delete_prefix(&log_prefix(id)).await?;
                 self.storage.delete_multiple(log_keys(id)).await?;
                 run.todo_mut().push(Work::ResetJob { job: id, attempt });
-                run.outbox_mut().mark(id);
+                run.outbox_mut().reset(id);
             }
             let attempt = run.info.run_attempt + 1;
             run.todo_mut().push(Work::ReopenRun { attempt });
@@ -1335,7 +1338,7 @@ impl<'a> Cx<'a> {
     /// Sends the check run update of each job that is due, one request
     /// per job. The requests are planned under the lock, sent without
     /// it, and each answer is recorded under it again. Stops when GitHub
-    /// throttles.
+    /// rate limits; one job failing does not stop the rest.
     async fn flush(&self) -> Result<()> {
         let plans = {
             let _turn = self.turn.lock().await;
@@ -1376,14 +1379,12 @@ impl<'a> Cx<'a> {
                     run.graph.node(plan.job).map(|node| &node.state),
                     Some(NodeState::Done(_))
                 );
-                if matches!(flushed, Flushed::Failed)
-                    && !terminal
-                    && state.send_failures + 1 >= MAX_SEND_TRIES
-                {
+                if gives_up(&flushed, state.send_failures + 1, terminal) {
                     worker::console_error!(
-                        "run {}: check run of job {}: update dropped after {MAX_SEND_TRIES} tries",
+                        "run {}: check run of job {}: update dropped after {} tries ({flushed:?})",
                         run.info.run_id,
-                        plan.job
+                        plan.job,
+                        state.send_failures + 1
                     );
                 }
                 let now = self.now;
@@ -1470,14 +1471,16 @@ impl<'a> Cx<'a> {
         match delivery(&response, self.now, plan.attempt) {
             Delivery::Done => Self::sent(plan, &response, plan.sent_count),
             Delivery::Wait(seconds) => Flushed::Throttled(seconds),
-            Delivery::Failed => Flushed::Failed,
+            Delivery::Failed => {
+                Self::log_reply(plan, &response, false);
+                Flushed::Failed
+            }
+            Delivery::Gone => {
+                Self::log_reply(plan, &response, false);
+                Flushed::Gone
+            }
             Delivery::Rejected => {
-                worker::console_warn!(
-                    "check run of job {}: GitHub answered {}: {}",
-                    plan.job,
-                    response.status,
-                    response.text()
-                );
+                Self::log_reply(plan, &response, true);
                 let minimal = minimal_check(&plan.check);
                 let Some(response) = self.request(tokens, plan, &minimal).await else {
                     return Flushed::Failed;
@@ -1485,9 +1488,32 @@ impl<'a> Cx<'a> {
                 match delivery(&response, self.now, plan.attempt) {
                     Delivery::Done => Self::sent(plan, &response, plan.file_total),
                     Delivery::Wait(seconds) => Flushed::Throttled(seconds),
-                    Delivery::Failed | Delivery::Rejected => Flushed::Failed,
+                    Delivery::Failed => {
+                        Self::log_reply(plan, &response, false);
+                        Flushed::Failed
+                    }
+                    Delivery::Rejected | Delivery::Gone => {
+                        Self::log_reply(plan, &response, false);
+                        Flushed::Rejected
+                    }
                 }
             }
+        }
+    }
+
+    /// Logs GitHub's status and the start of its body for a reply that
+    /// did not go through. A first refusal (`retried`) is a warning: a
+    /// minimal request follows.
+    fn log_reply(plan: &Planned, response: &HttpResponse, retried: bool) {
+        let body: String = response.text().chars().take(REPLY_LOG_CHARS).collect();
+        let line = format!(
+            "check run of job {}: GitHub answered {}: {body}",
+            plan.job, response.status
+        );
+        if retried {
+            worker::console_warn!("{line}");
+        } else {
+            worker::console_error!("{line}");
         }
     }
 

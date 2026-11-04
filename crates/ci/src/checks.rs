@@ -33,7 +33,7 @@ pub const MAX_OUTPUT_CHARS: usize = 65_535;
 const TRUNCATED: &str = "\n\n(truncated)";
 
 /// The last lines of a failed job shown in the check run.
-pub const TAIL_LINES: usize = 50;
+pub const TAIL_LINES: usize = 100;
 
 const EXTERNAL_ID_PREFIX: &str = "hatchrun-ci:";
 
@@ -267,16 +267,15 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
     let fresh = with_file[sent..end].to_vec();
     let fresh_len = fresh.len();
 
+    let step_failed = view.steps.iter().any(|s| {
+        s.summary
+            .as_ref()
+            .is_some_and(|s| s.conclusion == Conclusion::Failure)
+    });
     let text = view
         .failed_tail
         .filter(|tail| !tail.is_empty())
-        .map(|tail| {
-            let body = tail.join("\n");
-            let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-            let fence = "`".repeat(longest.max(2) + 1);
-            let room = MAX_OUTPUT_CHARS - 2 * fence.len() - 2;
-            format!("{fence}\n{}\n{fence}", truncate(&body, room))
-        });
+        .map(|tail| tail_text(tail, step_failed));
 
     let run = CheckRun {
         name: check_name(view.workflow, &view.node.job.id),
@@ -297,13 +296,40 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
     (run, sent + fresh_len)
 }
 
-/// The jobs whose check run is behind, and when GitHub lets us send
-/// again.
+/// The log lines of a failed job as a fenced `text` block under a
+/// "last N lines" note, cut from the end to fit GitHub's limit. `N` is
+/// the number of lines that stay. The lines are the failed step's, or
+/// the job's when no step is marked failed.
+fn tail_text(tail: &[String], step_failed: bool) -> String {
+    let what = if step_failed {
+        "the failed step"
+    } else {
+        "the job log"
+    };
+    let body = tail.join("\n");
+    let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    // The note is no longer with the final count than with `tail.len()`.
+    let widest = format!("Last {} lines of {what}:\n\n", tail.len());
+    let room = MAX_OUTPUT_CHARS - widest.len() - 2 * (fence.len() + 4) - 2;
+    let shown = truncate(&body, room);
+    let kept = shown.strip_suffix(TRUNCATED).unwrap_or(&shown);
+    let note = format!("Last {} lines of {what}:\n\n", kept.lines().count());
+    format!("{note}{fence}text\n{shown}\n{fence}")
+}
+
+/// The jobs whose check run is behind, when each may be tried again
+/// after a failed send, and when GitHub lets us send at all again.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outbox {
     /// Marked jobs and the generation of their latest mark.
     marked: BTreeMap<u64, u64>,
+    /// When a marked job whose send failed may be tried again. Absent
+    /// in state stored before the field existed.
+    #[serde(default)]
+    retry_at_ms: BTreeMap<u64, u64>,
     counter: u64,
+    /// Set only by GitHub's rate limit; it holds back every job.
     blocked_until_ms: u64,
     attempts: u32,
 }
@@ -317,19 +343,31 @@ impl Outbox {
         self.marked.insert(job, self.counter);
     }
 
+    /// The job started over (a rerun): mark it and forget the backoff
+    /// of its old attempt.
+    pub fn reset(&mut self, job: u64) {
+        self.retry_at_ms.remove(&job);
+        self.mark(job);
+    }
+
     /// Whether no job waits for an update.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.marked.is_empty()
     }
 
-    /// The jobs to send now. Empty while GitHub has us blocked.
+    /// The jobs to send now. Empty while GitHub has us blocked; a job
+    /// whose last send failed waits for its own retry time.
     #[must_use]
     pub fn due(&self, now_ms: u64) -> Vec<u64> {
         if now_ms < self.blocked_until_ms {
             return Vec::new();
         }
-        self.marked.keys().copied().collect()
+        self.marked
+            .keys()
+            .copied()
+            .filter(|job| self.retry_at_ms.get(job).is_none_or(|at| *at <= now_ms))
+            .collect()
     }
 
     /// The generation of the job's latest mark. A sender reads it
@@ -345,11 +383,19 @@ impl Outbox {
     pub fn sent(&mut self, job: u64, generation: u64) {
         if self.marked.get(&job) == Some(&generation) {
             self.marked.remove(&job);
+            self.retry_at_ms.remove(&job);
         }
         self.attempts = 0;
     }
 
-    /// GitHub throttled a send: block for `wait_secs` (never shortening
+    /// The job's send failed: leave it alone for `wait_secs`. Other
+    /// jobs are not held back.
+    pub fn retry_after(&mut self, job: u64, now_ms: u64, wait_secs: u64) {
+        let until = now_ms.saturating_add(wait_secs.saturating_mul(1000));
+        self.retry_at_ms.insert(job, until);
+    }
+
+    /// GitHub rate limited a send: block every job for `wait_secs` (never shortening
     /// a block that is already longer) and count the attempt.
     pub fn throttled(&mut self, now_ms: u64, wait_secs: u64) {
         let until = now_ms.saturating_add(wait_secs.saturating_mul(1000));
@@ -363,14 +409,16 @@ impl Outbox {
         self.attempts
     }
 
-    /// When to wake up to send: now when unblocked, the unblock time
-    /// otherwise, `None` with nothing marked.
+    /// When to wake up to send: now when a job is ready and nothing
+    /// blocks, the earliest retry or unblock time otherwise, `None`
+    /// with nothing marked.
     #[must_use]
     pub fn next_alarm(&self, now_ms: u64) -> Option<u64> {
-        if self.marked.is_empty() {
-            return None;
-        }
-        Some(self.blocked_until_ms.max(now_ms))
+        self.marked
+            .keys()
+            .map(|job| self.retry_at_ms.get(job).copied().unwrap_or(0))
+            .min()
+            .map(|at| at.max(self.blocked_until_ms).max(now_ms))
     }
 }
 
@@ -586,7 +634,10 @@ mod tests {
         v.failed_tail = Some(&tail);
         let out = render(&v).0.output.unwrap();
         assert!(out.summary.starts_with("Step 2 failed."));
-        assert_eq!(out.text.as_deref(), Some("```\nerror: boom\nexit 1\n```"));
+        assert_eq!(
+            out.text.as_deref(),
+            Some("Last 2 lines of the job log:\n\n```text\nerror: boom\nexit 1\n```")
+        );
     }
 
     #[test]
@@ -721,8 +772,39 @@ mod tests {
         v.failed_tail = Some(&tail);
         let text = render(&v).0.output.unwrap().text.unwrap();
         assert!(text.chars().count() <= MAX_OUTPUT_CHARS);
-        assert!(text.starts_with("``````\n"));
+        assert!(text.starts_with("Last 2 lines of the job log:\n\n``````text\n"));
         assert!(text.ends_with("(truncated)\n``````"));
+    }
+
+    #[test]
+    fn the_tail_note_names_the_failed_step_and_counts_the_lines_shown() {
+        let failed = StepSummary {
+            name: "s".to_owned(),
+            outcome: Conclusion::Failure,
+            conclusion: Conclusion::Failure,
+            duration_ms: 0,
+        };
+        let steps = [StepView {
+            index: 0,
+            name: "s".to_owned(),
+            summary: Some(failed),
+        }];
+        let n = node(State::Done(Conclusion::Failure), None);
+        let tail = vec!["a".to_owned(), "b".to_owned()];
+        let mut v = view(&n, &steps, &[]);
+        v.failed_tail = Some(&tail);
+        let text = render(&v).0.output.unwrap().text.unwrap();
+        assert!(text.starts_with("Last 2 lines of the failed step:\n\n"));
+
+        let long = vec!["x".repeat(40_000), "y".repeat(40_000), "z".to_owned()];
+        v.failed_tail = Some(&long);
+        let text = render(&v).0.output.unwrap().text.unwrap();
+        assert!(text.chars().count() <= MAX_OUTPUT_CHARS);
+        assert!(
+            text.starts_with("Last 2 lines of the failed step:\n\n"),
+            "{}",
+            &text[..60]
+        );
     }
 
     #[test]
@@ -732,7 +814,10 @@ mod tests {
         let mut v = view(&n, &[], &[]);
         v.failed_tail = Some(&tail);
         let text = render(&v).0.output.unwrap().text.unwrap();
-        assert_eq!(text, "````\n```\nafter\n````");
+        assert_eq!(
+            text,
+            "Last 2 lines of the job log:\n\n````text\n```\nafter\n````"
+        );
     }
 
     #[test]
@@ -839,10 +924,59 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_job_waits_alone() {
+        let mut o = Outbox::default();
+        o.mark(1);
+        o.mark(2);
+        o.retry_after(1, 0, 60);
+        assert_eq!(o.due(0), vec![2]);
+        assert_eq!(o.due(60_000), vec![1, 2]);
+        let g = o.generation(2).unwrap();
+        o.sent(2, g);
+        assert_eq!(o.next_alarm(0), Some(60_000));
+        assert_eq!(o.next_alarm(90_000), Some(90_000));
+        let g = o.generation(1).unwrap();
+        o.sent(1, g);
+        assert_eq!(o.next_alarm(0), None);
+        o.mark(1);
+        assert_eq!(o.due(0), vec![1], "a sent job leaves no retry time");
+    }
+
+    #[test]
+    fn a_rerun_forgets_the_backoff_of_the_old_attempt() {
+        let mut o = Outbox::default();
+        o.mark(1);
+        o.retry_after(1, 0, 600);
+        o.mark(1);
+        assert!(o.due(0).is_empty(), "a plain mark keeps the backoff");
+        o.reset(1);
+        assert_eq!(o.due(0), vec![1]);
+    }
+
+    #[test]
+    fn a_rate_limit_holds_back_a_job_past_its_retry_time() {
+        let mut o = Outbox::default();
+        o.mark(1);
+        o.retry_after(1, 0, 10);
+        o.throttled(0, 100);
+        assert_eq!(o.due(50_000), Vec::<u64>::new());
+        assert_eq!(o.next_alarm(0), Some(100_000));
+    }
+
+    #[test]
+    fn outbox_stored_before_per_job_retries_still_loads() {
+        let old = r#"{"marked":{"3":2},"counter":2,"blocked_until_ms":7,"attempts":1}"#;
+        let o: Outbox = serde_json::from_str(old).unwrap();
+        assert_eq!(o.generation(3), Some(2));
+        assert_eq!(o.due(7), vec![3]);
+    }
+
+    #[test]
     fn outbox_round_trips_through_serde() {
         let mut o = Outbox::default();
         o.mark(3);
         o.throttled(10, 5);
+        o.retry_after(3, 10, 5);
         let back: Outbox = serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
         assert_eq!(back, o);
     }
