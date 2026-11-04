@@ -259,6 +259,13 @@ pub struct Deadlines {
 pub enum Work {
     /// The run's row leaves `queued`.
     StartRun,
+    /// The run's row leaves `queued` for attempt `attempt`. Items stored
+    /// as [`Work::StartRun`] before the attempt was kept take the run's
+    /// current one.
+    StartRunAt {
+        /// The attempt that started.
+        attempt: u32,
+    },
     /// Queue attempt `attempt` of the job, and its launch, unless the
     /// job already moved on.
     QueueLaunch {
@@ -343,6 +350,15 @@ pub struct PendingChain {
     pub tries: u32,
 }
 
+/// What [`Todo::claim_chains`] took.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Claim {
+    /// The changes to send now.
+    pub due: Vec<PendingChain>,
+    /// The changes dropped for being too old.
+    pub expired: Vec<PendingChain>,
+}
+
 /// The side effects still to do, in order.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Todo {
@@ -401,15 +417,21 @@ impl Todo {
     /// Takes the changes whose time has come, oldest first. Each is
     /// held for `lease` milliseconds, so that nothing else sends it
     /// meanwhile; one whose sender died is due again after that.
-    pub fn claim_chains(&mut self, now: u64, lease: u64) -> Vec<PendingChain> {
-        let mut claimed = Vec::new();
+    /// A change an hour old is dropped instead, so that one whose
+    /// outcome could not be written is not sent for ever.
+    pub fn claim_chains(&mut self, now: u64, lease: u64) -> Claim {
+        let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.chains)
+            .into_iter()
+            .partition(|c| now.saturating_sub(c.first_at) >= CHAIN_GIVE_UP_MS);
+        self.chains = kept;
+        let mut due = Vec::new();
         for chain in &mut self.chains {
             if chain.next_at <= now {
-                claimed.push(chain.clone());
+                due.push(chain.clone());
                 chain.next_at = now + lease;
             }
         }
-        claimed
+        Claim { due, expired }
     }
 
     /// Drops the change `id`, which was sent.
@@ -523,12 +545,34 @@ mod tests {
     fn a_claimed_chain_is_not_handed_out_again_until_its_lease_ends() {
         let mut todo = Todo::default();
         todo.push_chain(1, "completed", Some("success"), 1_000);
-        assert_eq!(todo.claim_chains(500, 50_000).len(), 0);
-        assert_eq!(todo.claim_chains(1_000, 50_000).len(), 1);
-        assert_eq!(todo.claim_chains(1_000, 50_000).len(), 0);
-        assert_eq!(todo.claim_chains(30_000, 50_000).len(), 0);
+        assert_eq!(todo.claim_chains(500, 50_000).due.len(), 0);
+        assert_eq!(todo.claim_chains(1_000, 50_000).due.len(), 1);
+        assert_eq!(todo.claim_chains(1_000, 50_000).due.len(), 0);
+        assert_eq!(todo.claim_chains(30_000, 50_000).due.len(), 0);
         // A sender that died leaves the change due again.
-        assert_eq!(todo.claim_chains(51_000, 50_000).len(), 1);
+        assert_eq!(todo.claim_chains(51_000, 50_000).due.len(), 1);
+    }
+
+    #[test]
+    fn a_change_that_is_an_hour_old_is_dropped_by_the_claim() {
+        let mut todo = Todo::default();
+        todo.push_chain(1, "completed", None, 1_000);
+        todo.push_chain(1, "requested", None, 3_000_000);
+        // The outcome of the first was never written: its lease runs out
+        // again and again, but it is not handed out past the hour.
+        let claim = todo.claim_chains(1_000 + CHAIN_GIVE_UP_MS, 50_000);
+        assert_eq!(claim.expired.len(), 1);
+        assert_eq!(claim.expired[0].action, "completed");
+        assert_eq!(claim.due.len(), 1);
+        assert_eq!(todo.chains.len(), 1);
+    }
+
+    #[test]
+    fn a_start_stored_before_it_kept_its_attempt_still_loads() {
+        let old: Work = serde_json::from_str(r#""StartRun""#).unwrap();
+        assert_eq!(old, Work::StartRun);
+        let new: Work = serde_json::from_str(r#"{"StartRunAt":{"attempt":2}}"#).unwrap();
+        assert_eq!(new, Work::StartRunAt { attempt: 2 });
     }
 
     #[test]

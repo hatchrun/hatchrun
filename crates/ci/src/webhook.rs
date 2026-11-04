@@ -202,16 +202,63 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
     reply(&outcome)
 }
 
-/// A delivery that starts workflows on a commit it does not name itself.
+/// A delivery that starts workflows on a commit it does not name itself:
+/// what [`runs::create`] is asked for, before the config is read.
 struct Fired<'a> {
     installation_id: u64,
     repo: &'a Repo,
-    event_name: &'a str,
+    event_name: &'static str,
     payload: &'a Value,
-    trigger: &'a Event,
-    git_ref: &'a str,
-    sha: &'a str,
+    trigger: Event,
+    git_ref: String,
+    sha: String,
     actor: &'a str,
+}
+
+/// A release runs on its tag, at the tag's commit.
+fn release_fired(release: &Release, sha: String) -> Fired<'_> {
+    Fired {
+        installation_id: release.installation_id,
+        repo: &release.repo,
+        event_name: "release",
+        payload: &release.payload,
+        trigger: Event::Release {
+            action: release.action.clone(),
+            tag: release.tag.clone(),
+        },
+        git_ref: format!("refs/tags/{}", release.tag),
+        sha,
+        actor: &release.actor,
+    }
+}
+
+/// A created branch or tag runs on its own ref, at its commit.
+fn create_fired(change: &RefChange, sha: String) -> Fired<'_> {
+    Fired {
+        installation_id: change.installation_id,
+        repo: &change.repo,
+        event_name: "create",
+        payload: &change.payload,
+        trigger: Event::Create,
+        git_ref: change.r#ref.clone(),
+        sha,
+        actor: &change.actor,
+    }
+}
+
+/// A deleted ref has no commit, so as on GitHub the run is on the
+/// default branch, at `sha`, its head.
+fn delete_fired(change: &RefChange, sha: String) -> Fired<'_> {
+    Fired {
+        installation_id: change.installation_id,
+        repo: &change.repo,
+        event_name: "delete",
+        payload: &change.payload,
+        trigger: Event::Delete,
+        git_ref: format!("refs/heads/{}", change.repo.default_branch),
+        sha,
+        actor: &change.actor,
+    }
 }
 
 struct Cx<'a> {
@@ -365,26 +412,8 @@ impl Cx<'_> {
             Ok(sha) => sha,
             Err(outcome) => return Ok(outcome),
         };
-        let trigger = Event::Release {
-            action: release.action.clone(),
-            tag: release.tag.clone(),
-        };
-        let git_ref = format!("refs/tags/{}", release.tag);
         let config = self.config_at(id, &release.repo, &sha).await?;
-        self.fire(
-            &Fired {
-                installation_id: id,
-                repo: &release.repo,
-                event_name: "release",
-                payload: &release.payload,
-                trigger: &trigger,
-                git_ref: &git_ref,
-                sha: &sha,
-                actor: &release.actor,
-            },
-            &config,
-        )
-        .await
+        self.fire(&release_fired(release, sha), &config).await
     }
 
     /// A created branch or tag runs on its own commit.
@@ -397,20 +426,7 @@ impl Cx<'_> {
             return Ok(Outcome::Ignored("the created ref is gone".to_owned()));
         };
         let config = self.config_at(id, &change.repo, &sha).await?;
-        self.fire(
-            &Fired {
-                installation_id: id,
-                repo: &change.repo,
-                event_name: "create",
-                payload: &change.payload,
-                trigger: &Event::Create,
-                git_ref: &change.r#ref,
-                sha: &sha,
-                actor: &change.actor,
-            },
-            &config,
-        )
-        .await
+        self.fire(&create_fired(change, sha), &config).await
     }
 
     /// A deleted branch or tag has no commit, so as on GitHub the run is
@@ -422,21 +438,7 @@ impl Cx<'_> {
         else {
             return Ok(Outcome::Ignored("the repository has no commits".to_owned()));
         };
-        let git_ref = format!("refs/heads/{}", change.repo.default_branch);
-        self.fire(
-            &Fired {
-                installation_id: id,
-                repo: &change.repo,
-                event_name: "delete",
-                payload: &change.payload,
-                trigger: &Event::Delete,
-                git_ref: &git_ref,
-                sha: &sha,
-                actor: &change.actor,
-            },
-            &config,
-        )
-        .await
+        self.fire(&delete_fired(change, sha), &config).await
     }
 
     async fn config_at(&self, installation_id: u64, repo: &Repo, sha: &str) -> Result<Config> {
@@ -465,10 +467,10 @@ impl Cx<'_> {
                 delivery: self.delivery,
                 event_name: fired.event_name,
                 event: fired.payload,
-                trigger: fired.trigger,
-                compile_ref: fired.git_ref,
-                git_ref: fired.git_ref,
-                sha: fired.sha,
+                trigger: &fired.trigger,
+                compile_ref: &fired.git_ref,
+                git_ref: &fired.git_ref,
+                sha: &fired.sha,
                 actor: fired.actor,
                 head_ref: "",
                 base_ref: "",
@@ -516,6 +518,69 @@ impl Cx<'_> {
 
 #[cfg(test)]
 mod tests {
+    fn repo() -> Repo {
+        Repo {
+            id: 4242,
+            full_name: "octo/widgets".into(),
+            default_branch: "main".into(),
+            private: false,
+        }
+    }
+
+    fn ref_change(r#ref: &str) -> RefChange {
+        RefChange {
+            installation_id: 7,
+            repo: repo(),
+            r#ref: r#ref.into(),
+            actor: "octocat".into(),
+            payload: json!({ "ref": r#ref }),
+        }
+    }
+
+    #[test]
+    fn a_release_runs_on_its_tag_at_the_tags_commit() {
+        let release = Release {
+            installation_id: 7,
+            repo: repo(),
+            action: "published".into(),
+            tag: "v1.2.0".into(),
+            actor: "octocat".into(),
+            payload: json!({ "action": "published" }),
+        };
+        let fired = release_fired(&release, "abc".into());
+        assert_eq!(fired.event_name, "release");
+        assert_eq!(fired.git_ref, "refs/tags/v1.2.0");
+        assert_eq!(fired.sha, "abc");
+        assert_eq!(fired.actor, "octocat");
+        assert_eq!(fired.installation_id, 7);
+        assert_eq!(fired.payload, &release.payload);
+        assert_eq!(
+            fired.trigger,
+            Event::Release {
+                action: "published".into(),
+                tag: "v1.2.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_created_ref_runs_on_itself_and_a_deleted_one_on_the_default_branch() {
+        let created = ref_change("refs/heads/topic/x");
+        let fired = create_fired(&created, "def".into());
+        assert_eq!(fired.event_name, "create");
+        assert_eq!(fired.git_ref, "refs/heads/topic/x");
+        assert_eq!(fired.sha, "def");
+        assert_eq!(fired.trigger, Event::Create);
+
+        let deleted = ref_change("refs/tags/v0");
+        let fired = delete_fired(&deleted, "head".into());
+        assert_eq!(fired.event_name, "delete");
+        assert_eq!(fired.git_ref, "refs/heads/main");
+        assert_eq!(fired.sha, "head");
+        assert_eq!(fired.trigger, Event::Delete);
+        assert_eq!(fired.payload, &deleted.payload);
+    }
+
     #[test]
     fn a_release_whose_tag_is_gone_starts_nothing() {
         assert!(matches!(

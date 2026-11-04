@@ -2667,4 +2667,5 @@ fn workflow_run_and_release_keep_their_activity_types() {
         ["unpublished", "edited", "deleted"]
     );
     assert_eq!(out.warnings, []);
+    round_trips(&out);
 }

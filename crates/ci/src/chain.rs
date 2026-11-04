@@ -87,8 +87,10 @@ pub fn delivery(info: &RunInfo, action: &str) -> String {
 }
 
 /// The `workflow_run` event payload for a change of the run `info`.
+/// `repo` is the repository as it is now, which may differ from the copy
+/// the run holds after a rename.
 #[must_use]
-pub fn payload(info: &RunInfo, change: &Change<'_>, chain_depth: u32) -> Value {
+pub fn payload(info: &RunInfo, repo: &Repo, change: &Change<'_>, chain_depth: u32) -> Value {
     let status = if change.action == "completed" {
         "completed"
     } else if change.action == "requested" {
@@ -114,10 +116,10 @@ pub fn payload(info: &RunInfo, change: &Change<'_>, chain_depth: u32) -> Value {
             "actor": { "login": info.actor },
         },
         "repository": {
-            "id": info.repo.id,
-            "full_name": info.repo.full_name,
-            "default_branch": info.repo.default_branch,
-            "private": info.repo.private,
+            "id": repo.id,
+            "full_name": repo.full_name,
+            "default_branch": repo.default_branch,
+            "private": repo.private,
         },
         "sender": { "login": info.actor },
     })
@@ -138,6 +140,35 @@ pub fn current_repo(info: &RunInfo, row: Option<RepoRow>) -> Option<(Repo, u64)>
         },
         row.installation_id,
     ))
+}
+
+/// What one change asks [`runs::create`] for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Child {
+    /// The delivery key, which makes the runs once.
+    pub delivery: String,
+    /// The `workflow_run` payload the workflows see.
+    pub event: Value,
+    /// What workflows match their triggers against.
+    pub trigger: Event,
+}
+
+/// What each of `changes` of the run `info` asks for, one more hop down
+/// the chain than `parent`.
+#[must_use]
+pub fn children(info: &RunInfo, repo: &Repo, parent: u32, changes: &[Change<'_>]) -> Vec<Child> {
+    changes
+        .iter()
+        .map(|change| Child {
+            delivery: delivery(info, change.action),
+            event: payload(info, repo, change, parent + 1),
+            trigger: Event::WorkflowRun {
+                action: change.action.to_owned(),
+                workflow: info.workflow.clone(),
+                branch: branch(info),
+            },
+        })
+        .collect()
 }
 
 /// Starts the workflows that listen for `changes` of the run `info`, on
@@ -180,14 +211,7 @@ pub async fn fire(
         return Ok(Vec::new());
     };
     let mut ids = Vec::new();
-    for change in changes {
-        let trigger = Event::WorkflowRun {
-            action: change.action.to_owned(),
-            workflow: info.workflow.clone(),
-            branch: branch(info),
-        };
-        let event = payload(info, change, parent + 1);
-        let delivery = delivery(info, change.action);
+    for child in children(info, &repo, parent, changes) {
         ids.extend(
             runs::create(
                 env,
@@ -198,10 +222,10 @@ pub async fn fire(
                     tenant_id: &info.tenant_id,
                     installation_id,
                     repo: &repo,
-                    delivery: &delivery,
+                    delivery: &child.delivery,
                     event_name: "workflow_run",
-                    event: &event,
-                    trigger: &trigger,
+                    event: &child.event,
+                    trigger: &child.trigger,
                     compile_ref: &git_ref,
                     git_ref: &git_ref,
                     sha: &sha,
@@ -270,6 +294,73 @@ mod tests {
     }
 
     #[test]
+    fn a_child_sees_the_repository_as_it_is_now() {
+        let run = info("refs/heads/feat/x", "");
+        let renamed = Repo {
+            id: 4242,
+            full_name: "octo/gadgets".into(),
+            default_branch: "trunk".into(),
+            private: true,
+        };
+        let changes = [
+            Change {
+                action: "requested",
+                conclusion: None,
+            },
+            Change {
+                action: "completed",
+                conclusion: Some("failure"),
+            },
+        ];
+        let children = children(&run, &renamed, 1, &changes);
+        assert_eq!(children.len(), 2);
+        let done = &children[1];
+        assert_eq!(done.delivery, "workflow_run:5:1:completed");
+        assert_eq!(done.event["repository"]["full_name"], "octo/gadgets");
+        assert_eq!(done.event["repository"]["default_branch"], "trunk");
+        assert_eq!(depth("workflow_run", &done.event), 2);
+        assert_eq!(
+            done.trigger,
+            Event::WorkflowRun {
+                action: "completed".into(),
+                workflow: "ci".into(),
+                branch: "feat/x".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_child_starts_the_workflow_that_listens_on_the_default_branch() {
+        let config = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [t]
+  deploy:
+    on: { workflow_run: { workflows: [ci], types: [completed], branches: [main] } }
+    jobs: [t]
+  early:
+    on: { workflow_run: { workflows: [ci], types: [requested] } }
+    jobs: [t]
+";
+        let run = info("refs/heads/main", "");
+        let changes = [Change {
+            action: "completed",
+            conclusion: Some("success"),
+        }];
+        let children = children(&run, &run.repo, 0, &changes);
+        let selected = crate::planning::select(config, &children[0].trigger, "refs/heads/main");
+        let crate::planning::Selected::Plans { plans, failed } = selected else {
+            panic!("config is valid");
+        };
+        assert_eq!(failed.len(), 0);
+        let names: Vec<&str> = plans.iter().map(|p| p.workflow.as_str()).collect();
+        assert_eq!(names, ["deploy"]);
+    }
+
+    #[test]
     fn depth_counts_workflow_run_hops() {
         assert_eq!(depth("push", &json!({})), 0);
         assert_eq!(depth("push", &json!({ "chain_depth": 2 })), 0);
@@ -292,7 +383,8 @@ mod tests {
             action: "completed",
             conclusion: Some("success"),
         };
-        let p = payload(&info("refs/heads/main", ""), &change, 1);
+        let run = info("refs/heads/main", "");
+        let p = payload(&run, &run.repo, &change, 1);
         assert_eq!(depth("workflow_run", &p), 1);
         assert_eq!(p["action"], "completed");
         assert_eq!(p["workflow"], "ci");
@@ -310,7 +402,7 @@ mod tests {
                 action,
                 conclusion: None,
             };
-            payload(&run, &change, 1)["workflow_run"]["status"].clone()
+            payload(&run, &run.repo, &change, 1)["workflow_run"]["status"].clone()
         };
         assert_eq!(status("requested"), "queued");
         assert_eq!(status("in_progress"), "in_progress");

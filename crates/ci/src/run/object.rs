@@ -814,11 +814,8 @@ impl<'a> Cx<'a> {
     async fn perform(&self, info: &RunInfo, work: &Work) -> Result<()> {
         let db = self.db().await?;
         match work {
-            Work::StartRun => {
-                store::run_started(db, info.run_id, self.now).await?;
-                self.chain(info.run_attempt, &["requested", "in_progress"], None)
-                    .await
-            }
+            Work::StartRun => self.started(db, info, info.run_attempt).await,
+            Work::StartRunAt { attempt } => self.started(db, info, *attempt).await,
             Work::QueueLaunch { job, attempt } => {
                 self.register_concurrency(db, info, *job, *attempt).await?;
                 // A job that is launching or launched is not queued
@@ -885,6 +882,15 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// Moves the run's row to in progress for `attempt` and records its
+    /// start for `on: workflow_run`. The attempt comes from the item, as
+    /// a re-run may have changed the run's own by the time it is done.
+    async fn started(&self, db: &Db, info: &RunInfo, attempt: u32) -> Result<()> {
+        store::run_started(db, info.run_id, self.now).await?;
+        self.chain(attempt, &["requested", "in_progress"], None)
+            .await
+    }
+
     /// Records that `actions` of attempt `attempt` have to be sent to the
     /// workflows that listen for them (`on: workflow_run`). Only the
     /// record is made here: the alarm, set for now, sends it, so GitHub
@@ -917,12 +923,24 @@ impl<'a> Cx<'a> {
             let Some(mut run) = self.loaded().await? else {
                 return Ok(());
             };
-            let due = run.todo_mut().claim_chains(self.now, CHAIN_LEASE_MS);
-            if due.is_empty() {
+            let claim = run.todo_mut().claim_chains(self.now, CHAIN_LEASE_MS);
+            for dropped in &claim.expired {
+                worker::console_error!(
+                    "run {}: workflow_run {} given up after an hour",
+                    run.info.run_id,
+                    dropped.action
+                );
+            }
+            // Written even with nothing due: a change dropped for its
+            // age must not come back.
+            if claim.due.is_empty() && claim.expired.is_empty() {
                 return Ok(());
             }
             self.commit(&mut run).await?;
-            (run.info.clone(), due)
+            if claim.due.is_empty() {
+                return Ok(());
+            }
+            (run.info.clone(), claim.due)
         };
         let event = self.event().await?;
         let mut outcomes = Vec::new();
@@ -1165,7 +1183,8 @@ impl<'a> Cx<'a> {
             self.storage.put(EVENT, &bounded_event(event)).await?;
             let ctx = self.github_ctx(&run.info).await?;
             let actions = run.graph.advance(&ctx);
-            run.todo.push(Work::StartRun);
+            let attempt = run.info.run_attempt;
+            run.todo.push(Work::StartRunAt { attempt });
             let revoke = self.apply_actions(&mut run, actions).await?;
             self.commit(&mut run).await?;
             revoke

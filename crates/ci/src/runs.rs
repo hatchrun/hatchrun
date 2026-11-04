@@ -168,9 +168,19 @@ fn is_throttled(response: &hatchrun_cloud::http::Response) -> bool {
         return true;
     }
     let text = response.text().to_ascii_lowercase();
-    ["rate limit", "abuse", "secondary"]
-        .iter()
-        .any(|word| text.contains(word))
+    // A missing ref is the answer whatever its name says: a tag called
+    // `secondary-v1` is not a rate limit.
+    if text.contains("no commit found") {
+        return false;
+    }
+    [
+        "rate limit",
+        "abuse detection",
+        "secondary rate",
+        "exceeded a secondary",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
 }
 
 /// The head of a repository's default branch and its config there.
@@ -637,6 +647,16 @@ mod tests {
         assert!(commit_of(&waiting).is_err());
         let unresolvable = answer(422, r#"{"message":"No commit found for SHA: x"}"#);
         assert_eq!(commit_of(&unresolvable), Ok(None));
+        let named = answer(
+            422,
+            r#"{"message":"No commit found for SHA: tags/secondary-v1"}"#,
+        );
+        assert_eq!(commit_of(&named), Ok(None));
+        let abuse = answer(
+            422,
+            r#"{"message":"You have triggered an abuse detection mechanism."}"#,
+        );
+        assert!(commit_of(&abuse).is_err());
         assert!(commit_of(&answer(403, "rate limited")).is_err());
     }
 
