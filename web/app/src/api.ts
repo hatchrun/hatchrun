@@ -618,6 +618,24 @@ export const listCiRuns = (owner: string, repo: string, before?: number) =>
 
 export const getCiRun = (id: string | number) => retrying(() => get<CiRunDetail>(`/api/ci/runs/${id}`));
 
+/** An artifact a run's jobs uploaded. Times are Unix milliseconds. */
+export interface CiArtifact {
+  id: number;
+  name: string;
+  /** Bytes. */
+  size: number;
+  created_at: number;
+  /** When the run's retention deletes it. */
+  expires_at: number;
+}
+
+/** The run's finished artifacts, oldest first. */
+export const listCiArtifacts = (run: string | number) =>
+  retrying(() => get<{ artifacts: CiArtifact[] }>(`/api/ci/runs/${run}/artifacts`));
+
+/** Where an artifact downloads from: the API answers with a redirect to a short-lived link. */
+export const ciArtifactUrl = (run: string | number, artifact: number) => `/api/ci/runs/${run}/artifacts/${artifact}`;
+
 export const cancelCiRun = (id: number) => post<undefined>(`/api/ci/runs/${id}/cancel`);
 
 /** Lets a job held for approval run. Answers 409 when the job is not waiting. */

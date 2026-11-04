@@ -13,6 +13,7 @@
 
 mod artifacts;
 mod billing;
+mod cache;
 mod concurrency;
 mod environments;
 mod jobs;
@@ -30,6 +31,11 @@ pub use self::artifacts::{
 pub use self::billing::{
     Standing, UnsentUsage, set_spend_cap, standing, tenant_standing, unsent_usage, usage_rejected,
     usage_sent,
+};
+pub use self::cache::{
+    CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, drop_pending_cache_entry,
+    evict_idle_cache_entries, evict_over_quota_cache_entries, finalize_cache_entry,
+    lookup_cache_entry, pending_cache_entry, start_cache_entry, touch_cache_entry,
 };
 pub use self::concurrency::{
     Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, unfinished_superseded,

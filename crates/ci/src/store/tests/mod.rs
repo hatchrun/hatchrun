@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 mod artifacts;
+mod cache;
 mod concurrency;
 mod jobs;
 mod reconciler;
@@ -59,6 +60,7 @@ pub(super) fn new_run(delivery: &str, workflow: &str, now: u64) -> NewRun {
         git_ref: "refs/heads/main".into(),
         sha: "abc".into(),
         actor: "octocat".into(),
+        base_ref: None,
         now,
     }
 }

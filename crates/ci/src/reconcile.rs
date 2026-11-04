@@ -14,7 +14,8 @@
 //! 4. terminates instances that no job needs;
 //! 5. keeps the warm pool of each runner template at the size the last
 //!    hour's claims ask for ([`crate::pool`]);
-//! 6. deletes expired runs and purges their objects;
+//! 6. deletes expired runs and purges their objects, and deletes the
+//!    cache entries nobody restored for 7 days;
 //! 7. sends metered usage to Polar;
 //! 8. re-seals secrets that an old key still seals.
 //!
@@ -24,7 +25,8 @@
 //! A pass is bounded so it stays inside the Worker's CPU time and
 //! subrequest limits. It counts the outbound calls it makes (GitHub,
 //! run objects, queue, AWS, Polar) against [`BUDGET`], split by
-//! [`shares`]: 500 for schedules, then of the rest 3/8 for stalled
+//! [`shares`]: 1/40 for evicting cache entries, then 5/9 of the rest
+//! (at most 500) for schedules, then of the rest 3/8 for stalled
 //! jobs, 1/8 each for orphans and the warm pool, 1/16 each for usage and
 //! re-sealing, and the remainder (100 at [`BUDGET`]) for retention. A step whose share runs out stops and resumes in the next
 //! pass. Rows and runs are bounded too: [`MAX_MINUTES`] minutes,
@@ -52,6 +54,7 @@ use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, Template, UtcMinute};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
+use crate::cache;
 use crate::concurrency;
 use crate::env::{Settings, run_stub};
 use crate::github;
@@ -125,15 +128,19 @@ pub struct Shares {
     pub reseal: u32,
     /// Retention.
     pub retention: u32,
+    /// Evicting job cache entries.
+    pub cache: u32,
 }
 
-/// Splits `total`: schedules take 5/9 of it, at most 500. Of the rest
-/// stalled jobs take 3/8, orphans and the pool 1/8 each, usage and
+/// Splits `total`: cache eviction takes 1/40 of it. Of the remainder
+/// schedules take 5/9, at most 500. Of the rest stalled jobs take 3/8, orphans and the pool 1/8 each, usage and
 /// re-sealing 1/16 each, rounded down, and retention the remainder.
 /// Schedules cannot take what the other steps need, and retention keeps
 /// at least `SWEEP_LIMIT * PURGE_COST` at [`BUDGET`].
 #[must_use]
 pub fn shares(total: u32) -> Shares {
+    let cache = total / 40;
+    let total = total - cache;
     let schedules = (total / 9 * 5).min(500);
     let rest = total - schedules;
     let stalled = rest / 8 * 3 + rest % 8 * 3 / 8;
@@ -149,6 +156,7 @@ pub fn shares(total: u32) -> Shares {
         usage,
         reseal,
         retention: rest - stalled - orphans - pool - usage - reseal,
+        cache,
     }
 }
 
@@ -486,6 +494,9 @@ pub async fn run(env: Env) {
     }
     if let Err(err) = retain(&env, &db, &Budget::new(share.retention), now).await {
         console_error!("reconcile: retention: {err}");
+    }
+    if let Err(err) = evict_cache(&settings, &db, &Budget::new(share.cache), now).await {
+        console_error!("reconcile: cache eviction: {err}");
     }
     if let Err(err) = report_usage(&db, &settings, &Budget::new(share.usage), now).await {
         console_error!("reconcile: usage: {err}");
@@ -1204,6 +1215,28 @@ async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), Str
         .map_err(|e| e.to_string())
 }
 
+/// Step 6, for the job cache: deletes the entries nobody restored for
+/// [`cache::IDLE_DAYS`] days. A pass evicts at most [`cache::EVICT_LIMIT`]
+/// entries, which `budget` covers.
+async fn evict_cache(
+    settings: &Settings,
+    db: &Db,
+    budget: &Budget,
+    now: u64,
+) -> Result<(), String> {
+    // One subrequest for the role's credentials, the rest one delete
+    // per entry.
+    let limit = budget.left().saturating_sub(1).min(cache::EVICT_LIMIT);
+    if limit == 0 {
+        return Ok(());
+    }
+    let evicted = cache::evict(settings, db, now, limit).await?;
+    if evicted > 0 {
+        budget.take(u32::try_from(evicted).unwrap_or(limit) + 1);
+    }
+    Ok(())
+}
+
 /// Of one ingest call to Polar.
 const INGEST_COST: u32 = 1;
 
@@ -1719,24 +1752,33 @@ mod tests {
     #[test]
     fn shares_split_the_budget() {
         let sum = |s: Shares| {
-            s.schedules + s.stalled + s.orphans + s.pool + s.usage + s.reseal + s.retention
+            s.schedules
+                + s.stalled
+                + s.orphans
+                + s.pool
+                + s.usage
+                + s.reseal
+                + s.retention
+                + s.cache
         };
         let share = shares(BUDGET);
         assert_eq!(
             share,
             Shares {
-                schedules: 500,
-                stalled: 150,
-                orphans: 50,
-                pool: 50,
-                usage: 25,
-                reseal: 25,
+                schedules: 485,
+                stalled: 147,
+                orphans: 49,
+                pool: 49,
+                usage: 24,
+                reseal: 24,
                 retention: 100,
+                cache: 22,
             }
         );
         assert_eq!(sum(share), BUDGET);
         assert!(share.retention >= store::SWEEP_LIMIT * PURGE_COST);
         assert!(share.reseal > 0 && share.usage > 0);
+        assert!(share.cache > cache::EVICT_LIMIT);
         for total in [0, 1, 8, 100, 900, 5_000] {
             let share = shares(total);
             assert_eq!(sum(share), total, "{total}");

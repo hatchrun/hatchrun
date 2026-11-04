@@ -19,6 +19,8 @@
 //! | `GET /api/ci/jobs/{job}/log?offset=N` | read | the log text |
 //! | `GET /api/ci/jobs/{job}/log/index` | read | the step index, `404` while running |
 //! | `GET /api/ci/jobs/{job}/live` | read | WebSocket |
+//! | `GET /api/ci/runs/{run}/artifacts` | read | the run's artifacts |
+//! | `GET /api/ci/runs/{run}/artifacts/{id}` | read | `302` to a presigned download |
 //! | `POST /api/ci/repos/{owner}/{repo}/dispatch` | write, CSRF | `202` `{"runs": [..]}` |
 //! | `POST /api/ci/runs/{run}/cancel` | write, CSRF | `204` |
 //! | `POST /api/ci/jobs/{job}/approve` | org admin, CSRF | `204` |
@@ -106,6 +108,10 @@ pub enum Route<'a> {
     LogIndex(u64),
     /// A running job's log as it grows.
     Live(u64),
+    /// A run's artifacts.
+    Artifacts(u64),
+    /// One artifact of a run, as a download.
+    Artifact(u64, u64),
 }
 
 impl Route<'_> {
@@ -159,6 +165,8 @@ pub fn route(path: &str) -> Option<Route<'_>> {
         ["jobs", job, "log"] => id(job).map(Route::Log),
         ["jobs", job, "log", "index"] => id(job).map(Route::LogIndex),
         ["jobs", job, "live"] => id(job).map(Route::Live),
+        ["runs", run, "artifacts"] => id(run).map(Route::Artifacts),
+        ["runs", run, "artifacts", artifact] => Some(Route::Artifact(id(run)?, id(artifact)?)),
         _ => None,
     }
 }
@@ -427,6 +435,44 @@ fn run_json(run: &RunRow, repo: &RepoRow) -> Value {
     })
 }
 
+/// How long a presigned artifact download holds, in seconds.
+const DOWNLOAD_SECS: u64 = 300;
+
+/// An artifact as the run page lists it. It goes when its run does, at
+/// the run's creation plus its retention.
+fn artifact_json(row: &store::ArtifactRow, run: &RunRow) -> Value {
+    let uploaded = row.finalized_at.unwrap_or(row.created_at);
+    json!({
+        "id": row.id,
+        "name": row.name,
+        "size": row.size.unwrap_or(0),
+        "created_at": uploaded,
+        "expires_at": run.created_at + u64::from(run.retention_days) * 86_400_000,
+    })
+}
+
+/// Percent-encodes everything but the unreserved characters.
+fn percent_encode(text: &str) -> String {
+    use std::fmt::Write;
+    text.bytes().fold(String::new(), |mut out, byte| {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+        out
+    })
+}
+
+/// The `Content-Disposition` of an artifact's download: the toolkit
+/// stores a zip, and the object's own key is a random token.
+fn disposition(name: &str) -> String {
+    format!(
+        "attachment; filename*=UTF-8''{}",
+        percent_encode(&format!("{name}.zip"))
+    )
+}
+
 fn job_json(row: &JobRow, live: &BTreeMap<u64, Value>) -> Value {
     json!({
         "id": row.id,
@@ -585,6 +631,8 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
         Route::Log(job) => cx.log(job, offset_query(query.as_deref())).await,
         Route::LogIndex(job) => cx.log_index(job).await,
         Route::Live(job) => cx.live(job, &req).await,
+        Route::Artifacts(run) => cx.artifacts(run).await,
+        Route::Artifact(run, artifact) => cx.artifact(run, artifact).await,
         Route::Cancel(run) => cx.cancel(run).await,
         Route::Approve(job) => cx.decide(job, true).await,
         Route::Reject(job) => cx.decide(job, false).await,
@@ -722,6 +770,80 @@ impl Cx<'_> {
                 None
             }
         }
+    }
+
+    /// The run's finalized artifacts, oldest first. An artifact goes with
+    /// the run, when the run's retention ends.
+    async fn artifacts(&self, run_id: u64) -> Result<Served> {
+        let found = match self.found(run_id, Access::Read).await? {
+            Ok(found) => found,
+            Err(stop) => return Ok(Err(stop)),
+        };
+        let rows = store::artifacts(self.db, run_id, None, None).await?;
+        let artifacts: Vec<Value> = rows
+            .iter()
+            .map(|row| artifact_json(row, &found.run))
+            .collect();
+        Ok(Ok(Response::from_json(&json!({ "artifacts": artifacts }))?))
+    }
+
+    /// Sends the caller to a presigned download of artifact `id` of the
+    /// run, which holds for a few minutes. The artifact is looked up by
+    /// the run the caller may read, so no other run's artifact comes
+    /// out, and its key must be one this run would have made.
+    async fn artifact(&self, run_id: u64, id: u64) -> Result<Served> {
+        let found = match self.found(run_id, Access::Read).await? {
+            Ok(found) => found,
+            Err(stop) => return Ok(Err(stop)),
+        };
+        if self.settings.artifacts_bucket.is_empty() {
+            return Ok(stop(404, "no artifacts"));
+        }
+        let rows = store::artifacts(self.db, run_id, None, Some(id)).await?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(stop(404, "not found"));
+        };
+        if !crate::artifacts::in_run(
+            &row.object_key,
+            found.run.retention_days,
+            &found.run.tenant_id,
+            found.repo.id,
+            found.run.id,
+        ) {
+            console_error!(
+                "artifact {id}: key {} is outside run {run_id}",
+                row.object_key
+            );
+            return Ok(stop(404, "not found"));
+        }
+        let credentials = match crate::artifacts::credentials(self.settings).await {
+            Ok(credentials) => credentials,
+            Err(refusal) => return Ok(stop(refusal.status, refusal.message)),
+        };
+        let object = hatchrun_cloud::aws::s3::object_url(
+            &self.settings.artifacts_bucket,
+            &self.settings.ci_region,
+            self.settings.aws_endpoint.as_deref(),
+            &row.object_key,
+        );
+        let url = format!(
+            "{object}?response-content-disposition={}",
+            percent_encode(&disposition(&row.name))
+        );
+        let url = match hatchrun_cloud::aws::s3::presign(
+            &hatchrun_cloud::aws::s3::get_object(&url),
+            &credentials,
+            &self.settings.ci_region,
+            now_ms(),
+            std::time::Duration::from_secs(DOWNLOAD_SECS),
+        ) {
+            Ok(url) => url,
+            Err(err) => return Ok(stop(500, err)),
+        };
+        Ok(Ok(Response::redirect_with_status(
+            worker::Url::parse(&url).map_err(|err| fail(err.to_string()))?,
+            302,
+        )?))
     }
 
     async fn log(&self, job_id: u64, offset: Option<u64>) -> Result<Served> {
@@ -1112,6 +1234,14 @@ mod tests {
         assert_eq!(route("/api/ci/jobs/7/log/index"), Some(Route::LogIndex(7)));
         assert_eq!(route("/api/ci/jobs/7/live"), Some(Route::Live(7)));
         assert_eq!(route("/api/ci/runs/12"), Some(Route::Run(12)));
+        assert_eq!(
+            route("/api/ci/runs/12/artifacts"),
+            Some(Route::Artifacts(12))
+        );
+        assert_eq!(
+            route("/api/ci/runs/12/artifacts/5"),
+            Some(Route::Artifact(12, 5))
+        );
         assert_eq!(route("/api/ci/runs/12/cancel"), Some(Route::Cancel(12)));
         assert_eq!(route("/api/ci/jobs/5/approve"), Some(Route::Approve(5)));
         assert_eq!(route("/api/ci/jobs/5/reject"), Some(Route::Reject(5)));
@@ -1140,6 +1270,9 @@ mod tests {
             "/api/ci/runs/+1",
             "/api/ci/runs/1/",
             "/api/ci/runs/1/cancel/more",
+            "/api/ci/runs/1/artifacts/",
+            "/api/ci/runs/1/artifacts/x",
+            "/api/ci/runs/1/artifacts/2/more",
             "/api/ci/jobs/7/logs",
             "/api/ci/repos/acme/runs",
             "/api/ci/repos/a%2Fb/app/runs",
@@ -1366,6 +1499,56 @@ workflows:
                 "sender": { "login": "octo" },
             })
         );
+    }
+
+    #[test]
+    fn artifacts_expire_with_the_run_retention() {
+        let row = store::ArtifactRow {
+            id: 3,
+            run_id: 9,
+            job_id: 1,
+            attempt: 1,
+            name: "dist".into(),
+            object_key: "k".into(),
+            upload_id: None,
+            size: Some(12),
+            digest: None,
+            created_at: 100,
+            finalized_at: Some(200),
+        };
+        // Uploaded a day into the run, which expires 30 days after it
+        // was created.
+        let run: RunRow = serde_json::from_value(json!({
+            "id": 9, "run_number": 1, "run_attempt": 1, "tenant_id": "t1",
+            "repo_id": 7, "workflow": "ci", "delivery": "d", "event": "push",
+            "git_ref": "refs/heads/main", "sha": "abc", "actor": "a",
+            "status": "completed", "conclusion": "success", "created_at": 1000,
+            "completed_at": null, "retention_days": 30
+        }))
+        .unwrap();
+        let row = store::ArtifactRow {
+            created_at: 1000 + 86_400_000,
+            finalized_at: Some(1000 + 86_400_000),
+            ..row
+        };
+        assert_eq!(
+            artifact_json(&row, &run),
+            json!({
+                "id": 3, "name": "dist", "size": 12, "created_at": 1000 + 86_400_000_u64,
+                "expires_at": 1000 + 30 * 86_400_000_u64,
+            })
+        );
+    }
+
+    #[test]
+    fn downloads_are_named_after_the_artifact() {
+        assert_eq!(
+            disposition("my dist"),
+            "attachment; filename*=UTF-8''my%20dist.zip"
+        );
+        assert_eq!(percent_encode("a b/c%"), "a%20b%2Fc%25");
+        assert_eq!(percent_encode("é"), "%C3%A9");
+        assert_eq!(percent_encode("Az09-_.~"), "Az09-_.~");
     }
 
     #[test]

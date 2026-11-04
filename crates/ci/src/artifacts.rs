@@ -68,7 +68,7 @@ pub(crate) struct Refusal {
 }
 
 impl Refusal {
-    fn new(status: u16, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: u16, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
@@ -83,7 +83,7 @@ impl From<worker::Error> for Refusal {
     }
 }
 
-type Answer = std::result::Result<Response, Refusal>;
+pub(crate) type Answer = std::result::Result<Response, Refusal>;
 
 /// Whether `job` may call the service with `claims`: the token is for
 /// this job, run and attempt, and the job is running.
@@ -249,7 +249,9 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
     }
 }
 
-async fn body<T: for<'de> Deserialize<'de>>(req: &mut Request) -> std::result::Result<T, Refusal> {
+pub(crate) async fn body<T: for<'de> Deserialize<'de>>(
+    req: &mut Request,
+) -> std::result::Result<T, Refusal> {
     let declared = req
         .headers()
         .get("Content-Length")
@@ -271,7 +273,7 @@ async fn body<T: for<'de> Deserialize<'de>>(req: &mut Request) -> std::result::R
     serde_json::from_slice(&bytes).map_err(|err| Refusal::new(400, format!("bad request: {err}")))
 }
 
-fn json(value: &impl serde::Serialize, status: u16) -> Answer {
+pub(crate) fn json(value: &impl serde::Serialize, status: u16) -> Answer {
     Ok(Response::from_json(value)?.with_status(status))
 }
 
@@ -521,7 +523,7 @@ async fn delete(ctx: &Context<'_>, request: NameRequest) -> Answer {
     json(&DeleteResponse { id: row.id }, 200)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     worker::Date::now().as_millis()
 }
 
@@ -534,7 +536,7 @@ fn object_url(ctx: &Context<'_>, key: &str) -> String {
     )
 }
 
-fn aws_failure(action: &'static str) -> impl Fn(aws::Error) -> Refusal {
+pub(crate) fn aws_failure(action: &'static str) -> impl Fn(aws::Error) -> Refusal {
     move |err| {
         let status = if err.code == "AccessDenied" { 403 } else { 502 };
         Refusal::new(status, format!("{action}: {err}"))
@@ -545,9 +547,18 @@ fn aws_failure(action: &'static str) -> impl Fn(aws::Error) -> Refusal {
 async fn signed(
     ctx: &Context<'_>,
     credentials: &Credentials,
+    request: Outgoing,
+) -> std::result::Result<Incoming, Refusal> {
+    sign_send(ctx.settings, credentials, request).await
+}
+
+/// Signs and sends an S3 request in the CI account.
+pub(crate) async fn sign_send(
+    settings: &Settings,
+    credentials: &Credentials,
     mut request: Outgoing,
 ) -> std::result::Result<Incoming, Refusal> {
-    s3::sign(&mut request, credentials, &ctx.settings.ci_region, now_ms())
+    s3::sign(&mut request, credentials, &settings.ci_region, now_ms())
         .map_err(|err| Refusal::new(500, format!("sign S3 request: {err}")))?;
     send(&request)
         .await
@@ -555,7 +566,7 @@ async fn signed(
 }
 
 /// The CI role's credentials, from the isolate when fresh.
-async fn credentials(settings: &Settings) -> std::result::Result<Credentials, Refusal> {
+pub(crate) async fn credentials(settings: &Settings) -> std::result::Result<Credentials, Refusal> {
     let now = now_ms();
     let cached = CREDENTIALS.with(|cell| {
         cell.borrow()
