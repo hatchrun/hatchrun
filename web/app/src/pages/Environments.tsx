@@ -34,12 +34,30 @@ const patterns = (text: string) =>
 const onlyRepo = (current: string | null, next: { all: boolean; repos: string[] }) =>
   next.all || next.repos.length === 0 ? null : (next.repos.find((name) => name !== current) ?? next.repos[next.repos.length - 1] ?? null);
 
+/** Whether the repository already has an environment of this name; the list search is a substring match, so read every page. */
+async function taken(org: string, repository: string, name: string): Promise<boolean> {
+  let cursor: string | null = null;
+  do {
+    const page: Awaited<ReturnType<typeof listOrgEnvironments>> = await listOrgEnvironments(org, { q: name, repo: repository, cursor, limit: 50 });
+    if (page.items.some((item) => item.repository === repository && item.name === name)) return true;
+    cursor = page.next;
+  } while (cursor);
+  return false;
+}
+
 export function Environments({ org }: OrgPageProps) {
   const repo = useQuery("repo");
   const cursors = useCursors();
   const [search, setSearch] = useState("");
   const q = useDebounced(search.trim(), 250);
-  const [panel, setPanel] = useState<{ edit: CiOrgEnvironment | null } | null>(null);
+  const [panel, setPanel] = useState<{ edit: CiOrgEnvironment | null; id: number } | null>(null);
+  const panelSeq = useRef(0);
+  const openPanel = (edit: CiOrgEnvironment | null) => setPanel({ edit, id: (panelSeq.current += 1) });
+  // A panel belongs to one organization: its repository is that org's.
+  useEffect(() => {
+    setPanel(null);
+    setConfirming(null);
+  }, [org]);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -64,7 +82,9 @@ export function Environments({ org }: OrgPageProps) {
       await deleteCiEnvironment(owner, name, row.name);
       setConfirming(null);
       notify(`Deleted ${row.name}`);
-      reload();
+      // The last row of a later page is gone: go back a page, whose key reloads.
+      if (rows.state === "ready" && rows.data.items.length === 1 && cursors.hasPrev) cursors.prev();
+      else reload();
     } catch (error) {
       setFailure(error instanceof Error ? error.message : String(error));
     }
@@ -76,7 +96,7 @@ export function Environments({ org }: OrgPageProps) {
       title="Environments"
       meta={total === null ? "" : `${abbreviate(total)} environment${total === 1 ? "" : "s"}${repo || q ? " match" : ""}`}
       actions={
-        <button type="button" className={BTN_PRIMARY} onClick={() => setPanel({ edit: null })}>
+        <button type="button" className={BTN_PRIMARY} onClick={() => openPanel(null)}>
           <Plus size={12} aria-hidden="true" />
           New environment
         </button>
@@ -142,7 +162,7 @@ export function Environments({ org }: OrgPageProps) {
                 {page.items.length === 0 ? (
                   <div className="flex flex-col items-start gap-3 rounded-sm border border-control px-4 py-6 font-mono text-[13px] text-fg-2">
                     {q || repo ? "No environments match those filters." : "No environments yet. Jobs that name one deploy through it."}
-                    <button type="button" className={BTN} onClick={() => setPanel({ edit: null })}>
+                    <button type="button" className={BTN} onClick={() => openPanel(null)}>
                       New environment
                     </button>
                   </div>
@@ -207,7 +227,7 @@ export function Environments({ org }: OrgPageProps) {
                                   </span>
                                 ) : (
                                   <span className="inline-flex gap-2">
-                                    <button type="button" className={BTN_SM} aria-label={`Edit ${row.name} in ${row.repository}`} onClick={() => setPanel({ edit: row })}>
+                                    <button type="button" className={BTN_SM} aria-label={`Edit ${row.name} in ${row.repository}`} onClick={() => openPanel(row)}>
                                       Edit
                                     </button>
                                     <button type="button" className={BTN_SM} aria-label={`Delete ${row.name} in ${row.repository}`} onClick={() => setConfirming(id)}>
@@ -239,13 +259,14 @@ export function Environments({ org }: OrgPageProps) {
 
         {panel && (
           <EnvPanel
-            key={panel.edit ? `${panel.edit.repository}/${panel.edit.name}` : "new"}
+            key={`${panel.id}/${panel.edit ? `${panel.edit.repository}/${panel.edit.name}` : "new"}`}
             org={org}
             edit={panel.edit}
             defaultRepo={repo}
             onClose={() => setPanel(null)}
             onSaved={(message) => {
-              setPanel(null);
+              // A late save must not close a panel opened since.
+              setPanel((current) => (current?.id === panel.id ? null : current));
               notify(message);
               reload();
             }}
@@ -300,6 +321,11 @@ function EnvPanel({
     setBusy(true);
     setProblem(null);
     try {
+      if (!edit && (await taken(org, repository, given))) {
+        setProblem(`${given} already exists in ${repository}. Edit it instead.`);
+        setBusy(false);
+        return;
+      }
       const stored = await putCiEnvironment(owner, repoName, given, { branches: patterns(branches), approval });
       onSaved(`Saved ${stored.name} in ${repository}`);
     } catch (error) {
