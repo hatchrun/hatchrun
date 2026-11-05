@@ -246,6 +246,13 @@ pub fn stalled(rows: &[JobRow], now: u64) -> Vec<Fix> {
 fn fix(row: &JobRow, now: u64) -> Option<Fix> {
     let quiet_since = |since: u64, limit: u64| since < now.saturating_sub(limit);
     match row.status.as_str() {
+        // A job held for capacity is tried again at its own time.
+        "queued"
+            if row.held.as_deref() == Some(launches::CAPACITY_HOLD)
+                && row.next_launch_at.is_some_and(|at| at <= now) =>
+        {
+            Some(Fix::Requeue(row.id))
+        }
         // A held job is woken, not requeued: see [`wake_held`].
         "queued"
             if row.held.is_none()
@@ -1477,7 +1484,8 @@ mod tests {
         let mut row: JobRow = serde_json::from_value(json!({
             "id": 1, "run_id": 2, "plan_id": "a", "name": "a", "status": status,
             "conclusion": null, "instance_id": null, "attempt": 1,
-            "launch_attempts": 1, "next_launch_at": null,
+            "launch_attempts": 1, "capacity_attempts": 0, "capacity_since": null,
+            "next_launch_at": null,
             "timeout_minutes": 10, "updated_at": NOW, "heartbeat_at": null,
             "started_at": null, "completed_at": null, "steps": "[]", "log_key": null,
             "template": "ubuntu-latest", "token_permissions": "{}",
@@ -1497,6 +1505,17 @@ mod tests {
         assert_eq!(stalled(&[held.clone()], NOW), []);
         held.held = None;
         assert_eq!(stalled(&[held], NOW), [Fix::Requeue(1)]);
+    }
+
+    #[test]
+    fn a_job_held_for_capacity_is_requeued_at_its_time() {
+        let mut waiting = row("queued");
+        waiting.held = Some("capacity".into());
+        waiting.next_launch_at = Some(NOW + 1);
+        waiting.updated_at = NOW - 3_600_000;
+        assert_eq!(stalled(&[waiting.clone()], NOW), []);
+        waiting.next_launch_at = Some(NOW);
+        assert_eq!(stalled(&[waiting], NOW), [Fix::Requeue(1)]);
     }
 
     #[test]

@@ -603,7 +603,7 @@ mod tests {
     fn job(status: &str, attempt: u32) -> JobRow {
         serde_json::from_value(serde_json::json!({
             "id": 5, "run_id": 9, "plan_id": "build", "name": "build", "status": status,
-            "conclusion": null, "instance_id": "i-1", "attempt": attempt, "launch_attempts": 1,
+            "conclusion": null, "instance_id": "i-1", "attempt": attempt, "launch_attempts": 1, "capacity_attempts": 0, "capacity_since": null,
             "next_launch_at": null, "timeout_minutes": 10, "updated_at": 1,
             "heartbeat_at": null, "started_at": null, "completed_at": null, "steps": "[]",
             "log_key": null, "template": "ubuntu-latest", "token_permissions": "{}",

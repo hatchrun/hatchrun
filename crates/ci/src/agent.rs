@@ -777,6 +777,8 @@ mod tests {
             instance_id: Some("i-1".into()),
             attempt: 2,
             launch_attempts: 1,
+            capacity_attempts: 0,
+            capacity_since: None,
             next_launch_at: None,
             timeout_minutes: 10,
             updated_at: 0,

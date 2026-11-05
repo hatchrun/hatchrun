@@ -47,7 +47,7 @@ const STALE_HELD: &str = "SELECT job_id, attempt FROM (\
          row_number() OVER (PARTITION BY ci_runs.tenant_id ORDER BY ci_jobs.id) AS place \
        FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
        WHERE ci_jobs.status = 'queued' AND ci_jobs.held IS NOT NULL \
-         AND ci_jobs.held <> 'approval' AND ci_jobs.updated_at < $1) ranked \
+         AND ci_jobs.held NOT IN ('approval', 'capacity') AND ci_jobs.updated_at < $1) ranked \
      WHERE place <= $2 ORDER BY job_id LIMIT $3";
 
 /// Turns the card and spend-cap holds of tenant `$1` into concurrency

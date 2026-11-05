@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use super::jobs::held_of;
 use super::*;
 use hatchrun_cloud::testdb::Db as TestDb;
 
@@ -24,6 +25,79 @@ fn a_failed_launch_retries_or_fails_the_job() {
     assert_eq!(job_row.status, "completed");
     assert_eq!(job_row.conclusion.as_deref(), Some("failure"));
     assert_eq!(job_row.completed_at, Some(40));
+}
+
+#[test]
+fn a_capacity_wait_holds_the_job_without_using_an_attempt() {
+    let db = setup();
+    let (_, job_id) = run_with_job(&db, "queued");
+    claim(&db, job_id, 10);
+    assert!(
+        db.wait(capacity_wait(db.db(), job_id, "VcpuLimitExceeded", 500, 20))
+            .unwrap()
+    );
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(row.status, "queued");
+    assert_eq!(row.held.as_deref(), Some("capacity"));
+    assert_eq!(row.next_launch_at, Some(500));
+    assert_eq!(row.launch_attempts, 1);
+    assert_eq!(row.capacity_attempts, 1);
+    assert_eq!(row.capacity_since, Some(20));
+    // The second wait counts but keeps when the waiting began.
+    claim(&db, job_id, 600);
+    assert_eq!(held_of(&db, job_id), None);
+    assert!(
+        db.wait(capacity_wait(
+            db.db(),
+            job_id,
+            "VcpuLimitExceeded",
+            900,
+            610
+        ))
+        .unwrap()
+    );
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(
+        (
+            row.launch_attempts,
+            row.capacity_attempts,
+            row.capacity_since
+        ),
+        (2, 2, Some(20))
+    );
+    // Launching ends the wait.
+    claim(&db, job_id, 1_000);
+    assert!(db.wait(launched(db.db(), job_id, "i-1", 1_010)).unwrap());
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(row.capacity_since, None);
+}
+
+#[test]
+fn a_capacity_wait_only_changes_a_launching_job() {
+    let db = setup();
+    let (_, job_id) = run_with_job(&db, "queued");
+    assert!(
+        !db.wait(capacity_wait(db.db(), job_id, "VcpuLimitExceeded", 500, 20))
+            .unwrap()
+    );
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!((row.held, row.capacity_attempts), (None, 0));
+}
+
+#[test]
+fn a_job_held_for_capacity_does_not_block_a_newer_one() {
+    let db = setup();
+    let (_, older) = run_with_job_named(&db, "older", "queued");
+    let (_, newer) = run_with_job_named(&db, "newer", "queued");
+    claim(&db, older, 10);
+    db.wait(capacity_wait(db.db(), older, "VcpuLimitExceeded", 500, 20))
+        .unwrap();
+    let claimed = claim(&db, newer, 30);
+    assert_eq!(claimed.status, "launching");
+    // A rerun starts over.
+    db.wait(reset_job(db.db(), older, 2, 40)).unwrap();
+    let row = db.wait(job(db.db(), older)).unwrap().unwrap();
+    assert_eq!((row.capacity_attempts, row.capacity_since), (0, None));
 }
 
 #[test]
@@ -160,6 +234,8 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
         "beating-running",
         "old-waiting",
         "old-completed",
+        "capacity-due",
+        "capacity-waiting",
     ];
     let jobs: Vec<NewJob> = names.iter().map(|name| new_job(name)).collect();
     let ids = db.wait(insert_jobs(db.db(), run.id, &jobs, 1)).unwrap();
@@ -191,6 +267,21 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
         Some(now - 5_000),
         None,
     );
+    set("capacity-due", "queued", now - 1_000, None, Some(now - 1));
+    set(
+        "capacity-waiting",
+        "queued",
+        now - 3_600_000,
+        None,
+        Some(now + 1),
+    );
+    for name in ["capacity-due", "capacity-waiting"] {
+        let id = ids.iter().find(|(plan, _)| plan == name).unwrap().1;
+        db.run(
+            "UPDATE ci_jobs SET held = 'capacity' WHERE id = $1",
+            &params![id],
+        );
+    }
     set("old-waiting", "waiting", 0, None, None);
     set("old-completed", "completed", 0, None, None);
     let rows = db.wait(stalled_jobs(db.db(), now, 50)).unwrap();
@@ -199,6 +290,7 @@ fn stalled_jobs_match_the_reconcilers_decisions() {
     assert_eq!(
         from_sql,
         [
+            "capacity-due",
             "due-queued",
             "old-launched",
             "old-launching",

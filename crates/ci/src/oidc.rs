@@ -384,7 +384,7 @@ mod tests {
         serde_json::from_value(json!({
             "id": 7, "run_id": 1, "plan_id": "build", "name": "build",
             "status": "running", "conclusion": null, "instance_id": "i-1",
-            "attempt": 2, "launch_attempts": 1, "next_launch_at": null,
+            "attempt": 2, "launch_attempts": 1, "capacity_attempts": 0, "capacity_since": null, "next_launch_at": null,
             "timeout_minutes": 10, "updated_at": 0, "heartbeat_at": null,
             "started_at": null, "completed_at": null, "steps": "[]",
             "log_key": null, "template": "ubuntu-latest",

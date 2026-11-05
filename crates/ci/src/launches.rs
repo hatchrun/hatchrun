@@ -23,16 +23,24 @@
 //! 4. records the instance, unless the job moved on meanwhile, which
 //!    terminates the instance too.
 //!
-//! A launch that found no capacity or no answer is queued again after
-//! 30 s, twice; any other failure, or the third, ends the job through
-//! the run object (see [`next_step`]). The dead-letter consumer ends the
-//! jobs whose messages ran out of retries.
+//! A launch that found no answer is queued again after 30 s, twice;
+//! any other failure, or the third, ends the job through the run
+//! object (see [`next_step`]). A launch EC2 refused for a limit or
+//! capacity that clears on its own (a vCPU quota the previous run's
+//! instances still use, no Spot capacity, throttling; see
+//! [`is_capacity_error`]) does not use up those attempts: the job is
+//! held for `capacity` and tried again after a wait that doubles from
+//! 30 s to 5 min, like a job waiting for a runner on GitHub. It fails
+//! after [`CAPACITY_CEILING_MS`]. The dead-letter consumer ends the jobs
+//! whose messages ran out of retries.
 
 use futures_util::future::join_all;
 use hatchrun_cloud::ci_wake::{self, Woken};
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::send;
 use hatchrun_cloud::http::Request;
+use hatchrun_cloud::launch_retry_delay;
+use hatchrun_cloud::offerings;
 use hatchrun_cloud::start::{Cause, Failure};
 use hatchrun_cloud::{jwt, webcrypto};
 use hatchrun_workflow::agent::{BootDocument, CiBoot};
@@ -59,6 +67,25 @@ pub const DEAD_LETTERS: &str = "hatchrun-ci-launches-dlq";
 
 /// How long a launch that found no capacity waits, in milliseconds.
 const RETRY_AFTER_MS: u64 = 30_000;
+/// How long a job waits for EC2 capacity before it fails, in
+/// milliseconds: 6 hours.
+pub const CAPACITY_CEILING_MS: u64 = 6 * 60 * 60_000;
+/// The word `ci_jobs.held` stores for a job waiting for EC2 capacity.
+pub const CAPACITY_HOLD: &str = "capacity";
+/// EC2 account limits and throttles that clear on their own, besides
+/// the capacity codes of [`offerings::is_capacity`].
+const LIMIT_CODES: &[&str] = &[
+    "VcpuLimitExceeded",
+    "InstanceLimitExceeded",
+    "RequestLimitExceeded",
+    "Throttling",
+    "ThrottlingException",
+    "ServiceUnavailable",
+    "Unavailable",
+];
+/// Capacity codes that say something about the request, not about a
+/// shortage: a launch that gets one of them as its own error fails.
+const NOT_A_SHORTAGE: &[&str] = &["Unsupported", "SpotMaxPriceTooLow"];
 /// How long a message waits before it is delivered again, in seconds.
 const REDELIVER_AFTER_SECS: u32 = 15;
 /// Launch attempts a job gets.
@@ -87,8 +114,14 @@ pub struct LaunchMessage {
 /// What happens to a launch that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Next {
-    /// Queued again, not before `at_ms`.
+    /// Queued again, not before `at_ms`, using up a launch attempt.
     Retry {
+        /// Unix milliseconds.
+        at_ms: u64,
+    },
+    /// Held for capacity, tried again not before `at_ms`; no launch
+    /// attempt is used up.
+    Wait {
         /// Unix milliseconds.
         at_ms: u64,
     },
@@ -96,17 +129,50 @@ pub enum Next {
     Fail,
 }
 
-/// What to do after launch attempt `launch_attempts` failed on `cause`
-/// at `now_ms`: capacity and connection failures wait 30 s and try
-/// again until the third attempt; everything else fails the job.
+/// Whether `cause` is a limit or a shortage at EC2 that clears on its
+/// own, such as `VcpuLimitExceeded` while the previous run's instances
+/// end, so the job waits instead of failing.
 #[must_use]
-pub fn next_step(cause: &Cause, launch_attempts: u32, now_ms: u64) -> Next {
+pub fn is_capacity_error(cause: &Cause) -> bool {
     match cause {
-        Cause::NoCapacity | Cause::Unreachable if launch_attempts < MAX_LAUNCH_ATTEMPTS => {
-            Next::Retry {
-                at_ms: now_ms + RETRY_AFTER_MS,
-            }
+        Cause::NoCapacity => true,
+        Cause::Aws(code) => {
+            LIMIT_CODES.contains(&code.as_str())
+                || (offerings::is_capacity(code) && !NOT_A_SHORTAGE.contains(&code.as_str()))
         }
+        _ => false,
+    }
+}
+
+/// The launch attempts a job has used: claims that were not refused
+/// for capacity.
+fn attempts_used(job: &JobRow) -> u32 {
+    job.launch_attempts.saturating_sub(job.capacity_attempts)
+}
+
+/// What to do after the launch of `job` failed on `cause` at `now_ms`,
+/// when what it failed on may pass at `not_before`:
+/// a capacity error holds the job and tries again with a growing wait
+/// until the job has waited [`CAPACITY_CEILING_MS`]; a connection
+/// failure waits 30 s and tries again until the third attempt;
+/// everything else fails the job.
+#[must_use]
+pub fn next_step(cause: &Cause, job: &JobRow, not_before: Option<u64>, now_ms: u64) -> Next {
+    if is_capacity_error(cause) {
+        let since = job.capacity_since.unwrap_or(now_ms);
+        return if now_ms.saturating_sub(since) >= CAPACITY_CEILING_MS {
+            Next::Fail
+        } else {
+            let next = now_ms.saturating_add(launch_retry_delay(job.capacity_attempts + 1));
+            Next::Wait {
+                at_ms: not_before.map_or(next, |at| at.max(next)),
+            }
+        };
+    }
+    match cause {
+        Cause::Unreachable if attempts_used(job) < MAX_LAUNCH_ATTEMPTS => Next::Retry {
+            at_ms: now_ms + RETRY_AFTER_MS,
+        },
         _ => Next::Fail,
     }
 }
@@ -461,7 +527,7 @@ fn delivery(job: &JobRow, attempt: u32) -> Delivery {
         return Delivery::Skip;
     }
     match job.status.as_str() {
-        "queued" if job.launch_attempts >= MAX_LAUNCH_ATTEMPTS => Delivery::GiveUp,
+        "queued" if attempts_used(job) >= MAX_LAUNCH_ATTEMPTS => Delivery::GiveUp,
         "queued" => Delivery::Launch,
         "launching" => Delivery::Wait,
         _ => Delivery::Skip,
@@ -614,14 +680,54 @@ pub(crate) fn broker_cause(status: u16) -> Cause {
 /// means the outcome could not be recorded and the message is retried.
 async fn record_failure(env: &Env, db: &Db, job: &JobRow, failure: &Failure) -> Result<(), String> {
     let now = now_ms();
-    match next_step(&failure.cause, job.launch_attempts, now) {
+    match next_step(&failure.cause, job, failure.not_before, now) {
         Next::Retry { at_ms } => {
             store::launch_failed(db, job.id, &failure.message, Some(at_ms), now)
                 .await
                 .map_err(|err| err.to_string())?;
             Ok(())
         }
-        Next::Fail => end_job(env, db, job, &failure.message).await,
+        Next::Wait { at_ms } => {
+            let waiting = store::capacity_wait(db, job.id, &failure.message, at_ms, now)
+                .await
+                .map_err(|err| err.to_string())?;
+            if waiting {
+                console_log!("job {}: held, {CAPACITY_HOLD}", job.id);
+                // The job gave back its place in the tenant and its
+                // matrix, which a job held for them waits for.
+                if let Ok(Some(run)) = store::run(db, job.run_id).await {
+                    wake_oldest(env, db, &run.tenant_id).await;
+                }
+                wake_group(env, db, job.id).await;
+                let message = capacity_message(&failure.cause);
+                let answer = post_to_run(env, db, job, "held", &message).await;
+                if !matches!(answer, EndAnswer::Status(200..=299 | 409)) {
+                    console_error!("job {}: post held: {answer:?}", job.id);
+                }
+            }
+            Ok(())
+        }
+        Next::Fail => {
+            let message = if is_capacity_error(&failure.cause) {
+                format!(
+                    "gave up waiting for EC2 capacity after {} hours: {}",
+                    CAPACITY_CEILING_MS / 3_600_000,
+                    failure.message
+                )
+            } else {
+                failure.message.clone()
+            };
+            end_job(env, db, job, &message).await
+        }
+    }
+}
+
+/// What the check run of a job waiting for EC2 capacity says.
+#[must_use]
+pub fn capacity_message(cause: &Cause) -> String {
+    match cause {
+        Cause::Aws(code) => format!("Waiting for EC2 capacity: {code}"),
+        _ => "Waiting for EC2 capacity: no capacity".to_owned(),
     }
 }
 
@@ -798,34 +904,101 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retries_capacity_twice_then_fails() {
+    fn capacity_errors_wait_with_backoff_and_use_no_attempt() {
+        let mut job = row("launching", 1, 3);
+        job.capacity_attempts = 2;
+        assert_eq!(attempts_used(&job), 1);
+        for cause in [
+            Cause::NoCapacity,
+            Cause::Aws("VcpuLimitExceeded".into()),
+            Cause::Aws("InsufficientInstanceCapacity".into()),
+            Cause::Aws("InstanceLimitExceeded".into()),
+            Cause::Aws("MaxSpotInstanceCountExceeded".into()),
+            Cause::Aws("RequestLimitExceeded".into()),
+        ] {
+            assert!(
+                matches!(next_step(&cause, &job, None, 0), Next::Wait { .. }),
+                "{cause:?}"
+            );
+        }
+        let waits: Vec<u64> = (1..=6).map(launch_retry_delay).collect();
+        assert_eq!(waits, [30_000, 60_000, 120_000, 240_000, 300_000, 300_000]);
+        let first = row("launching", 1, 1);
         assert_eq!(
-            next_step(&Cause::NoCapacity, 1, 0),
-            Next::Retry { at_ms: 30_000 }
+            next_step(&Cause::NoCapacity, &first, None, 5_000),
+            Next::Wait { at_ms: 35_000 }
         );
         assert_eq!(
-            next_step(&Cause::NoCapacity, 2, 5_000),
-            Next::Retry { at_ms: 35_000 }
+            next_step(&Cause::NoCapacity, &job, None, 5_000),
+            Next::Wait { at_ms: 125_000 }
         );
-        assert_eq!(next_step(&Cause::NoCapacity, 3, 0), Next::Fail);
     }
 
     #[test]
-    fn unreachable_retries_and_other_causes_fail() {
+    fn a_wait_for_capacity_honors_when_the_offering_returns() {
+        let job = row("launching", 1, 1);
         assert_eq!(
-            next_step(&Cause::Unreachable, 1, 0),
+            next_step(&Cause::NoCapacity, &job, Some(500_000), 0),
+            Next::Wait { at_ms: 500_000 }
+        );
+        assert_eq!(
+            next_step(&Cause::NoCapacity, &job, Some(10), 0),
+            Next::Wait { at_ms: 30_000 }
+        );
+    }
+
+    #[test]
+    fn a_job_stops_waiting_for_capacity_at_the_ceiling() {
+        let mut job = row("launching", 1, 40);
+        job.capacity_attempts = 39;
+        job.capacity_since = Some(1_000);
+        let cause = Cause::Aws("VcpuLimitExceeded".into());
+        assert!(matches!(
+            next_step(&cause, &job, None, 1_000 + CAPACITY_CEILING_MS - 1),
+            Next::Wait { .. }
+        ));
+        assert_eq!(
+            next_step(&cause, &job, None, 1_000 + CAPACITY_CEILING_MS),
+            Next::Fail
+        );
+    }
+
+    #[test]
+    fn unreachable_retries_twice_and_other_causes_fail() {
+        assert_eq!(
+            next_step(&Cause::Unreachable, &row("launching", 1, 1), None, 0),
             Next::Retry { at_ms: 30_000 }
         );
-        assert_eq!(next_step(&Cause::Unreachable, 3, 0), Next::Fail);
+        assert_eq!(
+            next_step(&Cause::Unreachable, &row("launching", 1, 3), None, 0),
+            Next::Fail
+        );
         for cause in [
             Cause::Aws("AccessDenied".into()),
+            Cause::Aws("InvalidAMIID.NotFound".into()),
+            Cause::Aws("InvalidParameterValue".into()),
+            Cause::Aws("UnauthorizedOperation".into()),
+            Cause::Aws("Unsupported".into()),
+            Cause::Aws("SpotMaxPriceTooLow".into()),
             Cause::Broker,
             Cause::NoImage,
             Cause::Internal,
             Cause::NoInstanceType,
         ] {
-            assert_eq!(next_step(&cause, 1, 0), Next::Fail, "{cause:?}");
+            assert_eq!(
+                next_step(&cause, &row("launching", 1, 1), None, 0),
+                Next::Fail,
+                "{cause:?}"
+            );
         }
+    }
+
+    #[test]
+    fn the_check_run_names_the_capacity_error() {
+        assert_eq!(
+            capacity_message(&Cause::Aws("VcpuLimitExceeded".into())),
+            "Waiting for EC2 capacity: VcpuLimitExceeded"
+        );
     }
 
     fn quiet_row(status: &str, attempt: u32, updated_at: u64) -> JobRow {
@@ -870,13 +1043,16 @@ mod tests {
         for status in [429, 500, 502, 503, 504] {
             assert_eq!(broker_cause(status), Cause::Unreachable, "{status}");
             assert_eq!(
-                next_step(&broker_cause(status), 1, 0),
+                next_step(&broker_cause(status), &row("launching", 1, 1), None, 0),
                 Next::Retry { at_ms: 30_000 }
             );
         }
         for status in [400, 401, 403, 404, 409] {
             assert_eq!(broker_cause(status), Cause::Broker, "{status}");
-            assert_eq!(next_step(&broker_cause(status), 1, 0), Next::Fail);
+            assert_eq!(
+                next_step(&broker_cause(status), &row("launching", 1, 1), None, 0),
+                Next::Fail
+            );
         }
     }
 
@@ -915,7 +1091,8 @@ mod tests {
         serde_json::from_value(json!({
             "id": 1, "run_id": 2, "plan_id": "a", "name": "a", "status": status,
             "conclusion": null, "instance_id": null, "attempt": attempt,
-            "launch_attempts": launch_attempts, "next_launch_at": null,
+            "launch_attempts": launch_attempts, "capacity_attempts": 0,
+            "capacity_since": null, "next_launch_at": null,
             "timeout_minutes": 10, "updated_at": 0, "heartbeat_at": null,
             "started_at": null, "completed_at": null, "steps": "[]", "log_key": null,
             "template": "ubuntu-latest", "token_permissions": "{}",
@@ -946,6 +1123,10 @@ mod tests {
         assert_eq!(delivery(&row("queued", 1, 2), 1), Delivery::Launch);
         assert_eq!(delivery(&row("queued", 1, 3), 1), Delivery::GiveUp);
         assert_eq!(delivery(&row("queued", 1, 5), 1), Delivery::GiveUp);
+        // Launches refused for capacity use no attempt.
+        let mut waited = row("queued", 1, 9);
+        waited.capacity_attempts = 8;
+        assert_eq!(delivery(&waited, 1), Delivery::Launch);
         assert_eq!(delivery(&row("queued", 2, 0), 1), Delivery::Skip);
         assert_eq!(delivery(&row("launching", 1, 1), 1), Delivery::Wait);
         for status in ["launched", "running", "completed", "waiting"] {

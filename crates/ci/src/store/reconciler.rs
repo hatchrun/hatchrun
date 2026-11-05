@@ -76,12 +76,13 @@ const SET_LAST_MINUTE: &str = "UPDATE ci_reconciler SET last_minute = $1 WHERE i
 
 /// Jobs a reconciler pass looks at, the least recently changed first, at
 /// most `$5`: queued ones due for a launch (`$1` now) or quiet since
-/// `$2`, launching or launched ones quiet since `$3`, and running ones
+/// `$2` (a job held for capacity only when due), launching or launched ones quiet since `$3`, and running ones
 /// without a heartbeat since `$4`, or without a start or any change when
 /// the heartbeat is missing. [`crate::reconcile::stalled`] makes the
 /// same decisions over the rows.
 const STALLED_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE \
      (status = 'queued' AND held IS NULL AND (next_launch_at <= $1 OR updated_at < $2)) \
+     OR (status = 'queued' AND held = 'capacity' AND next_launch_at <= $1) \
      OR (status IN ('launching', 'launched') AND updated_at < $3) \
      OR (status = 'running' AND COALESCE(heartbeat_at, started_at, updated_at) < $4) \
      ORDER BY updated_at, id LIMIT $5";

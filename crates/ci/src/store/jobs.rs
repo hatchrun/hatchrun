@@ -61,6 +61,11 @@ pub struct JobRow {
     pub attempt: u32,
     /// How many times a launch was claimed for this attempt.
     pub launch_attempts: u32,
+    /// How many of those launches EC2 refused for a limit or capacity
+    /// that clears on its own; they do not use up the launch attempts.
+    pub capacity_attempts: u32,
+    /// When the job first waited for EC2 capacity, until it launches.
+    pub capacity_since: Option<u64>,
     /// Not before this, a failed launch is tried again.
     pub next_launch_at: Option<u64>,
     /// The most minutes it may run.
@@ -111,7 +116,7 @@ fn json_text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<serde_json:
 
 /// The columns of a [`JobRow`].
 pub(super) const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclusion, instance_id, attempt, \
-     launch_attempts, next_launch_at, timeout_minutes, updated_at, heartbeat_at, started_at, \
+     launch_attempts, capacity_attempts, capacity_since, next_launch_at, timeout_minutes, updated_at, heartbeat_at, started_at, \
      completed_at, steps::text AS steps, log_key, template, \
      token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held, \
      environment, approval_attempt, approval_decision, approval_by, approval_at";
@@ -136,7 +141,7 @@ const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2,
 /// attempt is left. A job already at that attempt or later is left
 /// alone, so a late repeat does nothing.
 const RESET_JOB: &str = "UPDATE ci_jobs SET status = 'waiting', attempt = $2, launch_attempts = 0, \
-     conclusion = NULL, instance_id = NULL, launch_error = NULL, next_launch_at = NULL, \
+     capacity_attempts = 0, capacity_since = NULL, conclusion = NULL, instance_id = NULL, launch_error = NULL, next_launch_at = NULL, \
      heartbeat_at = NULL, started_at = NULL, completed_at = NULL, log_key = NULL, \
      held = NULL, steps = '[]', updated_at = $3 WHERE id = $1 AND attempt < $2";
 
@@ -219,7 +224,8 @@ const HOLD: &str = "WITH prior AS (SELECT held FROM ci_jobs \
        WHERE id = $1 AND attempt = $2 AND status = 'queued' \
        AND NOT ($3::text = 'approval' AND approval_attempt = attempt \
                 AND approval_decision IS NOT NULL) FOR UPDATE) \
-     UPDATE ci_jobs SET held = $3::text, next_launch_at = $4, updated_at = $5 \
+     UPDATE ci_jobs SET held = $3::text, next_launch_at = $4, updated_at = $5, \
+       capacity_since = CASE WHEN $3::text = 'capacity' THEN capacity_since ELSE NULL END \
      FROM prior WHERE ci_jobs.id = $1 \
      RETURNING (prior.held IS DISTINCT FROM $3::text) AS changed";
 
@@ -229,7 +235,16 @@ const NOTE_QUEUED_ERROR: &str = "UPDATE ci_jobs SET launch_error = $2, updated_a
 
 /// Records the instance `$2` of job `$1` at `$3`.
 const LAUNCHED: &str = "UPDATE ci_jobs SET status = 'launched', instance_id = $2, \
-     launch_error = NULL, next_launch_at = NULL, updated_at = $3 \
+     launch_error = NULL, next_launch_at = NULL, capacity_since = NULL, updated_at = $3 \
+     WHERE id = $1 AND status = 'launching'";
+
+/// Queues job `$1` again, held for `capacity`, after EC2 refused its
+/// launch for a limit or capacity that clears on its own: error `$2`,
+/// not before `$3`, at `$4`. The launch does not count against the
+/// launch attempts, and `$4` is when the wait began if it had not.
+const CAPACITY_WAIT: &str = "UPDATE ci_jobs SET status = 'queued', held = 'capacity', \
+     launch_error = $2, next_launch_at = $3, capacity_attempts = capacity_attempts + 1, \
+     capacity_since = COALESCE(capacity_since, $4), updated_at = $4 \
      WHERE id = $1 AND status = 'launching'";
 
 /// Queues job `$1` again after a failed launch: error `$2`, not before
@@ -602,6 +617,27 @@ pub async fn launch_failed(
         None => db.run(LAUNCH_GAVE_UP, &params![job_id, error, now]).await?,
     };
     Ok(changed == 1)
+}
+
+/// Queues job `job_id` again, held for `capacity`, after a launch EC2
+/// refused for a limit or capacity that clears on its own: `error`, not
+/// before `retry_at`. Only a launching job changes; returns whether it
+/// did.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn capacity_wait(
+    db: &Db,
+    job_id: u64,
+    error: &str,
+    retry_at: u64,
+    now: u64,
+) -> Result<bool> {
+    Ok(db
+        .run(CAPACITY_WAIT, &params![job_id, error, retry_at, now])
+        .await?
+        == 1)
 }
 
 /// Records the agent's heartbeat for job `job_id`.
