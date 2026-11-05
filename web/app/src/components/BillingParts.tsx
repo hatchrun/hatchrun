@@ -73,7 +73,7 @@ export function SpendCapForm({
     event.preventDefault();
     setSaved(false);
     const value = Number(cap.replace(/,/g, ""));
-    if (cap.trim() === "" || !Number.isInteger(value) || value < min || value > max) {
+    if (!/^[0-9,]+$/.test(cap.trim()) || !Number.isInteger(value) || value < min || value > max) {
       setProblem(`Set a cap in whole dollars from ${dollars(min)} to ${dollars(max)}`);
       return;
     }
@@ -103,7 +103,7 @@ export function SpendCapForm({
           inputMode="numeric"
           value={cap}
           onChange={(event) => {
-            setCap(event.target.value.replace(/[^0-9,]/g, ""));
+            setCap(event.target.value);
             setSaved(false);
           }}
           aria-invalid={problem !== null}
