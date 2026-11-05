@@ -14,8 +14,9 @@
 //! [`access::readable_in_installation`]). An admin of the organization
 //! reads all of them. Anyone who is not a member sees a `404`.
 //!
-//! The repository, setup and environment routes are for admins of the
-//! organization, like the settings routes next to them.
+//! The repository list answers members with the same rule. The setup,
+//! environment and enable routes are for admins of the organization,
+//! like the settings routes next to them.
 
 use std::collections::{HashMap, HashSet};
 
@@ -344,14 +345,14 @@ fn next_offset(from: u64, len: usize, total: u64) -> Option<String> {
     (end < total).then(|| page::encode(&[end]))
 }
 
-/// `GET /orgs/{org}/repos`.
+/// `GET /orgs/{org}/repos`, for any active member.
 pub(crate) async fn repos(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Result<Served> {
     finish(repos_done(cx, org, query).await)
 }
 
 async fn repos_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
     let query = Query::parse(query);
-    let tenant = admin_of(cx, org).await?;
+    let (tenant, admin, session) = member_tenant(cx, org).await?;
     let limit = query.limit()?;
     let from = offset(&query)?;
     let enabled = match query.get("enabled") {
@@ -361,9 +362,25 @@ async fn repos_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
         Some(_) => return refuse(400, "enabled is true or false"),
     };
     installation::ensure(cx.env, cx.db, cx.settings, &tenant.id, now_ms()).await?;
+    // A member sees the public repositories and the private ones their
+    // token reaches; an admin sees all.
+    let reach = if admin {
+        None
+    } else {
+        match store::tenant_installation(cx.db, &tenant.id).await? {
+            Some(installation_id) => Some(
+                access::readable_in_installation(session, cx.settings, installation_id)
+                    .await?
+                    .into_iter()
+                    .collect::<Vec<u64>>(),
+            ),
+            None => Some(Vec::new()),
+        }
+    };
     let filter = RepoFilter {
         text: query.get("q"),
         enabled,
+        reach: reach.as_deref(),
     };
     let (items, total) = store::repos_page(cx.db, &tenant.id, filter, from, limit).await?;
     let next = next_offset(from, items.len(), total);

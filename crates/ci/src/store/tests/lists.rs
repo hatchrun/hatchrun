@@ -268,6 +268,7 @@ fn installation_repositories_sync_and_keep_their_choice() {
     let only = |enabled| RepoFilter {
         text: None,
         enabled: Some(enabled),
+        reach: None,
     };
     let on = db
         .wait(repos_page(db.db(), "t1", only(true), 0, 10))
@@ -280,9 +281,32 @@ fn installation_repositories_sync_and_keep_their_choice() {
     let text = RepoFilter {
         text: Some("APP"),
         enabled: None,
+        reach: None,
     };
     let found = db.wait(repos_page(db.db(), "t1", text, 0, 10)).unwrap();
     assert_eq!(names(&found), ["acme/app-renamed"]);
+
+    // A reader who is not an admin sees public repositories and the
+    // private ones they reach.
+    let reach_none = RepoFilter {
+        reach: Some(&[]),
+        ..RepoFilter::default()
+    };
+    let seen = db
+        .wait(repos_page(db.db(), "t1", reach_none, 0, 10))
+        .unwrap();
+    assert_eq!(names(&seen), ["acme/app-renamed", "acme/new"]);
+    let reach_api = RepoFilter {
+        reach: Some(&[8]),
+        ..RepoFilter::default()
+    };
+    let seen = db
+        .wait(repos_page(db.db(), "t1", reach_api, 0, 10))
+        .unwrap();
+    assert_eq!(
+        (names(&seen), seen.1),
+        (vec!["acme/api", "acme/app-renamed", "acme/new"], 3)
+    );
 
     // All again.
     db.wait(set_enabled(db.db(), "t1", true, &[])).unwrap();

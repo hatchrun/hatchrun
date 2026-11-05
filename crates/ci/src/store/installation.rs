@@ -66,6 +66,9 @@ pub struct RepoFilter<'a> {
     pub text: Option<&'a str>,
     /// Only the enabled, or only the disabled, ones.
     pub enabled: Option<bool>,
+    /// For a reader who is not an admin: the private repositories they
+    /// reach. Public ones are always listed. `None` lists everything.
+    pub reach: Option<&'a [u64]>,
 }
 
 /// The `LIKE` pattern for text in a name.
@@ -104,8 +107,13 @@ pub async fn repos_page(
            FROM ci_runs r WHERE r.repo_id = i.repo_id AND r.tenant_id = i.tenant_id \
            ORDER BY r.created_at DESC, r.id DESC LIMIT 1) lr ON true \
          WHERE i.tenant_id = $1 AND ($2::text IS NULL OR i.full_name ILIKE $2::text) \
-         AND ($3::boolean IS NULL OR (t.ci_all_repos OR i.enabled) = $3::boolean)";
-    let bound = params![tenant, filter.text.map(contains), filter.enabled];
+         AND ($3::boolean IS NULL OR (t.ci_all_repos OR i.enabled) = $3::boolean) \
+         AND ($4::text IS NULL OR NOT i.private \
+           OR i.repo_id = ANY (string_to_array($4, ',')::bigint[]))";
+    let reach = filter
+        .reach
+        .map(|ids| ids.iter().map(u64::to_string).collect::<Vec<_>>().join(","));
+    let bound = params![tenant, filter.text.map(contains), filter.enabled, reach];
     let total = db
         .first::<Total>(&format!("SELECT count(*) AS total {from}"), &bound)
         .await?
@@ -119,7 +127,7 @@ pub async fn repos_page(
                  lr.id AS run_id, lr.run_number, lr.status AS run_status, \
                  lr.conclusion AS run_conclusion, lr.created_at AS run_created_at {from} \
                  ORDER BY lr.created_at DESC NULLS LAST, lower(i.full_name), i.repo_id \
-                 LIMIT $4 OFFSET $5"
+                 LIMIT $5 OFFSET $6"
             ),
             &bound,
         )

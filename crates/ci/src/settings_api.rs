@@ -13,7 +13,7 @@
 //! | `PUT, DELETE /api/ci/orgs/{org}/secrets/{name}` | org admin, CSRF | `204` |
 //! | `GET /api/ci/orgs/{org}/vars?q=&cursor=&limit=` | org admin | `Page` of `{"name", "value", "updatedAt", "repositories"}` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/vars/{name}` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/repos?q=&enabled=&cursor=&limit=` | org admin | `Page` of `{"name", "default_branch", "enabled", "last_run"}`, every repository of the installation |
+//! | `GET /api/ci/orgs/{org}/repos?q=&enabled=&cursor=&limit=` | org member | `Page` of `{"name", "default_branch", "enabled", "last_run"}`, the installation's repositories the caller may read |
 //! | `PUT /api/ci/orgs/{org}/repos/enabled` | org admin, CSRF | `204`, body `{"all", "repos"}` |
 //! | `GET /api/ci/orgs/{org}/setup` | org admin | `{"app", "enabled", "first_run", "billing"}` |
 //! | `GET /api/ci/orgs/{org}/environments?q=&repo=&cursor=&limit=` | org admin | `Page` of `{"repository", "name", "branches", "approval", "updatedAt", "secrets", "vars"}` |
