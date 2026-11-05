@@ -1110,8 +1110,7 @@ impl PoolPass<'_> {
                         unchanged.retain(|id| id != &instance_id);
                     }
                 }
-                Action::Launch { .. } | Action::LaunchPool { .. } | Action::RemoveRunner { .. } => {
-                }
+                Action::LaunchPool { .. } => {}
             }
         }
         Ok(starved)
