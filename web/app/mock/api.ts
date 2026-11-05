@@ -101,12 +101,12 @@ const routes: Record<string, Handler> = {
   },
   "POST /api/tenants/:org/checkout": (_req, url) => {
     const org = url.pathname.split("/")[3] ?? "";
-    return [200, { url: `/api/mock/polar?org=${org}${url.searchParams.get("return") === "ci" ? "&return=ci" : ""}` }];
+    return [200, { url: `/api/mock/polar?org=${org}` }];
   },
   "GET /api/mock/polar": (_req, url) => {
     const org = url.searchParams.get("org") ?? "";
     ciBilling.card = true;
-    return url.searchParams.get("return") === "ci" ? `/o/${org}/settings/billing?checkout=mock` : `/o/${org}/settings?checkout=mock`;
+    return `/o/${org}/settings/billing?checkout=mock`;
   },
   "POST /api/tenants/:org/portal": (_req, url) => {
     const org = url.pathname.split("/")[3];

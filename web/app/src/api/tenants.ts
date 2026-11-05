@@ -44,8 +44,6 @@ export const getTenant = (org: string) => get<Tenant>(`/api/tenants/${encodeURIC
 export const createTenant = (installationId: number) => post<Tenant>("/api/tenants", { installationId });
 
 const tenantPath = (org: string) => `/api/tenants/${encodeURIComponent(org)}`;
-// `back` sends Polar's return to the CI page instead of Settings.
-export const startCheckout = (org: string, back?: "ci") =>
-  post<{ url: string }>(`${tenantPath(org)}/checkout${back ? "?return=ci" : ""}`);
-export const openPortal = (org: string, back?: "ci") =>
-  post<{ url: string }>(`${tenantPath(org)}/portal${back ? "?return=ci" : ""}`);
+// Polar returns to Settings, Billing.
+export const startCheckout = (org: string) => post<{ url: string }>(`${tenantPath(org)}/checkout`);
+export const openPortal = (org: string) => post<{ url: string }>(`${tenantPath(org)}/portal`);

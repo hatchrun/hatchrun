@@ -28,7 +28,7 @@ export function CardButton({ org, card, primary = true }: { org: string; card: b
     setBusy(true);
     setError(null);
     try {
-      window.location.assign((await (card ? openPortal(org, "ci") : startCheckout(org, "ci"))).url);
+      window.location.assign((await (card ? openPortal(org) : startCheckout(org))).url);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setBusy(false);
