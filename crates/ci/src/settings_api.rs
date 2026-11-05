@@ -9,9 +9,9 @@
 //! | --- | --- | --- |
 //! | `GET /api/ci/orgs/{org}/billing` | org admin | [`BillingView`](crate::billing::BillingView) |
 //! | `PUT /api/ci/orgs/{org}/billing/cap` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/secrets?q=&cursor=&limit=` | org admin | `Page` of `{"name", "updatedAt", "repositories"}` |
+//! | `GET /api/ci/orgs/{org}/secrets?q=&cursor=&limit=` | org admin | `Page` of `{"name", "updatedAt", "repositories", "scope", "shadowed", "last_used_at"}` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/secrets/{name}` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/vars?q=&cursor=&limit=` | org admin | `Page` of `{"name", "value", "updatedAt", "repositories"}` |
+//! | `GET /api/ci/orgs/{org}/vars?q=&cursor=&limit=` | org admin | `Page` of `{"name", "value", "updatedAt", "repositories", "scope", "shadowed", "last_used_at"}` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/vars/{name}` | org admin, CSRF | `204` |
 //! | `GET /api/ci/orgs/{org}/repos?q=&enabled=&cursor=&limit=` | org member | `Page` of `{"name", "default_branch", "enabled", "last_run"}`, the installation's repositories the caller may read |
 //! | `PATCH /api/ci/orgs/{org}/repos/enabled` | org admin, CSRF | `204`, body `{"all"?, "add"?, "remove"?}` |
@@ -666,6 +666,9 @@ async fn list_secrets(cx: &Cx<'_>, scope: Scope<'_>, query: Option<&str>) -> Res
                 "name": item.name,
                 "updatedAt": item.updated_at,
                 "repositories": item.repositories,
+                "scope": item.scope,
+                "shadowed": item.shadowed,
+                "last_used_at": item.last_used_at,
             })
         })
         .collect();
@@ -696,6 +699,9 @@ async fn list_vars(cx: &Cx<'_>, scope: Scope<'_>, query: Option<&str>) -> Result
                 "value": item.value,
                 "updatedAt": item.updated_at,
                 "repositories": item.repositories,
+                "scope": item.scope,
+                "shadowed": item.shadowed,
+                "last_used_at": item.last_used_at,
             })
         })
         .collect();

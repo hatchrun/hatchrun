@@ -415,7 +415,90 @@ fn another_environment_stays_out() {
         ))
         .unwrap();
     assert_eq!(put, Put::Saved);
-    assert_eq!(db.wait(secret_names(db.db(), "t1", of_f)).unwrap().len(), 1);
+    let listed = db.wait(secret_names(db.db(), "t1", of_f)).unwrap();
+    assert_eq!(listed.iter().filter(|item| item.scope == "env").count(), 1);
+}
+
+#[test]
+fn narrower_scopes_list_what_they_inherit_and_shadow_it() {
+    let db = setup();
+    let e = save_environment(&db, "e", &[], false);
+    let of_e = Owner::Environment {
+        repo_id: 7,
+        environment_id: e.id,
+    };
+    put_secret_ok(&db, Owner::Org, "A", "k", "org");
+    put_secret_ok(&db, Owner::Org, "B", "k", "org");
+    put_secret_ok(&db, Owner::Repo(7), "A", "k", "repo");
+    put_secret_ok(&db, of_e, "A", "k", "env");
+    put_var_ok(&db, Owner::Org, "V", "org");
+    put_var_ok(&db, Owner::Repo(7), "V", "repo");
+    // An organization sees only its own.
+    let org = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
+    assert_eq!(org.len(), 2);
+    assert!(org.iter().all(|i| i.scope == "org" && !i.shadowed));
+    // A repository sees the organization's too; its own A hides the org's.
+    let repo = db
+        .wait(secret_names(db.db(), "t1", Owner::Repo(7)))
+        .unwrap();
+    let shown: Vec<_> = repo
+        .iter()
+        .map(|i| (i.name.as_str(), i.scope, i.shadowed))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("A", "org", true),
+            ("A", "repo", false),
+            ("B", "org", false)
+        ]
+    );
+    // An environment sees all three levels.
+    let env = db.wait(secret_names(db.db(), "t1", of_e)).unwrap();
+    let shown: Vec<_> = env
+        .iter()
+        .map(|i| (i.name.as_str(), i.scope, i.shadowed))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("A", "org", true),
+            ("A", "repo", true),
+            ("A", "env", false),
+            ("B", "org", false)
+        ]
+    );
+    let vars = db.wait(vars(db.db(), "t1", Owner::Repo(7))).unwrap();
+    let shown: Vec<_> = vars.iter().map(|i| (i.scope, i.shadowed)).collect();
+    assert_eq!(shown, [("org", true), ("repo", false)]);
+}
+
+#[test]
+fn receiving_a_secret_sets_its_last_use() {
+    let db = setup();
+    put_secret_ok(&db, Owner::Org, "A", "k", "org");
+    put_secret_ok(&db, Owner::Org, "B", "k", "org");
+    put_secret_ok(&db, Owner::Repo(7), "A", "k", "repo");
+    put_var_ok(&db, Owner::Org, "V", "org");
+    put_var_ok(&db, Owner::Repo(7), "V", "repo");
+    let used = |db: &TestDb| {
+        let secrets = db
+            .wait(secret_names(db.db(), "t1", Owner::Repo(7)))
+            .unwrap();
+        let vars = db.wait(vars(db.db(), "t1", Owner::Repo(7))).unwrap();
+        (
+            secrets.iter().map(|i| i.last_used_at).collect::<Vec<_>>(),
+            vars.iter().map(|i| i.last_used_at).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(used(&db), (vec![None, None, None], vec![None, None]));
+    // The job reads A only: the repository's wins, the org's stays unused.
+    db.wait(mark_used(db.db(), "t1", 7, None, &["A".to_owned()], 99))
+        .unwrap();
+    assert_eq!(
+        used(&db),
+        (vec![None, Some(99), None], vec![None, Some(99)])
+    );
 }
 
 #[test]

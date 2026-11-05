@@ -74,7 +74,7 @@ pub use self::runs::{
 };
 pub use self::secrets::{
     Owner, Put, SealedRow, SecretItem, StaleRow, VarItem, delete_secret, delete_var, job_vars,
-    put_secret, put_var, repo_ids, reseal, sealed_secrets, secret_names, stale_secrets,
+    mark_used, put_secret, put_var, repo_ids, reseal, sealed_secrets, secret_names, stale_secrets,
     tenant_repos, vars,
 };
 pub use self::tenants::{

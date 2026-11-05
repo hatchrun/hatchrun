@@ -584,6 +584,19 @@ async fn read_values(
     let vars = store::job_vars(db, &repo.tenant_id, repo.id, environment_id)
         .await
         .map_err(|e| unavailable(&e))?;
+    let received: Vec<String> = rows.iter().map(|row| row.name.clone()).collect();
+    if let Err(err) = store::mark_used(
+        db,
+        &repo.tenant_id,
+        repo.id,
+        environment_id,
+        &received,
+        now_ms(),
+    )
+    .await
+    {
+        console_warn!("job {}: mark secrets used: {err}", row.id);
+    }
     if rows.is_empty() {
         return Ok((BTreeMap::new(), vars));
     }

@@ -207,6 +207,13 @@ pub struct SecretItem {
     pub updated_at: u64,
     /// The repositories an organization secret reaches, `None` for all.
     pub repositories: Option<Vec<String>>,
+    /// Whose row it is: `org`, `repo` or `env`. A repository's or an
+    /// environment's list also holds the rows it inherits.
+    pub scope: &'static str,
+    /// A narrower row of the same name hides this inherited one.
+    pub shadowed: bool,
+    /// When a job last received it.
+    pub last_used_at: Option<u64>,
 }
 
 /// A listed var.
@@ -220,6 +227,13 @@ pub struct VarItem {
     pub updated_at: u64,
     /// The repositories an organization var reaches, `None` for all.
     pub repositories: Option<Vec<String>>,
+    /// Whose row it is: `org`, `repo` or `env`. A repository's or an
+    /// environment's list also holds the rows it inherits.
+    pub scope: &'static str,
+    /// A narrower row of the same name hides this inherited one.
+    pub shadowed: bool,
+    /// When a job last received it.
+    pub last_used_at: Option<u64>,
 }
 
 /// The names in a row's `repositories` column.
@@ -230,23 +244,82 @@ fn repository_list(text: Option<&str>) -> Result<Option<Vec<String>>> {
     })
 }
 
+/// How wide a row of a list reaches: the scope word and a rank, the
+/// narrowest highest.
+fn scope_of(repo_id: Option<u64>, environment_id: Option<u64>) -> (&'static str, u8) {
+    match Owner::of(repo_id, environment_id) {
+        Owner::Org => ("org", 0),
+        Owner::Repo(_) => ("repo", 1),
+        Owner::Environment { .. } => ("env", 2),
+    }
+}
+
+/// Marks each row that a narrower row of its name hides. `rows` come
+/// ordered by name, then from the widest scope to the narrowest.
+fn mark_shadowed<T>(rows: &mut [T], name: impl Fn(&T) -> &str, shadow: impl Fn(&mut T)) {
+    for at in 1..rows.len() {
+        if name(&rows[at - 1]) == name(&rows[at]) {
+            shadow(&mut rows[at - 1]);
+        }
+    }
+}
+
+/// The condition for the rows `owner` sees, of the table aliased `x`,
+/// with `$1` the tenant, `$2` the repository and `$3` the environment:
+/// its own, and for a repository or environment those of wider scopes
+/// that reach it. An organization sees its own only.
+fn visible(x: &str, owner: Owner) -> String {
+    match owner {
+        Owner::Org => format!(
+            "{x}.tenant_id = $1 AND {x}.repo_id IS NULL \
+             AND $2::bigint IS NULL AND $3::bigint IS NULL"
+        ),
+        Owner::Repo(_) | Owner::Environment { .. } => reach(x),
+    }
+}
+
+/// The rows a job of repository `$2` and environment `$3` (maybe NULL)
+/// of tenant `$1` receives from the table aliased `x`, before narrower
+/// ones replace wider ones of a name.
+fn reach(x: &str) -> String {
+    format!(
+        "{x}.tenant_id = $1 AND (({x}.repo_id IS NULL \
+         AND ({x}.repositories IS NULL OR $2::bigint = ANY ({x}.repositories))) \
+         OR ({x}.repo_id = $2 AND ({x}.environment_id IS NULL OR {x}.environment_id = $3::bigint)))"
+    )
+}
+
+/// The scope rank of a row of the table aliased `x`, as SQL.
+fn rank(x: &str) -> String {
+    format!(
+        "(CASE WHEN {x}.environment_id IS NOT NULL THEN 2 \
+         WHEN {x}.repo_id IS NOT NULL THEN 1 ELSE 0 END)"
+    )
+}
+
 #[derive(Deserialize)]
 struct NameRow {
     name: String,
     updated_at: u64,
+    last_used_at: Option<u64>,
+    repo_id: Option<u64>,
+    environment_id: Option<u64>,
     repositories: Option<String>,
 }
 
-/// A scope's secrets: names and times, never values.
+/// A scope's secrets: names and times, never values. A repository's or
+/// an environment's list also holds the rows it inherits from wider
+/// scopes, a narrower row of a name marking the wider ones `shadowed`.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
 pub async fn secret_names(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<SecretItem>> {
     let sql = format!(
-        "SELECT s.name, s.updated_at, {REPOSITORY_NAMES} FROM ci_secrets s \
-         WHERE s.tenant_id = $1 AND s.repo_id IS NOT DISTINCT FROM $2::bigint \
-         AND s.environment_id IS NOT DISTINCT FROM $3::bigint ORDER BY s.name"
+        "SELECT s.name, s.updated_at, s.last_used_at, s.repo_id, s.environment_id, \
+         {REPOSITORY_NAMES} FROM ci_secrets s WHERE {} ORDER BY s.name, {}",
+        visible("s", owner),
+        rank("s")
     );
     let rows: Vec<NameRow> = db
         .all(
@@ -254,15 +327,21 @@ pub async fn secret_names(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<Sec
             &params![tenant, owner.repo_id(), owner.environment_id()],
         )
         .await?;
-    rows.into_iter()
+    let mut items = rows
+        .into_iter()
         .map(|r| {
             Ok(SecretItem {
                 name: r.name,
                 updated_at: r.updated_at,
                 repositories: repository_list(r.repositories.as_deref())?,
+                scope: scope_of(r.repo_id, r.environment_id).0,
+                shadowed: false,
+                last_used_at: r.last_used_at,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    mark_shadowed(&mut items, |item| &item.name, |item| item.shadowed = true);
+    Ok(items)
 }
 
 /// A sealed secret as stored.
@@ -392,6 +471,9 @@ struct VarRow {
     name: String,
     value: String,
     updated_at: u64,
+    last_used_at: Option<u64>,
+    repo_id: Option<u64>,
+    environment_id: Option<u64>,
     repositories: Option<String>,
 }
 
@@ -402,9 +484,10 @@ struct VarRow {
 /// Postgres refused the statement.
 pub async fn vars(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<VarItem>> {
     let sql = format!(
-        "SELECT s.name, s.value, s.updated_at, {REPOSITORY_NAMES} FROM ci_vars s \
-         WHERE s.tenant_id = $1 AND s.repo_id IS NOT DISTINCT FROM $2::bigint \
-         AND s.environment_id IS NOT DISTINCT FROM $3::bigint ORDER BY s.name"
+        "SELECT s.name, s.value, s.updated_at, s.last_used_at, s.repo_id, s.environment_id, \
+         {REPOSITORY_NAMES} FROM ci_vars s WHERE {} ORDER BY s.name, {}",
+        visible("s", owner),
+        rank("s")
     );
     let rows: Vec<VarRow> = db
         .all(
@@ -412,16 +495,65 @@ pub async fn vars(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<VarItem>> {
             &params![tenant, owner.repo_id(), owner.environment_id()],
         )
         .await?;
-    rows.into_iter()
+    let mut items = rows
+        .into_iter()
         .map(|r| {
             Ok(VarItem {
                 name: r.name,
                 value: r.value,
                 updated_at: r.updated_at,
                 repositories: repository_list(r.repositories.as_deref())?,
+                scope: scope_of(r.repo_id, r.environment_id).0,
+                shadowed: false,
+                last_used_at: r.last_used_at,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    mark_shadowed(&mut items, |item| &item.name, |item| item.shadowed = true);
+    Ok(items)
+}
+
+/// Records at `now` that a job of repository `repo_id` and environment
+/// `environment_id` of `tenant` received the secrets in `names` and
+/// every var. Only the row that wins its name is marked.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn mark_used(
+    db: &Db,
+    tenant: &str,
+    repo_id: u64,
+    environment_id: Option<u64>,
+    names: &[String],
+    now: u64,
+) -> Result<()> {
+    let winner = |table: &str, only: &str| {
+        format!(
+            "UPDATE {table} s SET last_used_at = $4 WHERE {} {only} AND NOT EXISTS ( \
+             SELECT 1 FROM {table} w WHERE {} AND w.name = s.name AND {} > {})",
+            reach("s"),
+            reach("w"),
+            rank("w"),
+            rank("s")
+        )
+    };
+    let bound = params![tenant, repo_id, environment_id, now];
+    let mut statements = vec![(winner("ci_vars", ""), bound.clone())];
+    if !names.is_empty() {
+        let mut with_names = bound;
+        with_names.push(Param::from(names.join(",")));
+        statements.push((
+            winner("ci_secrets", "AND s.name = ANY (string_to_array($5, ','))"),
+            with_names,
+        ));
+    }
+    let statements: Vec<(&str, Vec<Param>)> = statements
+        .iter()
+        .map(|(sql, bound)| (sql.as_str(), bound.clone()))
+        .collect();
+    db.batch(&statements).await?;
+    Ok(())
 }
 
 #[derive(Deserialize)]

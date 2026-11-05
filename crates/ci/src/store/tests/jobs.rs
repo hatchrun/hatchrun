@@ -323,23 +323,24 @@ fn a_transferred_repo_leaves_its_secrets_and_vars_behind() {
     // Re-registering the repository under its own tenant keeps them.
     let mut same = db.wait(repo(db.db(), 7)).unwrap().unwrap();
     db.wait(upsert_repo(db.db(), &same, 6)).unwrap();
-    assert_eq!(
+    let own = |db: &TestDb| {
         db.wait(secret_names(db.db(), "t1", Owner::Repo(7)))
             .unwrap()
-            .len(),
-        1
-    );
+            .iter()
+            .filter(|item| item.scope == "repo")
+            .count()
+    };
+    assert_eq!(own(&db), 1);
     same.tenant_id = "t2".into();
     same.installation_id = 100;
     db.wait(upsert_repo(db.db(), &same, 7)).unwrap();
+    assert_eq!(own(&db), 0);
     assert_eq!(
-        db.wait(secret_names(db.db(), "t1", Owner::Repo(7)))
+        db.wait(vars(db.db(), "t1", Owner::Repo(7)))
             .unwrap()
-            .len(),
-        0
-    );
-    assert_eq!(
-        db.wait(vars(db.db(), "t1", Owner::Repo(7))).unwrap().len(),
+            .iter()
+            .filter(|item| item.scope == "repo")
+            .count(),
         0
     );
     // The old organization's own rows stay.
