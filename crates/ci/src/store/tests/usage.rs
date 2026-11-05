@@ -852,6 +852,35 @@ fn seconds_round_up_with_a_minute_minimum() {
 }
 
 #[test]
+fn daily_usage_groups_by_utc_day() {
+    let db = setup();
+    let month = 1_790_812_800_000_u64;
+    for (job, seconds, ended, units) in [
+        (1, 100, month - 1, 100),
+        (2, 60, month + 5, 60),
+        (3, 90, month + DAY - 1, 90),
+        (4, 60, month + 3 * DAY, 60),
+    ] {
+        db.run(
+            "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
+             ended_at) VALUES ($1, 1, 't1', 'ubuntu-latest', $2, $4, $3)",
+            &params![job, seconds, ended, units],
+        );
+    }
+    let days = db.wait(daily_usage(db.db(), "t1", month)).unwrap();
+    let shown: Vec<_> = days
+        .iter()
+        .map(|d| (d.day.as_str(), d.seconds, d.units))
+        .collect();
+    assert_eq!(shown, [("2026-10-01", 150, 150), ("2026-10-04", 60, 60)]);
+    assert!(
+        db.wait(daily_usage(db.db(), "t2", month))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn standing_counts_this_month_and_running_jobs() {
     let db = setup();
     let month = 1_790_812_800_000_u64;

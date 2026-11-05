@@ -38,6 +38,8 @@
 
 use hatchrun_cloud::ci_wake::{self, Woken};
 use hatchrun_cloud::db::Db;
+use hatchrun_cloud::fetch::send;
+use hatchrun_cloud::polar;
 use hatchrun_cloud::tenant::valid_login;
 use hatchrun_workflow::valid_environment_name;
 use serde::Deserialize;
@@ -388,7 +390,64 @@ async fn billing_view(cx: &Cx<'_>, org: &str) -> Result<Served> {
     let Some(standing) = standing else {
         return Ok(stop(404, "not found"));
     };
-    reply(200, &serde_json::to_value(billing::view(&standing))?).map(Ok)
+    let daily = store::daily_usage(cx.db, &tenant.id, billing::month_start(now_ms()))
+        .await?
+        .into_iter()
+        .map(|day| billing::Daily::new(day.day, day.seconds, day.units))
+        .collect();
+    let (card, invoices) = polar_billing(cx, &tenant.id).await;
+    reply(
+        200,
+        &serde_json::to_value(billing::view(&standing, card, daily, invoices))?,
+    )
+    .map(Ok)
+}
+
+/// How many invoices the billing page lists.
+const INVOICES: u32 = 12;
+
+/// The card and the newest invoices Polar holds for `tenant`. Polar
+/// being down or not configured leaves them empty: the page still
+/// shows the usage.
+async fn polar_billing(cx: &Cx<'_>, tenant: &str) -> (Option<polar::Card>, Vec<billing::Invoice>) {
+    let settings = cx.settings;
+    if settings.polar_token.is_empty() {
+        return (None, Vec::new());
+    }
+    let (api, token) = (settings.polar_api.as_str(), settings.polar_token.as_str());
+    let card = async {
+        let answer = send(&polar::payment_methods(api, token, tenant)).await?;
+        polar::default_card(&answer)
+    };
+    let orders = async {
+        let answer = send(&polar::orders(api, token, tenant, INVOICES)).await?;
+        polar::order_list(&answer)
+    };
+    let (card, orders) = futures_util::future::join(card, orders).await;
+    let card = card.unwrap_or_else(|err| {
+        console_error!("billing {tenant}: {err}");
+        None
+    });
+    let orders = orders.unwrap_or_else(|err| {
+        console_error!("billing {tenant}: {err}");
+        Vec::new()
+    });
+    let links = orders.iter().map(|order| async {
+        if !order.is_invoice_generated {
+            return None;
+        }
+        let answer = send(&polar::order_invoice(api, token, &order.id))
+            .await
+            .ok()?;
+        polar::invoice_url(&answer).ok()
+    });
+    let links = futures_util::future::join_all(links).await;
+    let invoices = orders
+        .into_iter()
+        .zip(links)
+        .map(|(order, url)| billing::Invoice::of(order, url))
+        .collect();
+    (card, invoices)
 }
 
 /// The body of `PUT .../billing/cap`.

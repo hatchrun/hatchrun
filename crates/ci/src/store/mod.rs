@@ -32,8 +32,8 @@ pub use self::artifacts::{
 };
 pub use self::audit::{Action, AuditRow, NewAudit, audit_page, record_audit};
 pub use self::billing::{
-    Standing, UnsentUsage, set_spend_cap, standing, tenant_standing, unsent_usage, usage_rejected,
-    usage_sent,
+    DayUsage, Standing, UnsentUsage, daily_usage, set_spend_cap, standing, tenant_standing,
+    unsent_usage, usage_rejected, usage_sent,
 };
 pub use self::cache::{
     CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, drop_pending_cache_entry,

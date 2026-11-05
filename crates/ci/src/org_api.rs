@@ -578,7 +578,7 @@ async fn setup_done(cx: &Cx<'_>, org: &str) -> Done {
     let Some(standing) = standing else {
         return refuse(404, "not found");
     };
-    let bill = billing::view(&standing);
+    let cap_dollars = standing.cap_micros / 1_000_000;
     let first_run = row
         .first_run_id
         .zip(row.first_run_repository)
@@ -596,7 +596,7 @@ async fn setup_done(cx: &Cx<'_>, org: &str) -> Done {
         },
         "enabled": { "all": row.all_repos, "count": count },
         "first_run": first_run,
-        "billing": { "card": bill.card, "cap_dollars": bill.cap_dollars },
+        "billing": { "card": standing.card, "cap_dollars": cap_dollars },
     });
     Ok(reply(200, &body)?)
 }

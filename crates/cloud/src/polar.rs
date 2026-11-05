@@ -197,6 +197,123 @@ pub fn portal_url(response: &Response) -> Result<String, String> {
     decode::<SessionAnswer>(response, "customer session").map(|answer| answer.customer_portal_url)
 }
 
+/// The payment methods of the customer of `tenant`.
+#[must_use]
+pub fn payment_methods(api: &str, token: &str, tenant: &str) -> Request {
+    call(
+        "GET",
+        format!("{api}/v1/customers/external/{tenant}/payment-methods"),
+        token,
+    )
+}
+
+/// The card a customer pays with.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct Card {
+    /// `visa`, `mastercard` and so on.
+    pub brand: String,
+    /// The last four digits.
+    pub last4: String,
+    /// The month it expires, 1 to 12.
+    pub exp_month: u32,
+    /// The year it expires.
+    pub exp_year: u32,
+}
+
+/// The customer's default card, or the first one when none is marked,
+/// `None` when they pay another way or have none.
+///
+/// # Errors
+///
+/// Polar's answer when it is not a list of payment methods.
+pub fn default_card(response: &Response) -> Result<Option<Card>, String> {
+    #[derive(Deserialize)]
+    struct Method {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        is_default: bool,
+        method_metadata: Option<Card>,
+    }
+    #[derive(Deserialize)]
+    struct List {
+        items: Vec<Method>,
+    }
+    let list: List = decode(response, "payment methods")?;
+    let mut cards: Vec<Method> = list
+        .items
+        .into_iter()
+        .filter(|method| method.kind == "card" && method.method_metadata.is_some())
+        .collect();
+    let at = cards
+        .iter()
+        .position(|method| method.is_default)
+        .unwrap_or(0);
+    Ok((!cards.is_empty())
+        .then(|| cards.swap_remove(at).method_metadata)
+        .flatten())
+}
+
+/// The newest `limit` orders of the customer of `tenant`.
+#[must_use]
+pub fn orders(api: &str, token: &str, tenant: &str, limit: u32) -> Request {
+    call(
+        "GET",
+        format!("{api}/v1/orders/?external_customer_id={tenant}&limit={limit}&sorting=-created_at"),
+        token,
+    )
+}
+
+/// An order, as the billing page lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct Order {
+    /// Polar's id of the order.
+    pub id: String,
+    /// When it was made, an RFC 3339 time.
+    #[serde(rename = "created_at")]
+    pub date: String,
+    /// What it comes to with tax, in cents.
+    #[serde(rename = "total_amount")]
+    pub amount_cents: i64,
+    /// `pending`, `paid`, `refunded` and so on.
+    pub status: String,
+    /// Whether Polar has an invoice for it.
+    #[serde(default)]
+    pub is_invoice_generated: bool,
+}
+
+/// The orders in Polar's answer, in its order.
+///
+/// # Errors
+///
+/// Polar's answer when it is not a list of orders.
+pub fn order_list(response: &Response) -> Result<Vec<Order>, String> {
+    #[derive(Deserialize)]
+    struct List {
+        items: Vec<Order>,
+    }
+    decode::<List>(response, "orders").map(|list| list.items)
+}
+
+/// The invoice of order `id`.
+#[must_use]
+pub fn order_invoice(api: &str, token: &str, id: &str) -> Request {
+    call("GET", format!("{api}/v1/orders/{id}/invoice"), token)
+}
+
+/// The URL of an invoice.
+///
+/// # Errors
+///
+/// Polar's answer when it is not an invoice.
+pub fn invoice_url(response: &Response) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Invoice {
+        url: String,
+    }
+    decode::<Invoice>(response, "invoice").map(|invoice| invoice.url)
+}
+
 /// The keys a webhook secret may sign with. Standard Webhooks secrets
 /// are `whsec_` and base64 of the key; Polar signed with the UTF-8
 /// bytes of the whole string until 8 September 2026, as endpoints made
@@ -535,6 +652,54 @@ mod tests {
             .unwrap_err(),
             "customer session: Polar answered 404: {}"
         );
+    }
+
+    fn json(status: u16, body: &str) -> Response {
+        Response {
+            headers: Vec::new(),
+            status,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn reads_the_default_card() {
+        let body = r#"{"items":[
+            {"type":"generic","method_metadata":null},
+            {"type":"card","is_default":false,"method_metadata":
+              {"brand":"visa","last4":"1111","exp_month":1,"exp_year":2030}},
+            {"type":"card","is_default":true,"method_metadata":
+              {"brand":"mastercard","last4":"4444","exp_month":12,"exp_year":2031,"wallet":null}}],
+            "pagination":{}}"#;
+        let card = default_card(&json(200, body)).unwrap().unwrap();
+        assert_eq!(
+            (card.brand.as_str(), card.last4.as_str()),
+            ("mastercard", "4444")
+        );
+        assert_eq!((card.exp_month, card.exp_year), (12, 2031));
+        assert_eq!(default_card(&json(200, r#"{"items":[]}"#)), Ok(None));
+        assert!(default_card(&json(404, "{}")).is_err());
+    }
+
+    #[test]
+    fn reads_orders_and_invoices() {
+        let body = r#"{"items":[{"id":"o1","created_at":"2026-11-01T00:00:00Z",
+            "total_amount":1250,"status":"paid","is_invoice_generated":true,"x":1}]}"#;
+        let orders = order_list(&json(200, body)).unwrap();
+        assert_eq!(orders[0].amount_cents, 1250);
+        assert_eq!(orders[0].date, "2026-11-01T00:00:00Z");
+        assert!(orders[0].is_invoice_generated);
+        assert_eq!(
+            invoice_url(&json(200, r#"{"url":"https://x/i.pdf"}"#)).unwrap(),
+            "https://x/i.pdf"
+        );
+        let request = orders_request();
+        assert!(request.url.contains("external_customer_id=t1&limit=12"));
+        assert_eq!(request.method, "GET");
+    }
+
+    fn orders_request() -> Request {
+        orders(API, "tok", "t1", 12)
     }
 
     #[test]
