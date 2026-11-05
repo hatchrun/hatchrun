@@ -71,7 +71,7 @@ export function App() {
       <OrgRoute session={session} route={route} />
     ) : (
       <Shell user={null} publicRepo={`${route.org}/${route.repo}`}>
-        <CiRun session={null} route={{ org: route.org, repo: route.repo, run: route.run, job: route.job }} />
+        <CiRun session={null} role={null} route={{ org: route.org, repo: route.repo, run: route.run, job: route.job }} />
       </Shell>
     );
   }
@@ -107,7 +107,7 @@ function OrgRoute({ session, route }: { session: Session; route: OrgRoute }) {
   if (publicRun && tenant.state === "error" && tenant.error instanceof ApiError && [403, 404].includes(tenant.error.status)) {
     return (
       <Shell user={user} publicRepo={`${route.org}/${route.repo}`}>
-        <CiRun session={session} route={{ org: route.org, repo: route.repo ?? "", run: route.run ?? "", job: route.job }} />
+        <CiRun session={session} role={null} route={{ org: route.org, repo: route.repo ?? "", run: route.run ?? "", job: route.job }} />
       </Shell>
     );
   }
@@ -139,7 +139,7 @@ function OrgPage({ session, tenant, route }: { session: Session; tenant: Tenant;
     case "billing":
       return <Billing {...props} />;
     case "run":
-      return <CiRun session={session} route={{ org: route.org, repo: route.repo ?? "", run: route.run ?? "", job: route.job }} />;
+      return <CiRun session={session} role={tenant.role} route={{ org: route.org, repo: route.repo ?? "", run: route.run ?? "", job: route.job }} />;
   }
 }
 

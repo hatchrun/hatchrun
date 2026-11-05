@@ -17,4 +17,6 @@ export interface OrgPageProps {
 export interface RunPageProps {
   session: Session | null;
   route: CiRoute;
+  /** The viewer's role in the organization; null outside it. */
+  role: Tenant["role"] | null;
 }

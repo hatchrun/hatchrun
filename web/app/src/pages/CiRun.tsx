@@ -36,7 +36,9 @@ const REFRESH_MS = 5000;
 
 /** The viewer the API turned away: signed out and not allowed to see this. */
 const turnedAway = (error: Error, session: Session | null) =>
-  session === null && error instanceof ApiError && (error.status === 401 || error.status === 404);
+  session === null &&
+  error instanceof ApiError &&
+  (error.status === 401 || error.status === 404);
 
 /** Reads again every few seconds while `active`. */
 function useRefresh(active: boolean, reload: () => void) {
@@ -54,22 +56,44 @@ function useRefresh(active: boolean, reload: () => void) {
  * (`.../jobs/:job`): the approval card, the jobs of the run on the
  * left, one job's log on the right.
  */
-export function CiRun({ session, route }: RunPageProps) {
+export function CiRun({ session, role, route }: RunPageProps) {
   const location = useLocation();
   const [detail, reload] = useLoad(() => getCiRun(route.run), route.run, true);
   const quiet = useCallback(() => reload(), [reload]);
-  useRefresh(detail.state === "ready" && detail.data.jobs.some((job) => job.status !== "completed"), quiet);
+  useRefresh(
+    detail.state === "ready" &&
+      (detail.data.run.status !== "completed" ||
+        detail.data.jobs.some((job) => job.status !== "completed")),
+    quiet,
+  );
 
   if (detail.state === "error" && turnedAway(detail.error, session)) {
     return <SignIn returnTo={location} />;
   }
-  if (detail.state === "error" && detail.error instanceof ApiError && detail.error.status === 404) {
-    return <LoadError error={new Error("Not found, or you cannot read this repository.")} />;
+  if (
+    detail.state === "error" &&
+    detail.error instanceof ApiError &&
+    detail.error.status === 404
+  ) {
+    return (
+      <LoadError
+        error={new Error("Not found, or you cannot read this repository.")}
+      />
+    );
   }
   return (
     <div className="mx-auto flex w-full max-w-[1400px] flex-col gap-4">
       <Await loaded={detail} retry={reload}>
-        {(data) => <RunScreen route={route} data={data} stale={detail.state === "ready" ? detail.stale : undefined} session={session} reload={reload} />}
+        {(data) => (
+          <RunScreen
+            route={route}
+            data={data}
+            stale={detail.state === "ready" ? detail.stale : undefined}
+            session={session}
+            role={role}
+            reload={reload}
+          />
+        )}
       </Await>
     </div>
   );
@@ -80,8 +104,13 @@ function chosen(jobs: CiJob[], id: string | null): CiJob | undefined {
   if (id !== null) {
     return jobs.find((job) => String(job.id) === id);
   }
-  const by = (status: ReturnType<typeof ciStatus>) => jobs.find((job) => ciStatus(job.status, job.conclusion, job.held) === status);
-  return by("failed") ?? by("running") ?? jobs.find((job) => job.has_log) ?? jobs[0];
+  const by = (status: ReturnType<typeof ciStatus>) =>
+    jobs.find(
+      (job) => ciStatus(job.status, job.conclusion, job.held) === status,
+    );
+  return (
+    by("failed") ?? by("running") ?? jobs.find((job) => job.has_log) ?? jobs[0]
+  );
 }
 
 function RunScreen({
@@ -89,12 +118,14 @@ function RunScreen({
   data,
   stale,
   session,
+  role,
   reload,
 }: {
   route: CiRoute;
   data: CiRunDetail;
   stale: Error | undefined;
   session: Session | null;
+  role: RunPageProps["role"];
   reload: () => void;
 }) {
   const { run, jobs } = data;
@@ -109,16 +140,32 @@ function RunScreen({
           Could not refresh: {stale.message}. Showing the last result.
         </p>
       )}
-      <ApprovalCard run={run} jobs={jobs} session={session} reload={reload} />
+      <ApprovalCard
+        run={run}
+        jobs={jobs}
+        session={session}
+        role={role}
+        reload={reload}
+      />
       <div className="flex h-[calc(100dvh-9rem)] min-h-[520px] gap-4 max-lg:h-auto max-lg:flex-col">
-        <JobsPanel run={run} jobs={jobs} selected={job?.id ?? null} now={now} />
+        <JobsPanel
+          key={run.id}
+          run={run}
+          jobs={jobs}
+          selected={job?.id ?? null}
+          now={now}
+        />
         <div className="flex min-h-0 min-w-0 flex-1 flex-col max-lg:h-[70vh]">
           {job === undefined ? (
             <p className="muted">This run has no such job.</p>
           ) : job.has_log || job.status !== "queued" ? (
             <JobLog key={job.id} job={job} onCheck={reload} />
           ) : (
-            <p className="font-mono text-[13px] text-fg-3">{job.held ? "This job waits for approval." : "This job has not started."}</p>
+            <p className="font-mono text-[13px] text-fg-3">
+              {job.held
+                ? "This job waits for approval."
+                : "This job has not started."}
+            </p>
           )}
         </div>
       </div>
@@ -127,30 +174,55 @@ function RunScreen({
   );
 }
 
-function Crumbs({ route, run, job }: { route: CiRoute; run: Run; job: CiJob | undefined }) {
+function Crumbs({
+  route,
+  run,
+  job,
+}: {
+  route: CiRoute;
+  run: Run;
+  job: CiJob | undefined;
+}) {
   const sep = (
     <span aria-hidden="true" className="text-control">
       /
     </span>
   );
   return (
-    <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-2 font-mono text-[13px] text-fg-3">
-      <Link href={orgUrl(route.org)} className="inline-flex items-center gap-1 text-fg hover:text-brand">
+    <nav
+      aria-label="Breadcrumb"
+      className="flex min-w-0 items-center gap-2 font-mono text-[13px] text-fg-3"
+    >
+      <Link
+        href={orgUrl(route.org)}
+        className="inline-flex items-center gap-1 text-fg hover:text-brand"
+      >
         <ChevronLeft size={12} aria-hidden="true" className="text-brand" />
         Runs
       </Link>
       {sep}
-      <Link href={repoRunsUrl(run.repository)} title={run.repository} className="min-w-0 truncate underline decoration-control underline-offset-4 hover:text-fg">
+      <Link
+        href={repoRunsUrl(run.repository)}
+        title={run.repository}
+        className="min-w-0 truncate underline decoration-control underline-offset-4 hover:text-fg"
+      >
         {run.repository}
       </Link>
       {sep}
-      <Link href={runUrl(run.repository, run.id)} className="underline decoration-control underline-offset-4 hover:text-fg">
+      <Link
+        href={runUrl(run.repository, run.id)}
+        className="underline decoration-control underline-offset-4 hover:text-fg"
+      >
         #{run.run_number}
       </Link>
       {job && (
         <>
           {sep}
-          <span aria-current="page" title={job.name} className="min-w-0 truncate text-fg">
+          <span
+            aria-current="page"
+            title={job.name}
+            className="min-w-0 truncate text-fg"
+          >
             {job.name}
           </span>
         </>
@@ -159,7 +231,17 @@ function Crumbs({ route, run, job }: { route: CiRoute; run: Run; job: CiJob | un
   );
 }
 
-function Header({ run, session, now, reload }: { run: Run; session: Session | null; now: number; reload: () => void }) {
+function Header({
+  run,
+  session,
+  now,
+  reload,
+}: {
+  run: Run;
+  session: Session | null;
+  now: number;
+  reload: () => void;
+}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const finished = run.status === "completed";
@@ -167,7 +249,11 @@ function Header({ run, session, now, reload }: { run: Run; session: Session | nu
   const branch = run.branch ?? shortRef(run.ref);
 
   const cancel = async () => {
-    if (!window.confirm(`Cancel run #${run.run_number}? Jobs that are running stop.`)) {
+    if (
+      !window.confirm(
+        `Cancel run #${run.run_number}? Jobs that are running stop.`,
+      )
+    ) {
       return;
     }
     setBusy(true);
@@ -185,11 +271,19 @@ function Header({ run, session, now, reload }: { run: Run; session: Session | nu
   return (
     <div className="flex flex-wrap items-start justify-between gap-4">
       <div className="flex min-w-0 flex-col gap-2">
-        <StatusPill status={ciStatus(run.status, run.conclusion)} className="self-start">
-          <span className="font-normal text-fg-2">{finished ? `took ${took}` : `for ${took}`}</span>
+        <StatusPill
+          status={ciStatus(run.status, run.conclusion)}
+          className="self-start"
+        >
+          <span className="font-normal text-fg-2">
+            {finished ? `took ${took}` : `for ${took}`}
+          </span>
         </StatusPill>
         <h1 className="page-title break-words" title={run.workflow}>
-          {run.workflow} <span className="font-mono text-xl font-medium tracking-normal text-fg-3 normal-case [font-stretch:100%]">#{run.run_number}</span>
+          {run.workflow}{" "}
+          <span className="font-mono text-xl font-medium tracking-normal text-fg-3 normal-case [font-stretch:100%]">
+            #{run.run_number}
+          </span>
         </h1>
         <div className="flex flex-wrap items-center gap-x-5 gap-y-1 font-mono text-[13px]">
           <span className="flex min-w-0 items-center gap-2">
@@ -204,7 +298,11 @@ function Header({ run, session, now, reload }: { run: Run; session: Session | nu
               className="inline-flex items-center gap-1.5 text-fg underline decoration-control underline-offset-4 hover:text-brand"
             >
               {shortSha(run.sha)}
-              <ExternalLink size={10} aria-hidden="true" className="text-fg-3" />
+              <ExternalLink
+                size={10}
+                aria-hidden="true"
+                className="text-fg-3"
+              />
             </a>
           </span>
           <span className="flex items-center gap-2">
@@ -230,12 +328,20 @@ function Header({ run, session, now, reload }: { run: Run; session: Session | nu
       </div>
       <div className="flex items-center gap-2">
         {session && !finished && (
-          <button type="button" className={BTN} disabled={busy} onClick={() => void cancel()}>
+          <button
+            type="button"
+            className={BTN}
+            disabled={busy}
+            onClick={() => void cancel()}
+          >
             Cancel run
           </button>
         )}
         <span className="inline-flex items-center gap-1 font-mono text-[13px] text-fg-3">
-          <CopyButton text={window.location.href.split("#")[0] ?? ""} label="Copy the link to this run" />
+          <CopyButton
+            text={window.location.href.split("#")[0] ?? ""}
+            label="Copy the link to this run"
+          />
           Copy link
         </span>
       </div>
@@ -245,11 +351,28 @@ function Header({ run, session, now, reload }: { run: Run; session: Session | nu
 
 /** The artifacts the run's jobs uploaded, each a download. Nothing shows while there are none. */
 function Artifacts({ run }: { run: Run }) {
-  const [loaded, reload] = useLoad(() => listCiArtifacts(run.id), `${run.id}:${run.status}`, true);
+  const [loaded, reload] = useLoad(
+    () => listCiArtifacts(run.id),
+    `${run.id}:${run.status}`,
+    true,
+  );
   // Jobs upload while the run goes; read again until it ends.
   useRefresh(run.status !== "completed", reload);
-  if (loaded.state === "loading") {
-    return null;
+  if (loaded.state === "error") {
+    return (
+      <section aria-label="Artifacts" className="flex flex-col gap-2">
+        <h2 className="text-base font-semibold">Artifacts</h2>
+        <p
+          role="alert"
+          className="flex flex-wrap items-center gap-3 font-mono text-[13px] text-failed"
+        >
+          Could not load artifacts: {loaded.error.message}
+          <button type="button" className={BTN} onClick={reload}>
+            Retry
+          </button>
+        </p>
+      </section>
+    );
   }
   if (loaded.state !== "ready" || loaded.data.artifacts.length === 0) {
     return null;
@@ -259,12 +382,19 @@ function Artifacts({ run }: { run: Run }) {
       <h2 className="text-base font-semibold">Artifacts</h2>
       <ul className="divide-y divide-rule overflow-hidden rounded-md border border-rule bg-panel">
         {loaded.data.artifacts.map((artifact) => (
-          <li key={artifact.id} className="flex items-center justify-between gap-3 px-3 py-2 font-mono text-[13px]">
-            <a href={ciArtifactUrl(run.id, artifact.id)} className="min-w-0 truncate font-bold text-fg hover:text-brand">
+          <li
+            key={artifact.id}
+            className="flex items-center justify-between gap-3 px-3 py-2 font-mono text-[13px]"
+          >
+            <a
+              href={ciArtifactUrl(run.id, artifact.id)}
+              className="min-w-0 truncate font-bold text-fg hover:text-brand"
+            >
               {artifact.name}
             </a>
             <span className="shrink-0 text-fg-3">
-              {bytes(artifact.size)} · expires {new Date(artifact.expires_at).toLocaleDateString()}
+              {bytes(artifact.size)} · expires{" "}
+              {new Date(artifact.expires_at).toLocaleDateString()}
             </span>
           </li>
         ))}
