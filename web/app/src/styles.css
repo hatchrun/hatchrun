@@ -5,27 +5,26 @@
  */
 
 :root {
-  /* Incubator palette on dark, from hatchrun/brand colors/tokens.json.
-     The tokens shadcn reads live in index.css. */
-  --app-bg: #141517; /* graphite */
-  --app-surface: #1a1c1f; /* panel */
-  --app-surface-2: #1e2023; /* housing */
-  --app-border: #34373c; /* rivet */
-  --app-border-strong: #5e636a;
-  --app-text: #ece6d6; /* bone */
-  --app-muted: #9a9fa6; /* fog */
-  --app-accent: #ffcf33; /* chick */
+  /* Legacy classes below read these; they alias the v2 tokens of index.css. */
+  --app-bg: var(--background);
+  --app-surface: var(--panel);
+  --app-surface-2: var(--raised);
+  --app-border: var(--rule);
+  --app-border-strong: var(--control);
+  --app-text: var(--fg);
+  --app-muted: var(--fg-3);
+  --app-accent: var(--brand);
   --app-accent-ink: #141517;
-  --app-accent-strong: #ffcf33;
-  --app-accent-soft: #423c26;
-  --app-primary: #ece6d6;
+  --app-accent-strong: var(--brand);
+  --app-accent-soft: rgb(232 190 63 / 12%);
+  --app-primary: var(--brand);
   --app-primary-ink: #141517;
-  --app-success: #40ff80; /* passed */
+  --app-success: var(--passed);
   --app-success-ink: #141517;
-  --app-success-soft: #233f30;
-  --app-danger: #f06aa8; /* failed, lifted to 4.5:1 on dark panels */
-  --app-danger-soft: #3e2434;
-  --app-focus: #ffcf33;
+  --app-success-soft: rgb(111 200 145 / 12%);
+  --app-danger: var(--failed);
+  --app-danger-soft: rgb(224 122 168 / 12%);
+  --app-focus: var(--brand);
   --app-shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 4px 16px rgb(0 0 0 / 30%);
   --app-radius: 4px;
   --app-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -825,7 +824,7 @@ select.input {
 }
 
 .step-summary code {
-  font-size: 0.82em;
+  font-size: 0.75rem;
 }
 
 /* Panels and tables */
@@ -1248,15 +1247,15 @@ fieldset.field {
 .ansi-dim { opacity: 0.7; }
 .ansi-italic { font-style: italic; }
 .ansi-underline { text-decoration: underline; }
-.ansi-fg-30, .ansi-fg-90 { color: #7d828a; }
-.ansi-fg-31, .ansi-fg-91 { color: #f06aa8; }
-.ansi-fg-32, .ansi-fg-92 { color: #40ff80; }
-.ansi-fg-33, .ansi-fg-93 { color: #ffcf33; }
+.ansi-fg-30, .ansi-fg-90 { color: #8a8f96; }
+.ansi-fg-31, .ansi-fg-91 { color: #e07aa8; }
+.ansi-fg-32, .ansi-fg-92 { color: #6fc891; }
+.ansi-fg-33, .ansi-fg-93 { color: #d9b65a; }
 .ansi-fg-34, .ansi-fg-94 { color: #6aa8f0; }
 .ansi-fg-35, .ansi-fg-95 { color: #c58af0; }
 .ansi-fg-36, .ansi-fg-96 { color: #5fd7d7; }
-.ansi-fg-37, .ansi-fg-97 { color: #ece6d6; }
-.ansi-bg-40, .ansi-bg-100 { background: #34373c; }
+.ansi-fg-37, .ansi-fg-97 { color: #e3ded3; }
+.ansi-bg-40, .ansi-bg-100 { background: #3a3d42; }
 .ansi-bg-41, .ansi-bg-101 { background: #5a2540; }
 .ansi-bg-42, .ansi-bg-102 { background: #1f4a31; }
 .ansi-bg-43, .ansi-bg-103 { background: #554a1c; }

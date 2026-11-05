@@ -19,45 +19,76 @@
 @import "./styles.css" layer(legacy);
 
 :root {
-  /* Incubator palette, from hatchrun/brand colors/tokens.json. */
-  --graphite: #141517;
+  /*
+   * Tokens v2 (design 2026-11-unified-console/Tokens.dc.html). The brand
+   * palette stays on the website and logo; the app uses this dimmed set.
+   *
+   * Grounds: background < panel < raised; rule divides inside panels,
+   * control borders inputs and buttons.
+   * Text: fg, fg-2, fg-3. Nothing dimmer is used for text.
+   * brand is the yellow accent. Use it only for the current page, the
+   * primary button, the focus ring and the selected list item.
+   * Status colours always come with their glyph (see StatusPill).
+   */
+  --background: #141517;
   --panel: #1a1c1f;
-  --housing: #1e2023;
-  --seam: #26282c;
-  --rivet: #34373c;
-  --steel: #5e636a;
-  --fog: #9a9fa6;
-  --bone-dim: #c9c3b4;
-  --bone: #ece6d6;
-  --chick: #ffcf33;
-  --heat: #ff6a13;
-  --blush: #ff9466;
-  --ember: #6a3010;
-  --passed: #40ff80;
-  --failed: #e6398f;
-  --failed-soft: #f7a8cf;
+  --raised: #202226;
+  --rule: #2a2d31;
+  --control: #3a3d42;
+  --fg: #e3ded3;
+  --fg-2: #b4b0a7;
+  --fg-3: #8a8f96;
+  --brand: #e8be3f;
+  --brand-hover: #f0c94f;
+  --passed: #6fc891;
+  --running: #e8895a;
+  --failed: #e07aa8;
+  --failed-soft: #f0b3ce;
+  --waiting: #d9b65a;
+  --queued: #8a8f96;
 
-  --background: var(--graphite);
-  --foreground: var(--bone);
+  --foreground: var(--fg);
   --card: var(--panel);
-  --card-foreground: var(--bone);
-  --popover: var(--housing);
-  --popover-foreground: var(--bone);
-  --primary: var(--chick);
-  --primary-foreground: var(--graphite);
-  --secondary: var(--housing);
-  --secondary-foreground: var(--bone);
-  --muted: var(--housing);
-  --muted-foreground: var(--fog);
-  --accent: var(--seam);
-  --accent-foreground: var(--bone);
+  --card-foreground: var(--fg);
+  --popover: var(--raised);
+  --popover-foreground: var(--fg);
+  --primary: var(--brand);
+  --primary-foreground: #141517;
+  --secondary: var(--raised);
+  --secondary-foreground: var(--fg);
+  --muted: var(--raised);
+  --muted-foreground: var(--fg-3);
+  --accent: var(--raised);
+  --accent-foreground: var(--fg);
   --destructive: var(--failed);
-  --border: var(--rivet);
-  --input: var(--rivet);
-  --ring: var(--chick);
+  --border: var(--control);
+  --input: var(--control);
+  --ring: var(--brand);
   --radius: 4px;
 
   color-scheme: dark;
+}
+
+/* Light theme from the profile menu: the same roles, inverted grounds. */
+:root[data-theme="light"] {
+  --background: #f6f4ee;
+  --panel: #ffffff;
+  --raised: #ece8de;
+  --rule: #dcd7ca;
+  --control: #b9b3a3;
+  --fg: #1d1e20;
+  --fg-2: #46484c;
+  --fg-3: #5c6066;
+  --brand: #b8860b;
+  --brand-hover: #a6790a;
+  --passed: #1f7a45;
+  --running: #b4501f;
+  --failed: #b42361;
+  --failed-soft: #8c1d4d;
+  --waiting: #8a6a0a;
+  --queued: #5c6066;
+  --primary-foreground: #ffffff;
+  color-scheme: light;
 }
 
 @theme inline {
@@ -83,22 +114,21 @@
   --color-input: var(--input);
   --color-ring: var(--ring);
 
-  --color-graphite: var(--graphite);
   --color-panel: var(--panel);
-  --color-housing: var(--housing);
-  --color-seam: var(--seam);
-  --color-rivet: var(--rivet);
-  --color-steel: var(--steel);
-  --color-fog: var(--fog);
-  --color-bone-dim: var(--bone-dim);
-  --color-bone: var(--bone);
-  --color-chick: var(--chick);
-  --color-heat: var(--heat);
-  --color-blush: var(--blush);
-  --color-ember: var(--ember);
+  --color-raised: var(--raised);
+  --color-rule: var(--rule);
+  --color-control: var(--control);
+  --color-fg: var(--fg);
+  --color-fg-2: var(--fg-2);
+  --color-fg-3: var(--fg-3);
+  --color-brand: var(--brand);
+  --color-brand-hover: var(--brand-hover);
   --color-passed: var(--passed);
+  --color-running: var(--running);
   --color-failed: var(--failed);
   --color-failed-soft: var(--failed-soft);
+  --color-waiting: var(--waiting);
+  --color-queued: var(--queued);
 
   --radius-xs: 2px;
   --radius-sm: 3px;
@@ -114,39 +144,63 @@
   body {
     @apply bg-background font-sans text-foreground;
     font-size: 14px;
-    line-height: 1.5;
+    line-height: 20px;
+    font-variant-numeric: tabular-nums;
     -webkit-font-smoothing: antialiased;
   }
 
   :focus-visible {
-    outline: 2px solid var(--chick);
+    outline: 2px solid var(--brand);
     outline-offset: 2px;
   }
 }
 
-/* A mono caption: column heads, panel labels. */
+/* A mono label: column heads, panel labels. 12px, 0.04em. */
 @utility cap {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 400;
-  line-height: 1.5;
+  line-height: 16px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--fog);
+  letter-spacing: 0.04em;
+  color: var(--fg-3);
 }
 
-/* Archivo at its widest, as the brand sets titles. */
-@utility display {
-  font-weight: 900;
+/* The 24px page title: Archivo wide, uppercase. Nothing else uses it. */
+@utility page-title {
+  font-size: 24px;
+  font-weight: 800;
   font-stretch: 125%;
   text-transform: uppercase;
-  line-height: 1;
-  letter-spacing: -0.01em;
+  line-height: 28px;
+  letter-spacing: 0.01em;
+}
+
+/* Section title: 16px 600, sentence case. */
+@utility section-title {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 24px;
+}
+
+/* Meta and helper text: 13px, text-3. */
+@utility meta {
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--fg-3);
+}
+
+/* Mono ids, SHAs, durations: 13px with tabular numbers. */
+@utility mono-id {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* A link whose text is underlined quietly until hovered. */
 @utility quiet-underline {
   text-decoration: underline;
-  text-decoration-color: var(--rivet);
+  text-decoration-color: var(--control);
   text-underline-offset: 3px;
 }
