@@ -17,6 +17,7 @@ import { Repos } from "./pages/Repos";
 import { Runs } from "./pages/Runs";
 import { Secrets } from "./pages/Secrets";
 import { Audit } from "./pages/Audit";
+import { Profile } from "./pages/Profile";
 import { Setup } from "./pages/Setup";
 import { SignIn } from "./pages/SignIn";
 import { legacyCiRedirect, matchOrg, navigate, useLocation, type OrgRoute } from "./router";
@@ -85,7 +86,7 @@ export function App() {
   return (
     <Shell user={session.user}>
       <div className="mx-auto w-full max-w-[1080px] pt-3">
-        {path === "/new" ? <Home stay /> : path === "/" ? <Home /> : <NotFound />}
+        {path === "/new" ? <Home stay /> : path === "/" ? <Home /> : path === "/profile" ? <Profile user={session.user} /> : <NotFound />}
       </div>
     </Shell>
   );

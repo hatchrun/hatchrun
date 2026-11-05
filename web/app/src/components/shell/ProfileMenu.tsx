@@ -11,6 +11,7 @@ import {
   ExternalLink,
   Keyboard,
   LogOut,
+  UserRound,
   Sparkles,
   Terminal,
 } from "lucide-react";
@@ -20,6 +21,7 @@ import { useState, type ReactNode } from "react";
 import { ApiError, signOut, type User } from "@/api";
 import { THEMES, setTheme, useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
+import { Link } from "@/router";
 import { NAV_ITEM } from "./Sidebar";
 
 export const CLI_INSTALL = "brew install hatchrun/tap/hatchrun";
@@ -133,6 +135,11 @@ export function ProfileMenu({
           </div>
 
           <Menu.Group className={GROUP}>
+            <Menu.Item asChild className={ITEM}>
+              <Link href="/profile">
+                <Row icon={<UserRound {...icon} />}>Your profile</Row>
+              </Link>
+            </Menu.Item>
             <Menu.Item className={ITEM} onSelect={onShortcuts}>
               <Row icon={<Keyboard {...icon} />} trailing={<Kbd>?</Kbd>}>
                 Keyboard shortcuts
