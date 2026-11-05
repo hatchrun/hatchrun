@@ -42,7 +42,7 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
   const secret = kind === "secrets";
   const noun = secret ? "secret" : "variable";
   const [rows, reload] = useLoad<Row[]>(
-    () => (secret ? listCiSecrets(scope) : listCiVars(scope)),
+    async () => (await (secret ? listCiSecrets(scope, { limit: 100 }) : listCiVars(scope, { limit: 100 }))).items,
     `${scopeKey(scope)}/${kind}`,
   );
   const orgScope = "org" in scope ? scope.org : null;
@@ -113,13 +113,13 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
   const id = `${kind}-${scopeKey(scope)}`;
   return (
     <section aria-label={secret ? "Secrets" : "Variables"} className="flex flex-col gap-3">
-      <h2 className="display text-xl">{secret ? "Secrets" : "Variables"}</h2>
+      <h2 className="section-title">{secret ? "Secrets" : "Variables"}</h2>
       <Await loaded={rows} retry={reload}>
         {(list) =>
           list.length === 0 ? (
             <p className="muted">No {secret ? "secrets" : "variables"} yet.</p>
           ) : (
-            <div className="overflow-x-auto rounded-md border border-rivet">
+            <div className="overflow-x-auto rounded-md border border-control">
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -142,7 +142,7 @@ export function SecretsTable({ scope, kind }: { scope: CiScope; kind: CiItemKind
                           {row.repositories === null ? "All" : `${row.repositories.length} selected`}
                         </TableCell>
                       )}
-                      <TableCell className="font-mono text-xs text-fog" title={new Date(row.updatedAt).toLocaleString()}>
+                      <TableCell className="font-mono text-xs text-fg-3" title={new Date(row.updatedAt).toLocaleString()}>
                         {new Date(row.updatedAt).toLocaleDateString()}
                       </TableCell>
                       <TableCell className="text-right whitespace-nowrap">

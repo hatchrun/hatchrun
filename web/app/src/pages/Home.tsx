@@ -140,18 +140,18 @@ function Install({ installUrl }: { installUrl: string }) {
       </div>
       <h1>Add hatchrun to your GitHub organization</h1>
       <p className="muted">
-        Start by installing the hatchrun app. GitHub asks which organization, then brings you back
-        here to connect AWS. Runners launch once you add a card.
+        Install the hatchrun app. GitHub asks which organization, then brings you back here. Jobs
+        from <code>.hatchrun/config.yml</code> run on hatchrun machines once you add a card.
       </p>
       <ul className="card start-points">
         <li>
           <CheckIcon />
-          <span>Jobs that ask for a hatchrun runner get a fresh EC2 instance in your AWS account.</span>
+          <span>Jobs run on hatchrun machines with live logs, secrets, variables and environments.</span>
         </li>
         <li>
           <CheckIcon />
           <span>
-            hatchrun registers runners and watches job events. It <strong>can't read your code</strong>.
+            hatchrun reads repository events and writes check runs. It <strong>can't read your code</strong>.
           </span>
         </li>
         <li>

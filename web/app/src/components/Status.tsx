@@ -45,7 +45,7 @@ export function Await<T>({
   return (
     <>
       {loaded.stale && (
-        <p className="font-mono text-xs text-fog" role="status">
+        <p className="font-mono text-xs text-fg-3" role="status">
           Could not refresh: {loaded.stale.message}. Showing the last result.
         </p>
       )}

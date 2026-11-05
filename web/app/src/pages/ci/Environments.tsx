@@ -99,13 +99,13 @@ export function Environments({ owner, repo }: { owner: string; repo: string }) {
   const id = `env-${owner}/${repo}`;
   return (
     <section aria-label="Environments" className="flex flex-col gap-3">
-      <h2 className="display text-xl">Environments</h2>
+      <h2 className="section-title">Environments</h2>
       <Await loaded={rows} retry={reload}>
         {(list) =>
           list.length === 0 ? (
             <p className="muted">No environments yet.</p>
           ) : (
-            <div className="overflow-x-auto rounded-md border border-rivet">
+            <div className="overflow-x-auto rounded-md border border-control">
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -151,8 +151,8 @@ export function Environments({ owner, repo }: { owner: string; repo: string }) {
       </Await>
       {open !== null && (
         // Keyed by the environment so a half-typed secret does not carry over to another one.
-        <div key={open} className="flex flex-col gap-6 rounded-md border border-rivet p-4">
-          <h3 className="display text-lg">
+        <div key={open} className="flex flex-col gap-6 rounded-md border border-control p-4">
+          <h3 className="section-title">
             <span className="font-mono">{open}</span>
           </h3>
           <SecretsTable scope={{ owner, repo, environment: open }} kind="secrets" />

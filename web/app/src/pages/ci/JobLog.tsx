@@ -173,7 +173,7 @@ export function JobLog({ job, onCheck }: { job: CiJob; onCheck: () => void }) {
   const total = log.sections.reduce((sum, section) => sum + section.lines, 0);
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between font-mono text-xs text-fog">
+      <div className="flex items-center justify-between font-mono text-xs text-fg-3">
         <span aria-live="polite">
           {feed === "live" && "Live"}
           {feed === "reconnecting" && "Reconnecting"}
@@ -225,27 +225,27 @@ const StepSection = memo(function StepSection({
       ? "…"
       : null;
   return (
-    <section className="rounded-sm border border-rivet bg-housing">
+    <section className="rounded-sm border border-control bg-raised">
       <button
         type="button"
         aria-expanded={open}
         onClick={() => setChosen(!open)}
-        className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left font-mono text-xs text-bone"
+        className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left font-mono text-xs text-fg"
       >
-        <span aria-hidden="true" className="w-3 text-fog">
+        <span aria-hidden="true" className="w-3 text-fg-3">
           {open ? "▾" : "▸"}
         </span>
         <span
           aria-hidden="true"
-          className={cn("w-3 text-center", failed(section) ? "text-failed" : section.conclusion === "success" ? "text-passed" : "text-fog")}
+          className={cn("w-3 text-center", failed(section) ? "text-failed" : section.conclusion === "success" ? "text-passed" : "text-fg-3")}
         >
           {mark ?? ""}
         </span>
         <span className="min-w-0 flex-1 truncate font-semibold">{section.name}</span>
-        <span className="text-fog">{section.lines} lines</span>
+        <span className="text-fg-3">{section.lines} lines</span>
       </button>
       {open && (
-        <div className="border-t border-rivet">
+        <div className="border-t border-control">
           {hidden > 0 && (
             <button type="button" className="button button-small m-2" onClick={() => setAll(true)}>
               Show {hidden * BLOCK_LINES} earlier lines

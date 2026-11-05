@@ -26,7 +26,7 @@ export function CiSettings({ org }: { org: string }) {
   return (
     <div className="flex flex-col gap-8">
       <section aria-label="Billing" className="flex flex-col gap-3">
-        <h1 className="display text-[26px] leading-[1.05]">CI</h1>
+        <h2 className="section-title">Billing</h2>
         <Await loaded={billing} retry={reload}>
           {(data) => <BillingCard org={org} billing={data} onChange={reload} />}
         </Await>

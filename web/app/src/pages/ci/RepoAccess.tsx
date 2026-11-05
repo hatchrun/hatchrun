@@ -5,21 +5,21 @@
 // Which repositories of an organization may use a secret or variable:
 // all of them (null) or a chosen list of `owner/repo` names.
 
-import { listCiOrgRepos } from "@/api";
+import { listOrgRepos } from "@/api";
 import { Await } from "@/components/Status";
 import { useLoad } from "@/load";
 
 /** The org's repositories as checkboxes. Mounted only while a list is chosen, so the read waits for that. */
 function RepoChecks({ org, value, onChange }: { org: string; value: string[]; onChange: (value: string[]) => void }) {
-  const [repos, reload] = useLoad(() => listCiOrgRepos(org), `${org}/repositories`);
+  const [repos, reload] = useLoad(() => listOrgRepos(org, { limit: 100 }), `${org}/repos`);
   const toggle = (name: string) =>
     onChange(value.includes(name) ? value.filter((seen) => seen !== name) : [...value, name]);
 
   return (
     <Await loaded={repos} retry={reload}>
-      {(list) =>
+      {({ items: list }) =>
         list.length === 0 ? (
-          <p className="muted">No repositories have run CI yet.</p>
+          <p className="muted">No repositories.</p>
         ) : (
           <div className="check-grid">
             {list.map((repo) => (
