@@ -132,6 +132,13 @@ pub enum Trigger {
     Rerequested(Rerequested),
     /// A repository changed visibility, name, owner or default branch.
     Repository(RepositoryChange),
+    /// Repositories were added to or removed from an installation. The
+    /// payload lists no default branches, so the delivery only says to
+    /// read the installation again.
+    InstallationRepositories {
+        /// The installation that changed.
+        installation_id: u64,
+    },
     /// Nothing to do, and why.
     Ignored(String),
 }
@@ -305,10 +312,18 @@ fn ref_change(
 ///
 /// Returns the JSON error when the body is not the payload GitHub sends
 /// for an event this crate uses.
+#[allow(clippy::too_many_lines)] // One arm per event.
 pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
     if !matches!(
         event,
-        "push" | "pull_request" | "check_run" | "repository" | "release" | "create" | "delete"
+        "push"
+            | "pull_request"
+            | "check_run"
+            | "repository"
+            | "release"
+            | "create"
+            | "delete"
+            | "installation_repositories"
     ) {
         return Ok(Trigger::Ignored(format!("{event} events are not used")));
     }
@@ -323,6 +338,7 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
         return Ok(ignored("no App installation"));
     };
     match event {
+        "installation_repositories" => Ok(Trigger::InstallationRepositories { installation_id }),
         "push" => {
             let p = PushBody::deserialize(&payload)?;
             if p.deleted {
@@ -420,6 +436,21 @@ mod tests {
         let mut v: Value = serde_json::from_str(body).unwrap();
         f(&mut v);
         serde_json::to_vec(&v).unwrap()
+    }
+
+    #[test]
+    fn installation_repository_changes_ask_for_a_reread() {
+        let body = br#"{"action":"added","installation":{"id":55},"repositories_added":[]}"#;
+        assert_eq!(
+            parse("installation_repositories", body).unwrap(),
+            Trigger::InstallationRepositories {
+                installation_id: 55
+            }
+        );
+        assert!(matches!(
+            parse("installation_repositories", br#"{"action":"added"}"#).unwrap(),
+            Trigger::Ignored(_)
+        ));
     }
 
     #[test]

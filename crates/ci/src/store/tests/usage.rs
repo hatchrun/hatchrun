@@ -635,7 +635,17 @@ fn runs_page_newest_first() {
         page.iter().map(|r| r.id).collect::<Vec<_>>(),
         [ids[2], ids[1]]
     );
-    let next = db.wait(runs_for_repo(db.db(), 7, Some(ids[1]), 2)).unwrap();
+    let next = db
+        .wait(runs_for_repo(
+            db.db(),
+            7,
+            Some(After {
+                created_at: 1,
+                id: ids[1],
+            }),
+            2,
+        ))
+        .unwrap();
     assert_eq!(next.iter().map(|r| r.id).collect::<Vec<_>>(), [ids[0]]);
 }
 

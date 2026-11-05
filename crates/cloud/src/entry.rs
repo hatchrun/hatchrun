@@ -42,7 +42,14 @@ const CI: &str = "CI";
 fn forwarded(event: &str) -> bool {
     matches!(
         event,
-        "push" | "pull_request" | "check_run" | "repository" | "release" | "create" | "delete"
+        "push"
+            | "pull_request"
+            | "check_run"
+            | "repository"
+            | "release"
+            | "create"
+            | "delete"
+            | "installation_repositories"
     )
 }
 
@@ -265,6 +272,7 @@ mod tests {
         assert!(forwarded("release"));
         assert!(forwarded("create"));
         assert!(forwarded("delete"));
+        assert!(forwarded("installation_repositories"));
         assert!(!forwarded("workflow_job"));
         assert!(!forwarded("installation"));
         assert!(!forwarded(""));

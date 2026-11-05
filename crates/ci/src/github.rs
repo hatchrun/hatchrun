@@ -372,6 +372,64 @@ pub fn user_repo(api: &str, repo: &str, user_token: &str) -> Request {
     rest("GET", format!("{api}/repos/{repo}"), user_token)
 }
 
+/// The repositories of installation `installation_id` that the signed-in
+/// user can reach, a hundred to the page, asked with their user token.
+#[must_use]
+pub fn user_installation_repos(
+    api: &str,
+    installation_id: u64,
+    page: u32,
+    user_token: &str,
+) -> Request {
+    rest(
+        "GET",
+        format!("{api}/user/installations/{installation_id}/repositories?per_page=100&page={page}"),
+        user_token,
+    )
+}
+
+/// The repositories the App installation of `installation_token` is
+/// installed on, a hundred to the page.
+#[must_use]
+pub fn installation_repos(api: &str, page: u32, installation_token: &str) -> Request {
+    rest(
+        "GET",
+        format!("{api}/installation/repositories?per_page=100&page={page}"),
+        installation_token,
+    )
+}
+
+/// A repository of an installation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InstalledRepo {
+    /// GitHub's repository id.
+    pub id: u64,
+    /// `owner/name`.
+    pub full_name: String,
+    /// The default branch.
+    #[serde(default)]
+    pub default_branch: String,
+    /// Whether the repository is private.
+    #[serde(default)]
+    pub private: bool,
+}
+
+/// The repositories in the answer of [`user_installation_repos`] or
+/// [`installation_repos`], and whether a page after it may exist.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a list of repositories.
+pub fn installed_repos(response: &Response) -> Result<(Vec<InstalledRepo>, bool), String> {
+    #[derive(Deserialize)]
+    struct Repos {
+        repositories: Vec<InstalledRepo>,
+    }
+    let list = decode::<Repos>(response, "installation repositories")?.repositories;
+    let more = list.len() >= 100;
+    Ok((list, more))
+}
+
 /// What a user may do in a repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Permissions {
