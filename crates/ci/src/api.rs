@@ -948,18 +948,35 @@ impl Cx<'_> {
     /// bytes start (they start after a character that `offset` splits)
     /// and how long the whole log is.
     async fn log_window(&self, key: &str, offset: u64, length: u64) -> Result<Option<Response>> {
-        let Some(gz) = self.stored_bytes(key).await? else {
-            return Ok(None);
-        };
-        let window =
-            logs::window(&gz, offset, length).map_err(|err| fail(format!("{key}: {err}")))?;
-        let total = match index_of(key) {
-            Some(index_key) => self.index(&index_key).await?.map(|index| index.bytes),
+        let index = match index_of(key) {
+            Some(index_key) => self.index(&index_key).await?,
             None => None,
         };
-        let total = match total {
-            Some(total) => total,
-            None => logs::text_len(&gz).map_err(|err| fail(format!("{key}: {err}")))?,
+        let span = index.as_ref().map_or(logs::Span::Whole, |index| {
+            logs::span(&index.chunks, offset, length)
+        });
+        let (bytes, start) = match span {
+            logs::Span::Whole => (self.stored_bytes(key).await?, 0),
+            logs::Span::Range { at, len, start } => (self.stored_range(key, at, len).await?, start),
+            logs::Span::Empty => (Some(Vec::new()), offset),
+        };
+        let Some(gz) = bytes else {
+            return Ok(None);
+        };
+        let window = if gz.is_empty() {
+            logs::Window {
+                offset,
+                bytes: Vec::new(),
+            }
+        } else {
+            logs::window(&gz, start, offset, length).map_err(|err| fail(format!("{key}: {err}")))?
+        };
+        let total = match &index {
+            Some(index) => index.bytes,
+            None => match self.stored_bytes(key).await? {
+                Some(all) => logs::text_len(&all).map_err(|err| fail(format!("{key}: {err}")))?,
+                None => return Ok(None),
+            },
         };
         let mut response = Response::from_bytes(window.bytes)?;
         let headers = response.headers_mut();
@@ -967,6 +984,24 @@ impl Cx<'_> {
         headers.set("x-log-offset", &window.offset.to_string())?;
         headers.set("x-log-bytes", &total.to_string())?;
         Ok(Some(response))
+    }
+
+    /// `length` bytes of the stored object at `key` from `at`.
+    async fn stored_range(&self, key: &str, at: u64, length: u64) -> Result<Option<Vec<u8>>> {
+        let Some(object) = self
+            .env
+            .bucket(BUCKET)?
+            .get(key)
+            .range(worker::Range::OffsetWithLength { offset: at, length })
+            .execute()
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(body) = object.body() else {
+            return Ok(None);
+        };
+        Ok(Some(body.bytes().await?))
     }
 
     /// The index stored at `key`; one that does not read is as if it
@@ -1035,19 +1070,33 @@ impl Cx<'_> {
         let Some(key) = Self::log_key_of(&job, &found) else {
             return Ok(stop(404, "no stored log"));
         };
-        let Some(gz) = self.stored_bytes(&key).await? else {
-            return Ok(stop(404, "no stored log"));
+        let index = match index_of(&key) {
+            Some(index_key) => self.index(&index_key).await?,
+            None => None,
         };
-        let steps = match index_of(&key) {
-            Some(index_key) => self
-                .index(&index_key)
-                .await?
-                .map(|index| index.steps)
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let result =
-            logs::search(&gz, needle, &steps, from).map_err(|err| fail(format!("{key}: {err}")))?;
+        let (steps, chunks) = index.map_or_else(Default::default, |i| (i.steps, i.chunks));
+        let mut searcher = logs::Searcher::new(needle, &steps, from);
+        if chunks.is_empty() {
+            let Some(gz) = self.stored_bytes(&key).await? else {
+                return Ok(stop(404, "no stored log"));
+            };
+            searcher
+                .scan(&gz)
+                .map_err(|err| fail(format!("{key}: {err}")))?;
+        }
+        // One member at a time: a log is never held whole.
+        for chunk in &chunks {
+            if searcher.done() {
+                break;
+            }
+            let Some(member) = self.stored_range(&key, chunk.at, chunk.len).await? else {
+                return Ok(stop(404, "no stored log"));
+            };
+            searcher
+                .scan(&member)
+                .map_err(|err| fail(format!("{key}: {err}")))?;
+        }
+        let result = searcher.finish();
         let matches: Vec<Value> = result
             .hits
             .iter()

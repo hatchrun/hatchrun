@@ -18,7 +18,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 
 use flate2::Compression;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +90,117 @@ pub struct LogIndex {
     pub lines: u64,
     /// The first [`MAX_ERRORS`] error lines.
     pub errors: Vec<ErrorMark>,
+    /// The gzip members the stored log is made of. Empty for a log
+    /// stored before members existed, which is one member.
+    pub chunks: Vec<ChunkMark>,
+}
+
+/// One gzip member of a stored log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkMark {
+    /// Where its text starts in the whole log, in bytes.
+    pub offset: u64,
+    /// The length of its text, in bytes.
+    pub bytes: u64,
+    /// Where the member starts in the stored object.
+    pub at: u64,
+    /// The length of the member in the stored object.
+    pub len: u64,
+}
+
+/// The text of a member, about: a member ends at the first chunk end
+/// at or after this many bytes.
+pub const MEMBER_BYTES: u64 = 1 << 20;
+
+/// Builds the stored log as concatenated gzip members of about
+/// [`MEMBER_BYTES`] of text each: still one valid `.gz`, and a reader
+/// that knows where a member lies decompresses only that one. Members
+/// end where the text pushed to them ends, which is at a line end.
+#[derive(Default)]
+pub struct Members {
+    out: Vec<u8>,
+    current: Compressor,
+    text: u64,
+    done: u64,
+    chunks: Vec<ChunkMark>,
+}
+
+impl Members {
+    /// Adds `text`, which ends at a line end.
+    pub fn push(&mut self, text: &str) {
+        self.current.push(text);
+        self.text += text.len() as u64;
+        if self.text >= MEMBER_BYTES {
+            self.close();
+        }
+    }
+
+    fn close(&mut self) {
+        if self.text == 0 {
+            return;
+        }
+        let member = std::mem::take(&mut self.current).finish();
+        self.chunks.push(ChunkMark {
+            offset: self.done,
+            bytes: self.text,
+            at: self.out.len() as u64,
+            len: member.len() as u64,
+        });
+        self.out.extend_from_slice(&member);
+        self.done += self.text;
+        self.text = 0;
+    }
+
+    /// The stored bytes and where each member lies. A log with no
+    /// text is one empty member, and no marks.
+    #[must_use]
+    pub fn finish(mut self) -> (Vec<u8>, Vec<ChunkMark>) {
+        self.close();
+        if self.out.is_empty() {
+            self.out = Compressor::new().finish();
+        }
+        (self.out, self.chunks)
+    }
+}
+
+/// What to read of the stored object for a range of the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Span {
+    /// The whole object, which starts at text offset 0.
+    Whole,
+    /// Bytes `at` to `at + len` of the object, which hold members whose
+    /// text starts at `start`.
+    Range {
+        /// Where in the object.
+        at: u64,
+        /// How many bytes.
+        len: u64,
+        /// The text offset of the first member.
+        start: u64,
+    },
+    /// The range lies past the end of the text.
+    Empty,
+}
+
+/// The members that hold text bytes `offset` to `offset + length`.
+#[must_use]
+pub fn span(chunks: &[ChunkMark], offset: u64, length: u64) -> Span {
+    if chunks.is_empty() {
+        return Span::Whole;
+    }
+    let end = offset.saturating_add(length);
+    let covering: Vec<&ChunkMark> = chunks
+        .iter()
+        .filter(|c| c.offset + c.bytes > offset && c.offset < end.max(offset + 1))
+        .collect();
+    match (covering.first(), covering.last()) {
+        (Some(first), Some(last)) => Span::Range {
+            at: first.at,
+            len: last.at + last.len - first.at,
+            start: first.offset,
+        },
+        _ => Span::Empty,
+    }
 }
 
 /// Whether a log line reports an error: a `##[error]` line, or the
@@ -420,18 +531,22 @@ pub struct Window {
     pub bytes: Vec<u8>,
 }
 
-/// Up to `length` bytes of the text of the gzip stream `gz` from byte
-/// `offset` of the text. A stored log is one gzip stream, so the bytes
-/// before `offset` are read and dropped. The range moves to whole
+/// Up to `length` bytes of the text of the gzip members `gz`, which
+/// start at text offset `start`, from byte `offset` of the text. The
+/// bytes before `offset` are read and dropped; with members only the
+/// ones that hold the range are given. The range moves to whole
 /// characters: it starts after a character that `offset` splits and
 /// ends before one that the end splits.
 ///
 /// # Errors
 ///
 /// The stream is not valid gzip.
-pub fn window(gz: &[u8], offset: u64, length: u64) -> io::Result<Window> {
-    let mut text = GzDecoder::new(gz);
-    io::copy(&mut text.by_ref().take(offset), &mut io::sink())?;
+pub fn window(gz: &[u8], start: u64, offset: u64, length: u64) -> io::Result<Window> {
+    let mut text = MultiGzDecoder::new(gz);
+    io::copy(
+        &mut text.by_ref().take(offset.saturating_sub(start)),
+        &mut io::sink(),
+    )?;
     let mut bytes = Vec::new();
     text.take(length.min(MAX_RANGE_BYTES))
         .read_to_end(&mut bytes)?;
@@ -461,7 +576,7 @@ pub fn window(gz: &[u8], offset: u64, length: u64) -> io::Result<Window> {
 ///
 /// The stream is not valid gzip.
 pub fn text_len(gz: &[u8]) -> io::Result<u64> {
-    io::copy(&mut GzDecoder::new(gz), &mut io::sink())
+    io::copy(&mut MultiGzDecoder::new(gz), &mut io::sink())
 }
 
 /// A line of a log that holds the text searched for.
@@ -488,63 +603,111 @@ pub struct Found {
     pub capped: bool,
 }
 
+/// A search over a log, fed one gzip stream at a time: the members of
+/// a log in order, or the whole stream. Lines do not cross members.
+pub struct Searcher<'a> {
+    needle: String,
+    steps: &'a [StepMark],
+    from: u64,
+    found: Found,
+    offset: u64,
+    number: u64,
+    step: usize,
+    current: Option<usize>,
+}
+
+impl<'a> Searcher<'a> {
+    /// A search for `needle`, ignoring case, that lists the hits at
+    /// byte offset `from` or later. `steps` name the step of each hit.
+    #[must_use]
+    pub fn new(needle: &str, steps: &'a [StepMark], from: u64) -> Self {
+        Self {
+            needle: needle.to_lowercase(),
+            steps,
+            from,
+            found: Found {
+                hits: Vec::new(),
+                total: 0,
+                next: None,
+                capped: false,
+            },
+            offset: 0,
+            number: 0,
+            step: 0,
+            current: None,
+        }
+    }
+
+    /// Whether the count stopped at [`MAX_COUNTED`]: more input would
+    /// change nothing.
+    #[must_use]
+    pub fn done(&self) -> bool {
+        self.found.capped
+    }
+
+    /// Reads the next stream, line by line.
+    ///
+    /// # Errors
+    ///
+    /// The stream is not valid gzip.
+    pub fn scan(&mut self, gz: &[u8]) -> io::Result<()> {
+        let mut reader = BufReader::with_capacity(CHUNK_BYTES, MultiGzDecoder::new(gz));
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line)?;
+            if read == 0 {
+                return Ok(());
+            }
+            while let Some(mark) = self.steps.get(self.step)
+                && mark.offset <= self.offset
+            {
+                self.current = Some(mark.index);
+                self.step += 1;
+            }
+            if String::from_utf8_lossy(&line)
+                .to_lowercase()
+                .contains(&self.needle)
+            {
+                self.found.total += 1;
+                if self.offset >= self.from {
+                    if self.found.hits.len() < MAX_MATCHES {
+                        self.found.hits.push(Hit {
+                            offset: self.offset,
+                            line: self.number,
+                            step: self.current,
+                        });
+                    } else if self.found.next.is_none() {
+                        self.found.next = Some(self.offset);
+                    }
+                }
+                if self.found.total >= MAX_COUNTED {
+                    self.found.capped = true;
+                    return Ok(());
+                }
+            }
+            self.offset += read as u64;
+            self.number += 1;
+        }
+    }
+
+    /// What was found.
+    #[must_use]
+    pub fn finish(self) -> Found {
+        self.found
+    }
+}
+
 /// The lines of the gzip stream `gz` that hold `needle`, ignoring case,
-/// from byte offset `from` on. The whole log is read, line by line,
-/// so each hit has its line number; the search stops counting at
-/// [`MAX_COUNTED`] hits. `steps` name the step of each hit.
+/// from byte offset `from` on: [`Searcher`] over one stream.
 ///
 /// # Errors
 ///
 /// The stream is not valid gzip.
 pub fn search(gz: &[u8], needle: &str, steps: &[StepMark], from: u64) -> io::Result<Found> {
-    let needle = needle.to_lowercase();
-    let mut reader = BufReader::with_capacity(CHUNK_BYTES, GzDecoder::new(gz));
-    let mut found = Found {
-        hits: Vec::new(),
-        total: 0,
-        next: None,
-        capped: false,
-    };
-    let mut line = Vec::new();
-    let (mut offset, mut number, mut step) = (0_u64, 0_u64, 0_usize);
-    let mut current = None;
-    loop {
-        line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            break;
-        }
-        while let Some(mark) = steps.get(step)
-            && mark.offset <= offset
-        {
-            current = Some(mark.index);
-            step += 1;
-        }
-        if String::from_utf8_lossy(&line)
-            .to_lowercase()
-            .contains(&needle)
-        {
-            found.total += 1;
-            if offset >= from {
-                if found.hits.len() < MAX_MATCHES {
-                    found.hits.push(Hit {
-                        offset,
-                        line: number,
-                        step: current,
-                    });
-                } else if found.next.is_none() {
-                    found.next = Some(offset);
-                }
-            }
-            if found.total >= MAX_COUNTED {
-                found.capped = true;
-                break;
-            }
-        }
-        offset += read as u64;
-        number += 1;
-    }
-    Ok(found)
+    let mut searcher = Searcher::new(needle, steps, from);
+    searcher.scan(gz)?;
+    Ok(searcher.finish())
 }
 
 /// The last `lines` lines of `text` from byte offset `from` on.
@@ -563,9 +726,10 @@ pub fn tail(text: &str, from: u64, lines: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::io::Read;
 
-    use flate2::read::GzDecoder;
+    use flate2::read::{GzDecoder, MultiGzDecoder};
 
     use super::*;
 
@@ -841,21 +1005,106 @@ mod tests {
     #[test]
     fn a_window_reads_bytes_of_the_text_and_keeps_characters_whole() {
         let (gz, index) = stored();
-        let all = window(&gz, 0, MAX_RANGE_BYTES).unwrap();
+        let all = window(&gz, 0, 0, MAX_RANGE_BYTES).unwrap();
         assert_eq!(all.bytes.len() as u64, index.bytes);
-        let two = window(&gz, 3, 6).unwrap();
+        let two = window(&gz, 0, 3, 6).unwrap();
         assert_eq!(
             (two.offset, two.bytes.as_slice()),
             (3, "ore \u{e9}".as_bytes())
         );
         // Byte 8 is the second byte of the e-acute: the range starts after it.
-        let split = window(&gz, 8, 4).unwrap();
+        let split = window(&gz, 0, 8, 4).unwrap();
         assert_eq!((split.offset, split.bytes.as_slice()), (9, &b"\n=="[..]));
         // An end inside a character leaves it out.
-        let cut = window(&gz, 0, 8).unwrap();
+        let cut = window(&gz, 0, 0, 8).unwrap();
         assert_eq!(cut.bytes, b"before ");
-        assert_eq!(window(&gz, 10_000, 10).unwrap().bytes, b"");
-        assert!(window(b"not gzip", 0, 10).is_err());
+        assert_eq!(window(&gz, 0, 10_000, 10).unwrap().bytes, b"");
+        assert!(window(b"not gzip", 0, 0, 10).is_err());
+    }
+
+    /// A log of `lines` lines of `width` bytes, in members of
+    /// `per_member` lines.
+    fn members_of(lines: usize, per_member: usize) -> (Vec<u8>, Vec<ChunkMark>, String) {
+        let mut members = Members::default();
+        let mut text = String::new();
+        for first in (0..lines).step_by(per_member) {
+            let mut chunk = String::new();
+            for n in first..(first + per_member).min(lines) {
+                let _ = writeln!(chunk, "line {n:05} x");
+            }
+            text.push_str(&chunk);
+            members.push(&chunk);
+            // Members close at the size, not at the chunk: force it.
+            members.close();
+        }
+        let (gz, chunks) = members.finish();
+        (gz, chunks, text)
+    }
+
+    #[test]
+    fn members_are_one_valid_gzip_and_can_be_read_alone() {
+        let (gz, chunks, text) = members_of(30, 10);
+        assert_eq!(chunks.len(), 3);
+        let mut whole = String::new();
+        MultiGzDecoder::new(gz.as_slice())
+            .read_to_string(&mut whole)
+            .unwrap();
+        assert_eq!(whole, text);
+        assert_eq!(chunks[1].offset, 130);
+        assert_eq!(chunks[1].bytes, 130);
+        // A range inside the middle member reads only that member.
+        let Span::Range { at, len, start } = span(&chunks, 140, 20) else {
+            panic!("not a range");
+        };
+        assert_eq!(start, 130);
+        let part = &gz[usize::try_from(at).unwrap()..usize::try_from(at + len).unwrap()];
+        let got = window(part, start, 140, 20).unwrap();
+        assert_eq!(got.bytes, text.as_bytes()[140..160].to_vec());
+        // A range over two members reads both.
+        let Span::Range { at, len, start } = span(&chunks, 120, 20) else {
+            panic!("not a range");
+        };
+        assert_eq!(start, 0);
+        let part = &gz[usize::try_from(at).unwrap()..usize::try_from(at + len).unwrap()];
+        let got = window(part, start, 120, 20).unwrap();
+        assert_eq!(got.bytes, text.as_bytes()[120..140].to_vec());
+        assert_eq!(span(&chunks, 390, 5), Span::Empty);
+        assert_eq!(span(&[], 5, 5), Span::Whole);
+    }
+
+    #[test]
+    fn members_close_at_the_size_and_an_empty_log_is_valid() {
+        let mut members = Members::default();
+        let line = "y".repeat(1000) + "\n";
+        for _ in 0..(usize::try_from(MEMBER_BYTES).unwrap() / 1001) + 2 {
+            members.push(&line);
+        }
+        let (_, chunks) = members.finish();
+        assert_eq!(chunks.len(), 2);
+        let (gz, chunks) = Members::default().finish();
+        assert_eq!(chunks.len(), 0);
+        assert_eq!(text_len(&gz).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_search_streams_members_one_at_a_time() {
+        let (gz, chunks, _) = members_of(30, 10);
+        let mut searcher = Searcher::new("LINE 00015", &[], 0);
+        for chunk in &chunks {
+            let at = usize::try_from(chunk.at).unwrap();
+            let end = at + usize::try_from(chunk.len).unwrap();
+            searcher.scan(&gz[at..end]).unwrap();
+        }
+        let found = searcher.finish();
+        assert_eq!(found.total, 1);
+        assert_eq!(
+            found.hits[0],
+            Hit {
+                offset: 195,
+                line: 15,
+                step: None
+            }
+        );
     }
 
     #[test]
