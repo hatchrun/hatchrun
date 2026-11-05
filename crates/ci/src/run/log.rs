@@ -13,7 +13,9 @@ use worker::{HttpMetadata, Request, Response, Result, WebSocketPair};
 
 use crate::checks::{StepView, TAIL_LINES, conclusion_word};
 use crate::graph::State as NodeState;
-use crate::logs::{BACKLOG_BYTES, Compressor, LogIndex, LogWriter, index_key, log_key, tail};
+use crate::logs::{
+    BACKLOG_BYTES, Compressor, LogIndex, LogWriter, Scanner, index_key, log_key, tail,
+};
 
 use super::decide::{plan_is_current, take_drain};
 use super::object::{Cx, answer, fail};
@@ -631,12 +633,15 @@ impl Cx<'_> {
     /// read a few at a time, so the text is never held whole.
     pub(super) async fn upload_one(&self, info: &RunInfo, job: u64, sealed: &Sealed) -> Result<()> {
         let mut gzip = Compressor::new();
+        let mut scanner = Scanner::new(sealed.index.clone());
         for first in (0..sealed.chunks).step_by(READ_CHUNKS as usize) {
             let last = (first + READ_CHUNKS).min(sealed.chunks);
             let keys: Vec<String> = (first..last).map(|n| chunk_key(job, n)).collect();
             for (key, bytes) in keys.iter().zip(self.raw_get(&keys).await?) {
                 let bytes = bytes.ok_or_else(|| fail(format!("chunk {key} is gone")))?;
-                gzip.push(&String::from_utf8_lossy(&bytes));
+                let text = String::from_utf8_lossy(&bytes);
+                scanner.push(&text);
+                gzip.push(&text);
             }
         }
         let bucket = self.env.bucket(BUCKET)?;
@@ -659,7 +664,7 @@ impl Cx<'_> {
             })
             .execute()
             .await?;
-        let index = serde_json::to_vec(&sealed.index).map_err(|err| fail(err.to_string()))?;
+        let index = serde_json::to_vec(&scanner.finish()).map_err(|err| fail(err.to_string()))?;
         bucket
             .put(
                 index_key(

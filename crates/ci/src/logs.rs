@@ -15,9 +15,10 @@
 //! chunk is at most [`CHUNK_BYTES`] plus one line, so no value passes
 //! the 128 KiB limit of one storage value.
 
-use std::io::Write;
+use std::io::{self, BufRead, BufReader, Read, Write};
 
 use flate2::Compression;
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 
@@ -36,8 +37,15 @@ pub const MAX_NAME_BYTES: usize = 96;
 /// and no mark.
 pub const MAX_MARKS: usize = 256;
 
-/// Where a step's header starts in the log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The most error lines the index lists.
+pub const MAX_ERRORS: usize = 200;
+/// The most characters of an error line the index keeps.
+pub const MAX_ERROR_CHARS: usize = 300;
+
+/// Where a step's header starts in the log. Indexes stored before
+/// `line` and `lines` existed read them as 0.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StepMark {
     /// The step's position in the job, from 0.
     pub index: usize,
@@ -45,10 +53,32 @@ pub struct StepMark {
     pub name: String,
     /// The byte offset of the step's `== name` line in the whole log.
     pub offset: u64,
+    /// The step's header line, counted from 0.
+    pub line: u64,
+    /// The lines of the step, its header included.
+    pub lines: u64,
 }
 
-/// What `<job>.index.json` holds.
+/// A line that reports an error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorMark {
+    /// The byte offset of the line in the whole log.
+    pub offset: u64,
+    /// The line, counted from 0.
+    pub line: u64,
+    /// The position of the step the line is in; `None` before the
+    /// first step.
+    pub step: Option<usize>,
+    /// The line, cut to [`MAX_ERROR_CHARS`] characters.
+    pub text: String,
+}
+
+/// What `<job>.index.json` holds. The writer's index has the first
+/// three fields; the upload adds the rest while it reads the chunks
+/// (see [`Scanner`]). An index stored before that reads `lines` as 0
+/// and `errors` as empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LogIndex {
     /// The size of the whole log in bytes.
     pub bytes: u64,
@@ -56,6 +86,79 @@ pub struct LogIndex {
     pub steps: Vec<StepMark>,
     /// How many lines were dropped for the size cap.
     pub dropped_lines: u64,
+    /// How many lines the log has.
+    pub lines: u64,
+    /// The first [`MAX_ERRORS`] error lines.
+    pub errors: Vec<ErrorMark>,
+}
+
+/// Whether a log line reports an error: a `##[error]` line, or the
+/// agent's `Error: ` line for an `::error::` command.
+fn is_error(line: &str) -> bool {
+    line.contains("##[error]") || line.starts_with("Error: ")
+}
+
+/// Reads a finished log chunk by chunk and fills in what the writer
+/// does not know: the line counts and the error lines. Chunks end at
+/// line ends, and arrive in order.
+#[derive(Debug)]
+pub struct Scanner {
+    index: LogIndex,
+    offset: u64,
+    line: u64,
+    step: Option<usize>,
+    next_mark: usize,
+}
+
+impl Scanner {
+    /// A scanner for the log the writer's `index` describes.
+    #[must_use]
+    pub fn new(mut index: LogIndex) -> Self {
+        index.errors.clear();
+        Self {
+            index,
+            offset: 0,
+            line: 0,
+            step: None,
+            next_mark: 0,
+        }
+    }
+
+    /// Reads the next chunk.
+    pub fn push(&mut self, chunk: &str) {
+        for raw in chunk.split_inclusive('\n') {
+            if let Some(mark) = self.index.steps.get_mut(self.next_mark)
+                && mark.offset == self.offset
+            {
+                mark.line = self.line;
+                self.step = Some(mark.index);
+                self.next_mark += 1;
+            }
+            let text = raw.strip_suffix('\n').unwrap_or(raw);
+            if self.index.errors.len() < MAX_ERRORS && is_error(text) {
+                self.index.errors.push(ErrorMark {
+                    offset: self.offset,
+                    line: self.line,
+                    step: self.step,
+                    text: text.chars().take(MAX_ERROR_CHARS).collect(),
+                });
+            }
+            self.offset += raw.len() as u64;
+            self.line += 1;
+        }
+    }
+
+    /// The index, with the lines counted.
+    #[must_use]
+    pub fn finish(mut self) -> LogIndex {
+        self.index.lines = self.line;
+        let firsts: Vec<u64> = self.index.steps.iter().map(|mark| mark.line).collect();
+        for (at, mark) in self.index.steps.iter_mut().enumerate() {
+            let end = firsts.get(at + 1).copied().unwrap_or(self.line);
+            mark.lines = end.saturating_sub(mark.line);
+        }
+        self.index
+    }
 }
 
 /// Collects the lines of a job into chunks.
@@ -151,6 +254,7 @@ impl LogWriter {
                 index,
                 name,
                 offset,
+                ..StepMark::default()
             });
         }
     }
@@ -216,6 +320,7 @@ impl LogWriter {
             bytes: self.bytes,
             steps: self.steps.clone(),
             dropped_lines: self.dropped_lines,
+            ..LogIndex::default()
         };
         (last, index)
     }
@@ -299,6 +404,149 @@ pub fn gzip(chunks: impl IntoIterator<Item = String>) -> Vec<u8> {
     compressor.finish()
 }
 
+/// The most bytes one range read of a stored log answers.
+pub const MAX_RANGE_BYTES: u64 = 1 << 20;
+/// The most matches one search page lists.
+pub const MAX_MATCHES: usize = 1000;
+/// The most matches a search counts before it stops reading the log.
+pub const MAX_COUNTED: u64 = 100_000;
+
+/// A range of a stored log, as bytes of the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Window {
+    /// Where the bytes start in the whole log.
+    pub offset: u64,
+    /// The text.
+    pub bytes: Vec<u8>,
+}
+
+/// Up to `length` bytes of the text of the gzip stream `gz` from byte
+/// `offset` of the text. A stored log is one gzip stream, so the bytes
+/// before `offset` are read and dropped. The range moves to whole
+/// characters: it starts after a character that `offset` splits and
+/// ends before one that the end splits.
+///
+/// # Errors
+///
+/// The stream is not valid gzip.
+pub fn window(gz: &[u8], offset: u64, length: u64) -> io::Result<Window> {
+    let mut text = GzDecoder::new(gz);
+    io::copy(&mut text.by_ref().take(offset), &mut io::sink())?;
+    let mut bytes = Vec::new();
+    text.take(length.min(MAX_RANGE_BYTES))
+        .read_to_end(&mut bytes)?;
+    let skip = bytes
+        .iter()
+        .take(3)
+        .take_while(|b| (**b & 0b1100_0000) == 0b1000_0000)
+        .count();
+    // Only when the range starts inside a character: at 0, or after a
+    // line end, the first byte starts one.
+    let skip = if offset == 0 { 0 } else { skip };
+    bytes.drain(..skip.min(bytes.len()));
+    if let Err(err) = std::str::from_utf8(&bytes)
+        && err.error_len().is_none()
+    {
+        bytes.truncate(err.valid_up_to());
+    }
+    Ok(Window {
+        offset: offset + skip as u64,
+        bytes,
+    })
+}
+
+/// The size of the text of the gzip stream `gz`, in bytes.
+///
+/// # Errors
+///
+/// The stream is not valid gzip.
+pub fn text_len(gz: &[u8]) -> io::Result<u64> {
+    io::copy(&mut GzDecoder::new(gz), &mut io::sink())
+}
+
+/// A line of a log that holds the text searched for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    /// The byte offset of the line.
+    pub offset: u64,
+    /// The line, counted from 0.
+    pub line: u64,
+    /// The position of the step the line is in.
+    pub step: Option<usize>,
+}
+
+/// What a search found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    /// The first [`MAX_MATCHES`] hits from the cursor on.
+    pub hits: Vec<Hit>,
+    /// How many lines hold the text, in the whole log.
+    pub total: u64,
+    /// Where the next page starts, when there is one.
+    pub next: Option<u64>,
+    /// Whether the count stopped at [`MAX_COUNTED`].
+    pub capped: bool,
+}
+
+/// The lines of the gzip stream `gz` that hold `needle`, ignoring case,
+/// from byte offset `from` on. The whole log is read, line by line,
+/// so each hit has its line number; the search stops counting at
+/// [`MAX_COUNTED`] hits. `steps` name the step of each hit.
+///
+/// # Errors
+///
+/// The stream is not valid gzip.
+pub fn search(gz: &[u8], needle: &str, steps: &[StepMark], from: u64) -> io::Result<Found> {
+    let needle = needle.to_lowercase();
+    let mut reader = BufReader::with_capacity(CHUNK_BYTES, GzDecoder::new(gz));
+    let mut found = Found {
+        hits: Vec::new(),
+        total: 0,
+        next: None,
+        capped: false,
+    };
+    let mut line = Vec::new();
+    let (mut offset, mut number, mut step) = (0_u64, 0_u64, 0_usize);
+    let mut current = None;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        while let Some(mark) = steps.get(step)
+            && mark.offset <= offset
+        {
+            current = Some(mark.index);
+            step += 1;
+        }
+        if String::from_utf8_lossy(&line)
+            .to_lowercase()
+            .contains(&needle)
+        {
+            found.total += 1;
+            if offset >= from {
+                if found.hits.len() < MAX_MATCHES {
+                    found.hits.push(Hit {
+                        offset,
+                        line: number,
+                        step: current,
+                    });
+                } else if found.next.is_none() {
+                    found.next = Some(offset);
+                }
+            }
+            if found.total >= MAX_COUNTED {
+                found.capped = true;
+                break;
+            }
+        }
+        offset += read as u64;
+        number += 1;
+    }
+    Ok(found)
+}
+
 /// The last `lines` lines of `text` from byte offset `from` on.
 #[must_use]
 pub fn tail(text: &str, from: u64, lines: usize) -> Vec<String> {
@@ -349,6 +597,63 @@ mod tests {
             assert!(text[at..].starts_with(&format!("== {}\n", mark.name)));
         }
         assert_eq!(index.steps[1].index, 1);
+    }
+
+    #[test]
+    fn scanner_counts_lines_and_finds_errors() {
+        let mut w = LogWriter::default();
+        w.line("before");
+        w.step_started(0, "a");
+        w.line("one");
+        w.step_started(1, "b");
+        w.line("##[error]boom");
+        w.line("Error: \u{e9}");
+        w.line(&format!("Error: {}", "x".repeat(400)));
+        w.line("not an Error: line");
+        let (text, index) = whole(&mut w);
+        // Feed the text in two chunks that split at a line end.
+        let split = text.find("one\n").unwrap() + 4;
+        let mut scanner = Scanner::new(index);
+        scanner.push(&text[..split]);
+        scanner.push(&text[split..]);
+        let index = scanner.finish();
+        assert_eq!(index.lines, 8);
+        assert_eq!(index.steps[0].line, 1);
+        assert_eq!(index.steps[0].lines, 2);
+        assert_eq!(index.steps[1].line, 3);
+        assert_eq!(index.steps[1].lines, 5);
+        assert_eq!(index.errors.len(), 3);
+        let first = &index.errors[0];
+        assert_eq!((first.line, first.step), (4, Some(1)));
+        assert_eq!(first.text, "##[error]boom");
+        assert_eq!(
+            &text[usize::try_from(first.offset).unwrap()..][..5],
+            "##[er"
+        );
+        assert_eq!(index.errors[2].text.chars().count(), MAX_ERROR_CHARS);
+    }
+
+    #[test]
+    fn scanner_caps_the_errors() {
+        let mut w = LogWriter::default();
+        for _ in 0..MAX_ERRORS + 10 {
+            w.line("##[error]x");
+        }
+        let (text, index) = whole(&mut w);
+        let mut scanner = Scanner::new(index);
+        scanner.push(&text);
+        let index = scanner.finish();
+        assert_eq!(index.errors.len(), MAX_ERRORS);
+        assert_eq!(index.lines, MAX_ERRORS as u64 + 10);
+    }
+
+    #[test]
+    fn an_old_index_reads_with_defaults() {
+        let old = r#"{"bytes":9,"steps":[{"index":0,"name":"a","offset":0}],"dropped_lines":0}"#;
+        let index: LogIndex = serde_json::from_str(old).unwrap();
+        assert_eq!(index.lines, 0);
+        assert_eq!(index.errors.len(), 0);
+        assert_eq!((index.steps[0].line, index.steps[0].lines), (0, 0));
     }
 
     #[test]
@@ -519,6 +824,85 @@ mod tests {
             "logs/90d/t1/9/7/3/2.index.json"
         );
         assert_ne!(log_key(30, "t1", 9, 7, 3, 1), log_key(30, "t1", 9, 7, 3, 2));
+    }
+
+    fn stored() -> (Vec<u8>, LogIndex) {
+        let mut w = LogWriter::default();
+        w.line("before \u{e9}");
+        w.step_started(0, "build");
+        w.line("compiling Foo");
+        w.line("nothing here");
+        w.step_started(1, "test");
+        w.line("FOO failed");
+        let (text, index) = whole(&mut w);
+        (gzip([text]), index)
+    }
+
+    #[test]
+    fn a_window_reads_bytes_of_the_text_and_keeps_characters_whole() {
+        let (gz, index) = stored();
+        let all = window(&gz, 0, MAX_RANGE_BYTES).unwrap();
+        assert_eq!(all.bytes.len() as u64, index.bytes);
+        let two = window(&gz, 3, 6).unwrap();
+        assert_eq!(
+            (two.offset, two.bytes.as_slice()),
+            (3, "ore \u{e9}".as_bytes())
+        );
+        // Byte 8 is the second byte of the e-acute: the range starts after it.
+        let split = window(&gz, 8, 4).unwrap();
+        assert_eq!((split.offset, split.bytes.as_slice()), (9, &b"\n=="[..]));
+        // An end inside a character leaves it out.
+        let cut = window(&gz, 0, 8).unwrap();
+        assert_eq!(cut.bytes, b"before ");
+        assert_eq!(window(&gz, 10_000, 10).unwrap().bytes, b"");
+        assert!(window(b"not gzip", 0, 10).is_err());
+    }
+
+    #[test]
+    fn search_finds_lines_ignoring_case_with_their_steps() {
+        let (gz, index) = stored();
+        let found = search(&gz, "foo", &index.steps, 0).unwrap();
+        assert_eq!(found.total, 2);
+        assert_eq!(
+            found.hits,
+            [
+                Hit {
+                    offset: 19,
+                    line: 2,
+                    step: Some(0)
+                },
+                Hit {
+                    offset: 54,
+                    line: 5,
+                    step: Some(1)
+                },
+            ]
+        );
+        assert_eq!(found.next, None);
+        let rest = search(&gz, "foo", &index.steps, 20).unwrap();
+        assert_eq!((rest.total, rest.hits.len()), (2, 1));
+        let none = search(&gz, "absent", &index.steps, 0).unwrap();
+        assert_eq!((none.total, none.hits.len()), (0, 0));
+        let before = search(&gz, "BEFORE", &index.steps, 0).unwrap();
+        assert_eq!(before.hits[0].step, None);
+    }
+
+    #[test]
+    fn a_search_page_ends_at_the_match_limit() {
+        let mut w = LogWriter::default();
+        for _ in 0..MAX_MATCHES + 5 {
+            w.line("hit");
+        }
+        let (text, index) = whole(&mut w);
+        let gz = gzip([text]);
+        let first = search(&gz, "hit", &index.steps, 0).unwrap();
+        assert_eq!(first.hits.len(), MAX_MATCHES);
+        assert_eq!(first.total, MAX_MATCHES as u64 + 5);
+        let next = first.next.unwrap();
+        assert_eq!(next, 4 * MAX_MATCHES as u64);
+        let second = search(&gz, "hit", &index.steps, next).unwrap();
+        assert_eq!(second.hits.len(), 5);
+        assert_eq!(second.next, None);
     }
 
     #[test]
