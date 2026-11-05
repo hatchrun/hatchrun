@@ -1,59 +1,39 @@
 # hatchrun
 
-Self-hosted GitHub Actions runners on your own AWS account, one fresh EC2
-instance per job.
+hatchrun is a CI: workflows run on a fresh EC2 instance per job, in your
+own AWS account.
 
-This repository holds three Rust programs:
+This repository holds:
 
-- **scaler**: long-polls GitHub's runner scale set API, launches an
-  instance for every assigned job and cleans up the ones that finish or
-  get stuck. Runs on AWS Fargate, Cloudflare Containers, Kubernetes or any
-  machine with outbound internet access.
-- **agent**: baked into the runner image. It starts early in boot, reads
-  the instance's just-in-time runner config, runs exactly one job as the
-  `runner` user and powers the instance off.
-- **hatchrun**: command line tool developers run locally to convert and
-  validate workflow files, released as its own tarball.
+- **hatchrun-ci** ([`crates/ci`](crates/ci)): the Cloudflare Worker that
+  runs workflows. It takes the hatchrun GitHub App's webhooks, plans
+  runs, launches an instance per job and keeps logs, artifacts, caches,
+  secrets and billing usage.
+- **hatchrun.io** ([`crates/cloud`](crates/cloud)): the Cloudflare
+  Worker in front of it. It owns the webhook endpoint, sign-in with
+  GitHub, the organization and billing API of app.hatchrun.io and the
+  OIDC issuer.
+- **agent** ([`crates/hatchrun-agent`](crates/hatchrun-agent)): baked
+  into the instance image. It starts early in boot, claims its boot
+  document, runs exactly one job and powers the instance off.
+- **hatchrun** ([`crates/cli`](crates/cli)): command line tool
+  developers run locally to convert and validate workflow files,
+  released as its own tarball.
 
 ## Agent
 
 `hatchrun-agent` is a static binary started by
 [`packaging/systemd/hatchrun-agent.service`](packaging/systemd/hatchrun-agent.service).
-It takes the instance's just-in-time runner config from the first source
-that has one:
+It reads `"mode": "ci"`, a `broker` URL and a `ticket` in the
+instance's JSON user data and claims its boot document from hatchrun-broker, which hands it out
+once, retrying while the broker has nothing stored yet. The broker must
+be HTTPS. When the job ends, or no document arrives within 10 minutes,
+the unit powers the instance off.
 
-1. A `jitConfig` field in JSON user data, plain or gzip.
-2. A `broker` URL and `ticket` in JSON user data. The agent claims its
-   boot document from hatchrun-broker, which hands it out once, retrying
-   while the broker has nothing stored yet. The broker must be HTTPS.
-   The document holds the config and, on hatchrun.io launches, where to
-   report metrics (see [Runner telemetry](#runner-telemetry)).
-3. The SSM parameter named by the `hatchrun:jit-parameter` instance tag.
-4. The token parameter of
-   [github-aws-runners/terraform-aws-github-runner](https://github.com/github-aws-runners/terraform-aws-github-runner),
-   found through its `ghr:ssm_config_path` tag. This lets the agent replace
-   that module's user data script (`enable_userdata = false`).
-
-Parameters are polled until they exist, then deleted. The launch template
-must expose instance tags in metadata (`InstanceMetadataTags = enabled`).
-
-The agent passes the config to the runner in `ACTIONS_RUNNER_INPUT_JITCONFIG`
-rather than on the command line, so other processes cannot read it from
-argv and job steps never see it. The runner runs as `runner` with all its
-supplementary groups and the environment from `/etc/environment`. When the
-runner exits, or no config arrives within 10 minutes, the unit powers the
-instance off.
-
-On hatchrun.io launches the agent samples the instance once a second
-while the job runs and reports CPU, memory, disk and network in
-ten-second windows to `telemetry.hatchrun.io`. Reporting never fails or
-delays the job. Configs from the self-hosted scaler, user data or SSM
-come without telemetry, and the agent reports nothing.
-
-The agent starts only on instances launched as runners: user data with a
-config or ticket, or one of the tags above. `hatchrun-launch.service`
-checks that first, so an instance launched any other way, by hand or by
-the AWS Marketplace scan, boots normally and stays up.
+The agent starts only on instances launched for a job: user data with
+`"mode": "ci"`. `hatchrun-launch.service` checks that first, so an instance
+launched any other way, by hand or by the AWS Marketplace scan, boots
+normally and stays up.
 
 ### Installing
 
@@ -68,7 +48,7 @@ sudo apt install ./hatchrun-agent_0.1.0_amd64.deb
 
 The package installs `/usr/bin/hatchrun-agent` and the systemd unit but
 leaves the unit disabled, because the agent powers the machine off when
-it exits. Runner images enable it with `systemctl enable hatchrun-agent`.
+it exits. Images enable it with `systemctl enable hatchrun-agent`.
 
 ## hatchrun
 
@@ -84,103 +64,15 @@ Each release has a static tarball for `amd64` and `arm64`, named
 `hatchrun-<version>-linux-<arch>.tar.gz`, with checksums and build
 provenance like the agent.
 
-## Scaler
-
-`hatchrun-scaler` serves one scale set. On start it creates or updates
-the scale set, opens a message session and long-polls it. For every
-assigned job it registers a just-in-time runner and starts an instance
-from your launch template. User data holds only the broker URL and a
-single-use ticket; the scaler stores the runner config in the broker
-once the instance exists, and the agent claims it at boot. Instances are tagged `hatchrun:scale-set-id`,
-`hatchrun:runner-name` and `hatchrun:runner-id`. Every minute it lists
-the tagged instances, which lets a restarted scaler pick up where the
-last one stopped. On SIGTERM it closes the session and leaves running
-jobs alone.
-
-```sh
-hatchrun-scaler \
-  --github-url https://github.com/acme \
-  --scale-set linux-x64 \
-  --broker-url https://hatchrun-broker.acme.workers.dev \
-  --launch-template lt-0123456789abcdef0 \
-  --subnets subnet-aaa,subnet-bbb \
-  --max-runners 20
-```
-
-Every flag also reads from a `HATCHRUN_*` environment variable, listed
-in `--help`. Secrets are read from the environment only, so they stay
-out of the process list: `HATCHRUN_BROKER_TOKEN` for the broker token.
-Authenticate with a GitHub App (`--github-app-client-id`,
-`--github-app-installation-id` and the PEM key in
-`HATCHRUN_GITHUB_APP_PRIVATE_KEY`) with read and write access to the
-organization's self-hosted runners (repository administration for a
-repository scale set), or with a personal access token in
-`HATCHRUN_GITHUB_TOKEN`. AWS credentials come from the usual
-SDK chain. The scaler needs `ec2:RunInstances`, `ec2:CreateTags`,
-`ec2:DescribeInstances` and `ec2:TerminateInstances`, plus
-`iam:PassRole` when the launch template sets an instance profile.
-
-### Running the scaler
-
-Each release has a static `hatchrun-scaler` tarball for `amd64` and
-`arm64`, with checksums, an SBOM and build provenance like the agent,
-and a multi-arch image built from the same binaries:
-
-```sh
-docker pull ghcr.io/hatchrun/hatchrun-scaler:0.1.0
-gh attestation verify oci://ghcr.io/hatchrun/hatchrun-scaler:0.1.0 --repo hatchrun/hatchrun
-docker run --rm --read-only \
-  -e HATCHRUN_GITHUB_TOKEN -e HATCHRUN_BROKER_TOKEN \
-  -e AWS_REGION -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
-  ghcr.io/hatchrun/hatchrun-scaler:0.1.0 \
-  --github-url https://github.com/acme \
-  --scale-set linux-x64 \
-  --broker-url https://hatchrun-broker.acme.workers.dev \
-  --launch-template lt-0123456789abcdef0 \
-  --subnets subnet-aaa,subnet-bbb
-```
-
-The image is distroless with CA certificates and the binary and nothing
-else. It runs as user 65532 and writes no files, so it works with a
-read-only root filesystem, `runAsNonRoot` on Kubernetes and
-`readonlyRootFilesystem` on Fargate. On Fargate or EKS give the task or
-pod an IAM role instead of access keys.
-
-The launch template sets the runner image, instance type and security
-groups. The scaler sets the shutdown behaviour to terminate, so the
-agent powering off ends the instance. Subnets are tried in order when
-one is out of capacity.
-
-### Warm pool
-
-`--warm-pool N` keeps N instances ready for new runners. A pool instance
-launches without user data, so the agent stays off, boots once and reads
-the image's files off the snapshot, and is stopped after
-`--warm-pool-warmup` (3 minutes). A new runner gets the oldest stopped
-pool instance: the scaler sets its user data to the ticket, tags it as
-the runner's and starts it, and launches a replacement. A runner from
-the pool skips the launch and the slow first read of a fresh volume.
-Pool instances older than `--warm-pool-max-age` (24 hours) are replaced,
-so the pool picks up new images.
-
-A stopped instance costs its volume and nothing else: a 10 GB gp3 root
-volume is about $0.80 a month per pool instance. The pool needs an
-on-demand launch template, because spot instances cannot be stopped
-this way, and the scaler also needs `ec2:StopInstances`,
-`ec2:StartInstances`, `ec2:ModifyInstanceAttribute` and
-`ec2:DeleteTags`. Pool instances are tagged `hatchrun:pool`.
-
 ## Broker
 
 [`crates/broker`](crates/broker) is a Cloudflare Worker that hands each
-instance its runner config exactly once, so the config never sits in
-user data. The scaler puts a random ticket in the instance's user data
-and stores a boot document, `{"jitConfig": "..."}`, in the broker under
-that ticket; hatchrun.io adds a `telemetry` field to it. At boot the
-agent claims it with the ticket. The claim deletes the config, so the
-ticket is useless once the runner has started, and an unclaimed config
-is deleted when it expires (15 minutes by default). Every cloud has
-user data, so this works the same on all of them.
+instance its boot document exactly once, so the document never sits in
+user data. `hatchrun-ci` puts a random ticket in the instance's user
+data and stores the boot document in the broker under that ticket. At
+boot the agent claims it with the ticket. The claim deletes the
+document, so the ticket is useless once the job has started, and an
+unclaimed document is deleted when it expires (15 minutes by default).
 
 Each ticket gets its own Durable Object, named by the ticket's SHA-256,
 so two claims of one ticket cannot both succeed and nothing stored is
@@ -200,58 +92,13 @@ npx wrangler@4.143.0 deploy
 
 ## hatchrun.io
 
-[`crates/cloud`](crates/cloud) is the Cloudflare Worker behind the
-hosted service. Instead of a scaler per scale set, it takes the
-`workflow_job` webhooks of the hatchrun GitHub App and records every job
-whose only `runs-on` label names a runner profile, in D1, once per job,
-under its workflow run. The app lists runs with their jobs nested under
-them; a run's state rolls up from its hatchrun jobs.
-A profile holds requirements in Karpenter's terms: instance categories
-(`c`, `m`, `r`, ...), the oldest generation, the architecture, vCPU and
-memory bounds, a root volume, the capacity type (on-demand, Spot, or
-Spot falling back to on-demand) and an image. Naming instance families
-is an optional pin.
-
-```yaml
-runs-on: hatchrun-4cpu-arm64
-```
-
-Every organization has the built-in profiles `hatchrun-2cpu`,
-`hatchrun-4cpu`, `hatchrun-8cpu` and `hatchrun-16cpu` (amd64), the same
-with `-arm64` (Graviton), all general purpose (category `m`) with at
-least 4 GiB per vCPU and on-demand, and `hatchrun`, which is
-`hatchrun-2cpu`. Owners add their own profiles in the app, named
-`hatchrun-` and anything, and a profile named like a built-in replaces
-it for that organization.
-
-One job can change its profile with overrides in the same label:
-
-```yaml
-runs-on: hatchrun-4cpu/disk=200/spot=true
-```
-
-The overrides are `cpu=N` (at least N vCPUs), `ram=N` (at least N GiB),
-`disk=N` (GiB) and `spot=true` (Spot falling back to on-demand) or
-`spot=false`. A job with an unknown
-profile or option, or with other labels next to the hatchrun one, is
-skipped, and the App's webhook delivery log says why. There is one
-label on purpose: GitHub gives a job any runner whose labels include
-all of the job's labels, so with label sets a job asking for less can
-take the runner launched for a job asking for more and leave that job
-waiting.
-
-The instance types come from the profile and the region's instance
-type catalog: of every family that fits, the smallest size the connect
-stack allows, newest generation first and cheapest first within it.
-GPU, accelerator, bare metal, burstable and flex types only come with a
-pin. A launch hands a generation at a time to EC2 Fleet, which takes
-the cheapest offering with capacity. The stack's `InstanceTypes`
-(by default any size up to `8xlarge`), `ExcludedInstanceTypes` (by
-default GPU, accelerator and bare metal families) and `VolumeSizeLimit`
-stay the final word; when nothing they allow fits, the job fails and
-the app says why. Until a region's catalog is first read, the families
-[`scripts/ec2-catalog.py`](crates/cloud/scripts/ec2-catalog.py) wrote
-from AWS's public price lists stand in for it.
+[`crates/cloud`](crates/cloud) is the Cloudflare Worker behind
+hatchrun.io. `POST /github/webhook` takes the hatchrun GitHub App's
+deliveries: push, pull_request, check_run, repository, release, create
+and delete go on to `hatchrun-ci` as they came; `installation` events
+link a tenant to its installation or unlink it. Everything under
+`/api/ci/` on app.hatchrun.io is forwarded to `hatchrun-ci` too.
+`GET /healthz` answers 200 while the database does.
 
 ```sh
 npm --prefix web/app ci && npm --prefix web/app run build
@@ -283,304 +130,30 @@ gets the installation id back. It makes the organization's tenant once
 the App's JWT reads the installation, the user's token sees it in
 `/user/installations`, the account is an organization and the user is
 an active owner of it. Owners who already installed the App pick the
-organization from the start page instead. Every request on a tenant
-checks the user's ownership with GitHub again, which needs the App's
-organization permission Members (read). The `installation` webhook
-unlinks a tenant when the App is uninstalled or suspended and links it
-again when the App comes back.
+organization from the start page instead.
 
-Billing is per second of runner time, at least one minute a job. A job
-that ran on a hatchrun runner counts GitHub's `started_at` to
-`completed_at`, rounded up to whole seconds, once, when its `completed`
-webhook (or the reconciler's sync) lands; the `usage_events` table keeps
-one row per job. There is no free tier: runners launch only for
-tenants in the beta or with an active or trialing subscription.
-`PRICE_MICROS_PER_MINUTE` and `MIN_BILLED_SECONDS` in
-[`usage.rs`](crates/cloud/src/usage.rs) set the rate and the minimum.
+`GET /api/tenants/<org>` answers for any member of the organization:
+`{ id, org: { id, login, avatarUrl }, installationId, installUrl, role }`,
+where `role` is `admin` for an owner and `member` for anyone else, from
+the user's membership on GitHub, which needs the App's organization
+permission Members (read). Checkout and the customer portal need an
+owner. The `installation` webhook unlinks a tenant when the App is
+uninstalled or suspended and links it again when the App comes back.
 
-Adding a card is a Polar subscription to the `POLAR_PRODUCT_ID`
-product, which carries a metered price of 0.001666666666 cents a second
-on the "Runner seconds" meter, with no monthly cap and no credit. The
-app opens Polar's checkout with the tenant id as the external customer
-id, and Polar's webhooks, at `https://app.hatchrun.io/api/polar/webhook`
-and checked against `POLAR_WEBHOOK_SECRET`, keep the `subscriptions`
-table current. Seconds of jobs that completed while the tenant paid go
-to Polar as `job.seconds` events, which the meter sums: the reconciler
-sends up to 500 a minute, with the job as each event's `external_id`
-(`job:{id}`), so an event sent twice counts once. `POLAR_ACCESS_TOKEN`
-needs the `events:write` scope for that.
-
-Tenants in the invite-only beta count seconds and pay nothing. An owner
-redeems an invite code, or the operator lists the organization:
-
-```sh
-code=$(openssl rand -hex 8)
-hash=$(printf %s "$code" | shasum -a 256 | cut -d' ' -f1)
-psql "$DATABASE_MIGRATE_URL" -c \
-  "INSERT INTO invites (code_hash, note, uses_left, created_at) VALUES ('$hash', 'acme', 1, (extract(epoch from now()) * 1000)::bigint)"
-echo "invite code: $code"
-
-psql "$DATABASE_MIGRATE_URL" -c \
-  "INSERT INTO beta_orgs (org_login, created_at) VALUES (lower('acme'), (extract(epoch from now()) * 1000)::bigint)"
-```
-
-An owner connects AWS from the app. The account first subscribes to the
-amd64 and arm64 runner images in AWS Marketplace (`MARKETPLACE_AMD64_URL`
-and `MARKETPLACE_ARM64_URL` in `wrangler.toml`); EC2 refuses to launch
-an image of a product the account has not subscribed to, with
-`OptInRequired`, and the job says where to subscribe. A Launch Stack
-link per region opens the published `connect.yaml` with the tenant id
-filled in; the owner pastes the stack's `RoleArn` output back. The Worker assumes the
-role with a token for the tenant, reads what the stack allows (its
-launch template, subnets and instance type limits) from the SSM
-parameter `/hatchrun/connect/<tenant id>`, checks the subnets exist, and
-only then saves them. The settings live in a parameter because
-CloudFormation rewrites it on every stack update; tags on a launch
-template keep the values the stack was created with.
-
-Published stacks do not change when `connect.yaml` does. The settings
-parameter carries the template's `version`; a change to the template
-bumps it and `TEMPLATE_VERSION` in
-[`connect.rs`](crates/cloud/src/connect.rs) together (a test and
-the `template-version` CI job fail otherwise) and adds what the version
-brings to `CHANGES`. Owners update on their own schedule, so the Worker
-ignores settings fields it does not know, and fields added later take
-defaults: a stack can be updated before or after the release that
-reads it. The
-dashboard of a tenant on an older stack, or one still limited by the
-old family list, says what an update brings and how to apply it in the
-console or with the AWS CLI. The reconciler reads each tenant's stack
-settings again once a day, so an updated stack is picked up without
-anyone verifying the role again, and jobs waiting on the setup launch.
-
-The stack also holds what features beyond launching need, so they ship
-without asking owners to update again: an S3 bucket for job caches
-that the Worker signs per-repository URLs for, cache volumes and
-snapshots tagged with the tenant, security groups and capacity
-reservations the owner tags `hatchrun:tenant`, runners' boot logs, and
-roles under the `/hatchrun/` path that an owner picks for runners.
-
-[`publish-template.yml`](.github/workflows/publish-template.yml)
-uploads `connect.yaml` on every change merged to main. It needs, once,
-the bucket and role from
-[`templates-bucket.yaml`](deploy/cloudformation/templates-bucket.yaml),
-the `TEMPLATES_ROLE_ARN` secret and the `TEMPLATES_BUCKET` variable in
-the `production` environment, and the
-bucket's `TemplateUrl` output as `CONNECT_TEMPLATE_URL` in
-`wrangler.toml`:
-
-```sh
-aws cloudformation deploy --region us-east-1 --stack-name hatchrun-templates \
-  --template-file deploy/cloudformation/templates-bucket.yaml \
-  --capabilities CAPABILITY_NAMED_IAM
-```
-
-Once every step is done the app shows the organization's recent jobs,
-what each launch did, each job's CPU and memory (see
-[Runner telemetry](#runner-telemetry)) and the `runs-on` syntax, its
-runner profiles
-with the instance type and on-demand price each gets in the tenant's
-region, and its settings: the most runners at once and the regions
-runners may use, which the Worker also checks before every launch.
-
-### Runner images
-
-Launches take the AMI for the tenant's region and the runner's
-architecture from the `images` table. Every release of
-[hatchrun/images](https://github.com/hatchrun/images) fills it: once
-AWS Marketplace serves the AMIs, its `register.yml` job posts the
-release's `manifest.json` to `POST https://app.hatchrun.io/api/internal/images`
-with a GitHub Actions OIDC token for the audience
-`https://app.hatchrun.io`. The Worker checks the token's signature
-against GitHub's JWKS and accepts only that job, on the protected
-`main` branch, in the `image-build` environment of hatchrun/images, on
-a GitHub-hosted runner, started by a push, the schedule or by hand
-([`images.rs`](crates/cloud/src/images.rs)). Each token posts once. It
-writes every region and architecture in one batch, and refuses a
-release older than the one it holds or whose version is far from the
-token's issue time. `ACTIONS_OIDC_ISSUER` points the Worker at a local
-issuer under `wrangler dev`, together with a local `APP_URL` such as
-`--var APP_URL:http://localhost:8787`; on app.hatchrun.io it is
-refused. To post the newest release again:
-
-```sh
-gh workflow run register.yml --repo hatchrun/images --ref main
-```
-
-### Reconciler
-
-A Cron Trigger runs [`reconcile`](crates/cloud/src/reconcile) every
-minute. It asks GitHub to redeliver the App's webhook deliveries that
-failed (each event once), asks GitHub about open jobs that have had no
-webhook for a while, and, per tenant with a verified role, describes
-the instances tagged with the tenant: it terminates the ones whose job
-is over, that never got a job, or that ran past the longest age, and
-launches queued jobs again whose launch was lost or whose runner took
-another job. A launch that failed on something that passes (an EC2 or Spot
-capacity error, throttling, an AWS, GitHub or broker error, no image
-yet for the region) is launched
-again after 30 seconds, doubling up to 5 minutes, for as long as
-GitHub keeps the job queued. A launch that failed on the
-organization's setup (the role cannot be assumed or may not launch,
-no allowed instance type fits the profile, no such profile) waits
-until an owner verifies the role again, edits a profile, changes the
-settings or adds a card; [`retry.rs`](crates/cloud/src/reconcile/retry.rs)
-lists every case. Once a day per region it refreshes the instance
-type catalog in the database through a tenant role there: every current
-generation amd64 and arm64 type with the zones that offer it
-(`DescribeInstanceTypes`, `DescribeInstanceTypeOfferings`), its Linux
-on-demand price from AWS's public price list and its lowest Spot price
-(`DescribeSpotPriceHistory`). It sends runner usage to Polar as
-`job.seconds` (whole seconds), deletes expired sessions, and
-jobs and runs past their tenant's retention (`tenants.retention_days`,
-30 days unless set, up to 90). The timeouts are the `RECONCILE_*` variables in
-`wrangler.toml`. Each pass logs one summary line and keeps it in the
-`reconciler` table:
-
-```sh
-psql "$DATABASE_MIGRATE_URL" -c "SELECT finished_at, summary FROM reconciler"
-```
-
-`wrangler dev --test-scheduled` runs a pass on
-`GET /__scheduled?cron=*+*+*+*+*`.
-
-`npm run dev` in `web/app` serves the app with hot reload and sends
-`/api` to `wrangler dev` on port 8787. `npm run dev:mock` answers `/api`
-from [`web/app/mock/api.ts`](web/app/mock/api.ts) instead, with no
-Worker, GitHub or AWS behind it.
-
-### Runner telemetry
-
-hatchrun.io shows each job's CPU and memory on its page in the app,
-next to a link to the job on GitHub. Logs stay on GitHub; hatchrun
-neither stores nor shows them.
-
-The launch stores a boot document in the broker instead of the bare
-config:
-
-```json
-{"jitConfig": "...", "telemetry": {"url": "https://telemetry.hatchrun.io", "token": "..."}}
-```
-
-The token is an EdDSA JWT naming the tenant, the installation, the job
-and the runner, valid for nine hours. It is signed with
-`TELEMETRY_SIGNING_KEY`, an Ed25519 key that signs nothing else; the
-OIDC key buys credentials in customer accounts and never signs anything
-a runner holds. The agent keeps the token in memory.
-
-Every ten seconds the agent sums up its one-second samples into a
-window: CPU busy share (lowest second, mean, highest second) and steal,
-the highest memory in use and the instance's total, the peak memory of
-the agent's cgroup and its OOM kills, disk used on the root file system,
-and bytes received and sent. It posts the windows once a minute, at
-most 60 at a time, and once more when the runner exits, with the
-instance type, the architecture and its version. Nothing else leaves
-the instance: no command lines, environment, file names or logs.
-
-[`crates/telemetry`](crates/telemetry) is the Worker at
-`telemetry.hatchrun.io` that takes the reports. It holds only the
-Analytics Engine binding and the token public keys. It checks the
-token's signature and expiry, takes the job and installation from the
-token alone, refuses bodies over 64 KiB, unknown fields and numbers
-out of range, and writes one data point per window to the
-`hatchrun_runner_metrics` dataset: the job id as the index, the
-installation id, instance type, architecture and agent version as
-blobs, the window's numbers as doubles. Analytics Engine keeps data for
-three months. The app reads it back through the Analytics SQL binding,
-always for one installation, with a lower time bound and a limit.
-
-Generate the key once and store both halves in the `production`
-environment: the private key as a secret for hatchrun-cloud, the public
-key, unpadded base64url, as a variable for hatchrun-telemetry.
-
-```sh
-openssl genpkey -algorithm ed25519 -out ~/telemetry-2026-10.pem
-gh secret set TELEMETRY_SIGNING_KEY --env production < ~/telemetry-2026-10.pem
-gh variable set TELEMETRY_PUBLIC_KEYS --env production --body "$(
-  openssl pkey -in ~/telemetry-2026-10.pem -pubout -outform DER |
-    tail -c 32 | base64 | tr '+/' '-_' | tr -d '=')"
-```
-
-To rotate, add the new public key to `TELEMETRY_PUBLIC_KEYS` after a
-comma and deploy hatchrun-telemetry, then set the new private key and
-deploy hatchrun-cloud. Nine hours later, when the last old token has
-expired, drop the old public key. Under `wrangler dev`, put
-`TELEMETRY_SIGNING_KEY` in `crates/cloud/.dev.vars` and
-`TELEMETRY_PUBLIC_KEYS` in `crates/telemetry/.dev.vars`.
-
-### Job cache
-
-Runners of a profile with the `cache` extra keep `actions/cache`
-entries in the S3 bucket of the tenant's connect stack (version 5 on),
-in the runners' own account and region. The design is on #53. The
-Worker side is `/v1/cache/*` on `app.hatchrun.io`
-([`cache`](crates/cloud/src/cache.rs)); the jobs reach it through a
-proxy in the agent ([`cache`](crates/hatchrun-agent/src/cache.rs)).
-
-The boot document of such a runner carries a second token:
-
-```json
-{"jitConfig": "...", "telemetry": {...}, "cache": {"url": "https://app.hatchrun.io/v1/cache", "token": "..."}}
-```
-
-It is signed by `TELEMETRY_SIGNING_KEY` like the telemetry token, with
-`"aud": "cache"`, and the Worker checks it against the public half of
-the same key. While that key is rotated, runners holding a token from
-the old key get 401 and run without the cache.
-
-The token names the tenant and the job. Which repository and refs the
-job may use come from its job row and, on its first call, its workflow
-run on GitHub, kept on the row as `cache_write` and `cache_reads`.
-Entries live at `<repository id>/<scope>/<version>/<key>`. A run
-writes `b/<branch hash>` only when its commit is on that branch of the
-repository (the branch's tip is the commit or a descendant, checked
-through GitHub's compare API). Pull requests and runs of code from a
-fork write `p/<head repository id>/<branch hash>`, and any other run,
-such as a tag push, writes `o/<ref hash>`, so a tag named `main` cannot
-fill the `main` branch's cache. Every job reads its own scope, then the
-default branch's. A lookup
-takes the exact key, then the newest entry for each restore key in
-turn, and answers a presigned GET that holds for 15 minutes. Uploads
-are S3 multipart uploads the Worker starts and completes with
-`If-None-Match: *`; the runner uploads the parts to presigned URLs.
-The Worker keeps each tenant's role credentials in the isolate for 30
-minutes, so a cache call costs S3 calls and not an STS call each time.
-
-The proxy listens on the instance's private IP, port 7419, so host
-steps and container jobs reach the same URL, and serves GitHub's cache
-v2 protocol: the three Twirp RPCs `actions/cache` and BuildKit's
-`type=gha` call, the Azure Blob upload to the URL a create hands out,
-and the download from the URL a lookup hands out. Uploads stream to S3
-in parts of up to 64 MiB and never touch disk. A plain download is
-redirected to the presigned S3 GET; a ranged one is fetched by the
-proxy, since S3 ignores Azure's `x-ms-range`. Every other Twirp call,
-such as the artifact service `actions/upload-artifact` uses, passes
-through to `results-receiver.actions.githubusercontent.com`.
-
-The runner sets `ACTIONS_RESULTS_URL` on every action from the job
-message, so nothing in the environment can override it. Once the proxy
-answers its health check (which also checks the cloud takes the token)
-within 5 seconds, the agent renames `ACTIONS_CACHE_URL`,
-`ACTIONS_RESULTS_URL` and `ACTIONS_CACHE_SERVICE_V2` in the runner's
-`bin/Runner.Worker.dll` to `ZCTIONS_*`, and starts the runner with
-`ACTIONS_RESULTS_URL` pointing at the proxy and
-`ACTIONS_CACHE_SERVICE_V2=true`. A job-started hook
-(`ACTIONS_RUNNER_HOOK_JOB_STARTED`) writes both to `$GITHUB_ENV`, so
-container jobs and Docker actions get them too. A `.sh` or `.ps1`
-job-started hook the image already sets runs first; any other kind is
-kept, and container jobs then miss the proxy. A job's `env:` can
-override them. Each name must occur exactly once in
-the worker, or it is left alone. When anything fails, the runner starts
-stock and the job uses GitHub's cache. A lookup that fails answers a
-miss; a save that fails is a warning in the job.
+Billing goes through Polar. `POST /api/tenants/<org>/checkout` opens a
+checkout for the card, `POST /api/tenants/<org>/portal` the customer
+portal, and Polar's webhooks at `/api/polar/webhook` keep the
+`subscriptions` table current. `hatchrun-ci` sends each job's usage to
+Polar's "CI usage" meter. A job runs for a tenant in the beta or with an
+active or trialing subscription.
 
 ### OIDC issuer
 
-The Worker reaches a customer's AWS account by signing a five-minute
-token for `tenant:<id>` and trading it for the role that
-[`connect.yaml`](deploy/cloudformation/connect.yaml) creates, through
-`AssumeRoleWithWebIdentity`. STS checks the token against the keys the
-Worker serves on `oidc.hatchrun.io`:
+hatchrun CI reaches its AWS account by signing a five-minute token
+for `tenant:hatchrun-ci` and trading it for the role that
+[`ci-account.yaml`](deploy/cloudformation/ci-account.yaml) creates,
+through `AssumeRoleWithWebIdentity`. STS checks the token against the
+keys the Worker serves on `oidc.hatchrun.io`:
 
 - `/.well-known/openid-configuration`, the discovery document;
 - `/.well-known/jwks.json`, the public keys, matched by `kid`.
@@ -617,30 +190,14 @@ secrets do nothing. Delete them anyway, from GitHub with
 `gh secret delete NAME --env production` and from the Worker with
 `npx wrangler@4.145.0 secret delete NAME`.
 
-## Scale set client
-
-[`crates/scaleset`](crates/scaleset) talks to the GitHub Actions runner
-scale set API, the same API Actions Runner Controller uses. It does no
-I/O: every call returns an HTTP request to send and a parser for the
-response. The scaler sends them with its own HTTP client, which is what
-lets it run on tokio or inside a Cloudflare Worker. CI builds the crate
-for `wasm32-unknown-unknown` to keep it that way.
-
 ## Scaler core
 
-[`crates/scaler-core`](crates/scaler-core) decides what the scaler does.
-It keeps one runner per assigned job, between `min_runners` and
-`max_runners`, and tracks each runner from launch to termination. It
-removes runners that wait for a job longer than the idle timeout (15
-minutes by default), which covers instances that never started the
-runner and jobs that went to another runner. Warm runners kept by
-`min_runners` get recycled on the same timeout. On start, and whenever
-the scaler compares its runners with the instances in the account, it
-adopts instances it does not know and removes the registration of
-runners whose instance is gone. It also keeps the warm pool at its size,
-hands pool instances to new runners and adopts pool instances after a
-restart by whether they are stopped. Like the client, it does no I/O
-and builds for `wasm32-unknown-unknown`.
+[`crates/scaler-core`](crates/scaler-core) is the warm pool of
+`hatchrun-ci`: stopped instances that booted once and read their files,
+kept ready so a job starts without the slow first boot. It decides when
+to launch, stop and terminate pool instances, adopts pool instances after
+a restart by whether they are stopped, and backs off after launch
+failures. It does no I/O and builds for `wasm32-unknown-unknown`.
 
 ## Releases
 
@@ -649,9 +206,7 @@ Merging to `main` releases automatically when there are `feat`, `fix`,
 those Conventional Commits (see `cliff.toml`): `fix` bumps the patch
 version, `feat` and breaking changes bump the minor version until 1.0.
 
-Runner images live in [hatchrun/images](https://github.com/hatchrun/images)
-and the Terraform module in
-[hatchrun/terraform-aws-hatchrun](https://github.com/hatchrun/terraform-aws-hatchrun).
+Instance images live in [hatchrun/images](https://github.com/hatchrun/images).
 
 Status: early development, not ready for production.
 

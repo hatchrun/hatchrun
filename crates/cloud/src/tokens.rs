@@ -22,10 +22,16 @@ use worker::{Env, KvStore, console_warn};
 
 use crate::fetch::Sender;
 use crate::http::{Request, Response};
-use crate::launch::{APP_ID, APP_KEY, GITHUB_API_URL};
-use crate::reconcile::time;
 use crate::start::app_jwt;
+use crate::time;
 use crate::{github, jwt};
+
+/// Variable with the App's client id.
+pub(crate) const APP_ID: &str = "GITHUB_APP_ID";
+/// Secret with the App's private key, PEM.
+pub(crate) const APP_KEY: &str = "GITHUB_APP_PRIVATE_KEY";
+/// Variable that replaces the GitHub API URL, for development.
+pub(crate) const GITHUB_API_URL: &str = "GITHUB_API_URL";
 
 /// The KV namespace that holds the tokens.
 pub(crate) const BINDING: &str = "TOKENS";
@@ -430,7 +436,7 @@ pub(crate) mod tests {
     }
 
     fn register(token: &str) -> Request {
-        github::generate_jit_config(github::API, "acme", token, "r", "hatchrun")
+        github::user(github::API, token)
     }
 
     #[test]

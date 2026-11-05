@@ -2,11 +2,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
-# Marks the instance when it was launched as a runner, so that
+# Marks the instance when it was launched for CI, so that
 # hatchrun-agent.service starts only then. An instance launched by hand,
 # or by the AWS Marketplace scan, boots and stays up like any other.
 [Unit]
-Description=hatchrun agent: tell whether the instance was launched as a runner
+Description=hatchrun agent: tell whether the instance was launched for CI
 Wants=network-online.target
 After=network-online.target
 

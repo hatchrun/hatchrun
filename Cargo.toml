@@ -36,6 +36,3 @@ strip = "debuginfo"
 
 [profile.release.package.hatchrun-cloud]
 strip = "debuginfo"
-
-[profile.release.package.hatchrun-telemetry]
-strip = "debuginfo"

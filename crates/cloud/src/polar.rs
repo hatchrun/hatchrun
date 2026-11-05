@@ -5,11 +5,9 @@
 //! Billing through Polar, the merchant of record, kept apart from the
 //! Workers runtime so it tests natively.
 //!
-//! An organization pays per second of runner time through a Polar
-//! subscription to the metered product: a metered price on the "Runner
-//! seconds" meter, with no cap and no free credit (see
-//! [`crate::usage`]). The reconciler sends each job's billed seconds as
-//! an event (see [`ingest`]). The app opens a Polar checkout for the
+//! An organization pays for hatchrun CI through a Polar subscription to
+//! the metered product. `hatchrun-ci` sends each job's usage as an event
+//! (see [`ci_ingest`]). The app opens a Polar checkout for the
 //! product, with the tenant id as Polar's
 //! external customer id and in the checkout's metadata, so every
 //! subscription Polar reports names its tenant. Polar's webhooks, signed
@@ -109,47 +107,6 @@ fn decode<T: for<'de> Deserialize<'de>>(response: &Response, what: &str) -> Resu
         ));
     }
     serde_json::from_slice(&response.body).map_err(|err| format!("{what}: {err}"))
-}
-
-/// Name of the events that carry a job's billed seconds. The "Runner
-/// seconds" meter sums their `seconds`.
-pub const SECONDS_EVENT: &str = "job.seconds";
-
-/// Most events in one ingest call.
-pub const INGEST_BATCH: usize = 500;
-
-/// One job's billed seconds, as Polar's meter takes them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JobSeconds<'a> {
-    /// The job, which keeps Polar from counting it twice.
-    pub job_id: u64,
-    /// The tenant, Polar's external customer id.
-    pub tenant: &'a str,
-    /// Its billed seconds.
-    pub seconds: u64,
-    /// When it completed, ISO 8601.
-    pub at: String,
-}
-
-/// Sends job seconds to Polar. Each event's `external_id` is the job,
-/// so an event sent again after a lost answer is skipped as a
-/// duplicate.
-#[must_use]
-pub fn ingest(api: &str, token: &str, events: &[JobSeconds<'_>]) -> Request {
-    let events: Vec<_> = events
-        .iter()
-        .map(|event| {
-            serde_json::json!({
-                "name": SECONDS_EVENT,
-                "external_customer_id": event.tenant,
-                "external_id": format!("job:{}", event.job_id),
-                "timestamp": event.at,
-                "metadata": { "seconds": event.seconds, "job_id": event.job_id.to_string() },
-            })
-        })
-        .collect();
-    call("POST", format!("{api}/v1/events/ingest"), token)
-        .body(serde_json::json!({ "events": events }).to_string())
 }
 
 /// Name of the events that carry a CI job attempt's billing units. The
@@ -581,29 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn sends_job_seconds() {
-        let request = ingest(
-            API,
-            "t",
-            &[JobSeconds {
-                job_id: 29_679_449,
-                tenant: "abcdefgh12345678",
-                seconds: 600,
-                at: "2026-10-14T10:09:30Z".to_owned(),
-            }],
-        );
-        assert_eq!(request.url, "https://api.polar.sh/v1/events/ingest");
-        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({ "events": [{
-                "name": "job.seconds",
-                "external_customer_id": "abcdefgh12345678",
-                "external_id": "job:29679449",
-                "timestamp": "2026-10-14T10:09:30Z",
-                "metadata": { "seconds": 600, "job_id": "29679449" },
-            }] })
-        );
+    fn reads_the_ingest_answer() {
         assert_eq!(
             ingested(&Response {
                 headers: Vec::new(),

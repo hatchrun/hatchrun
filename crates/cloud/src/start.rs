@@ -5,12 +5,11 @@
 //! Starts one on-demand or Spot instance in a customer's AWS account
 //! from their launch template, and terminates one that will not run.
 //!
-//! Shared by the hatchrun.io launcher (see [`crate::launch`]) and the
-//! CI control plane. The caller says where ([`Target`]) and what
+//! Used by the CI control plane. The caller says where ([`Target`]) and what
 //! ([`Instance`]); this module tries EC2 Fleet or `RunInstances` over
 //! the subnets, instance types and markets, and returns the instance id
 //! or a [`Failure`] with the cause the retry pass acts on (see
-//! [`crate::reconcile::retry`]).
+//! [`crate::retry`]).
 
 use worker::{console_log, console_warn};
 
@@ -22,7 +21,7 @@ use crate::instance::Choice;
 use crate::offerings::{self, Candidate, Unavailable};
 use crate::{github, instance_types, jwt, now_ms, oidc, webcrypto};
 
-pub use crate::reconcile::retry::{Cause, Failure};
+pub use crate::retry::{Cause, Failure};
 
 /// Where to start an instance.
 pub struct Target<'a> {

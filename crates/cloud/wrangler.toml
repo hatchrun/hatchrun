@@ -23,10 +23,6 @@ binding = "ASSETS"
 run_worker_first = true
 not_found_handling = "single-page-application"
 
-# The reconciler (crates/cloud/src/reconcile) every minute.
-[triggers]
-crons = ["* * * * *"]
-
 [build]
 command = "cargo install --locked worker-build --version 0.8.7 && worker-build --release"
 
@@ -55,14 +51,6 @@ id = "92b81a8052544d3387c16535ee2a4fa2"
 binding = "CI"
 service = "hatchrun-ci"
 
-# Launches. The webhook sends each queued job here and this Worker's
-# consumer launches it (crates/cloud/src/launches.rs), so a launch
-# outlives the webhook request. Messages that fail max_retries times go
-# to the dead-letter queue; the reconciler launches their jobs again.
-[[queues.producers]]
-binding = "LAUNCHES"
-queue = "hatchrun-launches"
-
 # The CI Worker's launch queue. The Polar webhook sends the held jobs of a
 # tenant whose card came back here (crates/cloud/src/ci_wake.rs); the CI
 # Worker consumes it.
@@ -70,55 +58,15 @@ queue = "hatchrun-launches"
 binding = "CI_LAUNCHES"
 queue = "hatchrun-ci-launches"
 
-# Small batches, sent after a second at most, so a runner's start does
-# not wait for other jobs. max_concurrency caps the batches launching at
-# once, and with max_batch_size the launches in flight: 10 batches of 5,
-# at most 50 launches across all tenants. Each one registers a runner
-# with GitHub, and a burst from one organization would otherwise spend
-# its installation's rate limit, which the reconciler and the app share.
-[[queues.consumers]]
-queue = "hatchrun-launches"
-max_batch_size = 5
-max_batch_timeout = 1
-max_retries = 3
-max_concurrency = 10
-dead_letter_queue = "hatchrun-launches-dlq"
-
-# Launch messages that ran out of retries. This Worker records each one
-# in failed_launches and emails the failed launch alert
-# (crates/cloud/src/alerts.rs); the reconciler launches the job again.
-[[queues.consumers]]
-queue = "hatchrun-launches-dlq"
-max_batch_size = 10
-max_batch_timeout = 5
-max_retries = 3
-
-# Alert emails, sent through Cloudflare Email Service from
-# alerts@notify.hatchrun.io, a subdomain onboarded to Email Sending so
-# hatchrun.io's own mail records stay as they are. The binding sends
-# from that address only. The inbox is the ALERT_EMAIL secret, kept out
-# of this public file.
-[[send_email]]
-name = "ALERTS"
-allowed_sender_addresses = ["alerts@notify.hatchrun.io"]
-
-# Runner metrics, which hatchrun-telemetry (crates/telemetry) writes to
-# Analytics Engine, read back for the app's job pages.
-[analytics]
-binding = "ANALYTICS_SQL"
-
 # Secrets: GITHUB_WEBHOOK_SECRET, GITHUB_APP_PRIVATE_KEY (PEM),
 # GITHUB_CLIENT_SECRET (the App's client secret, for sign-in),
 # POLAR_ACCESS_TOKEN and POLAR_WEBHOOK_SECRET (billing),
-# OIDC_SIGNING_KEY (RSA private key in PEM), BROKER_TOKEN and
-# TELEMETRY_SIGNING_KEY (Ed25519 private key in PKCS#8 PEM, which signs
-# runners' telemetry tokens and nothing else), plus
+# OIDC_SIGNING_KEY (RSA private key in PEM), plus
 # OIDC_NEXT_SIGNING_KEY and OIDC_PREVIOUS_SIGNING_KEY while a key is
-# rotated, and ALERT_EMAIL (the inbox alerts go to, which the uptime
-# monitor polling https://app.hatchrun.io/healthz emails too).
-# Variables: those below. GITHUB_API_URL, GITHUB_WEB_URL,
-# AWS_ENDPOINT_URL and ACTIONS_OIDC_ISSUER point the Worker at local
-# stubs under wrangler dev.
+# rotated.
+# Variables: those below. GITHUB_API_URL, GITHUB_WEB_URL and
+# ACTIONS_OIDC_ISSUER point the Worker at local stubs under wrangler
+# dev.
 [vars]
 # The app's origin. Sign-in sends GitHub users back to
 # $APP_URL/api/auth/callback, which the App lists as its callback URL.
@@ -128,55 +76,16 @@ GITHUB_APP_ID = "Iv23liMh4C066YyxQB7R"
 # Its slug; owners install it at github.com/apps/$GITHUB_APP_SLUG, and
 # its setup URL is $APP_URL/api/github/setup.
 GITHUB_APP_SLUG = "hatchrun"
-# The published connect.yaml (the TemplateUrl output of
-# deploy/cloudformation/templates-bucket.yaml), which the Launch Stack
-# links open. Empty until the bucket exists; the app says so until then.
-CONNECT_TEMPLATE_URL = "https://hatchrun-templates.s3.us-east-1.amazonaws.com/connect.yaml"
-# The AWS Marketplace pages of the runner images (hatchrun/images). An
-# account subscribes to each once before the connect stack's role can
-# launch it.
-MARKETPLACE_AMD64_URL = "https://aws.amazon.com/marketplace/pp/prodview-znhn62372z6jq"
-MARKETPLACE_ARM64_URL = "https://aws.amazon.com/marketplace/pp/prodview-nchg6i6uzlfr2"
-# The Polar product an organization subscribes to: a metered price of
-# 0.001666666666 cents per unit on the "Runner seconds" meter (the sum of
-# metadata.seconds of the "job.seconds" events the reconciler sends), no cap
-# and no meter credit, which matches PRICE_MICROS_PER_MINUTE in
-# src/usage.rs. Several products may be listed, separated by commas;
-# checkout offers all of them and answers 503 while the list is empty. The
-# product also carries a metered price of 0.003333333333 cents per unit on
-# the "CI usage" meter (the sum of metadata.units of the "ci.usage" events;
-# a unit is one 2 vCPU second), with no meter credit, which bills hatchrun
-# CI on the same subscription. POLAR_API_URL points the Worker at Polar's
-# sandbox (https://sandbox-api.polar.sh).
+# The Polar product an organization subscribes to. Its metered price of
+# 0.003333333333 cents per unit on the "CI usage" meter (the sum of
+# metadata.units of the "ci.usage" events hatchrun-ci sends; a unit is
+# one 2 vCPU second), with no meter credit, bills hatchrun CI. Several
+# products may be listed, separated by commas; checkout offers all of
+# them and answers 503 while the list is empty. POLAR_API_URL points the
+# Worker at Polar's sandbox (https://sandbox-api.polar.sh).
 POLAR_PRODUCT_ID = "a2dfff6e-1a3a-40fe-b576-70fccd81f694"
-# hatchrun-broker (crates/broker), where launches store runner configs.
-# Both Workers share BROKER_TOKEN.
-BROKER_URL = "https://broker.hatchrun.io"
-# hatchrun-telemetry (crates/telemetry), where runners report CPU and
-# memory with a token signed by TELEMETRY_SIGNING_KEY.
-TELEMETRY_URL = "https://telemetry.hatchrun.io"
-# The job cache API this Worker serves, which runners of profiles with
-# the cache extra call with a token in their boot document. Unset, no
-# runner gets the cache.
-CACHE_URL = "https://app.hatchrun.io/v1/cache"
 # kid of OIDC_SIGNING_KEY in oidc.hatchrun.io's JWKS. The JWKS also
 # lists OIDC_NEXT_SIGNING_KEY and OIDC_PREVIOUS_SIGNING_KEY while
 # OIDC_NEXT_KEY_ID and OIDC_PREVIOUS_KEY_ID are set here. The README
 # has the rotation steps.
 OIDC_KEY_ID = "2026-10-14"
-# The reconciler's timeouts, in seconds (crates/cloud/src/reconcile/plan.rs
-# says what each one bounds). A job queued this long without a runner
-# launches again.
-RECONCILE_QUEUED_GRACE_SECS = "60"
-# The longest a launch takes, and an instance without a known job runs.
-RECONCILE_LAUNCH_TIMEOUT_SECS = "600"
-# How long a runner waits for its job before the launch is given up.
-RECONCILE_IDLE_TIMEOUT_SECS = "1800"
-# How long an instance nothing needs stays up.
-RECONCILE_DONE_GRACE_SECS = "180"
-# The longest any runner instance runs.
-RECONCILE_MAX_INSTANCE_AGE_SECS = "28800"
-# How long an open job goes without a webhook before GitHub is asked.
-RECONCILE_SYNC_AFTER_SECS = "300"
-# How far back failed webhook deliveries are redelivered.
-RECONCILE_REDELIVER_WINDOW_SECS = "21600"

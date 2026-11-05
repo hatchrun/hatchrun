@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use hatchrun_cloud::ci_wake::Woken;
 use hatchrun_cloud::db::{Db, Param, params};
 use hatchrun_workflow::{Level, SecretRefs, templates};
-use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
+use serde::{Deserialize, Serialize};
 use worker::Result;
 
 use super::with_columns;
@@ -700,4 +700,117 @@ fn template_prices() -> String {
         })
         .collect();
     serde_json::to_string(&prices).unwrap_or_default()
+}
+
+/// How many jobs of a run are in each state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct JobCounts {
+    /// All jobs.
+    pub total: u64,
+    /// Completed with `success`.
+    pub passed: u64,
+    /// Completed with `failure`.
+    pub failed: u64,
+    /// Launching or running.
+    pub running: u64,
+    /// Not started: waiting on another job or queued.
+    pub waiting: u64,
+}
+
+impl JobCounts {
+    /// Counts `n` jobs in `status` with `conclusion`.
+    pub fn add(&mut self, status: &str, conclusion: Option<&str>, n: u64) {
+        self.total += n;
+        match (status, conclusion) {
+            ("completed", Some("success")) => self.passed += n,
+            ("completed", Some("failure")) => self.failed += n,
+            ("launching" | "launched" | "running", _) => self.running += n,
+            ("waiting" | "queued", _) => self.waiting += n,
+            _ => {}
+        }
+    }
+
+    /// The counts of `jobs`.
+    #[must_use]
+    pub fn of(jobs: &[JobRow]) -> Self {
+        let mut counts = Self::default();
+        for job in jobs {
+            counts.add(&job.status, job.conclusion.as_deref(), 1);
+        }
+        counts
+    }
+}
+
+/// The job counts of each run in `run_ids`; a run with no jobs is not
+/// in the answer.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn job_counts(db: &Db, run_ids: &[u64]) -> Result<BTreeMap<u64, JobCounts>> {
+    #[derive(Deserialize)]
+    struct Row {
+        run_id: u64,
+        status: String,
+        conclusion: Option<String>,
+        n: u64,
+    }
+    if run_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let ids: Vec<String> = run_ids.iter().map(u64::to_string).collect();
+    let rows: Vec<Row> = db
+        .all(
+            "SELECT run_id, status, conclusion, count(*) AS n FROM ci_jobs \
+             WHERE run_id = ANY (string_to_array($1, ',')::bigint[]) \
+             GROUP BY run_id, status, conclusion",
+            &params![ids.join(",")],
+        )
+        .await?;
+    let mut counts: BTreeMap<u64, JobCounts> = BTreeMap::new();
+    for row in rows {
+        counts
+            .entry(row.run_id)
+            .or_default()
+            .add(&row.status, row.conclusion.as_deref(), row.n);
+    }
+    Ok(counts)
+}
+
+/// A job that waits for an approval, with the run it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ApprovalJob {
+    /// The job.
+    pub job_id: u64,
+    /// Its name.
+    pub job_name: String,
+    /// The environment it waits on.
+    pub environment: Option<String>,
+    /// When the job began to wait.
+    pub since: u64,
+    /// The run.
+    #[serde(flatten)]
+    pub run: super::runs::ListedRun,
+}
+
+/// The jobs of `tenant` held for approval, the longest waiting first,
+/// at most `limit`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn approval_jobs(db: &Db, tenant: &str, limit: u32) -> Result<Vec<ApprovalJob>> {
+    db.all(
+        &format!(
+            "SELECT j.id AS job_id, j.name AS job_name, j.environment, j.updated_at AS since, \
+             {columns} \
+             FROM ci_jobs j, ci_runs r, ci_repos p \
+             WHERE j.run_id = r.id AND p.id = r.repo_id AND p.tenant_id = r.tenant_id \
+             AND p.tenant_id = $1 AND j.status = 'queued' AND j.held = 'approval' \
+             ORDER BY j.updated_at, j.id LIMIT $2",
+            columns = super::runs::LISTED_COLUMNS
+        ),
+        &params![tenant, limit],
+    )
+    .await
 }

@@ -14,26 +14,16 @@
 //! - `/api/installations`, `/api/github/setup` and `/api/tenants` set
 //!   up an organization from an installation of the App (see
 //!   [`tenants`]).
-//! - `/api/tenants/<org>/aws` connects the AWS account (see [`aws`]).
-//! - `/api/tenants/<org>/{runs,settings}` serve the dashboard (see
-//!   [`dashboard`]); `/api/tenants/<org>/jobs/<id>/metrics` serves one
-//!   job's CPU and memory (see [`metrics`]).
-//! - `/api/tenants/<org>/runners` manages runner profiles (see
-//!   [`runners`]).
-//! - `/api/tenants/<org>/{checkout,portal,beta}` and
-//!   `/api/polar/webhook` handle the licence (see [`billing`]).
-//! - `POST /api/internal/images` takes runner image releases from the
-//!   images build (see [`images`]).
+//! - `/api/tenants/<org>/{checkout,portal}` and `/api/polar/webhook`
+//!   handle the licence (see [`billing`]).
+//! - `POST /api/internal/images` takes image releases from the images
+//!   build (see [`images`]).
 //!
 //! Everything but sign-in, the webhooks and image releases needs a
 //! session, and everything but `GET` needs the session's CSRF token.
 
-mod aws;
 mod billing;
-mod dashboard;
 mod images;
-mod metrics;
-mod runners;
 pub(crate) mod tenants;
 
 use serde::Deserialize;
@@ -273,32 +263,14 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         session: &current,
     };
     let segments: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
-    let query = req.url()?.query().map(str::to_owned);
-    let back_to_ci = billing::back_to_ci(query.as_deref());
     let answer = match (method, segments.as_slice()) {
         (Method::Get, ["session"]) => session_json(&current),
         (Method::Get, ["installations"]) => tenants::installations(&ctx).await,
         (Method::Get, ["tenants"]) => tenants::mine(&ctx).await,
         (Method::Post, ["tenants"]) => tenants::create(&ctx, req.json().await?).await,
         (Method::Get, ["tenants", org]) => tenants::show(&ctx, org).await,
-        (Method::Get, ["tenants", org, "aws"]) => aws::instructions(&ctx, org).await,
-        (Method::Post, ["tenants", org, "aws"]) => aws::verify(&ctx, org, req.json().await?).await,
-        (Method::Get, ["tenants", org, "runs"]) => dashboard::runs(&ctx, org, &req).await,
-        (Method::Get, ["tenants", org, "runs", id]) => dashboard::run(&ctx, org, id).await,
-        (Method::Get, ["tenants", org, "jobs", id, "metrics"]) => metrics::job(&ctx, org, id).await,
-        (Method::Put, ["tenants", org, "settings"]) => {
-            dashboard::settings(&ctx, org, req.json().await?).await
-        }
-        (method, ["tenants", org, "runners", rest @ ..]) => {
-            runners::route(&ctx, org, method, rest, &mut req).await
-        }
-        (Method::Post, ["tenants", org, "checkout"]) => {
-            billing::checkout(&ctx, org, back_to_ci).await
-        }
-        (Method::Post, ["tenants", org, "portal"]) => billing::portal(&ctx, org, back_to_ci).await,
-        (Method::Post, ["tenants", org, "beta"]) => {
-            billing::redeem(&ctx, org, req.json().await?).await
-        }
+        (Method::Post, ["tenants", org, "checkout"]) => billing::checkout(&ctx, org).await,
+        (Method::Post, ["tenants", org, "portal"]) => billing::portal(&ctx, org).await,
         (Method::Get, ["github", "setup"]) => tenants::setup(&ctx, &req).await,
         _ => return json_error("not found", 404),
     };

@@ -218,6 +218,141 @@ pub fn admin_verdict(
         .map_err(|err| Failure::Worker(worker::Error::RustError(format!("membership: {err}"))))
 }
 
+/// What GitHub's answer to the membership call means at `now_secs`:
+/// the organization and whether the user is an admin of it, when the
+/// user is an active member.
+///
+/// # Errors
+///
+/// GitHub rate limits the user's token, or failed.
+pub fn member_verdict(
+    response: &hatchrun_cloud::http::Response,
+    now_secs: u64,
+) -> Result<Option<(u64, bool)>, Failure> {
+    if let Some(wait) = github::throttle(response, now_secs, 0) {
+        return Err(Failure::Retry(wait));
+    }
+    if response.status == 403 {
+        return Ok(None);
+    }
+    hatchrun_cloud::github::parse_membership(response)
+        .map(|membership| {
+            membership
+                .filter(|m| m.state == "active")
+                .map(|m| (m.organization.id, m.is_admin()))
+        })
+        .map_err(|err| Failure::Worker(worker::Error::RustError(format!("membership: {err}"))))
+}
+
+/// The id of the GitHub organization `org` and whether the session's
+/// user is an admin of it, when they are an active member. Same rules
+/// as [`org_admin`].
+///
+/// # Errors
+///
+/// As [`org_admin`].
+pub async fn org_member(
+    settings: &Settings,
+    session: &Session,
+    org: &str,
+) -> Result<Option<(u64, bool)>, Failure> {
+    let request = hatchrun_cloud::github::membership(&settings.github_api, &session.token, org);
+    let response = send(&request).await.map_err(|err| {
+        Failure::Worker(worker::Error::RustError(format!(
+            "membership of {org}: {err}"
+        )))
+    })?;
+    member_verdict(&response, worker::Date::now().as_millis() / 1000)
+}
+
+/// Pages of an installation's repositories that are read for one user,
+/// a hundred repositories each. A repository after them is not
+/// readable by the list routes.
+const READABLE_PAGES: u32 = 10;
+
+type Readable = (u64, std::collections::HashSet<u64>);
+
+thread_local! {
+    static READABLE: RefCell<HashMap<Key, Readable>> = RefCell::new(HashMap::new());
+}
+
+fn readable_cached(key: Key, now: u64) -> Option<std::collections::HashSet<u64>> {
+    READABLE.with(|cache| {
+        cache
+            .borrow()
+            .get(&key)
+            .filter(|(until, _)| *until > now)
+            .map(|(_, ids)| ids.clone())
+    })
+}
+
+fn readable_remember(key: Key, ids: &std::collections::HashSet<u64>, now: u64) {
+    READABLE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= CACHE_CAP {
+            cache.retain(|_, (until, _)| *until > now);
+            if cache.len() >= CACHE_CAP {
+                cache.clear();
+            }
+        }
+        cache.insert(key, (now + CACHE_MS, ids.clone()));
+    });
+}
+
+/// The ids of the repositories of installation `installation_id` that
+/// the session's user can read, from GitHub's list of what their token
+/// reaches through the installation: one call per hundred repositories
+/// instead of one per repository, kept for [`CACHE_MS`] per user. A
+/// public repository is readable by anyone and is not in this set
+/// unless the user reaches it; callers add those by the stored
+/// visibility.
+///
+/// # Errors
+///
+/// A call to GitHub failed, or GitHub asks to wait. The caller never
+/// reads that as "no repositories".
+pub async fn readable_in_installation(
+    session: &Session,
+    settings: &Settings,
+    installation_id: u64,
+) -> Result<std::collections::HashSet<u64>, Failure> {
+    let now = worker::Date::now().as_millis();
+    let key = (session.user.id, installation_id);
+    if let Some(ids) = readable_cached(key, now) {
+        return Ok(ids);
+    }
+    let mut ids = std::collections::HashSet::new();
+    for page in 1..=READABLE_PAGES {
+        let request = github::user_installation_repos(
+            &settings.github_api,
+            installation_id,
+            page,
+            &session.token,
+        );
+        let response = send(&request).await.map_err(|err| {
+            Failure::Worker(worker::Error::RustError(format!(
+                "installation {installation_id} repositories: {err}"
+            )))
+        })?;
+        if let Some(wait) = github::throttle(&response, now / 1000, 0) {
+            return Err(Failure::Retry(wait));
+        }
+        // The user's token cannot see the installation: it reaches
+        // nothing through it.
+        if matches!(response.status, 403 | 404) {
+            break;
+        }
+        let (repos, more) = github::installed_repos(&response)
+            .map_err(|err| Failure::Worker(worker::Error::RustError(err)))?;
+        ids.extend(repos.iter().map(|repo| repo.id));
+        if !more {
+            break;
+        }
+    }
+    readable_remember(key, &ids, now);
+    Ok(ids)
+}
+
 /// The id of the GitHub organization `org` when the session's user is
 /// an active admin of it, by GitHub's word on every call. A login can
 /// name another organization than a tenant once knew, so callers find
@@ -362,6 +497,43 @@ mod tests {
         assert_eq!(cached(key, 1000 + CACHE_MS - 1), Some(p));
         assert_eq!(cached(key, 1000 + CACHE_MS), None);
         assert_eq!(cached((900_001, 5), 1000), None);
+    }
+
+    #[test]
+    fn any_active_member_passes_with_their_role() {
+        let ok = |role: &str, state: &str| {
+            answer(
+                200,
+                &[],
+                &format!(
+                    r#"{{"role":"{role}","state":"{state}","organization":{{"id":42,"login":"acme","avatar_url":""}}}}"#
+                ),
+            )
+        };
+        assert_eq!(
+            member_verdict(&ok("admin", "active"), 0).unwrap(),
+            Some((42, true))
+        );
+        assert_eq!(
+            member_verdict(&ok("member", "active"), 0).unwrap(),
+            Some((42, false))
+        );
+        assert_eq!(member_verdict(&ok("member", "pending"), 0).unwrap(), None);
+        assert_eq!(member_verdict(&answer(404, &[], ""), 0).unwrap(), None);
+        assert!(matches!(
+            member_verdict(&answer(429, &[], ""), 1000),
+            Err(Failure::Retry(60))
+        ));
+    }
+
+    #[test]
+    fn readable_sets_are_kept_for_a_minute() {
+        let key = (900_011, 900_012);
+        assert_eq!(readable_cached(key, 1000), None);
+        let ids = std::collections::HashSet::from([1, 2]);
+        readable_remember(key, &ids, 1000);
+        assert_eq!(readable_cached(key, 1000 + CACHE_MS - 1), Some(ids));
+        assert_eq!(readable_cached(key, 1000 + CACHE_MS), None);
     }
 
     #[test]

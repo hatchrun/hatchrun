@@ -64,6 +64,79 @@ pub async fn environments(db: &Db, repo_id: u64) -> Result<Vec<EnvironmentRow>> 
     .await
 }
 
+/// An environment of an organization's repository, with what hangs on
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OrgEnvironment {
+    /// The repository, `owner/name`.
+    pub repository: String,
+    /// The environment.
+    #[serde(flatten)]
+    pub environment: EnvironmentRow,
+    /// How many secrets are set on the environment.
+    pub secrets: u64,
+    /// How many variables are set on it.
+    pub vars: u64,
+}
+
+/// The environments of the repositories of `tenant`, by repository and
+/// name: `limit` of them from `offset`, and how many `text` (in the
+/// name or the repository, ignoring case) and `repo` (`owner/name`)
+/// leave in all.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn org_environments(
+    db: &Db,
+    tenant: &str,
+    text: Option<&str>,
+    repo: Option<&str>,
+    offset: u64,
+    limit: u32,
+) -> Result<(Vec<OrgEnvironment>, u64)> {
+    #[derive(Deserialize)]
+    struct Total {
+        total: u64,
+    }
+    let pattern = text.map(|text| {
+        let mut out = String::from("%");
+        for c in text.chars() {
+            if matches!(c, '%' | '_' | '\\') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('%');
+        out
+    });
+    let from = "FROM ci_environments e JOIN ci_repos p ON p.id = e.repo_id \
+         AND p.tenant_id = e.tenant_id \
+         WHERE e.tenant_id = $1 AND position('#gone-' in p.full_name) = 0 \
+         AND ($2::text IS NULL OR e.name ILIKE $2::text OR p.full_name ILIKE $2::text) \
+         AND ($3::text IS NULL OR lower(p.full_name) = lower($3::text))";
+    let bound = params![tenant, pattern, repo];
+    let total = db
+        .first::<Total>(&format!("SELECT count(*) AS total {from}"), &bound)
+        .await?
+        .map_or(0, |row| row.total);
+    let mut bound = bound;
+    bound.extend(params![limit, offset]);
+    let rows = db
+        .all(
+            &format!(
+                "SELECT p.full_name AS repository, e.id, e.repo_id, e.name, \
+                 e.branches::text AS branches, e.approval, e.updated_at, \
+                 (SELECT count(*) FROM ci_secrets s WHERE s.environment_id = e.id) AS secrets, \
+                 (SELECT count(*) FROM ci_vars v WHERE v.environment_id = e.id) AS vars \
+                 {from} ORDER BY lower(p.full_name), lower(e.name), e.id LIMIT $4 OFFSET $5"
+            ),
+            &bound,
+        )
+        .await?;
+    Ok((rows, total))
+}
+
 /// The environment of `repo_id` called `name`, ignoring case.
 ///
 /// # Errors

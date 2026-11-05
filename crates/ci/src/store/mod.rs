@@ -16,6 +16,7 @@ mod billing;
 mod cache;
 mod concurrency;
 mod environments;
+mod installation;
 mod jobs;
 mod pool;
 mod reconciler;
@@ -42,13 +43,20 @@ pub use self::concurrency::{
     victims, wake_targets,
 };
 pub use self::environments::{
-    EnvironmentRow, JobEnvironment, PutEnvironment, decide_approval, delete_environment,
-    environment, environments, job_environment, put_environment, release_approval_holds,
+    EnvironmentRow, JobEnvironment, OrgEnvironment, PutEnvironment, decide_approval,
+    delete_environment, environment, environments, job_environment, org_environments,
+    put_environment, release_approval_holds,
+};
+pub use self::installation::{
+    LastRun, OrgRepo, RepoFilter, RepoVisibility, SetupRow, installation_synced, repo_enabled,
+    repos_page, set_enabled, sync_installation, tenant_installation, tenant_repo_visibility,
+    tenant_setup, touch_installation_repo, unknown_repos,
 };
 pub use self::jobs::{
-    Claim, JobRow, NewJob, capacity_wait, claim_launch, finish_job, heartbeat, held_siblings, hold,
-    insert_jobs, job, jobs_by_ids, jobs_for_run, launch_failed, launched, note_queued_error,
-    open_jobs, queue_job, reset_job, set_job, start_job,
+    ApprovalJob, Claim, JobCounts, JobRow, NewJob, approval_jobs, capacity_wait, claim_launch,
+    finish_job, heartbeat, held_siblings, hold, insert_jobs, job, job_counts, jobs_by_ids,
+    jobs_for_run, launch_failed, launched, note_queued_error, open_jobs, queue_job, reset_job,
+    set_job, start_job,
 };
 pub use self::pool::{
     PoolRow, claims_by_bucket, drop_pool, move_pool, pool_rows, save_pool, take_pool,
@@ -59,8 +67,8 @@ pub use self::reconciler::{
 };
 pub use self::repos::{RepoRow, delivery_seen, record_delivery, repo, repo_by_name, upsert_repo};
 pub use self::runs::{
-    NewRun, RunRow, finish_run, insert_run, reopen_run_at, run, run_for_delivery, run_started,
-    runs_for_repo,
+    After, ListedRun, NewRun, RunCounts, RunFilter, RunRow, RunStatus, finish_run, insert_run,
+    latest_on_default, reopen_run_at, run, run_counts, run_for_delivery, run_started, runs_page,
 };
 pub use self::secrets::{
     Owner, Put, SealedRow, SecretItem, StaleRow, VarItem, delete_secret, delete_var, job_vars,

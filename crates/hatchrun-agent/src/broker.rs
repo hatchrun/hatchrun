@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Claims the runner's boot document from hatchrun-broker.
+//! Claims the instance's boot document from hatchrun-broker.
 
 use std::time::Duration;
 
@@ -45,7 +45,7 @@ impl Broker for HttpBroker {
                 debug!("broker unreachable: {err}");
                 return Ok(None);
             }
-            Err(err) => return Err(err).context("claim runner config"),
+            Err(err) => return Err(err).context("claim boot document"),
         };
         match response.status() {
             StatusCode::OK => {
@@ -59,7 +59,7 @@ impl Broker for HttpBroker {
                 debug!(%status, "broker busy");
                 Ok(None)
             }
-            status => bail!("claim runner config: broker answered {status}"),
+            status => bail!("claim boot document: broker answered {status}"),
         }
     }
 }

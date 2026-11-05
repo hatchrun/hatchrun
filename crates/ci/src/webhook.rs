@@ -3,8 +3,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! `POST /github/webhook`: the `push`, `pull_request`, `check_run`,
-//! `release`, `create` and `delete` deliveries that `hatchrun-cloud`
+//! `release`, `create`, `delete`, `repository` and
+//! `installation_repositories` deliveries that `hatchrun-cloud`
 //! forwards.
+//!
+//! A repository that is not enabled for its tenant (see
+//! [`crate::installation`]) starts no runs: its deliveries are
+//! answered as ignored.
 
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
@@ -16,6 +21,7 @@ use worker::{Env, Method, Request, RequestInit, Response, Result};
 
 use crate::env::{Settings, run_stub};
 use crate::github;
+use crate::installation;
 use crate::intake::{self, PullRequest, Push, RefChange, Release, Repo, Rerequested, Trigger};
 use crate::planning;
 use crate::runs::{self, Config};
@@ -130,8 +136,12 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
             return Response::error("bad payload", 400);
         }
     };
+    if let Trigger::InstallationRepositories { installation_id } = &trigger {
+        return installation_changed(env, &db, *installation_id, guid, kind).await;
+    }
     let (installation_id, repo) = match &trigger {
         Trigger::Ignored(reason) => return reply(&Outcome::Ignored(reason.clone())),
+        Trigger::InstallationRepositories { .. } => unreachable!("answered above"),
         Trigger::Push(p) => (p.installation_id, &p.repo),
         Trigger::PullRequest(p) => (p.installation_id, &p.repo),
         Trigger::Release(r) => (r.installation_id, &r.repo),
@@ -163,6 +173,21 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         now,
     )
     .await?;
+    if let Trigger::Repository(_) = &trigger {
+        store::touch_installation_repo(
+            &db,
+            &tenant.id,
+            repo.id,
+            &repo.full_name,
+            &repo.default_branch,
+            repo.private,
+            now,
+        )
+        .await?;
+    } else if !store::repo_enabled(&db, &tenant.id, repo.id).await? {
+        store::record_delivery(&db, guid, kind, now).await?;
+        return reply(&Outcome::Ignored("repository is not enabled".to_owned()));
+    }
     let settings = Settings::read(env).map_err(fail)?;
     let github = Counted::default();
     let tokens = Tokens::new(
@@ -195,11 +220,34 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         // writes; nothing runs.
         Trigger::Repository(_) => Outcome::Done(Vec::new()),
         Trigger::Ignored(reason) => Outcome::Ignored(reason.clone()),
+        Trigger::InstallationRepositories { .. } => unreachable!("answered above"),
     };
     if !matches!(outcome, Outcome::Retry) {
         store::record_delivery(&db, guid, kind, now).await?;
     }
     reply(&outcome)
+}
+
+/// Reads the installation's repositories again after
+/// `installation_repositories` said they changed. A tenant with no
+/// installation of that id has nothing to update.
+async fn installation_changed(
+    env: &Env,
+    db: &Db,
+    installation_id: u64,
+    guid: &str,
+    kind: &str,
+) -> Result<Response> {
+    let Some(tenant) = store::tenant_for_installation(db, installation_id).await? else {
+        return reply(&Outcome::Ignored(
+            "no tenant for this installation".to_owned(),
+        ));
+    };
+    let settings = Settings::read(env).map_err(fail)?;
+    let now = now_ms();
+    installation::sync(env, db, &settings, &tenant.id, installation_id, now).await?;
+    store::record_delivery(db, guid, kind, now).await?;
+    reply(&Outcome::Done(Vec::new()))
 }
 
 /// A delivery that starts workflows on a commit it does not name itself:

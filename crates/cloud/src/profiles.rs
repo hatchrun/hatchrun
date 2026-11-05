@@ -21,10 +21,7 @@
 //! newest generation and then the lowest price. `extras` and
 //! `warm_pool` are kept for features to come and must be empty for now.
 //!
-//! Everything here but [`store`], which reads and writes the
-//! `runner_profiles` table, runs and tests without the Workers runtime.
-
-pub(crate) mod store;
+//! Nothing here needs the Workers runtime.
 
 use serde::{Deserialize, Serialize};
 
@@ -647,9 +644,7 @@ mod tests {
         for family in catalog::FAMILIES {
             assert!(!family.sizes.is_empty(), "{}", family.name);
             assert!(family.sizes.windows(2).all(|pair| pair[0] < pair[1]));
-            for (region, _) in family.prices {
-                assert!(crate::connect::known_region(region), "{region}");
-            }
+            assert!(family.prices.iter().all(|(region, _)| !region.is_empty()));
         }
     }
 }
