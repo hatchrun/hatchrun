@@ -14,8 +14,9 @@ import { createHash } from "node:crypto";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 
-import type { LogIndex } from "../src/api.ts";
-import { handleCiSettings } from "./ci-settings.ts";
+import type { LogIndex } from "../src/api/ci.ts";
+import { handleCiSettings, type Session } from "./ci-settings.ts";
+import { handleScale, paginate } from "./scale.ts";
 
 interface Step {
   index: number;
@@ -67,12 +68,30 @@ const text = (steps: Step[]) => steps.map((step) => [`== ${step.name}`, ...step.
 
 function indexOf(steps: Step[]): LogIndex {
   let offset = 0;
+  let line = 0;
   const marks = steps.map((step) => {
-    const mark = { index: step.index, name: step.name, offset };
+    const lines = step.lines.length + 1;
+    const mark = { index: step.index, name: step.name, offset, line, lines };
     offset += Buffer.byteLength(text([step]));
+    line += lines;
     return mark;
   });
-  return { bytes: offset, steps: marks, dropped_lines: 0 };
+  const errors = steps.flatMap((step, index) =>
+    step.lines.flatMap((text, n) =>
+      text.includes("FAILED") || text.startsWith("error")
+        ? [
+            {
+              // The step's header and the lines before this one, in bytes.
+              offset: (marks[index] as { offset: number }).offset + Buffer.byteLength(`== ${step.name}\n${step.lines.slice(0, n).map((before) => `${before}\n`).join("")}`),
+              line: (marks[index] as { line: number }).line + 1 + n,
+              step: step.index,
+              text,
+            },
+          ]
+        : [],
+    ),
+  );
+  return { bytes: offset, lines: line, steps: marks, dropped_lines: 0, errors, first_error: errors[0] ?? null };
 }
 
 const summary = (step: Step) => ({
@@ -143,12 +162,29 @@ function run(id: number, number: number, workflow: string, event: string, ref: s
     workflow,
     event,
     ref,
+    branch: ref.replace("refs/heads/", ""),
     sha: "3f2a9c1d5e6b7a8091a2b3c4d5e6f708192a3b4c",
     actor: "octocat",
     status,
     conclusion,
     created_at: created,
     completed_at: completed,
+    duration_ms: completed === null ? null : completed - created,
+    jobs: countsOf(id),
+  };
+}
+
+/** What the jobs of a run add up to now. */
+function countsOf(id: number) {
+  const own = jobs.filter((job) => job.run === id);
+  return {
+    total: own.length,
+    passed: own.filter((job) => job.conclusion === "success").length,
+    failed: own.filter((job) => job.conclusion === "failure").length,
+    running: own.filter((job) => job.status === "in_progress").length,
+    waiting: own.filter((job) => job.held !== null).length,
+    cancelled: own.filter((job) => job.conclusion === "cancelled").length,
+    skipped: own.filter((job) => job.conclusion === "skipped").length,
   };
 }
 
@@ -224,14 +260,14 @@ export async function handleCi(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
-  session: { signedIn: boolean; csrf: string },
+  session: Session,
   body: unknown,
 ) {
   const path = url.pathname.replace(/^\/api\/ci\//, "");
   const hidden = () => json(res, 404, { error: "not found" });
   let found: RegExpExecArray | null;
 
-  if (handleCiSettings(req, res, path, session, body)) {
+  if (handleScale(req, res, url, path, session, body) || handleCiSettings(req, res, path, session, body, url)) {
     return;
   }
 
@@ -240,9 +276,8 @@ export async function handleCi(
     if (req.method !== "GET" || (repository !== "e2e/demo" && !isPrivate(repository)) || (isPrivate(repository) && !session.signedIn)) {
       return hidden();
     }
-    const before = Number(url.searchParams.get("before") ?? Infinity);
-    const page = (isPrivate(repository) ? [] : runs).filter((candidate) => candidate.id < before).sort((a, b) => b.id - a.id);
-    return json(res, 200, { runs: page });
+    const page = (isPrivate(repository) ? [] : runs).sort((a, b) => b.id - a.id);
+    return json(res, 200, paginate(page, url));
   }
 
   if ((found = /^repos\/([^/]+)\/([^/]+)\/dispatch$/.exec(path))) {
@@ -281,7 +316,7 @@ export async function handleCi(
     if (!wanted) {
       return hidden();
     }
-    return json(res, 200, { run: wanted, jobs: jobs.filter((job) => job.run === wanted.id).map(jobJson) });
+    return json(res, 200, { access: "admin", run: wanted, jobs: jobs.filter((job) => job.run === wanted.id).map(jobJson) });
   }
 
   if ((found = /^runs\/(\d+)\/artifacts(?:\/(\d+))?$/.exec(path))) {
@@ -334,6 +369,10 @@ export async function handleCi(
         owner.conclusion = "failure";
         owner.completed_at = at;
       }
+    }
+    const owner = runs.find((candidate) => candidate.id === job.run);
+    if (owner) {
+      owner.jobs = countsOf(owner.id);
     }
     return void res.writeHead(204).end();
   }
@@ -415,6 +454,7 @@ export function serveLiveSockets(server: Server) {
           live.status = "completed";
           live.conclusion = "failure";
           live.completed_at = job.completed_at;
+          live.jobs = countsOf(live.id);
         }
         socket.write(frame(JSON.stringify({ type: "end", conclusion: "success" })));
         socket.end(Buffer.from([0x88, 0x00]));

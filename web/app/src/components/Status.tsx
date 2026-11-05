@@ -2,25 +2,28 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { LoaderCircle } from "lucide-react";
+
 import type { Loaded } from "../load";
+import { Button } from "./ui/button";
 
 export function Spinner({ label = "Loading" }: { label?: string }) {
   return (
-    <div className="spinner-row" role="status">
-      <span className="spinner" aria-hidden="true" />
-      <span className="muted">{label}</span>
+    <div className="flex items-center gap-2 py-4 text-fg-2" role="status">
+      <LoaderCircle size={16} aria-hidden="true" className="animate-spin motion-reduce:animate-none" />
+      <span>{label}</span>
     </div>
   );
 }
 
 export function LoadError({ error, retry }: { error: Error; retry?: () => void }) {
   return (
-    <div className="notice notice-error" role="alert">
-      <p>{error.message}</p>
+    <div className="flex flex-wrap items-center gap-3 rounded-sm border border-failed/40 bg-failed/12 px-3 py-2 text-failed-soft" role="alert">
+      <p className="m-0 min-w-0 flex-1">{error.message}</p>
       {retry && (
-        <button type="button" className="button button-small" onClick={retry}>
+        <Button variant="outline" size="sm" onClick={retry}>
           Try again
-        </button>
+        </Button>
       )}
     </div>
   );
@@ -45,7 +48,7 @@ export function Await<T>({
   return (
     <>
       {loaded.stale && (
-        <p className="font-mono text-xs text-fog" role="status">
+        <p className="font-mono text-xs text-fg-3" role="status">
           Could not refresh: {loaded.stale.message}. Showing the last result.
         </p>
       )}

@@ -4,60 +4,84 @@
 
 import type { ReactNode } from "react";
 
+import { cn } from "@/lib/utils";
+
 export interface Step {
   key: string;
   title: string;
   done: boolean;
-  /** Not open yet; says so instead of its body. */
-  soon?: string;
-  /** What the step says when done; its body is shown only while open. */
-  summary?: ReactNode;
-  body: ReactNode;
+  /** The line under the title: what the step does, or what is done. */
+  note?: ReactNode;
+  /** A link or button at the right of the title row. */
+  aside?: ReactNode;
+  /** The step's controls. */
+  children?: ReactNode;
 }
 
-/** The setup steps, one open at a time: the first that is not done. */
-export function Checklist({ steps }: { steps: Step[] }) {
-  const open = steps.findIndex((step) => !step.done && !step.soon);
-  const done = steps.filter((step) => step.done).length;
+/** "2 / 4 done" for the title row. */
+export function ChecklistCount({ steps }: { steps: Step[] }) {
   return (
-    <div className="card checklist">
-      <div className="checklist-head">
-        <span>
-          {done} of {steps.length} done
-        </span>
-        <span className="progress" aria-hidden="true">
-          <span style={{ width: `${(done / steps.length) * 100}%` }} />
-        </span>
-      </div>
-      <ol>
-        {steps.map((step, index) => {
-          const state = step.done ? "done" : index === open ? "open" : "waiting";
-          return (
-            <li key={step.key} className={`step step-${state}`} aria-current={state === "open" ? "step" : undefined}>
-              <span className="step-mark" aria-hidden="true">
-                {step.done ? <Check /> : index + 1}
-              </span>
-              <div className="step-content">
-                <h2 className="step-title">
-                  {step.title}
-                  <span className="visually-hidden">{step.done ? " (done)" : ""}</span>
-                </h2>
-                {step.done ? step.summary && <div className="step-summary">{step.summary}</div> : null}
-                {!step.done && state === "open" && <div className="step-body">{step.body}</div>}
-                {!step.done && step.soon && <p className="step-summary muted">{step.soon}</p>}
-              </div>
-            </li>
-          );
-        })}
-      </ol>
-    </div>
+    <span className="font-mono text-xs text-fg-3">
+      <span className="text-lg font-bold text-fg">{steps.filter((step) => step.done).length}</span> / {steps.length} done
+    </span>
   );
 }
 
-function Check() {
+/**
+ * Setup steps in one panel with a segmented progress bar above. The
+ * first step that is not done is the current one: brand edge and glyph.
+ * Done steps get a green check, later ones three dots.
+ */
+export function Checklist({ steps, label }: { steps: Step[]; label: string }) {
+  const current = steps.findIndex((step) => !step.done);
+  const done = steps.filter((step) => step.done).length;
   return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2">
-      <path d="M3 8.5 6.5 12 13 4.5" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
+    <>
+      <div
+        role="progressbar"
+        aria-label={`${label} progress`}
+        aria-valuemin={0}
+        aria-valuemax={steps.length}
+        aria-valuenow={done}
+        className="grid gap-1"
+        style={{ gridTemplateColumns: `repeat(${steps.length}, 1fr)` }}
+      >
+        {steps.map((step, index) => (
+          <span key={step.key} className={cn("h-1 rounded-xs", step.done ? "bg-passed" : index === current ? "bg-brand" : "bg-control")} />
+        ))}
+      </div>
+      <section aria-label={label} className="rounded-md border border-control bg-panel">
+        {steps.map((step, index) => {
+          const state = step.done ? "done" : index === current ? "current" : "later";
+          return (
+            <div
+              key={step.key}
+              aria-current={state === "current" ? "step" : undefined}
+              className={cn(
+                "flex flex-wrap gap-x-3.5 gap-y-2 px-4 py-3.5",
+                index > 0 && "border-t border-rule",
+                state === "current" && "shadow-[inset_3px_0_0_var(--brand)]",
+              )}
+            >
+              <span
+                aria-hidden="true"
+                className={cn("w-[22px] text-center font-mono font-bold", state === "done" ? "text-passed" : state === "current" ? "text-brand" : "text-fg-3")}
+              >
+                {state === "done" ? "✓" : state === "current" ? "▶" : "•••"}
+              </span>
+              <div className="flex min-w-0 flex-[1_1_420px] flex-col gap-2">
+                <h2 className={cn("m-0 text-[15px] font-bold", state === "later" ? "text-fg-2" : "text-fg")}>
+                  {step.title}
+                  <span className="sr-only">{step.done ? " (done)" : ""}</span>
+                </h2>
+                {step.note && <div className="font-mono text-xs text-fg-3">{step.note}</div>}
+                {step.children}
+              </div>
+              {step.aside}
+            </div>
+          );
+        })}
+      </section>
+    </>
   );
 }

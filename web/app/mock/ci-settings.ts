@@ -6,12 +6,14 @@
 // crates/ci/src/settings_api.rs: an organization's billing the secrets and
 // variables of an organization (with the repositories each reaches), a
 // repository or one of its environments, and a repository's environments.
-// Any organization of the mock tenants answers, and so does the repository
-// demo of each. Billing has a card (the mock Polar checkout adds one),
+// An organization answers to its admins (a member or a stranger gets a 404),
+// and so does the repository demo of each. Billing has a card (the mock Polar checkout adds one),
 // 19,200 seconds and a $50 cap; MOCK_CARD=off drops the card. Values are
 // kept in memory and a secret's is never answered.
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+
+import { orgItems, paginate, SCALE_ORG, scaleEnvironments, scaleRepoNames } from "./scale.ts";
 
 interface Item {
   value: string;
@@ -28,25 +30,33 @@ interface Environment {
 
 type Table = Map<string, Item>;
 
-const orgs = ["acme", "acme-corp", "octo-labs"];
 const day = 24 * 3600 * 1000;
 
 const table = (rows: Record<string, string>): Table =>
   new Map(Object.entries(rows).map(([name, value], i) => [name, { value, updatedAt: Date.now() - (i + 1) * day }]));
 
-/** The repositories of each organization that have run CI. */
-const orgRepos = (org: string) => [`${org}/api`, `${org}/web`];
+/** The mock session: who is signed in, the CSRF token, and the viewer's role in an organization (null when it has no tenant). */
+export interface Session {
+  signedIn: boolean;
+  csrf: string;
+  role: (login: string) => "admin" | "member" | null;
+}
 
 /** Environments by `<owner>/<repo>`, in the order of creation. */
 const environments = new Map<string, Map<string, Environment>>();
 
-function seedEnvironments(key: string): Map<string, Environment> {
+/** The environments of `<owner>/<repo>`; the organization-wide list reads them from here too. */
+export function seedEnvironments(key: string): Map<string, Environment> {
   let found = environments.get(key);
   if (!found) {
-    found = new Map([
-      ["production", { branches: ["main"], approval: true, updatedAt: Date.now() - day }],
-      ["staging", { branches: [], approval: false, updatedAt: Date.now() - 2 * day }],
-    ]);
+    found = new Map(
+      key.startsWith(`${SCALE_ORG}/`) && scaleRepoNames().includes(key)
+        ? scaleEnvironments(key)
+        : [
+            ["production", { branches: ["main"], approval: true, updatedAt: Date.now() - day }],
+            ["staging", { branches: [], approval: false, updatedAt: Date.now() - 2 * day }],
+          ],
+    );
     environments.set(key, found);
   }
   return found;
@@ -73,7 +83,9 @@ function seed(key: string, kind: "secrets" | "vars"): Table {
           ? { REGION: "ap-south-1" }
           : {},
     );
-    if (org && kind === "secrets") {
+    if (key === `org:${SCALE_ORG}`) {
+      found = new Map(orgItems(kind).map(({ name, ...item }) => [name, item]));
+    } else if (org && kind === "secrets") {
       const first = found.get("NPM_TOKEN");
       if (first) first.repositories = [`${key.slice("org:".length)}/api`];
     }
@@ -82,7 +94,19 @@ function seed(key: string, kind: "secrets" | "vars"): Table {
   return found;
 }
 
-export const billing = { card: process.env.MOCK_CARD !== "off", capDollars: 50 };
+/** How many secrets and variables an environment of `<owner>/<repo>` holds. */
+export const environmentCounts = (repository: string, name: string) => ({
+  secrets: seed(`env:${repository}/${name}`, "secrets").size,
+  vars: seed(`env:${repository}/${name}`, "vars").size,
+});
+
+export const billing = { capDollars: 50 };
+
+/** Organizations the mock Polar checkout put a card on. */
+const carded = new Set<string>();
+export const addCard = (org: string) => void carded.add(org.toLowerCase());
+/** Whether the organization has a card: all do unless MOCK_CARD=off, then those that went through the checkout. */
+export const hasCard = (org: string) => process.env.MOCK_CARD !== "off" || carded.has(org.toLowerCase());
 
 const MAX_BYTES = 48 * 1024;
 const NAME_MAX = 100;
@@ -115,7 +139,7 @@ function checkRepositories(org: string, given: unknown): string[] | null | { err
   if (!Array.isArray(given) || given.some((name) => typeof name !== "string")) {
     return { error: "repositories must be a list of names or null" };
   }
-  const known = orgRepos(org);
+  const known = org === SCALE_ORG ? scaleRepoNames() : [`${org}/api`, `${org}/web`];
   const unknown = (given as string[]).filter((name) => !known.some((seen) => seen.toLowerCase() === name.toLowerCase()));
   if (unknown.length > 0) return { error: `Unknown repositories: ${[...new Set(unknown)].join(", ")}` };
   return [...new Set(given as string[])].sort();
@@ -164,11 +188,12 @@ export function handleCiSettings(
   req: IncomingMessage,
   res: ServerResponse,
   path: string,
-  session: { signedIn: boolean; csrf: string },
+  session: Session,
   body: unknown,
+  url: URL = new URL("http://localhost/"),
 ): boolean {
   const found =
-    /^orgs\/([^/]+)\/(billing(?:\/cap)?|secrets|vars|repositories)(?:\/([^/]+))?$/.exec(path) ??
+    /^orgs\/([^/]+)\/(billing(?:\/cap)?|secrets|vars)(?:\/([^/]+))?$/.exec(path) ??
     /^repos\/([^/]+)\/([^/]+)\/(secrets|vars)(?:\/([^/]+))?$/.exec(path) ??
     /^repos\/([^/]+)\/([^/]+)\/environments(?:\/([^/]+)(?:\/(secrets|vars)(?:\/([^/]+))?)?)?$/.exec(path);
   if (!found) {
@@ -186,7 +211,7 @@ export function handleCiSettings(
   const method = req.method ?? "GET";
 
   // A viewer who cannot manage the scope sees a 404, as the API answers.
-  const known = org ? orgs.includes(owner) : (orgs.includes(owner) || owner === "e2e") && repo === "demo";
+  const known = org ? session.role(owner) === "admin" : (owner === "e2e" || session.role(owner) === "admin") && (repo === "demo" || owner === SCALE_ORG);
   if (!session.signedIn) {
     json(res, 401, { error: "sign in to manage billing" });
     return true;
@@ -204,7 +229,7 @@ export function handleCiSettings(
     const sub = what.slice("billing/".length);
     if (what === "billing" && method === "GET") {
       json(res, 200, {
-        card: billing.card,
+        card: hasCard(owner),
         seconds: 19_200,
         units: 19_200,
         spendCents: Math.floor((19_200 * 2_000) / 60 / 10_000),
@@ -230,15 +255,6 @@ export function handleCiSettings(
     return true;
   }
 
-  if (org && what === "repositories") {
-    if (method !== "GET") {
-      json(res, 405, { error: "method not allowed" });
-    } else {
-      json(res, 200, orgRepos(owner).map((name) => ({ name })));
-    }
-    return true;
-  }
-
   const environmentRows = inEnvironments ? seedEnvironments(`${owner}/${repo}`) : null;
   if (environmentRows && what === "") {
     return environmentRoute(res, method, environmentRows, environment, body);
@@ -251,13 +267,15 @@ export function handleCiSettings(
   const kind = what as "secrets" | "vars";
   const rows = seed(org ? `org:${owner}` : inEnvironments ? `env:${owner}/${repo}/${environment}` : `repo:${owner}/${repo}`, kind);
   if (item === "" && method === "GET") {
+    const needle = (url.searchParams.get("q") ?? "").toLowerCase();
     const list = [...rows.entries()]
+      .filter(([name]) => !needle || name.toLowerCase().includes(needle))
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([name, row]) => {
         const repositories = org ? (row.repositories ?? null) : null;
         return kind === "secrets" ? { name, updatedAt: row.updatedAt, repositories } : { name, value: row.value, updatedAt: row.updatedAt, repositories };
       });
-    json(res, 200, list);
+    json(res, 200, paginate(list, url));
     return true;
   }
   const name = validName(item, kind === "secrets" ? "secret" : "variable");

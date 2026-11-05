@@ -804,7 +804,7 @@ status="$(app_call PUT orgs/e2e/secrets/ORG_ONLY "$(jq -nc --arg v "$only_value"
   die "an unknown repository answered $status: $(cat "$tmp/answer")"
 put_ok 204 orgs/e2e/secrets/ORG_ONLY "$(jq -nc --arg v "$only_value" '{value: $v, repositories: ["e2e/other"]}')"
 status="$(app_call GET orgs/e2e/secrets)"
-answered 200 --arg name ORG_ONLY '[.[] | select(.name == $name)] | length == 1 and .[0].repositories == ["e2e/other"]' ||
+answered 200 --arg name ORG_ONLY '[.items[] | select(.name == $name)] | length == 1 and .[0].repositories == ["e2e/other"]' ||
   die "ORG_ONLY is not listed for e2e/other: $status $(cat "$tmp/answer")"
 log "environments: set up"
 

@@ -164,8 +164,8 @@ export function DispatchDialog({
               returnFocus.current.focus();
             }
           }}
-          className="fixed top-1/2 left-1/2 z-50 max-h-[90vh] w-[min(520px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-md border border-rivet bg-graphite p-5">
-          <Dialog.Title className="display text-xl">Run workflow</Dialog.Title>
+          className="fixed top-1/2 left-1/2 z-50 max-h-[90vh] w-[min(520px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-md border border-control bg-background p-5">
+          <Dialog.Title className="section-title">Run workflow</Dialog.Title>
           <Dialog.Description className="muted mb-4">
             Starts a workflow of {owner}/{repo} that has a <code>workflow_dispatch</code> trigger.
           </Dialog.Description>
