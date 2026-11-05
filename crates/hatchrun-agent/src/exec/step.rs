@@ -27,7 +27,7 @@ use super::commands::{Command as WorkflowCommand, Parser};
 use super::lines::Lines;
 use super::mask::Masker;
 use super::sink::Sink;
-use crate::runner::run_as;
+use crate::account::run_as;
 
 /// How long output is read after the main process ends.
 const DRAIN: Duration = Duration::from_secs(1);

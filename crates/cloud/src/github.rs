@@ -2,10 +2,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The GitHub App's REST calls: an installation token, then a
-//! just-in-time runner for a job, and removing it again when its
-//! instance does not start; and, with a signed-in user's token, who the
-//! user is.
+//! The GitHub App's REST calls: an installation token, and, with a
+//! signed-in user's token, who the user is and what they can see.
 
 use std::collections::BTreeMap;
 
@@ -16,10 +14,6 @@ use crate::jwt;
 
 /// The REST API.
 pub const API: &str = "https://api.github.com";
-/// Runner group every JIT runner joins: the organization's default.
-const RUNNER_GROUP: u64 = 1;
-/// The runner's work directory, relative to its install directory.
-const WORK_FOLDER: &str = "_work";
 
 /// The claims of the App's JWT, which it trades for an installation
 /// token. Backdated a minute for clock drift and valid for nine, under
@@ -135,71 +129,6 @@ pub fn token(response: &Response) -> Result<Token, String> {
 #[must_use]
 pub fn owner(repository: &str) -> &str {
     repository.split('/').next().unwrap_or(repository)
-}
-
-/// Registers a just-in-time runner in `org` that takes jobs with exactly
-/// `label` (see [`crate::labels`] on why one label).
-#[must_use]
-pub fn generate_jit_config(api: &str, org: &str, token: &str, name: &str, label: &str) -> Request {
-    call(
-        "POST",
-        format!("{api}/orgs/{org}/actions/runners/generate-jitconfig"),
-        token,
-    )
-    .header("Content-Type", "application/json")
-    .body(
-        serde_json::json!({
-            "name": name,
-            "runner_group_id": RUNNER_GROUP,
-            "labels": [label],
-            "work_folder": WORK_FOLDER,
-        })
-        .to_string(),
-    )
-}
-
-/// A registered JIT runner.
-#[derive(Deserialize)]
-pub struct JitConfig {
-    /// The runner.
-    pub runner: Runner,
-    /// What the agent hands to the runner. Anyone holding it can run
-    /// jobs as this runner, so it travels only through the broker.
-    pub encoded_jit_config: String,
-}
-
-impl std::fmt::Debug for JitConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JitConfig")
-            .field("runner", &self.runner)
-            .finish_non_exhaustive()
-    }
-}
-
-/// A runner GitHub knows.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-pub struct Runner {
-    /// Runner id.
-    pub id: u64,
-}
-
-/// Reads the JIT config out of the answer.
-///
-/// # Errors
-///
-/// GitHub's answer when it is not a config.
-pub fn jit_config(response: &Response) -> Result<JitConfig, String> {
-    decode(response, "JIT config")
-}
-
-/// Removes a runner that never got an instance.
-#[must_use]
-pub fn delete_runner(api: &str, org: &str, token: &str, runner_id: u64) -> Request {
-    call(
-        "DELETE",
-        format!("{api}/orgs/{org}/actions/runners/{runner_id}"),
-        token,
-    )
 }
 
 /// The signed-in user, asked with their user token.
@@ -364,113 +293,6 @@ pub fn install_url(web: &str, app_slug: &str, state: &str) -> String {
     )
 }
 
-/// A workflow run of `repository` (`owner/name`).
-#[must_use]
-pub fn workflow_run(api: &str, token: &str, repository: &str, run_id: u64) -> Request {
-    call(
-        "GET",
-        format!("{api}/repos/{repository}/actions/runs/{run_id}"),
-        token,
-    )
-}
-
-/// Reads a workflow run as the cache needs it.
-///
-/// # Errors
-///
-/// GitHub's answer when it is not a run.
-pub fn parse_workflow_run(response: &Response) -> Result<crate::cache::Run, String> {
-    decode(response, "workflow run")
-}
-
-/// The branch `branch` of `repository`.
-#[must_use]
-pub fn branch_ref(api: &str, token: &str, repository: &str, branch: &str) -> Request {
-    let path = branch
-        .split('/')
-        .map(crate::http::encode)
-        .collect::<Vec<_>>()
-        .join("/");
-    call(
-        "GET",
-        format!("{api}/repos/{repository}/git/ref/heads/{path}"),
-        token,
-    )
-}
-
-#[derive(Deserialize)]
-struct GitRef {
-    object: GitObject,
-}
-
-#[derive(Deserialize)]
-struct GitObject {
-    sha: String,
-}
-
-/// The commit a branch points at, or `None` when there is no such
-/// branch.
-///
-/// # Errors
-///
-/// GitHub's answer when it is neither a ref nor a 404.
-pub fn branch_sha(response: &Response) -> Result<Option<String>, String> {
-    if response.status == 404 {
-        return Ok(None);
-    }
-    decode::<GitRef>(response, "branch").map(|found| Some(found.object.sha))
-}
-
-/// Compares commit `head` with commit `base` in `repository`.
-#[must_use]
-pub fn compare(api: &str, token: &str, repository: &str, base: &str, head: &str) -> Request {
-    call(
-        "GET",
-        format!(
-            "{api}/repos/{repository}/compare/{}...{}?per_page=1",
-            crate::http::encode(base),
-            crate::http::encode(head)
-        ),
-        token,
-    )
-}
-
-#[derive(Deserialize)]
-struct Comparison {
-    status: String,
-}
-
-/// Whether `head` is `base` or one of its ancestors, from a compare
-/// answer: `identical` or `behind`.
-///
-/// # Errors
-///
-/// GitHub's answer when it is not a comparison.
-pub fn contained(response: &Response) -> Result<bool, String> {
-    decode::<Comparison>(response, "comparison")
-        .map(|comparison| matches!(comparison.status.as_str(), "identical" | "behind"))
-}
-
-/// The repository `owner/name`.
-#[must_use]
-pub fn repository(api: &str, token: &str, repository: &str) -> Request {
-    call("GET", format!("{api}/repos/{repository}"), token)
-}
-
-#[derive(Deserialize)]
-struct Repository {
-    default_branch: String,
-}
-
-/// The default branch from a repository answer.
-///
-/// # Errors
-///
-/// GitHub's answer when it is not a repository.
-pub fn default_branch(response: &Response) -> Result<String, String> {
-    decode::<Repository>(response, "repository").map(|repository| repository.default_branch)
-}
-
 fn decode<T: for<'de> Deserialize<'de>>(response: &Response, what: &str) -> Result<T, String> {
     if !response.ok() {
         return Err(format!(
@@ -564,54 +386,8 @@ mod tests {
     }
 
     #[test]
-    fn registers_a_runner_with_the_job_label_only() {
-        let request = generate_jit_config(
-            API,
-            "acme",
-            "ghs_x",
-            "hatchrun-7-ab12",
-            "hatchrun-4cpu-arm64",
-        );
-        assert_eq!(
-            request.url,
-            "https://api.github.com/orgs/acme/actions/runners/generate-jitconfig"
-        );
-        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({
-                "name": "hatchrun-7-ab12",
-                "runner_group_id": 1,
-                "labels": ["hatchrun-4cpu-arm64"],
-                "work_folder": "_work",
-            })
-        );
-        let answer = Response { headers: Vec::new(),
-            status: 201,
-            body: br#"{"runner":{"id":23,"name":"hatchrun-7-ab12","os":"unknown","status":"offline","busy":false,"labels":[]},"encoded_jit_config":"abc"}"#.to_vec(),
-        };
-        let config = jit_config(&answer).unwrap();
-        assert_eq!(config.runner, Runner { id: 23 });
-        assert_eq!(config.encoded_jit_config, "abc");
-        assert!(!format!("{config:?}").contains("abc"));
-    }
-
-    #[test]
-    fn says_what_github_answered() {
-        let answer = Response {
-            headers: Vec::new(),
-            status: 403,
-            body: br#"{"message":"Resource not accessible by integration"}"#.to_vec(),
-        };
-        assert_eq!(
-            jit_config(&answer).unwrap_err(),
-            "JIT config: GitHub answered 403: {\"message\":\"Resource not accessible by integration\"}"
-        );
+    fn names_the_owner() {
         assert_eq!(owner("acme/app"), "acme");
-        assert_eq!(
-            delete_runner(API, "acme", "t", 23).url,
-            "https://api.github.com/orgs/acme/actions/runners/23"
-        );
     }
 
     #[test]
@@ -703,43 +479,5 @@ mod tests {
             install_url("https://github.com", "hatchrun", "t.s/x"),
             "https://github.com/apps/hatchrun/installations/new?state=t.s%2Fx"
         );
-    }
-
-    #[test]
-    fn finds_whether_a_commit_is_on_a_branch() {
-        let answer = |status: u16, body: &str| Response {
-            headers: Vec::new(),
-            status,
-            body: body.as_bytes().to_vec(),
-        };
-        assert_eq!(
-            branch_ref("https://api", "t", "acme/repo", "release/1.x").url,
-            "https://api/repos/acme/repo/git/ref/heads/release/1.x"
-        );
-        assert_eq!(
-            branch_sha(&answer(
-                200,
-                r#"{"ref":"refs/heads/main","object":{"sha":"abc","type":"commit"}}"#
-            )),
-            Ok(Some("abc".to_owned()))
-        );
-        assert_eq!(
-            branch_sha(&answer(404, r#"{"message":"Not Found"}"#)),
-            Ok(None)
-        );
-        assert!(branch_sha(&answer(403, "{}")).is_err());
-        assert_eq!(
-            compare("https://api", "t", "acme/repo", "tip", "head").url,
-            "https://api/repos/acme/repo/compare/tip...head?per_page=1"
-        );
-        for (status, on) in [
-            ("identical", true),
-            ("behind", true),
-            ("ahead", false),
-            ("diverged", false),
-        ] {
-            let body = format!(r#"{{"status":"{status}","ahead_by":0}}"#);
-            assert_eq!(contained(&answer(200, &body)), Ok(on), "{status}");
-        }
     }
 }

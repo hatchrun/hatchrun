@@ -6,6 +6,7 @@ mod artifacts;
 mod cache;
 mod concurrency;
 mod jobs;
+mod lists;
 mod reconciler;
 mod secrets;
 mod usage;
@@ -48,6 +49,21 @@ pub(super) fn claim(db: &TestDb, job_id: u64, now: u64) -> JobRow {
         Claim::Claimed(job) => job,
         other => panic!("not claimed: {other:?}"),
     }
+}
+
+/// The runs of one repository, newest first.
+pub(super) async fn runs_for_repo(
+    db: &Db,
+    repo_id: u64,
+    after: Option<After>,
+    limit: u32,
+) -> worker::Result<Vec<RunRow>> {
+    let filter = RunFilter {
+        repo_ids: vec![repo_id],
+        ..RunFilter::default()
+    };
+    let (rows, _) = runs_page(db, &filter, after, limit).await?;
+    Ok(rows.into_iter().map(|row| row.run).collect())
 }
 
 pub(super) fn new_run(delivery: &str, workflow: &str, now: u64) -> NewRun {

@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The warm pool: stopped instances that already booted once, kept ready
-//! for new runners.
+//! for new jobs.
 //!
-//! Every time is in the unit of the [`PoolConfig`]. [`crate::Scaler`] uses
+//! Every time is in the unit of the [`PoolConfig`]. The CI reconciler uses
 //! seconds; another caller may use milliseconds as long as it does so
 //! everywhere (config, `now` and the rows it restores).
 
@@ -29,8 +29,8 @@ pub struct PoolConfig {
     pub inventory_grace: u64,
 }
 
-/// Launch failures and the time before which nothing launches. A
-/// [`crate::Scaler`] shares one between its runners and its pool.
+/// Launch failures and the time before which nothing launches. Shared
+/// by the pool and its callers.
 #[derive(Clone, Debug)]
 pub struct Backoff {
     /// Failures since the last success.

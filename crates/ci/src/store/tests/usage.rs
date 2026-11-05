@@ -635,7 +635,17 @@ fn runs_page_newest_first() {
         page.iter().map(|r| r.id).collect::<Vec<_>>(),
         [ids[2], ids[1]]
     );
-    let next = db.wait(runs_for_repo(db.db(), 7, Some(ids[1]), 2)).unwrap();
+    let next = db
+        .wait(runs_for_repo(
+            db.db(),
+            7,
+            Some(After {
+                created_at: 1,
+                id: ids[1],
+            }),
+            2,
+        ))
+        .unwrap();
     assert_eq!(next.iter().map(|r| r.id).collect::<Vec<_>>(), [ids[0]]);
 }
 
@@ -831,10 +841,7 @@ fn seconds_round_up_with_a_minute_minimum() {
     };
     for (n, ms) in [0_u64, 1, 60_000, 60_001, 61_500].into_iter().enumerate() {
         let (job_id, seconds) = finished(n, ms, None);
-        assert_eq!(
-            seconds,
-            hatchrun_cloud::usage::job_seconds(1_000, 1_000 + ms)
-        );
+        assert_eq!(seconds, ms.div_ceil(1000).max(60));
         // 2 vCPU: one unit a second.
         assert_eq!(units_of(job_id), seconds);
         got.push(seconds);

@@ -111,9 +111,6 @@ jobs:
           OIDC_SIGNING_KEY: ${{ secrets.OIDC_SIGNING_KEY }}
           OIDC_NEXT_SIGNING_KEY: ${{ secrets.OIDC_NEXT_SIGNING_KEY }}
           OIDC_PREVIOUS_SIGNING_KEY: ${{ secrets.OIDC_PREVIOUS_SIGNING_KEY }}
-          BROKER_TOKEN: ${{ secrets.BROKER_TOKEN }}
-          TELEMETRY_SIGNING_KEY: ${{ secrets.TELEMETRY_SIGNING_KEY }}
-          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
         run: |
           # The Worker answers 500 to every webhook without the secret.
           if [ -z "$GITHUB_WEBHOOK_SECRET" ]; then
@@ -124,8 +121,7 @@ jobs:
           trap 'rm -f "$secrets"' EXIT
           (umask 077 && jq -n 'env | with_entries(select(
               (.key | IN("GITHUB_WEBHOOK_SECRET", "GITHUB_APP_PRIVATE_KEY", "GITHUB_CLIENT_SECRET",
-                         "POLAR_ACCESS_TOKEN", "POLAR_WEBHOOK_SECRET", "BROKER_TOKEN",
-                         "TELEMETRY_SIGNING_KEY", "ALERT_EMAIL",
+                         "POLAR_ACCESS_TOKEN", "POLAR_WEBHOOK_SECRET",
                          "OIDC_SIGNING_KEY", "OIDC_NEXT_SIGNING_KEY", "OIDC_PREVIOUS_SIGNING_KEY"))
               and .value != ""))' > "$secrets")
           echo "Uploading secrets: $(jq -r 'keys | join(", ")' "$secrets")"

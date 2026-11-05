@@ -2,22 +2,17 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The Worker's entry points: `fetch`, `scheduled` and `queue`. Another
-//! Worker that reuses this crate turns the `worker` feature off and
-//! defines its own.
+//! The Worker's entry point: `fetch`. Another Worker that reuses this
+//! crate turns the `worker` feature off and defines its own.
 
 use worker::{
-    Env, Headers, MessageBatch, Method, Request, Response, ResponseBuilder, Result,
-    ScheduleContext, ScheduledEvent, console_error, console_warn, event,
+    Env, Headers, Method, Request, Response, ResponseBuilder, Result, console_error, event,
 };
 
 use crate::db::{Db, params};
 use crate::jwt::PublicKey;
-use crate::webhook::{Event, Placement, QueuedJob};
-use crate::{
-    alerts, app, cache, jobs, labels, launches, now_ms, oidc, profiles, reconcile, runs, usage,
-    webhook,
-};
+use crate::webhook::Event;
+use crate::{app, now_ms, oidc, webhook};
 
 /// Static assets binding in `wrangler.toml`.
 const ASSETS: &str = "ASSETS";
@@ -47,7 +42,14 @@ const CI: &str = "CI";
 fn forwarded(event: &str) -> bool {
     matches!(
         event,
-        "push" | "pull_request" | "check_run" | "repository" | "release" | "create" | "delete"
+        "push"
+            | "pull_request"
+            | "check_run"
+            | "repository"
+            | "release"
+            | "create"
+            | "delete"
+            | "installation_repositories"
     )
 }
 
@@ -101,18 +103,13 @@ async fn forward(env: &Env, req: &mut Request) -> Result<Response> {
 }
 
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     if req.url()?.host_str() == Some(oidc::HOST) {
         return issuer(&req, &env);
     }
     let path = req.path();
     if req.method() == Method::Post && path == "/github/webhook" {
-        return github_webhook(req, env, &ctx).await;
-    }
-    if path.starts_with("/v1/cache/") {
-        let mut response = cache::serve::handle(req, env).await?;
-        response.headers_mut().set("Cache-Control", "no-store")?;
-        return Ok(response);
+        return github_webhook(req, env).await;
     }
     let host = req.url()?.host_str().map(str::to_owned);
     if forwards_api(&path, host.as_deref(), app_host(&env).as_deref()) {
@@ -132,40 +129,12 @@ async fn fetch(req: Request, env: Env, ctx: worker::Context) -> Result<Response>
     assets(req, &env).await
 }
 
-/// The Cron Trigger in `wrangler.toml`, every minute: the reconciler.
-#[event(scheduled)]
-async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    reconcile::run(env).await;
-}
-
-/// The launch queue's consumers in `wrangler.toml`: the launches, and
-/// the messages that ran out of retries (see [`launches`]).
-#[event(queue)]
-async fn queue(
-    batch: MessageBatch<serde_json::Value>,
-    env: Env,
-    _ctx: worker::Context,
-) -> Result<()> {
-    if batch.queue() == launches::DEAD_LETTERS {
-        launches::dead_letters(batch, env).await;
-    } else {
-        launches::consume(batch, env).await;
-    }
-    Ok(())
-}
-
-/// Whether the reconciler is running: 200 while its last pass is
-/// recent and the passes are not all failing, 503 otherwise, or when
-/// the database does not answer.
+/// Whether the database answers: 200 when it does, 503 when it does
+/// not.
 async fn healthz(env: &Env) -> Result<Response> {
-    let read = async {
-        Db::connect(env)
-            .await?
-            .first::<alerts::HealthRow>(alerts::HEALTH, &[])
-            .await
-    };
+    let read = async { Db::connect(env).await?.run("SELECT 1", &[]).await };
     let (status, body) = match read.await {
-        Ok(row) => alerts::health(&row.unwrap_or_default(), now_ms()),
+        Ok(_) => (200, serde_json::json!({ "status": "ok" })),
         Err(err) => {
             console_error!("healthz: {err}");
             (503, serde_json::json!({ "status": "database" }))
@@ -203,29 +172,7 @@ const UNINSTALLED: &str =
 const INSTALLED: &str =
     "UPDATE tenants SET installation_id = $1, updated_at = $3 WHERE org_id = $2";
 
-/// Records a queued job and its run. The run's first job fetches the
-/// rest of the run from GitHub; the reconciler tries again if that
-/// fails.
-async fn record_queued(
-    db: &Db,
-    env: &Env,
-    ctx: &worker::Context,
-    job: &QueuedJob,
-    placement: &Placement,
-    now: u64,
-) -> Result<()> {
-    if jobs::record_queued(db, job, placement, now).await? {
-        ctx.wait_until(runs::fetch(
-            env.clone(),
-            job.installation_id,
-            job.repository.clone(),
-            job.run_id,
-        ));
-    }
-    Ok(())
-}
-
-async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Result<Response> {
+async fn github_webhook(mut req: Request, env: Env) -> Result<Response> {
     if forwarded(&req.headers().get("X-GitHub-Event")?.unwrap_or_default()) {
         return forward(&env, &mut req).await;
     }
@@ -250,45 +197,6 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
     let db = Db::connect(&env).await?;
     let now = now_ms();
     match event {
-        Event::Queued(job, placement) => {
-            if let Some(reason) =
-                profiles::store::unknown(&db, job.installation_id, &job.spec).await?
-            {
-                let reason = format!("{}: {reason}", job.label);
-                console_warn!("{reason}");
-                return Response::from_json(&serde_json::json!({ "ignored": reason }));
-            }
-            record_queued(&db, &env, ctx, &job, &placement, now).await?;
-            // A repeated delivery comes here too; the launch claims the
-            // job first, so only one of them launches. The job is
-            // recorded either way, and the reconciler launches it when
-            // the queue does not take the message.
-            let queued = match env.queue(launches::QUEUE) {
-                Ok(queue) => launches::enqueue(&queue, &job).await,
-                Err(err) => Err(err.to_string()),
-            };
-            if let Err(err) = queued {
-                console_error!("job {}: not queued for launch: {err}", job.id);
-            }
-            Ok(Response::from_json(&serde_json::json!({ "recorded": job.id }))?.with_status(202))
-        }
-        Event::Progress {
-            id,
-            status,
-            runner,
-            outcome,
-        } => {
-            // Deliveries can arrive out of order; a completed job stays
-            // completed. The runner shows the reconciler which instance
-            // ran the job (see `reconcile`).
-            jobs::progress(&db, id, status.as_str(), runner.as_deref(), &outcome, now).await?;
-            if status == webhook::Status::Completed
-                && let (Some(started), Some(completed)) = (outcome.started_at, outcome.completed_at)
-            {
-                usage::record(&db, id, started, completed).await?;
-            }
-            Ok(Response::empty()?.with_status(204))
-        }
         Event::Uninstalled { installation_id } => {
             db.run(UNINSTALLED, &params![installation_id, now]).await?;
             Ok(Response::empty()?.with_status(204))
@@ -303,12 +211,7 @@ async fn github_webhook(mut req: Request, env: Env, ctx: &worker::Context) -> Re
                 .await?;
             Ok(Response::empty()?.with_status(204))
         }
-        Event::Ignored(reason) => {
-            if reason.starts_with(labels::PREFIX) {
-                console_warn!("{reason}");
-            }
-            Response::from_json(&serde_json::json!({ "ignored": reason }))
-        }
+        Event::Ignored(reason) => Response::from_json(&serde_json::json!({ "ignored": reason })),
     }
 }
 
@@ -369,6 +272,7 @@ mod tests {
         assert!(forwarded("release"));
         assert!(forwarded("create"));
         assert!(forwarded("delete"));
+        assert!(forwarded("installation_repositories"));
         assert!(!forwarded("workflow_job"));
         assert!(!forwarded("installation"));
         assert!(!forwarded(""));
@@ -382,7 +286,6 @@ mod tests {
         assert!(!forwards_api("/api/session", app, app));
         assert!(!forwards_api("/api/ci", app, app));
         assert!(!forwards_api("/api/cinema", app, app));
-        assert!(!forwards_api("/v1/cache/x", app, app));
     }
 
     #[test]
@@ -399,151 +302,6 @@ mod tests {
     }
 
     const NOW: u64 = 1_792_140_000_000;
-
-    fn queued(db: &Db, id: u64, label: &str, now: u64) -> usize {
-        db.run(
-            jobs::QUEUED,
-            &params![id, 42u64, "acme/app", 77u64, label, now, "build", 1u64],
-        )
-    }
-
-    fn progress(db: &Db, id: u64, status: &str, runner: Option<&str>, now: u64) -> usize {
-        db.run(
-            jobs::PROGRESS,
-            &params![
-                status,
-                now,
-                id,
-                runner,
-                None::<&str>,
-                None::<u64>,
-                None::<u64>
-            ],
-        )
-    }
-
-    /// The webhook's batch for a job of run 77 in attempt `attempt`:
-    /// rows changed by each statement.
-    fn job_of_run(db: &Db, id: u64, attempt: u64, sha: &str, now: u64) -> Vec<usize> {
-        db.batch(&[
-            (
-                jobs::RUN,
-                params![
-                    77u64,
-                    42u64,
-                    "acme/app",
-                    "Smoke test",
-                    "main",
-                    sha,
-                    attempt,
-                    now
-                ],
-            ),
-            (jobs::RUN_ATTEMPT, params![77u64, attempt, now, sha, "main"]),
-            (
-                jobs::QUEUED,
-                params![
-                    id,
-                    42u64,
-                    "acme/app",
-                    77u64,
-                    "hatchrun",
-                    now,
-                    "Save (host)",
-                    attempt
-                ],
-            ),
-        ])
-        .unwrap()
-    }
-
-    #[test]
-    fn a_run_moves_to_its_newest_attempt() {
-        let db = Db::new();
-        assert_eq!(job_of_run(&db, 1, 1, "a1", NOW), [1, 0, 1]);
-        assert_eq!(job_of_run(&db, 2, 1, "a1", NOW + 5), [0, 0, 1]);
-        db.run(
-            "UPDATE runs SET cache_write = '1/b/x', cache_reads = '[\"1/b/x\"]' WHERE id = 77",
-            &[],
-        );
-        // A re-run: new job ids, attempt 2 and the list's place moves.
-        assert_eq!(job_of_run(&db, 3, 2, "a2", NOW + 100), [0, 1, 1]);
-        // A late delivery of attempt 1 leaves the run on attempt 2.
-        assert_eq!(job_of_run(&db, 4, 1, "a1", NOW + 200), [0, 0, 1]);
-        let rows = db
-            .rows(
-                "SELECT attempt, queued_at, head_sha, workflow_name, expires_at, cache_write, \
-                 cache_reads FROM runs",
-                &[],
-            )
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["attempt"], 2);
-        assert_eq!(rows[0]["queued_at"], NOW + 100);
-        assert_eq!(rows[0]["head_sha"], "a2");
-        assert_eq!(rows[0]["workflow_name"], "Smoke test");
-        // No tenant: the default 30 days, from the newest attempt.
-        assert_eq!(rows[0]["expires_at"], NOW + 100 + 30 * 24 * 60 * 60 * 1000);
-        // The re-run works out its cache scopes again.
-        assert!(rows[0]["cache_write"].is_null() && rows[0]["cache_reads"].is_null());
-        let attempts = db
-            .rows("SELECT name, run_attempt FROM jobs ORDER BY id", &[])
-            .unwrap();
-        assert_eq!(attempts[2]["run_attempt"], 2);
-        assert_eq!(attempts[2]["name"], "Save (host)");
-    }
-
-    #[test]
-    fn progress_records_how_a_job_ended() {
-        let db = Db::new();
-        queued(&db, 5, "hatchrun", NOW);
-        let progress =
-            |status: &str, conclusion: Option<&str>, started: Option<u64>, ended: Option<u64>| {
-                db.run(
-                    jobs::PROGRESS,
-                    &params![status, NOW, 5u64, None::<&str>, conclusion, started, ended],
-                )
-            };
-        assert_eq!(progress("in_progress", None, Some(NOW + 1), None), 1);
-        assert_eq!(
-            progress("completed", Some("failure"), None, Some(NOW + 9)),
-            1
-        );
-        let rows = db
-            .rows("SELECT conclusion, started_at, completed_at FROM jobs", &[])
-            .unwrap();
-        assert_eq!(rows[0]["conclusion"], "failure");
-        assert_eq!(rows[0]["started_at"], NOW + 1);
-        assert_eq!(rows[0]["completed_at"], NOW + 9);
-    }
-
-    #[test]
-    fn a_job_is_recorded_once_and_stays_completed() {
-        let db = Db::new();
-        assert_eq!(queued(&db, 5, "hatchrun", NOW), 1);
-        assert_eq!(queued(&db, 5, "other", NOW + 1), 0);
-
-        assert_eq!(
-            progress(&db, 5, "in_progress", Some("hatchrun-5-ab"), NOW + 2),
-            1
-        );
-        // A completed delivery without a runner keeps the one recorded.
-        assert_eq!(progress(&db, 5, "completed", None, NOW + 3), 1);
-        assert_eq!(progress(&db, 5, "in_progress", Some("other"), NOW + 4), 0);
-        let rows = db
-            .rows(
-                "SELECT label, status, ran_on, queued_at, updated_at FROM jobs",
-                &[],
-            )
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["label"], "hatchrun");
-        assert_eq!(rows[0]["status"], "completed");
-        assert_eq!(rows[0]["ran_on"], "hatchrun-5-ab");
-        assert_eq!(rows[0]["queued_at"], NOW);
-        assert_eq!(rows[0]["updated_at"], NOW + 3);
-        assert_eq!(progress(&db, 6, "in_progress", None, NOW), 0);
-    }
 
     #[test]
     fn installs_move_the_tenant() {

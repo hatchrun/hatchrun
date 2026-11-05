@@ -17,7 +17,7 @@
 //! - `POST /api/tenants` with `{"installationId": id}` does what the
 //!   setup URL does for an installation already listed.
 //! - `GET /api/tenants` lists the user's tenants;
-//!   `GET /api/tenants/<org>` shows one, with what is left to set up.
+//!   `GET /api/tenants/<org>` shows one, with the user's role in it.
 //!
 //! The setup URL and `POST /api/tenants` create the organization's
 //! tenant, or add the user to the one that exists, once [`install`]
@@ -30,15 +30,15 @@
 use serde::{Deserialize, Serialize};
 use worker::{Request, Response, console_error};
 
-use super::billing::{Billing, billing, join_listed_beta};
+use super::billing::join_listed_beta;
 use super::{Answer, Ctx, Failure, found};
 use crate::db::params;
 use crate::fetch::send;
 use crate::github::{self, Installation, Membership};
 use crate::install::{self, Refusal};
-use crate::launch::APP_KEY;
 use crate::start::app_jwt;
-use crate::{connect, jwt, now_ms, session, settings, tenant, webcrypto};
+use crate::tokens::APP_KEY;
+use crate::{jwt, now_ms, session, tenant, webcrypto};
 
 /// A tenant row.
 #[derive(Debug, Deserialize)]
@@ -47,26 +47,11 @@ pub(crate) struct TenantRow {
     pub org_id: u64,
     pub org_login: String,
     pub installation_id: Option<u64>,
-    pub role_arn: Option<String>,
-    pub region: Option<String>,
-    pub launch_template_id: Option<String>,
-    pub subnet_ids: Option<String>,
-    pub max_runners: u32,
     pub beta: bool,
-    pub allowed_regions: Option<String>,
-    pub instance_types: Option<String>,
-    pub excluded_instance_types: Option<String>,
-    pub volume_size_limit: Option<u16>,
-    pub root_volume_size: Option<u16>,
-    pub template_version: Option<u32>,
-    pub stack_checked_at: Option<u64>,
 }
 
 pub(crate) const TENANT_COLUMNS: &str = "tenants.id, tenants.org_id, tenants.org_login, \
-    tenants.installation_id, tenants.role_arn, tenants.region, tenants.launch_template_id, \
-    tenants.subnet_ids, tenants.max_runners, tenants.beta, tenants.allowed_regions, \
-    tenants.instance_types, tenants.excluded_instance_types, tenants.volume_size_limit, \
-    tenants.root_volume_size, tenants.template_version, tenants.stack_checked_at";
+    tenants.installation_id, tenants.beta";
 
 /// The tenant of an organization, by login, that a user is a member
 /// of. Binds the login and the user id.
@@ -78,14 +63,6 @@ pub(crate) fn authorize_query() -> String {
     )
 }
 
-/// The setup steps a tenant has done.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Steps {
-    app: bool,
-    aws: bool,
-}
-
 /// A tenant as the app shows it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,14 +70,19 @@ struct TenantView {
     id: String,
     org: OrgView,
     installation_id: Option<u64>,
-    aws: Option<AwsView>,
-    max_runners: u32,
-    /// `None` for every region.
-    allowed_regions: Option<Vec<String>>,
-    billing: Billing,
-    steps: Steps,
     /// Installs the App again after it was removed.
     install_url: String,
+    /// What the user may do in the organization: `admin` for an owner,
+    /// `member` for anyone else in it.
+    role: Role,
+}
+
+/// The user's role in an organization, from GitHub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Role {
+    Admin,
+    Member,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,41 +91,6 @@ struct OrgView {
     id: u64,
     login: String,
     avatar_url: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AwsView {
-    role_arn: String,
-    region: String,
-    launch_template_id: String,
-    subnet_ids: Vec<String>,
-    stack: StackView,
-}
-
-/// The connect stack's version and, when it is older than this
-/// release's, how to update it.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StackView {
-    /// The stack's version; 1 for a stack from before the version tag.
-    version: u32,
-    /// This release's version.
-    latest: u32,
-    /// When the stack was last read, Unix milliseconds.
-    checked_at: Option<u64>,
-    /// What the newer versions bring, oldest first; empty when current.
-    changes: Vec<&'static str>,
-    /// Whether the stack still limits instance types with the old
-    /// family list, which an update keeps unless told otherwise.
-    family_list: bool,
-    /// The console page of the stack in its region.
-    console_url: String,
-    /// The template to update to, when the Worker knows it.
-    template_url: Option<String>,
-    /// An AWS CLI command that updates the stack, moving a family list
-    /// to the size cap.
-    update_command: Option<String>,
 }
 
 fn install_url(ctx: &Ctx<'_>) -> String {
@@ -158,40 +105,9 @@ fn avatar(org_id: u64) -> String {
     format!("https://avatars.githubusercontent.com/u/{org_id}?v=4")
 }
 
-async fn view(ctx: &Ctx<'_>, row: TenantRow) -> worker::Result<TenantView> {
-    let billing = billing(ctx.db, &row.id, row.beta).await?;
-    let aws = match (
-        row.role_arn,
-        row.region,
-        row.launch_template_id,
-        row.subnet_ids,
-    ) {
-        (Some(role_arn), Some(region), Some(launch_template_id), Some(subnets)) => Some(AwsView {
-            stack: stack_view(
-                ctx,
-                &region,
-                row.template_version,
-                row.instance_types.as_deref(),
-                row.stack_checked_at,
-            ),
-            role_arn,
-            region,
-            launch_template_id,
-            subnet_ids: subnets
-                .split(',')
-                .map(str::trim)
-                .filter(|subnet| !subnet.is_empty())
-                .map(str::to_owned)
-                .collect(),
-        }),
-        _ => None,
-    };
-    Ok(TenantView {
+fn view(ctx: &Ctx<'_>, row: TenantRow, role: Role) -> TenantView {
+    TenantView {
         install_url: install_url(ctx),
-        steps: Steps {
-            app: row.installation_id.is_some(),
-            aws: aws.is_some(),
-        },
         id: row.id,
         org: OrgView {
             id: row.org_id,
@@ -199,35 +115,7 @@ async fn view(ctx: &Ctx<'_>, row: TenantRow) -> worker::Result<TenantView> {
             login: row.org_login,
         },
         installation_id: row.installation_id,
-        aws,
-        max_runners: row.max_runners,
-        allowed_regions: settings::regions(row.allowed_regions.as_deref()),
-        billing,
-    })
-}
-
-fn stack_view(
-    ctx: &Ctx<'_>,
-    region: &str,
-    template_version: Option<u32>,
-    instance_types: Option<&str>,
-    checked_at: Option<u64>,
-) -> StackView {
-    let template_url = super::get(ctx.env, super::aws::TEMPLATE_URL);
-    let family_list = instance_types.is_none_or(|types| types == connect::FAMILY_LIST_DEFAULT);
-    let changes = connect::changes_since(template_version);
-    StackView {
-        version: template_version.unwrap_or(1),
-        latest: connect::TEMPLATE_VERSION,
-        checked_at,
-        console_url: connect::stack_console_url(region),
-        update_command: template_url
-            .as_deref()
-            .filter(|_| !changes.is_empty() || family_list)
-            .map(|url| connect::update_command(region, url, family_list)),
-        changes,
-        family_list,
-        template_url,
+        role,
     }
 }
 
@@ -257,10 +145,10 @@ async fn membership(
     Ok(Ok(github::parse_membership(&answer)?))
 }
 
-/// The tenant of `org`, if the user is a member and owns the
-/// organization on GitHub. Not found otherwise, so the answer does not
-/// say which organizations use hatchrun.
-pub(crate) async fn authorize(ctx: &Ctx<'_>, org: &str) -> Result<TenantRow, Failure> {
+/// The tenant of `org` in the database, if the user is a member of it.
+/// Not found otherwise, so the answer does not say which organizations
+/// use hatchrun.
+async fn listed(ctx: &Ctx<'_>, org: &str) -> Result<TenantRow, Failure> {
     let missing = || Failure::new(404, format!("no organization {org} here"));
     if !tenant::valid_login(org) {
         return Err(missing());
@@ -269,7 +157,32 @@ pub(crate) async fn authorize(ctx: &Ctx<'_>, org: &str) -> Result<TenantRow, Fai
         .db
         .first(&authorize_query(), &params![org, ctx.session.user.id])
         .await?;
-    let row = row.ok_or_else(missing)?;
+    row.ok_or_else(missing)
+}
+
+/// The tenant of `org` and the user's role in the organization, if the
+/// user is a member of the tenant and still in the organization on
+/// GitHub.
+async fn authorize_member(ctx: &Ctx<'_>, org: &str) -> Result<(TenantRow, Role), Failure> {
+    let row = listed(ctx, org).await?;
+    let membership = membership(ctx, &row.org_login)
+        .await?
+        .map_err(|refusal| Failure::new(403, refusal.message(&row.org_login)))?
+        .filter(|membership| membership.state == "active")
+        .ok_or_else(|| Failure::new(403, format!("you are not in {} on GitHub", row.org_login)))?;
+    let role = if membership.is_admin() {
+        Role::Admin
+    } else {
+        Role::Member
+    };
+    Ok((row, role))
+}
+
+/// The tenant of `org`, if the user is a member and owns the
+/// organization on GitHub. Not found otherwise, so the answer does not
+/// say which organizations use hatchrun.
+pub(crate) async fn authorize(ctx: &Ctx<'_>, org: &str) -> Result<TenantRow, Failure> {
+    let row = listed(ctx, org).await?;
     if owned(ctx, &row.org_login).await?.is_none() {
         return Err(Failure::new(
             403,
@@ -487,12 +400,12 @@ pub(crate) async fn mine(ctx: &Ctx<'_>) -> Answer {
 
 /// `GET /api/tenants/<org>`
 pub(crate) async fn show(ctx: &Ctx<'_>, org: &str) -> Answer {
-    let mut row = authorize(ctx, org).await?;
+    let (mut row, mut role) = authorize_member(ctx, org).await?;
     if !row.beta {
         join_listed_beta(ctx.db, &row.id).await?;
-        row = authorize(ctx, org).await?;
+        (row, role) = authorize_member(ctx, org).await?;
     }
-    Ok(Response::from_json(&view(ctx, row).await?)?)
+    Ok(Response::from_json(&view(ctx, row, role))?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -600,54 +513,7 @@ mod tests {
         let row = authorized(&db, "acme", 5).unwrap();
         assert_eq!(row.org_id, 11);
         assert_eq!(row.org_login, "acme");
-        assert_eq!(row.max_runners, 10);
         assert!(!row.beta);
-        assert_eq!(row.role_arn, None);
-        assert_eq!(row.template_version, None);
-        assert_eq!(row.stack_checked_at, None);
-    }
-
-    #[test]
-    fn a_connected_tenant_reads_into_its_row() {
-        let db = Db::new();
-        user(&db, 5);
-        db.batch(&adopt_batch("aaaaaaaaaaaaaaaa", 11, "acme", 100, 5))
-            .unwrap();
-        // As aws::save and stack::record bind them.
-        db.run(
-            "UPDATE tenants SET role_arn = $2, region = $3, updated_at = $4 WHERE id = $1",
-            &params![
-                "aaaaaaaaaaaaaaaa",
-                "arn:aws:iam::1:role/r",
-                "eu-west-1",
-                NOW
-            ],
-        );
-        db.run(
-            "UPDATE tenants SET launch_template_id = $2, subnet_ids = $3, \
-             instance_types = $4, volume_size_limit = $5, root_volume_size = $6, \
-             fleet = $7, excluded_instance_types = $8, template_version = $9, \
-             updated_at = $10, stack_checked_at = $10 WHERE id = $1",
-            &params![
-                "aaaaaaaaaaaaaaaa",
-                "lt-1",
-                "subnet-1,subnet-2",
-                "m7g",
-                200u32,
-                40u32,
-                true,
-                "",
-                5u32,
-                NOW,
-            ],
-        );
-        let row = authorized(&db, "acme", 5).unwrap();
-        assert_eq!(row.region.as_deref(), Some("eu-west-1"));
-        assert_eq!(row.subnet_ids.as_deref(), Some("subnet-1,subnet-2"));
-        assert_eq!(row.volume_size_limit, Some(200));
-        assert_eq!(row.root_volume_size, Some(40));
-        assert_eq!(row.template_version, Some(5));
-        assert_eq!(row.stack_checked_at, Some(NOW));
     }
 
     #[test]
