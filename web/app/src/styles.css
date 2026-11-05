@@ -380,142 +380,6 @@ a.list-row:hover {
   line-height: 1;
 }
 
-/* Loading */
-
-.spinner-row {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  padding: 1rem 0;
-}
-
-/* The brand mark rocks back and forth while something loads. */
-.spinner {
-  width: 20px;
-  height: 20px;
-  background: url("/brand/hatchrun-mark-micro.svg") center / contain no-repeat;
-  transform-origin: 50% 85%;
-  animation: rock 1.2s ease-in-out infinite;
-}
-
-@keyframes rock {
-  0%,
-  100% {
-    transform: rotate(-24deg);
-  }
-  50% {
-    transform: rotate(24deg);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .spinner {
-    animation-duration: 3s;
-  }
-}
-
-/* Setup checklist */
-
-.checklist-head {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  padding: 0.9rem 1.25rem;
-  border-bottom: 1px solid var(--app-border);
-  font-size: 0.88rem;
-  color: var(--app-muted);
-}
-
-.progress {
-  flex: 1;
-  height: 6px;
-  border-radius: 999px;
-  background: var(--app-surface-2);
-  overflow: hidden;
-}
-
-.progress > span {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: var(--app-accent-strong);
-}
-
-.checklist ol {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.step {
-  position: relative;
-  display: flex;
-  gap: 1rem;
-  padding: 1.1rem 1.25rem;
-}
-
-.step + .step {
-  border-top: 1px solid var(--app-border);
-}
-
-.step-mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
-  width: 26px;
-  height: 26px;
-  border: 1px solid var(--app-border-strong);
-  border-radius: 50%;
-  font-size: 0.82rem;
-  font-weight: 600;
-  color: var(--app-muted);
-}
-
-.step-done .step-mark {
-  border-color: var(--app-success);
-  background: var(--app-success);
-  color: var(--app-success-ink);
-}
-
-.step-open .step-mark {
-  border-color: var(--app-accent);
-  background: var(--app-accent);
-  color: var(--app-accent-ink);
-}
-
-.step-content {
-  flex: 1;
-  min-width: 0;
-}
-
-.step-title {
-  margin: 2px 0 0;
-  font-size: 1rem;
-}
-
-.step-waiting .step-title {
-  color: var(--app-muted);
-}
-
-.step-summary {
-  margin: 0.25rem 0 0;
-  font-size: 0.9rem;
-  color: var(--app-muted);
-}
-
-.step-summary a {
-  color: var(--app-text);
-}
-
-.step-body {
-  margin-top: 0.75rem;
-}
-
-.step-body > :last-child {
-  margin-bottom: 0;
-}
-
 .inline-actions {
   display: flex;
   flex-wrap: wrap;
@@ -629,14 +493,9 @@ a.list-row:hover {
   }
 }
 
-/* Setup checklist on phones */
+/* Phones */
 
 @media (max-width: 560px) {
-  .step {
-    padding: 1rem;
-    gap: 0.75rem;
-  }
-
   .page-head {
     flex-wrap: wrap;
   }
@@ -821,10 +680,6 @@ select.input {
 
 .details ul {
   padding-left: 1.1rem;
-}
-
-.step-summary code {
-  font-size: 0.75rem;
 }
 
 /* Panels and tables */
