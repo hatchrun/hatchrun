@@ -476,7 +476,21 @@ export function handleScale(
 
   if ((found = /^orgs\/([^/]+)\/runs$/.exec(path))) {
     const org = decodeURIComponent(found[1] as string);
-    json(res, 200, org === SCALE_ORG ? paginate(filterRuns(url), url) : empty(url));
+    const counts = { all: 0, running: 0, waiting: 0, failed: 0, passed: 0 };
+    if (org !== SCALE_ORG) {
+      json(res, 200, { ...empty(url), counts });
+      return true;
+    }
+    const unfiltered = new URL(url);
+    unfiltered.searchParams.delete("status");
+    for (const run of filterRuns(unfiltered)) {
+      counts.all++;
+      if (matchesStatus(run, ["running"])) counts.running++;
+      if (matchesStatus(run, ["waiting"])) counts.waiting++;
+      if (matchesStatus(run, ["failure"])) counts.failed++;
+      if (matchesStatus(run, ["success"])) counts.passed++;
+    }
+    json(res, 200, { ...paginate(filterRuns(url), url), counts });
     return true;
   }
   if ((found = /^repos\/([^/]+)\/([^/]+)\/runs$/.exec(path)) && found[1] === SCALE_ORG) {

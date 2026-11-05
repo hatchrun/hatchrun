@@ -5,7 +5,7 @@
 import { ChevronsUpDown } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { listOrgRuns, type CiRunStatus, type Page as ApiPage, type CiRun, type RunFilters } from "@/api";
+import { listOrgRuns, type CiRunStatus, type RunCounts, type Page as ApiPage, type CiRun } from "@/api";
 import { CursorPager, useCursors } from "@/components/CursorPager";
 import { FilterBar, useUrlFilters } from "@/components/FilterBar";
 import { Page } from "@/components/Page";
@@ -32,7 +32,7 @@ const DEFAULT_RANGE = "7d"; // RANGES[2]
 
 const TABS: [Tab, ...Tab[]] = [
   { id: "all", label: "All", status: undefined },
-  { id: "running", label: "Running", status: ["running", "queued"] },
+  { id: "running", label: "Running", status: ["running"] },
   { id: "waiting", label: "Waiting", status: ["waiting"] },
   { id: "failed", label: "Failed", status: ["failure"] },
   { id: "passed", label: "Passed", status: ["success"] },
@@ -44,9 +44,6 @@ interface Tab {
   status: CiRunStatus[] | undefined;
 }
 
-/** Every tab's total under the same filters, one request each (limit 1: only `total` is read). */
-const countTabs = (org: string, filters: RunFilters) =>
-  Promise.all(TABS.map((tab) => listOrgRuns(org, { ...filters, status: tab.status, limit: 1 }).then((page) => page.total)));
 
 /** The landing page: needs-you block, activity of the range, filters and the runs table. */
 export function Runs({ org }: OrgPageProps) {
@@ -62,17 +59,12 @@ export function Runs({ org }: OrgPageProps) {
   const scope = `${filters.key}|${range.id}`;
   const listKey = `${scope}|${tab.id}`;
   const since = () => Date.now() - range.ms;
-  const [runs, reloadRuns] = useLoad<ApiPage<CiRun>>(
+  const [runs, reload] = useLoad<ApiPage<CiRun> & { counts: RunCounts }>(
     () => listOrgRuns(org, { ...filters.asRunFilters, status: tab.status, since: since(), cursor: cursors.cursor, limit: 50 }),
     `${org}|${listKey}#${cursors.key}`,
     true,
   );
-  const [counts, reloadCounts] = useLoad<number[]>(() => countTabs(org, { ...filters.asRunFilters, since: since() }), `${org}|${scope}`, true);
-
-  const reload = () => {
-    reloadRuns();
-    reloadCounts();
-  };
+  const counts = runs.state === "ready" ? TABS.map((item) => runs.data.counts[item.id as keyof RunCounts]) : null;
 
   // A new filter, tab or range starts at the newest page.
   useEffect(() => {
@@ -80,14 +72,14 @@ export function Runs({ org }: OrgPageProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [listKey]);
 
-  const live = counts.state === "ready" && ((counts.data[1] ?? 0) > 0 || (counts.data[2] ?? 0) > 0);
+  const live = counts !== null && ((counts[1] ?? 0) > 0 || (counts[2] ?? 0) > 0);
   useEffect(() => {
     const timer = window.setInterval(reload, live ? 5_000 : 30_000);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live, listKey, cursors.key]);
 
-  const total = counts.state === "ready" ? counts.data : null;
+  const total = counts;
   const branches = useMemo(() => (runs.state === "ready" ? [...new Set(runs.data.items.flatMap((run) => (run.branch ? [run.branch] : [])))].sort() : []), [runs]);
   const actors = useMemo(() => (runs.state === "ready" ? [...new Set(runs.data.items.map((run) => run.actor))].sort() : []), [runs]);
 

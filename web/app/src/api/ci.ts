@@ -99,8 +99,17 @@ const runQuery = ({ status, repo, branch, actor, q, since, until, cursor, limit 
   queryString({ status, repo, branch, actor, q, since, until, cursor, limit });
 
 /** The runs of every repository of an organization the viewer can read, newest first. */
+/** Runs per Runs-page tab under the same filters, status aside. */
+export interface RunCounts {
+  all: number;
+  running: number;
+  waiting: number;
+  failed: number;
+  passed: number;
+}
+
 export const listOrgRuns = (org: string, filters: RunFilters & Paging = {}) =>
-  retrying(() => get<Page<CiRun>>(`${orgPath(org)}/runs${runQuery(filters)}`));
+  retrying(() => get<Page<CiRun> & { counts: RunCounts }>(`${orgPath(org)}/runs${runQuery(filters)}`));
 
 /** A repository's runs, newest first. `repo` is not a filter here. */
 export const listRepoRuns = (owner: string, repo: string, filters: Omit<RunFilters, "repo"> & Paging = {}) =>
