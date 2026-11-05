@@ -37,7 +37,6 @@ export function RunsTable({ runs, now }: { runs: CiRun[]; now: number }) {
         <tbody>
           {runs.map((run) => {
             const status = ciStatus(run.status, run.conclusion);
-            const open = run.status !== "completed";
             return (
               <tr key={run.id} className="group border-t border-rule hover:bg-raised">
                 <td className="py-2.5 pr-3 pl-3.5 whitespace-nowrap" style={EDGE[status] ? { boxShadow: `inset 3px 0 0 var(${EDGE[status]})` } : undefined}>
@@ -70,7 +69,7 @@ export function RunsTable({ runs, now }: { runs: CiRun[]; now: number }) {
                   <JobSquares jobs={run.jobs} />
                 </td>
                 <td className={`px-3 py-2.5 text-right font-mono text-[13px] whitespace-nowrap ${status === "failed" ? STATUS.failed.text : "text-fg-2"}`}>
-                  {run.duration_ms === null ? (open ? "running" : "-") : duration(run.duration_ms)}
+                  {run.duration_ms === null ? (status === "running" ? "running" : "-") : duration(run.duration_ms)}
                 </td>
                 <td className="px-3.5 py-2.5 text-[13px] whitespace-nowrap text-fg-3">{ago(run.created_at, now)}</td>
               </tr>

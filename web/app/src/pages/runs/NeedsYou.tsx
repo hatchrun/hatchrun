@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { ChevronRight } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { approveCiJob, getNeedsYou, type NeedsYou as NeedsYouData } from "@/api";
 import { Button } from "@/components/ui/button";
@@ -40,6 +40,12 @@ export function NeedsYou({ org, onChange }: { org: string; onChange: () => void 
   const [busy, setBusy] = useState<number | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const now = useNow(30_000);
+
+  // The run list polls; the approvals and failing branches read again on the slow cadence.
+  useEffect(() => {
+    const timer = window.setInterval(reload, 30_000);
+    return () => window.clearInterval(timer);
+  }, [reload]);
 
   if (loaded.state === "error") {
     return <LoadError error={loaded.error} retry={reload} />;
