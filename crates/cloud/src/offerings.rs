@@ -13,7 +13,7 @@
 //! launch moves to the next one, and a Spot launch to on-demand. When
 //! nothing is left the launch fails on capacity and waits at least
 //! until the first offering comes back (see
-//! [`crate::reconcile::retry`]).
+//! [`crate::retry`]).
 //!
 //! Everything here but [`store`], which reads and writes the
 //! `unavailable_offerings` table, runs and tests without the Workers

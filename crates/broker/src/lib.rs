@@ -2,13 +2,13 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Hands each runner instance its JIT config exactly once.
+//! Hands each instance its boot document exactly once.
 //!
-//! The scaler launches an instance with a random ticket in its user data,
-//! then stores the instance's JIT config here under that ticket. At boot
-//! the agent claims the config with the ticket. The claim deletes it, so
-//! the ticket in user data is useless once the runner has started, and a
-//! config nobody claims is deleted when it expires.
+//! `hatchrun-ci` launches an instance with a random ticket in its user data,
+//! then stores the instance's boot document here under that ticket. At boot
+//! the agent claims the document with the ticket. The claim deletes it, so
+//! the ticket in user data is useless once the job has started, and a
+//! document nobody claims is deleted when it expires.
 //!
 //! Each ticket gets its own Durable Object, named by the ticket's hash.
 //! A Durable Object handles one request at a time, so two claims for the
@@ -19,7 +19,7 @@
 //!   stored once; storing it again answers 409.
 //! - `POST /v1/tickets/{ticket}/claim` answers `{"config": "..."}` once,
 //!   then 404. A ticket that was never stored, was claimed or expired
-//!   answers the same 404, so the agent retries until the scaler stores
+//!   answers the same 404, so the agent retries until `hatchrun-ci` stores
 //!   its config.
 
 pub mod protocol;
@@ -32,7 +32,7 @@ use crate::protocol::Route;
 
 /// Durable Object binding in `wrangler.toml`.
 const BINDING: &str = "TICKETS";
-/// Secret holding the token the scaler sends.
+/// Secret holding the token `hatchrun-ci` sends.
 const TOKEN_SECRET: &str = "BROKER_TOKEN";
 
 #[event(fetch)]

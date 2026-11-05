@@ -2,8 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The few AWS calls the Worker makes, over the Query API and, for
-//! [`ssm`], JSON.
+//! The few AWS calls the Workers make, over the Query API.
 //!
 //! aws-sdk does not build for wasm, so requests are built here as
 //! [`crate::http::Request`]s, signed with `SigV4` by `aws-sigv4`, and the
@@ -14,7 +13,6 @@ pub mod ec2;
 pub mod fleet;
 pub mod instances;
 pub mod s3;
-pub mod ssm;
 pub mod sts;
 
 use std::time::{Duration, SystemTime};

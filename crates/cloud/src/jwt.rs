@@ -9,8 +9,7 @@
 //!
 //! Two RS256 tokens use this: the GitHub App's JWT, signed with the key
 //! GitHub issued for the App, and the tenant token for AWS (see
-//! [`crate::oidc`]). The runner's telemetry token is `EdDSA`, signed with
-//! a key of its own (see [`crate::telemetry`]).
+//! [`crate::oidc`]).
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};

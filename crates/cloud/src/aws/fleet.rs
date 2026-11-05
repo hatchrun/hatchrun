@@ -256,7 +256,7 @@ pub fn stale(found: &[Version], before: u64) -> Vec<u64> {
         .filter(|version| {
             !version.default
                 && version.description.starts_with("hatchrun-")
-                && crate::reconcile::time::parse(&version.created).is_some_and(|at| at < before)
+                && crate::time::parse(&version.created).is_some_and(|at| at < before)
         })
         .map(|version| version.number)
         .collect()
@@ -589,7 +589,7 @@ mod tests {
             version(3, "2026-10-01T00:00:00.000Z", "hatchrun-1-00", true),
             version(8, "yesterday", "hatchrun-10-aa", false),
         ];
-        let before = crate::reconcile::time::parse("2026-10-14T09:00:00Z").unwrap();
+        let before = crate::time::parse("2026-10-14T09:00:00Z").unwrap();
         assert_eq!(stale(&found, before), [5]);
         assert_eq!(stale(&found, 0), Vec::<u64>::new());
     }

@@ -273,18 +273,27 @@ mod tests {
         name: Option<String>,
     }
 
+    /// A table of the column types the tests bind: a bigint, a nullable
+    /// bigint and a boolean.
+    fn probe(db: &Db) {
+        db.run(
+            "CREATE TABLE probe (id bigint, remaining bigint, limited boolean, seen_at bigint)",
+            &[],
+        );
+    }
+
     #[test]
     fn values_bind_as_their_declared_types() {
         let db = Db::new();
+        probe(&db);
         db.run(
-            "INSERT INTO rate_limits (installation_id, remaining, limited, seen_at) \
+            "INSERT INTO probe (id, remaining, limited, seen_at) \
              VALUES ($1, $2, $3, $4)",
             &params![7u64, None::<u64>, true, 5u64],
         );
         let row: Row = db
             .first(
-                "SELECT installation_id AS n, limited AS flag, NULL::text AS name \
-                 FROM rate_limits",
+                "SELECT id AS n, limited AS flag, NULL::text AS name FROM probe",
                 &[],
             )
             .unwrap();
@@ -294,9 +303,10 @@ mod tests {
     #[test]
     fn an_integer_is_no_boolean() {
         let db = Db::new();
+        probe(&db);
         let err = db
             .try_run(
-                "INSERT INTO rate_limits (installation_id, remaining, limited, seen_at) \
+                "INSERT INTO probe (id, remaining, limited, seen_at) \
                  VALUES ($1, $2, $3, $4)",
                 &params![7u64, None::<u64>, 1u64, 5u64],
             )

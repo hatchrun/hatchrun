@@ -831,10 +831,7 @@ fn seconds_round_up_with_a_minute_minimum() {
     };
     for (n, ms) in [0_u64, 1, 60_000, 60_001, 61_500].into_iter().enumerate() {
         let (job_id, seconds) = finished(n, ms, None);
-        assert_eq!(
-            seconds,
-            hatchrun_cloud::usage::job_seconds(1_000, 1_000 + ms)
-        );
+        assert_eq!(seconds, ms.div_ceil(1000).max(60));
         // 2 vCPU: one unit a second.
         assert_eq!(units_of(job_id), seconds);
         got.push(seconds);

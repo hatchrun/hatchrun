@@ -4,18 +4,14 @@
 
 //! The instance type catalog: every current generation amd64 and arm64
 //! instance type a region offers, with the zones that offer it, its
-//! Linux on-demand price and its lowest Spot price. The reconciler
-//! refreshes a region's catalog once a day (see [`store`]) through a
-//! tenant role in that region, so types AWS adds show up the next day
-//! without a release.
+//! Linux on-demand price and its lowest Spot price. A caller
+//! describes a region's catalog from what AWS answers, so types AWS adds
+//! show up without a release.
 //!
 //! Types are described in Karpenter's vocabulary: `m8g.xlarge` is
 //! family `m8g`, category `m`, generation 8, size `xlarge`.
 //!
-//! Everything here but [`store`] runs and tests without the Workers
-//! runtime.
-
-pub(crate) mod store;
+//! Nothing here needs the Workers runtime.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
@@ -290,9 +286,6 @@ mod tests {
              ec2-ondemand-without-sec-sel/Asia%20Pacific%20%28Mumbai%29/Linux/index.json"
         );
         assert_eq!(price_list_url("mars-north-1"), None);
-        for (region, _) in crate::connect::REGIONS {
-            assert!(price_list_url(region).is_some(), "{region}");
-        }
     }
 
     #[test]

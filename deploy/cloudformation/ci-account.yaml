@@ -221,7 +221,7 @@ Resources:
   # the role's credentials through the account's IAM provider for
   # oidc.hatchrun.io. An account has one provider per URL, so the stack
   # uses the existing one: create it first, with audience
-  # sts.amazonaws.com, where no connect.yaml stack made it.
+  # sts.amazonaws.com, where no other stack made it.
   LauncherRole:
     Type: AWS::IAM::Role
     Properties:
