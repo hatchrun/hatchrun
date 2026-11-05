@@ -16,7 +16,6 @@ import {
 import { Await } from "@/components/Status";
 import { useLoad } from "@/load";
 import { runnerTime } from "@/lib/utils";
-import { SecretsTable } from "./SecretsTable";
 
 const dollars = (cents: number) =>
   new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(cents / 100);
@@ -31,8 +30,6 @@ export function CiSettings({ org }: { org: string }) {
           {(data) => <BillingCard org={org} billing={data} onChange={reload} />}
         </Await>
       </section>
-      <SecretsTable scope={{ org }} kind="secrets" />
-      <SecretsTable scope={{ org }} kind="vars" />
     </div>
   );
 }
