@@ -525,10 +525,27 @@ fn job_json(row: &JobRow, live: &BTreeMap<u64, Value>) -> Value {
     })
 }
 
-/// The answer of `GET /api/ci/runs/{run}`.
-fn run_answer(run: &RunRow, repo: &RepoRow, jobs: &[JobRow], state: Option<&RunState>) -> Value {
+/// The name the console reads an access by.
+fn access_name(access: Access) -> &'static str {
+    match access {
+        Access::None | Access::Read => "read",
+        Access::Write => "write",
+        Access::Admin => "admin",
+    }
+}
+
+/// The answer of `GET /api/ci/runs/{run}`: the caller's `access` to
+/// the repository, the run and its jobs.
+fn run_answer(
+    run: &RunRow,
+    repo: &RepoRow,
+    access: Access,
+    jobs: &[JobRow],
+    state: Option<&RunState>,
+) -> Value {
     let live = live_steps(jobs, state);
     json!({
+        "access": access_name(access),
         "run": run_json(run, &repo.full_name, JobCounts::of(jobs)),
         "jobs": jobs.iter().map(|row| job_json(row, &live)).collect::<Vec<_>>(),
     })
@@ -687,6 +704,8 @@ pub(crate) struct Cx<'a> {
 struct Found {
     run: RunRow,
     repo: RepoRow,
+    /// What the caller may do with the repository.
+    access: Access,
 }
 
 impl Cx<'_> {
@@ -713,12 +732,13 @@ impl Cx<'_> {
         let Some(repo) = store::repo_by_name(self.db, &format!("{owner}/{name}")).await? else {
             return Ok(stop(404, "not found"));
         };
-        Ok(self.allowed(&repo, want).await?.map(|()| repo))
+        Ok(self.allowed(&repo, want).await?.map(|_| repo))
     }
 
-    async fn allowed(&self, repo: &RepoRow, want: Access) -> Result<Served<()>> {
+    /// The caller's access when it is at least `want`.
+    async fn allowed(&self, repo: &RepoRow, want: Access) -> Result<Served<Access>> {
         match self.access(repo).await? {
-            Ok(have) => Ok(needs(have, want, self.session.is_some())),
+            Ok(have) => Ok(needs(have, want, self.session.is_some()).map(|()| have)),
             Err(stop) => Ok(Err(stop)),
         }
     }
@@ -739,7 +759,7 @@ impl Cx<'_> {
         Ok(self
             .allowed(&repo, want)
             .await?
-            .map(|()| Found { run, repo }))
+            .map(|access| Found { run, repo, access }))
     }
 
     /// The job and its run, when the caller may read them.
@@ -789,7 +809,7 @@ impl Cx<'_> {
         } else {
             None
         };
-        let body = run_answer(&found.run, &found.repo, &jobs, state.as_ref());
+        let body = run_answer(&found.run, &found.repo, found.access, &jobs, state.as_ref());
         Ok(Ok(Response::from_json(&body)?))
     }
 
@@ -1533,6 +1553,13 @@ mod tests {
         }
         assert_eq!(route("/api/ci/runs/1").unwrap().method(), Method::Get);
         assert_eq!(route("/api/ci/jobs/1/live").unwrap().method(), Method::Get);
+    }
+
+    #[test]
+    fn access_is_named_for_the_console() {
+        assert_eq!(access_name(Access::Read), "read");
+        assert_eq!(access_name(Access::Write), "write");
+        assert_eq!(access_name(Access::Admin), "admin");
     }
 
     #[test]
