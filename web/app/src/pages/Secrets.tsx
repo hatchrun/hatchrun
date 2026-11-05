@@ -2,14 +2,578 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
+// Secrets and variables of an organization, a repository or one of its
+// environments. The scope lives in the URL (?scope=org|repo|env&repo=&env=).
+// A secret's value is write-only; a variable's is shown.
+
+import { Plus, Search, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  deleteCiItem,
+  listCiSecrets,
+  listCiVars,
+  putCiItem,
+  type CiItemKind,
+  type CiScope,
+  type CiSecret,
+  type CiVar,
+  type Page as ApiPage,
+} from "@/api";
+import { CopyButton } from "@/components/CopyButton";
+import { CursorPager, useCursors } from "@/components/CursorPager";
 import { Page } from "@/components/Page";
+import { RepoMultiSelect, summarizeRepos, type RepoSelection } from "@/components/RepoMultiSelect";
+import { ScopePicker, type ScopeValue } from "@/components/ScopePicker";
+import { Await } from "@/components/Status";
+import { Truncate } from "@/components/Truncate";
+import { abbreviate, ago } from "@/lib/format";
+import { useDebounced } from "@/lib/useRepos";
+import { cn } from "@/lib/utils";
+import { useLoad } from "@/load";
+import { setQuery, useQuery } from "@/router";
+import { BTN, BTN_PRIMARY, BTN_SM, FIELD, TD, TH } from "./formStyles";
 import type { OrgPageProps } from "./types";
 
-/** Placeholder for Secrets: replaced by the screen build. */
+type Row = CiSecret | CiVar;
+
+const word = (kind: CiItemKind) => (kind === "secrets" ? "secret" : "variable");
+
+/** What a name must look like: the API uppercases it and takes A-Z, 0-9 and _ only. */
+const fixName = (raw: string) => {
+  const fixed = raw
+    .toUpperCase()
+    .replace(/[^A-Z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return /^[0-9]/.test(fixed) ? `_${fixed}` : fixed;
+};
+
+/** Two or more KEY=VALUE lines (comments and `export` allowed); anything else is a plain value. */
+function parsePaste(text: string): { name: string; value: string }[] {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  const matches = lines.map((line) => /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*)$/.exec(line));
+  if (lines.length < 2 || !matches.every(Boolean)) return [];
+  return matches.map((match) => {
+    let value = match?.[2] ?? "";
+    const quote = value.charAt(0);
+    if (value.length > 1 && (quote === '"' || quote === "'") && value.endsWith(quote)) value = value.slice(1, -1);
+    return { name: fixName(match?.[1] ?? ""), value };
+  });
+}
+
+const reference = (kind: CiItemKind, name: string) => `\${{ ${kind === "secrets" ? "secrets" : "vars"}.${name || "NAME"} }}`;
+
+function scopeOf(org: string, value: ScopeValue): CiScope | null {
+  if (value.scope === "org") return { org };
+  const [owner = "", repo = ""] = (value.repo ?? "").split("/");
+  if (!value.repo) return null;
+  if (value.scope === "repo") return { owner, repo };
+  return value.env ? { owner, repo, environment: value.env } : null;
+}
+
+const scopeWord = (org: string, value: ScopeValue) =>
+  value.scope === "org" ? `organization ${org}` : value.scope === "repo" ? `repository ${value.repo}` : `environment ${value.env} of ${value.repo}`;
+
 export function Secrets({ org }: OrgPageProps) {
+  const scopeParam = useQuery("scope");
+  const repoParam = useQuery("repo");
+  const envParam = useQuery("env");
+  const kindParam = useQuery("kind");
+  const value: ScopeValue = {
+    scope: scopeParam === "repo" || scopeParam === "env" ? scopeParam : "org",
+    repo: scopeParam === "repo" || scopeParam === "env" ? repoParam : null,
+    env: scopeParam === "env" ? envParam : null,
+  };
+  const kind: CiItemKind = kindParam === "vars" ? "vars" : "secrets";
+  const scope = scopeOf(org, value);
+  const noun = word(kind);
+
+  const cursors = useCursors();
+  const [search, setSearch] = useState("");
+  const q = useDebounced(search.trim(), 250);
+  const [panel, setPanel] = useState<{ edit: Row | null } | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+  const toastTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
+
+  const scopeId = `${value.scope}/${value.repo ?? ""}/${value.env ?? ""}`;
+  const list = (which: CiItemKind, cursor: string | null, limit: number): Promise<ApiPage<Row>> =>
+    !scope
+      ? Promise.resolve({ items: [], total: 0, next: null })
+      : which === "secrets"
+        ? listCiSecrets(scope, { q, cursor, limit })
+        : listCiVars(scope, { q, cursor, limit });
+  const [rows, reloadRows] = useLoad(() => list(kind, cursors.cursor, 50), `${scopeId}/${kind}/${q}/${cursors.key}`, true);
+  const other: CiItemKind = kind === "secrets" ? "vars" : "secrets";
+  const [otherRows, reloadOther] = useLoad(() => list(other, null, 1), `${scopeId}/${other}/${q}`, true);
+  const reload = () => {
+    reloadRows();
+    reloadOther();
+  };
+
+  const setScope = (next: ScopeValue) => {
+    cursors.reset();
+    setPanel(null);
+    setConfirming(null);
+    setQuery({ scope: next.scope === "org" ? null : next.scope, repo: next.repo, env: next.env });
+  };
+  const setKind = (next: CiItemKind) => {
+    cursors.reset();
+    setPanel(null);
+    setConfirming(null);
+    setQuery({ kind: next === "vars" ? "vars" : null });
+  };
+
+  const notify = (message: string) => {
+    setToast(message);
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 6000);
+  };
+
+  const remove = async (row: Row) => {
+    if (!scope) return;
+    setFailure(null);
+    try {
+      await deleteCiItem(scope, kind, row.name);
+      setConfirming(null);
+      notify(`Deleted ${row.name}`);
+      reload();
+    } catch (error) {
+      setFailure(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const total = (state: typeof rows) => (state.state === "ready" ? state.data.total : null);
+  const secretsTotal = kind === "secrets" ? total(rows) : total(otherRows);
+  const varsTotal = kind === "vars" ? total(rows) : total(otherRows);
+  const own = total(rows);
+  const summary =
+    own === null ? "" : `${abbreviate(own)} ${noun}${own === 1 ? "" : "s"} at this scope`;
+  const tabs: [CiItemKind, string, number | null][] = [
+    ["secrets", "Secrets", secretsTotal],
+    ["vars", "Variables", varsTotal],
+  ];
+
   return (
-    <Page title="Secrets" meta={org}>
-      <p className="meta">Scope picker and secrets table. Not built yet.</p>
+    <Page
+      title="Secrets"
+      meta={summary}
+      actions={
+        <button type="button" className={BTN_PRIMARY} disabled={!scope} onClick={() => setPanel({ edit: null })}>
+          <Plus size={12} aria-hidden="true" />
+          New {noun}
+        </button>
+      }
+    >
+      <section aria-label="Scope" className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        <span className="cap">Scope</span>
+        <ScopePicker org={org} value={value} onChange={setScope} />
+        <span className="cap">Resolution: environment &gt; repository &gt; organization. The narrowest scope wins.</span>
+      </section>
+
+      <div className={cn("grid items-start gap-4", panel ? "grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-1")}>
+        <section aria-label="Secrets and variables list" className="flex min-w-0 flex-col gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div role="tablist" aria-label="Secrets or variables" className="inline-flex gap-4 border-b border-rule font-mono text-[13px]">
+              {tabs.map(([id, label, count]) => (
+                <button
+                  key={id}
+                  type="button"
+                  role="tab"
+                  aria-selected={kind === id}
+                  onClick={() => setKind(id)}
+                  className={cn(
+                    "-mb-px cursor-pointer border-b-2 py-1.5",
+                    kind === id ? "border-brand text-fg" : "border-transparent text-fg-3 hover:text-fg",
+                  )}
+                >
+                  {label} <span className="text-fg-3">{count === null ? "" : abbreviate(count)}</span>
+                </button>
+              ))}
+            </div>
+            <label className="relative">
+              <span className="sr-only">Search by name</span>
+              <Search size={14} aria-hidden="true" className="pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2 text-fg-3" />
+              <input
+                type="search"
+                value={search}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  cursors.reset();
+                }}
+                placeholder="Search by name"
+                autoComplete="off"
+                spellCheck={false}
+                className="h-8 w-[240px] rounded-sm border border-control bg-background pr-2 pl-8 font-mono text-[13px] text-fg outline-none placeholder:text-fg-3 focus:border-brand"
+              />
+            </label>
+          </div>
+
+          {failure && (
+            <p className="notice notice-error !mb-0" role="alert">
+              {failure}
+            </p>
+          )}
+
+          {!scope ? (
+            <p className="meta rounded-sm border border-control px-4 py-6">
+              {value.scope === "env" && value.repo ? "Choose an environment to see its " : "Choose a repository to see its "}
+              {noun}s.
+            </p>
+          ) : (
+            <Await loaded={rows} retry={reloadRows}>
+              {(page) => (
+                <>
+                  {page.items.length === 0 ? (
+                    <div className="flex flex-col items-start gap-3 rounded-sm border border-control px-4 py-6 font-mono text-[13px] text-fg-2">
+                      {q ? `No ${noun}s match that name.` : `No ${noun}s at this scope.`}
+                      <button type="button" className={BTN} onClick={() => setPanel({ edit: null })}>
+                        New {noun}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto rounded-sm border border-control">
+                      <table className="w-full border-collapse text-sm">
+                        <thead>
+                          <tr>
+                            <th className={TH}>Name</th>
+                            <th className={TH}>Scope / access</th>
+                            <th className={TH}>Value</th>
+                            <th className={TH}>Updated</th>
+                            <th className={cn(TH, "text-right")}>Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {page.items.map((row) => (
+                            <tr key={row.name} className="border-t border-rule hover:bg-panel">
+                              <td className={cn(TD, "max-w-[220px]")}>
+                                <Truncate value={row.name} mono className="font-bold" />
+                              </td>
+                              <td className={cn(TD, "max-w-[250px] font-mono text-[13px] text-fg-2")}>{access(value, row)}</td>
+                              <td className={cn(TD, "max-w-[200px] font-mono text-[13px] text-fg-2")}>
+                                {"value" in row ? <Truncate value={row.value} mono /> : "write-only"}
+                              </td>
+                              <td className={cn(TD, "font-mono text-[13px] text-fg-2")} title={new Date(row.updatedAt).toLocaleString()}>
+                                {ago(row.updatedAt)}
+                              </td>
+                              <td className={cn(TD, "text-right")}>
+                                {confirming === row.name ? (
+                                  <span className="inline-flex items-center gap-2">
+                                    <span className="cap max-w-[160px] truncate" title={`Delete ${row.name}?`}>
+                                      Delete {row.name}?
+                                    </span>
+                                    <button type="button" className={BTN_SM} aria-label={`Confirm delete ${row.name}`} onClick={() => void remove(row)}>
+                                      Confirm
+                                    </button>
+                                    <button type="button" className={BTN_SM} onClick={() => setConfirming(null)}>
+                                      Cancel
+                                    </button>
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex gap-2">
+                                    <button type="button" className={BTN_SM} aria-label={`${kind === "vars" ? "Change" : "Replace"} ${row.name}`} onClick={() => setPanel({ edit: row })}>
+                                      {kind === "vars" ? "Change" : "Replace"}
+                                    </button>
+                                    <button type="button" className={BTN_SM} aria-label={`Delete ${row.name}`} onClick={() => setConfirming(row.name)}>
+                                      Delete
+                                    </button>
+                                  </span>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  <CursorPager
+                    page={page}
+                    index={cursors.index}
+                    hasPrev={cursors.hasPrev}
+                    onPrev={cursors.prev}
+                    onNext={cursors.next}
+                    noun={`${noun}s`}
+                  />
+                  <p className="meta">Values are encrypted at rest and masked in logs.</p>
+                </>
+              )}
+            </Await>
+          )}
+        </section>
+
+        {panel && scope && (
+          <ItemPanel
+            // A fresh form for each item, so a half-typed value never carries over.
+            key={`${scopeId}/${kind}/${panel.edit?.name ?? ""}`}
+            org={org}
+            scope={scope}
+            scopeLabel={scopeWord(org, value)}
+            kind={kind}
+            edit={panel.edit}
+            onClose={() => setPanel(null)}
+            onSaved={(message) => {
+              setPanel(null);
+              notify(message);
+              reload();
+            }}
+          />
+        )}
+      </div>
+
+      {toast && (
+        <div
+          role="status"
+          className="fixed right-6 bottom-6 z-30 flex items-center gap-3 rounded-sm border border-control bg-raised px-4 py-2 font-mono text-[13px] shadow-lg"
+        >
+          <span aria-hidden="true" className="text-passed">
+            ✓
+          </span>
+          <span>{toast}</span>
+          <button type="button" className={BTN_SM} aria-label="Dismiss notification" onClick={() => setToast(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
     </Page>
+  );
+}
+
+/** The access cell: who can read the item at this scope. */
+function access(value: ScopeValue, row: Row) {
+  if (value.scope === "env") return `env ${value.env}`;
+  if (value.scope === "repo") return `repo ${value.repo} only`;
+  if (row.repositories === null) return "all repos";
+  return (
+    <span className="inline-flex max-w-full items-center gap-2" title={row.repositories.join(", ")}>
+      <span>selected repos</span>
+      <span className="min-w-0 truncate rounded-xs border border-control px-1.5 text-xs text-fg-2">
+        {summarizeRepos({ all: false, repos: row.repositories })}
+      </span>
+    </span>
+  );
+}
+
+function ItemPanel({
+  org,
+  scope,
+  scopeLabel,
+  kind,
+  edit,
+  onClose,
+  onSaved,
+}: {
+  org: string;
+  scope: CiScope;
+  scopeLabel: string;
+  kind: CiItemKind;
+  edit: Row | null;
+  onClose: () => void;
+  onSaved: (message: string) => void;
+}) {
+  const noun = word(kind);
+  const isOrg = "org" in scope;
+  const [name, setName] = useState(edit?.name ?? "");
+  const [value, setValue] = useState(edit && "value" in edit ? edit.value : "");
+  const [grant, setGrant] = useState<RepoSelection>({ all: edit?.repositories == null, repos: edit?.repositories ?? [] });
+  const [tried, setTried] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+
+  const fixed = fixName(name);
+  const upper = name.toUpperCase();
+  const nameBad = upper.length > 0 && upper !== fixed;
+  const pasted = useMemo(() => (edit ? [] : parsePaste(value)), [edit, value]);
+  const multi = pasted.length > 0;
+  const invalid = pasted.filter((item) => !item.name).length;
+  const noRepos = isOrg && !grant.all && grant.repos.length === 0;
+  const nameError = multi ? null : nameBad ? (/\s/.test(name) ? "Spaces are not allowed." : "Only A-Z, 0-9 and _ are allowed.") : tried && !fixed ? "Name is required." : null;
+  const valueError = tried && !multi && value === "";
+  const preview = reference(kind, fixed);
+
+  const save = async () => {
+    setTried(true);
+    if (multi ? pasted.every((item) => !item.name) : !fixed || nameBad || value === "") return;
+    if (noRepos) return;
+    const items = multi ? pasted.filter((item) => item.name) : [{ name: fixed, value }];
+    const repositories = isOrg ? (grant.all ? null : grant.repos) : undefined;
+    setBusy(true);
+    setProblem(null);
+    let saved = 0;
+    try {
+      for (const item of items) {
+        await putCiItem(scope, kind, item.name, item.value, repositories);
+        saved += 1;
+      }
+      onSaved(multi ? `Saved ${saved} ${noun}s` : `Saved ${fixed}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const at = items[saved]?.name;
+      setProblem(`${multi ? `${saved} saved, ${at} failed: ` : ""}${message}`);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section aria-labelledby="item-title" className="flex flex-col gap-4 rounded-sm border border-control bg-panel p-4">
+      <div className="flex items-center justify-between">
+        <h2 id="item-title" className="cap">
+          {edit ? `${kind === "vars" ? "Change" : "Replace"} ${edit.name}` : `New ${noun}`}
+        </h2>
+        <button type="button" aria-label="Close panel" onClick={onClose} className="cursor-pointer text-fg-3 hover:text-fg">
+          <X size={14} aria-hidden="true" />
+        </button>
+      </div>
+
+      <div className="flex flex-col gap-1.5">
+        <label className="cap" htmlFor="item-name">
+          <span className="text-fg-2">01</span> Name
+        </label>
+        <input
+          id="item-name"
+          type="text"
+          className={cn(FIELD, "font-bold", multi && "opacity-50")}
+          value={name}
+          readOnly={edit !== null}
+          disabled={multi}
+          onChange={(event) => setName(event.target.value.toUpperCase())}
+          aria-invalid={nameError !== null}
+          aria-describedby="item-name-help item-name-error"
+          autoComplete="off"
+          spellCheck={false}
+          autoFocus={!edit}
+        />
+        <div id="item-name-help" className="meta">
+          A-Z 0-9 _ only. Uppercased as you type.
+        </div>
+        <div id="item-name-error" aria-live="polite">
+          {nameError && (
+            <div className="flex flex-wrap items-center gap-2 font-mono text-[13px] text-failed">
+              <span>✕ {nameError}</span>
+              {nameBad && fixed && (
+                <button type="button" className={BTN_SM} onClick={() => setName(fixed)}>
+                  Use {fixed}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+        {multi ? (
+          <div className="meta">Names are taken from the pasted lines below.</div>
+        ) : (
+          <div className="flex items-center justify-between gap-2 rounded-sm border border-control bg-background px-2 py-1">
+            <code className="min-w-0 truncate font-mono text-[13px] text-fg" title={preview}>
+              {preview}
+            </code>
+            <CopyButton text={preview} label={`Copy reference ${preview}`} />
+          </div>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-1.5">
+        <label className="cap" htmlFor="item-value">
+          <span className="text-fg-2">02</span> Value
+        </label>
+        <textarea
+          id="item-value"
+          rows={5}
+          className={cn(FIELD, "resize-y leading-normal")}
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          aria-describedby="item-value-help"
+          aria-invalid={valueError}
+          spellCheck={false}
+          placeholder={edit ? (kind === "secrets" ? "new value" : "value") : "value, or paste KEY=VALUE lines"}
+        />
+        <div id="item-value-help" className="meta">
+          {kind === "secrets"
+            ? "Write-only after save."
+            : `Visible to everyone in ${org} after save.`}
+          {!edit && " Paste KEY=VALUE lines to add several."}
+        </div>
+        {valueError && (
+          <div role="alert" className="font-mono text-[13px] text-failed">
+            ✕ Value is empty.
+          </div>
+        )}
+        {multi && (
+          <div className="mt-1 flex flex-col gap-1">
+            <div className="cap">
+              {abbreviate(pasted.length)} {noun}s detected · {abbreviate(pasted.length - invalid)} valid · {abbreviate(invalid)} invalid
+            </div>
+            <div className="flex max-h-40 flex-col gap-0.5 overflow-y-auto rounded-sm border border-control bg-background p-2 font-mono text-[13px]">
+              {[...pasted]
+                .sort((a, b) => Number(!a.name) - Number(!b.name))
+                .map((item, index) => (
+                  <div key={index} className={cn("flex justify-between gap-3", !item.name && "text-failed")}>
+                    <span className="min-w-0 truncate">
+                      {item.name ? "✓" : "✕"} {item.name || "(invalid name)"}
+                    </span>
+                    <span className="shrink-0 text-fg-3">
+                      {kind === "secrets" ? `write-only · ${item.value.length} chars` : item.value.length > 22 ? `${item.value.slice(0, 22)}...` : item.value}
+                    </span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {isOrg && (
+        <fieldset className="flex flex-col gap-2">
+          <legend className="cap mb-1">
+            <span className="text-fg-2">03</span> Access
+          </legend>
+          <label className="flex cursor-pointer items-start gap-2">
+            <input type="radio" name="access" className="mt-1 accent-brand" checked={grant.all} onChange={() => setGrant({ all: true, repos: grant.repos })} />
+            <span className="flex flex-col">
+              <span className="font-mono text-[13px]">All repositories</span>
+              <span className="meta">every job in {org} can read it</span>
+            </span>
+          </label>
+          <label className="flex cursor-pointer items-start gap-2">
+            <input type="radio" name="access" className="mt-1 accent-brand" checked={!grant.all} onChange={() => setGrant({ all: false, repos: grant.repos })} />
+            <span className="flex flex-col">
+              <span className="font-mono text-[13px]">Selected repositories</span>
+              <span className="meta">only jobs in the repos you pick</span>
+            </span>
+          </label>
+          {!grant.all && (
+            <div className="flex flex-col gap-1.5 pl-6">
+              <RepoMultiSelect org={org} value={grant} onChange={setGrant} allowAll={false} label="Choose repositories" />
+              {tried && noRepos && (
+                <div role="alert" className="font-mono text-[13px] text-failed">
+                  ✕ Select at least one repository.
+                </div>
+              )}
+            </div>
+          )}
+        </fieldset>
+      )}
+
+      <div className="meta">
+        Stored at: <span className="text-fg-2">{scopeLabel}</span> · jobs read it as{" "}
+        <span className="text-fg-2">{kind === "secrets" ? "secrets" : "vars"}.NAME</span>
+      </div>
+
+      {problem && (
+        <p className="notice notice-error !mb-0" role="alert">
+          {problem}
+        </p>
+      )}
+
+      <div className="flex gap-2">
+        <button type="button" className={BTN_PRIMARY} disabled={busy} onClick={() => void save()}>
+          {busy ? "Saving" : multi ? `Save ${abbreviate(pasted.length - invalid)} ${noun}s` : `Save ${noun}`}
+        </button>
+        <button type="button" className={BTN} onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </section>
   );
 }
