@@ -278,9 +278,13 @@ function Invoices({ invoices }: { invoices: CiInvoice[] }) {
                       </span>
                     </td>
                     <td className="px-3.5 py-2.5 text-right">
-                      <a href={invoice.url} target="_blank" rel="noreferrer" aria-label={`Open the ${month} invoice`} className="inline-flex items-center gap-1.5 font-mono text-xs text-fg quiet-underline hover:text-brand">
-                        Open <ExternalLink size={11} aria-hidden="true" />
-                      </a>
+                      {invoice.url === null ? (
+                        <span className="font-mono text-xs text-fg-3">Not ready</span>
+                      ) : (
+                        <a href={invoice.url} target="_blank" rel="noreferrer" aria-label={`Open the ${month} invoice`} className="inline-flex items-center gap-1.5 font-mono text-xs text-fg quiet-underline hover:text-brand">
+                          Open <ExternalLink size={11} aria-hidden="true" />
+                        </a>
+                      )}
                     </td>
                   </tr>
                 );

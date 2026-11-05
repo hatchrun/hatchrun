@@ -328,11 +328,12 @@ export interface CiDay {
 /** A Polar order, newest first, at most 12. */
 export interface CiInvoice {
   id: string;
-  /** Unix ms. */
-  date: number;
+  /** RFC 3339, as Polar answers. */
+  date: string;
   amount_cents: number;
   status: string;
-  url: string;
+  /** Null until Polar has generated the invoice. */
+  url: string | null;
 }
 
 /** What /api/ci/orgs/:org/billing answers. */

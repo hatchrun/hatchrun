@@ -134,7 +134,7 @@ export function invoicesOf(org: string) {
   return Array.from({ length: 12 }, (_, n) => {
     const date = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - n, 1);
     const id = `ord_${(small(seed, n) >>> 0).toString(36).padStart(7, "0")}`;
-    return { id, date, amount_cents: Math.round((org === SCALE_ORG ? 38_000 : 1_400) * (0.7 + (small(seed, 40 + n) % 60) / 100)), status: n === 4 ? "refunded" : "paid", url: `https://polar.sh/mock/orders/${id}` };
+    return { id, date: new Date(date).toISOString(), amount_cents: Math.round((org === SCALE_ORG ? 38_000 : 1_400) * (0.7 + (small(seed, 40 + n) % 60) / 100)), status: n === 4 ? "refunded" : "paid", url: n === 0 ? null : `https://polar.sh/mock/orders/${id}` };
   });
 }
 
