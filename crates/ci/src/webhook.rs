@@ -406,7 +406,7 @@ impl Cx<'_> {
     /// unpublished or deleted release) starts nothing.
     async fn release(&self, release: &Release) -> Result<Outcome> {
         let (id, name) = (release.installation_id, &release.repo.full_name);
-        let tag = format!("tags/{}", release.tag);
+        let tag = format!("refs/tags/{}", release.tag);
         let found = runs::commit(self.tokens, self.settings, id, name, &tag).await?;
         let sha = match release_commit(found) {
             Ok(sha) => sha,
@@ -419,9 +419,14 @@ impl Cx<'_> {
     /// A created branch or tag runs on its own commit.
     async fn create(&self, change: &RefChange) -> Result<Outcome> {
         let id = change.installation_id;
-        let name = change.r#ref.trim_start_matches("refs/");
-        let Some(sha) =
-            runs::commit(self.tokens, self.settings, id, &change.repo.full_name, name).await?
+        let Some(sha) = runs::commit(
+            self.tokens,
+            self.settings,
+            id,
+            &change.repo.full_name,
+            &change.r#ref,
+        )
+        .await?
         else {
             return Ok(Outcome::Ignored("the created ref is gone".to_owned()));
         };

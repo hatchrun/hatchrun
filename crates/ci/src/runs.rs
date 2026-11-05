@@ -114,10 +114,12 @@ pub async fn read_config(
     }
 }
 
-/// The commit `reference` (`heads/main`, `tags/v1`) names, `None` when
-/// the repository has no such ref: GitHub answers 404 for a ref that is
-/// gone, 409 for an empty repository and 422 for a ref it cannot
-/// resolve. None of them gets better by asking again.
+/// The commit the full ref `reference` (`refs/heads/main`,
+/// `refs/tags/v1`) names, `None` when the repository has no such ref:
+/// GitHub answers 404 for a ref that is gone, 409 for an empty
+/// repository and 422 for a ref it cannot resolve. None of them gets
+/// better by asking again. The commits endpoint does not take
+/// `tags/v1` (it answers 422), so the ref is always given in full.
 ///
 /// # Errors
 ///
@@ -195,7 +197,7 @@ pub async fn default_head(
     installation_id: u64,
     repo: &Repo,
 ) -> Result<Option<(String, Config)>> {
-    let reference = format!("heads/{}", repo.default_branch);
+    let reference = format!("refs/heads/{}", repo.default_branch);
     let Some(sha) = commit(
         tokens,
         settings,
