@@ -12,11 +12,14 @@ pub(crate) const FAILED_SINCE: &str = "SELECT job_id, job_name, error, attempts,
 pub(crate) const LOW_SINCE: &str = "SELECT installation_id, remaining, limited \
      FROM ci_rate_limits WHERE seen_at >= $1 ORDER BY seen_at DESC LIMIT $2";
 
-/// Notes an installation's low rate limit at `$4`.
+/// Notes an installation's low rate limit at `$4`. A row seen later than
+/// `$4` stays: a pass that ran late does not overwrite what a newer one
+/// found.
 pub(crate) const NOTE_RATE_LIMIT: &str = "INSERT INTO ci_rate_limits \
      (installation_id, remaining, limited, seen_at) VALUES ($1, $2, $3, $4) \
      ON CONFLICT (installation_id) DO UPDATE SET remaining = excluded.remaining, \
-     limited = excluded.limited, seen_at = excluded.seen_at";
+     limited = excluded.limited, seen_at = excluded.seen_at \
+     WHERE ci_rate_limits.seen_at <= excluded.seen_at";
 
 /// Records a failed launch message `$1`, with its job's name, error and
 /// attempts, once.

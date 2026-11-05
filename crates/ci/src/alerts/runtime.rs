@@ -20,7 +20,7 @@ use super::queries::{
 };
 use super::{
     Alert, BINDING, DELETE_BATCH, Email, FAILED_LAUNCH_MEMORY, FAILED_LAUNCHES_FOR, FROM, HISTORY,
-    Key, LISTED, Mail, RATE_LIMIT_MEMORY, RATE_LIMITS_FOR, State, Store, TO, settle,
+    Key, LISTED, Mail, RATE_LIMIT_MEMORY, RATE_LIMITS_FOR, Seen, State, Store, TO, settle,
 };
 
 /// Every alert.
@@ -250,26 +250,31 @@ impl Mail for Inbox {
 /// Records the pass that started at `now` with `errors` failed steps in
 /// the `ci_reconciler` row, runs the checks and sends what is due.
 pub(crate) async fn after_pass(env: &Env, db: &Db, now: u64, errors: u32) {
-    let history = logged(
-        "pass history",
-        record_pass(db, now, worker::Date::now().as_millis(), errors).await,
-    );
-    let facts = Facts {
-        history,
-        database: logged(
-            "database",
-            db.first::<Database>(DATABASE, &[])
-                .await
-                .map_err(text)
-                .and_then(|row| row.ok_or_else(|| "no row".to_owned())),
-        ),
-        failed: logged("failed launches", recent_failures(db, now).await),
-        rate_limits: logged(
-            "rate limits",
-            since(db, LOW_SINCE, now.saturating_sub(RATE_LIMITS_FOR), LISTED).await,
-        ),
+    // Read once the stored alerts are, so what a check found is not older
+    // than the rows it changes.
+    let read = async || {
+        let history = logged(
+            "pass history",
+            record_pass(db, now, worker::Date::now().as_millis(), errors).await,
+        );
+        let facts = Facts {
+            history,
+            database: logged(
+                "database",
+                db.first::<Database>(DATABASE, &[])
+                    .await
+                    .map_err(text)
+                    .and_then(|row| row.ok_or_else(|| "no row".to_owned())),
+            ),
+            failed: logged("failed launches", recent_failures(db, now).await),
+            rate_limits: logged(
+                "rate limits",
+                since(db, LOW_SINCE, now.saturating_sub(RATE_LIMITS_FOR), LISTED).await,
+            ),
+        };
+        check(&facts)
     };
-    for err in settle(&Kept(db), &Inbox::new(env), now, &check(&facts), true).await {
+    for err in settle(&Kept(db), &Inbox::new(env), now, read, true).await {
         console_error!("alerts: {err}");
     }
     if let Err(err) = prune(db, now).await {
@@ -296,7 +301,7 @@ pub(super) async fn record_pass(
         .await
         .map_err(text)?
         .ok_or_else(|| "no row".to_owned())?;
-    Ok(history(row.history.as_deref()))
+    history(row.history.as_deref()).ok_or_else(|| "the stored history does not read".to_owned())
 }
 
 /// Deletes failed launches and rate limits nobody needs any more.
@@ -345,11 +350,15 @@ pub(crate) async fn launches_failed(
     if recorded.iter().all(|changed| *changed == 0) {
         return Ok(());
     }
-    let Some(failed) = logged("failed launches", recent_failures(db, now).await) else {
-        return Ok(());
+    // Unreadable failures leave the alert as it is.
+    let read = async || {
+        let seen = match logged("failed launches", recent_failures(db, now).await) {
+            Some(failed) => failed_launches(&failed),
+            None => Seen::Unknown,
+        };
+        vec![(Key::LaunchFailed, seen)]
     };
-    let seen = [(Key::LaunchFailed, failed_launches(&failed))];
-    for err in settle(&Kept(db), &Inbox::new(env), now, &seen, false).await {
+    for err in settle(&Kept(db), &Inbox::new(env), now, read, false).await {
         console_error!("alerts: {err}");
     }
     Ok(())

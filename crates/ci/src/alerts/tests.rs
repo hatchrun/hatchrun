@@ -173,7 +173,13 @@ impl Store for Unsaved<'_> {
 }
 
 fn pass(db: &Db, outbox: &Outbox, now: u64, seen: &[(Key, Seen)]) -> Vec<String> {
-    db.wait(settle(&Kept(db.db()), outbox.at(now), now, seen, true))
+    db.wait(settle(
+        &Kept(db.db()),
+        outbox.at(now),
+        now,
+        async || seen.to_vec(),
+        true,
+    ))
 }
 
 fn firing(detail: &str) -> Seen {
@@ -208,9 +214,10 @@ fn the_history_reads_as_the_reconciler_row_keeps_it() {
     let history = passes(&[0, 1, 0]);
     // As the reconciler row keeps it.
     let text = serde_json::to_string(&history).unwrap();
-    assert_eq!(parse_history(Some(&text)), history);
-    assert_eq!(parse_history(Some("not json")), []);
-    assert_eq!(parse_history(None), []);
+    assert_eq!(parse_history(Some(&text)), Some(history));
+    assert_eq!(parse_history(Some("not json")), None);
+    assert_eq!(parse_history(Some("")), Some(Vec::new()));
+    assert_eq!(parse_history(None), Some(Vec::new()));
 }
 
 #[test]
@@ -649,7 +656,7 @@ fn an_alert_whose_row_fails_to_save_sends_nothing_that_pass() {
         &store,
         outbox.at(NOW + MINUTE),
         NOW + MINUTE,
-        &[(key, Seen::Clear)],
+        async || vec![(key, Seen::Clear)],
         true,
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -678,7 +685,7 @@ fn a_failed_save_of_a_new_detail_still_announces_the_alert() {
         &store,
         outbox.at(NOW + MINUTE),
         NOW + MINUTE,
-        &[(key, firing("job 6"))],
+        async || vec![(key, firing("job 6"))],
         true,
     ));
     assert_eq!(
@@ -793,6 +800,12 @@ fn healthz_says_when_the_reconciler_stopped_or_fails() {
     let (status, body) = health(&read(&db), NOW + 6 * MINUTE);
     assert_eq!(status, 503);
     assert_eq!(body["status"], "stale");
+
+    // A history that does not read is not a clear one.
+    db.run(record, &params![NOW, "not json"]);
+    let (status, body) = health(&read(&db), NOW + 30_000);
+    assert_eq!(status, 200);
+    assert_eq!(body["status"], "unknown");
 }
 
 /// Job 5 of a run in `acme/app`, whose launch failed for good.
@@ -857,7 +870,7 @@ fn the_dead_letter_queue_records_each_launch_once() {
             &Kept(db.db()),
             outbox.at(now),
             now,
-            &[(Key::LaunchFailed, seen.clone())],
+            async || vec![(Key::LaunchFailed, seen.clone())],
             false,
         ))
     };
@@ -901,6 +914,69 @@ fn low_rate_limits_are_kept_per_installation() {
         }]
     );
     assert_eq!(db.run(DELETE_RATE_LIMITS, &params![NOW - 10 * MINUTE]), 1);
+}
+
+#[test]
+fn a_late_rate_limit_note_keeps_the_newer_row() {
+    let db = Db::new();
+    let note = |remaining: Option<u32>, limited: bool, at: u64| {
+        db.run(NOTE_RATE_LIMIT, &params![42u64, remaining, limited, at])
+    };
+    note(Some(0), true, NOW);
+    // A pass that read the answer earlier writes after the newer one.
+    note(Some(1500), false, NOW - MINUTE);
+    let low = db.all::<LowRateLimit>(LOW_SINCE, &params![NOW - RATE_LIMITS_FOR, LISTED]);
+    assert_eq!(
+        low,
+        [LowRateLimit {
+            installation_id: 42,
+            remaining: Some(0),
+            limited: true,
+        }]
+    );
+    // A later one replaces it.
+    note(Some(1900), false, NOW + MINUTE);
+    let low = db.all::<LowRateLimit>(LOW_SINCE, &params![NOW - RATE_LIMITS_FOR, LISTED]);
+    assert_eq!(low[0].remaining, Some(1900));
+    assert!(!low[0].limited);
+}
+
+#[test]
+fn answers_through_counted_reach_the_rate_limit_rows() {
+    use hatchrun_cloud::fetch::Counted;
+    use hatchrun_cloud::http::Response;
+
+    let db = Db::new();
+    let answer = |status: u16, body: &str| Response {
+        status,
+        headers: Vec::new(),
+        body: body.as_bytes().to_vec(),
+    };
+    let calls = Counted::default();
+    // 1999 is low, 2000 is not; a refusal is low whatever it left.
+    calls.note(1, &answer(200, "{}"), Some("1999"));
+    calls.note(2, &answer(200, "{}"), Some("2000"));
+    calls.note(3, &answer(403, "API rate limit exceeded"), None);
+    // A later, higher answer does not raise the lowest one seen.
+    calls.note(1, &answer(200, "{}"), Some("2500"));
+    db.wait(note_rate_limits(db.db(), &calls, NOW));
+    let mut low = db.all::<LowRateLimit>(LOW_SINCE, &params![NOW - RATE_LIMITS_FOR, LISTED]);
+    low.sort_by_key(|limit| limit.installation_id);
+    assert_eq!(
+        low,
+        [
+            LowRateLimit {
+                installation_id: 1,
+                remaining: Some(1999),
+                limited: false,
+            },
+            LowRateLimit {
+                installation_id: 3,
+                remaining: None,
+                limited: true,
+            },
+        ]
+    );
 }
 
 #[test]
@@ -990,7 +1066,7 @@ fn a_firing_email_in_flight_when_the_alert_resolves_is_followed_by_the_resolutio
         outbox.hold.set(false);
     };
     let (errors, ()) = db.wait(futures_util::future::join(
-        settle(&kept, outbox.at(at), at, &[], true),
+        settle(&kept, outbox.at(at), at, async || Vec::new(), true),
         resolve,
     ));
     assert_eq!(errors, NONE);
@@ -1213,7 +1289,7 @@ fn a_digest_waits_for_the_pass_that_reads_every_firing_alert() {
         &store,
         outbox.at(at),
         at,
-        &[(stale, Seen::Clear)],
+        async || vec![(stale, Seen::Clear)],
         true,
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -1235,6 +1311,31 @@ fn a_digest_waits_for_the_pass_that_reads_every_firing_alert() {
 }
 
 #[test]
+fn a_check_read_after_another_pass_fired_does_not_undo_it() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let key = Key::LaunchFailed;
+    let kept = Kept(db.db());
+    // Another pass fires the alert while this one's check runs. The
+    // check read its data before that, so it finds nothing wrong.
+    let fire = async || {
+        let fired = Alert {
+            key: key.as_str().to_owned(),
+            state: State::Firing,
+            detail: "job 5".to_owned(),
+            fired_at: NOW,
+            resolved_at: None,
+            sent: None,
+        };
+        assert!(kept.save(None, &fired, NOW).await.unwrap());
+        vec![(key, Seen::Clear)]
+    };
+    let errors = db.wait(settle(&kept, outbox.at(NOW), NOW, fire, false));
+    assert_eq!(errors, NONE);
+    assert_eq!(alert(&db, key).state, State::Firing);
+}
+
+#[test]
 fn overlapping_passes_keep_each_others_records() {
     let db = Db::new();
     let at = |n: u64| NOW + n * MINUTE;
@@ -1246,14 +1347,14 @@ fn overlapping_passes_keep_each_others_records() {
     a.unwrap();
     b.unwrap();
     let row = db.first::<HealthRow>(HEALTH, &[]).unwrap();
-    assert_eq!(parse_history(row.history.as_deref()).len(), 2);
+    assert_eq!(parse_history(row.history.as_deref()).unwrap().len(), 2);
     // The history stays at its limit, newest last.
     for n in 2..15 {
         db.wait(runtime::record_pass(db.db(), at(n), at(n) + 5000, 0))
             .unwrap();
     }
     let row = db.first::<HealthRow>(HEALTH, &[]).unwrap();
-    let kept = parse_history(row.history.as_deref());
+    let kept = parse_history(row.history.as_deref()).unwrap();
     assert_eq!(kept.len(), HISTORY);
     assert_eq!(kept.last().map(|pass| pass.at), Some(at(14)));
 }
@@ -1277,7 +1378,7 @@ fn a_pass_is_added_to_the_history_and_stamps_its_end() {
 
     let row = db.first::<HealthRow>(HEALTH, &[]).unwrap();
     assert_eq!(row.finished_at, Some(NOW + MINUTE + 5000));
-    assert_eq!(parse_history(row.history.as_deref()), second);
+    assert_eq!(parse_history(row.history.as_deref()), Some(second));
 }
 
 fn passes_at(passes: &[(u64, u32)]) -> Vec<PassRecord> {
@@ -1338,7 +1439,7 @@ fn an_unreadable_dead_letter_is_recorded_and_fires_the_alert() {
         &Kept(db.db()),
         outbox.at(NOW),
         NOW,
-        &[(Key::LaunchFailed, seen)],
+        async || vec![(Key::LaunchFailed, seen)],
         false,
     ));
     assert_eq!(errors, NONE);

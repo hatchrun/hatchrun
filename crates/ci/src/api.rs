@@ -58,6 +58,7 @@ use worker::{
 };
 
 use crate::access::{self, Access};
+use crate::alerts;
 use crate::env::{Settings, run_stub};
 use crate::environments::{self, Decision};
 use crate::github;
@@ -1269,8 +1270,22 @@ impl Cx<'_> {
         no_content().map(Ok)
     }
 
-    #[allow(clippy::too_many_lines)] // One request, read top to bottom.
     async fn dispatch(&self, owner: &str, name: &str, req: &mut Request) -> Result<Served> {
+        let github = Counted::default();
+        let served = self.dispatch_with(owner, name, req, &github).await;
+        // The calls made are noted even when the dispatch was refused.
+        alerts::note_rate_limits(self.db, &github, now_ms()).await;
+        served
+    }
+
+    #[allow(clippy::too_many_lines)] // One request, read top to bottom.
+    async fn dispatch_with(
+        &self,
+        owner: &str,
+        name: &str,
+        req: &mut Request,
+        github: &Counted,
+    ) -> Result<Served> {
         let repo = match self.repo(owner, name, Access::Write).await? {
             Ok(repo) => repo,
             Err(stop) => return Ok(Err(stop)),
@@ -1295,7 +1310,6 @@ impl Cx<'_> {
         };
         let now = now_ms();
         let settings = self.settings;
-        let github = Counted::default();
         let tokens = Tokens::new(
             Kv::new(self.env),
             App::new(
@@ -1303,7 +1317,7 @@ impl Cx<'_> {
                 settings.app_id.clone(),
                 settings.app_key.clone(),
             ),
-            &github,
+            github,
             now,
         );
         let response = tokens

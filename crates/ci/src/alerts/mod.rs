@@ -341,14 +341,17 @@ pub(crate) trait Mail {
     async fn sleep(&self, ms: u64);
 }
 
-/// Applies what the checks in `seen` found at `now` and sends the
-/// emails that are due; with `digest`, also the daily digest. Returns
-/// what went wrong, for the log. An email that fails stays due.
+/// Applies what the checks found at `now` and sends the emails that are
+/// due; with `digest`, also the daily digest. `read` runs the checks. It
+/// runs after the stored alerts are read, so a pass that fired an alert
+/// in between has its row seen here and a check that read the data
+/// before that cannot undo it. Returns what went wrong, for the log. An
+/// email that fails stays due.
 pub(crate) async fn settle(
     store: &impl Store,
     mail: &impl Mail,
     now: u64,
-    seen: &[(Key, Seen)],
+    read: impl AsyncFnOnce() -> Vec<(Key, Seen)>,
     digest: bool,
 ) -> Vec<String> {
     let mut errors = Vec::new();
@@ -357,7 +360,8 @@ pub(crate) async fn settle(
         Ok(alerts) => alerts,
         Err(err) => return vec![format!("alerts: {err}")],
     };
-    for (key, seen) in seen {
+    let seen = read().await;
+    for (key, seen) in &seen {
         let at = alerts.iter().position(|alert| alert.key == key.as_str());
         let prev = at.map(|at| &alerts[at]);
         let Some(next) = observe(prev, *key, seen, now) else {

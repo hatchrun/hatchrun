@@ -20,25 +20,32 @@ pub(crate) struct HealthRow {
     pub history: Option<String>,
 }
 
-/// A pass history as the `ci_reconciler` row keeps it; an unreadable one
-/// is empty.
-pub(crate) fn history(text: Option<&str>) -> Vec<PassRecord> {
-    text.and_then(|text| serde_json::from_str(text).ok())
-        .unwrap_or_default()
+/// A pass history as the `ci_reconciler` row keeps it. No history, or a
+/// blank one, is empty; text that does not parse is `None`, unknown
+/// rather than clear.
+pub(crate) fn history(text: Option<&str>) -> Option<Vec<PassRecord>> {
+    match text {
+        None => Some(Vec::new()),
+        Some(text) if text.trim().is_empty() => Some(Vec::new()),
+        Some(text) => serde_json::from_str(text).ok(),
+    }
 }
 
 /// `/healthz`'s status and body at `now`: 200 while the last pass is
-/// recent, 503 once it is not. Failing passes show in the body only: the
+/// recent, 503 once it is not. A history that does not read shows as
+/// `unknown`, not `ok`. Failing passes show in the body only: the
 /// reconciler emails those, and 503 is for what email cannot cover, a
 /// cron that stopped.
 pub(crate) fn health(row: &HealthRow, now: u64) -> (u16, serde_json::Value) {
     let age = row.finished_at.map(|at| now.saturating_sub(at));
     let status = if age.is_none_or(|age| age > STALE) {
         "stale"
-    } else if failing(&history(row.history.as_deref())) {
-        "failing"
     } else {
-        "ok"
+        match history(row.history.as_deref()) {
+            None => "unknown",
+            Some(history) if failing(&history) => "failing",
+            Some(_) => "ok",
+        }
     };
     let body = serde_json::json!({
         "status": status,
