@@ -15,7 +15,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { billing, environmentCounts, hasCard, seedEnvironments } from "./ci-settings.ts";
+import { billing, environmentCounts, hasCard, recordAudit, seedEnvironments } from "./ci-settings.ts";
 
 export const SCALE_ORG = "acme";
 const NOW = Date.now();
@@ -52,11 +52,26 @@ const BRANCHES = [
   "dependabot/npm_and_yarn/typescript-eslint-8.72.0", "feat/billing-v2", "fix/oom-in-ingest",
 ];
 const ACTORS = [ME, "gamunu", "alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi", "ivan", "judy", "mallory", "niaj", "olivia", "peggy", "rupert", "sybil", "trent", "victor", "wendy", "dependabot[bot]", "renovate[bot]"];
+/** Head commit subjects; the last is 200 characters, the most the API keeps. */
+const MESSAGES = [
+  "fix: retry the webhook delivery when the queue is full",
+  "feat(billing): show the daily spend chart",
+  "chore(deps): bump typescript-eslint from 8.71.0 to 8.72.0",
+  "Merge pull request #4127 from acme/fix/oom-in-ingest",
+  "refactor(router): drop the legacy redirect table",
+  "docs: explain how to rotate the signing key",
+  "test: cover the empty-page case of the cursor pager",
+  "perf(ingest): batch inserts in groups of 500 instead of one at a time",
+  "revert \"feat: new sidebar\"",
+  "fix(auth): refuse a session cookie issued before the key rotation, and log which key signed it so the on-call can tell a replay from a stale browser tab without reading the code or asking the author (ENG-9912)",
+];
+
 const EVENTS = ["push", "push", "push", "pull_request", "pull_request", "workflow_dispatch", "schedule"];
 
 export interface Job {
   id: number;
   plan_id: string;
+  needs: string[];
   name: string;
   status: string;
   conclusion: string | null;
@@ -81,6 +96,7 @@ interface RunRow {
   branch: string | null;
   sha: string;
   actor: string;
+  message: string | null;
   status: string;
   conclusion: string | null;
   created_at: number;
@@ -102,6 +118,7 @@ const NODE = [18, 20, 22];
 
 interface Plan {
   name: string;
+  needs?: string[];
   /** Position in the run's order, 0-based. */
   k: number;
   environment?: string;
@@ -112,7 +129,17 @@ const bigPlans: Plan[] = (() => {
   for (const os of OS) for (const node of NODE) for (let shard = 1; shard <= 8; shard++) names.push(`test (${os}, node ${node}, shard ${shard}/8)`);
   for (let shard = 1; shard <= 24; shard++) names.push(`e2e (shard ${shard}/24)`);
   names.push("package", "deploy-staging", "deploy-production");
-  return names.map((name, k) => ({ name, k, environment: name === "deploy-production" ? "production" : name === "deploy-staging" ? "staging" : undefined }));
+  const needsOf = (name: string): string[] => {
+    const id = name.split(" ")[0] as string;
+    if (id === "build") return ["lint", "typecheck"];
+    if (id === "test") return ["build"];
+    if (id === "e2e") return ["build", "test"];
+    if (id === "package") return ["test", "e2e"];
+    if (id === "deploy-staging") return ["package"];
+    if (id === "deploy-production") return ["deploy-staging"];
+    return [];
+  };
+  return names.map((name, k) => ({ name, k, needs: needsOf(name), environment: name === "deploy-production" ? "production" : name === "deploy-staging" ? "staging" : undefined }));
 })();
 
 /** The matrix job whose log is 200,000 lines with errors. */
@@ -201,6 +228,8 @@ function runAt(i: number): RunRow {
     branch: i === BIG_AT ? "main" : branch,
     sha: sha.slice(0, 40),
     actor: i === BIG_AT ? ME : pick(ACTORS, i, 12),
+    // A scheduled run has no head commit message.
+    message: i === BIG_AT ? MESSAGES[3] as string : pick(EVENTS, i, 11) === "schedule" ? null : pick(MESSAGES, i, 13),
     status: o.status,
     conclusion: o.conclusion,
     created_at: created,
@@ -366,7 +395,10 @@ const GENERIC = ["build", "test", "lint", "deploy", "e2e", "package", "docs", "r
 
 function jobsOf(run: RunRow): Job[] {
   const i = indexOfRun(run.id);
-  const plans: Plan[] = i === BIG_AT ? bigPlans : Array.from({ length: run.jobs.total }, (_, k) => ({ name: GENERIC[(hash(i, 20) + k) % GENERIC.length] as string, k }));
+  const plans: Plan[] = i === BIG_AT ? bigPlans : Array.from({ length: run.jobs.total }, (_, k): Plan => {
+        const name = (offset: number) => GENERIC[(hash(i, 20) + offset) % GENERIC.length] as string;
+        return { name: name(k), k, needs: k === 0 ? [] : k < 3 ? [name(0)] : [name(k - 1)] };
+      });
   type State = { status: string; conclusion: string | null; held: string | null };
   // Generic runs list their jobs passed first, then failed, running, held, and the rest.
   const order: State[] = [
@@ -392,6 +424,7 @@ function jobsOf(run: RunRow): Job[] {
     return {
       id,
       plan_id: plan.name.split(" ")[0] as string,
+      needs: plan.needs ?? [],
       name: plan.name,
       status: held ? "queued" : state.status,
       conclusion: state.conclusion,
@@ -483,6 +516,43 @@ function buildLog(id: number): Log | null {
   return log;
 }
 
+// ---- activity -------------------------------------------------------------------
+
+/** Jobs running and queued now across the org's active runs, and the org's limit. */
+export function concurrencyNow(org: string) {
+  if (org !== SCALE_ORG) return { running: 0, queued: 0, limit: 5 };
+  let running = 0;
+  let queued = 0;
+  for (let i = 0; i < 60; i++) {
+    const run = runAt(i);
+    if (run.status === "completed") continue;
+    running += run.jobs.running;
+    queued += run.jobs.total - run.jobs.passed - run.jobs.failed - run.jobs.running - run.jobs.waiting - run.jobs.cancelled - run.jobs.skipped;
+  }
+  return { running, queued, limit: 20 };
+}
+
+/** Runs per hour (24h) or per six hours (7d) ending at the current bucket, counted from the generated runs. */
+function activityOf(org: string, range: "24h" | "7d", repos: string[]) {
+  const bucketMs = range === "24h" ? 60 * MINUTE : 6 * 60 * MINUTE;
+  const count = range === "24h" ? 24 : 28;
+  const end = Math.ceil(Date.now() / bucketMs) * bucketMs;
+  const buckets = Array.from({ length: count }, (_, n) => ({ at: end - (count - n) * bucketMs, started: 0, passed: 0, failed: 0 }));
+  if (org === SCALE_ORG) {
+    for (let i = 0; i < RUNS; i++) {
+      const run = runAt(i);
+      if (run.created_at < buckets[0]!.at) break;
+      if (repos.length && !repos.includes(run.repository)) continue;
+      const bucket = buckets[Math.floor((run.created_at - buckets[0]!.at) / bucketMs)];
+      if (!bucket) continue;
+      bucket.started++;
+      if (run.conclusion === "success") bucket.passed++;
+      if (run.conclusion === "failure") bucket.failed++;
+    }
+  }
+  return { bucket_ms: bucketMs, buckets, concurrency: concurrencyNow(org) };
+}
+
 // ---- the handler --------------------------------------------------------------------
 
 const json = (res: ServerResponse, status: number, body?: unknown, headers: Record<string, string> = {}) => {
@@ -569,16 +639,40 @@ export function handleScale(
     );
     return true;
   }
+  if ((found = /^orgs\/([^/]+)\/activity$/.exec(path))) {
+    const org = decodeURIComponent(found[1] as string);
+    json(res, 200, activityOf(org, url.searchParams.get("range") === "7d" ? "7d" : "24h", list(url, "repo")));
+    return true;
+  }
   if ((found = /^orgs\/([^/]+)\/repos\/enabled$/.exec(path))) {
-    if (method !== "PUT") return json(res, 405, { error: "method not allowed" }), true;
+    if (method !== "PATCH") return json(res, 405, { error: "method not allowed" }), true;
     if (!session.signedIn) return json(res, 401, { error: "sign in to change repositories" }), true;
     if (decodeURIComponent(found[1] as string) !== SCALE_ORG) return json(res, 404, { error: "not found" }), true;
     if (req.headers["x-csrf-token"] !== session.csrf) return json(res, 403, { error: "missing or wrong CSRF token" }), true;
-    const asked = (body ?? {}) as { all?: unknown; repos?: unknown };
-    if (typeof asked.all !== "boolean" || !Array.isArray(asked.repos)) return json(res, 400, { error: 'expected {"all": true, "repos": []}' }), true;
-    enabledAll = asked.all;
-    enabledSet.clear();
-    for (const name of asked.repos as string[]) enabledSet.add(name);
+    const asked = (body ?? {}) as { all?: unknown; add?: unknown; remove?: unknown };
+    const names = (value: unknown) => (value === undefined ? [] : Array.isArray(value) && value.every((name) => typeof name === "string") ? (value as string[]) : null);
+    const add = names(asked.add);
+    const remove = names(asked.remove);
+    if ((asked.all !== undefined && typeof asked.all !== "boolean") || add === null || remove === null) {
+      return json(res, 400, { error: 'expected {"all": true} or {"add": [], "remove": []}' }), true;
+    }
+    if (add.some((name) => !REPOS.includes(name)) || remove.some((name) => !REPOS.includes(name))) return json(res, 422, { error: "a repository is not part of the installation" }), true;
+    // Leaving the unset-by-hand state, the seeded repositories become the explicit set.
+    if (enabledAll === null) {
+      REPOS.forEach((name, i) => hashEnabled(i) && enabledSet.add(name));
+      enabledAll = false;
+    }
+    if (typeof asked.all === "boolean") {
+      enabledAll = asked.all;
+      if (asked.all) enabledSet.clear();
+    }
+    if (enabledAll && remove.length > 0) {
+      REPOS.forEach((name) => enabledSet.add(name));
+      enabledAll = false;
+    }
+    for (const name of add) enabledSet.add(name);
+    for (const name of remove) enabledSet.delete(name);
+    recordAudit("repos.enabled", SCALE_ORG, asked.all === true ? "all repositories" : `${add.length} added, ${remove.length} removed`);
     json(res, 204);
     return true;
   }

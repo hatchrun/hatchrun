@@ -13,7 +13,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { orgItems, paginate, SCALE_ORG, scaleEnvironments, scaleRepoNames } from "./scale.ts";
+import { concurrencyNow, orgItems, paginate, SCALE_ORG, scaleEnvironments, scaleRepoNames } from "./scale.ts";
 
 interface Item {
   value: string;
@@ -78,7 +78,9 @@ function seed(key: string, kind: "secrets" | "vars"): Table {
           ? { NPM_TOKEN: "x", DEPLOY_KEY: "x" }
           : env
             ? key.endsWith("/production") ? { DEPLOY_TOKEN: "x" } : {}
-            : { API_TOKEN: "x" }
+            : key.startsWith(`repo:${SCALE_ORG}/`)
+              ? { API_TOKEN: "x", TOKEN_NPM_1: "x" }
+              : { API_TOKEN: "x", NPM_TOKEN: "x" }
         : org
           ? { REGION: "ap-south-1" }
           : {},
@@ -100,7 +102,88 @@ export const environmentCounts = (repository: string, name: string) => ({
   vars: seed(`env:${repository}/${name}`, "vars").size,
 });
 
-export const billing = { capDollars: 50 };
+export const billing = { capDollars: 200 };
+
+// ---- spend per day, invoices, audit log -----------------------------------------
+
+const small = (a: number, b: number) => {
+  let h = (Math.imul(a + 0x9e3779b9, 0x85ebca6b) ^ Math.imul(b + 0x7f4a7c15, 0xc2b2ae35)) >>> 0;
+  h ^= h >>> 15;
+  h = Math.imul(h, 0x2c1b3c6d) >>> 0;
+  return (h ^ (h >>> 13)) >>> 0;
+};
+const orgSeed = (org: string) => [...org].reduce((sum, ch) => sum * 31 + ch.charCodeAt(0), 7) >>> 0;
+
+/** This UTC month's billed seconds and cents per day up to today: busy on weekdays, the same on every start. */
+export function dailySpend(org: string) {
+  const now = new Date();
+  const factor = org === SCALE_ORG ? 1 : 0.04;
+  const seed = orgSeed(org);
+  return Array.from({ length: now.getUTCDate() }, (_, n) => {
+    const date = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), n + 1));
+    const weekend = date.getUTCDay() === 0 || date.getUTCDay() === 6;
+    const seconds = Math.round((weekend ? 30_000 : 150_000) * factor * (0.6 + (small(seed, n) % 80) / 100));
+    return { day: date.toISOString().slice(0, 10), seconds, cents: Math.floor(seconds / 300) };
+  });
+}
+
+/** The last 12 months' Polar orders before this one, newest first. */
+export function invoicesOf(org: string) {
+  const now = new Date();
+  const seed = orgSeed(org);
+  return Array.from({ length: 12 }, (_, n) => {
+    const date = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - n, 1);
+    const id = `ord_${(small(seed, n) >>> 0).toString(36).padStart(7, "0")}`;
+    return { id, date, amount_cents: Math.round((org === SCALE_ORG ? 38_000 : 1_400) * (0.7 + (small(seed, 40 + n) % 60) / 100)), status: n === 4 ? "refunded" : "paid", url: `https://polar.sh/mock/orders/${id}` };
+  });
+}
+
+export type AuditAction = "secret.put" | "secret.delete" | "var.put" | "var.delete" | "environment.put" | "environment.delete" | "repos.enabled";
+interface AuditRow {
+  id: number;
+  at: number;
+  actor: string;
+  action: AuditAction;
+  scope: string;
+  target: string;
+}
+const AUDIT_ACTORS = ["octocat", "gamunu", "alice", "bob", "carol", "dave"];
+const AUDIT_ACTIONS: AuditAction[] = ["secret.put", "secret.put", "secret.delete", "var.put", "var.delete", "environment.put", "environment.delete", "repos.enabled"];
+/** Changes made through the mock since it started, newest first. */
+const audited: AuditRow[] = [];
+let auditSeq = 1_000_000;
+export function recordAudit(action: AuditAction, scope: string, target: string, actor = "octocat") {
+  audited.unshift({ id: (auditSeq += 1), at: Date.now(), actor, action, scope, target });
+}
+
+/** The acme log: 1,200 entries, one every 37 minutes, then what happened since the start. */
+function auditRows(org: string, repos: () => string[]): AuditRow[] {
+  if (org !== SCALE_ORG) return audited.filter((row) => row.scope === org || row.scope.startsWith(`${org}/`));
+  const names = repos();
+  const base = Array.from({ length: 1200 }, (_, n): AuditRow => {
+    const action = AUDIT_ACTIONS[small(n, 1) % AUDIT_ACTIONS.length] as AuditAction;
+    const repo = names[small(n, 2) % 40] as string;
+    const wide = small(n, 3) % 3 === 0;
+    const kind = action.startsWith("secret") ? "secret" : action.startsWith("var") ? "var" : action.startsWith("env") ? "environment" : "repos";
+    return {
+      id: 900_000 - n,
+      at: Date.now() - (n + 1) * 37 * 60_000,
+      actor: AUDIT_ACTORS[small(n, 4) % AUDIT_ACTORS.length] as string,
+      action,
+      scope: kind === "repos" || wide ? org : kind === "environment" ? `${repo}/production` : repo,
+      target: kind === "repos" ? `${1 + (small(n, 5) % 40)} repositories` : kind === "environment" ? ["production", "staging", "qa"][small(n, 6) % 3] as string : `${["NPM", "DEPLOY", "AWS", "SENTRY"][small(n, 7) % 4]}_${kind === "secret" ? "TOKEN" : "REGION"}_${small(n, 8) % 90}`,
+    };
+  });
+  return [...audited, ...base];
+}
+
+/** Item age since a job last read it: a fifth never, a fifth over 90 days ago, the rest within the last 60. */
+function lastUsed(name: string): number | null {
+  const roll = small(orgSeed(name), 9) % 100;
+  if (roll < 20) return null;
+  if (roll < 40) return Date.now() - (91 + (roll % 40)) * day;
+  return Date.now() - (roll % 60) * day - 3_600_000;
+}
 
 /** Organizations the mock Polar checkout put a card on. */
 const carded = new Set<string>();
@@ -153,6 +236,7 @@ function environmentRoute(
   rows: Map<string, Environment>,
   name: string,
   body: unknown,
+  scope: string,
 ): true {
   if (name === "") {
     if (method !== "GET") {
@@ -161,7 +245,9 @@ function environmentRoute(
     }
     json(res, 200, [...rows.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([n, row]) => environmentJson(n, row)));
   } else if (method === "DELETE") {
-    json(res, rows.delete(name) ? 204 : 404, { error: "not found" });
+    const removed = rows.delete(name);
+    if (removed) recordAudit("environment.delete", scope, name);
+    json(res, removed ? 204 : 404, { error: "not found" });
   } else if (method === "PUT") {
     const { branches, approval } = (body ?? {}) as { branches?: unknown; approval?: unknown };
     if (!/^[A-Za-z0-9._-]+$/.test(name) || /^\.+$/.test(name) || name.length > 100) {
@@ -172,6 +258,7 @@ function environmentRoute(
       const existing = [...rows.keys()].find((seen) => seen.toLowerCase() === name.toLowerCase()) ?? name;
       const row = { branches: branches as string[], approval, updatedAt: Date.now() };
       rows.set(existing, row);
+      recordAudit("environment.put", scope, existing);
       json(res, 200, environmentJson(existing, row));
     }
   } else {
@@ -193,7 +280,7 @@ export function handleCiSettings(
   url: URL = new URL("http://localhost/"),
 ): boolean {
   const found =
-    /^orgs\/([^/]+)\/(billing(?:\/cap)?|secrets|vars)(?:\/([^/]+))?$/.exec(path) ??
+    /^orgs\/([^/]+)\/(billing(?:\/cap)?|secrets|vars|audit)(?:\/([^/]+))?$/.exec(path) ??
     /^repos\/([^/]+)\/([^/]+)\/(secrets|vars)(?:\/([^/]+))?$/.exec(path) ??
     /^repos\/([^/]+)\/([^/]+)\/environments(?:\/([^/]+)(?:\/(secrets|vars)(?:\/([^/]+))?)?)?$/.exec(path);
   if (!found) {
@@ -228,16 +315,19 @@ export function handleCiSettings(
   if (what.startsWith("billing")) {
     const sub = what.slice("billing/".length);
     if (what === "billing" && method === "GET") {
+      const daily = dailySpend(owner);
       json(res, 200, {
-        card: hasCard(owner),
-        seconds: 19_200,
-        units: 19_200,
-        spendCents: Math.floor((19_200 * 2_000) / 60 / 10_000),
+        card: hasCard(owner) ? { brand: "visa", last4: "4242", exp_month: 8, exp_year: 2029 } : null,
+        daily,
+        invoices: invoicesOf(owner),
+        seconds: daily.reduce((sum, d) => sum + d.seconds, 0),
+        units: daily.reduce((sum, d) => sum + d.seconds, 0),
+        spendCents: daily.reduce((sum, d) => sum + d.cents, 0),
         capDollars: billing.capDollars,
         minCapDollars: 50,
         maxCapDollars: 10_000,
-        running: 2,
-        maxRunning: 5,
+        running: concurrencyNow(owner).running,
+        maxRunning: concurrencyNow(owner).limit,
       });
     } else if (sub === "cap" && method === "PUT") {
       const asked = (body as { capDollars?: unknown } | undefined)?.capDollars;
@@ -255,9 +345,19 @@ export function handleCiSettings(
     return true;
   }
 
+  if (what === "audit") {
+    if (method !== "GET") {
+      json(res, 405, { error: "method not allowed" });
+      return true;
+    }
+    const repo = url.searchParams.get("repo");
+    json(res, 200, paginate(auditRows(owner, scaleRepoNames).filter((row) => !repo || row.scope === repo || row.scope.startsWith(`${repo}/`)), url));
+    return true;
+  }
+
   const environmentRows = inEnvironments ? seedEnvironments(`${owner}/${repo}`) : null;
   if (environmentRows && what === "") {
-    return environmentRoute(res, method, environmentRows, environment, body);
+    return environmentRoute(res, method, environmentRows, environment, body, `${owner}/${repo}`);
   }
   if (environmentRows && !environmentRows.has(environment)) {
     json(res, 404, { error: "not found" });
@@ -268,13 +368,28 @@ export function handleCiSettings(
   const rows = seed(org ? `org:${owner}` : inEnvironments ? `env:${owner}/${repo}/${environment}` : `repo:${owner}/${repo}`, kind);
   if (item === "" && method === "GET") {
     const needle = (url.searchParams.get("q") ?? "").toLowerCase();
-    const list = [...rows.entries()]
-      .filter(([name]) => !needle || name.toLowerCase().includes(needle))
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([name, row]) => {
-        const repositories = org ? (row.repositories ?? null) : null;
-        return kind === "secrets" ? { name, updatedAt: row.updatedAt, repositories } : { name, value: row.value, updatedAt: row.updatedAt, repositories };
-      });
+    const own = org ? "org" : inEnvironments ? "env" : "repo";
+    // Wider scopes the list also holds, narrowest first.
+    const wider: { scope: "org" | "repo"; rows: Table }[] =
+      own === "env" ? [{ scope: "repo", rows: seed(`repo:${owner}/${repo}`, kind) }, { scope: "org", rows: seed(`org:${owner}`, kind) }] : own === "repo" ? [{ scope: "org", rows: seed(`org:${owner}`, kind) }] : [];
+    const reaches = (scope: string, row: Item) => scope !== "org" || !row.repositories || row.repositories.includes(`${owner}/${repo}`);
+    const view = (name: string, row: Item, scope: "org" | "repo" | "env", shadowed: boolean) => {
+      const repositories = scope === "org" ? (row.repositories ?? null) : null;
+      const common = { name, updatedAt: row.updatedAt, repositories, scope, shadowed, last_used_at: lastUsed(name) };
+      return kind === "secrets" ? common : { ...common, value: row.value };
+    };
+    const matches = ([name]: [string, Item]) => !needle || name.toLowerCase().includes(needle);
+    const byName = ([a]: [string, Item], [b]: [string, Item]) => a.localeCompare(b);
+    const list = [
+      ...[...rows.entries()].filter(matches).sort(byName).map(([name, row]) => view(name, row, own, false)),
+      ...wider.flatMap((level, at) =>
+        [...level.rows.entries()]
+          .filter(([, row]) => reaches(level.scope, row))
+          .filter(matches)
+          .sort(byName)
+          .map(([name, row]) => view(name, row, level.scope, rows.has(name) || wider.slice(0, at).some((narrower) => narrower.rows.has(name)))),
+      ),
+    ];
     json(res, 200, paginate(list, url));
     return true;
   }
@@ -283,8 +398,12 @@ export function handleCiSettings(
     json(res, 400, typeof name === "string" ? { error: "not found" } : name);
     return true;
   }
+  const auditScope = org ? owner : inEnvironments ? `${owner}/${repo}/${environment}` : `${owner}/${repo}`;
+  const auditKind = kind === "secrets" ? "secret" : "var";
   if (method === "DELETE") {
-    json(res, rows.delete(name) ? 204 : 404, { error: "not found" });
+    const removed = rows.delete(name);
+    if (removed) recordAudit(`${auditKind}.delete`, auditScope, name);
+    json(res, removed ? 204 : 404, { error: "not found" });
   } else if (method === "PUT") {
     const { value, repositories } = (body ?? {}) as { value?: unknown; repositories?: unknown };
     const chosen = org ? checkRepositories(owner, repositories) : null;
@@ -300,6 +419,7 @@ export function handleCiSettings(
       json(res, 409, { error: `${org ? owner : `${owner}/${repo}`} has ${org ? 1000 : 100} ${kind}, the most allowed` });
     } else {
       rows.set(name, { value, updatedAt: Date.now(), repositories: chosen as string[] | null });
+      recordAudit(`${auditKind}.put`, auditScope, name);
       json(res, 204);
     }
   } else {

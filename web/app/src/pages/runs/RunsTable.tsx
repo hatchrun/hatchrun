@@ -16,17 +16,18 @@ const EDGE: Partial<Record<Status, string>> = { failed: "--failed", waiting: "--
 
 const TH = "cap px-3 py-2.5 text-left font-normal";
 
-/** One page of runs: status edge, repo and workflow, branch, sha, actor, status, jobs, duration, age. */
+/** One page of runs: status edge, repo and workflow, branch, sha, commit message, actor, status, jobs, duration, age. */
 export function RunsTable({ runs, now }: { runs: CiRun[]; now: number }) {
   return (
     <div className="max-h-[560px] overflow-auto">
-      <table className="w-full min-w-[1080px] border-collapse">
+      <table className="w-full min-w-[1320px] border-collapse">
         <thead className="sticky top-0 z-[1] bg-background">
           <tr>
             <th className={`${TH} pl-3.5`}>Run</th>
             <th className={TH}>Workflow</th>
             <th className={TH}>Branch</th>
             <th className={TH}>Commit</th>
+            <th className={TH}>Message</th>
             <th className={TH}>Actor</th>
             <th className={TH}>Status</th>
             <th className={TH}>Jobs</th>
@@ -58,6 +59,9 @@ export function RunsTable({ runs, now }: { runs: CiRun[]; now: number }) {
                   <Truncate value={run.sha} copy mono>
                     {shortSha(run.sha)}
                   </Truncate>
+                </td>
+                <td className="max-w-[300px] min-w-[200px] px-3 py-2.5 whitespace-nowrap text-fg-2">
+                  {run.message ? <Truncate value={run.message} className="block" /> : <span className="text-fg-3">-</span>}
                 </td>
                 <td className="max-w-[130px] px-3 py-2.5 whitespace-nowrap text-fg-2">
                   <Truncate value={run.actor} className="block" />

@@ -6,7 +6,7 @@
 // orchestrator. Shapes follow crates/ci/src/api.rs. Times are Unix
 // milliseconds. List routes answer `Page<T>`.
 
-import { adminOnly, ApiError, del, failure, get, post, put, queryString, retrying, type Page, type Paging } from "./core";
+import { adminOnly, ApiError, del, failure, get, patch, post, put, queryString, retrying, type Page, type Paging } from "./core";
 
 const orgPath = (org: string) => `/api/ci/orgs/${encodeURIComponent(org)}`;
 const repoPath = (owner: string, repo: string) => `/api/ci/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
@@ -37,6 +37,8 @@ export interface CiRun {
   branch: string | null;
   sha: string;
   actor: string;
+  /** The head commit's subject, at most 200 characters; null when the trigger carried none. */
+  message: string | null;
   status: string;
   conclusion: string | null;
   created_at: number;
@@ -59,6 +61,8 @@ export interface CiStep {
 export interface CiJob {
   id: number;
   plan_id: string;
+  /** The `plan_id`s of the jobs this one waits on. */
+  needs: string[];
   name: string;
   status: string;
   conclusion: string | null;
@@ -283,10 +287,61 @@ export interface DispatchRequest {
 export const dispatchWorkflow = (owner: string, repo: string, body: DispatchRequest) =>
   post<{ runs: number[] }>(`${repoPath(owner, repo)}/dispatch`, body);
 
+/** Runs started per bucket of the activity chart. */
+export interface ActivityBucket {
+  /** Start of the bucket, Unix ms. */
+  at: number;
+  started: number;
+  passed: number;
+  failed: number;
+}
+
+export interface Activity {
+  /** 3,600,000 for "24h" (24 buckets), 21,600,000 for "7d" (28 buckets). */
+  bucket_ms: number;
+  buckets: ActivityBucket[];
+  /** Jobs running and queued now, and the most that may run at once. */
+  concurrency: { running: number; queued: number; limit: number };
+}
+
+export type ActivityRange = "24h" | "7d";
+
+export const getActivity = (org: string, range: ActivityRange, repo?: string[]) =>
+  retrying(() => get<Activity>(`${orgPath(org)}/activity${queryString({ range, repo })}`));
+
+/** The card on file at Polar. */
+export interface CiCard {
+  brand: string;
+  last4: string;
+  exp_month: number;
+  exp_year: number;
+}
+
+/** One day of the month's spend. */
+export interface CiDay {
+  /** UTC date, YYYY-MM-DD. */
+  day: string;
+  seconds: number;
+  cents: number;
+}
+
+/** A Polar order, newest first, at most 12. */
+export interface CiInvoice {
+  id: string;
+  /** Unix ms. */
+  date: number;
+  amount_cents: number;
+  status: string;
+  url: string;
+}
+
 /** What /api/ci/orgs/:org/billing answers. */
 export interface CiBilling {
-  /** Whether a card is on file. */
-  card: boolean;
+  /** The card on file; null when there is none. */
+  card: CiCard | null;
+  /** This month, one entry per UTC day up to today. */
+  daily: CiDay[];
+  invoices: CiInvoice[];
   /** Billed runner seconds this month, every attempt at least 60. */
   seconds: number;
   /** Billing units this month; one unit is one 2 vCPU second. */
@@ -325,9 +380,13 @@ export interface OrgRepoQuery extends Paging {
 export const listOrgRepos = (org: string, { q, enabled, cursor, limit }: OrgRepoQuery = {}) =>
   retrying(() => get<Page<CiOrgRepo>>(`${orgPath(org)}/repos${queryString({ q, enabled, cursor, limit })}`));
 
-/** Chooses which repositories start runs (org admin). `all` ignores `repos`. */
-export const setEnabledRepos = (org: string, body: { all: boolean; repos: string[] }) =>
-  adminOnly(() => put<undefined>(`${orgPath(org)}/repos/enabled`, body));
+/**
+ * Changes which repositories start runs (org admin). `all` turns CI on
+ * for every repository or off for the ones not added; `add` and
+ * `remove` are `owner/name` lists that leave the rest as they are.
+ */
+export const patchEnabledRepos = (org: string, body: { all?: boolean; add?: string[]; remove?: string[] }) =>
+  adminOnly(() => patch<undefined>(`${orgPath(org)}/repos/enabled`, body));
 
 export interface OrgSetup {
   app: { installed: boolean; repos: number; manage_url: string };
@@ -359,6 +418,12 @@ export interface CiSecret {
   name: string;
   updatedAt: number;
   repositories: string[] | null;
+  /** Where the item lives. A list also holds items inherited from a wider scope. */
+  scope: "org" | "repo" | "env";
+  /** An inherited item that a narrower one of the same name hides. */
+  shadowed: boolean;
+  /** When a job last received it, Unix ms; null if none did. */
+  last_used_at: number | null;
 }
 
 export interface CiVar extends CiSecret {
@@ -428,3 +493,23 @@ export const putCiEnvironment = (owner: string, repo: string, name: string, body
 
 export const deleteCiEnvironment = (owner: string, repo: string, name: string) =>
   adminOnly(() => del<undefined>(`${environmentsPath(owner, repo)}/${encodeURIComponent(name)}`));
+
+/** What an audit entry did. */
+export type AuditAction = "secret.put" | "secret.delete" | "var.put" | "var.delete" | "environment.put" | "environment.delete" | "repos.enabled";
+
+export interface AuditEntry {
+  id: number;
+  /** Unix ms. */
+  at: number;
+  /** GitHub login. */
+  actor: string;
+  action: AuditAction;
+  /** "org", "owner/repo" or "owner/repo/environment". */
+  scope: string;
+  /** The secret, variable, environment or repository the action touched. */
+  target: string;
+}
+
+/** The org's audit log, newest first (org admin). */
+export const listAudit = (org: string, { repo, cursor, limit }: { repo?: string } & Paging = {}) =>
+  adminOnly(() => get<Page<AuditEntry>>(`${orgPath(org)}/audit${queryString({ repo, cursor, limit })}`));

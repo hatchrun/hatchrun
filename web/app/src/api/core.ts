@@ -72,6 +72,7 @@ export async function request<T>(method: string, path: string, body?: unknown): 
 export const get = <T>(path: string) => request<T>("GET", path);
 export const post = <T>(path: string, body?: unknown) => request<T>("POST", path, body ?? {});
 export const put = <T>(path: string, body?: unknown) => request<T>("PUT", path, body ?? {});
+export const patch = <T>(path: string, body?: unknown) => request<T>("PATCH", path, body ?? {});
 export const del = <T>(path: string) => request<T>("DELETE", path);
 
 /** The signed-in session, or null when nobody is signed in. */
