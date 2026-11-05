@@ -193,7 +193,10 @@ export function FilterBar({
     ...(filters.repos.length > 0 ? [{ id: "repo", label: filters.repos.length > 2 ? `Repo: ${filters.repos.slice(0, 2).join(", ")} + ${filters.repos.length - 2} more` : `Repo: ${filters.repos.join(", ")}`, remove: () => setFilters({ repos: null }) }] : []),
     ...(filters.branch ? [{ id: "branch", label: `Branch: ${filters.branch}`, remove: () => setFilters({ branch: null }) }] : []),
     ...(filters.actor ? [{ id: "actor", label: `Actor: ${filters.actor}`, remove: () => setFilters({ actor: null }) }] : []),
-    ...(filters.q ? [{ id: "q", label: `Text: ${filters.q}`, remove: () => setFilters({ q: null }) }] : []),
+    ...(filters.q ? [{ id: "q", label: `Text: ${filters.q}`, remove: () => {
+      setDraft(null);
+      setFilters({ q: null });
+    } }] : []),
   ];
 
   return (
@@ -234,7 +237,10 @@ export function FilterBar({
           <button
             type="button"
             className="cursor-pointer font-mono text-[13px] text-fg underline decoration-control underline-offset-3 hover:decoration-fg-3"
-            onClick={() => setFilters({ q: null, repos: null, branch: null, actor: null })}
+            onClick={() => {
+              setDraft(null);
+              setFilters({ q: null, repos: null, branch: null, actor: null });
+            }}
           >
             clear all
           </button>

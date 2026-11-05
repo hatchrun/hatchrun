@@ -34,14 +34,19 @@ export function CopyButton({
     }
   };
   return (
-    <button
-      type="button"
-      onClick={copy}
-      aria-label={copied ? "Copied" : label}
-      title={copied ? "Copied" : label}
-      className={cn("inline-flex shrink-0 cursor-pointer p-0.5 text-fg-3 hover:text-fg", className)}
-    >
-      {copied ? <Check size={size} aria-hidden="true" className="text-passed" /> : <Copy size={size} aria-hidden="true" />}
-    </button>
+    <>
+      <button
+        type="button"
+        onClick={copy}
+        aria-label={copied ? "Copied" : label}
+        title={copied ? "Copied" : label}
+        className={cn("inline-flex shrink-0 cursor-pointer p-0.5 text-fg-3 hover:text-fg", className)}
+      >
+        {copied ? <Check size={size} aria-hidden="true" className="text-passed" /> : <Copy size={size} aria-hidden="true" />}
+      </button>
+      <span role="status" className="sr-only">
+        {copied ? "Copied" : ""}
+      </span>
+    </>
   );
 }

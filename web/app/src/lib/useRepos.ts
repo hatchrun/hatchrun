@@ -25,6 +25,7 @@ export interface RepoSearch {
 }
 
 interface Answer {
+  org: string;
   key: string;
   repos: CiOrgRepo[];
   total: number;
@@ -47,8 +48,8 @@ export function useRepoSearch(org: string, query: string, limit = 50, enabled = 
     }
     let current = true;
     listOrgRepos(org, { q, limit }).then(
-      (page) => current && setAnswer({ key, repos: page.items, total: page.total, error: null }),
-      (error: unknown) => current && setAnswer({ key, repos: [], total: 0, error: error instanceof Error ? error : new Error(String(error)) }),
+      (page) => current && setAnswer({ org, key, repos: page.items, total: page.total, error: null }),
+      (error: unknown) => current && setAnswer({ org, key, repos: [], total: 0, error: error instanceof Error ? error : new Error(String(error)) }),
     );
     return () => {
       current = false;
@@ -56,6 +57,7 @@ export function useRepoSearch(org: string, query: string, limit = 50, enabled = 
   }, [org, q, limit, enabled, key]);
 
   const fresh = answer?.key === key;
-  // While a new answer is on its way the last one stays on screen.
-  return { repos: answer?.repos ?? [], total: answer?.total ?? 0, loading: enabled && !fresh, error: fresh ? answer.error : null };
+  // While a new answer is on its way the last one of the same organization stays on screen.
+  const shown = answer?.org === org ? answer : null;
+  return { repos: shown?.repos ?? [], total: shown?.total ?? 0, loading: enabled && !fresh, error: fresh ? answer.error : null };
 }

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { ChevronsUpDown } from "lucide-react";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { listOrgRepos } from "@/api";
 import { abbreviate } from "@/lib/format";
@@ -42,6 +42,9 @@ async function allMatching(org: string, q: string): Promise<string[]> {
   return names;
 }
 
+/** What a selection is, for telling whether it changed. */
+const selectionKey = ({ all, repos }: RepoSelection) => (all ? "*" : repos.join("\u0000"));
+
 const LINK = "cursor-pointer font-mono text-[13px] text-fg underline decoration-control underline-offset-3 hover:decoration-fg-3 disabled:cursor-default disabled:opacity-50 disabled:no-underline";
 
 /**
@@ -72,6 +75,7 @@ export function RepoMultiSelect({
   const [query, setQuery] = useState("");
   const [onlySelected, setOnlySelected] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const q = query.trim();
   const { repos, total, loading } = useRepoSearch(org, q, 50, open && !onlySelected);
 
@@ -87,14 +91,44 @@ export function RepoMultiSelect({
   // Picking a row while "All repositories" is on turns it off and starts a selection.
   const toggle = (name: string) =>
     onChange({ all: false, repos: value.all ? [name] : chosen.has(name) ? value.repos.filter((seen) => seen !== name) : [...value.repos, name] });
+  // The newest selection and whether the selector is still on screen, for a bulk read that finishes late.
+  const latest = useRef(selectionKey(value));
+  const mounted = useRef(true);
+  useEffect(() => {
+    latest.current = selectionKey(value);
+  }, [value]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
   const selectMatching = async () => {
+    const started = selectionKey(value);
+    setError(null);
     setBusy(true);
     try {
       const names = await allMatching(org, q);
-      onChange({ all: false, repos: [...new Set([...(value.all ? [] : value.repos), ...names])] });
+      // A selection edited meanwhile, or a closed selector, drops the result: the user runs it again.
+      if (mounted.current && latest.current === started) {
+        onChange({ all: false, repos: [...new Set([...(value.all ? [] : value.repos), ...names])] });
+      }
+    } catch (err) {
+      if (mounted.current) {
+        setError(err instanceof Error ? err.message : "Could not read the matching repositories.");
+      }
     } finally {
-      setBusy(false);
+      if (mounted.current) {
+        setBusy(false);
+      }
     }
+  };
+  const close = () => {
+    setOpen(false);
+    setQuery("");
+    setOnlySelected(false);
+    setError(null);
   };
 
   const items = shown.map((repo) => ({
@@ -122,7 +156,10 @@ export function RepoMultiSelect({
             role="switch"
             aria-checked={value.all}
             aria-label="All repositories"
-            onClick={() => onChange({ all: !value.all, repos: value.repos })}
+            onClick={() => {
+              if (!value.all) setOnlySelected(false);
+              onChange({ all: !value.all, repos: value.repos });
+            }}
             className={cn("relative h-5 w-9 cursor-pointer rounded-full border border-control", value.all ? "bg-fg" : "bg-background")}
           >
             <span className={cn("absolute top-0.5 size-3.5 rounded-full transition-[left]", value.all ? "left-[18px] bg-background" : "left-0.5 bg-fg-3")} />
@@ -133,7 +170,10 @@ export function RepoMultiSelect({
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 font-mono text-[13px] text-fg-2">
           <span>{value.repos.length} selected</span>
           <span className="flex gap-3">
-            <button type="button" className={LINK} disabled={value.repos.length === 0} onClick={() => onChange({ all: false, repos: [] })}>
+            <button type="button" className={LINK} disabled={value.repos.length === 0} onClick={() => {
+                setError(null);
+                onChange({ all: false, repos: [] });
+              }}>
               clear
             </button>
             <button type="button" className={LINK} aria-pressed={onlySelected} onClick={() => setOnlySelected(!onlySelected)}>
@@ -147,6 +187,11 @@ export function RepoMultiSelect({
           {busy ? "Selecting" : `Select all matching (${abbreviate(total)})`}
         </button>
       )}
+      {error && (
+        <p role="alert" className="font-mono text-[13px] text-failed">
+          {error}
+        </p>
+      )}
     </div>
   );
 
@@ -154,11 +199,8 @@ export function RepoMultiSelect({
     <Popover
       open={open}
       onOpenChange={(next) => {
-        setOpen(next);
-        if (!next) {
-          setQuery("");
-          setOnlySelected(false);
-        }
+        if (next) setOpen(true);
+        else close();
       }}
       width={380}
       trigger={
@@ -181,7 +223,10 @@ export function RepoMultiSelect({
         <PickList
           items={items}
           query={query}
-          onQuery={setQuery}
+          onQuery={(next) => {
+            setQuery(next);
+            setError(null);
+          }}
           label="Search repositories"
           placeholder={`Search ${total ? abbreviate(total) : ""} repositories`.replace("  ", " ")}
           empty={loading ? "Loading" : onlySelected ? "Nothing selected." : "No repositories match."}
@@ -192,7 +237,7 @@ export function RepoMultiSelect({
                 {`${abbreviate(matches)} ${q ? "matches" : "repositories"}`}
                 {!value.all && !onlySelected && total > shown.length && ` · showing ${shown.length}`}
               </span>
-              <button type="button" className={LINK} onClick={() => setOpen(false)}>
+              <button type="button" className={LINK} onClick={close}>
                 Done
               </button>
             </>
