@@ -836,25 +836,33 @@ pub(crate) async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> 
 /// out of retries, fires their alert (see [`crate::alerts`]) and ends
 /// their jobs. A message that does not read is recorded with its body
 /// and left unacked, which the queue counts as done, since no job can be
-/// named; a job that cannot be ended is retried.
+/// named; a job that cannot be ended is retried, and so is the whole
+/// batch when the failures cannot be recorded.
 pub async fn dead_letters(batch: MessageBatch<LaunchMessage>, env: Env) {
     let mut messages = Vec::new();
     let mut unreadable = Vec::new();
     for raw in batch.raw_iter() {
         let id = raw.id();
-        let body = js_sys::JSON::stringify(&raw.body())
-            .ok()
-            .and_then(|text| text.as_string())
-            .unwrap_or_default();
+        let raw_body = raw.body();
         match worker::Message::<LaunchMessage>::try_from(raw) {
             Ok(message) => messages.push(message),
             Err(err) => {
+                let body = js_sys::JSON::stringify(&raw_body)
+                    .ok()
+                    .and_then(|text| text.as_string())
+                    .unwrap_or_default();
                 console_error!("launch dead letters: unreadable message {id}: {err}");
                 unreadable.push((id, alerts::unreadable(&err.to_string(), &body)));
             }
         }
     }
-    record_failures(&env, &messages, &unreadable).await;
+    if let Err(err) = record_failures(&env, &messages, &unreadable).await {
+        // Nothing is acked, so the queue delivers the batch again and
+        // the alert still gets its chance.
+        console_error!("launch dead letters: alert: {err}");
+        batch.retry_all();
+        return;
+    }
     let results = join_all(
         messages
             .iter()
@@ -874,27 +882,19 @@ pub async fn dead_letters(batch: MessageBatch<LaunchMessage>, env: Env) {
 
 /// Records the launches of `messages` and the `unreadable` ones, and
 /// fires the failed launch alert before the jobs are ended, so the job's
-/// error is still the launch's. A failure is logged: the jobs are ended
-/// either way.
+/// error is still the launch's. A failure to record is returned: the
+/// batch is then retried, since acking it would lose the alert.
 async fn record_failures(
     env: &Env,
     messages: &[worker::Message<LaunchMessage>],
     unreadable: &[(String, String)],
-) {
+) -> Result<(), String> {
     let failed: Vec<(String, u64)> = messages
         .iter()
         .map(|message| (message.id(), message.body().job_id))
         .collect();
-    let db = match Db::connect(env).await {
-        Ok(db) => db,
-        Err(err) => {
-            console_error!("launch dead letters: alert: database: {err}");
-            return;
-        }
-    };
-    if let Err(err) = alerts::launches_failed(env, &db, now_ms(), &failed, unreadable).await {
-        console_error!("launch dead letters: alert: {err}");
-    }
+    let db = Db::connect(env).await.map_err(|err| err.to_string())?;
+    alerts::launches_failed(env, &db, now_ms(), &failed, unreadable).await
 }
 
 async fn dead_letter(env: &Env, message: LaunchMessage) -> Result<(), String> {
