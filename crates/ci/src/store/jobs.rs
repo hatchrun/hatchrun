@@ -715,6 +715,10 @@ pub struct JobCounts {
     pub running: u64,
     /// Not started: waiting on another job or queued.
     pub waiting: u64,
+    /// Completed with `cancelled`.
+    pub cancelled: u64,
+    /// Completed with `skipped`.
+    pub skipped: u64,
 }
 
 impl JobCounts {
@@ -724,6 +728,8 @@ impl JobCounts {
         match (status, conclusion) {
             ("completed", Some("success")) => self.passed += n,
             ("completed", Some("failure")) => self.failed += n,
+            ("completed", Some("cancelled")) => self.cancelled += n,
+            ("completed", Some("skipped")) => self.skipped += n,
             ("launching" | "launched" | "running", _) => self.running += n,
             ("waiting" | "queued", _) => self.waiting += n,
             _ => {}
@@ -813,4 +819,32 @@ pub async fn approval_jobs(db: &Db, tenant: &str, limit: u32) -> Result<Vec<Appr
         &params![tenant, limit],
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobCounts;
+
+    #[test]
+    fn counts_split_the_completed_conclusions() {
+        let mut counts = JobCounts::default();
+        counts.add("completed", Some("success"), 2);
+        counts.add("completed", Some("failure"), 1);
+        counts.add("completed", Some("cancelled"), 3);
+        counts.add("completed", Some("skipped"), 4);
+        counts.add("running", None, 1);
+        counts.add("queued", None, 5);
+        assert_eq!(
+            counts,
+            JobCounts {
+                total: 16,
+                passed: 2,
+                failed: 1,
+                running: 1,
+                waiting: 5,
+                cancelled: 3,
+                skipped: 4,
+            }
+        );
+    }
 }
