@@ -314,14 +314,13 @@ struct Cx<'a> {
 impl Cx<'_> {
     /// Starts what `trigger` asks for.
     async fn run(&self, trigger: &Trigger) -> Result<Outcome> {
-        let cx = self;
         Ok(match trigger {
-            Trigger::Push(push) => cx.push(push).await?,
-            Trigger::PullRequest(pr) => cx.pull_request(pr).await?,
-            Trigger::Release(release) => cx.release(release).await?,
-            Trigger::Create(change) => cx.create(change).await?,
-            Trigger::Delete(change) => cx.delete(change).await?,
-            Trigger::Rerequested(rerun) => cx.rerun(rerun).await?,
+            Trigger::Push(push) => self.push(push).await?,
+            Trigger::PullRequest(pr) => self.pull_request(pr).await?,
+            Trigger::Release(release) => self.release(release).await?,
+            Trigger::Create(change) => self.create(change).await?,
+            Trigger::Delete(change) => self.delete(change).await?,
+            Trigger::Rerequested(rerun) => self.rerun(rerun).await?,
             // The row was updated before, with the tenant's other
             // repository writes; nothing runs.
             Trigger::Repository(_) => Outcome::Done(Vec::new()),
