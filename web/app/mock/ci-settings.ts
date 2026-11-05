@@ -13,6 +13,8 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
+import { orgItems, paginate, SCALE_ORG, scaleRepoNames } from "./scale.ts";
+
 interface Item {
   value: string;
   updatedAt: number;
@@ -28,14 +30,13 @@ interface Environment {
 
 type Table = Map<string, Item>;
 
-const orgs = ["acme", "acme-corp", "octo-labs"];
 const day = 24 * 3600 * 1000;
 
 const table = (rows: Record<string, string>): Table =>
   new Map(Object.entries(rows).map(([name, value], i) => [name, { value, updatedAt: Date.now() - (i + 1) * day }]));
 
-/** The repositories of each organization that have run CI. */
-const orgRepos = (org: string) => [`${org}/api`, `${org}/web`];
+/** Any organization of the mock tenants has these pages; "acme" is the one with org-scale data. */
+const knownOrg = (login: string) => /^[a-z0-9-]+$/.test(login) && login !== "e2e";
 
 /** Environments by `<owner>/<repo>`, in the order of creation. */
 const environments = new Map<string, Map<string, Environment>>();
@@ -73,7 +74,9 @@ function seed(key: string, kind: "secrets" | "vars"): Table {
           ? { REGION: "ap-south-1" }
           : {},
     );
-    if (org && kind === "secrets") {
+    if (key === `org:${SCALE_ORG}`) {
+      found = new Map(orgItems(kind).map(({ name, ...item }) => [name, item]));
+    } else if (org && kind === "secrets") {
       const first = found.get("NPM_TOKEN");
       if (first) first.repositories = [`${key.slice("org:".length)}/api`];
     }
@@ -115,7 +118,7 @@ function checkRepositories(org: string, given: unknown): string[] | null | { err
   if (!Array.isArray(given) || given.some((name) => typeof name !== "string")) {
     return { error: "repositories must be a list of names or null" };
   }
-  const known = orgRepos(org);
+  const known = org === SCALE_ORG ? scaleRepoNames() : [`${org}/api`, `${org}/web`];
   const unknown = (given as string[]).filter((name) => !known.some((seen) => seen.toLowerCase() === name.toLowerCase()));
   if (unknown.length > 0) return { error: `Unknown repositories: ${[...new Set(unknown)].join(", ")}` };
   return [...new Set(given as string[])].sort();
@@ -166,9 +169,10 @@ export function handleCiSettings(
   path: string,
   session: { signedIn: boolean; csrf: string },
   body: unknown,
+  url: URL = new URL("http://localhost/"),
 ): boolean {
   const found =
-    /^orgs\/([^/]+)\/(billing(?:\/cap)?|secrets|vars|repositories)(?:\/([^/]+))?$/.exec(path) ??
+    /^orgs\/([^/]+)\/(billing(?:\/cap)?|secrets|vars)(?:\/([^/]+))?$/.exec(path) ??
     /^repos\/([^/]+)\/([^/]+)\/(secrets|vars)(?:\/([^/]+))?$/.exec(path) ??
     /^repos\/([^/]+)\/([^/]+)\/environments(?:\/([^/]+)(?:\/(secrets|vars)(?:\/([^/]+))?)?)?$/.exec(path);
   if (!found) {
@@ -186,7 +190,7 @@ export function handleCiSettings(
   const method = req.method ?? "GET";
 
   // A viewer who cannot manage the scope sees a 404, as the API answers.
-  const known = org ? orgs.includes(owner) : (orgs.includes(owner) || owner === "e2e") && repo === "demo";
+  const known = org ? knownOrg(owner) : (knownOrg(owner) || owner === "e2e") && (repo === "demo" || owner === SCALE_ORG);
   if (!session.signedIn) {
     json(res, 401, { error: "sign in to manage billing" });
     return true;
@@ -230,15 +234,6 @@ export function handleCiSettings(
     return true;
   }
 
-  if (org && what === "repositories") {
-    if (method !== "GET") {
-      json(res, 405, { error: "method not allowed" });
-    } else {
-      json(res, 200, orgRepos(owner).map((name) => ({ name })));
-    }
-    return true;
-  }
-
   const environmentRows = inEnvironments ? seedEnvironments(`${owner}/${repo}`) : null;
   if (environmentRows && what === "") {
     return environmentRoute(res, method, environmentRows, environment, body);
@@ -251,13 +246,15 @@ export function handleCiSettings(
   const kind = what as "secrets" | "vars";
   const rows = seed(org ? `org:${owner}` : inEnvironments ? `env:${owner}/${repo}/${environment}` : `repo:${owner}/${repo}`, kind);
   if (item === "" && method === "GET") {
+    const needle = (url.searchParams.get("q") ?? "").toLowerCase();
     const list = [...rows.entries()]
+      .filter(([name]) => !needle || name.toLowerCase().includes(needle))
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([name, row]) => {
         const repositories = org ? (row.repositories ?? null) : null;
         return kind === "secrets" ? { name, updatedAt: row.updatedAt, repositories } : { name, value: row.value, updatedAt: row.updatedAt, repositories };
       });
-    json(res, 200, list);
+    json(res, 200, paginate(list, url));
     return true;
   }
   const name = validName(item, kind === "secrets" ? "secret" : "variable");

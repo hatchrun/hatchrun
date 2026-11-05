@@ -14,8 +14,9 @@ import { createHash } from "node:crypto";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 
-import type { LogIndex } from "../src/api.ts";
+import type { LogIndex } from "../src/api/ci.ts";
 import { handleCiSettings } from "./ci-settings.ts";
+import { handleScale, paginate } from "./scale.ts";
 
 interface Step {
   index: number;
@@ -67,12 +68,18 @@ const text = (steps: Step[]) => steps.map((step) => [`== ${step.name}`, ...step.
 
 function indexOf(steps: Step[]): LogIndex {
   let offset = 0;
+  let line = 0;
   const marks = steps.map((step) => {
-    const mark = { index: step.index, name: step.name, offset };
+    const lines = step.lines.length + 1;
+    const mark = { index: step.index, name: step.name, offset, line, lines };
     offset += Buffer.byteLength(text([step]));
+    line += lines;
     return mark;
   });
-  return { bytes: offset, steps: marks, dropped_lines: 0 };
+  const errors = steps.flatMap((step, index) =>
+    step.lines.flatMap((text, n) => (text.includes("FAILED") || text.startsWith("error") ? [{ offset: (marks[index] as { offset: number }).offset, line: (marks[index] as { line: number }).line + 1 + n, step: step.index, text }] : [])),
+  );
+  return { bytes: offset, lines: line, steps: marks, dropped_lines: 0, errors, first_error: errors[0] ?? null };
 }
 
 const summary = (step: Step) => ({
@@ -143,12 +150,21 @@ function run(id: number, number: number, workflow: string, event: string, ref: s
     workflow,
     event,
     ref,
+    branch: ref.replace("refs/heads/", ""),
     sha: "3f2a9c1d5e6b7a8091a2b3c4d5e6f708192a3b4c",
     actor: "octocat",
     status,
     conclusion,
     created_at: created,
     completed_at: completed,
+    duration_ms: completed === null ? null : completed - created,
+    jobs: {
+      total: jobs.filter((job) => job.run === id).length,
+      passed: jobs.filter((job) => job.run === id && job.conclusion === "success").length,
+      failed: jobs.filter((job) => job.run === id && job.conclusion === "failure").length,
+      running: jobs.filter((job) => job.run === id && job.status === "in_progress").length,
+      waiting: jobs.filter((job) => job.run === id && job.held !== null).length,
+    },
   };
 }
 
@@ -231,7 +247,7 @@ export async function handleCi(
   const hidden = () => json(res, 404, { error: "not found" });
   let found: RegExpExecArray | null;
 
-  if (handleCiSettings(req, res, path, session, body)) {
+  if (handleScale(req, res, url, path, session, body) || handleCiSettings(req, res, path, session, body, url)) {
     return;
   }
 
@@ -240,9 +256,8 @@ export async function handleCi(
     if (req.method !== "GET" || (repository !== "e2e/demo" && !isPrivate(repository)) || (isPrivate(repository) && !session.signedIn)) {
       return hidden();
     }
-    const before = Number(url.searchParams.get("before") ?? Infinity);
-    const page = (isPrivate(repository) ? [] : runs).filter((candidate) => candidate.id < before).sort((a, b) => b.id - a.id);
-    return json(res, 200, { runs: page });
+    const page = (isPrivate(repository) ? [] : runs).sort((a, b) => b.id - a.id);
+    return json(res, 200, paginate(page, url));
   }
 
   if ((found = /^repos\/([^/]+)\/([^/]+)\/dispatch$/.exec(path))) {
