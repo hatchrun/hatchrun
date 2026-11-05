@@ -82,7 +82,7 @@ function SetupSteps({ org, setup, reload }: { org: string; setup: OrgSetup; relo
             ? `CI is on for all ${count(setup.app.repos)} repositories.`
             : `CI is on for ${count(enabledCount)} of ${count(setup.app.repos)} repositories.`
           : "Pick the repositories that run jobs on hatchrun.",
-      children: setup.app.installed && <EnableRepos org={org} setup={setup} enabled={enabled} reloadEnabled={reloadEnabled} onChanged={reload} />,
+      children: setup.app.installed && <EnableRepos key={org} org={org} setup={setup} enabled={enabled} reloadEnabled={reloadEnabled} onChanged={reload} />,
     },
     {
       key: "config",
@@ -133,6 +133,8 @@ async function readEnabled(org: string): Promise<CiOrgRepo[]> {
 }
 
 function EnableRepos({ org, setup, enabled, reloadEnabled, onChanged }: { org: string; setup: OrgSetup; enabled: Loaded<CiOrgRepo[]>; reloadEnabled: () => void; onChanged: () => void }) {
+  // Kept here so the message survives the form remounting on the saved-selection key.
+  const [result, setResult] = useState<SaveResult | null>(null);
   return (
     <Await loaded={enabled} retry={reloadEnabled}>
       {(repos) => (
@@ -140,6 +142,8 @@ function EnableRepos({ org, setup, enabled, reloadEnabled, onChanged }: { org: s
           // A different saved selection starts a new draft, once the refreshed list is in.
           key={`${setup.enabled.all}:${repos.map((repo) => repo.name).join(",")}`}
           org={org}
+          result={result}
+          setResult={setResult}
           total={setup.app.repos}
           saved={{ all: setup.enabled.all, repos: repos.map((repo) => repo.name) }}
           onChanged={() => {
@@ -152,10 +156,11 @@ function EnableRepos({ org, setup, enabled, reloadEnabled, onChanged }: { org: s
   );
 }
 
-function EnableForm({ org, total, saved, onChanged }: { org: string; total: number; saved: RepoSelection; onChanged: () => void }) {
+type SaveResult = { ok: boolean; text: string };
+
+function EnableForm({ org, total, saved, result, setResult, onChanged }: { org: string; total: number; saved: RepoSelection; result: SaveResult | null; setResult: (result: SaveResult | null) => void; onChanged: () => void }) {
   const [draft, setDraft] = useState<RepoSelection>(saved);
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
   const n = draft.all ? total : draft.repos.length;
 
   const enable = async () => {

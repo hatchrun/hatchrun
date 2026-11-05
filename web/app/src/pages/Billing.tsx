@@ -17,12 +17,12 @@ const HEAD = "border-b border-control px-3.5 py-2";
 
 /** Settings, Billing (also /settings): this month's CI spend, the spend cap and the card. */
 export function Billing({ org }: OrgPageProps) {
-  const [billing, reload] = useLoad(() => getCiBilling(org), org);
+  const returning = new URLSearchParams(window.location.search).has("checkout");
+  const [billing, reload] = useLoad(() => getCiBilling(org), org, returning);
   const now = new Date();
   // The server bills by UTC month, so the page reads the month in UTC too.
   const month = now.toLocaleDateString("en-US", { month: "long", timeZone: "UTC" });
   const card = billing.state === "ready" ? billing.data.card : false;
-  const returning = new URLSearchParams(window.location.search).has("checkout");
   const tries = useRef(0);
   useEffect(() => {
     // Polar confirms the card by webhook, a moment after the redirect back.

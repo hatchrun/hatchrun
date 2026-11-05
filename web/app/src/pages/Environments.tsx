@@ -59,6 +59,7 @@ export function Environments({ org }: OrgPageProps) {
   const [seenOrg, setSeenOrg] = useState(org);
   if (seenOrg !== org) {
     setSeenOrg(org);
+    cursors.reset();
     setPanel(null);
     setConfirming(null);
   }

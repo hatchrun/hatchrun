@@ -336,7 +336,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
       current = false;
       window.clearTimeout(timer);
     };
-  }, [q, source, source.version]);
+  }, [q, source, live ? source.version : 0]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const matches = search.state === "ready" ? search.matches : [];
   const stepMatch = (delta: number) => {
