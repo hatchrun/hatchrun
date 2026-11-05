@@ -59,6 +59,13 @@ function initialOpen(source: LogSource, live: boolean): Set<number> {
       open.add(section.id);
     }
   }
+  if (live) {
+    // A running log follows its last step, whatever failed before it.
+    const last = sections[sections.length - 1];
+    if (last) {
+      open.add(last.id);
+    }
+  }
   if (open.size === 0) {
     if (live || source.lines > 2000) {
       const last = sections[sections.length - 1];
@@ -132,9 +139,11 @@ export interface Props {
   onRetry: () => void;
   download: () => void;
   downloading: boolean;
+  /** Why the last download failed; null when it did not. */
+  downloadError: string | null;
 }
 
-export function LogViewer({ source, name, live, feed, failed, onRetry, download, downloading }: Props) {
+export function LogViewer({ source, name, live, feed, failed, onRetry, download, downloading, downloadError }: Props) {
   const [, rerender] = useReducer((n: number) => n + 1, 0);
   useEffect(() => {
     let frame = 0;
@@ -168,6 +177,8 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
   const scroller = useRef<HTMLDivElement>(null);
   const finder = useRef<HTMLInputElement>(null);
   const handled = useRef(0);
+  const lastTop = useRef(0);
+  const searchedQ = useRef("");
 
   // Rows: each section is its header, then its lines when open.
   const layout = useMemo(() => {
@@ -303,6 +314,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
   // Find, asked of the server (or memory, for a running job) once typing pauses.
   useEffect(() => {
     if (q === "") {
+      searchedQ.current = "";
       return;
     }
     let current = true;
@@ -311,7 +323,10 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
         (found) => {
           if (current) {
             setSearch({ state: "ready", q, ...found });
-            setMatchAt(-1);
+            if (searchedQ.current !== q) {
+              searchedQ.current = q;
+              setMatchAt(-1);
+            }
           }
         },
         (err: unknown) => current && setSearch({ state: "error", message: err instanceof Error ? err.message : String(err) }),
@@ -321,7 +336,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
       current = false;
       window.clearTimeout(timer);
     };
-  }, [q, source]);
+  }, [q, source, source.version]);
 
   const matches = search.state === "ready" ? search.matches : [];
   const stepMatch = (delta: number) => {
@@ -460,10 +475,15 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
     }
   }
 
-  const onWheel = (event: React.WheelEvent) => {
-    if (event.deltaY < 0) {
+  // Any upward move away from the end (wheel, scrollbar, keys, touch)
+  // stops following. The viewer's own scrolls only go down to the end.
+  const onScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    const el = event.currentTarget;
+    if (el.scrollTop < lastTop.current && el.scrollHeight - el.scrollTop - el.clientHeight > 4) {
       setFollow(false);
     }
+    lastTop.current = el.scrollTop;
+    setScrollTop(el.scrollTop);
   };
 
   return (
@@ -595,6 +615,11 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
           <button type="button" className={BTN} disabled={downloading} aria-label="Download this job log as a text file" onClick={download}>
             {downloading ? "Preparing" : "Download"}
           </button>
+          {downloadError !== null && (
+            <span role="alert" className="max-w-[240px] truncate font-mono text-[13px] text-failed" title={downloadError}>
+              Download failed: {downloadError}
+            </span>
+          )}
           <button
             type="button"
             className={BTN}
@@ -649,7 +674,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
           Expand failed
         </button>
       </div>
-      <div ref={scroller} className="relative min-h-0 flex-1 overflow-auto bg-background" onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)} onWheel={onWheel} onClick={() => setMenu(null)}>
+      <div ref={scroller} className="relative min-h-0 flex-1 overflow-auto bg-background" onScroll={onScroll} onClick={() => setMenu(null)}>
         <div style={{ paddingTop: first * ROW, paddingBottom: Math.max(0, layout.rows - last) * ROW }} className="w-max min-w-full">
           {rows}
         </div>

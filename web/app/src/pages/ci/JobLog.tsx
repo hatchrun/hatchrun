@@ -62,6 +62,7 @@ export function JobLog({ job, onCheck }: { job: CiJob; onCheck: () => void }) {
   const source = completed ? stored : memory;
   const [feed, setFeed] = useState<Feed>("loading");
   const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [round, setRound] = useState(0);
   // The latest job and callback, for effects that must not restart when they change.
   const latest = useRef({ job, onCheck });
@@ -165,6 +166,7 @@ export function JobLog({ job, onCheck }: { job: CiJob; onCheck: () => void }) {
       return;
     }
     setDownloading(true);
+    setDownloadError(null);
     try {
       const url = URL.createObjectURL(new Blob([await source.all()], { type: "text/plain" }));
       const link = document.createElement("a");
@@ -172,8 +174,9 @@ export function JobLog({ job, onCheck }: { job: CiJob; onCheck: () => void }) {
       link.download = `${job.name.replace(/[^A-Za-z0-9._-]+/g, "-")}-${job.id}.log`;
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
-    } catch {
+    } catch (err) {
       // The log stays on screen; the button works again.
+      setDownloadError(err instanceof Error ? err.message : String(err));
     } finally {
       setDownloading(false);
     }
@@ -202,6 +205,7 @@ export function JobLog({ job, onCheck }: { job: CiJob; onCheck: () => void }) {
       onRetry={() => (source instanceof StoredLog ? source.retry() : setRound((n) => n + 1))}
       download={() => void download()}
       downloading={downloading}
+      downloadError={downloadError}
     />
   );
 }

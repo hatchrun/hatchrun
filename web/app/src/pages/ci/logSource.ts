@@ -332,7 +332,7 @@ export class MemoryLog implements LogSource {
       } else if (event.type === "line") {
         this.pushLive(event.text);
       } else if (event.type === "annotation") {
-        this.pushLive(annotationLine(event.annotation));
+        this.pushLive(annotationLine(event.annotation), event.annotation.level === "error");
       } else {
         const step = this.steps.find((s) => s.index === event.index);
         if (step) {
@@ -344,12 +344,12 @@ export class MemoryLog implements LogSource {
     this.changed();
   }
 
-  private pushLive(line: string) {
+  private pushLive(line: string, error = false) {
     const last = this.steps[this.steps.length - 1];
     if (last) {
       last.lines++;
     }
-    if (isError(line)) {
+    if (error || isError(line)) {
       this.errors.push({ offset: 0, line: this.text.length, step: Math.max(0, this.steps.length - 1), text: line.slice(0, 300) });
     }
     this.text.push(line);
