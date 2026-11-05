@@ -27,6 +27,12 @@ pub(crate) const RECORD_FAILED: &str = "INSERT INTO ci_failed_launches \
        (SELECT launch_attempts FROM ci_jobs WHERE id = $2), $3) \
      ON CONFLICT (message_id) DO NOTHING";
 
+/// Records a message `$1` that did not read, with what is known of it
+/// as the error `$2`, once.
+pub(crate) const RECORD_UNREADABLE: &str = "INSERT INTO ci_failed_launches \
+     (message_id, error, failed_at) VALUES ($1, $2, $3) \
+     ON CONFLICT (message_id) DO NOTHING";
+
 /// Deletes up to `$2` failed launches recorded before `$1`.
 pub(crate) const DELETE_FAILED: &str = "DELETE FROM ci_failed_launches WHERE id IN \
      (SELECT id FROM ci_failed_launches WHERE failed_at < $1 LIMIT $2)";

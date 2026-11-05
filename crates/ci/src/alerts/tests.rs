@@ -13,7 +13,7 @@ use super::checks::{
 use super::health::history as parse_history;
 use super::queries::{
     DATABASE, DELETE_FAILED, DELETE_RATE_LIMITS, FAILED_SINCE, LOW_SINCE, NOTE_RATE_LIMIT,
-    RECORD_FAILED,
+    RECORD_FAILED, RECORD_UNREADABLE,
 };
 use super::runtime::Kept;
 use super::*;
@@ -1246,4 +1246,43 @@ fn old_failed_launches_and_rate_limits_are_pruned() {
     let low = db.all::<LowRateLimit>(LOW_SINCE, &params![0u64, LISTED]);
     assert_eq!(low.len(), 1);
     assert_eq!(low[0].installation_id, 43);
+}
+
+#[test]
+fn an_unreadable_dead_letter_is_recorded_and_fires_the_alert() {
+    let db = Db::new();
+    let long = "x".repeat(2 * BODY_KEPT);
+    let error = unreadable("missing field `job_id`", &long);
+    assert!(error.starts_with("unreadable message (missing field `job_id`): xxx"));
+    assert!(error.ends_with("..."));
+    assert_eq!(
+        error.len(),
+        "unreadable message (missing field `job_id`): ".len() + BODY_KEPT + 3
+    );
+    assert_eq!(unreadable("bad", "{}"), "unreadable message (bad): {}");
+
+    let record =
+        |message: &str, at: u64| db.run(RECORD_UNREADABLE, &params![message, error.as_str(), at]);
+    assert_eq!(record("m1", NOW), 1);
+    assert_eq!(record("m1", NOW + 1), 0);
+
+    let failed = db.all::<FailedLaunch>(FAILED_SINCE, &params![NOW - HOUR, LISTED]);
+    assert_eq!(failed.len(), 1);
+    assert_eq!((failed[0].job_id, failed[0].attempts), (None, None));
+    let seen = failed_launches(&failed);
+    assert!(matches!(&seen, Seen::Firing(detail) if detail.contains("unreadable message")));
+
+    let outbox = Outbox::default();
+    let errors = db.wait(settle(
+        &Kept(db.db()),
+        outbox.at(NOW),
+        NOW,
+        &[(Key::LaunchFailed, seen)],
+        false,
+    ));
+    assert_eq!(errors, NONE);
+    assert_eq!(
+        outbox.take(),
+        ["[hatchrun] Firing: CI launch failed for good"]
+    );
 }

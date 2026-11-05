@@ -82,6 +82,8 @@ const FAILED_LAUNCH_MEMORY: u64 = 7 * DAY;
 const RATE_LIMIT_MEMORY: u64 = DAY;
 /// Failed launches one pass deletes at most.
 const DELETE_BATCH: u32 = 1000;
+/// Characters of an unreadable message's body that its record keeps.
+const BODY_KEPT: usize = 300;
 /// Rows a detail lists at most.
 const LISTED: u32 = 10;
 
@@ -122,6 +124,16 @@ fn title(key: &str) -> &str {
         "ci_database_connections" => "Database connections near the limit",
         other => other,
     }
+}
+
+/// The error recorded for a dead-letter message that did not read: why,
+/// and its raw `body` cut to [`BODY_KEPT`] characters.
+pub(crate) fn unreadable(why: &str, body: &str) -> String {
+    let mut kept: String = body.chars().take(BODY_KEPT).collect();
+    if kept.len() < body.len() {
+        kept.push_str("...");
+    }
+    format!("unreadable message ({why}): {kept}")
 }
 
 /// What a check found.

@@ -16,7 +16,7 @@ use super::checks::{Database, Facts, FailedLaunch, PassRecord, check, failed_lau
 use super::health::{HEALTH, HealthRow, history};
 use super::queries::{
     DATABASE, DELETE_FAILED, DELETE_RATE_LIMITS, FAILED_SINCE, LOW_SINCE, NOTE_RATE_LIMIT,
-    RECORD_FAILED,
+    RECORD_FAILED, RECORD_UNREADABLE,
 };
 use super::{
     Alert, BINDING, DELETE_BATCH, Email, FAILED_LAUNCH_MEMORY, FAILED_LAUNCHES_FOR, FROM, Key,
@@ -310,21 +310,30 @@ pub(super) async fn prune(db: &Db, now: u64) -> Result<(), String> {
 }
 
 /// Records failed launches from the dead-letter queue, as
-/// `(message id, job id)`, and fires their alert. Errors are returned
-/// when the launches could not be recorded; the alert's are logged.
+/// `(message id, job id)`, and the messages that did not read, as
+/// `(message id, error)` (see [`super::unreadable`]), and fires their
+/// alert. Errors are returned when they could not be recorded; the
+/// alert's are logged.
 pub(crate) async fn launches_failed(
     env: &Env,
     db: &Db,
     now: u64,
     failed: &[(String, u64)],
+    unreadable: &[(String, String)],
 ) -> Result<(), String> {
-    if failed.is_empty() {
+    if failed.is_empty() && unreadable.is_empty() {
         return Ok(());
     }
-    let statements: Vec<(&str, Vec<Param>)> = failed
+    let mut statements: Vec<(&str, Vec<Param>)> = failed
         .iter()
         .map(|(message, job)| (RECORD_FAILED, params![message.as_str(), *job, now]))
         .collect();
+    statements.extend(unreadable.iter().map(|(message, error)| {
+        (
+            RECORD_UNREADABLE,
+            params![message.as_str(), error.as_str(), now],
+        )
+    }));
     let recorded = db.batch(&statements).await.map_err(text)?;
     if recorded.iter().all(|changed| *changed == 0) {
         return Ok(());
