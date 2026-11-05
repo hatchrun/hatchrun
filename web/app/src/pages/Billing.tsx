@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { useEffect, useRef } from "react";
+
 import { getCiBilling, type CiBilling } from "@/api";
 import { CardButton, dollars, SpendCapForm } from "@/components/BillingParts";
 import { Page } from "@/components/Page";
@@ -17,9 +19,27 @@ const HEAD = "border-b border-control px-3.5 py-2";
 export function Billing({ org }: OrgPageProps) {
   const [billing, reload] = useLoad(() => getCiBilling(org), org);
   const now = new Date();
-  const month = now.toLocaleDateString("en-US", { month: "long" });
+  // The server bills by UTC month, so the page reads the month in UTC too.
+  const month = now.toLocaleDateString("en-US", { month: "long", timeZone: "UTC" });
+  const card = billing.state === "ready" ? billing.data.card : false;
+  const returning = new URLSearchParams(window.location.search).has("checkout");
+  const tries = useRef(0);
+  useEffect(() => {
+    // Polar confirms the card by webhook, a moment after the redirect back.
+    if (!returning || card) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      tries.current += 1;
+      reload();
+      if (tries.current >= 10) {
+        window.clearInterval(timer);
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [returning, card, reload]);
   return (
-    <Page title="Billing" meta={`${org} · billed per second · 1 to ${now.getDate()} ${now.toLocaleDateString("en-US", { month: "short" })}`} narrow>
+    <Page title="Billing" meta={`${org} · billed per second · 1 to ${now.getUTCDate()} ${now.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" })}`} narrow>
       <Await loaded={billing} retry={reload}>
         {(data) => <BillingBody org={org} billing={data} month={month} now={now} reload={reload} />}
       </Await>
@@ -29,11 +49,10 @@ export function Billing({ org }: OrgPageProps) {
 
 function BillingBody({ org, billing, month, now, reload }: { org: string; billing: CiBilling; month: string; now: Date; reload: () => void }) {
   const spent = billing.spendCents / 100;
-  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-  const projected = (spent / now.getDate()) * daysInMonth;
+  const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
+  const projected = (spent / now.getUTCDate()) * daysInMonth;
   const percent = billing.capDollars > 0 ? Math.min(100, Math.round((spent / billing.capDollars) * 100)) : 0;
   const reached = spent >= billing.capDollars;
-  const minutes = Math.round(billing.units / 60);
 
   return (
     <>
@@ -70,8 +89,8 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
             <tbody>
               <tr className="border-t border-rule hover:bg-panel">
                 <td className="px-3.5 py-2.5 font-bold shadow-[inset_3px_0_0_var(--brand)]">hatchrun CI</td>
-                <td className="px-3 py-2.5 font-mono text-xs text-fg-2">min at 2 vCPU</td>
-                <td className="px-3 py-2.5 text-right font-mono text-xs">{minutes.toLocaleString("en-US")}</td>
+                <td className="px-3 py-2.5 font-mono text-xs text-fg-2">2 vCPU seconds</td>
+                <td className="px-3 py-2.5 text-right font-mono text-xs">{billing.units.toLocaleString("en-US")}</td>
                 <td className="px-3.5 py-2.5 text-right font-mono text-xs">{dollars(spent, true)}</td>
               </tr>
               <tr className="border-t border-control bg-panel">
@@ -111,7 +130,11 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
               <div className={cn("h-full", reached ? "bg-waiting" : "bg-brand")} style={{ width: `${percent}%` }} />
             </div>
             <p className={cn("m-0 mt-2 font-mono text-xs", reached ? "text-waiting" : "text-fg-3")}>
-              {reached ? "Cap reached. New CI jobs queue until you raise it." : "New CI jobs start until the month reaches the cap."}
+              {!billing.card
+                ? "A card is required. New CI jobs wait until one is added."
+                : reached
+                  ? "Cap reached. New CI jobs queue until you raise it."
+                  : "New CI jobs start until the month reaches the cap."}
             </p>
           </div>
           <SpendCapForm key={billing.capDollars} org={org} current={billing.capDollars} min={billing.minCapDollars} max={billing.maxCapDollars} onSaved={reload} />

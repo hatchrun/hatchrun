@@ -58,7 +58,7 @@ export function Setup({ org }: OrgPageProps) {
 const isComplete = (setup: OrgSetup) => setup.app.installed && (setup.enabled.all || setup.enabled.count > 0) && setup.first_run !== null && setup.billing.card;
 
 function SetupSteps({ org, setup, reload }: { org: string; setup: OrgSetup; reload: () => void }) {
-  const [enabled, reloadEnabled] = useLoad(() => readEnabled(org, setup.enabled.all), `${org}:${setup.enabled.all}`);
+  const [enabled, reloadEnabled] = useLoad(() => readEnabled(org), `${org}:${setup.enabled.all}:${setup.enabled.count}`);
   const enabledCount = setup.enabled.all ? setup.app.repos : setup.enabled.count;
   const steps: Step[] = [
     {
@@ -120,14 +120,14 @@ function SetupSteps({ org, setup, reload }: { org: string; setup: OrgSetup; relo
   );
 }
 
-/** All enabled repositories, read a page at a time; with `all` only the first page, for the repo chooser. */
-async function readEnabled(org: string, all: boolean): Promise<CiOrgRepo[]> {
+/** All enabled repositories, read a page at a time. */
+async function readEnabled(org: string): Promise<CiOrgRepo[]> {
   const repos: CiOrgRepo[] = [];
   let cursor: string | null = null;
   do {
     const page: Awaited<ReturnType<typeof listOrgRepos>> = await listOrgRepos(org, { enabled: true, limit: 100, cursor });
     repos.push(...page.items);
-    cursor = all ? null : page.next;
+    cursor = page.next;
   } while (cursor);
   return repos;
 }
@@ -137,8 +137,8 @@ function EnableRepos({ org, setup, enabled, reloadEnabled, onChanged }: { org: s
     <Await loaded={enabled} retry={reloadEnabled}>
       {(repos) => (
         <EnableForm
-          // A different saved selection starts a new draft.
-          key={`${setup.enabled.all}:${setup.enabled.count}`}
+          // A different saved selection starts a new draft, once the refreshed list is in.
+          key={`${setup.enabled.all}:${repos.map((repo) => repo.name).join(",")}`}
           org={org}
           total={setup.app.repos}
           saved={{ all: setup.enabled.all, repos: repos.map((repo) => repo.name) }}

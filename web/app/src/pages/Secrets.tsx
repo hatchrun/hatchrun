@@ -43,8 +43,7 @@ const word = (kind: CiItemKind) => (kind === "secrets" ? "secret" : "variable");
 const fixName = (raw: string) => {
   const fixed = raw
     .toUpperCase()
-    .replace(/[^A-Z0-9_]+/g, "_")
-    .replace(/^_+|_+$/g, "");
+    .replace(/[^A-Z0-9_]+/g, "_");
   return /^[0-9]/.test(fixed) ? `_${fixed}` : fixed;
 };
 
@@ -62,6 +61,21 @@ function parsePaste(text: string): { name: string; value: string }[] {
     if (value.length > 1 && (quote === '"' || quote === "'") && value.endsWith(quote)) value = value.slice(1, -1);
     return { name: fixName(match?.[1] ?? ""), value };
   });
+}
+
+/** A pasted entry that cannot be saved: no usable name or no value. */
+const unusable = (item: { name: string; value: string }) => !item.name || item.value === "";
+
+/** Whether this scope already has an item of this name; the list search is a substring match, so read every page. */
+async function taken(scope: CiScope, kind: CiItemKind, name: string): Promise<boolean> {
+  let cursor: string | null = null;
+  do {
+    const query = { q: name, cursor, limit: 50 };
+    const page: ApiPage<Row> = await (kind === "secrets" ? listCiSecrets(scope, query) : listCiVars(scope, query));
+    if (page.items.some((item) => item.name === name)) return true;
+    cursor = page.next;
+  } while (cursor);
+  return false;
 }
 
 const reference = (kind: CiItemKind, name: string) => `\${{ ${kind === "secrets" ? "secrets" : "vars"}.${name || "NAME"} }}`;
@@ -94,20 +108,33 @@ export function Secrets({ org }: OrgPageProps) {
   const cursors = useCursors();
   const [search, setSearch] = useState("");
   const q = useDebounced(search.trim(), 250);
-  const [panel, setPanel] = useState<{ edit: Row | null } | null>(null);
+  const [panel, setPanel] = useState<{ edit: Row | null; id: number } | null>(null);
+  const panelSeq = useRef(0);
+  const openPanel = (edit: Row | null) => setPanel({ edit, id: (panelSeq.current += 1) });
   const [toast, setToast] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const toastTimer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
-  const scopeId = `${value.scope}/${value.repo ?? ""}/${value.env ?? ""}`;
-  const list = (which: CiItemKind, cursor: string | null, limit: number): Promise<ApiPage<Row>> =>
-    !scope
-      ? Promise.resolve({ items: [], total: 0, next: null })
-      : which === "secrets"
-        ? listCiSecrets(scope, { q, cursor, limit })
-        : listCiVars(scope, { q, cursor, limit });
+  const scopeId = `${org}/${value.scope}/${value.repo ?? ""}/${value.env ?? ""}`;
+  // Whatever moves the page to another list (the sidebar, history, the
+  // scope or tab controls) drops the open editor, the delete prompt and
+  // the page cursors of the old one.
+  const [seen, setSeen] = useState(`${scopeId}/${kind}`);
+  if (seen !== `${scopeId}/${kind}`) {
+    setSeen(`${scopeId}/${kind}`);
+    cursors.reset();
+    setPanel(null);
+    setConfirming(null);
+  }
+  // Each read says which list it is of, so rows of the previous scope or tab are never shown or acted on.
+  const list = async (which: CiItemKind, cursor: string | null, limit: number): Promise<ApiPage<Row> & { of: string }> => {
+    const of = `${scopeId}/${which}`;
+    if (!scope) return { items: [], total: 0, next: null, of };
+    const page = await (which === "secrets" ? listCiSecrets(scope, { q, cursor, limit }) : listCiVars(scope, { q, cursor, limit }));
+    return { ...page, of };
+  };
   const [rows, reloadRows] = useLoad(() => list(kind, cursors.cursor, 50), `${scopeId}/${kind}/${q}/${cursors.key}`, true);
   const other: CiItemKind = kind === "secrets" ? "vars" : "secrets";
   const [otherRows, reloadOther] = useLoad(() => list(other, null, 1), `${scopeId}/${other}/${q}`, true);
@@ -148,10 +175,12 @@ export function Secrets({ org }: OrgPageProps) {
     }
   };
 
-  const total = (state: typeof rows) => (state.state === "ready" ? state.data.total : null);
-  const secretsTotal = kind === "secrets" ? total(rows) : total(otherRows);
-  const varsTotal = kind === "vars" ? total(rows) : total(otherRows);
-  const own = total(rows);
+  const current = (state: typeof rows, which: CiItemKind) => state.state === "ready" && state.data.of === `${scopeId}/${which}`;
+  const total = (state: typeof rows, which: CiItemKind) => (state.state === "ready" && current(state, which) ? state.data.total : null);
+  const secretsTotal = kind === "secrets" ? total(rows, kind) : total(otherRows, other);
+  const varsTotal = kind === "vars" ? total(rows, kind) : total(otherRows, other);
+  const own = total(rows, kind);
+  const shown: typeof rows = rows.state === "ready" && !current(rows, kind) ? { state: "loading" } : rows;
   const summary =
     own === null ? "" : `${abbreviate(own)} ${noun}${own === 1 ? "" : "s"} at this scope`;
   const tabs: [CiItemKind, string, number | null][] = [
@@ -164,7 +193,7 @@ export function Secrets({ org }: OrgPageProps) {
       title="Secrets"
       meta={summary}
       actions={
-        <button type="button" className={BTN_PRIMARY} disabled={!scope} onClick={() => setPanel({ edit: null })}>
+        <button type="button" className={BTN_PRIMARY} disabled={!scope} onClick={() => openPanel(null)}>
           <Plus size={12} aria-hidden="true" />
           New {noun}
         </button>
@@ -226,13 +255,13 @@ export function Secrets({ org }: OrgPageProps) {
               {noun}s.
             </p>
           ) : (
-            <Await loaded={rows} retry={reloadRows}>
+            <Await loaded={shown} retry={reloadRows}>
               {(page) => (
                 <>
                   {page.items.length === 0 ? (
                     <div className="flex flex-col items-start gap-3 rounded-sm border border-control px-4 py-6 font-mono text-[13px] text-fg-2">
                       {q ? `No ${noun}s match that name.` : `No ${noun}s at this scope.`}
-                      <button type="button" className={BTN} onClick={() => setPanel({ edit: null })}>
+                      <button type="button" className={BTN} onClick={() => openPanel(null)}>
                         New {noun}
                       </button>
                     </div>
@@ -276,7 +305,7 @@ export function Secrets({ org }: OrgPageProps) {
                                   </span>
                                 ) : (
                                   <span className="inline-flex gap-2">
-                                    <button type="button" className={BTN_SM} aria-label={`${kind === "vars" ? "Change" : "Replace"} ${row.name}`} onClick={() => setPanel({ edit: row })}>
+                                    <button type="button" className={BTN_SM} aria-label={`${kind === "vars" ? "Change" : "Replace"} ${row.name}`} onClick={() => openPanel(row)}>
                                       {kind === "vars" ? "Change" : "Replace"}
                                     </button>
                                     <button type="button" className={BTN_SM} aria-label={`Delete ${row.name}`} onClick={() => setConfirming(row.name)}>
@@ -299,7 +328,7 @@ export function Secrets({ org }: OrgPageProps) {
                     onNext={cursors.next}
                     noun={`${noun}s`}
                   />
-                  <p className="meta">Values are encrypted at rest and masked in logs.</p>
+                  <p className="meta">{kind === "secrets" ? "Values are encrypted at rest and masked in logs." : "Values are stored as plain text and shown to everyone in the organization."}</p>
                 </>
               )}
             </Await>
@@ -309,7 +338,7 @@ export function Secrets({ org }: OrgPageProps) {
         {panel && scope && (
           <ItemPanel
             // A fresh form for each item, so a half-typed value never carries over.
-            key={`${scopeId}/${kind}/${panel.edit?.name ?? ""}`}
+            key={`${panel.id}/${scopeId}/${kind}/${panel.edit?.name ?? ""}`}
             org={org}
             scope={scope}
             scopeLabel={scopeWord(org, value)}
@@ -317,7 +346,8 @@ export function Secrets({ org }: OrgPageProps) {
             edit={panel.edit}
             onClose={() => setPanel(null)}
             onSaved={(message) => {
-              setPanel(null);
+              // A late save must not close a panel opened since.
+              setPanel((open) => (open?.id === panel.id ? null : open));
               notify(message);
               reload();
             }}
@@ -388,8 +418,9 @@ function ItemPanel({
   const upper = name.toUpperCase();
   const nameBad = upper.length > 0 && upper !== fixed;
   const pasted = useMemo(() => (edit ? [] : parsePaste(value)), [edit, value]);
-  const multi = pasted.length > 0;
-  const invalid = pasted.filter((item) => !item.name).length;
+  // A name typed by hand makes the whole value one literal.
+  const multi = pasted.length > 0 && name.trim() === "";
+  const invalid = pasted.filter(unusable).length;
   const noRepos = isOrg && !grant.all && grant.repos.length === 0;
   const nameError = multi ? null : nameBad ? (/\s/.test(name) ? "Spaces are not allowed." : "Only A-Z, 0-9 and _ are allowed.") : tried && !fixed ? "Name is required." : null;
   const valueError = tried && !multi && value === "";
@@ -397,14 +428,31 @@ function ItemPanel({
 
   const save = async () => {
     setTried(true);
-    if (multi ? pasted.every((item) => !item.name) : !fixed || nameBad || value === "") return;
+    if (multi ? pasted.every(unusable) : !fixed || nameBad || value === "") return;
     if (noRepos) return;
-    const items = multi ? pasted.filter((item) => item.name) : [{ name: fixed, value }];
+    const items = multi ? pasted.filter((item) => !unusable(item)) : [{ name: fixed, value }];
     const repositories = isOrg ? (grant.all ? null : grant.repos) : undefined;
+    if (multi) {
+      const names = items.map((item) => item.name);
+      const dup = names.find((n, i) => names.indexOf(n) !== i);
+      if (dup) {
+        setProblem(`${dup} appears more than once in the pasted lines.`);
+        return;
+      }
+    }
     setBusy(true);
     setProblem(null);
     let saved = 0;
     try {
+      if (!edit) {
+        for (const item of items) {
+          if (await taken(scope, kind, item.name)) {
+            setProblem(`${item.name} already exists at this scope. Replace it from the list instead.`);
+            setBusy(false);
+            return;
+          }
+        }
+      }
       for (const item of items) {
         await putCiItem(scope, kind, item.name, item.value, repositories);
         saved += 1;
@@ -436,10 +484,9 @@ function ItemPanel({
         <input
           id="item-name"
           type="text"
-          className={cn(FIELD, "font-bold", multi && "opacity-50")}
+          className={cn(FIELD, "font-bold")}
           value={name}
           readOnly={edit !== null}
-          disabled={multi}
           onChange={(event) => setName(event.target.value.toUpperCase())}
           aria-invalid={nameError !== null}
           aria-describedby="item-name-help item-name-error"
@@ -507,11 +554,11 @@ function ItemPanel({
             </div>
             <div className="flex max-h-40 flex-col gap-0.5 overflow-y-auto rounded-sm border border-control bg-background p-2 font-mono text-[13px]">
               {[...pasted]
-                .sort((a, b) => Number(!a.name) - Number(!b.name))
+                .sort((a, b) => Number(unusable(a)) - Number(unusable(b)))
                 .map((item, index) => (
-                  <div key={index} className={cn("flex justify-between gap-3", !item.name && "text-failed")}>
+                  <div key={index} className={cn("flex justify-between gap-3", unusable(item) && "text-failed")}>
                     <span className="min-w-0 truncate">
-                      {item.name ? "✓" : "✕"} {item.name || "(invalid name)"}
+                      {unusable(item) ? "✕" : "✓"} {item.name || "(invalid name)"}{item.name && item.value === "" ? " (empty value)" : ""}
                     </span>
                     <span className="shrink-0 text-fg-3">
                       {kind === "secrets" ? `write-only · ${item.value.length} chars` : item.value.length > 22 ? `${item.value.slice(0, 22)}...` : item.value}
