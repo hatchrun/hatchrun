@@ -2,23 +2,18 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { memo, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { ApiError, getCiLog, getCiLogIndex, type CiJob } from "@/api";
 import { LoadError, Spinner } from "@/components/Status";
-import { cn } from "@/lib/utils";
-import { segments } from "./ansi";
-import { BLOCK_LINES, EMPTY, reduce, type LogEvent, type Section } from "./logModel";
+import { LogViewer } from "./LogViewer";
+import { MemoryLog, StoredLog, type LogEvent, type LogSource } from "./logSource";
 
-/** Blocks of a step shown until "Show earlier lines" is pressed. */
-const TAIL_BLOCKS = 6;
-/** Total lines up to which every step starts open. */
-const OPEN_ALL_UNDER = 400;
 const MOST_RECONNECT_MS = 15_000;
 
-type Socket = { kind: "backlog"; text: string } | { kind: "events"; events: LogEvent[] } | { kind: "end" };
+type Message = { kind: "backlog"; text: string } | { kind: "events"; events: LogEvent[] } | { kind: "end" };
 
-function parseMessage(data: unknown): Socket | null {
+function parseMessage(data: unknown): Message | null {
   if (typeof data !== "string") {
     return null;
   }
@@ -39,14 +34,14 @@ function parseMessage(data: unknown): Socket | null {
   return null;
 }
 
-/** How the steps of a finished job ended, by position. */
-function conclusions(job: CiJob): Map<number, string> {
-  const out = new Map<number, string>();
+/** How the steps of the job ended, by step index. */
+function conclusions(job: CiJob) {
+  const out = new Map<number, { conclusion: string | null; durationMs: number | null }>();
   job.steps.forEach((step, i) => {
-    const conclusion = step.summary?.conclusion ?? step.conclusion;
-    if (conclusion) {
-      out.set(step.index ?? i, conclusion);
-    }
+    out.set(step.index ?? i, {
+      conclusion: step.summary?.conclusion ?? step.conclusion ?? null,
+      durationMs: step.summary?.duration_ms ?? step.duration_ms ?? null,
+    });
   });
   return out;
 }
@@ -54,17 +49,20 @@ function conclusions(job: CiJob): Map<number, string> {
 type Feed = "loading" | "live" | "reconnecting" | "done" | { error: Error };
 
 /**
- * A job's log, one collapsible section per step. A job that ended shows
- * its finished log with the step index. A running job opens the live
- * socket: the backlog first, then every `events` message; on `end` it
- * asks the page to read the job again and then shows the finished log.
+ * A job's log. A job that ended reads its stored log by range, using
+ * the index; one that runs opens the live socket (backlog first, then
+ * `events`) and, on `end`, asks the page to read the job again, after
+ * which the finished log shows.
  */
 export function JobLog({ job, onCheck }: { job: CiJob; onCheck: () => void }) {
-  const [log, dispatch] = useReducer(reduce, EMPTY);
-  const [feed, setFeed] = useState<Feed>("loading");
-  const [follow, setFollow] = useState(true);
   const completed = job.status === "completed";
   const jobId = job.id;
+  const [stored, setStored] = useState<LogSource | null>(null);
+  const [memory] = useState(() => new MemoryLog());
+  const source = completed ? stored : memory;
+  const [feed, setFeed] = useState<Feed>("loading");
+  const [downloading, setDownloading] = useState(false);
+  const [round, setRound] = useState(0);
   // The latest job and callback, for effects that must not restart when they change.
   const latest = useRef({ job, onCheck });
   useLayoutEffect(() => {
@@ -79,11 +77,22 @@ export function JobLog({ job, onCheck }: { job: CiJob; onCheck: () => void }) {
     const finished = async () => {
       setFeed("loading");
       try {
-        const [text, index] = await Promise.all([getCiLog(jobId), getCiLogIndex(jobId)]);
-        if (!stopped) {
-          dispatch({ type: "load", text: text.text, index, conclusions: conclusions(latest.current.job) });
-          setFeed("done");
+        const index = await getCiLogIndex(jobId);
+        const marks = conclusions(latest.current.job);
+        if (stopped) {
+          return;
         }
+        if (index !== null) {
+          setStored(new StoredLog(jobId, index, marks));
+        } else {
+          // No index: read the whole log and find the steps by their headers.
+          const whole = await getCiLog(jobId);
+          if (stopped) {
+            return;
+          }
+          setStored(MemoryLog.fromText(whole.text, marks));
+        }
+        setFeed("done");
       } catch (err) {
         if (!stopped) {
           setFeed({ error: err instanceof Error ? err : new Error(String(err)) });
@@ -111,10 +120,10 @@ export function JobLog({ job, onCheck }: { job: CiJob; onCheck: () => void }) {
         }
         attempts = 0;
         if (message.kind === "backlog") {
-          dispatch({ type: "load", text: message.text, index: null, conclusions: new Map() });
+          memory.load(message.text);
           setFeed("live");
         } else if (message.kind === "events") {
-          dispatch({ type: "events", events: message.events });
+          memory.apply(message.events);
         } else {
           ended = true;
           // The row may trail the object by a moment: ask a few times.
@@ -149,135 +158,50 @@ export function JobLog({ job, onCheck }: { job: CiJob; onCheck: () => void }) {
         socket.close();
       }
     };
-  }, [jobId, completed]);
+  }, [jobId, completed, round, memory]);
 
-  const sentinel = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    if (follow && !completed) {
-      sentinel.current?.scrollIntoView({ block: "end" });
+  const download = async () => {
+    if (source === null) {
+      return;
     }
-  }, [log, follow, completed]);
-  useEffect(() => {
-    // Scrolling up ends following; the checkbox turns it back on.
-    const stop = (event: WheelEvent) => event.deltaY < 0 && setFollow(false);
-    window.addEventListener("wheel", stop, { passive: true });
-    return () => window.removeEventListener("wheel", stop);
-  }, []);
+    setDownloading(true);
+    try {
+      const url = URL.createObjectURL(new Blob([await source.all()], { type: "text/plain" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${job.name.replace(/[^A-Za-z0-9._-]+/g, "-")}-${job.id}.log`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    } catch {
+      // The log stays on screen; the button works again.
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   if (typeof feed === "object") {
     if (feed.error instanceof ApiError && feed.error.status === 404) {
       return <p className="muted">This job has no log.</p>;
     }
-    return <LoadError error={feed.error} />;
+    return <LoadError error={feed.error} retry={() => setRound((n) => n + 1)} />;
   }
-  const total = log.sections.reduce((sum, section) => sum + section.lines, 0);
+  if (source === null || (feed === "loading" && completed)) {
+    return <Spinner label="Loading log" />;
+  }
+  if (!completed && feed === "loading" && source.lines === 0) {
+    return <Spinner label="Waiting for the first line" />;
+  }
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between font-mono text-xs text-fg-3">
-        <span aria-live="polite">
-          {feed === "live" && "Live"}
-          {feed === "reconnecting" && "Reconnecting"}
-          {feed === "done" && `${total} ${total === 1 ? "line" : "lines"}`}
-        </span>
-        {!completed && (
-          <label className="flex items-center gap-1.5">
-            <input type="checkbox" checked={follow} onChange={(event) => setFollow(event.target.checked)} />
-            Follow output
-          </label>
-        )}
-      </div>
-      {feed === "loading" && <Spinner label="Loading log" />}
-      {log.sections.map((section, i) => (
-        <StepSection
-          key={section.key}
-          section={section}
-          last={i === log.sections.length - 1}
-          live={!completed}
-          startOpen={failed(section) || (i === log.sections.length - 1 && !completed) || total <= OPEN_ALL_UNDER}
-        />
-      ))}
-      <div ref={sentinel} />
-    </div>
+    <LogViewer
+      key={`${jobId}:${completed}`}
+      source={source}
+      name={job.name}
+      live={!completed}
+      feed={typeof feed === "string" ? feed : "done"}
+      failed={job.conclusion === "failure" || job.conclusion === "timed_out"}
+      onRetry={() => (source instanceof StoredLog ? source.retry() : setRound((n) => n + 1))}
+      download={() => void download()}
+      downloading={downloading}
+    />
   );
 }
-
-const failed = (section: Section) => section.conclusion === "failure" || section.conclusion === "timed_out";
-
-const StepSection = memo(function StepSection({
-  section,
-  last,
-  live,
-  startOpen,
-}: {
-  section: Section;
-  last: boolean;
-  live: boolean;
-  startOpen: boolean;
-}) {
-  // What the viewer chose wins; until then a step is open when `startOpen` says so.
-  const [chosen, setChosen] = useState<boolean | null>(null);
-  const [all, setAll] = useState(false);
-  const open = chosen ?? startOpen;
-  const hidden = all ? 0 : Math.max(0, section.blocks.length - TAIL_BLOCKS);
-  const mark = section.conclusion
-    ? { success: "✓", failure: "✕", timed_out: "✕", cancelled: "⊘", skipped: "-" }[section.conclusion]
-    : live && last
-      ? "…"
-      : null;
-  return (
-    <section className="rounded-sm border border-control bg-raised">
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={() => setChosen(!open)}
-        className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left font-mono text-xs text-fg"
-      >
-        <span aria-hidden="true" className="w-3 text-fg-3">
-          {open ? "▾" : "▸"}
-        </span>
-        <span
-          aria-hidden="true"
-          className={cn("w-3 text-center", failed(section) ? "text-failed" : section.conclusion === "success" ? "text-passed" : "text-fg-3")}
-        >
-          {mark ?? ""}
-        </span>
-        <span className="min-w-0 flex-1 truncate font-semibold">{section.name}</span>
-        <span className="text-fg-3">{section.lines} lines</span>
-      </button>
-      {open && (
-        <div className="border-t border-control">
-          {hidden > 0 && (
-            <button type="button" className="button button-small m-2" onClick={() => setAll(true)}>
-              Show {hidden * BLOCK_LINES} earlier lines
-            </button>
-          )}
-          <pre className="log-lines">
-            {section.blocks.map((block, i) => (i < hidden ? null : <Block key={i} lines={block} />))}
-          </pre>
-        </div>
-      )}
-    </section>
-  );
-});
-
-/** Up to BLOCK_LINES lines. Memoized on the block's identity, so only the block that grew renders again. */
-const Block = memo(function Block({ lines }: { lines: string[] }) {
-  return (
-    <>
-      {lines.map((line, i) => (
-        <div key={i} className="log-line">
-          {segments(line).map((piece, j) =>
-            piece.className ? (
-              <span key={j} className={piece.className}>
-                {piece.text}
-              </span>
-            ) : (
-              piece.text
-            ),
-          )}
-          {line === "" && "​"}
-        </div>
-      ))}
-    </>
-  );
-});
