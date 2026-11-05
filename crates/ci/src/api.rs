@@ -223,10 +223,10 @@ fn before_query(query: Option<&str>) -> std::result::Result<Option<u64>, Stop> {
         .map_or_else(|| stop(400, "before is a run id"), Ok)
 }
 
-/// The names of a ref a dispatch asks for: the full ref the run shows
-/// and the form GitHub's commit endpoint takes. A bare name is a branch
-/// and an empty one is the default branch.
-fn ref_names(input: &str, default_branch: &str) -> std::result::Result<(String, String), String> {
+/// The full ref a dispatch asks for, which the run shows and GitHub's
+/// commit endpoint takes. A bare name is a branch and an empty one is
+/// the default branch.
+fn ref_name(input: &str, default_branch: &str) -> std::result::Result<String, String> {
     let input = input.trim();
     let full = if input.is_empty() {
         format!("refs/heads/{default_branch}")
@@ -243,10 +243,8 @@ fn ref_names(input: &str, default_branch: &str) -> std::result::Result<(String, 
     if !valid {
         return Err(format!("`{input}` is not a branch or tag name"));
     }
-    if let Some(branch) = full.strip_prefix("refs/heads/") {
-        Ok((full.clone(), format!("heads/{branch}")))
-    } else if let Some(tag) = full.strip_prefix("refs/tags/") {
-        Ok((full.clone(), format!("tags/{tag}")))
+    if full.starts_with("refs/heads/") || full.starts_with("refs/tags/") {
+        Ok(full)
     } else {
         Err("a ref is a branch or a tag".to_owned())
     }
@@ -1047,8 +1045,8 @@ impl Cx<'_> {
         let Ok(asked) = serde_json::from_slice::<Dispatch>(&body) else {
             return Ok(stop(400, "expected {\"workflow\", \"ref\", \"inputs\"}"));
         };
-        let (git_ref, api_ref) = match ref_names(&asked.r#ref, &repo.default_branch) {
-            Ok(names) => names,
+        let git_ref = match ref_name(&asked.r#ref, &repo.default_branch) {
+            Ok(full) => full,
             Err(message) => return Ok(stop(422, message)),
         };
         let now = now_ms();
@@ -1066,7 +1064,7 @@ impl Cx<'_> {
         );
         let response = tokens
             .send(repo.installation_id, |token| {
-                github::commit_sha(&settings.github_api, &repo.full_name, &api_ref, token)
+                github::commit_sha(&settings.github_api, &repo.full_name, &git_ref, token)
             })
             .await
             .map_err(|err| fail(err.to_string()))?;
@@ -1336,19 +1334,10 @@ mod tests {
 
     #[test]
     fn refs_resolve_to_branches_and_tags() {
-        let names = |input| ref_names(input, "main");
-        assert_eq!(
-            names(""),
-            Ok(("refs/heads/main".into(), "heads/main".into()))
-        );
-        assert_eq!(
-            names("feat/x"),
-            Ok(("refs/heads/feat/x".into(), "heads/feat/x".into()))
-        );
-        assert_eq!(
-            names("refs/tags/v1"),
-            Ok(("refs/tags/v1".into(), "tags/v1".into()))
-        );
+        let names = |input| ref_name(input, "main");
+        assert_eq!(names(""), Ok("refs/heads/main".into()));
+        assert_eq!(names("feat/x"), Ok("refs/heads/feat/x".into()));
+        assert_eq!(names("refs/tags/v1"), Ok("refs/tags/v1".into()));
         assert!(names("refs/pull/1/merge").is_err());
         assert!(names("a..b").is_err());
         assert!(names("a b").is_err());
