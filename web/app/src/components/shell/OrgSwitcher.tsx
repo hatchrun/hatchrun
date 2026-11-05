@@ -29,7 +29,7 @@ export function OrgSwitcher({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const tenants = useTenants();
+  const { tenants, error, retry } = useTenants();
   const [query, setQuery] = useState("");
 
   const items = useMemo(() => {
@@ -82,10 +82,16 @@ export function OrgSwitcher({
         onPick={(item) => pick(item.key)}
         label="Choose an organization"
         placeholder={`Search ${total || ""} organizations`.replace("  ", " ")}
-        empty={tenants === null ? "Loading" : "No organizations match."}
+        empty={error ? `Could not load organizations: ${error.message}` : tenants === null ? "Loading" : "No organizations match."}
         footer={
           <>
-            <span>{query ? `${items.length} matches` : `Recent first · ${total} organizations`}</span>
+            {error ? (
+              <button type="button" className="cursor-pointer text-fg hover:underline" onClick={retry}>
+                Retry
+              </button>
+            ) : (
+              <span>{query ? `${items.length} matches` : `Recent first · ${total} organizations`}</span>
+            )}
             <a href="/new" className="text-fg hover:underline" onClick={(event) => { event.preventDefault(); onOpenChange(false); navigate("/new"); }}>
               Add
             </a>

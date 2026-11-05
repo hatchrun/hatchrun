@@ -10,7 +10,7 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
 import { handleCi, serveLiveSockets } from "./ci.ts";
-import { billing as ciBilling } from "./ci-settings.ts";
+import { addCard } from "./ci-settings.ts";
 
 interface MockTenant {
   id: string;
@@ -68,15 +68,23 @@ const routes: Record<string, Handler> = {
     200,
     {
       installUrl: installUrl(),
-      installations: orgs
-        .filter((org) => state.installed.includes(org.id))
-        .map((org) => ({
-          id: org.id * 10,
-          login: org.login,
-          avatarUrl: org.avatarUrl,
-          suspended: false,
-          tenant: findTenant(org.login)?.org.login ?? null,
-        })),
+      installations: [
+        ...orgs
+          .filter((org) => state.installed.includes(org.id))
+          .map((org) => ({
+            id: org.id * 10,
+            login: org.login,
+            avatarUrl: org.avatarUrl,
+            suspended: false,
+            tenant: findTenant(org.login)?.org.login ?? null,
+          })),
+        // The seeded organizations already have the App installed.
+        ...seeded.flatMap((tenant) =>
+          tenant.installationId === null
+            ? []
+            : [{ id: tenant.installationId, login: tenant.org.login, avatarUrl: tenant.org.avatarUrl, suspended: false, tenant: tenant.org.login }],
+        ),
+      ],
     },
   ],
   "GET /api/mock/install": (_req, url) => {
@@ -105,7 +113,7 @@ const routes: Record<string, Handler> = {
   },
   "GET /api/mock/polar": (_req, url) => {
     const org = url.searchParams.get("org") ?? "";
-    ciBilling.card = true;
+    addCard(org);
     return `/o/${org}/settings/billing?checkout=mock`;
   },
   "POST /api/tenants/:org/portal": (_req, url) => {
@@ -173,7 +181,7 @@ export function mockApi(): Plugin {
           return;
         }
         if (url.pathname.startsWith("/api/ci/")) {
-          await handleCi(req, res, url, { signedIn: state.signedIn, csrf: "mock" }, await readBody(req));
+          await handleCi(req, res, url, { signedIn: state.signedIn, csrf: "mock", role: (login) => findTenant(login)?.role ?? null }, await readBody(req));
           return;
         }
         const key = `${req.method} ${url.pathname}`;

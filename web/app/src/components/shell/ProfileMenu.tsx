@@ -4,26 +4,22 @@
 
 import {
   ArrowLeftRight,
-  Bell,
   Check,
   ChevronRight,
   CircleHelp,
   Copy,
   ExternalLink,
   Keyboard,
-  KeyRound,
   LogOut,
   Sparkles,
   Terminal,
-  User as UserIcon,
 } from "lucide-react";
 import { DropdownMenu as Menu } from "radix-ui";
 import { useState, type ReactNode } from "react";
 
-import { signOut, type User } from "@/api";
+import { ApiError, signOut, type User } from "@/api";
 import { THEMES, setTheme, useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
-import { navigate } from "@/router";
 import { NAV_ITEM } from "./Sidebar";
 
 export const CLI_INSTALL = "brew install hatchrun/tap/hatchrun";
@@ -70,7 +66,6 @@ export function ProfileMenu({
   onShortcuts: () => void;
 }) {
   const theme = useTheme();
-  const settings = org ? `/o/${org}/settings` : "/";
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
   const name = user.name ?? user.login;
@@ -85,9 +80,14 @@ export function ProfileMenu({
     setBusy(true);
     try {
       await signOut();
-    } finally {
-      window.location.assign("/signin");
+    } catch (err) {
+      // Not signed in any more counts as signed out; any other failure keeps the session, so stay.
+      if (!(err instanceof ApiError && err.status === 401)) {
+        setBusy(false);
+        return;
+      }
     }
+    window.location.assign("/signin");
   };
   const copy = () => {
     void navigator.clipboard?.writeText(CLI_INSTALL).then(() => {
@@ -133,19 +133,6 @@ export function ProfileMenu({
           </div>
 
           <Menu.Group className={GROUP}>
-            <Menu.Item className={ITEM} onSelect={() => navigate(settings)}>
-              <Row icon={<UserIcon {...icon} />}>Your profile</Row>
-            </Menu.Item>
-            <Menu.Item className={ITEM} onSelect={() => navigate(settings)}>
-              <Row icon={<KeyRound {...icon} />} hint="for the hatchrun CLI">
-                Personal access tokens
-              </Row>
-            </Menu.Item>
-            <Menu.Item className={ITEM} onSelect={() => navigate(settings)}>
-              <Row icon={<Bell {...icon} />} hint="Failed runs, approvals">
-                Notifications
-              </Row>
-            </Menu.Item>
             <Menu.Item className={ITEM} onSelect={onShortcuts}>
               <Row icon={<Keyboard {...icon} />} trailing={<Kbd>?</Kbd>}>
                 Keyboard shortcuts

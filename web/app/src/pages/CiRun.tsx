@@ -69,7 +69,14 @@ export function CiRun({ session, route }: RunPageProps) {
   return (
     <div className="mx-auto flex w-full max-w-[1400px] flex-col gap-4">
       <Await loaded={detail} retry={reload}>
-        {(data) => <RunScreen route={route} data={data} stale={detail.state === "ready" ? detail.stale : undefined} session={session} reload={reload} />}
+        {(data) =>
+          // The URL names the repository; a run of another one is not shown under it.
+          data.run.repository.toLowerCase() !== `${route.org}/${route.repo}`.toLowerCase() ? (
+            <LoadError error={new Error("Not found, or you cannot read this repository.")} />
+          ) : (
+            <RunScreen route={route} data={data} stale={detail.state === "ready" ? detail.stale : undefined} session={session} reload={reload} />
+          )
+        }
       </Await>
     </div>
   );

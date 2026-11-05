@@ -84,7 +84,7 @@ export function ScopePicker({
 function RepoPicker({ org, value, onPick }: { org: string; value: string | null; onPick: (repo: string) => void }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const { repos, total, loading } = useRepoSearch(org, query, 50, open);
+  const { repos, total, loading, error } = useRepoSearch(org, query, 50, open);
   const items = useMemo(() => {
     const { items: ordered, recent } = recentFirst(repos, (repo) => repo.name, query ? [] : recents(`repos:${org}`));
     return ordered.map((repo, index) => ({
@@ -120,12 +120,13 @@ function RepoPicker({ org, value, onPick }: { org: string; value: string | null;
         onQuery={setQuery}
         label="Choose a repository"
         placeholder={`Search ${total ? abbreviate(total) : ""} repositories`.replace("  ", " ")}
-        empty={loading ? "Loading" : "No repositories match."}
+        empty={error ? `Could not load repositories: ${error.message}` : loading ? "Loading" : "No repositories match."}
         footer={<span>{query ? `${abbreviate(total)} matches` : "Recent first"}{total > repos.length && ` · showing ${repos.length} of ${abbreviate(total)}, type to narrow`}</span>}
         onPick={(item) => {
           remember(`repos:${org}`, item.key);
           onPick(item.key);
           setOpen(false);
+          setQuery("");
         }}
       />
     </Popover>
@@ -165,11 +166,12 @@ function EnvPicker({ repo, value, onPick }: { repo: string | null; value: string
         onQuery={setQuery}
         label="Choose an environment"
         placeholder={`Search ${names.length || ""} environments`.replace("  ", " ")}
-        empty={loaded.state === "loading" ? "Loading" : "No environments match."}
+        empty={loaded.state === "error" ? `Could not load environments: ${loaded.error.message}` : loaded.state === "loading" ? "Loading" : "No environments match."}
         footer={<span>{names.length} in {repo}</span>}
         onPick={(item) => {
           onPick(item.key);
           setOpen(false);
+          setQuery("");
         }}
       />
     </Popover>

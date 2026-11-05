@@ -27,6 +27,15 @@ export function applyTheme(theme: Theme = getTheme()) {
   document.documentElement.dataset.theme = light ? "light" : "dark";
 }
 
+// While "system" is the saved theme, a change of the OS appearance shows at once.
+if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+  window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+    if (getTheme() === "system") {
+      applyTheme("system");
+    }
+  });
+}
+
 export function setTheme(theme: Theme) {
   setItem("theme", theme);
   applyTheme(theme);

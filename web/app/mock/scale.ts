@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Org-scale data for `npm run dev:mock`: the org "acme" has 1,000
-// repositories, 5,000 runs over the last week, 2,000 secrets, 20
+// repositories, 5,000 runs over the last week, 900 secrets, 20
 // environments per repository, one run with 104 jobs (a matrix of 72) and
 // a 200,000 line log with errors. Everything is computed from indexes
 // with a small hash, so it is the same on every start and nothing big is
@@ -15,7 +15,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { billing } from "./ci-settings.ts";
+import { billing, environmentCounts, hasCard, seedEnvironments } from "./ci-settings.ts";
 
 export const SCALE_ORG = "acme";
 const NOW = Date.now();
@@ -123,10 +123,18 @@ const jobId = (run: number, k: number) => 1_000_000 + run * 200 + k;
 const decodeJob = (id: number) => ({ run: Math.floor((id - 1_000_000) / 200), k: (id - 1_000_000) % 200 });
 export const BIG_JOB = jobId(BIG_RUN, BIG_JOB_K);
 
-const approved = new Set<number>();
+/** What an admin decided about a held job, by job id. */
+const decisions = new Map<number, { decision: "approved" | "rejected"; at: number }>();
+/** The runs with a decided job: their job counts are read from the jobs. */
+const decidedRuns = new Set<number>();
 
 function bigStatus(k: number): { status: string; conclusion: string | null; held: string | null } {
-  if (k === bigPlans.length - 1) return approved.has(k) ? { status: "in_progress", conclusion: null, held: null } : { status: "queued", conclusion: null, held: "approval" };
+  if (k === bigPlans.length - 1) {
+    const decision = decisions.get(jobId(BIG_RUN, k))?.decision;
+    if (decision === "approved") return { status: "in_progress", conclusion: null, held: null };
+    if (decision === "rejected") return { status: "completed", conclusion: "failure", held: null };
+    return { status: "queued", conclusion: null, held: "approval" };
+  }
   if (FAILED_K.has(k)) return { status: "completed", conclusion: "failure", held: null };
   if (k < 70) return { status: "completed", conclusion: "success", held: null };
   if (k < 84) return { status: "in_progress", conclusion: null, held: null };
@@ -201,8 +209,25 @@ function runAt(i: number): RunRow {
   return row;
 }
 
+/** The run as answered: once one of its jobs is decided its counts are read from the jobs. */
+function viewOf(run: RunRow): RunRow {
+  if (!decidedRuns.has(run.id)) return run;
+  const jobs = jobsOf(run);
+  return {
+    ...run,
+    jobs: {
+      total: jobs.length,
+      passed: jobs.filter((job) => job.conclusion === "success").length,
+      failed: jobs.filter((job) => job.conclusion === "failure").length,
+      running: jobs.filter((job) => job.status === "in_progress").length,
+      waiting: jobs.filter((job) => job.held).length,
+    },
+  };
+}
+
 const indexOfRun = (id: number) => (id === BIG_RUN ? BIG_AT : 50_000 - id);
-const validRun = (id: number) => id === BIG_RUN || (id > 50_000 - RUNS && id <= 50_000);
+/** The generated id the big run displaced is not a run. */
+const validRun = (id: number) => id === BIG_RUN || (id > 50_000 - RUNS && id <= 50_000 && indexOfRun(id) !== BIG_AT);
 
 // ---- paging, filters ----------------------------------------------------
 
@@ -299,25 +324,27 @@ function repoRows() {
 
 const ENVS = ["production", "staging", "qa", "dev", "preview", "canary", "sandbox", "demo", "eu-west", "eu-central", "us-east", "us-west", "ap-south", "ap-northeast", "sa-east", "dr", "load-test", "security", "uat", "internal"];
 
-let envRows: unknown[] | null = null;
-function environmentRows() {
-  envRows ??= REPOS.flatMap((repository, r) =>
-    ENVS.map((name, e) => ({
-      repository,
-      name,
+/** The environments a repository of the org starts with, for ci-settings.ts to seed its store from. */
+export function scaleEnvironments(repository: string): [string, { branches: string[]; approval: boolean; updatedAt: number }][] {
+  const r = REPOS.indexOf(repository);
+  return ENVS.map((name, e) => [
+    name,
+    {
       branches: e === 0 ? [defaultBranch(r)] : e === 1 ? ["main", "release/*"] : [],
       approval: e === 0 || e === 14,
       updatedAt: NOW - (1 + (hash(r, e) % 90)) * 24 * 60 * MINUTE,
-      secrets: hash(r, e + 200) % 6,
-      vars: hash(r, e + 300) % 4,
-    })),
-  );
-  return envRows as { repository: string; name: string; branches: string[]; approval: boolean; updatedAt: number; secrets: number; vars: number }[];
+    },
+  ]);
 }
 
-/** Names and repos of the org's 2,000 secrets and 300 variables, for ci-settings.ts to seed from. */
+/** The org's environments as the repository store holds them now, so edits and deletes show here. */
+function environmentRows() {
+  return REPOS.flatMap((repository) => [...seedEnvironments(repository).entries()].map(([name, row]) => ({ repository, name, ...row })));
+}
+
+/** Names and repos of the org's 900 secrets and 300 variables, for ci-settings.ts to seed from. */
 export function orgItems(kind: "secrets" | "vars") {
-  const count = kind === "secrets" ? 2000 : 300;
+  const count = kind === "secrets" ? 900 : 300;
   const stems = "NPM TOKEN DEPLOY KEY AWS GCP SENTRY DATADOG SLACK DOCKER REGISTRY SIGNING STRIPE SMTP DB CACHE S3 CDN TWILIO PAGER".split(" ");
   return Array.from({ length: count }, (_, n) => ({
     name: `${stems[n % stems.length]}_${stems[Math.floor(n / stems.length) % stems.length]}_${n}`,
@@ -348,11 +375,15 @@ function jobsOf(run: RunRow): Job[] {
       ? { status: "completed", conclusion: run.conclusion === "cancelled" ? "cancelled" : "skipped", held: null }
       : { status: "queued", conclusion: null, held: null };
   return plans.map((plan) => {
-    const state: State = i === BIG_AT ? bigStatus(plan.k) : (order[plan.k] ?? rest);
     const id = jobId(run.id, plan.k);
+    let state: State = i === BIG_AT ? bigStatus(plan.k) : (order[plan.k] ?? rest);
+    const decision = decisions.get(id);
+    if (state.held && decision) {
+      state = decision.decision === "approved" ? { status: "in_progress", conclusion: null, held: null } : { status: "completed", conclusion: "failure", held: null };
+    }
     const started = state.status === "queued" ? null : run.created_at + 5000 + (hash(id, 1) % 60_000);
     const done = state.status === "completed" && started !== null ? started + 20_000 + (hash(id, 2) % 400_000) : null;
-    const held = state.held && !approved.has(id) ? state.held : null;
+    const held = state.held;
     return {
       id,
       plan_id: plan.name.split(" ")[0] as string,
@@ -372,7 +403,7 @@ function jobsOf(run: RunRow): Job[] {
       has_log: state.status !== "queued",
       held,
       environment: plan.environment ?? null,
-      approval: approved.has(id) ? { decision: "approved" as const, by: ME, at: NOW } : null,
+      approval: decision ? { decision: decision.decision, by: ME, at: decision.at } : null,
     };
   });
 }
@@ -490,18 +521,21 @@ export function handleScale(
       if (matchesStatus(run, ["failure"])) counts.failed++;
       if (matchesStatus(run, ["success"])) counts.passed++;
     }
-    json(res, 200, { ...paginate(filterRuns(url), url), counts });
+    const page = paginate(filterRuns(url), url);
+    json(res, 200, { ...page, items: page.items.map(viewOf), counts });
     return true;
   }
   if ((found = /^repos\/([^/]+)\/([^/]+)\/runs$/.exec(path)) && found[1] === SCALE_ORG) {
-    json(res, 200, paginate(filterRuns(url, `${found[1]}/${found[2]}`), url));
+    const page = paginate(filterRuns(url, `${found[1]}/${found[2]}`), url);
+    json(res, 200, { ...page, items: page.items.map(viewOf) });
     return true;
   }
   if ((found = /^orgs\/([^/]+)\/needs-you$/.exec(path))) {
     if (found[1] !== SCALE_ORG) return json(res, 200, { approvals: [], failing: [] }), true;
-    const approvals = [2, 25, 60, BIG_AT].map((i) => runAt(i)).map((run) => {
+    const approvals = [2, 25, 60, BIG_AT].flatMap((i) => {
+      const run = runAt(i);
       const held = jobsOf(run).find((job) => job.held);
-      return { run, job: { id: held?.id ?? 0, name: held?.name ?? "deploy", environment: held?.environment ?? "production" }, since: run.created_at + 5 * MINUTE };
+      return held ? [{ run: viewOf(run), job: { id: held.id, name: held.name, environment: held.environment ?? "production" }, since: run.created_at + 5 * MINUTE }] : [];
     });
     const seen = new Set<string>();
     const failing = [];
@@ -509,7 +543,7 @@ export function handleScale(
       const run = runAt(i);
       if (run.conclusion === "failure" && run.branch === "main" && !seen.has(run.repository)) {
         seen.add(run.repository);
-        failing.push({ repository: run.repository, branch: "main", run });
+        failing.push({ repository: run.repository, branch: "main", run: viewOf(run) });
       }
     }
     json(res, 200, { approvals, failing });
@@ -530,9 +564,10 @@ export function handleScale(
     );
     return true;
   }
-  if (/^orgs\/[^/]+\/repos\/enabled$/.test(path)) {
+  if ((found = /^orgs\/([^/]+)\/repos\/enabled$/.exec(path))) {
     if (method !== "PUT") return json(res, 405, { error: "method not allowed" }), true;
     if (!session.signedIn) return json(res, 401, { error: "sign in to change repositories" }), true;
+    if (decodeURIComponent(found[1] as string) !== SCALE_ORG) return json(res, 404, { error: "not found" }), true;
     if (req.headers["x-csrf-token"] !== session.csrf) return json(res, 403, { error: "missing or wrong CSRF token" }), true;
     const asked = (body ?? {}) as { all?: unknown; repos?: unknown };
     if (typeof asked.all !== "boolean" || !Array.isArray(asked.repos)) return json(res, 400, { error: 'expected {"all": true, "repos": []}' }), true;
@@ -551,7 +586,7 @@ export function handleScale(
       app: { installed: true, repos: scale ? REPO_COUNT : 0, manage_url: `https://github.com/organizations/${org}/settings/installations/1` },
       enabled: { all: scale && enabledAll === true, count },
       first_run: first ? { id: first.id, repository: first.repository } : null,
-      billing: { card: billing.card, cap_dollars: billing.capDollars },
+      billing: { card: hasCard(org), cap_dollars: billing.capDollars },
     });
     return true;
   }
@@ -559,23 +594,39 @@ export function handleScale(
     if (found[1] !== SCALE_ORG) return json(res, 200, empty(url)), true;
     const q = (url.searchParams.get("q") ?? "").toLowerCase();
     const repo = url.searchParams.get("repo");
-    json(res, 200, paginate(environmentRows().filter((row) => (!repo || row.repository === repo) && (!q || `${row.repository} ${row.name}`.toLowerCase().includes(q))), url));
+    const page = paginate(environmentRows().filter((row) => (!repo || row.repository === repo) && (!q || `${row.repository} ${row.name}`.toLowerCase().includes(q))), url);
+    json(res, 200, { ...page, items: page.items.map((row) => ({ ...row, ...environmentCounts(row.repository, row.name) })) });
     return true;
   }
 
   if ((found = /^runs\/(\d+)$/.exec(path)) && validRun(Number(found[1]))) {
     const run = runAt(indexOfRun(Number(found[1])));
-    json(res, 200, { run, jobs: jobsOf(run) });
+    json(res, 200, { run: viewOf(run), jobs: jobsOf(run) });
     return true;
   }
   if (/^runs\/\d+\/cancel$/.test(path) && validRun(Number(path.split("/")[1]))) {
+    const run = runAt(indexOfRun(Number(path.split("/")[1])));
+    if (run.status !== "completed") {
+      // The jobs that had not finished are listed as cancelled, as for a cancelled run of the data.
+      run.status = "completed";
+      run.conclusion = "cancelled";
+      run.completed_at = Date.now();
+      run.duration_ms = run.completed_at - run.created_at;
+      run.jobs.running = 0;
+      run.jobs.waiting = 0;
+    }
     json(res, 204);
     return true;
   }
   if ((found = /^jobs\/(\d+)\/(approve|reject)$/.exec(path)) && Number(found[1]) >= 1_000_000) {
     if (!session.signedIn) return json(res, 401, { error: "sign in to approve or reject jobs" }), true;
     if (req.headers["x-csrf-token"] !== session.csrf) return json(res, 403, { error: "missing or wrong CSRF token" }), true;
-    approved.add(Number(found[1]));
+    const { run: owner } = decodeJob(Number(found[1]));
+    const job = validRun(owner) ? jobsOf(runAt(indexOfRun(owner))).find((candidate) => candidate.id === Number(found?.[1])) : undefined;
+    if (!job) return json(res, 404, { error: "not found" }), true;
+    if (job.held !== "approval") return json(res, 409, { error: "This job is not waiting for approval" }), true;
+    decisions.set(job.id, { decision: found[2] === "approve" ? "approved" : "rejected", at: Date.now() });
+    decidedRuns.add(owner);
     json(res, 204);
     return true;
   }
