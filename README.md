@@ -24,14 +24,14 @@ This repository holds:
 
 `hatchrun-agent` is a static binary started by
 [`packaging/systemd/hatchrun-agent.service`](packaging/systemd/hatchrun-agent.service).
-It reads a `broker` URL and `ticket` in the instance's JSON user data
-and claims its boot document from hatchrun-broker, which hands it out
+It reads `"mode": "ci"`, a `broker` URL and a `ticket` in the
+instance's JSON user data and claims its boot document from hatchrun-broker, which hands it out
 once, retrying while the broker has nothing stored yet. The broker must
 be HTTPS. When the job ends, or no document arrives within 10 minutes,
 the unit powers the instance off.
 
-The agent starts only on instances launched for a job: user data with a
-ticket. `hatchrun-launch.service` checks that first, so an instance
+The agent starts only on instances launched for a job: user data with
+`"mode": "ci"`. `hatchrun-launch.service` checks that first, so an instance
 launched any other way, by hand or by the AWS Marketplace scan, boots
 normally and stays up.
 

@@ -12,10 +12,10 @@ section: admin
 priority: optional
 maintainer: Gamunu Balagalla <gamunu.balagalla@gmail.com>
 description: |
-  Boot agent for hatchrun runner instances.
-  Fetches the instance's just-in-time GitHub Actions runner config, runs
-  one job and powers the instance off. Meant for runner images only: the
-  unit is installed disabled.
+  Boot agent for hatchrun CI instances.
+  Claims the instance's boot document from the control plane, runs one
+  job and powers the instance off. Meant for CI images only: the unit is
+  installed disabled.
 vendor: hatchrun
 homepage: https://github.com/hatchrun/hatchrun
 license: AGPL-3.0-only

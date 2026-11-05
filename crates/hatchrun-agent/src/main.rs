@@ -2,76 +2,48 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! hatchrun-agent runs on a runner instance at boot. It fetches the
-//! instance's just-in-time runner config, runs exactly one GitHub Actions job
-//! and exits. The systemd unit powers the instance off when it exits, whether
-//! the job ran or the agent failed. On hatchrun.io launches it reports the
-//! instance's CPU and memory while the job runs (see [`telemetry`]), and
-//! serves the job cache from the tenant's bucket when the launch says
-//! (see [`cache`]).
+//! hatchrun-agent runs on a CI instance at boot. Started with no
+//! subcommand, as the systemd unit does, it claims the boot document the
+//! launch's user data names, runs exactly one job for the control plane
+//! and exits; that is the `ci` subcommand with its defaults. The systemd
+//! unit powers the instance off when it exits, whether the job ran or the
+//! agent failed. The job cache is served from the tenant's bucket when
+//! the job document says so (see [`cache`]).
 
+mod account;
 mod broker;
 mod cache;
 mod ci;
 mod envfile;
 mod exec;
 mod imds;
-mod metrics;
-mod runner;
 mod source;
 mod split;
-mod ssm;
-mod telemetry;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-use aws_config::{BehaviorVersion, Region};
+use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::broker::HttpBroker;
-use crate::cache::Proxy;
-use crate::cache::patch::{self, Direction};
 use crate::imds::Imds;
-use crate::metrics::Sampler;
-use crate::runner::Runner;
-use crate::source::Metadata as _;
-use crate::source::Resolver;
-use crate::ssm::Ssm;
-use crate::telemetry::{Machine, Reporter};
 
-/// Defaults shared by the `ci` subcommand and the boot path.
+/// Defaults shared by the `ci` subcommand and the no-subcommand boot path.
 const DEFAULT_WORK_DIR: &str = "/home/runner/work";
 const DEFAULT_STATE_DIR: &str = "/var/lib/hatchrun-agent";
+const DEFAULT_RUNNER_USER: &str = "runner";
+const DEFAULT_ENV_FILE: &str = "/etc/environment";
+const DEFAULT_CLAIM_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Parser)]
 #[command(version = env!("HATCHRUN_VERSION"), about)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Directory holding the runner's run.sh.
-    #[arg(long, default_value = "/home/runner")]
-    runner_dir: PathBuf,
-    /// User the runner runs as. Pass an empty value to keep the agent's user.
-    #[arg(long, default_value = "runner")]
-    runner_user: String,
-    /// KEY=VALUE file that becomes the runner's environment.
-    #[arg(long, default_value = "/etc/environment")]
-    env_file: PathBuf,
-    /// How long to wait for the runner config before giving up.
-    #[arg(long, default_value = "10m", value_parser = humantime::parse_duration)]
-    config_timeout: Duration,
-    /// How often to check for a runner config parameter that does not exist yet.
-    #[arg(long, default_value = "1s", value_parser = humantime::parse_duration)]
-    poll_interval: Duration,
-    /// How long the runner gets to exit after SIGTERM.
-    #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
-    stop_timeout: Duration,
     /// Instance metadata endpoint.
     #[arg(long, default_value = imds::DEFAULT_ENDPOINT, hide = true)]
     imds_endpoint: String,
@@ -79,13 +51,13 @@ struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// Mark the instance as launched as a runner, for hatchrun-launch.service.
+    /// Mark the instance as launched for CI, for hatchrun-launch.service.
     ///
-    /// Writes the mark file when user data or tags hold a runner config. An
-    /// instance launched any other way, by hand or by the AWS Marketplace
-    /// scan, gets no mark, so hatchrun-agent.service stays off instead of
+    /// Writes the mark file when user data names a CI launch. An instance
+    /// launched any other way, by hand or by the AWS Marketplace scan,
+    /// gets no mark, so hatchrun-agent.service stays off instead of
     /// powering it off. When the metadata cannot be read the instance is
-    /// marked, so a runner never sits idle and billed.
+    /// marked, so a CI instance never sits idle and billed.
     Detect {
         /// File to create on a runner launch.
         #[arg(long, default_value = "/run/hatchrun/launch")]
@@ -260,7 +232,21 @@ async fn main() -> ExitCode {
             by: SplitBy::Timings,
             items,
         }) => return split::run(items.clone()),
-        None => run(args).await,
+        None => {
+            let opts = ci_options(
+                Path::new(DEFAULT_WORK_DIR),
+                DEFAULT_RUNNER_USER,
+                Path::new(DEFAULT_ENV_FILE),
+                None,
+                Path::new(DEFAULT_STATE_DIR),
+                DEFAULT_CLAIM_TIMEOUT,
+            );
+            let code = match read_user_data(&args.imds_endpoint).await {
+                Ok(user_data) => ci::run(user_data, opts).await,
+                Err(err) => Err(err),
+            };
+            exit_with(code)
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -293,20 +279,6 @@ fn ci_options(
         },
         claim_timeout,
     }
-}
-
-/// Options for a CI launch started with no subcommand: the `ci`
-/// subcommand's defaults, with the top-level flags that share a name.
-/// `node` stays unset, as it does for `ci`, so the executor finds it.
-fn boot_ci_options(args: &Args) -> ci::CiOptions {
-    ci_options(
-        Path::new(DEFAULT_WORK_DIR),
-        &args.runner_user,
-        &args.env_file,
-        None,
-        Path::new(DEFAULT_STATE_DIR),
-        args.config_timeout,
-    )
 }
 
 async fn read_user_data(imds_endpoint: &str) -> Result<Vec<u8>> {
@@ -420,15 +392,18 @@ fn write_result(path: &Path, job: &hatchrun_workflow::JobResult) -> Result<()> {
 
 async fn detect(imds_endpoint: &str, mark: &Path) -> Result<()> {
     let launch = match Imds::new(imds_endpoint) {
-        Ok(metadata) => source::is_runner_launch(&metadata).await,
+        Ok(metadata) => match metadata.user_data().await.context("read user data") {
+            Ok(user_data) => source::is_ci_launch(user_data.as_deref()),
+            Err(err) => Err(err),
+        },
         Err(err) => Err(err),
     };
     let launch = launch.unwrap_or_else(|err| {
-        warn!("cannot tell how the instance was launched, treating it as a runner: {err:#}");
+        warn!("cannot tell how the instance was launched, treating it as CI: {err:#}");
         true
     });
     if !launch {
-        info!("not launched as a runner, hatchrun-agent stays off");
+        info!("not launched for CI, hatchrun-agent stays off");
         return Ok(());
     }
     if let Some(dir) = mark.parent() {
@@ -437,160 +412,14 @@ async fn detect(imds_endpoint: &str, mark: &Path) -> Result<()> {
     std::fs::write(mark, b"").with_context(|| format!("write {}", mark.display()))
 }
 
-async fn run(args: Args) -> Result<()> {
-    let mut terminate = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
-    let shutdown = async move {
-        terminate.recv().await;
-    };
-    tokio::pin!(shutdown);
-
-    let metadata = Imds::new(&args.imds_endpoint)?;
-    // A launch by the control plane's CI says so in its user data.
-    let user_data = metadata.user_data().await.context("read user data")?;
-    if source::ci_ticket(user_data.as_deref().unwrap_or_default())?.is_some() {
-        let opts = boot_ci_options(&args);
-        exit_with(ci::run(user_data.unwrap_or_default(), opts).await);
-    }
-    let region = metadata.region().await?;
-    let aws = aws_config::defaults(BehaviorVersion::latest())
-        .region(Region::new(region))
-        .load()
-        .await;
-    let resolver = Resolver {
-        metadata,
-        parameters: Ssm::new(aws_sdk_ssm::Client::new(&aws)),
-        broker: HttpBroker::new()?,
-        poll_interval: args.poll_interval,
-    };
-
-    let boot = tokio::select! {
-        result = tokio::time::timeout(args.config_timeout, resolver.boot()) => {
-            result.map_err(|_| anyhow!("no runner config after {:?}", args.config_timeout))??
-        }
-        () = &mut shutdown => bail!("stopped before the runner config arrived"),
-    };
-
-    let reporter = match boot.telemetry {
-        Some(telemetry) => start_reporter(&resolver.metadata, telemetry).await,
-        None => None,
-    };
-
-    let cache = match boot.cache {
-        Some(cache) => start_cache(&resolver.metadata, cache, &args.runner_dir).await,
-        None => None,
-    };
-    let env = cache
-        .as_ref()
-        .map(|proxy| {
-            vec![
-                ("ACTIONS_RESULTS_URL".to_owned(), proxy.url().to_owned()),
-                ("ACTIONS_CACHE_SERVICE_V2".to_owned(), "true".to_owned()),
-            ]
-        })
-        .unwrap_or_default();
-
-    let runner = Runner {
-        dir: args.runner_dir,
-        user: Some(args.runner_user).filter(|user| !user.is_empty()),
-        env_file: args.env_file,
-        stop_timeout: args.stop_timeout,
-        env,
-    };
-    info!(dir = %runner.dir.display(), user = runner.user.as_deref().unwrap_or("(agent)"), "starting runner");
-    let run = runner.run(&boot.jit_config, shutdown);
-    let status = match reporter {
-        Some(mut reporter) => {
-            let status = tokio::select! {
-                status = run => status,
-                never = reporter.collect() => match never {},
-            };
-            reporter.finish().await;
-            status
-        }
-        None => run.await,
-    };
-    if let Some(proxy) = cache {
-        proxy.stop().await;
-    }
-    let status = status?;
-    if !status.success() {
-        bail!("runner exited with {status}");
-    }
-    info!("runner exited");
-    Ok(())
-}
-
-/// The cache proxy for a hosted launch, with the runner pointed at it.
-/// The runner is patched only once the proxy passed its health check; a
-/// proxy that cannot start or fails it is logged and skipped, the runner
-/// stays stock, and the job uses GitHub's cache.
-async fn start_cache(metadata: &Imds, cache: source::Cache, runner_dir: &Path) -> Option<Proxy> {
-    let started = async {
-        let ip = tokio::time::timeout(Duration::from_secs(2), metadata.private_ip())
-            .await
-            .map_err(|_| anyhow!("instance metadata has no local-ipv4 after 2s"))??;
-        let proxy = Proxy::start(cache, ip).await?;
-        proxy.check().await?;
-        patch::patch_runner(runner_dir, Direction::Redirect)?;
-        anyhow::Ok(proxy)
-    };
-    match started.await {
-        Ok(proxy) => {
-            info!(url = proxy.url(), "serving the job cache");
-            Some(proxy)
-        }
-        Err(err) => {
-            warn!("not serving the job cache, the job uses GitHub's: {err:#}");
-            if let Err(err) = patch::patch_runner(runner_dir, Direction::Restore) {
-                warn!("{err:#}");
-            }
-            None
-        }
-    }
-}
-
-/// The metrics reporter for a hosted launch. A reporter that cannot
-/// start is logged and skipped; the job runs either way.
-async fn start_reporter(metadata: &Imds, telemetry: source::Telemetry) -> Option<Reporter> {
-    // Metadata answered for the user data a moment ago; the job does not
-    // wait long for it a second time.
-    let instance_type =
-        match tokio::time::timeout(Duration::from_secs(2), metadata.instance_type()).await {
-            Ok(Ok(instance_type)) => instance_type,
-            Ok(Err(err)) => {
-                warn!("{err:#}");
-                "unknown".to_owned()
-            }
-            Err(_) => {
-                warn!("instance metadata has no instance-type after 2s");
-                "unknown".to_owned()
-            }
-        };
-    let machine = Machine {
-        instance_type,
-        arch: std::env::consts::ARCH,
-        agent_version: env!("HATCHRUN_VERSION"),
-    };
-    match Reporter::new(telemetry, machine, Sampler::new("/")) {
-        Ok(reporter) => {
-            info!("reporting metrics");
-            Some(reporter)
-        }
-        Err(err) => {
-            warn!("not reporting metrics: {err:#}");
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The boot path and `hatchrun-agent ci` build the same options.
+    /// The no-subcommand boot path and `hatchrun-agent ci` use the same
+    /// defaults.
     #[test]
-    fn boot_path_options_match_the_ci_subcommand() {
-        let boot = boot_ci_options(&Args::parse_from(["hatchrun-agent"]));
+    fn boot_defaults_match_the_ci_subcommand() {
         let args = Args::parse_from(["hatchrun-agent", "ci"]);
         let Some(Command::Ci {
             work_dir,
@@ -604,23 +433,11 @@ mod tests {
         else {
             panic!("not the ci subcommand");
         };
-        let ci = ci_options(
-            &work_dir,
-            &runner_user,
-            &env_file,
-            node.as_ref(),
-            &state_dir,
-            claim_timeout,
-        );
-        assert_eq!(boot.claim_timeout, ci.claim_timeout);
-        let (b, c) = (boot.exec, ci.exec);
-        assert_eq!(b.work_dir, c.work_dir);
-        assert_eq!(b.runner_user, c.runner_user);
-        assert_eq!(b.env_file, c.env_file);
-        assert_eq!(b.node, c.node);
-        assert_eq!(b.store, c.store);
-        assert_eq!(b.state_dir, c.state_dir);
-        assert_eq!(b.tool_cache, c.tool_cache);
-        assert_eq!(b.minute, c.minute);
+        assert_eq!(work_dir, Path::new(DEFAULT_WORK_DIR));
+        assert_eq!(runner_user, DEFAULT_RUNNER_USER);
+        assert_eq!(env_file, Path::new(DEFAULT_ENV_FILE));
+        assert_eq!(node, None);
+        assert_eq!(state_dir, Path::new(DEFAULT_STATE_DIR));
+        assert_eq!(claim_timeout, DEFAULT_CLAIM_TIMEOUT);
     }
 }

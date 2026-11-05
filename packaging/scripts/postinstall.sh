@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 # The agent powers the machine off when it exits, so the package never
-# enables or starts the unit. Runner images enable it themselves with
+# enables or starts the unit. CI images enable it themselves with
 # `systemctl enable hatchrun-agent`.
 set -e
 if [ -d /run/systemd/system ]; then

@@ -263,18 +263,14 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
         session: &current,
     };
     let segments: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
-    let query = req.url()?.query().map(str::to_owned);
-    let back_to_ci = billing::back_to_ci(query.as_deref());
     let answer = match (method, segments.as_slice()) {
         (Method::Get, ["session"]) => session_json(&current),
         (Method::Get, ["installations"]) => tenants::installations(&ctx).await,
         (Method::Get, ["tenants"]) => tenants::mine(&ctx).await,
         (Method::Post, ["tenants"]) => tenants::create(&ctx, req.json().await?).await,
         (Method::Get, ["tenants", org]) => tenants::show(&ctx, org).await,
-        (Method::Post, ["tenants", org, "checkout"]) => {
-            billing::checkout(&ctx, org, back_to_ci).await
-        }
-        (Method::Post, ["tenants", org, "portal"]) => billing::portal(&ctx, org, back_to_ci).await,
+        (Method::Post, ["tenants", org, "checkout"]) => billing::checkout(&ctx, org).await,
+        (Method::Post, ["tenants", org, "portal"]) => billing::portal(&ctx, org).await,
         (Method::Get, ["github", "setup"]) => tenants::setup(&ctx, &req).await,
         _ => return json_error("not found", 404),
     };
