@@ -134,7 +134,7 @@ function RunScreen({
   return (
     <>
       <Crumbs route={route} run={run} job={job} />
-      <Header run={run} session={session} now={now} reload={reload} />
+      <Header run={run} access={data.access} now={now} reload={reload} />
       {stale && (
         <p className="font-mono text-[13px] text-fg-3" role="status">
           Could not refresh: {stale.message}. Showing the last result.
@@ -233,12 +233,12 @@ function Crumbs({
 
 function Header({
   run,
-  session,
+  access,
   now,
   reload,
 }: {
   run: Run;
-  session: Session | null;
+  access: CiRunDetail["access"];
   now: number;
   reload: () => void;
 }) {
@@ -327,7 +327,7 @@ function Header({
         )}
       </div>
       <div className="flex items-center gap-2">
-        {session && !finished && (
+        {access !== "read" && !finished && (
           <button
             type="button"
             className={BTN}

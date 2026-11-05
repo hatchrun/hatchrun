@@ -72,8 +72,8 @@ export function Kit({ org }: OrgPageProps) {
           </span>
         </div>
         <SegmentedBar segments={[{ status: "passed", count: 120 }, { status: "failed", count: 9 }, { status: "running", count: 4 }, { status: "queued", count: 30 }]} />
-        <JobSquares jobs={{ total: 104, passed: 66, failed: 4, running: 14, waiting: 1 }} />
-        <JobSquares jobs={{ total: 3, passed: 3, failed: 0, running: 0, waiting: 0 }} />
+        <JobSquares jobs={{ total: 104, passed: 66, failed: 4, running: 14, waiting: 1, cancelled: 2, skipped: 1 }} />
+        <JobSquares jobs={{ total: 3, passed: 3, failed: 0, running: 0, waiting: 0, cancelled: 0, skipped: 0 }} />
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="section-title">FilterBar, CursorPager</h2>

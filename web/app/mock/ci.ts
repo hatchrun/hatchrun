@@ -164,6 +164,8 @@ function run(id: number, number: number, workflow: string, event: string, ref: s
       failed: jobs.filter((job) => job.run === id && job.conclusion === "failure").length,
       running: jobs.filter((job) => job.run === id && job.status === "in_progress").length,
       waiting: jobs.filter((job) => job.run === id && job.held !== null).length,
+      cancelled: jobs.filter((job) => job.run === id && job.conclusion === "cancelled").length,
+      skipped: jobs.filter((job) => job.run === id && job.conclusion === "skipped").length,
     },
   };
 }
@@ -296,7 +298,7 @@ export async function handleCi(
     if (!wanted) {
       return hidden();
     }
-    return json(res, 200, { run: wanted, jobs: jobs.filter((job) => job.run === wanted.id).map(jobJson) });
+    return json(res, 200, { access: "admin", run: wanted, jobs: jobs.filter((job) => job.run === wanted.id).map(jobJson) });
   }
 
   if ((found = /^runs\/(\d+)\/artifacts(?:\/(\d+))?$/.exec(path))) {

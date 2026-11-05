@@ -86,7 +86,7 @@ interface RunRow {
   created_at: number;
   completed_at: number | null;
   duration_ms: number | null;
-  jobs: { total: number; passed: number; failed: number; running: number; waiting: number };
+  jobs: { total: number; passed: number; failed: number; running: number; waiting: number; cancelled: number; skipped: number };
 }
 
 const RUNS = 5000;
@@ -154,16 +154,19 @@ function countsFor(i: number, o: ReturnType<typeof outcome>): RunRow["jobs"] {
       failed: all.filter((s) => s.conclusion === "failure").length,
       running: all.filter((s) => s.status === "in_progress").length,
       waiting: all.filter((s) => s.held).length,
+      cancelled: all.filter((s) => s.conclusion === "cancelled").length,
+      skipped: all.filter((s) => s.conclusion === "skipped").length,
     };
   }
   const total = 1 + (hash(i, 6) % 8);
   if (o.status === "completed") {
     const failed = o.conclusion === "failure" ? 1 + (hash(i, 7) % Math.max(1, Math.min(2, total))) : 0;
-    return { total, passed: o.conclusion === "success" ? total : total - failed - (o.conclusion === "cancelled" ? 1 : 0), failed, running: 0, waiting: 0 };
+    const cancelled = o.conclusion === "cancelled" ? 1 : 0;
+    return { total, passed: o.conclusion === "success" ? total : total - failed - cancelled, failed, running: 0, waiting: 0, cancelled, skipped: 0 };
   }
   const waiting = o.wait ? 1 : 0;
   const running = o.status === "in_progress" ? 1 : 0;
-  return { total, passed: Math.max(0, total - running - waiting - (o.status === "queued" ? 1 : 0)), failed: 0, running, waiting };
+  return { total, passed: Math.max(0, total - running - waiting - (o.status === "queued" ? 1 : 0)), failed: 0, running, waiting, cancelled: 0, skipped: 0 };
 }
 
 const runCache = new Map<number, RunRow>();
@@ -565,7 +568,7 @@ export function handleScale(
 
   if ((found = /^runs\/(\d+)$/.exec(path)) && validRun(Number(found[1]))) {
     const run = runAt(indexOfRun(Number(found[1])));
-    json(res, 200, { run, jobs: jobsOf(run) });
+    json(res, 200, { access: "admin", run, jobs: jobsOf(run) });
     return true;
   }
   if (/^runs\/\d+\/cancel$/.test(path) && validRun(Number(path.split("/")[1]))) {

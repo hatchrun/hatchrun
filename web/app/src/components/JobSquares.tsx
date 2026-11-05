@@ -12,13 +12,15 @@ export const MAX_SQUARES = 12;
 
 /** The squares for a run's jobs, worst first, so a failure is never in the "+N". */
 export function squaresFor(jobs: CiJobCounts): Status[] {
-  const queued = Math.max(0, jobs.total - jobs.passed - jobs.failed - jobs.running - jobs.waiting);
+  const queued = Math.max(0, jobs.total - jobs.passed - jobs.failed - jobs.running - jobs.waiting - jobs.cancelled - jobs.skipped);
   const all: [Status, number][] = [
     ["failed", jobs.failed],
     ["waiting", jobs.waiting],
     ["running", jobs.running],
     ["queued", queued],
     ["passed", jobs.passed],
+    ["cancelled", jobs.cancelled],
+    ["skipped", jobs.skipped],
   ];
   return all.flatMap(([status, count]) => Array<Status>(count).fill(status)).slice(0, MAX_SQUARES);
 }
