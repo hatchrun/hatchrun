@@ -52,6 +52,7 @@ use worker::{
     RequestInit, console_error, console_log,
 };
 
+use crate::alerts;
 use crate::billing::{self, HOLD_RECHECK_MS, Hold};
 use crate::concurrency::{self, Gate as GroupGate};
 use crate::env::{Settings, run_stub};
@@ -831,9 +832,10 @@ pub(crate) async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> 
     }
 }
 
-/// The consumer of the dead-letter queue: ends the jobs whose launch
-/// messages ran out of retries. A message that does not read is acked,
-/// since no job can be named; a job that cannot be ended is retried.
+/// The consumer of the dead-letter queue: records the launches that ran
+/// out of retries, fires their alert (see [`crate::alerts`]) and ends
+/// their jobs. A message that does not read is acked, since no job can
+/// be named; a job that cannot be ended is retried.
 pub async fn dead_letters(batch: MessageBatch<LaunchMessage>, env: Env) {
     let messages = match batch.messages() {
         Ok(messages) => messages,
@@ -843,6 +845,7 @@ pub async fn dead_letters(batch: MessageBatch<LaunchMessage>, env: Env) {
             return;
         }
     };
+    record_failures(&env, &messages).await;
     let results = join_all(
         messages
             .iter()
@@ -857,6 +860,26 @@ pub async fn dead_letters(batch: MessageBatch<LaunchMessage>, env: Env) {
                 message.retry();
             }
         }
+    }
+}
+
+/// Records the launches of `messages` and fires the failed launch alert
+/// before the jobs are ended, so the job's error is still the launch's.
+/// A failure is logged: the jobs are ended either way.
+async fn record_failures(env: &Env, messages: &[worker::Message<LaunchMessage>]) {
+    let failed: Vec<(String, u64)> = messages
+        .iter()
+        .map(|message| (message.id(), message.body().job_id))
+        .collect();
+    let db = match Db::connect(env).await {
+        Ok(db) => db,
+        Err(err) => {
+            console_error!("launch dead letters: alert: database: {err}");
+            return;
+        }
+    };
+    if let Err(err) = alerts::launches_failed(env, &db, now_ms(), &failed).await {
+        console_error!("launch dead letters: alert: {err}");
     }
 }
 

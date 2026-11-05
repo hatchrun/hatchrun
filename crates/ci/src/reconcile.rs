@@ -19,6 +19,9 @@
 //! 7. sends metered usage to Polar;
 //! 8. re-seals secrets that an old key still seals.
 //!
+//! Then the pass is added to the history in `ci_reconciler` and the
+//! alerts are checked (see [`crate::alerts`]).
+//!
 //! Each step decides over rows and the clock with a pure function
 //! ([`minutes`], [`fires`], [`stalled`], [`orphans`]) and then acts.
 //!
@@ -54,6 +57,7 @@ use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, Template, UtcMinute};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
+use crate::alerts;
 use crate::cache;
 use crate::concurrency;
 use crate::env::{Settings, run_stub};
@@ -450,25 +454,47 @@ pub async fn run(env: Env) {
             return;
         }
     }
-    let settings = match Settings::read(&env) {
+    let errors = steps(&env, &db, now).await;
+    // The history and the alerts come after the steps, so they see this
+    // pass.
+    alerts::after_pass(&env, &db, now, errors).await;
+}
+
+/// The steps of a pass. Returns how many failed, which the pass history
+/// keeps.
+async fn steps(env: &Env, db: &Db, now: u64) -> u32 {
+    let mut errors = 0;
+    let settings = match Settings::read(env) {
         Ok(settings) => settings,
         Err(err) => {
             console_error!("reconcile: {err}");
-            return;
+            return 1;
         }
     };
     let share = shares(BUDGET);
-    if let Err(err) = fire_schedules(&env, &db, &settings, &Budget::new(share.schedules), now).await
+    let github = Counted::default();
+    if let Err(err) = fire_schedules(
+        env,
+        db,
+        &settings,
+        &github,
+        &Budget::new(share.schedules),
+        now,
+    )
+    .await
     {
         console_error!("reconcile: schedules: {err}");
+        errors += 1;
     }
+    alerts::note_rate_limits(db, &github, now).await;
     let backend = Backend::new(&settings).await;
     if let Err(err) = &backend {
         console_error!("reconcile: no launcher backend: {err}");
+        errors += 1;
     }
     if let Err(err) = fix_stalled(
-        &env,
-        &db,
+        env,
+        db,
         backend.as_ref().ok(),
         &Budget::new(share.stalled),
         now,
@@ -476,40 +502,49 @@ pub async fn run(env: Env) {
     .await
     {
         console_error!("reconcile: stalled jobs: {err}");
+        errors += 1;
     }
     if held_backstop_due(now)
-        && let Err(err) = wake_held(&env, &db, &Budget::new(HELD_BUDGET), now).await
+        && let Err(err) = wake_held(env, db, &Budget::new(HELD_BUDGET), now).await
     {
         console_error!("reconcile: held jobs: {err}");
+        errors += 1;
     }
     let cancels = Budget::new(MAX_RECANCELS);
-    if let Err(err) =
-        concurrency::resend_cancels(&env, &db, MAX_RECANCELS, || cancels.take(1)).await
+    if let Err(err) = concurrency::resend_cancels(env, db, MAX_RECANCELS, || cancels.take(1)).await
     {
         console_error!("reconcile: superseded runs: {err}");
+        errors += 1;
     }
     if let Ok(backend) = &backend
-        && let Err(err) = end_orphans(&db, backend, &Budget::new(share.orphans), now).await
+        && let Err(err) = end_orphans(db, backend, &Budget::new(share.orphans), now).await
     {
         console_error!("reconcile: orphans: {err}");
+        errors += 1;
     }
     if let Ok(backend) = &backend
-        && let Err(err) = keep_pool(&db, backend, &Budget::new(share.pool), now).await
+        && let Err(err) = keep_pool(db, backend, &Budget::new(share.pool), now).await
     {
         console_error!("reconcile: warm pool: {err}");
+        errors += 1;
     }
-    if let Err(err) = retain(&env, &db, &Budget::new(share.retention), now).await {
+    if let Err(err) = retain(env, db, &Budget::new(share.retention), now).await {
         console_error!("reconcile: retention: {err}");
+        errors += 1;
     }
-    if let Err(err) = evict_cache(&settings, &db, &Budget::new(share.cache), now).await {
+    if let Err(err) = evict_cache(&settings, db, &Budget::new(share.cache), now).await {
         console_error!("reconcile: cache eviction: {err}");
+        errors += 1;
     }
-    if let Err(err) = report_usage(&db, &settings, &Budget::new(share.usage), now).await {
+    if let Err(err) = report_usage(db, &settings, &Budget::new(share.usage), now).await {
         console_error!("reconcile: usage: {err}");
+        errors += 1;
     }
-    if let Err(err) = reseal_secrets(&env, &db, &Budget::new(share.reseal)).await {
+    if let Err(err) = reseal_secrets(env, db, &Budget::new(share.reseal)).await {
         console_error!("reconcile: reseal: {err}");
+        errors += 1;
     }
+    errors
 }
 
 /// A repository ready to start scheduled runs: where it is now, the
@@ -532,6 +567,7 @@ async fn fire_schedules(
     env: &Env,
     db: &Db,
     settings: &Settings,
+    github: &Counted,
     budget: &Budget,
     now: u64,
 ) -> Result<(), String> {
@@ -540,7 +576,6 @@ async fn fire_schedules(
     let Some(&newest) = due.last() else {
         return Ok(());
     };
-    let github = Counted::default();
     let tokens = Tokens::new(
         Kv::new(env),
         App::new(
@@ -548,7 +583,7 @@ async fn fire_schedules(
             settings.app_id.clone(),
             settings.app_key.clone(),
         ),
-        &github,
+        github,
         now,
     );
     // The repository, its head and its config are read once per pass.

@@ -98,7 +98,8 @@ deliveries: push, pull_request, check_run, repository, release, create
 and delete go on to `hatchrun-ci` as they came; `installation` events
 link a tenant to its installation or unlink it. Everything under
 `/api/ci/` on app.hatchrun.io is forwarded to `hatchrun-ci` too.
-`GET /healthz` answers 200 while the database does.
+`GET /healthz` answers 200 while the database does and `hatchrun-ci` is
+healthy.
 
 ```sh
 npm --prefix web/app ci && npm --prefix web/app run build
@@ -189,6 +190,20 @@ A slot is published only while its `kid` is set, so the leftover
 secrets do nothing. Delete them anyway, from GitHub with
 `gh secret delete NAME --env production` and from the Worker with
 `npx wrangler@4.145.0 secret delete NAME`.
+
+## CI alerts
+
+`hatchrun-ci` emails `ALERT_EMAIL` through Cloudflare Email Service,
+from `alerts@notify.hatchrun.io`, when its reconciler fails five passes
+in a row, a launch message reaches `hatchrun-ci-launches-dlq`, GitHub
+rate limits an installation or leaves it under 2,000 requests, or the
+database passes 80% of its connections. Each alert sends one email when
+it fires, is listed in one digest a day while it lasts, and sends one
+when it resolves; an email that fails is sent on the next pass. The
+state is in `ci_alerts`. A Worker cannot see its own cron stop, so
+`GET /healthz` on `hatchrun-ci` answers 503 when the last pass is over
+five minutes old or failing, and the one on hatchrun.io passes that on
+for an uptime monitor.
 
 ## Scaler core
 
