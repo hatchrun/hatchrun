@@ -8,7 +8,7 @@ use hatchrun_cloud::time;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CONNECTIONS_PERCENT, FAILED_LAUNCHES_FOR, FAILING_PASSES, GB, HISTORY, Key, LISTED, MINUTE,
+    CONNECTIONS_PERCENT, FAILED_LAUNCHES_FOR, FAILING_PASSES, GB, Key, LISTED, MINUTE,
     RATE_LIMITS_FOR, Seen,
 };
 
@@ -19,14 +19,6 @@ pub(crate) struct PassRecord {
     pub at: u64,
     /// Steps that failed.
     pub errors: u32,
-}
-
-/// `history` with `pass` added, newest last, [`HISTORY`] at most.
-pub(crate) fn remember(mut history: Vec<PassRecord>, pass: PassRecord) -> Vec<PassRecord> {
-    history.push(pass);
-    let extra = history.len().saturating_sub(HISTORY);
-    history.drain(..extra);
-    history
 }
 
 /// The last `count` passes, when there are that many and each says
@@ -160,11 +152,14 @@ fn rate_limited(limits: &[LowRateLimit]) -> Seen {
     ))
 }
 
-/// The failed launch alert, from the latest failures.
+/// The failed launch alert, from the latest failures, newest first. One
+/// more than [`LISTED`] says there are more than the detail lists.
 pub(super) fn failed_launches(failed: &[FailedLaunch]) -> Seen {
     if failed.is_empty() {
         return Seen::Clear;
     }
+    let more = failed.len() > LISTED as usize;
+    let failed = &failed[..failed.len().min(LISTED as usize)];
     let known = |value: Option<u64>| value.map_or_else(|| "?".to_owned(), |id| id.to_string());
     let lines: Vec<String> = failed
         .iter()
@@ -183,11 +178,7 @@ pub(super) fn failed_launches(failed: &[FailedLaunch]) -> Seen {
         "Launch messages reached hatchrun-ci-launches-dlq in the last {} min{}:\n{}\n\n\
          The reconciler sends queued jobs again and fails launches that stalled; the error says why the queue could not.",
         FAILED_LAUNCHES_FOR / MINUTE,
-        if failed.len() == LISTED as usize {
-            ", the latest of them"
-        } else {
-            ""
-        },
+        if more { ", the latest of them" } else { "" },
         lines.join("\n")
     ))
 }

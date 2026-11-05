@@ -18,7 +18,7 @@
 //! Mail goes through Cloudflare Email Service from
 //! `alerts@notify.hatchrun.io` to the `ALERT_EMAIL` inbox. A Worker
 //! cannot tell that its own cron stopped, so `/healthz` answers 503
-//! when the last pass is old or failing, and `hatchrun-cloud`'s
+//! when the last pass is old (failing passes email instead), and `hatchrun-cloud`'s
 //! `/healthz` passes that on for an uptime monitor outside Cloudflare
 //! to poll (see [`health`]).
 
@@ -506,9 +506,10 @@ async fn send_bounded(mail: &impl Mail, email: &Email) -> Option<Result<(), Stri
     }
 }
 
-/// Sends the digest of `firing` once a day. With nothing firing the day
-/// starts again, so an alert that fires later waits up to a day for its
-/// first digest rather than getting one minutes after its own email.
+/// Sends the digest of `firing` once a day. The day runs on its own
+/// clock, not the alerts': one that fired minutes before it ends is in
+/// that digest as well as in its own email. With nothing firing the day
+/// starts again, so a digest never repeats what an empty day was owed.
 /// The day is claimed before the send, so only one pass sends; a failed
 /// send gives it back, one that got no answer keeps it.
 async fn send_digest(

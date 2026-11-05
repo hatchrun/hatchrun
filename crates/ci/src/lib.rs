@@ -24,8 +24,9 @@
 //! - `/api/ci/*` serves runs, jobs and logs to the app and takes its
 //!   dispatch and cancel requests; `hatchrun-cloud` forwards them.
 //! - `GET /healthz` answers 200 while the database answers and the
-//!   reconciler's last pass is recent and not failing, 503 otherwise;
-//!   `hatchrun-cloud`'s `/healthz` asks it (see [`alerts`]).
+//!   reconciler's last pass is recent, 503 otherwise. Only the service
+//!   binding's host reaches it; `hatchrun-cloud`'s `/healthz` asks it
+//!   (see [`alerts`]).
 //!
 //! A Cron Trigger runs the reconciler every minute (stuck jobs,
 //! schedules, expiry), and the `hatchrun-ci-launches` queue starts the
@@ -72,6 +73,9 @@ use worker::{
     console_error, event,
 };
 
+/// The host `hatchrun-cloud` calls through the service binding.
+const INTERNAL_HOST: &str = "ci";
+
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if req.url()?.host_str() == Some(oidc::HOST) {
@@ -81,6 +85,11 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return webhook::handle(req, &env).await;
     }
     if req.method() == Method::Get && req.path() == "/healthz" {
+        // Public on ci.hatchrun.io it would open a database connection
+        // per hit; only the service binding's host gets an answer.
+        if req.url()?.host_str() != Some(INTERNAL_HOST) {
+            return Response::error("not found", 404);
+        }
         return healthz(&env).await;
     }
     if req.path().starts_with("/api/ci/") {

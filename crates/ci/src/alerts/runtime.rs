@@ -12,15 +12,15 @@ use hatchrun_cloud::github::RateLimit;
 use serde::Deserialize;
 use worker::{Env, SendEmail, SendEmailBuilder, console_error};
 
-use super::checks::{Database, Facts, FailedLaunch, PassRecord, check, failed_launches, remember};
-use super::health::{HEALTH, HealthRow, history};
+use super::checks::{Database, Facts, FailedLaunch, PassRecord, check, failed_launches};
+use super::health::{HealthRow, history};
 use super::queries::{
     DATABASE, DELETE_FAILED, DELETE_RATE_LIMITS, FAILED_SINCE, LOW_SINCE, NOTE_RATE_LIMIT,
     RECORD_FAILED, RECORD_UNREADABLE,
 };
 use super::{
-    Alert, BINDING, DELETE_BATCH, Email, FAILED_LAUNCH_MEMORY, FAILED_LAUNCHES_FOR, FROM, Key,
-    LISTED, Mail, RATE_LIMIT_MEMORY, RATE_LIMITS_FOR, State, Store, TO, settle,
+    Alert, BINDING, DELETE_BATCH, Email, FAILED_LAUNCH_MEMORY, FAILED_LAUNCHES_FOR, FROM, HISTORY,
+    Key, LISTED, Mail, RATE_LIMIT_MEMORY, RATE_LIMITS_FOR, State, Store, TO, settle,
 };
 
 /// Every alert.
@@ -57,8 +57,18 @@ const SENT: &str = "UPDATE ci_alerts SET sent = $2, sending_until = NULL, update
 const RELEASE: &str =
     "UPDATE ci_alerts SET sending_until = NULL WHERE key = $1 AND sending_until = $2";
 
-/// Stamps the end of a pass at `$1` and keeps its history `$2`.
-const RECORD_PASS: &str = "UPDATE ci_reconciler SET finished_at = $1, history = $2 WHERE id = 1";
+/// Stamps the end of a pass at `$1` and appends the pass `$2` (JSON) to
+/// the history, keeping the last `$3`. One statement, so a pass that
+/// outlives its lease and overlaps the next one cannot overwrite the
+/// other's record.
+const RECORD_PASS: &str = "\
+    UPDATE ci_reconciler SET finished_at = $1, history = ( \
+        SELECT COALESCE(jsonb_agg(entry ORDER BY n), '[]'::jsonb)::text FROM ( \
+            SELECT entry, n FROM jsonb_array_elements( \
+                COALESCE(NULLIF(ci_reconciler.history, '')::jsonb, '[]'::jsonb) || $2::jsonb \
+            ) WITH ORDINALITY AS t(entry, n) ORDER BY n DESC LIMIT $3 \
+        ) AS kept \
+    ) WHERE id = 1 RETURNING history, finished_at";
 
 /// When the last digest went out.
 const DIGEST_AT: &str = "SELECT digest_at FROM ci_reconciler WHERE id = 1";
@@ -256,7 +266,7 @@ pub(crate) async fn after_pass(env: &Env, db: &Db, now: u64, errors: u32) {
         failed: logged("failed launches", recent_failures(db, now).await),
         rate_limits: logged(
             "rate limits",
-            since(db, LOW_SINCE, now.saturating_sub(RATE_LIMITS_FOR)).await,
+            since(db, LOW_SINCE, now.saturating_sub(RATE_LIMITS_FOR), LISTED).await,
         ),
     };
     for err in settle(&Kept(db), &Inbox::new(env), now, &check(&facts), true).await {
@@ -276,20 +286,17 @@ pub(super) async fn record_pass(
     finished: u64,
     errors: u32,
 ) -> Result<Vec<PassRecord>, String> {
+    let record =
+        serde_json::to_string(&[PassRecord { at: now, errors }]).map_err(|err| err.to_string())?;
     let row = db
-        .first::<HealthRow>(HEALTH, &[])
+        .first::<HealthRow>(
+            RECORD_PASS,
+            &params![finished, record.as_str(), HISTORY as u64],
+        )
         .await
         .map_err(text)?
         .ok_or_else(|| "no row".to_owned())?;
-    let kept = remember(
-        history(row.history.as_deref()),
-        PassRecord { at: now, errors },
-    );
-    let text_of = serde_json::to_string(&kept).map_err(|err| err.to_string())?;
-    db.run(RECORD_PASS, &params![finished, text_of.as_str()])
-        .await
-        .map_err(text)?;
-    Ok(kept)
+    Ok(history(row.history.as_deref()))
 }
 
 /// Deletes failed launches and rate limits nobody needs any more.
@@ -368,17 +375,25 @@ pub(crate) async fn note_rate_limits(db: &Db, calls: &Counted, now: u64) {
 }
 
 async fn recent_failures(db: &Db, now: u64) -> Result<Vec<FailedLaunch>, String> {
-    since(db, FAILED_SINCE, now.saturating_sub(FAILED_LAUNCHES_FOR)).await
+    // One more than a detail lists, so it can say when there are more.
+    since(
+        db,
+        FAILED_SINCE,
+        now.saturating_sub(FAILED_LAUNCHES_FOR),
+        LISTED + 1,
+    )
+    .await
 }
 
-/// The rows of a query that takes a time, `$1`, and at most [`LISTED`]
+/// The rows of a query that takes a time, `$1`, and at most `limit`
 /// rows, `$2`.
 pub(super) async fn since<T: for<'de> Deserialize<'de>>(
     db: &Db,
     sql: &str,
     at: u64,
+    limit: u32,
 ) -> Result<Vec<T>, String> {
-    db.all(sql, &params![at, LISTED]).await.map_err(text)
+    db.all(sql, &params![at, limit]).await.map_err(text)
 }
 
 /// The value, or `None` with the error logged.

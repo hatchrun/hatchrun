@@ -8,7 +8,7 @@ use hatchrun_cloud::db::params;
 use hatchrun_cloud::testdb::Db;
 
 use super::checks::{
-    Database, Facts, FailedLaunch, LowRateLimit, PassRecord, check, failed_launches, remember,
+    Database, Facts, FailedLaunch, LowRateLimit, PassRecord, check, failed_launches,
 };
 use super::health::history as parse_history;
 use super::queries::{
@@ -204,14 +204,8 @@ fn alert(db: &Db, key: Key) -> Alert {
 }
 
 #[test]
-fn the_history_keeps_the_last_passes() {
-    let mut history = Vec::new();
-    for at in 0..15 {
-        history = remember(history, PassRecord { at, errors: 0 });
-    }
-    assert_eq!(history.len(), HISTORY);
-    assert_eq!(history[0].at, 5);
-    assert_eq!(history[HISTORY - 1].at, 14);
+fn the_history_reads_as_the_reconciler_row_keeps_it() {
+    let history = passes(&[0, 1, 0]);
     // As the reconciler row keeps it.
     let text = serde_json::to_string(&history).unwrap();
     assert_eq!(parse_history(Some(&text)), history);
@@ -792,9 +786,13 @@ fn healthz_says_when_the_reconciler_stopped_or_fails() {
 
     let failing = serde_json::to_string(&passes(&[1, 2, 1, 1, 4])).unwrap();
     db.run(record, &params![NOW, failing.as_str()]);
+    // Failing passes email; only a stopped cron fails the uptime check.
     let (status, body) = health(&read(&db), NOW + 30_000);
-    assert_eq!(status, 503);
+    assert_eq!(status, 200);
     assert_eq!(body["status"], "failing");
+    let (status, body) = health(&read(&db), NOW + 6 * MINUTE);
+    assert_eq!(status, 503);
+    assert_eq!(body["status"], "stale");
 }
 
 /// Job 5 of a run in `acme/app`, whose launch failed for good.
@@ -1036,6 +1034,45 @@ fn a_claim_too_close_to_its_end_is_given_back_unsent() {
 }
 
 #[test]
+fn the_digest_keeps_its_own_clock_for_an_alert_that_just_fired() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    pass(&db, &outbox, NOW, &[]);
+    pass(
+        &db,
+        &outbox,
+        NOW + DAY - MINUTE,
+        &[(Key::ReconcilerFailing, firing("acme"))],
+    );
+    assert_eq!(outbox.take().len(), 1);
+    // The day ends a minute later: the digest lists it.
+    pass(&db, &outbox, NOW + DAY, &[]);
+    assert_eq!(outbox.take(), ["[hatchrun] Still firing: 1 alerts"]);
+}
+
+#[test]
+fn the_failed_launch_detail_says_the_latest_only_when_there_are_more() {
+    let launch = |id: u64| FailedLaunch {
+        job_id: Some(id),
+        job_name: None,
+        error: None,
+        attempts: None,
+        failed_at: NOW,
+    };
+    let detail = |count: u64| match failed_launches(&(0..count).map(launch).collect::<Vec<_>>()) {
+        Seen::Firing(detail) => detail,
+        other => panic!("{other:?}"),
+    };
+    let listed = u64::from(LISTED);
+    let exact = detail(listed);
+    assert!(!exact.contains("the latest of them"));
+    assert_eq!(exact.matches("\njob ").count(), LISTED as usize);
+    let more = detail(listed + 1);
+    assert!(more.contains("the latest of them"));
+    assert_eq!(more.matches("\njob ").count(), LISTED as usize);
+}
+
+#[test]
 fn two_passes_send_one_digest() {
     let db = Db::new();
     let outbox = Outbox::default();
@@ -1195,6 +1232,30 @@ fn a_digest_waits_for_the_pass_that_reads_every_firing_alert() {
             "[hatchrun] Still firing: 1 alerts"
         ]
     );
+}
+
+#[test]
+fn overlapping_passes_keep_each_others_records() {
+    let db = Db::new();
+    let at = |n: u64| NOW + n * MINUTE;
+    // Both passes finish without having read the other's record.
+    let (a, b) = db.wait(futures_util::future::join(
+        runtime::record_pass(db.db(), at(0), at(0) + 5000, 0),
+        runtime::record_pass(db.db(), at(1), at(1) + 5000, 1),
+    ));
+    a.unwrap();
+    b.unwrap();
+    let row = db.first::<HealthRow>(HEALTH, &[]).unwrap();
+    assert_eq!(parse_history(row.history.as_deref()).len(), 2);
+    // The history stays at its limit, newest last.
+    for n in 2..15 {
+        db.wait(runtime::record_pass(db.db(), at(n), at(n) + 5000, 0))
+            .unwrap();
+    }
+    let row = db.first::<HealthRow>(HEALTH, &[]).unwrap();
+    let kept = parse_history(row.history.as_deref());
+    assert_eq!(kept.len(), HISTORY);
+    assert_eq!(kept.last().map(|pass| pass.at), Some(at(14)));
 }
 
 #[test]

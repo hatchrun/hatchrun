@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `/healthz`: whether the last pass is recent and not failing.
+//! `/healthz`: whether the last pass is recent.
 
 use hatchrun_cloud::time;
 use serde::Deserialize;
@@ -28,7 +28,9 @@ pub(crate) fn history(text: Option<&str>) -> Vec<PassRecord> {
 }
 
 /// `/healthz`'s status and body at `now`: 200 while the last pass is
-/// recent and the passes are not all failing, 503 otherwise.
+/// recent, 503 once it is not. Failing passes show in the body only: the
+/// reconciler emails those, and 503 is for what email cannot cover, a
+/// cron that stopped.
 pub(crate) fn health(row: &HealthRow, now: u64) -> (u16, serde_json::Value) {
     let age = row.finished_at.map(|at| now.saturating_sub(at));
     let status = if age.is_none_or(|age| age > STALE) {
@@ -43,5 +45,5 @@ pub(crate) fn health(row: &HealthRow, now: u64) -> (u16, serde_json::Value) {
         "lastPass": row.finished_at.map(time::format),
         "ageSeconds": age.map(|age| age / 1000),
     });
-    (if status == "ok" { 200 } else { 503 }, body)
+    (if status == "stale" { 503 } else { 200 }, body)
 }
