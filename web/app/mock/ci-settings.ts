@@ -6,14 +6,14 @@
 // crates/ci/src/settings_api.rs: an organization's billing the secrets and
 // variables of an organization (with the repositories each reaches), a
 // repository or one of its environments, and a repository's environments.
-// Any organization of the mock tenants answers, and so does the repository
-// demo of each. Billing has a card (the mock Polar checkout adds one),
+// An organization answers to its admins (a member or a stranger gets a 404),
+// and so does the repository demo of each. Billing has a card (the mock Polar checkout adds one),
 // 19,200 seconds and a $50 cap; MOCK_CARD=off drops the card. Values are
 // kept in memory and a secret's is never answered.
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { orgItems, paginate, SCALE_ORG, scaleRepoNames } from "./scale.ts";
+import { orgItems, paginate, SCALE_ORG, scaleEnvironments, scaleRepoNames } from "./scale.ts";
 
 interface Item {
   value: string;
@@ -35,19 +35,28 @@ const day = 24 * 3600 * 1000;
 const table = (rows: Record<string, string>): Table =>
   new Map(Object.entries(rows).map(([name, value], i) => [name, { value, updatedAt: Date.now() - (i + 1) * day }]));
 
-/** Any organization of the mock tenants has these pages; "acme" is the one with org-scale data. */
-const knownOrg = (login: string) => /^[a-z0-9-]+$/.test(login) && login !== "e2e";
+/** The mock session: who is signed in, the CSRF token, and the viewer's role in an organization (null when it has no tenant). */
+export interface Session {
+  signedIn: boolean;
+  csrf: string;
+  role: (login: string) => "admin" | "member" | null;
+}
 
 /** Environments by `<owner>/<repo>`, in the order of creation. */
 const environments = new Map<string, Map<string, Environment>>();
 
-function seedEnvironments(key: string): Map<string, Environment> {
+/** The environments of `<owner>/<repo>`; the organization-wide list reads them from here too. */
+export function seedEnvironments(key: string): Map<string, Environment> {
   let found = environments.get(key);
   if (!found) {
-    found = new Map([
-      ["production", { branches: ["main"], approval: true, updatedAt: Date.now() - day }],
-      ["staging", { branches: [], approval: false, updatedAt: Date.now() - 2 * day }],
-    ]);
+    found = new Map(
+      key.startsWith(`${SCALE_ORG}/`) && scaleRepoNames().includes(key)
+        ? scaleEnvironments(key)
+        : [
+            ["production", { branches: ["main"], approval: true, updatedAt: Date.now() - day }],
+            ["staging", { branches: [], approval: false, updatedAt: Date.now() - 2 * day }],
+          ],
+    );
     environments.set(key, found);
   }
   return found;
@@ -85,7 +94,19 @@ function seed(key: string, kind: "secrets" | "vars"): Table {
   return found;
 }
 
-export const billing = { card: process.env.MOCK_CARD !== "off", capDollars: 50 };
+/** How many secrets and variables an environment of `<owner>/<repo>` holds. */
+export const environmentCounts = (repository: string, name: string) => ({
+  secrets: seed(`env:${repository}/${name}`, "secrets").size,
+  vars: seed(`env:${repository}/${name}`, "vars").size,
+});
+
+export const billing = { capDollars: 50 };
+
+/** Organizations the mock Polar checkout put a card on. */
+const carded = new Set<string>();
+export const addCard = (org: string) => void carded.add(org.toLowerCase());
+/** Whether the organization has a card: all do unless MOCK_CARD=off, then those that went through the checkout. */
+export const hasCard = (org: string) => process.env.MOCK_CARD !== "off" || carded.has(org.toLowerCase());
 
 const MAX_BYTES = 48 * 1024;
 const NAME_MAX = 100;
@@ -167,7 +188,7 @@ export function handleCiSettings(
   req: IncomingMessage,
   res: ServerResponse,
   path: string,
-  session: { signedIn: boolean; csrf: string },
+  session: Session,
   body: unknown,
   url: URL = new URL("http://localhost/"),
 ): boolean {
@@ -190,7 +211,7 @@ export function handleCiSettings(
   const method = req.method ?? "GET";
 
   // A viewer who cannot manage the scope sees a 404, as the API answers.
-  const known = org ? knownOrg(owner) : (knownOrg(owner) || owner === "e2e") && (repo === "demo" || owner === SCALE_ORG);
+  const known = org ? session.role(owner) === "admin" : (owner === "e2e" || session.role(owner) === "admin") && (repo === "demo" || owner === SCALE_ORG);
   if (!session.signedIn) {
     json(res, 401, { error: "sign in to manage billing" });
     return true;
@@ -208,7 +229,7 @@ export function handleCiSettings(
     const sub = what.slice("billing/".length);
     if (what === "billing" && method === "GET") {
       json(res, 200, {
-        card: billing.card,
+        card: hasCard(owner),
         seconds: 19_200,
         units: 19_200,
         spendCents: Math.floor((19_200 * 2_000) / 60 / 10_000),
