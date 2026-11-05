@@ -268,7 +268,9 @@ async fn runs_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
         DEFAULT_WINDOW_MS,
     )?;
     filter.repo_ids = readable(cx, session, &tenant, admin).await?;
-    let body = run_list(cx, &filter, &query).await?;
+    let mut body = run_list(cx, &filter, &query).await?;
+    // The tabs of the page: the same filters, whatever the status.
+    body["counts"] = json!(store::run_counts(cx.db, &filter).await?);
     Ok(Response::from_json(&body)?)
 }
 

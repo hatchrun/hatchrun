@@ -5,7 +5,7 @@
 //! Runs.
 
 use hatchrun_cloud::db::{Db, params};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use worker::Result;
 
 use super::with_columns;
@@ -398,6 +398,48 @@ pub async fn runs_page(
     );
     let rows = db.all(&page, &bound).await?;
     Ok((rows, total))
+}
+
+/// How many runs a filter holds, by state, for the tabs of a run list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RunCounts {
+    /// Every run the filter holds.
+    pub all: u64,
+    /// Running.
+    pub running: u64,
+    /// Waiting for an approval.
+    pub waiting: u64,
+    /// Completed with `failure`.
+    pub failed: u64,
+    /// Completed with `success`.
+    pub passed: u64,
+}
+
+/// The counts of the runs `filter` holds, whatever its states.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn run_counts(db: &Db, filter: &RunFilter) -> Result<RunCounts> {
+    let mut all_states = filter.clone();
+    all_states.states.clear();
+    let (conditions, bound) = run_where(&all_states);
+    let sql = format!(
+        "SELECT count(*) AS all, \
+         count(*) FILTER (WHERE {running}) AS running, \
+         count(*) FILTER (WHERE {waiting}) AS waiting, \
+         count(*) FILTER (WHERE {failed}) AS failed, \
+         count(*) FILTER (WHERE {passed}) AS passed \
+         FROM ci_runs r, ci_repos p WHERE {conditions}",
+        running = RunStatus::Running.condition(),
+        waiting = RunStatus::Waiting.condition(),
+        failed = RunStatus::Failure.condition(),
+        passed = RunStatus::Success.condition(),
+    );
+    Ok(db
+        .first::<RunCounts>(&sql, &bound)
+        .await?
+        .unwrap_or_default())
 }
 
 /// The newest completed run on the default branch of each repository

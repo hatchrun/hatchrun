@@ -14,7 +14,7 @@
 //!
 //! | Route | Needs | Answer |
 //! | --- | --- | --- |
-//! | `GET /api/ci/orgs/{org}/runs?status=&repo=&branch=&actor=&q=&since=&until=&cursor=&limit=` | org member | `Page` of runs of the repositories the caller may read, last 7 days unless `since` |
+//! | `GET /api/ci/orgs/{org}/runs?status=&repo=&branch=&actor=&q=&since=&until=&cursor=&limit=` | org member | `Page` of runs of the repositories the caller may read, last 7 days unless `since`, plus `counts` by state for the same filters |
 //! | `GET /api/ci/orgs/{org}/needs-you` | org member | `{"approvals", "failing"}` |
 //! | `GET /api/ci/repos/{owner}/{repo}/runs?status=&branch=&actor=&q=&since=&until=&cursor=&limit=` | read | `Page` of runs, newest first |
 //! | `GET /api/ci/runs/{run}` | read | the run and its jobs |

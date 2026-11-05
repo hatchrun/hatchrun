@@ -42,6 +42,22 @@ fn runs_are_filtered_and_counted() {
 
     let all = page(&filter());
     assert_eq!(all.1, 4);
+    // The counts ignore the states of the filter.
+    let mut counted = filter();
+    counted.states = vec![RunStatus::Failure];
+    let counts = db.wait(run_counts(db.db(), &counted)).unwrap();
+    assert_eq!(
+        counts,
+        RunCounts {
+            all: 4,
+            running: 1,
+            waiting: 0,
+            failed: 1,
+            passed: 1
+        }
+    );
+    counted.actors = vec!["hubot".into()];
+    assert_eq!(db.wait(run_counts(db.db(), &counted)).unwrap().all, 1);
     assert_eq!(ids(&all), [tag.id, pr.id, bad.id, ok.id]);
 
     let mut f = filter();

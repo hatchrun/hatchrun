@@ -67,8 +67,8 @@ pub use self::reconciler::{
 };
 pub use self::repos::{RepoRow, delivery_seen, record_delivery, repo, repo_by_name, upsert_repo};
 pub use self::runs::{
-    After, ListedRun, NewRun, RunFilter, RunRow, RunStatus, finish_run, insert_run,
-    latest_on_default, reopen_run_at, run, run_for_delivery, run_started, runs_page,
+    After, ListedRun, NewRun, RunCounts, RunFilter, RunRow, RunStatus, finish_run, insert_run,
+    latest_on_default, reopen_run_at, run, run_counts, run_for_delivery, run_started, runs_page,
 };
 pub use self::secrets::{
     Owner, Put, SealedRow, SecretItem, StaleRow, VarItem, delete_secret, delete_var, job_vars,
