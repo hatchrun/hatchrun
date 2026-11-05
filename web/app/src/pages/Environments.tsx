@@ -53,13 +53,15 @@ export function Environments({ org }: OrgPageProps) {
   const [panel, setPanel] = useState<{ edit: CiOrgEnvironment | null; id: number } | null>(null);
   const panelSeq = useRef(0);
   const openPanel = (edit: CiOrgEnvironment | null) => setPanel({ edit, id: (panelSeq.current += 1) });
-  // A panel belongs to one organization: its repository is that org's.
-  useEffect(() => {
-    setPanel(null);
-    setConfirming(null);
-  }, [org]);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
+  // A panel belongs to one organization: its repository is that org's.
+  const [seenOrg, setSeenOrg] = useState(org);
+  if (seenOrg !== org) {
+    setSeenOrg(org);
+    setPanel(null);
+    setConfirming(null);
+  }
   const [toast, setToast] = useState<string | null>(null);
   const timer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(timer.current), []);
