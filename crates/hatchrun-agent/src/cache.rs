@@ -2,8 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The job cache proxy, for launches whose boot document has a `cache`
-//! field.
+//! The job cache proxy, for jobs whose document has a `cache` field.
 //!
 //! `actions/cache`, the `actions/setup-*` caches and `BuildKit`'s
 //! `type=gha` backend talk to GitHub's cache v2 service: three Twirp
@@ -24,15 +23,14 @@
 //! - the Azure upload to that URL goes to S3 as parts (see [`blob`]).
 //! - a finalize completes the multipart upload.
 //!
-//! A job of hatchrun CI also gets the artifact service
+//! A job also gets the artifact service
 //! `actions/upload-artifact` and `download-artifact` use (see
 //! [`artifact`]): the same Azure Blob upload and download URLs, backed by
 //! the control plane's `/v1/agent/artifacts`. Without an artifact
-//! service, as on a hosted runner, every other Twirp call under
-//! `ACTIONS_RESULTS_URL` is passed through to GitHub's results service.
+//! service, every other Twirp call under `ACTIONS_RESULTS_URL` is passed
+//! through to GitHub's results service.
 //!
-//! The runner is pointed here by [`patch`]. A lookup that fails is a
-//! miss, and a save that fails is an error the client turns into a
+//! A lookup that fails is a miss, and a save that fails is an error the client turns into a
 //! warning.
 
 mod artifact;
@@ -40,7 +38,6 @@ mod artifact_twirp;
 mod blob;
 mod cloud;
 mod download;
-pub mod patch;
 mod rpc;
 mod twirp;
 mod upload;
@@ -75,8 +72,7 @@ use self::twirp::Rpc;
 use self::upload::put;
 use crate::source;
 
-/// GitHub's results service, the `ACTIONS_RESULTS_URL` the runner gets
-/// on github.com.
+/// GitHub's results service, the `ACTIONS_RESULTS_URL` on github.com.
 const RESULTS_URL: &str = "https://results-receiver.actions.githubusercontent.com";
 /// Request headers passed through to the results service.
 const FORWARDED: [header::HeaderName; 4] = [
@@ -226,19 +222,6 @@ impl Upload {
 }
 
 impl Proxy {
-    /// Starts the proxy on `ip`, for the boot document's cache.
-    ///
-    /// # Errors
-    ///
-    /// When the cache URL is unusable or the port cannot be bound.
-    pub async fn start(cache: source::Cache, ip: IpAddr) -> Result<Self> {
-        let services = Services {
-            cache: Some(cache),
-            artifacts: None,
-        };
-        Self::start_with(services, SocketAddr::new(ip, PORT), RESULTS_URL).await
-    }
-
     /// Starts the proxy on `ip` for the services a job's document
     /// names: the cache, the artifacts, or both.
     ///

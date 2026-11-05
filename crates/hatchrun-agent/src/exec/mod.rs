@@ -41,8 +41,8 @@ use self::layout::Layout;
 use self::mask::Masker;
 use self::sink::Sink;
 use self::step::{Background, Budget, Exit, Process, StepOutput, spawn};
+use crate::account::{DEFAULT_PATH, home_of};
 use crate::envfile;
-use crate::runner::{DEFAULT_PATH, home_of};
 
 /// How long a cancelled job may keep running steps that still run,
 /// such as `always()` steps and `post` hooks, in `--minute`s.
