@@ -16,6 +16,7 @@ import { Kit } from "./pages/Kit";
 import { Repos } from "./pages/Repos";
 import { Runs } from "./pages/Runs";
 import { Secrets } from "./pages/Secrets";
+import { Audit } from "./pages/Audit";
 import { Setup } from "./pages/Setup";
 import { SignIn } from "./pages/SignIn";
 import { legacyCiRedirect, matchOrg, navigate, useLocation, type OrgRoute } from "./router";
@@ -131,6 +132,8 @@ function OrgPage({ session, tenant, route }: { session: Session; tenant: Tenant;
       return <Secrets {...props} />;
     case "environments":
       return <Environments {...props} />;
+    case "audit":
+      return <Audit {...props} />;
     case "kit":
       return <Kit {...props} />;
     case "setup":

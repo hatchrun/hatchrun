@@ -538,12 +538,13 @@ function activityOf(org: string, range: "24h" | "7d", repos: string[]) {
   const count = range === "24h" ? 24 : 28;
   const end = Math.ceil(Date.now() / bucketMs) * bucketMs;
   const buckets = Array.from({ length: count }, (_, n) => ({ at: end - (count - n) * bucketMs, started: 0, passed: 0, failed: 0 }));
+  const start = end - count * bucketMs;
   if (org === SCALE_ORG) {
     for (let i = 0; i < RUNS; i++) {
       const run = runAt(i);
-      if (run.created_at < buckets[0]!.at) break;
+      if (run.created_at < start) break;
       if (repos.length && !repos.includes(run.repository)) continue;
-      const bucket = buckets[Math.floor((run.created_at - buckets[0]!.at) / bucketMs)];
+      const bucket = buckets[Math.floor((run.created_at - start) / bucketMs)];
       if (!bucket) continue;
       bucket.started++;
       if (run.conclusion === "success") bucket.passed++;
