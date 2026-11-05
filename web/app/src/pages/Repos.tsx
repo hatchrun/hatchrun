@@ -15,7 +15,8 @@ import { abbreviate, ago } from "@/lib/format";
 import { repoRunsUrl, runUrl } from "@/lib/urls";
 import { cn } from "@/lib/utils";
 import { useLoad, useNow } from "@/load";
-import { Link, setQuery, useQuery } from "@/router";
+import { Link, navigate, setQuery, useQuery } from "@/router";
+import { DispatchDialog } from "./ci/DispatchDialog";
 import type { OrgPageProps } from "./types";
 
 const TH = "cap px-3 py-2.5 text-left font-normal";
@@ -32,6 +33,7 @@ export function Repos({ org }: OrgPageProps) {
   const showId = useQuery("show");
   const show = SHOW.find((item) => item.id === showId) ?? SHOW[0];
   const [draft, setDraft] = useState<string | null>(null);
+  const [dispatch, setDispatch] = useState<string | null>(null);
   const cursors = useCursors();
   const now = useNow(30_000);
 
@@ -134,6 +136,15 @@ export function Repos({ org }: OrgPageProps) {
                             <Link href={repoRunsUrl(repo.name)} className="font-mono text-[13px] text-fg underline decoration-control underline-offset-3 hover:decoration-fg-3">
                               View runs
                             </Link>
+                            {repo.enabled && (
+                              <button
+                                type="button"
+                                onClick={() => setDispatch(repo.name)}
+                                className="font-mono text-[13px] text-fg underline decoration-control underline-offset-3 hover:decoration-fg-3"
+                              >
+                                Run workflow
+                              </button>
+                            )}
                           </span>
                         </td>
                       </tr>
@@ -151,6 +162,15 @@ export function Repos({ org }: OrgPageProps) {
           </div>
         )}
       </section>
+      {dispatch && (
+        <DispatchDialog
+          owner={dispatch.slice(0, dispatch.indexOf("/"))}
+          repo={dispatch.slice(dispatch.indexOf("/") + 1)}
+          open
+          onOpenChange={(open) => !open && setDispatch(null)}
+          onStarted={(run) => navigate(runUrl(dispatch, run))}
+        />
+      )}
     </Page>
   );
 }
