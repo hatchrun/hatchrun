@@ -70,7 +70,7 @@ export function Runs({ org }: OrgPageProps) {
   useEffect(() => {
     cursors.reset();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [listKey]);
+  }, [org, listKey]);
 
   const live = counts !== null && ((counts[1] ?? 0) > 0 || (counts[2] ?? 0) > 0);
   useEffect(() => {

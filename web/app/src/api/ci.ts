@@ -18,6 +18,8 @@ export interface CiJobCounts {
   failed: number;
   running: number;
   waiting: number;
+  cancelled: number;
+  skipped: number;
 }
 
 /** A run of the orchestrator. */
@@ -74,6 +76,8 @@ export interface CiJob {
 }
 
 export interface CiRunDetail {
+  /** What the viewer may do with the repository. */
+  access: "read" | "write" | "admin";
   run: CiRun;
   jobs: CiJob[];
 }

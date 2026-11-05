@@ -172,7 +172,9 @@ fn job_counts_and_approvals() {
             passed: 1,
             failed: 1,
             running: 1,
-            waiting: 1
+            waiting: 1,
+            cancelled: 0,
+            skipped: 0
         }
     );
     assert!(!counts.contains_key(&999));

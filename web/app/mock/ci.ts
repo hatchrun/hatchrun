@@ -183,6 +183,8 @@ function countsOf(id: number) {
     failed: own.filter((job) => job.conclusion === "failure").length,
     running: own.filter((job) => job.status === "in_progress").length,
     waiting: own.filter((job) => job.held !== null).length,
+    cancelled: own.filter((job) => job.conclusion === "cancelled").length,
+    skipped: own.filter((job) => job.conclusion === "skipped").length,
   };
 }
 
@@ -314,7 +316,7 @@ export async function handleCi(
     if (!wanted) {
       return hidden();
     }
-    return json(res, 200, { run: wanted, jobs: jobs.filter((job) => job.run === wanted.id).map(jobJson) });
+    return json(res, 200, { access: "admin", run: wanted, jobs: jobs.filter((job) => job.run === wanted.id).map(jobJson) });
   }
 
   if ((found = /^runs\/(\d+)\/artifacts(?:\/(\d+))?$/.exec(path))) {
