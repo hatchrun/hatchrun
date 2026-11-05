@@ -78,14 +78,13 @@ pub(crate) async fn join_listed_beta(db: &Db, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a checkout or portal request asked to come back to the CI
-/// page: its query holds `return=ci`.
-pub(crate) fn back_to_ci(query: Option<&str>) -> bool {
-    query.is_some_and(|query| query.split('&').any(|pair| pair == "return=ci"))
+/// Where checkout and the portal send the customer back to.
+fn billing_page(ctx: &Ctx<'_>, org: &str) -> String {
+    format!("{}/o/{org}/settings/billing", ctx.config.app_url)
 }
 
 /// `POST /api/tenants/<org>/checkout`
-pub(crate) async fn checkout(ctx: &Ctx<'_>, org: &str, back_to_ci: bool) -> Answer {
+pub(crate) async fn checkout(ctx: &Ctx<'_>, org: &str) -> Answer {
     let row = authorize(ctx, org).await?;
     let polar = Polar::read(ctx.env)?;
     let card = ctx
@@ -99,11 +98,7 @@ pub(crate) async fn checkout(ctx: &Ctx<'_>, org: &str, back_to_ci: bool) -> Answ
             format!("{} already has a card on file", row.org_login),
         ));
     }
-    let page = if back_to_ci {
-        format!("{}/o/{}/ci", ctx.config.app_url, row.org_login)
-    } else {
-        format!("{}/o/{}/settings", ctx.config.app_url, row.org_login)
-    };
+    let page = billing_page(ctx, &row.org_login);
     let url = polar::checkout_url(
         &send(&polar::checkout(
             &polar.api,
@@ -120,14 +115,10 @@ pub(crate) async fn checkout(ctx: &Ctx<'_>, org: &str, back_to_ci: bool) -> Answ
 }
 
 /// `POST /api/tenants/<org>/portal`
-pub(crate) async fn portal(ctx: &Ctx<'_>, org: &str, back_to_ci: bool) -> Answer {
+pub(crate) async fn portal(ctx: &Ctx<'_>, org: &str) -> Answer {
     let row = authorize(ctx, org).await?;
     let polar = Polar::read(ctx.env)?;
-    let page = if back_to_ci {
-        format!("{}/o/{}/ci", ctx.config.app_url, row.org_login)
-    } else {
-        format!("{}/o/{}", ctx.config.app_url, row.org_login)
-    };
+    let page = billing_page(ctx, &row.org_login);
     let url = polar::portal_url(
         &send(&polar::customer_session(
             &polar.api,
@@ -314,14 +305,6 @@ mod tests {
         let row = subscription(&db, "t1").unwrap();
         assert_eq!(row.status, "active");
         assert!(subscription(&db, "t2").is_none());
-    }
-
-    #[test]
-    fn back_to_ci_reads_the_query() {
-        assert!(back_to_ci(Some("return=ci")));
-        assert!(back_to_ci(Some("a=1&return=ci")));
-        assert!(!back_to_ci(Some("return=settings")));
-        assert!(!back_to_ci(None));
     }
 
     fn subscription_of(id: &str, tenant: &str, status: &str) -> Subscription {
