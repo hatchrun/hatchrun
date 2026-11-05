@@ -274,6 +274,62 @@ async fn runs_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
     Ok(Response::from_json(&body)?)
 }
 
+/// The buckets of an activity range: their length in milliseconds and
+/// how many.
+fn activity_range(word: Option<&str>) -> std::result::Result<(u64, u32), Stop> {
+    match word {
+        None | Some("24h") => Ok((3_600_000, 24)),
+        Some("7d") => Ok((6 * 3_600_000, 28)),
+        Some(_) => stop(400, "range is 24h or 7d"),
+    }
+}
+
+/// `GET /orgs/{org}/activity`.
+pub(crate) async fn activity(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Result<Served> {
+    finish(activity_done(cx, org, query).await)
+}
+
+async fn activity_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
+    let query = Query::parse(query);
+    let (bucket_ms, count) = activity_range(query.get("range"))?;
+    let repo = query.get("repo");
+    if repo.is_some_and(|repo| {
+        repo.split_once('/')
+            .is_none_or(|(owner, name_)| name(owner).is_none() || name(name_).is_none())
+    }) {
+        return refuse(400, "repo is owner/name");
+    }
+    let (tenant, admin, session) = member_tenant(cx, org).await?;
+    let repo_ids = readable(cx, session, &tenant, admin).await?;
+    // The last bucket ends at the next whole bucket, so the chart's
+    // columns keep their place as time passes.
+    let end = now_ms().div_ceil(bucket_ms) * bucket_ms;
+    let start = end - bucket_ms * u64::from(count);
+    let buckets = store::activity(cx.db, &repo_ids, repo, start, bucket_ms, count).await?;
+    let (running, queued) = store::job_load(cx.db, &repo_ids, repo).await?;
+    let buckets: Vec<Value> = buckets
+        .iter()
+        .zip(0_u64..)
+        .map(|(bucket, at)| {
+            json!({
+                "at": start + at * bucket_ms,
+                "started": bucket.started,
+                "passed": bucket.passed,
+                "failed": bucket.failed,
+            })
+        })
+        .collect();
+    Ok(Response::from_json(&json!({
+        "bucket_ms": bucket_ms,
+        "buckets": buckets,
+        "concurrency": {
+            "running": running,
+            "queued": queued,
+            "limit": hatchrun_workflow::templates::MAX_RUNNING_JOBS,
+        },
+    }))?)
+}
+
 /// A job that waits for the caller's approval, as `needs-you` lists it.
 fn approval_json(job: &store::ApprovalJob, counts: &HashMap<u64, JobCounts>) -> Value {
     json!({
@@ -705,6 +761,14 @@ mod tests {
     }
 
     #[test]
+    fn activity_ranges() {
+        assert_eq!(activity_range(None).unwrap(), (3_600_000, 24));
+        assert_eq!(activity_range(Some("24h")).unwrap(), (3_600_000, 24));
+        assert_eq!(activity_range(Some("7d")).unwrap(), (21_600_000, 28));
+        assert_eq!(activity_range(Some("30d")).unwrap_err().0, 400);
+    }
+
+    #[test]
     fn enable_bodies() {
         let ok = parse_enabled(
             br#"{"all":false,"add":["acme/app"],"remove":["acme/web"]}"#,
@@ -720,7 +784,7 @@ mod tests {
         let add = parse_enabled(br#"{"add":["acme/app"]}"#, 1000).unwrap();
         assert_eq!(add.all, None);
         for body in [
-            &br#"{}"#[..],
+            &br"{}"[..],
             br#"{"add":[]}"#,
             br#"{"all":true,"add":["acme/app"]}"#,
             br#"{"add":["app"]}"#,

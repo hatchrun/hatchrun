@@ -15,6 +15,7 @@
 //! | Route | Needs | Answer |
 //! | --- | --- | --- |
 //! | `GET /api/ci/orgs/{org}/runs?status=&repo=&branch=&actor=&q=&since=&until=&cursor=&limit=` | org member | `Page` of runs of the repositories the caller may read, last 7 days unless `since`, plus `counts` by state for the same filters |
+//! | `GET /api/ci/orgs/{org}/activity?range=24h\|7d&repo=` | org member | `{"bucket_ms", "buckets": [{"at", "started", "passed", "failed"}], "concurrency": {"running", "queued", "limit"}}` for the repositories the caller may read |
 //! | `GET /api/ci/orgs/{org}/needs-you` | org member | `{"approvals", "failing"}` |
 //! | `GET /api/ci/repos/{owner}/{repo}/runs?status=&branch=&actor=&q=&since=&until=&cursor=&limit=` | read | `Page` of runs, newest first |
 //! | `GET /api/ci/runs/{run}` | read | the run and its jobs |
@@ -92,6 +93,11 @@ const MAX_REF: usize = 255;
 pub enum Route<'a> {
     /// An organization's runs, in the repositories the caller may read.
     OrgRuns {
+        /// The organization.
+        org: &'a str,
+    },
+    /// An organization's runs and jobs over time.
+    OrgActivity {
         /// The organization.
         org: &'a str,
     },
@@ -173,6 +179,7 @@ pub fn route(path: &str) -> Option<Route<'_>> {
     let parts: Vec<&str> = rest.split('/').collect();
     match parts.as_slice() {
         ["orgs", org, "runs"] => Some(Route::OrgRuns { org: login(org)? }),
+        ["orgs", org, "activity"] => Some(Route::OrgActivity { org: login(org)? }),
         ["orgs", org, "needs-you"] => Some(Route::NeedsYou { org: login(org)? }),
         ["repos", owner, repo, "runs"] => Some(Route::Runs {
             owner: name(owner)?,
@@ -676,6 +683,7 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
     };
     match route {
         Route::OrgRuns { org } => org_api::runs(&cx, org, query.as_deref()).await,
+        Route::OrgActivity { org } => org_api::activity(&cx, org, query.as_deref()).await,
         Route::NeedsYou { org } => org_api::needs_you(&cx, org).await,
         Route::Runs { owner, repo } => cx.runs(owner, repo, query.as_deref()).await,
         Route::Run(run) => cx.run(run).await,
@@ -1484,6 +1492,10 @@ mod tests {
         assert_eq!(
             route("/api/ci/orgs/acme/runs"),
             Some(Route::OrgRuns { org: "acme" })
+        );
+        assert_eq!(
+            route("/api/ci/orgs/acme/activity"),
+            Some(Route::OrgActivity { org: "acme" })
         );
         assert_eq!(
             route("/api/ci/orgs/acme/needs-you"),

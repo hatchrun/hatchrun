@@ -233,7 +233,8 @@ pub fn default_card(response: &Response) -> Result<Option<Card>, String> {
         kind: String,
         #[serde(default)]
         is_default: bool,
-        method_metadata: Option<Card>,
+        #[serde(rename = "method_metadata")]
+        card: Option<Card>,
     }
     #[derive(Deserialize)]
     struct List {
@@ -243,14 +244,14 @@ pub fn default_card(response: &Response) -> Result<Option<Card>, String> {
     let mut cards: Vec<Method> = list
         .items
         .into_iter()
-        .filter(|method| method.kind == "card" && method.method_metadata.is_some())
+        .filter(|method| method.kind == "card" && method.card.is_some())
         .collect();
     let at = cards
         .iter()
         .position(|method| method.is_default)
         .unwrap_or(0);
     Ok((!cards.is_empty())
-        .then(|| cards.swap_remove(at).method_metadata)
+        .then(|| cards.swap_remove(at).card)
         .flatten())
 }
 

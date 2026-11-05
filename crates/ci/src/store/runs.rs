@@ -406,6 +406,104 @@ pub async fn runs_page(
     Ok((rows, total))
 }
 
+/// What one bucket of the activity chart holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Bucket {
+    /// Runs recorded in it.
+    pub started: u64,
+    /// Runs that completed in it with `success`.
+    pub passed: u64,
+    /// Runs that completed in it with `failure`.
+    pub failed: u64,
+}
+
+/// The runs of `repo_ids` (and of the repository `repo`, `owner/name`,
+/// when given) per bucket of `bucket_ms` milliseconds, `count` buckets
+/// from `start`. A run counts as started at its creation and as passed
+/// or failed at its completion.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn activity(
+    db: &Db,
+    repo_ids: &[u64],
+    repo: Option<&str>,
+    start: u64,
+    bucket_ms: u64,
+    count: u32,
+) -> Result<Vec<Bucket>> {
+    #[derive(Deserialize)]
+    struct Row {
+        kind: String,
+        bucket: u64,
+        n: u64,
+    }
+    let scope = "r.repo_id = ANY (string_to_array($1, ',')::bigint[]) \
+         AND ($2::text IS NULL OR lower(p.full_name) = lower($2::text)) \
+         AND p.id = r.repo_id AND p.tenant_id = r.tenant_id";
+    let sql = format!(
+        "SELECT 'started' AS kind, ((r.created_at - $3) / $4)::bigint AS bucket, \
+           count(*)::bigint AS n \
+         FROM ci_runs r, ci_repos p WHERE {scope} \
+           AND r.created_at >= $3 AND r.created_at < $3 + $4 * $5 GROUP BY 2 \
+         UNION ALL \
+         SELECT r.conclusion AS kind, ((r.completed_at - $3) / $4)::bigint AS bucket, \
+           count(*)::bigint AS n \
+         FROM ci_runs r, ci_repos p WHERE {scope} \
+           AND r.conclusion IN ('success', 'failure') \
+           AND r.completed_at >= $3 AND r.completed_at < $3 + $4 * $5 GROUP BY 1, 2"
+    );
+    let ids: Vec<String> = repo_ids.iter().map(u64::to_string).collect();
+    let rows: Vec<Row> = db
+        .all(&sql, &params![ids.join(","), repo, start, bucket_ms, count])
+        .await?;
+    let mut buckets = vec![Bucket::default(); count as usize];
+    for row in rows {
+        let Some(bucket) = usize::try_from(row.bucket)
+            .ok()
+            .and_then(|at| buckets.get_mut(at))
+        else {
+            continue;
+        };
+        match row.kind.as_str() {
+            "started" => bucket.started = row.n,
+            "success" => bucket.passed = row.n,
+            _ => bucket.failed = row.n,
+        }
+    }
+    Ok(buckets)
+}
+
+/// The jobs of `repo_ids` (and of `repo`, when given) that run now and
+/// that wait for a launch.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn job_load(db: &Db, repo_ids: &[u64], repo: Option<&str>) -> Result<(u64, u64)> {
+    #[derive(Deserialize)]
+    struct Row {
+        running: u64,
+        queued: u64,
+    }
+    let ids: Vec<String> = repo_ids.iter().map(u64::to_string).collect();
+    let row = db
+        .first::<Row>(
+            "SELECT count(*) FILTER (WHERE j.status IN ('launching', 'launched', 'running'))::bigint \
+               AS running, \
+             count(*) FILTER (WHERE j.status = 'queued')::bigint AS queued \
+             FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id \
+             JOIN ci_repos p ON p.id = r.repo_id AND p.tenant_id = r.tenant_id \
+             WHERE r.repo_id = ANY (string_to_array($1, ',')::bigint[]) \
+               AND ($2::text IS NULL OR lower(p.full_name) = lower($2::text)) \
+               AND j.status IN ('queued', 'launching', 'launched', 'running')",
+            &params![ids.join(","), repo],
+        )
+        .await?;
+    Ok(row.map_or((0, 0), |row| (row.running, row.queued)))
+}
+
 /// How many runs a filter holds, by state, for the tabs of a run list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RunCounts {
