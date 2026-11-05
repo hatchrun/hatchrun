@@ -431,6 +431,32 @@ fn jobs_come_back_in_plan_order() {
 }
 
 #[test]
+fn jobs_keep_their_needs_and_runs_their_message() {
+    let db = setup();
+    let mut asked = new_run("d", "ci", 1);
+    asked.message = Some("fix the build".into());
+    let run = db.wait(insert_run(db.db(), &asked)).unwrap().unwrap();
+    assert_eq!(run.message.as_deref(), Some("fix the build"));
+    let mut deploy = new_job("deploy");
+    deploy.needs = vec!["test".into(), "build".into()];
+    db.wait(insert_jobs(
+        db.db(),
+        run.id,
+        &[new_job("test"), new_job("build"), deploy],
+        2,
+    ))
+    .unwrap();
+    let jobs = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
+    assert_eq!(jobs[0].needs, serde_json::json!([]));
+    assert_eq!(jobs[2].needs, serde_json::json!(["test", "build"]));
+    let plain = db
+        .wait(insert_run(db.db(), &new_run("e", "ci", 1)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(plain.message, None);
+}
+
+#[test]
 fn insert_jobs_keeps_template_permissions_and_refs() {
     let db = setup();
     let run = db

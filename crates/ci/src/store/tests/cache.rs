@@ -402,6 +402,7 @@ fn a_pull_request_run_records_its_base_branch() {
             db.db(),
             &NewRun {
                 base_ref: Some("release".into()),
+                message: None,
                 ..new_run("pr", "ci", 1)
             },
         ))

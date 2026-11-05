@@ -30,7 +30,7 @@ use crate::api::{Cx, Served, Stop, name, no_content, now_ms, reply, run_json, st
 use crate::billing;
 use crate::installation;
 use crate::page::{self, Query};
-use crate::settings_api::admin_tenant;
+use crate::settings_api::{admin_tenant, audit};
 use crate::store::{
     self, After, JobCounts, ListedRun, RepoFilter, RepoVisibility, RunFilter, RunStatus, TenantRow,
 };
@@ -42,7 +42,7 @@ const DEFAULT_WINDOW_MS: u64 = 7 * 86_400_000;
 /// The most entries of each list of the needs-attention answer.
 const NEEDS_LIMIT: u32 = 100;
 
-/// The most repositories one `PUT .../repos/enabled` names.
+/// The most repositories one `PATCH .../repos/enabled` names.
 const MAX_ENABLED: usize = 5000;
 
 /// The longest search text, in characters.
@@ -393,15 +393,20 @@ async fn repos_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
     ))?)
 }
 
-/// The body of `PUT .../repos/enabled`.
+/// The body of `PATCH .../repos/enabled`. `all` sets every repository
+/// on or off; `add` and `remove` then turn the named ones on or off.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnabledBody {
-    all: bool,
-    repos: Vec<String>,
+    #[serde(default)]
+    all: Option<bool>,
+    #[serde(default)]
+    add: Vec<String>,
+    #[serde(default)]
+    remove: Vec<String>,
 }
 
-/// The body of an enable `PUT` of at most `max_body` bytes.
+/// The body of an enable `PATCH` of at most `max_body` bytes.
 fn parse_enabled(body: &[u8], max_body: usize) -> std::result::Result<EnabledBody, Stop> {
     if body.len() > max_body {
         return stop(413, "the request is too large");
@@ -409,13 +414,19 @@ fn parse_enabled(body: &[u8], max_body: usize) -> std::result::Result<EnabledBod
     let Ok(asked) = serde_json::from_slice::<EnabledBody>(body) else {
         return stop(
             400,
-            "expected {\"all\": false, \"repos\": [\"owner/repo\"]}",
+            "expected {\"all\": false, \"add\": [\"owner/repo\"], \"remove\": [\"owner/repo\"]}",
         );
     };
-    if asked.repos.len() > MAX_ENABLED {
+    if asked.all.is_none() && asked.add.is_empty() && asked.remove.is_empty() {
+        return stop(400, "name all, add or remove");
+    }
+    if asked.all == Some(true) && !(asked.add.is_empty() && asked.remove.is_empty()) {
+        return stop(400, "all cannot be combined with add or remove");
+    }
+    if asked.add.len() > MAX_ENABLED || asked.remove.len() > MAX_ENABLED {
         return stop(422, format!("at most {MAX_ENABLED} repositories"));
     }
-    let bad = asked.repos.iter().find(|repo| {
+    let bad = asked.add.iter().chain(&asked.remove).find(|repo| {
         repo.split_once('/')
             .is_none_or(|(owner, name_)| name(owner).is_none() || name(name_).is_none())
     });
@@ -425,31 +436,117 @@ fn parse_enabled(body: &[u8], max_body: usize) -> std::result::Result<EnabledBod
     Ok(asked)
 }
 
-/// `PUT /orgs/{org}/repos/enabled`.
-pub(crate) async fn set_enabled(
+/// What the audit row of an enable change says: `all` or `none`, then
+/// how many repositories were added and removed.
+fn enabled_target(asked: &EnabledBody) -> String {
+    let mut parts = Vec::new();
+    match asked.all {
+        Some(true) => parts.push("all".to_owned()),
+        Some(false) => parts.push("none".to_owned()),
+        None => {}
+    }
+    if !asked.add.is_empty() {
+        parts.push(format!("+{}", asked.add.len()));
+    }
+    if !asked.remove.is_empty() {
+        parts.push(format!("-{}", asked.remove.len()));
+    }
+    parts.join(" ")
+}
+
+/// `PATCH /orgs/{org}/repos/enabled`.
+pub(crate) async fn patch_enabled(
     cx: &Cx<'_>,
     org: &str,
     req: &mut Request,
     max_body: usize,
 ) -> Result<Served> {
-    finish(set_enabled_done(cx, org, req, max_body).await)
+    finish(patch_enabled_done(cx, org, req, max_body).await)
 }
 
-async fn set_enabled_done(cx: &Cx<'_>, org: &str, req: &mut Request, max_body: usize) -> Done {
+async fn patch_enabled_done(cx: &Cx<'_>, org: &str, req: &mut Request, max_body: usize) -> Done {
     let tenant = admin_of(cx, org).await?;
     let body = req.bytes().await?;
     let asked = parse_enabled(&body, max_body)?;
     installation::ensure(cx.env, cx.db, cx.settings, &tenant.id, now_ms()).await?;
-    let unknown = store::unknown_repos(cx.db, &tenant.id, &asked.repos).await?;
-    if !asked.all && !unknown.is_empty() {
+    let named: Vec<String> = asked.add.iter().chain(&asked.remove).cloned().collect();
+    let unknown = store::unknown_repos(cx.db, &tenant.id, &named).await?;
+    if !unknown.is_empty() {
         let shown: Vec<&str> = unknown.iter().take(5).map(String::as_str).collect();
         return refuse(
             422,
             format!("not repositories of the installation: {}", shown.join(", ")),
         );
     }
-    store::set_enabled(cx.db, &tenant.id, asked.all, &asked.repos).await?;
+    // Turning a repository off while every repository runs leaves that
+    // mode, or the repository would keep running.
+    let all = match asked.all {
+        None if !asked.remove.is_empty() => Some(false),
+        other => other,
+    };
+    store::patch_enabled(cx.db, &tenant.id, all, &asked.add, &asked.remove).await?;
+    audit(
+        cx,
+        &tenant.id,
+        store::Action::ReposEnabled,
+        "org",
+        None,
+        &enabled_target(&asked),
+    )
+    .await?;
     Ok(no_content()?)
+}
+
+/// `GET /orgs/{org}/audit`: the changes to the organization's
+/// settings, newest first. The cursor holds the id of the last row
+/// shown.
+pub(crate) async fn audit_list(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Result<Served> {
+    finish(audit_done(cx, org, query).await)
+}
+
+async fn audit_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
+    let query = Query::parse(query);
+    let tenant = admin_of(cx, org).await?;
+    let limit = query.limit()?;
+    let before = match query.cursor()?.as_deref() {
+        None => None,
+        Some(&[id]) => Some(id),
+        Some(_) => return refuse(400, "the cursor is not valid"),
+    };
+    let repo = query.get("repo");
+    if repo.is_some_and(|repo| {
+        repo.split_once('/')
+            .is_none_or(|(owner, name_)| name(owner).is_none() || name(name_).is_none())
+    }) {
+        return refuse(400, "repo is owner/name");
+    }
+    // One more than the page: its existence says there is a next page.
+    let (mut rows, total) = store::audit_page(cx.db, &tenant.id, repo, before, limit + 1).await?;
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next = rows
+        .last()
+        .filter(|_| more)
+        .map(|last| page::encode(&[last.id]));
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "at": row.at,
+                "actor": row.actor,
+                "action": row.action,
+                "scope": row.scope,
+                "repo": row.repo,
+                "target": row.target,
+            })
+        })
+        .collect();
+    Ok(Response::from_json(&page::page(
+        &items,
+        total,
+        next.as_deref(),
+    ))?)
 }
 
 /// `GET /orgs/{org}/setup`.
@@ -609,23 +706,31 @@ mod tests {
 
     #[test]
     fn enable_bodies() {
-        let ok = parse_enabled(br#"{"all":false,"repos":["acme/app"]}"#, 1000).unwrap();
-        assert!(!ok.all);
-        assert_eq!(ok.repos, ["acme/app"]);
+        let ok = parse_enabled(
+            br#"{"all":false,"add":["acme/app"],"remove":["acme/web"]}"#,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(ok.all, Some(false));
+        assert_eq!(ok.add, ["acme/app"]);
+        assert_eq!(ok.remove, ["acme/web"]);
+        assert_eq!(enabled_target(&ok), "none +1 -1");
+        let all = parse_enabled(br#"{"all":true}"#, 1000).unwrap();
+        assert_eq!(enabled_target(&all), "all");
+        let add = parse_enabled(br#"{"add":["acme/app"]}"#, 1000).unwrap();
+        assert_eq!(add.all, None);
         for body in [
-            &br#"{"all":false}"#[..],
-            br#"{"all":false,"repos":["app"]}"#,
-            br#"{"all":false,"repos":[],"x":1}"#,
+            &br#"{}"#[..],
+            br#"{"add":[]}"#,
+            br#"{"all":true,"add":["acme/app"]}"#,
+            br#"{"add":["app"]}"#,
+            br#"{"remove":["acme/a/b"]}"#,
+            br#"{"all":false,"repos":[]}"#,
             b"nope",
         ] {
             assert_eq!(parse_enabled(body, 1000).unwrap_err().0, 400);
         }
-        assert_eq!(
-            parse_enabled(br#"{"all":true,"repos":[]}"#, 5)
-                .unwrap_err()
-                .0,
-            413
-        );
+        assert_eq!(parse_enabled(br#"{"all":true}"#, 5).unwrap_err().0, 413);
     }
 
     #[test]

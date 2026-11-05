@@ -454,6 +454,7 @@ pub(crate) fn run_json(run: &RunRow, repository: &str, jobs: JobCounts) -> Value
         "branch": run.branch(),
         "sha": run.sha,
         "actor": run.actor,
+        "message": run.message,
         "status": run.status,
         "conclusion": run.conclusion,
         "created_at": run.created_at,
@@ -506,6 +507,7 @@ fn job_json(row: &JobRow, live: &BTreeMap<u64, Value>) -> Value {
         "id": row.id,
         "plan_id": row.plan_id,
         "name": row.name,
+        "needs": row.needs,
         "status": row.status,
         "conclusion": row.conclusion,
         "attempt": row.attempt,
@@ -1839,7 +1841,7 @@ workflows:
             "next_launch_at": null, "timeout_minutes": 10, "updated_at": 0,
             "heartbeat_at": null, "started_at": null, "completed_at": null,
             "steps": steps.to_string(), "log_key": null, "template": "ubuntu-latest",
-            "token_permissions": "{}", "secret_refs": "{\"all\":false,\"names\":[]}"
+            "token_permissions": "{}", "secret_refs": "{\"all\":false,\"names\":[]}", "needs": "[]"
         }))
         .unwrap()
     }

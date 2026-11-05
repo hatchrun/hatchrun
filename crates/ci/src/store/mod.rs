@@ -12,6 +12,7 @@
 //! so are `token_permissions` and `secret_refs`.
 
 mod artifacts;
+mod audit;
 mod billing;
 mod cache;
 mod concurrency;
@@ -29,6 +30,7 @@ pub use self::artifacts::{
     ArtifactRow, Finalized, artifact_by_name, artifact_count, artifacts, delete_artifact,
     drop_pending_artifact, finalize_artifact, pending_artifact, replaced_artifact, start_artifact,
 };
+pub use self::audit::{Action, AuditRow, NewAudit, audit_page, record_audit};
 pub use self::billing::{
     Standing, UnsentUsage, set_spend_cap, standing, tenant_standing, unsent_usage, usage_rejected,
     usage_sent,
@@ -48,8 +50,8 @@ pub use self::environments::{
     put_environment, release_approval_holds,
 };
 pub use self::installation::{
-    LastRun, OrgRepo, RepoFilter, RepoVisibility, SetupRow, installation_synced, repo_enabled,
-    repos_page, set_enabled, sync_installation, tenant_installation, tenant_repo_visibility,
+    LastRun, OrgRepo, RepoFilter, RepoVisibility, SetupRow, installation_synced, patch_enabled,
+    repo_enabled, repos_page, sync_installation, tenant_installation, tenant_repo_visibility,
     tenant_setup, touch_installation_repo, unknown_repos,
 };
 pub use self::jobs::{

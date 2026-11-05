@@ -77,6 +77,7 @@ pub(super) fn new_run(delivery: &str, workflow: &str, now: u64) -> NewRun {
         sha: "abc".into(),
         actor: "octocat".into(),
         base_ref: None,
+        message: None,
         now,
     }
 }
@@ -92,6 +93,7 @@ pub(super) fn new_job(plan_id: &str) -> NewJob {
         environment: None,
         strategy_group: None,
         max_parallel: None,
+        needs: Vec::new(),
     }
 }
 

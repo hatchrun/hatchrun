@@ -14,7 +14,8 @@
 //! | `GET /api/ci/orgs/{org}/vars?q=&cursor=&limit=` | org admin | `Page` of `{"name", "value", "updatedAt", "repositories"}` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/vars/{name}` | org admin, CSRF | `204` |
 //! | `GET /api/ci/orgs/{org}/repos?q=&enabled=&cursor=&limit=` | org member | `Page` of `{"name", "default_branch", "enabled", "last_run"}`, the installation's repositories the caller may read |
-//! | `PUT /api/ci/orgs/{org}/repos/enabled` | org admin, CSRF | `204`, body `{"all", "repos"}` |
+//! | `PATCH /api/ci/orgs/{org}/repos/enabled` | org admin, CSRF | `204`, body `{"all"?, "add"?, "remove"?}` |
+//! | `GET /api/ci/orgs/{org}/audit?repo=&cursor=&limit=` | org admin | `Page` of `{"id", "at", "actor", "action", "scope", "repo", "target"}`, newest first |
 //! | `GET /api/ci/orgs/{org}/setup` | org admin | `{"app", "enabled", "first_run", "billing"}` |
 //! | `GET /api/ci/orgs/{org}/environments?q=&repo=&cursor=&limit=` | org admin | `Page` of `{"repository", "name", "branches", "approval", "updatedAt", "secrets", "vars"}` |
 //! | `GET /api/ci/repos/{owner}/{repo}/environments` | repo admin | `[{"name", "branches", "approval", "updatedAt"}]` |
@@ -107,6 +108,11 @@ pub enum SettingsRoute<'a> {
         /// The organization.
         org: &'a str,
     },
+    /// The changes made to the organization's settings.
+    Audit {
+        /// The organization.
+        org: &'a str,
+    },
     /// Where the organization stands in setting up.
     Setup {
         /// The organization.
@@ -144,10 +150,12 @@ impl SettingsRoute<'_> {
             | SettingsRoute::Secrets(_)
             | SettingsRoute::Vars(_)
             | SettingsRoute::Repos { .. }
+            | SettingsRoute::Audit { .. }
             | SettingsRoute::Setup { .. }
             | SettingsRoute::OrgEnvironments { .. }
             | SettingsRoute::Environments { .. } => *method == Method::Get,
-            SettingsRoute::Cap { .. } | SettingsRoute::EnableRepos { .. } => *method == Method::Put,
+            SettingsRoute::Cap { .. } => *method == Method::Put,
+            SettingsRoute::EnableRepos { .. } => *method == Method::Patch,
             SettingsRoute::Secret(..)
             | SettingsRoute::Var(..)
             | SettingsRoute::Environment { .. } => {
@@ -167,6 +175,7 @@ pub fn find(path: &str) -> Option<SettingsRoute<'_>> {
         ["orgs", org, "billing", "cap"] => Some(SettingsRoute::Cap { org: login(org)? }),
         ["orgs", org, "repos"] => Some(SettingsRoute::Repos { org: login(org)? }),
         ["orgs", org, "repos", "enabled"] => Some(SettingsRoute::EnableRepos { org: login(org)? }),
+        ["orgs", org, "audit"] => Some(SettingsRoute::Audit { org: login(org)? }),
         ["orgs", org, "setup"] => Some(SettingsRoute::Setup { org: login(org)? }),
         ["orgs", org, "environments"] => Some(SettingsRoute::OrgEnvironments { org: login(org)? }),
         ["orgs", org, kind @ ("secrets" | "vars")] => {
@@ -281,8 +290,9 @@ pub(crate) async fn handle(
         SettingsRoute::Cap { org } => cap(cx, org, req, body_cap(&route)).await,
         SettingsRoute::Repos { org } => org_api::repos(cx, org, query).await,
         SettingsRoute::EnableRepos { org } => {
-            org_api::set_enabled(cx, org, req, body_cap(&route)).await
+            org_api::patch_enabled(cx, org, req, body_cap(&route)).await
         }
+        SettingsRoute::Audit { org } => org_api::audit_list(cx, org, query).await,
         SettingsRoute::Setup { org } => org_api::setup(cx, org).await,
         SettingsRoute::OrgEnvironments { org } => org_api::environments(cx, org, query).await,
         SettingsRoute::Environments { owner, repo } => list_environments(cx, owner, repo).await,
@@ -336,6 +346,31 @@ pub(crate) async fn admin_tenant(cx: &Cx<'_>, org: &str) -> Result<Served<Tenant
         Some(tenant) => Ok(Ok(tenant)),
         None => Ok(stop(404, "not found")),
     }
+}
+
+/// Records a change the caller made to `tenant`'s settings.
+pub(crate) async fn audit(
+    cx: &Cx<'_>,
+    tenant: &str,
+    action: store::Action,
+    scope: &str,
+    repo: Option<&str>,
+    target: &str,
+) -> Result<()> {
+    let actor = cx.session.map_or("", |session| session.user.login.as_str());
+    store::record_audit(
+        cx.db,
+        &store::NewAudit {
+            tenant,
+            actor,
+            action,
+            scope,
+            repo,
+            target,
+            now: now_ms(),
+        },
+    )
+    .await
 }
 
 async fn billing_view(cx: &Cx<'_>, org: &str) -> Result<Served> {
@@ -416,6 +451,30 @@ struct Target {
     owner: Owner,
     /// The organization login or `owner/repo`, for messages.
     label: String,
+    /// The repository's `owner/repo`, for a repository or environment.
+    repo: Option<String>,
+    /// The environment's name, for an environment.
+    environment: Option<String>,
+}
+
+impl Target {
+    /// The audit scope: `org`, `repo` or `env`.
+    fn scope(&self) -> &'static str {
+        match self.owner {
+            Owner::Org => "org",
+            Owner::Repo(_) => "repo",
+            Owner::Environment { .. } => "env",
+        }
+    }
+
+    /// The audit target of the row `name`: an environment's rows are
+    /// named `environment/name`.
+    fn audited(&self, name: &str) -> String {
+        match &self.environment {
+            Some(environment) => format!("{environment}/{name}"),
+            None => name.to_owned(),
+        }
+    }
 }
 
 /// The rows `scope` names, when the caller may manage them: an admin of
@@ -427,6 +486,8 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
             tenant: tenant.id,
             owner: Owner::Org,
             label: tenant.org_login,
+            repo: None,
+            environment: None,
         })),
         Scope::Repo { owner, repo } => {
             Ok(cx
@@ -435,7 +496,9 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
                 .map(|repo| Target {
                     tenant: repo.tenant_id,
                     owner: Owner::Repo(repo.id),
-                    label: repo.full_name,
+                    label: repo.full_name.clone(),
+                    repo: Some(repo.full_name),
+                    environment: None,
                 }))
         }
         Scope::Environment {
@@ -457,6 +520,8 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
                     environment_id: found.id,
                 },
                 label: format!("{} environment {}", repo.full_name, found.name),
+                repo: Some(repo.full_name),
+                environment: Some(found.name),
             }))
         }
     }
@@ -685,7 +750,7 @@ async fn put_secret(
         now_ms(),
     )
     .await?;
-    saved(put, &target, Kind::Secrets, max)
+    saved(cx, put, &target, Kind::Secrets, &name, max).await
 }
 
 async fn put_var(
@@ -723,7 +788,7 @@ async fn put_var(
         now_ms(),
     )
     .await?;
-    saved(put, &target, Kind::Vars, max)
+    saved(cx, put, &target, Kind::Vars, &name, max).await
 }
 
 async fn list_environments(cx: &Cx<'_>, owner: &str, repo: &str) -> Result<Served> {
@@ -802,6 +867,15 @@ async fn put_environment(
             ));
         }
     };
+    audit(
+        cx,
+        &repo.tenant_id,
+        store::Action::EnvironmentPut,
+        "repo",
+        Some(&repo.full_name),
+        &row.name,
+    )
+    .await?;
     release_and_wake(cx, repo.id, &row.name, row.approval, false, now).await;
     reply(200, &environment_json(&row)).map(Ok)
 }
@@ -814,6 +888,15 @@ async fn delete_environment(cx: &Cx<'_>, owner: &str, repo: &str, name: &str) ->
     if !store::delete_environment(cx.db, repo.id, name).await? {
         return Ok(stop(404, "not found"));
     }
+    audit(
+        cx,
+        &repo.tenant_id,
+        store::Action::EnvironmentDelete,
+        "repo",
+        Some(&repo.full_name),
+        name,
+    )
+    .await?;
     release_and_wake(cx, repo.id, name, false, true, now_ms()).await;
     no_content().map(Ok)
 }
@@ -864,11 +947,38 @@ async fn release_and_wake(
     }
 }
 
-fn saved(put: Put, target: &Target, kind: Kind, max: u32) -> Result<Served> {
+async fn saved(
+    cx: &Cx<'_>,
+    put: Put,
+    target: &Target,
+    kind: Kind,
+    name: &str,
+    max: u32,
+) -> Result<Served> {
     match put {
-        Put::Saved => no_content().map(Ok),
+        Put::Saved => {
+            let action = match kind {
+                Kind::Secrets => store::Action::SecretPut,
+                Kind::Vars => store::Action::VarPut,
+            };
+            audit_row(cx, target, action, name).await?;
+            no_content().map(Ok)
+        }
         Put::TooMany => Ok(stop(409, too_many_message(&target.label, kind, max))),
     }
+}
+
+/// Records a change to the row `name` of `target`.
+async fn audit_row(cx: &Cx<'_>, target: &Target, action: store::Action, name: &str) -> Result<()> {
+    audit(
+        cx,
+        &target.tenant,
+        action,
+        target.scope(),
+        target.repo.as_deref(),
+        &target.audited(name),
+    )
+    .await
 }
 
 async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result<Served> {
@@ -885,6 +995,11 @@ async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result
         Kind::Vars => store::delete_var(cx.db, &target.tenant, target.owner, &name).await?,
     };
     if existed {
+        let action = match kind {
+            Kind::Secrets => store::Action::SecretDelete,
+            Kind::Vars => store::Action::VarDelete,
+        };
+        audit_row(cx, &target, action, &name).await?;
         no_content().map(Ok)
     } else {
         Ok(stop(404, "not found"))
@@ -996,9 +1111,18 @@ mod tests {
             Some(SettingsRoute::Repos { org })
         );
         assert_eq!(
-            settings_route("orgs/acme/repos/enabled", &Method::Put),
+            settings_route("orgs/acme/repos/enabled", &Method::Patch),
             Some(SettingsRoute::EnableRepos { org })
         );
+        assert_eq!(
+            settings_route("orgs/acme/repos/enabled", &Method::Put),
+            None
+        );
+        assert_eq!(
+            settings_route("orgs/acme/audit", &Method::Get),
+            Some(SettingsRoute::Audit { org })
+        );
+        assert_eq!(settings_route("orgs/acme/audit", &Method::Post), None);
         assert_eq!(
             settings_route("orgs/acme/repos/enabled", &Method::Get),
             None

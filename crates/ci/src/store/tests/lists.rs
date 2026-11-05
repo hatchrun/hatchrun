@@ -256,8 +256,14 @@ fn installation_repositories_sync_and_keep_their_choice() {
     assert!(db.wait(repo_enabled(db.db(), "t1", 8)).unwrap());
 
     // Choose two; web leaves, a new one arrives.
-    db.wait(set_enabled(db.db(), "t1", false, &["ACME/api".to_owned()]))
-        .unwrap();
+    db.wait(patch_enabled(
+        db.db(),
+        "t1",
+        Some(false),
+        &["ACME/api".to_owned()],
+        &["acme/app".to_owned(), "acme/web".to_owned()],
+    ))
+    .unwrap();
     assert!(db.wait(repo_enabled(db.db(), "t1", 8)).unwrap());
     assert!(!db.wait(repo_enabled(db.db(), "t1", 7)).unwrap());
     let next = [
@@ -327,12 +333,16 @@ fn installation_repositories_sync_and_keep_their_choice() {
     );
 
     // All again.
-    db.wait(set_enabled(db.db(), "t1", true, &[])).unwrap();
+    db.wait(patch_enabled(db.db(), "t1", Some(true), &[], &[]))
+        .unwrap();
     assert!(db.wait(repo_enabled(db.db(), "t1", 10)).unwrap());
     // A repository without a row follows the flag.
     assert!(db.wait(repo_enabled(db.db(), "t1", 4242)).unwrap());
-    db.wait(set_enabled(db.db(), "t1", false, &[])).unwrap();
+    db.wait(patch_enabled(db.db(), "t1", Some(false), &[], &[]))
+        .unwrap();
     assert!(!db.wait(repo_enabled(db.db(), "t1", 4242)).unwrap());
+    // Leaving the mode keeps each repository's choice.
+    assert!(db.wait(repo_enabled(db.db(), "t1", 10)).unwrap());
     assert!(!db.wait(repo_enabled(db.db(), "nobody", 7)).unwrap());
 }
 
@@ -385,8 +395,14 @@ fn unknown_names_and_the_setup_counts() {
     assert_eq!((row.repos, row.enabled), (2, 2));
     assert_eq!(row.first_run_id, Some(first.id));
     assert_eq!(row.first_run_repository.as_deref(), Some("acme/app"));
-    db.wait(set_enabled(db.db(), "t1", false, &["acme/app".to_owned()]))
-        .unwrap();
+    db.wait(patch_enabled(
+        db.db(),
+        "t1",
+        Some(false),
+        &[],
+        &["acme/api".to_owned()],
+    ))
+    .unwrap();
     let row = db.wait(tenant_setup(db.db(), "t1")).unwrap().unwrap();
     assert!(!row.all_repos);
     assert_eq!((row.repos, row.enabled), (2, 1));
@@ -508,4 +524,54 @@ fn environments_of_the_organization_count_their_secrets_and_vars() {
         .wait(org_environments(db.db(), "t2", None, None, 0, 10))
         .unwrap();
     assert_eq!(none.1, 0);
+}
+
+#[test]
+fn audit_rows_page_newest_first_and_filter_by_repository() {
+    let db = setup();
+    let record = |action, scope, repo: Option<&str>, target: &str, now| {
+        db.wait(record_audit(
+            db.db(),
+            &NewAudit {
+                tenant: "t1",
+                actor: "octocat",
+                action,
+                scope,
+                repo,
+                target,
+                now,
+            },
+        ))
+        .unwrap();
+    };
+    record(Action::SecretPut, "org", None, "TOKEN", 1);
+    record(Action::VarPut, "repo", Some("acme/app"), "MODE", 2);
+    record(
+        Action::SecretDelete,
+        "env",
+        Some("acme/app"),
+        "prod/TOKEN",
+        3,
+    );
+    record(Action::ReposEnabled, "org", None, "all", 4);
+
+    let (rows, total) = db.wait(audit_page(db.db(), "t1", None, None, 3)).unwrap();
+    assert_eq!(total, 4);
+    let targets: Vec<&str> = rows.iter().map(|row| row.target.as_str()).collect();
+    assert_eq!(targets, ["all", "prod/TOKEN", "MODE"]);
+    assert_eq!(rows[1].action, "secret.delete");
+    let (rest, _) = db
+        .wait(audit_page(db.db(), "t1", None, Some(rows[2].id), 3))
+        .unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].target, "TOKEN");
+
+    let (app, total) = db
+        .wait(audit_page(db.db(), "t1", Some("ACME/app"), None, 10))
+        .unwrap();
+    assert_eq!((app.len(), total), (2, 2));
+    let (none, total) = db
+        .wait(audit_page(db.db(), "other", None, None, 10))
+        .unwrap();
+    assert_eq!((none.len(), total), (0, 0));
 }
