@@ -659,6 +659,13 @@ async fn head(
         Some(tenant) if tenant.ci_billing == CiBilling::Active => {}
         _ => return Ok(None),
     }
+    // A repository that is not enabled starts no scheduled runs.
+    if !store::repo_enabled(db, &row.tenant_id, row.id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(None);
+    }
     let repo = Repo {
         id: row.id,
         full_name: row.full_name,

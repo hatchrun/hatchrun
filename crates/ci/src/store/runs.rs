@@ -76,6 +76,21 @@ pub struct RunRow {
     pub retention_days: u32,
 }
 
+impl RunRow {
+    /// The branch the run is on: that of a push, the base branch of a
+    /// pull request, none for a tag. The same as [`BRANCH`].
+    #[must_use]
+    pub fn branch(&self) -> Option<&str> {
+        if let Some(name) = self.git_ref.strip_prefix("refs/heads/") {
+            Some(name)
+        } else if self.git_ref.starts_with("refs/pull/") {
+            self.base_ref.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
 /// The columns of a [`RunRow`].
 const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, \
      event, ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
@@ -115,16 +130,6 @@ const INSERT_RUN: &str = "WITH n AS (\
 
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
-
-/// Runs of repository `$1` newest first, those with an id below `$2`
-/// when it is set, at most `$3`. Only runs of the tenant that owns the
-/// repository now: after a transfer, the history stays with the tenant
-/// that owned the repository when the run happened.
-const RUNS_FOR_REPO: &str = "SELECT {columns} FROM ci_runs \
-     WHERE repo_id = $1 \
-     AND tenant_id = (SELECT tenant_id FROM ci_repos WHERE id = $1) \
-     AND ($2::bigint IS NULL OR id < $2::bigint) \
-     ORDER BY id DESC LIMIT $3";
 
 /// Moves run `$1` from queued to in progress at `$2`.
 const RUN_STARTED: &str = "UPDATE ci_runs SET status = 'in_progress', updated_at = $2 WHERE id = $1 AND status = 'queued'";
@@ -188,21 +193,231 @@ pub async fn run(db: &Db, run_id: u64) -> Result<Option<RunRow>> {
         .await
 }
 
-/// Runs of `repo_id`, newest first: those with an id below `before`
-/// when it is set, at most `limit`.
+/// What a run's status is for a list: the filter's words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RunStatus {
+    /// Recorded, nothing started.
+    Queued,
+    /// In progress, and no job waits for an approval.
+    Running,
+    /// In progress, and a job waits for an approval.
+    Waiting,
+    /// Completed with `success`.
+    Success,
+    /// Completed with `failure`.
+    Failure,
+    /// Completed with `cancelled`.
+    Cancelled,
+}
+
+impl RunStatus {
+    /// The state the filter calls `word`.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        Some(match word {
+            "queued" => Self::Queued,
+            "running" => Self::Running,
+            "waiting" => Self::Waiting,
+            "success" => Self::Success,
+            "failure" => Self::Failure,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
+
+    /// The condition on `ci_runs r` that holds for this state. Fixed
+    /// text: nothing the caller sent is in it.
+    const fn condition(self) -> &'static str {
+        match self {
+            Self::Queued => "r.status = 'queued'",
+            Self::Running => {
+                "(r.status = 'in_progress' AND NOT EXISTS (SELECT 1 FROM ci_jobs j \
+                 WHERE j.run_id = r.id AND j.status <> 'completed' AND j.held = 'approval'))"
+            }
+            Self::Waiting => {
+                "(r.status = 'in_progress' AND EXISTS (SELECT 1 FROM ci_jobs j \
+                 WHERE j.run_id = r.id AND j.status <> 'completed' AND j.held = 'approval'))"
+            }
+            Self::Success => "(r.status = 'completed' AND r.conclusion = 'success')",
+            Self::Failure => "(r.status = 'completed' AND r.conclusion = 'failure')",
+            Self::Cancelled => "(r.status = 'completed' AND r.conclusion = 'cancelled')",
+        }
+    }
+}
+
+/// The branch a run is on: the branch of a push, the base branch of a
+/// pull request, nothing for a tag or other refs. For a query that
+/// aliases `ci_runs` as `r`.
+const BRANCH: &str = "CASE WHEN r.ref LIKE 'refs/heads/%' THEN substr(r.ref, 12) \
+     WHEN r.ref LIKE 'refs/pull/%' THEN r.base_ref END";
+
+/// Which runs a list holds. Every field narrows the list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunFilter {
+    /// The repositories the list may show, by id. An empty list shows
+    /// nothing.
+    pub repo_ids: Vec<u64>,
+    /// The states; empty for all.
+    pub states: Vec<RunStatus>,
+    /// Repository names, `owner/name`; empty for all.
+    pub repos: Vec<String>,
+    /// Branches; empty for all.
+    pub branches: Vec<String>,
+    /// Actor logins; empty for all.
+    pub actors: Vec<String>,
+    /// Text in the workflow, ref, actor or the start of the commit.
+    pub text: Option<String>,
+    /// Runs recorded at or after this, in Unix milliseconds.
+    pub since: u64,
+    /// Runs recorded before this, in Unix milliseconds.
+    pub until: Option<u64>,
+}
+
+/// A run of a list, with the name of its repository.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ListedRun {
+    /// The run.
+    #[serde(flatten)]
+    pub run: RunRow,
+    /// The repository, `owner/name`.
+    pub repository: String,
+}
+
+/// The place after which the next page of a list starts: the sort key
+/// of its last run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct After {
+    /// The run's creation time.
+    pub created_at: u64,
+    /// The run's id.
+    pub id: u64,
+}
+
+/// Escapes `text` for a `LIKE` pattern.
+fn like(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('%');
+    for c in text.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
+
+/// The `WHERE` of a run list over `ci_runs r` and `ci_repos p`, and
+/// its parameters `$1` to `$9`.
+fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
+    let mut sql = String::from(
+        "p.id = r.repo_id AND p.tenant_id = r.tenant_id \
+         AND r.repo_id = ANY (string_to_array($1, ',')::bigint[]) \
+         AND r.created_at >= $2 AND ($3::bigint IS NULL OR r.created_at < $3::bigint) \
+         AND ($4::text IS NULL OR lower(p.full_name) = ANY (string_to_array(lower($4), ','))) \
+         AND ($5::text IS NULL OR ",
+    );
+    sql.push_str(BRANCH);
+    sql.push_str(
+        " = ANY (string_to_array($5, ','))) \
+         AND ($6::text IS NULL OR lower(r.actor) = ANY (string_to_array(lower($6), ','))) \
+         AND ($7::text IS NULL OR r.workflow ILIKE $7 OR r.ref ILIKE $7 OR r.actor ILIKE $7 \
+           OR r.sha ILIKE $8::text)",
+    );
+    if !filter.states.is_empty() {
+        let any: Vec<&str> = filter.states.iter().map(|s| s.condition()).collect();
+        sql.push_str(" AND (");
+        sql.push_str(&any.join(" OR "));
+        sql.push(')');
+    }
+    let ids: Vec<String> = filter.repo_ids.iter().map(u64::to_string).collect();
+    let list = |items: &[String]| (!items.is_empty()).then(|| items.join(","));
+    let text = filter.text.as_deref().map(like);
+    let sha = filter
+        .text
+        .as_deref()
+        .map(|t| like(t).trim_start_matches('%').to_owned());
+    let bound = params![
+        ids.join(","),
+        filter.since,
+        filter.until,
+        list(&filter.repos),
+        list(&filter.branches),
+        list(&filter.actors),
+        text,
+        sha
+    ];
+    (sql, bound)
+}
+
+/// The columns of a [`ListedRun`] over `ci_runs r` and `ci_repos p`.
+pub(super) const LISTED_COLUMNS: &str = "r.id, r.run_number, r.run_attempt, r.tenant_id, r.repo_id, \
+     r.workflow, r.delivery, r.event, r.ref AS git_ref, r.sha, r.actor, r.base_ref, r.status, \
+     r.conclusion, r.created_at, r.completed_at, \
+     (r.expires_at - r.created_at) / 86400000 AS retention_days, \
+     p.full_name AS repository";
+
+/// One page of the runs `filter` holds, newest first, those after
+/// `after` when it is set, at most `limit`; and how many runs the
+/// filter holds in all.
+///
+/// Only runs of the tenant that owns the repository now are shown:
+/// after a transfer, the history stays with the tenant that owned the
+/// repository when the run happened.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn runs_for_repo(
+pub async fn runs_page(
     db: &Db,
-    repo_id: u64,
-    before: Option<u64>,
+    filter: &RunFilter,
+    after: Option<After>,
     limit: u32,
-) -> Result<Vec<RunRow>> {
+) -> Result<(Vec<ListedRun>, u64)> {
+    #[derive(Deserialize)]
+    struct Total {
+        total: u64,
+    }
+    let (conditions, bound) = run_where(filter);
+    let count = format!("SELECT count(*) AS total FROM ci_runs r, ci_repos p WHERE {conditions}");
+    let total = db
+        .first::<Total>(&count, &bound)
+        .await?
+        .map_or(0, |row| row.total);
+    let mut bound = bound;
+    bound.extend(params![
+        after.map(|a| a.created_at),
+        after.map(|a| a.id),
+        limit
+    ]);
+    let page = format!(
+        "SELECT {LISTED_COLUMNS} FROM ci_runs r, ci_repos p \
+         WHERE {conditions} \
+         AND ($9::bigint IS NULL OR (r.created_at, r.id) < ($9::bigint, $10::bigint)) \
+         ORDER BY r.created_at DESC, r.id DESC LIMIT $11"
+    );
+    let rows = db.all(&page, &bound).await?;
+    Ok((rows, total))
+}
+
+/// The newest completed run on the default branch of each repository
+/// in `repo_ids` of `tenant`, for those that have one.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn latest_on_default(db: &Db, tenant: &str, repo_ids: &[u64]) -> Result<Vec<ListedRun>> {
+    let ids: Vec<String> = repo_ids.iter().map(u64::to_string).collect();
     db.all(
-        &with_columns(RUNS_FOR_REPO, RUN_COLUMNS),
-        &params![repo_id, before, limit],
+        &format!(
+            "SELECT DISTINCT ON (r.repo_id) {LISTED_COLUMNS} \
+             FROM ci_runs r, ci_repos p \
+             WHERE p.id = r.repo_id AND p.tenant_id = r.tenant_id AND p.tenant_id = $1 \
+             AND p.id = ANY (string_to_array($2, ',')::bigint[]) \
+             AND r.status = 'completed' AND r.ref = 'refs/heads/' || p.default_branch \
+             ORDER BY r.repo_id, r.created_at DESC, r.id DESC"
+        ),
+        &params![tenant, ids.join(",")],
     )
     .await
 }

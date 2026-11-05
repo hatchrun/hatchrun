@@ -9,15 +9,18 @@
 //! | --- | --- | --- |
 //! | `GET /api/ci/orgs/{org}/billing` | org admin | [`BillingView`](crate::billing::BillingView) |
 //! | `PUT /api/ci/orgs/{org}/billing/cap` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/secrets` | org admin | `[{"name", "updatedAt", "repositories"}]` |
+//! | `GET /api/ci/orgs/{org}/secrets?q=&cursor=&limit=` | org admin | `Page` of `{"name", "updatedAt", "repositories"}` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/secrets/{name}` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/vars` | org admin | `[{"name", "value", "updatedAt", "repositories"}]` |
+//! | `GET /api/ci/orgs/{org}/vars?q=&cursor=&limit=` | org admin | `Page` of `{"name", "value", "updatedAt", "repositories"}` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/vars/{name}` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/repositories` | org admin | `[{"name"}]` |
+//! | `GET /api/ci/orgs/{org}/repos?q=&enabled=&cursor=&limit=` | org admin | `Page` of `{"name", "default_branch", "enabled", "last_run"}`, every repository of the installation |
+//! | `PUT /api/ci/orgs/{org}/repos/enabled` | org admin, CSRF | `204`, body `{"all", "repos"}` |
+//! | `GET /api/ci/orgs/{org}/setup` | org admin | `{"app", "enabled", "first_run", "billing"}` |
+//! | `GET /api/ci/orgs/{org}/environments?q=&repo=&cursor=&limit=` | org admin | `Page` of `{"repository", "name", "branches", "approval", "updatedAt", "secrets", "vars"}` |
 //! | `GET /api/ci/repos/{owner}/{repo}/environments` | repo admin | `[{"name", "branches", "approval", "updatedAt"}]` |
 //! | `PUT /api/ci/repos/{owner}/{repo}/environments/{env}` | repo admin, CSRF | the environment |
 //! | `DELETE /api/ci/repos/{owner}/{repo}/environments/{env}` | repo admin, CSRF | `204` |
-//! | `GET /api/ci/repos/{owner}/{repo}/environments/{env}/(secrets\|vars)` | repo admin | as for an organization |
+//! | `GET /api/ci/repos/{owner}/{repo}/environments/{env}/(secrets\|vars)?q=&cursor=&limit=` | repo admin | as for an organization |
 //! | `PUT, DELETE /api/ci/repos/{owner}/{repo}/environments/{env}/(secrets\|vars)/{name}` | repo admin, CSRF | `204` |
 //!
 //! The secret and variable routes under `/api/ci/repos/{owner}/{repo}/`
@@ -45,6 +48,8 @@ use crate::api::{Cx, Served, Stop, body_cap, name, no_content, now_ms, reply, st
 use crate::billing;
 use crate::environments::{self, environment_json};
 use crate::launches;
+use crate::org_api;
+use crate::page::{self, Query};
 use crate::secrets::{self, Aad, Keyring};
 use crate::store::{self, Owner, Put, TenantRow};
 
@@ -92,9 +97,23 @@ pub enum SettingsRoute<'a> {
     Vars(Scope<'a>),
     /// Set or delete one variable.
     Var(Scope<'a>, &'a str),
-    /// The organization's repositories, for choosing who a secret
-    /// reaches.
-    Repositories {
+    /// The repositories of the organization's installation.
+    Repos {
+        /// The organization.
+        org: &'a str,
+    },
+    /// Choose which repositories run.
+    EnableRepos {
+        /// The organization.
+        org: &'a str,
+    },
+    /// Where the organization stands in setting up.
+    Setup {
+        /// The organization.
+        org: &'a str,
+    },
+    /// The environments of all the organization's repositories.
+    OrgEnvironments {
         /// The organization.
         org: &'a str,
     },
@@ -124,9 +143,11 @@ impl SettingsRoute<'_> {
             SettingsRoute::Billing { .. }
             | SettingsRoute::Secrets(_)
             | SettingsRoute::Vars(_)
-            | SettingsRoute::Repositories { .. }
+            | SettingsRoute::Repos { .. }
+            | SettingsRoute::Setup { .. }
+            | SettingsRoute::OrgEnvironments { .. }
             | SettingsRoute::Environments { .. } => *method == Method::Get,
-            SettingsRoute::Cap { .. } => *method == Method::Put,
+            SettingsRoute::Cap { .. } | SettingsRoute::EnableRepos { .. } => *method == Method::Put,
             SettingsRoute::Secret(..)
             | SettingsRoute::Var(..)
             | SettingsRoute::Environment { .. } => {
@@ -144,7 +165,10 @@ pub fn find(path: &str) -> Option<SettingsRoute<'_>> {
     match parts.as_slice() {
         ["orgs", org, "billing"] => Some(SettingsRoute::Billing { org: login(org)? }),
         ["orgs", org, "billing", "cap"] => Some(SettingsRoute::Cap { org: login(org)? }),
-        ["orgs", org, "repositories"] => Some(SettingsRoute::Repositories { org: login(org)? }),
+        ["orgs", org, "repos"] => Some(SettingsRoute::Repos { org: login(org)? }),
+        ["orgs", org, "repos", "enabled"] => Some(SettingsRoute::EnableRepos { org: login(org)? }),
+        ["orgs", org, "setup"] => Some(SettingsRoute::Setup { org: login(org)? }),
+        ["orgs", org, "environments"] => Some(SettingsRoute::OrgEnvironments { org: login(org)? }),
         ["orgs", org, kind @ ("secrets" | "vars")] => {
             let scope = Scope::Org(login(org)?);
             Some(if *kind == "secrets" {
@@ -234,7 +258,7 @@ fn item_route<'a>(kind: &str, scope: Scope<'a>, item: &'a str) -> SettingsRoute<
     }
 }
 
-fn login(org: &str) -> Option<&str> {
+pub(crate) fn login(org: &str) -> Option<&str> {
     valid_login(org).then_some(org)
 }
 
@@ -250,11 +274,17 @@ pub(crate) async fn handle(
     cx: &Cx<'_>,
     route: SettingsRoute<'_>,
     req: &mut Request,
+    query: Option<&str>,
 ) -> Result<Served> {
     match route {
         SettingsRoute::Billing { org } => billing_view(cx, org).await,
         SettingsRoute::Cap { org } => cap(cx, org, req, body_cap(&route)).await,
-        SettingsRoute::Repositories { org } => repositories(cx, org).await,
+        SettingsRoute::Repos { org } => org_api::repos(cx, org, query).await,
+        SettingsRoute::EnableRepos { org } => {
+            org_api::set_enabled(cx, org, req, body_cap(&route)).await
+        }
+        SettingsRoute::Setup { org } => org_api::setup(cx, org).await,
+        SettingsRoute::OrgEnvironments { org } => org_api::environments(cx, org, query).await,
         SettingsRoute::Environments { owner, repo } => list_environments(cx, owner, repo).await,
         SettingsRoute::Environment { owner, repo, name } => {
             if req.method() == Method::Put {
@@ -263,8 +293,8 @@ pub(crate) async fn handle(
                 delete_environment(cx, owner, repo, name).await
             }
         }
-        SettingsRoute::Secrets(scope) => list_secrets(cx, scope).await,
-        SettingsRoute::Vars(scope) => list_vars(cx, scope).await,
+        SettingsRoute::Secrets(scope) => list_secrets(cx, scope, query).await,
+        SettingsRoute::Vars(scope) => list_vars(cx, scope, query).await,
         SettingsRoute::Secret(scope, item) => {
             if req.method() == Method::Put {
                 put_secret(cx, scope, item, req, body_cap(&route)).await
@@ -286,7 +316,7 @@ pub(crate) async fn handle(
 /// organization. The tenant is found by the organization's id from
 /// GitHub, never by the login, which a renamed organization leaves
 /// behind and another can take. Anyone else sees a `404`.
-async fn admin_tenant(cx: &Cx<'_>, org: &str) -> Result<Served<TenantRow>> {
+pub(crate) async fn admin_tenant(cx: &Cx<'_>, org: &str) -> Result<Served<TenantRow>> {
     let Some(session) = cx.session else {
         return Ok(stop(401, "sign in to manage billing"));
     };
@@ -548,25 +578,22 @@ fn item_name(item: &str, kind: Kind) -> std::result::Result<String, Stop> {
     secrets::valid_name(item, noun).or_else(|message| stop(400, message))
 }
 
-async fn repositories(cx: &Cx<'_>, org: &str) -> Result<Served> {
-    let tenant = match admin_tenant(cx, org).await? {
-        Ok(tenant) => tenant,
-        Err(stop) => return Ok(Err(stop)),
-    };
-    let names = store::tenant_repos(cx.db, &tenant.id).await?;
-    let list: Vec<_> = names
-        .into_iter()
-        .map(|name| json!({ "name": name }))
-        .collect();
-    reply(200, &json!(list)).map(Ok)
-}
-
-async fn list_secrets(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
+async fn list_secrets(cx: &Cx<'_>, scope: Scope<'_>, query: Option<&str>) -> Result<Served> {
+    let query = Query::parse(query);
     let target = match target(cx, scope).await? {
         Ok(target) => target,
         Err(stop) => return Ok(Err(stop)),
     };
     let rows = store::secret_names(cx.db, &target.tenant, target.owner).await?;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|item| page::matches(&item.name, query.get("q")))
+        .collect();
+    let total = rows.len() as u64;
+    let (rows, next) = match page::slice(&rows, &query) {
+        Ok(sliced) => sliced,
+        Err(stop) => return Ok(Err(stop)),
+    };
     let list: Vec<_> = rows
         .into_iter()
         .map(|item| {
@@ -577,15 +604,25 @@ async fn list_secrets(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
             })
         })
         .collect();
-    reply(200, &json!(list)).map(Ok)
+    reply(200, &page::page(&list, total, next.as_deref())).map(Ok)
 }
 
-async fn list_vars(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
+async fn list_vars(cx: &Cx<'_>, scope: Scope<'_>, query: Option<&str>) -> Result<Served> {
+    let query = Query::parse(query);
     let target = match target(cx, scope).await? {
         Ok(target) => target,
         Err(stop) => return Ok(Err(stop)),
     };
     let rows = store::vars(cx.db, &target.tenant, target.owner).await?;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|item| page::matches(&item.name, query.get("q")))
+        .collect();
+    let total = rows.len() as u64;
+    let (rows, next) = match page::slice(&rows, &query) {
+        Ok(sliced) => sliced,
+        Err(stop) => return Ok(Err(stop)),
+    };
     let list: Vec<_> = rows
         .into_iter()
         .map(|item| {
@@ -597,7 +634,7 @@ async fn list_vars(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served> {
             })
         })
         .collect();
-    reply(200, &json!(list)).map(Ok)
+    reply(200, &page::page(&list, total, next.as_deref())).map(Ok)
 }
 
 async fn put_secret(
@@ -955,9 +992,26 @@ mod tests {
             Some(SettingsRoute::Vars(scope))
         );
         assert_eq!(
-            settings_route("orgs/acme/repositories", &Method::Get),
-            Some(SettingsRoute::Repositories { org })
+            settings_route("orgs/acme/repos", &Method::Get),
+            Some(SettingsRoute::Repos { org })
         );
+        assert_eq!(
+            settings_route("orgs/acme/repos/enabled", &Method::Put),
+            Some(SettingsRoute::EnableRepos { org })
+        );
+        assert_eq!(
+            settings_route("orgs/acme/repos/enabled", &Method::Get),
+            None
+        );
+        assert_eq!(
+            settings_route("orgs/acme/setup", &Method::Get),
+            Some(SettingsRoute::Setup { org })
+        );
+        assert_eq!(
+            settings_route("orgs/acme/environments", &Method::Get),
+            Some(SettingsRoute::OrgEnvironments { org })
+        );
+        assert_eq!(settings_route("orgs/acme/repositories", &Method::Get), None);
         let repo = Scope::Repo {
             owner: "acme",
             repo: "api",
@@ -1076,7 +1130,7 @@ mod tests {
     fn other_paths_and_methods_have_no_route() {
         for (path, method) in [
             ("orgs/acme/billing", Method::Post),
-            ("orgs/acme/repositories", Method::Put),
+            ("orgs/acme/repos", Method::Put),
             ("orgs/acme/billing/checkout", Method::Post),
             ("orgs/acme/billing/portal", Method::Post),
             ("orgs/acme/billing/cap", Method::Post),
