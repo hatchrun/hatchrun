@@ -4,16 +4,21 @@
 
 import { useEffect, useState } from "react";
 
-import { getSession, getTenant, type Session } from "./api";
-import { OrgSwitcher } from "./components/OrgSwitcher";
+import { ApiError, getSession, getTenant, type Session, type Tenant } from "./api";
 import { Shell } from "./components/Shell";
 import { Await } from "./components/Status";
 import { useLoad } from "./load";
+import { Billing } from "./pages/Billing";
+import { CiRun } from "./pages/CiRun";
+import { Environments } from "./pages/Environments";
 import { Home } from "./pages/Home";
+import { Kit } from "./pages/Kit";
+import { Repos } from "./pages/Repos";
+import { Runs } from "./pages/Runs";
+import { Secrets } from "./pages/Secrets";
+import { Setup } from "./pages/Setup";
 import { SignIn } from "./pages/SignIn";
-import { TenantPage } from "./pages/TenantPage";
-import { CiPages } from "./pages/ci/RunPage";
-import { matchCi, navigate, useLocation } from "./router";
+import { legacyCiRedirect, matchOrg, navigate, useLocation, type OrgRoute } from "./router";
 
 type State = { kind: "loading" } | { kind: "error"; message: string } | { kind: "ready"; session: Session | null };
 
@@ -30,14 +35,18 @@ export function App() {
 
   const path = location.split("?")[0] ?? "/";
   const signedIn = state.kind === "ready" && state.session !== null;
+  // Old /ci/:owner/:repo URLs live under the organization now.
+  const moved = legacyCiRedirect(path);
 
   useEffect(() => {
-    if (signedIn && path === "/signin") {
+    if (moved) {
+      navigate(moved, true);
+    } else if (signedIn && path === "/signin") {
       navigate("/", true);
     }
-  }, [signedIn, path]);
+  }, [signedIn, path, moved]);
 
-  if (state.kind === "loading") {
+  if (state.kind === "loading" || moved) {
     return <div className="loading" aria-busy="true" />;
   }
   if (state.kind === "error") {
@@ -53,22 +62,27 @@ export function App() {
       </main>
     );
   }
-  // Runs of public repositories read without signing in.
-  const ci = matchCi(path);
-  if (ci) {
-    return <CiPages session={state.session} route={ci} />;
+  const session = state.session;
+  const route = matchOrg(path);
+
+  if (route?.page === "run" && route.repo && route.run) {
+    // Runs of public repositories read without signing in.
+    return session ? (
+      <OrgRoute session={session} route={route} />
+    ) : (
+      <Shell user={null} publicRepo={`${route.org}/${route.repo}`}>
+        <CiRun session={null} route={{ org: route.org, repo: route.repo, run: route.run, job: route.job }} />
+      </Shell>
+    );
   }
-  if (state.session === null) {
+  if (session === null) {
     return <SignIn returnTo={path === "/signin" ? "/" : location} />;
   }
-
-  const user = state.session.user;
-  const tenantRoute = /^\/o\/([A-Za-z0-9-]+)(?:\/([a-z]+)(?:\/([a-z0-9-]+))?)?\/?$/.exec(path);
-  if (tenantRoute?.[1]) {
-    return <TenantRoute user={user} org={tenantRoute[1]} section={tenantRoute[2]} item={tenantRoute[3]} />;
+  if (route) {
+    return <OrgRoute session={session} route={route} />;
   }
   return (
-    <Shell user={user}>
+    <Shell user={session.user}>
       <div className="mx-auto w-full max-w-[1080px] pt-3">
         {path === "/new" ? <Home stay /> : path === "/" ? <Home /> : <NotFound />}
       </div>
@@ -76,30 +90,57 @@ export function App() {
   );
 }
 
-function TenantRoute({
-  user,
-  org,
-  section,
-  item,
-}: {
-  user: Session["user"];
-  org: string;
-  section: string | undefined;
-  item: string | undefined;
-}) {
-  const [tenant, reload] = useLoad(() => getTenant(org), org);
+/** A page under /o/:org: reads the tenant for the sidebar and the role, then mounts the page. */
+function OrgRoute({ session, route }: { session: Session; route: OrgRoute }) {
+  const { user } = session;
+  const [tenant, reload] = useLoad(() => getTenant(route.org), route.org);
+  const publicRun = route.page === "run" && route.repo !== null && route.run !== null;
+
   if (tenant.state === "ready") {
     return (
-      <TenantPage key={tenant.data.org.login} user={user} tenant={tenant.data} section={section} item={item} />
+      <Shell user={user} org={{ login: tenant.data.org.login, role: tenant.data.role }}>
+        <OrgPage session={session} tenant={tenant.data} route={route} />
+      </Shell>
+    );
+  }
+  // A viewer outside the organization still reads a public repository's run.
+  if (publicRun && tenant.state === "error" && tenant.error instanceof ApiError && [403, 404].includes(tenant.error.status)) {
+    return (
+      <Shell user={user} publicRepo={`${route.org}/${route.repo}`}>
+        <CiRun session={session} route={{ org: route.org, repo: route.repo ?? "", run: route.run ?? "", job: route.job }} />
+      </Shell>
     );
   }
   return (
-    <Shell user={user} nav={<OrgSwitcher current={{ login: org, avatarUrl: "" }} />}>
+    <Shell user={user} org={{ login: route.org, role: null }}>
       <Await loaded={tenant} retry={reload}>
         {() => null}
       </Await>
     </Shell>
   );
+}
+
+function OrgPage({ session, tenant, route }: { session: Session; tenant: Tenant; route: OrgRoute }) {
+  const props = { org: tenant.org.login, tenant, user: session.user };
+  switch (route.page) {
+    case "runs":
+      return <Runs {...props} />;
+    case "repos":
+      return <Repos {...props} />;
+    case "secrets":
+      return <Secrets {...props} />;
+    case "environments":
+      return <Environments {...props} />;
+    case "kit":
+      return <Kit {...props} />;
+    case "setup":
+      return <Setup {...props} />;
+    case "settings":
+    case "billing":
+      return <Billing {...props} />;
+    case "run":
+      return <CiRun session={session} route={{ org: route.org, repo: route.repo ?? "", run: route.run ?? "", job: route.job }} />;
+  }
 }
 
 function NotFound() {
