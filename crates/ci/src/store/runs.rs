@@ -156,6 +156,9 @@ const INSERT_RUN: &str = "WITH n AS (\
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
 
+/// Gives run `$1` the title `$2`.
+const SET_RUN_MESSAGE: &str = "UPDATE ci_runs SET message = $2 WHERE id = $1";
+
 /// Moves run `$1` from queued to in progress at `$2`.
 const RUN_STARTED: &str = "UPDATE ci_runs SET status = 'in_progress', updated_at = $2 WHERE id = $1 AND status = 'queued'";
 
@@ -209,6 +212,16 @@ pub async fn run_for_delivery(db: &Db, delivery: &str, workflow: &str) -> Result
         &params![delivery, workflow],
     )
     .await
+}
+
+/// Gives run `run_id` the title its workflow's `run-name` made.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn set_run_message(db: &Db, run_id: u64, message: &str) -> Result<()> {
+    db.run(SET_RUN_MESSAGE, &params![run_id, message]).await?;
+    Ok(())
 }
 
 /// Run `run_id`.

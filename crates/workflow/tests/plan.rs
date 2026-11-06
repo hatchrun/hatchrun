@@ -1353,10 +1353,10 @@ workflows:
 fn environment_names_read_only_what_the_host_has_when_the_job_starts() {
     assert_error(
         r#"
-jobs: { deploy: { runs-on: ubuntu-latest, environment: "${{ vars.STAGE }}", steps: [] } }
+jobs: { deploy: { runs-on: ubuntu-latest, environment: "${{ env.STAGE }}", steps: [] } }
 workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
 "#,
-        &["`environment` reads `vars`", "it can read only"],
+        &["`environment` reads `env`", "it can read only"],
     );
     assert_error(
         r#"

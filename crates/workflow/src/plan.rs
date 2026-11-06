@@ -23,7 +23,7 @@ use crate::config::{
 };
 use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
-use crate::environment::valid_environment_name;
+use crate::environment::{is_expression, valid_environment_name};
 use crate::expr::{self, ExprError};
 use crate::permissions::{Level, token_scopes};
 use crate::templates::{Template, template, template_labels};
@@ -42,8 +42,8 @@ const MAX_MATRIX: usize = 256;
 
 /// Contexts a job's `environment` name may read: those the control plane
 /// has when the job is ready to start.
-const ENVIRONMENT_CONTEXTS: &[&str] = &[
-    "hatchrun", "github", "inputs", "matrix", "needs", "strategy",
+pub(crate) const ENVIRONMENT_CONTEXTS: &[&str] = &[
+    "hatchrun", "github", "inputs", "vars", "matrix", "needs", "strategy",
 ];
 
 /// The most combinations a matrix with `exclude` may have before the
@@ -800,22 +800,12 @@ impl Check<'_> {
 
     /// Reports each context a template reads that is not in `allowed`.
     fn allowed(&mut self, label: &str, text: &str, allowed: &[&str]) {
-        let Ok(found) = expr::expressions(text) else {
-            return;
-        };
-        for (_, inner) in found {
-            if parameter_name(inner).is_some() {
-                continue;
-            }
-            for (name, _) in expr::contexts(inner).unwrap_or_default() {
-                if !allowed.contains(&name.as_ref()) && name != "parameters" {
-                    self.errors.push(Diagnostic::new(format!(
-                        "{} {label} reads `{name}`; it can read only {}",
-                        self.owner,
-                        allowed.join(", ")
-                    )));
-                }
-            }
+        for name in unallowed_contexts(text, allowed) {
+            self.errors.push(Diagnostic::new(format!(
+                "{} {label} reads `{name}`; it can read only {}",
+                self.owner,
+                allowed.join(", ")
+            )));
         }
     }
 
@@ -972,6 +962,26 @@ impl Check<'_> {
             self.owner
         )));
     }
+}
+
+/// The contexts `text` reads that are not in `allowed`. A template that
+/// does not parse reads none; its own check reports it.
+pub(crate) fn unallowed_contexts(text: &str, allowed: &[&str]) -> Vec<String> {
+    let Ok(found) = expr::expressions(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (_, inner) in found {
+        if parameter_name(inner).is_some() {
+            continue;
+        }
+        for (name, _) in expr::contexts(inner).unwrap_or_default() {
+            if !allowed.contains(&name.as_ref()) && name != "parameters" {
+                out.push(name.into_owned());
+            }
+        }
+    }
+    out
 }
 
 /// A key of a step as it reads in a message, such as step 2 `env.X`.
@@ -2150,7 +2160,7 @@ fn expand_job(
     let environment_url = sub.opt(job.environment_url.as_deref());
     // A name that still holds an expression is checked when it is
     // evaluated, as the job starts.
-    if let Some(name) = environment.as_ref().filter(|n| !n.contains("${{"))
+    if let Some(name) = environment.as_ref().filter(|n| !is_expression(n))
         && let Err(rule) = valid_environment_name(name)
     {
         errors.push(Diagnostic::new(format!(

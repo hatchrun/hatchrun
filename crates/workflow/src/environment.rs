@@ -28,6 +28,13 @@ pub fn valid_environment_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether an environment name is an expression the host evaluates when
+/// the job starts, rather than a name.
+#[must_use]
+pub fn is_expression(name: &str) -> bool {
+    name.contains("${{")
+}
+
 /// The longest environment URL.
 pub const ENVIRONMENT_URL_MAX: usize = 2048;
 

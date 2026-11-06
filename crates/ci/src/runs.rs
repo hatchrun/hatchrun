@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Diagnostic, Event, JobKind, Plan, run_title};
+use hatchrun_workflow::{Diagnostic, Event, JobKind, Plan, is_expression, run_title};
 use serde_json::Value;
 use worker::{Env, Method, RequestInit, Result};
 
@@ -532,24 +532,25 @@ fn pull_number(req: &Request<'_>) -> Option<u64> {
 }
 
 /// The title `plan`'s `run-name` gives the run, cut to [`MAX_MESSAGE`]
-/// characters. The run has no id yet, and `run-name` reads neither its
-/// id nor its number. A template that fails to evaluate, or gives
-/// nothing, leaves the run with its usual message.
+/// characters. `github` holds the run's id, number and attempt too. A
+/// template that fails to evaluate, or gives nothing, leaves the run
+/// with its usual message.
 fn title_of(
     req: &Request<'_>,
     plan: &Plan,
     api: &str,
     vars: &std::collections::BTreeMap<String, String>,
+    run: &RunRow,
 ) -> Result<Option<String>, String> {
     let Some(template) = plan.run_name.as_deref() else {
         return Ok(None);
     };
     let info = RunInfo {
-        run_id: 0,
-        run_number: 0,
-        run_attempt: 1,
+        run_id: run.id,
+        run_number: run.run_number,
+        run_attempt: run.run_attempt,
         tenant_id: req.tenant_id.to_owned(),
-        retention_days: 0,
+        retention_days: run.retention_days,
         installation_id: req.installation_id,
         repo: req.repo.clone(),
         workflow: plan.workflow.clone(),
@@ -562,7 +563,16 @@ fn title_of(
         concurrency: None,
         title: None,
     };
-    let ctx = crate::concurrency::context(&github_context(&info, req.event, api), vars);
+    let mut github = github_context(&info, req.event, api);
+    if let Some(fields) = github.as_object_mut() {
+        fields.insert("run_id".to_owned(), info.run_id.to_string().into());
+        fields.insert("run_number".to_owned(), info.run_number.to_string().into());
+        fields.insert(
+            "run_attempt".to_owned(),
+            info.run_attempt.to_string().into(),
+        );
+    }
+    let ctx = crate::concurrency::context(&github, vars);
     let title = run_title(template, &ctx)?;
     Ok((!title.is_empty()).then(|| title.chars().take(MAX_MESSAGE).collect()))
 }
@@ -576,15 +586,6 @@ async fn start_plan(
     plan: &Plan,
     now: u64,
 ) -> Result<u64> {
-    let title = if plan.run_name.is_some() {
-        let vars = store::job_vars(db, req.tenant_id, req.repo.id, None).await?;
-        title_of(req, plan, &settings.github_api, &vars).unwrap_or_else(|err| {
-            worker::console_error!("{}: workflow {}: {err}", req.repo.full_name, plan.workflow);
-            None
-        })
-    } else {
-        None
-    };
     let new = NewRun {
         tenant_id: req.tenant_id.to_owned(),
         repo_id: req.repo.id,
@@ -595,9 +596,7 @@ async fn start_plan(
         sha: req.sha.to_owned(),
         actor: req.actor.to_owned(),
         base_ref: (req.event_name == "pull_request").then(|| req.base_ref.to_owned()),
-        message: title
-            .clone()
-            .or_else(|| run_message(req.event_name, req.event)),
+        message: run_message(req.event_name, req.event),
         pull_number: pull_number(req),
         head_ref: pull_number(req).map(|_| req.head_ref.to_owned()),
         now,
@@ -618,6 +617,19 @@ async fn start_plan(
             req.delivery, run.id
         )));
     }
+    // The title reads the run's id and number, so it follows the insert.
+    let title = if plan.run_name.is_some() {
+        let vars = store::job_vars(db, req.tenant_id, req.repo.id, None).await?;
+        title_of(req, plan, &settings.github_api, &vars, &run).unwrap_or_else(|err| {
+            worker::console_error!("{}: workflow {}: {err}", req.repo.full_name, plan.workflow);
+            None
+        })
+    } else {
+        None
+    };
+    if let (true, Some(title)) = (fresh, &title) {
+        store::set_run_message(db, run.id, title).await?;
+    }
     let mut rows = store::jobs_for_run(db, run.id).await?;
     if rows.is_empty() {
         let jobs: Vec<NewJob> = plan
@@ -635,7 +647,7 @@ async fn start_plan(
                 secret_refs: job.secret_refs(),
                 // A name that is an expression is known when the job is
                 // queued, and the row is given it then.
-                environment: job.environment.clone().filter(|name| !name.contains("${{")),
+                environment: job.environment.clone().filter(|name| !is_expression(name)),
                 strategy_group: job.strategy.as_ref().map(|s| s.group.clone()),
                 max_parallel: job.strategy.as_ref().and_then(|s| s.max_parallel),
                 needs: job.requires.clone(),
@@ -751,7 +763,30 @@ mod tests {
             workflow: None,
         };
         let vars = std::collections::BTreeMap::from([("REGION".to_owned(), "eu".to_owned())]);
-        title_of(&req, &plan, "https://api.github.com", &vars)
+        let run = crate::store::RunRow {
+            id: 9,
+            run_number: 12,
+            run_attempt: 1,
+            tenant_id: "t".into(),
+            repo_id: 4242,
+            workflow: "ci".into(),
+            delivery: "d".into(),
+            event: "workflow_dispatch".into(),
+            git_ref: "refs/heads/main".into(),
+            sha: "abc".into(),
+            actor: "octocat".into(),
+            base_ref: None,
+            status: "queued".into(),
+            conclusion: None,
+            created_at: 0,
+            completed_at: None,
+            retention_days: 30,
+            message: None,
+            pull_number: None,
+            head_ref: None,
+            pull_title: None,
+        };
+        title_of(&req, &plan, "https://api.github.com", &vars, &run)
     }
 
     fn titled(run_name: &str, event: &serde_json::Value) -> Option<String> {
@@ -768,6 +803,19 @@ mod tests {
             )
             .as_deref(),
             Some("Deploy staging to eu by octocat")
+        );
+    }
+
+    #[test]
+    fn run_name_reads_the_run_number() {
+        let event = serde_json::json!({});
+        assert_eq!(
+            titled(
+                "Deploy #${{ github.run_number }} (${{ github.run_id }})",
+                &event
+            )
+            .as_deref(),
+            Some("Deploy #12 (9)")
         );
     }
 

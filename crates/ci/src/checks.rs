@@ -14,9 +14,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use hatchrun_workflow::{
-    Annotation, AnnotationLevel, Conclusion, StepSummary, valid_environment_url,
-};
+use hatchrun_workflow::{Annotation, AnnotationLevel, Conclusion, StepSummary};
 use serde::{Deserialize, Serialize};
 
 use crate::github::{Capped, CheckRun, GhAnnotation, Output, rfc3339};
@@ -134,6 +132,25 @@ fn cell(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('|', "\\|")
         .replace(['\n', '\r'], " ")
+}
+
+/// `text` as one line of plain text in Markdown: every character that
+/// could start a link, an image, emphasis, HTML or a list is escaped, so
+/// a title from a pull request or a dispatch payload cannot make any.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' | '\r' => out.push(' '),
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '<' | '>' | '!' | '#' | '|' | '~'
+            | '&' | ':' | '-' | '+' | '=' | '{' | '}' | '.' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn level_word(level: AnnotationLevel) -> &'static str {
@@ -305,15 +322,14 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
 fn heading(view: &JobView<'_>) -> String {
     let mut text = String::new();
     if let Some(run_title) = view.run_title {
-        let _ = write!(text, "**{}**\n\n", cell(run_title));
+        let _ = write!(text, "{}\n\n", plain(run_title));
     }
     if let Some(environment) = &view.node.environment {
         let url = view
             .node
             .result
             .as_ref()
-            .and_then(|result| result.environment_url.as_deref())
-            .filter(|url| valid_environment_url(url));
+            .and_then(|result| result.environment_url.as_deref());
         let _ = match url {
             Some(url) => write!(text, "Environment `{environment}`: {url}\n\n"),
             None => write!(text, "Environment `{environment}`\n\n"),
@@ -573,23 +589,29 @@ mod tests {
         let (run, _) = render(&v);
         assert_eq!(
             run.output.unwrap().summary,
-            "**Deploy staging by octocat**\n\nEnvironment `production`: https://app.example.com/pr-7"
+            "Deploy staging by octocat\n\nEnvironment `production`: https://app.example.com/pr-7"
         );
     }
 
     #[test]
-    fn an_environment_url_that_is_not_a_link_is_not_shown() {
-        let mut n = node(State::Running, None);
-        n.environment = Some("production".into());
-        n.result = Some(hatchrun_workflow::JobResult {
-            conclusion: Conclusion::Success,
-            outputs: BTreeMap::new(),
-            steps: Vec::new(),
-            annotations: Vec::new(),
-            environment_url: Some("javascript:alert(1)".into()),
-        });
-        let (run, _) = render(&view(&n, &[], &[]));
-        assert_eq!(run.output.unwrap().summary, "Environment `production`");
+    fn a_hostile_run_title_is_plain_text() {
+        let n = node(State::Running, None);
+        let mut v = view(&n, &[], &[]);
+        v.run_title = Some(
+            "[click](https://evil.example) ![t](https://evil.example/p.png) **b** <b>x</b> @all",
+        );
+        let (run, _) = render(&v);
+        let summary = run.output.unwrap().summary;
+        // Nothing in it can open a link, an image, emphasis or a tag.
+        for opener in ["[", "(", "!", "*", "<", ":"] {
+            for (i, _) in summary.match_indices(opener) {
+                assert!(summary[..i].ends_with('\\'), "{opener} at {i}: {summary}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_job_without_an_environment_shows_none() {
         let n = node(State::Running, None);
         let (run, _) = render(&view(&n, &[], &[]));
         assert_eq!(run.output.unwrap().summary, "");

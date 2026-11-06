@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use hatchrun_workflow::{
     Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Need, Outcome, Plan,
     PlannedJob, Ready, Statuses, checks_status, continue_on_error, hatchrun_context, interpolate,
-    job_condition, ready, valid_environment_name,
+    is_expression, job_condition, ready, valid_environment_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -130,7 +130,7 @@ impl Graph {
             jobs: jobs
                 .into_iter()
                 .map(|(id, job)| Node {
-                    environment: job.environment.clone().filter(|name| !name.contains("${{")),
+                    environment: job.environment.clone().filter(|name| !is_expression(name)),
                     id,
                     job,
                     state: State::Waiting,
@@ -144,6 +144,18 @@ impl Graph {
             run_done: false,
             vars: BTreeMap::new(),
         }
+    }
+
+    /// Whether an environment name of the run reads `vars`, which the
+    /// caller then fills with [`Graph::set_vars`] before jobs start.
+    #[must_use]
+    pub fn environments_read_vars(&self) -> bool {
+        self.jobs.iter().any(|n| {
+            n.job
+                .environment
+                .as_deref()
+                .is_some_and(|name| is_expression(name) && name.contains("vars"))
+        })
     }
 
     /// Gives the graph the variables the `continue-on-error` of a job
@@ -740,7 +752,7 @@ impl Graph {
         let Some(template) = self.jobs[at].job.environment.clone() else {
             return Ok(());
         };
-        let name = if template.contains("${{") {
+        let name = if is_expression(&template) {
             let ctx = self.context(at, github_ctx);
             interpolate(&template, &ctx, &Status(JobStatus::Success))
                 .map_err(|e| format!("environment: {e}"))?
@@ -1723,6 +1735,21 @@ workflows:
         assert_eq!(g.node(3).unwrap().state, State::Done(Conclusion::Failure));
         let message = g.node(3).unwrap().message.clone().unwrap();
         assert!(message.starts_with("environment: "), "{message}");
+    }
+
+    #[test]
+    fn an_environment_name_can_read_vars() {
+        let yaml = ENVIRONMENTS.replace(
+            "${{ needs.pick.outputs.stage }}-${{ matrix.zone }}",
+            "${{ vars.STAGE }}-${{ matrix.zone }}",
+        );
+        let mut g = graph_from(&yaml);
+        assert!(g.environments_read_vars());
+        g.set_vars(BTreeMap::from([("STAGE".to_owned(), "qa".to_owned())]));
+        g.advance(&ctx());
+        g.finished(1, ok(), &ctx());
+        assert_eq!(g.node(3).unwrap().environment.as_deref(), Some("qa-a"));
+        assert!(!graph_from(ENVIRONMENTS).environments_read_vars());
     }
 
     #[test]

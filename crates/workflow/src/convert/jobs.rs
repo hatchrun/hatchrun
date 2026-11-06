@@ -9,8 +9,8 @@ use super::rewrite::LATER;
 use super::{
     BTreeMap, BTreeSet, Cancel, Concurrency, ContinueOnError, Cx, Deserialize, GhJob, GhMatrix,
     GhStep, JOB_KEYS, Job, Matrix, OLD_UBUNTU, ParameterKind, Require, RunStep, RunsOn, STEP_KEYS,
-    Step, Strategy, UsesStep, Value, WorkflowJob, expr, plan, template, template_labels,
-    valid_environment_name, vendor_template,
+    Step, Strategy, UsesStep, Value, WORKFLOW_CONTEXTS, WorkflowJob, expr, plan, template,
+    template_labels, valid_environment_name, vendor_template,
 };
 
 impl Cx {
@@ -99,15 +99,12 @@ impl Cx {
                 return None;
             }
         };
-        for (_, inner) in found {
-            for (name, _) in expr::contexts(inner).unwrap_or_default() {
-                if !matches!(name.as_ref(), "github" | "inputs" | "vars") {
-                    self.warn(format!(
-                        "{at} reads `{name}`, which a run title cannot, and was dropped"
-                    ));
-                    return None;
-                }
-            }
+        drop(found);
+        if let Some(name) = plan::unallowed_contexts(&text, WORKFLOW_CONTEXTS).first() {
+            self.warn(format!(
+                "{at} reads `{name}`, which a run title cannot, and was dropped"
+            ));
+            return None;
         }
         Some(text)
     }
@@ -159,25 +156,18 @@ impl Cx {
             }
         };
         if name.contains("${{") {
-            let found = match expr::expressions(name) {
-                Ok(found) => found,
-                Err(e) => {
-                    self.error(format!("{at}: `environment` has a bad expression: {e}"));
-                    return (None, None);
-                }
-            };
-            for (_, inner) in found {
-                for (context, _) in expr::contexts(inner).unwrap_or_default() {
-                    if !matches!(
-                        context.as_ref(),
-                        "github" | "inputs" | "matrix" | "needs" | "strategy" | "parameters"
-                    ) {
-                        self.error(format!(
-                            "{at}: `environment` reads `{context}`; a name can read only github, inputs, matrix, needs and strategy"
-                        ));
-                        return (None, None);
-                    }
-                }
+            if let Err(e) = expr::expressions(name) {
+                self.error(format!("{at}: `environment` has a bad expression: {e}"));
+                return (None, None);
+            }
+            if let Some(context) =
+                plan::unallowed_contexts(name, plan::ENVIRONMENT_CONTEXTS).first()
+            {
+                self.error(format!(
+                    "{at}: `environment` reads `{context}`; a name can read only {}",
+                    plan::ENVIRONMENT_CONTEXTS.join(", ")
+                ));
+                return (None, None);
             }
         } else if let Err(rule) = valid_environment_name(name) {
             self.error(format!("{at}: `environment` `{name}`: {rule}"));

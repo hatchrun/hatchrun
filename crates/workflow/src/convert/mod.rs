@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
+use crate::concurrency::WORKFLOW_CONTEXTS;
 use crate::concurrency::{Cancel, Concurrency};
 use crate::config::{
     Config, ContinueOnError, Job, MAX_SOURCE, Matrix, Parameter, ParameterKind, Require, RunStep,

@@ -1774,14 +1774,14 @@ on: push
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: ${{ vars.STAGE }}
+    environment: ${{ env.STAGE }}
     steps: [{ run: d }]
   lint:
     runs-on: ubuntu-latest
     steps: [{ run: l }]
 ");
     assert!(
-        has(&out.errors, &["`environment` reads `vars`"]),
+        has(&out.errors, &["`environment` reads `env`"]),
         "{:?}",
         out.errors
     );

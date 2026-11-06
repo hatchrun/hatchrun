@@ -284,18 +284,28 @@ fn a_uses_step_timeout_ends_what_its_composite_action_runs() {
 }
 
 #[test]
-fn a_uses_step_without_a_timeout_is_not_cut_short() {
+fn a_uses_step_without_a_timeout_is_not_cut_short_by_the_one_before() {
     let dir = tempfile::tempdir().unwrap();
     local_action(
         dir.path(),
-        "comp",
-        "name: c\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: sleep 3; echo done\n",
+        "quick",
+        "name: q\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo quick\n",
         &[],
     );
-    let mut step = make::uses("c", "./comp");
-    step.timeout_minutes = Some(1);
-    let doc = make::document(vec![PlannedStep::Uses(step)]);
-    let out = exec_with(dir.path(), &json(&doc), &["--minute", "30s"]);
+    local_action(
+        dir.path(),
+        "slow",
+        "name: s\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: sleep 3; echo done\n",
+        &[],
+    );
+    // The first step's limit (1 minute is 1 second here) is over when the
+    // second, which has none, takes three seconds.
+    let mut first = make::uses("q", "./quick");
+    first.timeout_minutes = Some(1);
+    let second = make::uses("s", "./slow");
+    assert_eq!(second.timeout_minutes, None);
+    let doc = make::document(vec![PlannedStep::Uses(first), PlannedStep::Uses(second)]);
+    let out = exec_with(dir.path(), &json(&doc), &["--minute", "1s"]);
     assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
     assert!(
         stdout(&out).lines().any(|l| l == "done"),

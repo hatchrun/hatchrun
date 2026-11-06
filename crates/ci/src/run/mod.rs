@@ -276,6 +276,9 @@ pub enum Work {
         job: u64,
         /// The attempt.
         attempt: u32,
+        /// The environment the graph settled on, for the job's row.
+        #[serde(default)]
+        environment: Option<String>,
     },
     /// The job's row ends.
     FinishJob {
@@ -514,14 +517,25 @@ mod tests {
     fn the_todo_list_keeps_order_and_drops_by_id() {
         let mut todo = Todo::default();
         todo.push(Work::StartRun);
-        todo.push(Work::QueueLaunch { job: 1, attempt: 1 });
+        todo.push(Work::QueueLaunch {
+            job: 1,
+            attempt: 1,
+            environment: None,
+        });
         let first = todo.items[0].id;
         todo.remove(first);
         todo.remove(first);
         assert_eq!(todo.items.len(), 1);
         todo.push(Work::ReopenRun { attempt: 2 });
         assert_ne!(todo.items[0].id, todo.items[1].id);
-        assert_eq!(todo.items[0].work, Work::QueueLaunch { job: 1, attempt: 1 });
+        assert_eq!(
+            todo.items[0].work,
+            Work::QueueLaunch {
+                job: 1,
+                attempt: 1,
+                environment: None
+            }
+        );
     }
 
     #[test]
