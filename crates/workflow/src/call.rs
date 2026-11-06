@@ -350,6 +350,24 @@ impl CallTarget {
         if !plain(owner) || !plain(repo) || file.is_empty() || git_ref.is_empty() {
             return Err(format!("`call: {call}` is not `owner/repo/path.yml@ref`"));
         }
+        // The ref goes into an API path, so it follows git's ref rules
+        // where they keep it inside that path.
+        let bad_ref = git_ref
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+            || git_ref.contains("..")
+            || git_ref.contains("@{")
+            || git_ref.to_ascii_lowercase().ends_with(".lock")
+            || git_ref.chars().any(|c| {
+                c.is_control()
+                    || c.is_whitespace()
+                    || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+            });
+        if bad_ref {
+            return Err(format!(
+                "`call: {call}` has the ref `{git_ref}`, which is not a valid git ref: it may not have an empty, `.` or `..` part, `..`, spaces, control characters or any of `~^:?*[\\`"
+            ));
+        }
         if file.split('/').any(|part| part == ".." || part.is_empty()) {
             return Err(format!(
                 "`call: {call}` has a path with `..` or an empty part"
@@ -788,6 +806,29 @@ mod tests {
         ] {
             let err = CallTarget::parse(text).unwrap_err();
             assert!(err.contains(want), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_ref_cannot_steer_the_api_path() {
+        for bad in [
+            "../../other/repo/commits/main",
+            "..",
+            ".",
+            "a//b",
+            "a/./b",
+            "a/../b",
+            "x..y",
+            "a b",
+            "a\u{7}b",
+            "a:b",
+            "x.lock",
+        ] {
+            let err = CallTarget::parse(&format!("a/b/c.yml@{bad}")).unwrap_err();
+            assert!(err.contains("not a valid git ref"), "{bad}: {err}");
+        }
+        for good in ["main", "v1.2.3", "feature/x-y", "0123abc"] {
+            assert!(CallTarget::parse(&format!("a/b/c.yml@{good}")).is_ok());
         }
     }
 
