@@ -2370,6 +2370,7 @@ fn plan_step(
                 env: sub.map(&uses.env),
                 if_: sub.opt(uses.if_.as_deref()),
                 continue_on_error: uses.continue_on_error,
+                timeout_minutes: uses.timeout_minutes,
             };
             if planned.uses.starts_with("docker://") {
                 sub.walk.report(

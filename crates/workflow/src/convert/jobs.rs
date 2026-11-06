@@ -794,7 +794,6 @@ impl Cx {
                 for (key, set) in [
                     ("shell", gh.shell.is_some()),
                     ("working-directory", gh.working_directory.is_some()),
-                    ("timeout-minutes", gh.timeout_minutes.is_some()),
                 ] {
                     if set {
                         self.warn(format!(
@@ -802,6 +801,8 @@ impl Cx {
                         ));
                     }
                 }
+                let timeout_minutes =
+                    self.minutes(&at, "timeout-minutes", gh.timeout_minutes.as_ref());
                 let step = UsesStep {
                     name: gh.name,
                     id: gh.id,
@@ -810,6 +811,7 @@ impl Cx {
                     env,
                     if_,
                     continue_on_error,
+                    timeout_minutes,
                 };
                 Some(Step::Uses(step))
             }

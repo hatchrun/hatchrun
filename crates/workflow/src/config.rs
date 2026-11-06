@@ -558,6 +558,9 @@ pub struct UsesStep {
     /// A failure does not fail the job.
     #[serde(default, skip_serializing_if = "is_false")]
     pub continue_on_error: bool,
+    /// The step is cancelled after this many minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_minutes: Option<u32>,
 }
 
 /// A `cache:` step.
@@ -672,7 +675,6 @@ impl StepFields {
                 for (key, set) in [
                     ("shell", self.shell.is_some()),
                     ("working-directory", self.working_directory.is_some()),
-                    ("timeout-minutes", self.timeout_minutes.is_some()),
                 ] {
                     if set {
                         return Err(format!("`{key}` is valid only on run steps"));
@@ -686,6 +688,7 @@ impl StepFields {
                     env: self.env.unwrap_or_default(),
                     if_: self.if_,
                     continue_on_error: self.continue_on_error.unwrap_or_default(),
+                    timeout_minutes: self.timeout_minutes,
                 }))
             }
             (None, None) => Err(

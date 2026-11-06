@@ -533,6 +533,33 @@ jobs:
 }
 
 #[test]
+fn uses_steps_keep_their_timeout() {
+    let out = ok("
+on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v4
+        timeout-minutes: 4
+      - uses: actions/setup-node@v4
+        timeout-minutes: soon
+");
+    let steps = &out.config.jobs["ci-t"].steps;
+    let Step::Uses(first) = &steps[0] else {
+        panic!("{:?}", steps[0])
+    };
+    let Step::Uses(second) = &steps[1] else {
+        panic!("{:?}", steps[1])
+    };
+    assert_eq!(first.timeout_minutes, Some(4));
+    assert_eq!(second.timeout_minutes, None);
+    assert!(has(&out.warnings, &["timeout-minutes: soon", "dropped"]));
+    assert!(!has(&out.warnings, &["only on run steps"]));
+    round_trips(&out);
+}
+
+#[test]
 fn several_files_become_several_workflows() {
     let out = convert(&[
         (

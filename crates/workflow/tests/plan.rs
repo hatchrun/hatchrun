@@ -56,6 +56,30 @@ fn runs(job: &PlannedJob) -> Vec<&str> {
 }
 
 #[test]
+fn uses_steps_take_a_timeout() {
+    let p = plan(
+        r#"
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - { uses: "actions/cache@v4", timeout-minutes: 7 }
+      - { uses: "actions/setup-node@v4" }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+"#,
+    );
+    let timeouts: Vec<Option<u32>> = p.jobs[0]
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            PlannedStep::Uses(u) => Some(u.timeout_minutes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(timeouts, [Some(7), None]);
+}
+
+#[test]
 fn expands_the_spec_example() {
     let config = parse(include_str!("fixtures/spec_example.yml")).unwrap();
     let plan = compile(&config, "ci", "refs/heads/main").unwrap();

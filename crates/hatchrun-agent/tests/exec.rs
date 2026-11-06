@@ -254,6 +254,57 @@ fn timeout_kills_the_process_group() {
 }
 
 #[test]
+fn a_uses_step_timeout_ends_what_its_composite_action_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: trap '' TERM; sleep 600\n",
+        &[],
+    );
+    let mut step = make::uses("c", "./comp");
+    step.timeout_minutes = Some(1);
+    let mut always = make::run("echo after");
+    always.if_ = Some("always()".to_owned());
+    let doc = make::document(vec![PlannedStep::Uses(step), make::planned(always)]);
+    let began = Instant::now();
+    let out = exec_with(dir.path(), &json(&doc), &["--minute", "2s"]);
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let text = stdout(&out);
+    assert!(text.contains("timed out after 1 minutes"), "{text}");
+    assert!(text.lines().any(|l| l == "after"), "{text}");
+    let result = result(dir.path());
+    assert_eq!(result.steps[0].outcome, Conclusion::Failure);
+    assert_eq!(result.steps[1].outcome, Conclusion::Success);
+}
+
+#[test]
+fn a_uses_step_without_a_timeout_is_not_cut_short() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: sleep 3; echo done\n",
+        &[],
+    );
+    let mut step = make::uses("c", "./comp");
+    step.timeout_minutes = Some(1);
+    let doc = make::document(vec![PlannedStep::Uses(step)]);
+    let out = exec_with(dir.path(), &json(&doc), &["--minute", "30s"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    assert!(
+        stdout(&out).lines().any(|l| l == "done"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
 fn background_child_does_not_hold_the_step() {
     // The step ends when its shell does; the child lives on until the
     // job ends, which stops it.
