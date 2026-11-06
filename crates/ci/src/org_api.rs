@@ -30,7 +30,7 @@ use crate::api::{Cx, Served, Stop, access_name, name, no_content, now_ms, reply,
 use crate::billing;
 use crate::installation;
 use crate::page::{self, Query};
-use crate::settings_api::{admin_tenant, audit};
+use crate::settings_api::{admin_tenant, audit_of};
 use crate::store::{
     self, After, BranchAfter, JobCounts, ListedRun, PullAfter, RepoFilter, RepoRow, RepoVisibility,
     RunFilter, RunStatus, TenantRow,
@@ -543,16 +543,16 @@ async fn patch_enabled_done(cx: &Cx<'_>, org: &str, req: &mut Request, max_body:
         None if !asked.remove.is_empty() => Some(false),
         other => other,
     };
-    store::patch_enabled(cx.db, &tenant.id, all, &asked.add, &asked.remove).await?;
-    audit(
+    let target = enabled_target(&asked);
+    let audit = audit_of(
         cx,
         &tenant.id,
         store::Action::ReposEnabled,
         "org",
         None,
-        &enabled_target(&asked),
-    )
-    .await?;
+        &target,
+    );
+    store::patch_enabled(cx.db, &tenant.id, all, &asked.add, &asked.remove, &audit).await?;
     Ok(no_content()?)
 }
 

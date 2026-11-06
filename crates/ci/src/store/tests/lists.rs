@@ -237,9 +237,38 @@ fn names(page: &(Vec<OrgRepo>, u64)) -> Vec<&str> {
     page.0.iter().map(|repo| repo.name.as_str()).collect()
 }
 
+fn readers_see_public_and_reachable_repos(db: &TestDb) {
+    // A reader who is not an admin sees public repositories and the
+    // private ones they reach.
+    let reach_none = RepoFilter {
+        reach: Some(&[]),
+        ..RepoFilter::default()
+    };
+    let seen = db
+        .wait(repos_page(db.db(), "t1", reach_none, 0, 10))
+        .unwrap();
+    assert_eq!(names(&seen), ["acme/app-renamed", "acme/new"]);
+    let reach_api = RepoFilter {
+        reach: Some(&[8]),
+        ..RepoFilter::default()
+    };
+    let seen = db
+        .wait(repos_page(db.db(), "t1", reach_api, 0, 10))
+        .unwrap();
+    assert_eq!(
+        (names(&seen), seen.1),
+        (vec!["acme/api", "acme/app-renamed", "acme/new"], 3)
+    );
+}
+
 #[test]
 fn installation_repositories_sync_and_keep_their_choice() {
     let db = setup();
+    let patch = |all: Option<bool>, add: &[String], remove: &[String]| {
+        let audit = super::secrets::audit(Action::ReposEnabled, "x");
+        db.wait(patch_enabled(db.db(), "t1", all, add, remove, &audit))
+            .unwrap();
+    };
     let repos = [
         installed(7, "acme/app", false),
         installed(8, "acme/api", true),
@@ -258,15 +287,18 @@ fn installation_repositories_sync_and_keep_their_choice() {
     // The tenant runs everything: all are enabled.
     assert!(db.wait(repo_enabled(db.db(), "t1", 8)).unwrap());
 
-    // Choose two; web leaves, a new one arrives.
-    db.wait(patch_enabled(
-        db.db(),
-        "t1",
+    // Leave all mode with everything off, then choose api again.
+    patch(
         Some(false),
-        &["ACME/api".to_owned()],
-        &["acme/app".to_owned(), "acme/web".to_owned()],
-    ))
-    .unwrap();
+        &[],
+        &[
+            "acme/api".to_owned(),
+            "acme/app".to_owned(),
+            "acme/web".to_owned(),
+        ],
+    );
+    assert!(!db.wait(repo_enabled(db.db(), "t1", 8)).unwrap());
+    patch(None, &["ACME/api".to_owned()], &[]);
     assert!(db.wait(repo_enabled(db.db(), "t1", 8)).unwrap());
     assert!(!db.wait(repo_enabled(db.db(), "t1", 7)).unwrap());
     let next = [
@@ -313,36 +345,14 @@ fn installation_repositories_sync_and_keep_their_choice() {
     let found = db.wait(repos_page(db.db(), "t1", text, 0, 10)).unwrap();
     assert_eq!(names(&found), ["acme/app-renamed"]);
 
-    // A reader who is not an admin sees public repositories and the
-    // private ones they reach.
-    let reach_none = RepoFilter {
-        reach: Some(&[]),
-        ..RepoFilter::default()
-    };
-    let seen = db
-        .wait(repos_page(db.db(), "t1", reach_none, 0, 10))
-        .unwrap();
-    assert_eq!(names(&seen), ["acme/app-renamed", "acme/new"]);
-    let reach_api = RepoFilter {
-        reach: Some(&[8]),
-        ..RepoFilter::default()
-    };
-    let seen = db
-        .wait(repos_page(db.db(), "t1", reach_api, 0, 10))
-        .unwrap();
-    assert_eq!(
-        (names(&seen), seen.1),
-        (vec!["acme/api", "acme/app-renamed", "acme/new"], 3)
-    );
+    readers_see_public_and_reachable_repos(&db);
 
     // All again.
-    db.wait(patch_enabled(db.db(), "t1", Some(true), &[], &[]))
-        .unwrap();
+    patch(Some(true), &[], &[]);
     assert!(db.wait(repo_enabled(db.db(), "t1", 10)).unwrap());
     // A repository without a row follows the flag.
     assert!(db.wait(repo_enabled(db.db(), "t1", 4242)).unwrap());
-    db.wait(patch_enabled(db.db(), "t1", Some(false), &[], &[]))
-        .unwrap();
+    patch(Some(false), &[], &[]);
     assert!(!db.wait(repo_enabled(db.db(), "t1", 4242)).unwrap());
     // Leaving the mode keeps each repository's choice.
     assert!(db.wait(repo_enabled(db.db(), "t1", 10)).unwrap());
@@ -404,6 +414,7 @@ fn unknown_names_and_the_setup_counts() {
         Some(false),
         &[],
         &["acme/api".to_owned()],
+        &super::secrets::audit(Action::ReposEnabled, "x"),
     ))
     .unwrap();
     let row = db.wait(tenant_setup(db.db(), "t1")).unwrap().unwrap();
@@ -474,6 +485,7 @@ fn environments_of_the_organization_count_their_secrets_and_vars() {
                 name == "prod",
                 10,
                 5,
+                &super::secrets::audit(Action::EnvironmentPut, "x"),
             ))
             .unwrap();
         assert!(matches!(put, PutEnvironment::Saved(_)));

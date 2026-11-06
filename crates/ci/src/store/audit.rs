@@ -5,7 +5,7 @@
 //! The audit trail of an organization's settings: secrets, vars,
 //! environments and the repositories that run CI.
 
-use hatchrun_cloud::db::{Db, params};
+use hatchrun_cloud::db::{Db, Param, params};
 use serde::Deserialize;
 use worker::Result;
 
@@ -84,24 +84,62 @@ pub struct AuditRow {
     pub target: String,
 }
 
-/// Records `audit`.
+impl NewAudit<'_> {
+    /// The binds of [`NewAudit::insert_sql`], tenant to repository.
+    pub(super) fn binds(&self) -> Vec<Param> {
+        params![
+            self.tenant,
+            self.now,
+            self.actor,
+            self.action.as_str(),
+            self.scope,
+            self.repo
+        ]
+    }
+
+    /// The binds of [`NewAudit::insert_sql`] with the target bound
+    /// last.
+    pub(super) fn binds_with_target(&self) -> Vec<Param> {
+        let mut binds = self.binds();
+        binds.push(Param::from(self.target));
+        binds
+    }
+
+    /// An `INSERT` of the row, to run in the transaction of the change
+    /// it records. Its binds start at `$first` (see [`NewAudit::binds`]);
+    /// `target` is the SQL of the target column, `${first + 6}` after
+    /// [`NewAudit::binds_with_target`]. `from` is a table expression
+    /// that has a row only when the change happened.
+    pub(super) fn insert_sql(first: usize, target: &str, from: &str) -> String {
+        format!(
+            "INSERT INTO ci_audit (tenant_id, at, actor, action, scope, repo, target) \
+             SELECT ${}::text, ${}::bigint, ${}::text, ${}::text, ${}::text, ${}::text, \
+             {target} FROM {from}",
+            first,
+            first + 1,
+            first + 2,
+            first + 3,
+            first + 4,
+            first + 5
+        )
+    }
+
+    /// As [`NewAudit::insert_sql`], with the target bound last.
+    pub(super) fn insert_bound_sql(first: usize, from: &str) -> String {
+        Self::insert_sql(first, &format!("${}::text", first + 6), from)
+    }
+}
+
+/// Records `audit` on its own. A change to settings records itself in
+/// its own transaction instead (see [`NewAudit::insert_sql`]).
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
 pub async fn record_audit(db: &Db, audit: &NewAudit<'_>) -> Result<()> {
     db.run(
-        "INSERT INTO ci_audit (tenant_id, at, actor, action, scope, repo, target) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        &params![
-            audit.tenant,
-            audit.now,
-            audit.actor,
-            audit.action.as_str(),
-            audit.scope,
-            audit.repo,
-            audit.target
-        ],
+        &NewAudit::insert_bound_sql(1, "(SELECT 1) one"),
+        &audit.binds_with_target(),
     )
     .await?;
     Ok(())

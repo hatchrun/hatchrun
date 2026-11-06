@@ -11,6 +11,7 @@ use hatchrun_cloud::db::{Db, Param, params};
 use serde::Deserialize;
 use worker::Result;
 
+use super::NewAudit;
 use super::jobs::LOCK_TENANT;
 
 /// Where a secret or var row lives.
@@ -111,10 +112,16 @@ const PUT_VAR: &str = "INSERT INTO ci_vars \
 pub(super) struct Saved {}
 
 /// Runs a put statement with the tenant row locked, so two puts cannot
-/// both take the last place.
-async fn put(db: &Db, tenant: &str, sql: &str, bound: &[Param]) -> Result<Put> {
-    let lock = params![tenant];
-    let saved: Option<Saved> = db.first_locked((LOCK_TENANT, &lock), sql, bound).await?;
+/// both take the last place. The audit row goes in with it, binds
+/// after `bound`, and only when the row was stored.
+async fn put(db: &Db, sql: &str, mut bound: Vec<Param>, audit: &NewAudit<'_>) -> Result<Put> {
+    let sql = format!(
+        "WITH saved AS ({sql}), audited AS ({}) SELECT 1 AS saved FROM saved",
+        NewAudit::insert_bound_sql(bound.len() + 1, "saved")
+    );
+    bound.extend(audit.binds_with_target());
+    let lock = params![audit.tenant];
+    let saved: Option<Saved> = db.first_locked((LOCK_TENANT, &lock), &sql, &bound).await?;
     Ok(if saved.is_some() {
         Put::Saved
     } else {
@@ -150,12 +157,12 @@ pub async fn put_secret(
     sealed: &str,
     limit: u32,
     now: u64,
+    audit: &NewAudit<'_>,
 ) -> Result<Put> {
     put(
         db,
-        tenant,
         PUT_SECRET,
-        &params![
+        params![
             tenant,
             owner.repo_id(),
             owner.environment_id(),
@@ -166,8 +173,35 @@ pub async fn put_secret(
             now,
             array_text(repositories)
         ],
+        audit,
     )
     .await
+}
+
+/// Deletes row `name` of `table` and records `audit` in the same
+/// transaction. Returns whether it existed.
+async fn delete(
+    db: &Db,
+    table: &str,
+    tenant: &str,
+    owner: Owner,
+    name: &str,
+    audit: &NewAudit<'_>,
+) -> Result<bool> {
+    let mut bound = params![tenant, owner.repo_id(), owner.environment_id(), name];
+    bound.extend(audit.binds_with_target());
+    db.run(
+        &format!(
+            "WITH gone AS (DELETE FROM {table} WHERE tenant_id = $1 \
+               AND repo_id IS NOT DISTINCT FROM $2::bigint \
+               AND environment_id IS NOT DISTINCT FROM $3::bigint AND name = $4 \
+               RETURNING 1) {}",
+            NewAudit::insert_bound_sql(5, "gone")
+        ),
+        &bound,
+    )
+    .await
+    .map(|n| n > 0)
 }
 
 /// Deletes secret `name`. Returns whether it existed.
@@ -175,26 +209,29 @@ pub async fn put_secret(
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn delete_secret(db: &Db, tenant: &str, owner: Owner, name: &str) -> Result<bool> {
-    db.run(
-        "DELETE FROM ci_secrets WHERE tenant_id = $1 \
-         AND repo_id IS NOT DISTINCT FROM $2::bigint \
-         AND environment_id IS NOT DISTINCT FROM $3::bigint AND name = $4",
-        &params![tenant, owner.repo_id(), owner.environment_id(), name],
-    )
-    .await
-    .map(|n| n > 0)
+pub async fn delete_secret(
+    db: &Db,
+    tenant: &str,
+    owner: Owner,
+    name: &str,
+    audit: &NewAudit<'_>,
+) -> Result<bool> {
+    delete(db, "ci_secrets", tenant, owner, name, audit).await
 }
 
 /// The names of the repositories an organization row reaches: a JSON
 /// array of `ci_repos.full_name`, or NULL when it reaches all of them.
 /// Repositories renamed to `#gone-` (deleted or transferred) are left
 /// out, so a list read back and sent in a `PUT` names only repositories
-/// that still exist. For a query that aliases the secrets or vars table
-/// as `s`.
+/// that still exist. A repository's or environment's view (`$2` is the
+/// repository) names only that repository, so an inherited row does not
+/// show the other repositories of its restriction list; it stays
+/// restricted. For a query that aliases the secrets or vars table as
+/// `s`.
 const REPOSITORY_NAMES: &str = "CASE WHEN s.repositories IS NULL THEN NULL ELSE \
        COALESCE((SELECT json_agg(r.full_name ORDER BY lower(r.full_name)) FROM ci_repos r \
          WHERE r.id = ANY (s.repositories) AND r.tenant_id = s.tenant_id \
+         AND ($2::bigint IS NULL OR r.id = $2) \
          AND position('#gone-' in r.full_name) = 0), \
          '[]'::json)::text END AS repositories";
 
@@ -431,12 +468,12 @@ pub async fn put_var(
     value: &str,
     limit: u32,
     now: u64,
+    audit: &NewAudit<'_>,
 ) -> Result<Put> {
     put(
         db,
-        tenant,
         PUT_VAR,
-        &params![
+        params![
             tenant,
             owner.repo_id(),
             owner.environment_id(),
@@ -446,6 +483,7 @@ pub async fn put_var(
             now,
             array_text(repositories)
         ],
+        audit,
     )
     .await
 }
@@ -455,15 +493,14 @@ pub async fn put_var(
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn delete_var(db: &Db, tenant: &str, owner: Owner, name: &str) -> Result<bool> {
-    db.run(
-        "DELETE FROM ci_vars WHERE tenant_id = $1 \
-         AND repo_id IS NOT DISTINCT FROM $2::bigint \
-         AND environment_id IS NOT DISTINCT FROM $3::bigint AND name = $4",
-        &params![tenant, owner.repo_id(), owner.environment_id(), name],
-    )
-    .await
-    .map(|n| n > 0)
+pub async fn delete_var(
+    db: &Db,
+    tenant: &str,
+    owner: Owner,
+    name: &str,
+    audit: &NewAudit<'_>,
+) -> Result<bool> {
+    delete(db, "ci_vars", tenant, owner, name, audit).await
 }
 
 #[derive(Deserialize)]
@@ -513,9 +550,22 @@ pub async fn vars(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<VarItem>> {
     Ok(items)
 }
 
-/// Records at `now` that a job of repository `repo_id` and environment
-/// `environment_id` of `tenant` received the secrets in `names` and
-/// every var. Only the row that wins its name is marked.
+/// The rows a job received, one per name: the last of `rows`, which
+/// come from the widest scope to the narrowest, as the job reads them.
+#[must_use]
+pub fn winners<'a>(rows: impl IntoIterator<Item = (&'a str, Owner)>) -> Vec<(String, Owner)> {
+    let mut won: BTreeMap<&str, Owner> = BTreeMap::new();
+    for (name, owner) in rows {
+        won.insert(name, owner);
+    }
+    won.into_iter()
+        .map(|(name, owner)| (name.to_owned(), owner))
+        .collect()
+}
+
+/// Records at `now` that a job of `tenant` received the secret and var
+/// rows given, each as its name and owner. A row that was used later
+/// keeps its later time.
 ///
 /// # Errors
 ///
@@ -523,43 +573,65 @@ pub async fn vars(db: &Db, tenant: &str, owner: Owner) -> Result<Vec<VarItem>> {
 pub async fn mark_used(
     db: &Db,
     tenant: &str,
-    repo_id: u64,
-    environment_id: Option<u64>,
-    names: &[String],
+    secrets: &[(String, Owner)],
+    vars: &[(String, Owner)],
     now: u64,
 ) -> Result<()> {
-    let winner = |table: &str, only: &str| {
+    let mark = |table: &str| {
         format!(
-            "UPDATE {table} s SET last_used_at = $4 WHERE {} {only} AND NOT EXISTS ( \
-             SELECT 1 FROM {table} w WHERE {} AND w.name = s.name AND {} > {})",
-            reach("s"),
-            reach("w"),
-            rank("w"),
-            rank("s")
+            "UPDATE {table} s SET last_used_at = GREATEST(COALESCE(s.last_used_at, $3), $3) \
+             FROM jsonb_to_recordset($2::jsonb) AS k(repo_id bigint, environment_id bigint, name text) \
+             WHERE s.tenant_id = $1 AND s.name = k.name \
+             AND s.repo_id IS NOT DISTINCT FROM k.repo_id \
+             AND s.environment_id IS NOT DISTINCT FROM k.environment_id"
         )
     };
-    let bound = params![tenant, repo_id, environment_id, now];
-    let mut statements = vec![(winner("ci_vars", ""), bound.clone())];
-    if !names.is_empty() {
-        let mut with_names = bound;
-        with_names.push(Param::from(names.join(",")));
-        statements.push((
-            winner("ci_secrets", "AND s.name = ANY (string_to_array($5, ','))"),
-            with_names,
-        ));
+    let keys = |rows: &[(String, Owner)]| -> Result<String> {
+        let keys: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(name, owner)| {
+                serde_json::json!({
+                    "repo_id": owner.repo_id(),
+                    "environment_id": owner.environment_id(),
+                    "name": name,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_string(&keys)?)
+    };
+    let mut statements = Vec::new();
+    for (table, rows) in [("ci_secrets", secrets), ("ci_vars", vars)] {
+        if !rows.is_empty() {
+            statements.push((mark(table), params![tenant, keys(rows)?, now]));
+        }
     }
     let statements: Vec<(&str, Vec<Param>)> = statements
         .iter()
         .map(|(sql, bound)| (sql.as_str(), bound.clone()))
         .collect();
-    db.batch(&statements).await?;
+    if !statements.is_empty() {
+        db.batch(&statements).await?;
+    }
     Ok(())
 }
 
+/// A var a job receives, with the row it comes from.
 #[derive(Deserialize)]
-struct JobVar {
-    name: String,
-    value: String,
+pub struct JobVar {
+    /// The name.
+    pub name: String,
+    /// The value.
+    pub value: String,
+    repo_id: Option<u64>,
+    environment_id: Option<u64>,
+}
+
+impl JobVar {
+    /// Whose row it is.
+    #[must_use]
+    pub fn owner(&self) -> Owner {
+        Owner::of(self.repo_id, self.environment_id)
+    }
 }
 
 /// The organization's vars that reach repository `repo_id`, overlaid
@@ -574,18 +646,32 @@ pub async fn job_vars(
     repo_id: u64,
     environment_id: Option<u64>,
 ) -> Result<BTreeMap<String, String>> {
-    let rows: Vec<JobVar> = db
-        .all(
-            "SELECT name, value FROM ci_vars WHERE tenant_id = $1 \
+    let rows = job_var_rows(db, tenant, repo_id, environment_id).await?;
+    Ok(rows.into_iter().map(|r| (r.name, r.value)).collect())
+}
+
+/// The rows [`job_vars`] overlays, from the widest scope to the
+/// narrowest.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn job_var_rows(
+    db: &Db,
+    tenant: &str,
+    repo_id: u64,
+    environment_id: Option<u64>,
+) -> Result<Vec<JobVar>> {
+    db.all(
+        "SELECT name, value, repo_id, environment_id FROM ci_vars WHERE tenant_id = $1 \
              AND ((repo_id IS NULL \
                AND (repositories IS NULL OR $2::bigint = ANY (repositories))) \
                OR (repo_id = $2 \
                AND (environment_id IS NULL OR environment_id = $3::bigint))) \
              ORDER BY repo_id NULLS FIRST, environment_id NULLS FIRST",
-            &params![tenant, repo_id, environment_id],
-        )
-        .await?;
-    Ok(rows.into_iter().map(|r| (r.name, r.value)).collect())
+        &params![tenant, repo_id, environment_id],
+    )
+    .await
 }
 
 #[derive(Deserialize)]

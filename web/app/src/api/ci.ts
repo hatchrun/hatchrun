@@ -6,7 +6,7 @@
 // orchestrator. Shapes follow crates/ci/src/api.rs. Times are Unix
 // milliseconds. List routes answer `Page<T>`.
 
-import { adminOnly, ApiError, del, failure, get, post, put, queryString, retrying, type Page, type Paging } from "./core";
+import { adminOnly, ApiError, del, failure, get, patch, post, put, queryString, retrying, type Page, type Paging } from "./core";
 
 const orgPath = (org: string) => `/api/ci/orgs/${encodeURIComponent(org)}`;
 const repoPath = (owner: string, repo: string) => `/api/ci/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
@@ -325,9 +325,23 @@ export interface OrgRepoQuery extends Paging {
 export const listOrgRepos = (org: string, { q, enabled, cursor, limit }: OrgRepoQuery = {}) =>
   retrying(() => get<Page<CiOrgRepo>>(`${orgPath(org)}/repos${queryString({ q, enabled, cursor, limit })}`));
 
-/** Chooses which repositories start runs (org admin). `all` ignores `repos`. */
-export const setEnabledRepos = (org: string, body: { all: boolean; repos: string[] }) =>
-  adminOnly(() => put<undefined>(`${orgPath(org)}/repos/enabled`, body));
+/**
+ * Changes which repositories start runs (org admin), from the saved selection to the chosen one.
+ * `all` sends no names; otherwise only the repositories that differ go in `add` and `remove`.
+ */
+export const setEnabledRepos = (org: string, saved: { all: boolean; repos: string[] }, chosen: { all: boolean; repos: string[] }) => {
+  const keep = (names: string[]) => new Set(names.map((name) => name.toLowerCase()));
+  const had = keep(saved.repos);
+  const wants = keep(chosen.repos);
+  const body = chosen.all
+    ? { all: true }
+    : {
+        all: false,
+        add: chosen.repos.filter((name) => !had.has(name.toLowerCase())),
+        remove: saved.repos.filter((name) => !wants.has(name.toLowerCase())),
+      };
+  return adminOnly(() => patch<undefined>(`${orgPath(org)}/repos/enabled`, body));
+};
 
 export interface OrgSetup {
   app: { installed: boolean; repos: number; manage_url: string };
