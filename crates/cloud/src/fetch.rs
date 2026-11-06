@@ -46,6 +46,18 @@ impl Counted {
         self.sent.get()
     }
 
+    /// Keeps what `response`, an answer to a call as `installation_id`,
+    /// shows of the rate limit; `remaining` is its `x-ratelimit-remaining`
+    /// header.
+    pub fn note(&self, installation_id: u64, response: &Response, remaining: Option<&str>) {
+        let seen = github::rate_limit(response, remaining);
+        self.limits
+            .borrow_mut()
+            .entry(installation_id)
+            .and_modify(|limit| *limit = limit.merge(seen))
+            .or_insert(seen);
+    }
+
     /// The installations whose answers had little left or were refused
     /// for the rate limit, with the lowest each showed.
     pub fn low(&self) -> Vec<(u64, RateLimit)> {
@@ -72,12 +84,7 @@ impl Sender for Counted {
         self.sent.set(self.sent.get() + 1);
         let (response, remaining) =
             send_reading(request, Some(github::RATE_LIMIT_REMAINING)).await?;
-        let seen = github::rate_limit(&response, remaining.as_deref());
-        self.limits
-            .borrow_mut()
-            .entry(installation_id)
-            .and_modify(|limit| *limit = limit.merge(seen))
-            .or_insert(seen);
+        self.note(installation_id, &response, remaining.as_deref());
         Ok(response)
     }
 }

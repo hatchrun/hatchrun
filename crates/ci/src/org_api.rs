@@ -493,7 +493,7 @@ fn parse_enabled(body: &[u8], max_body: usize) -> std::result::Result<EnabledBod
 }
 
 /// What the audit row of an enable change says: `all` or `none`, then
-/// how many repositories were added and removed.
+/// the repositories added (`+owner/name`) and removed (`-owner/name`).
 fn enabled_target(asked: &EnabledBody) -> String {
     let mut parts = Vec::new();
     match asked.all {
@@ -501,12 +501,8 @@ fn enabled_target(asked: &EnabledBody) -> String {
         Some(false) => parts.push("none".to_owned()),
         None => {}
     }
-    if !asked.add.is_empty() {
-        parts.push(format!("+{}", asked.add.len()));
-    }
-    if !asked.remove.is_empty() {
-        parts.push(format!("-{}", asked.remove.len()));
-    }
+    parts.extend(asked.add.iter().map(|repo| format!("+{repo}")));
+    parts.extend(asked.remove.iter().map(|repo| format!("-{repo}")));
     parts.join(" ")
 }
 
@@ -778,7 +774,7 @@ mod tests {
         assert_eq!(ok.all, Some(false));
         assert_eq!(ok.add, ["acme/app"]);
         assert_eq!(ok.remove, ["acme/web"]);
-        assert_eq!(enabled_target(&ok), "none +1 -1");
+        assert_eq!(enabled_target(&ok), "none +acme/app -acme/web");
         let all = parse_enabled(br#"{"all":true}"#, 1000).unwrap();
         assert_eq!(enabled_target(&all), "all");
         let add = parse_enabled(br#"{"add":["acme/app"]}"#, 1000).unwrap();

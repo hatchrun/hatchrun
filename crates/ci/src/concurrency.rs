@@ -268,7 +268,7 @@ async fn post_cancel(env: &Env, victim: &Victim) -> Result<(), String> {
 /// still open, which happens when the first cancel failed and the one
 /// that waited was promoted before anything looked at the group again.
 /// Takes `budget` for each call and stops when it is spent. Returns how
-/// many cancels it sent.
+/// many cancels failed to send.
 ///
 /// # Errors
 ///
@@ -278,14 +278,14 @@ pub async fn resend_cancels(
     db: &Db,
     limit: u32,
     mut take: impl FnMut() -> bool,
-) -> worker::Result<usize> {
-    let mut sent = 0;
+) -> worker::Result<u32> {
+    let mut failed = 0;
     for victim in store::unfinished_superseded(db, limit).await? {
         if !take() {
             break;
         }
-        sent += 1;
         if let Err(err) = post_cancel(env, &victim).await {
+            failed += 1;
             console_error!(
                 "group {}: cancel run {} again: {err}",
                 victim.group_name,
@@ -293,7 +293,7 @@ pub async fn resend_cancels(
             );
         }
     }
-    Ok(sent)
+    Ok(failed)
 }
 
 /// A run (`job_id` is `None`) or a job ended: gives up its place in its

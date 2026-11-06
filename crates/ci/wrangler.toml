@@ -72,12 +72,23 @@ max_retries = 3
 max_concurrency = 10
 dead_letter_queue = "hatchrun-ci-launches-dlq"
 
-# Launch messages that ran out of retries.
+# Launch messages that ran out of retries. This Worker records each one
+# in ci_failed_launches and emails the failed launch alert
+# (crates/ci/src/alerts); the reconciler launches the job again.
 [[queues.consumers]]
 queue = "hatchrun-ci-launches-dlq"
 max_batch_size = 10
 max_batch_timeout = 5
 max_retries = 3
+
+# Alert emails, sent through Cloudflare Email Service from
+# alerts@notify.hatchrun.io, a subdomain onboarded to Email Sending so
+# hatchrun.io's own mail records stay as they are. The binding sends
+# from that address only. The inbox is the ALERT_EMAIL secret, kept out
+# of this public file.
+[[send_email]]
+name = "ALERTS"
+allowed_sender_addresses = ["alerts@notify.hatchrun.io"]
 
 # The key that seals CI secrets, from the account's Secrets Store;
 # e2e.sh points store_id at a local store. secret_name is a secret in
@@ -99,11 +110,12 @@ secret_name = "ci-secrets-key-2026-10"
 # `openssl genrsa 2048`, the PEM must be PKCS#8: add `| openssl pkcs8
 # -topk8 -nocrypt`),
 # BROKER_TOKEN (shared with hatchrun-broker), CI_TOKEN_KEY (the HMAC
-# key of job tokens) and POLAR_ACCESS_TOKEN (the usage events only; the
-# same token hatchrun-cloud holds), uploaded by
-# deploy-ci.yml, and CI_ROLE_ARN, set once on the Worker by hand: the
-# RoleArn output of deploy/cloudformation/ci-account.yaml, the role
-# the Worker assumes in the CI AWS account. The Worker finds the
+# key of job tokens), POLAR_ACCESS_TOKEN (the usage events only; the
+# same token hatchrun-cloud holds) and ALERT_EMAIL (the inbox alerts go
+# to), uploaded by deploy-ci.yml, and CI_ROLE_ARN, set once on the
+# Worker by hand: the RoleArn output of
+# deploy/cloudformation/ci-account.yaml, the role the Worker assumes in
+# the CI AWS account. The Worker finds the
 # launch template and subnets there by name and tag.
 # Variables: those below.
 [vars]
