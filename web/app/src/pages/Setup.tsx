@@ -5,7 +5,7 @@
 import { ExternalLink } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { getCiBilling, getOrgSetup, listOrgRepos, setEnabledRepos, type CiOrgRepo, type OrgSetup } from "@/api";
+import { getCiBilling, getOrgSetup, listOrgRepos, patchEnabledRepos, type CiOrgRepo, type OrgSetup } from "@/api";
 import { CardButton, dollars, FIELD, SpendCapForm } from "@/components/BillingParts";
 import { Checklist, ChecklistCount, type Step } from "@/components/Checklist";
 import { CopyButton } from "@/components/CopyButton";
@@ -120,55 +120,68 @@ function SetupSteps({ org, setup, reload }: { org: string; setup: OrgSetup; relo
   );
 }
 
-/** All enabled repositories, read a page at a time. */
+/** The first page of enabled repositories: enough to pick one for the starter file. */
 async function readEnabled(org: string): Promise<CiOrgRepo[]> {
-  const repos: CiOrgRepo[] = [];
-  let cursor: string | null = null;
-  do {
-    const page: Awaited<ReturnType<typeof listOrgRepos>> = await listOrgRepos(org, { enabled: true, limit: 100, cursor });
-    repos.push(...page.items);
-    cursor = page.next;
-  } while (cursor);
-  return repos;
+  return (await listOrgRepos(org, { enabled: true, limit: 50 })).items;
 }
 
 function EnableRepos({ org, setup, enabled, reloadEnabled, onChanged }: { org: string; setup: OrgSetup; enabled: Loaded<CiOrgRepo[]>; reloadEnabled: () => void; onChanged: () => void }) {
-  // Kept here so the message survives the form remounting on the saved-selection key.
+  // Kept here so the message survives the form remounting.
   const [result, setResult] = useState<SaveResult | null>(null);
   return (
-    <Await loaded={enabled} retry={reloadEnabled}>
-      {(repos) => (
-        <EnableForm
-          // A different saved selection starts a new draft, once the refreshed list is in.
-          key={`${setup.enabled.all}:${repos.map((repo) => repo.name).join(",")}`}
-          org={org}
-          result={result}
-          setResult={setResult}
-          total={setup.app.repos}
-          saved={{ all: setup.enabled.all, repos: repos.map((repo) => repo.name) }}
-          onChanged={() => {
-            reloadEnabled();
-            onChanged();
-          }}
-        />
-      )}
-    </Await>
+    <EnableForm
+      org={org}
+      result={result}
+      setResult={setResult}
+      total={setup.app.repos}
+      allOn={setup.enabled.all}
+      enabledCount={setup.enabled.count}
+      onChanged={() => {
+        reloadEnabled();
+        onChanged();
+      }}
+      failed={enabled.state === "error" ? reloadEnabled : null}
+    />
   );
 }
 
 type SaveResult = { ok: boolean; text: string };
 
-function EnableForm({ org, total, saved, result, setResult, onChanged }: { org: string; total: number; saved: RepoSelection; result: SaveResult | null; setResult: (result: SaveResult | null) => void; onChanged: () => void }) {
-  const [draft, setDraft] = useState<RepoSelection>(saved);
+/**
+ * Changes the enabled set with PATCH: the picked repositories are added
+ * or removed, the rest are left as they are. The saved set is never read
+ * in full, so the form opens at once on an org with thousands of repositories.
+ */
+function EnableForm({
+  org,
+  total,
+  allOn,
+  enabledCount,
+  result,
+  setResult,
+  onChanged,
+  failed,
+}: {
+  org: string;
+  total: number;
+  allOn: boolean;
+  enabledCount: number;
+  result: SaveResult | null;
+  setResult: (result: SaveResult | null) => void;
+  onChanged: () => void;
+  failed: (() => void) | null;
+}) {
+  const [draft, setDraft] = useState<RepoSelection>({ all: false, repos: [] });
   const [busy, setBusy] = useState(false);
   const n = draft.all ? total : draft.repos.length;
 
-  const enable = async () => {
+  const change = async (body: { all?: boolean; add?: string[]; remove?: string[] }, text: string) => {
     setBusy(true);
     setResult(null);
     try {
-      await setEnabledRepos(org, saved, draft);
-      setResult({ ok: true, text: `${count(n)} enabled` });
+      await patchEnabledRepos(org, body);
+      setResult({ ok: true, text });
+      setDraft({ all: false, repos: [] });
       onChanged();
     } catch (err) {
       setResult({ ok: false, text: err instanceof Error ? err.message : String(err) });
@@ -176,21 +189,32 @@ function EnableForm({ org, total, saved, result, setResult, onChanged }: { org: 
       setBusy(false);
     }
   };
+  const enable = () => change(draft.all ? { all: true } : { add: draft.repos }, `${count(n)} enabled`);
+  const disable = () => change({ remove: draft.repos }, `${count(n)} disabled`);
 
   return (
     <div className="sticky bottom-0 flex flex-col gap-2">
       <div className="flex flex-wrap items-center gap-2">
-        <RepoMultiSelect org={org} value={draft} onChange={setDraft} label="Choose repositories to run on hatchrun CI" />
+        <RepoMultiSelect org={org} value={draft} onChange={setDraft} label="Choose repositories to change" />
+        <span className="font-mono text-xs text-fg-3">{allOn ? `CI is on for all ${count(total)}` : `${count(enabledCount)} enabled now`}</span>
       </div>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-rule bg-panel pt-2">
         <Button disabled={busy || n === 0} onClick={() => void enable()} className="font-mono text-xs uppercase tracking-[0.04em]">
-          {busy ? "Enabling" : draft.all ? `Enable CI on all ${count(total)} repositories` : `Enable CI on ${count(n)} ${n === 1 ? "repository" : "repositories"}`}
+          {busy ? "Saving" : draft.all ? `Enable CI on all ${count(total)} repositories` : `Enable CI on ${count(n)} ${n === 1 ? "repository" : "repositories"}`}
+        </Button>
+        <Button variant="outline" disabled={busy || draft.all || n === 0} onClick={() => void disable()} className="font-mono text-xs uppercase tracking-[0.04em]">
+          Disable on {count(draft.all ? 0 : n)}
         </Button>
         <span className="font-mono text-xs text-fg-3">{draft.all ? `all ${count(total)} selected` : `${count(n)} of ${count(total)} selected`}</span>
         {result && (
           <span role="status" className={cn("font-mono text-xs font-bold", result.ok ? "text-passed" : "text-failed-soft")}>
             {result.text}
           </span>
+        )}
+        {failed && (
+          <button type="button" onClick={failed} className="cursor-pointer font-mono text-xs text-fg-2 quiet-underline hover:text-fg">
+            Retry loading enabled repositories
+          </button>
         )}
         <Link href={orgUrl(org, "repos")} className="font-mono text-xs text-fg-2 quiet-underline hover:text-fg">
           Filter in Repos →

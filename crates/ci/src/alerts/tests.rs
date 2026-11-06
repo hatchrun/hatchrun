@@ -830,11 +830,11 @@ fn failed_job(db: &Db) {
     db.run(
         "INSERT INTO ci_jobs (id, run_id, plan_id, name, status, conclusion, timeout_minutes, \
          launch_attempts, launch_error, steps, created_at, updated_at, token_permissions, \
-         secret_refs) \
+         secret_refs, needs) \
          OVERRIDING SYSTEM VALUE \
          SELECT 5, id, 'build', 'build', 'completed', 'failure', 30, 4, \
          'RunInstances: InsufficientInstanceCapacity', '[]', 0, 0, \
-         '{\"metadata\":\"read\"}', '{\"all\":false,\"names\":[]}' FROM ci_runs",
+         '{\"metadata\":\"read\"}', '{\"all\":false,\"names\":[]}', '[]' FROM ci_runs",
         &[],
     );
 }
