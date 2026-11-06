@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { ChevronRight } from "lucide-react";
 import { useState } from "react";
 
 import {
@@ -13,6 +14,7 @@ import {
   type Tenant,
 } from "@/api";
 import { Truncate } from "@/components/Truncate";
+import { cn } from "@/lib/utils";
 import { orgUrl } from "@/lib/urls";
 import { Link } from "@/router";
 import { BTN, BTN_PRIMARY } from "./runUi";
@@ -32,17 +34,38 @@ export function ApprovalCard({
   reload: () => void;
 }) {
   const held = jobs.filter((job) => job.held === "approval");
-  if (held.length === 0) {
+  const decided = jobs.filter((job) => job.held === null && job.approval !== null);
+  // Decided cards start folded to one line; pending ones start open.
+  const [pick, setPick] = useState<boolean | null>(null);
+  const open = pick ?? held.length > 0;
+  if (held.length === 0 && decided.length === 0) {
     return null;
   }
   const [owner = ""] = run.repository.split("/");
+  const pending = held.length > 0;
+  const shown = pending ? held : decided;
+  const summary = pending
+    ? `${held.length} ${held.length === 1 ? "job waits" : "jobs wait"} for approval`
+    : decided.map((job) => `${job.name} ${job.approval?.decision} by ${job.approval?.by}`).join(" · ");
   return (
     <section
-      aria-label="Approval required"
-      className="flex flex-col gap-3 rounded-md border border-waiting/50 bg-waiting/10 p-4"
+      aria-label={pending ? "Approval required" : "Approval decided"}
+      className={cn(
+        "flex flex-col gap-2 rounded-md border px-3 py-2",
+        pending ? "border-waiting/50 bg-waiting/10" : "border-rule bg-panel",
+      )}
     >
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <span className="cap text-waiting">Approval required</span>
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setPick(!open)}
+          className="flex min-w-0 cursor-pointer items-center gap-2 border-0 bg-transparent p-0 text-left"
+        >
+          <ChevronRight size={12} aria-hidden="true" className={cn("shrink-0 text-fg-3 transition-transform", open && "rotate-90")} />
+          <span className={cn("cap shrink-0", pending && "text-waiting")}>{pending ? "Approval required" : "Approval decided"}</span>
+          {!open && <span className="min-w-0 truncate font-mono text-[13px] text-fg-2">{summary}</span>}
+        </button>
         <Link
           href={orgUrl(owner, "environments")}
           className="font-mono text-[13px] text-fg-2 underline decoration-control underline-offset-4 hover:text-fg"
@@ -50,16 +73,17 @@ export function ApprovalCard({
           Edit environment rules
         </Link>
       </div>
-      {held.map((job) => (
-        <Held
-          key={job.id}
-          job={job}
-          branch={run.branch}
-          session={session}
-          role={role}
-          reload={reload}
-        />
-      ))}
+      {open &&
+        shown.map((job) => (
+          <Held
+            key={job.id}
+            job={job}
+            branch={run.branch}
+            session={session}
+            role={role}
+            reload={reload}
+          />
+        ))}
     </section>
   );
 }
@@ -97,8 +121,8 @@ function Held({
   };
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3">
-      <div className="flex min-w-0 flex-col gap-1 font-mono text-[13px]">
+    <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-5 gap-y-1 font-mono text-[13px]">
         <div className="flex flex-wrap items-center gap-x-5 gap-y-1">
           <span className="flex min-w-0 items-center gap-2">
             <span className="cap">environment</span>
@@ -112,8 +136,16 @@ function Held({
           )}
         </div>
         <span className="text-fg-2">
-          Job <span className="text-fg">{job.name}</span> does not start until
-          an org admin approves.
+          {job.approval ? (
+            <>
+              Job <span className="text-fg">{job.name}</span> was {job.approval.decision} by{" "}
+              <span className="text-fg">{job.approval.by}</span> on {new Date(job.approval.at).toLocaleString()}.
+            </>
+          ) : (
+            <>
+              Job <span className="text-fg">{job.name}</span> does not start until an org admin approves.
+            </>
+          )}
         </span>
         {error !== null && (
           <span role="alert" className="text-failed">
@@ -121,7 +153,7 @@ function Held({
           </span>
         )}
       </div>
-      {session && role === "admin" ? (
+      {job.approval ? null : session && role === "admin" ? (
         <div className="flex items-center gap-2">
           <button
             type="button"

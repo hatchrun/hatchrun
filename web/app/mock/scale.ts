@@ -561,7 +561,7 @@ function jobsOf(run: RunRow): Job[] {
       })),
       has_log: state.status !== "queued",
       held,
-      environment: plan.environment ?? null,
+      environment: plan.environment ?? (held ? "production" : null),
       approval: decision ? { decision: decision.decision, by: ME, at: decision.at } : null,
     };
   });
