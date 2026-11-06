@@ -211,13 +211,15 @@ pub async fn delete_environment(
     name: &str,
     audit: &NewAudit<'_>,
 ) -> Result<bool> {
+    // The audit names the environment as stored, whatever case the
+    // request spelled it in.
     let mut bound = params![repo_id, name];
-    bound.extend(audit.binds_with_target());
+    bound.extend(audit.binds());
     db.run(
         &format!(
             "WITH gone AS (DELETE FROM ci_environments \
-               WHERE repo_id = $1 AND lower(name) = lower($2) RETURNING 1) {}",
-            NewAudit::insert_bound_sql(3, "gone")
+               WHERE repo_id = $1 AND lower(name) = lower($2) RETURNING name) {}",
+            NewAudit::insert_sql(3, "gone.name", "gone")
         ),
         &bound,
     )

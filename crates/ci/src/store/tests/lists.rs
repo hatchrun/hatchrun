@@ -569,22 +569,32 @@ fn audit_rows_page_newest_first_and_filter_by_repository() {
         3,
     );
     record(Action::ReposEnabled, "org", None, "all", 4);
+    record(Action::ReposEnabled, "org", None, "+Acme/App -acme/web", 5);
 
     let (rows, total) = db.wait(audit_page(db.db(), "t1", None, None, 3)).unwrap();
-    assert_eq!(total, 4);
+    assert_eq!(total, 5);
     let targets: Vec<&str> = rows.iter().map(|row| row.target.as_str()).collect();
-    assert_eq!(targets, ["all", "prod/TOKEN", "MODE"]);
-    assert_eq!(rows[1].action, "secret.delete");
+    assert_eq!(targets, ["+Acme/App -acme/web", "all", "prod/TOKEN"]);
+    assert_eq!(rows[2].action, "secret.delete");
     let (rest, _) = db
         .wait(audit_page(db.db(), "t1", None, Some(rows[2].id), 3))
         .unwrap();
-    assert_eq!(rest.len(), 1);
-    assert_eq!(rest[0].target, "TOKEN");
+    assert_eq!(rest.len(), 2);
+    assert_eq!(rest[1].target, "TOKEN");
 
     let (app, total) = db
         .wait(audit_page(db.db(), "t1", Some("ACME/app"), None, 10))
         .unwrap();
-    assert_eq!((app.len(), total), (2, 2));
+    assert_eq!((app.len(), total), (3, 3));
+    assert_eq!(app[0].target, "+Acme/App -acme/web");
+    let (web, total) = db
+        .wait(audit_page(db.db(), "t1", Some("acme/web"), None, 10))
+        .unwrap();
+    assert_eq!((web.len(), total), (1, 1));
+    let (ap, _) = db
+        .wait(audit_page(db.db(), "t1", Some("acme/ap"), None, 10))
+        .unwrap();
+    assert_eq!(ap.len(), 0);
     let (none, total) = db
         .wait(audit_page(db.db(), "other", None, None, 10))
         .unwrap();
