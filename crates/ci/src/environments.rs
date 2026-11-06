@@ -308,6 +308,7 @@ mod tests {
             approval_decision: Some("approved".into()),
             approval_by: Some("octo".into()),
             approval_at: Some(5),
+            needs: json!([]),
         };
         assert_eq!(decision(&job), None);
         job.approval_attempt = Some(2);

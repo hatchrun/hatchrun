@@ -15,6 +15,7 @@
 //! | Route | Needs | Answer |
 //! | --- | --- | --- |
 //! | `GET /api/ci/orgs/{org}/runs?status=&repo=&branch=&actor=&q=&since=&until=&cursor=&limit=` | org member | `Page` of runs of the repositories the caller may read, last 7 days unless `since`, plus `counts` by state for the same filters |
+//! | `GET /api/ci/orgs/{org}/activity?range=24h\|7d&repo=` | org member | `{"bucket_ms", "buckets": [{"at", "started", "passed", "failed"}], "concurrency": {"running", "queued", "limit"}}` for the repositories the caller may read |
 //! | `GET /api/ci/orgs/{org}/needs-you` | org member | `{"approvals", "failing"}` |
 //! | `GET /api/ci/repos/{owner}/{repo}/runs?status=&branch=&actor=&q=&since=&until=&cursor=&limit=` | read | `Page` of runs, newest first |
 //! | `GET /api/ci/runs/{run}` | read | the run and its jobs |
@@ -96,6 +97,11 @@ pub enum Route<'a> {
         /// The organization.
         org: &'a str,
     },
+    /// An organization's runs and jobs over time.
+    OrgActivity {
+        /// The organization.
+        org: &'a str,
+    },
     /// What waits for the caller in an organization.
     NeedsYou {
         /// The organization.
@@ -174,6 +180,7 @@ pub fn route(path: &str) -> Option<Route<'_>> {
     let parts: Vec<&str> = rest.split('/').collect();
     match parts.as_slice() {
         ["orgs", org, "runs"] => Some(Route::OrgRuns { org: login(org)? }),
+        ["orgs", org, "activity"] => Some(Route::OrgActivity { org: login(org)? }),
         ["orgs", org, "needs-you"] => Some(Route::NeedsYou { org: login(org)? }),
         ["repos", owner, repo, "runs"] => Some(Route::Runs {
             owner: name(owner)?,
@@ -455,6 +462,7 @@ pub(crate) fn run_json(run: &RunRow, repository: &str, jobs: JobCounts) -> Value
         "branch": run.branch(),
         "sha": run.sha,
         "actor": run.actor,
+        "message": run.message,
         "status": run.status,
         "conclusion": run.conclusion,
         "created_at": run.created_at,
@@ -507,6 +515,7 @@ fn job_json(row: &JobRow, live: &BTreeMap<u64, Value>) -> Value {
         "id": row.id,
         "plan_id": row.plan_id,
         "name": row.name,
+        "needs": row.needs,
         "status": row.status,
         "conclusion": row.conclusion,
         "attempt": row.attempt,
@@ -675,6 +684,7 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
     };
     match route {
         Route::OrgRuns { org } => org_api::runs(&cx, org, query.as_deref()).await,
+        Route::OrgActivity { org } => org_api::activity(&cx, org, query.as_deref()).await,
         Route::NeedsYou { org } => org_api::needs_you(&cx, org).await,
         Route::Runs { owner, repo } => cx.runs(owner, repo, query.as_deref()).await,
         Route::Run(run) => cx.run(run).await,
@@ -1498,6 +1508,10 @@ mod tests {
             Some(Route::OrgRuns { org: "acme" })
         );
         assert_eq!(
+            route("/api/ci/orgs/acme/activity"),
+            Some(Route::OrgActivity { org: "acme" })
+        );
+        assert_eq!(
             route("/api/ci/orgs/acme/needs-you"),
             Some(Route::NeedsYou { org: "acme" })
         );
@@ -1853,7 +1867,7 @@ workflows:
             "next_launch_at": null, "timeout_minutes": 10, "updated_at": 0,
             "heartbeat_at": null, "started_at": null, "completed_at": null,
             "steps": steps.to_string(), "log_key": null, "template": "ubuntu-latest",
-            "token_permissions": "{}", "secret_refs": "{\"all\":false,\"names\":[]}"
+            "token_permissions": "{}", "secret_refs": "{\"all\":false,\"names\":[]}", "needs": "[]"
         }))
         .unwrap()
     }

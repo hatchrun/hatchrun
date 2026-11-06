@@ -323,23 +323,24 @@ fn a_transferred_repo_leaves_its_secrets_and_vars_behind() {
     // Re-registering the repository under its own tenant keeps them.
     let mut same = db.wait(repo(db.db(), 7)).unwrap().unwrap();
     db.wait(upsert_repo(db.db(), &same, 6)).unwrap();
-    assert_eq!(
+    let own = |db: &TestDb| {
         db.wait(secret_names(db.db(), "t1", Owner::Repo(7)))
             .unwrap()
-            .len(),
-        1
-    );
+            .iter()
+            .filter(|item| item.scope == "repo")
+            .count()
+    };
+    assert_eq!(own(&db), 1);
     same.tenant_id = "t2".into();
     same.installation_id = 100;
     db.wait(upsert_repo(db.db(), &same, 7)).unwrap();
+    assert_eq!(own(&db), 0);
     assert_eq!(
-        db.wait(secret_names(db.db(), "t1", Owner::Repo(7)))
+        db.wait(vars(db.db(), "t1", Owner::Repo(7)))
             .unwrap()
-            .len(),
-        0
-    );
-    assert_eq!(
-        db.wait(vars(db.db(), "t1", Owner::Repo(7))).unwrap().len(),
+            .iter()
+            .filter(|item| item.scope == "repo")
+            .count(),
         0
     );
     // The old organization's own rows stay.
@@ -428,6 +429,32 @@ fn jobs_come_back_in_plan_order() {
             .all(|job| job.status == "waiting" && job.attempt == 1)
     );
     assert_eq!(jobs[0].steps, serde_json::json!([]));
+}
+
+#[test]
+fn jobs_keep_their_needs_and_runs_their_message() {
+    let db = setup();
+    let mut asked = new_run("d", "ci", 1);
+    asked.message = Some("fix the build".into());
+    let run = db.wait(insert_run(db.db(), &asked)).unwrap().unwrap();
+    assert_eq!(run.message.as_deref(), Some("fix the build"));
+    let mut deploy = new_job("deploy");
+    deploy.needs = vec!["test".into(), "build".into()];
+    db.wait(insert_jobs(
+        db.db(),
+        run.id,
+        &[new_job("test"), new_job("build"), deploy],
+        2,
+    ))
+    .unwrap();
+    let jobs = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
+    assert_eq!(jobs[0].needs, serde_json::json!([]));
+    assert_eq!(jobs[2].needs, serde_json::json!(["test", "build"]));
+    let plain = db
+        .wait(insert_run(db.db(), &new_run("e", "ci", 1)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(plain.message, None);
 }
 
 #[test]

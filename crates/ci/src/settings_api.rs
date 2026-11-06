@@ -9,12 +9,13 @@
 //! | --- | --- | --- |
 //! | `GET /api/ci/orgs/{org}/billing` | org admin | [`BillingView`](crate::billing::BillingView) |
 //! | `PUT /api/ci/orgs/{org}/billing/cap` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/secrets?q=&cursor=&limit=` | org admin | `Page` of `{"name", "updatedAt", "repositories"}` |
+//! | `GET /api/ci/orgs/{org}/secrets?q=&cursor=&limit=` | org admin | `Page` of `{"name", "updatedAt", "repositories", "scope", "shadowed", "last_used_at"}` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/secrets/{name}` | org admin, CSRF | `204` |
-//! | `GET /api/ci/orgs/{org}/vars?q=&cursor=&limit=` | org admin | `Page` of `{"name", "value", "updatedAt", "repositories"}` |
+//! | `GET /api/ci/orgs/{org}/vars?q=&cursor=&limit=` | org admin | `Page` of `{"name", "value", "updatedAt", "repositories", "scope", "shadowed", "last_used_at"}` |
 //! | `PUT, DELETE /api/ci/orgs/{org}/vars/{name}` | org admin, CSRF | `204` |
 //! | `GET /api/ci/orgs/{org}/repos?q=&enabled=&cursor=&limit=` | org member | `Page` of `{"name", "default_branch", "enabled", "last_run"}`, the installation's repositories the caller may read |
-//! | `PUT /api/ci/orgs/{org}/repos/enabled` | org admin, CSRF | `204`, body `{"all", "repos"}` |
+//! | `PATCH /api/ci/orgs/{org}/repos/enabled` | org admin, CSRF | `204`, body `{"all"?, "add"?, "remove"?}` |
+//! | `GET /api/ci/orgs/{org}/audit?repo=&cursor=&limit=` | org admin | `Page` of `{"id", "at", "actor", "action", "scope", "repo", "target"}`, newest first |
 //! | `GET /api/ci/orgs/{org}/setup` | org admin | `{"app", "enabled", "first_run", "billing"}` |
 //! | `GET /api/ci/orgs/{org}/environments?q=&repo=&cursor=&limit=` | org admin | `Page` of `{"repository", "name", "branches", "approval", "updatedAt", "secrets", "vars"}` |
 //! | `GET /api/ci/repos/{owner}/{repo}/environments` | repo admin | `[{"name", "branches", "approval", "updatedAt"}]` |
@@ -37,6 +38,8 @@
 
 use hatchrun_cloud::ci_wake::{self, Woken};
 use hatchrun_cloud::db::Db;
+use hatchrun_cloud::fetch::send;
+use hatchrun_cloud::polar;
 use hatchrun_cloud::tenant::valid_login;
 use hatchrun_workflow::valid_environment_name;
 use serde::Deserialize;
@@ -107,6 +110,11 @@ pub enum SettingsRoute<'a> {
         /// The organization.
         org: &'a str,
     },
+    /// The changes made to the organization's settings.
+    Audit {
+        /// The organization.
+        org: &'a str,
+    },
     /// Where the organization stands in setting up.
     Setup {
         /// The organization.
@@ -144,10 +152,12 @@ impl SettingsRoute<'_> {
             | SettingsRoute::Secrets(_)
             | SettingsRoute::Vars(_)
             | SettingsRoute::Repos { .. }
+            | SettingsRoute::Audit { .. }
             | SettingsRoute::Setup { .. }
             | SettingsRoute::OrgEnvironments { .. }
             | SettingsRoute::Environments { .. } => *method == Method::Get,
-            SettingsRoute::Cap { .. } | SettingsRoute::EnableRepos { .. } => *method == Method::Put,
+            SettingsRoute::Cap { .. } => *method == Method::Put,
+            SettingsRoute::EnableRepos { .. } => *method == Method::Patch,
             SettingsRoute::Secret(..)
             | SettingsRoute::Var(..)
             | SettingsRoute::Environment { .. } => {
@@ -167,6 +177,7 @@ pub fn find(path: &str) -> Option<SettingsRoute<'_>> {
         ["orgs", org, "billing", "cap"] => Some(SettingsRoute::Cap { org: login(org)? }),
         ["orgs", org, "repos"] => Some(SettingsRoute::Repos { org: login(org)? }),
         ["orgs", org, "repos", "enabled"] => Some(SettingsRoute::EnableRepos { org: login(org)? }),
+        ["orgs", org, "audit"] => Some(SettingsRoute::Audit { org: login(org)? }),
         ["orgs", org, "setup"] => Some(SettingsRoute::Setup { org: login(org)? }),
         ["orgs", org, "environments"] => Some(SettingsRoute::OrgEnvironments { org: login(org)? }),
         ["orgs", org, kind @ ("secrets" | "vars")] => {
@@ -281,8 +292,9 @@ pub(crate) async fn handle(
         SettingsRoute::Cap { org } => cap(cx, org, req, body_cap(&route)).await,
         SettingsRoute::Repos { org } => org_api::repos(cx, org, query).await,
         SettingsRoute::EnableRepos { org } => {
-            org_api::set_enabled(cx, org, req, body_cap(&route)).await
+            org_api::patch_enabled(cx, org, req, body_cap(&route)).await
         }
+        SettingsRoute::Audit { org } => org_api::audit_list(cx, org, query).await,
         SettingsRoute::Setup { org } => org_api::setup(cx, org).await,
         SettingsRoute::OrgEnvironments { org } => org_api::environments(cx, org, query).await,
         SettingsRoute::Environments { owner, repo } => list_environments(cx, owner, repo).await,
@@ -338,6 +350,27 @@ pub(crate) async fn admin_tenant(cx: &Cx<'_>, org: &str) -> Result<Served<Tenant
     }
 }
 
+/// A change the caller makes to `tenant`'s settings, for the store to
+/// record in the transaction of the change itself.
+pub(crate) fn audit_of<'a>(
+    cx: &'a Cx<'_>,
+    tenant: &'a str,
+    action: store::Action,
+    scope: &'a str,
+    repo: Option<&'a str>,
+    target: &'a str,
+) -> store::NewAudit<'a> {
+    store::NewAudit {
+        tenant,
+        actor: cx.session.map_or("", |session| session.user.login.as_str()),
+        action,
+        scope,
+        repo,
+        target,
+        now: now_ms(),
+    }
+}
+
 async fn billing_view(cx: &Cx<'_>, org: &str) -> Result<Served> {
     let tenant = match admin_tenant(cx, org).await? {
         Ok(tenant) => tenant,
@@ -353,7 +386,64 @@ async fn billing_view(cx: &Cx<'_>, org: &str) -> Result<Served> {
     let Some(standing) = standing else {
         return Ok(stop(404, "not found"));
     };
-    reply(200, &serde_json::to_value(billing::view(&standing))?).map(Ok)
+    let daily = store::daily_usage(cx.db, &tenant.id, billing::month_start(now_ms()))
+        .await?
+        .into_iter()
+        .map(|day| billing::Daily::new(day.day, day.seconds, day.units))
+        .collect();
+    let (card, invoices) = polar_billing(cx, &tenant.id).await;
+    reply(
+        200,
+        &serde_json::to_value(billing::view(&standing, card, daily, invoices))?,
+    )
+    .map(Ok)
+}
+
+/// How many invoices the billing page lists.
+const INVOICES: u32 = 12;
+
+/// The card details and the newest invoices Polar holds for `tenant`.
+/// Polar being down or not configured leaves them empty: the page still
+/// shows the usage, and a card on file without details.
+async fn polar_billing(cx: &Cx<'_>, tenant: &str) -> (Option<polar::Card>, Vec<billing::Invoice>) {
+    let settings = cx.settings;
+    if settings.polar_token.is_empty() {
+        return (None, Vec::new());
+    }
+    let (api, token) = (settings.polar_api.as_str(), settings.polar_token.as_str());
+    let card = async {
+        let answer = send(&polar::payment_methods(api, token, tenant)).await?;
+        polar::default_card(&answer)
+    };
+    let orders = async {
+        let answer = send(&polar::orders(api, token, tenant, INVOICES)).await?;
+        polar::order_list(&answer)
+    };
+    let (card, orders) = futures_util::future::join(card, orders).await;
+    let card = card.unwrap_or_else(|err| {
+        console_error!("billing {tenant}: {err}");
+        None
+    });
+    let orders = orders.unwrap_or_else(|err| {
+        console_error!("billing {tenant}: {err}");
+        Vec::new()
+    });
+    let links = orders.iter().map(|order| async {
+        if !order.is_invoice_generated {
+            return None;
+        }
+        let answer = send(&polar::order_invoice(api, token, &order.id))
+            .await
+            .ok()?;
+        polar::invoice_url(&answer).ok()
+    });
+    let links = futures_util::future::join_all(links).await;
+    let invoices = orders
+        .into_iter()
+        .zip(links)
+        .map(|(order, url)| billing::Invoice::of(order, url))
+        .collect();
+    (card, invoices)
 }
 
 /// The body of `PUT .../billing/cap`.
@@ -416,6 +506,30 @@ struct Target {
     owner: Owner,
     /// The organization login or `owner/repo`, for messages.
     label: String,
+    /// The repository's `owner/repo`, for a repository or environment.
+    repo: Option<String>,
+    /// The environment's name, for an environment.
+    environment: Option<String>,
+}
+
+impl Target {
+    /// The audit scope: `org`, `repo` or `env`.
+    fn scope(&self) -> &'static str {
+        match self.owner {
+            Owner::Org => "org",
+            Owner::Repo(_) => "repo",
+            Owner::Environment { .. } => "env",
+        }
+    }
+
+    /// The audit target of the row `name`: an environment's rows are
+    /// named `environment/name`.
+    fn audited(&self, name: &str) -> String {
+        match &self.environment {
+            Some(environment) => format!("{environment}/{name}"),
+            None => name.to_owned(),
+        }
+    }
 }
 
 /// The rows `scope` names, when the caller may manage them: an admin of
@@ -427,6 +541,8 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
             tenant: tenant.id,
             owner: Owner::Org,
             label: tenant.org_login,
+            repo: None,
+            environment: None,
         })),
         Scope::Repo { owner, repo } => {
             Ok(cx
@@ -435,7 +551,9 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
                 .map(|repo| Target {
                     tenant: repo.tenant_id,
                     owner: Owner::Repo(repo.id),
-                    label: repo.full_name,
+                    label: repo.full_name.clone(),
+                    repo: Some(repo.full_name),
+                    environment: None,
                 }))
         }
         Scope::Environment {
@@ -457,6 +575,8 @@ async fn target(cx: &Cx<'_>, scope: Scope<'_>) -> Result<Served<Target>> {
                     environment_id: found.id,
                 },
                 label: format!("{} environment {}", repo.full_name, found.name),
+                repo: Some(repo.full_name),
+                environment: Some(found.name),
             }))
         }
     }
@@ -601,6 +721,9 @@ async fn list_secrets(cx: &Cx<'_>, scope: Scope<'_>, query: Option<&str>) -> Res
                 "name": item.name,
                 "updatedAt": item.updated_at,
                 "repositories": item.repositories,
+                "scope": item.scope,
+                "shadowed": item.shadowed,
+                "last_used_at": item.last_used_at,
             })
         })
         .collect();
@@ -631,6 +754,9 @@ async fn list_vars(cx: &Cx<'_>, scope: Scope<'_>, query: Option<&str>) -> Result
                 "value": item.value,
                 "updatedAt": item.updated_at,
                 "repositories": item.repositories,
+                "scope": item.scope,
+                "shadowed": item.shadowed,
+                "last_used_at": item.last_used_at,
             })
         })
         .collect();
@@ -673,6 +799,8 @@ async fn put_secret(
     };
     let sealed = secrets::seal(&keyring.current, &aad, nonce, &body.value);
     let max = limit(target.owner != Owner::Org);
+    let audited = target.audited(&name);
+    let audit = audit_row(cx, &target, store::Action::SecretPut, &audited);
     let put = store::put_secret(
         cx.db,
         &target.tenant,
@@ -683,6 +811,7 @@ async fn put_secret(
         &sealed,
         max,
         now_ms(),
+        &audit,
     )
     .await?;
     saved(put, &target, Kind::Secrets, max)
@@ -712,6 +841,8 @@ async fn put_var(
         Err(stop) => return Ok(Err(stop)),
     };
     let max = limit(target.owner != Owner::Org);
+    let audited = target.audited(&name);
+    let audit = audit_row(cx, &target, store::Action::VarPut, &audited);
     let put = store::put_var(
         cx.db,
         &target.tenant,
@@ -721,6 +852,7 @@ async fn put_var(
         &body.value,
         max,
         now_ms(),
+        &audit,
     )
     .await?;
     saved(put, &target, Kind::Vars, max)
@@ -778,6 +910,15 @@ async fn put_environment(
         Err(stop) => return Ok(Err(stop)),
     };
     let now = now_ms();
+    // The store records the stored name of the environment, not `name`.
+    let audit = audit_of(
+        cx,
+        &repo.tenant_id,
+        store::Action::EnvironmentPut,
+        "repo",
+        Some(&repo.full_name),
+        name,
+    );
     let saved = store::put_environment(
         cx.db,
         &repo.tenant_id,
@@ -787,6 +928,7 @@ async fn put_environment(
         body.approval,
         environments::MAX_PER_REPO,
         now,
+        &audit,
     )
     .await?;
     let row = match saved {
@@ -811,7 +953,15 @@ async fn delete_environment(cx: &Cx<'_>, owner: &str, repo: &str, name: &str) ->
         Ok(repo) => repo,
         Err(stop) => return Ok(Err(stop)),
     };
-    if !store::delete_environment(cx.db, repo.id, name).await? {
+    let audit = audit_of(
+        cx,
+        &repo.tenant_id,
+        store::Action::EnvironmentDelete,
+        "repo",
+        Some(&repo.full_name),
+        name,
+    );
+    if !store::delete_environment(cx.db, repo.id, name, &audit).await? {
         return Ok(stop(404, "not found"));
     }
     release_and_wake(cx, repo.id, name, false, true, now_ms()).await;
@@ -871,6 +1021,24 @@ fn saved(put: Put, target: &Target, kind: Kind, max: u32) -> Result<Served> {
     }
 }
 
+/// The record of a change to a row of `target`; `audited` is
+/// [`Target::audited`] of its name.
+fn audit_row<'a>(
+    cx: &'a Cx<'_>,
+    target: &'a Target,
+    action: store::Action,
+    audited: &'a str,
+) -> store::NewAudit<'a> {
+    audit_of(
+        cx,
+        &target.tenant,
+        action,
+        target.scope(),
+        target.repo.as_deref(),
+        audited,
+    )
+}
+
 async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result<Served> {
     let target = match target(cx, scope).await? {
         Ok(target) => target,
@@ -880,9 +1048,17 @@ async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result
         Ok(name) => name,
         Err(stop) => return Ok(Err(stop)),
     };
+    let action = match kind {
+        Kind::Secrets => store::Action::SecretDelete,
+        Kind::Vars => store::Action::VarDelete,
+    };
+    let audited = target.audited(&name);
+    let audit = audit_row(cx, &target, action, &audited);
     let existed = match kind {
-        Kind::Secrets => store::delete_secret(cx.db, &target.tenant, target.owner, &name).await?,
-        Kind::Vars => store::delete_var(cx.db, &target.tenant, target.owner, &name).await?,
+        Kind::Secrets => {
+            store::delete_secret(cx.db, &target.tenant, target.owner, &name, &audit).await?
+        }
+        Kind::Vars => store::delete_var(cx.db, &target.tenant, target.owner, &name, &audit).await?,
     };
     if existed {
         no_content().map(Ok)
@@ -996,9 +1172,18 @@ mod tests {
             Some(SettingsRoute::Repos { org })
         );
         assert_eq!(
-            settings_route("orgs/acme/repos/enabled", &Method::Put),
+            settings_route("orgs/acme/repos/enabled", &Method::Patch),
             Some(SettingsRoute::EnableRepos { org })
         );
+        assert_eq!(
+            settings_route("orgs/acme/repos/enabled", &Method::Put),
+            None
+        );
+        assert_eq!(
+            settings_route("orgs/acme/audit", &Method::Get),
+            Some(SettingsRoute::Audit { org })
+        );
+        assert_eq!(settings_route("orgs/acme/audit", &Method::Post), None);
         assert_eq!(
             settings_route("orgs/acme/repos/enabled", &Method::Get),
             None

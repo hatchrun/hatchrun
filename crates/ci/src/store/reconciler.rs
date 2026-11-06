@@ -114,6 +114,12 @@ const SWEEP_USAGE: &str = "DELETE FROM ci_usage WHERE sent_at < $1 OR rejected_a
 /// How long sent usage rows are kept, in milliseconds.
 const USAGE_RETENTION_MS: u64 = 90 * 86_400_000;
 
+/// Deletes audit rows made before `$1`.
+const SWEEP_AUDIT: &str = "DELETE FROM ci_audit WHERE at < $1";
+
+/// How long audit rows are kept, in milliseconds.
+const AUDIT_RETENTION_MS: u64 = 400 * 86_400_000;
+
 /// Replaces the schedules of `repo_id` with `schedules`, pairs of
 /// workflow and cron, in one transaction.
 ///
@@ -202,8 +208,8 @@ pub async fn set_last_minute(db: &Db, minute_ms: u64) -> Result<()> {
     Ok(())
 }
 
-/// Deletes delivery ids older than 30 days and usage rows Polar took
-/// more than 90 days ago, and returns the ids of the runs that expired
+/// Deletes delivery ids older than 30 days, usage rows Polar took more
+/// than 90 days ago and audit rows older than 400 days, and returns the ids of the runs that expired
 /// before `now`, at most [`SWEEP_LIMIT`], oldest first. The runs stay
 /// until [`delete_runs`]; a run whose logs could not be purged goes
 /// through [`defer_runs`], which puts it behind the runs that expire
@@ -223,6 +229,11 @@ pub async fn sweep(db: &Db, now: u64) -> Result<Vec<u64>> {
     db.run(
         SWEEP_USAGE,
         &params![now.saturating_sub(USAGE_RETENTION_MS)],
+    )
+    .await?;
+    db.run(
+        SWEEP_AUDIT,
+        &params![now.saturating_sub(AUDIT_RETENTION_MS)],
     )
     .await?;
     Ok(runs.into_iter().map(|row| row.id).collect())

@@ -34,6 +34,32 @@ const OWNER_OF_JOB: &str = "tenants.id = (SELECT ci_runs.tenant_id FROM ci_jobs 
 /// [`STANDING`]'s `{owner}` for tenant `$1`.
 const OWNER_IS_TENANT: &str = "tenants.id = $1::text";
 
+/// Billed seconds and units per UTC day, from `$2`, of tenant `$1`.
+const DAILY_USAGE: &str = "SELECT to_char(to_timestamp(ended_at / 1000) AT TIME ZONE 'UTC', \
+       'YYYY-MM-DD') AS day, SUM(seconds)::bigint AS seconds, SUM(units)::bigint AS units \
+     FROM ci_usage WHERE tenant_id = $1 AND ended_at >= $2 GROUP BY 1 ORDER BY 1";
+
+/// One day of [`daily_usage`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DayUsage {
+    /// The UTC day, `YYYY-MM-DD`.
+    pub day: String,
+    /// Billed seconds.
+    pub seconds: u64,
+    /// Billing units.
+    pub units: u64,
+}
+
+/// What `tenant` used each UTC day since `since`, oldest first; days
+/// with no usage are left out.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn daily_usage(db: &Db, tenant: &str, since: u64) -> Result<Vec<DayUsage>> {
+    db.all(DAILY_USAGE, &params![tenant, since]).await
+}
+
 /// Sets the spend cap of tenant `$1` to `$2` micros at `$3`.
 const SET_SPEND_CAP: &str = "INSERT INTO ci_spend_caps (tenant_id, cap_micros, updated_at) \
      VALUES ($1, $2, $3) \

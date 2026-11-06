@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::de::{Deserializer, Error as _};
 use worker::Result;
 
+use super::NewAudit;
 use super::jobs::LOCK_TENANT;
 
 /// Reads a JSON array of strings that the row carries as text.
@@ -172,8 +173,11 @@ pub async fn put_environment(
     approval: bool,
     limit: u32,
     now: u64,
+    audit: &NewAudit<'_>,
 ) -> Result<PutEnvironment> {
     let branches = serde_json::to_string(branches).map_err(worker::Error::from)?;
+    // The row records the stored name, which may differ from `name` in
+    // case, so the audit's own target is left out of the binds.
     let sql = format!(
         "WITH updated AS (UPDATE ci_environments SET branches = $4::jsonb, approval = $5, \
            updated_at = $7 WHERE repo_id = $2 AND lower(name) = lower($3) \
@@ -183,17 +187,15 @@ pub async fn put_environment(
            SELECT $1, $2::bigint, $3, $4::jsonb, $5, $7 \
            WHERE NOT EXISTS (SELECT 1 FROM updated) \
              AND (SELECT count(*) FROM ci_environments WHERE repo_id = $2) < $6 \
-           RETURNING {ENVIRONMENT_COLUMNS}) \
-         SELECT * FROM updated UNION ALL SELECT * FROM inserted"
+           RETURNING {ENVIRONMENT_COLUMNS}), \
+         saved AS (SELECT * FROM updated UNION ALL SELECT * FROM inserted), \
+         audited AS ({}) SELECT * FROM saved",
+        NewAudit::insert_sql(8, "saved.name", "saved")
     );
     let lock = params![tenant];
-    let saved: Option<EnvironmentRow> = db
-        .first_locked(
-            (LOCK_TENANT, &lock),
-            &sql,
-            &params![tenant, repo_id, name, branches, approval, limit, now],
-        )
-        .await?;
+    let mut bound = params![tenant, repo_id, name, branches, approval, limit, now];
+    bound.extend(audit.binds());
+    let saved: Option<EnvironmentRow> = db.first_locked((LOCK_TENANT, &lock), &sql, &bound).await?;
     Ok(saved.map_or(PutEnvironment::TooMany, PutEnvironment::Saved))
 }
 
@@ -203,10 +205,23 @@ pub async fn put_environment(
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn delete_environment(db: &Db, repo_id: u64, name: &str) -> Result<bool> {
+pub async fn delete_environment(
+    db: &Db,
+    repo_id: u64,
+    name: &str,
+    audit: &NewAudit<'_>,
+) -> Result<bool> {
+    // The audit names the environment as stored, whatever case the
+    // request spelled it in.
+    let mut bound = params![repo_id, name];
+    bound.extend(audit.binds());
     db.run(
-        "DELETE FROM ci_environments WHERE repo_id = $1 AND lower(name) = lower($2)",
-        &params![repo_id, name],
+        &format!(
+            "WITH gone AS (DELETE FROM ci_environments \
+               WHERE repo_id = $1 AND lower(name) = lower($2) RETURNING name) {}",
+            NewAudit::insert_sql(3, "gone.name", "gone")
+        ),
+        &bound,
     )
     .await
     .map(|n| n > 0)

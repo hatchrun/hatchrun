@@ -12,6 +12,7 @@
 //! so are `token_permissions` and `secret_refs`.
 
 mod artifacts;
+mod audit;
 mod billing;
 mod cache;
 mod concurrency;
@@ -29,9 +30,10 @@ pub use self::artifacts::{
     ArtifactRow, Finalized, artifact_by_name, artifact_count, artifacts, delete_artifact,
     drop_pending_artifact, finalize_artifact, pending_artifact, replaced_artifact, start_artifact,
 };
+pub use self::audit::{Action, AuditRow, NewAudit, audit_page, record_audit};
 pub use self::billing::{
-    Standing, UnsentUsage, set_spend_cap, standing, tenant_standing, unsent_usage, usage_rejected,
-    usage_sent,
+    DayUsage, Standing, UnsentUsage, daily_usage, set_spend_cap, standing, tenant_standing,
+    unsent_usage, usage_rejected, usage_sent,
 };
 pub use self::cache::{
     CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, drop_pending_cache_entry,
@@ -48,8 +50,8 @@ pub use self::environments::{
     put_environment, release_approval_holds,
 };
 pub use self::installation::{
-    LastRun, OrgRepo, RepoFilter, RepoVisibility, SetupRow, installation_synced, repo_enabled,
-    repos_page, set_enabled, sync_installation, tenant_installation, tenant_repo_visibility,
+    LastRun, OrgRepo, RepoFilter, RepoVisibility, SetupRow, installation_synced, patch_enabled,
+    repo_enabled, repos_page, sync_installation, tenant_installation, tenant_repo_visibility,
     tenant_setup, touch_installation_repo, unknown_repos,
 };
 pub use self::jobs::{
@@ -67,13 +69,14 @@ pub use self::reconciler::{
 };
 pub use self::repos::{RepoRow, delivery_seen, record_delivery, repo, repo_by_name, upsert_repo};
 pub use self::runs::{
-    After, ListedRun, NewRun, RunCounts, RunFilter, RunRow, RunStatus, finish_run, insert_run,
-    latest_on_default, reopen_run_at, run, run_counts, run_for_delivery, run_started, runs_page,
+    After, Bucket, ListedRun, NewRun, RunCounts, RunFilter, RunRow, RunStatus, activity,
+    finish_run, insert_run, job_load, latest_on_default, reopen_run_at, run, run_counts,
+    run_for_delivery, run_started, runs_page,
 };
 pub use self::secrets::{
-    Owner, Put, SealedRow, SecretItem, StaleRow, VarItem, delete_secret, delete_var, job_vars,
-    put_secret, put_var, repo_ids, reseal, sealed_secrets, secret_names, stale_secrets,
-    tenant_repos, vars,
+    Owner, Put, SealedRow, SecretItem, StaleRow, VarItem, delete_secret, delete_var, job_var_rows,
+    job_vars, mark_used, put_secret, put_var, repo_ids, reseal, sealed_secrets, secret_names,
+    stale_secrets, tenant_repos, vars, winners,
 };
 pub use self::tenants::{
     CiBilling, TenantRow, has_card, tenant, tenant_by_org_id, tenant_for_installation,

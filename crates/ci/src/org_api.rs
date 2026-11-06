@@ -30,7 +30,7 @@ use crate::api::{Cx, Served, Stop, name, no_content, now_ms, reply, run_json, st
 use crate::billing;
 use crate::installation;
 use crate::page::{self, Query};
-use crate::settings_api::admin_tenant;
+use crate::settings_api::{admin_tenant, audit_of};
 use crate::store::{
     self, After, JobCounts, ListedRun, RepoFilter, RepoVisibility, RunFilter, RunStatus, TenantRow,
 };
@@ -42,7 +42,7 @@ const DEFAULT_WINDOW_MS: u64 = 7 * 86_400_000;
 /// The most entries of each list of the needs-attention answer.
 const NEEDS_LIMIT: u32 = 100;
 
-/// The most repositories one `PUT .../repos/enabled` names.
+/// The most repositories one `PATCH .../repos/enabled` names.
 const MAX_ENABLED: usize = 5000;
 
 /// The longest search text, in characters.
@@ -274,6 +274,62 @@ async fn runs_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
     Ok(Response::from_json(&body)?)
 }
 
+/// The buckets of an activity range: their length in milliseconds and
+/// how many.
+fn activity_range(word: Option<&str>) -> std::result::Result<(u64, u32), Stop> {
+    match word {
+        None | Some("24h") => Ok((3_600_000, 24)),
+        Some("7d") => Ok((6 * 3_600_000, 28)),
+        Some(_) => stop(400, "range is 24h or 7d"),
+    }
+}
+
+/// `GET /orgs/{org}/activity`.
+pub(crate) async fn activity(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Result<Served> {
+    finish(activity_done(cx, org, query).await)
+}
+
+async fn activity_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
+    let query = Query::parse(query);
+    let (bucket_ms, count) = activity_range(query.get("range"))?;
+    let repo = query.get("repo");
+    if repo.is_some_and(|repo| {
+        repo.split_once('/')
+            .is_none_or(|(owner, name_)| name(owner).is_none() || name(name_).is_none())
+    }) {
+        return refuse(400, "repo is owner/name");
+    }
+    let (tenant, admin, session) = member_tenant(cx, org).await?;
+    let repo_ids = readable(cx, session, &tenant, admin).await?;
+    // The last bucket ends at the next whole bucket, so the chart's
+    // columns keep their place as time passes.
+    let end = now_ms().div_ceil(bucket_ms) * bucket_ms;
+    let start = end - bucket_ms * u64::from(count);
+    let buckets = store::activity(cx.db, &repo_ids, repo, start, bucket_ms, count).await?;
+    let (running, queued) = store::job_load(cx.db, &repo_ids, repo).await?;
+    let buckets: Vec<Value> = buckets
+        .iter()
+        .zip(0_u64..)
+        .map(|(bucket, at)| {
+            json!({
+                "at": start + at * bucket_ms,
+                "started": bucket.started,
+                "passed": bucket.passed,
+                "failed": bucket.failed,
+            })
+        })
+        .collect();
+    Ok(Response::from_json(&json!({
+        "bucket_ms": bucket_ms,
+        "buckets": buckets,
+        "concurrency": {
+            "running": running,
+            "queued": queued,
+            "limit": hatchrun_workflow::templates::MAX_RUNNING_JOBS,
+        },
+    }))?)
+}
+
 /// A job that waits for the caller's approval, as `needs-you` lists it.
 fn approval_json(job: &store::ApprovalJob, counts: &HashMap<u64, JobCounts>) -> Value {
     json!({
@@ -393,15 +449,20 @@ async fn repos_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
     ))?)
 }
 
-/// The body of `PUT .../repos/enabled`.
+/// The body of `PATCH .../repos/enabled`. `all` sets every repository
+/// on or off; `add` and `remove` then turn the named ones on or off.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnabledBody {
-    all: bool,
-    repos: Vec<String>,
+    #[serde(default)]
+    all: Option<bool>,
+    #[serde(default)]
+    add: Vec<String>,
+    #[serde(default)]
+    remove: Vec<String>,
 }
 
-/// The body of an enable `PUT` of at most `max_body` bytes.
+/// The body of an enable `PATCH` of at most `max_body` bytes.
 fn parse_enabled(body: &[u8], max_body: usize) -> std::result::Result<EnabledBody, Stop> {
     if body.len() > max_body {
         return stop(413, "the request is too large");
@@ -409,13 +470,19 @@ fn parse_enabled(body: &[u8], max_body: usize) -> std::result::Result<EnabledBod
     let Ok(asked) = serde_json::from_slice::<EnabledBody>(body) else {
         return stop(
             400,
-            "expected {\"all\": false, \"repos\": [\"owner/repo\"]}",
+            "expected {\"all\": false, \"add\": [\"owner/repo\"], \"remove\": [\"owner/repo\"]}",
         );
     };
-    if asked.repos.len() > MAX_ENABLED {
+    if asked.all.is_none() && asked.add.is_empty() && asked.remove.is_empty() {
+        return stop(400, "name all, add or remove");
+    }
+    if asked.all == Some(true) && !(asked.add.is_empty() && asked.remove.is_empty()) {
+        return stop(400, "all cannot be combined with add or remove");
+    }
+    if asked.add.len() > MAX_ENABLED || asked.remove.len() > MAX_ENABLED {
         return stop(422, format!("at most {MAX_ENABLED} repositories"));
     }
-    let bad = asked.repos.iter().find(|repo| {
+    let bad = asked.add.iter().chain(&asked.remove).find(|repo| {
         repo.split_once('/')
             .is_none_or(|(owner, name_)| name(owner).is_none() || name(name_).is_none())
     });
@@ -425,31 +492,113 @@ fn parse_enabled(body: &[u8], max_body: usize) -> std::result::Result<EnabledBod
     Ok(asked)
 }
 
-/// `PUT /orgs/{org}/repos/enabled`.
-pub(crate) async fn set_enabled(
+/// What the audit row of an enable change says: `all` or `none`, then
+/// the repositories added (`+owner/name`) and removed (`-owner/name`).
+fn enabled_target(asked: &EnabledBody) -> String {
+    let mut parts = Vec::new();
+    match asked.all {
+        Some(true) => parts.push("all".to_owned()),
+        Some(false) => parts.push("none".to_owned()),
+        None => {}
+    }
+    parts.extend(asked.add.iter().map(|repo| format!("+{repo}")));
+    parts.extend(asked.remove.iter().map(|repo| format!("-{repo}")));
+    parts.join(" ")
+}
+
+/// `PATCH /orgs/{org}/repos/enabled`.
+pub(crate) async fn patch_enabled(
     cx: &Cx<'_>,
     org: &str,
     req: &mut Request,
     max_body: usize,
 ) -> Result<Served> {
-    finish(set_enabled_done(cx, org, req, max_body).await)
+    finish(patch_enabled_done(cx, org, req, max_body).await)
 }
 
-async fn set_enabled_done(cx: &Cx<'_>, org: &str, req: &mut Request, max_body: usize) -> Done {
+async fn patch_enabled_done(cx: &Cx<'_>, org: &str, req: &mut Request, max_body: usize) -> Done {
     let tenant = admin_of(cx, org).await?;
     let body = req.bytes().await?;
     let asked = parse_enabled(&body, max_body)?;
     installation::ensure(cx.env, cx.db, cx.settings, &tenant.id, now_ms()).await?;
-    let unknown = store::unknown_repos(cx.db, &tenant.id, &asked.repos).await?;
-    if !asked.all && !unknown.is_empty() {
+    let named: Vec<String> = asked.add.iter().chain(&asked.remove).cloned().collect();
+    let unknown = store::unknown_repos(cx.db, &tenant.id, &named).await?;
+    if !unknown.is_empty() {
         let shown: Vec<&str> = unknown.iter().take(5).map(String::as_str).collect();
         return refuse(
             422,
             format!("not repositories of the installation: {}", shown.join(", ")),
         );
     }
-    store::set_enabled(cx.db, &tenant.id, asked.all, &asked.repos).await?;
+    // Turning a repository off while every repository runs leaves that
+    // mode, or the repository would keep running.
+    let all = match asked.all {
+        None if !asked.remove.is_empty() => Some(false),
+        other => other,
+    };
+    let target = enabled_target(&asked);
+    let audit = audit_of(
+        cx,
+        &tenant.id,
+        store::Action::ReposEnabled,
+        "org",
+        None,
+        &target,
+    );
+    store::patch_enabled(cx.db, &tenant.id, all, &asked.add, &asked.remove, &audit).await?;
     Ok(no_content()?)
+}
+
+/// `GET /orgs/{org}/audit`: the changes to the organization's
+/// settings, newest first. The cursor holds the id of the last row
+/// shown.
+pub(crate) async fn audit_list(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Result<Served> {
+    finish(audit_done(cx, org, query).await)
+}
+
+async fn audit_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
+    let query = Query::parse(query);
+    let tenant = admin_of(cx, org).await?;
+    let limit = query.limit()?;
+    let before = match query.cursor()?.as_deref() {
+        None => None,
+        Some(&[id]) => Some(id),
+        Some(_) => return refuse(400, "the cursor is not valid"),
+    };
+    let repo = query.get("repo");
+    if repo.is_some_and(|repo| {
+        repo.split_once('/')
+            .is_none_or(|(owner, name_)| name(owner).is_none() || name(name_).is_none())
+    }) {
+        return refuse(400, "repo is owner/name");
+    }
+    // One more than the page: its existence says there is a next page.
+    let (mut rows, total) = store::audit_page(cx.db, &tenant.id, repo, before, limit + 1).await?;
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next = rows
+        .last()
+        .filter(|_| more)
+        .map(|last| page::encode(&[last.id]));
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "at": row.at,
+                "actor": row.actor,
+                "action": row.action,
+                "scope": row.scope,
+                "repo": row.repo,
+                "target": row.target,
+            })
+        })
+        .collect();
+    Ok(Response::from_json(&page::page(
+        &items,
+        total,
+        next.as_deref(),
+    ))?)
 }
 
 /// `GET /orgs/{org}/setup`.
@@ -481,7 +630,7 @@ async fn setup_done(cx: &Cx<'_>, org: &str) -> Done {
     let Some(standing) = standing else {
         return refuse(404, "not found");
     };
-    let bill = billing::view(&standing);
+    let cap_dollars = standing.cap_micros / 1_000_000;
     let first_run = row
         .first_run_id
         .zip(row.first_run_repository)
@@ -499,7 +648,7 @@ async fn setup_done(cx: &Cx<'_>, org: &str) -> Done {
         },
         "enabled": { "all": row.all_repos, "count": count },
         "first_run": first_run,
-        "billing": { "card": bill.card, "cap_dollars": bill.cap_dollars },
+        "billing": { "card": standing.card, "cap_dollars": cap_dollars },
     });
     Ok(reply(200, &body)?)
 }
@@ -608,24 +757,40 @@ mod tests {
     }
 
     #[test]
+    fn activity_ranges() {
+        assert_eq!(activity_range(None).unwrap(), (3_600_000, 24));
+        assert_eq!(activity_range(Some("24h")).unwrap(), (3_600_000, 24));
+        assert_eq!(activity_range(Some("7d")).unwrap(), (21_600_000, 28));
+        assert_eq!(activity_range(Some("30d")).unwrap_err().0, 400);
+    }
+
+    #[test]
     fn enable_bodies() {
-        let ok = parse_enabled(br#"{"all":false,"repos":["acme/app"]}"#, 1000).unwrap();
-        assert!(!ok.all);
-        assert_eq!(ok.repos, ["acme/app"]);
+        let ok = parse_enabled(
+            br#"{"all":false,"add":["acme/app"],"remove":["acme/web"]}"#,
+            1000,
+        )
+        .unwrap();
+        assert_eq!(ok.all, Some(false));
+        assert_eq!(ok.add, ["acme/app"]);
+        assert_eq!(ok.remove, ["acme/web"]);
+        assert_eq!(enabled_target(&ok), "none +acme/app -acme/web");
+        let all = parse_enabled(br#"{"all":true}"#, 1000).unwrap();
+        assert_eq!(enabled_target(&all), "all");
+        let add = parse_enabled(br#"{"add":["acme/app"]}"#, 1000).unwrap();
+        assert_eq!(add.all, None);
         for body in [
-            &br#"{"all":false}"#[..],
-            br#"{"all":false,"repos":["app"]}"#,
-            br#"{"all":false,"repos":[],"x":1}"#,
+            &br"{}"[..],
+            br#"{"add":[]}"#,
+            br#"{"all":true,"add":["acme/app"]}"#,
+            br#"{"add":["app"]}"#,
+            br#"{"remove":["acme/a/b"]}"#,
+            br#"{"all":false,"repos":[]}"#,
             b"nope",
         ] {
             assert_eq!(parse_enabled(body, 1000).unwrap_err().0, 400);
         }
-        assert_eq!(
-            parse_enabled(br#"{"all":true,"repos":[]}"#, 5)
-                .unwrap_err()
-                .0,
-            413
-        );
+        assert_eq!(parse_enabled(br#"{"all":true}"#, 5).unwrap_err().0, 413);
     }
 
     #[test]

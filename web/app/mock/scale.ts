@@ -570,15 +570,28 @@ export function handleScale(
     return true;
   }
   if ((found = /^orgs\/([^/]+)\/repos\/enabled$/.exec(path))) {
-    if (method !== "PUT") return json(res, 405, { error: "method not allowed" }), true;
+    if (method !== "PATCH") return json(res, 405, { error: "method not allowed" }), true;
     if (!session.signedIn) return json(res, 401, { error: "sign in to change repositories" }), true;
     if (decodeURIComponent(found[1] as string) !== SCALE_ORG) return json(res, 404, { error: "not found" }), true;
     if (req.headers["x-csrf-token"] !== session.csrf) return json(res, 403, { error: "missing or wrong CSRF token" }), true;
-    const asked = (body ?? {}) as { all?: unknown; repos?: unknown };
-    if (typeof asked.all !== "boolean" || !Array.isArray(asked.repos)) return json(res, 400, { error: 'expected {"all": true, "repos": []}' }), true;
-    enabledAll = asked.all;
-    enabledSet.clear();
-    for (const name of asked.repos as string[]) enabledSet.add(name);
+    const asked = (body ?? {}) as { all?: unknown; add?: unknown; remove?: unknown };
+    const names = (list: unknown) => (list === undefined ? [] : Array.isArray(list) ? (list as string[]) : null);
+    const add = names(asked.add);
+    const remove = names(asked.remove);
+    if ((asked.all !== undefined && typeof asked.all !== "boolean") || !add || !remove) return json(res, 400, { error: 'expected {"all": false, "add": [], "remove": []}' }), true;
+    if (asked.all === undefined && add.length === 0 && remove.length === 0) return json(res, 400, { error: "name all, add or remove" }), true;
+    if (asked.all === true && (add.length > 0 || remove.length > 0)) return json(res, 400, { error: "all cannot be combined with add or remove" }), true;
+    // Removing a repository leaves all mode, as the server does.
+    const all = asked.all ?? (remove.length > 0 ? false : undefined);
+    if ((all !== undefined && all !== enabledAll) || enabledAll === null) {
+      // Leaving all mode keeps what ran; the mock holds the names that ran.
+      const ran = REPOS.filter((name, i) => isEnabled(name, i));
+      enabledSet.clear();
+      if (all !== true) for (const name of ran) enabledSet.add(name);
+      enabledAll = all ?? false;
+    }
+    for (const name of add) enabledSet.add(name);
+    for (const name of remove) enabledSet.delete(name);
     json(res, 204);
     return true;
   }
