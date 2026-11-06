@@ -35,8 +35,21 @@ fn pull(number: u64, state: &str, now: u64) -> NewPull {
 #[test]
 fn a_pull_request_run_keeps_its_pull_request() {
     let db = setup();
+    db.wait(upsert_pull(db.db(), &pull(3, "open", 100)))
+        .unwrap();
     let run = run_on(&db, "a", "ci", "refs/pull/3/merge", DAY);
     assert_eq!(run.pull_number, Some(3));
+    assert_eq!(run.pull_title.as_deref(), Some("change 3"));
+    assert_eq!(run.branch(), Some("feature"));
+    // A rename shows on the runs already recorded.
+    let mut renamed = pull(3, "open", 200);
+    renamed.title = "renamed".into();
+    db.wait(upsert_pull(db.db(), &renamed)).unwrap();
+    let read = db
+        .wait(crate::store::run(db.db(), run.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.pull_title.as_deref(), Some("renamed"));
     assert_eq!(run.head_ref.as_deref(), Some("feature"));
     let push = run_on(&db, "b", "ci", "refs/heads/main", 2 * DAY);
     assert_eq!(push.pull_number, None);
@@ -146,7 +159,7 @@ fn workflows_and_branches_are_grouped_from_runs() {
         counts,
         RepoCounts {
             workflows: 2,
-            branches: 2,
+            branches: 3,
             open_pulls: 0
         }
     );
@@ -177,18 +190,18 @@ fn workflows_and_branches_are_grouped_from_runs() {
     assert_eq!(rest.len(), 1);
 
     // The default branch comes first though dev ran later; the pull
-    // request counts for its base branch, and the tag for none.
+    // request counts for its head branch, and the tag for none.
     let branches = |q: Option<&str>, after| {
         db.wait(branches_page(db.db(), 7, "t1", "main", q, after, 10))
             .unwrap()
     };
     let (rows, total) = branches(None, None);
-    assert_eq!(total, 2);
+    assert_eq!(total, 3);
     assert_eq!(
         rows.iter()
             .map(|b| (b.name.as_str(), b.default, b.runs))
             .collect::<Vec<_>>(),
-        [("main", true, 2), ("dev", false, 2)]
+        [("main", true, 1), ("dev", false, 2), ("feature", false, 1)]
     );
     assert_eq!(branches(Some("de"), None).1, 1);
     let after = BranchAfter {
@@ -199,6 +212,6 @@ fn workflows_and_branches_are_grouped_from_runs() {
         },
     };
     let (rest, _) = branches(None, Some(after));
-    assert_eq!(rest.len(), 1);
+    assert_eq!(rest.len(), 2);
     assert_eq!(rest[0].name, "dev");
 }

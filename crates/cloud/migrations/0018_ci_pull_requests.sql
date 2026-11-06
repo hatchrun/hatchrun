@@ -3,8 +3,8 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 
 -- Browsing a repository by workflow, branch and pull request. A run of a
--- pull request keeps the pull request's number and head branch; the
--- title is the run's message and the base branch is base_ref. Runs
+-- pull request keeps the pull request's number and head branch, and
+-- belongs to that branch; the title is read from ci_pulls. Runs
 -- recorded before this have neither, and stay without a pull request.
 ALTER TABLE ci_runs ADD COLUMN pull_number bigint;
 ALTER TABLE ci_runs ADD COLUMN head_ref text;

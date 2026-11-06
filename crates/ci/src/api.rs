@@ -508,7 +508,7 @@ pub(crate) fn run_json(run: &RunRow, repository: &str, jobs: JobCounts) -> Value
         "message": run.message,
         "pull_request": run.pull_number.map(|number| json!({
             "number": number,
-            "title": run.message,
+            "title": run.pull_title,
             "head_ref": run.head_ref,
             "base_ref": run.base_ref,
         })),

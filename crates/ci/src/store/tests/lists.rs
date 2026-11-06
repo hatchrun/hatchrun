@@ -11,6 +11,7 @@ fn run_with(db: &TestDb, delivery: &str, actor: &str, git_ref: &str, now: u64) -
     new.git_ref = git_ref.into();
     if git_ref.starts_with("refs/pull/") {
         new.base_ref = Some("main".into());
+        new.head_ref = Some("feature".into());
     }
     db.wait(insert_run(db.db(), &new)).unwrap().unwrap()
 }
@@ -68,11 +69,13 @@ fn runs_are_filtered_and_counted() {
     f.states = vec![RunStatus::Queued];
     assert_eq!(ids(&page(&f)), [tag.id]);
 
-    // Branch: a push's branch, a pull request's base, never a tag.
+    // Branch: a push's branch, a pull request's head, never a tag.
     let mut f = filter();
     f.branches = vec!["main".into()];
-    assert_eq!(ids(&page(&f)), [pr.id, ok.id]);
-    assert_eq!(all.0[1].run.branch(), Some("main"));
+    assert_eq!(ids(&page(&f)), [ok.id]);
+    f.branches = vec!["feature".into()];
+    assert_eq!(ids(&page(&f)), [pr.id]);
+    assert_eq!(all.0[1].run.branch(), Some("feature"));
     assert_eq!(all.0[0].run.branch(), None);
 
     let mut f = filter();

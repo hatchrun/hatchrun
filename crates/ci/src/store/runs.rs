@@ -88,17 +88,20 @@ pub struct RunRow {
     pub pull_number: Option<u64>,
     /// The pull request's head branch, with the number.
     pub head_ref: Option<String>,
+    /// The pull request's title, as the `pull_request` webhook last
+    /// said it.
+    pub pull_title: Option<String>,
 }
 
 impl RunRow {
-    /// The branch the run is on: that of a push, the base branch of a
+    /// The branch the run is on: that of a push, the head branch of a
     /// pull request, none for a tag. The same as [`BRANCH`].
     #[must_use]
     pub fn branch(&self) -> Option<&str> {
         if let Some(name) = self.git_ref.strip_prefix("refs/heads/") {
             Some(name)
         } else if self.git_ref.starts_with("refs/pull/") {
-            self.base_ref.as_deref()
+            self.head_ref.as_deref()
         } else {
             None
         }
@@ -109,7 +112,9 @@ impl RunRow {
 const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, \
      event, ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
      completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
-     pull_number, head_ref";
+     pull_number, head_ref, \
+     (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
+      AND number = ci_runs.pull_number) AS pull_title";
 
 /// The run of delivery `$1` and workflow `$2`, where `{columns}` is
 /// [`RUN_COLUMNS`].
@@ -144,7 +149,9 @@ const INSERT_RUN: &str = "WITH n AS (\
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
        ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
        completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
-       pull_number, head_ref";
+       pull_number, head_ref, \
+       (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
+        AND number = ci_runs.pull_number) AS pull_title";
 
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
@@ -266,11 +273,11 @@ impl RunStatus {
     }
 }
 
-/// The branch a run is on: the branch of a push, the base branch of a
+/// The branch a run is on: the branch of a push, the head branch of a
 /// pull request, nothing for a tag or other refs. For a query that
 /// aliases `ci_runs` as `r`.
 pub(super) const BRANCH: &str = "CASE WHEN r.ref LIKE 'refs/heads/%' THEN substr(r.ref, 12) \
-     WHEN r.ref LIKE 'refs/pull/%' THEN r.base_ref END";
+     WHEN r.ref LIKE 'refs/pull/%' THEN r.head_ref END";
 
 /// Which runs a list holds. Every field narrows the list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -384,7 +391,9 @@ pub(super) const LISTED_COLUMNS: &str = "r.id, r.run_number, r.run_attempt, r.te
      r.workflow, r.delivery, r.event, r.ref AS git_ref, r.sha, r.actor, r.base_ref, r.status, \
      r.conclusion, r.created_at, r.completed_at, \
      (r.expires_at - r.created_at) / 86400000 AS retention_days, r.message, \
-     r.pull_number, r.head_ref, p.full_name AS repository";
+     r.pull_number, r.head_ref, \
+     (SELECT title FROM ci_pulls WHERE repo_id = r.repo_id AND number = r.pull_number) \
+     AS pull_title, p.full_name AS repository";
 
 /// One page of the runs `filter` holds, newest first, those after
 /// `after` when it is set, at most `limit`; and how many runs the
