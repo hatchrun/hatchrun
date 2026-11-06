@@ -557,6 +557,7 @@ mod tests {
             environment: None,
             concurrency: None,
             steps: Vec::new(),
+            deferred: None,
         }
     }
 

@@ -7,6 +7,7 @@
 #![allow(missing_docs)]
 
 use std::cell::{Cell, OnceCell};
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use async_lock::Mutex;
@@ -1080,13 +1081,87 @@ impl<'a> Cx<'a> {
         Ok(())
     }
 
+    /// Makes the jobs of a job that reads its matrix or `runs-on` now
+    /// that it can start. The job's own row becomes the first job; the
+    /// others get rows, and a check run on the first flush. A matrix
+    /// that cannot be made ends the job as failed. A row that an
+    /// earlier try of this turn recorded is reused, so a retry adds no
+    /// second one. The caller holds the lock.
+    async fn expand(&self, run: &mut Loaded, job: u64) -> Result<Vec<Action>> {
+        let db = self.db().await?;
+        let ctx = self.github_ctx(&run.info).await?;
+        let vars = store::job_vars(db, &run.info.tenant_id, run.info.repo.id, None).await?;
+        let Some(made) = run.graph.expansion(job, &ctx, &vars) else {
+            return Ok(Vec::new());
+        };
+        run.graph_mut().set_vars(vars);
+        let legs = match made {
+            Ok(legs) if !legs.is_empty() => legs,
+            Ok(_) => {
+                let message = "the matrix made no job".to_owned();
+                return Ok(run.graph_mut().failed(job, message, &ctx));
+            }
+            Err(message) => return Ok(run.graph_mut().failed(job, message, &ctx)),
+        };
+        let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
+        let now = self.now;
+        let existing = store::jobs_for_run(db, run.info.run_id).await?;
+        let mut rows: Vec<Option<u64>> = Vec::with_capacity(legs.len());
+        let mut fresh = Vec::new();
+        for (i, leg) in legs.iter().enumerate() {
+            let new = crate::runs::new_job(&leg.job);
+            if i == 0 {
+                store::retarget_job(db, job, &new, attempt, now).await?;
+                rows.push(Some(job));
+            } else if let Some(row) = existing.iter().find(|r| r.plan_id == leg.job.id) {
+                rows.push(Some(row.id));
+            } else {
+                rows.push(None);
+                fresh.push(new);
+            }
+        }
+        let inserted = store::insert_jobs(db, run.info.run_id, &fresh, now).await?;
+        let mut ids = Vec::with_capacity(legs.len());
+        for (leg, row) in legs.iter().zip(rows) {
+            if let Some(id) = row {
+                ids.push(id);
+                continue;
+            }
+            let found = inserted.iter().find(|(plan, _)| *plan == leg.job.id);
+            let (_, id) = found.ok_or_else(|| fail("a job of the matrix has no row"))?;
+            if attempt > 1 {
+                store::reset_job(db, *id, attempt, now).await?;
+            }
+            ids.push(*id);
+        }
+        let plan_ids: Vec<String> = legs.iter().map(|l| l.job.id.clone()).collect();
+        let legs: Vec<(u64, _)> = ids.iter().copied().zip(legs).collect();
+        let actions = run.graph_mut().expanded(job, legs, &ctx);
+        for id in &ids {
+            run.outbox_mut().mark(*id);
+        }
+        let waiting: Vec<(u64, Vec<String>)> = run
+            .graph
+            .jobs
+            .iter()
+            .filter(|n| !ids.contains(&n.id) && n.job.requires.iter().any(|r| plan_ids.contains(r)))
+            .map(|n| (n.id, n.job.requires.clone()))
+            .collect();
+        for (id, needs) in waiting {
+            store::set_needs(db, id, &needs, now).await?;
+        }
+        Ok(actions)
+    }
+
     /// Turns what the graph decided into storage changes now and side
     /// effects on the todo list, and returns the GitHub tokens to
     /// revoke once the lock is released. The caller holds the lock.
     async fn apply_actions(&self, run: &mut Loaded, actions: Vec<Action>) -> Result<Vec<String>> {
         let mut revoke = Vec::new();
-        for action in actions {
+        let mut queue: VecDeque<Action> = actions.into();
+        while let Some(action) = queue.pop_front() {
             match action {
+                Action::Expand(job) => queue.extend(self.expand(run, job).await?),
                 Action::Launch(job) => {
                     let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
                     run.todo_mut().push(Work::QueueLaunch { job, attempt });

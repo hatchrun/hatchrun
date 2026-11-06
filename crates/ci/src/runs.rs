@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Diagnostic, Event, JobKind, Plan};
+use hatchrun_workflow::{Diagnostic, Event, JobKind, Plan, PlannedJob};
 use serde_json::Value;
 use worker::{Env, Method, RequestInit, Result};
 
@@ -565,25 +565,7 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
     }
     let mut rows = store::jobs_for_run(db, run.id).await?;
     if rows.is_empty() {
-        let jobs: Vec<NewJob> = plan
-            .jobs
-            .iter()
-            .map(|job| NewJob {
-                plan_id: job.id.clone(),
-                name: job.name.clone(),
-                timeout_minutes: job.timeout_minutes,
-                template: match job.kind {
-                    JobKind::Run { template } => Some(template.labels[0].to_owned()),
-                    JobKind::Approval => None,
-                },
-                token_permissions: job.token_permissions.clone(),
-                secret_refs: job.secret_refs(),
-                environment: job.environment.clone(),
-                strategy_group: job.strategy.as_ref().map(|s| s.group.clone()),
-                max_parallel: job.strategy.as_ref().and_then(|s| s.max_parallel),
-                needs: job.requires.clone(),
-            })
-            .collect();
+        let jobs: Vec<NewJob> = plan.jobs.iter().map(new_job).collect();
         store::insert_jobs(db, run.id, &jobs, now).await?;
         rows = store::jobs_for_run(db, run.id).await?;
     } else if !fresh && !unstarted(&run, &rows) {
@@ -594,6 +576,25 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
     let start = start_body(req, &run, &rows, plan)?;
     post_start(env, run.id, &start).await?;
     Ok(run.id)
+}
+
+/// The row of a planned job.
+pub(crate) fn new_job(job: &PlannedJob) -> NewJob {
+    NewJob {
+        plan_id: job.id.clone(),
+        name: job.name.clone(),
+        timeout_minutes: job.timeout_minutes,
+        template: match job.kind {
+            JobKind::Run { template } => Some(template.labels[0].to_owned()),
+            JobKind::Approval => None,
+        },
+        token_permissions: job.token_permissions.clone(),
+        secret_refs: job.secret_refs(),
+        environment: job.environment.clone(),
+        strategy_group: job.strategy.as_ref().map(|s| s.group.clone()),
+        max_parallel: job.strategy.as_ref().and_then(|s| s.max_parallel),
+        needs: job.requires.clone(),
+    }
 }
 
 /// Whether a recorded run has not started: it is queued and no job has

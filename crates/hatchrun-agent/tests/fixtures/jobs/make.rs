@@ -41,6 +41,7 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
             environment: None,
             concurrency: None,
             steps,
+            deferred: None,
         },
         event_name: "push".to_owned(),
         event: json!({}),

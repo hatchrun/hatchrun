@@ -451,6 +451,7 @@ mod tests {
                 environment: None,
                 concurrency: None,
                 steps: vec![],
+                deferred: None,
             },
             state,
             attempt: 1,
