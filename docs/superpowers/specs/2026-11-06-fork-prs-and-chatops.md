@@ -52,7 +52,7 @@ environment without patterns would hand its secrets to a fork run. The
 fork rule is a separate check that comes before the patterns.
 
 Variables (`vars`) are not secrets by contract, and GitHub passes them to
-fork runs. hatchrun does the same. See open question 5.
+fork runs. hatchrun does the same (decision 5).
 
 ### Residual exposure we accept
 
@@ -163,7 +163,7 @@ write, otherwise defaults) holds:
 | Column | Values | Default |
 | --- | --- | --- |
 | `fork_runs` | `off`, `on` | `on` for public repositories, `off` for private |
-| `fork_approval` | `first_timers`, `first_time_contributors`, `all_outside` | `all_outside` |
+| `fork_approval` | `first_timers`, `first_time_contributors`, `all_outside` | `first_time_contributors` |
 | `fork_max_running` | 1 to 10 | 2 |
 | `fork_timeout_minutes` | 5 to 60 | 30 |
 | `pull_request_target_head_checkout` | `warn`, `block` | `warn` |
@@ -176,9 +176,8 @@ The three approval levels use GitHub's `author_association` values:
 | `first_time_contributors` | `FIRST_TIMER` or `FIRST_TIME_CONTRIBUTOR` (first contribution to this repository) |
 | `all_outside` | anyone but `OWNER`, `MEMBER` or `COLLABORATOR` |
 
-`all_outside` is the default (GitHub's is `first_time_contributors`):
-the base tenant pays for fork compute and a maintainer can lower the
-level in one setting. See open question 1.
+`first_time_contributors` is the default, as on GitHub. A maintainer can
+raise it to `all_outside` in one setting.
 
 An author who does not need approval still gets a `fork` run with no
 secrets. Approval and capabilities are independent: approval controls
@@ -227,8 +226,8 @@ cancels the older pending run of the same PR with the message
 `Superseded by a newer commit`. A rerun of an approved run keeps the
 approval, since the code is the same and a rerun already needs write
 access. An author who becomes `CONTRIBUTOR` after a merge stops needing
-approval under the first two levels. Open question 3 covers a sticky
-approval per author.
+approval under the first two levels. There is no sticky approval per
+author (decision 3).
 
 What the approver sees (check run summary and the app page):
 
@@ -263,7 +262,7 @@ control plane, so no step needs `checks: write`. A step that calls
 `gh pr comment` fails, as on GitHub.
 
 `pull_requests: read` is on the ceiling because `gh pr view` and
-paths-filter actions need it. Open question 6 asks whether to drop it.
+paths-filter actions need it. It stays (decision 6).
 
 The agent receives it the same way as today: the control plane mints it
 when the agent claims the job and puts it in the job document. The token
@@ -369,11 +368,15 @@ an `issue_comment` on a PR, on the PR head sha (one `GET /pulls/{n}` at
 intake), so `/retest` shows next to the other checks. A plain issue has no
 commit and no check run; the run shows in the app.
 
-Replies are the workflow's own: a step calls the API with the job's
-token (`issues: write` or `pull_requests: write` in `permissions:`).
-hatchrun posts no comments or reactions itself. A built-in reaction on a
-command comment needs `issues: write` on the App and a second owner
-prompt. Open question 4.
+The platform reacts to command comments itself, with the App's own
+identity: `eyes` when the delivery is accepted, then `+1` on success or
+`-1` on failure, or `rocket` and `confused` for `/deploy`-style commands
+(the command's `reaction: rocket` option picks the set). It posts no
+comment text. A refused commenter gets no reaction. Reactions use
+`POST /repos/{repo}/issues/comments/{id}/reactions`, which needs
+`Issues: write` (for comments on a PR GitHub accepts `Issues: write` or
+`Pull requests: write`, so `Issues: write` alone covers both). Workflow
+steps can still reply with the job token and `permissions:`.
 
 ### Loop and noise control
 
@@ -506,17 +509,24 @@ maintainer chose to run it with secrets. This is the `/ok-to-test` and
 `/deploy` pattern that projects use today, now with the permission check
 and the sha pinned.
 
+### Built-in /approve-run
+
+`/approve-run` needs no workflow. On a fork PR comment from a user with
+`write` or higher (same collaborator permission call), the control plane
+approves the pending run for the PR's current head sha, exactly as the
+check run button does, and reacts `+1`. A comment with no pending run gets
+`confused`. It is the only built-in command, and the name is reserved.
+
 ## GitHub App permission and event changes
 
 | Change | Why | Prompts owners |
 | --- | --- | --- |
-| Repository permission `Issues: read` | needed for `issues` webhooks and the issue API reads | yes |
+| Repository permission `Issues: write` (includes read) | `issues` webhooks, issue API reads, reactions on command comments | yes |
 | Webhook subscriptions `issues`, `issue_comment` | the two events | no, these follow the permission |
 | `pull_request_target` | uses the existing `pull_request` webhook and the existing `Pull requests: read` permission | no |
 | Fork runs | use the existing webhook, `Contents: read`, `Checks: write` | no |
 | `Metadata: read` for the collaborator permission call | already held by every App | no |
 | `Checks: write` for `requested_action` and `action_required` | the App already creates check runs | no |
-| Later: `Issues: write` | reactions and replies by the platform (open question 4) | yes |
 
 A new permission puts a request in front of every installation owner, and
 GitHub sends no event for an installation until the owner accepts. Until
@@ -574,11 +584,11 @@ Fewer, larger PRs with a deploy order, as every merge to main releases.
 
 1. Merge PR 1. The deploy workflow runs migration 0019 as the owner role,
    then deploys the Worker and the app together. Fork PRs start running
-   for public repositories at once, behind the default `all_outside`
-   gate.
+   for public repositories at once, behind the default first-time
+   contributor gate.
 2. Merge PR 2. Deploy the CLI release with it so `validate` and the
    Worker agree.
-3. Change the GitHub App in its settings: add `Issues: read` and subscribe
+3. Change the GitHub App in its settings: add `Issues: write` and subscribe
    to `issues` and `issue_comment`. Record it in the ops repo (the App's
    permission list is part of its inventory).
 4. Merge PR 3. Installations that accept the new permission begin to send
@@ -586,18 +596,19 @@ Fewer, larger PRs with a deploy order, as every merge to main releases.
 
 PR 3 can merge before step 3. It then sees no events and breaks nothing.
 
-## Open questions for the owner
+## Decisions
 
-1. Default approval level: `all_outside` (this spec) or GitHub's
-   `first_time_contributors`.
-2. Private repositories: fork runs `off` by default. Confirm.
-3. Approval per head sha (this spec, maintainers re-approve every push) or
-   sticky per PR author until their first merge.
-4. Whether the platform should react to command comments itself. That needs
-   `Issues: write` and a second owner prompt. This spec defers it.
-5. Pass `vars` to fork runs as GitHub does (this spec), or withhold them.
-6. Keep `pull_requests: read` on the fork token ceiling, or reduce it to
-   `contents: read` and `metadata: read`.
-7. A built-in `/approve-run` comment command for maintainers.
-8. Default of `pull_request_target_head_checkout`: `warn` (this spec, as
-   GitHub) or `block`.
+Owner answers of 2026-11-06, applied above.
+
+1. Default approval level is `first_time_contributors`, as GitHub's.
+2. Fork runs on private repositories are off by default, with a
+   repository setting to enable them.
+3. Approval is per head sha. Each push from an author who needs approval
+   asks again. There is no sticky approval per author.
+4. The platform reacts to command comments itself (`eyes`, then result
+   reactions), so the App holds `Issues: write`.
+5. Fork runs get `vars`.
+6. The fork token keeps `pull_requests: read`.
+7. A built-in `/approve-run` command exists (below).
+8. A PR-head checkout in `pull_request_target` warns by default, with a
+   repository setting to block.
