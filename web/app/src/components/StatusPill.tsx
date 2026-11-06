@@ -12,31 +12,44 @@ export type Status = "passed" | "running" | "failed" | "waiting" | "queued" | "c
 interface Look {
   label: string;
   glyph: string;
-  /** Text colour of the glyph and label. */
+  /** Text colour of the glyph. queued, cancelled and skipped have no glyph colour; they show a dot. */
   text: string;
-  /** The 12% tint behind a pill. */
-  tint: string;
-  /** The 2px edge of a row that needs action. */
+  /** The 8px status dot. */
+  dot: string;
+  /** Colour of the status word: text-2, except failed and waiting. */
+  word: string;
+  /** The 2px left edge of a row. Only failed and waiting rows have one. */
   edge: string;
-  /** A fill, for bars and squares. */
+  /** A fill for job squares and chart bars. Passed is control grey; only failures are coloured. */
   fill: string;
 }
 
 export const STATUS: Record<Status, Look> = {
-  passed: { label: "passed", glyph: "✓", text: "text-passed", tint: "bg-passed/12", edge: "border-l-passed", fill: "bg-passed" },
-  running: { label: "running", glyph: "▶", text: "text-running", tint: "bg-running/12", edge: "border-l-running", fill: "bg-running" },
-  failed: { label: "failed", glyph: "✕", text: "text-failed", tint: "bg-failed/12", edge: "border-l-failed", fill: "bg-failed" },
-  waiting: { label: "waiting", glyph: "!", text: "text-waiting", tint: "bg-waiting/12", edge: "border-l-waiting", fill: "bg-waiting" },
-  queued: { label: "queued", glyph: "•••", text: "text-queued", tint: "bg-queued/12", edge: "border-l-queued", fill: "bg-queued" },
-  cancelled: { label: "cancelled", glyph: "⊘", text: "text-queued", tint: "bg-queued/12", edge: "border-l-queued", fill: "bg-queued" },
-  skipped: { label: "skipped", glyph: "-", text: "text-queued", tint: "bg-queued/12", edge: "border-l-queued", fill: "bg-queued" },
+  passed: { label: "passed", glyph: "✓", text: "text-passed", dot: "bg-passed", word: "text-fg-2", edge: "", fill: "bg-control" },
+  running: { label: "running", glyph: "▶", text: "text-running", dot: "bg-running", word: "text-fg-2", edge: "", fill: "bg-fg-3" },
+  failed: {
+    label: "failed",
+    glyph: "✕",
+    text: "text-failed",
+    dot: "bg-failed",
+    word: "text-failed",
+    edge: "border-l-2 border-l-failed/60",
+    fill: "bg-failed",
+  },
+  waiting: {
+    label: "waiting",
+    glyph: "!",
+    text: "text-waiting",
+    dot: "bg-waiting",
+    word: "text-waiting",
+    edge: "border-l-2 border-l-waiting/60",
+    fill: "bg-fg-3",
+  },
+  queued: { label: "queued", glyph: "", text: "text-fg-3", dot: "bg-queued", word: "text-fg-2", edge: "", fill: "bg-rule" },
+  cancelled: { label: "cancelled", glyph: "⊘", text: "text-fg-3", dot: "bg-queued", word: "text-fg-2", edge: "", fill: "bg-rule" },
+  skipped: { label: "skipped", glyph: "-", text: "text-fg-3", dot: "bg-queued", word: "text-fg-2", edge: "", fill: "bg-rule" },
 };
 
-/**
- * Maps what /api/ci answers (a run or job's `status` and `conclusion`,
- * or a status filter value such as "success") to a `Status`. A job
- * `held` for approval is waiting.
- */
 export function ciStatus(status: string, conclusion?: string | null, held?: string | null): Status {
   if (held) {
     return "waiting";
@@ -67,8 +80,21 @@ export function ciStatus(status: string, conclusion?: string | null, held?: stri
 }
 
 /** The glyph alone, for dense rows. It carries the status as its accessible name. */
+/** The 8px dot in the status colour. */
+export function StatusDot({ status, className }: { status: Status; className?: string }) {
+  return <span aria-hidden="true" className={cn("inline-block size-2 flex-none rounded-full", STATUS[status].dot, className)} />;
+}
+
+/** The glyph in the status colour, for dense lists. queued has no glyph and shows its dot. */
 export function StatusGlyph({ status, className }: { status: Status; className?: string }) {
   const look = STATUS[status];
+  if (!look.glyph) {
+    return (
+      <span role="img" aria-label={look.label} className={cn("inline-flex w-4 items-center justify-center", className)}>
+        <StatusDot status={status} />
+      </span>
+    );
+  }
   return (
     <span role="img" aria-label={look.label} className={cn("inline-block w-4 text-center font-semibold", look.text, className)}>
       {look.glyph}
@@ -76,7 +102,7 @@ export function StatusGlyph({ status, className }: { status: Status; className?:
   );
 }
 
-/** Glyph and word on the status colour at 12%. `children` follow the word, such as a count. */
+/** A status: the dot and the word. No tinted pill; only failed and waiting colour the word. */
 export function StatusPill({
   status,
   label,
@@ -91,15 +117,8 @@ export function StatusPill({
 }) {
   const look = STATUS[status];
   return (
-    <span
-      className={cn(
-        "inline-flex h-6 items-center gap-1.5 rounded-sm px-2.5 text-[13px] font-semibold whitespace-nowrap",
-        look.text,
-        look.tint,
-        className,
-      )}
-    >
-      <span aria-hidden="true">{look.glyph}</span>
+    <span className={cn("inline-flex h-6 items-center gap-2 text-[13px] whitespace-nowrap", look.word, className)}>
+      <StatusDot status={status} />
       {label ?? look.label}
       {children}
     </span>

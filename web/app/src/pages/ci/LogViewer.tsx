@@ -12,7 +12,7 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer,
 import { abbreviate, duration } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { StatusGlyph, ciStatus } from "@/components/StatusPill";
-import { segments } from "./ansi";
+import { plain, segments } from "./ansi";
 import { isError, type LogSource, type SearchResult, type Step } from "./logSource";
 import { BTN, BTN_PRIMARY, BTN_SM, FIELD } from "./runUi";
 
@@ -31,6 +31,11 @@ interface Section {
   /** First line below the header. */
   body: number;
   count: number;
+}
+
+/** An error line for the summary and the error list: no escapes, no `##[error]` marker. */
+function errorText(line: string): string {
+  return plain(line).replace(/^##\[error\]/, "");
 }
 
 function sectionsOf(source: LogSource): Section[] {
@@ -93,7 +98,7 @@ function mark(text: string, q: string, key: string): ReactNode {
       out.push(text.slice(at, hit));
     }
     out.push(
-      <mark key={`${key}${hit}`} className="rounded-xs bg-brand/35 text-inherit">
+      <mark key={`${key}${hit}`} className="rounded-xs bg-brand/25 text-inherit">
         {text.slice(hit, hit + needle.length)}
       </mark>,
     );
@@ -449,7 +454,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
           onClick={() => toggle(section.id)}
           className={cn(
             "flex h-[20px] w-full cursor-pointer items-center gap-2 border-0 bg-raised px-2 text-left font-mono text-[13px] text-fg hover:bg-control/40",
-            target?.line === section.header && "bg-brand/15",
+            target?.line === section.header && "bg-brand/10",
           )}
         >
           {expanded ? <ChevronDown size={12} aria-hidden="true" className="shrink-0 text-fg-3" /> : <ChevronRight size={12} aria-hidden="true" className="shrink-0 text-fg-3" />}
@@ -484,15 +489,15 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
           key={line}
           className={cn(
             "flex min-h-[20px] font-mono text-[12.5px] leading-[20px] hover:bg-raised",
-            bad && "bg-failed/10",
-            target?.line === line && "bg-brand/25 shadow-[inset_3px_0_0_var(--brand)]",
+            bad ? "error-line" : "border-l-2 border-l-transparent",
+            target?.line === line && "bg-brand/15 shadow-[inset_2px_0_0_var(--brand)]",
           )}
         >
           <span aria-hidden="true" className="sticky left-0 w-[68px] shrink-0 bg-inherit pr-3 text-right text-fg-3 tabular-nums select-none">
             {line + 1}
           </span>
           {times && stamp !== null && <span className="mr-3 shrink-0 text-fg-3 tabular-nums">{stamp}</span>}
-          <span className={cn("min-w-0 pr-3", wrap ? "break-words whitespace-pre-wrap" : "whitespace-pre", bad && "text-failed")}>
+          <span className={cn("min-w-0 pr-3", wrap ? "break-words whitespace-pre-wrap" : "whitespace-pre", bad ? "text-fg" : "text-fg-2")}>
             {raw === undefined ? "" : <LineText text={text} q={search.state === "ready" ? search.q : ""} />}
             {text === "" && "​"}
           </span>
@@ -515,7 +520,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
   return (
     <section ref={frame} aria-label="Log" title={name} className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-md border border-rule bg-panel">
       {failed && firstError && (
-        <div className="flex items-center justify-between gap-3 border-b border-rule bg-failed/10 px-3 py-1">
+        <div className="flex items-center justify-between gap-3 error-line border-b border-rule px-3 py-1">
           <div className="flex min-w-0 items-center gap-2 font-mono text-[13px]">
             <div className="flex shrink-0 items-center gap-2">
               <span aria-hidden="true" className="text-failed">
@@ -528,8 +533,8 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
               <span aria-hidden="true" className="text-fg-3">
                 └
               </span>
-              <span className="min-w-0 truncate" title={firstError.text}>
-                {firstError.text.replace(/^##\[error\]/, "")}
+              <span className="min-w-0 truncate" title={errorText(firstError.text)}>
+                {errorText(firstError.text)}
               </span>
             </div>
           </div>
@@ -609,8 +614,8 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
                   }}
                 >
                   <span className="w-14 shrink-0 text-right text-fg-3 tabular-nums">{error.line + 1}</span>
-                  <span className="min-w-0 flex-1 truncate text-failed" title={error.text}>
-                    {error.text.replace(/^##\[error\]/, "")}
+                  <span className="min-w-0 flex-1 truncate text-fg" title={errorText(error.text)}>
+                    {errorText(error.text)}
                   </span>
                   <span className="max-w-28 shrink-0 truncate text-fg-3">{stepOf(error.step)}</span>
                 </button>
@@ -718,7 +723,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
           {rows}
         </div>
         {source.failure && (
-          <div role="alert" className="sticky bottom-0 flex items-center justify-between gap-3 border-t border-failed/40 bg-raised px-3 py-2 font-mono text-[13px] text-failed">
+          <div role="alert" className="sticky bottom-0 flex items-center justify-between gap-3 error-line border-t border-rule px-3 py-2 font-mono text-[13px]">
             <span>Could not read the log: {source.failure.message}</span>
             <button type="button" className={BTN_SM} onClick={onRetry}>
               Retry

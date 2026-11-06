@@ -205,7 +205,7 @@ export function JobsPanel({ run, jobs, selected, now }: { run: CiRun; jobs: CiJo
                 <ChevronRight size={12} aria-hidden="true" className={cn("shrink-0 text-fg-3 transition-transform", isOpen(unit) && "rotate-90")} />
                 <span className="min-w-0 flex-1 truncate font-mono text-[13px] font-bold">{unit.name}</span>
                 <span className="font-mono text-[13px] text-fg-3">{unit.entries.length}</span>
-                <span className="font-mono text-[13px] text-passed">{unit.passed}</span>
+                <span className="font-mono text-[13px] text-fg-2">{unit.passed}</span>
                 {unit.failed > 0 && <span className="font-mono text-[13px] text-failed">{unit.failed}✕</span>}
               </button>
               {isOpen(unit) &&
@@ -244,7 +244,7 @@ function JobRow({
       aria-current={current ? "true" : undefined}
       title={`${job.name}, ${needsTitle(job)}`}
       style={{ paddingLeft: indent(level, nested) }}
-      className={cn("group flex items-center gap-2 border-l-2 py-1.5 pr-3 hover:bg-raised", current ? "border-l-brand bg-raised" : "border-l-transparent")}
+      className={cn("group flex items-center gap-2 border-l-2 py-1.5 pr-3 hover:bg-raised", current ? "selected-item border-l-transparent" : "border-l-transparent")}
     >
       {level > 0 && (
         <span aria-hidden="true" className="-mr-1 font-mono text-[13px] text-fg-3">
@@ -253,7 +253,7 @@ function JobRow({
       )}
       <StatusGlyph status={status} />
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate font-mono text-[13px] font-bold group-hover:text-brand">{label ?? job.name}</span>
+        <span className="truncate font-mono text-[13px] font-bold group-hover:text-fg">{label ?? job.name}</span>
         <span title={needsTitle(job)} className={cn("truncate font-mono text-xs", status === "waiting" ? "text-waiting" : "text-fg-3")}>
           {note(job, status)}
         </span>

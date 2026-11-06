@@ -92,7 +92,7 @@ function Summary({ data, range }: { data: Activity; range: ActivityRange }) {
   return (
     <span className="font-mono text-[13px] text-fg-3">
       <span className="text-fg">{running}</span> / {limit} slots, {queued} queued <span className="text-control">|</span> {range}: <span className="text-fg">{abbreviate(sum("started"))}</span> started,{" "}
-      <span className="text-passed">{abbreviate(sum("passed"))}</span> passed, <span className={cn(failed > 0 ? "text-failed" : "text-fg-3")}>{abbreviate(failed)}</span> failed
+      <span className="text-fg">{abbreviate(sum("passed"))}</span> passed, <span className={cn(failed > 0 ? "text-failed" : "text-fg-3")}>{abbreviate(failed)}</span> failed
     </span>
   );
 }
@@ -101,9 +101,9 @@ function Concurrency({ concurrency }: { concurrency: Activity["concurrency"] }) 
   const { running, queued, limit } = concurrency;
   const free = Math.max(0, limit - running);
   const parts = [
-    { key: "running", label: "running", n: running, className: "bg-running" },
+    { key: "running", label: "running", n: running, className: "bg-fg-3" },
     { key: "free", label: "free", n: free, className: "border border-control bg-transparent" },
-    { key: "queued", label: "queued", n: queued, className: "bg-waiting/60" },
+    { key: "queued", label: "queued", n: queued, className: "border border-dashed border-fg-3 bg-transparent" },
   ];
   return (
     <div className="flex min-w-[320px] flex-[1_1_380px] flex-col gap-3 px-4.5 py-4">
@@ -161,7 +161,7 @@ function Chart({ data, look, range, onRange }: { data: Activity; look: (typeof R
           </div>
         </div>
         <span className="font-mono text-[13px] text-fg-3">
-          <span className="text-lg font-semibold text-fg">{abbreviate(started)}</span> started <span className="text-control">|</span> <span className="text-passed">{abbreviate(passed)}</span> passed{" "}
+          <span className="text-lg font-semibold text-fg">{abbreviate(started)}</span> started <span className="text-control">|</span> <span className="text-fg">{abbreviate(passed)}</span> passed{" "}
           <span className="text-control">|</span> <span className={cn("text-failed", failed > 0 && "text-lg font-semibold")}>{abbreviate(failed)}</span> failed
         </span>
       </div>
@@ -179,8 +179,8 @@ function Chart({ data, look, range, onRange }: { data: Activity; look: (typeof R
           {data.buckets.map((bucket) => (
             <span key={bucket.at} title={`${stamp(bucket.at)}: ${bucket.started} started, ${bucket.passed} passed, ${bucket.failed} failed`} className="flex min-h-px flex-1 flex-col justify-end">
               <span className="bg-failed" style={{ height: px(bucket.failed) }} />
-              <span className="min-h-px bg-passed/70" style={{ height: px(bucket.passed), minHeight: bucket.passed > 0 ? 1 : 0 }} />
-              <span className="bg-fg-3/40" style={{ height: px(Math.max(0, bucket.started - bucket.passed - bucket.failed)) }} />
+              <span className="min-h-px bg-control" style={{ height: px(bucket.passed), minHeight: bucket.passed > 0 ? 1 : 0 }} />
+              <span className="bg-fg-3" style={{ height: px(Math.max(0, bucket.started - bucket.passed - bucket.failed)) }} />
             </span>
           ))}
         </div>

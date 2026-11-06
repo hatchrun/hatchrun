@@ -296,7 +296,7 @@ export function Environments({ org }: OrgPageProps) {
           role="status"
           className="fixed right-6 bottom-6 z-30 flex items-center gap-3 rounded-sm border border-control bg-raised px-4 py-2 font-mono text-[13px] shadow-lg"
         >
-          <span aria-hidden="true" className="text-passed">
+          <span aria-hidden="true" className="text-fg-2">
             ✓
           </span>
           <span>{toast}</span>

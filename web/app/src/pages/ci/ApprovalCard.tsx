@@ -52,7 +52,7 @@ export function ApprovalCard({
       aria-label={pending ? "Approval required" : "Approval decided"}
       className={cn(
         "flex flex-col gap-2 rounded-md border px-3 py-2",
-        pending ? "border-waiting/50 bg-waiting/10" : "border-rule bg-panel",
+        pending ? "border-rule border-l-2 border-l-waiting/60 bg-panel" : "border-rule bg-panel",
       )}
     >
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">

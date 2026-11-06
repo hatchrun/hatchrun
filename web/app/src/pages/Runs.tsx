@@ -109,8 +109,8 @@ export function Runs({ org }: OrgPageProps) {
               })}
             </div>
             <div className="flex flex-wrap items-center gap-3">
-              <span className={cn("inline-flex items-center gap-2 font-mono text-[13px]", live ? "text-passed" : "text-fg-3")}>
-                <span className={cn("size-1.5 rounded-full", live ? "bg-passed" : "bg-fg-3")} />
+              <span className={cn("inline-flex items-center gap-2 font-mono text-[13px]", "text-fg-3")}>
+                <span className={cn("size-1.5 rounded-full", live ? "bg-running" : "bg-fg-3")} />
                 {live ? "Live, refreshes every 5 s" : "Idle, nothing running"}
               </span>
               <Popover
@@ -141,7 +141,7 @@ export function Runs({ org }: OrgPageProps) {
                         setQuery({ range: item.id === DEFAULT_RANGE ? null : item.id });
                         setRangeOpen(false);
                       }}
-                      className={cn("flex w-full cursor-pointer items-center gap-2.5 px-3 py-1.5 text-left font-mono text-[13px] hover:bg-rule", item.id === range.id && "bg-brand/10 shadow-[inset_2px_0_0_var(--brand)]")}
+                      className={cn("flex w-full cursor-pointer items-center gap-2.5 px-3 py-1.5 text-left font-mono text-[13px] hover:bg-rule", item.id === range.id && "selected-item")}
                     >
                       <span className="w-2.5">{item.id === range.id ? "✓" : ""}</span>
                       {item.label}

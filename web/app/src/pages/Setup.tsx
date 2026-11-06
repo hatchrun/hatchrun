@@ -121,9 +121,9 @@ function SetupSteps({ org, admin, setup, reload }: { org: string; admin: boolean
       narrow
     >
       {complete && (
-        <section aria-label="Setup complete" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-passed bg-panel px-4 py-3">
+        <section aria-label="Setup complete" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-control bg-panel px-4 py-3">
           <div className="flex items-center gap-3">
-            <span aria-hidden="true" className="font-mono font-bold text-passed">
+            <span aria-hidden="true" className="font-mono font-bold text-fg-2">
               ✓
             </span>
             <div>
@@ -133,7 +133,7 @@ function SetupSteps({ org, admin, setup, reload }: { org: string; admin: boolean
               </div>
             </div>
           </div>
-          <Link href={orgUrl(org)} className="font-mono text-xs text-fg quiet-underline hover:text-brand">
+          <Link href={orgUrl(org)} className="font-mono text-xs link">
             Go to Runs →
           </Link>
         </section>
@@ -230,7 +230,7 @@ function EnableForm({
         </Button>
         <span className="font-mono text-xs text-fg-3">{draft.all ? `all ${count(total)} selected` : `${count(n)} of ${count(total)} selected`}</span>
         {result && (
-          <span role="status" className={cn("font-mono text-xs font-bold", result.ok ? "text-passed" : "text-failed-soft")}>
+          <span role="status" className={cn("font-mono text-xs font-bold", result.ok ? "text-fg-2" : "text-failed")}>
             {result.text}
           </span>
         )}
