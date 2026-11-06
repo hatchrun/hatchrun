@@ -226,6 +226,7 @@ impl Job<'_> {
                     env: step.env.clone(),
                     if_: step.if_.clone(),
                     continue_on_error,
+                    timeout_minutes: None,
                 };
                 // A composite action may use composite actions, so this
                 // future would contain itself without the box.

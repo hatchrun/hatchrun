@@ -304,6 +304,7 @@ mod tests {
             secret_refs: json!({}),
             held: None,
             environment: Some("production".into()),
+            environment_url: None,
             approval_attempt: Some(1),
             approval_decision: Some("approved".into()),
             approval_by: Some("octo".into()),

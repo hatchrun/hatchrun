@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use hatchrun_workflow::RELEASE_TYPES;
+use hatchrun_workflow::{MERGE_GROUP_TYPES, RELEASE_TYPES};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -113,6 +113,40 @@ pub struct RefChange {
     pub payload: Value,
 }
 
+/// A pull request entering the merge queue asks for its checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeGroup {
+    /// The App installation the delivery came through.
+    pub installation_id: u64,
+    /// The repository.
+    pub repo: Repo,
+    /// The activity type, `checks_requested`.
+    pub action: String,
+    /// The merge group's commit, which the queue reads checks on.
+    pub head_sha: String,
+    /// The full ref of the merge group, `refs/heads/gh-readonly-queue/...`.
+    pub head_ref: String,
+    /// The login of the user behind the entry.
+    pub actor: String,
+    /// The delivery body.
+    pub payload: Value,
+}
+
+/// A `repository_dispatch` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryDispatch {
+    /// The App installation the delivery came through.
+    pub installation_id: u64,
+    /// The repository.
+    pub repo: Repo,
+    /// The request's `event_type`.
+    pub action: String,
+    /// The login of the user behind the request.
+    pub actor: String,
+    /// The delivery body, with the request's `client_payload`.
+    pub payload: Value,
+}
+
 /// A request to run a job again, from the check run's button.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rerequested {
@@ -137,6 +171,10 @@ pub enum Trigger {
     Create(RefChange),
     /// A branch or tag was deleted.
     Delete(RefChange),
+    /// A merge queue entry asks for its checks.
+    MergeGroup(MergeGroup),
+    /// A repository dispatch request.
+    RepositoryDispatch(RepositoryDispatch),
     /// A re-run of one job.
     Rerequested(Rerequested),
     /// A repository changed visibility, name, owner or default branch.
@@ -260,6 +298,28 @@ struct ReleaseInfo {
 }
 
 #[derive(Deserialize)]
+struct MergeGroupBody {
+    action: String,
+    merge_group: MergeGroupInfo,
+    sender: Sender,
+    repository: Repo,
+}
+
+#[derive(Deserialize)]
+struct MergeGroupInfo {
+    head_sha: String,
+    head_ref: String,
+}
+
+#[derive(Deserialize)]
+struct DispatchBody {
+    /// The request's `event_type`.
+    action: String,
+    sender: Sender,
+    repository: Repo,
+}
+
+#[derive(Deserialize)]
 struct RefBody {
     r#ref: String,
     ref_type: String,
@@ -301,6 +361,33 @@ fn release(installation_id: u64, payload: Value) -> Result<Trigger, serde_json::
         action: r.action,
         tag: r.release.tag_name,
         actor: r.sender.login,
+        payload,
+    }))
+}
+
+fn merge_group(installation_id: u64, payload: Value) -> Result<Trigger, serde_json::Error> {
+    let g = MergeGroupBody::deserialize(&payload)?;
+    if !MERGE_GROUP_TYPES.contains(&g.action.as_str()) {
+        return Ok(ignored("merge_group action is not used"));
+    }
+    Ok(Trigger::MergeGroup(MergeGroup {
+        installation_id,
+        repo: g.repository,
+        action: g.action,
+        head_sha: g.merge_group.head_sha,
+        head_ref: g.merge_group.head_ref,
+        actor: g.sender.login,
+        payload,
+    }))
+}
+
+fn repository_dispatch(installation_id: u64, payload: Value) -> Result<Trigger, serde_json::Error> {
+    let d = DispatchBody::deserialize(&payload)?;
+    Ok(Trigger::RepositoryDispatch(RepositoryDispatch {
+        installation_id,
+        repo: d.repository,
+        action: d.action,
+        actor: d.sender.login,
         payload,
     }))
 }
@@ -348,6 +435,8 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
             | "release"
             | "create"
             | "delete"
+            | "merge_group"
+            | "repository_dispatch"
             | "installation_repositories"
     ) {
         return Ok(Trigger::Ignored(format!("{event} events are not used")));
@@ -426,6 +515,8 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
             }))
         }
         "release" => release(installation_id, payload),
+        "merge_group" => merge_group(installation_id, payload),
+        "repository_dispatch" => repository_dispatch(installation_id, payload),
         "create" | "delete" => ref_change(event == "create", installation_id, payload),
         "repository" => {
             let r = RepositoryBody::deserialize(&payload)?;
@@ -469,6 +560,8 @@ mod tests {
     const RERUN: &str = include_str!("../testdata/check_run_rerequested.json");
     const RELEASE: &str = include_str!("../testdata/release.json");
     const CREATE: &str = include_str!("../testdata/create.json");
+    const MERGE_GROUP: &str = include_str!("../testdata/merge_group.json");
+    const DISPATCH: &str = include_str!("../testdata/repository_dispatch.json");
 
     fn edited(body: &str, f: impl FnOnce(&mut Value)) -> Vec<u8> {
         let mut v: Value = serde_json::from_str(body).unwrap();
@@ -677,10 +770,14 @@ mod tests {
             "release",
             "create",
             "delete",
+            "merge_group",
+            "repository_dispatch",
         ] {
             let body = match event {
                 "push" => PUSH,
                 "pull_request" => PULL_REQUEST,
+                "merge_group" => MERGE_GROUP,
+                "repository_dispatch" => DISPATCH,
                 "release" => RELEASE,
                 "create" | "delete" => CREATE,
                 _ => RERUN,
@@ -738,6 +835,44 @@ mod tests {
             panic!("not a delete");
         };
         assert_eq!(d.r#ref, "refs/heads/topic/x");
+    }
+
+    #[test]
+    fn a_merge_group_is_read_by_its_head() {
+        let Trigger::MergeGroup(g) = parse("merge_group", MERGE_GROUP.as_bytes()).unwrap() else {
+            panic!("not a merge group");
+        };
+        assert_eq!(g.action, "checks_requested");
+        assert_eq!(g.head_sha, "6d2f1c0e9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d");
+        assert!(
+            g.head_ref
+                .starts_with("refs/heads/gh-readonly-queue/main/pr-5-")
+        );
+        assert_eq!(g.actor, "octocat");
+        assert_eq!(g.installation_id, 777);
+        assert_eq!(g.repo.full_name, "octo/widgets");
+    }
+
+    #[test]
+    fn a_destroyed_merge_group_is_ignored() {
+        let body = edited(MERGE_GROUP, |v| v["action"] = "destroyed".into());
+        assert_eq!(
+            parse("merge_group", &body).unwrap(),
+            Trigger::Ignored("merge_group action is not used".into())
+        );
+    }
+
+    #[test]
+    fn a_repository_dispatch_keeps_its_type_and_client_payload() {
+        let Trigger::RepositoryDispatch(d) =
+            parse("repository_dispatch", DISPATCH.as_bytes()).unwrap()
+        else {
+            panic!("not a dispatch");
+        };
+        assert_eq!(d.action, "deploy");
+        assert_eq!(d.actor, "octocat");
+        assert_eq!(d.repo.default_branch, "main");
+        assert_eq!(d.payload["client_payload"]["target"], "staging");
     }
 
     #[test]

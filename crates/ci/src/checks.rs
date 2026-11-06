@@ -78,6 +78,8 @@ pub struct StepView {
 pub struct JobView<'a> {
     /// The workflow's name.
     pub workflow: &'a str,
+    /// The run's title, from the workflow's `run-name`.
+    pub run_title: Option<&'a str>,
     /// The job.
     pub node: &'a Node,
     /// The commit the check run is on.
@@ -130,6 +132,25 @@ fn cell(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('|', "\\|")
         .replace(['\n', '\r'], " ")
+}
+
+/// `text` as one line of plain text in Markdown: every character that
+/// could start a link, an image, emphasis, HTML or a list is escaped, so
+/// a title from a pull request or a dispatch payload cannot make any.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' | '\r' => out.push(' '),
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '<' | '>' | '!' | '#' | '|' | '~'
+            | '&' | ':' | '-' | '+' | '=' | '{' | '}' | '.' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn level_word(level: AnnotationLevel) -> &'static str {
@@ -213,7 +234,7 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
         _ => title.to_owned(),
     };
 
-    let mut summary = String::new();
+    let mut summary = heading(view);
     if let Some(message) = held {
         summary.push_str(message);
         summary.push_str("\n\n");
@@ -294,6 +315,27 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
         }),
     };
     (run, sent + fresh_len)
+}
+
+/// What opens the summary: the run's title, then the environment the
+/// job deploys to, with its URL once it has one.
+fn heading(view: &JobView<'_>) -> String {
+    let mut text = String::new();
+    if let Some(run_title) = view.run_title {
+        let _ = write!(text, "{}\n\n", plain(run_title));
+    }
+    if let Some(environment) = &view.node.environment {
+        let url = view
+            .node
+            .result
+            .as_ref()
+            .and_then(|result| result.environment_url.as_deref());
+        let _ = match url {
+            Some(url) => write!(text, "Environment `{environment}`: {url}\n\n"),
+            None => write!(text, "Environment `{environment}`\n\n"),
+        };
+    }
+    text
 }
 
 /// The log lines of a failed job as a fenced `text` block under a
@@ -449,9 +491,11 @@ mod tests {
                 outputs: BTreeMap::new(),
                 token_permissions: BTreeMap::new(),
                 environment: None,
+                environment_url: None,
                 concurrency: None,
                 steps: vec![],
             },
+            environment: None,
             state,
             attempt: 1,
             result: None,
@@ -463,6 +507,7 @@ mod tests {
     fn view<'a>(node: &'a Node, steps: &'a [StepView], notes: &'a [Annotation]) -> JobView<'a> {
         JobView {
             workflow: "ci",
+            run_title: None,
             node,
             head_sha: "abc",
             details_url: "https://ci.hatchrun.io/ci/o/r/runs/1/jobs/42".into(),
@@ -526,6 +571,50 @@ mod tests {
             assert_eq!(run.output.unwrap().title, "Queued");
             assert_eq!(run.conclusion, None);
         }
+    }
+
+    #[test]
+    fn the_run_title_and_the_environment_head_the_summary() {
+        let mut n = node(State::Done(Conclusion::Success), None);
+        n.environment = Some("production".into());
+        n.result = Some(hatchrun_workflow::JobResult {
+            conclusion: Conclusion::Success,
+            outputs: BTreeMap::new(),
+            steps: Vec::new(),
+            annotations: Vec::new(),
+            environment_url: Some("https://app.example.com/pr-7".into()),
+        });
+        let mut v = view(&n, &[], &[]);
+        v.run_title = Some("Deploy staging\nby octocat");
+        let (run, _) = render(&v);
+        assert_eq!(
+            run.output.unwrap().summary,
+            "Deploy staging by octocat\n\nEnvironment `production`: https://app.example.com/pr-7"
+        );
+    }
+
+    #[test]
+    fn a_hostile_run_title_is_plain_text() {
+        let n = node(State::Running, None);
+        let mut v = view(&n, &[], &[]);
+        v.run_title = Some(
+            "[click](https://evil.example) ![t](https://evil.example/p.png) **b** <b>x</b> @all",
+        );
+        let (run, _) = render(&v);
+        let summary = run.output.unwrap().summary;
+        // Nothing in it can open a link, an image, emphasis or a tag.
+        for opener in ["[", "(", "!", "*", "<", ":"] {
+            for (i, _) in summary.match_indices(opener) {
+                assert!(summary[..i].ends_with('\\'), "{opener} at {i}: {summary}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_job_without_an_environment_shows_none() {
+        let n = node(State::Running, None);
+        let (run, _) = render(&view(&n, &[], &[]));
+        assert_eq!(run.output.unwrap().summary, "");
     }
 
     #[test]

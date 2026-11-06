@@ -15,7 +15,7 @@ use hatchrun_cloud::fetch::{Counted, Sender};
 use hatchrun_cloud::http::Response as HttpResponse;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
 use hatchrun_workflow::agent::{Batch, BatchReply};
-use hatchrun_workflow::{Conclusion, JobResult};
+use hatchrun_workflow::{Conclusion, JobResult, valid_environment_url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use worker::{
@@ -816,11 +816,18 @@ impl<'a> Cx<'a> {
         match work {
             Work::StartRun => self.started(db, info, info.run_attempt).await,
             Work::StartRunAt { attempt } => self.started(db, info, *attempt).await,
-            Work::QueueLaunch { job, attempt } => {
+            Work::QueueLaunch {
+                job,
+                attempt,
+                environment,
+            } => {
                 self.register_concurrency(db, info, *job, *attempt).await?;
+                // `environment` is what the graph settled on: a name that
+                // was an expression is only now known, and the launch
+                // checks the environment's rules against the row.
                 // A job that is launching or launched is not queued
                 // again, and no second launch is sent for it.
-                if store::queue_job(db, *job, *attempt, self.now).await? {
+                if store::queue_job(db, *job, *attempt, environment.as_deref(), self.now).await? {
                     self.env
                         .queue(LAUNCHES)?
                         .send(LaunchMessage {
@@ -837,6 +844,7 @@ impl<'a> Cx<'a> {
                 conclusion,
                 steps,
                 log_key,
+                environment_url,
             } => {
                 let ended = store::finish_job(
                     db,
@@ -845,6 +853,7 @@ impl<'a> Cx<'a> {
                     conclusion_word(*conclusion),
                     steps,
                     log_key.as_deref(),
+                    environment_url.as_deref(),
                     self.now,
                 )
                 .await?;
@@ -1028,12 +1037,14 @@ impl<'a> Cx<'a> {
     }
 
     /// Gives the graph the variables of the run's scope when the job
-    /// that ends has a `continue-on-error` to evaluate.
+    /// that ends has a `continue-on-error` to evaluate, or an
+    /// environment name of the run reads them.
     async fn load_vars(&self, run: &mut Loaded, job: u64) -> Result<()> {
         if run
             .graph
             .node(job)
             .is_some_and(|n| n.job.continue_on_error.is_some())
+            || run.graph.environments_read_vars()
         {
             let vars = store::job_vars(
                 self.db().await?,
@@ -1088,8 +1099,15 @@ impl<'a> Cx<'a> {
         for action in actions {
             match action {
                 Action::Launch(job) => {
-                    let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
-                    run.todo_mut().push(Work::QueueLaunch { job, attempt });
+                    let (attempt, environment) = run
+                        .graph
+                        .node(job)
+                        .map_or((1, None), |node| (node.attempt, node.environment.clone()));
+                    run.todo_mut().push(Work::QueueLaunch {
+                        job,
+                        attempt,
+                        environment,
+                    });
                 }
                 Action::Finished { job, conclusion } => {
                     let mut state = self.job_state(job).await?;
@@ -1107,12 +1125,18 @@ impl<'a> Cx<'a> {
                     self.end_sockets(job, conclusion);
                     self.put_job(job, &state).await?;
                     run.outbox_mut().mark(job);
+                    let environment_url = run
+                        .graph
+                        .node(job)
+                        .and_then(|node| node.result.as_ref())
+                        .and_then(|result| result.environment_url.clone());
                     run.todo_mut().push(Work::FinishJob {
                         job,
                         attempt,
                         conclusion,
                         steps,
                         log_key,
+                        environment_url,
                     });
                 }
                 // The agent learns of a cancel from the reply to its
@@ -1182,6 +1206,9 @@ impl<'a> Cx<'a> {
             }
             self.storage.put(EVENT, &bounded_event(event)).await?;
             let ctx = self.github_ctx(&run.info).await?;
+            if let Some(first) = run.graph.jobs.first().map(|n| n.id) {
+                self.load_vars(&mut run, first).await?;
+            }
             let actions = run.graph.advance(&ctx);
             let attempt = run.info.run_attempt;
             run.todo.push(Work::StartRunAt { attempt });
@@ -1321,7 +1348,13 @@ impl<'a> Cx<'a> {
         Response::from_json(&reply)
     }
 
-    async fn result(&self, job: u64, attempt: u32, result: JobResult) -> Result<Response> {
+    async fn result(&self, job: u64, attempt: u32, mut result: JobResult) -> Result<Response> {
+        // The agent's word is not trusted: only a plain link is kept, so
+        // nothing downstream shows or stores another kind of address.
+        result.environment_url = result
+            .environment_url
+            .take()
+            .filter(|url| valid_environment_url(url));
         let revoke = {
             let _turn = self.turn.lock().await;
             let Some(mut run) = self.loaded().await? else {
@@ -1451,6 +1484,7 @@ impl<'a> Cx<'a> {
             };
             let ctx = self.github_ctx(&run.info).await?;
             let before = attempts(&run.graph);
+            self.load_vars(&mut run, job).await?;
             let actions = run.graph_mut().rerun(job, &ctx);
             let reset = reset_jobs(&before, &run.graph);
             if reset.is_empty() {
@@ -1589,6 +1623,7 @@ impl<'a> Cx<'a> {
             };
             let view = JobView {
                 workflow: &run.info.workflow,
+                run_title: run.info.title.as_deref(),
                 node,
                 head_sha: &run.info.sha,
                 details_url: details_url(

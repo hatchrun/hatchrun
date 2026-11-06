@@ -147,8 +147,8 @@ pub fn dollars(micros: u64) -> String {
 /// `buildjet-<N>vcpu-ubuntu-<ver>[-arm]`, `depot-ubuntu-<ver>[-arm][-<N>]`,
 /// `namespace-profile-<name>` (sized by a `<cpu>x<mem>` part, else two
 /// vCPUs), `ubicloud-standard-<N>[-arm]`,
-/// `warp-ubuntu-<ver>-<x64|arm64>-<N>x` and GitHub's one-vCPU
-/// `ubuntu-slim`.
+/// `warp-ubuntu-<ver>-<x64|arm64>-<N>x`, GitHub's one-vCPU
+/// `ubuntu-slim` and GitHub's larger runners (see [`github_larger`]).
 pub(crate) fn vendor_template(label: &str) -> Option<(&'static Template, u32)> {
     let (arch, vcpu) = vendor_size(label)?;
     if vcpu == 0 {
@@ -167,11 +167,47 @@ pub(crate) fn vendor_template(label: &str) -> Option<(&'static Template, u32)> {
     Some((template, vcpu))
 }
 
+/// The arch and vCPUs of a GitHub larger runner label the way
+/// organizations name them: `ubuntu-<latest|NN.NN>[-arm|-arm64]` then a
+/// size, `<N>-cores`, `<N>core` or `xl`. The `xl` size has no fixed
+/// meaning on GitHub, where the owner names the runner; it is read as 8
+/// vCPUs, the size such runners most often have.
+fn github_larger(label: &str) -> Option<(Arch, u32)> {
+    let mut parts = label.strip_prefix("ubuntu-")?.split('-');
+    let version = parts.next()?;
+    let release = version.split_once('.').is_some_and(|(year, month)| {
+        [year, month]
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit()))
+    });
+    if version != "latest" && !release {
+        return None;
+    }
+    let (mut arm, mut vcpu) = (false, None);
+    for part in parts {
+        match part {
+            "arm" | "arm64" => arm = true,
+            "cores" | "core" => {}
+            "xl" => vcpu = Some(8),
+            _ => {
+                let n = part
+                    .strip_suffix("cores")
+                    .or_else(|| part.strip_suffix("core"));
+                vcpu = Some(n.unwrap_or(part).parse().ok()?);
+            }
+        }
+    }
+    Some((if arm { Arch::Arm64 } else { Arch::Amd64 }, vcpu?))
+}
+
 /// The arch and vCPUs a third-party label asks for.
 fn vendor_size(label: &str) -> Option<(Arch, u32)> {
     let arch = |arm: bool| if arm { Arch::Arm64 } else { Arch::Amd64 };
     if label == "ubuntu-slim" {
         return Some((Arch::Amd64, 1));
+    }
+    if let Some(size) = github_larger(label) {
+        return Some(size);
     }
     for vendor in ["blacksmith-", "buildjet-"] {
         if let Some(rest) = label.strip_prefix(vendor) {
@@ -250,6 +286,35 @@ mod tests {
         assert!(template("ubuntu-24.04").is_none());
         assert!(template_labels().contains(&"ubuntu-26.04-8core"));
         assert_eq!(template_labels().len(), 9);
+    }
+
+    #[test]
+    fn github_larger_runner_labels_take_the_template_of_their_size() {
+        let cases = [
+            ("ubuntu-latest-4-cores", "ubuntu-26.04-4core", 4),
+            ("ubuntu-latest-8-cores", "ubuntu-26.04-8core", 8),
+            ("ubuntu-22.04-8core", "ubuntu-26.04-8core", 8),
+            ("ubuntu-24.04-16core", "ubuntu-26.04-16core", 16),
+            ("ubuntu-latest-xl", "ubuntu-26.04-8core", 8),
+            ("ubuntu-24.04-xl", "ubuntu-26.04-8core", 8),
+            ("ubuntu-24.04-arm-4-cores", "ubuntu-26.04-4core-arm", 4),
+            ("ubuntu-latest-32-cores", "ubuntu-26.04-16core", 32),
+            ("ubuntu-22.04-64core", "ubuntu-26.04-16core", 64),
+        ];
+        for (label, want, asked) in cases {
+            let (t, vcpu) = vendor_template(label).unwrap_or_else(|| panic!("{label}"));
+            assert_eq!((t.labels[0], vcpu), (want, asked), "{label}");
+        }
+        for label in [
+            "ubuntu-latest",
+            "ubuntu-22.04",
+            "ubuntu-latest-big",
+            "ubuntu-latest-cores",
+            "ubuntu-2x.04-4core",
+            "macos-latest-xl",
+        ] {
+            assert!(vendor_template(label).is_none(), "{label}");
+        }
     }
 
     #[test]

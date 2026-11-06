@@ -94,8 +94,8 @@ npx wrangler@4.143.0 deploy
 
 [`crates/cloud`](crates/cloud) is the Cloudflare Worker behind
 hatchrun.io. `POST /github/webhook` takes the hatchrun GitHub App's
-deliveries: push, pull_request, check_run, repository, release, create
-and delete go on to `hatchrun-ci` as they came; `installation` events
+deliveries: push, pull_request, check_run, repository, release, create,
+delete, merge_group and repository_dispatch go on to `hatchrun-ci` as they came; `installation` events
 link a tenant to its installation or unlink it. Everything under
 `/api/ci/` on app.hatchrun.io is forwarded to `hatchrun-ci` too.
 `GET /healthz` answers 200 while the database does and `hatchrun-ci` is

@@ -254,6 +254,67 @@ fn timeout_kills_the_process_group() {
 }
 
 #[test]
+fn a_uses_step_timeout_ends_what_its_composite_action_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "comp",
+        "name: c\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: trap '' TERM; sleep 600\n",
+        &[],
+    );
+    let mut step = make::uses("c", "./comp");
+    step.timeout_minutes = Some(1);
+    let mut always = make::run("echo after");
+    always.if_ = Some("always()".to_owned());
+    let doc = make::document(vec![PlannedStep::Uses(step), make::planned(always)]);
+    let began = Instant::now();
+    let out = exec_with(dir.path(), &json(&doc), &["--minute", "2s"]);
+    assert!(
+        began.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let text = stdout(&out);
+    assert!(text.contains("timed out after 1 minutes"), "{text}");
+    assert!(text.lines().any(|l| l == "after"), "{text}");
+    let result = result(dir.path());
+    assert_eq!(result.steps[0].outcome, Conclusion::Failure);
+    assert_eq!(result.steps[1].outcome, Conclusion::Success);
+}
+
+#[test]
+fn a_uses_step_without_a_timeout_is_not_cut_short_by_the_one_before() {
+    let dir = tempfile::tempdir().unwrap();
+    local_action(
+        dir.path(),
+        "quick",
+        "name: q\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo quick\n",
+        &[],
+    );
+    local_action(
+        dir.path(),
+        "slow",
+        "name: s\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: sleep 3; echo done\n",
+        &[],
+    );
+    // The first step's limit (1 minute is 1 second here) is over when the
+    // second, which has none, takes three seconds.
+    let mut first = make::uses("q", "./quick");
+    first.timeout_minutes = Some(1);
+    let second = make::uses("s", "./slow");
+    assert_eq!(second.timeout_minutes, None);
+    let doc = make::document(vec![PlannedStep::Uses(first), PlannedStep::Uses(second)]);
+    let out = exec_with(dir.path(), &json(&doc), &["--minute", "1s"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    assert!(
+        stdout(&out).lines().any(|l| l == "done"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
 fn background_child_does_not_hold_the_step() {
     // The step ends when its shell does; the child lives on until the
     // job ends, which stops it.
@@ -2171,6 +2232,49 @@ fn a_step_timeout_longer_than_the_grace_time_ends_cancelled() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let result = result(dir.path());
     assert_eq!(result.steps[1].outcome, Conclusion::Cancelled);
+}
+
+#[test]
+fn environment_url_is_evaluated_after_the_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut step = make::run("echo host=app-7.example.com >> \"$GITHUB_OUTPUT\"");
+    step.id = Some("up".to_owned());
+    let mut doc = make::document(vec![make::planned(step)]);
+    doc.job.environment = Some("preview".to_owned());
+    doc.job.environment_url = Some("https://${{ steps.up.outputs.host }}/".to_owned());
+    let out = exec_with(dir.path(), &json(&doc), &[]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    assert_eq!(
+        result(dir.path()).environment_url.as_deref(),
+        Some("https://app-7.example.com/")
+    );
+}
+
+#[test]
+fn an_environment_url_that_is_not_a_link_or_a_failed_job_reports_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("true")]);
+    doc.job.environment_url = Some("javascript:alert(1)".to_owned());
+    let out = exec_with(dir.path(), &json(&doc), &[]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(stdout(&out).contains("is not an http or https link"));
+    assert_eq!(result(dir.path()).environment_url, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("exit 1")]);
+    doc.job.environment_url = Some("https://app.example.com".to_owned());
+    let out = exec_with(dir.path(), &json(&doc), &[]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(result(dir.path()).environment_url, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("true")]);
+    doc.secrets.insert("K".to_owned(), "hunter2".to_owned());
+    doc.job.environment_url = Some("https://x.example.com/${{ secrets.K }}".to_owned());
+    let out = exec_with(dir.path(), &json(&doc), &[]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(!stdout(&out).contains("hunter2"));
+    assert_eq!(result(dir.path()).environment_url, None);
 }
 
 #[test]
