@@ -581,15 +581,25 @@ async fn read_values(
         store::sealed_secrets(db, &repo.tenant_id, repo.id, environment_id, Some(&names)).await
     }
     .map_err(|e| unavailable(&e))?;
-    let vars = store::job_vars(db, &repo.tenant_id, repo.id, environment_id)
+    let var_rows = store::job_var_rows(db, &repo.tenant_id, repo.id, environment_id)
         .await
         .map_err(|e| unavailable(&e))?;
-    if rows.is_empty() {
-        return Ok((BTreeMap::new(), vars));
+    let secrets = if rows.is_empty() {
+        BTreeMap::new()
+    } else {
+        let keyring = Keyring::load(env).await.map_err(|e| unavailable(&e))?;
+        job_secrets(&refs, &rows, &keyring, &repo.tenant_id)
+            .map_err(|(name, err)| OpenFailure::Unreadable(name, err))?
+    };
+    // The job gets its values from here on: record the rows it got,
+    // the narrowest of each name.
+    let got_secrets = store::winners(rows.iter().map(|r| (r.name.as_str(), r.owner())));
+    let got_vars = store::winners(var_rows.iter().map(|r| (r.name.as_str(), r.owner())));
+    if let Err(err) = store::mark_used(db, &repo.tenant_id, &got_secrets, &got_vars, now_ms()).await
+    {
+        console_warn!("job {}: mark secrets used: {err}", row.id);
     }
-    let keyring = Keyring::load(env).await.map_err(|e| unavailable(&e))?;
-    let secrets = job_secrets(&refs, &rows, &keyring, &repo.tenant_id)
-        .map_err(|(name, err)| OpenFailure::Unreadable(name, err))?;
+    let vars = var_rows.into_iter().map(|r| (r.name, r.value)).collect();
     Ok((secrets, vars))
 }
 
@@ -796,6 +806,7 @@ mod tests {
             approval_decision: None,
             approval_by: None,
             approval_at: None,
+            needs: serde_json::json!([]),
         }
     }
 

@@ -501,6 +501,22 @@ async fn report_once(
     Ok(())
 }
 
+/// The longest message a run keeps, in characters.
+const MAX_MESSAGE: usize = 200;
+
+/// What a run shows next to its number: the first line of the head
+/// commit's message of a push, or the title of a pull request.
+fn run_message(event_name: &str, event: &Value) -> Option<String> {
+    let text = match event_name {
+        "push" => event.pointer("/head_commit/message"),
+        "pull_request" => event.pointer("/pull_request/title"),
+        _ => None,
+    }?
+    .as_str()?;
+    let line = text.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.chars().take(MAX_MESSAGE).collect())
+}
+
 /// Records the run of `plan`, with its jobs, and has its object start.
 async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64) -> Result<u64> {
     let new = NewRun {
@@ -513,6 +529,7 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
         sha: req.sha.to_owned(),
         actor: req.actor.to_owned(),
         base_ref: (req.event_name == "pull_request").then(|| req.base_ref.to_owned()),
+        message: run_message(req.event_name, req.event),
         now,
     };
     let (run, fresh) = match store::insert_run(db, &new).await? {
@@ -549,6 +566,7 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
                 environment: job.environment.clone(),
                 strategy_group: job.strategy.as_ref().map(|s| s.group.clone()),
                 max_parallel: job.strategy.as_ref().and_then(|s| s.max_parallel),
+                needs: job.requires.clone(),
             })
             .collect();
         store::insert_jobs(db, run.id, &jobs, now).await?;
@@ -620,6 +638,23 @@ async fn post_start(env: &Env, run_id: u64, start: &Start) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use hatchrun_cloud::http::Response as HttpResponse;
+
+    use super::run_message;
+
+    #[test]
+    fn messages_are_the_first_line_cut_short() {
+        let push = serde_json::json!({"head_commit": {"message": " fix it\n\nlong body"}});
+        assert_eq!(run_message("push", &push).as_deref(), Some("fix it"));
+        let pr = serde_json::json!({"pull_request": {"title": "x".repeat(300)}});
+        assert_eq!(
+            run_message("pull_request", &pr).unwrap().chars().count(),
+            200
+        );
+        assert_eq!(run_message("schedule", &push), None);
+        assert_eq!(run_message("push", &serde_json::json!({})), None);
+        let empty = serde_json::json!({"head_commit": {"message": ""}});
+        assert_eq!(run_message("push", &empty), None);
+    }
 
     fn answer(status: u16, body: &str) -> HttpResponse {
         HttpResponse {
@@ -782,6 +817,7 @@ mod tests {
                     sha: "abc".into(),
                     actor: "octocat".into(),
                     base_ref: None,
+                    message: None,
                     now: 1,
                 },
             ))
@@ -797,6 +833,7 @@ mod tests {
             environment: None,
             strategy_group: None,
             max_parallel: None,
+            needs: Vec::new(),
         }];
         let ids = db
             .wait(store::insert_jobs(db.db(), run.id, &jobs, 1))
