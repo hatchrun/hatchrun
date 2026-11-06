@@ -7,10 +7,12 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 import {
   getRepo,
+  patchEnabledRepos,
   listRepoBranches,
   listRepoPulls,
   listRepoRuns,
   listRepoWorkflows,
+  type CiPullRef,
   type CiRepo,
   type CiRun,
   type Page as ApiPage,
@@ -48,7 +50,7 @@ interface RepositoryProps extends OrgPageProps {
 }
 
 /** A repository: header, tabs (Runs, Workflows, Branches, Pull requests) and the tab's list. */
-export function Repository({ org, repo, tab, workflow }: RepositoryProps) {
+export function Repository({ org, repo, tab, workflow, tenant }: RepositoryProps) {
   const [loaded, reload] = useLoad<CiRepo>(() => getRepo(org, repo), `${org}/${repo}`);
   const [dispatch, setDispatch] = useState(false);
 
@@ -57,8 +59,8 @@ export function Repository({ org, repo, tab, workflow }: RepositoryProps) {
       <Await loaded={loaded} retry={reload}>
         {(info) => (
           <>
-            <Crumbs org={org} repo={repo} workflow={workflow} />
-            <Header info={info} org={org} repo={repo} onRun={() => setDispatch(true)} />
+            <Crumbs org={org} repo={repo} workflow={tab === "workflows" ? workflow : null} />
+            <Header info={info} org={org} admin={tenant.role === "admin"} onRun={() => setDispatch(true)} onEnabled={reload} />
             <Tabs info={info} tab={tab} />
             {tab === "runs" && <RunsTab org={org} repo={repo} workflow={null} />}
             {tab === "workflows" && (workflow ? <RunsTab org={org} repo={repo} workflow={workflow} /> : <WorkflowsTab org={org} repo={repo} />)}
@@ -73,6 +75,7 @@ export function Repository({ org, repo, tab, workflow }: RepositoryProps) {
 }
 
 function Crumbs({ org, repo, workflow }: { org: string; repo: string; workflow: string | null }) {
+  const link = "min-w-0 truncate underline decoration-control underline-offset-4 hover:text-fg";
   return (
     <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-2 font-mono text-[13px] text-fg-3">
       <Link href={orgUrl(org)} className="text-fg hover:text-brand">
@@ -80,7 +83,7 @@ function Crumbs({ org, repo, workflow }: { org: string; repo: string; workflow: 
       </Link>
       {SEP}
       {workflow ? (
-        <Link href={repoUrl({ org, repo })} className="min-w-0 truncate underline decoration-control underline-offset-4 hover:text-fg">
+        <Link href={repoUrl({ org, repo })} className={link}>
           {repo}
         </Link>
       ) : (
@@ -91,6 +94,10 @@ function Crumbs({ org, repo, workflow }: { org: string; repo: string; workflow: 
       {workflow && (
         <>
           {SEP}
+          <Link href={repoUrl({ org, repo }, "workflows")} className={link}>
+            Workflows
+          </Link>
+          {SEP}
           <span aria-current="page" title={workflow} className="min-w-0 truncate text-fg">
             {workflow}
           </span>
@@ -100,15 +107,28 @@ function Crumbs({ org, repo, workflow }: { org: string; repo: string; workflow: 
   );
 }
 
-function Header({ info, org, repo, onRun }: { info: CiRepo; org: string; repo: string; onRun: () => void }) {
+function Header({ info, org, admin, onRun, onEnabled }: { info: CiRepo; org: string; admin: boolean; onRun: () => void; onEnabled: () => void }) {
+  const [enabling, setEnabling] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+  const enable = async () => {
+    setEnabling(true);
+    setError(null);
+    try {
+      await patchEnabledRepos(org, { add: [info.name] });
+      onEnabled();
+    } catch (err) {
+      setError(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      setEnabling(false);
+    }
+  };
   return (
     <div className="flex flex-wrap items-end justify-between gap-3">
       <div className="flex min-w-0 flex-col gap-2">
         <h1 className="page-title min-w-0 break-words" title={info.name}>
-          {repo}
+          {info.name}
         </h1>
         <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 font-mono text-[13px]">
-          <span className="text-fg-2">{org}</span>
           <span className="flex min-w-0 items-center gap-2">
             <span className="cap">default branch</span>
             <Truncate value={info.default_branch} copy className="max-w-[240px] text-fg" />
@@ -129,6 +149,26 @@ function Header({ info, org, repo, onRun }: { info: CiRepo; org: string; repo: s
         </Button>
         {info.enabled && info.access !== "read" && <Button onClick={onRun}>Run workflow</Button>}
       </div>
+      {!info.enabled && (
+        <div className="flex basis-full flex-wrap items-center gap-x-4 gap-y-2 rounded-md border border-rule bg-panel px-3.5 py-2.5 font-mono text-[13px]" role="status">
+          <span className="text-fg">CI is off for this repository.</span>
+          {admin ? (
+            <>
+              <span className="text-fg-3">Pushes and pull requests start no runs until it is enabled.</span>
+              <Button size="sm" variant="secondary" disabled={enabling} onClick={enable}>
+                {enabling ? "Enabling" : "Enable"}
+              </Button>
+            </>
+          ) : (
+            <span className="text-fg-3">An organization admin can turn it on.</span>
+          )}
+          {error && (
+            <span className="text-failed" role="alert">
+              {error.message}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -247,6 +287,8 @@ function RunsTab({ org, repo, workflow }: { org: string; repo: string; workflow:
     <ListFrame
       label={workflow ? `Runs of ${workflow}` : "Runs"}
       tools={
+        <>
+        {(pull !== undefined || filters.branch) && <ScopeHeader pull={pull} pullRef={runs.state === "ready" ? (runs.data.items.find((run) => run.pull_request?.number === pull)?.pull_request ?? null) : null} branch={filters.branch} />}
         <FilterBar
           org={org}
           showRepo={false}
@@ -254,6 +296,7 @@ function RunsTab({ org, repo, workflow }: { org: string; repo: string; workflow:
           actors={actors}
           extra={pull === undefined ? [] : [{ id: "pull", label: `Pull request: #${pull}`, remove: () => setQuery({ pull: null }) }]}
         />
+        </>
       }
       footer={runs.state === "ready" && <CursorPager page={runs.data} index={cursors.index} pageSize={PAGE_SIZE} hasPrev={cursors.hasPrev} onPrev={cursors.prev} onNext={cursors.next} range="newest first" noun="runs" />}
     >
@@ -262,11 +305,41 @@ function RunsTab({ org, repo, workflow }: { org: string; repo: string; workflow:
           page.items.length === 0 ? (
             <Empty>{workflow ? `No runs of ${workflow} match these filters.` : "No runs match these filters."}</Empty>
           ) : (
-            <RunsTable runs={page.items} now={now} inRepo />
+            <RunsTable runs={page.items} now={now} inRepo inWorkflow={workflow !== null} />
           )
         }
       </Await>
     </ListFrame>
+  );
+}
+
+/** What a narrowed run list is about: a pull request (title, head into base) or a branch. */
+function ScopeHeader({ pull, pullRef, branch }: { pull: number | undefined; pullRef: CiPullRef | null; branch: string | null }) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[13px]">
+      {pull !== undefined ? (
+        <>
+          <span className="shrink-0 font-semibold text-fg">PR #{pull}</span>
+          {pullRef && (
+            <>
+              <Truncate value={pullRef.title} className="max-w-[420px] font-sans text-fg-2" />
+              <span className="inline-flex min-w-0 items-center gap-1.5">
+                <Truncate value={pullRef.head_ref} mono copy className="max-w-[220px]" />
+                <span aria-label="into" className="shrink-0 text-fg-3">
+                  →
+                </span>
+                <Truncate value={pullRef.base_ref} mono className="max-w-[160px] text-fg-2" />
+              </span>
+            </>
+          )}
+        </>
+      ) : (
+        <>
+          <span className="cap">Branch</span>
+          <Truncate value={branch ?? ""} mono copy className="max-w-[360px] font-semibold" />
+        </>
+      )}
+    </div>
   );
 }
 
@@ -286,7 +359,7 @@ function WorkflowsTab({ org, repo }: { org: string; repo: string }) {
           page.items.length === 0 ? (
             <Empty>No workflow has run in this repository yet.</Empty>
           ) : (
-            <div className="overflow-auto">
+            <div className="relative overflow-auto">
               <table className="w-full min-w-[900px] border-collapse">
                 <thead className="bg-background">
                   <tr>
@@ -367,7 +440,7 @@ function BranchesTab({ org, repo, defaultBranch }: { org: string; repo: string; 
           page.items.length === 0 ? (
             <Empty>{q ? `No branch with runs matches "${q}".` : "No branch has run here yet."}</Empty>
           ) : (
-            <div className="overflow-auto">
+            <div className="relative overflow-auto">
               <table className="w-full min-w-[980px] border-collapse">
                 <thead className="bg-background">
                   <tr>
@@ -481,7 +554,7 @@ function PullsTab({ org, repo }: { org: string; repo: string }) {
           page.items.length === 0 ? (
             <Empty>{q ? `No ${state === "all" ? "" : `${state} `}pull request matches "${q}".` : state === "all" ? "No pull request has run here yet." : `No ${state} pull requests.`}</Empty>
           ) : (
-            <div className="overflow-auto">
+            <div className="relative overflow-auto">
               <table className="w-full min-w-[1040px] border-collapse">
                 <thead className="bg-background">
                   <tr>
