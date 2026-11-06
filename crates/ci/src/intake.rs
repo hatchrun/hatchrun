@@ -68,6 +68,12 @@ pub struct PullRequest {
     pub base_ref: String,
     /// The login of the user behind the activity.
     pub actor: String,
+    /// The pull request's title.
+    pub title: String,
+    /// The login of the user who opened it.
+    pub author: String,
+    /// `open`, `closed` or `merged`, as the delivery says it stands.
+    pub state: &'static str,
     /// The delivery body.
     pub payload: Value,
 }
@@ -206,6 +212,13 @@ struct PullRequestBody {
 struct PullRequestInfo {
     head: Side,
     base: Side,
+    #[serde(default)]
+    title: String,
+    user: Option<Sender>,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    merged: bool,
 }
 
 #[derive(Deserialize)]
@@ -383,7 +396,19 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
                 head_sha: p.pull_request.head.sha,
                 head_ref: p.pull_request.head.r#ref,
                 base_ref: p.pull_request.base.r#ref,
+                author: p
+                    .pull_request
+                    .user
+                    .map_or_else(|| p.sender.login.clone(), |user| user.login),
                 actor: p.sender.login,
+                title: p.pull_request.title,
+                state: if p.pull_request.merged {
+                    "merged"
+                } else if p.pull_request.state == "closed" {
+                    "closed"
+                } else {
+                    "open"
+                },
                 payload,
             }))
         }
@@ -546,6 +571,34 @@ mod tests {
         assert_eq!(p.actor, "octocat");
         assert_eq!(p.repo.id, 4242);
         assert!(!p.repo.private);
+    }
+
+    #[test]
+    fn pull_request_state_and_text_are_read() {
+        let read = |f: fn(&mut Value)| {
+            let Trigger::PullRequest(p) = parse("pull_request", &edited(PULL_REQUEST, f)).unwrap()
+            else {
+                panic!("not a pull request");
+            };
+            p
+        };
+        let open = read(|v| {
+            v["pull_request"]["title"] = "Fix it".into();
+            v["pull_request"]["user"] = serde_json::json!({ "login": "author" });
+            v["pull_request"]["state"] = "open".into();
+        });
+        assert_eq!(open.title, "Fix it");
+        assert_eq!(open.author, "author");
+        assert_eq!(open.state, "open");
+        let closed = read(|v| v["pull_request"]["state"] = "closed".into());
+        assert_eq!(closed.state, "closed");
+        // Without a user the author is the sender.
+        assert_eq!(closed.author, "octocat");
+        let merged = read(|v| {
+            v["pull_request"]["state"] = "closed".into();
+            v["pull_request"]["merged"] = true.into();
+        });
+        assert_eq!(merged.state, "merged");
     }
 
     #[test]

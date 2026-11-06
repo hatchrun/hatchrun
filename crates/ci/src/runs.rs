@@ -517,6 +517,19 @@ fn run_message(event_name: &str, event: &Value) -> Option<String> {
     (!line.is_empty()).then(|| line.chars().take(MAX_MESSAGE).collect())
 }
 
+/// The number of the pull request a run is for: the one in the ref of a
+/// pull request event.
+fn pull_number(req: &Request<'_>) -> Option<u64> {
+    if req.event_name != "pull_request" {
+        return None;
+    }
+    req.git_ref
+        .strip_prefix("refs/pull/")?
+        .strip_suffix("/merge")?
+        .parse()
+        .ok()
+}
+
 /// Records the run of `plan`, with its jobs, and has its object start.
 async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64) -> Result<u64> {
     let new = NewRun {
@@ -530,6 +543,8 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
         actor: req.actor.to_owned(),
         base_ref: (req.event_name == "pull_request").then(|| req.base_ref.to_owned()),
         message: run_message(req.event_name, req.event),
+        pull_number: pull_number(req),
+        head_ref: pull_number(req).map(|_| req.head_ref.to_owned()),
         now,
     };
     let (run, fresh) = match store::insert_run(db, &new).await? {
@@ -818,6 +833,8 @@ mod tests {
                     actor: "octocat".into(),
                     base_ref: None,
                     message: None,
+                    pull_number: None,
+                    head_ref: None,
                     now: 1,
                 },
             ))
