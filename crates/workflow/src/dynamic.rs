@@ -209,9 +209,10 @@ fn runner(
     let label = interpolate(text, ctx, &Plain)
         .map_err(|e| format!("`runs-on` of `{id}` could not be read: {e}"))?;
     let label = label.trim();
+    // The label can come from vars or outputs, so it is not echoed.
     template(label).ok_or_else(|| {
         format!(
-            "`runs-on` of `{id}` is `{label}`, which names no runner template; use one of {}",
+            "`runs-on` of `{id}` evaluated to a label that names no runner template; use one of {}",
             template_labels().join(", ")
         )
     })

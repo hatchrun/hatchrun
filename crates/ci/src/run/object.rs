@@ -1095,19 +1095,12 @@ impl<'a> Cx<'a> {
         if node.state != NodeState::Queued || node.job.deferred.is_none() {
             return Ok(Vec::new());
         }
-        let environment = node.job.environment.clone();
         let db = self.db().await?;
         let ctx = self.github_ctx(&run.info).await?;
-        // The variables the job itself reads, with those of its
-        // environment (the planner leaves no expression in its name).
-        let environment_id = match environment.as_deref() {
-            Some(name) => store::environment(db, run.info.repo.id, name)
-                .await?
-                .map(|row| row.id),
-            None => None,
-        };
-        let vars =
-            store::job_vars(db, &run.info.tenant_id, run.info.repo.id, environment_id).await?;
+        // Only the repository and organization variables, as on GitHub:
+        // the job's environment gates its branches and approval when the
+        // agent opens the job, which has not happened yet.
+        let vars = store::job_vars(db, &run.info.tenant_id, run.info.repo.id, None).await?;
         let Some(made) = run.graph.expansion(job, &ctx, &vars) else {
             return Ok(Vec::new());
         };

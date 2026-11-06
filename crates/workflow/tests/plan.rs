@@ -2110,7 +2110,8 @@ fn an_unknown_label_fails_that_job_alone() {
     assert_eq!(legs[0].error, None);
     let message = legs[1].error.as_deref().unwrap();
     assert!(message.contains("`test (20, windows)`"), "{message}");
-    assert!(message.contains("`windows`, which names no runner template"));
+    assert!(message.contains("evaluated to a label that names no runner template"));
+    assert!(!message.contains("`windows`"), "the value is not echoed");
     // A rerun reads the label again.
     assert!(legs[1].job.deferred.is_some());
 }
@@ -2322,4 +2323,26 @@ fn a_matrix_is_numbered_and_limited_with_the_jobs_around_it() {
     };
     let err = hatchrun_workflow::expand(&job, &c, crowded).unwrap_err();
     assert!(err.contains("limit is 256"), "{err}");
+}
+
+#[test]
+fn matrix_and_runs_on_read_only_the_vars_the_host_gives() {
+    let p = plan(
+        "
+jobs:
+  t: { runs-on: \"${{ vars.RUNNER }}\", steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [{ t: { matrix: { k: '${{ fromJSON(vars.LIST) }}' } } }]
+",
+    );
+    // An environment-only var is not in what the host passes.
+    let c = serde_json::json!({
+        "needs": {}, "github": {}, "inputs": {}, "hatchrun": {},
+        "vars": { "LIST": "[1]" },
+    });
+    let legs = expand(&p.jobs[0], &c).unwrap();
+    let message = legs[0].error.as_deref().unwrap();
+    assert!(message.contains("evaluated to a label"), "{message}");
 }
