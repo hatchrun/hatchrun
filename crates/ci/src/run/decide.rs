@@ -143,6 +143,7 @@ pub(crate) fn job_document(
     job: u64,
     token: &str,
     api: &str,
+    inputs: Option<Value>,
 ) -> Option<JobDocument> {
     let node = graph.node(job)?;
     Some(JobDocument {
@@ -164,6 +165,7 @@ pub(crate) fn job_document(
         cache: None,
         id_token: None,
         artifacts: None,
+        inputs,
     })
 }
 
@@ -790,7 +792,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
     fn job_document_for_a_claim() {
         let graph = graph();
         let event = json!({ "after": "abc" });
-        let doc = job_document(&info(), &event, &graph, 1, "tok", API).unwrap();
+        let doc = job_document(&info(), &event, &graph, 1, "tok", API, None).unwrap();
         assert_eq!(doc.run_id, "7");
         assert_eq!(doc.run_attempt, 1);
         assert_eq!(doc.github.token, "tok");
@@ -799,7 +801,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         assert_eq!(doc.needs, graph.needs(1));
         assert!(doc.secrets.is_empty() && doc.vars.is_empty() && doc.timings.is_empty());
         assert!(doc.cache.is_none());
-        assert!(job_document(&info(), &event, &graph, 404, "tok", API).is_none());
+        assert!(job_document(&info(), &event, &graph, 404, "tok", API, None).is_none());
     }
 
     #[test]

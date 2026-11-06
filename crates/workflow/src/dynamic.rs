@@ -127,14 +127,16 @@ pub fn expand(job: &PlannedJob, ctx: &Value, siblings: Siblings) -> Result<Vec<L
     }
     let mut ids = BTreeSet::new();
     let mut scope = ctx.clone();
+    // A job of a called workflow keeps the calls in front of its name.
+    let prefix = job.scope_prefix();
     let mut legs = Vec::with_capacity(total);
     for combo in combos {
         let base = if fixed {
             job.id.clone()
         } else if combo.shown.is_empty() {
-            job.name.clone()
+            format!("{prefix}{}", job.name)
         } else {
-            format!("{} ({})", job.name, combo.shown.join(", "))
+            format!("{prefix}{} ({})", job.name, combo.shown.join(", "))
         };
         for node in 0..nodes {
             let id = if fixed {

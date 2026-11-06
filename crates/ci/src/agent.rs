@@ -394,7 +394,7 @@ async fn claim(
         return Ok(response);
     }
     let mut document = response.json::<JobDocument>().await?;
-    fill(&mut document, secrets, vars);
+    fill(&mut document, &secrets, vars);
     document.id_token =
         id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
     document.artifacts = artifact_service(settings, job_token);
@@ -406,10 +406,12 @@ async fn claim(
 /// answered with.
 pub(crate) fn fill(
     doc: &mut JobDocument,
-    secrets: BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
     vars: BTreeMap<String, String>,
 ) {
-    doc.secrets = secrets;
+    // A job of a called workflow reads only what its calls passed, under
+    // the names the callee gave them.
+    doc.secrets = doc.job.visible_secrets(secrets);
     doc.vars = vars;
 }
 
@@ -1033,6 +1035,7 @@ mod tests {
                 concurrency: None,
                 steps: Vec::new(),
                 deferred: None,
+                scope: Vec::new(),
             },
             event_name: "push".into(),
             event: serde_json::json!({}),
@@ -1058,6 +1061,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
+            inputs: None,
         }
     }
 
@@ -1067,7 +1071,7 @@ mod tests {
         let before = document();
         fill(
             &mut doc,
-            BTreeMap::from([("A".into(), "s".into())]),
+            &BTreeMap::from([("A".into(), "s".into())]),
             BTreeMap::from([("V".into(), "v".into())]),
         );
         assert_eq!(doc.secrets, BTreeMap::from([("A".into(), "s".into())]));

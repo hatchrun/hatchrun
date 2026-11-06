@@ -1333,6 +1333,21 @@ impl<'a> Cx<'a> {
                 state.heartbeat_written_at = self.now;
             }
             self.put_job(job, &state).await?;
+            // A job of a called workflow reads the inputs its calls passed.
+            let inputs = if run.graph.node(job).is_some_and(|n| !n.job.scope.is_empty()) {
+                let ctx = self.github_ctx(&run.info).await?;
+                let vars = store::job_vars(
+                    self.db().await?,
+                    &run.info.tenant_id,
+                    run.info.repo.id,
+                    None,
+                )
+                .await?;
+                run.graph_mut().set_vars(vars);
+                run.graph.call_inputs(job, &ctx).map_err(fail)?
+            } else {
+                None
+            };
             let document = job_document(
                 &run.info,
                 &self.event().await?,
@@ -1340,6 +1355,7 @@ impl<'a> Cx<'a> {
                 job,
                 &token,
                 &self.settings.github_api,
+                inputs,
             )
             .ok_or_else(|| fail("job vanished"))?;
             self.commit(&mut run).await?;

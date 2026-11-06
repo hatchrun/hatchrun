@@ -170,7 +170,7 @@ impl Contexts {
             "parameters": {},
             "runner": runner,
             "job": { "status": "success" },
-            "inputs": {},
+            "inputs": doc.inputs.clone().unwrap_or_else(|| json!({})),
         });
         Self {
             value,
@@ -558,6 +558,7 @@ mod tests {
             concurrency: None,
             steps: Vec::new(),
             deferred: None,
+            scope: Vec::new(),
         }
     }
 
@@ -592,6 +593,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
+            inputs: None,
         }
     }
 

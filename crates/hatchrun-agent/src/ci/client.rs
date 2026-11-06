@@ -244,6 +244,7 @@ mod tests {
                 concurrency: None,
                 steps: Vec::new(),
                 deferred: None,
+                scope: Vec::new(),
             },
             event_name: "push".into(),
             event: serde_json::json!({}),
@@ -269,6 +270,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
+            inputs: None,
         };
         serde_json::to_value(doc).unwrap()
     }

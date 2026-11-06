@@ -49,6 +49,10 @@ pub struct JobDocument {
     /// The artifact service, when the control plane has one. The agent
     /// serves `actions/upload-artifact` and `download-artifact` from it.
     pub artifacts: Option<ArtifactService>,
+    /// The `inputs` context of a job of a called workflow: what the
+    /// calls passed. `None` for a job of the workflow that was started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Value>,
 }
 
 impl fmt::Debug for JobDocument {
@@ -71,6 +75,7 @@ impl fmt::Debug for JobDocument {
             .field("cache", &self.cache)
             .field("id_token", &self.id_token)
             .field("artifacts", &self.artifacts)
+            .field("inputs", &self.inputs)
             .finish()
     }
 }

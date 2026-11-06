@@ -145,17 +145,33 @@ impl PlannedJob {
     /// The secrets this job reads: every `${{ secrets.X }}` in its
     /// `env`, `outputs` and steps, and the secrets its `if:` conditions
     /// name, plus [`DEBUG_SECRETS`].
+    ///
+    /// A job of a called workflow reads only what its calls pass, so
+    /// the names are the stored secrets of the outermost workflow those
+    /// reads end at: see [`PlannedJob::visible_secrets`] for the names
+    /// the job reads them as.
     #[must_use]
     pub fn secret_refs(&self) -> SecretRefs {
         let mut refs = SecretRefs::default();
-        for name in DEBUG_SECRETS {
-            refs.add(name);
-        }
         refs.scan_all(self.env.values());
         refs.scan_all(self.outputs.values());
         refs.scan_opt(self.if_.as_deref(), true);
         for step in &self.steps {
             refs.scan_step(step);
+        }
+        if !self.scope.is_empty() {
+            let read: Vec<String> = refs.names.iter().cloned().collect();
+            let (names, all) = self.outer_secrets(&read, refs.all);
+            refs = SecretRefs {
+                all,
+                names: names
+                    .into_iter()
+                    .filter(|name| name != "GITHUB_TOKEN")
+                    .collect(),
+            };
+        }
+        for name in DEBUG_SECRETS {
+            refs.add(name);
         }
         refs
     }
@@ -253,6 +269,7 @@ mod tests {
             concurrency: None,
             steps: vec![step],
             deferred: None,
+            scope: Vec::new(),
         };
         let refs = job.secret_refs();
         assert!(!refs.all);
