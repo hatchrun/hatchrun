@@ -219,9 +219,15 @@ Resources:
   # iam:PassRole, so no instance can get a role. hatchrun-ci signs a
   # short-lived token with subject tenant:hatchrun-ci and trades it for
   # the role's credentials through the account's IAM provider for
-  # oidc.hatchrun.io. An account has one provider per URL, so the stack
-  # uses the existing one: create it first, with audience
-  # sts.amazonaws.com, where no other stack made it.
+  # oidc.hatchrun.io, which this stack owns. An account has one provider
+  # per URL: create this stack only where no other stack made one.
+  OidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://oidc.hatchrun.io
+      ClientIdList:
+        - sts.amazonaws.com
+
   LauncherRole:
     Type: AWS::IAM::Role
     Properties:
@@ -232,7 +238,7 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/oidc.hatchrun.io"
+              Federated: !Ref OidcProvider
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
               StringEquals:
