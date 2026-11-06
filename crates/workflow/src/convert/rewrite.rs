@@ -29,6 +29,8 @@ pub(super) fn expression_problems(job: &Job) -> (Vec<&'static str>, Vec<String>)
     }
     texts.extend(job.env.values().map(String::as_str));
     texts.extend(job.outputs.values().map(String::as_str));
+    texts.extend(job.environment.as_deref());
+    texts.extend(job.environment_url.as_deref());
     for step in &job.steps {
         match step {
             Step::Run(run) => {

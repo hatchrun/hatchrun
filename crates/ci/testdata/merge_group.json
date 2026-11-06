@@ -1,0 +1,17 @@
+{
+  "action": "checks_requested",
+  "merge_group": {
+    "head_sha": "6d2f1c0e9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
+    "head_ref": "refs/heads/gh-readonly-queue/main/pr-5-1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+    "base_sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+    "base_ref": "refs/heads/main"
+  },
+  "sender": { "login": "octocat" },
+  "installation": { "id": 777 },
+  "repository": {
+    "id": 4242,
+    "full_name": "octo/widgets",
+    "default_branch": "main",
+    "private": true
+  }
+}

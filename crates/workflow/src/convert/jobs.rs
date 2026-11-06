@@ -9,8 +9,8 @@ use super::rewrite::LATER;
 use super::{
     BTreeMap, BTreeSet, Cancel, Concurrency, ContinueOnError, Cx, Deserialize, GhJob, GhMatrix,
     GhStep, JOB_KEYS, Job, Matrix, OLD_UBUNTU, ParameterKind, Require, RunStep, RunsOn, STEP_KEYS,
-    Step, Strategy, UsesStep, Value, WorkflowJob, plan, template, template_labels,
-    valid_environment_name, vendor_template,
+    Step, Strategy, UsesStep, Value, WORKFLOW_CONTEXTS, WorkflowJob, expr, plan, template,
+    template_labels, valid_environment_name, vendor_template,
 };
 
 impl Cx {
@@ -82,19 +82,58 @@ impl Cx {
         })
     }
 
-    /// Reads a job's `environment`: a name, or a map whose `name` is the
-    /// name. Records an error for anything hatchrun cannot read as written.
-    pub(super) fn environment(&mut self, at: &str, value: Option<&Value>) -> Option<String> {
+    /// Reads a workflow's `run-name`, a template over the `github`,
+    /// `inputs` and `vars` contexts. One that hatchrun cannot evaluate
+    /// is dropped with a warning.
+    pub(super) fn run_name(&mut self, file: &str, value: Option<&Value>) -> Option<String> {
         let value = value?;
+        let at = format!("`{file}`: `run-name`");
+        let Some(text) = scalar(value).filter(|t| !t.trim().is_empty()) else {
+            self.warn(format!("{at} is not a string and was dropped"));
+            return None;
+        };
+        let found = match expr::expressions(&text) {
+            Ok(found) => found,
+            Err(e) => {
+                self.warn(format!("{at} has a bad expression and was dropped: {e}"));
+                return None;
+            }
+        };
+        drop(found);
+        if let Some(name) = plan::unallowed_contexts(&text, WORKFLOW_CONTEXTS).first() {
+            self.warn(format!(
+                "{at} reads `{name}`, which a run title cannot, and was dropped"
+            ));
+            return None;
+        }
+        Some(text)
+    }
+
+    /// Reads a job's `environment`: a name, or a map whose `name` is the
+    /// name and `url` the address of the deployment. A name may be an
+    /// expression over the contexts a job has when it is ready to start.
+    /// Records an error for anything hatchrun cannot read as written.
+    pub(super) fn environment(
+        &mut self,
+        at: &str,
+        value: Option<&Value>,
+    ) -> (Option<String>, Option<String>) {
+        let Some(value) = value else {
+            return (None, None);
+        };
+        let mut url = None;
         let name = match value {
             Value::String(name) => name,
             Value::Object(map) => {
-                for key in map.keys() {
+                for (key, value) in map {
                     match key.as_str() {
                         "name" => {}
-                        "url" => self.warn(format!(
-                            "{at}: `environment.url` is not supported and was dropped"
-                        )),
+                        "url" => match scalar(value) {
+                            Some(text) if !text.trim().is_empty() => url = Some(text),
+                            _ => self.warn(format!(
+                                "{at}: `environment.url` is not a string and was dropped"
+                            )),
+                        },
                         other => self.warn(format!(
                             "{at}: unknown key `environment.{other}` was dropped"
                         )),
@@ -106,27 +145,35 @@ impl Cx {
                     self.error(format!(
                         "{at}: `environment` must be a name or a map with `name`"
                     ));
-                    return None;
+                    return (None, None);
                 }
             }
             _ => {
                 self.error(format!(
                     "{at}: `environment` must be a name or a map with `name`"
                 ));
-                return None;
+                return (None, None);
             }
         };
         if name.contains("${{") {
-            self.error(format!(
-                "{at}: `environment` uses an expression; hatchrun reads environment names as written"
-            ));
-            return None;
-        }
-        if let Err(rule) = valid_environment_name(name) {
+            if let Err(e) = expr::expressions(name) {
+                self.error(format!("{at}: `environment` has a bad expression: {e}"));
+                return (None, None);
+            }
+            if let Some(context) =
+                plan::unallowed_contexts(name, plan::ENVIRONMENT_CONTEXTS).first()
+            {
+                self.error(format!(
+                    "{at}: `environment` reads `{context}`; a name can read only {}",
+                    plan::ENVIRONMENT_CONTEXTS.join(", ")
+                ));
+                return (None, None);
+            }
+        } else if let Err(rule) = valid_environment_name(name) {
             self.error(format!("{at}: `environment` `{name}`: {rule}"));
-            return None;
+            return (None, None);
         }
-        Some(name.clone())
+        (Some(name.clone()), url)
     }
 
     /// Converts one job into the job and its workflow entries: one, or
@@ -151,7 +198,7 @@ impl Cx {
                 ));
             }
         }
-        let environment = self.environment(at, gh.environment.as_ref());
+        let (environment, environment_url) = self.environment(at, gh.environment.as_ref());
         let continue_on_error = self.continue_on_error(at, gh.continue_on_error.as_ref());
         let concurrency = self.concurrency(at, gh.concurrency.as_ref());
         let (mut matrix, settings) = self.strategy(at, gh.strategy);
@@ -194,6 +241,7 @@ impl Cx {
             outputs,
             permissions,
             environment,
+            environment_url,
             concurrency,
             steps,
             ..Job::default()
@@ -877,7 +925,6 @@ impl Cx {
                 for (key, set) in [
                     ("shell", gh.shell.is_some()),
                     ("working-directory", gh.working_directory.is_some()),
-                    ("timeout-minutes", gh.timeout_minutes.is_some()),
                 ] {
                     if set {
                         self.warn(format!(
@@ -885,6 +932,8 @@ impl Cx {
                         ));
                     }
                 }
+                let timeout_minutes =
+                    self.minutes(&at, "timeout-minutes", gh.timeout_minutes.as_ref());
                 let step = UsesStep {
                     name: gh.name,
                     id: gh.id,
@@ -893,6 +942,7 @@ impl Cx {
                     env,
                     if_,
                     continue_on_error,
+                    timeout_minutes,
                 };
                 Some(Step::Uses(step))
             }

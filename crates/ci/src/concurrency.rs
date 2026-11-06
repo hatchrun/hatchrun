@@ -350,6 +350,7 @@ mod tests {
             head_ref: String::new(),
             base_ref: String::new(),
             concurrency: None,
+            title: None,
         }
     }
 

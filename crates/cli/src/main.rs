@@ -32,8 +32,10 @@ enum Command {
     /// Convert GitHub Actions or Forgejo Actions workflow files into a
     /// hatchrun config
     ///
-    /// Jobs and files that cannot convert are left out and reported; the
-    /// config holds the rest, and the exit code is 1 when any were left out.
+    /// Jobs and files that cannot convert are left out and reported as
+    /// `error:` lines; the config holds the rest, and the exit code is 1
+    /// when any were left out. What was dropped without losing a job is
+    /// reported as `warning:` lines and leaves the exit code at 0.
     Convert {
         /// The files to convert (default: *.yml and *.yaml in .github/workflows,
         /// .forgejo/workflows and .gitea/workflows)
@@ -110,14 +112,18 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
     let mut inputs = Vec::new();
     // Problems name the file by its name; print them with its path.
     let mut paths: BTreeMap<String, &Path> = BTreeMap::new();
-    // Files too large to read are reported and left out; the rest still
-    // convert, as files that fail to convert do.
+    // Files that cannot be read, or are too large, are reported and left
+    // out; the rest still convert, as files that fail to convert do.
     let mut refused = Vec::new();
     for path in &files {
-        let source = match read_source(path)? {
-            Ok(source) => source,
-            Err(refusal) => {
+        let source = match read_source(path) {
+            Ok(Ok(source)) => source,
+            Ok(Err(refusal)) => {
                 refused.push(refusal);
+                continue;
+            }
+            Err(err) => {
+                refused.push(format!("{err:#}"));
                 continue;
             }
         };
@@ -139,7 +145,7 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
         None => problem.to_string(),
     };
     for refusal in &refused {
-        eprintln!("{refusal}");
+        eprintln!("error: {refusal}");
     }
     if inputs.is_empty() {
         return Ok(ExitCode::FAILURE);
@@ -148,16 +154,16 @@ fn run_convert(mut files: Vec<PathBuf>, output: Option<&Path>) -> Result<ExitCod
         Ok(conversion) => conversion,
         Err(problems) => {
             for problem in &problems {
-                eprintln!("{}", shown(problem));
+                eprintln!("error: {}", shown(problem));
             }
             return Ok(ExitCode::FAILURE);
         }
     };
     for warning in &conversion.warnings {
-        eprintln!("{}", shown(warning));
+        eprintln!("warning: {}", shown(warning));
     }
     for error in &conversion.errors {
-        eprintln!("{}", shown(error));
+        eprintln!("error: {}", shown(error));
     }
     let yaml = to_yaml(&conversion.config).map_err(|e| anyhow::anyhow!(shown(&e)))?;
     match output {

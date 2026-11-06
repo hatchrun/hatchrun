@@ -375,6 +375,7 @@ fn failed(result: Option<&Path>, code: i32, masker: &exec::mask::Masker) -> i32 
         outputs: std::collections::BTreeMap::new(),
         steps: Vec::new(),
         annotations: Vec::new(),
+        environment_url: None,
     };
     if let Some(path) = result
         && let Err(err) = write_result(path, &failure)

@@ -143,7 +143,7 @@ impl SecretRefs {
 
 impl PlannedJob {
     /// The secrets this job reads: every `${{ secrets.X }}` in its
-    /// `env`, `outputs` and steps, and the secrets its `if:` conditions
+    /// `env`, `outputs`, `environment-url` and steps, and the secrets its `if:` conditions
     /// name, plus [`DEBUG_SECRETS`].
     ///
     /// A job of a called workflow reads only what its calls pass, so
@@ -155,6 +155,7 @@ impl PlannedJob {
         let mut refs = SecretRefs::default();
         refs.scan_all(self.env.values());
         refs.scan_all(self.outputs.values());
+        refs.scan_opt(self.environment_url.as_deref(), false);
         refs.scan_opt(self.if_.as_deref(), true);
         for step in &self.steps {
             refs.scan_step(step);
@@ -266,6 +267,7 @@ mod tests {
             outputs: BTreeMap::new(),
             token_permissions: BTreeMap::new(),
             environment: None,
+            environment_url: None,
             concurrency: None,
             steps: vec![step],
             deferred: None,

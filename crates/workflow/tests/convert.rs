@@ -506,6 +506,33 @@ jobs:
 }
 
 #[test]
+fn uses_steps_keep_their_timeout() {
+    let out = ok("
+on: push
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v4
+        timeout-minutes: 4
+      - uses: actions/setup-node@v4
+        timeout-minutes: soon
+");
+    let steps = &out.config.jobs["ci-t"].steps;
+    let Step::Uses(first) = &steps[0] else {
+        panic!("{:?}", steps[0])
+    };
+    let Step::Uses(second) = &steps[1] else {
+        panic!("{:?}", steps[1])
+    };
+    assert_eq!(first.timeout_minutes, Some(4));
+    assert_eq!(second.timeout_minutes, None);
+    assert!(has(&out.warnings, &["timeout-minutes: soon", "dropped"]));
+    assert!(!has(&out.warnings, &["only on run steps"]));
+    round_trips(&out);
+}
+
+#[test]
 fn several_files_become_several_workflows() {
     let out = convert(&[
         (
@@ -1077,6 +1104,41 @@ jobs:
 }
 
 #[test]
+fn github_larger_runner_labels_map_to_templates() {
+    let cases = [
+        ("ubuntu-latest-4-cores", "ubuntu-26.04-4core"),
+        ("ubuntu-22.04-8core", "ubuntu-26.04-8core"),
+        ("ubuntu-24.04-16core", "ubuntu-26.04-16core"),
+        ("ubuntu-latest-xl", "ubuntu-26.04-8core"),
+        ("ubuntu-24.04-arm-8-cores", "ubuntu-26.04-8core-arm"),
+    ];
+    for (label, want) in cases {
+        let out = ok(&format!(
+            "on: push\njobs:\n  t: {{ runs-on: {label}, steps: [{{ run: x }}] }}\n"
+        ));
+        assert_eq!(out.errors, [], "{label}");
+        assert_eq!(
+            out.config.jobs["ci-t"].runs_on.as_deref(),
+            Some(want),
+            "{label}"
+        );
+        assert!(has(&out.warnings, &[label, "became"]), "{label}");
+        round_trips(&out);
+    }
+    // Sizes with no template run on the largest, and the warning says so.
+    let out =
+        ok("on: push\njobs:\n  t: { runs-on: ubuntu-latest-32-cores, steps: [{ run: x }] }\n");
+    assert_eq!(
+        out.config.jobs["ci-t"].runs_on.as_deref(),
+        Some("ubuntu-26.04-16core")
+    );
+    assert!(has(
+        &out.warnings,
+        &["asks for 32 vCPUs", "the largest template has 16"]
+    ));
+}
+
+#[test]
 fn a_runs_on_matrix_without_a_template_is_an_error() {
     let out = ok("on: push
 jobs:
@@ -1566,33 +1628,126 @@ jobs:
         out.config.jobs["ci-b"].environment.as_deref(),
         Some("staging")
     );
-    assert!(
-        has(
-            &out.warnings,
-            &["`environment.url` is not supported and was dropped"]
-        ),
-        "{:?}",
-        out.warnings
+    assert_eq!(
+        out.config.jobs["ci-b"].environment_url.as_deref(),
+        Some("https://x")
     );
+    assert_eq!(out.config.jobs["ci-a"].environment_url, None);
+    assert_eq!(out.warnings, []);
+    round_trips(&out);
+}
+
+#[test]
+fn run_name_converts() {
+    let out = ok("
+run-name: Deploy ${{ inputs.target }} by ${{ github.actor }}
+on: push
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert_eq!(
+        out.config.workflows["ci"].run_name.as_deref(),
+        Some("Deploy ${{ inputs.target }} by ${{ github.actor }}")
+    );
+    assert_eq!(out.warnings, []);
+    round_trips(&out);
+
+    let out = ok("
+run-name: ${{ env.X }}
+on: push
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert_eq!(out.config.workflows["ci"].run_name, None);
+    assert!(has(&out.warnings, &["`run-name` reads `env`", "dropped"]));
+
+    let out = ok("
+run-name: ${{ github.
+on: push
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert_eq!(out.config.workflows["ci"].run_name, None);
+    assert!(has(&out.warnings, &["`run-name`", "bad expression"]));
+}
+
+#[test]
+fn environment_url_is_checked_with_the_job() {
+    let out = ok("
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: { name: prod, url: '${{ secrets.X }}/${{ nothing.here }}' }
+    steps: [{ run: d }]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{ run: l }]
+");
     assert!(
-        !has(&out.warnings, &["`environment` is not supported"]),
+        has(&out.errors, &["unknown context 'nothing'"]),
         "{:?}",
-        out.warnings
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-deploy"));
+    assert!(out.config.jobs.contains_key("ci-lint"));
+}
+
+#[test]
+fn environment_names_and_urls_can_be_expressions() {
+    let out = ok("
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    needs: pick
+    strategy: { matrix: { region: [eu, us] } }
+    environment:
+      name: ${{ needs.pick.outputs.stage }}-${{ matrix.region }}
+      url: ${{ steps.up.outputs.url }}
+    steps: [{ id: up, run: d }]
+  pick:
+    runs-on: ubuntu-latest
+    outputs: { stage: '${{ steps.s.outputs.v }}' }
+    steps: [{ id: s, run: p }]
+");
+    assert_eq!(out.errors, []);
+    assert_eq!(out.warnings, []);
+    let job = &out.config.jobs["ci-deploy"];
+    assert_eq!(
+        job.environment.as_deref(),
+        Some("${{ needs.pick.outputs.stage }}-${{ matrix.region }}")
     );
     assert_eq!(
-        out.warnings
-            .iter()
-            .filter(|w| w.message.contains("environment"))
-            .count(),
-        1,
-        "{:?}",
-        out.warnings
+        job.environment_url.as_deref(),
+        Some("${{ steps.up.outputs.url }}")
     );
     round_trips(&out);
 }
 
 #[test]
-fn environment_expressions_drop_the_job() {
+fn environment_names_that_read_other_contexts_drop_the_job() {
+    let out = ok("
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ env.STAGE }}
+    steps: [{ run: d }]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{ run: l }]
+");
+    assert!(
+        has(&out.errors, &["`environment` reads `env`"]),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-deploy"));
+}
+
+#[test]
+fn an_environment_expression_that_does_not_parse_drops_the_job() {
     let out = convert(&[(
         "ci.yml".into(),
         "
@@ -1600,7 +1755,7 @@ on: push
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: ${{ matrix.env }}
+    environment: ${{ matrix.env
     steps: [{ run: d }]
   lint:
     runs-on: ubuntu-latest
@@ -1610,7 +1765,7 @@ jobs:
     )])
     .unwrap();
     assert!(
-        has(&out.errors, &["`environment` uses an expression"]),
+        has(&out.errors, &["`environment`", "bad expression"]),
         "{:?}",
         out.errors
     );
@@ -2444,4 +2599,117 @@ jobs:
     assert!(call.outputs.contains_key("good"));
     assert!(!call.outputs.contains_key("bad"));
     assert!(has(&out.warnings, &["output `bad`", "reads `github`"]));
+}
+
+#[test]
+fn merge_group_and_repository_dispatch_convert() {
+    let out = ok("
+on:
+  merge_group:
+  repository_dispatch: { types: [deploy, rollback] }
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    let on = &out.config.workflows["ci"].on;
+    assert_eq!(on.merge_group.as_ref().unwrap().types, ["checks_requested"]);
+    assert_eq!(
+        on.repository_dispatch.as_ref().unwrap().types,
+        ["deploy", "rollback"]
+    );
+    assert_eq!(out.errors, []);
+    assert_eq!(out.warnings, []);
+    round_trips(&out);
+
+    let out = ok("on: [merge_group, repository_dispatch]
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    let on = &out.config.workflows["ci"].on;
+    assert!(on.merge_group.is_some());
+    assert_eq!(
+        on.repository_dispatch.as_ref().unwrap().types,
+        Vec::<String>::new()
+    );
+    assert_eq!(out.warnings, []);
+    round_trips(&out);
+
+    let out = ok("
+on:
+  merge_group: { types: [checks_requested], branches: [main] }
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert!(out.config.workflows["ci"].on.merge_group.is_some());
+    assert!(has(
+        &out.warnings,
+        &["`on.merge_group`", "branch filters", "dropped"]
+    ));
+
+    let out = ok("
+on:
+  push:
+  merge_group: { types: [destroyed] }
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert!(out.config.workflows["ci"].on.merge_group.is_none());
+    assert!(has(&out.warnings, &["`on.merge_group`", "`destroyed`"]));
+}
+
+#[test]
+fn the_deploy_fixture_converts_without_losing_a_capability() {
+    let out = convert(&[(
+        ".github/workflows/deploy.yml".into(),
+        include_str!("fixtures/github/deploy.yml").into(),
+    )])
+    .unwrap();
+    assert_eq!(out.errors, []);
+    // Only the larger runner label is reported, as it is renamed.
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(has(
+        &out.warnings,
+        &["ubuntu-latest-8-cores", "ubuntu-26.04-8core"]
+    ));
+    round_trips(&out);
+
+    let wf = &out.config.workflows["deploy"];
+    assert_eq!(
+        wf.run_name.as_deref(),
+        Some("Deploy ${{ inputs.target || 'staging' }} (${{ github.actor }})")
+    );
+    assert!(wf.on.merge_group.is_some());
+    assert_eq!(
+        wf.on.repository_dispatch.as_ref().unwrap().types,
+        ["deploy-request"]
+    );
+    let job = &out.config.jobs["deploy-deploy"];
+    assert_eq!(job.runs_on.as_deref(), Some("ubuntu-26.04-8core"));
+    assert!(
+        job.environment
+            .as_deref()
+            .unwrap()
+            .contains("matrix.region")
+    );
+    assert!(
+        job.environment_url
+            .as_deref()
+            .unwrap()
+            .contains("steps.up.outputs.id")
+    );
+    let Step::Uses(checkout) = &job.steps[0] else {
+        panic!("{:?}", job.steps[0])
+    };
+    assert_eq!(checkout.timeout_minutes, Some(5));
+
+    // The plan names the environment of each matrix leg when it starts.
+    let plan = hatchrun_workflow::compile(&out.config, "deploy", "refs/heads/main").unwrap();
+    let deploys: Vec<_> = plan.jobs.iter().filter(|j| j.name == "deploy").collect();
+    assert_eq!(deploys.len(), 2);
+    assert_eq!(
+        deploys[1].matrix["region"],
+        json!("us"),
+        "{:?}",
+        deploys[1].matrix
+    );
+    assert_eq!(plan.run_name, wf.run_name);
 }

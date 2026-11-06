@@ -7,9 +7,10 @@
 use super::calls::{scalar, show};
 use super::jobs::fit_default;
 use super::{
-    BTreeMap, Cx, Deserialize, Dispatch, EVENTS, GITHUB_ONLY, GhInput, GhRef, GhRelease,
-    GhWorkflowRun, Level, Parameter, ParameterKind, Permissions, PullRequestTrigger, PushTrigger,
-    RELEASE_TYPES, RefTrigger, ReleaseTrigger, SCOPES, Schedule, Triggers, Value,
+    BTreeMap, Cx, Deserialize, Dispatch, EVENTS, GITHUB_ONLY, GhInput, GhMergeGroup, GhRef,
+    GhRelease, GhRepositoryDispatch, GhWorkflowRun, Level, MERGE_GROUP_TYPES, MergeGroupTrigger,
+    Parameter, ParameterKind, Permissions, PullRequestTrigger, PushTrigger, RELEASE_TYPES,
+    RefTrigger, ReleaseTrigger, RepositoryDispatchTrigger, SCOPES, Schedule, Triggers, Value,
     WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
 };
 
@@ -182,6 +183,23 @@ impl Cx {
                 Ok(_) => triggers.delete = Some(RefTrigger {}),
                 Err(err) => self.error(bad(err)),
             },
+            "merge_group" => match Option::<GhMergeGroup>::deserialize(body) {
+                Ok(group) => triggers.merge_group = self.merge_group(file, group),
+                Err(err) => self.error(bad(err)),
+            },
+            "repository_dispatch" => match Option::<GhRepositoryDispatch>::deserialize(body) {
+                Ok(dispatch) => {
+                    let types = dispatch.and_then(|d| d.types);
+                    triggers.repository_dispatch = Some(RepositoryDispatchTrigger {
+                        types: match types {
+                            Some(Value::Array(items)) => items.iter().filter_map(scalar).collect(),
+                            Some(other) => scalar(&other).into_iter().collect(),
+                            None => Vec::new(),
+                        },
+                    });
+                }
+                Err(err) => self.error(bad(err)),
+            },
             _ => return false,
         }
         true
@@ -280,6 +298,31 @@ impl Cx {
         Some(ReleaseTrigger {
             types: self.types(&at, types, RELEASE_TYPES)?,
             ..ReleaseTrigger::default()
+        })
+    }
+
+    /// Converts `on.merge_group`. Branch filters are dropped with a
+    /// warning: hatchrun runs the workflow for every merge group of the
+    /// repository. `None` when no type is left.
+    pub(super) fn merge_group(
+        &mut self,
+        file: &str,
+        group: Option<GhMergeGroup>,
+    ) -> Option<MergeGroupTrigger> {
+        let at = format!("`{file}`: `on.merge_group`");
+        let Some(group) = group else {
+            return Some(MergeGroupTrigger::default());
+        };
+        if group.branches.is_some() || group.branches_ignore.is_some() {
+            self.warn(format!(
+                "{at}: branch filters are not supported and were dropped; it runs for every merge group"
+            ));
+        }
+        let Some(types) = group.types.filter(|t| !t.is_null()) else {
+            return Some(MergeGroupTrigger::default());
+        };
+        Some(MergeGroupTrigger {
+            types: self.types(&at, &types, MERGE_GROUP_TYPES)?,
         })
     }
 

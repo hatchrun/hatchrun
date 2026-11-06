@@ -178,5 +178,6 @@ fn failure() -> JobResult {
         outputs: std::collections::BTreeMap::new(),
         steps: Vec::new(),
         annotations: Vec::new(),
+        environment_url: None,
     }
 }

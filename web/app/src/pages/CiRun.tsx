@@ -348,6 +348,21 @@ function Header({
             <span className="text-fg">{run.run_attempt}</span>
           </span>
         )}
+        {jobs
+          .filter((job) => job.environment_url && /^https?:\/\//.test(job.environment_url))
+          .map((job) => (
+            <span key={job.id} className="flex min-w-0 items-center gap-2">
+              <span className="cap">deployed</span>
+              <a
+                href={job.environment_url ?? undefined}
+                aria-label={`${job.environment ?? job.name} deployment, opens ${job.environment_url ?? ""}`}
+                className="inline-flex max-w-[260px] items-center gap-1.5 link"
+              >
+                <span className="truncate">{job.environment ?? job.name}</span>
+                <ExternalLink size={10} aria-hidden="true" className="text-fg-3" />
+              </a>
+            </span>
+          ))}
       </div>
       {error !== null && (
         <p role="alert" className="font-mono text-[13px] text-failed">

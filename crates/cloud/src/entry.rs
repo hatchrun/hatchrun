@@ -53,6 +53,8 @@ fn forwarded(event: &str) -> bool {
             | "check_run"
             | "repository"
             | "release"
+            | "merge_group"
+            | "repository_dispatch"
             | "create"
             | "delete"
             | "installation_repositories"
@@ -320,6 +322,8 @@ mod tests {
         assert!(forwarded("check_run"));
         assert!(forwarded("repository"));
         assert!(forwarded("release"));
+        assert!(forwarded("merge_group"));
+        assert!(forwarded("repository_dispatch"));
         assert!(forwarded("create"));
         assert!(forwarded("delete"));
         assert!(forwarded("installation_repositories"));

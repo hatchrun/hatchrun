@@ -279,4 +279,9 @@ pub struct JobResult {
     pub steps: Vec<StepSummary>,
     /// Annotations from all steps.
     pub annotations: Vec<Annotation>,
+    /// The job's `environment-url`, evaluated after its steps ran. `None`
+    /// when the job names none, did not succeed, or the address is not a
+    /// usable link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_url: Option<String>,
 }

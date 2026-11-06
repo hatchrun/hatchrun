@@ -85,6 +85,8 @@ export interface CiJob {
   held: string | null;
   /** The environment the job deploys to, when it has one. */
   environment: string | null;
+  /** Where the deployment can be seen, once the job succeeded. */
+  environment_url?: string | null;
   /** The admin's decision on a job held for approval; null until one is made. */
   approval: { decision: "approved" | "rejected"; by: string; at: number } | null;
 }

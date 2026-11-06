@@ -707,6 +707,7 @@ pub(super) mod tests {
             head_ref: String::new(),
             base_ref: String::new(),
             concurrency: None,
+            title: None,
         }
     }
 
@@ -932,6 +933,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
                 col: None,
                 end_column: None,
             }],
+            environment_url: None,
         };
         apply_result(&mut state, &result);
         assert_eq!(state.steps.len(), 2);
@@ -968,6 +970,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             outputs: std::collections::BTreeMap::new(),
             steps: vec![],
             annotations: vec![],
+            environment_url: None,
         };
         let _ = g.advance(&ctx);
         g.running(1);
@@ -1320,6 +1323,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
                 outputs: std::collections::BTreeMap::new(),
                 steps: vec![],
                 annotations: vec![],
+                environment_url: None,
             },
             &ctx,
         );
@@ -1416,6 +1420,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             outputs: std::collections::BTreeMap::new(),
             steps: vec![],
             annotations: vec![],
+            environment_url: None,
         };
         apply_result(&mut state, &result);
         assert_eq!(state.steps.len(), 1);
@@ -1452,6 +1457,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             outputs: std::collections::BTreeMap::new(),
             steps: vec![],
             annotations: vec![],
+            environment_url: None,
         };
         let _ = g.finished(1, result, &ctx);
         let _ = g.rerun(1, &ctx);

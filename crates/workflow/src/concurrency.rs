@@ -121,7 +121,7 @@ pub struct Resolved {
 }
 
 /// Evaluates on the control plane, which has no files and no steps.
-struct Plain;
+pub(crate) struct Plain;
 
 impl Functions for Plain {
     fn hash_files(&self, _patterns: &[String]) -> Result<String, ExprError> {
