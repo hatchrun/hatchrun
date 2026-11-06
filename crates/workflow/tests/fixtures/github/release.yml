@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
+  images:
+    needs: test
+    strategy:
+      matrix:
+        image: [api, worker]
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      image: ${{ matrix.image }}
+      push: true
+      replicas: 3
+    secrets:
+      REGISTRY_TOKEN: ${{ secrets.GHCR_TOKEN }}
+  shared:
+    needs: test
+    uses: acme/shared-workflows/.github/workflows/scan.yml@v2
+    secrets: inherit
+    permissions:
+      contents: read
+      security-events: write
+  announce:
+    needs: [images, shared]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "digest ${{ needs.images.outputs.digest }}"

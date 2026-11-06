@@ -29,9 +29,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use hatchrun_workflow::{
-    Arch, Config, Event, ExprError, Functions, HATCHRUN_KEYS, JobKind, JobStatus, ParameterKind,
-    Plan, PlannedJob, PlannedStep, Submodules, Workflow, compile, interpolate, job_condition,
-    parse, to_yaml, triggered,
+    Arch, Config, Event, ExprError, Functions, HATCHRUN_KEYS, JobKind, JobStatus, Library,
+    ParameterKind, Plan, PlannedJob, PlannedStep, Submodules, Workflow, compile, compile_with,
+    interpolate, job_condition, parse, to_yaml, triggered,
 };
 use serde_json::{Map, Value, json};
 
@@ -581,7 +581,7 @@ fn play(config: &Config, d: &Delivery, outputs: &Value, out: &mut String) {
             writeln!(out, "  {name}: not triggered").unwrap();
             continue;
         }
-        let plan = match compile(config, name, &git_ref) {
+        let plan = match compile_with(config, name, &git_ref, &Library::offline()) {
             Ok(plan) => plan,
             Err(errors) => {
                 writeln!(out, "  {name}: compile failed").unwrap();
@@ -813,7 +813,7 @@ fn nightly_schedule() {
 }
 
 #[test]
-fn local_reusable_workflows_are_inlined_and_remote_ones_dropped() {
+fn reusable_workflows_plan_as_calls_and_remote_ones_wait_for_a_host() {
     scenario("reusable");
 }
 

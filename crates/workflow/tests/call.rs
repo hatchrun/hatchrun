@@ -163,7 +163,13 @@ fn inherit_passes_every_secret_and_none_passes_nothing() {
 "
     ));
     assert_eq!(inherit[0].scope[0].secrets, SecretsPassed::Inherit);
-    assert_eq!(inherit[0].visible_secrets(&opened).get("A").map(String::as_str), Some("a"));
+    assert_eq!(
+        inherit[0]
+            .visible_secrets(&opened)
+            .get("A")
+            .map(String::as_str),
+        Some("a")
+    );
     let nested = plan(
         "
   inner:
@@ -201,7 +207,10 @@ fn a_required_input_that_is_not_passed_is_named() {
     jobs: [{{ p: {{ call: deploy, secrets: inherit }} }}]
 "
     ));
-    assert!(msg.contains("does not pass the input `env` of `deploy`"), "{msg}");
+    assert!(
+        msg.contains("does not pass the input `env` of `deploy`"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -217,10 +226,22 @@ fn input_and_secret_mistakes_are_named() {
           secrets: {{ EXTRA: '${{{{ secrets.A }}}}' }}
 "
     ));
-    assert!(msg.contains("`nope`, which is not an input of `deploy`"), "{msg}");
-    assert!(msg.contains("input `fast` of `deploy` must be a boolean"), "{msg}");
-    assert!(msg.contains("secret `EXTRA`, which `deploy` does not declare"), "{msg}");
-    assert!(msg.contains("secret `TOKEN` of `deploy`, which is required"), "{msg}");
+    assert!(
+        msg.contains("`nope`, which is not an input of `deploy`"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("input `fast` of `deploy` must be a boolean"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("secret `EXTRA`, which `deploy` does not declare"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("secret `TOKEN` of `deploy`, which is required"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -266,7 +287,10 @@ fn an_output_must_read_a_job_of_the_callee() {
     jobs: [{ p: { call: w } }]
 ",
     );
-    assert!(msg.contains("`jobs.ghost`, which is not a job of `w`"), "{msg}");
+    assert!(
+        msg.contains("`jobs.ghost`, which is not a job of `w`"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -284,7 +308,10 @@ fn cycles_are_reported_with_the_chain() {
     jobs: [{ p: { call: a } }]
 ",
     );
-    assert!(msg.contains("makes a cycle (`release` calls `a` calls `b` calls `a`)"), "{msg}");
+    assert!(
+        msg.contains("makes a cycle (`release` calls `a` calls `b` calls `a`)"),
+        "{msg}"
+    );
 }
 
 fn chain(depth: usize) -> String {
@@ -295,7 +322,10 @@ fn chain(depth: usize) -> String {
         } else {
             format!("{{ n: {{ call: w{} }} }}", i + 1)
         };
-        let _ = write!(out, "  w{i}:\n    on: {{ call: {{}} }}\n    jobs: [{next}]\n");
+        let _ = write!(
+            out,
+            "  w{i}:\n    on: {{ call: {{}} }}\n    jobs: [{next}]\n"
+        );
     }
     out.push_str("  release:\n    on: { push: {} }\n    jobs: [{ p: { call: w0 } }]\n");
     out
@@ -319,7 +349,10 @@ fn twenty_one_different_workflows_are_too_many() {
     let mut text = String::new();
     let mut jobs = Vec::new();
     for i in 0..21 {
-        let _ = write!(text, "  w{i}:\n    on: {{ call: {{}} }}\n    jobs: [build]\n");
+        let _ = write!(
+            text,
+            "  w{i}:\n    on: {{ call: {{}} }}\n    jobs: [build]\n"
+        );
         jobs.push(format!("{{ c{i}: {{ call: w{i} }} }}"));
     }
     let _ = write!(

@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 
 use super::{
     BTreeMap, Budget, Config, Diagnostic, ENTRY_OVERHEAD, EntryAt, PlannedJob, Value, Walk,
-    WorkflowJob, combination, compile_workflow, entry_value_errors, expression_problems,
-    job_bytes, kept_combinations, matrix_entries, matrix_id, reads_parameters, reserve_jobs,
+    WorkflowJob, combination, compile_workflow, entry_value_errors, expression_problems, job_bytes,
+    kept_combinations, matrix_entries, matrix_id, reads_parameters, reserve_jobs,
 };
 use crate::call::{
     CallFrame, CallTarget, CallTrigger, InputType, Library, MAX_CALL_DEPTH, MAX_UNIQUE_CALLEES,
@@ -150,6 +150,9 @@ pub(super) fn expand_call(
             let Some(library) = library else {
                 return Vec::new();
             };
+            if library.is_offline() && library.get(remote).is_none() {
+                return Vec::new();
+            }
             match remote_target(library, remote) {
                 Ok(target) => target,
                 Err(message) => {
@@ -331,7 +334,11 @@ pub(super) fn expand_call(
         for job in &plan.jobs {
             let mut job = job.clone();
             job.id = format!("{prefix}{}", job.id);
-            job.requires = job.requires.iter().map(|r| format!("{prefix}{r}")).collect();
+            job.requires = job
+                .requires
+                .iter()
+                .map(|r| format!("{prefix}{r}"))
+                .collect();
             for outer in &mut job.scope {
                 outer.id = format!("{prefix}{}", outer.id);
             }
@@ -434,7 +441,9 @@ fn inputs(
                     problem(
                         errors,
                         owner,
-                        format!("input `{name}` must be a string, number or boolean, found {value}"),
+                        format!(
+                            "input `{name}` must be a string, number or boolean, found {value}"
+                        ),
                     );
                     continue;
                 }
@@ -442,7 +451,9 @@ fn inputs(
                     problem(
                         errors,
                         owner,
-                        format!("input `{name}` reads `parameters`, which a workflow does not have"),
+                        format!(
+                            "input `{name}` reads `parameters`, which a workflow does not have"
+                        ),
                     );
                 }
                 if let Some(want) = input.kind.mismatch(value) {
@@ -615,7 +626,7 @@ fn jobs_read(inner: &str) -> Vec<String> {
 /// What is wrong with an expression of a call, which the host reads
 /// when the call's jobs can start. `bare` reads a text without `${{ }}`
 /// as an expression, as `if` does.
-fn call_expression(field: &str, text: &str, bare: bool) -> Vec<String> {
+pub(crate) fn call_expression(field: &str, text: &str, bare: bool) -> Vec<String> {
     let wrapped;
     let text = if bare && expr::find_open(text).is_none() {
         wrapped = format!("${{{{ {text} }}}}");
@@ -624,4 +635,28 @@ fn call_expression(field: &str, text: &str, bare: bool) -> Vec<String> {
         text
     };
     expression_problems(field, text, CALL_CONTEXTS)
+}
+
+/// What is wrong with the value of an `on.call.outputs` entry, each
+/// starting with `field`: it may read only `jobs`.
+pub(crate) fn output_expression(field: &str, text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![format!("{field} has no value")];
+    }
+    let mut problems = Vec::new();
+    let found = match expr::expressions(text) {
+        Ok(found) => found,
+        Err(e) => return vec![format!("{field} has a bad expression: {e}")],
+    };
+    for (_, inner) in found {
+        for (context, _) in expr::contexts(inner).unwrap_or_default() {
+            if !OUTPUT_CONTEXTS.contains(&context.as_ref()) {
+                problems.push(format!(
+                    "{field} reads `{context}`; it can read only {}",
+                    OUTPUT_CONTEXTS.join(", ")
+                ));
+            }
+        }
+    }
+    problems
 }

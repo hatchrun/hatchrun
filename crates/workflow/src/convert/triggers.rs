@@ -170,6 +170,10 @@ impl Cx {
                 }
                 Err(err) => self.error(bad(err)),
             },
+            "workflow_call" => {
+                let on = serde_json::json!({ "workflow_call": body });
+                triggers.call = Some(self.call_trigger(file, &on));
+            }
             "create" => match Option::<GhRef>::deserialize(body) {
                 Ok(_) => triggers.create = Some(RefTrigger {}),
                 Err(err) => self.error(bad(err)),
@@ -202,15 +206,6 @@ impl Cx {
     /// with its jobs: they could never start. `unsupported` names the
     /// events it had that hatchrun does not run on.
     pub(super) fn no_events(&mut self, file: &str, unsupported: &[String]) {
-        if !unsupported.is_empty() && unsupported.iter().all(|e| e == "workflow_call") {
-            if self.called.contains(file) {
-                return;
-            }
-            self.warn(format!(
-                "`{file}` was dropped: it is a reusable workflow (`on: workflow_call`), which is not supported"
-            ));
-            return;
-        }
         if unsupported.is_empty() {
             // `on` named no event, or the events it named did not convert
             // and are errors already.

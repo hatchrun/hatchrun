@@ -106,40 +106,26 @@ pub(super) fn expression_problems(job: &Job) -> (Vec<&'static str>, Vec<String>)
 /// What `validate` would reject in what a converted job reads when it
 /// becomes ready: a `runs-on` that is an expression, and the
 /// expressions of its entries' matrices. They can read only the
-/// contexts the host has then. A reusable workflow call cannot pass the
-/// names they read through yet, so `called` jobs have none.
-pub(super) fn dynamic_problems(job: &Job, entries: &[WorkflowJob], called: bool) -> Vec<String> {
+/// contexts the host has then.
+pub(super) fn dynamic_problems(job: &Job, entries: &[WorkflowJob]) -> Vec<String> {
     let mut problems = Vec::new();
     if let Some(text) = &job.runs_on
         && text.contains("${{")
         && !text.trim().starts_with("${{ parameters.")
     {
-        if called {
-            problems.push(
-                "reads an expression in `runs-on`, which a reusable workflow call does not support yet"
-                    .to_owned(),
-            );
-        } else {
-            problems.extend(plan::expression_problems(
-                "`runs-on`",
-                text,
-                plan::RUNS_ON_CONTEXTS,
-            ));
-        }
+        problems.extend(plan::expression_problems(
+            "`runs-on`",
+            text,
+            plan::RUNS_ON_CONTEXTS,
+        ));
     }
     for entry in entries {
         for (field, text) in entry.matrix.expressions() {
-            if called {
-                problems.push(format!(
-                    "reads an expression in {field}, which a reusable workflow call does not support yet"
-                ));
-            } else {
-                problems.extend(plan::expression_problems(
-                    &field,
-                    text,
-                    plan::MATRIX_CONTEXTS,
-                ));
-            }
+            problems.extend(plan::expression_problems(
+                &field,
+                text,
+                plan::MATRIX_CONTEXTS,
+            ));
         }
     }
     problems
@@ -174,200 +160,4 @@ pub(super) fn workflow_call(on: &Value) -> Option<Value> {
 /// Whether an `on:` value has `workflow_call`.
 pub(super) fn calls_workflow(on: &Value) -> bool {
     workflow_call(on).is_some()
-}
-
-/// A reader of the dotted names in an expression: given the parts of
-/// one, such as `["inputs", "target"]`, it returns how many parts it
-/// replaces and what with.
-pub(super) type Names<'a> = dyn FnMut(&[&str]) -> Option<(usize, String)> + 'a;
-
-/// The inside of a text that is one `${{ }}` and nothing else.
-pub(super) fn whole(text: &str) -> Option<&str> {
-    let inner = text.trim().strip_prefix("${{")?.strip_suffix("}}")?;
-    (!inner.contains("${{") && !inner.contains("}}")).then_some(inner.trim())
-}
-
-/// Whether an expression is a plain name, which needs no parentheses.
-pub(super) fn simple(expr: &str) -> bool {
-    !expr.is_empty()
-        && expr
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-}
-
-/// A value as an expression: an expression that was its whole text
-/// stays, anything else is a literal.
-pub(super) fn expr_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => match whole(text) {
-            Some(expr) if simple(expr) => expr.to_owned(),
-            Some(expr) => format!("({expr})"),
-            None => format!("'{}'", text.replace('\'', "''")),
-        },
-        Value::Null => "''".to_owned(),
-        other => other.to_string(),
-    }
-}
-
-/// A text with each dotted name `names` answers replaced. Quoted strings
-/// and the parts of longer names are left alone. `bare` says the text is
-/// an expression; otherwise the expressions are the `${{ }}` in it.
-pub(super) fn rewrite(text: &str, bare: bool, names: &mut Names<'_>) -> String {
-    if bare {
-        return rewrite_expr(text, names);
-    }
-    let Ok(found) = expr::expressions(text) else {
-        return text.to_owned();
-    };
-    let mut out = text.to_owned();
-    for (start, inner) in found.into_iter().rev() {
-        out.replace_range(start..start + inner.len(), &rewrite_expr(inner, names));
-    }
-    out
-}
-
-/// The name in a literal string index `['name']` at `at`, with the
-/// offset after the `]`. Spaces around the string are allowed.
-fn literal_index(expr: &str, at: usize) -> Option<(&str, usize)> {
-    let rest = expr[at..].trim_start().strip_prefix('[')?;
-    let rest = rest.trim_start().strip_prefix('\'')?;
-    let len = rest.find('\'')?;
-    let name = &rest[..len];
-    let tail = rest[len + 1..].trim_start().strip_prefix(']')?;
-    (!name.is_empty()).then_some((name, expr.len() - tail.len()))
-}
-
-/// [`rewrite`] of one expression.
-pub(super) fn rewrite_expr(expr: &str, names: &mut Names<'_>) -> String {
-    let bytes = expr.as_bytes();
-    let part = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
-    let start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
-    let mut out = String::with_capacity(expr.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'\'' {
-            let mut end = i + 1;
-            while end < bytes.len() {
-                if bytes[end] == b'\'' {
-                    if bytes.get(end + 1) == Some(&b'\'') {
-                        end += 2;
-                        continue;
-                    }
-                    break;
-                }
-                end += 1;
-            }
-            let end = (end + 1).min(bytes.len());
-            out.push_str(&expr[i..end]);
-            i = end;
-        } else if start(b) && (i == 0 || !(part(bytes[i - 1]) || bytes[i - 1] == b'.')) {
-            let mut ends = Vec::new();
-            let mut end = i;
-            loop {
-                while end < bytes.len() && part(bytes[end]) {
-                    end += 1;
-                }
-                ends.push(end);
-                if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(|b| start(*b)) {
-                    end += 1;
-                } else {
-                    break;
-                }
-            }
-            // `secrets['NAME']` reads like `secrets.NAME`.
-            let literal = (ends.len() == 1 && &expr[i..end] == "secrets")
-                .then(|| literal_index(expr, end))
-                .flatten();
-            let mut from = i;
-            let mut parts: Vec<&str> = ends
-                .iter()
-                .map(|&to| {
-                    let name = &expr[from..to];
-                    from = to + 1;
-                    name
-                })
-                .collect();
-            if let Some((name, after)) = literal {
-                parts.push(name);
-                ends.push(after);
-            }
-            let call = bytes.get(end) == Some(&b'(');
-            if let Some((n, replacement)) = names(&parts).filter(|_| !call) {
-                out.push_str(&replacement);
-                i = ends[n - 1];
-            } else {
-                out.push_str(&expr[i..end]);
-                i = end;
-            }
-        } else {
-            let ch = expr[i..].chars().next().unwrap_or_default();
-            out.push(ch);
-            i += ch.len_utf8().max(1);
-        }
-    }
-    out
-}
-
-/// Rewrites one text, which is a bare expression when the flag is set.
-pub(super) type Texts<'a> = dyn FnMut(&str, bool) -> String + 'a;
-
-/// Rewrites the expressions of a value's strings, at any depth.
-pub(super) fn rewrite_value(value: &mut Value, names: &mut Names<'_>) {
-    walk_value(value, &mut |text, bare| rewrite(text, bare, names));
-}
-
-/// [`rewrite_value`] with a rewriter of whole texts.
-pub(super) fn walk_value(value: &mut Value, texts: &mut Texts<'_>) {
-    match value {
-        Value::String(text) => *text = texts(text, false),
-        Value::Array(items) => items.iter_mut().for_each(|v| walk_value(v, texts)),
-        Value::Object(map) => map.values_mut().for_each(|v| walk_value(v, texts)),
-        _ => {}
-    }
-}
-
-/// Rewrites every expression of a converted job.
-pub(super) fn map_job(job: &mut Job, names: &mut Names<'_>) {
-    walk_job(job, &mut |text, bare| rewrite(text, bare, names));
-}
-
-/// [`map_job`] with a rewriter of whole texts.
-pub(super) fn walk_job(job: &mut Job, texts: &mut Texts<'_>) {
-    fn text(text: &mut String, texts: &mut Texts<'_>) {
-        *text = texts(text, false);
-    }
-    fn opt(text: &mut Option<String>, texts: &mut Texts<'_>) {
-        if let Some(t) = text {
-            *t = texts(t, false);
-        }
-    }
-    fn cond(text: &mut Option<String>, texts: &mut Texts<'_>) {
-        if let Some(t) = text {
-            *t = texts(t, !t.contains("${{"));
-        }
-    }
-    job.env.values_mut().for_each(|v| text(v, texts));
-    job.outputs.values_mut().for_each(|v| text(v, texts));
-    opt(&mut job.runs_on, texts);
-    cond(&mut job.if_, texts);
-    for step in &mut job.steps {
-        match step {
-            Step::Run(run) => {
-                opt(&mut run.name, texts);
-                text(&mut run.run, texts);
-                opt(&mut run.shell, texts);
-                opt(&mut run.working_directory, texts);
-                run.env.values_mut().for_each(|v| text(v, texts));
-                cond(&mut run.if_, texts);
-            }
-            Step::Uses(uses) => {
-                opt(&mut uses.name, texts);
-                uses.with.values_mut().for_each(|v| walk_value(v, texts));
-                uses.env.values_mut().for_each(|v| text(v, texts));
-                cond(&mut uses.if_, texts);
-            }
-            _ => {}
-        }
-    }
 }

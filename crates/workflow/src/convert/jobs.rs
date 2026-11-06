@@ -981,7 +981,9 @@ pub(super) fn flatten(entries: Vec<(String, Vec<WorkflowJob>)>) -> Vec<WorkflowJ
         .map(|(id, e)| {
             (
                 id.clone(),
-                e.iter().filter_map(|e| e.name.clone()).collect(),
+                e.iter()
+                    .map(|e| e.name.clone().unwrap_or_else(|| e.job.clone()))
+                    .collect(),
             )
         })
         .collect();

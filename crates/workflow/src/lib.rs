@@ -27,9 +27,9 @@ pub mod templates;
 pub mod trigger;
 
 pub use call::{
-    Callee, CallFrame, CallInput, CallSecret, CallTarget, CallTrigger, InputType, MAX_CALL_DEPTH,
-    Library, MAX_UNIQUE_CALLEES, RemoteCall, SecretsPassed, entry_in, read_value, remote_calls,
-    resolve_inputs, shared_depth,
+    CallFrame, CallInput, CallSecret, CallTarget, CallTrigger, Callee, InputType, Library,
+    MAX_CALL_DEPTH, MAX_UNIQUE_CALLEES, RemoteCall, SecretsPassed, entry_in, read_value,
+    remote_calls, resolve_inputs, shared_depth,
 };
 pub use concurrency::{Cancel, Concurrency, Resolved};
 pub use config::{
@@ -54,8 +54,8 @@ pub use permissions::{
     DEFAULT_SCOPES, ID_TOKEN, ID_TOKEN_SCOPE, Level, Permissions, SCOPES, token_scopes,
 };
 pub use plan::{
-    Deferred, JobKind, Plan, PlannedJob, PlannedStep, PlannedStrategy, Ready, compile, compile_with,
-    config_errors, ready, validate,
+    Deferred, JobKind, Plan, PlannedJob, PlannedStep, PlannedStrategy, Ready, compile,
+    compile_with, config_errors, ready, validate,
 };
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;

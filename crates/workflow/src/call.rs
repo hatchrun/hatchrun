@@ -108,13 +108,12 @@ impl InputType {
     /// A message when `value` cannot be read as the type.
     pub fn coerce(self, value: &Value) -> Result<Value, String> {
         match (self, value) {
-            (Self::String, Value::String(_)) => Ok(value.clone()),
             (Self::String, Value::Null) => Ok(Value::String(String::new())),
             (Self::String, Value::Number(n)) => Ok(Value::String(n.to_string())),
             (Self::String, Value::Bool(b)) => Ok(Value::String(b.to_string())),
-            (Self::Boolean, Value::Bool(_)) | (Self::Number, Value::Number(_)) => {
-                Ok(value.clone())
-            }
+            (Self::String, Value::String(_))
+            | (Self::Boolean, Value::Bool(_))
+            | (Self::Number, Value::Number(_)) => Ok(value.clone()),
             (Self::Boolean, Value::String(text)) if text == "true" => Ok(Value::Bool(true)),
             (Self::Boolean, Value::String(text)) if text == "false" => Ok(Value::Bool(false)),
             (Self::Number, Value::String(text)) => text
@@ -341,9 +340,7 @@ impl CallTarget {
         let mut parts = path.splitn(3, '/');
         let (Some(owner), Some(repo), Some(file)) = (parts.next(), parts.next(), parts.next())
         else {
-            return Err(format!(
-                "`call: {call}` is not `owner/repo/path.yml@ref`"
-            ));
+            return Err(format!("`call: {call}` is not `owner/repo/path.yml@ref`"));
         };
         let plain = |s: &str| {
             !s.is_empty()
@@ -351,9 +348,7 @@ impl CallTarget {
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         };
         if !plain(owner) || !plain(repo) || file.is_empty() || git_ref.is_empty() {
-            return Err(format!(
-                "`call: {call}` is not `owner/repo/path.yml@ref`"
-            ));
+            return Err(format!("`call: {call}` is not `owner/repo/path.yml@ref`"));
         }
         if file.split('/').any(|part| part == ".." || part.is_empty()) {
             return Err(format!(
@@ -388,9 +383,26 @@ pub struct Callee {
 #[derive(Debug, Clone, Default)]
 pub struct Library {
     files: BTreeMap<RemoteCall, Callee>,
+    offline: bool,
 }
 
 impl Library {
+    /// A library for a host that cannot read other repositories, such
+    /// as the command line: a call of a file it does not have plans no
+    /// jobs, where [`Library::default`] makes it an error.
+    #[must_use]
+    pub fn offline() -> Self {
+        Self {
+            files: BTreeMap::new(),
+            offline: true,
+        }
+    }
+
+    /// Whether a call of a missing file plans nothing.
+    pub(crate) fn is_offline(&self) -> bool {
+        self.offline
+    }
+
     /// Adds the file `call` names.
     pub fn insert(&mut self, call: RemoteCall, callee: Callee) {
         self.files.insert(call, callee);
@@ -582,10 +594,7 @@ impl PlannedJob {
     /// ones every call on the way passed, and no others.
     /// [`DEBUG_SECRETS`] reach every job.
     #[must_use]
-    pub fn visible_secrets(
-        &self,
-        opened: &BTreeMap<String, String>,
-    ) -> BTreeMap<String, String> {
+    pub fn visible_secrets(&self, opened: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         let mut seen = opened.clone();
         for frame in &self.scope {
             seen = match &frame.secrets {
@@ -677,7 +686,11 @@ pub fn resolve_inputs(
                 .map_err(|e| format!("`with.{name}` of `{}` could not be read: {e}", frame.id))?;
             let kind = frame.kinds.get(name).copied().unwrap_or_default();
             let read = kind.coerce(&read).map_err(|e| {
-                format!("`with.{name}` of `{}` must be {}: {e}", frame.id, kind.word())
+                format!(
+                    "`with.{name}` of `{}` must be {}: {e}",
+                    frame.id,
+                    kind.word()
+                )
             })?;
             next.insert(name.clone(), read);
         }
@@ -764,7 +777,11 @@ mod tests {
     fn a_literal_of_the_wrong_type_is_a_mismatch_but_an_expression_is_not() {
         assert!(InputType::Boolean.mismatch(&json!("true")).is_some());
         assert!(InputType::Boolean.mismatch(&json!(true)).is_none());
-        assert!(InputType::Number.mismatch(&json!("${{ inputs.n }}")).is_none());
+        assert!(
+            InputType::Number
+                .mismatch(&json!("${{ inputs.n }}"))
+                .is_none()
+        );
         assert!(InputType::String.mismatch(&json!(1)).is_some());
     }
 
@@ -774,7 +791,10 @@ mod tests {
             name: id.to_owned(),
             workflow: "w".to_owned(),
             source: None,
-            with: with.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect(),
+            with: with
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
             kinds: kinds.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
             secrets: SecretsPassed::None,
             matrix: BTreeMap::new(),
@@ -792,12 +812,17 @@ mod tests {
         );
         let inner = frame(
             "a / b",
-            &[("target", json!("deploy-${{ inputs.env }}")), ("n", json!("2"))],
+            &[
+                ("target", json!("deploy-${{ inputs.env }}")),
+                ("n", json!("2")),
+            ],
             &[("target", InputType::String), ("n", InputType::Number)],
         );
-        let got = resolve_inputs(&[outer, inner], &json!({}), |i, inputs| {
-            json!({ "github": { "ref_name": "main" }, "inputs": inputs, "level": i })
-        })
+        let got = resolve_inputs(
+            &[outer, inner],
+            &json!({}),
+            |i, inputs| json!({ "github": { "ref_name": "main" }, "inputs": inputs, "level": i }),
+        )
         .unwrap();
         assert_eq!(got, json!({ "target": "deploy-main", "n": 2 }));
     }
@@ -809,8 +834,12 @@ mod tests {
             &[("flag", json!("${{ matrix.x }}"))],
             &[("flag", InputType::Boolean)],
         );
-        let err = resolve_inputs(&[bad], &json!({}), |_, _| json!({ "matrix": { "x": "maybe" } }))
-            .unwrap_err();
+        let err = resolve_inputs(
+            &[bad],
+            &json!({}),
+            |_, _| json!({ "matrix": { "x": "maybe" } }),
+        )
+        .unwrap_err();
         assert!(err.contains("`with.flag` of `a`"), "{err}");
     }
 }

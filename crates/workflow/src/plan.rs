@@ -122,6 +122,7 @@ pub(crate) const ENTRY_KEYS: &[&str] = &[
 mod calls;
 
 use self::calls::Calls;
+pub(crate) use self::calls::{call_expression, output_expression};
 
 /// The jobs one workflow runs for one ref.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
