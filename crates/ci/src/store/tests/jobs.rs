@@ -448,16 +448,8 @@ fn jobs_keep_their_needs_and_runs_their_message() {
     ))
     .unwrap();
     let jobs = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
-    assert_eq!(jobs[0].needs, Some(serde_json::json!([])));
-    assert_eq!(jobs[2].needs, Some(serde_json::json!(["test", "build"])));
-    // A job from before the plan ids were kept reads as unknown, not empty.
-    db.run(
-        "UPDATE ci_jobs SET needs = NULL WHERE plan_id = 'test'",
-        &[],
-    );
-    let jobs = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
-    assert_eq!(jobs[0].needs, None);
-    assert_eq!(jobs[1].needs, Some(serde_json::json!([])));
+    assert_eq!(jobs[0].needs, serde_json::json!([]));
+    assert_eq!(jobs[2].needs, serde_json::json!(["test", "build"]));
     let plain = db
         .wait(insert_run(db.db(), &new_run("e", "ci", 1)))
         .unwrap()

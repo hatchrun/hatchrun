@@ -108,25 +108,15 @@ pub struct JobRow {
     pub approval_by: Option<String>,
     /// When they decided.
     pub approval_at: Option<u64>,
-    /// The plan ids of the jobs it waits on, a JSON array; `None` for a
-    /// job recorded before the plan ids were kept.
-    #[serde(deserialize_with = "json_text_opt")]
-    pub needs: Option<serde_json::Value>,
+    /// The plan ids of the jobs it waits on, a JSON array.
+    #[serde(deserialize_with = "json_text")]
+    pub needs: serde_json::Value,
 }
 
 /// Reads a JSON document that the row carries as text.
 fn json_text<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<serde_json::Value, D::Error> {
     let text = String::deserialize(d)?;
     serde_json::from_str(&text).map_err(D::Error::custom)
-}
-
-/// Reads a JSON document that the row carries as text, or NULL.
-fn json_text_opt<'de, D: Deserializer<'de>>(
-    d: D,
-) -> std::result::Result<Option<serde_json::Value>, D::Error> {
-    Option::<String>::deserialize(d)?
-        .map(|text| serde_json::from_str(&text).map_err(D::Error::custom))
-        .transpose()
 }
 
 /// The columns of a [`JobRow`].

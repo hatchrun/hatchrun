@@ -29,11 +29,3 @@ CREATE INDEX ci_pulls_updated ON ci_pulls (repo_id, updated_at DESC, number DESC
 -- A pull request's runs, newest first.
 CREATE INDEX ci_runs_pull ON ci_runs (repo_id, pull_number, created_at DESC)
   WHERE pull_number IS NOT NULL;
-
--- Jobs of runs created before 0017 (2026-11-06 09:21:59 UTC) never had
--- their plan ids recorded; 0017 filled them with an empty array, which
--- the console cannot tell from a job that waits on nothing. NULL marks
--- them unknown.
-ALTER TABLE ci_jobs ALTER COLUMN needs DROP NOT NULL;
-UPDATE ci_jobs SET needs = NULL
-  WHERE run_id IN (SELECT id FROM ci_runs WHERE created_at < 1793956919000);
