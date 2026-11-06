@@ -714,6 +714,7 @@ impl Job<'_> {
                 sink,
             )
             .await;
+        exec.cleanup();
         self.states
             .entry(hook.index)
             .or_default()

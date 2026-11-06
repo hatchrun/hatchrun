@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 
 use hatchrun_workflow::{Conclusion, UsesStep};
 
-use super::{env_flags, path_text};
+use super::path_text;
 use crate::exec::action::{Action, ActionRef, Input, Metadata, Runs};
 use crate::exec::files::StepFiles;
 use crate::exec::sink::Sink;
@@ -202,17 +202,25 @@ impl Job<'_> {
         env.remove("RUNNER_WORKSPACE");
         let maps = maps(self);
         let inner = self.container_env(&env, &maps, None);
-        let (flags, cli_env) = env_flags(inner);
-        let mut docker_env = match self.docker_env() {
-            Ok(env) => env,
+        let (flags, env_file) = match self.env_args(inner) {
+            Ok(args) => args,
             Err(message) => return failed(self, sink, &message),
         };
-        docker_env.extend(cli_env);
+        let docker_env = match self.docker_env() {
+            Ok(env) => env,
+            Err(message) => {
+                super::remove_env_file(env_file.as_deref());
+                return failed(self, sink, &message);
+            }
+        };
 
         let layout = self.layout.clone();
         let name = match random_name() {
             Ok(name) => format!("hatchrun_action_{name}"),
-            Err(message) => return failed(self, sink, &message),
+            Err(message) => {
+                super::remove_env_file(env_file.as_deref());
+                return failed(self, sink, &message);
+            }
         };
         let mut argv = vec![
             "run".to_owned(),
@@ -262,6 +270,7 @@ impl Job<'_> {
         let ran = self
             .docker_stream(argv, docker_env, Some(&files), sink)
             .await;
+        super::remove_env_file(env_file.as_deref());
         self.states
             .entry(state_index)
             .or_default()

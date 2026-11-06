@@ -200,22 +200,11 @@ impl Job<'_> {
         args: &[String],
         stdin: Option<&str>,
     ) -> Result<Captured, String> {
-        self.docker_capture_env(args, stdin, &BTreeMap::new()).await
-    }
-
-    /// [`Self::docker_capture`] with more variables in the docker
-    /// client's environment, for `-e KEY` flags to read. The command
-    /// stops when the job is cancelled, unless the job is being cleaned
-    /// up.
-    pub(super) async fn docker_capture_env(
-        &mut self,
-        args: &[String],
-        stdin: Option<&str>,
-        extra: &BTreeMap<String, String>,
-    ) -> Result<Captured, String> {
+        // The docker client gets only the agent's own variables, never a
+        // value from the workflow: `LD_PRELOAD` or `SSL_CERT_FILE` in a
+        // step's `env` must not reach a process that runs as the agent.
+        let env = self.docker_env()?;
         let bin = self.docker_bin()?;
-        let mut env = self.docker_env()?;
-        env.extend(extra.clone());
         let mut command = Command::new(&bin);
         command
             .args(args)
@@ -469,7 +458,7 @@ impl Job<'_> {
                 sink,
                 Line::Note(&format!("Starting service {id} ({})", service.image)),
             );
-            let (flags, cli_env) = env_flags(service.env.clone());
+            let (flags, env_file) = self.env_args(service.env.clone())?;
             let create = Create {
                 name: &name,
                 label: &label,
@@ -483,7 +472,7 @@ impl Job<'_> {
                 ..Create::default()
             };
             let port_map = self
-                .create_and_start(&create, &service.volumes, &cli_env)
+                .create_and_start(&create, &service.volumes, env_file.as_deref())
                 .await?;
             started.push(Service {
                 id: id.clone(),
@@ -507,7 +496,7 @@ impl Job<'_> {
         &mut self,
         create: &Create<'_>,
         volumes: &[String],
-        cli_env: &BTreeMap<String, String>,
+        env_file: Option<&Path>,
     ) -> Result<BTreeMap<String, String>, String> {
         // A named volume that does not exist yet is made by `docker
         // create` for this job, and only those are removed afterwards.
@@ -524,7 +513,10 @@ impl Job<'_> {
         let mut argv = vec!["create".to_owned()];
         argv.extend(create.args());
         self.docker.containers.push(create.name.to_owned());
-        let out = self.docker_capture_env(&argv, None, cli_env).await?;
+        let out = self.docker_capture(&argv, None).await;
+        // The file held the container's variables, secrets among them.
+        remove_env_file(env_file);
+        let out = out?;
         if out.code != 0 {
             return Err(format!(
                 "docker create failed with exit code {}: {}",
@@ -608,7 +600,7 @@ impl Job<'_> {
             ("CI".to_owned(), "true".to_owned()),
         ]);
         env.extend(job.env.clone());
-        let (flags, cli_env) = env_flags(env);
+        let (flags, env_file) = self.env_args(env)?;
         let name = format!("hatchrun_job_{}", random_name()?);
         let label = self.docker.label.clone();
         self.say(
@@ -630,7 +622,7 @@ impl Job<'_> {
             command: vec!["-f".to_owned(), "/dev/null".to_owned()],
             ..Create::default()
         };
-        self.create_and_start(&create, &job.volumes, &cli_env)
+        self.create_and_start(&create, &job.volumes, env_file.as_deref())
             .await?;
 
         // What the image's shell setup is like decides the default shell
@@ -793,14 +785,14 @@ impl Job<'_> {
                 cwd: cwd.to_owned(),
                 env: env.clone(),
                 as_agent: false,
+                env_file: None,
             });
         };
         let maps = self.docker.maps.clone();
         let inner = self.container_env(env, &maps, Some(&job.path));
-        let (mut flags, cli_env) = env_flags(inner);
         let name = job.name.clone();
-        let mut docker_env = self.docker_env()?;
-        docker_env.extend(cli_env);
+        let (mut flags, env_file) = self.env_args(inner)?;
+        let docker_env = self.docker_env()?;
         let mut line = vec![
             "exec".to_owned(),
             "--workdir".to_owned(),
@@ -816,6 +808,7 @@ impl Job<'_> {
             cwd: self.layout.work.clone(),
             env: docker_env,
             as_agent: true,
+            env_file,
         })
     }
 
@@ -956,23 +949,63 @@ fn is_host_path(path: &str, host_path: &str, dirs: &[String]) -> bool {
     path == parts.join(":")
 }
 
-/// `-e` flags for a container environment. A value goes through the
-/// docker command's own environment, so a secret never shows in a
-/// process list; `PATH`, `HOME` and `DOCKER_*` would change how the
-/// docker command itself runs, so those go on the command line.
-fn env_flags(env: BTreeMap<String, String>) -> (Vec<String>, BTreeMap<String, String>) {
+/// Splits a container environment into the text of a Docker env file
+/// and the `-e KEY=VALUE` flags for what a file cannot carry. An env file
+/// has one `KEY=VALUE` per line and no escapes, so a value with a line
+/// break, or a key Docker would misread, goes on the command line, where
+/// the runner puts every value. That is the only place a process list
+/// can show a value.
+fn split_env(env: BTreeMap<String, String>) -> (String, Vec<String>) {
+    let mut file = String::new();
     let mut flags = Vec::new();
-    let mut cli = BTreeMap::new();
     for (key, value) in env {
-        flags.push("-e".to_owned());
-        if matches!(key.as_str(), "PATH" | "HOME") || key.starts_with("DOCKER_") {
-            flags.push(format!("{key}={value}"));
+        let plain_key = !key.is_empty()
+            && !key.starts_with('#')
+            && !key.contains(|c: char| c == '=' || c.is_whitespace() || c == '\0');
+        if plain_key && !value.contains(['\n', '\r', '\0']) {
+            file.extend([key.as_str(), "=", value.as_str(), "\n"]);
         } else {
-            flags.push(key.clone());
-            cli.insert(key, value);
+            flags.extend(["-e".to_owned(), format!("{key}={value}")]);
         }
     }
-    (flags, cli)
+    (file, flags)
+}
+
+impl Job<'_> {
+    /// The flags that give a container its environment: `--env-file`
+    /// with a file only the agent can read (in the job's state
+    /// directory, mode 0600), and `-e` for the rest. The caller removes
+    /// the file as soon as the docker command ends. Nothing from the
+    /// workflow goes into the docker client's own environment.
+    pub(super) fn env_args(
+        &mut self,
+        env: BTreeMap<String, String>,
+    ) -> Result<(Vec<String>, Option<PathBuf>), String> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let (text, mut flags) = split_env(env);
+        if text.is_empty() {
+            return Ok((flags, None));
+        }
+        let path = self
+            .docker_config()?
+            .join(format!("env-{}", random_name()?));
+        let fail = |e: std::io::Error| format!("write {}: {e}", path.display());
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(fail)?;
+        if let Err(e) = file.write_all(text.as_bytes()) {
+            let _ = std::fs::remove_file(&path);
+            return Err(fail(e));
+        }
+        let mut with_file = vec!["--env-file".to_owned(), path.to_string_lossy().into_owned()];
+        with_file.append(&mut flags);
+        Ok((with_file, Some(path)))
+    }
 }
 
 fn path_text(path: &Path) -> String {
@@ -994,6 +1027,26 @@ pub(super) struct Exec {
     pub(super) env: BTreeMap<String, String>,
     /// It runs as the agent, not the runner user.
     pub(super) as_agent: bool,
+    /// The container's variables, for `--env-file`. Removed when the
+    /// process has ended.
+    pub(super) env_file: Option<PathBuf>,
+}
+
+impl Exec {
+    /// Removes the environment file.
+    pub(super) fn cleanup(&self) {
+        remove_env_file(self.env_file.as_deref());
+    }
+}
+
+/// Removes a container environment file. A file that is gone is fine.
+fn remove_env_file(path: Option<&Path>) {
+    if let Some(path) = path
+        && let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("remove {}: {e}", path.display());
+    }
 }
 
 #[cfg(test)]
@@ -1012,20 +1065,15 @@ mod tests {
     }
 
     #[test]
-    fn env_flags_keep_values_off_the_command_line() {
+    fn env_goes_in_a_file_unless_a_file_cannot_carry_it() {
         let env = BTreeMap::from([
             ("SECRET".to_owned(), "hunter2".to_owned()),
             ("PATH".to_owned(), "/x".to_owned()),
-            ("DOCKER_HOST".to_owned(), "h".to_owned()),
+            ("MULTI".to_owned(), "a\nb".to_owned()),
+            ("A B".to_owned(), "v".to_owned()),
         ]);
-        let (flags, cli) = env_flags(env);
-        assert_eq!(
-            flags,
-            ["-e", "DOCKER_HOST=h", "-e", "PATH=/x", "-e", "SECRET"]
-        );
-        assert_eq!(
-            cli,
-            BTreeMap::from([("SECRET".to_owned(), "hunter2".to_owned())])
-        );
+        let (file, flags) = split_env(env);
+        assert_eq!(file, "PATH=/x\nSECRET=hunter2\n");
+        assert_eq!(flags, ["-e", "A B=v", "-e", "MULTI=a\nb"]);
     }
 }

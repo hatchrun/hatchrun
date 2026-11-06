@@ -22,6 +22,12 @@ use hatchrun_workflow::{
 const FAKE: &str = r#"#!/bin/sh
 dir=$(dirname "$0")
 printf '%s\n' "$*" >> "$dir/calls.log"
+env >> "$dir/cli-env.log"
+prev=
+for a in "$@"; do
+  [ "$prev" = --env-file ] && { cat "$a" >> "$dir/envfile.log"; echo "$a" >> "$dir/envfile.paths"; }
+  prev=$a
+done
 case "$1" in
 network)
   [ "$2" = inspect ] && exit 1
@@ -113,6 +119,10 @@ impl Setup {
             .unwrap()
     }
 
+    fn read(&self, file: &str) -> String {
+        std::fs::read_to_string(self.path().join("bin").join(file)).unwrap_or_default()
+    }
+
     fn result(&self) -> JobResult {
         let text = std::fs::read_to_string(self.path().join("result.json")).unwrap();
         serde_json::from_str(&text).unwrap()
@@ -159,8 +169,7 @@ fn a_job_container_runs_steps_through_exec() {
     for want in [
         "--workdir /__w/repo/repo".to_owned(),
         "--network hatchrun_network_".to_owned(),
-        "-e CI".to_owned(),
-        "-e MODE".to_owned(),
+        "--env-file ".to_owned(),
         "-p 8080:80".to_owned(),
         "-v /data:/data".to_owned(),
         format!("-v {}:/__w", work.display()),
@@ -175,11 +184,19 @@ fn a_job_container_runs_steps_through_exec() {
 
     let exec = find(&calls, "exec --workdir");
     assert!(exec.contains("--workdir /__w/repo/repo"), "{exec}");
-    assert!(exec.contains("-e GITHUB_WORKSPACE"), "{exec}");
-    assert!(exec.contains("-e HOME=/github/home"), "{exec}");
+    let files = setup.read("envfile.log");
+    for want in [
+        "CI=true",
+        "MODE=acme/repo",
+        "GITHUB_WORKSPACE=/__w/repo/repo",
+        "HOME=/github/home",
+    ] {
+        assert!(files.lines().any(|l| l == want), "{want} not in\n{files}");
+    }
     // The image's environment file and the host's user are not the container's.
-    assert!(!exec.contains("JAVA_HOME"), "{exec}");
-    assert!(!exec.contains("-e USER"), "{exec}");
+    assert!(!files.contains("JAVA_HOME"), "{files}");
+    assert!(!files.lines().any(|l| l.starts_with("USER=")), "{files}");
+    assert!(!files.lines().any(|l| l.starts_with("PATH=")), "{files}");
     // Default shell: the container has bash.
     assert!(exec.contains(" bash -e /__w/_temp/"), "{exec}");
     assert!(
@@ -234,7 +251,7 @@ fn services_get_aliases_ports_and_a_health_wait() {
     let create = find(&calls, "create --name hatchrun_db_");
     for want in [
         "--network-alias db",
-        "-e POSTGRES_PASSWORD",
+        "--env-file ",
         "-p 5432",
         "--health-cmd pg_isready",
         "postgres:17",
@@ -242,6 +259,12 @@ fn services_get_aliases_ports_and_a_health_wait() {
         assert!(create.contains(want), "{want} not in {create}");
     }
     assert!(!create.contains("=pw"), "{create}");
+    assert!(
+        setup
+            .read("envfile.log")
+            .lines()
+            .any(|l| l == "POSTGRES_PASSWORD=pw")
+    );
     // No job container: steps run on the machine, not through exec.
     assert!(!calls.iter().any(|c| c.starts_with("exec ")), "{calls:#?}");
     assert_eq!(setup.result().outputs["port"], "49153");
@@ -347,9 +370,7 @@ fn uses_docker_runs_the_image_with_the_runners_mounts() {
     let run = find(&calls, "run --rm");
     for want in [
         "--workdir /github/workspace",
-        "-e GITHUB_WORKSPACE",
-        "-e INPUT_WHO",
-        "-e HOME=/github/home",
+        "--env-file ",
         ":/github/workspace",
         ":/github/file_commands",
         ":/github/workflow",
@@ -360,10 +381,16 @@ fn uses_docker_runs_the_image_with_the_runners_mounts() {
     }
     assert!(!run.contains("--network"), "{run}");
     // The host's environment file and PATH stay out of the container.
-    assert!(
-        !run.contains("JAVA_HOME") && !run.contains("-e PATH"),
-        "{run}"
-    );
+    let files = setup.read("envfile.log");
+    for want in [
+        "GITHUB_WORKSPACE=/github/workspace",
+        "INPUT_WHO=x",
+        "HOME=/github/home",
+    ] {
+        assert!(files.lines().any(|l| l == want), "{want} not in\n{files}");
+    }
+    assert!(!files.contains("JAVA_HOME"), "{files}");
+    assert!(!files.lines().any(|l| l.starts_with("PATH=")), "{files}");
     assert!(stdout(&out).contains("RUN run --rm"), "{}", stdout(&out));
 }
 
@@ -405,7 +432,12 @@ runs:
     assert_eq!(runs.len(), 3, "{calls:#?}");
     assert!(runs[0].contains("--entrypoint /pre.sh") && !runs[0].contains("hello"));
     assert!(runs[1].contains("--entrypoint /main.sh") && runs[1].ends_with("hello world"));
-    assert!(runs[1].contains("-e FROM_ACTION"));
+    assert!(
+        setup
+            .read("envfile.log")
+            .lines()
+            .any(|l| l == "FROM_ACTION=yes")
+    );
     assert!(runs[2].contains("--entrypoint /post.sh") && !runs[2].contains("hello"));
     // The job has a service, so the action joins its network.
     assert!(runs[1].contains("--network hatchrun_network_"));
@@ -519,7 +551,11 @@ fn a_timeout_during_a_pull_stops_it_and_cleans_up() {
     // A job that ran out of time is a failure; no step ran.
     assert_eq!(setup.result().conclusion, Conclusion::Failure);
     assert_eq!(setup.result().steps[0].outcome, Conclusion::Skipped);
-    assert!(setup.calls().iter().any(|c| c.starts_with("network rm")));
+    // A network made before the timeout is removed.
+    let calls = setup.calls();
+    let made = calls.iter().any(|c| c.starts_with("network create"));
+    let removed = calls.iter().any(|c| c.starts_with("network rm"));
+    assert_eq!(made, removed, "{calls:#?}");
 }
 
 #[test]
@@ -533,5 +569,67 @@ fn the_job_context_keeps_the_machines_paths_for_host_side_expansion() {
     assert!(
         ws.ends_with("work/repo/repo") && !ws.starts_with("/__w"),
         "{ws}"
+    );
+}
+
+#[test]
+fn workflow_values_reach_the_container_by_env_file_never_the_docker_client() {
+    let setup = Setup::new();
+    let mut step = make::run("true");
+    step.env = BTreeMap::from([
+        ("LD_PRELOAD".to_owned(), "/tmp/evil.so".to_owned()),
+        ("SSL_CERT_FILE".to_owned(), "/tmp/ca".to_owned()),
+        ("MULTI".to_owned(), "line1\nline2".to_owned()),
+    ]);
+    let mut doc = make::document(vec![PlannedStep::Run(step)]);
+    doc.job.container = Some(Container {
+        env: BTreeMap::from([("SVC_SECRET".to_owned(), "topsecret".to_owned())]),
+        ..image("node:20")
+    });
+    doc.job.services = BTreeMap::from([(
+        "db".to_owned(),
+        Container {
+            env: BTreeMap::from([("HTTPS_PROXY".to_owned(), "http://p".to_owned())]),
+            ..image("postgres")
+        },
+    )]);
+    let out = setup.run(&doc);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    // The docker client's environment never held a workflow value.
+    let cli = setup.read("cli-env.log");
+    for name in [
+        "LD_PRELOAD",
+        "SSL_CERT_FILE",
+        "MULTI",
+        "SVC_SECRET",
+        "HTTPS_PROXY",
+    ] {
+        assert!(
+            !cli.contains(name),
+            "{name} reached the docker client:\n{cli}"
+        );
+    }
+    // They went in env files, which are gone afterwards.
+    let files = setup.read("envfile.log");
+    for want in [
+        "LD_PRELOAD=/tmp/evil.so",
+        "SSL_CERT_FILE=/tmp/ca",
+        "SVC_SECRET=topsecret",
+        "HTTPS_PROXY=http://p",
+    ] {
+        assert!(files.lines().any(|l| l == want), "{want} not in\n{files}");
+    }
+    assert!(!files.contains("MULTI"), "{files}");
+    for path in setup.read("envfile.paths").lines() {
+        assert!(!Path::new(path).exists(), "{path} was left behind");
+    }
+    // A value an env file cannot carry is a flag, and no secret is on a
+    // create line.
+    let calls = setup.calls().join("\n");
+    assert!(calls.contains("-e MULTI=line1"), "{calls}");
+    assert!(
+        !calls.contains("topsecret") && !calls.contains("evil.so"),
+        "{calls}"
     );
 }

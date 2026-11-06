@@ -741,6 +741,7 @@ impl Job<'_> {
                 sink,
             )
             .await;
+        exec.cleanup();
         // The script may hold secrets. Nothing needs it after the run.
         remove_script(&prepared.script);
         (common, ran.outcome, ran.outputs)
