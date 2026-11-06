@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { ApiError, getSession, getTenant, type Session, type Tenant } from "./api";
 import { Shell } from "./components/Shell";
 import { Await } from "./components/Status";
+import { recents } from "./lib/storage";
 import { useLoad } from "./load";
 import { Billing } from "./pages/Billing";
 import { CiRun } from "./pages/CiRun";
@@ -84,8 +85,10 @@ export function App() {
   if (route) {
     return <OrgRoute session={session} route={route} />;
   }
+  // The profile page keeps the bar of the organization visited last.
+  const lastOrg = path === "/profile" ? (recents("orgs")[0] ?? null) : null;
   return (
-    <Shell user={session.user}>
+    <Shell user={session.user} org={lastOrg ? { login: lastOrg, role: null } : null}>
       <div className="mx-auto w-full max-w-[1080px] pt-3">
         {path === "/new" ? <Home stay /> : path === "/" ? <Home /> : path === "/profile" ? <Profile user={session.user} /> : <NotFound />}
       </div>
@@ -142,7 +145,6 @@ function OrgPage({ session, tenant, route }: { session: Session; tenant: Tenant;
       return <Kit {...props} />;
     case "setup":
       return <Setup {...props} />;
-    case "settings":
     case "billing":
       return <Billing {...props} />;
     case "run":

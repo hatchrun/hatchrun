@@ -134,7 +134,9 @@ export function invoicesOf(org: string) {
   return Array.from({ length: 12 }, (_, n) => {
     const date = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - n, 1);
     const id = `ord_${(small(seed, n) >>> 0).toString(36).padStart(7, "0")}`;
-    return { id, date: new Date(date).toISOString(), amount_cents: Math.round((org === SCALE_ORG ? 38_000 : 1_400) * (0.7 + (small(seed, 40 + n) % 60) / 100)), status: n === 4 ? "refunded" : "paid", url: n === 0 ? null : `https://polar.sh/mock/orders/${id}` };
+    // This month's order is not paid yet and equals the month-to-date spend.
+    const amount = n === 0 ? dailySpend(org).reduce((sum, d) => sum + d.cents, 0) : Math.round((org === SCALE_ORG ? 38_000 : 1_400) * (0.7 + (small(seed, 40 + n) % 60) / 100));
+    return { id, date: new Date(date).toISOString(), amount_cents: amount, status: n === 0 ? "pending" : n === 4 ? "refunded" : "paid", url: n === 0 ? null : `https://polar.sh/mock/orders/${id}` };
   });
 }
 

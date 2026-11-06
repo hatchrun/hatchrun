@@ -155,6 +155,38 @@
   }
 }
 
+/*
+ * The same 2px accent ring for every control. Unlayered, so it also wins over
+ * the `outline-none` that buttons and menus carry in their utility classes.
+ */
+a:focus-visible,
+button:focus-visible,
+summary:focus-visible,
+[role="tab"]:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+/* The skip link: off screen until it takes focus. */
+.skip-link {
+  position: fixed;
+  top: 8px;
+  left: 8px;
+  z-index: 100;
+  transform: translateY(-200%);
+  padding: 8px 12px;
+  border-radius: 3px;
+  background: var(--raised);
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+  border: 1px solid var(--control);
+}
+.skip-link:focus {
+  transform: none;
+}
+
 /* A mono label: column heads, panel labels. 12px, 0.04em. */
 @utility cap {
   font-family: var(--font-mono);

@@ -7,23 +7,21 @@ import {
   Check,
   ChevronRight,
   CircleHelp,
-  Copy,
   ExternalLink,
   Keyboard,
   LogOut,
   UserRound,
   Sparkles,
-  Terminal,
 } from "lucide-react";
 import { DropdownMenu as Menu } from "radix-ui";
 import { useState, type ReactNode } from "react";
 
 import { ApiError, signOut, type User } from "@/api";
+import { Avatar } from "@/components/Avatar";
+import { shortcut } from "@/lib/platform";
 import { THEMES, setTheme, useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 import { Link } from "@/router";
-
-export const CLI_INSTALL = "brew install hatchrun/tap/hatchrun";
 
 const ITEM =
   "flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-sm px-2.5 text-sm text-fg outline-none select-none data-[highlighted]:bg-raised";
@@ -68,14 +66,8 @@ export function ProfileMenu({
 }) {
   const theme = useTheme();
   const [busy, setBusy] = useState(false);
-  const [copied, setCopied] = useState(false);
   const name = user.name ?? user.login;
-  const initial = (name.charAt(0) || "?").toUpperCase();
-  const avatar = user.avatarUrl ? (
-    <img src={user.avatarUrl} alt="" className="size-full rounded-[inherit]" />
-  ) : (
-    initial
-  );
+  const avatar = <Avatar src={user.avatarUrl} name={name} />;
 
   const leave = async () => {
     setBusy(true);
@@ -89,12 +81,6 @@ export function ProfileMenu({
       }
     }
     window.location.assign("/signin");
-  };
-  const copy = () => {
-    void navigator.clipboard?.writeText(CLI_INSTALL).then(() => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    }, () => undefined);
   };
   const icon = { size: 16, "aria-hidden": true } as const;
 
@@ -174,28 +160,11 @@ export function ProfileMenu({
           <Menu.Group className={GROUP}>
             {org && (
               <Menu.Item className={ITEM} onSelect={onSwitchOrg}>
-                <Row icon={<ArrowLeftRight {...icon} />} hint={org} trailing={<Kbd>⌘O</Kbd>}>
+                <Row icon={<ArrowLeftRight {...icon} />} hint={org} trailing={<Kbd>{shortcut("O")}</Kbd>}>
                   Switch organization
                 </Row>
               </Menu.Item>
             )}
-            <div className="px-2.5 pt-1 pb-1.5">
-              <Menu.Item
-                className="flex h-9 cursor-pointer items-center gap-2 rounded-sm border border-control bg-background pl-2.5 outline-none data-[highlighted]:border-fg-3"
-                onSelect={(event) => {
-                  event.preventDefault();
-                  copy();
-                }}
-                aria-label={copied ? "Copied" : "Copy install command"}
-              >
-                <Terminal size={14} aria-hidden="true" className="shrink-0 text-fg-3" />
-                <span className="min-w-0 flex-1 truncate font-mono text-[13px] text-fg-2" title={CLI_INSTALL}>
-                  {CLI_INSTALL}
-                </span>
-                <span className="p-2 text-fg-3">{copied ? <Check size={14} className="text-passed" /> : <Copy size={14} />}</span>
-              </Menu.Item>
-              <div className="meta px-0.5 pt-1">Install the CLI</div>
-            </div>
           </Menu.Group>
 
           <Menu.Group className={GROUP}>

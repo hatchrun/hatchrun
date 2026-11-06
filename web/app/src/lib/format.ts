@@ -79,3 +79,44 @@ export const shortSha = (sha: string) => sha.slice(0, 7);
 
 /** refs/heads/main -> main. */
 export const shortRef = (ref: string) => ref.replace(/^refs\/(heads|tags)\//, "");
+
+const pad = (n: number) => String(n).padStart(2, "0");
+
+/** 2026-11-03 for a Unix ms time, in the viewer's time zone. */
+export function isoDate(ms: number): string {
+  const date = new Date(ms);
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** 2026-11-03 14:05, the absolute form for a hover title. */
+export function isoDateTime(ms: number): string {
+  const date = new Date(ms);
+  return `${isoDate(ms)} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+const WEEK = 7 * 86_400_000;
+
+/**
+ * The one date format of the tables: relative ("4 min ago", "3 d ago")
+ * under 7 days, else the ISO-like date "2026-11-03". Put `isoDateTime(ms)`
+ * in the title for the absolute time on hover.
+ */
+export function tableDate(ms: number, now = Date.now()): string {
+  const age = now - ms;
+  if (age >= WEEK) {
+    return isoDate(ms);
+  }
+  const seconds = Math.max(0, Math.round(age / 1000));
+  if (seconds < 60) {
+    return "just now";
+  }
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes} min ago`;
+  }
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) {
+    return `${hours} h ago`;
+  }
+  return `${Math.floor(hours / 24)} d ago`;
+}

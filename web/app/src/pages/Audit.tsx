@@ -10,9 +10,10 @@ import { useState } from "react";
 import { listAudit, type AuditAction } from "@/api";
 import { CursorPager, useCursors } from "@/components/CursorPager";
 import { Page } from "@/components/Page";
+import { SettingsNav } from "@/components/SettingsNav";
 import { Await } from "@/components/Status";
 import { Truncate } from "@/components/Truncate";
-import { ago } from "@/lib/format";
+import { isoDateTime, tableDate } from "@/lib/format";
 import { useDebounced } from "@/lib/useRepos";
 import { cn } from "@/lib/utils";
 import { useLoad } from "@/load";
@@ -39,7 +40,7 @@ export function Audit({ org, tenant }: OrgPageProps) {
 
   if (tenant.role !== "admin") {
     return (
-      <Page title="Audit log">
+      <Page title="Audit log" nav={<SettingsNav org={org} current="audit" admin={false} />}>
         <p className="meta rounded-sm border border-control px-4 py-6">Only organization admins can read the audit log.</p>
       </Page>
     );
@@ -48,9 +49,10 @@ export function Audit({ org, tenant }: OrgPageProps) {
   return (
     <Page
       title="Audit log"
+      nav={<SettingsNav org={org} current="audit" admin />}
       meta={
         <Link href={orgUrl(org, "secrets")} className="text-fg-2 quiet-underline hover:text-fg">
-          ← Secrets
+          Secrets →
         </Link>
       }
       actions={
@@ -63,7 +65,7 @@ export function Audit({ org, tenant }: OrgPageProps) {
               setRepo(event.target.value);
               cursors.reset();
             }}
-            placeholder="Filter by owner/repo"
+            placeholder="Search repositories"
             autoComplete="off"
             spellCheck={false}
             className={cn(FIELD, "!h-8 !w-[240px]")}
@@ -78,33 +80,36 @@ export function Audit({ org, tenant }: OrgPageProps) {
               <p className="meta rounded-sm border border-control px-4 py-6">{filter ? "No entries for that repository." : "Nothing has changed yet."}</p>
             ) : (
               <div className="overflow-x-auto rounded-sm border border-control">
-                <table className="w-full min-w-[760px] border-collapse text-sm">
+                <table className="w-full min-w-[640px] border-collapse text-sm">
                   <thead>
                     <tr>
-                      <th className={TH}>When</th>
-                      <th className={TH}>Actor</th>
                       <th className={TH}>Action</th>
-                      <th className={TH}>Scope</th>
                       <th className={TH}>Target</th>
+                      <th className={TH}>Actor</th>
+                      <th className={TH}>Time</th>
                     </tr>
                   </thead>
                   <tbody>
                     {data.items.map((entry) => (
                       <tr key={entry.id} className="border-t border-rule hover:bg-panel">
-                        <td className={cn(TD, "font-mono text-[13px] text-fg-2")} title={new Date(entry.at).toLocaleString()}>
-                          {ago(entry.at)}
+                        <td className={cn(TD, "font-mono text-[13px]", entry.action.endsWith(".delete") ? "text-failed-soft" : "text-fg")} title={entry.action}>
+                          {WORDS[entry.action] ?? entry.action}
+                        </td>
+                        <td className={cn(TD, "max-w-[420px] font-mono text-[13px]")}>
+                          <span className="inline-flex max-w-full items-baseline gap-2">
+                            <Truncate value={entry.target} mono className="font-bold" />
+                            {entry.scope !== "org" && entry.scope !== org && (
+                              <span className="min-w-0 truncate text-fg-3" title={entry.scope}>
+                                in {entry.scope}
+                              </span>
+                            )}
+                          </span>
                         </td>
                         <td className={cn(TD, "max-w-[160px] font-mono text-[13px]")}>
                           <Truncate value={entry.actor} mono />
                         </td>
-                        <td className={cn(TD, "font-mono text-[13px]", entry.action.endsWith(".delete") ? "text-failed-soft" : "text-fg")} title={entry.action}>
-                          {WORDS[entry.action] ?? entry.action}
-                        </td>
-                        <td className={cn(TD, "max-w-[280px] font-mono text-[13px] text-fg-2")}>
-                          <Truncate value={entry.scope} mono />
-                        </td>
-                        <td className={cn(TD, "max-w-[260px] font-mono text-[13px]")}>
-                          <Truncate value={entry.target} mono />
+                        <td className={cn(TD, "font-mono text-[13px] text-fg-2")} title={isoDateTime(entry.at)}>
+                          {tableDate(entry.at)}
                         </td>
                       </tr>
                     ))}

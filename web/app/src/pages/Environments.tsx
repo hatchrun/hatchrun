@@ -12,10 +12,11 @@ import { useEffect, useRef, useState } from "react";
 import { deleteCiEnvironment, listOrgEnvironments, putCiEnvironment, type CiOrgEnvironment } from "@/api";
 import { CursorPager, useCursors } from "@/components/CursorPager";
 import { Page } from "@/components/Page";
+import { SidePanel, useRoomForPanel } from "@/components/SidePanel";
 import { RepoMultiSelect } from "@/components/RepoMultiSelect";
 import { Await } from "@/components/Status";
 import { Truncate } from "@/components/Truncate";
-import { abbreviate, ago } from "@/lib/format";
+import { abbreviate, isoDateTime, tableDate } from "@/lib/format";
 import { useDebounced } from "@/lib/useRepos";
 import { orgUrl, repoUrl } from "@/lib/urls";
 import { cn } from "@/lib/utils";
@@ -50,6 +51,7 @@ export function Environments({ org }: OrgPageProps) {
   const cursors = useCursors();
   const [search, setSearch] = useState("");
   const q = useDebounced(search.trim(), 250);
+  const room = useRoomForPanel();
   const [panel, setPanel] = useState<{ edit: CiOrgEnvironment | null; id: number } | null>(null);
   const panelSeq = useRef(0);
   const openPanel = (edit: CiOrgEnvironment | null) => setPanel({ edit, id: (panelSeq.current += 1) });
@@ -157,7 +159,7 @@ export function Environments({ org }: OrgPageProps) {
         </p>
       )}
 
-      <div className={cn("grid items-start gap-4", panel ? "grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-1")}>
+      <div className={cn("grid items-start gap-4", panel && room ? "grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-1")}>
         <section aria-label="Environments list" className="flex min-w-0 flex-col gap-3">
           <Await loaded={rows} retry={reload}>
             {(page) => (
@@ -205,17 +207,25 @@ export function Environments({ org }: OrgPageProps) {
                                 {row.approval ? "required" : "not required"}
                               </td>
                               <td className={cn(TD, "text-right font-mono text-[13px]")}>
-                                <Link href={secretsHref} className="underline decoration-control underline-offset-3 hover:decoration-fg-3">
-                                  {abbreviate(row.secrets)}
-                                </Link>
+                                {row.secrets === 0 ? (
+                                  "0"
+                                ) : (
+                                  <Link href={secretsHref} className="underline decoration-control underline-offset-3 hover:decoration-fg-3">
+                                    {abbreviate(row.secrets)}
+                                  </Link>
+                                )}
                               </td>
                               <td className={cn(TD, "text-right font-mono text-[13px]")}>
-                                <Link href={`${secretsHref}&kind=vars`} className="underline decoration-control underline-offset-3 hover:decoration-fg-3">
-                                  {abbreviate(row.vars)}
-                                </Link>
+                                {row.vars === 0 ? (
+                                  "0"
+                                ) : (
+                                  <Link href={`${secretsHref}&kind=vars`} className="underline decoration-control underline-offset-3 hover:decoration-fg-3">
+                                    {abbreviate(row.vars)}
+                                  </Link>
+                                )}
                               </td>
-                              <td className={cn(TD, "font-mono text-[13px] text-fg-2")} title={new Date(row.updatedAt).toLocaleString()}>
-                                {ago(row.updatedAt)}
+                              <td className={cn(TD, "font-mono text-[13px] text-fg-2")} title={isoDateTime(row.updatedAt)}>
+                                {tableDate(row.updatedAt)}
                               </td>
                               <td className={cn(TD, "text-right")}>
                                 {confirming === id ? (
@@ -263,6 +273,7 @@ export function Environments({ org }: OrgPageProps) {
         </section>
 
         {panel && (
+          <SidePanel inline={room} labelledBy="env-title" onClose={() => setPanel(null)}>
           <EnvPanel
             key={`${panel.id}/${panel.edit ? `${panel.edit.repository}/${panel.edit.name}` : "new"}`}
             org={org}
@@ -276,6 +287,7 @@ export function Environments({ org }: OrgPageProps) {
               reload();
             }}
           />
+          </SidePanel>
         )}
       </div>
 
