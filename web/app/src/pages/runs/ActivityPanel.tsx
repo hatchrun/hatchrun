@@ -103,7 +103,7 @@ function Concurrency({ concurrency }: { concurrency: Activity["concurrency"] }) 
   const parts = [
     { key: "running", label: "running", n: running, className: "bg-fg-3" },
     { key: "free", label: "free", n: free, className: "border border-control bg-transparent" },
-    { key: "queued", label: "queued", n: queued, className: "bg-rule" },
+    { key: "queued", label: "queued", n: queued, className: "border border-dashed border-fg-3 bg-transparent" },
   ];
   return (
     <div className="flex min-w-[320px] flex-[1_1_380px] flex-col gap-3 px-4.5 py-4">
@@ -180,7 +180,7 @@ function Chart({ data, look, range, onRange }: { data: Activity; look: (typeof R
             <span key={bucket.at} title={`${stamp(bucket.at)}: ${bucket.started} started, ${bucket.passed} passed, ${bucket.failed} failed`} className="flex min-h-px flex-1 flex-col justify-end">
               <span className="bg-failed" style={{ height: px(bucket.failed) }} />
               <span className="min-h-px bg-control" style={{ height: px(bucket.passed), minHeight: bucket.passed > 0 ? 1 : 0 }} />
-              <span className="bg-rule" style={{ height: px(Math.max(0, bucket.started - bucket.passed - bucket.failed)) }} />
+              <span className="bg-fg-3" style={{ height: px(Math.max(0, bucket.started - bucket.passed - bucket.failed)) }} />
             </span>
           ))}
         </div>

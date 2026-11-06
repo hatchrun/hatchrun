@@ -244,7 +244,7 @@ function JobRow({
       aria-current={current ? "true" : undefined}
       title={`${job.name}, ${needsTitle(job)}`}
       style={{ paddingLeft: indent(level, nested) }}
-      className={cn("group flex items-center gap-2 border-l-2 py-1.5 pr-3 hover:bg-raised", current ? "selected-item" : "border-l-transparent")}
+      className={cn("group flex items-center gap-2 border-l-2 py-1.5 pr-3 hover:bg-raised", current ? "selected-item border-l-transparent" : "border-l-transparent")}
     >
       {level > 0 && (
         <span aria-hidden="true" className="-mr-1 font-mono text-[13px] text-fg-3">

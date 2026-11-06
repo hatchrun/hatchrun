@@ -493,7 +493,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
             target?.line === line && "bg-brand/15 shadow-[inset_2px_0_0_var(--brand)]",
           )}
         >
-          <span aria-hidden="true" className="sticky left-0 w-[68px] shrink-0 bg-inherit pr-3 text-right text-queued tabular-nums select-none">
+          <span aria-hidden="true" className="sticky left-0 w-[68px] shrink-0 bg-inherit pr-3 text-right text-fg-3 tabular-nums select-none">
             {line + 1}
           </span>
           {times && stamp !== null && <span className="mr-3 shrink-0 text-fg-3 tabular-nums">{stamp}</span>}
@@ -613,7 +613,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
                     jump(error.line);
                   }}
                 >
-                  <span className="w-14 shrink-0 text-right text-queued tabular-nums">{error.line + 1}</span>
+                  <span className="w-14 shrink-0 text-right text-fg-3 tabular-nums">{error.line + 1}</span>
                   <span className="min-w-0 flex-1 truncate text-fg" title={errorText(error.text)}>
                     {errorText(error.text)}
                   </span>

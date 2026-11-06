@@ -28,8 +28,7 @@
    * Grounds: background < panel < raised; rule divides inside panels,
    * control borders inputs and buttons, and fills passed job squares and
    * passed chart bars.
-   * Text: fg, fg-2, fg-3. Nothing dimmer is used for text, except log
-   * line numbers in queued.
+   * Text: fg, fg-2, fg-3. Nothing dimmer is used for text.
    * brand is the accent. It marks four things only: the current tab, the
    * primary button, the focus ring and the selected list item. Links are
    * fg-2 with an underline; counts and badges are fg-3 on raised.
