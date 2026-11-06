@@ -40,6 +40,12 @@ const MAX_PARALLELISM: u32 = 64;
 /// The most entries one matrix can expand to.
 const MAX_MATRIX: usize = 256;
 
+/// Contexts a job's `environment` name may read: those the control plane
+/// has when the job is ready to start.
+const ENVIRONMENT_CONTEXTS: &[&str] = &[
+    "hatchrun", "github", "inputs", "matrix", "needs", "strategy",
+];
+
 /// The most combinations a matrix with `exclude` may have before the
 /// excluded ones are taken out. Each is checked against every `exclude`
 /// entry.
@@ -114,8 +120,24 @@ pub struct Plan {
     /// The workflow's `concurrency`, unevaluated: the host reads it
     /// against the event when the run is about to start.
     pub concurrency: Option<Concurrency>,
+    /// The workflow's `run-name`, unevaluated: the host reads it against
+    /// the event when the run is made.
+    pub run_name: Option<String>,
     /// The jobs. Every job comes after the jobs it requires.
     pub jobs: Vec<PlannedJob>,
+}
+
+/// The title a workflow's `run-name` gives a run: the template evaluated
+/// against `ctx`, an object whose keys are context names (`github`,
+/// `inputs`, `vars`, `hatchrun`). Only the first line is kept, trimmed.
+///
+/// # Errors
+///
+/// The reason an expression in the template failed.
+pub fn run_title(template: &str, ctx: &Value) -> Result<String, String> {
+    let text = expr::interpolate(template, ctx, &crate::concurrency::Plain)
+        .map_err(|e| format!("run-name: {e}"))?;
+    Ok(text.lines().next().unwrap_or_default().trim().to_owned())
 }
 
 /// One job of a plan: one matrix entry and one parallel node of a
@@ -164,8 +186,13 @@ pub struct PlannedJob {
     /// `permissions:`, else its workflow's, else the read default.
     pub token_permissions: BTreeMap<String, Level>,
     /// The environment the job deploys to, after parameter substitution.
-    /// `None` for approval jobs and jobs without one.
+    /// `None` for approval jobs and jobs without one. A name that reads
+    /// `matrix`, `needs`, `inputs` or `github` is still an expression,
+    /// which the host evaluates when the job is ready to start.
     pub environment: Option<String>,
+    /// The environment's URL, parameters substituted, evaluated by the
+    /// agent when the job ends.
+    pub environment_url: Option<String>,
     /// The job's `concurrency`, parameters substituted, the rest left
     /// for the host to evaluate when the job is about to start.
     pub concurrency: Option<Concurrency>,
@@ -549,6 +576,7 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
         if let Some(c) = &job.concurrency {
             check.concurrency(c, JOB_CONTEXTS);
         }
+        check.environment(job);
         check.steps(&job.steps);
     }
     for (name, command) in &config.commands {
@@ -563,15 +591,18 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
         .steps(&command.steps);
     }
     for (workflow, wf) in &config.workflows {
+        let owner = format!("workflow `{workflow}`");
+        let mut check = Check {
+            config,
+            owner: &owner,
+            params: None,
+            errors,
+        };
+        if let Some(text) = &wf.run_name {
+            check.run_name(text);
+        }
         if let Some(c) = &wf.concurrency {
-            let owner = format!("workflow `{workflow}`");
-            Check {
-                config,
-                owner: &owner,
-                params: None,
-                errors,
-            }
-            .concurrency(c, WORKFLOW_CONTEXTS);
+            check.concurrency(c, WORKFLOW_CONTEXTS);
         }
         for entry in &wf.jobs {
             let id = entry.name.as_deref().unwrap_or(&entry.job);
@@ -733,21 +764,56 @@ impl Check<'_> {
                     self.owner
                 )));
             }
-            let Ok(found) = expr::expressions(text) else {
+            self.allowed(&label, text, allowed);
+        }
+    }
+
+    /// Checks a job's `environment` and `environment-url`: the name reads
+    /// only what the host has when the job starts, and a URL needs a name.
+    fn environment(&mut self, job: &Job) {
+        if let Some(name) = &job.environment {
+            self.text(&"`environment`", name);
+            self.allowed("`environment`", name, ENVIRONMENT_CONTEXTS);
+        }
+        if let Some(url) = &job.environment_url {
+            self.text(&"`environment-url`", url);
+            if job.environment.is_none() {
+                self.errors.push(Diagnostic::new(format!(
+                    "{} has `environment-url` but no `environment`",
+                    self.owner
+                )));
+            }
+        }
+    }
+
+    /// Checks a workflow's `run-name`, which is evaluated when the run is
+    /// made and reads no parameters.
+    fn run_name(&mut self, text: &str) {
+        if self.text(&"`run-name`", text) {
+            self.errors.push(Diagnostic::new(format!(
+                "{} `run-name` reads `parameters`, which it cannot here",
+                self.owner
+            )));
+        }
+        self.allowed("`run-name`", text, WORKFLOW_CONTEXTS);
+    }
+
+    /// Reports each context a template reads that is not in `allowed`.
+    fn allowed(&mut self, label: &str, text: &str, allowed: &[&str]) {
+        let Ok(found) = expr::expressions(text) else {
+            return;
+        };
+        for (_, inner) in found {
+            if parameter_name(inner).is_some() {
                 continue;
-            };
-            for (_, inner) in found {
-                if parameter_name(inner).is_some() {
-                    continue;
-                }
-                for (name, _) in expr::contexts(inner).unwrap_or_default() {
-                    if !allowed.contains(&name.as_ref()) && name != "parameters" {
-                        self.errors.push(Diagnostic::new(format!(
-                            "{} {label} reads `{name}`; it can read only {}",
-                            self.owner,
-                            allowed.join(", ")
-                        )));
-                    }
+            }
+            for (name, _) in expr::contexts(inner).unwrap_or_default() {
+                if !allowed.contains(&name.as_ref()) && name != "parameters" {
+                    self.errors.push(Diagnostic::new(format!(
+                        "{} {label} reads `{name}`; it can read only {}",
+                        self.owner,
+                        allowed.join(", ")
+                    )));
                 }
             }
         }
@@ -1032,6 +1098,7 @@ fn compile_workflow(
     Some(Plan {
         workflow: name.to_owned(),
         concurrency: wf.concurrency.clone(),
+        run_name: wf.run_name.clone(),
         jobs,
     })
 }
@@ -1881,6 +1948,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         outputs: BTreeMap::new(),
         token_permissions: BTreeMap::new(),
         environment: None,
+        environment_url: None,
         concurrency: None,
         steps: Vec::new(),
     }]
@@ -2064,16 +2132,15 @@ fn expand_job(
         },
     });
     let environment = sub.opt(job.environment.as_deref());
-    if let Some(name) = &environment {
-        if name.contains("${{") {
-            errors.push(Diagnostic::new(format!(
-                "{owner}: `environment` can use only parameters; found `{name}`"
-            )));
-        } else if let Err(rule) = valid_environment_name(name) {
-            errors.push(Diagnostic::new(format!(
-                "{owner}: `environment` `{name}`: {rule}"
-            )));
-        }
+    let environment_url = sub.opt(job.environment_url.as_deref());
+    // A name that still holds an expression is checked when it is
+    // evaluated, as the job starts.
+    if let Some(name) = environment.as_ref().filter(|n| !n.contains("${{"))
+        && let Err(rule) = valid_environment_name(name)
+    {
+        errors.push(Diagnostic::new(format!(
+            "{owner}: `environment` `{name}`: {rule}"
+        )));
     }
     if errors.len() > before || walk.budget.spent {
         return None;
@@ -2094,6 +2161,7 @@ fn expand_job(
         outputs,
         token_permissions: token_scopes(job.permissions.as_ref()),
         environment,
+        environment_url,
         concurrency,
         steps,
     })

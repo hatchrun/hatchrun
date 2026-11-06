@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
-use hatchrun_workflow::{Diagnostic, Event, JobKind, Plan};
+use hatchrun_workflow::{Diagnostic, Event, JobKind, Plan, run_title};
 use serde_json::Value;
 use worker::{Env, Method, RequestInit, Result};
 
@@ -19,7 +19,7 @@ use crate::env::{Settings, run_stub};
 use crate::github::{self, CONFIG_PATH, CheckRun, GhAnnotation, Output};
 use crate::intake::{PullRequest, Repo};
 use crate::planning::{self, Failed, Selected};
-use crate::run::{RunInfo, Start};
+use crate::run::{RunInfo, Start, github_context};
 use crate::store::{self, CiBilling, JobRow, NewJob, NewRun, RunRow};
 
 /// The name of the check run that reports an unusable config.
@@ -423,7 +423,7 @@ pub async fn create(
     }
     let mut ids = Vec::new();
     for plan in &plans {
-        ids.push(start_plan(env, db, req, plan, now).await?);
+        ids.push(start_plan(env, db, settings, req, plan, now).await?);
     }
     // The good workflows run first: a GitHub error on a failed
     // workflow's check run must not keep them from starting.
@@ -504,8 +504,9 @@ async fn report_once(
 /// The longest message a run keeps, in characters.
 const MAX_MESSAGE: usize = 200;
 
-/// What a run shows next to its number: the first line of the head
-/// commit's message of a push, or the title of a pull request.
+/// What a run shows next to its number: the workflow's `run-name` when
+/// it has one, else the first line of the head commit's message of a
+/// push, or the title of a pull request.
 fn run_message(event_name: &str, event: &Value) -> Option<String> {
     let text = match event_name {
         "push" => event.pointer("/head_commit/message"),
@@ -530,8 +531,60 @@ fn pull_number(req: &Request<'_>) -> Option<u64> {
         .ok()
 }
 
+/// The title `plan`'s `run-name` gives the run, cut to [`MAX_MESSAGE`]
+/// characters. The run has no id yet, and `run-name` reads neither its
+/// id nor its number. A template that fails to evaluate, or gives
+/// nothing, leaves the run with its usual message.
+fn title_of(
+    req: &Request<'_>,
+    plan: &Plan,
+    api: &str,
+    vars: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<String>, String> {
+    let Some(template) = plan.run_name.as_deref() else {
+        return Ok(None);
+    };
+    let info = RunInfo {
+        run_id: 0,
+        run_number: 0,
+        run_attempt: 1,
+        tenant_id: req.tenant_id.to_owned(),
+        retention_days: 0,
+        installation_id: req.installation_id,
+        repo: req.repo.clone(),
+        workflow: plan.workflow.clone(),
+        event_name: req.event_name.to_owned(),
+        git_ref: req.git_ref.to_owned(),
+        sha: req.sha.to_owned(),
+        actor: req.actor.to_owned(),
+        head_ref: req.head_ref.to_owned(),
+        base_ref: req.base_ref.to_owned(),
+        concurrency: None,
+        title: None,
+    };
+    let ctx = crate::concurrency::context(&github_context(&info, req.event, api), vars);
+    let title = run_title(template, &ctx)?;
+    Ok((!title.is_empty()).then(|| title.chars().take(MAX_MESSAGE).collect()))
+}
+
 /// Records the run of `plan`, with its jobs, and has its object start.
-async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64) -> Result<u64> {
+async fn start_plan(
+    env: &Env,
+    db: &Db,
+    settings: &Settings,
+    req: &Request<'_>,
+    plan: &Plan,
+    now: u64,
+) -> Result<u64> {
+    let title = if plan.run_name.is_some() {
+        let vars = store::job_vars(db, req.tenant_id, req.repo.id, None).await?;
+        title_of(req, plan, &settings.github_api, &vars).unwrap_or_else(|err| {
+            worker::console_error!("{}: workflow {}: {err}", req.repo.full_name, plan.workflow);
+            None
+        })
+    } else {
+        None
+    };
     let new = NewRun {
         tenant_id: req.tenant_id.to_owned(),
         repo_id: req.repo.id,
@@ -542,7 +595,9 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
         sha: req.sha.to_owned(),
         actor: req.actor.to_owned(),
         base_ref: (req.event_name == "pull_request").then(|| req.base_ref.to_owned()),
-        message: run_message(req.event_name, req.event),
+        message: title
+            .clone()
+            .or_else(|| run_message(req.event_name, req.event)),
         pull_number: pull_number(req),
         head_ref: pull_number(req).map(|_| req.head_ref.to_owned()),
         now,
@@ -578,7 +633,9 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
                 },
                 token_permissions: job.token_permissions.clone(),
                 secret_refs: job.secret_refs(),
-                environment: job.environment.clone(),
+                // A name that is an expression is known when the job is
+                // queued, and the row is given it then.
+                environment: job.environment.clone().filter(|name| !name.contains("${{")),
                 strategy_group: job.strategy.as_ref().map(|s| s.group.clone()),
                 max_parallel: job.strategy.as_ref().and_then(|s| s.max_parallel),
                 needs: job.requires.clone(),
@@ -591,7 +648,7 @@ async fn start_plan(env: &Env, db: &Db, req: &Request<'_>, plan: &Plan, now: u64
         // finished and been purged, and a second start would run it again.
         return Ok(run.id);
     }
-    let start = start_body(req, &run, &rows, plan)?;
+    let start = start_body(req, &run, &rows, plan, title)?;
     post_start(env, run.id, &start).await?;
     Ok(run.id)
 }
@@ -604,7 +661,13 @@ pub fn unstarted(run: &RunRow, rows: &[JobRow]) -> bool {
 }
 
 /// The body of `POST /start`: each planned job with its row id.
-fn start_body(req: &Request<'_>, run: &RunRow, rows: &[JobRow], plan: &Plan) -> Result<Start> {
+fn start_body(
+    req: &Request<'_>,
+    run: &RunRow,
+    rows: &[JobRow],
+    plan: &Plan,
+    title: Option<String>,
+) -> Result<Start> {
     let jobs = plan
         .jobs
         .iter()
@@ -632,6 +695,7 @@ fn start_body(req: &Request<'_>, run: &RunRow, rows: &[JobRow], plan: &Plan) -> 
             head_ref: req.head_ref.to_owned(),
             base_ref: req.base_ref.to_owned(),
             concurrency: plan.concurrency.clone(),
+            title,
         },
         jobs,
         event: req.event.clone(),
@@ -654,7 +718,67 @@ async fn post_start(env: &Env, run_id: u64, start: &Start) -> Result<()> {
 mod tests {
     use hatchrun_cloud::http::Response as HttpResponse;
 
-    use super::run_message;
+    use super::{Request, run_message, title_of};
+    use crate::intake::Repo;
+
+    fn title(run_name: &str, event: &serde_json::Value) -> Result<Option<String>, String> {
+        let yaml = format!(
+            "jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}\nworkflows: {{ ci: {{ run-name: \"{run_name}\", on: {{ workflow_dispatch: {{}} }}, jobs: [t] }} }}\n"
+        );
+        let config = hatchrun_workflow::parse(&yaml).unwrap();
+        let plan = hatchrun_workflow::compile(&config, "ci", "refs/heads/main").unwrap();
+        let repo = Repo {
+            id: 4242,
+            full_name: "octo/widgets".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        let trigger = hatchrun_workflow::Event::Dispatch;
+        let req = Request {
+            tenant_id: "t",
+            installation_id: 7,
+            repo: &repo,
+            delivery: "d",
+            event_name: "workflow_dispatch",
+            event,
+            trigger: &trigger,
+            compile_ref: "refs/heads/main",
+            git_ref: "refs/heads/main",
+            sha: "abc",
+            actor: "octocat",
+            head_ref: "",
+            base_ref: "",
+            workflow: None,
+        };
+        let vars = std::collections::BTreeMap::from([("REGION".to_owned(), "eu".to_owned())]);
+        title_of(&req, &plan, "https://api.github.com", &vars)
+    }
+
+    fn titled(run_name: &str, event: &serde_json::Value) -> Option<String> {
+        title(run_name, event).unwrap()
+    }
+
+    #[test]
+    fn run_name_reads_github_inputs_and_vars() {
+        let event = serde_json::json!({ "inputs": { "target": "staging" } });
+        assert_eq!(
+            titled(
+                "Deploy ${{ inputs.target }} to ${{ vars.REGION }} by ${{ github.actor }}",
+                &event
+            )
+            .as_deref(),
+            Some("Deploy staging to eu by octocat")
+        );
+    }
+
+    #[test]
+    fn a_run_name_that_fails_or_comes_out_empty_gives_no_title() {
+        let event = serde_json::json!({});
+        assert!(title("${{ fromJSON('{') }}", &event).is_err());
+        assert_eq!(titled("${{ inputs.missing }}", &event), None);
+        let long = "x".repeat(300);
+        assert_eq!(titled(&long, &event).unwrap().chars().count(), 200);
+    }
 
     #[test]
     fn messages_are_the_first_line_cut_short() {

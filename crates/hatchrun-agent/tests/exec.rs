@@ -2225,6 +2225,49 @@ fn a_step_timeout_longer_than_the_grace_time_ends_cancelled() {
 }
 
 #[test]
+fn environment_url_is_evaluated_after_the_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut step = make::run("echo host=app-7.example.com >> \"$GITHUB_OUTPUT\"");
+    step.id = Some("up".to_owned());
+    let mut doc = make::document(vec![make::planned(step)]);
+    doc.job.environment = Some("preview".to_owned());
+    doc.job.environment_url = Some("https://${{ steps.up.outputs.host }}/".to_owned());
+    let out = exec_with(dir.path(), &json(&doc), &[]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}\n{}", stdout(&out));
+    assert_eq!(
+        result(dir.path()).environment_url.as_deref(),
+        Some("https://app-7.example.com/")
+    );
+}
+
+#[test]
+fn an_environment_url_that_is_not_a_link_or_a_failed_job_reports_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("true")]);
+    doc.job.environment_url = Some("javascript:alert(1)".to_owned());
+    let out = exec_with(dir.path(), &json(&doc), &[]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(stdout(&out).contains("is not an http or https link"));
+    assert_eq!(result(dir.path()).environment_url, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("exit 1")]);
+    doc.job.environment_url = Some("https://app.example.com".to_owned());
+    let out = exec_with(dir.path(), &json(&doc), &[]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(result(dir.path()).environment_url, None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("true")]);
+    doc.secrets.insert("K".to_owned(), "hunter2".to_owned());
+    doc.job.environment_url = Some("https://x.example.com/${{ secrets.K }}".to_owned());
+    let out = exec_with(dir.path(), &json(&doc), &[]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(!stdout(&out).contains("hunter2"));
+    assert_eq!(result(dir.path()).environment_url, None);
+}
+
+#[test]
 fn secret_never_printed() {
     let dir = tempfile::tempdir().unwrap();
     local_action(

@@ -196,6 +196,7 @@ pub async fn run_job(
         cache_saves: Vec::new(),
         cache_env: BTreeMap::new(),
         background: Background::default(),
+        environment_url: None,
     };
     job.start();
 
@@ -240,6 +241,7 @@ async fn finish(
     job.drain_background(sink);
     job.save_caches(sink).await;
     let outputs = job.job_outputs(sink);
+    job.evaluate_environment_url(sink);
     if let Some(proxy) = proxy {
         proxy.stop().await;
     }
@@ -408,6 +410,8 @@ struct Job<'a> {
     cache_env: BTreeMap<String, String>,
     /// Process groups that steps left running. They end with the job.
     background: Background,
+    /// The `environment-url`, once the job ended well and it evaluated.
+    environment_url: Option<String>,
 }
 
 /// What a step needs to start.

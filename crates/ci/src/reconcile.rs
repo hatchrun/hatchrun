@@ -927,9 +927,18 @@ fn attempt_ended(current: Option<&JobRow>, attempt: u32) -> bool {
 /// Completes the attempt of `row` as failed in the database, for a job
 /// no run object holds, and the run with it once every job is over.
 pub(crate) async fn fail_row(env: &Env, db: &Db, row: &JobRow, now: u64) -> Result<(), String> {
-    let ended = store::finish_job(db, row.id, row.attempt, "failure", &row.steps, None, now)
-        .await
-        .map_err(|e| e.to_string())?;
+    let ended = store::finish_job(
+        db,
+        row.id,
+        row.attempt,
+        "failure",
+        &row.steps,
+        None,
+        None,
+        now,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if !ended {
         // An earlier call may have completed the row and failed before
         // it gave up the place. Release it when this attempt is the one

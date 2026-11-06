@@ -164,6 +164,9 @@ pub struct RunInfo {
     pub base_ref: String,
     /// The workflow's `concurrency`, as written.
     pub concurrency: Option<Concurrency>,
+    /// What the workflow's `run-name` gave, when it has one: the title
+    /// the check runs show.
+    pub title: Option<String>,
 }
 
 /// The body of `POST /start`.
@@ -287,6 +290,8 @@ pub enum Work {
         /// Where the job's log will be in R2, `None` when the job
         /// wrote none.
         log_key: Option<String>,
+        /// Where the job's deployment can be seen.
+        environment_url: Option<String>,
     },
     /// The run's row ends.
     FinishRun {
@@ -489,6 +494,7 @@ pub struct RunState {
     pub jobs: Vec<JobSummary>,
 }
 
+pub(crate) use decide::github_context;
 pub use object::RunObject;
 
 #[cfg(test)]

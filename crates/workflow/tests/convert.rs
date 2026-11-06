@@ -1670,33 +1670,126 @@ jobs:
         out.config.jobs["ci-b"].environment.as_deref(),
         Some("staging")
     );
-    assert!(
-        has(
-            &out.warnings,
-            &["`environment.url` is not supported and was dropped"]
-        ),
-        "{:?}",
-        out.warnings
+    assert_eq!(
+        out.config.jobs["ci-b"].environment_url.as_deref(),
+        Some("https://x")
     );
+    assert_eq!(out.config.jobs["ci-a"].environment_url, None);
+    assert_eq!(out.warnings, []);
+    round_trips(&out);
+}
+
+#[test]
+fn run_name_converts() {
+    let out = ok("
+run-name: Deploy ${{ inputs.target }} by ${{ github.actor }}
+on: push
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert_eq!(
+        out.config.workflows["ci"].run_name.as_deref(),
+        Some("Deploy ${{ inputs.target }} by ${{ github.actor }}")
+    );
+    assert_eq!(out.warnings, []);
+    round_trips(&out);
+
+    let out = ok("
+run-name: ${{ env.X }}
+on: push
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert_eq!(out.config.workflows["ci"].run_name, None);
+    assert!(has(&out.warnings, &["`run-name` reads `env`", "dropped"]));
+
+    let out = ok("
+run-name: ${{ github.
+on: push
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert_eq!(out.config.workflows["ci"].run_name, None);
+    assert!(has(&out.warnings, &["`run-name`", "bad expression"]));
+}
+
+#[test]
+fn environment_url_is_checked_with_the_job() {
+    let out = ok("
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: { name: prod, url: '${{ secrets.X }}/${{ nothing.here }}' }
+    steps: [{ run: d }]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{ run: l }]
+");
     assert!(
-        !has(&out.warnings, &["`environment` is not supported"]),
+        has(&out.errors, &["unknown context 'nothing'"]),
         "{:?}",
-        out.warnings
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-deploy"));
+    assert!(out.config.jobs.contains_key("ci-lint"));
+}
+
+#[test]
+fn environment_names_and_urls_can_be_expressions() {
+    let out = ok("
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    needs: pick
+    strategy: { matrix: { region: [eu, us] } }
+    environment:
+      name: ${{ needs.pick.outputs.stage }}-${{ matrix.region }}
+      url: ${{ steps.up.outputs.url }}
+    steps: [{ id: up, run: d }]
+  pick:
+    runs-on: ubuntu-latest
+    outputs: { stage: '${{ steps.s.outputs.v }}' }
+    steps: [{ id: s, run: p }]
+");
+    assert_eq!(out.errors, []);
+    assert_eq!(out.warnings, []);
+    let job = &out.config.jobs["ci-deploy"];
+    assert_eq!(
+        job.environment.as_deref(),
+        Some("${{ needs.pick.outputs.stage }}-${{ matrix.region }}")
     );
     assert_eq!(
-        out.warnings
-            .iter()
-            .filter(|w| w.message.contains("environment"))
-            .count(),
-        1,
-        "{:?}",
-        out.warnings
+        job.environment_url.as_deref(),
+        Some("${{ steps.up.outputs.url }}")
     );
     round_trips(&out);
 }
 
 #[test]
-fn environment_expressions_drop_the_job() {
+fn environment_names_that_read_other_contexts_drop_the_job() {
+    let out = ok("
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ vars.STAGE }}
+    steps: [{ run: d }]
+  lint:
+    runs-on: ubuntu-latest
+    steps: [{ run: l }]
+");
+    assert!(
+        has(&out.errors, &["`environment` reads `vars`"]),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.jobs.contains_key("ci-deploy"));
+}
+
+#[test]
+fn an_environment_expression_that_does_not_parse_drops_the_job() {
     let out = convert(&[(
         "ci.yml".into(),
         "
@@ -1704,7 +1797,7 @@ on: push
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: ${{ matrix.env }}
+    environment: ${{ matrix.env
     steps: [{ run: d }]
   lint:
     runs-on: ubuntu-latest
@@ -1714,7 +1807,7 @@ jobs:
     )])
     .unwrap();
     assert!(
-        has(&out.errors, &["`environment` uses an expression"]),
+        has(&out.errors, &["`environment`", "bad expression"]),
         "{:?}",
         out.errors
     );

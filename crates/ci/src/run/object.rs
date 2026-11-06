@@ -15,7 +15,7 @@ use hatchrun_cloud::fetch::{Counted, Sender};
 use hatchrun_cloud::http::Response as HttpResponse;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
 use hatchrun_workflow::agent::{Batch, BatchReply};
-use hatchrun_workflow::{Conclusion, JobResult};
+use hatchrun_workflow::{Conclusion, JobResult, valid_environment_url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use worker::{
@@ -818,9 +818,17 @@ impl<'a> Cx<'a> {
             Work::StartRunAt { attempt } => self.started(db, info, *attempt).await,
             Work::QueueLaunch { job, attempt } => {
                 self.register_concurrency(db, info, *job, *attempt).await?;
+                // The environment the graph settled on: a name that was
+                // an expression is only now known, and the launch checks
+                // the environment's rules against the row.
+                let environment = self
+                    .storage
+                    .get::<Graph>(GRAPH)
+                    .await?
+                    .and_then(|graph| graph.node(*job).and_then(|n| n.environment.clone()));
                 // A job that is launching or launched is not queued
                 // again, and no second launch is sent for it.
-                if store::queue_job(db, *job, *attempt, self.now).await? {
+                if store::queue_job(db, *job, *attempt, environment.as_deref(), self.now).await? {
                     self.env
                         .queue(LAUNCHES)?
                         .send(LaunchMessage {
@@ -837,6 +845,7 @@ impl<'a> Cx<'a> {
                 conclusion,
                 steps,
                 log_key,
+                environment_url,
             } => {
                 let ended = store::finish_job(
                     db,
@@ -845,6 +854,7 @@ impl<'a> Cx<'a> {
                     conclusion_word(*conclusion),
                     steps,
                     log_key.as_deref(),
+                    environment_url.as_deref(),
                     self.now,
                 )
                 .await?;
@@ -1107,12 +1117,19 @@ impl<'a> Cx<'a> {
                     self.end_sockets(job, conclusion);
                     self.put_job(job, &state).await?;
                     run.outbox_mut().mark(job);
+                    let environment_url = run
+                        .graph
+                        .node(job)
+                        .and_then(|node| node.result.as_ref())
+                        .and_then(|result| result.environment_url.clone())
+                        .filter(|url| valid_environment_url(url));
                     run.todo_mut().push(Work::FinishJob {
                         job,
                         attempt,
                         conclusion,
                         steps,
                         log_key,
+                        environment_url,
                     });
                 }
                 // The agent learns of a cancel from the reply to its
@@ -1589,6 +1606,7 @@ impl<'a> Cx<'a> {
             };
             let view = JobView {
                 workflow: &run.info.workflow,
+                run_title: run.info.title.as_deref(),
                 node,
                 head_sha: &run.info.sha,
                 details_url: details_url(

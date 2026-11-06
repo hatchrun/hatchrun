@@ -241,6 +241,7 @@ mod tests {
                 outputs: BTreeMap::new(),
                 token_permissions: BTreeMap::new(),
                 environment: None,
+                environment_url: None,
                 concurrency: None,
                 steps: Vec::new(),
             },
@@ -379,6 +380,7 @@ mod tests {
             outputs: BTreeMap::new(),
             steps: Vec::new(),
             annotations: Vec::new(),
+            environment_url: None,
         }
     }
 

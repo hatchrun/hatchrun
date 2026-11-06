@@ -565,11 +565,7 @@ impl Cx {
 
     /// Converts one workflow file.
     fn workflow(&mut self, file: &str, stem: &str, gh: GhWorkflow) {
-        if gh.run_name.is_some() {
-            self.warn(format!(
-                "`{file}`: `run-name` is not supported and was dropped"
-            ));
-        }
+        let run_name = self.run_name(file, gh.run_name.as_ref());
         for key in gh.unknown.keys() {
             self.warn(format!("`{file}`: unknown key `{key}` was dropped"));
         }
@@ -602,6 +598,7 @@ impl Cx {
             stem.to_owned(),
             Workflow {
                 on,
+                run_name,
                 permissions,
                 concurrency,
                 jobs,

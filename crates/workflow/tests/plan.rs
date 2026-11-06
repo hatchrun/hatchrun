@@ -1323,14 +1323,129 @@ workflows:
 }
 
 #[test]
-fn environment_with_a_run_time_expression_is_an_error() {
+fn environment_with_a_run_time_expression_is_kept_for_the_host() {
+    let plan = plan(
+        r#"
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: "${{ matrix.stage }}-${{ needs.pick.outputs.zone }}"
+    environment-url: "https://${{ steps.up.outputs.host }}"
+    steps: []
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - deploy: { matrix: { stage: [a, b] } }
+"#,
+    );
+    assert_eq!(
+        plan.jobs[0].environment.as_deref(),
+        Some("${{ matrix.stage }}-${{ needs.pick.outputs.zone }}")
+    );
+    assert_eq!(
+        plan.jobs[1].environment_url.as_deref(),
+        Some("https://${{ steps.up.outputs.host }}")
+    );
+}
+
+#[test]
+fn environment_names_read_only_what_the_host_has_when_the_job_starts() {
     assert_error(
         r#"
-jobs: { deploy: { runs-on: ubuntu-latest, environment: "${{ github.ref_name }}", steps: [] } }
+jobs: { deploy: { runs-on: ubuntu-latest, environment: "${{ vars.STAGE }}", steps: [] } }
 workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
 "#,
-        &["`environment` can use only parameters"],
+        &["`environment` reads `vars`", "it can read only"],
     );
+    assert_error(
+        r#"
+jobs: { deploy: { runs-on: ubuntu-latest, environment: "${{ steps.x.outputs.y }}", steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
+"#,
+        &["`environment` reads `steps`"],
+    );
+    assert_error(
+        r#"
+jobs: { deploy: { runs-on: ubuntu-latest, environment: "${{ github.ref_name", steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
+"#,
+        &["`environment` has a bad expression"],
+    );
+}
+
+#[test]
+fn environment_url_needs_an_environment_and_a_good_expression() {
+    assert_error(
+        r#"
+jobs: { deploy: { runs-on: ubuntu-latest, environment-url: "https://x", steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
+"#,
+        &["`environment-url` but no `environment`"],
+    );
+    assert_error(
+        r#"
+jobs: { deploy: { runs-on: ubuntu-latest, environment: prod, environment-url: "${{ nope.x }}", steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [deploy] } }
+"#,
+        &["`environment-url` has a bad expression"],
+    );
+}
+
+#[test]
+fn run_name_is_checked_and_reaches_the_plan() {
+    let p = plan(
+        r#"
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    run-name: "Deploy ${{ inputs.target }} by ${{ github.actor }}"
+    on: { push: {} }
+    jobs: [t]
+"#,
+    );
+    assert_eq!(
+        p.run_name.as_deref(),
+        Some("Deploy ${{ inputs.target }} by ${{ github.actor }}")
+    );
+    let none = plan(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+    );
+    assert_eq!(none.run_name, None);
+    assert_error(
+        r#"
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows: { ci: { run-name: "${{ matrix.x }}", on: { push: {} }, jobs: [t] } }
+"#,
+        &["`run-name` reads `matrix`"],
+    );
+    assert_error(
+        r#"
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows: { ci: { run-name: "${{ github.", on: { push: {} }, jobs: [t] } }
+"#,
+        &["`run-name` has a bad expression"],
+    );
+}
+
+#[test]
+fn run_titles_are_evaluated_against_github_and_inputs() {
+    let ctx = serde_json::json!({
+        "github": { "actor": "octocat", "ref_name": "main" },
+        "inputs": { "target": "staging" },
+    });
+    assert_eq!(
+        hatchrun_workflow::run_title("Deploy ${{ inputs.target }} by ${{ github.actor }}", &ctx),
+        Ok("Deploy staging by octocat".to_owned())
+    );
+    assert_eq!(
+        hatchrun_workflow::run_title("  ${{ github.ref_name }}\nsecond", &ctx),
+        Ok("main".to_owned())
+    );
+    assert!(hatchrun_workflow::run_title("${{ nope.x }}", &ctx).is_err());
 }
 
 #[test]
