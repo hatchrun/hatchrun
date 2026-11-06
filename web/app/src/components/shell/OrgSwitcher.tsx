@@ -5,16 +5,15 @@
 import { ChevronsUpDown } from "lucide-react";
 import { useMemo, useState } from "react";
 
-import { Logo } from "@/components/Logo";
 import { PickList } from "@/components/PickList";
 import { Popover } from "@/components/Popover";
 import { recentFirst, recents } from "@/lib/storage";
 import { navigate } from "@/router";
-import { NAV_ITEM } from "./Sidebar";
+import { BAR_BUTTON } from "./TopBar";
 import { useTenants } from "./tenants";
 
 /**
- * The organization button at the top of the sidebar and its popover:
+ * The organization button in the top bar and its popover:
  * search, the recent organizations first, "Add an organization" at the
  * bottom. `suffix` is the page to keep when switching ("repos", "").
  */
@@ -65,12 +64,11 @@ export function OrgSwitcher({
       trigger={
         <button
           type="button"
-          className={`${NAV_ITEM} h-10 text-fg`}
+          className={`${BAR_BUTTON} max-w-[200px] text-fg`}
           aria-haspopup="listbox"
           aria-label={`Switch organization, current ${current}`}
         >
-          <Logo size={22} />
-          <span className="min-w-0 flex-1 truncate">{current}</span>
+          <span className="min-w-0 truncate">{current}</span>
           <ChevronsUpDown size={12} aria-hidden="true" className="shrink-0 text-fg-3" />
         </button>
       }

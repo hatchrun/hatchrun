@@ -135,7 +135,7 @@ export function matchOrg(path: string): OrgRoute | null {
   return known ? { org: page[1], page: known, repo: null, run: null, job: null } : null;
 }
 
-/** A run page's parts; the sidebar of a public page reduces to its repository. */
+/** A run page's parts; the top bar of a public page reduces to its repository. */
 export interface CiRoute {
   org: string;
   repo: string;
