@@ -165,6 +165,7 @@ function run(id: number, number: number, workflow: string, event: string, ref: s
     branch: ref.replace("refs/heads/", ""),
     sha: "3f2a9c1d5e6b7a8091a2b3c4d5e6f708192a3b4c",
     actor: "octocat",
+    message: number === 3 ? null : number === 2 ? "fix: keep the log follow toggle after a reload" : "feat: add the deploy workflow",
     status,
     conclusion,
     created_at: created,
@@ -197,6 +198,7 @@ const artifacts = [
 const jobJson = (job: Job) => ({
   id: job.id,
   plan_id: job.name.split(" ")[0],
+  needs: job.id === 2 ? ["build"] : [],
   name: job.name,
   status: job.status,
   conclusion: job.conclusion,

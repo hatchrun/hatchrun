@@ -152,7 +152,7 @@ function RunScreen({
         role={role}
         reload={reload}
       />
-      <div className="flex h-[calc(100dvh-9rem)] min-h-[520px] gap-4 max-lg:h-auto max-lg:flex-col">
+      <div className="flex h-[calc(100dvh-12.5rem)] min-h-[520px] gap-4 max-lg:h-auto max-lg:flex-col">
         <JobsPanel
           key={run.id}
           run={run}

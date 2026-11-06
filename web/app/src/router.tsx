@@ -89,10 +89,11 @@ export function useQueryList(name: string): string[] {
  *   /o/:org/ci/:repo/runs/:n[/jobs/:j]   one run (n is the run id) and a job of it
  *   /o/:org/secrets                      Secrets and variables
  *   /o/:org/environments                 Environments
+ *   /o/:org/audit                        Audit log (org admin)
  *   /o/:org/settings[/billing]           Settings, Billing
  *   /o/:org/setup                        First run checklist
  */
-export type OrgPage = "kit" | "runs" | "repos" | "secrets" | "environments" | "settings" | "billing" | "setup" | "run";
+export type OrgPage = "kit" | "runs" | "repos" | "secrets" | "environments" | "settings" | "billing" | "audit" | "setup" | "run";
 
 export interface OrgRoute {
   org: string;
@@ -112,6 +113,7 @@ const PAGES: Record<string, OrgPage> = {
   settings: "settings",
   "settings/billing": "billing",
   setup: "setup",
+  audit: "audit",
   // The component gallery, under `npm run dev:mock` only.
   ...(import.meta.env.MODE === "mock" ? { kit: "kit" as const } : {}),
 };
@@ -133,7 +135,7 @@ export function matchOrg(path: string): OrgRoute | null {
   return known ? { org: page[1], page: known, repo: null, run: null, job: null } : null;
 }
 
-/** A run page's parts; the sidebar of a public page reduces to its repository. */
+/** A run page's parts; the top bar of a public page reduces to its repository. */
 export interface CiRoute {
   org: string;
   repo: string;

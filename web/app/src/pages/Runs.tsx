@@ -10,13 +10,12 @@ import { CursorPager, useCursors } from "@/components/CursorPager";
 import { FilterBar, useUrlFilters } from "@/components/FilterBar";
 import { Page } from "@/components/Page";
 import { Popover } from "@/components/Popover";
-import { SegmentedBar } from "@/components/SegmentedBar";
 import { Await } from "@/components/Status";
-import { STATUS } from "@/components/StatusPill";
 import { abbreviate } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useLoad, useNow } from "@/load";
 import { setQuery, useQuery } from "@/router";
+import { ActivityPanel } from "./runs/ActivityPanel";
 import { NeedsYou } from "./runs/NeedsYou";
 import { RunsTable } from "./runs/RunsTable";
 import type { OrgPageProps } from "./types";
@@ -87,27 +86,7 @@ export function Runs({ org }: OrgPageProps) {
     <Page title="Runs" meta={total ? `${abbreviate(total[0] ?? 0)} runs, ${range.label.toLowerCase()}` : org}>
       <NeedsYou org={org} onChange={reload} />
 
-      {total && (
-        <section aria-label="Activity" className="flex flex-wrap items-center gap-x-6 gap-y-3 rounded-md border border-rule bg-panel px-4.5 py-4">
-          <h2 className="section-title">Activity</h2>
-          <div className="min-w-[240px] flex-1">
-            <SegmentedBar
-              height={22}
-              segments={[
-                { status: "passed", count: total[4] ?? 0 },
-                { status: "failed", count: total[3] ?? 0 },
-                { status: "waiting", count: total[2] ?? 0 },
-                { status: "running", count: total[1] ?? 0 },
-              ]}
-            />
-          </div>
-          <span className="font-mono text-[13px] text-fg-3">
-            <span className="text-lg font-semibold text-fg">{abbreviate(total[0] ?? 0)}</span> runs <span className="text-control">|</span>{" "}
-            <span className={STATUS.passed.text}>{abbreviate(total[4] ?? 0)}</span> passed <span className="text-control">|</span>{" "}
-            <span className={cn(STATUS.failed.text, "text-lg font-semibold")}>{abbreviate(total[3] ?? 0)}</span> failed
-          </span>
-        </section>
-      )}
+      <ActivityPanel org={org} repos={filters.asRunFilters.repo ?? []} />
 
       <section aria-label="CI runs" className="rounded-md border border-rule">
         <div className="flex flex-col gap-2.5 rounded-t-md border-b border-rule bg-panel px-3.5 py-2.5">
