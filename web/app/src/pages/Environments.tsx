@@ -17,7 +17,7 @@ import { Await } from "@/components/Status";
 import { Truncate } from "@/components/Truncate";
 import { abbreviate, ago } from "@/lib/format";
 import { useDebounced } from "@/lib/useRepos";
-import { orgUrl } from "@/lib/urls";
+import { orgUrl, repoUrl } from "@/lib/urls";
 import { cn } from "@/lib/utils";
 import { useLoad } from "@/load";
 import { Link, setQuery, useQuery } from "@/router";
@@ -194,7 +194,9 @@ export function Environments({ org }: OrgPageProps) {
                                 <Truncate value={row.name} mono className="font-bold" />
                               </td>
                               <td className={cn(TD, "max-w-[260px]")}>
-                                <Truncate value={row.repository} mono />
+                                <Link href={repoUrl(row.repository)} className="inline-flex max-w-full min-w-0 hover:underline">
+                                  <Truncate value={row.repository} mono />
+                                </Link>
                               </td>
                               <td className={cn(TD, "max-w-[240px] font-mono text-[13px] text-fg-2")}>
                                 {row.branches.length === 0 ? "any branch" : <Truncate value={row.branches.join(", ")} mono />}

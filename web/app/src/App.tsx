@@ -13,7 +13,8 @@ import { CiRun } from "./pages/CiRun";
 import { Environments } from "./pages/Environments";
 import { Home } from "./pages/Home";
 import { Kit } from "./pages/Kit";
-import { Repos } from "./pages/Repos";
+import { Repositories } from "./pages/Repositories";
+import { Repository } from "./pages/Repository";
 import { Runs } from "./pages/Runs";
 import { Secrets } from "./pages/Secrets";
 import { Audit } from "./pages/Audit";
@@ -127,8 +128,10 @@ function OrgPage({ session, tenant, route }: { session: Session; tenant: Tenant;
   switch (route.page) {
     case "runs":
       return <Runs {...props} />;
-    case "repos":
-      return <Repos {...props} />;
+    case "repositories":
+      return <Repositories {...props} />;
+    case "repository":
+      return <Repository {...props} repo={route.repo ?? ""} tab={route.tab ?? "runs"} workflow={route.workflow} />;
     case "secrets":
       return <Secrets {...props} />;
     case "environments":

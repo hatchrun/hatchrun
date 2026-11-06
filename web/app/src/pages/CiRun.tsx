@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { ChevronLeft, ExternalLink } from "lucide-react";
+import { ExternalLink } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
 import {
@@ -22,7 +22,7 @@ import { ciStatus, StatusPill } from "@/components/StatusPill";
 import { Truncate } from "@/components/Truncate";
 import { useLoad, useNow } from "@/load";
 import { bytes, duration, shortRef, shortSha } from "@/lib/format";
-import { orgUrl, repoRunsUrl, runUrl } from "@/lib/urls";
+import { orgUrl, repoUrl, runUrl, workflowUrl } from "@/lib/urls";
 import { Link, useLocation, type CiRoute } from "@/router";
 import { ApprovalCard } from "./ci/ApprovalCard";
 import { JobLog } from "./ci/JobLog";
@@ -198,20 +198,24 @@ function Crumbs({
       aria-label="Breadcrumb"
       className="flex min-w-0 items-center gap-2 font-mono text-[13px] text-fg-3"
     >
-      <Link
-        href={orgUrl(route.org)}
-        className="inline-flex items-center gap-1 text-fg hover:text-brand"
-      >
-        <ChevronLeft size={12} aria-hidden="true" className="text-brand" />
-        Runs
+      <Link href={orgUrl(route.org)} className="text-fg hover:text-brand">
+        {route.org}
       </Link>
       {sep}
       <Link
-        href={repoRunsUrl(run.repository)}
+        href={repoUrl(run.repository)}
         title={run.repository}
         className="min-w-0 truncate underline decoration-control underline-offset-4 hover:text-fg"
       >
-        {run.repository}
+        {route.repo}
+      </Link>
+      {sep}
+      <Link
+        href={workflowUrl(run.repository, run.workflow)}
+        title={run.workflow}
+        className="min-w-0 truncate underline decoration-control underline-offset-4 hover:text-fg"
+      >
+        {run.workflow}
       </Link>
       {sep}
       <Link
@@ -318,6 +322,14 @@ function Header({
             <span className="cap">event</span>
             <span className="text-fg">{run.event}</span>
           </span>
+          {run.pull_request && (
+            <span className="flex min-w-0 items-center gap-2">
+              <span className="cap">pull request</span>
+              <Link href={repoUrl(run.repository, "pulls")} title={run.pull_request.title} className="max-w-[320px] truncate text-fg underline decoration-control underline-offset-4 hover:text-brand">
+                #{run.pull_request.number} {run.pull_request.title}
+              </Link>
+            </span>
+          )}
           {run.run_attempt > 1 && (
             <span className="flex items-center gap-2">
               <span className="cap">attempt</span>

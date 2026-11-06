@@ -31,7 +31,7 @@ import { abbreviate, ago } from "@/lib/format";
 import { useDebounced } from "@/lib/useRepos";
 import { cn } from "@/lib/utils";
 import { useLoad, useNow } from "@/load";
-import { orgUrl } from "@/lib/urls";
+import { orgUrl, repoUrl } from "@/lib/urls";
 import { Link, setQuery, useQuery } from "@/router";
 import { BTN, BTN_PRIMARY, BTN_SM, FIELD, TD, TH } from "./formStyles";
 import type { OrgPageProps } from "./types";
@@ -432,8 +432,13 @@ function staleFor(row: Row, now: number): number | null {
 
 /** The access cell: who can read the item at this scope. */
 function access(value: ScopeValue, row: Row) {
-  if (row.scope === "env") return `env ${value.env ?? ""}`;
-  if (row.scope === "repo") return `repo ${value.repo ?? ""} only`;
+  const repoLink = value.repo && (
+    <Link href={repoUrl(value.repo)} className="underline decoration-control underline-offset-3 hover:decoration-fg-3">
+      {value.repo}
+    </Link>
+  );
+  if (row.scope === "env") return <>env {value.env ?? ""} of {repoLink}</>;
+  if (row.scope === "repo") return <>repo {repoLink} only</>;
   if (row.repositories === null) return "all repos";
   return (
     <span className="inline-flex max-w-full items-center gap-2" title={row.repositories.join(", ")}>

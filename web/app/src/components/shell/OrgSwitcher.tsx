@@ -15,7 +15,7 @@ import { useTenants } from "./tenants";
 /**
  * The organization button in the top bar and its popover:
  * search, the recent organizations first, "Add an organization" at the
- * bottom. `suffix` is the page to keep when switching ("repos", "").
+ * bottom. `suffix` is the page to keep when switching ("repositories", "").
  */
 export function OrgSwitcher({
   current,

@@ -9,7 +9,7 @@ import { JobSquares } from "@/components/JobSquares";
 import { STATUS, StatusPill, ciStatus, type Status } from "@/components/StatusPill";
 import { Truncate } from "@/components/Truncate";
 import { ago, duration, shortSha } from "@/lib/format";
-import { runUrl } from "@/lib/urls";
+import { repoUrl, runUrl, workflowUrl } from "@/lib/urls";
 import { Link } from "@/router";
 
 const EDGE: Partial<Record<Status, string>> = { failed: "--failed", waiting: "--waiting", running: "--running" };
@@ -17,13 +17,13 @@ const EDGE: Partial<Record<Status, string>> = { failed: "--failed", waiting: "--
 const TH = "cap px-3 py-2.5 text-left font-normal";
 
 /** One page of runs: status edge, repo and workflow, branch, sha, commit message, actor, status, jobs, duration, age. */
-export function RunsTable({ runs, now }: { runs: CiRun[]; now: number }) {
+export function RunsTable({ runs, now, inRepo = false }: { runs: CiRun[]; now: number; /** On a repository page: the repository column is left out. */ inRepo?: boolean }) {
   return (
     <div className="max-h-[560px] overflow-auto">
       <table className="w-full min-w-[1320px] border-collapse">
         <thead className="sticky top-0 z-[1] bg-background">
           <tr>
-            <th className={`${TH} pl-3.5`}>Run</th>
+            <th className={`${TH} pl-3.5`}>{inRepo ? "Run" : "Repository"}</th>
             <th className={TH}>Workflow</th>
             <th className={TH}>Branch</th>
             <th className={TH}>Commit</th>
@@ -41,19 +41,32 @@ export function RunsTable({ runs, now }: { runs: CiRun[]; now: number }) {
             return (
               <tr key={run.id} className="group border-t border-rule hover:bg-raised">
                 <td className="py-2.5 pr-3 pl-3.5 whitespace-nowrap" style={EDGE[status] ? { boxShadow: `inset 3px 0 0 var(${EDGE[status]})` } : undefined}>
-                  <Link href={runUrl(run.repository, run.id)} aria-label={`Run ${run.repository} number ${run.run_number}, open details`} className="inline-flex max-w-[300px] items-center gap-2.5 hover:underline">
-                    <span className="max-w-[220px] truncate font-semibold" title={run.repository}>
-                      {run.repository}
-                    </span>
-                    <span className="shrink-0 font-mono text-[13px] text-fg-3">#{run.run_number}</span>
-                    <ChevronRight size={12} aria-hidden="true" className="shrink-0 text-fg-2" />
-                  </Link>
+                  <span className="inline-flex max-w-[320px] items-center gap-2.5">
+                    {!inRepo && (
+                      <Link href={repoUrl(run.repository)} className="max-w-[220px] truncate font-semibold hover:underline" title={run.repository}>
+                        {run.repository}
+                      </Link>
+                    )}
+                    <Link href={runUrl(run.repository, run.id)} aria-label={`Run ${run.repository} number ${run.run_number}, open details`} className="inline-flex shrink-0 items-center gap-1.5 font-mono text-[13px] text-fg-3 hover:text-fg hover:underline">
+                      #{run.run_number}
+                      <ChevronRight size={12} aria-hidden="true" className="shrink-0 text-fg-2" />
+                    </Link>
+                  </span>
                 </td>
                 <td className="max-w-[220px] px-3 py-2.5 whitespace-nowrap text-fg-2">
-                  <Truncate value={run.workflow} className="block" />
+                  <Link href={workflowUrl(run.repository, run.workflow)} className="block min-w-0 hover:text-fg hover:underline">
+                    <Truncate value={run.workflow} className="block" />
+                  </Link>
                 </td>
                 <td className="max-w-[240px] px-3 py-2.5 whitespace-nowrap">
-                  {run.branch ? <Truncate value={run.branch} copy mono /> : <span className="font-mono text-[13px] text-fg-3">{run.event}</span>}
+                  <span className="inline-flex max-w-full items-center gap-2">
+                    {run.pull_request && (
+                      <Link href={repoUrl(run.repository, "runs", { pull: run.pull_request.number })} title={run.pull_request.title} className="shrink-0 font-mono text-[13px] text-fg-2 hover:text-fg hover:underline">
+                        PR #{run.pull_request.number}
+                      </Link>
+                    )}
+                    {run.branch ? <Truncate value={run.branch} copy mono /> : <span className="font-mono text-[13px] text-fg-3">{run.event}</span>}
+                  </span>
                 </td>
                 <td className="px-3 py-2.5 whitespace-nowrap">
                   <Truncate value={run.sha} copy mono>

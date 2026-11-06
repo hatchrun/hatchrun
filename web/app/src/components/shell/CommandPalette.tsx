@@ -8,13 +8,13 @@ import { useEffect, useMemo, useState } from "react";
 import { listOrgRuns, type CiRun } from "@/api";
 import { PickList, type PickItem } from "@/components/PickList";
 import { recents, remember } from "@/lib/storage";
-import { runUrl } from "@/lib/urls";
+import { repoUrl, runUrl } from "@/lib/urls";
 import { useDebounced, useRepoSearch } from "@/lib/useRepos";
 import { navigate } from "@/router";
 
 const PAGES = [
   { label: "Runs", path: "" },
-  { label: "Repos", path: "repos" },
+  { label: "Repositories", path: "repositories" },
   { label: "Secrets", path: "secrets" },
   { label: "Environments", path: "environments" },
   { label: "Settings", path: "settings" },
@@ -55,7 +55,7 @@ export function CommandPalette({ org, open, onOpenChange }: { org: string; open:
     const out: (PickItem & { go: string })[] = [];
     if (!needle) {
       for (const name of recents(`repos:${org}`).slice(0, 4)) {
-        out.push({ key: `r:${name}`, group: "Recent repositories", label: name, mono: true, go: `/o/${org}?repo=${encodeURIComponent(name)}`, note: "runs" });
+        out.push({ key: `r:${name}`, group: "Recent repositories", label: name, mono: true, go: repoUrl(name) });
       }
     }
     for (const page of PAGES.filter((item) => !needle || item.label.toLowerCase().includes(needle))) {
@@ -63,7 +63,7 @@ export function CommandPalette({ org, open, onOpenChange }: { org: string; open:
     }
     if (needle) {
       for (const repo of repos) {
-        out.push({ key: `r:${repo.name}`, group: "Repositories", label: repo.name, mono: true, go: `/o/${org}?repo=${encodeURIComponent(repo.name)}`, note: "runs" });
+        out.push({ key: `r:${repo.name}`, group: "Repositories", label: repo.name, mono: true, go: repoUrl(repo.name) });
       }
       for (const run of runs) {
         out.push({

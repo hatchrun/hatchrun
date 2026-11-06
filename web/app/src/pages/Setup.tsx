@@ -216,8 +216,8 @@ function EnableForm({
             Retry loading enabled repositories
           </button>
         )}
-        <Link href={orgUrl(org, "repos")} className="font-mono text-xs text-fg-2 quiet-underline hover:text-fg">
-          Filter in Repos →
+        <Link href={orgUrl(org, "repositories")} className="font-mono text-xs text-fg-2 quiet-underline hover:text-fg">
+          Filter in Repositories →
         </Link>
       </div>
     </div>

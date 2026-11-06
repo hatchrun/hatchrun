@@ -16,7 +16,7 @@ import { BAR_BUTTON, DocsLink, LogoLink, OrgTabs, SearchButton, Slash, TopBarFra
 /**
  * The one shell of the app: a sticky top bar and the page under it.
  *
- * - `org` set: logo, `/`, org switcher and the tabs Runs, Repos, Secrets,
+ * - `org` set: logo, `/`, org switcher and the tabs Runs, Repositories, Secrets,
  *   Environments, Settings on the left; Search (⌘K), Docs and the profile
  *   menu on the right. The current tab is read from the URL.
  * - `publicRepo` set (a public CI page, `user` may be null): the bar
@@ -75,7 +75,7 @@ export function Shell({
   }, [login, user]);
 
   const current = route?.page ?? null;
-  const suffix = current === "runs" || current === "run" || current === null ? "" : current === "billing" ? "settings/billing" : current;
+  const suffix = current === "runs" || current === null ? "" : current === "billing" ? "settings/billing" : current === "repository" || current === "run" ? "repositories" : current;
 
   const left =
     login && user ? (

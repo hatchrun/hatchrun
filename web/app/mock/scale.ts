@@ -85,6 +85,13 @@ export interface Job {
   approval: { decision: "approved" | "rejected"; by: string; at: number } | null;
 }
 
+interface PullRef {
+  number: number;
+  title: string;
+  head_ref: string;
+  base_ref: string;
+}
+
 interface RunRow {
   id: number;
   run_number: number;
@@ -97,6 +104,7 @@ interface RunRow {
   sha: string;
   actor: string;
   message: string | null;
+  pull_request: PullRef | null;
   status: string;
   conclusion: string | null;
   created_at: number;
@@ -168,6 +176,57 @@ function bigStatus(k: number): { status: string; conclusion: string | null; held
   return { status: "queued", conclusion: null, held: null };
 }
 
+// ---- pull requests --------------------------------------------------------
+
+type PullState = "open" | "closed" | "merged";
+
+interface PullRow extends PullRef {
+  author: string;
+  state: PullState;
+  updated_at: number;
+}
+
+const PR_TITLES = [
+  "fix: retry the webhook delivery when the queue is full",
+  "feat(billing): daily spend chart",
+  "chore(deps): bump typescript-eslint to 8.72.0",
+  "refactor(router): drop the legacy redirect table",
+  "docs: how to rotate the signing key",
+  "test: cover the empty page of the cursor pager",
+  "perf(ingest): batch inserts in groups of 500",
+  "fix(auth): refuse session cookies issued before the key rotation and log which key signed them so the on-call can tell a replay from a stale tab (ENG-9912)",
+  "feat: org-wide secrets with repository allow lists",
+  "fix: flaky e2e shard 3 of 8 on windows",
+];
+const PR_SLUGS = ["nav", "flaky-test", "deps", "billing-v2", "oom-in-ingest", "retry-queue", "docs-keys", "cursor-pager", "router-cleanup", "feature/very-long-branch-name-for-truncation-checks-with-ticket-ENG-12345-and-more"];
+
+const pullCache = new Map<number, PullRow[]>();
+
+/** The pull requests of repository `ix`, newest first, numbers falling. */
+function pullsOf(ix: number): PullRow[] {
+  const cached = pullCache.get(ix);
+  if (cached) return cached;
+  const count = ix < 20 ? 30 + (hash(ix, 60) % 40) : 2 + (hash(ix, 60) % 10);
+  const rows = Array.from({ length: count }, (_, k): PullRow => {
+    const number = 20 + (count - k) * 2;
+    const r = hash(ix * 1000 + k, 61) % 10;
+    const slug = pick(PR_SLUGS, ix, k);
+    return {
+      number,
+      title: pick(PR_TITLES, ix, k + 1),
+      head_ref: slug.includes("/") ? slug : `${pick(["feat", "fix", "chore"], ix, k + 2)}/${slug}-${number}`,
+      base_ref: defaultBranch(ix),
+      author: pick(ACTORS, ix, k + 3),
+      state: k < 3 ? "open" : r < 4 ? "open" : r < 8 ? "merged" : "closed",
+      updated_at: NOW - k * 3 * 60 * MINUTE - (hash(ix * 1000 + k, 62) % (90 * MINUTE)),
+    };
+  });
+  pullCache.set(ix, rows);
+  return rows;
+}
+
+const pullRef = ({ number, title, head_ref, base_ref }: PullRow): PullRef => ({ number, title, head_ref, base_ref });
+
 // ---- runs --------------------------------------------------------------
 
 const outcome = (i: number): { status: string; conclusion: string | null; wait: boolean } => {
@@ -206,13 +265,22 @@ function countsFor(i: number, o: ReturnType<typeof outcome>): RunRow["jobs"] {
 
 const runCache = new Map<number, RunRow>();
 
+const pickPull = (repoIx: number, i: number): PullRow => {
+  const pulls = pullsOf(repoIx);
+  return pulls[hash(i, 21) % pulls.length] as PullRow;
+};
+
 function runAt(i: number): RunRow {
   const cached = runCache.get(i);
   if (cached) return cached;
   const o = outcome(i);
   const topRepo = hash(i, 1) % 100 < 40;
   const repoIx = i === BIG_AT ? 2 : topRepo ? hash(i, 2) % 20 : hash(i, 3) % REPO_COUNT;
-  const branch = pick(BRANCHES, i, 4);
+  const event = pick(EVENTS, i, 11);
+  const pr = event === "pull_request" && i !== BIG_AT ? pickPull(repoIx, i) : null;
+  // "main" is the repository's default branch, whatever it is called.
+  const picked = pick(BRANCHES, i, 4);
+  const branch = pr ? pr.head_ref : picked === "main" ? defaultBranch(repoIx) : picked;
   const created = NOW - i * 115_000 - (hash(i, 8) % 60_000);
   const duration = 40_000 + (hash(i, 9) % 25) * MINUTE;
   const finished = o.status === "completed";
@@ -223,13 +291,14 @@ function runAt(i: number): RunRow {
     run_attempt: 1,
     repository: REPOS[repoIx] as string,
     workflow: i === BIG_AT ? "ci" : pick(WORKFLOWS, i, 10),
-    event: pick(EVENTS, i, 11),
+    event,
     ref: `refs/heads/${i === BIG_AT ? "main" : branch}`,
     branch: i === BIG_AT ? "main" : branch,
     sha: sha.slice(0, 40),
     actor: i === BIG_AT ? ME : pick(ACTORS, i, 12),
     // A scheduled run has no head commit message.
-    message: i === BIG_AT ? MESSAGES[3] as string : pick(EVENTS, i, 11) === "schedule" ? null : pick(MESSAGES, i, 13),
+    message: i === BIG_AT ? MESSAGES[3] as string : event === "schedule" ? null : pr ? pr.title : pick(MESSAGES, i, 13),
+    pull_request: pr ? pullRef(pr) : null,
     status: o.status,
     conclusion: o.conclusion,
     created_at: created,
@@ -305,6 +374,8 @@ function filterRuns(url: URL, repoFixed?: string): RunRow[] {
   const status = list(url, "status");
   const repos = repoFixed ? [repoFixed] : list(url, "repo");
   const branch = url.searchParams.get("branch");
+  const workflow = url.searchParams.get("workflow");
+  const pull = url.searchParams.get("pull");
   const actorParam = url.searchParams.get("actor");
   const actor = actorParam === "me" ? ME : actorParam;
   const q = (url.searchParams.get("q") ?? "").toLowerCase();
@@ -317,6 +388,8 @@ function filterRuns(url: URL, repoFixed?: string): RunRow[] {
     if (run.created_at > until) continue;
     if (repos.length && !repos.includes(run.repository)) continue;
     if (branch && run.branch !== branch) continue;
+    if (workflow && run.workflow !== workflow) continue;
+    if (pull && String(run.pull_request?.number) !== pull) continue;
     if (actor && run.actor !== actor) continue;
     if (status.length && !matchesStatus(run, status)) continue;
     if (q && !`${run.repository} ${run.workflow} ${run.branch} ${run.sha} ${run.actor} #${run.run_number}`.toLowerCase().includes(q)) continue;
@@ -341,6 +414,54 @@ function lastRuns() {
     }
   }
   return lastRunOf;
+}
+
+// ---- repository pages ---------------------------------------------------------
+
+const repoIndex = new Map(REPOS.map((name, i) => [name, i]));
+const runsOfRepo = new Map<string, RunRow[]>();
+function repoRuns(name: string): RunRow[] {
+  if (runsOfRepo.size === 0) {
+    for (let i = 0; i < RUNS; i++) {
+      const run = runAt(i);
+      const list = runsOfRepo.get(run.repository);
+      if (list) list.push(run);
+      else runsOfRepo.set(run.repository, [run]);
+    }
+  }
+  return runsOfRepo.get(name) ?? [];
+}
+
+function workflowRows(name: string) {
+  const by = new Map<string, RunRow[]>();
+  for (const run of repoRuns(name)) by.set(run.workflow, [...(by.get(run.workflow) ?? []), run]);
+  return [...by.entries()]
+    .map(([workflow, runs]) => ({
+      name: workflow,
+      last_run: viewOf(runs[0] as RunRow),
+      runs_7d: runs.length,
+      passed_7d: runs.filter((run) => run.conclusion === "success").length,
+      failed_7d: runs.filter((run) => run.conclusion === "failure").length,
+    }))
+    .sort((a, b) => b.last_run.created_at - a.last_run.created_at);
+}
+
+function branchRows(name: string, ix: number) {
+  const by = new Map<string, RunRow[]>();
+  for (const run of repoRuns(name)) if (run.branch) by.set(run.branch, [...(by.get(run.branch) ?? []), run]);
+  const main = defaultBranch(ix);
+  return [...by.entries()]
+    .map(([branch, runs]) => ({ name: branch, default: branch === main, last_run: viewOf(runs[0] as RunRow), runs: runs.length }))
+    .sort((a, b) => Number(b.default) - Number(a.default) || b.last_run.created_at - a.last_run.created_at);
+}
+
+function pullRows(name: string, ix: number) {
+  const latest = new Map<number, RunRow>();
+  for (const run of repoRuns(name)) if (run.pull_request && !latest.has(run.pull_request.number)) latest.set(run.pull_request.number, run);
+  return pullsOf(ix).map((pull) => {
+    const last = latest.get(pull.number);
+    return { ...pull, updated_at: Math.max(pull.updated_at, last?.created_at ?? 0), last_run: last ? viewOf(last) : null };
+  });
 }
 
 function repoRows() {
@@ -601,6 +722,34 @@ export function handleScale(
     json(res, 200, { ...page, items: page.items.map(viewOf), counts });
     return true;
   }
+  if ((found = /^repos\/([^/]+)\/([^/]+)(?:\/(workflows|branches|pulls))?$/.exec(path)) && found[1] === SCALE_ORG) {
+    const name = `${found[1]}/${found[2]}`;
+    const ix = repoIndex.get(name);
+    if (method !== "GET" || ix === undefined) return json(res, 404, { error: "not found" }), true;
+    if (!found[3]) {
+      json(res, 200, {
+        name,
+        default_branch: defaultBranch(ix),
+        private: ix % 7 === 0,
+        enabled: isEnabled(name, ix),
+        html_url: `https://github.com/${name}`,
+        counts: { workflows: workflowRows(name).length, branches: branchRows(name, ix).length, open_pulls: pullRows(name, ix).filter((pull) => pull.state === "open").length },
+      });
+    } else if (found[3] === "workflows") {
+      json(res, 200, paginate(workflowRows(name), url));
+    } else if (found[3] === "branches") {
+      const q = (url.searchParams.get("q") ?? "").toLowerCase();
+      json(res, 200, paginate(branchRows(name, ix).filter((branch) => !q || branch.name.toLowerCase().includes(q)), url));
+    } else {
+      const state = url.searchParams.get("state") ?? "open";
+      const q = (url.searchParams.get("q") ?? "").toLowerCase();
+      const rows = pullRows(name, ix)
+        .filter((pull) => (state === "all" || pull.state === state) && (!q || `${pull.title} ${pull.head_ref} ${pull.author} #${pull.number}`.toLowerCase().includes(q)))
+        .sort((a, b) => b.updated_at - a.updated_at);
+      json(res, 200, paginate(rows, url));
+    }
+    return true;
+  }
   if ((found = /^repos\/([^/]+)\/([^/]+)\/runs$/.exec(path)) && found[1] === SCALE_ORG) {
     const page = paginate(filterRuns(url, `${found[1]}/${found[2]}`), url);
     json(res, 200, { ...page, items: page.items.map(viewOf) });
@@ -617,9 +766,9 @@ export function handleScale(
     const failing = [];
     for (let i = 0; i < RUNS && failing.length < 4; i++) {
       const run = runAt(i);
-      if (run.conclusion === "failure" && run.branch === "main" && !seen.has(run.repository)) {
+      if (run.conclusion === "failure" && run.branch === defaultBranch(repoIndex.get(run.repository) ?? 0) && !seen.has(run.repository)) {
         seen.add(run.repository);
-        failing.push({ repository: run.repository, branch: "main", run: viewOf(run) });
+        failing.push({ repository: run.repository, branch: run.branch, run: viewOf(run) });
       }
     }
     json(res, 200, { approvals, failing });

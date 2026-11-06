@@ -9,13 +9,19 @@ import { approveCiJob, getNeedsYou, type NeedsYou as NeedsYouData } from "@/api"
 import { Button } from "@/components/ui/button";
 import { LoadError } from "@/components/Status";
 import { ago } from "@/lib/format";
-import { jobUrl, runUrl } from "@/lib/urls";
+import { jobUrl, repoUrl, runUrl } from "@/lib/urls";
 import { useLoad, useNow } from "@/load";
 import { Link } from "@/router";
 
 const ROW = "flex flex-wrap items-center gap-x-3.5 gap-y-2 border-t border-rule px-3.5 py-[9px]";
 
-function Row({ edge, glyph, head, rest, children }: { edge: string; glyph: string; head: string; rest: string; children: React.ReactNode }) {
+const repoLink = (repository: string) => (
+  <Link href={repoUrl(repository)} className="hover:text-fg hover:underline">
+    {repository}
+  </Link>
+);
+
+function Row({ edge, glyph, head, rest, children }: { edge: string; glyph: string; head: string; rest: React.ReactNode; children: React.ReactNode }) {
   return (
     <li className={ROW} style={{ boxShadow: `inset 3px 0 0 var(${edge})` }}>
       <span aria-hidden="true" className="w-3.5 text-center font-mono font-semibold" style={{ color: `var(${edge})` }}>
@@ -91,7 +97,7 @@ export function NeedsYou({ org, onChange }: { org: string; onChange: () => void 
             edge="--waiting"
             glyph="!"
             head={job.environment ? "deploy waiting for approval" : "job waiting for approval"}
-            rest={[`${run.repository} #${run.run_number}`, job.environment ?? job.name, run.actor, ago(since, now)].join(" · ")}
+            rest={<>{repoLink(run.repository)} #{run.run_number} · {[job.environment ?? job.name, run.actor, ago(since, now)].join(" · ")}</>}
           >
             <Button asChild variant="outline">
               <Link href={jobUrl(run.repository, run.id, job.id)} aria-label={`Review approval for ${run.repository} ${run.run_number}`}>
@@ -104,7 +110,7 @@ export function NeedsYou({ org, onChange }: { org: string; onChange: () => void 
           </Row>
         ))}
         {failing.map(({ repository, branch, run }) => (
-          <Row key={`f${repository}`} edge="--failed" glyph="✕" head={`${branch} failing`} rest={`${repository} #${run.run_number} · ${run.workflow} · ${ago(run.completed_at ?? run.created_at, now)}`}>
+          <Row key={`f${repository}`} edge="--failed" glyph="✕" head={`${branch} failing`} rest={<>{repoLink(repository)} #{run.run_number} · {run.workflow} · {ago(run.completed_at ?? run.created_at, now)}</>}>
             <Button asChild variant="outline">
               <Link href={runUrl(repository, run.id)} aria-label={`Open run ${repository} ${run.run_number}`}>
                 Open run

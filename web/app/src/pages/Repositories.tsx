@@ -12,7 +12,7 @@ import { Await } from "@/components/Status";
 import { StatusPill, ciStatus } from "@/components/StatusPill";
 import { Truncate } from "@/components/Truncate";
 import { abbreviate, ago } from "@/lib/format";
-import { repoRunsUrl, runUrl } from "@/lib/urls";
+import { repoUrl, runUrl } from "@/lib/urls";
 import { cn } from "@/lib/utils";
 import { useLoad, useNow } from "@/load";
 import { Link, navigate, setQuery, useQuery } from "@/router";
@@ -28,7 +28,7 @@ const SHOW = [
 const PAGE_SIZE = 50;
 
 /** Every repository of the App installation, with its latest run and whether it starts runs. */
-export function Repos({ org }: OrgPageProps) {
+export function Repositories({ org }: OrgPageProps) {
   const q = useQuery("q") ?? "";
   const showId = useQuery("show");
   const show = SHOW.find((item) => item.id === showId) ?? SHOW[0];
@@ -68,7 +68,7 @@ export function Repos({ org }: OrgPageProps) {
 
   return (
     <Page
-      title="Repos"
+      title="Repositories"
       meta={
         repos.state === "ready"
           ? `${abbreviate(repos.data.total)} repositories`
@@ -152,7 +152,9 @@ export function Repos({ org }: OrgPageProps) {
                         className="border-t border-rule hover:bg-raised"
                       >
                         <td className="max-w-[360px] py-2.5 pr-3 pl-3.5 font-semibold whitespace-nowrap">
-                          <Truncate value={repo.name} className="block" />
+                          <Link href={repoUrl(repo.name)} className="block min-w-0 hover:underline">
+                            <Truncate value={repo.name} className="block" />
+                          </Link>
                         </td>
                         <td className="max-w-[220px] px-3 py-2.5 whitespace-nowrap">
                           <Truncate value={repo.default_branch} mono copy />
@@ -202,10 +204,10 @@ export function Repos({ org }: OrgPageProps) {
                               {repo.enabled ? "enabled" : "disabled"}
                             </span>
                             <Link
-                              href={repoRunsUrl(repo.name)}
+                              href={repoUrl(repo.name)}
                               className="font-mono text-[13px] text-fg underline decoration-control underline-offset-3 hover:decoration-fg-3"
                             >
-                              View runs
+                              Open
                             </Link>
                             {repo.enabled && (
                               <button

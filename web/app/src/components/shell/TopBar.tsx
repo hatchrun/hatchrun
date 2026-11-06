@@ -23,8 +23,8 @@ interface Item {
 export function orgNav(org: string): Item[] {
   const base = `/o/${org}`;
   return [
-    { page: ["runs", "run"], label: "Runs", href: base },
-    { page: ["repos"], label: "Repos", href: `${base}/repos` },
+    { page: ["runs"], label: "Runs", href: base },
+    { page: ["repositories", "repository", "run"], label: "Repositories", href: `${base}/repositories` },
     { page: ["secrets"], label: "Secrets", href: `${base}/secrets` },
     { page: ["environments"], label: "Environments", href: `${base}/environments` },
     { page: ["settings", "billing", "setup"], label: "Settings", href: `${base}/settings` },

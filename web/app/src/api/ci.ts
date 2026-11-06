@@ -22,6 +22,14 @@ export interface CiJobCounts {
   skipped: number;
 }
 
+/** The pull request of a run. */
+export interface CiPullRef {
+  number: number;
+  title: string;
+  head_ref: string;
+  base_ref: string;
+}
+
 /** A run of the orchestrator. */
 export interface CiRun {
   id: number;
@@ -39,6 +47,8 @@ export interface CiRun {
   actor: string;
   /** The head commit's subject, at most 200 characters; null when the trigger carried none. */
   message: string | null;
+  /** The pull request a pull_request-triggered run belongs to. */
+  pull_request: CiPullRef | null;
   status: string;
   conclusion: string | null;
   created_at: number;
@@ -94,6 +104,10 @@ export interface RunFilters {
   /** `owner/name`; org list only. */
   repo?: string[];
   branch?: string;
+  /** Workflow name; repository run lists only. */
+  workflow?: string;
+  /** Pull request number; repository run lists only. */
+  pull?: number;
   /** A login, or "me" for the viewer. */
   actor?: string;
   /** Text the run's workflow, title, branch or sha contains. */
@@ -103,8 +117,8 @@ export interface RunFilters {
   until?: number;
 }
 
-const runQuery = ({ status, repo, branch, actor, q, since, until, cursor, limit }: RunFilters & Paging) =>
-  queryString({ status, repo, branch, actor, q, since, until, cursor, limit });
+const runQuery = ({ status, repo, branch, workflow, pull, actor, q, since, until, cursor, limit }: RunFilters & Paging) =>
+  queryString({ status, repo, branch, workflow, pull, actor, q, since, until, cursor, limit });
 
 /** The runs of every repository of an organization the viewer can read, newest first. */
 /** Runs per Runs-page tab under the same filters, status aside. */
@@ -122,6 +136,58 @@ export const listOrgRuns = (org: string, filters: RunFilters & Paging = {}) =>
 /** A repository's runs, newest first. `repo` is not a filter here. */
 export const listRepoRuns = (owner: string, repo: string, filters: Omit<RunFilters, "repo"> & Paging = {}) =>
   retrying(() => get<Page<CiRun>>(`${repoPath(owner, repo)}/runs${runQuery(filters)}`));
+
+/** A repository's page header. */
+export interface CiRepo {
+  /** owner/name. */
+  name: string;
+  default_branch: string;
+  private: boolean;
+  enabled: boolean;
+  html_url: string;
+  counts: { workflows: number; branches: number; open_pulls: number };
+}
+
+export const getRepo = (owner: string, repo: string) => retrying(() => get<CiRepo>(repoPath(owner, repo)));
+
+/** A workflow that ran in the repository, with its last week. */
+export interface CiWorkflow {
+  name: string;
+  last_run: CiRun | null;
+  runs_7d: number;
+  passed_7d: number;
+  failed_7d: number;
+}
+
+export const listRepoWorkflows = (owner: string, repo: string, paging: Paging = {}) =>
+  retrying(() => get<Page<CiWorkflow>>(`${repoPath(owner, repo)}/workflows${queryString({ cursor: paging.cursor, limit: paging.limit })}`));
+
+/** A branch that ran. */
+export interface CiBranch {
+  name: string;
+  default: boolean;
+  last_run: CiRun;
+  runs: number;
+}
+
+export const listRepoBranches = (owner: string, repo: string, { q, cursor, limit }: { q?: string } & Paging = {}) =>
+  retrying(() => get<Page<CiBranch>>(`${repoPath(owner, repo)}/branches${queryString({ q, cursor, limit })}`));
+
+export type PullState = "open" | "closed" | "merged";
+
+export interface CiPull {
+  number: number;
+  title: string;
+  head_ref: string;
+  base_ref: string;
+  author: string;
+  state: PullState;
+  updated_at: number;
+  last_run: CiRun | null;
+}
+
+export const listRepoPulls = (owner: string, repo: string, { state, q, cursor, limit }: { state?: PullState | "all"; q?: string } & Paging = {}) =>
+  retrying(() => get<Page<CiPull>>(`${repoPath(owner, repo)}/pulls${queryString({ state, q, cursor, limit })}`));
 
 /** A job held for an approval the viewer can give. `since` is when it began to wait. */
 export interface CiApproval {
