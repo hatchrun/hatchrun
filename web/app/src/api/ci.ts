@@ -309,12 +309,12 @@ export type ActivityRange = "24h" | "7d";
 export const getActivity = (org: string, range: ActivityRange, repo?: string[]) =>
   retrying(() => get<Activity>(`${orgPath(org)}/activity${queryString({ range, repo })}`));
 
-/** The card on file at Polar. */
+/** The card on file; each detail is null when Polar cannot give it. */
 export interface CiCard {
-  brand: string;
-  last4: string;
-  exp_month: number;
-  exp_year: number;
+  brand: string | null;
+  last4: string | null;
+  exp_month: number | null;
+  exp_year: number | null;
 }
 
 /** One day of the month's spend. */

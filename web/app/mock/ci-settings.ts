@@ -188,7 +188,7 @@ function lastUsed(name: string): number | null {
 /** Organizations the mock Polar checkout put a card on. */
 const carded = new Set<string>();
 export const addCard = (org: string) => void carded.add(org.toLowerCase());
-/** Whether the organization has a card: all do unless MOCK_CARD=off, then those that went through the checkout. */
+/** Whether the organization has a card (octo-labs is shown without details, as when Polar is unreachable): all do unless MOCK_CARD=off, then those that went through the checkout. */
 export const hasCard = (org: string) => process.env.MOCK_CARD !== "off" || carded.has(org.toLowerCase());
 
 const MAX_BYTES = 48 * 1024;
@@ -317,7 +317,7 @@ export function handleCiSettings(
     if (what === "billing" && method === "GET") {
       const daily = dailySpend(owner);
       json(res, 200, {
-        card: hasCard(owner) ? { brand: "visa", last4: "4242", exp_month: 8, exp_year: 2029 } : null,
+        card: hasCard(owner) ? (owner === "octo-labs" ? { brand: null, last4: null, exp_month: null, exp_year: null } : { brand: "visa", last4: "4242", exp_month: 8, exp_year: 2029 }) : null,
         daily,
         invoices: invoicesOf(owner),
         seconds: daily.reduce((sum, d) => sum + d.seconds, 0),

@@ -162,10 +162,13 @@ function Figure({ label, className, children }: { label: string; className?: str
 
 const BRANDS: Record<string, string> = { visa: "Visa", mastercard: "Mastercard", amex: "American Express", discover: "Discover", diners: "Diners Club", jcb: "JCB", unionpay: "UnionPay" };
 
-/** "Visa ending 4242, expires 08/2029". */
+/** "Visa ending 4242, expires 08/2029"; the parts Polar did not give are left out. */
 function cardText(card: CiCard): string {
-  const brand = BRANDS[card.brand.toLowerCase()] ?? card.brand;
-  return `${brand} ending ${card.last4}, expires ${String(card.exp_month).padStart(2, "0")}/${card.exp_year}`;
+  const brand = card.brand ? (BRANDS[card.brand.toLowerCase()] ?? card.brand) : null;
+  const ending = card.last4 ? `ending ${card.last4}` : null;
+  const expiry = card.exp_month !== null && card.exp_year !== null ? `expires ${String(card.exp_month).padStart(2, "0")}/${card.exp_year}` : null;
+  const named = [brand, ending].filter(Boolean).join(" ");
+  return [named, expiry].filter(Boolean).join(", ") || "Card on file";
 }
 
 const CHART = { width: 900, height: 250, left: 48, right: 890, base: 205 };
