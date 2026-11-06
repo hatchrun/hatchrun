@@ -40,6 +40,8 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
             token_permissions: BTreeMap::new(),
             environment: None,
             concurrency: None,
+            container: None,
+            services: std::collections::BTreeMap::new(),
             steps,
         },
         event_name: "push".to_owned(),

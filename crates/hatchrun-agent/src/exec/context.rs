@@ -556,6 +556,8 @@ mod tests {
             token_permissions: BTreeMap::new(),
             environment: None,
             concurrency: None,
+            container: None,
+            services: std::collections::BTreeMap::new(),
             steps: Vec::new(),
         }
     }

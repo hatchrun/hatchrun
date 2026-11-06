@@ -28,23 +28,48 @@ fn reports_line_and_column() {
 }
 
 #[test]
-fn rejects_docker_phase_features() {
-    for (yaml, word) in [
-        ("executors: { d: { docker: [{ image: rust }] } }", "docker"),
-        (
-            "jobs: { t: { runs-on: ubuntu-latest, services: { pg: { image: postgres } }, steps: [] } }",
-            "services",
-        ),
-        (
-            "jobs: { t: { runs-on: ubuntu-latest, container: rust, steps: [] } }",
-            "container",
-        ),
+fn executors_take_no_docker_key() {
+    let err = parse("executors: { d: { docker: [{ image: rust }] } }").unwrap_err();
+    assert!(err[0].message.contains("`container`"), "{err:?}");
+}
+
+#[test]
+fn parses_containers_and_services() {
+    let config = parse(
+        "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    container: rust:1
+    services:
+      pg:
+        image: postgres:17
+        credentials: { username: u, password: p }
+        env: { POSTGRES_PASSWORD: x }
+        ports: [5432, '8080:80']
+        volumes: ['v:/data']
+        options: --health-cmd pg_isready
+    steps: []
+",
+    )
+    .unwrap();
+    let job = &config.jobs["t"];
+    assert_eq!(job.container.as_ref().unwrap().image, "rust:1");
+    let pg = &job.services["pg"];
+    assert_eq!(pg.ports, ["5432", "8080:80"]);
+    assert_eq!(pg.credentials.as_ref().unwrap().password, "p");
+    let yaml = serde_saphyr::to_string(&config).unwrap();
+    assert_eq!(parse(&yaml).unwrap(), config);
+}
+
+#[test]
+fn rejects_malformed_containers() {
+    for yaml in [
+        "jobs: { t: { runs-on: ubuntu-latest, container: { env: {} }, steps: [] } }",
+        "jobs: { t: { runs-on: ubuntu-latest, container: { image: a, bogus: 1 }, steps: [] } }",
+        "jobs: { t: { runs-on: ubuntu-latest, services: { a: { image: a, credentials: { username: u } } }, steps: [] } }",
     ] {
-        let err = parse(yaml).unwrap_err();
-        assert!(
-            err[0].message.contains(word) && err[0].message.contains("later"),
-            "{err:?}"
-        );
+        assert!(parse(yaml).is_err(), "{yaml}");
     }
 }
 

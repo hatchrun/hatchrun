@@ -99,23 +99,10 @@ impl From<ExecutorDe> for Executor {
     }
 }
 
-/// Fails on a key that belongs to the Docker phase.
-fn later<E: de::Error>(key: &str) -> E {
-    E::custom(format!(
-        "{key} is not supported yet; Docker services and containers come in a later release"
-    ))
-}
-
 fn later_docker<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-    Err(later("docker"))
-}
-
-fn later_services<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-    Err(later("services"))
-}
-
-fn later_container<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-    Err(later("container"))
+    Err(de::Error::custom(
+        "docker is not supported in an executor; set `container` on the job",
+    ))
 }
 
 /// A reusable list of steps.
@@ -255,8 +242,182 @@ pub struct Job {
     /// At most one job of a group runs in the repository, one waits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<Concurrency>,
+    /// Runs the steps inside this container instead of on the runner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<Container>,
+    /// Containers that run beside the job, by the hostname the steps
+    /// reach them under.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, Container>,
     /// The steps.
     pub steps: Vec<Step>,
+}
+
+/// A container image the job runs in (`container`) or beside
+/// (`services`), with GitHub's keys. In YAML a bare string is the
+/// image. Every string may hold `${{ }}` over the `github`, `needs`,
+/// `matrix`, `strategy`, `vars`, `secrets` and `inputs` contexts, read
+/// when the job starts.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Container {
+    /// The image, such as `postgres:16` or `ghcr.io/acme/build:1`.
+    pub image: String,
+    /// The registry login for a private image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<Credentials>,
+    /// Environment variables of the container.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Ports to publish, as `docker create -p` reads them: `5432`,
+    /// `8080:80`, `127.0.0.1:8080:80/tcp`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<String>,
+    /// Volumes to mount, as `docker create -v` reads them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<String>,
+    /// More `docker create` options, such as `--cpus 1` or
+    /// `--health-cmd "pg_isready"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<String>,
+}
+
+/// The login `docker login` gets for a container's image.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Credentials {
+    /// The user name.
+    pub username: String,
+    /// The password or token, usually `${{ secrets.X }}`.
+    pub password: String,
+}
+
+/// A string that may be written as a number in YAML, such as a port.
+#[derive(Debug)]
+struct Text(String);
+
+impl<'de> Deserialize<'de> for Text {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl Visitor<'_> for V {
+            type Value = Text;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a string or a number")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Text, E> {
+                Ok(Text(v.to_owned()))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Text, E> {
+                Ok(Text(v.to_string()))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Text, E> {
+                Ok(Text(v.to_string()))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[derive(Default)]
+struct ContainerMap {
+    image: String,
+    credentials: Option<Credentials>,
+    env: BTreeMap<String, String>,
+    ports: Vec<Text>,
+    volumes: Vec<Text>,
+    options: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Container {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Container;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an image or a map with `image`")
+            }
+
+            fn visit_str<E: de::Error>(self, image: &str) -> Result<Container, E> {
+                if image.trim().is_empty() {
+                    return Err(E::custom("a container needs an `image`"));
+                }
+                Ok(Container {
+                    image: image.to_owned(),
+                    ..Container::default()
+                })
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Container, A::Error> {
+                let map = ContainerMap::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                if map.image.trim().is_empty() {
+                    return Err(de::Error::custom("a container needs an `image`"));
+                }
+                Ok(Container {
+                    image: map.image,
+                    credentials: map.credentials,
+                    env: map.env,
+                    ports: map.ports.into_iter().map(|t| t.0).collect(),
+                    volumes: map.volumes.into_iter().map(|t| t.0).collect(),
+                    options: map.options,
+                })
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl Container {
+    /// Every string the container holds, with the key it came from as
+    /// it reads in a message.
+    #[must_use]
+    pub fn texts(&self) -> Vec<(String, &str)> {
+        let mut out = vec![("image".to_owned(), self.image.as_str())];
+        if let Some(c) = &self.credentials {
+            out.push(("credentials.username".to_owned(), &c.username));
+            out.push(("credentials.password".to_owned(), &c.password));
+        }
+        out.extend(
+            self.env
+                .iter()
+                .map(|(k, v)| (format!("env.{k}"), v.as_str())),
+        );
+        out.extend(self.ports.iter().map(|p| ("ports".to_owned(), p.as_str())));
+        out.extend(
+            self.volumes
+                .iter()
+                .map(|v| ("volumes".to_owned(), v.as_str())),
+        );
+        if let Some(o) = &self.options {
+            out.push(("options".to_owned(), o));
+        }
+        out
+    }
+
+    /// Replaces every string the container holds with what `f` makes
+    /// of it.
+    pub fn map_texts(&mut self, f: &mut dyn FnMut(&str) -> String) {
+        self.image = f(&self.image);
+        if let Some(c) = &mut self.credentials {
+            c.username = f(&c.username);
+            c.password = f(&c.password);
+        }
+        for v in self.env.values_mut() {
+            *v = f(v);
+        }
+        for v in self.ports.iter_mut().chain(self.volumes.iter_mut()) {
+            *v = f(v);
+        }
+        if let Some(o) = &mut self.options {
+            *o = f(o);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -275,11 +436,9 @@ struct JobDe {
     permissions: Option<Permissions>,
     environment: Option<String>,
     concurrency: Option<Concurrency>,
+    container: Option<Container>,
+    services: BTreeMap<String, Container>,
     steps: Vec<Step>,
-    #[serde(rename = "services", deserialize_with = "later_services")]
-    _services: (),
-    #[serde(rename = "container", deserialize_with = "later_container")]
-    _container: (),
 }
 
 impl Default for JobDe {
@@ -298,9 +457,9 @@ impl Default for JobDe {
             permissions: job.permissions,
             environment: job.environment,
             concurrency: job.concurrency,
+            container: job.container,
+            services: job.services,
             steps: job.steps,
-            _services: (),
-            _container: (),
         }
     }
 }
@@ -320,6 +479,8 @@ impl From<JobDe> for Job {
             permissions: de.permissions,
             environment: de.environment,
             concurrency: de.concurrency,
+            container: de.container,
+            services: de.services,
             steps: de.steps,
         }
     }
