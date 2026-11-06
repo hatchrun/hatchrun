@@ -120,6 +120,13 @@ export function segments(line: string): Segment[] {
   return out;
 }
 
+/** A line as plain text: escapes and control characters dropped, as the log view shows it. */
+export function plain(line: string): string {
+  return segments(line)
+    .map((segment) => segment.text)
+    .join("");
+}
+
 /** Control characters other than a tab, and a lone escape, have no place in a line of text. */
 function clean(text: string): string {
   // eslint-disable-next-line no-control-regex

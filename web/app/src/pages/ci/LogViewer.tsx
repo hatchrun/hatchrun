@@ -12,7 +12,7 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer,
 import { abbreviate, duration } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { StatusGlyph, ciStatus } from "@/components/StatusPill";
-import { segments } from "./ansi";
+import { plain, segments } from "./ansi";
 import { isError, type LogSource, type SearchResult, type Step } from "./logSource";
 import { BTN, BTN_PRIMARY, BTN_SM, FIELD } from "./runUi";
 
@@ -31,6 +31,11 @@ interface Section {
   /** First line below the header. */
   body: number;
   count: number;
+}
+
+/** An error line for the summary and the error list: no escapes, no `##[error]` marker. */
+function errorText(line: string): string {
+  return plain(line).replace(/^##\[error\]/, "");
 }
 
 function sectionsOf(source: LogSource): Section[] {
@@ -528,8 +533,8 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
               <span aria-hidden="true" className="text-fg-3">
                 └
               </span>
-              <span className="min-w-0 truncate" title={firstError.text}>
-                {firstError.text.replace(/^##\[error\]/, "")}
+              <span className="min-w-0 truncate" title={errorText(firstError.text)}>
+                {errorText(firstError.text)}
               </span>
             </div>
           </div>
@@ -609,8 +614,8 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
                   }}
                 >
                   <span className="w-14 shrink-0 text-right text-queued tabular-nums">{error.line + 1}</span>
-                  <span className="min-w-0 flex-1 truncate text-fg" title={error.text}>
-                    {error.text.replace(/^##\[error\]/, "")}
+                  <span className="min-w-0 flex-1 truncate text-fg" title={errorText(error.text)}>
+                    {errorText(error.text)}
                   </span>
                   <span className="max-w-28 shrink-0 truncate text-fg-3">{stepOf(error.step)}</span>
                 </button>
