@@ -107,6 +107,34 @@ pub enum Route<'a> {
         /// The organization.
         org: &'a str,
     },
+    /// A repository, with what its page counts.
+    Repo {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+    },
+    /// The workflows that ran in a repository.
+    Workflows {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+    },
+    /// The branches that ran in a repository.
+    Branches {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+    },
+    /// The pull requests of a repository.
+    Pulls {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+    },
     /// A repository's runs.
     Runs {
         /// The owner.
@@ -182,6 +210,22 @@ pub fn route(path: &str) -> Option<Route<'_>> {
         ["orgs", org, "runs"] => Some(Route::OrgRuns { org: login(org)? }),
         ["orgs", org, "activity"] => Some(Route::OrgActivity { org: login(org)? }),
         ["orgs", org, "needs-you"] => Some(Route::NeedsYou { org: login(org)? }),
+        ["repos", owner, repo] => Some(Route::Repo {
+            owner: name(owner)?,
+            repo: name(repo)?,
+        }),
+        ["repos", owner, repo, "workflows"] => Some(Route::Workflows {
+            owner: name(owner)?,
+            repo: name(repo)?,
+        }),
+        ["repos", owner, repo, "branches"] => Some(Route::Branches {
+            owner: name(owner)?,
+            repo: name(repo)?,
+        }),
+        ["repos", owner, repo, "pulls"] => Some(Route::Pulls {
+            owner: name(owner)?,
+            repo: name(repo)?,
+        }),
         ["repos", owner, repo, "runs"] => Some(Route::Runs {
             owner: name(owner)?,
             repo: name(repo)?,
@@ -463,6 +507,12 @@ pub(crate) fn run_json(run: &RunRow, repository: &str, jobs: JobCounts) -> Value
         "sha": run.sha,
         "actor": run.actor,
         "message": run.message,
+        "pull_request": run.pull_number.map(|number| json!({
+            "number": number,
+            "title": run.pull_title,
+            "head_ref": run.head_ref,
+            "base_ref": run.base_ref,
+        })),
         "status": run.status,
         "conclusion": run.conclusion,
         "created_at": run.created_at,
@@ -536,7 +586,7 @@ fn job_json(row: &JobRow, live: &BTreeMap<u64, Value>) -> Value {
 }
 
 /// The name the console reads an access by.
-fn access_name(access: Access) -> &'static str {
+pub(crate) fn access_name(access: Access) -> &'static str {
     match access {
         Access::None | Access::Read => "read",
         Access::Write => "write",
@@ -686,6 +736,14 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
         Route::OrgRuns { org } => org_api::runs(&cx, org, query.as_deref()).await,
         Route::OrgActivity { org } => org_api::activity(&cx, org, query.as_deref()).await,
         Route::NeedsYou { org } => org_api::needs_you(&cx, org).await,
+        Route::Repo { owner, repo } => org_api::repo(&cx, owner, repo).await,
+        Route::Workflows { owner, repo } => {
+            org_api::workflows(&cx, owner, repo, query.as_deref()).await
+        }
+        Route::Branches { owner, repo } => {
+            org_api::branches(&cx, owner, repo, query.as_deref()).await
+        }
+        Route::Pulls { owner, repo } => org_api::pulls(&cx, owner, repo, query.as_deref()).await,
         Route::Runs { owner, repo } => cx.runs(owner, repo, query.as_deref()).await,
         Route::Run(run) => cx.run(run).await,
         Route::Log(job) => match log_range(query.as_deref()) {
@@ -740,10 +798,24 @@ impl Cx<'_> {
         name: &str,
         want: Access,
     ) -> Result<Served<RepoRow>> {
+        Ok(self
+            .repo_access(owner, name, want)
+            .await?
+            .map(|(repo, _)| repo))
+    }
+
+    /// The repository and the caller's access to it, when that is at
+    /// least `want`.
+    pub(crate) async fn repo_access(
+        &self,
+        owner: &str,
+        name: &str,
+        want: Access,
+    ) -> Result<Served<(RepoRow, Access)>> {
         let Some(repo) = store::repo_by_name(self.db, &format!("{owner}/{name}")).await? else {
             return Ok(stop(404, "not found"));
         };
-        Ok(self.allowed(&repo, want).await?.map(|_| repo))
+        Ok(self.allowed(&repo, want).await?.map(|have| (repo, have)))
     }
 
     /// The caller's access when it is at least `want`.
@@ -1503,6 +1575,38 @@ mod tests {
             route("/api/ci/jobs/7/log/search"),
             Some(Route::LogSearch(7))
         );
+        for (path, want) in [
+            (
+                "/api/ci/repos/acme/app",
+                Route::Repo {
+                    owner: "acme",
+                    repo: "app",
+                },
+            ),
+            (
+                "/api/ci/repos/acme/app/workflows",
+                Route::Workflows {
+                    owner: "acme",
+                    repo: "app",
+                },
+            ),
+            (
+                "/api/ci/repos/acme/app/branches",
+                Route::Branches {
+                    owner: "acme",
+                    repo: "app",
+                },
+            ),
+            (
+                "/api/ci/repos/acme/app/pulls",
+                Route::Pulls {
+                    owner: "acme",
+                    repo: "app",
+                },
+            ),
+        ] {
+            assert_eq!(route(path), Some(want), "{path}");
+        }
         assert_eq!(
             route("/api/ci/orgs/acme/runs"),
             Some(Route::OrgRuns { org: "acme" })
@@ -1556,7 +1660,10 @@ mod tests {
             "/api/ci/runs/1/artifacts/x",
             "/api/ci/runs/1/artifacts/2/more",
             "/api/ci/jobs/7/logs",
-            "/api/ci/repos/acme/runs",
+            "/api/ci/repos/acme",
+            "/api/ci/repos/acme/app/pulls/3",
+            "/api/ci/repos/acme/app/",
+            "/api/ci/repos/a%2Fb/app",
             "/api/ci/repos/a%2Fb/app/runs",
             "/api/ci/repos//app/runs",
             "/api/ci/runs/99999999999999999999999",

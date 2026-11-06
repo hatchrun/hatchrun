@@ -14,6 +14,9 @@ const STANDING: &str = "SELECT tenants.id AS tenant_id, tenants.org_login, \
        (tenants.beta OR EXISTS (SELECT 1 FROM subscriptions \
          WHERE subscriptions.tenant_id = tenants.id \
          AND subscriptions.status IN ('active', 'trialing'))) AS card, \
+       EXISTS (SELECT 1 FROM subscriptions \
+         WHERE subscriptions.tenant_id = tenants.id \
+         AND subscriptions.status IN ('active', 'trialing')) AS subscribed, \
        COALESCE((SELECT cap_micros FROM ci_spend_caps WHERE tenant_id = tenants.id), $3) \
          AS cap_micros, \
        COALESCE((SELECT json_agg(json_build_object('template', u.template, 'seconds', u.seconds)) \
@@ -81,6 +84,9 @@ pub struct Standing {
     /// Whether the tenant is in the beta or has an active or trialing
     /// subscription.
     pub card: bool,
+    /// Whether the tenant has an active or trialing subscription, which
+    /// a beta tenant may lack.
+    pub subscribed: bool,
     /// The monthly spend cap in micros: the tenant's own or the default.
     pub cap_micros: u64,
     /// Billed seconds metered this month, per template label.
@@ -98,6 +104,7 @@ struct StandingRow {
     tenant_id: String,
     org_login: String,
     card: bool,
+    subscribed: bool,
     cap_micros: u64,
     seconds_by_template: String,
     units: u64,
@@ -116,6 +123,7 @@ impl StandingRow {
             tenant_id: self.tenant_id,
             org_login: self.org_login,
             card: self.card,
+            subscribed: self.subscribed,
             cap_micros: self.cap_micros,
             seconds_by_template: seconds
                 .into_iter()

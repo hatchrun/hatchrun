@@ -35,6 +35,10 @@ pub struct NewRun {
     /// The head commit's subject or the pull request's title, cut to
     /// 200 characters.
     pub message: Option<String>,
+    /// The pull request's number, for a run of a pull request.
+    pub pull_number: Option<u64>,
+    /// The pull request's head branch, as a short name.
+    pub head_ref: Option<String>,
     /// When the run is recorded.
     pub now: u64,
 }
@@ -79,17 +83,25 @@ pub struct RunRow {
     pub retention_days: u32,
     /// The head commit's subject or the pull request's title.
     pub message: Option<String>,
+    /// The pull request's number. Runs recorded before pull requests
+    /// were kept have none.
+    pub pull_number: Option<u64>,
+    /// The pull request's head branch, with the number.
+    pub head_ref: Option<String>,
+    /// The pull request's title, as the `pull_request` webhook last
+    /// said it.
+    pub pull_title: Option<String>,
 }
 
 impl RunRow {
-    /// The branch the run is on: that of a push, the base branch of a
+    /// The branch the run is on: that of a push, the head branch of a
     /// pull request, none for a tag. The same as [`BRANCH`].
     #[must_use]
     pub fn branch(&self) -> Option<&str> {
         if let Some(name) = self.git_ref.strip_prefix("refs/heads/") {
             Some(name)
         } else if self.git_ref.starts_with("refs/pull/") {
-            self.base_ref.as_deref()
+            self.head_ref.as_deref()
         } else {
             None
         }
@@ -99,7 +111,10 @@ impl RunRow {
 /// The columns of a [`RunRow`].
 const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, \
      event, ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
-     completed_at, (expires_at - created_at) / 86400000 AS retention_days, message";
+     completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
+     pull_number, head_ref, \
+     (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
+      AND number = ci_runs.pull_number) AS pull_title";
 
 /// The run of delivery `$1` and workflow `$2`, where `{columns}` is
 /// [`RUN_COLUMNS`].
@@ -114,7 +129,8 @@ const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE
 /// Records a run and takes its number in one statement, run after
 /// [`LOCK_REPO`]. Binds `$1` tenant, `$2` repository, `$3` workflow,
 /// `$4` delivery, `$5` event, `$6` ref, `$7` sha, `$8` actor, `$9`
-/// now, `$10` the pull request's base branch and `$11` the message. The run expires after its tenant's retention tier (30 or 90 days), read
+/// now, `$10` the pull request's base branch, `$11` the message, `$12` the
+/// pull request's number and `$13` its head branch. The run expires after its tenant's retention tier (30 or 90 days), read
 /// in the same statement. The number is taken only when no run of this
 /// delivery and workflow exists, so a duplicate leaves the counter
 /// alone, and the statement returns no row for it.
@@ -125,13 +141,17 @@ const INSERT_RUN: &str = "WITH n AS (\
        ON CONFLICT (repo_id, workflow) DO UPDATE SET last = ci_run_numbers.last + 1 \
        RETURNING last) \
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
-       actor, base_ref, message, status, created_at, updated_at, expires_at) \
-     SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, $10::text, $11::text, 'queued', $9, $9, \
+       actor, base_ref, message, pull_number, head_ref, status, created_at, updated_at, \
+       expires_at) \
+     SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, $10::text, $11::text, $12::bigint, $13::text, 'queued', $9, $9, \
        $9 + (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END * 86400000::bigint \
          FROM tenants WHERE id = $1) FROM n \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
        ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
-       completed_at, (expires_at - created_at) / 86400000 AS retention_days, message";
+       completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
+       pull_number, head_ref, \
+       (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
+        AND number = ci_runs.pull_number) AS pull_title";
 
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
@@ -169,7 +189,9 @@ pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>> {
             &run.actor,
             run.now,
             &run.base_ref,
-            &run.message
+            &run.message,
+            run.pull_number,
+            &run.head_ref
         ],
     )
     .await
@@ -251,11 +273,11 @@ impl RunStatus {
     }
 }
 
-/// The branch a run is on: the branch of a push, the base branch of a
+/// The branch a run is on: the branch of a push, the head branch of a
 /// pull request, nothing for a tag or other refs. For a query that
 /// aliases `ci_runs` as `r`.
-const BRANCH: &str = "CASE WHEN r.ref LIKE 'refs/heads/%' THEN substr(r.ref, 12) \
-     WHEN r.ref LIKE 'refs/pull/%' THEN r.base_ref END";
+pub(super) const BRANCH: &str = "CASE WHEN r.ref LIKE 'refs/heads/%' THEN substr(r.ref, 12) \
+     WHEN r.ref LIKE 'refs/pull/%' THEN r.head_ref END";
 
 /// Which runs a list holds. Every field narrows the list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -271,6 +293,10 @@ pub struct RunFilter {
     pub branches: Vec<String>,
     /// Actor logins; empty for all.
     pub actors: Vec<String>,
+    /// Workflow file names; empty for all.
+    pub workflows: Vec<String>,
+    /// The pull request number, for the runs of that pull request.
+    pub pull: Option<u64>,
     /// Text in the workflow, ref, actor or the start of the commit.
     pub text: Option<String>,
     /// Runs recorded at or after this, in Unix milliseconds.
@@ -300,7 +326,7 @@ pub struct After {
 }
 
 /// Escapes `text` for a `LIKE` pattern.
-fn like(text: &str) -> String {
+pub(super) fn like(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('%');
     for c in text.chars() {
@@ -314,7 +340,7 @@ fn like(text: &str) -> String {
 }
 
 /// The `WHERE` of a run list over `ci_runs r` and `ci_repos p`, and
-/// its parameters `$1` to `$9`.
+/// its parameters `$1` to `$10`.
 fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
     let mut sql = String::from(
         "p.id = r.repo_id AND p.tenant_id = r.tenant_id \
@@ -328,7 +354,9 @@ fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
         " = ANY (string_to_array($5, ','))) \
          AND ($6::text IS NULL OR lower(r.actor) = ANY (string_to_array(lower($6), ','))) \
          AND ($7::text IS NULL OR r.workflow ILIKE $7 OR r.ref ILIKE $7 OR r.actor ILIKE $7 \
-           OR r.sha ILIKE $8::text)",
+           OR r.sha ILIKE $8::text) \
+         AND ($9::text IS NULL OR r.workflow = ANY (string_to_array($9, ','))) \
+         AND ($10::bigint IS NULL OR r.pull_number = $10::bigint)",
     );
     if !filter.states.is_empty() {
         let any: Vec<&str> = filter.states.iter().map(|s| s.condition()).collect();
@@ -351,7 +379,9 @@ fn run_where(filter: &RunFilter) -> (String, Vec<hatchrun_cloud::db::Param>) {
         list(&filter.branches),
         list(&filter.actors),
         text,
-        sha
+        sha,
+        list(&filter.workflows),
+        filter.pull
     ];
     (sql, bound)
 }
@@ -361,7 +391,9 @@ pub(super) const LISTED_COLUMNS: &str = "r.id, r.run_number, r.run_attempt, r.te
      r.workflow, r.delivery, r.event, r.ref AS git_ref, r.sha, r.actor, r.base_ref, r.status, \
      r.conclusion, r.created_at, r.completed_at, \
      (r.expires_at - r.created_at) / 86400000 AS retention_days, r.message, \
-     p.full_name AS repository";
+     r.pull_number, r.head_ref, \
+     (SELECT title FROM ci_pulls WHERE repo_id = r.repo_id AND number = r.pull_number) \
+     AS pull_title, p.full_name AS repository";
 
 /// One page of the runs `filter` holds, newest first, those after
 /// `after` when it is set, at most `limit`; and how many runs the
@@ -399,11 +431,30 @@ pub async fn runs_page(
     let page = format!(
         "SELECT {LISTED_COLUMNS} FROM ci_runs r, ci_repos p \
          WHERE {conditions} \
-         AND ($9::bigint IS NULL OR (r.created_at, r.id) < ($9::bigint, $10::bigint)) \
-         ORDER BY r.created_at DESC, r.id DESC LIMIT $11"
+         AND ($11::bigint IS NULL OR (r.created_at, r.id) < ($11::bigint, $12::bigint)) \
+         ORDER BY r.created_at DESC, r.id DESC LIMIT $13"
     );
     let rows = db.all(&page, &bound).await?;
     Ok((rows, total))
+}
+
+/// The runs `ids` name, with their repositories' names, for the runs of
+/// the repositories' present tenants only. The order is unspecified.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn listed_runs(db: &Db, ids: &[u64]) -> Result<Vec<ListedRun>> {
+    let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
+    db.all(
+        &format!(
+            "SELECT {LISTED_COLUMNS} FROM ci_runs r, ci_repos p \
+             WHERE p.id = r.repo_id AND p.tenant_id = r.tenant_id \
+             AND r.id = ANY (string_to_array($1, ',')::bigint[])"
+        ),
+        &params![ids.join(",")],
+    )
+    .await
 }
 
 /// What one bucket of the activity chart holds.

@@ -330,7 +330,7 @@ function filterRuns(url: URL, repoFixed?: string): RunRow[] {
 let enabledAll: boolean | null = null;
 const enabledSet = new Set<string>();
 const hashEnabled = (i: number) => hash(i, 50) % 10 !== 0;
-const isEnabled = (name: string, i: number) => (enabledAll === null ? hashEnabled(i) : enabledAll || enabledSet.has(name));
+const isEnabled = (name: string, i: number) => (enabledAll === null ? hashEnabled(i) : enabledAll || enabledSet.has(name.toLowerCase()));
 
 const lastRunOf = new Map<string, RunRow>();
 function lastRuns() {
@@ -657,10 +657,12 @@ export function handleScale(
     if ((asked.all !== undefined && typeof asked.all !== "boolean") || add === null || remove === null) {
       return json(res, 400, { error: 'expected {"all": true} or {"add": [], "remove": []}' }), true;
     }
-    if (add.some((name) => !REPOS.includes(name)) || remove.some((name) => !REPOS.includes(name))) return json(res, 422, { error: "a repository is not part of the installation" }), true;
+    // Names match without regard to case, as the server does.
+    const known = new Set(REPOS.map((name) => name.toLowerCase()));
+    if (add.some((name) => !known.has(name.toLowerCase())) || remove.some((name) => !known.has(name.toLowerCase()))) return json(res, 422, { error: "a repository is not part of the installation" }), true;
     // Leaving the unset-by-hand state, the seeded repositories become the explicit set.
     if (enabledAll === null) {
-      REPOS.forEach((name, i) => hashEnabled(i) && enabledSet.add(name));
+      REPOS.forEach((name, i) => hashEnabled(i) && enabledSet.add(name.toLowerCase()));
       enabledAll = false;
     }
     if (typeof asked.all === "boolean") {
@@ -668,11 +670,11 @@ export function handleScale(
       if (asked.all) enabledSet.clear();
     }
     if (enabledAll && remove.length > 0) {
-      REPOS.forEach((name) => enabledSet.add(name));
+      REPOS.forEach((name) => enabledSet.add(name.toLowerCase()));
       enabledAll = false;
     }
-    for (const name of add) enabledSet.add(name);
-    for (const name of remove) enabledSet.delete(name);
+    for (const name of add) enabledSet.add(name.toLowerCase());
+    for (const name of remove) enabledSet.delete(name.toLowerCase());
     recordAudit("repos.enabled", SCALE_ORG, asked.all === true ? "all repositories" : `${add.length} added, ${remove.length} removed`);
     json(res, 204);
     return true;

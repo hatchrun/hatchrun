@@ -576,6 +576,7 @@ fn beta_tenant_has_a_card_without_a_subscription() {
         .unwrap()
         .unwrap();
     assert!(standing.card);
+    assert!(!standing.subscribed);
     db.run("UPDATE tenants SET beta = false WHERE id = 't1'", &[]);
     assert!(!card(&db));
 }
@@ -880,6 +881,7 @@ fn daily_usage_groups_by_utc_day() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One fixture, read top to bottom.
 fn standing_counts_this_month_and_running_jobs() {
     let db = setup();
     let month = 1_790_812_800_000_u64;
@@ -919,6 +921,7 @@ fn standing_counts_this_month_and_running_jobs() {
             tenant_id: "t1".into(),
             org_login: "acme".into(),
             card: false,
+            subscribed: false,
             cap_micros: default_cap,
             seconds_by_template: vec![
                 ("removed-label".into(), 60),

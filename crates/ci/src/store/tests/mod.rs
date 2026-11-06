@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 mod artifacts;
+mod browse;
 mod cache;
 mod concurrency;
 mod jobs;
@@ -78,6 +79,8 @@ pub(super) fn new_run(delivery: &str, workflow: &str, now: u64) -> NewRun {
         actor: "octocat".into(),
         base_ref: None,
         message: None,
+        pull_number: None,
+        head_ref: None,
         now,
     }
 }

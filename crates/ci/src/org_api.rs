@@ -25,14 +25,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use worker::{Request, Response, Result};
 
-use crate::access::{self, Failure};
-use crate::api::{Cx, Served, Stop, name, no_content, now_ms, reply, run_json, stop};
+use crate::access::{self, Access, Failure};
+use crate::api::{Cx, Served, Stop, access_name, name, no_content, now_ms, reply, run_json, stop};
 use crate::billing;
 use crate::installation;
 use crate::page::{self, Query};
 use crate::settings_api::{admin_tenant, audit_of};
 use crate::store::{
-    self, After, JobCounts, ListedRun, RepoFilter, RepoVisibility, RunFilter, RunStatus, TenantRow,
+    self, After, BranchAfter, JobCounts, ListedRun, PullAfter, RepoFilter, RepoRow, RepoVisibility,
+    RunFilter, RunStatus, TenantRow,
 };
 
 /// How far back the org-wide run list looks when the caller gives no
@@ -213,6 +214,8 @@ pub fn run_filter(
         states,
         repos,
         branches: query.list("branch"),
+        workflows: query.list("workflow"),
+        pull: query.number("pull")?,
         actors,
         text,
         since: query
@@ -449,8 +452,10 @@ async fn repos_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
     ))?)
 }
 
-/// The body of `PATCH .../repos/enabled`. `all` sets every repository
-/// on or off; `add` and `remove` then turn the named ones on or off.
+/// The body of `PATCH .../repos/enabled`. `all: true` turns every
+/// repository on; `all: false` leaves all mode and keeps each
+/// repository's own choice. `add` and `remove` then turn the named
+/// ones on and off.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnabledBody {
@@ -694,6 +699,263 @@ async fn environments_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done 
     ))?)
 }
 
+/// How far back the counts of a workflow look, in milliseconds.
+const WORKFLOW_WINDOW_MS: u64 = 7 * 86_400_000;
+
+/// The repository of `owner/name`, when the caller may read it.
+async fn readable_repo(cx: &Cx<'_>, owner: &str, name: &str) -> Done<RepoRow> {
+    cx.repo(owner, name, Access::Read)
+        .await?
+        .map_err(Fail::Stop)
+}
+
+/// The newest runs `ids` name, as the run lists show them, by id.
+async fn runs_by_id(cx: &Cx<'_>, ids: &[u64]) -> Done<HashMap<u64, Value>> {
+    let rows = store::listed_runs(cx.db, ids).await?;
+    let found: Vec<u64> = rows.iter().map(|row| row.run.id).collect();
+    let counts: HashMap<u64, JobCounts> = store::job_counts(cx.db, &found)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(rows
+        .iter()
+        .map(|row| (row.run.id, listed_json(row, &counts)))
+        .collect())
+}
+
+/// `GET /repos/{owner}/{repo}`.
+pub(crate) async fn repo(cx: &Cx<'_>, owner: &str, name: &str) -> Result<Served> {
+    finish(repo_done(cx, owner, name).await)
+}
+
+async fn repo_done(cx: &Cx<'_>, owner: &str, name: &str) -> Done {
+    let (repo, access) = cx
+        .repo_access(owner, name, Access::Read)
+        .await?
+        .map_err(Fail::Stop)?;
+    let counts = store::repo_counts(cx.db, repo.id, &repo.tenant_id).await?;
+    let enabled = store::repo_enabled(cx.db, &repo.tenant_id, repo.id).await?;
+    Ok(Response::from_json(&repo_body(
+        &repo, enabled, &counts, access,
+    ))?)
+}
+
+/// The answer of `GET /repos/{owner}/{repo}`.
+fn repo_body(repo: &RepoRow, enabled: bool, counts: &store::RepoCounts, access: Access) -> Value {
+    json!({
+        "name": repo.full_name,
+        "default_branch": repo.default_branch,
+        "private": repo.private,
+        "enabled": enabled,
+        "html_url": format!("https://github.com/{}", repo.full_name),
+        "access": access_name(access),
+        "counts": counts,
+    })
+}
+
+/// The cursor of a page of workflows or branches that ends at `run`.
+fn after_run(cursor: Option<&[u64]>, parts: usize) -> Done<Option<&[u64]>> {
+    match cursor {
+        Some(found) if found.len() != parts => refuse(400, "the cursor is not valid"),
+        other => Ok(other),
+    }
+}
+
+/// `GET /repos/{owner}/{repo}/workflows`.
+pub(crate) async fn workflows(
+    cx: &Cx<'_>,
+    owner: &str,
+    name: &str,
+    query: Option<&str>,
+) -> Result<Served> {
+    finish(workflows_done(cx, owner, name, query).await)
+}
+
+async fn workflows_done(cx: &Cx<'_>, owner: &str, name: &str, query: Option<&str>) -> Done {
+    let query = Query::parse(query);
+    let repo = readable_repo(cx, owner, name).await?;
+    let limit = query.limit()?;
+    let cursor = query.cursor()?;
+    let after = after_run(cursor.as_deref(), 2)?.map(|c| After {
+        created_at: c[0],
+        id: c[1],
+    });
+    let since = now_ms().saturating_sub(WORKFLOW_WINDOW_MS);
+    let (mut rows, total) =
+        store::workflows_page(cx.db, repo.id, &repo.tenant_id, since, after, limit + 1).await?;
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next = rows
+        .last()
+        .filter(|_| more)
+        .map(|last| page::encode(&[last.last_at, last.last_run_id]));
+    let ids: Vec<u64> = rows.iter().map(|row| row.last_run_id).collect();
+    let runs = runs_by_id(cx, &ids).await?;
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "name": row.name,
+                "last_run": runs.get(&row.last_run_id),
+                "runs_7d": row.runs_7d,
+                "passed_7d": row.passed_7d,
+                "failed_7d": row.failed_7d,
+            })
+        })
+        .collect();
+    Ok(Response::from_json(&page::page(
+        &items,
+        total,
+        next.as_deref(),
+    ))?)
+}
+
+/// `GET /repos/{owner}/{repo}/branches`.
+pub(crate) async fn branches(
+    cx: &Cx<'_>,
+    owner: &str,
+    name: &str,
+    query: Option<&str>,
+) -> Result<Served> {
+    finish(branches_done(cx, owner, name, query).await)
+}
+
+async fn branches_done(cx: &Cx<'_>, owner: &str, name: &str, query: Option<&str>) -> Done {
+    let query = Query::parse(query);
+    let repo = readable_repo(cx, owner, name).await?;
+    let limit = query.limit()?;
+    let text = search_text(&query);
+    let cursor = query.cursor()?;
+    let after = after_run(cursor.as_deref(), 3)?
+        .map(|c| {
+            if c[0] > 1 {
+                return refuse(400, "the cursor is not valid");
+            }
+            Ok(BranchAfter {
+                rank: c[0],
+                run: After {
+                    created_at: c[1],
+                    id: c[2],
+                },
+            })
+        })
+        .transpose()?;
+    let (mut rows, total) = store::branches_page(
+        cx.db,
+        repo.id,
+        &repo.tenant_id,
+        &repo.default_branch,
+        text.as_deref(),
+        after,
+        limit + 1,
+    )
+    .await?;
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next = rows
+        .last()
+        .filter(|_| more)
+        .map(|last| page::encode(&[u64::from(!last.default), last.last_at, last.last_run_id]));
+    let ids: Vec<u64> = rows.iter().map(|row| row.last_run_id).collect();
+    let runs = runs_by_id(cx, &ids).await?;
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "name": row.name,
+                "default": row.default,
+                "last_run": runs.get(&row.last_run_id),
+                "runs": row.runs,
+            })
+        })
+        .collect();
+    Ok(Response::from_json(&page::page(
+        &items,
+        total,
+        next.as_deref(),
+    ))?)
+}
+
+/// The `q` of a query, trimmed and cut, `None` when empty.
+fn search_text(query: &Query) -> Option<String> {
+    query
+        .get("q")
+        .map(|text| text.trim().chars().take(MAX_TEXT).collect::<String>())
+        .filter(|text| !text.is_empty())
+}
+
+/// The pull request state a `state` word names: `None` for all.
+fn pull_state(word: Option<&str>) -> std::result::Result<Option<&'static str>, Stop> {
+    match word {
+        None | Some("open") => Ok(Some("open")),
+        Some("closed") => Ok(Some("closed")),
+        Some("merged") => Ok(Some("merged")),
+        Some("all") => Ok(None),
+        Some(_) => stop(400, "state is open, closed, merged or all"),
+    }
+}
+
+/// `GET /repos/{owner}/{repo}/pulls`.
+pub(crate) async fn pulls(
+    cx: &Cx<'_>,
+    owner: &str,
+    name: &str,
+    query: Option<&str>,
+) -> Result<Served> {
+    finish(pulls_done(cx, owner, name, query).await)
+}
+
+async fn pulls_done(cx: &Cx<'_>, owner: &str, name: &str, query: Option<&str>) -> Done {
+    let query = Query::parse(query);
+    let repo = readable_repo(cx, owner, name).await?;
+    let limit = query.limit()?;
+    let state = pull_state(query.get("state"))?;
+    let text = search_text(&query);
+    let cursor = query.cursor()?;
+    let after = after_run(cursor.as_deref(), 2)?.map(|c| PullAfter {
+        updated_at: c[0],
+        number: c[1],
+    });
+    let (mut rows, total) = store::pulls_page(
+        cx.db,
+        repo.id,
+        &repo.tenant_id,
+        state,
+        text.as_deref(),
+        after,
+        limit + 1,
+    )
+    .await?;
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next = rows
+        .last()
+        .filter(|_| more)
+        .map(|last| page::encode(&[last.updated_at, last.number]));
+    let ids: Vec<u64> = rows.iter().filter_map(|row| row.last_run_id).collect();
+    let runs = runs_by_id(cx, &ids).await?;
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "number": row.number,
+                "title": row.title,
+                "head_ref": row.head_ref,
+                "base_ref": row.base_ref,
+                "author": row.author,
+                "state": row.state,
+                "updated_at": row.updated_at,
+                "last_run": row.last_run_id.and_then(|id| runs.get(&id)),
+            })
+        })
+        .collect();
+    Ok(Response::from_json(&page::page(
+        &items,
+        total,
+        next.as_deref(),
+    ))?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,6 +983,50 @@ mod tests {
         assert_eq!(f.text.as_deref(), Some("fix"));
         assert_eq!(f.since, 9 * DEFAULT_WINDOW_MS);
         assert_eq!(f.until, Some(99));
+    }
+
+    #[test]
+    fn workflow_and_pull_filters_are_read() {
+        let f = filter("workflow=ci.yml,lint.yml&pull=12", None).unwrap();
+        assert_eq!(f.workflows, ["ci.yml", "lint.yml"]);
+        assert_eq!(f.pull, Some(12));
+        assert!(filter("pull=x", None).is_err());
+    }
+
+    #[test]
+    fn the_repository_answer_names_the_access() {
+        let repo = RepoRow {
+            id: 7,
+            tenant_id: "t".into(),
+            installation_id: 1,
+            full_name: "acme/app".into(),
+            default_branch: "main".into(),
+            private: true,
+        };
+        let counts = store::RepoCounts {
+            workflows: 2,
+            branches: 3,
+            open_pulls: 1,
+        };
+        for (access, name) in [
+            (Access::Read, "read"),
+            (Access::Write, "write"),
+            (Access::Admin, "admin"),
+        ] {
+            let body = repo_body(&repo, true, &counts, access);
+            assert_eq!(body["access"], name);
+            assert_eq!(body["name"], "acme/app");
+            assert_eq!(body["html_url"], "https://github.com/acme/app");
+            assert_eq!(body["counts"]["open_pulls"], 1);
+        }
+    }
+
+    #[test]
+    fn pull_states_default_to_open() {
+        assert_eq!(pull_state(None), Ok(Some("open")));
+        assert_eq!(pull_state(Some("merged")), Ok(Some("merged")));
+        assert_eq!(pull_state(Some("all")), Ok(None));
+        assert!(pull_state(Some("draft")).is_err());
     }
 
     #[test]

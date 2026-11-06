@@ -96,6 +96,58 @@ async fn vars_of(db: &Db, owner: Owner) -> Result<Vec<VarItem>> {
 }
 
 #[test]
+fn a_refused_audit_row_rolls_the_change_back() {
+    let db = setup();
+    put_var_ok(&db, Owner::Org, "V", "1");
+    put_secret_ok(&db, Owner::Org, "S", "k", "s");
+    let audits = |db: &TestDb| db.rows("SELECT id FROM ci_audit", &[]).unwrap().len();
+    let before = audits(&db);
+    // The audit table refuses a scope it does not know, and the put,
+    // which shares its statement, is undone with it.
+    let bad = NewAudit {
+        scope: "bogus",
+        ..audit(Action::VarPut, "V")
+    };
+    let put = db.wait(put_var(
+        db.db(),
+        "t1",
+        Owner::Org,
+        None,
+        "V",
+        "2",
+        100,
+        6,
+        &bad,
+    ));
+    assert!(put.is_err());
+    let put = db.wait(put_secret(
+        db.db(),
+        "t1",
+        Owner::Org,
+        None,
+        "T",
+        "k",
+        "s",
+        100,
+        6,
+        &NewAudit {
+            action: Action::SecretPut,
+            ..bad
+        },
+    ));
+    assert!(put.is_err());
+    let vars = db.wait(vars_of(db.db(), Owner::Org)).unwrap();
+    assert_eq!(vars.len(), 1);
+    assert_eq!(vars[0].value, "1");
+    let secrets = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
+    assert_eq!(
+        secrets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        ["S"]
+    );
+    assert_eq!(audits(&db), before);
+}
+
+#[test]
 fn a_change_records_its_audit_row_with_it() {
     let db = setup();
     let rows = |db: &TestDb| {
