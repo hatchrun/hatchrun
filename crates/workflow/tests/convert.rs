@@ -1146,6 +1146,41 @@ jobs:
 }
 
 #[test]
+fn github_larger_runner_labels_map_to_templates() {
+    let cases = [
+        ("ubuntu-latest-4-cores", "ubuntu-26.04-4core"),
+        ("ubuntu-22.04-8core", "ubuntu-26.04-8core"),
+        ("ubuntu-24.04-16core", "ubuntu-26.04-16core"),
+        ("ubuntu-latest-xl", "ubuntu-26.04-8core"),
+        ("ubuntu-24.04-arm-8-cores", "ubuntu-26.04-8core-arm"),
+    ];
+    for (label, want) in cases {
+        let out = ok(&format!(
+            "on: push\njobs:\n  t: {{ runs-on: {label}, steps: [{{ run: x }}] }}\n"
+        ));
+        assert_eq!(out.errors, [], "{label}");
+        assert_eq!(
+            out.config.jobs["ci-t"].runs_on.as_deref(),
+            Some(want),
+            "{label}"
+        );
+        assert!(has(&out.warnings, &[label, "became"]), "{label}");
+        round_trips(&out);
+    }
+    // Sizes with no template run on the largest, and the warning says so.
+    let out =
+        ok("on: push\njobs:\n  t: { runs-on: ubuntu-latest-32-cores, steps: [{ run: x }] }\n");
+    assert_eq!(
+        out.config.jobs["ci-t"].runs_on.as_deref(),
+        Some("ubuntu-26.04-16core")
+    );
+    assert!(has(
+        &out.warnings,
+        &["asks for 32 vCPUs", "the largest template has 16"]
+    ));
+}
+
+#[test]
 fn a_runs_on_matrix_without_a_template_is_an_error() {
     let out = ok("on: push
 jobs:
