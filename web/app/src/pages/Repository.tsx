@@ -25,7 +25,7 @@ import { Await } from "@/components/Status";
 import { StatusPill, ciStatus } from "@/components/StatusPill";
 import { Truncate } from "@/components/Truncate";
 import { Button } from "@/components/ui/button";
-import { abbreviate, ago, shortSha } from "@/lib/format";
+import { abbreviate, ago, isoDateTime, shortSha, tableDate } from "@/lib/format";
 import { orgUrl, repoUrl, runUrl, workflowUrl, type RepoTab } from "@/lib/urls";
 import { cn } from "@/lib/utils";
 import { useLoad, useNow } from "@/load";
@@ -599,7 +599,7 @@ function PullsTab({ org, repo }: { org: string; repo: string }) {
                         <td className="px-3 py-2.5 whitespace-nowrap">
                           <LastRun run={pull.last_run} now={now} />
                         </td>
-                        <td className="px-3.5 py-2.5 text-[13px] whitespace-nowrap text-fg-3">{ago(pull.updated_at, now)}</td>
+                        <td className="px-3.5 py-2.5 text-[13px] whitespace-nowrap text-fg-3" title={isoDateTime(pull.updated_at)}>{tableDate(pull.updated_at, now)}</td>
                       </tr>
                     );
                   })}
