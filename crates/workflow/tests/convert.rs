@@ -2824,3 +2824,116 @@ fn workflow_run_and_release_keep_their_activity_types() {
     assert_eq!(out.warnings, []);
     round_trips(&out);
 }
+
+#[test]
+fn merge_group_and_repository_dispatch_convert() {
+    let out = ok("
+on:
+  merge_group:
+  repository_dispatch: { types: [deploy, rollback] }
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    let on = &out.config.workflows["ci"].on;
+    assert_eq!(on.merge_group.as_ref().unwrap().types, ["checks_requested"]);
+    assert_eq!(
+        on.repository_dispatch.as_ref().unwrap().types,
+        ["deploy", "rollback"]
+    );
+    assert_eq!(out.errors, []);
+    assert_eq!(out.warnings, []);
+    round_trips(&out);
+
+    let out = ok("on: [merge_group, repository_dispatch]
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    let on = &out.config.workflows["ci"].on;
+    assert!(on.merge_group.is_some());
+    assert_eq!(
+        on.repository_dispatch.as_ref().unwrap().types,
+        Vec::<String>::new()
+    );
+    assert_eq!(out.warnings, []);
+    round_trips(&out);
+
+    let out = ok("
+on:
+  merge_group: { types: [checks_requested], branches: [main] }
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert!(out.config.workflows["ci"].on.merge_group.is_some());
+    assert!(has(
+        &out.warnings,
+        &["`on.merge_group`", "branch filters", "dropped"]
+    ));
+
+    let out = ok("
+on:
+  push:
+  merge_group: { types: [destroyed] }
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    assert!(out.config.workflows["ci"].on.merge_group.is_none());
+    assert!(has(&out.warnings, &["`on.merge_group`", "`destroyed`"]));
+}
+
+#[test]
+fn the_deploy_fixture_converts_without_losing_a_capability() {
+    let out = convert(&[(
+        ".github/workflows/deploy.yml".into(),
+        include_str!("fixtures/github/deploy.yml").into(),
+    )])
+    .unwrap();
+    assert_eq!(out.errors, []);
+    // Only the larger runner label is reported, as it is renamed.
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(has(
+        &out.warnings,
+        &["ubuntu-latest-8-cores", "ubuntu-26.04-8core"]
+    ));
+    round_trips(&out);
+
+    let wf = &out.config.workflows["deploy"];
+    assert_eq!(
+        wf.run_name.as_deref(),
+        Some("Deploy ${{ inputs.target || 'staging' }} (${{ github.actor }})")
+    );
+    assert!(wf.on.merge_group.is_some());
+    assert_eq!(
+        wf.on.repository_dispatch.as_ref().unwrap().types,
+        ["deploy-request"]
+    );
+    let job = &out.config.jobs["deploy-deploy"];
+    assert_eq!(job.runs_on.as_deref(), Some("ubuntu-26.04-8core"));
+    assert!(
+        job.environment
+            .as_deref()
+            .unwrap()
+            .contains("matrix.region")
+    );
+    assert!(
+        job.environment_url
+            .as_deref()
+            .unwrap()
+            .contains("steps.up.outputs.id")
+    );
+    let Step::Uses(checkout) = &job.steps[0] else {
+        panic!("{:?}", job.steps[0])
+    };
+    assert_eq!(checkout.timeout_minutes, Some(5));
+
+    // The plan names the environment of each matrix leg when it starts.
+    let plan = hatchrun_workflow::compile(&out.config, "deploy", "refs/heads/main").unwrap();
+    let deploys: Vec<_> = plan.jobs.iter().filter(|j| j.name == "deploy").collect();
+    assert_eq!(deploys.len(), 2);
+    assert_eq!(
+        deploys[1].matrix["region"],
+        json!("us"),
+        "{:?}",
+        deploys[1].matrix
+    );
+    assert_eq!(plan.run_name, wf.run_name);
+}

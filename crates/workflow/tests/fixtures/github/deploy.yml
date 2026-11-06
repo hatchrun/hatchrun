@@ -1,0 +1,37 @@
+name: Deploy
+run-name: Deploy ${{ inputs.target || 'staging' }} (${{ github.actor }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Where to deploy
+        default: staging
+  merge_group:
+    types: [checks_requested]
+  repository_dispatch:
+    types: [deploy-request]
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    outputs:
+      stage: ${{ steps.pick.outputs.stage }}
+    steps:
+      - id: pick
+        run: echo "stage=blue" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: pick
+    runs-on: ubuntu-latest-8-cores
+    strategy:
+      matrix:
+        region: [eu, us]
+    environment:
+      name: ${{ needs.pick.outputs.stage }}-${{ matrix.region }}
+      url: https://${{ matrix.region }}.example.com/${{ steps.up.outputs.id }}
+    steps:
+      - uses: actions/checkout@v5
+        timeout-minutes: 5
+      - id: up
+        run: echo "id=7" >> "$GITHUB_OUTPUT"

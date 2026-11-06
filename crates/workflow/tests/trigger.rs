@@ -387,6 +387,56 @@ fn create_and_delete_take_no_filters() {
 }
 
 #[test]
+fn merge_group_matches_its_type() {
+    let checks = Event::MergeGroup {
+        action: "checks_requested".into(),
+    };
+    for yaml in ["merge_group:", "merge_group: { types: [checks_requested] }"] {
+        let t = on(yaml);
+        assert!(triggered(&t, &checks), "{yaml}");
+        assert!(!triggered(&t, &Event::Create), "{yaml}");
+    }
+    assert!(!triggered(&on("push: {}"), &checks));
+    assert!(!triggered(
+        &on("merge_group:"),
+        &Event::MergeGroup {
+            action: "destroyed".into()
+        }
+    ));
+    assert!(serde_saphyr::from_str::<Triggers>("merge_group: { branches: [main] }").is_err());
+}
+
+#[test]
+fn repository_dispatch_filters_by_event_type() {
+    let event = |kind: &str| Event::RepositoryDispatch {
+        action: kind.into(),
+    };
+    let any = on("repository_dispatch:");
+    assert!(triggered(&any, &event("deploy")) && triggered(&any, &event("anything")));
+    let some = on("repository_dispatch: { types: [deploy, rollback] }");
+    assert!(triggered(&some, &event("rollback")));
+    assert!(!triggered(&some, &event("build")));
+    let one = on("repository_dispatch: { types: deploy }");
+    assert!(triggered(&one, &event("deploy")) && !triggered(&one, &event("rollback")));
+    assert!(!triggered(&on("push: {}"), &event("deploy")));
+    assert!(!triggered(&some, &Event::Dispatch));
+}
+
+#[test]
+fn merge_group_and_repository_dispatch_round_trip() {
+    for yaml in [
+        "merge_group:",
+        "repository_dispatch:",
+        "repository_dispatch: { types: [deploy] }",
+        "merge_group: {}\nrepository_dispatch: { types: [a, b] }",
+    ] {
+        let t = on(yaml);
+        let written = serde_saphyr::to_string(&t).unwrap();
+        assert_eq!(on(&written), t, "{yaml}\n{written}");
+    }
+}
+
+#[test]
 fn new_triggers_round_trip() {
     for yaml in [
         "workflow_run: { workflows: [ci], types: [completed], branches: [main] }",

@@ -536,6 +536,20 @@ pub struct Triggers {
         skip_serializing_if = "Option::is_none"
     )]
     pub delete: Option<RefTrigger>,
+    /// A pull request entering the merge queue, for its checks.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub merge_group: Option<MergeGroupTrigger>,
+    /// A `repository_dispatch` request sent to the repository.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repository_dispatch: Option<RepositoryDispatchTrigger>,
 }
 
 /// `on: create` and `on: delete`, which take no filters.
@@ -673,6 +687,43 @@ pub struct ReleaseTrigger {
     pub tags_ignore: Option<Filter>,
 }
 
+/// `on: merge_group`: a merge queue entry asks for its checks. The run
+/// is on the merge group's head commit, so the queue sees its results.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct MergeGroupTrigger {
+    /// Activity types, from [`MERGE_GROUP_TYPES`]; `checks_requested`
+    /// when absent. One type may be written as a plain string.
+    #[serde(deserialize_with = "one_or_many")]
+    pub types: Vec<String>,
+}
+
+/// The activity types `on.merge_group` accepts.
+pub const MERGE_GROUP_TYPES: &[&str] = &["checks_requested"];
+
+impl Default for MergeGroupTrigger {
+    fn default() -> Self {
+        Self {
+            types: vec!["checks_requested".to_owned()],
+        }
+    }
+}
+
+/// `on: repository_dispatch`: a `POST /repos/{repo}/dispatches` request
+/// starts the workflow on the default branch. The request's
+/// `client_payload` is in `github.event`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RepositoryDispatchTrigger {
+    /// The `event_type` values that start the workflow; any when empty.
+    /// One may be written as a plain string.
+    #[serde(
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub types: Vec<String>,
+}
+
 /// The activity types `on.release` accepts.
 pub const RELEASE_TYPES: &[&str] = &[
     "published",
@@ -770,6 +821,16 @@ pub enum Event {
     Create,
     /// A branch or tag was deleted.
     Delete,
+    /// A merge queue entry asks for its checks.
+    MergeGroup {
+        /// The activity type, `checks_requested`.
+        action: String,
+    },
+    /// A repository dispatch request.
+    RepositoryDispatch {
+        /// The request's `event_type`.
+        action: String,
+    },
 }
 
 /// Whether `event` starts a workflow with the triggers `on`.
@@ -809,6 +870,14 @@ pub fn triggered(on: &Triggers, event: &Event) -> bool {
         }),
         Event::Create => on.create.is_some(),
         Event::Delete => on.delete.is_some(),
+        Event::MergeGroup { action } => on
+            .merge_group
+            .as_ref()
+            .is_some_and(|group| group.types.iter().any(|t| t == action)),
+        Event::RepositoryDispatch { action } => on
+            .repository_dispatch
+            .as_ref()
+            .is_some_and(|d| d.types.is_empty() || d.types.iter().any(|t| t == action)),
     }
 }
 

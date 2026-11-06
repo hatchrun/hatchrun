@@ -31,8 +31,9 @@ use crate::permissions::{Level, Permissions, SCOPES};
 use crate::plan;
 use crate::templates::{template, template_labels, vendor_template};
 use crate::trigger::{
-    Dispatch, Filter, PullRequestTrigger, PushTrigger, RELEASE_TYPES, RefTrigger, ReleaseTrigger,
-    Schedule, Triggers, WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
+    Dispatch, Filter, MERGE_GROUP_TYPES, MergeGroupTrigger, PullRequestTrigger, PushTrigger,
+    RELEASE_TYPES, RefTrigger, ReleaseTrigger, RepositoryDispatchTrigger, Schedule, Triggers,
+    WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
 };
 
 /// The result of a conversion: the config and what was dropped on the way.
@@ -235,8 +236,7 @@ const OLD_UBUNTU: &[(&str, &str)] = &[
 const UNSUPPORTED_CONTEXTS: &[&str] = &["jobs"];
 
 /// The events hatchrun can start a workflow on.
-const EVENTS: &str =
-    "push, pull_request, schedule, workflow_dispatch, workflow_run, release, create and delete";
+const EVENTS: &str = "push, pull_request, schedule, workflow_dispatch, workflow_run, release, create, delete, merge_group and repository_dispatch";
 
 /// Events that only GitHub can deliver, as they act on GitHub's own
 /// issues and pull requests with the base repository's secrets.
@@ -398,6 +398,26 @@ struct GhRef {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GhRelease {
+    #[serde(default)]
+    types: Option<Value>,
+}
+
+/// `on.merge_group`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct GhMergeGroup {
+    #[serde(default)]
+    types: Option<Value>,
+    #[serde(default)]
+    branches: Option<Value>,
+    #[serde(default)]
+    branches_ignore: Option<Value>,
+}
+
+/// `on.repository_dispatch`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GhRepositoryDispatch {
     #[serde(default)]
     types: Option<Value>,
 }

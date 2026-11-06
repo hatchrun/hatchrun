@@ -59,7 +59,8 @@ pub use templates::{
     template_labels,
 };
 pub use trigger::{
-    Dispatch, Event, Filter, MAX_CHANGED, MAX_GLOBS, MAX_PATTERNS, PullRequestTrigger, PushTrigger,
-    RELEASE_TYPES, RefTrigger, ReleaseTrigger, Schedule, Triggers, WORKFLOW_RUN_TYPES,
-    WorkflowRunTrigger, triggered,
+    Dispatch, Event, Filter, MAX_CHANGED, MAX_GLOBS, MAX_PATTERNS, MERGE_GROUP_TYPES,
+    MergeGroupTrigger, PullRequestTrigger, PushTrigger, RELEASE_TYPES, RefTrigger, ReleaseTrigger,
+    RepositoryDispatchTrigger, Schedule, Triggers, WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
+    triggered,
 };

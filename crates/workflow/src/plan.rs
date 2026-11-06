@@ -28,7 +28,7 @@ use crate::expr::{self, ExprError};
 use crate::permissions::{Level, token_scopes};
 use crate::templates::{Template, template, template_labels};
 use crate::trigger::{
-    Filter, MAX_GLOBS, MAX_PATTERNS, RELEASE_TYPES, Triggers, WORKFLOW_RUN_TYPES,
+    Filter, MAX_GLOBS, MAX_PATTERNS, MERGE_GROUP_TYPES, RELEASE_TYPES, Triggers, WORKFLOW_RUN_TYPES,
 };
 
 /// The timeout of a job that sets none.
@@ -1283,6 +1283,21 @@ fn trigger_errors(config: &Config, name: &str, on: &Triggers, errors: &mut Vec<D
     }
     if let Some(release) = &on.release {
         types_errors(name, "release", &release.types, RELEASE_TYPES, errors);
+    }
+    queue_and_dispatch_errors(name, on, errors);
+}
+
+/// Problems in `on.merge_group` and `on.repository_dispatch`.
+fn queue_and_dispatch_errors(name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
+    if let Some(group) = &on.merge_group {
+        types_errors(name, "merge_group", &group.types, MERGE_GROUP_TYPES, errors);
+    }
+    if let Some(dispatch) = &on.repository_dispatch
+        && dispatch.types.iter().any(|t| t.trim().is_empty())
+    {
+        errors.push(Diagnostic::new(format!(
+            "workflow `{name}`: `on.repository_dispatch.types` has an empty type"
+        )));
     }
 }
 
