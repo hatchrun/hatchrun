@@ -30,6 +30,8 @@ export function Page({
 }) {
   return (
     <div className={cn("mx-auto flex w-full flex-col gap-4", narrow ? "max-w-[880px]" : "max-w-[1400px]")}>
+      {/* Settings pages keep the sub-nav and title in the same 880px column, wide content below stays wide. */}
+      <div className={cn("flex flex-col gap-4", nav && !narrow && "mx-auto w-full max-w-[880px]")}>
       {nav}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
@@ -37,6 +39,7 @@ export function Page({
           {meta && <span className="font-mono text-[13px] text-fg-2">{meta}</span>}
         </div>
         {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+      </div>
       </div>
       {children}
     </div>

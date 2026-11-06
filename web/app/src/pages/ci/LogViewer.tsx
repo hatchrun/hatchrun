@@ -540,7 +540,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
         </div>
       )}
       <div className="relative flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-rule px-3 py-1.5">
-        <div role="group" aria-label="Find in this log" className="flex items-center gap-1.5 rounded-sm border border-rule px-1.5 py-1">
+        <div role="group" aria-label="Find in this log" className="flex shrink items-center gap-1.5 rounded-sm border border-rule px-1.5 py-1">
           <label className="sr-only" htmlFor="log-find">
             Find in log
           </label>
@@ -550,7 +550,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
             type="search"
             value={q}
             placeholder="Find in log"
-            className={cn(FIELD, "h-7 w-32")}
+            className={cn(FIELD, "h-7 w-44 min-w-[9rem]")}
             onChange={(event) => {
               setQ(event.target.value);
               setSearch(event.target.value === "" ? { state: "idle" } : { state: "loading" });
@@ -574,7 +574,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
             <ChevronDown size={12} aria-hidden="true" />
           </button>
         </div>
-        <div role="group" aria-label="Errors in this log" className="relative flex items-center gap-1.5 rounded-sm border border-rule px-1.5 py-1">
+        <div role="group" aria-label="Errors in this log" className="relative flex shrink-0 items-center gap-1.5 rounded-sm border border-rule px-1.5 py-1">
           <span className={cn("min-w-[6rem] font-mono text-[13px] whitespace-nowrap", errors.length === 0 ? "text-fg-3" : "text-failed")}>{errorLabel}</span>
           <button type="button" className={cn(BTN_SM, "h-7 w-7 px-0")} aria-label="Previous error" disabled={errors.length === 0} onClick={() => stepError(-1)}>
             <ChevronUp size={12} aria-hidden="true" />

@@ -105,19 +105,22 @@ function SetupSteps({ org, admin, setup, reload }: { org: string; admin: boolean
     },
   ];
 
+  const complete = steps.every((step) => step.done);
   return (
     <Page
       title={`Set up ${org}`}
       nav={<SettingsNav org={org} current="setup" admin={admin} />}
       meta={<ChecklistCount steps={steps} />}
       actions={
-        <Link href={orgUrl(org)} className="font-mono text-xs text-fg-2 quiet-underline hover:text-fg">
-          Skip to Runs →
-        </Link>
+        complete ? undefined : (
+          <Link href={orgUrl(org)} className="font-mono text-xs text-fg-2 quiet-underline hover:text-fg">
+            Skip to Runs →
+          </Link>
+        )
       }
       narrow
     >
-      {steps.every((step) => step.done) && (
+      {complete && (
         <section aria-label="Setup complete" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-passed bg-panel px-4 py-3">
           <div className="flex items-center gap-3">
             <span aria-hidden="true" className="font-mono font-bold text-passed">
@@ -135,7 +138,7 @@ function SetupSteps({ org, admin, setup, reload }: { org: string; admin: boolean
           </Link>
         </section>
       )}
-      <Checklist steps={steps} label="CI setup steps" />
+      <Checklist steps={steps} label="CI setup steps" collapseDone={complete} />
     </Page>
   );
 }
