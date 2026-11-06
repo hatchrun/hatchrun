@@ -5,6 +5,7 @@
 import { ExternalLink, Search } from "lucide-react";
 import type { ReactNode } from "react";
 
+import { shortcut } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 import { Link, type OrgPage } from "@/router";
 import { Logo } from "../Logo";
@@ -23,11 +24,11 @@ interface Item {
 export function orgNav(org: string): Item[] {
   const base = `/o/${org}`;
   return [
-    { page: ["runs", "run"], label: "Runs", href: base },
-    { page: ["repos"], label: "Repos", href: `${base}/repos` },
+    { page: ["runs"], label: "Runs", href: base },
+    { page: ["repositories", "repository", "run"], label: "Repositories", href: `${base}/repositories` },
     { page: ["secrets"], label: "Secrets", href: `${base}/secrets` },
     { page: ["environments"], label: "Environments", href: `${base}/environments` },
-    { page: ["settings", "billing", "setup"], label: "Settings", href: `${base}/settings` },
+    { page: ["billing", "setup", "audit"], label: "Settings", href: `${base}/settings/billing` },
   ];
 }
 
@@ -54,9 +55,9 @@ export function OrgTabs({ org, current }: { org: string; current: OrgPage | null
 
 export function SearchButton({ onClick }: { onClick: () => void }) {
   return (
-    <button type="button" className={BAR_BUTTON} aria-label="Search, shortcut command K" onClick={onClick}>
+    <button type="button" className={BAR_BUTTON} aria-label={`Search, shortcut ${shortcut("K")}`} onClick={onClick}>
       <Search size={16} aria-hidden="true" className="shrink-0" />
-      <span className="rounded-xs border border-control px-1.5 font-mono text-xs leading-4 font-normal max-[899px]:hidden">⌘K</span>
+      <span className="rounded-xs border border-control px-1.5 font-mono text-xs leading-4 font-normal max-[899px]:hidden">{shortcut("K")}</span>
     </button>
   );
 }

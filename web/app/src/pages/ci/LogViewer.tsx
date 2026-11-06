@@ -6,7 +6,7 @@
 // DOM, lines fetched by byte range around the viewport (see
 // logSource.ts), find, error navigation and following a live job.
 
-import { ChevronDown, ChevronRight, ChevronUp } from "lucide-react";
+import { ChevronDown, ChevronRight, ChevronUp, Ellipsis, ListTree } from "lucide-react";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
 
 import { abbreviate, duration } from "@/lib/format";
@@ -169,12 +169,17 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
   const [q, setQ] = useState("");
   const [search, setSearch] = useState<Search>({ state: "idle" });
   const [matchAt, setMatchAt] = useState(-1);
-  const [errAt, setErrAt] = useState(-1);
-  const [menu, setMenu] = useState<"steps" | "errors" | null>(null);
-  const [target, setTarget] = useState<{ line: number; seq: number } | null>(null);
+  // A failed job opens on its first error line, highlighted.
+  const startError = failed && !live ? source.errors[0] : undefined;
+  const [errAt, setErrAt] = useState(startError ? 0 : -1);
+  const [menu, setMenu] = useState<"steps" | "errors" | "more" | null>(null);
+  const [target, setTarget] = useState<{ line: number; seq: number } | null>(startError ? { line: startError.line, seq: 1 } : null);
   const [scrollTop, setScrollTop] = useState(0);
   const [height, setHeight] = useState(600);
+  const [narrow, setNarrow] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
+  const frame = useRef<HTMLElement>(null);
+  const jumpRef = useRef<(line: number) => void>(() => undefined);
   const finder = useRef<HTMLInputElement>(null);
   const handled = useRef(0);
   const lastTop = useRef(0);
@@ -222,10 +227,18 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
     if (!el) {
       return;
     }
-    const measure = () => setHeight(el.clientHeight);
+    // Never more than a couple of screens, whatever the layout gives the
+    // box: an unbounded one would draw every row of a 200,000 line log.
+    const measure = () => {
+      setHeight(Math.min(el.clientHeight, window.innerHeight * 2));
+      setNarrow((frame.current?.clientWidth ?? 9999) < 960);
+    };
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(el);
+    if (frame.current) {
+      observer.observe(frame.current);
+    }
     return () => observer.disconnect();
   }, []);
 
@@ -271,6 +284,10 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
   );
 
   useLayoutEffect(() => {
+    jumpRef.current = jump;
+  });
+
+  useLayoutEffect(() => {
     if (target && handled.current !== target.seq) {
       const row = rowOf(target.line);
       if (row >= 0) {
@@ -287,11 +304,14 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
       return;
     }
     opened.current = true;
+    if (failed && source.errors[0]) {
+      return;
+    }
     const at = sections.findIndex((s) => failedStep(s.step));
     if (at > 0) {
       scrollToRow(layout.starts[at] as number, "top");
     }
-  }, [live, sections, layout, scrollToRow]);
+  }, [live, sections, layout, scrollToRow]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A running job: new steps open, and the view follows the end.
   const seen = useRef(sections.length);
@@ -325,13 +345,18 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
             setSearch({ state: "ready", q, ...found });
             if (searchedQ.current !== q) {
               searchedQ.current = q;
-              setMatchAt(-1);
+              // Typing jumps to the first match.
+              const hit = found.matches[0];
+              setMatchAt(hit ? 0 : -1);
+              if (hit) {
+                jumpRef.current(hit.line);
+              }
             }
           }
         },
         (err: unknown) => current && setSearch({ state: "error", message: err instanceof Error ? err.message : String(err) }),
       );
-    }, 300);
+    }, 250);
     return () => {
       current = false;
       window.clearTimeout(timer);
@@ -401,9 +426,10 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
         : search.state === "ready"
           ? search.total === 0
             ? "no matches"
-            : `${matchAt >= 0 ? matchAt + 1 : "-"} of ${abbreviate(search.total)}${search.truncated ? "+" : ""}`
-          : "";
-  const errorLabel = `${errors.length}${errors.length >= 200 ? "+" : ""} ${errors.length === 1 ? "error" : "errors"}`;
+            : `Match ${matchAt >= 0 ? matchAt + 1 : "-"} of ${abbreviate(search.total)}${search.truncated ? "+" : ""}`
+          : "Match - of -";
+  const errorLabel =
+    errors.length === 0 ? "No errors" : `Error ${errAt >= 0 ? errAt + 1 : "-"} of ${errors.length}${errors.length >= 200 ? "+" : ""}`;
 
   // The window of rows.
   const rows: ReactNode[] = [];
@@ -459,7 +485,7 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
           className={cn(
             "flex min-h-[20px] font-mono text-[12.5px] leading-[20px] hover:bg-raised",
             bad && "bg-failed/10",
-            target?.line === line && "bg-brand/15 shadow-[inset_2px_0_0_var(--brand)]",
+            target?.line === line && "bg-brand/25 shadow-[inset_3px_0_0_var(--brand)]",
           )}
         >
           <span aria-hidden="true" className="sticky left-0 w-[68px] shrink-0 bg-inherit pr-3 text-right text-fg-3 tabular-nums select-none">
@@ -487,11 +513,11 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
   };
 
   return (
-    <section aria-label="Log" className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-md border border-rule bg-panel">
+    <section ref={frame} aria-label="Log" title={name} className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-md border border-rule bg-panel">
       {failed && firstError && (
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-rule bg-failed/10 px-3 py-2">
-          <div className="flex min-w-0 flex-col gap-0.5 font-mono text-[13px]">
-            <div className="flex min-w-0 items-center gap-2">
+        <div className="flex items-center justify-between gap-3 border-b border-rule bg-failed/10 px-3 py-1">
+          <div className="flex min-w-0 items-center gap-2 font-mono text-[13px]">
+            <div className="flex shrink-0 items-center gap-2">
               <span aria-hidden="true" className="text-failed">
                 ✕
               </span>
@@ -513,22 +539,18 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
           </button>
         </div>
       )}
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-rule px-3 py-2">
-        <span className="cap">Log</span>
-        <span className="max-w-[200px] min-w-0 truncate font-mono text-[13px] text-fg" title={name}>
-          {name}
-        </span>
-        <div className="flex items-center gap-1.5">
-          <label className="cap" htmlFor="log-find">
-            Find
+      <div className="relative flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-rule px-3 py-1.5">
+        <div role="group" aria-label="Find in this log" className="flex shrink items-center gap-1.5 rounded-sm border border-rule px-1.5 py-1">
+          <label className="sr-only" htmlFor="log-find">
+            Find in log
           </label>
           <input
             id="log-find"
             ref={finder}
             type="search"
             value={q}
-            placeholder="text in log"
-            className={cn(FIELD, "w-44")}
+            placeholder="Find in log"
+            className={cn(FIELD, "h-7 w-44 min-w-[9rem]")}
             onChange={(event) => {
               setQ(event.target.value);
               setSearch(event.target.value === "" ? { state: "idle" } : { state: "loading" });
@@ -542,36 +564,35 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
               }
             }}
           />
-          <span className="min-w-16 font-mono text-[13px] text-fg-2" role="status">
+          <span className="min-w-[6.5rem] font-mono text-[13px] whitespace-nowrap text-fg-2" role="status">
             {matchLabel}
           </span>
-          <button type="button" className={BTN_SM} aria-label="Previous match" disabled={matches.length === 0} onClick={() => stepMatch(-1)}>
+          <button type="button" className={cn(BTN_SM, "h-7 w-7 px-0")} aria-label="Previous match" disabled={matches.length === 0} onClick={() => stepMatch(-1)}>
             <ChevronUp size={12} aria-hidden="true" />
           </button>
-          <button type="button" className={BTN_SM} aria-label="Next match" disabled={matches.length === 0} onClick={() => stepMatch(1)}>
+          <button type="button" className={cn(BTN_SM, "h-7 w-7 px-0")} aria-label="Next match" disabled={matches.length === 0} onClick={() => stepMatch(1)}>
             <ChevronDown size={12} aria-hidden="true" />
           </button>
         </div>
-        <div role="group" aria-label="Errors in this log" className="relative flex items-center gap-1.5">
+        <div role="group" aria-label="Errors in this log" className="relative flex shrink-0 items-center gap-1.5 rounded-sm border border-rule px-1.5 py-1">
+          <span className={cn("min-w-[6rem] font-mono text-[13px] whitespace-nowrap", errors.length === 0 ? "text-fg-3" : "text-failed")}>{errorLabel}</span>
+          <button type="button" className={cn(BTN_SM, "h-7 w-7 px-0")} aria-label="Previous error" disabled={errors.length === 0} onClick={() => stepError(-1)}>
+            <ChevronUp size={12} aria-hidden="true" />
+          </button>
+          <button type="button" className={cn(BTN_SM, "h-7 w-7 px-0")} aria-label="Next error" disabled={errors.length === 0} onClick={() => stepError(1)}>
+            <ChevronDown size={12} aria-hidden="true" />
+          </button>
           <button
             type="button"
-            className={BTN_SM}
+            className={cn(BTN_SM, "h-7 w-7 px-0")}
+            aria-label="List all errors"
+            title="List all errors"
             aria-haspopup="true"
             aria-expanded={menu === "errors"}
             disabled={errors.length === 0}
             onClick={() => setMenu(menu === "errors" ? null : "errors")}
           >
-            {errors.length === 0 ? "no errors" : errorLabel}
-            <ChevronDown size={11} aria-hidden="true" />
-          </button>
-          {errors.length > 0 && (
-            <span className="min-w-12 font-mono text-[13px] text-fg-2">{errAt >= 0 ? `${errAt + 1} of ${errors.length}` : ""}</span>
-          )}
-          <button type="button" className={BTN_SM} aria-label="Previous error" disabled={errors.length === 0} onClick={() => stepError(-1)}>
-            <ChevronUp size={12} aria-hidden="true" />
-          </button>
-          <button type="button" className={BTN_SM} aria-label="Next error" disabled={errors.length === 0} onClick={() => stepError(1)}>
-            <ChevronDown size={12} aria-hidden="true" />
+            <ListTree size={12} aria-hidden="true" />
           </button>
           {menu === "errors" && (
             <div role="menu" aria-label="Errors in this log" className="absolute top-full left-0 z-30 mt-1 max-h-80 w-[520px] max-w-[80vw] overflow-y-auto rounded-md border border-control bg-raised py-1 shadow-xl">
@@ -598,52 +619,21 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
           )}
         </div>
         <div className="flex-1" />
-        <div className="flex items-center gap-1.5">
-          <button type="button" className={BTN} aria-pressed={wrap} onClick={() => setWrap(!wrap)}>
-            Wrap
-          </button>
-          <button
-            type="button"
-            className={BTN}
-            aria-pressed={times}
-            disabled={!times && !anyStamp}
-            title={anyStamp || times ? "Show the time of each line" : "The lines in view carry no timestamps"}
-            onClick={() => setTimes(!times)}
-          >
-            Timestamps
-          </button>
-          <button type="button" className={BTN} disabled={downloading} aria-label="Download this job log as a text file" onClick={download}>
-            {downloading ? "Preparing" : "Download"}
-          </button>
-          {downloadError !== null && (
-            <span role="alert" className="max-w-[240px] truncate font-mono text-[13px] text-failed" title={downloadError}>
-              Download failed: {downloadError}
-            </span>
-          )}
-          <button
-            type="button"
-            className={BTN}
-            aria-pressed={live && follow}
-            disabled={!live}
-            title={live ? "Keep the newest line in view" : "The job has ended"}
-            onClick={() => setFollow(!follow)}
-          >
-            Follow live
-          </button>
-        </div>
-      </div>
-      <div className="relative flex flex-wrap items-center gap-2 border-b border-rule px-3 py-1.5">
-        <span className="font-mono text-[13px] text-fg-2">
-          {feed === "reconnecting" ? "reconnecting" : `${abbreviate(source.lines)} lines${source.bytes ? ` · ${(source.bytes / 1048576).toFixed(source.bytes > 1048576 ? 1 : 2)} MiB` : ""}`}
-        </span>
-        <div className="flex-1" />
         <div className="relative">
           <button type="button" className={BTN_SM} aria-haspopup="true" aria-expanded={menu === "steps"} onClick={() => setMenu(menu === "steps" ? null : "steps")}>
-            Jump to step
+            Steps
             <ChevronDown size={11} aria-hidden="true" />
           </button>
           {menu === "steps" && (
             <div role="menu" aria-label="Jump to step" className="absolute top-full right-0 z-30 mt-1 max-h-80 w-72 overflow-y-auto rounded-md border border-control bg-raised py-1 shadow-xl">
+              <div className="flex gap-2 border-b border-rule px-3 pb-1.5">
+                <button type="button" className={BTN_SM} onClick={() => (setMenu(null), setOpen(new Set()))}>
+                  Collapse all
+                </button>
+                <button type="button" className={BTN_SM} onClick={() => (setMenu(null), setOpen(new Set(sections.filter((s) => failedStep(s.step)).map((s) => s.id))))}>
+                  Expand failed
+                </button>
+              </div>
               {sections.map((section) => (
                 <button
                   key={section.id}
@@ -667,12 +657,61 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
             </div>
           )}
         </div>
-        <button type="button" className={BTN_SM} onClick={() => setOpen(new Set())}>
-          Collapse all
+        {narrow ? (
+          <div className="relative">
+            <button type="button" className={cn(BTN_SM, "w-8 px-0")} aria-label="More: wrap, timestamps, download" aria-haspopup="true" aria-expanded={menu === "more"} onClick={() => setMenu(menu === "more" ? null : "more")}>
+              <Ellipsis size={14} aria-hidden="true" />
+            </button>
+            {menu === "more" && (
+              <div role="menu" aria-label="More" className="absolute top-full right-0 z-30 mt-1 flex w-52 flex-col gap-1 rounded-md border border-control bg-raised p-2 shadow-xl">
+                <button type="button" role="menuitemcheckbox" aria-checked={wrap} className={BTN} aria-pressed={wrap} onClick={() => setWrap(!wrap)}>
+                  Wrap
+                </button>
+                <button type="button" role="menuitemcheckbox" aria-checked={times} className={BTN} aria-pressed={times} disabled={!times && !anyStamp} onClick={() => setTimes(!times)}>
+                  Timestamps
+                </button>
+                <button type="button" role="menuitem" className={BTN} disabled={downloading} aria-label="Download this job log as a text file" onClick={() => (setMenu(null), download())}>
+                  {downloading ? "Preparing" : "Download"}
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <>
+            <button type="button" className={BTN_SM} aria-pressed={wrap} onClick={() => setWrap(!wrap)}>
+              Wrap
+            </button>
+            <button
+              type="button"
+              className={BTN_SM}
+              aria-pressed={times}
+              disabled={!times && !anyStamp}
+              title={anyStamp || times ? "Show the time of each line" : "The lines in view carry no timestamps"}
+              onClick={() => setTimes(!times)}
+            >
+              Timestamps
+            </button>
+            <button type="button" className={BTN_SM} disabled={downloading} aria-label="Download this job log as a text file" onClick={download}>
+              {downloading ? "Preparing" : "Download"}
+            </button>
+          </>
+        )}
+        {downloadError !== null && (
+          <span role="alert" className="max-w-[240px] truncate font-mono text-[13px] text-failed" title={downloadError}>
+            Download failed: {downloadError}
+          </span>
+        )}
+        {live && (
+        <button
+          type="button"
+          className={BTN_SM}
+          aria-pressed={live && follow}
+          title={live ? "Keep the newest line in view" : "The job has ended"}
+          onClick={() => setFollow(!follow)}
+        >
+          Follow live
         </button>
-        <button type="button" className={BTN_SM} onClick={() => setOpen(new Set(sections.filter((s) => failedStep(s.step)).map((s) => s.id)))}>
-          Expand failed
-        </button>
+        )}
       </div>
       <div ref={scroller} className="relative min-h-0 flex-1 overflow-auto bg-background" onScroll={onScroll} onClick={() => setMenu(null)}>
         <div style={{ paddingTop: first * ROW, paddingBottom: Math.max(0, layout.rows - last) * ROW }} className="w-max min-w-full">
@@ -690,7 +729,8 @@ export function LogViewer({ source, name, live, feed, failed, onRetry, download,
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-rule px-3 py-1.5 font-mono text-[13px] text-fg-3">
         <span>
           <span aria-hidden="true">└ </span>
-          {live ? "live" : `end of log · ${abbreviate(source.lines)} lines`}
+          {feed === "reconnecting" ? "reconnecting" : live ? "live" : "end of log"} · {abbreviate(source.lines)} lines
+          {source.bytes ? ` · ${(source.bytes / 1048576).toFixed(source.bytes > 1048576 ? 1 : 2)} MiB` : ""}
         </span>
         <span>n N next and previous match · e E next and previous error · / find</span>
       </div>

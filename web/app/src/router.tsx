@@ -84,55 +84,74 @@ export function useQueryList(name: string): string[] {
 /**
  * The app's routes, all under an organization:
  *
- *   /o/:org                              Runs
- *   /o/:org/repos                        Repos
- *   /o/:org/ci/:repo/runs/:n[/jobs/:j]   one run (n is the run id) and a job of it
- *   /o/:org/secrets                      Secrets and variables
- *   /o/:org/environments                 Environments
- *   /o/:org/audit                        Audit log (org admin)
- *   /o/:org/settings[/billing]           Settings, Billing
- *   /o/:org/setup                        First run checklist
+ *   /o/:org                                        Runs
+ *   /o/:org/repositories                           Repositories
+ *   /o/:org/repositories/:repo[/runs]              one repository, Runs tab
+ *   /o/:org/repositories/:repo/(workflows|branches|pulls)   its other tabs
+ *   /o/:org/repositories/:repo/workflows/:workflow one workflow's runs
+ *   /o/:org/repositories/:repo/runs/:n[/jobs/:j]   one run (n is the run id) and a job of it
+ *   /o/:org/secrets                                Secrets and variables
+ *   /o/:org/environments                           Environments
+ *   /o/:org/settings/billing                       Settings, Billing (/settings redirects here)
+ *   /o/:org/settings/setup                         First run checklist
+ *   /o/:org/settings/audit                         Audit log (org admin)
  */
-export type OrgPage = "kit" | "runs" | "repos" | "secrets" | "environments" | "settings" | "billing" | "audit" | "setup" | "run";
+export type OrgPage = "kit" | "runs" | "repositories" | "repository" | "secrets" | "environments" | "billing" | "audit" | "setup" | "run";
+
+export type RepoTabId = "runs" | "workflows" | "branches" | "pulls";
 
 export interface OrgRoute {
   org: string;
   page: OrgPage;
-  /** The run page only. `repo` is the name without the owner, which is `org`. */
+  /** The repository and run pages. `repo` is the name without the owner, which is `org`. */
   repo: string | null;
   run: string | null;
   job: string | null;
+  /** The repository page's tab. */
+  tab: RepoTabId | null;
+  /** The workflow of a workflow page. */
+  workflow: string | null;
 }
 
 const NAME = "[A-Za-z0-9._-]+";
 
 const PAGES: Record<string, OrgPage> = {
-  repos: "repos",
+  repositories: "repositories",
   secrets: "secrets",
   environments: "environments",
-  settings: "settings",
   "settings/billing": "billing",
-  setup: "setup",
-  audit: "audit",
+  "settings/setup": "setup",
+  "settings/audit": "audit",
   // The component gallery, under `npm run dev:mock` only.
   ...(import.meta.env.MODE === "mock" ? { kit: "kit" as const } : {}),
 };
 
+const NONE = { repo: null, run: null, job: null, tab: null, workflow: null } as const;
+
 /** The route of a `/o/...` path, null for any other or an unknown page. */
 export function matchOrg(path: string): OrgRoute | null {
-  const run = new RegExp(`^/o/(${NAME})/ci/(${NAME})/runs/(\\d+)(?:/jobs/(\\d+))?/?$`).exec(path);
+  const run = new RegExp(`^/o/(${NAME})/repositories/(${NAME})/runs/(\\d+)(?:/jobs/(\\d+))?/?$`).exec(path);
   if (run?.[1] && run[2] && run[3]) {
-    return { org: run[1], page: "run", repo: run[2], run: run[3], job: run[4] ?? null };
+    return { ...NONE, org: run[1], page: "run", repo: run[2], run: run[3], job: run[4] ?? null };
+  }
+  const repository = new RegExp(`^/o/(${NAME})/repositories/(${NAME})(?:/(runs|workflows|branches|pulls)(?:/([^/]+))?)?/?$`).exec(path);
+  if (repository?.[1] && repository[2]) {
+    const tab = (repository[3] ?? "runs") as RepoTabId;
+    const workflow = repository[4] ? decodeURIComponent(repository[4]) : null;
+    if (workflow !== null && tab !== "workflows") {
+      return null;
+    }
+    return { ...NONE, org: repository[1], page: "repository", repo: repository[2], tab, workflow };
   }
   const page = new RegExp(`^/o/(${NAME})(?:/([a-z/]+?))?/?$`).exec(path);
   if (!page?.[1]) {
     return null;
   }
   if (page[2] === undefined) {
-    return { org: page[1], page: "runs", repo: null, run: null, job: null };
+    return { ...NONE, org: page[1], page: "runs" };
   }
   const known = PAGES[page[2]];
-  return known ? { org: page[1], page: known, repo: null, run: null, job: null } : null;
+  return known ? { ...NONE, org: page[1], page: known } : null;
 }
 
 /** A run page's parts; the top bar of a public page reduces to its repository. */
@@ -150,16 +169,28 @@ export function matchCi(path: string): CiRoute | null {
     : null;
 }
 
-/** Where an old `/ci/:owner/:repo...` URL lives now, null for a path that is not one. */
+/** Where an old URL lives now, null for a path that moved nowhere. */
 export function legacyCiRedirect(path: string): string | null {
+  const orgRun = new RegExp(`^/o/(${NAME})/ci/(${NAME})/runs/(\\d+)(?:/jobs/(\\d+))?/?$`).exec(path);
+  if (orgRun?.[1] && orgRun[2] && orgRun[3]) {
+    return `/o/${orgRun[1]}/repositories/${orgRun[2]}/runs/${orgRun[3]}${orgRun[4] ? `/jobs/${orgRun[4]}` : ""}`;
+  }
+  const moved = new RegExp(`^/o/(${NAME})/(?:(setup|audit)|settings)/?$`).exec(path);
+  if (moved?.[1]) {
+    return `/o/${moved[1]}/settings/${moved[2] ?? "billing"}`;
+  }
+  const repos = new RegExp(`^/o/(${NAME})/repos/?$`).exec(path);
+  if (repos?.[1]) {
+    return `/o/${repos[1]}/repositories`;
+  }
   const found = new RegExp(`^/ci/(${NAME})/(${NAME})(?:/runs/(\\d+)(?:/jobs/(\\d+))?|(/settings))?/?$`).exec(path);
   if (!found?.[1] || !found[2]) {
     return null;
   }
   const [, owner, repo, run, job, settings] = found;
   if (run) {
-    return `/o/${owner}/ci/${repo}/runs/${run}${job ? `/jobs/${job}` : ""}`;
+    return `/o/${owner}/repositories/${repo}/runs/${run}${job ? `/jobs/${job}` : ""}`;
   }
   const full = encodeURIComponent(`${owner}/${repo}`);
-  return settings ? `/o/${owner}/secrets?scope=repo&repo=${full}` : `/o/${owner}?repo=${full}`;
+  return settings ? `/o/${owner}/secrets?scope=repo&repo=${full}` : `/o/${owner}/repositories/${repo}`;
 }

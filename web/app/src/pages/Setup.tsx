@@ -10,6 +10,7 @@ import { CardButton, dollars, FIELD, SpendCapForm } from "@/components/BillingPa
 import { Checklist, ChecklistCount, type Step } from "@/components/Checklist";
 import { CopyButton } from "@/components/CopyButton";
 import { Page } from "@/components/Page";
+import { SettingsNav } from "@/components/SettingsNav";
 import { RepoMultiSelect, type RepoSelection } from "@/components/RepoMultiSelect";
 import { Await } from "@/components/Status";
 import { Button } from "@/components/ui/button";
@@ -39,7 +40,7 @@ const POLL_MS = 10_000;
 const count = (n: number) => n.toLocaleString("en-US");
 
 /** First run checklist (CI only). The state is read again every 10 s until every step is done. */
-export function Setup({ org }: OrgPageProps) {
+export function Setup({ org, tenant }: OrgPageProps) {
   const [setup, reload] = useLoad(() => getOrgSetup(org), org, true);
   const complete = setup.state === "ready" && isComplete(setup.data);
   useEffect(() => {
@@ -50,14 +51,14 @@ export function Setup({ org }: OrgPageProps) {
 
   return (
     <Await loaded={setup} retry={reload}>
-      {(data) => <SetupSteps org={org} setup={data} reload={reload} />}
+      {(data) => <SetupSteps org={org} admin={tenant.role === "admin"} setup={data} reload={reload} />}
     </Await>
   );
 }
 
 const isComplete = (setup: OrgSetup) => setup.app.installed && (setup.enabled.all || setup.enabled.count > 0) && setup.first_run !== null && setup.billing.card;
 
-function SetupSteps({ org, setup, reload }: { org: string; setup: OrgSetup; reload: () => void }) {
+function SetupSteps({ org, admin, setup, reload }: { org: string; admin: boolean; setup: OrgSetup; reload: () => void }) {
   const [enabled, reloadEnabled] = useLoad(() => readEnabled(org), `${org}:${setup.enabled.all}:${setup.enabled.count}`);
   const enabledCount = setup.enabled.all ? setup.app.repos : setup.enabled.count;
   const steps: Step[] = [
@@ -104,18 +105,40 @@ function SetupSteps({ org, setup, reload }: { org: string; setup: OrgSetup; relo
     },
   ];
 
+  const complete = steps.every((step) => step.done);
   return (
     <Page
       title={`Set up ${org}`}
+      nav={<SettingsNav org={org} current="setup" admin={admin} />}
       meta={<ChecklistCount steps={steps} />}
       actions={
-        <Link href={orgUrl(org)} className="font-mono text-xs text-fg-2 quiet-underline hover:text-fg">
-          Skip to Runs →
-        </Link>
+        complete ? undefined : (
+          <Link href={orgUrl(org)} className="font-mono text-xs text-fg-2 quiet-underline hover:text-fg">
+            Skip to Runs →
+          </Link>
+        )
       }
       narrow
     >
-      <Checklist steps={steps} label="CI setup steps" />
+      {complete && (
+        <section aria-label="Setup complete" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-passed bg-panel px-4 py-3">
+          <div className="flex items-center gap-3">
+            <span aria-hidden="true" className="font-mono font-bold text-passed">
+              ✓
+            </span>
+            <div>
+              <div className="text-[15px] font-bold">Setup complete</div>
+              <div className="font-mono text-xs text-fg-3">
+                CI is on for {setup.enabled.all ? `all ${count(setup.app.repos)}` : count(enabledCount)} {(setup.enabled.all ? setup.app.repos : enabledCount) === 1 ? "repository" : "repositories"}, a card is on file and a run has been seen.
+              </div>
+            </div>
+          </div>
+          <Link href={orgUrl(org)} className="font-mono text-xs text-fg quiet-underline hover:text-brand">
+            Go to Runs →
+          </Link>
+        </section>
+      )}
+      <Checklist steps={steps} label="CI setup steps" collapseDone={complete} />
     </Page>
   );
 }
@@ -200,10 +223,10 @@ function EnableForm({
       </div>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-rule bg-panel pt-2">
         <Button disabled={busy || n === 0} onClick={() => void enable()} className="font-mono text-xs uppercase tracking-[0.04em]">
-          {busy ? "Saving" : draft.all ? `Enable CI on all ${count(total)} repositories` : `Enable CI on ${count(n)} ${n === 1 ? "repository" : "repositories"}`}
+          {busy ? "Saving" : draft.all ? `Enable CI on all ${count(total)} repositories` : n === 0 ? "Select repositories to enable" : `Enable CI on ${count(n)} ${n === 1 ? "repository" : "repositories"}`}
         </Button>
         <Button variant="outline" disabled={busy || draft.all || n === 0} onClick={() => void disable()} className="font-mono text-xs uppercase tracking-[0.04em]">
-          Disable on {count(draft.all ? 0 : n)}
+          {draft.all || n === 0 ? "Disable selected" : `Disable on ${count(n)}`}
         </Button>
         <span className="font-mono text-xs text-fg-3">{draft.all ? `all ${count(total)} selected` : `${count(n)} of ${count(total)} selected`}</span>
         {result && (
@@ -216,8 +239,8 @@ function EnableForm({
             Retry loading enabled repositories
           </button>
         )}
-        <Link href={orgUrl(org, "repos")} className="font-mono text-xs text-fg-2 quiet-underline hover:text-fg">
-          Filter in Repos →
+        <Link href={orgUrl(org, "repositories")} className="font-mono text-xs text-fg-2 quiet-underline hover:text-fg">
+          Filter in Repositories →
         </Link>
       </div>
     </div>

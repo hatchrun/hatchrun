@@ -9,16 +9,18 @@ import { ExternalLink } from "lucide-react";
 import { getCiBilling, type CiBilling, type CiCard, type CiDay, type CiInvoice } from "@/api";
 import { CardButton, dollars, SpendCapForm } from "@/components/BillingParts";
 import { Page } from "@/components/Page";
+import { SettingsNav } from "@/components/SettingsNav";
 import { Await } from "@/components/Status";
 import { cn } from "@/lib/utils";
 import { useLoad } from "@/load";
+import { isoDateTime, tableDate } from "@/lib/format";
 import type { OrgPageProps } from "./types";
 
 const CAP = "rounded-md border border-control bg-panel";
 const HEAD = "border-b border-control px-3.5 py-2";
 
 /** Settings, Billing (also /settings): this month's CI spend, the spend cap and the card. */
-export function Billing({ org }: OrgPageProps) {
+export function Billing({ org, tenant }: OrgPageProps) {
   const returning = new URLSearchParams(window.location.search).has("checkout");
   const [billing, reload] = useLoad(() => getCiBilling(org), org, returning);
   const now = new Date();
@@ -41,7 +43,7 @@ export function Billing({ org }: OrgPageProps) {
     return () => window.clearInterval(timer);
   }, [returning, card, reload]);
   return (
-    <Page title="Billing" meta={`${org} · billed per second · 1 to ${now.getUTCDate()} ${now.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" })}`} narrow>
+    <Page title="Billing" nav={<SettingsNav org={org} current="billing" admin={tenant.role === "admin"} />} meta={`${org} · billed per second · 1 to ${now.getUTCDate()} ${now.toLocaleDateString("en-US", { month: "short", timeZone: "UTC" })}`} narrow>
       <Await loaded={billing} retry={reload}>
         {(data) => <BillingBody org={org} billing={data} month={month} now={now} reload={reload} />}
       </Await>
@@ -257,12 +259,13 @@ function Invoices({ invoices }: { invoices: CiInvoice[] }) {
         <p className="m-0 px-3.5 py-4 font-mono text-[13px] text-fg-3">No invoices yet. The first one is issued after the month closes.</p>
       ) : (
         <div className="max-h-[520px] overflow-auto">
-          <table className="w-full min-w-[560px] border-collapse">
+          <table className="w-full min-w-[640px] border-collapse">
             <thead className="sticky top-0 bg-background">
               <tr className="text-left">
                 <th className="cap px-3.5 py-2.5 font-normal">Month</th>
                 <th className="cap px-3 py-2.5 text-right font-normal">Total</th>
                 <th className="cap px-3 py-2.5 font-normal">Status</th>
+                <th className="cap px-3 py-2.5 font-normal">Issued</th>
                 <th className="cap px-3.5 py-2.5 text-right font-normal">Invoice</th>
               </tr>
             </thead>
@@ -279,6 +282,9 @@ function Invoices({ invoices }: { invoices: CiInvoice[] }) {
                         {paid && <span aria-hidden="true">✓</span>}
                         {invoice.status.replace(/_/g, " ")}
                       </span>
+                    </td>
+                    <td className="px-3 py-2.5 font-mono text-xs text-fg-2" title={isoDateTime(Date.parse(invoice.date))}>
+                      {tableDate(Date.parse(invoice.date))}
                     </td>
                     <td className="px-3.5 py-2.5 text-right">
                       {invoice.url === null ? (

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -32,7 +32,8 @@ export function ChecklistCount({ steps }: { steps: Step[] }) {
  * first step that is not done is the current one: brand edge and glyph.
  * Done steps get a green check, later ones three dots.
  */
-export function Checklist({ steps, label }: { steps: Step[]; label: string }) {
+export function Checklist({ steps, label, collapseDone = false }: { steps: Step[]; label: string; collapseDone?: boolean }) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const current = steps.findIndex((step) => !step.done);
   const done = steps.filter((step) => step.done).length;
   return (
@@ -53,6 +54,8 @@ export function Checklist({ steps, label }: { steps: Step[]; label: string }) {
       <section aria-label={label} className="rounded-md border border-control bg-panel">
         {steps.map((step, index) => {
           const state = step.done ? "done" : index === current ? "current" : "later";
+          const folded = collapseDone && step.done && !expanded.has(step.key);
+          const foldable = collapseDone && step.done && Boolean(step.children);
           return (
             <div
               key={step.key}
@@ -75,8 +78,25 @@ export function Checklist({ steps, label }: { steps: Step[]; label: string }) {
                   <span className="sr-only">{step.done ? " (done)" : ""}</span>
                 </h2>
                 {step.note && <div className="font-mono text-xs text-fg-3">{step.note}</div>}
-                {step.children}
+                {!folded && step.children}
               </div>
+              {foldable && (
+                <button
+                  type="button"
+                  aria-expanded={!folded}
+                  aria-label={`${folded ? "Change" : "Hide"} ${step.title}`}
+                  onClick={() =>
+                    setExpanded((prev) => {
+                      const next = new Set(prev);
+                      if (!next.delete(step.key)) next.add(step.key);
+                      return next;
+                    })
+                  }
+                  className="cursor-pointer self-start font-mono text-xs text-fg-2 quiet-underline hover:text-fg"
+                >
+                  {folded ? "Change" : "Hide"}
+                </button>
+              )}
               {step.aside}
             </div>
           );

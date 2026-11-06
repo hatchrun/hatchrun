@@ -166,6 +166,7 @@ function run(id: number, number: number, workflow: string, event: string, ref: s
     sha: "3f2a9c1d5e6b7a8091a2b3c4d5e6f708192a3b4c",
     actor: "octocat",
     message: number === 3 ? null : number === 2 ? "fix: keep the log follow toggle after a reload" : "feat: add the deploy workflow",
+    pull_request: null,
     status,
     conclusion,
     created_at: created,
@@ -271,6 +272,25 @@ export async function handleCi(
 
   if (handleScale(req, res, url, path, session, body) || handleCiSettings(req, res, path, session, body, url)) {
     return;
+  }
+
+  if ((found = /^repos\/([^/]+)\/([^/]+)(?:\/(workflows|branches|pulls))?$/.exec(path))) {
+    const repository = `${found[1]}/${found[2]}`;
+    if (req.method !== "GET" || (repository !== "e2e/demo" && !isPrivate(repository)) || (isPrivate(repository) && !session.signedIn)) {
+      return hidden();
+    }
+    if (found[3]) {
+      return json(res, 200, paginate([], url));
+    }
+    return json(res, 200, {
+      name: repository,
+      default_branch: "main",
+      private: isPrivate(repository),
+      enabled: true,
+      access: isPrivate(repository) ? "read" : "admin",
+      html_url: `https://github.com/${repository}`,
+      counts: { workflows: 0, branches: 0, open_pulls: 0 },
+    });
   }
 
   if ((found = /^repos\/([^/]+)\/([^/]+)\/runs$/.exec(path))) {

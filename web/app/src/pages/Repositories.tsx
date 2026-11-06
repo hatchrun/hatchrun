@@ -5,14 +5,15 @@
 import { Search } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { listOrgRepos, type Page as ApiPage, type CiOrgRepo } from "@/api";
+import { listOrgRepos, patchEnabledRepos, type Page as ApiPage, type CiOrgRepo } from "@/api";
 import { CursorPager, useCursors } from "@/components/CursorPager";
 import { Page } from "@/components/Page";
 import { Await } from "@/components/Status";
 import { StatusPill, ciStatus } from "@/components/StatusPill";
 import { Truncate } from "@/components/Truncate";
+import { Button } from "@/components/ui/button";
 import { abbreviate, ago } from "@/lib/format";
-import { repoRunsUrl, runUrl } from "@/lib/urls";
+import { repoUrl, runUrl } from "@/lib/urls";
 import { cn } from "@/lib/utils";
 import { useLoad, useNow } from "@/load";
 import { Link, navigate, setQuery, useQuery } from "@/router";
@@ -28,7 +29,8 @@ const SHOW = [
 const PAGE_SIZE = 50;
 
 /** Every repository of the App installation, with its latest run and whether it starts runs. */
-export function Repos({ org }: OrgPageProps) {
+export function Repositories({ org, tenant }: OrgPageProps) {
+  const admin = tenant.role === "admin";
   const q = useQuery("q") ?? "";
   const showId = useQuery("show");
   const show = SHOW.find((item) => item.id === showId) ?? SHOW[0];
@@ -36,6 +38,8 @@ export function Repos({ org }: OrgPageProps) {
   const [typed, setDraft] = useState<{ from: string; text: string } | null>(null);
   const draft = typed !== null && typed.from === q ? typed.text : null;
   const [dispatch, setDispatch] = useState<string | null>(null);
+  const [enabling, setEnabling] = useState<string | null>(null);
+  const [enableError, setEnableError] = useState<Error | null>(null);
   const cursors = useCursors();
   const now = useNow(30_000);
 
@@ -66,9 +70,22 @@ export function Repos({ org }: OrgPageProps) {
     `${key}#${cursors.key}`,
   );
 
+  const enable = async (name: string) => {
+    setEnabling(name);
+    setEnableError(null);
+    try {
+      await patchEnabledRepos(org, { add: [name] });
+      reload();
+    } catch (err) {
+      setEnableError(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      setEnabling(null);
+    }
+  };
+
   return (
     <Page
-      title="Repos"
+      title="Repositories"
       meta={
         repos.state === "ready"
           ? `${abbreviate(repos.data.total)} repositories`
@@ -123,6 +140,12 @@ export function Repos({ org }: OrgPageProps) {
           </div>
         </div>
 
+        {enableError && (
+          <p className="border-b border-rule px-3.5 py-2 font-mono text-[13px] text-failed" role="alert">
+            {enableError.message}
+          </p>
+        )}
+
         <Await loaded={repos} retry={reload}>
           {(page) =>
             page.items.length === 0 ? (
@@ -134,7 +157,7 @@ export function Repos({ org }: OrgPageProps) {
                     : `No ${show.label.toLowerCase()} repositories.`}
               </div>
             ) : (
-              <div className="overflow-auto">
+              <div className="relative overflow-auto">
                 <table className="w-full min-w-[820px] border-collapse">
                   <thead className="bg-background">
                     <tr>
@@ -142,7 +165,10 @@ export function Repos({ org }: OrgPageProps) {
                       <th className={TH}>Default branch</th>
                       <th className={TH}>Last run</th>
                       <th className={TH}>Started</th>
-                      <th className={`${TH} pr-3.5`}>State</th>
+                      <th className={TH}>State</th>
+                      <th className={`${TH} pr-3.5`}>
+                        <span className="sr-only">Actions</span>
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
@@ -152,7 +178,9 @@ export function Repos({ org }: OrgPageProps) {
                         className="border-t border-rule hover:bg-raised"
                       >
                         <td className="max-w-[360px] py-2.5 pr-3 pl-3.5 font-semibold whitespace-nowrap">
-                          <Truncate value={repo.name} className="block" />
+                          <Link href={repoUrl(repo.name)} className="block min-w-0 hover:underline">
+                            <Truncate value={repo.name} className="block" />
+                          </Link>
                         </td>
                         <td className="max-w-[220px] px-3 py-2.5 whitespace-nowrap">
                           <Truncate value={repo.default_branch} mono copy />
@@ -185,38 +213,24 @@ export function Repos({ org }: OrgPageProps) {
                             ? ago(repo.last_run.created_at, now)
                             : "-"}
                         </td>
-                        <td className="px-3.5 py-2.5 whitespace-nowrap">
-                          <span className="inline-flex items-center gap-4">
-                            <span
-                              className={cn(
-                                "inline-flex w-[72px] items-center gap-2 font-mono text-[13px]",
-                                repo.enabled ? "text-fg" : "text-fg-3",
-                              )}
-                            >
-                              <span
-                                className={cn(
-                                  "size-1.5 rounded-full",
-                                  repo.enabled ? "bg-passed" : "bg-queued",
-                                )}
-                              />
-                              {repo.enabled ? "enabled" : "disabled"}
-                            </span>
-                            <Link
-                              href={repoRunsUrl(repo.name)}
-                              className="font-mono text-[13px] text-fg underline decoration-control underline-offset-3 hover:decoration-fg-3"
-                            >
-                              View runs
-                            </Link>
-                            {repo.enabled && (
-                              <button
-                                type="button"
-                                onClick={() => setDispatch(repo.name)}
-                                className="font-mono text-[13px] text-fg underline decoration-control underline-offset-3 hover:decoration-fg-3"
-                              >
-                                Run workflow
-                              </button>
-                            )}
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          <span className={cn("inline-flex items-center gap-2 font-mono text-[13px]", repo.enabled ? "text-fg" : "text-fg-3")}>
+                            <span className={cn("size-1.5 rounded-full", repo.enabled ? "bg-passed" : "bg-queued")} />
+                            {repo.enabled ? "enabled" : "disabled"}
                           </span>
+                        </td>
+                        <td className="px-3.5 py-1.5 text-right whitespace-nowrap">
+                          {repo.enabled ? (
+                            <Button variant="secondary" size="sm" onClick={() => setDispatch(repo.name)} aria-label={`Run workflow in ${repo.name}`}>
+                              Run workflow
+                            </Button>
+                          ) : (
+                            admin && (
+                              <Button variant="secondary" size="sm" disabled={enabling === repo.name} onClick={() => enable(repo.name)} aria-label={`Enable CI for ${repo.name}`}>
+                                {enabling === repo.name ? "Enabling" : "Enable"}
+                              </Button>
+                            )
+                          )}
                         </td>
                       </tr>
                     ))}

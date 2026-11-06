@@ -6,7 +6,7 @@
 // environments. The scope lives in the URL (?scope=org|repo|env&repo=&env=).
 // A secret's value is write-only; a variable's is shown.
 
-import { Plus, Search, X } from "lucide-react";
+import { ChevronRight, Plus, Search, X } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -23,15 +23,16 @@ import {
 import { CopyButton } from "@/components/CopyButton";
 import { CursorPager, useCursors } from "@/components/CursorPager";
 import { Page } from "@/components/Page";
+import { SidePanel, useRoomForPanel } from "@/components/SidePanel";
 import { RepoMultiSelect, summarizeRepos, type RepoSelection } from "@/components/RepoMultiSelect";
 import { ScopePicker, type ScopeValue } from "@/components/ScopePicker";
 import { Await } from "@/components/Status";
 import { Truncate } from "@/components/Truncate";
-import { abbreviate, ago } from "@/lib/format";
+import { abbreviate, isoDateTime, tableDate } from "@/lib/format";
 import { useDebounced } from "@/lib/useRepos";
 import { cn } from "@/lib/utils";
 import { useLoad, useNow } from "@/load";
-import { orgUrl } from "@/lib/urls";
+import { orgUrl, repoUrl } from "@/lib/urls";
 import { Link, setQuery, useQuery } from "@/router";
 import { BTN, BTN_PRIMARY, BTN_SM, FIELD, TD, TH } from "./formStyles";
 import type { OrgPageProps } from "./types";
@@ -107,6 +108,12 @@ export function Secrets({ org, tenant }: OrgPageProps) {
   const scope = scopeOf(org, value);
   const noun = word(kind);
   const now = useNow(60_000);
+  const room = useRoomForPanel();
+  const showParam = useQuery("show");
+  const show: "all" | "own" | "inherited" | "stale" = showParam === "own" || showParam === "inherited" || showParam === "stale" ? showParam : "all";
+  const [inheritedOpen, setInheritedOpen] = useState(false);
+  // Own counts seen on a list's first page, for the pages after it.
+  const ownKnown = useRef(new Map<string, number>());
 
   const cursors = useCursors();
   const [search, setSearch] = useState("");
@@ -150,7 +157,7 @@ export function Secrets({ org, tenant }: OrgPageProps) {
     cursors.reset();
     setPanel(null);
     setConfirming(null);
-    setQuery({ scope: next.scope === "org" ? null : next.scope, repo: next.repo, env: next.env });
+    setQuery({ scope: next.scope === "org" ? null : next.scope, repo: next.repo, env: next.env, show: null });
   };
   /** Moves to the wider scope an inherited row lives in, with the name searched. */
   const openInherited = (row: Row) => {
@@ -158,7 +165,7 @@ export function Secrets({ org, tenant }: OrgPageProps) {
     setPanel(null);
     setConfirming(null);
     setSearch(row.name);
-    setQuery(row.scope === "org" ? { scope: null, repo: null, env: null } : { scope: "repo", repo: value.repo, env: null });
+    setQuery(row.scope === "org" ? { scope: null, repo: null, env: null, show: null } : { scope: "repo", repo: value.repo, env: null, show: null });
   };
   const setKind = (next: CiItemKind) => {
     cursors.reset();
@@ -199,6 +206,90 @@ export function Secrets({ org, tenant }: OrgPageProps) {
     ["vars", "Variables", varsTotal],
   ];
 
+  /** One table of rows; the stale hint shows at every scope. */
+  const itemTable = (items: Row[]) => (
+    <div className="overflow-x-auto rounded-sm border border-control">
+      <table className="w-full border-collapse text-sm">
+        <thead>
+          <tr>
+            <th className={TH}>Name</th>
+            <th className={TH}>Scope / access</th>
+            <th className={TH}>Value</th>
+            <th className={TH}>Updated</th>
+            <th className={cn(TH, "text-right")}>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((row) => {
+            const inheritedRow = row.scope !== value.scope;
+            const staleDays = staleFor(row, now);
+            const edge = staleDays !== null ? { boxShadow: "inset 3px 0 0 var(--waiting)" } : undefined;
+            return (
+              <Fragment key={`${row.scope}/${row.name}`}>
+                <tr className={cn("border-t border-rule hover:bg-panel", row.shadowed && "opacity-50")}>
+                  <td className={cn(TD, "max-w-[260px]")} style={edge}>
+                    <span className="inline-flex max-w-full items-center gap-2">
+                      <Truncate value={row.name} mono className="font-bold" />
+                      {(row.shadowed || inheritedRow) && (
+                        <span className="shrink-0 rounded-xs border border-control px-1.5 font-mono text-[11px] tracking-[0.04em] text-fg-2 uppercase">
+                          {row.shadowed ? "overridden" : `from ${row.scope}`}
+                        </span>
+                      )}
+                    </span>
+                  </td>
+                  <td className={cn(TD, "max-w-[250px] font-mono text-[13px] text-fg-2")}>{access(value, row)}</td>
+                  <td className={cn(TD, "max-w-[200px] font-mono text-[13px] text-fg-2")}>
+                    {"value" in row ? <Truncate value={row.value} mono /> : "write-only"}
+                  </td>
+                  <td className={cn(TD, "font-mono text-[13px] text-fg-2")} title={isoDateTime(row.updatedAt)}>
+                    {tableDate(row.updatedAt, now)}
+                  </td>
+                  <td className={cn(TD, "text-right")}>
+                    {inheritedRow ? (
+                      <button type="button" className={BTN_SM} aria-label={`Open ${row.name} in ${row.scope} scope`} onClick={() => openInherited(row)}>
+                        Open in {row.scope}
+                      </button>
+                    ) : confirming === row.name ? (
+                      <span className="inline-flex items-center gap-2">
+                        <span className="cap max-w-[160px] truncate" title={`Delete ${row.name}?`}>
+                          Delete {row.name}?
+                        </span>
+                        <button type="button" className={BTN_SM} aria-label={`Confirm delete ${row.name}`} onClick={() => void remove(row)}>
+                          Confirm
+                        </button>
+                        <button type="button" className={BTN_SM} onClick={() => setConfirming(null)}>
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <span className="inline-flex gap-2">
+                        <button type="button" className={BTN_SM} aria-label={`${kind === "vars" ? "Change" : "Replace"} ${row.name}`} onClick={() => openPanel(row)}>
+                          {kind === "vars" ? "Change" : "Replace"}
+                        </button>
+                        <button type="button" className={BTN_SM} aria-label={`Delete ${row.name}`} onClick={() => setConfirming(row.name)}>
+                          Delete
+                        </button>
+                      </span>
+                    )}
+                  </td>
+                </tr>
+                {staleDays !== null && (
+                  <tr>
+                    <td colSpan={5} className="px-3 pb-2.5 pl-9 font-mono text-[13px] whitespace-normal text-waiting" style={edge}>
+                      <span className="text-fg-3">└ </span>
+                      {row.last_used_at === null ? "never used by a job." : `not used in ${staleDays} days.`}
+                      {inheritedRow ? "" : " Delete it if nothing needs it, or replace the value to rotate it."}
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+
   return (
     <Page
       title="Secrets"
@@ -208,7 +299,7 @@ export function Secrets({ org, tenant }: OrgPageProps) {
           {tenant.role === "admin" && (
             <>
               {summary && " · "}
-              <Link href={orgUrl(org, "audit")} className="text-brand quiet-underline">
+              <Link href={orgUrl(org, "settings/audit")} className="text-brand quiet-underline">
                 audit log →
               </Link>
             </>
@@ -225,10 +316,10 @@ export function Secrets({ org, tenant }: OrgPageProps) {
       <section aria-label="Scope" className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <span className="cap">Scope</span>
         <ScopePicker org={org} value={value} onChange={setScope} />
-        <span className="cap">Resolution: environment &gt; repository &gt; organization. The narrowest scope wins.</span>
+        <span className="meta">Resolution order: environment, repository, organization. The narrowest scope wins.</span>
       </section>
 
-      <div className={cn("grid items-start gap-4", panel ? "grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-1")}>
+      <div className={cn("grid items-start gap-4", panel && room ? "grid-cols-[minmax(0,1fr)_360px]" : "grid-cols-1")}>
         <section aria-label="Secrets and variables list" className="flex min-w-0 flex-col gap-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div role="tablist" aria-label="Secrets or variables" className="inline-flex gap-4 border-b border-rule font-mono text-[13px]">
@@ -248,6 +339,20 @@ export function Secrets({ org, tenant }: OrgPageProps) {
                 </button>
               ))}
             </div>
+            <div className="flex flex-wrap items-center gap-3">
+            <div role="group" aria-label="Show" className="inline-flex overflow-hidden rounded-sm border border-control font-mono text-xs">
+              {(value.scope === "org" ? (["all", "stale"] as const) : (["all", "own", "inherited", "stale"] as const)).map((id) => (
+                <button
+                  key={id}
+                  type="button"
+                  aria-pressed={show === id}
+                  onClick={() => setQuery({ show: id === "all" ? null : id })}
+                  className={cn("h-8 cursor-pointer border-0 border-r border-control px-2.5 last:border-r-0", show === id ? "bg-raised text-fg" : "bg-transparent text-fg-3 hover:text-fg")}
+                >
+                  {id === "all" ? "All" : id === "own" ? "Own" : id === "inherited" ? "Inherited" : "Stale"}
+                </button>
+              ))}
+            </div>
             <label className="relative">
               <span className="sr-only">Search by name</span>
               <Search size={14} aria-hidden="true" className="pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2 text-fg-3" />
@@ -264,6 +369,7 @@ export function Secrets({ org, tenant }: OrgPageProps) {
                 className="h-8 w-[240px] rounded-sm border border-control bg-background pr-2 pl-8 font-mono text-[13px] text-fg outline-none placeholder:text-fg-3 focus:border-brand"
               />
             </label>
+            </div>
           </div>
 
           {failure && (
@@ -279,128 +385,105 @@ export function Secrets({ org, tenant }: OrgPageProps) {
             </p>
           ) : (
             <Await loaded={shown} retry={reloadRows}>
-              {(page) => (
-                <>
-                  {page.items.length === 0 ? (
-                    <div className="flex flex-col items-start gap-3 rounded-sm border border-control px-4 py-6 font-mono text-[13px] text-fg-2">
-                      {q ? `No ${noun}s match that name.` : `No ${noun}s at this scope.`}
-                      <button type="button" className={BTN} onClick={() => openPanel(null)}>
-                        New {noun}
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="overflow-x-auto rounded-sm border border-control">
-                      <table className="w-full border-collapse text-sm">
-                        <thead>
-                          <tr>
-                            <th className={TH}>Name</th>
-                            <th className={TH}>Scope / access</th>
-                            <th className={TH}>Value</th>
-                            <th className={TH}>Updated</th>
-                            <th className={cn(TH, "text-right")}>Actions</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {page.items.map((row) => {
-                            const inheritedRow = row.scope !== value.scope;
-                            const staleDays = inheritedRow ? null : staleFor(row, now);
-                            const edge = staleDays !== null ? { boxShadow: "inset 3px 0 0 var(--waiting)" } : undefined;
-                            return (
-                              <Fragment key={`${row.scope}/${row.name}`}>
-                                <tr className={cn("border-t border-rule hover:bg-panel", row.shadowed && "opacity-50")}>
-                                  <td className={cn(TD, "max-w-[260px]")} style={edge}>
-                                    <span className="inline-flex max-w-full items-center gap-2">
-                                      <Truncate value={row.name} mono className="font-bold" />
-                                      {(row.shadowed || inheritedRow) && (
-                                        <span className="shrink-0 rounded-xs border border-control px-1.5 font-mono text-[11px] tracking-[0.04em] text-fg-2 uppercase">
-                                          {row.shadowed ? "overridden" : `from ${row.scope}`}
-                                        </span>
-                                      )}
-                                    </span>
-                                  </td>
-                                  <td className={cn(TD, "max-w-[250px] font-mono text-[13px] text-fg-2")}>{access(value, row)}</td>
-                                  <td className={cn(TD, "max-w-[200px] font-mono text-[13px] text-fg-2")}>
-                                    {"value" in row ? <Truncate value={row.value} mono /> : "write-only"}
-                                  </td>
-                                  <td className={cn(TD, "font-mono text-[13px] text-fg-2")} title={new Date(row.updatedAt).toLocaleString()}>
-                                    {ago(row.updatedAt)}
-                                  </td>
-                                  <td className={cn(TD, "text-right")}>
-                                    {inheritedRow ? (
-                                      <button type="button" className={BTN_SM} aria-label={`Open ${row.name} in ${row.scope} scope`} onClick={() => openInherited(row)}>
-                                        Open in {row.scope}
-                                      </button>
-                                    ) : confirming === row.name ? (
-                                      <span className="inline-flex items-center gap-2">
-                                        <span className="cap max-w-[160px] truncate" title={`Delete ${row.name}?`}>
-                                          Delete {row.name}?
-                                        </span>
-                                        <button type="button" className={BTN_SM} aria-label={`Confirm delete ${row.name}`} onClick={() => void remove(row)}>
-                                          Confirm
-                                        </button>
-                                        <button type="button" className={BTN_SM} onClick={() => setConfirming(null)}>
-                                          Cancel
-                                        </button>
-                                      </span>
-                                    ) : (
-                                      <span className="inline-flex gap-2">
-                                        <button type="button" className={BTN_SM} aria-label={`${kind === "vars" ? "Change" : "Replace"} ${row.name}`} onClick={() => openPanel(row)}>
-                                          {kind === "vars" ? "Change" : "Replace"}
-                                        </button>
-                                        <button type="button" className={BTN_SM} aria-label={`Delete ${row.name}`} onClick={() => setConfirming(row.name)}>
-                                          Delete
-                                        </button>
-                                      </span>
-                                    )}
-                                  </td>
-                                </tr>
-                                {staleDays !== null && (
-                                  <tr>
-                                    <td colSpan={5} className="px-3 pb-2.5 pl-9 font-mono text-[13px] whitespace-normal text-waiting" style={edge}>
-                                      <span className="text-fg-3">└ </span>
-                                      {row.last_used_at === null ? "never used by a job." : `not used in ${staleDays} days.`} Delete it if nothing needs it, or replace the value to rotate it.
-                                    </td>
-                                  </tr>
+              {(page) => {
+                const ownRows = page.items.filter((row) => row.scope === value.scope);
+                const inheritedRows = page.items.filter((row) => row.scope !== value.scope);
+                const keep = (row: Row) => show !== "stale" || staleFor(row, now) !== null;
+                const ownShown = show === "inherited" ? [] : ownRows.filter(keep);
+                const inheritedShown = show === "own" ? [] : inheritedRows.filter(keep);
+                const sectioned = value.scope !== "org";
+                const ownCount = !sectioned ? page.total : cursors.index === 0 && (page.next === null || inheritedRows.length > 0) ? ownRows.length : ownKnown.current.get(scopeId + kind + q) ?? ownRows.length;
+                if (sectioned && cursors.index === 0 && (page.next === null || inheritedRows.length > 0)) ownKnown.current.set(scopeId + kind + q, ownRows.length);
+                const inheritedCount = Math.max(page.total - ownCount, inheritedRows.length);
+                const from = value.scope === "env" ? "repository and organization" : "organization";
+                const open = inheritedOpen || show === "inherited" || show === "stale";
+                const scopeName = value.scope === "env" ? "environment" : "repository";
+                return (
+                  <>
+                    {page.items.length === 0 ? (
+                      <div className="flex flex-col items-start gap-3 rounded-sm border border-control px-4 py-6 font-mono text-[13px] text-fg-2">
+                        {q ? `No ${noun}s match that name.` : `No ${noun}s at this scope.`}
+                        <button type="button" className={BTN} onClick={() => openPanel(null)}>
+                          New {noun}
+                        </button>
+                      </div>
+                    ) : !sectioned ? (
+                      ownShown.length === 0 ? (
+                        <p className="meta rounded-sm border border-control px-4 py-6">Nothing on this page matches that filter.</p>
+                      ) : (
+                        itemTable(ownShown)
+                      )
+                    ) : (
+                      <>
+                        {show !== "inherited" && (
+                          <section aria-label={`Own ${noun}s`} className="flex flex-col gap-2">
+                            <h2 className="section-title">
+                              In this {scopeName} <span className="text-fg-3">({abbreviate(ownCount)})</span>
+                            </h2>
+                            {ownShown.length === 0 ? (
+                              <div className="flex flex-wrap items-center gap-3 rounded-sm border border-control px-4 py-4 font-mono text-[13px] text-fg-2">
+                                {show === "stale" ? `No stale ${noun}s of this ${scopeName} on this page.` : `No ${noun}s are set on this ${scopeName}.`}
+                                {show !== "stale" && (
+                                  <button type="button" className={BTN} onClick={() => openPanel(null)}>
+                                    New {noun}
+                                  </button>
                                 )}
-                              </Fragment>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                  <CursorPager
-                    page={page}
-                    index={cursors.index}
-                    hasPrev={cursors.hasPrev}
-                    onPrev={cursors.prev}
-                    onNext={cursors.next}
-                    noun={`${noun}s`}
-                  />
-                  <p className="meta">{kind === "secrets" ? "Values are encrypted at rest and masked in logs." : "Values are stored as plain text and shown to everyone in the organization."}</p>
-                </>
-              )}
+                              </div>
+                            ) : (
+                              itemTable(ownShown)
+                            )}
+                          </section>
+                        )}
+                        {show !== "own" && (
+                          <section aria-label={`Inherited ${noun}s`} className="flex flex-col gap-2">
+                            <button
+                              type="button"
+                              aria-expanded={open}
+                              disabled={show === "inherited" || show === "stale"}
+                              onClick={() => setInheritedOpen(!open)}
+                              className="section-title inline-flex w-fit cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-fg disabled:cursor-default"
+                            >
+                              <ChevronRight size={14} aria-hidden="true" className={cn("shrink-0 transition-transform", open && "rotate-90")} />
+                              Inherited from {from} <span className="text-fg-3">({abbreviate(inheritedCount)})</span>
+                            </button>
+                            {open &&
+                              (inheritedShown.length === 0 ? (
+                                <p className="meta rounded-sm border border-control px-4 py-4">{show === "stale" ? `No stale inherited ${noun}s on this page.` : `Nothing is inherited at this scope.`}</p>
+                              ) : (
+                                itemTable(inheritedShown)
+                              ))}
+                          </section>
+                        )}
+                      </>
+                    )}
+                    <CursorPager page={page} index={cursors.index} hasPrev={cursors.hasPrev} onPrev={cursors.prev} onNext={cursors.next} noun={`${noun}s`} />
+                    <p className="meta">{kind === "secrets" ? "Values are encrypted at rest and masked in logs." : "Values are stored as plain text and shown to everyone in the organization."}</p>
+                  </>
+                );
+              }}
             </Await>
           )}
         </section>
 
         {panel && scope && (
-          <ItemPanel
-            // A fresh form for each item, so a half-typed value never carries over.
-            key={`${panel.id}/${scopeId}/${kind}/${panel.edit?.name ?? ""}`}
-            org={org}
-            scope={scope}
-            scopeLabel={scopeWord(org, value)}
-            kind={kind}
-            edit={panel.edit}
-            onClose={() => setPanel(null)}
-            onSaved={(message) => {
-              // A late save must not close a panel opened since.
-              setPanel((open) => (open?.id === panel.id ? null : open));
-              notify(message);
-              reload();
-            }}
-          />
+          <SidePanel inline={room} labelledBy="item-title" onClose={() => setPanel(null)}>
+            <ItemPanel
+              // A fresh form for each item, so a half-typed value never carries over.
+              key={`${panel.id}/${scopeId}/${kind}/${panel.edit?.name ?? ""}`}
+              org={org}
+              scope={scope}
+              scopeLabel={scopeWord(org, value)}
+              kind={kind}
+              edit={panel.edit}
+              onClose={() => setPanel(null)}
+              onSaved={(message) => {
+                // A late save must not close a panel opened since.
+                setPanel((open) => (open?.id === panel.id ? null : open));
+                notify(message);
+                reload();
+              }}
+            />
+          </SidePanel>
         )}
       </div>
 
@@ -433,8 +516,13 @@ function staleFor(row: Row, now: number): number | null {
 
 /** The access cell: who can read the item at this scope. */
 function access(value: ScopeValue, row: Row) {
-  if (row.scope === "env") return `env ${value.env ?? ""}`;
-  if (row.scope === "repo") return `repo ${value.repo ?? ""} only`;
+  const repoLink = value.repo && (
+    <Link href={repoUrl(value.repo)} className="underline decoration-control underline-offset-3 hover:decoration-fg-3">
+      {value.repo}
+    </Link>
+  );
+  if (row.scope === "env") return <>env {value.env ?? ""} of {repoLink}</>;
+  if (row.scope === "repo") return <>repo {repoLink} only</>;
   if (row.repositories === null) return "all repos";
   return (
     <span className="inline-flex max-w-full items-center gap-2" title={row.repositories.join(", ")}>

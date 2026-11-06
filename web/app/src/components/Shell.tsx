@@ -16,8 +16,8 @@ import { BAR_BUTTON, DocsLink, LogoLink, OrgTabs, SearchButton, Slash, TopBarFra
 /**
  * The one shell of the app: a sticky top bar and the page under it.
  *
- * - `org` set: logo, `/`, org switcher and the tabs Runs, Repos, Secrets,
- *   Environments, Settings on the left; Search (⌘K), Docs and the profile
+ * - `org` set: logo, `/`, org switcher and the tabs Runs, Repositories, Secrets,
+ *   Environments, Settings on the left; Search (Ctrl or ⌘ K), Docs and the profile
  *   menu on the right. The current tab is read from the URL.
  * - `publicRepo` set (a public CI page, `user` may be null): the bar
  *   shrinks to logo, repository and Docs (plus sign in when signed out).
@@ -75,7 +75,7 @@ export function Shell({
   }, [login, user]);
 
   const current = route?.page ?? null;
-  const suffix = current === "runs" || current === "run" || current === null ? "" : current === "billing" ? "settings/billing" : current;
+  const suffix = current === "runs" || current === null ? "" : current === "billing" || current === "setup" || current === "audit" ? `settings/${current}` : current === "repository" || current === "run" ? "repositories" : current;
 
   const left =
     login && user ? (
@@ -114,8 +114,18 @@ export function Shell({
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
+      <a
+        href="#main"
+        className="skip-link"
+        onClick={(event) => {
+          event.preventDefault();
+          document.getElementById("main")?.focus();
+        }}
+      >
+        Skip to content
+      </a>
       <TopBarFrame label={publicRepo ? "Repository" : "Main"} left={left} right={right} />
-      <main className="min-w-0 flex-1 p-6 max-md:p-4">{children}</main>
+      <main id="main" tabIndex={-1} className="min-w-0 flex-1 p-6 max-md:p-4 outline-none">{children}</main>
       {login && user && <CommandPalette org={login} open={searchOpen} onOpenChange={setSearchOpen} />}
       <ShortcutsDialog open={shortcuts} onOpenChange={setShortcuts} />
     </div>

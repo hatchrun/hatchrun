@@ -58,6 +58,49 @@ function depths(jobs: CiJob[]): Map<string, number> {
   return memo;
 }
 
+const planIds = (unit: Unit) => (unit.kind === "job" ? [unit.entry.job.plan_id] : unit.entries.map((e) => e.job.plan_id));
+const needsOf = (unit: Unit) => (unit.kind === "job" ? unit.entry.job.needs : unit.entries.flatMap((e) => e.job.needs));
+
+/**
+ * Topological order: a unit comes after every unit it needs. Among the
+ * units ready at the same time, failures (then running and waiting) come
+ * first when `failedFirst`, otherwise the order the API gave. A cycle
+ * falls back to the earliest unit left.
+ */
+function ordered(units: Unit[], failedFirst: boolean): Unit[] {
+  const owner = new Map<string, number>();
+  units.forEach((unit, i) => planIds(unit).forEach((id) => owner.set(id, i)));
+  const deps = units.map((unit, i) => new Set(needsOf(unit).map((id) => owner.get(id)).filter((d): d is number => d !== undefined && d !== i)));
+  const rank = (i: number) => (failedFirst ? (units[i] as Unit).rank : 0);
+  const done = new Set<number>();
+  const out: Unit[] = [];
+  while (out.length < units.length) {
+    let best = -1;
+    let fallback = -1;
+    for (let i = 0; i < units.length; i++) {
+      if (done.has(i)) continue;
+      if (fallback < 0) fallback = i;
+      if ([...(deps[i] as Set<number>)].every((d) => done.has(d)) && (best < 0 || rank(i) < rank(best))) best = i;
+    }
+    const pick = best >= 0 ? best : fallback;
+    done.add(pick);
+    out.push(units[pick] as Unit);
+  }
+  return out;
+}
+
+/**
+ * The part of a matrix job's name that tells it from its siblings: the
+ * parenthesised values that are not the same in every member.
+ */
+function matrixLabel(name: string, siblings: string[]): string {
+  const values = (n: string) => (/\((.*)\)$/.exec(n)?.[1] ?? "").split(", ");
+  const mine = values(name);
+  const all = siblings.map(values);
+  const differing = mine.filter((value, i) => all.some((other) => other[i] !== value));
+  return differing.length > 0 && differing.length < mine.length ? differing.join(", ") : mine.join(", ");
+}
+
 /** The line under a job's name: what it waits on, then what it is doing. */
 function note(job: CiJob, status: Status): string {
   const needs = job.needs.length === 0 ? "no needs" : job.needs.length === 1 ? `needs ${job.needs[0]}` : `needs ${job.needs.length} jobs`;
@@ -116,7 +159,7 @@ export function JobsPanel({ run, jobs, selected, now }: { run: CiRun; jobs: CiJo
         out.push({ kind: "job", entry, rank: RANK[entry.status] });
       }
     }
-    return failedFirst ? out.slice().sort((a, b) => a.rank - b.rank) : out;
+    return ordered(out, failedFirst);
   }, [jobs, q, failedFirst]);
 
   const isOpen = (group: Group) =>
@@ -166,7 +209,7 @@ export function JobsPanel({ run, jobs, selected, now }: { run: CiRun; jobs: CiJo
                 {unit.failed > 0 && <span className="font-mono text-[13px] text-failed">{unit.failed}✕</span>}
               </button>
               {isOpen(unit) &&
-                unit.entries.map((entry) => <JobRow key={entry.job.id} entry={entry} run={run} selected={selected} now={now} nested label={entry.job.name.slice(unit.name.length + 1)} />)}
+                unit.entries.map((entry) => <JobRow key={entry.job.id} entry={entry} run={run} selected={selected} now={now} nested label={matrixLabel(entry.job.name, unit.entries.map((e) => e.job.name))} />)}
             </div>
           ),
         )}

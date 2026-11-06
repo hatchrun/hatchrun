@@ -164,6 +164,8 @@ export function FilterBar({
   branches = [],
   actors = [],
   placeholder = "Search runs",
+  showRepo = true,
+  extra = [],
   children,
   className,
 }: {
@@ -171,6 +173,10 @@ export function FilterBar({
   branches?: string[];
   actors?: string[];
   placeholder?: string;
+  /** False on a repository's page, where the repository is fixed. */
+  showRepo?: boolean;
+  /** Filters the page owns (a pull request, say), shown as removable chips with the others. */
+  extra?: { id: string; label: string; remove: () => void }[];
   children?: React.ReactNode;
   className?: string;
 }) {
@@ -190,7 +196,8 @@ export function FilterBar({
   }, [draft]);
 
   const active = [
-    ...(filters.repos.length > 0 ? [{ id: "repo", label: filters.repos.length > 2 ? `Repo: ${filters.repos.slice(0, 2).join(", ")} + ${filters.repos.length - 2} more` : `Repo: ${filters.repos.join(", ")}`, remove: () => setFilters({ repos: null }) }] : []),
+    ...extra,
+    ...(showRepo && filters.repos.length > 0 ? [{ id: "repo", label: filters.repos.length > 2 ? `Repo: ${filters.repos.slice(0, 2).join(", ")} + ${filters.repos.length - 2} more` : `Repo: ${filters.repos.join(", ")}`, remove: () => setFilters({ repos: null }) }] : []),
     ...(filters.branch ? [{ id: "branch", label: `Branch: ${filters.branch}`, remove: () => setFilters({ branch: null }) }] : []),
     ...(filters.actor ? [{ id: "actor", label: `Actor: ${filters.actor}`, remove: () => setFilters({ actor: null }) }] : []),
     ...(filters.q ? [{ id: "q", label: `Text: ${filters.q}`, remove: () => {
@@ -213,6 +220,7 @@ export function FilterBar({
             className="h-8 w-[240px] rounded-sm border border-control bg-background pr-2 pl-8 font-mono text-[13px] text-fg outline-none placeholder:text-fg-3 focus:border-brand"
           />
         </label>
+        {showRepo && (
         <RepoMultiSelect
           org={org}
           value={{ all: filters.repos.length === 0, repos: filters.repos }}
@@ -225,6 +233,7 @@ export function FilterBar({
             </>
           }
         />
+        )}
         <ValueChip name="Branch" value={filters.branch} suggestions={branches} onPick={(branch) => setFilters({ branch })} />
         <ValueChip name="Actor" value={filters.actor} suggestions={actors} extra={[{ value: "me", note: "you" }]} onPick={(actor) => setFilters({ actor })} />
         {children}
@@ -240,6 +249,7 @@ export function FilterBar({
             onClick={() => {
               setDraft(null);
               setFilters({ q: null, repos: null, branch: null, actor: null });
+              extra.forEach((chip) => chip.remove());
             }}
           >
             clear all

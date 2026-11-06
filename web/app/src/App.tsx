@@ -7,13 +7,15 @@ import { useEffect, useState } from "react";
 import { ApiError, getSession, getTenant, type Session, type Tenant } from "./api";
 import { Shell } from "./components/Shell";
 import { Await } from "./components/Status";
+import { recents } from "./lib/storage";
 import { useLoad } from "./load";
 import { Billing } from "./pages/Billing";
 import { CiRun } from "./pages/CiRun";
 import { Environments } from "./pages/Environments";
 import { Home } from "./pages/Home";
 import { Kit } from "./pages/Kit";
-import { Repos } from "./pages/Repos";
+import { Repositories } from "./pages/Repositories";
+import { Repository } from "./pages/Repository";
 import { Runs } from "./pages/Runs";
 import { Secrets } from "./pages/Secrets";
 import { Audit } from "./pages/Audit";
@@ -83,8 +85,10 @@ export function App() {
   if (route) {
     return <OrgRoute session={session} route={route} />;
   }
+  // The profile page keeps the bar of the organization visited last.
+  const lastOrg = path === "/profile" ? (recents("orgs")[0] ?? null) : null;
   return (
-    <Shell user={session.user}>
+    <Shell user={session.user} org={lastOrg ? { login: lastOrg, role: null } : null}>
       <div className="mx-auto w-full max-w-[1080px] pt-3">
         {path === "/new" ? <Home stay /> : path === "/" ? <Home /> : path === "/profile" ? <Profile user={session.user} /> : <NotFound />}
       </div>
@@ -127,8 +131,10 @@ function OrgPage({ session, tenant, route }: { session: Session; tenant: Tenant;
   switch (route.page) {
     case "runs":
       return <Runs {...props} />;
-    case "repos":
-      return <Repos {...props} />;
+    case "repositories":
+      return <Repositories {...props} />;
+    case "repository":
+      return <Repository {...props} repo={route.repo ?? ""} tab={route.tab ?? "runs"} workflow={route.workflow} />;
     case "secrets":
       return <Secrets {...props} />;
     case "environments":
@@ -139,7 +145,6 @@ function OrgPage({ session, tenant, route }: { session: Session; tenant: Tenant;
       return <Kit {...props} />;
     case "setup":
       return <Setup {...props} />;
-    case "settings":
     case "billing":
       return <Billing {...props} />;
     case "run":
