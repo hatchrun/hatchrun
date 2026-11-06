@@ -11,6 +11,7 @@ pub mod builtin;
 pub mod commands;
 pub mod composite;
 pub mod context;
+pub mod docker;
 pub mod files;
 pub mod finish;
 pub mod layout;
@@ -67,7 +68,10 @@ pub struct Options {
     /// `RUNNER_TOOL_CACHE`.
     pub tool_cache: PathBuf,
     /// How long one `timeout-minutes` minute lasts. Tests shorten it.
+    /// A service's health check wait is a thirtieth of it.
     pub minute: Duration,
+    /// The `docker` command. `None` finds `docker` on the `PATH`.
+    pub docker: Option<PathBuf>,
 }
 
 /// The directories the runner user owns while the job runs. The action
@@ -195,7 +199,17 @@ pub async fn run_job(
         cache_saves: Vec::new(),
         cache_env: BTreeMap::new(),
         background: Background::default(),
+        docker: docker::DockerState::new(format!("hatchrun-{}", random_name().unwrap_or_default())),
     };
+    for container in doc.job.container.iter().chain(doc.job.services.values()) {
+        if let Some(credentials) = &container.credentials
+            && !credentials.password.contains("${{")
+        {
+            // A literal password is a secret too; one from `secrets` is
+            // already hidden.
+            job.masker.add(&credentials.password);
+        }
+    }
     job.start();
 
     let result = finish(&mut job, sink, &timed_out, &external).await;
@@ -221,6 +235,21 @@ async fn finish(
     }
 
     let proxy = job.start_cache(sink).await;
+    if job.start_containers(sink).await.is_err() {
+        // The steps never run, as on GitHub when a container does not start.
+        let summaries = doc
+            .job
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| job.skip(index, step, sink))
+            .collect();
+        job.stop_containers(sink).await;
+        if let Some(proxy) = proxy {
+            proxy.stop().await;
+        }
+        return job.result(Conclusion::Failure, BTreeMap::new(), summaries);
+    }
     // GitHub runs every `pre` before the first step, in step order.
     job.pre_phase(sink).await;
     let mut summaries = Vec::new();
@@ -239,6 +268,7 @@ async fn finish(
     job.drain_background(sink);
     job.save_caches(sink).await;
     let outputs = job.job_outputs(sink);
+    job.stop_containers(sink).await;
     if let Some(proxy) = proxy {
         proxy.stop().await;
     }
@@ -403,6 +433,8 @@ struct Job<'a> {
     cache_env: BTreeMap<String, String>,
     /// Process groups that steps left running. They end with the job.
     background: Background,
+    /// The containers the job started.
+    docker: docker::DockerState,
 }
 
 /// What a step needs to start.
@@ -675,16 +707,26 @@ impl Job<'_> {
             }
         };
         let args = prepared.shell.args_for(&prepared.script.to_string_lossy());
+        let exec =
+            match self.launch_for(&prepared.shell.program, &args, &prepared.cwd, &prepared.env) {
+                Ok(exec) => exec,
+                Err(message) => {
+                    remove_script(&prepared.script);
+                    self.say(sink, Line::Error(&message));
+                    return (common, Conclusion::Failure, BTreeMap::new());
+                }
+            };
         let ran = self
             .execute(
                 Launch {
-                    program: &prepared.shell.program,
-                    args: &args,
-                    cwd: &prepared.cwd,
-                    env: &prepared.env,
+                    program: &exec.program,
+                    args: &exec.args,
+                    cwd: &exec.cwd,
+                    env: &exec.env,
                     timeout: prepared.timeout,
                     timeout_minutes: step.timeout_minutes,
-                    files: &prepared.files,
+                    files: Some(&prepared.files),
+                    as_agent: exec.as_agent,
                 },
                 sink,
             )
@@ -717,7 +759,11 @@ impl Job<'_> {
             args: launch.args,
             cwd: launch.cwd,
             env: launch.env,
-            user: self.opts.runner_user.as_deref(),
+            user: self
+                .opts
+                .runner_user
+                .as_deref()
+                .filter(|_| !launch.as_agent),
             timeout,
         };
         let mut cancel: Pin<Box<dyn Future<Output = ()>>> = if self.grace_until.is_some() {
@@ -755,24 +801,26 @@ impl Job<'_> {
         }
 
         let mut state = Vec::new();
-        let read = files::read(launch.files);
-        // Nothing needs the files now, and a process left running must
-        // not write to them for a later reader to trust.
-        launch.files.remove();
-        match read {
-            Ok(written) => {
-                for warning in &written.warnings {
-                    out.warning(warning);
+        if let Some(step_files) = launch.files {
+            let read = files::read(step_files);
+            // Nothing needs the files now, and a process left running must
+            // not write to them for a later reader to trust.
+            step_files.remove();
+            match read {
+                Ok(written) => {
+                    for warning in &written.warnings {
+                        out.warning(warning);
+                    }
+                    self.github_env.extend(written.env);
+                    self.path_dirs.extend(written.path);
+                    state = written.state;
+                    out.push_outputs(written.outputs);
                 }
-                self.github_env.extend(written.env);
-                self.path_dirs.extend(written.path);
-                state = written.state;
-                out.push_outputs(written.outputs);
-            }
-            Err(err) => {
-                out.error(&err.to_string());
-                if outcome == Conclusion::Success {
-                    outcome = Conclusion::Failure;
+                Err(err) => {
+                    out.error(&err.to_string());
+                    if outcome == Conclusion::Success {
+                        outcome = Conclusion::Failure;
+                    }
                 }
             }
         }
@@ -830,7 +878,13 @@ struct Launch<'a> {
     env: &'a BTreeMap<String, String>,
     timeout: Option<Duration>,
     timeout_minutes: Option<u32>,
-    files: &'a StepFiles,
+    /// The file command files to read when it ends. `None` for a process
+    /// that has none, such as a `docker pull`.
+    files: Option<&'a StepFiles>,
+    /// Runs as the agent, not the runner user: the `docker` command
+    /// does, so it needs no `docker` group and no access to the
+    /// runner's home.
+    as_agent: bool,
 }
 
 /// How a launched process went.
@@ -905,10 +959,14 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
     env.extend(step_env);
     job.with_path(&mut env);
 
-    let has_bash = env.get("PATH").is_some_and(|path| {
-        path.split(':')
-            .any(|dir| Path::new(dir).join("bash").is_file())
-    });
+    // In a container the image decides, not this machine.
+    let has_bash = match job.docker.has_bash() {
+        Some(has_bash) => has_bash,
+        None => env.get("PATH").is_some_and(|path| {
+            path.split(':')
+                .any(|dir| Path::new(dir).join("bash").is_file())
+        }),
+    };
     let shell = shell::resolve(shell_name.as_deref(), has_bash)?;
     let script = layout
         .temp

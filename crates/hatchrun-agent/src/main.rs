@@ -98,6 +98,9 @@ enum Command {
         /// How long one `timeout-minutes` minute lasts. Tests shorten it.
         #[arg(long, default_value = "60s", value_parser = humantime::parse_duration, hide = true)]
         minute: Duration,
+        /// The `docker` command. Tests point it at a stand-in.
+        #[arg(long, hide = true)]
+        docker: Option<PathBuf>,
     },
     /// Run one job for the control plane.
     ///
@@ -177,6 +180,7 @@ async fn main() -> ExitCode {
             state_dir,
             result,
             minute,
+            docker,
         }) => {
             let opts = exec::Options {
                 work_dir: work_dir.clone(),
@@ -187,6 +191,7 @@ async fn main() -> ExitCode {
                 state_dir: state_dir.clone(),
                 tool_cache: PathBuf::from("/opt/hostedtoolcache"),
                 minute: *minute,
+                docker: docker.clone(),
             };
             let code = exec_command(job_file, &opts, result.as_deref()).await;
             // A blocking task that outlived the job, such as an archive
@@ -276,6 +281,7 @@ fn ci_options(
             state_dir: state_dir.to_owned(),
             tool_cache: PathBuf::from("/opt/hostedtoolcache"),
             minute: Duration::from_secs(60),
+            docker: None,
         },
         claim_timeout,
     }

@@ -200,6 +200,25 @@ impl Contexts {
         self.value["env"] = json!(env);
     }
 
+    /// Sets `job.container` and `job.services`, which the job's
+    /// containers make: their ids, network and mapped ports.
+    pub fn set_containers(&mut self, container: Option<Value>, services: Value) {
+        if let Some(container) = container {
+            self.value["job"]["container"] = container;
+        }
+        self.value["job"]["services"] = services;
+    }
+
+    /// Replaces the paths of the `github` and `runner` contexts with
+    /// where the job's container sees them, as `to_container` maps them.
+    pub fn set_paths(&mut self, layout: &Layout, to_container: impl Fn(&Path) -> String) {
+        let runner_workspace = layout.workspace.parent().unwrap_or(&layout.workspace);
+        self.value["github"]["workspace"] = json!(to_container(&layout.workspace));
+        self.value["runner"]["temp"] = json!(to_container(&layout.temp));
+        self.value["runner"]["tool_cache"] = json!(to_container(&layout.tool_cache));
+        self.value["runner"]["workspace"] = json!(to_container(runner_workspace));
+    }
+
     /// Records a finished step under `steps.<id>`.
     pub fn record_step(
         &mut self,

@@ -33,6 +33,11 @@ pub enum ActionRef {
         /// The tag, branch or commit.
         git_ref: String,
     },
+    /// `docker://image`.
+    Docker {
+        /// The image, such as `alpine:3.20`.
+        image: String,
+    },
     /// `./path` inside the workspace.
     Local(PathBuf),
 }
@@ -103,7 +108,25 @@ pub enum Runs {
         steps: Vec<CompositeStep>,
     },
     /// A Docker container action.
-    Docker,
+    Docker {
+        /// `image`: `docker://name` to pull, or a Dockerfile in the
+        /// action's directory.
+        image: String,
+        /// `entrypoint`, raw.
+        entrypoint: Option<String>,
+        /// `args`, raw, one argument each.
+        args: Vec<String>,
+        /// `env`, raw.
+        env: BTreeMap<String, String>,
+        /// `pre-entrypoint`, raw.
+        pre_entrypoint: Option<String>,
+        /// The condition for `pre-entrypoint`, raw.
+        pre_if: Option<String>,
+        /// `post-entrypoint`, raw.
+        post_entrypoint: Option<String>,
+        /// The condition for `post-entrypoint`, raw.
+        post_if: Option<String>,
+    },
 }
 
 /// One step of a composite action. Every field is the raw text, which
@@ -176,10 +199,13 @@ const RETRIES: u32 = 3;
 
 /// Splits a `uses:` value.
 pub fn parse_ref(uses: &str) -> Result<ActionRef, String> {
-    if uses.starts_with("docker://") {
-        return Err(format!(
-            "`{uses}` is a Docker container action; Docker services and containers come in a later release"
-        ));
+    if let Some(image) = uses.strip_prefix("docker://") {
+        if image.trim().is_empty() || image.contains(char::is_whitespace) {
+            return Err(format!("`{uses}` has no valid image: write docker://image"));
+        }
+        return Ok(ActionRef::Docker {
+            image: image.to_owned(),
+        });
     }
     if uses.starts_with("./") {
         return Ok(ActionRef::Local(PathBuf::from(uses)));
@@ -337,6 +363,7 @@ pub async fn fetch_with(
     limits: Limits,
 ) -> Result<Action> {
     match r {
+        ActionRef::Docker { .. } => bail!("a docker:// step has no action.yml"),
         ActionRef::Local(p) => {
             let dir = local_dir(&layout.workspace, p)?;
             let root = layout.workspace.canonicalize()?;
