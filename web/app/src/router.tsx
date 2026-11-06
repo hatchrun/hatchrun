@@ -92,11 +92,11 @@ export function useQueryList(name: string): string[] {
  *   /o/:org/repositories/:repo/runs/:n[/jobs/:j]   one run (n is the run id) and a job of it
  *   /o/:org/secrets                                Secrets and variables
  *   /o/:org/environments                           Environments
- *   /o/:org/audit                                  Audit log (org admin)
- *   /o/:org/settings[/billing]                     Settings, Billing
- *   /o/:org/setup                                  First run checklist
+ *   /o/:org/settings/billing                       Settings, Billing (/settings redirects here)
+ *   /o/:org/settings/setup                         First run checklist
+ *   /o/:org/settings/audit                         Audit log (org admin)
  */
-export type OrgPage = "kit" | "runs" | "repositories" | "repository" | "secrets" | "environments" | "settings" | "billing" | "audit" | "setup" | "run";
+export type OrgPage = "kit" | "runs" | "repositories" | "repository" | "secrets" | "environments" | "billing" | "audit" | "setup" | "run";
 
 export type RepoTabId = "runs" | "workflows" | "branches" | "pulls";
 
@@ -119,10 +119,9 @@ const PAGES: Record<string, OrgPage> = {
   repositories: "repositories",
   secrets: "secrets",
   environments: "environments",
-  settings: "settings",
   "settings/billing": "billing",
-  setup: "setup",
-  audit: "audit",
+  "settings/setup": "setup",
+  "settings/audit": "audit",
   // The component gallery, under `npm run dev:mock` only.
   ...(import.meta.env.MODE === "mock" ? { kit: "kit" as const } : {}),
 };
@@ -175,6 +174,10 @@ export function legacyCiRedirect(path: string): string | null {
   const orgRun = new RegExp(`^/o/(${NAME})/ci/(${NAME})/runs/(\\d+)(?:/jobs/(\\d+))?/?$`).exec(path);
   if (orgRun?.[1] && orgRun[2] && orgRun[3]) {
     return `/o/${orgRun[1]}/repositories/${orgRun[2]}/runs/${orgRun[3]}${orgRun[4] ? `/jobs/${orgRun[4]}` : ""}`;
+  }
+  const moved = new RegExp(`^/o/(${NAME})/(?:(setup|audit)|settings)/?$`).exec(path);
+  if (moved?.[1]) {
+    return `/o/${moved[1]}/settings/${moved[2] ?? "billing"}`;
   }
   const repos = new RegExp(`^/o/(${NAME})/repos/?$`).exec(path);
   if (repos?.[1]) {
