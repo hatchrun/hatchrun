@@ -74,9 +74,9 @@ pub use self::runs::{
     run_for_delivery, run_started, runs_page,
 };
 pub use self::secrets::{
-    Owner, Put, SealedRow, SecretItem, StaleRow, VarItem, delete_secret, delete_var, job_vars,
-    mark_used, put_secret, put_var, repo_ids, reseal, sealed_secrets, secret_names, stale_secrets,
-    tenant_repos, vars,
+    Owner, Put, SealedRow, SecretItem, StaleRow, VarItem, delete_secret, delete_var, job_var_rows,
+    job_vars, mark_used, put_secret, put_var, repo_ids, reseal, sealed_secrets, secret_names,
+    stale_secrets, tenant_repos, vars, winners,
 };
 pub use self::tenants::{
     CiBilling, TenantRow, has_card, tenant, tenant_by_org_id, tenant_for_installation,

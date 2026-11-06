@@ -350,29 +350,25 @@ pub(crate) async fn admin_tenant(cx: &Cx<'_>, org: &str) -> Result<Served<Tenant
     }
 }
 
-/// Records a change the caller made to `tenant`'s settings.
-pub(crate) async fn audit(
-    cx: &Cx<'_>,
-    tenant: &str,
+/// A change the caller makes to `tenant`'s settings, for the store to
+/// record in the transaction of the change itself.
+pub(crate) fn audit_of<'a>(
+    cx: &'a Cx<'_>,
+    tenant: &'a str,
     action: store::Action,
-    scope: &str,
-    repo: Option<&str>,
-    target: &str,
-) -> Result<()> {
-    let actor = cx.session.map_or("", |session| session.user.login.as_str());
-    store::record_audit(
-        cx.db,
-        &store::NewAudit {
-            tenant,
-            actor,
-            action,
-            scope,
-            repo,
-            target,
-            now: now_ms(),
-        },
-    )
-    .await
+    scope: &'a str,
+    repo: Option<&'a str>,
+    target: &'a str,
+) -> store::NewAudit<'a> {
+    store::NewAudit {
+        tenant,
+        actor: cx.session.map_or("", |session| session.user.login.as_str()),
+        action,
+        scope,
+        repo,
+        target,
+        now: now_ms(),
+    }
 }
 
 async fn billing_view(cx: &Cx<'_>, org: &str) -> Result<Served> {
@@ -803,6 +799,8 @@ async fn put_secret(
     };
     let sealed = secrets::seal(&keyring.current, &aad, nonce, &body.value);
     let max = limit(target.owner != Owner::Org);
+    let audited = target.audited(&name);
+    let audit = audit_row(cx, &target, store::Action::SecretPut, &audited);
     let put = store::put_secret(
         cx.db,
         &target.tenant,
@@ -813,9 +811,10 @@ async fn put_secret(
         &sealed,
         max,
         now_ms(),
+        &audit,
     )
     .await?;
-    saved(cx, put, &target, Kind::Secrets, &name, max).await
+    saved(put, &target, Kind::Secrets, max)
 }
 
 async fn put_var(
@@ -842,6 +841,8 @@ async fn put_var(
         Err(stop) => return Ok(Err(stop)),
     };
     let max = limit(target.owner != Owner::Org);
+    let audited = target.audited(&name);
+    let audit = audit_row(cx, &target, store::Action::VarPut, &audited);
     let put = store::put_var(
         cx.db,
         &target.tenant,
@@ -851,9 +852,10 @@ async fn put_var(
         &body.value,
         max,
         now_ms(),
+        &audit,
     )
     .await?;
-    saved(cx, put, &target, Kind::Vars, &name, max).await
+    saved(put, &target, Kind::Vars, max)
 }
 
 async fn list_environments(cx: &Cx<'_>, owner: &str, repo: &str) -> Result<Served> {
@@ -908,6 +910,15 @@ async fn put_environment(
         Err(stop) => return Ok(Err(stop)),
     };
     let now = now_ms();
+    // The store records the stored name of the environment, not `name`.
+    let audit = audit_of(
+        cx,
+        &repo.tenant_id,
+        store::Action::EnvironmentPut,
+        "repo",
+        Some(&repo.full_name),
+        name,
+    );
     let saved = store::put_environment(
         cx.db,
         &repo.tenant_id,
@@ -917,6 +928,7 @@ async fn put_environment(
         body.approval,
         environments::MAX_PER_REPO,
         now,
+        &audit,
     )
     .await?;
     let row = match saved {
@@ -932,15 +944,6 @@ async fn put_environment(
             ));
         }
     };
-    audit(
-        cx,
-        &repo.tenant_id,
-        store::Action::EnvironmentPut,
-        "repo",
-        Some(&repo.full_name),
-        &row.name,
-    )
-    .await?;
     release_and_wake(cx, repo.id, &row.name, row.approval, false, now).await;
     reply(200, &environment_json(&row)).map(Ok)
 }
@@ -950,18 +953,17 @@ async fn delete_environment(cx: &Cx<'_>, owner: &str, repo: &str, name: &str) ->
         Ok(repo) => repo,
         Err(stop) => return Ok(Err(stop)),
     };
-    if !store::delete_environment(cx.db, repo.id, name).await? {
-        return Ok(stop(404, "not found"));
-    }
-    audit(
+    let audit = audit_of(
         cx,
         &repo.tenant_id,
         store::Action::EnvironmentDelete,
         "repo",
         Some(&repo.full_name),
         name,
-    )
-    .await?;
+    );
+    if !store::delete_environment(cx.db, repo.id, name, &audit).await? {
+        return Ok(stop(404, "not found"));
+    }
     release_and_wake(cx, repo.id, name, false, true, now_ms()).await;
     no_content().map(Ok)
 }
@@ -1012,38 +1014,29 @@ async fn release_and_wake(
     }
 }
 
-async fn saved(
-    cx: &Cx<'_>,
-    put: Put,
-    target: &Target,
-    kind: Kind,
-    name: &str,
-    max: u32,
-) -> Result<Served> {
+fn saved(put: Put, target: &Target, kind: Kind, max: u32) -> Result<Served> {
     match put {
-        Put::Saved => {
-            let action = match kind {
-                Kind::Secrets => store::Action::SecretPut,
-                Kind::Vars => store::Action::VarPut,
-            };
-            audit_row(cx, target, action, name).await?;
-            no_content().map(Ok)
-        }
+        Put::Saved => no_content().map(Ok),
         Put::TooMany => Ok(stop(409, too_many_message(&target.label, kind, max))),
     }
 }
 
-/// Records a change to the row `name` of `target`.
-async fn audit_row(cx: &Cx<'_>, target: &Target, action: store::Action, name: &str) -> Result<()> {
-    audit(
+/// The record of a change to a row of `target`; `audited` is
+/// [`Target::audited`] of its name.
+fn audit_row<'a>(
+    cx: &'a Cx<'_>,
+    target: &'a Target,
+    action: store::Action,
+    audited: &'a str,
+) -> store::NewAudit<'a> {
+    audit_of(
         cx,
         &target.tenant,
         action,
         target.scope(),
         target.repo.as_deref(),
-        &target.audited(name),
+        audited,
     )
-    .await
 }
 
 async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result<Served> {
@@ -1055,16 +1048,19 @@ async fn delete(cx: &Cx<'_>, scope: Scope<'_>, kind: Kind, item: &str) -> Result
         Ok(name) => name,
         Err(stop) => return Ok(Err(stop)),
     };
+    let action = match kind {
+        Kind::Secrets => store::Action::SecretDelete,
+        Kind::Vars => store::Action::VarDelete,
+    };
+    let audited = target.audited(&name);
+    let audit = audit_row(cx, &target, action, &audited);
     let existed = match kind {
-        Kind::Secrets => store::delete_secret(cx.db, &target.tenant, target.owner, &name).await?,
-        Kind::Vars => store::delete_var(cx.db, &target.tenant, target.owner, &name).await?,
+        Kind::Secrets => {
+            store::delete_secret(cx.db, &target.tenant, target.owner, &name, &audit).await?
+        }
+        Kind::Vars => store::delete_var(cx.db, &target.tenant, target.owner, &name, &audit).await?,
     };
     if existed {
-        let action = match kind {
-            Kind::Secrets => store::Action::SecretDelete,
-            Kind::Vars => store::Action::VarDelete,
-        };
-        audit_row(cx, &target, action, &name).await?;
         no_content().map(Ok)
     } else {
         Ok(stop(404, "not found"))

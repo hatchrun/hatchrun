@@ -858,7 +858,7 @@ fn daily_usage_groups_by_utc_day() {
     for (job, seconds, ended, units) in [
         (1, 100, month - 1, 100),
         (2, 60, month + 5, 60),
-        (3, 90, month + DAY - 1, 90),
+        (3, 90, month + DAY - 1, 180),
         (4, 60, month + 3 * DAY, 60),
     ] {
         db.run(
@@ -872,7 +872,7 @@ fn daily_usage_groups_by_utc_day() {
         .iter()
         .map(|d| (d.day.as_str(), d.seconds, d.units))
         .collect();
-    assert_eq!(shown, [("2026-10-01", 150, 150), ("2026-10-04", 60, 60)]);
+    assert_eq!(shown, [("2026-10-01", 150, 240), ("2026-10-04", 60, 60)]);
     assert_eq!(
         db.wait(daily_usage(db.db(), "t2", month)).unwrap(),
         Vec::new()
@@ -1123,6 +1123,12 @@ fn activity_buckets_runs_by_creation_and_completion() {
         .wait(activity(db.db(), &[8], None, start, hour, 3))
         .unwrap();
     assert!(none.iter().all(|b| b.started == 0));
+    for name in ["acme/app", "ACME/App"] {
+        let named = db
+            .wait(activity(db.db(), &[7], Some(name), start, hour, 3))
+            .unwrap();
+        assert_eq!(named, buckets, "{name}");
+    }
     let other = db
         .wait(activity(db.db(), &[7], Some("nope/none"), start, hour, 3))
         .unwrap();

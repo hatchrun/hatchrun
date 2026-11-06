@@ -13,6 +13,7 @@ use hatchrun_cloud::db::{Db, params};
 use serde::{Deserialize, Serialize};
 use worker::Result;
 
+use super::NewAudit;
 use crate::github::InstalledRepo;
 
 /// The rows of the JSON list `$2` of repositories.
@@ -330,7 +331,9 @@ pub async fn patch_enabled(
     all: Option<bool>,
     add: &[String],
     remove: &[String],
+    audit: &NewAudit<'_>,
 ) -> Result<()> {
+    let audit_sql = NewAudit::insert_bound_sql(1, "(SELECT 1) one");
     let mut statements = Vec::new();
     if let Some(all) = all {
         statements.push((
@@ -353,6 +356,7 @@ pub async fn patch_enabled(
             ));
         }
     }
+    statements.push((audit_sql.as_str(), audit.binds_with_target()));
     db.batch(&statements).await?;
     Ok(())
 }
