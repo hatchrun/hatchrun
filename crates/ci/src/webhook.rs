@@ -19,6 +19,7 @@ use hatchrun_workflow::{Event, MAX_CHANGED};
 use serde_json::{Value, json};
 use worker::{Env, Method, Request, RequestInit, Response, Result};
 
+use crate::alerts;
 use crate::env::{Settings, run_stub};
 use crate::github;
 use crate::installation;
@@ -212,19 +213,10 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         delivery: guid,
         now,
     };
-    let outcome = match &trigger {
-        Trigger::Push(push) => cx.push(push).await?,
-        Trigger::PullRequest(pr) => cx.pull_request(pr).await?,
-        Trigger::Release(release) => cx.release(release).await?,
-        Trigger::Create(change) => cx.create(change).await?,
-        Trigger::Delete(change) => cx.delete(change).await?,
-        Trigger::Rerequested(rerun) => cx.rerun(rerun).await?,
-        // The row was updated above, with the tenant's other repository
-        // writes; nothing runs.
-        Trigger::Repository(_) => Outcome::Done(Vec::new()),
-        Trigger::Ignored(reason) => Outcome::Ignored(reason.clone()),
-        Trigger::InstallationRepositories { .. } => unreachable!("answered above"),
-    };
+    let result = cx.run(&trigger).await;
+    // The calls made are noted even when the delivery failed.
+    alerts::note_rate_limits(&db, &github, now).await;
+    let outcome = result?;
     if !matches!(outcome, Outcome::Retry) {
         store::record_delivery(&db, guid, kind, now).await?;
     }
@@ -323,6 +315,23 @@ struct Cx<'a> {
 }
 
 impl Cx<'_> {
+    /// Starts what `trigger` asks for.
+    async fn run(&self, trigger: &Trigger) -> Result<Outcome> {
+        Ok(match trigger {
+            Trigger::Push(push) => self.push(push).await?,
+            Trigger::PullRequest(pr) => self.pull_request(pr).await?,
+            Trigger::Release(release) => self.release(release).await?,
+            Trigger::Create(change) => self.create(change).await?,
+            Trigger::Delete(change) => self.delete(change).await?,
+            Trigger::Rerequested(rerun) => self.rerun(rerun).await?,
+            // The row was updated before, with the tenant's other
+            // repository writes; nothing runs.
+            Trigger::Repository(_) => Outcome::Done(Vec::new()),
+            Trigger::Ignored(reason) => Outcome::Ignored(reason.clone()),
+            Trigger::InstallationRepositories { .. } => unreachable!("answered above"),
+        })
+    }
+
     async fn push(&self, push: &Push) -> Result<Outcome> {
         let trigger = Event::Push {
             r#ref: push.r#ref.clone(),

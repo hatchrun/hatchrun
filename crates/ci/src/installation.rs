@@ -12,6 +12,7 @@ use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
 use worker::{Env, Result};
 
+use crate::alerts;
 use crate::env::Settings;
 use crate::github;
 use crate::store;
@@ -45,6 +46,21 @@ pub async fn sync(
     now: u64,
 ) -> Result<usize> {
     let counted = Counted::default();
+    let read = read(env, db, settings, tenant, installation_id, now, &counted).await;
+    // The calls made are noted even when the read failed.
+    alerts::note_rate_limits(db, &counted, now).await;
+    read
+}
+
+async fn read(
+    env: &Env,
+    db: &Db,
+    settings: &Settings,
+    tenant: &str,
+    installation_id: u64,
+    now: u64,
+    counted: &Counted,
+) -> Result<usize> {
     let tokens = Tokens::new(
         Kv::new(env),
         App::new(
@@ -52,7 +68,7 @@ pub async fn sync(
             settings.app_id.clone(),
             settings.app_key.clone(),
         ),
-        &counted,
+        counted,
         now,
     );
     let mut repos = Vec::new();

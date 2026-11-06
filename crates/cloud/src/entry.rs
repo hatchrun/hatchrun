@@ -5,8 +5,12 @@
 //! The Worker's entry point: `fetch`. Another Worker that reuses this
 //! crate turns the `worker` feature off and defines its own.
 
+use std::pin::pin;
+use std::time::Duration;
+
+use futures_util::future::{Either, select};
 use worker::{
-    Env, Headers, Method, Request, Response, ResponseBuilder, Result, console_error, event,
+    Delay, Env, Headers, Method, Request, Response, ResponseBuilder, Result, console_error, event,
 };
 
 use crate::db::{Db, params};
@@ -37,6 +41,8 @@ const SECURITY_HEADERS: [(&str, &str); 5] = [
 const WEBHOOK_SECRET: &str = "GITHUB_WEBHOOK_SECRET";
 /// Service binding to `hatchrun-ci`.
 const CI: &str = "CI";
+/// How long `/healthz` waits for `hatchrun-ci` before it answers 503.
+const CI_HEALTH_FOR: Duration = Duration::from_secs(3);
 
 /// Whether `hatchrun-ci` handles deliveries of `event`.
 fn forwarded(event: &str) -> bool {
@@ -129,20 +135,64 @@ async fn fetch(req: Request, env: Env, _ctx: worker::Context) -> Result<Response
     assets(req, &env).await
 }
 
-/// Whether the database answers: 200 when it does, 503 when it does
-/// not.
+/// Whether the database answers and `hatchrun-ci`'s reconciler runs:
+/// 200 when both do, 503 when either does not. The CI Worker answers for
+/// its reconciler (see `hatchrun-ci`'s alerts), which this Worker cannot
+/// see. Both checks run at once; CI's answer is dropped when the
+/// database failed.
 async fn healthz(env: &Env) -> Result<Response> {
-    let read = async { Db::connect(env).await?.run("SELECT 1", &[]).await };
-    let (status, body) = match read.await {
-        Ok(_) => (200, serde_json::json!({ "status": "ok" })),
-        Err(err) => {
-            console_error!("healthz: {err}");
-            (503, serde_json::json!({ "status": "database" }))
+    let database = async {
+        let read = async { Db::connect(env).await?.run("SELECT 1", &[]).await };
+        match read.await {
+            Ok(_) => true,
+            Err(err) => {
+                console_error!("healthz: {err}");
+                false
+            }
         }
     };
+    let (database, ci) = futures_util::join!(database, ci_health(env));
+    if let (true, Err(err)) = (database, &ci) {
+        console_error!("healthz: ci: {err}");
+    }
+    let (status, body) = verdict(database, ci);
     let mut response = Response::from_json(&body)?.with_status(status);
     response.headers_mut().set("Cache-Control", "no-store")?;
     Ok(response)
+}
+
+/// `hatchrun-ci`'s `/healthz` over the service binding: its status and
+/// body. A CI Worker that does not answer within [`CI_HEALTH_FOR`] is an
+/// error.
+async fn ci_health(env: &Env) -> std::result::Result<(u16, serde_json::Value), String> {
+    let ci = env.service(CI).map_err(|err| err.to_string())?;
+    let ask = async {
+        let mut answer = ci
+            .fetch("https://ci/healthz", None)
+            .await
+            .map_err(|err| err.to_string())?;
+        let status = answer.status_code();
+        let body = answer.json().await.unwrap_or(serde_json::Value::Null);
+        Ok((status, body))
+    };
+    match select(pin!(ask), pin!(Delay::from(CI_HEALTH_FOR))).await {
+        Either::Left((answer, _)) => answer,
+        Either::Right(_) => Err("timed out".to_owned()),
+    }
+}
+
+/// `/healthz`'s status and body from what the checks found. The
+/// database comes first; CI's own answer is passed on.
+fn verdict(
+    database: bool,
+    ci: std::result::Result<(u16, serde_json::Value), String>,
+) -> (u16, serde_json::Value) {
+    match (database, ci) {
+        (false, _) => (503, serde_json::json!({ "status": "database" })),
+        (true, Ok((200, _))) => (200, serde_json::json!({ "status": "ok" })),
+        (true, Ok((_, body))) => (503, serde_json::json!({ "status": "ci", "ci": body })),
+        (true, Err(_)) => (503, serde_json::json!({ "status": "ci" })),
+    }
 }
 
 /// The app's static assets. Every path that is not a file is the app's
@@ -299,6 +349,25 @@ mod tests {
         assert!(!forwards_api("/api/ci/runs/1", None, app));
         assert!(!forwards_api("/api/ci/runs/1", app, None));
         assert!(!forwards_api("/api/ci/runs/1", None, None));
+    }
+
+    #[test]
+    fn healthz_needs_the_database_and_ci() {
+        let ok = serde_json::json!({ "status": "ok" });
+        assert_eq!(verdict(true, Ok((200, ok.clone()))), (200, ok));
+        let stale = serde_json::json!({ "status": "stale" });
+        assert_eq!(
+            verdict(true, Ok((503, stale.clone()))),
+            (503, serde_json::json!({ "status": "ci", "ci": stale }))
+        );
+        assert_eq!(
+            verdict(true, Err("no service".to_owned())),
+            (503, serde_json::json!({ "status": "ci" }))
+        );
+        assert_eq!(
+            verdict(false, Ok((200, serde_json::Value::Null))),
+            (503, serde_json::json!({ "status": "database" }))
+        );
     }
 
     const NOW: u64 = 1_792_140_000_000;

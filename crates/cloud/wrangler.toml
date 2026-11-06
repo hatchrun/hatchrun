@@ -46,7 +46,8 @@ id = "92b81a8052544d3387c16535ee2a4fa2"
 
 # hatchrun-ci takes the push, pull_request, check_run, repository,
 # release, create and delete deliveries
-# (crates/cloud/src/entry.rs forwards them as they came).
+# (crates/cloud/src/entry.rs forwards them as they came); /healthz asks
+# its /healthz too.
 [[services]]
 binding = "CI"
 service = "hatchrun-ci"
