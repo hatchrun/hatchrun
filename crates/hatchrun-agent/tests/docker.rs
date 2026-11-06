@@ -47,6 +47,7 @@ logs) echo "db log line" ;;
 ps) ;;
 exec)
   if [ "$2" = --workdir ]; then
+    [ -f "$dir/slow_exec" ] && sleep 5
     echo "EXEC $*"
     [ -f "$dir/exec_code" ] && exit "$(cat "$dir/exec_code")"
   else
@@ -55,7 +56,7 @@ exec)
       *PATH*) echo /usr/local/bin:/usr/bin ;;
     esac
   fi ;;
-run) echo "RUN $*" ;;
+run) [ -f "$dir/slow_run" ] && sleep 5; echo "RUN $*" ;;
 build) echo "BUILD $*" ;;
 esac
 exit 0
@@ -631,5 +632,44 @@ fn workflow_values_reach_the_container_by_env_file_never_the_docker_client() {
     assert!(
         !calls.contains("topsecret") && !calls.contains("evil.so"),
         "{calls}"
+    );
+}
+
+#[test]
+fn a_step_timeout_covers_docker_actions_and_steps_in_the_container() {
+    let slow = std::time::Duration::from_secs(4);
+
+    let setup = Setup::new();
+    setup.set("slow_run", "");
+    let mut step = UsesStep {
+        id: Some("a".to_owned()),
+        uses: "docker://alpine".to_owned(),
+        ..UsesStep::default()
+    };
+    step.timeout_minutes = Some(1);
+    let started = std::time::Instant::now();
+    let out = setup.run(&make::document(vec![PlannedStep::Uses(step)]));
+    assert!(started.elapsed() < slow);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stdout(&out).contains("timed out after 1 minutes"),
+        "{}",
+        stdout(&out)
+    );
+
+    let setup = Setup::new();
+    setup.set("slow_exec", "");
+    let mut run = make::run("sleep 100");
+    run.timeout_minutes = Some(1);
+    let mut doc = make::document(vec![PlannedStep::Run(run)]);
+    doc.job.container = Some(image("alpine"));
+    let started = std::time::Instant::now();
+    let out = setup.run(&doc);
+    assert!(started.elapsed() < slow);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stdout(&out).contains("timed out after 1 minutes"),
+        "{}",
+        stdout(&out)
     );
 }

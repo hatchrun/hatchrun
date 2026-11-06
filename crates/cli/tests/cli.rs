@@ -283,3 +283,65 @@ fn convert_skips_an_oversized_file_and_converts_the_rest() {
     let out = run(hatchrun().arg("validate").arg(&out_file));
     assert!(out.status.success(), "{}", text(&out.stdout));
 }
+
+#[test]
+fn convert_prefixes_warnings_and_exits_0_on_warnings_alone() {
+    let src = scratch("warns.yml");
+    std::fs::write(
+        &src,
+        "on: push\nbogus: 1\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps: [{ run: make }]\n",
+    )
+    .unwrap();
+    let out = run(hatchrun().arg("convert").arg(&src));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(err.contains("warning: "), "{err}");
+    assert!(err.lines().all(|l| l.starts_with("warning: ")), "{err}");
+}
+
+#[test]
+fn convert_reports_a_step_with_neither_run_nor_uses_and_converts_the_rest() {
+    let bad = scratch("empty-step.yml");
+    std::fs::write(
+        &bad,
+        "on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - name: nothing\n      - run: echo hi\n",
+    )
+    .unwrap();
+    let dest = scratch("empty-step-out.yml");
+    let out = run(hatchrun()
+        .arg("convert")
+        .arg(&bad)
+        .arg(fixture("github/ci.yml"))
+        .arg("-o")
+        .arg(&dest));
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    let line = err
+        .lines()
+        .find(|l| l.contains("neither `run` nor `uses`"))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!(line.starts_with("error: "), "{line}");
+    assert!(
+        line.contains("empty-step.yml") && line.contains("step `nothing`"),
+        "{line}"
+    );
+    let written = std::fs::read_to_string(&dest).unwrap();
+    assert!(written.contains("workflows"), "{written}");
+    assert!(!written.contains("empty-step"), "{written}");
+}
+
+#[test]
+fn convert_leaves_an_unreadable_file_out_and_converts_the_rest() {
+    let out_file = scratch("unreadable-out.yml");
+    let out = run(hatchrun()
+        .arg("convert")
+        .arg(scratch("missing-workflow.yml"))
+        .arg(fixture("github/ci.yml"))
+        .arg("-o")
+        .arg(&out_file));
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("error: read "), "{err}");
+    let written = std::fs::read_to_string(&out_file).unwrap();
+    assert!(written.contains("workflows"), "{written}");
+}

@@ -433,6 +433,8 @@ impl Job<'_> {
 
         let network = format!("hatchrun_network_{}", random_name()?);
         self.say(sink, Line::Note(&format!("Creating network {network}")));
+        // Recorded first: a stop during the create still removes it.
+        self.docker.network = Some(network.clone());
         self.docker_ok(&[
             "network".to_owned(),
             "create".to_owned(),
@@ -441,7 +443,6 @@ impl Job<'_> {
             network.clone(),
         ])
         .await?;
-        self.docker.network = Some(network.clone());
 
         for (_, service) in &services {
             self.pull(service, sink).await?;

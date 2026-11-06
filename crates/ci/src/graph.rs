@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 
 use hatchrun_workflow::{
     Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Need, Outcome, Plan,
-    PlannedJob, Ready, Statuses, checks_status, continue_on_error, hatchrun_context, job_condition,
-    ready,
+    PlannedJob, Ready, Statuses, checks_status, continue_on_error, hatchrun_context, interpolate,
+    is_expression, job_condition, ready, valid_environment_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -58,6 +58,9 @@ pub struct Node {
     pub result: Option<JobResult>,
     /// Why the control plane ended the job, when it did.
     pub message: Option<String>,
+    /// The environment the job runs in, once known: the name as planned,
+    /// or the one its expression gave when the job became ready.
+    pub environment: Option<String>,
     /// 0 until the job is asked to stop, 1 once asked, 2 once told to
     /// stop hard.
     pub cancel: u32,
@@ -127,6 +130,7 @@ impl Graph {
             jobs: jobs
                 .into_iter()
                 .map(|(id, job)| Node {
+                    environment: job.environment.clone().filter(|name| !is_expression(name)),
                     id,
                     job,
                     state: State::Waiting,
@@ -140,6 +144,18 @@ impl Graph {
             run_done: false,
             vars: BTreeMap::new(),
         }
+    }
+
+    /// Whether an environment name of the run reads `vars`, which the
+    /// caller then fills with [`Graph::set_vars`] before jobs start.
+    #[must_use]
+    pub fn environments_read_vars(&self) -> bool {
+        self.jobs.iter().any(|n| {
+            n.job
+                .environment
+                .as_deref()
+                .is_some_and(|name| is_expression(name) && name.contains("vars"))
+        })
     }
 
     /// Gives the graph the variables the `continue-on-error` of a job
@@ -543,6 +559,7 @@ impl Graph {
         let plan = Plan {
             workflow: String::new(),
             concurrency: None,
+            run_name: None,
             jobs: self.jobs.iter().map(|n| n.job.clone()).collect(),
         };
         let job = &plan.jobs[at];
@@ -700,23 +717,53 @@ impl Graph {
             .statuses
             .values()
             .any(|s| *s != Statuses::SUCCESS);
-        match self.decide(at, github_ctx, statuses_ok) {
-            Ok(true) => {
-                self.jobs[at].state = State::Queued;
-                actions.push(Action::Launch(self.jobs[at].id));
+        let problem = match self.decide(at, github_ctx, statuses_ok) {
+            Ok(true) => match self.resolve_environment(at, github_ctx) {
+                Ok(()) => {
+                    self.jobs[at].state = State::Queued;
+                    actions.push(Action::Launch(self.jobs[at].id));
+                    return;
+                }
+                Err(message) => message,
+            },
+            Ok(false) if self.cancelled => {
+                self.end(at, Conclusion::Cancelled, None, actions);
+                return;
             }
-            Ok(false) if self.cancelled => self.end(at, Conclusion::Cancelled, None, actions),
-            Ok(false) => self.end(at, Conclusion::Skipped, None, actions),
-            Err(e) => {
-                let (conclusion, note) = self.forgive(at, Conclusion::Failure, github_ctx);
-                let message = match note {
-                    Some(note) => format!("{} {note}", if_error(&e)),
-                    None => if_error(&e),
-                };
-                self.end(at, conclusion, Some(message), actions);
-                self.fail_fast(at, actions);
+            Ok(false) => {
+                self.end(at, Conclusion::Skipped, None, actions);
+                return;
             }
-        }
+            Err(e) => if_error(&e),
+        };
+        let (conclusion, note) = self.forgive(at, Conclusion::Failure, github_ctx);
+        let message = match note {
+            Some(note) => format!("{problem} {note}"),
+            None => problem,
+        };
+        self.end(at, conclusion, Some(message), actions);
+        self.fail_fast(at, actions);
+    }
+
+    /// Settles the environment of the job at `at`: an expression in its
+    /// name is evaluated against the job's contexts, now that the jobs it
+    /// needs ended, and the name must be a valid one.
+    fn resolve_environment(&mut self, at: usize, github_ctx: &Value) -> Result<(), String> {
+        let Some(template) = self.jobs[at].job.environment.clone() else {
+            return Ok(());
+        };
+        let name = if is_expression(&template) {
+            let ctx = self.context(at, github_ctx);
+            interpolate(&template, &ctx, &Status(JobStatus::Success))
+                .map_err(|e| format!("environment: {e}"))?
+                .trim()
+                .to_owned()
+        } else {
+            template
+        };
+        valid_environment_name(&name).map_err(|rule| format!("environment `{name}`: {rule}"))?;
+        self.jobs[at].environment = Some(name);
+        Ok(())
     }
 
     fn end(
@@ -817,6 +864,7 @@ jobs:
                 .collect(),
             steps: Vec::new(),
             annotations: Vec::new(),
+            environment_url: None,
         }
     }
 
@@ -1589,6 +1637,119 @@ jobs:
         // `matrix.experimental` is not set: the expression is null, not true.
         g.finished(1, done(Conclusion::Failure, &[]), &ctx());
         assert_eq!(g.node(1).unwrap().state, State::Done(Conclusion::Failure));
+    }
+
+    /// The graph of the workflow `ci` of `yaml`, jobs numbered from 1.
+    fn graph_from(yaml: &str) -> Graph {
+        let config = parse(yaml).unwrap_or_else(|e| panic!("{e:?}"));
+        let plan = compile(&config, "ci", "refs/heads/main").unwrap_or_else(|e| panic!("{e:?}"));
+        Graph::new(
+            plan.jobs
+                .into_iter()
+                .enumerate()
+                .map(|(i, j)| (i as u64 + 1, j))
+                .collect(),
+        )
+    }
+
+    const ENVIRONMENTS: &str = r#"
+jobs:
+  pick: { runs-on: ubuntu-latest, outputs: { stage: "${{ steps.s.outputs.v }}" }, steps: [] }
+  deploy:
+    runs-on: ubuntu-latest
+    parameters: { region: { type: string } }
+    environment: "${{ needs.pick.outputs.stage }}-${{ matrix.zone }}"
+    steps: []
+  fixed: { runs-on: ubuntu-latest, environment: production, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - pick
+      - fixed
+      - deploy: { requires: [pick], matrix: { region: [x], zone: [a, b] } }
+"#;
+
+    #[test]
+    fn an_environment_expression_is_evaluated_when_the_job_is_ready() {
+        let mut g = graph_from(ENVIRONMENTS);
+        // A name that is plain text is known from the start; an
+        // expression is not.
+        assert_eq!(
+            g.node(2).unwrap().environment.as_deref(),
+            Some("production")
+        );
+        assert_eq!(g.node(3).unwrap().environment, None);
+        g.advance(&ctx());
+        assert_eq!(g.node(3).unwrap().state, State::Waiting);
+        assert_eq!(g.node(3).unwrap().environment, None);
+        let finished = JobResult {
+            outputs: BTreeMap::from([("stage".to_owned(), "prod".to_owned())]),
+            ..ok()
+        };
+        let actions = g.finished(1, finished, &ctx());
+        assert!(actions.contains(&Action::Launch(3)));
+        assert!(actions.contains(&Action::Launch(4)));
+        assert_eq!(g.node(3).unwrap().environment.as_deref(), Some("prod-a"));
+        assert_eq!(g.node(4).unwrap().environment.as_deref(), Some("prod-b"));
+        // The plan keeps the expression, for a rerun to read again.
+        assert!(
+            g.node(3)
+                .unwrap()
+                .job
+                .environment
+                .as_deref()
+                .unwrap()
+                .contains("${{")
+        );
+    }
+
+    #[test]
+    fn an_environment_name_that_is_not_valid_ends_the_job_as_failed() {
+        let mut g = graph_from(ENVIRONMENTS);
+        g.advance(&ctx());
+        let finished = JobResult {
+            outputs: BTreeMap::from([("stage".to_owned(), "prod eu".to_owned())]),
+            ..ok()
+        };
+        let actions = g.finished(1, finished, &ctx());
+        assert!(!actions.contains(&Action::Launch(3)));
+        assert_eq!(g.node(3).unwrap().state, State::Done(Conclusion::Failure));
+        let message = g.node(3).unwrap().message.clone().unwrap();
+        assert!(message.contains("environment `prod eu-a`"), "{message}");
+    }
+
+    #[test]
+    fn an_environment_name_that_cannot_be_evaluated_ends_the_job_as_failed() {
+        let yaml = ENVIRONMENTS.replace(
+            "${{ needs.pick.outputs.stage }}-${{ matrix.zone }}",
+            "${{ fromJSON(needs.pick.outputs.stage) }}",
+        );
+        let mut g = graph_from(&yaml);
+        g.advance(&ctx());
+        let finished = JobResult {
+            outputs: BTreeMap::from([("stage".to_owned(), "{".to_owned())]),
+            ..ok()
+        };
+        g.finished(1, finished, &ctx());
+        assert_eq!(g.node(3).unwrap().state, State::Done(Conclusion::Failure));
+        let message = g.node(3).unwrap().message.clone().unwrap();
+        assert!(message.starts_with("environment: "), "{message}");
+    }
+
+    #[test]
+    fn an_environment_name_can_read_vars() {
+        let yaml = ENVIRONMENTS.replace(
+            "${{ needs.pick.outputs.stage }}-${{ matrix.zone }}",
+            "${{ vars.STAGE }}-${{ matrix.zone }}",
+        );
+        let mut g = graph_from(&yaml);
+        assert!(g.environments_read_vars());
+        g.set_vars(BTreeMap::from([("STAGE".to_owned(), "qa".to_owned())]));
+        g.advance(&ctx());
+        g.finished(1, ok(), &ctx());
+        assert_eq!(g.node(3).unwrap().environment.as_deref(), Some("qa-a"));
+        assert!(!graph_from(ENVIRONMENTS).environments_read_vars());
     }
 
     #[test]

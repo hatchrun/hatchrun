@@ -236,9 +236,17 @@ pub struct Job {
     /// What the job's token may do; replaces the workflow's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Permissions>,
-    /// The environment the job deploys to; it can read `${{ parameters.x }}`.
+    /// The environment the job deploys to. It can read
+    /// `${{ parameters.x }}`, and the `hatchrun`, `github`, `needs`,
+    /// `matrix`, `strategy`, `vars` and `inputs` contexts, which are
+    /// evaluated when the job is ready to start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// Where the deployment can be seen. Evaluated when the job ends,
+    /// with the job's own contexts (`steps`, `job`, `env`), and shown on
+    /// the job's check run and in the app.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_url: Option<String>,
     /// At most one job of a group runs in the repository, one waits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<Concurrency>,
@@ -435,6 +443,7 @@ struct JobDe {
     outputs: BTreeMap<String, String>,
     permissions: Option<Permissions>,
     environment: Option<String>,
+    environment_url: Option<String>,
     concurrency: Option<Concurrency>,
     container: Option<Container>,
     services: BTreeMap<String, Container>,
@@ -456,6 +465,7 @@ impl Default for JobDe {
             outputs: job.outputs,
             permissions: job.permissions,
             environment: job.environment,
+            environment_url: job.environment_url,
             concurrency: job.concurrency,
             container: job.container,
             services: job.services,
@@ -478,6 +488,7 @@ impl From<JobDe> for Job {
             outputs: de.outputs,
             permissions: de.permissions,
             environment: de.environment,
+            environment_url: de.environment_url,
             concurrency: de.concurrency,
             container: de.container,
             services: de.services,
@@ -719,6 +730,9 @@ pub struct UsesStep {
     /// A failure does not fail the job.
     #[serde(default, skip_serializing_if = "is_false")]
     pub continue_on_error: bool,
+    /// The step is cancelled after this many minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_minutes: Option<u32>,
 }
 
 /// A `cache:` step.
@@ -833,7 +847,6 @@ impl StepFields {
                 for (key, set) in [
                     ("shell", self.shell.is_some()),
                     ("working-directory", self.working_directory.is_some()),
-                    ("timeout-minutes", self.timeout_minutes.is_some()),
                 ] {
                     if set {
                         return Err(format!("`{key}` is valid only on run steps"));
@@ -847,6 +860,7 @@ impl StepFields {
                     env: self.env.unwrap_or_default(),
                     if_: self.if_,
                     continue_on_error: self.continue_on_error.unwrap_or_default(),
+                    timeout_minutes: self.timeout_minutes,
                 }))
             }
             (None, None) => Err(
@@ -952,6 +966,11 @@ fn single_entry<S: Serializer, V: Serialize + ?Sized>(
 pub struct Workflow {
     /// The events that start the workflow.
     pub on: Triggers,
+    /// The title of each run, such as `Deploy ${{ inputs.target }}`. It
+    /// reads the `hatchrun`, `github`, `inputs` and `vars` contexts and
+    /// is evaluated when the run is made.
+    #[serde(default, rename = "run-name", skip_serializing_if = "Option::is_none")]
+    pub run_name: Option<String>,
     /// What the token of every job without its own `permissions` may do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Permissions>,

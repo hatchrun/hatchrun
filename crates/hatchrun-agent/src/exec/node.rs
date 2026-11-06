@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use hatchrun_workflow::{Conclusion, PlannedStep, UsesStep};
@@ -379,9 +380,29 @@ impl Job<'_> {
         sink.step_started(index, &name);
     }
 
-    /// A `uses:` step whose action is fetched or local.
-    #[allow(clippy::too_many_lines)]
+    /// A `uses:` step whose action is fetched or local. Its
+    /// `timeout-minutes` ends the processes it starts, a composite
+    /// action's steps included, when the time is up.
     pub(super) async fn uses_step(
+        &mut self,
+        index: usize,
+        step: &UsesStep,
+        sink: &mut dyn Sink,
+    ) -> (Common, Conclusion, BTreeMap<String, String>) {
+        let outer = self.uses_limit;
+        if let Some(minutes) = step.timeout_minutes {
+            let end = Instant::now() + self.opts.minute * minutes;
+            if outer.is_none_or(|(outer_end, _)| end < outer_end) {
+                self.uses_limit = Some((end, minutes));
+            }
+        }
+        let ran = self.run_uses(index, step, sink).await;
+        self.uses_limit = outer;
+        ran
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_uses(
         &mut self,
         index: usize,
         step: &UsesStep,

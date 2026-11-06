@@ -29,6 +29,8 @@ pub(super) fn expression_problems(job: &Job) -> (Vec<&'static str>, Vec<String>)
     for container in job.container.iter().chain(job.services.values()) {
         texts.extend(container.texts().into_iter().map(|(_, text)| text));
     }
+    texts.extend(job.environment.as_deref());
+    texts.extend(job.environment_url.as_deref());
     for step in &job.steps {
         match step {
             Step::Run(run) => {
@@ -308,6 +310,8 @@ pub(super) fn walk_job(job: &mut Job, texts: &mut Texts<'_>) {
     for container in job.container.iter_mut().chain(job.services.values_mut()) {
         container.map_texts(&mut |t| texts(t, false));
     }
+    opt(&mut job.environment, texts);
+    opt(&mut job.environment_url, texts);
     cond(&mut job.if_, texts);
     for step in &mut job.steps {
         match step {

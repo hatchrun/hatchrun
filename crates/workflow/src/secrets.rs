@@ -143,7 +143,7 @@ impl SecretRefs {
 
 impl PlannedJob {
     /// The secrets this job reads: every `${{ secrets.X }}` in its
-    /// `env`, `outputs`, `container`, `services` and steps, and the
+    /// `env`, `outputs`, `environment-url`, `container`, `services` and steps, and the
     /// secrets its `if:` conditions name, plus [`DEBUG_SECRETS`].
     #[must_use]
     pub fn secret_refs(&self) -> SecretRefs {
@@ -153,6 +153,7 @@ impl PlannedJob {
         }
         refs.scan_all(self.env.values());
         refs.scan_all(self.outputs.values());
+        refs.scan_opt(self.environment_url.as_deref(), false);
         refs.scan_opt(self.if_.as_deref(), true);
         for container in self.container.iter().chain(self.services.values()) {
             for (_, text) in container.texts() {
@@ -255,6 +256,7 @@ mod tests {
             outputs: BTreeMap::new(),
             token_permissions: BTreeMap::new(),
             environment: None,
+            environment_url: None,
             concurrency: None,
             container: Some(crate::config::Container {
                 image: "ghcr.io/acme/build:1".into(),

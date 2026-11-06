@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Instant;
 
-use hatchrun_workflow::{Conclusion, ExprError, JobResult, JobStatus, StepSummary};
+use hatchrun_workflow::{
+    Conclusion, ExprError, JobResult, JobStatus, StepSummary, valid_environment_url,
+};
 use tracing::warn;
 
 use super::context::Runtime;
@@ -187,6 +189,35 @@ impl Job<'_> {
         outputs
     }
 
+    /// Evaluates the job's `environment-url` when the job succeeded. An
+    /// address that fails, holds a secret or is not an `http` or `https`
+    /// link is left out with a warning.
+    pub(super) fn evaluate_environment_url(&mut self, sink: &mut dyn Sink) {
+        let Some(template) = &self.doc.job.environment_url else {
+            return;
+        };
+        if self.status != JobStatus::Success {
+            return;
+        }
+        let url = match interp(template, &self.ctx, &self.layout.workspace, self.status) {
+            Ok(url) => url.trim().to_owned(),
+            Err(err) => {
+                let message = format!("Failed to evaluate environment-url: {err}");
+                self.say(sink, Line::Warning(&message));
+                return;
+            }
+        };
+        if self.masker.mask(&url) != url {
+            let message = "Skip environment-url since it may contain secret.";
+            self.say(sink, Line::Warning(message));
+        } else if !valid_environment_url(&url) {
+            let message = format!("Skip environment-url '{url}': it is not an http or https link.");
+            self.say(sink, Line::Warning(&message));
+        } else {
+            self.environment_url = Some(url);
+        }
+    }
+
     /// The result to report.
     pub(super) fn result(
         &mut self,
@@ -199,6 +230,10 @@ impl Job<'_> {
             outputs,
             steps,
             annotations: std::mem::take(&mut self.annotations),
+            environment_url: self
+                .environment_url
+                .take()
+                .filter(|_| conclusion == Conclusion::Success),
         }
     }
 }

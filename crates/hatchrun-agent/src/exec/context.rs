@@ -581,6 +581,7 @@ mod tests {
             outputs: BTreeMap::new(),
             token_permissions: BTreeMap::new(),
             environment: None,
+            environment_url: None,
             concurrency: None,
             container: None,
             services: std::collections::BTreeMap::new(),

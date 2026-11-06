@@ -7,7 +7,7 @@
 # shows A/B: runs while the job passes / runs after an earlier step failed.
 
 convert: exit 0
-  `node.yml` job `test`: matrix key `os` values `macos-latest`, `windows-latest` name no runner template and were dropped; hatchrun runs Linux only
+  warning: `node.yml` job `test`: matrix key `os` values `macos-latest`, `windows-latest` name no runner template and were dropped; hatchrun runs Linux only
 validate: exit 0
 event push-main (compile refs/heads/main)
   node: triggered

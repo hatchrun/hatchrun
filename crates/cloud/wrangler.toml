@@ -45,7 +45,7 @@ binding = "TOKENS"
 id = "92b81a8052544d3387c16535ee2a4fa2"
 
 # hatchrun-ci takes the push, pull_request, check_run, repository,
-# release, create and delete deliveries
+# release, create, delete, merge_group and repository_dispatch deliveries
 # (crates/cloud/src/entry.rs forwards them as they came); /healthz asks
 # its /healthz too.
 [[services]]

@@ -183,6 +183,7 @@ pub async fn run_job(
         status: JobStatus::Success,
         cancel_requests: cancel,
         grace_until: None,
+        uses_limit: None,
         aborted: false,
         declared_env: BTreeMap::new(),
         env_error: None,
@@ -200,6 +201,7 @@ pub async fn run_job(
         cache_env: BTreeMap::new(),
         background: Background::default(),
         docker: docker::DockerState::new(format!("hatchrun-{}", random_name().unwrap_or_default())),
+        environment_url: None,
     };
     for container in doc.job.container.iter().chain(doc.job.services.values()) {
         if let Some(credentials) = &container.credentials
@@ -269,6 +271,7 @@ async fn finish(
     job.drain_background(sink);
     job.save_caches(sink).await;
     let outputs = job.job_outputs(sink);
+    job.evaluate_environment_url(sink);
     job.stop_containers(sink).await;
     if let Some(proxy) = proxy {
         proxy.stop().await;
@@ -410,6 +413,10 @@ struct Job<'a> {
     cancel_requests: tokio::sync::watch::Receiver<u32>,
     /// When the grace period after the first cancel ends.
     grace_until: Option<Instant>,
+    /// When the `timeout-minutes` of the `uses:` step that runs ends, and
+    /// its length in minutes. Everything the step starts, a composite
+    /// action's steps included, ends by then.
+    uses_limit: Option<(Instant, u32)>,
     /// A second cancel arrived: nothing else runs.
     aborted: bool,
     /// The job's `env` with expressions replaced.
@@ -445,6 +452,8 @@ struct Job<'a> {
     background: Background,
     /// The containers the job started.
     docker: docker::DockerState,
+    /// The `environment-url`, once the job ended well and it evaluated.
+    environment_url: Option<String>,
 }
 
 /// What a step needs to start.
@@ -755,16 +764,28 @@ impl Job<'_> {
             &mut self.annotations,
             &mut self.budget,
         );
+        // A `uses:` step's timeout covers each process it starts.
+        let (own, minutes) = match self.uses_limit {
+            Some((end, minutes)) => {
+                let left = end.saturating_duration_since(Instant::now());
+                if launch.timeout.is_none_or(|t| left < t) {
+                    (Some(left), Some(minutes))
+                } else {
+                    (launch.timeout, launch.timeout_minutes)
+                }
+            }
+            None => (launch.timeout, launch.timeout_minutes),
+        };
         // After a cancel, whatever still runs shares the grace period.
         let left = self
             .grace_until
             .map(|end| end.saturating_duration_since(Instant::now()));
         let timeout = match left {
-            Some(left) => Some(launch.timeout.map_or(left, |t| t.min(left))),
-            None => launch.timeout,
+            Some(left) => Some(own.map_or(left, |t| t.min(left))),
+            None => own,
         };
         // The step's own timeout only counts when it ends first.
-        let grace_limited = left.is_some_and(|left| launch.timeout.is_none_or(|t| t > left));
+        let grace_limited = left.is_some_and(|left| own.is_none_or(|t| t > left));
         let process = Process {
             program: launch.program,
             args: launch.args,
@@ -796,7 +817,7 @@ impl Job<'_> {
             Ok(Exit::TimedOut) if grace_limited => {
                 exit_outcome(&mut out, Ok(Exit::Cancelled), None)
             }
-            other => exit_outcome(&mut out, other, launch.timeout_minutes),
+            other => exit_outcome(&mut out, other, minutes),
         };
         if outcome == Conclusion::Cancelled {
             if *self.cancel_requests.borrow() >= 2 {

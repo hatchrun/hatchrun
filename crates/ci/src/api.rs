@@ -575,6 +575,7 @@ fn job_json(row: &JobRow, live: &BTreeMap<u64, Value>) -> Value {
         "has_log": row.log_key.is_some(),
         "held": row.held,
         "environment": row.environment,
+        "environment_url": row.environment_url,
         "approval": environments::decision(row).map(|decision| {
             let (verdict, by) = match decision {
                 Decision::Approved(by) => ("approved", by),
