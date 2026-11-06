@@ -406,9 +406,9 @@ async fn billing_view(cx: &Cx<'_>, org: &str) -> Result<Served> {
 /// How many invoices the billing page lists.
 const INVOICES: u32 = 12;
 
-/// The card and the newest invoices Polar holds for `tenant`. Polar
-/// being down or not configured leaves them empty: the page still
-/// shows the usage.
+/// The card details and the newest invoices Polar holds for `tenant`.
+/// Polar being down or not configured leaves them empty: the page still
+/// shows the usage, and a card on file without details.
 async fn polar_billing(cx: &Cx<'_>, tenant: &str) -> (Option<polar::Card>, Vec<billing::Invoice>) {
     let settings = cx.settings;
     if settings.polar_token.is_empty() {

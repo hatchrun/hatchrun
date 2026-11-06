@@ -904,9 +904,9 @@ runs_3001="$(psql_run -At -c "SELECT count(*) FROM ci_runs WHERE repo_id = 3001"
 [[ "$runs_3001" == 0 ]] || die "the never subscribed tenant has $runs_3001 runs"
 # The card state as the billing page reads it.
 status="$(app_call GET orgs/e2e/billing)"
-answered 200 '.card == true' || die "the billing view of e2e answered $status: $(cat "$tmp/answer")"
+answered 200 '.card != null' || die "the billing view of e2e answered $status: $(cat "$tmp/answer")"
 status="$(app_call GET orgs/e2e2/billing)"
-answered 200 '.card == false' || die "the billing view of e2e2 answered $status: $(cat "$tmp/answer")"
+answered 200 '.card == null' || die "the billing view of e2e2 answered $status: $(cat "$tmp/answer")"
 log "billing: the card state of both tenants read as expected"
 
 # Cancels run $1 as the app would, signed in.

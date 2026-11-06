@@ -43,12 +43,37 @@ pub fn spend_micros(standing: &Standing) -> u64 {
     templates::spend_micros(units(standing))
 }
 
+/// A card on file as the billing page shows it. The details are `None`
+/// when Polar cannot give them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CardView {
+    /// `visa`, `mastercard` and so on.
+    pub brand: Option<String>,
+    /// The last four digits.
+    pub last4: Option<String>,
+    /// The month it expires, 1 to 12.
+    pub exp_month: Option<u32>,
+    /// The year it expires.
+    pub exp_year: Option<u32>,
+}
+
+impl CardView {
+    fn of(card: Card) -> Self {
+        Self {
+            brand: Some(card.brand),
+            last4: Some(card.last4),
+            exp_month: Some(card.exp_month),
+            exp_year: Some(card.exp_year),
+        }
+    }
+}
+
 /// What the billing page shows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BillingView {
-    /// The card on file, when Polar has one.
-    pub card: Option<Card>,
+    /// The card on file, `None` when the tenant has none.
+    pub card: Option<CardView>,
     /// Billed runner seconds this month, of every template; every
     /// attempt counts at least 60.
     pub seconds: u64,
@@ -125,7 +150,9 @@ impl Invoice {
 }
 
 /// The billing page of `standing`, with what Polar and the usage rows
-/// add to it.
+/// add to it. Whether a card is on file comes from the standing; `card`
+/// only fills in its details, and is `None` when Polar could not
+/// give them.
 #[must_use]
 pub fn view(
     standing: &Standing,
@@ -134,7 +161,9 @@ pub fn view(
     invoices: Vec<Invoice>,
 ) -> BillingView {
     BillingView {
-        card,
+        card: standing
+            .card
+            .then(|| card.map_or_else(CardView::default, CardView::of)),
         daily,
         invoices,
         seconds: standing.seconds_by_template.iter().map(|(_, s)| s).sum(),
@@ -265,6 +294,27 @@ mod tests {
     }
 
     #[test]
+    fn card_state_follows_the_standing() {
+        let mut s = standing(&[]);
+        let card = Card {
+            brand: "visa".into(),
+            last4: "4242".into(),
+            exp_month: 3,
+            exp_year: 2030,
+        };
+        let json = |s: &Standing, card| {
+            serde_json::to_value(view(s, card, Vec::new(), Vec::new())).unwrap()["card"].clone()
+        };
+        assert_eq!(
+            json(&s, Some(card.clone())),
+            serde_json::json!({"brand": "visa", "last4": "4242", "exp_month": 3, "exp_year": 2030})
+        );
+        s.card = false;
+        assert_eq!(json(&s, None), serde_json::Value::Null);
+        assert_eq!(json(&s, Some(card)), serde_json::Value::Null);
+    }
+
+    #[test]
     fn view_from_standing() {
         let v = view(
             &standing(&[("ubuntu-latest", 24_000), ("ubuntu-26.04-4core", 6_000)]),
@@ -275,7 +325,7 @@ mod tests {
         assert_eq!(
             v,
             BillingView {
-                card: None,
+                card: Some(CardView::default()),
                 daily: vec![Daily {
                     day: "2026-11-01".into(),
                     seconds: 90,
@@ -298,7 +348,10 @@ mod tests {
         assert!(json.get("freeUnits").is_none());
         assert!(json.get("minutes").is_none());
         assert_eq!(json["maxRunning"], 5);
-        assert_eq!(json["card"], serde_json::Value::Null);
+        assert_eq!(
+            json["card"],
+            serde_json::json!({"brand": null, "last4": null, "exp_month": null, "exp_year": null})
+        );
         assert_eq!(json["daily"][0]["day"], "2026-11-01");
         assert_eq!(json["invoices"], serde_json::json!([]));
         assert_eq!(json["minCapDollars"], 50);
