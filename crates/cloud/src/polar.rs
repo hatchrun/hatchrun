@@ -233,26 +233,30 @@ pub fn default_card(response: &Response) -> Result<Option<Card>, String> {
         kind: String,
         #[serde(default)]
         is_default: bool,
-        #[serde(rename = "method_metadata")]
-        card: Option<Card>,
+        /// Only a `card` method's metadata has the shape of [`Card`];
+        /// other types (`kr_card` and so on) carry their own.
+        #[serde(default, rename = "method_metadata")]
+        details: Option<serde_json::Value>,
     }
     #[derive(Deserialize)]
     struct List {
         items: Vec<Method>,
     }
     let list: List = decode(response, "payment methods")?;
-    let mut cards: Vec<Method> = list
+    let mut cards: Vec<(bool, Card)> = list
         .items
         .into_iter()
-        .filter(|method| method.kind == "card" && method.card.is_some())
+        .filter(|method| method.kind == "card")
+        .filter_map(|method| {
+            let card = serde_json::from_value(method.details?).ok()?;
+            Some((method.is_default, card))
+        })
         .collect();
     let at = cards
         .iter()
-        .position(|method| method.is_default)
+        .position(|(is_default, _)| *is_default)
         .unwrap_or(0);
-    Ok((!cards.is_empty())
-        .then(|| cards.swap_remove(at).card)
-        .flatten())
+    Ok((!cards.is_empty()).then(|| cards.swap_remove(at).1))
 }
 
 /// The newest `limit` orders of the customer of `tenant`.
@@ -679,6 +683,12 @@ mod tests {
         );
         assert_eq!((card.exp_month, card.exp_year), (12, 2031));
         assert_eq!(default_card(&json(200, r#"{"items":[]}"#)), Ok(None));
+        let body = r#"{"items":[
+            {"type":"kr_card","is_default":true,"method_metadata":{"issuer":"x","number":"1"}},
+            {"type":"card","method_metadata":
+              {"brand":"visa","last4":"1111","exp_month":1,"exp_year":2030}}]}"#;
+        let card = default_card(&json(200, body)).unwrap().unwrap();
+        assert_eq!(card.last4, "1111");
         assert!(default_card(&json(404, "{}")).is_err());
     }
 

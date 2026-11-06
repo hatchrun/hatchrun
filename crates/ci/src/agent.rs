@@ -806,7 +806,7 @@ mod tests {
             approval_decision: None,
             approval_by: None,
             approval_at: None,
-            needs: serde_json::json!([]),
+            needs: Some(serde_json::json!([])),
         }
     }
 

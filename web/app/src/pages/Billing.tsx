@@ -22,7 +22,7 @@ export function Billing({ org }: OrgPageProps) {
   const now = new Date();
   // The server bills by UTC month, so the page reads the month in UTC too.
   const month = now.toLocaleDateString("en-US", { month: "long", timeZone: "UTC" });
-  const card = billing.state === "ready" ? billing.data.card : false;
+  const card = billing.state === "ready" ? billing.data.card !== null : false;
   const tries = useRef(0);
   useEffect(() => {
     // Polar confirms the card by webhook, a moment after the redirect back.
@@ -65,9 +65,9 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
           <span className="font-mono text-[11px] text-fg-3">at the current daily rate</span>
         </Figure>
         <Figure label="Card on file" className="flex-[1_1_240px] border-l border-control">
-          <span className="mt-1 font-mono text-sm">{billing.card ? "Card on file" : "No card"}</span>
+          <span className="mt-1 font-mono text-sm">{billing.card !== null ? "Card on file" : "No card"}</span>
           <span className="mt-1">
-            <CardButton org={org} card={billing.card} primary={false} />
+            <CardButton org={org} card={billing.card !== null} primary={false} />
           </span>
         </Figure>
       </section>
@@ -130,7 +130,7 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
               <div className={cn("h-full", reached ? "bg-waiting" : "bg-brand")} style={{ width: `${percent}%` }} />
             </div>
             <p className={cn("m-0 mt-2 font-mono text-xs", reached ? "text-waiting" : "text-fg-3")}>
-              {!billing.card
+              {billing.card === null
                 ? "A card is required. New CI jobs wait until one is added."
                 : reached
                   ? "Cap reached. New CI jobs queue until you raise it."

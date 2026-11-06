@@ -74,6 +74,9 @@ pub struct PullRequest {
     pub author: String,
     /// `open`, `closed` or `merged`, as the delivery says it stands.
     pub state: &'static str,
+    /// When GitHub last changed the pull request, in Unix milliseconds:
+    /// the order of its deliveries.
+    pub updated_at: u64,
     /// The delivery body.
     pub payload: Value,
 }
@@ -219,6 +222,15 @@ struct PullRequestInfo {
     state: String,
     #[serde(default)]
     merged: bool,
+    #[serde(deserialize_with = "rfc3339_ms")]
+    updated_at: u64,
+}
+
+/// Unix milliseconds of the RFC 3339 time GitHub wrote.
+fn rfc3339_ms<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let text = String::deserialize(d)?;
+    hatchrun_cloud::parse_rfc3339(&text)
+        .ok_or_else(|| serde::de::Error::custom(format!("bad time {text:?}")))
 }
 
 #[derive(Deserialize)]
@@ -402,6 +414,7 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
                     .map_or_else(|| p.sender.login.clone(), |user| user.login),
                 actor: p.sender.login,
                 title: p.pull_request.title,
+                updated_at: p.pull_request.updated_at,
                 state: if p.pull_request.merged {
                     "merged"
                 } else if p.pull_request.state == "closed" {
@@ -571,6 +584,7 @@ mod tests {
         assert_eq!(p.actor, "octocat");
         assert_eq!(p.repo.id, 4242);
         assert!(!p.repo.private);
+        assert_eq!(p.updated_at, 1_793_956_919_000);
     }
 
     #[test]

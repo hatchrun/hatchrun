@@ -229,7 +229,7 @@ export function handleCiSettings(
     const sub = what.slice("billing/".length);
     if (what === "billing" && method === "GET") {
       json(res, 200, {
-        card: hasCard(owner),
+        card: hasCard(owner) ? { brand: "visa", last4: "4242", exp_month: 3, exp_year: 2030 } : null,
         seconds: 19_200,
         units: 19_200,
         spendCents: Math.floor((19_200 * 2_000) / 60 / 10_000),
@@ -273,7 +273,8 @@ export function handleCiSettings(
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([name, row]) => {
         const repositories = org ? (row.repositories ?? null) : null;
-        return kind === "secrets" ? { name, updatedAt: row.updatedAt, repositories } : { name, value: row.value, updatedAt: row.updatedAt, repositories };
+        const scope = org ? "org" : inEnvironments ? "env" : "repo";
+        return kind === "secrets" ? { name, scope, updatedAt: row.updatedAt, repositories } : { name, scope, value: row.value, updatedAt: row.updatedAt, repositories };
       });
     json(res, 200, paginate(list, url));
     return true;

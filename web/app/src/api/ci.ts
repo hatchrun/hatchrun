@@ -283,10 +283,18 @@ export interface DispatchRequest {
 export const dispatchWorkflow = (owner: string, repo: string, body: DispatchRequest) =>
   post<{ runs: number[] }>(`${repoPath(owner, repo)}/dispatch`, body);
 
+/** The card on file; the details are null when Polar cannot give them. */
+export interface CiCard {
+  brand: string | null;
+  last4: string | null;
+  exp_month: number | null;
+  exp_year: number | null;
+}
+
 /** What /api/ci/orgs/:org/billing answers. */
 export interface CiBilling {
-  /** Whether a card is on file. */
-  card: boolean;
+  /** The card on file, null when there is none. */
+  card: CiCard | null;
   /** Billed runner seconds this month, every attempt at least 60. */
   seconds: number;
   /** Billing units this month; one unit is one 2 vCPU second. */
@@ -371,6 +379,8 @@ const scopePath = (scope: CiScope) =>
  */
 export interface CiSecret {
   name: string;
+  /** The scope the row is set at; a repository's or environment's list also holds rows inherited from wider scopes. */
+  scope: "org" | "repo" | "env";
   updatedAt: number;
   repositories: string[] | null;
 }

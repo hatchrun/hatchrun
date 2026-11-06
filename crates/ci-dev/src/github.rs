@@ -460,13 +460,16 @@ async fn polar_payment_methods(headers: HeaderMap, Path(tenant): Path<String>) -
 
 /// Polar's orders of a customer, newest first: for the billed tenant a
 /// paid one with an invoice and a pending one without.
-async fn polar_orders(headers: HeaderMap, query: axum::extract::RawQuery) -> Response {
+async fn polar_orders(
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<Vec<(String, String)>>,
+) -> Response {
     if !polar_authorized(&headers) {
         return unauthorized();
     }
-    let billed = query.0.is_some_and(|query| {
-        query.contains(&format!("external_customer_id={POLAR_BILLED_TENANT}"))
-    });
+    let billed = query
+        .iter()
+        .any(|(key, value)| key == "external_customer_id" && value == POLAR_BILLED_TENANT);
     let items = if billed {
         json!([
             {
@@ -709,6 +712,8 @@ mod tests {
             get("/v1/orders/?external_customer_id=e2etenant0000001&limit=12&sorting=-created_at")
                 .await;
         assert_eq!(body["items"].as_array().unwrap().len(), 2);
+        let (_, body) = get("/v1/orders/?external_customer_id=e2etenant00000010&limit=12").await;
+        assert_eq!(body["items"], json!([]));
         let (status, body) = get("/v1/orders/ord_e2e_1/invoice").await;
         assert_eq!((status, body["url"].is_string()), (200, true));
         let (status, _) = get("/v1/orders/ord_e2e_2/invoice").await;

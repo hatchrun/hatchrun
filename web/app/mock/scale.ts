@@ -301,7 +301,7 @@ function filterRuns(url: URL, repoFixed?: string): RunRow[] {
 let enabledAll: boolean | null = null;
 const enabledSet = new Set<string>();
 const hashEnabled = (i: number) => hash(i, 50) % 10 !== 0;
-const isEnabled = (name: string, i: number) => (enabledAll === null ? hashEnabled(i) : enabledAll || enabledSet.has(name));
+const isEnabled = (name: string, i: number) => (enabledAll === null ? hashEnabled(i) : enabledAll || enabledSet.has(name.toLowerCase()));
 
 const lastRunOf = new Map<string, RunRow>();
 function lastRuns() {
@@ -587,11 +587,13 @@ export function handleScale(
       // Leaving all mode keeps what ran; the mock holds the names that ran.
       const ran = REPOS.filter((name, i) => isEnabled(name, i));
       enabledSet.clear();
-      if (all !== true) for (const name of ran) enabledSet.add(name);
+      if (all !== true) for (const name of ran) enabledSet.add(name.toLowerCase());
       enabledAll = all ?? false;
     }
-    for (const name of add) enabledSet.add(name);
-    for (const name of remove) enabledSet.delete(name);
+    // Names match without regard to case, as the server does.
+    const lower = (list: string[]) => list.map((name) => name.toLowerCase());
+    for (const name of lower(add)) enabledSet.add(name);
+    for (const name of lower(remove)) enabledSet.delete(name);
     json(res, 204);
     return true;
   }

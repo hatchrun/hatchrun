@@ -31,13 +31,14 @@ pub struct NewPull {
     pub author: String,
     /// `open`, `closed` or `merged`.
     pub state: String,
-    /// When the delivery came, in Unix milliseconds.
-    pub now: u64,
+    /// When GitHub last changed the pull request, in Unix milliseconds.
+    /// A delivery with an older time than the row leaves it alone.
+    pub updated_at: u64,
 }
 
 /// Records pull request `$2` of repository `$1` as it stands: title
-/// `$3`, head `$4`, base `$5`, author `$6`, state `$7`, at `$8`. A
-/// delivery older than the row leaves it alone.
+/// `$3`, head `$4`, base `$5`, author `$6`, state `$7`, as of GitHub's
+/// time `$8`. A delivery older than the row leaves it alone.
 const UPSERT_PULL: &str = "INSERT INTO ci_pulls \
      (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at) \
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) \
@@ -60,7 +61,7 @@ pub async fn upsert_pull(db: &Db, pull: &NewPull) -> Result<()> {
             &pull.base_ref,
             &pull.author,
             &pull.state,
-            pull.now
+            pull.updated_at
         ],
     )
     .await?;

@@ -452,8 +452,10 @@ async fn repos_done(cx: &Cx<'_>, org: &str, query: Option<&str>) -> Done {
     ))?)
 }
 
-/// The body of `PATCH .../repos/enabled`. `all` sets every repository
-/// on or off; `add` and `remove` then turn the named ones on or off.
+/// The body of `PATCH .../repos/enabled`. `all: true` turns every
+/// repository on; `all: false` leaves all mode and keeps each
+/// repository's own choice. `add` and `remove` then turn the named
+/// ones on and off.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnabledBody {

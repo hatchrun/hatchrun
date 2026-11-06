@@ -150,9 +150,9 @@ impl Invoice {
 }
 
 /// The billing page of `standing`, with what Polar and the usage rows
-/// add to it. Whether a card is on file comes from the standing; `card`
-/// only fills in its details, and is `None` when Polar could not
-/// give them.
+/// add to it. A card is shown when Polar gave one or the tenant has a
+/// subscription (its details are then empty); a beta tenant with
+/// neither has none, so it can reach the checkout.
 #[must_use]
 pub fn view(
     standing: &Standing,
@@ -161,9 +161,10 @@ pub fn view(
     invoices: Vec<Invoice>,
 ) -> BillingView {
     BillingView {
-        card: standing
-            .card
-            .then(|| card.map_or_else(CardView::default, CardView::of)),
+        card: match card {
+            Some(card) => Some(CardView::of(card)),
+            None => standing.subscribed.then(CardView::default),
+        },
         daily,
         invoices,
         seconds: standing.seconds_by_template.iter().map(|(_, s)| s).sum(),
@@ -274,6 +275,7 @@ mod tests {
             tenant_id: "t1".into(),
             org_login: "acme".into(),
             card: true,
+            subscribed: true,
             cap_micros: templates::DEFAULT_SPEND_CAP_MICROS,
             seconds_by_template: seconds.iter().map(|(l, s)| ((*l).into(), *s)).collect(),
             units,
@@ -294,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn card_state_follows_the_standing() {
+    fn card_follows_the_payment_method() {
         let mut s = standing(&[]);
         let card = Card {
             brand: "visa".into(),
@@ -309,9 +311,15 @@ mod tests {
             json(&s, Some(card.clone())),
             serde_json::json!({"brand": "visa", "last4": "4242", "exp_month": 3, "exp_year": 2030})
         );
-        s.card = false;
+        // A beta tenant without a payment method has no card, though
+        // its jobs run.
+        s.subscribed = false;
+        assert!(s.card);
         assert_eq!(json(&s, None), serde_json::Value::Null);
-        assert_eq!(json(&s, Some(card)), serde_json::Value::Null);
+        assert_eq!(
+            json(&s, Some(card)),
+            serde_json::json!({"brand": "visa", "last4": "4242", "exp_month": 3, "exp_year": 2030})
+        );
     }
 
     #[test]
@@ -319,18 +327,28 @@ mod tests {
         let v = view(
             &standing(&[("ubuntu-latest", 24_000), ("ubuntu-26.04-4core", 6_000)]),
             None,
-            vec![Daily::new("2026-11-01".into(), 90, 90)],
+            vec![
+                Daily::new("2026-11-01".into(), 90, 90),
+                Daily::new("2026-11-02".into(), 1_500, 3_000),
+            ],
             Vec::new(),
         );
         assert_eq!(
             v,
             BillingView {
                 card: Some(CardView::default()),
-                daily: vec![Daily {
-                    day: "2026-11-01".into(),
-                    seconds: 90,
-                    cents: 0,
-                }],
+                daily: vec![
+                    Daily {
+                        day: "2026-11-01".into(),
+                        seconds: 90,
+                        cents: 0,
+                    },
+                    Daily {
+                        day: "2026-11-02".into(),
+                        seconds: 1_500,
+                        cents: 10,
+                    },
+                ],
                 invoices: Vec::new(),
                 seconds: 30_000,
                 units: 36_000,
@@ -353,6 +371,8 @@ mod tests {
             serde_json::json!({"brand": null, "last4": null, "exp_month": null, "exp_year": null})
         );
         assert_eq!(json["daily"][0]["day"], "2026-11-01");
+        assert_eq!(json["daily"][1]["seconds"], 1_500);
+        assert_eq!(json["daily"][1]["cents"], 10);
         assert_eq!(json["invoices"], serde_json::json!([]));
         assert_eq!(json["minCapDollars"], 50);
         assert_eq!(json["maxCapDollars"], 10_000);

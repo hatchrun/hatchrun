@@ -19,7 +19,7 @@ fn run_on(db: &TestDb, delivery: &str, workflow: &str, git_ref: &str, now: u64) 
     db.wait(insert_run(db.db(), &new)).unwrap().unwrap()
 }
 
-fn pull(number: u64, state: &str, now: u64) -> NewPull {
+fn pull(number: u64, state: &str, updated_at: u64) -> NewPull {
     NewPull {
         repo_id: 7,
         number,
@@ -28,7 +28,7 @@ fn pull(number: u64, state: &str, now: u64) -> NewPull {
         base_ref: "main".into(),
         author: "octocat".into(),
         state: state.into(),
-        now,
+        updated_at,
     }
 }
 
@@ -64,26 +64,30 @@ fn a_pull_request_run_keeps_its_pull_request() {
 #[test]
 fn runs_filter_by_workflow_and_pull_request() {
     let db = setup();
-    run_on(&db, "a", "ci", "refs/pull/3/merge", DAY);
-    run_on(&db, "b", "lint", "refs/pull/3/merge", 2 * DAY);
-    run_on(&db, "c", "ci", "refs/pull/4/merge", 3 * DAY);
-    run_on(&db, "d", "ci", "refs/heads/main", 4 * DAY);
-    let count = |f: RunFilter| db.wait(runs_page(db.db(), &f, None, 10)).unwrap().1;
+    let ci_old = run_on(&db, "a", "ci", "refs/pull/3/merge", DAY).id;
+    let lint = run_on(&db, "b", "lint", "refs/pull/3/merge", 2 * DAY).id;
+    let other = run_on(&db, "c", "ci", "refs/pull/4/merge", 3 * DAY).id;
+    let main = run_on(&db, "d", "ci", "refs/heads/main", 4 * DAY).id;
+    // The run ids of a page, newest first, and the total.
+    let found = |f: RunFilter| {
+        let (rows, total) = db.wait(runs_page(db.db(), &f, None, 10)).unwrap();
+        (rows.iter().map(|r| r.run.id).collect::<Vec<_>>(), total)
+    };
     let base = RunFilter {
         repo_ids: vec![7],
         ..RunFilter::default()
     };
-    assert_eq!(count(base.clone()), 4);
+    assert_eq!(found(base.clone()), (vec![main, other, lint, ci_old], 4));
     let mut f = base.clone();
     f.workflows = vec!["ci".into()];
-    assert_eq!(count(f), 3);
+    assert_eq!(found(f), (vec![main, other, ci_old], 3));
     let mut f = base.clone();
     f.pull = Some(3);
-    assert_eq!(count(f), 2);
+    assert_eq!(found(f), (vec![lint, ci_old], 2));
     let mut f = base;
     f.pull = Some(3);
     f.workflows = vec!["lint".into()];
-    assert_eq!(count(f), 1);
+    assert_eq!(found(f), (vec![lint], 1));
 }
 
 #[test]

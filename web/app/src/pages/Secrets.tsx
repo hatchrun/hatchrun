@@ -66,13 +66,14 @@ function parsePaste(text: string): { name: string; value: string }[] {
 /** A pasted entry that cannot be saved: no usable name or no value. */
 const unusable = (item: { name: string; value: string }) => !item.name || item.value === "";
 
-/** Whether this scope already has an item of this name; the list search is a substring match, so read every page. */
+/** Whether this scope itself has an item of this name; the list search is a substring match, so read every page. An inherited row of a wider scope does not count, a narrower one overrides it. */
 async function taken(scope: CiScope, kind: CiItemKind, name: string): Promise<boolean> {
+  const own = "org" in scope ? "org" : "environment" in scope ? "env" : "repo";
   let cursor: string | null = null;
   do {
     const query = { q: name, cursor, limit: 50 };
     const page: ApiPage<Row> = await (kind === "secrets" ? listCiSecrets(scope, query) : listCiVars(scope, query));
-    if (page.items.some((item) => item.name === name)) return true;
+    if (page.items.some((item) => item.name === name && item.scope === own)) return true;
     cursor = page.next;
   } while (cursor);
   return false;

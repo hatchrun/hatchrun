@@ -37,9 +37,6 @@ const FILE_PAGES: u32 = 3;
 /// Files GitHub lists on a full page.
 const PAGE_SIZE: usize = 100;
 
-/// The pull request actions that change what the repository page shows.
-const RECORDED_ACTIONS: [&str; 5] = ["opened", "reopened", "synchronize", "edited", "closed"];
-
 fn now_ms() -> u64 {
     worker::Date::now().as_millis()
 }
@@ -389,22 +386,24 @@ impl Cx<'_> {
     }
 
     async fn pull_request(&self, pr: &PullRequest) -> Result<Outcome> {
-        if RECORDED_ACTIONS.contains(&pr.action.as_str()) {
-            store::upsert_pull(
-                self.db,
-                &store::NewPull {
-                    repo_id: pr.repo.id,
-                    number: pr.number,
-                    title: pr.title.clone(),
-                    head_ref: pr.head_ref.clone(),
-                    base_ref: pr.base_ref.clone(),
-                    author: pr.author.clone(),
-                    state: pr.state.to_owned(),
-                    now: self.now,
-                },
-            )
-            .await?;
-        }
+        // Every action carries the pull request as it stands, and a run
+        // of any of them (`labeled` included) needs its row, so all are
+        // recorded. The time is GitHub's, so a late delivery cannot
+        // replace newer data.
+        store::upsert_pull(
+            self.db,
+            &store::NewPull {
+                repo_id: pr.repo.id,
+                number: pr.number,
+                title: pr.title.clone(),
+                head_ref: pr.head_ref.clone(),
+                base_ref: pr.base_ref.clone(),
+                author: pr.author.clone(),
+                state: pr.state.to_owned(),
+                updated_at: pr.updated_at,
+            },
+        )
+        .await?;
         let config = runs::read_config(
             self.tokens,
             self.settings,
