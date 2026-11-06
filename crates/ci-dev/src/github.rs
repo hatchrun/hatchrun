@@ -17,7 +17,9 @@
 //! The fake also answers the Polar calls `hatchrun-ci` makes, so
 //! `POLAR_API_URL` may point at it: `POST /v1/events/ingest` keeps the
 //! events (an `external_id` seen before counts as a duplicate, as Polar
-//! does). It wants the bearer token [`POLAR_TOKEN`].
+//! does). The billing reads (payment methods, orders, order invoices)
+//! answer a card and two orders for tenant `e2etenant0000001` and
+//! nothing for the others. It wants the bearer token [`POLAR_TOKEN`].
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -125,6 +127,12 @@ pub fn router(fake: Fake) -> Router {
             patch(update_check_run),
         )
         .route("/v1/events/ingest", post(polar_ingest))
+        .route(
+            "/v1/customers/external/{tenant}/payment-methods",
+            get(polar_payment_methods),
+        )
+        .route("/v1/orders/", get(polar_orders))
+        .route("/v1/orders/{id}/invoice", get(polar_invoice))
         .route("/_state", get(state))
         .with_state(fake)
 }
@@ -422,6 +430,83 @@ async fn polar_ingest(
     Json(json!({ "inserted": inserted, "duplicates": duplicates })).into_response()
 }
 
+/// The tenant the billing e2e reads a card and orders for.
+const POLAR_BILLED_TENANT: &str = "e2etenant0000001";
+
+/// Polar's payment methods of a customer: one card for the billed
+/// tenant, none for the others.
+async fn polar_payment_methods(headers: HeaderMap, Path(tenant): Path<String>) -> Response {
+    if !polar_authorized(&headers) {
+        return unauthorized();
+    }
+    let items = if tenant == POLAR_BILLED_TENANT {
+        json!([{
+            "id": "pm_e2e_1",
+            "type": "card",
+            "is_default": true,
+            "method_metadata": {
+                "brand": "visa",
+                "last4": "4242",
+                "exp_month": 12,
+                "exp_year": 2030,
+            },
+        }])
+    } else {
+        json!([])
+    };
+    Json(json!({ "items": items, "pagination": { "total_count": 0, "max_page": 1 } }))
+        .into_response()
+}
+
+/// Polar's orders of a customer, newest first: for the billed tenant a
+/// paid one with an invoice and a pending one without.
+async fn polar_orders(headers: HeaderMap, query: axum::extract::RawQuery) -> Response {
+    if !polar_authorized(&headers) {
+        return unauthorized();
+    }
+    let billed = query.0.is_some_and(|query| {
+        query.contains(&format!("external_customer_id={POLAR_BILLED_TENANT}"))
+    });
+    let items = if billed {
+        json!([
+            {
+                "id": "ord_e2e_2",
+                "created_at": "2026-11-01T00:00:00Z",
+                "total_amount": 1200,
+                "status": "pending",
+                "is_invoice_generated": false,
+            },
+            {
+                "id": "ord_e2e_1",
+                "created_at": "2026-10-01T00:00:00Z",
+                "total_amount": 3400,
+                "status": "paid",
+                "is_invoice_generated": true,
+            },
+        ])
+    } else {
+        json!([])
+    };
+    Json(json!({ "items": items, "pagination": { "total_count": 0, "max_page": 1 } }))
+        .into_response()
+}
+
+/// The invoice of an order: only the paid one has a document.
+async fn polar_invoice(headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if !polar_authorized(&headers) {
+        return unauthorized();
+    }
+    if id == "ord_e2e_1" {
+        Json(json!({ "url": "https://invoices.e2e.invalid/ord_e2e_1.pdf" })).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "detail": "Not found" })),
+        )
+            .into_response()
+    }
+}
+
 async fn state(State(fake): State<Fake>) -> Json<Value> {
     let inner = fake.lock();
     let runs: Vec<&CheckRun> = inner.check_runs.values().collect();
@@ -596,6 +681,38 @@ mod tests {
             .map(|e| e["external_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["ci:1:1", "ci:2:1", "ci:3:1"]);
+    }
+
+    #[tokio::test]
+    async fn fake_polar_answers_the_billing_reads() {
+        let app = router(Fake::new(PathBuf::new()));
+        let get = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let request = Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {POLAR_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status().as_u16();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let (status, body) = get("/v1/customers/external/e2etenant0000001/payment-methods").await;
+        assert_eq!(status, 200);
+        assert_eq!(body["items"][0]["method_metadata"]["last4"], "4242");
+        let (_, body) = get("/v1/customers/external/e2etenant0000002/payment-methods").await;
+        assert_eq!(body["items"], json!([]));
+        let (_, body) =
+            get("/v1/orders/?external_customer_id=e2etenant0000001&limit=12&sorting=-created_at")
+                .await;
+        assert_eq!(body["items"].as_array().unwrap().len(), 2);
+        let (status, body) = get("/v1/orders/ord_e2e_1/invoice").await;
+        assert_eq!((status, body["url"].is_string()), (200, true));
+        let (status, _) = get("/v1/orders/ord_e2e_2/invoice").await;
+        assert_eq!(status, 404);
     }
 
     #[test]
