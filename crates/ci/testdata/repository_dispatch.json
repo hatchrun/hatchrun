@@ -1,0 +1,13 @@
+{
+  "action": "deploy",
+  "branch": "main",
+  "client_payload": { "target": "staging", "version": 3 },
+  "sender": { "login": "octocat" },
+  "installation": { "id": 777 },
+  "repository": {
+    "id": 4242,
+    "full_name": "octo/widgets",
+    "default_branch": "main",
+    "private": true
+  }
+}

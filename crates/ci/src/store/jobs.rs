@@ -100,6 +100,8 @@ pub struct JobRow {
     pub held: Option<String>,
     /// The environment the job names.
     pub environment: Option<String>,
+    /// Where the job's deployment can be seen, once it ended well.
+    pub environment_url: Option<String>,
     /// The attempt the approval below is for.
     pub approval_attempt: Option<u32>,
     /// `approved` or `rejected`.
@@ -124,8 +126,8 @@ pub(super) const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclus
      launch_attempts, capacity_attempts, capacity_since, next_launch_at, timeout_minutes, updated_at, heartbeat_at, started_at, \
      completed_at, steps::text AS steps, log_key, template, \
      token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held, \
-     environment, approval_attempt, approval_decision, approval_by, approval_at, \
-     needs::text AS needs";
+     environment, environment_url, approval_attempt, approval_decision, approval_by, \
+     approval_at, needs::text AS needs";
 
 /// The jobs of run `$1` in plan order.
 const JOBS_FOR_RUN: &str = "SELECT {columns} FROM ci_jobs WHERE run_id = $1 ORDER BY id";
@@ -149,7 +151,8 @@ const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2,
 const RESET_JOB: &str = "UPDATE ci_jobs SET status = 'waiting', attempt = $2, launch_attempts = 0, \
      capacity_attempts = 0, capacity_since = NULL, conclusion = NULL, instance_id = NULL, launch_error = NULL, next_launch_at = NULL, \
      heartbeat_at = NULL, started_at = NULL, completed_at = NULL, log_key = NULL, \
-     held = NULL, steps = '[]', updated_at = $3 WHERE id = $1 AND attempt < $2";
+     held = NULL, steps = '[]', environment_url = NULL, updated_at = $3 \
+     WHERE id = $1 AND attempt < $2";
 
 /// Makes job `$1`, the stand-in of a job that reads its matrix or
 /// `runs-on` when it is ready, the first job it expanded to: its plan
@@ -163,11 +166,13 @@ const RETARGET_JOB: &str = "UPDATE ci_jobs SET plan_id = $2, template = $3, stra
 /// Sets the plan ids job `$1` waits on to `$2`, a JSON array, at `$3`.
 const SET_NEEDS: &str = "UPDATE ci_jobs SET needs = $2::jsonb, updated_at = $3 WHERE id = $1";
 
-/// Queues attempt `$2` of job `$1` at `$3`. Only a job of that attempt
+/// Queues attempt `$2` of job `$1` at `$3`, with the environment `$4` the
+/// graph settled on when there is one. Only a job of that attempt
 /// that is waiting, or already queued, changes: one that is launching
 /// or launched is left alone, so repeating the call launches nothing
 /// twice.
-const QUEUE_JOB: &str = "UPDATE ci_jobs SET status = 'queued', updated_at = $3 \
+const QUEUE_JOB: &str = "UPDATE ci_jobs SET status = 'queued', \
+     environment = COALESCE($4::text, environment), updated_at = $3 \
      WHERE id = $1 AND attempt = $2 AND status IN ('waiting', 'queued')";
 
 /// Sets job `$1` to status `$2` and conclusion `$3` at `$4`. A
@@ -283,7 +288,8 @@ const HEARTBEAT: &str = "UPDATE ci_jobs SET heartbeat_at = $2, updated_at = $2 \
 /// Completes attempt `$6` of job `$1` with conclusion `$2`, steps `$3`
 /// (JSON text) and log key `$4` at `$5`.
 const FINISH_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = $2, \
-     steps = $3::jsonb, log_key = $4, completed_at = $5, updated_at = $5 \
+     steps = $3::jsonb, log_key = $4, completed_at = $5, updated_at = $5, \
+     environment_url = $7::text \
      WHERE id = $1 AND status <> 'completed' AND attempt = $6";
 
 /// Records the usage of attempt `$3` of job `$1`, completed at `$2`,
@@ -498,15 +504,25 @@ pub async fn reset_job(db: &Db, job_id: u64, attempt: u32, now: u64) -> Result<(
 }
 
 /// Queues attempt `attempt` of job `job_id`, unless the job moved on:
-/// returns whether the job is queued for that attempt now. Repeating
+/// returns whether the job is queued for that attempt now. `environment`
+/// is the name its environment settled on, when it has one. Repeating
 /// the call is safe; a job already launching or launched stays so and
 /// the answer is `false`.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn queue_job(db: &Db, job_id: u64, attempt: u32, now: u64) -> Result<bool> {
-    Ok(db.run(QUEUE_JOB, &params![job_id, attempt, now]).await? == 1)
+pub async fn queue_job(
+    db: &Db,
+    job_id: u64,
+    attempt: u32,
+    environment: Option<&str>,
+    now: u64,
+) -> Result<bool> {
+    Ok(db
+        .run(QUEUE_JOB, &params![job_id, attempt, now, environment])
+        .await?
+        == 1)
 }
 
 /// Sets the status and conclusion of job `job_id`. Completing a job
@@ -715,7 +731,7 @@ pub async fn heartbeat(db: &Db, job_id: u64, now: u64) -> Result<()> {
 }
 
 /// Completes attempt `attempt` of job `job_id` with its `conclusion`,
-/// `steps` and the key of its finished log. A completed job, and a job
+/// `steps`, the key of its finished log and the URL of its deployment. A completed job, and a job
 /// of another attempt, keep what they have; returns whether this call
 /// completed it. In the same transaction a job that was claimed gets
 /// its seconds recorded for this attempt, once.
@@ -723,6 +739,7 @@ pub async fn heartbeat(db: &Db, job_id: u64, now: u64) -> Result<()> {
 /// # Errors
 ///
 /// Postgres refused the statement.
+#[allow(clippy::too_many_arguments)] // one column each
 pub async fn finish_job(
     db: &Db,
     job_id: u64,
@@ -730,13 +747,22 @@ pub async fn finish_job(
     conclusion: &str,
     steps: &serde_json::Value,
     log_key: Option<&str>,
+    environment_url: Option<&str>,
     now: u64,
 ) -> Result<bool> {
     let changes = db
         .batch(&[
             (
                 FINISH_JOB,
-                params![job_id, conclusion, steps.to_string(), log_key, now, attempt],
+                params![
+                    job_id,
+                    conclusion,
+                    steps.to_string(),
+                    log_key,
+                    now,
+                    attempt,
+                    environment_url
+                ],
             ),
             (
                 RECORD_USAGE,

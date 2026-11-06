@@ -116,6 +116,7 @@ fn late_calls_leave_a_completed_job_alone() {
             "success",
             &steps,
             Some("k1"),
+            None,
             20
         ))
         .unwrap()
@@ -129,6 +130,7 @@ fn late_calls_leave_a_completed_job_alone() {
             "failure",
             &late,
             Some("k2"),
+            None,
             30
         ))
         .unwrap()
@@ -326,6 +328,7 @@ fn reset_job_clears_the_attempt() {
         "failure",
         &steps,
         Some("logs/x"),
+        None,
         30,
     ))
     .unwrap();
@@ -377,8 +380,17 @@ fn late_repeats_of_side_effects_change_nothing() {
         "launching"
     );
     assert!(
-        !db.wait(finish_job(db.db(), job_id, 1, "failure", &steps, None, 8))
-            .unwrap()
+        !db.wait(finish_job(
+            db.db(),
+            job_id,
+            1,
+            "failure",
+            &steps,
+            None,
+            None,
+            8
+        ))
+        .unwrap()
     );
     db.wait(reopen_run_at(db.db(), run_row.id, 2, 9)).unwrap();
     db.wait(finish_run(db.db(), run_row.id, 1, "failure", 10))
@@ -386,21 +398,80 @@ fn late_repeats_of_side_effects_change_nothing() {
     let row = db.wait(run(db.db(), run_row.id)).unwrap().unwrap();
     assert_eq!((row.status.as_str(), row.conclusion), ("in_progress", None));
     assert!(
-        db.wait(finish_job(db.db(), job_id, 2, "success", &steps, None, 11))
+        db.wait(finish_job(
+            db.db(),
+            job_id,
+            2,
+            "success",
+            &steps,
+            None,
+            None,
+            11
+        ))
+        .unwrap()
+    );
+}
+
+#[test]
+fn queueing_gives_the_job_the_environment_the_graph_settled_on() {
+    let db = setup();
+    // An environment that is an expression has no name in the row yet.
+    let job_id = secrets::job_naming(&db, "expr", None);
+    assert!(
+        db.wait(queue_job(db.db(), job_id, 1, Some("prod-eu"), 5))
             .unwrap()
     );
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(row.environment.as_deref(), Some("prod-eu"));
+    // A queue without a name keeps the one the row has.
+    assert!(db.wait(queue_job(db.db(), job_id, 1, None, 6)).unwrap());
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(row.environment.as_deref(), Some("prod-eu"));
+    // A job named in the plan keeps its name too.
+    let named = secrets::job_naming(&db, "named", Some("production"));
+    assert!(db.wait(queue_job(db.db(), named, 1, None, 5)).unwrap());
+    let row = db.wait(job(db.db(), named)).unwrap().unwrap();
+    assert_eq!(row.environment.as_deref(), Some("production"));
+}
+
+#[test]
+fn a_finished_job_keeps_its_environment_url_until_a_rerun() {
+    let db = setup();
+    let job_id = secrets::job_naming(&db, "url", Some("production"));
+    let steps = serde_json::json!([]);
+    assert!(
+        db.wait(finish_job(
+            db.db(),
+            job_id,
+            1,
+            "success",
+            &steps,
+            None,
+            Some("https://app.example.com/pr-7"),
+            10
+        ))
+        .unwrap()
+    );
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(
+        row.environment_url.as_deref(),
+        Some("https://app.example.com/pr-7")
+    );
+    db.wait(reset_job(db.db(), job_id, 2, 20)).unwrap();
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(row.environment_url, None);
 }
 
 #[test]
 fn queue_job_only_moves_a_waiting_job_of_that_attempt() {
     let db = setup();
     let (_, job_id) = run_with_job(&db, "waiting");
-    assert!(!db.wait(queue_job(db.db(), job_id, 2, 5)).unwrap());
-    assert!(db.wait(queue_job(db.db(), job_id, 1, 5)).unwrap());
-    assert!(db.wait(queue_job(db.db(), job_id, 1, 6)).unwrap());
+    assert!(!db.wait(queue_job(db.db(), job_id, 2, None, 5)).unwrap());
+    assert!(db.wait(queue_job(db.db(), job_id, 1, None, 5)).unwrap());
+    assert!(db.wait(queue_job(db.db(), job_id, 1, None, 6)).unwrap());
     db.wait(set_job(db.db(), job_id, "launching", None, 7))
         .unwrap();
-    assert!(!db.wait(queue_job(db.db(), job_id, 1, 8)).unwrap());
+    assert!(!db.wait(queue_job(db.db(), job_id, 1, None, 8)).unwrap());
     let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
     assert_eq!(row.status, "launching");
 }
@@ -718,6 +789,7 @@ fn finish(db: &TestDb, job_id: u64, attempt: u32, now: u64) -> bool {
         attempt,
         "success",
         &serde_json::json!([]),
+        None,
         None,
         now,
     ))

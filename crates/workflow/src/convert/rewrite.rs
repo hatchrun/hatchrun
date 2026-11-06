@@ -29,6 +29,8 @@ pub(super) fn expression_problems(job: &Job) -> (Vec<&'static str>, Vec<String>)
     }
     texts.extend(job.env.values().map(String::as_str));
     texts.extend(job.outputs.values().map(String::as_str));
+    texts.extend(job.environment.as_deref());
+    texts.extend(job.environment_url.as_deref());
     for step in &job.steps {
         match step {
             Step::Run(run) => {
@@ -350,6 +352,8 @@ pub(super) fn walk_job(job: &mut Job, texts: &mut Texts<'_>) {
     job.env.values_mut().for_each(|v| text(v, texts));
     job.outputs.values_mut().for_each(|v| text(v, texts));
     opt(&mut job.runs_on, texts);
+    opt(&mut job.environment, texts);
+    opt(&mut job.environment_url, texts);
     cond(&mut job.if_, texts);
     for step in &mut job.steps {
         match step {

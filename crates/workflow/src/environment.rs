@@ -28,9 +28,50 @@ pub fn valid_environment_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether an environment name is an expression the host evaluates when
+/// the job starts, rather than a name.
+#[must_use]
+pub fn is_expression(name: &str) -> bool {
+    name.contains("${{")
+}
+
+/// The longest environment URL.
+pub const ENVIRONMENT_URL_MAX: usize = 2048;
+
+/// Whether `url` can be shown as a link: an `http` or `https` address of
+/// at most 2048 bytes with no whitespace or control characters. Anything
+/// else, such as a `javascript:` address, is not shown.
+#[must_use]
+pub fn valid_environment_url(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"));
+    url.len() <= ENVIRONMENT_URL_MAX
+        && rest.is_some_and(|rest| !rest.is_empty())
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_urls() {
+        assert!(valid_environment_url(
+            "https://app.example.com/pr-7?x=1#top"
+        ));
+        assert!(valid_environment_url("http://10.0.0.1:8080"));
+        assert!(!valid_environment_url(""));
+        assert!(!valid_environment_url("https://"));
+        assert!(!valid_environment_url("javascript:alert(1)"));
+        assert!(!valid_environment_url("ftp://example.com"));
+        assert!(!valid_environment_url("https://a b"));
+        assert!(!valid_environment_url("https://a\nb"));
+        assert!(!valid_environment_url(&format!(
+            "https://{}",
+            "a".repeat(2048)
+        )));
+    }
 
     #[test]
     fn environment_names() {

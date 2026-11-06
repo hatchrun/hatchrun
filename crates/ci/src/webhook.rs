@@ -23,7 +23,10 @@ use crate::alerts;
 use crate::env::{Settings, run_stub};
 use crate::github;
 use crate::installation;
-use crate::intake::{self, PullRequest, Push, RefChange, Release, Repo, Rerequested, Trigger};
+use crate::intake::{
+    self, MergeGroup, PullRequest, Push, RefChange, Release, Repo, RepositoryDispatch, Rerequested,
+    Trigger,
+};
 use crate::planning;
 use crate::runs::{self, Config};
 use crate::store::{self, RepoRow, TenantRow};
@@ -147,6 +150,8 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         Trigger::PullRequest(p) => (p.installation_id, &p.repo),
         Trigger::Release(r) => (r.installation_id, &r.repo),
         Trigger::Create(c) | Trigger::Delete(c) => (c.installation_id, &c.repo),
+        Trigger::MergeGroup(g) => (g.installation_id, &g.repo),
+        Trigger::RepositoryDispatch(d) => (d.installation_id, &d.repo),
         Trigger::Rerequested(r) => (r.installation_id, &r.repo),
         Trigger::Repository(r) => (r.installation_id, &r.repo),
     };
@@ -301,6 +306,39 @@ fn delete_fired(change: &RefChange, sha: String) -> Fired<'_> {
     }
 }
 
+/// A merge group runs on its own ref, at its head commit, which is where
+/// the merge queue looks for the checks.
+fn merge_group_fired(group: &MergeGroup) -> Fired<'_> {
+    Fired {
+        installation_id: group.installation_id,
+        repo: &group.repo,
+        event_name: "merge_group",
+        payload: &group.payload,
+        trigger: Event::MergeGroup {
+            action: group.action.clone(),
+        },
+        git_ref: group.head_ref.clone(),
+        sha: group.head_sha.clone(),
+        actor: &group.actor,
+    }
+}
+
+/// A repository dispatch runs on the default branch, at its head `sha`.
+fn dispatch_fired(dispatch: &RepositoryDispatch, sha: String) -> Fired<'_> {
+    Fired {
+        installation_id: dispatch.installation_id,
+        repo: &dispatch.repo,
+        event_name: "repository_dispatch",
+        payload: &dispatch.payload,
+        trigger: Event::RepositoryDispatch {
+            action: dispatch.action.clone(),
+        },
+        git_ref: format!("refs/heads/{}", dispatch.repo.default_branch),
+        sha,
+        actor: &dispatch.actor,
+    }
+}
+
 struct Cx<'a> {
     env: &'a Env,
     db: &'a Db,
@@ -320,6 +358,8 @@ impl Cx<'_> {
             Trigger::Release(release) => self.release(release).await?,
             Trigger::Create(change) => self.create(change).await?,
             Trigger::Delete(change) => self.delete(change).await?,
+            Trigger::MergeGroup(group) => self.merge_group(group).await?,
+            Trigger::RepositoryDispatch(dispatch) => self.repository_dispatch(dispatch).await?,
             Trigger::Rerequested(rerun) => self.rerun(rerun).await?,
             // The row was updated before, with the tenant's other
             // repository writes; nothing runs.
@@ -521,6 +561,26 @@ impl Cx<'_> {
         self.fire(&delete_fired(change, sha), &config).await
     }
 
+    /// A merge group runs on its head commit, which the delivery names.
+    async fn merge_group(&self, group: &MergeGroup) -> Result<Outcome> {
+        let config = self
+            .config_at(group.installation_id, &group.repo, &group.head_sha)
+            .await?;
+        self.fire(&merge_group_fired(group), &config).await
+    }
+
+    /// A repository dispatch runs on the head of the default branch, as
+    /// on GitHub.
+    async fn repository_dispatch(&self, dispatch: &RepositoryDispatch) -> Result<Outcome> {
+        let id = dispatch.installation_id;
+        let Some((sha, config)) =
+            runs::default_head(self.tokens, self.settings, id, &dispatch.repo).await?
+        else {
+            return Ok(Outcome::Ignored("the repository has no commits".to_owned()));
+        };
+        self.fire(&dispatch_fired(dispatch, sha), &config).await
+    }
+
     async fn config_at(&self, installation_id: u64, repo: &Repo, sha: &str) -> Result<Config> {
         runs::read_config(
             self.tokens,
@@ -659,6 +719,53 @@ mod tests {
         assert_eq!(fired.sha, "head");
         assert_eq!(fired.trigger, Event::Delete);
         assert_eq!(fired.payload, &deleted.payload);
+    }
+
+    #[test]
+    fn a_merge_group_runs_on_its_own_ref_at_its_head_commit() {
+        let group = MergeGroup {
+            installation_id: 7,
+            repo: repo(),
+            action: "checks_requested".into(),
+            head_sha: "abc".into(),
+            head_ref: "refs/heads/gh-readonly-queue/main/pr-5-def".into(),
+            actor: "octocat".into(),
+            payload: json!({ "action": "checks_requested" }),
+        };
+        let fired = merge_group_fired(&group);
+        assert_eq!(fired.event_name, "merge_group");
+        assert_eq!(fired.git_ref, "refs/heads/gh-readonly-queue/main/pr-5-def");
+        assert_eq!(fired.sha, "abc");
+        assert_eq!(fired.actor, "octocat");
+        assert_eq!(fired.payload, &group.payload);
+        assert_eq!(
+            fired.trigger,
+            Event::MergeGroup {
+                action: "checks_requested".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_repository_dispatch_runs_on_the_default_branch_head() {
+        let dispatch = RepositoryDispatch {
+            installation_id: 7,
+            repo: repo(),
+            action: "deploy".into(),
+            actor: "octocat".into(),
+            payload: json!({ "action": "deploy", "client_payload": { "x": 1 } }),
+        };
+        let fired = dispatch_fired(&dispatch, "head".into());
+        assert_eq!(fired.event_name, "repository_dispatch");
+        assert_eq!(fired.git_ref, "refs/heads/main");
+        assert_eq!(fired.sha, "head");
+        assert_eq!(fired.payload["client_payload"]["x"], 1);
+        assert_eq!(
+            fired.trigger,
+            Event::RepositoryDispatch {
+                action: "deploy".into()
+            }
+        );
     }
 
     #[test]

@@ -164,6 +164,9 @@ pub struct RunInfo {
     pub base_ref: String,
     /// The workflow's `concurrency`, as written.
     pub concurrency: Option<Concurrency>,
+    /// What the workflow's `run-name` gave, when it has one: the title
+    /// the check runs show.
+    pub title: Option<String>,
 }
 
 /// The body of `POST /start`.
@@ -273,6 +276,9 @@ pub enum Work {
         job: u64,
         /// The attempt.
         attempt: u32,
+        /// The environment the graph settled on, for the job's row.
+        #[serde(default)]
+        environment: Option<String>,
     },
     /// The job's row ends.
     FinishJob {
@@ -287,6 +293,8 @@ pub enum Work {
         /// Where the job's log will be in R2, `None` when the job
         /// wrote none.
         log_key: Option<String>,
+        /// Where the job's deployment can be seen.
+        environment_url: Option<String>,
     },
     /// The run's row ends.
     FinishRun {
@@ -489,6 +497,7 @@ pub struct RunState {
     pub jobs: Vec<JobSummary>,
 }
 
+pub(crate) use decide::github_context;
 pub use object::RunObject;
 
 #[cfg(test)]
@@ -508,14 +517,25 @@ mod tests {
     fn the_todo_list_keeps_order_and_drops_by_id() {
         let mut todo = Todo::default();
         todo.push(Work::StartRun);
-        todo.push(Work::QueueLaunch { job: 1, attempt: 1 });
+        todo.push(Work::QueueLaunch {
+            job: 1,
+            attempt: 1,
+            environment: None,
+        });
         let first = todo.items[0].id;
         todo.remove(first);
         todo.remove(first);
         assert_eq!(todo.items.len(), 1);
         todo.push(Work::ReopenRun { attempt: 2 });
         assert_ne!(todo.items[0].id, todo.items[1].id);
-        assert_eq!(todo.items[0].work, Work::QueueLaunch { job: 1, attempt: 1 });
+        assert_eq!(
+            todo.items[0].work,
+            Work::QueueLaunch {
+                job: 1,
+                attempt: 1,
+                environment: None
+            }
+        );
     }
 
     #[test]

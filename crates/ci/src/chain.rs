@@ -270,6 +270,7 @@ mod tests {
             head_ref: head_ref.into(),
             base_ref: String::new(),
             concurrency: None,
+            title: None,
         }
     }
 
