@@ -4,7 +4,9 @@
 
 //! Picks the workflows a GitHub event starts.
 
-use hatchrun_workflow::{Diagnostic, Event, Plan, compile, config_errors, parse, triggered};
+use hatchrun_workflow::{
+    Diagnostic, Event, Library, Plan, compile_with, config_errors, parse, triggered,
+};
 
 /// A triggered workflow that did not compile.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,6 +41,13 @@ pub enum Selected {
 /// run.
 #[must_use]
 pub fn select(source: &str, event: &Event, compile_ref: &str) -> Selected {
+    select_with(source, event, compile_ref, &Library::default())
+}
+
+/// [`select`], with the workflow files of other repositories the
+/// workflows call (see [`crate::remote`]).
+#[must_use]
+pub fn select_with(source: &str, event: &Event, compile_ref: &str, library: &Library) -> Selected {
     let config = match parse(source) {
         Ok(config) => config,
         Err(diagnostics) => return Selected::Invalid(diagnostics),
@@ -53,7 +62,7 @@ pub fn select(source: &str, event: &Event, compile_ref: &str) -> Selected {
         if !triggered(&workflow.on, event) {
             continue;
         }
-        match compile(&config, name, compile_ref) {
+        match compile_with(&config, name, compile_ref, library) {
             Ok(plan) if plan.jobs.is_empty() => {}
             Ok(plan) => plans.push(plan),
             Err(diagnostics) => failed.push(Failed {
@@ -63,6 +72,18 @@ pub fn select(source: &str, event: &Event, compile_ref: &str) -> Selected {
         }
     }
     Selected::Plans { plans, failed }
+}
+
+/// Whether some workflow of `source` is started by `event` and the
+/// config calls a file of another repository, so that file is worth
+/// reading before the workflows are planned.
+#[must_use]
+pub fn needs_remote_files(source: &str, event: &Event) -> bool {
+    let Ok(config) = parse(source) else {
+        return false;
+    };
+    !hatchrun_workflow::remote_calls(&config, &Library::default()).is_empty()
+        && config.workflows.values().any(|wf| triggered(&wf.on, event))
 }
 
 /// Whether a pull request `action` against `base_ref` starts a workflow
@@ -302,5 +323,23 @@ workflows:
             ]
         );
         assert_eq!(schedules("jobs: ["), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn remote_files_are_read_only_for_a_triggered_workflow_that_calls_them() {
+        let source = "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: { branches: [main] } }
+    jobs: [{ up: { call: 'acme/shared/.github/workflows/x.yml@v1' } }]
+  plain:
+    on: { schedule: [{ cron: '0 3 * * *' }] }
+    jobs: [t]
+";
+        assert!(needs_remote_files(source, &push("refs/heads/main")));
+        assert!(!needs_remote_files(source, &push("refs/heads/dev")));
+        assert!(!needs_remote_files(CONFIG, &push("refs/heads/main")));
+        assert!(!needs_remote_files("jobs: [", &push("refs/heads/main")));
     }
 }

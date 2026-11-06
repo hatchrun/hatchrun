@@ -89,6 +89,75 @@ pub fn config_text(response: &Response) -> Result<Option<String>, String> {
         .map_err(|_| format!("{CONFIG_PATH} is not UTF-8"))
 }
 
+/// The raw file at `path` of `repo` at a commit.
+#[must_use]
+pub fn file_at(api: &str, repo: &str, path: &str, sha: &str, token: &str) -> Request {
+    let path = path.split('/').map(encode).collect::<Vec<_>>().join("/");
+    call(
+        "GET",
+        format!("{api}/repos/{repo}/contents/{path}?ref={}", encode(sha)),
+        token,
+        "application/vnd.github.raw+json",
+    )
+}
+
+/// The text of a file [`file_at`] asked for, `None` when there is no
+/// such file.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not the file, or a file over
+/// [`MAX_SOURCE`] bytes or not UTF-8.
+pub fn file_text(response: &Response, what: &str) -> Result<Option<String>, String> {
+    if response.status == 404 {
+        return Ok(None);
+    }
+    if !response.ok() {
+        return Err(format!(
+            "{what}: GitHub answered {}: {}",
+            response.status,
+            response.text()
+        ));
+    }
+    if response.body.len() > MAX_SOURCE {
+        return Err(format!(
+            "{what} is {} bytes; the limit is {MAX_SOURCE}",
+            response.body.len()
+        ));
+    }
+    String::from_utf8(response.body.clone())
+        .map(Some)
+        .map_err(|_| format!("{what} is not UTF-8"))
+}
+
+/// A repository by `owner/name`, as the installation sees it.
+#[must_use]
+pub fn repo_by_name(api: &str, repo: &str, token: &str) -> Request {
+    rest("GET", format!("{api}/repos/{repo}"), token)
+}
+
+/// Whether the repository [`repo_by_name`] asked for is private: `None`
+/// when the installation cannot read it (GitHub answers 404 for a
+/// repository it hides).
+///
+/// # Errors
+///
+/// GitHub's answer when it is neither the repository nor a 403 or 404.
+pub fn repo_is_private(response: &Response) -> Result<Option<bool>, String> {
+    #[derive(Deserialize)]
+    struct Repo {
+        #[serde(default = "yes")]
+        private: bool,
+    }
+    fn yes() -> bool {
+        true
+    }
+    match response.status {
+        403 | 404 => Ok(None),
+        _ => decode::<Repo>(response, "repository").map(|r| Some(r.private)),
+    }
+}
+
 /// One page of the files a pull request changes, 100 to a page.
 #[must_use]
 pub fn pull_files(api: &str, repo: &str, number: u64, page: u32, token: &str) -> Request {

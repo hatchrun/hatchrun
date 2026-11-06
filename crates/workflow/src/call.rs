@@ -383,6 +383,7 @@ pub struct Callee {
 #[derive(Debug, Clone, Default)]
 pub struct Library {
     files: BTreeMap<RemoteCall, Callee>,
+    refused: BTreeMap<RemoteCall, String>,
     offline: bool,
 }
 
@@ -393,8 +394,8 @@ impl Library {
     #[must_use]
     pub fn offline() -> Self {
         Self {
-            files: BTreeMap::new(),
             offline: true,
+            ..Self::default()
         }
     }
 
@@ -406,6 +407,18 @@ impl Library {
     /// Adds the file `call` names.
     pub fn insert(&mut self, call: RemoteCall, callee: Callee) {
         self.files.insert(call, callee);
+    }
+
+    /// Records why the host did not read the file `call` names, which a
+    /// plan that calls it reports.
+    pub fn refuse(&mut self, call: RemoteCall, reason: impl Into<String>) {
+        self.refused.insert(call, reason.into());
+    }
+
+    /// Why the file `call` names was not read, when the host said.
+    #[must_use]
+    pub fn refusal(&self, call: &RemoteCall) -> Option<&str> {
+        self.refused.get(call).map(String::as_str)
     }
 
     /// The file `call` names, when it was added.
@@ -435,6 +448,7 @@ pub fn remote_calls(config: &Config, library: &Library) -> Vec<RemoteCall> {
                 };
                 match library.get(&call) {
                     Some(callee) => seen.push(&callee.config),
+                    None if library.refusal(&call).is_some() => {}
                     None if !out.contains(&call) => out.push(call),
                     None => {}
                 }

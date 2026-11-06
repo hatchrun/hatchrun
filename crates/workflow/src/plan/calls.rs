@@ -369,9 +369,10 @@ fn capped(
 /// The workflow a file of another repository holds.
 fn remote_target<'a>(library: &'a Library, remote: &RemoteCall) -> Result<Target<'a>, String> {
     let Some(callee) = library.get(remote) else {
-        return Err(format!(
-            "calls `{remote}`, which was not read; the file is missing, or its repository is not one this run may read"
-        ));
+        return Err(match library.refusal(remote) {
+            Some(reason) => format!("calls `{remote}`, which cannot be used: {reason}"),
+            None => format!("calls `{remote}`, which was not read by the host that planned this"),
+        });
     };
     let Some(wf) = callee.config.workflows.get(&callee.workflow) else {
         return Err(format!(
