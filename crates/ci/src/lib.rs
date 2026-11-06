@@ -23,13 +23,20 @@
 //!   its entries in the same bucket (see [`cache`]).
 //! - `/api/ci/*` serves runs, jobs and logs to the app and takes its
 //!   dispatch and cancel requests; `hatchrun-cloud` forwards them.
+//! - `GET /healthz` answers 200 while the database answers and the
+//!   reconciler's last pass is recent, 503 otherwise. Only the service
+//!   binding's host reaches it; `hatchrun-cloud`'s `/healthz` asks it
+//!   (see [`alerts`]).
 //!
 //! A Cron Trigger runs the reconciler every minute (stuck jobs,
 //! schedules, expiry), and the `hatchrun-ci-launches` queue starts the
-//! instances. Every other path answers 404.
+//! instances. Alerts about the reconciler, failed launches, GitHub's
+//! rate limit and the database go out by email (see [`alerts`]). Every
+//! other path answers 404.
 
 pub mod access;
 pub mod agent;
+mod alerts;
 pub mod api;
 pub mod artifacts;
 pub mod billing;
@@ -60,10 +67,14 @@ pub mod store;
 pub mod token;
 pub mod webhook;
 
+use hatchrun_cloud::db::Db;
 use worker::{
     Context, Env, MessageBatch, Method, Request, Response, Result, ScheduleContext, ScheduledEvent,
-    event,
+    console_error, event,
 };
+
+/// The host `hatchrun-cloud` calls through the service binding.
+const INTERNAL_HOST: &str = "ci";
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -72,6 +83,14 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
     if req.method() == Method::Post && req.path() == "/github/webhook" {
         return webhook::handle(req, &env).await;
+    }
+    if req.method() == Method::Get && req.path() == "/healthz" {
+        // Public on ci.hatchrun.io it would open a database connection
+        // per hit; only the service binding's host gets an answer.
+        if req.url()?.host_str() != Some(INTERNAL_HOST) {
+            return Response::error("not found", 404);
+        }
+        return healthz(&env).await;
     }
     if req.path().starts_with("/api/ci/") {
         return api::handle(req, &env).await;
@@ -83,6 +102,27 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return agent::handle(req, &env).await;
     }
     Response::error("not found", 404)
+}
+
+/// Whether the database answers and the reconciler runs: 200 when it
+/// does, 503 when it does not (see [`alerts::health`]).
+async fn healthz(env: &Env) -> Result<Response> {
+    let read = async {
+        Db::connect(env)
+            .await?
+            .first::<alerts::HealthRow>(alerts::HEALTH, &[])
+            .await
+    };
+    let (status, body) = match read.await {
+        Ok(row) => alerts::health(&row.unwrap_or_default(), worker::Date::now().as_millis()),
+        Err(err) => {
+            console_error!("healthz: {err}");
+            (503, serde_json::json!({ "status": "database" }))
+        }
+    };
+    let mut response = Response::from_json(&body)?.with_status(status);
+    response.headers_mut().set("Cache-Control", "no-store")?;
+    Ok(response)
 }
 
 /// The launch queue and its dead-letter queue (see [`launches`]).
