@@ -92,7 +92,7 @@ export function App() {
   );
 }
 
-/** A page under /o/:org: reads the tenant for the sidebar and the role, then mounts the page. */
+/** A page under /o/:org: reads the tenant for the top bar and the role, then mounts the page. */
 function OrgRoute({ session, route }: { session: Session; route: OrgRoute }) {
   const { user } = session;
   const [tenant, reload] = useLoad(() => getTenant(route.org), route.org);

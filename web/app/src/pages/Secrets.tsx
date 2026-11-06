@@ -120,7 +120,7 @@ export function Secrets({ org, tenant }: OrgPageProps) {
   useEffect(() => () => window.clearTimeout(toastTimer.current), []);
 
   const scopeId = `${org}/${value.scope}/${value.repo ?? ""}/${value.env ?? ""}`;
-  // Whatever moves the page to another list (the sidebar, history, the
+  // Whatever moves the page to another list (the top bar, history, the
   // scope or tab controls) drops the open editor, the delete prompt and
   // the page cursors of the old one.
   const [seen, setSeen] = useState(`${scopeId}/${kind}`);

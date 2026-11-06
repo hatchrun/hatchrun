@@ -22,7 +22,6 @@ import { ApiError, signOut, type User } from "@/api";
 import { THEMES, setTheme, useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 import { Link } from "@/router";
-import { NAV_ITEM } from "./Sidebar";
 
 export const CLI_INSTALL = "brew install hatchrun/tap/hatchrun";
 
@@ -49,8 +48,8 @@ const Kbd = ({ children }: { children: ReactNode }) => (
 );
 
 /**
- * The profile button at the bottom of the sidebar and the menu that
- * opens upward from it (Radix menu: arrows, Enter, Esc, type-ahead and
+ * The avatar button at the right of the top bar and the menu that
+ * opens downward from it (Radix menu: arrows, Enter, Esc, type-ahead and
  * Right/Left for the Theme submenu all work). `org` and `role` describe
  * the current organization; without them the org rows are left out.
  */
@@ -102,20 +101,16 @@ export function ProfileMenu({
   return (
     <Menu.Root>
       <Menu.Trigger asChild>
-        <button type="button" className={cn(NAV_ITEM, "h-12 gap-2.5 px-2")} aria-label={`Account menu for ${user.login}`}>
-          <span className="flex size-7 flex-none items-center justify-center rounded-sm bg-raised font-semibold text-fg">{avatar}</span>
-          <span className="flex min-w-0 flex-1 flex-col text-left leading-tight">
-            <span className="truncate text-sm font-semibold text-fg">{name}</span>
-            <span className="truncate font-mono text-xs font-normal text-fg-3">
-              @{user.login}
-              {role && ` · ${role}`}
-            </span>
-          </span>
-          <ChevronsUpDownMini />
+        <button
+          type="button"
+          className="flex size-8 flex-none cursor-pointer items-center justify-center rounded-sm border-0 bg-raised p-0 text-sm font-semibold text-fg hover:ring-1 hover:ring-fg-3"
+          aria-label={`Account menu for ${user.login}`}
+        >
+          {avatar}
         </button>
       </Menu.Trigger>
       <Menu.Portal>
-        <Menu.Content side="top" align="start" sideOffset={6} collisionPadding={8} aria-label="Account menu" className={cn(SURFACE, "z-50 w-[300px] max-w-[calc(100vw-16px)] outline-none")}>
+        <Menu.Content side="bottom" align="end" sideOffset={6} collisionPadding={8} aria-label="Account menu" className={cn(SURFACE, "z-50 w-[300px] max-w-[calc(100vw-16px)] outline-none")}>
           <div className="flex flex-col gap-2.5 border-b border-rule px-3.5 pt-3.5 pb-3">
             <div className="flex items-center gap-3">
               <span className="flex size-10 flex-none items-center justify-center rounded-md bg-raised text-lg font-semibold">{avatar}</span>
@@ -234,13 +229,5 @@ export function ProfileMenu({
         </Menu.Content>
       </Menu.Portal>
     </Menu.Root>
-  );
-}
-
-function ChevronsUpDownMini() {
-  return (
-    <svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" fill="currentColor" className="shrink-0 text-fg-3">
-      <path d="M4.5 6 8 2.5 11.5 6zM4.5 10 8 13.5 11.5 10z" />
-    </svg>
   );
 }
