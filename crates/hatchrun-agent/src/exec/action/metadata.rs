@@ -111,7 +111,32 @@ fn parse_metadata(text: &str) -> Result<Metadata> {
                 .map(CompositeStep::from)
                 .collect(),
         },
-        "docker" => Runs::Docker,
+        "docker" => Runs::Docker {
+            image: raw
+                .runs
+                .image
+                .map(|v| v.0)
+                .context("runs.image is required for a Docker action")?,
+            entrypoint: raw.runs.entrypoint.map(|v| v.0),
+            args: raw
+                .runs
+                .args
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| v.0)
+                .collect(),
+            env: raw
+                .runs
+                .env
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, v)| (k, v.0))
+                .collect(),
+            pre_entrypoint: raw.runs.pre_entrypoint.map(|v| v.0),
+            pre_if: raw.runs.pre_if.map(|v| v.0),
+            post_entrypoint: raw.runs.post_entrypoint.map(|v| v.0),
+            post_if: raw.runs.post_if.map(|v| v.0),
+        },
         other => bail!("runs.using `{other}` is not supported"),
     };
     Ok(Metadata {
@@ -220,6 +245,14 @@ struct RawRuns {
     #[serde(rename = "post-if")]
     post_if: Option<Scalar>,
     steps: Option<Vec<RawStep>>,
+    image: Option<Scalar>,
+    entrypoint: Option<Scalar>,
+    args: Option<Vec<Scalar>>,
+    env: Option<BTreeMap<String, Scalar>>,
+    #[serde(rename = "pre-entrypoint")]
+    pre_entrypoint: Option<Scalar>,
+    #[serde(rename = "post-entrypoint")]
+    post_entrypoint: Option<Scalar>,
 }
 
 #[derive(Deserialize)]

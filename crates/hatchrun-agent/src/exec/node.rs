@@ -16,12 +16,13 @@ use serde_json::Value;
 
 use super::action::{self, Action, ActionRef, Runs};
 use super::context::ActionScope;
+use super::docker::action::DockerRun;
 use super::files::StepFiles;
 use super::sink::Sink;
 use super::{Common, Job, Launch, Line, Options, Ran, base_env, interp};
 
 /// Where the runner image keeps its Node builds.
-const EXTERNALS: &str = "/home/runner/externals";
+pub(super) const EXTERNALS: &str = "/home/runner/externals";
 
 /// The Node binary for an action's `runs.using` value.
 ///
@@ -73,6 +74,19 @@ fn locate(
     bail!("no Node binary found for `{version}`: pass --node or install one in {EXTERNALS}")
 }
 
+/// What a due `post` runs.
+pub(super) enum PostRun {
+    /// A script on Node.
+    Node {
+        node: PathBuf,
+        script: PathBuf,
+        /// The step's `env`, its inputs and the action variables.
+        extra: BTreeMap<String, String>,
+    },
+    /// The `post-entrypoint` of a container action.
+    Container(DockerRun),
+}
+
 /// A `post` script that is due after the job's steps.
 pub struct Post {
     /// The step's index, for its `STATE_*`.
@@ -82,12 +96,31 @@ pub struct Post {
     /// The `uses:` value, for the header.
     uses: String,
     action_name: String,
-    node: PathBuf,
-    script: PathBuf,
+    run: PostRun,
     condition: Option<String>,
-    /// The step's `env`, its inputs and the action variables.
-    extra: BTreeMap<String, String>,
     continue_on_error: bool,
+}
+
+impl Post {
+    /// The `post-entrypoint` of a container action.
+    pub(super) fn docker(
+        index: usize,
+        uses: String,
+        action_name: String,
+        run: DockerRun,
+        condition: Option<String>,
+        continue_on_error: bool,
+    ) -> Self {
+        Self {
+            index,
+            slot: 0,
+            uses,
+            action_name,
+            run: PostRun::Container(run),
+            condition,
+            continue_on_error,
+        }
+    }
 }
 
 /// The inputs and environment a `uses:` step gives its action.
@@ -106,6 +139,13 @@ pub(super) fn action_name(step: &UsesStep, r: &ActionRef) -> String {
     match (&step.id, r) {
         (Some(id), _) => id.clone(),
         (None, ActionRef::Remote { owner, repo, .. }) => format!("__{owner}_{repo}"),
+        (None, ActionRef::Docker { image }) => {
+            let name: String = image
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            format!("__{name}")
+        }
         (None, ActionRef::Local(_)) => "__run".to_owned(),
     }
 }
@@ -124,6 +164,9 @@ impl Job<'_> {
             let Ok(r) = action::parse_ref(&uses.uses) else {
                 continue;
             };
+            if matches!(r, ActionRef::Docker { .. }) {
+                continue;
+            }
             let found = self.fetch_action(&r).await;
             if matches!((&r, &found), (ActionRef::Local(_), Err(_))) {
                 continue;
@@ -159,7 +202,63 @@ impl Job<'_> {
                 };
                 self.run_pre(&hook, uses, &action, &r, sink).await;
             }
+            if let Runs::Docker {
+                pre_entrypoint: Some(pre),
+                pre_if,
+                ..
+            } = &action.meta.runs
+            {
+                self.run_docker_pre(index, pre, pre_if.as_deref(), uses, &action, &r, sink)
+                    .await;
+            }
         }
+    }
+
+    /// Runs a container action's `pre-entrypoint`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_docker_pre(
+        &mut self,
+        index: usize,
+        entrypoint: &str,
+        condition: Option<&str>,
+        uses: &UsesStep,
+        action: &Action,
+        r: &ActionRef,
+        sink: &mut dyn Sink,
+    ) {
+        match self.hook_runs(Some(condition.unwrap_or("always()"))) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                self.announce(sink, index, "Pre", &uses.uses);
+                self.say(sink, Line::Error(&format!("pre-if: {err}")));
+                self.settle(Conclusion::Failure, uses.continue_on_error);
+                return;
+            }
+        }
+        self.announce(sink, index, "Pre", &uses.uses);
+        let name = action_name(uses, r);
+        let prepared = self
+            .evaluate(uses, action, r, &name)
+            .and_then(|evaluated| Ok((self.docker_run(action, &evaluated)?, evaluated)));
+        let outcome = match prepared {
+            Ok((mut run, evaluated)) => {
+                for warning in &evaluated.warnings {
+                    self.say(sink, Line::Warning(warning));
+                }
+                run.entrypoint = Some(entrypoint.to_owned());
+                run.args = Vec::new();
+                let slot = self.doc.job.steps.len() + index;
+                self.run_docker(slot, index, &name, &run, sink)
+                    .await
+                    .outcome
+            }
+            Err(message) => {
+                self.say(sink, Line::Error(&message));
+                Conclusion::Failure
+            }
+        };
+        self.settle(outcome, uses.continue_on_error);
     }
 
     /// Fetches an action, giving up when the job is stopped. The first
@@ -246,23 +345,27 @@ impl Job<'_> {
                 }
             }
             self.announce(sink, post.index, "Post", &post.uses);
-            let hook = Hook {
-                index: post.index,
-                slot: post.slot,
-                version: "",
-                script: "",
-                condition: None,
+            let ran = match &post.run {
+                PostRun::Node {
+                    node,
+                    script,
+                    extra,
+                } => {
+                    let hook = Hook {
+                        index: post.index,
+                        slot: post.slot,
+                        version: "",
+                        script: "",
+                        condition: None,
+                    };
+                    self.run_hook(&hook, node, script, &post.action_name, extra, sink)
+                        .await
+                }
+                PostRun::Container(run) => {
+                    self.run_docker(post.slot, post.index, &post.action_name, run, sink)
+                        .await
+                }
             };
-            let ran = self
-                .run_hook(
-                    &hook,
-                    &post.node,
-                    &post.script,
-                    &post.action_name,
-                    &post.extra,
-                    sink,
-                )
-                .await;
             self.settle(ran.outcome, post.continue_on_error);
         }
     }
@@ -298,6 +401,7 @@ impl Job<'_> {
         ran
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_uses(
         &mut self,
         index: usize,
@@ -341,6 +445,16 @@ impl Job<'_> {
             Ok(r) => r,
             Err(message) => return failed(self, sink, common, &message),
         };
+        if let ActionRef::Docker { image } = &r {
+            let name = action_name(step, &r);
+            return match self.docker_image_step(step, image, &name) {
+                Ok(prepared) => {
+                    self.docker_step(index, step, &name, prepared, None, common, sink)
+                        .await
+                }
+                Err(message) => failed(self, sink, common, &message),
+            };
+        }
         // A local action may have arrived since the job started.
         let action = match (&r, self.fetched.get(&index)) {
             (ActionRef::Remote { .. }, Some(found)) => found.clone(),
@@ -354,6 +468,25 @@ impl Job<'_> {
             let (outcome, outputs) = self.composite(step, &action, &r, steps, sink).await;
             return (common, outcome, outputs);
         }
+        if let Runs::Docker {
+            post_entrypoint,
+            post_if,
+            ..
+        } = &action.meta.runs
+        {
+            let name = action_name(step, &r);
+            let prepared = self
+                .evaluate(step, &action, &r, &name)
+                .and_then(|evaluated| Ok((self.docker_run(&action, &evaluated)?, evaluated)));
+            return match prepared {
+                Ok(prepared) => {
+                    let post = post_entrypoint.clone().map(|e| (e, post_if.clone()));
+                    self.docker_step(index, step, &name, prepared, post, common, sink)
+                        .await
+                }
+                Err(message) => failed(self, sink, common, &message),
+            };
+        }
         let Runs::Node {
             version,
             main,
@@ -362,11 +495,8 @@ impl Job<'_> {
             ..
         } = &action.meta.runs
         else {
-            let message = format!(
-                "`{}` is a Docker container action; Docker services and containers come in a later release",
-                step.uses
-            );
-            return failed(self, sink, common, &message);
+            // A composite action returned above.
+            return failed(self, sink, common, "unsupported action type");
         };
 
         let hook = Hook {
@@ -389,10 +519,12 @@ impl Job<'_> {
                 slot: 0,
                 uses: step.uses.clone(),
                 action_name: name.clone(),
-                node: node.clone(),
-                script: action.dir.join(post),
+                run: PostRun::Node {
+                    node: node.clone(),
+                    script: action.dir.join(post),
+                    extra: evaluated.env.clone(),
+                },
                 condition: post_if.clone(),
-                extra: evaluated.env.clone(),
                 continue_on_error: step.continue_on_error,
             };
             self.queue_post(due);
@@ -406,16 +538,26 @@ impl Job<'_> {
     /// Queues a `post` that is due at the end of the job. Inside a
     /// composite action the step has no slot reserved for it, and the
     /// composite step's `env` still applies to it.
-    fn queue_post(&mut self, mut post: Post) {
+    pub(super) fn queue_post(&mut self, mut post: Post) {
         let steps = self.doc.job.steps.len();
         post.slot = if post.index < steps {
             2 * steps + post.index
         } else {
             self.fresh_slot()
         };
-        let mut extra = self.scope_env.clone();
-        extra.extend(std::mem::take(&mut post.extra));
-        post.extra = extra;
+        let scope = self.scope_env.clone();
+        match &mut post.run {
+            PostRun::Node { extra, .. } => {
+                let mut merged = scope;
+                merged.extend(std::mem::take(extra));
+                *extra = merged;
+            }
+            PostRun::Container(run) => {
+                let mut merged = scope;
+                merged.extend(std::mem::take(&mut run.env));
+                run.env = merged;
+            }
+        }
         self.posts.push(post);
     }
 
@@ -444,14 +586,16 @@ impl Job<'_> {
         name: &str,
     ) -> Result<Evaluated, String> {
         let workspace = &self.layout.workspace;
+        // A step in the job container sees the container's paths.
+        let base = self.step_ctx();
         let mut env = BTreeMap::new();
         for (key, value) in &step.env {
-            let text = interp(value, &self.ctx, workspace, self.status)
+            let text = interp(value, &base, workspace, self.status)
                 .map_err(|e| format!("env {key}: {e}"))?;
             env.insert(key.clone(), text);
         }
         // The step's own expressions see its env too.
-        let mut caller = self.ctx.clone();
+        let mut caller = base;
         let mut visible = self.env_context();
         visible.extend(env.clone());
         caller.set_env(&visible);
@@ -474,7 +618,7 @@ impl Job<'_> {
                 git_ref,
                 ..
             } => (format!("{owner}/{repo}"), git_ref.clone()),
-            ActionRef::Local(_) => (String::new(), String::new()),
+            ActionRef::Docker { .. } | ActionRef::Local(_) => (String::new(), String::new()),
         };
         let path = action.dir.to_string_lossy().into_owned();
         let mut action_scope = ActionScope {
@@ -565,20 +709,33 @@ impl Job<'_> {
         let args = [script.to_string_lossy().into_owned()];
         let program = node.to_string_lossy();
         let cwd = self.layout.workspace.clone();
+        let exec = match self.launch_for(&program, &args, &cwd, &env) {
+            Ok(exec) => exec,
+            Err(message) => {
+                self.say(sink, Line::Error(&message));
+                return Ran {
+                    outcome: Conclusion::Failure,
+                    outputs: BTreeMap::new(),
+                    state: Vec::new(),
+                };
+            }
+        };
         let ran = self
             .execute(
                 Launch {
-                    program: &program,
-                    args: &args,
-                    cwd: &cwd,
-                    env: &env,
+                    program: &exec.program,
+                    args: &exec.args,
+                    cwd: &exec.cwd,
+                    env: &exec.env,
                     timeout: None,
                     timeout_minutes: None,
-                    files: &files,
+                    files: Some(&files),
+                    as_agent: exec.as_agent,
                 },
                 sink,
             )
             .await;
+        exec.cleanup();
         self.states
             .entry(hook.index)
             .or_default()

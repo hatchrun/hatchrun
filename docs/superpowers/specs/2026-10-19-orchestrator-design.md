@@ -47,15 +47,29 @@ agent, the runner images and the EC2 launch code.
 - Code hosts other than GitHub. The event and status pieces are kept
   per host so GitLab, Bitbucket or plain webhooks can be added later
   with the same middle, but none are built now.
-- Docker beyond `run:` steps at launch. Each job owns a whole VM and
-  the runner image ships rootful Docker with Buildx, so `docker build`
-  and `docker run` inside a step work from day one. `services:`,
-  `container:` and Docker container actions need the engine to start
-  containers, wire their network and mount the workspace; they come in
-  a later phase. Until then a workflow that uses them fails before it
-  starts with a message that says so.
 - Windows and macOS runners.
 - Running in the customer's cloud account. That is hatchrun.io.
+
+## Docker
+
+Docker is required. Each job owns a whole VM, and the runner image
+ships rootful Docker Engine, Buildx and Compose with the `runner` user
+in the `docker` group. The agent supports GitHub's container features
+(decided 2026-11-06, reversing the earlier "no Docker at launch"):
+
+- `container:` runs the job's steps inside the container. The work
+  directory is mounted at `/__w`, the image's Node builds at `/__e`,
+  the tool cache at `/__t`; `run:` steps and JavaScript actions are
+  `docker exec` calls.
+- `services:` start on a user-defined network before the job container.
+  A service is `<id>` on that network and `localhost:<mapped port>`
+  from steps that run on the machine. The agent waits for health checks
+  and fills `job.services.<id>.ports`.
+- `uses: docker://image` and `runs.using: docker` actions are pulled or
+  built, run with the runner's mounts and `pre`/`post` entrypoints.
+- The cache proxy listens on the address of Docker's default bridge, so
+  BuildKit's `type=gha` backend reaches it from its own container.
+- Everything the job started is removed when it ends.
 
 ## Workflow format
 

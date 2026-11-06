@@ -493,6 +493,8 @@ mod tests {
                 environment: None,
                 environment_url: None,
                 concurrency: None,
+                container: None,
+                services: std::collections::BTreeMap::new(),
                 steps: vec![],
             },
             environment: None,

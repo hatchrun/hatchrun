@@ -114,11 +114,14 @@ fn parses_refs() {
     assert!(parse_ref("a/b/../c@v1").is_err());
     assert!(parse_ref("a b/c@v1").is_err());
     assert!(parse_ref("lonely@v1").is_err());
-    assert!(
-        parse_ref("docker://alpine:3")
-            .unwrap_err()
-            .contains("Docker container action")
+    assert_eq!(
+        parse_ref("docker://alpine:3").unwrap(),
+        ActionRef::Docker {
+            image: "alpine:3".to_owned()
+        }
     );
+    assert!(parse_ref("docker://").is_err());
+    assert!(parse_ref("docker://a b").is_err());
 }
 
 #[tokio::test]
@@ -571,7 +574,39 @@ fn parse(yml: &str) -> Result<Metadata> {
 #[test]
 fn docker_action_is_runs_docker() {
     let m = parse("name: d\nruns:\n  using: docker\n  image: Dockerfile\n").unwrap();
-    assert_eq!(m.runs, Runs::Docker);
+    assert!(matches!(
+        &m.runs,
+        Runs::Docker { image, entrypoint: None, .. } if image == "Dockerfile"
+    ));
+}
+
+#[test]
+fn docker_action_fields() {
+    let m = parse(
+        "name: d\nruns:\n  using: docker\n  image: docker://alpine:3\n  entrypoint: /e.sh\n  args: [a, 1]\n  env: { K: v }\n  pre-entrypoint: /pre.sh\n  pre-if: always()\n  post-entrypoint: /post.sh\n",
+    )
+    .unwrap();
+    let Runs::Docker {
+        image,
+        entrypoint,
+        args,
+        env,
+        pre_entrypoint,
+        pre_if,
+        post_entrypoint,
+        post_if,
+    } = m.runs
+    else {
+        panic!()
+    };
+    assert_eq!(image, "docker://alpine:3");
+    assert_eq!(entrypoint.as_deref(), Some("/e.sh"));
+    assert_eq!(args, ["a", "1"]);
+    assert_eq!(env["K"], "v");
+    assert_eq!(pre_entrypoint.as_deref(), Some("/pre.sh"));
+    assert_eq!(pre_if.as_deref(), Some("always()"));
+    assert_eq!(post_entrypoint.as_deref(), Some("/post.sh"));
+    assert_eq!(post_if, None);
 }
 
 #[test]

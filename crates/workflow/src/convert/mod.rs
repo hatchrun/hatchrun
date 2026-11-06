@@ -55,7 +55,7 @@ pub struct Conversion {
 /// file stem, so `.github/workflows/ci.yml` becomes workflow `ci`.
 ///
 /// A job with a problem (a `runs-on` that names no runner template, a
-/// `docker://` step, a `needs` that names no job, a job key another file
+/// `container` that names no image, a `needs` that names no job, a job key another file
 /// already uses, a read of the `jobs` context) is dropped,
 /// like a reusable workflow call. Every job that needs a dropped job,
 /// directly or through others, is dropped too, with a warning naming the
