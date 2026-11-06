@@ -468,10 +468,13 @@ fn deleting_an_environment_deletes_its_secrets_and_vars() {
             db.db(),
             7,
             "production",
-            &audit(Action::EnvironmentDelete, "x")
+            &audit(Action::EnvironmentDelete, "production")
         ))
         .unwrap()
     );
+    let (rows, _) = db.wait(audit_page(db.db(), "t1", None, None, 10)).unwrap();
+    assert_eq!(rows[0].action, "environment.delete");
+    assert_eq!(rows[0].target, "Production");
     assert!(
         !db.wait(delete_environment(
             db.db(),

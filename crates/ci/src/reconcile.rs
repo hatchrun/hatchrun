@@ -19,6 +19,9 @@
 //! 7. sends metered usage to Polar;
 //! 8. re-seals secrets that an old key still seals.
 //!
+//! Then the pass is added to the history in `ci_reconciler` and the
+//! alerts are checked (see [`crate::alerts`]).
+//!
 //! Each step decides over rows and the clock with a pure function
 //! ([`minutes`], [`fires`], [`stalled`], [`orphans`]) and then acts.
 //!
@@ -54,6 +57,7 @@ use hatchrun_workflow::{Cron, Event, MAX_RUNNING_JOBS, Template, UtcMinute};
 use serde_json::json;
 use worker::{Env, Method, RequestInit, console_error, console_log};
 
+use crate::alerts;
 use crate::cache;
 use crate::concurrency;
 use crate::env::{Settings, run_stub};
@@ -450,66 +454,114 @@ pub async fn run(env: Env) {
             return;
         }
     }
-    let settings = match Settings::read(&env) {
+    let errors = steps(&env, &db, now).await;
+    // The history and the alerts come after the steps, so they see this
+    // pass.
+    alerts::after_pass(&env, &db, now, errors).await;
+}
+
+/// Adds what a step cost to `errors`: the items it reported failed, or
+/// one for a step that failed as a whole.
+fn tally(errors: &mut u32, step: &str, result: Result<u32, String>) {
+    match result {
+        Ok(failed) => *errors += failed,
+        Err(err) => {
+            console_error!("reconcile: {step}: {err}");
+            *errors += 1;
+        }
+    }
+}
+
+/// The steps of a pass. Returns how many failed, steps and the items a
+/// step reported, which the pass history keeps.
+async fn steps(env: &Env, db: &Db, now: u64) -> u32 {
+    let mut errors = 0;
+    let settings = match Settings::read(env) {
         Ok(settings) => settings,
         Err(err) => {
             console_error!("reconcile: {err}");
-            return;
+            return 1;
         }
     };
     let share = shares(BUDGET);
-    if let Err(err) = fire_schedules(&env, &db, &settings, &Budget::new(share.schedules), now).await
-    {
-        console_error!("reconcile: schedules: {err}");
-    }
+    let github = Counted::default();
+    tally(
+        &mut errors,
+        "schedules",
+        fire_schedules(
+            env,
+            db,
+            &settings,
+            &github,
+            &Budget::new(share.schedules),
+            now,
+        )
+        .await,
+    );
+    alerts::note_rate_limits(db, &github, now).await;
     let backend = Backend::new(&settings).await;
     if let Err(err) = &backend {
         console_error!("reconcile: no launcher backend: {err}");
+        errors += 1;
     }
-    if let Err(err) = fix_stalled(
-        &env,
-        &db,
-        backend.as_ref().ok(),
-        &Budget::new(share.stalled),
-        now,
-    )
-    .await
-    {
-        console_error!("reconcile: stalled jobs: {err}");
-    }
+    tally(
+        &mut errors,
+        "stalled jobs",
+        fix_stalled(
+            env,
+            db,
+            backend.as_ref().ok(),
+            &Budget::new(share.stalled),
+            now,
+        )
+        .await,
+    );
     if held_backstop_due(now)
-        && let Err(err) = wake_held(&env, &db, &Budget::new(HELD_BUDGET), now).await
+        && let Err(err) = wake_held(env, db, &Budget::new(HELD_BUDGET), now).await
     {
         console_error!("reconcile: held jobs: {err}");
+        errors += 1;
     }
     let cancels = Budget::new(MAX_RECANCELS);
-    if let Err(err) =
-        concurrency::resend_cancels(&env, &db, MAX_RECANCELS, || cancels.take(1)).await
-    {
-        console_error!("reconcile: superseded runs: {err}");
-    }
+    tally(
+        &mut errors,
+        "superseded runs",
+        concurrency::resend_cancels(env, db, MAX_RECANCELS, || cancels.take(1))
+            .await
+            .map_err(|err| err.to_string()),
+    );
     if let Ok(backend) = &backend
-        && let Err(err) = end_orphans(&db, backend, &Budget::new(share.orphans), now).await
+        && let Err(err) = end_orphans(db, backend, &Budget::new(share.orphans), now).await
     {
         console_error!("reconcile: orphans: {err}");
+        errors += 1;
     }
-    if let Ok(backend) = &backend
-        && let Err(err) = keep_pool(&db, backend, &Budget::new(share.pool), now).await
-    {
-        console_error!("reconcile: warm pool: {err}");
+    if let Ok(backend) = &backend {
+        tally(
+            &mut errors,
+            "warm pool",
+            keep_pool(db, backend, &Budget::new(share.pool), now).await,
+        );
     }
-    if let Err(err) = retain(&env, &db, &Budget::new(share.retention), now).await {
-        console_error!("reconcile: retention: {err}");
-    }
-    if let Err(err) = evict_cache(&settings, &db, &Budget::new(share.cache), now).await {
+    tally(
+        &mut errors,
+        "retention",
+        retain(env, db, &Budget::new(share.retention), now).await,
+    );
+    if let Err(err) = evict_cache(&settings, db, &Budget::new(share.cache), now).await {
         console_error!("reconcile: cache eviction: {err}");
+        errors += 1;
     }
-    if let Err(err) = report_usage(&db, &settings, &Budget::new(share.usage), now).await {
+    if let Err(err) = report_usage(db, &settings, &Budget::new(share.usage), now).await {
         console_error!("reconcile: usage: {err}");
+        errors += 1;
     }
-    if let Err(err) = reseal_secrets(&env, &db, &Budget::new(share.reseal)).await {
-        console_error!("reconcile: reseal: {err}");
-    }
+    tally(
+        &mut errors,
+        "reseal",
+        reseal_secrets(env, db, &Budget::new(share.reseal)).await,
+    );
+    errors
 }
 
 /// A repository ready to start scheduled runs: where it is now, the
@@ -523,7 +575,7 @@ struct Head {
     config: Config,
 }
 
-/// Step 1. Schedules are read [`SCHEDULE_ROWS`] at a time until none are
+/// Step 1. Returns how many repositories and fires failed. Schedules are read [`SCHEDULE_ROWS`] at a time until none are
 /// left. When `budget` runs out the pass stops before the first fire it
 /// cannot pay for; the next pass starts again from that minute (from the
 /// oldest one when schedules were left unread), and the runs already
@@ -532,15 +584,16 @@ async fn fire_schedules(
     env: &Env,
     db: &Db,
     settings: &Settings,
+    github: &Counted,
     budget: &Budget,
     now: u64,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let last = store::last_minute(db).await.map_err(|e| e.to_string())?;
     let due = minutes(last, now);
     let Some(&newest) = due.last() else {
-        return Ok(());
+        return Ok(0);
     };
-    let github = Counted::default();
+    let mut failed = 0;
     let tokens = Tokens::new(
         Kv::new(env),
         App::new(
@@ -548,7 +601,7 @@ async fn fire_schedules(
             settings.app_id.clone(),
             settings.app_key.clone(),
         ),
-        &github,
+        github,
         now,
     );
     // The repository, its head and its config are read once per pass.
@@ -590,6 +643,7 @@ async fn fire_schedules(
                     Ok(head) => head,
                     Err(err) => {
                         console_error!("reconcile: repository {}: {err}", fire.repo_id);
+                        failed += 1;
                         None
                     }
                 };
@@ -610,6 +664,7 @@ async fn fire_schedules(
                     fire.cron,
                     head.repo.full_name
                 );
+                failed += 1;
             }
         }
         if last_page {
@@ -637,7 +692,8 @@ async fn fire_schedules(
     };
     store::set_last_minute(db, done)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(failed)
 }
 
 /// The head of repository `repo_id`'s default branch, under the tenant
@@ -749,11 +805,12 @@ async fn fix_stalled(
     backend: Option<&Backend>,
     budget: &Budget,
     now: u64,
-) -> Result<(), String> {
+) -> Result<u32, String> {
     let rows = store::stalled_jobs(db, now, MAX_FIXES)
         .await
         .map_err(|e| e.to_string())?;
     let by_id: HashMap<u64, &JobRow> = rows.iter().map(|row| (row.id, row)).collect();
+    let mut failed = 0;
     for fix in stalled(&rows, now) {
         let cost = match &fix {
             Fix::Requeue(_) => REQUEUE_COST,
@@ -776,9 +833,10 @@ async fn fix_stalled(
         };
         if let Err(err) = result {
             console_error!("reconcile: job {id}: {err}");
+            failed += 1;
         }
     }
-    Ok(())
+    Ok(failed)
 }
 
 /// Whether the pass at `now_ms` runs the held-job backstop.
@@ -955,9 +1013,9 @@ async fn end_orphans(db: &Db, backend: &Backend, budget: &Budget, now: u64) -> R
 /// backend without a pool. One list of the pool instances serves every
 /// template; an error in one template's pool is logged and does not stop
 /// the next. What `budget` does not pay for waits for the next pass.
-async fn keep_pool(db: &Db, backend: &Backend, budget: &Budget, now: u64) -> Result<(), String> {
+async fn keep_pool(db: &Db, backend: &Backend, budget: &Budget, now: u64) -> Result<u32, String> {
     if !backend.has_pool() || !budget.take(LIST_COST) {
-        return Ok(());
+        return Ok(0);
     }
     let described = backend.pool_instances().await?;
     let claims = store::claims_by_bucket(db, now.saturating_sub(WINDOW_MS))
@@ -972,6 +1030,7 @@ async fn keep_pool(db: &Db, backend: &Backend, budget: &Budget, now: u64) -> Res
         // Launch failures back off across the templates of one pass.
         backoff: pool::backoff(),
     };
+    let mut failed = 0;
     for template in TEMPLATES {
         let size = demand
             .get(template.labels[0])
@@ -979,9 +1038,10 @@ async fn keep_pool(db: &Db, backend: &Backend, budget: &Budget, now: u64) -> Res
         let held = pool::inventory(&described, template);
         if let Err(err) = pass.keep(template, size, &held).await {
             console_error!("reconcile: pool {}: {err}", template.labels[0]);
+            failed += 1;
         }
     }
-    Ok(())
+    Ok(failed)
 }
 
 /// What the pools share in one pass.
@@ -1188,9 +1248,9 @@ impl PoolPass<'_> {
 /// Step 6. A sweep takes at most [`store::SWEEP_LIMIT`] runs and one
 /// subrequest each purges them, which `budget` covers. A run is deleted
 /// once its purge succeeded.
-async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), String> {
+async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<u32, String> {
     if budget.left() < store::SWEEP_LIMIT * PURGE_COST {
-        return Ok(());
+        return Ok(0);
     }
     let expired = store::sweep(db, now).await.map_err(|e| e.to_string())?;
     budget.take(PURGE_COST * u32::try_from(expired.len()).unwrap_or(0));
@@ -1210,6 +1270,7 @@ async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), Str
     // A run whose purge failed stays, deferred an hour so it cannot keep
     // newer expired runs out of the batch.
     let failed = ids(failed);
+    let unpurged = u32::try_from(failed.len()).unwrap_or(u32::MAX);
     if !failed.is_empty() {
         console_error!(
             "reconcile: {} runs not purged, retrying later",
@@ -1221,7 +1282,8 @@ async fn retain(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), Str
         .map_err(|e| e.to_string())?;
     store::delete_runs(db, &ids(purged))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(unpurged)
 }
 
 /// Step 6, for the job cache: deletes the entries nobody restored for
@@ -1417,14 +1479,15 @@ async fn report_usage(
 /// keyring and seals it again with the current key. A row that does not
 /// open is logged by name and key id, never by value, and stays for an
 /// operator; a row set again meanwhile is left as it is.
-async fn reseal_secrets(env: &Env, db: &Db, budget: &Budget) -> Result<(), String> {
+async fn reseal_secrets(env: &Env, db: &Db, budget: &Budget) -> Result<u32, String> {
     if budget.left() == 0 {
-        return Ok(());
+        return Ok(0);
     }
     let keyring = secrets::Keyring::load(env).await?;
     let rows = store::stale_secrets(db, &keyring.current.id, budget.left())
         .await
         .map_err(|e| e.to_string())?;
+    let mut failed = 0;
     for row in rows {
         if !budget.take(1) {
             break;
@@ -1444,15 +1507,18 @@ async fn reseal_secrets(env: &Env, db: &Db, budget: &Budget) -> Result<(), Strin
                     .await
                     .map_err(|e| e.to_string())?;
             }
-            Err(err) => console_error!(
-                "reconcile: secret {} of tenant {} (key {}) not re-sealed: {err}",
-                row.name,
-                row.tenant,
-                row.key_id
-            ),
+            Err(err) => {
+                console_error!(
+                    "reconcile: secret {} of tenant {} (key {}) not re-sealed: {err}",
+                    row.name,
+                    row.tenant,
+                    row.key_id
+                );
+                failed += 1;
+            }
         }
     }
-    Ok(())
+    Ok(failed)
 }
 
 async fn purge(env: &Env, run_id: u64) -> worker::Result<()> {

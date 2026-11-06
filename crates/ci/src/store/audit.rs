@@ -58,8 +58,9 @@ pub struct NewAudit<'a> {
     /// The repository's `owner/name`, for the `repo` and `env` scopes.
     pub repo: Option<&'a str>,
     /// What changed: a name, `env/name` for an environment's secret or
-    /// var, or for the enabled repositories `all` or a count of added
-    /// and removed.
+    /// var, or for the enabled repositories `all` or `none` and the
+    /// repositories added (`+owner/name`) and removed (`-owner/name`),
+    /// separated by spaces.
     pub target: &'a str,
     /// When.
     pub now: u64,
@@ -146,7 +147,8 @@ pub async fn record_audit(db: &Db, audit: &NewAudit<'_>) -> Result<()> {
 }
 
 /// The newest `limit` rows of `tenant`, those older than `before` when
-/// given, for one repository (ignoring case) when `repo` is given.
+/// given, for one repository (ignoring case) when `repo` is given: its
+/// own changes and the enable changes that added or removed it.
 /// Also how many rows match, ignoring `before`.
 ///
 /// # Errors
@@ -163,7 +165,9 @@ pub async fn audit_page(
     struct Total {
         total: u64,
     }
-    let filter = "tenant_id = $1 AND ($2::text IS NULL OR lower(repo) = lower($2::text))";
+    let filter = "tenant_id = $1 AND ($2::text IS NULL OR lower(repo) = lower($2::text) \
+         OR (action = 'repos.enabled' AND string_to_array(lower(target), ' ') \
+             && ARRAY['+' || lower($2::text), '-' || lower($2::text)]))";
     let total = db
         .first::<Total>(
             &format!("SELECT count(*) AS total FROM ci_audit WHERE {filter}"),

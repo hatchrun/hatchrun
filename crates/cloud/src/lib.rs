@@ -16,7 +16,8 @@
 //! - `/api/*` on `app.hatchrun.io` is the app's API (see [`app`]), and
 //!   `/api/ci/*` goes on to `hatchrun-ci`; every other path there is the
 //!   app itself, from the static assets.
-//! - `GET /healthz` says whether the database answers, for an uptime
+//! - `GET /healthz` says whether the database answers and `hatchrun-ci`
+//!   is healthy (its reconciler runs; see its `/healthz`), for an uptime
 //!   monitor.
 //! - `GET /.well-known/openid-configuration` and
 //!   `GET /.well-known/jwks.json` on `oidc.hatchrun.io` let STS check
