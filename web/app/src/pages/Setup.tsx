@@ -167,7 +167,7 @@ function EnableForm({ org, total, saved, result, setResult, onChanged }: { org: 
     setBusy(true);
     setResult(null);
     try {
-      await setEnabledRepos(org, draft);
+      await setEnabledRepos(org, saved, draft);
       setResult({ ok: true, text: `${count(n)} enabled` });
       onChanged();
     } catch (err) {
