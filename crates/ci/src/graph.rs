@@ -12,9 +12,9 @@
 use std::collections::BTreeMap;
 
 use hatchrun_workflow::{
-    Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Need, Outcome, Plan,
-    PlannedJob, Ready, Statuses, checks_status, continue_on_error, hatchrun_context, interpolate,
-    is_expression, job_condition, ready, valid_environment_name,
+    Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Leg, Need, Outcome, Plan,
+    PlannedJob, Ready, Siblings, Statuses, checks_status, continue_on_error, expand,
+    hatchrun_context, interpolate, is_expression, job_condition, ready, valid_environment_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -101,6 +101,11 @@ pub enum Action {
         /// 1 asks, 2 insists.
         count: u32,
     },
+    /// The job reads its matrix or `runs-on` now that it can start: the
+    /// caller reads [`Graph::expansion`], records the jobs it made and
+    /// hands them to [`Graph::expanded`], or ends the job with
+    /// [`Graph::failed`].
+    Expand(u64),
     /// Every job ended.
     RunDone(Conclusion),
 }
@@ -411,6 +416,189 @@ impl Graph {
         self.advance(github_ctx)
     }
 
+    /// The jobs a job that asked to expand makes, read from its
+    /// context. `vars` are the repository and organization variables.
+    /// `None` for a job the graph does not hold or that has nothing
+    /// deferred.
+    ///
+    /// # Errors
+    ///
+    /// A message when the matrix cannot be made, or a job it makes
+    /// would have the id of another job of the run.
+    #[must_use]
+    pub fn expansion(
+        &self,
+        job: u64,
+        github_ctx: &Value,
+        vars: &BTreeMap<String, String>,
+    ) -> Option<Result<Vec<Leg>, String>> {
+        let at = self.position(job)?;
+        self.jobs[at].job.deferred.as_ref()?;
+        if self.jobs[at].state != State::Queued {
+            return None;
+        }
+        let ctx = self.job_context(job, github_ctx, vars)?;
+        let group = self.jobs[at].job.strategy.as_ref().map(|s| &s.group);
+        let in_group = |i: usize| {
+            i != at
+                && group.is_some()
+                && self.jobs[i].job.strategy.as_ref().map(|s| &s.group) == group
+        };
+        let count = |range: std::ops::Range<usize>| {
+            u32::try_from(range.filter(|i| in_group(*i)).count()).unwrap_or(u32::MAX)
+        };
+        let siblings = Siblings {
+            jobs: self.jobs.len() - 1,
+            group_before: count(0..at),
+            group_others: count(0..self.jobs.len()),
+        };
+        Some(expand(&self.jobs[at].job, &ctx, siblings).and_then(|legs| {
+            let clash = legs.iter().find(|leg| {
+                self.jobs
+                    .iter()
+                    .enumerate()
+                    .any(|(i, n)| i != at && n.job.id == leg.job.id)
+            });
+            match clash {
+                Some(leg) => Err(format!(
+                    "the matrix would make a job `{}`, which another job of the run has",
+                    leg.job.id
+                )),
+                None => Ok(legs),
+            }
+        }))
+    }
+
+    /// Ends job `job`, which asked to expand and whose matrix has no
+    /// entry, as skipped, as GitHub does.
+    pub fn no_jobs(&mut self, job: u64, github_ctx: &Value) -> Vec<Action> {
+        let Some(at) = self.position(job) else {
+            return Vec::new();
+        };
+        if self.jobs[at].state != State::Queued {
+            return Vec::new();
+        }
+        let mut actions = Vec::new();
+        self.end(
+            at,
+            Conclusion::Skipped,
+            Some("The matrix has no entries.".to_owned()),
+            &mut actions,
+        );
+        actions.extend(self.advance(github_ctx));
+        actions
+    }
+
+    /// Replaces job `job`, which asked to expand, with its `legs`, each
+    /// with the row id it was recorded under. The first one is normally
+    /// the job's own row. Jobs that required it now require every leg.
+    /// A leg that has an error ends as failed with it; the others
+    /// start as soon as their requirements allow.
+    pub fn expanded(&mut self, job: u64, legs: Vec<(u64, Leg)>, github_ctx: &Value) -> Vec<Action> {
+        let Some(at) = self.position(job) else {
+            return Vec::new();
+        };
+        if self.jobs[at].state != State::Queued || self.jobs[at].job.deferred.is_none() {
+            return Vec::new();
+        }
+        let old = self.jobs.remove(at);
+        let ids: Vec<String> = legs.iter().map(|(_, l)| l.job.id.clone()).collect();
+        let mut failed = Vec::new();
+        let nodes: Vec<Node> = legs
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, leg))| {
+                if let Some(message) = leg.error {
+                    failed.push((i, message));
+                }
+                Node {
+                    environment: leg
+                        .job
+                        .environment
+                        .clone()
+                        .filter(|name| !is_expression(name)),
+                    id,
+                    job: leg.job,
+                    state: State::Waiting,
+                    attempt: old.attempt,
+                    result: None,
+                    message: None,
+                    cancel: 0,
+                }
+            })
+            .collect();
+        self.jobs.splice(at..at, nodes);
+        for node in &mut self.jobs {
+            let Some(p) = node.job.requires.iter().position(|r| *r == old.job.id) else {
+                continue;
+            };
+            node.job.requires.remove(p);
+            for (k, id) in ids.iter().enumerate() {
+                if !node.job.requires.contains(id) {
+                    node.job.requires.insert(p + k, id.clone());
+                }
+            }
+        }
+        self.number_groups();
+        let mut actions = Vec::new();
+        for (i, message) in failed {
+            let at = at + i;
+            // `fail-fast` of an earlier leg may have ended it already.
+            if matches!(self.jobs[at].state, State::Done(_)) {
+                continue;
+            }
+            // The job's `if:` comes first: a job that does not run has
+            // no use for a runner, so an unreadable label is no failure.
+            let by_statuses = self.jobs[at]
+                .job
+                .statuses
+                .values()
+                .any(|s| *s != Statuses::SUCCESS);
+            match self.decide(at, github_ctx, by_statuses) {
+                Ok(true) => {
+                    let (conclusion, note) = self.forgive(at, Conclusion::Failure, github_ctx);
+                    let message = match note {
+                        Some(note) => format!("{message} {note}"),
+                        None => message,
+                    };
+                    self.end(at, conclusion, Some(message), &mut actions);
+                    self.fail_fast(at, &mut actions);
+                }
+                Ok(false) if self.cancelled => {
+                    self.end(at, Conclusion::Cancelled, None, &mut actions);
+                }
+                Ok(false) => self.end(at, Conclusion::Skipped, None, &mut actions),
+                Err(e) => {
+                    let (conclusion, note) = self.forgive(at, Conclusion::Failure, github_ctx);
+                    let message = match note {
+                        Some(note) => format!("{} {note}", if_error(&e)),
+                        None => if_error(&e),
+                    };
+                    self.end(at, conclusion, Some(message), &mut actions);
+                    self.fail_fast(at, &mut actions);
+                }
+            }
+        }
+        actions.extend(self.advance(github_ctx));
+        actions
+    }
+
+    /// Numbers the jobs of each strategy group in graph order and counts
+    /// them, for `strategy.job-index` and `strategy.job-total`.
+    fn number_groups(&mut self) {
+        let mut totals: BTreeMap<String, u32> = BTreeMap::new();
+        for strategy in self.jobs.iter().filter_map(|n| n.job.strategy.as_ref()) {
+            *totals.entry(strategy.group.clone()).or_default() += 1;
+        }
+        let mut seen: BTreeMap<String, u32> = BTreeMap::new();
+        for strategy in self.jobs.iter_mut().filter_map(|n| n.job.strategy.as_mut()) {
+            let next = seen.entry(strategy.group.clone()).or_default();
+            strategy.job_index = *next;
+            strategy.job_total = totals[&strategy.group];
+            *next += 1;
+        }
+    }
+
     /// What `job` reads as `needs`, grouped by the name of the jobs it
     /// requires. Jobs that have not ended are left out.
     #[must_use]
@@ -718,6 +906,14 @@ impl Graph {
             .values()
             .any(|s| *s != Statuses::SUCCESS);
         let problem = match self.decide(at, github_ctx, statuses_ok) {
+            Ok(true) if self.jobs[at].job.deferred.is_some() => {
+                // The job's own `if:` held. Each job it makes meets its
+                // `if:` again with its matrix entry, and settles its own
+                // environment, which can read that entry.
+                self.jobs[at].state = State::Queued;
+                actions.push(Action::Expand(self.jobs[at].id));
+                return;
+            }
             Ok(true) => match self.resolve_environment(at, github_ctx) {
                 Ok(()) => {
                     self.jobs[at].state = State::Queued;
@@ -1809,5 +2005,335 @@ workflows:
         assert_eq!(g.node(2).unwrap().message.as_deref(), Some("newer job"));
         // The run goes on until job 1 stops.
         assert_eq!(g.conclusion(), None);
+    }
+
+    const DYNAMIC: &str = "
+jobs:
+  setup: { runs-on: ubuntu-latest, steps: [], outputs: { os: x } }
+  test: { runs-on: '${{ matrix.os }}', steps: [], if: \"matrix.os != 'skipme'\" }
+  after: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - setup
+      - test:
+          requires: [setup]
+          strategy: { fail-fast: false }
+          matrix: { os: '${{ fromJSON(needs.setup.outputs.os) }}' }
+      - after: { requires: [test] }
+";
+
+    fn dynamic() -> Graph {
+        let config = parse(DYNAMIC).unwrap_or_else(|e| panic!("{e:?}"));
+        let plan = compile(&config, "ci", "refs/heads/main").unwrap();
+        Graph::new(
+            plan.jobs
+                .into_iter()
+                .enumerate()
+                .map(|(i, j)| (i as u64 + 1, j))
+                .collect(),
+        )
+    }
+
+    /// Runs setup with `os` as its output and returns the actions.
+    fn after_setup(g: &mut Graph, os: &str) -> Vec<Action> {
+        assert_eq!(g.advance(&ctx()), [Action::Launch(1)]);
+        run(g, 1);
+        g.finished(1, done(Conclusion::Success, &[("os", os)]), &ctx())
+    }
+
+    #[test]
+    fn a_dynamic_job_expands_when_its_requirements_ended() {
+        let mut g = dynamic();
+        let actions = after_setup(
+            &mut g,
+            r#"["ubuntu-latest","ubuntu-26.04-arm","skipme","windows"]"#,
+        );
+        assert_eq!(actions.last(), Some(&Action::Expand(2)));
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        assert_eq!(legs.len(), 4);
+        let rows = vec![
+            (2, legs[0].clone()),
+            (10, legs[1].clone()),
+            (11, legs[2].clone()),
+            (12, legs[3].clone()),
+        ];
+        let actions = g.expanded(2, rows, &ctx());
+        assert_eq!(
+            actions,
+            [
+                // A label that names no template fails that job alone,
+                // unless its `if:` skips it first.
+                Action::Finished {
+                    job: 11,
+                    conclusion: Conclusion::Skipped
+                },
+                Action::Finished {
+                    job: 12,
+                    conclusion: Conclusion::Failure
+                },
+                Action::Launch(2),
+                Action::Launch(10),
+            ]
+        );
+        assert!(
+            g.node(12)
+                .unwrap()
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("names no runner template")
+        );
+        let ids: Vec<&str> = g.jobs.iter().map(|n| n.job.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "setup",
+                "test (ubuntu-latest)",
+                "test (ubuntu-26.04-arm)",
+                "test (skipme)",
+                "test (windows)",
+                "after"
+            ]
+        );
+        // The job after it waits for every leg.
+        assert_eq!(g.node(3).unwrap().job.requires.len(), 4);
+        let strategy = g.node(10).unwrap().job.strategy.as_ref().unwrap();
+        assert_eq!((strategy.job_index, strategy.job_total), (1, 4));
+        run(&mut g, 2);
+        run(&mut g, 10);
+        g.finished(2, ok(), &ctx());
+        let actions = g.finished(10, ok(), &ctx());
+        // Two legs failed, so the job after them is skipped.
+        assert!(actions.contains(&Action::Finished {
+            job: 3,
+            conclusion: Conclusion::Skipped
+        }));
+    }
+
+    #[test]
+    fn a_matrix_that_cannot_be_read_fails_the_job_and_skips_its_dependents() {
+        let mut g = dynamic();
+        let actions = after_setup(&mut g, "[]");
+        assert_eq!(actions.last(), Some(&Action::Expand(2)));
+        let message = g
+            .expansion(2, &ctx(), &BTreeMap::new())
+            .unwrap()
+            .unwrap_err();
+        let actions = g.failed(2, message, &ctx());
+        assert!(actions.contains(&Action::Finished {
+            job: 2,
+            conclusion: Conclusion::Failure
+        }));
+        assert_eq!(g.node(3).unwrap().state, State::Done(Conclusion::Skipped));
+        assert!(
+            g.node(2)
+                .unwrap()
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("no values")
+        );
+    }
+
+    #[test]
+    fn a_cancelled_run_makes_no_jobs() {
+        let mut g = dynamic();
+        g.advance(&ctx());
+        run(&mut g, 1);
+        g.cancel(&ctx());
+        let actions = g.finished(1, done(Conclusion::Cancelled, &[]), &ctx());
+        assert!(!actions.iter().any(|a| matches!(a, Action::Expand(_))));
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Cancelled));
+    }
+
+    #[test]
+    fn a_failed_setup_skips_the_dynamic_job_without_expanding() {
+        let mut g = dynamic();
+        g.advance(&ctx());
+        run(&mut g, 1);
+        let actions = g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert!(!actions.iter().any(|a| matches!(a, Action::Expand(_))));
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+    }
+
+    fn dynamic_with(job_if: &str, matrix: &str, fail_fast: bool) -> Graph {
+        let yaml = format!(
+            "
+jobs:
+  setup: {{ runs-on: ubuntu-latest, steps: [], outputs: {{ os: x }} }}
+  test: {{ runs-on: '${{{{ matrix.os }}}}', steps: [], if: \"{job_if}\" }}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs:
+      - setup
+      - test:
+          requires: [setup]
+          strategy: {{ fail-fast: {fail_fast} }}
+          matrix: {matrix}
+"
+        );
+        let config = parse(&yaml).unwrap_or_else(|e| panic!("{e:?}"));
+        let plan = compile(&config, "ci", "refs/heads/main").unwrap_or_else(|e| panic!("{e:?}"));
+        Graph::new(
+            plan.jobs
+                .into_iter()
+                .enumerate()
+                .map(|(i, j)| (i as u64 + 1, j))
+                .collect(),
+        )
+    }
+
+    const FROM: &str = "'${{ fromJSON(needs.setup.outputs.os) }}'";
+
+    #[test]
+    fn the_job_if_is_read_before_the_matrix() {
+        let mut g = dynamic_with("needs.setup.outputs.os != '[]'", FROM, true);
+        let actions = after_setup(&mut g, "[]");
+        assert!(!actions.iter().any(|a| matches!(a, Action::Expand(_))));
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+    }
+
+    #[test]
+    fn an_empty_matrix_skips_the_job() {
+        for empty in ["[]", "{}"] {
+            let mut g = dynamic_with("true", FROM, true);
+            let actions = after_setup(&mut g, empty);
+            assert_eq!(actions.last(), Some(&Action::Expand(2)));
+            let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+            assert!(legs.is_empty(), "{empty}");
+            let actions = g.no_jobs(2, &ctx());
+            assert!(actions.contains(&Action::Finished {
+                job: 2,
+                conclusion: Conclusion::Skipped
+            }));
+            assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+        }
+    }
+
+    #[test]
+    fn a_leg_ends_once_when_fail_fast_cancels_a_later_failed_leg() {
+        let mut g = dynamic_with("true", FROM, true);
+        after_setup(&mut g, r#"{"os":["windows","macos"]}"#);
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        let rows = vec![(2, legs[0].clone()), (3, legs[1].clone())];
+        let actions = g.expanded(2, rows, &ctx());
+        for job in [2, 3] {
+            let ended = actions
+                .iter()
+                .filter(|a| matches!(a, Action::Finished { job: j, .. } if *j == job))
+                .count();
+            assert_eq!(ended, 1, "{actions:?}");
+        }
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Failure));
+        assert_eq!(g.node(3).unwrap().state, State::Done(Conclusion::Cancelled));
+    }
+
+    #[test]
+    fn a_leg_whose_if_is_false_is_skipped_not_failed_for_its_label() {
+        let mut g = dynamic_with("matrix.os != 'windows'", FROM, false);
+        after_setup(&mut g, r#"{"os":["windows","ubuntu-latest"]}"#);
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        let rows = vec![(2, legs[0].clone()), (3, legs[1].clone())];
+        g.expanded(2, rows, &ctx());
+        assert_eq!(g.node(2).unwrap().job.id, "test (windows)");
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+        assert_eq!(g.node(3).unwrap().state, State::Queued);
+    }
+
+    #[test]
+    fn only_a_queued_job_expands() {
+        let mut g = dynamic_with("true", FROM, true);
+        g.advance(&ctx());
+        assert!(g.expansion(2, &ctx(), &BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn a_dynamic_job_waits_on_the_statuses_it_requires() {
+        let yaml = "
+jobs:
+  setup: { runs-on: ubuntu-latest, steps: [] }
+  test: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - setup
+      - test:
+          requires: [{ setup: failed }]
+          matrix: { os: '${{ fromJSON(needs.setup.outputs.os) }}' }
+";
+        let config = parse(yaml).unwrap_or_else(|e| panic!("{e:?}"));
+        let plan = compile(&config, "ci", "refs/heads/main").unwrap();
+        let build = || {
+            Graph::new(
+                plan.jobs
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(i, j)| (i as u64 + 1, j))
+                    .collect(),
+            )
+        };
+        // Setup succeeded, so `failed` is not met: no expansion.
+        let mut g = build();
+        g.advance(&ctx());
+        run(&mut g, 1);
+        let actions = g.finished(1, ok(), &ctx());
+        assert!(!actions.iter().any(|a| matches!(a, Action::Expand(_))));
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+        // Setup failed: it expands, even though that is not a success.
+        let mut g = build();
+        g.advance(&ctx());
+        run(&mut g, 1);
+        let actions = g.finished(1, done(Conclusion::Failure, &[]), &ctx());
+        assert!(actions.contains(&Action::Expand(2)), "{actions:?}");
+    }
+
+    #[test]
+    fn each_expanded_job_resolves_its_environment_from_its_matrix_entry() {
+        let yaml = "
+jobs:
+  setup: { runs-on: ubuntu-latest, steps: [], outputs: { zones: x } }
+  deploy:
+    runs-on: ubuntu-latest
+    environment: 'deploy-${{ matrix.zone }}'
+    steps: []
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - setup
+      - deploy:
+          requires: [setup]
+          matrix: { zone: '${{ fromJSON(needs.setup.outputs.zones) }}' }
+";
+        let config = parse(yaml).unwrap_or_else(|e| panic!("{e:?}"));
+        let plan = compile(&config, "ci", "refs/heads/main").unwrap();
+        let mut g = Graph::new(
+            plan.jobs
+                .into_iter()
+                .enumerate()
+                .map(|(i, j)| (i as u64 + 1, j))
+                .collect(),
+        );
+        g.advance(&ctx());
+        run(&mut g, 1);
+        let actions = g.finished(
+            1,
+            done(Conclusion::Success, &[("zones", r#"["a","b"]"#)]),
+            &ctx(),
+        );
+        assert_eq!(actions.last(), Some(&Action::Expand(2)));
+        // The stand-in settles nothing: the matrix feeds the name.
+        assert_eq!(g.node(2).unwrap().environment, None);
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        let rows = vec![(2, legs[0].clone()), (3, legs[1].clone())];
+        let actions = g.expanded(2, rows, &ctx());
+        assert_eq!(actions, [Action::Launch(2), Action::Launch(3)]);
+        assert_eq!(g.node(2).unwrap().environment.as_deref(), Some("deploy-a"));
+        assert_eq!(g.node(3).unwrap().environment.as_deref(), Some("deploy-b"));
     }
 }

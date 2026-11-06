@@ -2148,3 +2148,340 @@ workflows: { ci: { on: { push: {} }, jobs: [t] } }
         &["parameter `strategy`"],
     );
 }
+
+fn expand(
+    job: &PlannedJob,
+    ctx: &serde_json::Value,
+) -> Result<Vec<hatchrun_workflow::Leg>, String> {
+    hatchrun_workflow::expand(job, ctx, hatchrun_workflow::Siblings::default())
+}
+
+const DYNAMIC: &str = "
+jobs:
+  setup: { runs-on: ubuntu-latest, outputs: { m: x }, steps: [] }
+  test: { runs-on: '${{ matrix.os }}', steps: [] }
+  after: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - setup
+      - test:
+          requires: [setup]
+          strategy: { fail-fast: false, max-parallel: 2 }
+          matrix:
+            node: [18, 20]
+            os: ${{ fromJSON(needs.setup.outputs.os) }}
+            include: ${{ fromJSON(needs.setup.outputs.extra) }}
+            exclude: [{ node: 18, os: ubuntu-latest }]
+      - after: { requires: [test] }
+";
+
+fn ctx(os: &str, extra: &str) -> serde_json::Value {
+    serde_json::json!({
+        "needs": { "setup": { "result": "success", "outputs": { "os": os, "extra": extra } } },
+        "github": {}, "inputs": {}, "vars": {}, "hatchrun": {},
+    })
+}
+
+fn deferred_test() -> PlannedJob {
+    let p = plan(DYNAMIC);
+    assert_eq!(p.jobs.len(), 3, "one stand-in job for the matrix");
+    let job = p.jobs[1].clone();
+    assert!(job.deferred.is_some());
+    assert_eq!(p.jobs[2].requires, std::slice::from_ref(&job.id));
+    job
+}
+
+#[test]
+fn a_dynamic_matrix_plans_one_stand_in_job() {
+    let job = deferred_test();
+    assert_eq!(job.id, "test");
+    let strategy = job.strategy.unwrap();
+    assert!(!strategy.fail_fast);
+    assert_eq!(strategy.max_parallel, Some(2));
+}
+
+#[test]
+fn a_dynamic_matrix_expands_as_on_github() {
+    let job = deferred_test();
+    let legs = expand(
+        &job,
+        &ctx(
+            r#"["ubuntu-latest","ubuntu-26.04-arm"]"#,
+            r#"[{"os":"ubuntu-latest","experimental":true},{"os":"windows","node":20}]"#,
+        ),
+    )
+    .unwrap();
+    let ids: Vec<&str> = legs.iter().map(|l| l.job.id.as_str()).collect();
+    // `exclude` takes out node 18 on ubuntu-latest. The first `include`
+    // extends the combination it matches; the second matches none.
+    assert_eq!(
+        ids,
+        [
+            "test (18, ubuntu-26.04-arm)",
+            "test (20, ubuntu-latest)",
+            "test (20, ubuntu-26.04-arm)",
+            "test (20, windows)",
+        ]
+    );
+    assert_eq!(legs[1].job.matrix["experimental"], true);
+    assert_eq!(legs[0].job.strategy.as_ref().unwrap().job_total, 4);
+    for leg in &legs[..3] {
+        assert_eq!(leg.error, None);
+        assert!(leg.job.deferred.is_none());
+    }
+    let JobKind::Run { template } = legs[0].job.kind else {
+        panic!("not a run job");
+    };
+    assert_eq!(template.labels[0], "ubuntu-26.04-arm");
+}
+
+#[test]
+fn an_unknown_label_fails_that_job_alone() {
+    let job = deferred_test();
+    let legs = expand(
+        &job,
+        &ctx(r#"["ubuntu-latest"]"#, r#"[{"os":"windows","node":20}]"#),
+    )
+    .unwrap();
+    assert_eq!(legs.len(), 2);
+    assert_eq!(legs[0].error, None);
+    let message = legs[1].error.as_deref().unwrap();
+    assert!(message.contains("`test (20, windows)`"), "{message}");
+    assert!(message.contains("evaluated to a label that names no runner template"));
+    assert!(!message.contains("`windows`"), "the value is not echoed");
+    // A rerun reads the label again.
+    assert!(legs[1].job.deferred.is_some());
+}
+
+#[test]
+fn a_matrix_that_cannot_be_read_fails_the_job() {
+    let job = deferred_test();
+    for (os, extra, words) in [
+        ("not json", "[]", "fromJSON"),
+        (r#"{"a":1}"#, "[]", "must be a list"),
+        ("[]", "[]", "no values"),
+        (r#"["ubuntu-latest"]"#, "[1]", "must be maps"),
+    ] {
+        let err = expand(&job, &ctx(os, extra)).unwrap_err();
+        assert!(err.contains(words), "{err}");
+    }
+    let many: Vec<u32> = (0..300).collect();
+    let os = serde_json::to_string(&many).unwrap();
+    let err = expand(&job, &ctx(&os, "[]")).unwrap_err();
+    assert!(err.contains("limit is 256"), "{err}");
+}
+
+#[test]
+fn a_whole_matrix_expression_and_a_runs_on_expression() {
+    let p = plan(
+        "
+jobs:
+  t: { runs-on: \"${{ inputs.runner || 'ubuntu-latest' }}\", parallelism: 2, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { matrix: '${{ fromJSON(needs.s.outputs.m) }}' }
+",
+    );
+    let c = serde_json::json!({
+        "needs": { "s": { "outputs": { "m": r#"{"k":["a","b"],"include":[{"k":"c"}]}"# } } },
+        "github": {}, "inputs": { "runner": "ubuntu-26.04-arm" }, "vars": {}, "hatchrun": {},
+    });
+    let legs = expand(&p.jobs[0], &c).unwrap();
+    let ids: Vec<&str> = legs.iter().map(|l| l.job.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "t (a) [1/2]",
+            "t (a) [2/2]",
+            "t (b) [1/2]",
+            "t (b) [2/2]",
+            "t (c) [1/2]",
+            "t (c) [2/2]"
+        ]
+    );
+    assert_eq!(legs[0].job.node, Some((0, 2)));
+}
+
+#[test]
+fn a_runs_on_expression_alone_resolves_each_planned_job() {
+    let p = plan(
+        "
+jobs:
+  t: { runs-on: '${{ matrix.os }}', steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t: { matrix: { os: [ubuntu-latest, ubuntu-26.04-arm] } }
+",
+    );
+    assert_eq!(p.jobs.len(), 2);
+    let legs = expand(&p.jobs[1], &serde_json::json!({})).unwrap();
+    assert_eq!(legs.len(), 1);
+    assert_eq!(legs[0].job.id, "t (ubuntu-26.04-arm)");
+    let JobKind::Run { template } = legs[0].job.kind else {
+        panic!();
+    };
+    assert_eq!(template.labels[0], "ubuntu-26.04-arm");
+}
+
+#[test]
+fn dynamic_matrix_and_runs_on_are_validated() {
+    assert_error(
+        "
+jobs: { t: { runs-on: '${{ secrets.X }}', steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+        &["`runs-on` reads `secrets`"],
+    );
+    assert_error(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [{ t: { matrix: '${{ matrix.x }}' } }]
+",
+        &["`matrix` reads `matrix`"],
+    );
+}
+
+#[test]
+fn a_static_matrix_takes_include_and_exclude_as_on_github() {
+    let p = plan(
+        "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - t:
+          matrix:
+            node: [18, 20]
+            os: [a, b]
+            exclude: [{ node: 18, os: a }]
+            include:
+              - { os: b, extra: yes }
+              - { node: 22, os: c }
+",
+    );
+    let ids: Vec<&str> = p.jobs.iter().map(|j| j.id.as_str()).collect();
+    // `extra` joins the entries of os b, and shows in no name.
+    assert_eq!(ids, ["t (18, b)", "t (20, a)", "t (20, b)", "t (22, c)"]);
+    assert_eq!(p.jobs[0].matrix["extra"], "yes");
+    assert_eq!(p.jobs[2].matrix["extra"], "yes");
+    assert!(!p.jobs[1].matrix.contains_key("extra"));
+    assert_eq!(p.jobs[3].strategy.as_ref().unwrap().job_total, 4);
+}
+
+#[test]
+fn a_matrix_of_include_only_runs_each_entry() {
+    let p = plan(
+        "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [{ t: { matrix: { include: [{ os: a }, { os: b }] } } }]
+",
+    );
+    assert_eq!(p.jobs.len(), 2);
+}
+
+#[test]
+fn include_matches_with_the_equality_exclude_uses() {
+    let job = deferred_test();
+    // `20` and `"20"` are the same text, as in `exclude`.
+    let legs = expand(
+        &job,
+        &ctx(
+            r#"["ubuntu-latest"]"#,
+            r#"[{"os":"ubuntu-latest","node":"20","tag":"x"}]"#,
+        ),
+    )
+    .unwrap();
+    assert_eq!(legs.len(), 1);
+    assert_eq!(legs[0].job.matrix["tag"], "x");
+}
+
+#[test]
+fn an_empty_matrix_makes_no_job_and_a_big_run_is_refused() {
+    let job = deferred_test();
+    let c = |m: &str| {
+        serde_json::json!({
+            "needs": { "setup": { "outputs": { "m": m } } },
+            "github": {}, "inputs": {}, "vars": {}, "hatchrun": {},
+        })
+    };
+    let p = plan(
+        "
+jobs:
+  t: { runs-on: ubuntu-latest, parallelism: 64, steps: [{ run: x }] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [{ t: { matrix: '${{ fromJSON(needs.setup.outputs.m) }}' } }]
+",
+    );
+    for empty in ["[]", "{}"] {
+        assert!(expand(&p.jobs[0], &c(empty)).unwrap().is_empty(), "{empty}");
+    }
+    let err = expand(&p.jobs[0], &c(r#"{"k":[1,2,3,4,5]}"#)).unwrap_err();
+    assert!(err.contains("limit is 256"), "{err}");
+    let _ = job;
+}
+
+#[test]
+fn a_matrix_is_numbered_and_limited_with_the_jobs_around_it() {
+    let job = deferred_test();
+    let c = ctx(r#"["ubuntu-latest","ubuntu-26.04-arm"]"#, "[]");
+    let siblings = hatchrun_workflow::Siblings {
+        jobs: 5,
+        group_before: 2,
+        group_others: 3,
+    };
+    let legs = hatchrun_workflow::expand(&job, &c, siblings).unwrap();
+    // The exclude leaves three of four entries.
+    let numbers: Vec<(u32, u32)> = legs
+        .iter()
+        .map(|l| {
+            let s = l.job.strategy.as_ref().unwrap();
+            (s.job_index, s.job_total)
+        })
+        .collect();
+    assert_eq!(numbers, [(2, 6), (3, 6), (4, 6)]);
+    let crowded = hatchrun_workflow::Siblings {
+        jobs: 254,
+        ..Default::default()
+    };
+    let err = hatchrun_workflow::expand(&job, &c, crowded).unwrap_err();
+    assert!(err.contains("limit is 256"), "{err}");
+}
+
+#[test]
+fn matrix_and_runs_on_read_only_the_vars_the_host_gives() {
+    let p = plan(
+        "
+jobs:
+  t: { runs-on: \"${{ vars.RUNNER }}\", steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [{ t: { matrix: { k: '${{ fromJSON(vars.LIST) }}' } } }]
+",
+    );
+    // An environment-only var is not in what the host passes.
+    let c = serde_json::json!({
+        "needs": {}, "github": {}, "inputs": {}, "hatchrun": {},
+        "vars": { "LIST": "[1]" },
+    });
+    let legs = expand(&p.jobs[0], &c).unwrap();
+    let message = legs[0].error.as_deref().unwrap();
+    assert!(message.contains("evaluated to a label"), "{message}");
+}

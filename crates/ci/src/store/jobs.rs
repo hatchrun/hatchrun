@@ -154,6 +154,18 @@ const RESET_JOB: &str = "UPDATE ci_jobs SET status = 'waiting', attempt = $2, la
      held = NULL, steps = '[]', environment_url = NULL, updated_at = $3 \
      WHERE id = $1 AND attempt < $2";
 
+/// Makes job `$1`, the stand-in of a job that reads its matrix or
+/// `runs-on` when it is ready, the first job it expanded to: its plan
+/// id `$2`, template `$3`, strategy group `$4`, `max_parallel` `$5` and
+/// needs `$6`, at attempt `$7` or later, at `$8`. Repeating it changes
+/// nothing more.
+const RETARGET_JOB: &str = "UPDATE ci_jobs SET plan_id = $2, template = $3, strategy_group = $4, \
+     max_parallel = $5, needs = $6::jsonb, attempt = GREATEST(attempt, $7), updated_at = $8 \
+     WHERE id = $1";
+
+/// Sets the plan ids job `$1` waits on to `$2`, a JSON array, at `$3`.
+const SET_NEEDS: &str = "UPDATE ci_jobs SET needs = $2::jsonb, updated_at = $3 WHERE id = $1";
+
 /// Queues attempt `$2` of job `$1` at `$3`, with the environment `$4` the
 /// graph settled on when there is one. Only a job of that attempt
 /// that is waiting, or already queued, changes: one that is launching
@@ -376,6 +388,48 @@ pub async fn insert_jobs(
         .into_iter()
         .map(|row| (row.plan_id, row.id))
         .collect())
+}
+
+/// Makes job `job_id` the first job it expanded to, `new`, at
+/// `attempt`. See [`RETARGET_JOB`].
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn retarget_job(
+    db: &Db,
+    job_id: u64,
+    new: &NewJob,
+    attempt: u32,
+    now: u64,
+) -> Result<()> {
+    let needs = serde_json::to_string(&new.needs).map_err(worker::Error::from)?;
+    db.run(
+        RETARGET_JOB,
+        &params![
+            job_id,
+            &new.plan_id,
+            new.template.as_deref(),
+            new.strategy_group.as_deref(),
+            new.max_parallel,
+            needs,
+            attempt,
+            now
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Sets the plan ids job `job_id` waits on.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn set_needs(db: &Db, job_id: u64, needs: &[String], now: u64) -> Result<()> {
+    let needs = serde_json::to_string(needs).map_err(worker::Error::from)?;
+    db.run(SET_NEEDS, &params![job_id, needs, now]).await?;
+    Ok(())
 }
 
 /// The jobs of `run_id` in plan order.
