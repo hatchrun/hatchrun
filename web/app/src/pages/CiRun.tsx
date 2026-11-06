@@ -82,7 +82,7 @@ export function CiRun({ session, role, route }: RunPageProps) {
     );
   }
   return (
-    <div className="mx-auto flex w-full max-w-[1400px] flex-col gap-4">
+    <div className="mx-auto flex w-full max-w-[1400px] flex-col gap-3">
       <Await loaded={detail} retry={reload}>
         {(data) =>
           // The URL names the repository; a run of another one is not shown under it.
@@ -139,7 +139,7 @@ function RunScreen({
   return (
     <>
       <Crumbs route={route} run={run} job={job} />
-      <Header run={run} access={data.access} now={now} reload={reload} />
+      <Header run={run} jobs={jobs} access={data.access} now={now} reload={reload} />
       {stale && (
         <p className="font-mono text-[13px] text-fg-3" role="status">
           Could not refresh: {stale.message}. Showing the last result.
@@ -152,7 +152,7 @@ function RunScreen({
         role={role}
         reload={reload}
       />
-      <div className="flex h-[calc(100dvh-12.5rem)] min-h-[520px] gap-4 max-lg:h-auto max-lg:flex-col">
+      <div className="flex h-[calc(100dvh-9.5rem)] min-h-[520px] gap-4 max-lg:h-auto max-lg:flex-col">
         <JobsPanel
           key={run.id}
           run={run}
@@ -160,7 +160,7 @@ function RunScreen({
           selected={job?.id ?? null}
           now={now}
         />
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col max-lg:h-[70vh]">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col max-lg:h-[75vh] max-lg:flex-none">
           {job === undefined ? (
             <p className="muted">This run has no such job.</p>
           ) : job.has_log || job.status !== "queued" ? (
@@ -242,11 +242,13 @@ function Crumbs({
 
 function Header({
   run,
+  jobs,
   access,
   now,
   reload,
 }: {
   run: Run;
+  jobs: CiJob[];
   access: CiRunDetail["access"];
   now: number;
   reload: () => void;
@@ -256,6 +258,9 @@ function Header({
   const finished = run.status === "completed";
   const took = duration((run.completed_at ?? now) - run.created_at);
   const branch = run.branch ?? shortRef(run.ref);
+  // Held for approval and nothing running: the run waits on a person, not the queue.
+  const awaiting = !finished && jobs.some((job) => job.held === "approval") && !jobs.some((job) => job.status === "in_progress");
+  const status = awaiting ? "waiting" : ciStatus(run.status, run.conclusion);
 
   const cancel = async () => {
     if (
@@ -278,90 +283,77 @@ function Header({
   };
 
   return (
-    <div className="flex flex-wrap items-start justify-between gap-4">
-      <div className="flex min-w-0 flex-col gap-2">
-        <StatusPill
-          status={ciStatus(run.status, run.conclusion)}
-          className="self-start"
-        >
-          <span className="font-normal text-fg-2">
-            {finished ? `took ${took}` : `for ${took}`}
-          </span>
-        </StatusPill>
-        <h1 className="page-title break-words" title={run.workflow}>
-          {run.workflow}{" "}
-          <span className="font-mono text-xl font-medium tracking-normal text-fg-3 normal-case [font-stretch:100%]">
-            #{run.run_number}
-          </span>
-        </h1>
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-1 font-mono text-[13px]">
-          <span className="flex min-w-0 items-center gap-2">
-            <span className="cap">branch</span>
-            <Truncate value={branch} copy className="max-w-[260px] text-fg" />
-          </span>
-          <span className="flex items-center gap-2">
-            <span className="cap">sha</span>
-            <a
-              href={`https://github.com/${run.repository}/commit/${run.sha}`}
-              aria-label={`Commit ${shortSha(run.sha)} on GitHub, opens github.com`}
-              className="inline-flex items-center gap-1.5 text-fg underline decoration-control underline-offset-4 hover:text-brand"
-            >
-              {shortSha(run.sha)}
-              <ExternalLink
-                size={10}
-                aria-hidden="true"
-                className="text-fg-3"
-              />
-            </a>
-          </span>
-          <span className="flex items-center gap-2">
-            <span className="cap">actor</span>
-            <span className="text-fg">{run.actor}</span>
-          </span>
-          <span className="flex items-center gap-2">
-            <span className="cap">event</span>
-            <span className="text-fg">{run.event}</span>
-          </span>
-          {run.pull_request && (
-            <span className="flex min-w-0 items-center gap-2">
-              <span className="cap">pull request</span>
-              <Link href={repoUrl(run.repository, "pulls")} title={run.pull_request.title} className="max-w-[320px] truncate text-fg underline decoration-control underline-offset-4 hover:text-brand">
-                #{run.pull_request.number} {run.pull_request.title}
-              </Link>
+    <div className="flex flex-col gap-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+          <h1 className="page-title min-w-0 break-words" title={run.workflow}>
+            {run.workflow}{" "}
+            <span className="font-mono text-xl font-medium tracking-normal text-fg-3 normal-case [font-stretch:100%]">
+              #{run.run_number}
             </span>
-          )}
-          {run.run_attempt > 1 && (
-            <span className="flex items-center gap-2">
-              <span className="cap">attempt</span>
-              <span className="text-fg">{run.run_attempt}</span>
+          </h1>
+          <StatusPill status={status} label={awaiting ? "Waiting for approval" : undefined}>
+            <span className="font-normal text-fg-2">
+              {awaiting ? `for ${took}` : finished ? `took ${took}` : `for ${took}`}
             </span>
-          )}
+          </StatusPill>
         </div>
-        {error !== null && (
-          <p role="alert" className="font-mono text-[13px] text-failed">
-            {error}
-          </p>
-        )}
+        <div className="flex items-center gap-2">
+          {access !== "read" && !finished && (
+            <button type="button" className={BTN} disabled={busy} onClick={() => void cancel()}>
+              Cancel run
+            </button>
+          )}
+          <span className="inline-flex items-center gap-1 font-mono text-[13px] text-fg-3">
+            <CopyButton text={window.location.href.split("#")[0] ?? ""} label="Copy the link to this run" />
+            Copy link
+          </span>
+        </div>
       </div>
-      <div className="flex items-center gap-2">
-        {access !== "read" && !finished && (
-          <button
-            type="button"
-            className={BTN}
-            disabled={busy}
-            onClick={() => void cancel()}
-          >
-            Cancel run
-          </button>
-        )}
-        <span className="inline-flex items-center gap-1 font-mono text-[13px] text-fg-3">
-          <CopyButton
-            text={window.location.href.split("#")[0] ?? ""}
-            label="Copy the link to this run"
-          />
-          Copy link
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 font-mono text-[13px]">
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="cap">branch</span>
+          <Truncate value={branch} copy className="max-w-[260px] text-fg" />
         </span>
+        <span className="flex items-center gap-2">
+          <span className="cap">sha</span>
+          <a
+            href={`https://github.com/${run.repository}/commit/${run.sha}`}
+            aria-label={`Commit ${shortSha(run.sha)} on GitHub, opens github.com`}
+            className="inline-flex items-center gap-1.5 text-fg underline decoration-control underline-offset-4 hover:text-brand"
+          >
+            {shortSha(run.sha)}
+            <ExternalLink size={10} aria-hidden="true" className="text-fg-3" />
+          </a>
+        </span>
+        <span className="flex items-center gap-2">
+          <span className="cap">actor</span>
+          <span className="text-fg">{run.actor}</span>
+        </span>
+        <span className="flex items-center gap-2">
+          <span className="cap">event</span>
+          <span className="text-fg">{run.event}</span>
+        </span>
+        {run.pull_request && (
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="cap">pull request</span>
+            <Link href={repoUrl(run.repository, "pulls")} title={run.pull_request.title} className="max-w-[320px] truncate text-fg underline decoration-control underline-offset-4 hover:text-brand">
+              #{run.pull_request.number} {run.pull_request.title}
+            </Link>
+          </span>
+        )}
+        {run.run_attempt > 1 && (
+          <span className="flex items-center gap-2">
+            <span className="cap">attempt</span>
+            <span className="text-fg">{run.run_attempt}</span>
+          </span>
+        )}
       </div>
+      {error !== null && (
+        <p role="alert" className="font-mono text-[13px] text-failed">
+          {error}
+        </p>
+      )}
     </div>
   );
 }
