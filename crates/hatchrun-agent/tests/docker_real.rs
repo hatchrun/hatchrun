@@ -165,6 +165,35 @@ fn uses_docker_runs_an_image_and_reads_its_outputs() {
 }
 
 #[test]
+fn a_service_without_a_health_check_is_ready_at_once() {
+    let Some(_guard) = enabled() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = make::document(vec![make::step("echo ok")]);
+    doc.job.services = BTreeMap::from([
+        (
+            "plain".to_owned(),
+            Container {
+                image: image(),
+                ..Container::default()
+            },
+        ),
+        (
+            "none".to_owned(),
+            Container {
+                image: image(),
+                options: Some("--no-healthcheck".to_owned()),
+                ..Container::default()
+            },
+        ),
+    ]);
+    let out = exec(dir.path(), &doc);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert_eq!(leftovers(), Vec::<String>::new());
+}
+
+#[test]
 fn a_failing_service_health_check_fails_the_job_and_cleans_up() {
     let Some(_guard) = enabled() else {
         return;

@@ -18,7 +18,9 @@ pub struct Create<'a> {
     /// The hostname other containers on the network reach it by.
     pub alias: Option<&'a str>,
     pub workdir: Option<&'a str>,
-    pub env: Vec<(String, String)>,
+    /// `-e` flags, from `env_flags`: values travel in the docker
+    /// client's environment, not on its command line.
+    pub env: Vec<String>,
     pub ports: Vec<String>,
     pub volumes: Vec<String>,
     /// The user's `options`, already split.
@@ -51,9 +53,7 @@ impl Create<'_> {
         if let Some(alias) = self.alias {
             out.extend(["--network-alias".to_owned(), alias.to_owned()]);
         }
-        for (key, value) in &self.env {
-            out.extend(["-e".to_owned(), format!("{key}={value}")]);
-        }
+        out.extend(self.env.iter().cloned());
         for port in &self.ports {
             out.extend(["-p".to_owned(), port.clone()]);
         }
@@ -140,8 +140,9 @@ pub fn parse_health(output: &str) -> Health {
 }
 
 /// The `--format` that prints the health status, or nothing for a
-/// container with no health check.
-pub const HEALTH_FORMAT: &str = "{{if .Config.Healthcheck}}{{print .State.Health.Status}}{{end}}";
+/// container with no health state. That includes an image whose check is
+/// `NONE`, which `--no-healthcheck` sets and which has no `State.Health`.
+pub const HEALTH_FORMAT: &str = "{{if .State.Health}}{{print .State.Health.Status}}{{end}}";
 
 /// Whether a volume's source names a Docker volume rather than a path:
 /// `mydata:/data` does, `/data:/data` and `./data:/data` do not.
@@ -209,7 +210,7 @@ mod tests {
             network: Some("net"),
             alias: Some("db"),
             workdir: Some("/__w/repo/repo"),
-            env: vec![("A".into(), "1".into())],
+            env: vec!["-e".into(), "A".into()],
             ports: vec!["5432:5432".into()],
             volumes: vec!["/a:/b".into()],
             options: vec!["--cpus".into(), "1".into()],
@@ -220,7 +221,7 @@ mod tests {
         assert_eq!(
             create.args().join(" "),
             "--name c1 --label hatchrun-1 --workdir /__w/repo/repo --network net \
-             --network-alias db -e A=1 -p 5432:5432 -v /a:/b --cpus 1 \
+             --network-alias db -e A -p 5432:5432 -v /a:/b --cpus 1 \
              --entrypoint tail postgres:17 -f /dev/null"
         );
     }

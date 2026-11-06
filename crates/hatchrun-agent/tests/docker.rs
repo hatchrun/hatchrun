@@ -29,7 +29,10 @@ network)
 login)
   cat > "$dir/login.pw"
   echo "login-stdin:$(cat "$dir/login.pw")" >> "$dir/calls.log" ;;
+volume)
+  [ "$2" = inspect ] && { [ -f "$dir/volume_exists" ] && exit 0; exit 1; } ;;
 pull)
+  [ -f "$dir/slow_pull" ] && sleep 5
   if [ -f "$dir/fail_pull" ]; then cat "$dir/login.pw" >&2; exit 1; fi ;;
 create) echo cid ;;
 port) echo "5432/tcp -> 0.0.0.0:49153"; echo "5432/tcp -> [::]:49153" ;;
@@ -156,8 +159,8 @@ fn a_job_container_runs_steps_through_exec() {
     for want in [
         "--workdir /__w/repo/repo".to_owned(),
         "--network hatchrun_network_".to_owned(),
-        "-e CI=true".to_owned(),
-        "-e MODE=acme/repo".to_owned(),
+        "-e CI".to_owned(),
+        "-e MODE".to_owned(),
         "-p 8080:80".to_owned(),
         "-v /data:/data".to_owned(),
         format!("-v {}:/__w", work.display()),
@@ -166,6 +169,8 @@ fn a_job_container_runs_steps_through_exec() {
     ] {
         assert!(create.contains(&want), "{want} not in {create}");
     }
+    // Values are in the docker client's environment, not its arguments.
+    assert!(!create.contains("acme/repo"), "{create}");
     assert!(find(&calls, "start hatchrun_job_").starts_with("start "));
 
     let exec = find(&calls, "exec --workdir");
@@ -229,13 +234,14 @@ fn services_get_aliases_ports_and_a_health_wait() {
     let create = find(&calls, "create --name hatchrun_db_");
     for want in [
         "--network-alias db",
-        "-e POSTGRES_PASSWORD=pw",
+        "-e POSTGRES_PASSWORD",
         "-p 5432",
         "--health-cmd pg_isready",
         "postgres:17",
     ] {
         assert!(create.contains(want), "{want} not in {create}");
     }
+    assert!(!create.contains("=pw"), "{create}");
     // No job container: steps run on the machine, not through exec.
     assert!(!calls.iter().any(|c| c.starts_with("exec ")), "{calls:#?}");
     assert_eq!(setup.result().outputs["port"], "49153");
@@ -253,6 +259,7 @@ fn an_unhealthy_service_fails_the_job_before_any_step() {
     assert!(text.contains("Service db did not become healthy"), "{text}");
     assert!(text.contains("db log line"), "{text}");
     assert!(!text.lines().any(|l| l == "should-not-run"), "{text}");
+    assert!(text.contains("== Stop containers"), "{text}");
     let result = setup.result();
     assert_eq!(result.conclusion, Conclusion::Failure);
     assert_eq!(result.steps[0].outcome, Conclusion::Skipped);
@@ -352,6 +359,11 @@ fn uses_docker_runs_the_image_with_the_runners_mounts() {
         assert!(run.contains(want), "{want} not in {run}");
     }
     assert!(!run.contains("--network"), "{run}");
+    // The host's environment file and PATH stay out of the container.
+    assert!(
+        !run.contains("JAVA_HOME") && !run.contains("-e PATH"),
+        "{run}"
+    );
     assert!(stdout(&out).contains("RUN run --rm"), "{}", stdout(&out));
 }
 
@@ -426,4 +438,100 @@ fn a_job_without_containers_never_calls_docker() {
     let out = setup.run(&make::document(vec![make::step("echo plain")]));
     assert_eq!(out.status.code(), Some(0));
     assert!(setup.calls().is_empty(), "{:#?}", setup.calls());
+}
+
+#[test]
+fn empty_credentials_skip_the_login_and_still_pull() {
+    let setup = Setup::new();
+    let mut doc = make::document(vec![make::step("true")]);
+    // A fork's pull request has no secrets: the password reads empty.
+    doc.job.container = Some(Container {
+        credentials: Some(Credentials {
+            username: "bot".to_owned(),
+            password: "${{ secrets.MISSING }}".to_owned(),
+        }),
+        ..image("postgres:17")
+    });
+    let out = setup.run(&doc);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let calls = setup.calls();
+    assert!(!calls.iter().any(|c| c.starts_with("login")), "{calls:#?}");
+    assert!(calls.contains(&"pull postgres:17".to_owned()));
+}
+
+#[test]
+fn a_dockerfile_may_start_with_dot_slash() {
+    let setup = Setup::new();
+    let act = setup.path().join("work/repo/repo/act");
+    std::fs::create_dir_all(&act).unwrap();
+    std::fs::write(
+        act.join("action.yml"),
+        "name: d\nruns:\n  using: docker\n  image: ./Dockerfile\n",
+    )
+    .unwrap();
+    let out = setup.run(&make::document(vec![uses("./act", &[])]));
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(find(&setup.calls(), "build --label").contains("Dockerfile"));
+}
+
+fn with_volume(name: &str) -> Container {
+    Container {
+        volumes: vec![format!("{name}:/data")],
+        ..image("postgres")
+    }
+}
+
+#[test]
+fn only_volumes_the_job_made_are_removed_and_never_forced() {
+    let setup = Setup::new();
+    let mut doc = make::document(vec![make::step("true")]);
+    doc.job.services = BTreeMap::from([("db".to_owned(), with_volume("fresh"))]);
+    assert_eq!(setup.run(&doc).status.code(), Some(0));
+    assert!(
+        setup.calls().contains(&"volume rm fresh".to_owned()),
+        "{:#?}",
+        setup.calls()
+    );
+
+    let setup = Setup::new();
+    setup.set("volume_exists", "");
+    doc.job.services = BTreeMap::from([("db".to_owned(), with_volume("kept"))]);
+    assert_eq!(setup.run(&doc).status.code(), Some(0));
+    assert!(
+        !setup.calls().iter().any(|c| c.starts_with("volume rm")),
+        "{:#?}",
+        setup.calls()
+    );
+}
+
+#[test]
+fn a_timeout_during_a_pull_stops_it_and_cleans_up() {
+    let setup = Setup::new();
+    setup.set("slow_pull", "");
+    let mut doc = make::document(vec![make::step("echo never")]);
+    doc.job.timeout_minutes = 1;
+    doc.job.container = Some(image("postgres"));
+    let started = std::time::Instant::now();
+    let out = setup.run(&doc);
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    let text = stdout(&out);
+    assert!(text.contains("The operation was canceled."), "{text}");
+    // A job that ran out of time is a failure; no step ran.
+    assert_eq!(setup.result().conclusion, Conclusion::Failure);
+    assert_eq!(setup.result().steps[0].outcome, Conclusion::Skipped);
+    assert!(setup.calls().iter().any(|c| c.starts_with("network rm")));
+}
+
+#[test]
+fn the_job_context_keeps_the_machines_paths_for_host_side_expansion() {
+    let setup = Setup::new();
+    let mut doc = make::document(vec![make::step("true")]);
+    doc.job.container = Some(image("alpine"));
+    doc.job.outputs = BTreeMap::from([("ws".to_owned(), "${{ github.workspace }}".to_owned())]);
+    assert_eq!(setup.run(&doc).status.code(), Some(0));
+    let ws = setup.result().outputs["ws"].clone();
+    assert!(
+        ws.ends_with("work/repo/repo") && !ws.starts_with("/__w"),
+        "{ws}"
+    );
 }

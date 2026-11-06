@@ -248,7 +248,8 @@ async fn finish(
         if let Some(proxy) = proxy {
             proxy.stop().await;
         }
-        return job.result(Conclusion::Failure, BTreeMap::new(), summaries);
+        let conclusion = conclusion_of(job.status, timed_out, external);
+        return job.result(conclusion, BTreeMap::new(), summaries);
     }
     // GitHub runs every `pre` before the first step, in step order.
     job.pre_phase(sink).await;
@@ -273,16 +274,25 @@ async fn finish(
         proxy.stop().await;
     }
 
-    // GitHub reports a job that ran out of time as failed.
+    let conclusion = conclusion_of(job.status, timed_out, external);
+    job.result(conclusion, outputs, summaries)
+}
+
+/// How the job ended, from its status. A job that ran out of time is
+/// reported as failed, as the hosted runner does.
+fn conclusion_of(
+    status: JobStatus,
+    timed_out: &std::sync::atomic::AtomicBool,
+    external: &tokio::sync::watch::Receiver<u32>,
+) -> Conclusion {
     let timed_out = timed_out.load(std::sync::atomic::Ordering::Relaxed) && *external.borrow() == 0;
-    let conclusion = match job.status {
+    match status {
         JobStatus::Success => Conclusion::Success,
         JobStatus::Failure => Conclusion::Failure,
         JobStatus::Cancelled if timed_out => Conclusion::Failure,
         JobStatus::Cancelled => Conclusion::Cancelled,
         JobStatus::Skipped => Conclusion::Skipped,
-    };
-    job.result(conclusion, outputs, summaries)
+    }
 }
 
 /// Passes the agent's stop requests on to the job and adds the job's
@@ -930,14 +940,16 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
     let workspace = &layout.workspace;
     let files = StepFiles::create(&layout.temp, index, job.owner).map_err(|e| format!("{e:#}"))?;
 
+    // A step in the job container sees the container's paths.
+    let base = job.step_ctx();
     let mut step_env = BTreeMap::new();
     for (key, value) in &step.env {
-        let text = interp(value, &job.ctx, workspace, job.status)
-            .map_err(|e| format!("env {key}: {e}"))?;
+        let text =
+            interp(value, &base, workspace, job.status).map_err(|e| format!("env {key}: {e}"))?;
         step_env.insert(key.clone(), text);
     }
     // The step's own expressions see its env too.
-    let mut ctx = job.ctx.clone();
+    let mut ctx = base;
     let mut visible = job.env_context();
     visible.extend(step_env.clone());
     ctx.set_env(&visible);

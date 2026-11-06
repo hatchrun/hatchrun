@@ -79,7 +79,9 @@ fn maps(job: &Job<'_>) -> Vec<(String, String)> {
 /// The relative path of a Dockerfile, when it stays inside the action.
 fn dockerfile(file: &str) -> Result<&str, String> {
     let path = Path::new(file);
-    let inside = path.components().all(|c| matches!(c, Component::Normal(_)));
+    let inside = path
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
     if file.is_empty() || !inside {
         return Err(format!(
             "`image: {file}` must name a Dockerfile inside the action"
@@ -180,6 +182,11 @@ impl Job<'_> {
             let _ = nix::unistd::chown(&home, Some(uid), Some(gid));
         }
 
+        // Only the runner's variables and the step's go in, never the
+        // host's environment file or its `PATH`.
+        if let Err(message) = self.load_host_env() {
+            return failed(self, sink, &message);
+        }
         let mut env = match base_env(self, &files, action_name) {
             Ok(env) => env,
             Err(message) => return failed(self, sink, &message),

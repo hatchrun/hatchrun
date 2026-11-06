@@ -565,14 +565,16 @@ impl Job<'_> {
         name: &str,
     ) -> Result<Evaluated, String> {
         let workspace = &self.layout.workspace;
+        // A step in the job container sees the container's paths.
+        let base = self.step_ctx();
         let mut env = BTreeMap::new();
         for (key, value) in &step.env {
-            let text = interp(value, &self.ctx, workspace, self.status)
+            let text = interp(value, &base, workspace, self.status)
                 .map_err(|e| format!("env {key}: {e}"))?;
             env.insert(key.clone(), text);
         }
         // The step's own expressions see its env too.
-        let mut caller = self.ctx.clone();
+        let mut caller = base;
         let mut visible = self.env_context();
         visible.extend(env.clone());
         caller.set_env(&visible);

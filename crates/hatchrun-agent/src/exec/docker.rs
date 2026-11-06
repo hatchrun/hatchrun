@@ -45,6 +45,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 /// The most health checks a service gets, as on GitHub: a wait doubles
 /// each time, so the last starts after about a minute.
 const HEALTH_TRIES: u32 = 6;
+/// What a start that was stopped reports, as a step does.
+const CANCELED: &str = "The operation was canceled.";
 /// The most lines of a container's log printed when it fails.
 const LOG_TAIL: &str = "40";
 
@@ -77,6 +79,8 @@ pub(super) struct DockerState {
     bin: Option<PathBuf>,
     /// Dockerfile actions already built, by action directory and file.
     built: BTreeMap<String, String>,
+    /// The job is being cleaned up: commands no longer stop on cancel.
+    cleaning: bool,
 }
 
 /// The container the job's steps run in.
@@ -109,10 +113,7 @@ impl DockerState {
 
     /// Whether the job started anything that needs removing.
     fn has_work(&self) -> bool {
-        self.network.is_some()
-            || !self.containers.is_empty()
-            || !self.images.is_empty()
-            || self.config.is_some()
+        self.network.is_some() || !self.containers.is_empty() || !self.images.is_empty()
     }
 }
 
@@ -199,8 +200,22 @@ impl Job<'_> {
         args: &[String],
         stdin: Option<&str>,
     ) -> Result<Captured, String> {
+        self.docker_capture_env(args, stdin, &BTreeMap::new()).await
+    }
+
+    /// [`Self::docker_capture`] with more variables in the docker
+    /// client's environment, for `-e KEY` flags to read. The command
+    /// stops when the job is cancelled, unless the job is being cleaned
+    /// up.
+    pub(super) async fn docker_capture_env(
+        &mut self,
+        args: &[String],
+        stdin: Option<&str>,
+        extra: &BTreeMap<String, String>,
+    ) -> Result<Captured, String> {
         let bin = self.docker_bin()?;
-        let env = self.docker_env()?;
+        let mut env = self.docker_env()?;
+        env.extend(extra.clone());
         let mut command = Command::new(&bin);
         command
             .args(args)
@@ -223,10 +238,15 @@ impl Job<'_> {
                 .map_err(|e| format!("write to docker: {e}"))?;
             drop(pipe);
         }
-        let output = tokio::time::timeout(COMMAND_TIMEOUT, child.wait_with_output())
-            .await
-            .map_err(|_| "docker did not finish in time".to_owned())?
-            .map_err(|e| format!("wait for docker: {e}"))?;
+        let mut cancel = super::wait_for(self.cancel_requests.clone(), 1);
+        let cleaning = self.docker.cleaning;
+        let output = tokio::select! {
+            output = tokio::time::timeout(COMMAND_TIMEOUT, child.wait_with_output()) => output
+                .map_err(|_| "docker did not finish in time".to_owned())?
+                .map_err(|e| format!("wait for docker: {e}"))?,
+            // Dropping the child kills it.
+            () = &mut cancel, if !cleaning => return Err(CANCELED.to_owned()),
+        };
         Ok(Captured {
             code: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -291,7 +311,12 @@ impl Job<'_> {
     /// `docker pull` with the container's registry login, when it has
     /// one. Pull output goes to the log.
     async fn pull(&mut self, c: &Resolved, sink: &mut dyn Sink) -> Result<(), String> {
-        if let Some((username, password)) = &c.credentials {
+        // Like the runner, log in only with both values: a fork's pull
+        // request gets empty secrets and can still pull a public image.
+        if let Some((username, password)) = &c.credentials
+            && !username.is_empty()
+            && !password.is_empty()
+        {
             self.masker.add(password);
             let registry = args::registry_of(&c.image).map(str::to_owned);
             let login = args::login_args(registry.as_deref(), username);
@@ -375,14 +400,20 @@ impl Job<'_> {
         let started = std::time::Instant::now();
         sink.step_started(index, "Initialize containers");
         let result = self.start_containers_inner(sink).await;
-        let outcome = if result.is_ok() {
-            Conclusion::Success
-        } else {
-            Conclusion::Failure
+        let cancelled = result.is_err() && *self.cancel_requests.borrow() >= 1;
+        let outcome = match (&result, cancelled) {
+            (Ok(()), _) => Conclusion::Success,
+            (Err(_), true) => Conclusion::Cancelled,
+            (Err(_), false) => Conclusion::Failure,
         };
         if let Err(message) = &result {
             self.say(sink, Line::Error(message));
-            self.set_status(hatchrun_workflow::JobStatus::Failure);
+            if cancelled {
+                // Starts the grace period and sets the job's status.
+                self.note_cancel();
+            } else {
+                self.set_status(hatchrun_workflow::JobStatus::Failure);
+            }
         }
         sink.step_finished(
             index,
@@ -438,23 +469,22 @@ impl Job<'_> {
                 sink,
                 Line::Note(&format!("Starting service {id} ({})", service.image)),
             );
+            let (flags, cli_env) = env_flags(service.env.clone());
             let create = Create {
                 name: &name,
                 label: &label,
                 network: Some(&network),
                 alias: Some(id),
-                env: service
-                    .env
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
+                env: flags.clone(),
                 ports: service.ports.clone(),
                 volumes: service.volumes.clone(),
                 options: service.options.clone(),
                 image: &service.image,
                 ..Create::default()
             };
-            let port_map = self.create_and_start(&create, &service.volumes).await?;
+            let port_map = self
+                .create_and_start(&create, &service.volumes, &cli_env)
+                .await?;
             started.push(Service {
                 id: id.clone(),
                 name,
@@ -477,18 +507,31 @@ impl Job<'_> {
         &mut self,
         create: &Create<'_>,
         volumes: &[String],
+        cli_env: &BTreeMap<String, String>,
     ) -> Result<BTreeMap<String, String>, String> {
+        // A named volume that does not exist yet is made by `docker
+        // create` for this job, and only those are removed afterwards.
         for volume in volumes {
             if let Some(name) = args::named_volume(volume)
                 && !self.docker.volumes.iter().any(|v| v == name)
             {
-                self.docker.volumes.push(name.to_owned());
+                let args = ["volume".to_owned(), "inspect".to_owned(), name.to_owned()];
+                if self.docker_capture(&args, None).await?.code != 0 {
+                    self.docker.volumes.push(name.to_owned());
+                }
             }
         }
         let mut argv = vec!["create".to_owned()];
         argv.extend(create.args());
         self.docker.containers.push(create.name.to_owned());
-        self.docker_ok(&argv).await?;
+        let out = self.docker_capture_env(&argv, None, cli_env).await?;
+        if out.code != 0 {
+            return Err(format!(
+                "docker create failed with exit code {}: {}",
+                out.code,
+                out.stderr.trim()
+            ));
+        }
         self.docker_ok(&["start".to_owned(), create.name.to_owned()])
             .await?;
         if create.ports.is_empty() {
@@ -560,11 +603,12 @@ impl Job<'_> {
         volumes.extend(job.volumes.iter().cloned());
 
         let workdir = args::translate_path(&layout.workspace, &maps);
-        let mut env: Vec<(String, String)> = vec![
+        let mut env = BTreeMap::from([
             ("GITHUB_ACTIONS".to_owned(), "true".to_owned()),
             ("CI".to_owned(), "true".to_owned()),
-        ];
-        env.extend(job.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        ]);
+        env.extend(job.env.clone());
+        let (flags, cli_env) = env_flags(env);
         let name = format!("hatchrun_job_{}", random_name()?);
         let label = self.docker.label.clone();
         self.say(
@@ -576,7 +620,7 @@ impl Job<'_> {
             label: &label,
             network: Some(network),
             workdir: Some(&workdir),
-            env,
+            env: flags,
             ports: job.ports.clone(),
             volumes: volumes.clone(),
             options: job.options.clone(),
@@ -586,7 +630,8 @@ impl Job<'_> {
             command: vec!["-f".to_owned(), "/dev/null".to_owned()],
             ..Create::default()
         };
-        self.create_and_start(&create, &job.volumes).await?;
+        self.create_and_start(&create, &job.volumes, &cli_env)
+            .await?;
 
         // What the image's shell setup is like decides the default shell
         // and where `GITHUB_PATH` entries go.
@@ -670,7 +715,11 @@ impl Job<'_> {
                                 service.id
                             )),
                         );
-                        tokio::time::sleep(base * 2u32.pow(attempt)).await;
+                        let mut cancel = super::wait_for(self.cancel_requests.clone(), 1);
+                        tokio::select! {
+                            () = tokio::time::sleep(base * 2u32.pow(attempt)) => {}
+                            () = &mut cancel => return Err(CANCELED.to_owned()),
+                        }
                     }
                 }
             }
@@ -711,11 +760,19 @@ impl Job<'_> {
         }
         self.ctx
             .set_containers(container, Value::Object(service_map));
+    }
+
+    /// The contexts a step that runs in the job container expands its
+    /// strings with: `github.workspace` and the `runner` paths are the
+    /// container's. Steps that run on the machine (cache, workspace,
+    /// test results) and `if:` keep the machine's paths.
+    pub(super) fn step_ctx(&self) -> super::context::Contexts {
+        let mut ctx = self.ctx.clone();
         if self.docker.contained() {
             let maps = self.docker.maps.clone();
-            self.ctx
-                .set_paths(&self.layout, |p| args::translate_path(p, &maps));
+            ctx.set_paths(&self.layout, |p| args::translate_path(p, &maps));
         }
+        ctx
     }
 
     /// The command line that runs `program args` in the job container:
@@ -811,10 +868,12 @@ impl Job<'_> {
     /// Removes what the job started: containers, volumes, the network,
     /// built images and the login. Problems are logged, never fatal.
     pub(super) async fn stop_containers(&mut self, sink: &mut dyn Sink) {
+        self.docker.cleaning = true;
         if !self.docker.has_work() {
+            self.remove_login_dir();
             return;
         }
-        let index = self.doc.job.steps.len();
+        let index = self.doc.job.steps.len() + 1;
         sink.step_started(index, "Stop containers");
         let label = format!("label={}", self.docker.label);
         // Containers a killed docker action left behind carry the label too.
@@ -843,13 +902,10 @@ impl Job<'_> {
             self.run_cleanup(&argv, "Stopped the containers", sink)
                 .await;
         }
+        // Only volumes this job made. Anonymous ones went with
+        // `rm --volumes`.
         for volume in self.docker.volumes.clone() {
-            let argv = [
-                "volume".to_owned(),
-                "rm".to_owned(),
-                "--force".to_owned(),
-                volume,
-            ];
+            let argv = ["volume".to_owned(), "rm".to_owned(), volume];
             self.run_cleanup(&argv, "Removed a volume", sink).await;
         }
         if let Some(network) = self.docker.network.take() {
@@ -862,11 +918,7 @@ impl Job<'_> {
             self.run_cleanup(&argv, "Removed the built images", sink)
                 .await;
         }
-        if let Some(dir) = self.docker.config.take()
-            && let Err(e) = std::fs::remove_dir_all(&dir)
-        {
-            tracing::warn!("remove {}: {e}", dir.display());
-        }
+        self.remove_login_dir();
         self.docker.job = None;
         sink.step_finished(
             index,
@@ -877,6 +929,15 @@ impl Job<'_> {
                 duration_ms: 0,
             },
         );
+    }
+
+    /// Removes the directory `docker login` wrote to.
+    fn remove_login_dir(&mut self) {
+        if let Some(dir) = self.docker.config.take()
+            && let Err(e) = std::fs::remove_dir_all(&dir)
+        {
+            tracing::warn!("remove {}: {e}", dir.display());
+        }
     }
 
     async fn run_cleanup(&mut self, argv: &[String], done: &str, sink: &mut dyn Sink) {
@@ -933,4 +994,38 @@ pub(super) struct Exec {
     pub(super) env: BTreeMap<String, String>,
     /// It runs as the agent, not the runner user.
     pub(super) as_agent: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_login_directory_alone_is_no_work_to_clean_up() {
+        // The cache proxy's bridge lookup makes the directory; a job
+        // without containers must not get a "Stop containers" step.
+        let mut state = DockerState::new("hatchrun-x".to_owned());
+        state.config = Some(PathBuf::from("/state/docker-x"));
+        assert!(!state.has_work());
+        state.network = Some("n".to_owned());
+        assert!(state.has_work());
+    }
+
+    #[test]
+    fn env_flags_keep_values_off_the_command_line() {
+        let env = BTreeMap::from([
+            ("SECRET".to_owned(), "hunter2".to_owned()),
+            ("PATH".to_owned(), "/x".to_owned()),
+            ("DOCKER_HOST".to_owned(), "h".to_owned()),
+        ]);
+        let (flags, cli) = env_flags(env);
+        assert_eq!(
+            flags,
+            ["-e", "DOCKER_HOST=h", "-e", "PATH=/x", "-e", "SECRET"]
+        );
+        assert_eq!(
+            cli,
+            BTreeMap::from([("SECRET".to_owned(), "hunter2".to_owned())])
+        );
+    }
 }
