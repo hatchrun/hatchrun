@@ -341,6 +341,36 @@ pub(crate) trait Mail {
     async fn sleep(&self, ms: u64);
 }
 
+/// [`settle`] for a reconciler pass. `record` writes the pass into the
+/// history and runs exactly once, whether or not `read` does: `settle`
+/// skips `read` when the stored alerts cannot be read, and the pass must
+/// not drop out of the history then. When `read` runs, `record` runs
+/// first and its result goes to `read`.
+pub(crate) async fn settle_pass<H>(
+    store: &impl Store,
+    mail: &impl Mail,
+    now: u64,
+    record: impl AsyncFnOnce() -> H,
+    read: impl AsyncFnOnce(H) -> Vec<(Key, Seen)>,
+) -> Vec<String> {
+    let mut record = Some(record);
+    let errors = settle(
+        store,
+        mail,
+        now,
+        async || match record.take() {
+            Some(record) => read(record().await).await,
+            None => Vec::new(),
+        },
+        true,
+    )
+    .await;
+    if let Some(record) = record {
+        record().await;
+    }
+    errors
+}
+
 /// Applies what the checks found at `now` and sends the emails that are
 /// due; with `digest`, also the daily digest. `read` runs the checks. It
 /// runs after the stored alerts are read, so a pass that fired an alert

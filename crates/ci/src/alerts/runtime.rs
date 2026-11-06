@@ -21,6 +21,7 @@ use super::queries::{
 use super::{
     Alert, BINDING, DELETE_BATCH, Email, FAILED_LAUNCH_MEMORY, FAILED_LAUNCHES_FOR, FROM, HISTORY,
     Key, LISTED, Mail, RATE_LIMIT_MEMORY, RATE_LIMITS_FOR, Seen, State, Store, TO, settle,
+    settle_pass,
 };
 
 /// Every alert.
@@ -250,13 +251,15 @@ impl Mail for Inbox {
 /// Records the pass that started at `now` with `errors` failed steps in
 /// the `ci_reconciler` row, runs the checks and sends what is due.
 pub(crate) async fn after_pass(env: &Env, db: &Db, now: u64, errors: u32) {
-    // Read once the stored alerts are, so what a check found is not older
-    // than the rows it changes.
-    let read = async || {
-        let history = logged(
+    let record = async || {
+        logged(
             "pass history",
             record_pass(db, now, worker::Date::now().as_millis(), errors).await,
-        );
+        )
+    };
+    // Read once the stored alerts are, so what a check found is not older
+    // than the rows it changes.
+    let read = async |history| {
         let facts = Facts {
             history,
             database: logged(
@@ -274,7 +277,7 @@ pub(crate) async fn after_pass(env: &Env, db: &Db, now: u64, errors: u32) {
         };
         check(&facts)
     };
-    for err in settle(&Kept(db), &Inbox::new(env), now, read, true).await {
+    for err in settle_pass(&Kept(db), &Inbox::new(env), now, record, read).await {
         console_error!("alerts: {err}");
     }
     if let Err(err) = prune(db, now).await {

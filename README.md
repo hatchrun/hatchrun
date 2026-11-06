@@ -202,8 +202,10 @@ it fires, is listed in one digest a day while it lasts, and sends one
 when it resolves; an email that fails is sent on the next pass. The
 state is in `ci_alerts`. A Worker cannot see its own cron stop, so
 `GET /healthz` on `hatchrun-ci` answers 503 when the last pass is over
-five minutes old or failing, and the one on hatchrun.io passes that on
-for an uptime monitor.
+five minutes old (or the database does not answer). A failing pass
+answers 200 with its status in the body; email alerts report those. It
+answers only the service binding, and `app.hatchrun.io/healthz` passes
+CI's state on for the uptime monitor.
 
 ## Scaler core
 

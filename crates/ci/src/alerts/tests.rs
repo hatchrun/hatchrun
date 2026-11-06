@@ -1448,3 +1448,71 @@ fn an_unreadable_dead_letter_is_recorded_and_fires_the_alert() {
         ["[hatchrun] Firing: CI launch failed for good"]
     );
 }
+
+/// A store whose stored alerts cannot be read.
+struct Unreadable;
+
+#[allow(clippy::unused_async_trait_impl)]
+impl Store for Unreadable {
+    async fn alerts(&self) -> Result<Vec<Alert>, String> {
+        Err("database unavailable".to_owned())
+    }
+
+    async fn save(&self, _: Option<&Alert>, _: &Alert, _: u64) -> Result<bool, String> {
+        unreachable!()
+    }
+
+    async fn claim(&self, _: &Alert, _: State, _: u64, _: u64) -> Result<bool, String> {
+        unreachable!()
+    }
+
+    async fn sent(&self, _: &Alert, _: State, _: u64, _: u64) -> Result<bool, String> {
+        unreachable!()
+    }
+
+    async fn release(&self, _: &str, _: u64) -> Result<(), String> {
+        unreachable!()
+    }
+
+    async fn digest_at(&self) -> Result<Option<u64>, String> {
+        unreachable!()
+    }
+
+    async fn digest_claim(&self, _: Option<u64>, _: u64) -> Result<bool, String> {
+        unreachable!()
+    }
+
+    async fn digest_undo(&self, _: Option<u64>, _: u64) -> Result<(), String> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn a_pass_is_recorded_once_whether_or_not_the_checks_run() {
+    let db = Db::new();
+    let outbox = Outbox::default();
+    let order = RefCell::new(Vec::new());
+    let record = async || order.borrow_mut().push("record");
+    let read = async |()| {
+        order.borrow_mut().push("read");
+        Vec::new()
+    };
+
+    // The checks run after the pass is recorded.
+    let errors = db.wait(settle_pass(
+        &Kept(db.db()),
+        outbox.at(NOW),
+        NOW,
+        record,
+        read,
+    ));
+    assert_eq!(errors, NONE);
+    assert_eq!(*order.borrow(), ["record", "read"]);
+
+    // The stored alerts cannot be read, so the checks are skipped and the
+    // pass is still recorded.
+    order.borrow_mut().clear();
+    let errors = db.wait(settle_pass(&Unreadable, outbox.at(NOW), NOW, record, read));
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(*order.borrow(), ["record"]);
+}
