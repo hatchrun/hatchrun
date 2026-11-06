@@ -7,7 +7,7 @@
 # shows A/B: runs while the job passes / runs after an earlier step failed.
 
 convert: exit 0
-  `ci.yml` job `lint` calls `acme/shared-workflows/.github/workflows/lint.yml@v3`, a reusable workflow in another repository, which is not supported; copy `lint.yml` into this repository and call it as `./.github/workflows/lint.yml`; the job was dropped
+  warning: `ci.yml` job `lint` calls `acme/shared-workflows/.github/workflows/lint.yml@v3`, a reusable workflow in another repository, which is not supported; copy `lint.yml` into this repository and call it as `./.github/workflows/lint.yml`; the job was dropped
 validate: exit 0
 event push-main (compile refs/heads/main)
   ci: triggered
