@@ -13,6 +13,7 @@ use hatchrun_cloud::db::{Db, params};
 use serde::{Deserialize, Serialize};
 use worker::Result;
 
+use super::NewAudit;
 use crate::github::InstalledRepo;
 
 /// The rows of the JSON list `$2` of repositories.
@@ -314,26 +315,49 @@ pub async fn unknown_repos(db: &Db, tenant: &str, names: &[String]) -> Result<Ve
         .collect())
 }
 
-/// Sets what runs for `tenant`: every repository with `all`, else the
-/// repositories in `names`. Each repository's `enabled` is set to
-/// match, so the choice survives switching `all` off.
+/// Changes what runs for `tenant`. `Some(true)` sets the tenant's flag
+/// and enables every repository. `Some(false)` clears the flag and
+/// leaves each repository's `enabled` as it is, so the repositories
+/// that ran keep running until `remove` names them. Then each
+/// repository in `add` is enabled and each in `remove` disabled (names
+/// ignore case).
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn set_enabled(db: &Db, tenant: &str, all: bool, names: &[String]) -> Result<()> {
-    db.batch(&[
-        (
+pub async fn patch_enabled(
+    db: &Db,
+    tenant: &str,
+    all: Option<bool>,
+    add: &[String],
+    remove: &[String],
+    audit: &NewAudit<'_>,
+) -> Result<()> {
+    let audit_sql = NewAudit::insert_bound_sql(1, "(SELECT 1) one");
+    let mut statements = Vec::new();
+    if let Some(all) = all {
+        statements.push((
             "UPDATE tenants SET ci_all_repos = $2 WHERE id = $1",
             params![tenant, all],
-        ),
-        (
-            "UPDATE ci_installation_repos SET enabled = $2 \
-             OR lower(full_name) = ANY (string_to_array(lower($3), ',')) WHERE tenant_id = $1",
-            params![tenant, all, names.join(",")],
-        ),
-    ])
-    .await?;
+        ));
+        if all {
+            statements.push((
+                "UPDATE ci_installation_repos SET enabled = true WHERE tenant_id = $1",
+                params![tenant],
+            ));
+        }
+    }
+    for (names, enabled) in [(add, true), (remove, false)] {
+        if !names.is_empty() {
+            statements.push((
+                "UPDATE ci_installation_repos SET enabled = $2 WHERE tenant_id = $1 \
+                 AND lower(full_name) = ANY (string_to_array(lower($3), ','))",
+                params![tenant, enabled, names.join(",")],
+            ));
+        }
+    }
+    statements.push((audit_sql.as_str(), audit.binds_with_target()));
+    db.batch(&statements).await?;
     Ok(())
 }
 

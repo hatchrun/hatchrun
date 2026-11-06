@@ -347,8 +347,8 @@ mod tests {
         for plan in ["a", "b"] {
             db.run(
                 "INSERT INTO ci_jobs (run_id, plan_id, name, status, timeout_minutes, held, \
-                 created_at, updated_at, template, token_permissions, secret_refs) \
-                 SELECT id, $1, $1, 'queued', 10, 'card', 1, 1, 'hatchrun', '{}', '{}' \
+                 created_at, updated_at, template, token_permissions, secret_refs, needs) \
+                 SELECT id, $1, $1, 'queued', 10, 'card', 1, 1, 'hatchrun', '{}', '{}', '[]' \
                  FROM ci_runs",
                 &params![plan],
             );

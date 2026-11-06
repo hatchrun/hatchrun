@@ -852,6 +852,34 @@ fn seconds_round_up_with_a_minute_minimum() {
 }
 
 #[test]
+fn daily_usage_groups_by_utc_day() {
+    let db = setup();
+    let month = 1_790_812_800_000_u64;
+    for (job, seconds, ended, units) in [
+        (1, 100, month - 1, 100),
+        (2, 60, month + 5, 60),
+        (3, 90, month + DAY - 1, 180),
+        (4, 60, month + 3 * DAY, 60),
+    ] {
+        db.run(
+            "INSERT INTO ci_usage (job_id, attempt, tenant_id, template, seconds, units, \
+             ended_at) VALUES ($1, 1, 't1', 'ubuntu-latest', $2, $4, $3)",
+            &params![job, seconds, ended, units],
+        );
+    }
+    let days = db.wait(daily_usage(db.db(), "t1", month)).unwrap();
+    let shown: Vec<_> = days
+        .iter()
+        .map(|d| (d.day.as_str(), d.seconds, d.units))
+        .collect();
+    assert_eq!(shown, [("2026-10-01", 150, 240), ("2026-10-04", 60, 60)]);
+    assert_eq!(
+        db.wait(daily_usage(db.db(), "t2", month)).unwrap(),
+        Vec::new()
+    );
+}
+
+#[test]
 fn standing_counts_this_month_and_running_jobs() {
     let db = setup();
     let month = 1_790_812_800_000_u64;
@@ -1058,4 +1086,58 @@ fn usage_goes_to_polar_oldest_first_and_once() {
         )
         .unwrap();
     assert_eq!(sent[0]["sent_at"].as_u64(), Some(99));
+}
+
+#[test]
+fn activity_buckets_runs_by_creation_and_completion() {
+    let db = setup();
+    let hour = 3_600_000_u64;
+    let start = 10 * hour;
+    let make = |delivery: &str, created: u64, conclusion: Option<(&str, u64)>| {
+        let run = db
+            .wait(insert_run(db.db(), &new_run(delivery, "ci", created)))
+            .unwrap()
+            .unwrap();
+        if let Some((conclusion, at)) = conclusion {
+            db.run(
+                "UPDATE ci_runs SET status = 'completed', conclusion = $2, completed_at = $3 \
+                 WHERE id = $1",
+                &params![run.id, conclusion, at],
+            );
+        }
+    };
+    make("a", start + 1, Some(("success", start + 2)));
+    make("b", start + 3, Some(("failure", start + hour + 5)));
+    make("c", start + hour, None);
+    make("d", start - 1, Some(("success", start + 4)));
+    make("e", start + 5, Some(("cancelled", start + 6)));
+    let buckets = db
+        .wait(activity(db.db(), &[7], None, start, hour, 3))
+        .unwrap();
+    let shown: Vec<_> = buckets
+        .iter()
+        .map(|b| (b.started, b.passed, b.failed))
+        .collect();
+    assert_eq!(shown, [(3, 2, 0), (1, 0, 1), (0, 0, 0)]);
+    let none = db
+        .wait(activity(db.db(), &[8], None, start, hour, 3))
+        .unwrap();
+    assert!(none.iter().all(|b| b.started == 0));
+    for name in ["acme/app", "ACME/App"] {
+        let named = db
+            .wait(activity(db.db(), &[7], Some(name), start, hour, 3))
+            .unwrap();
+        assert_eq!(named, buckets, "{name}");
+    }
+    let other = db
+        .wait(activity(db.db(), &[7], Some("nope/none"), start, hour, 3))
+        .unwrap();
+    assert!(other.iter().all(|b| b.started == 0));
+    let (running, queued) = db.wait(job_load(db.db(), &[7], None)).unwrap();
+    assert_eq!((running, queued), (0, 0));
+    run_with_job_named(&db, "r1", "running");
+    run_with_job_named(&db, "r2", "queued");
+    run_with_job_named(&db, "r3", "completed");
+    assert_eq!(db.wait(job_load(db.db(), &[7], None)).unwrap(), (1, 1));
+    assert_eq!(db.wait(job_load(db.db(), &[8], None)).unwrap(), (0, 0));
 }

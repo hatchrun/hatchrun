@@ -391,7 +391,7 @@ mod tests {
             "token_permissions": permissions.to_string(),
             "secret_refs": "{\"all\":false,\"names\":[]}", "held": null,
             "environment": environment, "approval_attempt": null,
-            "approval_decision": null, "approval_by": null, "approval_at": null,
+            "approval_decision": null, "approval_by": null, "approval_at": null, "needs": "[]",
         }))
         .expect("a job row")
     }

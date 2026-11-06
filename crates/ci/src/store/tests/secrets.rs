@@ -6,9 +6,32 @@ use super::jobs::{held_of, woken_ids};
 use super::*;
 use hatchrun_cloud::testdb::Db as TestDb;
 
+/// An audit row for a test change.
+pub(super) fn audit(action: Action, target: &str) -> NewAudit<'_> {
+    NewAudit {
+        tenant: "t1",
+        actor: "octo",
+        action,
+        scope: "org",
+        repo: None,
+        target,
+        now: 5,
+    }
+}
+
 pub(super) fn put_var_ok(db: &TestDb, owner: Owner, name: &str, value: &str) {
     let put = db
-        .wait(put_var(db.db(), "t1", owner, None, name, value, 100, 5))
+        .wait(put_var(
+            db.db(),
+            "t1",
+            owner,
+            None,
+            name,
+            value,
+            100,
+            5,
+            &audit(Action::VarPut, "x"),
+        ))
         .unwrap();
     assert_eq!(put, Put::Saved);
 }
@@ -25,6 +48,7 @@ pub(super) fn put_secret_ok(db: &TestDb, owner: Owner, name: &str, key: &str, se
             sealed,
             100,
             5,
+            &audit(Action::SecretPut, "x"),
         ))
         .unwrap();
     assert_eq!(put, Put::Saved);
@@ -44,12 +68,24 @@ fn repo_value_overrides_org() {
     let org = db.wait(vars_of(db.db(), Owner::Org)).unwrap();
     assert_eq!(org.len(), 2);
     assert!(
-        db.wait(delete_var(db.db(), "t1", Owner::Repo(7), "A"))
-            .unwrap()
+        db.wait(delete_var(
+            db.db(),
+            "t1",
+            Owner::Repo(7),
+            "A",
+            &audit(Action::VarDelete, "x")
+        ))
+        .unwrap()
     );
     assert!(
-        !db.wait(delete_var(db.db(), "t1", Owner::Repo(7), "A"))
-            .unwrap()
+        !db.wait(delete_var(
+            db.db(),
+            "t1",
+            Owner::Repo(7),
+            "A",
+            &audit(Action::VarDelete, "x")
+        ))
+        .unwrap()
     );
     let vars = db.wait(job_vars(db.db(), "t1", 7, None)).unwrap();
     assert_eq!(vars["A"], "1");
@@ -57,6 +93,89 @@ fn repo_value_overrides_org() {
 
 async fn vars_of(db: &Db, owner: Owner) -> Result<Vec<VarItem>> {
     vars(db, "t1", owner).await
+}
+
+#[test]
+fn a_change_records_its_audit_row_with_it() {
+    let db = setup();
+    let rows = |db: &TestDb| {
+        db.rows("SELECT action, target FROM ci_audit ORDER BY id", &[])
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["action"].as_str().unwrap().to_owned(),
+                    r["target"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    put_secret_ok(&db, Owner::Org, "A", "k", "s");
+    put_var_ok(&db, Owner::Org, "V", "v");
+    let env = save_environment(&db, "Prod", &[], false);
+    assert!(
+        db.wait(delete_var(
+            db.db(),
+            "t1",
+            Owner::Org,
+            "V",
+            &audit(Action::VarDelete, "V")
+        ))
+        .unwrap()
+    );
+    // Nothing deleted, nothing recorded.
+    assert!(
+        !db.wait(delete_secret(
+            db.db(),
+            "t1",
+            Owner::Org,
+            "none",
+            &audit(Action::SecretDelete, "none")
+        ))
+        .unwrap()
+    );
+    // A put over the limit stores nothing and records nothing.
+    let refused = db
+        .wait(put_secret(
+            db.db(),
+            "t1",
+            Owner::Org,
+            None,
+            "B",
+            "k",
+            "s",
+            1,
+            5,
+            &audit(Action::SecretPut, "B"),
+        ))
+        .unwrap();
+    assert_eq!(refused, Put::TooMany);
+    // The environment is recorded under the name it is stored by.
+    let env_again = db
+        .wait(put_environment(
+            db.db(),
+            "t1",
+            7,
+            "PROD",
+            &[],
+            false,
+            10,
+            6,
+            &audit(Action::EnvironmentPut, "PROD"),
+        ))
+        .unwrap();
+    assert!(matches!(env_again, PutEnvironment::Saved(_)));
+    assert_eq!(env.name, "Prod");
+    assert_eq!(
+        rows(&db),
+        [
+            ("secret.put".to_owned(), "x".to_owned()),
+            ("var.put".to_owned(), "x".to_owned()),
+            ("environment.put".to_owned(), "Prod".to_owned()),
+            ("var.delete".to_owned(), "V".to_owned()),
+            ("environment.put".to_owned(), "Prod".to_owned()),
+        ]
+    );
 }
 
 #[test]
@@ -73,6 +192,7 @@ fn put_counts_against_the_limit() {
             "s",
             limit,
             5,
+            &audit(Action::SecretPut, "x"),
         ))
         .unwrap()
     };
@@ -95,13 +215,24 @@ fn put_counts_against_the_limit() {
             "s",
             2,
             5,
+            &audit(Action::SecretPut, "x"),
         ))
         .unwrap();
     assert_eq!(repo, Put::Saved);
     // And the same for vars.
     let var = |name: &str| {
-        db.wait(put_var(db.db(), "t1", Owner::Org, None, name, "v", 1, 5))
-            .unwrap()
+        db.wait(put_var(
+            db.db(),
+            "t1",
+            Owner::Org,
+            None,
+            name,
+            "v",
+            1,
+            5,
+            &audit(Action::VarPut, "x"),
+        ))
+        .unwrap()
     };
     assert_eq!(var("A"), Put::Saved);
     assert_eq!(var("B"), Put::TooMany);
@@ -185,12 +316,24 @@ fn deleting_a_repo_or_tenant_removes_its_secrets() {
     let db = setup();
     put_secret_ok(&db, Owner::Repo(7), "A", "k", "s");
     assert!(
-        db.wait(delete_secret(db.db(), "t1", Owner::Repo(7), "A"))
-            .unwrap()
+        db.wait(delete_secret(
+            db.db(),
+            "t1",
+            Owner::Repo(7),
+            "A",
+            &audit(Action::SecretDelete, "x")
+        ))
+        .unwrap()
     );
     assert!(
-        !db.wait(delete_secret(db.db(), "t1", Owner::Repo(7), "A"))
-            .unwrap()
+        !db.wait(delete_secret(
+            db.db(),
+            "t1",
+            Owner::Repo(7),
+            "A",
+            &audit(Action::SecretDelete, "x")
+        ))
+        .unwrap()
     );
     put_secret_ok(&db, Owner::Repo(7), "A", "k", "s");
     db.run("DELETE FROM tenants WHERE id = 't1'", &[]);
@@ -215,6 +358,7 @@ pub(super) fn save_environment(
             approval,
             10,
             5,
+            &audit(Action::EnvironmentPut, "x"),
         ))
         .unwrap()
     {
@@ -288,8 +432,18 @@ fn environment_lookup_ignores_case() {
 fn put_environment_counts_against_the_limit() {
     let db = setup();
     let put = |name: &str| {
-        db.wait(put_environment(db.db(), "t1", 7, name, &[], false, 2, 5))
-            .unwrap()
+        db.wait(put_environment(
+            db.db(),
+            "t1",
+            7,
+            name,
+            &[],
+            false,
+            2,
+            5,
+            &audit(Action::EnvironmentPut, "x"),
+        ))
+        .unwrap()
     };
     assert!(matches!(put("a"), PutEnvironment::Saved(_)));
     assert!(matches!(put("b"), PutEnvironment::Saved(_)));
@@ -310,12 +464,22 @@ fn deleting_an_environment_deletes_its_secrets_and_vars() {
     put_var_ok(&db, owner, "V", "1");
     put_secret_ok(&db, Owner::Repo(7), "S", "k", "repo");
     assert!(
-        db.wait(delete_environment(db.db(), 7, "production"))
-            .unwrap()
+        db.wait(delete_environment(
+            db.db(),
+            7,
+            "production",
+            &audit(Action::EnvironmentDelete, "x")
+        ))
+        .unwrap()
     );
     assert!(
-        !db.wait(delete_environment(db.db(), 7, "production"))
-            .unwrap()
+        !db.wait(delete_environment(
+            db.db(),
+            7,
+            "production",
+            &audit(Action::EnvironmentDelete, "x")
+        ))
+        .unwrap()
     );
     let left = db
         .rows(
@@ -412,10 +576,107 @@ fn another_environment_stays_out() {
             "s",
             1,
             5,
+            &audit(Action::SecretPut, "x"),
         ))
         .unwrap();
     assert_eq!(put, Put::Saved);
-    assert_eq!(db.wait(secret_names(db.db(), "t1", of_f)).unwrap().len(), 1);
+    let listed = db.wait(secret_names(db.db(), "t1", of_f)).unwrap();
+    assert_eq!(listed.iter().filter(|item| item.scope == "env").count(), 1);
+}
+
+#[test]
+fn narrower_scopes_list_what_they_inherit_and_shadow_it() {
+    let db = setup();
+    let e = save_environment(&db, "e", &[], false);
+    let of_e = Owner::Environment {
+        repo_id: 7,
+        environment_id: e.id,
+    };
+    put_secret_ok(&db, Owner::Org, "A", "k", "org");
+    put_secret_ok(&db, Owner::Org, "B", "k", "org");
+    put_secret_ok(&db, Owner::Repo(7), "A", "k", "repo");
+    put_secret_ok(&db, of_e, "A", "k", "env");
+    put_var_ok(&db, Owner::Org, "V", "org");
+    put_var_ok(&db, Owner::Repo(7), "V", "repo");
+    // An organization sees only its own.
+    let org = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
+    assert_eq!(org.len(), 2);
+    assert!(org.iter().all(|i| i.scope == "org" && !i.shadowed));
+    // A repository sees the organization's too; its own A hides the org's.
+    let repo = db
+        .wait(secret_names(db.db(), "t1", Owner::Repo(7)))
+        .unwrap();
+    let shown: Vec<_> = repo
+        .iter()
+        .map(|i| (i.name.as_str(), i.scope, i.shadowed))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("A", "org", true),
+            ("A", "repo", false),
+            ("B", "org", false)
+        ]
+    );
+    // An environment sees all three levels.
+    let env = db.wait(secret_names(db.db(), "t1", of_e)).unwrap();
+    let shown: Vec<_> = env
+        .iter()
+        .map(|i| (i.name.as_str(), i.scope, i.shadowed))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("A", "org", true),
+            ("A", "repo", true),
+            ("A", "env", false),
+            ("B", "org", false)
+        ]
+    );
+    let vars = db.wait(vars(db.db(), "t1", Owner::Repo(7))).unwrap();
+    let shown: Vec<_> = vars.iter().map(|i| (i.scope, i.shadowed)).collect();
+    assert_eq!(shown, [("org", true), ("repo", false)]);
+}
+
+#[test]
+fn receiving_a_secret_sets_its_last_use() {
+    let db = setup();
+    put_secret_ok(&db, Owner::Org, "A", "k", "org");
+    put_secret_ok(&db, Owner::Org, "B", "k", "org");
+    put_secret_ok(&db, Owner::Repo(7), "A", "k", "repo");
+    put_var_ok(&db, Owner::Org, "V", "org");
+    put_var_ok(&db, Owner::Repo(7), "V", "repo");
+    let used = |db: &TestDb| {
+        let secrets = db
+            .wait(secret_names(db.db(), "t1", Owner::Repo(7)))
+            .unwrap();
+        let vars = db.wait(vars(db.db(), "t1", Owner::Repo(7))).unwrap();
+        (
+            secrets.iter().map(|i| i.last_used_at).collect::<Vec<_>>(),
+            vars.iter().map(|i| i.last_used_at).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(used(&db), (vec![None, None, None], vec![None, None]));
+    // The job read the repository's A and V: the org's rows stay unused.
+    let got = [("A".to_owned(), Owner::Repo(7))];
+    let got_vars = [("V".to_owned(), Owner::Repo(7))];
+    db.wait(mark_used(db.db(), "t1", &got, &got_vars, 99))
+        .unwrap();
+    assert_eq!(
+        used(&db),
+        (vec![None, Some(99), None], vec![None, Some(99)])
+    );
+    // The job read the org's B; an older time does not replace a later
+    // one on A.
+    let got = [
+        ("A".to_owned(), Owner::Repo(7)),
+        ("B".to_owned(), Owner::Org),
+    ];
+    db.wait(mark_used(db.db(), "t1", &got, &[], 50)).unwrap();
+    assert_eq!(
+        used(&db),
+        (vec![None, Some(99), Some(50)], vec![None, Some(99)])
+    );
 }
 
 #[test]
@@ -497,8 +758,13 @@ fn environment_changes_release_holds_through_the_handler_path() {
     hold(later);
     save_environment(&db, "Production", &[], true);
     assert!(
-        db.wait(delete_environment(db.db(), 7, "production"))
-            .unwrap()
+        db.wait(delete_environment(
+            db.db(),
+            7,
+            "production",
+            &audit(Action::EnvironmentDelete, "x")
+        ))
+        .unwrap()
     );
     assert_eq!(woken_ids(release(false, true, 30)), [later]);
     assert_eq!(held_of(&db, later), None);
@@ -568,6 +834,7 @@ fn put_selected(db: &TestDb, kind: &str, name: &str, repos: Option<&[u64]>) {
             name,
             100,
             5,
+            &audit(Action::SecretPut, "x"),
         ))
     } else {
         db.wait(put_var(
@@ -579,6 +846,7 @@ fn put_selected(db: &TestDb, kind: &str, name: &str, repos: Option<&[u64]>) {
             name,
             100,
             5,
+            &audit(Action::VarPut, "x"),
         ))
     };
     assert_eq!(put.unwrap(), Put::Saved);
@@ -740,6 +1008,72 @@ fn listing_names_the_selected_repos() {
 }
 
 #[test]
+fn inherited_selections_name_only_the_viewing_repo() {
+    let db = with_repos();
+    let e = save_environment(&db, "e", &[], false);
+    let of_e = Owner::Environment {
+        repo_id: 7,
+        environment_id: e.id,
+    };
+    for kind in ["secret", "var"] {
+        put_selected(&db, kind, "A", Some(&[8, 7]));
+        put_selected(&db, kind, "B", None);
+        // Reaches web only, and the repository and environment rows
+        // below take its names.
+        put_selected(&db, kind, "C", Some(&[8]));
+        put_selected(&db, kind, "D", Some(&[8]));
+    }
+    for name in ["B", "C"] {
+        put_secret_ok(&db, Owner::Repo(7), name, "k", "repo");
+        put_var_ok(&db, Owner::Repo(7), name, "repo");
+    }
+    put_secret_ok(&db, of_e, "D", "k", "env");
+    put_var_ok(&db, of_e, "D", "env");
+    let app = Some(vec!["acme/app".to_owned()]);
+    let expect = |owner: Owner, rows: Vec<(&str, &str, bool, Option<Vec<String>>)>| {
+        let secrets = db.wait(secret_names(db.db(), "t1", owner)).unwrap();
+        let shown: Vec<_> = secrets
+            .iter()
+            .map(|i| (i.name.as_str(), i.scope, i.shadowed, i.repositories.clone()))
+            .collect();
+        assert_eq!(shown, rows, "secrets of {owner:?}");
+        let vars = db.wait(vars(db.db(), "t1", owner)).unwrap();
+        let shown: Vec<_> = vars
+            .iter()
+            .map(|i| (i.name.as_str(), i.scope, i.shadowed, i.repositories.clone()))
+            .collect();
+        assert_eq!(shown, rows, "vars of {owner:?}");
+    };
+    // A repository sees the selection as its own name alone, never the
+    // other repositories of the list, and no row selected for another.
+    expect(
+        Owner::Repo(7),
+        vec![
+            ("A", "org", false, app.clone()),
+            ("B", "org", true, None),
+            ("B", "repo", false, None),
+            ("C", "repo", false, None),
+        ],
+    );
+    expect(
+        of_e,
+        vec![
+            ("A", "org", false, app),
+            ("B", "org", true, None),
+            ("B", "repo", false, None),
+            ("C", "repo", false, None),
+            ("D", "env", false, None),
+        ],
+    );
+    // The organization still sees the whole list.
+    let secrets = db.wait(secret_names(db.db(), "t1", Owner::Org)).unwrap();
+    assert_eq!(
+        secrets[0].repositories,
+        Some(vec!["acme/app".to_owned(), "acme/web".to_owned()])
+    );
+}
+
+#[test]
 fn listing_leaves_out_gone_repos() {
     let db = with_repos();
     put_selected(&db, "secret", "A", Some(&[7, 8]));
@@ -786,6 +1120,7 @@ fn a_repo_row_cannot_select_repos() {
         "v",
         100,
         5,
+        &audit(Action::VarPut, "x"),
     ));
     assert!(put.is_err());
 }

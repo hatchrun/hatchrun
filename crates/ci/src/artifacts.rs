@@ -608,7 +608,7 @@ mod tests {
             "heartbeat_at": null, "started_at": null, "completed_at": null, "steps": "[]",
             "log_key": null, "template": "ubuntu-latest", "token_permissions": "{}",
             "secret_refs": "{}", "held": null, "environment": null, "approval_attempt": null,
-            "approval_decision": null, "approval_by": null, "approval_at": null
+            "approval_decision": null, "approval_by": null, "approval_at": null, "needs": "[]"
         }))
         .unwrap()
     }

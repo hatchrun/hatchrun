@@ -37,6 +37,8 @@ pub struct NewJob {
     pub strategy_group: Option<String>,
     /// The most jobs of the group that run at once.
     pub max_parallel: Option<u32>,
+    /// The plan ids of the jobs it waits on.
+    pub needs: Vec<String>,
 }
 
 /// A recorded job.
@@ -106,6 +108,9 @@ pub struct JobRow {
     pub approval_by: Option<String>,
     /// When they decided.
     pub approval_at: Option<u64>,
+    /// The plan ids of the jobs it waits on, a JSON array.
+    #[serde(deserialize_with = "json_text")]
+    pub needs: serde_json::Value,
 }
 
 /// Reads a JSON document that the row carries as text.
@@ -119,7 +124,8 @@ pub(super) const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclus
      launch_attempts, capacity_attempts, capacity_since, next_launch_at, timeout_minutes, updated_at, heartbeat_at, started_at, \
      completed_at, steps::text AS steps, log_key, template, \
      token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held, \
-     environment, approval_attempt, approval_decision, approval_by, approval_at";
+     environment, approval_attempt, approval_decision, approval_by, approval_at, \
+     needs::text AS needs";
 
 /// The jobs of run `$1` in plan order.
 const JOBS_FOR_RUN: &str = "SELECT {columns} FROM ci_jobs WHERE run_id = $1 ORDER BY id";
@@ -318,10 +324,10 @@ pub async fn insert_jobs(
     let mut bound = params![run_id, now];
     let mut highest = 0;
     for (i, job) in jobs.iter().enumerate() {
-        let base = 3 + i * 9;
-        highest = base + 8;
+        let base = 3 + i * 10;
+        highest = base + 9;
         values.push(format!(
-            "($1, ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, ${}, ${}, ${}, 'waiting', $2, $2)",
+            "($1, ${}, ${}, ${}, ${}, ${}::jsonb, ${}::jsonb, ${}, ${}, ${}, ${}::jsonb, 'waiting', $2, $2)",
             base,
             base + 1,
             base + 2,
@@ -330,7 +336,8 @@ pub async fn insert_jobs(
             base + 5,
             base + 6,
             base + 7,
-            base + 8
+            base + 8,
+            base + 9
         ));
         bound.push(Param::from(&job.plan_id));
         bound.push(Param::from(&job.name));
@@ -345,11 +352,14 @@ pub async fn insert_jobs(
         bound.push(Param::from(job.environment.as_deref()));
         bound.push(Param::from(job.strategy_group.as_deref()));
         bound.push(Param::from(job.max_parallel));
+        bound.push(Param::from(
+            serde_json::to_string(&job.needs).map_err(worker::Error::from)?,
+        ));
     }
     debug_assert_eq!(bound.len(), highest);
     let sql = format!(
         "INSERT INTO ci_jobs (run_id, plan_id, name, timeout_minutes, template, \
-         token_permissions, secret_refs, environment, strategy_group, max_parallel, status, \
+         token_permissions, secret_refs, environment, strategy_group, max_parallel, needs, status, \
          created_at, updated_at) \
          VALUES {} RETURNING plan_id, id",
         values.join(", ")
