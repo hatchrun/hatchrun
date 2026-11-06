@@ -74,16 +74,25 @@ pub fn select_with(source: &str, event: &Event, compile_ref: &str, library: &Lib
     Selected::Plans { plans, failed }
 }
 
-/// Whether some workflow of `source` is started by `event` and the
-/// config calls a file of another repository, so that file is worth
-/// reading before the workflows are planned.
+/// The workflows of `source` that `event` starts and that call a file of
+/// another repository, directly or through another workflow, so that
+/// file is worth reading before they are planned. Empty when the config
+/// does not parse.
 #[must_use]
-pub fn needs_remote_files(source: &str, event: &Event) -> bool {
+pub fn remote_workflows(source: &str, event: &Event) -> Vec<String> {
     let Ok(config) = parse(source) else {
-        return false;
+        return Vec::new();
     };
-    !hatchrun_workflow::remote_calls(&config, &Library::default()).is_empty()
-        && config.workflows.values().any(|wf| triggered(&wf.on, event))
+    config
+        .workflows
+        .iter()
+        .filter(|(_, wf)| triggered(&wf.on, event))
+        .filter(|(name, _)| {
+            !hatchrun_workflow::remote_calls_from(&config, &[name.as_str()], &Library::default())
+                .is_empty()
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Whether a pull request `action` against `base_ref` starts a workflow
@@ -326,20 +335,29 @@ workflows:
     }
 
     #[test]
-    fn remote_files_are_read_only_for_a_triggered_workflow_that_calls_them() {
+    fn remote_files_are_read_only_for_a_triggered_workflow_that_reaches_them() {
         let source = "
 jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
 workflows:
   ci:
     on: { push: { branches: [main] } }
-    jobs: [{ up: { call: 'acme/shared/.github/workflows/x.yml@v1' } }]
+    jobs: [{ up: { call: shared } }]
+  shared:
+    on: { call: {} }
+    jobs: [{ far: { call: 'acme/shared/.github/workflows/x.yml@v1' } }]
+  other:
+    on: { push: { branches: [dev] } }
+    jobs: [{ far: { call: 'acme/other/.github/workflows/y.yml@v1' } }]
   plain:
     on: { schedule: [{ cron: '0 3 * * *' }] }
     jobs: [t]
 ";
-        assert!(needs_remote_files(source, &push("refs/heads/main")));
-        assert!(!needs_remote_files(source, &push("refs/heads/dev")));
-        assert!(!needs_remote_files(CONFIG, &push("refs/heads/main")));
-        assert!(!needs_remote_files("jobs: [", &push("refs/heads/main")));
+        assert_eq!(remote_workflows(source, &push("refs/heads/main")), ["ci"]);
+        assert_eq!(remote_workflows(source, &push("refs/heads/dev")), ["other"]);
+        assert_eq!(remote_workflows(CONFIG, &push("refs/heads/main")).len(), 0);
+        assert_eq!(
+            remote_workflows("jobs: [", &push("refs/heads/main")).len(),
+            0
+        );
     }
 }

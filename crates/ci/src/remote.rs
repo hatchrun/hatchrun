@@ -23,7 +23,7 @@ use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
 use hatchrun_workflow::{
-    Callee, Config, Library, MAX_UNIQUE_CALLEES, RemoteCall, convert, remote_calls,
+    Callee, Config, Library, MAX_UNIQUE_CALLEES, RemoteCall, convert, remote_calls_from,
 };
 
 use crate::env::Settings;
@@ -62,36 +62,45 @@ pub fn refusal(call: &RemoteCall, owned: bool, private: bool) -> Option<String> 
     ))
 }
 
-/// Reads every file of another repository that `config` calls, and
-/// those they call. A file that may not be used is recorded in the
+/// Reads every file of another repository that the workflows `workflows`
+/// of `config` call, and those they call. A file that may not be used is recorded in the
 /// library with the reason, for the plan to report where it is called.
 ///
 /// # Errors
 ///
 /// GitHub or the database failed; the caller retries the delivery.
-pub async fn read_library<S: Source>(source: &S, config: &Config) -> Result<Library, String> {
+pub async fn read_library<S: Source>(
+    source: &S,
+    config: &Config,
+    workflows: &[&str],
+) -> Result<Library, String> {
     let mut library = Library::default();
-    let mut read = 0usize;
-    loop {
-        let wanted = remote_calls(config, &library);
-        if wanted.is_empty() {
-            return Ok(library);
-        }
-        for call in wanted {
-            read += 1;
-            if read > MAX_UNIQUE_CALLEES {
-                library.refuse(
-                    call,
-                    format!("a run may call at most {MAX_UNIQUE_CALLEES} different workflows"),
-                );
-                continue;
+    // The limit counts the files one workflow reaches, as the planner
+    // counts them for one plan.
+    for name in workflows {
+        let mut read = 0usize;
+        loop {
+            let wanted = remote_calls_from(config, &[name], &library);
+            if wanted.is_empty() {
+                break;
             }
-            match read_one(source, &call).await? {
-                Ok(callee) => library.insert(call, callee),
-                Err(reason) => library.refuse(call, reason),
+            for call in wanted {
+                read += 1;
+                if read > MAX_UNIQUE_CALLEES {
+                    library.refuse(
+                        call,
+                        format!("a run may call at most {MAX_UNIQUE_CALLEES} different workflows"),
+                    );
+                    continue;
+                }
+                match read_one(source, &call).await? {
+                    Ok(callee) => library.insert(call, callee),
+                    Err(reason) => library.refuse(call, reason),
+                }
             }
         }
     }
+    Ok(library)
 }
 
 /// The file `call` names as a callee, or why it cannot be one.
@@ -239,7 +248,7 @@ impl Source for Github<'_> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use hatchrun_workflow::{compile_with, parse};
+    use hatchrun_workflow::{compile_with, parse, remote_calls};
 
     use super::*;
 
@@ -263,6 +272,8 @@ jobs:
     struct Fake {
         repos: BTreeMap<&'static str, (bool, bool)>,
         files: BTreeMap<(&'static str, &'static str), &'static str>,
+        /// Every path of a known repository is the reusable file.
+        any_file: bool,
     }
 
     #[allow(clippy::unused_async_trait_impl)]
@@ -281,6 +292,9 @@ jobs:
         }
 
         async fn file(&self, repo: &str, path: &str, _sha: &str) -> Result<Option<String>, String> {
+            if self.any_file && self.repos.contains_key(repo) {
+                return Ok(Some(REUSABLE.to_owned()));
+            }
             Ok(self
                 .files
                 .iter()
@@ -318,7 +332,7 @@ workflows:
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(read_library(source, config))
+            .block_on(read_library(source, config, &["ci"]))
             .unwrap()
     }
 
@@ -476,6 +490,121 @@ workflows:
             refusal(&call, false, true)
                 .unwrap()
                 .starts_with("o/r is a private repository")
+        );
+    }
+
+    #[test]
+    fn a_file_that_calls_itself_ends_the_walk_and_the_plan_reports_the_cycle() {
+        let mut source = fake("acme/shared", false, true);
+        source.files.insert(
+            ("acme/shared", ".github/workflows/build.yml"),
+            "on: workflow_call\njobs:\n  j:\n    uses: acme/shared/.github/workflows/build.yml@v1\n",
+        );
+        let config = parse(&format!(
+            "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs: [{{ up: {{ call: '{CALL}' }} }}]
+"
+        ))
+        .unwrap();
+        let library = read(&source, &config);
+        assert!(plan_error(&library, &config).contains("makes a cycle"));
+    }
+
+    #[test]
+    fn two_files_that_call_each_other_end_the_walk() {
+        let mut source = fake("acme/shared", false, true);
+        source.files.insert(
+            ("acme/shared", ".github/workflows/build.yml"),
+            "on: workflow_call\njobs:\n  j:\n    uses: acme/shared/.github/workflows/other.yml@v1\n",
+        );
+        source.files.insert(
+            ("acme/shared", ".github/workflows/other.yml"),
+            "on: workflow_call\njobs:\n  k:\n    uses: acme/shared/.github/workflows/build.yml@v1\n",
+        );
+        let config = parse(&format!(
+            "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  ci:
+    on: {{ push: {{}} }}
+    jobs: [{{ up: {{ call: '{CALL}' }} }}]
+"
+        ))
+        .unwrap();
+        let library = read(&source, &config);
+        assert_eq!(remote_calls(&config, &library).len(), 0);
+        assert!(plan_error(&library, &config).contains("makes a cycle"));
+    }
+
+    #[test]
+    fn the_limit_counts_the_files_one_workflow_reaches() {
+        let mut source = fake("acme/shared", false, true);
+        source.any_file = true;
+        let jobs = |from: usize, to: usize| {
+            (from..to)
+                .map(|i| {
+                    format!("{{ c{i}: {{ call: 'acme/shared/.github/workflows/f{i}.yml@v1', with: {{ target: x }} }} }}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // 12 and 12 files: 24 between two workflows, 12 for each.
+        let config = parse(&format!(
+            "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  a:
+    on: {{ push: {{}} }}
+    jobs: [{}]
+  b:
+    on: {{ push: {{}} }}
+    jobs: [{}]
+",
+            jobs(0, 12),
+            jobs(12, 24)
+        ))
+        .unwrap();
+        let both = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(read_library(&source, &config, &["a", "b"]))
+            .unwrap();
+        assert!(compile_with(&config, "a", "refs/heads/main", &both).is_ok());
+        assert!(compile_with(&config, "b", "refs/heads/main", &both).is_ok());
+        // Only the workflow asked for is read.
+        let only_a = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(read_library(&source, &config, &["a"]))
+            .unwrap();
+        assert!(compile_with(&config, "a", "refs/heads/main", &only_a).is_ok());
+        assert!(compile_with(&config, "b", "refs/heads/main", &only_a).is_err());
+        // 25 files for one workflow: the extra one is refused.
+        let config = parse(&format!(
+            "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  a:
+    on: {{ push: {{}} }}
+    jobs: [{}]
+",
+            jobs(0, 25)
+        ))
+        .unwrap();
+        let big = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(read_library(&source, &config, &["a"]))
+            .unwrap();
+        let errors = compile_with(&config, "a", "refs/heads/main", &big).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("at most 20 different workflows"))
         );
     }
 }

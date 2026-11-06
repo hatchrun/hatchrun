@@ -1072,7 +1072,9 @@ impl<'a> Cx<'a> {
         let ctx = self.github_ctx(info).await?;
         let vars = store::job_vars(db, &info.tenant_id, info.repo.id, None).await?;
         let workflow_ctx = concurrency::context(&ctx, &vars);
-        let Some(job_ctx) = graph.job_context(job, &ctx, &vars) else {
+        // A job whose inputs cannot be read ends as failed when it is
+        // decided; it has no concurrency slot to claim.
+        let Some(Ok(job_ctx)) = graph.job_context(job, &ctx, &vars) else {
             return Ok(());
         };
         for slot in concurrency::claims(info, node, &workflow_ctx, &job_ctx, self.now) {
@@ -1275,6 +1277,28 @@ impl<'a> Cx<'a> {
         answer(204)
     }
 
+    /// The `inputs` of a job that runs in a called workflow, or the
+    /// message that says why they cannot be read. `None` for a job of
+    /// the workflow that was started.
+    async fn call_inputs(
+        &self,
+        run: &Loaded,
+        job: u64,
+    ) -> Result<std::result::Result<Option<Value>, String>> {
+        if run.graph.node(job).is_none_or(|n| n.job.scope.is_empty()) {
+            return Ok(Ok(None));
+        }
+        let ctx = self.github_ctx(&run.info).await?;
+        let vars = store::job_vars(
+            self.db().await?,
+            &run.info.tenant_id,
+            run.info.repo.id,
+            None,
+        )
+        .await?;
+        Ok(run.graph.call_inputs(job, &ctx, &vars))
+    }
+
     async fn claim(
         &self,
         job: u64,
@@ -1282,13 +1306,36 @@ impl<'a> Cx<'a> {
         token: String,
         capped: Vec<Capped>,
     ) -> Result<Response> {
-        let first = {
+        // The inputs a job of a called workflow reads are made before the
+        // job moves: one that cannot be read ends the job as failed, with
+        // the message, and is never left running.
+        let (first, inputs, failed) = {
             let _turn = self.turn.lock().await;
-            let Some(run) = self.loaded().await? else {
+            let Some(mut run) = self.loaded().await? else {
                 return answer(409);
             };
-            gate(run.graph.node(job), attempt)
+            let first = gate(run.graph.node(job), attempt);
+            let mut inputs = None;
+            let mut failed = None;
+            if matches!(first, Gate::Queued | Gate::Running) {
+                match self.call_inputs(&run, job).await? {
+                    Ok(found) => inputs = found,
+                    Err(message) => {
+                        let ctx = self.github_ctx(&run.info).await?;
+                        self.load_vars(&mut run, job).await?;
+                        let actions = run.graph_mut().failed(job, message, &ctx);
+                        let revoke = self.apply_actions(&mut run, actions).await?;
+                        self.commit(&mut run).await?;
+                        failed = Some(revoke);
+                    }
+                }
+            }
+            (first, inputs, failed)
         };
+        if let Some(revoke) = failed {
+            self.after(revoke).await;
+            return answer(409);
+        }
         match first {
             Gate::Missing => return Response::error("no such job", 404),
             Gate::Stale | Gate::Ended => return answer(409),
@@ -1333,21 +1380,6 @@ impl<'a> Cx<'a> {
                 state.heartbeat_written_at = self.now;
             }
             self.put_job(job, &state).await?;
-            // A job of a called workflow reads the inputs its calls passed.
-            let inputs = if run.graph.node(job).is_some_and(|n| !n.job.scope.is_empty()) {
-                let ctx = self.github_ctx(&run.info).await?;
-                let vars = store::job_vars(
-                    self.db().await?,
-                    &run.info.tenant_id,
-                    run.info.repo.id,
-                    None,
-                )
-                .await?;
-                run.graph_mut().set_vars(vars);
-                run.graph.call_inputs(job, &ctx).map_err(fail)?
-            } else {
-                None
-            };
             let document = job_document(
                 &run.info,
                 &self.event().await?,

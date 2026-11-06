@@ -367,7 +367,10 @@ mod tests {
         gh: &Value,
         vars: &BTreeMap<String, String>,
     ) -> Vec<NewSlot> {
-        let job_ctx = graph.job_context(7, gh, vars).expect("job 7");
+        let job_ctx = graph
+            .job_context(7, gh, vars)
+            .expect("job 7")
+            .expect("inputs");
         claims(run, &graph.jobs[0], &context(gh, vars), &job_ctx, 5)
     }
 

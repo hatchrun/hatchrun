@@ -569,26 +569,14 @@ fn outputs(owner: &str, target: &Target<'_>, trigger: &CallTrigger, errors: &mut
         .collect();
     for (name, text) in &trigger.outputs {
         let field = format!("`on.call.outputs.{name}` of `{}`", target.shown);
-        let found = match expr::expressions(text) {
-            Ok(found) => found,
-            Err(e) => {
-                problem(errors, owner, format!("{field} has a bad expression: {e}"));
-                continue;
-            }
-        };
-        for (_, inner) in found {
-            for (context, _) in expr::contexts(inner).unwrap_or_default() {
-                if !OUTPUT_CONTEXTS.contains(&context.as_ref()) {
-                    problem(
-                        errors,
-                        owner,
-                        format!(
-                            "{field} reads `{context}`; it can read only {}",
-                            OUTPUT_CONTEXTS.join(", ")
-                        ),
-                    );
-                }
-            }
+        for message in output_expression(&field, text) {
+            problem(errors, owner, message);
+        }
+        for inner in expr::expressions(text)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, e)| e)
+        {
             for job in jobs_read(inner) {
                 if !entries.contains(job.as_str()) {
                     problem(

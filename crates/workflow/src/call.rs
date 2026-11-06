@@ -38,7 +38,7 @@
 //! reads the callee's `outputs`, and `requires: [prod]` waits for every
 //! job of the callee.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::de::{self, Deserializer, MapAccess, Visitor};
@@ -433,25 +433,50 @@ impl Library {
 /// more; ask again after adding what this returns, until it is empty.
 #[must_use]
 pub fn remote_calls(config: &Config, library: &Library) -> Vec<RemoteCall> {
+    let all: Vec<&str> = config.workflows.keys().map(String::as_str).collect();
+    remote_calls_from(config, &all, library)
+}
+
+/// [`remote_calls`] for the calls the workflows `workflows` of `config`
+/// reach: their own, those of the workflows of the config they call, and
+/// those of the files already in `library`. A workflow or file is
+/// walked once, so a file that calls itself ends the walk; the planner
+/// reports the cycle.
+#[must_use]
+pub fn remote_calls_from(
+    config: &Config,
+    workflows: &[&str],
+    library: &Library,
+) -> Vec<RemoteCall> {
     let mut out: Vec<RemoteCall> = Vec::new();
-    let mut seen: Vec<&Config> = vec![config];
-    let mut at = 0;
-    while at < seen.len() {
-        let current = seen[at];
-        at += 1;
-        for wf in current.workflows.values() {
-            for entry in &wf.jobs {
-                let Some(Ok(CallTarget::Remote(call))) =
-                    entry.call.as_deref().map(CallTarget::parse)
-                else {
-                    continue;
-                };
-                match library.get(&call) {
-                    Some(callee) => seen.push(&callee.config),
+    let mut walked: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut todo: Vec<(&Config, &str, String)> = workflows
+        .iter()
+        .map(|name| (config, *name, String::new()))
+        .collect();
+    while let Some((current, name, origin)) = todo.pop() {
+        if !walked.insert((origin.clone(), name.to_owned())) {
+            continue;
+        }
+        let Some(wf) = current.workflows.get(name) else {
+            continue;
+        };
+        for entry in &wf.jobs {
+            match entry.call.as_deref().map(CallTarget::parse) {
+                Some(Ok(CallTarget::Local(key))) => {
+                    if let Some((key, _)) = current.workflows.get_key_value(&key) {
+                        todo.push((current, key.as_str(), origin.clone()));
+                    }
+                }
+                Some(Ok(CallTarget::Remote(call))) => match library.get(&call) {
+                    Some(callee) => {
+                        todo.push((&callee.config, callee.workflow.as_str(), call.to_string()));
+                    }
                     None if library.refusal(&call).is_some() => {}
                     None if !out.contains(&call) => out.push(call),
                     None => {}
-                }
+                },
+                _ => {}
             }
         }
     }

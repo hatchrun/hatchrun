@@ -153,9 +153,26 @@ pub fn repo_is_private(response: &Response) -> Result<Option<bool>, String> {
         true
     }
     match response.status {
+        403 if rate_limited(response) => Err(format!(
+            "repository: GitHub throttled the request: {}",
+            response.text()
+        )),
         403 | 404 => Ok(None),
         _ => decode::<Repo>(response, "repository").map(|r| Some(r.private)),
     }
+}
+
+/// Whether a 403 is a rate or abuse limit, not a refusal: GitHub marks
+/// it with `Retry-After`, an exhausted `X-RateLimit-Remaining` or its
+/// message.
+fn rate_limited(response: &Response) -> bool {
+    if response.header("retry-after").is_some()
+        || response.header("x-ratelimit-remaining") == Some("0")
+    {
+        return true;
+    }
+    let text = response.text().to_ascii_lowercase();
+    text.contains("rate limit") || text.contains("abuse")
 }
 
 /// One page of the files a pull request changes, 100 to a page.
@@ -650,6 +667,35 @@ mod tests {
         assert_eq!(r.header_value("Authorization"), Some("Bearer tok"));
         assert_eq!(r.header_value("User-Agent"), Some("hatchrun-ci"));
         assert_eq!(r.header_value("X-GitHub-Api-Version"), Some("2022-11-28"));
+    }
+
+    #[test]
+    fn a_repository_the_installation_hides_is_none_and_a_throttle_is_an_error() {
+        assert_eq!(repo_is_private(&answer(404, &[], "{}")), Ok(None));
+        assert_eq!(
+            repo_is_private(&answer(
+                403,
+                &[],
+                r#"{"message":"Resource not accessible"}"#
+            )),
+            Ok(None)
+        );
+        assert_eq!(
+            repo_is_private(&answer(200, &[], r#"{"private":false}"#)),
+            Ok(Some(false))
+        );
+        for limited in [
+            answer(403, &[("retry-after", "30")], "{}"),
+            answer(403, &[("x-ratelimit-remaining", "0")], "{}"),
+            answer(
+                403,
+                &[],
+                r#"{"message":"You have exceeded a secondary rate limit"}"#,
+            ),
+            answer(403, &[], r#"{"message":"abuse detection mechanism"}"#),
+        ] {
+            assert!(repo_is_private(&limited).is_err(), "{limited:?}");
+        }
     }
 
     #[test]
