@@ -198,7 +198,7 @@ function Crumbs({
       aria-label="Breadcrumb"
       className="flex min-w-0 items-center gap-2 font-mono text-[13px] text-fg-3"
     >
-      <Link href={orgUrl(route.org)} className="text-fg hover:text-brand">
+      <Link href={orgUrl(route.org)} className="link">
         {route.org}
       </Link>
       {sep}
@@ -320,7 +320,7 @@ function Header({
           <a
             href={`https://github.com/${run.repository}/commit/${run.sha}`}
             aria-label={`Commit ${shortSha(run.sha)} on GitHub, opens github.com`}
-            className="inline-flex items-center gap-1.5 text-fg underline decoration-control underline-offset-4 hover:text-brand"
+            className="inline-flex items-center gap-1.5 link"
           >
             {shortSha(run.sha)}
             <ExternalLink size={10} aria-hidden="true" className="text-fg-3" />
@@ -337,7 +337,7 @@ function Header({
         {run.pull_request && (
           <span className="flex min-w-0 items-center gap-2">
             <span className="cap">pull request</span>
-            <Link href={repoUrl(run.repository, "pulls")} title={run.pull_request.title} className="max-w-[320px] truncate text-fg underline decoration-control underline-offset-4 hover:text-brand">
+            <Link href={repoUrl(run.repository, "pulls")} title={run.pull_request.title} className="max-w-[320px] truncate link">
               #{run.pull_request.number} {run.pull_request.title}
             </Link>
           </span>
@@ -397,7 +397,7 @@ function Artifacts({ run }: { run: Run }) {
           >
             <a
               href={ciArtifactUrl(run.id, artifact.id)}
-              className="min-w-0 truncate font-bold text-fg hover:text-brand"
+              className="min-w-0 truncate font-bold link"
             >
               {artifact.name}
             </a>

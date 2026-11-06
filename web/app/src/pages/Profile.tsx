@@ -103,7 +103,7 @@ export function Profile({ user }: { user: User }) {
             {CLI_INSTALL}
           </span>
           <button type="button" aria-label={copied ? "Copied" : "Copy install command"} onClick={copy} className="cursor-pointer border-0 bg-transparent p-2 text-fg-3 hover:text-fg">
-            {copied ? <Check size={14} className="text-passed" /> : <Copy size={14} />}
+            {copied ? <Check size={14} className="text-fg-2" /> : <Copy size={14} />}
           </button>
         </div>
       </section>
@@ -143,7 +143,7 @@ function OrgList({ list, filter, shown, more }: { list: TenantSummary[]; filter:
           {Math.min(shown, matching.length)} of {matching.length} organizations
         </span>
         {shown < matching.length && (
-          <button type="button" onClick={more} className="cursor-pointer border-0 bg-transparent p-0 font-mono text-xs text-fg quiet-underline hover:text-brand">
+          <button type="button" onClick={more} className="cursor-pointer border-0 bg-transparent p-0 font-mono text-xs link">
             Show more
           </button>
         )}

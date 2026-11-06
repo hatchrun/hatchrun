@@ -53,6 +53,22 @@ export function Kit({ org }: OrgPageProps) {
         </div>
       </section>
       <section className="flex flex-col gap-2">
+        <h2 className="section-title">Colour rules: link, count-badge, selected-item, error-line</h2>
+        <div className="flex flex-wrap items-center gap-3 text-[13px]">
+          <a href="#kit" className="link">a link</a>
+          <span className="count-badge">12</span>
+          <span className="selected-item px-3 py-1">selected item</span>
+          <span className="error-line px-3 py-1">An error line</span>
+          <span className="text-failed">short inline error</span>
+        </div>
+        <div className="flex gap-1">
+          <span className="size-3 rounded-[2px] bg-control" />
+          <span className="size-3 rounded-[2px] bg-control" />
+          <span className="size-3 rounded-[2px] bg-failed" />
+        </div>
+        <span className="meta">Accent only marks the current tab, the primary button, focus and the selected item. Passed is grey; failures are coloured.</span>
+      </section>
+      <section className="flex flex-col gap-2">
         <h2 className="section-title">ScopePicker</h2>
         <ScopePicker org={org} value={scope} onChange={setScope} />
         <span className="meta">{JSON.stringify(scope)}</span>

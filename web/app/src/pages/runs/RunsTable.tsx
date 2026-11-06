@@ -6,13 +6,11 @@ import { ChevronRight } from "lucide-react";
 
 import type { CiRun } from "@/api";
 import { JobSquares } from "@/components/JobSquares";
-import { STATUS, StatusPill, ciStatus, type Status } from "@/components/StatusPill";
+import { STATUS, StatusPill, ciStatus } from "@/components/StatusPill";
 import { Truncate } from "@/components/Truncate";
 import { ago, duration, shortSha } from "@/lib/format";
 import { repoUrl, runUrl, workflowUrl } from "@/lib/urls";
 import { Link } from "@/router";
-
-const EDGE: Partial<Record<Status, string>> = { failed: "--failed", waiting: "--waiting", running: "--running" };
 
 const TH = "cap px-3 py-2.5 text-left font-normal";
 // Under 1500px actor, duration and jobs fold into a second line under the
@@ -63,7 +61,7 @@ export function RunsTable({ runs, now, inRepo = false, inWorkflow = false }: { r
             );
             return (
               <tr key={run.id} className="group border-t border-rule hover:bg-raised">
-                <td className="max-w-0 min-w-[200px] py-2.5 pr-3 pl-3.5 whitespace-nowrap min-[1000px]:max-w-[320px]" style={EDGE[status] ? { boxShadow: `inset 3px 0 0 var(${EDGE[status]})` } : undefined}>
+                <td className={`max-w-0 min-w-[200px] py-2.5 pr-3 pl-3.5 whitespace-nowrap min-[1000px]:max-w-[320px] ${STATUS[status].edge}`}>
                   <span className="flex max-w-full items-center gap-2.5">
                     {!inRepo && (
                       <Link href={repoUrl(run.repository)} className="min-w-0 truncate font-semibold hover:underline" title={run.repository}>

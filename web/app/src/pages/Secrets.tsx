@@ -223,7 +223,7 @@ export function Secrets({ org, tenant }: OrgPageProps) {
           {items.map((row) => {
             const inheritedRow = row.scope !== value.scope;
             const staleDays = staleFor(row, now);
-            const edge = staleDays !== null ? { boxShadow: "inset 3px 0 0 var(--waiting)" } : undefined;
+            const edge = staleDays !== null ? { boxShadow: "inset 2px 0 0 color-mix(in srgb, var(--waiting) 60%, transparent)" } : undefined;
             return (
               <Fragment key={`${row.scope}/${row.name}`}>
                 <tr className={cn("border-t border-rule hover:bg-panel", row.shadowed && "opacity-50")}>
@@ -231,7 +231,7 @@ export function Secrets({ org, tenant }: OrgPageProps) {
                     <span className="inline-flex max-w-full items-center gap-2">
                       <Truncate value={row.name} mono className="font-bold" />
                       {(row.shadowed || inheritedRow) && (
-                        <span className="shrink-0 rounded-xs border border-control px-1.5 font-mono text-[11px] tracking-[0.04em] text-fg-2 uppercase">
+                        <span className="shrink-0 rounded-xs border border-control px-1.5 font-mono text-xs tracking-[0.04em] text-fg-2 uppercase">
                           {row.shadowed ? "overridden" : `from ${row.scope}`}
                         </span>
                       )}
@@ -299,7 +299,7 @@ export function Secrets({ org, tenant }: OrgPageProps) {
           {tenant.role === "admin" && (
             <>
               {summary && " · "}
-              <Link href={orgUrl(org, "settings/audit")} className="text-brand quiet-underline">
+              <Link href={orgUrl(org, "settings/audit")} className="link">
                 audit log →
               </Link>
             </>
@@ -492,7 +492,7 @@ export function Secrets({ org, tenant }: OrgPageProps) {
           role="status"
           className="fixed right-6 bottom-6 z-30 flex items-center gap-3 rounded-sm border border-control bg-raised px-4 py-2 font-mono text-[13px] shadow-lg"
         >
-          <span aria-hidden="true" className="text-passed">
+          <span aria-hidden="true" className="text-fg-2">
             ✓
           </span>
           <span>{toast}</span>

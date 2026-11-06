@@ -129,7 +129,7 @@ export function PickList({
               className={cn(
                 "flex w-full cursor-pointer items-center gap-2.5 px-3 py-1.5 text-left text-sm text-fg",
                 index === active && "bg-rule",
-                item.selected && "bg-brand/10 shadow-[inset_2px_0_0_var(--brand)]",
+                item.selected && "selected-item",
               )}
             >
               <span className={cn("min-w-0 flex-1 truncate", item.mono ? "font-mono text-[13px]" : "font-semibold")}>

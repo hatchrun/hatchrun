@@ -18,7 +18,7 @@ export function Spinner({ label = "Loading" }: { label?: string }) {
 
 export function LoadError({ error, retry }: { error: Error; retry?: () => void }) {
   return (
-    <div className="flex flex-wrap items-center gap-3 rounded-sm border border-failed/40 bg-failed/12 px-3 py-2 text-failed-soft" role="alert">
+    <div className="flex flex-wrap items-center gap-3 error-line rounded-xs px-3 py-2" role="alert">
       <p className="m-0 min-w-0 flex-1">{error.message}</p>
       {retry && (
         <Button variant="outline" size="sm" onClick={retry}>

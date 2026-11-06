@@ -20,15 +20,22 @@
 
 :root {
   /*
-   * Tokens v2 (design 2026-11-unified-console/Tokens.dc.html). The brand
-   * palette stays on the website and logo; the app uses this dimmed set.
+   * Ember, tuned (brand designs/2026-11-unified-console, "Colour and
+   * type"). This file is the only place the app's colours are written
+   * down; components use the roles below. The brand palette stays on the
+   * website and logo.
    *
    * Grounds: background < panel < raised; rule divides inside panels,
-   * control borders inputs and buttons.
-   * Text: fg, fg-2, fg-3. Nothing dimmer is used for text.
-   * brand is the yellow accent. Use it only for the current page, the
-   * primary button, the focus ring and the selected list item.
-   * Status colours always come with their glyph (see StatusPill).
+   * control borders inputs and buttons, and fills passed job squares and
+   * passed chart bars.
+   * Text: fg, fg-2, fg-3. Nothing dimmer is used for text, except log
+   * line numbers in queued.
+   * brand is the accent. It marks four things only: the current tab, the
+   * primary button, the focus ring and the selected list item. Links are
+   * fg-2 with an underline; counts and badges are fg-3 on raised.
+   * A status is a dot or glyph in its colour with the word in fg-2. Only
+   * failed and waiting colour their word and get a 2px edge at 60%.
+   * queued is a dot colour only, never text.
    */
   --background: #141517;
   --panel: #1a1c1f;
@@ -38,14 +45,13 @@
   --fg: #e3ded3;
   --fg-2: #b4b0a7;
   --fg-3: #8a8f96;
-  --brand: #e8be3f;
-  --brand-hover: #f0c94f;
-  --passed: #6fc891;
-  --running: #e8895a;
-  --failed: #e07aa8;
-  --failed-soft: #f0b3ce;
-  --waiting: #d9b65a;
-  --queued: #8a8f96;
+  --brand: #cdae5c;
+  --brand-hover: color-mix(in srgb, var(--brand) 88%, var(--fg));
+  --passed: #8faf95;
+  --running: #c9936f;
+  --failed: #d08a9c;
+  --waiting: #c2a872;
+  --queued: #5e636a;
 
   --foreground: var(--fg);
   --card: var(--panel);
@@ -80,11 +86,9 @@
   --fg-2: #46484c;
   --fg-3: #5c6066;
   --brand: #b8860b;
-  --brand-hover: #a6790a;
   --passed: #1f7a45;
   --running: #b4501f;
   --failed: #b42361;
-  --failed-soft: #8c1d4d;
   --waiting: #8a6a0a;
   --queued: #5c6066;
   --primary-foreground: #ffffff;
@@ -126,7 +130,6 @@
   --color-passed: var(--passed);
   --color-running: var(--running);
   --color-failed: var(--failed);
-  --color-failed-soft: var(--failed-soft);
   --color-waiting: var(--waiting);
   --color-queued: var(--queued);
 
@@ -235,4 +238,44 @@ summary:focus-visible,
   text-decoration: underline;
   text-decoration-color: var(--control);
   text-underline-offset: 3px;
+}
+
+/* A link: text-2 with an underline. The accent never marks links. */
+@utility link {
+  color: var(--fg-2);
+  text-decoration: underline;
+  text-decoration-color: var(--control);
+  text-underline-offset: 3px;
+  &:hover {
+    color: var(--fg);
+    text-decoration-color: var(--fg-3);
+  }
+}
+
+/* A count or badge: text-3 on raised. */
+@utility count-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 3px;
+  padding: 0 6px;
+  background: var(--raised);
+  color: var(--fg-3);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The selected list item: a 2px accent bar and a 10% accent tint. */
+@utility selected-item {
+  box-shadow: inset 2px 0 0 var(--brand);
+  background: color-mix(in srgb, var(--brand) 10%, transparent);
+  color: var(--fg);
+}
+
+/* An error: a 2px failed bar, a 6% failed tint, primary text. Log error lines and alerts. */
+@utility error-line {
+  border-left: 2px solid var(--failed);
+  background: color-mix(in srgb, var(--failed) 6%, transparent);
+  color: var(--fg);
 }

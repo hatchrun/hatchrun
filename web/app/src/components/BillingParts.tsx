@@ -40,7 +40,7 @@ export function CardButton({ org, card, primary = true }: { org: string; card: b
         {card ? "Manage card" : "Add a card"}
       </Button>
       {error && (
-        <span role="alert" className="font-mono text-xs text-failed-soft">
+        <span role="alert" className="font-mono text-xs text-failed">
           {error}
         </span>
       )}
@@ -114,12 +114,12 @@ export function SpendCapForm({
         {busy ? "Saving" : "Save cap"}
       </Button>
       {saved && (
-        <span role="status" className="inline-flex h-8 items-center gap-1.5 font-mono text-xs text-passed">
+        <span role="status" className="inline-flex h-8 items-center gap-1.5 font-mono text-xs text-fg-2">
           <span aria-hidden="true">✓</span>Cap saved
         </span>
       )}
       {problem && (
-        <p id={`${id}-error`} role="alert" className="m-0 basis-full font-mono text-xs text-failed-soft">
+        <p id={`${id}-error`} role="alert" className="m-0 basis-full font-mono text-xs text-failed">
           {problem}
         </p>
       )}

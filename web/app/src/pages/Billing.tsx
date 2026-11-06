@@ -66,7 +66,7 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
         </Figure>
         <Figure label={`Projected for ${month}`} className="flex-[1_1_200px] border-l border-control">
           <span className="font-mono text-[26px] leading-8 font-bold">{dollars(projected)}</span>
-          <span className="font-mono text-[11px] text-fg-3">at the current daily rate</span>
+          <span className="font-mono text-xs text-fg-3">at the current daily rate</span>
         </Figure>
         <Figure label="Card on file" className="flex-[1_1_240px] border-l border-control">
           <span className="mt-1 font-mono text-sm">{billing.card ? cardText(billing.card) : "No card"}</span>
@@ -94,7 +94,7 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
             </thead>
             <tbody>
               <tr className="border-t border-rule hover:bg-panel">
-                <td className="px-3.5 py-2.5 font-bold shadow-[inset_3px_0_0_var(--brand)]">hatchrun CI</td>
+                <td className="px-3.5 py-2.5 font-bold">hatchrun CI</td>
                 <td className="px-3 py-2.5 font-mono text-xs text-fg-2">2 vCPU seconds</td>
                 <td className="px-3 py-2.5 text-right font-mono text-xs">{billing.units.toLocaleString("en-US")}</td>
                 <td className="px-3.5 py-2.5 text-right font-mono text-xs">{dollars(spent, true)}</td>
@@ -135,9 +135,9 @@ function BillingBody({ org, billing, month, now, reload }: { org: string; billin
               aria-valuenow={percent}
               className="h-2.5 overflow-hidden rounded-sm border border-control bg-background"
             >
-              <div className={cn("h-full", reached ? "bg-waiting" : "bg-brand")} style={{ width: `${percent}%` }} />
+              <div className={cn("h-full", reached ? "bg-failed" : "bg-fg-3")} style={{ width: `${percent}%` }} />
             </div>
-            <p className={cn("m-0 mt-2 font-mono text-xs", reached ? "text-waiting" : "text-fg-3")}>
+            <p className={cn("m-0 mt-2 font-mono text-xs", reached ? "text-failed" : "text-fg-3")}>
               {billing.card === null
                 ? "A card is required. New CI jobs wait until one is added."
                 : reached
@@ -193,7 +193,7 @@ function DailyChart({ days, now, month }: { days: CiDay[]; now: Date; month: str
       <div className={cn(HEAD, "flex flex-wrap items-baseline justify-between gap-2")}>
         <span className="cap">Spend per day, {month}</span>
         <span className="font-mono text-xs text-fg-2">
-          <span aria-hidden="true" className="mr-1.5 inline-block size-2.5 rounded-[1px] bg-brand" />
+          <span aria-hidden="true" className="mr-1.5 inline-block size-2.5 rounded-[1px] bg-control" />
           hatchrun CI
         </span>
       </div>
@@ -204,7 +204,7 @@ function DailyChart({ days, now, month }: { days: CiDay[]; now: Date; month: str
             return (
               <g key={share}>
                 <line x1={CHART.left} x2={CHART.right} y1={y} y2={y} className="stroke-rule" />
-                <text x={CHART.left - 8} y={y + 4} textAnchor="end" fontSize={11} className="fill-fg-3 font-mono">
+                <text x={CHART.left - 8} y={y + 4} textAnchor="end" fontSize={12} className="fill-fg-3 font-mono">
                   {dollars((top * share) / 100)}
                 </text>
               </g>
@@ -221,12 +221,12 @@ function DailyChart({ days, now, month }: { days: CiDay[]; now: Date; month: str
               <g key={n}>
                 <title>{tip}</title>
                 {day ? (
-                  <rect x={x} y={CHART.base - Math.max(h, day.cents > 0 ? 1 : 0)} width={width} height={Math.max(h, day.cents > 0 ? 1 : 0)} className="fill-brand" />
+                  <rect x={x} y={CHART.base - Math.max(h, day.cents > 0 ? 1 : 0)} width={width} height={Math.max(h, day.cents > 0 ? 1 : 0)} className="fill-control" />
                 ) : (
                   <rect x={x} y={CHART.base - 40} width={width} height={40} fill="none" strokeDasharray="3 3" className="stroke-rule" />
                 )}
                 {(n === 0 || (n + 1) % 5 === 0 || n + 1 === count) && (
-                  <text x={x + width / 2} y={226} textAnchor="middle" fontSize={11} className="fill-fg-3 font-mono">
+                  <text x={x + width / 2} y={226} textAnchor="middle" fontSize={12} className="fill-fg-3 font-mono">
                     {n + 1}
                   </text>
                 )}
@@ -234,10 +234,10 @@ function DailyChart({ days, now, month }: { days: CiDay[]; now: Date; month: str
             );
           })}
           <line x1={CHART.left} x2={CHART.right} y1={CHART.base} y2={CHART.base} className="stroke-control" />
-          <text x={(CHART.left + CHART.right) / 2} y={244} textAnchor="middle" fontSize={11} className="fill-fg-3 font-mono">
+          <text x={(CHART.left + CHART.right) / 2} y={244} textAnchor="middle" fontSize={12} className="fill-fg-3 font-mono">
             DAY OF {month.toUpperCase()} (UTC)
           </text>
-          <text x={CHART.right} y={16} textAnchor="end" fontSize={11} className="fill-fg-2 font-mono">
+          <text x={CHART.right} y={16} textAnchor="end" fontSize={12} className="fill-fg-2 font-mono">
             peak {dollars(peak / 100, true)} / day
           </text>
         </svg>
@@ -278,7 +278,7 @@ function Invoices({ invoices }: { invoices: CiInvoice[] }) {
                     <td className="px-3.5 py-2.5 font-bold">{month}</td>
                     <td className="px-3 py-2.5 text-right font-mono text-xs">{money(invoice.amount_cents)}</td>
                     <td className="px-3 py-2.5">
-                      <span className={cn("inline-flex items-center gap-1.5 rounded-sm border px-2 py-px font-mono text-xs font-bold", paid ? "border-passed text-passed" : "border-control text-fg-2")}>
+                      <span className={cn("inline-flex items-center gap-1.5 rounded-sm border px-2 py-px font-mono text-xs font-bold", "border-control text-fg-2")}>
                         {paid && <span aria-hidden="true">✓</span>}
                         {invoice.status.replace(/_/g, " ")}
                       </span>
@@ -290,7 +290,7 @@ function Invoices({ invoices }: { invoices: CiInvoice[] }) {
                       {invoice.url === null ? (
                         <span className="font-mono text-xs text-fg-3">Not ready</span>
                       ) : (
-                        <a href={invoice.url} target="_blank" rel="noreferrer" aria-label={`Open the ${month} invoice`} className="inline-flex items-center gap-1.5 font-mono text-xs text-fg quiet-underline hover:text-brand">
+                        <a href={invoice.url} target="_blank" rel="noreferrer" aria-label={`Open the ${month} invoice`} className="inline-flex items-center gap-1.5 font-mono text-xs link">
                           Open <ExternalLink size={11} aria-hidden="true" />
                         </a>
                       )}

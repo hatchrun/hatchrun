@@ -78,7 +78,7 @@ function Crumbs({ org, repo, workflow }: { org: string; repo: string; workflow: 
   const link = "min-w-0 truncate underline decoration-control underline-offset-4 hover:text-fg";
   return (
     <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-2 font-mono text-[13px] text-fg-3">
-      <Link href={orgUrl(org)} className="text-fg hover:text-brand">
+      <Link href={orgUrl(org)} className="text-fg hover:text-fg-2">
         {org}
       </Link>
       {SEP}
@@ -390,15 +390,15 @@ function WorkflowsTab({ org, repo }: { org: string; repo: string }) {
                           {item.last_run?.branch ? <Truncate value={item.last_run.branch} mono copy /> : <span className="text-fg-3">-</span>}
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono text-[13px] text-fg-2">{abbreviate(item.runs_7d)}</td>
-                        <td className="px-3 py-2.5 text-right font-mono text-[13px] text-passed">{abbreviate(item.passed_7d)}</td>
+                        <td className="px-3 py-2.5 text-right font-mono text-[13px] text-fg-2">{abbreviate(item.passed_7d)}</td>
                         <td className={cn("px-3 py-2.5 text-right font-mono text-[13px]", item.failed_7d > 0 ? "text-failed" : "text-fg-3")}>{abbreviate(item.failed_7d)}</td>
                         <td className="px-3 py-2.5 pr-3.5 font-mono text-[13px] whitespace-nowrap text-fg-2">
                           {rate === null ? (
                             "-"
                           ) : (
                             <span className="inline-flex items-center gap-2.5">
-                              <span aria-hidden="true" className="h-1.5 w-20 overflow-hidden rounded-full bg-failed/40">
-                                <span className="block h-full bg-passed" style={{ width: `${rate}%` }} />
+                              <span aria-hidden="true" className="h-1.5 w-20 overflow-hidden rounded-full bg-failed/60">
+                                <span className="block h-full bg-control" style={{ width: `${rate}%` }} />
                               </span>
                               {rate}%
                             </span>
@@ -508,9 +508,9 @@ const STATES: { id: PullState | "all"; label: string }[] = [
 ];
 
 const PULL_LOOK: Record<PullState, { glyph: string; text: string }> = {
-  open: { glyph: "●", text: "text-passed" },
-  merged: { glyph: "◆", text: "text-brand" },
-  closed: { glyph: "⊘", text: "text-queued" },
+  open: { glyph: "●", text: "text-fg-2" },
+  merged: { glyph: "◆", text: "text-fg-2" },
+  closed: { glyph: "⊘", text: "text-fg-3" },
 };
 
 function PullsTab({ org, repo }: { org: string; repo: string }) {

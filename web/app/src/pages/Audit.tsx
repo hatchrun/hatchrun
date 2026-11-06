@@ -92,7 +92,7 @@ export function Audit({ org, tenant }: OrgPageProps) {
                   <tbody>
                     {data.items.map((entry) => (
                       <tr key={entry.id} className="border-t border-rule hover:bg-panel">
-                        <td className={cn(TD, "font-mono text-[13px]", entry.action.endsWith(".delete") ? "text-failed-soft" : "text-fg")} title={entry.action}>
+                        <td className={cn(TD, "font-mono text-[13px]", entry.action.endsWith(".delete") ? "text-failed" : "text-fg")} title={entry.action}>
                           {WORDS[entry.action] ?? entry.action}
                         </td>
                         <td className={cn(TD, "max-w-[420px] font-mono text-[13px]")}>

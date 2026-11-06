@@ -118,8 +118,8 @@ code {
 }
 
 .button-primary:hover:not(:disabled) {
-  background: var(--brand);
-  opacity: 0.88;
+  border-color: var(--brand-hover);
+  background: var(--brand-hover);
 }
 
 .button-wide {
@@ -145,13 +145,14 @@ code {
 
 .notice-error {
   border-color: transparent;
-  background: color-mix(in srgb, var(--failed) 12%, transparent);
-  color: var(--failed);
+  border-left: 2px solid var(--failed);
+  background: color-mix(in srgb, var(--failed) 6%, transparent);
+  color: var(--fg);
 }
 
 .notice-accent {
-  border-color: transparent;
-  background: color-mix(in srgb, var(--brand) 12%, transparent);
+  border-color: var(--rule);
+  background: var(--raised);
 }
 
 /* Sign-in */
@@ -242,8 +243,8 @@ code {
 }
 
 .badge-danger {
-  background: color-mix(in srgb, var(--failed) 12%, transparent);
-  color: var(--failed);
+  background: var(--raised);
+  color: var(--fg-3);
 }
 
 .avatar-square {
@@ -373,7 +374,7 @@ a.list-row:hover {
 .start-check {
   flex: none;
   margin-top: 0.2rem;
-  color: var(--passed);
+  color: var(--fg-2);
 }
 
 .start-add {

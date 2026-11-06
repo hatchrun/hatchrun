@@ -8,6 +8,7 @@ import { useEffect, useState } from "react";
 import { approveCiJob, getNeedsYou, type NeedsYou as NeedsYouData } from "@/api";
 import { Button } from "@/components/ui/button";
 import { LoadError } from "@/components/Status";
+import { STATUS, StatusGlyph, type Status } from "@/components/StatusPill";
 import { ago } from "@/lib/format";
 import { jobUrl, runUrl } from "@/lib/urls";
 import { cn } from "@/lib/utils";
@@ -18,12 +19,10 @@ const ROW = "flex items-center gap-3 border-t border-rule px-3.5 py-1.5";
 /** Items shown before "N more". */
 const SHOWN = 3;
 
-function Row({ edge, glyph, href, label, head, rest, children }: { edge: string; glyph: string; href: string; label: string; head: string; rest: React.ReactNode; children?: React.ReactNode }) {
+function Row({ status, href, label, head, rest, children }: { status: Status; href: string; label: string; head: string; rest: React.ReactNode; children?: React.ReactNode }) {
   return (
-    <li className={ROW} style={{ boxShadow: `inset 3px 0 0 var(${edge})` }}>
-      <span aria-hidden="true" className="w-3.5 shrink-0 text-center font-mono font-semibold" style={{ color: `var(${edge})` }}>
-        {glyph}
-      </span>
+    <li className={cn(ROW, STATUS[status].edge)}>
+      <StatusGlyph status={status} className="shrink-0 font-mono" />
       <Link href={href} aria-label={label} className="min-w-0 flex-1 truncate font-mono text-[13px] text-fg-2 hover:text-fg hover:underline">
         <span className="font-semibold text-fg">{head}</span> · {rest}
       </Link>
@@ -83,8 +82,7 @@ export function NeedsYou({ org, onChange }: { org: string; onChange: () => void 
     ...approvals.map(({ run, job, since }) => (
       <Row
         key={`a${job.id}`}
-        edge="--waiting"
-        glyph="!"
+        status="waiting"
         href={jobUrl(run.repository, run.id, job.id)}
         label={`Review approval for ${run.repository} ${run.run_number}`}
         head={job.environment ? "deploy waiting for approval" : "job waiting for approval"}
@@ -96,7 +94,7 @@ export function NeedsYou({ org, onChange }: { org: string; onChange: () => void 
       </Row>
     )),
     ...failing.map(({ repository, branch, run }) => (
-      <Row key={`f${repository}`} edge="--failed" glyph="✕" href={runUrl(repository, run.id)} label={`Open run ${repository} ${run.run_number}`} head={`${branch} failing`} rest={<>{repository} #{run.run_number} · {run.workflow} · {ago(run.completed_at ?? run.created_at, now)}</>} />
+      <Row key={`f${repository}`} status="failed" href={runUrl(repository, run.id)} label={`Open run ${repository} ${run.run_number}`} head={`${branch} failing`} rest={<>{repository} #{run.run_number} · {run.workflow} · {ago(run.completed_at ?? run.created_at, now)}</>} />
     )),
   ];
 

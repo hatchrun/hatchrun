@@ -29,7 +29,7 @@ export function ChecklistCount({ steps }: { steps: Step[] }) {
 
 /**
  * Setup steps in one panel with a segmented progress bar above. The
- * first step that is not done is the current one: brand edge and glyph.
+ * first step that is not done is the current one: neutral edge and bright glyph.
  * Done steps get a green check, later ones three dots.
  */
 export function Checklist({ steps, label, collapseDone = false }: { steps: Step[]; label: string; collapseDone?: boolean }) {
@@ -48,7 +48,7 @@ export function Checklist({ steps, label, collapseDone = false }: { steps: Step[
         style={{ gridTemplateColumns: `repeat(${steps.length}, 1fr)` }}
       >
         {steps.map((step, index) => (
-          <span key={step.key} className={cn("h-1 rounded-xs", step.done ? "bg-passed" : index === current ? "bg-brand" : "bg-control")} />
+          <span key={step.key} className={cn("h-1 rounded-xs", step.done ? "bg-fg-3" : index === current ? "bg-fg-2" : "bg-control")} />
         ))}
       </div>
       <section aria-label={label} className="rounded-md border border-control bg-panel">
@@ -63,12 +63,12 @@ export function Checklist({ steps, label, collapseDone = false }: { steps: Step[
               className={cn(
                 "flex flex-wrap gap-x-3.5 gap-y-2 px-4 py-3.5",
                 index > 0 && "border-t border-rule",
-                state === "current" && "shadow-[inset_3px_0_0_var(--brand)]",
+                state === "current" && "shadow-[inset_2px_0_0_var(--fg-3)]",
               )}
             >
               <span
                 aria-hidden="true"
-                className={cn("w-[22px] text-center font-mono font-bold", state === "done" ? "text-passed" : state === "current" ? "text-brand" : "text-fg-3")}
+                className={cn("w-[22px] text-center font-mono font-bold", state === "done" ? "text-fg-2" : state === "current" ? "text-fg" : "text-fg-3")}
               >
                 {state === "done" ? "✓" : state === "current" ? "▶" : "•••"}
               </span>
