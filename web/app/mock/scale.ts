@@ -732,6 +732,8 @@ export function handleScale(
         default_branch: defaultBranch(ix),
         private: ix % 7 === 0,
         enabled: isEnabled(name, ix),
+        // Every fifth repository is read-only for the viewer.
+        access: ix % 5 === 4 ? "read" : "admin",
         html_url: `https://github.com/${name}`,
         counts: { workflows: workflowRows(name).length, branches: branchRows(name, ix).length, open_pulls: pullRows(name, ix).filter((pull) => pull.state === "open").length },
       });

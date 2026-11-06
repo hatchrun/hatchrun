@@ -144,6 +144,8 @@ export interface CiRepo {
   default_branch: string;
   private: boolean;
   enabled: boolean;
+  /** What the viewer may do with the repository. */
+  access: "read" | "write" | "admin";
   html_url: string;
   counts: { workflows: number; branches: number; open_pulls: number };
 }

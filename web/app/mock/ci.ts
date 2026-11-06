@@ -287,6 +287,7 @@ export async function handleCi(
       default_branch: "main",
       private: isPrivate(repository),
       enabled: true,
+      access: isPrivate(repository) ? "read" : "admin",
       html_url: `https://github.com/${repository}`,
       counts: { workflows: 0, branches: 0, open_pulls: 0 },
     });

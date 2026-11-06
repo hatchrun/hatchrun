@@ -127,7 +127,7 @@ function Header({ info, org, repo, onRun }: { info: CiRepo; org: string; repo: s
             <ExternalLink aria-hidden="true" />
           </a>
         </Button>
-        {info.enabled && <Button onClick={onRun}>Run workflow</Button>}
+        {info.enabled && info.access !== "read" && <Button onClick={onRun}>Run workflow</Button>}
       </div>
     </div>
   );
