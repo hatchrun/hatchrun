@@ -63,6 +63,7 @@ fn document(job: PlannedJob) -> JobDocument {
             token: "i_tok".into(),
         }),
         artifacts: None,
+        inputs: None,
     }
 }
 

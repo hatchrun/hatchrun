@@ -43,6 +43,7 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
             concurrency: None,
             steps,
             deferred: None,
+            scope: Vec::new(),
         },
         event_name: "push".to_owned(),
         event: json!({}),
@@ -68,6 +69,7 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
         cache: None::<CacheService>,
         id_token: None,
         artifacts: None,
+        inputs: None,
     }
 }
 

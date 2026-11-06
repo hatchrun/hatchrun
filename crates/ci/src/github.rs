@@ -89,6 +89,92 @@ pub fn config_text(response: &Response) -> Result<Option<String>, String> {
         .map_err(|_| format!("{CONFIG_PATH} is not UTF-8"))
 }
 
+/// The raw file at `path` of `repo` at a commit.
+#[must_use]
+pub fn file_at(api: &str, repo: &str, path: &str, sha: &str, token: &str) -> Request {
+    let path = path.split('/').map(encode).collect::<Vec<_>>().join("/");
+    call(
+        "GET",
+        format!("{api}/repos/{repo}/contents/{path}?ref={}", encode(sha)),
+        token,
+        "application/vnd.github.raw+json",
+    )
+}
+
+/// The text of a file [`file_at`] asked for, `None` when there is no
+/// such file.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not the file, or a file over
+/// [`MAX_SOURCE`] bytes or not UTF-8.
+pub fn file_text(response: &Response, what: &str) -> Result<Option<String>, String> {
+    if response.status == 404 {
+        return Ok(None);
+    }
+    if !response.ok() {
+        return Err(format!(
+            "{what}: GitHub answered {}: {}",
+            response.status,
+            response.text()
+        ));
+    }
+    if response.body.len() > MAX_SOURCE {
+        return Err(format!(
+            "{what} is {} bytes; the limit is {MAX_SOURCE}",
+            response.body.len()
+        ));
+    }
+    String::from_utf8(response.body.clone())
+        .map(Some)
+        .map_err(|_| format!("{what} is not UTF-8"))
+}
+
+/// A repository by `owner/name`, as the installation sees it.
+#[must_use]
+pub fn repo_by_name(api: &str, repo: &str, token: &str) -> Request {
+    rest("GET", format!("{api}/repos/{repo}"), token)
+}
+
+/// Whether the repository [`repo_by_name`] asked for is private: `None`
+/// when the installation cannot read it (GitHub answers 404 for a
+/// repository it hides).
+///
+/// # Errors
+///
+/// GitHub's answer when it is neither the repository nor a 403 or 404.
+pub fn repo_is_private(response: &Response) -> Result<Option<bool>, String> {
+    #[derive(Deserialize)]
+    struct Repo {
+        #[serde(default = "yes")]
+        private: bool,
+    }
+    fn yes() -> bool {
+        true
+    }
+    match response.status {
+        403 if rate_limited(response) => Err(format!(
+            "repository: GitHub throttled the request: {}",
+            response.text()
+        )),
+        403 | 404 => Ok(None),
+        _ => decode::<Repo>(response, "repository").map(|r| Some(r.private)),
+    }
+}
+
+/// Whether a 403 is a rate or abuse limit, not a refusal: GitHub marks
+/// it with `Retry-After`, an exhausted `X-RateLimit-Remaining` or its
+/// message.
+fn rate_limited(response: &Response) -> bool {
+    if response.header("retry-after").is_some()
+        || response.header("x-ratelimit-remaining") == Some("0")
+    {
+        return true;
+    }
+    let text = response.text().to_ascii_lowercase();
+    text.contains("rate limit") || text.contains("abuse")
+}
+
 /// One page of the files a pull request changes, 100 to a page.
 #[must_use]
 pub fn pull_files(api: &str, repo: &str, number: u64, page: u32, token: &str) -> Request {
@@ -581,6 +667,35 @@ mod tests {
         assert_eq!(r.header_value("Authorization"), Some("Bearer tok"));
         assert_eq!(r.header_value("User-Agent"), Some("hatchrun-ci"));
         assert_eq!(r.header_value("X-GitHub-Api-Version"), Some("2022-11-28"));
+    }
+
+    #[test]
+    fn a_repository_the_installation_hides_is_none_and_a_throttle_is_an_error() {
+        assert_eq!(repo_is_private(&answer(404, &[], "{}")), Ok(None));
+        assert_eq!(
+            repo_is_private(&answer(
+                403,
+                &[],
+                r#"{"message":"Resource not accessible"}"#
+            )),
+            Ok(None)
+        );
+        assert_eq!(
+            repo_is_private(&answer(200, &[], r#"{"private":false}"#)),
+            Ok(Some(false))
+        );
+        for limited in [
+            answer(403, &[("retry-after", "30")], "{}"),
+            answer(403, &[("x-ratelimit-remaining", "0")], "{}"),
+            answer(
+                403,
+                &[],
+                r#"{"message":"You have exceeded a secondary rate limit"}"#,
+            ),
+            answer(403, &[], r#"{"message":"abuse detection mechanism"}"#),
+        ] {
+            assert!(repo_is_private(&limited).is_err(), "{limited:?}");
+        }
     }
 
     #[test]

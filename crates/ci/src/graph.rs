@@ -12,9 +12,10 @@
 use std::collections::BTreeMap;
 
 use hatchrun_workflow::{
-    Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Leg, Need, Outcome, Plan,
-    PlannedJob, Ready, Siblings, Statuses, checks_status, continue_on_error, expand,
-    hatchrun_context, interpolate, is_expression, job_condition, ready, valid_environment_name,
+    CallFrame, Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Leg, Need, Outcome,
+    Plan, PlannedJob, Ready, Siblings, Statuses, checks_status, continue_on_error, entry_in,
+    expand, hatchrun_context, interpolate, is_expression, job_condition, read_value, ready,
+    resolve_inputs, shared_depth, valid_environment_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,6 +42,13 @@ pub struct Graph {
     /// reads. Not stored; [`Graph::set_vars`] fills it before a job ends.
     #[serde(skip)]
     vars: BTreeMap<String, String>,
+}
+
+/// What reading the scope of a job found: its `inputs`, and the contexts
+/// of each call it runs in.
+struct Walked {
+    inputs: Value,
+    frames: Vec<Value>,
 }
 
 /// One job of a run.
@@ -437,7 +445,10 @@ impl Graph {
         if self.jobs[at].state != State::Queued {
             return None;
         }
-        let ctx = self.job_context(job, github_ctx, vars)?;
+        let ctx = match self.job_context(job, github_ctx, vars)? {
+            Ok(ctx) => ctx,
+            Err(message) => return Some(Err(message)),
+        };
         let group = self.jobs[at].job.strategy.as_ref().map(|s| &s.group);
         let in_group = |i: usize| {
             i != at
@@ -647,49 +658,248 @@ impl Graph {
     }
 
     fn needs_at(&self, at: usize) -> BTreeMap<String, Need> {
-        let mut groups: BTreeMap<String, Vec<&Node>> = BTreeMap::new();
-        for id in &self.jobs[at].job.requires {
+        self.needs_for(&self.jobs[at].job.scope, &self.jobs[at].job.requires)
+    }
+
+    /// What a job that runs in `scope` and requires `requires` reads as
+    /// `needs`: the jobs of its own workflow by name, and each call it
+    /// requires as one entry, with the outputs of the call.
+    fn needs_for(&self, scope: &[CallFrame], requires: &[String]) -> BTreeMap<String, Need> {
+        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for id in requires {
             if let Some(p) = self.position_of(id)
                 && matches!(self.jobs[p].state, State::Done(_))
             {
                 groups
-                    .entry(self.jobs[p].job.name.clone())
+                    .entry(entry_in(scope, &self.jobs[p].job).to_owned())
                     .or_default()
-                    .push(&self.jobs[p]);
+                    .push(p);
             }
         }
-        // Members merge in plan order, not in the order `requires` lists
-        // them.
-        let order: BTreeMap<&str, usize> = self
-            .jobs
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.job.id.as_str(), i))
-            .collect();
         groups
             .into_iter()
-            .map(|(name, mut members)| {
-                members.sort_by_key(|n| order[n.job.id.as_str()]);
-                let result = combine(members.iter().filter_map(|n| match n.state {
-                    State::Done(c) => Some(c),
-                    _ => None,
-                }));
-                let mut outputs: BTreeMap<String, String> = BTreeMap::new();
-                for member in &members {
-                    let Some(r) = &member.result else { continue };
-                    for (k, v) in &r.outputs {
-                        match outputs.get_mut(k) {
-                            Some(slot) if !v.is_empty() => slot.clone_from(v),
-                            Some(_) => {}
-                            None => {
-                                outputs.insert(k.clone(), v.clone());
-                            }
-                        }
-                    }
-                }
-                (name, Need { result, outputs })
+            .map(|(name, members)| {
+                let depth = shared_depth(scope, &self.jobs[members[0]].job);
+                (name, self.group_need(depth, members))
             })
             .collect()
+    }
+
+    /// The result and outputs of the jobs `members` (positions) that one
+    /// entry made, read from `depth` frames in. A job of the workflow
+    /// itself, or its matrix entries, merge in plan order. The jobs of a
+    /// call give the outputs the callee declares.
+    fn group_need(&self, depth: usize, mut members: Vec<usize>) -> Need {
+        members.sort_unstable();
+        members.dedup();
+        let result = combine(members.iter().filter_map(|&p| match self.jobs[p].state {
+            State::Done(c) => Some(c),
+            _ => None,
+        }));
+        let mut outputs: BTreeMap<String, String> = BTreeMap::new();
+        let mut merge = |from: &BTreeMap<String, String>| {
+            for (k, v) in from {
+                match outputs.get_mut(k) {
+                    Some(slot) if !v.is_empty() => slot.clone_from(v),
+                    Some(_) => {}
+                    None => {
+                        outputs.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        };
+        if self.jobs[members[0]].job.scope.len() > depth {
+            let mut seen: Vec<&str> = Vec::new();
+            for &p in &members {
+                let id = self.jobs[p].job.scope[depth].id.as_str();
+                if !seen.contains(&id) {
+                    seen.push(id);
+                    merge(&self.call_outputs(depth, id));
+                }
+            }
+        } else {
+            for &p in &members {
+                if let Some(r) = &self.jobs[p].result {
+                    merge(&r.outputs);
+                }
+            }
+        }
+        Need { result, outputs }
+    }
+
+    /// What the call `instance`, at frame `depth`, gives back: each
+    /// `on.call.outputs` of its workflow read over the jobs it ran.
+    fn call_outputs(&self, depth: usize, instance: &str) -> BTreeMap<String, String> {
+        let inside: Vec<usize> = (0..self.jobs.len())
+            .filter(|&p| {
+                matches!(self.jobs[p].state, State::Done(_))
+                    && self.jobs[p]
+                        .job
+                        .scope
+                        .get(depth)
+                        .is_some_and(|f| f.id == instance)
+            })
+            .collect();
+        let Some(&first) = inside.first() else {
+            return BTreeMap::new();
+        };
+        let frame = &self.jobs[first].job.scope[depth];
+        if frame.outputs.is_empty() {
+            return BTreeMap::new();
+        }
+        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for &p in &inside {
+            let job = &self.jobs[p].job;
+            let name = job
+                .scope
+                .get(depth + 1)
+                .map_or(&job.name, |f| &f.name)
+                .clone();
+            groups.entry(name).or_default().push(p);
+        }
+        let jobs: BTreeMap<String, Need> = groups
+            .into_iter()
+            .map(|(name, members)| (name, self.group_need(depth + 1, members)))
+            .collect();
+        let ctx = json!({ "jobs": jobs });
+        frame
+            .outputs
+            .iter()
+            .map(|(name, text)| {
+                let value = read_value(&Value::String(text.clone()), &ctx, JobStatus::Success)
+                    .map(|v| match v {
+                        Value::String(s) => s,
+                        Value::Null => String::new(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
+                (name.clone(), value)
+            })
+            .collect()
+    }
+
+    /// The requires of the call at frame `depth` of the job at `at`
+    /// that point outside the call, and whether any job of the call that
+    /// has one asks for a status other than `success`.
+    fn call_edges(&self, at: usize, depth: usize) -> (Vec<String>, bool) {
+        let instance = &self.jobs[at].job.scope[depth].id;
+        let inside: Vec<&PlannedJob> = self
+            .jobs
+            .iter()
+            .map(|n| &n.job)
+            .filter(|j| j.scope.get(depth).is_some_and(|f| f.id == *instance))
+            .collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut statuses = false;
+        for job in &inside {
+            let before = out.len();
+            for id in &job.requires {
+                if !inside.iter().any(|j| j.id == *id) && !out.contains(id) {
+                    out.push(id.clone());
+                }
+            }
+            let outside = job
+                .requires
+                .iter()
+                .any(|id| !inside.iter().any(|j| j.id == *id));
+            if outside || out.len() > before {
+                statuses |= job.statuses.values().any(|s| *s != Statuses::SUCCESS);
+            }
+        }
+        (out, statuses)
+    }
+
+    /// The `strategy` context of the call at frame `depth` of the job at
+    /// `at`: its place among the instances of one call matrix.
+    fn frame_strategy(&self, at: usize, depth: usize) -> Value {
+        let scope = &self.jobs[at].job.scope;
+        let frame = &scope[depth];
+        let mut instances: Vec<&str> = Vec::new();
+        for node in &self.jobs {
+            let other = &node.job.scope;
+            let same = other.len() > depth
+                && other[depth].name == frame.name
+                && other[..depth]
+                    .iter()
+                    .zip(&scope[..depth])
+                    .all(|(a, b)| a.id == b.id)
+                && other[..depth].len() == depth;
+            if same && !instances.contains(&other[depth].id.as_str()) {
+                instances.push(&other[depth].id);
+            }
+        }
+        let index = instances
+            .iter()
+            .position(|id| *id == frame.id)
+            .unwrap_or_default();
+        json!({
+            "fail-fast": true,
+            "job-index": index,
+            "job-total": instances.len().max(1),
+            "max-parallel": instances.len().max(1),
+        })
+    }
+
+    /// The `inputs` of the job at `at` (those of the innermost call it
+    /// runs in, each call's `with` read in the contexts of the workflow
+    /// that made it; a manual run's for a job of the workflow that was
+    /// started) and the contexts of each call it runs in, for reading
+    /// the call's `if`. Read once for each evaluation.
+    ///
+    /// # Errors
+    ///
+    /// A message when an input cannot be read.
+    fn walk(
+        &self,
+        at: usize,
+        github_ctx: &Value,
+        vars: &BTreeMap<String, String>,
+    ) -> Result<Walked, String> {
+        let dispatch = github_ctx
+            .get("event")
+            .and_then(|e| e.get("inputs"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let frames = &self.jobs[at].job.scope;
+        let contexts = std::cell::RefCell::new(Vec::new());
+        let inputs = resolve_inputs(frames, &dispatch, |i, parent| {
+            let ctx = json!({
+                "hatchrun": hatchrun_context(github_ctx),
+                "github": github_ctx,
+                "needs": self.needs_for(&frames[..i], &self.call_edges(at, i).0),
+                "matrix": frames[i].matrix,
+                "strategy": self.frame_strategy(at, i),
+                "vars": vars,
+                "inputs": parent,
+            });
+            contexts.borrow_mut().push(ctx.clone());
+            ctx
+        })?;
+        Ok(Walked {
+            inputs,
+            frames: contexts.into_inner(),
+        })
+    }
+
+    /// The `inputs` of a job that runs in a call, `None` for a job of
+    /// the workflow that was started.
+    ///
+    /// # Errors
+    ///
+    /// A message when an input cannot be read.
+    pub fn call_inputs(
+        &self,
+        job: u64,
+        github_ctx: &Value,
+        vars: &BTreeMap<String, String>,
+    ) -> Result<Option<Value>, String> {
+        let Some(at) = self.position(job) else {
+            return Ok(None);
+        };
+        if self.jobs[at].job.scope.is_empty() {
+            return Ok(None);
+        }
+        self.walk(at, github_ctx, vars).map(|w| Some(w.inputs))
     }
 
     /// The status `success()` and `failure()` see: over every ancestor
@@ -697,14 +907,25 @@ impl Graph {
     /// ancestor failed (or was cancelled in a run that is not cancelled),
     /// `Success` when all succeeded, else `Skipped`.
     fn ancestor_status(&self, at: usize) -> JobStatus {
+        self.ancestors(&self.jobs[at].job.requires, &self.jobs[at].job.scope)
+    }
+
+    /// [`Graph::ancestor_status`] from the jobs `seeds` name, looking
+    /// only at jobs that run in `within`, a call or the whole run: a
+    /// job of a called workflow does not see the jobs the call waits
+    /// for, which the call's own `if` reads.
+    fn ancestors(&self, seeds: &[String], within: &[CallFrame]) -> JobStatus {
         let mut seen = vec![false; self.jobs.len()];
-        let mut stack = vec![at];
+        let mut stack: Vec<&[String]> = vec![seeds];
         let mut skipped = false;
-        while let Some(i) = stack.pop() {
-            for r in &self.jobs[i].job.requires {
+        while let Some(requires) = stack.pop() {
+            for r in requires {
                 let Some(p) = self.position_of(r) else {
                     continue;
                 };
+                if shared_depth(within, &self.jobs[p].job) < within.len() {
+                    continue;
+                }
                 if std::mem::replace(&mut seen[p], true) {
                     continue;
                 }
@@ -713,7 +934,7 @@ impl Graph {
                     State::Done(Conclusion::Skipped) => skipped = true,
                     _ => return JobStatus::Failure,
                 }
-                stack.push(p);
+                stack.push(&self.jobs[p].job.requires);
             }
         }
         if skipped {
@@ -767,7 +988,24 @@ impl Graph {
         } else {
             self.ancestor_status(at)
         };
-        let ctx = self.context(at, github_ctx);
+        let walked = self
+            .walk(at, github_ctx, &self.vars)
+            .map_err(|message| ExprError { message, offset: 0 })?;
+        // Each call's `if` is read once, against the call's own needs.
+        for (i, frame) in node.job.scope.iter().enumerate() {
+            let (roots, by_statuses) = self.call_edges(at, i);
+            let status = if self.cancelled {
+                JobStatus::Cancelled
+            } else if by_statuses && !frame.if_.as_deref().map_or(Ok(false), checks_status)? {
+                JobStatus::Success
+            } else {
+                self.ancestors(&roots, &node.job.scope[..i])
+            };
+            if !job_condition(frame.if_.as_deref(), &walked.frames[i], &Status(status))? {
+                return Ok(false);
+            }
+        }
+        let ctx = self.context_with(at, github_ctx, &self.vars, &walked);
         job_condition(node.job.if_.as_deref(), &ctx, &Status(status))
     }
 
@@ -775,37 +1013,53 @@ impl Graph {
     /// (`needs`, `matrix`, `strategy`, `inputs`), with the repository
     /// and organization variables `vars` it was not given. `None` for a
     /// job the graph does not hold.
+    ///
+    /// # Errors
+    ///
+    /// A message when the `inputs` of a job in a call cannot be read.
     #[must_use]
     pub fn job_context(
         &self,
         job: u64,
         github_ctx: &Value,
         vars: &BTreeMap<String, String>,
-    ) -> Option<Value> {
-        let mut ctx = self.context(self.position(job)?, github_ctx);
-        if let Some(map) = ctx.as_object_mut() {
-            map.insert("vars".to_owned(), json!(vars));
-        }
-        Some(ctx)
+    ) -> Option<Result<Value, String>> {
+        let at = self.position(job)?;
+        Some(self.context(at, github_ctx, vars))
     }
 
     /// The contexts the control plane gives an expression of the job at
     /// `at`: what it knows without a runner.
-    fn context(&self, at: usize, github_ctx: &Value) -> Value {
+    ///
+    /// # Errors
+    ///
+    /// A message when the `inputs` of a job in a call cannot be read.
+    fn context(
+        &self,
+        at: usize,
+        github_ctx: &Value,
+        vars: &BTreeMap<String, String>,
+    ) -> Result<Value, String> {
+        let walked = self.walk(at, github_ctx, vars)?;
+        Ok(self.context_with(at, github_ctx, vars, &walked))
+    }
+
+    fn context_with(
+        &self,
+        at: usize,
+        github_ctx: &Value,
+        vars: &BTreeMap<String, String>,
+        walked: &Walked,
+    ) -> Value {
         let node = &self.jobs[at];
-        let inputs = github_ctx
-            .get("event")
-            .and_then(|e| e.get("inputs"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
         json!({
             "hatchrun": hatchrun_context(github_ctx),
             "github": github_ctx,
             "needs": self.needs_at(at),
             "matrix": node.job.matrix,
             "strategy": node.job.strategy_context(),
-            "vars": self.vars,
-            "inputs": inputs,
+            "vars": vars,
+            "inputs": walked.inputs,
         })
     }
 
@@ -823,7 +1077,10 @@ impl Graph {
             Some(spec) if conclusion == Conclusion::Failure => spec,
             _ => return (conclusion, None),
         };
-        let ctx = self.context(at, github_ctx);
+        let ctx = match self.context(at, github_ctx, &self.vars) {
+            Ok(ctx) => ctx,
+            Err(message) => return (conclusion, Some(format!("continue-on-error: {message}"))),
+        };
         match continue_on_error(spec, &ctx, &Status(JobStatus::Failure)) {
             Ok(true) => (Conclusion::Success, Some(CONTINUED.to_owned())),
             Ok(false) => (conclusion, None),
@@ -949,7 +1206,7 @@ impl Graph {
             return Ok(());
         };
         let name = if is_expression(&template) {
-            let ctx = self.context(at, github_ctx);
+            let ctx = self.context(at, github_ctx, &self.vars)?;
             interpolate(&template, &ctx, &Status(JobStatus::Success))
                 .map_err(|e| format!("environment: {e}"))?
                 .trim()
@@ -2290,6 +2547,237 @@ workflows:
         run(&mut g, 1);
         let actions = g.finished(1, done(Conclusion::Failure, &[]), &ctx());
         assert!(actions.contains(&Action::Expand(2)), "{actions:?}");
+    }
+
+    const CALLS: &str = "
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [] }
+  pkg: { runs-on: ubuntu-latest, outputs: { tag: '${{ steps.x.outputs.tag }}' }, steps: [] }
+  push: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  publish:
+    on:
+      call:
+        inputs: { name: { type: string, required: true } }
+        outputs: { tag: '${{ jobs.pkg.outputs.tag }}' }
+    jobs: [pkg, { push: { requires: [pkg] } }]
+  ci:
+    on: { push: {} }
+    jobs:
+      - build
+      - p:
+          call: publish
+          requires: [build]
+          if: github.ref == 'refs/heads/main'
+          with: { name: 'app-${{ needs.build.outputs.v }}' }
+      - { push: { name: after, requires: [p] } }
+";
+
+    fn calls(ref_: &str) -> Graph {
+        let plan = compile(&parse(CALLS).unwrap(), "ci", ref_).unwrap_or_else(|e| panic!("{e:?}"));
+        Graph::new(
+            plan.jobs
+                .into_iter()
+                .zip(1u64..)
+                .map(|(j, i)| (i, j))
+                .collect(),
+        )
+    }
+
+    fn github(ref_: &str) -> Value {
+        serde_json::json!({ "ref": ref_, "ref_name": "main" })
+    }
+
+    #[test]
+    fn a_call_reads_as_one_entry_with_the_outputs_the_callee_declares() {
+        let ctx = github("refs/heads/main");
+        let mut g = calls("refs/heads/main");
+        let names: Vec<&str> = g.jobs.iter().map(|n| n.job.id.as_str()).collect();
+        assert_eq!(names, ["build", "p / pkg", "p / push", "after"]);
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, done(Conclusion::Success, &[("v", "7")]), &ctx);
+        // The callee's root job reads the caller's `needs` through `with`.
+        let inputs = g.call_inputs(2, &ctx, &BTreeMap::new()).unwrap().unwrap();
+        assert_eq!(inputs["name"], "app-7");
+        run(&mut g, 2);
+        g.finished(2, done(Conclusion::Success, &[("tag", "v1")]), &ctx);
+        run(&mut g, 3);
+        g.finished(3, ok(), &ctx);
+        let needs = g.needs(4);
+        assert_eq!(needs.len(), 1, "{needs:?}");
+        assert_eq!(needs["p"].result, Conclusion::Success);
+        assert_eq!(needs["p"].outputs["tag"], "v1");
+        // Inside the call, jobs still see each other by their own names.
+        assert!(g.needs(3).contains_key("pkg"));
+    }
+
+    #[test]
+    fn a_call_if_that_is_false_skips_every_job_of_the_call() {
+        let ctx = github("refs/heads/dev");
+        let mut g = calls("refs/heads/dev");
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, ok(), &ctx);
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+        assert_eq!(g.node(3).unwrap().state, State::Done(Conclusion::Skipped));
+    }
+
+    #[test]
+    fn a_failed_callee_job_fails_the_call_for_those_that_need_it() {
+        let ctx = github("refs/heads/main");
+        let mut g = calls("refs/heads/main");
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, ok(), &ctx);
+        run(&mut g, 2);
+        g.finished(2, done(Conclusion::Failure, &[]), &ctx);
+        assert_eq!(g.node(4).unwrap().state, State::Done(Conclusion::Skipped));
+    }
+
+    const CLEANUP: &str = "
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [] }
+  work: { runs-on: ubuntu-latest, steps: [] }
+  tidy: { runs-on: ubuntu-latest, if: always(), steps: [] }
+  report: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  inner:
+    on: { call: {} }
+    jobs: [work, { tidy: { requires: [work] } }]
+  ci:
+    on: { push: {} }
+    jobs:
+      - build
+      - plain: { call: inner, requires: [build] }
+      - always: { call: inner, requires: [build], if: always() }
+      - failing: { call: inner, requires: [build], if: failure() }
+";
+
+    fn cleanup() -> Graph {
+        let plan = compile(&parse(CLEANUP).unwrap(), "ci", "refs/heads/main")
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        Graph::new(
+            plan.jobs
+                .into_iter()
+                .zip(1u64..)
+                .map(|(j, i)| (i, j))
+                .collect(),
+        )
+    }
+
+    fn state_of_id(g: &Graph, id: &str) -> State {
+        g.jobs.iter().find(|n| n.job.id == id).unwrap().state
+    }
+
+    #[test]
+    fn a_call_if_reads_the_calls_own_needs() {
+        let ctx = github("refs/heads/main");
+        let mut g = cleanup();
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx);
+        // Without an `if` a call is skipped when what it needs failed.
+        assert_eq!(
+            state_of_id(&g, "plain / work"),
+            State::Done(Conclusion::Skipped)
+        );
+        assert_eq!(
+            state_of_id(&g, "plain / tidy"),
+            State::Done(Conclusion::Skipped)
+        );
+        // `always()` runs the callee, and `failure()` runs it too.
+        let id = |g: &Graph, name: &str| g.jobs.iter().find(|n| n.job.id == name).unwrap().id;
+        assert_eq!(state_of_id(&g, "always / work"), State::Queued);
+        assert_eq!(state_of_id(&g, "failing / work"), State::Queued);
+        // A callee job with `if: always()` runs after a callee job fails,
+        // and one without waits for success only inside the call.
+        let work = id(&g, "always / work");
+        run(&mut g, work);
+        g.finished(work, done(Conclusion::Failure, &[]), &ctx);
+        assert_eq!(state_of_id(&g, "always / tidy"), State::Queued);
+    }
+
+    #[test]
+    fn a_callee_root_job_does_not_see_what_the_call_waits_for() {
+        let ctx = github("refs/heads/main");
+        let mut g = cleanup();
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, ok(), &ctx);
+        assert_eq!(state_of_id(&g, "plain / work"), State::Queued);
+        // `failure()` is false when the call's needs passed.
+        assert_eq!(
+            state_of_id(&g, "failing / work"),
+            State::Done(Conclusion::Skipped)
+        );
+    }
+
+    #[test]
+    fn a_call_matrix_instance_reads_its_own_strategy() {
+        let yaml = "
+jobs:
+  j: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  inner:
+    on: { call: { inputs: { n: { type: number } } } }
+    jobs: [j]
+  ci:
+    on: { push: {} }
+    jobs:
+      - c:
+          call: inner
+          matrix: { x: [a, b, c] }
+          with: { n: '${{ strategy.job-index }}' }
+";
+        let plan = compile(&parse(yaml).unwrap(), "ci", "refs/heads/main").unwrap();
+        let mut g = Graph::new(
+            plan.jobs
+                .into_iter()
+                .zip(1u64..)
+                .map(|(j, i)| (i, j))
+                .collect(),
+        );
+        let ctx = github("refs/heads/main");
+        g.advance(&ctx);
+        for (row, want) in [(1, 0), (2, 1), (3, 2)] {
+            let inputs = g.call_inputs(row, &ctx, &BTreeMap::new()).unwrap().unwrap();
+            assert_eq!(inputs["n"], want);
+        }
+    }
+
+    #[test]
+    fn inputs_that_cannot_be_read_fail_the_job_with_the_message() {
+        let yaml = "
+jobs:
+  j: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  inner:
+    on: { call: { inputs: { flag: { type: boolean } } } }
+    jobs: [j]
+  ci:
+    on: { push: {} }
+    jobs:
+      - c:
+          call: inner
+          matrix: { x: [maybe] }
+          with: { flag: '${{ matrix.x }}' }
+";
+        let plan = compile(&parse(yaml).unwrap(), "ci", "refs/heads/main").unwrap();
+        let mut g = Graph::new(
+            plan.jobs
+                .into_iter()
+                .zip(1u64..)
+                .map(|(j, i)| (i, j))
+                .collect(),
+        );
+        let actions = g.advance(&github("refs/heads/main"));
+        assert!(actions.contains(&Action::Finished {
+            job: 1,
+            conclusion: Conclusion::Failure
+        }));
+        let message = g.node(1).unwrap().message.clone().unwrap();
+        assert!(message.contains("`with.flag` of `c (maybe)`"), "{message}");
     }
 
     #[test]

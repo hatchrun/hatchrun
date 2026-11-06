@@ -495,6 +495,7 @@ mod tests {
                 concurrency: None,
                 steps: vec![],
                 deferred: None,
+                scope: Vec::new(),
             },
             environment: None,
             state,

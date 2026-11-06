@@ -59,6 +59,7 @@ pub mod page;
 pub mod planning;
 pub mod pool;
 pub mod reconcile;
+pub mod remote;
 pub mod run;
 pub mod runs;
 pub mod secrets;

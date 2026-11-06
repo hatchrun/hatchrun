@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod artifacts;
+pub mod call;
 pub mod concurrency;
 pub mod config;
 pub mod convert;
@@ -25,6 +26,11 @@ pub mod split;
 pub mod templates;
 pub mod trigger;
 
+pub use call::{
+    CallFrame, CallInput, CallSecret, CallTarget, CallTrigger, Callee, InputType, Library,
+    MAX_CALL_DEPTH, MAX_UNIQUE_CALLEES, RemoteCall, SecretsPassed, entry_in, read_value,
+    remote_calls, remote_calls_from, resolve_inputs, shared_depth,
+};
 pub use concurrency::{Cancel, Concurrency, Resolved};
 pub use config::{
     CacheStep, CheckoutStep, Command, Config, ContinueOnError, Executor, Job, MAX_SOURCE, Matrix,
@@ -52,7 +58,7 @@ pub use permissions::{
 };
 pub use plan::{
     Deferred, JobKind, Plan, PlannedJob, PlannedStep, PlannedStrategy, Ready, compile,
-    config_errors, ready, run_title, validate,
+    compile_with, config_errors, ready, run_title, validate,
 };
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;

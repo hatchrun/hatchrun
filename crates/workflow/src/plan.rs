@@ -16,6 +16,7 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::call::{CallFrame, Library};
 use crate::concurrency::{Cancel, Concurrency, JOB_CONTEXTS, WORKFLOW_CONTEXTS};
 use crate::config::{
     CacheStep, CheckoutStep, Config, ContinueOnError, Job, Matrix, Outcome, Parameter,
@@ -110,8 +111,24 @@ const STEP_KEYS: &[&str] = &[
 /// Keys of a workflow entry. A job parameter with one of these names
 /// could never be set from a workflow: the entry reads the key itself.
 pub(crate) const ENTRY_KEYS: &[&str] = &[
-    "name", "requires", "type", "branches", "tags", "matrix", "strategy",
+    "name",
+    "requires",
+    "type",
+    "branches",
+    "tags",
+    "matrix",
+    "strategy",
+    "call",
+    "secrets",
+    "permissions",
+    "if",
+    "with",
 ];
+
+mod calls;
+
+use self::calls::Calls;
+pub(crate) use self::calls::{call_expression, output_expression};
 
 /// The jobs one workflow runs for one ref.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -205,6 +222,10 @@ pub struct PlannedJob {
     /// `kind` holds a stand-in template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred: Option<Deferred>,
+    /// The calls this job runs in, the outermost first. Empty for a job
+    /// of the workflow that was planned. See [`crate::call`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<CallFrame>,
 }
 
 /// What a planned job reads when it becomes ready, after the jobs it
@@ -325,6 +346,27 @@ pub enum PlannedStep {
 /// Returns every problem found in the config and the workflow. Problems
 /// in jobs the ref drops are reported too.
 pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, Vec<Diagnostic>> {
+    compile_with(config, workflow, git_ref, &Library::default())
+}
+
+/// [`compile`], with the workflow files of other repositories the
+/// workflow may call (see [`remote_calls`](crate::remote_calls)). A call
+/// of a file `library` does not have is an error.
+///
+/// A job of a called workflow is planned as `<call> / <job>`; see
+/// [`crate::call`].
+///
+/// # Errors
+///
+/// As [`compile`], and a call that names no workflow, passes inputs or
+/// secrets the callee does not take, leaves out what it requires, or
+/// nests more than [`MAX_CALL_DEPTH`](crate::MAX_CALL_DEPTH) deep.
+pub fn compile_with(
+    config: &Config,
+    workflow: &str,
+    git_ref: &str,
+    library: &Library,
+) -> Result<Plan, Vec<Diagnostic>> {
     let mut errors = config_errors(config);
     let Some(wf) = config.workflows.get(workflow) else {
         errors.push(Diagnostic::new(format!(
@@ -333,7 +375,16 @@ pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, V
         return Err(dedup(errors));
     };
     let mut budget = Budget::new();
-    let plan = compile_workflow(config, workflow, wf, git_ref, &mut budget, &mut errors);
+    let mut calls = Calls::new(Some(library), workflow);
+    let plan = compile_workflow(
+        config,
+        workflow,
+        wf,
+        git_ref,
+        &mut budget,
+        &mut calls,
+        &mut errors,
+    );
     match plan {
         Some(plan) if errors.is_empty() => Ok(plan),
         _ => Err(dedup(errors)),
@@ -363,7 +414,18 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
     standalone_errors(config, &mut errors);
     let mut budget = Budget::new();
     for (name, wf) in &config.workflows {
-        compile_workflow(config, name, wf, VALIDATE_REF, &mut budget, &mut errors);
+        // A file of another repository is not read here: its calls plan
+        // nothing, and the host checks them when it plans the workflow.
+        let mut calls = Calls::new(None, name);
+        compile_workflow(
+            config,
+            name,
+            wf,
+            VALIDATE_REF,
+            &mut budget,
+            &mut calls,
+            &mut errors,
+        );
         if budget.spent {
             break;
         }
@@ -399,7 +461,7 @@ where
     F: Fn(&str) -> Option<Outcome>,
 {
     let by_id: BTreeMap<&str, &PlannedJob> = plan.jobs.iter().map(|j| (j.id.as_str(), j)).collect();
-    let entry = |id: &'a str| -> &'a str { by_id.get(id).map_or(id, |j| j.name.as_str()) };
+    let entry = |id: &'a str| -> &'a str { by_id.get(id).map_or(id, |j| job.entry_of(j)) };
     let mut entries: Vec<&str> = Vec::new();
     for id in &job.requires {
         let name = entry(id);
@@ -1038,6 +1100,7 @@ fn compile_workflow(
     wf: &Workflow,
     git_ref: &str,
     budget: &mut Budget,
+    calls: &mut Calls<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<Plan> {
     let before = errors.len();
@@ -1068,7 +1131,15 @@ fn compile_workflow(
         .jobs
         .iter()
         .zip(&ids)
-        .map(|(entry, id)| expand_entry(config, wf, name, entry, id, budget, &mut planned, errors))
+        .map(|(entry, id)| {
+            let at = EntryAt {
+                config,
+                wf,
+                workflow: name,
+                git_ref,
+            };
+            expand_entry(&at, entry, id, budget, &mut planned, calls, errors)
+        })
         .collect();
     if budget.spent {
         return None;
@@ -1122,8 +1193,12 @@ fn compile_workflow(
             .map(|(&d, &s)| (ids[d].clone(), s))
             .collect();
         for mut job in std::mem::take(&mut expansions[i]) {
-            job.requires.clone_from(&requires);
-            job.statuses.clone_from(&statuses);
+            // The jobs of a call that need nothing inside the call start
+            // when the call does; the others keep what they need.
+            if wf.jobs[i].call.is_none() || job.requires.is_empty() {
+                job.requires.clone_from(&requires);
+                job.statuses.clone_from(&statuses);
+            }
             jobs.push(job);
         }
     }
@@ -1417,22 +1492,39 @@ fn ref_allows(entry: &WorkflowJob, git_ref: &str) -> bool {
     }
 }
 
+/// Where an entry being expanded is: its config, workflow and the ref
+/// the plan is for.
+#[derive(Clone, Copy)]
+struct EntryAt<'a> {
+    config: &'a Config,
+    wf: &'a Workflow,
+    workflow: &'a str,
+    git_ref: &'a str,
+}
+
 /// Expands one workflow entry into its matrix entries and parallel
 /// nodes, with `requires` left empty.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // One pass over an entry, top to bottom.
 fn expand_entry(
-    config: &Config,
-    wf: &Workflow,
-    workflow: &str,
+    at: &EntryAt<'_>,
     entry: &WorkflowJob,
     id: &str,
     budget: &mut Budget,
     planned: &mut usize,
+    calls: &mut Calls<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Vec<PlannedJob> {
+    let EntryAt {
+        config,
+        wf,
+        workflow,
+        ..
+    } = *at;
     if budget.spent {
         return Vec::new();
+    }
+    if entry.call.is_some() {
+        return calls::expand_call(at, entry, id, budget, planned, calls, errors);
     }
     if entry.approval {
         if !reserve_jobs(workflow, planned, 1, errors) {
@@ -2248,6 +2340,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         concurrency: None,
         steps: Vec::new(),
         deferred: None,
+        scope: Vec::new(),
     }]
 }
 
@@ -2475,6 +2568,7 @@ fn expand_job(
         concurrency,
         steps,
         deferred: None,
+        scope: Vec::new(),
     })
 }
 

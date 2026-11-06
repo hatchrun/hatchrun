@@ -400,7 +400,28 @@ pub async fn create(
             return Ok(Vec::new());
         }
     };
-    let (plans, failed) = match planning::select(source, req.trigger, req.compile_ref) {
+    let mut wanted = planning::remote_workflows(source, req.trigger);
+    if let Some(only) = req.workflow {
+        wanted.retain(|name| name == only);
+    }
+    let library = match hatchrun_workflow::parse(source) {
+        Ok(parsed) if !wanted.is_empty() => {
+            let github = crate::remote::Github {
+                db,
+                tokens,
+                settings,
+                installation_id: req.installation_id,
+                tenant_id: req.tenant_id,
+            };
+            let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
+            crate::remote::read_library(&github, &parsed, &names)
+                .await
+                .map_err(fail)?
+        }
+        _ => hatchrun_workflow::Library::default(),
+    };
+    let selected = planning::select_with(source, req.trigger, req.compile_ref, &library);
+    let (plans, failed) = match selected {
         Selected::Plans { plans, failed } => (
             only_workflow(plans, req.workflow),
             only_failed(failed, req.workflow),
