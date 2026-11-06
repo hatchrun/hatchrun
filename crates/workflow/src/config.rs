@@ -1105,8 +1105,8 @@ impl Serialize for Require {
 /// A matrix can also be read when the entry becomes ready, after the
 /// jobs it requires have ended: the whole `matrix` as one `${{ }}`
 /// expression, a key's list or the `include` list as one. Such a matrix
-/// is dynamic, and it alone may have `include`, which adds combinations
-/// and keys to the ones the other parts make, as on GitHub Actions.
+/// is dynamic. `include` adds combinations and keys to the ones the
+/// other parts make, as on GitHub Actions, in either kind of matrix.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Matrix {
     /// Each key and its values; every combination of them runs.
@@ -1114,7 +1114,7 @@ pub struct Matrix {
     /// Partial combinations that do not run.
     pub exclude: Vec<BTreeMap<String, Value>>,
     /// Combinations `include` adds, or keys it adds to combinations.
-    /// Only a dynamic matrix has them.
+    /// Applied after `exclude`.
     pub include: Vec<BTreeMap<String, Value>>,
     /// The whole matrix as an expression that reads as a map of value
     /// lists, with `include` and `exclude` allowed in it.

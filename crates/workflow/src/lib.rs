@@ -34,7 +34,7 @@ pub use config::{
 pub use convert::{Conversion, convert, to_yaml};
 pub use cron::{Cron, UtcMinute};
 pub use diagnostic::Diagnostic;
-pub use dynamic::{Leg, expand};
+pub use dynamic::{Leg, Siblings, expand};
 pub use environment::{ENVIRONMENT_NAME_MAX, valid_environment_name};
 pub use expr::{
     ExprError, Functions, HATCHRUN_KEYS, JobStatus, checks_status, continue_on_error, evaluate,

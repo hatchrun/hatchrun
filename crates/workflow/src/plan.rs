@@ -23,6 +23,7 @@ use crate::config::{
 };
 use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
+use crate::dynamic::combinations as matrix_entries;
 use crate::environment::valid_environment_name;
 use crate::expr::{self, ExprError};
 use crate::permissions::{Level, token_scopes};
@@ -53,14 +54,14 @@ pub(crate) const MAX_EXCLUDE: usize = 256;
 /// written into the plan, counted once per matrix entry and parallel
 /// node. With `BYTE_BUDGET` it bounds both time and memory, whatever the
 /// config.
-const BUDGET: usize = 50_000;
+pub(crate) const BUDGET: usize = 50_000;
 
 /// The bytes one `compile` or `validate` call may produce. Everything
 /// the call stores is charged before it is allocated: each string, each
 /// map entry and list item (plus `ENTRY_OVERHEAD`), each value passed
 /// into a command, each step and job struct, each matrix entry, each
 /// reported problem, and each extra copy of a job for parallel nodes.
-const BYTE_BUDGET: usize = 8 << 20;
+pub(crate) const BYTE_BUDGET: usize = 8 << 20;
 
 /// The bytes charged for each stored map entry or list string on top of
 /// its text: its `String` headers, the key's heap block and the map node
@@ -72,7 +73,7 @@ const ENTRY_OVERHEAD: usize = 64;
 const MAX_VALUE: usize = 64 << 10;
 
 /// The most jobs one plan can hold, as GitHub caps a run's matrix.
-const MAX_JOBS: usize = 256;
+pub(crate) const MAX_JOBS: usize = 256;
 
 /// The deepest commands can nest.
 const MAX_NESTING: usize = 64;
@@ -1380,8 +1381,29 @@ fn expand_entry(
     // A matrix with expressions is one stand-in job for now; the host
     // makes its jobs when it becomes ready.
     let dynamic = entry.matrix.dynamic();
+    // A matrix with `include` is made the way GitHub makes it, all at
+    // once, since the entries it adds are not a product of the lists.
+    let listed = if !dynamic && !entry.matrix.include.is_empty() {
+        match matrix_entries(&entry.matrix, &Value::Null) {
+            Ok(listed) => Some(listed),
+            Err(message) => {
+                errors.push(Diagnostic::new(format!("`{id}`: {message}")));
+                return Vec::new();
+            }
+        }
+    } else {
+        None
+    };
     let kept = if dynamic {
         vec![0]
+    } else if let Some(listed) = &listed {
+        if listed.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has a matrix whose `exclude` leaves no combination"
+            )));
+            return Vec::new();
+        }
+        (0..listed.len()).collect()
     } else {
         let Some(kept) = kept_combinations(&entry.matrix, combinations, id, &mut walk, errors)
         else {
@@ -1398,12 +1420,20 @@ fn expand_entry(
     for index in kept {
         let combo = if dynamic {
             Some(BTreeMap::new())
+        } else if let Some(listed) = &listed {
+            let combo = listed[index].values.clone();
+            let bytes = combo
+                .iter()
+                .map(|(k, v)| k.len() + ENTRY_OVERHEAD + value_bytes(v))
+                .sum();
+            walk.bytes(bytes, errors).then_some(combo)
         } else {
             combination(&entry.matrix.values, index, &mut walk, errors)
         };
         let Some(combo) = combo else {
             break;
         };
+        let shown = listed.as_ref().map(|l| l[index].shown.as_slice());
         let Some(args) = entry_args(entry, job, &combo, &mut walk, errors) else {
             break;
         };
@@ -1434,7 +1464,8 @@ fn expand_entry(
         }
         let deferred = deferral(&runner, entry, nodes);
         let copy_nodes = if dynamic { 1 } else { nodes };
-        let Some(mut jobs) = copy_job(base, combo, id, copy_nodes, &mut walk, errors) else {
+        let Some(mut jobs) = copy_job(base, combo, (id, shown), copy_nodes, &mut walk, errors)
+        else {
             break;
         };
         if let Some(deferred) = deferred {
@@ -1725,6 +1756,9 @@ pub(crate) fn excluded(matrix: &Matrix, index: usize) -> bool {
 /// `MAX_COMBINATIONS` to check, all of them, which is over the limit
 /// either way.
 fn matrix_size(matrix: &Matrix) -> usize {
+    if !matrix.include.is_empty() && !matrix.dynamic() {
+        return matrix_entries(matrix, &Value::Null).map_or(MAX_MATRIX + 1, |c| c.len());
+    }
     let all = matrix
         .values
         .values()
@@ -1800,7 +1834,7 @@ fn entry_args(
 fn copy_job(
     base: PlannedJob,
     combo: BTreeMap<String, Value>,
-    id: &str,
+    (id, shown): (&str, Option<&[String]>),
     nodes: u32,
     walk: &mut Walk<'_>,
     errors: &mut Vec<Diagnostic>,
@@ -1826,7 +1860,10 @@ fn copy_job(
     {
         return None;
     }
-    let matrix_id = matrix_id(id, &combo);
+    let matrix_id = match shown {
+        Some(shown) if !shown.is_empty() => format!("{id} ({})", shown.join(", ")),
+        _ => matrix_id(id, &combo),
+    };
     let mut base = Some(base);
     let mut combo = Some(combo);
     let mut out = Vec::with_capacity(copies);
@@ -1926,10 +1963,23 @@ fn entry_value_errors(
         dynamic_matrix_errors(entry, id, params, errors);
         return 1;
     }
-    if !matrix.include.is_empty() {
+    if matrix.include.len() > MAX_EXCLUDE {
         errors.push(Diagnostic::new(format!(
-            "`{id}` has matrix `include` but no matrix expression; list the combinations as keys, or read the matrix from a `${{{{ }}}}` expression"
+            "`{id}` has {} matrix `include` entries; the limit is {MAX_EXCLUDE}",
+            matrix.include.len()
         )));
+    }
+    for include in &matrix.include {
+        if include.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has an empty matrix `include` entry"
+            )));
+        }
+        if include.values().any(reads_parameters) {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has a matrix `include` entry that reads `parameters`, which a matrix cannot"
+            )));
+        }
     }
     if matrix.exclude.len() > MAX_EXCLUDE {
         errors.push(Diagnostic::new(format!(

@@ -18,7 +18,8 @@ use serde_json::{Map, Value};
 use crate::config::Matrix;
 use crate::expr::{self, ExprError, Functions, JobStatus, evaluate, interpolate};
 use crate::plan::{
-    Deferred, JobKind, MAX_COMBINATIONS, MAX_MATRIX, PlannedJob, PlannedStrategy, render,
+    BUDGET, BYTE_BUDGET, Deferred, JobKind, MAX_COMBINATIONS, MAX_JOBS, MAX_MATRIX, PlannedJob,
+    PlannedStrategy, render,
 };
 use crate::templates::{template, template_labels};
 
@@ -49,10 +50,23 @@ impl Functions for Plain {
     }
 }
 
+/// What the rest of the run holds around the job being expanded, so
+/// that the limits and the numbering of its strategy group count the
+/// jobs it makes with them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Siblings {
+    /// The jobs of the run other than the one being expanded.
+    pub jobs: usize,
+    /// Jobs of the strategy group before it, in run order.
+    pub group_before: u32,
+    /// Jobs of the strategy group other than it.
+    pub group_others: u32,
+}
+
 /// One matrix entry: its values, and the values its job's name shows.
-struct Combo {
-    values: BTreeMap<String, Value>,
-    shown: Vec<String>,
+pub(crate) struct Combo {
+    pub(crate) values: BTreeMap<String, Value>,
+    pub(crate) shown: Vec<String>,
 }
 
 /// Makes the jobs of `job` from `ctx`, the contexts of the job as the
@@ -70,8 +84,11 @@ struct Combo {
 ///
 /// A message when the matrix cannot be made: an expression fails or
 /// reads the wrong kind of value, a key has no values, the matrix has
-/// no combination or more than 256, or it would make a job id twice.
-pub fn expand(job: &PlannedJob, ctx: &Value) -> Result<Vec<Leg>, String> {
+/// more than 256 entries, or the run would pass the limits of a plan
+/// (256 jobs, and the steps and bytes of a compiled workflow). A matrix
+/// with no entry makes no job: the list is empty and the host skips the
+/// job.
+pub fn expand(job: &PlannedJob, ctx: &Value, siblings: Siblings) -> Result<Vec<Leg>, String> {
     let Some(deferred) = &job.deferred else {
         return Ok(vec![Leg {
             job: job.clone(),
@@ -90,6 +107,24 @@ pub fn expand(job: &PlannedJob, ctx: &Value) -> Result<Vec<Leg>, String> {
     };
     let nodes = deferred.nodes.max(1);
     let total = combos.len() * nodes as usize;
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    if siblings.jobs + total > MAX_JOBS {
+        return Err(format!(
+            "the matrix would make {total} jobs, and the run would have {}; the limit is {MAX_JOBS}",
+            siblings.jobs + total
+        ));
+    }
+    let size = serde_json::to_vec(job).map_or(0, |bytes| bytes.len());
+    if total.saturating_mul(job.steps.len() + 1) > BUDGET
+        || total.saturating_mul(size) > BYTE_BUDGET
+    {
+        return Err(format!(
+            "the matrix would make {total} jobs of {} steps, which is more work than a workflow may plan",
+            job.steps.len()
+        ));
+    }
     let mut ids = BTreeSet::new();
     let mut scope = ctx.clone();
     let mut legs = Vec::with_capacity(total);
@@ -118,8 +153,8 @@ pub fn expand(job: &PlannedJob, ctx: &Value) -> Result<Vec<Leg>, String> {
                 leg.node = (nodes > 1).then_some((node, nodes));
             }
             leg.strategy = job.strategy.as_ref().map(|s| PlannedStrategy {
-                job_index: u32::try_from(legs.len()).unwrap_or(u32::MAX),
-                job_total: u32::try_from(total).unwrap_or(u32::MAX),
+                job_index: siblings.group_before + u32::try_from(legs.len()).unwrap_or(u32::MAX),
+                job_total: siblings.group_others + u32::try_from(total).unwrap_or(u32::MAX),
                 ..s.clone()
             });
             leg.deferred = None;
@@ -225,14 +260,18 @@ fn maps(value: Value, what: &str) -> Result<Vec<BTreeMap<String, Value>>, String
 
 /// The entries of a matrix, as GitHub makes them.
 #[allow(clippy::too_many_lines)] // Reads each part of a matrix, then combines them.
-fn combinations(matrix: &Matrix, ctx: &Value) -> Result<Vec<Combo>, String> {
+pub(crate) fn combinations(matrix: &Matrix, ctx: &Value) -> Result<Vec<Combo>, String> {
     let mut values = matrix.values.clone();
     let mut include = matrix.include.clone();
     let mut exclude = matrix.exclude.clone();
     if let Some(text) = &matrix.from {
-        let value = read(text, ctx, "matrix")?;
-        let Value::Object(map) = value else {
-            return Err(format!("matrix must read as a map of lists, found {value}"));
+        let map = match read(text, ctx, "matrix")? {
+            Value::Object(map) => map,
+            // `fromJSON('[]')` is the usual way to say there is nothing.
+            Value::Array(items) if items.is_empty() => Map::new(),
+            other => {
+                return Err(format!("matrix must read as a map of lists, found {other}"));
+            }
         };
         for (key, value) in map {
             match key.as_str() {
@@ -290,9 +329,9 @@ fn combinations(matrix: &Matrix, ctx: &Value) -> Result<Vec<Combo>, String> {
         let mut matched = false;
         for combo in &mut combos {
             // Original values stay; keys an earlier entry added can change.
-            let fits = entry
-                .iter()
-                .all(|(k, v)| !values.contains_key(k) || combo.values.get(k) == Some(v));
+            let fits = entry.iter().all(|(k, v)| {
+                !values.contains_key(k) || combo.values.get(k).is_some_and(|c| same(c, v))
+            });
             if fits {
                 matched = true;
                 for (k, v) in &entry {
@@ -321,9 +360,6 @@ fn combinations(matrix: &Matrix, ctx: &Value) -> Result<Vec<Combo>, String> {
             .to_string(),
         )
     });
-    if combos.is_empty() {
-        return Err("matrix has no combination to run".to_owned());
-    }
     if combos.len() > MAX_MATRIX {
         return Err(format!(
             "matrix has {} jobs; the limit is {MAX_MATRIX}",
@@ -337,10 +373,14 @@ fn combinations(matrix: &Matrix, ctx: &Value) -> Result<Vec<Combo>, String> {
 /// every one of its keys.
 fn excluded_by(exclude: &[BTreeMap<String, Value>], combo: &BTreeMap<String, Value>) -> bool {
     exclude.iter().any(|entry| {
-        entry.iter().all(|(k, want)| {
-            combo
-                .get(k)
-                .is_some_and(|v| v == want || render(v) == render(want))
-        })
+        entry
+            .iter()
+            .all(|(k, want)| combo.get(k).is_some_and(|v| same(v, want)))
     })
+}
+
+/// Whether two matrix values are the same, as `exclude` and `include`
+/// compare them: GitHub reads them as the text they show.
+fn same(a: &Value, b: &Value) -> bool {
+    a == b || render(a) == render(b)
 }

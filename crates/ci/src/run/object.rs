@@ -1088,19 +1088,33 @@ impl<'a> Cx<'a> {
     /// earlier try of this turn recorded is reused, so a retry adds no
     /// second one. The caller holds the lock.
     async fn expand(&self, run: &mut Loaded, job: u64) -> Result<Vec<Action>> {
+        // Only a job that waits to expand has rows to change.
+        let Some(node) = run.graph.node(job) else {
+            return Ok(Vec::new());
+        };
+        if node.state != NodeState::Queued || node.job.deferred.is_none() {
+            return Ok(Vec::new());
+        }
+        let environment = node.job.environment.clone();
         let db = self.db().await?;
         let ctx = self.github_ctx(&run.info).await?;
-        let vars = store::job_vars(db, &run.info.tenant_id, run.info.repo.id, None).await?;
+        // The variables the job itself reads, with those of its
+        // environment (the planner leaves no expression in its name).
+        let environment_id = match environment.as_deref() {
+            Some(name) => store::environment(db, run.info.repo.id, name)
+                .await?
+                .map(|row| row.id),
+            None => None,
+        };
+        let vars =
+            store::job_vars(db, &run.info.tenant_id, run.info.repo.id, environment_id).await?;
         let Some(made) = run.graph.expansion(job, &ctx, &vars) else {
             return Ok(Vec::new());
         };
         run.graph_mut().set_vars(vars);
         let legs = match made {
             Ok(legs) if !legs.is_empty() => legs,
-            Ok(_) => {
-                let message = "the matrix made no job".to_owned();
-                return Ok(run.graph_mut().failed(job, message, &ctx));
-            }
+            Ok(_) => return Ok(run.graph_mut().no_jobs(job, &ctx)),
             Err(message) => return Ok(run.graph_mut().failed(job, message, &ctx)),
         };
         let attempt = run.graph.node(job).map_or(1, |node| node.attempt);

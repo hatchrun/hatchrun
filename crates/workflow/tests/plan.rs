@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use hatchrun_workflow::{
     CheckoutStep, Diagnostic, JobKind, Level, Outcome, Plan, PlannedJob, PlannedStep, Ready,
-    Statuses, compile, config_errors, expand, parse, ready, template, validate,
+    Statuses, compile, config_errors, parse, ready, template, validate,
 };
 
 const CYCLE: &str = "
@@ -2010,6 +2010,13 @@ workflows: { ci: { on: { push: {} }, jobs: [t] } }
     );
 }
 
+fn expand(
+    job: &PlannedJob,
+    ctx: &serde_json::Value,
+) -> Result<Vec<hatchrun_workflow::Leg>, String> {
+    hatchrun_workflow::expand(job, ctx, hatchrun_workflow::Siblings::default())
+}
+
 const DYNAMIC: &str = "
 jobs:
   setup: { runs-on: ubuntu-latest, outputs: { m: x }, steps: [] }
@@ -2201,14 +2208,118 @@ workflows:
 ",
         &["`matrix` reads `matrix`"],
     );
-    assert_error(
+}
+
+#[test]
+fn a_static_matrix_takes_include_and_exclude_as_on_github() {
+    let p = plan(
         "
-jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
 workflows:
   ci:
     on: { push: {} }
-    jobs: [{ t: { matrix: { os: [a], include: [{ os: b }] } } }]
+    jobs:
+      - t:
+          matrix:
+            node: [18, 20]
+            os: [a, b]
+            exclude: [{ node: 18, os: a }]
+            include:
+              - { os: b, extra: yes }
+              - { node: 22, os: c }
 ",
-        &["matrix `include` but no matrix expression"],
     );
+    let ids: Vec<&str> = p.jobs.iter().map(|j| j.id.as_str()).collect();
+    // `extra` joins the entries of os b, and shows in no name.
+    assert_eq!(ids, ["t (18, b)", "t (20, a)", "t (20, b)", "t (22, c)"]);
+    assert_eq!(p.jobs[0].matrix["extra"], "yes");
+    assert_eq!(p.jobs[2].matrix["extra"], "yes");
+    assert!(!p.jobs[1].matrix.contains_key("extra"));
+    assert_eq!(p.jobs[3].strategy.as_ref().unwrap().job_total, 4);
+}
+
+#[test]
+fn a_matrix_of_include_only_runs_each_entry() {
+    let p = plan(
+        "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [{ t: { matrix: { include: [{ os: a }, { os: b }] } } }]
+",
+    );
+    assert_eq!(p.jobs.len(), 2);
+}
+
+#[test]
+fn include_matches_with_the_equality_exclude_uses() {
+    let job = deferred_test();
+    // `20` and `"20"` are the same text, as in `exclude`.
+    let legs = expand(
+        &job,
+        &ctx(
+            r#"["ubuntu-latest"]"#,
+            r#"[{"os":"ubuntu-latest","node":"20","tag":"x"}]"#,
+        ),
+    )
+    .unwrap();
+    assert_eq!(legs.len(), 1);
+    assert_eq!(legs[0].job.matrix["tag"], "x");
+}
+
+#[test]
+fn an_empty_matrix_makes_no_job_and_a_big_run_is_refused() {
+    let job = deferred_test();
+    let c = |m: &str| {
+        serde_json::json!({
+            "needs": { "setup": { "outputs": { "m": m } } },
+            "github": {}, "inputs": {}, "vars": {}, "hatchrun": {},
+        })
+    };
+    let p = plan(
+        "
+jobs:
+  t: { runs-on: ubuntu-latest, parallelism: 64, steps: [{ run: x }] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs: [{ t: { matrix: '${{ fromJSON(needs.setup.outputs.m) }}' } }]
+",
+    );
+    for empty in ["[]", "{}"] {
+        assert!(expand(&p.jobs[0], &c(empty)).unwrap().is_empty(), "{empty}");
+    }
+    let err = expand(&p.jobs[0], &c(r#"{"k":[1,2,3,4,5]}"#)).unwrap_err();
+    assert!(err.contains("limit is 256"), "{err}");
+    let _ = job;
+}
+
+#[test]
+fn a_matrix_is_numbered_and_limited_with_the_jobs_around_it() {
+    let job = deferred_test();
+    let c = ctx(r#"["ubuntu-latest","ubuntu-26.04-arm"]"#, "[]");
+    let siblings = hatchrun_workflow::Siblings {
+        jobs: 5,
+        group_before: 2,
+        group_others: 3,
+    };
+    let legs = hatchrun_workflow::expand(&job, &c, siblings).unwrap();
+    // The exclude leaves three of four entries.
+    let numbers: Vec<(u32, u32)> = legs
+        .iter()
+        .map(|l| {
+            let s = l.job.strategy.as_ref().unwrap();
+            (s.job_index, s.job_total)
+        })
+        .collect();
+    assert_eq!(numbers, [(2, 6), (3, 6), (4, 6)]);
+    let crowded = hatchrun_workflow::Siblings {
+        jobs: 254,
+        ..Default::default()
+    };
+    let err = hatchrun_workflow::expand(&job, &c, crowded).unwrap_err();
+    assert!(err.contains("limit is 256"), "{err}");
 }
