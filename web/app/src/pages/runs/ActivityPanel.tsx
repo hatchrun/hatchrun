@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { ChevronDown } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { getActivity, type Activity, type ActivityRange } from "@/api";
@@ -17,13 +18,26 @@ const RANGES: { id: ActivityRange; label: string; title: string; unit: string; a
 
 const CHART_HEIGHT = 56;
 
+const OPEN_KEY = "hatchrun.activity-open";
+const readOpen = () => {
+  try {
+    return window.localStorage.getItem(OPEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+};
+
 /**
- * Concurrency now (running, queued and free slots of the org's limit)
- * next to the runs started per bucket over 24 hours or 7 days. Bars
- * scale to the largest bucket of the range.
+ * A one-line summary of concurrency now (running, queued and free slots
+ * of the org's limit) and the runs started over 24 hours or 7 days,
+ * which opens into the full concurrency bar and chart. The repository
+ * filter scopes both; the activity API has no branch, actor or text
+ * filter, so the line says so when one is set. Bars scale to the
+ * largest bucket of the range.
  */
-export function ActivityPanel({ org, repos }: { org: string; repos: string[] }) {
+export function ActivityPanel({ org, repos, otherFilters = false }: { org: string; repos: string[]; /** A branch, actor or text filter is set: the panel cannot apply it. */ otherFilters?: boolean }) {
   const [range, setRange] = useState<ActivityRange>("24h");
+  const [open, setOpen] = useState(readOpen);
   const look = RANGES.find((item) => item.id === range) ?? (RANGES[0] as (typeof RANGES)[number]);
   const [activity, reload] = useLoad(() => getActivity(org, range, repos), `${org}|${range}|${repos.join(",")}`, true);
   useEffect(() => {
@@ -31,17 +45,55 @@ export function ActivityPanel({ org, repos }: { org: string; repos: string[] }) 
     return () => window.clearInterval(timer);
   }, [reload]);
 
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    try {
+      window.localStorage.setItem(OPEN_KEY, next ? "1" : "0");
+    } catch {
+      // Not remembered.
+    }
+  };
+  const scope = repos.length === 0 ? "org-wide" : repos.length === 1 ? `repo ${repos[0]}` : `${repos.length} repos`;
+
   return (
-    <section aria-label="Concurrency now and runs over time" className="flex flex-wrap rounded-md border border-rule bg-panel">
-      <Await loaded={activity} retry={reload}>
-        {(data) => (
-          <>
-            <Concurrency concurrency={data.concurrency} />
-            <Chart data={data} look={look} range={range} onRange={setRange} />
-          </>
-        )}
-      </Await>
+    <section aria-label="Concurrency now and runs over time" className="rounded-md border border-rule bg-panel">
+      <button type="button" aria-expanded={open} onClick={toggle} className="flex w-full cursor-pointer flex-wrap items-center gap-x-4 gap-y-1 px-3.5 py-1.5 text-left">
+        <span className="flex items-center gap-2">
+          <ChevronDown size={14} aria-hidden="true" className={cn("text-fg-3 transition-transform", !open && "-rotate-90")} />
+          <h2 className="section-title">Activity</h2>
+        </span>
+        <span className="font-mono text-[13px] text-fg-3" title={repos.join(", ") || undefined}>
+          {scope}
+          {otherFilters && ", branch, actor and text filters not applied"}
+        </span>
+        {activity.state === "ready" && <Summary data={activity.data} range={range} />}
+      </button>
+      {open && (
+        <div className="flex flex-wrap border-t border-rule">
+          <Await loaded={activity} retry={reload}>
+            {(data) => (
+              <>
+                <Concurrency concurrency={data.concurrency} />
+                <Chart data={data} look={look} range={range} onRange={setRange} />
+              </>
+            )}
+          </Await>
+        </div>
+      )}
     </section>
+  );
+}
+
+function Summary({ data, range }: { data: Activity; range: ActivityRange }) {
+  const { running, queued, limit } = data.concurrency;
+  const sum = (key: "started" | "passed" | "failed") => data.buckets.reduce((total, bucket) => total + bucket[key], 0);
+  const failed = sum("failed");
+  return (
+    <span className="font-mono text-[13px] text-fg-3">
+      <span className="text-fg">{running}</span> / {limit} slots, {queued} queued <span className="text-control">|</span> {range}: <span className="text-fg">{abbreviate(sum("started"))}</span> started,{" "}
+      <span className="text-passed">{abbreviate(sum("passed"))}</span> passed, <span className={cn(failed > 0 ? "text-failed" : "text-fg-3")}>{abbreviate(failed)}</span> failed
+    </span>
   );
 }
 

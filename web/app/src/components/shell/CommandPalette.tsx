@@ -12,6 +12,16 @@ import { repoUrl, runUrl } from "@/lib/urls";
 import { useDebounced, useRepoSearch } from "@/lib/useRepos";
 import { navigate } from "@/router";
 
+/** Lower ranks first: the short name (after the owner) equals the needle, starts with it, then any other match. */
+const rank = (name: string, needle: string) => {
+  const full = name.toLowerCase();
+  const short = full.slice(full.indexOf("/") + 1);
+  if (short === needle || full === needle) return 0;
+  if (short.startsWith(needle)) return 1;
+  if (full.startsWith(needle)) return 2;
+  return 3;
+};
+
 const PAGES = [
   { label: "Runs", path: "" },
   { label: "Repositories", path: "repositories" },
@@ -19,7 +29,8 @@ const PAGES = [
   { label: "Environments", path: "environments" },
   { label: "Settings", path: "settings" },
   { label: "Billing", path: "settings/billing" },
-  { label: "Setup", path: "setup" },
+  { label: "Setup", path: "settings/setup" },
+  { label: "Audit log", path: "settings/audit" },
 ];
 
 /**
@@ -55,24 +66,26 @@ export function CommandPalette({ org, open, onOpenChange }: { org: string; open:
     const out: (PickItem & { go: string })[] = [];
     if (!needle) {
       for (const name of recents(`repos:${org}`).slice(0, 4)) {
-        out.push({ key: `r:${name}`, group: "Recent repositories", label: name, mono: true, go: repoUrl(name) });
+        out.push({ key: `r:${name}`, group: "Recent repositories", label: name, title: name, mono: true, go: repoUrl(name) });
       }
     }
     for (const page of PAGES.filter((item) => !needle || item.label.toLowerCase().includes(needle))) {
       out.push({ key: `p:${page.path}`, group: "Pages", label: page.label, go: `/o/${org}${page.path ? `/${page.path}` : ""}` });
     }
     if (needle) {
-      for (const repo of repos) {
-        out.push({ key: `r:${repo.name}`, group: "Repositories", label: repo.name, mono: true, go: repoUrl(repo.name) });
+      const ranked = repos.map((repo, order) => ({ repo, order, rank: rank(repo.name, needle) })).sort((a, b) => a.rank - b.rank || a.order - b.order);
+      for (const { repo } of ranked) {
+        out.push({ key: `r:${repo.name}`, group: "Repositories", label: repo.name, title: repo.name, mono: true, go: repoUrl(repo.name) });
       }
       for (const run of runs) {
         out.push({
           key: `u:${run.id}`,
           group: "Runs",
           label: `${run.repository} · ${run.workflow} #${run.run_number}`,
+          title: `${run.repository} · ${run.workflow} #${run.run_number}${run.branch ? ` on ${run.branch}` : ""}`,
           mono: true,
           go: runUrl(run.repository, run.id),
-          note: run.branch ?? undefined,
+          note: run.branch ? <span className="inline-block max-w-[140px] truncate align-bottom">{run.branch}</span> : undefined,
         });
       }
     }

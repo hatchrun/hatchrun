@@ -86,7 +86,7 @@ export function Runs({ org }: OrgPageProps) {
     <Page title="Runs" meta={total ? `${abbreviate(total[0] ?? 0)} runs, ${range.label.toLowerCase()}` : org}>
       <NeedsYou org={org} onChange={reload} />
 
-      <ActivityPanel org={org} repos={filters.asRunFilters.repo ?? []} />
+      <ActivityPanel org={org} repos={filters.repos} otherFilters={filters.branch !== null || filters.actor !== null || filters.q !== ""} />
 
       <section aria-label="CI runs" className="rounded-md border border-rule">
         <div className="flex flex-col gap-2.5 rounded-t-md border-b border-rule bg-panel px-3.5 py-2.5">
