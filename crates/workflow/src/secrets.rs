@@ -143,8 +143,8 @@ impl SecretRefs {
 
 impl PlannedJob {
     /// The secrets this job reads: every `${{ secrets.X }}` in its
-    /// `env`, `outputs`, `environment-url` and steps, and the secrets its `if:` conditions
-    /// name, plus [`DEBUG_SECRETS`].
+    /// `env`, `outputs`, `environment-url`, `container`, `services` and steps, and the
+    /// secrets its `if:` conditions name, plus [`DEBUG_SECRETS`].
     ///
     /// A job of a called workflow reads only what its calls pass, so
     /// the names are the stored secrets of the outermost workflow those
@@ -157,6 +157,11 @@ impl PlannedJob {
         refs.scan_all(self.outputs.values());
         refs.scan_opt(self.environment_url.as_deref(), false);
         refs.scan_opt(self.if_.as_deref(), true);
+        for container in self.container.iter().chain(self.services.values()) {
+            for (_, text) in container.texts() {
+                refs.scan(text, false);
+            }
+        }
         for step in &self.steps {
             refs.scan_step(step);
         }
@@ -269,13 +274,29 @@ mod tests {
             environment: None,
             environment_url: None,
             concurrency: None,
+            container: Some(crate::config::Container {
+                image: "ghcr.io/acme/build:1".into(),
+                credentials: Some(crate::config::Credentials {
+                    username: "bot".into(),
+                    password: "${{ secrets.REGISTRY }}".into(),
+                }),
+                ..crate::config::Container::default()
+            }),
+            services: BTreeMap::from([(
+                "db".into(),
+                crate::config::Container {
+                    image: "postgres".into(),
+                    env: BTreeMap::from([("PW".into(), "${{ secrets.DB_PASSWORD }}".into())]),
+                    ..crate::config::Container::default()
+                },
+            )]),
             steps: vec![step],
             deferred: None,
             scope: Vec::new(),
         };
         let refs = job.secret_refs();
         assert!(!refs.all);
-        let mut want = set(&["ONE", "TWO", "THREE"]);
+        let mut want = set(&["ONE", "TWO", "THREE", "REGISTRY", "DB_PASSWORD"]);
         want.extend(DEBUG_SECRETS.iter().map(|s| (*s).to_string()));
         assert_eq!(refs.names, want);
     }

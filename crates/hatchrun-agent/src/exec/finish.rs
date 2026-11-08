@@ -78,7 +78,8 @@ impl Job<'_> {
             self.masker.add(&token);
         }
         let services = Services { cache, artifacts };
-        let proxy = match Proxy::start_services(services, IpAddr::V4(Ipv4Addr::LOCALHOST)).await {
+        let ip = self.proxy_bind().await;
+        let proxy = match Proxy::start_services(services, ip).await {
             Ok(proxy) => proxy,
             Err(err) => {
                 self.cache_unavailable(sink, &err);
@@ -102,12 +103,35 @@ impl Job<'_> {
             },
         };
         self.masker.add(&token);
+        // `docker buildx` with `type=gha` reads these three, and the
+        // v1 URL too, when it checks that a cache is configured.
         self.cache_env = BTreeMap::from([
+            ("ACTIONS_CACHE_URL".to_owned(), format!("{}/", proxy.url())),
             ("ACTIONS_RESULTS_URL".to_owned(), proxy.url().to_owned()),
             ("ACTIONS_CACHE_SERVICE_V2".to_owned(), "true".to_owned()),
             ("ACTIONS_RUNTIME_TOKEN".to_owned(), token),
         ]);
         Some(proxy)
+    }
+
+    /// Where the proxy listens: the address of Docker's default bridge
+    /// when Docker answers, so a `BuildKit` container (which cannot reach
+    /// the machine's loopback) and job containers can use it, and the
+    /// loopback otherwise. Only the host and the containers on its
+    /// bridges can connect.
+    async fn proxy_bind(&mut self) -> IpAddr {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let args = [
+            "network".to_owned(),
+            "inspect".to_owned(),
+            "bridge".to_owned(),
+            "--format".to_owned(),
+            "{{(index .IPAM.Config 0).Gateway}}".to_owned(),
+        ];
+        match self.docker_capture(&args, None).await {
+            Ok(out) if out.code == 0 => out.stdout.trim().parse().unwrap_or(loopback),
+            _ => loopback,
+        }
     }
 
     fn cache_unavailable(&mut self, sink: &mut dyn Sink, err: &anyhow::Error) {

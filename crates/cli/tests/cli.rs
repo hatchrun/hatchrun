@@ -63,7 +63,11 @@ fn convert_writes_yaml() {
         .arg("-o")
         .arg(&dest));
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(text(&out.stderr).contains("services"));
+    assert!(
+        std::fs::read_to_string(&dest)
+            .unwrap()
+            .contains("services:")
+    );
     let out = run(hatchrun().arg("validate").arg(&dest));
     assert!(
         out.status.success(),

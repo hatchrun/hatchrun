@@ -11,6 +11,7 @@ pub mod builtin;
 pub mod commands;
 pub mod composite;
 pub mod context;
+pub mod docker;
 pub mod files;
 pub mod finish;
 pub mod layout;
@@ -67,7 +68,10 @@ pub struct Options {
     /// `RUNNER_TOOL_CACHE`.
     pub tool_cache: PathBuf,
     /// How long one `timeout-minutes` minute lasts. Tests shorten it.
+    /// A service's health check wait is a thirtieth of it.
     pub minute: Duration,
+    /// The `docker` command. `None` finds `docker` on the `PATH`.
+    pub docker: Option<PathBuf>,
 }
 
 /// The directories the runner user owns while the job runs. The action
@@ -196,8 +200,18 @@ pub async fn run_job(
         cache_saves: Vec::new(),
         cache_env: BTreeMap::new(),
         background: Background::default(),
+        docker: docker::DockerState::new(format!("hatchrun-{}", random_name().unwrap_or_default())),
         environment_url: None,
     };
+    for container in doc.job.container.iter().chain(doc.job.services.values()) {
+        if let Some(credentials) = &container.credentials
+            && !credentials.password.contains("${{")
+        {
+            // A literal password is a secret too; one from `secrets` is
+            // already hidden.
+            job.masker.add(&credentials.password);
+        }
+    }
     job.start();
 
     let result = finish(&mut job, sink, &timed_out, &external).await;
@@ -223,6 +237,22 @@ async fn finish(
     }
 
     let proxy = job.start_cache(sink).await;
+    if job.start_containers(sink).await.is_err() {
+        // The steps never run, as on GitHub when a container does not start.
+        let summaries = doc
+            .job
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| job.skip(index, step, sink))
+            .collect();
+        job.stop_containers(sink).await;
+        if let Some(proxy) = proxy {
+            proxy.stop().await;
+        }
+        let conclusion = conclusion_of(job.status, timed_out, external);
+        return job.result(conclusion, BTreeMap::new(), summaries);
+    }
     // GitHub runs every `pre` before the first step, in step order.
     job.pre_phase(sink).await;
     let mut summaries = Vec::new();
@@ -242,20 +272,30 @@ async fn finish(
     job.save_caches(sink).await;
     let outputs = job.job_outputs(sink);
     job.evaluate_environment_url(sink);
+    job.stop_containers(sink).await;
     if let Some(proxy) = proxy {
         proxy.stop().await;
     }
 
-    // GitHub reports a job that ran out of time as failed.
+    let conclusion = conclusion_of(job.status, timed_out, external);
+    job.result(conclusion, outputs, summaries)
+}
+
+/// How the job ended, from its status. A job that ran out of time is
+/// reported as failed, as the hosted runner does.
+fn conclusion_of(
+    status: JobStatus,
+    timed_out: &std::sync::atomic::AtomicBool,
+    external: &tokio::sync::watch::Receiver<u32>,
+) -> Conclusion {
     let timed_out = timed_out.load(std::sync::atomic::Ordering::Relaxed) && *external.borrow() == 0;
-    let conclusion = match job.status {
+    match status {
         JobStatus::Success => Conclusion::Success,
         JobStatus::Failure => Conclusion::Failure,
         JobStatus::Cancelled if timed_out => Conclusion::Failure,
         JobStatus::Cancelled => Conclusion::Cancelled,
         JobStatus::Skipped => Conclusion::Skipped,
-    };
-    job.result(conclusion, outputs, summaries)
+    }
 }
 
 /// Passes the agent's stop requests on to the job and adds the job's
@@ -410,6 +450,8 @@ struct Job<'a> {
     cache_env: BTreeMap<String, String>,
     /// Process groups that steps left running. They end with the job.
     background: Background,
+    /// The containers the job started.
+    docker: docker::DockerState,
     /// The `environment-url`, once the job ended well and it evaluated.
     environment_url: Option<String>,
 }
@@ -420,6 +462,8 @@ struct Prepared {
     script: PathBuf,
     cwd: PathBuf,
     env: BTreeMap<String, String>,
+    /// The names the step's own `env` sets.
+    step_keys: Vec<String>,
     timeout: Option<Duration>,
     files: StepFiles,
 }
@@ -684,20 +728,36 @@ impl Job<'_> {
             }
         };
         let args = prepared.shell.args_for(&prepared.script.to_string_lossy());
+        let exec = match self.launch_for(
+            &prepared.shell.program,
+            &args,
+            &prepared.cwd,
+            &prepared.env,
+            &prepared.step_keys,
+        ) {
+            Ok(exec) => exec,
+            Err(message) => {
+                remove_script(&prepared.script);
+                self.say(sink, Line::Error(&message));
+                return (common, Conclusion::Failure, BTreeMap::new());
+            }
+        };
         let ran = self
             .execute(
                 Launch {
-                    program: &prepared.shell.program,
-                    args: &args,
-                    cwd: &prepared.cwd,
-                    env: &prepared.env,
+                    program: &exec.program,
+                    args: &exec.args,
+                    cwd: &exec.cwd,
+                    env: &exec.env,
                     timeout: prepared.timeout,
                     timeout_minutes: step.timeout_minutes,
-                    files: &prepared.files,
+                    files: Some(&prepared.files),
+                    as_agent: exec.as_agent,
                 },
                 sink,
             )
             .await;
+        exec.cleanup();
         // The script may hold secrets. Nothing needs it after the run.
         remove_script(&prepared.script);
         (common, ran.outcome, ran.outputs)
@@ -738,7 +798,11 @@ impl Job<'_> {
             args: launch.args,
             cwd: launch.cwd,
             env: launch.env,
-            user: self.opts.runner_user.as_deref(),
+            user: self
+                .opts
+                .runner_user
+                .as_deref()
+                .filter(|_| !launch.as_agent),
             timeout,
         };
         let mut cancel: Pin<Box<dyn Future<Output = ()>>> = if self.grace_until.is_some() {
@@ -776,24 +840,26 @@ impl Job<'_> {
         }
 
         let mut state = Vec::new();
-        let read = files::read(launch.files);
-        // Nothing needs the files now, and a process left running must
-        // not write to them for a later reader to trust.
-        launch.files.remove();
-        match read {
-            Ok(written) => {
-                for warning in &written.warnings {
-                    out.warning(warning);
+        if let Some(step_files) = launch.files {
+            let read = files::read(step_files);
+            // Nothing needs the files now, and a process left running must
+            // not write to them for a later reader to trust.
+            step_files.remove();
+            match read {
+                Ok(written) => {
+                    for warning in &written.warnings {
+                        out.warning(warning);
+                    }
+                    self.github_env.extend(written.env);
+                    self.path_dirs.extend(written.path);
+                    state = written.state;
+                    out.push_outputs(written.outputs);
                 }
-                self.github_env.extend(written.env);
-                self.path_dirs.extend(written.path);
-                state = written.state;
-                out.push_outputs(written.outputs);
-            }
-            Err(err) => {
-                out.error(&err.to_string());
-                if outcome == Conclusion::Success {
-                    outcome = Conclusion::Failure;
+                Err(err) => {
+                    out.error(&err.to_string());
+                    if outcome == Conclusion::Success {
+                        outcome = Conclusion::Failure;
+                    }
                 }
             }
         }
@@ -851,7 +917,13 @@ struct Launch<'a> {
     env: &'a BTreeMap<String, String>,
     timeout: Option<Duration>,
     timeout_minutes: Option<u32>,
-    files: &'a StepFiles,
+    /// The file command files to read when it ends. `None` for a process
+    /// that has none, such as a `docker pull`.
+    files: Option<&'a StepFiles>,
+    /// Runs as the agent, not the runner user: the `docker` command
+    /// does, so it needs no `docker` group and no access to the
+    /// runner's home.
+    as_agent: bool,
 }
 
 /// How a launched process went.
@@ -897,14 +969,16 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
     let workspace = &layout.workspace;
     let files = StepFiles::create(&layout.temp, index, job.owner).map_err(|e| format!("{e:#}"))?;
 
+    // A step in the job container sees the container's paths.
+    let base = job.step_ctx();
     let mut step_env = BTreeMap::new();
     for (key, value) in &step.env {
-        let text = interp(value, &job.ctx, workspace, job.status)
-            .map_err(|e| format!("env {key}: {e}"))?;
+        let text =
+            interp(value, &base, workspace, job.status).map_err(|e| format!("env {key}: {e}"))?;
         step_env.insert(key.clone(), text);
     }
     // The step's own expressions see its env too.
-    let mut ctx = job.ctx.clone();
+    let mut ctx = base;
     let mut visible = job.env_context();
     visible.extend(step_env.clone());
     ctx.set_env(&visible);
@@ -923,13 +997,18 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
 
     let mut env = base_env(job, &files, &step_action(step, index))?;
     env.extend(job.env_context());
+    let step_keys: Vec<String> = step_env.keys().cloned().collect();
     env.extend(step_env);
     job.with_path(&mut env);
 
-    let has_bash = env.get("PATH").is_some_and(|path| {
-        path.split(':')
-            .any(|dir| Path::new(dir).join("bash").is_file())
-    });
+    // In a container the image decides, not this machine.
+    let has_bash = match job.docker.has_bash() {
+        Some(has_bash) => has_bash,
+        None => env.get("PATH").is_some_and(|path| {
+            path.split(':')
+                .any(|dir| Path::new(dir).join("bash").is_file())
+        }),
+    };
     let shell = shell::resolve(shell_name.as_deref(), has_bash)?;
     let script = layout
         .temp
@@ -941,6 +1020,7 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
         script,
         cwd,
         env,
+        step_keys,
         timeout: step
             .timeout_minutes
             .map(|minutes| job.opts.minute * minutes),

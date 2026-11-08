@@ -41,6 +41,8 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
             environment: None,
             environment_url: None,
             concurrency: None,
+            container: None,
+            services: std::collections::BTreeMap::new(),
             steps,
             deferred: None,
             scope: Vec::new(),

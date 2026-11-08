@@ -200,6 +200,32 @@ impl Contexts {
         self.value["env"] = json!(env);
     }
 
+    /// Sets `job.container` and `job.services`, which the job's
+    /// containers make: their ids, network and mapped ports.
+    pub fn set_containers(&mut self, container: Option<Value>, services: Value) {
+        if let Some(container) = container {
+            self.value["job"]["container"] = container;
+        }
+        self.value["job"]["services"] = services;
+    }
+
+    /// Replaces the paths of the `github` and `runner` contexts with
+    /// where the job's container sees them, as `to_container` maps them.
+    pub fn set_paths(&mut self, layout: &Layout, to_container: impl Fn(&Path) -> String) {
+        let runner_workspace = layout.workspace.parent().unwrap_or(&layout.workspace);
+        self.value["github"]["workspace"] = json!(to_container(&layout.workspace));
+        self.value["runner"]["temp"] = json!(to_container(&layout.temp));
+        self.value["runner"]["tool_cache"] = json!(to_container(&layout.tool_cache));
+        self.value["runner"]["workspace"] = json!(to_container(runner_workspace));
+        if let Some(path) = self.value["github"]["action_path"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(|p| to_container(Path::new(p)))
+        {
+            self.value["github"]["action_path"] = json!(path);
+        }
+    }
+
     /// Records a finished step under `steps.<id>`.
     pub fn record_step(
         &mut self,
@@ -557,6 +583,8 @@ mod tests {
             environment: None,
             environment_url: None,
             concurrency: None,
+            container: None,
+            services: std::collections::BTreeMap::new(),
             steps: Vec::new(),
             deferred: None,
             scope: Vec::new(),
@@ -975,5 +1003,28 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn container_paths_apply_to_a_copy_only() {
+        let layout = Layout::new(Path::new("/w"), "acme/repo", Path::new("/tc"));
+        let mut ctx = Contexts {
+            value: json!({
+                "github": { "workspace": "/w/repo/repo", "action_path": "/w/_actions/a/b" },
+                "runner": { "temp": "/w/_temp", "tool_cache": "/tc", "workspace": "/w/repo" },
+            }),
+            cancel: None,
+        };
+        let host = ctx.clone();
+        ctx.set_paths(&layout, |p| p.to_string_lossy().replace("/w", "/__w"));
+        assert_eq!(ctx.value["github"]["workspace"], "/__w/repo/repo");
+        assert_eq!(ctx.value["github"]["action_path"], "/__w/_actions/a/b");
+        assert_eq!(ctx.value["runner"]["temp"], "/__w/_temp");
+        assert_eq!(host.value["github"]["workspace"], "/w/repo/repo");
     }
 }

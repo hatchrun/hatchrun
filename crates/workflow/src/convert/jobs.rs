@@ -5,13 +5,13 @@
 //! Jobs, runners, matrices and steps.
 
 use super::calls::{scalar, show};
-use super::rewrite::LATER;
 use super::{
     BTreeMap, BTreeSet, Cancel, Concurrency, ContinueOnError, Cx, Deserialize, GhJob, GhMatrix,
     GhStep, JOB_KEYS, Job, Matrix, ParameterKind, Require, RunStep, RunsOn, STEP_KEYS, Step,
     Strategy, UsesStep, Value, WORKFLOW_CONTEXTS, WorkflowJob, expr, plan, template,
     template_labels, valid_environment_name, vendor_template,
 };
+use crate::config::{Container, Credentials};
 
 impl Cx {
     /// Reads one GitHub job, warning about keys GitHub does not define.
@@ -188,14 +188,12 @@ impl Cx {
         gh: GhJob,
     ) -> Option<(Job, Vec<WorkflowJob>)> {
         let before = self.errors.len();
-        for (name, set, why) in [
-            ("services", gh.services.is_some(), LATER),
-            ("container", gh.container.is_some(), LATER),
-        ] {
-            if set {
-                self.warn(format!(
-                    "{at}: `{name}` is not supported and was dropped{why}"
-                ));
+        let container = self.container(at, "container", gh.container.as_ref());
+        let services = self.services(at, gh.services.as_ref());
+        if let Some(container) = &container {
+            let named = format!("{at}: `container`");
+            for problem in crate::container::alias_problems(&named, container, services.keys()) {
+                self.error(problem);
             }
         }
         let (environment, environment_url) = self.environment(at, gh.environment.as_ref());
@@ -243,6 +241,8 @@ impl Cx {
             environment,
             environment_url,
             concurrency,
+            container,
+            services,
             steps,
             ..Job::default()
         };
@@ -258,6 +258,185 @@ impl Cx {
             }
         }
         Some((job, entries))
+    }
+
+    /// Reads a job's `container` (`key` is `container`) or one of its
+    /// `services`: an image, or a map of `image`, `credentials`, `env`,
+    /// `ports`, `volumes` and `options`. Keys the format does not define
+    /// are dropped with a warning; anything else hatchrun cannot read is
+    /// an error.
+    pub(super) fn container(
+        &mut self,
+        at: &str,
+        key: &str,
+        value: Option<&Value>,
+    ) -> Option<Container> {
+        let value = value?;
+        let map = match value {
+            Value::String(image) if !image.trim().is_empty() => {
+                let container = Container {
+                    image: image.clone(),
+                    ..Container::default()
+                };
+                for problem in crate::container::problems(&format!("{at}: `{key}`"), &container) {
+                    self.error(problem);
+                }
+                return Some(container);
+            }
+            Value::Object(map) => map,
+            other => {
+                self.error(format!(
+                    "{at}: `{key}` is {}; it must be an image or a map with `image`",
+                    show(other)
+                ));
+                return None;
+            }
+        };
+        for name in map.keys().filter(|k| {
+            !matches!(
+                k.as_str(),
+                "image" | "credentials" | "env" | "ports" | "volumes" | "options"
+            )
+        }) {
+            self.warn(format!("{at}: unknown key `{key}.{name}` was dropped"));
+        }
+        let Some(image) = map
+            .get("image")
+            .and_then(scalar)
+            .filter(|i| !i.trim().is_empty())
+        else {
+            self.error(format!("{at}: `{key}` needs an `image`"));
+            return None;
+        };
+        let credentials = match map.get("credentials") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(c)) => {
+                let field = |name: &str| c.get(name).and_then(scalar);
+                let (Some(username), Some(password)) = (field("username"), field("password"))
+                else {
+                    self.error(format!(
+                        "{at}: `{key}.credentials` needs a `username` and a `password`"
+                    ));
+                    return None;
+                };
+                Some(Credentials { username, password })
+            }
+            Some(other) => {
+                self.error(format!(
+                    "{at}: `{key}.credentials` is {}; it must be a map",
+                    show(other)
+                ));
+                return None;
+            }
+        };
+        let env = match map.get("env") {
+            Some(Value::Object(env)) => {
+                let env: BTreeMap<String, Value> =
+                    env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                self.env(at, &format!("{key}.env"), Some(&env))
+            }
+            None | Some(Value::Null) => BTreeMap::new(),
+            Some(other) => {
+                self.error(format!(
+                    "{at}: `{key}.env` is {}; it must be a map",
+                    show(other)
+                ));
+                return None;
+            }
+        };
+        let ports = self.texts(at, key, "ports", map.get("ports"))?;
+        let volumes = self.texts(at, key, "volumes", map.get("volumes"))?;
+        let options = match map.get("options") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let Some(text) = scalar(value) else {
+                    self.error(format!(
+                        "{at}: `{key}.options` is {}; it must be a string",
+                        show(value)
+                    ));
+                    return None;
+                };
+                Some(text)
+            }
+        };
+        let container = Container {
+            image,
+            credentials,
+            env,
+            ports,
+            volumes,
+            options,
+        };
+        for problem in crate::container::problems(&format!("{at}: `{key}`"), &container) {
+            self.error(problem);
+        }
+        Some(container)
+    }
+
+    /// Reads a list of scalars, such as `ports`, as text. A value that
+    /// is not a list is an error, which is recorded.
+    fn texts(
+        &mut self,
+        at: &str,
+        key: &str,
+        name: &str,
+        value: Option<&Value>,
+    ) -> Option<Vec<String>> {
+        match value {
+            None | Some(Value::Null) => Some(Vec::new()),
+            Some(Value::Array(items)) => {
+                let mut out = Vec::new();
+                for item in items {
+                    let Some(text) = scalar(item) else {
+                        self.error(format!(
+                            "{at}: `{key}.{name}` has {}; each entry must be a string or a number",
+                            show(item)
+                        ));
+                        return None;
+                    };
+                    out.push(text);
+                }
+                Some(out)
+            }
+            Some(other) => {
+                self.error(format!(
+                    "{at}: `{key}.{name}` is {}; it must be a list",
+                    show(other)
+                ));
+                None
+            }
+        }
+    }
+
+    /// Reads a job's `services`: a map of service ids to containers.
+    pub(super) fn services(
+        &mut self,
+        at: &str,
+        value: Option<&Value>,
+    ) -> BTreeMap<String, Container> {
+        let mut out = BTreeMap::new();
+        let Some(value) = value else {
+            return out;
+        };
+        let Some(map) = value.as_object() else {
+            self.error(format!(
+                "{at}: `services` is {}; it must be a map of service ids",
+                show(value)
+            ));
+            return out;
+        };
+        for (id, service) in map {
+            if !crate::container::valid_service_id(id) {
+                self.error(format!(
+                    "{at}: service id `{id}` is not a hostname: use letters, digits, `_` and `-`, starting with a letter or `_`"
+                ));
+                continue;
+            }
+            if let Some(container) = self.container(at, &format!("services.{id}"), Some(service)) {
+                out.insert(id.clone(), container);
+            }
+        }
+        out
     }
 
     /// Reads a job's `continue-on-error`: a boolean, or an expression,
@@ -900,10 +1079,8 @@ impl Cx {
                     timeout_minutes,
                 }))
             }
-            (None, Some(uses)) if uses.starts_with("docker://") => {
-                self.error(format!(
-                    "{at} has `uses: {uses}`; Docker steps are not supported yet and come in a later release"
-                ));
+            (None, Some(uses)) if uses.trim() == "docker://" => {
+                self.error(format!("{at} has `uses: docker://` with no image"));
                 None
             }
             (None, Some(uses)) => {

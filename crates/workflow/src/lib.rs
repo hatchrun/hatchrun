@@ -12,6 +12,7 @@ pub mod artifacts;
 pub mod call;
 pub mod concurrency;
 pub mod config;
+pub mod container;
 pub mod convert;
 pub mod cron;
 pub mod diagnostic;
@@ -33,9 +34,9 @@ pub use call::{
 };
 pub use concurrency::{Cancel, Concurrency, Resolved};
 pub use config::{
-    CacheStep, CheckoutStep, Command, Config, ContinueOnError, Executor, Job, MAX_SOURCE, Matrix,
-    Outcome, Parameter, ParameterKind, Require, RunStep, Statuses, Step, Strategy, Submodules,
-    UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
+    CacheStep, CheckoutStep, Command, Config, Container, ContinueOnError, Credentials, Executor,
+    Job, MAX_SOURCE, Matrix, Outcome, Parameter, ParameterKind, Require, RunStep, Statuses, Step,
+    Strategy, Submodules, UsesStep, Workflow, WorkflowJob, WorkspaceStep, parse,
 };
 pub use convert::{Conversion, convert, to_yaml};
 pub use cron::{Cron, UtcMinute};

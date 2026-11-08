@@ -29,6 +29,9 @@ pub(super) fn expression_problems(job: &Job) -> (Vec<&'static str>, Vec<String>)
     }
     texts.extend(job.env.values().map(String::as_str));
     texts.extend(job.outputs.values().map(String::as_str));
+    for container in job.container.iter().chain(job.services.values()) {
+        texts.extend(container.texts().into_iter().map(|(_, text)| text));
+    }
     texts.extend(job.environment.as_deref());
     texts.extend(job.environment_url.as_deref());
     for step in &job.steps {
@@ -142,9 +145,6 @@ pub(super) fn strings<'v>(value: &'v Value, out: &mut Vec<&'v str>) {
         _ => {}
     }
 }
-
-/// The reason Docker-phase keys are dropped.
-pub(super) const LATER: &str = "; Docker services and containers come in a later release";
 
 /// What `on.workflow_call` is in an `on:` value, when it has one: its
 /// map, or null.
