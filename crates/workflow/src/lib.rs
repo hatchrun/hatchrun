@@ -14,6 +14,7 @@ pub mod config;
 pub mod convert;
 pub mod cron;
 pub mod diagnostic;
+pub mod dynamic;
 pub mod environment;
 pub mod expr;
 pub mod job;
@@ -33,6 +34,7 @@ pub use config::{
 pub use convert::{Conversion, convert, to_yaml};
 pub use cron::{Cron, UtcMinute};
 pub use diagnostic::Diagnostic;
+pub use dynamic::{Leg, Siblings, expand};
 pub use environment::{
     ENVIRONMENT_NAME_MAX, ENVIRONMENT_URL_MAX, is_expression, valid_environment_name,
     valid_environment_url,
@@ -49,8 +51,8 @@ pub use permissions::{
     DEFAULT_SCOPES, ID_TOKEN, ID_TOKEN_SCOPE, Level, Permissions, SCOPES, token_scopes,
 };
 pub use plan::{
-    JobKind, Plan, PlannedJob, PlannedStep, PlannedStrategy, Ready, compile, config_errors, ready,
-    run_title, validate,
+    Deferred, JobKind, Plan, PlannedJob, PlannedStep, PlannedStrategy, Ready, compile,
+    config_errors, ready, run_title, validate,
 };
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;

@@ -494,6 +494,7 @@ mod tests {
                 environment_url: None,
                 concurrency: None,
                 steps: vec![],
+                deferred: None,
             },
             environment: None,
             state,

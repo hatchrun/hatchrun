@@ -4,7 +4,10 @@
 
 //! Expression checks and rewriting of `${{ }}` text inside jobs.
 
-use super::{BTreeSet, ContinueOnError, ExprError, Job, Step, UNSUPPORTED_CONTEXTS, Value, expr};
+use super::{
+    BTreeSet, ContinueOnError, ExprError, Job, Step, UNSUPPORTED_CONTEXTS, Value, WorkflowJob,
+    expr, plan,
+};
 
 /// Why a job that had errors is missing from those that need it.
 /// What happened to a job that had errors, after "which".
@@ -100,6 +103,48 @@ pub(super) fn expression_problems(job: &Job) -> (Vec<&'static str>, Vec<String>)
         .filter(|c| read.contains(*c))
         .collect();
     (read, bad)
+}
+
+/// What `validate` would reject in what a converted job reads when it
+/// becomes ready: a `runs-on` that is an expression, and the
+/// expressions of its entries' matrices. They can read only the
+/// contexts the host has then. A reusable workflow call cannot pass the
+/// names they read through yet, so `called` jobs have none.
+pub(super) fn dynamic_problems(job: &Job, entries: &[WorkflowJob], called: bool) -> Vec<String> {
+    let mut problems = Vec::new();
+    if let Some(text) = &job.runs_on
+        && text.contains("${{")
+        && !text.trim().starts_with("${{ parameters.")
+    {
+        if called {
+            problems.push(
+                "reads an expression in `runs-on`, which a reusable workflow call does not support yet"
+                    .to_owned(),
+            );
+        } else {
+            problems.extend(plan::expression_problems(
+                "`runs-on`",
+                text,
+                plan::RUNS_ON_CONTEXTS,
+            ));
+        }
+    }
+    for entry in entries {
+        for (field, text) in entry.matrix.expressions() {
+            if called {
+                problems.push(format!(
+                    "reads an expression in {field}, which a reusable workflow call does not support yet"
+                ));
+            } else {
+                problems.extend(plan::expression_problems(
+                    &field,
+                    text,
+                    plan::MATRIX_CONTEXTS,
+                ));
+            }
+        }
+    }
+    problems
 }
 
 /// Adds every string inside `value` to `out`.

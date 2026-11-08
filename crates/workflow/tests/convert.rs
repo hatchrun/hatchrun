@@ -808,19 +808,33 @@ jobs:
 }
 
 #[test]
-fn matrix_expressions_are_dropped_with_a_warning() {
+fn a_matrix_expression_is_kept_for_run_time() {
     let out = ok("
 on: push
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs: { m: '${{ steps.m.outputs.m }}' }
+    steps: [{ id: m, run: 'echo m={} >> $GITHUB_OUTPUT' }]
   t:
+    needs: setup
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.m) }}
-    steps: [{ run: x }]
+    steps: [{ run: 'echo ${{ matrix.os }}' }]
 ");
-    assert!(has(&out.warnings, &["ci.yml", "t", "matrix"]));
-    assert!(out.config.workflows["ci"].jobs[0].matrix.is_empty());
+    assert_eq!(out.errors, Vec::new());
+    let entry = &out.config.workflows["ci"].jobs[1];
+    assert_eq!(
+        entry.matrix.from.as_deref(),
+        Some("${{ fromJSON(needs.setup.outputs.m) }}")
+    );
+    assert!(!entry.strategy.as_ref().unwrap().fail_fast);
     round_trips(&out);
+    let plan = compiled(&out);
+    assert_eq!(plan.jobs.len(), 2);
+    assert!(plan.jobs[1].deferred.is_some());
 }
 
 fn dispatch_with(inputs: &str) -> Conversion {
@@ -1409,19 +1423,19 @@ jobs:
           - 7
     steps: [{ run: x }]
 ");
-    for words in [
-        &["matrix key `os`", "not a list"][..],
-        &["`strategy.matrix.include`", "not a list of maps"],
-        &["`strategy.matrix.exclude` entry `7`", "not a map"],
-        &[
-            "`strategy.matrix.exclude` entry names `os`",
-            "not a matrix key",
-        ],
-    ] {
-        assert!(has(&out.warnings, words), "{words:?}: {:?}", out.warnings);
-    }
+    assert!(
+        has(
+            &out.warnings,
+            &["`strategy.matrix.exclude` entry `7`", "not a map"]
+        ),
+        "{:?}",
+        out.warnings
+    );
     let entry = &out.config.workflows["ci"].jobs[0];
-    assert_eq!(entry.matrix.exclude, Vec::<BTreeMap<String, Value>>::new());
+    // Keys the expressions make are unknown, so `exclude` keeps its entry.
+    assert_eq!(entry.matrix.exclude, [matrix_map(json!({"os": "linux"}))]);
+    assert!(entry.matrix.lists.contains_key("os"));
+    assert!(entry.matrix.include_from.is_some());
     round_trips(&out);
 }
 
@@ -2823,6 +2837,60 @@ fn workflow_run_and_release_keep_their_activity_types() {
     );
     assert_eq!(out.warnings, []);
     round_trips(&out);
+}
+
+#[test]
+fn runs_on_expressions_are_kept_for_run_time() {
+    let out = ok("on: push
+jobs:
+  a:
+    runs-on: ${{ inputs.runner }}
+    steps: [{ run: x }]
+  b:
+    runs-on: ${{ github.event_name == 'push' && 'ubuntu-24.04' || 'ubuntu-latest' }}
+    steps: [{ run: x }]
+  c:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: ${{ fromJSON(needs.a.outputs.os) }}
+        include: ${{ fromJSON(needs.a.outputs.extra) }}
+    needs: a
+    steps: [{ run: x }]
+");
+    assert_eq!(out.errors, Vec::new());
+    let jobs = &out.config.jobs;
+    assert_eq!(
+        jobs["ci-a"].runs_on.as_deref(),
+        Some("${{ inputs.runner }}")
+    );
+    // The label it spells is brought to a template label.
+    assert_eq!(
+        jobs["ci-b"].runs_on.as_deref(),
+        Some("${{ github.event_name == 'push' && 'ubuntu-latest' || 'ubuntu-latest' }}")
+    );
+    assert_eq!(jobs["ci-c"].runs_on.as_deref(), Some("${{ matrix.os }}"));
+    assert!(has(&out.warnings, &["`runs-on: ubuntu-24.04` became"]));
+    round_trips(&out);
+}
+
+#[test]
+fn a_runs_on_that_reads_an_unknown_context_drops_the_job() {
+    let out = ok("on: push
+jobs:
+  a:
+    runs-on: ${{ secrets.RUNNER }}
+    steps: [{ run: x }]
+  b:
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+");
+    assert!(
+        has(&out.errors, &["`runs-on` reads `secrets`"]),
+        "{:?}",
+        out.errors
+    );
+    assert_eq!(out.config.jobs.keys().collect::<Vec<_>>(), ["ci-b"]);
 }
 
 #[test]

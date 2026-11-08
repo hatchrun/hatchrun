@@ -1034,6 +1034,7 @@ mod tests {
                 environment_url: None,
                 concurrency: None,
                 steps: Vec::new(),
+                deferred: None,
             },
             event_name: "push".into(),
             event: serde_json::json!({}),
