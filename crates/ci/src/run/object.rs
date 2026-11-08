@@ -1126,61 +1126,18 @@ impl<'a> Cx<'a> {
         };
         let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
         let now = self.now;
-        let existing = store::all_jobs_for_run(db, run.info.run_id).await?;
-        let mut rows: Vec<Option<u64>> = Vec::with_capacity(legs.len());
-        let mut fresh = Vec::new();
-        // Rows of an earlier attempt that the matrix makes again.
-        let mut again: Vec<u64> = Vec::new();
-        for (i, leg) in legs.iter().enumerate() {
-            let new = crate::runs::new_job(&leg.job);
-            if i == 0 {
-                store::retarget_job(db, job, &new, attempt, now).await?;
-                rows.push(Some(job));
-            } else if let Some(row) = existing.iter().find(|r| r.plan_id == leg.job.id) {
-                if row.attempt < attempt {
-                    again.push(row.id);
-                }
-                rows.push(Some(row.id));
-            } else {
-                rows.push(None);
-                fresh.push(new);
-            }
-        }
-        let inserted = store::insert_jobs(db, run.info.run_id, &fresh, now).await?;
-        let mut ids = Vec::with_capacity(legs.len());
-        for (leg, row) in legs.iter().zip(rows) {
-            if let Some(id) = row {
-                ids.push(id);
-                continue;
-            }
-            let found = inserted.iter().find(|(plan, _)| *plan == leg.job.id);
-            let (_, id) = found.ok_or_else(|| fail("a job of the matrix has no row"))?;
-            if attempt > 1 {
-                store::reset_job(db, *id, attempt, now).await?;
-            }
-            ids.push(*id);
-        }
+        let news: Vec<store::NewJob> = legs
+            .iter()
+            .map(|leg| crate::runs::new_job(&leg.job))
+            .collect();
+        let rows = store::assign_matrix_rows(db, run.info.run_id, job, &news, attempt, now).await?;
+        let (ids, again) = (rows.ids, rows.again);
         let plan_ids: Vec<String> = legs.iter().map(|l| l.job.id.clone()).collect();
         let legs: Vec<(u64, _)> = ids.iter().copied().zip(legs).collect();
-        let stand_in = run.graph.node(job).map(|n| n.job.id.clone());
         let actions = run.graph_mut().expanded(job, legs, &ctx);
         // A job a rerun made again starts over, as the first one did.
         for id in again {
             self.start_over(run, id, attempt).await?;
-        }
-        // A job the new matrix leaves out ends as skipped for this
-        // attempt, which `actions` carries out, and its row is marked so
-        // the run's list and counts leave it out.
-        let left_out: Vec<u64> = run
-            .graph
-            .jobs
-            .iter()
-            .filter(|n| n.stale && n.attempt == attempt && n.expanded_from == stand_in)
-            .map(|n| n.id)
-            .collect();
-        for id in left_out {
-            self.start_over(run, id, attempt).await?;
-            run.todo_mut().push(Work::Supersede { job: id, attempt });
         }
         for id in &ids {
             run.outbox_mut().mark(*id);
@@ -1230,6 +1187,14 @@ impl<'a> Cx<'a> {
                     });
                 }
                 Action::Finished { job, conclusion } => {
+                    // A job a rerun left out of its matrix ends as skipped
+                    // for this attempt on a row that is reset and marked,
+                    // so the run's list and counts leave it out.
+                    if let Some(node) = run.graph.node(job).filter(|n| n.stale) {
+                        let attempt = node.attempt;
+                        self.start_over(run, job, attempt).await?;
+                        run.todo_mut().push(Work::Supersede { job, attempt });
+                    }
                     let mut state = self.job_state(job).await?;
                     state.completed_at = Some(self.now);
                     let steps = steps_json(&state.steps);
@@ -1651,6 +1616,10 @@ impl<'a> Cx<'a> {
             let Some(mut run) = self.loaded().await? else {
                 return answer(404);
             };
+            // A job a rerun left out of its matrix is no part of the run.
+            if run.graph.node(job).is_some_and(|n| n.stale) {
+                return answer(409);
+            }
             let ctx = self.github_ctx(&run.info).await?;
             let before = attempts(&run.graph);
             self.load_vars(&mut run, job).await?;
@@ -1658,6 +1627,14 @@ impl<'a> Cx<'a> {
             let reset = reset_jobs(&before, &run.graph);
             if reset.is_empty() {
                 return answer(204);
+            }
+            // The jobs a matrix was read into leave the graph when their
+            // producer runs again: a log of theirs that is not in R2 yet
+            // would be lost.
+            for (id, _) in &before {
+                if run.graph.node(*id).is_none() && self.job_state(*id).await?.upload_pending {
+                    return answer(409);
+                }
             }
             for (id, _) in &reset {
                 if self.job_state(*id).await?.upload_pending {

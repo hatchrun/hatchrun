@@ -91,7 +91,7 @@ pub async fn read_library<S: Source>(
                     // The file may be fine for another workflow, so it is
                     // not refused for all of them.
                     library.mark_limit();
-                    break 'workflow;
+                    continue 'workflow;
                 }
                 match read_one(source, &call).await? {
                     Ok(callee) => library.insert(call, callee),
@@ -662,5 +662,41 @@ workflows:
         assert!(compile_with(&config, "small", "refs/heads/main", &library).is_ok());
         let errors = compile_with(&config, "big", "refs/heads/main", &library).unwrap_err();
         assert!(errors.iter().any(|d| d.message.contains("at most 20")));
+    }
+
+    #[test]
+    fn a_workflow_over_the_limit_does_not_keep_a_later_one_from_its_own_files() {
+        let mut source = fake("acme/shared", false, true);
+        source.any_file = true;
+        let many: Vec<String> = (0..25)
+            .map(|i| {
+                format!(
+                    "{{ c{i}: {{ call: 'acme/shared/.github/workflows/f{i}.yml@v1', with: {{ target: x }} }} }}"
+                )
+            })
+            .collect();
+        // `big` comes first and is over the limit; `small` calls a file
+        // `big` never got to read.
+        let config = parse(&format!(
+            "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  big:
+    on: {{ push: {{}} }}
+    jobs: [{}]
+  small:
+    on: {{ push: {{}} }}
+    jobs: [{{ s: {{ call: 'acme/shared/.github/workflows/only-small.yml@v1', with: {{ target: x }} }} }}]
+",
+            many.join(", ")
+        ))
+        .unwrap();
+        let library = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(read_library(&source, &config, &["big", "small"]))
+            .unwrap();
+        assert!(compile_with(&config, "small", "refs/heads/main", &library).is_ok());
+        assert!(compile_with(&config, "big", "refs/heads/main", &library).is_err());
     }
 }

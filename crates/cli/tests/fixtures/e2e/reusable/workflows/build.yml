@@ -10,6 +10,12 @@ on:
       target:
         type: string
         required: true
+      fast:
+        type: boolean
+        default: false
+      retries:
+        type: number
+        default: 2
 
 jobs:
   build:

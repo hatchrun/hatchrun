@@ -666,6 +666,9 @@ impl PlannedJob {
     #[must_use]
     pub fn visible_secrets(&self, opened: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         let mut seen = opened.clone();
+        // The job token is not passed: every workflow of a plan has it,
+        // so a call further in can pass it on under another name.
+        let token = opened.get("GITHUB_TOKEN");
         for frame in &self.scope {
             seen = match &frame.secrets {
                 SecretsPassed::Inherit => seen,
@@ -678,6 +681,10 @@ impl PlannedJob {
                     })
                     .collect(),
             };
+            if let Some(token) = token {
+                seen.entry("GITHUB_TOKEN".to_owned())
+                    .or_insert_with(|| token.clone());
+            }
         }
         for name in DEBUG_SECRETS {
             if let Some(value) = opened.get(name) {

@@ -693,3 +693,40 @@ fn continue_on_error_reads_a_bool_or_an_expression() {
     assert!(continue_on_error("nosuch.x", &ctx, &NoFiles).is_err());
     assert!(continue_on_error("${{ matrix.", &ctx, &NoFiles).is_err());
 }
+
+#[test]
+fn a_condition_reads_a_context_from_the_parsed_expression() {
+    use hatchrun_workflow::reads_context;
+    assert!(reads_context("matrix.os == 'x'", "matrix"));
+    assert!(reads_context("MATRIX.os == 'x'", "matrix"));
+    assert!(reads_context("${{ always() && matrix.os }}", "matrix"));
+    // A string that spells the name is no read.
+    assert!(!reads_context("'matrix' == 'other'", "matrix"));
+    assert!(!reads_context("github.ref == 'matrix.os'", "matrix"));
+    // A condition that does not parse may read it.
+    assert!(reads_context("matrix.os ==", "matrix"));
+}
+
+#[test]
+fn a_condition_is_definitely_false_when_a_part_that_does_not_read_the_context_is() {
+    use hatchrun_workflow::may_hold_without;
+    let ctx = json!({ "github": { "ref": "refs/heads/main" } });
+    let held = |cond: &str, status| may_hold_without(cond, "matrix", &ctx, &Files(status)).unwrap();
+    // `failure()` after a success is false, whatever the matrix says.
+    assert!(!held("failure() && matrix.os == 'x'", JobStatus::Success));
+    assert!(held("failure() && matrix.os == 'x'", JobStatus::Failure));
+    // The implied success() after a failure.
+    assert!(!held("matrix.os == 'x'", JobStatus::Failure));
+    assert!(held("matrix.os == 'x'", JobStatus::Success));
+    // A part about the run that is false.
+    assert!(!held(
+        "github.ref == 'refs/heads/dev' && matrix.os == 'x'",
+        JobStatus::Success
+    ));
+    assert!(held(
+        "github.ref == 'refs/heads/main' && matrix.os == 'x'",
+        JobStatus::Success
+    ));
+    // `always()` holds, and a part that reads the matrix is left to the legs.
+    assert!(held("always() && matrix.os == 'x'", JobStatus::Failure));
+}

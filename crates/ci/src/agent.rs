@@ -1133,6 +1133,37 @@ mod tests {
     }
 
     #[test]
+    fn the_job_token_crosses_a_call_that_passes_no_secrets() {
+        use hatchrun_workflow::{CallFrame, SecretsPassed};
+        let mut doc = document();
+        doc.github.token = "job-token".into();
+        let frame = |id: &str, secrets| CallFrame {
+            id: id.into(),
+            name: id.into(),
+            workflow: "w".into(),
+            source: None,
+            with: BTreeMap::new(),
+            kinds: BTreeMap::new(),
+            secrets,
+            matrix: BTreeMap::new(),
+            if_: None,
+            outputs: BTreeMap::new(),
+        };
+        let named = SecretsPassed::Named(BTreeMap::from([(
+            "TOKEN".to_owned(),
+            "${{ secrets.GITHUB_TOKEN }}".to_owned(),
+        )]));
+        // The outer call passes nothing; the inner one maps the token.
+        doc.job.scope = vec![frame("o", SecretsPassed::None), frame("o / i", named)];
+        let stored = BTreeMap::from([("A".to_owned(), "s".to_owned())]);
+        fill(&mut doc, &stored, BTreeMap::new());
+        assert_eq!(
+            doc.secrets,
+            BTreeMap::from([("TOKEN".to_owned(), "job-token".to_owned())])
+        );
+    }
+
+    #[test]
     fn unreadable_secret_ends_the_job() {
         let secrets = BTreeMap::from([("A".to_owned(), "s".to_owned())]);
         assert_eq!(

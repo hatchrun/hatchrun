@@ -1369,3 +1369,235 @@ fn a_job_a_rerun_left_out_stays_out_of_the_list_and_counts_until_made_again() {
     assert_eq!(db.wait(jobs_for_run(db.db(), run.id)).unwrap().len(), 2);
     assert_eq!(counts(&db).total, 2);
 }
+
+const SHRINK: &str = "
+jobs:
+  setup: { runs-on: ubuntu-latest, steps: [], outputs: { os: x } }
+  test: { runs-on: '${{ matrix.os }}', steps: [] }
+  after: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  ci:
+    on: { push: {} }
+    jobs:
+      - setup
+      - test:
+          requires: [setup]
+          matrix: { os: '${{ fromJSON(needs.setup.outputs.os) }}' }
+      - after: { requires: [test] }
+";
+
+/// What a rerun does to the rows of a matrix, with the rows made by the
+/// database path the object uses and the work it queues carried out.
+#[test]
+#[allow(clippy::too_many_lines)] // One run, from its first expansion to the last rerun.
+fn a_rerun_that_shrinks_a_matrix_goes_through_the_rows_the_database_holds() {
+    use crate::graph::{Action, Graph, State};
+    use hatchrun_workflow::{Conclusion, JobResult, compile, parse};
+
+    let db = setup();
+    let ctx = serde_json::json!({ "ref": "refs/heads/main" });
+    let finished = |outputs: &[(&str, &str)]| JobResult {
+        conclusion: Conclusion::Success,
+        outputs: outputs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        steps: Vec::new(),
+        annotations: Vec::new(),
+        environment_url: None,
+    };
+    let plan = compile(&parse(SHRINK).unwrap(), "ci", "refs/heads/main").unwrap();
+    let run = db
+        .wait(insert_run(db.db(), &new_run("shrink", "ci", 1_000)))
+        .unwrap()
+        .unwrap();
+    let news: Vec<NewJob> = plan.jobs.iter().map(crate::runs::new_job).collect();
+    let rows = db.wait(insert_jobs(db.db(), run.id, &news, 1_000)).unwrap();
+    let row = |plan_id: &str| rows.iter().find(|(p, _)| p == plan_id).unwrap().1;
+    let mut graph = Graph::new(plan.jobs.iter().map(|j| (row(&j.id), j.clone())).collect());
+    let setup_row = row("setup");
+    let after_row = row("after");
+
+    // Expands the stand-in through the store, as the run object does.
+    let expand = |graph: &mut Graph, attempt: u32| -> Vec<Action> {
+        // The row of the job waiting to expand: the first row it made
+        // after a rerun.
+        let stand_in = graph
+            .jobs
+            .iter()
+            .find(|n| n.job.deferred.is_some() && n.state == State::Queued)
+            .unwrap()
+            .id;
+        let legs = graph
+            .expansion(stand_in, &ctx, &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+        let news: Vec<NewJob> = legs.iter().map(|l| crate::runs::new_job(&l.job)).collect();
+        let made = db
+            .wait(assign_matrix_rows(
+                db.db(),
+                run.id,
+                stand_in,
+                &news,
+                attempt,
+                2_000,
+            ))
+            .unwrap();
+        assert_eq!(made.ids.len(), legs.len());
+        for row in &made.again {
+            db.wait(reset_job(db.db(), *row, attempt, 2_000)).unwrap();
+        }
+        let legs: Vec<(u64, _)> = made.ids.iter().copied().zip(legs).collect();
+        graph.expanded(stand_in, legs, &ctx)
+    };
+    // Carries out the finishes of left-out jobs, as the object's todo does.
+    let end_left_out = |graph: &Graph, actions: &[Action], attempt: u32| {
+        for action in actions {
+            let Action::Finished { job, .. } = action else {
+                continue;
+            };
+            if graph.node(*job).is_some_and(|n| n.stale) {
+                db.wait(reset_job(db.db(), *job, attempt, 3_000)).unwrap();
+                db.wait(finish_job(
+                    db.db(),
+                    *job,
+                    attempt,
+                    "skipped",
+                    &serde_json::json!([]),
+                    None,
+                    None,
+                    3_001,
+                ))
+                .unwrap();
+                db.wait(supersede_job(db.db(), *job, attempt)).unwrap();
+            }
+        }
+    };
+
+    graph.advance(&ctx);
+    graph.running(setup_row);
+    graph.finished(
+        setup_row,
+        finished(&[("os", r#"["ubuntu-latest","ubuntu-26.04-arm"]"#)]),
+        &ctx,
+    );
+    expand(&mut graph, 1);
+    let current: Vec<u64> = graph
+        .jobs
+        .iter()
+        .filter(|n| n.job.name == "test")
+        .map(|n| n.id)
+        .collect();
+    assert_eq!(current.len(), 2);
+    for id in &current {
+        graph.running(*id);
+        graph.finished(*id, finished(&[]), &ctx);
+    }
+    graph.running(after_row);
+    graph.finished(after_row, finished(&[]), &ctx);
+    assert!(graph.conclusion().is_some());
+
+    // The rerun: the matrix is now one entry, the second the first had.
+    let before: Vec<(u64, u32)> = graph.jobs.iter().map(|n| (n.id, n.attempt)).collect();
+    graph.rerun(setup_row, &ctx);
+    for node in &graph.jobs {
+        if !before.contains(&(node.id, node.attempt)) {
+            db.wait(reset_job(db.db(), node.id, node.attempt, 2_500))
+                .unwrap();
+        }
+    }
+    graph.running(setup_row);
+    graph.finished(
+        setup_row,
+        finished(&[("os", r#"["ubuntu-26.04-arm"]"#)]),
+        &ctx,
+    );
+    let actions = expand(&mut graph, 2);
+    end_left_out(&graph, &actions, 2);
+
+    // The job that is current keeps its row; the other is out of the list.
+    let kept = graph
+        .jobs
+        .iter()
+        .find(|n| n.job.name == "test" && !n.stale)
+        .unwrap();
+    let gone_id = graph.jobs.iter().find(|n| n.stale).unwrap().id;
+    assert_eq!(kept.job.id, "test (ubuntu-26.04-arm)");
+    assert_ne!(kept.id, gone_id);
+    let listed = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
+    let listed_ids: Vec<u64> = listed.iter().map(|r| r.id).collect();
+    assert!(listed_ids.contains(&kept.id));
+    assert!(!listed_ids.contains(&gone_id));
+    assert_eq!(db.wait(all_jobs_for_run(db.db(), run.id)).unwrap().len(), 4);
+    let kept_row = listed.iter().find(|r| r.id == kept.id).unwrap();
+    assert_eq!(kept_row.attempt, 2);
+    assert_eq!(kept_row.plan_id, "test (ubuntu-26.04-arm)");
+    assert_eq!(kept_row.conclusion, None, "reset for the new attempt");
+    let all = db.wait(all_jobs_for_run(db.db(), run.id)).unwrap();
+    let gone_row = all.iter().find(|r| r.id == gone_id).unwrap();
+    assert_eq!(gone_row.conclusion.as_deref(), Some("skipped"));
+    let counts = db
+        .wait(job_counts(db.db(), &[run.id]))
+        .unwrap()
+        .remove(&run.id)
+        .unwrap();
+    assert_eq!(counts.total, 3);
+
+    // The run finishes on the current jobs.
+    assert_eq!(kept.state, State::Queued);
+    let kept_id = kept.id;
+    graph.running(kept_id);
+    graph.finished(kept_id, finished(&[]), &ctx);
+    graph.running(after_row);
+    let actions = graph.finished(after_row, finished(&[]), &ctx);
+    assert!(actions.contains(&Action::RunDone(Conclusion::Success)));
+
+    // A rerun with a matrix of two again makes the dropped job current
+    // and its row is listed and counted.
+    graph.rerun(setup_row, &ctx);
+    graph.running(setup_row);
+    graph.finished(
+        setup_row,
+        finished(&[("os", r#"["ubuntu-latest","ubuntu-26.04-arm"]"#)]),
+        &ctx,
+    );
+    expand(&mut graph, 3);
+    let listed = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
+    assert!(listed.iter().any(|r| r.id == gone_id));
+    assert!(graph.jobs.iter().all(|n| !n.stale));
+}
+
+#[test]
+fn a_job_made_again_takes_the_template_it_is_planned_with_and_keeps_its_attempt() {
+    let db = setup();
+    let (run, job_id) = run_with_job(&db, "queued");
+    let steps = serde_json::json!([]);
+    db.wait(finish_job(
+        db.db(),
+        job_id,
+        1,
+        "success",
+        &steps,
+        None,
+        None,
+        5,
+    ))
+    .unwrap();
+    let again = NewJob {
+        template: Some("ubuntu-26.04-arm".into()),
+        strategy_group: Some("g".into()),
+        max_parallel: Some(2),
+        needs: vec!["setup".into()],
+        ..new_job("build")
+    };
+    db.wait(refresh_job(db.db(), job_id, &again, 9)).unwrap();
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(row.template.as_deref(), Some("ubuntu-26.04-arm"));
+    assert_eq!(row.needs, serde_json::json!(["setup"]));
+    // The result and the attempt wait for the reset.
+    assert_eq!(
+        (row.attempt, row.conclusion.as_deref()),
+        (1, Some("success"))
+    );
+    assert_eq!(db.wait(jobs_for_run(db.db(), run.id)).unwrap().len(), 1);
+}

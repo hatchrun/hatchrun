@@ -137,6 +137,11 @@ const JOBS_FOR_RUN: &str =
 /// Every row of run `$1`, those a rerun left out of their matrix too.
 const ALL_JOBS_FOR_RUN: &str = "SELECT {columns} FROM ci_jobs WHERE run_id = $1 ORDER BY id";
 
+/// Gives job `$1` the template `$2`, strategy group `$3`, `max_parallel`
+/// `$4` and needs `$5` of the job it is made again as, at `$6`.
+const REFRESH_JOB: &str = "UPDATE ci_jobs SET template = $2, strategy_group = $3, \
+     max_parallel = $4, needs = $5::jsonb, updated_at = $6 WHERE id = $1";
+
 /// Marks job `$1`, which a rerun left out of its matrix for attempt
 /// `$2`, so the run's job list and counts leave it out.
 const SUPERSEDE_JOB: &str = "UPDATE ci_jobs SET superseded = true WHERE id = $1 AND attempt = $2";
@@ -464,6 +469,113 @@ pub async fn all_jobs_for_run(db: &Db, run_id: u64) -> Result<Vec<JobRow>> {
         &params![run_id],
     )
     .await
+}
+
+/// The rows the jobs of a matrix run on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixRows {
+    /// The row of each job, in the order the jobs were given.
+    pub ids: Vec<u64>,
+    /// The rows among them that an earlier attempt used and that need
+    /// resetting for this one.
+    pub again: Vec<u64>,
+}
+
+/// Finds or makes the row of each job of a matrix that `stand_in` (a
+/// row) read when it was ready, for `attempt`.
+///
+/// A job takes the row that has its plan id, whichever it is, and the
+/// template and limits of the job it is made as. A job with no row takes
+/// the stand-in's own row when nothing else uses it, else a new row. So a
+/// matrix that changes from `[A, B]` to `[B]` keeps the row of `B` and
+/// does not rename the row of `A` to `B` beside it, which the plan id
+/// being unique per run would refuse. A row left over is the caller's to
+/// end as skipped.
+///
+/// # Errors
+///
+/// Postgres refused a statement, or a row was not made.
+pub async fn assign_matrix_rows(
+    db: &Db,
+    run_id: u64,
+    stand_in: u64,
+    jobs: &[NewJob],
+    attempt: u32,
+    now: u64,
+) -> Result<MatrixRows> {
+    let existing = all_jobs_for_run(db, run_id).await?;
+    let by_plan: BTreeMap<&str, &JobRow> =
+        existing.iter().map(|r| (r.plan_id.as_str(), r)).collect();
+    let mut rows: Vec<Option<u64>> = Vec::with_capacity(jobs.len());
+    let mut again = Vec::new();
+    let mut stand_in_free = true;
+    for new in jobs {
+        let Some(row) = by_plan.get(new.plan_id.as_str()) else {
+            rows.push(None);
+            continue;
+        };
+        if row.id == stand_in {
+            stand_in_free = false;
+        }
+        refresh_job(db, row.id, new, now).await?;
+        if row.attempt < attempt && row.id != stand_in {
+            again.push(row.id);
+        }
+        rows.push(Some(row.id));
+    }
+    let mut fresh = Vec::new();
+    for (new, row) in jobs.iter().zip(&mut rows) {
+        if row.is_some() {
+            continue;
+        }
+        if stand_in_free {
+            retarget_job(db, stand_in, new, attempt, now).await?;
+            *row = Some(stand_in);
+            stand_in_free = false;
+        } else {
+            fresh.push(new.clone());
+        }
+    }
+    let inserted = insert_jobs(db, run_id, &fresh, now).await?;
+    let mut ids = Vec::with_capacity(jobs.len());
+    for (new, row) in jobs.iter().zip(rows) {
+        if let Some(id) = row {
+            ids.push(id);
+            continue;
+        }
+        let (_, id) = inserted
+            .iter()
+            .find(|(plan, _)| *plan == new.plan_id)
+            .ok_or_else(|| worker::Error::RustError("a job of the matrix has no row".into()))?;
+        if attempt > 1 {
+            reset_job(db, *id, attempt, now).await?;
+        }
+        ids.push(*id);
+    }
+    Ok(MatrixRows { ids, again })
+}
+
+/// Gives job `job_id`, made again by a matrix that was read again, what
+/// the job it is made as plans: its template, strategy group, limit and
+/// needs. The attempt and the result are left to the reset.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn refresh_job(db: &Db, job_id: u64, new: &NewJob, now: u64) -> Result<()> {
+    db.run(
+        REFRESH_JOB,
+        &params![
+            job_id,
+            new.template.as_deref(),
+            new.strategy_group.as_deref(),
+            new.max_parallel,
+            serde_json::to_string(&new.needs).map_err(worker::Error::from)?,
+            now
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Marks job `job_id`, which a rerun left out of its matrix for

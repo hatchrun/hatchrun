@@ -14,6 +14,7 @@ mod lexer;
 mod parser;
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde_json::Value;
@@ -457,6 +458,176 @@ pub(crate) fn jobs_read(expr: &str) -> Result<Vec<String>, ExprError> {
     let mut out = Vec::new();
     walk(&ast, &mut out);
     Ok(out)
+}
+
+/// The expression a condition is, when it is one: a bare expression, or
+/// one `${{ }}` that is the whole text. `None` for text that has several
+/// segments.
+fn whole_expression(cond: &str) -> Result<Option<&str>, ExprError> {
+    let trimmed = cond.trim();
+    if find_open(trimmed).is_none() {
+        return Ok(Some(trimmed));
+    }
+    let segments = expressions(trimmed)?;
+    Ok(match segments.as_slice() {
+        [(3, inner)] if trimmed.starts_with("${{") && 3 + inner.len() + 2 == trimmed.len() => {
+            Some(inner.trim())
+        }
+        _ => None,
+    })
+}
+
+/// Whether a condition reads the context `context`, found in the parsed
+/// expression: a string that spells the name is no read, and the name is
+/// matched in any case. A condition that does not parse reads it, as
+/// far as a caller can tell.
+#[must_use]
+pub fn reads_context(cond: &str, context: &str) -> bool {
+    let found = if find_open(cond).is_some() {
+        expressions(cond)
+    } else {
+        Ok(vec![(0, cond)])
+    };
+    let Ok(found) = found else {
+        return true;
+    };
+    found.into_iter().any(|(_, inner)| {
+        contexts(inner).map_or(true, |names| {
+            names
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(context))
+        })
+    })
+}
+
+/// Whether a condition that reads `context` may hold before that context
+/// is known: `false` only when a part that does not read it is already
+/// false, such as `failure()` of `failure() && matrix.os == 'x'` after a
+/// success, or the implied `success()` after a failure. The operands of
+/// a top-level `&&` that read `context` are left to be read when it is
+/// known.
+///
+/// # Errors
+///
+/// When the condition does not parse or an operand fails to evaluate.
+pub fn may_hold_without(
+    cond: &str,
+    context: &str,
+    ctx: &Value,
+    funcs: &dyn Functions,
+) -> Result<bool, ExprError> {
+    let Some(inner) = whole_expression(cond)? else {
+        return Ok(true);
+    };
+    let ast = tree(inner)?;
+    if !eval::calls_status(&ast) && funcs.status() != JobStatus::Success {
+        return Ok(false);
+    }
+    let budget = eval::Budget::new();
+    let operands: Vec<&parser::Expr<'_>> = match &ast {
+        parser::Expr::And(args) => args.iter().collect(),
+        other => vec![other],
+    };
+    for operand in operands {
+        let mut reads = false;
+        eval::visit_contexts(operand, &mut |name, _| {
+            reads |= name.eq_ignore_ascii_case(context);
+            Ok(())
+        })?;
+        if reads {
+            continue;
+        }
+        let value = eval::Evaluator {
+            ctx,
+            funcs,
+            budget: &budget,
+        }
+        .eval(operand)?;
+        if !truthy(&value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `text` with each read of `jobs.<id>.outputs.<name>` (or
+/// `jobs['<id>'].outputs.<name>`) of a job in `splits` replaced by a read
+/// of each entry the job was split into, the last one that has a value
+/// winning, as the outputs of a matrix merge. Only the parsed reads are
+/// rewritten, never text inside a string.
+#[must_use]
+pub fn split_job_outputs(text: &str, splits: &BTreeMap<String, Vec<String>>) -> String {
+    let Ok(found) = expressions(text) else {
+        return text.to_owned();
+    };
+    let mut out = text.to_owned();
+    for (start, inner) in found.into_iter().rev() {
+        let Ok(tokens) = lexer::lex(inner) else {
+            continue;
+        };
+        let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            use lexer::Kind;
+            let kinds: Vec<&Kind<'_>> = tokens[i..].iter().take(8).map(|t| &t.kind).collect();
+            let (job, used) = match kinds.as_slice() {
+                [
+                    Kind::Ident(jobs),
+                    Kind::Dot,
+                    Kind::Ident(id),
+                    Kind::Dot,
+                    Kind::Ident(outputs),
+                    Kind::Dot,
+                    Kind::Ident(name),
+                    ..,
+                ] if jobs.eq_ignore_ascii_case("jobs")
+                    && outputs.eq_ignore_ascii_case("outputs")
+                    && (i == 0 || !matches!(tokens[i - 1].kind, Kind::Dot)) =>
+                {
+                    (Some((*id).to_owned()), (7, *name))
+                }
+                [
+                    Kind::Ident(jobs),
+                    Kind::LBracket,
+                    Kind::Str(id),
+                    Kind::RBracket,
+                    Kind::Dot,
+                    Kind::Ident(outputs),
+                    Kind::Dot,
+                    Kind::Ident(name),
+                    ..,
+                ] if jobs.eq_ignore_ascii_case("jobs")
+                    && outputs.eq_ignore_ascii_case("outputs")
+                    && (i == 0 || !matches!(tokens[i - 1].kind, Kind::Dot)) =>
+                {
+                    (Some(id.clone()), (8, *name))
+                }
+                _ => (None, (0, "")),
+            };
+            match job.and_then(|id| splits.get(&id)) {
+                Some(entries) => {
+                    let (count, name) = used;
+                    let last = &tokens[i + count - 1];
+                    let reads: Vec<String> = entries
+                        .iter()
+                        .rev()
+                        .map(|n| format!("jobs.{n}.outputs.{name}"))
+                        .collect();
+                    edits.push((
+                        tokens[i].offset,
+                        last.offset + name.len(),
+                        format!("({})", reads.join(" || ")),
+                    ));
+                    i += count;
+                }
+                None => i += 1,
+            }
+        }
+        for (from, to, with) in edits.into_iter().rev() {
+            out.replace_range(start + from..start + to, &with);
+        }
+    }
+    out
 }
 
 /// Lexes and parses one expression, within the length limit.

@@ -48,7 +48,8 @@ pub use environment::{
 };
 pub use expr::{
     ExprError, Functions, HATCHRUN_KEYS, JobStatus, checks_status, continue_on_error, evaluate,
-    hatchrun_context, interpolate, job_condition, secret_refs, truthy,
+    hatchrun_context, interpolate, job_condition, may_hold_without, reads_context, secret_refs,
+    split_job_outputs, truthy,
 };
 pub use job::{
     Annotation, AnnotationLevel, ArtifactService, CacheService, Conclusion, Github, IdTokenRequest,

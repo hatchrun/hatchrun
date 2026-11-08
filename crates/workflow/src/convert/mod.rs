@@ -571,9 +571,20 @@ impl Cx {
                 (id.clone(), names)
             })
             .collect();
+        let survivors: BTreeSet<String> = entries
+            .iter()
+            .flat_map(|(_, made)| {
+                made.iter()
+                    .map(|e| e.name.clone().unwrap_or_else(|| e.job.clone()))
+            })
+            .collect();
+        if let Some(mut call) = on.call.take() {
+            self.prune_outputs(&format!("`{file}`"), &mut call, &survivors);
+            on.call = Some(call);
+        }
         if let Some(call) = &mut on.call {
             for text in call.outputs.values_mut() {
-                *text = calls::split_outputs(text, &splits);
+                *text = crate::expr::split_job_outputs(text, &splits);
             }
         }
         let jobs = flatten(entries);

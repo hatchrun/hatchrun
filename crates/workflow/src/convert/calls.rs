@@ -311,41 +311,36 @@ impl Cx {
     }
 }
 
-/// `text`, an output of a reusable workflow, with each read of
-/// `jobs.<id>.outputs.<name>` of a job that `include` split into the
-/// entries `splits` names read from each of them, the first that has a
-/// value winning.
-pub(super) fn split_outputs(text: &str, splits: &BTreeMap<String, Vec<String>>) -> String {
-    let mut out = text.to_owned();
-    for (id, names) in splits {
-        let head = format!("jobs.{id}.outputs.");
-        let mut from = 0;
-        while let Some(at) = out[from..].find(&head).map(|i| from + i) {
-            let before = out[..at].chars().next_back();
-            let after = at + head.len();
-            let name: String = out[after..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-                .collect();
-            let inside = before
-                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '\''));
-            if inside || name.is_empty() {
-                from = after;
-                continue;
-            }
-            let reads: Vec<String> = names
-                .iter()
-                .map(|n| format!("jobs.{n}.outputs.{name}"))
-                .collect();
-            let replacement = format!("({})", reads.join(" || "));
-            out.replace_range(at..after + name.len(), &replacement);
-            from = at + replacement.len();
+impl Cx {
+    /// Removes the outputs of a reusable workflow that read a job it no
+    /// longer has, which the conversion dropped: a caller would fail to
+    /// plan for an output it may not even read.
+    pub(super) fn prune_outputs(
+        &mut self,
+        label: &str,
+        call: &mut CallTrigger,
+        survivors: &BTreeSet<String>,
+    ) {
+        let gone: Vec<(String, String)> = call
+            .outputs
+            .iter()
+            .filter_map(|(name, text)| {
+                let missing = crate::expr::expressions(text)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .flat_map(|(_, inner)| crate::expr::jobs_read(inner).unwrap_or_default())
+                    .find(|job| !survivors.contains(job))?;
+                Some((name.clone(), missing))
+            })
+            .collect();
+        for (name, job) in gone {
+            call.outputs.remove(&name);
+            self.warn(format!(
+                "{label}: output `{name}` of the called workflow reads job `{job}`, which was dropped; the output was dropped"
+            ));
         }
     }
-    out
-}
 
-impl Cx {
     /// Drops the calls of workflows that did not convert, as the files
     /// that had them are among the converted ones: each job that needs
     /// such a call is dropped too, and a workflow left with no job goes
@@ -397,6 +392,22 @@ impl Cx {
                 for entry in dropped {
                     if entry.call.is_none() {
                         self.config.jobs.remove(&entry.job);
+                    }
+                }
+                let survivors: BTreeSet<String> = self.config.workflows[&key]
+                    .jobs
+                    .iter()
+                    .map(|e| e.name.clone().unwrap_or_else(|| e.job.clone()))
+                    .collect();
+                if let Some(mut call) = self
+                    .config
+                    .workflows
+                    .get_mut(&key)
+                    .and_then(|wf| wf.on.call.take())
+                {
+                    self.prune_outputs(&format!("workflow `{key}`"), &mut call, &survivors);
+                    if let Some(wf) = self.config.workflows.get_mut(&key) {
+                        wf.on.call = Some(call);
                     }
                 }
                 if empty {

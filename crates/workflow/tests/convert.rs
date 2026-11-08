@@ -2863,8 +2863,100 @@ jobs:
     ]);
     let tag = &out.config.workflows["w"].on.call.as_ref().unwrap().outputs["tag"];
     assert!(
-        tag.contains("(jobs.build.outputs.tag || jobs.build-2.outputs.tag)"),
+        tag.contains("(jobs.build-2.outputs.tag || jobs.build.outputs.tag)"),
         "{tag}"
+    );
+    // The caller reads the last entry that has a value, as the outputs
+    // of a matrix merge.
+    let read = |first: &str, second: &str| {
+        let ctx = json!({ "jobs": {
+            "build": { "outputs": { "tag": first } },
+            "build-2": { "outputs": { "tag": second } },
+        } });
+        hatchrun_workflow::interpolate(tag, &ctx, &Offline).unwrap()
+    };
+    assert_eq!(read("", "v2"), "v2");
+    assert_eq!(read("v1", ""), "v1");
+    assert_eq!(read("v1", "v2"), "v2");
+}
+
+struct Offline;
+
+impl hatchrun_workflow::Functions for Offline {
+    fn hash_files(&self, _patterns: &[String]) -> Result<String, hatchrun_workflow::ExprError> {
+        Err(hatchrun_workflow::ExprError {
+            message: "no files".into(),
+            offset: 0,
+        })
+    }
+
+    fn status(&self) -> hatchrun_workflow::JobStatus {
+        hatchrun_workflow::JobStatus::Success
+    }
+}
+
+#[test]
+fn split_outputs_are_read_from_the_parsed_expression() {
+    let splits = BTreeMap::from([(
+        "build".to_owned(),
+        vec!["build".to_owned(), "build-2".to_owned()],
+    )]);
+    let split = |text: &str| hatchrun_workflow::split_job_outputs(text, &splits);
+    // A bracket read is a read.
+    assert_eq!(
+        split("${{ jobs['build'].outputs.tag }}"),
+        "${{ (jobs.build-2.outputs.tag || jobs.build.outputs.tag) }}"
+    );
+    // Text in a string is not.
+    let literal = "${{ jobs.other.outputs.t || 'fallback jobs.build.outputs.tag' }}";
+    assert_eq!(split(literal), literal);
+    assert_eq!(
+        split("${{ jobs.build.outputs.tag || 'jobs.build.outputs.tag' }}"),
+        "${{ (jobs.build-2.outputs.tag || jobs.build.outputs.tag) || 'jobs.build.outputs.tag' }}"
+    );
+    // A property of something else is not a job.
+    let other = "${{ github.jobs.build.outputs.tag }}";
+    assert_eq!(split(other), other);
+}
+
+#[test]
+fn an_output_of_a_job_the_conversion_dropped_is_dropped_with_a_warning() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    uses: ./.github/workflows/w.yml\n",
+        ),
+        (
+            "w.yml",
+            "
+on:
+  workflow_call:
+    outputs:
+      kept: { value: '${{ jobs.ok.outputs.x }}' }
+      lost: { value: '${{ jobs.bad.outputs.x }}' }
+jobs:
+  ok:
+    runs-on: ubuntu-latest
+    outputs: { x: '1' }
+    steps: [{ run: x }]
+  bad:
+    runs-on: macos-latest
+    outputs: { x: '1' }
+    steps: [{ run: x }]
+",
+        ),
+    ]);
+    let call = out.config.workflows["w"].on.call.as_ref().unwrap();
+    assert!(call.outputs.contains_key("kept"));
+    assert!(!call.outputs.contains_key("lost"));
+    assert!(has(
+        &out.warnings,
+        &["output `lost`", "job `bad`", "dropped"]
+    ));
+    assert_eq!(validate(&out.config), Vec::new());
+    assert!(
+        hatchrun_workflow::compile(&out.config, "ci", "refs/heads/main").is_ok(),
+        "the caller plans"
     );
 }
 
@@ -2918,10 +3010,23 @@ fn pruning_a_workflow_run_chain_keeps_a_job_a_call_shares_a_key_with() {
             "on: workflow_call\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps: [{ run: x }]\n",
         ),
         (
+            "ghost.yml",
+            "on: push\njobs:\n  g:\n    runs-on: macos-latest\n    steps: [{ run: x }]\n",
+        ),
+        (
             "deploy.yml",
-            "on:\n  workflow_run: { workflows: [ghost] }\njobs:\n  ci-c:\n    uses: ./.github/workflows/w.yml\n",
+            "on:\n  workflow_run: { workflows: [ghost.yml] }\njobs:\n  ci-c:\n    uses: ./.github/workflows/w.yml\n",
         ),
     ]);
+    assert!(!out.config.workflows.contains_key("ghost"));
+    assert!(!out.config.workflows.contains_key("deploy"));
+    assert!(has(
+        &out.warnings,
+        &[
+            "`deploy.yml` was dropped",
+            "runs only after workflows that did not convert"
+        ]
+    ));
     assert!(out.config.jobs.contains_key("ci-c"));
     assert_eq!(validate(&out.config), Vec::new());
 }

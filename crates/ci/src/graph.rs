@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use hatchrun_workflow::{
     CallFrame, Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Leg, Need, Outcome,
     Plan, PlannedJob, Ready, Siblings, Statuses, checks_status, continue_on_error, entry_in,
-    expand, hatchrun_context, interpolate, is_expression, job_condition, read_value, ready,
-    resolve_frame, shared_depth, valid_environment_name,
+    expand, hatchrun_context, interpolate, is_expression, job_condition, may_hold_without,
+    read_value, reads_context, ready, resolve_frame, shared_depth, valid_environment_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -54,6 +54,11 @@ pub struct Graph {
     /// ids: those the new matrix leaves out end as skipped.
     #[serde(default)]
     previous: BTreeMap<String, Vec<(u64, PlannedJob)>>,
+    /// Whether each call instance was let in, by its id, once decided:
+    /// a variable that changes while the call runs does not stop it
+    /// half way. A rerun forgets them.
+    #[serde(default)]
+    admitted: BTreeMap<String, bool>,
 }
 
 /// What reading the scope of a job found: its `inputs`.
@@ -179,6 +184,7 @@ impl Graph {
             vars: BTreeMap::new(),
             stand_ins: BTreeMap::new(),
             previous: BTreeMap::new(),
+            admitted: BTreeMap::new(),
         }
     }
 
@@ -269,6 +275,7 @@ impl Graph {
         });
         self.jobs[at].state = State::Done(conclusion);
         let mut actions = vec![Action::Finished { job, conclusion }];
+        self.leave_out_previous(at, &mut actions);
         self.fail_fast(at, &mut actions);
         actions.extend(self.advance(github_ctx));
         actions
@@ -409,6 +416,11 @@ impl Graph {
         let Some(root) = self.position(job) else {
             return Vec::new();
         };
+        // A job a rerun left out of its matrix is no part of the run; its
+        // producer is what runs again.
+        if self.jobs[root].stale {
+            return Vec::new();
+        }
         // Like GitHub, only a run that has ended can be rerun: a running
         // dependent would otherwise run twice.
         if self.conclusion().is_none() {
@@ -446,6 +458,7 @@ impl Graph {
             }
         }
         self.collapse_rerun();
+        self.admitted.clear();
         self.cancelled = false;
         self.run_done = false;
         self.advance(github_ctx)
@@ -474,11 +487,11 @@ impl Graph {
             let Some(stand_in) = self.stand_ins.get(&from).cloned() else {
                 continue;
             };
-            // What an earlier attempt left out is gone with this one.
-            self.jobs
-                .retain(|n| !(n.stale && n.expanded_from.as_deref() == Some(from.as_str())));
             let made: Vec<usize> = (0..self.jobs.len())
-                .filter(|&i| self.jobs[i].expanded_from.as_deref() == Some(from.as_str()))
+                .filter(|&i| {
+                    !self.jobs[i].stale
+                        && self.jobs[i].expanded_from.as_deref() == Some(from.as_str())
+                })
                 .collect();
             let (Some(&first), attempt) = (
                 made.first(),
@@ -491,12 +504,11 @@ impl Graph {
             };
             let ids: Vec<String> = made.iter().map(|&i| self.jobs[i].job.id.clone()).collect();
             let row = self.jobs[first].id;
-            // The first job keeps its row; the others are left out when
-            // the matrix no longer makes them.
+            // A job the matrix no longer makes is left out, whichever row
+            // the new jobs take.
             self.previous.insert(
                 from.clone(),
                 made.iter()
-                    .skip(1)
                     .map(|&i| (self.jobs[i].id, self.jobs[i].job.clone()))
                     .collect(),
             );
@@ -664,7 +676,7 @@ impl Graph {
         let at = at.min(self.jobs.len());
         let made = nodes.len();
         let rows: Vec<u64> = nodes.iter().map(|n| n.id).collect();
-        let dropped = self.left_out(&old, &ids, &rows);
+        let dropped = self.left_out(&old.job.id, old.attempt, &ids, &rows);
         let left_out: Vec<u64> = dropped.iter().map(|n| n.id).collect();
         self.jobs.splice(at..at, nodes);
         self.jobs.splice(at + made..at + made, dropped);
@@ -729,12 +741,18 @@ impl Graph {
         actions
     }
 
-    /// The jobs a rerun made before from `old`, the job that read its
+    /// The jobs a rerun made before from `stand_in`, the job that read its
     /// matrix, that the new jobs `ids` (in `rows`) leave out: each ends
     /// as skipped for this attempt, and is no part of the run.
-    fn left_out(&mut self, old: &Node, ids: &[String], rows: &[u64]) -> Vec<Node> {
+    fn left_out(
+        &mut self,
+        stand_in: &str,
+        attempt: u32,
+        ids: &[String],
+        rows: &[u64],
+    ) -> Vec<Node> {
         let mut dropped = Vec::new();
-        for (row, job) in self.previous.remove(&old.job.id).unwrap_or_default() {
+        for (row, job) in self.previous.remove(stand_in).unwrap_or_default() {
             if ids.contains(&job.id) || rows.contains(&row) {
                 continue;
             }
@@ -747,12 +765,12 @@ impl Graph {
                     ..job
                 },
                 state: State::Done(Conclusion::Skipped),
-                attempt: old.attempt,
+                attempt,
                 result: None,
                 message: Some(NOT_IN_MATRIX.to_owned()),
                 environment: None,
                 cancel: 0,
-                expanded_from: Some(old.job.id.clone()),
+                expanded_from: Some(stand_in.to_owned()),
                 stale: true,
             });
         }
@@ -995,6 +1013,13 @@ impl Graph {
                 statuses |= job.statuses.values().any(|s| *s != Statuses::SUCCESS);
             }
         }
+        // What an outer call waits for is not this call's own: it is read
+        // by the outer call's `if` and `with`, not passed on.
+        let parent = &self.jobs[at].job.scope[..depth];
+        out.retain(|id| {
+            self.position_of(id)
+                .is_none_or(|p| shared_depth(parent, &self.jobs[p].job) == depth)
+        });
         (out, statuses)
     }
 
@@ -1118,16 +1143,20 @@ impl Graph {
     /// for, which the call's own `if` reads.
     fn ancestors(&self, seeds: &[String], within: &[CallFrame]) -> JobStatus {
         let mut seen = vec![false; self.jobs.len()];
-        let mut stack: Vec<&[String]> = vec![seeds];
         let mut skipped = false;
-        while let Some(requires) = stack.pop() {
-            for r in requires {
-                let Some(p) = self.position_of(r) else {
-                    continue;
-                };
-                if shared_depth(within, &self.jobs[p].job) < within.len() {
-                    continue;
-                }
+        for seed in seeds {
+            let Some(root) = self.position_of(seed) else {
+                continue;
+            };
+            // A seed that is a job of a call counts as the call: the walk
+            // from it stays inside that call.
+            let job = &self.jobs[root].job;
+            if shared_depth(within, job) < within.len() {
+                continue;
+            }
+            let limit = &job.scope[..job.scope.len().min(shared_depth(within, job) + 1)];
+            let mut stack: Vec<usize> = vec![root];
+            while let Some(p) = stack.pop() {
                 if std::mem::replace(&mut seen[p], true) {
                     continue;
                 }
@@ -1136,7 +1165,14 @@ impl Graph {
                     State::Done(Conclusion::Skipped) => skipped = true,
                     _ => return JobStatus::Failure,
                 }
-                stack.push(&self.jobs[p].job.requires);
+                for r in &self.jobs[p].job.requires {
+                    let Some(next) = self.position_of(r) else {
+                        continue;
+                    };
+                    if shared_depth(limit, &self.jobs[next].job) >= limit.len() {
+                        stack.push(next);
+                    }
+                }
             }
         }
         if skipped {
@@ -1182,6 +1218,18 @@ impl Graph {
     /// stand in for the implied `success()` of an `if:` that calls no
     /// status function.
     fn decide(&self, at: usize, github_ctx: &Value, statuses_ok: bool) -> Result<bool, ExprError> {
+        self.decide_recording(at, github_ctx, statuses_ok, &mut Vec::new())
+    }
+
+    /// [`Graph::decide`], that also tells which call instances it let in
+    /// or kept out for the first time, for [`Graph::admitted`].
+    fn decide_recording(
+        &self,
+        at: usize,
+        github_ctx: &Value,
+        statuses_ok: bool,
+        decided: &mut Vec<(String, bool)>,
+    ) -> Result<bool, ExprError> {
         let node = &self.jobs[at];
         let status = if self.cancelled {
             JobStatus::Cancelled
@@ -1195,6 +1243,9 @@ impl Graph {
         let walked = self
             .walk_gated(at, github_ctx, &self.vars, &mut |i, ctx| {
                 let frame = &node.job.scope[i];
+                if let Some(held) = self.admitted.get(&frame.id) {
+                    return Ok(*held);
+                }
                 let held = (|| {
                     let (roots, by_statuses) = self.call_edges(at, i);
                     let status = if self.cancelled {
@@ -1208,7 +1259,11 @@ impl Graph {
                     };
                     job_condition(frame.if_.as_deref(), ctx, &Status(status))
                 })();
-                held.map_err(|e| e.to_string())
+                let held = held.map_err(|e| e.to_string())?;
+                if !self.cancelled {
+                    decided.push((frame.id.clone(), held));
+                }
+                Ok(held)
             })
             .map_err(|message| ExprError { message, offset: 0 })?;
         let Some(walked) = walked else {
@@ -1224,13 +1279,9 @@ impl Graph {
             .deferred
             .as_ref()
             .is_some_and(|d| !d.matrix.is_empty())
-            && own.is_some_and(|cond| cond.contains("matrix"));
+            && own.is_some_and(|cond| reads_context(cond, "matrix"));
         if waits_for_legs {
-            return if checks_status(own.unwrap_or_default())? {
-                Ok(true)
-            } else {
-                job_condition(None, &ctx, &Status(status))
-            };
+            return may_hold_without(own.unwrap_or_default(), "matrix", &ctx, &Status(status));
         }
         job_condition(own, &ctx, &Status(status))
     }
@@ -1388,7 +1439,10 @@ impl Graph {
             .statuses
             .values()
             .any(|s| *s != Statuses::SUCCESS);
-        let problem = match self.decide(at, github_ctx, statuses_ok) {
+        let mut decided = Vec::new();
+        let verdict = self.decide_recording(at, github_ctx, statuses_ok, &mut decided);
+        self.admitted.extend(decided);
+        let problem = match verdict {
             Ok(true) if self.jobs[at].job.deferred.is_some() => {
                 // The job's own `if:` held. Each job it makes meets its
                 // `if:` again with its matrix entry, and settles its own
@@ -1459,6 +1513,22 @@ impl Graph {
             job: node.id,
             conclusion,
         });
+        self.leave_out_previous(at, actions);
+    }
+
+    /// The job at `at` ended without making jobs from its matrix: the
+    /// jobs a rerun took out of the graph for it end as skipped.
+    fn leave_out_previous(&mut self, at: usize, actions: &mut Vec<Action>) {
+        let (id, attempt) = (self.jobs[at].job.id.clone(), self.jobs[at].attempt);
+        let dropped = self.left_out(&id, attempt, &[], &[]);
+        for node in &dropped {
+            actions.push(Action::Finished {
+                job: node.id,
+                conclusion: Conclusion::Skipped,
+            });
+        }
+        let after = at + 1;
+        self.jobs.splice(after..after, dropped);
     }
 
     fn emit_run_done(&mut self, actions: &mut Vec<Action>) {
@@ -3311,5 +3381,253 @@ workflows:
             "the dropped job is current again"
         );
         assert_eq!(g.node(10).unwrap().state, State::Queued);
+    }
+
+    const NESTED: &str = "
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [] }
+  work: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  inner:
+    on: { call: { inputs: { v: { type: string } } } }
+    jobs: [work]
+  outer:
+    on: { call: {} }
+    jobs:
+      - i: { call: inner, with: { v: '${{ needs.build.outputs.v }}' } }
+  ci:
+    on: { push: {} }
+    jobs:
+      - build
+      - c: { call: outer, requires: [build] }
+";
+
+    #[test]
+    fn an_inner_call_does_not_read_what_the_outer_call_waits_for() {
+        let ctx = github("refs/heads/main");
+        let mut g = vars_graph(NESTED);
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, done(Conclusion::Success, &[("v", "secret-value")]), &ctx);
+        let inputs = g.call_inputs(2, &ctx, &BTreeMap::new()).unwrap().unwrap();
+        assert_eq!(inputs["v"], "");
+    }
+
+    const ADMIT: &str = "
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [] }
+  work: { runs-on: ubuntu-latest, steps: [] }
+  more: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  inner:
+    on: { call: {} }
+    jobs: [work, { more: { requires: [work] } }]
+  ci:
+    on: { push: {} }
+    jobs:
+      - build
+      - c: { call: inner, requires: [build], if: vars.GO == 'yes' }
+";
+
+    #[test]
+    fn a_call_that_was_let_in_is_not_stopped_by_a_variable_that_changes() {
+        let ctx = github("refs/heads/main");
+        let mut g = vars_graph(ADMIT);
+        g.set_vars(BTreeMap::from([("GO".to_owned(), "yes".to_owned())]));
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, ok(), &ctx);
+        assert_eq!(g.node(2).unwrap().state, State::Queued);
+        g.set_vars(BTreeMap::from([("GO".to_owned(), "no".to_owned())]));
+        run(&mut g, 2);
+        let actions = g.finished(2, ok(), &ctx);
+        assert!(actions.contains(&Action::Launch(3)), "{actions:?}");
+        // After a rerun the call is decided again.
+        run(&mut g, 3);
+        g.finished(3, ok(), &ctx);
+        g.rerun(1, &ctx);
+        run(&mut g, 1);
+        g.finished(1, ok(), &ctx);
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+    }
+
+    #[test]
+    fn a_matrix_condition_is_read_from_the_parsed_expression() {
+        // Any case reads the matrix, so the job expands.
+        let mut g = dynamic_with("MATRIX.os == 'ubuntu-latest'", FROM, true);
+        let actions = after_setup(&mut g, r#"{"os":["ubuntu-latest"]}"#);
+        assert!(actions.iter().any(|a| matches!(a, Action::Expand(_))));
+        // A string that spells it is not a read: the condition is false.
+        let mut g = dynamic_with("'matrix' == 'other'", FROM, true);
+        let actions = after_setup(&mut g, r#"{"os":["ubuntu-latest"]}"#);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Expand(_))));
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+    }
+
+    #[test]
+    fn a_status_guard_that_is_false_skips_the_job_before_the_matrix_is_read() {
+        let mut g = dynamic_with("failure() && matrix.os == 'ubuntu-latest'", FROM, true);
+        // Malformed producer output is no failure of a job that is off.
+        let actions = after_setup(&mut g, "not json");
+        assert!(!actions.iter().any(|a| matches!(a, Action::Expand(_))));
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+        // The same guard holds after a failure, and the legs read it.
+        let mut g = dynamic_with("failure() && matrix.os == 'ubuntu-latest'", FROM, true);
+        g.advance(&ctx());
+        run(&mut g, 1);
+        let actions = g.finished(
+            1,
+            done(
+                Conclusion::Failure,
+                &[("os", r#"{"os":["ubuntu-latest"]}"#)],
+            ),
+            &ctx(),
+        );
+        // The job after setup needs it to succeed unless it says otherwise.
+        assert!(actions.iter().all(|a| !matches!(a, Action::Launch(_))));
+    }
+
+    const FAILED_BUILD: &str = "
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [] }
+  work: { runs-on: ubuntu-latest, steps: [] }
+  after: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  inner:
+    on: { call: {} }
+    jobs: [work]
+  ci:
+    on: { push: {} }
+    jobs:
+      - build
+      - c: { call: inner, requires: [{ build: failed }] }
+      - { after: { requires: [c] } }
+";
+
+    #[test]
+    fn a_job_that_needs_a_call_does_not_count_what_the_call_waited_for() {
+        let ctx = github("refs/heads/main");
+        let mut g = vars_graph(FAILED_BUILD);
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, done(Conclusion::Failure, &[]), &ctx);
+        assert_eq!(g.node(2).unwrap().state, State::Queued);
+        run(&mut g, 2);
+        let actions = g.finished(2, ok(), &ctx);
+        // `after` needs the call, which succeeded, not the build that failed.
+        assert!(actions.contains(&Action::Launch(3)), "{actions:?}");
+    }
+
+    fn shrunk() -> Graph {
+        let (g, _) = rerun_with(
+            r#"["ubuntu-latest","ubuntu-26.04-arm","ubuntu-26.04"]"#,
+            r#"["ubuntu-latest"]"#,
+        );
+        g
+    }
+
+    #[test]
+    fn a_job_a_rerun_left_out_cannot_be_rerun() {
+        let mut g = shrunk();
+        run(&mut g, 2);
+        g.finished(2, ok(), &ctx());
+        run(&mut g, 3);
+        g.finished(3, ok(), &ctx());
+        assert!(g.conclusion().is_some());
+        assert_eq!(g.rerun(10, &ctx()), Vec::<Action>::new());
+        assert_eq!(g.node(10).unwrap().state, State::Done(Conclusion::Skipped));
+        assert_eq!(g.conclusion(), Some(Conclusion::Success));
+    }
+
+    #[test]
+    fn what_a_rerun_left_out_stays_in_the_graph_until_something_takes_its_place() {
+        let mut g = shrunk();
+        run(&mut g, 2);
+        g.finished(2, ok(), &ctx());
+        run(&mut g, 3);
+        g.finished(3, ok(), &ctx());
+        g.rerun(1, &ctx());
+        // The skipped checks of the attempt before are still there to send.
+        assert!(g.node(10).is_some_and(|n| n.stale));
+        assert!(g.node(11).is_some_and(|n| n.stale));
+        run(&mut g, 1);
+        g.finished(
+            1,
+            done(Conclusion::Success, &[("os", r#"["ubuntu-latest"]"#)]),
+            &ctx(),
+        );
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        g.expanded(2, vec![(2, legs[0].clone())], &ctx());
+        // One node for each row, dropped again for the new attempt.
+        let ids: Vec<u64> = g.jobs.iter().map(|n| n.id).collect();
+        assert_eq!(ids.iter().filter(|id| **id == 10).count(), 1);
+        assert!(g.node(10).unwrap().stale);
+    }
+
+    #[test]
+    fn a_rerun_whose_matrix_makes_no_job_ends_the_old_jobs_as_skipped() {
+        let ctx = ctx();
+        let (mut g, _) = rerun_with(
+            r#"["ubuntu-latest","ubuntu-26.04-arm"]"#,
+            r#"["ubuntu-latest","ubuntu-26.04-arm"]"#,
+        );
+        // Again, with a matrix that has nothing in it.
+        for job in [2, 10] {
+            if g.node(job).is_some_and(|n| n.state == State::Queued) {
+                run(&mut g, job);
+                g.finished(job, ok(), &ctx);
+            }
+        }
+        for job in [2, 10, 3] {
+            if g.node(job).is_some_and(|n| n.state == State::Queued) {
+                run(&mut g, job);
+                g.finished(job, ok(), &ctx);
+            }
+        }
+        assert!(g.conclusion().is_some());
+        g.rerun(1, &ctx);
+        run(&mut g, 1);
+        g.finished(
+            1,
+            done(Conclusion::Success, &[("os", r#"["ubuntu-latest"]"#)]),
+            &ctx,
+        );
+        // The matrix reads as no entry, as an `exclude` can leave it.
+        let actions = g.no_jobs(2, &ctx);
+        assert!(actions.contains(&Action::Finished {
+            job: 10,
+            conclusion: Conclusion::Skipped
+        }));
+        let node = g.node(10).unwrap();
+        assert!(node.stale);
+        assert_eq!(node.state, State::Done(Conclusion::Skipped));
+        assert_eq!(g.conclusion(), Some(Conclusion::Success));
+    }
+
+    #[test]
+    fn a_matrix_that_cannot_be_read_ends_the_old_jobs_as_skipped_too() {
+        let ctx = ctx();
+        let (mut g, _) = rerun_with(
+            r#"["ubuntu-latest","ubuntu-26.04-arm"]"#,
+            r#"["ubuntu-latest","ubuntu-26.04-arm"]"#,
+        );
+        for job in [2, 10, 3] {
+            if g.node(job).is_some_and(|n| n.state == State::Queued) {
+                run(&mut g, job);
+                g.finished(job, ok(), &ctx);
+            }
+        }
+        assert!(g.conclusion().is_some());
+        g.rerun(1, &ctx);
+        run(&mut g, 1);
+        g.finished(1, done(Conclusion::Success, &[("os", "not json")]), &ctx);
+        let message = g.expansion(2, &ctx, &BTreeMap::new()).unwrap().unwrap_err();
+        let actions = g.failed(2, message, &ctx);
+        assert!(actions.contains(&Action::Finished {
+            job: 10,
+            conclusion: Conclusion::Skipped
+        }));
+        assert!(g.node(10).unwrap().stale);
+        assert_eq!(g.conclusion(), Some(Conclusion::Failure));
     }
 }
