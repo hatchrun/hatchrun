@@ -29,10 +29,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use hatchrun_workflow::{
-    Arch, Config, Event, ExprError, Functions, HATCHRUN_KEYS, JobKind, JobStatus, ParameterKind,
-    Plan, PlannedJob, PlannedStep, Submodules, Workflow, compile, interpolate, job_condition,
-    parse, to_yaml, triggered,
+    Arch, Config, Event, ExprError, Functions, HATCHRUN_KEYS, JobKind, JobStatus, Library,
+    ParameterKind, Plan, PlannedJob, PlannedStep, Submodules, Workflow, compile, compile_with,
+    interpolate, job_condition, parse, resolve_inputs, to_yaml, triggered,
 };
+use hatchrun_workflow::{CallFrame, entry_in, shared_depth};
 use serde_json::{Map, Value, json};
 
 /// The head of the default branch, which schedules and dispatches run on.
@@ -162,6 +163,14 @@ fn deliveries(config: &Config) -> Vec<Delivery> {
 
 fn text(value: &Value) -> &str {
     value.as_str().unwrap_or_default()
+}
+
+/// A value as the transcript shows it: a string as it is, a boolean or
+/// a number as written.
+fn typed(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_owned)
 }
 
 /// The paths a push changed, from its commits.
@@ -434,16 +443,21 @@ fn simulate(plan: &Plan, base: &Value, outputs: &Value, fail: bool) -> Run {
     for job in &plan.jobs {
         let upstream = upstream(job, &by_id, &ran);
         let ctx = job_context(job, base, &by_id, &ran, outputs);
-        let runs = match &job.if_ {
-            Some(cond) => condition(cond, &ctx, upstream.status()),
-            None => Ok(matches!(upstream, Upstream::Passed)),
+        // A call that does not hold skips every job of the called workflow.
+        let runs = if walk_calls(job, base, &by_id, &ran, outputs).held {
+            match &job.if_ {
+                Some(cond) => condition(cond, &ctx, upstream.status()),
+                None => Ok(matches!(upstream, Upstream::Passed)),
+            }
+        } else {
+            Ok(false)
         };
         let result = match runs {
             Ok(true) if fail => "failure",
             Ok(true) => "success",
             _ => "skipped",
         };
-        ran.entry(job.name.clone()).or_default().push(result);
+        ran.entry(rkey(job)).or_default().push(result);
         lines.insert(job.id.clone(), runs);
     }
     let results = ran
@@ -451,6 +465,124 @@ fn simulate(plan: &Plan, base: &Value, outputs: &Value, fail: bool) -> Run {
         .map(|(name, legs)| (name, combined(&legs)))
         .collect();
     Run { results, lines }
+}
+
+/// The key a job's result is kept under: the call it runs in and its
+/// name, so two calls of one workflow keep their results apart.
+fn rkey(job: &PlannedJob) -> String {
+    format!("{}\u{1}{}", job.call_id().unwrap_or_default(), job.name)
+}
+
+/// What a job's calls make of it: whether each holds, and what the
+/// innermost passes.
+struct Calls {
+    /// Every call the job runs in holds, by its `if`.
+    held: bool,
+    /// The `inputs` of the innermost call, `None` when a call does not
+    /// hold: a call that is off reads no input.
+    inputs: Option<Value>,
+}
+
+/// Reads the calls a job runs in, outermost first. Each call's `if` is
+/// read, with the status of what the call waits for, before its inputs,
+/// with the call's own needs, matrix and the inputs of the call before.
+fn walk_calls(
+    job: &PlannedJob,
+    base: &Value,
+    by_id: &BTreeMap<&str, &PlannedJob>,
+    ran: &BTreeMap<String, Vec<&'static str>>,
+    outputs: &Value,
+) -> Calls {
+    let mut inputs = base["inputs"].clone();
+    for (i, frame) in job.scope.iter().enumerate() {
+        let parent = &job.scope[..i];
+        let edges = call_edges(job, i, by_id);
+        let status = upstream_from(&edges, parent, by_id, ran).status();
+        let mut ctx = base.clone();
+        ctx["inputs"] = inputs.clone();
+        ctx["matrix"] = json!(frame.matrix);
+        ctx["needs"] = needs_value(parent, &edges, by_id, ran, base, outputs);
+        let held = match frame.if_.as_deref() {
+            Some(cond) => matches!(condition(cond, &ctx, status), Ok(true)),
+            // No `if` is the implied `success()` of what it waits for.
+            None => status == JobStatus::Success,
+        };
+        if !held {
+            return Calls {
+                held: false,
+                inputs: None,
+            };
+        }
+        inputs = resolve_inputs(std::slice::from_ref(frame), &inputs, |_, _| ctx.clone())
+            .unwrap_or_else(|e| panic!("{}: {e}", job.id));
+    }
+    Calls {
+        held: true,
+        inputs: Some(inputs),
+    }
+}
+
+/// The ids of the jobs the call at frame `depth` of a job waits for:
+/// what its jobs require outside the call, inside the workflow that made
+/// it.
+fn call_edges<'a>(
+    job: &PlannedJob,
+    depth: usize,
+    by_id: &BTreeMap<&str, &'a PlannedJob>,
+) -> Vec<&'a str> {
+    let instance = &job.scope[depth].id;
+    let inside = |j: &PlannedJob| j.scope.get(depth).is_some_and(|f| f.id == *instance);
+    let mut ids: Vec<&str> = Vec::new();
+    for member in by_id.values().filter(|j| inside(j)) {
+        for id in &member.requires {
+            let required = by_id[id.as_str()];
+            if inside(required) || shared_depth(&job.scope[..depth], required) < depth {
+                continue;
+            }
+            let id = required.id.as_str();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// The `needs` entries for the jobs `ids`, as a job that runs in `scope`
+/// reads them: how each entry ended and what it gave. A call is one
+/// entry, and the results of its jobs are its own.
+fn needs_value(
+    scope: &[CallFrame],
+    ids: &[&str],
+    by_id: &BTreeMap<&str, &PlannedJob>,
+    ran: &BTreeMap<String, Vec<&'static str>>,
+    base: &Value,
+    outputs: &Value,
+) -> Value {
+    let mut groups: Vec<(String, Vec<&'static str>, Option<&PlannedJob>)> = Vec::new();
+    for id in ids {
+        let required = by_id[id];
+        let name = entry_in(scope, required).to_owned();
+        let legs = ran.get(&rkey(required)).cloned().unwrap_or_default();
+        let direct = (required.scope.len() == scope.len()).then_some(required);
+        match groups.iter_mut().find(|g| g.0 == name) {
+            Some(group) => {
+                group.1.extend(legs);
+                group.2 = group.2.or(direct);
+            }
+            None => groups.push((name, legs, direct)),
+        }
+    }
+    let mut needs = Map::new();
+    for (name, legs, first) in groups {
+        let result = combined(&legs);
+        let outs = match first {
+            Some(first) if result == "success" => job_outputs(first, base, outputs),
+            _ => json!({}),
+        };
+        needs.insert(name, json!({ "result": result, "outputs": outs }));
+    }
+    Value::Object(needs)
 }
 
 /// One result for a job and all its matrix legs and nodes.
@@ -464,38 +596,52 @@ fn combined(legs: &[&'static str]) -> &'static str {
     }
 }
 
-/// The names a job requires, in order, once each.
-fn needs_names<'a>(job: &PlannedJob, by_id: &BTreeMap<&str, &'a PlannedJob>) -> Vec<&'a str> {
-    let mut names: Vec<&str> = Vec::new();
-    for id in &job.requires {
-        let name = by_id[id.as_str()].name.as_str();
-        if !names.contains(&name) {
-            names.push(name);
-        }
-    }
-    names
-}
-
 fn upstream(
     job: &PlannedJob,
     by_id: &BTreeMap<&str, &PlannedJob>,
     ran: &BTreeMap<String, Vec<&'static str>>,
 ) -> Upstream {
-    // Every ancestor, not only the direct needs.
+    let seeds: Vec<&str> = job.requires.iter().map(String::as_str).collect();
+    upstream_from(&seeds, &job.scope, by_id, ran)
+}
+
+/// The status of every ancestor of the jobs `seeds`, not only the direct
+/// needs, as `success()` and `failure()` see it for a job that runs in
+/// `within`: a job of a call does not see what the call waits for, and a
+/// job that needs a call sees the call's own jobs.
+fn upstream_from(
+    seeds: &[&str],
+    within: &[CallFrame],
+    by_id: &BTreeMap<&str, &PlannedJob>,
+    ran: &BTreeMap<String, Vec<&'static str>>,
+) -> Upstream {
     let mut seen = BTreeSet::new();
-    let mut todo: Vec<&str> = job.requires.iter().map(String::as_str).collect();
     let mut skipped = false;
-    while let Some(id) = todo.pop() {
-        if !seen.insert(id) {
+    for seed in seeds {
+        let root = by_id[seed];
+        let shared = shared_depth(within, root);
+        if shared < within.len() {
             continue;
         }
-        let up = by_id[id];
-        match combined(&ran[&up.name]) {
-            "failure" => return Upstream::Failed,
-            "skipped" => skipped = true,
-            _ => {}
+        let limit = &root.scope[..root.scope.len().min(shared + 1)];
+        let mut todo: Vec<&str> = vec![seed];
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let up = by_id[id];
+            match combined(&ran[&rkey(up)]) {
+                "failure" => return Upstream::Failed,
+                "skipped" => skipped = true,
+                _ => {}
+            }
+            todo.extend(
+                up.requires
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|next| shared_depth(limit, by_id[next]) >= limit.len()),
+            );
         }
-        todo.extend(up.requires.iter().map(String::as_str));
     }
     if skipped {
         Upstream::Skipped
@@ -551,22 +697,14 @@ fn job_context(
     ran: &BTreeMap<String, Vec<&'static str>>,
     outputs: &Value,
 ) -> Value {
-    let mut needs = Map::new();
-    for name in needs_names(job, by_id) {
-        let first = by_id.values().find(|j| j.name == name).unwrap();
-        let result = combined(&ran[name]);
-        let outs = if result == "success" {
-            job_outputs(first, base, outputs)
-        } else {
-            json!({})
-        };
-        needs.insert(
-            name.to_owned(),
-            json!({ "result": result, "outputs": outs }),
-        );
-    }
+    let ids: Vec<&str> = job.requires.iter().map(String::as_str).collect();
+    let needs = needs_value(&job.scope, &ids, by_id, ran, base, outputs);
     let mut ctx = base.clone();
-    ctx["needs"] = Value::Object(needs);
+    ctx["needs"] = needs;
+    // A job of a called workflow reads what the calls passed.
+    ctx["inputs"] = walk_calls(job, base, by_id, ran, outputs)
+        .inputs
+        .unwrap_or_else(|| json!({}));
     ctx
 }
 
@@ -581,7 +719,7 @@ fn play(config: &Config, d: &Delivery, outputs: &Value, out: &mut String) {
             writeln!(out, "  {name}: not triggered").unwrap();
             continue;
         }
-        let plan = match compile(config, name, &git_ref) {
+        let plan = match compile_with(config, name, &git_ref, &Library::offline()) {
             Ok(plan) => plan,
             Err(errors) => {
                 writeln!(out, "  {name}: compile failed").unwrap();
@@ -645,6 +783,23 @@ fn render_job(
     }
     if let Some(cond) = &job.if_ {
         writeln!(out, "      if {cond}").unwrap();
+    }
+    for frame in &job.scope {
+        match &frame.if_ {
+            Some(cond) => writeln!(out, "      call {} if {cond}", frame.id).unwrap(),
+            None => writeln!(out, "      call {}", frame.id).unwrap(),
+        }
+    }
+    if !job.scope.is_empty()
+        && let Some(inputs) = walk_calls(job, base, by_id, &as_legs(&ok.results), outputs).inputs
+    {
+        let shown: Vec<String> = inputs
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| format!("{k}={}", typed(v)))
+            .collect();
+        writeln!(out, "      inputs {}", shown.join(" ")).unwrap();
     }
     if !job.matrix.is_empty() {
         let shown: Vec<String> = job.matrix.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -813,7 +968,7 @@ fn nightly_schedule() {
 }
 
 #[test]
-fn local_reusable_workflows_are_inlined_and_remote_ones_dropped() {
+fn reusable_workflows_plan_as_calls_and_remote_ones_wait_for_a_host() {
     scenario("reusable");
 }
 

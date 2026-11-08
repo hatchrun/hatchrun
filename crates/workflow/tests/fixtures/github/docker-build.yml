@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Docker build
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image name without the registry
+        required: true
+        type: string
+      push:
+        type: boolean
+        default: false
+      replicas:
+        type: number
+        default: 2
+      runner:
+        type: string
+        default: ubuntu-latest
+      platforms:
+        description: JSON list of platforms
+        type: string
+        default: '["linux/amd64"]'
+    secrets:
+      REGISTRY_TOKEN:
+        required: false
+      SIGNING_KEY:
+        required: false
+    outputs:
+      digest:
+        description: Digest of the pushed image
+        value: ${{ jobs.build.outputs.digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      matrix:
+        platform: ${{ fromJSON(inputs.platforms) }}
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: push
+        run: |
+          echo "building ${{ inputs.image }} for ${{ matrix.platform }}"
+          echo "digest=sha256:abc" >> "$GITHUB_OUTPUT"
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          PUSH: ${{ inputs.push }}
+  sign:
+    needs: build
+    if: ${{ inputs.push }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: cosign sign ${{ needs.build.outputs.digest }}
+        env:
+          KEY: ${{ secrets.SIGNING_KEY }}

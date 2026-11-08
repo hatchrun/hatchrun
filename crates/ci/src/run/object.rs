@@ -36,10 +36,11 @@ use crate::launches::{self, LaunchMessage};
 use crate::store;
 
 use super::decide::{
-    Delivery, Failed, Flushed, Gate, apply_batch, apply_held, apply_result, arm_chains, arm_todo,
-    attempts, bounded_event, delivery, due, file_annotations, gate, github_context, gives_up,
-    job_document, minimal_check, next_alarm, plan_is_current, record_flush, reschedule, reset_jobs,
-    run_state, running_for, should_write_heartbeat, snapshot_ready, steps_json, take_drain,
+    Delivery, Failed, Flushed, Gate, again_work, apply_batch, apply_held, apply_result, arm_chains,
+    arm_todo, attempts, bounded_event, delivery, due, file_annotations, gate, github_context,
+    gives_up, job_document, left_out_work, minimal_check, next_alarm, plan_is_current,
+    record_flush, reschedule, reset_jobs, run_state, running_for, should_write_heartbeat,
+    snapshot_ready, steps_json, take_drain,
 };
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
@@ -884,6 +885,7 @@ impl<'a> Cx<'a> {
                     .await
             }
             Work::ResetJob { job, attempt } => store::reset_job(db, *job, *attempt, self.now).await,
+            Work::Supersede { job, attempt } => store::supersede_job(db, *job, *attempt).await,
             Work::ReopenRun { attempt } => {
                 store::reopen_run_at(db, info.run_id, *attempt, self.now).await?;
                 self.chain(*attempt, &["requested", "in_progress"], None)
@@ -1045,7 +1047,7 @@ impl<'a> Cx<'a> {
             .graph
             .node(job)
             .is_some_and(|n| n.job.continue_on_error.is_some())
-            || run.graph.environments_read_vars()
+            || run.graph.reads_vars()
         {
             let vars = store::job_vars(
                 self.db().await?,
@@ -1083,7 +1085,9 @@ impl<'a> Cx<'a> {
         let ctx = self.github_ctx(info).await?;
         let vars = store::job_vars(db, &info.tenant_id, info.repo.id, None).await?;
         let workflow_ctx = concurrency::context(&ctx, &vars);
-        let Some(job_ctx) = graph.job_context(job, &ctx, &vars) else {
+        // A job whose inputs cannot be read ends as failed when it is
+        // decided; it has no concurrency slot to claim.
+        let Some(Ok(job_ctx)) = graph.job_context(job, &ctx, &vars) else {
             return Ok(());
         };
         for slot in concurrency::claims(info, node, &workflow_ctx, &job_ctx, self.now) {
@@ -1123,38 +1127,22 @@ impl<'a> Cx<'a> {
         };
         let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
         let now = self.now;
-        let existing = store::jobs_for_run(db, run.info.run_id).await?;
-        let mut rows: Vec<Option<u64>> = Vec::with_capacity(legs.len());
-        let mut fresh = Vec::new();
-        for (i, leg) in legs.iter().enumerate() {
-            let new = crate::runs::new_job(&leg.job);
-            if i == 0 {
-                store::retarget_job(db, job, &new, attempt, now).await?;
-                rows.push(Some(job));
-            } else if let Some(row) = existing.iter().find(|r| r.plan_id == leg.job.id) {
-                rows.push(Some(row.id));
-            } else {
-                rows.push(None);
-                fresh.push(new);
-            }
-        }
-        let inserted = store::insert_jobs(db, run.info.run_id, &fresh, now).await?;
-        let mut ids = Vec::with_capacity(legs.len());
-        for (leg, row) in legs.iter().zip(rows) {
-            if let Some(id) = row {
-                ids.push(id);
-                continue;
-            }
-            let found = inserted.iter().find(|(plan, _)| *plan == leg.job.id);
-            let (_, id) = found.ok_or_else(|| fail("a job of the matrix has no row"))?;
-            if attempt > 1 {
-                store::reset_job(db, *id, attempt, now).await?;
-            }
-            ids.push(*id);
-        }
+        let news: Vec<store::NewJob> = legs
+            .iter()
+            .map(|leg| crate::runs::new_job(&leg.job))
+            .collect();
+        let rows = store::assign_matrix_rows(db, run.info.run_id, job, &news, attempt, now).await?;
+        let (ids, again) = (rows.ids, rows.again);
         let plan_ids: Vec<String> = legs.iter().map(|l| l.job.id.clone()).collect();
         let legs: Vec<(u64, _)> = ids.iter().copied().zip(legs).collect();
         let actions = run.graph_mut().expanded(job, legs, &ctx);
+        // A job a rerun made again starts over, as the first one did.
+        for id in &again {
+            self.clear_job(run, *id).await?;
+        }
+        for work in again_work(&again, attempt) {
+            run.todo_mut().push(work);
+        }
         for id in &ids {
             run.outbox_mut().mark(*id);
         }
@@ -1169,6 +1157,17 @@ impl<'a> Cx<'a> {
             store::set_needs(db, id, &needs, now).await?;
         }
         Ok(actions)
+    }
+
+    /// Clears what an earlier attempt left of job `id` in the object: its
+    /// state and log, and the check run's backoff. The work on its row
+    /// is [`left_out_work`] and [`again_work`].
+    async fn clear_job(&self, run: &mut Loaded, id: u64) -> Result<()> {
+        self.put_job(id, &JobState::default()).await?;
+        self.delete_prefix(&log_prefix(id)).await?;
+        self.storage.delete_multiple(log_keys(id)).await?;
+        run.outbox_mut().reset(id);
+        Ok(())
     }
 
     /// Turns what the graph decided into storage changes now and side
@@ -1192,6 +1191,16 @@ impl<'a> Cx<'a> {
                     });
                 }
                 Action::Finished { job, conclusion } => {
+                    // A job a rerun left out of its matrix ends as skipped
+                    // for this attempt on a row that is reset and marked,
+                    // so the run's list and counts leave it out.
+                    let left_out = left_out_work(&run.graph, job);
+                    if !left_out.is_empty() {
+                        self.clear_job(run, job).await?;
+                        for work in left_out {
+                            run.todo_mut().push(work);
+                        }
+                    }
                     let mut state = self.job_state(job).await?;
                     state.completed_at = Some(self.now);
                     let steps = steps_json(&state.steps);
@@ -1302,6 +1311,28 @@ impl<'a> Cx<'a> {
         answer(204)
     }
 
+    /// The `inputs` of a job that runs in a called workflow, or the
+    /// message that says why they cannot be read. `None` for a job of
+    /// the workflow that was started.
+    async fn call_inputs(
+        &self,
+        run: &Loaded,
+        job: u64,
+    ) -> Result<std::result::Result<Option<Value>, String>> {
+        if run.graph.node(job).is_none_or(|n| n.job.scope.is_empty()) {
+            return Ok(Ok(None));
+        }
+        let ctx = self.github_ctx(&run.info).await?;
+        let vars = store::job_vars(
+            self.db().await?,
+            &run.info.tenant_id,
+            run.info.repo.id,
+            None,
+        )
+        .await?;
+        Ok(run.graph.call_inputs(job, &ctx, &vars))
+    }
+
     async fn claim(
         &self,
         job: u64,
@@ -1309,13 +1340,36 @@ impl<'a> Cx<'a> {
         token: String,
         capped: Vec<Capped>,
     ) -> Result<Response> {
-        let first = {
+        // The inputs a job of a called workflow reads are made before the
+        // job moves: one that cannot be read ends the job as failed, with
+        // the message, and is never left running.
+        let (first, inputs, failed) = {
             let _turn = self.turn.lock().await;
-            let Some(run) = self.loaded().await? else {
+            let Some(mut run) = self.loaded().await? else {
                 return answer(409);
             };
-            gate(run.graph.node(job), attempt)
+            let first = gate(run.graph.node(job), attempt);
+            let mut inputs = None;
+            let mut failed = None;
+            if matches!(first, Gate::Queued | Gate::Running) {
+                match self.call_inputs(&run, job).await? {
+                    Ok(found) => inputs = found,
+                    Err(message) => {
+                        let ctx = self.github_ctx(&run.info).await?;
+                        self.load_vars(&mut run, job).await?;
+                        let actions = run.graph_mut().failed(job, message, &ctx);
+                        let revoke = self.apply_actions(&mut run, actions).await?;
+                        self.commit(&mut run).await?;
+                        failed = Some(revoke);
+                    }
+                }
+            }
+            (first, inputs, failed)
         };
+        if let Some(revoke) = failed {
+            self.after(revoke).await;
+            return answer(409);
+        }
         match first {
             Gate::Missing => return Response::error("no such job", 404),
             Gate::Stale | Gate::Ended => return answer(409),
@@ -1367,6 +1421,7 @@ impl<'a> Cx<'a> {
                 job,
                 &token,
                 &self.settings.github_api,
+                inputs,
             )
             .ok_or_else(|| fail("job vanished"))?;
             self.commit(&mut run).await?;
@@ -1523,6 +1578,9 @@ impl<'a> Cx<'a> {
                 return answer(409);
             }
             let ctx = self.github_ctx(&run.info).await?;
+            if let Some(first) = run.graph.jobs.first().map(|n| n.id) {
+                self.load_vars(&mut run, first).await?;
+            }
             let actions = match (job, &body.message) {
                 (Some(job), message) => {
                     let Some(attempt) = attempt else {
@@ -1564,6 +1622,10 @@ impl<'a> Cx<'a> {
             let Some(mut run) = self.loaded().await? else {
                 return answer(404);
             };
+            // A job a rerun left out of its matrix is no part of the run.
+            if run.graph.node(job).is_some_and(|n| n.stale) {
+                return answer(409);
+            }
             let ctx = self.github_ctx(&run.info).await?;
             let before = attempts(&run.graph);
             self.load_vars(&mut run, job).await?;
@@ -1571,6 +1633,14 @@ impl<'a> Cx<'a> {
             let reset = reset_jobs(&before, &run.graph);
             if reset.is_empty() {
                 return answer(204);
+            }
+            // The jobs a matrix was read into leave the graph when their
+            // producer runs again: a log of theirs that is not in R2 yet
+            // would be lost.
+            for (id, _) in &before {
+                if run.graph.node(*id).is_none() && self.job_state(*id).await?.upload_pending {
+                    return answer(409);
+                }
             }
             for (id, _) in &reset {
                 if self.job_state(*id).await?.upload_pending {

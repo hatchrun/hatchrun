@@ -555,33 +555,6 @@ jobs:
 }
 
 #[test]
-fn reusable_workflow_calls_are_dropped_with_their_dependents() {
-    let out = ok("
-on: push
-jobs:
-  call:
-    uses: org/repo/.github/workflows/build.yml@main
-    with:
-      target: x
-    secrets: inherit
-  after:
-    needs: [call]
-    runs-on: ubuntu-latest
-    steps: [{ run: x }]
-  lint:
-    runs-on: ubuntu-latest
-    steps: [{ run: x }]
-");
-    assert!(has(&out.warnings, &["ci.yml", "call", "reusable"]));
-    assert!(!out.config.jobs.contains_key("ci-call"));
-    assert!(!out.config.jobs.contains_key("ci-after"));
-    let wf = &out.config.workflows["ci"];
-    assert_eq!(wf.jobs.len(), 1);
-    assert_eq!(wf.jobs[0].job, "ci-lint");
-    round_trips(&out);
-}
-
-#[test]
 fn steps_copy_across() {
     let out = ok(r#"
 on: push
@@ -1040,35 +1013,6 @@ fn file_stems_ignore_extension_case_and_must_not_be_empty() {
     assert!(out.config.workflows.contains_key("deploy"));
     let errs = one(".github/workflows/.yml", "on: push\njobs: {}\n").unwrap_err();
     assert!(has(&errs, &[".yml", "name"]), "{errs:?}");
-}
-
-#[test]
-fn dependents_of_a_dropped_reusable_job_are_dropped() {
-    let out = ok("
-on: push
-jobs:
-  call:
-    uses: org/repo/.github/workflows/build.yml@main
-  after:
-    needs: call
-    runs-on: ubuntu-latest
-    steps: [{ run: x }]
-");
-    assert!(
-        has(
-            &out.warnings,
-            &[
-                "ci.yml",
-                "`after` was dropped",
-                "needs `call`, which calls a reusable workflow"
-            ]
-        ),
-        "{:?}",
-        out.warnings
-    );
-    assert_eq!(out.config.jobs.len(), 0);
-    assert_eq!(out.config.workflows["ci"].jobs, Vec::new());
-    round_trips(&out);
 }
 
 #[test]
@@ -2037,24 +1981,6 @@ jobs:
 }
 
 #[test]
-fn reusable_workflow_files_are_dropped() {
-    let out = ok("
-on:
-  workflow_call:
-    inputs:
-      target: { type: string }
-jobs:
-  build: { runs-on: ubuntu-latest, steps: [{ run: x }] }
-");
-    assert!(has(
-        &out.warnings,
-        &["ci.yml", "reusable workflow", "workflow_call"]
-    ));
-    assert!(out.config.workflows.is_empty());
-    assert!(out.config.jobs.is_empty());
-}
-
-#[test]
 fn a_workflow_whose_events_all_fail_is_dropped() {
     let out = one(
         "ci.yml",
@@ -2260,512 +2186,6 @@ fn checkout_stays_a_uses_step_at_its_ref() {
     round_trips(&out);
 }
 
-const BUILD: &str = "
-on:
-  workflow_call:
-    inputs:
-      target: { type: string, required: true }
-      fast: { type: boolean, default: false }
-    outputs:
-      artifact: { value: '${{ jobs.pack.outputs.name }}' }
-    secrets:
-      TOKEN: { required: true }
-jobs:
-  compile:
-    runs-on: ubuntu-latest
-    steps:
-      - run: make ${{ inputs.target }}
-        env:
-          T: ${{ secrets.TOKEN }}
-  pack:
-    needs: compile
-    runs-on: ubuntu-latest
-    outputs:
-      name: ${{ steps.n.outputs.name }}
-    steps:
-      - id: n
-        run: echo name=x >> $GITHUB_OUTPUT
-";
-
-const CALLER: &str = "
-on: push
-jobs:
-  setup: { runs-on: ubuntu-latest, steps: [{ run: x }] }
-  build:
-    needs: setup
-    if: github.ref == 'refs/heads/main'
-    uses: ./.github/workflows/build.yml
-    with:
-      target: web
-    secrets:
-      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
-  ship:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo ${{ needs.build.outputs.artifact }}
-";
-
-#[test]
-fn a_local_reusable_workflow_is_inlined() {
-    let out = many(&[
-        (".github/workflows/ci.yml", CALLER),
-        (".github/workflows/build.yml", BUILD),
-    ]);
-    assert!(out.errors.is_empty(), "{:?}", out.errors);
-    assert!(
-        !out.warnings.iter().any(|w| w.message.contains("dropped")),
-        "{:?}",
-        out.warnings
-    );
-    let compile = &out.config.jobs["ci-build-compile"];
-    let Step::Run(run) = &compile.steps[0] else {
-        panic!()
-    };
-    assert_eq!(run.run, "make ${{ parameters.target }}");
-    assert_eq!(run.env["T"], "${{ secrets.DEPLOY_TOKEN }}");
-    assert_eq!(compile.parameters["target"].kind, ParameterKind::String);
-    assert_eq!(compile.parameters["fast"].default, Some(json!(false)));
-    assert_eq!(
-        compile.if_.as_deref(),
-        Some("github.ref == 'refs/heads/main'")
-    );
-    let wf = &out.config.workflows["ci"];
-    let entry = |job: &str| wf.jobs.iter().find(|j| j.job == job).unwrap();
-    assert_eq!(entry("ci-build-compile").with["target"], json!("web"));
-    assert_eq!(
-        entry("ci-build-compile").requires,
-        vec![Require::new("setup")]
-    );
-    assert_eq!(
-        entry("ci-build-pack").requires,
-        vec![Require::new("ci-build-compile")]
-    );
-    // A job that needs the caller requires the leaf, which the outputs read.
-    assert_eq!(
-        entry("ci-ship").requires,
-        vec![Require::new("ci-build-pack")]
-    );
-    let Step::Run(run) = &out.config.jobs["ci-ship"].steps[0] else {
-        panic!()
-    };
-    assert_eq!(run.run, "echo ${{ needs.ci-build-pack.outputs.name }}");
-    assert!(
-        !out.warnings
-            .iter()
-            .any(|w| w.message.contains("workflow_call"))
-    );
-    assert!(!out.config.workflows.contains_key("build"));
-    round_trips(&out);
-}
-
-#[test]
-fn a_reusable_workflow_file_nobody_calls_keeps_its_warning() {
-    let ci = "on: push\njobs:\n  a: { runs-on: ubuntu-latest, steps: [{ run: x }] }";
-    let out = many(&[(".github/workflows/ci.yml", ci), ("build.yml", BUILD)]);
-    assert!(has(
-        &out.warnings,
-        &["build.yml", "reusable workflow", "workflow_call"]
-    ));
-}
-
-#[test]
-fn forgejo_paths_secrets_and_missing_files() {
-    let ci = "
-on: push
-jobs:
-  a:
-    uses: ./.forgejo/workflows/build.yml
-    with: { target: x }
-    secrets: inherit
-  b:
-    uses: ./.github/workflows/missing.yml
-  c:
-    needs: b
-    runs-on: ubuntu-latest
-    steps: [{ run: x }]
-";
-    let out = many(&[("ci.yml", ci), ("build.yml", BUILD)]);
-    let compile = &out.config.jobs["ci-a-compile"];
-    let Step::Run(run) = &compile.steps[0] else {
-        panic!()
-    };
-    assert_eq!(run.env["T"], "${{ secrets.TOKEN }}");
-    assert!(has(
-        &out.warnings,
-        &["ci.yml", "job `b`", "missing.yml", "dropped"]
-    ));
-    assert!(!out.config.jobs.contains_key("ci-c"));
-    // Nothing is left unpassed with inherit; without it there is a warning.
-    assert!(!has(&out.warnings, &["declares secret"]));
-    let ci = ci.replace("secrets: inherit", "");
-    let out = many(&[("ci.yml", &ci), ("build.yml", BUILD)]);
-    assert!(has(
-        &out.warnings,
-        &["declares secret `TOKEN`", "does not pass"]
-    ));
-}
-
-const READS: &str = "
-on:
-  workflow_call:
-    secrets:
-      PASSED: { required: false }
-jobs:
-  use:
-    runs-on: ubuntu-latest
-    steps:
-      - if: secrets.DEPLOY_KEY != ''
-        run: echo deploy
-      - run: echo
-        env:
-          P: ${{ secrets.PASSED }}
-          K: ${{ secrets.DEPLOY_KEY }}
-          G: ${{ secrets.GITHUB_TOKEN }}
-";
-
-fn reads_call(with: &str) -> Conversion {
-    reads_call_of(READS, with)
-}
-
-/// [`READS`] with every read written as a literal bracket index.
-fn bracket_reads() -> String {
-    READS
-        .replace("secrets.DEPLOY_KEY", "secrets['DEPLOY_KEY']")
-        .replace("secrets.PASSED", "secrets[ 'PASSED' ]")
-        .replace("secrets.GITHUB_TOKEN", "secrets['GITHUB_TOKEN']")
-}
-
-fn reads_call_of(reads: &str, with: &str) -> Conversion {
-    let ci = format!(
-        "
-on: push
-jobs:
-  a:
-    uses: ./.github/workflows/reads.yml
-{with}
-"
-    );
-    many(&[("ci.yml", &ci), ("reads.yml", reads)])
-}
-
-fn reads(out: &Conversion) -> (Option<String>, BTreeMap<String, String>) {
-    let job = &out.config.jobs["ci-a-use"];
-    let Step::Run(first) = &job.steps[0] else {
-        panic!()
-    };
-    let Step::Run(second) = &job.steps[1] else {
-        panic!()
-    };
-    (first.if_.clone(), second.env.clone())
-}
-
-#[test]
-fn secrets_the_call_leaves_out_read_as_empty() {
-    for with in ["", "    secrets: { OTHER: x }"] {
-        let out = reads_call(with);
-        assert!(out.errors.is_empty(), "{:?}", out.errors);
-        let (cond, env) = reads(&out);
-        assert_eq!(cond.as_deref(), Some("'' != ''"));
-        assert_eq!(env["K"], "${{ '' }}");
-        assert_eq!(env["P"], "${{ '' }}");
-        assert_eq!(env["G"], "${{ secrets.GITHUB_TOKEN }}");
-    }
-}
-
-#[test]
-fn a_passed_secret_is_renamed_and_the_rest_are_empty() {
-    let out = reads_call("    secrets: { PASSED: '${{ secrets.REAL }}' }");
-    let (cond, env) = reads(&out);
-    assert_eq!(cond.as_deref(), Some("'' != ''"));
-    assert_eq!(env["P"], "${{ secrets.REAL }}");
-    assert_eq!(env["K"], "${{ '' }}");
-    assert_eq!(env["G"], "${{ secrets.GITHUB_TOKEN }}");
-}
-
-#[test]
-fn bracket_secret_reads_follow_the_dotted_ones() {
-    let source = bracket_reads();
-    for with in ["", "    secrets: { OTHER: x }"] {
-        let out = reads_call_of(&source, with);
-        let (cond, env) = reads(&out);
-        assert_eq!(cond.as_deref(), Some("'' != ''"));
-        assert_eq!(env["K"], "${{ '' }}");
-        assert_eq!(env["P"], "${{ '' }}");
-        assert_eq!(env["G"], "${{ secrets['GITHUB_TOKEN'] }}");
-    }
-    let out = reads_call_of(&source, "    secrets: { PASSED: '${{ secrets.REAL }}' }");
-    let (cond, env) = reads(&out);
-    assert_eq!(cond.as_deref(), Some("'' != ''"));
-    assert_eq!(env["P"], "${{ secrets.REAL }}");
-    assert_eq!(env["K"], "${{ '' }}");
-    assert_eq!(env["G"], "${{ secrets['GITHUB_TOKEN'] }}");
-}
-
-#[test]
-fn inherit_leaves_bracket_secret_reads_alone() {
-    let out = reads_call_of(&bracket_reads(), "    secrets: inherit");
-    let (cond, env) = reads(&out);
-    assert_eq!(cond.as_deref(), Some("secrets['DEPLOY_KEY'] != ''"));
-    assert_eq!(env["K"], "${{ secrets['DEPLOY_KEY'] }}");
-    assert_eq!(env["P"], "${{ secrets[ 'PASSED' ] }}");
-}
-
-#[test]
-fn inherit_leaves_secret_reads_alone() {
-    let out = reads_call("    secrets: inherit");
-    let (cond, env) = reads(&out);
-    assert_eq!(cond.as_deref(), Some("secrets.DEPLOY_KEY != ''"));
-    assert_eq!(env["K"], "${{ secrets.DEPLOY_KEY }}");
-    assert_eq!(env["P"], "${{ secrets.PASSED }}");
-    assert!(!has(&out.warnings, &["whole `secrets` context"]));
-}
-
-#[test]
-fn the_whole_secrets_context_without_inherit_warns() {
-    let reads = READS.replace("echo deploy", "echo ${{ toJSON(secrets) }}");
-    let ci = "on: push\njobs:\n  a:\n    uses: ./.github/workflows/reads.yml\n";
-    let out = many(&[("ci.yml", ci), ("reads.yml", &reads)]);
-    assert!(has(&out.warnings, &["whole `secrets` context", "inherit"]));
-}
-
-#[test]
-fn remote_calls_name_the_callee() {
-    let out = ok("
-on: push
-jobs:
-  lint:
-    uses: acme/shared/.github/workflows/lint.yml@v3
-");
-    assert!(has(
-        &out.warnings,
-        &["lint.yml", "another repository", "copy"]
-    ));
-}
-
-#[test]
-fn a_matrix_on_a_caller_is_dropped() {
-    let ci = "
-on: push
-jobs:
-  a:
-    strategy: { matrix: { x: [1, 2] } }
-    uses: ./.github/workflows/build.yml
-    with: { target: x }
-";
-    let out = many(&[("ci.yml", ci), ("build.yml", BUILD)]);
-    assert!(has(&out.warnings, &["strategy", "not supported"]));
-    assert_eq!(out.config.workflows["ci"].jobs.len(), 2);
-}
-
-#[test]
-fn a_missing_required_input_is_an_error() {
-    let ci = "
-on: push
-jobs:
-  a:
-    uses: ./.github/workflows/build.yml
-  b: { runs-on: ubuntu-latest, steps: [{ run: x }] }
-";
-    let out = many(&[("ci.yml", ci), ("build.yml", BUILD)]);
-    assert!(has(&out.errors, &["input `target`", "required"]));
-    assert!(!out.config.jobs.contains_key("ci-a-compile"));
-}
-
-#[test]
-fn calls_nest_and_cycles_are_errors() {
-    let leaf = "
-on:
-  workflow_call:
-    inputs:
-      v: { type: string }
-jobs:
-  j: { runs-on: ubuntu-latest, steps: [{ run: 'echo ${{ inputs.v }}' }] }
-";
-    let mid = "
-on:
-  workflow_call:
-    inputs:
-      w: { type: string }
-jobs:
-  m:
-    uses: ./.github/workflows/leaf.yml
-    with: { v: '${{ inputs.w }}-x' }
-";
-    let ci = "
-on: push
-jobs:
-  top:
-    uses: ./.github/workflows/mid.yml
-    with: { w: hi }
-  after:
-    needs: top
-    runs-on: ubuntu-latest
-    steps: [{ run: x }]
-";
-    let out = many(&[("ci.yml", ci), ("mid.yml", mid), ("leaf.yml", leaf)]);
-    assert!(out.errors.is_empty(), "{:?}", out.errors);
-    let job = &out.config.jobs["ci-top-m-j"];
-    let wf = &out.config.workflows["ci"];
-    let e = wf.jobs.iter().find(|j| j.job == "ci-top-m-j").unwrap();
-    assert_eq!(e.with["v"], json!("${{ 'hi' }}-x"));
-    assert!(job.parameters.contains_key("v"));
-    let after = wf.jobs.iter().find(|j| j.job == "ci-after").unwrap();
-    assert_eq!(after.requires, vec![Require::new("ci-top-m-j")]);
-    round_trips(&out);
-
-    let a = "on:\n  workflow_call:\njobs:\n  x:\n    uses: ./.github/workflows/b.yml\n";
-    let b = "on:\n  workflow_call:\njobs:\n  y:\n    uses: ./.github/workflows/a.yml\n";
-    let ci = "on: push\njobs:\n  z:\n    uses: ./.github/workflows/a.yml\n  k: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n";
-    let out = many(&[("ci.yml", ci), ("a.yml", a), ("b.yml", b)]);
-    assert!(has(&out.errors, &["cycle"]));
-    assert!(!out.config.jobs.keys().any(|k| k.starts_with("ci-z")));
-}
-
-const FLAGGED: &str = "
-on:
-  workflow_call:
-    inputs:
-      prerelease: { type: boolean, default: false }
-      tag: { type: string, default: '' }
-jobs:
-  notify:
-    if: ${{ !inputs.prerelease }}
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo ${{ inputs.tag }}
-      - if: inputs.tag != '' && !inputs.prerelease
-        run: echo ${{ inputs.tag || github.ref }}
-";
-
-#[test]
-fn inputs_inside_an_expression_become_the_literal_the_call_gives() {
-    let ci = "
-on: push
-jobs:
-  a:
-    uses: ./.github/workflows/flagged.yml
-    with: { prerelease: true, tag: v1 }
-";
-    let out = many(&[("ci.yml", ci), ("flagged.yml", FLAGGED)]);
-    assert!(out.errors.is_empty(), "{:?}", out.errors);
-    let job = &out.config.jobs["ci-a-notify"];
-    assert_eq!(job.if_.as_deref(), Some("${{ !true }}"));
-    let Step::Run(first) = &job.steps[0] else {
-        panic!()
-    };
-    assert_eq!(first.run, "echo ${{ parameters.tag }}");
-    let Step::Run(second) = &job.steps[1] else {
-        panic!()
-    };
-    assert_eq!(second.if_.as_deref(), Some("'v1' != '' && !true"));
-    assert_eq!(second.run, "echo ${{ 'v1' || github.ref }}");
-    round_trips(&out);
-}
-
-#[test]
-fn an_input_inside_an_expression_with_no_literal_drops_the_job() {
-    let ci = "
-on: push
-jobs:
-  pre:
-    runs-on: ubuntu-latest
-    outputs: { tag: x }
-    steps: [{ run: x }]
-  a:
-    needs: pre
-    uses: ./.github/workflows/flagged.yml
-    with: { prerelease: '${{ needs.pre.outputs.tag }}' }
-  b: { runs-on: ubuntu-latest, steps: [{ run: x }] }
-";
-    let out = many(&[("ci.yml", ci), ("flagged.yml", FLAGGED)]);
-    assert!(
-        has(
-            &out.errors,
-            &["`inputs.prerelease`", "inside an expression"]
-        ),
-        "{:?}",
-        out.errors
-    );
-    assert!(!out.config.jobs.contains_key("ci-a-notify"));
-    assert!(out.config.jobs.contains_key("ci-b"));
-    round_trips(&out);
-}
-
-#[test]
-fn an_input_named_like_an_entry_key_drops_the_call() {
-    let named = "
-on:
-  workflow_call:
-    inputs:
-      name: { type: string, default: x }
-jobs:
-  build: { runs-on: ubuntu-latest, steps: [{ run: 'echo ${{ inputs.name }}' }] }
-";
-    let ci = "
-on: push
-jobs:
-  a:
-    uses: ./.github/workflows/named.yml
-    with: { name: y }
-  b: { runs-on: ubuntu-latest, steps: [{ run: x }] }
-";
-    let out = many(&[("ci.yml", ci), ("named.yml", named)]);
-    assert!(
-        has(&out.errors, &["input `name`", "entry reads as its own key"])
-            || has(&out.errors, &["input `name`", "its own key"]),
-        "{:?}",
-        out.errors
-    );
-    assert!(!out.config.jobs.contains_key("ci-a-build"));
-    round_trips(&out);
-}
-
-#[test]
-fn a_call_condition_combines_with_a_called_job_condition_that_reads_an_input() {
-    let gated = "
-on:
-  workflow_call:
-    inputs:
-      affected: { type: boolean, default: false }
-jobs:
-  test:
-    if: ${{ inputs.affected }}
-    runs-on: ubuntu-latest
-    steps: [{ run: x }]
-";
-    let ci = "
-on: push
-jobs:
-  pre:
-    runs-on: ubuntu-latest
-    outputs: { hit: x }
-    steps: [{ run: x }]
-  lit:
-    needs: pre
-    if: always()
-    uses: ./.github/workflows/gated.yml
-    with: { affected: true }
-  dyn:
-    needs: pre
-    if: always()
-    uses: ./.github/workflows/gated.yml
-    with: { affected: '${{ needs.pre.outputs.hit }}' }
-";
-    let out = many(&[("ci.yml", ci), ("gated.yml", gated)]);
-    assert!(out.errors.is_empty(), "{:?}", out.errors);
-    assert_eq!(
-        out.config.jobs["ci-lit-test"].if_.as_deref(),
-        Some("(always()) && (true)")
-    );
-    assert_eq!(
-        out.config.jobs["ci-dyn-test"].if_.as_deref(),
-        Some("${{ parameters.affected }}")
-    );
-    assert!(has(&out.warnings, &["could not be combined"]));
-    round_trips(&out);
-}
-
 #[test]
 fn fail_fast_and_max_parallel_become_the_entry_strategy() {
     let out = ok("
@@ -2968,10 +2388,11 @@ jobs:
         jobs["ci-a"].runs_on.as_deref(),
         Some("${{ inputs.runner }}")
     );
-    // The label it spells is brought to a template label.
+    // The text stays as written: the label it reads is brought to a
+    // template when the job is ready, so a comparison reads it unchanged.
     assert_eq!(
         jobs["ci-b"].runs_on.as_deref(),
-        Some("${{ github.event_name == 'push' && 'ubuntu-latest' || 'ubuntu-latest' }}")
+        Some("${{ github.event_name == 'push' && 'ubuntu-24.04' || 'ubuntu-latest' }}")
     );
     assert_eq!(jobs["ci-c"].runs_on.as_deref(), Some("${{ matrix.os }}"));
     assert!(has(&out.warnings, &["`runs-on: ubuntu-24.04` became"]));
@@ -2995,6 +2416,294 @@ jobs:
         out.errors
     );
     assert_eq!(out.config.jobs.keys().collect::<Vec<_>>(), ["ci-b"]);
+}
+
+const DOCKER_BUILD: &str = include_str!("fixtures/github/docker-build.yml");
+const RELEASE: &str = include_str!("fixtures/github/release.yml");
+
+const REUSABLE_JOB: &str =
+    "on: workflow_call\njobs:\n  j: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n";
+
+fn release() -> Conversion {
+    many(&[("release.yml", RELEASE), ("docker-build.yml", DOCKER_BUILD)])
+}
+
+fn entry<'a>(out: &'a Conversion, workflow: &str, id: &str) -> &'a hatchrun_workflow::WorkflowJob {
+    out.config.workflows[workflow]
+        .jobs
+        .iter()
+        .find(|j| j.name.as_deref().unwrap_or(&j.job) == id)
+        .unwrap_or_else(|| panic!("no entry {id}"))
+}
+
+#[test]
+fn a_reusable_workflow_file_becomes_a_workflow_with_on_call() {
+    let out = release();
+    assert_eq!(out.errors, Vec::new());
+    let build = &out.config.workflows["docker-build"];
+    let call = build.on.call.as_ref().expect("on: call");
+    assert_eq!(call.inputs.len(), 5);
+    assert!(call.inputs["image"].required);
+    assert_eq!(call.inputs["push"].default, Some(json!(false)));
+    assert_eq!(call.inputs["replicas"].default, Some(json!(2)));
+    assert!(call.secrets.contains_key("REGISTRY_TOKEN"));
+    assert_eq!(call.outputs["digest"], "${{ jobs.build.outputs.digest }}");
+    // The jobs of the file convert like any other, with its runtime
+    // `runs-on` and matrix kept.
+    let job = &out.config.jobs["docker-build-build"];
+    assert_eq!(job.runs_on.as_deref(), Some("${{ inputs.runner }}"));
+    let build = entry(&out, "docker-build", "build");
+    assert!(build.matrix.dynamic());
+    round_trips(&out);
+}
+
+#[test]
+fn a_local_call_becomes_a_call_entry_with_its_matrix_inputs_and_secrets() {
+    let out = release();
+    let images = entry(&out, "release", "images");
+    assert_eq!(images.call.as_deref(), Some("docker-build"));
+    assert_eq!(images.requires, [Require::new("test")]);
+    assert_eq!(
+        images.matrix.values["image"],
+        [json!("api"), json!("worker")]
+    );
+    assert_eq!(images.with["image"], "${{ matrix.image }}");
+    assert_eq!(images.with["push"], true);
+    assert_eq!(images.with["replicas"], 3);
+    assert_eq!(
+        images.secrets,
+        hatchrun_workflow::SecretsPassed::Named(BTreeMap::from([(
+            "REGISTRY_TOKEN".to_owned(),
+            "${{ secrets.GHCR_TOKEN }}".to_owned()
+        )]))
+    );
+    let announce = entry(&out, "release", "announce");
+    assert_eq!(
+        announce.requires,
+        [Require::new("images"), Require::new("shared")]
+    );
+}
+
+#[test]
+fn a_remote_call_keeps_its_ref_and_what_the_job_passes() {
+    let out = release();
+    let shared = entry(&out, "release", "shared");
+    assert_eq!(
+        shared.call.as_deref(),
+        Some("acme/shared-workflows/.github/workflows/scan.yml@v2")
+    );
+    assert_eq!(shared.secrets, hatchrun_workflow::SecretsPassed::Inherit);
+    let Some(Permissions::Scopes(scopes)) = &shared.permissions else {
+        panic!("no permissions");
+    };
+    assert_eq!(scopes["security-events"], Level::Write);
+}
+
+#[test]
+fn a_converted_call_plans_with_the_callee_jobs_under_the_call() {
+    let out = release();
+    assert!(
+        out.warnings.iter().all(|w| !w.message.contains("dropped")),
+        "{:?}",
+        out.warnings
+    );
+    let mut library = hatchrun_workflow::Library::default();
+    let wanted = hatchrun_workflow::remote_calls(&out.config, &library);
+    assert_eq!(wanted.len(), 1);
+    assert_eq!(wanted[0].repository(), "acme/shared-workflows");
+    // The remote file is another converted workflow.
+    let scan = many(&[("scan.yml", REUSABLE_JOB)]);
+    library.insert(
+        wanted[0].clone(),
+        hatchrun_workflow::Callee {
+            config: scan.config,
+            workflow: "scan".into(),
+            sha: "0123abc".into(),
+        },
+    );
+    let plan = hatchrun_workflow::compile_with(&out.config, "release", "refs/tags/v1", &library)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let ids: Vec<&str> = plan.jobs.iter().map(|j| j.id.as_str()).collect();
+    assert!(ids.contains(&"images (api) / build"), "{ids:?}");
+    assert!(ids.contains(&"images (worker) / sign"), "{ids:?}");
+    assert!(ids.contains(&"shared / j"), "{ids:?}");
+    assert!(ids.contains(&"announce"), "{ids:?}");
+    let build = plan
+        .jobs
+        .iter()
+        .find(|j| j.id == "images (api) / build")
+        .unwrap();
+    // The runtime matrix and `runs-on` inside the call wait to be read.
+    assert!(build.deferred.is_some());
+}
+
+#[test]
+fn a_call_of_a_file_that_was_not_given_is_dropped_with_its_dependents() {
+    let out = many(&[(
+        "ci.yml",
+        "
+on: push
+jobs:
+  call:
+    uses: ./.github/workflows/missing.yml
+  after:
+    needs: call
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+  other:
+    runs-on: ubuntu-latest
+    steps: [{ run: y }]
+",
+    )]);
+    let ids: Vec<&str> = out.config.workflows["ci"]
+        .jobs
+        .iter()
+        .map(|j| j.name.as_deref().unwrap_or(&j.job))
+        .collect();
+    assert_eq!(ids, ["other"]);
+    assert!(has(
+        &out.warnings,
+        &["missing.yml", "not among the converted files"]
+    ));
+    assert!(has(
+        &out.warnings,
+        &["`after` was dropped", "calls a reusable workflow"]
+    ));
+}
+
+#[test]
+fn a_matrix_read_at_run_time_on_a_call_is_dropped() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "
+on: push
+jobs:
+  setup: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+  c:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.m) }}
+    uses: ./.github/workflows/w.yml
+",
+        ),
+        ("w.yml", REUSABLE_JOB),
+    ]);
+    assert!(has(&out.warnings, &["matrix that is read at run time"]));
+    assert!(
+        out.config.workflows["ci"]
+            .jobs
+            .iter()
+            .all(|j| j.call.is_none())
+    );
+}
+
+#[test]
+fn strategy_options_and_concurrency_on_a_call_are_warned_about() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "
+on: push
+jobs:
+  c:
+    strategy: { fail-fast: false, matrix: { n: [1, 2] } }
+    concurrency: { group: g }
+    uses: ./.github/workflows/w.yml
+",
+        ),
+        ("w.yml", REUSABLE_JOB),
+    ]);
+    assert!(has(&out.warnings, &["`strategy.fail-fast`"]));
+    assert!(has(&out.warnings, &["`concurrency`"]));
+    assert_eq!(entry(&out, "ci", "c").matrix.values["n"].len(), 2);
+    round_trips(&out);
+}
+
+#[test]
+fn a_secret_that_is_not_a_whole_reference_is_dropped_from_the_call() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "
+on: push
+jobs:
+  c:
+    uses: ./.github/workflows/w.yml
+    secrets:
+      A: ${{ secrets.A }}
+      B: literal
+      C: ${{ secrets.X || secrets.Y }}
+",
+        ),
+        ("w.yml", REUSABLE_JOB),
+    ]);
+    assert_eq!(
+        entry(&out, "ci", "c").secrets,
+        hatchrun_workflow::SecretsPassed::Named(BTreeMap::from([(
+            "A".to_owned(),
+            "${{ secrets.A }}".to_owned()
+        )]))
+    );
+    assert!(has(&out.warnings, &["`secrets.B`", "not one whole"]));
+    assert!(has(&out.warnings, &["`secrets.C`"]));
+}
+
+#[test]
+fn a_call_that_reads_a_context_a_call_does_not_have_is_an_error() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "
+on: push
+jobs:
+  c:
+    if: ${{ steps.x.outputs.y }}
+    uses: ./.github/workflows/w.yml
+    with: { a: '${{ secrets.TOKEN }}' }
+  ok:
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+",
+        ),
+        ("w.yml", REUSABLE_JOB),
+    ]);
+    assert!(has(&out.errors, &["`if`", "steps"]), "{:?}", out.errors);
+    assert!(
+        has(&out.errors, &["`with.a`", "secrets"]),
+        "{:?}",
+        out.errors
+    );
+}
+
+#[test]
+fn an_output_that_reads_more_than_jobs_is_dropped_with_a_warning() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    uses: ./.github/workflows/w.yml\n",
+        ),
+        (
+            "w.yml",
+            "
+on:
+  workflow_call:
+    outputs:
+      good: { value: '${{ jobs.j.outputs.x }}' }
+      bad: { value: '${{ github.sha }}' }
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    outputs: { x: '1' }
+    steps: [{ run: x }]
+",
+        ),
+    ]);
+    let call = out.config.workflows["w"].on.call.as_ref().unwrap();
+    assert!(call.outputs.contains_key("good"));
+    assert!(!call.outputs.contains_key("bad"));
+    assert!(has(&out.warnings, &["output `bad`", "reads `github`"]));
 }
 
 #[test]
@@ -3111,6 +2820,248 @@ fn the_deploy_fixture_converts_without_losing_a_capability() {
 }
 
 #[test]
+fn a_comparison_in_a_runs_on_expression_keeps_its_operand() {
+    let out = ok("on: push
+jobs:
+  a:
+    runs-on: ${{ inputs.runner == 'ubuntu-24.04' && 'ubuntu-26.04-arm' || 'ubuntu-latest' }}
+    steps: [{ run: x }]
+");
+    assert_eq!(
+        out.config.jobs["ci-a"].runs_on.as_deref(),
+        Some("${{ inputs.runner == 'ubuntu-24.04' && 'ubuntu-26.04-arm' || 'ubuntu-latest' }}")
+    );
+}
+
+#[test]
+fn a_calls_job_split_by_include_reads_its_outputs_from_every_entry() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    uses: ./.github/workflows/w.yml\n  after:\n    needs: c\n    runs-on: ubuntu-latest\n    steps: [{ run: 'echo ${{ needs.c.outputs.tag }}' }]\n",
+        ),
+        (
+            "w.yml",
+            "
+on:
+  workflow_call:
+    outputs:
+      tag: { value: '${{ jobs.build.outputs.tag }}' }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        include:
+          - { os: ubuntu-latest, extra: 1 }
+          - { os: ubuntu-26.04-arm, extra: 2 }
+    outputs: { tag: x }
+    steps: [{ run: x }]
+",
+        ),
+    ]);
+    let tag = &out.config.workflows["w"].on.call.as_ref().unwrap().outputs["tag"];
+    assert!(
+        tag.contains("(jobs.build-2.outputs.tag || jobs.build.outputs.tag)"),
+        "{tag}"
+    );
+    // The caller reads the last entry that has a value, as the outputs
+    // of a matrix merge.
+    let read = |first: &str, second: &str| {
+        let ctx = json!({ "jobs": {
+            "build": { "outputs": { "tag": first } },
+            "build-2": { "outputs": { "tag": second } },
+        } });
+        hatchrun_workflow::interpolate(tag, &ctx, &Offline).unwrap()
+    };
+    assert_eq!(read("", "v2"), "v2");
+    assert_eq!(read("v1", ""), "v1");
+    assert_eq!(read("v1", "v2"), "v2");
+}
+
+struct Offline;
+
+impl hatchrun_workflow::Functions for Offline {
+    fn hash_files(&self, _patterns: &[String]) -> Result<String, hatchrun_workflow::ExprError> {
+        Err(hatchrun_workflow::ExprError {
+            message: "no files".into(),
+            offset: 0,
+        })
+    }
+
+    fn status(&self) -> hatchrun_workflow::JobStatus {
+        hatchrun_workflow::JobStatus::Success
+    }
+}
+
+#[test]
+fn split_outputs_are_read_from_the_parsed_expression() {
+    let splits = BTreeMap::from([(
+        "build".to_owned(),
+        vec!["build".to_owned(), "build-2".to_owned()],
+    )]);
+    let split = |text: &str| hatchrun_workflow::split_job_outputs(text, &splits);
+    // A bracket read is a read.
+    assert_eq!(
+        split("${{ jobs['build'].outputs.tag }}"),
+        "${{ (jobs.build-2.outputs.tag || jobs.build.outputs.tag) }}"
+    );
+    // Text in a string is not.
+    let literal = "${{ jobs.other.outputs.t || 'fallback jobs.build.outputs.tag' }}";
+    assert_eq!(split(literal), literal);
+    assert_eq!(
+        split("${{ jobs.build.outputs.tag || 'jobs.build.outputs.tag' }}"),
+        "${{ (jobs.build-2.outputs.tag || jobs.build.outputs.tag) || 'jobs.build.outputs.tag' }}"
+    );
+    // A property of something else is not a job.
+    let other = "${{ github.jobs.build.outputs.tag }}";
+    assert_eq!(split(other), other);
+}
+
+#[test]
+fn an_output_of_a_job_the_conversion_dropped_is_dropped_with_a_warning() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    uses: ./.github/workflows/w.yml\n",
+        ),
+        (
+            "w.yml",
+            "
+on:
+  workflow_call:
+    outputs:
+      kept: { value: '${{ jobs.ok.outputs.x }}' }
+      lost: { value: '${{ jobs.bad.outputs.x }}' }
+jobs:
+  ok:
+    runs-on: ubuntu-latest
+    outputs: { x: '1' }
+    steps: [{ run: x }]
+  bad:
+    runs-on: macos-latest
+    outputs: { x: '1' }
+    steps: [{ run: x }]
+",
+        ),
+    ]);
+    let call = out.config.workflows["w"].on.call.as_ref().unwrap();
+    assert!(call.outputs.contains_key("kept"));
+    assert!(!call.outputs.contains_key("lost"));
+    assert!(has(
+        &out.warnings,
+        &["output `lost`", "job `bad`", "dropped"]
+    ));
+    assert_eq!(validate(&out.config), Vec::new());
+    assert!(
+        hatchrun_workflow::compile(&out.config, "ci", "refs/heads/main").is_ok(),
+        "the caller plans"
+    );
+}
+
+#[test]
+fn a_call_of_a_workflow_that_did_not_convert_is_dropped_with_what_needs_it() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "
+on: push
+jobs:
+  c:
+    uses: ./.github/workflows/w.yml
+  after:
+    needs: c
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+  fine:
+    runs-on: ubuntu-latest
+    steps: [{ run: y }]
+",
+        ),
+        (
+            "w.yml",
+            "on: workflow_call\njobs:\n  bad:\n    runs-on: macos-latest\n    steps: [{ run: x }]\n",
+        ),
+    ]);
+    assert!(!out.config.workflows.contains_key("w"));
+    let ids: Vec<&str> = out.config.workflows["ci"]
+        .jobs
+        .iter()
+        .map(|j| j.name.as_deref().unwrap_or(&j.job))
+        .collect();
+    assert_eq!(ids, ["fine"]);
+    assert!(has(&out.warnings, &["`c` was dropped", "did not convert"]));
+    assert!(has(&out.warnings, &["`after` was dropped", "needs `c`"]));
+    assert_eq!(validate(&out.config), Vec::new());
+}
+
+#[test]
+fn pruning_a_workflow_run_chain_keeps_a_job_a_call_shares_a_key_with() {
+    // `ci-c` is a job key of workflow `ci`; the pruned workflow `deploy`
+    // has a call whose entry is also named `ci-c`.
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps: [{ run: x }]\n",
+        ),
+        (
+            "w.yml",
+            "on: workflow_call\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps: [{ run: x }]\n",
+        ),
+        (
+            "ghost.yml",
+            "on: push\njobs:\n  g:\n    runs-on: macos-latest\n    steps: [{ run: x }]\n",
+        ),
+        (
+            "deploy.yml",
+            "on:\n  workflow_run: { workflows: [ghost.yml] }\njobs:\n  ci-c:\n    uses: ./.github/workflows/w.yml\n",
+        ),
+    ]);
+    assert!(!out.config.workflows.contains_key("ghost"));
+    assert!(!out.config.workflows.contains_key("deploy"));
+    assert!(has(
+        &out.warnings,
+        &[
+            "`deploy.yml` was dropped",
+            "runs only after workflows that did not convert"
+        ]
+    ));
+    assert!(out.config.jobs.contains_key("ci-c"));
+    assert_eq!(validate(&out.config), Vec::new());
+}
+
+#[test]
+fn a_dynamic_matrix_reads_a_static_runner_label_at_run_time() {
+    let out = ok("on: push
+jobs:
+  setup: { runs-on: ubuntu-latest, steps: [{ run: x }], outputs: { extra: x } }
+  b:
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04]
+        include: ${{ fromJSON(needs.setup.outputs.extra) }}
+    steps: [{ run: x }]
+");
+    assert_eq!(out.errors, Vec::new());
+    let entry = entry(&out, "ci", "b");
+    assert_eq!(entry.matrix.values["os"], [json!("ubuntu-24.04")]);
+    let plan = hatchrun_workflow::compile(&out.config, "ci", "refs/heads/main").unwrap();
+    let b = plan.jobs.iter().find(|j| j.name == "b").unwrap();
+    let ctx = json!({
+        "needs": { "setup": { "result": "success", "outputs": { "extra": "[]" } } },
+        "github": {}, "inputs": {}, "vars": {}
+    });
+    let legs = hatchrun_workflow::expand(b, &ctx, hatchrun_workflow::Siblings::default()).unwrap();
+    assert_eq!(legs.len(), 1);
+    assert_eq!(legs[0].error, None);
+    // The matrix keeps the label as written.
+    assert_eq!(legs[0].job.matrix["os"], "ubuntu-24.04");
+}
+
+#[test]
 fn container_fields_that_cannot_be_read_are_errors_not_dropped() {
     for (body, word) in [
         ("container: 'node 20'", "whitespace"),
@@ -3144,4 +3095,81 @@ jobs:
 ");
     let c = out.config.jobs["ci-build"].container.as_ref().unwrap();
     assert_eq!(c.options, None);
+}
+
+#[test]
+fn a_call_condition_that_is_a_list_is_an_error_not_a_dropped_condition() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    if: [false]\n    uses: ./.github/workflows/w.yml\n",
+        ),
+        ("w.yml", REUSABLE_JOB),
+    ]);
+    assert!(
+        has(&out.errors, &["`if: ", "list or a map"]),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.workflows.contains_key("ci"));
+}
+
+#[test]
+fn a_secret_or_output_that_cannot_be_read_is_reported() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    uses: ./.github/workflows/w.yml\n",
+        ),
+        (
+            "w.yml",
+            "
+on:
+  workflow_call:
+    secrets:
+      TOKEN: { required: 'true' }
+    outputs:
+      o: { value: ['x'] }
+jobs:
+  j: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+",
+        ),
+    ]);
+    assert!(has(&out.errors, &["secret `TOKEN`"]), "{:?}", out.errors);
+    assert!(has(&out.warnings, &["output `o`", "has no value"]));
+}
+
+#[test]
+fn a_secret_passed_through_an_upper_case_context_is_kept() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    uses: ./.github/workflows/w.yml\n    secrets:\n      T: ${{ SECRETS.TOKEN }}\n",
+        ),
+        ("w.yml", REUSABLE_JOB),
+    ]);
+    assert_eq!(
+        entry(&out, "ci", "c").secrets,
+        hatchrun_workflow::SecretsPassed::Named(BTreeMap::from([(
+            "T".to_owned(),
+            "${{ SECRETS.TOKEN }}".to_owned()
+        )]))
+    );
+}
+
+#[test]
+fn split_outputs_are_read_by_bracket_in_the_output_name_too() {
+    let splits = BTreeMap::from([(
+        "build".to_owned(),
+        vec!["build".to_owned(), "build-2".to_owned()],
+    )]);
+    let split = |text: &str| hatchrun_workflow::split_job_outputs(text, &splits);
+    assert_eq!(
+        split("${{ jobs.build.outputs['tag'] }}"),
+        "${{ (jobs.build-2.outputs['tag'] || jobs.build.outputs['tag']) }}"
+    );
+    assert_eq!(
+        split("${{ jobs['build'].outputs['tag'] }}"),
+        "${{ (jobs.build-2.outputs['tag'] || jobs.build.outputs['tag']) }}"
+    );
 }

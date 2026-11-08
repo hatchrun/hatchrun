@@ -7,8 +7,8 @@
 use super::calls::{scalar, show};
 use super::{
     BTreeMap, BTreeSet, Cancel, Concurrency, ContinueOnError, Cx, Deserialize, GhJob, GhMatrix,
-    GhStep, JOB_KEYS, Job, Matrix, OLD_UBUNTU, ParameterKind, Require, RunStep, RunsOn, STEP_KEYS,
-    Step, Strategy, UsesStep, Value, WORKFLOW_CONTEXTS, WorkflowJob, expr, plan, template,
+    GhStep, JOB_KEYS, Job, Matrix, ParameterKind, Require, RunStep, RunsOn, STEP_KEYS, Step,
+    Strategy, UsesStep, Value, WORKFLOW_CONTEXTS, WorkflowJob, expr, plan, template,
     template_labels, valid_environment_name, vendor_template,
 };
 use crate::config::{Container, Credentials};
@@ -548,51 +548,36 @@ impl Cx {
     }
 
     /// Keeps a `runs-on` expression, which the job reads when it becomes
-    /// ready, with each runner label it spells as a string brought to a
-    /// template label the way a plain label is. A label that names no
-    /// template stays, with a warning: the job fails with a message when
-    /// it reads that label.
+    /// ready, as it is written. The label it reads is brought to a
+    /// template label then, the way a plain label is, so a comparison
+    /// in the expression still reads the label as written. A label the
+    /// expression spells that names no template is a warning: the job
+    /// fails with a message when it reads that label.
     pub(super) fn runtime_runs_on(&mut self, at: &str, text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
         let mut rest = text;
         while let Some(open) = rest.find('\'') {
-            out.push_str(&rest[..open]);
             let tail = &rest[open + 1..];
             let Some(close) = tail.find('\'') else {
-                out.push_str(&rest[open..]);
-                rest = "";
                 break;
             };
             let literal = &tail[..close];
-            let known = runner_label(literal);
             let looks_like_runner = ["ubuntu", "macos", "windows", "self-hosted"]
                 .iter()
                 .any(|p| literal.starts_with(p));
-            out.push('\'');
-            match known {
-                Some(new) if new != literal => {
-                    self.warn(became(at, literal, new));
-                    out.push_str(new);
-                }
-                Some(_) => out.push_str(literal),
-                None => {
-                    if looks_like_runner {
-                        self.warn(format!(
-                            "{at}: `runs-on` can read `{literal}`, which names no runner template, so the job fails when it does; hatchrun runs Linux only, use one of {}",
-                            template_labels().join(", ")
-                        ));
-                    }
-                    out.push_str(literal);
-                }
+            match runner_label(literal) {
+                Some(new) if new != literal => self.warn(became(at, literal, new)),
+                None if looks_like_runner => self.warn(format!(
+                    "{at}: `runs-on` can read `{literal}`, which names no runner template, so the job fails when it does; hatchrun runs Linux only, use one of {}",
+                    template_labels().join(", ")
+                )),
+                Some(_) | None => {}
             }
-            out.push('\'');
             rest = &tail[close + 1..];
         }
-        out.push_str(rest);
         self.warn(format!(
             "{at}: `runs-on` is read when the job becomes ready; each label it reads must name a runner template"
         ));
-        out
+        text.to_owned()
     }
 
     /// Resolves `runs-on: ${{ matrix.KEY }}`. Legs whose value names no
@@ -1208,7 +1193,9 @@ pub(super) fn flatten(entries: Vec<(String, Vec<WorkflowJob>)>) -> Vec<WorkflowJ
         .map(|(id, e)| {
             (
                 id.clone(),
-                e.iter().filter_map(|e| e.name.clone()).collect(),
+                e.iter()
+                    .map(|e| e.name.clone().unwrap_or_else(|| e.job.clone()))
+                    .collect(),
             )
         })
         .collect();
@@ -1300,13 +1287,7 @@ impl RunDefaults {
 /// label itself, the template a retired Ubuntu label moved to, or the
 /// template of a third-party label's arch and size.
 pub(super) fn runner_label(label: &str) -> Option<&'static str> {
-    if let Some((_, new)) = OLD_UBUNTU.iter().find(|(old, _)| *old == label) {
-        return Some(new);
-    }
-    if let Some(found) = template_labels().into_iter().find(|l| *l == label) {
-        return Some(found);
-    }
-    vendor_template(label).map(|(t, _)| t.labels[0])
+    crate::templates::runner_label(label)
 }
 
 /// The warning for a label that became another template label, saying

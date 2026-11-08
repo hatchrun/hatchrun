@@ -17,9 +17,12 @@ jobs:
     secrets: inherit
 
   build:
+    if: github.event_name == 'pull_request'
     uses: ./.github/workflows/build.yml
     with:
       target: web
+      fast: true
+      retries: 3
 
   test:
     runs-on: ubuntu-latest
@@ -44,3 +47,8 @@ jobs:
       - run: npx playwright test
         env:
           BASE_URL: ${{ needs.deploy-preview.outputs.url }}
+
+  alert:
+    needs: test
+    if: failure()
+    uses: ./.github/workflows/notify.yml

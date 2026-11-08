@@ -60,10 +60,11 @@ pub use self::installation::{
     tenant_setup, touch_installation_repo, unknown_repos,
 };
 pub use self::jobs::{
-    ApprovalJob, Claim, JobCounts, JobRow, NewJob, approval_jobs, capacity_wait, claim_launch,
-    finish_job, heartbeat, held_siblings, hold, insert_jobs, job, job_counts, jobs_by_ids,
-    jobs_for_run, launch_failed, launched, note_queued_error, open_jobs, queue_job, reset_job,
-    retarget_job, set_job, set_needs, start_job,
+    ApprovalJob, Claim, JobCounts, JobRow, MatrixRows, NewJob, all_jobs_for_run, approval_jobs,
+    assign_matrix_rows, capacity_wait, claim_launch, finish_job, heartbeat, held_siblings, hold,
+    insert_jobs, job, job_counts, jobs_by_ids, jobs_for_run, launch_failed, launched,
+    note_queued_error, open_jobs, queue_job, refresh_job, reset_job, retarget_job, set_job,
+    set_needs, start_job, supersede_job,
 };
 pub use self::pool::{
     PoolRow, claims_by_bucket, drop_pool, move_pool, pool_rows, save_pool, take_pool,

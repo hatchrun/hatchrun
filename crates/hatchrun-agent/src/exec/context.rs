@@ -170,7 +170,7 @@ impl Contexts {
             "parameters": {},
             "runner": runner,
             "job": { "status": "success" },
-            "inputs": {},
+            "inputs": doc.inputs.clone().unwrap_or_else(|| json!({})),
         });
         Self {
             value,
@@ -587,6 +587,7 @@ mod tests {
             services: std::collections::BTreeMap::new(),
             steps: Vec::new(),
             deferred: None,
+            scope: Vec::new(),
         }
     }
 
@@ -621,6 +622,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
+            inputs: None,
         }
     }
 
@@ -767,6 +769,42 @@ mod tests {
         assert_eq!(eval(&scoped, "inputs.k"), json!("v"));
         assert_eq!(eval(&scoped, "steps.build.outcome"), Value::Null);
         assert_eq!(eval(&ctx, "github.action_path"), json!(""));
+    }
+
+    #[test]
+    fn workflow_inputs_read_as_their_values_and_the_empty_fallback_stays() {
+        let empty = Contexts::new(&doc("ubuntu-latest"), &layout());
+        assert_eq!(eval(&empty, "inputs.name"), Value::Null);
+        assert_eq!(eval(&empty, "toJSON(inputs)"), json!("{}"));
+        let mut d = doc("ubuntu-latest");
+        d.inputs = Some(json!({ "name": "web", "fast": false, "replicas": 3 }));
+        let ctx = Contexts::new(&d, &layout());
+        assert_eq!(eval(&ctx, "inputs.name"), json!("web"));
+        assert_eq!(eval(&ctx, "inputs.fast"), json!(false));
+        assert_eq!(eval(&ctx, "inputs.replicas"), json!(3));
+        assert_eq!(
+            eval(&ctx, "inputs.replicas == 3 && !inputs.fast"),
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn action_inputs_shadow_workflow_inputs_without_changing_the_callers_context() {
+        let mut d = doc("ubuntu-latest");
+        d.inputs = Some(json!({ "name": "web", "fast": false }));
+        let ctx = Contexts::new(&d, &layout());
+        let scoped = ctx.with_action(ActionScope {
+            action: "setup".into(),
+            path: "/w/_actions/o/r/v1".into(),
+            ref_: "v1".into(),
+            repository: "o/r".into(),
+            inputs: BTreeMap::from([("name".to_owned(), "action".to_owned())]),
+        });
+        assert_eq!(eval(&scoped, "inputs.name"), json!("action"));
+        // The workflow's other inputs are not the action's.
+        assert_eq!(eval(&scoped, "inputs.fast"), Value::Null);
+        assert_eq!(eval(&ctx, "inputs.name"), json!("web"));
+        assert_eq!(eval(&ctx, "inputs.fast"), json!(false));
     }
 
     #[test]

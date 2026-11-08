@@ -143,6 +143,7 @@ pub(crate) fn job_document(
     job: u64,
     token: &str,
     api: &str,
+    inputs: Option<Value>,
 ) -> Option<JobDocument> {
     let node = graph.node(job)?;
     Some(JobDocument {
@@ -164,6 +165,7 @@ pub(crate) fn job_document(
         cache: None,
         id_token: None,
         artifacts: None,
+        inputs,
     })
 }
 
@@ -369,6 +371,35 @@ pub(crate) fn bounded_event(mut event: Value) -> Value {
 pub(crate) fn steps_json(steps: &[StepView]) -> Value {
     let ended: Vec<_> = steps.iter().filter_map(|s| s.summary.as_ref()).collect();
     serde_json::to_value(ended).expect("step summaries always serialize")
+}
+
+/// The work on its row for a job a rerun left out of its matrix, which
+/// ended as skipped for this attempt: the row is set up for the attempt
+/// and marked, so the run's list and counts leave it out. Nothing for a
+/// job that is part of the run. The finish of the row follows, from the
+/// action that ended the job.
+pub(crate) fn left_out_work(graph: &Graph, job: u64) -> Vec<super::Work> {
+    match graph.node(job).filter(|n| n.stale) {
+        Some(node) => vec![
+            super::Work::ResetJob {
+                job,
+                attempt: node.attempt,
+            },
+            super::Work::Supersede {
+                job,
+                attempt: node.attempt,
+            },
+        ],
+        None => Vec::new(),
+    }
+}
+
+/// The work on the rows an earlier attempt used that a matrix read again
+/// makes again: each is set up for `attempt`.
+pub(crate) fn again_work(rows: &[u64], attempt: u32) -> Vec<super::Work> {
+    rows.iter()
+        .map(|&job| super::Work::ResetJob { job, attempt })
+        .collect()
 }
 
 /// Each job's row id and attempt.
@@ -791,7 +822,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
     fn job_document_for_a_claim() {
         let graph = graph();
         let event = json!({ "after": "abc" });
-        let doc = job_document(&info(), &event, &graph, 1, "tok", API).unwrap();
+        let doc = job_document(&info(), &event, &graph, 1, "tok", API, None).unwrap();
         assert_eq!(doc.run_id, "7");
         assert_eq!(doc.run_attempt, 1);
         assert_eq!(doc.github.token, "tok");
@@ -800,7 +831,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         assert_eq!(doc.needs, graph.needs(1));
         assert!(doc.secrets.is_empty() && doc.vars.is_empty() && doc.timings.is_empty());
         assert!(doc.cache.is_none());
-        assert!(job_document(&info(), &event, &graph, 404, "tok", API).is_none());
+        assert!(job_document(&info(), &event, &graph, 404, "tok", API, None).is_none());
     }
 
     #[test]

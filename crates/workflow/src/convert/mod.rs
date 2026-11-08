@@ -56,23 +56,24 @@ pub struct Conversion {
 ///
 /// A job with a problem (a `runs-on` that names no runner template, a
 /// `container` that names no image, a `needs` that names no job, a job key another file
-/// already uses, a read of the `jobs` context) is dropped,
-/// like a reusable workflow call. Every job that needs a dropped job,
-/// directly or through others, is dropped too, with a warning naming the
-/// chain of jobs it needed. A file over [`MAX_SOURCE`](crate::MAX_SOURCE)
-/// bytes, one that does not parse, has no name before its extension or
-/// repeats another file's name is skipped. Each problem is in
-/// [`Conversion::errors`]. A workflow left with no event hatchrun runs
-/// on, such as one that runs only on `issues`, is dropped with its jobs
-/// and a warning.
+/// already uses, a read of the `jobs` context) is dropped. Every job
+/// that needs a dropped job, directly or through others, is dropped
+/// too, with a warning naming the chain of jobs it needed. A file over
+/// [`MAX_SOURCE`](crate::MAX_SOURCE) bytes, one that does not parse, has
+/// no name before its extension or repeats another file's name is
+/// skipped. Each problem is in [`Conversion::errors`]. A workflow left
+/// with no event hatchrun runs on, such as one that runs only on
+/// `issues`, is dropped with its jobs and a warning.
 ///
-/// A job with `uses: ./.github/workflows/x.yml` (or a `.forgejo` or
-/// `.gitea` path) whose file is among the files is replaced by the jobs
-/// of that file, `<stem>-<job>-<called job>`, with the file's
-/// `on.workflow_call.inputs` as parameters; calls nest four levels deep.
-/// A file whose only event is `workflow_call` and that some file calls is
-/// not reported as dropped. A call of a file in another repository, or
-/// one that was not given, is dropped with a warning.
+/// A file with `on: workflow_call` becomes a workflow with `on: call`,
+/// its inputs, secrets and outputs declared. A job with
+/// `uses: ./.github/workflows/x.yml` (or a `.forgejo` or `.gitea` path)
+/// whose file is among the files becomes an entry with `call: x`, and a
+/// job with `uses: owner/repo/path.yml@ref` an entry with that call,
+/// both with the job's `with`, `secrets`, `needs`, `if`, `permissions`
+/// and matrix. A call of a file that was not given, a call whose matrix
+/// is read at run time, `strategy` options and `concurrency` on a call
+/// are dropped with a warning.
 ///
 /// `on.workflow_run` names workflows as GitHub does, by their `name:`,
 /// or by their file name when they have none. Each name becomes the stem of
@@ -121,21 +122,15 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
     }
     for (file, _, gh) in &parsed {
         if calls_workflow(&gh.on) {
-            cx.library.insert((*file).clone(), gh.clone());
-        }
-    }
-    for (_, _, gh) in &parsed {
-        for (_, job) in &gh.jobs.0 {
-            let called = job.get("uses").and_then(Value::as_str);
-            if let Some(file) = called.and_then(|uses| cx.callee(uses)) {
-                cx.called.insert(file);
-            }
+            cx.library.insert((*file).clone());
         }
     }
     for (file, stem, gh) in parsed {
         cx.workflow(file, stem, gh);
     }
+    cx.drop_unavailable_calls();
     cx.unreachable_runs(&stems);
+    cx.drop_unavailable_calls();
     if !cx.errors.is_empty() && cx.config.workflows.is_empty() {
         return Err(cx.errors);
     }
@@ -223,14 +218,6 @@ const STEP_KEYS: &[&str] = &[
     "env",
     "continue-on-error",
     "timeout-minutes",
-];
-
-/// Labels GitHub retires and the template each becomes.
-const OLD_UBUNTU: &[(&str, &str)] = &[
-    ("ubuntu-24.04", "ubuntu-latest"),
-    ("ubuntu-22.04", "ubuntu-latest"),
-    ("ubuntu-24.04-arm", "ubuntu-26.04-arm"),
-    ("ubuntu-22.04-arm", "ubuntu-26.04-arm"),
 ];
 
 /// GitHub contexts hatchrun does not provide.
@@ -476,9 +463,6 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Ordered<T> {
     }
 }
 
-/// How deep reusable workflows may call each other.
-const MAX_CALL_DEPTH: usize = 4;
-
 /// The directories workflow files, and so local calls, live in.
 const WORKFLOW_DIRS: &[&str] = &[
     ".github/workflows/",
@@ -486,51 +470,23 @@ const WORKFLOW_DIRS: &[&str] = &[
     ".gitea/workflows/",
 ];
 
-/// Where a set of jobs is converted: a workflow file, or a file that a
-/// job of another one calls.
+/// Where a set of jobs is converted: a workflow file.
 struct Scope {
     /// The file, quoted, for messages.
     label: String,
-    /// What the messages add about the call that brought the file in.
-    from: String,
-    /// The stem of the file at the root of the calls.
+    /// The stem of the file.
     stem: String,
-    /// The ids of the calls that led here, joined with `-`; empty for a
-    /// file that no call brought in.
-    prefix: String,
-    /// How many calls led here.
-    depth: usize,
-    /// The files of the calls that led here, the root's first.
-    stack: Vec<String>,
-    /// The values of the inputs the file was called with, defaults
-    /// included.
-    inputs: Option<BTreeMap<String, Value>>,
 }
 
 impl Scope {
     /// Where a job of the file is named in messages.
     fn at(&self, id: &str) -> String {
-        format!("{} job `{id}`{}", self.label, self.from)
-    }
-
-    /// The id of a job in the workflow: its own in the root file, else
-    /// the stem and the calls in front of it, so that ids of files
-    /// called twice differ.
-    fn full(&self, id: &str) -> String {
-        if self.prefix.is_empty() {
-            id.to_owned()
-        } else {
-            format!("{}-{}-{id}", self.stem, self.prefix)
-        }
+        format!("{} job `{id}`", self.label)
     }
 
     /// The key of a job in `jobs:`.
     fn key(&self, id: &str) -> String {
-        if self.prefix.is_empty() {
-            format!("{}-{id}", self.stem)
-        } else {
-            self.full(id)
-        }
+        format!("{}-{id}", self.stem)
     }
 }
 
@@ -544,32 +500,12 @@ struct Converted {
     dropped: BTreeMap<String, String>,
     /// A job had an error.
     failed: bool,
-    /// The keys of the jobs the file has itself, not through calls.
-    plain: BTreeSet<String>,
-    /// The ids those jobs have in the file.
-    local: BTreeSet<String>,
-    /// The calls, by the id of the job that made each.
-    calls: BTreeMap<String, Expansion>,
-}
-
-/// What a job that called a workflow stands for.
-struct Expansion {
-    /// The ids of the jobs that jobs needing the call require.
-    requires: Vec<String>,
-    /// What reads of each output of the call become, as an expression;
-    /// `None` for an output that cannot be mapped.
-    outputs: BTreeMap<String, Option<String>>,
-}
-
-/// A call that was inlined.
-struct Called {
-    entries: Vec<(String, Vec<WorkflowJob>)>,
-    expansion: Expansion,
 }
 
 /// What became of a job that calls a reusable workflow.
 enum Call {
-    Done(Called),
+    /// The workflow entry that calls it.
+    Done(Box<WorkflowJob>),
     /// Left out with a warning.
     Dropped,
     /// Left out with an error.
@@ -585,9 +521,7 @@ struct Cx {
     /// The stems of the files that have each GitHub workflow name.
     names: BTreeMap<String, Vec<String>>,
     /// The files with `on.workflow_call`, which jobs can call.
-    library: BTreeMap<String, GhWorkflow>,
-    /// The files some file calls with a local `uses`.
-    called: BTreeSet<String>,
+    library: BTreeSet<String>,
 }
 
 impl Cx {
@@ -605,7 +539,7 @@ impl Cx {
         for key in gh.unknown.keys() {
             self.warn(format!("`{file}`: unknown key `{key}` was dropped"));
         }
-        let Some(on) = self.kept_triggers(file, stem, &gh.on) else {
+        let Some(mut on) = self.kept_triggers(file, stem, &gh.on) else {
             return;
         };
         let permissions = self.permissions(&format!("`{file}`"), gh.permissions.as_ref(), false);
@@ -615,12 +549,7 @@ impl Cx {
 
         let scope = Scope {
             label: format!("`{file}`"),
-            from: String::new(),
             stem: stem.to_owned(),
-            prefix: String::new(),
-            depth: 0,
-            stack: vec![file.to_owned()],
-            inputs: None,
         };
         let Converted {
             entries, failed, ..
@@ -628,6 +557,35 @@ impl Cx {
         // A file whose every job failed converts to nothing.
         if entries.is_empty() && failed {
             return;
+        }
+        // A job that `include` split into several entries is one job to
+        // `jobs.<id>.outputs` of the outputs of a reusable workflow.
+        let splits: BTreeMap<String, Vec<String>> = entries
+            .iter()
+            .filter(|(_, made)| made.len() > 1)
+            .map(|(id, made)| {
+                let names = made
+                    .iter()
+                    .map(|e| e.name.clone().unwrap_or_else(|| e.job.clone()))
+                    .collect();
+                (id.clone(), names)
+            })
+            .collect();
+        let survivors: BTreeSet<String> = entries
+            .iter()
+            .flat_map(|(_, made)| {
+                made.iter()
+                    .map(|e| e.name.clone().unwrap_or_else(|| e.job.clone()))
+            })
+            .collect();
+        if let Some(mut call) = on.call.take() {
+            self.prune_outputs(&format!("`{file}`"), &mut call, &survivors);
+            on.call = Some(call);
+        }
+        if let Some(call) = &mut on.call {
+            for text in call.outputs.values_mut() {
+                *text = crate::expr::split_job_outputs(text, &splits);
+            }
         }
         let jobs = flatten(entries);
         self.config.workflows.insert(
@@ -642,11 +600,10 @@ impl Cx {
         );
     }
 
-    /// Converts the jobs of a workflow file, or of a file it calls.
-    /// A job that calls a local reusable workflow becomes the jobs of the
-    /// called file; see [`Cx::call`]. A job that needs a dropped job
-    /// would run without it, so it is dropped too, and so on down the
-    /// chain. The entries of one job share their `requires`.
+    /// Converts the jobs of a workflow file. A job that calls a reusable
+    /// workflow becomes a call entry; see [`Cx::call`]. A job that needs
+    /// a dropped job would run without it, so it is dropped too, and so
+    /// on down the chain. The entries of one job share their `requires`.
     fn jobs(
         &mut self,
         scope: &Scope,
@@ -658,18 +615,15 @@ impl Cx {
         let mut level = Converted::default();
         for (id, job) in jobs {
             let at = scope.at(&id);
-            let fid = scope.full(&id);
+            let fid = id.clone();
             let Some(job) = self.gh_job(&at, &job) else {
                 level.dropped.insert(fid, FAILED.to_owned());
                 level.failed = true;
                 continue;
             };
             if job.uses.is_some() {
-                match self.call(scope, &at, &id, &ids, &job) {
-                    Call::Done(done) => {
-                        level.entries.extend(done.entries);
-                        level.calls.insert(id, done.expansion);
-                    }
+                match self.call(&at, &id, &ids, &job) {
+                    Call::Done(entry) => level.entries.push((fid, vec![*entry])),
                     Call::Dropped => {
                         level.dropped.insert(fid, REUSABLE.to_owned());
                     }
@@ -689,7 +643,7 @@ impl Cx {
                 level.failed = true;
                 continue;
             }
-            let Some((mut converted, mut expanded)) = self.job(&at, &id, &key, &ids, job) else {
+            let Some((mut converted, expanded)) = self.job(&at, &id, &key, &ids, job) else {
                 level.dropped.insert(fid, FAILED.to_owned());
                 level.failed = true;
                 continue;
@@ -703,14 +657,7 @@ impl Cx {
             }
             // validate rejects these, so the job could not run.
             let (contexts, mut bad) = expression_problems(&converted);
-            bad.extend(dynamic_problems(
-                &converted,
-                &expanded,
-                !scope.prefix.is_empty() || scope.inputs.is_some(),
-            ));
-            if let Some(inputs) = &scope.inputs {
-                bad.extend(bind_literals(&mut converted, inputs));
-            }
+            bad.extend(dynamic_problems(&converted, &expanded));
             if !contexts.is_empty() || !bad.is_empty() {
                 for context in contexts {
                     self.error(format!(
@@ -724,18 +671,9 @@ impl Cx {
                 level.failed = true;
                 continue;
             }
-            for entry in &mut expanded {
-                entry.name = entry.name.take().map(|n| scope.full(&n));
-                for require in &mut entry.requires {
-                    require.job = scope.full(&require.job);
-                }
-            }
             self.config.jobs.insert(key.clone(), converted);
-            level.plain.insert(key);
-            level.local.insert(id);
             level.entries.push((fid, expanded));
         }
-        self.link_calls(scope, &mut level);
         while let Some((i, need)) = level.entries.iter().enumerate().find_map(|(i, (_, e))| {
             let need = e[0]
                 .requires
@@ -744,12 +682,11 @@ impl Cx {
             Some((i, need.job.clone()))
         }) {
             let (id, expanded) = level.entries.remove(i);
-            self.config.jobs.remove(&expanded[0].job);
+            if expanded[0].call.is_none() {
+                self.config.jobs.remove(&expanded[0].job);
+            }
             let why = format!("needs `{need}`, which {}", level.dropped[&need]);
-            self.warn(format!(
-                "{} job `{id}`{} was dropped: it {why}",
-                scope.label, scope.from
-            ));
+            self.warn(format!("{} job `{id}` was dropped: it {why}", scope.label));
             level.dropped.insert(id, why);
         }
         level
@@ -761,6 +698,6 @@ mod jobs;
 mod rewrite;
 mod triggers;
 
-use self::calls::{bind_literals, scalar};
+use self::calls::scalar;
 use self::jobs::{RunDefaults, flatten};
 use self::rewrite::{FAILED, REUSABLE, calls_workflow, dynamic_problems, expression_problems};

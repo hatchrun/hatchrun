@@ -145,6 +145,89 @@ converter targets the same format; act's and Forgejo's test workflows,
 run through it, test the converter, action execution and expressions
 together.
 
+### Reusable workflows
+
+A workflow with `on: call` can be run by a workflow entry with `call:`.
+This is GitHub's `workflow_call`, in the shape of the rest of the file.
+
+```yaml
+workflows:
+  deploy:
+    on:
+      call:
+        inputs:
+          env: { type: string, required: true }   # string, boolean, number
+          fast: { type: boolean, default: false }
+        secrets:
+          TOKEN: { required: true }
+        outputs:
+          url: ${{ jobs.ship.outputs.url }}
+    jobs: [ship]
+  release:
+    on: { push: { tags: ['v*'] } }
+    jobs:
+      - build
+      - prod:
+          call: deploy                 # or owner/repo/path.yml@ref
+          requires: [build]
+          matrix: { env: [eu, us] }
+          with: { env: '${{ matrix.env }}' }
+          secrets: { TOKEN: '${{ secrets.PROD_TOKEN }}' }   # or `inherit`
+          permissions: { contents: read }
+          if: github.ref_type == 'tag'
+      - notify: { requires: [prod] }
+```
+
+What the planner does:
+
+- The callee's jobs join the caller's plan as `<call> / <job>`, and
+  their check runs read `ci / prod (eu) / ship`. A matrix on the call
+  plans the callee once per entry. `github` in the callee is the
+  caller's.
+- Jobs outside the call see it as one entry. `needs.prod.result` is
+  the aggregate of the callee's jobs, `needs.prod.outputs.url` is the
+  callee's `on.call.outputs.url` read over `jobs.<job>.outputs`, and
+  `requires: [prod]` waits for every callee job. Inside the call, jobs
+  see each other by their own names.
+- `with` values read the caller's `github`, `needs`, `matrix`, `vars`
+  and `inputs`, and are checked against the callee's declared types.
+  A required input without a value, an input the callee does not
+  declare and a literal of the wrong type are plan errors.
+- Secrets reach only what the calls on the way pass: `secrets: inherit`
+  passes all of the caller's, a map passes the named ones under the
+  callee's names, and nothing else is passed. A map value is one whole
+  `${{ secrets.NAME }}`. The Worker opens only the outermost secrets
+  the job reaches, and renames them for the job.
+- A callee job that sets no permissions, in a callee that sets none,
+  gets the caller's (the entry's `permissions`, else the caller
+  workflow's). The callee can lower them and cannot raise them. `if`,
+  `permissions` and `secrets` on an entry that does not `call` are
+  errors: a job takes them from `jobs:`. A call's `if` is read once,
+  against the call's own needs, before its inputs are read; a job in the
+  callee counts only the jobs of its own call in `success()` and
+  `failure()`. The callee workflow's own `concurrency` is ignored; job
+  concurrency applies.
+- Calls nest four deep. One plan calls at most 20 different workflows.
+  A cycle, a callee without `on: call` and an output that reads
+  anything but `jobs` are errors.
+- Not supported yet: a matrix or `strategy` read at run time on the
+  call itself (the callee's own jobs may use both), `fail-fast` and
+  `max-parallel` across the instances of a call matrix, and a callee's
+  `uses: ./...` calls when the callee is in another repository.
+
+A call of another repository, `owner/repo/path.yml@ref`, reads a GitHub
+workflow file with `on: workflow_call` through the converter, with the
+installation token of the caller's tenant. The ref is resolved to a
+commit when the workflow is planned, and the plan records
+`owner/repo/path.yml@<sha>` on every job of the call. A repository may
+be called when the installation can read it and it belongs to the
+caller's tenant or is public. A private repository of another tenant is
+refused with the reason in the check run of the failed workflow.
+GitHub's own rule, "Accessible from repositories in the organization"
+under Settings, Actions, General of the callee repository, is not read:
+mirroring it needs a per-repository setting and a migration, and is
+deferred.
+
 ## Anti-goals
 
 - Spot capacity. Interrupted jobs are not acceptable, so every job runs

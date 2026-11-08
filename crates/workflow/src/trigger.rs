@@ -11,6 +11,7 @@ use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 
+use crate::call::CallTrigger;
 use crate::config::Parameter;
 
 /// Ordered GitHub filter patterns. A leading `!` negates a pattern.
@@ -536,6 +537,14 @@ pub struct Triggers {
         skip_serializing_if = "Option::is_none"
     )]
     pub delete: Option<RefTrigger>,
+    /// Another workflow calling this one. No event starts it. See
+    /// [`crate::call`].
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub call: Option<CallTrigger>,
     /// A pull request entering the merge queue, for its checks.
     #[serde(
         default,

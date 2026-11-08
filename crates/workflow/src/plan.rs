@@ -16,6 +16,7 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::call::{CallFrame, Library, shared_depth};
 use crate::concurrency::{Cancel, Concurrency, JOB_CONTEXTS, WORKFLOW_CONTEXTS};
 use crate::config::{
     CacheStep, CheckoutStep, Config, Container, ContinueOnError, Job, Matrix, Outcome, Parameter,
@@ -23,7 +24,7 @@ use crate::config::{
 };
 use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
-use crate::dynamic::combinations as matrix_entries;
+use crate::dynamic::{combinations as matrix_entries, same};
 use crate::environment::{is_expression, valid_environment_name};
 use crate::expr::{self, ExprError};
 use crate::permissions::{Level, token_scopes};
@@ -110,8 +111,24 @@ const STEP_KEYS: &[&str] = &[
 /// Keys of a workflow entry. A job parameter with one of these names
 /// could never be set from a workflow: the entry reads the key itself.
 pub(crate) const ENTRY_KEYS: &[&str] = &[
-    "name", "requires", "type", "branches", "tags", "matrix", "strategy",
+    "name",
+    "requires",
+    "type",
+    "branches",
+    "tags",
+    "matrix",
+    "strategy",
+    "call",
+    "secrets",
+    "permissions",
+    "if",
+    "with",
 ];
+
+mod calls;
+
+use self::calls::Calls;
+pub(crate) use self::calls::{call_expression, output_expression};
 
 /// The jobs one workflow runs for one ref.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -212,6 +229,10 @@ pub struct PlannedJob {
     /// `kind` holds a stand-in template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred: Option<Deferred>,
+    /// The calls this job runs in, the outermost first. Empty for a job
+    /// of the workflow that was planned. See [`crate::call`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<CallFrame>,
 }
 
 /// What a planned job reads when it becomes ready, after the jobs it
@@ -332,6 +353,27 @@ pub enum PlannedStep {
 /// Returns every problem found in the config and the workflow. Problems
 /// in jobs the ref drops are reported too.
 pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, Vec<Diagnostic>> {
+    compile_with(config, workflow, git_ref, &Library::default())
+}
+
+/// [`compile`], with the workflow files of other repositories the
+/// workflow may call (see [`remote_calls`](crate::remote_calls)). A call
+/// of a file `library` does not have is an error.
+///
+/// A job of a called workflow is planned as `<call> / <job>`; see
+/// [`crate::call`].
+///
+/// # Errors
+///
+/// As [`compile`], and a call that names no workflow, passes inputs or
+/// secrets the callee does not take, leaves out what it requires, or
+/// nests more than [`MAX_CALL_DEPTH`](crate::MAX_CALL_DEPTH) deep.
+pub fn compile_with(
+    config: &Config,
+    workflow: &str,
+    git_ref: &str,
+    library: &Library,
+) -> Result<Plan, Vec<Diagnostic>> {
     let mut errors = config_errors(config);
     let Some(wf) = config.workflows.get(workflow) else {
         errors.push(Diagnostic::new(format!(
@@ -340,7 +382,16 @@ pub fn compile(config: &Config, workflow: &str, git_ref: &str) -> Result<Plan, V
         return Err(dedup(errors));
     };
     let mut budget = Budget::new();
-    let plan = compile_workflow(config, workflow, wf, git_ref, &mut budget, &mut errors);
+    let mut calls = Calls::new(Some(library), workflow);
+    let plan = compile_workflow(
+        config,
+        workflow,
+        wf,
+        git_ref,
+        &mut budget,
+        &mut calls,
+        &mut errors,
+    );
     match plan {
         Some(plan) if errors.is_empty() => Ok(plan),
         _ => Err(dedup(errors)),
@@ -370,7 +421,18 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
     standalone_errors(config, &mut errors);
     let mut budget = Budget::new();
     for (name, wf) in &config.workflows {
-        compile_workflow(config, name, wf, VALIDATE_REF, &mut budget, &mut errors);
+        // A file of another repository is not read here: its calls plan
+        // nothing, and the host checks them when it plans the workflow.
+        let mut calls = Calls::new(None, name);
+        compile_workflow(
+            config,
+            name,
+            wf,
+            VALIDATE_REF,
+            &mut budget,
+            &mut calls,
+            &mut errors,
+        );
         if budget.spent {
             break;
         }
@@ -406,7 +468,7 @@ where
     F: Fn(&str) -> Option<Outcome>,
 {
     let by_id: BTreeMap<&str, &PlannedJob> = plan.jobs.iter().map(|j| (j.id.as_str(), j)).collect();
-    let entry = |id: &'a str| -> &'a str { by_id.get(id).map_or(id, |j| j.name.as_str()) };
+    let entry = |id: &'a str| -> &'a str { by_id.get(id).map_or(id, |j| job.entry_of(j)) };
     let mut entries: Vec<&str> = Vec::new();
     for id in &job.requires {
         let name = entry(id);
@@ -417,7 +479,7 @@ where
     let mut start = true;
     for name in entries {
         let roots = job.requires.iter().filter(|id| entry(id) == name);
-        let Some(state) = ancestry(roots, &by_id, &outcome) else {
+        let Some(state) = ancestry(roots, job, &by_id, &outcome) else {
             return Ready::Wait;
         };
         let wanted = job.statuses.get(name).copied().unwrap_or_default();
@@ -428,8 +490,13 @@ where
 
 /// The aggregate outcome of `roots` and every job before them: the
 /// strongest of their outcomes. `None` while one of them has not ended.
+///
+/// A root that is a job of a call counts as the call, for `viewer`
+/// outside it: only the jobs of that call count, not what the call
+/// waited for, which the call's own `if` read.
 fn ancestry<'a, F>(
     roots: impl Iterator<Item = &'a String>,
+    viewer: &PlannedJob,
     by_id: &BTreeMap<&str, &'a PlannedJob>,
     outcome: &F,
 ) -> Option<Outcome>
@@ -437,15 +504,26 @@ where
     F: Fn(&str) -> Option<Outcome>,
 {
     let mut seen = BTreeSet::new();
-    let mut todo: Vec<&str> = roots.map(String::as_str).collect();
     let mut strongest = Outcome::Success;
-    while let Some(id) = todo.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        strongest = strongest.max(outcome(id)?);
-        if let Some(job) = by_id.get(id) {
-            todo.extend(job.requires.iter().map(String::as_str));
+    for root in roots {
+        // The frames the walk from this root stays inside.
+        let limit: &[CallFrame] = by_id.get(root.as_str()).map_or(&[], |job| {
+            let shared = shared_depth(&viewer.scope, job);
+            &job.scope[..job.scope.len().min(shared + 1)]
+        });
+        let mut todo: Vec<&str> = vec![root.as_str()];
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            strongest = strongest.max(outcome(id)?);
+            if let Some(job) = by_id.get(id) {
+                todo.extend(job.requires.iter().map(String::as_str).filter(|r| {
+                    by_id
+                        .get(r)
+                        .is_none_or(|p| shared_depth(limit, p) == limit.len())
+                }));
+            }
         }
     }
     Some(strongest)
@@ -1079,6 +1157,7 @@ fn compile_workflow(
     wf: &Workflow,
     git_ref: &str,
     budget: &mut Budget,
+    calls: &mut Calls<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<Plan> {
     let before = errors.len();
@@ -1109,7 +1188,15 @@ fn compile_workflow(
         .jobs
         .iter()
         .zip(&ids)
-        .map(|(entry, id)| expand_entry(config, wf, name, entry, id, budget, &mut planned, errors))
+        .map(|(entry, id)| {
+            let at = EntryAt {
+                config,
+                wf,
+                workflow: name,
+                git_ref,
+            };
+            expand_entry(&at, entry, id, budget, &mut planned, calls, errors)
+        })
         .collect();
     if budget.spent {
         return None;
@@ -1163,8 +1250,12 @@ fn compile_workflow(
             .map(|(&d, &s)| (ids[d].clone(), s))
             .collect();
         for mut job in std::mem::take(&mut expansions[i]) {
-            job.requires.clone_from(&requires);
-            job.statuses.clone_from(&statuses);
+            // The jobs of a call that need nothing inside the call start
+            // when the call does; the others keep what they need.
+            if wf.jobs[i].call.is_none() || job.requires.is_empty() {
+                job.requires.clone_from(&requires);
+                job.statuses.clone_from(&statuses);
+            }
             jobs.push(job);
         }
     }
@@ -1458,21 +1549,44 @@ fn ref_allows(entry: &WorkflowJob, git_ref: &str) -> bool {
     }
 }
 
+/// Where an entry being expanded is: its config, workflow and the ref
+/// the plan is for.
+#[derive(Clone, Copy)]
+struct EntryAt<'a> {
+    config: &'a Config,
+    wf: &'a Workflow,
+    workflow: &'a str,
+    git_ref: &'a str,
+}
+
 /// Expands one workflow entry into its matrix entries and parallel
 /// nodes, with `requires` left empty.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // One pass over an entry, top to bottom.
 fn expand_entry(
-    config: &Config,
-    wf: &Workflow,
-    workflow: &str,
+    at: &EntryAt<'_>,
     entry: &WorkflowJob,
     id: &str,
     budget: &mut Budget,
     planned: &mut usize,
+    calls: &mut Calls<'_>,
     errors: &mut Vec<Diagnostic>,
 ) -> Vec<PlannedJob> {
+    let EntryAt {
+        config,
+        wf,
+        workflow,
+        ..
+    } = *at;
     if budget.spent {
+        return Vec::new();
+    }
+    if entry.call.is_some() {
+        return calls::expand_call(at, entry, id, budget, planned, calls, errors);
+    }
+    if let Some(key) = entry.call_only_key() {
+        errors.push(Diagnostic::new(format!(
+            "workflow `{workflow}` entry `{id}` sets `{key}`, which is for an entry that runs a workflow with `call`; set it on the job under `jobs:` instead"
+        )));
         return Vec::new();
     }
     if entry.approval {
@@ -1590,7 +1704,11 @@ fn expand_entry(
         };
         base.kind = JobKind::Run { template };
         if job.permissions.is_none() {
-            base.token_permissions = token_scopes(wf.permissions.as_ref());
+            base.token_permissions = match (&wf.permissions, calls.inherited()) {
+                // A called workflow that sets none takes its caller's.
+                (None, Some(inherited)) => inherited.clone(),
+                _ => token_scopes(wf.permissions.as_ref()),
+            };
         }
         if !attach_strategy(&mut base, entry, id, &mut walk, errors) {
             break;
@@ -1876,10 +1994,12 @@ pub(crate) fn excluded(matrix: &Matrix, index: usize) -> bool {
         rest /= values.len();
     }
     matrix.exclude.iter().any(|entry| {
+        // Values match as the text they show, as in a matrix that is made
+        // with `include` or when a job is ready.
         entry.iter().all(|(key, want)| {
             picked
                 .iter()
-                .any(|(k, value)| *k == key.as_str() && *value == want)
+                .any(|(k, value)| *k == key.as_str() && same(value, want))
         })
     })
 }
@@ -2234,10 +2354,20 @@ fn dynamic_matrix_errors(
         }
     }
     if matrix.from.is_some()
-        && (!matrix.values.is_empty() || !matrix.lists.is_empty() || matrix.include_from.is_some())
+        && (!matrix.values.is_empty()
+            || !matrix.lists.is_empty()
+            || matrix.include_from.is_some()
+            || !matrix.include.is_empty()
+            || !matrix.exclude.is_empty())
     {
         errors.push(Diagnostic::new(format!(
-            "`{id}` has a matrix that is one expression and keys beside it; put the keys in the expression"
+            "`{id}` has a matrix that is one expression and keys, `include` or `exclude` beside it; put them in the expression"
+        )));
+    }
+    // The file holds one `include`: the expression or the entries.
+    if matrix.include_from.is_some() && !matrix.include.is_empty() {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has `include` both as an expression and as entries; use one"
         )));
     }
 }
@@ -2291,6 +2421,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         services: BTreeMap::new(),
         steps: Vec::new(),
         deferred: None,
+        scope: Vec::new(),
     }]
 }
 
@@ -2526,6 +2657,7 @@ fn expand_job(
         services,
         steps,
         deferred: None,
+        scope: Vec::new(),
     })
 }
 

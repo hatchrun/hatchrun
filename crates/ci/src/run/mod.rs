@@ -310,6 +310,13 @@ pub enum Work {
         /// The new attempt.
         attempt: u32,
     },
+    /// The job's row is marked as left out of its matrix for `attempt`.
+    Supersede {
+        /// The job.
+        job: u64,
+        /// The attempt it is left out of.
+        attempt: u32,
+    },
     /// The run's row opens for `attempt`.
     ReopenRun {
         /// The new attempt.
@@ -498,6 +505,8 @@ pub struct RunState {
 }
 
 pub(crate) use decide::github_context;
+#[cfg(test)]
+pub(crate) use decide::{again_work, left_out_work};
 pub use object::RunObject;
 
 #[cfg(test)]

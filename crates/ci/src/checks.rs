@@ -474,6 +474,8 @@ mod tests {
 
     fn node(state: State, message: Option<&str>) -> Node {
         Node {
+            expanded_from: None,
+            stale: false,
             id: 42,
             job: PlannedJob {
                 id: "build".into(),
@@ -497,6 +499,7 @@ mod tests {
                 services: std::collections::BTreeMap::new(),
                 steps: vec![],
                 deferred: None,
+                scope: Vec::new(),
             },
             environment: None,
             state,

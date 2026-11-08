@@ -394,7 +394,7 @@ async fn claim(
         return Ok(response);
     }
     let mut document = response.json::<JobDocument>().await?;
-    fill(&mut document, secrets, vars);
+    fill(&mut document, &secrets, vars);
     document.id_token =
         id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
     document.artifacts = artifact_service(settings, job_token);
@@ -406,10 +406,21 @@ async fn claim(
 /// answered with.
 pub(crate) fn fill(
     doc: &mut JobDocument,
-    secrets: BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
     vars: BTreeMap<String, String>,
 ) {
-    doc.secrets = secrets;
+    // A job of a called workflow reads only what its calls passed, under
+    // the names the callee gave them. The job token is not a stored
+    // secret, but a call may pass it on under another name.
+    if doc.job.scope.is_empty() {
+        doc.secrets = doc.job.visible_secrets(secrets);
+    } else {
+        let mut opened = secrets.clone();
+        opened.insert("GITHUB_TOKEN".to_owned(), doc.github.token.clone());
+        doc.secrets = doc.job.visible_secrets(&opened);
+        // The agent adds the job token itself.
+        doc.secrets.remove("GITHUB_TOKEN");
+    }
     doc.vars = vars;
 }
 
@@ -1037,6 +1048,7 @@ mod tests {
                 services: std::collections::BTreeMap::new(),
                 steps: Vec::new(),
                 deferred: None,
+                scope: Vec::new(),
             },
             event_name: "push".into(),
             event: serde_json::json!({}),
@@ -1062,6 +1074,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
+            inputs: None,
         }
     }
 
@@ -1071,7 +1084,7 @@ mod tests {
         let before = document();
         fill(
             &mut doc,
-            BTreeMap::from([("A".into(), "s".into())]),
+            &BTreeMap::from([("A".into(), "s".into())]),
             BTreeMap::from([("V".into(), "v".into())]),
         );
         assert_eq!(doc.secrets, BTreeMap::from([("A".into(), "s".into())]));
@@ -1082,6 +1095,72 @@ mod tests {
         before.secrets.clear();
         before.vars.clear();
         assert!(doc == before, "fill changed another field");
+    }
+
+    #[test]
+    fn a_call_can_pass_the_job_token_under_another_name() {
+        use hatchrun_workflow::{CallFrame, SecretsPassed};
+        let mut doc = document();
+        doc.github.token = "job-token".into();
+        let frame = |secrets| CallFrame {
+            id: "c".into(),
+            name: "c".into(),
+            workflow: "w".into(),
+            source: None,
+            with: BTreeMap::new(),
+            kinds: BTreeMap::new(),
+            secrets,
+            matrix: BTreeMap::new(),
+            if_: None,
+            outputs: BTreeMap::new(),
+        };
+        let named = SecretsPassed::Named(BTreeMap::from([(
+            "TOKEN".to_owned(),
+            "${{ secrets.GITHUB_TOKEN }}".to_owned(),
+        )]));
+        doc.job.scope = vec![frame(named)];
+        let stored = BTreeMap::from([("A".to_owned(), "s".to_owned())]);
+        fill(&mut doc, &stored, BTreeMap::new());
+        assert_eq!(
+            doc.secrets,
+            BTreeMap::from([("TOKEN".to_owned(), "job-token".to_owned())])
+        );
+        // Without the mapping the callee gets neither the token under
+        // another name nor the stored secret.
+        doc.job.scope = vec![frame(SecretsPassed::None)];
+        fill(&mut doc, &stored, BTreeMap::new());
+        assert_eq!(doc.secrets, BTreeMap::new());
+    }
+
+    #[test]
+    fn the_job_token_crosses_a_call_that_passes_no_secrets() {
+        use hatchrun_workflow::{CallFrame, SecretsPassed};
+        let mut doc = document();
+        doc.github.token = "job-token".into();
+        let frame = |id: &str, secrets| CallFrame {
+            id: id.into(),
+            name: id.into(),
+            workflow: "w".into(),
+            source: None,
+            with: BTreeMap::new(),
+            kinds: BTreeMap::new(),
+            secrets,
+            matrix: BTreeMap::new(),
+            if_: None,
+            outputs: BTreeMap::new(),
+        };
+        let named = SecretsPassed::Named(BTreeMap::from([(
+            "TOKEN".to_owned(),
+            "${{ secrets.GITHUB_TOKEN }}".to_owned(),
+        )]));
+        // The outer call passes nothing; the inner one maps the token.
+        doc.job.scope = vec![frame("o", SecretsPassed::None), frame("o / i", named)];
+        let stored = BTreeMap::from([("A".to_owned(), "s".to_owned())]);
+        fill(&mut doc, &stored, BTreeMap::new());
+        assert_eq!(
+            doc.secrets,
+            BTreeMap::from([("TOKEN".to_owned(), "job-token".to_owned())])
+        );
     }
 
     #[test]

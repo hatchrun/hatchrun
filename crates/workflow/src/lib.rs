@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod artifacts;
+pub mod call;
 pub mod concurrency;
 pub mod config;
 pub mod container;
@@ -26,6 +27,11 @@ pub mod split;
 pub mod templates;
 pub mod trigger;
 
+pub use call::{
+    CallFrame, CallInput, CallSecret, CallTarget, CallTrigger, Callee, InputType, Library,
+    MAX_CALL_DEPTH, MAX_UNIQUE_CALLEES, RemoteCall, SecretsPassed, entry_in, read_value,
+    remote_calls, remote_calls_from, resolve_frame, resolve_inputs, shared_depth,
+};
 pub use concurrency::{Cancel, Concurrency, Resolved};
 pub use config::{
     CacheStep, CheckoutStep, Command, Config, Container, ContinueOnError, Credentials, Executor,
@@ -42,7 +48,8 @@ pub use environment::{
 };
 pub use expr::{
     ExprError, Functions, HATCHRUN_KEYS, JobStatus, checks_status, continue_on_error, evaluate,
-    hatchrun_context, interpolate, job_condition, secret_refs, truthy,
+    hatchrun_context, interpolate, job_condition, may_hold_without, reads_context, secret_refs,
+    split_job_outputs, truthy,
 };
 pub use job::{
     Annotation, AnnotationLevel, ArtifactService, CacheService, Conclusion, Github, IdTokenRequest,
@@ -53,7 +60,7 @@ pub use permissions::{
 };
 pub use plan::{
     Deferred, JobKind, Plan, PlannedJob, PlannedStep, PlannedStrategy, Ready, compile,
-    config_errors, ready, run_title, validate,
+    compile_with, config_errors, ready, run_title, validate,
 };
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;

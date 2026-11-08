@@ -15,6 +15,7 @@ use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::call::SecretsPassed;
 use crate::concurrency::Concurrency;
 use crate::diagnostic::Diagnostic;
 use crate::permissions::Permissions;
@@ -988,7 +989,8 @@ pub struct Workflow {
 ///
 /// In YAML a bare job name or a map with one key, the job name, whose
 /// value holds `requires`, `type: approval`, `branches`, `tags`,
-/// `matrix`, `strategy`, `name` and parameter values.
+/// `matrix`, `strategy`, `name`, `call` (with `with`, `secrets`,
+/// `permissions` and `if`) and parameter values.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkflowJob {
     /// The job from `jobs:`, or the approval's own name.
@@ -1008,8 +1010,42 @@ pub struct WorkflowJob {
     pub matrix: Matrix,
     /// How the copies run together; `None` is the defaults.
     pub strategy: Option<Strategy>,
-    /// Parameter values for the job.
+    /// Parameter values for the job, or the inputs of the workflow a
+    /// call runs.
     pub with: BTreeMap<String, Value>,
+    /// The workflow this entry runs instead of a job: a workflow of
+    /// the config by its key, or `owner/repo/path.yml@ref`. `job` then
+    /// names the entry, and `with` holds the call's inputs. See
+    /// [`crate::call`].
+    pub call: Option<String>,
+    /// The secrets a call passes: `inherit`, or each callee secret name
+    /// and the `${{ secrets.NAME }}` it takes.
+    pub secrets: SecretsPassed,
+    /// What the token of the called jobs may do at most.
+    pub permissions: Option<Permissions>,
+    /// A call runs only when this expression is true.
+    pub if_: Option<String>,
+}
+
+impl WorkflowJob {
+    /// The first of `if`, `permissions` and `secrets` this entry sets
+    /// without a `call`: they belong to a call, and a job takes its own
+    /// from `jobs:`, so they would be ignored.
+    #[must_use]
+    pub fn call_only_key(&self) -> Option<&'static str> {
+        if self.call.is_some() {
+            return None;
+        }
+        if self.if_.is_some() {
+            Some("if")
+        } else if self.permissions.is_some() {
+            Some("permissions")
+        } else if !self.secrets.is_none() {
+            Some("secrets")
+        } else {
+            None
+        }
+    }
 }
 
 /// One entry of a workflow job's `requires:` list.
@@ -1474,7 +1510,7 @@ impl<'de> Deserialize<'de> for WorkflowJobBody {
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(
-                    "a map of requires, type, branches, tags, matrix, strategy, name and parameters",
+                    "a map of requires, type, branches, tags, matrix, strategy, name, call and parameters",
                 )
             }
 
@@ -1494,6 +1530,14 @@ impl<'de> Deserialize<'de> for WorkflowJobBody {
                             }
                             job.approval = true;
                         }
+                        "call" => job.call = Some(map.next_value()?),
+                        "with" => {
+                            let given: Option<BTreeMap<String, Value>> = map.next_value()?;
+                            job.with.extend(given.unwrap_or_default());
+                        }
+                        "secrets" => job.secrets = map.next_value()?,
+                        "permissions" => job.permissions = Some(map.next_value()?),
+                        "if" => job.if_ = Some(map.next_value()?),
                         "branches" => job.branches = Some(map.next_value()?),
                         "tags" => job.tags = Some(map.next_value()?),
                         "matrix" => job.matrix = map.next_value()?,
@@ -1542,6 +1586,12 @@ impl<'de> Deserialize<'de> for WorkflowJob {
                 }
                 let mut entry = body.map(|b| b.0).unwrap_or_default();
                 entry.job = job;
+                if let Some(key) = entry.call_only_key() {
+                    return Err(de::Error::custom(format!(
+                        "`{key}` on entry `{}` is for an entry that runs a workflow with `call`; set it on the job under `jobs:` instead",
+                        entry.job
+                    )));
+                }
                 Ok(entry)
             }
         }
@@ -1574,6 +1624,10 @@ impl WorkflowJobBodyRef<'_> {
             && j.matrix.is_empty()
             && j.strategy.is_none()
             && j.with.is_empty()
+            && j.call.is_none()
+            && j.secrets.is_none()
+            && j.permissions.is_none()
+            && j.if_.is_none()
     }
 }
 
@@ -1602,8 +1656,26 @@ impl Serialize for WorkflowJobBodyRef<'_> {
         if let Some(strategy) = &j.strategy {
             map.serialize_entry("strategy", strategy)?;
         }
-        for (key, value) in &j.with {
-            map.serialize_entry(key, value)?;
+        if let Some(call) = &j.call {
+            map.serialize_entry("call", call)?;
+        }
+        if let Some(cond) = &j.if_ {
+            map.serialize_entry("if", cond)?;
+        }
+        if !j.secrets.is_none() {
+            map.serialize_entry("secrets", &j.secrets)?;
+        }
+        if let Some(permissions) = &j.permissions {
+            map.serialize_entry("permissions", permissions)?;
+        }
+        if j.call.is_some() {
+            if !j.with.is_empty() {
+                map.serialize_entry("with", &j.with)?;
+            }
+        } else {
+            for (key, value) in &j.with {
+                map.serialize_entry(key, value)?;
+            }
         }
         map.end()
     }

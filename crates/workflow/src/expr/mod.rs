@@ -14,6 +14,7 @@ mod lexer;
 mod parser;
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde_json::Value;
@@ -406,6 +407,268 @@ pub(crate) fn contexts(expr: &str) -> Result<Vec<(Cow<'_, str>, usize)>, ExprErr
         Ok(())
     })?;
     Ok(names)
+}
+
+/// The job names an expression reads as `jobs.NAME` or `jobs['NAME']`,
+/// read from the parsed expression: a string literal that spells one is
+/// not a read.
+///
+/// # Errors
+///
+/// When the expression is too long or too deep, or does not parse.
+pub(crate) fn jobs_read(expr: &str) -> Result<Vec<String>, ExprError> {
+    fn walk(expr: &parser::Expr<'_>, out: &mut Vec<String>) {
+        use parser::{Expr, Step};
+        match expr {
+            Expr::Literal(_) | Expr::Context { .. } => {}
+            Expr::Not(inner) => walk(inner, out),
+            Expr::Access { base, path } => {
+                if let Expr::Context { name, .. } = &**base
+                    && name.eq_ignore_ascii_case("jobs")
+                {
+                    match path.first() {
+                        Some(Step::Property(job)) => out.push((*job).to_owned()),
+                        Some(Step::Index(Expr::Literal(Value::String(job)))) => {
+                            out.push(job.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                walk(base, out);
+                for step in path {
+                    if let Step::Index(index) = step {
+                        walk(index, out);
+                    }
+                }
+            }
+            Expr::Call { args, .. } | Expr::And(args) | Expr::Or(args) => {
+                for arg in args {
+                    walk(arg, out);
+                }
+            }
+            Expr::Compare { first, rest } => {
+                walk(first, out);
+                for (_, operand) in rest {
+                    walk(operand, out);
+                }
+            }
+        }
+    }
+    let ast = tree(expr)?;
+    let mut out = Vec::new();
+    walk(&ast, &mut out);
+    Ok(out)
+}
+
+/// The expression a condition is, when it is one: a bare expression, or
+/// one `${{ }}` that is the whole text. `None` for text that has several
+/// segments.
+fn whole_expression(cond: &str) -> Result<Option<&str>, ExprError> {
+    let trimmed = cond.trim();
+    if find_open(trimmed).is_none() {
+        return Ok(Some(trimmed));
+    }
+    let segments = expressions(trimmed)?;
+    Ok(match segments.as_slice() {
+        [(3, inner)] if trimmed.starts_with("${{") && 3 + inner.len() + 2 == trimmed.len() => {
+            Some(inner.trim())
+        }
+        _ => None,
+    })
+}
+
+/// Whether a condition reads the context `context`, found in the parsed
+/// expression: a string that spells the name is no read, and the name is
+/// matched in any case. A condition that does not parse reads it, as
+/// far as a caller can tell.
+#[must_use]
+pub fn reads_context(cond: &str, context: &str) -> bool {
+    let found = if find_open(cond).is_some() {
+        expressions(cond)
+    } else {
+        Ok(vec![(0, cond)])
+    };
+    let Ok(found) = found else {
+        return true;
+    };
+    found.into_iter().any(|(_, inner)| {
+        contexts(inner).map_or(true, |names| {
+            names
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(context))
+        })
+    })
+}
+
+/// Whether a condition that reads `context` may hold before that context
+/// is known: `false` only when a part that does not read it is already
+/// false, such as `failure()` of `failure() && matrix.os == 'x'` after a
+/// success, or the implied `success()` after a failure. The operands of
+/// a top-level `&&` that read `context` are left to be read when it is
+/// known.
+///
+/// # Errors
+///
+/// When the condition does not parse or an operand fails to evaluate.
+pub fn may_hold_without(
+    cond: &str,
+    context: &str,
+    ctx: &Value,
+    funcs: &dyn Functions,
+) -> Result<bool, ExprError> {
+    let Some(inner) = whole_expression(cond)? else {
+        return Ok(true);
+    };
+    let ast = tree(inner)?;
+    if !eval::calls_status(&ast) && funcs.status() != JobStatus::Success {
+        return Ok(false);
+    }
+    let budget = eval::Budget::new();
+    let operands: Vec<&parser::Expr<'_>> = match &ast {
+        parser::Expr::And(args) => args.iter().collect(),
+        other => vec![other],
+    };
+    // Once an operand that reads the context is passed, whether the
+    // operands after it are reached depends on it: they can say false,
+    // which is false either way, but their errors wait for the legs.
+    let mut unknown = false;
+    for operand in operands {
+        let mut reads = false;
+        eval::visit_contexts(operand, &mut |name, _| {
+            reads |= name.eq_ignore_ascii_case(context);
+            Ok(())
+        })?;
+        if reads {
+            unknown = true;
+            continue;
+        }
+        let value = eval::Evaluator {
+            ctx,
+            funcs,
+            budget: &budget,
+        }
+        .eval(operand);
+        match value {
+            Ok(value) if !truthy(&value) => return Ok(false),
+            Ok(_) => {}
+            Err(_) if unknown => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
+}
+
+/// `text` with each read of `jobs.<id>.outputs.<name>` (or
+/// `jobs['<id>'].outputs.<name>`) of a job in `splits` replaced by a read
+/// of each entry the job was split into, the last one that has a value
+/// winning, as the outputs of a matrix merge. Only the parsed reads are
+/// rewritten, never text inside a string.
+#[must_use]
+pub fn split_job_outputs(text: &str, splits: &BTreeMap<String, Vec<String>>) -> String {
+    let Ok(found) = expressions(text) else {
+        return text.to_owned();
+    };
+    let mut out = text.to_owned();
+    for (start, inner) in found.into_iter().rev() {
+        let Ok(tokens) = lexer::lex(inner) else {
+            continue;
+        };
+        let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            match job_output_read(&tokens, i).filter(|read| splits.contains_key(&read.job)) {
+                Some(read) => {
+                    let reads: Vec<String> = splits[&read.job]
+                        .iter()
+                        .rev()
+                        .map(|n| {
+                            if read.bracket {
+                                format!("jobs.{n}.outputs['{}']", read.name.replace('\'', "''"))
+                            } else {
+                                format!("jobs.{n}.outputs.{}", read.name)
+                            }
+                        })
+                        .collect();
+                    edits.push((
+                        tokens[i].offset,
+                        read.end,
+                        format!("({})", reads.join(" || ")),
+                    ));
+                    i += read.tokens;
+                }
+                None => i += 1,
+            }
+        }
+        for (from, to, with) in edits.into_iter().rev() {
+            out.replace_range(start + from..start + to, &with);
+        }
+    }
+    out
+}
+
+/// A read of `jobs.<job>.outputs.<name>` found in tokens.
+struct JobOutputRead {
+    job: String,
+    name: String,
+    /// The output was read as `outputs['name']`.
+    bracket: bool,
+    /// How many tokens the read is.
+    tokens: usize,
+    /// The byte offset after the read.
+    end: usize,
+}
+
+/// The read of a job output that starts at token `i`, whichever way it
+/// spells the job and the output: `jobs.build.outputs.tag`,
+/// `jobs['build'].outputs['tag']` and the mixes.
+fn job_output_read(tokens: &[lexer::Token<'_>], i: usize) -> Option<JobOutputRead> {
+    use lexer::Kind;
+    let kind = |at: usize| tokens.get(at).map(|t| &t.kind);
+    if i > 0 && matches!(tokens[i - 1].kind, Kind::Dot) {
+        return None;
+    }
+    let Some(Kind::Ident(jobs)) = kind(i) else {
+        return None;
+    };
+    if !jobs.eq_ignore_ascii_case("jobs") {
+        return None;
+    }
+    let mut at = i + 1;
+    let job = match (kind(at), kind(at + 1), kind(at + 2)) {
+        (Some(Kind::Dot), Some(Kind::Ident(id)), _) => {
+            at += 2;
+            (*id).to_owned()
+        }
+        (Some(Kind::LBracket), Some(Kind::Str(id)), Some(Kind::RBracket)) => {
+            at += 3;
+            id.clone()
+        }
+        _ => return None,
+    };
+    if !matches!((kind(at), kind(at + 1)), (Some(Kind::Dot), Some(Kind::Ident(o))) if o.eq_ignore_ascii_case("outputs"))
+    {
+        return None;
+    }
+    at += 2;
+    let (name, bracket, used, end) = match (kind(at), kind(at + 1), kind(at + 2)) {
+        (Some(Kind::Dot), Some(Kind::Ident(name)), _) => (
+            (*name).to_owned(),
+            false,
+            2,
+            tokens[at + 1].offset + name.len(),
+        ),
+        (Some(Kind::LBracket), Some(Kind::Str(name)), Some(Kind::RBracket)) => {
+            (name.clone(), true, 3, tokens[at + 2].offset + 1)
+        }
+        _ => return None,
+    };
+    Some(JobOutputRead {
+        job,
+        name,
+        bracket,
+        tokens: at + used - i,
+        end,
+    })
 }
 
 /// Lexes and parses one expression, within the length limit.
