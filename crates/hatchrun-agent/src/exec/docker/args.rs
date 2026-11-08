@@ -12,20 +12,29 @@ use std::path::Path;
 /// `options`.
 #[derive(Debug, Default, Clone)]
 pub struct Create<'a> {
+    /// The container's name.
     pub name: &'a str,
+    /// The label that marks everything the job makes.
     pub label: &'a str,
+    /// The network to join.
     pub network: Option<&'a str>,
     /// The hostname other containers on the network reach it by.
     pub alias: Option<&'a str>,
+    /// The working directory inside the container.
     pub workdir: Option<&'a str>,
-    /// `-e` flags, from `env_flags`: values travel in the docker
-    /// client's environment, not on its command line.
+    /// The flags that set the environment: `--env-file <path>` and `-e`
+    /// for what a file cannot carry. They keep values out of the docker
+    /// client's own environment.
     pub env: Vec<String>,
+    /// Ports to publish, as `-p` reads them.
     pub ports: Vec<String>,
+    /// Volumes to mount, as `-v` reads them.
     pub volumes: Vec<String>,
     /// The user's `options`, already split.
     pub options: Vec<String>,
+    /// Replaces the image's entrypoint.
     pub entrypoint: Option<&'a str>,
+    /// The image.
     pub image: &'a str,
     /// The command and arguments after the image.
     pub command: Vec<String>,

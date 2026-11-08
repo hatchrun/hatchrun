@@ -391,11 +391,12 @@ impl Container {
             out.push(("credentials.username".to_owned(), &c.username));
             out.push(("credentials.password".to_owned(), &c.password));
         }
-        out.extend(
-            self.env
-                .iter()
-                .map(|(k, v)| (format!("env.{k}"), v.as_str())),
-        );
+        out.extend(self.env.iter().flat_map(|(k, v)| {
+            [
+                ("env name".to_owned(), k.as_str()),
+                (format!("env.{k}"), v.as_str()),
+            ]
+        }));
         out.extend(self.ports.iter().map(|p| ("ports".to_owned(), p.as_str())));
         out.extend(
             self.volumes
@@ -416,9 +417,11 @@ impl Container {
             c.username = f(&c.username);
             c.password = f(&c.password);
         }
-        for v in self.env.values_mut() {
-            *v = f(v);
-        }
+        // The names are expressions too, so the map is rebuilt.
+        self.env = std::mem::take(&mut self.env)
+            .into_iter()
+            .map(|(k, v)| (f(&k), f(&v)))
+            .collect();
         for v in self.ports.iter_mut().chain(self.volumes.iter_mut()) {
             *v = f(v);
         }

@@ -95,6 +95,53 @@ pub fn forbidden_options(words: &[String]) -> Vec<&str> {
         .collect()
 }
 
+/// The problems with the job container's `--network-alias` options: an
+/// alias equal to a service id would make the hostname name two
+/// containers. `what` starts each message; options that hold `${{ }}`
+/// are not judged.
+#[must_use]
+pub fn alias_problems<'a>(
+    what: &str,
+    container: &Container,
+    service_ids: impl IntoIterator<Item = &'a String>,
+) -> Vec<String> {
+    let Some(options) = container.options.as_deref().filter(|o| !o.contains("${{")) else {
+        return Vec::new();
+    };
+    let Ok(words) = split_options(options) else {
+        return Vec::new();
+    };
+    aliases_of_services(what, &words, service_ids)
+}
+
+/// [`alias_problems`] for options that are already split and evaluated.
+#[must_use]
+pub fn aliases_of_services<'a>(
+    what: &str,
+    words: &[String],
+    service_ids: impl IntoIterator<Item = &'a String>,
+) -> Vec<String> {
+    let ids: Vec<&String> = service_ids.into_iter().collect();
+    let mut out = Vec::new();
+    for (i, word) in words.iter().enumerate() {
+        let alias = match word.split_once('=') {
+            Some(("--network-alias" | "--net-alias", value)) => Some(value),
+            None if matches!(word.as_str(), "--network-alias" | "--net-alias") => {
+                words.get(i + 1).map(String::as_str)
+            }
+            _ => None,
+        };
+        if let Some(alias) = alias
+            && ids.iter().any(|id| id.as_str() == alias)
+        {
+            out.push(format!(
+                "{what} `options` sets `--network-alias {alias}`, which is the id of a service"
+            ));
+        }
+    }
+    out
+}
+
 /// Whether `id` can be a service id: it is the container's hostname on
 /// the job's network and a key of the `job.services` context.
 #[must_use]
@@ -182,6 +229,33 @@ mod tests {
         assert_eq!(forbidden_options(&words), ["--network", "--name"]);
         let none = split_options("--cpus 1").unwrap();
         assert_eq!(forbidden_options(&none).len(), 0);
+    }
+
+    #[test]
+    fn a_job_alias_may_not_be_a_service_id() {
+        let container = |options: &str| Container {
+            image: "x".to_owned(),
+            options: Some(options.to_owned()),
+            ..Container::default()
+        };
+        let ids = [String::from("db")];
+        assert_eq!(
+            alias_problems("c", &container("--network-alias db"), &ids).len(),
+            1
+        );
+        assert_eq!(
+            alias_problems("c", &container("--net-alias=db --cpus 1"), &ids).len(),
+            1
+        );
+        assert_eq!(
+            alias_problems("c", &container("--network-alias web"), &ids).len(),
+            0
+        );
+        assert_eq!(
+            alias_problems("c", &container("--network-alias ${{ x }}"), &ids).len(),
+            0
+        );
+        assert_eq!(alias_problems("c", &Container::default(), &ids).len(), 0);
     }
 
     #[test]

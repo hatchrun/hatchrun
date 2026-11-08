@@ -200,7 +200,9 @@ pub struct PlannedJob {
     /// The container the steps run in, parameters substituted. The
     /// agent reads its expressions when the job starts.
     pub container: Option<Container>,
-    /// The containers that run beside the job, by service id.
+    /// The containers that run beside the job, by service id. A plan
+    /// stored before services existed has none.
+    #[serde(default)]
     pub services: BTreeMap<String, Container>,
     /// The steps, with commands expanded.
     pub steps: Vec<PlannedStep>,
@@ -778,6 +780,11 @@ impl Check<'_> {
     fn containers(&mut self, job: &Job) {
         if let Some(container) = &job.container {
             self.container("`container`", container);
+            let named = format!("{} `container`", self.owner);
+            for problem in crate::container::alias_problems(&named, container, job.services.keys())
+            {
+                self.errors.push(Diagnostic::new(problem));
+            }
         }
         for (id, service) in &job.services {
             if !crate::container::valid_service_id(id) {

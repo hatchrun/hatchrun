@@ -709,7 +709,22 @@ impl Job<'_> {
         let args = [script.to_string_lossy().into_owned()];
         let program = node.to_string_lossy();
         let cwd = self.layout.workspace.clone();
-        let exec = match self.launch_for(&program, &args, &cwd, &env) {
+        if self.docker.contained() && !self.mounted_in_container(node) {
+            self.say(
+                sink,
+                Line::Error(&format!(
+                    "Node at {} is not available in the job container; only {EXTERNALS} and --node are mounted. Install node20 or node24 there.",
+                    node.display()
+                )),
+            );
+            return Ran {
+                outcome: Conclusion::Failure,
+                outputs: BTreeMap::new(),
+                state: Vec::new(),
+            };
+        }
+        let step_keys: Vec<String> = extra.keys().cloned().collect();
+        let exec = match self.launch_for(&program, &args, &cwd, &env, &step_keys) {
             Ok(exec) => exec,
             Err(message) => {
                 self.say(sink, Line::Error(&message));

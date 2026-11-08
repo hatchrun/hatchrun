@@ -2561,3 +2561,57 @@ workflows:
     let message = legs[0].error.as_deref().unwrap();
     assert!(message.contains("evaluated to a label"), "{message}");
 }
+
+#[test]
+fn container_env_names_are_substituted_and_checked() {
+    let p = plan(
+        "
+jobs:
+  t:
+    parameters: { n: { type: string, default: A } }
+    runs-on: ubuntu-latest
+    container: { image: a, env: { 'K_${{ parameters.n }}': v } }
+    steps: []
+workflows: { ci: { on: { push: {} }, jobs: [{ t: { n: B } }] } }
+",
+    );
+    let env = &p.jobs[0].container.as_ref().unwrap().env;
+    assert_eq!(env.keys().collect::<Vec<_>>(), ["K_B"]);
+    assert_error(
+        "
+jobs: { t: { runs-on: ubuntu-latest, container: { image: a, env: { '${{ nosuch.x }}': v } }, steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+        &["`container`", "unknown context"],
+    );
+}
+
+#[test]
+fn the_job_container_cannot_take_a_services_alias() {
+    assert_error(
+        "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    container: { image: a, options: '--network-alias db' }
+    services: { db: { image: b } }
+    steps: []
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+        &["`container`", "--network-alias db", "id of a service"],
+    );
+}
+
+#[test]
+fn a_stored_plan_without_services_loads() {
+    let p = plan(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+    );
+    let mut json = serde_json::to_value(&p).unwrap();
+    json["jobs"][0].as_object_mut().unwrap().remove("services");
+    let back: Plan = serde_json::from_value(json).unwrap();
+    assert!(back.jobs[0].services.is_empty());
+}

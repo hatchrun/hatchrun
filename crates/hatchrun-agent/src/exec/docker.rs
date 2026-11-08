@@ -94,6 +94,7 @@ pub(super) struct JobContainer {
 }
 
 impl DockerState {
+    /// A state for a job whose containers carry `label`.
     pub(super) fn new(label: String) -> Self {
         Self {
             label,
@@ -221,18 +222,26 @@ impl Job<'_> {
         let mut child = command
             .spawn()
             .map_err(|e| format!("start {}: {e}", bin.display()))?;
-        if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            pipe.write_all(text.as_bytes())
+        let pipe = child.stdin.take();
+        // Feeding standard input is part of the command: a docker that
+        // never reads it must still time out and stop on cancel.
+        let run = async {
+            if let (Some(text), Some(mut pipe)) = (stdin, pipe) {
+                pipe.write_all(text.as_bytes())
+                    .await
+                    .map_err(|e| format!("write to docker: {e}"))?;
+                drop(pipe);
+            }
+            child
+                .wait_with_output()
                 .await
-                .map_err(|e| format!("write to docker: {e}"))?;
-            drop(pipe);
-        }
+                .map_err(|e| format!("wait for docker: {e}"))
+        };
         let mut cancel = super::wait_for(self.cancel_requests.clone(), 1);
         let cleaning = self.docker.cleaning;
         let output = tokio::select! {
-            output = tokio::time::timeout(COMMAND_TIMEOUT, child.wait_with_output()) => output
-                .map_err(|_| "docker did not finish in time".to_owned())?
-                .map_err(|e| format!("wait for docker: {e}"))?,
+            output = tokio::time::timeout(COMMAND_TIMEOUT, run) => output
+                .map_err(|_| "docker did not finish in time".to_owned())??,
             // Dropping the child kills it.
             () = &mut cancel, if !cleaning => return Err(CANCELED.to_owned()),
         };
@@ -266,6 +275,7 @@ impl Job<'_> {
         args: Vec<String>,
         env: BTreeMap<String, String>,
         files: Option<&super::files::StepFiles>,
+        limit: Option<Duration>,
         sink: &mut dyn Sink,
     ) -> Ran {
         let bin = match self.docker_bin() {
@@ -287,8 +297,8 @@ impl Job<'_> {
                 args: &args,
                 cwd: &cwd,
                 env: &env,
-                timeout: None,
-                timeout_minutes: None,
+                timeout: limit,
+                timeout_minutes: limit.map(|l| u32::try_from(l.as_secs() / 60).unwrap_or(u32::MAX)),
                 files,
                 as_agent: true,
             },
@@ -343,7 +353,9 @@ impl Job<'_> {
         };
         let mut env = BTreeMap::new();
         for (key, value) in &c.env {
-            env.insert(key.clone(), eval(value, &format!("env.{key}"))?);
+            // The name is an expression too.
+            let name = eval(key, "env name")?;
+            env.insert(name, eval(value, &format!("env.{key}"))?);
         }
         let ports = c
             .ports
@@ -430,6 +442,17 @@ impl Job<'_> {
             Some(c) => Some(self.resolve("container", c)?),
             None => None,
         };
+        if let Some(job) = &job
+            && let Some(problem) = hatchrun_workflow::container::aliases_of_services(
+                "container",
+                &job.options,
+                doc.job.services.keys(),
+            )
+            .into_iter()
+            .next()
+        {
+            return Err(problem);
+        }
 
         let network = format!("hatchrun_network_{}", random_name()?);
         self.say(sink, Line::Note(&format!("Creating network {network}")));
@@ -506,7 +529,10 @@ impl Job<'_> {
                 && !self.docker.volumes.iter().any(|v| v == name)
             {
                 let args = ["volume".to_owned(), "inspect".to_owned(), name.to_owned()];
-                if self.docker_capture(&args, None).await?.code != 0 {
+                let found = self.docker_capture(&args, None).await?;
+                // Only a daemon that says the volume does not exist makes
+                // it this job's; any other failure leaves it alone.
+                if found.code != 0 && found.stderr.to_lowercase().contains("no such volume") {
                     self.docker.volumes.push(name.to_owned());
                 }
             }
@@ -778,6 +804,7 @@ impl Job<'_> {
         argv: &[String],
         cwd: &Path,
         env: &BTreeMap<String, String>,
+        step_keys: &[String],
     ) -> Result<Exec, String> {
         let Some(job) = &self.docker.job else {
             return Ok(Exec {
@@ -790,7 +817,8 @@ impl Job<'_> {
             });
         };
         let maps = self.docker.maps.clone();
-        let inner = self.container_env(env, &maps, Some(&job.path));
+        let explicit = self.explicit_keys(step_keys);
+        let inner = self.container_env(env, &maps, Some(&job.path), &explicit);
         let name = job.name.clone();
         let (mut flags, env_file) = self.env_args(inner)?;
         let docker_env = self.docker_env()?;
@@ -813,15 +841,38 @@ impl Job<'_> {
         })
     }
 
+    /// The variables the job assigned itself: its `env`, `GITHUB_ENV`
+    /// and the composite actions' `env`, with `step_keys`, the step's
+    /// own.
+    pub(super) fn explicit_keys(&self, step_keys: &[String]) -> BTreeSet<String> {
+        let mut keys: BTreeSet<String> = self.env_context().into_keys().collect();
+        keys.extend(step_keys.iter().cloned());
+        keys
+    }
+
+    /// Whether the job container sees `path`: it is under a directory the
+    /// container mounts. A path outside them does not exist there.
+    pub(super) fn mounted_in_container(&self, path: &Path) -> bool {
+        self.docker
+            .maps
+            .iter()
+            .any(|(host, _)| path.starts_with(host))
+    }
+
     /// What a step's environment becomes inside the job container: the
     /// runner's variables with paths translated, without the host's
     /// `HOME`, user and image environment, and a `PATH` of the
     /// container's own with the `GITHUB_PATH` entries in front.
+    ///
+    /// A variable that equals the environment file's value is left out
+    /// as the host's, unless `explicit` names it: the job, the step or
+    /// `GITHUB_ENV` assigned it.
     fn container_env(
         &self,
         env: &BTreeMap<String, String>,
         maps: &[(String, String)],
         container_path: Option<&str>,
+        explicit: &BTreeSet<String>,
     ) -> BTreeMap<String, String> {
         let host_path = self
             .docker
@@ -833,7 +884,7 @@ impl Job<'_> {
             if matches!(key.as_str(), "HOME" | "USER" | "LOGNAME" | "PATH") {
                 continue;
             }
-            if self.docker.host_env.get(key) == Some(value) {
+            if self.docker.host_env.get(key) == Some(value) && !explicit.contains(key) {
                 continue;
             }
             inner.insert(key.clone(), args::translate(value, maps));
@@ -847,7 +898,10 @@ impl Job<'_> {
             .collect();
         match env.get("PATH") {
             // A PATH the job or step set itself.
-            Some(path) if path != host_path && !is_host_path(path, host_path, &self.path_dirs) => {
+            Some(path)
+                if explicit.contains("PATH")
+                    || (path != host_path && !is_host_path(path, host_path, &self.path_dirs)) =>
+            {
                 inner.insert("PATH".to_owned(), args::translate(path, maps));
             }
             _ if !dirs.is_empty() && container_path.is_some() => {
@@ -1015,16 +1069,23 @@ fn path_text(path: &Path) -> String {
 
 /// What `docker` printed.
 pub(super) struct Captured {
+    /// The exit code, or -1 when a signal ended it.
     pub(super) code: i32,
+    /// What it wrote to standard output.
     pub(super) stdout: String,
+    /// What it wrote to standard error.
     pub(super) stderr: String,
 }
 
 /// A process to start for a step, on the machine or through `docker`.
 pub(super) struct Exec {
+    /// The program to start.
     pub(super) program: String,
+    /// Its arguments.
     pub(super) args: Vec<String>,
+    /// The directory it starts in.
     pub(super) cwd: PathBuf,
+    /// Its whole environment.
     pub(super) env: BTreeMap<String, String>,
     /// It runs as the agent, not the runner user.
     pub(super) as_agent: bool,

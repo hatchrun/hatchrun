@@ -190,6 +190,12 @@ impl Cx {
         let before = self.errors.len();
         let container = self.container(at, "container", gh.container.as_ref());
         let services = self.services(at, gh.services.as_ref());
+        if let Some(container) = &container {
+            let named = format!("{at}: `container`");
+            for problem in crate::container::alias_problems(&named, container, services.keys()) {
+                self.error(problem);
+            }
+        }
         let (environment, environment_url) = self.environment(at, gh.environment.as_ref());
         let continue_on_error = self.continue_on_error(at, gh.continue_on_error.as_ref());
         let concurrency = self.concurrency(at, gh.concurrency.as_ref());
@@ -268,10 +274,14 @@ impl Cx {
         let value = value?;
         let map = match value {
             Value::String(image) if !image.trim().is_empty() => {
-                return Some(Container {
+                let container = Container {
                     image: image.clone(),
                     ..Container::default()
-                });
+                };
+                for problem in crate::container::problems(&format!("{at}: `{key}`"), &container) {
+                    self.error(problem);
+                }
+                return Some(container);
             }
             Value::Object(map) => map,
             other => {
@@ -336,13 +346,26 @@ impl Cx {
         };
         let ports = self.texts(at, key, "ports", map.get("ports"))?;
         let volumes = self.texts(at, key, "volumes", map.get("volumes"))?;
+        let options = match map.get("options") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let Some(text) = scalar(value) else {
+                    self.error(format!(
+                        "{at}: `{key}.options` is {}; it must be a string",
+                        show(value)
+                    ));
+                    return None;
+                };
+                Some(text)
+            }
+        };
         let container = Container {
             image,
             credentials,
             env,
             ports,
             volumes,
-            options: map.get("options").and_then(scalar),
+            options,
         };
         for problem in crate::container::problems(&format!("{at}: `{key}`"), &container) {
             self.error(problem);
@@ -361,7 +384,20 @@ impl Cx {
     ) -> Option<Vec<String>> {
         match value {
             None | Some(Value::Null) => Some(Vec::new()),
-            Some(Value::Array(items)) => Some(items.iter().filter_map(scalar).collect()),
+            Some(Value::Array(items)) => {
+                let mut out = Vec::new();
+                for item in items {
+                    let Some(text) = scalar(item) else {
+                        self.error(format!(
+                            "{at}: `{key}.{name}` has {}; each entry must be a string or a number",
+                            show(item)
+                        ));
+                        return None;
+                    };
+                    out.push(text);
+                }
+                Some(out)
+            }
             Some(other) => {
                 self.error(format!(
                     "{at}: `{key}.{name}` is {}; it must be a list",

@@ -144,7 +144,7 @@ fn uses_docker_runs_an_image_and_reads_its_outputs() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
-    let doc = make::document(vec![PlannedStep::Uses(UsesStep {
+    let mut doc = make::document(vec![PlannedStep::Uses(UsesStep {
         id: Some("a".to_owned()),
         uses: format!("docker://{}", image()),
         with: BTreeMap::from([
@@ -157,10 +157,12 @@ fn uses_docker_runs_an_image_and_reads_its_outputs() {
         ]),
         ..UsesStep::default()
     })]);
+    doc.job.outputs = BTreeMap::from([("r".to_owned(), "${{ steps.a.outputs.r }}".to_owned())]);
     let out = exec(dir.path(), &doc);
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(0), "{text}");
     assert!(text.lines().any(|l| l == "ws=/github/workspace"), "{text}");
+    assert_eq!(result(dir.path()).outputs["r"], "me");
     assert_eq!(leftovers(), Vec::<String>::new());
 }
 

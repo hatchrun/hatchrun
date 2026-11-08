@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 
 use hatchrun_workflow::{Conclusion, UsesStep};
 
-use super::path_text;
+use super::{COMMAND_TIMEOUT, args, path_text};
 use crate::exec::action::{Action, ActionRef, Input, Metadata, Runs};
 use crate::exec::files::StepFiles;
 use crate::exec::sink::Sink;
@@ -41,8 +41,11 @@ pub(in crate::exec) enum Image {
 /// What one run of a Docker action starts.
 #[derive(Debug, Clone)]
 pub(in crate::exec) struct DockerRun {
+    /// Where the image comes from.
     pub(in crate::exec) image: Image,
+    /// Replaces the image's entrypoint.
     pub(in crate::exec) entrypoint: Option<String>,
+    /// The arguments after the image, one each.
     pub(in crate::exec) args: Vec<String>,
     /// The step's `env`, `INPUT_*` and the action's own `env`.
     pub(in crate::exec) env: BTreeMap<String, String>,
@@ -104,7 +107,13 @@ impl Job<'_> {
                     self.say(sink, Line::Note(&format!("Pulling {name}")));
                     let env = self.docker_env()?;
                     let ran = self
-                        .docker_stream(vec!["pull".to_owned(), name.clone()], env, None, sink)
+                        .docker_stream(
+                            vec!["pull".to_owned(), name.clone()],
+                            env,
+                            None,
+                            Some(COMMAND_TIMEOUT),
+                            sink,
+                        )
                         .await;
                     if ran.outcome != Conclusion::Success {
                         return Err(format!("Failed to pull {name}"));
@@ -136,7 +145,9 @@ impl Job<'_> {
                 ];
                 self.docker.images.push(tag.clone());
                 let env = self.docker_env()?;
-                let ran = self.docker_stream(argv, env, None, sink).await;
+                let ran = self
+                    .docker_stream(argv, env, None, Some(COMMAND_TIMEOUT), sink)
+                    .await;
                 if ran.outcome != Conclusion::Success {
                     return Err(format!("Failed to build {}", dockerfile.display()));
                 }
@@ -201,7 +212,8 @@ impl Job<'_> {
         env.remove("GITHUB_ACTION_PATH");
         env.remove("RUNNER_WORKSPACE");
         let maps = maps(self);
-        let inner = self.container_env(&env, &maps, None);
+        let explicit = self.explicit_keys(&run.env.keys().cloned().collect::<Vec<_>>());
+        let inner = self.container_env(&env, &maps, None, &explicit);
         let (flags, env_file) = match self.env_args(inner) {
             Ok(args) => args,
             Err(message) => return failed(self, sink, &message),
@@ -262,13 +274,17 @@ impl Job<'_> {
             ]);
         }
         if let Some(entrypoint) = &run.entrypoint {
-            argv.extend(["--entrypoint".to_owned(), entrypoint.clone()]);
+            argv.extend([
+                "--entrypoint".to_owned(),
+                args::translate(entrypoint, &maps),
+            ]);
         }
         argv.push(image);
-        argv.extend(run.args.iter().cloned());
+        // The workspace is `/github/workspace` in the container.
+        argv.extend(run.args.iter().map(|a| args::translate(a, &maps)));
 
         let ran = self
-            .docker_stream(argv, docker_env, Some(&files), sink)
+            .docker_stream(argv, docker_env, Some(&files), None, sink)
             .await;
         super::remove_env_file(env_file.as_deref());
         self.states
@@ -295,7 +311,11 @@ impl Job<'_> {
         else {
             return Err("not a Docker action".to_owned());
         };
-        let scope = self.ctx.with_action(evaluated.scope.clone());
+        let mut scope = self.ctx.with_action(evaluated.scope.clone());
+        // The action's own `env` and `args` read the step's `env` too.
+        let mut visible = self.env_context();
+        visible.extend(evaluated.step_env.clone());
+        scope.set_env(&visible);
         let ws = &self.layout.workspace;
         let eval = |text: &str, what: &str| {
             interp(text, &scope, ws, self.status).map_err(|e| format!("{what}: {e}"))

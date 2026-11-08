@@ -36,7 +36,12 @@ login)
   cat > "$dir/login.pw"
   echo "login-stdin:$(cat "$dir/login.pw")" >> "$dir/calls.log" ;;
 volume)
-  [ "$2" = inspect ] && { [ -f "$dir/volume_exists" ] && exit 0; exit 1; } ;;
+  if [ "$2" = inspect ]; then
+    [ -f "$dir/volume_exists" ] && exit 0
+    [ -f "$dir/volume_error" ] && { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+    echo "Error response from daemon: get $3: no such volume" >&2
+    exit 1
+  fi ;;
 pull)
   [ -f "$dir/slow_pull" ] && sleep 5
   if [ -f "$dir/fail_pull" ]; then cat "$dir/login.pw" >&2; exit 1; fi ;;
@@ -49,6 +54,8 @@ exec)
   if [ "$2" = --workdir ]; then
     [ -f "$dir/slow_exec" ] && sleep 5
     echo "EXEC $*"
+    for a; do last=$a; done
+    case "$last" in /__w/*) cat "$dir/../work${last#/__w}" >> "$dir/scripts.log" ;; esac
     [ -f "$dir/exec_code" ] && exit "$(cat "$dir/exec_code")"
   else
     case "$*" in
@@ -96,12 +103,25 @@ impl Setup {
     }
 
     fn run(&self, doc: &JobDocument) -> Output {
+        self.run_env(doc, None)
+    }
+
+    /// Runs with `dir` first on the agent's `PATH`.
+    fn run_with_path(&self, doc: &JobDocument, dir: &Path) -> Output {
+        self.run_env(doc, Some(dir))
+    }
+
+    fn run_env(&self, doc: &JobDocument, path_dir: Option<&Path>) -> Output {
         let job = self.path().join("job.json");
         std::fs::write(&job, serde_json::to_string(doc).unwrap()).unwrap();
         let env = self.path().join("environment");
         std::fs::write(&env, "PATH=/usr/bin:/bin\nJAVA_HOME=/opt/jdk\n").unwrap();
         let state = self.path().canonicalize().unwrap().join("state");
-        Command::new(env!("CARGO_BIN_EXE_hatchrun-agent"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hatchrun-agent"));
+        if let Some(dir) = path_dir {
+            command.env("PATH", format!("{}:/usr/bin:/bin", dir.display()));
+        }
+        command
             .arg("exec")
             .arg(&job)
             .arg("--work-dir")
@@ -671,5 +691,108 @@ fn a_step_timeout_covers_docker_actions_and_steps_in_the_container() {
         stdout(&out).contains("timed out after 1 minutes"),
         "{}",
         stdout(&out)
+    );
+}
+
+#[test]
+fn an_unclear_volume_lookup_never_marks_a_volume_for_removal() {
+    let setup = Setup::new();
+    setup.set("volume_error", "");
+    let mut doc = make::document(vec![make::step("true")]);
+    doc.job.services = BTreeMap::from([("db".to_owned(), with_volume("maybe"))]);
+    assert_eq!(setup.run(&doc).status.code(), Some(0));
+    assert!(
+        !setup.calls().iter().any(|c| c.starts_with("volume rm")),
+        "{:#?}",
+        setup.calls()
+    );
+}
+
+#[test]
+fn a_variable_the_job_sets_reaches_the_container_even_when_it_equals_the_hosts() {
+    let setup = Setup::new();
+    let mut doc = make::document(vec![make::step("true")]);
+    // The environment file in these tests also sets JAVA_HOME=/opt/jdk.
+    doc.job.env = BTreeMap::from([("JAVA_HOME".to_owned(), "/opt/jdk".to_owned())]);
+    doc.job.container = Some(image("alpine"));
+    assert_eq!(setup.run(&doc).status.code(), Some(0));
+    let files = setup.read("envfile.log");
+    assert!(files.lines().any(|l| l == "JAVA_HOME=/opt/jdk"), "{files}");
+}
+
+#[test]
+fn a_script_in_the_container_reads_the_containers_paths() {
+    let setup = Setup::new();
+    let mut doc = make::document(vec![make::step("echo ${{ github.workspace }}")]);
+    doc.job.container = Some(image("alpine"));
+    assert_eq!(setup.run(&doc).status.code(), Some(0));
+    let scripts = setup.read("scripts.log");
+    assert!(scripts.contains("echo /__w/repo/repo"), "{scripts}");
+}
+
+#[test]
+fn a_docker_actions_args_and_env_read_the_step_and_the_containers_paths() {
+    let setup = Setup::new();
+    let act = setup.path().join("work/repo/repo/act");
+    std::fs::create_dir_all(&act).unwrap();
+    std::fs::write(
+        act.join("action.yml"),
+        "name: d
+runs:
+  using: docker
+  image: docker://alpine
+  args: ['${{ github.workspace }}/x']
+  env:
+    FROM_STEP: ${{ env.FOO }}
+",
+    )
+    .unwrap();
+    let step = UsesStep {
+        id: Some("a".to_owned()),
+        uses: "./act".to_owned(),
+        env: BTreeMap::from([("FOO".to_owned(), "bar".to_owned())]),
+        ..UsesStep::default()
+    };
+    let out = setup.run(&make::document(vec![PlannedStep::Uses(step)]));
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let run = setup
+        .calls()
+        .into_iter()
+        .find(|c| c.starts_with("run --rm"))
+        .unwrap();
+    assert!(run.ends_with("alpine /github/workspace/x"), "{run}");
+    let files = setup.read("envfile.log");
+    assert!(files.lines().any(|l| l == "FROM_STEP=bar"), "{files}");
+}
+
+#[test]
+fn a_node_outside_the_mounted_paths_is_refused_in_a_container() {
+    let setup = Setup::new();
+    let act = setup.path().join("work/repo/repo/act");
+    std::fs::create_dir_all(&act).unwrap();
+    std::fs::write(
+        act.join("action.yml"),
+        "name: n\nruns:\n  using: node20\n  main: main.js\n",
+    )
+    .unwrap();
+    std::fs::write(act.join("main.js"), "").unwrap();
+    // A node that only the machine's PATH has, which no mount carries.
+    let bin = setup.path().join("hostbin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(bin.join("node"), "").unwrap();
+    let mut doc = make::document(vec![uses("./act", &[])]);
+    doc.job.container = Some(image("alpine"));
+    let out = setup.run_with_path(&doc, &bin);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stdout(&out).contains("is not available in the job container"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        !setup
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("exec --workdir"))
     );
 }

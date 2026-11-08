@@ -3109,3 +3109,39 @@ fn the_deploy_fixture_converts_without_losing_a_capability() {
     );
     assert_eq!(plan.run_name, wf.run_name);
 }
+
+#[test]
+fn container_fields_that_cannot_be_read_are_errors_not_dropped() {
+    for (body, word) in [
+        ("container: 'node 20'", "whitespace"),
+        ("container: { image: a, options: { x: 1 } }", "options"),
+        ("container: { image: a, options: [--cpus] }", "options"),
+        ("container: { image: a, ports: [{ a: 1 }] }", "ports"),
+        ("services: { db: { image: a, volumes: [[x]] } }", "volumes"),
+        (
+            "container: { image: a, options: '--network-alias db' }\n    services: { db: b }",
+            "id of a service",
+        ),
+    ] {
+        let yaml = format!(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    {body}\n    steps:\n      - run: true\n"
+        );
+        let errs = one("ci.yml", &yaml).unwrap_err();
+        assert!(has(&errs, &["ci.yml", "build", word]), "{body}: {errs:?}");
+    }
+}
+
+#[test]
+fn a_null_options_stays_none() {
+    let out = ok("
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: { image: a, options: null }
+    steps:
+      - run: true
+");
+    let c = out.config.jobs["ci-build"].container.as_ref().unwrap();
+    assert_eq!(c.options, None);
+}

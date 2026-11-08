@@ -462,6 +462,8 @@ struct Prepared {
     script: PathBuf,
     cwd: PathBuf,
     env: BTreeMap<String, String>,
+    /// The names the step's own `env` sets.
+    step_keys: Vec<String>,
     timeout: Option<Duration>,
     files: StepFiles,
 }
@@ -726,15 +728,20 @@ impl Job<'_> {
             }
         };
         let args = prepared.shell.args_for(&prepared.script.to_string_lossy());
-        let exec =
-            match self.launch_for(&prepared.shell.program, &args, &prepared.cwd, &prepared.env) {
-                Ok(exec) => exec,
-                Err(message) => {
-                    remove_script(&prepared.script);
-                    self.say(sink, Line::Error(&message));
-                    return (common, Conclusion::Failure, BTreeMap::new());
-                }
-            };
+        let exec = match self.launch_for(
+            &prepared.shell.program,
+            &args,
+            &prepared.cwd,
+            &prepared.env,
+            &prepared.step_keys,
+        ) {
+            Ok(exec) => exec,
+            Err(message) => {
+                remove_script(&prepared.script);
+                self.say(sink, Line::Error(&message));
+                return (common, Conclusion::Failure, BTreeMap::new());
+            }
+        };
         let ran = self
             .execute(
                 Launch {
@@ -990,6 +997,7 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
 
     let mut env = base_env(job, &files, &step_action(step, index))?;
     env.extend(job.env_context());
+    let step_keys: Vec<String> = step_env.keys().cloned().collect();
     env.extend(step_env);
     job.with_path(&mut env);
 
@@ -1012,6 +1020,7 @@ fn prepare(job: &Job<'_>, index: usize, step: &RunStep) -> Result<Prepared, Stri
         script,
         cwd,
         env,
+        step_keys,
         timeout: step
             .timeout_minutes
             .map(|minutes| job.opts.minute * minutes),
