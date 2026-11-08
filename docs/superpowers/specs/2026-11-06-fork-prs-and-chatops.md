@@ -374,8 +374,8 @@ identity: `eyes` when the delivery is accepted, then `+1` on success or
 (the command's `reaction: rocket` option picks the set). It posts no
 comment text. A refused commenter gets no reaction. Reactions use
 `POST /repos/{repo}/issues/comments/{id}/reactions`, which needs
-`Issues: write` (for comments on a PR GitHub accepts `Issues: write` or
-`Pull requests: write`, so `Issues: write` alone covers both). Workflow
+`Issues: write` for comments on issues and on pull requests alike;
+`Pull requests: write` does not grant it. Workflow
 steps can still reply with the job token and `permissions:`.
 
 ### Loop and noise control
