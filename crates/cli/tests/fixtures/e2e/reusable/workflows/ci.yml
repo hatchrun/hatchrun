@@ -47,3 +47,8 @@ jobs:
       - run: npx playwright test
         env:
           BASE_URL: ${{ needs.deploy-preview.outputs.url }}
+
+  alert:
+    needs: test
+    if: failure()
+    uses: ./.github/workflows/notify.yml

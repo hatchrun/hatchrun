@@ -36,10 +36,11 @@ use crate::launches::{self, LaunchMessage};
 use crate::store;
 
 use super::decide::{
-    Delivery, Failed, Flushed, Gate, apply_batch, apply_held, apply_result, arm_chains, arm_todo,
-    attempts, bounded_event, delivery, due, file_annotations, gate, github_context, gives_up,
-    job_document, minimal_check, next_alarm, plan_is_current, record_flush, reschedule, reset_jobs,
-    run_state, running_for, should_write_heartbeat, snapshot_ready, steps_json, take_drain,
+    Delivery, Failed, Flushed, Gate, again_work, apply_batch, apply_held, apply_result, arm_chains,
+    arm_todo, attempts, bounded_event, delivery, due, file_annotations, gate, github_context,
+    gives_up, job_document, left_out_work, minimal_check, next_alarm, plan_is_current,
+    record_flush, reschedule, reset_jobs, run_state, running_for, should_write_heartbeat,
+    snapshot_ready, steps_json, take_drain,
 };
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
@@ -1136,8 +1137,11 @@ impl<'a> Cx<'a> {
         let legs: Vec<(u64, _)> = ids.iter().copied().zip(legs).collect();
         let actions = run.graph_mut().expanded(job, legs, &ctx);
         // A job a rerun made again starts over, as the first one did.
-        for id in again {
-            self.start_over(run, id, attempt).await?;
+        for id in &again {
+            self.clear_job(run, *id).await?;
+        }
+        for work in again_work(&again, attempt) {
+            run.todo_mut().push(work);
         }
         for id in &ids {
             run.outbox_mut().mark(*id);
@@ -1155,13 +1159,13 @@ impl<'a> Cx<'a> {
         Ok(actions)
     }
 
-    /// Clears what an earlier attempt left of job `id` and sets its row
-    /// up for `attempt`, as a rerun does for the jobs it resets.
-    async fn start_over(&self, run: &mut Loaded, id: u64, attempt: u32) -> Result<()> {
+    /// Clears what an earlier attempt left of job `id` in the object: its
+    /// state and log, and the check run's backoff. The work on its row
+    /// is [`left_out_work`] and [`again_work`].
+    async fn clear_job(&self, run: &mut Loaded, id: u64) -> Result<()> {
         self.put_job(id, &JobState::default()).await?;
         self.delete_prefix(&log_prefix(id)).await?;
         self.storage.delete_multiple(log_keys(id)).await?;
-        run.todo_mut().push(Work::ResetJob { job: id, attempt });
         run.outbox_mut().reset(id);
         Ok(())
     }
@@ -1190,10 +1194,12 @@ impl<'a> Cx<'a> {
                     // A job a rerun left out of its matrix ends as skipped
                     // for this attempt on a row that is reset and marked,
                     // so the run's list and counts leave it out.
-                    if let Some(node) = run.graph.node(job).filter(|n| n.stale) {
-                        let attempt = node.attempt;
-                        self.start_over(run, job, attempt).await?;
-                        run.todo_mut().push(Work::Supersede { job, attempt });
+                    let left_out = left_out_work(&run.graph, job);
+                    if !left_out.is_empty() {
+                        self.clear_job(run, job).await?;
+                        for work in left_out {
+                            run.todo_mut().push(work);
+                        }
                     }
                     let mut state = self.job_state(job).await?;
                     state.completed_at = Some(self.now);

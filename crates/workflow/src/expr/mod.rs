@@ -528,6 +528,10 @@ pub fn may_hold_without(
         parser::Expr::And(args) => args.iter().collect(),
         other => vec![other],
     };
+    // Once an operand that reads the context is passed, whether the
+    // operands after it are reached depends on it: they can say false,
+    // which is false either way, but their errors wait for the legs.
+    let mut unknown = false;
     for operand in operands {
         let mut reads = false;
         eval::visit_contexts(operand, &mut |name, _| {
@@ -535,6 +539,7 @@ pub fn may_hold_without(
             Ok(())
         })?;
         if reads {
+            unknown = true;
             continue;
         }
         let value = eval::Evaluator {
@@ -542,9 +547,12 @@ pub fn may_hold_without(
             funcs,
             budget: &budget,
         }
-        .eval(operand)?;
-        if !truthy(&value) {
-            return Ok(false);
+        .eval(operand);
+        match value {
+            Ok(value) if !truthy(&value) => return Ok(false),
+            Ok(_) => {}
+            Err(_) if unknown => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(true)
@@ -568,57 +576,25 @@ pub fn split_job_outputs(text: &str, splits: &BTreeMap<String, Vec<String>>) -> 
         let mut edits: Vec<(usize, usize, String)> = Vec::new();
         let mut i = 0;
         while i < tokens.len() {
-            use lexer::Kind;
-            let kinds: Vec<&Kind<'_>> = tokens[i..].iter().take(8).map(|t| &t.kind).collect();
-            let (job, used) = match kinds.as_slice() {
-                [
-                    Kind::Ident(jobs),
-                    Kind::Dot,
-                    Kind::Ident(id),
-                    Kind::Dot,
-                    Kind::Ident(outputs),
-                    Kind::Dot,
-                    Kind::Ident(name),
-                    ..,
-                ] if jobs.eq_ignore_ascii_case("jobs")
-                    && outputs.eq_ignore_ascii_case("outputs")
-                    && (i == 0 || !matches!(tokens[i - 1].kind, Kind::Dot)) =>
-                {
-                    (Some((*id).to_owned()), (7, *name))
-                }
-                [
-                    Kind::Ident(jobs),
-                    Kind::LBracket,
-                    Kind::Str(id),
-                    Kind::RBracket,
-                    Kind::Dot,
-                    Kind::Ident(outputs),
-                    Kind::Dot,
-                    Kind::Ident(name),
-                    ..,
-                ] if jobs.eq_ignore_ascii_case("jobs")
-                    && outputs.eq_ignore_ascii_case("outputs")
-                    && (i == 0 || !matches!(tokens[i - 1].kind, Kind::Dot)) =>
-                {
-                    (Some(id.clone()), (8, *name))
-                }
-                _ => (None, (0, "")),
-            };
-            match job.and_then(|id| splits.get(&id)) {
-                Some(entries) => {
-                    let (count, name) = used;
-                    let last = &tokens[i + count - 1];
-                    let reads: Vec<String> = entries
+            match job_output_read(&tokens, i).filter(|read| splits.contains_key(&read.job)) {
+                Some(read) => {
+                    let reads: Vec<String> = splits[&read.job]
                         .iter()
                         .rev()
-                        .map(|n| format!("jobs.{n}.outputs.{name}"))
+                        .map(|n| {
+                            if read.bracket {
+                                format!("jobs.{n}.outputs['{}']", read.name.replace('\'', "''"))
+                            } else {
+                                format!("jobs.{n}.outputs.{}", read.name)
+                            }
+                        })
                         .collect();
                     edits.push((
                         tokens[i].offset,
-                        last.offset + name.len(),
+                        read.end,
                         format!("({})", reads.join(" || ")),
                     ));
-                    i += count;
+                    i += read.tokens;
                 }
                 None => i += 1,
             }
@@ -628,6 +604,71 @@ pub fn split_job_outputs(text: &str, splits: &BTreeMap<String, Vec<String>>) -> 
         }
     }
     out
+}
+
+/// A read of `jobs.<job>.outputs.<name>` found in tokens.
+struct JobOutputRead {
+    job: String,
+    name: String,
+    /// The output was read as `outputs['name']`.
+    bracket: bool,
+    /// How many tokens the read is.
+    tokens: usize,
+    /// The byte offset after the read.
+    end: usize,
+}
+
+/// The read of a job output that starts at token `i`, whichever way it
+/// spells the job and the output: `jobs.build.outputs.tag`,
+/// `jobs['build'].outputs['tag']` and the mixes.
+fn job_output_read(tokens: &[lexer::Token<'_>], i: usize) -> Option<JobOutputRead> {
+    use lexer::Kind;
+    let kind = |at: usize| tokens.get(at).map(|t| &t.kind);
+    if i > 0 && matches!(tokens[i - 1].kind, Kind::Dot) {
+        return None;
+    }
+    let Some(Kind::Ident(jobs)) = kind(i) else {
+        return None;
+    };
+    if !jobs.eq_ignore_ascii_case("jobs") {
+        return None;
+    }
+    let mut at = i + 1;
+    let job = match (kind(at), kind(at + 1), kind(at + 2)) {
+        (Some(Kind::Dot), Some(Kind::Ident(id)), _) => {
+            at += 2;
+            (*id).to_owned()
+        }
+        (Some(Kind::LBracket), Some(Kind::Str(id)), Some(Kind::RBracket)) => {
+            at += 3;
+            id.clone()
+        }
+        _ => return None,
+    };
+    if !matches!((kind(at), kind(at + 1)), (Some(Kind::Dot), Some(Kind::Ident(o))) if o.eq_ignore_ascii_case("outputs"))
+    {
+        return None;
+    }
+    at += 2;
+    let (name, bracket, used, end) = match (kind(at), kind(at + 1), kind(at + 2)) {
+        (Some(Kind::Dot), Some(Kind::Ident(name)), _) => (
+            (*name).to_owned(),
+            false,
+            2,
+            tokens[at + 1].offset + name.len(),
+        ),
+        (Some(Kind::LBracket), Some(Kind::Str(name)), Some(Kind::RBracket)) => {
+            (name.clone(), true, 3, tokens[at + 2].offset + 1)
+        }
+        _ => return None,
+    };
+    Some(JobOutputRead {
+        job,
+        name,
+        bracket,
+        tokens: at + used - i,
+        end,
+    })
 }
 
 /// Lexes and parses one expression, within the length limit.

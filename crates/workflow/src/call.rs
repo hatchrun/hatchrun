@@ -120,8 +120,16 @@ impl InputType {
                 .trim()
                 .parse::<i64>()
                 .map(Value::from)
-                .or_else(|_| text.trim().parse::<f64>().map(Value::from))
-                .map_err(|_| format!("`{text}` is not a number")),
+                .or_else(|_| {
+                    // `NaN` and `inf` parse, and are no JSON number.
+                    text.trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|number| number.is_finite())
+                        .map(Value::from)
+                        .ok_or(())
+                })
+                .map_err(|()| format!("`{text}` is not a number")),
             _ => Err(format!("{value} is not {}", self.word())),
         }
     }
@@ -267,7 +275,11 @@ impl<'de> Deserialize<'de> for SecretsPassed {
 #[must_use]
 pub fn passed_secret(value: &str) -> Option<String> {
     let inner = value.trim().strip_prefix("${{")?.strip_suffix("}}")?.trim();
-    let name = inner.strip_prefix("secrets.")?;
+    // The context name is read in any case, as expressions read it.
+    let prefix = inner
+        .get(..8)
+        .filter(|p| p.eq_ignore_ascii_case("secrets."))?;
+    let name = &inner[prefix.len()..];
     let valid = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     valid.then(|| name.to_ascii_uppercase())
 }
@@ -571,7 +583,11 @@ impl CallFrame {
                 .iter()
                 .map(|(k, v)| k.len() + 64 + v.to_string().len())
                 .sum::<usize>()
-            + self.matrix.len() * 96
+            + self
+                .matrix
+                .iter()
+                .map(|(k, v)| k.len() + 64 + v.to_string().len())
+                .sum::<usize>()
             + match &self.secrets {
                 SecretsPassed::Named(m) => map(m),
                 _ => 0,

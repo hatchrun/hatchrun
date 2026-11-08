@@ -373,6 +373,35 @@ pub(crate) fn steps_json(steps: &[StepView]) -> Value {
     serde_json::to_value(ended).expect("step summaries always serialize")
 }
 
+/// The work on its row for a job a rerun left out of its matrix, which
+/// ended as skipped for this attempt: the row is set up for the attempt
+/// and marked, so the run's list and counts leave it out. Nothing for a
+/// job that is part of the run. The finish of the row follows, from the
+/// action that ended the job.
+pub(crate) fn left_out_work(graph: &Graph, job: u64) -> Vec<super::Work> {
+    match graph.node(job).filter(|n| n.stale) {
+        Some(node) => vec![
+            super::Work::ResetJob {
+                job,
+                attempt: node.attempt,
+            },
+            super::Work::Supersede {
+                job,
+                attempt: node.attempt,
+            },
+        ],
+        None => Vec::new(),
+    }
+}
+
+/// The work on the rows an earlier attempt used that a matrix read again
+/// makes again: each is set up for `attempt`.
+pub(crate) fn again_work(rows: &[u64], attempt: u32) -> Vec<super::Work> {
+    rows.iter()
+        .map(|&job| super::Work::ResetJob { job, attempt })
+        .collect()
+}
+
 /// Each job's row id and attempt.
 pub(super) fn attempts(graph: &Graph) -> Vec<(u64, u32)> {
     graph.jobs.iter().map(|n| (n.id, n.attempt)).collect()

@@ -730,3 +730,20 @@ fn a_condition_is_definitely_false_when_a_part_that_does_not_read_the_context_is
     // `always()` holds, and a part that reads the matrix is left to the legs.
     assert!(held("always() && matrix.os == 'x'", JobStatus::Failure));
 }
+
+#[test]
+fn an_error_after_an_operand_that_reads_the_context_waits_for_the_legs() {
+    use hatchrun_workflow::may_hold_without;
+    let ctx = json!({ "vars": { "CONFIG": "not json" } });
+    let held = |cond: &str| may_hold_without(cond, "matrix", &ctx, &Files(JobStatus::Success));
+    // The operand after the matrix read cannot be told yet: its error is
+    // for the legs, which may never reach it.
+    assert_eq!(
+        held("matrix.experimental && fromJSON(vars.CONFIG)"),
+        Ok(true)
+    );
+    // Before the matrix read it is reached whatever the matrix says.
+    assert!(held("fromJSON(vars.CONFIG) && matrix.experimental").is_err());
+    // A later operand that is false makes the condition false either way.
+    assert_eq!(held("matrix.x && false"), Ok(false));
+}

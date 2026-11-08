@@ -505,6 +505,8 @@ pub struct RunState {
 }
 
 pub(crate) use decide::github_context;
+#[cfg(test)]
+pub(crate) use decide::{again_work, left_out_work};
 pub use object::RunObject;
 
 #[cfg(test)]

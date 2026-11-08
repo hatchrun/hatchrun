@@ -125,11 +125,20 @@ impl Cx {
         let permissions = self.permissions(at, gh.permissions.as_ref(), true);
         let with = self.call_with(at, gh);
         let secrets = self.call_secrets(at, gh);
-        let if_ = gh
-            .if_
-            .as_ref()
-            .and_then(super::calls::scalar)
-            .filter(|c| !c.trim().is_empty());
+        let if_ = match &gh.if_ {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let Some(text) = super::calls::scalar(value) else {
+                    // Dropping it would run the call whatever the author said.
+                    self.error(format!(
+                        "{at}: `if: {}` is a list or a map; an `if` is one expression; the job was dropped",
+                        show(value)
+                    ));
+                    return Call::Failed;
+                };
+                Some(text).filter(|c| !c.trim().is_empty())
+            }
+        };
         let mut problems = Vec::new();
         if let Some(cond) = &if_ {
             problems.extend(call_expression("`if`", cond, true));
@@ -281,7 +290,18 @@ impl Cx {
         }
         if let Some(Value::Object(secrets)) = body.get("secrets") {
             for (name, secret) in secrets {
-                let secret = GhCallSecret::deserialize(secret).unwrap_or_default();
+                let secret = match secret {
+                    Value::Null => GhCallSecret::default(),
+                    other => match GhCallSecret::deserialize(other) {
+                        Ok(secret) => secret,
+                        Err(err) => {
+                            // A secret taken as optional would let a call
+                            // leave out what the workflow needs.
+                            self.error(format!("`{file}`: secret `{name}`: {err}"));
+                            continue;
+                        }
+                    },
+                };
                 trigger.secrets.insert(
                     name.clone(),
                     CallSecret {
@@ -293,7 +313,13 @@ impl Cx {
         }
         if let Some(Value::Object(outputs)) = body.get("outputs") {
             for (name, output) in outputs {
-                let output = GhCallOutput::deserialize(output).unwrap_or_default();
+                let output = match GhCallOutput::deserialize(output) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        self.error(format!("`{file}`: output `{name}`: {err}"));
+                        continue;
+                    }
+                };
                 let text = output.value.as_ref().and_then(scalar).unwrap_or_default();
                 let problems =
                     output_expression(&format!("`on.workflow_call.outputs.{name}`"), &text);

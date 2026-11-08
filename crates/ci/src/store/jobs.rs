@@ -137,10 +137,13 @@ const JOBS_FOR_RUN: &str =
 /// Every row of run `$1`, those a rerun left out of their matrix too.
 const ALL_JOBS_FOR_RUN: &str = "SELECT {columns} FROM ci_jobs WHERE run_id = $1 ORDER BY id";
 
-/// Gives job `$1` the template `$2`, strategy group `$3`, `max_parallel`
-/// `$4` and needs `$5` of the job it is made again as, at `$6`.
-const REFRESH_JOB: &str = "UPDATE ci_jobs SET template = $2, strategy_group = $3, \
-     max_parallel = $4, needs = $5::jsonb, updated_at = $6 WHERE id = $1";
+/// Gives job `$1` what the job it is made again as plans: name `$2`,
+/// timeout `$3`, template `$4`, token permissions `$5`, secret
+/// references `$6`, environment `$7`, strategy group `$8`, `max_parallel`
+/// `$9` and needs `$10`, at `$11`.
+const REFRESH_JOB: &str = "UPDATE ci_jobs SET name = $2, timeout_minutes = $3, template = $4, \
+     token_permissions = $5::jsonb, secret_refs = $6::jsonb, environment = $7, \
+     strategy_group = $8, max_parallel = $9, needs = $10::jsonb, updated_at = $11 WHERE id = $1";
 
 /// Marks job `$1`, which a rerun left out of its matrix for attempt
 /// `$2`, so the run's job list and counts leave it out.
@@ -556,8 +559,10 @@ pub async fn assign_matrix_rows(
 }
 
 /// Gives job `job_id`, made again by a matrix that was read again, what
-/// the job it is made as plans: its template, strategy group, limit and
-/// needs. The attempt and the result are left to the reset.
+/// the job it is made as plans: its name, timeout, template, token
+/// permissions, secret references (what the agent mints and opens for
+/// it), environment, strategy group, limit and needs. The attempt and
+/// the result are left to the reset.
 ///
 /// # Errors
 ///
@@ -567,7 +572,12 @@ pub async fn refresh_job(db: &Db, job_id: u64, new: &NewJob, now: u64) -> Result
         REFRESH_JOB,
         &params![
             job_id,
+            &new.name,
+            new.timeout_minutes,
             new.template.as_deref(),
+            serde_json::to_string(&new.token_permissions).map_err(worker::Error::from)?,
+            serde_json::to_string(&new.secret_refs).map_err(worker::Error::from)?,
+            new.environment.as_deref(),
             new.strategy_group.as_deref(),
             new.max_parallel,
             serde_json::to_string(&new.needs).map_err(worker::Error::from)?,

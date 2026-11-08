@@ -33,6 +33,7 @@ use hatchrun_workflow::{
     ParameterKind, Plan, PlannedJob, PlannedStep, Submodules, Workflow, compile, compile_with,
     interpolate, job_condition, parse, resolve_inputs, to_yaml, triggered,
 };
+use hatchrun_workflow::{CallFrame, entry_in, shared_depth};
 use serde_json::{Map, Value, json};
 
 /// The head of the default branch, which schedules and dispatches run on.
@@ -456,7 +457,7 @@ fn simulate(plan: &Plan, base: &Value, outputs: &Value, fail: bool) -> Run {
             Ok(true) => "success",
             _ => "skipped",
         };
-        ran.entry(job.name.clone()).or_default().push(result);
+        ran.entry(rkey(job)).or_default().push(result);
         lines.insert(job.id.clone(), runs);
     }
     let results = ran
@@ -464,6 +465,12 @@ fn simulate(plan: &Plan, base: &Value, outputs: &Value, fail: bool) -> Run {
         .map(|(name, legs)| (name, combined(&legs)))
         .collect();
     Run { results, lines }
+}
+
+/// The key a job's result is kept under: the call it runs in and its
+/// name, so two calls of one workflow keep their results apart.
+fn rkey(job: &PlannedJob) -> String {
+    format!("{}\u{1}{}", job.call_id().unwrap_or_default(), job.name)
 }
 
 /// What a job's calls make of it: whether each holds, and what the
@@ -477,8 +484,8 @@ struct Calls {
 }
 
 /// Reads the calls a job runs in, outermost first. Each call's `if` is
-/// read before its inputs, with the call's own needs, matrix and the
-/// inputs of the call before.
+/// read, with the status of what the call waits for, before its inputs,
+/// with the call's own needs, matrix and the inputs of the call before.
 fn walk_calls(
     job: &PlannedJob,
     base: &Value,
@@ -488,14 +495,18 @@ fn walk_calls(
 ) -> Calls {
     let mut inputs = base["inputs"].clone();
     for (i, frame) in job.scope.iter().enumerate() {
+        let parent = &job.scope[..i];
+        let edges = call_edges(job, i, by_id);
+        let status = upstream_from(&edges, parent, by_id, ran).status();
         let mut ctx = base.clone();
         ctx["inputs"] = inputs.clone();
         ctx["matrix"] = json!(frame.matrix);
-        ctx["needs"] = call_needs(job, i, base, by_id, ran, outputs);
-        let held = frame
-            .if_
-            .as_deref()
-            .is_none_or(|cond| matches!(condition(cond, &ctx, JobStatus::Success), Ok(true)));
+        ctx["needs"] = needs_value(parent, &edges, by_id, ran, base, outputs);
+        let held = match frame.if_.as_deref() {
+            Some(cond) => matches!(condition(cond, &ctx, status), Ok(true)),
+            // No `if` is the implied `success()` of what it waits for.
+            None => status == JobStatus::Success,
+        };
         if !held {
             return Calls {
                 held: false,
@@ -511,61 +522,65 @@ fn walk_calls(
     }
 }
 
-/// What the call at frame `depth` of a job needs, as the call's own
-/// `if` and `with` read it: the jobs its jobs wait for outside the call,
-/// inside the workflow that made it.
-fn call_needs(
+/// The ids of the jobs the call at frame `depth` of a job waits for:
+/// what its jobs require outside the call, inside the workflow that made
+/// it.
+fn call_edges<'a>(
     job: &PlannedJob,
     depth: usize,
-    base: &Value,
-    by_id: &BTreeMap<&str, &PlannedJob>,
-    ran: &BTreeMap<String, Vec<&'static str>>,
-    outputs: &Value,
-) -> Value {
+    by_id: &BTreeMap<&str, &'a PlannedJob>,
+) -> Vec<&'a str> {
     let instance = &job.scope[depth].id;
     let inside = |j: &PlannedJob| j.scope.get(depth).is_some_and(|f| f.id == *instance);
-    let mut names: Vec<&str> = Vec::new();
+    let mut ids: Vec<&str> = Vec::new();
     for member in by_id.values().filter(|j| inside(j)) {
         for id in &member.requires {
             let required = by_id[id.as_str()];
-            if inside(required)
-                || hatchrun_workflow::shared_depth(&job.scope[..depth], required) < depth
-            {
+            if inside(required) || shared_depth(&job.scope[..depth], required) < depth {
                 continue;
             }
-            let name = hatchrun_workflow::entry_in(&job.scope[..depth], required);
-            if !names.contains(&name) {
-                names.push(name);
+            let id = required.id.as_str();
+            if !ids.contains(&id) {
+                ids.push(id);
             }
         }
     }
-    needs_value(&names, by_id, ran, base, outputs)
+    ids
 }
 
-/// The `needs` entries for `names`: how each ended and what it gave.
+/// The `needs` entries for the jobs `ids`, as a job that runs in `scope`
+/// reads them: how each entry ended and what it gave. A call is one
+/// entry, and the results of its jobs are its own.
 fn needs_value(
-    names: &[&str],
+    scope: &[CallFrame],
+    ids: &[&str],
     by_id: &BTreeMap<&str, &PlannedJob>,
     ran: &BTreeMap<String, Vec<&'static str>>,
     base: &Value,
     outputs: &Value,
 ) -> Value {
+    let mut groups: Vec<(String, Vec<&'static str>, Option<&PlannedJob>)> = Vec::new();
+    for id in ids {
+        let required = by_id[id];
+        let name = entry_in(scope, required).to_owned();
+        let legs = ran.get(&rkey(required)).cloned().unwrap_or_default();
+        let direct = (required.scope.len() == scope.len()).then_some(required);
+        match groups.iter_mut().find(|g| g.0 == name) {
+            Some(group) => {
+                group.1.extend(legs);
+                group.2 = group.2.or(direct);
+            }
+            None => groups.push((name, legs, direct)),
+        }
+    }
     let mut needs = Map::new();
-    for name in names {
-        let Some(legs) = ran.get(*name) else {
-            continue;
+    for (name, legs, first) in groups {
+        let result = combined(&legs);
+        let outs = match first {
+            Some(first) if result == "success" => job_outputs(first, base, outputs),
+            _ => json!({}),
         };
-        let first = by_id.values().find(|j| j.name == *name).unwrap();
-        let result = combined(legs);
-        let outs = if result == "success" {
-            job_outputs(first, base, outputs)
-        } else {
-            json!({})
-        };
-        needs.insert(
-            (*name).to_owned(),
-            json!({ "result": result, "outputs": outs }),
-        );
+        needs.insert(name, json!({ "result": result, "outputs": outs }));
     }
     Value::Object(needs)
 }
@@ -581,38 +596,52 @@ fn combined(legs: &[&'static str]) -> &'static str {
     }
 }
 
-/// The names a job requires, in order, once each.
-fn needs_names<'a>(job: &PlannedJob, by_id: &BTreeMap<&str, &'a PlannedJob>) -> Vec<&'a str> {
-    let mut names: Vec<&str> = Vec::new();
-    for id in &job.requires {
-        let name = by_id[id.as_str()].name.as_str();
-        if !names.contains(&name) {
-            names.push(name);
-        }
-    }
-    names
-}
-
 fn upstream(
     job: &PlannedJob,
     by_id: &BTreeMap<&str, &PlannedJob>,
     ran: &BTreeMap<String, Vec<&'static str>>,
 ) -> Upstream {
-    // Every ancestor, not only the direct needs.
+    let seeds: Vec<&str> = job.requires.iter().map(String::as_str).collect();
+    upstream_from(&seeds, &job.scope, by_id, ran)
+}
+
+/// The status of every ancestor of the jobs `seeds`, not only the direct
+/// needs, as `success()` and `failure()` see it for a job that runs in
+/// `within`: a job of a call does not see what the call waits for, and a
+/// job that needs a call sees the call's own jobs.
+fn upstream_from(
+    seeds: &[&str],
+    within: &[CallFrame],
+    by_id: &BTreeMap<&str, &PlannedJob>,
+    ran: &BTreeMap<String, Vec<&'static str>>,
+) -> Upstream {
     let mut seen = BTreeSet::new();
-    let mut todo: Vec<&str> = job.requires.iter().map(String::as_str).collect();
     let mut skipped = false;
-    while let Some(id) = todo.pop() {
-        if !seen.insert(id) {
+    for seed in seeds {
+        let root = by_id[seed];
+        let shared = shared_depth(within, root);
+        if shared < within.len() {
             continue;
         }
-        let up = by_id[id];
-        match combined(&ran[&up.name]) {
-            "failure" => return Upstream::Failed,
-            "skipped" => skipped = true,
-            _ => {}
+        let limit = &root.scope[..root.scope.len().min(shared + 1)];
+        let mut todo: Vec<&str> = vec![seed];
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let up = by_id[id];
+            match combined(&ran[&rkey(up)]) {
+                "failure" => return Upstream::Failed,
+                "skipped" => skipped = true,
+                _ => {}
+            }
+            todo.extend(
+                up.requires
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|next| shared_depth(limit, by_id[next]) >= limit.len()),
+            );
         }
-        todo.extend(up.requires.iter().map(String::as_str));
     }
     if skipped {
         Upstream::Skipped
@@ -668,7 +697,8 @@ fn job_context(
     ran: &BTreeMap<String, Vec<&'static str>>,
     outputs: &Value,
 ) -> Value {
-    let needs = needs_value(&needs_names(job, by_id), by_id, ran, base, outputs);
+    let ids: Vec<&str> = job.requires.iter().map(String::as_str).collect();
+    let needs = needs_value(&job.scope, &ids, by_id, ran, base, outputs);
     let mut ctx = base.clone();
     ctx["needs"] = needs;
     // A job of a called workflow reads what the calls passed.

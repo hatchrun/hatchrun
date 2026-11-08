@@ -1392,6 +1392,7 @@ workflows:
 #[allow(clippy::too_many_lines)] // One run, from its first expansion to the last rerun.
 fn a_rerun_that_shrinks_a_matrix_goes_through_the_rows_the_database_holds() {
     use crate::graph::{Action, Graph, State};
+    use crate::run::{Work, again_work, left_out_work};
     use hatchrun_workflow::{Conclusion, JobResult, compile, parse};
 
     let db = setup();
@@ -1417,6 +1418,21 @@ fn a_rerun_that_shrinks_a_matrix_goes_through_the_rows_the_database_holds() {
     let mut graph = Graph::new(plan.jobs.iter().map(|j| (row(&j.id), j.clone())).collect());
     let setup_row = row("setup");
     let after_row = row("after");
+
+    // The work the object queues on rows, carried out as its todo does.
+    let apply = |works: Vec<Work>| {
+        for work in works {
+            match work {
+                Work::ResetJob { job, attempt } => {
+                    db.wait(reset_job(db.db(), job, attempt, 2_000)).unwrap();
+                }
+                Work::Supersede { job, attempt } => {
+                    db.wait(supersede_job(db.db(), job, attempt)).unwrap();
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    };
 
     // Expands the stand-in through the store, as the run object does.
     let expand = |graph: &mut Graph, attempt: u32| -> Vec<Action> {
@@ -1444,9 +1460,7 @@ fn a_rerun_that_shrinks_a_matrix_goes_through_the_rows_the_database_holds() {
             ))
             .unwrap();
         assert_eq!(made.ids.len(), legs.len());
-        for row in &made.again {
-            db.wait(reset_job(db.db(), *row, attempt, 2_000)).unwrap();
-        }
+        apply(again_work(&made.again, attempt));
         let legs: Vec<(u64, _)> = made.ids.iter().copied().zip(legs).collect();
         graph.expanded(stand_in, legs, &ctx)
     };
@@ -1456,8 +1470,18 @@ fn a_rerun_that_shrinks_a_matrix_goes_through_the_rows_the_database_holds() {
             let Action::Finished { job, .. } = action else {
                 continue;
             };
+            let work = left_out_work(graph, *job);
             if graph.node(*job).is_some_and(|n| n.stale) {
-                db.wait(reset_job(db.db(), *job, attempt, 3_000)).unwrap();
+                // What the object queues for a job left out: the row is
+                // reset for the attempt and marked, then it is finished.
+                assert_eq!(
+                    work,
+                    [
+                        Work::ResetJob { job: *job, attempt },
+                        Work::Supersede { job: *job, attempt }
+                    ]
+                );
+                apply(work);
                 db.wait(finish_job(
                     db.db(),
                     *job,
@@ -1469,7 +1493,8 @@ fn a_rerun_that_shrinks_a_matrix_goes_through_the_rows_the_database_holds() {
                     3_001,
                 ))
                 .unwrap();
-                db.wait(supersede_job(db.db(), *job, attempt)).unwrap();
+            } else {
+                assert_eq!(work, Vec::<Work>::new());
             }
         }
     };
@@ -1584,6 +1609,13 @@ fn a_job_made_again_takes_the_template_it_is_planned_with_and_keeps_its_attempt(
     ))
     .unwrap();
     let again = NewJob {
+        name: "renamed".into(),
+        timeout_minutes: 15,
+        token_permissions: BTreeMap::from([("contents".to_owned(), Level::Write)]),
+        secret_refs: SecretRefs {
+            all: false,
+            names: ["DEPLOY".to_owned()].into(),
+        },
         template: Some("ubuntu-26.04-arm".into()),
         strategy_group: Some("g".into()),
         max_parallel: Some(2),
@@ -1593,6 +1625,16 @@ fn a_job_made_again_takes_the_template_it_is_planned_with_and_keeps_its_attempt(
     db.wait(refresh_job(db.db(), job_id, &again, 9)).unwrap();
     let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
     assert_eq!(row.template.as_deref(), Some("ubuntu-26.04-arm"));
+    // What the agent mints and opens for the job is the plan's now.
+    assert_eq!((row.name.as_str(), row.timeout_minutes), ("renamed", 15));
+    assert_eq!(
+        row.token_permissions,
+        serde_json::json!({ "contents": "write" })
+    );
+    assert_eq!(
+        row.secret_refs,
+        serde_json::json!({ "all": false, "names": ["DEPLOY"] })
+    );
     assert_eq!(row.needs, serde_json::json!(["setup"]));
     // The result and the attempt wait for the reset.
     assert_eq!(

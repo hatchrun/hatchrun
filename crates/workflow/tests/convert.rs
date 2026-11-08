@@ -3096,3 +3096,80 @@ jobs:
     let c = out.config.jobs["ci-build"].container.as_ref().unwrap();
     assert_eq!(c.options, None);
 }
+
+#[test]
+fn a_call_condition_that_is_a_list_is_an_error_not_a_dropped_condition() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    if: [false]\n    uses: ./.github/workflows/w.yml\n",
+        ),
+        ("w.yml", REUSABLE_JOB),
+    ]);
+    assert!(
+        has(&out.errors, &["`if: ", "list or a map"]),
+        "{:?}",
+        out.errors
+    );
+    assert!(!out.config.workflows.contains_key("ci"));
+}
+
+#[test]
+fn a_secret_or_output_that_cannot_be_read_is_reported() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    uses: ./.github/workflows/w.yml\n",
+        ),
+        (
+            "w.yml",
+            "
+on:
+  workflow_call:
+    secrets:
+      TOKEN: { required: 'true' }
+    outputs:
+      o: { value: ['x'] }
+jobs:
+  j: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+",
+        ),
+    ]);
+    assert!(has(&out.errors, &["secret `TOKEN`"]), "{:?}", out.errors);
+    assert!(has(&out.warnings, &["output `o`", "has no value"]));
+}
+
+#[test]
+fn a_secret_passed_through_an_upper_case_context_is_kept() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    uses: ./.github/workflows/w.yml\n    secrets:\n      T: ${{ SECRETS.TOKEN }}\n",
+        ),
+        ("w.yml", REUSABLE_JOB),
+    ]);
+    assert_eq!(
+        entry(&out, "ci", "c").secrets,
+        hatchrun_workflow::SecretsPassed::Named(BTreeMap::from([(
+            "T".to_owned(),
+            "${{ SECRETS.TOKEN }}".to_owned()
+        )]))
+    );
+}
+
+#[test]
+fn split_outputs_are_read_by_bracket_in_the_output_name_too() {
+    let splits = BTreeMap::from([(
+        "build".to_owned(),
+        vec!["build".to_owned(), "build-2".to_owned()],
+    )]);
+    let split = |text: &str| hatchrun_workflow::split_job_outputs(text, &splits);
+    assert_eq!(
+        split("${{ jobs.build.outputs['tag'] }}"),
+        "${{ (jobs.build-2.outputs['tag'] || jobs.build.outputs['tag']) }}"
+    );
+    assert_eq!(
+        split("${{ jobs['build'].outputs['tag'] }}"),
+        "${{ (jobs.build-2.outputs['tag'] || jobs.build.outputs['tag']) }}"
+    );
+}

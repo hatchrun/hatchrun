@@ -662,3 +662,59 @@ fn an_include_leaves_the_axis_value_it_matched() {
     assert_eq!(jobs[0].matrix["flag"], serde_json::json!(false));
     assert_eq!(jobs[0].matrix["extra"], "x");
 }
+
+#[test]
+fn a_number_input_rejects_what_json_cannot_hold() {
+    use hatchrun_workflow::InputType;
+    for text in ["NaN", "inf", "-Infinity", "x"] {
+        assert!(
+            InputType::Number.coerce(&serde_json::json!(text)).is_err(),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        InputType::Number.coerce(&serde_json::json!("2.5")).unwrap(),
+        serde_json::json!(2.5)
+    );
+}
+
+#[test]
+fn the_secrets_context_is_read_in_any_case() {
+    use hatchrun_workflow::call::passed_secret;
+    assert_eq!(
+        passed_secret("${{ SECRETS.token }}").as_deref(),
+        Some("TOKEN")
+    );
+    assert_eq!(
+        passed_secret("${{ Secrets.Token }}").as_deref(),
+        Some("TOKEN")
+    );
+    assert_eq!(passed_secret("${{ secretsX.token }}"), None);
+}
+
+#[test]
+fn a_matrix_value_a_call_keeps_is_charged_for_every_job_of_the_call() {
+    // 100 jobs in the callee, each keeping a frame with a 100 KB value.
+    let entries: Vec<String> = (0..100)
+        .map(|i| format!("{{ build: {{ name: j{i} }} }}"))
+        .collect();
+    let big = "x".repeat(100_000);
+    let text = format!(
+        "
+  w:
+    on: {{ call: {{}} }}
+    jobs: [{}]
+  release:
+    on: {{ push: {{}} }}
+    jobs:
+      - p:
+          call: w
+          matrix:
+            n: [1]
+            include: [{{ n: 1, big: '{big}' }}]
+",
+        entries.join(", ")
+    );
+    let msg = errors(&text);
+    assert!(msg.contains("bytes of steps and values"), "{msg}");
+}
