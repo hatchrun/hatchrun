@@ -1315,3 +1315,57 @@ fn a_stand_in_job_becomes_its_first_expanded_job() {
     let after = db.wait(job(db.db(), rows[2].id)).unwrap().unwrap();
     assert_eq!(after.needs, serde_json::json!(["test (arm)", "test (x86)"]));
 }
+
+#[test]
+fn a_job_a_rerun_left_out_stays_out_of_the_list_and_counts_until_made_again() {
+    let db = setup();
+    let (run, kept) = run_with_job(&db, "queued");
+    let ids = db
+        .wait(insert_jobs(db.db(), run.id, &[new_job("gone")], 1_000))
+        .unwrap();
+    let gone = ids[0].1;
+    let steps = serde_json::json!([]);
+    for id in [kept, gone] {
+        assert!(
+            db.wait(finish_job(db.db(), id, 1, "success", &steps, None, None, 5))
+                .unwrap()
+        );
+    }
+    let counts = |db: &TestDb| {
+        db.wait(job_counts(db.db(), &[run.id]))
+            .unwrap()
+            .remove(&run.id)
+            .unwrap()
+    };
+    assert_eq!(counts(&db).total, 2);
+    // The rerun makes a smaller matrix: the job ends as skipped for the
+    // new attempt and the row is marked.
+    db.wait(reset_job(db.db(), gone, 2, 10)).unwrap();
+    assert!(
+        db.wait(finish_job(
+            db.db(),
+            gone,
+            2,
+            "skipped",
+            &steps,
+            None,
+            None,
+            11
+        ))
+        .unwrap()
+    );
+    db.wait(supersede_job(db.db(), gone, 2)).unwrap();
+    let listed = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
+    assert_eq!(listed.iter().map(|r| r.id).collect::<Vec<_>>(), [kept]);
+    let all = db.wait(all_jobs_for_run(db.db(), run.id)).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(counts(&db).total, 1);
+    assert_eq!(counts(&db).skipped, 0);
+    // A mark for another attempt does nothing.
+    db.wait(supersede_job(db.db(), kept, 7)).unwrap();
+    assert_eq!(db.wait(jobs_for_run(db.db(), run.id)).unwrap().len(), 1);
+    // A later rerun that makes the job again clears the mark.
+    db.wait(reset_job(db.db(), gone, 3, 20)).unwrap();
+    assert_eq!(db.wait(jobs_for_run(db.db(), run.id)).unwrap().len(), 2);
+    assert_eq!(counts(&db).total, 2);
+}

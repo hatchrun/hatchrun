@@ -26,6 +26,9 @@ const APPROVAL_MESSAGE: &str = "Approval jobs come in a later release.";
 /// Why a job that failed ends as a success.
 const CONTINUED: &str = "The job failed, and continue-on-error counts it as a success.";
 
+/// Why a job a rerun dropped from its matrix ends as skipped.
+const NOT_IN_MATRIX: &str = "Not in the matrix of this attempt.";
+
 /// Why a job of a matrix ends as cancelled when another one failed.
 const FAIL_FAST: &str = "Canceled because another job of its matrix failed and fail-fast is on.";
 
@@ -46,6 +49,11 @@ pub struct Graph {
     /// before: a rerun of what they read makes them again.
     #[serde(default)]
     stand_ins: BTreeMap<String, PlannedJob>,
+    /// The jobs a rerun took out of the graph to read their matrix
+    /// again, by the plan id of the job that made them, with their row
+    /// ids: those the new matrix leaves out end as skipped.
+    #[serde(default)]
+    previous: BTreeMap<String, Vec<(u64, PlannedJob)>>,
 }
 
 /// What reading the scope of a job found: its `inputs`.
@@ -78,6 +86,11 @@ pub struct Node {
     /// this one.
     #[serde(default)]
     pub expanded_from: Option<String>,
+    /// The job is one a rerun left out of its matrix: it ended as
+    /// skipped for this attempt and is no part of the run, its
+    /// conclusion or what requires jobs.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// Where a job is.
@@ -158,12 +171,14 @@ impl Graph {
                     message: None,
                     cancel: 0,
                     expanded_from: None,
+                    stale: false,
                 })
                 .collect(),
             cancelled: false,
             run_done: false,
             vars: BTreeMap::new(),
             stand_ins: BTreeMap::new(),
+            previous: BTreeMap::new(),
         }
     }
 
@@ -459,6 +474,9 @@ impl Graph {
             let Some(stand_in) = self.stand_ins.get(&from).cloned() else {
                 continue;
             };
+            // What an earlier attempt left out is gone with this one.
+            self.jobs
+                .retain(|n| !(n.stale && n.expanded_from.as_deref() == Some(from.as_str())));
             let made: Vec<usize> = (0..self.jobs.len())
                 .filter(|&i| self.jobs[i].expanded_from.as_deref() == Some(from.as_str()))
                 .collect();
@@ -473,6 +491,15 @@ impl Graph {
             };
             let ids: Vec<String> = made.iter().map(|&i| self.jobs[i].job.id.clone()).collect();
             let row = self.jobs[first].id;
+            // The first job keeps its row; the others are left out when
+            // the matrix no longer makes them.
+            self.previous.insert(
+                from.clone(),
+                made.iter()
+                    .skip(1)
+                    .map(|&i| (self.jobs[i].id, self.jobs[i].job.clone()))
+                    .collect(),
+            );
             for &i in made.iter().rev() {
                 self.jobs.remove(i);
             }
@@ -491,6 +518,7 @@ impl Graph {
                     message: None,
                     cancel: 0,
                     expanded_from: None,
+                    stale: false,
                 },
             );
             let join = |requires: &mut Vec<String>| {
@@ -541,6 +569,7 @@ impl Graph {
         let group = self.jobs[at].job.strategy.as_ref().map(|s| &s.group);
         let in_group = |i: usize| {
             i != at
+                && !self.jobs[i].stale
                 && group.is_some()
                 && self.jobs[i].job.strategy.as_ref().map(|s| &s.group) == group
         };
@@ -548,7 +577,7 @@ impl Graph {
             u32::try_from(range.filter(|i| in_group(*i)).count()).unwrap_or(u32::MAX)
         };
         let siblings = Siblings {
-            jobs: self.jobs.len() - 1,
+            jobs: self.jobs.iter().filter(|n| !n.stale).count() - 1,
             group_before: count(0..at),
             group_others: count(0..self.jobs.len()),
         };
@@ -557,7 +586,7 @@ impl Graph {
                 self.jobs
                     .iter()
                     .enumerate()
-                    .any(|(i, n)| i != at && n.job.id == leg.job.id)
+                    .any(|(i, n)| i != at && !n.stale && n.job.id == leg.job.id)
             });
             match clash {
                 Some(leg) => Err(format!(
@@ -625,11 +654,20 @@ impl Graph {
                     message: None,
                     cancel: 0,
                     expanded_from: Some(old.job.id.clone()),
+                    stale: false,
                 }
             })
             .collect();
         self.stand_ins.insert(old.job.id.clone(), old.job.clone());
+        // A job that was left out earlier and is made again is current.
+        self.jobs.retain(|n| !(n.stale && ids.contains(&n.job.id)));
+        let at = at.min(self.jobs.len());
+        let made = nodes.len();
+        let rows: Vec<u64> = nodes.iter().map(|n| n.id).collect();
+        let dropped = self.left_out(&old, &ids, &rows);
+        let left_out: Vec<u64> = dropped.iter().map(|n| n.id).collect();
         self.jobs.splice(at..at, nodes);
+        self.jobs.splice(at + made..at + made, dropped);
         for node in &mut self.jobs {
             let Some(p) = node.job.requires.iter().position(|r| *r == old.job.id) else {
                 continue;
@@ -642,7 +680,13 @@ impl Graph {
             }
         }
         self.number_groups();
-        let mut actions = Vec::new();
+        let mut actions: Vec<Action> = left_out
+            .into_iter()
+            .map(|job| Action::Finished {
+                job,
+                conclusion: Conclusion::Skipped,
+            })
+            .collect();
         for (i, message) in failed {
             let at = at + i;
             // `fail-fast` of an earlier leg may have ended it already.
@@ -685,15 +729,55 @@ impl Graph {
         actions
     }
 
+    /// The jobs a rerun made before from `old`, the job that read its
+    /// matrix, that the new jobs `ids` (in `rows`) leave out: each ends
+    /// as skipped for this attempt, and is no part of the run.
+    fn left_out(&mut self, old: &Node, ids: &[String], rows: &[u64]) -> Vec<Node> {
+        let mut dropped = Vec::new();
+        for (row, job) in self.previous.remove(&old.job.id).unwrap_or_default() {
+            if ids.contains(&job.id) || rows.contains(&row) {
+                continue;
+            }
+            dropped.push(Node {
+                id: row,
+                job: PlannedJob {
+                    requires: Vec::new(),
+                    statuses: BTreeMap::new(),
+                    deferred: None,
+                    ..job
+                },
+                state: State::Done(Conclusion::Skipped),
+                attempt: old.attempt,
+                result: None,
+                message: Some(NOT_IN_MATRIX.to_owned()),
+                environment: None,
+                cancel: 0,
+                expanded_from: Some(old.job.id.clone()),
+                stale: true,
+            });
+        }
+        dropped
+    }
+
     /// Numbers the jobs of each strategy group in graph order and counts
     /// them, for `strategy.job-index` and `strategy.job-total`.
     fn number_groups(&mut self) {
         let mut totals: BTreeMap<String, u32> = BTreeMap::new();
-        for strategy in self.jobs.iter().filter_map(|n| n.job.strategy.as_ref()) {
+        for strategy in self
+            .jobs
+            .iter()
+            .filter(|n| !n.stale)
+            .filter_map(|n| n.job.strategy.as_ref())
+        {
             *totals.entry(strategy.group.clone()).or_default() += 1;
         }
         let mut seen: BTreeMap<String, u32> = BTreeMap::new();
-        for strategy in self.jobs.iter_mut().filter_map(|n| n.job.strategy.as_mut()) {
+        for strategy in self
+            .jobs
+            .iter_mut()
+            .filter(|n| !n.stale)
+            .filter_map(|n| n.job.strategy.as_mut())
+        {
             let next = seen.entry(strategy.group.clone()).or_default();
             strategy.job_index = *next;
             strategy.job_total = totals[&strategy.group];
@@ -714,7 +798,7 @@ impl Graph {
     #[must_use]
     pub fn conclusion(&self) -> Option<Conclusion> {
         let mut conclusions = Vec::with_capacity(self.jobs.len());
-        for node in &self.jobs {
+        for node in self.jobs.iter().filter(|n| !n.stale) {
             let State::Done(c) = node.state else {
                 return None;
             };
@@ -738,7 +822,7 @@ impl Graph {
     }
 
     fn position_of(&self, id: &str) -> Option<usize> {
-        self.jobs.iter().position(|n| n.job.id == id)
+        self.jobs.iter().position(|n| n.job.id == id && !n.stale)
     }
 
     fn requirements_done(&self, at: usize) -> bool {
@@ -836,6 +920,7 @@ impl Graph {
         let inside: Vec<usize> = (0..self.jobs.len())
             .filter(|&p| {
                 matches!(self.jobs[p].state, State::Done(_))
+                    && !self.jobs[p].stale
                     && self.jobs[p]
                         .job
                         .scope
@@ -889,6 +974,7 @@ impl Graph {
         let inside: Vec<&PlannedJob> = self
             .jobs
             .iter()
+            .filter(|n| !n.stale)
             .map(|n| &n.job)
             .filter(|j| j.scope.get(depth).is_some_and(|f| f.id == *instance))
             .collect();
@@ -918,7 +1004,7 @@ impl Graph {
         let scope = &self.jobs[at].job.scope;
         let frame = &scope[depth];
         let mut instances: Vec<&str> = Vec::new();
-        for node in &self.jobs {
+        for node in self.jobs.iter().filter(|n| !n.stale) {
             let other = &node.job.scope;
             let same = other.len() > depth
                 && other[depth].name == frame.name
@@ -3099,5 +3185,131 @@ workflows:
         assert!(g.needs(2).is_empty(), "{:?}", g.needs(2));
         let inputs = g.call_inputs(2, &ctx, &g.vars.clone()).unwrap().unwrap();
         assert_eq!(inputs["flag"], true);
+    }
+
+    /// Runs the dynamic graph through its first expansion into `os`
+    /// labels, with every job done, and reruns setup.
+    fn rerun_with(first: &str, second: &str) -> (Graph, Vec<Action>) {
+        let mut g = dynamic();
+        after_setup(&mut g, first);
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        let rows: Vec<(u64, _)> = legs
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (if i == 0 { 2 } else { 9 + i as u64 }, l.clone()))
+            .collect();
+        let launched = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        g.expanded(2, rows, &ctx());
+        for id in launched {
+            run(&mut g, id);
+            g.finished(id, ok(), &ctx());
+        }
+        run(&mut g, 3);
+        g.finished(3, ok(), &ctx());
+        assert!(g.conclusion().is_some());
+        g.rerun(1, &ctx());
+        run(&mut g, 1);
+        g.finished(1, done(Conclusion::Success, &[("os", second)]), &ctx());
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        let rows: Vec<(u64, _)> = legs
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (if i == 0 { 2 } else { 9 + i as u64 }, l.clone()))
+            .collect();
+        let actions = g.expanded(2, rows, &ctx());
+        (g, actions)
+    }
+
+    #[test]
+    fn a_rerun_with_a_smaller_matrix_ends_the_dropped_jobs_as_skipped() {
+        let (mut g, actions) = rerun_with(
+            r#"["ubuntu-latest","ubuntu-26.04-arm","ubuntu-26.04"]"#,
+            r#"["ubuntu-latest"]"#,
+        );
+        // Rows 10 and 11 are dropped for this attempt.
+        for job in [10, 11] {
+            let node = g.node(job).unwrap();
+            assert!(node.stale);
+            assert_eq!(node.state, State::Done(Conclusion::Skipped));
+            assert_eq!(
+                node.message.as_deref(),
+                Some("Not in the matrix of this attempt.")
+            );
+            assert!(actions.contains(&Action::Finished {
+                job,
+                conclusion: Conclusion::Skipped
+            }));
+        }
+        // The job after the matrix waits for the current leg only.
+        let after = g.jobs.iter().find(|n| n.job.id == "after").unwrap();
+        assert_eq!(after.job.requires, ["test (ubuntu-latest)"]);
+        // The run ends on the current jobs, whatever the dropped ones say.
+        run(&mut g, 2);
+        let actions = g.finished(2, ok(), &ctx());
+        assert!(actions.contains(&Action::Launch(3)), "{actions:?}");
+        run(&mut g, 3);
+        let actions = g.finished(3, ok(), &ctx());
+        assert!(actions.contains(&Action::RunDone(Conclusion::Success)));
+        assert_eq!(g.conclusion(), Some(Conclusion::Success));
+        // The strategy numbering counts the current leg alone.
+        let strategy = g.node(2).unwrap().job.strategy.as_ref().unwrap();
+        assert_eq!((strategy.job_index, strategy.job_total), (0, 1));
+    }
+
+    #[test]
+    fn a_rerun_with_a_larger_matrix_adds_jobs_and_a_returning_job_is_current() {
+        let (g, actions) = rerun_with(
+            r#"["ubuntu-latest"]"#,
+            r#"["ubuntu-latest","ubuntu-26.04-arm"]"#,
+        );
+        assert!(g.jobs.iter().all(|n| !n.stale));
+        let ids: Vec<&str> = g.jobs.iter().map(|n| n.job.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "setup",
+                "test (ubuntu-latest)",
+                "test (ubuntu-26.04-arm)",
+                "after"
+            ]
+        );
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::Finished {
+                conclusion: Conclusion::Skipped,
+                ..
+            }
+        )));
+        // Dropped and then made again: the stale job is replaced.
+        let (mut g, _) = rerun_with(
+            r#"["ubuntu-latest","ubuntu-26.04-arm"]"#,
+            r#"["ubuntu-latest"]"#,
+        );
+        for job in [2, 3] {
+            if g.node(job).is_some_and(|n| n.state == State::Queued) {
+                run(&mut g, job);
+                g.finished(job, ok(), &ctx());
+            }
+        }
+        assert!(g.conclusion().is_some());
+        g.rerun(1, &ctx());
+        run(&mut g, 1);
+        g.finished(
+            1,
+            done(
+                Conclusion::Success,
+                &[("os", r#"["ubuntu-latest","ubuntu-26.04-arm"]"#)],
+            ),
+            &ctx(),
+        );
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        assert_eq!(legs.len(), 2);
+        let rows = vec![(2, legs[0].clone()), (10, legs[1].clone())];
+        g.expanded(2, rows, &ctx());
+        assert!(
+            g.jobs.iter().all(|n| !n.stale),
+            "the dropped job is current again"
+        );
+        assert_eq!(g.node(10).unwrap().state, State::Queued);
     }
 }

@@ -475,6 +475,7 @@ mod tests {
     fn node(state: State, message: Option<&str>) -> Node {
         Node {
             expanded_from: None,
+            stale: false,
             id: 42,
             job: PlannedJob {
                 id: "build".into(),

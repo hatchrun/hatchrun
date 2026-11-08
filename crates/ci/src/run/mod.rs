@@ -310,6 +310,13 @@ pub enum Work {
         /// The new attempt.
         attempt: u32,
     },
+    /// The job's row is marked as left out of its matrix for `attempt`.
+    Supersede {
+        /// The job.
+        job: u64,
+        /// The attempt it is left out of.
+        attempt: u32,
+    },
     /// The run's row opens for `attempt`.
     ReopenRun {
         /// The new attempt.

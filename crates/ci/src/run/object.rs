@@ -884,6 +884,7 @@ impl<'a> Cx<'a> {
                     .await
             }
             Work::ResetJob { job, attempt } => store::reset_job(db, *job, *attempt, self.now).await,
+            Work::Supersede { job, attempt } => store::supersede_job(db, *job, *attempt).await,
             Work::ReopenRun { attempt } => {
                 store::reopen_run_at(db, info.run_id, *attempt, self.now).await?;
                 self.chain(*attempt, &["requested", "in_progress"], None)
@@ -1125,15 +1126,20 @@ impl<'a> Cx<'a> {
         };
         let attempt = run.graph.node(job).map_or(1, |node| node.attempt);
         let now = self.now;
-        let existing = store::jobs_for_run(db, run.info.run_id).await?;
+        let existing = store::all_jobs_for_run(db, run.info.run_id).await?;
         let mut rows: Vec<Option<u64>> = Vec::with_capacity(legs.len());
         let mut fresh = Vec::new();
+        // Rows of an earlier attempt that the matrix makes again.
+        let mut again: Vec<u64> = Vec::new();
         for (i, leg) in legs.iter().enumerate() {
             let new = crate::runs::new_job(&leg.job);
             if i == 0 {
                 store::retarget_job(db, job, &new, attempt, now).await?;
                 rows.push(Some(job));
             } else if let Some(row) = existing.iter().find(|r| r.plan_id == leg.job.id) {
+                if row.attempt < attempt {
+                    again.push(row.id);
+                }
                 rows.push(Some(row.id));
             } else {
                 rows.push(None);
@@ -1156,7 +1162,26 @@ impl<'a> Cx<'a> {
         }
         let plan_ids: Vec<String> = legs.iter().map(|l| l.job.id.clone()).collect();
         let legs: Vec<(u64, _)> = ids.iter().copied().zip(legs).collect();
+        let stand_in = run.graph.node(job).map(|n| n.job.id.clone());
         let actions = run.graph_mut().expanded(job, legs, &ctx);
+        // A job a rerun made again starts over, as the first one did.
+        for id in again {
+            self.start_over(run, id, attempt).await?;
+        }
+        // A job the new matrix leaves out ends as skipped for this
+        // attempt, which `actions` carries out, and its row is marked so
+        // the run's list and counts leave it out.
+        let left_out: Vec<u64> = run
+            .graph
+            .jobs
+            .iter()
+            .filter(|n| n.stale && n.attempt == attempt && n.expanded_from == stand_in)
+            .map(|n| n.id)
+            .collect();
+        for id in left_out {
+            self.start_over(run, id, attempt).await?;
+            run.todo_mut().push(Work::Supersede { job: id, attempt });
+        }
         for id in &ids {
             run.outbox_mut().mark(*id);
         }
@@ -1171,6 +1196,17 @@ impl<'a> Cx<'a> {
             store::set_needs(db, id, &needs, now).await?;
         }
         Ok(actions)
+    }
+
+    /// Clears what an earlier attempt left of job `id` and sets its row
+    /// up for `attempt`, as a rerun does for the jobs it resets.
+    async fn start_over(&self, run: &mut Loaded, id: u64, attempt: u32) -> Result<()> {
+        self.put_job(id, &JobState::default()).await?;
+        self.delete_prefix(&log_prefix(id)).await?;
+        self.storage.delete_multiple(log_keys(id)).await?;
+        run.todo_mut().push(Work::ResetJob { job: id, attempt });
+        run.outbox_mut().reset(id);
+        Ok(())
     }
 
     /// Turns what the graph decided into storage changes now and side
