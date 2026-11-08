@@ -29,7 +29,7 @@ pub mod trigger;
 pub use call::{
     CallFrame, CallInput, CallSecret, CallTarget, CallTrigger, Callee, InputType, Library,
     MAX_CALL_DEPTH, MAX_UNIQUE_CALLEES, RemoteCall, SecretsPassed, entry_in, read_value,
-    remote_calls, remote_calls_from, resolve_inputs, shared_depth,
+    remote_calls, remote_calls_from, resolve_frame, resolve_inputs, shared_depth,
 };
 pub use concurrency::{Cancel, Concurrency, Resolved};
 pub use config::{

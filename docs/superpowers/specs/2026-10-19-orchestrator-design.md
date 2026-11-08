@@ -184,9 +184,14 @@ What the planner does:
   callee's names, and nothing else is passed. A map value is one whole
   `${{ secrets.NAME }}`. The Worker opens only the outermost secrets
   the job reaches, and renames them for the job.
-- The callee can lower the token permissions the caller grants (the
-  entry's `permissions`, else the caller workflow's) and cannot raise
-  them. The callee workflow's own `concurrency` is ignored; job
+- A callee job that sets no permissions, in a callee that sets none,
+  gets the caller's (the entry's `permissions`, else the caller
+  workflow's). The callee can lower them and cannot raise them. `if`,
+  `permissions` and `secrets` on an entry that does not `call` are
+  errors: a job takes them from `jobs:`. A call's `if` is read once,
+  against the call's own needs, before its inputs are read; a job in the
+  callee counts only the jobs of its own call in `success()` and
+  `failure()`. The callee workflow's own `concurrency` is ignored; job
   concurrency applies.
 - Calls nest four deep. One plan calls at most 20 different workflows.
   A cycle, a callee without `on: call` and an output that reads

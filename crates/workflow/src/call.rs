@@ -403,6 +403,7 @@ pub struct Library {
     files: BTreeMap<RemoteCall, Callee>,
     refused: BTreeMap<RemoteCall, String>,
     offline: bool,
+    limit: bool,
 }
 
 impl Library {
@@ -425,6 +426,18 @@ impl Library {
     /// Adds the file `call` names.
     pub fn insert(&mut self, call: RemoteCall, callee: Callee) {
         self.files.insert(call, callee);
+    }
+
+    /// Records that the host stopped reading files for a workflow that
+    /// reaches more than [`MAX_UNIQUE_CALLEES`] of them.
+    pub fn mark_limit(&mut self) {
+        self.limit = true;
+    }
+
+    /// Whether the host stopped reading files at the limit.
+    #[must_use]
+    pub fn limit_reached(&self) -> bool {
+        self.limit
     }
 
     /// Records why the host did not read the file `call` names, which a
@@ -737,23 +750,33 @@ pub fn resolve_inputs(
     let mut inputs = dispatch.clone();
     for (i, frame) in frames.iter().enumerate() {
         let ctx = context_at(i, &inputs);
-        let mut next = Map::new();
-        for (name, value) in &frame.with {
-            let read = read_value(value, &ctx, JobStatus::Success)
-                .map_err(|e| format!("`with.{name}` of `{}` could not be read: {e}", frame.id))?;
-            let kind = frame.kinds.get(name).copied().unwrap_or_default();
-            let read = kind.coerce(&read).map_err(|e| {
-                format!(
-                    "`with.{name}` of `{}` must be {}: {e}",
-                    frame.id,
-                    kind.word()
-                )
-            })?;
-            next.insert(name.clone(), read);
-        }
-        inputs = Value::Object(next);
+        inputs = resolve_frame(frame, &ctx)?;
     }
     Ok(inputs)
+}
+
+/// The inputs one call gives its workflow: each `with` value read in
+/// `ctx` and coerced to the type of its input.
+///
+/// # Errors
+///
+/// A message naming the call and the input that cannot be read.
+pub fn resolve_frame(frame: &CallFrame, ctx: &Value) -> Result<Value, String> {
+    let mut next = Map::new();
+    for (name, value) in &frame.with {
+        let read = read_value(value, ctx, JobStatus::Success)
+            .map_err(|e| format!("`with.{name}` of `{}` could not be read: {e}", frame.id))?;
+        let kind = frame.kinds.get(name).copied().unwrap_or_default();
+        let read = kind.coerce(&read).map_err(|e| {
+            format!(
+                "`with.{name}` of `{}` must be {}: {e}",
+                frame.id,
+                kind.word()
+            )
+        })?;
+        next.insert(name.clone(), read);
+    }
+    Ok(Value::Object(next))
 }
 
 #[cfg(test)]

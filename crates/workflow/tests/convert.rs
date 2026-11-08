@@ -2284,10 +2284,11 @@ jobs:
         jobs["ci-a"].runs_on.as_deref(),
         Some("${{ inputs.runner }}")
     );
-    // The label it spells is brought to a template label.
+    // The text stays as written: the label it reads is brought to a
+    // template when the job is ready, so a comparison reads it unchanged.
     assert_eq!(
         jobs["ci-b"].runs_on.as_deref(),
-        Some("${{ github.event_name == 'push' && 'ubuntu-latest' || 'ubuntu-latest' }}")
+        Some("${{ github.event_name == 'push' && 'ubuntu-24.04' || 'ubuntu-latest' }}")
     );
     assert_eq!(jobs["ci-c"].runs_on.as_deref(), Some("${{ matrix.os }}"));
     assert!(has(&out.warnings, &["`runs-on: ubuntu-24.04` became"]));
@@ -2712,4 +2713,141 @@ fn the_deploy_fixture_converts_without_losing_a_capability() {
         deploys[1].matrix
     );
     assert_eq!(plan.run_name, wf.run_name);
+}
+
+#[test]
+fn a_comparison_in_a_runs_on_expression_keeps_its_operand() {
+    let out = ok("on: push
+jobs:
+  a:
+    runs-on: ${{ inputs.runner == 'ubuntu-24.04' && 'ubuntu-26.04-arm' || 'ubuntu-latest' }}
+    steps: [{ run: x }]
+");
+    assert_eq!(
+        out.config.jobs["ci-a"].runs_on.as_deref(),
+        Some("${{ inputs.runner == 'ubuntu-24.04' && 'ubuntu-26.04-arm' || 'ubuntu-latest' }}")
+    );
+}
+
+#[test]
+fn a_calls_job_split_by_include_reads_its_outputs_from_every_entry() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    uses: ./.github/workflows/w.yml\n  after:\n    needs: c\n    runs-on: ubuntu-latest\n    steps: [{ run: 'echo ${{ needs.c.outputs.tag }}' }]\n",
+        ),
+        (
+            "w.yml",
+            "
+on:
+  workflow_call:
+    outputs:
+      tag: { value: '${{ jobs.build.outputs.tag }}' }
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        include:
+          - { os: ubuntu-latest, extra: 1 }
+          - { os: ubuntu-26.04-arm, extra: 2 }
+    outputs: { tag: x }
+    steps: [{ run: x }]
+",
+        ),
+    ]);
+    let tag = &out.config.workflows["w"].on.call.as_ref().unwrap().outputs["tag"];
+    assert!(
+        tag.contains("(jobs.build.outputs.tag || jobs.build-2.outputs.tag)"),
+        "{tag}"
+    );
+}
+
+#[test]
+fn a_call_of_a_workflow_that_did_not_convert_is_dropped_with_what_needs_it() {
+    let out = many(&[
+        (
+            "ci.yml",
+            "
+on: push
+jobs:
+  c:
+    uses: ./.github/workflows/w.yml
+  after:
+    needs: c
+    runs-on: ubuntu-latest
+    steps: [{ run: x }]
+  fine:
+    runs-on: ubuntu-latest
+    steps: [{ run: y }]
+",
+        ),
+        (
+            "w.yml",
+            "on: workflow_call\njobs:\n  bad:\n    runs-on: macos-latest\n    steps: [{ run: x }]\n",
+        ),
+    ]);
+    assert!(!out.config.workflows.contains_key("w"));
+    let ids: Vec<&str> = out.config.workflows["ci"]
+        .jobs
+        .iter()
+        .map(|j| j.name.as_deref().unwrap_or(&j.job))
+        .collect();
+    assert_eq!(ids, ["fine"]);
+    assert!(has(&out.warnings, &["`c` was dropped", "did not convert"]));
+    assert!(has(&out.warnings, &["`after` was dropped", "needs `c`"]));
+    assert_eq!(validate(&out.config), Vec::new());
+}
+
+#[test]
+fn pruning_a_workflow_run_chain_keeps_a_job_a_call_shares_a_key_with() {
+    // `ci-c` is a job key of workflow `ci`; the pruned workflow `deploy`
+    // has a call whose entry is also named `ci-c`.
+    let out = many(&[
+        (
+            "ci.yml",
+            "on: push\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps: [{ run: x }]\n",
+        ),
+        (
+            "w.yml",
+            "on: workflow_call\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps: [{ run: x }]\n",
+        ),
+        (
+            "deploy.yml",
+            "on:\n  workflow_run: { workflows: [ghost] }\njobs:\n  ci-c:\n    uses: ./.github/workflows/w.yml\n",
+        ),
+    ]);
+    assert!(out.config.jobs.contains_key("ci-c"));
+    assert_eq!(validate(&out.config), Vec::new());
+}
+
+#[test]
+fn a_dynamic_matrix_reads_a_static_runner_label_at_run_time() {
+    let out = ok("on: push
+jobs:
+  setup: { runs-on: ubuntu-latest, steps: [{ run: x }], outputs: { extra: x } }
+  b:
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04]
+        include: ${{ fromJSON(needs.setup.outputs.extra) }}
+    steps: [{ run: x }]
+");
+    assert_eq!(out.errors, Vec::new());
+    let entry = entry(&out, "ci", "b");
+    assert_eq!(entry.matrix.values["os"], [json!("ubuntu-24.04")]);
+    let plan = hatchrun_workflow::compile(&out.config, "ci", "refs/heads/main").unwrap();
+    let b = plan.jobs.iter().find(|j| j.name == "b").unwrap();
+    let ctx = json!({
+        "needs": { "setup": { "result": "success", "outputs": { "extra": "[]" } } },
+        "github": {}, "inputs": {}, "vars": {}
+    });
+    let legs = hatchrun_workflow::expand(b, &ctx, hatchrun_workflow::Siblings::default()).unwrap();
+    assert_eq!(legs.len(), 1);
+    assert_eq!(legs[0].error, None);
+    // The matrix keeps the label as written.
+    assert_eq!(legs[0].job.matrix["os"], "ubuntu-24.04");
 }

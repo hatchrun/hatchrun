@@ -410,8 +410,17 @@ pub(crate) fn fill(
     vars: BTreeMap<String, String>,
 ) {
     // A job of a called workflow reads only what its calls passed, under
-    // the names the callee gave them.
-    doc.secrets = doc.job.visible_secrets(secrets);
+    // the names the callee gave them. The job token is not a stored
+    // secret, but a call may pass it on under another name.
+    if doc.job.scope.is_empty() {
+        doc.secrets = doc.job.visible_secrets(secrets);
+    } else {
+        let mut opened = secrets.clone();
+        opened.insert("GITHUB_TOKEN".to_owned(), doc.github.token.clone());
+        doc.secrets = doc.job.visible_secrets(&opened);
+        // The agent adds the job token itself.
+        doc.secrets.remove("GITHUB_TOKEN");
+    }
     doc.vars = vars;
 }
 
@@ -1084,6 +1093,41 @@ mod tests {
         before.secrets.clear();
         before.vars.clear();
         assert!(doc == before, "fill changed another field");
+    }
+
+    #[test]
+    fn a_call_can_pass_the_job_token_under_another_name() {
+        use hatchrun_workflow::{CallFrame, SecretsPassed};
+        let mut doc = document();
+        doc.github.token = "job-token".into();
+        let frame = |secrets| CallFrame {
+            id: "c".into(),
+            name: "c".into(),
+            workflow: "w".into(),
+            source: None,
+            with: BTreeMap::new(),
+            kinds: BTreeMap::new(),
+            secrets,
+            matrix: BTreeMap::new(),
+            if_: None,
+            outputs: BTreeMap::new(),
+        };
+        let named = SecretsPassed::Named(BTreeMap::from([(
+            "TOKEN".to_owned(),
+            "${{ secrets.GITHUB_TOKEN }}".to_owned(),
+        )]));
+        doc.job.scope = vec![frame(named)];
+        let stored = BTreeMap::from([("A".to_owned(), "s".to_owned())]);
+        fill(&mut doc, &stored, BTreeMap::new());
+        assert_eq!(
+            doc.secrets,
+            BTreeMap::from([("TOKEN".to_owned(), "job-token".to_owned())])
+        );
+        // Without the mapping the callee gets neither the token under
+        // another name nor the stored secret.
+        doc.job.scope = vec![frame(SecretsPassed::None)];
+        fill(&mut doc, &stored, BTreeMap::new());
+        assert_eq!(doc.secrets, BTreeMap::new());
     }
 
     #[test]

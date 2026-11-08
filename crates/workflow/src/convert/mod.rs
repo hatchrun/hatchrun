@@ -128,7 +128,9 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
     for (file, stem, gh) in parsed {
         cx.workflow(file, stem, gh);
     }
+    cx.drop_unavailable_calls();
     cx.unreachable_runs(&stems);
+    cx.drop_unavailable_calls();
     if !cx.errors.is_empty() && cx.config.workflows.is_empty() {
         return Err(cx.errors);
     }
@@ -216,14 +218,6 @@ const STEP_KEYS: &[&str] = &[
     "env",
     "continue-on-error",
     "timeout-minutes",
-];
-
-/// Labels GitHub retires and the template each becomes.
-const OLD_UBUNTU: &[(&str, &str)] = &[
-    ("ubuntu-24.04", "ubuntu-latest"),
-    ("ubuntu-22.04", "ubuntu-latest"),
-    ("ubuntu-24.04-arm", "ubuntu-26.04-arm"),
-    ("ubuntu-22.04-arm", "ubuntu-26.04-arm"),
 ];
 
 /// GitHub contexts hatchrun does not provide.
@@ -545,7 +539,7 @@ impl Cx {
         for key in gh.unknown.keys() {
             self.warn(format!("`{file}`: unknown key `{key}` was dropped"));
         }
-        let Some(on) = self.kept_triggers(file, stem, &gh.on) else {
+        let Some(mut on) = self.kept_triggers(file, stem, &gh.on) else {
             return;
         };
         let permissions = self.permissions(&format!("`{file}`"), gh.permissions.as_ref(), false);
@@ -563,6 +557,24 @@ impl Cx {
         // A file whose every job failed converts to nothing.
         if entries.is_empty() && failed {
             return;
+        }
+        // A job that `include` split into several entries is one job to
+        // `jobs.<id>.outputs` of the outputs of a reusable workflow.
+        let splits: BTreeMap<String, Vec<String>> = entries
+            .iter()
+            .filter(|(_, made)| made.len() > 1)
+            .map(|(id, made)| {
+                let names = made
+                    .iter()
+                    .map(|e| e.name.clone().unwrap_or_else(|| e.job.clone()))
+                    .collect();
+                (id.clone(), names)
+            })
+            .collect();
+        if let Some(call) = &mut on.call {
+            for text in call.outputs.values_mut() {
+                *text = calls::split_outputs(text, &splits);
+            }
         }
         let jobs = flatten(entries);
         self.config.workflows.insert(

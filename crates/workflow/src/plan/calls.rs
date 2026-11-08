@@ -42,15 +42,26 @@ pub(super) struct Calls<'a> {
     /// The file the workflows being planned come from: empty for the
     /// config, the call that named it for a file of another repository.
     origin: String,
+    /// What the token of the workflow being planned may do when it and
+    /// its jobs set no permissions: the caller's, for a called workflow.
+    inherited: Option<BTreeMap<String, Level>>,
 }
 
 impl<'a> Calls<'a> {
+    /// The permissions a job of the workflow being planned gets when
+    /// neither the job nor its workflow sets any, `None` for a workflow
+    /// that was not called.
+    pub(super) fn inherited(&self) -> Option<&BTreeMap<String, Level>> {
+        self.inherited.as_ref()
+    }
+
     pub(super) fn new(library: Option<&'a Library>, top: &str) -> Self {
         Self {
             library,
             stack: vec![top.to_owned()],
             unique: BTreeSet::new(),
             origin: String::new(),
+            inherited: None,
         }
     }
 }
@@ -235,6 +246,16 @@ pub(super) fn expand_call(
         return Vec::new();
     }
 
+    // What the caller's token may do, which a callee that sets no
+    // permissions of its own inherits, and none may raise.
+    let caller_scopes = match entry.permissions.as_ref().or(wf.permissions.as_ref()) {
+        Some(p) => token_scopes(Some(p)),
+        None => calls
+            .inherited
+            .clone()
+            .unwrap_or_else(|| token_scopes(None)),
+    };
+    let outer_inherited = calls.inherited.replace(caller_scopes.clone());
     calls.stack.push(target.unique.clone());
     let saved = std::mem::replace(&mut calls.origin, target.origin.clone());
     let plan = compile_workflow(
@@ -247,6 +268,7 @@ pub(super) fn expand_call(
         errors,
     );
     calls.origin = saved;
+    calls.inherited = outer_inherited;
     calls.stack.pop();
     let Some(plan) = plan else {
         return Vec::new();
@@ -292,7 +314,7 @@ pub(super) fn expand_call(
     if !reserve_jobs(workflow, planned, plan.jobs.len() * kept.len(), errors) {
         return Vec::new();
     }
-    let cap = token_scopes(entry.permissions.as_ref().or(wf.permissions.as_ref()));
+    let cap = caller_scopes;
     let one = plan.jobs.iter().map(job_bytes).sum::<usize>();
     let mut out = Vec::with_capacity(plan.jobs.len() * kept.len());
     for index in kept {
@@ -343,6 +365,11 @@ pub(super) fn expand_call(
                 outer.id = format!("{prefix}{}", outer.id);
             }
             job.scope.insert(0, frame.clone());
+            // Each instance of a call has its own strategy groups, so a
+            // failure in one does not cancel the jobs of another.
+            if let Some(strategy) = &mut job.strategy {
+                strategy.group = format!("{prefix}{}", strategy.group);
+            }
             job.token_permissions = capped(&job.token_permissions, &cap);
             out.push(job);
         }
@@ -371,6 +398,9 @@ fn remote_target<'a>(library: &'a Library, remote: &RemoteCall) -> Result<Target
     let Some(callee) = library.get(remote) else {
         return Err(match library.refusal(remote) {
             Some(reason) => format!("calls `{remote}`, which cannot be used: {reason}"),
+            None if library.limit_reached() => format!(
+                "calls `{remote}`, which was not read: a run may call at most {MAX_UNIQUE_CALLEES} different workflows"
+            ),
             None => format!("calls `{remote}`, which was not read by the host that planned this"),
         });
     };
@@ -577,7 +607,7 @@ fn outputs(owner: &str, target: &Target<'_>, trigger: &CallTrigger, errors: &mut
             .into_iter()
             .map(|(_, e)| e)
         {
-            for job in jobs_read(inner) {
+            for job in expr::jobs_read(inner).unwrap_or_default() {
                 if !entries.contains(job.as_str()) {
                     problem(
                         errors,
@@ -591,25 +621,6 @@ fn outputs(owner: &str, target: &Target<'_>, trigger: &CallTrigger, errors: &mut
             }
         }
     }
-}
-
-/// The job names an expression reads as `jobs.NAME`.
-fn jobs_read(inner: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = inner;
-    while let Some(at) = rest.find("jobs.") {
-        let before = rest[..at].chars().next_back();
-        let name: String = rest[at + 5..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-            .collect();
-        let inside = before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.'));
-        if !inside && !name.is_empty() {
-            out.push(name);
-        }
-        rest = &rest[at + 5..];
-    }
-    out
 }
 
 /// What is wrong with an expression of a call, which the host reads
@@ -638,12 +649,17 @@ pub(crate) fn output_expression(field: &str, text: &str) -> Vec<String> {
         Err(e) => return vec![format!("{field} has a bad expression: {e}")],
     };
     for (_, inner) in found {
-        for (context, _) in expr::contexts(inner).unwrap_or_default() {
-            if !OUTPUT_CONTEXTS.contains(&context.as_ref()) {
-                problems.push(format!(
-                    "{field} reads `{context}`; it can read only {}",
-                    OUTPUT_CONTEXTS.join(", ")
-                ));
+        match expr::contexts(inner) {
+            Err(e) => problems.push(format!("{field} has a bad expression: {e}")),
+            Ok(names) => {
+                for (context, _) in names {
+                    if !OUTPUT_CONTEXTS.contains(&context.as_ref()) {
+                        problems.push(format!(
+                            "{field} reads `{context}`; it can read only {}",
+                            OUTPUT_CONTEXTS.join(", ")
+                        ));
+                    }
+                }
             }
         }
     }

@@ -863,6 +863,27 @@ pub struct WorkflowJob {
     pub if_: Option<String>,
 }
 
+impl WorkflowJob {
+    /// The first of `if`, `permissions` and `secrets` this entry sets
+    /// without a `call`: they belong to a call, and a job takes its own
+    /// from `jobs:`, so they would be ignored.
+    #[must_use]
+    pub fn call_only_key(&self) -> Option<&'static str> {
+        if self.call.is_some() {
+            return None;
+        }
+        if self.if_.is_some() {
+            Some("if")
+        } else if self.permissions.is_some() {
+            Some("permissions")
+        } else if !self.secrets.is_none() {
+            Some("secrets")
+        } else {
+            None
+        }
+    }
+}
+
 /// One entry of a workflow job's `requires:` list.
 ///
 /// In YAML a bare entry id (`- build`), which asks for
@@ -1401,6 +1422,12 @@ impl<'de> Deserialize<'de> for WorkflowJob {
                 }
                 let mut entry = body.map(|b| b.0).unwrap_or_default();
                 entry.job = job;
+                if let Some(key) = entry.call_only_key() {
+                    return Err(de::Error::custom(format!(
+                        "`{key}` on entry `{}` is for an entry that runs a workflow with `call`; set it on the job under `jobs:` instead",
+                        entry.job
+                    )));
+                }
                 Ok(entry)
             }
         }

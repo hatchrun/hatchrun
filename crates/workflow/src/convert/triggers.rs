@@ -405,7 +405,10 @@ impl Cx {
                     continue;
                 };
                 for entry in wf.jobs {
-                    self.config.jobs.remove(&entry.job);
+                    // A call names a workflow, not a job.
+                    if entry.call.is_none() {
+                        self.config.jobs.remove(&entry.job);
+                    }
                 }
                 self.warn(format!(
                     "`{file}` was dropped: it runs only after workflows that did not convert"

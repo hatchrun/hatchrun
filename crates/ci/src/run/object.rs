@@ -1045,7 +1045,7 @@ impl<'a> Cx<'a> {
             .graph
             .node(job)
             .is_some_and(|n| n.job.continue_on_error.is_some())
-            || run.graph.environments_read_vars()
+            || run.graph.reads_vars()
         {
             let vars = store::job_vars(
                 self.db().await?,
@@ -1571,6 +1571,9 @@ impl<'a> Cx<'a> {
                 return answer(409);
             }
             let ctx = self.github_ctx(&run.info).await?;
+            if let Some(first) = run.graph.jobs.first().map(|n| n.id) {
+                self.load_vars(&mut run, first).await?;
+            }
             let actions = match (job, &body.message) {
                 (Some(job), message) => {
                     let Some(attempt) = attempt else {

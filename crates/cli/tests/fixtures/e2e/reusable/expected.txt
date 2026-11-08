@@ -11,8 +11,10 @@ validate: exit 0
 event push-main (compile refs/heads/main)
   build: not triggered
   ci: triggered
-    job build / build on ubuntu-latest: ok=run fail=run
+    job build / build on ubuntu-latest: ok=skip fail=skip
       name build
+      call build if github.event_name == 'pull_request'
+      inputs target=web
       step actions/checkout@v5
       step run: npm ci && npm run build -- --target ${{ inputs.target }}
     job test on ubuntu-latest: ok=run fail=run
@@ -34,6 +36,8 @@ event pull_request-opened (compile refs/heads/main)
   ci: triggered
     job build / build on ubuntu-latest: ok=run fail=run
       name build
+      call build if github.event_name == 'pull_request'
+      inputs target=web
       step actions/checkout@v5
       step run: npm ci && npm run build -- --target ${{ inputs.target }}
     job test on ubuntu-latest: ok=run fail=run
@@ -50,6 +54,8 @@ event pull_request-synchronize (compile refs/heads/main)
   ci: triggered
     job build / build on ubuntu-latest: ok=run fail=run
       name build
+      call build if github.event_name == 'pull_request'
+      inputs target=web
       step actions/checkout@v5
       step run: npm ci && npm run build -- --target ${{ inputs.target }}
     job test on ubuntu-latest: ok=run fail=run

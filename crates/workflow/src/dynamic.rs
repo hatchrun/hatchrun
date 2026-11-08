@@ -21,7 +21,7 @@ use crate::plan::{
     BUDGET, BYTE_BUDGET, Deferred, JobKind, MAX_COMBINATIONS, MAX_JOBS, MAX_MATRIX, PlannedJob,
     PlannedStrategy, render,
 };
-use crate::templates::{template, template_labels};
+use crate::templates::{runner_label, template, template_labels};
 
 /// One job an expansion makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,8 +211,12 @@ fn runner(
     let label = interpolate(text, ctx, &Plain)
         .map_err(|e| format!("`runs-on` of `{id}` could not be read: {e}"))?;
     let label = label.trim();
-    // The label can come from vars or outputs, so it is not echoed.
-    template(label).ok_or_else(|| {
+    // The label can come from vars or outputs, so it is not echoed. A
+    // label of GitHub or another service selects the template it
+    // converts to, as a plain `runs-on` does.
+    template(label)
+        .or_else(|| runner_label(label).and_then(template))
+        .ok_or_else(|| {
         format!(
             "`runs-on` of `{id}` evaluated to a label that names no runner template; use one of {}",
             template_labels().join(", ")
@@ -338,7 +342,11 @@ pub(crate) fn combinations(matrix: &Matrix, ctx: &Value) -> Result<Vec<Combo>, S
             if fits {
                 matched = true;
                 for (k, v) in &entry {
-                    combo.values.insert(k.clone(), v.clone());
+                    // The entry's value for an axis key only matched; the
+                    // axis keeps its own, as `false` is not `'false'`.
+                    if !values.contains_key(k) {
+                        combo.values.insert(k.clone(), v.clone());
+                    }
                 }
             }
         }
@@ -384,6 +392,6 @@ fn excluded_by(exclude: &[BTreeMap<String, Value>], combo: &BTreeMap<String, Val
 
 /// Whether two matrix values are the same, as `exclude` and `include`
 /// compare them: GitHub reads them as the text they show.
-fn same(a: &Value, b: &Value) -> bool {
+pub(crate) fn same(a: &Value, b: &Value) -> bool {
     a == b || render(a) == render(b)
 }

@@ -15,7 +15,7 @@ use hatchrun_workflow::{
     CallFrame, Conclusion, ExprError, Functions, JobKind, JobResult, JobStatus, Leg, Need, Outcome,
     Plan, PlannedJob, Ready, Siblings, Statuses, checks_status, continue_on_error, entry_in,
     expand, hatchrun_context, interpolate, is_expression, job_condition, read_value, ready,
-    resolve_inputs, shared_depth, valid_environment_name,
+    resolve_frame, shared_depth, valid_environment_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,13 +42,15 @@ pub struct Graph {
     /// reads. Not stored; [`Graph::set_vars`] fills it before a job ends.
     #[serde(skip)]
     vars: BTreeMap<String, String>,
+    /// The jobs that were read into several, by plan id, as they were
+    /// before: a rerun of what they read makes them again.
+    #[serde(default)]
+    stand_ins: BTreeMap<String, PlannedJob>,
 }
 
-/// What reading the scope of a job found: its `inputs`, and the contexts
-/// of each call it runs in.
+/// What reading the scope of a job found: its `inputs`.
 struct Walked {
     inputs: Value,
-    frames: Vec<Value>,
 }
 
 /// One job of a run.
@@ -72,6 +74,10 @@ pub struct Node {
     /// 0 until the job is asked to stop, 1 once asked, 2 once told to
     /// stop hard.
     pub cancel: u32,
+    /// The plan id of the job that read its matrix or `runs-on` and made
+    /// this one.
+    #[serde(default)]
+    pub expanded_from: Option<String>,
 }
 
 /// Where a job is.
@@ -151,23 +157,28 @@ impl Graph {
                     result: None,
                     message: None,
                     cancel: 0,
+                    expanded_from: None,
                 })
                 .collect(),
             cancelled: false,
             run_done: false,
             vars: BTreeMap::new(),
+            stand_ins: BTreeMap::new(),
         }
     }
 
-    /// Whether an environment name of the run reads `vars`, which the
-    /// caller then fills with [`Graph::set_vars`] before jobs start.
+    /// Whether the run reads `vars` when it decides: an environment name
+    /// does, and so can the `if` and `with` of a call, which every job of
+    /// a called workflow reads. The caller then fills them with
+    /// [`Graph::set_vars`] before it decides anything.
     #[must_use]
-    pub fn environments_read_vars(&self) -> bool {
+    pub fn reads_vars(&self) -> bool {
         self.jobs.iter().any(|n| {
-            n.job
-                .environment
-                .as_deref()
-                .is_some_and(|name| is_expression(name) && name.contains("vars"))
+            !n.job.scope.is_empty()
+                || n.job
+                    .environment
+                    .as_deref()
+                    .is_some_and(|name| is_expression(name) && name.contains("vars"))
         })
     }
 
@@ -419,9 +430,87 @@ impl Graph {
                 node.cancel = 0;
             }
         }
+        self.collapse_rerun();
         self.cancelled = false;
         self.run_done = false;
         self.advance(github_ctx)
+    }
+
+    /// Puts back, as the job it was, each job that read its matrix or
+    /// `runs-on` from a job that is run again: it reads them again when
+    /// that job ends, so entries the new output adds run and the ones it
+    /// drops do not. The first job it made keeps its row.
+    fn collapse_rerun(&mut self) {
+        let mut again: Vec<String> = Vec::new();
+        for node in &self.jobs {
+            let Some(from) = &node.expanded_from else {
+                continue;
+            };
+            let waits = node.state == State::Waiting
+                && node.job.requires.iter().any(|r| {
+                    self.position_of(r)
+                        .is_some_and(|p| self.jobs[p].state == State::Waiting)
+                });
+            if waits && !again.contains(from) && self.stand_ins.contains_key(from) {
+                again.push(from.clone());
+            }
+        }
+        for from in again {
+            let Some(stand_in) = self.stand_ins.get(&from).cloned() else {
+                continue;
+            };
+            let made: Vec<usize> = (0..self.jobs.len())
+                .filter(|&i| self.jobs[i].expanded_from.as_deref() == Some(from.as_str()))
+                .collect();
+            let (Some(&first), attempt) = (
+                made.first(),
+                made.iter()
+                    .map(|&i| self.jobs[i].attempt)
+                    .max()
+                    .unwrap_or(1),
+            ) else {
+                continue;
+            };
+            let ids: Vec<String> = made.iter().map(|&i| self.jobs[i].job.id.clone()).collect();
+            let row = self.jobs[first].id;
+            for &i in made.iter().rev() {
+                self.jobs.remove(i);
+            }
+            self.jobs.insert(
+                first,
+                Node {
+                    id: row,
+                    environment: stand_in
+                        .environment
+                        .clone()
+                        .filter(|name| !is_expression(name)),
+                    job: stand_in.clone(),
+                    state: State::Waiting,
+                    attempt,
+                    result: None,
+                    message: None,
+                    cancel: 0,
+                    expanded_from: None,
+                },
+            );
+            let join = |requires: &mut Vec<String>| {
+                let Some(p) = requires.iter().position(|r| ids.contains(r)) else {
+                    return;
+                };
+                requires.retain(|r| !ids.contains(r));
+                let p = p.min(requires.len());
+                requires.insert(p, from.clone());
+            };
+            for node in &mut self.jobs {
+                if node.job.id != from {
+                    join(&mut node.job.requires);
+                }
+            }
+            for other in self.stand_ins.values_mut() {
+                join(&mut other.requires);
+            }
+            self.number_groups();
+        }
     }
 
     /// The jobs a job that asked to expand makes, read from its
@@ -535,9 +624,11 @@ impl Graph {
                     result: None,
                     message: None,
                     cancel: 0,
+                    expanded_from: Some(old.job.id.clone()),
                 }
             })
             .collect();
+        self.stand_ins.insert(old.job.id.clone(), old.job.clone());
         self.jobs.splice(at..at, nodes);
         for node in &mut self.jobs {
             let Some(p) = node.job.requires.iter().position(|r| *r == old.job.id) else {
@@ -658,7 +749,19 @@ impl Graph {
     }
 
     fn needs_at(&self, at: usize) -> BTreeMap<String, Need> {
-        self.needs_for(&self.jobs[at].job.scope, &self.jobs[at].job.requires)
+        let job = &self.jobs[at].job;
+        // A job of a called workflow reads the jobs of its own call: what
+        // the call waits for reaches it as inputs, not as `needs`.
+        let inside: Vec<String> = job
+            .requires
+            .iter()
+            .filter(|id| {
+                self.position_of(id)
+                    .is_none_or(|p| shared_depth(&job.scope, &self.jobs[p].job) == job.scope.len())
+            })
+            .cloned()
+            .collect();
+        self.needs_for(&job.scope, &inside)
     }
 
     /// What a job that runs in `scope` and requires `requires` reads as
@@ -855,30 +958,43 @@ impl Graph {
         github_ctx: &Value,
         vars: &BTreeMap<String, String>,
     ) -> Result<Walked, String> {
-        let dispatch = github_ctx
+        let walked = self.walk_gated(at, github_ctx, vars, &mut |_, _| Ok(true))?;
+        walked.ok_or_else(|| "a call stopped the walk".to_owned())
+    }
+
+    /// [`Graph::walk`] that asks `gate` about each call, with the call's
+    /// index and contexts, before it reads the inputs of that call. A
+    /// call that is skipped gives its workflow no inputs to read, so one
+    /// that could not be read is no failure: the walk ends with `None`.
+    fn walk_gated(
+        &self,
+        at: usize,
+        github_ctx: &Value,
+        vars: &BTreeMap<String, String>,
+        gate: &mut dyn FnMut(usize, &Value) -> Result<bool, String>,
+    ) -> Result<Option<Walked>, String> {
+        let mut inputs = github_ctx
             .get("event")
             .and_then(|e| e.get("inputs"))
             .cloned()
             .unwrap_or_else(|| json!({}));
         let frames = &self.jobs[at].job.scope;
-        let contexts = std::cell::RefCell::new(Vec::new());
-        let inputs = resolve_inputs(frames, &dispatch, |i, parent| {
+        for (i, frame) in frames.iter().enumerate() {
             let ctx = json!({
                 "hatchrun": hatchrun_context(github_ctx),
                 "github": github_ctx,
                 "needs": self.needs_for(&frames[..i], &self.call_edges(at, i).0),
-                "matrix": frames[i].matrix,
+                "matrix": frame.matrix,
                 "strategy": self.frame_strategy(at, i),
                 "vars": vars,
-                "inputs": parent,
+                "inputs": inputs,
             });
-            contexts.borrow_mut().push(ctx.clone());
-            ctx
-        })?;
-        Ok(Walked {
-            inputs,
-            frames: contexts.into_inner(),
-        })
+            if !gate(i, &ctx)? {
+                return Ok(None);
+            }
+            inputs = resolve_frame(frame, &ctx)?;
+        }
+        Ok(Some(Walked { inputs }))
     }
 
     /// The `inputs` of a job that runs in a call, `None` for a job of
@@ -988,25 +1104,49 @@ impl Graph {
         } else {
             self.ancestor_status(at)
         };
+        // Each call's `if` is read once, against the call's own needs,
+        // before the inputs of that call are read.
         let walked = self
-            .walk(at, github_ctx, &self.vars)
+            .walk_gated(at, github_ctx, &self.vars, &mut |i, ctx| {
+                let frame = &node.job.scope[i];
+                let held = (|| {
+                    let (roots, by_statuses) = self.call_edges(at, i);
+                    let status = if self.cancelled {
+                        JobStatus::Cancelled
+                    } else if by_statuses
+                        && !frame.if_.as_deref().map_or(Ok(false), checks_status)?
+                    {
+                        JobStatus::Success
+                    } else {
+                        self.ancestors(&roots, &node.job.scope[..i])
+                    };
+                    job_condition(frame.if_.as_deref(), ctx, &Status(status))
+                })();
+                held.map_err(|e| e.to_string())
+            })
             .map_err(|message| ExprError { message, offset: 0 })?;
-        // Each call's `if` is read once, against the call's own needs.
-        for (i, frame) in node.job.scope.iter().enumerate() {
-            let (roots, by_statuses) = self.call_edges(at, i);
-            let status = if self.cancelled {
-                JobStatus::Cancelled
-            } else if by_statuses && !frame.if_.as_deref().map_or(Ok(false), checks_status)? {
-                JobStatus::Success
-            } else {
-                self.ancestors(&roots, &node.job.scope[..i])
-            };
-            if !job_condition(frame.if_.as_deref(), &walked.frames[i], &Status(status))? {
-                return Ok(false);
-            }
-        }
+        let Some(walked) = walked else {
+            return Ok(false);
+        };
         let ctx = self.context_with(at, github_ctx, &self.vars, &walked);
-        job_condition(node.job.if_.as_deref(), &ctx, &Status(status))
+        // A job whose matrix is read when it is ready sees an empty matrix
+        // now: an `if` that reads the matrix is read by each job the
+        // matrix makes. Only the implicit `success()` is read here.
+        let own = node.job.if_.as_deref();
+        let waits_for_legs = node
+            .job
+            .deferred
+            .as_ref()
+            .is_some_and(|d| !d.matrix.is_empty())
+            && own.is_some_and(|cond| cond.contains("matrix"));
+        if waits_for_legs {
+            return if checks_status(own.unwrap_or_default())? {
+                Ok(true)
+            } else {
+                job_condition(None, &ctx, &Status(status))
+            };
+        }
+        job_condition(own, &ctx, &Status(status))
     }
 
     /// The context of job `job`'s own expressions, as the graph builds it
@@ -2197,12 +2337,12 @@ workflows:
             "${{ vars.STAGE }}-${{ matrix.zone }}",
         );
         let mut g = graph_from(&yaml);
-        assert!(g.environments_read_vars());
+        assert!(g.reads_vars());
         g.set_vars(BTreeMap::from([("STAGE".to_owned(), "qa".to_owned())]));
         g.advance(&ctx());
         g.finished(1, ok(), &ctx());
         assert_eq!(g.node(3).unwrap().environment.as_deref(), Some("qa-a"));
-        assert!(!graph_from(ENVIRONMENTS).environments_read_vars());
+        assert!(!graph_from(ENVIRONMENTS).reads_vars());
     }
 
     #[test]
@@ -2823,5 +2963,141 @@ workflows:
         assert_eq!(actions, [Action::Launch(2), Action::Launch(3)]);
         assert_eq!(g.node(2).unwrap().environment.as_deref(), Some("deploy-a"));
         assert_eq!(g.node(3).unwrap().environment.as_deref(), Some("deploy-b"));
+    }
+
+    #[test]
+    fn a_matrix_dependent_job_if_waits_for_the_legs() {
+        let mut g = dynamic_with("matrix.os == 'ubuntu-latest'", FROM, true);
+        let actions = after_setup(&mut g, r#"{"os":["ubuntu-latest"]}"#);
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Expand(_))),
+            "{actions:?}"
+        );
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        let actions = g.expanded(2, vec![(2, legs[0].clone())], &ctx());
+        assert_eq!(actions, [Action::Launch(2)]);
+        // A leg that the `if` does not match is skipped, not the job.
+        let mut g = dynamic_with("matrix.os == 'ubuntu-latest'", FROM, true);
+        after_setup(&mut g, r#"{"os":["ubuntu-latest","ubuntu-26.04-arm"]}"#);
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        let rows = vec![(2, legs[0].clone()), (10, legs[1].clone())];
+        let actions = g.expanded(2, rows, &ctx());
+        assert!(actions.contains(&Action::Launch(2)));
+        assert!(actions.contains(&Action::Finished {
+            job: 10,
+            conclusion: Conclusion::Skipped
+        }));
+    }
+
+    #[test]
+    fn a_rerun_of_the_producer_reads_the_matrix_again() {
+        let mut g = dynamic();
+        let actions = after_setup(&mut g, r#"["ubuntu-latest","ubuntu-26.04-arm"]"#);
+        assert_eq!(actions.last(), Some(&Action::Expand(2)));
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        let rows = vec![(2, legs[0].clone()), (10, legs[1].clone())];
+        g.expanded(2, rows, &ctx());
+        for job in [2, 10] {
+            run(&mut g, job);
+            g.finished(job, ok(), &ctx());
+        }
+        run(&mut g, 3);
+        g.finished(3, ok(), &ctx());
+        assert!(g.conclusion().is_some());
+        let actions = g.rerun(1, &ctx());
+        assert_eq!(actions, [Action::Launch(1)]);
+        // The jobs the matrix made are the one job again, which waits.
+        let ids: Vec<&str> = g.jobs.iter().map(|n| n.job.id.as_str()).collect();
+        assert_eq!(ids, ["setup", "test", "after"]);
+        assert_eq!(g.node(2).unwrap().attempt, 2);
+        assert_eq!(g.node(3).unwrap().job.requires, ["test"]);
+        run(&mut g, 1);
+        let actions = g.finished(
+            1,
+            done(
+                Conclusion::Success,
+                &[(
+                    "os",
+                    r#"["ubuntu-26.04-arm","ubuntu-latest","ubuntu-26.04"]"#,
+                )],
+            ),
+            &ctx(),
+        );
+        assert_eq!(actions.last(), Some(&Action::Expand(2)));
+        let legs = g.expansion(2, &ctx(), &BTreeMap::new()).unwrap().unwrap();
+        assert_eq!(legs.len(), 3);
+    }
+
+    const VARS: &str = "
+jobs:
+  build: { runs-on: ubuntu-latest, steps: [] }
+  work: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  inner:
+    on: { call: { inputs: { flag: { type: boolean } } } }
+    jobs: [work]
+  ci:
+    on: { push: {} }
+    jobs:
+      - build
+      - c:
+          call: inner
+          requires: [build]
+          if: vars.GO == 'yes'
+          with: { flag: '${{ needs.build.outputs.v }}' }
+";
+
+    fn vars_graph(yaml: &str) -> Graph {
+        let plan = compile(&parse(yaml).unwrap(), "ci", "refs/heads/main")
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        Graph::new(
+            plan.jobs
+                .into_iter()
+                .zip(1u64..)
+                .map(|(j, i)| (i, j))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_call_reads_the_variables_the_graph_was_given() {
+        let ctx = github("refs/heads/main");
+        let mut g = vars_graph(VARS);
+        assert!(g.reads_vars());
+        g.set_vars(BTreeMap::from([("GO".to_owned(), "yes".to_owned())]));
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, done(Conclusion::Success, &[("v", "true")]), &ctx);
+        assert_eq!(g.node(2).unwrap().state, State::Queued);
+        let mut g = vars_graph(VARS);
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, done(Conclusion::Success, &[("v", "true")]), &ctx);
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+    }
+
+    #[test]
+    fn a_call_that_is_skipped_never_reads_its_inputs() {
+        let ctx = github("refs/heads/main");
+        let mut g = vars_graph(VARS);
+        g.advance(&ctx);
+        run(&mut g, 1);
+        // `maybe` is no boolean, but the call is off, so it is no failure.
+        g.finished(1, done(Conclusion::Success, &[("v", "maybe")]), &ctx);
+        assert_eq!(g.node(2).unwrap().state, State::Done(Conclusion::Skipped));
+        assert_eq!(g.conclusion(), Some(Conclusion::Success));
+    }
+
+    #[test]
+    fn what_a_call_waits_for_is_not_in_the_needs_of_its_jobs() {
+        let ctx = github("refs/heads/main");
+        let mut g = vars_graph(VARS);
+        g.set_vars(BTreeMap::from([("GO".to_owned(), "yes".to_owned())]));
+        g.advance(&ctx);
+        run(&mut g, 1);
+        g.finished(1, done(Conclusion::Success, &[("v", "true")]), &ctx);
+        assert!(g.needs(2).is_empty(), "{:?}", g.needs(2));
+        let inputs = g.call_inputs(2, &ctx, &g.vars.clone()).unwrap().unwrap();
+        assert_eq!(inputs["flag"], true);
     }
 }

@@ -101,16 +101,26 @@ pub fn file_at(api: &str, repo: &str, path: &str, sha: &str, token: &str) -> Req
     )
 }
 
-/// The text of a file [`file_at`] asked for, `None` when there is no
-/// such file.
+/// What GitHub answered to [`file_at`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileText {
+    /// There is no such file.
+    Missing,
+    /// The file.
+    Text(String),
+    /// The file is there and cannot be used: over [`MAX_SOURCE`] bytes
+    /// or not UTF-8. A retry gives the same answer.
+    Invalid(String),
+}
+
+/// The text of a file [`file_at`] asked for.
 ///
 /// # Errors
 ///
-/// GitHub's answer when it is not the file, or a file over
-/// [`MAX_SOURCE`] bytes or not UTF-8.
-pub fn file_text(response: &Response, what: &str) -> Result<Option<String>, String> {
+/// GitHub's answer when it is neither the file nor a 404: worth a retry.
+pub fn file_text(response: &Response, what: &str) -> Result<FileText, String> {
     if response.status == 404 {
-        return Ok(None);
+        return Ok(FileText::Missing);
     }
     if !response.ok() {
         return Err(format!(
@@ -120,14 +130,15 @@ pub fn file_text(response: &Response, what: &str) -> Result<Option<String>, Stri
         ));
     }
     if response.body.len() > MAX_SOURCE {
-        return Err(format!(
+        return Ok(FileText::Invalid(format!(
             "{what} is {} bytes; the limit is {MAX_SOURCE}",
             response.body.len()
-        ));
+        )));
     }
-    String::from_utf8(response.body.clone())
-        .map(Some)
-        .map_err(|_| format!("{what} is not UTF-8"))
+    Ok(String::from_utf8(response.body.clone()).map_or_else(
+        |_| FileText::Invalid(format!("{what} is not UTF-8")),
+        FileText::Text,
+    ))
 }
 
 /// A repository by `owner/name`, as the installation sees it.

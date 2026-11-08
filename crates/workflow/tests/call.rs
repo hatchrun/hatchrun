@@ -138,7 +138,7 @@ fn secrets_reach_only_what_the_call_passes() {
     ));
     let ship = &jobs[0];
     let refs = ship.secret_refs();
-    assert!(refs.names.contains("PROD"), "{refs:?}");
+    assert!(refs.names.contains("PROD"));
     // TOKEN is the callee's name; OTHER is read but not passed.
     assert!(!refs.names.contains("TOKEN"));
     assert!(!refs.names.contains("OTHER"));
@@ -170,6 +170,20 @@ fn inherit_passes_every_secret_and_none_passes_nothing() {
             .map(String::as_str),
         Some("a")
     );
+    let none = plan(
+        "
+  bare:
+    on: { call: {} }
+    jobs: [reads_s]
+  release:
+    on: { push: {} }
+    jobs: [{ p: { call: bare } }]
+",
+    );
+    assert_eq!(none[0].scope[0].secrets, SecretsPassed::None);
+    // An ordinary secret of the caller is not passed on.
+    assert_eq!(none[0].visible_secrets(&opened).len(), 0);
+    assert!(!none[0].secret_refs().names.contains("A"));
     let nested = plan(
         "
   inner:
@@ -434,4 +448,217 @@ fn a_remote_call_needs_the_file_in_the_library() {
         Some("acme/x/.github/workflows/y.yml@abc123")
     );
     let _: RemoteCall = wanted[0].clone();
+}
+
+#[test]
+fn a_callee_that_sets_no_permissions_inherits_the_callers() {
+    let jobs = plan(
+        "
+  w:
+    on: { call: {} }
+    jobs: [build]
+  release:
+    on: { push: {} }
+    permissions: { contents: write }
+    jobs: [{ p: { call: w } }]
+",
+    );
+    assert_eq!(
+        jobs[0].token_permissions.get("contents"),
+        Some(&hatchrun_workflow::Level::Write)
+    );
+    // The entry's own permissions are what the callee inherits and may
+    // lower.
+    let jobs = plan(
+        "
+  w:
+    on: { call: {} }
+    jobs: [build]
+  release:
+    on: { push: {} }
+    permissions: { contents: write }
+    jobs: [{ p: { call: w, permissions: { contents: read } } }]
+",
+    );
+    assert_eq!(
+        jobs[0].token_permissions.get("contents"),
+        Some(&hatchrun_workflow::Level::Read)
+    );
+}
+
+#[test]
+fn each_call_instance_has_its_own_strategy_groups() {
+    let jobs = plan(
+        "
+  w:
+    on: { call: {} }
+    jobs: [{ build: { matrix: { n: [1, 2] } } }]
+  release:
+    on: { push: {} }
+    jobs: [{ p: { call: w, matrix: { x: [a, b] } } }]
+",
+    );
+    let groups: Vec<(String, u32)> = jobs
+        .iter()
+        .map(|j| {
+            let s = j.strategy.as_ref().unwrap();
+            (s.group.clone(), s.job_total)
+        })
+        .collect();
+    assert_eq!(groups.len(), 4);
+    assert_eq!(groups[0].0, "p (a) / build");
+    assert_eq!(groups[2].0, "p (b) / build");
+    assert!(groups.iter().all(|(_, total)| *total == 2));
+}
+
+#[test]
+fn an_output_may_spell_a_job_name_in_a_string_and_must_parse() {
+    let jobs = plan(
+        "
+  w:
+    on: { call: { outputs: { u: \"${{ jobs.build.outputs.url || 'jobs.ghost.outputs.x' }}\" } } }
+    jobs: [build]
+  release:
+    on: { push: {} }
+    jobs: [{ p: { call: w } }]
+",
+    );
+    assert_eq!(jobs.len(), 1);
+    let msg = errors(
+        "
+  w:
+    on: { call: { outputs: { u: '${{ jobs.build.outputs.x + }}' } } }
+    jobs: [build]
+  release:
+    on: { push: {} }
+    jobs: [{ p: { call: w } }]
+",
+    );
+    assert!(
+        msg.contains("`on.call.outputs.u` of `w` has a bad expression"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn what_a_call_waits_for_does_not_count_in_what_needs_the_call() {
+    use hatchrun_workflow::{Outcome, Ready, ready};
+    let plan = compile(
+        &config(
+            "
+  w:
+    on: { call: {} }
+    jobs: [reads_s]
+  release:
+    on: { push: {} }
+    jobs:
+      - build
+      - c: { call: w, requires: [{ build: failed }] }
+      - { build: { name: after, requires: [{ c: success }] } }
+",
+        ),
+        "release",
+        "refs/heads/main",
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    let after = plan.jobs.iter().find(|j| j.id == "after").unwrap();
+    let outcome = |id: &str| match id {
+        "build" => Some(Outcome::Failed),
+        "c / reads_s" => Some(Outcome::Success),
+        _ => None,
+    };
+    assert_eq!(ready(&plan, after, outcome), Ready::Start);
+}
+
+#[test]
+fn if_and_permissions_and_secrets_belong_to_a_call() {
+    for (key, value) in [
+        ("if", "'false'"),
+        ("permissions", "{ contents: read }"),
+        ("secrets", "inherit"),
+    ] {
+        let text = format!(
+            "{BASE}\nworkflows:\n  release:\n    on: {{ push: {{}} }}\n    jobs: [{{ build: {{ {key}: {value} }} }}]\n"
+        );
+        let err = parse(&text).unwrap_err();
+        assert!(
+            err[0].message.contains(&format!("`{key}`")),
+            "{key}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_matrix_expression_cannot_have_entries_beside_it() {
+    use hatchrun_workflow::{Matrix, WorkflowJob};
+    let mut cfg = config(
+        "
+  release:
+    on: { push: {} }
+    jobs: [build]
+",
+    );
+    let entry = WorkflowJob {
+        job: "build".into(),
+        matrix: Matrix {
+            from: Some("${{ fromJSON('{}') }}".into()),
+            exclude: vec![BTreeMap::from([("a".to_owned(), serde_json::json!(1))])],
+            ..Matrix::default()
+        },
+        ..WorkflowJob::default()
+    };
+    cfg.workflows.get_mut("release").unwrap().jobs = vec![entry];
+    let msg = compile(&cfg, "release", "refs/heads/main")
+        .unwrap_err()
+        .iter()
+        .map(|d| d.message.clone())
+        .collect::<String>();
+    assert!(
+        msg.contains("one expression and keys, `include` or `exclude` beside it"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn an_exclude_matches_the_text_a_value_shows_with_or_without_an_include() {
+    let ids = |include: &str| -> Vec<String> {
+        plan(&format!(
+            "
+  release:
+    on: {{ push: {{}} }}
+    jobs:
+      - build:
+          matrix:
+            node: [18, 20]
+            exclude: [{{ node: '20' }}]
+{include}
+"
+        ))
+        .into_iter()
+        .map(|j| j.id)
+        .collect()
+    };
+    assert_eq!(ids(""), ["build (18)"]);
+    assert_eq!(
+        ids("            include: [{ node: 22 }]"),
+        ["build (18)", "build (22)"]
+    );
+}
+
+#[test]
+fn an_include_leaves_the_axis_value_it_matched() {
+    let jobs = plan(
+        "
+  release:
+    on: { push: {} }
+    jobs:
+      - build:
+          matrix:
+            flag: [false]
+            include: [{ flag: 'false', extra: x }]
+",
+    );
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].matrix["flag"], serde_json::json!(false));
+    assert_eq!(jobs[0].matrix["extra"], "x");
 }

@@ -139,6 +139,27 @@ pub fn dollars(micros: u64) -> String {
     format!("${}.{:02}", cents / 100, cents % 100)
 }
 
+/// The template a runner label of a workflow that ran on GitHub or
+/// another service selects: the label itself, the template a retired
+/// Ubuntu label moved to, or the template of a third-party label's arch
+/// and size. Read when a job's `runs-on` or matrix is read at run time.
+pub(crate) fn runner_label(label: &str) -> Option<&'static str> {
+    /// Labels GitHub retires and the template each becomes.
+    const OLD_UBUNTU: &[(&str, &str)] = &[
+        ("ubuntu-24.04", "ubuntu-latest"),
+        ("ubuntu-22.04", "ubuntu-latest"),
+        ("ubuntu-24.04-arm", "ubuntu-26.04-arm"),
+        ("ubuntu-22.04-arm", "ubuntu-26.04-arm"),
+    ];
+    if let Some((_, new)) = OLD_UBUNTU.iter().find(|(old, _)| *old == label) {
+        return Some(new);
+    }
+    if let Some(found) = template_labels().into_iter().find(|l| *l == label) {
+        return Some(found);
+    }
+    vendor_template(label).map(|(t, _)| t.labels[0])
+}
+
 /// Reads a third-party runner label as the template with its arch and at
 /// least its vCPUs: the smallest that fits, or the largest when none
 /// does. Returns the template and the vCPUs the label asks for.

@@ -27,7 +27,7 @@ use hatchrun_workflow::{
 };
 
 use crate::env::Settings;
-use crate::github;
+use crate::github::{self, FileText};
 use crate::runs::commit_of;
 use crate::store;
 
@@ -44,8 +44,8 @@ pub trait Source {
     /// The commit `git_ref` names, `None` when the repository has no
     /// such ref.
     async fn sha(&self, repo: &str, git_ref: &str) -> Result<Option<String>, String>;
-    /// The file at a commit, `None` when it is not there.
-    async fn file(&self, repo: &str, path: &str, sha: &str) -> Result<Option<String>, String>;
+    /// The file at a commit.
+    async fn file(&self, repo: &str, path: &str, sha: &str) -> Result<FileText, String>;
 }
 
 /// Why a repository may not be called, `None` when it may. The caller's
@@ -77,7 +77,7 @@ pub async fn read_library<S: Source>(
     let mut library = Library::default();
     // The limit counts the files one workflow reaches, as the planner
     // counts them for one plan.
-    for name in workflows {
+    'workflow: for name in workflows {
         let mut read = 0usize;
         loop {
             let wanted = remote_calls_from(config, &[name], &library);
@@ -87,11 +87,11 @@ pub async fn read_library<S: Source>(
             for call in wanted {
                 read += 1;
                 if read > MAX_UNIQUE_CALLEES {
-                    library.refuse(
-                        call,
-                        format!("a run may call at most {MAX_UNIQUE_CALLEES} different workflows"),
-                    );
-                    continue;
+                    // The workflow is over the limit; the plan says so.
+                    // The file may be fine for another workflow, so it is
+                    // not refused for all of them.
+                    library.mark_limit();
+                    break 'workflow;
                 }
                 match read_one(source, &call).await? {
                     Ok(callee) => library.insert(call, callee),
@@ -121,13 +121,18 @@ async fn read_one<S: Source>(
     let Some(sha) = source.sha(&repo, &call.git_ref).await? else {
         return Ok(Err(format!("{repo} has no ref `{}`", call.git_ref)));
     };
-    let Some(text) = source.file(&repo, &call.path, &sha).await? else {
-        return Ok(Err(format!(
-            "{repo} has no file `{}` at {} ({})",
-            call.path,
-            call.git_ref,
-            &sha[..sha.len().min(12)]
-        )));
+    let text = match source.file(&repo, &call.path, &sha).await? {
+        FileText::Text(text) => text,
+        FileText::Missing => {
+            return Ok(Err(format!(
+                "{repo} has no file `{}` at {} ({})",
+                call.path,
+                call.git_ref,
+                &sha[..sha.len().min(12)]
+            )));
+        }
+        // A file that cannot be used stays that way: a refusal, not a retry.
+        FileText::Invalid(reason) => return Ok(Err(reason)),
     };
     Ok(callee(call, &text, &sha))
 }
@@ -232,7 +237,7 @@ impl Source for Github<'_> {
         commit_of(&response)
     }
 
-    async fn file(&self, repo: &str, path: &str, sha: &str) -> Result<Option<String>, String> {
+    async fn file(&self, repo: &str, path: &str, sha: &str) -> Result<FileText, String> {
         let response = self
             .tokens
             .send(self.installation_id, |token| {
@@ -274,6 +279,8 @@ jobs:
         files: BTreeMap<(&'static str, &'static str), &'static str>,
         /// Every path of a known repository is the reusable file.
         any_file: bool,
+        /// Every file is there and cannot be used, for this reason.
+        invalid: Option<&'static str>,
     }
 
     #[allow(clippy::unused_async_trait_impl)]
@@ -291,15 +298,20 @@ jobs:
                 .then(|| "0123456789abcdef0123456789abcdef01234567".to_owned()))
         }
 
-        async fn file(&self, repo: &str, path: &str, _sha: &str) -> Result<Option<String>, String> {
+        async fn file(&self, repo: &str, path: &str, _sha: &str) -> Result<FileText, String> {
+            if let Some(reason) = self.invalid {
+                return Ok(FileText::Invalid(reason.to_owned()));
+            }
             if self.any_file && self.repos.contains_key(repo) {
-                return Ok(Some(REUSABLE.to_owned()));
+                return Ok(FileText::Text(REUSABLE.to_owned()));
             }
             Ok(self
                 .files
                 .iter()
                 .find(|((r, p), _)| *r == repo && *p == path)
-                .map(|(_, text)| (*text).to_owned()))
+                .map_or(FileText::Missing, |(_, text)| {
+                    FileText::Text((*text).to_owned())
+                }))
         }
     }
 
@@ -606,5 +618,49 @@ workflows:
                 .iter()
                 .any(|d| d.message.contains("at most 20 different workflows"))
         );
+    }
+
+    #[test]
+    fn a_file_over_the_size_limit_is_a_refusal_not_a_retry() {
+        let mut source = fake("acme/shared", false, true);
+        source.invalid = Some("acme/shared/.github/workflows/build.yml is not UTF-8");
+        let config = caller(CALL);
+        let library = read(&source, &config);
+        assert!(plan_error(&library, &config).contains("is not UTF-8"));
+    }
+
+    #[test]
+    fn a_workflow_over_the_limit_does_not_refuse_a_file_for_the_others() {
+        let mut source = fake("acme/shared", false, true);
+        source.any_file = true;
+        let many: Vec<String> = (0..25)
+            .map(|i| {
+                format!(
+                    "{{ c{i}: {{ call: 'acme/shared/.github/workflows/f{i}.yml@v1', with: {{ target: x }} }} }}"
+                )
+            })
+            .collect();
+        let config = parse(&format!(
+            "
+jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}
+workflows:
+  big:
+    on: {{ push: {{}} }}
+    jobs: [{}]
+  small:
+    on: {{ push: {{}} }}
+    jobs: [{{ c0: {{ call: 'acme/shared/.github/workflows/f0.yml@v1', with: {{ target: x }} }} }}]
+",
+            many.join(", ")
+        ))
+        .unwrap();
+        let library = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(read_library(&source, &config, &["big", "small"]))
+            .unwrap();
+        assert!(compile_with(&config, "small", "refs/heads/main", &library).is_ok());
+        let errors = compile_with(&config, "big", "refs/heads/main", &library).unwrap_err();
+        assert!(errors.iter().any(|d| d.message.contains("at most 20")));
     }
 }

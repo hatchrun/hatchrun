@@ -31,7 +31,7 @@ use std::process::Command;
 use hatchrun_workflow::{
     Arch, Config, Event, ExprError, Functions, HATCHRUN_KEYS, JobKind, JobStatus, Library,
     ParameterKind, Plan, PlannedJob, PlannedStep, Submodules, Workflow, compile, compile_with,
-    interpolate, job_condition, parse, to_yaml, triggered,
+    interpolate, job_condition, parse, resolve_inputs, to_yaml, triggered,
 };
 use serde_json::{Map, Value, json};
 
@@ -434,9 +434,14 @@ fn simulate(plan: &Plan, base: &Value, outputs: &Value, fail: bool) -> Run {
     for job in &plan.jobs {
         let upstream = upstream(job, &by_id, &ran);
         let ctx = job_context(job, base, &by_id, &ran, outputs);
-        let runs = match &job.if_ {
-            Some(cond) => condition(cond, &ctx, upstream.status()),
-            None => Ok(matches!(upstream, Upstream::Passed)),
+        // A call that does not hold skips every job of the called workflow.
+        let runs = if calls_hold(job, base) {
+            match &job.if_ {
+                Some(cond) => condition(cond, &ctx, upstream.status()),
+                None => Ok(matches!(upstream, Upstream::Passed)),
+            }
+        } else {
+            Ok(false)
         };
         let result = match runs {
             Ok(true) if fail => "failure",
@@ -451,6 +456,38 @@ fn simulate(plan: &Plan, base: &Value, outputs: &Value, fail: bool) -> Run {
         .map(|(name, legs)| (name, combined(&legs)))
         .collect();
     Run { results, lines }
+}
+
+/// The contexts of each call a job runs in, outermost first, with the
+/// inputs of the call before as `inputs`.
+fn call_contexts(job: &PlannedJob, base: &Value) -> (Value, Vec<Value>) {
+    let contexts = std::cell::RefCell::new(Vec::new());
+    let inputs = resolve_inputs(&job.scope, &base["inputs"], |i, parent| {
+        let mut ctx = base.clone();
+        ctx["inputs"] = parent.clone();
+        ctx["matrix"] = json!(job.scope[i].matrix);
+        ctx["needs"] = json!({});
+        contexts.borrow_mut().push(ctx.clone());
+        ctx
+    })
+    .unwrap_or_else(|e| panic!("{}: {e}", job.id));
+    let inputs = if job.scope.is_empty() {
+        base["inputs"].clone()
+    } else {
+        inputs
+    };
+    (inputs, contexts.into_inner())
+}
+
+/// Whether every call a job runs in holds, by its `if`.
+fn calls_hold(job: &PlannedJob, base: &Value) -> bool {
+    let (_, contexts) = call_contexts(job, base);
+    job.scope.iter().zip(&contexts).all(|(frame, ctx)| {
+        frame
+            .if_
+            .as_deref()
+            .is_none_or(|cond| matches!(condition(cond, ctx, JobStatus::Success), Ok(true)))
+    })
 }
 
 /// One result for a job and all its matrix legs and nodes.
@@ -567,6 +604,8 @@ fn job_context(
     }
     let mut ctx = base.clone();
     ctx["needs"] = Value::Object(needs);
+    // A job of a called workflow reads what the calls passed.
+    ctx["inputs"] = call_contexts(job, base).0;
     ctx
 }
 
@@ -645,6 +684,22 @@ fn render_job(
     }
     if let Some(cond) = &job.if_ {
         writeln!(out, "      if {cond}").unwrap();
+    }
+    for frame in &job.scope {
+        match &frame.if_ {
+            Some(cond) => writeln!(out, "      call {} if {cond}", frame.id).unwrap(),
+            None => writeln!(out, "      call {}", frame.id).unwrap(),
+        }
+    }
+    if !job.scope.is_empty() {
+        let (inputs, _) = call_contexts(job, base);
+        let shown: Vec<String> = inputs
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| format!("{k}={}", text(v)))
+            .collect();
+        writeln!(out, "      inputs {}", shown.join(" ")).unwrap();
     }
     if !job.matrix.is_empty() {
         let shown: Vec<String> = job.matrix.iter().map(|(k, v)| format!("{k}={v}")).collect();

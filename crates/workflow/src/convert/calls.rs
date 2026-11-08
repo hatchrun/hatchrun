@@ -311,6 +311,106 @@ impl Cx {
     }
 }
 
+/// `text`, an output of a reusable workflow, with each read of
+/// `jobs.<id>.outputs.<name>` of a job that `include` split into the
+/// entries `splits` names read from each of them, the first that has a
+/// value winning.
+pub(super) fn split_outputs(text: &str, splits: &BTreeMap<String, Vec<String>>) -> String {
+    let mut out = text.to_owned();
+    for (id, names) in splits {
+        let head = format!("jobs.{id}.outputs.");
+        let mut from = 0;
+        while let Some(at) = out[from..].find(&head).map(|i| from + i) {
+            let before = out[..at].chars().next_back();
+            let after = at + head.len();
+            let name: String = out[after..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                .collect();
+            let inside = before
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '\''));
+            if inside || name.is_empty() {
+                from = after;
+                continue;
+            }
+            let reads: Vec<String> = names
+                .iter()
+                .map(|n| format!("jobs.{n}.outputs.{name}"))
+                .collect();
+            let replacement = format!("({})", reads.join(" || "));
+            out.replace_range(at..after + name.len(), &replacement);
+            from = at + replacement.len();
+        }
+    }
+    out
+}
+
+impl Cx {
+    /// Drops the calls of workflows that did not convert, as the files
+    /// that had them are among the converted ones: each job that needs
+    /// such a call is dropped too, and a workflow left with no job goes
+    /// with them. Each is a warning.
+    pub(super) fn drop_unavailable_calls(&mut self) {
+        loop {
+            let mut changed = false;
+            let keys: Vec<String> = self.config.workflows.keys().cloned().collect();
+            for key in keys {
+                let Some(wf) = self.config.workflows.get(&key) else {
+                    continue;
+                };
+                let id = |e: &WorkflowJob| e.name.clone().unwrap_or_else(|| e.job.clone());
+                let mut gone: BTreeMap<String, String> = BTreeMap::new();
+                for entry in &wf.jobs {
+                    if let Some(Ok(CallTarget::Local(target))) =
+                        entry.call.as_deref().map(CallTarget::parse)
+                        && !self.config.workflows.contains_key(&target)
+                    {
+                        gone.insert(
+                            id(entry),
+                            format!("calls `{target}`, which did not convert"),
+                        );
+                    }
+                }
+                if gone.is_empty() {
+                    continue;
+                }
+                changed = true;
+                while let Some((entry, need)) = wf.jobs.iter().find_map(|e| {
+                    let need = e.requires.iter().find(|r| gone.contains_key(&r.job))?;
+                    (!gone.contains_key(&id(e))).then(|| (id(e), need.job.clone()))
+                }) {
+                    gone.insert(entry, format!("needs `{need}`, which was dropped"));
+                }
+                for (entry, why) in &gone {
+                    self.warn(format!(
+                        "workflow `{key}` job `{entry}` was dropped: it {why}"
+                    ));
+                }
+                let Some(wf) = self.config.workflows.get_mut(&key) else {
+                    continue;
+                };
+                let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut wf.jobs)
+                    .into_iter()
+                    .partition(|e| gone.contains_key(&id(e)));
+                wf.jobs = kept;
+                let empty = wf.jobs.is_empty();
+                for entry in dropped {
+                    if entry.call.is_none() {
+                        self.config.jobs.remove(&entry.job);
+                    }
+                }
+                if empty {
+                    self.config.workflows.remove(&key);
+                    self.warn(format!("workflow `{key}` was dropped: no job is left"));
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+}
+
 /// A string, number or boolean as text. `None` for lists and maps; null
 /// is the empty string.
 pub(super) fn scalar(value: &Value) -> Option<String> {

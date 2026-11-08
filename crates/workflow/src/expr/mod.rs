@@ -408,6 +408,57 @@ pub(crate) fn contexts(expr: &str) -> Result<Vec<(Cow<'_, str>, usize)>, ExprErr
     Ok(names)
 }
 
+/// The job names an expression reads as `jobs.NAME` or `jobs['NAME']`,
+/// read from the parsed expression: a string literal that spells one is
+/// not a read.
+///
+/// # Errors
+///
+/// When the expression is too long or too deep, or does not parse.
+pub(crate) fn jobs_read(expr: &str) -> Result<Vec<String>, ExprError> {
+    fn walk(expr: &parser::Expr<'_>, out: &mut Vec<String>) {
+        use parser::{Expr, Step};
+        match expr {
+            Expr::Literal(_) | Expr::Context { .. } => {}
+            Expr::Not(inner) => walk(inner, out),
+            Expr::Access { base, path } => {
+                if let Expr::Context { name, .. } = &**base
+                    && name.eq_ignore_ascii_case("jobs")
+                {
+                    match path.first() {
+                        Some(Step::Property(job)) => out.push((*job).to_owned()),
+                        Some(Step::Index(Expr::Literal(Value::String(job)))) => {
+                            out.push(job.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                walk(base, out);
+                for step in path {
+                    if let Step::Index(index) = step {
+                        walk(index, out);
+                    }
+                }
+            }
+            Expr::Call { args, .. } | Expr::And(args) | Expr::Or(args) => {
+                for arg in args {
+                    walk(arg, out);
+                }
+            }
+            Expr::Compare { first, rest } => {
+                walk(first, out);
+                for (_, operand) in rest {
+                    walk(operand, out);
+                }
+            }
+        }
+    }
+    let ast = tree(expr)?;
+    let mut out = Vec::new();
+    walk(&ast, &mut out);
+    Ok(out)
+}
+
 /// Lexes and parses one expression, within the length limit.
 fn tree(expr: &str) -> Result<parser::Expr<'_>, ExprError> {
     if expr.len() > MAX_LEN {

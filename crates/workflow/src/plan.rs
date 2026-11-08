@@ -16,7 +16,7 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::call::{CallFrame, Library};
+use crate::call::{CallFrame, Library, shared_depth};
 use crate::concurrency::{Cancel, Concurrency, JOB_CONTEXTS, WORKFLOW_CONTEXTS};
 use crate::config::{
     CacheStep, CheckoutStep, Config, ContinueOnError, Job, Matrix, Outcome, Parameter,
@@ -24,7 +24,7 @@ use crate::config::{
 };
 use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
-use crate::dynamic::combinations as matrix_entries;
+use crate::dynamic::{combinations as matrix_entries, same};
 use crate::environment::{is_expression, valid_environment_name};
 use crate::expr::{self, ExprError};
 use crate::permissions::{Level, token_scopes};
@@ -472,7 +472,7 @@ where
     let mut start = true;
     for name in entries {
         let roots = job.requires.iter().filter(|id| entry(id) == name);
-        let Some(state) = ancestry(roots, &by_id, &outcome) else {
+        let Some(state) = ancestry(roots, job, &by_id, &outcome) else {
             return Ready::Wait;
         };
         let wanted = job.statuses.get(name).copied().unwrap_or_default();
@@ -483,8 +483,13 @@ where
 
 /// The aggregate outcome of `roots` and every job before them: the
 /// strongest of their outcomes. `None` while one of them has not ended.
+///
+/// A root that is a job of a call counts as the call, for `viewer`
+/// outside it: only the jobs of that call count, not what the call
+/// waited for, which the call's own `if` read.
 fn ancestry<'a, F>(
     roots: impl Iterator<Item = &'a String>,
+    viewer: &PlannedJob,
     by_id: &BTreeMap<&str, &'a PlannedJob>,
     outcome: &F,
 ) -> Option<Outcome>
@@ -492,15 +497,26 @@ where
     F: Fn(&str) -> Option<Outcome>,
 {
     let mut seen = BTreeSet::new();
-    let mut todo: Vec<&str> = roots.map(String::as_str).collect();
     let mut strongest = Outcome::Success;
-    while let Some(id) = todo.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        strongest = strongest.max(outcome(id)?);
-        if let Some(job) = by_id.get(id) {
-            todo.extend(job.requires.iter().map(String::as_str));
+    for root in roots {
+        // The frames the walk from this root stays inside.
+        let limit: &[CallFrame] = by_id.get(root.as_str()).map_or(&[], |job| {
+            let shared = shared_depth(&viewer.scope, job);
+            &job.scope[..job.scope.len().min(shared + 1)]
+        });
+        let mut todo: Vec<&str> = vec![root.as_str()];
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            strongest = strongest.max(outcome(id)?);
+            if let Some(job) = by_id.get(id) {
+                todo.extend(job.requires.iter().map(String::as_str).filter(|r| {
+                    by_id
+                        .get(r)
+                        .is_none_or(|p| shared_depth(limit, p) == limit.len())
+                }));
+            }
         }
     }
     Some(strongest)
@@ -1526,6 +1542,12 @@ fn expand_entry(
     if entry.call.is_some() {
         return calls::expand_call(at, entry, id, budget, planned, calls, errors);
     }
+    if let Some(key) = entry.call_only_key() {
+        errors.push(Diagnostic::new(format!(
+            "workflow `{workflow}` entry `{id}` sets `{key}`, which is for an entry that runs a workflow with `call`; set it on the job under `jobs:` instead"
+        )));
+        return Vec::new();
+    }
     if entry.approval {
         if !reserve_jobs(workflow, planned, 1, errors) {
             return Vec::new();
@@ -1641,7 +1663,11 @@ fn expand_entry(
         };
         base.kind = JobKind::Run { template };
         if job.permissions.is_none() {
-            base.token_permissions = token_scopes(wf.permissions.as_ref());
+            base.token_permissions = match (&wf.permissions, calls.inherited()) {
+                // A called workflow that sets none takes its caller's.
+                (None, Some(inherited)) => inherited.clone(),
+                _ => token_scopes(wf.permissions.as_ref()),
+            };
         }
         if !attach_strategy(&mut base, entry, id, &mut walk, errors) {
             break;
@@ -1927,10 +1953,12 @@ pub(crate) fn excluded(matrix: &Matrix, index: usize) -> bool {
         rest /= values.len();
     }
     matrix.exclude.iter().any(|entry| {
+        // Values match as the text they show, as in a matrix that is made
+        // with `include` or when a job is ready.
         entry.iter().all(|(key, want)| {
             picked
                 .iter()
-                .any(|(k, value)| *k == key.as_str() && *value == want)
+                .any(|(k, value)| *k == key.as_str() && same(value, want))
         })
     })
 }
@@ -2285,10 +2313,20 @@ fn dynamic_matrix_errors(
         }
     }
     if matrix.from.is_some()
-        && (!matrix.values.is_empty() || !matrix.lists.is_empty() || matrix.include_from.is_some())
+        && (!matrix.values.is_empty()
+            || !matrix.lists.is_empty()
+            || matrix.include_from.is_some()
+            || !matrix.include.is_empty()
+            || !matrix.exclude.is_empty())
     {
         errors.push(Diagnostic::new(format!(
-            "`{id}` has a matrix that is one expression and keys beside it; put the keys in the expression"
+            "`{id}` has a matrix that is one expression and keys, `include` or `exclude` beside it; put them in the expression"
+        )));
+    }
+    // The file holds one `include`: the expression or the entries.
+    if matrix.include_from.is_some() && !matrix.include.is_empty() {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has `include` both as an expression and as entries; use one"
         )));
     }
 }
