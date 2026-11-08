@@ -280,15 +280,44 @@ Cache: unchanged model, with the guard written down.
 - The service refuses a save whose scope is not the run's. For an
   untrusted run it also refuses a save when the repository's fork cache
   quota (a share of the tenant's cache quota, default 10 percent) is
-  full, and evicts only entries of `refs/pull/*` scopes, oldest first.
-  A fork PR cannot evict `main`'s caches.
+  full, and evicts only entries saved by `fork` runs (each entry records
+  the trust of the run that saved it), oldest first. Entries of
+  `refs/pull/<n>/target` scopes come from trusted runs, and neither they
+  nor base and default branch entries are evicted by a fork run.
 - PR scopes are deleted when the PR closes, and by the existing 7 day idle rule.
 
-Artifacts: keyed by run, as today. Fork run artifacts are readable by
-the run's own later jobs and by people who can read the repository
-through the app. A `workflow_run` workflow downloads them with the
-repository's own token and gets the warning described above. Retention
-is the tenant's.
+Artifacts: keyed by run, as today. A fork run's artifacts are readable by
+its own later jobs and by people who can read the repository through the
+app. Each artifact row records the trust of its run.
+
+A `workflow_run` or `pull_request_target` job often needs the artifacts
+of another run (`actions/download-artifact` with `run-id` and
+`github-token`). That action talks to GitHub's REST API, which has no
+copy of a hatchrun run's artifacts, so the agent's ArtifactService proxy
+serves the path:
+
+- The agent points `GITHUB_API_URL` at a local proxy for the job. The proxy
+  answers `GET /repos/{repo}/actions/runs/{id}/artifacts`,
+  `GET /repos/{repo}/actions/artifacts/{id}` and
+  `GET /repos/{repo}/actions/artifacts/{id}/zip` itself and forwards every
+  other path to GitHub unchanged.
+- Run ids are hatchrun's. `github.event.workflow_run.id` carries the
+  upstream hatchrun run id, so `run-id: ${{ github.event.workflow_run.id }}`
+  resolves. The proxy asks the control plane first, and forwards the
+  request to GitHub when the id is not a hatchrun run (a run on GitHub
+  Actions).
+- Authentication is the job token the agent holds, never the workflow's
+  `github-token` value, which only proves repository access on GitHub.
+  The control plane endpoints are `GET /v1/artifacts/runs/{run}` (list)
+  and `GET /v1/artifacts/{id}/download`, which answers a presigned S3 URL
+  that the proxy returns as the zip's `302`.
+- Who may read which run: a trusted job reads the artifacts of any run of
+  its own repository, fork runs included, because that is what
+  `workflow_run` is for. A fork job reads only its own run. A job never
+  reads another repository's run or another tenant's.
+- A trusted job that downloads from a `fork` run gets a warning line in its
+  log naming the run and its head repository, and the planner warns on
+  such workflows (see "pull_request_target").
 
 ### Billing and abuse
 
@@ -299,15 +328,20 @@ Limits specific to fork runs:
 
 - `fork_max_running` jobs per repository at a time (default 2). Jobs over
   it wait in the queue. The tenant-wide `MAX_RUNNING_JOBS` still applies.
-- At most 20 runs per repository waiting for approval. A 21st delivery
-  creates no run and records `Too many pull requests waiting for
-  approval`. The oldest pending run is not cancelled, so a spammer cannot
-  push a real PR out.
+- At most 20 runs per repository waiting for approval. A delivery over
+  that creates the run as `deferred`: the planner expands it, the check run
+  `hatchrun / approval` says `Waiting for a free approval slot`, and no
+  approval card is shown. The reconciler admits deferred runs, oldest
+  first, when a slot frees, and then creates the card. A maintainer can
+  admit and approve one at once with `/approve-run` or the app's button.
+  At most 100 deferred runs per repository; a delivery over that is
+  dropped and recorded, and `/approve-run` on the PR starts a run for its
+  current head. Deferred runs expire after 7 days. The oldest pending run
+  is never cancelled, so a spammer cannot push a real PR out.
 - At most 3 active runs per author login per repository.
 - `fork_timeout_minutes` caps the job timeout (default 30).
 - Runner templates for fork runs are limited to 4 vCPU. Larger templates
   fail at planning with a clear message.
-- Runner templates for fork runs are limited to 4 vCPU.
 
 ## issues and issue_comment
 
@@ -319,7 +353,8 @@ GitHub App subscription and read permission are needed (see "GitHub App").
 `issues` actions that start workflows, as on GitHub: `opened`, `edited`,
 `deleted`, `transferred`, `pinned`, `unpinned`, `closed`, `reopened`,
 `assigned`, `unassigned`, `labeled`, `unlabeled`, `locked`, `unlocked`,
-`milestoned`, `demilestoned`. The default when `types` is absent is
+`milestoned`, `demilestoned`, `typed`, `untyped`, `field_added`,
+`field_removed`. The default when `types` is absent is
 every one of them.
 
 `issue_comment` actions: `created`, `edited`, `deleted`. The default
@@ -371,8 +406,7 @@ commit and no check run; the run shows in the app.
 The platform reacts to command comments itself, with the App's own
 identity: `eyes` when the delivery is accepted, then `+1` on success or
 `-1` on failure, or `rocket` and `confused` for `/deploy`-style commands
-(the command's `reaction: rocket` option picks the set). It posts no
-comment text. A refused commenter gets no reaction. Reactions use
+(the command's `reaction: rocket` option picks the set). It posts comment text only for the sha prompts of `on.command`. A refused commenter gets no reaction. Reactions use
 `POST /repos/{repo}/issues/comments/{id}/reactions`, which needs
 `Issues: write` for comments on issues and on pull requests alike;
 `Pull requests: write` does not grant it. Workflow
@@ -435,6 +469,7 @@ workflows:
           permission: maintain
           in: [pull_request]
           args: [environment]            # optional, names the words after the command
+          sha: auto                      # auto (default), required, optional
     jobs:
       - go
 ```
@@ -446,7 +481,8 @@ hyphen and underscore, up to 32 characters. Options:
 | --- | --- | --- |
 | `permission` | the GitHub repository permission the commenter must hold: `read`, `triage`, `write`, `maintain`, `admin` | `write` |
 | `in` | where the comment may be: `pull_request`, `issue` | `[pull_request]` |
-| `args` | names for the positional words, for `github.event.command.args.<name>` | none |
+| `sha` | whether the comment must name the PR head sha: `required`, `optional`, or `auto`, which is required when the PR is from a fork | `auto` |
+| `args` | names for the positional words, read as `github.event.command.named.<name>`; `args` holds all of them in order | none |
 
 A workflow may also write `command: retest` or `command: [retest, deploy]`
 for the defaults.
@@ -459,6 +495,8 @@ for the defaults.
   The first matching line of each name wins. Lines inside fenced code
   blocks and block quotes (`>`) never match.
 - One comment can carry several commands, at most 3.
+- A word of the form `@<hex>` (7 to 40 hex digits) is the sha pin, not an
+  argument.
 - Words after the name on the same line, split on whitespace, are the
   arguments. They are untrusted strings. At most 20 words, 200 characters
   each.
@@ -480,13 +518,13 @@ A command run is a trusted run on the default branch, like any
 ```json
 "command": {
   "name": "deploy",
-  "line": "/deploy staging",
+  "line": "/deploy staging @1a2b3c4",
   "args": ["staging"],
   "named": {"environment": "staging"},
   "actor": "alice",
   "permission": "maintain",
   "pull_request": {
-    "number": 12, "head_sha": "<sha at comment time>",
+    "number": 12, "head_sha": "<full sha the comment named>",
     "head_repo": "alice/repo", "base_ref": "main", "fork": true
   }
 }
@@ -495,27 +533,42 @@ A command run is a trusted run on the default branch, like any
 `pull_request` is present when the comment is on a PR, filled from one
 `GET /pulls/{n}` call.
 
-The job checks out the PR with `ref: ${{ github.event.command.pull_request.head_sha }}`.
-That is a sha, so a push between the comment and the checkout cannot swap
-the code: the maintainer who typed `/deploy` approved what the PR looked
-like at that moment. The validator accepts this form without the
-head-checkout warning when the same workflow's command requires
-`write` or higher, and warns on `github.head_ref` and `refs/pull/` forms.
-For a fork PR the sha is fetched from the base repository's
-`refs/pull/<n>/head`.
+The job checks out the PR with
+`ref: ${{ github.event.command.pull_request.head_sha }}`. A comment's
+timestamp does not bind it to the code the maintainer read, since a fork
+author can push between the comment and intake, so the commenter names
+the sha:
+
+1. A command that needs a sha (`required`, or `auto` on a fork PR) and has
+   no `@<sha>` starts nothing. The platform replies with one comment:
+   `The head is <sha>. Send "/deploy staging @<sha>" to run it.`
+2. A command with a sha is compared with the PR's current head, fetched
+   once at intake. A prefix that does not match starts nothing and gets a
+   reply naming the new head. A match runs with `head_sha` set to the
+   full sha.
+3. The job checks out exactly that sha, so a push after intake changes
+   nothing. For a fork PR the sha is fetched from the base repository's
+   `refs/pull/<n>/head`, and the run fails if that ref no longer holds it.
+
+The validator accepts the `head_sha` form without the head-checkout
+warning when the command requires `write` or higher, and warns on
+`github.head_ref` and `refs/pull/` forms.
 
 A command on a fork PR from a maintainer is deliberately trusted. The
 maintainer chose to run it with secrets. This is the `/ok-to-test` and
 `/deploy` pattern that projects use today, now with the permission check
-and the sha pinned.
+and a sha the maintainer named.
 
 ### Built-in /approve-run
 
 `/approve-run` needs no workflow. On a fork PR comment from a user with
 `write` or higher (same collaborator permission call), the control plane
-approves the pending run for the PR's current head sha, exactly as the
-check run button does, and reacts `+1`. A comment with no pending run gets
-`confused`. It is the only built-in command, and the name is reserved.
+approves the run for the PR's current head sha as the check run button
+does and reacts `+1`. A pending or deferred run is approved (a deferred
+one skips the queue). With no run for that sha, the control plane creates
+one from the PR, already approved. This is the retry path for a delivery
+that was dropped. It is the only built-in command, and the name is
+reserved.
 
 ## GitHub App permission and event changes
 
