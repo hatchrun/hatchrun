@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::concurrency::{Cancel, Concurrency, JOB_CONTEXTS, WORKFLOW_CONTEXTS};
 use crate::config::{
-    CacheStep, CheckoutStep, Config, ContinueOnError, Job, Matrix, Outcome, Parameter,
+    CacheStep, CheckoutStep, Config, Container, ContinueOnError, Job, Matrix, Outcome, Parameter,
     ParameterKind, RunStep, Statuses, Step, UsesStep, Workflow, WorkflowJob, WorkspaceStep,
 };
 use crate::cron::Cron;
@@ -197,6 +197,13 @@ pub struct PlannedJob {
     /// The job's `concurrency`, parameters substituted, the rest left
     /// for the host to evaluate when the job is about to start.
     pub concurrency: Option<Concurrency>,
+    /// The container the steps run in, parameters substituted. The
+    /// agent reads its expressions when the job starts.
+    pub container: Option<Container>,
+    /// The containers that run beside the job, by service id. A plan
+    /// stored before services existed has none.
+    #[serde(default)]
+    pub services: BTreeMap<String, Container>,
     /// The steps, with commands expanded.
     pub steps: Vec<PlannedStep>,
     /// What the job still has to read before it can start: a matrix or
@@ -599,6 +606,7 @@ fn standalone_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
         if let Some(c) = &job.concurrency {
             check.concurrency(c, JOB_CONTEXTS);
         }
+        check.containers(job);
         check.environment(job);
         check.steps(&job.steps);
     }
@@ -708,10 +716,10 @@ impl Check<'_> {
                 Step::Uses(uses) => {
                     self.opt(&at("name"), uses.name.as_deref());
                     self.text(&at("uses"), &uses.uses);
-                    if uses.uses.starts_with("docker://") {
+                    if uses.uses.trim() == "docker://" {
                         self.errors.push(Diagnostic::new(format!(
-                            "{} has `uses: {}`; `uses: docker://` is not supported yet; Docker services and containers come in a later release",
-                            self.owner, uses.uses
+                            "{} has `uses: docker://` with no image",
+                            self.owner
                         )));
                     }
                     for (key, value) in &uses.with {
@@ -765,6 +773,39 @@ impl Check<'_> {
                 }
                 Step::Command { name, with } => self.call(&at(name), name, with),
             }
+        }
+    }
+
+    /// Checks a job's `container` and `services`.
+    fn containers(&mut self, job: &Job) {
+        if let Some(container) = &job.container {
+            self.container("`container`", container);
+            let named = format!("{} `container`", self.owner);
+            for problem in crate::container::alias_problems(&named, container, job.services.keys())
+            {
+                self.errors.push(Diagnostic::new(problem));
+            }
+        }
+        for (id, service) in &job.services {
+            if !crate::container::valid_service_id(id) {
+                self.errors.push(Diagnostic::new(format!(
+                    "{} has service `{id}`; a service id is a hostname: letters, digits, `_` and `-`, starting with a letter or `_`",
+                    self.owner
+                )));
+            }
+            self.container(&format!("service `{id}`"), service);
+        }
+    }
+
+    /// Checks a `container` or one of the `services`: each string's
+    /// expressions parse, and the options are ones the agent can pass.
+    fn container(&mut self, what: &str, container: &Container) {
+        for (key, text) in container.texts() {
+            self.text(&format_args!("{what} `{key}`"), text);
+        }
+        let named = format!("{} {what}", self.owner);
+        for problem in crate::container::problems(&named, container) {
+            self.errors.push(Diagnostic::new(problem));
         }
     }
 
@@ -2246,6 +2287,8 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         environment: None,
         environment_url: None,
         concurrency: None,
+        container: None,
+        services: BTreeMap::new(),
         steps: Vec::new(),
         deferred: None,
     }]
@@ -2428,6 +2471,12 @@ fn expand_job(
         Some(ContinueOnError::When(text)) => sub.opt(Some(text)),
     };
     let outputs = sub.map(&job.outputs);
+    let container = job.container.as_ref().map(|c| sub.container(c));
+    let services = job
+        .services
+        .iter()
+        .map(|(id, c)| (id.clone(), sub.container(c)))
+        .collect();
     let concurrency = job.concurrency.as_ref().map(|c| Concurrency {
         group: sub.text(&c.group),
         cancel_in_progress: match &c.cancel_in_progress {
@@ -2473,6 +2522,8 @@ fn expand_job(
         environment,
         environment_url,
         concurrency,
+        container,
+        services,
         steps,
         deferred: None,
     })
@@ -2751,15 +2802,6 @@ fn plan_step(
                 continue_on_error: uses.continue_on_error,
                 timeout_minutes: uses.timeout_minutes,
             };
-            if planned.uses.starts_with("docker://") {
-                sub.walk.report(
-                    format!(
-                        "{scope} has `uses: {}`; `uses: docker://` is not supported yet; Docker services and containers come in a later release",
-                        planned.uses
-                    ),
-                    sub.errors,
-                );
-            }
             PlannedStep::Uses(planned)
         }
         Step::Checkout(checkout) => PlannedStep::Checkout(CheckoutStep {
@@ -2835,6 +2877,14 @@ impl Sub<'_, '_> {
                     .then(|| (key.clone(), self.text(value)))
             })
             .collect()
+    }
+
+    /// A container with parameters substituted in its strings.
+    fn container(&mut self, container: &Container) -> Container {
+        let mut out = container.clone();
+        self.walk.bytes(size_of::<Container>(), self.errors);
+        out.map_texts(&mut |text| self.text(text));
+        out
     }
 
     /// A list of strings with parameters substituted.
@@ -3135,6 +3185,16 @@ fn step_bytes(step: &PlannedStep) -> usize {
         }
 }
 
+/// The bytes a copy of a container holds: the struct and its strings.
+fn container_bytes(container: &Container) -> usize {
+    size_of::<Container>()
+        + container
+            .texts()
+            .iter()
+            .map(|(key, text)| key.len() + text.len() + ENTRY_OVERHEAD)
+            .sum::<usize>()
+}
+
 /// The bytes a copy of a planned job holds: the job struct, its steps,
 /// `env`, `outputs` and `if`.
 fn job_bytes(job: &PlannedJob) -> usize {
@@ -3142,6 +3202,12 @@ fn job_bytes(job: &PlannedJob) -> usize {
         + job.steps.iter().map(step_bytes).sum::<usize>()
         + map_bytes(&job.env)
         + map_bytes(&job.outputs)
+        + job
+            .container
+            .iter()
+            .chain(job.services.values())
+            .map(container_bytes)
+            .sum::<usize>()
         + job.if_.as_ref().map_or(0, String::len)
         + job.continue_on_error.as_ref().map_or(0, String::len)
         + job.strategy.as_ref().map_or(0, |s| s.group.len())

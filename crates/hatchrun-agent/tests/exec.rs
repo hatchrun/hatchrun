@@ -859,29 +859,6 @@ fn failing_node_action_fails_the_step() {
     );
 }
 
-#[test]
-fn docker_action_fails_the_step() {
-    let dir = tempfile::tempdir().unwrap();
-    local_action(
-        dir.path(),
-        "act",
-        "name: d\nruns:\n  using: docker\n  image: Dockerfile\n",
-        &[],
-    );
-    let out = run_steps(
-        dir.path(),
-        vec![PlannedStep::Uses(make::uses("a", "./act"))],
-    );
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        stdout(&out).contains(
-            "`./act` is a Docker container action; Docker services and containers come in a later release"
-        ),
-        "{}",
-        stdout(&out)
-    );
-}
-
 #[tokio::test]
 async fn remote_action_is_fetched_and_readable() {
     use std::os::unix::fs::PermissionsExt;
@@ -2365,7 +2342,7 @@ async fn cache_service_starts_the_proxy() {
     .unwrap();
     assert!(
         a.lines()
-            .any(|l| l.starts_with("url=http://127.0.0.1:") && l.contains("v2=true tok=set")),
+            .any(|l| l.starts_with("url=http://") && l.contains("v2=true tok=set")),
         "{a}"
     );
     assert!(b.lines().any(|l| l == "url=unset v2=unset tok="), "{b}");

@@ -456,14 +456,90 @@ workflows: { ci: { on: { push: {} }, jobs: [] } }
 }
 
 #[test]
-fn rejects_docker_uses() {
-    assert_error(
+fn docker_uses_plans_and_needs_an_image() {
+    let p = plan(
         "
 jobs: { t: { runs-on: ubuntu-latest, steps: [{ uses: 'docker://alpine' }] } }
 workflows: { ci: { on: { push: {} }, jobs: [t] } }
 ",
-        &["docker://alpine", "later release"],
     );
+    let PlannedStep::Uses(step) = &p.jobs[0].steps[0] else {
+        panic!("{:?}", p.jobs[0].steps)
+    };
+    assert_eq!(step.uses, "docker://alpine");
+    assert_error(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [{ uses: 'docker://' }] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+        &["job `t`", "no image"],
+    );
+}
+
+#[test]
+fn containers_plan_with_parameters_substituted() {
+    let p = plan(
+        "
+jobs:
+  t:
+    parameters: { tag: { type: string, default: '17' } }
+    runs-on: ubuntu-latest
+    container: { image: 'rust:${{ parameters.tag }}', env: { A: '${{ secrets.X }}' } }
+    services:
+      db:
+        image: 'postgres:${{ parameters.tag }}'
+        ports: [5432]
+        options: --health-cmd pg_isready
+    steps: []
+workflows: { ci: { on: { push: {} }, jobs: [{ t: { tag: '18' } }] } }
+",
+    );
+    let job = &p.jobs[0];
+    assert_eq!(job.container.as_ref().unwrap().image, "rust:18");
+    assert_eq!(job.container.as_ref().unwrap().env["A"], "${{ secrets.X }}");
+    assert_eq!(job.services["db"].image, "postgres:18");
+    let json = serde_json::to_string(&p).unwrap();
+    assert_eq!(serde_json::from_str::<Plan>(&json).unwrap(), p);
+}
+
+#[test]
+fn rejects_bad_containers() {
+    for (body, words) in [
+        (
+            "container: { image: 'a b' }",
+            &["job `t`", "`container`", "whitespace"][..],
+        ),
+        (
+            "container: { image: a, options: '--network host' }",
+            &["`container`", "--network"],
+        ),
+        (
+            "services: { db: { image: a, options: '--name x' } }",
+            &["service `db`", "--name"],
+        ),
+        (
+            "services: { 'a.b': { image: a } }",
+            &["service `a.b`", "hostname"],
+        ),
+        (
+            "container: { image: a, options: \"--x 'y\" }",
+            &["`options`", "quote"],
+        ),
+        (
+            "container: { image: a, env: { A: '${{ nosuch.x }}' } }",
+            &["`container`", "unknown context"],
+        ),
+    ] {
+        assert_error(
+            &format!(
+                "
+jobs: {{ t: {{ runs-on: ubuntu-latest, {body}, steps: [] }} }}
+workflows: {{ ci: {{ on: {{ push: {{}} }}, jobs: [t] }} }}
+"
+            ),
+            words,
+        );
+    }
 }
 
 #[test]
@@ -1130,7 +1206,7 @@ fn validate_checks_jobs_and_commands_no_workflow_runs() {
             &["command `c`", "unknown context"],
         ),
         (
-            "commands: { c: { steps: [{ uses: docker://alpine }] } }",
+            "commands: { c: { steps: [{ uses: 'docker://' }] } }",
             &["command `c`", "docker://"],
         ),
         (
@@ -2484,4 +2560,58 @@ workflows:
     let legs = expand(&p.jobs[0], &c).unwrap();
     let message = legs[0].error.as_deref().unwrap();
     assert!(message.contains("evaluated to a label"), "{message}");
+}
+
+#[test]
+fn container_env_names_are_substituted_and_checked() {
+    let p = plan(
+        "
+jobs:
+  t:
+    parameters: { n: { type: string, default: A } }
+    runs-on: ubuntu-latest
+    container: { image: a, env: { 'K_${{ parameters.n }}': v } }
+    steps: []
+workflows: { ci: { on: { push: {} }, jobs: [{ t: { n: B } }] } }
+",
+    );
+    let env = &p.jobs[0].container.as_ref().unwrap().env;
+    assert_eq!(env.keys().collect::<Vec<_>>(), ["K_B"]);
+    assert_error(
+        "
+jobs: { t: { runs-on: ubuntu-latest, container: { image: a, env: { '${{ nosuch.x }}': v } }, steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+        &["`container`", "unknown context"],
+    );
+}
+
+#[test]
+fn the_job_container_cannot_take_a_services_alias() {
+    assert_error(
+        "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    container: { image: a, options: '--network-alias db' }
+    services: { db: { image: b } }
+    steps: []
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+        &["`container`", "--network-alias db", "id of a service"],
+    );
+}
+
+#[test]
+fn a_stored_plan_without_services_loads() {
+    let p = plan(
+        "
+jobs: { t: { runs-on: ubuntu-latest, steps: [] } }
+workflows: { ci: { on: { push: {} }, jobs: [t] } }
+",
+    );
+    let mut json = serde_json::to_value(&p).unwrap();
+    json["jobs"][0].as_object_mut().unwrap().remove("services");
+    let back: Plan = serde_json::from_value(json).unwrap();
+    assert!(back.jobs[0].services.is_empty());
 }

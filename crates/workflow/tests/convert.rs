@@ -53,7 +53,7 @@ fn converts_a_typical_ci_workflow() {
             .requires,
         Vec::<Require>::new()
     );
-    assert!(out.warnings.iter().any(|w| w.message.contains("services")));
+    assert!(job.services.contains_key("postgres"));
     // round trip: the YAML we write parses and validates clean
     let reparsed = parse(&to_yaml(&out.config).unwrap()).unwrap();
     assert_eq!(validate(&reparsed), Vec::<Diagnostic>::new());
@@ -100,7 +100,10 @@ fn the_ci_fixture_maps_every_part() {
         &out.warnings,
         &["ci.yml", "test", "continue-on-error", "expression"]
     ));
-    assert!(has(&out.warnings, &["ci.yml", "test", "services"]));
+    let pg = &out.config.jobs["ci-test"].services["postgres"];
+    assert_eq!(pg.image, "postgres:17");
+    assert_eq!(pg.env["POSTGRES_PASSWORD"], "postgres");
+    assert_eq!(pg.ports, ["5432:5432"]);
     assert_eq!(out.config.jobs["ci-lint"].timeout_minutes, Some(10));
 }
 
@@ -146,16 +149,109 @@ fn runs_on_must_name_a_template() {
 }
 
 #[test]
-fn docker_steps_are_errors() {
+fn docker_steps_convert_to_uses_steps() {
+    let out = ok("
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Alpine
+        uses: docker://alpine:3.20
+        with:
+          entrypoint: /bin/echo
+          args: hello
+");
+    let Step::Uses(step) = &out.config.jobs["ci-build"].steps[0] else {
+        panic!("{:?}", out.config.jobs["ci-build"].steps)
+    };
+    assert_eq!(step.uses, "docker://alpine:3.20");
+    assert_eq!(step.with["entrypoint"], "/bin/echo");
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     let errs = one(
         "ci.yml",
-        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Alpine\n        uses: docker://alpine:3.20\n",
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: docker://\n",
     )
     .unwrap_err();
+    assert!(has(&errs, &["ci.yml", "build", "no image"]), "{errs:?}");
+}
+
+#[test]
+fn containers_and_services_convert() {
+    let out = ok("
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/acme/build:${{ matrix.v }}
+      credentials:
+        username: bot
+        password: ${{ secrets.GHCR_TOKEN }}
+      env:
+        MODE: 1
+      ports: [8080, '9090:90']
+      volumes: ['/data:/data']
+      options: --cpus 1
+      bogus: x
+    services:
+      redis: redis:7
+      db:
+        image: postgres:17
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+    strategy:
+      matrix:
+        v: [1, 2]
+    steps:
+      - run: true
+");
+    let job = &out.config.jobs["ci-build"];
+    let container = job.container.as_ref().unwrap();
+    assert_eq!(container.image, "ghcr.io/acme/build:${{ matrix.v }}");
+    assert_eq!(container.credentials.as_ref().unwrap().username, "bot");
+    assert_eq!(container.env["MODE"], "1");
+    assert_eq!(container.ports, ["8080", "9090:90"]);
+    assert_eq!(job.services["redis"].image, "redis:7");
     assert!(
-        has(&errs, &["ci.yml", "build", "docker://alpine:3.20"]),
-        "{errs:?}"
+        job.services["db"]
+            .options
+            .as_deref()
+            .unwrap()
+            .contains("--health-cmd pg_isready")
     );
+    assert!(has(&out.warnings, &["ci.yml", "build", "container.bogus"]));
+    // The converted config validates, round trips and plans.
+    let yaml = to_yaml(&out.config).unwrap();
+    let reparsed = parse(&yaml).unwrap();
+    assert_eq!(reparsed, out.config);
+    assert_eq!(validate(&reparsed), Vec::<Diagnostic>::new());
+}
+
+#[test]
+fn bad_containers_drop_the_job() {
+    for (body, word) in [
+        ("container: { env: { A: b } }", "needs an `image`"),
+        ("container: [a]", "must be an image"),
+        (
+            "container: { image: a, credentials: { username: u } }",
+            "credentials",
+        ),
+        (
+            "container: { image: a, options: --network host }",
+            "--network",
+        ),
+        ("services: { 'a.b': x }", "not a hostname"),
+        ("services: [x]", "map of service ids"),
+        ("services: { db: { image: x, ports: 5 } }", "must be a list"),
+    ] {
+        let yaml = format!(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    {body}\n    steps:\n      - run: true\n"
+        );
+        let errs = one("ci.yml", &yaml).unwrap_err();
+        assert!(has(&errs, &["ci.yml", "build", word]), "{body}: {errs:?}");
+    }
 }
 
 #[test]
@@ -286,9 +382,17 @@ jobs:
       - run: npm test
 ");
     assert!(
-        has(&out.warnings, &["ci.yml", "build", "container"]),
+        !out.warnings.iter().any(|w| w.message.contains("container")),
         "container: {:?}",
         out.warnings
+    );
+    assert_eq!(
+        out.config.jobs["ci-build"]
+            .container
+            .as_ref()
+            .unwrap()
+            .image,
+        "node:22"
     );
     assert!(
         !out.warnings
@@ -3004,4 +3108,40 @@ fn the_deploy_fixture_converts_without_losing_a_capability() {
         deploys[1].matrix
     );
     assert_eq!(plan.run_name, wf.run_name);
+}
+
+#[test]
+fn container_fields_that_cannot_be_read_are_errors_not_dropped() {
+    for (body, word) in [
+        ("container: 'node 20'", "whitespace"),
+        ("container: { image: a, options: { x: 1 } }", "options"),
+        ("container: { image: a, options: [--cpus] }", "options"),
+        ("container: { image: a, ports: [{ a: 1 }] }", "ports"),
+        ("services: { db: { image: a, volumes: [[x]] } }", "volumes"),
+        (
+            "container: { image: a, options: '--network-alias db' }\n    services: { db: b }",
+            "id of a service",
+        ),
+    ] {
+        let yaml = format!(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    {body}\n    steps:\n      - run: true\n"
+        );
+        let errs = one("ci.yml", &yaml).unwrap_err();
+        assert!(has(&errs, &["ci.yml", "build", word]), "{body}: {errs:?}");
+    }
+}
+
+#[test]
+fn a_null_options_stays_none() {
+    let out = ok("
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: { image: a, options: null }
+    steps:
+      - run: true
+");
+    let c = out.config.jobs["ci-build"].container.as_ref().unwrap();
+    assert_eq!(c.options, None);
 }
