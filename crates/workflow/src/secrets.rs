@@ -275,6 +275,7 @@ mod tests {
                 },
             )]),
             steps: vec![step],
+            deferred: None,
         };
         let refs = job.secret_refs();
         assert!(!refs.all);

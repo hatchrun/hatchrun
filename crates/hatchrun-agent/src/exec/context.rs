@@ -586,6 +586,7 @@ mod tests {
             container: None,
             services: std::collections::BTreeMap::new(),
             steps: Vec::new(),
+            deferred: None,
         }
     }
 

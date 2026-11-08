@@ -348,10 +348,25 @@ struct GhMatrix {
     exclude: Vec<BTreeMap<String, Value>>,
     /// Keys added to combinations, or combinations of their own.
     include: Vec<BTreeMap<String, Value>>,
+    /// The whole matrix as an expression, read when the job is ready.
+    from: Option<String>,
+    /// Keys whose list is an expression.
+    lists: BTreeMap<String, String>,
+    /// `include` as an expression.
+    include_from: Option<String>,
+}
+
+impl GhMatrix {
+    /// Whether some of the matrix is an expression.
+    fn dynamic(&self) -> bool {
+        self.from.is_some() || !self.lists.is_empty() || self.include_from.is_some()
+    }
 }
 
 /// What a converted job runs on.
 enum RunsOn {
+    /// An expression the job reads when it becomes ready.
+    Expression(String),
     /// One template label.
     Label(String),
     /// The template the matrix key, passed as a parameter, names in each
@@ -363,7 +378,7 @@ impl RunsOn {
     /// The job's `runs-on` and the parameter it reads, if any.
     fn into_job(self) -> (String, BTreeMap<String, Parameter>) {
         match self {
-            Self::Label(label) => (label, BTreeMap::new()),
+            Self::Label(label) | Self::Expression(label) => (label, BTreeMap::new()),
             Self::Matrix(name) => {
                 let read = format!("${{{{ parameters.{name} }}}}");
                 let param = Parameter {
@@ -688,6 +703,11 @@ impl Cx {
             }
             // validate rejects these, so the job could not run.
             let (contexts, mut bad) = expression_problems(&converted);
+            bad.extend(dynamic_problems(
+                &converted,
+                &expanded,
+                !scope.prefix.is_empty() || scope.inputs.is_some(),
+            ));
             if let Some(inputs) = &scope.inputs {
                 bad.extend(bind_literals(&mut converted, inputs));
             }
@@ -743,4 +763,4 @@ mod triggers;
 
 use self::calls::{bind_literals, scalar};
 use self::jobs::{RunDefaults, flatten};
-use self::rewrite::{FAILED, REUSABLE, calls_workflow, expression_problems};
+use self::rewrite::{FAILED, REUSABLE, calls_workflow, dynamic_problems, expression_problems};

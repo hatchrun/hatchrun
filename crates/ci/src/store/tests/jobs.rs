@@ -1267,3 +1267,51 @@ fn insert_jobs_keeps_the_strategy() {
         .unwrap();
     assert_eq!(limit, 3);
 }
+
+#[test]
+fn a_stand_in_job_becomes_its_first_expanded_job() {
+    let db = setup();
+    let run = db
+        .wait(insert_run(db.db(), &new_run("d", "ci", 1)))
+        .unwrap()
+        .unwrap();
+    db.wait(insert_jobs(
+        db.db(),
+        run.id,
+        &[new_job("setup"), new_job("test"), new_job("after")],
+        2,
+    ))
+    .unwrap();
+    let rows = db.wait(jobs_for_run(db.db(), run.id)).unwrap();
+    let leg = NewJob {
+        plan_id: "test (arm)".into(),
+        name: "test".into(),
+        template: Some("ubuntu-26.04-arm".into()),
+        strategy_group: Some("test".into()),
+        max_parallel: Some(2),
+        needs: vec!["setup".into()],
+        ..new_job("test")
+    };
+    db.wait(retarget_job(db.db(), rows[1].id, &leg, 2, 7))
+        .unwrap();
+    db.wait(set_needs(
+        db.db(),
+        rows[2].id,
+        &["test (arm)".to_owned(), "test (x86)".to_owned()],
+        7,
+    ))
+    .unwrap();
+    let moved = db.wait(job(db.db(), rows[1].id)).unwrap().unwrap();
+    assert_eq!(moved.plan_id, "test (arm)");
+    assert_eq!(moved.name, "test");
+    assert_eq!(moved.template.as_deref(), Some("ubuntu-26.04-arm"));
+    assert_eq!(moved.attempt, 2);
+    assert_eq!(moved.needs, serde_json::json!(["setup"]));
+    // Repeating it, or a lower attempt, keeps the attempt.
+    db.wait(retarget_job(db.db(), rows[1].id, &leg, 1, 8))
+        .unwrap();
+    let again = db.wait(job(db.db(), rows[1].id)).unwrap().unwrap();
+    assert_eq!(again.attempt, 2);
+    let after = db.wait(job(db.db(), rows[2].id)).unwrap().unwrap();
+    assert_eq!(after.needs, serde_json::json!(["test (arm)", "test (x86)"]));
+}

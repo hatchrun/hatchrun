@@ -200,7 +200,11 @@ impl Cx {
             .as_ref()
             .and_then(runs_on_text)
             .and_then(matrix_key);
-        let matrices = self.include(at, matrix, leg_key);
+        let matrices = if matrix.dynamic() {
+            vec![dynamic_matrix(matrix)]
+        } else {
+            self.include(at, matrix, leg_key)
+        };
         let requires = self.needs(at, gh.needs, ids);
         let timeout_minutes = self.minutes(at, "timeout-minutes", gh.timeout_minutes.as_ref());
         let outputs = self.env(at, "outputs", gh.outputs.as_ref());
@@ -469,6 +473,12 @@ impl Cx {
     ) -> Option<RunsOn> {
         let label = runs_on.and_then(runs_on_text);
         if let Some(text) = label
+            && text.contains("${{")
+            && (matrix.dynamic() || matrix_key(text).is_none())
+        {
+            return Some(RunsOn::Expression(self.runtime_runs_on(at, text)));
+        }
+        if let Some(text) = label
             && let Some(key) = matrix_key(text)
             && (matrix.values.contains_key(key)
                 || matrix.include.iter().any(|i| i.contains_key(key)))
@@ -499,6 +509,54 @@ impl Cx {
             template_labels().join(", ")
         ));
         None
+    }
+
+    /// Keeps a `runs-on` expression, which the job reads when it becomes
+    /// ready, with each runner label it spells as a string brought to a
+    /// template label the way a plain label is. A label that names no
+    /// template stays, with a warning: the job fails with a message when
+    /// it reads that label.
+    pub(super) fn runtime_runs_on(&mut self, at: &str, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find('\'') {
+            out.push_str(&rest[..open]);
+            let tail = &rest[open + 1..];
+            let Some(close) = tail.find('\'') else {
+                out.push_str(&rest[open..]);
+                rest = "";
+                break;
+            };
+            let literal = &tail[..close];
+            let known = runner_label(literal);
+            let looks_like_runner = ["ubuntu", "macos", "windows", "self-hosted"]
+                .iter()
+                .any(|p| literal.starts_with(p));
+            out.push('\'');
+            match known {
+                Some(new) if new != literal => {
+                    self.warn(became(at, literal, new));
+                    out.push_str(new);
+                }
+                Some(_) => out.push_str(literal),
+                None => {
+                    if looks_like_runner {
+                        self.warn(format!(
+                            "{at}: `runs-on` can read `{literal}`, which names no runner template, so the job fails when it does; hatchrun runs Linux only, use one of {}",
+                            template_labels().join(", ")
+                        ));
+                    }
+                    out.push_str(literal);
+                }
+            }
+            out.push('\'');
+            rest = &tail[close + 1..];
+        }
+        out.push_str(rest);
+        self.warn(format!(
+            "{at}: `runs-on` is read when the job becomes ready; each label it reads must name a runner template"
+        ));
+        out
     }
 
     /// Resolves `runs-on: ${{ matrix.KEY }}`. Legs whose value names no
@@ -614,6 +672,7 @@ impl Cx {
     /// Reads `strategy.matrix`: value lists, `exclude` and `include`. The
     /// rest of `strategy`, and a matrix or key that is an expression,
     /// such as `${{ fromJSON(...) }}`, are dropped with a warning.
+    #[allow(clippy::too_many_lines)] // One arm per strategy key.
     pub(super) fn strategy(
         &mut self,
         at: &str,
@@ -655,14 +714,32 @@ impl Cx {
                 ));
                 continue;
             }
-            let Value::Object(keys) = value else {
-                self.warn(format!(
-                    "{at}: `strategy.matrix` is not a map of value lists and was dropped"
-                ));
-                continue;
+            let keys = match value {
+                Value::Object(keys) => keys,
+                Value::String(text) if text.trim_start().starts_with("${{") => {
+                    matrix.from = Some(text);
+                    continue;
+                }
+                _ => {
+                    self.warn(format!(
+                        "{at}: `strategy.matrix` is not a map of value lists and was dropped"
+                    ));
+                    continue;
+                }
             };
             for (name, values) in keys {
                 match values {
+                    Value::String(text) if text.trim_start().starts_with("${{") => {
+                        match name.as_str() {
+                            "include" => matrix.include_from = Some(text),
+                            "exclude" => self.warn(format!(
+                                "{at}: `strategy.matrix.exclude` is an expression and was dropped; write the entries out"
+                            )),
+                            _ => {
+                                matrix.lists.insert(name, text);
+                            }
+                        }
+                    }
                     _ if name == "include" || name == "exclude" => {
                         let entries = self.combinations(at, &name, values);
                         if name == "include" {
@@ -689,9 +766,10 @@ impl Cx {
         }
         // GitHub rejects these; the key may also have been dropped above.
         let values = &matrix.values;
+        let dynamic = matrix.dynamic();
         let mut unknown = Vec::new();
         matrix.exclude.retain(|entry| {
-            let missing = entry.keys().find(|k| !values.contains_key(*k));
+            let missing = entry.keys().find(|k| !dynamic && !values.contains_key(*k));
             if let Some(k) = missing {
                 unknown.push(k.clone());
             }
@@ -756,8 +834,13 @@ impl Cx {
             values,
             exclude,
             include,
+            ..
         } = matrix;
-        let base = Matrix { values, exclude };
+        let base = Matrix {
+            values,
+            exclude,
+            ..Matrix::default()
+        };
         if include.is_empty() {
             return vec![base];
         }
@@ -1019,11 +1102,25 @@ impl Cx {
 /// One combination of matrix keys and values.
 pub(super) type Combo = BTreeMap<String, Value>;
 
+/// The matrix of a job whose matrix has expressions: what is written
+/// out stays, and the host applies `include` and `exclude` to the
+/// combinations when the job becomes ready.
+pub(super) fn dynamic_matrix(matrix: GhMatrix) -> Matrix {
+    Matrix {
+        values: matrix.values,
+        exclude: matrix.exclude,
+        include: matrix.include,
+        from: matrix.from,
+        lists: matrix.lists,
+        include_from: matrix.include_from,
+    }
+}
+
 /// A matrix of one combination: one value per key.
 pub(super) fn one_each(combo: Combo) -> Matrix {
     Matrix {
         values: combo.into_iter().map(|(k, v)| (k, vec![v])).collect(),
-        exclude: Vec::new(),
+        ..Matrix::default()
     }
 }
 

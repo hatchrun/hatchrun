@@ -246,6 +246,7 @@ mod tests {
                 container: None,
                 services: std::collections::BTreeMap::new(),
                 steps: Vec::new(),
+                deferred: None,
             },
             event_name: "push".into(),
             event: serde_json::json!({}),

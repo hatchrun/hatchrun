@@ -496,6 +496,7 @@ mod tests {
                 container: None,
                 services: std::collections::BTreeMap::new(),
                 steps: vec![],
+                deferred: None,
             },
             environment: None,
             state,

@@ -23,10 +23,11 @@ use crate::config::{
 };
 use crate::cron::Cron;
 use crate::diagnostic::Diagnostic;
+use crate::dynamic::combinations as matrix_entries;
 use crate::environment::{is_expression, valid_environment_name};
 use crate::expr::{self, ExprError};
 use crate::permissions::{Level, token_scopes};
-use crate::templates::{Template, template, template_labels};
+use crate::templates::{TEMPLATES, Template, template, template_labels};
 use crate::trigger::{
     Filter, MAX_GLOBS, MAX_PATTERNS, MERGE_GROUP_TYPES, RELEASE_TYPES, Triggers, WORKFLOW_RUN_TYPES,
 };
@@ -38,7 +39,7 @@ pub const DEFAULT_TIMEOUT_MINUTES: u32 = 360;
 const MAX_PARALLELISM: u32 = 64;
 
 /// The most entries one matrix can expand to.
-const MAX_MATRIX: usize = 256;
+pub(crate) const MAX_MATRIX: usize = 256;
 
 /// Contexts a job's `environment` name may read: those the control plane
 /// has when the job is ready to start.
@@ -59,14 +60,14 @@ pub(crate) const MAX_EXCLUDE: usize = 256;
 /// written into the plan, counted once per matrix entry and parallel
 /// node. With `BYTE_BUDGET` it bounds both time and memory, whatever the
 /// config.
-const BUDGET: usize = 50_000;
+pub(crate) const BUDGET: usize = 50_000;
 
 /// The bytes one `compile` or `validate` call may produce. Everything
 /// the call stores is charged before it is allocated: each string, each
 /// map entry and list item (plus `ENTRY_OVERHEAD`), each value passed
 /// into a command, each step and job struct, each matrix entry, each
 /// reported problem, and each extra copy of a job for parallel nodes.
-const BYTE_BUDGET: usize = 8 << 20;
+pub(crate) const BYTE_BUDGET: usize = 8 << 20;
 
 /// The bytes charged for each stored map entry or list string on top of
 /// its text: its `String` headers, the key's heap block and the map node
@@ -78,7 +79,7 @@ const ENTRY_OVERHEAD: usize = 64;
 const MAX_VALUE: usize = 64 << 10;
 
 /// The most jobs one plan can hold, as GitHub caps a run's matrix.
-const MAX_JOBS: usize = 256;
+pub(crate) const MAX_JOBS: usize = 256;
 
 /// The deepest commands can nest.
 const MAX_NESTING: usize = 64;
@@ -203,6 +204,28 @@ pub struct PlannedJob {
     pub services: BTreeMap<String, Container>,
     /// The steps, with commands expanded.
     pub steps: Vec<PlannedStep>,
+    /// What the job still has to read before it can start: a matrix or
+    /// a `runs-on` that is an expression. The host calls
+    /// [`expand`](crate::expand) when the job becomes ready; until then
+    /// `kind` holds a stand-in template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<Deferred>,
+}
+
+/// What a planned job reads when it becomes ready, after the jobs it
+/// requires have ended, instead of when the workflow is planned.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Deferred {
+    /// The entry's matrix, which has expressions in it. Empty when the
+    /// job is one matrix entry already.
+    #[serde(default, skip_serializing_if = "Matrix::is_empty")]
+    pub matrix: Matrix,
+    /// The job's `runs-on`, an expression that reads as a runner
+    /// template label for each matrix entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_on: Option<String>,
+    /// How many parallel nodes each matrix entry runs.
+    pub nodes: u32,
 }
 
 /// The `strategy` of a planned job: how it runs with the other jobs of
@@ -1431,6 +1454,7 @@ fn ref_allows(entry: &WorkflowJob, git_ref: &str) -> bool {
 /// Expands one workflow entry into its matrix entries and parallel
 /// nodes, with `requires` left empty.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // One pass over an entry, top to bottom.
 fn expand_entry(
     config: &Config,
     wf: &Workflow,
@@ -1468,7 +1492,7 @@ fn expand_entry(
             "{owner} has parallelism {nodes}; it must be 1 to {MAX_PARALLELISM}"
         )));
     }
-    let combinations = entry_value_errors(entry, id, errors);
+    let combinations = entry_value_errors(entry, id, &job.parameters, errors);
     if errors.len() > before {
         return Vec::new();
     }
@@ -1480,19 +1504,62 @@ fn expand_entry(
         stack: Vec::new(),
         budget,
     };
-    let Some(kept) = kept_combinations(&entry.matrix, combinations, id, &mut walk, errors) else {
-        return Vec::new();
+    // A matrix with expressions is one stand-in job for now; the host
+    // makes its jobs when it becomes ready.
+    let dynamic = entry.matrix.dynamic();
+    // A matrix with `include` is made the way GitHub makes it, all at
+    // once, since the entries it adds are not a product of the lists.
+    let listed = if !dynamic && !entry.matrix.include.is_empty() {
+        match matrix_entries(&entry.matrix, &Value::Null) {
+            Ok(listed) => Some(listed),
+            Err(message) => {
+                errors.push(Diagnostic::new(format!("`{id}`: {message}")));
+                return Vec::new();
+            }
+        }
+    } else {
+        None
     };
-    let copies = nodes as usize;
+    let kept = if dynamic {
+        vec![0]
+    } else if let Some(listed) = &listed {
+        if listed.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has a matrix whose `exclude` leaves no combination"
+            )));
+            return Vec::new();
+        }
+        (0..listed.len()).collect()
+    } else {
+        let Some(kept) = kept_combinations(&entry.matrix, combinations, id, &mut walk, errors)
+        else {
+            return Vec::new();
+        };
+        kept
+    };
+    let copies = if dynamic { 1 } else { nodes as usize };
     if !reserve_jobs(workflow, planned, kept.len() * copies, errors) {
         return Vec::new();
     }
 
     let mut out = Vec::new();
     for index in kept {
-        let Some(combo) = combination(&entry.matrix.values, index, &mut walk, errors) else {
+        let combo = if dynamic {
+            Some(BTreeMap::new())
+        } else if let Some(listed) = &listed {
+            let combo = listed[index].values.clone();
+            let bytes = combo
+                .iter()
+                .map(|(k, v)| k.len() + ENTRY_OVERHEAD + value_bytes(v))
+                .sum();
+            walk.bytes(bytes, errors).then_some(combo)
+        } else {
+            combination(&entry.matrix.values, index, &mut walk, errors)
+        };
+        let Some(combo) = combo else {
             break;
         };
+        let shown = listed.as_ref().map(|l| l[index].shown.as_slice());
         let Some(args) = entry_args(entry, job, &combo, &mut walk, errors) else {
             break;
         };
@@ -1521,12 +1588,116 @@ fn expand_entry(
         if !attach_strategy(&mut base, entry, id, &mut walk, errors) {
             break;
         }
-        let Some(jobs) = copy_job(base, combo, id, nodes, &mut walk, errors) else {
+        let deferred = deferral(&runner, entry, nodes);
+        let copy_nodes = if dynamic { 1 } else { nodes };
+        let Some(mut jobs) = copy_job(base, combo, (id, shown), copy_nodes, &mut walk, errors)
+        else {
             break;
         };
+        if let Some(deferred) = deferred {
+            for job in &mut jobs {
+                job.deferred = Some(deferred.clone());
+            }
+        }
         out.extend(jobs);
     }
     out
+}
+
+/// What the planned jobs of an entry read when they become ready: its
+/// matrix when that has expressions, and `runs-on` when that is one.
+/// The jobs of a matrix that is written out keep only `runs-on`: each
+/// is one matrix entry already.
+fn deferral(runner: &Runner<'_>, entry: &WorkflowJob, nodes: u32) -> Option<Deferred> {
+    let runs_on = match runner {
+        Runner::Dynamic(text) => Some((*text).to_owned()),
+        _ => None,
+    };
+    if entry.matrix.dynamic() {
+        return Some(Deferred {
+            matrix: entry.matrix.clone(),
+            runs_on,
+            nodes,
+        });
+    }
+    runs_on.map(|runs_on| Deferred {
+        matrix: Matrix::default(),
+        runs_on: Some(runs_on),
+        nodes: 1,
+    })
+}
+
+/// The template a job holds until its `runs-on` is read.
+fn stand_in() -> &'static Template {
+    template(STAND_IN).unwrap_or(&TEMPLATES[0])
+}
+
+/// The label of [`stand_in`].
+const STAND_IN: &str = "ubuntu-latest";
+
+/// The contexts a `runs-on` expression reads: what the host knows when
+/// the job becomes ready.
+pub(crate) const RUNS_ON_CONTEXTS: &[&str] = &[
+    "hatchrun", "github", "needs", "inputs", "vars", "matrix", "strategy",
+];
+
+/// The contexts a matrix expression reads: the same, less the matrix.
+pub(crate) const MATRIX_CONTEXTS: &[&str] = &["hatchrun", "github", "needs", "inputs", "vars"];
+
+/// Checks an expression the host reads when a job becomes ready, for
+/// the problems [`expression_problems`] finds.
+fn expression_errors(
+    owner: &str,
+    field: &str,
+    text: &str,
+    allowed: &[&str],
+    errors: &mut Vec<Diagnostic>,
+) {
+    for problem in expression_problems(field, text, allowed) {
+        errors.push(Diagnostic::new(format!("{owner} {problem}")));
+    }
+}
+
+/// What is wrong with a text the host reads when a job becomes ready,
+/// each starting with `field`: every `${{ }}` must parse and read only
+/// the contexts in `allowed`, and none may read `parameters`, which are
+/// substituted when the workflow is planned and are not there then.
+pub(crate) fn expression_problems(field: &str, text: &str, allowed: &[&str]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let found = match expr::expressions(text) {
+        Ok(found) => found,
+        Err(e) => return vec![format!("{field} has a bad expression: {e}")],
+    };
+    if found.is_empty() {
+        problems.push(format!(
+            "{field} is `{text}`, which has no `${{{{ }}}}` expression"
+        ));
+    }
+    for (start, inner) in found {
+        let names = match expr::checked_contexts(inner) {
+            Ok(names) => names,
+            Err(e) => {
+                problems.push(format!(
+                    "{field} has a bad expression: {}",
+                    ExprError {
+                        message: e.message,
+                        offset: e.offset + start,
+                    }
+                ));
+                continue;
+            }
+        };
+        for (name, _) in names {
+            if !allowed.contains(&name.as_ref()) {
+                problems.push(format!(
+                    "{field} reads `{name}`; it can read only {}",
+                    allowed.join(", ")
+                ));
+                break;
+            }
+        }
+    }
+    problems
 }
 
 /// The group an entry's jobs belong to: its `strategy.group`, else its
@@ -1711,6 +1882,9 @@ pub(crate) fn excluded(matrix: &Matrix, index: usize) -> bool {
 /// `MAX_COMBINATIONS` to check, all of them, which is over the limit
 /// either way.
 fn matrix_size(matrix: &Matrix) -> usize {
+    if !matrix.include.is_empty() && !matrix.dynamic() {
+        return matrix_entries(matrix, &Value::Null).map_or(MAX_MATRIX + 1, |c| c.len());
+    }
     let all = matrix
         .values
         .values()
@@ -1786,7 +1960,7 @@ fn entry_args(
 fn copy_job(
     base: PlannedJob,
     combo: BTreeMap<String, Value>,
-    id: &str,
+    (id, shown): (&str, Option<&[String]>),
     nodes: u32,
     walk: &mut Walk<'_>,
     errors: &mut Vec<Diagnostic>,
@@ -1812,7 +1986,10 @@ fn copy_job(
     {
         return None;
     }
-    let matrix_id = matrix_id(id, &combo);
+    let matrix_id = match shown {
+        Some(shown) if !shown.is_empty() => format!("{id} ({})", shown.join(", ")),
+        _ => matrix_id(id, &combo),
+    };
     let mut base = Some(base);
     let mut combo = Some(combo);
     let mut out = Vec::with_capacity(copies);
@@ -1896,13 +2073,40 @@ fn reserve_jobs(
 /// name only matrix keys, and with `exclude` there may be at most
 /// `MAX_COMBINATIONS` combinations to check. Returns the number of
 /// combinations before `exclude`.
-fn entry_value_errors(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> usize {
+fn entry_value_errors(
+    entry: &WorkflowJob,
+    id: &str,
+    params: &BTreeMap<String, Parameter>,
+    errors: &mut Vec<Diagnostic>,
+) -> usize {
     for (key, value) in &entry.with {
         if reads_parameters(value) {
             errors.push(no_parameters_here(id, key));
         }
     }
     let matrix = &entry.matrix;
+    if matrix.dynamic() {
+        dynamic_matrix_errors(entry, id, params, errors);
+        return 1;
+    }
+    if matrix.include.len() > MAX_EXCLUDE {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has {} matrix `include` entries; the limit is {MAX_EXCLUDE}",
+            matrix.include.len()
+        )));
+    }
+    for include in &matrix.include {
+        if include.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has an empty matrix `include` entry"
+            )));
+        }
+        if include.values().any(reads_parameters) {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has a matrix `include` entry that reads `parameters`, which a matrix cannot"
+            )));
+        }
+    }
     if matrix.exclude.len() > MAX_EXCLUDE {
         errors.push(Diagnostic::new(format!(
             "`{id}` has {} matrix `exclude` entries; the limit is {MAX_EXCLUDE}",
@@ -1964,6 +2168,73 @@ fn entry_value_errors(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic
     size
 }
 
+/// Checks a matrix that has expressions in it. They are read when the
+/// entry is ready, so only what is written out can be checked now: the
+/// expressions, the keys and the `exclude` and `include` entries.
+/// Matrix keys reach the job as `matrix.KEY`, not as parameters, since
+/// no value is known yet.
+fn dynamic_matrix_errors(
+    entry: &WorkflowJob,
+    id: &str,
+    params: &BTreeMap<String, Parameter>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let owner = format!("`{id}`");
+    let matrix = &entry.matrix;
+    for (field, text) in matrix.expressions() {
+        expression_errors(&owner, &field, text, MATRIX_CONTEXTS, errors);
+    }
+    if matrix.exclude.len() > MAX_EXCLUDE {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has {} matrix `exclude` entries; the limit is {MAX_EXCLUDE}",
+            matrix.exclude.len()
+        )));
+    }
+    for key in matrix.values.keys().chain(matrix.lists.keys()) {
+        if params.contains_key(key) {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has matrix key `{key}`, which is also a parameter of its job; a matrix with expressions passes no parameters, so read it as `${{{{ matrix.{key} }}}}`"
+            )));
+        }
+        if entry.with.contains_key(key) {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` sets `{key}` both in its matrix and as a parameter"
+            )));
+        }
+    }
+    for key in matrix.values.keys() {
+        if matrix.lists.contains_key(key) {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has matrix key `{key}` twice"
+            )));
+        }
+    }
+    for (key, values) in &matrix.values {
+        if values.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has matrix key `{key}` with no values"
+            )));
+        }
+    }
+    for entry_map in matrix.exclude.iter().chain(&matrix.include) {
+        if entry_map.is_empty() {
+            errors.push(Diagnostic::new(format!(
+                "`{id}` has an empty matrix `include` or `exclude` entry"
+            )));
+        }
+        if entry_map.values().any(reads_parameters) {
+            errors.push(no_parameters_here(id, "matrix"));
+        }
+    }
+    if matrix.from.is_some()
+        && (!matrix.values.is_empty() || !matrix.lists.is_empty() || matrix.include_from.is_some())
+    {
+        errors.push(Diagnostic::new(format!(
+            "`{id}` has a matrix that is one expression and keys beside it; put the keys in the expression"
+        )));
+    }
+}
+
 /// The planned job of an approval entry, which takes no parameters and
 /// no matrix.
 fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<PlannedJob> {
@@ -2012,6 +2283,7 @@ fn approval(entry: &WorkflowJob, id: &str, errors: &mut Vec<Diagnostic>) -> Vec<
         container: None,
         services: BTreeMap::new(),
         steps: Vec::new(),
+        deferred: None,
     }]
 }
 
@@ -2023,6 +2295,9 @@ enum Runner<'j> {
     /// `runs-on: ${{ parameters.NAME }}`: each planned job runs on the
     /// template its value of `NAME` names.
     Parameter(&'j str),
+    /// `runs-on` is an expression the host reads when the job becomes
+    /// ready; the planned job holds a stand-in template until then.
+    Dynamic(&'j str),
 }
 
 /// Finds what a job runs on. A `runs-on` that is one whole
@@ -2035,6 +2310,15 @@ fn resolve_runner<'j>(
     job: &'j Job,
     errors: &mut Vec<Diagnostic>,
 ) -> Option<Runner<'j>> {
+    if job.executor.is_none()
+        && let Some(text) = job.runs_on.as_deref()
+        && sole_parameter(text).is_none()
+        && expr::find_open(text).is_some()
+    {
+        let before = errors.len();
+        expression_errors(owner, "`runs-on`", text, RUNS_ON_CONTEXTS, errors);
+        return (errors.len() == before).then_some(Runner::Dynamic(text));
+    }
     let Some(name) = job.runs_on.as_deref().and_then(sole_parameter) else {
         return resolve_template(config, owner, job, errors).map(Runner::Fixed);
     };
@@ -2081,6 +2365,7 @@ fn leg_template(
 ) -> Option<&'static Template> {
     let name = match runner {
         Runner::Fixed(template) => return Some(template),
+        Runner::Dynamic(_) => return Some(stand_in()),
         Runner::Parameter(name) => *name,
     };
     let found = values.get(name).and_then(Value::as_str).and_then(template);
@@ -2233,6 +2518,7 @@ fn expand_job(
         container,
         services,
         steps,
+        deferred: None,
     })
 }
 
@@ -2929,7 +3215,7 @@ fn job_bytes(job: &PlannedJob) -> usize {
 
 /// A parameter or matrix value as text: strings as they are, whole
 /// numbers without `.0`, booleans as `true` or `false`.
-fn render(value: &Value) -> String {
+pub(crate) fn render(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         Value::Number(n) => match n.as_f64() {

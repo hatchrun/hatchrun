@@ -1281,19 +1281,64 @@ impl Serialize for Require {
 /// In YAML a map of keys to value lists, with `exclude` holding the
 /// partial combinations left out. A combination is left out when it
 /// matches every key of one `exclude` entry.
+///
+/// A matrix can also be read when the entry becomes ready, after the
+/// jobs it requires have ended: the whole `matrix` as one `${{ }}`
+/// expression, a key's list or the `include` list as one. Such a matrix
+/// is dynamic. `include` adds combinations and keys to the ones the
+/// other parts make, as on GitHub Actions, in either kind of matrix.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Matrix {
     /// Each key and its values; every combination of them runs.
     pub values: BTreeMap<String, Vec<Value>>,
     /// Partial combinations that do not run.
     pub exclude: Vec<BTreeMap<String, Value>>,
+    /// Combinations `include` adds, or keys it adds to combinations.
+    /// Applied after `exclude`.
+    pub include: Vec<BTreeMap<String, Value>>,
+    /// The whole matrix as an expression that reads as a map of value
+    /// lists, with `include` and `exclude` allowed in it.
+    pub from: Option<String>,
+    /// Keys whose value list is an expression read when the entry
+    /// becomes ready.
+    pub lists: BTreeMap<String, String>,
+    /// `include` as an expression that reads as a list of maps.
+    pub include_from: Option<String>,
 }
 
 impl Matrix {
-    /// Whether the matrix has no keys and no `exclude`.
+    /// Whether the matrix has nothing in it.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty() && self.exclude.is_empty()
+        self.values.is_empty()
+            && self.exclude.is_empty()
+            && self.include.is_empty()
+            && !self.dynamic()
+    }
+
+    /// Whether some of the matrix is read when the entry becomes ready,
+    /// so the entry cannot be expanded when the workflow is planned.
+    #[must_use]
+    pub fn dynamic(&self) -> bool {
+        self.from.is_some() || !self.lists.is_empty() || self.include_from.is_some()
+    }
+
+    /// Every expression the matrix reads when the entry becomes ready,
+    /// with the part it belongs to as it reads in a message.
+    pub fn expressions(&self) -> impl Iterator<Item = (String, &str)> {
+        self.from
+            .iter()
+            .map(|e| ("`matrix`".to_owned(), e.as_str()))
+            .chain(
+                self.lists
+                    .iter()
+                    .map(|(k, e)| (format!("matrix key `{k}`"), e.as_str())),
+            )
+            .chain(
+                self.include_from
+                    .iter()
+                    .map(|e| ("matrix `include`".to_owned(), e.as_str())),
+            )
     }
 }
 
@@ -1305,6 +1350,39 @@ impl std::ops::Index<&str> for Matrix {
     }
 }
 
+/// The text of a matrix part that is an expression.
+fn matrix_expression(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|text| text.trim_start().starts_with("${{"))
+}
+
+fn matrix_list<E: de::Error>(key: &str, value: Value) -> Result<Vec<Value>, E> {
+    match value {
+        Value::Array(items) => Ok(items),
+        other => Err(E::custom(format!(
+            "matrix `{key}` must be a list or a `${{{{ }}}}` expression, found {other}"
+        ))),
+    }
+}
+
+fn matrix_maps<E: de::Error>(key: &str, value: Value) -> Result<Vec<BTreeMap<String, Value>>, E> {
+    let Value::Array(items) = value else {
+        return Err(E::custom(format!(
+            "matrix `{key}` must be a list of maps or a `${{{{ }}}}` expression, found {value}"
+        )));
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            Value::Object(map) => Ok(map.into_iter().collect()),
+            other => Err(E::custom(format!(
+                "matrix `{key}` entries must be maps, found {other}"
+            ))),
+        })
+        .collect()
+}
+
 impl<'de> Deserialize<'de> for Matrix {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct MatrixVisitor;
@@ -1313,36 +1391,66 @@ impl<'de> Deserialize<'de> for Matrix {
             type Value = Matrix;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a map of value lists and `exclude`")
+                f.write_str("a map of value lists and `exclude`, or a `${{ }}` expression")
             }
 
             fn visit_unit<E>(self) -> Result<Matrix, E> {
                 Ok(Matrix::default())
             }
 
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<Matrix, E> {
+                if !text.trim_start().starts_with("${{") {
+                    return Err(E::custom(
+                        "a matrix that is text must be one `${{ }}` expression",
+                    ));
+                }
+                Ok(Matrix {
+                    from: Some(text.to_owned()),
+                    ..Matrix::default()
+                })
+            }
+
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Matrix, A::Error> {
                 let mut matrix = Matrix::default();
                 while let Some(key) = map.next_key::<String>()? {
-                    if key == "exclude" {
-                        matrix.exclude = map.next_value()?;
-                    } else {
-                        let values = map.next_value()?;
-                        matrix.values.insert(key, values);
+                    let value: Value = map.next_value()?;
+                    match (key.as_str(), matrix_expression(&value)) {
+                        ("include", Some(text)) => matrix.include_from = Some(text.to_owned()),
+                        ("include", None) => matrix.include = matrix_maps(&key, value)?,
+                        ("exclude", _) => matrix.exclude = matrix_maps(&key, value)?,
+                        (_, Some(text)) => {
+                            matrix.lists.insert(key, text.to_owned());
+                        }
+                        (_, None) => {
+                            let values = matrix_list(&key, value)?;
+                            matrix.values.insert(key, values);
+                        }
                     }
                 }
                 Ok(matrix)
             }
         }
 
-        deserializer.deserialize_map(MatrixVisitor)
+        deserializer.deserialize_any(MatrixVisitor)
     }
 }
 
 impl Serialize for Matrix {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if let Some(from) = &self.from {
+            return serializer.serialize_str(from);
+        }
         let mut map = serializer.serialize_map(None)?;
         for (key, values) in &self.values {
             map.serialize_entry(key, values)?;
+        }
+        for (key, expr) in &self.lists {
+            map.serialize_entry(key, expr)?;
+        }
+        if let Some(expr) = &self.include_from {
+            map.serialize_entry("include", expr)?;
+        } else if !self.include.is_empty() {
+            map.serialize_entry("include", &self.include)?;
         }
         if !self.exclude.is_empty() {
             map.serialize_entry("exclude", &self.exclude)?;
