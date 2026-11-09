@@ -296,22 +296,32 @@ of another run (`actions/download-artifact` with `run-id` and
 copy of a hatchrun run's artifacts, so the agent's ArtifactService proxy
 serves the path:
 
-- Run ids shown to workflows (`github.run_id`, `github.event.workflow_run.id`,
-  API paths) are `4_000_000_000_000_000 + <row id>`. That is below
-  2^53, so JavaScript actions read it exactly, and far above any id GitHub
-  issues. The proxy decides origin by range alone and never guesses from a
-  small number: an id in the range is a hatchrun run and is never sent to
-  GitHub, an id below it is a GitHub run and is never answered locally.
+- Run ids and artifact ids shown to workflows (`github.run_id`,
+  `github.event.workflow_run.id`, artifact ids in API answers and paths)
+  are `4_000_000_000_000_000 + <row id>`, each from its own table. That
+  is below 2^53, so JavaScript actions read them exactly, and far above
+  any id GitHub issues. The proxy decides origin by range alone and
+  never guesses from a small number: an id in the range is a hatchrun id
+  and is never sent to GitHub, an id below it is a GitHub id and is never
+  answered locally. Run-id paths and artifact-id paths are routed
+  separately, each by the range of its own id.
 - The agent points `GITHUB_API_URL` at a local proxy for the job. For
   hatchrun run ids the proxy answers these itself, through the control
   plane with the job token: `GET /repos/{repo}/actions/runs/{id}` (id,
   name, status, conclusion, event, head sha and branch, head repository,
   attempt, times, app URL), `.../runs/{id}/jobs` (job id, name, status,
-  conclusion, times, step summary, app URL), `.../runs/{id}/artifacts`,
-  `GET .../actions/artifacts/{id}` and `.../artifacts/{id}/zip`. Any other
-  path under a hatchrun run id (logs, cancel, rerun, approve) answers
-  `404` locally; logs are in the app. Paths without a hatchrun run id go
-  to GitHub unchanged.
+  conclusion, times, step summary, app URL) and `.../runs/{id}/artifacts`.
+  For hatchrun artifact ids it answers `GET .../actions/artifacts/{id}`
+  and `.../artifacts/{id}/zip`. Any other path under a hatchrun run id
+  (logs, cancel, rerun, approve) answers `404` locally; logs are in the
+  app. Paths without a hatchrun id go to GitHub unchanged.
+- Limitation: a workflow or action that hard-codes `https://api.github.com`
+  instead of reading `GITHUB_API_URL` sends the hatchrun id to GitHub,
+  which answers `404`. Such workflows must use `GITHUB_API_URL`.
+  `actions/github-script`, `gh` (`GH_HOST` and the API URL) and
+  `actions/download-artifact` read it. `hatchrun validate` warns on a
+  literal `api.github.com` in a `run:` or `with:` of a job that handles a
+  run id.
 - Authentication is the job token the agent holds, never the workflow's
   `github-token` value, which only proves repository access on GitHub.
   The control plane endpoints are `GET /v1/artifacts/runs/{run}` (list)
@@ -501,10 +511,11 @@ for the defaults.
   The first matching line of each name wins. Lines inside fenced code
   blocks and block quotes (`>`) never match.
 - One comment can carry several commands, at most 3.
-- The word `--sha=<hex>` (7 to 40 hex digits) anywhere on the line is the
-  sha pin and is not an argument. An invalid value refuses the command
-  with a reply. Every other word, including ones that start with `@` or
-  `-`, is an argument unchanged.
+- The word `--sha=<40 hex digits>` anywhere on the line is the sha pin and
+  is not an argument. Only the full sha is accepted: a short value, a
+  non-hex value or a second `--sha=` word refuses the command with a
+  reply. Every other word, including ones that start with `@` or `-`,
+  is an argument unchanged.
 - Words after the name on the same line, split on whitespace, are the
   arguments. They are untrusted strings. At most 20 words, 200 characters
   each.
@@ -526,7 +537,7 @@ A command run is a trusted run on the default branch, like any
 ```json
 "command": {
   "name": "deploy",
-  "line": "/deploy staging --sha=1a2b3c4",
+  "line": "/deploy staging --sha=1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
   "args": ["staging"],
   "named": {"environment": "staging"},
   "actor": "alice",
@@ -548,15 +559,21 @@ author can push between the comment and intake, so the commenter names
 the sha:
 
 1. A command that needs a sha (`required`, or `auto` on a fork PR) and has
-   no `--sha=` starts nothing. The platform replies with one comment:
-   `The head is <sha>. Send "/deploy staging --sha=<sha>" to run it.`
+   no `--sha=` starts nothing. The platform replies with one comment that
+   quotes the maintainer's own line: `Add --sha=<head> to: /deploy staging`
+   (the head sha in full, the command and arguments exactly as typed).
 2. A command with a sha is compared with the PR's current head, fetched
-   once at intake. A prefix that does not match starts nothing and gets a
-   reply naming the new head. A match runs with `head_sha` set to the
-   full sha.
+   once at intake, as full strings. A different value starts nothing and
+   gets a reply naming the new head and quoting the line again. A match
+   runs with `head_sha` set to that sha.
 3. The job checks out exactly that sha, so a push after intake changes
    nothing. For a fork PR the sha is fetched from the base repository's
    `refs/pull/<n>/head`, and the run fails if that ref no longer holds it.
+
+On a plain issue there is no PR head. `--sha=` is not allowed there and
+refuses the command with the reason `Issues have no head commit`. A
+command with `sha: required` and `in: [issue]` is a validation error, and
+one that lists both places refuses on issues with the same reason.
 
 The validator accepts the `head_sha` form without the head-checkout
 warning when the command requires `write` or higher, and warns on
@@ -569,11 +586,14 @@ and a sha the maintainer named.
 
 ### Built-in /approve-run
 
-`/approve-run --sha=<hex>` needs no workflow. It follows the pin rule of
-commands: the sha is required, is compared with the PR's current head at
-intake, and a missing or stale sha approves nothing and gets a reply
-naming the head. A push after the maintainer's comment therefore cannot
-be approved by it. Only the run for exactly that sha is touched.
+`/approve-run --sha=<40 hex digits>` needs no workflow. It follows the
+pin rule of commands, full sha only and one `--sha=` word, and it
+quotes the maintainer's line in its reply. The sha is required and is
+compared as a full string with the PR's current head at intake. A
+missing or stale sha approves nothing. A push after the maintainer's
+comment therefore cannot be approved by it. Only the run for exactly
+that sha is touched. The PR must be open: on a closed or merged PR the
+command refuses with `The pull request is closed`.
 
 The commenter needs `write` or higher (same collaborator permission
 call). The command runs the rules of the repository policy first: with
