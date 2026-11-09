@@ -296,16 +296,22 @@ of another run (`actions/download-artifact` with `run-id` and
 copy of a hatchrun run's artifacts, so the agent's ArtifactService proxy
 serves the path:
 
-- The agent points `GITHUB_API_URL` at a local proxy for the job. The proxy
-  answers `GET /repos/{repo}/actions/runs/{id}/artifacts`,
-  `GET /repos/{repo}/actions/artifacts/{id}` and
-  `GET /repos/{repo}/actions/artifacts/{id}/zip` itself and forwards every
-  other path to GitHub unchanged.
-- Run ids are hatchrun's. `github.event.workflow_run.id` carries the
-  upstream hatchrun run id, so `run-id: ${{ github.event.workflow_run.id }}`
-  resolves. The proxy asks the control plane first, and forwards the
-  request to GitHub when the id is not a hatchrun run (a run on GitHub
-  Actions).
+- Run ids shown to workflows (`github.run_id`, `github.event.workflow_run.id`,
+  API paths) are `4_000_000_000_000_000 + <row id>`. That is below
+  2^53, so JavaScript actions read it exactly, and far above any id GitHub
+  issues. The proxy decides origin by range alone and never guesses from a
+  small number: an id in the range is a hatchrun run and is never sent to
+  GitHub, an id below it is a GitHub run and is never answered locally.
+- The agent points `GITHUB_API_URL` at a local proxy for the job. For
+  hatchrun run ids the proxy answers these itself, through the control
+  plane with the job token: `GET /repos/{repo}/actions/runs/{id}` (id,
+  name, status, conclusion, event, head sha and branch, head repository,
+  attempt, times, app URL), `.../runs/{id}/jobs` (job id, name, status,
+  conclusion, times, step summary, app URL), `.../runs/{id}/artifacts`,
+  `GET .../actions/artifacts/{id}` and `.../artifacts/{id}/zip`. Any other
+  path under a hatchrun run id (logs, cancel, rerun, approve) answers
+  `404` locally; logs are in the app. Paths without a hatchrun run id go
+  to GitHub unchanged.
 - Authentication is the job token the agent holds, never the workflow's
   `github-token` value, which only proves repository access on GitHub.
   The control plane endpoints are `GET /v1/artifacts/runs/{run}` (list)
@@ -495,8 +501,10 @@ for the defaults.
   The first matching line of each name wins. Lines inside fenced code
   blocks and block quotes (`>`) never match.
 - One comment can carry several commands, at most 3.
-- A word of the form `@<hex>` (7 to 40 hex digits) is the sha pin, not an
-  argument.
+- The word `--sha=<hex>` (7 to 40 hex digits) anywhere on the line is the
+  sha pin and is not an argument. An invalid value refuses the command
+  with a reply. Every other word, including ones that start with `@` or
+  `-`, is an argument unchanged.
 - Words after the name on the same line, split on whitespace, are the
   arguments. They are untrusted strings. At most 20 words, 200 characters
   each.
@@ -518,7 +526,7 @@ A command run is a trusted run on the default branch, like any
 ```json
 "command": {
   "name": "deploy",
-  "line": "/deploy staging @1a2b3c4",
+  "line": "/deploy staging --sha=1a2b3c4",
   "args": ["staging"],
   "named": {"environment": "staging"},
   "actor": "alice",
@@ -540,8 +548,8 @@ author can push between the comment and intake, so the commenter names
 the sha:
 
 1. A command that needs a sha (`required`, or `auto` on a fork PR) and has
-   no `@<sha>` starts nothing. The platform replies with one comment:
-   `The head is <sha>. Send "/deploy staging @<sha>" to run it.`
+   no `--sha=` starts nothing. The platform replies with one comment:
+   `The head is <sha>. Send "/deploy staging --sha=<sha>" to run it.`
 2. A command with a sha is compared with the PR's current head, fetched
    once at intake. A prefix that does not match starts nothing and gets a
    reply naming the new head. A match runs with `head_sha` set to the
@@ -561,14 +569,31 @@ and a sha the maintainer named.
 
 ### Built-in /approve-run
 
-`/approve-run` needs no workflow. On a fork PR comment from a user with
-`write` or higher (same collaborator permission call), the control plane
-approves the run for the PR's current head sha as the check run button
-does and reacts `+1`. A pending or deferred run is approved (a deferred
-one skips the queue). With no run for that sha, the control plane creates
-one from the PR, already approved. This is the retry path for a delivery
-that was dropped. It is the only built-in command, and the name is
-reserved.
+`/approve-run --sha=<hex>` needs no workflow. It follows the pin rule of
+commands: the sha is required, is compared with the PR's current head at
+intake, and a missing or stale sha approves nothing and gets a reply
+naming the head. A push after the maintainer's comment therefore cannot
+be approved by it. Only the run for exactly that sha is touched.
+
+The commenter needs `write` or higher (same collaborator permission
+call). The command runs the rules of the repository policy first: with
+`fork_runs = off` (the default for private repositories) it creates and
+approves nothing and replies `Fork runs are off for this repository`.
+
+Then, for that sha:
+
+- a pending or deferred run is approved (a deferred one skips the queue);
+- with a run already running or approved, the command reacts `+1` and does
+  nothing else;
+- with only terminal runs (cancelled, expired, failed), for example a PR
+  reopened at the same sha after its delivery was dropped, the command
+  creates a new run, not a rerun. Earlier approvals do not carry over.
+  The new run starts gated and this comment is its approval, recorded as
+  `gate_by` the commenter;
+- with no run at all, it creates one the same way.
+
+A new run still counts against the pending, deferred and per-author caps.
+`/approve-run` is the only built-in command, and the name is reserved.
 
 ## GitHub App permission and event changes
 
