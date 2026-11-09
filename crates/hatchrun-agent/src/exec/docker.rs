@@ -138,7 +138,7 @@ struct Service {
 impl Job<'_> {
     /// The Docker command, from `--docker` or the first `docker` on the
     /// agent's `PATH` or the default one.
-    fn docker_bin(&mut self) -> Result<PathBuf, String> {
+    pub(super) fn docker_bin(&mut self) -> Result<PathBuf, String> {
         if let Some(bin) = &self.docker.bin {
             return Ok(bin.clone());
         }

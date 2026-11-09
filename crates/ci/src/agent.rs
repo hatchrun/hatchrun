@@ -399,7 +399,10 @@ async fn claim(
             Some(&repo.default_branch),
         );
         match store::set_cache_scopes(db, row.id, row.attempt, &wanted).await {
-            Ok(Some(scopes)) => scopes,
+            Ok(Some(text)) => store::parse_cache_scopes(Some(&text)).unwrap_or_else(|err| {
+                console_error!("job {}: malformed cache scopes: {err}", row.id);
+                Vec::new()
+            }),
             Ok(None) => return status(409),
             Err(err) => {
                 console_error!("job {}: record cache scopes: {err}", row.id);
@@ -420,7 +423,6 @@ async fn claim(
     fill(&mut document, &secrets, vars);
     document.id_token =
         id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
-    document.token_lifetime_secs = token::lifetime_secs(row.timeout_minutes);
     document.artifacts = artifact_service(settings, job_token);
     document.cache = cache_service(settings, job_token, scopes);
     Response::from_json(&document)

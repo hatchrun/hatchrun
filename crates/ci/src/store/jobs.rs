@@ -669,8 +669,9 @@ struct ScopesRow {
 
 /// Fixes the cache scopes of `attempt` of the job to `scopes`, first the
 /// one it saves to, unless an earlier claim of the attempt did, and
-/// returns the ones the attempt has. `None` when the job is not at
-/// `attempt` any more.
+/// returns the JSON text of the ones the attempt has (see
+/// [`parse_cache_scopes`]). `None` when the job is not at `attempt` any
+/// more.
 ///
 /// # Errors
 ///
@@ -680,26 +681,27 @@ pub async fn set_cache_scopes(
     job_id: u64,
     attempt: u32,
     scopes: &[String],
-) -> Result<Option<Vec<String>>> {
+) -> Result<Option<String>> {
     let text = serde_json::to_string(scopes).unwrap_or_else(|_| "[]".to_owned());
     let row: Option<ScopesRow> = db
         .first(SET_CACHE_SCOPES, &params![job_id, attempt, text])
         .await?;
-    Ok(row.map(|row| parse_cache_scopes(job_id, row.cache_scopes.as_deref())))
+    Ok(row.map(|row| row.cache_scopes.unwrap_or_default()))
 }
 
-/// The scopes a job's row holds. A row with none, or with text that is
-/// not a JSON list of refs, which only a bug writes, has no scopes and so
-/// no cache; the claim and the cache service read it the same way.
-#[must_use]
-pub fn parse_cache_scopes(job_id: u64, text: Option<&str>) -> Vec<String> {
-    let Some(text) = text else {
-        return Vec::new();
-    };
-    serde_json::from_str(text).unwrap_or_else(|err| {
-        worker::console_error!("job {job_id}: malformed cache scopes: {err}");
-        Vec::new()
-    })
+/// The scopes the text of a job's `cache_scopes` holds: none for a job
+/// without them.
+///
+/// # Errors
+///
+/// The text is not a JSON list of refs, which only a bug writes. The
+/// caller logs it and treats the job as having no scopes, so the claim
+/// and the cache service read it the same way.
+pub fn parse_cache_scopes(text: Option<&str>) -> std::result::Result<Vec<String>, String> {
+    text.map_or_else(
+        || Ok(Vec::new()),
+        |text| serde_json::from_str(text).map_err(|err| err.to_string()),
+    )
 }
 
 /// Sets job `job_id` up for `attempt`: waiting, with nothing left of

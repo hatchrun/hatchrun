@@ -266,8 +266,25 @@ impl std::fmt::Display for JobEnded {
 
 impl std::error::Error for JobEnded {}
 
+/// The control plane refused a call: its status and the start of its
+/// body.
+#[derive(Debug)]
+pub(super) struct Refused {
+    pub status: StatusCode,
+    what: String,
+    body: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}: {}", self.what, self.status, self.body)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// The response when it succeeded, else an error with its status and
-/// the start of its body.
+/// the start of its body: a [`Refused`].
 pub(super) async fn answer(response: reqwest::Response, what: &str) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
@@ -277,8 +294,12 @@ pub(super) async fn answer(response: reqwest::Response, what: &str) -> Result<re
         return Err(JobEnded.into());
     }
     let body = response.text().await.unwrap_or_default();
-    let body: String = body.chars().take(300).collect();
-    bail!("{what}: {status}: {body}")
+    Err(Refused {
+        status,
+        what: what.to_owned(),
+        body: body.chars().take(300).collect(),
+    }
+    .into())
 }
 
 #[cfg(test)]

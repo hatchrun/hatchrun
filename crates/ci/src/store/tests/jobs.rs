@@ -1654,7 +1654,7 @@ fn a_claim_records_the_cache_scopes_and_a_rerun_clears_them() {
     let first = db
         .wait(set_cache_scopes(db.db(), job_id, 1, &scopes))
         .unwrap();
-    assert_eq!(first.as_deref(), Some(scopes.as_slice()));
+    assert_eq!(parse_cache_scopes(first.as_deref()).unwrap(), scopes);
     // A later claim of the attempt, which saw another default branch,
     // gets the scopes the first one fixed.
     let other = vec![
@@ -1664,7 +1664,7 @@ fn a_claim_records_the_cache_scopes_and_a_rerun_clears_them() {
     let again = db
         .wait(set_cache_scopes(db.db(), job_id, 1, &other))
         .unwrap();
-    assert_eq!(again.as_deref(), Some(scopes.as_slice()));
+    assert_eq!(parse_cache_scopes(again.as_deref()).unwrap(), scopes);
     // A claim of another attempt matches no row.
     assert_eq!(
         db.wait(set_cache_scopes(db.db(), job_id, 2, &other))
@@ -1677,4 +1677,15 @@ fn a_claim_records_the_cache_scopes_and_a_rerun_clears_them() {
     db.wait(reset_job(db.db(), job_id, 2, 50)).unwrap();
     let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
     assert_eq!(row.cache_scopes, None);
+}
+
+#[test]
+fn cache_scopes_text_parses_to_a_list_or_an_error() {
+    assert_eq!(parse_cache_scopes(None), Ok(Vec::new()));
+    assert_eq!(
+        parse_cache_scopes(Some(r#"["refs/heads/main"]"#)),
+        Ok(vec!["refs/heads/main".to_owned()])
+    );
+    assert!(parse_cache_scopes(Some("not json")).is_err());
+    assert!(parse_cache_scopes(Some(r#"{"a":1}"#)).is_err());
 }

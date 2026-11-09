@@ -13,6 +13,7 @@ use hyper::body::Incoming;
 use serde::de::DeserializeOwned;
 use tracing::{debug, info, warn};
 
+use super::cloud::Refused;
 use super::twirp;
 use super::{
     DOWNLOAD_PATH, Download, MAX_SMALL_BODY, Reply, State, UPLOAD_PATH, Upload, UploadState,
@@ -105,11 +106,22 @@ pub(super) async fn create(state: &State, request: twirp::CreateRequest) -> Repl
         }
         Err(err) => {
             warn!(key = request.key, "cache save refused: {err:#}");
-            return twirp_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                format!("{err:#}"),
-            );
+            // A 4xx of the control plane is final, and the toolkit and
+            // `BuildKit` do not retry what is not `unavailable`.
+            return match err.downcast_ref::<Refused>() {
+                Some(refused) if refused.status.is_client_error() => {
+                    let code = match refused.status {
+                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "permission_denied",
+                        _ => "failed_precondition",
+                    };
+                    twirp_error(refused.status, code, format!("{err:#}"))
+                }
+                _ => twirp_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    format!("{err:#}"),
+                ),
+            };
         }
     };
     let url = format!("{}{UPLOAD_PATH}{id}", state.base);

@@ -104,9 +104,9 @@ impl Job<'_> {
             // The bridge gateway can be an address this machine does not
             // have yet; the loopback still serves the host's steps.
             Err(err) if ip != loopback => {
-                let text = self.masker.mask(&format!("{err:#}")).into_owned();
+                let text = self.masked(&format!("{err:#}"));
                 warn!(%ip, "cache proxy: cannot listen, trying the loopback: {text}");
-                loopback_reason = Some(format!("it cannot listen on {ip}: {text}"));
+                loopback_reason = Some(format!("it cannot listen on {ip}: {err:#}"));
                 bound = loopback;
                 Proxy::start_services(services(false), loopback).await
             }
@@ -115,19 +115,13 @@ impl Job<'_> {
         let proxy = match started {
             Ok(proxy) => proxy,
             Err(err) => {
-                let text = self.masker.mask(&format!("{err:#}")).into_owned();
-                warn!(addr = %bound, "cache proxy: cannot listen: {text}");
-                self.cache_unavailable(sink, &err);
+                self.cache_unavailable(sink, &err.context(format!("cannot listen on {bound}")));
                 return None;
             }
         };
         if let Err(err) = proxy.check().await {
-            let text = self.masker.mask(&format!("{err:#}")).into_owned();
-            warn!(
-                url = proxy.url(),
-                "cache proxy: health check failed: {text}"
-            );
-            self.cache_unavailable(sink, &err);
+            let at = format!("health check of {}", proxy.url());
+            self.cache_unavailable(sink, &err.context(at));
             proxy.stop().await;
             return None;
         }
@@ -169,6 +163,11 @@ impl Job<'_> {
             "--format".to_owned(),
             "{{(index .IPAM.Config 0).Gateway}}".to_owned(),
         ];
+        // No `docker` command: no Docker on this machine, so nothing to
+        // warn about, and no containers either.
+        if self.docker_bin().is_err() {
+            return (loopback, None);
+        }
         match self.docker_capture(&args, None).await {
             Ok(out) if out.code == 0 => match out.stdout.trim().parse() {
                 Ok(ip) => (ip, None),
@@ -187,9 +186,12 @@ impl Job<'_> {
                     out.code
                 )),
             ),
-            // No Docker on this machine: nothing to warn about, there are
-            // no containers either.
-            Err(_) => (loopback, None),
+            // Docker is there and did not answer: a timeout, a stop
+            // request or an unusable client environment.
+            Err(err) => (
+                loopback,
+                Some(format!("docker network inspect bridge failed: {err}")),
+            ),
         }
     }
 
@@ -201,14 +203,19 @@ impl Job<'_> {
              and BuildKit builders (docker buildx with type=gha) cannot use the cache or \
              the artifact service. Steps on the host still can."
         );
-        let message = self.masker.mask(&message).into_owned();
-        warn!("{message}");
+        // The log gets the masked text; the sink masks its own.
+        warn!("{}", self.masked(&message));
         self.say(sink, Line::Warning(&message));
     }
 
+    /// `text` as the agent's own log may show it.
+    fn masked(&self, text: &str) -> String {
+        self.masker.mask(text).into_owned()
+    }
+
+    /// Logs once and tells the job that it runs without the cache.
     fn cache_unavailable(&mut self, sink: &mut dyn Sink, err: &anyhow::Error) {
-        let text = self.masker.mask(&format!("{err:#}")).into_owned();
-        warn!("cache proxy: {text}");
+        warn!("cache proxy: {}", self.masked(&format!("{err:#}")));
         let message = format!("The cache service is not available, running without it: {err:#}");
         self.say(sink, Line::Warning(&message));
     }

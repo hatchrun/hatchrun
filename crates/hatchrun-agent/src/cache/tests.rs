@@ -263,6 +263,30 @@ async fn a_failed_save_is_an_error_not_already_exists() {
 }
 
 #[tokio::test]
+async fn a_refusal_of_the_control_plane_is_final() {
+    let server = cloud().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/cache/uploads"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("the job has no cache scopes"))
+        .mount(&server)
+        .await;
+    let proxy = proxy(&server).await;
+
+    let (status, body) = rpc(
+        &proxy,
+        "CreateCacheEntry",
+        json!({ "key": "k", "version": "v1" }),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_eq!(body["code"], "permission_denied");
+    assert!(
+        body["msg"].as_str().unwrap().contains("no cache scopes"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn finalizing_an_unfinished_upload_abandons_it() {
     let server = cloud().await;
     expect_upload(&server, "k").await;

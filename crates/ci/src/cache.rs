@@ -41,7 +41,7 @@ use hatchrun_cloud::cache::{
 };
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::{jwt, webcrypto};
-use worker::{Env, Method, Request, Response, Result, console_warn};
+use worker::{Env, Method, Request, Response, Result, console_error, console_warn};
 
 use crate::artifacts::{
     Answer, Refusal, aws_failure, body, check_job, credentials, json, now_ms, sign_send,
@@ -173,7 +173,10 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
         .ok_or_else(|| Refusal::new(410, JOB_ENDED))?;
     // The list the job's claim fixed. A job claimed before it was kept
     // has none, and no cache.
-    let scopes = store::parse_cache_scopes(job.id, job.cache_scopes.as_deref());
+    let scopes = store::parse_cache_scopes(job.cache_scopes.as_deref()).unwrap_or_else(|err| {
+        console_error!("job {}: malformed cache scopes: {err}", job.id);
+        Vec::new()
+    });
     let ctx = Context {
         settings,
         db,
