@@ -675,13 +675,13 @@ fn a_waiting_run_with_no_check_run_is_found_for_the_reconciler() {
     fork_run(&db, "young", 4, "s4", "mallory", GateStatus::Pending, 900);
     fork_run(&db, "free", 5, "s5", "mallory", GateStatus::NotGated, 10);
     db.wait(set_gate_check(db.db(), carded.id, 5150)).unwrap();
-    let found = db.wait(runs_without_card(db.db(), 500, 10, 5)).unwrap();
+    let found = db.wait(runs_needing_card(db.db(), 500, 10, 5)).unwrap();
     let ids: Vec<u64> = found.iter().map(|run| run.id).collect();
     assert_eq!(ids, [lost.id, lost_deferred.id]);
     // Once its id is recorded (adopted or made), it is not found again,
     // and the button, which finds the run by that id, works.
     db.wait(set_gate_check(db.db(), lost.id, 6000)).unwrap();
-    let found = db.wait(runs_without_card(db.db(), 500, 10, 5)).unwrap();
+    let found = db.wait(runs_needing_card(db.db(), 500, 10, 5)).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, lost_deferred.id);
     let approved = db
@@ -713,28 +713,52 @@ fn a_card_is_recorded_only_for_a_run_that_still_waits() {
 }
 
 #[test]
-fn a_card_that_could_not_be_updated_is_forgotten_so_the_reconciler_makes_it_again() {
+fn a_run_has_at_most_one_card_and_the_first_recorded_wins() {
+    let db = setup();
+    let run = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 10);
+    assert!(db.wait(set_gate_check(db.db(), run.id, 5150)).unwrap());
+    // A second card made by a racing attempt is not recorded; the caller
+    // supersedes it.
+    assert!(!db.wait(set_gate_check(db.db(), run.id, 5151)).unwrap());
+    let read = db.wait(super::run(db.db(), run.id)).unwrap().unwrap();
+    assert_eq!(read.gate_check_run_id, Some(5150));
+    assert!(!read.gate_card_dirty);
+}
+
+#[test]
+fn a_card_that_could_not_be_updated_keeps_its_id_and_is_found_for_refresh() {
     let db = setup();
     let run = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 10);
     db.wait(set_gate_check(db.db(), run.id, 5150)).unwrap();
     assert_eq!(
-        db.wait(runs_without_card(db.db(), 500, 10, 5))
+        db.wait(runs_needing_card(db.db(), 500, 10, 5))
             .unwrap()
             .len(),
         0
     );
-    db.wait(clear_gate_check(db.db(), run.id)).unwrap();
-    let found = db.wait(runs_without_card(db.db(), 500, 10, 5)).unwrap();
+    db.wait(set_card_dirty(db.db(), run.id, true)).unwrap();
+    let found = db.wait(runs_needing_card(db.db(), 500, 10, 5)).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, run.id);
-    // A decided run keeps what it has: nothing to make again.
-    db.wait(set_gate_check(db.db(), run.id, 5151)).unwrap();
-    db.wait(approve_run(db.db(), "t1", 7, run.id, "m", 20))
-        .unwrap()
+    assert_eq!(found[0].gate_check_run_id, Some(5150), "the id is kept");
+    assert!(found[0].gate_card_dirty);
+    // Brought up to date, it is not found again, and the button still
+    // finds the run.
+    db.wait(set_card_dirty(db.db(), run.id, false)).unwrap();
+    assert_eq!(
+        db.wait(runs_needing_card(db.db(), 500, 10, 5))
+            .unwrap()
+            .len(),
+        0
+    );
+    let approved = db
+        .wait(approve_by_check(db.db(), "t1", 7, 5150, "m", 20))
         .unwrap();
-    db.wait(clear_gate_check(db.db(), run.id)).unwrap();
+    assert_eq!(approved.len(), 1);
+    // A decided run is never marked.
+    db.wait(set_card_dirty(db.db(), run.id, true)).unwrap();
     let read = db.wait(super::run(db.db(), run.id)).unwrap().unwrap();
-    assert_eq!(read.gate_check_run_id, Some(5151));
+    assert!(!read.gate_card_dirty);
 }
 
 fn second_repo(db: &TestDb) {
@@ -857,7 +881,7 @@ fn no_card_runs_are_windowed_per_repository() {
         "UPDATE ci_runs SET repo_id = 8 WHERE id = $1",
         &params![other.id],
     );
-    let cards = db.wait(runs_without_card(db.db(), 10_000, 6, 5)).unwrap();
+    let cards = db.wait(runs_needing_card(db.db(), 10_000, 6, 5)).unwrap();
     assert_eq!(cards.iter().filter(|run| run.repo_id == 7).count(), 5);
     assert!(cards.iter().any(|run| run.id == other.id));
 }

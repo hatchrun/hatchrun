@@ -444,7 +444,6 @@ pub fn check_run_total(response: &Response) -> Result<u64, String> {
 /// A check run of ours in the answer of [`check_runs_named`].
 struct OwnCheck {
     id: u64,
-    conclusion: Option<String>,
     external_id: Option<String>,
 }
 
@@ -459,8 +458,6 @@ fn own_check_runs(response: &Response, app_id: &str) -> Result<Vec<OwnCheck>, St
     #[derive(Deserialize)]
     struct Found {
         id: u64,
-        #[serde(default)]
-        conclusion: Option<String>,
         #[serde(default)]
         external_id: Option<String>,
         #[serde(default)]
@@ -482,33 +479,28 @@ fn own_check_runs(response: &Response, app_id: &str) -> Result<Vec<OwnCheck>, St
         })
         .map(|check| OwnCheck {
             id: check.id,
-            conclusion: check.conclusion,
             external_id: check.external_id,
         })
         .collect())
 }
 
-/// The id of the approval card an earlier attempt left on the commit for
-/// one run, from the answer of [`check_runs_named`]: made by this App
-/// (`app_id`), carrying `external_id` (the run's), and still asking
-/// (`action_required`). A card that was decided or is waiting for a
-/// slot, made by anyone else, or for another run, is never adopted.
+/// The ids of the approval cards earlier attempts left on the commit for
+/// one run, oldest first, from the answer of [`check_runs_named`]: made
+/// by this App (`app_id`) and carrying `external_id` (the run's), in any
+/// state (asking, or waiting for a slot). A check run of anyone else, or
+/// for another run, is never one of them.
 ///
 /// # Errors
 ///
 /// GitHub's answer when it is not a check run list.
-pub fn adoptable_card(
-    response: &Response,
-    app_id: &str,
-    external_id: &str,
-) -> Result<Option<u64>, String> {
-    Ok(own_check_runs(response, app_id)?
+pub fn own_cards(response: &Response, app_id: &str, external_id: &str) -> Result<Vec<u64>, String> {
+    let mut ids: Vec<u64> = own_check_runs(response, app_id)?
         .into_iter()
-        .find(|check| {
-            check.conclusion.as_deref() == Some("action_required")
-                && check.external_id.as_deref() == Some(external_id)
-        })
-        .map(|check| check.id))
+        .filter(|check| check.external_id.as_deref() == Some(external_id))
+        .map(|check| check.id)
+        .collect();
+    ids.sort_unstable();
+    Ok(ids)
 }
 
 /// The id of a check run of the answer of [`check_runs_named`] that this
@@ -838,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn only_our_own_pending_card_of_this_run_is_adopted() {
+    fn every_card_of_ours_for_this_run_is_found_in_any_state() {
         let list = |checks: &str| answered(200, &format!(r#"{{"check_runs":[{checks}]}}"#));
         let card = |id: u64, app: u64, conclusion: &str, external: &str| {
             format!(
@@ -846,38 +838,30 @@ mod tests {
             )
         };
         let mine = "hatchrun-ci-approval:9";
-        // Ours, this run's, and asking: adopted.
-        let ours = list(&card(5150, 77, "action_required", mine));
-        assert_eq!(adoptable_card(&ours, "77", mine), Ok(Some(5150)));
-        // Another App's check run of the same name is not ours to use.
+        // Asking (a button) and waiting for a slot (neutral) are both
+        // this run's card.
+        let ours = list(&format!(
+            "{},{}",
+            card(5152, 77, "neutral", mine),
+            card(5150, 77, "action_required", mine)
+        ));
+        assert_eq!(own_cards(&ours, "77", mine), Ok(vec![5150, 5152]));
+        // Another App's check run of the same name is not ours.
         let other = list(&card(5151, 78, "action_required", mine));
-        assert_eq!(adoptable_card(&other, "77", mine), Ok(None));
-        // Another run's card (same name or not) is never this run's.
+        assert_eq!(own_cards(&other, "77", mine), Ok(vec![]));
+        // Another run's card, or one with no external id, is never this
+        // run's.
         let theirs = list(&card(
             5153,
             77,
             "action_required",
             "hatchrun-ci-approval:10",
         ));
-        assert_eq!(adoptable_card(&theirs, "77", mine), Ok(None));
+        assert_eq!(own_cards(&theirs, "77", mine), Ok(vec![]));
         let bare = list(r#"{"id":5154,"conclusion":"action_required","app":{"id":77}}"#);
-        assert_eq!(adoptable_card(&bare, "77", mine), Ok(None));
-        // A decided or waiting card is never adopted.
-        for conclusion in ["neutral", "success", "cancelled"] {
-            let done = list(&card(5152, 77, conclusion, mine));
-            assert_eq!(adoptable_card(&done, "77", mine), Ok(None), "{conclusion}");
-        }
-        // The first that qualifies wins, whatever comes before it.
-        let mixed = list(&format!(
-            "{},{},{},{}",
-            card(1, 78, "action_required", mine),
-            card(2, 77, "neutral", mine),
-            card(3, 77, "action_required", "hatchrun-ci-approval:10"),
-            card(4, 77, "action_required", mine)
-        ));
-        assert_eq!(adoptable_card(&mixed, "77", mine), Ok(Some(4)));
-        assert_eq!(adoptable_card(&answered(200, "{}"), "77", mine), Ok(None));
-        assert!(adoptable_card(&answered(500, "boom"), "77", mine).is_err());
+        assert_eq!(own_cards(&bare, "77", mine), Ok(vec![]));
+        assert_eq!(own_cards(&answered(200, "{}"), "77", mine), Ok(vec![]));
+        assert!(own_cards(&answered(500, "boom"), "77", mine).is_err());
     }
 
     #[test]

@@ -51,13 +51,13 @@ const WAITING: &str = "SELECT \
             OR (trust = 'fork' AND author_login = $2 AND status <> 'completed'))";
 
 /// Records `$2` as the check run that carries the approve button of run
-/// `$1`, while it waits. Each run has its own card, set only once the
-/// check run exists.
-const SET_GATE_CHECK: &str = "UPDATE ci_runs SET gate_check_run_id = $2 \
-     WHERE id = $1 AND gate_status IN ('pending', 'deferred')";
+/// `$1`, while it waits and has none: a run has at most one card, set
+/// only once the check run exists, and the first one recorded wins.
+const SET_GATE_CHECK: &str = "UPDATE ci_runs SET gate_check_run_id = $2, gate_card_dirty = false \
+     WHERE id = $1 AND gate_check_run_id IS NULL AND gate_status IN ('pending', 'deferred')";
 
-/// Forgets the check run of run `$1` while it waits.
-const CLEAR_GATE_CHECK: &str = "UPDATE ci_runs SET gate_check_run_id = NULL \
+/// Marks (`$2` true) or unmarks the card of run `$1` as needing an update.
+const SET_CARD_DIRTY: &str = "UPDATE ci_runs SET gate_card_dirty = $2 \
      WHERE id = $1 AND gate_status IN ('pending', 'deferred')";
 
 /// The deferred runs of pull request `$2` of repository `$1` at `$3`: a
@@ -124,12 +124,13 @@ const ADMIT: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_at 
      WHERE id = $1 AND gate_status = 'deferred' RETURNING {columns}";
 
 /// The waiting runs created before `$1` that have no check run with the
-/// approve button: the oldest `$3` of each repository, the oldest first,
-/// at most `$2`.
+/// approve button, or whose card needs an update: the oldest `$3` of
+/// each repository, the oldest first, at most `$2`.
 const WITHOUT_CARD: &str = "SELECT {columns} FROM (\
        SELECT ci_runs.*, row_number() OVER (PARTITION BY repo_id ORDER BY created_at, id) AS rn \
        FROM ci_runs WHERE gate_status IN ('pending', 'deferred') \
-       AND gate_check_run_id IS NULL AND status <> 'completed' AND created_at < $1) ci_runs \
+       AND (gate_check_run_id IS NULL OR gate_card_dirty) AND status <> 'completed' \
+       AND created_at < $1) ci_runs \
      WHERE rn <= $3 ORDER BY created_at, id LIMIT $2";
 
 /// The runs of the repositories `$2` of tenant `$1` that wait for an
@@ -205,9 +206,10 @@ pub async fn fork_waiting(
 
 /// Records check run `check_run_id` as the carrier of the approve
 /// button of run `run_id`. Called once the check run exists, so a run's
-/// card id is never recorded before its card. Returns whether it was
-/// recorded: `false` when the run was decided meanwhile, whose new card
-/// the caller then settles.
+/// card id is never recorded before its card. A run has at most one: the
+/// first recorded wins. Returns whether it was recorded: `false` when the
+/// run was decided meanwhile or already has another card, and the caller
+/// then settles the card it just made.
 ///
 /// # Errors
 ///
@@ -219,14 +221,15 @@ pub async fn set_gate_check(db: &Db, run_id: u64, check_run_id: u64) -> Result<b
         == 1)
 }
 
-/// Forgets the card of run `run_id` while it waits, so the reconciler
-/// makes it again: for a card that could not be updated.
+/// Marks the card of run `run_id` as needing an update (or, with
+/// `dirty` false, as up to date), while it waits. The reconciler brings
+/// a marked card up to date again.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn clear_gate_check(db: &Db, run_id: u64) -> Result<()> {
-    db.run(CLEAR_GATE_CHECK, &params![run_id]).await?;
+pub async fn set_card_dirty(db: &Db, run_id: u64, dirty: bool) -> Result<()> {
+    db.run(SET_CARD_DIRTY, &params![run_id, dirty]).await?;
     Ok(())
 }
 
@@ -407,13 +410,14 @@ pub async fn admit_run(
 }
 
 /// The waiting runs created before `before` that have no approval check
-/// run recorded, at most `limit`: a delivery that stopped between
-/// making the runs and the check run.
+/// run recorded or whose card needs an update, at most `limit`: a
+/// delivery that stopped between making the runs and the check run, or
+/// a card that could not be updated.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn runs_without_card(
+pub async fn runs_needing_card(
     db: &Db,
     before: u64,
     limit: u32,

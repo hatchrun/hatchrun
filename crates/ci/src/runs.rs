@@ -904,6 +904,7 @@ mod tests {
             gate_by: None,
             gate_at: None,
             gate_check_run_id: None,
+            gate_card_dirty: false,
         };
         title_of(&req, &plan, "https://api.github.com", &vars, &run)
     }

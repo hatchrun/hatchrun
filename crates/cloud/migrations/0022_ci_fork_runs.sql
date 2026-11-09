@@ -34,6 +34,9 @@ ALTER TABLE ci_runs ADD COLUMN gate_status text NOT NULL DEFAULT 'none'
 ALTER TABLE ci_runs ADD COLUMN gate_by text;
 ALTER TABLE ci_runs ADD COLUMN gate_at bigint;
 ALTER TABLE ci_runs ADD COLUMN gate_check_run_id bigint;
+-- Set when the approval check run of a waiting run could not be brought
+-- up to date; the reconciler updates it again and clears the mark.
+ALTER TABLE ci_runs ADD COLUMN gate_card_dirty boolean NOT NULL DEFAULT false;
 UPDATE ci_runs SET author_login = actor;
 ALTER TABLE ci_runs ALTER COLUMN trust DROP DEFAULT;
 ALTER TABLE ci_runs ALTER COLUMN author_login DROP DEFAULT;

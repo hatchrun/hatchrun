@@ -498,8 +498,16 @@ impl Cx<'_> {
             let Some(run) = store::run(self.db, run_id).await? else {
                 continue;
             };
-            if let Err(err) =
-                fork::ensure_card(self.tokens, self.db, self.settings, &repo, &run, policy).await
+            if let Err(err) = fork::ensure_card(
+                self.tokens,
+                self.db,
+                self.settings,
+                &repo,
+                &run,
+                policy,
+                None,
+            )
+            .await
             {
                 worker::console_error!("run {run_id}: the approval check run: {err}");
             }

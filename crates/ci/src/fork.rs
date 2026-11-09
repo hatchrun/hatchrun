@@ -585,10 +585,10 @@ pub async fn sweep(
     {
         changed += admit(env, db, settings, tokens, &run, now).await?;
     }
-    // A card a delivery never finished is made here, so the approve
-    // button always exists.
+    // A card a delivery never finished, or that could not be updated, is
+    // made or updated here, so the approve button always exists.
     let stale = now.saturating_sub(CARD_GRACE_MS);
-    for run in store::runs_without_card(db, stale, PASS, PER_REPO)
+    for run in store::runs_needing_card(db, stale, PASS, PER_REPO)
         .await
         .map_err(|err| err.to_string())?
     {
@@ -601,7 +601,7 @@ pub async fn sweep(
         let policy = store::repo_policy(db, repo.id, repo.private)
             .await
             .map_err(|err| err.to_string())?;
-        if let Err(err) = ensure_card(tokens, db, settings, &repo, &run, &policy).await {
+        if let Err(err) = ensure_card(tokens, db, settings, &repo, &run, &policy, None).await {
             console_error!("run {}: make the approval check run: {err}", run.id);
         }
     }
@@ -620,12 +620,15 @@ const PER_AUTHOR: u32 = 2;
 /// reconciler makes it: the webhook is likely still at it before that.
 const CARD_GRACE_MS: u64 = 60_000;
 
-/// Whether a run needs its approval check run made: a pull request's
-/// run that waits and has none recorded. A run that was decided, or has
-/// no pull request, needs none.
+/// Whether a run needs its approval check run made or brought up to
+/// date: a pull request's run that waits and has none recorded, or has
+/// one marked as stale. A run that was decided, or has no pull request,
+/// needs none.
 #[must_use]
 pub const fn needs_card(run: &RunRow) -> bool {
-    run.pull_number.is_some() && waits(run) && run.gate_check_run_id.is_none()
+    run.pull_number.is_some()
+        && waits(run)
+        && (run.gate_check_run_id.is_none() || run.gate_card_dirty)
 }
 
 /// What a decided run's card says, `None` for a run that still waits.
@@ -643,10 +646,63 @@ pub fn decided_message(run: &RunRow) -> Option<String> {
     }
 }
 
-/// Records card `id` for `run`. When the run was decided while the card
-/// was being made, nothing is recorded and the new card is settled to
-/// the run's decided state at once, so it never offers a button for a
-/// run that no longer waits.
+/// What a card superseded by another is told.
+pub const SUPERSEDED_CARD: &str = "Superseded by another approval check run for this run";
+
+/// What to do about a run's card. A run has at most one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardPlan {
+    /// The run has its card recorded; bring it up to date.
+    Refresh(u64),
+    /// An earlier attempt left cards of ours for this run on the commit:
+    /// the newest is the run's, brought up to date, and every other is
+    /// superseded.
+    Adopt {
+        /// The card kept.
+        chosen: u64,
+        /// The cards to settle as superseded.
+        extras: Vec<u64>,
+    },
+    /// There is none: make one.
+    Create,
+}
+
+/// Plans a run's card from the id recorded on it and the cards of ours
+/// for it on the commit (`ours`, in any state).
+#[must_use]
+pub fn plan_card(recorded: Option<u64>, ours: &[u64]) -> CardPlan {
+    if let Some(id) = recorded {
+        return CardPlan::Refresh(id);
+    }
+    match ours.iter().max() {
+        Some(&chosen) => CardPlan::Adopt {
+            chosen,
+            extras: ours.iter().copied().filter(|id| *id != chosen).collect(),
+        },
+        None => CardPlan::Create,
+    }
+}
+
+/// Settles check run `id`, a card of `run`'s that is not its recorded one,
+/// to `message`: completed, no buttons.
+async fn settle(
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    settings: &Settings,
+    repo: &RepoRow,
+    run: &RunRow,
+    id: u64,
+    message: &str,
+) {
+    let check = decided_check_run(&run.workflow, run.run_number, message);
+    update_check(tokens, settings, repo, run.id, id, &check).await;
+}
+
+/// Records card `id` for `run`. When nothing is recorded, the card just
+/// made or found is not the run's: the run was decided while it was being
+/// made (the card is settled to that state, so it never offers a button
+/// for a run that no longer waits), or another attempt recorded a card
+/// first (this one is superseded). Returns whether `id` is the run's
+/// card now.
 async fn record_card(
     tokens: &Tokens<'_, Kv, App, Counted>,
     db: &Db,
@@ -654,34 +710,96 @@ async fn record_card(
     repo: &RepoRow,
     run: &RunRow,
     id: u64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let recorded = store::set_gate_check(db, run.id, id)
         .await
         .map_err(|err| err.to_string())?;
     if recorded {
-        return Ok(());
+        return Ok(true);
     }
     let current = store::run(db, run.id)
         .await
         .map_err(|err| err.to_string())?;
-    if let Some(message) = current.as_ref().and_then(decided_message) {
-        let check = decided_check_run(&run.workflow, run.run_number, &message);
-        update_check(tokens, settings, repo, run.id, id, &check).await;
+    let message = current
+        .as_ref()
+        .and_then(decided_message)
+        .unwrap_or_else(|| SUPERSEDED_CARD.to_owned());
+    if current.is_none_or(|current| current.gate_check_run_id != Some(id)) {
+        settle(tokens, settings, repo, run, id, &message).await;
     }
-    Ok(())
+    Ok(false)
 }
 
-/// Makes sure the waiting `run` has its own approval check run, named
+/// Brings card `id` of `run` up to the run's state: the approval card
+/// with its button while the run is pending, the waiting card while it
+/// waits for a slot. A failure leaves the card marked stale, for the
+/// reconciler to update again.
+#[allow(clippy::too_many_arguments)] // one value each
+async fn refresh_card(
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    db: &Db,
+    settings: &Settings,
+    repo: &RepoRow,
+    run: &RunRow,
+    id: u64,
+    policy: &RepoPolicy,
+    files: Option<&Option<Vec<String>>>,
+) -> Result<(), String> {
+    let pending = run.gate_status == GateStatus::Pending;
+    let files = match (files, run.pull_number) {
+        (Some(read), _) => read.clone(),
+        (None, Some(number)) if pending => changed_files(tokens, settings, repo, number).await,
+        _ => None,
+    };
+    let card = card_for(db, settings, repo, run, policy.fork_approval, files)
+        .await
+        .map_err(|err| err.to_string());
+    let updated = match card {
+        Ok(card) => {
+            let check = if pending {
+                approval_check_run(&card)
+            } else {
+                waiting_check_run(&card)
+            };
+            update_check(tokens, settings, repo, run.id, id, &check).await
+        }
+        Err(err) => {
+            store::set_card_dirty(db, run.id, true)
+                .await
+                .map_err(|err| err.to_string())?;
+            return Err(err);
+        }
+    };
+    store::set_card_dirty(db, run.id, !updated)
+        .await
+        .map_err(|err| err.to_string())?;
+    if updated {
+        Ok(())
+    } else {
+        Err(format!("could not update card {id}"))
+    }
+}
+
+/// Makes sure the waiting `run` has exactly one approval check run, named
 /// for its workflow and number and tied to the run by its `external_id`,
-/// and that its id is recorded, only after the check run exists: the
-/// Approve button then approves exactly this run. Safe to repeat, from
-/// the webhook and from the reconciler: it adopts this run's card of
-/// ours that an earlier attempt made and did not record, and only an
-/// undecided one (see [`github::adoptable_card`]).
+/// recorded only after it exists: the Approve button then approves
+/// exactly this run. Safe to repeat, from the webhook and from the
+/// reconciler:
+///
+/// - a run with a card recorded has it brought up to date (when marked
+///   stale);
+/// - otherwise the cards of ours for this run already on the commit, in
+///   any state, are found: the newest is adopted and brought up to date,
+///   and every other is settled as superseded;
+/// - otherwise one is made.
+///
+/// `files` is the pull request's changed files when the caller read them
+/// already (one read for a group).
 ///
 /// # Errors
 ///
-/// GitHub or Postgres failed; the caller tries again.
+/// GitHub or Postgres failed; the caller tries again, and a card that
+/// could not be updated is marked for the reconciler.
 pub async fn ensure_card(
     tokens: &Tokens<'_, Kv, App, Counted>,
     db: &Db,
@@ -689,50 +807,77 @@ pub async fn ensure_card(
     repo: &RepoRow,
     run: &RunRow,
     policy: &RepoPolicy,
+    files: Option<&Option<Vec<String>>>,
 ) -> Result<(), String> {
     if !needs_card(run) {
         return Ok(());
     }
-    let name = approval_check_name(&run.workflow, run.run_number);
-    let listed = tokens
-        .send(repo.installation_id, |token| {
-            github::check_runs_named(
-                &settings.github_api,
-                &repo.full_name,
-                &run.sha,
-                &name,
-                token,
-            )
-        })
-        .await
-        .map_err(|err| err.to_string())?;
-    let external_id = approval_external_id(run.id);
-    if let Some(id) = github::adoptable_card(&listed, &settings.app_id, &external_id)? {
-        return record_card(tokens, db, settings, repo, run, id).await;
-    }
-    // The file list is read only for a card that asks; a run waiting for
-    // a slot has no use for it yet.
-    let pending = run.gate_status == GateStatus::Pending;
-    let files = match run.pull_number {
-        Some(number) if pending => changed_files(tokens, settings, repo, number).await,
-        _ => None,
-    };
-    let card = card_for(db, settings, repo, run, policy.fork_approval, files)
-        .await
-        .map_err(|err| err.to_string())?;
-    let check = if pending {
-        approval_check_run(&card)
+    let ours = if run.gate_check_run_id.is_some() {
+        Vec::new()
     } else {
-        waiting_check_run(&card)
+        let name = approval_check_name(&run.workflow, run.run_number);
+        let listed = tokens
+            .send(repo.installation_id, |token| {
+                github::check_runs_named(
+                    &settings.github_api,
+                    &repo.full_name,
+                    &run.sha,
+                    &name,
+                    token,
+                )
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        github::own_cards(&listed, &settings.app_id, &approval_external_id(run.id))?
     };
-    let response = tokens
-        .send(repo.installation_id, |token| {
-            github::create_check_run(&settings.github_api, &repo.full_name, token, &check)
-        })
-        .await
-        .map_err(|err| err.to_string())?;
-    let id = github::check_run_id(&response)?;
-    record_card(tokens, db, settings, repo, run, id).await
+    match plan_card(run.gate_check_run_id, &ours) {
+        CardPlan::Refresh(id) => {
+            refresh_card(tokens, db, settings, repo, run, id, policy, files).await
+        }
+        CardPlan::Adopt { chosen, extras } => {
+            if !record_card(tokens, db, settings, repo, run, chosen).await? {
+                return Ok(());
+            }
+            for extra in extras {
+                settle(tokens, settings, repo, run, extra, SUPERSEDED_CARD).await;
+            }
+            let adopted = RunRow {
+                gate_check_run_id: Some(chosen),
+                ..run.clone()
+            };
+            refresh_card(tokens, db, settings, repo, &adopted, chosen, policy, files).await
+        }
+        CardPlan::Create => {
+            // The file list is read only for a card that asks; a run
+            // waiting for a slot has no use for it yet.
+            let pending = run.gate_status == GateStatus::Pending;
+            let files = match (files, run.pull_number) {
+                (Some(read), _) => read.clone(),
+                (None, Some(number)) if pending => {
+                    changed_files(tokens, settings, repo, number).await
+                }
+                _ => None,
+            };
+            let card = card_for(db, settings, repo, run, policy.fork_approval, files)
+                .await
+                .map_err(|err| err.to_string())?;
+            let check = if pending {
+                approval_check_run(&card)
+            } else {
+                waiting_check_run(&card)
+            };
+            let response = tokens
+                .send(repo.installation_id, |token| {
+                    github::create_check_run(&settings.github_api, &repo.full_name, token, &check)
+                })
+                .await
+                .map_err(|err| err.to_string())?;
+            let id = github::check_run_id(&response)?;
+            record_card(tokens, db, settings, repo, run, id)
+                .await
+                .map(|_| ())
+        }
+    }
 }
 
 /// Decides what the deferred runs of `run`'s pull request and commit
@@ -802,35 +947,24 @@ async fn admit(
     // The file list is the same for the whole group: read it once.
     let files = changed_files(tokens, settings, &repo, number).await;
     for member in &admitted {
-        let made = async {
-            if member.gate_check_run_id.is_none() {
-                return ensure_card(tokens, db, settings, &repo, member, &policy)
-                    .await
-                    .map(|()| true);
+        // A run that has a waiting card has it brought up to the approval
+        // card: marked stale first, so a failure leaves it for the
+        // reconciler, and the other members go on.
+        let member = if member.gate_check_run_id.is_some() {
+            if let Err(err) = store::set_card_dirty(db, member.id, true).await {
+                console_error!("run {}: mark the card stale: {err}", member.id);
             }
-            // The waiting card becomes the approval card.
-            let card = card_for(
-                db,
-                settings,
-                &repo,
-                member,
-                policy.fork_approval,
-                files.clone(),
-            )
-            .await
-            .map_err(|err| err.to_string())?;
-            Ok(update_card(tokens, settings, &repo, member, &approval_check_run(&card)).await)
-        }
-        .await;
-        // A card that could not be made or updated is forgotten, so the
-        // reconciler makes it again; the other members go on.
-        if !matches!(made, Ok(true)) {
-            if let Err(err) = &made {
-                console_error!("run {}: the approval check run: {err}", member.id);
+            RunRow {
+                gate_card_dirty: true,
+                ..member.clone()
             }
-            if let Err(err) = store::clear_gate_check(db, member.id).await {
-                console_error!("run {}: forget the approval check run: {err}", member.id);
-            }
+        } else {
+            member.clone()
+        };
+        if let Err(err) =
+            ensure_card(tokens, db, settings, &repo, &member, &policy, Some(&files)).await
+        {
+            console_error!("run {}: the approval check run: {err}", member.id);
         }
     }
     Ok(count(admitted.len()))
@@ -1130,9 +1264,43 @@ mod tests {
         assert!(needs_card(&waiting_row("deferred", None, Some(4))));
         // Recorded already, decided, or not a pull request's: no card.
         assert!(!needs_card(&waiting_row("pending", Some(5), Some(4))));
+        // A card marked stale is brought up to date again.
+        let mut stale = waiting_row("pending", Some(5), Some(4));
+        stale.gate_card_dirty = true;
+        assert!(needs_card(&stale));
         assert!(!needs_card(&waiting_row("approved", None, Some(4))));
         assert!(!needs_card(&waiting_row("cancelled", None, Some(4))));
         assert!(!needs_card(&waiting_row("pending", None, None)));
+    }
+
+    #[test]
+    fn a_run_has_at_most_one_card() {
+        // Recorded: refresh it, whatever else is on the commit.
+        assert_eq!(plan_card(Some(5), &[3, 4, 5]), CardPlan::Refresh(5));
+        assert_eq!(plan_card(Some(5), &[]), CardPlan::Refresh(5));
+        // Not recorded: adopt the newest of ours in any state (a card
+        // asking and a card waiting for a slot are both this run's) and
+        // supersede the rest.
+        assert_eq!(
+            plan_card(None, &[3, 9, 4]),
+            CardPlan::Adopt {
+                chosen: 9,
+                extras: vec![3, 4]
+            }
+        );
+        assert_eq!(
+            plan_card(None, &[7]),
+            CardPlan::Adopt {
+                chosen: 7,
+                extras: vec![]
+            }
+        );
+        // None of ours: make one.
+        assert_eq!(plan_card(None, &[]), CardPlan::Create);
+        assert!(SUPERSEDED_CARD.contains("Superseded"));
+        let check = decided_check_run("ci", 3, SUPERSEDED_CARD);
+        assert_eq!(check.actions.len(), 0);
+        assert_eq!(check.conclusion.as_deref(), Some("neutral"));
     }
 
     #[test]

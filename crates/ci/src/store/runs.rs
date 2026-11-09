@@ -166,6 +166,10 @@ pub struct RunRow {
     pub gate_at: Option<u64>,
     /// The check run that carries the approve button.
     pub gate_check_run_id: Option<u64>,
+    /// Whether that check run could not be brought up to date and the
+    /// reconciler has to update it again.
+    #[serde(default)]
+    pub gate_card_dirty: bool,
 }
 
 impl RunRow {
@@ -191,7 +195,7 @@ pub(super) const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, re
      (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
       AND number = ci_runs.pull_number) AS pull_title, \
      trust, head_repo_name, author_login, author_association, gate_status, gate_by, gate_at, \
-     gate_check_run_id";
+     gate_check_run_id, gate_card_dirty";
 
 /// The run of delivery `$1` and workflow `$2`, where `{columns}` is
 /// [`RUN_COLUMNS`].
@@ -234,7 +238,7 @@ const INSERT_RUN: &str = "WITH n AS (\
        (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
         AND number = ci_runs.pull_number) AS pull_title, \
        trust, head_repo_name, author_login, author_association, gate_status, gate_by, gate_at, \
-       gate_check_run_id";
+       gate_check_run_id, gate_card_dirty";
 
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
@@ -501,7 +505,8 @@ pub(super) const LISTED_COLUMNS: &str = "r.id, r.run_number, r.run_attempt, r.te
      r.pull_number, r.head_ref, \
      (SELECT title FROM ci_pulls WHERE repo_id = r.repo_id AND number = r.pull_number) \
      AS pull_title, r.trust, r.head_repo_name, r.author_login, r.author_association, \
-     r.gate_status, r.gate_by, r.gate_at, r.gate_check_run_id, p.full_name AS repository";
+     r.gate_status, r.gate_by, r.gate_at, r.gate_check_run_id, r.gate_card_dirty, \
+     p.full_name AS repository";
 
 /// One page of the runs `filter` holds, newest first, those after
 /// `after` when it is set, at most `limit`; and how many runs the
