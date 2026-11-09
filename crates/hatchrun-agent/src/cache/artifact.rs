@@ -198,7 +198,16 @@ async fn finalize(state: &State, request: FinalizeRequest) -> Reply {
         }
         Err(err) => {
             warn!(name = request.name, "artifact save failed: {err:#}");
-            abandon(&upload).await;
+            if super::twirp::is_retryable(&err) {
+                // The client finalizes again: keep the upload and what it
+                // committed for that.
+                upload.lock().committed = Some(parts);
+                let mut uploads = lock(&state.uploads);
+                uploads.by_entry.insert(entry, upload.id.clone());
+                uploads.by_id.insert(upload.id.clone(), upload);
+            } else {
+                abandon(&upload).await;
+            }
             refusal(&err)
         }
     }

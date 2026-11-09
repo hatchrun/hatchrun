@@ -263,6 +263,26 @@ async fn a_failed_save_is_an_error_not_already_exists() {
 }
 
 #[tokio::test]
+async fn an_unreadable_answer_of_the_control_plane_is_not_retried() {
+    let server = cloud().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/cache/uploads"))
+        .respond_with(ResponseTemplate::new(201).set_body_string("this is not json"))
+        .mount(&server)
+        .await;
+    let proxy = proxy(&server).await;
+
+    let (status, body) = rpc(
+        &proxy,
+        "CreateCacheEntry",
+        json!({ "key": "k", "version": "v1" }),
+    )
+    .await;
+    assert_eq!(status, 412, "{body}");
+    assert_eq!(body["code"], "failed_precondition");
+}
+
+#[tokio::test]
 async fn a_refusal_of_the_control_plane_is_final() {
     let server = cloud().await;
     Mock::given(method("POST"))

@@ -221,6 +221,80 @@ async fn a_lost_name_race_finalizes_not_ok() {
 }
 
 #[tokio::test]
+async fn a_finalize_that_may_be_retried_keeps_the_upload() {
+    let server = control_plane().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/artifacts/uploads"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "uploadId": "7" })))
+        .mount(&server)
+        .await;
+    // The control plane fails once, then completes.
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/artifacts/uploads/7/complete"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/artifacts/uploads/7/complete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 9 })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/agent/artifacts/uploads/7"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let proxy = artifact_proxy(&server).await;
+    let (_, body) = artifact_rpc(&proxy, "CreateArtifact", json!({ "name": "dist" })).await;
+    let url = body["signed_upload_url"].as_str().unwrap();
+    assert_eq!(azure_put(url, "", b"x").await.status(), 201);
+
+    let finalize = json!({ "name": "dist", "size": 1 });
+    let (status, body) = artifact_rpc(&proxy, "FinalizeArtifact", finalize.clone()).await;
+    assert_eq!((status, body["code"].as_str()), (503, Some("unavailable")));
+    let (status, body) = artifact_rpc(&proxy, "FinalizeArtifact", finalize).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({ "ok": true, "artifact_id": "9" }));
+}
+
+#[tokio::test]
+async fn a_final_refusal_of_a_finalize_abandons_the_upload() {
+    let server = control_plane().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/artifacts/uploads"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "uploadId": "7" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agent/artifacts/uploads/7/complete"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/agent/artifacts/uploads/7"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let proxy = artifact_proxy(&server).await;
+    let (_, body) = artifact_rpc(&proxy, "CreateArtifact", json!({ "name": "dist" })).await;
+    let url = body["signed_upload_url"].as_str().unwrap();
+    assert_eq!(azure_put(url, "", b"x").await.status(), 201);
+    let (status, body) = artifact_rpc(
+        &proxy,
+        "FinalizeArtifact",
+        json!({ "name": "dist", "size": 1 }),
+    )
+    .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (403, Some("permission_denied"))
+    );
+}
+
+#[tokio::test]
 async fn lists_and_downloads_artifacts() {
     let server = control_plane().await;
     s3(&server).await;

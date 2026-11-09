@@ -135,6 +135,17 @@ struct Service {
     ports: BTreeMap<String, String>,
 }
 
+/// The first of `dirs` that holds an executable file called `name`: a
+/// file without execute permission, or a directory, is passed over.
+fn first_executable(name: &Path, dirs: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    dirs.iter().map(|dir| dir.join(name)).find(|candidate| {
+        candidate
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    })
+}
+
 impl Job<'_> {
     /// The Docker command, from `--docker` or the first `docker` on the
     /// agent's `PATH` or the default one.
@@ -153,15 +164,12 @@ impl Job<'_> {
                 let path = std::env::var_os("PATH").unwrap_or_default();
                 let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
                 dirs.extend(std::env::split_paths(DEFAULT_PATH));
-                dirs.into_iter()
-                    .map(|dir| dir.join(name))
-                    .find(|candidate| candidate.is_file())
-                    .ok_or_else(|| {
-                        format!(
-                            "`{}` is not installed: this job needs it as its Docker command",
-                            name.display()
-                        )
-                    })?
+                first_executable(name, &dirs).ok_or_else(|| {
+                    format!(
+                        "`{}` is not installed: this job needs it as its Docker command",
+                        name.display()
+                    )
+                })?
             }
         };
         self.docker.bin = Some(bin.clone());
@@ -1129,6 +1137,35 @@ fn remove_env_file(path: Option<&Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_executable_on_the_path_is_the_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let make = |dir: &Path, mode: u32| {
+            let file = dir.join("podman");
+            std::fs::write(&file, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let plain = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let good = tempfile::tempdir().unwrap();
+        let later = tempfile::tempdir().unwrap();
+        make(plain.path(), 0o644);
+        std::fs::create_dir(folder.path().join("podman")).unwrap();
+        make(good.path(), 0o755);
+        make(later.path(), 0o755);
+        let dirs = [
+            plain.path().to_owned(),
+            folder.path().to_owned(),
+            good.path().to_owned(),
+            later.path().to_owned(),
+        ];
+        assert_eq!(
+            first_executable(Path::new("podman"), &dirs),
+            Some(good.path().join("podman"))
+        );
+        assert_eq!(first_executable(Path::new("docker"), &dirs), None);
+    }
 
     #[test]
     fn a_login_directory_alone_is_no_work_to_clean_up() {
