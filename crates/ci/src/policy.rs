@@ -18,7 +18,7 @@ pub const MAX_PENDING: u64 = 20;
 /// Deferred runs a repository keeps. A delivery over it is dropped.
 pub const MAX_DEFERRED: u64 = 100;
 /// Runs of one author a repository has active at once. A delivery over
-/// it is dropped.
+/// it is deferred, like one over the approval slots.
 pub const MAX_ACTIVE_PER_AUTHOR: u64 = 3;
 /// How long a run waits for a decision before it is cancelled, in
 /// milliseconds: 7 days.
@@ -213,13 +213,12 @@ fn known(association: &str) -> bool {
 pub enum Admission {
     /// Nothing is started: fork runs are off.
     Off,
-    /// The author's runs fill the per-author cap.
-    AuthorBusy,
     /// Runs start at once with no approval.
     Run,
     /// Runs wait for an approval, and the card is shown.
     Pending,
-    /// Runs wait for a free approval slot, and no card is shown yet.
+    /// Runs wait for a free approval slot, or for the author's active
+    /// runs to drop under the cap; the card says so and has no button.
     Deferred,
     /// Nothing is started: the repository has too many deferred runs.
     Drop,
@@ -243,18 +242,23 @@ pub fn admission(policy: &RepoPolicy, association: &str, waiting: Waiting) -> Ad
     if policy.fork_runs == ForkRuns::Off {
         return Admission::Off;
     }
+    // An author over the cap waits like a run over the approval slots,
+    // whether or not the run would need an approval.
+    let later = if waiting.deferred < MAX_DEFERRED {
+        Admission::Deferred
+    } else {
+        Admission::Drop
+    };
     if waiting.author_active >= MAX_ACTIVE_PER_AUTHOR {
-        return Admission::AuthorBusy;
+        return later;
     }
     if !needs_approval(policy.fork_approval, association) {
         return Admission::Run;
     }
     if waiting.pending < MAX_PENDING {
         Admission::Pending
-    } else if waiting.deferred < MAX_DEFERRED {
-        Admission::Deferred
     } else {
-        Admission::Drop
+        later
     }
 }
 
@@ -263,7 +267,6 @@ pub fn admission(policy: &RepoPolicy, association: &str, waiting: Waiting) -> Ad
 pub const fn refusal(admission: Admission) -> Option<&'static str> {
     match admission {
         Admission::Off => Some("fork runs are off for this repository"),
-        Admission::AuthorBusy => Some("too many active runs from this author"),
         Admission::Drop => Some("too many fork runs wait for approval"),
         Admission::Run | Admission::Pending | Admission::Deferred => None,
     }
@@ -376,16 +379,19 @@ mod tests {
     }
 
     #[test]
-    fn an_author_has_three_active_runs() {
+    fn an_author_over_three_active_runs_is_deferred_not_dropped() {
         let busy = Waiting {
             author_active: 3,
             ..Waiting::default()
         };
-        assert_eq!(
-            admission(&PUBLIC, "FIRST_TIMER", busy),
-            Admission::AuthorBusy
-        );
-        assert_eq!(admission(&PUBLIC, "OWNER", busy), Admission::AuthorBusy);
+        assert_eq!(admission(&PUBLIC, "FIRST_TIMER", busy), Admission::Deferred);
+        assert_eq!(admission(&PUBLIC, "OWNER", busy), Admission::Deferred);
+        // The deferred runs are capped too.
+        let full = Waiting {
+            deferred: 100,
+            ..busy
+        };
+        assert_eq!(admission(&PUBLIC, "OWNER", full), Admission::Drop);
         let free = Waiting {
             author_active: 2,
             ..Waiting::default()

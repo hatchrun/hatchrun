@@ -441,6 +441,25 @@ pub fn check_run_total(response: &Response) -> Result<u64, String> {
     decode::<Listed>(response, "check runs").map(|l| l.total_count)
 }
 
+/// The id of the first check run [`check_runs_named`] found, `None`
+/// when there is none.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a check run list.
+pub fn check_run_first_id(response: &Response) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct Listed {
+        #[serde(default)]
+        check_runs: Vec<Found>,
+    }
+    #[derive(Deserialize)]
+    struct Found {
+        id: u64,
+    }
+    decode::<Listed>(response, "check runs").map(|l| l.check_runs.first().map(|c| c.id))
+}
+
 /// Creates a check run.
 #[must_use]
 pub fn create_check_run(api: &str, repo: &str, token: &str, run: &CheckRun) -> Request {
@@ -746,6 +765,18 @@ mod tests {
             &run(),
         ));
         assert!(body.get("actions").is_none());
+    }
+
+    #[test]
+    fn the_first_check_run_of_a_list_is_found() {
+        let found = answered(
+            200,
+            r#"{"total_count":1,"check_runs":[{"id":5150,"name":"x"}]}"#,
+        );
+        assert_eq!(check_run_first_id(&found), Ok(Some(5150)));
+        let none = answered(200, r#"{"total_count":0,"check_runs":[]}"#);
+        assert_eq!(check_run_first_id(&none), Ok(None));
+        assert!(check_run_first_id(&answered(500, "boom")).is_err());
     }
 
     #[test]

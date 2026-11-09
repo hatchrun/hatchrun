@@ -57,8 +57,9 @@ pub use self::environments::{
     put_environment, release_approval_holds,
 };
 pub use self::forks::{
-    admit_deferred, approve_by_check, approve_run, end_gate, end_pull_gates, expire_gates,
-    fork_waiting, pending_gate_runs, put_repo_policy, repo_policy, set_gate_check,
+    admit_run, approve_by_check, approve_run, deferred_runs, end_gate, end_pull_gates,
+    expire_gates, fork_waiting, pending_gate_runs, put_repo_policy, repo_policy, runs_without_card,
+    set_gate_check,
 };
 pub use self::installation::{
     LastRun, OrgRepo, RepoFilter, RepoVisibility, SetupRow, installation_synced, patch_enabled,

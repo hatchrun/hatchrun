@@ -26,7 +26,7 @@ use crate::checks::plain;
 use crate::env::{Settings, run_stub};
 use crate::github::{self, CONFIG_PATH, CheckAction, CheckRun, Output};
 use crate::launches;
-use crate::policy::{APPROVAL_CHECK, APPROVE_ACTION, FORK_MAX_VCPU, ForkApproval};
+use crate::policy::{APPROVAL_CHECK, APPROVE_ACTION, FORK_MAX_VCPU, ForkApproval, RepoPolicy};
 use crate::store::{self, GateStatus, RepoRow, RunRow};
 
 /// Pages of a pull request's files the card reads, 100 files each.
@@ -533,35 +533,205 @@ pub async fn sweep(
             .await;
         }
     }
-    let admitted = store::admit_deferred(db, PASS)
+    for run in store::deferred_runs(db, PASS)
         .await
-        .map_err(|err| err.to_string())?;
-    changed += u32::try_from(admitted.len()).unwrap_or(PASS);
-    let mut carded: Vec<u64> = Vec::new();
-    for run in &admitted {
-        let found = store::repo(db, run.repo_id)
+        .map_err(|err| err.to_string())?
+    {
+        if admit(env, db, settings, tokens, &run, now).await? {
+            changed += 1;
+        }
+    }
+    // A card a delivery never finished is made here, so the approve
+    // button always exists.
+    let stale = now.saturating_sub(CARD_GRACE_MS);
+    for run in store::runs_without_card(db, stale, PASS)
+        .await
+        .map_err(|err| err.to_string())?
+    {
+        let Some(repo) = store::repo(db, run.repo_id)
             .await
-            .map_err(|err| err.to_string())?;
-        let (Some(repo), Some(id)) = (found, run.gate_check_run_id) else {
+            .map_err(|err| err.to_string())?
+        else {
             continue;
         };
-        if carded.contains(&id) {
-            continue;
-        }
-        carded.push(id);
         let policy = store::repo_policy(db, repo.id, repo.private)
             .await
             .map_err(|err| err.to_string())?;
-        let files = match run.pull_number {
+        if let Err(err) = ensure_card(tokens, db, settings, &repo, &run, &policy).await {
+            console_error!("run {}: make the approval check run: {err}", run.id);
+        }
+    }
+    Ok(changed)
+}
+
+/// How long a waiting run may go without its check run before the
+/// reconciler makes it: the webhook is likely still at it before that.
+const CARD_GRACE_MS: u64 = 60_000;
+
+/// What making the approval check run of a waiting run comes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardStep {
+    /// The run has its check run recorded.
+    Done,
+    /// A check run of the right name is on the commit already, made by
+    /// an earlier attempt that never recorded it: record its id.
+    Adopt(u64),
+    /// Make the check run.
+    Create,
+}
+
+/// Decides how to get the approval check run: the id recorded on the
+/// run, else one an earlier attempt left on the commit, else a new
+/// one.
+#[must_use]
+pub const fn card_step(recorded: Option<u64>, on_commit: Option<u64>) -> CardStep {
+    match (recorded, on_commit) {
+        (Some(_), _) => CardStep::Done,
+        (None, Some(id)) => CardStep::Adopt(id),
+        (None, None) => CardStep::Create,
+    }
+}
+
+/// Makes sure the waiting `run` has its approval check run and that its
+/// id is recorded, so the Approve button exists and its click finds the
+/// run. Safe to repeat, from the webhook and from the reconciler: it
+/// adopts a check run an earlier attempt made and did not record.
+///
+/// # Errors
+///
+/// GitHub or Postgres failed; the caller tries again.
+pub async fn ensure_card(
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    db: &Db,
+    settings: &Settings,
+    repo: &RepoRow,
+    run: &RunRow,
+    policy: &RepoPolicy,
+) -> Result<(), String> {
+    if card_step(run.gate_check_run_id, None) == CardStep::Done {
+        return Ok(());
+    }
+    let listed = tokens
+        .send(repo.installation_id, |token| {
+            github::check_runs_named(
+                &settings.github_api,
+                &repo.full_name,
+                &run.sha,
+                APPROVAL_CHECK,
+                token,
+            )
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+    let on_commit = github::check_run_first_id(&listed)?;
+    match card_step(run.gate_check_run_id, on_commit) {
+        CardStep::Done => {}
+        CardStep::Adopt(id) => store::set_gate_check(db, &run.delivery, id)
+            .await
+            .map_err(|err| err.to_string())?,
+        CardStep::Create => {
+            let pending = run.gate_status == GateStatus::Pending;
+            let files = match run.pull_number {
+                Some(number) if pending => changed_files(tokens, settings, repo, number).await,
+                _ => None,
+            };
+            let card = card_for(db, settings, repo, run, policy.fork_approval, files)
+                .await
+                .map_err(|err| err.to_string())?;
+            let check = if pending {
+                approval_check_run(&card)
+            } else {
+                waiting_check_run(&card)
+            };
+            let response = tokens
+                .send(repo.installation_id, |token| {
+                    github::create_check_run(&settings.github_api, &repo.full_name, token, &check)
+                })
+                .await
+                .map_err(|err| err.to_string())?;
+            let id = github::check_run_id(&response)?;
+            store::set_gate_check(db, &run.delivery, id)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Decides what a deferred `run` becomes now: asks for its approval
+/// when a slot is free and the author is under the cap, runs it when
+/// no approval is needed, ends it when the repository turned fork runs
+/// off, and leaves it otherwise. Returns whether it changed.
+async fn admit(
+    env: &Env,
+    db: &Db,
+    settings: &Settings,
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    run: &RunRow,
+    now: u64,
+) -> Result<bool, String> {
+    let Some(repo) = store::repo(db, run.repo_id)
+        .await
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(false);
+    };
+    let policy = store::repo_policy(db, repo.id, repo.private)
+        .await
+        .map_err(|err| err.to_string())?;
+    let mut waiting = store::fork_waiting(db, repo.id, &run.author_login)
+        .await
+        .map_err(|err| err.to_string())?;
+    // The run asking is one of the deferred; it must not count against
+    // itself.
+    waiting.deferred = 0;
+    let slot = crate::policy::admission(&policy, &run.author_association, waiting);
+    let (status, by) = match slot {
+        crate::policy::Admission::Pending => (GateStatus::Pending, None),
+        crate::policy::Admission::Run => (GateStatus::Approved, Some("policy")),
+        crate::policy::Admission::Off => {
+            let Some(ended) = store::end_gate(db, run.id, "cancelled", None, now)
+                .await
+                .map_err(|err| err.to_string())?
+            else {
+                return Ok(false);
+            };
+            let off = "Fork runs are off for this repository";
+            after_end(env, settings, tokens, &repo, &[ended], off).await;
+            return Ok(true);
+        }
+        crate::policy::Admission::Deferred | crate::policy::Admission::Drop => return Ok(false),
+    };
+    let Some(admitted) = store::admit_run(db, run.id, status, by, now)
+        .await
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(false);
+    };
+    if let Some(by) = by {
+        after_approval(env, db, settings, tokens, &repo, &[admitted], by).await;
+        return Ok(true);
+    }
+    if admitted.gate_check_run_id.is_some() {
+        let files = match admitted.pull_number {
             Some(number) => changed_files(tokens, settings, &repo, number).await,
             None => None,
         };
-        let card = card_for(db, settings, &repo, run, policy.fork_approval, files)
+        let card = card_for(db, settings, &repo, &admitted, policy.fork_approval, files)
             .await
             .map_err(|err| err.to_string())?;
-        update_card(tokens, settings, &repo, run, &approval_check_run(&card)).await;
+        update_card(
+            tokens,
+            settings,
+            &repo,
+            &admitted,
+            &approval_check_run(&card),
+        )
+        .await;
+    } else if let Err(err) = ensure_card(tokens, db, settings, &repo, &admitted, &policy).await {
+        console_error!("run {}: make the approval check run: {err}", admitted.id);
     }
-    Ok(changed)
+    Ok(true)
 }
 
 /// Whether a run still waits for a decision.
@@ -661,6 +831,17 @@ mod tests {
         gone.head_repo = None;
         let summary = approval_check_run(&gone).output.unwrap().summary;
         assert!(summary.contains("a deleted fork"));
+    }
+
+    #[test]
+    fn a_card_is_recorded_adopted_or_made() {
+        assert_eq!(card_step(Some(5), None), CardStep::Done);
+        assert_eq!(card_step(Some(5), Some(9)), CardStep::Done);
+        // A delivery that made the check run and stopped before it
+        // recorded the id: the retry adopts it instead of making a
+        // second one whose button no run knows.
+        assert_eq!(card_step(None, Some(9)), CardStep::Adopt(9));
+        assert_eq!(card_step(None, None), CardStep::Create);
     }
 
     #[test]

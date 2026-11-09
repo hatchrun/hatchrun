@@ -479,71 +479,19 @@ impl Cx<'_> {
 
     /// Puts the approval check run on the head of `pr`: the card with
     /// its button, or the note that the run waits for a free slot. One
-    /// per delivery, and one per commit: a delivery repeated after a
-    /// failure finds it and makes none.
-    async fn ask_approval(
-        &self,
-        pr: &PullRequest,
-        run_id: u64,
-        gate: GateStatus,
-        policy: &RepoPolicy,
-    ) -> Result<()> {
+    /// per commit: a delivery repeated after a failure adopts the one
+    /// an earlier attempt made and records its id, so the button always
+    /// finds its run (see [`fork::ensure_card`]).
+    async fn ask_approval(&self, pr: &PullRequest, run_id: u64, policy: &RepoPolicy) -> Result<()> {
         let (Some(repo), Some(run)) = (
             store::repo(self.db, pr.repo.id).await?,
             store::run(self.db, run_id).await?,
         ) else {
             return Ok(());
         };
-        let listed = self
-            .tokens
-            .send(pr.installation_id, |token| {
-                github::check_runs_named(
-                    &self.settings.github_api,
-                    &pr.repo.full_name,
-                    &pr.head_sha,
-                    policy::APPROVAL_CHECK,
-                    token,
-                )
-            })
+        fork::ensure_card(self.tokens, self.db, self.settings, &repo, &run, policy)
             .await
-            .map_err(|err| fail(err.to_string()))?;
-        if github::check_run_total(&listed).map_err(fail)? > 0 {
-            return Ok(());
-        }
-        let files = if gate == GateStatus::Pending {
-            fork::changed_files(self.tokens, self.settings, &repo, pr.number).await
-        } else {
-            None
-        };
-        let card = fork::card_for(
-            self.db,
-            self.settings,
-            &repo,
-            &run,
-            policy.fork_approval,
-            files,
-        )
-        .await?;
-        let check = if gate == GateStatus::Pending {
-            fork::approval_check_run(&card)
-        } else {
-            fork::waiting_check_run(&card)
-        };
-        let response = self
-            .tokens
-            .send(pr.installation_id, |token| {
-                github::create_check_run(
-                    &self.settings.github_api,
-                    &pr.repo.full_name,
-                    token,
-                    &check,
-                )
-            })
-            .await
-            .map_err(|err| fail(err.to_string()))?;
-        let id = github::check_run_id(&response).map_err(fail)?;
-        store::set_gate_check(self.db, self.delivery, id).await?;
-        Ok(())
+            .map_err(fail)
     }
 
     /// A click on "Approve and run". GitHub shows the button to people
@@ -720,7 +668,7 @@ impl Cx<'_> {
         if let (Some((gate, policy)), Some(&first)) = (&admitted, ids.first())
             && *gate != GateStatus::NotGated
         {
-            self.ask_approval(pr, first, *gate, policy).await?;
+            self.ask_approval(pr, first, policy).await?;
         }
         Ok(Outcome::Done(ids))
     }

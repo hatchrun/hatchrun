@@ -16,9 +16,9 @@ use hatchrun_cloud::db::{Db, params};
 use serde::Deserialize;
 use worker::Result;
 
-use super::runs::{ListedRun, RUN_COLUMNS, RunRow};
+use super::runs::{GateStatus, ListedRun, RUN_COLUMNS, RunRow};
 use super::with_columns;
-use crate::policy::{MAX_PENDING, RepoPolicy, Waiting};
+use crate::policy::{RepoPolicy, Waiting};
 
 /// The policy of repository `$1`.
 const POLICY: &str = "SELECT fork_runs, fork_approval, fork_max_running, fork_timeout_minutes, \
@@ -39,7 +39,7 @@ const WAITING: &str = "SELECT \
        count(*) FILTER (WHERE gate_status = 'pending')::bigint AS pending, \
        count(*) FILTER (WHERE gate_status = 'deferred')::bigint AS deferred, \
        count(*) FILTER (WHERE trust = 'fork' AND author_login = $2 AND status <> 'completed' \
-         AND gate_status NOT IN ('expired', 'cancelled'))::bigint AS author_active \
+         AND gate_status NOT IN ('deferred', 'expired', 'cancelled'))::bigint AS author_active \
      FROM ci_runs WHERE repo_id = $1 \
        AND (gate_status IN ('pending', 'deferred') \
             OR (trust = 'fork' AND author_login = $2 AND status <> 'completed'))";
@@ -76,17 +76,20 @@ const EXPIRE: &str = "UPDATE ci_runs SET gate_status = 'expired', gate_at = $2 W
        ORDER BY created_at, id LIMIT $3) AND gate_status IN ('pending', 'deferred') \
      RETURNING {columns}";
 
-/// Asks for the approval of up to `$2` deferred runs, the oldest first,
-/// while their repository has fewer than `$1` runs waiting.
-const ADMIT: &str = "UPDATE ci_runs SET gate_status = 'pending' WHERE id IN (\
-       SELECT id FROM (\
-         SELECT d.id, row_number() OVER (PARTITION BY d.repo_id ORDER BY d.created_at, d.id) \
-           AS place, d.created_at, \
-           (SELECT count(*) FROM ci_runs w WHERE w.repo_id = d.repo_id \
-              AND w.gate_status = 'pending') AS waiting \
-         FROM ci_runs d WHERE d.gate_status = 'deferred' AND d.status <> 'completed') ranked \
-       WHERE place <= $1 - waiting ORDER BY created_at LIMIT $2) \
-     AND gate_status = 'deferred' RETURNING {columns}";
+/// The deferred runs that are not over, the oldest first, at most `$1`.
+const DEFERRED: &str = "SELECT {columns} FROM ci_runs WHERE gate_status = 'deferred' \
+     AND status <> 'completed' ORDER BY created_at, id LIMIT $1";
+
+/// Takes deferred run `$1` out of the queue: gate status `$2`, by `$3`
+/// at `$4`.
+const ADMIT: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_at = $4 \
+     WHERE id = $1 AND gate_status = 'deferred' RETURNING {columns}";
+
+/// The waiting runs created before `$1` that have no check run with the
+/// approve button, the oldest first, at most `$2`.
+const WITHOUT_CARD: &str = "SELECT {columns} FROM ci_runs WHERE gate_status IN ('pending', 'deferred') \
+     AND gate_check_run_id IS NULL AND status <> 'completed' AND created_at < $1 \
+     ORDER BY created_at, id LIMIT $2";
 
 /// The runs of the repositories `$2` of tenant `$1` that wait for an
 /// approval, the oldest first, at most `$3`.
@@ -258,16 +261,49 @@ pub async fn expire_gates(db: &Db, before: u64, now: u64, limit: u32) -> Result<
     .await
 }
 
-/// Moves up to `limit` deferred runs to pending, the oldest first,
-/// while their repository has fewer than [`MAX_PENDING`] waiting.
+/// The deferred runs, the oldest first, at most `limit`: what the
+/// reconciler admits when a slot frees or the author's runs end.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn admit_deferred(db: &Db, limit: u32) -> Result<Vec<RunRow>> {
-    db.all(
+pub async fn deferred_runs(db: &Db, limit: u32) -> Result<Vec<RunRow>> {
+    db.all(&with_columns(DEFERRED, RUN_COLUMNS), &params![limit])
+        .await
+}
+
+/// Takes deferred run `run_id` out of the queue with `status`
+/// (`pending` to ask for approval, `approved` when none is needed), by
+/// `by` when it is approved. `None` when it was decided meanwhile.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn admit_run(
+    db: &Db,
+    run_id: u64,
+    status: GateStatus,
+    by: Option<&str>,
+    now: u64,
+) -> Result<Option<RunRow>> {
+    db.first(
         &with_columns(ADMIT, RUN_COLUMNS),
-        &params![MAX_PENDING, limit],
+        &params![run_id, status.as_str(), by, now],
+    )
+    .await
+}
+
+/// The waiting runs created before `before` that have no approval check
+/// run recorded, at most `limit`: a delivery that stopped between
+/// making the runs and the check run.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn runs_without_card(db: &Db, before: u64, limit: u32) -> Result<Vec<RunRow>> {
+    db.all(
+        &with_columns(WITHOUT_CARD, RUN_COLUMNS),
+        &params![before, limit],
     )
     .await
 }
