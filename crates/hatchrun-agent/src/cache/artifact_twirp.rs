@@ -166,19 +166,10 @@ pub fn timestamp(millis: u64) -> String {
     humantime::format_rfc3339_millis(UNIX_EPOCH + Duration::from_millis(millis)).to_string()
 }
 
-/// How long the runtime token lives for a job with this timeout, in
-/// seconds: the job's whole time, as the Worker's job tokens do (see
-/// `token::lifetime_secs` in `hatchrun-ci`), with room for the instance
-/// to boot and the job to wind down.
-#[must_use]
-pub fn lifetime_secs(timeout_minutes: u32) -> u64 {
-    u64::from(timeout_minutes) * 60 + 1500
-}
-
 /// The `ACTIONS_RUNTIME_TOKEN` of a job: a JWT the toolkits read and
 /// never verify, so the signature is random filler; the proxy checks
 /// the whole token on every artifact call. It is valid for
-/// `lifetime_secs` from now.
+/// `lifetime_secs` from now, which the Worker chooses.
 ///
 /// - The artifact toolkit reads the run and job from the `scp` claim,
 ///   `Actions.Results:<run>:<job>`.
@@ -189,6 +180,9 @@ pub fn lifetime_secs(timeout_minutes: u32) -> u64 {
 ///   bit and reads each scope that has the read bit. The first of
 ///   `scopes` is the ref the job saves to, so it gets 3 (a job reads
 ///   what it saved); the others are refs it only reads, so they get 1.
+///   With `scopes` of `None` the token has no `ac`, so `BuildKit`
+///   refuses it at once: used when the proxy is not reachable from a
+///   builder container.
 ///
 /// # Errors
 ///
@@ -196,7 +190,7 @@ pub fn lifetime_secs(timeout_minutes: u32) -> u64 {
 pub fn runtime_token(
     run_id: &str,
     job_id: &str,
-    scopes: &[String],
+    scopes: Option<&[String]>,
     lifetime_secs: u64,
 ) -> Result<String> {
     // The scope is `Actions.Results:<run>:<job>`, split on `:` and
@@ -216,22 +210,27 @@ pub fn runtime_token(
         .duration_since(UNIX_EPOCH)
         .map_err(|err| anyhow!("the clock is before 1970: {err}"))?
         .as_secs();
-    let access: Vec<serde_json::Value> = scopes
-        .iter()
-        .enumerate()
-        .map(|(index, scope)| {
-            serde_json::json!({ "Scope": scope, "Permission": if index == 0 { 3 } else { 1 } })
-        })
-        .collect();
+    let access = scopes.map(|scopes| {
+        let list: Vec<serde_json::Value> = scopes
+            .iter()
+            .enumerate()
+            .map(|(index, scope)| {
+                serde_json::json!({ "Scope": scope, "Permission": if index == 0 { 3 } else { 1 } })
+            })
+            .collect();
+        serde_json::Value::Array(list).to_string()
+    });
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
-    let claims = serde_json::json!({
+    let mut claims = serde_json::json!({
         "iss": "hatchrun",
         "scp": format!("Actions.Results:{}:{}", part(run_id), part(job_id)),
-        "ac": serde_json::Value::Array(access).to_string(),
         // A little before now, for clock skew.
         "nbf": now.saturating_sub(300),
         "exp": now + lifetime_secs,
     });
+    if let Some(access) = access {
+        claims["ac"] = serde_json::Value::String(access);
+    }
     let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
     let mut filler = [0u8; 32];
     getrandom::fill(&mut filler).map_err(|err| anyhow!("random runtime token: {err}"))?;
@@ -385,7 +384,7 @@ mod tests {
     #[test]
     fn the_runtime_token_carries_the_toolkits_scope() {
         let scopes = vec!["refs/pull/4/merge".to_owned(), "refs/heads/main".to_owned()];
-        let token = runtime_token("12", "build job", &scopes, lifetime_secs(360)).unwrap();
+        let token = runtime_token("12", "build job", Some(&scopes), 360 * 60 + 1500).unwrap();
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
         let claims: serde_json::Value =
@@ -393,7 +392,7 @@ mod tests {
         assert_eq!(claims["scp"], "Actions.Results:12:build_job");
         assert_ne!(
             token,
-            runtime_token("12", "build job", &scopes, lifetime_secs(360)).unwrap()
+            runtime_token("12", "build job", Some(&scopes), 360 * 60 + 1500).unwrap()
         );
         // BuildKit reads a JSON list in a string, and a window around now.
         let access: serde_json::Value =
@@ -413,7 +412,7 @@ mod tests {
         let exp = claims["exp"].as_u64().unwrap();
         assert!(exp >= now + 360 * 60 + 1400 && exp <= now + 360 * 60 + 1600);
         // A single scope is read and write.
-        let one = runtime_token("1", "j", &["refs/heads/main".to_owned()], 60).unwrap();
+        let one = runtime_token("1", "j", Some(&["refs/heads/main".to_owned()]), 60).unwrap();
         let claims: serde_json::Value = serde_json::from_slice(
             &URL_SAFE_NO_PAD
                 .decode(one.split('.').nth(1).unwrap())
@@ -424,5 +423,15 @@ mod tests {
             serde_json::from_str(claims["ac"].as_str().unwrap()).unwrap();
         assert_eq!(access[0]["Permission"], 3);
         assert_eq!(access.as_array().unwrap().len(), 1);
+        // Without scopes the token has no access controls.
+        let plain = runtime_token("1", "j", None, 60).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(plain.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(claims.get("ac").is_none());
+        assert_eq!(claims["scp"], "Actions.Results:1:j");
     }
 }

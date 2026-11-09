@@ -154,13 +154,11 @@ pub struct CacheService {
     /// The refs a job restores from, in order. The first is the ref the
     /// job saves to. The agent names them in its runtime token, which
     /// `BuildKit` reads to build its index keys.
-    ///
-    /// The Worker deploys before the AMIs that carry a new agent, and an
-    /// agent also meets a Worker older than itself, so a document
-    /// without scopes is read as empty; the agent then uses the run's
-    /// ref alone.
-    #[serde(default)]
     pub scopes: Vec<String>,
+    /// How long the runtime token the agent makes lives, in seconds: the
+    /// job's timeout and the time to boot and wind down, as the job
+    /// token's.
+    pub token_lifetime_secs: u64,
 }
 
 impl fmt::Debug for CacheService {
@@ -169,6 +167,7 @@ impl fmt::Debug for CacheService {
             .field("url", &self.url)
             .field("token", &"[redacted]")
             .field("scopes", &self.scopes)
+            .field("token_lifetime_secs", &self.token_lifetime_secs)
             .finish()
     }
 }
@@ -205,6 +204,8 @@ pub struct ArtifactService {
     pub url: String,
     /// The bearer token.
     pub token: String,
+    /// How long the runtime token the agent makes lives, in seconds.
+    pub token_lifetime_secs: u64,
 }
 
 impl fmt::Debug for ArtifactService {
@@ -212,6 +213,7 @@ impl fmt::Debug for ArtifactService {
         f.debug_struct("ArtifactService")
             .field("url", &self.url)
             .field("token", &"[redacted]")
+            .field("token_lifetime_secs", &self.token_lifetime_secs)
             .finish()
     }
 }

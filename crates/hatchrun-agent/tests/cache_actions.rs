@@ -307,6 +307,7 @@ fn job(server: &MockServer, store: &Shared, scopes: &[&str], steps: Vec<PlannedS
         url: format!("{}/v1/agent/cache", server.uri()),
         token,
         scopes,
+        token_lifetime_secs: 3600,
     });
     serde_json::to_string(&doc).unwrap()
 }

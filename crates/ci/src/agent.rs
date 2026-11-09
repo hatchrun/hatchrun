@@ -386,6 +386,29 @@ async fn claim(
             c.got
         );
     }
+    // The cache scopes are fixed before the run object claims the job, so
+    // a failure here leaves nothing claimed. The token the agent builds
+    // from them and the cache service must agree for the whole attempt,
+    // whatever happens to the default branch meanwhile: the first claim
+    // of the attempt fixes them and a claim that overlaps it, or repeats
+    // it, gets the same list. A job without a cache service has none.
+    let scopes = if cache_service_enabled(settings, job_token) {
+        let wanted = crate::cache::read_scopes(
+            &run.git_ref,
+            run.base_ref.as_deref(),
+            Some(&repo.default_branch),
+        );
+        match store::set_cache_scopes(db, row.id, row.attempt, &wanted).await {
+            Ok(Some(scopes)) => scopes,
+            Ok(None) => return status(409),
+            Err(err) => {
+                console_error!("job {}: record cache scopes: {err}", row.id);
+                return retry();
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let body = json!({ "token": github_token, "capped": capped })
         .to_string()
         .into_bytes();
@@ -397,26 +420,9 @@ async fn claim(
     fill(&mut document, &secrets, vars);
     document.id_token =
         id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
-    document.artifacts = artifact_service(settings, job_token);
-    // The scopes are fixed here and kept with the job: the token the
-    // agent builds from them and the cache service must agree for the
-    // whole job, whatever happens to the default branch meanwhile.
-    let scopes = crate::cache::read_scopes(
-        &run.git_ref,
-        run.base_ref.as_deref(),
-        Some(&repo.default_branch),
-    );
-    // The first claim of the attempt fixes them: a claim that overlaps
-    // it, or repeats it, gets the same list.
-    let scopes = match store::set_cache_scopes(db, row.id, row.attempt, &scopes).await {
-        Ok(Some(scopes)) => scopes,
-        Ok(None) => return status(409),
-        Err(err) => {
-            console_error!("job {}: record cache scopes: {err}", row.id);
-            return retry();
-        }
-    };
-    document.cache = cache_service(settings, job_token, scopes);
+    let lifetime = token::lifetime_secs(row.timeout_minutes);
+    document.artifacts = artifact_service(settings, job_token, lifetime);
+    document.cache = cache_service(settings, job_token, scopes, lifetime);
     Response::from_json(&document)
 }
 
@@ -468,14 +474,25 @@ pub(crate) fn id_token_request(
 
 /// The artifact service a job gets: this Worker, with the job's own
 /// token. `None` while the artifacts bucket is not set up.
-pub(crate) fn artifact_service(settings: &Settings, job_token: &str) -> Option<ArtifactService> {
-    if settings.artifacts_bucket.is_empty() || job_token.is_empty() {
+pub(crate) fn artifact_service(
+    settings: &Settings,
+    job_token: &str,
+    token_lifetime_secs: u64,
+) -> Option<ArtifactService> {
+    if !cache_service_enabled(settings, job_token) {
         return None;
     }
     Some(ArtifactService {
         url: format!("{}{ARTIFACTS_PATH}", settings.ci_url),
         token: job_token.to_owned(),
+        token_lifetime_secs,
     })
+}
+
+/// Whether a job gets the artifact and cache services: the artifacts
+/// bucket is set up and the job has a token.
+fn cache_service_enabled(settings: &Settings, job_token: &str) -> bool {
+    !settings.artifacts_bucket.is_empty() && !job_token.is_empty()
 }
 
 /// The cache service a job gets: this Worker, with the job's own token.
@@ -485,14 +502,16 @@ pub(crate) fn cache_service(
     settings: &Settings,
     job_token: &str,
     scopes: Vec<String>,
+    token_lifetime_secs: u64,
 ) -> Option<CacheService> {
-    if settings.artifacts_bucket.is_empty() || job_token.is_empty() {
+    if !cache_service_enabled(settings, job_token) {
         return None;
     }
     Some(CacheService {
         url: format!("{}{CACHE_PATH}", settings.ci_url),
         token: job_token.to_owned(),
         scopes,
+        token_lifetime_secs,
     })
 }
 
@@ -787,22 +806,24 @@ mod tests {
 
     #[test]
     fn the_artifact_service_is_this_worker_with_the_job_token() {
-        let service = artifact_service(&settings("bucket"), "v1.a.b").unwrap();
+        let service = artifact_service(&settings("bucket"), "v1.a.b", 900).unwrap();
+        assert_eq!(service.token_lifetime_secs, 900);
         assert_eq!(service.url, "https://ci.example/v1/agent/artifacts");
         assert_eq!(service.token, "v1.a.b");
-        assert!(artifact_service(&settings(""), "v1.a.b").is_none());
-        assert!(artifact_service(&settings("bucket"), "").is_none());
+        assert!(artifact_service(&settings(""), "v1.a.b", 900).is_none());
+        assert!(artifact_service(&settings("bucket"), "", 900).is_none());
     }
 
     #[test]
     fn the_cache_service_is_this_worker_with_the_job_token() {
         let scopes = vec!["refs/heads/topic".to_owned(), "refs/heads/main".to_owned()];
-        let service = cache_service(&settings("bucket"), "v1.a.b", scopes.clone()).unwrap();
+        let service = cache_service(&settings("bucket"), "v1.a.b", scopes.clone(), 900).unwrap();
+        assert_eq!(service.token_lifetime_secs, 900);
         assert_eq!(service.url, "https://ci.example/v1/agent/cache");
         assert_eq!(service.token, "v1.a.b");
         assert_eq!(service.scopes, scopes);
-        assert!(cache_service(&settings(""), "v1.a.b", Vec::new()).is_none());
-        assert!(cache_service(&settings("bucket"), "", Vec::new()).is_none());
+        assert!(cache_service(&settings(""), "v1.a.b", Vec::new(), 900).is_none());
+        assert!(cache_service(&settings("bucket"), "", Vec::new(), 900).is_none());
     }
     use super::*;
 

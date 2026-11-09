@@ -121,10 +121,11 @@ pub struct Identity {
     /// The job's id, which the artifact toolkit reads.
     pub job_id: String,
     /// The cache scopes: the first is the one the job saves to. `BuildKit`
-    /// reads them as the token's access controls.
-    pub scopes: Vec<String>,
-    /// The job's `timeout-minutes`, which the token outlives.
-    pub timeout_minutes: u32,
+    /// reads them as the token's access controls. `None` leaves them out
+    /// of the token, so `BuildKit` refuses it.
+    pub scopes: Option<Vec<String>>,
+    /// How long the token lives, in seconds.
+    pub lifetime_secs: u64,
 }
 
 /// The artifact service of a job.
@@ -254,8 +255,8 @@ impl Proxy {
             identity: Identity {
                 run_id: "1".into(),
                 job_id: "build".into(),
-                scopes: vec!["refs/heads/main".into()],
-                timeout_minutes: 10,
+                scopes: Some(vec!["refs/heads/main".into()]),
+                lifetime_secs: 2100,
             },
         };
         Self::start_with(services, addr, results).await
@@ -267,8 +268,8 @@ impl Proxy {
         let runtime_token = artifact_twirp::runtime_token(
             &identity.run_id,
             &identity.job_id,
-            &identity.scopes,
-            artifact_twirp::lifetime_secs(identity.timeout_minutes),
+            identity.scopes.as_deref(),
+            identity.lifetime_secs,
         )?;
         let artifacts = services
             .artifacts

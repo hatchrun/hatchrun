@@ -75,44 +75,57 @@ impl Job<'_> {
         {
             self.masker.add(&token);
         }
-        // A Worker older than this agent sends no scopes: the run's ref
-        // is then the only one.
+        // The cache scopes go into the runtime token for `BuildKit`. A job
+        // with no cache has none, and a token without them makes
+        // `BuildKit` refuse it.
         let scopes = self
             .doc
             .cache
             .as_ref()
-            .map(|service| service.scopes.clone())
-            .filter(|scopes| !scopes.is_empty())
-            .unwrap_or_else(|| vec![self.doc.github.ref_.clone()]);
-        let identity = Identity {
-            run_id: self.doc.run_id.clone(),
-            job_id: self.doc.job.id.clone(),
-            scopes,
-            timeout_minutes: self.doc.job.timeout_minutes,
+            .map(|service| service.scopes.clone());
+        let lifetime_secs = self
+            .doc
+            .cache
+            .as_ref()
+            .map(|service| service.token_lifetime_secs)
+            .or_else(|| {
+                self.doc
+                    .artifacts
+                    .as_ref()
+                    .map(|service| service.token_lifetime_secs)
+            })
+            .unwrap_or_default();
+        // `BuildKit` runs in a container, which reaches the proxy only
+        // when it listens on the bridge: on the loopback the token
+        // leaves the scopes out, and `type=gha` fails at once.
+        let services = |reachable: bool| Services {
+            cache: cache.clone(),
+            artifacts: artifacts.clone(),
+            identity: Identity {
+                run_id: self.doc.run_id.clone(),
+                job_id: self.doc.job.id.clone(),
+                scopes: scopes.clone().filter(|_| reachable),
+                lifetime_secs,
+            },
         };
-        let services = Services {
-            cache,
-            artifacts,
-            identity,
-        };
-        let ip = self.proxy_bind().await;
+        let (ip, mut loopback_reason) = self.proxy_bind().await;
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let mut fell_back = false;
-        let started = match Proxy::start_services(services.clone(), ip).await {
+        let mut bound = ip;
+        let started = match Proxy::start_services(services(ip != loopback), ip).await {
             // The bridge gateway can be an address this machine does not
-            // have yet; the loopback still serves the host's steps, but
-            // no container reaches it.
+            // have yet; the loopback still serves the host's steps.
             Err(err) if ip != loopback => {
                 warn!(%ip, "cache proxy: cannot listen, trying the loopback: {err:#}");
-                fell_back = true;
-                Proxy::start_services(services, loopback).await
+                loopback_reason = Some(format!("it cannot listen on {ip}: {err:#}"));
+                bound = loopback;
+                Proxy::start_services(services(false), loopback).await
             }
             other => other,
         };
         let proxy = match started {
             Ok(proxy) => proxy,
             Err(err) => {
-                warn!(%ip, "cache proxy: cannot listen: {err:#}");
+                warn!(addr = %bound, "cache proxy: cannot listen: {err:#}");
                 self.cache_unavailable(sink, &err);
                 return None;
             }
@@ -126,11 +139,9 @@ impl Job<'_> {
             proxy.stop().await;
             return None;
         }
-        self.cache_unreachable = fell_back || ip == loopback;
-        if fell_back {
-            let message = "The cache proxy listens on the loopback only: steps in containers and \
-                           BuildKit builders cannot use the cache or the artifact service.";
-            self.say(sink, Line::Warning(message));
+        self.cache_unreachable = loopback_reason.is_some();
+        if let Some(reason) = loopback_reason {
+            self.warn_loopback(sink, &reason);
         }
         let token = proxy.runtime_token().to_owned();
         self.masker.add(&token);
@@ -154,9 +165,9 @@ impl Job<'_> {
     /// Where the proxy listens: the address of Docker's default bridge
     /// when Docker answers, so a `BuildKit` container (which cannot reach
     /// the machine's loopback) and job containers can use it, and the
-    /// loopback otherwise. Only the host and the containers on its
-    /// bridges can connect.
-    async fn proxy_bind(&mut self) -> IpAddr {
+    /// loopback otherwise, with the reason Docker gave no address. Only
+    /// the host and the containers on its bridges can connect.
+    async fn proxy_bind(&mut self) -> (IpAddr, Option<String>) {
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let args = [
             "network".to_owned(),
@@ -166,9 +177,37 @@ impl Job<'_> {
             "{{(index .IPAM.Config 0).Gateway}}".to_owned(),
         ];
         match self.docker_capture(&args, None).await {
-            Ok(out) if out.code == 0 => out.stdout.trim().parse().unwrap_or(loopback),
-            _ => loopback,
+            Ok(out) if out.code == 0 => match out.stdout.trim().parse() {
+                Ok(ip) => (ip, None),
+                Err(_) => (
+                    loopback,
+                    Some(format!(
+                        "docker network inspect bridge printed no gateway address, but {:?}",
+                        out.stdout.trim()
+                    )),
+                ),
+            },
+            Ok(out) => (
+                loopback,
+                Some(format!(
+                    "docker network inspect bridge exited with {}",
+                    out.code
+                )),
+            ),
+            Err(err) => (loopback, Some(format!("docker is not available: {err}"))),
         }
+    }
+
+    /// Says that the proxy listens on the loopback only, and what that
+    /// costs.
+    fn warn_loopback(&mut self, sink: &mut dyn Sink, reason: &str) {
+        let message = format!(
+            "The cache proxy listens on the loopback only ({reason}): steps in containers \
+             and BuildKit builders (docker buildx with type=gha) cannot use the cache or \
+             the artifact service. Steps on the host still can."
+        );
+        warn!("{message}");
+        self.say(sink, Line::Warning(&message));
     }
 
     fn cache_unavailable(&mut self, sink: &mut dyn Sink, err: &anyhow::Error) {

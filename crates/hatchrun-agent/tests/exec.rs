@@ -2328,6 +2328,7 @@ async fn cache_service_starts_the_proxy() {
         url: format!("{}/v1/cache", server.uri()),
         token: "cache-service-token".to_owned(),
         scopes: vec!["refs/heads/main".to_owned()],
+        token_lifetime_secs: 3600,
     });
     let with_cache = json(&doc);
     doc.cache = None;

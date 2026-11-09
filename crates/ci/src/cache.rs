@@ -171,7 +171,13 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
     let run = store::run(&db, job.run_id)
         .await?
         .ok_or_else(|| Refusal::new(410, JOB_ENDED))?;
-    let scopes = job_scopes(&db, &job, &run).await?;
+    // The list the job's claim fixed. A job claimed before it was kept
+    // has none, and no cache.
+    let scopes = job
+        .cache_scopes
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .unwrap_or_default();
     let ctx = Context {
         settings,
         db,
@@ -189,32 +195,6 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
     }
 }
 
-/// The scopes `job` reads: the list its claim stored, which its token's
-/// access controls name too. A job claimed before they were stored gets
-/// the list worked out now.
-async fn job_scopes(
-    db: &Db,
-    job: &store::JobRow,
-    run: &RunRow,
-) -> std::result::Result<Vec<String>, Refusal> {
-    let stored = job
-        .cache_scopes
-        .as_deref()
-        .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
-        .filter(|scopes| !scopes.is_empty());
-    if let Some(scopes) = stored {
-        return Ok(scopes);
-    }
-    let default_branch = store::repo(db, run.repo_id)
-        .await?
-        .map(|repo| repo.default_branch);
-    Ok(read_scopes(
-        &run.git_ref,
-        run.base_ref.as_deref(),
-        default_branch.as_deref(),
-    ))
-}
-
 fn id_of(id: &str) -> std::result::Result<u64, Refusal> {
     id.parse().map_err(|_| Refusal::new(404, "no such upload"))
 }
@@ -224,8 +204,15 @@ fn check_entry(version: &str, key: &str) -> std::result::Result<(), Refusal> {
     check_key(key).map_err(|err| Refusal::new(400, err))
 }
 
+/// What a job with no scopes is told: it has no cache.
+const NO_SCOPES: &str = "the job has no cache scopes";
+
 async fn lookup(ctx: &Context<'_>, request: LookupRequest) -> Answer {
     check_entry(&request.version, &request.key)?;
+    if ctx.scopes.is_empty() {
+        // A miss, as for any entry that is not there.
+        return Err(Refusal::new(404, "no entry"));
+    }
     if request.restore_keys.len() > MAX_RESTORE_KEYS {
         return Err(Refusal::new(
             400,
@@ -273,6 +260,9 @@ async fn lookup(ctx: &Context<'_>, request: LookupRequest) -> Answer {
 
 async fn start(ctx: &Context<'_>, request: UploadRequest) -> Answer {
     check_entry(&request.version, &request.key)?;
+    if ctx.scopes.is_empty() {
+        return Err(Refusal::new(503, NO_SCOPES));
+    }
     // Saves the upload when the entry exists; finalizing still settles
     // a race between two jobs.
     if store::cache_entry(&ctx.db, ctx.owner(), &request.version, &request.key)
