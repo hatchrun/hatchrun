@@ -13,7 +13,7 @@
 //! the toolkit's `fromJson` reads, with int64 as strings and times as
 //! RFC 3339.
 
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use base64::Engine;
@@ -166,15 +166,22 @@ pub fn timestamp(millis: u64) -> String {
     humantime::format_rfc3339_millis(UNIX_EPOCH + Duration::from_millis(millis)).to_string()
 }
 
-/// The `ACTIONS_RUNTIME_TOKEN` of a job: an unsigned-looking JWT whose
-/// `scp` claim has the run and job the toolkit reads as its backend
-/// ids. The toolkit does not check the signature, so the last part is
-/// random filler; the proxy checks the whole token on every call.
+/// The `ACTIONS_RUNTIME_TOKEN` of a job: a JWT the toolkits read and
+/// never verify, so the signature is random filler; the proxy checks
+/// the whole token on every artifact call.
+///
+/// - The artifact toolkit reads the run and job from the `scp` claim,
+///   `Actions.Results:<run>:<job>`.
+/// - `BuildKit`'s `type=gha` backend (go-actions-cache) refuses a token
+///   without `nbf`, `exp` and `ac`, a string holding a JSON list of
+///   `{Scope, Permission}` (1 read, 2 write). It writes to the scope with
+///   write permission and reads each scope it may read, as GitHub issues
+///   them: the first of `scopes` is read and write, the others read.
 ///
 /// # Errors
 ///
 /// When the system has no randomness.
-pub fn runtime_token(run_id: &str, job_id: &str) -> Result<String> {
+pub fn runtime_token(run_id: &str, job_id: &str, scopes: &[String]) -> Result<String> {
     // The scope is `Actions.Results:<run>:<job>`, split on `:` and
     // spaces by the toolkit.
     let part = |text: &str| -> String {
@@ -188,13 +195,27 @@ pub fn runtime_token(run_id: &str, job_id: &str) -> Result<String> {
             })
             .collect()
     };
-    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let access: Vec<serde_json::Value> = scopes
+        .iter()
+        .enumerate()
+        .map(|(index, scope)| {
+            serde_json::json!({ "Scope": scope, "Permission": if index == 0 { 3 } else { 1 } })
+        })
+        .collect();
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
     let claims = serde_json::json!({
         "iss": "hatchrun",
         "scp": format!("Actions.Results:{}:{}", part(run_id), part(job_id)),
+        "ac": serde_json::Value::Array(access).to_string(),
+        // A little before now for clock skew, and past any job's timeout.
+        "nbf": now.saturating_sub(300),
+        "exp": now + 2 * 86_400,
     });
     let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
-    let mut filler = [0u8; 24];
+    let mut filler = [0u8; 32];
     getrandom::fill(&mut filler).map_err(|err| anyhow!("random runtime token: {err}"))?;
     Ok(format!(
         "{header}.{payload}.{}",
@@ -345,12 +366,29 @@ mod tests {
 
     #[test]
     fn the_runtime_token_carries_the_toolkits_scope() {
-        let token = runtime_token("12", "build job").unwrap();
+        let scopes = vec!["refs/pull/4/merge".to_owned(), "refs/heads/main".to_owned()];
+        let token = runtime_token("12", "build job", &scopes).unwrap();
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
         let claims: serde_json::Value =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
         assert_eq!(claims["scp"], "Actions.Results:12:build_job");
-        assert_ne!(token, runtime_token("12", "build job").unwrap());
+        assert_ne!(token, runtime_token("12", "build job", &scopes).unwrap());
+        // BuildKit reads a JSON list in a string, and a window around now.
+        let access: serde_json::Value =
+            serde_json::from_str(claims["ac"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            access,
+            serde_json::json!([
+                { "Scope": "refs/pull/4/merge", "Permission": 3 },
+                { "Scope": "refs/heads/main", "Permission": 1 },
+            ])
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(claims["nbf"].as_u64().unwrap() < now);
+        assert!(claims["exp"].as_u64().unwrap() > now + 86_400);
     }
 }

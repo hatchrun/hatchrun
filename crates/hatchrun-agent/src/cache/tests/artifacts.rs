@@ -18,9 +18,12 @@ async fn artifact_proxy(server: &MockServer) -> Proxy {
                     url: format!("{}/v1/agent/artifacts", server.uri()),
                     token: "job.token".into(),
                 },
+            }),
+            identity: Identity {
                 run_id: "12".into(),
                 job_id: "build".into(),
-            }),
+                scopes: vec!["refs/heads/main".into()],
+            },
         },
         SocketAddr::from(([127, 0, 0, 1], 0)),
         &server.uri(),
@@ -30,7 +33,7 @@ async fn artifact_proxy(server: &MockServer) -> Proxy {
 }
 
 async fn artifact_rpc(proxy: &Proxy, name: &str, body: Value) -> (u16, Value) {
-    let token = proxy.runtime_token().unwrap();
+    let token = proxy.runtime_token();
     let response = reqwest::Client::new()
         .post(format!("{}{ARTIFACT_RPC}{name}", proxy.url()))
         .header("Authorization", format!("Bearer {token}"))
@@ -324,7 +327,7 @@ async fn artifact_calls_need_the_runtime_token() {
 async fn the_runtime_token_names_the_run_and_job() {
     let server = control_plane().await;
     let proxy = artifact_proxy(&server).await;
-    let token = proxy.runtime_token().unwrap();
+    let token = proxy.runtime_token();
     let payload = token.split('.').nth(1).unwrap();
     let claims: Value = serde_json::from_slice(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD

@@ -398,7 +398,12 @@ async fn claim(
     document.id_token =
         id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
     document.artifacts = artifact_service(settings, job_token);
-    document.cache = cache_service(settings, job_token);
+    let scopes = crate::cache::read_scopes(
+        &run.git_ref,
+        run.base_ref.as_deref(),
+        Some(&repo.default_branch),
+    );
+    document.cache = cache_service(settings, job_token, scopes);
     Response::from_json(&document)
 }
 
@@ -463,13 +468,18 @@ pub(crate) fn artifact_service(settings: &Settings, job_token: &str) -> Option<A
 /// The cache service a job gets: this Worker, with the job's own token.
 /// `None` while the artifacts bucket, which holds the entries, is not
 /// set up.
-pub(crate) fn cache_service(settings: &Settings, job_token: &str) -> Option<CacheService> {
+pub(crate) fn cache_service(
+    settings: &Settings,
+    job_token: &str,
+    scopes: Vec<String>,
+) -> Option<CacheService> {
     if settings.artifacts_bucket.is_empty() || job_token.is_empty() {
         return None;
     }
     Some(CacheService {
         url: format!("{}{CACHE_PATH}", settings.ci_url),
         token: job_token.to_owned(),
+        scopes,
     })
 }
 
@@ -773,11 +783,13 @@ mod tests {
 
     #[test]
     fn the_cache_service_is_this_worker_with_the_job_token() {
-        let service = cache_service(&settings("bucket"), "v1.a.b").unwrap();
+        let scopes = vec!["refs/heads/topic".to_owned(), "refs/heads/main".to_owned()];
+        let service = cache_service(&settings("bucket"), "v1.a.b", scopes.clone()).unwrap();
         assert_eq!(service.url, "https://ci.example/v1/agent/cache");
         assert_eq!(service.token, "v1.a.b");
-        assert!(cache_service(&settings(""), "v1.a.b").is_none());
-        assert!(cache_service(&settings("bucket"), "").is_none());
+        assert_eq!(service.scopes, scopes);
+        assert!(cache_service(&settings(""), "v1.a.b", Vec::new()).is_none());
+        assert!(cache_service(&settings("bucket"), "", Vec::new()).is_none());
     }
     use super::*;
 

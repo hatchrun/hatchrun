@@ -151,6 +151,10 @@ pub struct CacheService {
     pub url: String,
     /// The bearer token.
     pub token: String,
+    /// The refs a job restores from, in order. The first is the ref the
+    /// job saves to. The agent names them in its runtime token, which
+    /// `BuildKit` reads to build its index keys.
+    pub scopes: Vec<String>,
 }
 
 impl fmt::Debug for CacheService {
@@ -158,6 +162,7 @@ impl fmt::Debug for CacheService {
         f.debug_struct("CacheService")
             .field("url", &self.url)
             .field("token", &"[redacted]")
+            .field("scopes", &self.scopes)
             .finish()
     }
 }

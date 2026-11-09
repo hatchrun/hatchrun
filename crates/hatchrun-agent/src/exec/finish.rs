@@ -17,7 +17,7 @@ use tracing::warn;
 use super::context::Runtime;
 use super::sink::Sink;
 use super::{GRACE_MINUTES, Job, Line, interp};
-use crate::cache::{ArtifactConfig, Proxy, Services};
+use crate::cache::{ArtifactConfig, Identity, Proxy, Services};
 use crate::source;
 
 /// Most outputs a job reports.
@@ -66,8 +66,6 @@ impl Job<'_> {
                 url: service.url.clone(),
                 token: service.token.clone(),
             },
-            run_id: self.doc.run_id.clone(),
-            job_id: self.doc.job.id.clone(),
         });
         for token in cache
             .iter()
@@ -77,7 +75,20 @@ impl Job<'_> {
         {
             self.masker.add(&token);
         }
-        let services = Services { cache, artifacts };
+        let scopes = match &self.doc.cache {
+            Some(service) if !service.scopes.is_empty() => service.scopes.clone(),
+            _ => vec![self.doc.github.ref_.clone()],
+        };
+        let identity = Identity {
+            run_id: self.doc.run_id.clone(),
+            job_id: self.doc.job.id.clone(),
+            scopes,
+        };
+        let services = Services {
+            cache,
+            artifacts,
+            identity,
+        };
         let ip = self.proxy_bind().await;
         let proxy = match Proxy::start_services(services, ip).await {
             Ok(proxy) => proxy,
@@ -91,17 +102,7 @@ impl Job<'_> {
             proxy.stop().await;
             return None;
         }
-        let token = match proxy.runtime_token().map(str::to_owned) {
-            Some(token) => token,
-            None => match super::random_name() {
-                Ok(token) => token,
-                Err(message) => {
-                    self.cache_unavailable(sink, &anyhow::anyhow!(message));
-                    proxy.stop().await;
-                    return None;
-                }
-            },
-        };
+        let token = proxy.runtime_token().to_owned();
         self.masker.add(&token);
         // `docker buildx` with `type=gha` reads these three, and the
         // v1 URL too, when it checks that a cache is configured.

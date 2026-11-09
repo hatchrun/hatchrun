@@ -2327,6 +2327,7 @@ async fn cache_service_starts_the_proxy() {
     doc.cache = Some(hatchrun_workflow::CacheService {
         url: format!("{}/v1/cache", server.uri()),
         token: "cache-service-token".to_owned(),
+        scopes: vec!["refs/heads/main".to_owned()],
     });
     let with_cache = json(&doc);
     doc.cache = None;
