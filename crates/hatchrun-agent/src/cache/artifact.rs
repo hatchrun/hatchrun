@@ -28,7 +28,7 @@ use super::artifact_twirp::{
     self as twirp, CreateRequest, CreateResponse, DeleteResponse, FinalizeRequest,
     FinalizeResponse, ListRequest, ListResponse, Listed, NamedRequest, Rpc, UrlResponse,
 };
-use super::cloud::{Cloud, JobEnded, Part, answer};
+use super::cloud::{Cloud, Part, answer};
 use super::rpc::{abandon, body, malformed};
 use super::{
     Artifacts, DOWNLOAD_PATH, Download, Reply, State, UPLOAD_PATH, Upload, UploadState,
@@ -199,10 +199,7 @@ async fn finalize(state: &State, request: FinalizeRequest) -> Reply {
         Err(err) => {
             warn!(name = request.name, "artifact save failed: {err:#}");
             abandon(&upload).await;
-            if err.downcast_ref::<JobEnded>().is_some() {
-                return refusal(&err);
-            }
-            refuse()
+            refusal(&err)
         }
     }
 }

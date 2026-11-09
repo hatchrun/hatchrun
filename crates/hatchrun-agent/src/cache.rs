@@ -580,14 +580,7 @@ fn json(value: &impl Serialize) -> Reply {
 /// and its `Retry-After`.
 fn refusal(err: &anyhow::Error) -> Reply {
     let (code, retry_after) = twirp::code_for(err);
-    // A job that is not running any more is told so in the same words
-    // whatever it was doing.
-    let message = if err.downcast_ref::<cloud::JobEnded>().is_some() {
-        "the job is no longer running, so its cache and artifacts cannot change".to_owned()
-    } else {
-        format!("{err:#}")
-    };
-    let mut reply = twirp_error(twirp::http_status(code), code, message);
+    let mut reply = twirp_error(twirp::http_status(code), code, format!("{err:#}"));
     if let Some(value) = retry_after.and_then(|v| HeaderValue::from_str(&v).ok()) {
         reply.headers_mut().insert(header::RETRY_AFTER, value);
     }

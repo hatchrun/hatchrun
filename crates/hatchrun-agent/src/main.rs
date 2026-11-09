@@ -159,7 +159,8 @@ enum SplitBy {
 /// A command or path that is not empty: `--docker ""` is a mistake to
 /// refuse at startup, not a Docker to look for on every job.
 fn non_empty_path(value: &str) -> Result<PathBuf, String> {
-    if value.trim().is_empty() {
+    let value = value.trim();
+    if value.is_empty() {
         Err("the value is empty".to_owned())
     } else {
         Ok(PathBuf::from(value))
@@ -438,6 +439,7 @@ mod tests {
         assert!(non_empty_path("").is_err());
         assert!(non_empty_path("  ").is_err());
         assert_eq!(non_empty_path("podman"), Ok(PathBuf::from("podman")));
+        assert_eq!(non_empty_path(" podman "), Ok(PathBuf::from("podman")));
         assert!(
             Args::try_parse_from(["hatchrun-agent", "exec", "job.json", "--docker", ""]).is_err()
         );

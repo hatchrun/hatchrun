@@ -226,7 +226,8 @@ pub fn runtime_token(
     let mut claims = serde_json::json!({
         "iss": "hatchrun",
         "scp": format!("Actions.Results:{}:{}", part(run_id), part(job_id)),
-        "nbf": now,
+        // A little before now, for clock skew.
+        "nbf": now.saturating_sub(300),
         "exp": now.saturating_add(expires_in),
     });
     if let Some(access) = access {
@@ -410,11 +411,12 @@ mod tests {
                 { "Scope": "refs/heads/main", "Permission": 1 },
             ])
         );
-        // The window is this machine's now and `expires` seconds on.
+        // The window starts a little before this machine's now, and ends
+        // `expires` seconds after it.
         let nbf = claims["nbf"].as_u64().unwrap();
         let exp = claims["exp"].as_u64().unwrap();
-        assert!(nbf >= now && nbf <= now + 5);
-        assert_eq!(exp, nbf + expires);
+        assert!(nbf + 300 >= now && nbf + 300 <= now + 5);
+        assert!(exp >= now + expires && exp <= now + expires + 5);
         // With nothing left the token is short-lived, not an error.
         assert!(runtime_token("1", "j", None, 0).is_ok());
         // A single scope is read and write.

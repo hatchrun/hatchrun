@@ -260,7 +260,7 @@ pub(super) struct JobEnded;
 
 impl std::fmt::Display for JobEnded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the job is not running")
+        f.write_str("the job has ended; its cache and artifacts are closed")
     }
 }
 
