@@ -271,6 +271,43 @@ async fn group_open(env: &Env, db: &Db, job: &JobRow, now: u64) -> Result<bool, 
     }
 }
 
+/// Checks the environment the job names against its run: whether it
+/// exists, allows the run's ref and trust, and has its approval. A
+/// `false` means the job was held or ended and nothing is left to do.
+async fn environment_open(
+    env: &Env,
+    db: &Db,
+    settings: &Settings,
+    job: &JobRow,
+    now: u64,
+) -> Result<bool, String> {
+    let Some(asked) = job.environment.as_deref() else {
+        return Ok(true);
+    };
+    let Some(found) = store::job_environment(db, job.id)
+        .await
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(false);
+    };
+    match environments::gate(
+        asked,
+        &found,
+        environments::decision(job),
+        &settings.app_url,
+    ) {
+        Gate::Pass => Ok(true),
+        Gate::Fail(message) => {
+            end_job(env, db, job, &message).await?;
+            Ok(false)
+        }
+        Gate::Approval(message) => {
+            hold_job(env, db, job, "approval", &message, now).await?;
+            Ok(false)
+        }
+    }
+}
+
 /// Holds a job whose matrix already has `max_parallel` legs in flight.
 async fn hold_capped(
     env: &Env,
@@ -307,26 +344,8 @@ async fn launch(
         Delivery::Launch | Delivery::GiveUp => {}
     }
     let now = now_ms();
-    if delivery == Delivery::Launch && job.environment.is_some() {
-        let Some(found) = store::job_environment(&db, job.id)
-            .await
-            .map_err(|err| err.to_string())?
-        else {
-            return Ok(());
-        };
-        let asked = job.environment.as_deref().unwrap_or_default();
-        match environments::gate(
-            asked,
-            &found,
-            environments::decision(&job),
-            &settings.app_url,
-        ) {
-            Gate::Pass => {}
-            Gate::Fail(message) => return end_job(env, &db, &job, &message).await,
-            Gate::Approval(message) => {
-                return hold_job(env, &db, &job, "approval", &message, now).await;
-            }
-        }
+    if delivery == Delivery::Launch && !environment_open(env, &db, settings, &job, now).await? {
+        return Ok(());
     }
     if delivery == Delivery::Launch && !group_open(env, &db, &job, now).await? {
         return Ok(());
@@ -359,6 +378,7 @@ async fn launch(
         &standing.tenant_id,
         max_running,
         delivery != Delivery::GiveUp,
+        None,
         now,
     )
     .await
@@ -370,6 +390,9 @@ async fn launch(
         }
         Claim::Capped { max_parallel } => {
             return hold_capped(env, &db, &job, max_parallel, now).await;
+        }
+        Claim::ForkLimit => {
+            return hold_job(env, &db, &job, FORK_LIMIT_HOLD, FORK_LIMIT_MESSAGE, now).await;
         }
         Claim::Gone => return Ok(()),
     };
@@ -487,6 +510,15 @@ pub(crate) async fn wake_group(env: &Env, db: &Db, job_id: u64) {
         console_error!("job {job_id}: wake the held job of its matrix: {err}");
     }
 }
+
+/// The word `ci_jobs.held` stores for a job of a fork run whose
+/// repository already runs the most fork jobs its policy allows.
+pub const FORK_LIMIT_HOLD: &str = "fork_limit";
+
+/// What the check run tells the user about a fork job over the
+/// repository's limit.
+const FORK_LIMIT_MESSAGE: &str = "Waiting: this repository already runs the most jobs from fork \
+     pull requests its policy allows. This job starts when one of them ends.";
 
 /// The word `ci_jobs.held` stores for a job over its matrix's
 /// `max-parallel`.

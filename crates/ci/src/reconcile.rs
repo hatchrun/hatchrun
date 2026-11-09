@@ -781,6 +781,7 @@ async fn start(
             head_ref: "",
             base_ref: "",
             workflow: Some(&fire.workflow),
+            origin: runs::Origin::own("schedule"),
         },
         &head.config,
         now,

@@ -111,6 +111,7 @@ impl Context<'_> {
     /// Where the run writes, and where a call to an upload looks.
     fn owner(&self) -> CacheOwner<'_> {
         CacheOwner {
+            trust: self.run.trust,
             tenant_id: &self.run.tenant_id,
             repo_id: self.run.repo_id,
             scope: &self.run.git_ref,

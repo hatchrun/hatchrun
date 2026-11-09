@@ -933,7 +933,8 @@ mod tests {
             "repo_id": repo, "workflow": "ci.yml", "delivery": "d", "event": "push",
             "git_ref": "refs/heads/main", "sha": "abc", "actor": "a",
             "status": "queued", "conclusion": null, "created_at": 0, "completed_at": null,
-            "retention_days": 30
+            "retention_days": 30, "trust": "trusted", "author_login": "a",
+            "author_association": "", "gate_status": "none"
         }))
         .expect("a run row")
     }

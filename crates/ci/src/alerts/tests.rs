@@ -822,9 +822,10 @@ fn failed_job(db: &Db) {
     );
     db.run(
         "INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, \
-         sha, actor, status, created_at, updated_at, expires_at) \
+         sha, actor, status, created_at, updated_at, expires_at, trust, author_login, \
+         author_association, gate, gate_status) \
          VALUES ('t1', 7, 'ci.yml', 1, 'd1', 'push', 'refs/heads/main', 'abc', 'me', \
-         'completed', 0, 0, 0)",
+         'completed', 0, 0, 0, 'trusted', 'me', '', 'none', 'none')",
         &[],
     );
     db.run(

@@ -153,6 +153,7 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         Trigger::MergeGroup(g) => (g.installation_id, &g.repo),
         Trigger::RepositoryDispatch(d) => (d.installation_id, &d.repo),
         Trigger::Rerequested(r) => (r.installation_id, &r.repo),
+        Trigger::ApproveFork(a) => (a.installation_id, &a.repo),
         Trigger::Repository(r) => (r.installation_id, &r.repo),
     };
     let found = store::tenant_for_installation(&db, installation_id).await?;
@@ -361,6 +362,7 @@ impl Cx<'_> {
             Trigger::MergeGroup(group) => self.merge_group(group).await?,
             Trigger::RepositoryDispatch(dispatch) => self.repository_dispatch(dispatch).await?,
             Trigger::Rerequested(rerun) => self.rerun(rerun).await?,
+            Trigger::ApproveFork(_) => Outcome::Ignored("fork approvals are not handled".into()),
             // The row was updated before, with the tenant's other
             // repository writes; nothing runs.
             Trigger::Repository(_) => Outcome::Done(Vec::new()),
@@ -402,6 +404,7 @@ impl Cx<'_> {
                 head_ref: "",
                 base_ref: "",
                 workflow: None,
+                origin: runs::Origin::own(&push.actor),
             },
             &config,
             self.now,
@@ -426,6 +429,9 @@ impl Cx<'_> {
     }
 
     async fn pull_request(&self, pr: &PullRequest) -> Result<Outcome> {
+        if pr.fork.is_some() {
+            return Ok(Outcome::Ignored("pull request from a fork".to_owned()));
+        }
         // Every action carries the pull request as it stands, and a run
         // of any of them (`labeled` included) needs its row, so all are
         // recorded. The time is GitHub's, so a late delivery cannot
@@ -439,6 +445,11 @@ impl Cx<'_> {
                 head_ref: pr.head_ref.clone(),
                 base_ref: pr.base_ref.clone(),
                 author: pr.author.clone(),
+                author_association: pr.author_association.clone(),
+                head_repo_id: pr
+                    .fork
+                    .as_ref()
+                    .map_or(Some(pr.repo.id), |f| f.head_repo_id),
                 state: pr.state.to_owned(),
                 updated_at: pr.updated_at,
             },
@@ -508,6 +519,7 @@ impl Cx<'_> {
                 head_ref: &pr.head_ref,
                 base_ref: &pr.base_ref,
                 workflow: None,
+                origin: runs::Origin::own(&pr.actor),
             },
             &config,
             self.now,
@@ -615,6 +627,7 @@ impl Cx<'_> {
                 head_ref: "",
                 base_ref: "",
                 workflow: None,
+                origin: runs::Origin::own(fired.actor),
             },
             config,
             self.now,

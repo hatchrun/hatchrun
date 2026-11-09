@@ -29,6 +29,10 @@ pub struct NewPull {
     pub base_ref: String,
     /// The login of the user who opened it.
     pub author: String,
+    /// GitHub's `author_association` of the user who opened it.
+    pub author_association: String,
+    /// The repository the head is in; `None` for a deleted fork.
+    pub head_repo_id: Option<u64>,
     /// `open`, `closed` or `merged`.
     pub state: String,
     /// When GitHub last changed the pull request, in Unix milliseconds.
@@ -38,12 +42,15 @@ pub struct NewPull {
 
 /// Records pull request `$2` of repository `$1` as it stands: title
 /// `$3`, head `$4`, base `$5`, author `$6`, state `$7`, as of GitHub's
-/// time `$8`. A delivery older than the row leaves it alone.
+/// time `$8`, the author's association `$9` and the head repository
+/// `$10`. A delivery older than the row leaves it alone.
 const UPSERT_PULL: &str = "INSERT INTO ci_pulls \
-     (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) \
+     (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at, \
+      author_association, head_repo_id) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10::bigint) \
      ON CONFLICT (repo_id, number) DO UPDATE SET title = $3, head_ref = $4, base_ref = $5, \
-     author = $6, state = $7, updated_at = $8 WHERE ci_pulls.updated_at <= $8";
+     author = $6, state = $7, updated_at = $8, author_association = $9, \
+     head_repo_id = $10::bigint WHERE ci_pulls.updated_at <= $8";
 
 /// Records the state of a pull request.
 ///
@@ -61,7 +68,9 @@ pub async fn upsert_pull(db: &Db, pull: &NewPull) -> Result<()> {
             &pull.base_ref,
             &pull.author,
             &pull.state,
-            pull.updated_at
+            pull.updated_at,
+            &pull.author_association,
+            pull.head_repo_id
         ],
     )
     .await?;

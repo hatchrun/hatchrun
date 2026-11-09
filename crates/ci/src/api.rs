@@ -1497,6 +1497,7 @@ impl Cx<'_> {
                 head_ref: "",
                 base_ref: "",
                 workflow: Some(&asked.workflow),
+                origin: runs::Origin::own(&session.user.login),
             },
             &config,
             now,
@@ -1913,7 +1914,8 @@ workflows:
             "repo_id": 7, "workflow": "ci", "delivery": "d", "event": "push",
             "git_ref": "refs/heads/main", "sha": "abc", "actor": "a",
             "status": "completed", "conclusion": "success", "created_at": 1000,
-            "completed_at": null, "retention_days": 30
+            "completed_at": null, "retention_days": 30, "trust": "trusted",
+            "author_login": "a", "author_association": "", "gate_status": "none"
         }))
         .unwrap();
         let row = store::ArtifactRow {

@@ -402,7 +402,8 @@ mod tests {
             "repo_id": 99, "workflow": "ci", "delivery": "d", "event": event,
             "git_ref": git_ref, "sha": "abc123", "actor": "octo",
             "status": "in_progress", "conclusion": null, "created_at": 0,
-            "completed_at": null, "retention_days": 30,
+            "completed_at": null, "retention_days": 30, "trust": "trusted",
+            "author_login": "octo", "author_association": "", "gate_status": "none",
         }))
         .expect("a run row")
     }

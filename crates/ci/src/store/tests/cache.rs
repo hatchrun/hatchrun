@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
+use crate::trust::Trust;
 use hatchrun_cloud::testdb::Db as TestDb;
 
 const MAIN: CacheOwner<'static> = CacheOwner {
+    trust: Trust::Trusted,
     tenant_id: "t1",
     repo_id: 7,
     scope: "refs/heads/main",

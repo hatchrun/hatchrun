@@ -27,6 +27,8 @@ fn pull(number: u64, state: &str, updated_at: u64) -> NewPull {
         head_ref: "feature".into(),
         base_ref: "main".into(),
         author: "octocat".into(),
+        author_association: "MEMBER".into(),
+        head_repo_id: Some(7),
         state: state.into(),
         updated_at,
     }

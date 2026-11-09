@@ -3,6 +3,11 @@
   "number": 7,
   "pull_request": {
     "number": 7,
+    "title": "Add a thing",
+    "user": {
+      "login": "mallory"
+    },
+    "author_association": "FIRST_TIME_CONTRIBUTOR",
     "updated_at": "2026-11-06T09:21:59Z",
     "head": {
       "ref": "evil",

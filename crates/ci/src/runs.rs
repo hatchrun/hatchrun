@@ -20,7 +20,8 @@ use crate::github::{self, CONFIG_PATH, CheckRun, GhAnnotation, Output};
 use crate::intake::{PullRequest, Repo};
 use crate::planning::{self, Failed, Selected};
 use crate::run::{RunInfo, Start, github_context};
-use crate::store::{self, CiBilling, JobRow, NewJob, NewRun, RunRow};
+use crate::store::{self, CiBilling, GateStatus, JobRow, NewJob, NewRun, RunRow};
+use crate::trust::Trust;
 
 /// The name of the check run that reports an unusable config.
 pub const CONFIG_CHECK: &str = "hatchrun / config";
@@ -33,6 +34,40 @@ const MAX_ANNOTATIONS: usize = 50;
 
 /// Diagnostics beyond this many are left out of the summary.
 const MAX_LISTED: usize = 100;
+
+/// Whose code a request runs and who wrote it: what the runs record as
+/// their trust, and the approval a fork pull request's runs wait for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Origin<'a> {
+    /// Whether the code is the repository's own or a fork's.
+    pub trust: Trust,
+    /// The head repository of a fork pull request, by id.
+    pub head_repo_id: Option<u64>,
+    /// The head repository of a fork pull request, `owner/name`.
+    pub head_repo_name: Option<&'a str>,
+    /// The login of the pull request's author; the actor otherwise.
+    pub author: &'a str,
+    /// GitHub's `author_association` of the author; empty otherwise.
+    pub association: &'a str,
+    /// Whether the runs wait for an approval.
+    pub gate: GateStatus,
+}
+
+impl<'a> Origin<'a> {
+    /// The origin of a run of the repository's own code started by
+    /// `actor`: trusted, and it waits for nobody.
+    #[must_use]
+    pub const fn own(actor: &'a str) -> Self {
+        Self {
+            trust: Trust::Trusted,
+            head_repo_id: None,
+            head_repo_name: None,
+            author: actor,
+            association: "",
+            gate: GateStatus::NotGated,
+        }
+    }
+}
 
 /// What starts runs.
 pub struct Request<'a> {
@@ -66,6 +101,8 @@ pub struct Request<'a> {
     /// Start only this workflow's plan. A schedule names its workflow;
     /// the other workflows that share its cron have their own entries.
     pub workflow: Option<&'a str>,
+    /// Whose code the runs execute.
+    pub origin: Origin<'a>,
 }
 
 fn fail(message: impl Into<String>) -> worker::Error {
@@ -620,6 +657,12 @@ async fn start_plan(
         message: run_message(req.event_name, req.event),
         pull_number: pull_number(req),
         head_ref: pull_number(req).map(|_| req.head_ref.to_owned()),
+        trust: req.origin.trust,
+        head_repo_id: req.origin.head_repo_id,
+        head_repo_name: req.origin.head_repo_name.map(str::to_owned),
+        author_login: req.origin.author.to_owned(),
+        author_association: req.origin.association.to_owned(),
+        gate_status: req.origin.gate,
         now,
     };
     let (run, fresh) = match store::insert_run(db, &new).await? {
@@ -783,6 +826,7 @@ mod tests {
             head_ref: "",
             base_ref: "",
             workflow: None,
+            origin: Origin::own("octocat"),
         };
         let vars = std::collections::BTreeMap::from([("REGION".to_owned(), "eu".to_owned())]);
         let run = crate::store::RunRow {
@@ -807,6 +851,14 @@ mod tests {
             pull_number: None,
             head_ref: None,
             pull_title: None,
+            trust: Trust::Trusted,
+            head_repo_name: None,
+            author_login: "octocat".into(),
+            author_association: String::new(),
+            gate_status: GateStatus::NotGated,
+            gate_by: None,
+            gate_at: None,
+            gate_check_run_id: None,
         };
         title_of(&req, &plan, "https://api.github.com", &vars, &run)
     }
@@ -1029,6 +1081,12 @@ mod tests {
                     message: None,
                     pull_number: None,
                     head_ref: None,
+                    trust: Trust::Trusted,
+                    head_repo_id: None,
+                    head_repo_name: None,
+                    author_login: "octocat".into(),
+                    author_association: String::new(),
+                    gate_status: GateStatus::NotGated,
                     now: 1,
                 },
             ))

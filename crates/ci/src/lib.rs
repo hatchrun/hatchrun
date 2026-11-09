@@ -57,6 +57,7 @@ pub mod oidc;
 pub mod org_api;
 pub mod page;
 pub mod planning;
+pub mod policy;
 pub mod pool;
 pub mod reconcile;
 pub mod remote;
@@ -66,6 +67,7 @@ pub mod secrets;
 pub mod settings_api;
 pub mod store;
 pub mod token;
+pub mod trust;
 pub mod webhook;
 
 use hatchrun_cloud::db::Db;

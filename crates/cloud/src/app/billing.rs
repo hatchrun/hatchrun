@@ -339,9 +339,10 @@ mod tests {
         );
         db.run(
             "INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, \
-             ref, sha, actor, status, created_at, updated_at, expires_at) \
+             ref, sha, actor, status, created_at, updated_at, expires_at, trust, author_login, \
+             author_association, gate, gate_status) \
              VALUES ('t1', 7, 'ci', 1, 'd1', 'push', 'refs/heads/main', 'abc', 'octocat', \
-             'queued', 1, 1, 2)",
+             'queued', 1, 1, 2, 'trusted', 'octocat', '', 'none', 'none')",
             &[],
         );
         for plan in ["a", "b"] {

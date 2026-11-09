@@ -6,6 +6,7 @@ mod artifacts;
 mod browse;
 mod cache;
 mod concurrency;
+mod forks;
 mod jobs;
 mod lists;
 mod reconciler;
@@ -19,6 +20,7 @@ use hatchrun_cloud::testdb::Db as TestDb;
 use hatchrun_workflow::{Level, SecretRefs};
 
 use super::*;
+use crate::trust::Trust;
 
 pub(super) const DAY: u64 = 86_400_000;
 
@@ -44,7 +46,7 @@ pub(super) fn setup() -> TestDb {
 /// Claims job `job_id` of tenant t1, which must succeed.
 pub(super) fn claim(db: &TestDb, job_id: u64, now: u64) -> JobRow {
     match db
-        .wait(claim_launch(db.db(), job_id, "t1", 5, true, now))
+        .wait(claim_launch(db.db(), job_id, "t1", 5, true, None, now))
         .unwrap()
     {
         Claim::Claimed(job) => job,
@@ -81,6 +83,12 @@ pub(super) fn new_run(delivery: &str, workflow: &str, now: u64) -> NewRun {
         message: None,
         pull_number: None,
         head_ref: None,
+        trust: Trust::Trusted,
+        head_repo_id: None,
+        head_repo_name: None,
+        author_login: "octocat".into(),
+        author_association: String::new(),
+        gate_status: GateStatus::NotGated,
         now,
     }
 }

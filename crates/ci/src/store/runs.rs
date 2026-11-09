@@ -9,6 +9,49 @@ use serde::{Deserialize, Serialize};
 use worker::Result;
 
 use super::with_columns;
+use crate::trust::Trust;
+
+/// Where a run stands with the approval its pull request needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateStatus {
+    /// The run never waited for an approval.
+    #[serde(rename = "none")]
+    NotGated,
+    /// It waits for a maintainer.
+    Pending,
+    /// It waits for a free approval slot, and no card is shown yet.
+    Deferred,
+    /// A maintainer approved it.
+    Approved,
+    /// Nobody decided in time.
+    Expired,
+    /// Rejected, superseded by a newer commit, or its pull request
+    /// closed.
+    Cancelled,
+}
+
+impl GateStatus {
+    /// The word the `gate_status` column stores.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotGated => "none",
+            Self::Pending => "pending",
+            Self::Deferred => "deferred",
+            Self::Approved => "approved",
+            Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Whether the run still waits for a decision, so its jobs do not
+    /// launch.
+    #[must_use]
+    pub const fn waits(self) -> bool {
+        matches!(self, Self::Pending | Self::Deferred)
+    }
+}
 
 /// A run to record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,8 +80,24 @@ pub struct NewRun {
     pub message: Option<String>,
     /// The pull request's number, for a run of a pull request.
     pub pull_number: Option<u64>,
-    /// The pull request's head branch, as a short name.
+    /// The head branch, as a short name.
     pub head_ref: Option<String>,
+    /// Whether the run is of the repository's own code or a fork's.
+    pub trust: Trust,
+    /// The head repository of a fork pull request, by id. `None` for
+    /// other runs and for a deleted fork.
+    pub head_repo_id: Option<u64>,
+    /// The head repository of a fork pull request, `owner/name`.
+    pub head_repo_name: Option<String>,
+    /// The login of the pull request's author; the actor for other
+    /// runs.
+    pub author_login: String,
+    /// GitHub's `author_association` of the pull request's author;
+    /// empty for other runs.
+    pub author_association: String,
+    /// `NotGated`, or `Pending` or `Deferred` for a fork run that needs
+    /// an approval.
+    pub gate_status: GateStatus,
     /// When the run is recorded.
     pub now: u64,
 }
@@ -91,6 +150,22 @@ pub struct RunRow {
     /// The pull request's title, as the `pull_request` webhook last
     /// said it.
     pub pull_title: Option<String>,
+    /// Whose code the run executes.
+    pub trust: Trust,
+    /// The head repository of a fork pull request, `owner/name`.
+    pub head_repo_name: Option<String>,
+    /// The login of the pull request's author; the actor otherwise.
+    pub author_login: String,
+    /// GitHub's `author_association` of the pull request's author.
+    pub author_association: String,
+    /// Where the run stands with the approval it needed.
+    pub gate_status: GateStatus,
+    /// Who approved it.
+    pub gate_by: Option<String>,
+    /// When it was decided.
+    pub gate_at: Option<u64>,
+    /// The check run that carries the approve button.
+    pub gate_check_run_id: Option<u64>,
 }
 
 impl RunRow {
@@ -109,12 +184,14 @@ impl RunRow {
 }
 
 /// The columns of a [`RunRow`].
-const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, \
+pub(super) const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, \
      event, ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
      completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
      pull_number, head_ref, \
      (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
-      AND number = ci_runs.pull_number) AS pull_title";
+      AND number = ci_runs.pull_number) AS pull_title, \
+     trust, head_repo_name, author_login, author_association, gate_status, gate_by, gate_at, \
+     gate_check_run_id";
 
 /// The run of delivery `$1` and workflow `$2`, where `{columns}` is
 /// [`RUN_COLUMNS`].
@@ -130,7 +207,9 @@ const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE
 /// [`LOCK_REPO`]. Binds `$1` tenant, `$2` repository, `$3` workflow,
 /// `$4` delivery, `$5` event, `$6` ref, `$7` sha, `$8` actor, `$9`
 /// now, `$10` the pull request's base branch, `$11` the message, `$12` the
-/// pull request's number and `$13` its head branch. The run expires after its tenant's retention tier (30 or 90 days), read
+/// pull request's number, `$13` its head branch, `$14` the trust, `$15` and
+/// `$16` the head repository's id and name, `$17` the author, `$18` the
+/// author's association, `$19` the gate and `$20` its status. The run expires after its tenant's retention tier (30 or 90 days), read
 /// in the same statement. The number is taken only when no run of this
 /// delivery and workflow exists, so a duplicate leaves the counter
 /// alone, and the statement returns no row for it.
@@ -142,16 +221,20 @@ const INSERT_RUN: &str = "WITH n AS (\
        RETURNING last) \
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
        actor, base_ref, message, pull_number, head_ref, status, created_at, updated_at, \
-       expires_at) \
+       expires_at, trust, head_repo_id, head_repo_name, author_login, author_association, \
+       gate, gate_status) \
      SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, $10::text, $11::text, $12::bigint, $13::text, 'queued', $9, $9, \
        $9 + (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END * 86400000::bigint \
-         FROM tenants WHERE id = $1) FROM n \
+         FROM tenants WHERE id = $1), \
+       $14::text, $15::bigint, $16::text, $17::text, $18::text, $19::text, $20::text FROM n \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
        ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
        completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
        pull_number, head_ref, \
        (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
-        AND number = ci_runs.pull_number) AS pull_title";
+        AND number = ci_runs.pull_number) AS pull_title, \
+       trust, head_repo_name, author_login, author_association, gate_status, gate_by, gate_at, \
+       gate_check_run_id";
 
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
@@ -194,7 +277,18 @@ pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>> {
             &run.base_ref,
             &run.message,
             run.pull_number,
-            &run.head_ref
+            &run.head_ref,
+            run.trust.as_str(),
+            run.head_repo_id,
+            &run.head_repo_name,
+            &run.author_login,
+            &run.author_association,
+            if run.gate_status == GateStatus::NotGated {
+                "none"
+            } else {
+                "fork_approval"
+            },
+            run.gate_status.as_str()
         ],
     )
     .await
@@ -406,7 +500,8 @@ pub(super) const LISTED_COLUMNS: &str = "r.id, r.run_number, r.run_attempt, r.te
      (r.expires_at - r.created_at) / 86400000 AS retention_days, r.message, \
      r.pull_number, r.head_ref, \
      (SELECT title FROM ci_pulls WHERE repo_id = r.repo_id AND number = r.pull_number) \
-     AS pull_title, p.full_name AS repository";
+     AS pull_title, r.trust, r.head_repo_name, r.author_login, r.author_association, \
+     r.gate_status, r.gate_by, r.gate_at, r.gate_check_run_id, p.full_name AS repository";
 
 /// One page of the runs `filter` holds, newest first, those after
 /// `after` when it is set, at most `limit`; and how many runs the

@@ -18,6 +18,7 @@ mod browse;
 mod cache;
 mod concurrency;
 mod environments;
+mod forks;
 mod installation;
 mod jobs;
 mod pool;
@@ -42,8 +43,9 @@ pub use self::browse::{
 };
 pub use self::cache::{
     CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, drop_pending_cache_entry,
-    evict_idle_cache_entries, evict_over_quota_cache_entries, finalize_cache_entry,
-    lookup_cache_entry, pending_cache_entry, start_cache_entry, touch_cache_entry,
+    evict_idle_cache_entries, evict_over_fork_quota_cache_entries, evict_over_quota_cache_entries,
+    finalize_cache_entry, fork_cache_bytes, lookup_cache_entry, pending_cache_entry,
+    start_cache_entry, touch_cache_entry,
 };
 pub use self::concurrency::{
     Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, unfinished_superseded,
@@ -54,6 +56,10 @@ pub use self::environments::{
     delete_environment, environment, environments, job_environment, org_environments,
     put_environment, release_approval_holds,
 };
+pub use self::forks::{
+    admit_deferred, approve_by_check, approve_run, end_gate, end_pull_gates, expire_gates,
+    fork_waiting, pending_gate_runs, put_repo_policy, repo_policy, set_gate_check,
+};
 pub use self::installation::{
     LastRun, OrgRepo, RepoFilter, RepoVisibility, SetupRow, installation_synced, patch_enabled,
     repo_enabled, repos_page, sync_installation, tenant_installation, tenant_repo_visibility,
@@ -61,10 +67,11 @@ pub use self::installation::{
 };
 pub use self::jobs::{
     ApprovalJob, Claim, JobCounts, JobRow, MatrixRows, NewJob, all_jobs_for_run, approval_jobs,
-    assign_matrix_rows, capacity_wait, claim_launch, finish_job, heartbeat, held_siblings, hold,
-    insert_jobs, job, job_counts, job_scopes, jobs_by_ids, jobs_for_run, launch_failed, launched,
-    note_queued_error, open_jobs, parse_cache_scopes, queue_job, refresh_job, reset_job,
-    retarget_job, set_cache_scopes, set_job, set_needs, start_job, supersede_job,
+    assign_matrix_rows, capacity_wait, claim_launch, finish_job, fork_approval_held, fork_running,
+    heartbeat, held_fork_jobs, held_siblings, hold, insert_jobs, job, job_counts, job_scopes,
+    jobs_by_ids, jobs_for_run, launch_failed, launched, note_queued_error, open_jobs,
+    parse_cache_scopes, queue_job, refresh_job, reset_job, retarget_job, set_cache_scopes, set_job,
+    set_needs, start_job, supersede_job,
 };
 pub use self::pool::{
     PoolRow, claims_by_bucket, drop_pool, move_pool, pool_rows, save_pool, take_pool,
@@ -75,8 +82,8 @@ pub use self::reconciler::{
 };
 pub use self::repos::{RepoRow, delivery_seen, record_delivery, repo, repo_by_name, upsert_repo};
 pub use self::runs::{
-    After, Bucket, ListedRun, NewRun, RunCounts, RunFilter, RunRow, RunStatus, activity,
-    finish_run, insert_run, job_load, latest_on_default, listed_runs, reopen_run_at, run,
+    After, Bucket, GateStatus, ListedRun, NewRun, RunCounts, RunFilter, RunRow, RunStatus,
+    activity, finish_run, insert_run, job_load, latest_on_default, listed_runs, reopen_run_at, run,
     run_counts, run_for_delivery, run_started, runs_page, set_run_message,
 };
 pub use self::secrets::{
