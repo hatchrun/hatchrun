@@ -237,18 +237,7 @@ async fn finish(
         }
     }
 
-    let proxy = match job.start_cache(sink).await {
-        Ok(proxy) => proxy,
-        Err(message) => {
-            // A setup failure: the steps never run and the job fails with
-            // the message, as when a container does not start.
-            job.say(sink, Line::Error(&message));
-            job.set_status(JobStatus::Failure);
-            let summaries = skip_steps(job, sink);
-            let conclusion = conclusion_of(job.status, timed_out, external);
-            return job.result(conclusion, BTreeMap::new(), summaries);
-        }
-    };
+    let proxy = job.start_cache(sink).await;
     if job.start_containers(sink).await.is_err() {
         // The steps never run, as on GitHub when a container does not start.
         let summaries = skip_steps(job, sink);

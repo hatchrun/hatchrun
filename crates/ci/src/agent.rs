@@ -409,26 +409,31 @@ async fn claim(
     } else {
         Vec::new()
     };
-    let body = claim_body(&github_token, &capped, claims);
+    let body = claim_body(&github_token, &capped, claims, now_ms() / 1000);
     let mut response = to_run(env, run.id, "claim", row.id, row.attempt, body).await?;
     if response.status_code() != 200 {
         return Ok(response);
     }
     let mut document = response.json::<JobDocument>().await?;
     fill(&mut document, &secrets, vars);
-    document.id_token =
-        id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
+    document.id_token = id_token_request(&settings.ci_url, &settings.token_key, row, claims.exp);
     offer_services(&mut document, settings, job_token, scopes);
     Response::from_json(&document)
 }
 
 /// What the claim sends the run object: the installation token, the
-/// permissions it was capped to, and when the job token the claim
-/// carries stops working, which the agent's runtime token follows.
-fn claim_body(github_token: &str, capped: &[github::Capped], claims: &Claims) -> Vec<u8> {
+/// permissions it was capped to, and how long the job token the claim
+/// carries has left by this clock, which the agent's runtime token lives
+/// for on its own.
+fn claim_body(
+    github_token: &str,
+    capped: &[github::Capped],
+    claims: &Claims,
+    now_secs: u64,
+) -> Vec<u8> {
     json!({
         "token": github_token,
-        "token_expires_at": claims.exp,
+        "token_expires_in": claims.exp.saturating_sub(now_secs),
         "capped": capped,
     })
     .to_string()
@@ -469,13 +474,13 @@ pub(crate) fn fill(
 }
 
 /// The OIDC request for the job, when its permissions grant one: the
-/// token endpoint and a request token for this attempt that lives as
-/// long as a job token does.
+/// token endpoint and a request token for this attempt that expires when
+/// the job token the claim carries does, at `exp`.
 pub(crate) fn id_token_request(
     ci_url: &str,
     key: &[u8],
     row: &JobRow,
-    now_secs: u64,
+    exp: u64,
 ) -> Option<IdTokenRequest> {
     if !oidc::granted(&row.token_permissions) {
         return None;
@@ -484,7 +489,7 @@ pub(crate) fn id_token_request(
         job: row.id,
         run: row.run_id,
         attempt: i32::try_from(row.attempt).ok()?,
-        exp: now_secs + token::lifetime_secs(row.timeout_minutes),
+        exp,
     };
     Some(IdTokenRequest {
         url: oidc::request_url(ci_url),
@@ -818,17 +823,22 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_sends_the_expiry_of_the_job_token_to_the_run_object() {
+    fn a_claim_sends_what_is_left_of_the_job_token_to_the_run_object() {
         let claims = Claims {
             job: 5,
             run: 9,
             attempt: 2,
             exp: 100 + token::lifetime_secs(10),
         };
+        let now = 100;
         let body: serde_json::Value =
-            serde_json::from_slice(&claim_body("gh", &[], &claims)).unwrap();
+            serde_json::from_slice(&claim_body("gh", &[], &claims, now)).unwrap();
         assert_eq!(body["token"], "gh");
-        assert_eq!(body["token_expires_at"], claims.exp);
+        assert_eq!(body["token_expires_in"], token::lifetime_secs(10));
+        // A token that is past its expiry has nothing left.
+        let late: serde_json::Value =
+            serde_json::from_slice(&claim_body("gh", &[], &claims, claims.exp + 5)).unwrap();
+        assert_eq!(late["token_expires_in"], 0);
         assert_eq!(body["capped"], serde_json::json!([]));
     }
 
@@ -943,18 +953,18 @@ mod tests {
     fn only_a_job_with_the_grant_gets_an_id_token_request() {
         let mut granted = row("launched");
         granted.token_permissions = serde_json::json!({ "id_token": "write", "metadata": "read" });
-        let got = id_token_request("https://ci.example", &*KEY, &granted, 100).unwrap();
+        let got = id_token_request("https://ci.example", &*KEY, &granted, 500).unwrap();
         assert_eq!(got.url, "https://ci.example/v1/oidc/token?api-version=2.0");
         // The request token is for this attempt, not a job token.
         let claims = token::verify_oidc(&*KEY, &got.token, 101).unwrap();
         assert_eq!((claims.job, claims.run, claims.attempt), (7, 1, 2));
-        assert_eq!(claims.exp, 100 + token::lifetime_secs(10));
+        assert_eq!(claims.exp, 500);
         assert_eq!(
             token::verify(&*KEY, &got.token, 101),
             Err(TokenError::Malformed)
         );
         assert_eq!(
-            id_token_request("https://ci.example", &*KEY, &row("launched"), 100),
+            id_token_request("https://ci.example", &*KEY, &row("launched"), 500),
             None
         );
     }
@@ -1160,7 +1170,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
-            token_expires_at: 4_102_444_800,
+            token_expires_in: 3600,
             inputs: None,
         }
     }

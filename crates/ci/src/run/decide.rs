@@ -139,9 +139,9 @@ pub(crate) fn github_context(info: &RunInfo, event: &Value, api: &str) -> Value 
 pub(crate) struct JobToken<'a> {
     /// The installation token the steps get as `GITHUB_TOKEN`.
     pub github: &'a str,
-    /// When the job token the agent authorizes with stops working, in
-    /// Unix seconds.
-    pub expires_at: u64,
+    /// How many seconds the job token the agent authorizes with has
+    /// left.
+    pub expires_in: u64,
 }
 
 /// The document an agent gets when it claims `job`, `None` when the
@@ -175,7 +175,7 @@ pub(crate) fn job_document(
         cache: None,
         id_token: None,
         artifacts: None,
-        token_expires_at: token.expires_at,
+        token_expires_in: token.expires_in,
         inputs,
     })
 }
@@ -832,7 +832,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
     fn tok() -> JobToken<'static> {
         JobToken {
             github: "tok",
-            expires_at: 1_800,
+            expires_in: 1_800,
         }
     }
 
@@ -841,7 +841,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         let graph = graph();
         let event = json!({ "after": "abc" });
         let doc = job_document(&info(), &event, &graph, 1, tok(), API, None).unwrap();
-        assert_eq!(doc.token_expires_at, 1_800);
+        assert_eq!(doc.token_expires_in, 1_800);
         assert_eq!(doc.run_id, "7");
         assert_eq!(doc.run_attempt, 1);
         assert_eq!(doc.github.token, "tok");

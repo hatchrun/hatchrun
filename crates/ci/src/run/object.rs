@@ -107,9 +107,8 @@ pub(super) fn answer(status: u16) -> Result<Response> {
 #[derive(Deserialize)]
 struct ClaimBody {
     token: String,
-    /// When the job token the claim carries stops working, in Unix
-    /// seconds.
-    token_expires_at: u64,
+    /// How many seconds the job token the claim carries has left.
+    token_expires_in: u64,
     capped: Vec<Capped>,
 }
 
@@ -442,7 +441,7 @@ impl<'a> Cx<'a> {
                 match path {
                     "/claim" => match req.json::<ClaimBody>().await {
                         Ok(body) => {
-                            self.claim(job, attempt, body.token, body.token_expires_at, body.capped)
+                            self.claim(job, attempt, body.token, body.token_expires_in, body.capped)
                                 .await
                         }
                         Err(_) => Response::error("bad claim", 400),
@@ -1344,7 +1343,7 @@ impl<'a> Cx<'a> {
         job: u64,
         attempt: u32,
         token: String,
-        token_expires_at: u64,
+        token_expires_in: u64,
         capped: Vec<Capped>,
     ) -> Result<Response> {
         // The inputs a job of a called workflow reads are made before the
@@ -1428,7 +1427,7 @@ impl<'a> Cx<'a> {
                 job,
                 JobToken {
                     github: &token,
-                    expires_at: token_expires_at,
+                    expires_in: token_expires_in,
                 },
                 &self.settings.github_api,
                 inputs,

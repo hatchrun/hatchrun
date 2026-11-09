@@ -71,7 +71,7 @@ pub fn document(steps: Vec<PlannedStep>) -> JobDocument {
         cache: None::<CacheService>,
         id_token: None,
         artifacts: None,
-        token_expires_at: 4_102_444_800,
+        token_expires_in: 3600,
         inputs: None,
     }
 }

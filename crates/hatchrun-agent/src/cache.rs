@@ -124,8 +124,8 @@ pub struct Identity {
     /// reads them as the token's access controls. `None` leaves them out
     /// of the token, so `BuildKit` refuses it.
     pub scopes: Option<Vec<String>>,
-    /// When the token stops working, in Unix seconds.
-    pub expires_at: u64,
+    /// How many seconds the token lives, from now.
+    pub expires_in: u64,
 }
 
 /// The artifact service of a job.
@@ -256,7 +256,7 @@ impl Proxy {
                 run_id: "1".into(),
                 job_id: "build".into(),
                 scopes: Some(vec!["refs/heads/main".into()]),
-                expires_at: 4_102_444_800,
+                expires_in: 3600,
             },
         };
         Self::start_with(services, addr, results).await
@@ -269,7 +269,7 @@ impl Proxy {
             &identity.run_id,
             &identity.job_id,
             identity.scopes.as_deref(),
-            identity.expires_at,
+            identity.expires_in,
         )?;
         let artifacts = services
             .artifacts
@@ -580,7 +580,14 @@ fn json(value: &impl Serialize) -> Reply {
 /// and its `Retry-After`.
 fn refusal(err: &anyhow::Error) -> Reply {
     let (code, retry_after) = twirp::code_for(err);
-    let mut reply = twirp_error(twirp::http_status(code), code, format!("{err:#}"));
+    // A job that is not running any more is told so in the same words
+    // whatever it was doing.
+    let message = if err.downcast_ref::<cloud::JobEnded>().is_some() {
+        "the job is no longer running, so its cache and artifacts cannot change".to_owned()
+    } else {
+        format!("{err:#}")
+    };
+    let mut reply = twirp_error(twirp::http_status(code), code, message);
     if let Some(value) = retry_after.and_then(|v| HeaderValue::from_str(&v).ok()) {
         reply.headers_mut().insert(header::RETRY_AFTER, value);
     }

@@ -158,7 +158,7 @@ impl Job<'_> {
                     .find(|candidate| candidate.is_file())
                     .ok_or_else(|| {
                         format!(
-                            "Docker is not installed: this job needs a `{}` command",
+                            "`{}` is not installed: this job needs it as its Docker command",
                             name.display()
                         )
                     })?

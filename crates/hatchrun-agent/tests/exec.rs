@@ -2324,7 +2324,7 @@ async fn cache_service_starts_the_proxy() {
     let script = "echo \"url=${ACTIONS_RESULTS_URL-unset} v2=${ACTIONS_CACHE_SERVICE_V2-unset} \
                   tok=${ACTIONS_RUNTIME_TOKEN:+set}\"";
     let mut doc = make::document(vec![make::step(script)]);
-    doc.token_expires_at = 4_102_444_800;
+    doc.token_expires_in = 3600;
     doc.cache = Some(hatchrun_workflow::CacheService {
         url: format!("{}/v1/cache", server.uri()),
         token: "cache-service-token".to_owned(),
@@ -2709,24 +2709,4 @@ fn a_setup_failure_still_writes_a_masked_failure_result() {
     let result = result(dir.path());
     assert_eq!(result.conclusion, Conclusion::Failure);
     assert_eq!(result.steps.len(), 0);
-}
-
-#[test]
-fn an_expired_job_token_fails_the_job_before_any_step() {
-    let mut doc = make::document(vec![make::step("echo should-not-run")]);
-    doc.cache = Some(hatchrun_workflow::CacheService {
-        url: "http://127.0.0.1:1/v1/cache".to_owned(),
-        token: "cache-service-token".to_owned(),
-        scopes: vec!["refs/heads/main".to_owned()],
-    });
-    doc.token_expires_at = 1;
-    let dir = tempfile::tempdir().unwrap();
-    let out = exec(dir.path(), &json(&doc));
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
-    let text = stdout(&out);
-    assert!(text.contains("expired at 1 (Unix time)"), "{text}");
-    assert!(!text.lines().any(|l| l == "should-not-run"), "{text}");
-    let result = result(dir.path());
-    assert_eq!(result.conclusion, Conclusion::Failure);
-    assert_eq!(result.steps[0].outcome, Conclusion::Skipped);
 }

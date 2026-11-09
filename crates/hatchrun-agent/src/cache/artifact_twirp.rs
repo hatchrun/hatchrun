@@ -168,8 +168,10 @@ pub fn timestamp(millis: u64) -> String {
 
 /// The `ACTIONS_RUNTIME_TOKEN` of a job: a JWT the toolkits read and
 /// never verify, so the signature is random filler; the proxy checks
-/// the whole token on every artifact call. It expires at `expires_at`,
-/// the job token's own expiry, which the Worker sends.
+/// the whole token on every artifact call. It lives `expires_in`
+/// seconds from now by this machine's clock: what the Worker says the job
+/// token has left. Whether the job token is good is for the control
+/// plane to say, so a short life is no error.
 ///
 /// - The artifact toolkit reads the run and job from the `scp` claim,
 ///   `Actions.Results:<run>:<job>`.
@@ -186,13 +188,12 @@ pub fn timestamp(millis: u64) -> String {
 ///
 /// # Errors
 ///
-/// When the system has no randomness, its clock is before 1970, or
-/// `expires_at` has passed.
+/// When the system has no randomness or its clock is before 1970.
 pub fn runtime_token(
     run_id: &str,
     job_id: &str,
     scopes: Option<&[String]>,
-    expires_at: u64,
+    expires_in: u64,
 ) -> Result<String> {
     // The scope is `Actions.Results:<run>:<job>`, split on `:` and
     // spaces by the toolkit.
@@ -211,11 +212,6 @@ pub fn runtime_token(
         .duration_since(UNIX_EPOCH)
         .map_err(|err| anyhow!("the clock is before 1970: {err}"))?
         .as_secs();
-    if expires_at <= now {
-        return Err(anyhow!(
-            "the job token expired at {expires_at}, now is {now}"
-        ));
-    }
     let access = scopes.map(|scopes| {
         let list: Vec<serde_json::Value> = scopes
             .iter()
@@ -230,9 +226,8 @@ pub fn runtime_token(
     let mut claims = serde_json::json!({
         "iss": "hatchrun",
         "scp": format!("Actions.Results:{}:{}", part(run_id), part(job_id)),
-        // A little before now, for clock skew.
-        "nbf": now.saturating_sub(300),
-        "exp": expires_at,
+        "nbf": now,
+        "exp": now.saturating_add(expires_in),
     });
     if let Some(access) = access {
         claims["ac"] = serde_json::Value::String(access);
@@ -394,7 +389,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let expires = now + 360 * 60 + 1500;
+        let expires = 360 * 60 + 1500;
         let token = runtime_token("12", "build job", Some(&scopes), expires).unwrap();
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
@@ -415,10 +410,13 @@ mod tests {
                 { "Scope": "refs/heads/main", "Permission": 1 },
             ])
         );
-        assert!(claims["nbf"].as_u64().unwrap() < now);
-        assert_eq!(claims["exp"].as_u64().unwrap(), expires);
-        // A token that has expired is refused.
-        assert!(runtime_token("1", "j", None, now).is_err());
+        // The window is this machine's now and `expires` seconds on.
+        let nbf = claims["nbf"].as_u64().unwrap();
+        let exp = claims["exp"].as_u64().unwrap();
+        assert!(nbf >= now && nbf <= now + 5);
+        assert_eq!(exp, nbf + expires);
+        // With nothing left the token is short-lived, not an error.
+        assert!(runtime_token("1", "j", None, 0).is_ok());
         // A single scope is read and write.
         let one = runtime_token("1", "j", Some(&["refs/heads/main".to_owned()]), expires).unwrap();
         let claims: serde_json::Value = serde_json::from_slice(

@@ -23,7 +23,7 @@ async fn artifact_proxy(server: &MockServer) -> Proxy {
                 run_id: "12".into(),
                 job_id: "build".into(),
                 scopes: Some(vec!["refs/heads/main".into()]),
-                expires_at: 4_102_444_800,
+                expires_in: 3600,
             },
         },
         SocketAddr::from(([127, 0, 0, 1], 0)),
