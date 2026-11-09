@@ -206,7 +206,7 @@ impl Cloud {
             .send()
             .await
             .with_context(|| format!("upload part {number}"))?;
-        let response = answer(response, &format!("upload part {number}")).await?;
+        let response = s3_answer(response, &format!("upload part {number}")).await?;
         let etag = response
             .headers()
             .get(reqwest::header::ETAG)
@@ -271,8 +271,10 @@ impl std::error::Error for JobEnded {}
 #[derive(Debug)]
 pub(super) struct Refused {
     pub status: StatusCode,
-    what: String,
-    body: String,
+    /// Its `Retry-After`, when it sent one.
+    pub retry_after: Option<String>,
+    pub(super) what: String,
+    pub(super) body: String,
 }
 
 impl std::fmt::Display for Refused {
@@ -282,6 +284,20 @@ impl std::fmt::Display for Refused {
 }
 
 impl std::error::Error for Refused {}
+
+/// The response of S3 when it succeeded, else an error with its status
+/// and the start of its body. Not a [`Refused`]: only what the control
+/// plane answers is final, and S3's refusals (a presigned URL that has
+/// expired, a 5xx) are the caller's to retry.
+async fn s3_answer(response: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    let body: String = body.chars().take(300).collect();
+    bail!("{what}: {status}: {body}")
+}
 
 /// The response when it succeeded, else an error with its status and
 /// the start of its body: a [`Refused`].
@@ -293,9 +309,15 @@ pub(super) async fn answer(response: reqwest::Response, what: &str) -> Result<re
     if status == StatusCode::GONE {
         return Err(JobEnded.into());
     }
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let body = response.text().await.unwrap_or_default();
     Err(Refused {
         status,
+        retry_after,
         what: what.to_owned(),
         body: body.chars().take(300).collect(),
     }

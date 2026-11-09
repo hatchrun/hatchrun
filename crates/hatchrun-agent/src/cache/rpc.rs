@@ -10,10 +10,10 @@ use http_body_util::{BodyExt, Limited};
 use hyper::Request;
 use hyper::StatusCode;
 use hyper::body::Incoming;
+use hyper::header::{self, HeaderValue};
 use serde::de::DeserializeOwned;
 use tracing::{debug, info, warn};
 
-use super::cloud::Refused;
 use super::twirp;
 use super::{
     DOWNLOAD_PATH, Download, MAX_SMALL_BODY, Reply, State, UPLOAD_PATH, Upload, UploadState,
@@ -106,22 +106,15 @@ pub(super) async fn create(state: &State, request: twirp::CreateRequest) -> Repl
         }
         Err(err) => {
             warn!(key = request.key, "cache save refused: {err:#}");
-            // A 4xx of the control plane is final, and the toolkit and
-            // `BuildKit` do not retry what is not `unavailable`.
-            return match err.downcast_ref::<Refused>() {
-                Some(refused) if refused.status.is_client_error() => {
-                    let code = match refused.status {
-                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "permission_denied",
-                        _ => "failed_precondition",
-                    };
-                    twirp_error(refused.status, code, format!("{err:#}"))
-                }
-                _ => twirp_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "unavailable",
-                    format!("{err:#}"),
-                ),
-            };
+            // What the control plane refused for good is a code the
+            // toolkit and `BuildKit` do not retry, with Twirp's own status
+            // for it; the rest is `unavailable`.
+            let (code, retry_after) = twirp::code_for(&err);
+            let mut reply = twirp_error(twirp::http_status(code), code, format!("{err:#}"));
+            if let Some(value) = retry_after.and_then(|v| HeaderValue::from_str(&v).ok()) {
+                reply.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return reply;
         }
     };
     let url = format!("{}{UPLOAD_PATH}{id}", state.base);

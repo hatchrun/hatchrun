@@ -1654,7 +1654,8 @@ fn a_claim_records_the_cache_scopes_and_a_rerun_clears_them() {
     let first = db
         .wait(set_cache_scopes(db.db(), job_id, 1, &scopes))
         .unwrap();
-    assert_eq!(parse_cache_scopes(first.as_deref()).unwrap(), scopes);
+    let first = first.unwrap();
+    assert_eq!(parse_cache_scopes(first.text.as_deref()).unwrap(), scopes);
     // A later claim of the attempt, which saw another default branch,
     // gets the scopes the first one fixed.
     let other = vec![
@@ -1664,7 +1665,10 @@ fn a_claim_records_the_cache_scopes_and_a_rerun_clears_them() {
     let again = db
         .wait(set_cache_scopes(db.db(), job_id, 1, &other))
         .unwrap();
-    assert_eq!(parse_cache_scopes(again.as_deref()).unwrap(), scopes);
+    assert_eq!(
+        parse_cache_scopes(again.unwrap().text.as_deref()).unwrap(),
+        scopes
+    );
     // A claim of another attempt matches no row.
     assert_eq!(
         db.wait(set_cache_scopes(db.db(), job_id, 2, &other))

@@ -667,11 +667,18 @@ struct ScopesRow {
     cache_scopes: Option<String>,
 }
 
+/// The cache scopes an attempt has: the JSON text of its column, `None`
+/// for NULL (see [`parse_cache_scopes`]).
+#[derive(Debug, PartialEq, Eq)]
+pub struct FixedScopes {
+    /// The column.
+    pub text: Option<String>,
+}
+
 /// Fixes the cache scopes of `attempt` of the job to `scopes`, first the
 /// one it saves to, unless an earlier claim of the attempt did, and
-/// returns the JSON text of the ones the attempt has (see
-/// [`parse_cache_scopes`]). `None` when the job is not at `attempt` any
-/// more.
+/// returns the ones the attempt has. `None` when the job is not at
+/// `attempt` any more.
 ///
 /// # Errors
 ///
@@ -681,12 +688,14 @@ pub async fn set_cache_scopes(
     job_id: u64,
     attempt: u32,
     scopes: &[String],
-) -> Result<Option<String>> {
+) -> Result<Option<FixedScopes>> {
     let text = serde_json::to_string(scopes).unwrap_or_else(|_| "[]".to_owned());
     let row: Option<ScopesRow> = db
         .first(SET_CACHE_SCOPES, &params![job_id, attempt, text])
         .await?;
-    Ok(row.map(|row| row.cache_scopes.unwrap_or_default()))
+    Ok(row.map(|row| FixedScopes {
+        text: row.cache_scopes,
+    }))
 }
 
 /// The scopes the text of a job's `cache_scopes` holds: none for a job

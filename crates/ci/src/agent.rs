@@ -399,10 +399,7 @@ async fn claim(
             Some(&repo.default_branch),
         );
         match store::set_cache_scopes(db, row.id, row.attempt, &wanted).await {
-            Ok(Some(text)) => store::parse_cache_scopes(Some(&text)).unwrap_or_else(|err| {
-                console_error!("job {}: malformed cache scopes: {err}", row.id);
-                Vec::new()
-            }),
+            Ok(Some(fixed)) => crate::cache::job_scopes(row.id, fixed.text.as_deref()),
             Ok(None) => return status(409),
             Err(err) => {
                 console_error!("job {}: record cache scopes: {err}", row.id);
@@ -423,9 +420,23 @@ async fn claim(
     fill(&mut document, &secrets, vars);
     document.id_token =
         id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
+    offer_services(&mut document, settings, job_token, row, scopes);
+    Response::from_json(&document)
+}
+
+/// Gives the document the services the job gets, and the lifetime of the
+/// runtime token the agent makes for them: the one of the job token the
+/// same claim carries, from the job's row.
+fn offer_services(
+    document: &mut JobDocument,
+    settings: &Settings,
+    job_token: &str,
+    row: &JobRow,
+    scopes: Vec<String>,
+) {
+    document.token_lifetime_secs = token::lifetime_secs(row.timeout_minutes);
     document.artifacts = artifact_service(settings, job_token);
     document.cache = cache_service(settings, job_token, scopes);
-    Response::from_json(&document)
 }
 
 /// Puts the job's secrets and vars in the document the run object
@@ -797,6 +808,32 @@ mod tests {
             Some(value.to_owned())
         })
         .unwrap()
+    }
+
+    #[test]
+    fn a_claim_offers_the_services_and_a_token_lifetime_from_the_row() {
+        let mut doc = document();
+        assert_eq!(doc.token_lifetime_secs, 0);
+        let job = row("running");
+        let scopes = vec!["refs/heads/main".to_owned()];
+        offer_services(
+            &mut doc,
+            &settings("bucket"),
+            "v1.a.b",
+            &job,
+            scopes.clone(),
+        );
+        assert_eq!(
+            doc.token_lifetime_secs,
+            token::lifetime_secs(job.timeout_minutes)
+        );
+        assert!(doc.token_lifetime_secs > u64::from(job.timeout_minutes) * 60);
+        assert_eq!(doc.cache.unwrap().scopes, scopes);
+        assert!(doc.artifacts.is_some());
+        // Without the artifacts bucket there are no services.
+        let mut bare = document();
+        offer_services(&mut bare, &settings(""), "v1.a.b", &job, Vec::new());
+        assert!(bare.cache.is_none() && bare.artifacts.is_none());
     }
 
     #[test]

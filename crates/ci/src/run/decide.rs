@@ -165,7 +165,9 @@ pub(crate) fn job_document(
         cache: None,
         id_token: None,
         artifacts: None,
-        token_lifetime_secs: crate::token::lifetime_secs(node.job.timeout_minutes),
+        // Set by the Worker at the claim, from the job's row, so that it
+        // is the lifetime of the job token the same claim mints.
+        token_lifetime_secs: 0,
         inputs,
     })
 }
@@ -832,11 +834,6 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         assert_eq!(doc.needs, graph.needs(1));
         assert!(doc.secrets.is_empty() && doc.vars.is_empty() && doc.timings.is_empty());
         assert!(doc.cache.is_none());
-        assert_eq!(
-            doc.token_lifetime_secs,
-            crate::token::lifetime_secs(graph.node(1).unwrap().job.timeout_minutes)
-        );
-        assert!(doc.token_lifetime_secs > 0);
         assert!(job_document(&info(), &event, &graph, 404, "tok", API, None).is_none());
     }
 

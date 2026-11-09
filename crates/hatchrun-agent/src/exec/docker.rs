@@ -46,7 +46,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 /// each time, so the last starts after about a minute.
 const HEALTH_TRIES: u32 = 6;
 /// What a start that was stopped reports, as a step does.
-const CANCELED: &str = "The operation was canceled.";
+pub(super) const CANCELED: &str = "The operation was canceled.";
 /// The most lines of a container's log printed when it fails.
 const LOG_TAIL: &str = "40";
 

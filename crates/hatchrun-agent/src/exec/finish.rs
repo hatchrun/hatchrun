@@ -104,8 +104,7 @@ impl Job<'_> {
             // The bridge gateway can be an address this machine does not
             // have yet; the loopback still serves the host's steps.
             Err(err) if ip != loopback => {
-                let text = self.masked(&format!("{err:#}"));
-                warn!(%ip, "cache proxy: cannot listen, trying the loopback: {text}");
+                // `warn_loopback` logs it, once.
                 loopback_reason = Some(format!("it cannot listen on {ip}: {err:#}"));
                 bound = loopback;
                 Proxy::start_services(services(false), loopback).await
@@ -163,9 +162,10 @@ impl Job<'_> {
             "--format".to_owned(),
             "{{(index .IPAM.Config 0).Gateway}}".to_owned(),
         ];
-        // No `docker` command: no Docker on this machine, so nothing to
-        // warn about, and no containers either.
-        if self.docker_bin().is_err() {
+        // No `docker` command, or a configured one that is not there: no
+        // Docker on this machine, so nothing to warn about, and no
+        // containers either.
+        if !self.docker_bin().is_ok_and(|bin| bin.is_file()) {
             return (loopback, None);
         }
         match self.docker_capture(&args, None).await {
@@ -186,8 +186,10 @@ impl Job<'_> {
                     out.code
                 )),
             ),
-            // Docker is there and did not answer: a timeout, a stop
-            // request or an unusable client environment.
+            // A stop request ends the probe, and the job with it.
+            Err(err) if err == super::docker::CANCELED => (loopback, None),
+            // Docker is there and did not answer: a timeout or an
+            // unusable client environment.
             Err(err) => (
                 loopback,
                 Some(format!("docker network inspect bridge failed: {err}")),
