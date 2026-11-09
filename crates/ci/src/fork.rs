@@ -34,6 +34,12 @@ use crate::trust::Trust;
 const FILE_PAGES: u32 = 3;
 /// Files the card names.
 const LISTED_FILES: usize = 20;
+/// `len` as a count for the reconciler's tally: all it can hold when it
+/// does not fit.
+fn count(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
 /// What a run that a newer commit replaced is told.
 pub const SUPERSEDED: &str = "Superseded by a newer commit";
 /// What a run whose approval nobody gave in time is told.
@@ -332,17 +338,20 @@ pub async fn card_for(
     level: ForkApproval,
     files: Option<Vec<String>>,
 ) -> worker::Result<Card> {
-    let mut jobs = Vec::new();
-    for run in runs {
-        for row in store::jobs_for_run(db, run.id).await? {
-            jobs.push(CardJob {
+    let ids: Vec<u64> = runs.iter().map(|run| run.id).collect();
+    let jobs = store::jobs_of_runs(db, &ids)
+        .await?
+        .into_iter()
+        .filter_map(|row| {
+            let run = runs.iter().find(|run| run.id == row.run_id)?;
+            Some(CardJob {
                 workflow: run.workflow.clone(),
                 job: row.name,
                 template: row.template,
                 timeout_minutes: row.timeout_minutes,
-            });
-        }
-    }
+            })
+        })
+        .collect();
     let Some(run) = runs.first() else {
         return Err(worker::Error::RustError("a card of no runs".to_owned()));
     };
@@ -522,7 +531,7 @@ pub async fn sweep(
     let expired = store::expire_gates(db, before, now, PASS)
         .await
         .map_err(|err| err.to_string())?;
-    let mut changed = u32::try_from(expired.len()).unwrap_or(PASS);
+    let mut changed = count(expired.len());
     for run in &expired {
         let found = store::repo(db, run.repo_id)
             .await
@@ -539,18 +548,12 @@ pub async fn sweep(
             .await;
         }
     }
-    // The oldest few of each repository, so one repository's runs that
-    // cannot be admitted do not keep the others from being looked at.
-    let mut seen: Vec<(u64, Option<u64>, String)> = Vec::new();
-    for run in store::deferred_runs(db, PASS, PER_REPO)
+    // The oldest group of each author in each repository: a group the
+    // author's cap blocks is skipped and the next author's is taken.
+    for run in store::deferred_runs(db, PASS, PER_AUTHOR)
         .await
         .map_err(|err| err.to_string())?
     {
-        let key = (run.repo_id, run.pull_number, run.sha.clone());
-        if seen.contains(&key) {
-            continue;
-        }
-        seen.push(key);
         changed += admit(env, db, settings, tokens, &run, now).await?;
     }
     // A card a delivery never finished is made here, so the approve
@@ -576,9 +579,13 @@ pub async fn sweep(
     Ok(changed)
 }
 
-/// The most runs of one repository a reconciler pass looks at in each
-/// of its fork queues.
+/// The most runs of one repository a reconciler pass looks at in the
+/// queue of cards that were never made.
 const PER_REPO: u32 = 5;
+
+/// The most groups of one author in one repository a reconciler pass
+/// looks at in the queue of deferred runs.
+const PER_AUTHOR: u32 = 2;
 
 /// How long a waiting run may go without its check run before the
 /// reconciler makes it: the webhook is likely still at it before that.
@@ -587,8 +594,11 @@ const CARD_GRACE_MS: u64 = 60_000;
 /// What making the approval check run of a waiting run comes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardStep {
-    /// The run has its check run recorded.
+    /// Every run of the group is on the recorded check run.
     Done,
+    /// The group has a check run, and a run that joined after it is not
+    /// on it: put the run on it and list its jobs.
+    Join(u64),
     /// A check run of the right name is on the commit already, made by
     /// an earlier attempt that never recorded it: record its id.
     Adopt(u64),
@@ -597,11 +607,12 @@ pub enum CardStep {
 }
 
 /// Decides how to get the approval check run: the id recorded on the
-/// run, else one an earlier attempt left on the commit, else a new
-/// one.
+/// group (a run that joined later is put on it), else one an earlier
+/// attempt left on the commit, else a new one.
 #[must_use]
-pub const fn card_step(recorded: Option<u64>, on_commit: Option<u64>) -> CardStep {
+pub const fn card_step(recorded: Option<u64>, on_commit: Option<u64>, all_on_it: bool) -> CardStep {
     match (recorded, on_commit) {
+        (Some(id), _) if !all_on_it => CardStep::Join(id),
         (Some(_), _) => CardStep::Done,
         (None, Some(id)) => CardStep::Adopt(id),
         (None, None) => CardStep::Create,
@@ -633,7 +644,36 @@ pub async fn ensure_card(
         .await
         .map_err(|err| err.to_string())?;
     let recorded = group.iter().find_map(|member| member.gate_check_run_id);
-    if card_step(recorded, None) == CardStep::Done || group.is_empty() {
+    let all_on_it = group
+        .iter()
+        .all(|member| member.gate_check_run_id == recorded);
+    if group.is_empty() || card_step(recorded, None, all_on_it) == CardStep::Done {
+        return Ok(());
+    }
+    // A run that joined a card that exists: on it, and listed on it, so
+    // a click never approves a run the card did not show.
+    if let CardStep::Join(id) = card_step(recorded, None, all_on_it) {
+        store::set_gate_check(db, repo.id, number, &run.sha, id)
+            .await
+            .map_err(|err| err.to_string())?;
+        let group = store::gate_group(db, repo.id, number, &run.sha)
+            .await
+            .map_err(|err| err.to_string())?;
+        let files = changed_files(tokens, settings, repo, number).await;
+        let card = card_for(db, settings, repo, &group, policy.fork_approval, files)
+            .await
+            .map_err(|err| err.to_string())?;
+        let check = if group
+            .iter()
+            .any(|member| member.gate_status == GateStatus::Pending)
+        {
+            approval_check_run(&card)
+        } else {
+            waiting_check_run(&card)
+        };
+        let mut carded = run.clone();
+        carded.gate_check_run_id = Some(id);
+        update_card(tokens, settings, repo, &carded, &check).await;
         return Ok(());
     }
     let listed = tokens
@@ -649,8 +689,8 @@ pub async fn ensure_card(
         .await
         .map_err(|err| err.to_string())?;
     let on_commit = github::adoptable_card(&listed, &settings.app_id)?;
-    match card_step(recorded, on_commit) {
-        CardStep::Done => {}
+    match card_step(recorded, on_commit, all_on_it) {
+        CardStep::Done | CardStep::Join(_) => {}
         CardStep::Adopt(id) => store::set_gate_check(db, repo.id, number, &run.sha, id)
             .await
             .map_err(|err| err.to_string())?,
@@ -738,7 +778,7 @@ async fn admit(
             }
             let off = "Fork runs are off for this repository";
             after_end(env, settings, tokens, &repo, &ended, off).await;
-            return Ok(u32::try_from(ended.len()).unwrap_or(1));
+            return Ok(count(ended.len()));
         }
         crate::policy::Admission::Deferred | crate::policy::Admission::Drop => return Ok(0),
     };
@@ -750,7 +790,7 @@ async fn admit(
                 .map_err(|err| err.to_string())?,
         );
     }
-    let changed = u32::try_from(admitted.len()).unwrap_or(1);
+    let changed = count(admitted.len());
     if let Some(by) = by {
         after_approval(env, db, settings, tokens, &repo, &admitted, by).await;
         return Ok(changed);
@@ -775,12 +815,17 @@ async fn admit(
     Ok(changed)
 }
 
-/// Whether a rerun of `run` has to ask for approval again: a fork run
-/// whose approval ended without being given. A rerun of an approved run
-/// keeps its approval, since the code is the same and a rerun already
-/// needs write access.
+/// What a rerun of a fork run whose approval ended is told.
+pub const RERUN_REFUSED: &str = "This fork run was not approved. Push a new commit to ask \
+     again, or a maintainer can use /approve-run once available.";
+
+/// Whether a rerun of `run` is refused: a fork run whose approval ended
+/// without being given (expired, rejected, superseded or its pull
+/// request closed). Its jobs never ran, and resetting them would leave
+/// jobs nothing ends. A rerun of an approved run keeps its approval,
+/// since the code is the same and a rerun already needs write access.
 #[must_use]
-pub const fn rerun_reopens(run: &RunRow) -> bool {
+pub const fn rerun_refused(run: &RunRow) -> bool {
     matches!(run.trust, Trust::Fork)
         && matches!(run.gate_status, GateStatus::Expired | GateStatus::Cancelled)
 }
@@ -884,15 +929,54 @@ mod tests {
         assert!(summary.contains("a deleted fork"));
     }
 
+    fn row(trust: &str, gate: &str) -> RunRow {
+        serde_json::from_value(serde_json::json!({
+            "id": 9, "run_number": 1, "run_attempt": 1, "tenant_id": "t1",
+            "repo_id": 7, "workflow": "ci", "delivery": "d", "event": "pull_request",
+            "git_ref": "refs/pull/4/merge", "sha": "abc", "actor": "a",
+            "status": "completed", "conclusion": "cancelled", "created_at": 0,
+            "completed_at": 1, "retention_days": 30, "pull_number": 4,
+            "trust": trust, "author_login": "a", "author_association": "",
+            "gate_status": gate
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_rerun_of_a_fork_run_that_was_never_approved_is_refused() {
+        for gate in ["expired", "cancelled"] {
+            assert!(rerun_refused(&row("fork", gate)), "{gate}");
+        }
+        // An approved run keeps working, as does one that never waited,
+        // and a waiting one has no job to rerun.
+        for gate in ["approved", "none", "pending", "deferred"] {
+            assert!(!rerun_refused(&row("fork", gate)), "{gate}");
+        }
+        // The repository's own code has no approval to lack.
+        assert!(!rerun_refused(&row("trusted", "none")));
+        assert!(RERUN_REFUSED.contains("not approved"));
+        assert!(RERUN_REFUSED.contains("/approve-run"));
+    }
+
+    #[test]
+    fn a_count_saturates() {
+        assert_eq!(count(3), 3);
+        assert_eq!(count(usize::MAX), u32::MAX);
+    }
+
     #[test]
     fn a_card_is_recorded_adopted_or_made() {
-        assert_eq!(card_step(Some(5), None), CardStep::Done);
-        assert_eq!(card_step(Some(5), Some(9)), CardStep::Done);
+        assert_eq!(card_step(Some(5), None, true), CardStep::Done);
+        assert_eq!(card_step(Some(5), Some(9), true), CardStep::Done);
+        // A run that joined the group after the card was made is put on
+        // the existing card, not left off it.
+        assert_eq!(card_step(Some(5), None, false), CardStep::Join(5));
+        assert_eq!(card_step(Some(5), Some(9), false), CardStep::Join(5));
         // A delivery that made the check run and stopped before it
         // recorded the id: the retry adopts it instead of making a
         // second one whose button no run knows.
-        assert_eq!(card_step(None, Some(9)), CardStep::Adopt(9));
-        assert_eq!(card_step(None, None), CardStep::Create);
+        assert_eq!(card_step(None, Some(9), true), CardStep::Adopt(9));
+        assert_eq!(card_step(None, None, true), CardStep::Create);
     }
 
     #[test]

@@ -64,11 +64,11 @@ export function NeedsYou({ org, onChange }: { org: string; onChange: () => void 
     return null;
   }
 
-  const approve = async (job: number, fork = false) => {
+  const approve = async (job: number, fork: { card: number | null } | null = null) => {
     setBusy(job);
     setError(null);
     try {
-      await (fork ? approveForkRun(job) : approveCiJob(job));
+      await (fork ? approveForkRun(job, fork.card) : approveCiJob(job));
       reload();
       onChange();
     } catch (err) {
@@ -106,7 +106,7 @@ export function NeedsYou({ org, onChange }: { org: string; onChange: () => void 
           </>
         }
       >
-        <Button variant="outline" size="sm" disabled={busy === run.id} onClick={() => approve(run.id, true)} aria-label={`Approve and run ${run.repository} ${run.run_number}`}>
+        <Button variant="outline" size="sm" disabled={busy === run.id} onClick={() => approve(run.id, { card: run.gate?.check_run_id ?? null })} aria-label={`Approve and run ${run.repository} ${run.run_number}`}>
           {busy === run.id ? "Approving" : "Approve and run"}
         </Button>
       </Row>
