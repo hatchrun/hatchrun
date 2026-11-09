@@ -560,7 +560,6 @@ export interface ForkPolicy {
   fork_max_running: number;
   /** The longest a fork job may run, in minutes, 5 to 60. */
   fork_timeout_minutes: number;
-  pull_request_target_head_checkout: "warn" | "block";
 }
 
 export const getForkPolicy = (owner: string, repo: string) => adminOnly(() => get<ForkPolicy>(`${repoPath(owner, repo)}/fork-policy`));

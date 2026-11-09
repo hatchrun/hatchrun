@@ -1317,8 +1317,9 @@ impl Cx<'_> {
         no_content().map(Ok)
     }
 
-    /// Decides a fork pull request's run that waits for approval, for
-    /// anyone who can write to the repository (not only an admin of the
+    /// Decides a fork pull request's runs that wait for approval (every
+    /// run of its pull request at its commit, as the approval check run
+    /// lists them), for anyone who can write to the repository (not only an admin of the
     /// organization, which approving an environment needs). The first
     /// decision wins: a repeat, or a run that expired or ended, answers
     /// `409`. What follows the saved decision (waking the jobs, marking
@@ -1345,32 +1346,35 @@ impl Cx<'_> {
             &github,
             now,
         );
+        // The decision covers every waiting run of the pull request at
+        // this commit, which is what the check run's button covers too.
         if approve {
-            let Some(run) = store::approve_run(self.db, found.run.id, login, now).await? else {
+            let runs = store::approve_group(self.db, found.run.id, login, now).await?;
+            if runs.is_empty() {
                 return Ok(stop(409, "This run is not waiting for approval"));
-            };
+            }
             fork::after_approval(
                 self.env,
                 self.db,
                 self.settings,
                 &tokens,
                 &found.repo,
-                &[run],
+                &runs,
                 login,
             )
             .await;
         } else {
-            let Some(run) =
-                store::end_gate(self.db, found.run.id, "cancelled", Some(login), now).await?
-            else {
+            let runs =
+                store::end_group(self.db, found.run.id, "cancelled", Some(login), now).await?;
+            if runs.is_empty() {
                 return Ok(stop(409, "This run is not waiting for approval"));
-            };
+            }
             fork::after_end(
                 self.env,
                 self.settings,
                 &tokens,
                 &found.repo,
-                &[run],
+                &runs,
                 &fork::rejected_message(login),
             )
             .await;

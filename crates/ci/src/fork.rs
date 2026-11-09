@@ -28,6 +28,7 @@ use crate::github::{self, CONFIG_PATH, CheckAction, CheckRun, Output};
 use crate::launches;
 use crate::policy::{APPROVAL_CHECK, APPROVE_ACTION, FORK_MAX_VCPU, ForkApproval, RepoPolicy};
 use crate::store::{self, GateStatus, RepoRow, RunRow};
+use crate::trust::Trust;
 
 /// Pages of a pull request's files the card reads, 100 files each.
 const FILE_PAGES: u32 = 3;
@@ -316,8 +317,9 @@ pub fn template_vcpu(label: &str) -> Option<u32> {
     hatchrun_workflow::template(label).map(|template| template.vcpu)
 }
 
-/// The card of `run` at its repository `repo`, with the jobs its rows
-/// hold and `files` as read.
+/// The card of the waiting `runs` of one pull request and commit at their
+/// repository `repo`, with the jobs of every one of them and `files` as
+/// read: what the card lists is exactly what a click approves.
 ///
 /// # Errors
 ///
@@ -326,20 +328,24 @@ pub async fn card_for(
     db: &Db,
     settings: &Settings,
     repo: &RepoRow,
-    run: &RunRow,
+    runs: &[RunRow],
     level: ForkApproval,
     files: Option<Vec<String>>,
 ) -> worker::Result<Card> {
-    let jobs = store::jobs_for_run(db, run.id)
-        .await?
-        .into_iter()
-        .map(|row| CardJob {
-            workflow: run.workflow.clone(),
-            job: row.name,
-            template: row.template,
-            timeout_minutes: row.timeout_minutes,
-        })
-        .collect();
+    let mut jobs = Vec::new();
+    for run in runs {
+        for row in store::jobs_for_run(db, run.id).await? {
+            jobs.push(CardJob {
+                workflow: run.workflow.clone(),
+                job: row.name,
+                template: row.template,
+                timeout_minutes: row.timeout_minutes,
+            });
+        }
+    }
+    let Some(run) = runs.first() else {
+        return Err(worker::Error::RustError("a card of no runs".to_owned()));
+    };
     Ok(Card {
         sha: run.sha.clone(),
         number: run.pull_number.unwrap_or_default(),
@@ -533,18 +539,24 @@ pub async fn sweep(
             .await;
         }
     }
-    for run in store::deferred_runs(db, PASS)
+    // The oldest few of each repository, so one repository's runs that
+    // cannot be admitted do not keep the others from being looked at.
+    let mut seen: Vec<(u64, Option<u64>, String)> = Vec::new();
+    for run in store::deferred_runs(db, PASS, PER_REPO)
         .await
         .map_err(|err| err.to_string())?
     {
-        if admit(env, db, settings, tokens, &run, now).await? {
-            changed += 1;
+        let key = (run.repo_id, run.pull_number, run.sha.clone());
+        if seen.contains(&key) {
+            continue;
         }
+        seen.push(key);
+        changed += admit(env, db, settings, tokens, &run, now).await?;
     }
     // A card a delivery never finished is made here, so the approve
     // button always exists.
     let stale = now.saturating_sub(CARD_GRACE_MS);
-    for run in store::runs_without_card(db, stale, PASS)
+    for run in store::runs_without_card(db, stale, PASS, PER_REPO)
         .await
         .map_err(|err| err.to_string())?
     {
@@ -563,6 +575,10 @@ pub async fn sweep(
     }
     Ok(changed)
 }
+
+/// The most runs of one repository a reconciler pass looks at in each
+/// of its fork queues.
+const PER_REPO: u32 = 5;
 
 /// How long a waiting run may go without its check run before the
 /// reconciler makes it: the webhook is likely still at it before that.
@@ -592,10 +608,12 @@ pub const fn card_step(recorded: Option<u64>, on_commit: Option<u64>) -> CardSte
     }
 }
 
-/// Makes sure the waiting `run` has its approval check run and that its
-/// id is recorded, so the Approve button exists and its click finds the
-/// run. Safe to repeat, from the webhook and from the reconciler: it
-/// adopts a check run an earlier attempt made and did not record.
+/// Makes sure the waiting runs of `run`'s pull request and commit have
+/// one approval check run, with its id recorded on all of them, so the
+/// Approve button exists, lists every run it will approve, and its click
+/// finds them. Safe to repeat, from the webhook and from the
+/// reconciler: it adopts a card of ours an earlier attempt made and did
+/// not record, and only an undecided one (see [`github::adoptable_card`]).
 ///
 /// # Errors
 ///
@@ -608,7 +626,14 @@ pub async fn ensure_card(
     run: &RunRow,
     policy: &RepoPolicy,
 ) -> Result<(), String> {
-    if card_step(run.gate_check_run_id, None) == CardStep::Done {
+    let Some(number) = run.pull_number else {
+        return Ok(());
+    };
+    let group = store::gate_group(db, repo.id, number, &run.sha)
+        .await
+        .map_err(|err| err.to_string())?;
+    let recorded = group.iter().find_map(|member| member.gate_check_run_id);
+    if card_step(recorded, None) == CardStep::Done || group.is_empty() {
         return Ok(());
     }
     let listed = tokens
@@ -623,19 +648,22 @@ pub async fn ensure_card(
         })
         .await
         .map_err(|err| err.to_string())?;
-    let on_commit = github::check_run_first_id(&listed)?;
-    match card_step(run.gate_check_run_id, on_commit) {
+    let on_commit = github::adoptable_card(&listed, &settings.app_id)?;
+    match card_step(recorded, on_commit) {
         CardStep::Done => {}
-        CardStep::Adopt(id) => store::set_gate_check(db, &run.delivery, id)
+        CardStep::Adopt(id) => store::set_gate_check(db, repo.id, number, &run.sha, id)
             .await
             .map_err(|err| err.to_string())?,
         CardStep::Create => {
-            let pending = run.gate_status == GateStatus::Pending;
-            let files = match run.pull_number {
-                Some(number) if pending => changed_files(tokens, settings, repo, number).await,
-                _ => None,
+            let pending = group
+                .iter()
+                .any(|member| member.gate_status == GateStatus::Pending);
+            let files = if pending {
+                changed_files(tokens, settings, repo, number).await
+            } else {
+                None
             };
-            let card = card_for(db, settings, repo, run, policy.fork_approval, files)
+            let card = card_for(db, settings, repo, &group, policy.fork_approval, files)
                 .await
                 .map_err(|err| err.to_string())?;
             let check = if pending {
@@ -650,7 +678,7 @@ pub async fn ensure_card(
                 .await
                 .map_err(|err| err.to_string())?;
             let id = github::check_run_id(&response)?;
-            store::set_gate_check(db, &run.delivery, id)
+            store::set_gate_check(db, repo.id, number, &run.sha, id)
                 .await
                 .map_err(|err| err.to_string())?;
         }
@@ -658,10 +686,12 @@ pub async fn ensure_card(
     Ok(())
 }
 
-/// Decides what a deferred `run` becomes now: asks for its approval
-/// when a slot is free and the author is under the cap, runs it when
-/// no approval is needed, ends it when the repository turned fork runs
-/// off, and leaves it otherwise. Returns whether it changed.
+/// Decides what the deferred runs of `run`'s pull request and commit
+/// become now, all together (one card covers them): asks for their
+/// approval when a slot is free and the author is under the cap, runs
+/// them when no approval is needed, ends them when the repository
+/// turned fork runs off, and leaves them otherwise. Returns how many
+/// changed.
 async fn admit(
     env: &Env,
     db: &Db,
@@ -669,69 +699,90 @@ async fn admit(
     tokens: &Tokens<'_, Kv, App, Counted>,
     run: &RunRow,
     now: u64,
-) -> Result<bool, String> {
-    let Some(repo) = store::repo(db, run.repo_id)
-        .await
-        .map_err(|err| err.to_string())?
-    else {
-        return Ok(false);
+) -> Result<u32, String> {
+    let (Some(repo), Some(number)) = (
+        store::repo(db, run.repo_id)
+            .await
+            .map_err(|err| err.to_string())?,
+        run.pull_number,
+    ) else {
+        return Ok(0);
     };
     let policy = store::repo_policy(db, repo.id, repo.private)
         .await
         .map_err(|err| err.to_string())?;
-    let mut waiting = store::fork_waiting(db, repo.id, &run.author_login)
+    let mut waiting = store::fork_waiting(db, repo.id, &run.author_login, Some(number))
         .await
         .map_err(|err| err.to_string())?;
-    // The run asking is one of the deferred; it must not count against
-    // itself.
+    // The runs asking are deferred; they must not count against
+    // themselves.
     waiting.deferred = 0;
+    let group: Vec<RunRow> = store::gate_group(db, repo.id, number, &run.sha)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .filter(|member| member.gate_status == GateStatus::Deferred)
+        .collect();
     let slot = crate::policy::admission(&policy, &run.author_association, waiting);
     let (status, by) = match slot {
         crate::policy::Admission::Pending => (GateStatus::Pending, None),
         crate::policy::Admission::Run => (GateStatus::Approved, Some("policy")),
         crate::policy::Admission::Off => {
-            let Some(ended) = store::end_gate(db, run.id, "cancelled", None, now)
-                .await
-                .map_err(|err| err.to_string())?
-            else {
-                return Ok(false);
-            };
+            let mut ended = Vec::new();
+            for member in &group {
+                ended.extend(
+                    store::end_gate(db, member.id, "cancelled", None, now)
+                        .await
+                        .map_err(|err| err.to_string())?,
+                );
+            }
             let off = "Fork runs are off for this repository";
-            after_end(env, settings, tokens, &repo, &[ended], off).await;
-            return Ok(true);
+            after_end(env, settings, tokens, &repo, &ended, off).await;
+            return Ok(u32::try_from(ended.len()).unwrap_or(1));
         }
-        crate::policy::Admission::Deferred | crate::policy::Admission::Drop => return Ok(false),
+        crate::policy::Admission::Deferred | crate::policy::Admission::Drop => return Ok(0),
     };
-    let Some(admitted) = store::admit_run(db, run.id, status, by, now)
-        .await
-        .map_err(|err| err.to_string())?
-    else {
-        return Ok(false);
-    };
-    if let Some(by) = by {
-        after_approval(env, db, settings, tokens, &repo, &[admitted], by).await;
-        return Ok(true);
+    let mut admitted = Vec::new();
+    for member in &group {
+        admitted.extend(
+            store::admit_run(db, member.id, status, by, now)
+                .await
+                .map_err(|err| err.to_string())?,
+        );
     }
-    if admitted.gate_check_run_id.is_some() {
-        let files = match admitted.pull_number {
-            Some(number) => changed_files(tokens, settings, &repo, number).await,
-            None => None,
-        };
-        let card = card_for(db, settings, &repo, &admitted, policy.fork_approval, files)
+    let changed = u32::try_from(admitted.len()).unwrap_or(1);
+    if let Some(by) = by {
+        after_approval(env, db, settings, tokens, &repo, &admitted, by).await;
+        return Ok(changed);
+    }
+    let Some(first) = admitted.first() else {
+        return Ok(0);
+    };
+    if first.gate_check_run_id.is_some() {
+        // The waiting card becomes the approval card, listing every run
+        // the click will approve.
+        let everyone = store::gate_group(db, repo.id, number, &run.sha)
             .await
             .map_err(|err| err.to_string())?;
-        update_card(
-            tokens,
-            settings,
-            &repo,
-            &admitted,
-            &approval_check_run(&card),
-        )
-        .await;
-    } else if let Err(err) = ensure_card(tokens, db, settings, &repo, &admitted, &policy).await {
-        console_error!("run {}: make the approval check run: {err}", admitted.id);
+        let files = changed_files(tokens, settings, &repo, number).await;
+        let card = card_for(db, settings, &repo, &everyone, policy.fork_approval, files)
+            .await
+            .map_err(|err| err.to_string())?;
+        update_card(tokens, settings, &repo, first, &approval_check_run(&card)).await;
+    } else if let Err(err) = ensure_card(tokens, db, settings, &repo, first, &policy).await {
+        console_error!("run {}: make the approval check run: {err}", first.id);
     }
-    Ok(true)
+    Ok(changed)
+}
+
+/// Whether a rerun of `run` has to ask for approval again: a fork run
+/// whose approval ended without being given. A rerun of an approved run
+/// keeps its approval, since the code is the same and a rerun already
+/// needs write access.
+#[must_use]
+pub const fn rerun_reopens(run: &RunRow) -> bool {
+    matches!(run.trust, Trust::Fork)
+        && matches!(run.gate_status, GateStatus::Expired | GateStatus::Cancelled)
 }
 
 /// Whether a run still waits for a decision.

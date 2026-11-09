@@ -55,18 +55,9 @@ pub enum ForkApproval {
     AllOutside,
 }
 
-/// What to do with a head checkout in `pull_request_target`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HeadCheckout {
-    /// Warn in the run summary.
-    Warn,
-    /// Fail the run at planning.
-    Block,
-}
-
 /// A repository's policy for pull requests from forks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoPolicy {
     /// Whether fork pull requests run.
     pub fork_runs: ForkRuns,
@@ -76,8 +67,6 @@ pub struct RepoPolicy {
     pub fork_max_running: u32,
     /// The longest a fork job may run, in minutes, 5 to 60.
     pub fork_timeout_minutes: u32,
-    /// The rule for a head checkout in `pull_request_target`.
-    pub pull_request_target_head_checkout: HeadCheckout,
 }
 
 impl RepoPolicy {
@@ -90,7 +79,6 @@ impl RepoPolicy {
             fork_approval: ForkApproval::FirstTimeContributors,
             fork_max_running: 2,
             fork_timeout_minutes: 30,
-            pull_request_target_head_checkout: HeadCheckout::Warn,
         }
     }
 
@@ -149,27 +137,6 @@ impl ForkApproval {
             "first_timers" => Some(Self::FirstTimers),
             "first_time_contributors" => Some(Self::FirstTimeContributors),
             "all_outside" => Some(Self::AllOutside),
-            _ => None,
-        }
-    }
-}
-
-impl HeadCheckout {
-    /// The word the column stores.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Warn => "warn",
-            Self::Block => "block",
-        }
-    }
-
-    /// The rule a stored word names.
-    #[must_use]
-    pub fn parse(word: &str) -> Option<Self> {
-        match word {
-            "warn" => Some(Self::Warn),
-            "block" => Some(Self::Block),
             _ => None,
         }
     }
@@ -292,7 +259,6 @@ mod tests {
         assert_eq!(policy.fork_approval, ForkApproval::FirstTimeContributors);
         assert_eq!(policy.fork_max_running, 2);
         assert_eq!(policy.fork_timeout_minutes, 30);
-        assert_eq!(policy.pull_request_target_head_checkout, HeadCheckout::Warn);
     }
 
     #[test]
@@ -437,9 +403,6 @@ mod tests {
         }
         for runs in [ForkRuns::Off, ForkRuns::On] {
             assert_eq!(ForkRuns::parse(runs.as_str()), Some(runs));
-        }
-        for rule in [HeadCheckout::Warn, HeadCheckout::Block] {
-            assert_eq!(HeadCheckout::parse(rule.as_str()), Some(rule));
         }
         assert_eq!(ForkApproval::parse("everyone"), None);
     }

@@ -458,7 +458,7 @@ pub async fn create(
                 tenant_id: req.tenant_id,
             };
             let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
-            crate::remote::read_library(&github, &parsed, &names)
+            crate::remote::read_library(&github, &parsed, &names, req.origin.trust == Trust::Fork)
                 .await
                 .map_err(fail)?
         }

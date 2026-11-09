@@ -451,7 +451,7 @@ impl Cx<'_> {
         if !open {
             return Ok(Err(Outcome::Ignored("pull request is closed".to_owned())));
         }
-        let waiting = store::fork_waiting(self.db, pr.repo.id, &pr.author).await?;
+        let waiting = store::fork_waiting(self.db, pr.repo.id, &pr.author, Some(pr.number)).await?;
         let admission = policy::admission(&policy, &pr.author_association, waiting);
         if let Some(reason) = policy::refusal(admission) {
             return Ok(Err(Outcome::Ignored(reason.to_owned())));
@@ -781,6 +781,18 @@ impl Cx<'_> {
         Ok(Outcome::Done(ids))
     }
 
+    /// Puts a new approval check run on the commit of a run whose
+    /// approval ended and that a rerun reopened.
+    async fn ask_again(&self, run: &store::RunRow) -> Result<()> {
+        let Some(repo) = store::repo(self.db, run.repo_id).await? else {
+            return Ok(());
+        };
+        let policy = store::repo_policy(self.db, repo.id, repo.private).await?;
+        fork::ensure_card(self.tokens, self.db, self.settings, &repo, run, &policy)
+            .await
+            .map_err(fail)
+    }
+
     async fn rerun(&self, rerun: &Rerequested) -> Result<Outcome> {
         let Some(job) = store::job(self.db, rerun.job_id).await? else {
             return Ok(Outcome::Ignored("check run of an unknown job".to_owned()));
@@ -793,6 +805,14 @@ impl Cx<'_> {
                 "check run of another repository".to_owned(),
             ));
         }
+        // A fork run that expired, was rejected or superseded has no
+        // approval: its jobs would be reset and held with nothing to
+        // end them. The rerun asks for the approval again instead.
+        let reopened = if fork::rerun_reopens(&run) {
+            store::reopen_gate(self.db, run.id).await?
+        } else {
+            None
+        };
         let url = format!(
             "https://run/rerun?job={}&run={}&tenant={}&days={}",
             job.id, run.id, run.tenant_id, run.retention_days
@@ -805,7 +825,12 @@ impl Cx<'_> {
             .await?;
         match response.status_code() {
             // 204 means nothing to reset, such as a job that still runs.
-            200..=299 => Ok(Outcome::Done(vec![run.id])),
+            200..=299 => {
+                if let Some(reopened) = &reopened {
+                    self.ask_again(reopened).await?;
+                }
+                Ok(Outcome::Done(vec![run.id]))
+            }
             // The earlier attempt's log is still uploading.
             409 => Ok(Outcome::Retry),
             404 => Ok(Outcome::Ignored("run is no longer held".to_owned())),

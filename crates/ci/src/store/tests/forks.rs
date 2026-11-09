@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
-use crate::policy::{ForkApproval, ForkRuns, HeadCheckout, RepoPolicy};
+use crate::policy::{ForkApproval, ForkRuns, RepoPolicy};
 
 /// A fork run of pull request `number` at `sha` by `author`, in `gate`.
 fn fork_run(
@@ -90,7 +90,6 @@ fn a_saved_policy_wins_over_the_defaults_and_can_be_changed() {
         fork_approval: ForkApproval::AllOutside,
         fork_max_running: 4,
         fork_timeout_minutes: 15,
-        pull_request_target_head_checkout: HeadCheckout::Block,
     };
     db.wait(put_repo_policy(db.db(), 7, &policy, 5)).unwrap();
     // Even for a private repository, the saved row decides.
@@ -120,19 +119,19 @@ fn waiting_counts_pending_deferred_and_the_authors_active_runs() {
     fork_run(&db, "b", 2, "s2", "mallory", GateStatus::Deferred, 2);
     fork_run(&db, "c", 3, "s3", "eve", GateStatus::Pending, 3);
     fork_run(&db, "d", 4, "s4", "mallory", GateStatus::NotGated, 4);
-    let waiting = db.wait(fork_waiting(db.db(), 7, "mallory")).unwrap();
+    let waiting = db.wait(fork_waiting(db.db(), 7, "mallory", None)).unwrap();
     assert_eq!((waiting.pending, waiting.deferred), (2, 1));
     assert_eq!(waiting.author_active, 2);
-    let eve = db.wait(fork_waiting(db.db(), 7, "eve")).unwrap();
+    let eve = db.wait(fork_waiting(db.db(), 7, "eve", None)).unwrap();
     assert_eq!(eve.author_active, 1);
-    let nobody = db.wait(fork_waiting(db.db(), 7, "nobody")).unwrap();
+    let nobody = db.wait(fork_waiting(db.db(), 7, "nobody", None)).unwrap();
     assert_eq!(nobody.author_active, 0);
     // A run that ended no longer counts for its author.
     db.run(
         "UPDATE ci_runs SET status = 'completed' WHERE delivery = 'd'",
         &[],
     );
-    let waiting = db.wait(fork_waiting(db.db(), 7, "mallory")).unwrap();
+    let waiting = db.wait(fork_waiting(db.db(), 7, "mallory", None)).unwrap();
     assert_eq!(waiting.author_active, 1);
 }
 
@@ -194,9 +193,9 @@ fn the_button_approves_only_the_runs_on_its_check_run_in_its_repository() {
     let a = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 1);
     let b = fork_run(&db, "a2", 1, "s1", "mallory", GateStatus::Pending, 1);
     let other = fork_run(&db, "b", 2, "s2", "eve", GateStatus::Pending, 2);
-    db.wait(set_gate_check(db.db(), "a", 5150)).unwrap();
-    db.wait(set_gate_check(db.db(), "a2", 5150)).unwrap();
-    db.wait(set_gate_check(db.db(), "b", 6000)).unwrap();
+    db.wait(set_gate_check(db.db(), 7, 1, "s1", 5150)).unwrap();
+    db.wait(set_gate_check(db.db(), 7, 1, "s1", 5150)).unwrap();
+    db.wait(set_gate_check(db.db(), 7, 2, "s2", 6000)).unwrap();
     assert_eq!(
         db.wait(approve_by_check(db.db(), "t1", 8, 5150, "m", 9))
             .unwrap()
@@ -321,10 +320,10 @@ fn deferred_runs_are_listed_oldest_first_and_admitted_once() {
     let first = fork_run(&db, "d1", 100, "s", "eve", GateStatus::Deferred, 10);
     let second = fork_run(&db, "d2", 101, "s", "eve", GateStatus::Deferred, 11);
     fork_run(&db, "p", 102, "s", "eve", GateStatus::Pending, 5);
-    let listed = db.wait(deferred_runs(db.db(), 10)).unwrap();
+    let listed = db.wait(deferred_runs(db.db(), 10, 5)).unwrap();
     let ids: Vec<u64> = listed.iter().map(|run| run.id).collect();
     assert_eq!(ids, [first.id, second.id]);
-    assert_eq!(db.wait(deferred_runs(db.db(), 1)).unwrap().len(), 1);
+    assert_eq!(db.wait(deferred_runs(db.db(), 1, 5)).unwrap().len(), 1);
     let admitted = db
         .wait(admit_run(db.db(), first.id, GateStatus::Pending, None, 20))
         .unwrap()
@@ -349,7 +348,7 @@ fn deferred_runs_are_listed_oldest_first_and_admitted_once() {
         .unwrap();
     assert_eq!(auto.gate_status, GateStatus::Approved);
     assert_eq!(auto.gate_by.as_deref(), Some("policy"));
-    assert_eq!(db.wait(deferred_runs(db.db(), 10)).unwrap().len(), 0);
+    assert_eq!(db.wait(deferred_runs(db.db(), 10, 5)).unwrap().len(), 0);
 }
 
 #[test]
@@ -368,7 +367,7 @@ fn an_author_over_the_cap_is_deferred_then_admitted_when_runs_end() {
             1,
         );
     }
-    let waiting = db.wait(fork_waiting(db.db(), 7, "mallory")).unwrap();
+    let waiting = db.wait(fork_waiting(db.db(), 7, "mallory", None)).unwrap();
     assert_eq!(waiting.author_active, 3);
     assert_eq!(
         crate::policy::admission(&policy, "CONTRIBUTOR", waiting),
@@ -376,7 +375,7 @@ fn an_author_over_the_cap_is_deferred_then_admitted_when_runs_end() {
     );
     let deferred = fork_run(&db, "late", 9, "s", "mallory", GateStatus::Deferred, 5);
     // The deferred run is not one of the author's active runs.
-    let waiting = db.wait(fork_waiting(db.db(), 7, "mallory")).unwrap();
+    let waiting = db.wait(fork_waiting(db.db(), 7, "mallory", None)).unwrap();
     assert_eq!(waiting.author_active, 3);
     assert_eq!(waiting.deferred, 1);
     // One of the three ends: the author is under the cap, and the
@@ -386,7 +385,7 @@ fn an_author_over_the_cap_is_deferred_then_admitted_when_runs_end() {
         "UPDATE ci_runs SET status = 'completed' WHERE delivery = 'a0'",
         &[],
     );
-    let mut waiting = db.wait(fork_waiting(db.db(), 7, "mallory")).unwrap();
+    let mut waiting = db.wait(fork_waiting(db.db(), 7, "mallory", None)).unwrap();
     assert_eq!(waiting.author_active, 2);
     waiting.deferred = 0;
     assert_eq!(
@@ -419,14 +418,14 @@ fn a_waiting_run_with_no_check_run_is_found_for_the_reconciler() {
     let carded = fork_run(&db, "carded", 3, "s3", "mallory", GateStatus::Pending, 10);
     fork_run(&db, "young", 4, "s4", "mallory", GateStatus::Pending, 900);
     fork_run(&db, "free", 5, "s5", "mallory", GateStatus::NotGated, 10);
-    db.wait(set_gate_check(db.db(), "carded", 5150)).unwrap();
-    let found = db.wait(runs_without_card(db.db(), 500, 10)).unwrap();
+    db.wait(set_gate_check(db.db(), 7, 3, "s3", 5150)).unwrap();
+    let found = db.wait(runs_without_card(db.db(), 500, 10, 5)).unwrap();
     let ids: Vec<u64> = found.iter().map(|run| run.id).collect();
     assert_eq!(ids, [lost.id, lost_deferred.id]);
     assert!(!ids.contains(&carded.id));
     // Once its id is recorded (adopted or made), it is not found again.
-    db.wait(set_gate_check(db.db(), "lost", 6000)).unwrap();
-    let found = db.wait(runs_without_card(db.db(), 500, 10)).unwrap();
+    db.wait(set_gate_check(db.db(), 7, 1, "s1", 6000)).unwrap();
+    let found = db.wait(runs_without_card(db.db(), 500, 10, 5)).unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, lost_deferred.id);
     // And the button, which finds the run by its check run id, works.
@@ -575,4 +574,206 @@ fn a_pull_request_row_keeps_its_authors_association_and_head_repository() {
         )
         .unwrap();
     assert_eq!(head, None);
+}
+
+fn second_repo(db: &TestDb) {
+    let repo = RepoRow {
+        id: 8,
+        tenant_id: "t1".into(),
+        installation_id: 99,
+        full_name: "acme/other".into(),
+        default_branch: "main".into(),
+        private: false,
+    };
+    db.wait(upsert_repo(db.db(), &repo, 1)).unwrap();
+}
+
+#[test]
+fn one_card_covers_every_waiting_run_of_the_commit_and_one_click_decides_them_all() {
+    let db = setup();
+    let ci = fork_run(&db, "d1", 4, "head", "mallory", GateStatus::Pending, 1);
+    let mut lint = new_run("d1", "lint", 1);
+    lint.event = "pull_request".into();
+    lint.git_ref = "refs/pull/4/merge".into();
+    lint.sha = "head".into();
+    lint.pull_number = Some(4);
+    lint.trust = Trust::Fork;
+    lint.author_login = "mallory".into();
+    lint.gate_status = GateStatus::Pending;
+    let lint = db.wait(insert_run(db.db(), &lint)).unwrap().unwrap();
+    // The same pull request at an older commit is a different card.
+    let older = fork_run(&db, "d0", 4, "older", "mallory", GateStatus::Pending, 0);
+    let group = db.wait(gate_group(db.db(), 7, 4, "head")).unwrap();
+    let ids: Vec<u64> = group.iter().map(|run| run.id).collect();
+    assert_eq!(ids, [ci.id, lint.id]);
+    db.wait(set_gate_check(db.db(), 7, 4, "head", 5150))
+        .unwrap();
+    for id in [ci.id, lint.id] {
+        let read = db.wait(super::run(db.db(), id)).unwrap().unwrap();
+        assert_eq!(read.gate_check_run_id, Some(5150));
+    }
+    let read = db.wait(super::run(db.db(), older.id)).unwrap().unwrap();
+    assert_eq!(
+        read.gate_check_run_id, None,
+        "another commit has its own card"
+    );
+    // Approving from the app approves what the card lists, no more.
+    let approved = db
+        .wait(approve_group(db.db(), ci.id, "maintainer", 10))
+        .unwrap();
+    let mut got: Vec<u64> = approved.iter().map(|run| run.id).collect();
+    got.sort_unstable();
+    assert_eq!(got, [ci.id, lint.id]);
+    let read = db.wait(super::run(db.db(), older.id)).unwrap().unwrap();
+    assert_eq!(read.gate_status, GateStatus::Pending);
+    assert_eq!(
+        db.wait(approve_group(db.db(), ci.id, "again", 11))
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn the_apps_reject_cancels_what_the_card_lists() {
+    let db = setup();
+    let a = fork_run(&db, "d1", 4, "head", "mallory", GateStatus::Pending, 1);
+    let b = fork_run(&db, "d2", 4, "head", "mallory", GateStatus::Deferred, 2);
+    let other = fork_run(&db, "d3", 5, "head", "eve", GateStatus::Pending, 3);
+    let ended = db
+        .wait(end_group(db.db(), b.id, "cancelled", Some("maintainer"), 9))
+        .unwrap();
+    let mut ids: Vec<u64> = ended.iter().map(|run| run.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [a.id, b.id]);
+    let read = db.wait(super::run(db.db(), other.id)).unwrap().unwrap();
+    assert_eq!(read.gate_status, GateStatus::Pending);
+}
+
+#[test]
+fn the_button_also_approves_a_deferred_run_its_card_lists() {
+    let db = setup();
+    let pending = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 1);
+    let deferred = fork_run(&db, "b", 1, "s1", "mallory", GateStatus::Deferred, 2);
+    db.wait(set_gate_check(db.db(), 7, 1, "s1", 5150)).unwrap();
+    let approved = db
+        .wait(approve_by_check(db.db(), "t1", 7, 5150, "m", 9))
+        .unwrap();
+    let mut ids: Vec<u64> = approved.iter().map(|run| run.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [pending.id, deferred.id]);
+}
+
+#[test]
+fn stuck_runs_of_one_repository_do_not_starve_the_others() {
+    let db = setup();
+    second_repo(&db);
+    for n in 0..7 {
+        let run = fork_run(
+            &db,
+            &format!("stuck{n}"),
+            n + 1,
+            "s",
+            "mallory",
+            GateStatus::Deferred,
+            10 + n,
+        );
+        db.run(
+            "UPDATE ci_runs SET gate_check_run_id = NULL WHERE id = $1",
+            &params![run.id],
+        );
+    }
+    let other = fork_run(&db, "other", 50, "s", "eve", GateStatus::Deferred, 900);
+    db.run(
+        "UPDATE ci_runs SET repo_id = 8 WHERE id = $1",
+        &params![other.id],
+    );
+    // Seven older runs of repository 7 would fill a plain oldest-first
+    // page; the window keeps five of each repository.
+    let listed = db.wait(deferred_runs(db.db(), 6, 5)).unwrap();
+    let repos: Vec<u64> = listed.iter().map(|run| run.repo_id).collect();
+    assert_eq!(repos.iter().filter(|&&id| id == 7).count(), 5);
+    assert!(listed.iter().any(|run| run.id == other.id), "{repos:?}");
+    let cards = db.wait(runs_without_card(db.db(), 10_000, 6, 5)).unwrap();
+    assert_eq!(cards.iter().filter(|run| run.repo_id == 7).count(), 5);
+    assert!(cards.iter().any(|run| run.id == other.id));
+}
+
+#[test]
+fn an_authors_cap_counts_pull_requests_not_runs() {
+    let db = setup();
+    // One pull request with three workflows is three runs and one pull
+    // request.
+    for (n, workflow) in ["ci", "lint", "docs"].into_iter().enumerate() {
+        let mut new = new_run(&format!("d{n}"), workflow, 1);
+        new.event = "pull_request".into();
+        new.git_ref = "refs/pull/4/merge".into();
+        new.pull_number = Some(4);
+        new.trust = Trust::Fork;
+        new.author_login = "mallory".into();
+        new.gate_status = GateStatus::NotGated;
+        db.wait(insert_run(db.db(), &new)).unwrap().unwrap();
+    }
+    let waiting = db.wait(fork_waiting(db.db(), 7, "mallory", None)).unwrap();
+    assert_eq!(waiting.author_active, 1);
+    fork_run(&db, "p5", 5, "s", "mallory", GateStatus::NotGated, 2);
+    fork_run(&db, "p6", 6, "s", "mallory", GateStatus::Pending, 3);
+    let waiting = db.wait(fork_waiting(db.db(), 7, "mallory", None)).unwrap();
+    assert_eq!(waiting.author_active, 3);
+    // A new commit on a pull request that is active already is not a
+    // fourth pull request.
+    let again = db
+        .wait(fork_waiting(db.db(), 7, "mallory", Some(4)))
+        .unwrap();
+    assert_eq!(again.author_active, 2);
+}
+
+#[test]
+fn a_fork_run_whose_approval_ended_asks_again_when_rerun() {
+    let db = setup();
+    let expired = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 1);
+    db.wait(set_gate_check(db.db(), 7, 1, "s1", 5150)).unwrap();
+    db.wait(end_gate(db.db(), expired.id, "expired", None, 5))
+        .unwrap()
+        .unwrap();
+    let reopened = db.wait(reopen_gate(db.db(), expired.id)).unwrap().unwrap();
+    assert_eq!(reopened.gate_status, GateStatus::Pending);
+    assert_eq!((reopened.gate_by, reopened.gate_at), (None, None));
+    assert_eq!(reopened.gate_check_run_id, None, "the old card is decided");
+    // Pending again: a second rerun changes nothing.
+    assert!(db.wait(reopen_gate(db.db(), expired.id)).unwrap().is_none());
+    let cancelled = fork_run(&db, "b", 2, "s2", "mallory", GateStatus::Pending, 2);
+    db.wait(end_gate(db.db(), cancelled.id, "cancelled", Some("m"), 6))
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.wait(reopen_gate(db.db(), cancelled.id))
+            .unwrap()
+            .is_some()
+    );
+    // An approved run keeps its approval, and a trusted run has none.
+    let approved = fork_run(&db, "c", 3, "s3", "mallory", GateStatus::Pending, 3);
+    db.wait(approve_run(db.db(), approved.id, "m", 7))
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.wait(reopen_gate(db.db(), approved.id))
+            .unwrap()
+            .is_none()
+    );
+    let own = db
+        .wait(insert_run(db.db(), &new_run("push", "ci", 4)))
+        .unwrap()
+        .unwrap();
+    assert!(db.wait(reopen_gate(db.db(), own.id)).unwrap().is_none());
+    assert!(!crate::fork::rerun_reopens(&approved));
+    assert!(crate::fork::rerun_reopens(&expired_row(&db, expired.id)));
+}
+
+fn expired_row(db: &TestDb, id: u64) -> RunRow {
+    db.run(
+        "UPDATE ci_runs SET gate_status = 'expired' WHERE id = $1",
+        &params![id],
+    );
+    db.wait(super::run(db.db(), id)).unwrap().unwrap()
 }

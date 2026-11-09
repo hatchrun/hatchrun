@@ -420,7 +420,7 @@ pub fn check_runs_named(api: &str, repo: &str, sha: &str, name: &str, token: &st
     rest(
         "GET",
         format!(
-            "{api}/repos/{repo}/commits/{}/check-runs?check_name={}&per_page=1",
+            "{api}/repos/{repo}/commits/{}/check-runs?check_name={}&per_page=100",
             encode(sha),
             encode(name)
         ),
@@ -441,13 +441,15 @@ pub fn check_run_total(response: &Response) -> Result<u64, String> {
     decode::<Listed>(response, "check runs").map(|l| l.total_count)
 }
 
-/// The id of the first check run [`check_runs_named`] found, `None`
-/// when there is none.
+/// The id of the approval card an earlier attempt left on the commit,
+/// from the answer of [`check_runs_named`]: made by this App (`app_id`)
+/// and still asking (`action_required`). A card that was decided,
+/// waiting for a slot, or made by anyone else is never adopted.
 ///
 /// # Errors
 ///
 /// GitHub's answer when it is not a check run list.
-pub fn check_run_first_id(response: &Response) -> Result<Option<u64>, String> {
+pub fn adoptable_card(response: &Response, app_id: &str) -> Result<Option<u64>, String> {
     #[derive(Deserialize)]
     struct Listed {
         #[serde(default)]
@@ -456,8 +458,27 @@ pub fn check_run_first_id(response: &Response) -> Result<Option<u64>, String> {
     #[derive(Deserialize)]
     struct Found {
         id: u64,
+        #[serde(default)]
+        conclusion: Option<String>,
+        #[serde(default)]
+        app: Option<App>,
     }
-    decode::<Listed>(response, "check runs").map(|l| l.check_runs.first().map(|c| c.id))
+    #[derive(Deserialize)]
+    struct App {
+        id: u64,
+    }
+    let listed = decode::<Listed>(response, "check runs")?;
+    Ok(listed
+        .check_runs
+        .into_iter()
+        .find(|check| {
+            check.conclusion.as_deref() == Some("action_required")
+                && check
+                    .app
+                    .as_ref()
+                    .is_some_and(|app| app.id.to_string() == app_id)
+        })
+        .map(|check| check.id))
 }
 
 /// Creates a check run.
@@ -469,20 +490,25 @@ pub fn create_check_run(api: &str, repo: &str, token: &str, run: &CheckRun) -> R
     )
 }
 
-/// Updates check run `id`. GitHub does not take `head_sha` here.
+/// Updates check run `id`. GitHub does not take `head_sha` here. The
+/// body always names `actions`, empty or not: a PATCH that leaves it out
+/// keeps the buttons the check run has, and a decided approval would
+/// still offer "Approve and run".
 #[must_use]
 pub fn update_check_run(api: &str, repo: &str, id: u64, token: &str, run: &CheckRun) -> Request {
     let run = CheckRun {
         head_sha: String::new(),
         ..run.clone()
     };
+    let mut body = serde_json::to_value(&run).unwrap_or_default();
+    body["actions"] = serde_json::to_value(&run.actions).unwrap_or_default();
     json_body(
         rest(
             "PATCH",
             format!("{api}/repos/{repo}/check-runs/{id}"),
             token,
         ),
-        &run,
+        &body,
     )
 }
 
@@ -768,15 +794,67 @@ mod tests {
     }
 
     #[test]
-    fn the_first_check_run_of_a_list_is_found() {
-        let found = answered(
-            200,
-            r#"{"total_count":1,"check_runs":[{"id":5150,"name":"x"}]}"#,
-        );
-        assert_eq!(check_run_first_id(&found), Ok(Some(5150)));
-        let none = answered(200, r#"{"total_count":0,"check_runs":[]}"#);
-        assert_eq!(check_run_first_id(&none), Ok(None));
-        assert!(check_run_first_id(&answered(500, "boom")).is_err());
+    fn only_our_own_pending_card_is_adopted() {
+        let list = |checks: &str| answered(200, &format!(r#"{{"check_runs":[{checks}]}}"#));
+        let card = |id: u64, app: u64, conclusion: &str| {
+            format!(r#"{{"id":{id},"conclusion":"{conclusion}","app":{{"id":{app}}}}}"#)
+        };
+        // Ours and asking: adopted.
+        let ours = list(&card(5150, 77, "action_required"));
+        assert_eq!(adoptable_card(&ours, "77"), Ok(Some(5150)));
+        // Another App's check run of the same name is not ours to use.
+        let other = list(&card(5151, 78, "action_required"));
+        assert_eq!(adoptable_card(&other, "77"), Ok(None));
+        // A decided or waiting card is never adopted.
+        for conclusion in ["neutral", "success", "cancelled"] {
+            let done = list(&card(5152, 77, conclusion));
+            assert_eq!(adoptable_card(&done, "77"), Ok(None), "{conclusion}");
+        }
+        // The first that qualifies wins, whatever comes before it.
+        let mixed = list(&format!(
+            "{},{},{}",
+            card(1, 78, "action_required"),
+            card(2, 77, "neutral"),
+            card(3, 77, "action_required")
+        ));
+        assert_eq!(adoptable_card(&mixed, "77"), Ok(Some(3)));
+        assert_eq!(adoptable_card(&answered(200, "{}"), "77"), Ok(None));
+        assert!(adoptable_card(&answered(500, "boom"), "77").is_err());
+    }
+
+    #[test]
+    fn an_update_names_its_actions_so_a_decided_card_loses_its_button() {
+        let body = json(&update_check_run(
+            "https://api.github.com",
+            "o/w",
+            9,
+            "tok",
+            &run(),
+        ));
+        assert_eq!(body["actions"], serde_json::json!([]));
+        assert!(body.get("head_sha").is_none());
+        // A create leaves an empty list out; an update never does.
+        let create = json(&create_check_run(
+            "https://api.github.com",
+            "o/w",
+            "tok",
+            &run(),
+        ));
+        assert!(create.get("actions").is_none());
+        let mut with = run();
+        with.actions = vec![CheckAction {
+            label: "Approve and run".into(),
+            description: "d".into(),
+            identifier: "approve-fork-run".into(),
+        }];
+        let body = json(&update_check_run(
+            "https://api.github.com",
+            "o/w",
+            9,
+            "tok",
+            &with,
+        ));
+        assert_eq!(body["actions"][0]["identifier"], "approve-fork-run");
     }
 
     #[test]

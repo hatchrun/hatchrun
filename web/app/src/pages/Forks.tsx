@@ -140,17 +140,6 @@ function PolicyForm({ owner, name, policy }: { owner: string; name: string; poli
           />
         </label>
       </div>
-      <label className={LABEL}>
-        A pull_request_target workflow that checks out the pull request head
-        <select
-          value={draft.pull_request_target_head_checkout}
-          onChange={(event) => set("pull_request_target_head_checkout", event.target.value as ForkPolicy["pull_request_target_head_checkout"])}
-          className={`${FIELD} !h-8 max-w-[240px]`}
-        >
-          <option value="warn">Warn in the run summary</option>
-          <option value="block">Fail the run</option>
-        </select>
-      </label>
       <div className="flex items-center gap-3">
         <button type="submit" className={BTN_PRIMARY} disabled={busy}>
           {busy ? "Saving" : "Save"}

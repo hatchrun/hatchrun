@@ -290,6 +290,15 @@ enum ForkGate {
 /// maintainer's approval.
 pub const FORK_APPROVAL_HOLD: &str = "fork_approval";
 
+/// Whether a job just held for its run's approval missed the decision:
+/// the run no longer waits (or is gone), so nothing will wake the job.
+const fn lost_wake(gate_after_hold: Option<GateStatus>) -> bool {
+    match gate_after_hold {
+        Some(status) => !status.waits(),
+        None => true,
+    }
+}
+
 /// What a job is told while its run waits for an approval.
 fn approval_message(repo: &str, app_url: &str, run_id: u64) -> String {
     format!(
@@ -323,6 +332,21 @@ async fn fork_open(
                 .map_or_else(String::new, |repo| repo.full_name);
             let message = approval_message(&repo, &settings.app_url, run.id);
             hold_job(env, db, job, FORK_APPROVAL_HOLD, &message, now).await?;
+            // A decision between the read above and the hold looked for
+            // held jobs before this one was held, and woke nothing. The
+            // gate is read again after the hold: a wake that was lost is
+            // sent here.
+            let after = store::run(db, run.id)
+                .await
+                .map_err(|err| err.to_string())?
+                .map(|run| run.gate_status);
+            if lost_wake(after) {
+                let woken = [Woken {
+                    job_id: job.id,
+                    attempt: job.attempt,
+                }];
+                send_wakes(env, &woken).await?;
+            }
             return Ok(ForkGate::Done);
         }
         // The run's object ends the job, with the reason.
@@ -632,6 +656,20 @@ mod fork_tests {
         assert!(message.contains("https://app.example/ci/acme/app/runs/12"));
         assert_eq!(FORK_APPROVAL_HOLD, "fork_approval");
         assert_eq!(FORK_LIMIT_HOLD, "fork_limit");
+    }
+
+    #[test]
+    fn a_decision_that_lands_after_the_gate_read_is_not_lost() {
+        // The run was pending when the consumer read it; this is what it
+        // finds after it wrote the hold.
+        assert!(lost_wake(Some(GateStatus::Approved)));
+        assert!(lost_wake(Some(GateStatus::Cancelled)));
+        assert!(lost_wake(Some(GateStatus::Expired)));
+        assert!(lost_wake(Some(GateStatus::NotGated)));
+        assert!(lost_wake(None));
+        // Still waiting: the decision's own wake will find the held job.
+        assert!(!lost_wake(Some(GateStatus::Pending)));
+        assert!(!lost_wake(Some(GateStatus::Deferred)));
     }
 
     #[test]

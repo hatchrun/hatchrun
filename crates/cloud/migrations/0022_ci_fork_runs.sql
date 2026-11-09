@@ -58,7 +58,7 @@ ALTER TABLE ci_pulls ALTER COLUMN author_association DROP DEFAULT;
 -- What a repository does with pull requests from forks. A row is made
 -- by the first write; a repository without one has the defaults
 -- (fork_runs on for a public repository and off for a private one,
--- first_time_contributors, 2, 30 and warn).
+-- first_time_contributors, 2 and 30).
 CREATE TABLE ci_repo_policy (
   repo_id bigint PRIMARY KEY REFERENCES ci_repos (id) ON DELETE CASCADE,
   fork_runs text NOT NULL CHECK (fork_runs IN ('off', 'on')),
@@ -66,8 +66,6 @@ CREATE TABLE ci_repo_policy (
     CHECK (fork_approval IN ('first_timers', 'first_time_contributors', 'all_outside')),
   fork_max_running integer NOT NULL CHECK (fork_max_running BETWEEN 1 AND 10),
   fork_timeout_minutes integer NOT NULL CHECK (fork_timeout_minutes BETWEEN 5 AND 60),
-  pull_request_target_head_checkout text NOT NULL
-    CHECK (pull_request_target_head_checkout IN ('warn', 'block')),
   updated_at bigint NOT NULL
 );
 
