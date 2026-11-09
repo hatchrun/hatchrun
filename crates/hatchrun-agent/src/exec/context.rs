@@ -622,6 +622,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
+            token_lifetime_secs: 0,
             inputs: None,
         }
     }

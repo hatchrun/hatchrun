@@ -300,6 +300,7 @@ fn install(work: &Path, toolkit: &Path) {
 fn job(server: &MockServer, store: &Shared, scopes: &[&str], steps: Vec<PlannedStep>) -> String {
     let scopes: Vec<String> = scopes.iter().map(|scope| (*scope).to_owned()).collect();
     let mut doc = make::document(steps);
+    doc.token_lifetime_secs = 3600;
     let token = format!("job-token-{}", lock(store).jobs.len());
     lock(store).jobs.insert(token.clone(), scopes.clone());
     doc.github.ref_.clone_from(&scopes[0]);
@@ -307,7 +308,6 @@ fn job(server: &MockServer, store: &Shared, scopes: &[&str], steps: Vec<PlannedS
         url: format!("{}/v1/agent/cache", server.uri()),
         token,
         scopes,
-        token_lifetime_secs: 3600,
     });
     serde_json::to_string(&doc).unwrap()
 }

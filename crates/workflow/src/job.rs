@@ -49,6 +49,10 @@ pub struct JobDocument {
     /// The artifact service, when the control plane has one. The agent
     /// serves `actions/upload-artifact` and `download-artifact` from it.
     pub artifacts: Option<ArtifactService>,
+    /// How long the runtime token the agent makes for the cache and
+    /// artifact toolkits lives, in seconds: the job's timeout and the
+    /// time to boot and wind down, as the job token's own lifetime.
+    pub token_lifetime_secs: u64,
     /// The `inputs` context of a job of a called workflow: what the
     /// calls passed. `None` for a job of the workflow that was started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,6 +79,7 @@ impl fmt::Debug for JobDocument {
             .field("cache", &self.cache)
             .field("id_token", &self.id_token)
             .field("artifacts", &self.artifacts)
+            .field("token_lifetime_secs", &self.token_lifetime_secs)
             .field("inputs", &self.inputs)
             .finish()
     }
@@ -155,10 +160,6 @@ pub struct CacheService {
     /// job saves to. The agent names them in its runtime token, which
     /// `BuildKit` reads to build its index keys.
     pub scopes: Vec<String>,
-    /// How long the runtime token the agent makes lives, in seconds: the
-    /// job's timeout and the time to boot and wind down, as the job
-    /// token's.
-    pub token_lifetime_secs: u64,
 }
 
 impl fmt::Debug for CacheService {
@@ -167,7 +168,6 @@ impl fmt::Debug for CacheService {
             .field("url", &self.url)
             .field("token", &"[redacted]")
             .field("scopes", &self.scopes)
-            .field("token_lifetime_secs", &self.token_lifetime_secs)
             .finish()
     }
 }
@@ -204,8 +204,6 @@ pub struct ArtifactService {
     pub url: String,
     /// The bearer token.
     pub token: String,
-    /// How long the runtime token the agent makes lives, in seconds.
-    pub token_lifetime_secs: u64,
 }
 
 impl fmt::Debug for ArtifactService {
@@ -213,7 +211,6 @@ impl fmt::Debug for ArtifactService {
         f.debug_struct("ArtifactService")
             .field("url", &self.url)
             .field("token", &"[redacted]")
-            .field("token_lifetime_secs", &self.token_lifetime_secs)
             .finish()
     }
 }

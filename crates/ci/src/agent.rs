@@ -392,7 +392,7 @@ async fn claim(
     // whatever happens to the default branch meanwhile: the first claim
     // of the attempt fixes them and a claim that overlaps it, or repeats
     // it, gets the same list. A job without a cache service has none.
-    let scopes = if cache_service_enabled(settings, job_token) {
+    let scopes = if artifacts_bucket_ready(settings, job_token) {
         let wanted = crate::cache::read_scopes(
             &run.git_ref,
             run.base_ref.as_deref(),
@@ -420,9 +420,9 @@ async fn claim(
     fill(&mut document, &secrets, vars);
     document.id_token =
         id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
-    let lifetime = token::lifetime_secs(row.timeout_minutes);
-    document.artifacts = artifact_service(settings, job_token, lifetime);
-    document.cache = cache_service(settings, job_token, scopes, lifetime);
+    document.token_lifetime_secs = token::lifetime_secs(row.timeout_minutes);
+    document.artifacts = artifact_service(settings, job_token);
+    document.cache = cache_service(settings, job_token, scopes);
     Response::from_json(&document)
 }
 
@@ -474,24 +474,19 @@ pub(crate) fn id_token_request(
 
 /// The artifact service a job gets: this Worker, with the job's own
 /// token. `None` while the artifacts bucket is not set up.
-pub(crate) fn artifact_service(
-    settings: &Settings,
-    job_token: &str,
-    token_lifetime_secs: u64,
-) -> Option<ArtifactService> {
-    if !cache_service_enabled(settings, job_token) {
+pub(crate) fn artifact_service(settings: &Settings, job_token: &str) -> Option<ArtifactService> {
+    if !artifacts_bucket_ready(settings, job_token) {
         return None;
     }
     Some(ArtifactService {
         url: format!("{}{ARTIFACTS_PATH}", settings.ci_url),
         token: job_token.to_owned(),
-        token_lifetime_secs,
     })
 }
 
 /// Whether a job gets the artifact and cache services: the artifacts
 /// bucket is set up and the job has a token.
-fn cache_service_enabled(settings: &Settings, job_token: &str) -> bool {
+fn artifacts_bucket_ready(settings: &Settings, job_token: &str) -> bool {
     !settings.artifacts_bucket.is_empty() && !job_token.is_empty()
 }
 
@@ -502,16 +497,14 @@ pub(crate) fn cache_service(
     settings: &Settings,
     job_token: &str,
     scopes: Vec<String>,
-    token_lifetime_secs: u64,
 ) -> Option<CacheService> {
-    if !cache_service_enabled(settings, job_token) {
+    if !artifacts_bucket_ready(settings, job_token) {
         return None;
     }
     Some(CacheService {
         url: format!("{}{CACHE_PATH}", settings.ci_url),
         token: job_token.to_owned(),
         scopes,
-        token_lifetime_secs,
     })
 }
 
@@ -806,24 +799,22 @@ mod tests {
 
     #[test]
     fn the_artifact_service_is_this_worker_with_the_job_token() {
-        let service = artifact_service(&settings("bucket"), "v1.a.b", 900).unwrap();
-        assert_eq!(service.token_lifetime_secs, 900);
+        let service = artifact_service(&settings("bucket"), "v1.a.b").unwrap();
         assert_eq!(service.url, "https://ci.example/v1/agent/artifacts");
         assert_eq!(service.token, "v1.a.b");
-        assert!(artifact_service(&settings(""), "v1.a.b", 900).is_none());
-        assert!(artifact_service(&settings("bucket"), "", 900).is_none());
+        assert!(artifact_service(&settings(""), "v1.a.b").is_none());
+        assert!(artifact_service(&settings("bucket"), "").is_none());
     }
 
     #[test]
     fn the_cache_service_is_this_worker_with_the_job_token() {
         let scopes = vec!["refs/heads/topic".to_owned(), "refs/heads/main".to_owned()];
-        let service = cache_service(&settings("bucket"), "v1.a.b", scopes.clone(), 900).unwrap();
-        assert_eq!(service.token_lifetime_secs, 900);
+        let service = cache_service(&settings("bucket"), "v1.a.b", scopes.clone()).unwrap();
         assert_eq!(service.url, "https://ci.example/v1/agent/cache");
         assert_eq!(service.token, "v1.a.b");
         assert_eq!(service.scopes, scopes);
-        assert!(cache_service(&settings(""), "v1.a.b", Vec::new(), 900).is_none());
-        assert!(cache_service(&settings("bucket"), "", Vec::new(), 900).is_none());
+        assert!(cache_service(&settings(""), "v1.a.b", Vec::new()).is_none());
+        assert!(cache_service(&settings("bucket"), "", Vec::new()).is_none());
     }
     use super::*;
 
@@ -1121,6 +1112,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
+            token_lifetime_secs: 0,
             inputs: None,
         }
     }

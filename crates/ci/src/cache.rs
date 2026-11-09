@@ -173,11 +173,7 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
         .ok_or_else(|| Refusal::new(410, JOB_ENDED))?;
     // The list the job's claim fixed. A job claimed before it was kept
     // has none, and no cache.
-    let scopes = job
-        .cache_scopes
-        .as_deref()
-        .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
-        .unwrap_or_default();
+    let scopes = store::parse_cache_scopes(job.id, job.cache_scopes.as_deref());
     let ctx = Context {
         settings,
         db,
@@ -209,10 +205,6 @@ const NO_SCOPES: &str = "the job has no cache scopes";
 
 async fn lookup(ctx: &Context<'_>, request: LookupRequest) -> Answer {
     check_entry(&request.version, &request.key)?;
-    if ctx.scopes.is_empty() {
-        // A miss, as for any entry that is not there.
-        return Err(Refusal::new(404, "no entry"));
-    }
     if request.restore_keys.len() > MAX_RESTORE_KEYS {
         return Err(Refusal::new(
             400,
@@ -221,6 +213,10 @@ async fn lookup(ctx: &Context<'_>, request: LookupRequest) -> Answer {
     }
     for key in &request.restore_keys {
         check_key(key).map_err(|err| Refusal::new(400, err))?;
+    }
+    if ctx.scopes.is_empty() {
+        // A miss, as for any entry that is not there.
+        return Err(Refusal::new(404, "no entry"));
     }
     let Some(found) = store::lookup_cache_entry(
         &ctx.db,
@@ -261,7 +257,8 @@ async fn lookup(ctx: &Context<'_>, request: LookupRequest) -> Answer {
 async fn start(ctx: &Context<'_>, request: UploadRequest) -> Answer {
     check_entry(&request.version, &request.key)?;
     if ctx.scopes.is_empty() {
-        return Err(Refusal::new(503, NO_SCOPES));
+        // Final, so that the clients do not retry.
+        return Err(Refusal::new(403, NO_SCOPES));
     }
     // Saves the upload when the entry exists; finalizing still settles
     // a race between two jobs.

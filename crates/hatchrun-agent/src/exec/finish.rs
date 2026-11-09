@@ -83,18 +83,7 @@ impl Job<'_> {
             .cache
             .as_ref()
             .map(|service| service.scopes.clone());
-        let lifetime_secs = self
-            .doc
-            .cache
-            .as_ref()
-            .map(|service| service.token_lifetime_secs)
-            .or_else(|| {
-                self.doc
-                    .artifacts
-                    .as_ref()
-                    .map(|service| service.token_lifetime_secs)
-            })
-            .unwrap_or_default();
+        let lifetime_secs = self.doc.token_lifetime_secs;
         // `BuildKit` runs in a container, which reaches the proxy only
         // when it listens on the bridge: on the loopback the token
         // leaves the scopes out, and `type=gha` fails at once.
@@ -115,8 +104,9 @@ impl Job<'_> {
             // The bridge gateway can be an address this machine does not
             // have yet; the loopback still serves the host's steps.
             Err(err) if ip != loopback => {
-                warn!(%ip, "cache proxy: cannot listen, trying the loopback: {err:#}");
-                loopback_reason = Some(format!("it cannot listen on {ip}: {err:#}"));
+                let text = self.masker.mask(&format!("{err:#}")).into_owned();
+                warn!(%ip, "cache proxy: cannot listen, trying the loopback: {text}");
+                loopback_reason = Some(format!("it cannot listen on {ip}: {text}"));
                 bound = loopback;
                 Proxy::start_services(services(false), loopback).await
             }
@@ -125,21 +115,23 @@ impl Job<'_> {
         let proxy = match started {
             Ok(proxy) => proxy,
             Err(err) => {
-                warn!(addr = %bound, "cache proxy: cannot listen: {err:#}");
+                let text = self.masker.mask(&format!("{err:#}")).into_owned();
+                warn!(addr = %bound, "cache proxy: cannot listen: {text}");
                 self.cache_unavailable(sink, &err);
                 return None;
             }
         };
         if let Err(err) = proxy.check().await {
+            let text = self.masker.mask(&format!("{err:#}")).into_owned();
             warn!(
                 url = proxy.url(),
-                "cache proxy: health check failed: {err:#}"
+                "cache proxy: health check failed: {text}"
             );
             self.cache_unavailable(sink, &err);
             proxy.stop().await;
             return None;
         }
-        self.cache_unreachable = loopback_reason.is_some();
+        self.cache_unreachable = bound == loopback;
         if let Some(reason) = loopback_reason {
             self.warn_loopback(sink, &reason);
         }
@@ -165,7 +157,8 @@ impl Job<'_> {
     /// Where the proxy listens: the address of Docker's default bridge
     /// when Docker answers, so a `BuildKit` container (which cannot reach
     /// the machine's loopback) and job containers can use it, and the
-    /// loopback otherwise, with the reason Docker gave no address. Only
+    /// loopback otherwise, with the reason Docker gave no address when it
+    /// is there and answered wrongly (none when it is absent). Only
     /// the host and the containers on its bridges can connect.
     async fn proxy_bind(&mut self) -> (IpAddr, Option<String>) {
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -194,7 +187,9 @@ impl Job<'_> {
                     out.code
                 )),
             ),
-            Err(err) => (loopback, Some(format!("docker is not available: {err}"))),
+            // No Docker on this machine: nothing to warn about, there are
+            // no containers either.
+            Err(_) => (loopback, None),
         }
     }
 
@@ -206,6 +201,7 @@ impl Job<'_> {
              and BuildKit builders (docker buildx with type=gha) cannot use the cache or \
              the artifact service. Steps on the host still can."
         );
+        let message = self.masker.mask(&message).into_owned();
         warn!("{message}");
         self.say(sink, Line::Warning(&message));
     }

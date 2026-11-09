@@ -685,9 +685,21 @@ pub async fn set_cache_scopes(
     let row: Option<ScopesRow> = db
         .first(SET_CACHE_SCOPES, &params![job_id, attempt, text])
         .await?;
-    Ok(row
-        .and_then(|row| row.cache_scopes)
-        .and_then(|text| serde_json::from_str(&text).ok()))
+    Ok(row.map(|row| parse_cache_scopes(job_id, row.cache_scopes.as_deref())))
+}
+
+/// The scopes a job's row holds. A row with none, or with text that is
+/// not a JSON list of refs, which only a bug writes, has no scopes and so
+/// no cache; the claim and the cache service read it the same way.
+#[must_use]
+pub fn parse_cache_scopes(job_id: u64, text: Option<&str>) -> Vec<String> {
+    let Some(text) = text else {
+        return Vec::new();
+    };
+    serde_json::from_str(text).unwrap_or_else(|err| {
+        worker::console_error!("job {job_id}: malformed cache scopes: {err}");
+        Vec::new()
+    })
 }
 
 /// Sets job `job_id` up for `attempt`: waiting, with nothing left of
