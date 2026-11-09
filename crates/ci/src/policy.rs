@@ -239,6 +239,28 @@ pub const fn refusal(admission: Admission) -> Option<&'static str> {
     }
 }
 
+/// How much an approval level asks for: the more authors it asks about,
+/// the stricter.
+const fn strictness(level: ForkApproval) -> u8 {
+    match level {
+        ForkApproval::FirstTimers => 0,
+        ForkApproval::FirstTimeContributors => 1,
+        ForkApproval::AllOutside => 2,
+    }
+}
+
+/// Whether `new` lets more fork code run, or run longer, than `old`: fork
+/// runs turned on, an approval level that asks about fewer authors, or a
+/// higher cap on running jobs or on timeout. Such a change is made on the
+/// admin's access as GitHub says now.
+#[must_use]
+pub fn loosens(old: &RepoPolicy, new: &RepoPolicy) -> bool {
+    (old.fork_runs == ForkRuns::Off && new.fork_runs == ForkRuns::On)
+        || strictness(new.fork_approval) < strictness(old.fork_approval)
+        || new.fork_max_running > old.fork_max_running
+        || new.fork_timeout_minutes > old.fork_timeout_minutes
+}
+
 /// The job timeout of a fork run: the workflow's, cut to the policy's.
 #[must_use]
 pub fn clamp_timeout(minutes: u32, policy: &RepoPolicy) -> u32 {
@@ -373,6 +395,58 @@ mod tests {
         };
         assert_eq!(clamp_timeout(360, &policy), 10);
         assert_eq!(clamp_timeout(5, &policy), 5);
+    }
+
+    #[test]
+    fn a_change_that_lets_more_fork_code_run_loosens_the_policy() {
+        let strict = RepoPolicy {
+            fork_runs: ForkRuns::On,
+            fork_approval: ForkApproval::AllOutside,
+            fork_max_running: 2,
+            fork_timeout_minutes: 30,
+        };
+        assert!(!loosens(&strict, &strict));
+        // Tightening is never loosening.
+        assert!(!loosens(&PUBLIC, &strict));
+        assert!(!loosens(
+            &strict,
+            &RepoPolicy {
+                fork_runs: ForkRuns::Off,
+                fork_max_running: 1,
+                fork_timeout_minutes: 5,
+                ..strict
+            }
+        ));
+        // Each way of letting more through.
+        let off = RepoPolicy {
+            fork_runs: ForkRuns::Off,
+            ..strict
+        };
+        assert!(loosens(&off, &strict), "turned on");
+        for weaker in [
+            ForkApproval::FirstTimeContributors,
+            ForkApproval::FirstTimers,
+        ] {
+            let new = RepoPolicy {
+                fork_approval: weaker,
+                ..strict
+            };
+            assert!(loosens(&strict, &new), "{weaker:?}");
+        }
+        assert!(loosens(
+            &strict,
+            &RepoPolicy {
+                fork_max_running: 3,
+                ..strict
+            }
+        ));
+        assert!(loosens(
+            &strict,
+            &RepoPolicy {
+                fork_timeout_minutes: 31,
+                ..strict
+            }
+        ));
     }
 
     #[test]

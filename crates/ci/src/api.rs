@@ -1329,7 +1329,10 @@ impl Cx<'_> {
         let Some(session) = self.session else {
             return Ok(stop(401, "sign in to approve or reject runs"));
         };
-        let found = match self.found(run_id, Access::Write).await? {
+        // The run is looked up as a reader: the write access is checked
+        // once, below, as GitHub says now. Asking for write here would
+        // make a second call to GitHub on a cache miss.
+        let found = match self.found(run_id, Access::Read).await? {
             Ok(found) => found,
             Err(stop) => return Ok(Err(stop)),
         };

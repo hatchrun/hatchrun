@@ -186,14 +186,44 @@ fn rate_limited(response: &Response) -> bool {
     text.contains("rate limit") || text.contains("abuse")
 }
 
-/// One page of the files a pull request changes, 100 to a page.
+/// Files GitHub lists on a page of a pull request's files.
+pub const FILES_PAGE_SIZE: usize = 100;
+
+/// Pages of a pull request's files that are read.
+pub const FILES_MAX_PAGES: u32 = 3;
+
+/// One page of the files a pull request changes, [`FILES_PAGE_SIZE`] to a
+/// page.
 #[must_use]
 pub fn pull_files(api: &str, repo: &str, number: u64, page: u32, token: &str) -> Request {
     rest(
         "GET",
-        format!("{api}/repos/{repo}/pulls/{number}/files?per_page=100&page={page}"),
+        format!("{api}/repos/{repo}/pulls/{number}/files?per_page={FILES_PAGE_SIZE}&page={page}"),
         token,
     )
+}
+
+/// A pull request, as GitHub has it now.
+#[must_use]
+pub fn pull_request(api: &str, repo: &str, number: u64, token: &str) -> Request {
+    rest("GET", format!("{api}/repos/{repo}/pulls/{number}"), token)
+}
+
+/// The head commit of the pull request [`pull_request`] read.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a pull request.
+pub fn pull_head_sha(response: &Response) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Pull {
+        head: Head,
+    }
+    #[derive(Deserialize)]
+    struct Head {
+        sha: String,
+    }
+    decode::<Pull>(response, "pull request").map(|pull| pull.head.sha)
 }
 
 /// The file names on one page of [`pull_files`].
@@ -911,6 +941,28 @@ mod tests {
             &with,
         ));
         assert_eq!(body["actions"][0]["identifier"], "approve-fork-run");
+    }
+
+    #[test]
+    fn a_pull_requests_head_is_read_from_githubs_answer() {
+        let ok = answered(200, r#"{"number":4,"head":{"sha":"abc123","ref":"x"}}"#);
+        assert_eq!(pull_head_sha(&ok), Ok("abc123".to_owned()));
+        assert!(pull_head_sha(&answered(404, "{}")).is_err());
+        assert!(pull_head_sha(&answered(200, "{}")).is_err());
+        let r = pull_request("https://api.github.com", "octo/widgets", 4, "tok");
+        assert_eq!(r.url, "https://api.github.com/repos/octo/widgets/pulls/4");
+    }
+
+    #[test]
+    fn the_file_pages_use_one_size_everywhere() {
+        let r = pull_files("https://api.github.com", "o/w", 4, 2, "tok");
+        assert!(
+            r.url.ends_with("/pulls/4/files?per_page=100&page=2"),
+            "{}",
+            r.url
+        );
+        assert_eq!(FILES_PAGE_SIZE, 100);
+        assert_eq!(FILES_MAX_PAGES, 3);
     }
 
     #[test]

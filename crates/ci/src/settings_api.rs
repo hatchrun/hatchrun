@@ -922,6 +922,32 @@ async fn put_fork_policy(
         Ok(policy) => policy,
         Err(stop) => return Ok(Err(stop)),
     };
+    // A change that lets more fork code run is made on the admin's access
+    // as GitHub says now, not on what was cached for a minute; viewing
+    // the policy can stay cached.
+    let current = store::repo_policy(cx.db, repo.id, repo.private).await?;
+    if crate::policy::loosens(&current, &policy) {
+        let Some(session) = cx.session else {
+            return Ok(stop(401, "sign in to change the policy"));
+        };
+        match access::resolve_fresh(session, cx.settings, &repo).await {
+            Ok(have) if have >= Access::Admin => {}
+            Ok(_) => {
+                return Ok(stop(
+                    403,
+                    "You need admin access to this repository to let more fork code run",
+                ));
+            }
+            Err(Failure::Retry(wait)) => {
+                return Ok(Err(Stop(
+                    503,
+                    "GitHub is rate limiting; try again shortly".to_owned(),
+                    Some(wait),
+                )));
+            }
+            Err(Failure::Worker(err)) => return Err(err),
+        }
+    }
     let audit = audit_of(
         cx,
         &repo.tenant_id,

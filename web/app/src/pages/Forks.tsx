@@ -12,7 +12,7 @@ import { useState } from "react";
 import { getForkPolicy, putForkPolicy, type ForkPolicy } from "@/api";
 import { Page } from "@/components/Page";
 import { SettingsNav } from "@/components/SettingsNav";
-import { Await } from "@/components/Status";
+import { Await, LoadError } from "@/components/Status";
 import { useRepoSearch } from "@/lib/useRepos";
 import { useLoad } from "@/load";
 import { setQuery, useQuery } from "@/router";
@@ -32,7 +32,7 @@ export function Forks({ org, tenant }: OrgPageProps) {
   const [search, setSearch] = useState("");
   // Every repository of the installation, found by name: the list holds
   // the first matches and the search narrows it, so none is out of reach.
-  const { repos, total, loading } = useRepoSearch(org, search, 20);
+  const { repos, total, loading, error } = useRepoSearch(org, search, 20);
   const admin = tenant.role === "admin";
 
   return (
@@ -66,8 +66,9 @@ export function Forks({ org, tenant }: OrgPageProps) {
             </button>
           </li>
         ))}
-        {repos.length === 0 && !loading && <li className="px-3 py-2 font-mono text-[13px] text-fg-3">No repository matches.</li>}
+        {repos.length === 0 && !loading && error === null && <li className="px-3 py-2 font-mono text-[13px] text-fg-3">No repository matches.</li>}
       </ul>
+      {error !== null && <LoadError error={error} />}
       {total > repos.length && <p className="m-0 font-mono text-xs text-fg-3">{total - repos.length} more: narrow the search.</p>}
       {repo && <Policy key={repo} repository={repo} />}
     </Page>

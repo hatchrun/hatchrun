@@ -1008,13 +1008,17 @@ pub(crate) async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> 
                 // is free, and so are the places it held, which jobs
                 // held for the tenant's cap, its matrix or the
                 // repository's cap on fork jobs wait for.
-                if let Some(run) = store::run(db, job.run_id)
-                    .await
-                    .map_err(|err| err.to_string())?
-                {
-                    wake_oldest(env, db, &run.tenant_id).await;
-                }
+                // The group place and the matrix wake do not need the run
+                // row, so a read that fails cannot skip them (the order
+                // `reconcile::fail_row` keeps).
                 wake_group(env, db, job.id).await;
+                match store::run(db, job.run_id).await {
+                    Ok(Some(run)) => wake_oldest(env, db, &run.tenant_id).await,
+                    Ok(None) => {}
+                    Err(err) => {
+                        console_error!("job {}: read its run to wake the tenant: {err}", job.id);
+                    }
+                }
                 return concurrency::release(env, db, job.run_id, Some(job.id))
                     .await
                     .map_err(|err| err.to_string());

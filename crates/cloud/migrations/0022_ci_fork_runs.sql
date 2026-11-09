@@ -52,6 +52,11 @@ UPDATE ci_runs SET author_login = actor;
 -- approval caps, the expiry and the list the app shows read them.
 CREATE INDEX ci_runs_gate ON ci_runs (repo_id, created_at, id)
   WHERE gate_status IN ('pending', 'deferred');
+-- The decided runs whose end is not finished (the reconciler's scan).
+CREATE INDEX ci_runs_gate_unfinished ON ci_runs (repo_id, gate_scanned_at, gate_at, id)
+  WHERE (gate_status IN ('expired', 'cancelled') AND status <> 'completed')
+     OR (gate_status IN ('approved', 'expired', 'cancelled')
+         AND gate_check_run_id IS NOT NULL AND gate_card_dirty);
 -- The fork runs of an author that are not over, for the per-author cap.
 CREATE INDEX ci_runs_fork_author ON ci_runs (repo_id, author_login)
   WHERE trust = 'fork' AND status <> 'completed';

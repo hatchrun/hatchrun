@@ -59,9 +59,17 @@ const WAITING: &str = "SELECT \
 const SET_GATE_CHECK: &str = "UPDATE ci_runs SET gate_check_run_id = $2, gate_card_dirty = false \
      WHERE id = $1 AND gate_check_run_id IS NULL AND gate_status IN ('pending', 'deferred')";
 
-/// Marks (`$2` true) or unmarks the card of run `$1` as needing an update.
+/// Marks (`$2` true) or unmarks the card of run `$1` as needing an update,
+/// while the run waits: a refresh that finishes after the run was decided
+/// must not clear the mark the decision set, which is for the decided
+/// card.
 const SET_CARD_DIRTY: &str = "UPDATE ci_runs SET gate_card_dirty = $2 \
-     WHERE id = $1 AND gate_check_run_id IS NOT NULL";
+     WHERE id = $1 AND gate_check_run_id IS NOT NULL \
+     AND gate_status IN ('pending', 'deferred')";
+
+/// Clears the mark of the decided run `$1`, once its card was settled.
+const CLEAR_DECIDED_MARK: &str = "UPDATE ci_runs SET gate_card_dirty = false \
+     WHERE id = $1 AND gate_status IN ('approved', 'expired', 'cancelled')";
 
 /// The deferred runs of pull request `$2` of repository `$1` at `$3`: a
 /// group, admitted together.
@@ -267,6 +275,17 @@ pub async fn set_gate_check(db: &Db, run_id: u64, check_run_id: u64) -> Result<b
         .run(SET_GATE_CHECK, &params![run_id, check_run_id])
         .await?
         == 1)
+}
+
+/// Clears the mark of the decided run `run_id` after its card was
+/// settled to the decision.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn clear_decided_mark(db: &Db, run_id: u64) -> Result<()> {
+    db.run(CLEAR_DECIDED_MARK, &params![run_id]).await?;
+    Ok(())
 }
 
 /// Marks the card of run `run_id` as needing an update (or, with

@@ -67,8 +67,8 @@ const EVICT_BATCHES: u32 = 5;
 
 /// Whether to evict another batch: the last one was full, so more may
 /// be over the share, and the save's batch budget is not spent.
-const fn another_batch(evicted: usize, batches_done: u32) -> bool {
-    evicted >= EVICT_LIMIT as usize && batches_done < EVICT_BATCHES
+const fn another_batch(evicted: usize, batches_done: u32, max_batches: u32) -> bool {
+    evicted >= EVICT_LIMIT as usize && batches_done < max_batches
 }
 
 /// What one repository may keep, as on GitHub: 10 GB. Past it the least
@@ -330,8 +330,14 @@ async fn start(ctx: &Context<'_>, request: UploadRequest) -> Answer {
         // Over the share (a cap that was lowered, or batches that did
         // not reach it): trim before refusing, or no save could ever
         // trigger the eviction that would let the next one in.
-        let credentials = credentials(ctx.settings).await?;
-        if let Err(err) = enforce_quota(ctx, &credentials).await {
+        // At most one small batch here: the request is an upload start,
+        // and the rest is trimmed when saves finish. A credential that
+        // cannot be had is the same final refusal, not a server error
+        // the client would retry.
+        let Ok(credentials) = credentials(ctx.settings).await else {
+            return Err(Refusal::new(403, FORK_FULL));
+        };
+        if let Err(err) = enforce_quota(ctx, &credentials, 1).await {
             console_warn!("cache: quota of repository {}: {}", ctx.run.repo_id, err);
         }
         if store::fork_cache_bytes(&ctx.db, &ctx.run.tenant_id, ctx.run.repo_id).await?
@@ -460,7 +466,7 @@ async fn complete(ctx: &Context<'_>, id: &str, request: CompleteRequest) -> Answ
     match done {
         Finalized::Done => {
             // The entry is saved; a failure to trim must not fail it.
-            if let Err(err) = enforce_quota(ctx, &credentials).await {
+            if let Err(err) = enforce_quota(ctx, &credentials, EVICT_BATCHES).await {
                 console_warn!("cache: quota of repository {}: {}", ctx.run.repo_id, err);
             }
             Ok(Response::empty()?.with_status(204))
@@ -503,6 +509,7 @@ async fn abort(ctx: &Context<'_>, id: &str) -> Answer {
 async fn enforce_quota(
     ctx: &Context<'_>,
     credentials: &Credentials,
+    max_batches: u32,
 ) -> std::result::Result<(), String> {
     // A fork run's save trims the fork entries to the fork share and
     // never evicts an entry of the base or default branch; a trusted
@@ -532,7 +539,7 @@ async fn enforce_quota(
         .map_err(|err| err.to_string())?;
         delete_objects(ctx.settings, credentials, &rows).await;
         batches += 1;
-        if !another_batch(rows.len(), batches) {
+        if !another_batch(rows.len(), batches, max_batches) {
             return Ok(());
         }
     }
@@ -701,11 +708,16 @@ mod tests {
 
     #[test]
     fn eviction_goes_on_while_batches_are_full_and_the_budget_lasts() {
-        assert!(another_batch(20, 1));
-        assert!(another_batch(20, 4));
-        assert!(!another_batch(20, 5), "the budget is spent");
-        assert!(!another_batch(19, 1), "a short batch reached the share");
-        assert!(!another_batch(0, 1));
+        assert!(another_batch(20, 1, EVICT_BATCHES));
+        assert!(another_batch(20, 4, EVICT_BATCHES));
+        assert!(!another_batch(20, 5, EVICT_BATCHES), "the budget is spent");
+        assert!(
+            !another_batch(19, 1, EVICT_BATCHES),
+            "a short batch reached the share"
+        );
+        assert!(!another_batch(0, 1, EVICT_BATCHES));
+        // An upload start trims one batch and no more.
+        assert!(!another_batch(20, 1, 1));
     }
 
     #[test]

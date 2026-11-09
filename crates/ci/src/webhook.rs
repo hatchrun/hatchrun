@@ -37,12 +37,6 @@ use crate::trust::Trust;
 /// Secret holding the App's webhook secret.
 const WEBHOOK_SECRET: &str = "GITHUB_WEBHOOK_SECRET";
 
-/// Pages of a pull request's files that are read, 100 files each.
-const FILE_PAGES: u32 = 3;
-
-/// Files GitHub lists on a full page.
-const PAGE_SIZE: usize = 100;
-
 fn now_ms() -> u64 {
     worker::Date::now().as_millis()
 }
@@ -431,6 +425,32 @@ impl Cx<'_> {
         Ok(Outcome::Done(ids))
     }
 
+    /// Settles a tie: two deliveries of the same second with different
+    /// head commits. GitHub's time has one second, so which is newer is
+    /// not in the deliveries; the pull request's head as GitHub has it
+    /// now is. The delivery counts only when it names that head, and then
+    /// the row is made to say so.
+    async fn tie_is_current(&self, pr: &PullRequest, record: &store::NewPull) -> Result<bool> {
+        let response = self
+            .tokens
+            .send(pr.installation_id, |token| {
+                github::pull_request(
+                    &self.settings.github_api,
+                    &pr.repo.full_name,
+                    pr.number,
+                    token,
+                )
+            })
+            .await
+            .map_err(|err| fail(err.to_string()))?;
+        let head = github::pull_head_sha(&response).map_err(fail)?;
+        if head != pr.head_sha {
+            return Ok(false);
+        }
+        store::upsert_pull_forced(self.db, record).await?;
+        Ok(true)
+    }
+
     /// What a fork pull request becomes under its repository's policy:
     /// the gate its runs get and the policy to plan them under, or the
     /// outcome that starts nothing. A newer commit ends the waiting runs
@@ -587,26 +607,27 @@ impl Cx<'_> {
         // of any of them (`labeled` included) needs its row, so all are
         // recorded. The time is GitHub's, so a late delivery cannot
         // replace newer data.
-        let applied = store::upsert_pull(
-            self.db,
-            &store::NewPull {
-                repo_id: pr.repo.id,
-                number: pr.number,
-                title: pr.title.clone(),
-                head_ref: pr.head_ref.clone(),
-                base_ref: pr.base_ref.clone(),
-                author: pr.author.clone(),
-                author_association: pr.author_association.clone(),
-                head_repo_id: pr
-                    .fork
-                    .as_ref()
-                    .map_or(Some(pr.repo.id), |f| f.head_repo_id),
-                head_sha: pr.head_sha.clone(),
-                state: pr.state.to_owned(),
-                updated_at: pr.updated_at,
-            },
-        )
-        .await?;
+        let record = store::NewPull {
+            repo_id: pr.repo.id,
+            number: pr.number,
+            title: pr.title.clone(),
+            head_ref: pr.head_ref.clone(),
+            base_ref: pr.base_ref.clone(),
+            author: pr.author.clone(),
+            author_association: pr.author_association.clone(),
+            head_repo_id: pr
+                .fork
+                .as_ref()
+                .map_or(Some(pr.repo.id), |f| f.head_repo_id),
+            head_sha: pr.head_sha.clone(),
+            state: pr.state.to_owned(),
+            updated_at: pr.updated_at,
+        };
+        let applied = match store::upsert_pull(self.db, &record).await? {
+            store::PullWrite::Applied => true,
+            store::PullWrite::Stale => false,
+            store::PullWrite::Tied => self.tie_is_current(pr, &record).await?,
+        };
         // A delivery older than what is recorded says nothing about the
         // pull request as it stands: it must not cancel the runs of the
         // newer commit as superseded, nor start runs of the older one.
@@ -634,7 +655,7 @@ impl Cx<'_> {
             if planning::needs_pull_request_paths(source, &pr.action, &pr.base_ref));
         let mut changed = Vec::new();
         if wants_paths {
-            for page in 1..=FILE_PAGES {
+            for page in 1..=github::FILES_MAX_PAGES {
                 let response = self
                     .tokens
                     .send(pr.installation_id, |token| {
@@ -649,7 +670,7 @@ impl Cx<'_> {
                     .await
                     .map_err(|err| fail(err.to_string()))?;
                 let names = github::pull_file_names(&response).map_err(fail)?;
-                let full = names.len() >= PAGE_SIZE;
+                let full = names.len() >= github::FILES_PAGE_SIZE;
                 changed.extend(names);
                 if !full || changed.len() >= MAX_CHANGED {
                     break;

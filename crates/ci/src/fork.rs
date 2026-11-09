@@ -30,8 +30,6 @@ use crate::policy::{APPROVAL_CHECK, APPROVE_ACTION, FORK_MAX_VCPU, ForkApproval,
 use crate::store::{self, GateStatus, RepoRow, RunRow};
 use crate::trust::Trust;
 
-/// Pages of a pull request's files the card reads, 100 files each.
-const FILE_PAGES: u32 = 3;
 /// Files the card names.
 const LISTED_FILES: usize = 20;
 /// `len` as a count for the reconciler's tally: all it can hold when it
@@ -111,7 +109,7 @@ pub struct Card {
 }
 
 /// The most files the card reads: three pages of a hundred.
-const FILES_READ: usize = FILE_PAGES as usize * 100;
+const FILES_READ: usize = github::FILES_MAX_PAGES as usize * github::FILES_PAGE_SIZE;
 
 /// Whether the file list may stop before the pull request's last file: it
 /// holds all the pages the card reads.
@@ -421,7 +419,7 @@ pub async fn changed_files(
     number: u64,
 ) -> Option<Vec<String>> {
     let mut all = Vec::new();
-    for page in 1..=FILE_PAGES {
+    for page in 1..=github::FILES_MAX_PAGES {
         let response = tokens
             .send(repo.installation_id, |token| {
                 github::pull_files(&settings.github_api, &repo.full_name, number, page, token)
@@ -429,7 +427,7 @@ pub async fn changed_files(
             .await
             .ok()?;
         let names = github::pull_file_names(&response).ok()?;
-        let full = names.len() >= 100;
+        let full = names.len() >= github::FILES_PAGE_SIZE;
         all.extend(names);
         if !full {
             break;
@@ -496,7 +494,7 @@ pub async fn update_card(
 /// # Errors
 ///
 /// The object could not be reached or refused.
-pub async fn cancel_run(env: &Env, run: &RunRow, message: &str) -> Result<(), String> {
+pub async fn cancel_run(env: &Env, run: &RunRow, message: &str) -> Result<Cancel, String> {
     let body = serde_json::json!({ "message": message, "outright": true });
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
@@ -511,10 +509,49 @@ pub async fn cancel_run(env: &Env, run: &RunRow, message: &str) -> Result<(), St
         .fetch_with_request(request)
         .await
         .map_err(|e| e.to_string())?;
-    match response.status_code() {
-        200..=299 | 404 | 409 => Ok(()),
+    cancel_status(response.status_code())
+}
+
+/// What asking a run's object to cancel it came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cancel {
+    /// The object took it, or the attempt moved on: it ends the run.
+    Asked,
+    /// The run has no object (purged, or never made): nothing will end
+    /// it, so its row is completed here.
+    Gone,
+}
+
+/// What an object's answer to a cancel means.
+///
+/// # Errors
+///
+/// An answer that is neither.
+pub fn cancel_status(code: u16) -> Result<Cancel, String> {
+    match code {
+        200..=299 | 409 => Ok(Cancel::Asked),
+        404 => Ok(Cancel::Gone),
         other => Err(format!("the run's object answered {other}")),
     }
+}
+
+/// Completes the run of a gone object in SQL: its jobs that are not over
+/// fail, which completes the run once all are, and the run itself is
+/// completed as cancelled, so it leaves the reconciler's queue.
+async fn end_gone_run(env: &Env, db: &Db, run: &RunRow, now: u64) -> Result<(), String> {
+    for job in store::jobs_for_run(db, run.id)
+        .await
+        .map_err(|err| err.to_string())?
+    {
+        if job.status != "completed"
+            && let Err(err) = crate::reconcile::fail_row(env, db, &job, now).await
+        {
+            console_error!("run {}: end job {}: {err}", run.id, job.id);
+        }
+    }
+    store::finish_run(db, run.id, run.run_attempt, "cancelled", now)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 /// After `runs` were approved by `by`: wakes the jobs held for the
@@ -556,7 +593,7 @@ async fn settle_decided(
 ) {
     if run.gate_check_run_id.is_some()
         && update_card(tokens, settings, repo, run, check).await
-        && let Err(err) = store::set_card_dirty(db, run.id, false).await
+        && let Err(err) = store::clear_decided_mark(db, run.id).await
     {
         console_error!("run {}: clear the card mark: {err}", run.id);
     }
@@ -684,9 +721,18 @@ async fn finish_decisions(
         let message = decided_message(run).unwrap_or_else(|| "Cancelled".to_owned());
         if matches!(run.gate_status, GateStatus::Expired | GateStatus::Cancelled)
             && run.status != "completed"
-            && let Err(err) = cancel_run(env, run, &message).await
         {
-            console_error!("run {}: cancel the decided run: {err}", run.id);
+            match cancel_run(env, run, &message).await {
+                Ok(Cancel::Asked) => {}
+                // Nothing will end it: complete the row, or it would be
+                // asked about every pass for ever.
+                Ok(Cancel::Gone) => {
+                    if let Err(err) = end_gone_run(env, db, run, now).await {
+                        console_error!("run {}: complete the run of a gone object: {err}", run.id);
+                    }
+                }
+                Err(err) => console_error!("run {}: cancel the decided run: {err}", run.id),
+            }
         }
         if run.gate_card_dirty
             && let Some(repo) = store::repo(db, run.repo_id)
@@ -1436,6 +1482,17 @@ mod tests {
         let check = decided_check_run("ci", 3, "Approved by maintainer");
         assert_eq!(check.actions.len(), 0);
         assert_eq!(check.name, "hatchrun / approval: ci #3");
+    }
+
+    #[test]
+    fn an_objects_answer_to_a_cancel_says_whether_the_run_is_gone() {
+        for code in [200, 204, 409] {
+            assert_eq!(cancel_status(code), Ok(Cancel::Asked), "{code}");
+        }
+        assert_eq!(cancel_status(404), Ok(Cancel::Gone));
+        for code in [500, 503, 400] {
+            assert!(cancel_status(code).is_err(), "{code}");
+        }
     }
 
     #[test]

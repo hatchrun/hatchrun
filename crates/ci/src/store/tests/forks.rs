@@ -31,8 +31,9 @@ fn fork_run(
     let run = db.wait(insert_run(db.db(), &new)).unwrap().unwrap();
     // The webhook records the pull request before it makes the runs; a
     // run is approved only while its pull request is open at its commit.
-    // A constant time lets a later call for the same pull request win.
-    db.wait(upsert_pull(
+    // Forced, so a later call for the same pull request wins whatever the
+    // time says.
+    db.wait(upsert_pull_forced(
         db.db(),
         &NewPull {
             repo_id: 7,
@@ -1073,26 +1074,50 @@ fn a_delivery_older_than_the_recorded_pull_request_does_not_apply() {
         state: "open".into(),
         updated_at: 200,
     };
-    assert!(db.wait(upsert_pull(db.db(), &pull)).unwrap());
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &pull)).unwrap(),
+        PullWrite::Applied
+    );
     // The delivery for the older commit A arrives late.
     pull.head_sha = "A".into();
     pull.updated_at = 100;
-    assert!(!db.wait(upsert_pull(db.db(), &pull)).unwrap());
-    let head: String = db
-        .column(
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &pull)).unwrap(),
+        PullWrite::Stale
+    );
+    let head = |db: &TestDb| -> String {
+        db.column(
             "SELECT head_sha AS h FROM ci_pulls WHERE number = 9",
             &[],
             "h",
         )
-        .unwrap();
-    assert_eq!(head, "B", "the newer commit stays the head");
+        .unwrap()
+    };
+    assert_eq!(head(&db), "B", "the newer commit stays the head");
     // The same time (a redelivery) and a newer one apply.
     pull.head_sha = "B".into();
     pull.updated_at = 200;
-    assert!(db.wait(upsert_pull(db.db(), &pull)).unwrap());
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &pull)).unwrap(),
+        PullWrite::Applied
+    );
+    // Two pushes in one second: the same time with another head is a
+    // tie, whichever arrived first, and delivery order does not settle it.
+    pull.head_sha = "B2".into();
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &pull)).unwrap(),
+        PullWrite::Tied
+    );
+    assert_eq!(head(&db), "B", "a tie changes nothing by itself");
+    // GitHub's answer says B2 is the head: the row is made to say so.
+    db.wait(upsert_pull_forced(db.db(), &pull)).unwrap();
+    assert_eq!(head(&db), "B2");
     pull.head_sha = "C".into();
     pull.updated_at = 300;
-    assert!(db.wait(upsert_pull(db.db(), &pull)).unwrap());
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &pull)).unwrap(),
+        PullWrite::Applied
+    );
 }
 
 #[test]
@@ -1188,7 +1213,7 @@ fn a_decision_marks_its_card_to_be_settled_and_the_reconciler_finds_it() {
     // Settled: the mark is cleared. A rejected run whose object has not
     // completed it is still found, and is not once it completed.
     for run in [&rejected, &approved, &plain] {
-        db.wait(set_card_dirty(db.db(), run.id, false)).unwrap();
+        db.wait(clear_decided_mark(db.db(), run.id)).unwrap();
     }
     let found = db.wait(unfinished_decisions(db.db(), 10, 10)).unwrap();
     let ids: Vec<u64> = found.iter().map(|run| run.id).collect();
@@ -1202,7 +1227,7 @@ fn a_decision_marks_its_card_to_be_settled_and_the_reconciler_finds_it() {
     // and marks its card: settled in turn.
     db.wait(finish_run(db.db(), expired.id, 1, "cancelled", 50))
         .unwrap();
-    db.wait(set_card_dirty(db.db(), expired.id, false)).unwrap();
+    db.wait(clear_decided_mark(db.db(), expired.id)).unwrap();
     assert_eq!(
         db.wait(unfinished_decisions(db.db(), 10, 10))
             .unwrap()
@@ -1253,4 +1278,33 @@ fn blocked_groups_rotate_behind_the_ones_not_looked_at_yet() {
         "{again:?} vs {ids:?}"
     );
     db.wait(mark_scanned(db.db(), &[], 1)).unwrap();
+}
+
+#[test]
+fn a_refresh_that_finishes_after_a_decision_cannot_clear_the_decisions_mark() {
+    let db = setup();
+    let run = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 1);
+    db.wait(set_gate_check(db.db(), run.id, 5150)).unwrap();
+    // The refresh built the approval card, then the run was approved,
+    // which marked the (decided) card to be settled.
+    db.wait(approve_run(db.db(), "t1", 7, run.id, "m", 5))
+        .unwrap()
+        .unwrap();
+    // The refresh finishes: it would write "pending" over the decided
+    // card and clear the mark. The mark stays, so the reconciler settles
+    // the card again.
+    db.wait(set_card_dirty(db.db(), run.id, false)).unwrap();
+    let read = db.wait(super::run(db.db(), run.id)).unwrap().unwrap();
+    assert!(read.gate_card_dirty);
+    // Only settling the decided card clears it.
+    db.wait(clear_decided_mark(db.db(), run.id)).unwrap();
+    let read = db.wait(super::run(db.db(), run.id)).unwrap().unwrap();
+    assert!(!read.gate_card_dirty);
+    // And clearing is for decided runs only: a waiting run keeps its mark.
+    let waiting = fork_run(&db, "b", 2, "s2", "mallory", GateStatus::Pending, 2);
+    db.wait(set_gate_check(db.db(), waiting.id, 5151)).unwrap();
+    db.wait(set_card_dirty(db.db(), waiting.id, true)).unwrap();
+    db.wait(clear_decided_mark(db.db(), waiting.id)).unwrap();
+    let read = db.wait(super::run(db.db(), waiting.id)).unwrap().unwrap();
+    assert!(read.gate_card_dirty);
 }
