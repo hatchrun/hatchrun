@@ -57,8 +57,8 @@ pub use self::environments::{
     put_environment, release_approval_holds,
 };
 pub use self::forks::{
-    admit_run, approve_by_check, approve_group, approve_run, deferred_runs, end_gate, end_group,
-    end_pull_gates, expire_gates, fork_waiting, gate_group, pending_gate_runs, put_repo_policy,
+    admit_run, approve_by_check, approve_run, deferred_group, deferred_runs, end_gate,
+    end_pull_gates, expire_gates, fork_waiting, pending_gate_runs, put_repo_policy, reject_run,
     repo_policy, runs_without_card, set_gate_check,
 };
 pub use self::installation::{
@@ -70,7 +70,7 @@ pub use self::jobs::{
     ApprovalJob, Claim, JobCounts, JobRow, MatrixRows, NewJob, all_jobs_for_run, approval_jobs,
     assign_matrix_rows, capacity_wait, claim_launch, finish_job, fork_approval_held, fork_running,
     heartbeat, held_fork_jobs, held_siblings, hold, insert_jobs, job, job_counts, job_scopes,
-    jobs_by_ids, jobs_for_run, jobs_of_runs, launch_failed, launched, note_queued_error, open_jobs,
+    jobs_by_ids, jobs_for_run, launch_failed, launched, note_queued_error, open_jobs,
     parse_cache_scopes, queue_job, refresh_job, reset_job, retarget_job, set_cache_scopes, set_job,
     set_needs, start_job, supersede_job,
 };

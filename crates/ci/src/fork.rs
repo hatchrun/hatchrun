@@ -60,9 +60,19 @@ pub struct CardJob {
     pub timeout_minutes: u32,
 }
 
-/// What the approver reads.
+/// The name of the approval check run of `workflow`'s run: one card per
+/// run, so the name differs per workflow, and a redelivery can find the
+/// card of this run among the check runs of the commit.
+#[must_use]
+pub fn approval_check_name(workflow: &str) -> String {
+    format!("{APPROVAL_CHECK}: {workflow}")
+}
+
+/// What the approver reads: one run's card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {
+    /// The workflow of the run the card is for.
+    pub workflow: String,
     /// The commit the check run is on.
     pub sha: String,
     /// The pull request's number.
@@ -194,7 +204,7 @@ fn card_check(
     output: Output,
 ) -> CheckRun {
     CheckRun {
-        name: APPROVAL_CHECK.to_owned(),
+        name: approval_check_name(&card.workflow),
         head_sha: card.sha.clone(),
         external_id: format!("hatchrun-ci-approval:{}", card.sha),
         details_url: format!(
@@ -253,9 +263,9 @@ pub fn waiting_check_run(card: &Card) -> CheckRun {
 /// The check run that replaces the card once the run is decided: no
 /// button, `neutral`, saying `message`.
 #[must_use]
-pub fn decided_check_run(message: &str) -> CheckRun {
+pub fn decided_check_run(workflow: &str, message: &str) -> CheckRun {
     CheckRun {
-        name: APPROVAL_CHECK.to_owned(),
+        name: approval_check_name(workflow),
         head_sha: String::new(),
         external_id: String::new(),
         details_url: String::new(),
@@ -323,9 +333,8 @@ pub fn template_vcpu(label: &str) -> Option<u32> {
     hatchrun_workflow::template(label).map(|template| template.vcpu)
 }
 
-/// The card of the waiting `runs` of one pull request and commit at their
-/// repository `repo`, with the jobs of every one of them and `files` as
-/// read: what the card lists is exactly what a click approves.
+/// The card of `run` at its repository `repo`, with the jobs of that
+/// run and `files` as read.
 ///
 /// # Errors
 ///
@@ -334,28 +343,22 @@ pub async fn card_for(
     db: &Db,
     settings: &Settings,
     repo: &RepoRow,
-    runs: &[RunRow],
+    run: &RunRow,
     level: ForkApproval,
     files: Option<Vec<String>>,
 ) -> worker::Result<Card> {
-    let ids: Vec<u64> = runs.iter().map(|run| run.id).collect();
-    let jobs = store::jobs_of_runs(db, &ids)
+    let jobs = store::jobs_for_run(db, run.id)
         .await?
         .into_iter()
-        .filter_map(|row| {
-            let run = runs.iter().find(|run| run.id == row.run_id)?;
-            Some(CardJob {
-                workflow: run.workflow.clone(),
-                job: row.name,
-                template: row.template,
-                timeout_minutes: row.timeout_minutes,
-            })
+        .map(|row| CardJob {
+            workflow: run.workflow.clone(),
+            job: row.name,
+            template: row.template,
+            timeout_minutes: row.timeout_minutes,
         })
         .collect();
-    let Some(run) = runs.first() else {
-        return Err(worker::Error::RustError("a card of no runs".to_owned()));
-    };
     Ok(Card {
+        workflow: run.workflow.clone(),
         sha: run.sha.clone(),
         number: run.pull_number.unwrap_or_default(),
         title: run
@@ -468,7 +471,6 @@ pub async fn after_approval(
     runs: &[RunRow],
     by: &str,
 ) {
-    let mut carded: Vec<u64> = Vec::new();
     for run in runs {
         match store::fork_approval_held(db, run.id).await {
             Ok(woken) => {
@@ -478,13 +480,8 @@ pub async fn after_approval(
             }
             Err(err) => console_error!("run {}: find held jobs: {err}", run.id),
         }
-        if let Some(id) = run.gate_check_run_id
-            && !carded.contains(&id)
-        {
-            carded.push(id);
-            let check = decided_check_run(&approved_message(by));
-            update_card(tokens, settings, repo, run, &check).await;
-        }
+        let check = decided_check_run(&run.workflow, &approved_message(by));
+        update_card(tokens, settings, repo, run, &check).await;
     }
 }
 
@@ -498,17 +495,12 @@ pub async fn after_end(
     runs: &[RunRow],
     message: &str,
 ) {
-    let mut carded: Vec<u64> = Vec::new();
     for run in runs {
         if let Err(err) = cancel_run(env, run, message).await {
             console_error!("run {}: cancel after {message}: {err}", run.id);
         }
-        if let Some(id) = run.gate_check_run_id
-            && !carded.contains(&id)
-        {
-            carded.push(id);
-            update_card(tokens, settings, repo, run, &decided_check_run(message)).await;
-        }
+        let check = decided_check_run(&run.workflow, message);
+        update_card(tokens, settings, repo, run, &check).await;
     }
 }
 
@@ -548,9 +540,9 @@ pub async fn sweep(
             .await;
         }
     }
-    // The oldest group of each author in each repository: a group the
-    // author's cap blocks is skipped and the next author's is taken.
-    for run in store::deferred_runs(db, PASS, PER_AUTHOR)
+    // The oldest groups of each repository and of each author in it: a
+    // group the author's cap blocks is skipped and the next is taken.
+    for run in store::deferred_runs(db, PASS, PER_REPO, PER_AUTHOR)
         .await
         .map_err(|err| err.to_string())?
     {
@@ -579,8 +571,8 @@ pub async fn sweep(
     Ok(changed)
 }
 
-/// The most runs of one repository a reconciler pass looks at in the
-/// queue of cards that were never made.
+/// The most runs of one repository a reconciler pass looks at in each
+/// of its fork queues.
 const PER_REPO: u32 = 5;
 
 /// The most groups of one author in one repository a reconciler pass
@@ -594,37 +586,34 @@ const CARD_GRACE_MS: u64 = 60_000;
 /// What making the approval check run of a waiting run comes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardStep {
-    /// Every run of the group is on the recorded check run.
+    /// The run has its check run recorded.
     Done,
-    /// The group has a check run, and a run that joined after it is not
-    /// on it: put the run on it and list its jobs.
-    Join(u64),
-    /// A check run of the right name is on the commit already, made by
-    /// an earlier attempt that never recorded it: record its id.
+    /// A card of ours for this run, still asking, is on the commit
+    /// already, made by an earlier attempt that never recorded it:
+    /// record its id.
     Adopt(u64),
     /// Make the check run.
     Create,
 }
 
-/// Decides how to get the approval check run: the id recorded on the
-/// group (a run that joined later is put on it), else one an earlier
-/// attempt left on the commit, else a new one.
+/// Decides how to get a run's approval check run: the id recorded on
+/// the run, else its own undecided card an earlier attempt left on the
+/// commit, else a new one.
 #[must_use]
-pub const fn card_step(recorded: Option<u64>, on_commit: Option<u64>, all_on_it: bool) -> CardStep {
+pub const fn card_step(recorded: Option<u64>, on_commit: Option<u64>) -> CardStep {
     match (recorded, on_commit) {
-        (Some(id), _) if !all_on_it => CardStep::Join(id),
         (Some(_), _) => CardStep::Done,
         (None, Some(id)) => CardStep::Adopt(id),
         (None, None) => CardStep::Create,
     }
 }
 
-/// Makes sure the waiting runs of `run`'s pull request and commit have
-/// one approval check run, with its id recorded on all of them, so the
-/// Approve button exists, lists every run it will approve, and its click
-/// finds them. Safe to repeat, from the webhook and from the
-/// reconciler: it adopts a card of ours an earlier attempt made and did
-/// not record, and only an undecided one (see [`github::adoptable_card`]).
+/// Makes sure the waiting `run` has its own approval check run, named
+/// for its workflow, and that its id is recorded, only after the check
+/// run exists: the Approve button then approves exactly this run. Safe
+/// to repeat, from the webhook and from the reconciler: it adopts this
+/// run's card of ours that an earlier attempt made and did not record,
+/// and only an undecided one (see [`github::adoptable_card`]).
 ///
 /// # Errors
 ///
@@ -637,73 +626,37 @@ pub async fn ensure_card(
     run: &RunRow,
     policy: &RepoPolicy,
 ) -> Result<(), String> {
-    let Some(number) = run.pull_number else {
-        return Ok(());
-    };
-    let group = store::gate_group(db, repo.id, number, &run.sha)
-        .await
-        .map_err(|err| err.to_string())?;
-    let recorded = group.iter().find_map(|member| member.gate_check_run_id);
-    let all_on_it = group
-        .iter()
-        .all(|member| member.gate_check_run_id == recorded);
-    if group.is_empty() || card_step(recorded, None, all_on_it) == CardStep::Done {
+    if card_step(run.gate_check_run_id, None) == CardStep::Done {
         return Ok(());
     }
-    // A run that joined a card that exists: on it, and listed on it, so
-    // a click never approves a run the card did not show.
-    if let CardStep::Join(id) = card_step(recorded, None, all_on_it) {
-        store::set_gate_check(db, repo.id, number, &run.sha, id)
-            .await
-            .map_err(|err| err.to_string())?;
-        let group = store::gate_group(db, repo.id, number, &run.sha)
-            .await
-            .map_err(|err| err.to_string())?;
-        let files = changed_files(tokens, settings, repo, number).await;
-        let card = card_for(db, settings, repo, &group, policy.fork_approval, files)
-            .await
-            .map_err(|err| err.to_string())?;
-        let check = if group
-            .iter()
-            .any(|member| member.gate_status == GateStatus::Pending)
-        {
-            approval_check_run(&card)
-        } else {
-            waiting_check_run(&card)
-        };
-        let mut carded = run.clone();
-        carded.gate_check_run_id = Some(id);
-        update_card(tokens, settings, repo, &carded, &check).await;
-        return Ok(());
-    }
+    let name = approval_check_name(&run.workflow);
     let listed = tokens
         .send(repo.installation_id, |token| {
             github::check_runs_named(
                 &settings.github_api,
                 &repo.full_name,
                 &run.sha,
-                APPROVAL_CHECK,
+                &name,
                 token,
             )
         })
         .await
         .map_err(|err| err.to_string())?;
     let on_commit = github::adoptable_card(&listed, &settings.app_id)?;
-    match card_step(recorded, on_commit, all_on_it) {
-        CardStep::Done | CardStep::Join(_) => {}
-        CardStep::Adopt(id) => store::set_gate_check(db, repo.id, number, &run.sha, id)
+    match card_step(run.gate_check_run_id, on_commit) {
+        CardStep::Done => {}
+        CardStep::Adopt(id) => store::set_gate_check(db, run.id, id)
             .await
             .map_err(|err| err.to_string())?,
         CardStep::Create => {
-            let pending = group
-                .iter()
-                .any(|member| member.gate_status == GateStatus::Pending);
-            let files = if pending {
-                changed_files(tokens, settings, repo, number).await
-            } else {
-                None
+            // The file list is read only for a card that asks; a run
+            // waiting for a slot has no use for it yet.
+            let pending = run.gate_status == GateStatus::Pending;
+            let files = match run.pull_number {
+                Some(number) if pending => changed_files(tokens, settings, repo, number).await,
+                _ => None,
             };
-            let card = card_for(db, settings, repo, &group, policy.fork_approval, files)
+            let card = card_for(db, settings, repo, run, policy.fork_approval, files)
                 .await
                 .map_err(|err| err.to_string())?;
             let check = if pending {
@@ -718,7 +671,7 @@ pub async fn ensure_card(
                 .await
                 .map_err(|err| err.to_string())?;
             let id = github::check_run_id(&response)?;
-            store::set_gate_check(db, repo.id, number, &run.sha, id)
+            store::set_gate_check(db, run.id, id)
                 .await
                 .map_err(|err| err.to_string())?;
         }
@@ -727,11 +680,11 @@ pub async fn ensure_card(
 }
 
 /// Decides what the deferred runs of `run`'s pull request and commit
-/// become now, all together (one card covers them): asks for their
-/// approval when a slot is free and the author is under the cap, runs
-/// them when no approval is needed, ends them when the repository
-/// turned fork runs off, and leaves them otherwise. Returns how many
-/// changed.
+/// (a group, counted once against the limits) become now, together:
+/// asks for their approval when a slot is free and the author is under
+/// the cap, runs them when no approval is needed, ends them when the
+/// repository turned fork runs off, and leaves them otherwise. Each
+/// keeps its own card. Returns how many changed.
 async fn admit(
     env: &Env,
     db: &Db,
@@ -757,12 +710,9 @@ async fn admit(
     // The runs asking are deferred; they must not count against
     // themselves.
     waiting.deferred = 0;
-    let group: Vec<RunRow> = store::gate_group(db, repo.id, number, &run.sha)
+    let group = store::deferred_group(db, repo.id, number, &run.sha)
         .await
-        .map_err(|err| err.to_string())?
-        .into_iter()
-        .filter(|member| member.gate_status == GateStatus::Deferred)
-        .collect();
+        .map_err(|err| err.to_string())?;
     let slot = crate::policy::admission(&policy, &run.author_association, waiting);
     let (status, by) = match slot {
         crate::policy::Admission::Pending => (GateStatus::Pending, None),
@@ -776,8 +726,7 @@ async fn admit(
                         .map_err(|err| err.to_string())?,
                 );
             }
-            let off = "Fork runs are off for this repository";
-            after_end(env, settings, tokens, &repo, &ended, off).await;
+            after_end(env, settings, tokens, &repo, &ended, FORK_RUNS_OFF).await;
             return Ok(count(ended.len()));
         }
         crate::policy::Admission::Deferred | crate::policy::Admission::Drop => return Ok(0),
@@ -790,44 +739,139 @@ async fn admit(
                 .map_err(|err| err.to_string())?,
         );
     }
-    let changed = count(admitted.len());
     if let Some(by) = by {
         after_approval(env, db, settings, tokens, &repo, &admitted, by).await;
-        return Ok(changed);
+        return Ok(count(admitted.len()));
     }
-    let Some(first) = admitted.first() else {
-        return Ok(0);
-    };
-    if first.gate_check_run_id.is_some() {
-        // The waiting card becomes the approval card, listing every run
-        // the click will approve.
-        let everyone = store::gate_group(db, repo.id, number, &run.sha)
-            .await
-            .map_err(|err| err.to_string())?;
-        let files = changed_files(tokens, settings, &repo, number).await;
-        let card = card_for(db, settings, &repo, &everyone, policy.fork_approval, files)
-            .await
-            .map_err(|err| err.to_string())?;
-        update_card(tokens, settings, &repo, first, &approval_check_run(&card)).await;
-    } else if let Err(err) = ensure_card(tokens, db, settings, &repo, first, &policy).await {
-        console_error!("run {}: make the approval check run: {err}", first.id);
+    for member in &admitted {
+        if member.gate_check_run_id.is_some() {
+            // The waiting card becomes the approval card.
+            let files = changed_files(tokens, settings, &repo, number).await;
+            let card = card_for(db, settings, &repo, member, policy.fork_approval, files)
+                .await
+                .map_err(|err| err.to_string())?;
+            update_card(tokens, settings, &repo, member, &approval_check_run(&card)).await;
+        } else if let Err(err) = ensure_card(tokens, db, settings, &repo, member, &policy).await {
+            console_error!("run {}: make the approval check run: {err}", member.id);
+        }
     }
-    Ok(changed)
+    Ok(count(admitted.len()))
 }
 
-/// What a rerun of a fork run whose approval ended is told.
-pub const RERUN_REFUSED: &str = "This fork run was not approved. Push a new commit to ask \
-     again, or a maintainer can use /approve-run once available.";
+/// What a rerun of a fork run is told when the repository turned fork
+/// runs off, and what a run that its approval ended says.
+pub const FORK_RUNS_OFF: &str = "Fork runs are off for this repository";
 
-/// Whether a rerun of `run` is refused: a fork run whose approval ended
-/// without being given (expired, rejected, superseded or its pull
-/// request closed). Its jobs never ran, and resetting them would leave
-/// jobs nothing ends. A rerun of an approved run keeps its approval,
-/// since the code is the same and a rerun already needs write access.
+/// What a rerun of a fork run whose approval ended is told.
+pub const NOT_APPROVED: &str =
+    "This fork run was not approved. Push a new commit to ask for approval again.";
+
+/// The name of the check run that says a rerun was refused, one per
+/// commit: a later refusal updates it.
+pub const RERUN_CHECK: &str = "hatchrun / rerun";
+
+/// Why a rerun of `run` is refused under `policy`, `None` when it may go
+/// on: a fork run of a repository that turned fork runs off, and a fork
+/// run whose approval ended without being given (expired, rejected,
+/// superseded or its pull request closed), whose jobs never ran and
+/// would be reset with nothing to end them. A rerun of an approved run
+/// keeps its approval, since the code is the same and a rerun already
+/// needs write access.
 #[must_use]
-pub const fn rerun_refused(run: &RunRow) -> bool {
-    matches!(run.trust, Trust::Fork)
-        && matches!(run.gate_status, GateStatus::Expired | GateStatus::Cancelled)
+pub const fn rerun_refusal(run: &RunRow, policy: &RepoPolicy) -> Option<&'static str> {
+    if !matches!(run.trust, Trust::Fork) {
+        return None;
+    }
+    if matches!(policy.fork_runs, crate::policy::ForkRuns::Off) {
+        return Some(FORK_RUNS_OFF);
+    }
+    match run.gate_status {
+        GateStatus::Expired | GateStatus::Cancelled => Some(NOT_APPROVED),
+        _ => None,
+    }
+}
+
+/// The check run that says on commit `sha` why a rerun was refused.
+#[must_use]
+pub fn rerun_check_run(sha: &str, message: &str) -> CheckRun {
+    CheckRun {
+        name: RERUN_CHECK.to_owned(),
+        head_sha: sha.to_owned(),
+        ..decided_check_run("", message)
+    }
+}
+
+/// What saying a refusal comes to: update the check run of ours that is
+/// on the commit already, or make one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerunNote {
+    /// Update this check run.
+    Update(u64),
+    /// Make a check run.
+    Create,
+}
+
+/// Decides between updating the rerun check run of ours on the commit
+/// and making one, so repeated refusals leave one check run.
+#[must_use]
+pub const fn rerun_note(existing: Option<u64>) -> RerunNote {
+    match existing {
+        Some(id) => RerunNote::Update(id),
+        None => RerunNote::Create,
+    }
+}
+
+/// Says on the commit of `run` why a rerun was refused, updating the
+/// rerun check run that is there or making it. Best effort.
+pub async fn say_rerun_refused(
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    settings: &Settings,
+    repo: &RepoRow,
+    run: &RunRow,
+    message: &str,
+) {
+    let check = rerun_check_run(&run.sha, message);
+    let sent = async {
+        let listed = tokens
+            .send(repo.installation_id, |token| {
+                github::check_runs_named(
+                    &settings.github_api,
+                    &repo.full_name,
+                    &run.sha,
+                    RERUN_CHECK,
+                    token,
+                )
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        let existing = github::own_check_run(&listed, &settings.app_id)?;
+        match rerun_note(existing) {
+            RerunNote::Update(id) => tokens
+                .send(repo.installation_id, |token| {
+                    github::update_check_run(
+                        &settings.github_api,
+                        &repo.full_name,
+                        id,
+                        token,
+                        &check,
+                    )
+                })
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string()),
+            RerunNote::Create => tokens
+                .send(repo.installation_id, |token| {
+                    github::create_check_run(&settings.github_api, &repo.full_name, token, &check)
+                })
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string()),
+        }
+    }
+    .await;
+    if let Err(err) = sent {
+        console_error!("run {}: say the rerun was refused: {err}", run.id);
+    }
 }
 
 /// Whether a run still waits for a decision.
@@ -842,6 +886,7 @@ mod tests {
 
     fn card(files: Option<Vec<&str>>) -> Card {
         Card {
+            workflow: "ci".into(),
             sha: "3333333333333333333333333333333333333333".into(),
             number: 7,
             title: "Fix the `thing` [now](http://evil)".into(),
@@ -865,7 +910,8 @@ mod tests {
     #[test]
     fn the_card_asks_with_one_button_on_the_head_sha() {
         let check = approval_check_run(&card(Some(vec!["src/a.rs"])));
-        assert_eq!(check.name, "hatchrun / approval");
+        assert_eq!(check.name, "hatchrun / approval: ci");
+        assert_eq!(approval_check_name("lint"), "hatchrun / approval: lint");
         assert_eq!(check.status, "completed");
         assert_eq!(check.conclusion.as_deref(), Some("action_required"));
         assert_eq!(check.head_sha, "3333333333333333333333333333333333333333");
@@ -943,19 +989,48 @@ mod tests {
     }
 
     #[test]
-    fn a_rerun_of_a_fork_run_that_was_never_approved_is_refused() {
+    fn a_rerun_of_a_fork_run_that_was_never_approved_is_refused_with_its_reason() {
+        let on = RepoPolicy::default_for(false);
         for gate in ["expired", "cancelled"] {
-            assert!(rerun_refused(&row("fork", gate)), "{gate}");
+            let reason = rerun_refusal(&row("fork", gate), &on).unwrap();
+            assert!(reason.contains("not approved"), "{gate}");
+            assert!(reason.contains("Push a new commit"), "{gate}");
+            assert!(!reason.contains("/approve-run"), "{gate}");
         }
         // An approved run keeps working, as does one that never waited,
         // and a waiting one has no job to rerun.
         for gate in ["approved", "none", "pending", "deferred"] {
-            assert!(!rerun_refused(&row("fork", gate)), "{gate}");
+            assert_eq!(rerun_refusal(&row("fork", gate), &on), None, "{gate}");
         }
         // The repository's own code has no approval to lack.
-        assert!(!rerun_refused(&row("trusted", "none")));
-        assert!(RERUN_REFUSED.contains("not approved"));
-        assert!(RERUN_REFUSED.contains("/approve-run"));
+        assert_eq!(rerun_refusal(&row("trusted", "none"), &on), None);
+        assert_eq!(rerun_refusal(&row("trusted", "cancelled"), &on), None);
+    }
+
+    #[test]
+    fn a_rerun_of_any_fork_run_is_refused_when_fork_runs_are_off() {
+        let off = RepoPolicy::default_for(true);
+        for gate in ["approved", "none", "expired"] {
+            assert_eq!(
+                rerun_refusal(&row("fork", gate), &off),
+                Some("Fork runs are off for this repository"),
+                "{gate}"
+            );
+        }
+        assert_eq!(rerun_refusal(&row("trusted", "none"), &off), None);
+    }
+
+    #[test]
+    fn a_refusal_updates_the_rerun_check_run_instead_of_making_another() {
+        assert_eq!(rerun_note(None), RerunNote::Create);
+        assert_eq!(rerun_note(Some(9)), RerunNote::Update(9));
+        let check = rerun_check_run("abc", NOT_APPROVED);
+        assert_eq!(check.name, "hatchrun / rerun");
+        assert_eq!(check.head_sha, "abc");
+        assert_eq!(check.status, "completed");
+        assert_eq!(check.conclusion.as_deref(), Some("neutral"));
+        assert_eq!(check.output.unwrap().summary, NOT_APPROVED);
+        assert_eq!(check.actions.len(), 0);
     }
 
     #[test]
@@ -966,17 +1041,13 @@ mod tests {
 
     #[test]
     fn a_card_is_recorded_adopted_or_made() {
-        assert_eq!(card_step(Some(5), None, true), CardStep::Done);
-        assert_eq!(card_step(Some(5), Some(9), true), CardStep::Done);
-        // A run that joined the group after the card was made is put on
-        // the existing card, not left off it.
-        assert_eq!(card_step(Some(5), None, false), CardStep::Join(5));
-        assert_eq!(card_step(Some(5), Some(9), false), CardStep::Join(5));
+        assert_eq!(card_step(Some(5), None), CardStep::Done);
+        assert_eq!(card_step(Some(5), Some(9)), CardStep::Done);
         // A delivery that made the check run and stopped before it
         // recorded the id: the retry adopts it instead of making a
         // second one whose button no run knows.
-        assert_eq!(card_step(None, Some(9), true), CardStep::Adopt(9));
-        assert_eq!(card_step(None, None, true), CardStep::Create);
+        assert_eq!(card_step(None, Some(9)), CardStep::Adopt(9));
+        assert_eq!(card_step(None, None), CardStep::Create);
     }
 
     #[test]
@@ -992,7 +1063,7 @@ mod tests {
 
     #[test]
     fn a_decided_card_says_who_and_loses_its_button() {
-        let check = decided_check_run(&approved_message("maintainer"));
+        let check = decided_check_run("ci", &approved_message("maintainer"));
         assert_eq!(check.actions.len(), 0);
         assert_eq!(check.conclusion.as_deref(), Some("neutral"));
         assert_eq!(check.output.unwrap().summary, "Approved by maintainer");

@@ -137,12 +137,6 @@ pub(super) const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclus
 const JOBS_FOR_RUN: &str =
     "SELECT {columns} FROM ci_jobs WHERE run_id = $1 AND NOT superseded ORDER BY id";
 
-/// The jobs of the runs `$1` (a comma separated list of ids) in plan
-/// order, without those a rerun left out of their matrix.
-const JOBS_OF_RUNS: &str = "SELECT {columns} FROM ci_jobs \
-     WHERE run_id = ANY (string_to_array($1, ',')::bigint[]) AND NOT superseded \
-     ORDER BY run_id, id";
-
 /// Every row of run `$1`, those a rerun left out of their matrix too.
 const ALL_JOBS_FOR_RUN: &str = "SELECT {columns} FROM ci_jobs WHERE run_id = $1 ORDER BY id";
 
@@ -506,21 +500,6 @@ pub async fn set_needs(db: &Db, job_id: u64, needs: &[String], now: u64) -> Resu
 pub async fn jobs_for_run(db: &Db, run_id: u64) -> Result<Vec<JobRow>> {
     db.all(&with_columns(JOBS_FOR_RUN, JOB_COLUMNS), &params![run_id])
         .await
-}
-
-/// The jobs of every run of `run_ids` in one query, run by run in plan
-/// order, without those a rerun left out of their matrix.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn jobs_of_runs(db: &Db, run_ids: &[u64]) -> Result<Vec<JobRow>> {
-    let ids: Vec<String> = run_ids.iter().map(u64::to_string).collect();
-    db.all(
-        &with_columns(JOBS_OF_RUNS, JOB_COLUMNS),
-        &params![ids.join(",")],
-    )
-    .await
 }
 
 /// Every row of `run_id` in plan order, the jobs a rerun left out of

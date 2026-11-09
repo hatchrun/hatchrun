@@ -107,7 +107,7 @@ interface RunRow {
   pull_request: PullRef | null;
   trust: "trusted" | "fork";
   fork: { head_repo: string | null; author: string; author_association: string } | null;
-  gate: { status: string; by: string | null; at: number | null; check_run_id: number | null } | null;
+  gate: { status: string; by: string | null; at: number | null } | null;
   status: string;
   conclusion: string | null;
   created_at: number;

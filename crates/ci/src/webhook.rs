@@ -477,21 +477,33 @@ impl Cx<'_> {
         Ok(())
     }
 
-    /// Puts the approval check run on the head of `pr`: the card with
-    /// its button, or the note that the run waits for a free slot. One
-    /// per commit: a delivery repeated after a failure adopts the one
-    /// an earlier attempt made and records its id, so the button always
-    /// finds its run (see [`fork::ensure_card`]).
-    async fn ask_approval(&self, pr: &PullRequest, run_id: u64, policy: &RepoPolicy) -> Result<()> {
-        let (Some(repo), Some(run)) = (
-            store::repo(self.db, pr.repo.id).await?,
-            store::run(self.db, run_id).await?,
-        ) else {
+    /// Puts an approval check run on the head of `pr` for each of the
+    /// runs the delivery made that waits: its own card, with its own
+    /// button, named for its workflow. A delivery repeated after a
+    /// failure adopts the card an earlier attempt made and records its
+    /// id, so the button always finds its run (see
+    /// [`fork::ensure_card`]).
+    async fn ask_approval(
+        &self,
+        pr: &PullRequest,
+        run_ids: &[u64],
+        policy: &RepoPolicy,
+    ) -> Result<()> {
+        let Some(repo) = store::repo(self.db, pr.repo.id).await? else {
             return Ok(());
         };
-        fork::ensure_card(self.tokens, self.db, self.settings, &repo, &run, policy)
-            .await
-            .map_err(fail)
+        for &run_id in run_ids {
+            let Some(run) = store::run(self.db, run_id).await? else {
+                continue;
+            };
+            if !fork::waits(&run) {
+                continue;
+            }
+            fork::ensure_card(self.tokens, self.db, self.settings, &repo, &run, policy)
+                .await
+                .map_err(fail)?;
+        }
+        Ok(())
     }
 
     /// A click on "Approve and run". GitHub shows the button to people
@@ -665,10 +677,10 @@ impl Cx<'_> {
             self.now,
         )
         .await?;
-        if let (Some((gate, policy)), Some(&first)) = (&admitted, ids.first())
+        if let Some((gate, policy)) = &admitted
             && *gate != GateStatus::NotGated
         {
-            self.ask_approval(pr, first, policy).await?;
+            self.ask_approval(pr, &ids, policy).await?;
         }
         Ok(Outcome::Done(ids))
     }
@@ -781,31 +793,6 @@ impl Cx<'_> {
         Ok(Outcome::Done(ids))
     }
 
-    /// Says on the commit why a rerun was refused: a neutral check run,
-    /// since the job's own check run is the run object's to update.
-    async fn say_rerun_refused(&self, rerun: &Rerequested, run: &store::RunRow) {
-        let check = fork::decided_check_run(fork::RERUN_REFUSED);
-        let check = github::CheckRun {
-            name: "hatchrun / rerun".to_owned(),
-            head_sha: run.sha.clone(),
-            ..check
-        };
-        let sent = self
-            .tokens
-            .send(rerun.installation_id, |token| {
-                github::create_check_run(
-                    &self.settings.github_api,
-                    &rerun.repo.full_name,
-                    token,
-                    &check,
-                )
-            })
-            .await;
-        if let Err(err) = sent {
-            worker::console_error!("run {}: say the rerun was refused: {err}", run.id);
-        }
-    }
-
     async fn rerun(&self, rerun: &Rerequested) -> Result<Outcome> {
         let Some(job) = store::job(self.db, rerun.job_id).await? else {
             return Ok(Outcome::Ignored("check run of an unknown job".to_owned()));
@@ -818,12 +805,17 @@ impl Cx<'_> {
                 "check run of another repository".to_owned(),
             ));
         }
-        // A fork run that expired, was rejected or superseded has no
-        // approval and its jobs never ran: nothing is reset, and the
-        // commit says why.
-        if fork::rerun_refused(&run) {
-            self.say_rerun_refused(rerun, &run).await;
-            return Ok(Outcome::Ignored(fork::RERUN_REFUSED.to_owned()));
+        // A fork run whose approval ended, or whose repository turned
+        // fork runs off, is not rerun: nothing is reset, and the commit
+        // says why in one check run that later refusals update.
+        if run.trust == Trust::Fork
+            && let Some(repo) = store::repo(self.db, run.repo_id).await?
+        {
+            let policy = store::repo_policy(self.db, repo.id, repo.private).await?;
+            if let Some(reason) = fork::rerun_refusal(&run, &policy) {
+                fork::say_rerun_refused(self.tokens, self.settings, &repo, &run, reason).await;
+                return Ok(Outcome::Ignored(reason.to_owned()));
+            }
         }
         let url = format!(
             "https://run/rerun?job={}&run={}&tenant={}&days={}",

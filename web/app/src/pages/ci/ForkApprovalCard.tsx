@@ -40,7 +40,7 @@ export function ForkApprovalCard({ run, session, reload }: { run: CiRun; session
     setBusy(true);
     setError(null);
     try {
-      await (approve ? approveForkRun(run.id, gate.check_run_id) : rejectForkRun(run.id, gate.check_run_id));
+      await (approve ? approveForkRun(run.id) : rejectForkRun(run.id));
       reload();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

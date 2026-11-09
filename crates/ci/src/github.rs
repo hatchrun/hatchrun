@@ -441,15 +441,9 @@ pub fn check_run_total(response: &Response) -> Result<u64, String> {
     decode::<Listed>(response, "check runs").map(|l| l.total_count)
 }
 
-/// The id of the approval card an earlier attempt left on the commit,
-/// from the answer of [`check_runs_named`]: made by this App (`app_id`)
-/// and still asking (`action_required`). A card that was decided,
-/// waiting for a slot, or made by anyone else is never adopted.
-///
-/// # Errors
-///
-/// GitHub's answer when it is not a check run list.
-pub fn adoptable_card(response: &Response, app_id: &str) -> Result<Option<u64>, String> {
+/// The check runs of an answer of [`check_runs_named`] that this App
+/// (`app_id`) made: `(id, conclusion)`, in GitHub's order.
+fn own_check_runs(response: &Response, app_id: &str) -> Result<Vec<(u64, Option<String>)>, String> {
     #[derive(Deserialize)]
     struct Listed {
         #[serde(default)]
@@ -471,14 +465,43 @@ pub fn adoptable_card(response: &Response, app_id: &str) -> Result<Option<u64>, 
     Ok(listed
         .check_runs
         .into_iter()
-        .find(|check| {
-            check.conclusion.as_deref() == Some("action_required")
-                && check
-                    .app
-                    .as_ref()
-                    .is_some_and(|app| app.id.to_string() == app_id)
+        .filter(|check| {
+            check
+                .app
+                .as_ref()
+                .is_some_and(|app| app.id.to_string() == app_id)
         })
-        .map(|check| check.id))
+        .map(|check| (check.id, check.conclusion))
+        .collect())
+}
+
+/// The id of the approval card an earlier attempt left on the commit,
+/// from the answer of [`check_runs_named`]: made by this App (`app_id`)
+/// and still asking (`action_required`). A card that was decided,
+/// waiting for a slot, or made by anyone else is never adopted.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a check run list.
+pub fn adoptable_card(response: &Response, app_id: &str) -> Result<Option<u64>, String> {
+    Ok(own_check_runs(response, app_id)?
+        .into_iter()
+        .find(|(_, conclusion)| conclusion.as_deref() == Some("action_required"))
+        .map(|(id, _)| id))
+}
+
+/// The id of a check run of the answer of [`check_runs_named`] that this
+/// App (`app_id`) made, whatever its conclusion: the one to update
+/// instead of making another of the same name.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a check run list.
+pub fn own_check_run(response: &Response, app_id: &str) -> Result<Option<u64>, String> {
+    Ok(own_check_runs(response, app_id)?
+        .into_iter()
+        .next()
+        .map(|(id, _)| id))
 }
 
 /// Creates a check run.
@@ -820,6 +843,18 @@ mod tests {
         assert_eq!(adoptable_card(&mixed, "77"), Ok(Some(3)));
         assert_eq!(adoptable_card(&answered(200, "{}"), "77"), Ok(None));
         assert!(adoptable_card(&answered(500, "boom"), "77").is_err());
+    }
+
+    #[test]
+    fn our_own_check_run_is_found_whatever_its_conclusion() {
+        let list = |checks: &str| answered(200, &format!(r#"{{"check_runs":[{checks}]}}"#));
+        let ours =
+            list(r#"{"id":1,"conclusion":"neutral","app":{"id":77}},{"id":2,"app":{"id":77}}"#);
+        assert_eq!(own_check_run(&ours, "77"), Ok(Some(1)));
+        let other = list(r#"{"id":3,"conclusion":"neutral","app":{"id":78}}"#);
+        assert_eq!(own_check_run(&other, "77"), Ok(None));
+        assert_eq!(own_check_run(&answered(200, "{}"), "77"), Ok(None));
+        assert!(own_check_run(&answered(500, "boom"), "77").is_err());
     }
 
     #[test]

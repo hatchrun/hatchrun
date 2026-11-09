@@ -504,25 +504,6 @@ fn live_steps(jobs: &[JobRow], state: Option<&RunState>) -> BTreeMap<u64, Value>
         .collect()
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ForkCard {
-    check_run_id: Option<u64>,
-}
-
-/// The check run the approver acted on, from the body of an approve or
-/// reject: `{"check_run_id": N}`, or the run's own `current` card when
-/// there is no body.
-fn fork_card(body: &[u8], current: Option<u64>) -> std::result::Result<Option<u64>, Stop> {
-    if body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(current);
-    }
-    match serde_json::from_slice::<ForkCard>(body) {
-        Ok(card) => Ok(card.check_run_id),
-        Err(_) => stop(400, "expected {\"check_run_id\": 123} or no body"),
-    }
-}
-
 /// A run as the app reads it: the row, its branch, how long it took
 /// and how its jobs stand.
 pub(crate) fn run_json(run: &RunRow, repository: &str, jobs: JobCounts) -> Value {
@@ -554,7 +535,6 @@ pub(crate) fn run_json(run: &RunRow, repository: &str, jobs: JobCounts) -> Value
             "status": run.gate_status,
             "by": run.gate_by,
             "at": run.gate_at,
-            "check_run_id": run.gate_check_run_id,
         })),
         "status": run.status,
         "conclusion": run.conclusion,
@@ -801,8 +781,8 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
         Route::Artifacts(run) => cx.artifacts(run).await,
         Route::Artifact(run, artifact) => cx.artifact(run, artifact).await,
         Route::Cancel(run) => cx.cancel(run).await,
-        Route::ApproveFork(run) => cx.decide_fork(run, true, &mut req).await,
-        Route::RejectFork(run) => cx.decide_fork(run, false, &mut req).await,
+        Route::ApproveFork(run) => cx.decide_fork(run, true).await,
+        Route::RejectFork(run) => cx.decide_fork(run, false).await,
         Route::Approve(job) => cx.decide(job, true).await,
         Route::Reject(job) => cx.decide(job, false).await,
         Route::Dispatch { owner, repo } => cx.dispatch(owner, repo, &mut req).await,
@@ -1337,28 +1317,20 @@ impl Cx<'_> {
         no_content().map(Ok)
     }
 
-    /// Decides a fork pull request's runs that wait for approval (every
-    /// run of its pull request at its commit, as the approval check run
-    /// lists them), for anyone who can write to the repository (not only an admin of the
+    /// Decides a fork pull request's run that waits for approval, one
+    /// run at a time (each has its own approval check run), for anyone
+    /// who can write to the repository (not only an admin of the
     /// organization, which approving an environment needs). The first
     /// decision wins: a repeat, or a run that expired or ended, answers
     /// `409`. What follows the saved decision (waking the jobs, marking
     /// the check run, cancelling) is best effort, and the reconciler's
     /// backstops catch what fails.
-    async fn decide_fork(&self, run_id: u64, approve: bool, req: &mut Request) -> Result<Served> {
+    async fn decide_fork(&self, run_id: u64, approve: bool) -> Result<Served> {
         let Some(session) = self.session else {
             return Ok(stop(401, "sign in to approve or reject runs"));
         };
         let found = match self.found(run_id, Access::Write).await? {
             Ok(found) => found,
-            Err(stop) => return Ok(Err(stop)),
-        };
-        // The card the approver saw. A decision covers only the runs on
-        // that card: a run that joined after it was never shown. Without
-        // a body the run's current card is meant.
-        let body = req.bytes().await?;
-        let card = match fork_card(&body, found.run.gate_check_run_id) {
-            Ok(card) => card,
             Err(stop) => return Ok(Err(stop)),
         };
         let login = session.user.login.as_str();
@@ -1374,35 +1346,37 @@ impl Cx<'_> {
             &github,
             now,
         );
-        // The decision covers every waiting run of the pull request at
-        // this commit, which is what the check run's button covers too.
+        // One run, scoped by its repository and tenant in the query: a
+        // run has its own approval check run and its own decision.
+        let (tenant, repo_id) = (&found.repo.tenant_id, found.repo.id);
         if approve {
-            let runs = store::approve_group(self.db, found.run.id, card, login, now).await?;
-            if runs.is_empty() {
+            let Some(run) =
+                store::approve_run(self.db, tenant, repo_id, found.run.id, login, now).await?
+            else {
                 return Ok(stop(409, "This run is not waiting for approval"));
-            }
+            };
             fork::after_approval(
                 self.env,
                 self.db,
                 self.settings,
                 &tokens,
                 &found.repo,
-                &runs,
+                &[run],
                 login,
             )
             .await;
         } else {
-            let runs = store::end_group(self.db, found.run.id, card, "cancelled", Some(login), now)
-                .await?;
-            if runs.is_empty() {
+            let Some(run) =
+                store::reject_run(self.db, tenant, repo_id, found.run.id, login, now).await?
+            else {
                 return Ok(stop(409, "This run is not waiting for approval"));
-            }
+            };
             fork::after_end(
                 self.env,
                 self.settings,
                 &tokens,
                 &found.repo,
-                &runs,
+                &[run],
                 &fork::rejected_message(login),
             )
             .await;
@@ -1792,17 +1766,6 @@ mod tests {
             "/api/session",
         ] {
             assert_eq!(route(path), None, "{path}");
-        }
-    }
-
-    #[test]
-    fn a_decision_names_the_card_the_approver_saw() {
-        assert_eq!(fork_card(b"", Some(7)), Ok(Some(7)));
-        assert_eq!(fork_card(b" \n", None), Ok(None));
-        assert_eq!(fork_card(br#"{"check_run_id": 5}"#, Some(7)), Ok(Some(5)));
-        assert_eq!(fork_card(br#"{"check_run_id": null}"#, Some(7)), Ok(None));
-        for bad in [&b"x"[..], br#"{"other": 1}"#, br#"{"check_run_id": "a"}"#] {
-            assert_eq!(fork_card(bad, Some(7)).unwrap_err().0, 400);
         }
     }
 

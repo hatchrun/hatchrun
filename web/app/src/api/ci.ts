@@ -59,7 +59,7 @@ export interface CiRun {
   /** The author and head repository of a fork pull request's run; null for the repository's own code. */
   fork: { head_repo: string | null; author: string; author_association: string } | null;
   /** The approval a fork run needed; null when it never waited. */
-  gate: { status: GateStatus; by: string | null; at: number | null; check_run_id: number | null } | null;
+  gate: { status: GateStatus; by: string | null; at: number | null } | null;
   status: string;
   conclusion: string | null;
   created_at: number;
@@ -254,17 +254,11 @@ export const cancelCiRun = (id: number) => post<undefined>(`/api/ci/runs/${id}/c
 /** Lets a job held for approval run. Answers 409 when the job is not waiting. */
 export const approveCiJob = (id: number) => post<undefined>(`/api/ci/jobs/${id}/approve`);
 
-/**
- * Runs a fork pull request's runs that wait for approval (write access): those on the approval check run the
- * viewer saw (`checkRunId`, the run's `gate.check_run_id`), so a run that joined after is not approved.
- * Answers 409 when none waits on it.
- */
-export const approveForkRun = (id: number, checkRunId: number | null) =>
-  post<undefined>(`/api/ci/runs/${id}/approve-fork`, { check_run_id: checkRunId });
+/** Runs a fork pull request's run that waits for approval (write access). Answers 409 when it is not waiting. */
+export const approveForkRun = (id: number) => post<undefined>(`/api/ci/runs/${id}/approve-fork`);
 
-/** Cancels the runs on the approval check run the viewer saw (write access). Answers 409 when none waits on it. */
-export const rejectForkRun = (id: number, checkRunId: number | null) =>
-  post<undefined>(`/api/ci/runs/${id}/reject-fork`, { check_run_id: checkRunId });
+/** Cancels a fork pull request's run that waits for approval (write access). Answers 409 when it is not waiting. */
+export const rejectForkRun = (id: number) => post<undefined>(`/api/ci/runs/${id}/reject-fork`);
 
 /** Fails a job held for approval. Answers 409 when the job is not waiting. */
 export const rejectCiJob = (id: number) => post<undefined>(`/api/ci/jobs/${id}/reject`);
