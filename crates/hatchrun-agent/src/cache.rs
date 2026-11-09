@@ -124,8 +124,8 @@ pub struct Identity {
     /// reads them as the token's access controls. `None` leaves them out
     /// of the token, so `BuildKit` refuses it.
     pub scopes: Option<Vec<String>>,
-    /// How long the token lives, in seconds.
-    pub lifetime_secs: u64,
+    /// When the token stops working, in Unix seconds.
+    pub expires_at: u64,
 }
 
 /// The artifact service of a job.
@@ -256,7 +256,7 @@ impl Proxy {
                 run_id: "1".into(),
                 job_id: "build".into(),
                 scopes: Some(vec!["refs/heads/main".into()]),
-                lifetime_secs: 2100,
+                expires_at: 4_102_444_800,
             },
         };
         Self::start_with(services, addr, results).await
@@ -269,7 +269,7 @@ impl Proxy {
             &identity.run_id,
             &identity.job_id,
             identity.scopes.as_deref(),
-            identity.lifetime_secs,
+            identity.expires_at,
         )?;
         let artifacts = services
             .artifacts
@@ -573,6 +573,18 @@ fn json(value: &impl Serialize) -> Reply {
             err.to_string(),
         ),
     }
+}
+
+/// The reply for a call to the control plane that failed, with the
+/// Twirp code and status its answer deserves (see [`twirp::code_for`])
+/// and its `Retry-After`.
+fn refusal(err: &anyhow::Error) -> Reply {
+    let (code, retry_after) = twirp::code_for(err);
+    let mut reply = twirp_error(twirp::http_status(code), code, format!("{err:#}"));
+    if let Some(value) = retry_after.and_then(|v| HeaderValue::from_str(&v).ok()) {
+        reply.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    reply
 }
 
 fn twirp_error(status: StatusCode, code: &'static str, msg: impl Into<String>) -> Reply {

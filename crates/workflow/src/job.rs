@@ -49,10 +49,10 @@ pub struct JobDocument {
     /// The artifact service, when the control plane has one. The agent
     /// serves `actions/upload-artifact` and `download-artifact` from it.
     pub artifacts: Option<ArtifactService>,
-    /// How long the runtime token the agent makes for the cache and
-    /// artifact toolkits lives, in seconds: the job's timeout and the
-    /// time to boot and wind down, as the job token's own lifetime.
-    pub token_lifetime_secs: u64,
+    /// When the job token stops working, in Unix seconds: the `exp` of
+    /// the token the claim carries. The runtime token the agent makes for
+    /// the cache and artifact toolkits expires then too.
+    pub token_expires_at: u64,
     /// The `inputs` context of a job of a called workflow: what the
     /// calls passed. `None` for a job of the workflow that was started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,7 +79,7 @@ impl fmt::Debug for JobDocument {
             .field("cache", &self.cache)
             .field("id_token", &self.id_token)
             .field("artifacts", &self.artifacts)
-            .field("token_lifetime_secs", &self.token_lifetime_secs)
+            .field("token_expires_at", &self.token_expires_at)
             .field("inputs", &self.inputs)
             .finish()
     }

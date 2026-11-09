@@ -10,14 +10,13 @@ use http_body_util::{BodyExt, Limited};
 use hyper::Request;
 use hyper::StatusCode;
 use hyper::body::Incoming;
-use hyper::header::{self, HeaderValue};
 use serde::de::DeserializeOwned;
 use tracing::{debug, info, warn};
 
 use super::twirp;
 use super::{
     DOWNLOAD_PATH, Download, MAX_SMALL_BODY, Reply, State, UPLOAD_PATH, Upload, UploadState,
-    download_token, json, lock, twirp_error,
+    download_token, json, lock, refusal, twirp_error,
 };
 
 /// A Twirp request body, or why it is malformed.
@@ -109,12 +108,7 @@ pub(super) async fn create(state: &State, request: twirp::CreateRequest) -> Repl
             // What the control plane refused for good is a code the
             // toolkit and `BuildKit` do not retry, with Twirp's own status
             // for it; the rest is `unavailable`.
-            let (code, retry_after) = twirp::code_for(&err);
-            let mut reply = twirp_error(twirp::http_status(code), code, format!("{err:#}"));
-            if let Some(value) = retry_after.and_then(|v| HeaderValue::from_str(&v).ok()) {
-                reply.headers_mut().insert(header::RETRY_AFTER, value);
-            }
-            return reply;
+            return refusal(&err);
         }
     };
     let url = format!("{}{UPLOAD_PATH}{id}", state.base);

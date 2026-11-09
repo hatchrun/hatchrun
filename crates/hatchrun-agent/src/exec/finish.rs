@@ -51,9 +51,28 @@ impl Job<'_> {
     /// Starts the cache proxy when the document has a cache or an
     /// artifact service and points the steps at it. Without one, or
     /// when it does not come up, steps run with neither.
-    pub(super) async fn start_cache(&mut self, sink: &mut dyn Sink) -> Option<Proxy> {
+    ///
+    /// # Errors
+    ///
+    /// The job token has expired already, so the runtime token the
+    /// steps' toolkits would get is no good; the job fails with the
+    /// message.
+    pub(super) async fn start_cache(
+        &mut self,
+        sink: &mut dyn Sink,
+    ) -> Result<Option<Proxy>, String> {
         if self.doc.cache.is_none() && self.doc.artifacts.is_none() {
-            return None;
+            return Ok(None);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        if self.doc.token_expires_at <= now {
+            return Err(format!(
+                "The job token expired at {} (Unix time) and it is {now}: the control \
+                 plane sent a document the job cannot run with.",
+                self.doc.token_expires_at
+            ));
         }
         // The service tokens are the agent's own credentials; an error
         // text that quotes one must not print.
@@ -83,7 +102,6 @@ impl Job<'_> {
             .cache
             .as_ref()
             .map(|service| service.scopes.clone());
-        let lifetime_secs = self.doc.token_lifetime_secs;
         // `BuildKit` runs in a container, which reaches the proxy only
         // when it listens on the bridge: on the loopback the token
         // leaves the scopes out, and `type=gha` fails at once.
@@ -94,7 +112,7 @@ impl Job<'_> {
                 run_id: self.doc.run_id.clone(),
                 job_id: self.doc.job.id.clone(),
                 scopes: scopes.clone().filter(|_| reachable),
-                lifetime_secs,
+                expires_at: self.doc.token_expires_at,
             },
         };
         let (ip, mut loopback_reason) = self.proxy_bind().await;
@@ -115,14 +133,14 @@ impl Job<'_> {
             Ok(proxy) => proxy,
             Err(err) => {
                 self.cache_unavailable(sink, &err.context(format!("cannot listen on {bound}")));
-                return None;
+                return Ok(None);
             }
         };
         if let Err(err) = proxy.check().await {
             let at = format!("health check of {}", proxy.url());
             self.cache_unavailable(sink, &err.context(at));
             proxy.stop().await;
-            return None;
+            return Ok(None);
         }
         self.cache_unreachable = bound == loopback;
         if let Some(reason) = loopback_reason {
@@ -144,7 +162,7 @@ impl Job<'_> {
             self.cache_env
                 .insert("ACTIONS_CACHE_SERVICE_V2".to_owned(), "true".to_owned());
         }
-        Some(proxy)
+        Ok(Some(proxy))
     }
 
     /// Where the proxy listens: the address of Docker's default bridge

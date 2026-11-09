@@ -127,11 +127,7 @@ impl Client {
         loop {
             match self.post(CLAIM_PATH, None).await? {
                 Answer::Ok(response) => {
-                    let doc: JobDocument =
-                        response.json().await.context("read the job document")?;
-                    if doc.token_lifetime_secs == 0 {
-                        bail!("the control plane sent a job document without a token lifetime");
-                    }
+                    let doc = response.json().await.context("read the job document")?;
                     return Ok(Claim::Job(Box::new(doc)));
                 }
                 Answer::Stopped(StatusCode::CONFLICT) => return Ok(Claim::Ended),
@@ -277,7 +273,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
-            token_lifetime_secs: 3600,
+            token_expires_at: 4_102_444_800,
             inputs: None,
         };
         serde_json::to_value(doc).unwrap()

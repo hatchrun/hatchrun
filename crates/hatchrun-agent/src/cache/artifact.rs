@@ -32,7 +32,7 @@ use super::cloud::{Cloud, JobEnded, Part, answer};
 use super::rpc::{abandon, body, malformed};
 use super::{
     Artifacts, DOWNLOAD_PATH, Download, Reply, State, UPLOAD_PATH, Upload, UploadState,
-    download_token, json, lock, twirp_error,
+    download_token, json, lock, refusal, twirp_error,
 };
 
 /// The version an artifact upload has in the upload table, which cache
@@ -106,11 +106,7 @@ async fn create(state: &State, cloud: &Cloud, request: CreateRequest) -> Reply {
         Err(err) if ended(&err) => return job_ended(),
         Err(err) => {
             warn!(name = request.name, "artifact upload refused: {err:#}");
-            return twirp_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                format!("{err:#}"),
-            );
+            return refusal(&err);
         }
     };
     let url = format!("{}{UPLOAD_PATH}{id}", state.base);
@@ -247,11 +243,7 @@ async fn list(cloud: &Cloud, request: ListRequest) -> Reply {
         Err(err) if ended(&err) => job_ended(),
         Err(err) => {
             warn!("artifact list failed: {err:#}");
-            twirp_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                format!("{err:#}"),
-            )
+            refusal(&err)
         }
     }
 }
@@ -269,11 +261,7 @@ async fn signed_url(state: &State, cloud: &Cloud, request: NamedRequest) -> Repl
         Err(err) if ended(&err) => return job_ended(),
         Err(err) => {
             warn!(name = request.name, "artifact url failed: {err:#}");
-            return twirp_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                format!("{err:#}"),
-            );
+            return refusal(&err);
         }
     };
     let token = match download_token() {
@@ -314,11 +302,7 @@ async fn delete(cloud: &Cloud, request: NamedRequest) -> Reply {
         Err(err) if ended(&err) => job_ended(),
         Err(err) => {
             warn!(name = request.name, "artifact delete failed: {err:#}");
-            twirp_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                format!("{err:#}"),
-            )
+            refusal(&err)
         }
     }
 }

@@ -168,8 +168,8 @@ pub fn timestamp(millis: u64) -> String {
 
 /// The `ACTIONS_RUNTIME_TOKEN` of a job: a JWT the toolkits read and
 /// never verify, so the signature is random filler; the proxy checks
-/// the whole token on every artifact call. It is valid for
-/// `lifetime_secs` from now, which the Worker chooses.
+/// the whole token on every artifact call. It expires at `expires_at`,
+/// the job token's own expiry, which the Worker sends.
 ///
 /// - The artifact toolkit reads the run and job from the `scp` claim,
 ///   `Actions.Results:<run>:<job>`.
@@ -186,12 +186,13 @@ pub fn timestamp(millis: u64) -> String {
 ///
 /// # Errors
 ///
-/// When the system has no randomness or its clock is before 1970.
+/// When the system has no randomness, its clock is before 1970, or
+/// `expires_at` has passed.
 pub fn runtime_token(
     run_id: &str,
     job_id: &str,
     scopes: Option<&[String]>,
-    lifetime_secs: u64,
+    expires_at: u64,
 ) -> Result<String> {
     // The scope is `Actions.Results:<run>:<job>`, split on `:` and
     // spaces by the toolkit.
@@ -210,6 +211,11 @@ pub fn runtime_token(
         .duration_since(UNIX_EPOCH)
         .map_err(|err| anyhow!("the clock is before 1970: {err}"))?
         .as_secs();
+    if expires_at <= now {
+        return Err(anyhow!(
+            "the job token expired at {expires_at}, now is {now}"
+        ));
+    }
     let access = scopes.map(|scopes| {
         let list: Vec<serde_json::Value> = scopes
             .iter()
@@ -226,7 +232,7 @@ pub fn runtime_token(
         "scp": format!("Actions.Results:{}:{}", part(run_id), part(job_id)),
         // A little before now, for clock skew.
         "nbf": now.saturating_sub(300),
-        "exp": now + lifetime_secs,
+        "exp": expires_at,
     });
     if let Some(access) = access {
         claims["ac"] = serde_json::Value::String(access);
@@ -384,7 +390,12 @@ mod tests {
     #[test]
     fn the_runtime_token_carries_the_toolkits_scope() {
         let scopes = vec!["refs/pull/4/merge".to_owned(), "refs/heads/main".to_owned()];
-        let token = runtime_token("12", "build job", Some(&scopes), 360 * 60 + 1500).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expires = now + 360 * 60 + 1500;
+        let token = runtime_token("12", "build job", Some(&scopes), expires).unwrap();
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
         let claims: serde_json::Value =
@@ -392,7 +403,7 @@ mod tests {
         assert_eq!(claims["scp"], "Actions.Results:12:build_job");
         assert_ne!(
             token,
-            runtime_token("12", "build job", Some(&scopes), 360 * 60 + 1500).unwrap()
+            runtime_token("12", "build job", Some(&scopes), expires).unwrap()
         );
         // BuildKit reads a JSON list in a string, and a window around now.
         let access: serde_json::Value =
@@ -404,15 +415,12 @@ mod tests {
                 { "Scope": "refs/heads/main", "Permission": 1 },
             ])
         );
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         assert!(claims["nbf"].as_u64().unwrap() < now);
-        let exp = claims["exp"].as_u64().unwrap();
-        assert!(exp >= now + 360 * 60 + 1400 && exp <= now + 360 * 60 + 1600);
+        assert_eq!(claims["exp"].as_u64().unwrap(), expires);
+        // A token that has expired is refused.
+        assert!(runtime_token("1", "j", None, now).is_err());
         // A single scope is read and write.
-        let one = runtime_token("1", "j", Some(&["refs/heads/main".to_owned()]), 60).unwrap();
+        let one = runtime_token("1", "j", Some(&["refs/heads/main".to_owned()]), expires).unwrap();
         let claims: serde_json::Value = serde_json::from_slice(
             &URL_SAFE_NO_PAD
                 .decode(one.split('.').nth(1).unwrap())
@@ -424,7 +432,7 @@ mod tests {
         assert_eq!(access[0]["Permission"], 3);
         assert_eq!(access.as_array().unwrap().len(), 1);
         // Without scopes the token has no access controls.
-        let plain = runtime_token("1", "j", None, 60).unwrap();
+        let plain = runtime_token("1", "j", None, expires).unwrap();
         let claims: serde_json::Value = serde_json::from_slice(
             &URL_SAFE_NO_PAD
                 .decode(plain.split('.').nth(1).unwrap())

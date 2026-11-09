@@ -142,18 +142,27 @@ impl Job<'_> {
         if let Some(bin) = &self.docker.bin {
             return Ok(bin.clone());
         }
-        let bin = if let Some(bin) = &self.opts.docker {
-            bin.clone()
-        } else {
-            let path = std::env::var_os("PATH").unwrap_or_default();
-            let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-            dirs.extend(std::env::split_paths(DEFAULT_PATH));
-            dirs.into_iter()
-                .map(|dir| dir.join("docker"))
-                .find(|candidate| candidate.is_file())
-                .ok_or_else(|| {
-                    "Docker is not installed: this job needs a `docker` command".to_owned()
-                })?
+        // A path is used as it is; a bare name, `docker` or `podman`, is
+        // looked up on the `PATH`.
+        let bin = match &self.opts.docker {
+            Some(bin) if bin.components().count() > 1 || bin.is_absolute() => bin.clone(),
+            configured => {
+                let name = configured
+                    .as_deref()
+                    .map_or_else(|| Path::new("docker"), |bin| bin);
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+                dirs.extend(std::env::split_paths(DEFAULT_PATH));
+                dirs.into_iter()
+                    .map(|dir| dir.join(name))
+                    .find(|candidate| candidate.is_file())
+                    .ok_or_else(|| {
+                        format!(
+                            "Docker is not installed: this job needs a `{}` command",
+                            name.display()
+                        )
+                    })?
+            }
         };
         self.docker.bin = Some(bin.clone());
         Ok(bin)

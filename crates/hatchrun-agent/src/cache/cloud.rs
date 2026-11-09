@@ -273,8 +273,21 @@ pub(super) struct Refused {
     pub status: StatusCode,
     /// Its `Retry-After`, when it sent one.
     pub retry_after: Option<String>,
-    pub(super) what: String,
-    pub(super) body: String,
+    what: String,
+    body: String,
+}
+
+impl Refused {
+    /// A refusal, for tests of what depends on one.
+    #[cfg(test)]
+    pub(super) fn new(status: StatusCode, retry_after: Option<&str>) -> Self {
+        Self {
+            status,
+            retry_after: retry_after.map(str::to_owned),
+            what: "start upload".to_owned(),
+            body: String::new(),
+        }
+    }
 }
 
 impl std::fmt::Display for Refused {
@@ -285,17 +298,23 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+/// The start of the body of a failed answer.
+async fn failure_body(response: reqwest::Response) -> String {
+    let body = response.text().await.unwrap_or_default();
+    body.chars().take(300).collect()
+}
+
 /// The response of S3 when it succeeded, else an error with its status
 /// and the start of its body. Not a [`Refused`]: only what the control
-/// plane answers is final, and S3's refusals (a presigned URL that has
-/// expired, a 5xx) are the caller's to retry.
+/// plane answers is final. A part that S3 refuses (a presigned URL that
+/// has expired, a 5xx) fails the upload, as `upload.rs` marks it, and
+/// the client's retry of the whole save is what recovers.
 async fn s3_answer(response: reqwest::Response, what: &str) -> Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
-    let body = response.text().await.unwrap_or_default();
-    let body: String = body.chars().take(300).collect();
+    let body = failure_body(response).await;
     bail!("{what}: {status}: {body}")
 }
 
@@ -314,12 +333,12 @@ pub(super) async fn answer(response: reqwest::Response, what: &str) -> Result<re
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let body = response.text().await.unwrap_or_default();
+    let body = failure_body(response).await;
     Err(Refused {
         status,
         retry_after,
         what: what.to_owned(),
-        body: body.chars().take(300).collect(),
+        body,
     }
     .into())
 }

@@ -315,13 +315,7 @@ mod status_tests {
     use super::*;
 
     fn refused(status: u16, retry_after: Option<&str>) -> anyhow::Error {
-        Refused {
-            status: StatusCode::from_u16(status).unwrap(),
-            retry_after: retry_after.map(str::to_owned),
-            what: "start upload".to_owned(),
-            body: String::new(),
-        }
-        .into()
+        Refused::new(StatusCode::from_u16(status).unwrap(), retry_after).into()
     }
 
     #[test]

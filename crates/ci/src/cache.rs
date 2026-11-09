@@ -41,7 +41,7 @@ use hatchrun_cloud::cache::{
 };
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::{jwt, webcrypto};
-use worker::{Env, Method, Request, Response, Result, console_error, console_warn};
+use worker::{Env, Method, Request, Response, Result, console_warn};
 
 use crate::artifacts::{
     Answer, Refusal, aws_failure, body, check_job, credentials, json, now_ms, sign_send,
@@ -65,15 +65,6 @@ pub const EVICT_LIMIT: u32 = 20;
 pub const MAX_REPO_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// How long a presigned URL holds, in seconds.
 const URL_SECS: u64 = 900;
-
-/// The scopes a job's column holds, for the claim and the cache service
-/// alike: none for NULL, and none, logged, for text that is not a list.
-pub(crate) fn job_scopes(job_id: u64, text: Option<&str>) -> Vec<String> {
-    store::parse_cache_scopes(text).unwrap_or_else(|err| {
-        console_error!("job {job_id}: malformed cache scopes: {err}");
-        Vec::new()
-    })
-}
 
 /// What a call from a job that is no longer running is told.
 const JOB_ENDED: &str = "the job is not running";
@@ -182,7 +173,7 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
         .ok_or_else(|| Refusal::new(410, JOB_ENDED))?;
     // The list the job's claim fixed. A job claimed before it was kept
     // has none, and no cache.
-    let scopes = job_scopes(job.id, job.cache_scopes.as_deref());
+    let scopes = store::job_scopes(job.id, job.cache_scopes.as_deref());
     let ctx = Context {
         settings,
         db,

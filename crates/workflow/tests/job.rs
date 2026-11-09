@@ -64,7 +64,7 @@ fn document(job: PlannedJob) -> JobDocument {
             token: "i_tok".into(),
         }),
         artifacts: None,
-        token_lifetime_secs: 0,
+        token_expires_at: 4_102_444_800,
         inputs: None,
     }
 }

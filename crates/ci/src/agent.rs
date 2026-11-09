@@ -399,7 +399,7 @@ async fn claim(
             Some(&repo.default_branch),
         );
         match store::set_cache_scopes(db, row.id, row.attempt, &wanted).await {
-            Ok(Some(fixed)) => crate::cache::job_scopes(row.id, fixed.text.as_deref()),
+            Ok(Some(scopes)) => scopes,
             Ok(None) => return status(409),
             Err(err) => {
                 console_error!("job {}: record cache scopes: {err}", row.id);
@@ -409,9 +409,7 @@ async fn claim(
     } else {
         Vec::new()
     };
-    let body = json!({ "token": github_token, "capped": capped })
-        .to_string()
-        .into_bytes();
+    let body = claim_body(&github_token, &capped, claims);
     let mut response = to_run(env, run.id, "claim", row.id, row.attempt, body).await?;
     if response.status_code() != 200 {
         return Ok(response);
@@ -420,21 +418,30 @@ async fn claim(
     fill(&mut document, &secrets, vars);
     document.id_token =
         id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
-    offer_services(&mut document, settings, job_token, row, scopes);
+    offer_services(&mut document, settings, job_token, scopes);
     Response::from_json(&document)
 }
 
-/// Gives the document the services the job gets, and the lifetime of the
-/// runtime token the agent makes for them: the one of the job token the
-/// same claim carries, from the job's row.
+/// What the claim sends the run object: the installation token, the
+/// permissions it was capped to, and when the job token the claim
+/// carries stops working, which the agent's runtime token follows.
+fn claim_body(github_token: &str, capped: &[github::Capped], claims: &Claims) -> Vec<u8> {
+    json!({
+        "token": github_token,
+        "token_expires_at": claims.exp,
+        "capped": capped,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Gives the document the services the job gets.
 fn offer_services(
     document: &mut JobDocument,
     settings: &Settings,
     job_token: &str,
-    row: &JobRow,
     scopes: Vec<String>,
 ) {
-    document.token_lifetime_secs = token::lifetime_secs(row.timeout_minutes);
     document.artifacts = artifact_service(settings, job_token);
     document.cache = cache_service(settings, job_token, scopes);
 }
@@ -811,28 +818,30 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_offers_the_services_and_a_token_lifetime_from_the_row() {
+    fn a_claim_sends_the_expiry_of_the_job_token_to_the_run_object() {
+        let claims = Claims {
+            job: 5,
+            run: 9,
+            attempt: 2,
+            exp: 100 + token::lifetime_secs(10),
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(&claim_body("gh", &[], &claims)).unwrap();
+        assert_eq!(body["token"], "gh");
+        assert_eq!(body["token_expires_at"], claims.exp);
+        assert_eq!(body["capped"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_claim_offers_the_services_the_bucket_allows() {
         let mut doc = document();
-        assert_eq!(doc.token_lifetime_secs, 0);
-        let job = row("running");
         let scopes = vec!["refs/heads/main".to_owned()];
-        offer_services(
-            &mut doc,
-            &settings("bucket"),
-            "v1.a.b",
-            &job,
-            scopes.clone(),
-        );
-        assert_eq!(
-            doc.token_lifetime_secs,
-            token::lifetime_secs(job.timeout_minutes)
-        );
-        assert!(doc.token_lifetime_secs > u64::from(job.timeout_minutes) * 60);
+        offer_services(&mut doc, &settings("bucket"), "v1.a.b", scopes.clone());
         assert_eq!(doc.cache.unwrap().scopes, scopes);
         assert!(doc.artifacts.is_some());
         // Without the artifacts bucket there are no services.
         let mut bare = document();
-        offer_services(&mut bare, &settings(""), "v1.a.b", &job, Vec::new());
+        offer_services(&mut bare, &settings(""), "v1.a.b", Vec::new());
         assert!(bare.cache.is_none() && bare.artifacts.is_none());
     }
 
@@ -1151,7 +1160,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
-            token_lifetime_secs: 0,
+            token_expires_at: 4_102_444_800,
             inputs: None,
         }
     }
