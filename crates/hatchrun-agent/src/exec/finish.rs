@@ -83,30 +83,33 @@ impl Job<'_> {
             .cache
             .as_ref()
             .map(|service| service.scopes.clone());
-        // `BuildKit` runs in a container, which reaches the proxy only
-        // when it listens on the bridge: on the loopback the token
-        // leaves the scopes out, and `type=gha` fails at once.
-        let services = |reachable: bool| Services {
+        // The token keeps the scopes even when the proxy listens on the
+        // loopback only. `BuildKit` then fails to connect from its
+        // container, which it treats like any other cache outage: a
+        // failed import is a warning and a failed export follows
+        // `ignore-error`. A token without scopes is a configuration error
+        // it fails the build on before `ignore-error` applies.
+        let services = || Services {
             cache: cache.clone(),
             artifacts: artifacts.clone(),
             identity: Identity {
                 run_id: self.doc.run_id.clone(),
                 job_id: self.doc.job.id.clone(),
-                scopes: scopes.clone().filter(|_| reachable),
+                scopes: scopes.clone(),
                 expires_in: self.doc.token_expires_in,
             },
         };
         let (ip, mut loopback_reason) = self.proxy_bind().await;
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut bound = ip;
-        let started = match Proxy::start_services(services(ip != loopback), ip).await {
+        let started = match Proxy::start_services(services(), ip).await {
             // The bridge gateway can be an address this machine does not
             // have yet; the loopback still serves the host's steps.
             Err(err) if ip != loopback => {
                 // `warn_loopback` logs it, once.
                 loopback_reason = Some(format!("it cannot listen on {ip}: {err:#}"));
                 bound = loopback;
-                Proxy::start_services(services(false), loopback).await
+                Proxy::start_services(services(), loopback).await
             }
             other => other,
         };
@@ -204,8 +207,9 @@ impl Job<'_> {
     fn warn_loopback(&mut self, sink: &mut dyn Sink, reason: &str) {
         let message = format!(
             "The cache proxy listens on the loopback only ({reason}): steps in containers \
-             and BuildKit builders (docker buildx with type=gha) cannot use the cache or \
-             the artifact service. Steps on the host still can."
+             cannot use the cache or the artifact service, and BuildKit builders (docker \
+             buildx with type=gha) cannot reach the cache, so their imports are skipped and \
+             their exports fail unless they set ignore-error=true. Steps on the host still can."
         );
         // The log gets the masked text; the sink masks its own.
         warn!("{}", self.masked(&message));
