@@ -15,9 +15,8 @@ use tracing::{debug, info, warn};
 
 use super::twirp;
 use super::{
-    DOWNLOAD_PATH, Download, Finalize, MAX_SMALL_BODY, Reply, State, UPLOAD_PATH, Upload,
-    UploadState, download_token, finalize_refused, finalize_upload, json, lock, refusal,
-    twirp_error,
+    DOWNLOAD_PATH, Download, MAX_SMALL_BODY, Reply, State, UPLOAD_PATH, Upload, UploadState,
+    download_token, json, lock, refusal, twirp_error,
 };
 
 /// A Twirp request body, or why it is malformed.
@@ -138,6 +137,13 @@ pub(super) async fn create(state: &State, request: twirp::CreateRequest) -> Repl
 
 pub(super) async fn finalize(state: &State, request: twirp::FinalizeRequest) -> Reply {
     let entry = (request.key.clone(), request.version.clone());
+    let upload = {
+        let mut uploads = lock(&state.uploads);
+        uploads
+            .by_entry
+            .remove(&entry)
+            .and_then(|id| uploads.by_id.remove(&id))
+    };
     let refuse = |message: String| {
         json(&twirp::FinalizeResponse {
             ok: false,
@@ -145,24 +151,27 @@ pub(super) async fn finalize(state: &State, request: twirp::FinalizeRequest) -> 
             message,
         })
     };
-    let done = finalize_upload(state, &entry, |upload, parts| async move {
-        upload.cloud.complete(&upload.id, &parts).await
-    })
-    .await;
-    match done {
-        Finalize::NoUpload => refuse(format!("no upload for {}", request.key)),
-        Finalize::InProgress => finalize_refused(format!(
-            "a finalize of {} is already in progress",
-            request.key
-        )),
-        Finalize::Unfinished => {
-            warn!(
-                key = request.key,
-                "cache save finalized without a whole upload"
-            );
-            refuse("the upload did not finish".into())
+    let Some(upload) = upload else {
+        return refuse(format!("no upload for {}", request.key));
+    };
+    let parts = {
+        let mut upload = upload.lock();
+        if upload.failed {
+            None
+        } else {
+            upload.committed.take()
         }
-        Finalize::Completed(Ok(true)) => {
+    };
+    let Some(parts) = parts else {
+        abandon(&upload).await;
+        warn!(
+            key = request.key,
+            "cache save finalized without a whole upload"
+        );
+        return refuse("the upload did not finish".into());
+    };
+    match upload.cloud.complete(&upload.id, &parts).await {
+        Ok(true) => {
             info!(key = request.key, size = request.size_bytes, "cache saved");
             json(&twirp::FinalizeResponse {
                 ok: true,
@@ -170,13 +179,14 @@ pub(super) async fn finalize(state: &State, request: twirp::FinalizeRequest) -> 
                 message: String::new(),
             })
         }
-        Finalize::Completed(Ok(false)) => {
+        Ok(false) => {
             info!(key = request.key, "another job saved the cache entry first");
             refuse(format!("another job saved {} first", request.key))
         }
-        Finalize::Completed(Err(err)) => {
+        Err(err) => {
             warn!(key = request.key, "cache save failed: {err:#}");
-            finalize_refused(format!("{err:#}"))
+            abandon(&upload).await;
+            refuse(format!("{err:#}"))
         }
     }
 }

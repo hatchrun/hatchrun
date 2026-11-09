@@ -115,14 +115,20 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_for_somebody_else_is_not_executable_by_this_user() {
+    fn a_file_without_execute_permission_is_not_executable() {
         let dir = tempfile::tempdir().unwrap();
-        // Executable by nobody the owner is: the owner is this user.
-        make(dir.path(), 0o011);
-        assert!(!is_executable(&dir.path().join("podman")));
         make(dir.path(), 0o700);
         assert!(is_executable(&dir.path().join("podman")));
         assert!(!is_executable(dir.path()));
+        // Root may execute any file that has an execute bit somewhere,
+        // and none that has no bit at all; mode 0o000 is refused to
+        // everybody.
+        make(dir.path(), 0o000);
+        assert!(!is_executable(&dir.path().join("podman")));
+        if !nix::unistd::geteuid().is_root() {
+            make(dir.path(), 0o011);
+            assert!(!is_executable(&dir.path().join("podman")));
+        }
     }
 
     #[test]

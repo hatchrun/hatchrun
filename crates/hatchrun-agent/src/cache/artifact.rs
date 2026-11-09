@@ -28,11 +28,11 @@ use super::artifact_twirp::{
     self as twirp, CreateRequest, CreateResponse, DeleteResponse, FinalizeRequest,
     FinalizeResponse, ListRequest, ListResponse, Listed, NamedRequest, Rpc, UrlResponse,
 };
-use super::cloud::{Cloud, Part, answer};
+use super::cloud::{Cloud, JobEnded, Part, answer};
 use super::rpc::{abandon, body, malformed};
 use super::{
-    Artifacts, DOWNLOAD_PATH, Download, Finalize, Reply, State, UPLOAD_PATH, Upload, UploadState,
-    download_token, finalize_refused, finalize_upload, json, lock, refusal, twirp_error,
+    Artifacts, DOWNLOAD_PATH, Download, Reply, State, UPLOAD_PATH, Upload, UploadState,
+    download_token, json, lock, refusal, twirp_error,
 };
 
 /// The version an artifact upload has in the upload table, which cache
@@ -146,50 +146,63 @@ async fn create(state: &State, cloud: &Cloud, request: CreateRequest) -> Reply {
 
 async fn finalize(state: &State, request: FinalizeRequest) -> Reply {
     let entry = (request.name.clone(), ARTIFACT_VERSION.to_owned());
+    let upload = {
+        let mut uploads = lock(&state.uploads);
+        uploads
+            .by_entry
+            .remove(&entry)
+            .and_then(|id| uploads.by_id.remove(&id))
+    };
     let refuse = || {
         json(&FinalizeResponse {
             ok: false,
             artifact_id: "0".into(),
         })
     };
+    let Some(upload) = upload else {
+        warn!(name = request.name, "no artifact upload to finalize");
+        return refuse();
+    };
+    let parts = {
+        let mut upload = upload.lock();
+        if upload.failed {
+            None
+        } else {
+            upload.committed.take()
+        }
+    };
+    let Some(parts) = parts else {
+        abandon(&upload).await;
+        warn!(
+            name = request.name,
+            "artifact finalized without a whole upload"
+        );
+        return refuse();
+    };
     let size = u64::try_from(request.size).unwrap_or(0);
-    let done = finalize_upload(state, &entry, |upload, parts| async move {
-        upload
-            .cloud
-            .complete_artifact(&upload.id, &parts, size, request.hash.as_deref())
-            .await
-    })
-    .await;
-    match done {
-        Finalize::NoUpload => {
-            warn!(name = request.name, "no artifact upload to finalize");
-            refuse()
-        }
-        Finalize::InProgress => finalize_refused(format!(
-            "a finalize of {} is already in progress",
-            request.name
-        )),
-        Finalize::Unfinished => {
-            warn!(
-                name = request.name,
-                "artifact finalized without a whole upload"
-            );
-            refuse()
-        }
-        Finalize::Completed(Ok(Some(id))) => {
+    match upload
+        .cloud
+        .complete_artifact(&upload.id, &parts, size, request.hash.as_deref())
+        .await
+    {
+        Ok(Some(id)) => {
             info!(name = request.name, size, "artifact saved");
             json(&FinalizeResponse {
                 ok: true,
                 artifact_id: id.to_string(),
             })
         }
-        Finalize::Completed(Ok(None)) => {
+        Ok(None) => {
             info!(name = request.name, "another job saved the artifact first");
             refuse()
         }
-        Finalize::Completed(Err(err)) => {
+        Err(err) => {
             warn!(name = request.name, "artifact save failed: {err:#}");
-            finalize_refused(format!("{err:#}"))
+            abandon(&upload).await;
+            if err.downcast_ref::<JobEnded>().is_some() {
+                return refusal(&err);
+            }
+            refuse()
         }
     }
 }

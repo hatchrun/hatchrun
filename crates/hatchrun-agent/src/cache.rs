@@ -215,8 +215,6 @@ struct Upload {
 
 #[derive(Default)]
 struct UploadState {
-    /// A finalize is waiting for the control plane's answer.
-    finalizing: bool,
     blocks: Blocks,
     /// The parts of the blob, once a Put Blob or Put Block List
     /// committed it.
@@ -224,90 +222,6 @@ struct UploadState {
     /// A part failed to reach S3. A client retrying the block would not
     /// bring it back, so the upload cannot finish.
     failed: bool,
-}
-
-/// How finalizing an upload went.
-enum Finalize<T> {
-    /// The table holds no upload of that entry.
-    NoUpload,
-    /// Another finalize of it has not been answered yet.
-    InProgress,
-    /// The upload never finished whole, and was abandoned.
-    Unfinished,
-    /// `complete` answered. A failure abandoned the upload.
-    Completed(anyhow::Result<T>),
-}
-
-/// Finalizes the upload of `entry` with `complete`, for the cache and the
-/// artifacts alike. The upload stays in the table until `complete`
-/// returns, so a finalize that overlaps it gets [`Finalize::InProgress`],
-/// not "no upload". Whatever `complete` answers, the upload leaves the
-/// table, and a failure abandons it: the client is then told, for good,
-/// that the call cannot succeed (see [`finalize_refused`]).
-async fn finalize_upload<T, F, Fut>(
-    state: &State,
-    entry: &(String, String),
-    complete: F,
-) -> Finalize<T>
-where
-    F: FnOnce(Arc<Upload>, Vec<Part>) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
-{
-    let upload = {
-        let uploads = lock(&state.uploads);
-        uploads
-            .by_entry
-            .get(entry)
-            .and_then(|id| uploads.by_id.get(id))
-            .cloned()
-    };
-    let Some(upload) = upload else {
-        return Finalize::NoUpload;
-    };
-    let parts = {
-        let mut inner = upload.lock();
-        if inner.finalizing {
-            return Finalize::InProgress;
-        }
-        inner.finalizing = true;
-        if inner.failed {
-            None
-        } else {
-            inner.committed.take()
-        }
-    };
-    let result = match parts {
-        Some(parts) => Some(complete(Arc::clone(&upload), parts).await),
-        None => None,
-    };
-    {
-        let mut uploads = lock(&state.uploads);
-        if uploads.by_entry.get(entry) == Some(&upload.id) {
-            uploads.by_entry.remove(entry);
-        }
-        uploads.by_id.remove(&upload.id);
-    }
-    match result {
-        None => {
-            rpc::abandon(&upload).await;
-            Finalize::Unfinished
-        }
-        Some(Err(err)) => {
-            rpc::abandon(&upload).await;
-            Finalize::Completed(Err(err))
-        }
-        Some(done) => Finalize::Completed(done),
-    }
-}
-
-/// The answer to a finalize that cannot succeed: a failed precondition,
-/// which the clients do not retry.
-fn finalize_refused(message: impl Into<String>) -> Reply {
-    twirp_error(
-        StatusCode::PRECONDITION_FAILED,
-        "failed_precondition",
-        message,
-    )
 }
 
 /// Locks `m`, taking the data back from a poisoned lock. One panicking

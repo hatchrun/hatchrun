@@ -20,7 +20,7 @@ use super::docker::action::DockerRun;
 use super::files::StepFiles;
 use super::sink::Sink;
 use super::{Common, Job, Launch, Line, Options, Ran, base_env, interp};
-use crate::account::first_executable;
+use crate::account::{first_executable, is_executable};
 
 /// Where the runner image keeps its Node builds.
 pub(super) const EXTERNALS: &str = "/home/runner/externals";
@@ -59,7 +59,7 @@ fn locate(
     };
     for runtime in runtimes {
         let candidate = externals.join(runtime).join("bin/node");
-        if candidate.is_file() {
+        if is_executable(&candidate) {
             return Ok(candidate);
         }
     }
@@ -806,6 +806,11 @@ mod tests {
             let bin = dir.path().join(runtime).join("bin");
             std::fs::create_dir_all(&bin).unwrap();
             std::fs::write(bin.join("node"), "").unwrap();
+            std::fs::set_permissions(
+                bin.join("node"),
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
         }
         dir
     }
