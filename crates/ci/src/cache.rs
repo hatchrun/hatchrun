@@ -49,6 +49,7 @@ use crate::artifacts::{
 use crate::env::Settings;
 use crate::store::{self, CacheOwner, CacheRow, Finalized, RunRow};
 use crate::token::Claims;
+use crate::trust::Capability;
 
 /// The service's base path on the control plane.
 pub const PATH: &str = "/v1/agent/cache";
@@ -63,6 +64,10 @@ pub const EVICT_LIMIT: u32 = 20;
 /// What one repository may keep, as on GitHub: 10 GB. Past it the least
 /// recently used entries are evicted.
 pub const MAX_REPO_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// The share of a repository's cache that entries saved by fork runs
+/// may fill: a tenth. Past it the least recently used fork entries are
+/// evicted, and nothing else.
+pub const FORK_REPO_BYTES: u64 = MAX_REPO_BYTES / 10;
 /// How long a presigned URL holds, in seconds.
 const URL_SECS: u64 = 900;
 
@@ -95,6 +100,44 @@ pub(crate) fn read_scopes(
         }
     }
     scopes
+}
+
+/// The scope a fork run on pull request `number` saves to.
+fn pull_scope(number: u64) -> String {
+    format!("refs/pull/{number}/merge")
+}
+
+/// Whether a run may save into `scope`. A run that may write the base
+/// scopes (a trusted run) saves into its own ref; one that may not (a
+/// fork run) saves only into `refs/pull/<n>/merge` of its own pull
+/// request, whatever its row's ref says.
+pub(crate) fn may_save(run: &RunRow) -> bool {
+    if run.trust.allows(Capability::CacheWriteBase) {
+        return true;
+    }
+    run.pull_number
+        .is_some_and(|number| run.git_ref == pull_scope(number))
+}
+
+/// The scopes a claimed job saves to and restores from, the first the
+/// one it saves to. For a fork run the first must be its pull request's
+/// merge ref; the rest are the base and default branches it only reads.
+///
+/// # Errors
+///
+/// A fork run whose ref is not its pull request's merge ref.
+pub(crate) fn run_scopes(run: &RunRow, default_branch: &str) -> Result<Vec<String>, String> {
+    if !may_save(run) {
+        return Err(format!(
+            "a fork run is on {}, not its pull request's merge ref",
+            run.git_ref
+        ));
+    }
+    Ok(read_scopes(
+        &run.git_ref,
+        run.base_ref.as_deref(),
+        Some(default_branch),
+    ))
 }
 
 /// Everything a call works with once the token checks out.
@@ -201,6 +244,10 @@ fn check_entry(version: &str, key: &str) -> std::result::Result<(), Refusal> {
     check_key(key).map_err(|err| Refusal::new(400, err))
 }
 
+/// What a fork run is told when it saves outside its pull request.
+const FORK_SCOPE: &str = "a fork run saves only into its pull request's scope";
+/// What a fork run is told when the fork share of the cache is full.
+const FORK_FULL: &str = "the cache share for fork pull requests is full";
 /// What a job with no scopes is told: it has no cache.
 const NO_SCOPES: &str = "the job has no cache scopes";
 
@@ -260,6 +307,17 @@ async fn start(ctx: &Context<'_>, request: UploadRequest) -> Answer {
     if ctx.scopes.is_empty() {
         // Final, so that the clients do not retry.
         return Err(Refusal::new(403, NO_SCOPES));
+    }
+    // The run's own row decides where it saves, from the control plane's
+    // side: a fork run is refused every scope but its pull request's.
+    if !may_save(&ctx.run) {
+        return Err(Refusal::new(403, FORK_SCOPE));
+    }
+    if !ctx.run.trust.allows(Capability::CacheWriteBase)
+        && store::fork_cache_bytes(&ctx.db, &ctx.run.tenant_id, ctx.run.repo_id).await?
+            > FORK_REPO_BYTES
+    {
+        return Err(Refusal::new(403, FORK_FULL));
     }
     // Saves the upload when the entry exists; finalizing still settles
     // a race between two jobs.
@@ -425,14 +483,27 @@ async fn enforce_quota(
     ctx: &Context<'_>,
     credentials: &Credentials,
 ) -> std::result::Result<(), String> {
-    let rows = store::evict_over_quota_cache_entries(
-        &ctx.db,
-        &ctx.run.tenant_id,
-        ctx.run.repo_id,
-        MAX_REPO_BYTES,
-        EVICT_LIMIT,
-    )
-    .await
+    // A fork run's save trims the fork entries to the fork share and
+    // never evicts an entry of the base or default branch.
+    let rows = if ctx.run.trust.allows(Capability::CacheWriteBase) {
+        store::evict_over_quota_cache_entries(
+            &ctx.db,
+            &ctx.run.tenant_id,
+            ctx.run.repo_id,
+            MAX_REPO_BYTES,
+            EVICT_LIMIT,
+        )
+        .await
+    } else {
+        store::evict_over_fork_quota_cache_entries(
+            &ctx.db,
+            &ctx.run.tenant_id,
+            ctx.run.repo_id,
+            FORK_REPO_BYTES,
+            EVICT_LIMIT,
+        )
+        .await
+    }
     .map_err(|err| err.to_string())?;
     delete_objects(ctx.settings, credentials, &rows).await;
     Ok(())
@@ -542,6 +613,67 @@ pub async fn evict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trust::Trust;
+
+    fn run(trust: Trust, git_ref: &str, pull_number: Option<u64>) -> RunRow {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "run_number": 1, "run_attempt": 1, "tenant_id": "t1",
+            "repo_id": 7, "workflow": "ci", "delivery": "d", "event": "pull_request",
+            "git_ref": git_ref, "sha": "abc", "actor": "a", "base_ref": "release",
+            "status": "queued", "conclusion": null, "created_at": 0, "completed_at": null,
+            "retention_days": 30, "pull_number": pull_number,
+            "trust": trust.as_str(), "author_login": "a", "author_association": "",
+            "gate_status": "none"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_fork_run_saves_only_into_its_pull_requests_merge_ref() {
+        let fork = |git_ref: &str, number| run(Trust::Fork, git_ref, number);
+        assert!(may_save(&fork("refs/pull/4/merge", Some(4))));
+        for (git_ref, number) in [
+            ("refs/heads/main", Some(4)),
+            ("refs/heads/main", None),
+            ("refs/pull/5/merge", Some(4)),
+            ("refs/pull/4/merge", None),
+            ("refs/pull/4/target", Some(4)),
+            ("refs/tags/v1", None),
+        ] {
+            assert!(!may_save(&fork(git_ref, number)), "{git_ref} {number:?}");
+        }
+    }
+
+    #[test]
+    fn a_trusted_run_saves_into_its_own_ref() {
+        assert!(may_save(&run(Trust::Trusted, "refs/heads/main", None)));
+        assert!(may_save(&run(Trust::Trusted, "refs/pull/4/merge", Some(4))));
+    }
+
+    #[test]
+    fn the_scopes_of_a_fork_run_write_its_merge_ref_and_only_read_the_base() {
+        let scopes = run_scopes(&run(Trust::Fork, "refs/pull/4/merge", Some(4)), "main").unwrap();
+        assert_eq!(
+            scopes,
+            ["refs/pull/4/merge", "refs/heads/release", "refs/heads/main"]
+        );
+        assert!(run_scopes(&run(Trust::Fork, "refs/heads/main", None), "main").is_err());
+    }
+
+    #[test]
+    fn the_runtime_token_of_a_fork_run_writes_one_scope_only() {
+        // The agent builds the token's `ac` claim from the scopes the
+        // control plane gives it: the first is writable, the rest read.
+        let scopes = run_scopes(&run(Trust::Fork, "refs/pull/4/merge", Some(4)), "main").unwrap();
+        let writable: Vec<&String> = scopes.iter().take(1).collect();
+        assert_eq!(writable, ["refs/pull/4/merge"]);
+        assert!(scopes.iter().skip(1).all(|s| s.starts_with("refs/heads/")));
+    }
+
+    #[test]
+    fn the_fork_share_is_a_tenth_of_the_repository_cache() {
+        assert_eq!(FORK_REPO_BYTES, MAX_REPO_BYTES / 10);
+    }
 
     #[test]
     fn keys_name_the_tenant_and_repository() {

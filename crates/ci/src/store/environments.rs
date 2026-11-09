@@ -11,6 +11,7 @@ use worker::Result;
 
 use super::NewAudit;
 use super::jobs::LOCK_TENANT;
+use crate::trust::Trust;
 
 /// Reads a JSON array of strings that the row carries as text.
 fn json_strings<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
@@ -240,6 +241,8 @@ pub struct JobEnvironment {
     pub event: String,
     /// The run's ref.
     pub git_ref: String,
+    /// Whose code the run executes.
+    pub trust: Trust,
     /// The environment the job names, `None` when the repository has
     /// none of that name.
     pub environment: Option<EnvironmentRow>,
@@ -254,6 +257,7 @@ struct JobEnvironmentRow {
     full_name: String,
     event: String,
     git_ref: String,
+    trust: Trust,
     environment_id: Option<u64>,
     environment_name: Option<String>,
     branches: Option<String>,
@@ -271,7 +275,7 @@ pub async fn job_environment(db: &Db, job_id: u64) -> Result<Option<JobEnvironme
     let row: Option<JobEnvironmentRow> = db
         .first(
             "SELECT ci_runs.id AS run_id, ci_runs.repo_id, ci_repos.full_name, ci_runs.event, \
-               ci_runs.ref AS git_ref, e.id AS environment_id, e.name AS environment_name, \
+               ci_runs.ref AS git_ref, ci_runs.trust, e.id AS environment_id, e.name AS environment_name, \
                e.branches::text AS branches, e.approval, e.updated_at AS environment_updated_at \
              FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
                JOIN ci_repos ON ci_repos.id = ci_runs.repo_id \
@@ -310,6 +314,7 @@ pub async fn job_environment(db: &Db, job_id: u64) -> Result<Option<JobEnvironme
         full_name: row.full_name,
         event: row.event,
         git_ref: row.git_ref,
+        trust: row.trust,
         environment,
     }))
 }

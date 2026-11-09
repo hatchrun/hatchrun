@@ -36,6 +36,7 @@ use crate::env::Settings;
 use crate::github::CONFIG_PATH;
 use crate::store::{self, JobRow, RepoRow, RunRow};
 use crate::token::{self, TokenError};
+use crate::trust::{Capability, Trust};
 
 /// The issuer URL, as a cloud account's trust names it.
 pub const ISSUER: &str = "https://token.ci.hatchrun.io";
@@ -225,6 +226,14 @@ pub enum Answer {
     Forbidden,
 }
 
+/// Why a run of `trust` gets no identity token, `None` when it may have
+/// one. The request document is never built for a fork run, and this
+/// refuses the endpoint too: any holder of a request token can reach it.
+#[must_use]
+pub fn trust_refusal(trust: Trust) -> Option<&'static str> {
+    (!trust.allows(Capability::IdToken)).then_some("id tokens are not available to runs from forks")
+}
+
 /// Decides what the request token's `claims` get from `row`.
 #[must_use]
 pub fn answer(row: &JobRow, claims: &token::Claims) -> Answer {
@@ -350,6 +359,9 @@ pub async fn handle(req: Request, env: &Env) -> Result<Response> {
     };
     if !crate::agent::consistent(&job, &run, &repo) {
         return error("unauthorized", 401);
+    }
+    if let Some(message) = trust_refusal(run.trust) {
+        return error(message, 403);
     }
     let audience = requested.unwrap_or_else(|| default_audience(&repo));
     let jti = match webcrypto::random_bytes(16) {
@@ -556,6 +568,15 @@ mod tests {
         assert_eq!(
             request_url("https://ci.hatchrun.io"),
             "https://ci.hatchrun.io/v1/oidc/token?api-version=2.0"
+        );
+    }
+
+    #[test]
+    fn a_fork_run_is_refused_the_token_endpoint_whatever_the_grant() {
+        assert_eq!(trust_refusal(Trust::Trusted), None);
+        assert_eq!(
+            trust_refusal(Trust::Fork),
+            Some("id tokens are not available to runs from forks")
         );
     }
 
