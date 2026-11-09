@@ -36,7 +36,7 @@ use self::args::{Create, Health};
 use super::node::EXTERNALS;
 use super::sink::Sink;
 use super::{Job, Launch, Line, Ran, interp, random_name};
-use crate::account::DEFAULT_PATH;
+use crate::account::{DEFAULT_PATH, first_executable};
 use crate::envfile;
 use hatchrun_workflow::Conclusion;
 
@@ -46,7 +46,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_mins(30);
 /// each time, so the last starts after about a minute.
 const HEALTH_TRIES: u32 = 6;
 /// What a start that was stopped reports, as a step does.
-const CANCELED: &str = "The operation was canceled.";
+pub(super) const CANCELED: &str = "The operation was canceled.";
 /// The most lines of a container's log printed when it fails.
 const LOG_TAIL: &str = "40";
 
@@ -138,22 +138,28 @@ struct Service {
 impl Job<'_> {
     /// The Docker command, from `--docker` or the first `docker` on the
     /// agent's `PATH` or the default one.
-    fn docker_bin(&mut self) -> Result<PathBuf, String> {
+    pub(super) fn docker_bin(&mut self) -> Result<PathBuf, String> {
         if let Some(bin) = &self.docker.bin {
             return Ok(bin.clone());
         }
-        let bin = if let Some(bin) = &self.opts.docker {
-            bin.clone()
-        } else {
-            let path = std::env::var_os("PATH").unwrap_or_default();
-            let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-            dirs.extend(std::env::split_paths(DEFAULT_PATH));
-            dirs.into_iter()
-                .map(|dir| dir.join("docker"))
-                .find(|candidate| candidate.is_file())
-                .ok_or_else(|| {
-                    "Docker is not installed: this job needs a `docker` command".to_owned()
+        // A path is used as it is; a bare name, `docker` or `podman`, is
+        // looked up on the `PATH`.
+        let bin = match &self.opts.docker {
+            Some(bin) if bin.components().count() > 1 || bin.is_absolute() => bin.clone(),
+            configured => {
+                let name = configured
+                    .as_deref()
+                    .map_or_else(|| Path::new("docker"), |bin| bin);
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+                dirs.extend(std::env::split_paths(DEFAULT_PATH));
+                first_executable(name, &dirs).ok_or_else(|| {
+                    format!(
+                        "`{}` is not installed: this job needs it as its Docker command",
+                        name.display()
+                    )
                 })?
+            }
         };
         self.docker.bin = Some(bin.clone());
         Ok(bin)
@@ -885,6 +891,12 @@ impl Job<'_> {
                 continue;
             }
             if self.docker.host_env.get(key) == Some(value) && !explicit.contains(key) {
+                continue;
+            }
+            // A container cannot reach a proxy on the loopback: without
+            // the variables its tools see no cache, not a dead one.
+            if self.cache_unreachable && self.cache_env.contains_key(key) && !explicit.contains(key)
+            {
                 continue;
             }
             inner.insert(key.clone(), args::translate(value, maps));

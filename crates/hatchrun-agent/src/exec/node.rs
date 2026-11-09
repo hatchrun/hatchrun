@@ -20,6 +20,7 @@ use super::docker::action::DockerRun;
 use super::files::StepFiles;
 use super::sink::Sink;
 use super::{Common, Job, Launch, Line, Options, Ran, base_env, interp};
+use crate::account::{first_executable, is_executable};
 
 /// Where the runner image keeps its Node builds.
 pub(super) const EXTERNALS: &str = "/home/runner/externals";
@@ -58,17 +59,15 @@ fn locate(
     };
     for runtime in runtimes {
         let candidate = externals.join(runtime).join("bin/node");
-        if candidate.is_file() {
+        if is_executable(&candidate) {
             return Ok(candidate);
         }
     }
     // The step's own PATH may not hold node, so resolve it here.
     if let Some(path) = path {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("node");
-            if dir.is_absolute() && candidate.is_file() {
-                return Ok(candidate);
-            }
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        if let Some(node) = first_executable(Path::new("node"), &dirs) {
+            return Ok(node);
         }
     }
     bail!("no Node binary found for `{version}`: pass --node or install one in {EXTERNALS}")
@@ -807,6 +806,11 @@ mod tests {
             let bin = dir.path().join(runtime).join("bin");
             std::fs::create_dir_all(&bin).unwrap();
             std::fs::write(bin.join("node"), "").unwrap();
+            std::fs::set_permissions(
+                bin.join("node"),
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
         }
         dir
     }
@@ -843,7 +847,10 @@ mod tests {
 
         let empty = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
-        std::fs::write(bin.path().join("node"), "").unwrap();
+        let node = bin.path().join("node");
+        std::fs::write(&node, "").unwrap();
+        std::fs::set_permissions(&node, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         let path = std::env::join_paths([bin.path()]).unwrap();
         let node = locate(None, empty.path(), Some(path), "node20").unwrap();
         assert_eq!(node, bin.path().join("node"));

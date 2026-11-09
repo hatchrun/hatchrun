@@ -199,6 +199,7 @@ pub async fn run_job(
         stage_fd: std::sync::Arc::new(stage_fd),
         cache_saves: Vec::new(),
         cache_env: BTreeMap::new(),
+        cache_unreachable: false,
         background: Background::default(),
         docker: docker::DockerState::new(format!("hatchrun-{}", random_name().unwrap_or_default())),
         environment_url: None,
@@ -239,13 +240,7 @@ async fn finish(
     let proxy = job.start_cache(sink).await;
     if job.start_containers(sink).await.is_err() {
         // The steps never run, as on GitHub when a container does not start.
-        let summaries = doc
-            .job
-            .steps
-            .iter()
-            .enumerate()
-            .map(|(index, step)| job.skip(index, step, sink))
-            .collect();
+        let summaries = skip_steps(job, sink);
         job.stop_containers(sink).await;
         if let Some(proxy) = proxy {
             proxy.stop().await;
@@ -279,6 +274,17 @@ async fn finish(
 
     let conclusion = conclusion_of(job.status, timed_out, external);
     job.result(conclusion, outputs, summaries)
+}
+
+/// Skips every step of the job: none of them runs.
+fn skip_steps(job: &mut Job<'_>, sink: &mut dyn Sink) -> Vec<StepSummary> {
+    let doc = job.doc;
+    doc.job
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| job.skip(index, step, sink))
+        .collect()
 }
 
 /// How the job ended, from its status. A job that ran out of time is
@@ -448,6 +454,9 @@ struct Job<'a> {
     cache_saves: Vec<builtin::CacheSave>,
     /// The cache proxy's variables, when it runs. Every step gets them.
     cache_env: BTreeMap<String, String>,
+    /// The proxy listens on the loopback only, which no container
+    /// reaches: container steps get none of `cache_env`.
+    cache_unreachable: bool,
     /// Process groups that steps left running. They end with the job.
     background: Background,
     /// The containers the job started.

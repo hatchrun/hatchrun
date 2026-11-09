@@ -36,11 +36,11 @@ use crate::launches::{self, LaunchMessage};
 use crate::store;
 
 use super::decide::{
-    Delivery, Failed, Flushed, Gate, again_work, apply_batch, apply_held, apply_result, arm_chains,
-    arm_todo, attempts, bounded_event, delivery, due, file_annotations, gate, github_context,
-    gives_up, job_document, left_out_work, minimal_check, next_alarm, plan_is_current,
-    record_flush, reschedule, reset_jobs, run_state, running_for, should_write_heartbeat,
-    snapshot_ready, steps_json, take_drain,
+    Delivery, Failed, Flushed, Gate, JobToken, again_work, apply_batch, apply_held, apply_result,
+    arm_chains, arm_todo, attempts, bounded_event, delivery, due, file_annotations, gate,
+    github_context, gives_up, job_document, left_out_work, minimal_check, next_alarm,
+    plan_is_current, record_flush, reschedule, reset_jobs, run_state, running_for,
+    should_write_heartbeat, snapshot_ready, steps_json, take_drain,
 };
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
@@ -107,6 +107,8 @@ pub(super) fn answer(status: u16) -> Result<Response> {
 #[derive(Deserialize)]
 struct ClaimBody {
     token: String,
+    /// How many seconds the job token the claim carries has left.
+    token_expires_in: u64,
     capped: Vec<Capped>,
 }
 
@@ -438,7 +440,10 @@ impl<'a> Cx<'a> {
                 };
                 match path {
                     "/claim" => match req.json::<ClaimBody>().await {
-                        Ok(body) => self.claim(job, attempt, body.token, body.capped).await,
+                        Ok(body) => {
+                            self.claim(job, attempt, body.token, body.token_expires_in, body.capped)
+                                .await
+                        }
                         Err(_) => Response::error("bad claim", 400),
                     },
                     "/events" => match req.json::<Batch>().await {
@@ -1338,6 +1343,7 @@ impl<'a> Cx<'a> {
         job: u64,
         attempt: u32,
         token: String,
+        token_expires_in: u64,
         capped: Vec<Capped>,
     ) -> Result<Response> {
         // The inputs a job of a called workflow reads are made before the
@@ -1419,7 +1425,10 @@ impl<'a> Cx<'a> {
                 &self.event().await?,
                 &run.graph,
                 job,
-                &token,
+                JobToken {
+                    github: &token,
+                    expires_in: token_expires_in,
+                },
                 &self.settings.github_api,
                 inputs,
             )

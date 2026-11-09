@@ -134,6 +134,16 @@ pub(crate) fn github_context(info: &RunInfo, event: &Value, api: &str) -> Value 
     context
 }
 
+/// The job token a claim carries.
+#[derive(Clone, Copy)]
+pub(crate) struct JobToken<'a> {
+    /// The installation token the steps get as `GITHUB_TOKEN`.
+    pub github: &'a str,
+    /// How many seconds the job token the agent authorizes with has
+    /// left.
+    pub expires_in: u64,
+}
+
 /// The document an agent gets when it claims `job`, `None` when the
 /// graph has no such job.
 pub(crate) fn job_document(
@@ -141,7 +151,7 @@ pub(crate) fn job_document(
     event: &Value,
     graph: &Graph,
     job: u64,
-    token: &str,
+    token: JobToken<'_>,
     api: &str,
     inputs: Option<Value>,
 ) -> Option<JobDocument> {
@@ -154,7 +164,7 @@ pub(crate) fn job_document(
         job: node.job.clone(),
         event_name: info.event_name.clone(),
         event: event.clone(),
-        github: github_struct(info, api, token),
+        github: github_struct(info, api, token.github),
         needs: graph.needs(job),
         secrets: std::collections::BTreeMap::new(),
         vars: std::collections::BTreeMap::new(),
@@ -165,6 +175,7 @@ pub(crate) fn job_document(
         cache: None,
         id_token: None,
         artifacts: None,
+        token_expires_in: token.expires_in,
         inputs,
     })
 }
@@ -818,11 +829,19 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         assert_eq!(github.graphql_url, format!("{API}/graphql"));
     }
 
+    fn tok() -> JobToken<'static> {
+        JobToken {
+            github: "tok",
+            expires_in: 1_800,
+        }
+    }
+
     #[test]
     fn job_document_for_a_claim() {
         let graph = graph();
         let event = json!({ "after": "abc" });
-        let doc = job_document(&info(), &event, &graph, 1, "tok", API, None).unwrap();
+        let doc = job_document(&info(), &event, &graph, 1, tok(), API, None).unwrap();
+        assert_eq!(doc.token_expires_in, 1_800);
         assert_eq!(doc.run_id, "7");
         assert_eq!(doc.run_attempt, 1);
         assert_eq!(doc.github.token, "tok");
@@ -831,7 +850,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
         assert_eq!(doc.needs, graph.needs(1));
         assert!(doc.secrets.is_empty() && doc.vars.is_empty() && doc.timings.is_empty());
         assert!(doc.cache.is_none());
-        assert!(job_document(&info(), &event, &graph, 404, "tok", API, None).is_none());
+        assert!(job_document(&info(), &event, &graph, 404, tok(), API, None).is_none());
     }
 
     #[test]

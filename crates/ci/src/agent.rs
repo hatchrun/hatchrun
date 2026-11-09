@@ -386,20 +386,69 @@ async fn claim(
             c.got
         );
     }
-    let body = json!({ "token": github_token, "capped": capped })
-        .to_string()
-        .into_bytes();
+    // The cache scopes are fixed before the run object claims the job, so
+    // a failure here leaves nothing claimed. The token the agent builds
+    // from them and the cache service must agree for the whole attempt,
+    // whatever happens to the default branch meanwhile: the first claim
+    // of the attempt fixes them and a claim that overlaps it, or repeats
+    // it, gets the same list. A job without a cache service has none.
+    let scopes = if artifacts_bucket_ready(settings, job_token) {
+        let wanted = crate::cache::read_scopes(
+            &run.git_ref,
+            run.base_ref.as_deref(),
+            Some(&repo.default_branch),
+        );
+        match store::set_cache_scopes(db, row.id, row.attempt, &wanted).await {
+            Ok(Some(scopes)) => scopes,
+            Ok(None) => return status(409),
+            Err(err) => {
+                console_error!("job {}: record cache scopes: {err}", row.id);
+                return retry();
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let body = claim_body(&github_token, &capped, claims, now_ms() / 1000);
     let mut response = to_run(env, run.id, "claim", row.id, row.attempt, body).await?;
     if response.status_code() != 200 {
         return Ok(response);
     }
     let mut document = response.json::<JobDocument>().await?;
     fill(&mut document, &secrets, vars);
-    document.id_token =
-        id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
-    document.artifacts = artifact_service(settings, job_token);
-    document.cache = cache_service(settings, job_token);
+    document.id_token = id_token_request(&settings.ci_url, &settings.token_key, row, claims.exp);
+    offer_services(&mut document, settings, job_token, scopes);
     Response::from_json(&document)
+}
+
+/// What the claim sends the run object: the installation token, the
+/// permissions it was capped to, and how long the job token the claim
+/// carries has left by this clock, which the agent's runtime token lives
+/// for on its own.
+fn claim_body(
+    github_token: &str,
+    capped: &[github::Capped],
+    claims: &Claims,
+    now_secs: u64,
+) -> Vec<u8> {
+    json!({
+        "token": github_token,
+        "token_expires_in": claims.exp.saturating_sub(now_secs),
+        "capped": capped,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Gives the document the services the job gets.
+fn offer_services(
+    document: &mut JobDocument,
+    settings: &Settings,
+    job_token: &str,
+    scopes: Vec<String>,
+) {
+    document.artifacts = artifact_service(settings, job_token);
+    document.cache = cache_service(settings, job_token, scopes);
 }
 
 /// Puts the job's secrets and vars in the document the run object
@@ -425,13 +474,13 @@ pub(crate) fn fill(
 }
 
 /// The OIDC request for the job, when its permissions grant one: the
-/// token endpoint and a request token for this attempt that lives as
-/// long as a job token does.
+/// token endpoint and a request token for this attempt that expires when
+/// the job token the claim carries does, at `exp`.
 pub(crate) fn id_token_request(
     ci_url: &str,
     key: &[u8],
     row: &JobRow,
-    now_secs: u64,
+    exp: u64,
 ) -> Option<IdTokenRequest> {
     if !oidc::granted(&row.token_permissions) {
         return None;
@@ -440,7 +489,7 @@ pub(crate) fn id_token_request(
         job: row.id,
         run: row.run_id,
         attempt: i32::try_from(row.attempt).ok()?,
-        exp: now_secs + token::lifetime_secs(row.timeout_minutes),
+        exp,
     };
     Some(IdTokenRequest {
         url: oidc::request_url(ci_url),
@@ -451,7 +500,7 @@ pub(crate) fn id_token_request(
 /// The artifact service a job gets: this Worker, with the job's own
 /// token. `None` while the artifacts bucket is not set up.
 pub(crate) fn artifact_service(settings: &Settings, job_token: &str) -> Option<ArtifactService> {
-    if settings.artifacts_bucket.is_empty() || job_token.is_empty() {
+    if !artifacts_bucket_ready(settings, job_token) {
         return None;
     }
     Some(ArtifactService {
@@ -460,16 +509,27 @@ pub(crate) fn artifact_service(settings: &Settings, job_token: &str) -> Option<A
     })
 }
 
+/// Whether a job gets the artifact and cache services: the artifacts
+/// bucket is set up and the job has a token.
+fn artifacts_bucket_ready(settings: &Settings, job_token: &str) -> bool {
+    !settings.artifacts_bucket.is_empty() && !job_token.is_empty()
+}
+
 /// The cache service a job gets: this Worker, with the job's own token.
 /// `None` while the artifacts bucket, which holds the entries, is not
 /// set up.
-pub(crate) fn cache_service(settings: &Settings, job_token: &str) -> Option<CacheService> {
-    if settings.artifacts_bucket.is_empty() || job_token.is_empty() {
+pub(crate) fn cache_service(
+    settings: &Settings,
+    job_token: &str,
+    scopes: Vec<String>,
+) -> Option<CacheService> {
+    if !artifacts_bucket_ready(settings, job_token) {
         return None;
     }
     Some(CacheService {
         url: format!("{}{CACHE_PATH}", settings.ci_url),
         token: job_token.to_owned(),
+        scopes,
     })
 }
 
@@ -763,6 +823,39 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_sends_what_is_left_of_the_job_token_to_the_run_object() {
+        let claims = Claims {
+            job: 5,
+            run: 9,
+            attempt: 2,
+            exp: 100 + token::lifetime_secs(10),
+        };
+        let now = 100;
+        let body: serde_json::Value =
+            serde_json::from_slice(&claim_body("gh", &[], &claims, now)).unwrap();
+        assert_eq!(body["token"], "gh");
+        assert_eq!(body["token_expires_in"], token::lifetime_secs(10));
+        // A token that is past its expiry has nothing left.
+        let late: serde_json::Value =
+            serde_json::from_slice(&claim_body("gh", &[], &claims, claims.exp + 5)).unwrap();
+        assert_eq!(late["token_expires_in"], 0);
+        assert_eq!(body["capped"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_claim_offers_the_services_the_bucket_allows() {
+        let mut doc = document();
+        let scopes = vec!["refs/heads/main".to_owned()];
+        offer_services(&mut doc, &settings("bucket"), "v1.a.b", scopes.clone());
+        assert_eq!(doc.cache.unwrap().scopes, scopes);
+        assert!(doc.artifacts.is_some());
+        // Without the artifacts bucket there are no services.
+        let mut bare = document();
+        offer_services(&mut bare, &settings(""), "v1.a.b", Vec::new());
+        assert!(bare.cache.is_none() && bare.artifacts.is_none());
+    }
+
+    #[test]
     fn the_artifact_service_is_this_worker_with_the_job_token() {
         let service = artifact_service(&settings("bucket"), "v1.a.b").unwrap();
         assert_eq!(service.url, "https://ci.example/v1/agent/artifacts");
@@ -773,11 +866,13 @@ mod tests {
 
     #[test]
     fn the_cache_service_is_this_worker_with_the_job_token() {
-        let service = cache_service(&settings("bucket"), "v1.a.b").unwrap();
+        let scopes = vec!["refs/heads/topic".to_owned(), "refs/heads/main".to_owned()];
+        let service = cache_service(&settings("bucket"), "v1.a.b", scopes.clone()).unwrap();
         assert_eq!(service.url, "https://ci.example/v1/agent/cache");
         assert_eq!(service.token, "v1.a.b");
-        assert!(cache_service(&settings(""), "v1.a.b").is_none());
-        assert!(cache_service(&settings("bucket"), "").is_none());
+        assert_eq!(service.scopes, scopes);
+        assert!(cache_service(&settings(""), "v1.a.b", Vec::new()).is_none());
+        assert!(cache_service(&settings("bucket"), "", Vec::new()).is_none());
     }
     use super::*;
 
@@ -819,6 +914,7 @@ mod tests {
             approval_by: None,
             approval_at: None,
             needs: serde_json::json!([]),
+            cache_scopes: None,
         }
     }
 
@@ -857,18 +953,18 @@ mod tests {
     fn only_a_job_with_the_grant_gets_an_id_token_request() {
         let mut granted = row("launched");
         granted.token_permissions = serde_json::json!({ "id_token": "write", "metadata": "read" });
-        let got = id_token_request("https://ci.example", &*KEY, &granted, 100).unwrap();
+        let got = id_token_request("https://ci.example", &*KEY, &granted, 500).unwrap();
         assert_eq!(got.url, "https://ci.example/v1/oidc/token?api-version=2.0");
         // The request token is for this attempt, not a job token.
         let claims = token::verify_oidc(&*KEY, &got.token, 101).unwrap();
         assert_eq!((claims.job, claims.run, claims.attempt), (7, 1, 2));
-        assert_eq!(claims.exp, 100 + token::lifetime_secs(10));
+        assert_eq!(claims.exp, 500);
         assert_eq!(
             token::verify(&*KEY, &got.token, 101),
             Err(TokenError::Malformed)
         );
         assert_eq!(
-            id_token_request("https://ci.example", &*KEY, &row("launched"), 100),
+            id_token_request("https://ci.example", &*KEY, &row("launched"), 500),
             None
         );
     }
@@ -1074,6 +1170,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
+            token_expires_in: 3600,
             inputs: None,
         }
     }

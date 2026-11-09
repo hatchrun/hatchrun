@@ -99,7 +99,7 @@ enum Command {
         #[arg(long, default_value = "60s", value_parser = humantime::parse_duration, hide = true)]
         minute: Duration,
         /// The `docker` command. Tests point it at a stand-in.
-        #[arg(long, hide = true)]
+        #[arg(long, hide = true, value_parser = non_empty_path)]
         docker: Option<PathBuf>,
     },
     /// Run one job for the control plane.
@@ -154,6 +154,17 @@ enum Command {
 enum SplitBy {
     /// By the timings recorded for earlier runs.
     Timings,
+}
+
+/// A command or path that is not empty: `--docker ""` is a mistake to
+/// refuse at startup, not a Docker to look for on every job.
+fn non_empty_path(value: &str) -> Result<PathBuf, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err("the value is empty".to_owned())
+    } else {
+        Ok(PathBuf::from(value))
+    }
 }
 
 // A second thread keeps the SIGTERM listener and the job timer running
@@ -422,6 +433,17 @@ async fn detect(imds_endpoint: &str, mark: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_docker_command_is_refused_at_startup() {
+        assert!(non_empty_path("").is_err());
+        assert!(non_empty_path("  ").is_err());
+        assert_eq!(non_empty_path("podman"), Ok(PathBuf::from("podman")));
+        assert_eq!(non_empty_path(" podman "), Ok(PathBuf::from("podman")));
+        assert!(
+            Args::try_parse_from(["hatchrun-agent", "exec", "job.json", "--docker", ""]).is_err()
+        );
+    }
 
     /// The no-subcommand boot path and `hatchrun-agent ci` use the same
     /// defaults.

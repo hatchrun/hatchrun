@@ -18,7 +18,7 @@ pub trait Broker {
 }
 
 /// The job cache API of a CI job.
-#[derive(PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct Cache {
     /// `/v1/cache` on hatchrun-cloud.
     pub url: String,

@@ -273,6 +273,7 @@ mod tests {
             cache: None,
             id_token: None,
             artifacts: None,
+            token_expires_in: 3600,
             inputs: None,
         };
         serde_json::to_value(doc).unwrap()

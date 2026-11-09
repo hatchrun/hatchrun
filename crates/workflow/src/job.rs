@@ -49,6 +49,13 @@ pub struct JobDocument {
     /// The artifact service, when the control plane has one. The agent
     /// serves `actions/upload-artifact` and `download-artifact` from it.
     pub artifacts: Option<ArtifactService>,
+    /// How many seconds the job token has left at the claim, by the
+    /// Worker's clock: the `exp` of the token the claim carries less the
+    /// Worker's now. The runtime token the agent makes for the cache and
+    /// artifact toolkits lives that long from the agent's own clock, so
+    /// the two clocks never meet. The job token itself is checked by the
+    /// control plane.
+    pub token_expires_in: u64,
     /// The `inputs` context of a job of a called workflow: what the
     /// calls passed. `None` for a job of the workflow that was started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,6 +82,7 @@ impl fmt::Debug for JobDocument {
             .field("cache", &self.cache)
             .field("id_token", &self.id_token)
             .field("artifacts", &self.artifacts)
+            .field("token_expires_in", &self.token_expires_in)
             .field("inputs", &self.inputs)
             .finish()
     }
@@ -151,6 +159,10 @@ pub struct CacheService {
     pub url: String,
     /// The bearer token.
     pub token: String,
+    /// The refs a job restores from, in order. The first is the ref the
+    /// job saves to. The agent names them in its runtime token, which
+    /// `BuildKit` reads to build its index keys.
+    pub scopes: Vec<String>,
 }
 
 impl fmt::Debug for CacheService {
@@ -158,6 +170,7 @@ impl fmt::Debug for CacheService {
         f.debug_struct("CacheService")
             .field("url", &self.url)
             .field("token", &"[redacted]")
+            .field("scopes", &self.scopes)
             .finish()
     }
 }

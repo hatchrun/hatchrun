@@ -11,8 +11,11 @@
 //! the proto names, which both clients read: `BuildKit` decodes
 //! `entry_id` into a string, so it goes out as one.
 
+use hyper::StatusCode;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
+
+use super::cloud::{JobEnded, Refused};
 
 /// The path prefix of the service's RPCs.
 pub const PREFIX: &str = "/twirp/github.actions.results.api.v1.CacheService/";
@@ -118,6 +121,60 @@ impl LookupResponse {
             signed_download_url: String::new(),
             matched_key: String::new(),
         }
+    }
+}
+
+/// The HTTP status Twirp gives an error code.
+#[must_use]
+pub fn http_status(code: &str) -> StatusCode {
+    match code {
+        "canceled" | "deadline_exceeded" => StatusCode::REQUEST_TIMEOUT,
+        "invalid_argument" | "malformed" | "out_of_range" => StatusCode::BAD_REQUEST,
+        "unauthenticated" => StatusCode::UNAUTHORIZED,
+        "permission_denied" => StatusCode::FORBIDDEN,
+        "not_found" | "bad_route" => StatusCode::NOT_FOUND,
+        "already_exists" | "aborted" => StatusCode::CONFLICT,
+        "failed_precondition" => StatusCode::PRECONDITION_FAILED,
+        "resource_exhausted" => StatusCode::TOO_MANY_REQUESTS,
+        "unimplemented" => StatusCode::NOT_IMPLEMENTED,
+        "unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The Twirp code for what a call to the control plane came to, and the
+/// `Retry-After` to pass on. Only a final refusal gets a code the
+/// clients do not retry: a 408 and a 429 are retried, as are 5xx and
+/// anything that is not an answer of the control plane.
+#[must_use]
+pub fn code_for(err: &anyhow::Error) -> (&'static str, Option<String>) {
+    if err.downcast_ref::<JobEnded>().is_some() {
+        return ("failed_precondition", None);
+    }
+    // An answer of the control plane that arrived whole and is not what it
+    // promised (JSON that does not parse or fit) is a fault there, and
+    // asking again would get the same: not `unavailable`. A body that
+    // could not be read to its end, or a timeout, has no `serde_json`
+    // error in it and stays retryable.
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+    {
+        return ("failed_precondition", None);
+    }
+    let Some(refused) = err.downcast_ref::<Refused>() else {
+        return ("unavailable", None);
+    };
+    match refused.status.as_u16() {
+        401 => ("unauthenticated", None),
+        403 => ("permission_denied", None),
+        404 => ("not_found", None),
+        400 | 422 => ("invalid_argument", None),
+        409 => ("already_exists", None),
+        410 => ("failed_precondition", None),
+        429 => ("resource_exhausted", refused.retry_after.clone()),
+        400..=499 if refused.status != StatusCode::REQUEST_TIMEOUT => ("failed_precondition", None),
+        _ => ("unavailable", None),
     }
 }
 
@@ -260,6 +317,59 @@ mod tests {
         assert_eq!(
             response,
             serde_json::json!({ "ok": false, "signed_download_url": "", "matched_key": "" })
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    fn refused(status: u16, retry_after: Option<&str>) -> anyhow::Error {
+        Refused::new(StatusCode::from_u16(status).unwrap(), retry_after).into()
+    }
+
+    #[test]
+    fn a_final_refusal_is_a_code_the_clients_do_not_retry() {
+        for (upstream, code, status) in [
+            (401, "unauthenticated", 401),
+            (403, "permission_denied", 403),
+            (404, "not_found", 404),
+            (400, "invalid_argument", 400),
+            (422, "invalid_argument", 400),
+            (409, "already_exists", 409),
+            (410, "failed_precondition", 412),
+            (413, "failed_precondition", 412),
+        ] {
+            let (got, retry) = code_for(&refused(upstream, None));
+            assert_eq!(got, code, "{upstream}");
+            assert_eq!(retry, None);
+            assert_eq!(http_status(got).as_u16(), status, "{upstream}");
+        }
+        let (code, _) = code_for(&JobEnded.into());
+        assert_eq!(
+            (code, http_status(code).as_u16()),
+            ("failed_precondition", 412)
+        );
+    }
+
+    #[test]
+    fn a_timeout_a_throttle_and_a_server_error_are_retried() {
+        let (code, retry) = code_for(&refused(408, None));
+        assert_eq!((code, http_status(code).as_u16()), ("unavailable", 503));
+        assert_eq!(retry, None);
+        let (code, retry) = code_for(&refused(429, Some("7")));
+        assert_eq!(
+            (code, http_status(code).as_u16()),
+            ("resource_exhausted", 429)
+        );
+        assert_eq!(retry.as_deref(), Some("7"));
+        for status in [500, 502, 503] {
+            assert_eq!(code_for(&refused(status, None)).0, "unavailable");
+        }
+        assert_eq!(
+            code_for(&anyhow::anyhow!("connection reset")).0,
+            "unavailable"
         );
     }
 }

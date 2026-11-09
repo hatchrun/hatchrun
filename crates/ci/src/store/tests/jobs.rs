@@ -1643,3 +1643,49 @@ fn a_job_made_again_takes_the_template_it_is_planned_with_and_keeps_its_attempt(
     );
     assert_eq!(db.wait(jobs_for_run(db.db(), run.id)).unwrap().len(), 1);
 }
+
+#[test]
+fn a_claim_records_the_cache_scopes_and_a_rerun_clears_them() {
+    let db = setup();
+    let (_, job_id) = run_with_job(&db, "queued");
+    let none = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(none.cache_scopes, None);
+    let scopes = vec!["refs/pull/4/merge".to_owned(), "refs/heads/main".to_owned()];
+    let first = db
+        .wait(set_cache_scopes(db.db(), job_id, 1, &scopes))
+        .unwrap();
+    assert_eq!(first, Some(scopes.clone()));
+    // A later claim of the attempt, which saw another default branch,
+    // gets the scopes the first one fixed.
+    let other = vec![
+        "refs/pull/4/merge".to_owned(),
+        "refs/heads/trunk".to_owned(),
+    ];
+    let again = db
+        .wait(set_cache_scopes(db.db(), job_id, 1, &other))
+        .unwrap();
+    assert_eq!(again, Some(scopes.clone()));
+    // A claim of another attempt matches no row.
+    assert_eq!(
+        db.wait(set_cache_scopes(db.db(), job_id, 2, &other))
+            .unwrap(),
+        None
+    );
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    let stored: Vec<String> = serde_json::from_str(row.cache_scopes.as_deref().unwrap()).unwrap();
+    assert_eq!(stored, scopes);
+    db.wait(reset_job(db.db(), job_id, 2, 50)).unwrap();
+    let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
+    assert_eq!(row.cache_scopes, None);
+}
+
+#[test]
+fn cache_scopes_text_parses_to_a_list_or_an_error() {
+    assert_eq!(parse_cache_scopes(None), Ok(Vec::new()));
+    assert_eq!(
+        parse_cache_scopes(Some(r#"["refs/heads/main"]"#)),
+        Ok(vec!["refs/heads/main".to_owned()])
+    );
+    assert!(parse_cache_scopes(Some("not json")).is_err());
+    assert!(parse_cache_scopes(Some(r#"{"a":1}"#)).is_err());
+}

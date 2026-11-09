@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use super::twirp;
 use super::{
     DOWNLOAD_PATH, Download, MAX_SMALL_BODY, Reply, State, UPLOAD_PATH, Upload, UploadState,
-    download_token, json, lock, twirp_error,
+    download_token, json, lock, refusal, twirp_error,
 };
 
 /// A Twirp request body, or why it is malformed.
@@ -105,11 +105,10 @@ pub(super) async fn create(state: &State, request: twirp::CreateRequest) -> Repl
         }
         Err(err) => {
             warn!(key = request.key, "cache save refused: {err:#}");
-            return twirp_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                format!("{err:#}"),
-            );
+            // What the control plane refused for good is a code the
+            // toolkit and `BuildKit` do not retry, with Twirp's own status
+            // for it; the rest is `unavailable`.
+            return refusal(&err);
         }
     };
     let url = format!("{}{UPLOAD_PATH}{id}", state.base);

@@ -57,12 +57,14 @@ fn document(job: PlannedJob) -> JobDocument {
         cache: Some(CacheService {
             url: "https://cache.example/".into(),
             token: "c_tok".into(),
+            scopes: vec!["refs/heads/main".into()],
         }),
         id_token: Some(IdTokenRequest {
             url: "https://ci.example/v1/oidc/token?api-version=2.0".into(),
             token: "i_tok".into(),
         }),
         artifacts: None,
+        token_expires_in: 3600,
         inputs: None,
     }
 }

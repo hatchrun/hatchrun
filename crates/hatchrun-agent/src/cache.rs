@@ -103,28 +103,43 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Reply = Response<BoxBody<Bytes, BoxError>>;
 
 /// The services a proxy fronts.
+#[derive(Clone)]
 pub struct Services {
     /// The job cache, when the job has one.
     pub cache: Option<source::Cache>,
     /// The artifact service, when the job has one.
     pub artifacts: Option<ArtifactConfig>,
+    /// Who the steps' runtime token names.
+    pub identity: Identity,
+}
+
+/// What the runtime token says: the toolkits read these from it.
+#[derive(Clone)]
+pub struct Identity {
+    /// The run's id, which the artifact toolkit reads.
+    pub run_id: String,
+    /// The job's id, which the artifact toolkit reads.
+    pub job_id: String,
+    /// The cache scopes: the first is the one the job saves to. `BuildKit`
+    /// reads them as the token's access controls. `None` leaves them out
+    /// of the token, so `BuildKit` refuses it.
+    pub scopes: Option<Vec<String>>,
+    /// How many seconds the token lives, from now.
+    pub expires_in: u64,
 }
 
 /// The artifact service of a job.
+#[derive(Clone)]
 pub struct ArtifactConfig {
     /// The control plane's artifact URL and the job token.
     pub service: source::Cache,
-    /// The run's id, which the runtime token names.
-    pub run_id: String,
-    /// The job's id, which the runtime token names.
-    pub job_id: String,
 }
 
 /// A running proxy.
 pub struct Proxy {
     state: Arc<State>,
     url: String,
-    runtime_token: Option<String>,
+    runtime_token: String,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -237,23 +252,34 @@ impl Proxy {
         let services = Services {
             cache: Some(cache),
             artifacts: None,
+            identity: Identity {
+                run_id: "1".into(),
+                job_id: "build".into(),
+                scopes: Some(vec!["refs/heads/main".into()]),
+                expires_in: 3600,
+            },
         };
         Self::start_with(services, addr, results).await
     }
 
     async fn start_with(services: Services, addr: SocketAddr, results: &str) -> Result<Self> {
         let cloud = services.cache.map(Cloud::new).transpose()?;
-        let (artifacts, runtime_token) = match services.artifacts {
-            Some(config) => {
-                let token = artifact_twirp::runtime_token(&config.run_id, &config.job_id)?;
-                let artifacts = Artifacts {
+        let identity = &services.identity;
+        let runtime_token = artifact_twirp::runtime_token(
+            &identity.run_id,
+            &identity.job_id,
+            identity.scopes.as_deref(),
+            identity.expires_in,
+        )?;
+        let artifacts = services
+            .artifacts
+            .map(|config| -> Result<Artifacts> {
+                Ok(Artifacts {
                     cloud: Cloud::new(config.service)?,
-                    token: token.clone(),
-                };
-                (Some(artifacts), Some(token))
-            }
-            None => (None, None),
-        };
+                    token: runtime_token.clone(),
+                })
+            })
+            .transpose()?;
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("listen on {addr}"))?;
@@ -283,13 +309,13 @@ impl Proxy {
         })
     }
 
-    /// The `ACTIONS_RUNTIME_TOKEN` the artifact toolkit needs: a JWT
-    /// whose `scp` claim names the run and job. The toolkit only reads
-    /// the claim, and the proxy accepts the token on artifact calls.
-    /// `None` when the proxy serves no artifacts.
+    /// The `ACTIONS_RUNTIME_TOKEN` of the steps: a JWT the toolkits read
+    /// and never verify (see [`artifact_twirp::runtime_token`]). The
+    /// proxy accepts it on artifact calls; the cache calls go to the
+    /// cloud with the job's own token.
     #[must_use]
-    pub fn runtime_token(&self) -> Option<&str> {
-        self.runtime_token.as_deref()
+    pub fn runtime_token(&self) -> &str {
+        &self.runtime_token
     }
 
     /// The URL the runner passes as `ACTIONS_RESULTS_URL`.
@@ -547,6 +573,18 @@ fn json(value: &impl Serialize) -> Reply {
             err.to_string(),
         ),
     }
+}
+
+/// The reply for a call to the control plane that failed, with the
+/// Twirp code and status its answer deserves (see [`twirp::code_for`])
+/// and its `Retry-After`.
+fn refusal(err: &anyhow::Error) -> Reply {
+    let (code, retry_after) = twirp::code_for(err);
+    let mut reply = twirp_error(twirp::http_status(code), code, format!("{err:#}"));
+    if let Some(value) = retry_after.and_then(|v| HeaderValue::from_str(&v).ok()) {
+        reply.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    reply
 }
 
 fn twirp_error(status: StatusCode, code: &'static str, msg: impl Into<String>) -> Reply {

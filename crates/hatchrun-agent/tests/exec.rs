@@ -2324,9 +2324,11 @@ async fn cache_service_starts_the_proxy() {
     let script = "echo \"url=${ACTIONS_RESULTS_URL-unset} v2=${ACTIONS_CACHE_SERVICE_V2-unset} \
                   tok=${ACTIONS_RUNTIME_TOKEN:+set}\"";
     let mut doc = make::document(vec![make::step(script)]);
+    doc.token_expires_in = 3600;
     doc.cache = Some(hatchrun_workflow::CacheService {
         url: format!("{}/v1/cache", server.uri()),
         token: "cache-service-token".to_owned(),
+        scopes: vec!["refs/heads/main".to_owned()],
     });
     let with_cache = json(&doc);
     doc.cache = None;

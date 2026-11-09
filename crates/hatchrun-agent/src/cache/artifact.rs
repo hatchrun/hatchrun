@@ -32,7 +32,7 @@ use super::cloud::{Cloud, JobEnded, Part, answer};
 use super::rpc::{abandon, body, malformed};
 use super::{
     Artifacts, DOWNLOAD_PATH, Download, Reply, State, UPLOAD_PATH, Upload, UploadState,
-    download_token, json, lock, twirp_error,
+    download_token, json, lock, refusal, twirp_error,
 };
 
 /// The version an artifact upload has in the upload table, which cache
@@ -103,14 +103,9 @@ async fn create(state: &State, cloud: &Cloud, request: CreateRequest) -> Reply {
                 ),
             );
         }
-        Err(err) if ended(&err) => return job_ended(),
         Err(err) => {
             warn!(name = request.name, "artifact upload refused: {err:#}");
-            return twirp_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                format!("{err:#}"),
-            );
+            return refusal(&err);
         }
     };
     let url = format!("{}{UPLOAD_PATH}{id}", state.base);
@@ -147,20 +142,6 @@ async fn create(state: &State, cloud: &Cloud, request: CreateRequest) -> Reply {
         ok: true,
         signed_upload_url: url,
     })
-}
-
-/// Whether the control plane refused the call because the job is not
-/// running any more (`410`), as opposed to a name that is taken (`409`).
-fn ended(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<JobEnded>().is_some()
-}
-
-fn job_ended() -> Reply {
-    twirp_error(
-        StatusCode::PRECONDITION_FAILED,
-        "failed_precondition",
-        "the job is no longer running, so its artifacts cannot change",
-    )
 }
 
 async fn finalize(state: &State, request: FinalizeRequest) -> Reply {
@@ -218,8 +199,8 @@ async fn finalize(state: &State, request: FinalizeRequest) -> Reply {
         Err(err) => {
             warn!(name = request.name, "artifact save failed: {err:#}");
             abandon(&upload).await;
-            if ended(&err) {
-                return job_ended();
+            if err.downcast_ref::<JobEnded>().is_some() {
+                return refusal(&err);
             }
             refuse()
         }
@@ -244,14 +225,9 @@ async fn list(cloud: &Cloud, request: ListRequest) -> Reply {
                 })
                 .collect(),
         }),
-        Err(err) if ended(&err) => job_ended(),
         Err(err) => {
             warn!("artifact list failed: {err:#}");
-            twirp_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                format!("{err:#}"),
-            )
+            refusal(&err)
         }
     }
 }
@@ -266,14 +242,9 @@ async fn signed_url(state: &State, cloud: &Cloud, request: NamedRequest) -> Repl
                 format!("no artifact named {}", request.name),
             );
         }
-        Err(err) if ended(&err) => return job_ended(),
         Err(err) => {
             warn!(name = request.name, "artifact url failed: {err:#}");
-            return twirp_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                format!("{err:#}"),
-            );
+            return refusal(&err);
         }
     };
     let token = match download_token() {
@@ -311,14 +282,9 @@ async fn delete(cloud: &Cloud, request: NamedRequest) -> Reply {
             "not_found",
             format!("no artifact named {}", request.name),
         ),
-        Err(err) if ended(&err) => job_ended(),
         Err(err) => {
             warn!(name = request.name, "artifact delete failed: {err:#}");
-            twirp_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                format!("{err:#}"),
-            )
+            refusal(&err)
         }
     }
 }
