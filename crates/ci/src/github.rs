@@ -354,9 +354,26 @@ pub struct CheckRun {
     /// RFC 3339 UTC, see [`rfc3339`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+    /// Buttons GitHub shows on the check run. A click arrives as a
+    /// `check_run` delivery with `requested_action`. Left out of the
+    /// body when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<CheckAction>,
     /// What the check run shows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<Output>,
+}
+
+/// A button on a check run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckAction {
+    /// The button's text, at most 20 characters.
+    pub label: String,
+    /// What it does, at most 40 characters.
+    pub description: String,
+    /// Names the button in the `requested_action` delivery, at most 20
+    /// characters.
+    pub identifier: String,
 }
 
 /// What a check run shows.
@@ -461,6 +478,48 @@ pub fn check_run_id(response: &Response) -> Result<u64, String> {
         id: u64,
     }
     decode::<Created>(response, "check run").map(|c| c.id)
+}
+
+/// What `user` may do in `repo`: GitHub's collaborator permission.
+#[must_use]
+pub fn collaborator_permission(api: &str, repo: &str, user: &str, token: &str) -> Request {
+    rest(
+        "GET",
+        format!(
+            "{api}/repos/{repo}/collaborators/{}/permission",
+            encode(user)
+        ),
+        token,
+    )
+}
+
+/// Whether the answer of [`collaborator_permission`] says the user can
+/// write: `write`, `maintain` or `admin`. A user who is not a
+/// collaborator (`404`) cannot.
+///
+/// # Errors
+///
+/// GitHub's answer when it is neither a permission nor a `404`.
+pub fn can_write(response: &Response) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct Permission {
+        #[serde(default)]
+        permission: String,
+        #[serde(default)]
+        role_name: String,
+    }
+    if response.status == 404 {
+        return Ok(false);
+    }
+    let found = decode::<Permission>(response, "collaborator permission")?;
+    // `role_name` has `maintain`; the legacy `permission` folds it into
+    // `write`. A role GitHub added later is read as no access.
+    let role = if found.role_name.is_empty() {
+        found.permission.as_str()
+    } else {
+        found.role_name.as_str()
+    };
+    Ok(matches!(role, "write" | "maintain" | "admin"))
 }
 
 /// A repository as a signed-in user sees it.
@@ -659,8 +718,83 @@ mod tests {
             started_at: Some(rfc3339(1_792_676_700_000)),
             conclusion: None,
             completed_at: None,
+            actions: Vec::new(),
             output: None,
         }
+    }
+
+    #[test]
+    fn a_check_run_with_a_button_sends_its_actions_and_one_without_sends_none() {
+        let mut with = run();
+        with.actions = vec![CheckAction {
+            label: "Approve and run".into(),
+            description: "Run this commit's workflows".into(),
+            identifier: "approve-fork-run".into(),
+        }];
+        let body = json(&create_check_run(
+            "https://api.github.com",
+            "o/w",
+            "tok",
+            &with,
+        ));
+        assert_eq!(body["actions"][0]["identifier"], "approve-fork-run");
+        assert_eq!(body["actions"][0]["label"], "Approve and run");
+        let body = json(&create_check_run(
+            "https://api.github.com",
+            "o/w",
+            "tok",
+            &run(),
+        ));
+        assert!(body.get("actions").is_none());
+    }
+
+    #[test]
+    fn the_collaborator_permission_is_asked_for_the_login() {
+        let r =
+            collaborator_permission("https://api.github.com", "octo/widgets", "ma-llory", "tok");
+        assert_eq!(r.method, "GET");
+        assert_eq!(
+            r.url,
+            "https://api.github.com/repos/octo/widgets/collaborators/ma-llory/permission"
+        );
+    }
+
+    fn answered(status: u16, body: &str) -> Response {
+        Response {
+            status,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn only_write_maintain_and_admin_can_approve() {
+        let role = |permission: &str, role_name: &str| {
+            can_write(&answered(
+                200,
+                &format!(r#"{{"permission":"{permission}","role_name":"{role_name}"}}"#),
+            ))
+        };
+        assert_eq!(role("admin", "admin"), Ok(true));
+        assert_eq!(role("write", "maintain"), Ok(true));
+        assert_eq!(role("write", "write"), Ok(true));
+        assert_eq!(role("read", "triage"), Ok(false));
+        assert_eq!(role("read", "read"), Ok(false));
+        assert_eq!(role("none", "none"), Ok(false));
+        // A role GitHub adds later is not a reason to approve.
+        assert_eq!(role("write", "custom-role"), Ok(false));
+        // Without role_name the legacy field decides.
+        assert_eq!(
+            can_write(&answered(200, r#"{"permission":"write"}"#)),
+            Ok(true)
+        );
+        assert_eq!(
+            can_write(&answered(200, r#"{"permission":"read"}"#)),
+            Ok(false)
+        );
+        // Not a collaborator at all.
+        assert_eq!(can_write(&answered(404, "{}")), Ok(false));
+        assert!(can_write(&answered(500, "boom")).is_err());
     }
 
     #[test]

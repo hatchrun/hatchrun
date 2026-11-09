@@ -54,11 +54,11 @@ const APPROVE_RUN: &str = "UPDATE ci_runs SET gate_status = 'approved', gate_by 
      gate_at = $3 WHERE id = $1 AND gate_status IN ('pending', 'deferred') AND status <> 'completed' \
      RETURNING {columns}";
 
-/// Approves the waiting runs of repository `$1` whose approval is on
-/// check run `$2`, by `$3` at `$4`.
+/// Approves the waiting runs of repository `$1` of tenant `$5` whose
+/// approval is on check run `$2`, by `$3` at `$4`.
 const APPROVE_BY_CHECK: &str = "UPDATE ci_runs SET gate_status = 'approved', gate_by = $3, \
-     gate_at = $4 WHERE repo_id = $1 AND gate_check_run_id = $2 AND gate_status = 'pending' \
-     AND status <> 'completed' RETURNING {columns}";
+     gate_at = $4 WHERE repo_id = $1 AND tenant_id = $5 AND gate_check_run_id = $2 \
+     AND gate_status = 'pending' AND status <> 'completed' RETURNING {columns}";
 
 /// Ends the wait of run `$1` with status `$2` by `$3` at `$4`.
 const END_GATE: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_at = $4 \
@@ -190,6 +190,7 @@ pub async fn approve_run(db: &Db, run_id: u64, by: &str, now: u64) -> Result<Opt
 /// Postgres refused the statement.
 pub async fn approve_by_check(
     db: &Db,
+    tenant_id: &str,
     repo_id: u64,
     check_run_id: u64,
     by: &str,
@@ -197,7 +198,7 @@ pub async fn approve_by_check(
 ) -> Result<Vec<RunRow>> {
     db.all(
         &with_columns(APPROVE_BY_CHECK, RUN_COLUMNS),
-        &params![repo_id, check_run_id, by, now],
+        &params![repo_id, check_run_id, by, now, tenant_id],
     )
     .await
 }

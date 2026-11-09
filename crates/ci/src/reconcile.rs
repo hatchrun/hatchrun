@@ -522,6 +522,11 @@ async fn steps(env: &Env, db: &Db, now: u64) -> u32 {
         console_error!("reconcile: held jobs: {err}");
         errors += 1;
     }
+    tally(
+        &mut errors,
+        "fork approvals",
+        fork_approvals(env, db, &settings, &github, now).await,
+    );
     let cancels = Budget::new(MAX_RECANCELS);
     tally(
         &mut errors,
@@ -562,6 +567,29 @@ async fn steps(env: &Env, db: &Db, now: u64) -> u32 {
         reseal_secrets(env, db, &Budget::new(share.reseal)).await,
     );
     errors
+}
+
+/// Expires the fork runs nobody approved in seven days and asks for the
+/// approval of deferred runs that a freed slot admits. See
+/// [`crate::fork::sweep`].
+async fn fork_approvals(
+    env: &Env,
+    db: &Db,
+    settings: &Settings,
+    github: &Counted,
+    now: u64,
+) -> Result<u32, String> {
+    let tokens = Tokens::new(
+        Kv::new(env),
+        App::new(
+            settings.github_api.clone(),
+            settings.app_id.clone(),
+            settings.app_key.clone(),
+        ),
+        github,
+        now,
+    );
+    crate::fork::sweep(env, db, settings, &tokens, now).await
 }
 
 /// A repository ready to start scheduled runs: where it is now, the
@@ -877,6 +905,16 @@ async fn wake_held(env: &Env, db: &Db, budget: &Budget, now: u64) -> Result<(), 
         ci_wake::release_orphan_approvals(db, now.saturating_sub(HELD_QUIET_MS), now, HELD_BUDGET)
             .await
             .map_err(|e| e.to_string())?;
+    stale.extend(
+        ci_wake::release_orphan_fork_approvals(
+            db,
+            now.saturating_sub(HELD_QUIET_MS),
+            now,
+            HELD_BUDGET,
+        )
+        .await
+        .map_err(|e| e.to_string())?,
+    );
     stale.extend(
         ci_wake::stale(
             db,

@@ -86,3 +86,10 @@ ALTER TABLE ci_jobs DROP CONSTRAINT ci_jobs_held_check,
   ADD CONSTRAINT ci_jobs_held_check
     CHECK (held IN ('card', 'spend_cap', 'concurrency', 'approval', 'max_parallel', 'group',
                     'capacity', 'fork_approval', 'fork_limit'));
+
+-- A change to a repository's fork policy is audited like the other
+-- settings.
+ALTER TABLE ci_audit DROP CONSTRAINT ci_audit_action_check,
+  ADD CONSTRAINT ci_audit_action_check CHECK (action IN
+    ('secret.put', 'secret.delete', 'var.put', 'var.delete',
+     'environment.put', 'environment.delete', 'repos.enabled', 'fork_policy.put'));

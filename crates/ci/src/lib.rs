@@ -46,6 +46,7 @@ pub mod checks;
 pub mod concurrency;
 pub mod env;
 pub mod environments;
+pub mod fork;
 pub mod github;
 pub mod graph;
 pub mod installation;

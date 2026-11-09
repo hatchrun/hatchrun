@@ -60,8 +60,9 @@ use crate::environments::{self, Gate};
 use crate::launcher::{Backend, LaunchSpec, user_data};
 use crate::reconcile::{self, LAUNCH_QUIET_MS};
 use crate::run::LAUNCHES;
-use crate::store::{self, Claim, JobRow, Standing};
+use crate::store::{self, Claim, GateStatus, JobRow, Standing};
 use crate::token::{self, Claims};
+use crate::trust::Trust;
 
 /// The dead-letter queue in `wrangler.toml`.
 pub const DEAD_LETTERS: &str = "hatchrun-ci-launches-dlq";
@@ -271,6 +272,91 @@ async fn group_open(env: &Env, db: &Db, job: &JobRow, now: u64) -> Result<bool, 
     }
 }
 
+/// What the fork checks decide for a job about to launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkGate {
+    /// Go on; a job of a fork run also waits for a place under the
+    /// repository's cap on fork jobs.
+    Go {
+        /// The most fork jobs of the repository that run at once.
+        cap: Option<u32>,
+    },
+    /// The job was held or ended, or its run is over: nothing is left
+    /// to do.
+    Done,
+}
+
+/// The word `ci_jobs.held` stores for a job whose run waits for a
+/// maintainer's approval.
+pub const FORK_APPROVAL_HOLD: &str = "fork_approval";
+
+/// What a job is told while its run waits for an approval.
+fn approval_message(repo: &str, app_url: &str, run_id: u64) -> String {
+    format!(
+        "Waiting for approval: this run is of a pull request from a fork. A maintainer of {repo} \
+         can approve it from the pull request's checks or at {app_url}/ci/{repo}/runs/{run_id}."
+    )
+}
+
+/// The fork rules at launch, read from the run row: a run that waits
+/// for its approval, or ended without one, starts nothing; a fork run's
+/// job needs a runner template of at most 4 vCPUs and a place under the
+/// repository's cap on fork jobs.
+async fn fork_open(
+    env: &Env,
+    db: &Db,
+    settings: &Settings,
+    job: &JobRow,
+    now: u64,
+) -> Result<ForkGate, String> {
+    let Some(run) = store::run(db, job.run_id)
+        .await
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(ForkGate::Done);
+    };
+    match run.gate_status {
+        GateStatus::Pending | GateStatus::Deferred => {
+            let repo = store::repo(db, run.repo_id)
+                .await
+                .map_err(|err| err.to_string())?
+                .map_or_else(String::new, |repo| repo.full_name);
+            let message = approval_message(&repo, &settings.app_url, run.id);
+            hold_job(env, db, job, FORK_APPROVAL_HOLD, &message, now).await?;
+            return Ok(ForkGate::Done);
+        }
+        // The run's object ends the job, with the reason.
+        GateStatus::Expired | GateStatus::Cancelled => return Ok(ForkGate::Done),
+        GateStatus::NotGated | GateStatus::Approved => {}
+    }
+    if run.trust == Trust::Trusted {
+        return Ok(ForkGate::Go { cap: None });
+    }
+    let too_big = job
+        .template
+        .as_deref()
+        .and_then(crate::fork::template_vcpu)
+        .is_some_and(|vcpu| vcpu > crate::policy::FORK_MAX_VCPU);
+    if too_big {
+        end_job(env, db, job, FORK_TEMPLATE_MESSAGE).await?;
+        return Ok(ForkGate::Done);
+    }
+    let private = store::repo(db, run.repo_id)
+        .await
+        .map_err(|err| err.to_string())?
+        .is_some_and(|repo| repo.private);
+    let policy = store::repo_policy(db, run.repo_id, private)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(ForkGate::Go {
+        cap: Some(policy.fork_max_running),
+    })
+}
+
+/// What ends a fork job on a template over 4 vCPUs.
+const FORK_TEMPLATE_MESSAGE: &str = "Pull requests from forks run on runner templates of at \
+     most 4 vCPUs.";
+
 /// Checks the environment the job names against its run: whether it
 /// exists, allows the run's ref and trust, and has its approval. A
 /// `false` means the job was held or ended and nothing is left to do.
@@ -347,6 +433,14 @@ async fn launch(
     if delivery == Delivery::Launch && !environment_open(env, &db, settings, &job, now).await? {
         return Ok(());
     }
+    let fork_cap = if delivery == Delivery::Launch {
+        match fork_open(env, &db, settings, &job, now).await? {
+            ForkGate::Go { cap } => cap,
+            ForkGate::Done => return Ok(()),
+        }
+    } else {
+        None
+    };
     if delivery == Delivery::Launch && !group_open(env, &db, &job, now).await? {
         return Ok(());
     }
@@ -378,7 +472,7 @@ async fn launch(
         &standing.tenant_id,
         max_running,
         delivery != Delivery::GiveUp,
-        None,
+        fork_cap,
         now,
     )
     .await
@@ -499,13 +593,19 @@ pub(crate) async fn wake_oldest(env: &Env, db: &Db, tenant_id: &str) {
 /// is logged and left to the reconciler's backstop, since the job's end
 /// is recorded already.
 pub(crate) async fn wake_group(env: &Env, db: &Db, job_id: u64) {
-    let woken = match store::held_siblings(db, job_id).await {
+    let mut woken = match store::held_siblings(db, job_id).await {
         Ok(woken) => woken,
         Err(err) => {
             console_error!("job {job_id}: find the held job of its matrix: {err}");
             return;
         }
     };
+    // A fork job that ended also frees a place under the repository's
+    // cap on fork jobs.
+    match store::held_fork_jobs(db, job_id).await {
+        Ok(more) => woken.extend(more),
+        Err(err) => console_error!("job {job_id}: find the held fork job: {err}"),
+    }
     if let Err(err) = send_wakes(env, &woken).await {
         console_error!("job {job_id}: wake the held job of its matrix: {err}");
     }
@@ -519,6 +619,26 @@ pub const FORK_LIMIT_HOLD: &str = "fork_limit";
 /// repository's limit.
 const FORK_LIMIT_MESSAGE: &str = "Waiting: this repository already runs the most jobs from fork \
      pull requests its policy allows. This job starts when one of them ends.";
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+
+    #[test]
+    fn a_run_that_waits_tells_its_jobs_where_to_approve() {
+        let message = approval_message("acme/app", "https://app.example", 12);
+        assert!(message.starts_with("Waiting for approval"));
+        assert!(message.contains("acme/app"));
+        assert!(message.contains("https://app.example/ci/acme/app/runs/12"));
+        assert_eq!(FORK_APPROVAL_HOLD, "fork_approval");
+        assert_eq!(FORK_LIMIT_HOLD, "fork_limit");
+    }
+
+    #[test]
+    fn the_fork_template_message_names_the_limit() {
+        assert!(FORK_TEMPLATE_MESSAGE.contains("4 vCPUs"));
+    }
+}
 
 /// The word `ci_jobs.held` stores for a job over its matrix's
 /// `max-parallel`.

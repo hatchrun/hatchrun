@@ -198,13 +198,13 @@ fn the_button_approves_only_the_runs_on_its_check_run_in_its_repository() {
     db.wait(set_gate_check(db.db(), "a2", 5150)).unwrap();
     db.wait(set_gate_check(db.db(), "b", 6000)).unwrap();
     assert_eq!(
-        db.wait(approve_by_check(db.db(), 8, 5150, "m", 9))
+        db.wait(approve_by_check(db.db(), "t1", 8, 5150, "m", 9))
             .unwrap()
             .len(),
         0
     );
     let approved = db
-        .wait(approve_by_check(db.db(), 7, 5150, "maintainer", 9))
+        .wait(approve_by_check(db.db(), "t1", 7, 5150, "maintainer", 9))
         .unwrap();
     let mut ids: Vec<u64> = approved.iter().map(|run| run.id).collect();
     ids.sort_unstable();
@@ -212,7 +212,7 @@ fn the_button_approves_only_the_runs_on_its_check_run_in_its_repository() {
     let read = db.wait(super::run(db.db(), other.id)).unwrap().unwrap();
     assert_eq!(read.gate_status, GateStatus::Pending);
     assert_eq!(
-        db.wait(approve_by_check(db.db(), 7, 5150, "again", 10))
+        db.wait(approve_by_check(db.db(), "t1", 7, 5150, "again", 10))
             .unwrap()
             .len(),
         0

@@ -364,6 +364,14 @@ async fn needs_you_done(cx: &Cx<'_>, org: &str) -> Done {
         Vec::new()
     };
     let ids = readable(cx, session, &tenant, admin).await?;
+    // Fork pull requests whose run waits for a maintainer. Anyone who
+    // can write may approve one; the list is the organization admins',
+    // like the environment approvals.
+    let fork_approvals = if admin {
+        store::pending_gate_runs(cx.db, &tenant.id, &ids, NEEDS_LIMIT).await?
+    } else {
+        Vec::new()
+    };
     let failing: Vec<ListedRun> = store::latest_on_default(cx.db, &tenant.id, &ids)
         .await?
         .into_iter()
@@ -373,6 +381,7 @@ async fn needs_you_done(cx: &Cx<'_>, org: &str) -> Done {
     let run_ids: Vec<u64> = approvals
         .iter()
         .map(|job| job.run.run.id)
+        .chain(fork_approvals.iter().map(|row| row.run.id))
         .chain(failing.iter().map(|row| row.run.id))
         .collect();
     let counts: HashMap<u64, JobCounts> = store::job_counts(cx.db, &run_ids)
@@ -381,6 +390,7 @@ async fn needs_you_done(cx: &Cx<'_>, org: &str) -> Done {
         .collect();
     let body = json!({
         "approvals": approvals.iter().map(|job| approval_json(job, &counts)).collect::<Vec<_>>(),
+        "fork_approvals": fork_approvals.iter().map(|row| listed_json(row, &counts)).collect::<Vec<_>>(),
         "failing": failing.iter().map(|row| json!({
             "repository": row.repository,
             "branch": row.run.branch(),

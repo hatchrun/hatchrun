@@ -26,6 +26,8 @@ pub enum Action {
     EnvironmentDelete,
     /// The repositories that run CI changed.
     ReposEnabled,
+    /// A repository's policy for pull requests from forks changed.
+    ForkPolicyPut,
 }
 
 impl Action {
@@ -40,6 +42,7 @@ impl Action {
             Self::EnvironmentPut => "environment.put",
             Self::EnvironmentDelete => "environment.delete",
             Self::ReposEnabled => "repos.enabled",
+            Self::ForkPolicyPut => "fork_policy.put",
         }
     }
 }
