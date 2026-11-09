@@ -56,6 +56,10 @@ const WAITING: &str = "SELECT \
 const SET_GATE_CHECK: &str = "UPDATE ci_runs SET gate_check_run_id = $2 \
      WHERE id = $1 AND gate_status IN ('pending', 'deferred')";
 
+/// Forgets the check run of run `$1` while it waits.
+const CLEAR_GATE_CHECK: &str = "UPDATE ci_runs SET gate_check_run_id = NULL \
+     WHERE id = $1 AND gate_status IN ('pending', 'deferred')";
+
 /// The deferred runs of pull request `$2` of repository `$1` at `$3`: a
 /// group, admitted together.
 const DEFERRED_GROUP: &str = "SELECT {columns} FROM ci_runs WHERE repo_id = $1 \
@@ -201,14 +205,28 @@ pub async fn fork_waiting(
 
 /// Records check run `check_run_id` as the carrier of the approve
 /// button of run `run_id`. Called once the check run exists, so a run's
-/// card id is never recorded before its card.
+/// card id is never recorded before its card. Returns whether it was
+/// recorded: `false` when the run was decided meanwhile, whose new card
+/// the caller then settles.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn set_gate_check(db: &Db, run_id: u64, check_run_id: u64) -> Result<()> {
-    db.run(SET_GATE_CHECK, &params![run_id, check_run_id])
-        .await?;
+pub async fn set_gate_check(db: &Db, run_id: u64, check_run_id: u64) -> Result<bool> {
+    Ok(db
+        .run(SET_GATE_CHECK, &params![run_id, check_run_id])
+        .await?
+        == 1)
+}
+
+/// Forgets the card of run `run_id` while it waits, so the reconciler
+/// makes it again: for a card that could not be updated.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn clear_gate_check(db: &Db, run_id: u64) -> Result<()> {
+    db.run(CLEAR_GATE_CHECK, &params![run_id]).await?;
     Ok(())
 }
 

@@ -492,16 +492,17 @@ impl Cx<'_> {
         let Some(repo) = store::repo(self.db, pr.repo.id).await? else {
             return Ok(());
         };
+        // The runs exist: a card that cannot be made now is logged, and
+        // the reconciler makes it. The delivery does not fail for it.
         for &run_id in run_ids {
             let Some(run) = store::run(self.db, run_id).await? else {
                 continue;
             };
-            if !fork::waits(&run) {
-                continue;
+            if let Err(err) =
+                fork::ensure_card(self.tokens, self.db, self.settings, &repo, &run, policy).await
+            {
+                worker::console_error!("run {run_id}: the approval check run: {err}");
             }
-            fork::ensure_card(self.tokens, self.db, self.settings, &repo, &run, policy)
-                .await
-                .map_err(fail)?;
         }
         Ok(())
     }
@@ -807,15 +808,18 @@ impl Cx<'_> {
         }
         // A fork run whose approval ended, or whose repository turned
         // fork runs off, is not rerun: nothing is reset, and the commit
-        // says why in one check run that later refusals update.
-        if run.trust == Trust::Fork
-            && let Some(repo) = store::repo(self.db, run.repo_id).await?
-        {
-            let policy = store::repo_policy(self.db, repo.id, repo.private).await?;
-            if let Some(reason) = fork::rerun_refusal(&run, &policy) {
-                fork::say_rerun_refused(self.tokens, self.settings, &repo, &run, reason).await;
-                return Ok(Outcome::Ignored(reason.to_owned()));
+        // says why in one check run that later refusals update. The
+        // not-approved reason needs only the run's row.
+        let repo = store::repo(self.db, run.repo_id).await?;
+        let policy = match &repo {
+            Some(repo) => Some(store::repo_policy(self.db, repo.id, repo.private).await?),
+            None => None,
+        };
+        if let Some(reason) = fork::rerun_refusal(&run, policy.as_ref()) {
+            if let Some(repo) = &repo {
+                fork::say_rerun_refused(self.tokens, self.settings, repo, &run, reason).await;
             }
+            return Ok(Outcome::Ignored(reason.to_owned()));
         }
         let url = format!(
             "https://run/rerun?job={}&run={}&tenant={}&days={}",

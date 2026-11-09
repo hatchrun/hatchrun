@@ -700,9 +700,41 @@ fn a_card_is_recorded_only_for_a_run_that_still_waits() {
         .unwrap();
     // A card that finishes being made after the run was decided is not
     // recorded as the run's button.
-    db.wait(set_gate_check(db.db(), run.id, 5150)).unwrap();
+    let kept = db.wait(set_gate_check(db.db(), run.id, 5150)).unwrap();
+    assert!(
+        !kept,
+        "the caller settles the new card to the decided state"
+    );
     let read = db.wait(super::run(db.db(), run.id)).unwrap().unwrap();
     assert_eq!(read.gate_check_run_id, None);
+    // A run that waits records it.
+    let waiting = fork_run(&db, "b", 2, "s2", "mallory", GateStatus::Pending, 3);
+    assert!(db.wait(set_gate_check(db.db(), waiting.id, 6000)).unwrap());
+}
+
+#[test]
+fn a_card_that_could_not_be_updated_is_forgotten_so_the_reconciler_makes_it_again() {
+    let db = setup();
+    let run = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 10);
+    db.wait(set_gate_check(db.db(), run.id, 5150)).unwrap();
+    assert_eq!(
+        db.wait(runs_without_card(db.db(), 500, 10, 5))
+            .unwrap()
+            .len(),
+        0
+    );
+    db.wait(clear_gate_check(db.db(), run.id)).unwrap();
+    let found = db.wait(runs_without_card(db.db(), 500, 10, 5)).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, run.id);
+    // A decided run keeps what it has: nothing to make again.
+    db.wait(set_gate_check(db.db(), run.id, 5151)).unwrap();
+    db.wait(approve_run(db.db(), "t1", 7, run.id, "m", 20))
+        .unwrap()
+        .unwrap();
+    db.wait(clear_gate_check(db.db(), run.id)).unwrap();
+    let read = db.wait(super::run(db.db(), run.id)).unwrap().unwrap();
+    assert_eq!(read.gate_check_run_id, Some(5151));
 }
 
 fn second_repo(db: &TestDb) {
