@@ -103,6 +103,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Reply = Response<BoxBody<Bytes, BoxError>>;
 
 /// The services a proxy fronts.
+#[derive(Clone)]
 pub struct Services {
     /// The job cache, when the job has one.
     pub cache: Option<source::Cache>,
@@ -113,6 +114,7 @@ pub struct Services {
 }
 
 /// What the runtime token says: the toolkits read these from it.
+#[derive(Clone)]
 pub struct Identity {
     /// The run's id, which the artifact toolkit reads.
     pub run_id: String,
@@ -121,9 +123,12 @@ pub struct Identity {
     /// The cache scopes: the first is the one the job saves to. `BuildKit`
     /// reads them as the token's access controls.
     pub scopes: Vec<String>,
+    /// The job's `timeout-minutes`, which the token outlives.
+    pub timeout_minutes: u32,
 }
 
 /// The artifact service of a job.
+#[derive(Clone)]
 pub struct ArtifactConfig {
     /// The control plane's artifact URL and the job token.
     pub service: source::Cache,
@@ -250,6 +255,7 @@ impl Proxy {
                 run_id: "1".into(),
                 job_id: "build".into(),
                 scopes: vec!["refs/heads/main".into()],
+                timeout_minutes: 10,
             },
         };
         Self::start_with(services, addr, results).await
@@ -258,8 +264,12 @@ impl Proxy {
     async fn start_with(services: Services, addr: SocketAddr, results: &str) -> Result<Self> {
         let cloud = services.cache.map(Cloud::new).transpose()?;
         let identity = &services.identity;
-        let runtime_token =
-            artifact_twirp::runtime_token(&identity.run_id, &identity.job_id, &identity.scopes)?;
+        let runtime_token = artifact_twirp::runtime_token(
+            &identity.run_id,
+            &identity.job_id,
+            &identity.scopes,
+            artifact_twirp::lifetime_secs(identity.timeout_minutes),
+        )?;
         let artifacts = services
             .artifacts
             .map(|config| -> Result<Artifacts> {

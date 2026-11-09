@@ -103,6 +103,8 @@ struct Context<'a> {
     db: Db,
     run: RunRow,
     bucket: &'a str,
+    /// The scopes the job reads, fixed when it was claimed.
+    scopes: Vec<String>,
 }
 
 impl Context<'_> {
@@ -169,11 +171,13 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
     let run = store::run(&db, job.run_id)
         .await?
         .ok_or_else(|| Refusal::new(410, JOB_ENDED))?;
+    let scopes = job_scopes(&db, &job, &run).await?;
     let ctx = Context {
         settings,
         db,
         run,
         bucket: &settings.artifacts_bucket,
+        scopes,
     };
     match (req.method(), segments.as_slice()) {
         (Method::Post, ["lookup"]) => lookup(&ctx, body(req).await?).await,
@@ -183,6 +187,32 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
         (Method::Delete, ["uploads", id]) => abort(&ctx, id).await,
         _ => Err(Refusal::new(404, "not found")),
     }
+}
+
+/// The scopes `job` reads: the list its claim stored, which its token's
+/// access controls name too. A job claimed before they were stored gets
+/// the list worked out now.
+async fn job_scopes(
+    db: &Db,
+    job: &store::JobRow,
+    run: &RunRow,
+) -> std::result::Result<Vec<String>, Refusal> {
+    let stored = job
+        .cache_scopes
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .filter(|scopes| !scopes.is_empty());
+    if let Some(scopes) = stored {
+        return Ok(scopes);
+    }
+    let default_branch = store::repo(db, run.repo_id)
+        .await?
+        .map(|repo| repo.default_branch);
+    Ok(read_scopes(
+        &run.git_ref,
+        run.base_ref.as_deref(),
+        default_branch.as_deref(),
+    ))
 }
 
 fn id_of(id: &str) -> std::result::Result<u64, Refusal> {
@@ -205,20 +235,12 @@ async fn lookup(ctx: &Context<'_>, request: LookupRequest) -> Answer {
     for key in &request.restore_keys {
         check_key(key).map_err(|err| Refusal::new(400, err))?;
     }
-    let default_branch = store::repo(&ctx.db, ctx.run.repo_id)
-        .await?
-        .map(|repo| repo.default_branch);
-    let scopes = read_scopes(
-        &ctx.run.git_ref,
-        ctx.run.base_ref.as_deref(),
-        default_branch.as_deref(),
-    );
     let Some(found) = store::lookup_cache_entry(
         &ctx.db,
         &ctx.run.tenant_id,
         ctx.run.repo_id,
         &request.version,
-        &scopes,
+        &ctx.scopes,
         &request.key,
         &request.restore_keys,
     )

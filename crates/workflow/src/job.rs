@@ -154,6 +154,12 @@ pub struct CacheService {
     /// The refs a job restores from, in order. The first is the ref the
     /// job saves to. The agent names them in its runtime token, which
     /// `BuildKit` reads to build its index keys.
+    ///
+    /// The Worker deploys before the AMIs that carry a new agent, and an
+    /// agent also meets a Worker older than itself, so a document
+    /// without scopes is read as empty; the agent then uses the run's
+    /// ref alone.
+    #[serde(default)]
     pub scopes: Vec<String>,
 }
 

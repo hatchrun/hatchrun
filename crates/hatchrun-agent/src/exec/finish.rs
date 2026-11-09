@@ -75,14 +75,20 @@ impl Job<'_> {
         {
             self.masker.add(&token);
         }
-        let scopes = match &self.doc.cache {
-            Some(service) if !service.scopes.is_empty() => service.scopes.clone(),
-            _ => vec![self.doc.github.ref_.clone()],
-        };
+        // A Worker older than this agent sends no scopes: the run's ref
+        // is then the only one.
+        let scopes = self
+            .doc
+            .cache
+            .as_ref()
+            .map(|service| service.scopes.clone())
+            .filter(|scopes| !scopes.is_empty())
+            .unwrap_or_else(|| vec![self.doc.github.ref_.clone()]);
         let identity = Identity {
             run_id: self.doc.run_id.clone(),
             job_id: self.doc.job.id.clone(),
             scopes,
+            timeout_minutes: self.doc.job.timeout_minutes,
         };
         let services = Services {
             cache,
@@ -90,28 +96,49 @@ impl Job<'_> {
             identity,
         };
         let ip = self.proxy_bind().await;
-        let proxy = match Proxy::start_services(services, ip).await {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let started = match Proxy::start_services(services.clone(), ip).await {
+            // The bridge gateway can be an address this machine does not
+            // have yet; the loopback still serves the host's steps.
+            Err(err) if ip != loopback => {
+                warn!(%ip, "cache proxy: cannot listen, trying the loopback: {err:#}");
+                Proxy::start_services(services, loopback).await
+            }
+            other => other,
+        };
+        let proxy = match started {
             Ok(proxy) => proxy,
             Err(err) => {
+                warn!(%ip, "cache proxy: cannot listen: {err:#}");
                 self.cache_unavailable(sink, &err);
                 return None;
             }
         };
         if let Err(err) = proxy.check().await {
+            warn!(
+                url = proxy.url(),
+                "cache proxy: health check failed: {err:#}"
+            );
             self.cache_unavailable(sink, &err);
             proxy.stop().await;
             return None;
         }
         let token = proxy.runtime_token().to_owned();
         self.masker.add(&token);
-        // `docker buildx` with `type=gha` reads these three, and the
-        // v1 URL too, when it checks that a cache is configured.
+        // The results URL and token serve the artifact toolkit and
+        // `BuildKit` alike. Only a job with a cache gets the cache
+        // variables: `docker buildx` with `type=gha` reads the v2 flag
+        // and the v1 URL too, when it checks that a cache is configured.
         self.cache_env = BTreeMap::from([
-            ("ACTIONS_CACHE_URL".to_owned(), format!("{}/", proxy.url())),
             ("ACTIONS_RESULTS_URL".to_owned(), proxy.url().to_owned()),
-            ("ACTIONS_CACHE_SERVICE_V2".to_owned(), "true".to_owned()),
             ("ACTIONS_RUNTIME_TOKEN".to_owned(), token),
         ]);
+        if self.doc.cache.is_some() {
+            self.cache_env
+                .insert("ACTIONS_CACHE_URL".to_owned(), format!("{}/", proxy.url()));
+            self.cache_env
+                .insert("ACTIONS_CACHE_SERVICE_V2".to_owned(), "true".to_owned());
+        }
         Some(proxy)
     }
 

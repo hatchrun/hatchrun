@@ -398,11 +398,18 @@ async fn claim(
     document.id_token =
         id_token_request(&settings.ci_url, &settings.token_key, row, now_ms() / 1000);
     document.artifacts = artifact_service(settings, job_token);
+    // The scopes are fixed here and kept with the job: the token the
+    // agent builds from them and the cache service must agree for the
+    // whole job, whatever happens to the default branch meanwhile.
     let scopes = crate::cache::read_scopes(
         &run.git_ref,
         run.base_ref.as_deref(),
         Some(&repo.default_branch),
     );
+    if let Err(err) = store::set_cache_scopes(db, row.id, &scopes).await {
+        console_error!("job {}: record cache scopes: {err}", row.id);
+        return retry();
+    }
     document.cache = cache_service(settings, job_token, scopes);
     Response::from_json(&document)
 }
@@ -831,6 +838,7 @@ mod tests {
             approval_by: None,
             approval_at: None,
             needs: serde_json::json!([]),
+            cache_scopes: None,
         }
     }
 

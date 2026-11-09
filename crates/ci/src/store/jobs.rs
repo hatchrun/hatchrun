@@ -113,6 +113,9 @@ pub struct JobRow {
     /// The plan ids of the jobs it waits on, a JSON array.
     #[serde(deserialize_with = "json_text")]
     pub needs: serde_json::Value,
+    /// The cache scopes fixed at the claim, a JSON array of refs.
+    #[serde(default)]
+    pub cache_scopes: Option<String>,
 }
 
 /// Reads a JSON document that the row carries as text.
@@ -127,7 +130,7 @@ pub(super) const JOB_COLUMNS: &str = "id, run_id, plan_id, name, status, conclus
      completed_at, steps::text AS steps, log_key, template, \
      token_permissions::text AS token_permissions, secret_refs::text AS secret_refs, held, \
      environment, environment_url, approval_attempt, approval_decision, approval_by, \
-     approval_at, needs::text AS needs";
+     approval_at, needs::text AS needs, cache_scopes";
 
 /// The jobs of run `$1` in plan order, without those a rerun left out
 /// of their matrix.
@@ -157,6 +160,9 @@ const OPEN_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE status <> 'complete
 /// Job `$1`.
 const JOB: &str = "SELECT {columns} FROM ci_jobs WHERE id = $1";
 
+/// Records the cache scopes `$2`, a JSON array, of the job `$1` claimed.
+const SET_CACHE_SCOPES: &str = "UPDATE ci_jobs SET cache_scopes = $2 WHERE id = $1";
+
 /// Starts running job `$1` at `$2`, which is also its first heartbeat.
 const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2, \
      heartbeat_at = $2, updated_at = $2 \
@@ -168,7 +174,8 @@ const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2,
 const RESET_JOB: &str = "UPDATE ci_jobs SET status = 'waiting', attempt = $2, launch_attempts = 0, \
      capacity_attempts = 0, capacity_since = NULL, conclusion = NULL, instance_id = NULL, launch_error = NULL, next_launch_at = NULL, \
      heartbeat_at = NULL, started_at = NULL, completed_at = NULL, log_key = NULL, \
-     held = NULL, steps = '[]', environment_url = NULL, superseded = false, updated_at = $3 \
+     held = NULL, steps = '[]', environment_url = NULL, superseded = false, cache_scopes = NULL, \
+     updated_at = $3 \
      WHERE id = $1 AND attempt < $2";
 
 /// Makes job `$1`, the stand-in of a job that reads its matrix or
@@ -648,6 +655,19 @@ pub async fn job(db: &Db, job_id: u64) -> Result<Option<JobRow>> {
 /// Postgres refused the statement.
 pub async fn start_job(db: &Db, job_id: u64, now: u64) -> Result<bool> {
     Ok(db.run(START_JOB, &params![job_id, now]).await? == 1)
+}
+
+/// Records the cache scopes the job was claimed with, first the one it
+/// saves to. The last claim wins, and it is the one whose document the
+/// agent runs.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn set_cache_scopes(db: &Db, job_id: u64, scopes: &[String]) -> Result<()> {
+    let text = serde_json::to_string(scopes).unwrap_or_else(|_| "[]".to_owned());
+    db.run(SET_CACHE_SCOPES, &params![job_id, text]).await?;
+    Ok(())
 }
 
 /// Sets job `job_id` up for `attempt`: waiting, with nothing left of
