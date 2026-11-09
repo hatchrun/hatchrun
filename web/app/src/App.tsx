@@ -12,6 +12,7 @@ import { useLoad } from "./load";
 import { Billing } from "./pages/Billing";
 import { CiRun } from "./pages/CiRun";
 import { Environments } from "./pages/Environments";
+import { Forks } from "./pages/Forks";
 import { Home } from "./pages/Home";
 import { Kit } from "./pages/Kit";
 import { Repositories } from "./pages/Repositories";
@@ -141,6 +142,8 @@ function OrgPage({ session, tenant, route }: { session: Session; tenant: Tenant;
       return <Environments {...props} />;
     case "audit":
       return <Audit {...props} />;
+    case "forks":
+      return <Forks {...props} />;
     case "kit":
       return <Kit {...props} />;
     case "setup":

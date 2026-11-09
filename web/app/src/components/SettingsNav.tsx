@@ -6,14 +6,19 @@ import { cn } from "@/lib/utils";
 import { orgUrl } from "@/lib/urls";
 import { Link } from "@/router";
 
-export type SettingsPage = "billing" | "setup" | "audit";
+export type SettingsPage = "billing" | "setup" | "forks" | "audit";
 
 /** The sub-navigation of /o/:org/settings/*: Billing, Setup and, for admins, the Audit log. */
 export function SettingsNav({ org, current, admin }: { org: string; current: SettingsPage; admin: boolean }) {
   const items: [SettingsPage, string][] = [
     ["billing", "Billing"],
     ["setup", "Setup"],
-    ...(admin ? ([["audit", "Audit log"]] as [SettingsPage, string][]) : []),
+    ...(admin
+      ? ([
+          ["forks", "Fork pull requests"],
+          ["audit", "Audit log"],
+        ] as [SettingsPage, string][])
+      : []),
   ];
   return (
     <nav aria-label="Settings" className="flex gap-4 border-b border-rule font-mono text-[13px]">

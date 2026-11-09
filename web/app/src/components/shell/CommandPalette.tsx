@@ -30,6 +30,7 @@ const PAGES = [
   { label: "Settings", path: "settings" },
   { label: "Billing", path: "settings/billing" },
   { label: "Setup", path: "settings/setup" },
+  { label: "Fork pull requests", path: "settings/forks" },
   { label: "Audit log", path: "settings/audit" },
 ];
 

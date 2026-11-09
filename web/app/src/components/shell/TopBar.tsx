@@ -28,7 +28,7 @@ export function orgNav(org: string): Item[] {
     { page: ["repositories", "repository", "run"], label: "Repositories", href: `${base}/repositories` },
     { page: ["secrets"], label: "Secrets", href: `${base}/secrets` },
     { page: ["environments"], label: "Environments", href: `${base}/environments` },
-    { page: ["billing", "setup", "audit"], label: "Settings", href: `${base}/settings/billing` },
+    { page: ["billing", "setup", "forks", "audit"], label: "Settings", href: `${base}/settings/billing` },
   ];
 }
 
