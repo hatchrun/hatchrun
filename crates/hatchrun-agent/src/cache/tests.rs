@@ -307,6 +307,74 @@ async fn a_refusal_of_the_control_plane_is_final() {
 }
 
 #[tokio::test]
+async fn a_failed_finalize_abandons_the_upload_and_is_not_retried() {
+    let server = cloud().await;
+    expect_upload(&server, "k").await;
+    Mock::given(method("POST"))
+        .and(path("/v1/cache/uploads/up-1/complete"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/cache/uploads/up-1"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let proxy = proxy(&server).await;
+    let url = create(&proxy, "k").await;
+    assert_eq!(azure_put(&url, "", b"hello").await.status(), 201);
+
+    let (status, body) = rpc(
+        &proxy,
+        "FinalizeCacheEntryUpload",
+        json!({ "key": "k", "version": "v1", "size_bytes": "5" }),
+    )
+    .await;
+    assert_eq!(status, 412, "{body}");
+    assert_eq!(body["code"], "failed_precondition");
+    // The upload is gone.
+    assert_eq!(finalize(&proxy, "k").await["ok"], false);
+}
+
+#[tokio::test]
+async fn a_finalize_that_overlaps_another_is_told_it_is_in_progress() {
+    let server = cloud().await;
+    expect_upload(&server, "k").await;
+    Mock::given(method("POST"))
+        .and(path("/v1/cache/uploads/up-1/complete"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(500)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let proxy = proxy(&server).await;
+    let url = create(&proxy, "k").await;
+    assert_eq!(azure_put(&url, "", b"hello").await.status(), 201);
+
+    let call = || {
+        rpc(
+            &proxy,
+            "FinalizeCacheEntryUpload",
+            json!({ "key": "k", "version": "v1", "size_bytes": "5" }),
+        )
+    };
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        call().await
+    };
+    let ((first, first_body), (second, second_body)) = tokio::join!(call(), second);
+    assert_eq!((first, first_body["ok"].clone()), (200, json!(true)));
+    assert_eq!(
+        (second, second_body["code"].as_str()),
+        (412, Some("failed_precondition"))
+    );
+    assert!(
+        second_body["msg"].as_str().unwrap().contains("in progress"),
+        "{second_body}"
+    );
+}
+
+#[tokio::test]
 async fn finalizing_an_unfinished_upload_abandons_it() {
     let server = cloud().await;
     expect_upload(&server, "k").await;

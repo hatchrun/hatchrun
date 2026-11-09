@@ -780,6 +780,11 @@ fn a_node_outside_the_mounted_paths_is_refused_in_a_container() {
     let bin = setup.path().join("hostbin");
     std::fs::create_dir(&bin).unwrap();
     std::fs::write(bin.join("node"), "").unwrap();
+    std::fs::set_permissions(
+        bin.join("node"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
     let mut doc = make::document(vec![uses("./act", &[])]);
     doc.job.container = Some(image("alpine"));
     let out = setup.run_with_path(&doc, &bin);

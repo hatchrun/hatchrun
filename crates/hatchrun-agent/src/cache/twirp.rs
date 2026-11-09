@@ -151,13 +151,15 @@ pub fn code_for(err: &anyhow::Error) -> (&'static str, Option<String>) {
     if err.downcast_ref::<JobEnded>().is_some() {
         return ("failed_precondition", None);
     }
-    // An answer of the control plane that cannot be read is a fault there,
-    // and asking again would get the same: not `unavailable`.
-    if err.chain().any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(reqwest::Error::is_decode)
-    }) {
+    // An answer of the control plane that arrived whole and is not what it
+    // promised (JSON that does not parse or fit) is a fault there, and
+    // asking again would get the same: not `unavailable`. A body that
+    // could not be read to its end, or a timeout, has no `serde_json`
+    // error in it and stays retryable.
+    if err
+        .chain()
+        .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+    {
         return ("failed_precondition", None);
     }
     let Some(refused) = err.downcast_ref::<Refused>() else {
@@ -174,13 +176,6 @@ pub fn code_for(err: &anyhow::Error) -> (&'static str, Option<String>) {
         400..=499 if refused.status != StatusCode::REQUEST_TIMEOUT => ("failed_precondition", None),
         _ => ("unavailable", None),
     }
-}
-
-/// Whether the client asking again may get a different answer (see
-/// [`code_for`]).
-#[must_use]
-pub fn is_retryable(err: &anyhow::Error) -> bool {
-    matches!(code_for(err).0, "unavailable" | "resource_exhausted")
 }
 
 /// A Twirp error body.

@@ -164,7 +164,10 @@ impl Job<'_> {
         // No `docker` command, or a configured one that is not there: no
         // Docker on this machine, so nothing to warn about, and no
         // containers either.
-        if !self.docker_bin().is_ok_and(|bin| bin.is_file()) {
+        if !self
+            .docker_bin()
+            .is_ok_and(|bin| crate::account::is_executable(&bin))
+        {
             return (loopback, None);
         }
         match self.docker_capture(&args, None).await {

@@ -36,7 +36,7 @@ use self::args::{Create, Health};
 use super::node::EXTERNALS;
 use super::sink::Sink;
 use super::{Job, Launch, Line, Ran, interp, random_name};
-use crate::account::DEFAULT_PATH;
+use crate::account::{DEFAULT_PATH, first_executable};
 use crate::envfile;
 use hatchrun_workflow::Conclusion;
 
@@ -133,17 +133,6 @@ struct Service {
     id: String,
     name: String,
     ports: BTreeMap<String, String>,
-}
-
-/// The first of `dirs` that holds an executable file called `name`: a
-/// file without execute permission, or a directory, is passed over.
-fn first_executable(name: &Path, dirs: &[PathBuf]) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    dirs.iter().map(|dir| dir.join(name)).find(|candidate| {
-        candidate
-            .metadata()
-            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-    })
 }
 
 impl Job<'_> {
@@ -1137,35 +1126,6 @@ fn remove_env_file(path: Option<&Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_first_executable_on_the_path_is_the_command() {
-        use std::os::unix::fs::PermissionsExt;
-        let make = |dir: &Path, mode: u32| {
-            let file = dir.join("podman");
-            std::fs::write(&file, "#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
-        };
-        let plain = tempfile::tempdir().unwrap();
-        let folder = tempfile::tempdir().unwrap();
-        let good = tempfile::tempdir().unwrap();
-        let later = tempfile::tempdir().unwrap();
-        make(plain.path(), 0o644);
-        std::fs::create_dir(folder.path().join("podman")).unwrap();
-        make(good.path(), 0o755);
-        make(later.path(), 0o755);
-        let dirs = [
-            plain.path().to_owned(),
-            folder.path().to_owned(),
-            good.path().to_owned(),
-            later.path().to_owned(),
-        ];
-        assert_eq!(
-            first_executable(Path::new("podman"), &dirs),
-            Some(good.path().join("podman"))
-        );
-        assert_eq!(first_executable(Path::new("docker"), &dirs), None);
-    }
 
     #[test]
     fn a_login_directory_alone_is_no_work_to_clean_up() {
