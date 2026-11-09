@@ -16,21 +16,24 @@ use hatchrun_cloud::db::{Db, params};
 use serde::Deserialize;
 use worker::Result;
 
+use super::NewAudit;
 use super::runs::{GateStatus, ListedRun, RUN_COLUMNS, RunRow};
 use super::with_columns;
-use crate::policy::{RepoPolicy, Waiting};
+use crate::policy::{APPROVAL_EXPIRES_MS, RepoPolicy, Waiting};
 
 /// The policy of repository `$1`.
 const POLICY: &str = "SELECT fork_runs, fork_approval, fork_max_running, fork_timeout_minutes \
      FROM ci_repo_policy WHERE repo_id = $1";
 
 /// Saves the policy of repository `$1`: fork runs `$2`, approval `$3`,
-/// running cap `$4`, timeout `$5`, at `$6`.
+/// running cap `$4`, timeout `$5`, at `$6`, returning the repository id
+/// for the audit row that goes in the same statement.
 const PUT_POLICY: &str = "INSERT INTO ci_repo_policy (repo_id, fork_runs, fork_approval, \
      fork_max_running, fork_timeout_minutes, updated_at) \
      VALUES ($1, $2, $3, $4, $5, $6) \
      ON CONFLICT (repo_id) DO UPDATE SET fork_runs = $2, fork_approval = $3, \
-     fork_max_running = $4, fork_timeout_minutes = $5, updated_at = $6";
+     fork_max_running = $4, fork_timeout_minutes = $5, updated_at = $6 \
+     RETURNING repo_id";
 
 /// What waits in repository `$1`, counted in groups (a pull request at a
 /// commit: one card, one decision), and how many pull requests of author
@@ -58,7 +61,7 @@ const SET_GATE_CHECK: &str = "UPDATE ci_runs SET gate_check_run_id = $2, gate_ca
 
 /// Marks (`$2` true) or unmarks the card of run `$1` as needing an update.
 const SET_CARD_DIRTY: &str = "UPDATE ci_runs SET gate_card_dirty = $2 \
-     WHERE id = $1 AND gate_status IN ('pending', 'deferred')";
+     WHERE id = $1 AND gate_check_run_id IS NOT NULL";
 
 /// The deferred runs of pull request `$2` of repository `$1` at `$3`: a
 /// group, admitted together.
@@ -67,56 +70,72 @@ const DEFERRED_GROUP: &str = "SELECT {columns} FROM ci_runs WHERE repo_id = $1 \
      AND status <> 'completed' ORDER BY id";
 
 /// Approves run `$1` of repository `$4` of tenant `$5` by `$2` at `$3`,
-/// if it waits (pending or deferred) and is not over.
+/// if it waits (pending or deferred), is not over, was created at or
+/// after `$6` (the approval has not expired), and its pull request is
+/// open at the run's commit. The card is marked to be settled.
 const APPROVE_RUN: &str = "UPDATE ci_runs SET gate_status = 'approved', gate_by = $2, \
-     gate_at = $3 WHERE id = $1 AND repo_id = $4 AND tenant_id = $5 \
+     gate_at = $3, gate_card_dirty = (gate_check_run_id IS NOT NULL) \
+     WHERE id = $1 AND repo_id = $4 AND tenant_id = $5 \
      AND gate_status IN ('pending', 'deferred') AND status <> 'completed' \
+     AND created_at >= $6 \
+     AND EXISTS (SELECT 1 FROM ci_pulls pl WHERE pl.repo_id = ci_runs.repo_id \
+       AND pl.number = ci_runs.pull_number AND pl.state = 'open' \
+       AND pl.head_sha = ci_runs.sha) \
      RETURNING {columns}";
 
 /// Rejects run `$1` of repository `$4` of tenant `$5` by `$2` at `$3`,
 /// if it waits.
 const REJECT_RUN: &str = "UPDATE ci_runs SET gate_status = 'cancelled', gate_by = $2, \
-     gate_at = $3 WHERE id = $1 AND repo_id = $4 AND tenant_id = $5 \
+     gate_at = $3, gate_card_dirty = (gate_check_run_id IS NOT NULL) WHERE id = $1 AND repo_id = $4 AND tenant_id = $5 \
      AND gate_status IN ('pending', 'deferred') RETURNING {columns}";
 
 /// Approves the pending run of repository `$1` of tenant `$5` whose
 /// approval is on check run `$2`, by `$3` at `$4`: a card is one run's,
-/// so a click approves exactly that run.
+/// so a click approves exactly that run. As for [`APPROVE_RUN`], not
+/// after the approval expired (`$6`) and only while the pull request is
+/// open at the run's commit.
 const APPROVE_BY_CHECK: &str = "UPDATE ci_runs SET gate_status = 'approved', gate_by = $3, \
-     gate_at = $4 WHERE repo_id = $1 AND tenant_id = $5 AND gate_check_run_id = $2 \
-     AND gate_status = 'pending' AND status <> 'completed' RETURNING {columns}";
+     gate_at = $4, gate_card_dirty = true WHERE repo_id = $1 AND tenant_id = $5 \
+     AND gate_check_run_id = $2 AND gate_status = 'pending' AND status <> 'completed' \
+     AND created_at >= $6 \
+     AND EXISTS (SELECT 1 FROM ci_pulls pl WHERE pl.repo_id = ci_runs.repo_id \
+       AND pl.number = ci_runs.pull_number AND pl.state = 'open' \
+       AND pl.head_sha = ci_runs.sha) RETURNING {columns}";
 
 /// Ends the wait of run `$1` with status `$2` by `$3` at `$4`.
-const END_GATE: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_at = $4 \
-     WHERE id = $1 AND gate_status IN ('pending', 'deferred') RETURNING {columns}";
+const END_GATE: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_at = $4, \
+     gate_card_dirty = (gate_check_run_id IS NOT NULL) WHERE id = $1 AND gate_status IN ('pending', 'deferred') RETURNING {columns}";
 
 /// Cancels the waiting runs of pull request `$2` of repository `$1`,
 /// except those at sha `$3` when it is set, by `$4` at `$5`.
-const END_PULL: &str = "UPDATE ci_runs SET gate_status = 'cancelled', gate_by = $4, gate_at = $5 \
-     WHERE repo_id = $1 AND pull_number = $2 AND gate_status IN ('pending', 'deferred') \
+const END_PULL: &str = "UPDATE ci_runs SET gate_status = 'cancelled', gate_by = $4, gate_at = $5, \
+     gate_card_dirty = (gate_check_run_id IS NOT NULL) WHERE repo_id = $1 AND pull_number = $2 AND gate_status IN ('pending', 'deferred') \
      AND ($3::text IS NULL OR sha <> $3::text) RETURNING {columns}";
 
 /// Expires up to `$3` runs that waited since before `$1`, at `$2`.
-const EXPIRE: &str = "UPDATE ci_runs SET gate_status = 'expired', gate_at = $2 WHERE id IN (\
+const EXPIRE: &str = "UPDATE ci_runs SET gate_status = 'expired', gate_at = $2, \
+       gate_card_dirty = (gate_check_run_id IS NOT NULL) WHERE id IN (\
        SELECT id FROM ci_runs WHERE gate_status IN ('pending', 'deferred') AND created_at < $1 \
        ORDER BY created_at, id LIMIT $3) AND gate_status IN ('pending', 'deferred') \
      RETURNING {columns}";
 
 /// The oldest deferred run of each group (a pull request at a commit),
-/// keeping the oldest `$3` of each author in each repository, and of
-/// those the oldest `$2` of each repository, so neither one repository
-/// nor one author, whose cap may block every group, can fill a pass;
-/// the oldest first, at most `$1`.
+/// looked at longest ago first (`gate_scanned_at`), keeping `$3` of each
+/// author in each repository, and of those `$2` of each repository, so
+/// neither one repository nor one author, whose cap may block every
+/// group, can fill a pass, and groups that cannot be admitted yet rotate
+/// behind the ones not looked at; at most `$1`.
 const DEFERRED: &str = "SELECT {columns} FROM (\
-       SELECT a.*, row_number() OVER (PARTITION BY repo_id ORDER BY created_at, id) AS rn_repo \
+       SELECT a.*, row_number() OVER (PARTITION BY repo_id \
+         ORDER BY gate_scanned_at, created_at, id) AS rn_repo \
        FROM (\
          SELECT g.*, row_number() OVER (PARTITION BY repo_id, author_login \
-           ORDER BY created_at, id) AS rn_author FROM (\
+           ORDER BY gate_scanned_at, created_at, id) AS rn_author FROM (\
            SELECT DISTINCT ON (repo_id, pull_number, sha) ci_runs.* FROM ci_runs \
            WHERE gate_status = 'deferred' AND status <> 'completed' \
            ORDER BY repo_id, pull_number, sha, created_at, id) g) a \
        WHERE rn_author <= $3) ci_runs \
-     WHERE rn_repo <= $2 ORDER BY created_at, id LIMIT $1";
+     WHERE rn_repo <= $2 ORDER BY gate_scanned_at, created_at, id LIMIT $1";
 
 /// Takes deferred run `$1` out of the queue: gate status `$2`, by `$3`
 /// at `$4`.
@@ -124,14 +143,32 @@ const ADMIT: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_at 
      WHERE id = $1 AND gate_status = 'deferred' RETURNING {columns}";
 
 /// The waiting runs created before `$1` that have no check run with the
-/// approve button, or whose card needs an update: the oldest `$3` of
-/// each repository, the oldest first, at most `$2`.
+/// approve button, or whose card needs an update, looked at longest ago
+/// first: `$3` of each repository, at most `$2`.
 const WITHOUT_CARD: &str = "SELECT {columns} FROM (\
-       SELECT ci_runs.*, row_number() OVER (PARTITION BY repo_id ORDER BY created_at, id) AS rn \
+       SELECT ci_runs.*, row_number() OVER (PARTITION BY repo_id \
+         ORDER BY gate_scanned_at, created_at, id) AS rn \
        FROM ci_runs WHERE gate_status IN ('pending', 'deferred') \
        AND (gate_check_run_id IS NULL OR gate_card_dirty) AND status <> 'completed' \
        AND created_at < $1) ci_runs \
-     WHERE rn <= $3 ORDER BY created_at, id LIMIT $2";
+     WHERE rn <= $3 ORDER BY gate_scanned_at, created_at, id LIMIT $2";
+
+/// Notes that the runs `$1` (a comma separated list of ids) were looked
+/// at in a scan at `$2`.
+const MARK_SCANNED: &str = "UPDATE ci_runs SET gate_scanned_at = $2 \
+     WHERE id = ANY (string_to_array($1, ',')::bigint[])";
+
+/// The decided runs whose end is not finished, looked at longest ago
+/// first: an expired or cancelled run that is not completed (its
+/// cancellation did not go through), and a decided run whose card still
+/// needs settling; `$2` of each repository, at most `$1`.
+const UNFINISHED: &str = "SELECT {columns} FROM (\
+       SELECT ci_runs.*, row_number() OVER (PARTITION BY repo_id \
+         ORDER BY gate_scanned_at, gate_at, id) AS rn FROM ci_runs \
+       WHERE (gate_status IN ('expired', 'cancelled') AND status <> 'completed') \
+          OR (gate_status IN ('approved', 'expired', 'cancelled') \
+              AND gate_check_run_id IS NOT NULL AND gate_card_dirty)) ci_runs \
+     WHERE rn <= $2 ORDER BY gate_scanned_at, gate_at, id LIMIT $1";
 
 /// The runs of the repositories `$2` of tenant `$1` that wait for an
 /// approval, the oldest first, at most `$3`.
@@ -153,24 +190,35 @@ pub async fn repo_policy(db: &Db, repo_id: u64, private: bool) -> Result<RepoPol
         .unwrap_or(RepoPolicy::default_for(private)))
 }
 
-/// Saves the policy of repository `repo_id`.
+/// Saves the policy of repository `repo_id` and records `audit` in the
+/// same statement: both happen or neither does, so a policy never takes
+/// effect unrecorded, and a failed audit never leaves the save looking
+/// as if it failed while it took.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn put_repo_policy(db: &Db, repo_id: u64, policy: &RepoPolicy, now: u64) -> Result<()> {
-    db.run(
-        PUT_POLICY,
-        &params![
-            repo_id,
-            policy.fork_runs.as_str(),
-            policy.fork_approval.as_str(),
-            policy.fork_max_running,
-            policy.fork_timeout_minutes,
-            now
-        ],
-    )
-    .await?;
+pub async fn put_repo_policy(
+    db: &Db,
+    repo_id: u64,
+    policy: &RepoPolicy,
+    now: u64,
+    audit: &NewAudit<'_>,
+) -> Result<()> {
+    let sql = format!(
+        "WITH saved AS ({PUT_POLICY}) {}",
+        NewAudit::insert_bound_sql(7, "saved")
+    );
+    let mut bound = params![
+        repo_id,
+        policy.fork_runs.as_str(),
+        policy.fork_approval.as_str(),
+        policy.fork_max_running,
+        policy.fork_timeout_minutes,
+        now
+    ];
+    bound.extend(audit.binds_with_target());
+    db.run(&sql, &bound).await?;
     Ok(())
 }
 
@@ -249,8 +297,10 @@ pub async fn deferred_group(db: &Db, repo_id: u64, number: u64, sha: &str) -> Re
 
 /// Approves run `run_id` of repository `repo_id` of `tenant_id` for
 /// `by`, whether it is pending or deferred. `None` when the run is not
-/// of that repository and tenant, or does not wait for a decision any
-/// more: someone decided first, or it expired.
+/// of that repository and tenant, does not wait for a decision any more
+/// (someone decided first, or it expired), its approval deadline has
+/// passed even though the reconciler has not expired it yet, or its pull
+/// request is not open at the run's commit.
 ///
 /// # Errors
 ///
@@ -265,7 +315,14 @@ pub async fn approve_run(
 ) -> Result<Option<RunRow>> {
     db.first(
         &with_columns(APPROVE_RUN, RUN_COLUMNS),
-        &params![run_id, by, now, repo_id, tenant_id],
+        &params![
+            run_id,
+            by,
+            now,
+            repo_id,
+            tenant_id,
+            now.saturating_sub(APPROVAL_EXPIRES_MS)
+        ],
     )
     .await
 }
@@ -307,7 +364,14 @@ pub async fn approve_by_check(
 ) -> Result<Vec<RunRow>> {
     db.all(
         &with_columns(APPROVE_BY_CHECK, RUN_COLUMNS),
-        &params![repo_id, check_run_id, by, now, tenant_id],
+        &params![
+            repo_id,
+            check_run_id,
+            by,
+            now,
+            tenant_id,
+            now.saturating_sub(APPROVAL_EXPIRES_MS)
+        ],
     )
     .await
 }
@@ -446,6 +510,36 @@ pub async fn pending_gate_runs(
     db.all(
         &with_columns(WAITING_RUNS, super::runs::LISTED_COLUMNS),
         &params![tenant, ids.join(","), limit],
+    )
+    .await
+}
+
+/// Notes that `run_ids` were looked at in a bounded scan at `now`, so
+/// the next scan takes the ones looked at longest ago first.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn mark_scanned(db: &Db, run_ids: &[u64], now: u64) -> Result<()> {
+    if run_ids.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = run_ids.iter().map(u64::to_string).collect();
+    db.run(MARK_SCANNED, &params![ids.join(","), now]).await?;
+    Ok(())
+}
+
+/// The decided runs whose end is not finished (see [`UNFINISHED`]): the
+/// reconciler cancels them again and settles their cards. `per_repo` of
+/// each repository, at most `limit`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn unfinished_decisions(db: &Db, limit: u32, per_repo: u32) -> Result<Vec<RunRow>> {
+    db.all(
+        &with_columns(UNFINISHED, RUN_COLUMNS),
+        &params![limit, per_repo],
     )
     .await
 }

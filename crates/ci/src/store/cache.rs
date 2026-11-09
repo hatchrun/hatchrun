@@ -123,16 +123,20 @@ const EVICT_IDLE: &str = "DELETE FROM ci_cache_entries WHERE id IN (\
           OR (finalized_at IS NULL AND created_at < $2)) \
      RETURNING {columns}";
 
-/// Deletes and returns the finalized entries of repository `$2` of
-/// tenant `$1` that do not fit in `$3` bytes when the most recently used
-/// are kept first, the least recently used first, at most `$4`. An entry
-/// larger than the cap does not fit alone.
+/// Deletes and returns the finalized entries saved by trusted runs of
+/// repository `$2` of tenant `$1` that do not fit in `$3` bytes when the
+/// most recently used are kept first, the least recently used first, at
+/// most `$4`. An entry larger than the cap does not fit alone. Entries
+/// fork runs saved are not counted and never evicted here: they have
+/// their own share (see [`EVICT_FORK_OVER_QUOTA`]), so a flood of them
+/// cannot push a base or default branch entry out.
 const EVICT_OVER_QUOTA: &str = "DELETE FROM ci_cache_entries WHERE id IN (\
        SELECT id FROM (\
          SELECT id, last_accessed_at, \
            sum(size) OVER (ORDER BY last_accessed_at DESC, id DESC) AS kept \
          FROM ci_cache_entries \
-         WHERE tenant_id = $1 AND repo_id = $2 AND finalized_at IS NOT NULL) AS ranked \
+         WHERE tenant_id = $1 AND repo_id = $2 AND finalized_at IS NOT NULL \
+           AND trust = 'trusted') AS ranked \
        WHERE kept > $3 ORDER BY last_accessed_at, id LIMIT $4) \
      RETURNING {columns}";
 

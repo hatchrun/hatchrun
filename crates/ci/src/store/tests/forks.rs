@@ -28,7 +28,28 @@ fn fork_run(
     new.author_login = author.into();
     new.author_association = "FIRST_TIME_CONTRIBUTOR".into();
     new.gate_status = gate;
-    db.wait(insert_run(db.db(), &new)).unwrap().unwrap()
+    let run = db.wait(insert_run(db.db(), &new)).unwrap().unwrap();
+    // The webhook records the pull request before it makes the runs; a
+    // run is approved only while its pull request is open at its commit.
+    // A constant time lets a later call for the same pull request win.
+    db.wait(upsert_pull(
+        db.db(),
+        &NewPull {
+            repo_id: 7,
+            number,
+            title: "change".into(),
+            head_ref: "feature".into(),
+            base_ref: "main".into(),
+            author: author.into(),
+            author_association: "FIRST_TIME_CONTRIBUTOR".into(),
+            head_repo_id: Some(99),
+            head_sha: sha.into(),
+            state: "open".into(),
+            updated_at: 5_000_000,
+        },
+    ))
+    .unwrap();
+    run
 }
 
 #[test]
@@ -72,6 +93,62 @@ fn a_run_keeps_its_trust_origin_and_gate() {
     assert_eq!(gate, "none");
 }
 
+fn audit(now: u64) -> NewAudit<'static> {
+    NewAudit {
+        tenant: "t1",
+        actor: "admin",
+        action: Action::ForkPolicyPut,
+        scope: "repo",
+        repo: Some("acme/app"),
+        target: "acme/app",
+        now,
+    }
+}
+
+fn audit_rows(db: &TestDb) -> u64 {
+    db.column(
+        "SELECT count(*)::bigint AS n FROM ci_audit WHERE action = 'fork_policy.put'",
+        &[],
+        "n",
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_policy_and_its_audit_row_are_saved_together_or_not_at_all() {
+    let db = setup();
+    let policy = RepoPolicy::default_for(false);
+    db.wait(put_repo_policy(db.db(), 7, &policy, 5, &audit(5)))
+        .unwrap();
+    assert_eq!(audit_rows(&db), 1);
+    // A policy the table refuses leaves no audit row behind.
+    let bad = RepoPolicy {
+        fork_max_running: 11,
+        ..policy
+    };
+    assert!(
+        db.wait(put_repo_policy(db.db(), 7, &bad, 6, &audit(6)))
+            .is_err()
+    );
+    assert_eq!(audit_rows(&db), 1);
+    assert_eq!(db.wait(repo_policy(db.db(), 7, false)).unwrap(), policy);
+    // An audit row the table refuses (an unknown tenant) undoes the
+    // policy write too.
+    let stranger = NewAudit {
+        tenant: "nobody",
+        ..audit(7)
+    };
+    let changed = RepoPolicy {
+        fork_max_running: 5,
+        ..policy
+    };
+    assert!(
+        db.wait(put_repo_policy(db.db(), 7, &changed, 7, &stranger))
+            .is_err()
+    );
+    assert_eq!(db.wait(repo_policy(db.db(), 7, false)).unwrap(), policy);
+}
+
 #[test]
 fn a_repository_without_a_policy_row_has_the_defaults() {
     let db = setup();
@@ -91,14 +168,16 @@ fn a_saved_policy_wins_over_the_defaults_and_can_be_changed() {
         fork_max_running: 4,
         fork_timeout_minutes: 15,
     };
-    db.wait(put_repo_policy(db.db(), 7, &policy, 5)).unwrap();
+    db.wait(put_repo_policy(db.db(), 7, &policy, 5, &audit(5)))
+        .unwrap();
     // Even for a private repository, the saved row decides.
     assert_eq!(db.wait(repo_policy(db.db(), 7, true)).unwrap(), policy);
     let lower = RepoPolicy {
         fork_approval: ForkApproval::FirstTimers,
         ..policy
     };
-    db.wait(put_repo_policy(db.db(), 7, &lower, 6)).unwrap();
+    db.wait(put_repo_policy(db.db(), 7, &lower, 6, &audit(6)))
+        .unwrap();
     assert_eq!(db.wait(repo_policy(db.db(), 7, false)).unwrap(), lower);
 }
 
@@ -109,7 +188,10 @@ fn out_of_range_policy_numbers_are_refused_by_the_table() {
         fork_max_running: 11,
         ..RepoPolicy::default_for(false)
     };
-    assert!(db.wait(put_repo_policy(db.db(), 7, &bad, 1)).is_err());
+    assert!(
+        db.wait(put_repo_policy(db.db(), 7, &bad, 1, &audit(1)))
+            .is_err()
+    );
 }
 
 #[test]
@@ -493,6 +575,7 @@ fn a_pull_request_row_keeps_its_authors_association_and_head_repository() {
         author: "mallory".into(),
         author_association: "FIRST_TIMER".into(),
         head_repo_id: Some(99),
+        head_sha: "abc".into(),
         state: "open".into(),
         updated_at: 10,
     };
@@ -755,10 +838,10 @@ fn a_card_that_could_not_be_updated_keeps_its_id_and_is_found_for_refresh() {
         .wait(approve_by_check(db.db(), "t1", 7, 5150, "m", 20))
         .unwrap();
     assert_eq!(approved.len(), 1);
-    // A decided run is never marked.
-    db.wait(set_card_dirty(db.db(), run.id, true)).unwrap();
+    // The approval marked the card to be settled in its own statement,
+    // and a mark is cleared only once the card was.
     let read = db.wait(super::run(db.db(), run.id)).unwrap().unwrap();
-    assert!(!read.gate_card_dirty);
+    assert!(read.gate_card_dirty);
 }
 
 fn second_repo(db: &TestDb) {
@@ -898,4 +981,276 @@ fn a_run_with_no_pull_request_is_not_counted_as_a_group() {
     );
     let waiting = db.wait(fork_waiting(db.db(), 7, "nobody", None)).unwrap();
     assert_eq!(waiting.pending, 1);
+}
+
+use crate::policy::APPROVAL_EXPIRES_MS;
+
+#[test]
+fn an_approval_after_the_deadline_is_refused_even_before_the_reconciler_expires_the_run() {
+    let db = setup();
+    // Created at 1: the deadline is 1 + the approval time.
+    let run = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 1);
+    let other = fork_run(&db, "b", 2, "s2", "mallory", GateStatus::Pending, 1);
+    db.wait(set_gate_check(db.db(), other.id, 5150)).unwrap();
+    let late = APPROVAL_EXPIRES_MS + 2;
+    assert!(
+        db.wait(approve_run(db.db(), "t1", 7, run.id, "m", late))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db.wait(approve_by_check(db.db(), "t1", 7, 5150, "m", late))
+            .unwrap()
+            .len(),
+        0,
+        "the check run's button is held to the same deadline"
+    );
+    // On time, both work.
+    let on_time = APPROVAL_EXPIRES_MS + 1;
+    assert!(
+        db.wait(approve_run(db.db(), "t1", 7, run.id, "m", on_time))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        db.wait(approve_by_check(db.db(), "t1", 7, 5150, "m", on_time))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_run_is_approved_only_while_its_pull_request_is_open_at_its_commit() {
+    let db = setup();
+    let closed = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 1);
+    let moved = fork_run(&db, "b", 2, "s2", "mallory", GateStatus::Pending, 1);
+    let live = fork_run(&db, "c", 3, "s3", "mallory", GateStatus::Pending, 1);
+    db.wait(set_gate_check(db.db(), closed.id, 5150)).unwrap();
+    db.wait(set_gate_check(db.db(), moved.id, 5151)).unwrap();
+    // The pull request closed, and another advanced to a newer commit,
+    // before their webhooks cancelled the old runs.
+    db.run("UPDATE ci_pulls SET state = 'closed' WHERE number = 1", &[]);
+    db.run(
+        "UPDATE ci_pulls SET head_sha = 'newer' WHERE number = 2",
+        &[],
+    );
+    for run in [&closed, &moved] {
+        assert!(
+            db.wait(approve_run(db.db(), "t1", 7, run.id, "m", 10))
+                .unwrap()
+                .is_none()
+        );
+    }
+    for check in [5150, 5151] {
+        assert_eq!(
+            db.wait(approve_by_check(db.db(), "t1", 7, check, "m", 10))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+    assert!(
+        db.wait(approve_run(db.db(), "t1", 7, live.id, "m", 10))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn a_delivery_older_than_the_recorded_pull_request_does_not_apply() {
+    let db = setup();
+    let mut pull = NewPull {
+        repo_id: 7,
+        number: 9,
+        title: "t".into(),
+        head_ref: "f".into(),
+        base_ref: "main".into(),
+        author: "mallory".into(),
+        author_association: "FIRST_TIMER".into(),
+        head_repo_id: Some(99),
+        head_sha: "B".into(),
+        state: "open".into(),
+        updated_at: 200,
+    };
+    assert!(db.wait(upsert_pull(db.db(), &pull)).unwrap());
+    // The delivery for the older commit A arrives late.
+    pull.head_sha = "A".into();
+    pull.updated_at = 100;
+    assert!(!db.wait(upsert_pull(db.db(), &pull)).unwrap());
+    let head: String = db
+        .column(
+            "SELECT head_sha AS h FROM ci_pulls WHERE number = 9",
+            &[],
+            "h",
+        )
+        .unwrap();
+    assert_eq!(head, "B", "the newer commit stays the head");
+    // The same time (a redelivery) and a newer one apply.
+    pull.head_sha = "B".into();
+    pull.updated_at = 200;
+    assert!(db.wait(upsert_pull(db.db(), &pull)).unwrap());
+    pull.head_sha = "C".into();
+    pull.updated_at = 300;
+    assert!(db.wait(upsert_pull(db.db(), &pull)).unwrap());
+}
+
+#[test]
+fn a_run_that_ends_while_it_waits_ends_its_gate_and_frees_its_slot() {
+    let db = setup();
+    let pending = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 1);
+    let deferred = fork_run(&db, "b", 2, "s2", "mallory", GateStatus::Deferred, 2);
+    let approved = fork_run(&db, "c", 3, "s3", "mallory", GateStatus::Pending, 3);
+    let bare = fork_run(&db, "d", 4, "s4", "mallory", GateStatus::Pending, 4);
+    let own = db
+        .wait(insert_run(db.db(), &new_run("push", "ci", 5)))
+        .unwrap()
+        .unwrap();
+    db.wait(set_gate_check(db.db(), pending.id, 5150)).unwrap();
+    db.wait(approve_run(db.db(), "t1", 7, approved.id, "m", 6))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.wait(fork_waiting(db.db(), 7, "x", None))
+            .unwrap()
+            .pending,
+        2
+    );
+    // The run is cancelled: its object finishes it.
+    for run in [&pending, &deferred, &approved, &bare, &own] {
+        db.wait(finish_run(db.db(), run.id, 1, "cancelled", 20))
+            .unwrap();
+    }
+    let read = |id| db.wait(super::run(db.db(), id)).unwrap().unwrap();
+    let gone = read(pending.id);
+    assert_eq!(gone.status, "completed");
+    assert_eq!(gone.gate_status, GateStatus::Cancelled);
+    assert_eq!(gone.gate_at, Some(20));
+    assert!(gone.gate_card_dirty, "its card is to be settled");
+    assert_eq!(read(deferred.id).gate_status, GateStatus::Cancelled);
+    assert!(!read(bare.id).gate_card_dirty, "no card, nothing to settle");
+    assert_eq!(read(bare.id).gate_status, GateStatus::Cancelled);
+    // An approved run keeps its approval, and the repository's own run
+    // has none.
+    assert_eq!(read(approved.id).gate_status, GateStatus::Approved);
+    assert_eq!(read(own.id).gate_status, GateStatus::NotGated);
+    // The slots are free: nothing waits.
+    let waiting = db.wait(fork_waiting(db.db(), 7, "x", None)).unwrap();
+    assert_eq!((waiting.pending, waiting.deferred), (0, 0));
+    // The button of the cancelled run no longer approves it.
+    assert_eq!(
+        db.wait(approve_by_check(db.db(), "t1", 7, 5150, "m", 30))
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn a_decision_marks_its_card_to_be_settled_and_the_reconciler_finds_it() {
+    let db = setup();
+    let rejected = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 1);
+    let approved = fork_run(&db, "b", 2, "s2", "mallory", GateStatus::Pending, 1);
+    let plain = fork_run(&db, "c", 3, "s3", "mallory", GateStatus::Pending, 1);
+    let expired = fork_run(&db, "d", 4, "s4", "mallory", GateStatus::Pending, 1);
+    for (run, card) in [
+        (&rejected, 5150),
+        (&approved, 5151),
+        (&plain, 5152),
+        (&expired, 5153),
+    ] {
+        db.wait(set_gate_check(db.db(), run.id, card)).unwrap();
+    }
+    db.wait(reject_run(db.db(), "t1", 7, rejected.id, "m", 5))
+        .unwrap()
+        .unwrap();
+    db.wait(approve_run(db.db(), "t1", 7, approved.id, "m", 5))
+        .unwrap()
+        .unwrap();
+    // The oldest waiting run expires.
+    let ended = db.wait(expire_gates(db.db(), 10, 6, 1)).unwrap();
+    assert_eq!(ended[0].id, plain.id);
+    // Nobody settled the cards: all are found, whichever way they were
+    // decided; a run that ended is cancelled again until it completes.
+    let found = db.wait(unfinished_decisions(db.db(), 10, 10)).unwrap();
+    let mut ids: Vec<u64> = found.iter().map(|run| run.id).collect();
+    ids.sort_unstable();
+    let mut want = vec![rejected.id, approved.id, plain.id];
+    want.sort_unstable();
+    assert!(
+        want.iter().all(|id| ids.contains(id)),
+        "{ids:?} should hold {want:?}"
+    );
+    assert!(
+        !ids.contains(&expired.id),
+        "a waiting run is not a decision"
+    );
+    // Settled: the mark is cleared. A rejected run whose object has not
+    // completed it is still found, and is not once it completed.
+    for run in [&rejected, &approved, &plain] {
+        db.wait(set_card_dirty(db.db(), run.id, false)).unwrap();
+    }
+    let found = db.wait(unfinished_decisions(db.db(), 10, 10)).unwrap();
+    let ids: Vec<u64> = found.iter().map(|run| run.id).collect();
+    assert!(ids.contains(&rejected.id), "its run is not completed");
+    assert!(!ids.contains(&approved.id));
+    db.wait(finish_run(db.db(), rejected.id, 1, "cancelled", 50))
+        .unwrap();
+    db.wait(finish_run(db.db(), plain.id, 1, "cancelled", 50))
+        .unwrap();
+    // The run that still waited is cancelled too, which ends its gate
+    // and marks its card: settled in turn.
+    db.wait(finish_run(db.db(), expired.id, 1, "cancelled", 50))
+        .unwrap();
+    db.wait(set_card_dirty(db.db(), expired.id, false)).unwrap();
+    assert_eq!(
+        db.wait(unfinished_decisions(db.db(), 10, 10))
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn blocked_groups_rotate_behind_the_ones_not_looked_at_yet() {
+    let db = setup();
+    // Four deferred groups of one repository; a pass takes two.
+    let runs: Vec<RunRow> = (0..4)
+        .map(|n| {
+            fork_run(
+                &db,
+                &format!("d{n}"),
+                n + 1,
+                "s",
+                &format!("user{n}"),
+                GateStatus::Deferred,
+                10 + n,
+            )
+        })
+        .collect();
+    let first = db.wait(deferred_runs(db.db(), 10, 2, 5)).unwrap();
+    let ids: Vec<u64> = first.iter().map(|run| run.id).collect();
+    assert_eq!(ids, [runs[0].id, runs[1].id]);
+    db.wait(mark_scanned(db.db(), &ids, 100)).unwrap();
+    // The two that stayed blocked rotate behind the two never looked at.
+    let second = db.wait(deferred_runs(db.db(), 10, 2, 5)).unwrap();
+    let ids: Vec<u64> = second.iter().map(|run| run.id).collect();
+    assert_eq!(ids, [runs[2].id, runs[3].id]);
+    db.wait(mark_scanned(db.db(), &ids, 200)).unwrap();
+    let third = db.wait(deferred_runs(db.db(), 10, 2, 5)).unwrap();
+    let ids: Vec<u64> = third.iter().map(|run| run.id).collect();
+    assert_eq!(ids, [runs[0].id, runs[1].id], "round again");
+    // The same for the cards that are still to be made.
+    db.run("UPDATE ci_runs SET gate_scanned_at = 0", &[]);
+    let first = db.wait(runs_needing_card(db.db(), 10_000, 10, 2)).unwrap();
+    let ids: Vec<u64> = first.iter().map(|run| run.id).collect();
+    assert_eq!(ids.len(), 2);
+    db.wait(mark_scanned(db.db(), &ids, 300)).unwrap();
+    let second = db.wait(runs_needing_card(db.db(), 10_000, 10, 2)).unwrap();
+    let again: Vec<u64> = second.iter().map(|run| run.id).collect();
+    assert!(
+        again.iter().all(|id| !ids.contains(id)),
+        "{again:?} vs {ids:?}"
+    );
+    db.wait(mark_scanned(db.db(), &[], 1)).unwrap();
 }

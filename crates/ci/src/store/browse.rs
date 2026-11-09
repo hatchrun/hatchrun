@@ -33,6 +33,8 @@ pub struct NewPull {
     pub author_association: String,
     /// The repository the head is in; `None` for a deleted fork.
     pub head_repo_id: Option<u64>,
+    /// The head commit.
+    pub head_sha: String,
     /// `open`, `closed` or `merged`.
     pub state: String,
     /// When GitHub last changed the pull request, in Unix milliseconds.
@@ -42,39 +44,44 @@ pub struct NewPull {
 
 /// Records pull request `$2` of repository `$1` as it stands: title
 /// `$3`, head `$4`, base `$5`, author `$6`, state `$7`, as of GitHub's
-/// time `$8`, the author's association `$9` and the head repository
-/// `$10`. A delivery older than the row leaves it alone.
+/// time `$8`, the author's association `$9`, the head repository `$10`
+/// and the head commit `$11`. A delivery older than the row leaves it
+/// alone.
 const UPSERT_PULL: &str = "INSERT INTO ci_pulls \
      (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at, \
-      author_association, head_repo_id) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10::bigint) \
+      author_association, head_repo_id, head_sha) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10::bigint, $11) \
      ON CONFLICT (repo_id, number) DO UPDATE SET title = $3, head_ref = $4, base_ref = $5, \
      author = $6, state = $7, updated_at = $8, author_association = $9, \
-     head_repo_id = $10::bigint WHERE ci_pulls.updated_at <= $8";
+     head_repo_id = $10::bigint, head_sha = $11 WHERE ci_pulls.updated_at <= $8";
 
-/// Records the state of a pull request.
+/// Records the state of a pull request. Returns whether the delivery
+/// applied: `false` for one older than what is recorded, which says
+/// nothing about the pull request as it stands now.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn upsert_pull(db: &Db, pull: &NewPull) -> Result<()> {
-    db.run(
-        UPSERT_PULL,
-        &params![
-            pull.repo_id,
-            pull.number,
-            &pull.title,
-            &pull.head_ref,
-            &pull.base_ref,
-            &pull.author,
-            &pull.state,
-            pull.updated_at,
-            &pull.author_association,
-            pull.head_repo_id
-        ],
-    )
-    .await?;
-    Ok(())
+pub async fn upsert_pull(db: &Db, pull: &NewPull) -> Result<bool> {
+    let changed = db
+        .run(
+            UPSERT_PULL,
+            &params![
+                pull.repo_id,
+                pull.number,
+                &pull.title,
+                &pull.head_ref,
+                &pull.base_ref,
+                &pull.author,
+                &pull.state,
+                pull.updated_at,
+                &pull.author_association,
+                pull.head_repo_id,
+                &pull.head_sha
+            ],
+        )
+        .await?;
+    Ok(changed == 1)
 }
 
 /// What a repository page counts.

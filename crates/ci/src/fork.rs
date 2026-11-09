@@ -110,6 +110,16 @@ pub struct Card {
     pub repo: String,
 }
 
+/// The most files the card reads: three pages of a hundred.
+const FILES_READ: usize = FILE_PAGES as usize * 100;
+
+/// Whether the file list may stop before the pull request's last file: it
+/// holds all the pages the card reads.
+#[must_use]
+pub const fn files_cut(files: &[String]) -> bool {
+    files.len() >= FILES_READ
+}
+
 /// Whether the changed `files` include the config: the line that
 /// matters most to an approver, since the pull request's own workflow
 /// is what would run.
@@ -158,7 +168,18 @@ fn summary(card: &Card) -> String {
     );
     match &card.files {
         Some(files) => {
-            let _ = writeln!(text, "- Files changed: {}", files.len());
+            if files_cut(files) {
+                // The list stops at the pages read: the count is a lower
+                // bound, and the config may be past it.
+                let _ = writeln!(
+                    text,
+                    "- Files changed: at least {}, the list is cut, so [read the full diff]({files_url}) \
+                     for changes to `{CONFIG_PATH}`",
+                    files.len()
+                );
+            } else {
+                let _ = writeln!(text, "- Files changed: {}", files.len());
+            }
             if changes_config(files) {
                 let _ = writeln!(
                     text,
@@ -518,7 +539,26 @@ pub async fn after_approval(
             Err(err) => console_error!("run {}: find held jobs: {err}", run.id),
         }
         let check = decided_check_run(&run.workflow, run.run_number, &approved_message(by));
-        update_card(tokens, settings, repo, run, &check).await;
+        settle_decided(db, tokens, settings, repo, run, &check).await;
+    }
+}
+
+/// Brings the card of a decided `run` to `check`. The decision marked the
+/// card to be settled in the same statement; the mark is cleared once
+/// GitHub took the update, and kept otherwise for the reconciler.
+async fn settle_decided(
+    db: &Db,
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    settings: &Settings,
+    repo: &RepoRow,
+    run: &RunRow,
+    check: &CheckRun,
+) {
+    if run.gate_check_run_id.is_some()
+        && update_card(tokens, settings, repo, run, check).await
+        && let Err(err) = store::set_card_dirty(db, run.id, false).await
+    {
+        console_error!("run {}: clear the card mark: {err}", run.id);
     }
 }
 
@@ -526,6 +566,7 @@ pub async fn after_approval(
 /// expired, closed): cancels them and marks the card with `message`.
 pub async fn after_end(
     env: &Env,
+    db: &Db,
     settings: &Settings,
     tokens: &Tokens<'_, Kv, App, Counted>,
     repo: &RepoRow,
@@ -537,7 +578,7 @@ pub async fn after_end(
             console_error!("run {}: cancel after {message}: {err}", run.id);
         }
         let check = decided_check_run(&run.workflow, run.run_number, message);
-        update_card(tokens, settings, repo, run, &check).await;
+        settle_decided(db, tokens, settings, repo, run, &check).await;
     }
 }
 
@@ -568,6 +609,7 @@ pub async fn sweep(
         if let Some(repo) = found {
             after_end(
                 env,
+                db,
                 settings,
                 tokens,
                 &repo,
@@ -577,21 +619,33 @@ pub async fn sweep(
             .await;
         }
     }
-    // The oldest groups of each repository and of each author in it: a
-    // group the author's cap blocks is skipped and the next is taken.
-    for run in store::deferred_runs(db, PASS, PER_REPO, PER_AUTHOR)
+    // Decisions whose end did not finish (a cancellation or a card update
+    // that failed, or a repository lookup that failed above) are finished.
+    changed += finish_decisions(env, db, settings, tokens, now).await?;
+    // The groups of each repository and of each author in it, those
+    // looked at longest ago first: a group the author's cap blocks is
+    // skipped, and rotates behind the ones not looked at yet.
+    let deferred = store::deferred_runs(db, PASS, PER_REPO, PER_AUTHOR)
         .await
-        .map_err(|err| err.to_string())?
-    {
+        .map_err(|err| err.to_string())?;
+    let ids: Vec<u64> = deferred.iter().map(|run| run.id).collect();
+    store::mark_scanned(db, &ids, now)
+        .await
+        .map_err(|err| err.to_string())?;
+    for run in deferred {
         changed += admit(env, db, settings, tokens, &run, now).await?;
     }
     // A card a delivery never finished, or that could not be updated, is
     // made or updated here, so the approve button always exists.
     let stale = now.saturating_sub(CARD_GRACE_MS);
-    for run in store::runs_needing_card(db, stale, PASS, PER_REPO)
+    let needing = store::runs_needing_card(db, stale, PASS, PER_REPO)
         .await
-        .map_err(|err| err.to_string())?
-    {
+        .map_err(|err| err.to_string())?;
+    let ids: Vec<u64> = needing.iter().map(|run| run.id).collect();
+    store::mark_scanned(db, &ids, now)
+        .await
+        .map_err(|err| err.to_string())?;
+    for run in needing {
         let Some(repo) = store::repo(db, run.repo_id)
             .await
             .map_err(|err| err.to_string())?
@@ -606,6 +660,44 @@ pub async fn sweep(
         }
     }
     Ok(changed)
+}
+
+/// Finishes the end of decided runs: cancels an expired or cancelled run
+/// that is not completed (asking its object again is safe), and settles
+/// a decided run's card that is still marked. Returns how many it
+/// touched.
+async fn finish_decisions(
+    env: &Env,
+    db: &Db,
+    settings: &Settings,
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    now: u64,
+) -> Result<u32, String> {
+    let runs = store::unfinished_decisions(db, 20, PER_REPO)
+        .await
+        .map_err(|err| err.to_string())?;
+    let ids: Vec<u64> = runs.iter().map(|run| run.id).collect();
+    store::mark_scanned(db, &ids, now)
+        .await
+        .map_err(|err| err.to_string())?;
+    for run in &runs {
+        let message = decided_message(run).unwrap_or_else(|| "Cancelled".to_owned());
+        if matches!(run.gate_status, GateStatus::Expired | GateStatus::Cancelled)
+            && run.status != "completed"
+            && let Err(err) = cancel_run(env, run, &message).await
+        {
+            console_error!("run {}: cancel the decided run: {err}", run.id);
+        }
+        if run.gate_card_dirty
+            && let Some(repo) = store::repo(db, run.repo_id)
+                .await
+                .map_err(|err| err.to_string())?
+        {
+            let check = decided_check_run(&run.workflow, run.run_number, &message);
+            settle_decided(db, tokens, settings, &repo, run, &check).await;
+        }
+    }
+    Ok(count(runs.len()))
 }
 
 /// The most runs of one repository a reconciler pass looks at in each
@@ -927,7 +1019,7 @@ async fn admit(
                         .map_err(|err| err.to_string())?,
                 );
             }
-            after_end(env, settings, tokens, &repo, &ended, FORK_RUNS_OFF).await;
+            after_end(env, db, settings, tokens, &repo, &ended, FORK_RUNS_OFF).await;
             return Ok(count(ended.len()));
         }
         crate::policy::Admission::Deferred | crate::policy::Admission::Drop => return Ok(0),
@@ -1156,6 +1248,30 @@ mod tests {
         assert!(summary.contains("https://github.com/octo/widgets/pull/7/files"));
         assert!(changes_config(&[".hatchrun/config.yml".to_owned()]));
         assert!(!changes_config(&["docs/.hatchrun/config.yml".to_owned()]));
+    }
+
+    #[test]
+    fn a_full_file_list_is_a_lower_bound_with_a_link_to_the_diff() {
+        let names = |n: usize| -> Vec<String> { (0..n).map(|i| format!("f{i}")).collect() };
+        let summary = |n: usize| {
+            let c = Card {
+                files: Some(names(n)),
+                ..card(None)
+            };
+            approval_check_run(&c).output.unwrap().summary
+        };
+        // Three full pages may stop before the last file, and the config
+        // may be past it.
+        let cut = summary(300);
+        assert!(cut.contains("Files changed: at least 300"), "{cut}");
+        assert!(cut.contains("https://github.com/octo/widgets/pull/7/files"));
+        assert!(cut.contains(".hatchrun/config.yml"));
+        assert!(files_cut(&names(300)));
+        // One short of that is the whole list.
+        let whole = summary(299);
+        assert!(whole.contains("Files changed: 299"), "{whole}");
+        assert!(!whole.contains("at least"));
+        assert!(!files_cut(&names(299)));
     }
 
     #[test]

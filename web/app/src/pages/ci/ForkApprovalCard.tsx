@@ -24,12 +24,41 @@ const WHO: Record<string, string> = {
  * and Reject for anyone who can write to the repository (the server
  * decides). Once decided it folds to one line with who decided.
  */
-export function ForkApprovalCard({ run, session, reload }: { run: CiRun; session: Session | null; reload: () => void }) {
+export function ForkApprovalCard({
+  run,
+  session,
+  access,
+  reload,
+}: {
+  run: CiRun;
+  session: Session | null;
+  /** What the viewer may do in the repository: only a writer decides. */
+  access: "read" | "write" | "admin";
+  reload: () => void;
+}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { fork, gate } = run;
-  if (fork === null || gate === null) {
+  if (fork === null) {
     return null;
+  }
+  if (gate === null) {
+    // The author needed no approval: the run is still a fork's, and its
+    // results and artifacts say where they came from.
+    return (
+      <section aria-label="Fork pull request" className="flex flex-wrap items-center gap-x-5 gap-y-1 rounded-md border border-rule bg-panel px-3 py-2 font-mono text-[13px]">
+        <span className="cap shrink-0">Fork pull request</span>
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="cap">author</span>
+          <Truncate value={fork.author} className="text-fg" />
+        </span>
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="cap">head</span>
+          <Truncate value={fork.head_repo ?? "a deleted fork"} className="text-fg" />
+        </span>
+        <span className="text-fg-3">No secrets, no write token, no OIDC token, no environment.</span>
+      </section>
+    );
   }
   const pending = gate.status === "pending" || gate.status === "deferred";
 
@@ -76,7 +105,7 @@ export function ForkApprovalCard({ run, session, reload }: { run: CiRun; session
           )}
         </div>
         {pending &&
-          (session ? (
+          (session && access !== "read" ? (
             <div className="flex items-center gap-2">
               <button type="button" className={BTN_PRIMARY} disabled={busy} aria-label="Approve and run" onClick={() => void decide(true)}>
                 Approve and run
@@ -86,7 +115,9 @@ export function ForkApprovalCard({ run, session, reload }: { run: CiRun; session
               </button>
             </div>
           ) : (
-            <span className="font-mono text-[13px] text-fg-3">Sign in to approve.</span>
+            <span className="font-mono text-[13px] text-fg-3">
+              {session ? "A maintainer with write access to this repository decides." : "Sign in to approve."}
+            </span>
           ))}
       </div>
       {pending && (

@@ -253,9 +253,19 @@ const RUN_STARTED: &str = "UPDATE ci_runs SET status = 'in_progress', updated_at
 const REOPEN_RUN_AT: &str = "UPDATE ci_runs SET status = 'in_progress', conclusion = NULL, \
      completed_at = NULL, run_attempt = $2, updated_at = $3 WHERE id = $1";
 
-/// Completes attempt `$4` of run `$1` with conclusion `$2` at `$3`.
+/// Completes attempt `$4` of run `$1` with conclusion `$2` at `$3`. A fork
+/// run that still waits for its approval (it was cancelled, or ended
+/// some other way) has its gate ended with it: it frees its approval
+/// slot, its approve button stops working and its card is marked to be
+/// settled.
 const FINISH_RUN: &str = "UPDATE ci_runs SET status = 'completed', conclusion = $2, \
-     completed_at = $3, updated_at = $3 WHERE id = $1 AND run_attempt = $4";
+     completed_at = $3, updated_at = $3, \
+     gate_card_dirty = CASE WHEN gate_status IN ('pending', 'deferred') \
+       THEN gate_check_run_id IS NOT NULL ELSE gate_card_dirty END, \
+     gate_at = CASE WHEN gate_status IN ('pending', 'deferred') THEN $3 ELSE gate_at END, \
+     gate_status = CASE WHEN gate_status IN ('pending', 'deferred') \
+       THEN 'cancelled' ELSE gate_status END \
+     WHERE id = $1 AND run_attempt = $4";
 
 /// Records `run` with the next number of its workflow in its repository.
 /// Returns `None` when a run of this delivery and workflow exists,

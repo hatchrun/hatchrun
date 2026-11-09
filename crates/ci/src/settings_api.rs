@@ -922,7 +922,6 @@ async fn put_fork_policy(
         Ok(policy) => policy,
         Err(stop) => return Ok(Err(stop)),
     };
-    store::put_repo_policy(cx.db, repo.id, &policy, now_ms()).await?;
     let audit = audit_of(
         cx,
         &repo.tenant_id,
@@ -931,7 +930,7 @@ async fn put_fork_policy(
         Some(&repo.full_name),
         &repo.full_name,
     );
-    store::record_audit(cx.db, &audit).await?;
+    store::put_repo_policy(cx.db, repo.id, &policy, now_ms(), &audit).await?;
     reply(200, &serde_json::to_value(policy)?).map(Ok)
 }
 

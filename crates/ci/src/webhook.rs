@@ -472,7 +472,16 @@ impl Cx<'_> {
             return Ok(());
         }
         if let Some(repo) = store::repo(self.db, pr.repo.id).await? {
-            fork::after_end(self.env, self.settings, self.tokens, &repo, &ended, message).await;
+            fork::after_end(
+                self.env,
+                self.db,
+                self.settings,
+                self.tokens,
+                &repo,
+                &ended,
+                message,
+            )
+            .await;
         }
         Ok(())
     }
@@ -578,7 +587,7 @@ impl Cx<'_> {
         // of any of them (`labeled` included) needs its row, so all are
         // recorded. The time is GitHub's, so a late delivery cannot
         // replace newer data.
-        store::upsert_pull(
+        let applied = store::upsert_pull(
             self.db,
             &store::NewPull {
                 repo_id: pr.repo.id,
@@ -592,11 +601,20 @@ impl Cx<'_> {
                     .fork
                     .as_ref()
                     .map_or(Some(pr.repo.id), |f| f.head_repo_id),
+                head_sha: pr.head_sha.clone(),
                 state: pr.state.to_owned(),
                 updated_at: pr.updated_at,
             },
         )
         .await?;
+        // A delivery older than what is recorded says nothing about the
+        // pull request as it stands: it must not cancel the runs of the
+        // newer commit as superseded, nor start runs of the older one.
+        if pr.fork.is_some() && !applied {
+            return Ok(Outcome::Ignored(
+                "the delivery is older than the pull request's recorded state".to_owned(),
+            ));
+        }
         let admitted = match self.fork_admission(pr).await? {
             Ok(admitted) => admitted,
             Err(outcome) => return Ok(outcome),

@@ -1005,7 +1005,16 @@ pub(crate) async fn end_job(env: &Env, db: &Db, job: &JobRow, message: &str) -> 
                 .map_err(|err| err.to_string())?;
             if claimed {
                 // The job's row is over without its object: its group
-                // is free.
+                // is free, and so are the places it held, which jobs
+                // held for the tenant's cap, its matrix or the
+                // repository's cap on fork jobs wait for.
+                if let Some(run) = store::run(db, job.run_id)
+                    .await
+                    .map_err(|err| err.to_string())?
+                {
+                    wake_oldest(env, db, &run.tenant_id).await;
+                }
+                wake_group(env, db, job.id).await;
                 return concurrency::release(env, db, job.run_id, Some(job.id))
                     .await
                     .map_err(|err| err.to_string());

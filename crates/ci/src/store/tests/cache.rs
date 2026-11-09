@@ -492,3 +492,29 @@ fn an_entry_records_the_trust_of_the_run_that_saved_it() {
         .unwrap();
     assert_eq!(trust, "trusted");
 }
+
+#[test]
+fn a_flood_of_fork_entries_does_not_push_trusted_entries_out_of_their_share() {
+    let db = TestDb::new();
+    let fork = |scope| CacheOwner {
+        trust: Trust::Fork,
+        ..on(scope)
+    };
+    save_sized(&db, MAIN, "base", 500, 1);
+    save_sized(&db, MAIN, "default", 500, 2);
+    save_sized(&db, fork("refs/pull/3/merge"), "a", 5_000, 10);
+    save_sized(&db, fork("refs/pull/4/merge"), "b", 5_000, 20);
+    // The trusted share is 1000 bytes, which the two trusted entries
+    // fit exactly: the fork entries do not count against it.
+    let gone = db
+        .wait(evict_over_quota_cache_entries(db.db(), "t1", 7, 1_000, 10))
+        .unwrap();
+    assert_eq!(gone.len(), 0, "{gone:?}");
+    // Past the share, only trusted entries go.
+    let gone = db
+        .wait(evict_over_quota_cache_entries(db.db(), "t1", 7, 700, 10))
+        .unwrap();
+    let keys: Vec<&str> = gone.iter().map(|row| row.key.as_str()).collect();
+    assert_eq!(keys, ["base"], "the least recently used trusted entry");
+    assert_eq!(db.wait(fork_cache_bytes(db.db(), "t1", 7)).unwrap(), 10_000);
+}

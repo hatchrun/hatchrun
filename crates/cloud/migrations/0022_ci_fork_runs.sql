@@ -19,8 +19,13 @@
 -- check run that carries the approve button.
 --
 -- Rows recorded before this are trusted and were never gated, so the
--- columns are added with a default that backfills them, and the default
--- is then dropped: the code names every value.
+-- columns are added with a default that backfills them. The defaults
+-- stay: between this migration and the deploy of the Worker that names
+-- every value, the old Worker still inserts runs, pull requests and
+-- cache entries (a scheduled run, a webhook, a cache save), and those
+-- are the repository's own code, so trusted and ungated rows are what
+-- they must be. Nothing the old Worker makes can be a fork run. The
+-- next release drops the defaults.
 ALTER TABLE ci_runs ADD COLUMN trust text NOT NULL DEFAULT 'trusted'
   CHECK (trust IN ('trusted', 'fork'));
 ALTER TABLE ci_runs ADD COLUMN head_repo_id bigint;
@@ -37,12 +42,11 @@ ALTER TABLE ci_runs ADD COLUMN gate_check_run_id bigint;
 -- Set when the approval check run of a waiting run could not be brought
 -- up to date; the reconciler updates it again and clears the mark.
 ALTER TABLE ci_runs ADD COLUMN gate_card_dirty boolean NOT NULL DEFAULT false;
+-- When the reconciler last looked at a run of the approval queues. Its
+-- bounded scans take the runs looked at longest ago first, so runs that
+-- cannot be admitted yet do not take every pass.
+ALTER TABLE ci_runs ADD COLUMN gate_scanned_at bigint NOT NULL DEFAULT 0;
 UPDATE ci_runs SET author_login = actor;
-ALTER TABLE ci_runs ALTER COLUMN trust DROP DEFAULT;
-ALTER TABLE ci_runs ALTER COLUMN author_login DROP DEFAULT;
-ALTER TABLE ci_runs ALTER COLUMN author_association DROP DEFAULT;
-ALTER TABLE ci_runs ALTER COLUMN gate DROP DEFAULT;
-ALTER TABLE ci_runs ALTER COLUMN gate_status DROP DEFAULT;
 
 -- The runs that wait for a decision, per repository, oldest first: the
 -- approval caps, the expiry and the list the app shows read them.
@@ -56,7 +60,9 @@ CREATE INDEX ci_runs_fork_author ON ci_runs (repo_id, author_login)
 -- head is in (null for a deleted fork), as the last delivery said.
 ALTER TABLE ci_pulls ADD COLUMN author_association text NOT NULL DEFAULT '';
 ALTER TABLE ci_pulls ADD COLUMN head_repo_id bigint;
-ALTER TABLE ci_pulls ALTER COLUMN author_association DROP DEFAULT;
+-- The head commit as the newest delivery said it. A fork run is
+-- approved only while its pull request is open at the run's commit.
+ALTER TABLE ci_pulls ADD COLUMN head_sha text NOT NULL DEFAULT '';
 
 -- What a repository does with pull requests from forks. A row is made
 -- by the first write; a repository without one has the defaults
@@ -78,7 +84,6 @@ CREATE TABLE ci_repo_policy (
 -- this were saved by trusted runs.
 ALTER TABLE ci_cache_entries ADD COLUMN trust text NOT NULL DEFAULT 'trusted'
   CHECK (trust IN ('trusted', 'fork'));
-ALTER TABLE ci_cache_entries ALTER COLUMN trust DROP DEFAULT;
 
 -- Why a job of a fork run waits: its run waits for an approval
 -- (fork_approval), or its repository already runs the most fork jobs its

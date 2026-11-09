@@ -681,7 +681,12 @@ Fewer, larger PRs with a deploy order, as every merge to main releases.
 **Deploy order**
 
 1. Merge PR 1. The deploy workflow runs migration 0022 as the owner role,
-   then deploys the Worker and the app together. Fork PRs start running
+   then deploys the Worker and the app together. The migration keeps the
+   defaults of its new `not null` columns (`trusted`, no gate, empty
+   author), because the old Worker runs between the two steps and its
+   scheduled runs, pull request rows and cache saves insert without them.
+   Everything the old Worker makes is the repository's own code, so the
+   defaults are the right values. PR 2 drops them. Fork PRs start running
    for public repositories at once, behind the default first-time
    contributor gate.
 2. Merge PR 2. Deploy the CLI release with it so `validate` and the

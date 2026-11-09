@@ -146,7 +146,7 @@ function RunScreen({
           Could not refresh: {stale.message}. Showing the last result.
         </p>
       )}
-      <ForkApprovalCard run={run} session={session} reload={reload} />
+      <ForkApprovalCard run={run} session={session} access={data.access} reload={reload} />
       <ApprovalCard
         run={run}
         jobs={jobs}

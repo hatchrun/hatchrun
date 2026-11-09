@@ -4,7 +4,8 @@
 
 // What a repository does with pull requests from forks: whether they
 // run, who needs a maintainer's approval first, how many fork jobs run
-// at once and for how long. Repository admins only.
+// at once and for how long. The policy of a repository is changed by
+// its admins; the server checks, and a member who is not one sees why.
 
 import { useState } from "react";
 
@@ -28,32 +29,46 @@ const APPROVAL: [ForkPolicy["fork_approval"], string][] = [
 
 export function Forks({ org, tenant }: OrgPageProps) {
   const repo = useQuery("repo");
-  const { repos } = useRepoSearch(org, "", 100, tenant.role === "admin");
-
-  if (tenant.role !== "admin") {
-    return (
-      <Page title="Fork pull requests" nav={<SettingsNav org={org} current="forks" admin={false} />}>
-        <p className="meta rounded-sm border border-control px-4 py-6">Only organization admins can change how pull requests from forks run.</p>
-      </Page>
-    );
-  }
+  const [search, setSearch] = useState("");
+  // Every repository of the installation, found by name: the list holds
+  // the first matches and the search narrows it, so none is out of reach.
+  const { repos, total, loading } = useRepoSearch(org, search, 20);
+  const admin = tenant.role === "admin";
 
   return (
-    <Page title="Fork pull requests" nav={<SettingsNav org={org} current="forks" admin />} narrow>
+    <Page title="Fork pull requests" nav={<SettingsNav org={org} current="forks" admin={admin} />} narrow>
       <p className="m-0 font-mono text-[13px] text-fg-2">
         A pull request from a fork runs without secrets, a write token, OIDC tokens or environments. An author the approval level names needs a maintainer to approve each commit first.
+        {!admin && " An admin of the repository can change its policy; the server decides who may."}
       </p>
       <label className={LABEL}>
-        Repository
-        <select value={repo ?? ""} onChange={(event) => setQuery({ repo: event.target.value || null })} className={`${FIELD} !h-8 max-w-[360px]`}>
-          <option value="">Choose a repository</option>
-          {repos.map((item) => (
-            <option key={item.name} value={item.name}>
-              {item.name}
-            </option>
-          ))}
-        </select>
+        Find a repository
+        <input
+          type="search"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="Search repositories"
+          autoComplete="off"
+          spellCheck={false}
+          className={`${FIELD} !h-8 max-w-[360px]`}
+        />
       </label>
+      <ul aria-label="Repositories" className="m-0 flex list-none flex-col rounded-md border border-rule p-0">
+        {repos.map((item) => (
+          <li key={item.name} className="border-t border-rule first:border-t-0">
+            <button
+              type="button"
+              aria-pressed={repo === item.name}
+              onClick={() => setQuery({ repo: item.name })}
+              className={`w-full cursor-pointer px-3 py-1.5 text-left font-mono text-[13px] hover:bg-raised ${repo === item.name ? "text-fg" : "text-fg-2"}`}
+            >
+              {item.name}
+            </button>
+          </li>
+        ))}
+        {repos.length === 0 && !loading && <li className="px-3 py-2 font-mono text-[13px] text-fg-3">No repository matches.</li>}
+      </ul>
+      {total > repos.length && <p className="m-0 font-mono text-xs text-fg-3">{total - repos.length} more: narrow the search.</p>}
       {repo && <Policy key={repo} repository={repo} />}
     </Page>
   );
@@ -99,6 +114,7 @@ function PolicyForm({ owner, name, policy }: { owner: string; name: string; poli
         void save();
       }}
     >
+      <fieldset disabled={busy} className="m-0 flex min-w-0 flex-col gap-4 border-0 p-0">
       <label className={LABEL}>
         Run pull requests from forks
         <select value={draft.fork_runs} onChange={(event) => set("fork_runs", event.target.value as ForkPolicy["fork_runs"])} className={`${FIELD} !h-8 max-w-[240px]`}>
@@ -140,6 +156,7 @@ function PolicyForm({ owner, name, policy }: { owner: string; name: string; poli
           />
         </label>
       </div>
+      </fieldset>
       <div className="flex items-center gap-3">
         <button type="submit" className={BTN_PRIMARY} disabled={busy}>
           {busy ? "Saving" : "Save"}

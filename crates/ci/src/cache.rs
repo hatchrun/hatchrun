@@ -60,6 +60,16 @@ pub const IDLE_DAYS: u64 = 7;
 pub const STALE_UPLOAD_MS: u64 = 86_400_000;
 /// Entries one reconciler pass evicts at most.
 pub const EVICT_LIMIT: u32 = 20;
+/// Batches of [`EVICT_LIMIT`] entries one save evicts at most, so a save
+/// that finds the cache far over its share trims it back in one go, and
+/// a request still ends quickly.
+const EVICT_BATCHES: u32 = 5;
+
+/// Whether to evict another batch: the last one was full, so more may
+/// be over the share, and the save's batch budget is not spent.
+const fn another_batch(evicted: usize, batches_done: u32) -> bool {
+    evicted >= EVICT_LIMIT as usize && batches_done < EVICT_BATCHES
+}
 
 /// What one repository may keep, as on GitHub: 10 GB. Past it the least
 /// recently used entries are evicted.
@@ -317,7 +327,18 @@ async fn start(ctx: &Context<'_>, request: UploadRequest) -> Answer {
         && store::fork_cache_bytes(&ctx.db, &ctx.run.tenant_id, ctx.run.repo_id).await?
             > FORK_REPO_BYTES
     {
-        return Err(Refusal::new(403, FORK_FULL));
+        // Over the share (a cap that was lowered, or batches that did
+        // not reach it): trim before refusing, or no save could ever
+        // trigger the eviction that would let the next one in.
+        let credentials = credentials(ctx.settings).await?;
+        if let Err(err) = enforce_quota(ctx, &credentials).await {
+            console_warn!("cache: quota of repository {}: {}", ctx.run.repo_id, err);
+        }
+        if store::fork_cache_bytes(&ctx.db, &ctx.run.tenant_id, ctx.run.repo_id).await?
+            > FORK_REPO_BYTES
+        {
+            return Err(Refusal::new(403, FORK_FULL));
+        }
     }
     // Saves the upload when the entry exists; finalizing still settles
     // a race between two jobs.
@@ -484,29 +505,37 @@ async fn enforce_quota(
     credentials: &Credentials,
 ) -> std::result::Result<(), String> {
     // A fork run's save trims the fork entries to the fork share and
-    // never evicts an entry of the base or default branch.
-    let rows = if ctx.run.trust.allows(Capability::CacheWriteBase) {
-        store::evict_over_quota_cache_entries(
-            &ctx.db,
-            &ctx.run.tenant_id,
-            ctx.run.repo_id,
-            MAX_REPO_BYTES,
-            EVICT_LIMIT,
-        )
-        .await
-    } else {
-        store::evict_over_fork_quota_cache_entries(
-            &ctx.db,
-            &ctx.run.tenant_id,
-            ctx.run.repo_id,
-            FORK_REPO_BYTES,
-            EVICT_LIMIT,
-        )
-        .await
+    // never evicts an entry of the base or default branch; a trusted
+    // save trims the trusted entries to the rest of the quota, which fork
+    // entries do not count against.
+    let mut batches = 0;
+    loop {
+        let rows = if ctx.run.trust.allows(Capability::CacheWriteBase) {
+            store::evict_over_quota_cache_entries(
+                &ctx.db,
+                &ctx.run.tenant_id,
+                ctx.run.repo_id,
+                MAX_REPO_BYTES - FORK_REPO_BYTES,
+                EVICT_LIMIT,
+            )
+            .await
+        } else {
+            store::evict_over_fork_quota_cache_entries(
+                &ctx.db,
+                &ctx.run.tenant_id,
+                ctx.run.repo_id,
+                FORK_REPO_BYTES,
+                EVICT_LIMIT,
+            )
+            .await
+        }
+        .map_err(|err| err.to_string())?;
+        delete_objects(ctx.settings, credentials, &rows).await;
+        batches += 1;
+        if !another_batch(rows.len(), batches) {
+            return Ok(());
+        }
     }
-    .map_err(|err| err.to_string())?;
-    delete_objects(ctx.settings, credentials, &rows).await;
-    Ok(())
 }
 
 /// Deletes the objects of evicted `rows`, which are already gone from
@@ -668,6 +697,15 @@ mod tests {
         let writable: Vec<&String> = scopes.iter().take(1).collect();
         assert_eq!(writable, ["refs/pull/4/merge"]);
         assert!(scopes.iter().skip(1).all(|s| s.starts_with("refs/heads/")));
+    }
+
+    #[test]
+    fn eviction_goes_on_while_batches_are_full_and_the_budget_lasts() {
+        assert!(another_batch(20, 1));
+        assert!(another_batch(20, 4));
+        assert!(!another_batch(20, 5), "the budget is spent");
+        assert!(!another_batch(19, 1), "a short batch reached the share");
+        assert!(!another_batch(0, 1));
     }
 
     #[test]

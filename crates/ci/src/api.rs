@@ -1333,6 +1333,26 @@ impl Cx<'_> {
             Ok(found) => found,
             Err(stop) => return Ok(Err(stop)),
         };
+        // The decision releases or cancels jobs, so the approver's write
+        // access to the base repository is asked of GitHub now, not read
+        // from the cache that serves page views for a minute.
+        match access::resolve_fresh(session, self.settings, &found.repo).await {
+            Ok(have) if have >= Access::Write => {}
+            Ok(_) => {
+                return Ok(stop(
+                    403,
+                    "You need write access to this repository to decide a fork pull request's run",
+                ));
+            }
+            Err(access::Failure::Retry(wait)) => {
+                return Ok(Err(Stop(
+                    503,
+                    "GitHub is rate limiting; try again shortly".to_owned(),
+                    Some(wait),
+                )));
+            }
+            Err(access::Failure::Worker(err)) => return Err(err),
+        }
         let login = session.user.login.as_str();
         let now = now_ms();
         let github = Counted::default();
@@ -1373,6 +1393,7 @@ impl Cx<'_> {
             };
             fork::after_end(
                 self.env,
+                self.db,
                 self.settings,
                 &tokens,
                 &found.repo,

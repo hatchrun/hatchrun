@@ -151,6 +151,13 @@ pub async fn check(
     resolve(session.as_ref(), settings, repo).await
 }
 
+/// The cached permissions to use for a request: those the cache holds,
+/// unless the request needs the answer as GitHub gives it now.
+#[must_use]
+pub fn reuse(cached: Option<Permissions>, fresh: bool) -> Option<Permissions> {
+    if fresh { None } else { cached }
+}
+
 /// The access of a session found already, `None` when nobody is signed
 /// in.
 ///
@@ -162,12 +169,38 @@ pub async fn resolve(
     settings: &Settings,
     repo: &RepoRow,
 ) -> Result<Access, Failure> {
+    resolve_with(session, settings, repo, false).await
+}
+
+/// The access of the session's user to `repo` as GitHub says now, never
+/// from the cache, for a decision that releases jobs: a user whose
+/// access just ended must not act on what was cached for a minute. The
+/// answer refreshes the cache. It asks about `repo`, the base
+/// repository, with the user's own token.
+///
+/// # Errors
+///
+/// As [`check`].
+pub async fn resolve_fresh(
+    session: &Session,
+    settings: &Settings,
+    repo: &RepoRow,
+) -> Result<Access, Failure> {
+    resolve_with(Some(session), settings, repo, true).await
+}
+
+async fn resolve_with(
+    session: Option<&Session>,
+    settings: &Settings,
+    repo: &RepoRow,
+    fresh: bool,
+) -> Result<Access, Failure> {
     let Some(session) = session else {
         return Ok(from_permissions(repo.private, None));
     };
     let now = worker::Date::now().as_millis();
     let key = (session.user.id, repo.id);
-    if let Some(p) = cached(key, now) {
+    if let Some(p) = reuse(cached(key, now), fresh) {
         return Ok(from_permissions(repo.private, Some(p)));
     }
     let request = github::user_repo(&settings.github_api, &repo.full_name, &session.token);
@@ -379,6 +412,19 @@ pub async fn org_admin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fresh_check_never_reuses_the_cache() {
+        let held = Permissions {
+            admin: false,
+            write: true,
+            read: true,
+        };
+        assert_eq!(reuse(Some(held), false), Some(held));
+        assert_eq!(reuse(Some(held), true), None);
+        assert_eq!(reuse(None, false), None);
+        assert_eq!(reuse(None, true), None);
+    }
 
     #[allow(clippy::unnecessary_wraps)] // The argument of `from_permissions`.
     const fn p(read: bool, write: bool) -> Option<Permissions> {

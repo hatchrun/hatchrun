@@ -593,14 +593,16 @@ pub fn can_write(response: &Response) -> Result<bool, String> {
         return Ok(false);
     }
     let found = decode::<Permission>(response, "collaborator permission")?;
-    // `role_name` has `maintain`; the legacy `permission` folds it into
-    // `write`. A role GitHub added later is read as no access.
-    let role = if found.role_name.is_empty() {
-        found.permission.as_str()
-    } else {
+    // The legacy `permission` is the base permission: a custom role
+    // built on `write` reads `write` there, and `maintain` reads
+    // `write` too. `role_name` is read only when GitHub sends no
+    // `permission`.
+    let level = if found.permission.is_empty() {
         found.role_name.as_str()
+    } else {
+        found.permission.as_str()
     };
-    Ok(matches!(role, "write" | "maintain" | "admin"))
+    Ok(matches!(level, "write" | "maintain" | "admin"))
 }
 
 /// A repository as a signed-in user sees it.
@@ -944,8 +946,11 @@ mod tests {
         assert_eq!(role("read", "triage"), Ok(false));
         assert_eq!(role("read", "read"), Ok(false));
         assert_eq!(role("none", "none"), Ok(false));
-        // A role GitHub adds later is not a reason to approve.
-        assert_eq!(role("write", "custom-role"), Ok(false));
+        // A custom role built on write has the base permission `write`.
+        assert_eq!(role("write", "custom-role"), Ok(true));
+        assert_eq!(role("admin", "custom-admin"), Ok(true));
+        // A custom role built on read stays read.
+        assert_eq!(role("read", "custom-role"), Ok(false));
         // Without role_name the legacy field decides.
         assert_eq!(
             can_write(&answered(200, r#"{"permission":"write"}"#)),

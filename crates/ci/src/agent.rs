@@ -654,6 +654,28 @@ async fn read_values(
     trust: Trust,
     app_url: &str,
 ) -> Result<Values, OpenFailure> {
+    read_values_with(db, row, repo, trust, app_url, now_ms(), || {
+        Keyring::load(env)
+    })
+    .await
+}
+
+/// [`read_values`] with the keyring supplied by `keyring`, which is called
+/// only when a secret has to be opened: a run that may not have secrets
+/// never calls it, so nothing is decrypted for it.
+async fn read_values_with<F, Fut>(
+    db: &Db,
+    row: &JobRow,
+    repo: &RepoRow,
+    trust: Trust,
+    app_url: &str,
+    now: u64,
+    keyring: F,
+) -> Result<Values, OpenFailure>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Keyring, String>>,
+{
     let unavailable = |err: &dyn std::fmt::Display| OpenFailure::Unavailable(err.to_string());
     let refs: SecretRefs =
         serde_json::from_value(row.secret_refs.clone()).map_err(|e| unavailable(&e))?;
@@ -682,7 +704,7 @@ async fn read_values(
     let secrets = if rows.is_empty() {
         BTreeMap::new()
     } else {
-        let keyring = Keyring::load(env).await.map_err(|e| unavailable(&e))?;
+        let keyring = keyring().await.map_err(|e| unavailable(&e))?;
         job_secrets(&refs, &rows, &keyring, &repo.tenant_id)
             .map_err(|(name, err)| OpenFailure::Unreadable(name, err))?
     };
@@ -690,8 +712,7 @@ async fn read_values(
     // the narrowest of each name.
     let got_secrets = store::winners(rows.iter().map(|r| (r.name.as_str(), r.owner())));
     let got_vars = store::winners(var_rows.iter().map(|r| (r.name.as_str(), r.owner())));
-    if let Err(err) = store::mark_used(db, &repo.tenant_id, &got_secrets, &got_vars, now_ms()).await
-    {
+    if let Err(err) = store::mark_used(db, &repo.tenant_id, &got_secrets, &got_vars, now).await {
         console_warn!("job {}: mark secrets used: {err}", row.id);
     }
     let vars = var_rows.into_iter().map(|r| (r.name, r.value)).collect();
@@ -1022,6 +1043,128 @@ mod tests {
         let mut doc = document();
         fill(&mut doc, &BTreeMap::new(), BTreeMap::new());
         assert_eq!(doc.secrets.len(), 0);
+    }
+
+    /// A tenant and a repository in a temporary database, with a stored
+    /// secret `TOKEN` and a var `REGION`.
+    fn stored_secret() -> (hatchrun_cloud::testdb::Db, RepoRow) {
+        use crate::store::{Action, NewAudit, Owner};
+        let db = hatchrun_cloud::testdb::Db::new();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, \
+             updated_at) VALUES ('t1', 1, 'acme', 99, 0, 0)",
+            &[],
+        );
+        let repo = repo_row("t1", 7);
+        db.wait(store::upsert_repo(db.db(), &repo, 1)).unwrap();
+        let audit = |action| NewAudit {
+            tenant: "t1",
+            actor: "octo",
+            action,
+            scope: "repo",
+            repo: None,
+            target: "x",
+            now: 5,
+        };
+        db.wait(store::put_secret(
+            db.db(),
+            "t1",
+            Owner::Repo(7),
+            None,
+            "TOKEN",
+            "k1",
+            "sealed-with-a-key-we-never-load",
+            100,
+            5,
+            &audit(Action::SecretPut),
+        ))
+        .unwrap();
+        db.wait(store::put_var(
+            db.db(),
+            "t1",
+            Owner::Repo(7),
+            None,
+            "REGION",
+            "eu",
+            100,
+            5,
+            &audit(Action::VarPut),
+        ))
+        .unwrap();
+        (db, repo)
+    }
+
+    fn refs_all() -> JobRow {
+        let mut job = row("launched");
+        job.secret_refs = serde_json::to_value(SecretRefs {
+            all: true,
+            ..SecretRefs::default()
+        })
+        .unwrap();
+        job
+    }
+
+    #[test]
+    fn a_fork_claim_reads_a_stored_secret_and_its_document_excludes_it() {
+        let (db, repo) = stored_secret();
+        let job = refs_all();
+        let loaded = std::cell::Cell::new(false);
+        // The secret exists and the job references it; a fork run goes
+        // through the real read, which never opens the keyring.
+        let (secrets, vars) = db
+            .wait(read_values_with(
+                db.db(),
+                &job,
+                &repo,
+                Trust::Fork,
+                "https://app.example",
+                9,
+                || async {
+                    loaded.set(true);
+                    Err("the keyring must not be loaded for a fork run".to_owned())
+                },
+            ))
+            .expect("a fork run reads its values");
+        assert!(!loaded.get(), "nothing was decrypted for the fork run");
+        assert_eq!(secrets.len(), 0);
+        // Vars are not secrets, and a fork run gets them.
+        assert_eq!(vars.get("REGION").map(String::as_str), Some("eu"));
+        // The document the claim answers holds neither the secret nor
+        // anything standing in for it.
+        let mut doc = document();
+        fill(&mut doc, &secrets, vars);
+        assert_eq!(doc.secrets.len(), 0);
+        assert!(!serde_json::to_string(&doc).unwrap().contains("sealed-with"));
+        assert_eq!(doc.vars.get("REGION").map(String::as_str), Some("eu"));
+    }
+
+    #[test]
+    fn a_trusted_claim_opens_the_same_secret_through_the_keyring() {
+        let (db, repo) = stored_secret();
+        let job = refs_all();
+        let loaded = std::cell::Cell::new(false);
+        // The control: the same job of a trusted run asks for the
+        // keyring, so the fork test above proves the trust check, not an
+        // empty store.
+        let outcome = db.wait(read_values_with(
+            db.db(),
+            &job,
+            &repo,
+            Trust::Trusted,
+            "https://app.example",
+            9,
+            || async {
+                loaded.set(true);
+                Err("no keyring in this test".to_owned())
+            },
+        ));
+        assert!(loaded.get(), "a trusted run opens its secrets");
+        assert_eq!(
+            outcome,
+            Err(OpenFailure::Unavailable(
+                "no keyring in this test".to_owned()
+            ))
+        );
     }
 
     #[test]
