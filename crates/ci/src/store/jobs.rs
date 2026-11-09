@@ -160,8 +160,12 @@ const OPEN_JOBS: &str = "SELECT {columns} FROM ci_jobs WHERE status <> 'complete
 /// Job `$1`.
 const JOB: &str = "SELECT {columns} FROM ci_jobs WHERE id = $1";
 
-/// Records the cache scopes `$2`, a JSON array, of the job `$1` claimed.
-const SET_CACHE_SCOPES: &str = "UPDATE ci_jobs SET cache_scopes = $2 WHERE id = $1";
+/// Records the cache scopes `$3`, a JSON array, of attempt `$2` of job
+/// `$1` unless the attempt has some, and returns the ones it has. The
+/// first claim of an attempt fixes them, and no row matches once the job
+/// has moved to another attempt.
+const SET_CACHE_SCOPES: &str = "UPDATE ci_jobs SET cache_scopes = COALESCE(cache_scopes, $3) \
+     WHERE id = $1 AND attempt = $2 RETURNING cache_scopes";
 
 /// Starts running job `$1` at `$2`, which is also its first heartbeat.
 const START_JOB: &str = "UPDATE ci_jobs SET status = 'running', started_at = $2, \
@@ -657,17 +661,33 @@ pub async fn start_job(db: &Db, job_id: u64, now: u64) -> Result<bool> {
     Ok(db.run(START_JOB, &params![job_id, now]).await? == 1)
 }
 
-/// Records the cache scopes the job was claimed with, first the one it
-/// saves to. The last claim wins, and it is the one whose document the
-/// agent runs.
+/// The scopes column alone, as [`SET_CACHE_SCOPES`] returns it.
+#[derive(Deserialize)]
+struct ScopesRow {
+    cache_scopes: Option<String>,
+}
+
+/// Fixes the cache scopes of `attempt` of the job to `scopes`, first the
+/// one it saves to, unless an earlier claim of the attempt did, and
+/// returns the ones the attempt has. `None` when the job is not at
+/// `attempt` any more.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn set_cache_scopes(db: &Db, job_id: u64, scopes: &[String]) -> Result<()> {
+pub async fn set_cache_scopes(
+    db: &Db,
+    job_id: u64,
+    attempt: u32,
+    scopes: &[String],
+) -> Result<Option<Vec<String>>> {
     let text = serde_json::to_string(scopes).unwrap_or_else(|_| "[]".to_owned());
-    db.run(SET_CACHE_SCOPES, &params![job_id, text]).await?;
-    Ok(())
+    let row: Option<ScopesRow> = db
+        .first(SET_CACHE_SCOPES, &params![job_id, attempt, text])
+        .await?;
+    Ok(row
+        .and_then(|row| row.cache_scopes)
+        .and_then(|text| serde_json::from_str(&text).ok()))
 }
 
 /// Sets job `job_id` up for `attempt`: waiting, with nothing left of

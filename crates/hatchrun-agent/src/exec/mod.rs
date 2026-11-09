@@ -199,6 +199,7 @@ pub async fn run_job(
         stage_fd: std::sync::Arc::new(stage_fd),
         cache_saves: Vec::new(),
         cache_env: BTreeMap::new(),
+        cache_unreachable: false,
         background: Background::default(),
         docker: docker::DockerState::new(format!("hatchrun-{}", random_name().unwrap_or_default())),
         environment_url: None,
@@ -448,6 +449,9 @@ struct Job<'a> {
     cache_saves: Vec<builtin::CacheSave>,
     /// The cache proxy's variables, when it runs. Every step gets them.
     cache_env: BTreeMap<String, String>,
+    /// The proxy listens on the loopback only, which no container
+    /// reaches: container steps get none of `cache_env`.
+    cache_unreachable: bool,
     /// Process groups that steps left running. They end with the job.
     background: Background,
     /// The containers the job started.

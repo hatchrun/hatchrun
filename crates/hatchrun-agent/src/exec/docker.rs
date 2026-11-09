@@ -887,6 +887,12 @@ impl Job<'_> {
             if self.docker.host_env.get(key) == Some(value) && !explicit.contains(key) {
                 continue;
             }
+            // A container cannot reach a proxy on the loopback: without
+            // the variables its tools see no cache, not a dead one.
+            if self.cache_unreachable && self.cache_env.contains_key(key) && !explicit.contains(key)
+            {
+                continue;
+            }
             inner.insert(key.clone(), args::translate(value, maps));
         }
         inner.insert("HOME".to_owned(), "/github/home".to_owned());

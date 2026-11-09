@@ -1651,7 +1651,26 @@ fn a_claim_records_the_cache_scopes_and_a_rerun_clears_them() {
     let none = db.wait(job(db.db(), job_id)).unwrap().unwrap();
     assert_eq!(none.cache_scopes, None);
     let scopes = vec!["refs/pull/4/merge".to_owned(), "refs/heads/main".to_owned()];
-    db.wait(set_cache_scopes(db.db(), job_id, &scopes)).unwrap();
+    let first = db
+        .wait(set_cache_scopes(db.db(), job_id, 1, &scopes))
+        .unwrap();
+    assert_eq!(first.as_deref(), Some(scopes.as_slice()));
+    // A later claim of the attempt, which saw another default branch,
+    // gets the scopes the first one fixed.
+    let other = vec![
+        "refs/pull/4/merge".to_owned(),
+        "refs/heads/trunk".to_owned(),
+    ];
+    let again = db
+        .wait(set_cache_scopes(db.db(), job_id, 1, &other))
+        .unwrap();
+    assert_eq!(again.as_deref(), Some(scopes.as_slice()));
+    // A claim of another attempt matches no row.
+    assert_eq!(
+        db.wait(set_cache_scopes(db.db(), job_id, 2, &other))
+            .unwrap(),
+        None
+    );
     let row = db.wait(job(db.db(), job_id)).unwrap().unwrap();
     let stored: Vec<String> = serde_json::from_str(row.cache_scopes.as_deref().unwrap()).unwrap();
     assert_eq!(stored, scopes);

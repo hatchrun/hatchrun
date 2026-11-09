@@ -406,10 +406,16 @@ async fn claim(
         run.base_ref.as_deref(),
         Some(&repo.default_branch),
     );
-    if let Err(err) = store::set_cache_scopes(db, row.id, &scopes).await {
-        console_error!("job {}: record cache scopes: {err}", row.id);
-        return retry();
-    }
+    // The first claim of the attempt fixes them: a claim that overlaps
+    // it, or repeats it, gets the same list.
+    let scopes = match store::set_cache_scopes(db, row.id, row.attempt, &scopes).await {
+        Ok(Some(scopes)) => scopes,
+        Ok(None) => return status(409),
+        Err(err) => {
+            console_error!("job {}: record cache scopes: {err}", row.id);
+            return retry();
+        }
+    };
     document.cache = cache_service(settings, job_token, scopes);
     Response::from_json(&document)
 }

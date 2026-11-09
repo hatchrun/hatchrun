@@ -97,6 +97,27 @@ impl Store {
     }
 }
 
+/// The part numbers a completion body lists, when it lists at least one,
+/// in ascending order, and each part arrived with the `ETag` the body
+/// gives.
+fn manifest(body: &[u8], parts: &HashMap<u16, Vec<u8>>) -> Option<Vec<u16>> {
+    let body: Value = serde_json::from_slice(body).ok()?;
+    let listed = body["parts"].as_array().filter(|list| !list.is_empty())?;
+    let mut numbers = Vec::new();
+    for part in listed {
+        let number = u16::try_from(part["number"].as_u64()?).ok()?;
+        let etag = part["etag"].as_str()?;
+        if etag != format!("\"e{number}\"") || !parts.contains_key(&number) {
+            return None;
+        }
+        if numbers.last().is_some_and(|last| *last >= number) {
+            return None;
+        }
+        numbers.push(number);
+    }
+    Some(numbers)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn worker() -> (MockServer, Shared) {
     let server = MockServer::start().await;
@@ -195,12 +216,16 @@ async fn worker() -> (MockServer, Shared) {
         .respond_with(move |req: &wiremock::Request| {
             let id = req.url.path().split('/').nth_back(1).unwrap().to_owned();
             let mut store = lock(&st);
-            let Some((entry, parts)) = store.uploads.remove(&id) else {
+            let Some((_, parts)) = store.uploads.get(&id) else {
                 return ResponseTemplate::new(404);
             };
-            let mut numbers: Vec<u16> = parts.keys().copied().collect();
-            numbers.sort_unstable();
-            let bytes: Vec<u8> = numbers.iter().flat_map(|n| parts[n].clone()).collect();
+            // Like S3: the manifest lists the parts to join, in ascending
+            // order, each with the ETag S3 answered it with.
+            let Some(listed) = manifest(&req.body, parts) else {
+                return ResponseTemplate::new(400).set_body_json(json!({ "error": "bad parts" }));
+            };
+            let bytes: Vec<u8> = listed.iter().flat_map(|n| parts[n].clone()).collect();
+            let (entry, _) = store.uploads.remove(&id).unwrap();
             store.entries.insert(entry, (id, bytes));
             ResponseTemplate::new(204)
         })
@@ -449,6 +474,7 @@ async fn buildx_round(
     written.sort();
     written.dedup();
     assert!(!marker(&out[0]).is_empty(), "export:\n{}", out[0]);
+    assert!(!marker(&out[1]).is_empty(), "import:\n{}", out[1]);
     (marker(&out[0]), marker(&out[1]), written)
 }
 

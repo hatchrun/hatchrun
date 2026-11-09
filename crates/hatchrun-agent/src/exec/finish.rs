@@ -97,11 +97,14 @@ impl Job<'_> {
         };
         let ip = self.proxy_bind().await;
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut fell_back = false;
         let started = match Proxy::start_services(services.clone(), ip).await {
             // The bridge gateway can be an address this machine does not
-            // have yet; the loopback still serves the host's steps.
+            // have yet; the loopback still serves the host's steps, but
+            // no container reaches it.
             Err(err) if ip != loopback => {
                 warn!(%ip, "cache proxy: cannot listen, trying the loopback: {err:#}");
+                fell_back = true;
                 Proxy::start_services(services, loopback).await
             }
             other => other,
@@ -122,6 +125,12 @@ impl Job<'_> {
             self.cache_unavailable(sink, &err);
             proxy.stop().await;
             return None;
+        }
+        self.cache_unreachable = fell_back || ip == loopback;
+        if fell_back {
+            let message = "The cache proxy listens on the loopback only: steps in containers and \
+                           BuildKit builders cannot use the cache or the artifact service.";
+            self.say(sink, Line::Warning(message));
         }
         let token = proxy.runtime_token().to_owned();
         self.masker.add(&token);
