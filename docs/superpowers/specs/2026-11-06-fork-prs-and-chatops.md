@@ -140,20 +140,31 @@ or `approve`:
   whether the pull request's code runs. The run's own commit is the base
   branch's; the approval, the card and the supersede are by the head,
   stored on the run as `head_sha`. A pull request from the same
-  repository never waits. A closed pull request and a delivery older
-  than what is recorded start no waiting run. The caps of fork runs
-  (waiting runs per repository, deferred runs) apply; the per-author cap
-  and the setting `fork_runs` do not, because the run is the base
-  repository's own workflow. A rerun follows the fork rule: an approved
-  run reruns, one whose approval ended is refused.
+  repository never waits. A workflow that cannot be asked for approval
+  (the pull request is closed, or the repository is over its caps) is
+  not run unapproved: a neutral check run on the pull request's head,
+  named `<workflow> / pull_request_target`, says it needs approval and
+  why it did not run. A delivery older than what is recorded starts
+  nothing. A newer commit ends the waiting runs of older ones before
+  anything is counted, and the fork run and the `pull_request_target`
+  run of one delivery share a group and count once against the caps. The
+  caps of fork runs (waiting runs per repository, deferred runs) apply;
+  the per-author cap and the setting `fork_runs` do not, because the run
+  is the base repository's own workflow. A rerun follows the policy as it
+  is now: under `approve`, a fork's run that was approved reruns, and one
+  whose approval ended, or that never had one (made under `warn`), is
+  refused with "This pull_request_target run was not approved; push a new
+  commit to ask again."
 - Moving from `approve` to `warn` lets more run, so it needs the admin's
   access as GitHub says now, like the other loosening changes.
 
-The base branch's config of a `pull_request_target` run is read once, by
-the branch name; a config that is missing, does not parse or has no such
-workflow starts nothing and says nothing (the push that made it was
-told). The commit lookup and the policy cost only a repository that has
-a `pull_request_target` workflow.
+The base branch's config is read by the branch name to see whether it
+has a `pull_request_target` workflow; a config that is missing, does not
+parse or has none starts nothing and says nothing (the push that made it
+was told), and that is the whole cost of a repository without one. For
+one that has, the branch's head commit is resolved and the config is read
+again at that commit, so the plan and `GITHUB_SHA` agree; the policy is
+read then.
 
 `workflow_run` has the same shape: it runs trusted from the default
 branch and can download artifacts a fork run made. The planner applies

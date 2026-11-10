@@ -182,6 +182,7 @@ fn summary(card: &Card) -> String {
         "- Head: {} at `{}`, into `{}`",
         card.head_repo
             .as_deref()
+            .filter(|name| !name.is_empty())
             .map_or_else(|| "a deleted fork".to_owned(), plain),
         card.sha,
         plain(&card.base_ref)
@@ -1094,9 +1095,15 @@ async fn admit(
     let policy = store::repo_policy(db, repo.id, repo.private)
         .await
         .map_err(|err| err.to_string())?;
-    let mut waiting = store::fork_waiting(db, repo.id, &run.author_login, Some(number))
-        .await
-        .map_err(|err| err.to_string())?;
+    let mut waiting = store::fork_waiting_beside(
+        db,
+        repo.id,
+        &run.author_login,
+        Some(number),
+        Some(run.pr_sha()),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
     // The runs asking are deferred; they must not count against
     // themselves.
     waiting.deferred = 0;
@@ -1118,7 +1125,7 @@ async fn admit(
         .await?;
     }
     if !targets.is_empty() {
-        let slot = crate::policy::target_admission(&policy, waiting);
+        let slot = crate::policy::target_admission(waiting);
         changed += admit_group(
             env, db, settings, tokens, &repo, &policy, number, &targets, slot, now,
         )
@@ -1204,6 +1211,11 @@ pub const FORK_RUNS_OFF: &str = "Fork runs are off for this repository";
 pub const NOT_APPROVED: &str =
     "This fork run was not approved. Push a new commit to ask for approval again.";
 
+/// What a rerun of a `pull_request_target` run of a fork's pull request
+/// that was not approved is told.
+pub const TARGET_NOT_APPROVED: &str =
+    "This pull_request_target run was not approved; push a new commit to ask again.";
+
 /// The name of the check run that says a rerun was refused, one per
 /// commit: a later refusal updates it.
 pub const RERUN_CHECK: &str = "hatchrun / rerun";
@@ -1217,11 +1229,30 @@ pub const RERUN_CHECK: &str = "hatchrun / rerun";
 /// approval, since the code is the same and a rerun already needs write
 /// access.
 #[must_use]
-pub const fn rerun_refusal(run: &RunRow, policy: Option<&RepoPolicy>) -> Option<&'static str> {
-    // A `pull_request_target` run is trusted but may have waited for an
-    // approval; the approval ending refuses its rerun like a fork run's.
-    // Fork runs being off is about the fork's code, which that run does
-    // not run.
+pub fn rerun_refusal(run: &RunRow, policy: Option<&RepoPolicy>) -> Option<&'static str> {
+    // A `pull_request_target` run is trusted but may wait for an
+    // approval when its pull request is a fork's (it records the fork it
+    // is from, an empty name for a deleted one). A rerun follows the
+    // policy as it is now: under `approve` the run must have been
+    // approved, so one made under `warn` and never approved is refused
+    // like an unapproved one. Fork runs being off is about the fork's
+    // code, which that run does not run.
+    let target = run.event_name_is_target();
+    if target {
+        let approving = policy.is_some_and(|policy| {
+            matches!(
+                policy.pull_request_target_head_checkout,
+                crate::policy::HeadCheckout::Approve
+            )
+        });
+        return match run.gate_status {
+            GateStatus::Expired | GateStatus::Cancelled => Some(TARGET_NOT_APPROVED),
+            GateStatus::NotGated if approving && run.head_repo_name.is_some() => {
+                Some(TARGET_NOT_APPROVED)
+            }
+            _ => None,
+        };
+    }
     if matches!(run.trust, Trust::Fork)
         && let Some(policy) = policy
         && matches!(policy.fork_runs, crate::policy::ForkRuns::Off)
@@ -1505,12 +1536,59 @@ mod tests {
     }
 
     #[test]
+    fn a_rerun_of_a_target_run_follows_the_policy_and_the_approval() {
+        let approving = RepoPolicy {
+            pull_request_target_head_checkout: crate::policy::HeadCheckout::Approve,
+            ..RepoPolicy::default_for(false)
+        };
+        let warning = RepoPolicy::default_for(false);
+        let target = |gate: &str, fork: bool| {
+            let mut run = row("trusted", gate);
+            run.event = "pull_request_target".into();
+            run.head_repo_name = fork.then(|| "mallory/app".to_owned());
+            run
+        };
+        // A run whose approval ended is refused, with its own words.
+        for gate in ["cancelled", "expired"] {
+            assert_eq!(
+                rerun_refusal(&target(gate, true), Some(&warning)),
+                Some(TARGET_NOT_APPROVED)
+            );
+        }
+        // Under approve, a fork's run that was never approved (made under
+        // warn) is refused; an approved one reruns.
+        assert_eq!(
+            rerun_refusal(&target("none", true), Some(&approving)),
+            Some(TARGET_NOT_APPROVED)
+        );
+        assert_eq!(
+            rerun_refusal(&target("approved", true), Some(&approving)),
+            None
+        );
+        // A deleted fork records an empty name and is still a fork's.
+        let mut deleted = target("none", true);
+        deleted.head_repo_name = Some(String::new());
+        assert_eq!(
+            rerun_refusal(&deleted, Some(&approving)),
+            Some(TARGET_NOT_APPROVED)
+        );
+        // Under warn, and for a pull request of the repository itself,
+        // nothing waits.
+        assert_eq!(rerun_refusal(&target("none", true), Some(&warning)), None);
+        assert_eq!(
+            rerun_refusal(&target("none", false), Some(&approving)),
+            None
+        );
+        assert_eq!(rerun_refusal(&target("none", true), None), None);
+        // The message is not the fork run's.
+        assert_ne!(TARGET_NOT_APPROVED, NOT_APPROVED);
+    }
+
+    #[test]
     fn the_approval_of_a_rerun_of_a_target_run_ending_refuses_it() {
-        // A trusted pull_request_target run that waited for an approval
-        // and did not get it is refused a rerun like a fork run is.
         let mut run = row("trusted", "cancelled");
         run.event = "pull_request_target".into();
-        assert_eq!(rerun_refusal(&run, None), Some(NOT_APPROVED));
+        assert_eq!(rerun_refusal(&run, None), Some(TARGET_NOT_APPROVED));
         for gate in ["approved", "none"] {
             let mut run = row("trusted", gate);
             run.event = "pull_request_target".into();

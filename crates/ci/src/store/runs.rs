@@ -192,6 +192,12 @@ impl RunRow {
         self.head_sha.as_deref().unwrap_or(&self.sha)
     }
 
+    /// Whether the run is of a `pull_request_target` event.
+    #[must_use]
+    pub fn event_name_is_target(&self) -> bool {
+        self.event == "pull_request_target"
+    }
+
     /// The branch the run is on: that of a push, the head branch of a
     /// pull request, none for a tag. The same as [`BRANCH`].
     #[must_use]

@@ -62,6 +62,10 @@ pub struct Origin<'a> {
 /// What a `pull_request_target` request needs beyond its origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target<'a> {
+    /// Why the run cannot be started: it needs an approval that cannot
+    /// be asked for. The planner then runs nothing and says so on the
+    /// pull request's head, once for each workflow that would have run.
+    pub refused: Option<&'static str>,
     /// The pull request's head commit. The run is on the base commit,
     /// where nobody looks, so what the planner has to say that must be
     /// seen (a workflow that did not start) goes on this commit.
@@ -298,6 +302,31 @@ pub fn invalid_workflow_check_run(
     )
 }
 
+/// The neutral check run of a `pull_request_target` workflow that needs
+/// an approval nobody can give, on the pull request's head.
+#[must_use]
+pub fn refused_target_check_run(workflow: &str, reason: &str, sha: &str) -> CheckRun {
+    CheckRun {
+        name: format!("{workflow} / pull_request_target"),
+        head_sha: sha.to_owned(),
+        external_id: String::new(),
+        details_url: String::new(),
+        status: "completed".to_owned(),
+        started_at: None,
+        conclusion: Some("neutral".to_owned()),
+        completed_at: None,
+        actions: Vec::new(),
+        output: Some(Output {
+            title: "Needs approval".to_owned(),
+            summary: format!(
+                "Workflow `{workflow}` needs approval, and {reason}, so it did not run."
+            ),
+            text: None,
+            annotations: Vec::new(),
+        }),
+    }
+}
+
 /// The failed check run of a `pull_request_target` workflow that did not
 /// compile, named `<workflow> / pull_request_target` so it never stands
 /// in for the same workflow's `pull_request` run on the same commit.
@@ -511,6 +540,21 @@ pub async fn create(
             return Ok(Vec::new());
         }
     };
+    if let Some(reason) = req.origin.target.and_then(|target| target.refused) {
+        // The workflows would have waited for an approval that cannot be
+        // asked for. They do not run, and the head says why.
+        for plan in &plans {
+            let check = refused_target_check_run(&plan.workflow, reason, report_sha(req));
+            if let Err(err) = report_once(tokens, settings, req, &check).await {
+                worker::console_error!(
+                    "{}: refusal of {}: {err}",
+                    req.repo.full_name,
+                    plan.workflow
+                );
+            }
+        }
+        return Ok(Vec::new());
+    }
     let plans = lint_plans(plans, req.origin.target.is_some());
     match billing_decision(tenant.ci_billing, plans.len()) {
         Billing::Run => {}
@@ -1173,6 +1217,19 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_target_workflow_is_a_neutral_report_on_the_head() {
+        let check =
+            refused_target_check_run("w", "a closed pull request cannot be approved", "headsha");
+        assert_eq!(check.name, "w / pull_request_target");
+        assert_eq!(check.head_sha, "headsha");
+        assert_eq!(check.conclusion.as_deref(), Some("neutral"));
+        let summary = check.output.unwrap().summary;
+        assert!(summary.contains("needs approval"), "{summary}");
+        assert!(summary.contains("closed pull request"), "{summary}");
+        assert!(summary.contains("did not run"), "{summary}");
+    }
+
+    #[test]
     fn a_target_workflow_that_did_not_compile_is_reported_on_the_head_under_its_own_name() {
         let check = invalid_target_check_run("w", &[], "headsha");
         assert_eq!(check.name, "w / pull_request_target");
@@ -1211,6 +1268,7 @@ mod tests {
         let target = Origin {
             target: Some(Target {
                 head_sha: "headsha",
+                refused: None,
             }),
             ..Origin::own("a")
         };

@@ -41,12 +41,19 @@ const PUT_POLICY: &str = "INSERT INTO ci_repo_policy (repo_id, fork_runs, fork_a
 /// commit: one card, one decision), and how many pull requests of author
 /// `$2` have a fork run that is not over, not counting pull request `$3`
 /// when it is set (a new commit on a pull request that is active
-/// already is not another pull request).
+/// already is not another pull request). The group of pull request `$3`
+/// at commit `$4`, when both are set, is not counted: the runs of one
+/// delivery (a fork run and a `pull_request_target` run) share a card's
+/// worth of room and must not count against each other.
 const WAITING: &str = "SELECT \
-       count(DISTINCT (pull_number, pr_sha)) \
-         FILTER (WHERE gate_status = 'pending')::bigint AS pending, \
-       count(DISTINCT (pull_number, pr_sha)) \
-         FILTER (WHERE gate_status = 'deferred')::bigint AS deferred, \
+       count(DISTINCT (pull_number, COALESCE(head_sha, sha))) \
+         FILTER (WHERE gate_status = 'pending' \
+           AND NOT ($4::text IS NOT NULL AND $3::bigint IS NOT NULL AND pull_number = $3::bigint \
+                    AND COALESCE(head_sha, sha) = $4::text))::bigint AS pending, \
+       count(DISTINCT (pull_number, COALESCE(head_sha, sha))) \
+         FILTER (WHERE gate_status = 'deferred' \
+           AND NOT ($4::text IS NOT NULL AND $3::bigint IS NOT NULL AND pull_number = $3::bigint \
+                    AND COALESCE(head_sha, sha) = $4::text))::bigint AS deferred, \
        count(DISTINCT pull_number) FILTER (WHERE trust = 'fork' AND author_login = $2 \
          AND status <> 'completed' AND pull_number IS NOT NULL \
          AND gate_status NOT IN ('deferred', 'expired', 'cancelled') \
@@ -76,7 +83,7 @@ const CLEAR_DECIDED_MARK: &str = "UPDATE ci_runs SET gate_card_dirty = false \
 /// The deferred runs of pull request `$2` of repository `$1` at `$3`: a
 /// group, admitted together.
 const DEFERRED_GROUP: &str = "SELECT {columns} FROM ci_runs WHERE repo_id = $1 \
-     AND pull_number = $2 AND pr_sha = $3 AND gate_status = 'deferred' \
+     AND pull_number = $2 AND COALESCE(head_sha, sha) = $3 AND gate_status = 'deferred' \
      AND status <> 'completed' ORDER BY id";
 
 /// Approves run `$1` of repository `$4` of tenant `$5` by `$2` at `$3`,
@@ -90,7 +97,7 @@ const APPROVE_RUN: &str = "UPDATE ci_runs SET gate_status = 'approved', gate_by 
      AND created_at >= $6 \
      AND EXISTS (SELECT 1 FROM ci_pulls pl WHERE pl.repo_id = ci_runs.repo_id \
        AND pl.number = ci_runs.pull_number AND pl.state = 'open' \
-       AND pl.head_sha = ci_runs.pr_sha) \
+       AND pl.head_sha = COALESCE(ci_runs.head_sha, ci_runs.sha)) \
      RETURNING {columns}";
 
 /// Rejects run `$1` of repository `$4` of tenant `$5` by `$2` at `$3`,
@@ -110,7 +117,7 @@ const APPROVE_BY_CHECK: &str = "UPDATE ci_runs SET gate_status = 'approved', gat
      AND created_at >= $6 \
      AND EXISTS (SELECT 1 FROM ci_pulls pl WHERE pl.repo_id = ci_runs.repo_id \
        AND pl.number = ci_runs.pull_number AND pl.state = 'open' \
-       AND pl.head_sha = ci_runs.pr_sha) RETURNING {columns}";
+       AND pl.head_sha = COALESCE(ci_runs.head_sha, ci_runs.sha)) RETURNING {columns}";
 
 /// Ends the wait of run `$1` with status `$2` by `$3` at `$4`.
 const END_GATE: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_at = $4, \
@@ -120,7 +127,7 @@ const END_GATE: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_
 /// except those at sha `$3` when it is set, by `$4` at `$5`.
 const END_PULL: &str = "UPDATE ci_runs SET gate_status = 'cancelled', gate_by = $4, gate_at = $5, \
      gate_card_dirty = (gate_check_run_id IS NOT NULL) WHERE repo_id = $1 AND pull_number = $2 AND gate_status IN ('pending', 'deferred') \
-     AND ($3::text IS NULL OR pr_sha <> $3::text) RETURNING {columns}";
+     AND ($3::text IS NULL OR COALESCE(head_sha, sha) <> $3::text) RETURNING {columns}";
 
 /// Expires up to `$3` runs that waited since before `$1`, at `$2`.
 const EXPIRE: &str = "UPDATE ci_runs SET gate_status = 'expired', gate_at = $2, \
@@ -141,9 +148,9 @@ const DEFERRED: &str = "SELECT {columns} FROM (\
        FROM (\
          SELECT g.*, row_number() OVER (PARTITION BY repo_id, author_login \
            ORDER BY gate_scanned_at, created_at, id) AS rn_author FROM (\
-           SELECT DISTINCT ON (repo_id, pull_number, pr_sha) ci_runs.* FROM ci_runs \
+           SELECT DISTINCT ON (repo_id, pull_number, COALESCE(head_sha, sha)) ci_runs.* FROM ci_runs \
            WHERE gate_status = 'deferred' AND status <> 'completed' \
-           ORDER BY repo_id, pull_number, pr_sha, created_at, id) g) a \
+           ORDER BY repo_id, pull_number, COALESCE(head_sha, sha), created_at, id) g) a \
        WHERE rn_author <= $3) ci_runs \
      WHERE rn_repo <= $2 ORDER BY gate_scanned_at, created_at, id LIMIT $1";
 
@@ -246,6 +253,22 @@ pub async fn fork_waiting(
     author: &str,
     except_pull: Option<u64>,
 ) -> Result<Waiting> {
+    fork_waiting_beside(db, repo_id, author, except_pull, None).await
+}
+
+/// [`fork_waiting`], not counting the group of `except_pull` at commit
+/// `own_sha` either, which the caller is about to ask for itself.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn fork_waiting_beside(
+    db: &Db,
+    repo_id: u64,
+    author: &str,
+    except_pull: Option<u64>,
+    own_sha: Option<&str>,
+) -> Result<Waiting> {
     #[derive(Deserialize, Default)]
     struct Counts {
         pending: u64,
@@ -253,7 +276,7 @@ pub async fn fork_waiting(
         author_active: u64,
     }
     let counts: Counts = db
-        .first(WAITING, &params![repo_id, author, except_pull])
+        .first(WAITING, &params![repo_id, author, except_pull, own_sha])
         .await?
         .unwrap_or_default();
     Ok(Waiting {

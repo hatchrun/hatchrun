@@ -253,21 +253,32 @@ pub fn admission(policy: &RepoPolicy, association: &str, waiting: Waiting) -> Ad
     }
     // An author over the cap waits like a run over the approval slots,
     // whether or not the run would need an approval.
-    let later = if waiting.deferred < MAX_DEFERRED {
-        Admission::Deferred
-    } else {
-        Admission::Drop
-    };
     if waiting.author_active >= MAX_ACTIVE_PER_AUTHOR {
-        return later;
+        return later(waiting);
     }
     if !needs_approval(policy.fork_approval, association) {
         return Admission::Run;
     }
+    caps(waiting)
+}
+
+/// What a run that has to wait for an approval becomes given what
+/// already waits: a card when a slot is free, otherwise it waits for one.
+fn caps(waiting: Waiting) -> Admission {
     if waiting.pending < MAX_PENDING {
         Admission::Pending
     } else {
-        later
+        later(waiting)
+    }
+}
+
+/// What a run that cannot ask yet becomes: deferred, or dropped when
+/// the repository has too many deferred.
+fn later(waiting: Waiting) -> Admission {
+    if waiting.deferred < MAX_DEFERRED {
+        Admission::Deferred
+    } else {
+        Admission::Drop
     }
 }
 
@@ -281,24 +292,13 @@ pub const fn refusal(admission: Admission) -> Option<&'static str> {
     }
 }
 
-/// What a `pull_request_target` run of a fork's pull request becomes
-/// under `policy`: it waits for approval whoever the author is, within
-/// the same caps as the fork runs of the `pull_request` event, and
-/// whether fork runs are on has no say, because the run is the base
-/// repository's own workflow.
+/// What a `pull_request_target` run of a fork's pull request becomes:
+/// it waits for approval whoever the author is, within the caps of the
+/// fork runs of the `pull_request` event on waiting runs. Whether fork
+/// runs are on and the per-author cap are about the other event.
 #[must_use]
-pub fn target_admission(policy: &RepoPolicy, waiting: Waiting) -> Admission {
-    let strictest = RepoPolicy {
-        fork_runs: ForkRuns::On,
-        fork_approval: ForkApproval::AllOutside,
-        ..*policy
-    };
-    // The per-author cap counts fork runs of the other event.
-    let waiting = Waiting {
-        author_active: 0,
-        ..waiting
-    };
-    admission(&strictest, "", waiting)
+pub fn target_admission(waiting: Waiting) -> Admission {
+    caps(waiting)
 }
 
 /// How much an approval level asks for: the more authors it asks about,
@@ -523,35 +523,29 @@ mod tests {
     }
 
     #[test]
-    fn a_target_run_of_a_fork_waits_whoever_the_author_is_and_fork_runs_off_has_no_say() {
+    fn a_target_run_of_a_fork_waits_for_a_card_and_shares_the_caps_of_fork_runs() {
         let free = Waiting::default();
-        for association in ["OWNER", "MEMBER", "COLLABORATOR", "NONE", ""] {
-            // Whatever `admission` would have made of the author.
-            let _ = admission(&PUBLIC, association, free);
-            assert_eq!(target_admission(&PUBLIC, free), Admission::Pending);
-        }
-        // The run is the base repository's own workflow: fork runs being
-        // off does not turn it away.
-        let off = RepoPolicy::default_for(true);
-        assert_eq!(target_admission(&off, free), Admission::Pending);
+        // It asks whoever the author is, and fork runs being off or an
+        // author over the cap are about the other event.
+        assert_eq!(target_admission(free), Admission::Pending);
         // The same caps as the other fork runs.
         let full = Waiting {
             pending: MAX_PENDING,
             ..free
         };
-        assert_eq!(target_admission(&PUBLIC, full), Admission::Deferred);
+        assert_eq!(target_admission(full), Admission::Deferred);
         let flooded = Waiting {
             pending: MAX_PENDING,
             deferred: MAX_DEFERRED,
             ..free
         };
-        assert_eq!(target_admission(&PUBLIC, flooded), Admission::Drop);
+        assert_eq!(target_admission(flooded), Admission::Drop);
         // The per-author cap counts the other event's runs.
         let busy = Waiting {
             author_active: MAX_ACTIVE_PER_AUTHOR,
             ..free
         };
-        assert_eq!(target_admission(&PUBLIC, busy), Admission::Pending);
+        assert_eq!(target_admission(busy), Admission::Pending);
     }
 
     #[test]

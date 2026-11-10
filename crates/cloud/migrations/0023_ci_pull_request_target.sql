@@ -21,11 +21,20 @@ ALTER TABLE ci_repo_policy ADD COLUMN pull_request_target_head_checkout text NOT
 
 -- The pull request head a pull_request_target run is for. The run's own
 -- sha is the base branch's, so the approval of a run, its card and the
--- newer commit that supersedes it are all by the head. pr_sha is the
--- commit an approval is about: the head for a pull_request_target run,
--- the run's sha for the others.
+-- newer commit that supersedes it are all by the head: the commit an
+-- approval is about is COALESCE(head_sha, sha), the head for a
+-- pull_request_target run and the run's sha for the others. The column
+-- is plain and nullable, so adding it only changes the catalog; a
+-- generated column would rewrite the table under an ACCESS EXCLUSIVE
+-- lock.
 ALTER TABLE ci_runs ADD COLUMN head_sha text;
-ALTER TABLE ci_runs ADD COLUMN pr_sha text GENERATED ALWAYS AS (COALESCE(head_sha, sha)) STORED;
+-- The runs that wait for an approval, by the commit it is about. The
+-- migration runner applies a pass in one transaction, which rules out
+-- CREATE INDEX CONCURRENTLY; the index is partial on the waiting states,
+-- so building it reads the table once under a lock that blocks writes to
+-- it for that scan.
+CREATE INDEX ci_runs_gate_commit ON ci_runs (repo_id, pull_number, (COALESCE(head_sha, sha)))
+  WHERE gate_status IN ('pending', 'deferred');
 -- What the planner found in the run's workflow, one finding to a line,
 -- for the approval card.
 ALTER TABLE ci_runs ADD COLUMN lints text;

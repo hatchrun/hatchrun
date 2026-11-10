@@ -1360,6 +1360,115 @@ fn a_target_run_is_approved_and_superseded_by_the_pull_requests_head() {
 }
 
 #[test]
+fn the_commit_of_an_approval_is_an_indexed_expression_not_a_generated_column() {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        found: String,
+    }
+    let db = setup();
+    let generated: Row = db
+        .wait(db.db().first(
+            "SELECT is_generated AS found FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'ci_runs' \
+             AND column_name = 'head_sha'",
+            &params![],
+        ))
+        .unwrap()
+        .unwrap();
+    // A plain column: adding it did not rewrite the table.
+    assert_eq!(generated.found, "NEVER");
+    let index: Row = db
+        .wait(db.db().first(
+            "SELECT indexdef AS found FROM pg_indexes \
+             WHERE schemaname = current_schema() AND indexname = 'ci_runs_gate_commit'",
+            &params![],
+        ))
+        .unwrap()
+        .unwrap();
+    assert!(
+        index.found.contains("COALESCE(head_sha, sha)"),
+        "{}",
+        index.found
+    );
+    let pr_sha: Option<Row> = db
+        .wait(db.db().first(
+            "SELECT column_name AS found FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'ci_runs' \
+             AND column_name = 'pr_sha'",
+            &params![],
+        ))
+        .unwrap();
+    assert!(pr_sha.is_none());
+}
+
+#[test]
+fn the_runs_of_one_delivery_do_not_count_against_each_other() {
+    let db = setup();
+    // The target run is asked for first; the fork run of the same
+    // delivery is then counted without it.
+    let target = target_run(&db, "d-pr:target", 4, "h1", GateStatus::Pending);
+    let fork = fork_run(&db, "d-pr", 4, "h1", "mallory", GateStatus::Pending, 10);
+    assert_eq!(target.pr_sha(), fork.pr_sha());
+    let counted = db
+        .wait(fork_waiting_beside(db.db(), 7, "mallory", Some(4), None))
+        .unwrap();
+    assert_eq!(counted.pending, 1, "one group, one card's room");
+    let beside = db
+        .wait(fork_waiting_beside(
+            db.db(),
+            7,
+            "mallory",
+            Some(4),
+            Some("h1"),
+        ))
+        .unwrap();
+    assert_eq!(beside.pending, 0, "its own group is not counted against it");
+    // Another pull request's group, or another commit of this one, is.
+    fork_run(&db, "d-other", 5, "o1", "eve", GateStatus::Pending, 11);
+    let other = db
+        .wait(fork_waiting_beside(
+            db.db(),
+            7,
+            "mallory",
+            Some(4),
+            Some("h1"),
+        ))
+        .unwrap();
+    assert_eq!(other.pending, 1);
+}
+
+#[test]
+fn a_newer_head_clears_the_older_ones_waiting_runs_before_anything_is_counted() {
+    let db = setup();
+    target_run(&db, "d1:target", 4, "h1", GateStatus::Pending);
+    fork_run(&db, "d1", 4, "h1", "mallory", GateStatus::Pending, 10);
+    let before = db
+        .wait(fork_waiting_beside(
+            db.db(),
+            7,
+            "mallory",
+            Some(4),
+            Some("h2"),
+        ))
+        .unwrap();
+    assert_eq!(before.pending, 1, "the old head still holds a slot");
+    let ended = db
+        .wait(end_pull_gates(db.db(), 7, 4, Some("h2"), 30))
+        .unwrap();
+    assert_eq!(ended.len(), 2);
+    let after = db
+        .wait(fork_waiting_beside(
+            db.db(),
+            7,
+            "mallory",
+            Some(4),
+            Some("h2"),
+        ))
+        .unwrap();
+    assert_eq!(after.pending, 0);
+}
+
+#[test]
 fn a_target_run_is_approved_or_rejected_from_the_app_like_a_fork_run() {
     let db = setup();
     fork_run(&db, "d-pr", 4, "h1", "mallory", GateStatus::Pending, 10);

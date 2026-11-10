@@ -375,32 +375,38 @@ fn names_head(text: &str) -> bool {
 }
 
 /// Why the job is tainted: the first read of the pull request head found
-/// in it (its env, a step's env, `with:`, a script, its container and
-/// services), else `None`. What only compares or labels (`if:`,
-/// `continue-on-error`, `concurrency:`, `name:`) is not a read. A job
-/// that cannot be read counts as tainted.
+/// in it (its env, its matrix, a step's env, `with:` or script, its
+/// container and services), else `None`. What only compares or labels
+/// is not a read: the job's own `if:`, `continue-on-error`,
+/// `concurrency:` and `name:`, and a step's. A job that cannot be read
+/// counts as tainted.
 fn job_taint(job: &PlannedJob) -> Option<String> {
-    let Ok(value) = serde_json::to_value(job) else {
+    let Some(texts) = job_texts(job) else {
         return Some("a job that could not be read".to_owned());
     };
-    taint_in(&value)
+    texts.iter().find_map(|text| head_read(text))
 }
 
-fn taint_in(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => head_read(text),
-        Value::Array(items) => items.iter().find_map(taint_in),
-        Value::Object(fields) => fields
-            .iter()
-            .filter(|(key, _)| !LABELS.contains(&key.as_str()))
-            .find_map(|(_, item)| taint_in(item)),
-        _ => None,
-    }
+/// Whether anything in the job reads the `needs` context.
+fn reads_needs(job: &PlannedJob) -> bool {
+    let Some(texts) = job_texts(job) else {
+        return true;
+    };
+    texts.iter().any(|text| {
+        reads(text).map_or(true, |list| {
+            list.iter().any(|read| {
+                read.paths
+                    .iter()
+                    .any(|path| path.first().is_some_and(|c| c == "needs"))
+            })
+        })
+    })
 }
 
-/// Keys of a planned job whose text only compares or labels.
-const LABELS: &[&str] = &[
-    "if",
+/// Keys of a planned job that only compare or label, at the job's own
+/// level. What is nested in the other keys is read whatever it is called:
+/// a `matrix` value, an env variable or a `with:` input named `name`.
+const JOB_LABELS: &[&str] = &[
     "if_",
     "continue_on_error",
     "concurrency",
@@ -408,29 +414,55 @@ const LABELS: &[&str] = &[
     "id",
     "requires",
     "strategy",
-    "matrix",
 ];
 
-/// Whether anything in the job reads the `needs` context.
-fn reads_needs(job: &PlannedJob) -> bool {
-    fn walk(value: &Value) -> bool {
+/// Keys of a planned step that only compare or label, at the step's own
+/// level.
+const STEP_LABELS: &[&str] = &["if", "continue_on_error", "name", "id", "timeout_minutes"];
+
+/// The texts of a job that can read something: every string in it but
+/// the labels, `None` when the job does not serialize.
+fn job_texts(job: &PlannedJob) -> Option<Vec<String>> {
+    fn strings(value: &Value, out: &mut Vec<String>) {
         match value {
-            Value::String(text) => reads(text).map_or(true, |list| {
-                list.iter().any(|read| {
-                    read.paths
-                        .iter()
-                        .any(|path| path.first().is_some_and(|c| c == "needs"))
-                })
-            }),
-            Value::Array(items) => items.iter().any(walk),
-            Value::Object(fields) => fields
-                .iter()
-                .filter(|(key, _)| !LABELS.contains(&key.as_str()))
-                .any(|(_, item)| walk(item)),
-            _ => false,
+            Value::String(text) => out.push(text.clone()),
+            Value::Array(items) => items.iter().for_each(|item| strings(item, out)),
+            Value::Object(fields) => fields.values().for_each(|item| strings(item, out)),
+            _ => {}
         }
     }
-    serde_json::to_value(job).map_or(true, |value| walk(&value))
+    let Value::Object(fields) = serde_json::to_value(job).ok()? else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for (key, value) in &fields {
+        if JOB_LABELS.contains(&key.as_str()) {
+            continue;
+        }
+        if key != "steps" {
+            strings(value, &mut out);
+            continue;
+        }
+        // A step is `{ "<kind>": { fields } }`.
+        for step in value.as_array()? {
+            let Value::Object(kinds) = step else {
+                strings(step, &mut out);
+                continue;
+            };
+            for inner in kinds.values() {
+                let Value::Object(fields) = inner else {
+                    strings(inner, &mut out);
+                    continue;
+                };
+                for (key, value) in fields {
+                    if !STEP_LABELS.contains(&key.as_str()) {
+                        strings(value, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 /// How a script finds the pull request at run time, when it does: its
@@ -705,6 +737,54 @@ mod tests {
         let job = "    if: github.event.pull_request.head.repo.full_name == github.repository\n    concurrency:\n      group: ci-${{ github.head_ref }}\n";
         assert!(!blocked(job, "      - checkout"));
         assert!(!blocked(job, "      - run: git fetch origin main"));
+    }
+
+    #[test]
+    fn a_label_key_nested_in_env_with_or_matrix_still_reads_the_head() {
+        let head = "${{ github.event.pull_request.head.sha }}";
+        // An env variable named like a label key.
+        for key in ["name", "if", "id", "concurrency"] {
+            let steps = format!(
+                "      - run: git fetch origin \"$V\"\n        env:\n          {key}: {head}\n          V: x"
+            );
+            assert!(blocked("", &steps), "env {key}");
+        }
+        // A `with:` input named like a label key.
+        for key in ["name", "if", "id"] {
+            let steps = format!(
+                "      - uses: some/action@v1\n        with:\n          {key}: {head}\n      - run: git fetch origin main"
+            );
+            assert!(blocked("", &steps), "with {key}");
+        }
+        // The job's env under a key that is not the job's own label.
+        let job = format!("    env:\n      name: {head}\n");
+        assert!(blocked(
+            &job,
+            "      - run: git clone https://example.com/x"
+        ));
+        // A matrix value.
+        let yaml = format!(
+            "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - run: git fetch origin ${{{{ matrix.ref }}}}
+workflows:
+  w:
+    on: {{ pull_request_target: {{}} }}
+    jobs:
+      - t: {{ matrix: {{ ref: ['{head}'] }} }}
+"
+        );
+        let config = parse(&yaml).unwrap();
+        let plan = compile(&config, "w", "refs/heads/main").unwrap();
+        assert_eq!(plan_lints(&plan).len(), 1, "matrix");
+        // The labels at their own level still are not reads.
+        let steps = format!(
+            "      - run: git fetch origin main\n        name: {head}\n        if: {head} != ''"
+        );
+        assert!(!blocked("", &steps));
     }
 
     #[test]

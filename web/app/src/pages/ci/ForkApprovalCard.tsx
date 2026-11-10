@@ -57,7 +57,7 @@ export function ForkApprovalCard({
         </span>
         <span className="flex min-w-0 items-center gap-2">
           <span className="cap">head</span>
-          <Truncate value={fork.head_repo ?? "a deleted fork"} className="text-fg" />
+          <Truncate value={fork.head_repo || "a deleted fork"} className="text-fg" />
         </span>
         <span className="text-fg-3">No secrets, no write token, no OIDC token, no environment.</span>
       </section>
@@ -98,7 +98,7 @@ export function ForkApprovalCard({
           </span>
           <span className="flex min-w-0 items-center gap-2">
             <span className="cap">head</span>
-            <Truncate value={fork.head_repo ?? "a deleted fork"} className="text-fg" />
+            <Truncate value={fork.head_repo || "a deleted fork"} className="text-fg" />
           </span>
           {target && <span className="text-fg-3">pull_request_target</span>}
           {gate.status === "approved" && gate.by && <span className="text-fg-2">Approved by {gate.by}</span>}

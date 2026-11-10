@@ -69,32 +69,46 @@ fn target_waits(policy: &RepoPolicy, fork: bool) -> bool {
     fork && policy.pull_request_target_head_checkout == policy::HeadCheckout::Approve
 }
 
-/// What the `pull_request_target` runs of a pull request start as: with
-/// no gate, or waiting for an approval (`Pending`) or a free slot
-/// (`Deferred`), or `Err` with why nothing starts. A run that waits for a
-/// closed pull request (`open` false) or a delivery that is not the
-/// newest (`applied` false) could never be approved, so none is made.
+/// What the `pull_request_target` runs of a pull request become.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetGate {
+    /// They start: with no gate, or waiting for an approval (`Pending`)
+    /// or a free slot (`Deferred`).
+    Start(GateStatus),
+    /// They need an approval that cannot be asked for, so they do not
+    /// run, and the pull request's head says why.
+    Refused(&'static str),
+    /// The delivery is not the newest, and says nothing about the pull
+    /// request as it stands.
+    Stale,
+}
+
+/// What the `pull_request_target` runs of a pull request become under
+/// `policy`, given what already waits. A run that waits for a closed pull
+/// request (`open` false) could never be approved, and a repository over
+/// its caps has no room to ask, so those are refused and never run
+/// without an approval.
 fn target_gate(
     policy: &RepoPolicy,
     fork: bool,
     open: bool,
     applied: bool,
     waiting: Waiting,
-) -> std::result::Result<GateStatus, &'static str> {
+) -> TargetGate {
     if !target_waits(policy, fork) {
-        return Ok(GateStatus::NotGated);
-    }
-    if !open {
-        return Err("the pull request is closed");
+        return TargetGate::Start(GateStatus::NotGated);
     }
     if !applied {
-        return Err("the delivery is older than the pull request's recorded state");
+        return TargetGate::Stale;
     }
-    let admission = policy::target_admission(policy, waiting);
+    if !open {
+        return TargetGate::Refused("a closed pull request cannot be approved");
+    }
+    let admission = policy::target_admission(waiting);
     if let Some(reason) = policy::refusal(admission) {
-        return Err(reason);
+        return TargetGate::Refused(reason);
     }
-    Ok(match admission {
+    TargetGate::Start(match admission {
         Admission::Pending => GateStatus::Pending,
         Admission::Deferred => GateStatus::Deferred,
         _ => GateStatus::NotGated,
@@ -767,7 +781,8 @@ impl Cx<'_> {
         cache: &mut Option<RepoPolicy>,
     ) -> Result<Vec<u64>> {
         let git_ref = runs::compile_ref_for(pr);
-        let config = runs::read_config(
+        // Whether the branch has a listener, read by its name.
+        let probe = runs::read_config(
             self.tokens,
             self.settings,
             pr.installation_id,
@@ -777,7 +792,7 @@ impl Cx<'_> {
         .await?;
         // A config that is missing or cannot be read has nothing to run:
         // the push that made it was told, on its own commit.
-        if !matches!(&config, Config::Text(Ok(source)) if planning::has_pull_request_target(source))
+        if !matches!(&probe, Config::Text(Ok(source)) if planning::has_pull_request_target(source))
         {
             return Ok(Vec::new());
         }
@@ -793,29 +808,51 @@ impl Cx<'_> {
             return Ok(Vec::new());
         };
         let sha = sha.as_str();
+        // The plan is the config at the commit the run is on, which is
+        // the `GITHUB_SHA` its steps see.
+        let config = runs::read_config(
+            self.tokens,
+            self.settings,
+            pr.installation_id,
+            &pr.repo.full_name,
+            sha,
+        )
+        .await?;
         let policy = self.policy_of(pr, cache).await?;
         let waits = target_waits(&policy, pr.fork.is_some());
+        if waits && applied {
+            // A newer commit ends the waiting runs of older ones, and a
+            // closed pull request all of them, before anything is
+            // counted, as for a fork run.
+            let open = pr.state == "open";
+            let keep = open.then_some(pr.head_sha.as_str());
+            self.end_waiting(pr, keep, if open { fork::SUPERSEDED } else { fork::CLOSED })
+                .await?;
+        }
         let waiting = if waits {
-            store::fork_waiting(self.db, pr.repo.id, &pr.author, Some(pr.number)).await?
+            // The fork run of this delivery, asked for next, shares the
+            // pull request's group with this run and counts once.
+            store::fork_waiting_beside(
+                self.db,
+                pr.repo.id,
+                &pr.author,
+                Some(pr.number),
+                Some(&pr.head_sha),
+            )
+            .await?
         } else {
             Waiting::default()
         };
-        let gate = match target_gate(
+        let (gate, refused) = match target_gate(
             &policy,
             pr.fork.is_some(),
             pr.state == "open",
             applied,
             waiting,
         ) {
-            Ok(gate) => gate,
-            Err(reason) => {
-                worker::console_warn!(
-                    "{}: pull_request_target of #{} not started: {reason}",
-                    pr.repo.full_name,
-                    pr.number
-                );
-                return Ok(Vec::new());
-            }
+            TargetGate::Start(gate) => (gate, None),
+            TargetGate::Refused(reason) => (GateStatus::NotGated, Some(reason)),
+            TargetGate::Stale => return Ok(Vec::new()),
         };
         let wants_paths = matches!(&config, Config::Text(Ok(source))
             if planning::needs_pull_request_target_paths(source, &pr.action, &pr.base_ref));
@@ -857,15 +894,18 @@ impl Cx<'_> {
                     // the run's page; the run's trust stays the
                     // repository's own.
                     head_repo_id: pr.fork.as_ref().and_then(|fork| fork.head_repo_id),
+                    // A deleted fork has no name; an empty one still marks
+                    // the run as a fork's.
                     head_repo_name: pr
                         .fork
                         .as_ref()
-                        .and_then(|fork| fork.head_repo_name.as_deref()),
+                        .map(|fork| fork.head_repo_name.as_deref().unwrap_or("")),
                     author: &pr.author,
                     association: &pr.author_association,
                     gate,
                     target: Some(runs::Target {
                         head_sha: &pr.head_sha,
+                        refused,
                     }),
                     ..runs::Origin::own(&pr.actor)
                 },
@@ -1192,19 +1232,23 @@ mod tests {
         // A fork's pull request waits whoever wrote it.
         assert_eq!(
             target_gate(&approving(), true, true, true, free),
-            Ok(GateStatus::Pending)
+            TargetGate::Start(GateStatus::Pending)
         );
         // The repository's own pull request runs at once.
         assert_eq!(
             target_gate(&approving(), false, true, true, free),
-            Ok(GateStatus::NotGated)
+            TargetGate::Start(GateStatus::NotGated)
         );
-        // Under warn nothing waits, fork or not.
+        // Under warn nothing waits, fork or not, closed or not.
         let warn = RepoPolicy::default_for(false);
-        for fork in [true, false] {
+        for (fork, open, applied) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, true),
+        ] {
             assert_eq!(
-                target_gate(&warn, fork, true, true, free),
-                Ok(GateStatus::NotGated)
+                target_gate(&warn, fork, open, applied, free),
+                TargetGate::Start(GateStatus::NotGated)
             );
         }
         assert!(target_waits(&approving(), true));
@@ -1213,37 +1257,43 @@ mod tests {
     }
 
     #[test]
-    fn a_waiting_target_run_is_not_made_for_a_closed_pull_request_or_a_stale_delivery() {
+    fn a_closed_pull_request_is_refused_visibly_and_a_stale_delivery_is_skipped() {
         let free = Waiting::default();
-        assert!(target_gate(&approving(), true, false, true, free).is_err());
-        assert!(target_gate(&approving(), true, true, false, free).is_err());
+        // Never run unapproved: the closed pull request's workflows are
+        // refused with a reason the head shows.
+        assert!(matches!(
+            target_gate(&approving(), true, false, true, free),
+            TargetGate::Refused(reason) if reason.contains("closed")
+        ));
+        assert_eq!(
+            target_gate(&approving(), true, true, false, free),
+            TargetGate::Stale
+        );
         // Neither applies to a run that does not wait.
         assert_eq!(
             target_gate(&approving(), false, false, false, free),
-            Ok(GateStatus::NotGated)
-        );
-        let warn = RepoPolicy::default_for(false);
-        assert_eq!(
-            target_gate(&warn, true, false, false, free),
-            Ok(GateStatus::NotGated)
+            TargetGate::Start(GateStatus::NotGated)
         );
     }
 
     #[test]
-    fn a_target_run_waits_for_a_slot_when_the_repository_has_too_many_waiting() {
+    fn a_target_run_waits_for_a_slot_and_is_refused_past_the_caps() {
         let full = Waiting {
             pending: policy::MAX_PENDING,
             ..Waiting::default()
         };
         assert_eq!(
             target_gate(&approving(), true, true, true, full),
-            Ok(GateStatus::Deferred)
+            TargetGate::Start(GateStatus::Deferred)
         );
         let flooded = Waiting {
             deferred: policy::MAX_DEFERRED,
             ..full
         };
-        assert!(target_gate(&approving(), true, true, true, flooded).is_err());
+        assert!(matches!(
+            target_gate(&approving(), true, true, true, flooded),
+            TargetGate::Refused(reason) if reason.contains("too many")
+        ));
         // Fork runs being off does not turn a target run away.
         let off = RepoPolicy {
             fork_runs: policy::ForkRuns::Off,
@@ -1251,7 +1301,7 @@ mod tests {
         };
         assert_eq!(
             target_gate(&off, true, true, true, Waiting::default()),
-            Ok(GateStatus::Pending)
+            TargetGate::Start(GateStatus::Pending)
         );
     }
 
