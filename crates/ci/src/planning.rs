@@ -100,19 +100,43 @@ pub fn remote_workflows(source: &str, event: &Event) -> Vec<String> {
 /// False when the config does not parse (it is reported without them).
 #[must_use]
 pub fn needs_pull_request_paths(source: &str, action: &str, base_ref: &str) -> bool {
+    needs_paths(source, action, base_ref, false)
+}
+
+/// As [`needs_pull_request_paths`], for the workflows of
+/// `on: pull_request_target`, which `source` is the base branch's config
+/// of.
+#[must_use]
+pub fn needs_pull_request_target_paths(source: &str, action: &str, base_ref: &str) -> bool {
+    needs_paths(source, action, base_ref, true)
+}
+
+fn needs_paths(source: &str, action: &str, base_ref: &str, target: bool) -> bool {
     let Ok(config) = parse(source) else {
         return false;
     };
-    let event = Event::PullRequest {
-        action: action.to_owned(),
-        base_ref: base_ref.to_owned(),
-        changed: Vec::new(),
+    let (action, base_ref, changed) = (action.to_owned(), base_ref.to_owned(), Vec::new());
+    let event = if target {
+        Event::PullRequestTarget {
+            action,
+            base_ref,
+            changed,
+        }
+    } else {
+        Event::PullRequest {
+            action,
+            base_ref,
+            changed,
+        }
     };
     config.workflows.values().any(|wf| {
+        let on = if target {
+            &wf.on.pull_request_target
+        } else {
+            &wf.on.pull_request
+        };
         triggered(&wf.on, &event)
-            && wf
-                .on
-                .pull_request
+            && on
                 .as_ref()
                 .is_some_and(|pr| pr.paths.is_some() || pr.paths_ignore.is_some())
     })
@@ -176,6 +200,29 @@ workflows:
         assert!(needs_pull_request_paths(config, "labeled", "main"));
         assert!(!needs_pull_request_paths(config, "opened", "main"));
         assert!(!needs_pull_request_paths("not: [valid", "labeled", "main"));
+    }
+
+    #[test]
+    fn pull_request_target_paths_are_needed_by_its_own_workflows_only() {
+        let config = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  plain:
+    on: { pull_request_target: { types: [labeled] } }
+    jobs: [t]
+  docs:
+    on: { pull_request_target: { types: [opened], paths: ['docs/**'] } }
+    jobs: [t]
+  other:
+    on: { pull_request: { types: [labeled], paths: ['src/**'] } }
+    jobs: [t]
+";
+        assert!(needs_pull_request_target_paths(config, "opened", "main"));
+        assert!(!needs_pull_request_target_paths(config, "labeled", "main"));
+        // The pull_request workflow's filter is not the target's.
+        assert!(needs_pull_request_paths(config, "labeled", "main"));
+        assert!(!needs_pull_request_paths(config, "opened", "main"));
     }
 
     #[test]

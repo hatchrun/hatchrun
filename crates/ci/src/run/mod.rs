@@ -167,6 +167,12 @@ pub struct RunInfo {
     /// What the workflow's `run-name` gave, when it has one: the title
     /// the check runs show.
     pub title: Option<String>,
+    /// What the planner found in the workflow that the author of the
+    /// event should hear about (see [`hatchrun_workflow::lints`]), shown
+    /// in the summary of every check run of the run. A run stored before
+    /// the planner kept them has none.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// The body of `POST /start`.

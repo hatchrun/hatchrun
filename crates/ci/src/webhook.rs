@@ -62,6 +62,17 @@ fn release_commit(found: Option<String>) -> std::result::Result<String, Outcome>
     found.ok_or_else(|| Outcome::Ignored("release tag is gone".to_owned()))
 }
 
+/// What a pull request's `pull_request_target` workflows run on: the
+/// ref (`refs/heads/<base>`, which is `GITHUB_REF`) and the commit
+/// (`GITHUB_SHA`) of the base branch, as GitHub sets them. The config is
+/// read at this commit and the run is on it, so nothing of the pull
+/// request's head, which its author controls, picks the workflow or
+/// what it checks out by default. `None` when the delivery names no base
+/// commit.
+fn target_base(pr: &PullRequest) -> Option<(String, &str)> {
+    (!pr.base_sha.is_empty()).then(|| (runs::compile_ref_for(pr), pr.base_sha.as_str()))
+}
+
 /// The tenant of a delivery, or why the delivery is ignored. A tenant
 /// without a card passes, and [`runs::create`] answers it with the card
 /// check run.
@@ -601,7 +612,9 @@ impl Cx<'_> {
         Ok(Outcome::Done(approved.iter().map(|run| run.id).collect()))
     }
 
-    #[allow(clippy::too_many_lines)] // One delivery, read top to bottom.
+    /// A pull request delivery starts up to two groups of runs: the
+    /// `pull_request_target` workflows, read from the base branch, and
+    /// the `pull_request` workflows, read at the head.
     async fn pull_request(&self, pr: &PullRequest) -> Result<Outcome> {
         // Every action carries the pull request as it stands, and a run
         // of any of them (`labeled` included) needs its row, so all are
@@ -628,6 +641,118 @@ impl Cx<'_> {
             store::PullWrite::Stale => false,
             store::PullWrite::Tied => self.tie_is_current(pr, &record).await?,
         };
+        // The base branch's workflows need nothing of the head: they run
+        // whatever happens to the fork's, and a late delivery is as good
+        // as an early one.
+        let mut ids = self.pull_request_target(pr).await?;
+        match self.pull_request_head(pr, applied).await? {
+            Outcome::Done(more) => ids.extend(more),
+            Outcome::Ignored(reason) if ids.is_empty() => return Ok(Outcome::Ignored(reason)),
+            Outcome::Ignored(_) => {}
+            Outcome::Retry => return Ok(Outcome::Retry),
+        }
+        Ok(Outcome::Done(ids))
+    }
+
+    /// The changed paths of a pull request, as GitHub lists them. Files
+    /// cost up to three calls, so callers ask only for a workflow that
+    /// filters on paths.
+    async fn pull_paths(&self, pr: &PullRequest) -> Result<Vec<String>> {
+        let mut changed = Vec::new();
+        for page in 1..=github::FILES_MAX_PAGES {
+            let response = self
+                .tokens
+                .send(pr.installation_id, |token| {
+                    github::pull_files(
+                        &self.settings.github_api,
+                        &pr.repo.full_name,
+                        pr.number,
+                        page,
+                        token,
+                    )
+                })
+                .await
+                .map_err(|err| fail(err.to_string()))?;
+            let names = github::pull_file_names(&response).map_err(fail)?;
+            let full = names.len() >= github::FILES_PAGE_SIZE;
+            changed.extend(names);
+            if !full || changed.len() >= MAX_CHANGED {
+                break;
+            }
+        }
+        changed.truncate(MAX_CHANGED);
+        Ok(changed)
+    }
+
+    /// The `pull_request_target` workflows of a pull request. As on
+    /// GitHub they run from the base branch: the config is read at the
+    /// base commit (never at the head, which the author controls),
+    /// `GITHUB_REF` is the base branch and `GITHUB_SHA` its commit. The
+    /// runs are trusted, so they get the repository's secrets and a
+    /// token that can write, and no approval is asked of a fork's. The
+    /// repository's policy says what a workflow that checks out the head
+    /// does (see [`runs::create`]).
+    async fn pull_request_target(&self, pr: &PullRequest) -> Result<Vec<u64>> {
+        let Some((git_ref, sha)) = target_base(pr) else {
+            return Ok(Vec::new());
+        };
+        let config = runs::read_config(
+            self.tokens,
+            self.settings,
+            pr.installation_id,
+            &pr.repo.full_name,
+            sha,
+        )
+        .await?;
+        let wants_paths = matches!(&config, Config::Text(Ok(source))
+            if planning::needs_pull_request_target_paths(source, &pr.action, &pr.base_ref));
+        let changed = if wants_paths {
+            self.pull_paths(pr).await?
+        } else {
+            Vec::new()
+        };
+        let policy = store::repo_policy(self.db, pr.repo.id, pr.repo.private).await?;
+        let trigger = Event::PullRequestTarget {
+            action: pr.action.clone(),
+            base_ref: pr.base_ref.clone(),
+            changed,
+        };
+        runs::create(
+            self.env,
+            self.db,
+            self.settings,
+            self.tokens,
+            &runs::Request {
+                tenant_id: self.tenant,
+                installation_id: pr.installation_id,
+                repo: &pr.repo,
+                delivery: self.delivery,
+                event_name: "pull_request_target",
+                event: &pr.payload,
+                trigger: &trigger,
+                compile_ref: &git_ref,
+                git_ref: &git_ref,
+                sha,
+                actor: &pr.actor,
+                head_ref: &pr.head_ref,
+                base_ref: &pr.base_ref,
+                workflow: None,
+                origin: runs::Origin {
+                    author: &pr.author,
+                    association: &pr.author_association,
+                    head_checkout: policy.pull_request_target_head_checkout,
+                    ..runs::Origin::own(&pr.actor)
+                },
+            },
+            &config,
+            self.now,
+        )
+        .await
+    }
+
+    /// The `pull_request` workflows of a pull request, read at the head.
+    #[allow(clippy::too_many_lines)] // One delivery, read top to bottom.
+    async fn pull_request_head(&self, pr: &PullRequest, applied: bool) -> Result<Outcome> {
         // A delivery older than what is recorded says nothing about the
         // pull request as it stands: it must not cancel the runs of the
         // newer commit as superseded, nor start runs of the older one.
@@ -653,31 +778,11 @@ impl Cx<'_> {
         // workflow that listens to this action and filters on paths.
         let wants_paths = matches!(&config, Config::Text(Ok(source))
             if planning::needs_pull_request_paths(source, &pr.action, &pr.base_ref));
-        let mut changed = Vec::new();
-        if wants_paths {
-            for page in 1..=github::FILES_MAX_PAGES {
-                let response = self
-                    .tokens
-                    .send(pr.installation_id, |token| {
-                        github::pull_files(
-                            &self.settings.github_api,
-                            &pr.repo.full_name,
-                            pr.number,
-                            page,
-                            token,
-                        )
-                    })
-                    .await
-                    .map_err(|err| fail(err.to_string()))?;
-                let names = github::pull_file_names(&response).map_err(fail)?;
-                let full = names.len() >= github::FILES_PAGE_SIZE;
-                changed.extend(names);
-                if !full || changed.len() >= MAX_CHANGED {
-                    break;
-                }
-            }
-            changed.truncate(MAX_CHANGED);
-        }
+        let changed = if wants_paths {
+            self.pull_paths(pr).await?
+        } else {
+            Vec::new()
+        };
         let trigger = Event::PullRequest {
             action: pr.action.clone(),
             base_ref: pr.base_ref.clone(),
@@ -712,6 +817,7 @@ impl Cx<'_> {
                         author: &pr.author,
                         association: &pr.author_association,
                         gate: *gate,
+                        head_checkout: policy.pull_request_target_head_checkout,
                         policy: Some(*policy),
                     },
                     _ => runs::Origin {
@@ -908,6 +1014,33 @@ mod tests {
             actor: "octocat".into(),
             payload: json!({ "ref": r#ref }),
         }
+    }
+
+    fn pull(body: &str) -> PullRequest {
+        match intake::parse("pull_request", body.as_bytes()).unwrap() {
+            Trigger::PullRequest(pr) => pr,
+            other => panic!("not a pull request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pull_request_target_run_is_on_the_base_branch_and_never_the_forks_head() {
+        let fork = pull(include_str!("../testdata/pull_request_fork.json"));
+        assert!(fork.fork.is_some());
+        let (git_ref, sha) = target_base(&fork).unwrap();
+        // The config is read at this commit and the run is on it: the
+        // base branch's commit, not the head the fork wrote.
+        assert_eq!(sha, "1111111111111111111111111111111111111111");
+        assert_ne!(sha, fork.head_sha);
+        assert_eq!(git_ref, "refs/heads/main");
+        assert!(!git_ref.contains("pull"), "{git_ref}");
+    }
+
+    #[test]
+    fn a_pull_request_target_delivery_without_a_base_commit_starts_nothing() {
+        let mut pr = pull(include_str!("../testdata/pull_request.json"));
+        pr.base_sha = String::new();
+        assert_eq!(target_base(&pr), None);
     }
 
     #[test]

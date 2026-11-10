@@ -80,6 +80,8 @@ pub struct JobView<'a> {
     pub workflow: &'a str,
     /// The run's title, from the workflow's `run-name`.
     pub run_title: Option<&'a str>,
+    /// What the planner found in the workflow, one line each.
+    pub warnings: &'a [String],
     /// The job.
     pub node: &'a Node,
     /// The commit the check run is on.
@@ -318,12 +320,16 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
     (run, sent + fresh_len)
 }
 
-/// What opens the summary: the run's title, then the environment the
-/// job deploys to, with its URL once it has one.
+/// What opens the summary: the run's title, what the planner warns
+/// about, then the environment the job deploys to, with its URL once it
+/// has one.
 fn heading(view: &JobView<'_>) -> String {
     let mut text = String::new();
     if let Some(run_title) = view.run_title {
         let _ = write!(text, "{}\n\n", plain(run_title));
+    }
+    for warning in view.warnings {
+        let _ = write!(text, "Warning: {}\n\n", plain(warning));
     }
     if let Some(environment) = &view.node.environment {
         let url = view
@@ -515,6 +521,7 @@ mod tests {
         JobView {
             workflow: "ci",
             run_title: None,
+            warnings: &[],
             node,
             head_sha: "abc",
             details_url: "https://ci.hatchrun.io/ci/o/r/runs/1/jobs/42".into(),
@@ -615,6 +622,28 @@ mod tests {
                 assert!(summary[..i].ends_with('\\'), "{opener} at {i}: {summary}");
             }
         }
+    }
+
+    #[test]
+    fn the_planners_warnings_head_the_summary_as_plain_text() {
+        let n = node(State::Running, None);
+        let warnings = [
+            "workflow `w`, job `t`, step 1: checks out the pull request head".to_owned(),
+            "[x](https://evil.example)".to_owned(),
+        ];
+        let mut v = view(&n, &[], &[]);
+        v.run_title = Some("Label");
+        v.warnings = &warnings;
+        let summary = render(&v).0.output.unwrap().summary;
+        assert!(
+            summary.starts_with("Label\n\nWarning: workflow "),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("checks out the pull request head"),
+            "{summary}"
+        );
+        assert!(!summary.contains("[x]"), "{summary}");
     }
 
     #[test]

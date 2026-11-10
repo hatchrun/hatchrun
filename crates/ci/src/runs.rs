@@ -19,7 +19,7 @@ use crate::env::{Settings, run_stub};
 use crate::github::{self, CONFIG_PATH, CheckRun, GhAnnotation, Output};
 use crate::intake::{PullRequest, Repo};
 use crate::planning::{self, Failed, Selected};
-use crate::policy::RepoPolicy;
+use crate::policy::{HeadCheckout, RepoPolicy};
 use crate::run::{RunInfo, Start, github_context};
 use crate::store::{self, CiBilling, GateStatus, JobRow, NewJob, NewRun, RunRow};
 use crate::trust::Trust;
@@ -55,6 +55,9 @@ pub struct Origin<'a> {
     /// The repository's fork policy, for a fork pull request: its jobs
     /// are cut to the policy's timeout and to 4 vCPUs.
     pub policy: Option<RepoPolicy>,
+    /// What a `pull_request_target` workflow that checks out the pull
+    /// request head does. Read for that event only.
+    pub head_checkout: HeadCheckout,
 }
 
 impl<'a> Origin<'a> {
@@ -70,6 +73,7 @@ impl<'a> Origin<'a> {
             association: "",
             gate: GateStatus::NotGated,
             policy: None,
+            head_checkout: HeadCheckout::Warn,
         }
     }
 }
@@ -478,6 +482,8 @@ pub async fn create(
             return Ok(Vec::new());
         }
     };
+    let (plans, failed) =
+        head_checkout_gate(plans, failed, req.event_name, req.origin.head_checkout);
     match billing_decision(tenant.ci_billing, plans.len()) {
         Billing::Run => {}
         Billing::AskForCard => {
@@ -488,8 +494,8 @@ pub async fn create(
         Billing::Nothing => return Ok(Vec::new()),
     }
     let mut ids = Vec::new();
-    for plan in &plans {
-        ids.push(start_plan(env, db, settings, req, plan, now).await?);
+    for (plan, warnings) in &plans {
+        ids.push(start_plan(env, db, settings, req, plan, warnings, now).await?);
     }
     // The good workflows run first: a GitHub error on a failed
     // workflow's check run must not keep them from starting.
@@ -522,6 +528,53 @@ fn fork_limits(plans: Vec<Plan>, mut failed: Vec<Failed>, fork: bool) -> (Vec<Pl
             }),
             None => kept.push(plan),
         }
+    }
+    (kept, failed)
+}
+
+/// The message of a workflow that a repository blocks for checking out
+/// the head of a pull request in `pull_request_target`.
+const HEAD_CHECKOUT_BLOCKED: &str = "this repository blocks pull_request_target workflows that \
+     check out the pull request head (`pull_request_target_head_checkout` is `block` in its fork \
+     policy), so the workflow did not run";
+
+/// What the planner found in each plan of a `pull_request_target`
+/// request. With the repository's rule at `block`, a plan that checks
+/// out the pull request head moves to the failed workflows with a
+/// message that says so, and starts nothing. Every other plan keeps the
+/// lines the findings make, for its check runs. Requests of other events
+/// pass unchanged and carry no lines.
+fn head_checkout_gate(
+    plans: Vec<Plan>,
+    mut failed: Vec<Failed>,
+    event_name: &str,
+    rule: HeadCheckout,
+) -> (Vec<(Plan, Vec<String>)>, Vec<Failed>) {
+    if event_name != "pull_request_target" {
+        return (
+            plans.into_iter().map(|plan| (plan, Vec::new())).collect(),
+            failed,
+        );
+    }
+    let mut kept = Vec::new();
+    for plan in plans {
+        let found = hatchrun_workflow::plan_lints(&plan);
+        let head: Vec<String> = found
+            .iter()
+            .filter(|lint| lint.kind == hatchrun_workflow::LintKind::HeadCheckout)
+            .map(hatchrun_workflow::Lint::text)
+            .collect();
+        if !head.is_empty() && rule == HeadCheckout::Block {
+            let mut diagnostics = vec![Diagnostic::new(HEAD_CHECKOUT_BLOCKED)];
+            diagnostics.extend(head.into_iter().map(Diagnostic::new));
+            failed.push(Failed {
+                workflow: plan.workflow.clone(),
+                diagnostics,
+            });
+            continue;
+        }
+        let lines = found.iter().map(hatchrun_workflow::Lint::text).collect();
+        kept.push((plan, lines));
     }
     (kept, failed)
 }
@@ -605,7 +658,7 @@ const MAX_MESSAGE: usize = 200;
 fn run_message(event_name: &str, event: &Value) -> Option<String> {
     let text = match event_name {
         "push" => event.pointer("/head_commit/message"),
-        "pull_request" => event.pointer("/pull_request/title"),
+        "pull_request" | "pull_request_target" => event.pointer("/pull_request/title"),
         _ => None,
     }?
     .as_str()?;
@@ -614,16 +667,21 @@ fn run_message(event_name: &str, event: &Value) -> Option<String> {
 }
 
 /// The number of the pull request a run is for: the one in the ref of a
-/// pull request event.
+/// `pull_request` run, and in the payload of a `pull_request_target`
+/// run.
 fn pull_number(req: &Request<'_>) -> Option<u64> {
-    if req.event_name != "pull_request" {
-        return None;
+    match req.event_name {
+        "pull_request" => req
+            .git_ref
+            .strip_prefix("refs/pull/")?
+            .strip_suffix("/merge")?
+            .parse()
+            .ok(),
+        // The ref of this run is the base branch; the delivery names the
+        // pull request.
+        "pull_request_target" => req.event.pointer("/pull_request/number")?.as_u64(),
+        _ => None,
     }
-    req.git_ref
-        .strip_prefix("refs/pull/")?
-        .strip_suffix("/merge")?
-        .parse()
-        .ok()
 }
 
 /// The title `plan`'s `run-name` gives the run, cut to [`MAX_MESSAGE`]
@@ -657,6 +715,7 @@ fn title_of(
         base_ref: req.base_ref.to_owned(),
         concurrency: None,
         title: None,
+        warnings: Vec::new(),
     };
     let mut github = github_context(&info, req.event, api);
     if let Some(fields) = github.as_object_mut() {
@@ -673,12 +732,15 @@ fn title_of(
 }
 
 /// Records the run of `plan`, with its jobs, and has its object start.
+/// `warnings` are what the planner found in the plan, shown in the check
+/// runs of its jobs.
 async fn start_plan(
     env: &Env,
     db: &Db,
     settings: &Settings,
     req: &Request<'_>,
     plan: &Plan,
+    warnings: &[String],
     now: u64,
 ) -> Result<u64> {
     let limited;
@@ -698,7 +760,8 @@ async fn start_plan(
         git_ref: req.git_ref.to_owned(),
         sha: req.sha.to_owned(),
         actor: req.actor.to_owned(),
-        base_ref: (req.event_name == "pull_request").then(|| req.base_ref.to_owned()),
+        base_ref: matches!(req.event_name, "pull_request" | "pull_request_target")
+            .then(|| req.base_ref.to_owned()),
         message: run_message(req.event_name, req.event),
         pull_number: pull_number(req),
         head_ref: pull_number(req).map(|_| req.head_ref.to_owned()),
@@ -749,7 +812,7 @@ async fn start_plan(
         // finished and been purged, and a second start would run it again.
         return Ok(run.id);
     }
-    let start = start_body(req, &run, &rows, plan, title)?;
+    let start = start_body(req, &run, &rows, plan, title, warnings)?;
     post_start(env, run.id, &start).await?;
     Ok(run.id)
 }
@@ -789,6 +852,7 @@ fn start_body(
     rows: &[JobRow],
     plan: &Plan,
     title: Option<String>,
+    warnings: &[String],
 ) -> Result<Start> {
     let jobs = plan
         .jobs
@@ -818,6 +882,7 @@ fn start_body(
             base_ref: req.base_ref.to_owned(),
             concurrency: plan.concurrency.clone(),
             title,
+            warnings: warnings.to_vec(),
         },
         jobs,
         event: req.event.clone(),
@@ -1035,6 +1100,156 @@ mod tests {
         );
         let config = hatchrun_workflow::parse(&yaml).unwrap();
         hatchrun_workflow::compile(&config, "ci", "refs/heads/main").unwrap()
+    }
+
+    /// The plan of a `pull_request_target` workflow with `steps`.
+    fn target_plan(steps: &str) -> Plan {
+        let yaml = format!(
+            "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n{steps}\n\
+             workflows:\n  w:\n    on: {{ pull_request_target: {{}} }}\n    jobs: [t]\n"
+        );
+        let config = hatchrun_workflow::parse(&yaml).unwrap();
+        hatchrun_workflow::compile(&config, "w", "refs/heads/main").unwrap()
+    }
+
+    const HEAD_CHECKOUT: &str = "      - uses: actions/checkout@v4\n        with:\n          \
+         ref: ${{ github.event.pull_request.head.sha }}\n      - run: make test";
+    const INJECTION: &str = "      - run: echo \"${{ github.event.pull_request.title }}\"";
+
+    #[test]
+    fn a_blocked_head_checkout_fails_the_workflow_with_a_clear_message_and_runs_nothing() {
+        let (plans, failed) = head_checkout_gate(
+            vec![target_plan(HEAD_CHECKOUT)],
+            Vec::new(),
+            "pull_request_target",
+            HeadCheckout::Block,
+        );
+        assert!(plans.is_empty(), "the plan must not start");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].workflow, "w");
+        let messages: Vec<&str> = failed[0]
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(messages[0].contains("blocks pull_request_target workflows"));
+        assert!(messages[0].contains("did not run"));
+        assert!(messages[1].contains("step 1"));
+        assert!(messages[1].contains("checks out the pull request head"));
+    }
+
+    #[test]
+    fn a_warned_head_checkout_runs_with_the_findings_attached() {
+        let (plans, failed) = head_checkout_gate(
+            vec![target_plan(HEAD_CHECKOUT)],
+            Vec::new(),
+            "pull_request_target",
+            HeadCheckout::Warn,
+        );
+        assert_eq!(failed.len(), 0);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].1.len(), 1);
+        assert!(plans[0].1[0].contains("checks out the pull request head"));
+    }
+
+    #[test]
+    fn script_injection_warns_and_is_never_blocked() {
+        for rule in [HeadCheckout::Warn, HeadCheckout::Block] {
+            let (plans, failed) = head_checkout_gate(
+                vec![target_plan(INJECTION)],
+                Vec::new(),
+                "pull_request_target",
+                rule,
+            );
+            assert!(failed.is_empty(), "{rule:?}");
+            assert_eq!(plans.len(), 1, "{rule:?}");
+            assert!(plans[0].1[0].contains("github.event.pull_request.title"));
+        }
+    }
+
+    #[test]
+    fn a_clean_plan_and_another_event_pass_untouched_under_block() {
+        let (plans, failed) = head_checkout_gate(
+            vec![target_plan("      - run: make test")],
+            Vec::new(),
+            "pull_request_target",
+            HeadCheckout::Block,
+        );
+        assert_eq!((plans.len(), failed.len()), (1, 0));
+        assert_eq!(plans[0].1.len(), 0);
+        // The rule is about pull_request_target; a pull_request run that
+        // checks out its own head is what that event is for.
+        let (plans, failed) = head_checkout_gate(
+            vec![target_plan(HEAD_CHECKOUT)],
+            Vec::new(),
+            "pull_request",
+            HeadCheckout::Block,
+        );
+        assert_eq!((plans.len(), failed.len()), (1, 0));
+        assert_eq!(plans[0].1.len(), 0);
+    }
+
+    #[test]
+    fn only_the_plan_that_checks_out_the_head_is_blocked() {
+        let mut clean = target_plan("      - run: make test");
+        clean.workflow = "clean".into();
+        let (plans, failed) = head_checkout_gate(
+            vec![clean, target_plan(HEAD_CHECKOUT)],
+            Vec::new(),
+            "pull_request_target",
+            HeadCheckout::Block,
+        );
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].0.workflow, "clean");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].workflow, "w");
+    }
+
+    #[test]
+    fn a_pull_request_target_run_is_for_the_pull_request_its_payload_names() {
+        let event = serde_json::json!({ "number": 7, "pull_request": { "number": 7 } });
+        let trigger = hatchrun_workflow::Event::Dispatch;
+        let repo = Repo {
+            id: 4242,
+            full_name: "octo/widgets".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        let request = |event_name, git_ref| Request {
+            tenant_id: "t",
+            installation_id: 1,
+            repo: &repo,
+            delivery: "d",
+            event_name,
+            event: &event,
+            trigger: &trigger,
+            compile_ref: git_ref,
+            git_ref,
+            sha: "abc",
+            actor: "octocat",
+            head_ref: "feature",
+            base_ref: "main",
+            workflow: None,
+            origin: Origin::own("octocat"),
+        };
+        // The ref is the base branch, so the number comes from the payload.
+        assert_eq!(
+            pull_number(&request("pull_request_target", "refs/heads/main")),
+            Some(7)
+        );
+        assert_eq!(
+            pull_number(&request("pull_request", "refs/pull/9/merge")),
+            Some(9)
+        );
+        assert_eq!(pull_number(&request("push", "refs/heads/main")), None);
+        assert_eq!(
+            run_message(
+                "pull_request_target",
+                &serde_json::json!({ "pull_request": { "title": "Fix" } })
+            )
+            .as_deref(),
+            Some("Fix")
+        );
     }
 
     #[test]

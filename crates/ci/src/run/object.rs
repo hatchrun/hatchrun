@@ -1785,6 +1785,7 @@ impl<'a> Cx<'a> {
             let view = JobView {
                 workflow: &run.info.workflow,
                 run_title: run.info.title.as_deref(),
+                warnings: &run.info.warnings,
                 node,
                 head_sha: &run.info.sha,
                 details_url: details_url(
