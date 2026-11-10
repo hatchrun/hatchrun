@@ -12,7 +12,7 @@ use hatchrun_workflow::{CommandOptions, CommandPermission};
 use serde_json::{Value, json};
 
 use crate::github::PullInfo;
-use crate::policy::{APPROVAL_EXPIRES_MS, ForkRuns};
+use crate::policy::{self, APPROVAL_EXPIRES_MS, Admission, ForkRuns};
 use crate::store::{GateStatus, RunRow};
 
 /// The most runs of the `issue_comment` event that are not over for one
@@ -40,6 +40,21 @@ pub const NOTHING_TO_RUN: &str = "No workflow runs on this pull request";
 /// The reply when the repository has too many fork runs waiting to take
 /// another.
 pub const TOO_MANY_WAITING: &str = "Too many fork runs wait for approval";
+
+/// The reply when `/approve-run` approved runs and then could not make
+/// the others.
+pub const REMAKE_FAILED: &str = "The approval went through, but making the runs again failed";
+
+/// What to say for a remake that was refused with `reason`: the cap on
+/// waiting runs is the reply above, any other reason is said as it is.
+#[must_use]
+pub fn refusal_reply(reason: &str) -> &str {
+    if policy::refusal(Admission::Drop) == Some(reason) {
+        TOO_MANY_WAITING
+    } else {
+        reason
+    }
+}
 
 /// How many more runs a comment may start on an issue that already has
 /// `active` runs that are not over.
@@ -71,11 +86,10 @@ pub fn stale_pin(head: &str, line: &str) -> String {
     format!("The pull request head is now {head}, so nothing ran. Use --sha={head} in: {line}")
 }
 
-/// What `/approve-run` does for one event of a pull request at a head.
+/// What `/approve-run` makes again for one event of a pull request at a
+/// head. What waits is approved whatever this says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
-    /// Some run of the event waits: approve what waits.
-    pub approve: bool,
     /// The workflows to make a run of again: each listens to the event
     /// and has no run at the head, or only ones that ended without an
     /// approval or with a failure.
@@ -179,15 +193,12 @@ pub fn decide(listening: &[String], runs: &[RunRow], event: &str, now: u64) -> D
             .map(|run| stage(run, now))
             .collect()
     };
-    let approve = runs
-        .iter()
-        .any(|run| run.event == event && stage(run, now) == Stage::Waiting);
     let remake = listening
         .iter()
         .filter(|name| stages(name).iter().all(|stage| *stage == Stage::Ended))
         .cloned()
         .collect();
-    Decision { approve, remake }
+    Decision { remake }
 }
 
 /// What the head sha rule says about a command line.
@@ -361,9 +372,8 @@ mod tests {
         names.iter().map(|n| (*n).to_owned()).collect()
     }
 
-    fn decided(approve: bool, remake: &[&str]) -> Decision {
+    fn decided(remake: &[&str]) -> Decision {
         Decision {
-            approve,
             remake: names(remake),
         }
     }
@@ -374,26 +384,20 @@ mod tests {
     fn a_waiting_run_is_approved_and_a_running_one_is_left_alone() {
         let ci = names(&["ci"]);
         let waiting = |gate| run(gate, "queued", None, NOW - 1);
-        assert_eq!(
-            decide(&ci, &[waiting("pending")], PR, NOW),
-            decided(true, &[])
-        );
-        assert_eq!(
-            decide(&ci, &[waiting("deferred")], PR, NOW),
-            decided(true, &[])
-        );
+        assert_eq!(decide(&ci, &[waiting("pending")], PR, NOW), decided(&[]));
+        assert_eq!(decide(&ci, &[waiting("deferred")], PR, NOW), decided(&[]));
         for gate in ["approved", "none"] {
             for status in ["queued", "in_progress"] {
                 assert_eq!(
                     decide(&ci, &[run(gate, status, None, 0)], PR, NOW),
-                    decided(false, &[]),
+                    decided(&[]),
                     "{gate} {status}"
                 );
             }
         }
         // A run that went well has nothing to approve either.
         let done = run("approved", "completed", Some("success"), 0);
-        assert_eq!(decide(&ci, &[done], PR, NOW), decided(false, &[]));
+        assert_eq!(decide(&ci, &[done], PR, NOW), decided(&[]));
     }
 
     #[test]
@@ -404,8 +408,8 @@ mod tests {
             run("approved", "in_progress", None, 1),
             run("pending", "queued", None, NOW),
         ];
-        assert_eq!(decide(&ci, &runs, PR, NOW), decided(true, &[]));
-        assert_eq!(decide(&ci, &runs[..2], PR, NOW), decided(false, &[]));
+        assert_eq!(decide(&ci, &runs, PR, NOW), decided(&[]));
+        assert_eq!(decide(&ci, &runs[..2], PR, NOW), decided(&[]));
     }
 
     #[test]
@@ -423,7 +427,7 @@ mod tests {
         let ci = names(&["ci"]);
         // No row at all: the delivery may have been refused at admission
         // or lost half way.
-        assert_eq!(decide(&ci, &[], PR, NOW), decided(false, &["ci"]));
+        assert_eq!(decide(&ci, &[], PR, NOW), decided(&["ci"]));
         for (gate, conclusion) in [
             ("cancelled", "cancelled"),
             ("expired", "cancelled"),
@@ -432,24 +436,20 @@ mod tests {
             ("none", "failure"),
         ] {
             let ended = run(gate, "completed", Some(conclusion), 1);
-            assert_eq!(
-                decide(&ci, &[ended], PR, NOW),
-                decided(false, &["ci"]),
-                "{gate}"
-            );
+            assert_eq!(decide(&ci, &[ended], PR, NOW), decided(&["ci"]), "{gate}");
         }
         // A rejected run whose cancellation is still going is not alive.
         let rejected = run("cancelled", "queued", None, 1);
-        assert_eq!(decide(&ci, &[rejected], PR, NOW), decided(false, &["ci"]));
+        assert_eq!(decide(&ci, &[rejected], PR, NOW), decided(&["ci"]));
     }
 
     #[test]
     fn a_waiting_run_past_its_deadline_is_not_revived() {
         let ci = names(&["ci"]);
         let late = run("pending", "queued", None, NOW - APPROVAL_EXPIRES_MS - 1);
-        assert_eq!(decide(&ci, &[late], PR, NOW), decided(false, &["ci"]));
+        assert_eq!(decide(&ci, &[late], PR, NOW), decided(&["ci"]));
         let on_time = run("deferred", "queued", None, NOW - APPROVAL_EXPIRES_MS);
-        assert_eq!(decide(&ci, &[on_time], PR, NOW), decided(true, &[]));
+        assert_eq!(decide(&ci, &[on_time], PR, NOW), decided(&[]));
     }
 
     #[test]
@@ -470,10 +470,7 @@ mod tests {
         );
         let listening = names(&["w1", "w2", "w4"]);
         let runs = [w1.clone(), w2.clone()];
-        assert_eq!(
-            decide(&listening, &runs, PR, NOW),
-            decided(false, &["w2", "w4"])
-        );
+        assert_eq!(decide(&listening, &runs, PR, NOW), decided(&["w2", "w4"]));
         // The same workflow under the other event is another group.
         let target = named(
             run("cancelled", "completed", Some("cancelled"), 1),
@@ -484,14 +481,14 @@ mod tests {
         let both = [w1, target];
         assert_eq!(
             decide(&names(&["w1"]), &both, "pull_request_target", NOW),
-            decided(false, &["w1"])
+            decided(&["w1"])
         );
-        assert_eq!(decide(&names(&["w1"]), &both, PR, NOW), decided(false, &[]));
+        assert_eq!(decide(&names(&["w1"]), &both, PR, NOW), decided(&[]));
         // A waiting group is approved while another is made again.
         let waiting = named(run("pending", "queued", None, NOW - 1), "w3", PR, 6);
         assert_eq!(
             decide(&names(&["w2", "w3"]), &[waiting, w2], PR, NOW),
-            decided(true, &["w2"])
+            decided(&["w2"])
         );
     }
 
@@ -513,6 +510,25 @@ mod tests {
         // Under `approve` the target runs still wait for the command.
         assert_eq!(unapprovable(true, ForkRuns::Off, true), None);
         assert_eq!(unapprovable(true, ForkRuns::On, false), None);
+    }
+
+    #[test]
+    fn a_failed_remake_says_the_approval_went_through() {
+        assert!(REMAKE_FAILED.contains("approval went through"));
+        assert!(REMAKE_FAILED.contains("failed"));
+        assert!(!REMAKE_FAILED.contains(['\u{2014}', '\u{2013}']));
+    }
+
+    #[test]
+    fn only_the_cap_refusal_is_said_as_too_many_waiting() {
+        let cap = policy::refusal(Admission::Drop).unwrap();
+        assert_eq!(refusal_reply(cap), TOO_MANY_WAITING);
+        for other in [
+            "pull request is closed",
+            "fork runs are off for this repository",
+        ] {
+            assert_eq!(refusal_reply(other), other);
+        }
     }
 
     #[test]
