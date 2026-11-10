@@ -20,6 +20,17 @@ This repository holds:
   developers run locally to convert and validate workflow files,
   released as its own tarball.
 
+## Documentation
+
+The [reference](docs/README.md) covers the interfaces:
+
+- [command line](docs/cli.md): `hatchrun validate` and
+  `hatchrun convert`;
+- [workflow configuration](docs/config.md): `.hatchrun/config.yml`,
+  its jobs, workflows, triggers, steps and expressions;
+- [HTTP API](docs/http-api.md): the Worker routes, the app's JSON API
+  and the `/api/ci/` run API.
+
 ## Agent
 
 `hatchrun-agent` is a static binary started by
