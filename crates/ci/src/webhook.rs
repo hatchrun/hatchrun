@@ -21,18 +21,18 @@ use serde_json::{Value, json};
 use worker::{Env, Method, Request, RequestInit, Response, Result};
 
 use crate::alerts;
-use crate::chatops::{self, CommandContext, Pin};
+use crate::chatops::{self, Approval, CommandContext, Pin};
 use crate::env::{Settings, run_stub};
 use crate::fork;
 use crate::github;
 use crate::github::PullInfo;
 use crate::installation;
 use crate::intake::{
-    self, ApproveFork, IssueComment, Issues, MergeGroup, PullRequest, Push, RefChange, Release,
-    Repo, RepositoryDispatch, Rerequested, Trigger,
+    self, ApproveFork, ForkInfo, IssueComment, Issues, MergeGroup, PullRequest, Push, RefChange,
+    Release, Repo, RepositoryDispatch, Rerequested, Trigger,
 };
 use crate::planning;
-use crate::policy::{self, Admission, RepoPolicy, Waiting};
+use crate::policy::{self, Admission, ForkRuns, RepoPolicy, Waiting};
 use crate::runs::{self, Config};
 use crate::store::{self, GateStatus, RepoRow, TenantRow};
 use crate::trust::Trust;
@@ -457,6 +457,65 @@ fn comment_origin<'a>(
     }
 }
 
+/// The row of `pr` in the table of pull requests.
+fn pull_record(pr: &PullRequest) -> store::NewPull {
+    store::NewPull {
+        repo_id: pr.repo.id,
+        number: pr.number,
+        title: pr.title.clone(),
+        head_ref: pr.head_ref.clone(),
+        base_ref: pr.base_ref.clone(),
+        author: pr.author.clone(),
+        author_association: pr.author_association.clone(),
+        head_repo_id: pr
+            .fork
+            .as_ref()
+            .map_or(Some(pr.repo.id), |f| f.head_repo_id),
+        head_sha: pr.head_sha.clone(),
+        state: pr.state.to_owned(),
+        updated_at: pr.updated_at,
+    }
+}
+
+/// The pull request a comment is on, as GitHub has it now, in the shape
+/// of a `pull_request` delivery: `/approve-run` starts the runs that
+/// delivery would have, and they see this payload as their event.
+fn pull_of_comment(comment: &IssueComment, pull: &PullInfo) -> PullRequest {
+    let fork = pull.fork.then(|| ForkInfo {
+        head_repo_id: pull.head_repo_id,
+        head_repo_name: pull.head_repo_name.clone(),
+    });
+    let author = if pull.author.is_empty() {
+        "ghost".to_owned()
+    } else {
+        pull.author.clone()
+    };
+    let payload = json!({
+        "action": "synchronize",
+        "number": comment.number,
+        "pull_request": pull.raw,
+        "repository": comment.payload["repository"],
+        "sender": comment.payload["sender"],
+    });
+    PullRequest {
+        installation_id: comment.installation_id,
+        repo: comment.repo.clone(),
+        action: "synchronize".to_owned(),
+        number: comment.number,
+        head_sha: pull.head_sha.clone(),
+        head_ref: pull.head_ref.clone(),
+        base_ref: pull.base_ref.clone(),
+        actor: comment.actor.clone(),
+        title: pull.title.clone(),
+        author,
+        author_association: pull.author_association.clone(),
+        fork,
+        state: pull.state,
+        updated_at: pull.updated_at,
+        payload,
+    }
+}
+
 /// Adds `text` to the replies of a comment unless the same reply is
 /// there already: two workflows that define a command can ask for the
 /// same thing, and the maintainer reads it once.
@@ -740,22 +799,7 @@ impl Cx<'_> {
         // of any of them (`labeled` included) needs its row, so all are
         // recorded. The time is GitHub's, so a late delivery cannot
         // replace newer data.
-        let record = store::NewPull {
-            repo_id: pr.repo.id,
-            number: pr.number,
-            title: pr.title.clone(),
-            head_ref: pr.head_ref.clone(),
-            base_ref: pr.base_ref.clone(),
-            author: pr.author.clone(),
-            author_association: pr.author_association.clone(),
-            head_repo_id: pr
-                .fork
-                .as_ref()
-                .map_or(Some(pr.repo.id), |f| f.head_repo_id),
-            head_sha: pr.head_sha.clone(),
-            state: pr.state.to_owned(),
-            updated_at: pr.updated_at,
-        };
+        let record = pull_record(pr);
         let applied = match store::upsert_pull(self.db, &record).await? {
             store::PullWrite::Applied => true,
             store::PullWrite::Stale => false,
@@ -768,7 +812,10 @@ impl Cx<'_> {
         // it first.
         let mut policy = None;
         let mut ids = self.pull_request_target(pr, applied, &mut policy).await?;
-        match self.pull_request_head(pr, applied, &mut policy).await? {
+        match self
+            .pull_request_head(pr, applied, &mut policy, self.delivery)
+            .await?
+        {
             Outcome::Done(more) => ids.extend(more),
             Outcome::Ignored(reason) if ids.is_empty() => return Ok(Outcome::Ignored(reason)),
             Outcome::Ignored(_) => {}
@@ -997,6 +1044,7 @@ impl Cx<'_> {
         pr: &PullRequest,
         applied: bool,
         cache: &mut Option<RepoPolicy>,
+        delivery: &str,
     ) -> Result<Outcome> {
         // A delivery older than what is recorded says nothing about the
         // pull request as it stands: it must not cancel the runs of the
@@ -1050,7 +1098,7 @@ impl Cx<'_> {
                 tenant_id: self.tenant,
                 installation_id: pr.installation_id,
                 repo: &pr.repo,
-                delivery: self.delivery,
+                delivery,
                 event_name: "pull_request",
                 event: &pr.payload,
                 trigger: &trigger,
@@ -1534,28 +1582,24 @@ impl Cx<'_> {
         Ok(ids)
     }
 
-    /// HOOK for the built-in `/approve-run`: it needs no workflow, and
-    /// the parser recognizes it always. It is called for the comment's
-    /// `/approve-run` line, in the order of the comment, after the
-    /// commenter's role was read and the pull request fetched. It
-    /// returns the ids of the runs it approved or made.
+    /// The built-in `/approve-run --sha=<head>`: a second way into the
+    /// approval of a fork's pull request, with the checks of the check
+    /// run's button. It is called for the comment's line, in the order
+    /// of the comment, after the commenter's role was read and the pull
+    /// request fetched, and returns the ids of the runs it approved or
+    /// made.
     ///
-    /// - `comment`: the delivery, for the repository, the issue or pull
-    ///   request number, the commenter's login and the comment id.
-    /// - `found`: the line as typed (for the reply to quote) and its
-    ///   pin and words, or why the line is refused.
-    /// - `role`: what the commenter holds on the repository, `None` for
-    ///   no access; `/approve-run` needs `write` or higher and posts
-    ///   nothing to anyone below it.
-    /// - `pull`: the pull request as GitHub has it now, `None` on a
-    ///   plain issue.
-    ///
-    /// For now it ignores the line: it starts and posts nothing.
-    #[allow(
-        clippy::unused_async,
-        clippy::unused_async_trait_impl,
-        clippy::unused_self
-    )]
+    /// The commenter needs `write` and is told nothing below it. Then a
+    /// plain issue, a closed pull request, a missing or stale pin, fork
+    /// runs turned off and a pull request of this repository are
+    /// answered with a reply. For a fork's pull request the waiting runs
+    /// at that head are approved (each approval is one statement that
+    /// only moves a waiting run, and expired, rejected or superseded
+    /// runs stay as they are); a run that is going is left alone; and
+    /// with none that could be approved a new run is made as a
+    /// `pull_request` delivery makes it, counted against the same caps,
+    /// and approved by this comment.
+    #[allow(clippy::too_many_lines)] // One command, read top to bottom.
     async fn approve_run(
         &self,
         comment: &IssueComment,
@@ -1563,15 +1607,133 @@ impl Cx<'_> {
         role: Option<CommandPermission>,
         pull: Option<&PullInfo>,
     ) -> Result<Vec<u64>> {
-        let _ = (role, pull);
-        worker::console_log!(
-            "{}: {} wrote {} on #{}, which is not built yet",
-            comment.repo.full_name,
-            comment.actor,
-            found.line,
-            comment.number
-        );
-        Ok(Vec::new())
+        if !chatops::permits(role, CommandPermission::Write) {
+            worker::console_warn!(
+                "{}: {} may not run /{} on #{}",
+                comment.repo.full_name,
+                comment.actor,
+                found.name,
+                comment.number
+            );
+            return Ok(Vec::new());
+        }
+        let args = match &found.args {
+            Ok(args) => args,
+            Err(err) => {
+                self.reply(comment, &err.to_string()).await;
+                return Ok(Vec::new());
+            }
+        };
+        let Some(pull) = pull else {
+            self.reply(comment, chatops::NO_HEAD_COMMIT).await;
+            return Ok(Vec::new());
+        };
+        if pull.state != "open" {
+            self.reply(comment, chatops::CLOSED_PULL_REQUEST).await;
+            return Ok(Vec::new());
+        }
+        let head = match chatops::approve_pin(args, &found.line, Some(pull)) {
+            Pin::Run(Some(head)) => head,
+            Pin::Run(None) => return Ok(Vec::new()),
+            Pin::Reply(text) => {
+                self.reply(comment, &text).await;
+                return Ok(Vec::new());
+            }
+        };
+        let (repo_id, number) = (comment.repo.id, comment.number);
+        let mut policy = Some(store::repo_policy(self.db, repo_id, comment.repo.private).await?);
+        if policy.is_some_and(|policy| policy.fork_runs == ForkRuns::Off) {
+            self.reply(comment, fork::FORK_RUNS_OFF).await;
+            return Ok(Vec::new());
+        }
+        if !pull.fork {
+            let made = store::pull_runs_at(self.db, repo_id, number, &head).await?;
+            if made.is_empty() {
+                self.reply(comment, chatops::NOTHING_TO_APPROVE).await;
+            } else {
+                self.react(comment, "+1").await;
+            }
+            return Ok(Vec::new());
+        }
+        // The pull request as it stands now: a push since the runs
+        // were made supersedes what waits at older commits, and an
+        // approval is only given while it is open at the run's commit.
+        let pr = pull_of_comment(comment, pull);
+        let record = pull_record(&pr);
+        if store::upsert_pull(self.db, &record).await? == store::PullWrite::Tied {
+            store::upsert_pull_forced(self.db, &record).await?;
+        }
+        self.end_waiting(&pr, Some(&head), fork::SUPERSEDED).await?;
+        let made = store::pull_runs_at(self.db, repo_id, number, &head).await?;
+        let decision = chatops::approval(&made, self.now);
+        if decision == Approval::Nothing {
+            self.react(comment, "+1").await;
+            return Ok(Vec::new());
+        }
+        self.react(comment, chatops::ACCEPTED).await;
+        let mut ids = Vec::new();
+        if decision == Approval::Create {
+            // The comment's delivery made no run of this event before,
+            // and a second line in it finds the first one's run.
+            let delivery = format!("{}:approve-run", self.delivery);
+            match self
+                .pull_request_head(&pr, true, &mut policy, &delivery)
+                .await?
+            {
+                Outcome::Done(started) if started.is_empty() => {
+                    self.reply(comment, chatops::NOTHING_TO_RUN).await;
+                    self.react(comment, "-1").await;
+                    return Ok(Vec::new());
+                }
+                Outcome::Done(started) => ids = started,
+                Outcome::Ignored(reason) => {
+                    worker::console_warn!(
+                        "{}: /approve-run on #{number} made no run: {reason}",
+                        comment.repo.full_name
+                    );
+                    self.reply(comment, chatops::TOO_MANY_WAITING).await;
+                    self.react(comment, "-1").await;
+                    return Ok(Vec::new());
+                }
+                Outcome::Retry => {
+                    self.react(comment, "-1").await;
+                    return Ok(Vec::new());
+                }
+            }
+        }
+        let approved = store::approve_at_head(
+            self.db,
+            self.tenant,
+            repo_id,
+            number,
+            &head,
+            &comment.actor,
+            self.now,
+        )
+        .await?;
+        // A run that started without waiting (its author needs no
+        // approval) is made and has nothing to approve.
+        if approved.is_empty() && ids.is_empty() {
+            self.react(comment, "-1").await;
+            return Ok(Vec::new());
+        }
+        if let Some(repo) = store::repo(self.db, repo_id).await? {
+            fork::after_approval(
+                self.env,
+                self.db,
+                self.settings,
+                self.tokens,
+                &repo,
+                &approved,
+                &comment.actor,
+            )
+            .await;
+        }
+        ids.extend(approved.iter().map(|run| run.id));
+        ids.sort_unstable();
+        ids.dedup();
+        self.react(comment, "+1").await;
+        Ok(ids)
     }
 
     async fn config_at(&self, installation_id: u64, repo: &Repo, sha: &str) -> Result<Config> {

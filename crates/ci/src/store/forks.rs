@@ -119,6 +119,27 @@ const APPROVE_BY_CHECK: &str = "UPDATE ci_runs SET gate_status = 'approved', gat
        AND pl.number = ci_runs.pull_number AND pl.state = 'open' \
        AND pl.head_sha = COALESCE(ci_runs.head_sha, ci_runs.sha)) RETURNING {columns}";
 
+/// The `pull_request` and `pull_request_target` runs of pull request `$2`
+/// of repository `$1` at commit `$3`, the oldest first.
+const PULL_RUNS: &str = "SELECT {columns} FROM ci_runs WHERE repo_id = $1 AND pull_number = $2 \
+     AND COALESCE(head_sha, sha) = $3 AND event IN ('pull_request', 'pull_request_target') \
+     ORDER BY id";
+
+/// Approves the waiting (pending or deferred) runs of pull request `$2`
+/// of repository `$1` of tenant `$6` at commit `$3`, by `$4` at `$5`: the
+/// runs of both events that the pull request's check runs ask about. As
+/// for [`APPROVE_RUN`], not after the approval expired (`$7`), and only
+/// while the pull request is open at that commit.
+const APPROVE_AT_HEAD: &str = "UPDATE ci_runs SET gate_status = 'approved', gate_by = $4, \
+     gate_at = $5, gate_card_dirty = (gate_check_run_id IS NOT NULL) \
+     WHERE repo_id = $1 AND tenant_id = $6 AND pull_number = $2 \
+     AND COALESCE(head_sha, sha) = $3 AND event IN ('pull_request', 'pull_request_target') \
+     AND gate_status IN ('pending', 'deferred') AND status <> 'completed' \
+     AND created_at >= $7 \
+     AND EXISTS (SELECT 1 FROM ci_pulls pl WHERE pl.repo_id = ci_runs.repo_id \
+       AND pl.number = ci_runs.pull_number AND pl.state = 'open' \
+       AND pl.head_sha = COALESCE(ci_runs.head_sha, ci_runs.sha)) RETURNING {columns}";
+
 /// Ends the wait of run `$1` with status `$2` by `$3` at `$4`.
 const END_GATE: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_at = $4, \
      gate_card_dirty = (gate_check_run_id IS NOT NULL) WHERE id = $1 AND gate_status IN ('pending', 'deferred') RETURNING {columns}";
@@ -365,6 +386,53 @@ pub async fn approve_run(
             by,
             now,
             repo_id,
+            tenant_id,
+            now.saturating_sub(APPROVAL_EXPIRES_MS)
+        ],
+    )
+    .await
+}
+
+/// The `pull_request` and `pull_request_target` runs of pull request
+/// `number` of repository `repo_id` at `sha`, the oldest first.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn pull_runs_at(db: &Db, repo_id: u64, number: u64, sha: &str) -> Result<Vec<RunRow>> {
+    db.all(
+        &with_columns(PULL_RUNS, RUN_COLUMNS),
+        &params![repo_id, number, sha],
+    )
+    .await
+}
+
+/// Approves the runs of pull request `number` of repository `repo_id`
+/// of `tenant_id` that wait at `sha`, for `by`: a comment's approval,
+/// where the button's is [`approve_by_check`]. Empty when none waits any
+/// more (someone decided first), their approval deadline passed, or the
+/// pull request is not open at `sha`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn approve_at_head(
+    db: &Db,
+    tenant_id: &str,
+    repo_id: u64,
+    number: u64,
+    sha: &str,
+    by: &str,
+    now: u64,
+) -> Result<Vec<RunRow>> {
+    db.all(
+        &with_columns(APPROVE_AT_HEAD, RUN_COLUMNS),
+        &params![
+            repo_id,
+            number,
+            sha,
+            by,
+            now,
             tenant_id,
             now.saturating_sub(APPROVAL_EXPIRES_MS)
         ],

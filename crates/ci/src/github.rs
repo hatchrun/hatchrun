@@ -242,6 +242,19 @@ pub struct PullInfo {
     pub fork: bool,
     /// `open`, `closed` or `merged`.
     pub state: &'static str,
+    /// The head branch, as a short name.
+    pub head_ref: String,
+    /// The pull request's title.
+    pub title: String,
+    /// The login of the user who opened it; empty when GitHub has none.
+    pub author: String,
+    /// GitHub's `author_association` of that user; empty when absent.
+    pub author_association: String,
+    /// When GitHub last changed the pull request, in Unix milliseconds;
+    /// 0 when the answer has no time.
+    pub updated_at: u64,
+    /// The answer as GitHub gave it, the `pull_request` of a payload.
+    pub raw: serde_json::Value,
 }
 
 /// The head, base and state of the pull request [`pull_request`] read,
@@ -259,6 +272,17 @@ pub fn pull_info(response: &Response) -> Result<Option<PullInfo>, String> {
         state: String,
         #[serde(default)]
         merged: bool,
+        #[serde(default)]
+        title: String,
+        user: Option<User>,
+        #[serde(default)]
+        author_association: String,
+        #[serde(default)]
+        updated_at: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct User {
+        login: String,
     }
     #[derive(Deserialize)]
     struct Side {
@@ -277,7 +301,8 @@ pub fn pull_info(response: &Response) -> Result<Option<PullInfo>, String> {
     if response.status == 404 {
         return Ok(None);
     }
-    let pull = decode::<Pull>(response, "pull request")?;
+    let raw = decode::<serde_json::Value>(response, "pull request")?;
+    let pull = Pull::deserialize(&raw).map_err(|err| format!("pull request: {err}"))?;
     let base_id = pull.base.repo.as_ref().map(|repo| repo.id);
     let fork = match &pull.head.repo {
         Some(head) => Some(head.id) != base_id,
@@ -296,6 +321,15 @@ pub fn pull_info(response: &Response) -> Result<Option<PullInfo>, String> {
         } else {
             "open"
         },
+        head_ref: pull.head.r#ref,
+        title: pull.title,
+        author: pull.user.map_or_else(String::new, |user| user.login),
+        author_association: pull.author_association,
+        updated_at: pull
+            .updated_at
+            .and_then(|time| hatchrun_cloud::parse_rfc3339(&time))
+            .unwrap_or(0),
+        raw,
     }))
 }
 

@@ -1540,3 +1540,159 @@ fn a_pull_request_and_a_pull_request_target_run_of_one_workflow_both_exist() {
     // The same key again finds the run it made instead of a second one.
     assert!(db.wait(insert_run(db.db(), &target)).unwrap().is_none());
 }
+
+#[test]
+fn a_comment_approves_every_waiting_run_at_the_head_and_no_other() {
+    let db = setup();
+    let ci = fork_run(&db, "d1", 4, "h1", "mallory", GateStatus::Pending, 10);
+    let target = target_run(&db, "d1:target", 4, "h1", GateStatus::Pending);
+    let mut lint = new_run("d1", "lint", 10);
+    lint.event = "pull_request".into();
+    lint.git_ref = "refs/pull/4/merge".into();
+    lint.sha = "h1".into();
+    lint.pull_number = Some(4);
+    lint.trust = Trust::Fork;
+    lint.gate_status = GateStatus::Deferred;
+    let lint = db.wait(insert_run(db.db(), &lint)).unwrap().unwrap();
+    // A run of an older commit of the same pull request, and a command
+    // run of the comment event on the same head, are not touched.
+    let old = fork_run(&db, "d0", 4, "h0", "mallory", GateStatus::Pending, 9);
+    db.wait(upsert_pull_forced(
+        db.db(),
+        &NewPull {
+            repo_id: 7,
+            number: 4,
+            title: "change".into(),
+            head_ref: "feature".into(),
+            base_ref: "main".into(),
+            author: "mallory".into(),
+            author_association: "NONE".into(),
+            head_repo_id: Some(99),
+            head_sha: "h1".into(),
+            state: "open".into(),
+            updated_at: 6_000_000,
+        },
+    ))
+    .unwrap();
+    let seen = db.wait(pull_runs_at(db.db(), 7, 4, "h1")).unwrap();
+    let ids: Vec<u64> = seen.iter().map(|run| run.id).collect();
+    assert_eq!(ids, [ci.id, target.id, lint.id]);
+    // Another repository, tenant or pull request finds nothing.
+    for (tenant, repo, number) in [("t1", 8, 4), ("t2", 7, 4), ("t1", 7, 5)] {
+        assert_eq!(
+            db.wait(approve_at_head(
+                db.db(),
+                tenant,
+                repo,
+                number,
+                "h1",
+                "m",
+                20
+            ))
+            .unwrap()
+            .len(),
+            0
+        );
+    }
+    let approved = db
+        .wait(approve_at_head(db.db(), "t1", 7, 4, "h1", "maintainer", 20))
+        .unwrap();
+    let mut ids: Vec<u64> = approved.iter().map(|run| run.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [ci.id, target.id, lint.id]);
+    assert!(approved.iter().all(|run| {
+        run.gate_status == GateStatus::Approved
+            && run.gate_by.as_deref() == Some("maintainer")
+            && run.gate_at == Some(20)
+    }));
+    let read = db.wait(super::run(db.db(), old.id)).unwrap().unwrap();
+    assert_eq!(read.gate_status, GateStatus::Pending);
+    // Whoever decides first wins; the second comment finds nothing.
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 4, "h1", "again", 21))
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn a_comment_never_revives_an_ended_run_or_approves_after_a_push_or_close() {
+    let db = setup();
+    let cancelled = fork_run(&db, "d1", 4, "h1", "mallory", GateStatus::Cancelled, 10);
+    let expired = fork_run(&db, "d2", 4, "h1", "mallory", GateStatus::Expired, 10);
+    let done = fork_run(&db, "d3", 4, "h1", "mallory", GateStatus::Pending, 10);
+    db.run(
+        "UPDATE ci_runs SET status = 'completed' WHERE id = $1",
+        &params![done.id],
+    );
+    let none = fork_run(&db, "d4", 4, "h1", "mallory", GateStatus::NotGated, 10);
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 4, "h1", "m", 20))
+            .unwrap()
+            .len(),
+        0
+    );
+    for id in [cancelled.id, expired.id, done.id, none.id] {
+        let read = db.wait(super::run(db.db(), id)).unwrap().unwrap();
+        assert_ne!(read.gate_by.as_deref(), Some("m"), "run {id}");
+    }
+    // A waiting run past its deadline, though not yet expired by the
+    // reconciler, stays waiting: the comment does not revive it.
+    let late = fork_run(&db, "d5", 5, "h5", "mallory", GateStatus::Pending, 10);
+    let after = 10 + APPROVAL_EXPIRES_MS + 1;
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 5, "h5", "m", after))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 5, "h5", "m", after - 1))
+            .unwrap()
+            .len(),
+        1,
+        "run {} on time",
+        late.id
+    );
+    // A push moved the pull request to a new head: the old one is not
+    // approved. A closed pull request approves nothing either.
+    let old = fork_run(&db, "d6", 6, "h6", "mallory", GateStatus::Pending, 30);
+    db.run(
+        "UPDATE ci_pulls SET head_sha = 'h7' WHERE repo_id = 7 AND number = 6",
+        &[],
+    );
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 6, "h6", "m", 31))
+            .unwrap()
+            .len(),
+        0
+    );
+    db.run(
+        "UPDATE ci_pulls SET head_sha = 'h6', state = 'closed' WHERE repo_id = 7 AND number = 6",
+        &[],
+    );
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 6, "h6", "m", 31))
+            .unwrap()
+            .len(),
+        0
+    );
+    let read = db.wait(super::run(db.db(), old.id)).unwrap().unwrap();
+    assert_eq!(read.gate_status, GateStatus::Pending);
+}
+
+#[test]
+fn the_runs_of_a_head_leave_out_what_other_events_made() {
+    let db = setup();
+    let fork = fork_run(&db, "d1", 4, "h1", "mallory", GateStatus::Pending, 10);
+    let mut comment = new_run("d2", "retest", 10);
+    comment.event = "issue_comment".into();
+    comment.pull_number = Some(4);
+    comment.head_sha = Some("h1".into());
+    db.wait(insert_run(db.db(), &comment)).unwrap().unwrap();
+    let seen = db.wait(pull_runs_at(db.db(), 7, 4, "h1")).unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].id, fork.id);
+    assert_eq!(db.wait(pull_runs_at(db.db(), 7, 4, "h2")).unwrap().len(), 0);
+}

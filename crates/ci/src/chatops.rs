@@ -12,6 +12,8 @@ use hatchrun_workflow::{CommandOptions, CommandPermission};
 use serde_json::{Value, json};
 
 use crate::github::PullInfo;
+use crate::policy::APPROVAL_EXPIRES_MS;
+use crate::store::{GateStatus, RunRow};
 
 /// The most runs of the `issue_comment` event that are not over for one
 /// issue or pull request. A comment over the cap starts nothing.
@@ -22,6 +24,22 @@ pub const ACCEPTED: &str = "eyes";
 
 /// The reply to a `--sha=` on a plain issue.
 pub const NO_HEAD_COMMIT: &str = "Issues have no head commit";
+
+/// The reply to `/approve-run` on a pull request that is not open.
+pub const CLOSED_PULL_REQUEST: &str = "The pull request is closed";
+
+/// The reply to `/approve-run` on a pull request of this repository,
+/// which runs without an approval.
+pub const NOTHING_TO_APPROVE: &str =
+    "This pull request is from this repository, so there is nothing to approve";
+
+/// The reply when approving started no run: no workflow listens to the
+/// pull request.
+pub const NOTHING_TO_RUN: &str = "No workflow runs on this pull request";
+
+/// The reply when the repository has too many fork runs waiting to take
+/// another.
+pub const TOO_MANY_WAITING: &str = "Too many fork runs wait for approval";
 
 /// How many more runs a comment may start on an issue that already has
 /// `active` runs that are not over.
@@ -53,6 +71,65 @@ pub fn stale_pin(head: &str, line: &str) -> String {
     format!("The pull request head is now {head}, so nothing ran. Use --sha={head} in: {line}")
 }
 
+/// What `/approve-run` does for the runs of a pull request at its head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// Some run waits: approve what waits.
+    Approve,
+    /// A run is going or has gone well already: nothing to do.
+    Nothing,
+    /// There is no run, or only ones that ended without an approval or
+    /// with a failure: make a new one.
+    Create,
+}
+
+/// Where one run stands for `/approve-run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Waits for a decision and can still be approved.
+    Waiting,
+    /// Runs, or ended well: it needs nothing.
+    Settled,
+    /// Rejected, superseded, expired, failed or cancelled.
+    Ended,
+}
+
+fn stage(run: &RunRow, now: u64) -> Stage {
+    let completed = run.status == "completed";
+    match run.gate_status {
+        GateStatus::Pending | GateStatus::Deferred if completed => Stage::Ended,
+        // Past its deadline, the reconciler has not expired it yet but
+        // an approval is refused: it is as good as expired.
+        GateStatus::Pending | GateStatus::Deferred
+            if run.created_at < now.saturating_sub(APPROVAL_EXPIRES_MS) =>
+        {
+            Stage::Ended
+        }
+        GateStatus::Pending | GateStatus::Deferred => Stage::Waiting,
+        GateStatus::Expired | GateStatus::Cancelled => Stage::Ended,
+        GateStatus::NotGated | GateStatus::Approved => match run.conclusion.as_deref() {
+            _ if !completed => Stage::Settled,
+            Some("success" | "skipped") => Stage::Settled,
+            _ => Stage::Ended,
+        },
+    }
+}
+
+/// What `/approve-run` does, given the runs of the pull request at the
+/// head the comment names, at time `now`. An earlier approval does not
+/// carry over to a run that ended, and an ended run is never revived.
+#[must_use]
+pub fn approval(runs: &[RunRow], now: u64) -> Approval {
+    let stages: Vec<Stage> = runs.iter().map(|run| stage(run, now)).collect();
+    if stages.contains(&Stage::Waiting) {
+        Approval::Approve
+    } else if stages.contains(&Stage::Settled) {
+        Approval::Nothing
+    } else {
+        Approval::Create
+    }
+}
+
 /// What the head sha rule says about a command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pin {
@@ -80,6 +157,17 @@ pub fn pin(options: &CommandOptions, args: &Args, line: &str, pull: Option<&Pull
         Some(sha) if sha != pull.head_sha => Pin::Reply(stale_pin(&pull.head_sha, line)),
         _ => Pin::Run(Some(pull.head_sha.clone())),
     }
+}
+
+/// The sha rule of the built-in `/approve-run`: the pin is always
+/// required.
+#[must_use]
+pub fn approve_pin(args: &Args, line: &str, pull: Option<&PullInfo>) -> Pin {
+    let options = CommandOptions {
+        sha: hatchrun_workflow::ShaPolicy::Required,
+        ..CommandOptions::default()
+    };
+    pin(&options, args, line, pull)
 }
 
 /// What a command run knows of its command: `github.event.command`.
@@ -168,6 +256,12 @@ mod tests {
             base_ref: "main".to_owned(),
             fork,
             state: "open",
+            head_ref: "feature".to_owned(),
+            title: "change".to_owned(),
+            author: "alice".to_owned(),
+            author_association: "NONE".to_owned(),
+            updated_at: 0,
+            raw: serde_json::Value::Null,
         }
     }
 
@@ -180,6 +274,97 @@ mod tests {
 
     fn args(line: &str) -> Args {
         parse_comment(line, |_| true)[0].args.clone().unwrap()
+    }
+
+    fn run(gate: &str, status: &str, conclusion: Option<&str>, created_at: u64) -> RunRow {
+        serde_json::from_value(json!({
+            "id": 9, "run_number": 1, "run_attempt": 1, "tenant_id": "t1",
+            "repo_id": 7, "workflow": "ci", "delivery": "d", "event": "pull_request",
+            "git_ref": "refs/pull/4/merge", "sha": HEAD, "actor": "a",
+            "status": status, "conclusion": conclusion, "created_at": created_at,
+            "retention_days": 30, "pull_number": 4, "trust": "fork",
+            "author_login": "a", "author_association": "NONE", "gate_status": gate
+        }))
+        .unwrap()
+    }
+
+    const NOW: u64 = 10 * APPROVAL_EXPIRES_MS;
+
+    #[test]
+    fn a_waiting_run_is_approved_and_a_running_one_is_left_alone() {
+        let waiting = |gate| run(gate, "queued", None, NOW - 1);
+        assert_eq!(approval(&[waiting("pending")], NOW), Approval::Approve);
+        assert_eq!(approval(&[waiting("deferred")], NOW), Approval::Approve);
+        for gate in ["approved", "none"] {
+            for status in ["queued", "in_progress"] {
+                assert_eq!(
+                    approval(&[run(gate, status, None, 0)], NOW),
+                    Approval::Nothing,
+                    "{gate} {status}"
+                );
+            }
+        }
+        // A run that went well has nothing to approve either.
+        let done = run("approved", "completed", Some("success"), 0);
+        assert_eq!(approval(&[done], NOW), Approval::Nothing);
+    }
+
+    #[test]
+    fn a_waiting_run_wins_over_the_others_at_the_head() {
+        let runs = [
+            run("cancelled", "completed", Some("cancelled"), 1),
+            run("approved", "in_progress", None, 1),
+            run("pending", "queued", None, NOW),
+        ];
+        assert_eq!(approval(&runs, NOW), Approval::Approve);
+        assert_eq!(approval(&runs[..2], NOW), Approval::Nothing);
+    }
+
+    #[test]
+    fn only_ended_runs_or_none_make_a_new_run() {
+        assert_eq!(approval(&[], NOW), Approval::Create);
+        for (gate, conclusion) in [
+            ("cancelled", "cancelled"),
+            ("expired", "cancelled"),
+            ("approved", "failure"),
+            ("approved", "cancelled"),
+            ("none", "failure"),
+        ] {
+            let ended = run(gate, "completed", Some(conclusion), 1);
+            assert_eq!(approval(&[ended], NOW), Approval::Create, "{gate}");
+        }
+        // A rejected run whose cancellation is still going is not alive.
+        let rejected = run("cancelled", "queued", None, 1);
+        assert_eq!(approval(&[rejected], NOW), Approval::Create);
+    }
+
+    #[test]
+    fn a_waiting_run_past_its_deadline_is_not_revived() {
+        let late = run("pending", "queued", None, NOW - APPROVAL_EXPIRES_MS - 1);
+        assert_eq!(approval(&[late], NOW), Approval::Create);
+        let on_time = run("deferred", "queued", None, NOW - APPROVAL_EXPIRES_MS);
+        assert_eq!(approval(&[on_time], NOW), Approval::Approve);
+    }
+
+    #[test]
+    fn approve_run_always_asks_for_the_pin() {
+        let line = "/approve-run";
+        for fork in [true, false] {
+            assert_eq!(
+                approve_pin(&args(line), line, Some(&pull(fork))),
+                Pin::Reply(format!("Add --sha={HEAD} to: /approve-run"))
+            );
+        }
+        let line = format!("/approve-run --sha={HEAD}");
+        assert_eq!(
+            approve_pin(&args(&line), &line, Some(&pull(true))),
+            Pin::Run(Some(HEAD.to_owned()))
+        );
+        let line = format!("/approve-run --sha={OTHER}");
+        assert!(matches!(
+            approve_pin(&args(&line), &line, Some(&pull(true))),
+            Pin::Reply(text) if text.contains(HEAD) && text.contains(&line)
+        ));
     }
 
     #[test]
