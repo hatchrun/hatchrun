@@ -184,19 +184,34 @@ pub fn listens(config: &Config, event: &Event) -> bool {
 /// the order it tries them.
 pub const REMAKE_ACTIONS: [&str; 3] = ["synchronize", "opened", "reopened"];
 
+/// The actions `/approve-run` makes workflows again as, for an event that
+/// `has_runs` at the head. The comment is no pull request delivery, so
+/// the action that starts a workflow is the one a commit gives:
+/// `synchronize`, and a workflow that only listens to `opened` or
+/// `reopened` is not made again. Only a head with no run of the event at
+/// all, where the whole delivery was lost, makes a workflow as the first
+/// of [`REMAKE_ACTIONS`] that it listens to.
+#[must_use]
+pub fn remake_actions(has_runs: bool) -> &'static [&'static str] {
+    if has_runs {
+        &REMAKE_ACTIONS[..1]
+    } else {
+        &REMAKE_ACTIONS
+    }
+}
+
 /// The workflows of `config` (those in `among`, all when `None`) that
-/// `/approve-run` makes again, grouped by the action they are made as.
-/// The comment is no pull request delivery, so a workflow is made as the
-/// first of [`REMAKE_ACTIONS`] that it listens to, which is the one that
-/// starts it when its pull request gets a commit, is opened or is
-/// reopened. A workflow that listens to none of them (one that only runs
-/// on `labeled`, say) is not made again. `event` builds the trigger for
-/// an action, and is returned with the workflows it starts.
+/// `/approve-run` makes again, grouped by the first of `actions` they
+/// listen to (see [`remake_actions`]). A workflow that listens to none
+/// of them (one that only runs on `labeled`, say) is not made again.
+/// `event` builds the trigger for an action, which is returned with the
+/// workflows it starts.
 #[must_use]
 pub fn remake_batches(
     config: &Config,
     event: impl Fn(&str) -> Event,
     among: Option<&[String]>,
+    actions: &[&'static str],
 ) -> Vec<(&'static str, Vec<String>, Event)> {
     let mut left: Vec<&String> = config
         .workflows
@@ -204,14 +219,14 @@ pub fn remake_batches(
         .filter(|name| among.is_none_or(|among| among.contains(name)))
         .collect();
     let mut batches = Vec::new();
-    for action in REMAKE_ACTIONS {
+    for action in actions {
         let trigger = event(action);
         let (hit, rest): (Vec<&String>, Vec<&String>) = left
             .into_iter()
             .partition(|name| triggered(&config.workflows[*name].on, &trigger));
         left = rest;
         if !hit.is_empty() {
-            batches.push((action, hit.into_iter().cloned().collect(), trigger));
+            batches.push((*action, hit.into_iter().cloned().collect(), trigger));
         }
     }
     batches
@@ -459,18 +474,55 @@ workflows:
         // `b` has the default types, which include `synchronize`; `d`
         // and `e` listen to none of the three.
         assert_eq!(
-            remake_batches(&config, event, None),
+            remake_batches(&config, event, None, &REMAKE_ACTIONS),
             [
                 ("synchronize", vec!["b".to_owned()], event("synchronize")),
                 ("opened", vec!["a".to_owned()], event("opened")),
                 ("reopened", vec!["c".to_owned()], event("reopened")),
             ]
         );
+        // With runs at the head only `synchronize` makes a workflow again.
+        assert_eq!(
+            remake_batches(&config, event, None, remake_actions(true)),
+            [("synchronize", vec!["b".to_owned()], event("synchronize"))]
+        );
         let among = ["a".to_owned(), "d".to_owned()];
         assert_eq!(
-            remake_batches(&config, event, Some(&among)),
+            remake_batches(&config, event, Some(&among), &REMAKE_ACTIONS),
             [("opened", vec!["a".to_owned()], event("opened"))]
         );
+    }
+
+    #[test]
+    fn a_remade_workflow_is_left_out_when_the_files_do_not_trigger_it() {
+        let config = parse(
+            "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  docs: { on: { pull_request: { paths: ['docs/**'] } }, jobs: [t] }
+  all: { on: { pull_request: {} }, jobs: [t] }
+",
+        )
+        .unwrap();
+        let event = |changed: &[&str]| {
+            let changed: Vec<String> = changed.iter().map(|c| (*c).to_owned()).collect();
+            move |action: &str| Event::PullRequest {
+                action: action.into(),
+                base_ref: "main".into(),
+                changed: changed.clone(),
+            }
+        };
+        let names = |changed: &[&str]| {
+            remake_batches(&config, event(changed), None, remake_actions(true))
+                .into_iter()
+                .flat_map(|(_, names, _)| names)
+                .collect::<Vec<_>>()
+        };
+        // Unknown files list both, and the files decide.
+        assert_eq!(names(&[]), ["all", "docs"]);
+        assert_eq!(names(&["src/main.rs"]), ["all"]);
+        assert_eq!(names(&["docs/a.md"]), ["all", "docs"]);
     }
 
     #[test]

@@ -121,14 +121,30 @@ fn target_gate(
 }
 
 /// Which workflows a pull request function makes runs of.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum Wanted<'a> {
     /// Those the delivery's own action starts.
     Delivery,
-    /// `/approve-run` making these workflows again, each as the first of
-    /// [`planning::REMAKE_ACTIONS`] that it listens to. The comment has
-    /// no pull request action of its own.
-    Remake(&'a [String]),
+    /// `/approve-run` making workflows again. The comment has no pull
+    /// request action of its own.
+    Remake(Prepared<'a>),
+}
+
+/// What `/approve-run` has read already when it makes workflows again,
+/// so the call does not read it a second time.
+#[derive(Clone, Copy)]
+struct Prepared<'a> {
+    /// The workflows to make, each as the first of `actions` that it
+    /// listens to.
+    among: &'a [String],
+    /// The actions to try (see [`planning::remake_actions`]).
+    actions: &'static [&'static str],
+    /// The config the event runs from, and the same parsed.
+    config: &'a Config,
+    parsed: &'a hatchrun_workflow::Config,
+    /// The pull request's changed paths, empty when no workflow looks at
+    /// them.
+    changed: &'a [String],
 }
 
 /// The runs to make for one action: the delivery to see as the event,
@@ -141,44 +157,29 @@ struct Batch<'p> {
 }
 
 impl Wanted<'_> {
-    /// Whether `needs` holds, for the workflows it is asked about, for
-    /// the delivery's `action` or for any action a remake may use.
-    fn paths(&self, action: &str, needs: impl Fn(&str, Option<&[String]>) -> bool) -> bool {
-        match self {
-            Self::Delivery => needs(action, None),
-            Self::Remake(among) => planning::REMAKE_ACTIONS
-                .iter()
-                .any(|action| needs(action, Some(among))),
-        }
-    }
-
     /// The pull request deliveries to make runs for. `event` builds the
-    /// trigger of an action. A remake has none when the config did not
-    /// parse.
-    fn batches<'p>(
-        &self,
-        pr: &'p PullRequest,
-        config: Option<&hatchrun_workflow::Config>,
-        event: impl Fn(&str) -> Event,
-    ) -> Vec<Batch<'p>> {
-        let Self::Remake(among) = self else {
+    /// trigger of an action.
+    fn batches<'p>(&self, pr: &'p PullRequest, event: impl Fn(&str) -> Event) -> Vec<Batch<'p>> {
+        let Self::Remake(prepared) = self else {
             return vec![Batch {
                 pr: Cow::Borrowed(pr),
                 workflows: None,
                 trigger: event(&pr.action),
             }];
         };
-        let Some(config) = config else {
-            return Vec::new();
-        };
-        planning::remake_batches(config, event, Some(among))
-            .into_iter()
-            .map(|(action, names, trigger)| Batch {
-                pr: Cow::Owned(with_action(pr, action)),
-                workflows: Some(names),
-                trigger,
-            })
-            .collect()
+        planning::remake_batches(
+            prepared.parsed,
+            event,
+            Some(prepared.among),
+            prepared.actions,
+        )
+        .into_iter()
+        .map(|(action, names, trigger)| Batch {
+            pr: Cow::Owned(with_action(pr, action)),
+            workflows: Some(names),
+            trigger,
+        })
+        .collect()
     }
 }
 
@@ -188,6 +189,42 @@ fn parsed(config: &Config) -> Option<hatchrun_workflow::Config> {
     match config {
         Config::Text(Ok(source)) => hatchrun_workflow::parse(source).ok(),
         _ => None,
+    }
+}
+
+/// The workflows of `parsed` that listen to the event `event` builds the
+/// trigger of, under `actions` (see [`planning::remake_batches`]).
+fn listed(
+    parsed: Option<&hatchrun_workflow::Config>,
+    event: impl Fn(&str) -> Event,
+    actions: &[&'static str],
+) -> Vec<String> {
+    parsed
+        .map(|parsed| {
+            planning::remake_batches(parsed, event, None, actions)
+                .into_iter()
+                .flat_map(|(_, names, _)| names)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The trigger of a `pull_request` delivery of an action, for a pull
+/// request against `base_ref` that changed `changed`.
+fn head_event<'a>(base_ref: &'a str, changed: &'a [String]) -> impl Fn(&str) -> Event + 'a {
+    move |action| Event::PullRequest {
+        action: action.to_owned(),
+        base_ref: base_ref.to_owned(),
+        changed: changed.to_vec(),
+    }
+}
+
+/// As [`head_event`], for `pull_request_target`.
+fn target_event<'a>(base_ref: &'a str, changed: &'a [String]) -> impl Fn(&str) -> Event + 'a {
+    move |action| Event::PullRequestTarget {
+        action: action.to_owned(),
+        base_ref: base_ref.to_owned(),
+        changed: changed.to_vec(),
     }
 }
 
@@ -1015,20 +1052,27 @@ impl Cx<'_> {
         wanted: Wanted<'_>,
     ) -> Result<(Vec<u64>, bool)> {
         let git_ref = runs::compile_ref_for(pr);
-        // Whether the branch has a listener, read by its name.
-        let probe = runs::read_config(
-            self.tokens,
-            self.settings,
-            pr.installation_id,
-            &pr.repo.full_name,
-            &git_ref,
-        )
-        .await?;
-        // A config that is missing or cannot be read has nothing to run:
-        // the push that made it was told, on its own commit.
-        if !matches!(&probe, Config::Text(Ok(source)) if planning::has_pull_request_target(source))
-        {
-            return Ok((Vec::new(), false));
+        let prepared = match wanted {
+            Wanted::Remake(prepared) => Some(prepared),
+            Wanted::Delivery => None,
+        };
+        if prepared.is_none() {
+            // Whether the branch has a listener, read by its name.
+            let probe = runs::read_config(
+                self.tokens,
+                self.settings,
+                pr.installation_id,
+                &pr.repo.full_name,
+                &git_ref,
+            )
+            .await?;
+            // A config that is missing or cannot be read has nothing to
+            // run: the push that made it was told, on its own commit.
+            if !matches!(&probe, Config::Text(Ok(source))
+                if planning::has_pull_request_target(source))
+            {
+                return Ok((Vec::new(), false));
+            }
         }
         let Some(sha) = runs::commit(
             self.tokens,
@@ -1043,15 +1087,22 @@ impl Cx<'_> {
         };
         let sha = sha.as_str();
         // The plan is the config at the commit the run is on, which is
-        // the `GITHUB_SHA` its steps see.
-        let config = runs::read_config(
-            self.tokens,
-            self.settings,
-            pr.installation_id,
-            &pr.repo.full_name,
-            sha,
-        )
-        .await?;
+        // the `GITHUB_SHA` its steps see. A remake has read the
+        // branch's already.
+        let read;
+        let config = if let Some(prepared) = prepared {
+            prepared.config
+        } else {
+            read = runs::read_config(
+                self.tokens,
+                self.settings,
+                pr.installation_id,
+                &pr.repo.full_name,
+                sha,
+            )
+            .await?;
+            &read
+        };
         let policy = self.policy_of(pr, cache).await?;
         let waits = target_waits(&policy, pr.fork.is_some());
         if waits && applied {
@@ -1088,21 +1139,20 @@ impl Cx<'_> {
             TargetGate::Refused(reason) => (GateStatus::NotGated, Some(reason)),
             TargetGate::Stale => return Ok((Vec::new(), false)),
         };
-        let parsed = parsed(&config);
-        let wants_paths = parsed.as_ref().is_some_and(|parsed| {
-            wanted.paths(&pr.action, |action, among| {
-                planning::needs_pull_request_target_paths(parsed, action, &pr.base_ref, among)
-            })
-        });
-        let changed = if wants_paths {
-            self.pull_paths(pr).await?
-        } else {
-            Vec::new()
+        let changed = match prepared {
+            Some(prepared) => prepared.changed.to_vec(),
+            None if parsed(config).is_some_and(|parsed| {
+                planning::needs_pull_request_target_paths(&parsed, &pr.action, &pr.base_ref, None)
+            }) =>
+            {
+                self.pull_paths(pr).await?
+            }
+            None => Vec::new(),
         };
         // A pull_request run of the same delivery and workflow is a
         // different run, so its key differs.
         let delivery = target_delivery(delivery);
-        let batches = wanted.batches(pr, parsed.as_ref(), |action| Event::PullRequestTarget {
+        let batches = wanted.batches(pr, |action| Event::PullRequestTarget {
             action: action.to_owned(),
             base_ref: pr.base_ref.clone(),
             changed: changed.clone(),
@@ -1152,7 +1202,7 @@ impl Cx<'_> {
                         ..runs::Origin::own(&pr.actor)
                     },
                 },
-                &config,
+                config,
                 self.now,
             )
             .await?;
@@ -1195,29 +1245,37 @@ impl Cx<'_> {
             Ok(admitted) => admitted,
             Err(outcome) => return Ok(outcome),
         };
-        let config = runs::read_config(
-            self.tokens,
-            self.settings,
-            pr.installation_id,
-            &pr.repo.full_name,
-            &pr.head_sha,
-        )
-        .await?;
+        // A remake has read the head's config and the files already.
+        let read;
+        let config = match wanted {
+            Wanted::Remake(prepared) => prepared.config,
+            Wanted::Delivery => {
+                read = runs::read_config(
+                    self.tokens,
+                    self.settings,
+                    pr.installation_id,
+                    &pr.repo.full_name,
+                    &pr.head_sha,
+                )
+                .await?;
+                &read
+            }
+        };
         let compile_ref = runs::compile_ref_for(pr);
         // Files cost up to three calls, so they are read only for a
         // workflow that listens to this action and filters on paths.
-        let parsed = parsed(&config);
-        let wants_paths = parsed.as_ref().is_some_and(|parsed| {
-            wanted.paths(&pr.action, |action, among| {
-                planning::needs_pull_request_paths(parsed, action, &pr.base_ref, among)
-            })
-        });
-        let changed = if wants_paths {
-            self.pull_paths(pr).await?
-        } else {
-            Vec::new()
+        let changed = match wanted {
+            Wanted::Remake(prepared) => prepared.changed.to_vec(),
+            Wanted::Delivery
+                if parsed(config).is_some_and(|parsed| {
+                    planning::needs_pull_request_paths(&parsed, &pr.action, &pr.base_ref, None)
+                }) =>
+            {
+                self.pull_paths(pr).await?
+            }
+            Wanted::Delivery => Vec::new(),
         };
-        let batches = wanted.batches(pr, parsed.as_ref(), |action| Event::PullRequest {
+        let batches = wanted.batches(pr, |action| Event::PullRequest {
             action: action.to_owned(),
             base_ref: pr.base_ref.clone(),
             changed: changed.clone(),
@@ -1264,7 +1322,7 @@ impl Cx<'_> {
                         },
                     },
                 },
-                &config,
+                config,
                 self.now,
             )
             .await?;
@@ -1665,7 +1723,10 @@ impl Cx<'_> {
                 default_ref: &default_ref,
                 pull: pull.as_ref(),
             };
-            ids.extend(self.comment_commands(&run, &commands, room).await?);
+            match self.comment_commands(&run, &commands, room).await? {
+                Outcome::Done(more) => ids.extend(more),
+                other => return Ok(other),
+            }
         }
         Ok(Outcome::Done(ids))
     }
@@ -1682,14 +1743,17 @@ impl Cx<'_> {
         run: &CommentRun<'_>,
         commands: &[Found],
         mut room: u64,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Outcome> {
         let comment = run.comment;
         let role = self.commenter_role(comment).await?;
         let mut ids = Vec::new();
         let mut replies: Vec<String> = Vec::new();
         for found in commands {
             if found.name == APPROVE_RUN {
-                ids.extend(self.approve_run(comment, found, role, run.pull).await?);
+                match self.approve_run(comment, found, role, run.pull).await? {
+                    Outcome::Done(more) => ids.extend(more),
+                    other => return Ok(other),
+                }
                 continue;
             }
             // A command of the config is known only when the config
@@ -1804,7 +1868,7 @@ impl Cx<'_> {
         for text in &replies {
             self.reply(comment, text).await;
         }
-        Ok(ids)
+        Ok(Outcome::Done(ids))
     }
 
     /// The built-in `/approve-run --sha=<head>`: a second way into the
@@ -1833,7 +1897,7 @@ impl Cx<'_> {
         found: &Found,
         role: Option<CommandPermission>,
         pull: Option<&PullInfo>,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Outcome> {
         if !chatops::permits(role, CommandPermission::Write) {
             worker::console_warn!(
                 "{}: {} may not run /{} on #{}",
@@ -1842,29 +1906,29 @@ impl Cx<'_> {
                 found.name,
                 comment.number
             );
-            return Ok(Vec::new());
+            return Ok(Outcome::Done(Vec::new()));
         }
         let args = match &found.args {
             Ok(args) => args,
             Err(err) => {
                 self.reply(comment, &err.to_string()).await;
-                return Ok(Vec::new());
+                return Ok(Outcome::Done(Vec::new()));
             }
         };
         let Some(pull) = pull else {
             self.reply(comment, chatops::NO_HEAD_COMMIT).await;
-            return Ok(Vec::new());
+            return Ok(Outcome::Done(Vec::new()));
         };
         if pull.state != "open" {
             self.reply(comment, chatops::CLOSED_PULL_REQUEST).await;
-            return Ok(Vec::new());
+            return Ok(Outcome::Done(Vec::new()));
         }
         let head = match chatops::approve_pin(args, &found.line, Some(pull)) {
             Pin::Run(Some(head)) => head,
-            Pin::Run(None) => return Ok(Vec::new()),
+            Pin::Run(None) => return Ok(Outcome::Done(Vec::new())),
             Pin::Reply(text) => {
                 self.reply(comment, &text).await;
-                return Ok(Vec::new());
+                return Ok(Outcome::Done(Vec::new()));
             }
         };
         let (repo_id, number) = (comment.repo.id, comment.number);
@@ -1878,11 +1942,11 @@ impl Cx<'_> {
                 } else {
                     self.react(comment, "+1").await;
                 }
-                return Ok(Vec::new());
+                return Ok(Outcome::Done(Vec::new()));
             }
             Some(Unapprovable::ForkRunsOff) => {
                 self.reply(comment, fork::FORK_RUNS_OFF).await;
-                return Ok(Vec::new());
+                return Ok(Outcome::Done(Vec::new()));
             }
             None => {}
         }
@@ -1896,103 +1960,180 @@ impl Cx<'_> {
             &["pull_request_target"]
         };
         let mut policy = Some(policy);
+        // The pull request as it stands now: a push since the runs
+        // were made supersedes what waits at older commits, and an
+        // approval is only given while it is open at the run's commit.
         let pr = pull_of_comment(comment, pull);
-        // What each workflow needs is read from the config the event runs
-        // from, the head's for `pull_request` and the base branch's for
-        // `pull_request_target`, and from its runs at the head.
-        let mut invalid = false;
-        let head_names = if forks_run {
-            let event = |action: &str| Event::PullRequest {
-                action: action.to_owned(),
-                base_ref: pr.base_ref.clone(),
-                changed: Vec::new(),
-            };
-            let config = self
-                .config_at(comment.installation_id, &comment.repo, &head)
-                .await?;
-            Self::listening(&config, event, &mut invalid)
-        } else {
-            Vec::new()
-        };
-        let target_names = if target_approves {
-            let event = |action: &str| Event::PullRequestTarget {
-                action: action.to_owned(),
-                base_ref: pr.base_ref.clone(),
-                changed: Vec::new(),
-            };
-            let config = self
-                .config_at(
-                    comment.installation_id,
-                    &comment.repo,
-                    &runs::compile_ref_for(&pr),
-                )
-                .await?;
-            Self::listening(&config, event, &mut invalid)
-        } else {
-            Vec::new()
-        };
-        let made = store::pull_runs_at(self.db, repo_id, number, &head).await?;
-        let made: Vec<_> = made
+        let record = pull_record(&pr);
+        if store::upsert_pull(self.db, &record).await? == store::PullWrite::Tied {
+            store::upsert_pull_forced(self.db, &record).await?;
+        }
+        self.end_waiting(&pr, Some(&head), fork::SUPERSEDED).await?;
+        // Approving needs no config, so what waits is approved before
+        // anything is read from GitHub.
+        let mut ids = self.approve_head(comment, &head, events).await?;
+        let made: Vec<_> = store::pull_runs_at(self.db, repo_id, number, &head)
+            .await?
             .into_iter()
             .filter(|run| events.contains(&run.event.as_str()))
             .collect();
-        let head_decision = chatops::decide(&head_names, &made, "pull_request", self.now);
-        let target_decision =
-            chatops::decide(&target_names, &made, "pull_request_target", self.now);
-        let approve = head_decision.approve || target_decision.approve;
-        let nothing_to_do =
-            !approve && head_decision.remake.is_empty() && target_decision.remake.is_empty();
-        if !forks_run && !target_decision.approve && target_decision.remake.is_empty() {
-            self.reply(comment, fork::FORK_RUNS_OFF).await;
-            return Ok(Vec::new());
+        // What each event may make again comes from the config it runs
+        // from, the head's for `pull_request` and the base branch's for
+        // `pull_request_target`, and from its runs at the head.
+        let mut unusable = Vec::new();
+        let head_config = if forks_run {
+            Some(
+                self.config_at(comment.installation_id, &comment.repo, &head)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let base_ref = runs::compile_ref_for(&pr);
+        let target_config = if target_approves {
+            Some(
+                self.config_at(comment.installation_id, &comment.repo, &base_ref)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let usable = |config: &Option<Config>| match config {
+            None | Some(Config::Missing) => Ok(None),
+            Some(Config::Text(Ok(source))) => {
+                hatchrun_workflow::parse(source).map(Some).map_err(|_| ())
+            }
+            Some(Config::Text(Err(_))) => Err(()),
+        };
+        let head_parsed = usable(&head_config);
+        let target_parsed = usable(&target_config);
+        if head_parsed.is_err() {
+            unusable.push(chatops::invalid_head_config(&head));
         }
-        if invalid {
-            // Said once, for whichever config could not be used.
-            self.reply(comment, &chatops::invalid_config(&head)).await;
+        if target_parsed.is_err() {
+            let sha = runs::commit(
+                self.tokens,
+                self.settings,
+                comment.installation_id,
+                &comment.repo.full_name,
+                &base_ref,
+            )
+            .await?;
+            unusable.push(chatops::invalid_base_config(&pr.base_ref, sha.as_deref()));
         }
-        if nothing_to_do {
-            if invalid {
+        let (head_parsed, target_parsed) =
+            (head_parsed.unwrap_or(None), target_parsed.unwrap_or(None));
+        let has_runs = |event: &str| made.iter().any(|run| run.event == event);
+        let head_actions = planning::remake_actions(has_runs("pull_request"));
+        let target_actions = planning::remake_actions(has_runs("pull_request_target"));
+        let decide = |changed: &[String]| {
+            (
+                chatops::decide(
+                    &listed(
+                        head_parsed.as_ref(),
+                        head_event(&pr.base_ref, changed),
+                        head_actions,
+                    ),
+                    &made,
+                    "pull_request",
+                    self.now,
+                ),
+                chatops::decide(
+                    &listed(
+                        target_parsed.as_ref(),
+                        target_event(&pr.base_ref, changed),
+                        target_actions,
+                    ),
+                    &made,
+                    "pull_request_target",
+                    self.now,
+                ),
+            )
+        };
+        let (mut head_decision, mut target_decision) = decide(&[]);
+        // The files are fetched once, and only when a workflow that would
+        // be made again filters on paths; the listing is then redone with
+        // them, so a workflow the files do not trigger is not made.
+        let wants_paths = |parsed: &Option<hatchrun_workflow::Config>,
+                           names: &[String],
+                           actions: &[&str],
+                           target: bool| {
+            parsed.as_ref().is_some_and(|parsed| {
+                actions.iter().any(|action| {
+                    if target {
+                        planning::needs_pull_request_target_paths(
+                            parsed,
+                            action,
+                            &pr.base_ref,
+                            Some(names),
+                        )
+                    } else {
+                        planning::needs_pull_request_paths(
+                            parsed,
+                            action,
+                            &pr.base_ref,
+                            Some(names),
+                        )
+                    }
+                })
+            })
+        };
+        let mut changed = Vec::new();
+        if wants_paths(&head_parsed, &head_decision.remake, head_actions, false)
+            || wants_paths(
+                &target_parsed,
+                &target_decision.remake,
+                target_actions,
+                true,
+            )
+        {
+            changed = self.pull_paths(&pr).await?;
+            (head_decision, target_decision) = decide(&changed);
+        }
+        let remakes = !head_decision.remake.is_empty() || !target_decision.remake.is_empty();
+        // An unusable config is answered with its own reply, ahead of any
+        // other.
+        for text in &unusable {
+            self.reply(comment, text).await;
+        }
+        if !remakes && ids.is_empty() {
+            if !unusable.is_empty() {
                 self.react(comment, "-1").await;
+            } else if !forks_run {
+                self.reply(comment, fork::FORK_RUNS_OFF).await;
             } else if made.is_empty() {
                 self.reply(comment, chatops::NOTHING_TO_RUN).await;
                 self.react(comment, "-1").await;
             } else {
                 self.react(comment, "+1").await;
             }
-            return Ok(Vec::new());
+            return Ok(Outcome::Done(Vec::new()));
         }
-        // The pull request as it stands now: a push since the runs
-        // were made supersedes what waits at older commits, and an
-        // approval is only given while it is open at the run's commit.
-        let record = pull_record(&pr);
-        if store::upsert_pull(self.db, &record).await? == store::PullWrite::Tied {
-            store::upsert_pull_forced(self.db, &record).await?;
-        }
-        self.end_waiting(&pr, Some(&head), fork::SUPERSEDED).await?;
         self.react(comment, chatops::ACCEPTED).await;
-        let mut ids = Vec::new();
-        let remake = !head_decision.remake.is_empty() || !target_decision.remake.is_empty();
-        if remake {
+        if remakes {
             // The comment's delivery made no run of these workflows
             // before, or a retry of it finds the ones it made (a run is
             // one per delivery and workflow) and makes the rest. One call
-            // for each event makes all of its workflows, so the config,
-            // the commit and the files are read once and the admission
-            // counts the group once.
+            // for each event makes all of its workflows, so the commit
+            // and the admission are read once for the group.
             let delivery = format!("{}:approve-run", self.delivery);
+            let mut made_ids = Vec::new();
             let mut refused = false;
-            if !head_decision.remake.is_empty() {
+            if let (false, Some(config), Some(parsed)) =
+                (head_decision.remake.is_empty(), &head_config, &head_parsed)
+            {
+                let prepared = Prepared {
+                    among: &head_decision.remake,
+                    actions: head_actions,
+                    config,
+                    parsed,
+                    changed: &changed,
+                };
                 match self
-                    .pull_request_head(
-                        &pr,
-                        true,
-                        &mut policy,
-                        &delivery,
-                        Wanted::Remake(&head_decision.remake),
-                    )
+                    .pull_request_head(&pr, true, &mut policy, &delivery, Wanted::Remake(prepared))
                     .await?
                 {
-                    Outcome::Done(started) => ids.extend(started),
+                    Outcome::Done(started) => made_ids.extend(started),
                     Outcome::Ignored(reason) => {
                         worker::console_warn!(
                             "{}: /approve-run on #{number} made no run: {reason}",
@@ -2000,53 +2141,79 @@ impl Cx<'_> {
                         );
                         refused = true;
                     }
-                    Outcome::Retry => refused = true,
+                    Outcome::Retry => return Ok(Outcome::Retry),
                 }
             }
-            if !target_decision.remake.is_empty() {
+            if let (false, Some(config), Some(parsed)) = (
+                target_decision.remake.is_empty(),
+                &target_config,
+                &target_parsed,
+            ) {
+                let prepared = Prepared {
+                    among: &target_decision.remake,
+                    actions: target_actions,
+                    config,
+                    parsed,
+                    changed: &changed,
+                };
                 let (started, target_refused) = self
                     .pull_request_target(
                         &pr,
                         true,
                         &mut policy,
                         &delivery,
-                        Wanted::Remake(&target_decision.remake),
+                        Wanted::Remake(prepared),
                     )
                     .await?;
-                ids.extend(started);
+                made_ids.extend(started);
                 refused |= target_refused;
             }
             if refused {
                 self.reply(comment, chatops::TOO_MANY_WAITING).await;
             }
-            if ids.is_empty() && !approve {
+            // The new runs wait for an approval, and this comment is it.
+            if !made_ids.is_empty() {
+                ids.extend(self.approve_head(comment, &head, events).await?);
+            }
+            ids.extend(made_ids);
+            if ids.is_empty() {
                 // Nothing could be made: no workflow has a plan for the
                 // actions it is made as.
                 if !refused {
                     self.reply(comment, chatops::NOTHING_TO_RUN).await;
                 }
                 self.react(comment, "-1").await;
-                return Ok(Vec::new());
+                return Ok(Outcome::Done(Vec::new()));
             }
         }
+        ids.sort_unstable();
+        ids.dedup();
+        self.react(comment, "+1").await;
+        Ok(Outcome::Done(ids))
+    }
+
+    /// Approves the waiting runs of `events` at `head` for the commenter
+    /// and has the cards updated. Returns the ids of the runs approved.
+    async fn approve_head(
+        &self,
+        comment: &IssueComment,
+        head: &str,
+        events: &[&str],
+    ) -> Result<Vec<u64>> {
         let approved = store::approve_at_head(
             self.db,
             self.tenant,
-            repo_id,
-            number,
-            &head,
+            comment.repo.id,
+            comment.number,
+            head,
             &comment.actor,
             self.now,
             events,
         )
         .await?;
-        // A run that started without waiting (its author needs no
-        // approval) is made and has nothing to approve.
-        if approved.is_empty() && ids.is_empty() {
-            self.react(comment, "-1").await;
-            return Ok(Vec::new());
-        }
-        if let Some(repo) = store::repo(self.db, repo_id).await? {
+        if !approved.is_empty()
+            && let Some(repo) = store::repo(self.db, comment.repo.id).await?
+        {
             fork::after_approval(
                 self.env,
                 self.db,
@@ -2058,41 +2225,7 @@ impl Cx<'_> {
             )
             .await;
         }
-        ids.extend(approved.iter().map(|run| run.id));
-        ids.sort_unstable();
-        ids.dedup();
-        self.react(comment, "+1").await;
-        Ok(ids)
-    }
-
-    /// The workflows of `config` that listen to the event `event` builds
-    /// the trigger of, under the actions a remake uses (see
-    /// [`planning::remake_batches`]). A missing config has none. One that
-    /// cannot be used has none either and sets `invalid`, so the comment
-    /// is answered with it. Path filters are left to the call that makes
-    /// the runs: the files are not known here.
-    fn listening(
-        config: &Config,
-        event: impl Fn(&str) -> Event,
-        invalid: &mut bool,
-    ) -> Vec<String> {
-        match config {
-            Config::Missing => Vec::new(),
-            Config::Text(Err(_)) => {
-                *invalid = true;
-                Vec::new()
-            }
-            Config::Text(Ok(_)) => {
-                let Some(parsed) = parsed(config) else {
-                    *invalid = true;
-                    return Vec::new();
-                };
-                planning::remake_batches(&parsed, event, None)
-                    .into_iter()
-                    .flat_map(|(_, names, _)| names)
-                    .collect()
-            }
-        }
+        Ok(approved.iter().map(|run| run.id).collect())
     }
 
     async fn config_at(&self, installation_id: u64, repo: &Repo, sha: &str) -> Result<Config> {

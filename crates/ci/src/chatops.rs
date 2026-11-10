@@ -82,11 +82,22 @@ pub struct Decision {
     pub remake: Vec<String>,
 }
 
-/// The reply when the config cannot be used, so nothing could be made
-/// again.
+/// The reply when the pull request head's config cannot be used: the
+/// `pull_request` workflows did not start.
 #[must_use]
-pub fn invalid_config(sha: &str) -> String {
-    format!("Invalid hatchrun config at {sha}, so no workflow started")
+pub fn invalid_head_config(sha: &str) -> String {
+    format!("Invalid hatchrun config at {sha}, so the pull_request workflows did not start")
+}
+
+/// The reply when the base branch's config cannot be used: the
+/// `pull_request_target` workflows did not start. `sha` is the branch's
+/// commit when it is known.
+#[must_use]
+pub fn invalid_base_config(branch: &str, sha: Option<&str>) -> String {
+    let at = sha.map_or(String::new(), |sha| format!(" at {sha}"));
+    format!(
+        "Invalid hatchrun config on {branch}{at}, so the pull_request_target workflows did not start"
+    )
 }
 
 /// Why `/approve-run` has nothing to approve for the pull request.
@@ -173,10 +184,7 @@ pub fn decide(listening: &[String], runs: &[RunRow], event: &str, now: u64) -> D
         .any(|run| run.event == event && stage(run, now) == Stage::Waiting);
     let remake = listening
         .iter()
-        .filter(|name| {
-            let stages = stages(name);
-            !stages.contains(&Stage::Waiting) && stages.iter().all(|stage| *stage == Stage::Ended)
-        })
+        .filter(|name| stages(name).iter().all(|stage| *stage == Stage::Ended))
         .cloned()
         .collect();
     Decision { approve, remake }
@@ -398,6 +406,16 @@ mod tests {
         ];
         assert_eq!(decide(&ci, &runs, PR, NOW), decided(true, &[]));
         assert_eq!(decide(&ci, &runs[..2], PR, NOW), decided(false, &[]));
+    }
+
+    #[test]
+    fn an_invalid_config_reply_names_the_config_and_the_events_that_did_not_start() {
+        let head = invalid_head_config("abc");
+        assert!(head.contains("at abc") && head.contains("pull_request workflows"));
+        assert!(!head.contains("target"));
+        let base = invalid_base_config("main", Some("def"));
+        assert!(base.contains("on main at def") && base.contains("pull_request_target workflows"));
+        assert!(invalid_base_config("main", None).contains("on main,"));
     }
 
     #[test]

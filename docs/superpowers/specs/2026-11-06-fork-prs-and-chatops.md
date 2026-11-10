@@ -691,10 +691,15 @@ Each workflow that listens is decided on its own, for `pull_request`
 (the head's config) and for `pull_request_target` (the base branch's), from
 its runs at the head; a listed workflow with no run is made too, so a retry
 after a partial failure makes the missing ones. With `fork_runs = off` the
-`pull_request` runs are never approved or made. A workflow is made again as the first of
-`synchronize`, `opened` and `reopened` that it listens to; one that
-listens to none of them (a `labeled`-only workflow) is not made again,
-and when nothing could be, the reply says so.
+`pull_request` runs are never approved or made. What waits is approved
+before any config is read. A workflow is made again as `synchronize`, the
+action a commit gives; one that only listens to `opened`, `reopened` or
+`labeled` is not. Only when the head has no run of the event at all (the
+whole delivery was dropped) is a workflow made as the first of
+`synchronize`, `opened` and `reopened` that it listens to. A workflow the
+pull request's files do not trigger is not made. When nothing could be
+made, the reply says so, and a config that cannot be used is named in a
+reply (the head sha, or the base branch and its sha).
 
 A new run still counts against the pending, deferred and per-author caps.
 `/approve-run` is the only built-in command, and the name is reserved.
