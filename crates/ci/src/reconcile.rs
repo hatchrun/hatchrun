@@ -808,7 +808,7 @@ async fn start(
             actor: "schedule",
             head_ref: "",
             base_ref: "",
-            workflow: Some(&fire.workflow),
+            workflows: Some(std::slice::from_ref(&fire.workflow)),
             origin: runs::Origin::own("schedule"),
         },
         &head.config,

@@ -392,12 +392,6 @@ impl<'a> Cx<'a> {
                     self.log(job, offset).await
                 };
             }
-            (Method::Get, "/event") => {
-                return match self.event().await? {
-                    Value::Null => answer(404),
-                    event => Response::from_json(&event),
-                };
-            }
             (Method::Get, "/state") => {
                 let Some(ident) = ident else {
                     return Response::error("a run and a tenant are needed", 400);

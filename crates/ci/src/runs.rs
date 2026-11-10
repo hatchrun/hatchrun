@@ -126,9 +126,10 @@ pub struct Request<'a> {
     pub head_ref: &'a str,
     /// The pull request's base branch, empty otherwise.
     pub base_ref: &'a str,
-    /// Start only this workflow's plan. A schedule names its workflow;
-    /// the other workflows that share its cron have their own entries.
-    pub workflow: Option<&'a str>,
+    /// Start only the plans of these workflows. A schedule names its
+    /// workflow; the other workflows that share its cron have their own
+    /// entries.
+    pub workflows: Option<&'a [String]>,
     /// Whose code the runs execute.
     pub origin: Origin<'a>,
 }
@@ -523,8 +524,8 @@ pub async fn create(
         }
     };
     let mut wanted = planning::remote_workflows(source, req.trigger);
-    if let Some(only) = req.workflow {
-        wanted.retain(|name| name == only);
+    if let Some(only) = req.workflows {
+        wanted.retain(|name| only.contains(name));
     }
     let library = match hatchrun_workflow::parse(source) {
         Ok(parsed) if !wanted.is_empty() => {
@@ -545,8 +546,8 @@ pub async fn create(
     let selected = planning::select_with(source, req.trigger, req.compile_ref, &library);
     let (plans, failed) = match selected {
         Selected::Plans { plans, failed } => fork_limits(
-            only_workflow(plans, req.workflow),
-            only_failed(failed, req.workflow),
+            only_workflow(plans, req.workflows),
+            only_failed(failed, req.workflows),
             req.origin.policy.is_some(),
         ),
         Selected::Invalid(diagnostics) => {
@@ -664,19 +665,19 @@ fn with_fork_timeouts(plan: &Plan, policy: &RepoPolicy) -> Plan {
     plan
 }
 
-/// The plans of `workflow` when one is named, all of them otherwise.
-fn only_workflow(mut plans: Vec<Plan>, workflow: Option<&str>) -> Vec<Plan> {
-    if let Some(workflow) = workflow {
-        plans.retain(|plan| plan.workflow == workflow);
+/// The plans of `workflows` when they are named, all of them otherwise.
+fn only_workflow(mut plans: Vec<Plan>, workflows: Option<&[String]>) -> Vec<Plan> {
+    if let Some(workflows) = workflows {
+        plans.retain(|plan| workflows.contains(&plan.workflow));
     }
     plans
 }
 
-/// The failed workflows of `workflow` when one is named, all of them
+/// The failed workflows of `workflows` when they are named, all of them
 /// otherwise.
-fn only_failed(mut failed: Vec<Failed>, workflow: Option<&str>) -> Vec<Failed> {
-    if let Some(workflow) = workflow {
-        failed.retain(|failed| failed.workflow == workflow);
+fn only_failed(mut failed: Vec<Failed>, workflows: Option<&[String]>) -> Vec<Failed> {
+    if let Some(workflows) = workflows {
+        failed.retain(|failed| workflows.contains(&failed.workflow));
     }
     failed
 }
@@ -1046,7 +1047,7 @@ mod tests {
             actor: "octocat",
             head_ref: "",
             base_ref: "",
-            workflow: None,
+            workflows: None,
             origin: Origin::own("octocat"),
         };
         let vars = std::collections::BTreeMap::from([("REGION".to_owned(), "eu".to_owned())]);
@@ -1310,7 +1311,7 @@ mod tests {
             actor: "a",
             head_ref: "",
             base_ref: "",
-            workflow: None,
+            workflows: None,
             origin,
         };
         let on_head = Origin {
@@ -1393,7 +1394,7 @@ mod tests {
             actor: "a",
             head_ref: "",
             base_ref: "",
-            workflow: None,
+            workflows: None,
             origin,
         };
         let target = Origin {
@@ -1431,7 +1432,7 @@ mod tests {
             actor: "octocat",
             head_ref: "feature",
             base_ref: "main",
-            workflow: None,
+            workflows: None,
             origin: Origin::own("octocat"),
         };
         // The ref is the base branch, so the number comes from the payload.
@@ -1659,8 +1660,9 @@ workflows:
             panic!("invalid");
         };
         assert_eq!(plans.len(), 2, "both share the cron");
-        let names = |workflow| {
-            only_workflow(plans.clone(), workflow)
+        let names = |workflow: Option<&str>| {
+            let workflows = workflow.map(|name| vec![name.to_owned()]);
+            only_workflow(plans.clone(), workflows.as_deref())
                 .into_iter()
                 .map(|plan| plan.workflow)
                 .collect::<Vec<_>>()

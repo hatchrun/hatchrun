@@ -28,12 +28,14 @@ ALTER TABLE ci_runs ADD COLUMN command_name text;
 -- `reaction` option, as the workflow said it when the run started.
 ALTER TABLE ci_runs ADD COLUMN command_reaction text;
 
--- Both constraints are added NOT VALID and validated after. Adding a
--- CHECK validated scans the whole table under an ACCESS EXCLUSIVE lock,
--- which blocks reads and writes of ci_runs for the scan. NOT VALID takes
--- the lock only for the catalog change and checks new and updated rows
--- from then on; VALIDATE CONSTRAINT then scans under a SHARE UPDATE
--- EXCLUSIVE lock, which lets reads and writes go on.
+-- Both constraints are added NOT VALID and left so. Adding a CHECK
+-- validated scans the whole table under an ACCESS EXCLUSIVE lock. NOT VALID
+-- takes the lock only for the catalog change and checks every row
+-- inserted or updated from then on. The migration runner holds one
+-- transaction for the pass, so a VALIDATE CONSTRAINT here would run its scan
+-- under the lock the ADD COLUMNs above took, which is what NOT VALID
+-- avoids. It is not needed: every existing row has the three columns NULL,
+-- which satisfies both checks, and new rows are checked.
 ALTER TABLE ci_runs ADD CONSTRAINT ci_runs_command_reaction_known
   CHECK (command_reaction IN ('default', 'rocket')) NOT VALID;
 
@@ -41,9 +43,6 @@ ALTER TABLE ci_runs ADD CONSTRAINT ci_runs_command_reaction_known
 ALTER TABLE ci_runs ADD CONSTRAINT ci_runs_command_whole CHECK (
   (comment_id IS NULL) = (command_name IS NULL)
   AND (comment_id IS NULL) = (command_reaction IS NULL)) NOT VALID;
-
-ALTER TABLE ci_runs VALIDATE CONSTRAINT ci_runs_command_reaction_known;
-ALTER TABLE ci_runs VALIDATE CONSTRAINT ci_runs_command_whole;
 
 -- The runs of a comment event that are not over, by issue, for the cap.
 -- The migration runner applies a pass in one transaction, which rules

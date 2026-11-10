@@ -232,7 +232,7 @@ pub async fn fire(
                     actor: &info.actor,
                     head_ref: "",
                     base_ref: "",
-                    workflow: None,
+                    workflows: None,
                     origin: runs::Origin::own(&info.actor),
                 },
                 &config,

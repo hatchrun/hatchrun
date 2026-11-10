@@ -1620,7 +1620,7 @@ impl Cx<'_> {
                 actor: &session.user.login,
                 head_ref: "",
                 base_ref: "",
-                workflow: Some(&asked.workflow),
+                workflows: Some(std::slice::from_ref(&asked.workflow)),
                 origin: runs::Origin::own(&session.user.login),
             },
             &config,

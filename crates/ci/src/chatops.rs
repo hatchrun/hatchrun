@@ -85,79 +85,45 @@ pub struct Approval {
     pub remake: Remake,
 }
 
-/// The runs `/approve-run` makes again.
+/// The runs `/approve-run` makes again, for each event.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Remake {
-    /// None: every workflow has a run that waits, goes or went well.
+pub struct Remake {
+    /// The `pull_request` workflows to make again.
+    pub pull_request: Which,
+    /// The `pull_request_target` workflows to make again.
+    pub pull_request_target: Which,
+}
+
+/// The workflows of one event that `/approve-run` makes again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Which {
+    /// None: each has a run that waits, goes or went well.
     Nothing,
-    /// There is no run at the head at all: make the runs a `pull_request`
-    /// and a `pull_request_target` delivery make.
+    /// There is no run at the head at all: every workflow of the event.
     All,
     /// These workflows have only runs that ended without an approval or
     /// with a failure.
-    Groups(Vec<Group>),
+    Only(Vec<String>),
 }
 
-/// The runs of one workflow for one event at a head.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Group {
-    /// The workflow's file name.
-    pub workflow: String,
-    /// `pull_request` or `pull_request_target`.
-    pub event: String,
-    /// The newest run of the group, whose event payload the new run is
-    /// made from.
-    pub latest: u64,
+impl Which {
+    /// The workflows to make: `None` for nothing, `Some(None)` for all
+    /// of them, `Some(Some(names))` for these.
+    #[must_use]
+    pub fn among(&self) -> Option<Option<&Vec<String>>> {
+        match self {
+            Self::Nothing => None,
+            Self::All => Some(None),
+            Self::Only(names) => Some(Some(names)),
+        }
+    }
 }
 
-/// The action of the `pull_request` delivery `/approve-run` stands in
-/// for when a workflow has no earlier run to take it from.
-pub const FIRST_ACTION: &str = "synchronize";
-
-/// One run `/approve-run` makes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Make {
-    /// The workflow, or every workflow of the event when `None`.
-    pub workflow: Option<String>,
-    /// `pull_request` or `pull_request_target`.
-    pub event: &'static str,
-    /// The action of the delivery the run is made as.
-    pub action: String,
-}
-
-/// The runs `remake` asks for. `actions` holds the `action` of the stored
-/// event of earlier runs, by run id: a workflow made again takes its
-/// newest run's, so a `types` filter that matched then matches again. A
-/// run with none, and a head with no run at all, use [`FIRST_ACTION`].
-/// With no run at all both events are made, so `pull_request_target`
-/// workflows come back too.
-#[must_use]
-pub fn makes(remake: &Remake, actions: &BTreeMap<u64, String>) -> Vec<Make> {
-    match remake {
-        Remake::Nothing => Vec::new(),
-        Remake::All => ["pull_request", "pull_request_target"]
-            .into_iter()
-            .map(|event| Make {
-                workflow: None,
-                event,
-                action: FIRST_ACTION.to_owned(),
-            })
-            .collect(),
-        Remake::Groups(groups) => groups
-            .iter()
-            .map(|group| Make {
-                workflow: Some(group.workflow.clone()),
-                event: if group.event == "pull_request_target" {
-                    "pull_request_target"
-                } else {
-                    "pull_request"
-                },
-                action: actions
-                    .get(&group.latest)
-                    .cloned()
-                    .unwrap_or_else(|| FIRST_ACTION.to_owned()),
-            })
-            .collect(),
+impl Remake {
+    /// Whether nothing is made again.
+    #[must_use]
+    pub fn is_nothing(&self) -> bool {
+        self.pull_request == Which::Nothing && self.pull_request_target == Which::Nothing
     }
 }
 
@@ -167,18 +133,25 @@ pub enum Unapprovable {
     /// The pull request is of this repository: its runs need no
     /// approval.
     NotAFork,
-    /// The repository runs no fork pull requests.
+    /// The repository runs no fork pull requests, and its
+    /// `pull_request_target` runs need no approval either.
     ForkRunsOff,
 }
 
 /// Whether `/approve-run` stops before looking at runs. A pull request of
-/// this repository is told there is nothing to approve whatever the
-/// fork policy is, so that is asked first.
+/// this repository is told there is nothing to approve whatever the fork
+/// policy is, so that is asked first. `fork_runs` off refuses only the
+/// `pull_request` runs: `target_approves` (the `pull_request_target`
+/// runs of a fork wait for an approval) keeps the command going.
 #[must_use]
-pub fn unapprovable(fork: bool, fork_runs: ForkRuns) -> Option<Unapprovable> {
+pub fn unapprovable(
+    fork: bool,
+    fork_runs: ForkRuns,
+    target_approves: bool,
+) -> Option<Unapprovable> {
     if !fork {
         Some(Unapprovable::NotAFork)
-    } else if fork_runs == ForkRuns::Off {
+    } else if fork_runs == ForkRuns::Off && !target_approves {
         Some(Unapprovable::ForkRunsOff)
     } else {
         None
@@ -228,35 +201,46 @@ pub fn approval(runs: &[RunRow], now: u64) -> Approval {
     if runs.is_empty() {
         return Approval {
             approve: false,
-            remake: Remake::All,
+            remake: Remake {
+                pull_request: Which::All,
+                pull_request_target: Which::All,
+            },
         };
     }
-    let mut groups: BTreeMap<(&str, &str), Vec<(Stage, u64)>> = BTreeMap::new();
+    let mut groups: BTreeMap<(&str, &str), Vec<Stage>> = BTreeMap::new();
     for run in runs {
         groups
             .entry((run.workflow.as_str(), run.event.as_str()))
             .or_default()
-            .push((stage(run, now), run.id));
+            .push(stage(run, now));
     }
     let mut approve = false;
-    let mut remake = Vec::new();
+    let mut pull_request = Vec::new();
+    let mut pull_request_target = Vec::new();
     for ((workflow, event), stages) in groups {
-        if stages.iter().any(|(stage, _)| *stage == Stage::Waiting) {
+        if stages.contains(&Stage::Waiting) {
             approve = true;
-        } else if stages.iter().all(|(stage, _)| *stage == Stage::Ended) {
-            remake.push(Group {
-                workflow: workflow.to_owned(),
-                event: event.to_owned(),
-                latest: stages.iter().map(|(_, id)| *id).max().unwrap_or_default(),
-            });
+        } else if stages.iter().all(|stage| *stage == Stage::Ended) {
+            let list = if event == "pull_request_target" {
+                &mut pull_request_target
+            } else {
+                &mut pull_request
+            };
+            list.push(workflow.to_owned());
         }
     }
+    let which = |list: Vec<String>| {
+        if list.is_empty() {
+            Which::Nothing
+        } else {
+            Which::Only(list)
+        }
+    };
     Approval {
         approve,
-        remake: if remake.is_empty() {
-            Remake::Nothing
-        } else {
-            Remake::Groups(remake)
+        remake: Remake {
+            pull_request: which(pull_request),
+            pull_request_target: which(pull_request_target),
         },
     }
 }
@@ -428,16 +412,29 @@ mod tests {
         run
     }
 
-    fn decided(approve: bool, remake: Remake) -> Approval {
-        Approval { approve, remake }
+    fn nothing() -> Remake {
+        Remake {
+            pull_request: Which::Nothing,
+            pull_request_target: Which::Nothing,
+        }
     }
 
-    fn group(workflow: &str, event: &str, latest: u64) -> Group {
-        Group {
-            workflow: workflow.to_owned(),
-            event: event.to_owned(),
-            latest,
+    fn pr_only(names: &[&str]) -> Remake {
+        Remake {
+            pull_request: Which::Only(names.iter().map(|n| (*n).to_owned()).collect()),
+            ..nothing()
         }
+    }
+
+    fn target_only(names: &[&str]) -> Remake {
+        Remake {
+            pull_request_target: Which::Only(names.iter().map(|n| (*n).to_owned()).collect()),
+            ..nothing()
+        }
+    }
+
+    fn decided(approve: bool, remake: Remake) -> Approval {
+        Approval { approve, remake }
     }
 
     #[test]
@@ -445,24 +442,24 @@ mod tests {
         let waiting = |gate| run(gate, "queued", None, NOW - 1);
         assert_eq!(
             approval(&[waiting("pending")], NOW),
-            decided(true, Remake::Nothing)
+            decided(true, nothing())
         );
         assert_eq!(
             approval(&[waiting("deferred")], NOW),
-            decided(true, Remake::Nothing)
+            decided(true, nothing())
         );
         for gate in ["approved", "none"] {
             for status in ["queued", "in_progress"] {
                 assert_eq!(
                     approval(&[run(gate, status, None, 0)], NOW),
-                    decided(false, Remake::Nothing),
+                    decided(false, nothing()),
                     "{gate} {status}"
                 );
             }
         }
         // A run that went well has nothing to approve either.
         let done = run("approved", "completed", Some("success"), 0);
-        assert_eq!(approval(&[done], NOW), decided(false, Remake::Nothing));
+        assert_eq!(approval(&[done], NOW), decided(false, nothing()));
     }
 
     #[test]
@@ -472,13 +469,17 @@ mod tests {
             run("approved", "in_progress", None, 1),
             run("pending", "queued", None, NOW),
         ];
-        assert_eq!(approval(&runs, NOW), decided(true, Remake::Nothing));
-        assert_eq!(approval(&runs[..2], NOW), decided(false, Remake::Nothing));
+        assert_eq!(approval(&runs, NOW), decided(true, nothing()));
+        assert_eq!(approval(&runs[..2], NOW), decided(false, nothing()));
     }
 
     #[test]
     fn only_ended_runs_or_none_make_a_new_run() {
-        assert_eq!(approval(&[], NOW), decided(false, Remake::All));
+        let everything = Remake {
+            pull_request: Which::All,
+            pull_request_target: Which::All,
+        };
+        assert_eq!(approval(&[], NOW), decided(false, everything));
         for (gate, conclusion) in [
             ("cancelled", "cancelled"),
             ("expired", "cancelled"),
@@ -489,27 +490,21 @@ mod tests {
             let ended = run(gate, "completed", Some(conclusion), 1);
             assert_eq!(
                 approval(&[ended], NOW),
-                decided(false, Remake::Groups(vec![group("ci", "pull_request", 9)])),
+                decided(false, pr_only(&["ci"])),
                 "{gate}"
             );
         }
         // A rejected run whose cancellation is still going is not alive.
         let rejected = run("cancelled", "queued", None, 1);
-        assert_eq!(
-            approval(&[rejected], NOW),
-            decided(false, Remake::Groups(vec![group("ci", "pull_request", 9)]))
-        );
+        assert_eq!(approval(&[rejected], NOW), decided(false, pr_only(&["ci"])));
     }
 
     #[test]
     fn a_waiting_run_past_its_deadline_is_not_revived() {
         let late = run("pending", "queued", None, NOW - APPROVAL_EXPIRES_MS - 1);
-        assert_eq!(
-            approval(&[late], NOW),
-            decided(false, Remake::Groups(vec![group("ci", "pull_request", 9)]))
-        );
+        assert_eq!(approval(&[late], NOW), decided(false, pr_only(&["ci"])));
         let on_time = run("deferred", "queued", None, NOW - APPROVAL_EXPIRES_MS);
-        assert_eq!(approval(&[on_time], NOW), decided(true, Remake::Nothing));
+        assert_eq!(approval(&[on_time], NOW), decided(true, nothing()));
     }
 
     #[test]
@@ -529,28 +524,18 @@ mod tests {
         );
         assert_eq!(
             approval(&[w1.clone(), w2.clone()], NOW),
-            decided(false, Remake::Groups(vec![group("w2", "pull_request", 4)]))
+            decided(false, pr_only(&["w2"]))
         );
-        // The same workflow under the other event is another group, and
-        // the newest run of a group names it.
+        // The same workflow under the other event is another group.
         let target = named(
             run("cancelled", "completed", Some("cancelled"), 1),
             "w1",
             "pull_request_target",
             5,
         );
-        let older = named(
-            run("cancelled", "completed", Some("cancelled"), 1),
-            "w1",
-            "pull_request_target",
-            2,
-        );
         assert_eq!(
-            approval(&[older, w1, target], NOW),
-            decided(
-                false,
-                Remake::Groups(vec![group("w1", "pull_request_target", 5)])
-            )
+            approval(&[w1, target], NOW),
+            decided(false, target_only(&["w1"]))
         );
         // A waiting group is approved while another is made again.
         let waiting = named(
@@ -561,53 +546,28 @@ mod tests {
         );
         assert_eq!(
             approval(&[waiting, w2], NOW),
-            decided(true, Remake::Groups(vec![group("w2", "pull_request", 4)]))
+            decided(true, pr_only(&["w2"]))
         );
     }
 
     #[test]
-    fn approve_run_makes_target_runs_again_and_keeps_each_workflows_action() {
-        let none = BTreeMap::new();
-        // With no run at all both events are made, for every workflow.
-        let all = makes(&Remake::All, &none);
-        let events: Vec<_> = all.iter().map(|make| make.event).collect();
-        assert_eq!(events, ["pull_request", "pull_request_target"]);
-        assert!(all.iter().all(|make| make.workflow.is_none()));
-        assert!(all.iter().all(|make| make.action == "synchronize"));
-        // A workflow made again takes the action of its newest run; one
-        // whose event is not stored falls back to `synchronize`.
-        let groups = Remake::Groups(vec![
-            group("w1", "pull_request", 4),
-            group("w2", "pull_request_target", 5),
-            group("w3", "pull_request", 6),
-        ]);
-        let actions = BTreeMap::from([(4, "opened".to_owned()), (5, "reopened".to_owned())]);
-        let made = makes(&groups, &actions);
-        let seen: Vec<_> = made
-            .iter()
-            .map(|make| (make.workflow.as_deref(), make.event, make.action.as_str()))
-            .collect();
-        assert_eq!(
-            seen,
-            [
-                (Some("w1"), "pull_request", "opened"),
-                (Some("w2"), "pull_request_target", "reopened"),
-                (Some("w3"), "pull_request", "synchronize"),
-            ]
-        );
-        assert_eq!(makes(&Remake::Nothing, &actions), Vec::new());
-    }
-
-    #[test]
-    fn a_pull_request_of_the_repository_is_asked_about_before_the_fork_policy() {
+    fn fork_runs_off_refuses_only_the_pull_request_part() {
+        // A pull request of the repository is asked about first.
         for fork_runs in [ForkRuns::Off, ForkRuns::On] {
-            assert_eq!(unapprovable(false, fork_runs), Some(Unapprovable::NotAFork));
+            for target in [false, true] {
+                assert_eq!(
+                    unapprovable(false, fork_runs, target),
+                    Some(Unapprovable::NotAFork)
+                );
+            }
         }
         assert_eq!(
-            unapprovable(true, ForkRuns::Off),
+            unapprovable(true, ForkRuns::Off, false),
             Some(Unapprovable::ForkRunsOff)
         );
-        assert_eq!(unapprovable(true, ForkRuns::On), None);
+        // Under `approve` the target runs still wait for the command.
+        assert_eq!(unapprovable(true, ForkRuns::Off, true), None);
+        assert_eq!(unapprovable(true, ForkRuns::On, false), None);
     }
 
     #[test]

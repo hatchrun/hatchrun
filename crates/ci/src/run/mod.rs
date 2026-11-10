@@ -31,7 +31,6 @@
 //! | `POST /rerun?job=ID` | none | `204` |
 //! | `POST /purge` | none | `204` |
 //! | `GET /state` | none | `200` [`RunState`] |
-//! | `GET /event` | none | `200` the webhook payload, `404` none |
 //! | `GET /live?job=ID` | WebSocket upgrade | `101`, `409` ended |
 //! | `GET /log?job=ID[&offset=N]` | none | `200` text, `404` none |
 //!

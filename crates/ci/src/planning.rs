@@ -167,6 +167,43 @@ pub fn listens(config: &Config, event: &Event) -> bool {
     config.workflows.values().any(|wf| triggered(&wf.on, event))
 }
 
+/// The pull request actions `/approve-run` makes a workflow again as, in
+/// the order it tries them.
+pub const REMAKE_ACTIONS: [&str; 3] = ["synchronize", "opened", "reopened"];
+
+/// The workflows of `config` (those in `among`, all when `None`) that
+/// `/approve-run` makes again, grouped by the action they are made as.
+/// The comment is no pull request delivery, so a workflow is made as the
+/// first of [`REMAKE_ACTIONS`] that it listens to, which is the one that
+/// starts it when its pull request gets a commit, is opened or is
+/// reopened. A workflow that listens to none of them (one that only runs
+/// on `labeled`, say) is not made again. `event` builds the trigger for
+/// an action.
+#[must_use]
+pub fn remake_batches(
+    config: &Config,
+    event: impl Fn(&str) -> Event,
+    among: Option<&[String]>,
+) -> Vec<(&'static str, Vec<String>)> {
+    let mut left: Vec<&String> = config
+        .workflows
+        .keys()
+        .filter(|name| among.is_none_or(|among| among.contains(name)))
+        .collect();
+    let mut batches = Vec::new();
+    for action in REMAKE_ACTIONS {
+        let trigger = event(action);
+        let (hit, rest): (Vec<&String>, Vec<&String>) = left
+            .into_iter()
+            .partition(|name| triggered(&config.workflows[*name].on, &trigger));
+        left = rest;
+        if !hit.is_empty() {
+            batches.push((action, hit.into_iter().cloned().collect()));
+        }
+    }
+    batches
+}
+
 /// The names of the chat commands any workflow of `config` defines, for
 /// the comment parser to look for.
 #[must_use]
@@ -368,6 +405,43 @@ workflows:
         assert_eq!(
             command_workflows(&parse(CHAT).unwrap(), "nope", true).len(),
             0
+        );
+    }
+
+    #[test]
+    fn a_remade_workflow_runs_as_the_first_action_it_listens_to() {
+        let config = parse(
+            "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  a: { on: { pull_request: { types: [opened, reopened] } }, jobs: [t] }
+  b: { on: { pull_request: {} }, jobs: [t] }
+  c: { on: { pull_request: { types: [reopened] } }, jobs: [t] }
+  d: { on: { pull_request: { types: [labeled] } }, jobs: [t] }
+  e: { on: { push: {} }, jobs: [t] }
+",
+        )
+        .unwrap();
+        let event = |action: &str| Event::PullRequest {
+            action: action.into(),
+            base_ref: "main".into(),
+            changed: Vec::new(),
+        };
+        // `b` has the default types, which include `synchronize`; `d`
+        // and `e` listen to none of the three.
+        assert_eq!(
+            remake_batches(&config, event, None),
+            [
+                ("synchronize", vec!["b".to_owned()]),
+                ("opened", vec!["a".to_owned()]),
+                ("reopened", vec!["c".to_owned()]),
+            ]
+        );
+        let among = ["a".to_owned(), "d".to_owned()];
+        assert_eq!(
+            remake_batches(&config, event, Some(&among)),
+            [("opened", vec!["a".to_owned()])]
         );
     }
 

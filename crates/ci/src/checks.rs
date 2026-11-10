@@ -38,10 +38,11 @@ pub const TAIL_LINES: usize = 100;
 const EXTERNAL_ID_PREFIX: &str = "hatchrun-ci:";
 
 /// The check run's name: the workflow and the planned job's id. The
-/// runs of an `issue_comment` event or of a chat command report on a
-/// pull request's head, where anyone who can comment may start them, so
-/// their names end in the event or the command. They can then never
-/// replace a required check of the pull request's own runs.
+/// runs of an `issues` or `issue_comment` event or of a chat command
+/// are started by anyone who can open an issue or comment, and may
+/// report on a pull request's head, so their names end in the event or
+/// the command. They can then never replace a required check of the
+/// pull request's own runs.
 #[must_use]
 pub fn check_name(
     workflow: &str,
@@ -51,7 +52,9 @@ pub fn check_name(
 ) -> String {
     match (command, event_name) {
         (Some(command), _) => format!("{workflow} / {plan_id} (/{command})"),
-        (None, "issue_comment") => format!("{workflow} / {plan_id} (issue_comment)"),
+        (None, event @ ("issue_comment" | "issues")) => {
+            format!("{workflow} / {plan_id} ({event})")
+        }
         (None, _) => format!("{workflow} / {plan_id}"),
     }
 }
@@ -593,6 +596,10 @@ mod tests {
         let comment = check_name("ci", "test", "issue_comment", None);
         let command = check_name("ci", "test", "issue_comment", Some("retest"));
         assert_eq!(comment, "ci / test (issue_comment)");
+        assert_eq!(
+            check_name("ci", "test", "issues", None),
+            "ci / test (issues)"
+        );
         assert_eq!(command, "ci / test (/retest)");
         assert_ne!(own, comment);
         assert_ne!(own, command);

@@ -486,8 +486,8 @@ GitHub attaches no check run to these events. hatchrun attaches them to
 an `issue_comment` on a PR, on the PR head sha (one `GET /pulls/{n}` at
 intake), so `/retest` shows next to the other checks. A plain issue has no
 commit and no check run; the run shows in the app. These check runs are
-named `{workflow} / {job} (issue_comment)`, and `{workflow} / {job} (/<command>)`
-for a command run, never the `{workflow} / {job}` of the pull request's own
+named `{workflow} / {job} (issue_comment)` or `(issues)`, and
+`{workflow} / {job} (/<command>)` for a command run, never the `{workflow} / {job}` of the pull request's own
 runs: anyone who can comment starts them, and on the same name they could
 replace a required check with `success`.
 
@@ -670,8 +670,10 @@ command refuses with `The pull request is closed`.
 
 The commenter needs `write` or higher (same collaborator permission
 call). The command runs the rules of the repository policy first: with
-`fork_runs = off` (the default for private repositories) it creates and
-approves nothing and replies `Fork runs are off for this repository`.
+`fork_runs = off` (the default for private repositories) it leaves the
+`pull_request` runs alone and replies `Fork runs are off for this
+repository` when it did nothing else; `pull_request_target` runs that wait
+under `approve` are still approved and made again.
 
 Then, for that sha:
 
@@ -684,6 +686,12 @@ Then, for that sha:
   The new run starts gated and this comment is its approval, recorded as
   `gate_by` the commenter;
 - with no run at all, it creates one the same way.
+
+Each workflow is decided on its own, for `pull_request` and for
+`pull_request_target`. A workflow is made again as the first of
+`synchronize`, `opened` and `reopened` that it listens to; one that
+listens to none of them (a `labeled`-only workflow) is not made again,
+and when nothing could be, the reply says so.
 
 A new run still counts against the pending, deferred and per-author caps.
 `/approve-run` is the only built-in command, and the name is reserved.
