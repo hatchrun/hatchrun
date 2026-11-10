@@ -46,7 +46,7 @@ use super::decide::{
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
     ALARM_FALLBACK_MS, BUCKET, CHAIN_LEASE_MS, DEADLINES, Deadlines, ESCALATE_AFTER_MS, EVENT,
-    GRAPH, INFO, JobState, LAUNCHES, OUTBOX, PendingChain, RESTORED_KEEP_MS, RunInfo,
+    GRAPH, INFO, JobState, LAUNCHES, OUTBOX, PendingChain, RESTORED_KEEP_MS, RunCommand, RunInfo,
     SNAPSHOT_RETRY_MS, Start, TODO, Todo, Work, is_run, job_key, restore_key, snapshot_key,
 };
 
@@ -351,6 +351,7 @@ impl<'a> Cx<'a> {
         self.db.get().ok_or_else(|| fail("no database"))
     }
 
+    #[allow(clippy::too_many_lines)] // One route table, read top to bottom.
     async fn route(
         &self,
         req: &mut Request,
@@ -389,6 +390,12 @@ impl<'a> Cx<'a> {
                     self.live(req, job).await
                 } else {
                     self.log(job, offset).await
+                };
+            }
+            (Method::Get, "/event") => {
+                return match self.event().await? {
+                    Value::Null => answer(404),
+                    event => Response::from_json(&event),
                 };
             }
             (Method::Get, "/state") => {
@@ -1028,7 +1035,7 @@ impl<'a> Cx<'a> {
             .collect();
         for change in &changes {
             if let ("completed", Some(conclusion)) = (change.action, change.conclusion) {
-                self.react_to_command(db, &tokens, info, conclusion).await;
+                self.react_to_command(&tokens, info, conclusion).await;
             }
         }
         let ids = chain::fire(
@@ -1059,19 +1066,17 @@ impl<'a> Cx<'a> {
     /// left with 200, so a change sent again reacts again harmlessly.
     async fn react_to_command(
         &self,
-        db: &Db,
         tokens: &Tokens<'_, Kv, App, Counted>,
         info: &RunInfo,
         conclusion: &str,
     ) {
-        let (comment_id, rocket) = match store::run_command(db, info.run_id).await {
-            Ok(Some(command)) => command,
-            Ok(None) => return,
-            Err(err) => {
-                worker::console_error!("run {}: the command's comment: {err}", info.run_id);
-                return;
-            }
+        let Some(RunCommand {
+            comment_id, rocket, ..
+        }) = &info.command
+        else {
+            return;
         };
+        let (comment_id, rocket) = (*comment_id, *rocket);
         let content = chatops::finished(rocket, conclusion);
         let sent = tokens
             .send(info.installation_id, |token| {
@@ -1838,6 +1843,8 @@ impl<'a> Cx<'a> {
             };
             let view = JobView {
                 workflow: &run.info.workflow,
+                event_name: &run.info.event_name,
+                command: run.info.command.as_ref().map(|c| c.name.as_str()),
                 run_title: run.info.title.as_deref(),
                 warnings: &run.info.warnings,
                 node,

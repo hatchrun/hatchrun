@@ -62,7 +62,7 @@ use serde_json::Value;
 use crate::config::{CheckoutStep, UsesStep};
 use crate::expr::{reads, reads_expression};
 use crate::plan::{Plan, PlannedJob, PlannedStep};
-use crate::trigger::CommandPermission;
+use crate::trigger::{CommandPermission, ShaPolicy};
 
 /// What a lint found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,14 +223,17 @@ impl Rules {
 
     /// The rules for the workflow with triggers `on`. A command's sha pin
     /// is accepted when every command of the workflow needs `write` or
-    /// higher.
+    /// higher and has a sha rule of `required` or `auto`: with
+    /// `optional` the sha can be left out, and then the run is on the
+    /// head the pull request has when the command is read.
     fn for_triggers(on: &crate::Triggers) -> Self {
         let mut rules = Self::strict();
         let pinned = on.command.as_ref().is_some_and(|commands| {
             !commands.is_empty()
-                && commands
-                    .iter()
-                    .all(|(_, options)| options.permission >= CommandPermission::Write)
+                && commands.iter().all(|(_, options)| {
+                    options.permission >= CommandPermission::Write
+                        && options.sha != ShaPolicy::Optional
+                })
         });
         if pinned {
             rules.head.retain(|path| *path != COMMAND_HEAD_SHA);
@@ -256,7 +259,8 @@ pub fn guarded(on: &crate::Triggers) -> bool {
 /// with triggers `on`: those of [`plan_lints`], and for an
 /// `issue_comment` workflow the findings about who may start it. A
 /// command's checkout of its pinned head sha is accepted when every
-/// command of `on` needs `write` or higher. The caller decides whether
+/// command of `on` needs `write` or higher and has a sha rule of
+/// `required` or `auto`. The caller decides whether
 /// the workflow is one to warn about (see [`guarded`]).
 #[must_use]
 pub fn workflow_lints(plan: &Plan, on: &crate::Triggers) -> Vec<Lint> {
@@ -1463,6 +1467,27 @@ workflows:
             "{PINNED}\n      - run: git fetch origin ${{{{ github.event.command.pull_request.head_sha }}}}"
         );
         assert_eq!(warned("{ command: retest }", "", &steps), []);
+    }
+
+    #[test]
+    fn a_command_with_an_optional_sha_warns_on_the_sha() {
+        // The pin can be left out, so the checkout is the head as it is.
+        for on in [
+            "{ command: { deploy: { permission: write, sha: optional } } }",
+            "{ command: { a: { permission: admin, sha: required }, b: { permission: write, sha: optional } } }",
+        ] {
+            assert_eq!(
+                kinds(&warned(on, "", PINNED)),
+                [LintKind::HeadCheckout],
+                "{on}"
+            );
+        }
+        for on in [
+            "{ command: { deploy: { permission: write, sha: required } } }",
+            "{ command: { deploy: { permission: write, sha: auto } } }",
+        ] {
+            assert_eq!(warned(on, "", PINNED), [], "{on}");
+        }
     }
 
     #[test]

@@ -458,6 +458,30 @@ pub fn installation_token(response: &Response) -> Result<String, String> {
     decode::<Minted>(response, "installation token").map(|m| m.token)
 }
 
+/// The App itself, asked with the App's JWT.
+#[must_use]
+pub fn app(api: &str, app_jwt: &str) -> Request {
+    rest("GET", format!("{api}/app"), app_jwt)
+}
+
+/// The login GitHub gives the App's bot user, `<slug>[bot]`, from the
+/// answer to [`app`]. It is the `sender.login` of what the App does.
+///
+/// # Errors
+///
+/// GitHub's answer when it names no slug.
+pub fn bot_login(response: &Response) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct App {
+        slug: String,
+    }
+    let app: App = decode(response, "app")?;
+    if app.slug.is_empty() {
+        return Err("app: GitHub gave no slug".to_owned());
+    }
+    Ok(format!("{}[bot]", app.slug))
+}
+
 /// Revokes the installation token it is sent with.
 #[must_use]
 pub fn revoke_token(api: &str, token: &str) -> Request {
@@ -1153,6 +1177,18 @@ mod tests {
             headers: Vec::new(),
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn the_apps_bot_login_is_its_slug_with_bot() {
+        let request = app("https://api.github.com", "jwt");
+        assert_eq!(request.url, "https://api.github.com/app");
+        assert_eq!(
+            bot_login(&answered(200, r#"{"id":1,"slug":"hatchrun"}"#)).unwrap(),
+            "hatchrun[bot]"
+        );
+        assert!(bot_login(&answered(200, r#"{"slug":""}"#)).is_err());
+        assert!(bot_login(&answered(401, "{}")).is_err());
     }
 
     #[test]

@@ -180,9 +180,6 @@ pub struct Issues {
     pub actor_is_bot: bool,
     /// Whether the issue is a pull request.
     pub is_pull_request: bool,
-    /// The id of the GitHub App the issue was made through, when it was
-    /// made through one.
-    pub via_app: Option<u64>,
     /// The delivery body.
     pub payload: Value,
 }
@@ -211,9 +208,6 @@ pub struct IssueComment {
     /// GitHub's `author_association` of the comment's author; empty
     /// when the delivery has none.
     pub author_association: String,
-    /// The id of the GitHub App the comment was made through, when it
-    /// was made through one.
-    pub via_app: Option<u64>,
     /// The delivery body.
     pub payload: Value,
 }
@@ -316,12 +310,6 @@ struct Actor {
     r#type: String,
 }
 
-/// The GitHub App an issue or a comment was made through.
-#[derive(Deserialize)]
-struct ViaApp {
-    id: u64,
-}
-
 #[derive(Deserialize)]
 struct IssuesBody {
     action: String,
@@ -336,8 +324,6 @@ struct IssueInfo {
     /// Present for an issue that is a pull request.
     #[serde(default)]
     pull_request: Option<Value>,
-    #[serde(default)]
-    performed_via_github_app: Option<ViaApp>,
 }
 
 #[derive(Deserialize)]
@@ -356,8 +342,6 @@ struct CommentInfo {
     body: Option<String>,
     #[serde(default)]
     author_association: String,
-    #[serde(default)]
-    performed_via_github_app: Option<ViaApp>,
 }
 
 #[derive(Deserialize)]
@@ -562,7 +546,6 @@ fn issues(installation_id: u64, payload: Value) -> Result<Trigger, serde_json::E
         actor_is_bot: i.sender.r#type == "Bot",
         actor: i.sender.login,
         is_pull_request: i.issue.pull_request.is_some(),
-        via_app: i.issue.performed_via_github_app.map(|app| app.id),
         payload,
     }))
 }
@@ -583,7 +566,6 @@ fn issue_comment(installation_id: u64, payload: Value) -> Result<Trigger, serde_
         comment_id: c.comment.id,
         body: c.comment.body.unwrap_or_default(),
         author_association: c.comment.author_association,
-        via_app: c.comment.performed_via_github_app.map(|app| app.id),
         payload,
     }))
 }
@@ -1196,31 +1178,21 @@ mod tests {
         assert_eq!(i.actor, "octocat");
         assert!(!i.actor_is_bot);
         assert!(!i.is_pull_request);
-        assert_eq!(i.via_app, None);
         assert_eq!(i.installation_id, 777);
         assert_eq!(i.repo.full_name, "octo/widgets");
         assert_eq!(i.payload["issue"]["title"], "Build fails on arm64");
     }
 
     #[test]
-    fn an_issue_made_through_an_app_names_it() {
+    fn an_issue_from_a_bot_says_so() {
         let body = edited(ISSUES, |v| {
-            v["issue"]["performed_via_github_app"] = serde_json::json!({ "id": 31337 });
             v["sender"] = serde_json::json!({ "login": "hatchrun[bot]", "type": "Bot" });
         });
         let Trigger::Issues(i) = parse("issues", &body).unwrap() else {
             panic!("not an issue");
         };
-        assert_eq!(i.via_app, Some(31337));
+        assert_eq!(i.actor, "hatchrun[bot]");
         assert!(i.actor_is_bot);
-        // GitHub sends null for an issue made by a person.
-        let body = edited(ISSUES, |v| {
-            v["issue"]["performed_via_github_app"] = Value::Null;
-        });
-        let Trigger::Issues(i) = parse("issues", &body).unwrap() else {
-            panic!("not an issue");
-        };
-        assert_eq!(i.via_app, None);
     }
 
     #[test]
@@ -1253,7 +1225,6 @@ mod tests {
         assert_eq!(c.actor, "maintainer");
         assert!(!c.actor_is_bot);
         assert!(c.is_pull_request);
-        assert_eq!(c.via_app, None);
         assert_eq!(c.installation_id, 777);
         assert_eq!(c.payload["comment"]["id"], 9001);
     }
@@ -1276,15 +1247,13 @@ mod tests {
     }
 
     #[test]
-    fn a_comment_made_through_an_app_or_by_a_bot_says_so() {
+    fn a_comment_by_a_bot_says_so() {
         let body = edited(ISSUE_COMMENT, |v| {
-            v["comment"]["performed_via_github_app"] = serde_json::json!({ "id": 31337 });
             v["sender"]["type"] = "Bot".into();
         });
         let Trigger::IssueComment(c) = parse("issue_comment", &body).unwrap() else {
             panic!("not a comment");
         };
-        assert_eq!(c.via_app, Some(31337));
         assert!(c.actor_is_bot);
     }
 

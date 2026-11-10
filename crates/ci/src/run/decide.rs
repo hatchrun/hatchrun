@@ -750,6 +750,7 @@ pub(super) mod tests {
             title: None,
             warnings: Vec::new(),
             check_sha: None,
+            command: None,
         }
     }
 

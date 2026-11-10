@@ -354,9 +354,10 @@ A match runs with `head_sha` set to that sha, and a push after that
 changes nothing. On a plain issue `--sha=` is refused.
 
 `hatchrun validate` accepts the `head_sha` checkout without a warning when
-every command of the workflow needs `write` or higher, and warns on
-`github.head_ref`, `refs/pull/` refs, `head_repo` and the head of a
-command that needs less than `write`.
+every command of the workflow needs `write` or higher and has `sha` set
+to `required` or `auto`, and warns on `github.head_ref`, `refs/pull/`
+refs, `head_repo` and the head of a command that needs less than `write`
+or has `sha: optional`.
 
 `/approve-run --sha=<40 hex digits>` is a built-in command that needs no
 workflow. A commenter with `write` or higher approves the waiting fork run

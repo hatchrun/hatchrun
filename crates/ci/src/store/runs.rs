@@ -403,48 +403,36 @@ pub async fn run(db: &Db, run_id: u64) -> Result<Option<RunRow>> {
 }
 
 /// How many runs of the `issue_comment` event of issue or pull request
-/// `$2` of repository `$1` are not over.
+/// `$2` of repository `$1` are not over, leaving out those of delivery
+/// `$3`: its own runs under the delivery's key and under
+/// `<delivery>:command:<name>`.
 const ACTIVE_COMMENT_RUNS: &str = "SELECT count(*)::bigint AS n FROM ci_runs \
      WHERE repo_id = $1 AND issue_number = $2 AND event = 'issue_comment' \
-     AND status <> 'completed'";
-
-/// The comment and reaction set of run `$1`, when a chat command started
-/// it.
-const RUN_COMMAND: &str = "SELECT comment_id, command_reaction = 'rocket' AS rocket \
-     FROM ci_runs WHERE id = $1 AND comment_id IS NOT NULL";
+     AND status <> 'completed' \
+     AND NOT (delivery = $3 OR starts_with(delivery, $3 || ':command:'))";
 
 /// How many runs of the `issue_comment` event of issue or pull request
-/// `number` are not over. The cap on them is
-/// [`crate::chatops::MAX_ACTIVE_PER_ISSUE`].
+/// `number` are not over, leaving out those `delivery` made already, so
+/// a retry of a delivery is not refused for its own runs. The cap on
+/// them is [`crate::chatops::MAX_ACTIVE_PER_ISSUE`].
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn active_comment_runs(db: &Db, repo_id: u64, number: u64) -> Result<u64> {
+pub async fn active_comment_runs(
+    db: &Db,
+    repo_id: u64,
+    number: u64,
+    delivery: &str,
+) -> Result<u64> {
     #[derive(Deserialize)]
     struct Count {
         n: u64,
     }
     let count: Option<Count> = db
-        .first(ACTIVE_COMMENT_RUNS, &params![repo_id, number])
+        .first(ACTIVE_COMMENT_RUNS, &params![repo_id, number, delivery])
         .await?;
     Ok(count.map_or(0, |count| count.n))
-}
-
-/// The comment a run's chat command was written in and whether it
-/// reacts with `rocket`, `None` for a run no command started.
-///
-/// # Errors
-///
-/// Postgres refused the statement.
-pub async fn run_command(db: &Db, run_id: u64) -> Result<Option<(u64, bool)>> {
-    #[derive(Deserialize)]
-    struct Command {
-        comment_id: u64,
-        rocket: bool,
-    }
-    let found: Option<Command> = db.first(RUN_COMMAND, &params![run_id]).await?;
-    Ok(found.map(|found| (found.comment_id, found.rocket)))
 }
 
 /// What a run's status is for a list: the filter's words.

@@ -31,6 +31,7 @@
 //! | `POST /rerun?job=ID` | none | `204` |
 //! | `POST /purge` | none | `204` |
 //! | `GET /state` | none | `200` [`RunState`] |
+//! | `GET /event` | none | `200` the webhook payload, `404` none |
 //! | `GET /live?job=ID` | WebSocket upgrade | `101`, `409` ended |
 //! | `GET /log?job=ID[&offset=N]` | none | `200` text, `404` none |
 //!
@@ -178,6 +179,23 @@ pub struct RunInfo {
     /// default branch. A run stored before this has none.
     #[serde(default)]
     pub check_sha: Option<String>,
+    /// The chat command that started the run: its check runs carry its
+    /// name, and the run's end reacts on its comment. A run stored before
+    /// this, or one no command started, has none.
+    #[serde(default)]
+    pub command: Option<RunCommand>,
+}
+
+/// The chat command a run was started by, as [`RunInfo`] keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCommand {
+    /// The comment the command was written in.
+    pub comment_id: u64,
+    /// The command's name, without the slash.
+    pub name: String,
+    /// Whether the run's end reacts with `rocket` and `confused`
+    /// instead of `+1` and `-1`.
+    pub rocket: bool,
 }
 
 /// The body of `POST /start`.

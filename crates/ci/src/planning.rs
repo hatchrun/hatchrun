@@ -7,7 +7,8 @@
 use std::collections::BTreeSet;
 
 use hatchrun_workflow::{
-    CommandOptions, Diagnostic, Event, Library, Plan, compile_with, config_errors, parse, triggered,
+    CommandOptions, Config, Diagnostic, Event, Library, Plan, compile_with, config_errors, parse,
+    triggered,
 };
 
 /// A triggered workflow that did not compile.
@@ -159,20 +160,17 @@ pub fn has_pull_request_target(source: &str) -> bool {
     })
 }
 
-/// Whether any workflow of `source` listens to `event`, so the event is
-/// worth the calls that plan it. False when the config does not parse.
+/// Whether any workflow of `config` listens to `event`, so the event is
+/// worth the calls that plan it.
 #[must_use]
-pub fn listens(source: &str, event: &Event) -> bool {
-    parse(source).is_ok_and(|config| config.workflows.values().any(|wf| triggered(&wf.on, event)))
+pub fn listens(config: &Config, event: &Event) -> bool {
+    config.workflows.values().any(|wf| triggered(&wf.on, event))
 }
 
-/// The names of the chat commands any workflow of `source` defines, for
-/// the comment parser to look for. Empty when the config does not parse.
+/// The names of the chat commands any workflow of `config` defines, for
+/// the comment parser to look for.
 #[must_use]
-pub fn command_names(source: &str) -> BTreeSet<String> {
-    let Ok(config) = parse(source) else {
-        return BTreeSet::new();
-    };
+pub fn command_names(config: &Config) -> BTreeSet<String> {
     config
         .workflows
         .values()
@@ -190,15 +188,16 @@ pub struct CommandWorkflow {
     pub options: CommandOptions,
 }
 
-/// The workflows of `source` that define the command `name` for a
+/// The workflows of `config` that define the command `name` for a
 /// comment on a pull request (`on_pull_request`) or on a plain issue, in
 /// workflow name order. Each decides alone who may run it, so the caller
 /// checks each one's options.
 #[must_use]
-pub fn command_workflows(source: &str, name: &str, on_pull_request: bool) -> Vec<CommandWorkflow> {
-    let Ok(config) = parse(source) else {
-        return Vec::new();
-    };
+pub fn command_workflows(
+    config: &Config,
+    name: &str,
+    on_pull_request: bool,
+) -> Vec<CommandWorkflow> {
     let event = Event::Command {
         name: name.to_owned(),
         on_pull_request,
@@ -338,15 +337,14 @@ workflows:
 
     #[test]
     fn the_commands_of_every_workflow_are_known() {
-        let names: Vec<String> = command_names(CHAT).into_iter().collect();
+        let names: Vec<String> = command_names(&parse(CHAT).unwrap()).into_iter().collect();
         assert_eq!(names, ["deploy", "retest"]);
-        assert!(command_names("not: [valid").is_empty());
-        assert!(command_names(CONFIG).is_empty());
+        assert!(command_names(&parse(CONFIG).unwrap()).is_empty());
     }
 
     #[test]
     fn a_command_finds_the_workflows_that_define_it_for_the_place() {
-        let on_pr = command_workflows(CHAT, "retest", true);
+        let on_pr = command_workflows(&parse(CHAT).unwrap(), "retest", true);
         let names: Vec<&str> = on_pr.iter().map(|c| c.workflow.as_str()).collect();
         assert_eq!(names, ["deploy", "retest"]);
         // Each workflow keeps its own options.
@@ -359,9 +357,18 @@ workflows:
             hatchrun_workflow::CommandPermission::Write
         );
         // `deploy` allows issues, `retest` does not.
-        assert_eq!(command_workflows(CHAT, "deploy", false).len(), 1);
-        assert_eq!(command_workflows(CHAT, "retest", false).len(), 0);
-        assert_eq!(command_workflows(CHAT, "nope", true).len(), 0);
+        assert_eq!(
+            command_workflows(&parse(CHAT).unwrap(), "deploy", false).len(),
+            1
+        );
+        assert_eq!(
+            command_workflows(&parse(CHAT).unwrap(), "retest", false).len(),
+            0
+        );
+        assert_eq!(
+            command_workflows(&parse(CHAT).unwrap(), "nope", true).len(),
+            0
+        );
     }
 
     #[test]
@@ -369,15 +376,15 @@ workflows:
         let comment = |action: &str| Event::IssueComment {
             action: action.into(),
         };
-        assert!(listens(CHAT, &comment("created")));
-        assert!(!listens(CHAT, &comment("edited")));
+        let chat = parse(CHAT).unwrap();
+        assert!(listens(&chat, &comment("created")));
+        assert!(!listens(&chat, &comment("edited")));
         assert!(!listens(
-            CHAT,
+            &chat,
             &Event::Issues {
                 action: "opened".into()
             }
         ));
-        assert!(!listens("not: [valid", &comment("created")));
     }
 
     #[test]

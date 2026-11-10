@@ -20,7 +20,7 @@ use crate::github::{self, CONFIG_PATH, CheckRun, GhAnnotation, Output};
 use crate::intake::{PullRequest, Repo};
 use crate::planning::{self, Failed, Selected};
 use crate::policy::RepoPolicy;
-use crate::run::{RunInfo, Start, github_context};
+use crate::run::{RunCommand, RunInfo, Start, github_context};
 use crate::store::{self, CiBilling, GateStatus, JobRow, NewJob, NewRun, RunRow};
 use crate::trust::Trust;
 
@@ -801,6 +801,7 @@ fn title_of(
         title: None,
         warnings: Vec::new(),
         check_sha: None,
+        command: None,
     };
     let mut github = github_context(&info, req.event, api);
     if let Some(fields) = github.as_object_mut() {
@@ -942,6 +943,17 @@ fn check_sha(req: &Request<'_>) -> Option<String> {
         .map(|target| target.head_sha.to_owned())
 }
 
+/// The chat command that started the request's runs, for the check run
+/// names and the reaction the end of the run leaves.
+fn command_of(req: &Request<'_>) -> Option<RunCommand> {
+    let command = req.origin.chat?.command.as_ref()?;
+    Some(RunCommand {
+        comment_id: command.comment_id,
+        name: command.name.clone(),
+        rocket: command.rocket,
+    })
+}
+
 /// The body of `POST /start`: each planned job with its row id.
 fn start_body(
     req: &Request<'_>,
@@ -981,6 +993,7 @@ fn start_body(
             title,
             warnings: warnings.to_vec(),
             check_sha: check_sha(req),
+            command: command_of(req),
         },
         jobs,
         event: req.event.clone(),

@@ -26,7 +26,8 @@ fn comment_run(
 }
 
 fn active(db: &TestDb, number: u64) -> u64 {
-    db.wait(active_comment_runs(db.db(), 7, number)).unwrap()
+    db.wait(active_comment_runs(db.db(), 7, number, "none"))
+        .unwrap()
 }
 
 #[test]
@@ -34,14 +35,24 @@ fn a_command_run_keeps_its_comment_and_reaction_set() {
     let db = setup();
     let plain = comment_run(&db, "d1", 12, Some((9001, "retest", false)));
     let rocket = comment_run(&db, "d2", 12, Some((9002, "deploy", true)));
-    assert_eq!(
-        db.wait(run_command(db.db(), plain.id)).unwrap(),
-        Some((9001, false))
-    );
-    assert_eq!(
-        db.wait(run_command(db.db(), rocket.id)).unwrap(),
-        Some((9002, true))
-    );
+    let comment = |id: u64| -> Option<i64> {
+        db.column(
+            "SELECT comment_id AS n FROM ci_runs WHERE id = $1",
+            &params![id],
+            "n",
+        )
+    };
+    assert_eq!(comment(plain.id), Some(9001));
+    assert_eq!(comment(rocket.id), Some(9002));
+    let reaction = |id: u64| -> Option<String> {
+        db.column(
+            "SELECT command_reaction AS n FROM ci_runs WHERE id = $1",
+            &params![id],
+            "n",
+        )
+    };
+    assert_eq!(reaction(rocket.id).as_deref(), Some("rocket"));
+    assert_eq!(reaction(plain.id).as_deref(), Some("default"));
     let name: String = db
         .column(
             "SELECT command_name AS n FROM ci_runs WHERE id = $1",
@@ -56,13 +67,12 @@ fn a_command_run_keeps_its_comment_and_reaction_set() {
 fn a_run_no_command_started_has_no_comment() {
     let db = setup();
     let comment = comment_run(&db, "d1", 12, None);
-    assert_eq!(db.wait(run_command(db.db(), comment.id)).unwrap(), None);
-    let push = db
-        .wait(insert_run(db.db(), &new_run("push", "ci", 11)))
-        .unwrap()
-        .unwrap();
-    assert_eq!(db.wait(run_command(db.db(), push.id)).unwrap(), None);
-    assert_eq!(db.wait(run_command(db.db(), 9_999)).unwrap(), None);
+    let id: Option<Option<i64>> = db.column(
+        "SELECT comment_id AS n FROM ci_runs WHERE id = $1",
+        &params![comment.id],
+        "n",
+    );
+    assert_eq!(id, Some(None));
 }
 
 #[test]
@@ -78,6 +88,23 @@ fn the_cap_counts_the_active_comment_runs_of_one_issue() {
     db.wait(finish_run(db.db(), first.id, 1, "success", 20))
         .unwrap();
     assert_eq!(active(&db, 12), 1);
+}
+
+#[test]
+fn the_cap_leaves_out_the_runs_of_the_delivery_being_counted() {
+    let db = setup();
+    comment_run(&db, "d1", 12, None);
+    comment_run(&db, "d1:command:retest", 12, Some((1, "retest", false)));
+    comment_run(&db, "d10", 12, None);
+    let count = |delivery: &str| {
+        db.wait(active_comment_runs(db.db(), 7, 12, delivery))
+            .unwrap()
+    };
+    assert_eq!(count("other"), 3);
+    // A retry of d1 does not count its own two runs, and the run of
+    // d10 is another delivery's.
+    assert_eq!(count("d1"), 1);
+    assert_eq!(count("d10"), 2);
 }
 
 #[test]
@@ -116,7 +143,11 @@ fn the_cap_leaves_out_other_events_and_other_repositories() {
     });
     db.wait(insert_run(db.db(), &other)).unwrap().unwrap();
     assert_eq!(active(&db, 12), 0);
-    assert_eq!(db.wait(active_comment_runs(db.db(), 8, 12)).unwrap(), 1);
+    assert_eq!(
+        db.wait(active_comment_runs(db.db(), 8, 12, "none"))
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
