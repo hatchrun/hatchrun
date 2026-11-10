@@ -236,6 +236,12 @@ full history with the same rules. Pass account IDs through CI secrets
 or variables; a finding that is not a secret goes in `.gitleaksignore`
 by fingerprint, with a comment saying why.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up, build, test
+and send a change. Report security problems privately, as described in
+[SECURITY.md](SECURITY.md), not in a public issue.
+
 ## Licence
 
 GNU Affero General Public License, version 3 only (AGPL-3.0-only). See
