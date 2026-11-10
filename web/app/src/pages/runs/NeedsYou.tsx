@@ -99,7 +99,7 @@ export function NeedsYou({ org, onChange }: { org: string; onChange: () => void 
         status="waiting"
         href={runUrl(run.repository, run.id)}
         label={`Review fork pull request ${run.repository} ${run.run_number}`}
-        head="fork pull request waiting for approval"
+        head={run.event === "pull_request_target" ? "pull_request_target of a fork waiting for approval" : "fork pull request waiting for approval"}
         rest={
           <>
             {run.repository} #{run.pull_request?.number ?? run.run_number} · {[run.fork?.author ?? run.actor, run.workflow, ago(run.created_at, now)].join(" · ")}

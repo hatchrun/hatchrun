@@ -168,6 +168,7 @@ function run(id: number, number: number, workflow: string, event: string, ref: s
     message: number === 3 ? null : number === 2 ? "fix: keep the log follow toggle after a reload" : "feat: add the deploy workflow",
     pull_request: null,
     trust: "trusted",
+    lints: [],
     fork: null,
     gate: null,
     status,

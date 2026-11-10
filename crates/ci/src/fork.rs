@@ -98,6 +98,11 @@ pub struct Card {
     pub base_ref: String,
     /// The approval level that asked for this approval.
     pub level: ForkApproval,
+    /// Whether the run is a `pull_request_target` run, which has the
+    /// repository's secrets, and not a fork run, which has none.
+    pub target: bool,
+    /// What the planner found in the run's workflow, one finding each.
+    pub lints: Vec<String>,
     /// The changed files; `None` when they could not be read.
     pub files: Option<Vec<String>>,
     /// The jobs that would start.
@@ -137,20 +142,41 @@ fn level_text(level: ForkApproval) -> &'static str {
 }
 
 /// The summary of the approval check run.
+#[allow(clippy::too_many_lines)] // One text, read top to bottom.
 fn summary(card: &Card) -> String {
-    let mut text = format!(
-        "Pull request #{} {} from {} wants to run workflows.\n\n",
-        card.number,
-        plain(&card.title),
-        plain(&card.author)
-    );
-    let _ = writeln!(
-        text,
-        "- Author: {} ({}), asked because {}",
-        plain(&card.author),
-        plain(&card.association.to_lowercase()),
-        level_text(card.level)
-    );
+    let mut text = if card.target {
+        format!(
+            "Pull request #{} {} from {} wants to run `pull_request_target` workflows, which \
+             run from the base branch with this repository's secrets.\n\n",
+            card.number,
+            plain(&card.title),
+            plain(&card.author)
+        )
+    } else {
+        format!(
+            "Pull request #{} {} from {} wants to run workflows.\n\n",
+            card.number,
+            plain(&card.title),
+            plain(&card.author)
+        )
+    };
+    if card.target {
+        let _ = writeln!(
+            text,
+            "- Author: {} ({}), asked because this repository requires approval for \
+             `pull_request_target` runs of pull requests from forks",
+            plain(&card.author),
+            plain(&card.association.to_lowercase()),
+        );
+    } else {
+        let _ = writeln!(
+            text,
+            "- Author: {} ({}), asked because {}",
+            plain(&card.author),
+            plain(&card.association.to_lowercase()),
+            level_text(card.level)
+        );
+    }
     let _ = writeln!(
         text,
         "- Head: {} at `{}`, into `{}`",
@@ -204,10 +230,27 @@ fn summary(card: &Card) -> String {
             job.timeout_minutes
         );
     }
-    text.push_str(
-        "\nThe run gets no secrets, no write token, no OIDC token and no environment. \
-         Approving it runs this commit only: a new push asks again.",
-    );
+    if !card.lints.is_empty() {
+        text.push_str(
+            "\nThe planner found, in the workflow that would run (it reads the plan, so it can \
+             be wrong either way):\n\n",
+        );
+        for lint in &card.lints {
+            let _ = writeln!(text, "- {}", plain(lint));
+        }
+    }
+    if card.target {
+        text.push_str(
+            "\nThe run gets this repository's secrets and a token that can write. It runs the \
+             workflow of the base branch, and that workflow decides whether the pull request's \
+             code runs too. Approving it runs this commit only: a new push asks again.",
+        );
+    } else {
+        text.push_str(
+            "\nThe run gets no secrets, no write token, no OIDC token and no environment. \
+             Approving it runs this commit only: a new push asks again.",
+        );
+    }
     text
 }
 
@@ -391,7 +434,7 @@ pub async fn card_for(
         run_id: run.id,
         run_number: run.run_number,
         workflow: run.workflow.clone(),
-        sha: run.sha.clone(),
+        sha: run.pr_sha().to_owned(),
         number: run.pull_number.unwrap_or_default(),
         title: run
             .pull_title
@@ -403,6 +446,14 @@ pub async fn card_for(
         head_repo: run.head_repo_name.clone(),
         base_ref: run.base_ref.clone().unwrap_or_default(),
         level,
+        target: run.event == "pull_request_target",
+        lints: run
+            .lints
+            .as_deref()
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect(),
         files,
         jobs,
         app_url: settings.app_url.clone(),
@@ -959,7 +1010,7 @@ pub async fn ensure_card(
                 github::check_runs_named(
                     &settings.github_api,
                     &repo.full_name,
-                    &run.sha,
+                    run.pr_sha(),
                     &name,
                     token,
                 )
@@ -1049,29 +1100,66 @@ async fn admit(
     // The runs asking are deferred; they must not count against
     // themselves.
     waiting.deferred = 0;
-    let group = store::deferred_group(db, repo.id, number, &run.sha)
+    let group = store::deferred_group(db, repo.id, number, run.pr_sha())
         .await
         .map_err(|err| err.to_string())?;
-    let slot = crate::policy::admission(&policy, &run.author_association, waiting);
+    // The runs of the two events share a commit and a group, and each
+    // kind is decided by its own rule: a `pull_request_target` run waits
+    // for approval whoever the author is.
+    let (targets, forks): (Vec<RunRow>, Vec<RunRow>) = group
+        .into_iter()
+        .partition(|member| member.event == "pull_request_target");
+    let mut changed = 0;
+    if !forks.is_empty() {
+        let slot = crate::policy::admission(&policy, &run.author_association, waiting);
+        changed += admit_group(
+            env, db, settings, tokens, &repo, &policy, number, &forks, slot, now,
+        )
+        .await?;
+    }
+    if !targets.is_empty() {
+        let slot = crate::policy::target_admission(&policy, waiting);
+        changed += admit_group(
+            env, db, settings, tokens, &repo, &policy, number, &targets, slot, now,
+        )
+        .await?;
+    }
+    Ok(changed)
+}
+
+/// Gives the deferred runs of `group` what `slot` decided for them.
+#[allow(clippy::too_many_arguments)] // One decision, with what it reads.
+async fn admit_group(
+    env: &Env,
+    db: &Db,
+    settings: &Settings,
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    repo: &RepoRow,
+    policy: &RepoPolicy,
+    number: u64,
+    group: &[RunRow],
+    slot: crate::policy::Admission,
+    now: u64,
+) -> Result<u32, String> {
     let (status, by) = match slot {
         crate::policy::Admission::Pending => (GateStatus::Pending, None),
         crate::policy::Admission::Run => (GateStatus::Approved, Some("policy")),
         crate::policy::Admission::Off => {
             let mut ended = Vec::new();
-            for member in &group {
+            for member in group {
                 ended.extend(
                     store::end_gate(db, member.id, "cancelled", None, now)
                         .await
                         .map_err(|err| err.to_string())?,
                 );
             }
-            after_end(env, db, settings, tokens, &repo, &ended, FORK_RUNS_OFF).await;
+            after_end(env, db, settings, tokens, repo, &ended, FORK_RUNS_OFF).await;
             return Ok(count(ended.len()));
         }
         crate::policy::Admission::Deferred | crate::policy::Admission::Drop => return Ok(0),
     };
     let mut admitted = Vec::new();
-    for member in &group {
+    for member in group {
         admitted.extend(
             store::admit_run(db, member.id, status, by, now)
                 .await
@@ -1079,11 +1167,11 @@ async fn admit(
         );
     }
     if let Some(by) = by {
-        after_approval(env, db, settings, tokens, &repo, &admitted, by).await;
+        after_approval(env, db, settings, tokens, repo, &admitted, by).await;
         return Ok(count(admitted.len()));
     }
     // The file list is the same for the whole group: read it once.
-    let files = changed_files(tokens, settings, &repo, number).await;
+    let files = changed_files(tokens, settings, repo, number).await;
     for member in &admitted {
         // A run that has a waiting card has it brought up to the approval
         // card: marked stale first, so a failure leaves it for the
@@ -1100,7 +1188,7 @@ async fn admit(
             member.clone()
         };
         if let Err(err) =
-            ensure_card(tokens, db, settings, &repo, &member, &policy, Some(&files)).await
+            ensure_card(tokens, db, settings, repo, &member, policy, Some(&files)).await
         {
             console_error!("run {}: the approval check run: {err}", member.id);
         }
@@ -1130,10 +1218,12 @@ pub const RERUN_CHECK: &str = "hatchrun / rerun";
 /// access.
 #[must_use]
 pub const fn rerun_refusal(run: &RunRow, policy: Option<&RepoPolicy>) -> Option<&'static str> {
-    if !matches!(run.trust, Trust::Fork) {
-        return None;
-    }
-    if let Some(policy) = policy
+    // A `pull_request_target` run is trusted but may have waited for an
+    // approval; the approval ending refuses its rerun like a fork run's.
+    // Fork runs being off is about the fork's code, which that run does
+    // not run.
+    if matches!(run.trust, Trust::Fork)
+        && let Some(policy) = policy
         && matches!(policy.fork_runs, crate::policy::ForkRuns::Off)
     {
         return Some(FORK_RUNS_OFF);
@@ -1142,25 +1232,6 @@ pub const fn rerun_refusal(run: &RunRow, policy: Option<&RepoPolicy>) -> Option<
         GateStatus::Expired | GateStatus::Cancelled => Some(NOT_APPROVED),
         _ => None,
     }
-}
-
-/// What a rerun of a `pull_request_target` run is told when the
-/// repository now blocks head checkouts and the run's plan has one.
-pub const HEAD_CHECKOUT_BLOCKED: &str = "This repository blocks pull_request_target workflows that check out the pull request head, so the run was not rerun.";
-
-/// Why a rerun of a `pull_request_target` run is refused under the
-/// repository's current `rule`: it blocks head checkouts and the plan
-/// the run was made with (`head_checkout`, as the planner recorded it,
-/// callee workflows included) has one. `None` when the rule is `warn`,
-/// and for a run of another event.
-#[must_use]
-pub fn target_rerun_refusal(
-    event: &str,
-    rule: crate::policy::HeadCheckout,
-    head_checkout: bool,
-) -> Option<&'static str> {
-    (event == "pull_request_target" && rule == crate::policy::HeadCheckout::Block && head_checkout)
-        .then_some(HEAD_CHECKOUT_BLOCKED)
 }
 
 /// The check run that says on commit `sha` why a rerun was refused.
@@ -1173,16 +1244,17 @@ pub fn rerun_check_run(sha: &str, message: &str) -> CheckRun {
     }
 }
 
-/// Says on the commit of `run` why a rerun was refused, updating the
+/// Says on the commit of `run` (the pull request's head for a
+/// `pull_request_target` run) why a rerun was refused, updating the
 /// rerun check run that is there or making it. Best effort.
 pub async fn say_rerun_refused(
     tokens: &Tokens<'_, Kv, App, Counted>,
     settings: &Settings,
     repo: &RepoRow,
-    sha: &str,
     run: &RunRow,
     message: &str,
 ) {
+    let sha = run.pr_sha();
     let check = rerun_check_run(sha, message);
     let sent = async {
         let listed = tokens
@@ -1250,6 +1322,8 @@ mod tests {
             head_repo: Some("mallory/widgets".into()),
             base_ref: "main".into(),
             level: ForkApproval::FirstTimeContributors,
+            target: false,
+            lints: Vec::new(),
             files: files.map(|f| f.into_iter().map(str::to_owned).collect()),
             jobs: vec![CardJob {
                 workflow: "ci".into(),
@@ -1399,23 +1473,54 @@ mod tests {
         }
         // The repository's own code has no approval to lack.
         assert_eq!(rerun_refusal(&row("trusted", "none"), Some(&on)), None);
-        assert_eq!(rerun_refusal(&row("trusted", "cancelled"), Some(&on)), None);
     }
 
     #[test]
-    fn a_rerun_of_a_target_run_is_rechecked_against_the_policy_now() {
-        use crate::policy::HeadCheckout::{Block, Warn};
-        let target = "pull_request_target";
-        // The policy was warn when the run started and is block now.
-        assert_eq!(
-            target_rerun_refusal(target, Block, true),
-            Some(HEAD_CHECKOUT_BLOCKED)
+    fn the_card_of_a_target_run_says_it_has_secrets_and_lists_the_findings() {
+        let c = Card {
+            target: true,
+            lints: vec![
+                "workflow `w`, job `t`, step 1: checks out the pull request head".to_owned(),
+                "[x](http://evil)".to_owned(),
+            ],
+            ..card(Some(vec!["README.md"]))
+        };
+        let text = summary(&c);
+        assert!(text.contains("`pull_request_target` workflows"), "{text}");
+        assert!(text.contains("this repository's secrets"), "{text}");
+        assert!(
+            text.contains("requires approval for `pull_request_target`"),
+            "{text}"
         );
-        assert_eq!(target_rerun_refusal(target, Block, false), None);
-        assert_eq!(target_rerun_refusal(target, Warn, true), None);
-        // Runs of other events are not this rule's business.
-        assert_eq!(target_rerun_refusal("pull_request", Block, true), None);
-        assert_eq!(target_rerun_refusal("push", Block, true), None);
+        assert!(!text.contains("gets no secrets"), "{text}");
+        assert!(text.contains("The planner found"), "{text}");
+        assert!(text.contains("checks out the pull request head"), "{text}");
+        // A finding is plain text on the card.
+        assert!(!text.contains("[x](http"), "{text}");
+        // A card without findings has no such section, and a fork run's
+        // card still says it gets no secrets.
+        let fork = summary(&card(None));
+        assert!(!fork.contains("The planner found"));
+        assert!(fork.contains("gets no secrets"));
+    }
+
+    #[test]
+    fn the_approval_of_a_rerun_of_a_target_run_ending_refuses_it() {
+        // A trusted pull_request_target run that waited for an approval
+        // and did not get it is refused a rerun like a fork run is.
+        let mut run = row("trusted", "cancelled");
+        run.event = "pull_request_target".into();
+        assert_eq!(rerun_refusal(&run, None), Some(NOT_APPROVED));
+        for gate in ["approved", "none"] {
+            let mut run = row("trusted", gate);
+            run.event = "pull_request_target".into();
+            assert_eq!(rerun_refusal(&run, None), None, "{gate}");
+        }
+        // Fork runs being off is about the fork's own code.
+        let mut approved = row("trusted", "approved");
+        approved.event = "pull_request_target".into();
+        let off = RepoPolicy::default_for(true);
+        assert_eq!(rerun_refusal(&approved, Some(&off)), None);
     }
 
     #[test]

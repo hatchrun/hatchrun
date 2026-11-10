@@ -4,8 +4,8 @@
 
 // What a repository does with pull requests from forks: whether they
 // run, who needs a maintainer's approval first, how many fork jobs run
-// at once and for how long, and whether a pull_request_target workflow
-// that checks out the pull request head may run. The policy of a
+// at once and for how long, and whether a pull_request_target run of a
+// fork's pull request needs a maintainer's approval. The policy of a
 // repository is changed by its admins; the server checks, and a member
 // who is not one sees why.
 
@@ -30,8 +30,8 @@ const APPROVAL: [ForkPolicy["fork_approval"], string][] = [
 ];
 
 const HEAD_CHECKOUT: [ForkPolicy["pull_request_target_head_checkout"], string][] = [
-  ["warn", "Run it and warn in its check runs"],
-  ["block", "Fail the run before it starts"],
+  ["warn", "Run at once, with the planner's warnings in the check runs"],
+  ["approve", "Require approval of a maintainer for each commit"],
 ];
 
 export function Forks({ org, tenant }: OrgPageProps) {
@@ -165,11 +165,11 @@ function PolicyForm({ owner, name, policy }: { owner: string; name: string; poli
         </label>
       </div>
       <label className={LABEL}>
-        A pull_request_target workflow that checks out the pull request head
+        pull_request_target from forks
         <select
           value={draft.pull_request_target_head_checkout}
           onChange={(event) => set("pull_request_target_head_checkout", event.target.value as ForkPolicy["pull_request_target_head_checkout"])}
-          className={`${FIELD} !h-8 max-w-[360px]`}
+          className={`${FIELD} !h-8 max-w-[420px]`}
         >
           {HEAD_CHECKOUT.map(([value, label]) => (
             <option key={value} value={value}>
@@ -178,7 +178,7 @@ function PolicyForm({ owner, name, policy }: { owner: string; name: string; poli
           ))}
         </select>
         <span className="font-mono text-xs text-fg-3">
-          Such a workflow runs the pull request author's code with this repository's secrets and a token that can write.
+          A pull_request_target run has this repository's secrets and a token that can write. A workflow can get the pull request's code onto the runner in ways no check finds, so the planner only warns. With approval, the run of a fork's pull request waits on the same card as a fork run, whoever the author is. Pull requests from this repository run at once.
         </span>
       </label>
       </fieldset>

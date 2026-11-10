@@ -144,13 +144,12 @@ fn needs_paths(source: &str, event: &Event) -> bool {
     })
 }
 
-/// Whether `source` may have a workflow that listens to
-/// `pull_request_target`, so the base branch's config is worth planning
-/// for a pull request. A config that does not parse may: it is planned
-/// so that the error is reported.
+/// Whether any workflow of `source` listens to `pull_request_target`,
+/// so the base branch's config is worth planning for a pull request. A
+/// config that does not parse has none: the push that made it was told.
 #[must_use]
-pub fn may_have_pull_request_target(source: &str) -> bool {
-    parse(source).map_or(true, |config| {
+pub fn has_pull_request_target(source: &str) -> bool {
+    parse(source).is_ok_and(|config| {
         config
             .workflows
             .values()
@@ -227,12 +226,12 @@ workflows:
   a: { on: { pull_request: {} }, jobs: [t] }
   b: { on: { pull_request_target: {} }, jobs: [t] }
 ";
-        assert!(may_have_pull_request_target(config));
-        assert!(!may_have_pull_request_target(
+        assert!(has_pull_request_target(config));
+        assert!(!has_pull_request_target(
             &config.replace("pull_request_target", "push")
         ));
-        // A config that cannot be read is planned, to report it.
-        assert!(may_have_pull_request_target("not: [valid"));
+        // A config that cannot be read has none to run.
+        assert!(!has_pull_request_target("not: [valid"));
     }
 
     #[test]

@@ -43,9 +43,9 @@ const PUT_POLICY: &str = "INSERT INTO ci_repo_policy (repo_id, fork_runs, fork_a
 /// when it is set (a new commit on a pull request that is active
 /// already is not another pull request).
 const WAITING: &str = "SELECT \
-       count(DISTINCT (pull_number, sha)) \
+       count(DISTINCT (pull_number, pr_sha)) \
          FILTER (WHERE gate_status = 'pending')::bigint AS pending, \
-       count(DISTINCT (pull_number, sha)) \
+       count(DISTINCT (pull_number, pr_sha)) \
          FILTER (WHERE gate_status = 'deferred')::bigint AS deferred, \
        count(DISTINCT pull_number) FILTER (WHERE trust = 'fork' AND author_login = $2 \
          AND status <> 'completed' AND pull_number IS NOT NULL \
@@ -76,7 +76,7 @@ const CLEAR_DECIDED_MARK: &str = "UPDATE ci_runs SET gate_card_dirty = false \
 /// The deferred runs of pull request `$2` of repository `$1` at `$3`: a
 /// group, admitted together.
 const DEFERRED_GROUP: &str = "SELECT {columns} FROM ci_runs WHERE repo_id = $1 \
-     AND pull_number = $2 AND sha = $3 AND gate_status = 'deferred' \
+     AND pull_number = $2 AND pr_sha = $3 AND gate_status = 'deferred' \
      AND status <> 'completed' ORDER BY id";
 
 /// Approves run `$1` of repository `$4` of tenant `$5` by `$2` at `$3`,
@@ -90,7 +90,7 @@ const APPROVE_RUN: &str = "UPDATE ci_runs SET gate_status = 'approved', gate_by 
      AND created_at >= $6 \
      AND EXISTS (SELECT 1 FROM ci_pulls pl WHERE pl.repo_id = ci_runs.repo_id \
        AND pl.number = ci_runs.pull_number AND pl.state = 'open' \
-       AND pl.head_sha = ci_runs.sha) \
+       AND pl.head_sha = ci_runs.pr_sha) \
      RETURNING {columns}";
 
 /// Rejects run `$1` of repository `$4` of tenant `$5` by `$2` at `$3`,
@@ -110,7 +110,7 @@ const APPROVE_BY_CHECK: &str = "UPDATE ci_runs SET gate_status = 'approved', gat
      AND created_at >= $6 \
      AND EXISTS (SELECT 1 FROM ci_pulls pl WHERE pl.repo_id = ci_runs.repo_id \
        AND pl.number = ci_runs.pull_number AND pl.state = 'open' \
-       AND pl.head_sha = ci_runs.sha) RETURNING {columns}";
+       AND pl.head_sha = ci_runs.pr_sha) RETURNING {columns}";
 
 /// Ends the wait of run `$1` with status `$2` by `$3` at `$4`.
 const END_GATE: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_at = $4, \
@@ -120,7 +120,7 @@ const END_GATE: &str = "UPDATE ci_runs SET gate_status = $2, gate_by = $3, gate_
 /// except those at sha `$3` when it is set, by `$4` at `$5`.
 const END_PULL: &str = "UPDATE ci_runs SET gate_status = 'cancelled', gate_by = $4, gate_at = $5, \
      gate_card_dirty = (gate_check_run_id IS NOT NULL) WHERE repo_id = $1 AND pull_number = $2 AND gate_status IN ('pending', 'deferred') \
-     AND ($3::text IS NULL OR sha <> $3::text) RETURNING {columns}";
+     AND ($3::text IS NULL OR pr_sha <> $3::text) RETURNING {columns}";
 
 /// Expires up to `$3` runs that waited since before `$1`, at `$2`.
 const EXPIRE: &str = "UPDATE ci_runs SET gate_status = 'expired', gate_at = $2, \
@@ -141,9 +141,9 @@ const DEFERRED: &str = "SELECT {columns} FROM (\
        FROM (\
          SELECT g.*, row_number() OVER (PARTITION BY repo_id, author_login \
            ORDER BY gate_scanned_at, created_at, id) AS rn_author FROM (\
-           SELECT DISTINCT ON (repo_id, pull_number, sha) ci_runs.* FROM ci_runs \
+           SELECT DISTINCT ON (repo_id, pull_number, pr_sha) ci_runs.* FROM ci_runs \
            WHERE gate_status = 'deferred' AND status <> 'completed' \
-           ORDER BY repo_id, pull_number, sha, created_at, id) g) a \
+           ORDER BY repo_id, pull_number, pr_sha, created_at, id) g) a \
        WHERE rn_author <= $3) ci_runs \
      WHERE rn_repo <= $2 ORDER BY gate_scanned_at, created_at, id LIMIT $1";
 

@@ -29,7 +29,7 @@ use crate::intake::{
     Rerequested, Trigger,
 };
 use crate::planning;
-use crate::policy::{self, Admission, RepoPolicy};
+use crate::policy::{self, Admission, RepoPolicy, Waiting};
 use crate::runs::{self, Config};
 use crate::store::{self, GateStatus, RepoRow, TenantRow};
 use crate::trust::Trust;
@@ -60,6 +60,45 @@ enum Outcome {
 /// the default branch would run it under a tag ref that is not there.
 fn release_commit(found: Option<String>) -> std::result::Result<String, Outcome> {
     found.ok_or_else(|| Outcome::Ignored("release tag is gone".to_owned()))
+}
+
+/// Whether the `pull_request_target` runs of a pull request wait for an
+/// approval under `policy`: it is from a fork and the repository
+/// approves. A pull request of the repository itself never waits.
+fn target_waits(policy: &RepoPolicy, fork: bool) -> bool {
+    fork && policy.pull_request_target_head_checkout == policy::HeadCheckout::Approve
+}
+
+/// What the `pull_request_target` runs of a pull request start as: with
+/// no gate, or waiting for an approval (`Pending`) or a free slot
+/// (`Deferred`), or `Err` with why nothing starts. A run that waits for a
+/// closed pull request (`open` false) or a delivery that is not the
+/// newest (`applied` false) could never be approved, so none is made.
+fn target_gate(
+    policy: &RepoPolicy,
+    fork: bool,
+    open: bool,
+    applied: bool,
+    waiting: Waiting,
+) -> std::result::Result<GateStatus, &'static str> {
+    if !target_waits(policy, fork) {
+        return Ok(GateStatus::NotGated);
+    }
+    if !open {
+        return Err("the pull request is closed");
+    }
+    if !applied {
+        return Err("the delivery is older than the pull request's recorded state");
+    }
+    let admission = policy::target_admission(policy, waiting);
+    if let Some(reason) = policy::refusal(admission) {
+        return Err(reason);
+    }
+    Ok(match admission {
+        Admission::Pending => GateStatus::Pending,
+        Admission::Deferred => GateStatus::Deferred,
+        _ => GateStatus::NotGated,
+    })
 }
 
 /// The delivery key of the `pull_request_target` runs of a delivery. A
@@ -644,7 +683,7 @@ impl Cx<'_> {
         // The repository's policy is read once, by whichever group needs
         // it first.
         let mut policy = None;
-        let mut ids = self.pull_request_target(pr, &mut policy).await?;
+        let mut ids = self.pull_request_target(pr, applied, &mut policy).await?;
         match self.pull_request_head(pr, applied, &mut policy).await? {
             Outcome::Done(more) => ids.extend(more),
             Outcome::Ignored(reason) if ids.is_empty() => return Ok(Outcome::Ignored(reason)),
@@ -700,22 +739,48 @@ impl Cx<'_> {
     }
 
     /// The `pull_request_target` workflows of a pull request. As on
-    /// GitHub they run from the base branch: the branch's head is
-    /// resolved now (the payload's `base.sha` is as old as the pull
-    /// request's last event and can be behind), the config is read at
-    /// that commit (never at the pull request's head, which the author
-    /// controls), `GITHUB_REF` is the base branch and `GITHUB_SHA` that
-    /// commit. The runs are trusted, so they get the repository's secrets
-    /// and a token that can write, and no approval is asked of a fork's.
-    /// The repository's policy, read only for a config that may have the
-    /// event, says what a workflow that checks out the head does (see
-    /// [`runs::create`]).
+    /// GitHub they run from the base branch: the config is read at the
+    /// branch's head (never at the pull request's head, which the author
+    /// controls), `GITHUB_REF` is the base branch and `GITHUB_SHA` its
+    /// head commit as it is now (the payload's `base.sha` is as old as
+    /// the pull request's last event and can be behind). The runs are
+    /// trusted, so they get the repository's secrets and a token that can
+    /// write.
+    ///
+    /// A fork's pull request under the repository's `approve` setting
+    /// waits for a maintainer, whoever the author is, through the same
+    /// card as a fork run of the `pull_request` event. A pull request of
+    /// the same repository does not wait. A closed pull request, and a
+    /// delivery older than what is recorded, start no run that would wait
+    /// for an approval that cannot be given.
+    ///
+    /// Most repositories have no such workflow, so one config read, by
+    /// the branch's name, is all they cost; the commit lookup and the
+    /// policy are for those that have one. The commit comes after the
+    /// read, and a branch that moved between them runs the config of the
+    /// moment before on the commit of the moment after.
+    #[allow(clippy::too_many_lines)] // One delivery, read top to bottom.
     async fn pull_request_target(
         &self,
         pr: &PullRequest,
+        applied: bool,
         cache: &mut Option<RepoPolicy>,
     ) -> Result<Vec<u64>> {
         let git_ref = runs::compile_ref_for(pr);
+        let config = runs::read_config(
+            self.tokens,
+            self.settings,
+            pr.installation_id,
+            &pr.repo.full_name,
+            &git_ref,
+        )
+        .await?;
+        // A config that is missing or cannot be read has nothing to run:
+        // the push that made it was told, on its own commit.
+        if !matches!(&config, Config::Text(Ok(source)) if planning::has_pull_request_target(source))
+        {
+            return Ok(Vec::new());
+        }
         let Some(sha) = runs::commit(
             self.tokens,
             self.settings,
@@ -728,23 +793,30 @@ impl Cx<'_> {
             return Ok(Vec::new());
         };
         let sha = sha.as_str();
-        let config = runs::read_config(
-            self.tokens,
-            self.settings,
-            pr.installation_id,
-            &pr.repo.full_name,
-            sha,
-        )
-        .await?;
-        // Most repositories have no such workflow. A config that cannot
-        // be read goes on, so that it is reported.
-        match &config {
-            Config::Missing => return Ok(Vec::new()),
-            Config::Text(Ok(source)) if !planning::may_have_pull_request_target(source) => {
+        let policy = self.policy_of(pr, cache).await?;
+        let waits = target_waits(&policy, pr.fork.is_some());
+        let waiting = if waits {
+            store::fork_waiting(self.db, pr.repo.id, &pr.author, Some(pr.number)).await?
+        } else {
+            Waiting::default()
+        };
+        let gate = match target_gate(
+            &policy,
+            pr.fork.is_some(),
+            pr.state == "open",
+            applied,
+            waiting,
+        ) {
+            Ok(gate) => gate,
+            Err(reason) => {
+                worker::console_warn!(
+                    "{}: pull_request_target of #{} not started: {reason}",
+                    pr.repo.full_name,
+                    pr.number
+                );
                 return Ok(Vec::new());
             }
-            Config::Text(_) => {}
-        }
+        };
         let wants_paths = matches!(&config, Config::Text(Ok(source))
             if planning::needs_pull_request_target_paths(source, &pr.action, &pr.base_ref));
         let changed = if wants_paths {
@@ -752,7 +824,6 @@ impl Cx<'_> {
         } else {
             Vec::new()
         };
-        let policy = self.policy_of(pr, cache).await?;
         // A pull_request run of the same delivery and workflow is a
         // different run, so its key differs.
         let delivery = target_delivery(self.delivery);
@@ -761,7 +832,7 @@ impl Cx<'_> {
             base_ref: pr.base_ref.clone(),
             changed,
         };
-        runs::create(
+        let ids = runs::create(
             self.env,
             self.db,
             self.settings,
@@ -782,10 +853,18 @@ impl Cx<'_> {
                 base_ref: &pr.base_ref,
                 workflow: None,
                 origin: runs::Origin {
+                    // The fork the pull request is from, for the card and
+                    // the run's page; the run's trust stays the
+                    // repository's own.
+                    head_repo_id: pr.fork.as_ref().and_then(|fork| fork.head_repo_id),
+                    head_repo_name: pr
+                        .fork
+                        .as_ref()
+                        .and_then(|fork| fork.head_repo_name.as_deref()),
                     author: &pr.author,
                     association: &pr.author_association,
+                    gate,
                     target: Some(runs::Target {
-                        head_checkout: policy.pull_request_target_head_checkout,
                         head_sha: &pr.head_sha,
                     }),
                     ..runs::Origin::own(&pr.actor)
@@ -794,7 +873,11 @@ impl Cx<'_> {
             &config,
             self.now,
         )
-        .await
+        .await?;
+        if gate != GateStatus::NotGated {
+            self.ask_approval(pr, &ids, &policy).await?;
+        }
+        Ok(ids)
     }
 
     /// The `pull_request` workflows of a pull request, read at the head.
@@ -1018,46 +1101,20 @@ impl Cx<'_> {
                 "check run of another repository".to_owned(),
             ));
         }
-        // A fork run whose approval ended, or whose repository turned
-        // fork runs off, is not rerun: nothing is reset, and the commit
-        // says why in one check run that later refusals update. The
-        // not-approved reason needs only the run's row.
+        // A run whose approval ended (a fork run, or a pull_request_target
+        // run of a fork under an approving policy), or a fork run of a
+        // repository that turned fork runs off, is not rerun: nothing is
+        // reset, and the commit says why in one check run that later
+        // refusals update. The not-approved reason needs only the run's
+        // row.
         let repo = store::repo(self.db, run.repo_id).await?;
         let policy = match &repo {
             Some(repo) => Some(store::repo_policy(self.db, repo.id, repo.private).await?),
             None => None,
         };
-        // The policy may have turned to block since a pull_request_target
-        // run started: the plan it was made with is judged by the rule as
-        // it is now. Only a blocking policy looks at the run at all.
-        let refusal = match &policy {
-            Some(policy)
-                if run.event == "pull_request_target"
-                    && policy.pull_request_target_head_checkout == policy::HeadCheckout::Block =>
-            {
-                let head_checkout = store::run_head_checkout(self.db, run.id).await?;
-                fork::target_rerun_refusal(
-                    &run.event,
-                    policy.pull_request_target_head_checkout,
-                    head_checkout,
-                )
-            }
-            _ => None,
-        };
-        if let Some(reason) = refusal.or_else(|| fork::rerun_refusal(&run, policy.as_ref())) {
+        if let Some(reason) = fork::rerun_refusal(&run, policy.as_ref()) {
             if let Some(repo) = &repo {
-                // The run of a pull_request_target event is on the base
-                // branch, where nobody looks: the refusal goes on the
-                // pull request's head.
-                let sha = match run
-                    .pull_number
-                    .filter(|_| run.event == "pull_request_target")
-                {
-                    Some(number) => store::pull_head_sha(self.db, repo.id, number).await?,
-                    None => None,
-                }
-                .unwrap_or_else(|| run.sha.clone());
-                fork::say_rerun_refused(self.tokens, self.settings, repo, &sha, &run, reason).await;
+                fork::say_rerun_refused(self.tokens, self.settings, repo, &run, reason).await;
             }
             return Ok(Outcome::Ignored(reason.to_owned()));
         }
@@ -1120,6 +1177,82 @@ mod tests {
         let git_ref = runs::compile_ref_for(&fork);
         assert_eq!(git_ref, "refs/heads/main");
         assert!(!git_ref.contains("pull"), "{git_ref}");
+    }
+
+    fn approving() -> RepoPolicy {
+        RepoPolicy {
+            pull_request_target_head_checkout: policy::HeadCheckout::Approve,
+            ..RepoPolicy::default_for(false)
+        }
+    }
+
+    #[test]
+    fn under_approve_a_forks_target_run_waits_and_the_same_repositorys_does_not() {
+        let free = Waiting::default();
+        // A fork's pull request waits whoever wrote it.
+        assert_eq!(
+            target_gate(&approving(), true, true, true, free),
+            Ok(GateStatus::Pending)
+        );
+        // The repository's own pull request runs at once.
+        assert_eq!(
+            target_gate(&approving(), false, true, true, free),
+            Ok(GateStatus::NotGated)
+        );
+        // Under warn nothing waits, fork or not.
+        let warn = RepoPolicy::default_for(false);
+        for fork in [true, false] {
+            assert_eq!(
+                target_gate(&warn, fork, true, true, free),
+                Ok(GateStatus::NotGated)
+            );
+        }
+        assert!(target_waits(&approving(), true));
+        assert!(!target_waits(&approving(), false));
+        assert!(!target_waits(&warn, true));
+    }
+
+    #[test]
+    fn a_waiting_target_run_is_not_made_for_a_closed_pull_request_or_a_stale_delivery() {
+        let free = Waiting::default();
+        assert!(target_gate(&approving(), true, false, true, free).is_err());
+        assert!(target_gate(&approving(), true, true, false, free).is_err());
+        // Neither applies to a run that does not wait.
+        assert_eq!(
+            target_gate(&approving(), false, false, false, free),
+            Ok(GateStatus::NotGated)
+        );
+        let warn = RepoPolicy::default_for(false);
+        assert_eq!(
+            target_gate(&warn, true, false, false, free),
+            Ok(GateStatus::NotGated)
+        );
+    }
+
+    #[test]
+    fn a_target_run_waits_for_a_slot_when_the_repository_has_too_many_waiting() {
+        let full = Waiting {
+            pending: policy::MAX_PENDING,
+            ..Waiting::default()
+        };
+        assert_eq!(
+            target_gate(&approving(), true, true, true, full),
+            Ok(GateStatus::Deferred)
+        );
+        let flooded = Waiting {
+            deferred: policy::MAX_DEFERRED,
+            ..full
+        };
+        assert!(target_gate(&approving(), true, true, true, flooded).is_err());
+        // Fork runs being off does not turn a target run away.
+        let off = RepoPolicy {
+            fork_runs: policy::ForkRuns::Off,
+            ..approving()
+        };
+        assert_eq!(
+            target_gate(&off, true, true, true, Waiting::default()),
+            Ok(GateStatus::Pending)
+        );
     }
 
     #[test]

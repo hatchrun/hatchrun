@@ -55,16 +55,21 @@ pub enum ForkApproval {
     AllOutside,
 }
 
-/// What a `pull_request_target` workflow that checks out the pull
-/// request head does. Such a workflow runs the author's code with the
-/// base repository's secrets and write token.
+/// What a repository does about `pull_request_target` runs for pull
+/// requests from forks. Such a run has the base repository's secrets and
+/// write token, and a workflow can get the author's code onto the runner
+/// in ways no reading of it finds, so the planner's findings are only
+/// warnings; this is the part that holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeadCheckout {
     /// The run starts, and its check runs say what the planner found.
     Warn,
-    /// The run fails at planning and starts nothing.
-    Block,
+    /// The run of a fork's pull request waits for a maintainer's
+    /// approval, whoever the author is, as a fork run of the
+    /// `pull_request` event does. A pull request from the same
+    /// repository runs at once.
+    Approve,
 }
 
 /// A repository's policy for pull requests from forks.
@@ -120,7 +125,7 @@ impl HeadCheckout {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Warn => "warn",
-            Self::Block => "block",
+            Self::Approve => "approve",
         }
     }
 
@@ -129,7 +134,7 @@ impl HeadCheckout {
     pub fn parse(word: &str) -> Option<Self> {
         match word {
             "warn" => Some(Self::Warn),
-            "block" => Some(Self::Block),
+            "approve" => Some(Self::Approve),
             _ => None,
         }
     }
@@ -276,6 +281,26 @@ pub const fn refusal(admission: Admission) -> Option<&'static str> {
     }
 }
 
+/// What a `pull_request_target` run of a fork's pull request becomes
+/// under `policy`: it waits for approval whoever the author is, within
+/// the same caps as the fork runs of the `pull_request` event, and
+/// whether fork runs are on has no say, because the run is the base
+/// repository's own workflow.
+#[must_use]
+pub fn target_admission(policy: &RepoPolicy, waiting: Waiting) -> Admission {
+    let strictest = RepoPolicy {
+        fork_runs: ForkRuns::On,
+        fork_approval: ForkApproval::AllOutside,
+        ..*policy
+    };
+    // The per-author cap counts fork runs of the other event.
+    let waiting = Waiting {
+        author_active: 0,
+        ..waiting
+    };
+    admission(&strictest, "", waiting)
+}
+
 /// How much an approval level asks for: the more authors it asks about,
 /// the stricter.
 const fn strictness(level: ForkApproval) -> u8 {
@@ -288,8 +313,8 @@ const fn strictness(level: ForkApproval) -> u8 {
 
 /// Whether `new` lets more fork code run, or run longer, than `old`: fork
 /// runs turned on, an approval level that asks about fewer authors, a
-/// higher cap on running jobs or on timeout, or a head checkout in a
-/// `pull_request_target` workflow no longer blocked. Such a change is made on the
+/// higher cap on running jobs or on timeout, or `pull_request_target`
+/// runs of forks no longer waiting for approval. Such a change is made on the
 /// admin's access as GitHub says now.
 #[must_use]
 pub fn loosens(old: &RepoPolicy, new: &RepoPolicy) -> bool {
@@ -297,7 +322,7 @@ pub fn loosens(old: &RepoPolicy, new: &RepoPolicy) -> bool {
         || strictness(new.fork_approval) < strictness(old.fork_approval)
         || new.fork_max_running > old.fork_max_running
         || new.fork_timeout_minutes > old.fork_timeout_minutes
-        || (old.pull_request_target_head_checkout == HeadCheckout::Block
+        || (old.pull_request_target_head_checkout == HeadCheckout::Approve
             && new.pull_request_target_head_checkout == HeadCheckout::Warn)
 }
 
@@ -444,7 +469,7 @@ mod tests {
             fork_approval: ForkApproval::AllOutside,
             fork_max_running: 2,
             fork_timeout_minutes: 30,
-            pull_request_target_head_checkout: HeadCheckout::Block,
+            pull_request_target_head_checkout: HeadCheckout::Approve,
         };
         assert!(!loosens(&strict, &strict));
         // Tightening is never loosening.
@@ -488,7 +513,7 @@ mod tests {
                 ..strict
             }
         ));
-        // Blocking a head checkout is tightening; allowing it again is not.
+        // Asking for approval is tightening; going back to warning is not.
         let warn = RepoPolicy {
             pull_request_target_head_checkout: HeadCheckout::Warn,
             ..strict
@@ -498,15 +523,47 @@ mod tests {
     }
 
     #[test]
+    fn a_target_run_of_a_fork_waits_whoever_the_author_is_and_fork_runs_off_has_no_say() {
+        let free = Waiting::default();
+        for association in ["OWNER", "MEMBER", "COLLABORATOR", "NONE", ""] {
+            // Whatever `admission` would have made of the author.
+            let _ = admission(&PUBLIC, association, free);
+            assert_eq!(target_admission(&PUBLIC, free), Admission::Pending);
+        }
+        // The run is the base repository's own workflow: fork runs being
+        // off does not turn it away.
+        let off = RepoPolicy::default_for(true);
+        assert_eq!(target_admission(&off, free), Admission::Pending);
+        // The same caps as the other fork runs.
+        let full = Waiting {
+            pending: MAX_PENDING,
+            ..free
+        };
+        assert_eq!(target_admission(&PUBLIC, full), Admission::Deferred);
+        let flooded = Waiting {
+            pending: MAX_PENDING,
+            deferred: MAX_DEFERRED,
+            ..free
+        };
+        assert_eq!(target_admission(&PUBLIC, flooded), Admission::Drop);
+        // The per-author cap counts the other event's runs.
+        let busy = Waiting {
+            author_active: MAX_ACTIVE_PER_AUTHOR,
+            ..free
+        };
+        assert_eq!(target_admission(&PUBLIC, busy), Admission::Pending);
+    }
+
+    #[test]
     fn the_head_checkout_rule_defaults_to_warn_and_round_trips_its_word() {
         assert_eq!(
             RepoPolicy::default_for(false).pull_request_target_head_checkout,
             HeadCheckout::Warn
         );
-        for rule in [HeadCheckout::Warn, HeadCheckout::Block] {
+        for rule in [HeadCheckout::Warn, HeadCheckout::Approve] {
             assert_eq!(HeadCheckout::parse(rule.as_str()), Some(rule));
         }
-        assert_eq!(HeadCheckout::parse("off"), None);
+        assert_eq!(HeadCheckout::parse("block"), None);
     }
 
     #[test]

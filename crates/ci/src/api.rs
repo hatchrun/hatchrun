@@ -526,7 +526,13 @@ pub(crate) fn run_json(run: &RunRow, repository: &str, jobs: JobCounts) -> Value
             "base_ref": run.base_ref,
         })),
         "trust": run.trust,
-        "fork": (run.trust == crate::trust::Trust::Fork).then(|| json!({
+        "lints": run.lints.as_deref().unwrap_or_default().lines().collect::<Vec<_>>(),
+        // A fork run, and a pull_request_target run of a fork that waits
+        // for or got an approval: the page shows where the code is from.
+        "fork": (run.trust == crate::trust::Trust::Fork
+            || (run.event == "pull_request_target"
+                && run.gate_status != store::GateStatus::NotGated))
+            .then(|| json!({
             "head_repo": run.head_repo_name,
             "author": run.author_login,
             "author_association": run.author_association,
@@ -1826,6 +1832,37 @@ mod tests {
             "gate_by": "maintainer", "gate_at": 2000
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_target_run_of_a_fork_shows_its_origin_gate_and_findings() {
+        let run: RunRow = serde_json::from_value(json!({
+            "id": 9, "run_number": 1, "run_attempt": 1, "tenant_id": "t1",
+            "repo_id": 7, "workflow": "ci", "delivery": "d:target",
+            "event": "pull_request_target", "git_ref": "refs/heads/main",
+            "sha": "base", "actor": "a", "status": "queued", "conclusion": null,
+            "created_at": 1000, "completed_at": null, "retention_days": 30,
+            "pull_number": 4, "trust": "trusted", "head_repo_name": "mallory/app",
+            "author_login": "mallory", "author_association": "NONE",
+            "gate_status": "pending", "head_sha": "head",
+            "lints": "step 1: checks out the head\nstep 2: injects the title"
+        }))
+        .unwrap();
+        assert_eq!(run.pr_sha(), "head");
+        let body = run_json(&run, "acme/app", JobCounts::default());
+        assert_eq!(body["trust"], "trusted");
+        assert_eq!(body["fork"]["head_repo"], "mallory/app");
+        assert_eq!(body["gate"]["status"], "pending");
+        assert_eq!(body["lints"][0], "step 1: checks out the head");
+        assert_eq!(body["lints"][1], "step 2: injects the title");
+        // A target run that never waited is the repository's own.
+        let own = RunRow {
+            gate_status: store::GateStatus::NotGated,
+            ..run
+        };
+        let body = run_json(&own, "acme/app", JobCounts::default());
+        assert!(body["fork"].is_null());
+        assert!(body["gate"].is_null());
     }
 
     #[test]

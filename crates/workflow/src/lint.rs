@@ -14,13 +14,17 @@
 //!   *tainted* when anything in it reads the head: a path of the
 //!   `github` context at or above `github.event.pull_request.head`, the
 //!   head ref, a `refs/pull/<n>/head` ref, `GITHUB_HEAD_REF`. The read can
-//!   be anywhere in the job (its env, a step's env, `with:`, `if:`, a
-//!   script), so passing the value through `env:` to a script does not
-//!   hide it. A tainted job that checks out code or runs a command that
-//!   fetches it is a head checkout. [`LintKind::UnverifiedCheckout`] is a
-//!   checkout whose `ref` or `repository` is an expression that is not
-//!   provably the base. A repository that blocks head checkouts blocks
-//!   both.
+//!   be anywhere in the job (its env, a step's env, `with:`, a script),
+//!   so passing the value through `env:` to a script does not hide it;
+//!   an `if:`, a `concurrency:` or a `name:` only compares or labels, and
+//!   is not a read. A job that reads an output of a tainted job through
+//!   `needs` is tainted too. A tainted job that checks out code or runs
+//!   a command that fetches it is a head checkout, and so is a script
+//!   that fetches code and looks the pull request up at run time (its
+//!   number, `GITHUB_EVENT_PATH`, `gh api` of `pulls`), names a
+//!   `refs/pull/` refspec, or downloads a tarball or zipball.
+//!   [`LintKind::UnverifiedCheckout`] is a checkout whose `ref` or
+//!   `repository` is an expression that is not provably the base.
 //! - [`LintKind::ScriptInjection`]: a field the pull request's author
 //!   writes (title, body, branch name) is interpolated with `${{ }}`
 //!   straight into a `run:` script, where the shell reads it as code.
@@ -31,14 +35,16 @@
 //! name, and reading a parent (`toJSON(github.event.pull_request)`) reads
 //! what is under it. The detectors still work on the plan and not on what
 //! a script computes at run time, so a workflow can be unsafe without a
-//! warning. A warning never stops `validate` or `convert` from
-//! succeeding; the host decides what a head checkout does (see the
-//! repository's `pull_request_target_head_checkout` setting).
+//! warning, and a warning can be a false alarm. A warning never stops
+//! `validate` or `convert` from succeeding, and the host never refuses a
+//! run for one: the findings are for the people who approve and read the
+//! run (see the repository's `pull_request_target_head_checkout`
+//! setting).
 
 use serde_json::Value;
 
 use crate::config::{CheckoutStep, UsesStep};
-use crate::expr::{reads, reads_expression};
+use crate::expr::reads;
 use crate::plan::{Plan, PlannedJob, PlannedStep};
 
 /// What a lint found.
@@ -173,8 +179,20 @@ pub fn guarded(on: &crate::Triggers) -> bool {
 #[must_use]
 pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
     let mut found = Vec::new();
+    // The jobs that read the head, by id, and why.
+    let mut tainted_jobs: Vec<(&str, String)> = Vec::new();
     for job in &plan.jobs {
-        let taint = job_taint(job);
+        let taint = job_taint(job).or_else(|| {
+            // A job that reads what a tainted job it needs produced.
+            let from = job
+                .requires
+                .iter()
+                .find_map(|id| tainted_jobs.iter().find(|(known, _)| known == id))?;
+            reads_needs(job).then(|| format!("an output of the job `{}`", from.0))
+        });
+        if let Some(reason) = &taint {
+            tainted_jobs.push((job.id.as_str(), reason.clone()));
+        }
         let tainted = |what: &str| {
             taint.as_ref().map(|reason| {
                 format!(
@@ -189,7 +207,7 @@ pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
             let (kind, message) = match step {
                 PlannedStep::Checkout(native) => {
                     match checkout_finding(native_checkout(native), tainted("checks out code")) {
-                        Some(found) => found,
+                        Some(hit) => hit,
                         None => continue,
                     }
                 }
@@ -205,7 +223,7 @@ pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
                     }
                     if is_action(uses, "actions/checkout") {
                         match checkout_finding(action_checkout(uses), tainted("checks out code")) {
-                            Some(found) => found,
+                            Some(hit) => hit,
                             None => continue,
                         }
                     } else {
@@ -224,6 +242,19 @@ pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
                     }
                     if has_word_run(&run.run, &["gh", "pr", "checkout"]) {
                         (LintKind::HeadCheckout, HEAD_CHECKOUT.to_owned())
+                    } else if fetches_code(&run.run)
+                        && let Some(how) = looks_up_pull_request(&run.run)
+                    {
+                        (
+                            LintKind::HeadCheckout,
+                            format!(
+                                "runs a command that fetches code and finds the pull request at \
+                                 run time ({how}), so the code of the pull request can run with \
+                                 the base repository's secrets and write token; keep the head out \
+                                 of this job and run the pull request's code in a pull_request \
+                                 workflow instead"
+                            ),
+                        )
                     } else if fetches_code(&run.run)
                         && let Some(message) = tainted("runs a command that fetches code")
                     {
@@ -304,10 +335,9 @@ fn squashed(text: &str) -> String {
 }
 
 /// What reading `text` says about the pull request head, `None` when it
-/// says nothing: the path it reads, or the ref it names. `bare` text is
-/// one expression without `${{ }}`, as an `if:` is. Text with an
+/// says nothing: the path it reads, or the ref it names. Text with an
 /// expression that does not parse counts as reading it.
-fn head_read(text: &str, bare: bool) -> Option<String> {
+fn head_read(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
     if lower.contains("github_head_ref") {
         return Some("GITHUB_HEAD_REF".to_owned());
@@ -315,12 +345,7 @@ fn head_read(text: &str, bare: bool) -> Option<String> {
     if pull_ref(&lower) {
         return Some("a refs/pull ref".to_owned());
     }
-    let parsed = if bare && !text.contains("${{") {
-        reads_expression(text).map(|read| vec![read])
-    } else {
-        reads(text)
-    };
-    let Ok(list) = parsed else {
+    let Ok(list) = reads(text) else {
         let flat = squashed(text);
         return HEAD_PATHS
             .iter()
@@ -346,29 +371,99 @@ fn head_read(text: &str, bare: bool) -> Option<String> {
 
 /// Whether `text` names the pull request head.
 fn names_head(text: &str) -> bool {
-    head_read(text, false).is_some()
+    head_read(text).is_some()
 }
 
 /// Why the job is tainted: the first read of the pull request head found
-/// anywhere in it (its env, a step's env, `with:`, `if:`, a script, its
-/// container and services), else `None`.
+/// in it (its env, a step's env, `with:`, a script, its container and
+/// services), else `None`. What only compares or labels (`if:`,
+/// `continue-on-error`, `concurrency:`, `name:`) is not a read. A job
+/// that cannot be read counts as tainted.
 fn job_taint(job: &PlannedJob) -> Option<String> {
-    let value = serde_json::to_value(job).ok()?;
-    taint_in(&value, false)
+    let Ok(value) = serde_json::to_value(job) else {
+        return Some("a job that could not be read".to_owned());
+    };
+    taint_in(&value)
 }
 
-fn taint_in(value: &Value, bare: bool) -> Option<String> {
+fn taint_in(value: &Value) -> Option<String> {
     match value {
-        Value::String(text) => head_read(text, bare),
-        Value::Array(items) => items.iter().find_map(|item| taint_in(item, false)),
-        Value::Object(fields) => fields.iter().find_map(|(key, item)| {
-            taint_in(
-                item,
-                matches!(key.as_str(), "if" | "if_" | "continue_on_error"),
-            )
-        }),
+        Value::String(text) => head_read(text),
+        Value::Array(items) => items.iter().find_map(taint_in),
+        Value::Object(fields) => fields
+            .iter()
+            .filter(|(key, _)| !LABELS.contains(&key.as_str()))
+            .find_map(|(_, item)| taint_in(item)),
         _ => None,
     }
+}
+
+/// Keys of a planned job whose text only compares or labels.
+const LABELS: &[&str] = &[
+    "if",
+    "if_",
+    "continue_on_error",
+    "concurrency",
+    "name",
+    "id",
+    "requires",
+    "strategy",
+    "matrix",
+];
+
+/// Whether anything in the job reads the `needs` context.
+fn reads_needs(job: &PlannedJob) -> bool {
+    fn walk(value: &Value) -> bool {
+        match value {
+            Value::String(text) => reads(text).map_or(true, |list| {
+                list.iter().any(|read| {
+                    read.paths
+                        .iter()
+                        .any(|path| path.first().is_some_and(|c| c == "needs"))
+                })
+            }),
+            Value::Array(items) => items.iter().any(walk),
+            Value::Object(fields) => fields
+                .iter()
+                .filter(|(key, _)| !LABELS.contains(&key.as_str()))
+                .any(|(_, item)| walk(item)),
+            _ => false,
+        }
+    }
+    serde_json::to_value(job).map_or(true, |value| walk(&value))
+}
+
+/// How a script finds the pull request at run time, when it does: its
+/// number from the event, the event file, `gh api` of the pull
+/// requests, or a `refs/pull/` refspec (a split or wildcard one too).
+fn looks_up_pull_request(script: &str) -> Option<&'static str> {
+    let lower = script.to_ascii_lowercase();
+    if lower.contains("github_event_path") {
+        return Some("GITHUB_EVENT_PATH");
+    }
+    if lower.contains("gh api") && (lower.contains("pulls") || lower.contains("/pull/")) {
+        return Some("gh api");
+    }
+    if lower.contains("refs/pull/") {
+        return Some("a refs/pull refspec");
+    }
+    if (lower.contains("curl") || lower.contains("wget"))
+        && ["tarball", "zipball", "/archive/"]
+            .iter()
+            .any(|word| lower.contains(word))
+    {
+        return Some("a download of a repository archive");
+    }
+    let numbered = reads(script).is_ok_and(|list| {
+        list.iter().any(|read| {
+            read.paths.iter().any(|path| {
+                ["github.event.number", "github.event.pull_request.number"]
+                    .iter()
+                    .any(|entry| touches(path, entry))
+            })
+        })
+    });
+    numbered.then_some("the pull request number")
 }
 
 /// Whether the text of a `ref` or `repository` input is provably the
@@ -421,7 +516,8 @@ fn action_checkout(step: &UsesStep) -> Option<LintKind> {
 /// Whether a script runs a command that fetches code or moves a
 /// checkout to it: a git command such as `fetch` or `checkout` (within
 /// a few words of `git`, which covers `git -C dir fetch`), `gh pr
-/// checkout` or `gh repo clone`.
+/// checkout`, `gh repo clone`, or `curl` or `wget` of a tarball, zipball
+/// or archive.
 fn fetches_code(script: &str) -> bool {
     let flat: String = script
         .chars()
@@ -434,6 +530,10 @@ fn fetches_code(script: &str) -> bool {
         })
         .collect();
     let words: Vec<&str> = flat.split_whitespace().collect();
+    let lower = flat.to_ascii_lowercase();
+    let archive = ["tarball", "zipball", "/archive/"]
+        .iter()
+        .any(|word| lower.contains(word));
     words.iter().enumerate().any(|(i, word)| match *word {
         "git" => words[i + 1..]
             .iter()
@@ -443,6 +543,8 @@ fn fetches_code(script: &str) -> bool {
             words.get(i + 1..i + 3),
             Some(["pr", "checkout"] | ["repo", "clone"])
         ),
+        // A download of a repository archive is a fetch of code.
+        "curl" | "wget" => archive,
         _ => false,
     })
 }
@@ -588,13 +690,83 @@ mod tests {
             "      - uses: actions/checkout@v4\n        with:\n          ref: main"
         ));
         assert!(blocked(&job, "      - checkout"));
-        // Read by an `if:`, a `with:` of another action or a later step.
-        let steps = "      - run: echo hi\n        if: github.event.pull_request.head.repo.fork\n      - run: git clone https://example.com/x\n";
-        assert!(blocked("", steps));
+        // Read by a `with:` of another action, then a fetch in the job.
         let steps = format!(
             "      - uses: some/action@v1\n        with:\n          sha: {head}\n      - run: gh repo clone o/r"
         );
         assert!(blocked("", &steps));
+    }
+
+    #[test]
+    fn a_guard_or_a_label_does_not_read_the_head() {
+        // `if:`, `concurrency:` and `name:` compare or label.
+        let steps = "      - run: git clone https://example.com/x\n        if: github.event.pull_request.head.repo.fork == false\n        name: ${{ github.event.pull_request.head.ref }}";
+        assert!(!blocked("", steps));
+        let job = "    if: github.event.pull_request.head.repo.full_name == github.repository\n    concurrency:\n      group: ci-${{ github.head_ref }}\n";
+        assert!(!blocked(job, "      - checkout"));
+        assert!(!blocked(job, "      - run: git fetch origin main"));
+    }
+
+    #[test]
+    fn a_run_time_lookup_of_the_pull_request_in_a_fetch_is_found() {
+        for script in [
+            "git fetch origin pull/${{ github.event.number }}/x",
+            "git fetch origin \"$(jq -r .pull_request.head.sha \"$GITHUB_EVENT_PATH\")\"",
+            "sha=$(gh api repos/o/r/pulls/12 --jq .head.sha) && git fetch origin $sha",
+            "git fetch origin ${{ github.event.pull_request.number }}",
+            "git fetch origin refs/pull/*/head:refs/remotes/pr/*",
+            "git fetch origin \"refs/pull/${N}\" && git checkout FETCH_HEAD",
+            "curl -L https://api.github.com/repos/o/r/tarball/$SHA | tar xz",
+            "wget https://github.com/o/r/archive/$SHA.zip",
+            "curl -L https://api.github.com/repos/o/r/zipball/$SHA -o x.zip",
+        ] {
+            let steps = format!("      - run: |\n          {script}");
+            assert!(blocked("", &steps), "{script}");
+        }
+        // The same lookup without a fetch fetches nothing.
+        for script in [
+            "echo ${{ github.event.number }}",
+            "jq .number \"$GITHUB_EVENT_PATH\"",
+            "gh api repos/o/r/pulls/12 --jq .title",
+            "curl https://example.com/health",
+        ] {
+            let steps = format!("      - run: |\n          {script}");
+            assert!(!blocked("", &steps), "{script}");
+        }
+    }
+
+    #[test]
+    fn the_head_passed_to_a_later_job_through_needs_is_found() {
+        let yaml = "
+jobs:
+  find:
+    runs-on: ubuntu-latest
+    outputs: { sha: '${{ steps.s.outputs.sha }}' }
+    steps:
+      - id: s
+        run: echo \"sha=${{ github.event.pull_request.head.sha }}\" >> \"$GITHUB_OUTPUT\"
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: git fetch origin ${{ needs.find.outputs.sha }}
+  unrelated:
+    runs-on: ubuntu-latest
+    steps:
+      - run: git fetch origin main
+workflows:
+  w:
+    on: { pull_request_target: {} }
+    jobs:
+      - find
+      - build: { requires: [find] }
+      - unrelated: { requires: [find] }
+";
+        let config = parse(yaml).unwrap();
+        let plan = compile(&config, "w", "refs/heads/main").unwrap();
+        let found = plan_lints(&plan);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].job, "build");
+        assert!(found[0].message.contains("an output of the job `find`"));
     }
 
     #[test]

@@ -1357,11 +1357,11 @@ mod tests {
         // either word.
         let mut with: serde_json::Value =
             serde_json::from_slice(&body("on", "all_outside", 3, 20)).unwrap();
-        with["pull_request_target_head_checkout"] = "block".into();
+        with["pull_request_target_head_checkout"] = "approve".into();
         let blocked = parse_fork_policy(with.to_string().as_bytes(), 1000).unwrap();
         assert_eq!(
             blocked.pull_request_target_head_checkout,
-            crate::policy::HeadCheckout::Block
+            crate::policy::HeadCheckout::Approve
         );
         with["pull_request_target_head_checkout"] = "ignore".into();
         assert_eq!(

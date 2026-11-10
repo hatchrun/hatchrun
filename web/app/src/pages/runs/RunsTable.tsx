@@ -52,6 +52,11 @@ export function RunsTable({ runs, now, inRepo = false, inWorkflow = false }: { r
                   </Link>
                 )}
                 {run.branch ? <Truncate value={run.branch} copy mono /> : <span className="font-mono text-[13px] text-fg-3">{run.event}</span>}
+                {run.trust !== "fork" && run.fork !== null && (run.gate?.status === "pending" || run.gate?.status === "deferred") && (
+                  <span title={`pull_request_target of a fork${run.fork.head_repo ? `: ${run.fork.head_repo}` : ""}`} className="cap shrink-0 text-fg-3">
+                    needs approval
+                  </span>
+                )}
                 {run.trust === "fork" && (
                   <span title={`From a fork${run.fork?.head_repo ? `: ${run.fork.head_repo}` : ""}`} className="cap shrink-0 text-fg-3">
                     {run.gate?.status === "pending" || run.gate?.status === "deferred" ? "fork, needs approval" : "fork"}
