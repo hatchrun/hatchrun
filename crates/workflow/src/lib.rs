@@ -20,6 +20,7 @@ pub mod dynamic;
 pub mod environment;
 pub mod expr;
 pub mod job;
+pub mod lint;
 pub mod permissions;
 pub mod plan;
 pub mod secrets;
@@ -47,20 +48,21 @@ pub use environment::{
     valid_environment_url,
 };
 pub use expr::{
-    ExprError, Functions, HATCHRUN_KEYS, JobStatus, checks_status, continue_on_error, evaluate,
-    hatchrun_context, interpolate, job_condition, may_hold_without, reads_context, secret_refs,
-    split_job_outputs, truthy,
+    ExprError, Functions, HATCHRUN_KEYS, JobStatus, Reads, checks_status, continue_on_error,
+    evaluate, hatchrun_context, interpolate, job_condition, may_hold_without, reads, reads_context,
+    reads_expression, secret_refs, split_job_outputs, truthy,
 };
 pub use job::{
     Annotation, AnnotationLevel, ArtifactService, CacheService, Conclusion, Github, IdTokenRequest,
     JobDocument, JobResult, Need, StepSummary,
 };
+pub use lint::{Lint, LintKind, plan_lints};
 pub use permissions::{
     DEFAULT_SCOPES, ID_TOKEN, ID_TOKEN_SCOPE, Level, Permissions, SCOPES, token_scopes,
 };
 pub use plan::{
     Deferred, JobKind, Plan, PlannedJob, PlannedStep, PlannedStrategy, Ready, compile,
-    compile_with, config_errors, ready, run_title, validate,
+    compile_with, config_errors, ready, run_title, validate, validate_with_warnings,
 };
 pub use secrets::{DEBUG_SECRETS, SecretRefs};
 pub use split::split;

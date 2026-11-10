@@ -58,9 +58,9 @@ pub use self::environments::{
 };
 pub use self::forks::{
     admit_run, approve_by_check, approve_run, clear_decided_mark, deferred_group, deferred_runs,
-    end_gate, end_pull_gates, expire_gates, fork_waiting, mark_scanned, pending_gate_runs,
-    put_repo_policy, reject_run, repo_policy, runs_needing_card, set_card_dirty, set_gate_check,
-    unfinished_decisions,
+    end_gate, end_pull_gates, expire_gates, fork_waiting, fork_waiting_beside, mark_scanned,
+    pending_gate_runs, put_repo_policy, reject_run, repo_policy, runs_needing_card, set_card_dirty,
+    set_gate_check, unfinished_decisions,
 };
 pub use self::installation::{
     LastRun, OrgRepo, RepoFilter, RepoVisibility, SetupRow, installation_synced, patch_enabled,

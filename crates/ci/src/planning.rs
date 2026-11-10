@@ -100,21 +100,60 @@ pub fn remote_workflows(source: &str, event: &Event) -> Vec<String> {
 /// False when the config does not parse (it is reported without them).
 #[must_use]
 pub fn needs_pull_request_paths(source: &str, action: &str, base_ref: &str) -> bool {
+    needs_paths(
+        source,
+        &Event::PullRequest {
+            action: action.to_owned(),
+            base_ref: base_ref.to_owned(),
+            changed: Vec::new(),
+        },
+    )
+}
+
+/// As [`needs_pull_request_paths`], for the workflows of
+/// `on: pull_request_target`, which `source` is the base branch's config
+/// of.
+#[must_use]
+pub fn needs_pull_request_target_paths(source: &str, action: &str, base_ref: &str) -> bool {
+    needs_paths(
+        source,
+        &Event::PullRequestTarget {
+            action: action.to_owned(),
+            base_ref: base_ref.to_owned(),
+            changed: Vec::new(),
+        },
+    )
+}
+
+/// Whether `event`, a pull request event, starts a workflow that filters
+/// on changed paths. Other events filter on none here.
+fn needs_paths(source: &str, event: &Event) -> bool {
     let Ok(config) = parse(source) else {
         return false;
     };
-    let event = Event::PullRequest {
-        action: action.to_owned(),
-        base_ref: base_ref.to_owned(),
-        changed: Vec::new(),
-    };
     config.workflows.values().any(|wf| {
-        triggered(&wf.on, &event)
-            && wf
-                .on
-                .pull_request
+        let on = match event {
+            Event::PullRequest { .. } => &wf.on.pull_request,
+            Event::PullRequestTarget { .. } => &wf.on.pull_request_target,
+            _ => return false,
+        };
+        triggered(&wf.on, event)
+            && on
                 .as_ref()
                 .is_some_and(|pr| pr.paths.is_some() || pr.paths_ignore.is_some())
+    })
+}
+
+/// Whether any workflow of `source` listens to `pull_request_target`,
+/// so the base branch's config is worth planning for a pull request. A
+/// config that does not parse has none: the push that made it was told.
+#[must_use]
+pub fn has_pull_request_target(source: &str) -> bool {
+    parse(source).is_ok_and(|config| {
+        config
+            .workflows
+            .values()
+            .any(|wf| wf.on.pull_request_target.is_some())
     })
 }
 
@@ -176,6 +215,46 @@ workflows:
         assert!(needs_pull_request_paths(config, "labeled", "main"));
         assert!(!needs_pull_request_paths(config, "opened", "main"));
         assert!(!needs_pull_request_paths("not: [valid", "labeled", "main"));
+    }
+
+    #[test]
+    fn a_pull_request_target_listener_is_found_in_the_config() {
+        let config = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  a: { on: { pull_request: {} }, jobs: [t] }
+  b: { on: { pull_request_target: {} }, jobs: [t] }
+";
+        assert!(has_pull_request_target(config));
+        assert!(!has_pull_request_target(
+            &config.replace("pull_request_target", "push")
+        ));
+        // A config that cannot be read has none to run.
+        assert!(!has_pull_request_target("not: [valid"));
+    }
+
+    #[test]
+    fn pull_request_target_paths_are_needed_by_its_own_workflows_only() {
+        let config = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  plain:
+    on: { pull_request_target: { types: [labeled] } }
+    jobs: [t]
+  docs:
+    on: { pull_request_target: { types: [opened], paths: ['docs/**'] } }
+    jobs: [t]
+  other:
+    on: { pull_request: { types: [labeled], paths: ['src/**'] } }
+    jobs: [t]
+";
+        assert!(needs_pull_request_target_paths(config, "opened", "main"));
+        assert!(!needs_pull_request_target_paths(config, "labeled", "main"));
+        // The pull_request workflow's filter is not the target's.
+        assert!(needs_pull_request_paths(config, "labeled", "main"));
+        assert!(!needs_pull_request_paths(config, "opened", "main"));
     }
 
     #[test]

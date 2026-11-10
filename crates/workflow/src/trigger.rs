@@ -499,6 +499,15 @@ pub struct Triggers {
         skip_serializing_if = "Option::is_none"
     )]
     pub pull_request: Option<PullRequestTrigger>,
+    /// Activity on a pull request, run from the base branch's config
+    /// with the base repository's secrets. It takes the filters and
+    /// types of `pull_request`.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pull_request_target: Option<PullRequestTrigger>,
     /// Cron schedules.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedule: Vec<Schedule>,
@@ -590,7 +599,7 @@ pub struct PushTrigger {
     pub paths_ignore: Option<Filter>,
 }
 
-/// Filters for `on: pull_request`.
+/// Filters for `on: pull_request` and `on: pull_request_target`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PullRequestTrigger {
@@ -803,6 +812,20 @@ pub enum Event {
         /// [`MAX_CHANGED`] paths are looked at.
         changed: Vec<String>,
     },
+    /// Activity on a pull request, for a workflow that runs from the base
+    /// branch (`on: pull_request_target`). The fields are those of
+    /// [`Event::PullRequest`]; `base_ref` is the branch the config was
+    /// read from.
+    PullRequestTarget {
+        /// The activity type, such as `opened`.
+        action: String,
+        /// The base branch, as a short name.
+        base_ref: String,
+        /// Paths changed by the pull request. Empty when the caller could
+        /// not compute them; path filters then pass. Only the first
+        /// [`MAX_CHANGED`] paths are looked at.
+        changed: Vec<String>,
+    },
     /// A cron schedule firing.
     Schedule {
         /// The cron string of the schedule that fired.
@@ -854,12 +877,18 @@ pub fn triggered(on: &Triggers, event: &Event) -> bool {
             action,
             base_ref,
             changed,
-        } => on.pull_request.as_ref().is_some_and(|pr| {
-            pr.types.iter().any(|t| t == action)
-                && ref_passes(pr.branches.as_ref(), pr.branches_ignore.as_ref(), base_ref)
-                    == Some(true)
-                && paths_pass(pr.paths.as_ref(), pr.paths_ignore.as_ref(), changed)
-        }),
+        } => on
+            .pull_request
+            .as_ref()
+            .is_some_and(|pr| pull_request_matches(pr, action, base_ref, changed)),
+        Event::PullRequestTarget {
+            action,
+            base_ref,
+            changed,
+        } => on
+            .pull_request_target
+            .as_ref()
+            .is_some_and(|pr| pull_request_matches(pr, action, base_ref, changed)),
         Event::Schedule { cron } => on.schedule.iter().any(|s| &s.cron == cron),
         Event::Dispatch => on.workflow_dispatch.is_some(),
         Event::WorkflowRun {
@@ -888,6 +917,17 @@ pub fn triggered(on: &Triggers, event: &Event) -> bool {
             .as_ref()
             .is_some_and(|d| d.types.is_empty() || d.types.iter().any(|t| t == action)),
     }
+}
+
+fn pull_request_matches(
+    pr: &PullRequestTrigger,
+    action: &str,
+    base_ref: &str,
+    changed: &[String],
+) -> bool {
+    pr.types.iter().any(|t| t == action)
+        && ref_passes(pr.branches.as_ref(), pr.branches_ignore.as_ref(), base_ref) == Some(true)
+        && paths_pass(pr.paths.as_ref(), pr.paths_ignore.as_ref(), changed)
 }
 
 fn push_matches(push: &PushTrigger, full_ref: &str, changed: &[String]) -> bool {

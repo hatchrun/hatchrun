@@ -106,6 +106,7 @@ interface RunRow {
   message: string | null;
   pull_request: PullRef | null;
   trust: "trusted" | "fork";
+  lints: string[];
   fork: { head_repo: string | null; author: string; author_association: string } | null;
   gate: { status: string; by: string | null; at: number | null } | null;
   status: string;
@@ -303,6 +304,7 @@ function runAt(i: number): RunRow {
     message: i === BIG_AT ? MESSAGES[3] as string : event === "schedule" ? null : pr ? pr.title : pick(MESSAGES, i, 13),
     pull_request: pr ? pullRef(pr) : null,
     trust: "trusted",
+    lints: [],
     fork: null,
     gate: null,
     status: o.status,

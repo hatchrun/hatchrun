@@ -338,7 +338,7 @@ on:
   push:
   release:
     types: [published]
-  pull_request_target:
+  watch:
 jobs:
   t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
 ");
@@ -346,7 +346,7 @@ jobs:
     assert!(on.push.is_some());
     assert_eq!(on.release.as_ref().unwrap().types, ["published"]);
     assert!(!has(&out.warnings, &["`on.release`"]));
-    assert!(has(&out.warnings, &["ci.yml", "pull_request_target"]));
+    assert!(has(&out.warnings, &["ci.yml", "watch"]));
     round_trips(&out);
 }
 
@@ -1992,7 +1992,7 @@ fn a_workflow_whose_events_all_fail_is_dropped() {
 
 #[test]
 fn github_only_events_say_to_stay_on_github_actions() {
-    for event in ["pull_request_target", "issues", "issue_comment"] {
+    for event in ["issues", "issue_comment"] {
         let out = ok(&format!(
             "on: [push, {event}]\njobs:\n  t: {{ runs-on: ubuntu-latest, steps: [{{ run: x }}] }}\n"
         ));
@@ -2014,6 +2014,81 @@ fn github_only_events_say_to_stay_on_github_actions() {
         ok("on: [push, watch]\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n");
     assert!(has(&out.warnings, &["`on.watch` is not supported"]));
     assert!(!has(&out.warnings, &["GitHub Actions"]));
+}
+
+#[test]
+fn pull_request_target_converts_with_its_filters() {
+    let out = ok("
+on:
+  pull_request_target:
+    types: [labeled, opened]
+    branches: [main]
+    paths: ['docs/**']
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    let on = &out.config.workflows["ci"].on;
+    let target = on.pull_request_target.as_ref().unwrap();
+    assert_eq!(target.types, ["labeled", "opened"]);
+    assert!(target.branches.is_some() && target.paths.is_some());
+    assert!(on.pull_request.is_none());
+    assert!(!has(&out.warnings, &["not supported"]));
+    round_trips(&out);
+    // Without a body it takes GitHub's default types.
+    let bare = ok(
+        "on: pull_request_target\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+    );
+    assert_eq!(
+        bare.config.workflows["ci"]
+            .on
+            .pull_request_target
+            .as_ref()
+            .unwrap()
+            .types,
+        ["opened", "synchronize", "reopened"]
+    );
+}
+
+#[test]
+fn a_pull_request_target_head_checkout_and_script_injection_warn() {
+    let out = ok("
+on: pull_request_target
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: echo \"${{ github.event.pull_request.title }}\"
+");
+    assert!(
+        has(
+            &out.warnings,
+            &["ci", "step 1", "checks out the pull request head"]
+        ),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        has(
+            &out.warnings,
+            &["ci", "step 2", "github.event.pull_request.title", "env:"]
+        ),
+        "{:?}",
+        out.warnings
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
+    // The same steps under pull_request warn about nothing.
+    let plain = ok("
+on: pull_request
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo \"${{ github.event.pull_request.title }}\"
+");
+    assert!(!has(&plain.warnings, &["github.event.pull_request.title"]));
 }
 
 /// Converts several files at once.

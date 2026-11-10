@@ -98,6 +98,12 @@ pub struct NewRun {
     /// `NotGated`, or `Pending` or `Deferred` for a fork run that needs
     /// an approval.
     pub gate_status: GateStatus,
+    /// The pull request's head commit, for a `pull_request_target` run,
+    /// whose own sha is the base branch's. An approval is by this.
+    pub head_sha: Option<String>,
+    /// What the planner found in the run's workflow, one finding to a
+    /// line.
+    pub lints: Option<String>,
     /// When the run is recorded.
     pub now: u64,
 }
@@ -170,9 +176,28 @@ pub struct RunRow {
     /// reconciler has to update it again.
     #[serde(default)]
     pub gate_card_dirty: bool,
+    /// The pull request's head commit, for a `pull_request_target` run.
+    pub head_sha: Option<String>,
+    /// What the planner found in the run's workflow, one finding to a
+    /// line.
+    pub lints: Option<String>,
 }
 
 impl RunRow {
+    /// The commit an approval of the run is about: the pull request's
+    /// head for a `pull_request_target` run, the run's own commit for
+    /// others.
+    #[must_use]
+    pub fn pr_sha(&self) -> &str {
+        self.head_sha.as_deref().unwrap_or(&self.sha)
+    }
+
+    /// Whether the run is of a `pull_request_target` event.
+    #[must_use]
+    pub fn event_name_is_target(&self) -> bool {
+        self.event == "pull_request_target"
+    }
+
     /// The branch the run is on: that of a push, the head branch of a
     /// pull request, none for a tag. The same as [`BRANCH`].
     #[must_use]
@@ -195,7 +220,7 @@ pub(super) const RUN_COLUMNS: &str = "id, run_number, run_attempt, tenant_id, re
      (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
       AND number = ci_runs.pull_number) AS pull_title, \
      trust, head_repo_name, author_login, author_association, gate_status, gate_by, gate_at, \
-     gate_check_run_id, gate_card_dirty";
+     gate_check_run_id, gate_card_dirty, head_sha, lints";
 
 /// The run of delivery `$1` and workflow `$2`, where `{columns}` is
 /// [`RUN_COLUMNS`].
@@ -213,7 +238,8 @@ const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE
 /// now, `$10` the pull request's base branch, `$11` the message, `$12` the
 /// pull request's number, `$13` its head branch, `$14` the trust, `$15` and
 /// `$16` the head repository's id and name, `$17` the author, `$18` the
-/// author's association, `$19` the gate and `$20` its status. The run expires after its tenant's retention tier (30 or 90 days), read
+/// author's association, `$19` the gate, `$20` its status, `$21` the
+/// pull request's head commit and `$22` the planner's findings. The run expires after its tenant's retention tier (30 or 90 days), read
 /// in the same statement. The number is taken only when no run of this
 /// delivery and workflow exists, so a duplicate leaves the counter
 /// alone, and the statement returns no row for it.
@@ -226,11 +252,11 @@ const INSERT_RUN: &str = "WITH n AS (\
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
        actor, base_ref, message, pull_number, head_ref, status, created_at, updated_at, \
        expires_at, trust, head_repo_id, head_repo_name, author_login, author_association, \
-       gate, gate_status) \
+       gate, gate_status, head_sha, lints) \
      SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, $10::text, $11::text, $12::bigint, $13::text, 'queued', $9, $9, \
        $9 + (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END * 86400000::bigint \
          FROM tenants WHERE id = $1), \
-       $14::text, $15::bigint, $16::text, $17::text, $18::text, $19::text, $20::text FROM n \
+       $14::text, $15::bigint, $16::text, $17::text, $18::text, $19::text, $20::text, $21::text, $22::text FROM n \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
        ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
        completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
@@ -238,7 +264,7 @@ const INSERT_RUN: &str = "WITH n AS (\
        (SELECT title FROM ci_pulls WHERE repo_id = ci_runs.repo_id \
         AND number = ci_runs.pull_number) AS pull_title, \
        trust, head_repo_name, author_login, author_association, gate_status, gate_by, gate_at, \
-       gate_check_run_id, gate_card_dirty";
+       gate_check_run_id, gate_card_dirty, head_sha, lints";
 
 /// Run `$1`, where `{columns}` is [`RUN_COLUMNS`].
 const RUN: &str = "SELECT {columns} FROM ci_runs WHERE id = $1";
@@ -302,7 +328,9 @@ pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>> {
             } else {
                 "fork_approval"
             },
-            run.gate_status.as_str()
+            run.gate_status.as_str(),
+            &run.head_sha,
+            &run.lints
         ],
     )
     .await

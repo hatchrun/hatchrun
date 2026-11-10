@@ -18,7 +18,7 @@
 //! | `GET /api/ci/orgs/{org}/audit?repo=&cursor=&limit=` | org admin | `Page` of `{"id", "at", "actor", "action", "scope", "repo", "target"}`, newest first |
 //! | `GET /api/ci/orgs/{org}/setup` | org admin | `{"app", "enabled", "first_run", "billing"}` |
 //! | `GET /api/ci/orgs/{org}/environments?q=&repo=&cursor=&limit=` | org admin | `Page` of `{"repository", "name", "branches", "approval", "updatedAt", "secrets", "vars"}` |
-//! | `GET /api/ci/repos/{owner}/{repo}/fork-policy` | repo admin | the policy for pull requests from forks: `{"fork_runs", "fork_approval", "fork_max_running", "fork_timeout_minutes"}`, the defaults when none was saved |
+//! | `GET /api/ci/repos/{owner}/{repo}/fork-policy` | repo admin | the policy for pull requests from forks and for `pull_request_target`: `{"fork_runs", "fork_approval", "fork_max_running", "fork_timeout_minutes", "pull_request_target_head_checkout"}`, the defaults when none was saved |
 //! | `PUT /api/ci/repos/{owner}/{repo}/fork-policy` | repo admin, CSRF | the saved policy; every field is required |
 //! | `GET /api/ci/repos/{owner}/{repo}/environments` | repo admin | `[{"name", "branches", "approval", "updatedAt"}]` |
 //! | `PUT /api/ci/repos/{owner}/{repo}/environments/{env}` | repo admin, CSRF | the environment |
@@ -898,7 +898,8 @@ fn parse_fork_policy(body: &[u8], max_body: usize) -> std::result::Result<RepoPo
         return stop(
             400,
             "expected {\"fork_runs\": \"on\", \"fork_approval\": \"first_time_contributors\", \
-             \"fork_max_running\": 2, \"fork_timeout_minutes\": 30}",
+             \"fork_max_running\": 2, \"fork_timeout_minutes\": 30, \
+             \"pull_request_target_head_checkout\": \"warn\"}",
         );
     };
     match policy.valid() {
@@ -935,7 +936,7 @@ async fn put_fork_policy(
             Ok(_) => {
                 return Ok(stop(
                     403,
-                    "You need admin access to this repository to let more fork code run",
+                    "You need admin access to this repository to loosen the fork policy",
                 ));
             }
             Err(Failure::Retry(wait)) => {
@@ -1340,24 +1341,44 @@ mod tests {
             json!({
                 "fork_runs": fork_runs, "fork_approval": approval,
                 "fork_max_running": running, "fork_timeout_minutes": timeout,
+                "pull_request_target_head_checkout": "warn",
             })
             .to_string()
             .into_bytes()
         };
-        // The head checkout rule belongs to pull_request_target, not
-        // to this policy: a body that names it is refused.
-        let mut extra: serde_json::Value =
-            serde_json::from_slice(&body("on", "all_outside", 3, 20)).unwrap();
-        extra["pull_request_target_head_checkout"] = "warn".into();
+        let ok = parse_fork_policy(&body("on", "all_outside", 3, 20), 1000).unwrap();
+        assert_eq!(ok.fork_max_running, 3);
+        assert_eq!(ok.fork_timeout_minutes, 20);
         assert_eq!(
-            parse_fork_policy(extra.to_string().as_bytes(), 1000)
+            ok.pull_request_target_head_checkout,
+            crate::policy::HeadCheckout::Warn
+        );
+        // The head checkout rule is a field of the policy: required, and
+        // either word.
+        let mut with: serde_json::Value =
+            serde_json::from_slice(&body("on", "all_outside", 3, 20)).unwrap();
+        with["pull_request_target_head_checkout"] = "approve".into();
+        let blocked = parse_fork_policy(with.to_string().as_bytes(), 1000).unwrap();
+        assert_eq!(
+            blocked.pull_request_target_head_checkout,
+            crate::policy::HeadCheckout::Approve
+        );
+        with["pull_request_target_head_checkout"] = "ignore".into();
+        assert_eq!(
+            parse_fork_policy(with.to_string().as_bytes(), 1000)
                 .unwrap_err()
                 .0,
             400
         );
-        let ok = parse_fork_policy(&body("on", "all_outside", 3, 20), 1000).unwrap();
-        assert_eq!(ok.fork_max_running, 3);
-        assert_eq!(ok.fork_timeout_minutes, 20);
+        with.as_object_mut()
+            .unwrap()
+            .remove("pull_request_target_head_checkout");
+        assert_eq!(
+            parse_fork_policy(with.to_string().as_bytes(), 1000)
+                .unwrap_err()
+                .0,
+            400
+        );
         for bad in [
             body("sometimes", "all_outside", 3, 20),
             body("on", "everyone", 3, 20),

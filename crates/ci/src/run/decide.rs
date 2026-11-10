@@ -748,6 +748,7 @@ pub(super) mod tests {
             base_ref: String::new(),
             concurrency: None,
             title: None,
+            warnings: Vec::new(),
         }
     }
 

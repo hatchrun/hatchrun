@@ -58,6 +58,8 @@ export interface CiRun {
   trust: Trust;
   /** The author and head repository of a fork pull request's run; null for the repository's own code. */
   fork: { head_repo: string | null; author: string; author_association: string } | null;
+  /** What the planner found in the workflow of a pull_request_target run, one finding each. A warning, never a refusal. */
+  lints: string[];
   /** The approval a fork run needed; null when it never waited. */
   gate: { status: GateStatus; by: string | null; at: number | null } | null;
   status: string;
@@ -550,7 +552,7 @@ export const putCiItem = (scope: CiScope, kind: CiItemKind, name: string, value:
 export const deleteCiItem = (scope: CiScope, kind: CiItemKind, name: string) =>
   adminOnly(() => del<undefined>(`${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`));
 
-/** What a repository does with pull requests from forks. */
+/** What a repository does with pull requests from forks, and with pull_request_target workflows that check out the head. */
 export interface ForkPolicy {
   /** Whether fork pull requests run. On by default for a public repository, off for a private one. */
   fork_runs: "off" | "on";
@@ -560,6 +562,8 @@ export interface ForkPolicy {
   fork_max_running: number;
   /** The longest a fork job may run, in minutes, 5 to 60. */
   fork_timeout_minutes: number;
+  /** What a repository does with pull_request_target runs of pull requests from forks: run at once with the planner's warnings, or wait for a maintainer's approval. */
+  pull_request_target_head_checkout: "warn" | "approve";
 }
 
 export const getForkPolicy = (owner: string, repo: string) => adminOnly(() => get<ForkPolicy>(`${repoPath(owner, repo)}/fork-policy`));

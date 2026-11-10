@@ -409,6 +409,15 @@ pub fn compile_with(
 /// substitutes; the plan carries no parameter values to run time.
 #[must_use]
 pub fn validate(config: &Config) -> Vec<Diagnostic> {
+    validate_with_warnings(config).0
+}
+
+/// [`validate`], and the warnings of [`crate::lint`] for the workflows
+/// that run on a guarded event, read from the plans `validate` compiles
+/// anyway. The warnings do not make a config invalid.
+#[must_use]
+pub fn validate_with_warnings(config: &Config) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
+    let mut warnings = Vec::new();
     let mut errors = config_errors(config);
     for (name, executor) in &config.executors {
         if template(&executor.runs_on).is_none() {
@@ -424,7 +433,7 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
         // A file of another repository is not read here: its calls plan
         // nothing, and the host checks them when it plans the workflow.
         let mut calls = Calls::new(None, name);
-        compile_workflow(
+        let plan = compile_workflow(
             config,
             name,
             wf,
@@ -433,11 +442,20 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
             &mut calls,
             &mut errors,
         );
+        if let Some(plan) = plan
+            && crate::lint::guarded(&wf.on)
+        {
+            warnings.extend(
+                crate::lint::plan_lints(&plan)
+                    .iter()
+                    .map(|lint| Diagnostic::new(lint.text())),
+            );
+        }
         if budget.spent {
             break;
         }
     }
-    dedup(errors)
+    (dedup(errors), warnings)
 }
 
 /// Whether a planned job can start, as [`ready`] decides it.
@@ -592,17 +610,25 @@ fn filter_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
             check(&owner, "on.push.paths", push.paths.as_ref());
             check(&owner, "on.push.paths-ignore", push.paths_ignore.as_ref());
         }
-        if let Some(pr) = &wf.on.pull_request {
-            check(&owner, "on.pull_request.branches", pr.branches.as_ref());
+        for (event, pr) in [
+            ("pull_request", &wf.on.pull_request),
+            ("pull_request_target", &wf.on.pull_request_target),
+        ] {
+            let Some(pr) = pr else { continue };
             check(
                 &owner,
-                "on.pull_request.branches-ignore",
+                &format!("on.{event}.branches"),
+                pr.branches.as_ref(),
+            );
+            check(
+                &owner,
+                &format!("on.{event}.branches-ignore"),
                 pr.branches_ignore.as_ref(),
             );
-            check(&owner, "on.pull_request.paths", pr.paths.as_ref());
+            check(&owner, &format!("on.{event}.paths"), pr.paths.as_ref());
             check(
                 &owner,
-                "on.pull_request.paths-ignore",
+                &format!("on.{event}.paths-ignore"),
                 pr.paths_ignore.as_ref(),
             );
         }
@@ -1397,19 +1423,18 @@ fn trigger_errors(config: &Config, name: &str, on: &Triggers, errors: &mut Vec<D
             push.paths_ignore.as_ref(),
         );
     }
-    if let Some(pr) = &on.pull_request {
+    for (event, pr) in [
+        ("pull_request", &on.pull_request),
+        ("pull_request_target", &on.pull_request_target),
+    ] {
+        let Some(pr) = pr else { continue };
         both(
-            "pull_request",
+            event,
             "branches",
             pr.branches.as_ref(),
             pr.branches_ignore.as_ref(),
         );
-        both(
-            "pull_request",
-            "paths",
-            pr.paths.as_ref(),
-            pr.paths_ignore.as_ref(),
-        );
+        both(event, "paths", pr.paths.as_ref(), pr.paths_ignore.as_ref());
     }
     if let Some(run) = &on.workflow_run {
         both(

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
-use crate::policy::{ForkApproval, ForkRuns, RepoPolicy};
+use crate::policy::{ForkApproval, ForkRuns, HeadCheckout, RepoPolicy};
 
 /// A fork run of pull request `number` at `sha` by `author`, in `gate`.
 fn fork_run(
@@ -168,6 +168,7 @@ fn a_saved_policy_wins_over_the_defaults_and_can_be_changed() {
         fork_approval: ForkApproval::AllOutside,
         fork_max_running: 4,
         fork_timeout_minutes: 15,
+        pull_request_target_head_checkout: HeadCheckout::Approve,
     };
     db.wait(put_repo_policy(db.db(), 7, &policy, 5, &audit(5)))
         .unwrap();
@@ -180,6 +181,14 @@ fn a_saved_policy_wins_over_the_defaults_and_can_be_changed() {
     db.wait(put_repo_policy(db.db(), 7, &lower, 6, &audit(6)))
         .unwrap();
     assert_eq!(db.wait(repo_policy(db.db(), 7, false)).unwrap(), lower);
+    // The head checkout rule is saved and read back with the rest.
+    let warn = RepoPolicy {
+        pull_request_target_head_checkout: HeadCheckout::Warn,
+        ..lower
+    };
+    db.wait(put_repo_policy(db.db(), 7, &warn, 7, &audit(7)))
+        .unwrap();
+    assert_eq!(db.wait(repo_policy(db.db(), 7, false)).unwrap(), warn);
 }
 
 #[test]
@@ -1307,4 +1316,227 @@ fn a_refresh_that_finishes_after_a_decision_cannot_clear_the_decisions_mark() {
     db.wait(clear_decided_mark(db.db(), waiting.id)).unwrap();
     let read = db.wait(super::run(db.db(), waiting.id)).unwrap().unwrap();
     assert!(read.gate_card_dirty);
+}
+
+/// A `pull_request_target` run of pull request `number`, on the base
+/// commit, for the pull request's head `head`, in `gate`.
+fn target_run(db: &TestDb, delivery: &str, number: u64, head: &str, gate: GateStatus) -> RunRow {
+    let mut new = new_run(delivery, "ci", 10);
+    new.event = "pull_request_target".into();
+    new.git_ref = "refs/heads/main".into();
+    new.sha = "basebase".into();
+    new.base_ref = Some("main".into());
+    new.pull_number = Some(number);
+    new.head_sha = Some(head.into());
+    new.lints = Some("one\ntwo".into());
+    new.gate_status = gate;
+    db.wait(insert_run(db.db(), &new)).unwrap().unwrap()
+}
+
+#[test]
+fn a_target_run_is_approved_and_superseded_by_the_pull_requests_head() {
+    let db = setup();
+    // The pull request is open at head `h1`.
+    let fork = fork_run(&db, "d-pr", 4, "h1", "mallory", GateStatus::Pending, 10);
+    let target = target_run(&db, "d-pr:target", 4, "h1", GateStatus::Pending);
+    assert_eq!(target.sha, "basebase");
+    assert_eq!(target.pr_sha(), "h1");
+    assert_eq!(fork.pr_sha(), "h1");
+    assert_eq!(target.lints.as_deref(), Some("one\ntwo"));
+    // Both are one group of one pull request at one commit.
+    let waiting = db
+        .wait(fork_waiting(db.db(), 7, "mallory", Some(4)))
+        .unwrap();
+    assert_eq!(waiting.pending, 1);
+    // A click approves the run it is for, at the head, though the run's
+    // own sha is the base's.
+    db.wait(set_gate_check(db.db(), target.id, 555)).unwrap();
+    let approved = db
+        .wait(approve_by_check(db.db(), "t1", 7, 555, "maint", 20))
+        .unwrap();
+    assert_eq!(approved.len(), 1);
+    assert_eq!(approved[0].id, target.id);
+    assert_eq!(approved[0].gate_status, GateStatus::Approved);
+}
+
+#[test]
+fn the_commit_of_an_approval_is_an_indexed_expression_not_a_generated_column() {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        found: String,
+    }
+    let db = setup();
+    let generated: Row = db
+        .wait(db.db().first(
+            "SELECT is_generated AS found FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'ci_runs' \
+             AND column_name = 'head_sha'",
+            &params![],
+        ))
+        .unwrap()
+        .unwrap();
+    // A plain column: adding it did not rewrite the table.
+    assert_eq!(generated.found, "NEVER");
+    let index: Row = db
+        .wait(db.db().first(
+            "SELECT indexdef AS found FROM pg_indexes \
+             WHERE schemaname = current_schema() AND indexname = 'ci_runs_gate_commit'",
+            &params![],
+        ))
+        .unwrap()
+        .unwrap();
+    assert!(
+        index.found.contains("COALESCE(head_sha, sha)"),
+        "{}",
+        index.found
+    );
+    let pr_sha: Option<Row> = db
+        .wait(db.db().first(
+            "SELECT column_name AS found FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'ci_runs' \
+             AND column_name = 'pr_sha'",
+            &params![],
+        ))
+        .unwrap();
+    assert!(pr_sha.is_none());
+}
+
+#[test]
+fn the_runs_of_one_delivery_do_not_count_against_each_other() {
+    let db = setup();
+    // The target run is asked for first; the fork run of the same
+    // delivery is then counted without it.
+    let target = target_run(&db, "d-pr:target", 4, "h1", GateStatus::Pending);
+    let fork = fork_run(&db, "d-pr", 4, "h1", "mallory", GateStatus::Pending, 10);
+    assert_eq!(target.pr_sha(), fork.pr_sha());
+    let counted = db
+        .wait(fork_waiting_beside(db.db(), 7, "mallory", Some(4), None))
+        .unwrap();
+    assert_eq!(counted.pending, 1, "one group, one card's room");
+    let beside = db
+        .wait(fork_waiting_beside(
+            db.db(),
+            7,
+            "mallory",
+            Some(4),
+            Some("h1"),
+        ))
+        .unwrap();
+    assert_eq!(beside.pending, 0, "its own group is not counted against it");
+    // Another pull request's group, or another commit of this one, is.
+    fork_run(&db, "d-other", 5, "o1", "eve", GateStatus::Pending, 11);
+    let other = db
+        .wait(fork_waiting_beside(
+            db.db(),
+            7,
+            "mallory",
+            Some(4),
+            Some("h1"),
+        ))
+        .unwrap();
+    assert_eq!(other.pending, 1);
+}
+
+#[test]
+fn a_newer_head_clears_the_older_ones_waiting_runs_before_anything_is_counted() {
+    let db = setup();
+    target_run(&db, "d1:target", 4, "h1", GateStatus::Pending);
+    fork_run(&db, "d1", 4, "h1", "mallory", GateStatus::Pending, 10);
+    let before = db
+        .wait(fork_waiting_beside(
+            db.db(),
+            7,
+            "mallory",
+            Some(4),
+            Some("h2"),
+        ))
+        .unwrap();
+    assert_eq!(before.pending, 1, "the old head still holds a slot");
+    let ended = db
+        .wait(end_pull_gates(db.db(), 7, 4, Some("h2"), 30))
+        .unwrap();
+    assert_eq!(ended.len(), 2);
+    let after = db
+        .wait(fork_waiting_beside(
+            db.db(),
+            7,
+            "mallory",
+            Some(4),
+            Some("h2"),
+        ))
+        .unwrap();
+    assert_eq!(after.pending, 0);
+}
+
+#[test]
+fn a_target_run_is_approved_or_rejected_from_the_app_like_a_fork_run() {
+    let db = setup();
+    fork_run(&db, "d-pr", 4, "h1", "mallory", GateStatus::Pending, 10);
+    let one = target_run(&db, "d1:target", 4, "h1", GateStatus::Pending);
+    let approved = db
+        .wait(approve_run(db.db(), "t1", 7, one.id, "maint", 20))
+        .unwrap()
+        .unwrap();
+    assert_eq!(approved.gate_status, GateStatus::Approved);
+    assert_eq!(approved.gate_by.as_deref(), Some("maint"));
+    // A second decision changes nothing.
+    assert!(
+        db.wait(reject_run(db.db(), "t1", 7, one.id, "other", 21))
+            .unwrap()
+            .is_none()
+    );
+    let two = target_run(&db, "d2:target", 4, "h1", GateStatus::Pending);
+    let rejected = db
+        .wait(reject_run(db.db(), "t1", 7, two.id, "maint", 22))
+        .unwrap()
+        .unwrap();
+    assert_eq!(rejected.gate_status, GateStatus::Cancelled);
+}
+
+#[test]
+fn a_newer_head_ends_the_waiting_target_run_of_the_older_one() {
+    let db = setup();
+    let old = target_run(&db, "d1:target", 4, "h1", GateStatus::Pending);
+    let new = target_run(&db, "d2:target", 4, "h2", GateStatus::Pending);
+    let ended = db
+        .wait(end_pull_gates(db.db(), 7, 4, Some("h2"), 30))
+        .unwrap();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0].id, old.id);
+    let kept = db.wait(super::run(db.db(), new.id)).unwrap().unwrap();
+    assert_eq!(kept.gate_status, GateStatus::Pending);
+}
+
+#[test]
+fn a_target_run_is_not_approved_once_the_head_moved() {
+    let db = setup();
+    // The pull request is at `h2` now; the run is for `h1`.
+    let old = target_run(&db, "d1:target", 4, "h1", GateStatus::Pending);
+    db.wait(set_gate_check(db.db(), old.id, 556)).unwrap();
+    fork_run(&db, "d-pr", 4, "h2", "mallory", GateStatus::Pending, 12);
+    let approved = db
+        .wait(approve_by_check(db.db(), "t1", 7, 556, "maint", 20))
+        .unwrap();
+    assert_eq!(approved.len(), 0);
+}
+
+#[test]
+fn a_pull_request_and_a_pull_request_target_run_of_one_workflow_both_exist() {
+    let db = setup();
+    // One delivery starts both for a workflow that listens to both events.
+    let delivery = "guid-1";
+    let mut pull = new_run(delivery, "ci", 10);
+    pull.event = "pull_request".into();
+    pull.git_ref = "refs/pull/4/merge".into();
+    pull.pull_number = Some(4);
+    let mut target = new_run(&crate::webhook::target_delivery(delivery), "ci", 10);
+    target.event = "pull_request_target".into();
+    target.git_ref = "refs/heads/main".into();
+    target.pull_number = Some(4);
+    let a = db.wait(insert_run(db.db(), &pull)).unwrap();
+    let b = db.wait(insert_run(db.db(), &target)).unwrap();
+    assert!(a.is_some() && b.is_some(), "neither run may be dropped");
+    assert_ne!(a.unwrap().id, b.unwrap().id);
+    // The same key again finds the run it made instead of a second one.
+    assert!(db.wait(insert_run(db.db(), &target)).unwrap().is_none());
 }

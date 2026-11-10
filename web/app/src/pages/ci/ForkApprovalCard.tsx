@@ -42,6 +42,9 @@ export function ForkApprovalCard({
   if (fork === null) {
     return null;
   }
+  // A pull_request_target run has the repository's secrets, which is why
+  // it waits; a fork run has none.
+  const target = run.event === "pull_request_target";
   if (gate === null) {
     // The author needed no approval: the run is still a fork's, and its
     // results and artifacts say where they came from.
@@ -54,7 +57,7 @@ export function ForkApprovalCard({
         </span>
         <span className="flex min-w-0 items-center gap-2">
           <span className="cap">head</span>
-          <Truncate value={fork.head_repo ?? "a deleted fork"} className="text-fg" />
+          <Truncate value={fork.head_repo || "a deleted fork"} className="text-fg" />
         </span>
         <span className="text-fg-3">No secrets, no write token, no OIDC token, no environment.</span>
       </section>
@@ -95,8 +98,9 @@ export function ForkApprovalCard({
           </span>
           <span className="flex min-w-0 items-center gap-2">
             <span className="cap">head</span>
-            <Truncate value={fork.head_repo ?? "a deleted fork"} className="text-fg" />
+            <Truncate value={fork.head_repo || "a deleted fork"} className="text-fg" />
           </span>
+          {target && <span className="text-fg-3">pull_request_target</span>}
           {gate.status === "approved" && gate.by && <span className="text-fg-2">Approved by {gate.by}</span>}
           {error !== null && (
             <span role="alert" className="text-failed">
@@ -120,7 +124,22 @@ export function ForkApprovalCard({
             </span>
           ))}
       </div>
-      {pending && (
+      {run.lints.length > 0 && (
+        <div className="font-mono text-[13px] text-fg-2">
+          <p className="m-0 text-waiting">The planner found, reading the plan of the workflow (it can be wrong either way):</p>
+          <ul className="m-0 mt-1 list-disc pl-5">
+            {run.lints.map((lint) => (
+              <li key={lint}>{lint}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {pending && target && (
+        <p className="m-0 font-mono text-[13px] text-fg-3">
+          The run gets this repository&apos;s secrets and a token that can write. It runs the workflow of the base branch, and that workflow decides whether the pull request&apos;s code runs too. Approving runs this commit only: a new push asks again.
+        </p>
+      )}
+      {pending && !target && (
         <p className="m-0 font-mono text-[13px] text-fg-3">
           The run gets no secrets, no write token, no OIDC token and no environment. Check the pull request for changes to the config before you approve: its own workflow is what runs.
         </p>

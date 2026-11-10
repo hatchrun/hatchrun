@@ -55,6 +55,23 @@ pub enum ForkApproval {
     AllOutside,
 }
 
+/// What a repository does about `pull_request_target` runs for pull
+/// requests from forks. Such a run has the base repository's secrets and
+/// write token, and a workflow can get the author's code onto the runner
+/// in ways no reading of it finds, so the planner's findings are only
+/// warnings; this is the part that holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadCheckout {
+    /// The run starts, and its check runs say what the planner found.
+    Warn,
+    /// The run of a fork's pull request waits for a maintainer's
+    /// approval, whoever the author is, as a fork run of the
+    /// `pull_request` event does. A pull request from the same
+    /// repository runs at once.
+    Approve,
+}
+
 /// A repository's policy for pull requests from forks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +84,9 @@ pub struct RepoPolicy {
     pub fork_max_running: u32,
     /// The longest a fork job may run, in minutes, 5 to 60.
     pub fork_timeout_minutes: u32,
+    /// What a `pull_request_target` workflow that checks out the pull
+    /// request head does.
+    pub pull_request_target_head_checkout: HeadCheckout,
 }
 
 impl RepoPolicy {
@@ -79,6 +99,7 @@ impl RepoPolicy {
             fork_approval: ForkApproval::FirstTimeContributors,
             fork_max_running: 2,
             fork_timeout_minutes: 30,
+            pull_request_target_head_checkout: HeadCheckout::Warn,
         }
     }
 
@@ -95,6 +116,27 @@ impl RepoPolicy {
             return Err("fork_timeout_minutes is 5 to 60".to_owned());
         }
         Ok(())
+    }
+}
+
+impl HeadCheckout {
+    /// The word the column stores.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Approve => "approve",
+        }
+    }
+
+    /// The rule a stored word names.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "warn" => Some(Self::Warn),
+            "approve" => Some(Self::Approve),
+            _ => None,
+        }
     }
 }
 
@@ -211,21 +253,32 @@ pub fn admission(policy: &RepoPolicy, association: &str, waiting: Waiting) -> Ad
     }
     // An author over the cap waits like a run over the approval slots,
     // whether or not the run would need an approval.
-    let later = if waiting.deferred < MAX_DEFERRED {
-        Admission::Deferred
-    } else {
-        Admission::Drop
-    };
     if waiting.author_active >= MAX_ACTIVE_PER_AUTHOR {
-        return later;
+        return later(waiting);
     }
     if !needs_approval(policy.fork_approval, association) {
         return Admission::Run;
     }
+    caps(waiting)
+}
+
+/// What a run that has to wait for an approval becomes given what
+/// already waits: a card when a slot is free, otherwise it waits for one.
+fn caps(waiting: Waiting) -> Admission {
     if waiting.pending < MAX_PENDING {
         Admission::Pending
     } else {
-        later
+        later(waiting)
+    }
+}
+
+/// What a run that cannot ask yet becomes: deferred, or dropped when
+/// the repository has too many deferred.
+fn later(waiting: Waiting) -> Admission {
+    if waiting.deferred < MAX_DEFERRED {
+        Admission::Deferred
+    } else {
+        Admission::Drop
     }
 }
 
@@ -239,6 +292,15 @@ pub const fn refusal(admission: Admission) -> Option<&'static str> {
     }
 }
 
+/// What a `pull_request_target` run of a fork's pull request becomes:
+/// it waits for approval whoever the author is, within the caps of the
+/// fork runs of the `pull_request` event on waiting runs. Whether fork
+/// runs are on and the per-author cap are about the other event.
+#[must_use]
+pub fn target_admission(waiting: Waiting) -> Admission {
+    caps(waiting)
+}
+
 /// How much an approval level asks for: the more authors it asks about,
 /// the stricter.
 const fn strictness(level: ForkApproval) -> u8 {
@@ -250,8 +312,9 @@ const fn strictness(level: ForkApproval) -> u8 {
 }
 
 /// Whether `new` lets more fork code run, or run longer, than `old`: fork
-/// runs turned on, an approval level that asks about fewer authors, or a
-/// higher cap on running jobs or on timeout. Such a change is made on the
+/// runs turned on, an approval level that asks about fewer authors, a
+/// higher cap on running jobs or on timeout, or `pull_request_target`
+/// runs of forks no longer waiting for approval. Such a change is made on the
 /// admin's access as GitHub says now.
 #[must_use]
 pub fn loosens(old: &RepoPolicy, new: &RepoPolicy) -> bool {
@@ -259,6 +322,8 @@ pub fn loosens(old: &RepoPolicy, new: &RepoPolicy) -> bool {
         || strictness(new.fork_approval) < strictness(old.fork_approval)
         || new.fork_max_running > old.fork_max_running
         || new.fork_timeout_minutes > old.fork_timeout_minutes
+        || (old.pull_request_target_head_checkout == HeadCheckout::Approve
+            && new.pull_request_target_head_checkout == HeadCheckout::Warn)
 }
 
 /// The job timeout of a fork run: the workflow's, cut to the policy's.
@@ -404,6 +469,7 @@ mod tests {
             fork_approval: ForkApproval::AllOutside,
             fork_max_running: 2,
             fork_timeout_minutes: 30,
+            pull_request_target_head_checkout: HeadCheckout::Approve,
         };
         assert!(!loosens(&strict, &strict));
         // Tightening is never loosening.
@@ -447,6 +513,51 @@ mod tests {
                 ..strict
             }
         ));
+        // Asking for approval is tightening; going back to warning is not.
+        let warn = RepoPolicy {
+            pull_request_target_head_checkout: HeadCheckout::Warn,
+            ..strict
+        };
+        assert!(loosens(&strict, &warn));
+        assert!(!loosens(&warn, &strict));
+    }
+
+    #[test]
+    fn a_target_run_of_a_fork_waits_for_a_card_and_shares_the_caps_of_fork_runs() {
+        let free = Waiting::default();
+        // It asks whoever the author is, and fork runs being off or an
+        // author over the cap are about the other event.
+        assert_eq!(target_admission(free), Admission::Pending);
+        // The same caps as the other fork runs.
+        let full = Waiting {
+            pending: MAX_PENDING,
+            ..free
+        };
+        assert_eq!(target_admission(full), Admission::Deferred);
+        let flooded = Waiting {
+            pending: MAX_PENDING,
+            deferred: MAX_DEFERRED,
+            ..free
+        };
+        assert_eq!(target_admission(flooded), Admission::Drop);
+        // The per-author cap counts the other event's runs.
+        let busy = Waiting {
+            author_active: MAX_ACTIVE_PER_AUTHOR,
+            ..free
+        };
+        assert_eq!(target_admission(busy), Admission::Pending);
+    }
+
+    #[test]
+    fn the_head_checkout_rule_defaults_to_warn_and_round_trips_its_word() {
+        assert_eq!(
+            RepoPolicy::default_for(false).pull_request_target_head_checkout,
+            HeadCheckout::Warn
+        );
+        for rule in [HeadCheckout::Warn, HeadCheckout::Approve] {
+            assert_eq!(HeadCheckout::parse(rule.as_str()), Some(rule));
+        }
+        assert_eq!(HeadCheckout::parse("block"), None);
     }
 
     #[test]

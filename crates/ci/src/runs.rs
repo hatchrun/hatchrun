@@ -55,6 +55,21 @@ pub struct Origin<'a> {
     /// The repository's fork policy, for a fork pull request: its jobs
     /// are cut to the policy's timeout and to 4 vCPUs.
     pub policy: Option<RepoPolicy>,
+    /// Set for the runs of a `pull_request_target` event only.
+    pub target: Option<Target<'a>>,
+}
+
+/// What a `pull_request_target` request needs beyond its origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Target<'a> {
+    /// Why the run cannot be started: it needs an approval that cannot
+    /// be asked for. The planner then runs nothing and says so on the
+    /// pull request's head, once for each workflow that would have run.
+    pub refused: Option<&'static str>,
+    /// The pull request's head commit. The run is on the base commit,
+    /// where nobody looks, so what the planner has to say that must be
+    /// seen (a workflow that did not start) goes on this commit.
+    pub head_sha: &'a str,
 }
 
 impl<'a> Origin<'a> {
@@ -70,6 +85,7 @@ impl<'a> Origin<'a> {
             association: "",
             gate: GateStatus::NotGated,
             policy: None,
+            target: None,
         }
     }
 }
@@ -286,6 +302,52 @@ pub fn invalid_workflow_check_run(
     )
 }
 
+/// The neutral check run of a `pull_request_target` workflow that needs
+/// an approval nobody can give, on the pull request's head.
+#[must_use]
+pub fn refused_target_check_run(workflow: &str, reason: &str, sha: &str) -> CheckRun {
+    CheckRun {
+        name: format!("{workflow} / pull_request_target"),
+        head_sha: sha.to_owned(),
+        external_id: String::new(),
+        details_url: String::new(),
+        status: "completed".to_owned(),
+        started_at: None,
+        conclusion: Some("neutral".to_owned()),
+        completed_at: None,
+        actions: Vec::new(),
+        output: Some(Output {
+            title: "Needs approval".to_owned(),
+            summary: format!(
+                "Workflow `{workflow}` needs approval, and {reason}, so it did not run."
+            ),
+            text: None,
+            annotations: Vec::new(),
+        }),
+    }
+}
+
+/// The failed check run of a `pull_request_target` workflow that did not
+/// compile, named `<workflow> / pull_request_target` so it never stands
+/// in for the same workflow's `pull_request` run on the same commit.
+#[must_use]
+pub fn invalid_target_check_run(workflow: &str, diagnostics: &[Diagnostic], sha: &str) -> CheckRun {
+    failed_check_run(
+        &format!("{workflow} / pull_request_target"),
+        "Workflow did not start",
+        &format!("so workflow `{workflow}` did not start"),
+        diagnostics,
+        sha,
+    )
+}
+
+/// The commit the planner's reports go on: the head of the pull request
+/// for a `pull_request_target` request, whose own commit is the base
+/// branch's, and the request's commit otherwise.
+fn report_sha<'a>(req: &Request<'a>) -> &'a str {
+    req.origin.target.map_or(req.sha, |target| target.head_sha)
+}
+
 /// A completed, failed check run `name` that lists `diagnostics` in its
 /// summary, `consequence` ending the first line, and annotates the
 /// config file with them.
@@ -478,23 +540,43 @@ pub async fn create(
             return Ok(Vec::new());
         }
     };
+    if let Some(reason) = req.origin.target.and_then(|target| target.refused) {
+        // The workflows would have waited for an approval that cannot be
+        // asked for. They do not run, and the head says why.
+        for plan in &plans {
+            let check = refused_target_check_run(&plan.workflow, reason, report_sha(req));
+            if let Err(err) = report_once(tokens, settings, req, &check).await {
+                worker::console_error!(
+                    "{}: refusal of {}: {err}",
+                    req.repo.full_name,
+                    plan.workflow
+                );
+            }
+        }
+        return Ok(Vec::new());
+    }
+    let plans = lint_plans(plans, req.origin.target.is_some());
     match billing_decision(tenant.ci_billing, plans.len()) {
         Billing::Run => {}
         Billing::AskForCard => {
-            let check = no_card_check_run(req.sha, &tenant.org_login, &settings.app_url);
+            let check = no_card_check_run(report_sha(req), &tenant.org_login, &settings.app_url);
             report_once(tokens, settings, req, &check).await?;
             return Ok(Vec::new());
         }
         Billing::Nothing => return Ok(Vec::new()),
     }
     let mut ids = Vec::new();
-    for plan in &plans {
-        ids.push(start_plan(env, db, settings, req, plan, now).await?);
+    for checked in &plans {
+        ids.push(start_plan(env, db, settings, req, checked, now).await?);
     }
     // The good workflows run first: a GitHub error on a failed
     // workflow's check run must not keep them from starting.
     for workflow in &failed {
-        let check = invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, req.sha);
+        let check = if req.origin.target.is_some() {
+            invalid_target_check_run(&workflow.workflow, &workflow.diagnostics, report_sha(req))
+        } else {
+            invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, req.sha)
+        };
         if let Err(err) = report_once(tokens, settings, req, &check).await {
             worker::console_error!(
                 "{}: check run for the invalid workflow {}: {err}",
@@ -526,6 +608,37 @@ fn fork_limits(plans: Vec<Plan>, mut failed: Vec<Failed>, fork: bool) -> (Vec<Pl
     (kept, failed)
 }
 
+/// A plan with what the planner found in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Checked {
+    plan: Plan,
+    /// The findings, one line each. They are warnings: the run's check
+    /// runs and its approval card show them, and nothing is refused for
+    /// them, because no reading of a workflow finds every way it can get
+    /// a pull request's code onto the runner.
+    warnings: Vec<String>,
+}
+
+/// What the planner finds in each plan of a request. Only the plans of
+/// a `pull_request_target` request (`target`) are read; the others carry
+/// no findings.
+fn lint_plans(plans: Vec<Plan>, target: bool) -> Vec<Checked> {
+    plans
+        .into_iter()
+        .map(|plan| Checked {
+            warnings: if target {
+                hatchrun_workflow::plan_lints(&plan)
+                    .iter()
+                    .map(hatchrun_workflow::Lint::text)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            plan,
+        })
+        .collect()
+}
+
 /// `plan` with every job's timeout cut to the fork policy's.
 fn with_fork_timeouts(plan: &Plan, policy: &RepoPolicy) -> Plan {
     let mut plan = plan.clone();
@@ -552,12 +665,19 @@ fn only_failed(mut failed: Vec<Failed>, workflow: Option<&str>) -> Vec<Failed> {
     failed
 }
 
+/// Reports a config that cannot be used on the commit the request is
+/// for. The base branch's config of a `pull_request_target` request is
+/// not reported: the push that made it was, on its own commit, and
+/// repeating it on every pull request would put the same failure on each.
 async fn report_invalid(
     tokens: &Tokens<'_, Kv, App, Counted>,
     settings: &Settings,
     req: &Request<'_>,
     diagnostics: &[Diagnostic],
 ) -> Result<()> {
+    if req.origin.target.is_some() {
+        return Ok(());
+    }
     let check = invalid_config_check_run(diagnostics, req.sha);
     report_once(tokens, settings, req, &check).await
 }
@@ -576,7 +696,7 @@ async fn report_once(
             github::check_runs_named(
                 &settings.github_api,
                 &req.repo.full_name,
-                req.sha,
+                &check.head_sha,
                 &check.name,
                 token,
             )
@@ -605,7 +725,7 @@ const MAX_MESSAGE: usize = 200;
 fn run_message(event_name: &str, event: &Value) -> Option<String> {
     let text = match event_name {
         "push" => event.pointer("/head_commit/message"),
-        "pull_request" => event.pointer("/pull_request/title"),
+        "pull_request" | "pull_request_target" => event.pointer("/pull_request/title"),
         _ => None,
     }?
     .as_str()?;
@@ -614,16 +734,21 @@ fn run_message(event_name: &str, event: &Value) -> Option<String> {
 }
 
 /// The number of the pull request a run is for: the one in the ref of a
-/// pull request event.
+/// `pull_request` run, and in the payload of a `pull_request_target`
+/// run.
 fn pull_number(req: &Request<'_>) -> Option<u64> {
-    if req.event_name != "pull_request" {
-        return None;
+    match req.event_name {
+        "pull_request" => req
+            .git_ref
+            .strip_prefix("refs/pull/")?
+            .strip_suffix("/merge")?
+            .parse()
+            .ok(),
+        // The ref of this run is the base branch; the delivery names the
+        // pull request.
+        "pull_request_target" => req.event.pointer("/pull_request/number")?.as_u64(),
+        _ => None,
     }
-    req.git_ref
-        .strip_prefix("refs/pull/")?
-        .strip_suffix("/merge")?
-        .parse()
-        .ok()
 }
 
 /// The title `plan`'s `run-name` gives the run, cut to [`MAX_MESSAGE`]
@@ -657,6 +782,7 @@ fn title_of(
         base_ref: req.base_ref.to_owned(),
         concurrency: None,
         title: None,
+        warnings: Vec::new(),
     };
     let mut github = github_context(&info, req.event, api);
     if let Some(fields) = github.as_object_mut() {
@@ -672,15 +798,16 @@ fn title_of(
     Ok((!title.is_empty()).then(|| title.chars().take(MAX_MESSAGE).collect()))
 }
 
-/// Records the run of `plan`, with its jobs, and has its object start.
+/// Records the run of a plan, with its jobs, and has its object start.
 async fn start_plan(
     env: &Env,
     db: &Db,
     settings: &Settings,
     req: &Request<'_>,
-    plan: &Plan,
+    checked: &Checked,
     now: u64,
 ) -> Result<u64> {
+    let (plan, warnings) = (&checked.plan, &checked.warnings);
     let limited;
     let plan = match &req.origin.policy {
         Some(policy) => {
@@ -698,7 +825,8 @@ async fn start_plan(
         git_ref: req.git_ref.to_owned(),
         sha: req.sha.to_owned(),
         actor: req.actor.to_owned(),
-        base_ref: (req.event_name == "pull_request").then(|| req.base_ref.to_owned()),
+        base_ref: matches!(req.event_name, "pull_request" | "pull_request_target")
+            .then(|| req.base_ref.to_owned()),
         message: run_message(req.event_name, req.event),
         pull_number: pull_number(req),
         head_ref: pull_number(req).map(|_| req.head_ref.to_owned()),
@@ -708,6 +836,8 @@ async fn start_plan(
         author_login: req.origin.author.to_owned(),
         author_association: req.origin.association.to_owned(),
         gate_status: req.origin.gate,
+        head_sha: req.origin.target.map(|target| target.head_sha.to_owned()),
+        lints: (!warnings.is_empty()).then(|| warnings.join("\n")),
         now,
     };
     let (run, fresh) = match store::insert_run(db, &new).await? {
@@ -749,7 +879,7 @@ async fn start_plan(
         // finished and been purged, and a second start would run it again.
         return Ok(run.id);
     }
-    let start = start_body(req, &run, &rows, plan, title)?;
+    let start = start_body(req, &run, &rows, plan, title, warnings)?;
     post_start(env, run.id, &start).await?;
     Ok(run.id)
 }
@@ -789,6 +919,7 @@ fn start_body(
     rows: &[JobRow],
     plan: &Plan,
     title: Option<String>,
+    warnings: &[String],
 ) -> Result<Start> {
     let jobs = plan
         .jobs
@@ -818,6 +949,7 @@ fn start_body(
             base_ref: req.base_ref.to_owned(),
             concurrency: plan.concurrency.clone(),
             title,
+            warnings: warnings.to_vec(),
         },
         jobs,
         event: req.event.clone(),
@@ -905,6 +1037,8 @@ mod tests {
             gate_at: None,
             gate_check_run_id: None,
             gate_card_dirty: false,
+            head_sha: None,
+            lints: None,
         };
         title_of(&req, &plan, "https://api.github.com", &vars, &run)
     }
@@ -1035,6 +1169,158 @@ mod tests {
         );
         let config = hatchrun_workflow::parse(&yaml).unwrap();
         hatchrun_workflow::compile(&config, "ci", "refs/heads/main").unwrap()
+    }
+
+    /// The plan of a `pull_request_target` workflow with `steps`.
+    fn target_plan(steps: &str) -> Plan {
+        let yaml = format!(
+            "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n{steps}\n\
+             workflows:\n  w:\n    on: {{ pull_request_target: {{}} }}\n    jobs: [t]\n"
+        );
+        let config = hatchrun_workflow::parse(&yaml).unwrap();
+        hatchrun_workflow::compile(&config, "w", "refs/heads/main").unwrap()
+    }
+
+    const HEAD_CHECKOUT: &str = "      - uses: actions/checkout@v4\n        with:\n          \
+         ref: ${{ github.event.pull_request.head.sha }}\n      - run: make test";
+    const INJECTION: &str = "      - run: echo \"${{ github.event.pull_request.title }}\"";
+
+    #[test]
+    fn a_head_checkout_is_a_warning_and_the_plan_still_runs() {
+        let plans = lint_plans(vec![target_plan(HEAD_CHECKOUT)], true);
+        // Nothing is refused: the plan is kept with its finding.
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].warnings.len(), 1);
+        assert!(plans[0].warnings[0].contains("checks out the pull request head"));
+    }
+
+    #[test]
+    fn injection_and_a_checkout_that_may_be_the_head_are_warnings_too() {
+        let maybe =
+            "      - uses: actions/checkout@v4\n        with:\n          ref: ${{ matrix.ref }}";
+        for steps in [INJECTION, maybe] {
+            let plans = lint_plans(vec![target_plan(steps)], true);
+            assert_eq!(plans.len(), 1);
+            assert_eq!(plans[0].warnings.len(), 1, "{steps}");
+        }
+    }
+
+    #[test]
+    fn a_clean_plan_has_no_findings_and_another_event_is_not_read() {
+        let plans = lint_plans(vec![target_plan("      - run: make test")], true);
+        assert_eq!(plans[0].warnings.len(), 0);
+        // A pull_request run that checks out its own head is what that
+        // event is for.
+        let plans = lint_plans(vec![target_plan(HEAD_CHECKOUT)], false);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].warnings.len(), 0);
+    }
+
+    #[test]
+    fn a_refused_target_workflow_is_a_neutral_report_on_the_head() {
+        let check =
+            refused_target_check_run("w", "a closed pull request cannot be approved", "headsha");
+        assert_eq!(check.name, "w / pull_request_target");
+        assert_eq!(check.head_sha, "headsha");
+        assert_eq!(check.conclusion.as_deref(), Some("neutral"));
+        let summary = check.output.unwrap().summary;
+        assert!(summary.contains("needs approval"), "{summary}");
+        assert!(summary.contains("closed pull request"), "{summary}");
+        assert!(summary.contains("did not run"), "{summary}");
+    }
+
+    #[test]
+    fn a_target_workflow_that_did_not_compile_is_reported_on_the_head_under_its_own_name() {
+        let check = invalid_target_check_run("w", &[], "headsha");
+        assert_eq!(check.name, "w / pull_request_target");
+        assert_eq!(check.head_sha, "headsha");
+        assert_eq!(check.conclusion.as_deref(), Some("failure"));
+        assert_ne!(check.name, invalid_workflow_check_run("w", &[], "x").name);
+    }
+
+    #[test]
+    fn the_planners_reports_go_on_the_head_for_a_target_request_only() {
+        let event = serde_json::json!({});
+        let trigger = hatchrun_workflow::Event::Dispatch;
+        let repo = Repo {
+            id: 1,
+            full_name: "o/r".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        let request = |origin| Request {
+            tenant_id: "t",
+            installation_id: 1,
+            repo: &repo,
+            delivery: "d",
+            event_name: "pull_request_target",
+            event: &event,
+            trigger: &trigger,
+            compile_ref: "refs/heads/main",
+            git_ref: "refs/heads/main",
+            sha: "basesha",
+            actor: "a",
+            head_ref: "",
+            base_ref: "",
+            workflow: None,
+            origin,
+        };
+        let target = Origin {
+            target: Some(Target {
+                head_sha: "headsha",
+                refused: None,
+            }),
+            ..Origin::own("a")
+        };
+        assert_eq!(report_sha(&request(target)), "headsha");
+        assert_eq!(report_sha(&request(Origin::own("a"))), "basesha");
+    }
+
+    #[test]
+    fn a_pull_request_target_run_is_for_the_pull_request_its_payload_names() {
+        let event = serde_json::json!({ "number": 7, "pull_request": { "number": 7 } });
+        let trigger = hatchrun_workflow::Event::Dispatch;
+        let repo = Repo {
+            id: 4242,
+            full_name: "octo/widgets".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        let request = |event_name, git_ref| Request {
+            tenant_id: "t",
+            installation_id: 1,
+            repo: &repo,
+            delivery: "d",
+            event_name,
+            event: &event,
+            trigger: &trigger,
+            compile_ref: git_ref,
+            git_ref,
+            sha: "abc",
+            actor: "octocat",
+            head_ref: "feature",
+            base_ref: "main",
+            workflow: None,
+            origin: Origin::own("octocat"),
+        };
+        // The ref is the base branch, so the number comes from the payload.
+        assert_eq!(
+            pull_number(&request("pull_request_target", "refs/heads/main")),
+            Some(7)
+        );
+        assert_eq!(
+            pull_number(&request("pull_request", "refs/pull/9/merge")),
+            Some(9)
+        );
+        assert_eq!(pull_number(&request("push", "refs/heads/main")), None);
+        assert_eq!(
+            run_message(
+                "pull_request_target",
+                &serde_json::json!({ "pull_request": { "title": "Fix" } })
+            )
+            .as_deref(),
+            Some("Fix")
+        );
     }
 
     #[test]
@@ -1182,6 +1468,8 @@ mod tests {
                     author_login: "octocat".into(),
                     author_association: String::new(),
                     gate_status: GateStatus::NotGated,
+                    head_sha: None,
+                    lints: None,
                     now: 1,
                 },
             ))

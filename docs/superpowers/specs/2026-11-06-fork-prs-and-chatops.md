@@ -77,26 +77,94 @@ hatchrun does what GitHub does: the run is trusted (secrets, write token,
 OIDC if granted), the config is read from the base branch head, and the
 workflow's own `if:` and `permissions:` rule. Differences from GitHub:
 
-1. **Static warning.** `hatchrun convert`, `hatchrun validate` and the
-   planner warn on a `pull_request_target` workflow that checks out
-   the PR head. The planner puts the warning in the run summary and in
-   the check run text. It does not block. Rule below.
-2. **Cache scope.** GitHub scopes `pull_request_target` caches to the base
+1. **Warnings.** `hatchrun convert`, `hatchrun validate` and the
+   planner warn on a `pull_request_target` workflow that gets the PR
+   head onto the runner. The planner puts the warnings in the summary of
+   the run's check runs and on the approval card. They never refuse a
+   run. Rules below.
+2. **Approval for forks.** A repository can make every
+   `pull_request_target` run of a fork's pull request wait for a
+   maintainer, through the approval card of the fork runs. Rules below.
+3. **Cache scope.** GitHub scopes `pull_request_target` caches to the base
    branch, so a pwn request can poison `main`'s cache. hatchrun writes a
    `pull_request_target` run's caches to `refs/pull/<n>/target` and reads
    `refs/pull/<n>/target`, the base branch and the default branch. The run
    cannot write where a push to `main` restores from.
-3. **OIDC subject.** `oidc::subject` already maps `pull_request_target` to
+4. **OIDC subject.** `oidc::subject` already maps `pull_request_target` to
    `repo:<repo>:pull_request`, so a cloud trust on
    `repo:<repo>:ref:refs/heads/main` does not accept it. This stays. The
    token carries `event_name`, which trusts can pin.
 
-The detector flags `actions/checkout` with a `ref` or `repository` input
-containing `github.event.pull_request.head`, `github.head_ref` or
-`refs/pull/`, and `run:` lines that call `gh pr checkout`. It is a
-heuristic, so false negatives are possible. The repository setting
-`pull_request_target_head_checkout` is `warn` (default) or `block`, which
-fails the run at planning.
+**What the lints read.** The planner reads the plan of each
+`pull_request_target` workflow (commands and called workflows are
+expanded in it) and reports:
+
+- a *head checkout*: a job is tainted when anything in it (its env, a
+  step's env, `with:`, a script, its container) reads the PR head, which
+  is a path of the `github` context at or above
+  `github.event.pull_request.head`, `github.head_ref`,
+  `github.event.pull_request.merge_commit_sha`, `GITHUB_HEAD_REF` or a
+  `refs/pull/<n>/head|merge` ref. A computed index in a path matches any
+  name, and reading a parent such as `github.event` counts. An `if:`, a
+  `concurrency:` or a `name:` only compares or labels and does not count.
+  A job that reads an output of a tainted job through `needs` is tainted.
+  A tainted job that has a checkout, or a script that runs `git fetch`,
+  `checkout`, `clone`, `pull`, `switch` or `worktree`, `gh pr checkout`
+  or `gh repo clone`, is reported. So is a script that fetches code and
+  finds the pull request at run time (`github.event.number`,
+  `github.event.pull_request.number`, `GITHUB_EVENT_PATH`, `gh api` of
+  `pulls`), names a `refs/pull/` refspec (split and wildcard ones too) or
+  downloads a tarball, zipball or archive, and a checkout whose `ref` or
+  `repository` is an expression that is not provably the base
+  (`github.sha`, `github.base_ref`, `github.event.pull_request.base.*`, a
+  literal);
+- *script injection*: an untrusted field (see below) interpolated into a
+  `run:` script or an `actions/github-script` script.
+
+These are warnings, never refusals. A script can compute the head at run
+time in ways no reading of the plan finds (a lookup through the API, a
+value passed between steps), and a guard such as an `if:` on the head
+repository can make a finding a false alarm. What holds is the approval.
+
+**The setting `pull_request_target_head_checkout`** is `warn` (default)
+or `approve`:
+
+- `warn`: the `pull_request_target` run starts at once, with the
+  findings in the summary of its check runs.
+- `approve`: the `pull_request_target` run of a pull request **from a
+  fork** waits for approval whoever the author is, through the card of
+  "Approval flow" (the same check run, button, app card, write-access
+  check, expiry and supersede on a new push). The card is on the pull
+  request's head commit and says the run has the repository's secrets,
+  lists the findings, and notes that the base branch's workflow decides
+  whether the pull request's code runs. The run's own commit is the base
+  branch's; the approval, the card and the supersede are by the head,
+  stored on the run as `head_sha`. A pull request from the same
+  repository never waits. A workflow that cannot be asked for approval
+  (the pull request is closed, or the repository is over its caps) is
+  not run unapproved: a neutral check run on the pull request's head,
+  named `<workflow> / pull_request_target`, says it needs approval and
+  why it did not run. A delivery older than what is recorded starts
+  nothing. A newer commit ends the waiting runs of older ones before
+  anything is counted, and the fork run and the `pull_request_target`
+  run of one delivery share a group and count once against the caps. The
+  caps of fork runs (waiting runs per repository, deferred runs) apply;
+  the per-author cap and the setting `fork_runs` do not, because the run
+  is the base repository's own workflow. A rerun follows the policy as it
+  is now: under `approve`, a fork's run that was approved reruns, and one
+  whose approval ended, or that never had one (made under `warn`), is
+  refused with "This pull_request_target run was not approved; push a new
+  commit to ask again."
+- Moving from `approve` to `warn` lets more run, so it needs the admin's
+  access as GitHub says now, like the other loosening changes.
+
+The base branch's config is read by the branch name to see whether it
+has a `pull_request_target` workflow; a config that is missing, does not
+parse or has none starts nothing and says nothing (the push that made it
+was told), and that is the whole cost of a repository without one. For
+one that has, the branch's head commit is resolved and the config is read
+again at that commit, so the plan and `GITHUB_SHA` agree; the policy is
+read then.
 
 `workflow_run` has the same shape: it runs trusted from the default
 branch and can download artifacts a fork run made. The planner applies
@@ -166,7 +234,7 @@ write, otherwise defaults) holds:
 | `fork_approval` | `first_timers`, `first_time_contributors`, `all_outside` | `first_time_contributors` |
 | `fork_max_running` | 1 to 10 | 2 |
 | `fork_timeout_minutes` | 5 to 60 | 30 |
-| `pull_request_target_head_checkout` | `warn`, `block` | `warn` |
+| `pull_request_target_head_checkout` | `warn`, `approve` | `warn` |
 
 The three approval levels use GitHub's `author_association` values:
 
@@ -664,10 +732,11 @@ Fewer, larger PRs with a deploy order, as every merge to main releases.
 **PR 2: pull_request_target and the lints**
 (`feat(ci): run pull_request_target workflows`)
 
-- `Event::PullRequestTarget`, base-sha config read, `refs/pull/<n>/target`
-  cache scope, head-checkout and script-injection lints in the planner,
-  `validate` and `convert`. The converter stops listing
-  `pull_request_target` as GitHub-only.
+- `Event::PullRequestTarget`, base branch config read, `refs/pull/<n>/target`
+  cache scope, head-checkout and script-injection lints (warnings) in the
+  planner, `validate` and `convert`, the `approve` setting and its use of
+  the approval card for a fork's `pull_request_target` runs. The
+  converter stops listing `pull_request_target` as GitHub-only.
 - No App change. Can ship right after PR 1.
 
 **PR 3: issues, issue_comment and on.command**
@@ -713,5 +782,8 @@ Owner answers of 2026-11-06, applied above.
 5. Fork runs get `vars`.
 6. The fork token keeps `pull_requests: read`.
 7. A built-in `/approve-run` command exists (below).
-8. A PR-head checkout in `pull_request_target` warns by default, with a
-   repository setting to block.
+8. A PR-head checkout in `pull_request_target` warns by default. A
+   repository setting makes every `pull_request_target` run of a fork's
+   pull request wait for approval instead. The lints never refuse a run:
+   reading a plan cannot find every way to get the head onto the runner,
+   so the approval is what holds, and the findings are for the approver.

@@ -19,12 +19,16 @@
 //! CI account, at `cache/<tenant>/<repo id>/<random>`. The rows that
 //! say what an object is live in `ci_cache_entries`.
 //!
-//! The scope of an entry is the git ref of the run that saved it. A
-//! run writes to its own ref and reads its own, then the default
-//! branch's, as on GitHub, so a topic branch or a pull request can use
-//! what `main` saved and never put an entry where `main` would restore
-//! it. The tenant, repository and ref come from the job token's run,
-//! never from a request.
+//! The scope of an entry is the git ref of the run that saved it, with
+//! one exception: a `pull_request_target` run has the base branch as its
+//! ref, and GitHub would save its entries there, where a push to the
+//! base branch restores them. A run of that event, which holds the base
+//! repository's secrets and may run code a pull request brought, saves
+//! into `refs/pull/<n>/target` instead. A run writes to its own scope and
+//! reads its own, then the base and default branches', as on GitHub, so
+//! a topic branch or a pull request can use what `main` saved and never
+//! put an entry where `main` would restore it. The tenant, repository
+//! and scope come from the job token's run, never from a request.
 //!
 //! A repository keeps at most [`MAX_REPO_BYTES`]: when a save takes it
 //! past that, the least recently used entries are deleted.
@@ -117,34 +121,57 @@ fn pull_scope(number: u64) -> String {
     format!("refs/pull/{number}/merge")
 }
 
-/// Whether a run may save into `scope`. A run that may write the base
-/// scopes (a trusted run) saves into its own ref; one that may not (a
-/// fork run) saves only into `refs/pull/<n>/merge` of its own pull
-/// request, whatever its row's ref says.
-pub(crate) fn may_save(run: &RunRow) -> bool {
-    if run.trust.allows(Capability::CacheWriteBase) {
-        return true;
+/// The scope a `pull_request_target` run on pull request `number` saves
+/// to. It is neither the pull request's merge scope, which the fork's
+/// own runs write, nor the base branch's.
+fn target_scope(number: u64) -> String {
+    format!("refs/pull/{number}/target")
+}
+
+/// The scope the run saves into, `None` when it may save nowhere. The
+/// run's own row decides, never a request:
+///
+/// - a `pull_request_target` run saves into `refs/pull/<n>/target`,
+///   whatever its ref (the base branch) says, so it never writes where
+///   the base branch restores from;
+/// - another run that may write the base scopes (a trusted run) saves
+///   into its own ref;
+/// - a run that may not (a fork run) saves only into
+///   `refs/pull/<n>/merge` of its own pull request.
+pub(crate) fn write_scope(run: &RunRow) -> Option<String> {
+    if run.event == "pull_request_target" {
+        return run.pull_number.map(target_scope);
     }
-    run.pull_number
-        .is_some_and(|number| run.git_ref == pull_scope(number))
+    if run.trust.allows(Capability::CacheWriteBase) {
+        return Some(run.git_ref.clone());
+    }
+    let number = run.pull_number?;
+    (run.git_ref == pull_scope(number)).then(|| run.git_ref.clone())
+}
+
+/// Whether a run may save at all (see [`write_scope`]).
+pub(crate) fn may_save(run: &RunRow) -> bool {
+    write_scope(run).is_some()
 }
 
 /// The scopes a claimed job saves to and restores from, the first the
-/// one it saves to. For a fork run the first must be its pull request's
-/// merge ref; the rest are the base and default branches it only reads.
+/// one it saves to (see [`write_scope`]); the rest are the base and
+/// default branches it only reads.
 ///
 /// # Errors
 ///
-/// A fork run whose ref is not its pull request's merge ref.
+/// A run that may save nowhere: a fork run whose ref is not its pull
+/// request's merge ref, or a `pull_request_target` run with no pull
+/// request.
 pub(crate) fn run_scopes(run: &RunRow, default_branch: &str) -> Result<Vec<String>, String> {
-    if !may_save(run) {
+    let Some(scope) = write_scope(run) else {
         return Err(format!(
-            "a fork run is on {}, not its pull request's merge ref",
+            "the run on {} has no scope it may save into",
             run.git_ref
         ));
-    }
+    };
     Ok(read_scopes(
-        &run.git_ref,
+        &scope,
         run.base_ref.as_deref(),
         Some(default_branch),
     ))
@@ -156,19 +183,27 @@ struct Context<'a> {
     db: Db,
     run: RunRow,
     bucket: &'a str,
+    /// The scope the run saves into, from its own row (see
+    /// [`write_scope`]); `None` when it saves nowhere.
+    write: Option<String>,
     /// The scopes the job reads, fixed when it was claimed.
     scopes: Vec<String>,
 }
 
 impl Context<'_> {
-    /// Where the run writes, and where a call to an upload looks.
-    fn owner(&self) -> CacheOwner<'_> {
-        CacheOwner {
+    /// Where the run writes, and where a call to an upload looks. A run
+    /// that may save nowhere has no owner, and no call reaches an
+    /// upload of it.
+    fn owner(&self) -> std::result::Result<CacheOwner<'_>, Refusal> {
+        Ok(CacheOwner {
             trust: self.run.trust,
             tenant_id: &self.run.tenant_id,
             repo_id: self.run.repo_id,
-            scope: &self.run.git_ref,
-        }
+            scope: self
+                .write
+                .as_deref()
+                .ok_or_else(|| Refusal::new(403, NO_SAVE_SCOPE))?,
+        })
     }
 }
 
@@ -231,6 +266,7 @@ async fn serve(req: &mut Request, env: &Env, settings: &Settings, claims: Claims
     let ctx = Context {
         settings,
         db,
+        write: write_scope(&run),
         run,
         bucket: &settings.artifacts_bucket,
         scopes,
@@ -258,6 +294,8 @@ fn check_entry(version: &str, key: &str) -> std::result::Result<(), Refusal> {
 const FORK_SCOPE: &str = "a fork run saves only into its pull request's scope";
 /// What a fork run is told when the fork share of the cache is full.
 const FORK_FULL: &str = "the cache share for fork pull requests is full";
+/// What a run that may save into no scope is told.
+const NO_SAVE_SCOPE: &str = "the run has no scope it may save into";
 /// What a job with no scopes is told: it has no cache.
 const NO_SCOPES: &str = "the job has no cache scopes";
 
@@ -348,7 +386,7 @@ async fn start(ctx: &Context<'_>, request: UploadRequest) -> Answer {
     }
     // Saves the upload when the entry exists; finalizing still settles
     // a race between two jobs.
-    if store::cache_entry(&ctx.db, ctx.owner(), &request.version, &request.key)
+    if store::cache_entry(&ctx.db, ctx.owner()?, &request.version, &request.key)
         .await?
         .is_some()
     {
@@ -368,7 +406,7 @@ async fn start(ctx: &Context<'_>, request: UploadRequest) -> Answer {
     .map_err(aws_failure("CreateMultipartUpload"))?;
     let row = store::start_cache_entry(
         &ctx.db,
-        ctx.owner(),
+        ctx.owner()?,
         &request.version,
         &request.key,
         &key,
@@ -386,7 +424,7 @@ async fn start(ctx: &Context<'_>, request: UploadRequest) -> Answer {
 
 /// The unfinished upload `id` of the job's repository and ref.
 async fn pending(ctx: &Context<'_>, id: &str) -> std::result::Result<CacheRow, Refusal> {
-    let row = store::pending_cache_entry(&ctx.db, id_of(id)?, ctx.owner())
+    let row = store::pending_cache_entry(&ctx.db, id_of(id)?, ctx.owner()?)
         .await?
         .ok_or_else(|| Refusal::new(404, "no such upload"))?;
     // The row's key must be one this repository would have made.
@@ -457,12 +495,12 @@ async fn complete(ctx: &Context<'_>, id: &str, request: CompleteRequest) -> Answ
                 console_warn!("cache: clean up upload {}: {}", row.id, err.message);
             }
         }
-        store::drop_pending_cache_entry(&ctx.db, row.id, ctx.owner()).await?;
+        store::drop_pending_cache_entry(&ctx.db, row.id, ctx.owner()?).await?;
         return Err(Refusal::new(409, "another job saved the entry first"));
     }
     // The agent does not send the size, and S3 knows it.
     let size = object_size(ctx, &credentials, &row.object_key).await?;
-    let done = store::finalize_cache_entry(&ctx.db, row.id, ctx.owner(), size, now_ms()).await?;
+    let done = store::finalize_cache_entry(&ctx.db, row.id, ctx.owner()?, size, now_ms()).await?;
     match done {
         Finalized::Done => {
             // The entry is saved; a failure to trim must not fail it.
@@ -477,7 +515,7 @@ async fn complete(ctx: &Context<'_>, id: &str, request: CompleteRequest) -> Answ
             if let Err(err) = signed(ctx, &credentials, s3::delete_object(&url)).await {
                 console_warn!("cache: delete {}: {}", row.id, err.message);
             }
-            store::drop_pending_cache_entry(&ctx.db, row.id, ctx.owner()).await?;
+            store::drop_pending_cache_entry(&ctx.db, row.id, ctx.owner()?).await?;
             Err(Refusal::new(409, "another job saved the entry first"))
         }
     }
@@ -498,7 +536,7 @@ async fn abort(ctx: &Context<'_>, id: &str) -> Answer {
             s3::ok(&response).map_err(aws_failure("AbortMultipartUpload"))?;
         }
     }
-    store::drop_pending_cache_entry(&ctx.db, row.id, ctx.owner()).await?;
+    store::drop_pending_cache_entry(&ctx.db, row.id, ctx.owner()?).await?;
     Ok(Response::empty()?.with_status(204))
 }
 
@@ -652,9 +690,13 @@ mod tests {
     use crate::trust::Trust;
 
     fn run(trust: Trust, git_ref: &str, pull_number: Option<u64>) -> RunRow {
+        run_of("pull_request", trust, git_ref, pull_number)
+    }
+
+    fn run_of(event: &str, trust: Trust, git_ref: &str, pull_number: Option<u64>) -> RunRow {
         serde_json::from_value(serde_json::json!({
             "id": 1, "run_number": 1, "run_attempt": 1, "tenant_id": "t1",
-            "repo_id": 7, "workflow": "ci", "delivery": "d", "event": "pull_request",
+            "repo_id": 7, "workflow": "ci", "delivery": "d", "event": event,
             "git_ref": git_ref, "sha": "abc", "actor": "a", "base_ref": "release",
             "status": "queued", "conclusion": null, "created_at": 0, "completed_at": null,
             "retention_days": 30, "pull_number": pull_number,
@@ -684,6 +726,53 @@ mod tests {
     fn a_trusted_run_saves_into_its_own_ref() {
         assert!(may_save(&run(Trust::Trusted, "refs/heads/main", None)));
         assert!(may_save(&run(Trust::Trusted, "refs/pull/4/merge", Some(4))));
+    }
+
+    /// A `pull_request_target` run: trusted, on the base branch.
+    fn target(number: Option<u64>) -> RunRow {
+        run_of(
+            "pull_request_target",
+            Trust::Trusted,
+            "refs/heads/release",
+            number,
+        )
+    }
+
+    #[test]
+    fn a_pull_request_target_run_saves_into_its_own_target_scope_never_the_base() {
+        // The row's ref is the base branch, which a push to it restores
+        // from; the run saves under the pull request's target scope.
+        let run = target(Some(4));
+        assert_eq!(write_scope(&run).as_deref(), Some("refs/pull/4/target"));
+        assert_eq!(
+            run_scopes(&run, "main").unwrap(),
+            [
+                "refs/pull/4/target",
+                "refs/heads/release",
+                "refs/heads/main"
+            ]
+        );
+        for scope in run_scopes(&run, "main").unwrap().iter().skip(1) {
+            assert_ne!(Some(scope.clone()), write_scope(&run));
+        }
+        // Never the fork's merge scope either: a fork run and a target run
+        // of one pull request write different scopes.
+        let fork = run_of("pull_request", Trust::Fork, "refs/pull/4/merge", Some(4));
+        assert_ne!(write_scope(&run), write_scope(&fork));
+        assert_eq!(write_scope(&fork).as_deref(), Some("refs/pull/4/merge"));
+        // Other pull requests have their own.
+        assert_eq!(
+            write_scope(&target(Some(5))).as_deref(),
+            Some("refs/pull/5/target")
+        );
+    }
+
+    #[test]
+    fn a_pull_request_target_run_without_a_pull_request_saves_nowhere() {
+        let run = target(None);
+        assert_eq!(write_scope(&run), None);
+        assert!(!may_save(&run));
+        assert!(run_scopes(&run, "main").is_err());
     }
 
     #[test]

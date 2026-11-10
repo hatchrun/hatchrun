@@ -48,6 +48,41 @@ fn validate_ok_and_error() {
 }
 
 #[test]
+fn validate_warns_about_a_pull_request_target_pwn_request_and_still_passes() {
+    let file = scratch("pwn.yml");
+    std::fs::write(
+        &file,
+        "jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: echo \"${{ github.event.pull_request.title }}\"
+workflows:
+  w:
+    on: { pull_request_target: {} }
+    jobs: [t]
+",
+    )
+    .unwrap();
+    let out = run(hatchrun().arg("validate").arg(&file));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("warning: "), "{stderr}");
+    assert!(
+        stderr.contains("checks out the pull request head"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("github.event.pull_request.title"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn validate_missing_file_fails() {
     let out = run(hatchrun().arg("validate").arg(scratch("nope.yml")));
     assert_eq!(out.status.code(), Some(1));
