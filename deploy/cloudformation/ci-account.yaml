@@ -214,7 +214,7 @@ Resources:
               Encrypted: true
               DeleteOnTermination: true
 
-  # What hatchrun-ci may do here: launch Marketplace images from this
+  # What hatchrun-ci may do here: launch the runner images from this
   # template into this VPC and end the instances it tagged. There is no
   # iam:PassRole, so no instance can get a role. hatchrun-ci signs a
   # short-lived token with subject tenant:hatchrun-ci and trades it for
@@ -276,8 +276,22 @@ Resources:
                 Condition:
                   Bool:
                     ec2:Encrypted: "true"
-              # Marketplace images, which the account subscribes to.
-              - Sid: LaunchImages
+              # The runner images, built by hatchrun/images in this
+              # account. The accountless image ARN and the
+              # aws-marketplace owner applied while the images came from
+              # AWS Marketplace.
+              - Sid: LaunchOwnImages
+                Effect: Allow
+                Action: [ec2:RunInstances, ec2:CreateFleet]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:image/*"
+                Condition:
+                  StringEquals:
+                    ec2:Owner: !Ref AWS::AccountId
+              # Transition: releases registered before the images build
+              # stopped submitting to AWS Marketplace are still copies
+              # Marketplace owns. Remove this statement once the images
+              # table names an AMI this account owns.
+              - Sid: LaunchMarketplaceImages
                 Effect: Allow
                 Action: [ec2:RunInstances, ec2:CreateFleet]
                 Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
