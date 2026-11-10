@@ -1,5 +1,7 @@
 # hatchrun
 
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/16537/badge)](https://www.bestpractices.dev/projects/16537)
+
 hatchrun is a CI: workflows run on a fresh EC2 instance per job, in your
 own AWS account.
 
