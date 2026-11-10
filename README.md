@@ -20,6 +20,17 @@ This repository holds:
   developers run locally to convert and validate workflow files,
   released as its own tarball.
 
+## Documentation
+
+The [reference](docs/README.md) covers the interfaces:
+
+- [command line](docs/cli.md): `hatchrun validate` and
+  `hatchrun convert`;
+- [workflow configuration](docs/config.md): `.hatchrun/config.yml`,
+  its jobs, workflows, triggers, steps and expressions;
+- [HTTP API](docs/http-api.md): the Worker routes, the app's JSON API
+  and the `/api/ci/` run API.
+
 ## Agent
 
 `hatchrun-agent` is a static binary started by
@@ -235,6 +246,12 @@ when it finds a secret or a Cloudflare or AWS account ID. CI scans the
 full history with the same rules. Pass account IDs through CI secrets
 or variables; a finding that is not a secret goes in `.gitleaksignore`
 by fingerprint, with a comment saying why.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up, build, test
+and send a change. Report security problems privately, as described in
+[SECURITY.md](SECURITY.md), not in a public issue.
 
 ## Licence
 
