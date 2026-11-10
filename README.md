@@ -32,7 +32,7 @@ the unit powers the instance off.
 
 The agent starts only on instances launched for a job: user data with
 `"mode": "ci"`. `hatchrun-launch.service` checks that first, so an instance
-launched any other way, by hand or by the AWS Marketplace scan, boots
+launched any other way, by hand, boots
 normally and stays up.
 
 ### Installing
