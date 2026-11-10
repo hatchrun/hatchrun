@@ -25,11 +25,12 @@ use worker::{
 };
 
 use crate::chain::{self, Change};
+use crate::chatops;
 use crate::checks::{JobView, Outbox, conclusion_word, details_url, render};
 use crate::concurrency;
 use crate::env::Settings;
 use crate::github::{
-    Capped, CheckRun, check_run_id, create_check_run, revoke_token, update_check_run,
+    self, Capped, CheckRun, check_run_id, create_check_run, revoke_token, update_check_run,
 };
 use crate::graph::{Action, Graph, State as NodeState};
 use crate::launches::{self, LaunchMessage};
@@ -1025,6 +1026,11 @@ impl<'a> Cx<'a> {
                 conclusion: pending.conclusion.as_deref(),
             })
             .collect();
+        for change in &changes {
+            if let ("completed", Some(conclusion)) = (change.action, change.conclusion) {
+                self.react_to_command(db, &tokens, info, conclusion).await;
+            }
+        }
         let ids = chain::fire(
             &chain::Services {
                 env: &self.env,
@@ -1042,6 +1048,54 @@ impl<'a> Cx<'a> {
             worker::console_log!("run {}: workflow_run started runs {ids:?}", info.run_id);
         }
         Ok(())
+    }
+
+    /// Leaves the result of a run that a chat command started on the
+    /// command's comment, as the App: `+1` or `-1`, or `rocket` or
+    /// `confused` for a command that asks for those (see
+    /// [`chatops::finished`]). A run no command started has none, and a
+    /// failure is only logged: it must not hold up the `workflow_run`
+    /// changes sent next, and GitHub answers a reaction the App already
+    /// left with 200, so a change sent again reacts again harmlessly.
+    async fn react_to_command(
+        &self,
+        db: &Db,
+        tokens: &Tokens<'_, Kv, App, Counted>,
+        info: &RunInfo,
+        conclusion: &str,
+    ) {
+        let (comment_id, rocket) = match store::run_command(db, info.run_id).await {
+            Ok(Some(command)) => command,
+            Ok(None) => return,
+            Err(err) => {
+                worker::console_error!("run {}: the command's comment: {err}", info.run_id);
+                return;
+            }
+        };
+        let content = chatops::finished(rocket, conclusion);
+        let sent = tokens
+            .send(info.installation_id, |token| {
+                github::add_reaction(
+                    &self.settings.github_api,
+                    &info.repo.full_name,
+                    comment_id,
+                    token,
+                    content,
+                )
+            })
+            .await;
+        match sent {
+            Ok(response) if response.ok() => {}
+            Ok(response) => worker::console_warn!(
+                "run {}: reaction {content} on comment {comment_id}: GitHub answered {}",
+                info.run_id,
+                response.status
+            ),
+            Err(err) => worker::console_warn!(
+                "run {}: reaction {content} on comment {comment_id}: {err}",
+                info.run_id
+            ),
+        }
     }
 
     /// Gives the graph the variables of the run's scope when the job
@@ -1787,7 +1841,7 @@ impl<'a> Cx<'a> {
                 run_title: run.info.title.as_deref(),
                 warnings: &run.info.warnings,
                 node,
-                head_sha: &run.info.sha,
+                head_sha: run.info.check_sha.as_deref().unwrap_or(&run.info.sha),
                 details_url: details_url(
                     &self.settings.app_url,
                     &run.info.repo.full_name,

@@ -352,6 +352,7 @@ mod tests {
             concurrency: None,
             title: None,
             warnings: Vec::new(),
+            check_sha: None,
         }
     }
 

@@ -4,8 +4,10 @@
 
 //! Picks the workflows a GitHub event starts.
 
+use std::collections::BTreeSet;
+
 use hatchrun_workflow::{
-    Diagnostic, Event, Library, Plan, compile_with, config_errors, parse, triggered,
+    CommandOptions, Diagnostic, Event, Library, Plan, compile_with, config_errors, parse, triggered,
 };
 
 /// A triggered workflow that did not compile.
@@ -157,6 +159,86 @@ pub fn has_pull_request_target(source: &str) -> bool {
     })
 }
 
+/// Whether any workflow of `source` listens to `event`, so the event is
+/// worth the calls that plan it. False when the config does not parse.
+#[must_use]
+pub fn listens(source: &str, event: &Event) -> bool {
+    parse(source).is_ok_and(|config| config.workflows.values().any(|wf| triggered(&wf.on, event)))
+}
+
+/// The names of the chat commands any workflow of `source` defines, for
+/// the comment parser to look for. Empty when the config does not parse.
+#[must_use]
+pub fn command_names(source: &str) -> BTreeSet<String> {
+    let Ok(config) = parse(source) else {
+        return BTreeSet::new();
+    };
+    config
+        .workflows
+        .values()
+        .filter_map(|wf| wf.on.command.as_ref())
+        .flat_map(|commands| commands.iter().map(|(name, _)| name.to_owned()))
+        .collect()
+}
+
+/// A workflow that defines a chat command, with the command's options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandWorkflow {
+    /// The workflow's name.
+    pub workflow: String,
+    /// The command's permission, places, sha rule and reaction.
+    pub options: CommandOptions,
+}
+
+/// The workflows of `source` that define the command `name` for a
+/// comment on a pull request (`on_pull_request`) or on a plain issue, in
+/// workflow name order. Each decides alone who may run it, so the caller
+/// checks each one's options.
+#[must_use]
+pub fn command_workflows(source: &str, name: &str, on_pull_request: bool) -> Vec<CommandWorkflow> {
+    let Ok(config) = parse(source) else {
+        return Vec::new();
+    };
+    let event = Event::Command {
+        name: name.to_owned(),
+        on_pull_request,
+    };
+    config
+        .workflows
+        .iter()
+        .filter(|(_, wf)| triggered(&wf.on, &event))
+        .filter_map(|(workflow, wf)| {
+            Some(CommandWorkflow {
+                workflow: workflow.clone(),
+                options: wf.on.command_options(name)?.clone(),
+            })
+        })
+        .collect()
+}
+
+/// What the planner finds in each of `plans`, workflows of `source`:
+/// the findings of [`hatchrun_workflow::workflow_lints`] for the
+/// workflow's own triggers, one line each.
+#[must_use]
+pub fn workflow_findings(source: &str, plans: &[Plan]) -> Vec<Vec<String>> {
+    let config = parse(source).ok();
+    plans
+        .iter()
+        .map(|plan| {
+            config
+                .as_ref()
+                .and_then(|config| config.workflows.get(&plan.workflow))
+                .map(|wf| {
+                    hatchrun_workflow::workflow_lints(plan, &wf.on)
+                        .iter()
+                        .map(hatchrun_workflow::Lint::text)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 /// Every `(workflow, cron)` pair of `on: schedule`, in workflow name
 /// order. Empty when the config does not parse.
 #[must_use]
@@ -232,6 +314,102 @@ workflows:
         ));
         // A config that cannot be read has none to run.
         assert!(!has_pull_request_target("not: [valid"));
+    }
+
+    const CHAT: &str = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  retest:
+    on:
+      command:
+        retest: {}
+    jobs: [t]
+  deploy:
+    on:
+      command:
+        deploy: { permission: maintain, in: [pull_request, issue] }
+        retest: { permission: admin }
+    jobs: [t]
+  triage:
+    on: { issue_comment: { types: [created] } }
+    jobs: [t]
+";
+
+    #[test]
+    fn the_commands_of_every_workflow_are_known() {
+        let names: Vec<String> = command_names(CHAT).into_iter().collect();
+        assert_eq!(names, ["deploy", "retest"]);
+        assert!(command_names("not: [valid").is_empty());
+        assert!(command_names(CONFIG).is_empty());
+    }
+
+    #[test]
+    fn a_command_finds_the_workflows_that_define_it_for_the_place() {
+        let on_pr = command_workflows(CHAT, "retest", true);
+        let names: Vec<&str> = on_pr.iter().map(|c| c.workflow.as_str()).collect();
+        assert_eq!(names, ["deploy", "retest"]);
+        // Each workflow keeps its own options.
+        assert_eq!(
+            on_pr[0].options.permission,
+            hatchrun_workflow::CommandPermission::Admin
+        );
+        assert_eq!(
+            on_pr[1].options.permission,
+            hatchrun_workflow::CommandPermission::Write
+        );
+        // `deploy` allows issues, `retest` does not.
+        assert_eq!(command_workflows(CHAT, "deploy", false).len(), 1);
+        assert_eq!(command_workflows(CHAT, "retest", false).len(), 0);
+        assert_eq!(command_workflows(CHAT, "nope", true).len(), 0);
+    }
+
+    #[test]
+    fn an_event_is_listened_to_by_a_workflow_that_names_it() {
+        let comment = |action: &str| Event::IssueComment {
+            action: action.into(),
+        };
+        assert!(listens(CHAT, &comment("created")));
+        assert!(!listens(CHAT, &comment("edited")));
+        assert!(!listens(
+            CHAT,
+            &Event::Issues {
+                action: "opened".into()
+            }
+        ));
+        assert!(!listens("not: [valid", &comment("created")));
+    }
+
+    #[test]
+    fn a_workflows_findings_use_its_own_triggers() {
+        let config = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: 'echo ${{ github.event.comment.body }}' }] }
+workflows:
+  talk:
+    on: { issue_comment: {} }
+    jobs: [t]
+  quiet:
+    on: { push: {} }
+    jobs: [t]
+";
+        let event = Event::IssueComment {
+            action: "created".into(),
+        };
+        let Selected::Plans { plans, .. } = select(config, &event, "refs/heads/main") else {
+            panic!("config is unusable");
+        };
+        assert_eq!(plans.len(), 1);
+        let found = workflow_findings(config, &plans);
+        assert!(!found[0].is_empty(), "{found:?}");
+        assert!(
+            found[0].iter().any(|line| line.contains("comment")),
+            "{found:?}"
+        );
+        assert_eq!(
+            workflow_findings("not: [valid", &plans),
+            [Vec::<String>::new()]
+        );
     }
 
     #[test]

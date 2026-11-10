@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use hatchrun_workflow::{MERGE_GROUP_TYPES, RELEASE_TYPES};
+use hatchrun_workflow::{ISSUE_COMMENT_TYPES, ISSUES_TYPES, MERGE_GROUP_TYPES, RELEASE_TYPES};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -162,6 +162,62 @@ pub struct RepositoryDispatch {
     pub payload: Value,
 }
 
+/// Activity on an issue, or on a pull request seen as an issue (labels,
+/// assignees, a lock).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issues {
+    /// The App installation the delivery came through.
+    pub installation_id: u64,
+    /// The repository.
+    pub repo: Repo,
+    /// The activity type, such as `opened`.
+    pub action: String,
+    /// The issue's number.
+    pub number: u64,
+    /// The login of the user behind the activity.
+    pub actor: String,
+    /// Whether that user is a bot (`sender.type` is `Bot`).
+    pub actor_is_bot: bool,
+    /// Whether the issue is a pull request.
+    pub is_pull_request: bool,
+    /// The id of the GitHub App the issue was made through, when it was
+    /// made through one.
+    pub via_app: Option<u64>,
+    /// The delivery body.
+    pub payload: Value,
+}
+
+/// A comment on an issue or on a pull request's conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueComment {
+    /// The App installation the delivery came through.
+    pub installation_id: u64,
+    /// The repository.
+    pub repo: Repo,
+    /// `created`, `edited` or `deleted`.
+    pub action: String,
+    /// The number of the issue or pull request.
+    pub number: u64,
+    /// The login of the user who wrote or changed the comment.
+    pub actor: String,
+    /// Whether that user is a bot (`sender.type` is `Bot`).
+    pub actor_is_bot: bool,
+    /// Whether the comment is on a pull request.
+    pub is_pull_request: bool,
+    /// The comment's id.
+    pub comment_id: u64,
+    /// The comment's text.
+    pub body: String,
+    /// GitHub's `author_association` of the comment's author; empty
+    /// when the delivery has none.
+    pub author_association: String,
+    /// The id of the GitHub App the comment was made through, when it
+    /// was made through one.
+    pub via_app: Option<u64>,
+    /// The delivery body.
+    pub payload: Value,
+}
+
 /// A request to run a job again, from the check run's button.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rerequested {
@@ -203,6 +259,10 @@ pub enum Trigger {
     MergeGroup(MergeGroup),
     /// A repository dispatch request.
     RepositoryDispatch(RepositoryDispatch),
+    /// Activity on an issue.
+    Issues(Issues),
+    /// A comment on an issue or a pull request.
+    IssueComment(IssueComment),
     /// A re-run of one job.
     Rerequested(Rerequested),
     /// A maintainer's click on "Approve and run".
@@ -246,6 +306,58 @@ struct Installation {
 #[derive(Deserialize)]
 struct Sender {
     login: String,
+}
+
+/// The user behind a delivery, with the kind of account.
+#[derive(Deserialize)]
+struct Actor {
+    login: String,
+    #[serde(default)]
+    r#type: String,
+}
+
+/// The GitHub App an issue or a comment was made through.
+#[derive(Deserialize)]
+struct ViaApp {
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct IssuesBody {
+    action: String,
+    issue: IssueInfo,
+    sender: Actor,
+    repository: Repo,
+}
+
+#[derive(Deserialize)]
+struct IssueInfo {
+    number: u64,
+    /// Present for an issue that is a pull request.
+    #[serde(default)]
+    pull_request: Option<Value>,
+    #[serde(default)]
+    performed_via_github_app: Option<ViaApp>,
+}
+
+#[derive(Deserialize)]
+struct IssueCommentBody {
+    action: String,
+    issue: IssueInfo,
+    comment: CommentInfo,
+    sender: Actor,
+    repository: Repo,
+}
+
+#[derive(Deserialize)]
+struct CommentInfo {
+    id: u64,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    author_association: String,
+    #[serde(default)]
+    performed_via_github_app: Option<ViaApp>,
 }
 
 #[derive(Deserialize)]
@@ -437,6 +549,45 @@ fn repository_dispatch(installation_id: u64, payload: Value) -> Result<Trigger, 
     }))
 }
 
+fn issues(installation_id: u64, payload: Value) -> Result<Trigger, serde_json::Error> {
+    let i = IssuesBody::deserialize(&payload)?;
+    if !ISSUES_TYPES.contains(&i.action.as_str()) {
+        return Ok(ignored("issues action is not used"));
+    }
+    Ok(Trigger::Issues(Issues {
+        installation_id,
+        repo: i.repository,
+        action: i.action,
+        number: i.issue.number,
+        actor_is_bot: i.sender.r#type == "Bot",
+        actor: i.sender.login,
+        is_pull_request: i.issue.pull_request.is_some(),
+        via_app: i.issue.performed_via_github_app.map(|app| app.id),
+        payload,
+    }))
+}
+
+fn issue_comment(installation_id: u64, payload: Value) -> Result<Trigger, serde_json::Error> {
+    let c = IssueCommentBody::deserialize(&payload)?;
+    if !ISSUE_COMMENT_TYPES.contains(&c.action.as_str()) {
+        return Ok(ignored("issue_comment action is not used"));
+    }
+    Ok(Trigger::IssueComment(IssueComment {
+        installation_id,
+        repo: c.repository,
+        action: c.action,
+        number: c.issue.number,
+        actor_is_bot: c.sender.r#type == "Bot",
+        actor: c.sender.login,
+        is_pull_request: c.issue.pull_request.is_some(),
+        comment_id: c.comment.id,
+        body: c.comment.body.unwrap_or_default(),
+        author_association: c.comment.author_association,
+        via_app: c.comment.performed_via_github_app.map(|app| app.id),
+        payload,
+    }))
+}
+
 fn ref_change(
     created: bool,
     installation_id: u64,
@@ -482,6 +633,8 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
             | "delete"
             | "merge_group"
             | "repository_dispatch"
+            | "issues"
+            | "issue_comment"
             | "installation_repositories"
     ) {
         return Ok(Trigger::Ignored(format!("{event} events are not used")));
@@ -568,6 +721,8 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
         "release" => release(installation_id, payload),
         "merge_group" => merge_group(installation_id, payload),
         "repository_dispatch" => repository_dispatch(installation_id, payload),
+        "issues" => issues(installation_id, payload),
+        "issue_comment" => issue_comment(installation_id, payload),
         "create" | "delete" => ref_change(event == "create", installation_id, payload),
         "repository" => {
             let r = RepositoryBody::deserialize(&payload)?;
@@ -631,6 +786,8 @@ mod tests {
     const CREATE: &str = include_str!("../testdata/create.json");
     const MERGE_GROUP: &str = include_str!("../testdata/merge_group.json");
     const DISPATCH: &str = include_str!("../testdata/repository_dispatch.json");
+    const ISSUES: &str = include_str!("../testdata/issues.json");
+    const ISSUE_COMMENT: &str = include_str!("../testdata/issue_comment.json");
 
     fn edited(body: &str, f: impl FnOnce(&mut Value)) -> Vec<u8> {
         let mut v: Value = serde_json::from_str(body).unwrap();
@@ -1030,10 +1187,141 @@ mod tests {
     }
 
     #[test]
+    fn an_issue_is_read_with_its_sender() {
+        let Trigger::Issues(i) = parse("issues", ISSUES.as_bytes()).unwrap() else {
+            panic!("not an issue");
+        };
+        assert_eq!(i.action, "opened");
+        assert_eq!(i.number, 12);
+        assert_eq!(i.actor, "octocat");
+        assert!(!i.actor_is_bot);
+        assert!(!i.is_pull_request);
+        assert_eq!(i.via_app, None);
+        assert_eq!(i.installation_id, 777);
+        assert_eq!(i.repo.full_name, "octo/widgets");
+        assert_eq!(i.payload["issue"]["title"], "Build fails on arm64");
+    }
+
+    #[test]
+    fn an_issue_made_through_an_app_names_it() {
+        let body = edited(ISSUES, |v| {
+            v["issue"]["performed_via_github_app"] = serde_json::json!({ "id": 31337 });
+            v["sender"] = serde_json::json!({ "login": "hatchrun[bot]", "type": "Bot" });
+        });
+        let Trigger::Issues(i) = parse("issues", &body).unwrap() else {
+            panic!("not an issue");
+        };
+        assert_eq!(i.via_app, Some(31337));
+        assert!(i.actor_is_bot);
+        // GitHub sends null for an issue made by a person.
+        let body = edited(ISSUES, |v| {
+            v["issue"]["performed_via_github_app"] = Value::Null;
+        });
+        let Trigger::Issues(i) = parse("issues", &body).unwrap() else {
+            panic!("not an issue");
+        };
+        assert_eq!(i.via_app, None);
+    }
+
+    #[test]
+    fn issue_actions_that_start_nothing_are_ignored() {
+        let body = edited(ISSUES, |v| v["action"] = "review_requested".into());
+        assert_eq!(
+            parse("issues", &body).unwrap(),
+            Trigger::Ignored("issues action is not used".into())
+        );
+        for action in ["labeled", "closed", "typed", "field_added"] {
+            let body = edited(ISSUES, |v| v["action"] = action.into());
+            assert!(matches!(
+                parse("issues", &body).unwrap(),
+                Trigger::Issues(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_comment_on_a_pull_request_is_read() {
+        let Trigger::IssueComment(c) = parse("issue_comment", ISSUE_COMMENT.as_bytes()).unwrap()
+        else {
+            panic!("not a comment");
+        };
+        assert_eq!(c.action, "created");
+        assert_eq!(c.number, 7);
+        assert_eq!(c.comment_id, 9001);
+        assert_eq!(c.body, "/retest");
+        assert_eq!(c.author_association, "MEMBER");
+        assert_eq!(c.actor, "maintainer");
+        assert!(!c.actor_is_bot);
+        assert!(c.is_pull_request);
+        assert_eq!(c.via_app, None);
+        assert_eq!(c.installation_id, 777);
+        assert_eq!(c.payload["comment"]["id"], 9001);
+    }
+
+    #[test]
+    fn a_comment_on_a_plain_issue_is_not_a_pull_request() {
+        let body = edited(ISSUE_COMMENT, |v| {
+            v["issue"].as_object_mut().unwrap().remove("pull_request");
+        });
+        let Trigger::IssueComment(c) = parse("issue_comment", &body).unwrap() else {
+            panic!("not a comment");
+        };
+        assert!(!c.is_pull_request);
+        // A null `pull_request` is no pull request either.
+        let body = edited(ISSUE_COMMENT, |v| v["issue"]["pull_request"] = Value::Null);
+        let Trigger::IssueComment(c) = parse("issue_comment", &body).unwrap() else {
+            panic!("not a comment");
+        };
+        assert!(!c.is_pull_request);
+    }
+
+    #[test]
+    fn a_comment_made_through_an_app_or_by_a_bot_says_so() {
+        let body = edited(ISSUE_COMMENT, |v| {
+            v["comment"]["performed_via_github_app"] = serde_json::json!({ "id": 31337 });
+            v["sender"]["type"] = "Bot".into();
+        });
+        let Trigger::IssueComment(c) = parse("issue_comment", &body).unwrap() else {
+            panic!("not a comment");
+        };
+        assert_eq!(c.via_app, Some(31337));
+        assert!(c.actor_is_bot);
+    }
+
+    #[test]
+    fn a_comment_without_text_or_association_reads_as_empty() {
+        let body = edited(ISSUE_COMMENT, |v| {
+            let comment = v["comment"].as_object_mut().unwrap();
+            comment.remove("body");
+            comment.remove("author_association");
+        });
+        let Trigger::IssueComment(c) = parse("issue_comment", &body).unwrap() else {
+            panic!("not a comment");
+        };
+        assert_eq!((c.body.as_str(), c.author_association.as_str()), ("", ""));
+    }
+
+    #[test]
+    fn edited_and_deleted_comments_are_read_and_others_are_ignored() {
+        for action in ["edited", "deleted"] {
+            let body = edited(ISSUE_COMMENT, |v| v["action"] = action.into());
+            let Trigger::IssueComment(c) = parse("issue_comment", &body).unwrap() else {
+                panic!("not a comment");
+            };
+            assert_eq!(c.action, action);
+        }
+        let body = edited(ISSUE_COMMENT, |v| v["action"] = "pinned".into());
+        assert_eq!(
+            parse("issue_comment", &body).unwrap(),
+            Trigger::Ignored("issue_comment action is not used".into())
+        );
+    }
+
+    #[test]
     fn other_events_are_ignored() {
         assert_eq!(
-            parse("issues", b"{}").unwrap(),
-            Trigger::Ignored("issues events are not used".into())
+            parse("star", b"{}").unwrap(),
+            Trigger::Ignored("star events are not used".into())
         );
     }
 

@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! `POST /github/webhook`: the `push`, `pull_request`, `check_run`,
-//! `release`, `create`, `delete`, `repository` and
-//! `installation_repositories` deliveries that `hatchrun-cloud`
+//! `release`, `create`, `delete`, `repository`, `issues`, `issue_comment`
+//! and `installation_repositories` deliveries that `hatchrun-cloud`
 //! forwards.
 //!
 //! A repository that is not enabled for its tenant (see
@@ -15,18 +15,21 @@ use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
 use hatchrun_cloud::webhook::verify;
-use hatchrun_workflow::{Event, MAX_CHANGED};
+use hatchrun_workflow::command::{APPROVE_RUN, Found};
+use hatchrun_workflow::{CommandPermission, CommandReaction, Event, MAX_CHANGED};
 use serde_json::{Value, json};
 use worker::{Env, Method, Request, RequestInit, Response, Result};
 
 use crate::alerts;
+use crate::chatops::{self, CommandContext, Pin};
 use crate::env::{Settings, run_stub};
 use crate::fork;
 use crate::github;
+use crate::github::PullInfo;
 use crate::installation;
 use crate::intake::{
-    self, ApproveFork, MergeGroup, PullRequest, Push, RefChange, Release, Repo, RepositoryDispatch,
-    Rerequested, Trigger,
+    self, ApproveFork, IssueComment, Issues, MergeGroup, PullRequest, Push, RefChange, Release,
+    Repo, RepositoryDispatch, Rerequested, Trigger,
 };
 use crate::planning;
 use crate::policy::{self, Admission, RepoPolicy, Waiting};
@@ -210,6 +213,8 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         Trigger::Create(c) | Trigger::Delete(c) => (c.installation_id, &c.repo),
         Trigger::MergeGroup(g) => (g.installation_id, &g.repo),
         Trigger::RepositoryDispatch(d) => (d.installation_id, &d.repo),
+        Trigger::Issues(i) => (i.installation_id, &i.repo),
+        Trigger::IssueComment(c) => (c.installation_id, &c.repo),
         Trigger::Rerequested(r) => (r.installation_id, &r.repo),
         Trigger::ApproveFork(a) => (a.installation_id, &a.repo),
         Trigger::Repository(r) => (r.installation_id, &r.repo),
@@ -398,6 +403,69 @@ fn dispatch_fired(dispatch: &RepositoryDispatch, sha: String) -> Fired<'_> {
     }
 }
 
+/// An issue activity runs on the default branch, at its head `sha`, as
+/// on GitHub.
+fn issues_fired(issue: &Issues, sha: String) -> Fired<'_> {
+    Fired {
+        installation_id: issue.installation_id,
+        repo: &issue.repo,
+        event_name: "issues",
+        payload: &issue.payload,
+        trigger: Event::Issues {
+            action: issue.action.clone(),
+        },
+        git_ref: default_ref(&issue.repo),
+        sha,
+        actor: &issue.actor,
+    }
+}
+
+/// The full ref of the repository's default branch.
+fn default_ref(repo: &Repo) -> String {
+    format!("refs/heads/{}", repo.default_branch)
+}
+
+/// What one comment's commands run against.
+struct CommentRun<'a> {
+    comment: &'a IssueComment,
+    /// The default branch's config text and the same as read.
+    source: &'a str,
+    config: &'a Config,
+    /// The head of the default branch, which the runs are on.
+    sha: &'a str,
+    /// The full ref of the default branch.
+    default_ref: &'a str,
+    /// The pull request the comment is on, `None` on a plain issue.
+    pull: Option<&'a PullInfo>,
+}
+
+/// Where a comment's runs report: trusted runs of the default branch,
+/// with their check runs on the head of the pull request the comment is
+/// on (see [`runs::Target`]).
+fn comment_origin<'a>(
+    comment: &'a IssueComment,
+    pull: Option<&'a PullInfo>,
+    chat: &'a store::Chat,
+) -> runs::Origin<'a> {
+    runs::Origin {
+        target: pull.map(|pull| runs::Target {
+            head_sha: &pull.head_sha,
+            refused: None,
+        }),
+        chat: Some(chat),
+        ..runs::Origin::own(&comment.actor)
+    }
+}
+
+/// Adds `text` to the replies of a comment unless the same reply is
+/// there already: two workflows that define a command can ask for the
+/// same thing, and the maintainer reads it once.
+fn push_reply(replies: &mut Vec<String>, text: String) {
+    if !replies.contains(&text) {
+        replies.push(text);
+    }
+}
+
 struct Cx<'a> {
     env: &'a Env,
     db: &'a Db,
@@ -419,6 +487,8 @@ impl Cx<'_> {
             Trigger::Delete(change) => self.delete(change).await?,
             Trigger::MergeGroup(group) => self.merge_group(group).await?,
             Trigger::RepositoryDispatch(dispatch) => self.repository_dispatch(dispatch).await?,
+            Trigger::Issues(issue) => self.issues(issue).await?,
+            Trigger::IssueComment(comment) => self.issue_comment(comment).await?,
             Trigger::Rerequested(rerun) => self.rerun(rerun).await?,
             Trigger::ApproveFork(approval) => self.approve_fork(approval).await?,
             // The row was updated before, with the tenant's other
@@ -1001,6 +1071,7 @@ impl Cx<'_> {
                         gate: *gate,
                         policy: Some(*policy),
                         target: None,
+                        chat: None,
                     },
                     _ => runs::Origin {
                         author: &pr.author,
@@ -1086,6 +1157,423 @@ impl Cx<'_> {
         self.fire(&dispatch_fired(dispatch, sha), &config).await
     }
 
+    /// Whether `app` is the id of this App: what it made starts no
+    /// workflow, as an event of `GITHUB_TOKEN` does not on GitHub, so a
+    /// step's comment cannot start another run.
+    fn is_own_app(&self, app: Option<u64>) -> bool {
+        app.is_some_and(|id| id.to_string() == self.settings.app_id)
+    }
+
+    /// An issue activity runs on the head of the default branch, as on
+    /// GitHub.
+    async fn issues(&self, issue: &Issues) -> Result<Outcome> {
+        if self.is_own_app(issue.via_app) {
+            return Ok(Outcome::Ignored(
+                "the issue was made through the hatchrun App".to_owned(),
+            ));
+        }
+        let id = issue.installation_id;
+        let Some((sha, config)) =
+            runs::default_head(self.tokens, self.settings, id, &issue.repo).await?
+        else {
+            return Ok(Outcome::Ignored("the repository has no commits".to_owned()));
+        };
+        let chat = store::Chat {
+            issue_number: issue.number,
+            command: None,
+        };
+        self.fire_with(&issues_fired(issue, sha), &config, Some(&chat))
+            .await
+    }
+
+    /// The pull request a comment is on, as GitHub has it now: the head
+    /// a command is pinned to, and where the checks go.
+    async fn comment_pull(&self, comment: &IssueComment) -> Result<Option<PullInfo>> {
+        let response = self
+            .tokens
+            .send(comment.installation_id, |token| {
+                github::pull_request(
+                    &self.settings.github_api,
+                    &comment.repo.full_name,
+                    comment.number,
+                    token,
+                )
+            })
+            .await
+            .map_err(|err| fail(err.to_string()))?;
+        github::pull_info(&response).map_err(fail)
+    }
+
+    /// What the commenter holds on the repository, asked of GitHub once
+    /// for the comment. `None` for no access at all.
+    async fn commenter_role(&self, comment: &IssueComment) -> Result<Option<CommandPermission>> {
+        let response = self
+            .tokens
+            .send(comment.installation_id, |token| {
+                github::collaborator_permission(
+                    &self.settings.github_api,
+                    &comment.repo.full_name,
+                    &comment.actor,
+                    token,
+                )
+            })
+            .await
+            .map_err(|err| fail(err.to_string()))?;
+        github::collaborator_role(&response).map_err(fail)
+    }
+
+    /// Posts `text` on the comment's issue or pull request as the App. A
+    /// failure is logged: the runs are made, and the delivery does not
+    /// fail for a reply.
+    async fn reply(&self, comment: &IssueComment, text: &str) {
+        let sent = self
+            .tokens
+            .send(comment.installation_id, |token| {
+                github::create_comment(
+                    &self.settings.github_api,
+                    &comment.repo.full_name,
+                    comment.number,
+                    token,
+                    text,
+                )
+            })
+            .await;
+        match sent {
+            Ok(response) if response.ok() => {}
+            Ok(response) => worker::console_warn!(
+                "{}: reply on #{}: GitHub answered {}",
+                comment.repo.full_name,
+                comment.number,
+                response.status
+            ),
+            Err(err) => worker::console_warn!(
+                "{}: reply on #{}: {err}",
+                comment.repo.full_name,
+                comment.number
+            ),
+        }
+    }
+
+    /// Reacts to the comment as the App. A failure is logged, as for
+    /// [`Self::reply`].
+    async fn react(&self, comment: &IssueComment, content: &str) {
+        let sent = self
+            .tokens
+            .send(comment.installation_id, |token| {
+                github::add_reaction(
+                    &self.settings.github_api,
+                    &comment.repo.full_name,
+                    comment.comment_id,
+                    token,
+                    content,
+                )
+            })
+            .await;
+        match sent {
+            Ok(response) if response.ok() => {}
+            Ok(response) => worker::console_warn!(
+                "{}: reaction on comment {}: GitHub answered {}",
+                comment.repo.full_name,
+                comment.comment_id,
+                response.status
+            ),
+            Err(err) => worker::console_warn!(
+                "{}: reaction on comment {}: {err}",
+                comment.repo.full_name,
+                comment.comment_id
+            ),
+        }
+    }
+
+    /// A comment runs the `issue_comment` workflows on the head of the
+    /// default branch, as on GitHub, and the chat commands it holds.
+    ///
+    /// The loop filter drops what the App itself wrote. A `created`
+    /// comment from a person is read for commands (see
+    /// [`Self::comment_commands`]); a bot's is not. The runs of one
+    /// issue or pull request are capped, and a comment over the cap
+    /// starts nothing.
+    #[allow(clippy::too_many_lines)] // One comment, read top to bottom.
+    async fn issue_comment(&self, comment: &IssueComment) -> Result<Outcome> {
+        if self.is_own_app(comment.via_app) {
+            return Ok(Outcome::Ignored(
+                "the comment was made through the hatchrun App".to_owned(),
+            ));
+        }
+        let id = comment.installation_id;
+        let Some((sha, config)) =
+            runs::default_head(self.tokens, self.settings, id, &comment.repo).await?
+        else {
+            return Ok(Outcome::Ignored("the repository has no commits".to_owned()));
+        };
+        // The config is the default branch's. One that is missing or
+        // unusable has nothing to run, and a comment is not the place to
+        // report it: the push that made it was told.
+        let Config::Text(Ok(source)) = &config else {
+            return Ok(Outcome::Ignored(
+                "no usable config on the default branch".to_owned(),
+            ));
+        };
+        let event = Event::IssueComment {
+            action: comment.action.clone(),
+        };
+        let listens = planning::listens(source, &event);
+        let commands = if comment.action == "created" && !comment.actor_is_bot {
+            let known = planning::command_names(source);
+            hatchrun_workflow::command::parse_comment(&comment.body, |name| known.contains(name))
+        } else {
+            Vec::new()
+        };
+        if !listens && commands.is_empty() {
+            return Ok(Outcome::Ignored(
+                "no workflow listens to this comment".to_owned(),
+            ));
+        }
+        let active = store::active_comment_runs(self.db, comment.repo.id, comment.number).await?;
+        let mut room = chatops::room(active);
+        if room == 0 {
+            worker::console_warn!(
+                "{}: #{} has {active} active runs from comments, so comment {} starts none",
+                comment.repo.full_name,
+                comment.number,
+                comment.comment_id
+            );
+            return Ok(Outcome::Ignored(
+                "too many active runs for this issue".to_owned(),
+            ));
+        }
+        // One call for the pull request's head, for the checks and for
+        // the sha of a command.
+        let pull = if comment.is_pull_request {
+            match self.comment_pull(comment).await? {
+                Some(pull) => Some(pull),
+                None => return Ok(Outcome::Ignored("the pull request is gone".to_owned())),
+            }
+        } else {
+            None
+        };
+        let default_ref = default_ref(&comment.repo);
+        let chat = store::Chat {
+            issue_number: comment.number,
+            command: None,
+        };
+        let mut ids = Vec::new();
+        if listens {
+            let started = runs::create(
+                self.env,
+                self.db,
+                self.settings,
+                self.tokens,
+                &runs::Request {
+                    tenant_id: self.tenant,
+                    installation_id: id,
+                    repo: &comment.repo,
+                    delivery: self.delivery,
+                    event_name: "issue_comment",
+                    event: &comment.payload,
+                    trigger: &event,
+                    compile_ref: &default_ref,
+                    git_ref: &default_ref,
+                    sha: &sha,
+                    actor: &comment.actor,
+                    head_ref: "",
+                    base_ref: "",
+                    workflow: None,
+                    origin: comment_origin(comment, pull.as_ref(), &chat),
+                },
+                &config,
+                self.now,
+            )
+            .await?;
+            room = room.saturating_sub(started.len() as u64);
+            ids.extend(started);
+        }
+        if !commands.is_empty() {
+            let run = CommentRun {
+                comment,
+                source,
+                config: &config,
+                sha: &sha,
+                default_ref: &default_ref,
+                pull: pull.as_ref(),
+            };
+            ids.extend(self.comment_commands(&run, &commands, room).await?);
+        }
+        Ok(Outcome::Done(ids))
+    }
+
+    /// The chat commands of a created comment. One call asks GitHub for
+    /// the commenter's role; a command whose workflow needs more starts
+    /// nothing and is only logged, so a stranger learns nothing of which
+    /// commands exist. A command that cannot run for want of a head sha
+    /// (or has a bad line) gets one reply from the App; a command that
+    /// started a run gets the `eyes` reaction.
+    #[allow(clippy::too_many_lines)] // One comment, read top to bottom.
+    async fn comment_commands(
+        &self,
+        run: &CommentRun<'_>,
+        commands: &[Found],
+        mut room: u64,
+    ) -> Result<Vec<u64>> {
+        let comment = run.comment;
+        let role = self.commenter_role(comment).await?;
+        let mut ids = Vec::new();
+        let mut replies: Vec<String> = Vec::new();
+        for found in commands {
+            if found.name == APPROVE_RUN {
+                ids.extend(self.approve_run(comment, found, role, run.pull).await?);
+                continue;
+            }
+            let defined =
+                planning::command_workflows(run.source, &found.name, comment.is_pull_request);
+            let allowed: Vec<_> = defined
+                .into_iter()
+                .filter(|wf| chatops::permits(role, wf.options.permission))
+                .collect();
+            let Some(role) = role.filter(|_| !allowed.is_empty()) else {
+                worker::console_warn!(
+                    "{}: {} may not run /{} on #{}",
+                    comment.repo.full_name,
+                    comment.actor,
+                    found.name,
+                    comment.number
+                );
+                continue;
+            };
+            let args = match &found.args {
+                Ok(args) => args,
+                Err(err) => {
+                    push_reply(&mut replies, err.to_string());
+                    continue;
+                }
+            };
+            for wf in allowed {
+                let head = match chatops::pin(&wf.options, args, &found.line, run.pull) {
+                    Pin::Reply(text) => {
+                        push_reply(&mut replies, text);
+                        continue;
+                    }
+                    Pin::Run(head) => head,
+                };
+                if room == 0 {
+                    worker::console_warn!(
+                        "{}: #{} is at its cap of active runs, so /{} starts nothing",
+                        comment.repo.full_name,
+                        comment.number,
+                        found.name
+                    );
+                    break;
+                }
+                let context = CommandContext {
+                    name: &found.name,
+                    line: &found.line,
+                    words: &args.words,
+                    names: &wf.options.args,
+                    actor: &comment.actor,
+                    role,
+                    pull: run.pull.map(|pull| (comment.number, pull)),
+                };
+                let event = chatops::event_with_command(&comment.payload, &context);
+                let chat = store::Chat {
+                    issue_number: comment.number,
+                    command: Some(store::CommentCommand {
+                        comment_id: comment.comment_id,
+                        name: found.name.clone(),
+                        rocket: wf.options.reaction == CommandReaction::Rocket,
+                    }),
+                };
+                let trigger = Event::Command {
+                    name: found.name.clone(),
+                    on_pull_request: comment.is_pull_request,
+                };
+                // One comment can carry several commands, and a workflow
+                // makes one run for each delivery.
+                let delivery = format!("{}:command:{}", self.delivery, found.name);
+                let started = runs::create(
+                    self.env,
+                    self.db,
+                    self.settings,
+                    self.tokens,
+                    &runs::Request {
+                        tenant_id: self.tenant,
+                        installation_id: comment.installation_id,
+                        repo: &comment.repo,
+                        delivery: &delivery,
+                        event_name: "issue_comment",
+                        event: &event,
+                        trigger: &trigger,
+                        compile_ref: run.default_ref,
+                        git_ref: run.default_ref,
+                        sha: run.sha,
+                        actor: &comment.actor,
+                        head_ref: "",
+                        base_ref: "",
+                        workflow: Some(&wf.workflow),
+                        origin: runs::Origin {
+                            target: head.as_deref().map(|head_sha| runs::Target {
+                                head_sha,
+                                refused: None,
+                            }),
+                            ..comment_origin(comment, run.pull, &chat)
+                        },
+                    },
+                    run.config,
+                    self.now,
+                )
+                .await?;
+                room = room.saturating_sub(started.len() as u64);
+                ids.extend(started);
+            }
+        }
+        if !ids.is_empty() {
+            self.react(comment, chatops::ACCEPTED).await;
+        }
+        for text in &replies {
+            self.reply(comment, text).await;
+        }
+        Ok(ids)
+    }
+
+    /// HOOK for the built-in `/approve-run`: it needs no workflow, and
+    /// the parser recognizes it always. It is called for the comment's
+    /// `/approve-run` line, in the order of the comment, after the
+    /// commenter's role was read and the pull request fetched. It
+    /// returns the ids of the runs it approved or made.
+    ///
+    /// - `comment`: the delivery, for the repository, the issue or pull
+    ///   request number, the commenter's login and the comment id.
+    /// - `found`: the line as typed (for the reply to quote) and its
+    ///   pin and words, or why the line is refused.
+    /// - `role`: what the commenter holds on the repository, `None` for
+    ///   no access; `/approve-run` needs `write` or higher and posts
+    ///   nothing to anyone below it.
+    /// - `pull`: the pull request as GitHub has it now, `None` on a
+    ///   plain issue.
+    ///
+    /// For now it ignores the line: it starts and posts nothing.
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        clippy::unused_self
+    )]
+    async fn approve_run(
+        &self,
+        comment: &IssueComment,
+        found: &Found,
+        role: Option<CommandPermission>,
+        pull: Option<&PullInfo>,
+    ) -> Result<Vec<u64>> {
+        let _ = (role, pull);
+        worker::console_log!(
+            "{}: {} wrote {} on #{}, which is not built yet",
+            comment.repo.full_name,
+            comment.actor,
+            found.line,
+            comment.number
+        );
+        Ok(Vec::new())
+    }
+
     async fn config_at(&self, installation_id: u64, repo: &Repo, sha: &str) -> Result<Config> {
         runs::read_config(
             self.tokens,
@@ -1100,6 +1588,16 @@ impl Cx<'_> {
     /// Starts the workflows that `fired.trigger` matches in `config`,
     /// compiled for `fired.git_ref`.
     async fn fire(&self, fired: &Fired<'_>, config: &Config) -> Result<Outcome> {
+        self.fire_with(fired, config, None).await
+    }
+
+    /// [`Self::fire`], for runs tied to an issue (`chat`).
+    async fn fire_with(
+        &self,
+        fired: &Fired<'_>,
+        config: &Config,
+        chat: Option<&store::Chat>,
+    ) -> Result<Outcome> {
         let ids = runs::create(
             self.env,
             self.db,
@@ -1120,7 +1618,10 @@ impl Cx<'_> {
                 head_ref: "",
                 base_ref: "",
                 workflow: None,
-                origin: runs::Origin::own(fired.actor),
+                origin: runs::Origin {
+                    chat,
+                    ..runs::Origin::own(fired.actor)
+                },
             },
             config,
             self.now,

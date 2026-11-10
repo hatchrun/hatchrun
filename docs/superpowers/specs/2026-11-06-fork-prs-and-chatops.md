@@ -718,6 +718,12 @@ backfills existing rows (`trusted`, no gate).
 - `ci_jobs`: no change. Environment approval stays per job attempt.
   Fork approval lives on the run so one decision releases every job.
 
+Migration `0024_ci_chatops.sql` adds nullable columns to `ci_runs` (a run
+that is not from an issue or a comment has none, so nothing is
+backfilled): `issue_number` (the issue or pull request, for the cap),
+`comment_id`, `command_name` and `command_reaction` (`default` or
+`rocket`), the last three set together for a run a chat command started.
+
 ## Phases and pull requests
 
 Fewer, larger PRs with a deploy order, as every merge to main releases.

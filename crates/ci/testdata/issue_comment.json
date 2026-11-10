@@ -1,0 +1,23 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 7,
+    "title": "Add a cache",
+    "state": "open",
+    "pull_request": { "url": "https://api.github.com/repos/octo/widgets/pulls/7" }
+  },
+  "comment": {
+    "id": 9001,
+    "body": "/retest",
+    "author_association": "MEMBER",
+    "user": { "login": "maintainer", "type": "User" }
+  },
+  "sender": { "login": "maintainer", "type": "User" },
+  "installation": { "id": 777 },
+  "repository": {
+    "id": 4242,
+    "full_name": "octo/widgets",
+    "default_branch": "main",
+    "private": false
+  }
+}

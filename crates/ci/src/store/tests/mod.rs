@@ -5,6 +5,7 @@
 mod artifacts;
 mod browse;
 mod cache;
+mod chat;
 mod concurrency;
 mod forks;
 mod jobs;
@@ -91,6 +92,7 @@ pub(super) fn new_run(delivery: &str, workflow: &str, now: u64) -> NewRun {
         gate_status: GateStatus::NotGated,
         head_sha: None,
         lints: None,
+        chat: None,
         now,
     }
 }

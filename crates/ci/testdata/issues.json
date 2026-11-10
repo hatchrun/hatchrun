@@ -1,0 +1,18 @@
+{
+  "action": "opened",
+  "issue": {
+    "number": 12,
+    "title": "Build fails on arm64",
+    "state": "open",
+    "user": { "login": "octocat" },
+    "author_association": "NONE"
+  },
+  "sender": { "login": "octocat", "type": "User" },
+  "installation": { "id": 777 },
+  "repository": {
+    "id": 4242,
+    "full_name": "octo/widgets",
+    "default_branch": "main",
+    "private": false
+  }
+}

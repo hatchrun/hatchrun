@@ -55,8 +55,14 @@ pub struct Origin<'a> {
     /// The repository's fork policy, for a fork pull request: its jobs
     /// are cut to the policy's timeout and to 4 vCPUs.
     pub policy: Option<RepoPolicy>,
-    /// Set for the runs of a `pull_request_target` event only.
+    /// Set for the runs of a `pull_request_target` event, and for those of
+    /// an `issue_comment` event on a pull request, which run on the base
+    /// repository's default branch while their reports go to the pull
+    /// request's head.
     pub target: Option<Target<'a>>,
+    /// The issue or comment the runs of an `issues` or `issue_comment`
+    /// event are for.
+    pub chat: Option<&'a store::Chat>,
 }
 
 /// What a `pull_request_target` request needs beyond its origin.
@@ -86,6 +92,7 @@ impl<'a> Origin<'a> {
             gate: GateStatus::NotGated,
             policy: None,
             target: None,
+            chat: None,
         }
     }
 }
@@ -348,6 +355,15 @@ fn report_sha<'a>(req: &Request<'a>) -> &'a str {
     req.origin.target.map_or(req.sha, |target| target.head_sha)
 }
 
+/// Whether the request runs the config of the base repository's default
+/// branch for an event an outsider can cause: `pull_request_target`,
+/// `issues` and `issue_comment`. The planner reads those workflows for
+/// findings, and a config that does not work is not reported on every
+/// pull request or comment (the push that made it was told).
+fn reads_default_config(req: &Request<'_>) -> bool {
+    req.origin.target.is_some() || matches!(req.event_name, "issues" | "issue_comment")
+}
+
 /// A completed, failed check run `name` that lists `diagnostics` in its
 /// summary, `consequence` ending the first line, and annotates the
 /// config file with them.
@@ -555,7 +571,7 @@ pub async fn create(
         }
         return Ok(Vec::new());
     }
-    let plans = lint_plans(plans, req.origin.target.is_some());
+    let plans = lint_plans(plans, source, reads_default_config(req));
     match billing_decision(tenant.ci_billing, plans.len()) {
         Billing::Run => {}
         Billing::AskForCard => {
@@ -572,10 +588,10 @@ pub async fn create(
     // The good workflows run first: a GitHub error on a failed
     // workflow's check run must not keep them from starting.
     for workflow in &failed {
-        let check = if req.origin.target.is_some() {
+        let check = if req.event_name == "pull_request_target" {
             invalid_target_check_run(&workflow.workflow, &workflow.diagnostics, report_sha(req))
         } else {
-            invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, req.sha)
+            invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, report_sha(req))
         };
         if let Err(err) = report_once(tokens, settings, req, &check).await {
             worker::console_error!(
@@ -619,21 +635,21 @@ struct Checked {
     warnings: Vec<String>,
 }
 
-/// What the planner finds in each plan of a request. Only the plans of
-/// a `pull_request_target` request (`target`) are read; the others carry
-/// no findings.
-fn lint_plans(plans: Vec<Plan>, target: bool) -> Vec<Checked> {
+/// What the planner finds in each plan of a request, whose workflows are
+/// in `source`. Only the plans of a request that runs an outsider's event
+/// from the default branch (`guarded`, see [`reads_default_config`]) are
+/// read, against the triggers of their own workflow; the others carry no
+/// findings.
+fn lint_plans(plans: Vec<Plan>, source: &str, guarded: bool) -> Vec<Checked> {
+    let mut findings = if guarded {
+        planning::workflow_findings(source, &plans).into_iter()
+    } else {
+        Vec::new().into_iter()
+    };
     plans
         .into_iter()
         .map(|plan| Checked {
-            warnings: if target {
-                hatchrun_workflow::plan_lints(&plan)
-                    .iter()
-                    .map(hatchrun_workflow::Lint::text)
-                    .collect()
-            } else {
-                Vec::new()
-            },
+            warnings: findings.next().unwrap_or_default(),
             plan,
         })
         .collect()
@@ -675,7 +691,7 @@ async fn report_invalid(
     req: &Request<'_>,
     diagnostics: &[Diagnostic],
 ) -> Result<()> {
-    if req.origin.target.is_some() {
+    if reads_default_config(req) {
         return Ok(());
     }
     let check = invalid_config_check_run(diagnostics, req.sha);
@@ -726,6 +742,7 @@ fn run_message(event_name: &str, event: &Value) -> Option<String> {
     let text = match event_name {
         "push" => event.pointer("/head_commit/message"),
         "pull_request" | "pull_request_target" => event.pointer("/pull_request/title"),
+        "issues" | "issue_comment" => event.pointer("/issue/title"),
         _ => None,
     }?
     .as_str()?;
@@ -783,6 +800,7 @@ fn title_of(
         concurrency: None,
         title: None,
         warnings: Vec::new(),
+        check_sha: None,
     };
     let mut github = github_context(&info, req.event, api);
     if let Some(fields) = github.as_object_mut() {
@@ -838,6 +856,7 @@ async fn start_plan(
         gate_status: req.origin.gate,
         head_sha: req.origin.target.map(|target| target.head_sha.to_owned()),
         lints: (!warnings.is_empty()).then(|| warnings.join("\n")),
+        chat: req.origin.chat.cloned(),
         now,
     };
     let (run, fresh) = match store::insert_run(db, &new).await? {
@@ -912,6 +931,17 @@ pub fn unstarted(run: &RunRow, rows: &[JobRow]) -> bool {
     run.status == "queued" && rows.iter().all(|row| row.status == "waiting")
 }
 
+/// The commit the check runs of a run go on when it is not the run's
+/// own: the head of the pull request an `issue_comment` run is about,
+/// so `/retest` shows next to the pull request's other checks. A run of
+/// a plain issue has no commit to show on.
+fn check_sha(req: &Request<'_>) -> Option<String> {
+    req.origin
+        .target
+        .filter(|_| req.event_name == "issue_comment")
+        .map(|target| target.head_sha.to_owned())
+}
+
 /// The body of `POST /start`: each planned job with its row id.
 fn start_body(
     req: &Request<'_>,
@@ -950,6 +980,7 @@ fn start_body(
             concurrency: plan.concurrency.clone(),
             title,
             warnings: warnings.to_vec(),
+            check_sha: check_sha(req),
         },
         jobs,
         event: req.event.clone(),
@@ -1171,14 +1202,16 @@ mod tests {
         hatchrun_workflow::compile(&config, "ci", "refs/heads/main").unwrap()
     }
 
-    /// The plan of a `pull_request_target` workflow with `steps`.
-    fn target_plan(steps: &str) -> Plan {
+    /// The config of a `pull_request_target` workflow with `steps`, and
+    /// what the planner finds in its plan.
+    fn lint_steps(steps: &str, guarded: bool) -> Vec<Checked> {
         let yaml = format!(
             "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n{steps}\n\
              workflows:\n  w:\n    on: {{ pull_request_target: {{}} }}\n    jobs: [t]\n"
         );
         let config = hatchrun_workflow::parse(&yaml).unwrap();
-        hatchrun_workflow::compile(&config, "w", "refs/heads/main").unwrap()
+        let plan = hatchrun_workflow::compile(&config, "w", "refs/heads/main").unwrap();
+        lint_plans(vec![plan], &yaml, guarded)
     }
 
     const HEAD_CHECKOUT: &str = "      - uses: actions/checkout@v4\n        with:\n          \
@@ -1187,7 +1220,7 @@ mod tests {
 
     #[test]
     fn a_head_checkout_is_a_warning_and_the_plan_still_runs() {
-        let plans = lint_plans(vec![target_plan(HEAD_CHECKOUT)], true);
+        let plans = lint_steps(HEAD_CHECKOUT, true);
         // Nothing is refused: the plan is kept with its finding.
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].warnings.len(), 1);
@@ -1199,7 +1232,7 @@ mod tests {
         let maybe =
             "      - uses: actions/checkout@v4\n        with:\n          ref: ${{ matrix.ref }}";
         for steps in [INJECTION, maybe] {
-            let plans = lint_plans(vec![target_plan(steps)], true);
+            let plans = lint_steps(steps, true);
             assert_eq!(plans.len(), 1);
             assert_eq!(plans[0].warnings.len(), 1, "{steps}");
         }
@@ -1207,11 +1240,11 @@ mod tests {
 
     #[test]
     fn a_clean_plan_has_no_findings_and_another_event_is_not_read() {
-        let plans = lint_plans(vec![target_plan("      - run: make test")], true);
+        let plans = lint_steps("      - run: make test", true);
         assert_eq!(plans[0].warnings.len(), 0);
         // A pull_request run that checks out its own head is what that
         // event is for.
-        let plans = lint_plans(vec![target_plan(HEAD_CHECKOUT)], false);
+        let plans = lint_steps(HEAD_CHECKOUT, false);
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].warnings.len(), 0);
     }
@@ -1236,6 +1269,91 @@ mod tests {
         assert_eq!(check.head_sha, "headsha");
         assert_eq!(check.conclusion.as_deref(), Some("failure"));
         assert_ne!(check.name, invalid_workflow_check_run("w", &[], "x").name);
+    }
+
+    #[test]
+    fn a_comment_run_on_a_pull_request_checks_on_its_head() {
+        let event = serde_json::json!({});
+        let trigger = hatchrun_workflow::Event::IssueComment {
+            action: "created".into(),
+        };
+        let repo = Repo {
+            id: 1,
+            full_name: "o/r".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        let request = |event_name, origin| Request {
+            tenant_id: "t",
+            installation_id: 1,
+            repo: &repo,
+            delivery: "d",
+            event_name,
+            event: &event,
+            trigger: &trigger,
+            compile_ref: "refs/heads/main",
+            git_ref: "refs/heads/main",
+            sha: "basesha",
+            actor: "a",
+            head_ref: "",
+            base_ref: "",
+            workflow: None,
+            origin,
+        };
+        let on_head = Origin {
+            target: Some(Target {
+                head_sha: "headsha",
+                refused: None,
+            }),
+            ..Origin::own("a")
+        };
+        let comment = request("issue_comment", on_head);
+        assert_eq!(check_sha(&comment).as_deref(), Some("headsha"));
+        assert_eq!(report_sha(&comment), "headsha");
+        assert!(reads_default_config(&comment));
+        // A comment on a plain issue has no head, and its run shows on the
+        // default branch's commit.
+        let on_issue = request("issue_comment", Origin::own("a"));
+        assert_eq!(check_sha(&on_issue), None);
+        assert_eq!(report_sha(&on_issue), "basesha");
+        assert!(reads_default_config(&on_issue));
+        assert!(reads_default_config(&request("issues", Origin::own("a"))));
+        assert!(!reads_default_config(&request("push", Origin::own("a"))));
+        // A `pull_request_target` run keeps its check runs where they
+        // were: only its reports go to the head.
+        let target = request(
+            "pull_request_target",
+            Origin {
+                target: Some(Target {
+                    head_sha: "headsha",
+                    refused: None,
+                }),
+                ..Origin::own("a")
+            },
+        );
+        assert_eq!(check_sha(&target), None);
+    }
+
+    #[test]
+    fn a_comment_workflow_is_read_for_findings_against_its_own_triggers() {
+        let yaml = "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      \
+                    - run: make\nworkflows:\n  talk:\n    on: { issue_comment: {} }\n    \
+                    jobs: [t]\n";
+        let config = hatchrun_workflow::parse(yaml).unwrap();
+        let plan = hatchrun_workflow::compile(&config, "talk", "refs/heads/main").unwrap();
+        // The job does not look at the commenter.
+        let plans = lint_plans(vec![plan.clone()], yaml, true);
+        assert_eq!(plans[0].warnings.len(), 1, "{:?}", plans[0].warnings);
+        let plans = lint_plans(vec![plan], yaml, false);
+        assert_eq!(plans[0].warnings.len(), 0);
+    }
+
+    #[test]
+    fn an_issue_run_shows_the_issue_title() {
+        let comment = serde_json::json!({"issue": {"title": " Add a cache \nmore"}});
+        for event in ["issues", "issue_comment"] {
+            assert_eq!(run_message(event, &comment).as_deref(), Some("Add a cache"));
+        }
     }
 
     #[test]
@@ -1470,6 +1588,7 @@ mod tests {
                     gate_status: GateStatus::NotGated,
                     head_sha: None,
                     lints: None,
+                    chat: None,
                     now: 1,
                 },
             ))

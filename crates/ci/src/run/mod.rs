@@ -173,6 +173,11 @@ pub struct RunInfo {
     /// the planner kept them has none.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// The commit the run's check runs go on when it is not `sha`: the
+    /// pull request head of an `issue_comment` run, which is on the
+    /// default branch. A run stored before this has none.
+    #[serde(default)]
+    pub check_sha: Option<String>,
 }
 
 /// The body of `POST /start`.
