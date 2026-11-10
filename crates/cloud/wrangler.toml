@@ -82,8 +82,9 @@ GITHUB_APP_SLUG = "hatchrun"
 # metadata.units of the "ci.usage" events hatchrun-ci sends; a unit is
 # one 2 vCPU second at the amd64 rate), with no meter credit, bills
 # hatchrun CI. Several products may be listed, separated by commas;
-# checkout offers all of them and answers 503 while the list is empty. POLAR_API_URL points the
-# Worker at Polar's sandbox (https://sandbox-api.polar.sh).
+# checkout offers all of them and answers 503 while the list is empty.
+# POLAR_API_URL points the Worker at Polar's sandbox
+# (https://sandbox-api.polar.sh).
 POLAR_PRODUCT_ID = "a2dfff6e-1a3a-40fe-b576-70fccd81f694"
 # kid of OIDC_SIGNING_KEY in oidc.hatchrun.io's JWKS. The JWKS also
 # lists OIDC_NEXT_SIGNING_KEY and OIDC_PREVIOUS_SIGNING_KEY while

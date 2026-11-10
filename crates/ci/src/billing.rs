@@ -31,7 +31,9 @@ pub fn month_start(now_ms: u64) -> u64 {
 }
 
 /// Billing units used this month, as priced when each job completed.
-/// A later price change or a removed template does not alter them.
+/// A later template price change or a removed template does not alter
+/// them. Changing [`templates::UNIT_PRICE_MICROS_PER_MINUTE`] is the
+/// exception: it reprices every unit already recorded.
 #[must_use]
 pub fn units(standing: &Standing) -> u64 {
     standing.units

@@ -9,6 +9,8 @@
 
 /// The billing unit is one 2 vCPU second at the amd64 rate. The price
 /// of one amd64 2 vCPU minute (60 units), in millionths of a dollar.
+/// Changing this reprices every unit already recorded, so it only
+/// changes while there is nothing recorded to reprice.
 pub const UNIT_PRICE_MICROS_PER_MINUTE: u64 = 4_000;
 /// Jobs one organization may have launching or running at once.
 pub const MAX_RUNNING_JOBS: u32 = 5;
@@ -437,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn units_are_two_vcpu_seconds() {
+    fn units_weight_seconds_by_template_price() {
         assert_eq!(template("ubuntu-latest").unwrap().units(61), 61);
         assert_eq!(template("ubuntu-26.04-4core-arm").unwrap().units(60), 97);
         assert_eq!(template("ubuntu-26.04-8core").unwrap().units(90), 360);
