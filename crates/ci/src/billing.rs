@@ -77,7 +77,8 @@ pub struct BillingView {
     /// Billed runner seconds this month, of every template; every
     /// attempt counts at least 60.
     pub seconds: u64,
-    /// Billing units used this month; one unit is one 2 vCPU second.
+    /// Billing units used this month; one unit is one 2 vCPU second at
+    /// the amd64 rate.
     pub units: u64,
     /// What this month's usage costs, in cents.
     pub spend_cents: u64,
@@ -346,13 +347,13 @@ mod tests {
                     Daily {
                         day: "2026-11-02".into(),
                         seconds: 1_500,
-                        cents: 10,
+                        cents: 20,
                     },
                 ],
                 invoices: Vec::new(),
                 seconds: 30_000,
                 units: 36_000,
-                spend_cents: 120,
+                spend_cents: 240,
                 cap_dollars: 50,
                 min_cap_dollars: 50,
                 max_cap_dollars: 10_000,
@@ -362,7 +363,7 @@ mod tests {
         );
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["seconds"], 30_000);
-        assert_eq!(json["spendCents"], 120);
+        assert_eq!(json["spendCents"], 240);
         assert!(json.get("freeUnits").is_none());
         assert!(json.get("minutes").is_none());
         assert_eq!(json["maxRunning"], 5);
@@ -372,7 +373,7 @@ mod tests {
         );
         assert_eq!(json["daily"][0]["day"], "2026-11-01");
         assert_eq!(json["daily"][1]["seconds"], 1_500);
-        assert_eq!(json["daily"][1]["cents"], 10);
+        assert_eq!(json["daily"][1]["cents"], 20);
         assert_eq!(json["invoices"], serde_json::json!([]));
         assert_eq!(json["minCapDollars"], 50);
         assert_eq!(json["maxCapDollars"], 10_000);
@@ -390,14 +391,14 @@ mod tests {
     fn spend_counts_every_unit() {
         let s = standing(&[("ubuntu-latest", 24_000), ("ubuntu-26.04-4core", 6_000)]);
         assert_eq!(units(&s), 36_000);
-        assert_eq!(spend_micros(&s), 1_200_000);
-        assert_eq!(spend_micros(&standing(&[("ubuntu-latest", 60)])), 2_000);
+        assert_eq!(spend_micros(&s), 2_400_000);
+        assert_eq!(spend_micros(&standing(&[("ubuntu-latest", 60)])), 4_000);
         // Recorded units win over what the catalog would compute.
         let mut s = standing(&[("no-such", 9)]);
         assert_eq!(units(&s), 0);
         s.units = 36_000;
         assert_eq!(units(&s), 36_000);
-        assert_eq!(spend_micros(&s), 1_200_000);
+        assert_eq!(spend_micros(&s), 2_400_000);
     }
 
     #[test]
@@ -407,11 +408,11 @@ mod tests {
         s.running = 5;
         assert_eq!(admission(&s), Some(Hold::Card));
         s.card = true;
-        s.units = 1_500_000;
+        s.units = 750_000;
         assert_eq!(spend_micros(&s), templates::DEFAULT_SPEND_CAP_MICROS);
         assert_eq!(admission(&s), Some(Hold::SpendCap));
-        s.units = 1_499_999;
-        assert_eq!(spend_micros(&s), 49_999_966);
+        s.units = 749_999;
+        assert_eq!(spend_micros(&s), 49_999_933);
         assert_eq!(admission(&s), Some(Hold::Concurrency));
         s.running = 4;
         assert_eq!(admission(&s), None);
