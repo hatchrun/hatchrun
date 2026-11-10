@@ -7,8 +7,6 @@
 //! of the run's event payload, the cap on runs per issue and the
 //! reactions. The webhook does the calls and acts on what these say.
 
-use std::collections::BTreeMap;
-
 use hatchrun_workflow::command::Args;
 use hatchrun_workflow::{CommandOptions, CommandPermission};
 use serde_json::{Value, json};
@@ -73,58 +71,22 @@ pub fn stale_pin(head: &str, line: &str) -> String {
     format!("The pull request head is now {head}, so nothing ran. Use --sha={head} in: {line}")
 }
 
-/// What `/approve-run` does for the runs of a pull request at its head.
-/// Each workflow is decided on its own, for each of the events
-/// `pull_request` and `pull_request_target`, so a workflow that went well
-/// does not hide another whose approval expired.
+/// What `/approve-run` does for one event of a pull request at a head.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Approval {
-    /// Some run waits: approve what waits.
+pub struct Decision {
+    /// Some run of the event waits: approve what waits.
     pub approve: bool,
-    /// The runs to make again.
-    pub remake: Remake,
+    /// The workflows to make a run of again: each listens to the event
+    /// and has no run at the head, or only ones that ended without an
+    /// approval or with a failure.
+    pub remake: Vec<String>,
 }
 
-/// The runs `/approve-run` makes again, for each event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Remake {
-    /// The `pull_request` workflows to make again.
-    pub pull_request: Which,
-    /// The `pull_request_target` workflows to make again.
-    pub pull_request_target: Which,
-}
-
-/// The workflows of one event that `/approve-run` makes again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Which {
-    /// None: each has a run that waits, goes or went well.
-    Nothing,
-    /// There is no run at the head at all: every workflow of the event.
-    All,
-    /// These workflows have only runs that ended without an approval or
-    /// with a failure.
-    Only(Vec<String>),
-}
-
-impl Which {
-    /// The workflows to make: `None` for nothing, `Some(None)` for all
-    /// of them, `Some(Some(names))` for these.
-    #[must_use]
-    pub fn among(&self) -> Option<Option<&Vec<String>>> {
-        match self {
-            Self::Nothing => None,
-            Self::All => Some(None),
-            Self::Only(names) => Some(Some(names)),
-        }
-    }
-}
-
-impl Remake {
-    /// Whether nothing is made again.
-    #[must_use]
-    pub fn is_nothing(&self) -> bool {
-        self.pull_request == Which::Nothing && self.pull_request_target == Which::Nothing
-    }
+/// The reply when the config cannot be used, so nothing could be made
+/// again.
+#[must_use]
+pub fn invalid_config(sha: &str) -> String {
+    format!("Invalid hatchrun config at {sha}, so no workflow started")
 }
 
 /// Why `/approve-run` has nothing to approve for the pull request.
@@ -190,59 +152,34 @@ fn stage(run: &RunRow, now: u64) -> Stage {
     }
 }
 
-/// What `/approve-run` does, given the runs of the pull request at the
-/// head the comment names, at time `now`. An earlier approval does not
-/// carry over to a run that ended, and an ended run is never revived.
-/// Within one workflow and event a waiting run is approved, one that is
-/// going or went well is left alone, and when all ended a new one is
-/// made.
+/// What `/approve-run` does for `event` (`pull_request` or
+/// `pull_request_target`), given the workflows that listen to it and
+/// `runs`, the runs of the pull request at the head the comment names,
+/// at time `now`. A workflow is decided on its own from its runs of the
+/// event: a waiting one is approved, one that goes or went well is left
+/// alone, and with no run, or only ones that ended, it is made again. An
+/// earlier approval does not carry over to a run that ended, and an
+/// ended run is never revived.
 #[must_use]
-pub fn approval(runs: &[RunRow], now: u64) -> Approval {
-    if runs.is_empty() {
-        return Approval {
-            approve: false,
-            remake: Remake {
-                pull_request: Which::All,
-                pull_request_target: Which::All,
-            },
-        };
-    }
-    let mut groups: BTreeMap<(&str, &str), Vec<Stage>> = BTreeMap::new();
-    for run in runs {
-        groups
-            .entry((run.workflow.as_str(), run.event.as_str()))
-            .or_default()
-            .push(stage(run, now));
-    }
-    let mut approve = false;
-    let mut pull_request = Vec::new();
-    let mut pull_request_target = Vec::new();
-    for ((workflow, event), stages) in groups {
-        if stages.contains(&Stage::Waiting) {
-            approve = true;
-        } else if stages.iter().all(|stage| *stage == Stage::Ended) {
-            let list = if event == "pull_request_target" {
-                &mut pull_request_target
-            } else {
-                &mut pull_request
-            };
-            list.push(workflow.to_owned());
-        }
-    }
-    let which = |list: Vec<String>| {
-        if list.is_empty() {
-            Which::Nothing
-        } else {
-            Which::Only(list)
-        }
+pub fn decide(listening: &[String], runs: &[RunRow], event: &str, now: u64) -> Decision {
+    let stages = |name: &str| -> Vec<Stage> {
+        runs.iter()
+            .filter(|run| run.event == event && run.workflow == name)
+            .map(|run| stage(run, now))
+            .collect()
     };
-    Approval {
-        approve,
-        remake: Remake {
-            pull_request: which(pull_request),
-            pull_request_target: which(pull_request_target),
-        },
-    }
+    let approve = runs
+        .iter()
+        .any(|run| run.event == event && stage(run, now) == Stage::Waiting);
+    let remake = listening
+        .iter()
+        .filter(|name| {
+            let stages = stages(name);
+            !stages.contains(&Stage::Waiting) && stages.iter().all(|stage| *stage == Stage::Ended)
+        })
+        .cloned()
+        .collect();
+    Decision { approve, remake }
 }
 
 /// What the head sha rule says about a command line.
@@ -412,74 +349,63 @@ mod tests {
         run
     }
 
-    fn nothing() -> Remake {
-        Remake {
-            pull_request: Which::Nothing,
-            pull_request_target: Which::Nothing,
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    fn decided(approve: bool, remake: &[&str]) -> Decision {
+        Decision {
+            approve,
+            remake: names(remake),
         }
     }
 
-    fn pr_only(names: &[&str]) -> Remake {
-        Remake {
-            pull_request: Which::Only(names.iter().map(|n| (*n).to_owned()).collect()),
-            ..nothing()
-        }
-    }
-
-    fn target_only(names: &[&str]) -> Remake {
-        Remake {
-            pull_request_target: Which::Only(names.iter().map(|n| (*n).to_owned()).collect()),
-            ..nothing()
-        }
-    }
-
-    fn decided(approve: bool, remake: Remake) -> Approval {
-        Approval { approve, remake }
-    }
+    const PR: &str = "pull_request";
 
     #[test]
     fn a_waiting_run_is_approved_and_a_running_one_is_left_alone() {
+        let ci = names(&["ci"]);
         let waiting = |gate| run(gate, "queued", None, NOW - 1);
         assert_eq!(
-            approval(&[waiting("pending")], NOW),
-            decided(true, nothing())
+            decide(&ci, &[waiting("pending")], PR, NOW),
+            decided(true, &[])
         );
         assert_eq!(
-            approval(&[waiting("deferred")], NOW),
-            decided(true, nothing())
+            decide(&ci, &[waiting("deferred")], PR, NOW),
+            decided(true, &[])
         );
         for gate in ["approved", "none"] {
             for status in ["queued", "in_progress"] {
                 assert_eq!(
-                    approval(&[run(gate, status, None, 0)], NOW),
-                    decided(false, nothing()),
+                    decide(&ci, &[run(gate, status, None, 0)], PR, NOW),
+                    decided(false, &[]),
                     "{gate} {status}"
                 );
             }
         }
         // A run that went well has nothing to approve either.
         let done = run("approved", "completed", Some("success"), 0);
-        assert_eq!(approval(&[done], NOW), decided(false, nothing()));
+        assert_eq!(decide(&ci, &[done], PR, NOW), decided(false, &[]));
     }
 
     #[test]
     fn a_waiting_run_wins_over_the_others_of_its_workflow() {
+        let ci = names(&["ci"]);
         let runs = [
             run("cancelled", "completed", Some("cancelled"), 1),
             run("approved", "in_progress", None, 1),
             run("pending", "queued", None, NOW),
         ];
-        assert_eq!(approval(&runs, NOW), decided(true, nothing()));
-        assert_eq!(approval(&runs[..2], NOW), decided(false, nothing()));
+        assert_eq!(decide(&ci, &runs, PR, NOW), decided(true, &[]));
+        assert_eq!(decide(&ci, &runs[..2], PR, NOW), decided(false, &[]));
     }
 
     #[test]
-    fn only_ended_runs_or_none_make_a_new_run() {
-        let everything = Remake {
-            pull_request: Which::All,
-            pull_request_target: Which::All,
-        };
-        assert_eq!(approval(&[], NOW), decided(false, everything));
+    fn a_workflow_with_no_run_or_only_ended_ones_is_made_again() {
+        let ci = names(&["ci"]);
+        // No row at all: the delivery may have been refused at admission
+        // or lost half way.
+        assert_eq!(decide(&ci, &[], PR, NOW), decided(false, &["ci"]));
         for (gate, conclusion) in [
             ("cancelled", "cancelled"),
             ("expired", "cancelled"),
@@ -489,42 +415,46 @@ mod tests {
         ] {
             let ended = run(gate, "completed", Some(conclusion), 1);
             assert_eq!(
-                approval(&[ended], NOW),
-                decided(false, pr_only(&["ci"])),
+                decide(&ci, &[ended], PR, NOW),
+                decided(false, &["ci"]),
                 "{gate}"
             );
         }
         // A rejected run whose cancellation is still going is not alive.
         let rejected = run("cancelled", "queued", None, 1);
-        assert_eq!(approval(&[rejected], NOW), decided(false, pr_only(&["ci"])));
+        assert_eq!(decide(&ci, &[rejected], PR, NOW), decided(false, &["ci"]));
     }
 
     #[test]
     fn a_waiting_run_past_its_deadline_is_not_revived() {
+        let ci = names(&["ci"]);
         let late = run("pending", "queued", None, NOW - APPROVAL_EXPIRES_MS - 1);
-        assert_eq!(approval(&[late], NOW), decided(false, pr_only(&["ci"])));
+        assert_eq!(decide(&ci, &[late], PR, NOW), decided(false, &["ci"]));
         let on_time = run("deferred", "queued", None, NOW - APPROVAL_EXPIRES_MS);
-        assert_eq!(approval(&[on_time], NOW), decided(true, nothing()));
+        assert_eq!(decide(&ci, &[on_time], PR, NOW), decided(true, &[]));
     }
 
     #[test]
     fn each_workflow_and_event_is_decided_on_its_own() {
-        // w1 went well and w2 expired: w2 is made again, w1 is left.
+        // w1 went well, w2 expired and w4 has no run (a partial failure
+        // before a retry): w2 and w4 are made again, w1 is left.
         let w1 = named(
             run("approved", "completed", Some("success"), 1),
             "w1",
-            "pull_request",
+            PR,
             3,
         );
         let w2 = named(
             run("pending", "queued", None, NOW - APPROVAL_EXPIRES_MS - 1),
             "w2",
-            "pull_request",
+            PR,
             4,
         );
+        let listening = names(&["w1", "w2", "w4"]);
+        let runs = [w1.clone(), w2.clone()];
         assert_eq!(
-            approval(&[w1.clone(), w2.clone()], NOW),
-            decided(false, pr_only(&["w2"]))
+            decide(&listening, &runs, PR, NOW),
+            decided(false, &["w2", "w4"])
         );
         // The same workflow under the other event is another group.
         let target = named(
@@ -533,20 +463,17 @@ mod tests {
             "pull_request_target",
             5,
         );
+        let both = [w1, target];
         assert_eq!(
-            approval(&[w1, target], NOW),
-            decided(false, target_only(&["w1"]))
+            decide(&names(&["w1"]), &both, "pull_request_target", NOW),
+            decided(false, &["w1"])
         );
+        assert_eq!(decide(&names(&["w1"]), &both, PR, NOW), decided(false, &[]));
         // A waiting group is approved while another is made again.
-        let waiting = named(
-            run("pending", "queued", None, NOW - 1),
-            "w3",
-            "pull_request",
-            6,
-        );
+        let waiting = named(run("pending", "queued", None, NOW - 1), "w3", PR, 6);
         assert_eq!(
-            approval(&[waiting, w2], NOW),
-            decided(true, pr_only(&["w2"]))
+            decide(&names(&["w2", "w3"]), &[waiting, w2], PR, NOW),
+            decided(true, &["w2"])
         );
     }
 

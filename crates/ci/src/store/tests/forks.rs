@@ -5,6 +5,8 @@
 use super::*;
 use crate::policy::{ForkApproval, ForkRuns, HeadCheckout, RepoPolicy};
 
+const BOTH: &[&str] = &["pull_request", "pull_request_target"];
+
 /// A fork run of pull request `number` at `sha` by `author`, in `gate`.
 fn fork_run(
     db: &TestDb,
@@ -1587,7 +1589,8 @@ fn a_comment_approves_every_waiting_run_at_the_head_and_no_other() {
                 number,
                 "h1",
                 "m",
-                20
+                20,
+                BOTH
             ))
             .unwrap()
             .len(),
@@ -1595,7 +1598,16 @@ fn a_comment_approves_every_waiting_run_at_the_head_and_no_other() {
         );
     }
     let approved = db
-        .wait(approve_at_head(db.db(), "t1", 7, 4, "h1", "maintainer", 20))
+        .wait(approve_at_head(
+            db.db(),
+            "t1",
+            7,
+            4,
+            "h1",
+            "maintainer",
+            20,
+            BOTH,
+        ))
         .unwrap();
     let mut ids: Vec<u64> = approved.iter().map(|run| run.id).collect();
     ids.sort_unstable();
@@ -1609,7 +1621,47 @@ fn a_comment_approves_every_waiting_run_at_the_head_and_no_other() {
     assert_eq!(read.gate_status, GateStatus::Pending);
     // Whoever decides first wins; the second comment finds nothing.
     assert_eq!(
-        db.wait(approve_at_head(db.db(), "t1", 7, 4, "h1", "again", 21))
+        db.wait(approve_at_head(
+            db.db(),
+            "t1",
+            7,
+            4,
+            "h1",
+            "again",
+            21,
+            BOTH
+        ))
+        .unwrap()
+        .len(),
+        0
+    );
+}
+
+#[test]
+fn a_comment_approves_only_the_events_it_is_given() {
+    let db = setup();
+    let ci = fork_run(&db, "d1", 4, "h1", "mallory", GateStatus::Pending, 10);
+    let target = target_run(&db, "d1:target", 4, "h1", GateStatus::Pending);
+    // With fork runs off the `pull_request` run stays as it is.
+    let approved = db
+        .wait(approve_at_head(
+            db.db(),
+            "t1",
+            7,
+            4,
+            "h1",
+            "maintainer",
+            20,
+            &["pull_request_target"],
+        ))
+        .unwrap();
+    let ids: Vec<u64> = approved.iter().map(|run| run.id).collect();
+    assert_eq!(ids, [target.id]);
+    let read = db.wait(super::run(db.db(), ci.id)).unwrap().unwrap();
+    assert_eq!(read.gate_status, GateStatus::Pending);
+    // No event, no approval.
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 4, "h1", "m", 21, &[]))
             .unwrap()
             .len(),
         0
@@ -1628,7 +1680,7 @@ fn a_comment_never_revives_an_ended_run_or_approves_after_a_push_or_close() {
     );
     let none = fork_run(&db, "d4", 4, "h1", "mallory", GateStatus::NotGated, 10);
     assert_eq!(
-        db.wait(approve_at_head(db.db(), "t1", 7, 4, "h1", "m", 20))
+        db.wait(approve_at_head(db.db(), "t1", 7, 4, "h1", "m", 20, BOTH))
             .unwrap()
             .len(),
         0
@@ -1642,15 +1694,24 @@ fn a_comment_never_revives_an_ended_run_or_approves_after_a_push_or_close() {
     let late = fork_run(&db, "d5", 5, "h5", "mallory", GateStatus::Pending, 10);
     let after = 10 + APPROVAL_EXPIRES_MS + 1;
     assert_eq!(
-        db.wait(approve_at_head(db.db(), "t1", 7, 5, "h5", "m", after))
+        db.wait(approve_at_head(db.db(), "t1", 7, 5, "h5", "m", after, BOTH))
             .unwrap()
             .len(),
         0
     );
     assert_eq!(
-        db.wait(approve_at_head(db.db(), "t1", 7, 5, "h5", "m", after - 1))
-            .unwrap()
-            .len(),
+        db.wait(approve_at_head(
+            db.db(),
+            "t1",
+            7,
+            5,
+            "h5",
+            "m",
+            after - 1,
+            BOTH
+        ))
+        .unwrap()
+        .len(),
         1,
         "run {} on time",
         late.id
@@ -1663,7 +1724,7 @@ fn a_comment_never_revives_an_ended_run_or_approves_after_a_push_or_close() {
         &[],
     );
     assert_eq!(
-        db.wait(approve_at_head(db.db(), "t1", 7, 6, "h6", "m", 31))
+        db.wait(approve_at_head(db.db(), "t1", 7, 6, "h6", "m", 31, BOTH))
             .unwrap()
             .len(),
         0
@@ -1673,7 +1734,7 @@ fn a_comment_never_revives_an_ended_run_or_approves_after_a_push_or_close() {
         &[],
     );
     assert_eq!(
-        db.wait(approve_at_head(db.db(), "t1", 7, 6, "h6", "m", 31))
+        db.wait(approve_at_head(db.db(), "t1", 7, 6, "h6", "m", 31, BOTH))
             .unwrap()
             .len(),
         0

@@ -687,8 +687,11 @@ Then, for that sha:
   `gate_by` the commenter;
 - with no run at all, it creates one the same way.
 
-Each workflow is decided on its own, for `pull_request` and for
-`pull_request_target`. A workflow is made again as the first of
+Each workflow that listens is decided on its own, for `pull_request`
+(the head's config) and for `pull_request_target` (the base branch's), from
+its runs at the head; a listed workflow with no run is made too, so a retry
+after a partial failure makes the missing ones. With `fork_runs = off` the
+`pull_request` runs are never approved or made. A workflow is made again as the first of
 `synchronize`, `opened` and `reopened` that it listens to; one that
 listens to none of them (a `labeled`-only workflow) is not made again,
 and when nothing could be, the reply says so.

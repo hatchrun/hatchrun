@@ -127,13 +127,13 @@ const PULL_RUNS: &str = "SELECT {columns} FROM ci_runs WHERE repo_id = $1 AND pu
 
 /// Approves the waiting (pending or deferred) runs of pull request `$2`
 /// of repository `$1` of tenant `$6` at commit `$3`, by `$4` at `$5`: the
-/// runs of both events that the pull request's check runs ask about. As
-/// for [`APPROVE_RUN`], not after the approval expired (`$7`), and only
-/// while the pull request is open at that commit.
+/// runs of the events in `$8` (comma separated). As for [`APPROVE_RUN`],
+/// not after the approval expired (`$7`), and only while the pull request
+/// is open at that commit.
 const APPROVE_AT_HEAD: &str = "UPDATE ci_runs SET gate_status = 'approved', gate_by = $4, \
      gate_at = $5, gate_card_dirty = (gate_check_run_id IS NOT NULL) \
      WHERE repo_id = $1 AND tenant_id = $6 AND pull_number = $2 \
-     AND COALESCE(head_sha, sha) = $3 AND event IN ('pull_request', 'pull_request_target') \
+     AND COALESCE(head_sha, sha) = $3 AND event = ANY(string_to_array($8, ',')) \
      AND gate_status IN ('pending', 'deferred') AND status <> 'completed' \
      AND created_at >= $7 \
      AND EXISTS (SELECT 1 FROM ci_pulls pl WHERE pl.repo_id = ci_runs.repo_id \
@@ -409,13 +409,16 @@ pub async fn pull_runs_at(db: &Db, repo_id: u64, number: u64, sha: &str) -> Resu
 
 /// Approves the runs of pull request `number` of repository `repo_id`
 /// of `tenant_id` that wait at `sha`, for `by`: a comment's approval,
-/// where the button's is [`approve_by_check`]. Empty when none waits any
-/// more (someone decided first), their approval deadline passed, or the
+/// where the button's is [`approve_by_check`], and only the runs of
+/// `events` (`pull_request`, `pull_request_target`): a repository that
+/// runs no fork pull requests has its `pull_request` runs left alone.
+/// Empty when none waits any more (someone decided first), their approval deadline passed, or the
 /// pull request is not open at `sha`.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
+#[allow(clippy::too_many_arguments)] // One statement's binds.
 pub async fn approve_at_head(
     db: &Db,
     tenant_id: &str,
@@ -424,6 +427,7 @@ pub async fn approve_at_head(
     sha: &str,
     by: &str,
     now: u64,
+    events: &[&str],
 ) -> Result<Vec<RunRow>> {
     db.all(
         &with_columns(APPROVE_AT_HEAD, RUN_COLUMNS),
@@ -434,7 +438,8 @@ pub async fn approve_at_head(
             by,
             now,
             tenant_id,
-            now.saturating_sub(APPROVAL_EXPIRES_MS)
+            now.saturating_sub(APPROVAL_EXPIRES_MS),
+            events.join(",")
         ],
     )
     .await

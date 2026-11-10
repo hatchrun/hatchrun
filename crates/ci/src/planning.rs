@@ -99,52 +99,65 @@ pub fn remote_workflows(source: &str, event: &Event) -> Vec<String> {
 }
 
 /// Whether a pull request `action` against `base_ref` starts a workflow
-/// that filters on changed paths, so the files are worth fetching.
-/// False when the config does not parse (it is reported without them).
+/// of `config` that filters on changed paths, so the files are worth
+/// fetching. With `among` only those workflows count.
 #[must_use]
-pub fn needs_pull_request_paths(source: &str, action: &str, base_ref: &str) -> bool {
+pub fn needs_pull_request_paths(
+    config: &Config,
+    action: &str,
+    base_ref: &str,
+    among: Option<&[String]>,
+) -> bool {
     needs_paths(
-        source,
+        config,
         &Event::PullRequest {
             action: action.to_owned(),
             base_ref: base_ref.to_owned(),
             changed: Vec::new(),
         },
+        among,
     )
 }
 
 /// As [`needs_pull_request_paths`], for the workflows of
-/// `on: pull_request_target`, which `source` is the base branch's config
-/// of.
+/// `on: pull_request_target`, which `config` is the base branch's of.
 #[must_use]
-pub fn needs_pull_request_target_paths(source: &str, action: &str, base_ref: &str) -> bool {
+pub fn needs_pull_request_target_paths(
+    config: &Config,
+    action: &str,
+    base_ref: &str,
+    among: Option<&[String]>,
+) -> bool {
     needs_paths(
-        source,
+        config,
         &Event::PullRequestTarget {
             action: action.to_owned(),
             base_ref: base_ref.to_owned(),
             changed: Vec::new(),
         },
+        among,
     )
 }
 
-/// Whether `event`, a pull request event, starts a workflow that filters
-/// on changed paths. Other events filter on none here.
-fn needs_paths(source: &str, event: &Event) -> bool {
-    let Ok(config) = parse(source) else {
-        return false;
-    };
-    config.workflows.values().any(|wf| {
-        let on = match event {
-            Event::PullRequest { .. } => &wf.on.pull_request,
-            Event::PullRequestTarget { .. } => &wf.on.pull_request_target,
-            _ => return false,
-        };
-        triggered(&wf.on, event)
-            && on
-                .as_ref()
-                .is_some_and(|pr| pr.paths.is_some() || pr.paths_ignore.is_some())
-    })
+/// Whether `event`, a pull request event, starts a workflow of `config`
+/// (of `among`, when given) that filters on changed paths. Other events
+/// filter on none here.
+fn needs_paths(config: &Config, event: &Event, among: Option<&[String]>) -> bool {
+    config
+        .workflows
+        .iter()
+        .filter(|(name, _)| among.is_none_or(|among| among.contains(name)))
+        .any(|(_, wf)| {
+            let on = match event {
+                Event::PullRequest { .. } => &wf.on.pull_request,
+                Event::PullRequestTarget { .. } => &wf.on.pull_request_target,
+                _ => return false,
+            };
+            triggered(&wf.on, event)
+                && on
+                    .as_ref()
+                    .is_some_and(|pr| pr.paths.is_some() || pr.paths_ignore.is_some())
+        })
 }
 
 /// Whether any workflow of `source` listens to `pull_request_target`,
@@ -178,13 +191,13 @@ pub const REMAKE_ACTIONS: [&str; 3] = ["synchronize", "opened", "reopened"];
 /// starts it when its pull request gets a commit, is opened or is
 /// reopened. A workflow that listens to none of them (one that only runs
 /// on `labeled`, say) is not made again. `event` builds the trigger for
-/// an action.
+/// an action, and is returned with the workflows it starts.
 #[must_use]
 pub fn remake_batches(
     config: &Config,
     event: impl Fn(&str) -> Event,
     among: Option<&[String]>,
-) -> Vec<(&'static str, Vec<String>)> {
+) -> Vec<(&'static str, Vec<String>, Event)> {
     let mut left: Vec<&String> = config
         .workflows
         .keys()
@@ -198,7 +211,7 @@ pub fn remake_batches(
             .partition(|name| triggered(&config.workflows[*name].on, &trigger));
         left = rest;
         if !hit.is_empty() {
-            batches.push((action, hit.into_iter().cloned().collect()));
+            batches.push((action, hit.into_iter().cloned().collect(), trigger));
         }
     }
     batches
@@ -330,9 +343,24 @@ workflows:
     on: { pull_request: { types: [labeled], paths: ['docs/**'] } }
     jobs: [t]
 ";
-        assert!(needs_pull_request_paths(config, "labeled", "main"));
-        assert!(!needs_pull_request_paths(config, "opened", "main"));
-        assert!(!needs_pull_request_paths("not: [valid", "labeled", "main"));
+        let config = parse(config).unwrap();
+        assert!(needs_pull_request_paths(&config, "labeled", "main", None));
+        assert!(!needs_pull_request_paths(&config, "opened", "main", None));
+        // Only the workflows asked about count.
+        let plain = ["plain".to_owned()];
+        assert!(!needs_pull_request_paths(
+            &config,
+            "labeled",
+            "main",
+            Some(&plain)
+        ));
+        let docs = ["docs".to_owned()];
+        assert!(needs_pull_request_paths(
+            &config,
+            "labeled",
+            "main",
+            Some(&docs)
+        ));
     }
 
     #[test]
@@ -433,15 +461,15 @@ workflows:
         assert_eq!(
             remake_batches(&config, event, None),
             [
-                ("synchronize", vec!["b".to_owned()]),
-                ("opened", vec!["a".to_owned()]),
-                ("reopened", vec!["c".to_owned()]),
+                ("synchronize", vec!["b".to_owned()], event("synchronize")),
+                ("opened", vec!["a".to_owned()], event("opened")),
+                ("reopened", vec!["c".to_owned()], event("reopened")),
             ]
         );
         let among = ["a".to_owned(), "d".to_owned()];
         assert_eq!(
             remake_batches(&config, event, Some(&among)),
-            [("opened", vec!["a".to_owned()])]
+            [("opened", vec!["a".to_owned()], event("opened"))]
         );
     }
 
@@ -509,11 +537,16 @@ workflows:
     on: { pull_request: { types: [labeled], paths: ['src/**'] } }
     jobs: [t]
 ";
-        assert!(needs_pull_request_target_paths(config, "opened", "main"));
-        assert!(!needs_pull_request_target_paths(config, "labeled", "main"));
+        let config = parse(config).unwrap();
+        assert!(needs_pull_request_target_paths(
+            &config, "opened", "main", None
+        ));
+        assert!(!needs_pull_request_target_paths(
+            &config, "labeled", "main", None
+        ));
         // The pull_request workflow's filter is not the target's.
-        assert!(needs_pull_request_paths(config, "labeled", "main"));
-        assert!(!needs_pull_request_paths(config, "opened", "main"));
+        assert!(needs_pull_request_paths(&config, "labeled", "main", None));
+        assert!(!needs_pull_request_paths(&config, "opened", "main", None));
     }
 
     #[test]
