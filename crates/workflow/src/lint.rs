@@ -7,34 +7,44 @@
 //!
 //! A `pull_request_target` workflow runs trusted (secrets, a write
 //! token) on an event that anyone can cause. Two mistakes turn that into
-//! remote code execution, and both are found by reading the steps:
+//! remote code execution, and both are found by reading the plan:
 //!
-//! - [`LintKind::HeadCheckout`]: the workflow checks out the pull
-//!   request's head (the fork's code) and runs it.
-//!   [`LintKind::UnverifiedCheckout`] is a checkout whose `ref` or
-//!   `repository` is an expression that is not provably the base, so
-//!   it may be the head; a repository that blocks head checkouts blocks
-//!   it too.
+//! - [`LintKind::HeadCheckout`]: the workflow gets the pull request's
+//!   head (the fork's code) onto the runner and runs it. A job is
+//!   *tainted* when anything in it reads the head: a path of the
+//!   `github` context at or above `github.event.pull_request.head`, the
+//!   head ref, a `refs/pull/<n>/head` ref, `GITHUB_HEAD_REF`. The read can
+//!   be anywhere in the job (its env, a step's env, `with:`, `if:`, a
+//!   script), so passing the value through `env:` to a script does not
+//!   hide it. A tainted job that checks out code or runs a command that
+//!   fetches it is a head checkout. [`LintKind::UnverifiedCheckout`] is a
+//!   checkout whose `ref` or `repository` is an expression that is not
+//!   provably the base. A repository that blocks head checkouts blocks
+//!   both.
 //! - [`LintKind::ScriptInjection`]: a field the pull request's author
 //!   writes (title, body, branch name) is interpolated with `${{ }}`
 //!   straight into a `run:` script, where the shell reads it as code.
 //!
 //! Expressions are read from their parse, so `github.event.x`,
-//! `github['event']['x']` and `GitHub.Event.X` are the same read. The
-//! detectors still work on steps and not on what a script computes at
-//! run time, so a workflow can be unsafe without a warning. A warning
-//! never stops `validate` or `convert` from succeeding; the host decides
-//! what a head checkout does (see the repository's
-//! `pull_request_target_head_checkout` setting).
+//! `github['event']['x']` and `GitHub.Event.X` are the same read, a
+//! computed index (`github.event.pull_request[format(...)]`) can be any
+//! name, and reading a parent (`toJSON(github.event.pull_request)`) reads
+//! what is under it. The detectors still work on the plan and not on what
+//! a script computes at run time, so a workflow can be unsafe without a
+//! warning. A warning never stops `validate` or `convert` from
+//! succeeding; the host decides what a head checkout does (see the
+//! repository's `pull_request_target_head_checkout` setting).
 
-use crate::config::{CheckoutStep, RunStep, UsesStep};
-use crate::expr::{Reads, reads};
-use crate::plan::{Plan, PlannedStep};
+use serde_json::Value;
+
+use crate::config::{CheckoutStep, UsesStep};
+use crate::expr::{reads, reads_expression};
+use crate::plan::{Plan, PlannedJob, PlannedStep};
 
 /// What a lint found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintKind {
-    /// The workflow checks out the pull request's head.
+    /// The workflow gets the pull request's head onto the runner.
     HeadCheckout,
     /// The workflow checks out a ref or repository that is an
     /// expression not provably the base.
@@ -90,8 +100,7 @@ const UNVERIFIED_CHECKOUT: &str = "checks out a ref or repository that is an exp
      use `github.sha`, `github.base_ref` or a literal";
 
 /// Paths of an event that the author of an issue, comment or pull
-/// request writes. A read of one of them, or of anything under it,
-/// counts.
+/// request writes.
 const UNTRUSTED: &[&str] = &[
     "github.event.issue.title",
     "github.event.issue.body",
@@ -120,7 +129,6 @@ const HEAD_PATHS: &[&str] = &[
     "github.event.pull_request.head",
     "github.event.pull_request.merge_commit_sha",
     "github.head_ref",
-    "env.github_head_ref",
 ];
 
 /// Paths a `ref` input may read and still be the base.
@@ -136,17 +144,17 @@ const BASE_REFS: &[&str] = &[
 /// Paths a `repository` input may read and still be the base.
 const BASE_REPOSITORIES: &[&str] = &["github.repository", "github.event.pull_request.base"];
 
-/// The git commands whose arguments can name the head.
+/// The git commands that fetch code or move a checkout to it.
 const GIT_FETCHERS: &[&str] = &[
     "fetch",
     "checkout",
-    "switch",
-    "pull",
-    "merge",
     "clone",
+    "pull",
+    "switch",
+    "worktree",
+    "merge",
     "reset",
     "cherry-pick",
-    "worktree",
     "restore",
 ];
 
@@ -158,52 +166,101 @@ pub fn guarded(on: &crate::Triggers) -> bool {
     on.pull_request_target.is_some()
 }
 
-/// The findings in the steps of `plan`, in job and step order. The
+/// The findings in the jobs of `plan`, in job and step order. The
 /// caller decides whether the plan's event is one to warn about (see
-/// [`guarded`]). Commands are already expanded in a plan, so a
-/// checkout inside a command is found too.
+/// [`guarded`]). Commands and called workflows are already expanded in a
+/// plan, so their steps are read too.
 #[must_use]
 pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
     let mut found = Vec::new();
     for job in &plan.jobs {
+        let taint = job_taint(job);
+        let tainted = |what: &str| {
+            taint.as_ref().map(|reason| {
+                format!(
+                    "{what} in a job that reads the pull request head ({reason}) in a \
+                     pull_request_target workflow, so the code of the pull request can run with \
+                     the base repository's secrets and write token; keep the head out of this job \
+                     and run the pull request's code in a pull_request workflow instead"
+                )
+            })
+        };
         for (i, step) in job.steps.iter().enumerate() {
-            let mut add = |kind, message: String| {
-                found.push(Lint {
-                    kind,
-                    workflow: plan.workflow.clone(),
-                    job: job.id.clone(),
-                    step: i + 1,
-                    message,
-                });
-            };
-            let mut checkout = |kind: Option<LintKind>| match kind {
-                Some(LintKind::HeadCheckout) => {
-                    add(LintKind::HeadCheckout, HEAD_CHECKOUT.to_owned());
+            let (kind, message) = match step {
+                PlannedStep::Checkout(native) => {
+                    match checkout_finding(native_checkout(native), tainted("checks out code")) {
+                        Some(found) => found,
+                        None => continue,
+                    }
                 }
-                Some(kind) => add(kind, UNVERIFIED_CHECKOUT.to_owned()),
-                None => {}
-            };
-            match step {
-                PlannedStep::Checkout(native) => checkout(native_checkout(native)),
                 PlannedStep::Uses(uses) => {
-                    checkout(action_checkout(uses));
                     if let Some(field) = script_input(uses).and_then(injected) {
-                        add(LintKind::ScriptInjection, injection(&field));
+                        found.push(lint(
+                            plan,
+                            job,
+                            i,
+                            LintKind::ScriptInjection,
+                            injection(&field),
+                        ));
+                    }
+                    if is_action(uses, "actions/checkout") {
+                        match checkout_finding(action_checkout(uses), tainted("checks out code")) {
+                            Some(found) => found,
+                            None => continue,
+                        }
+                    } else {
+                        continue;
                     }
                 }
                 PlannedStep::Run(run) => {
-                    if checks_out_head_script(run) {
-                        add(LintKind::HeadCheckout, HEAD_CHECKOUT.to_owned());
-                    }
                     if let Some(field) = injected(&run.run) {
-                        add(LintKind::ScriptInjection, injection(&field));
+                        found.push(lint(
+                            plan,
+                            job,
+                            i,
+                            LintKind::ScriptInjection,
+                            injection(&field),
+                        ));
+                    }
+                    if has_word_run(&run.run, &["gh", "pr", "checkout"]) {
+                        (LintKind::HeadCheckout, HEAD_CHECKOUT.to_owned())
+                    } else if fetches_code(&run.run)
+                        && let Some(message) = tainted("runs a command that fetches code")
+                    {
+                        (LintKind::HeadCheckout, message)
+                    } else {
+                        continue;
                     }
                 }
-                _ => {}
-            }
+                _ => continue,
+            };
+            found.push(lint(plan, job, i, kind, message));
         }
     }
     found
+}
+
+fn lint(plan: &Plan, job: &PlannedJob, step: usize, kind: LintKind, message: String) -> Lint {
+    Lint {
+        kind,
+        workflow: plan.workflow.clone(),
+        job: job.id.clone(),
+        step: step + 1,
+        message,
+    }
+}
+
+/// What a checkout step is found to be: what its own inputs rate, else
+/// a head checkout when its job is tainted.
+fn checkout_finding(
+    rated: Option<LintKind>,
+    tainted: Option<String>,
+) -> Option<(LintKind, String)> {
+    match rated {
+        Some(LintKind::HeadCheckout) => Some((LintKind::HeadCheckout, HEAD_CHECKOUT.to_owned())),
+        Some(kind) => Some((kind, UNVERIFIED_CHECKOUT.to_owned())),
+        None => tainted.map(|message| (LintKind::HeadCheckout, message)),
+    }
 }
 
 fn injection(field: &str) -> String {
@@ -213,20 +270,24 @@ fn injection(field: &str) -> String {
     )
 }
 
-/// Whether `path` is `under` or something below it.
-fn under(path: &[String], under: &str) -> bool {
-    let want: Vec<&str> = under.split('.').collect();
+/// Whether `path` reads `entry`: the same place, a place below it, or a
+/// parent of it (`github.event` reads everything under it). A step of
+/// `*` (a computed index) can be any name.
+fn touches(path: &[String], entry: &str) -> bool {
+    path.iter()
+        .zip(entry.split('.'))
+        .all(|(step, want)| step == "*" || step == want)
+}
+
+/// Whether `path` is `under` the dotted `entry`, or the entry itself: a
+/// stricter match than [`touches`], for what must be provably the base.
+fn under(path: &[String], entry: &str) -> bool {
+    let want: Vec<&str> = entry.split('.').collect();
     path.len() >= want.len() && path.iter().zip(&want).all(|(a, b)| a == b)
 }
 
-fn reads_any(read: &Reads, list: &[&str]) -> bool {
-    read.paths
-        .iter()
-        .any(|path| list.iter().any(|entry| under(path, entry)))
-}
-
-/// What the text of a `with.ref` reads cannot be parsed as: the text
-/// with case, spaces and quotes removed, for a substring match.
+/// The text with case, spaces and quotes removed, for a substring match
+/// on an expression that does not parse.
 fn squashed(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars().filter(|c| !c.is_whitespace()) {
@@ -242,26 +303,72 @@ fn squashed(text: &str) -> String {
     out
 }
 
-/// Whether `text` names the pull request head: a path of a `${{ }}` in
-/// it, a ref of the form `refs/pull/<n>/...` or `pull/<n>/head|merge`
-/// (in a string of an expression or outside one), or `GITHUB_HEAD_REF`.
-fn names_head(text: &str) -> bool {
+/// What reading `text` says about the pull request head, `None` when it
+/// says nothing: the path it reads, or the ref it names. `bare` text is
+/// one expression without `${{ }}`, as an `if:` is. Text with an
+/// expression that does not parse counts as reading it.
+fn head_read(text: &str, bare: bool) -> Option<String> {
     let lower = text.to_ascii_lowercase();
-    if lower.contains("refs/pull/") || lower.contains("github_head_ref") || pull_ref(&lower) {
-        return true;
+    if lower.contains("github_head_ref") {
+        return Some("GITHUB_HEAD_REF".to_owned());
     }
-    let Ok(list) = reads(text) else {
-        // An expression that does not parse is read as text.
-        let flat = squashed(text);
-        return HEAD_PATHS.iter().any(|p| flat.contains(p));
+    if pull_ref(&lower) {
+        return Some("a refs/pull ref".to_owned());
+    }
+    let parsed = if bare && !text.contains("${{") {
+        reads_expression(text).map(|read| vec![read])
+    } else {
+        reads(text)
     };
-    list.iter().any(|read| {
-        reads_any(read, HEAD_PATHS)
-            || read
-                .strings
-                .iter()
-                .any(|s| s.to_ascii_lowercase().contains("refs/pull/"))
-    })
+    let Ok(list) = parsed else {
+        let flat = squashed(text);
+        return HEAD_PATHS
+            .iter()
+            .any(|entry| flat.contains(entry))
+            .then(|| "an expression that cannot be read".to_owned());
+    };
+    for read in &list {
+        for path in &read.paths {
+            if HEAD_PATHS.iter().any(|entry| touches(path, entry)) {
+                return Some(path.join("."));
+            }
+        }
+        if read
+            .strings
+            .iter()
+            .any(|s| pull_ref(&s.to_ascii_lowercase()))
+        {
+            return Some("a refs/pull ref".to_owned());
+        }
+    }
+    None
+}
+
+/// Whether `text` names the pull request head.
+fn names_head(text: &str) -> bool {
+    head_read(text, false).is_some()
+}
+
+/// Why the job is tainted: the first read of the pull request head found
+/// anywhere in it (its env, a step's env, `with:`, `if:`, a script, its
+/// container and services), else `None`.
+fn job_taint(job: &PlannedJob) -> Option<String> {
+    let value = serde_json::to_value(job).ok()?;
+    taint_in(&value, false)
+}
+
+fn taint_in(value: &Value, bare: bool) -> Option<String> {
+    match value {
+        Value::String(text) => head_read(text, bare),
+        Value::Array(items) => items.iter().find_map(|item| taint_in(item, false)),
+        Value::Object(fields) => fields.iter().find_map(|(key, item)| {
+            taint_in(
+                item,
+                matches!(key.as_str(), "if" | "if_" | "continue_on_error"),
+            )
+        }),
+        _ => None,
+    }
 }
 
 /// Whether the text of a `ref` or `repository` input is provably the
@@ -297,58 +404,105 @@ fn native_checkout(step: &CheckoutStep) -> Option<LintKind> {
     rate_checkout(&[(text, BASE_REFS)])
 }
 
+fn is_action(step: &UsesStep, name: &str) -> bool {
+    step.uses.to_ascii_lowercase().split('@').next() == Some(name)
+}
+
 fn action_checkout(step: &UsesStep) -> Option<LintKind> {
-    let action = step.uses.to_ascii_lowercase();
-    if action.split('@').next() != Some("actions/checkout") {
-        return None;
-    }
     let mut inputs: Vec<(&str, &[&str])> = Vec::new();
     for (name, allowed) in [("ref", BASE_REFS), ("repository", BASE_REPOSITORIES)] {
-        if let Some(text) = step.with.get(name).and_then(serde_json::Value::as_str) {
+        if let Some(text) = step.with.get(name).and_then(Value::as_str) {
             inputs.push((text, allowed));
         }
     }
     rate_checkout(&inputs)
 }
 
-/// Whether a script checks out the head: `gh pr checkout`, or a git
-/// command on a line that names the head or a `pull/<n>/head` ref.
-fn checks_out_head_script(step: &RunStep) -> bool {
-    step.run.lines().any(|line| {
-        let line = line.trim();
-        if has_word_run(line, &["gh", "pr", "checkout"]) {
-            return true;
-        }
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let git = words
-            .windows(2)
-            .any(|pair| pair[0] == "git" && GIT_FETCHERS.contains(&pair[1]));
-        git && (names_head(line) || pull_ref(line))
+/// Whether a script runs a command that fetches code or moves a
+/// checkout to it: a git command such as `fetch` or `checkout` (within
+/// a few words of `git`, which covers `git -C dir fetch`), `gh pr
+/// checkout` or `gh repo clone`.
+fn fetches_code(script: &str) -> bool {
+    let flat: String = script
+        .chars()
+        .map(|c| {
+            if matches!(c, ';' | '&' | '|' | '(' | ')') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let words: Vec<&str> = flat.split_whitespace().collect();
+    words.iter().enumerate().any(|(i, word)| match *word {
+        "git" => words[i + 1..]
+            .iter()
+            .take(4)
+            .any(|w| GIT_FETCHERS.contains(w)),
+        "gh" => matches!(
+            words.get(i + 1..i + 3),
+            Some(["pr", "checkout"] | ["repo", "clone"])
+        ),
+        _ => false,
     })
 }
 
-/// Whether `words` appear in `line` one after another.
-fn has_word_run(line: &str, words: &[&str]) -> bool {
-    let all: Vec<&str> = line.split_whitespace().collect();
+/// Whether `words` appear in `text` one after another.
+fn has_word_run(text: &str, words: &[&str]) -> bool {
+    let all: Vec<&str> = text.split_whitespace().collect();
     all.windows(words.len()).any(|w| w == words)
 }
 
-/// Whether `line` has a ref of the form `pull/<n>/head` or
-/// `pull/<n>/merge`, with or without the `refs/` before it.
-fn pull_ref(line: &str) -> bool {
-    let mut rest = line;
-    while let Some(at) = rest.find("pull/") {
-        let after = &rest[at + "pull/".len()..];
-        if let Some((_, tail)) = after.split_once('/') {
-            for end in ["head", "merge"] {
-                if let Some(more) = tail.strip_prefix(end)
-                    && !more.starts_with(|c: char| c.is_alphanumeric() || c == '_')
-                {
-                    return true;
-                }
+/// Whether `c` can be in a git ref name.
+fn is_ref_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')
+}
+
+/// The text after a pull request number at the start of `text`: digits,
+/// a `${{ }}`, a `${VAR}`, a `$VAR` or a `{0}` placeholder.
+fn after_number(text: &str) -> Option<&str> {
+    if let Some(rest) = text.strip_prefix("${{") {
+        return rest.split_once("}}").map(|(_, rest)| rest);
+    }
+    if let Some(rest) = text.strip_prefix("${") {
+        return rest.split_once('}').map(|(_, rest)| rest);
+    }
+    if let Some(rest) = text.strip_prefix('{') {
+        return rest.split_once('}').map(|(_, rest)| rest);
+    }
+    let name = if let Some(rest) = text.strip_prefix('$') {
+        rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
+    } else {
+        text.trim_start_matches(|c: char| c.is_ascii_digit())
+    };
+    (name.len() < text.len()).then_some(name)
+}
+
+/// Whether `text` (lowercase) has a ref of the form
+/// `refs/pull/<n>/head` or `refs/pull/<n>/merge`, with or without the
+/// `refs/` before it. It starts where a ref starts and ends where it
+/// ends, so `release/pull/2/head-fix` and `pull/2/header` are other
+/// branches.
+fn pull_ref(text: &str) -> bool {
+    let mut from = 0;
+    while let Some(found) = text[from..].find("pull/") {
+        let at = from + found;
+        from = at + "pull/".len();
+        let before = &text[..at];
+        let before = before.strip_suffix("refs/").unwrap_or(before);
+        if before.chars().next_back().is_some_and(is_ref_char) {
+            continue;
+        }
+        let Some(rest) = after_number(&text[from..]).and_then(|rest| rest.strip_prefix('/')) else {
+            continue;
+        };
+        for end in ["head", "merge"] {
+            if let Some(more) = rest.strip_prefix(end)
+                && !more.chars().next().is_some_and(is_ref_char)
+            {
+                return true;
             }
         }
-        rest = after;
     }
     false
 }
@@ -356,15 +510,15 @@ fn pull_ref(line: &str) -> bool {
 /// The script of an `actions/github-script` step, which runs the text
 /// as JavaScript.
 fn script_input(step: &UsesStep) -> Option<&str> {
-    let action = step.uses.to_ascii_lowercase();
-    if action.split('@').next() != Some("actions/github-script") {
+    if !is_action(step, "actions/github-script") {
         return None;
     }
     step.with.get("script")?.as_str()
 }
 
 /// The first untrusted field that `script` interpolates with `${{ }}`,
-/// as a dotted path.
+/// as a dotted path. Reading a parent of one (`toJSON(github.event)`)
+/// reads it.
 fn injected(script: &str) -> Option<String> {
     let Ok(list) = reads(script) else {
         // An expression that does not parse is read as text.
@@ -378,7 +532,7 @@ fn injected(script: &str) -> Option<String> {
         read.paths.iter().find_map(|path| {
             UNTRUSTED
                 .iter()
-                .find(|entry| under(path, entry))
+                .find(|entry| touches(path, entry))
                 .map(|entry| (*entry).to_owned())
         })
     })
@@ -397,9 +551,125 @@ mod tests {
     }
 
     fn found(steps: &str) -> Vec<LintKind> {
-        let config = config("{ pull_request_target: {} }", steps);
+        found_in("", steps)
+    }
+
+    /// The findings of a job with `job` (more keys of the job) and `steps`.
+    fn found_in(job: &str, steps: &str) -> Vec<LintKind> {
+        let yaml = format!(
+            "jobs:\n  t:\n    runs-on: ubuntu-latest\n{job}    steps:\n{steps}\n\
+             workflows:\n  w:\n    on: {{ pull_request_target: {{}} }}\n    jobs: [t]\n"
+        );
+        let config = parse(&yaml).unwrap();
         let plan = compile(&config, "w", "refs/heads/main").unwrap();
         plan_lints(&plan).iter().map(|l| l.kind).collect()
+    }
+
+    /// Whether `block` would refuse the job.
+    fn blocked(job: &str, steps: &str) -> bool {
+        found_in(job, steps).iter().any(|k| k.is_head_checkout())
+    }
+
+    #[test]
+    fn the_head_passed_through_env_to_a_fetch_is_blocked() {
+        let head = "${{ github.event.pull_request.head.sha }}";
+        // A step's env.
+        let steps = format!(
+            "      - run: git fetch origin $PR_SHA && git checkout $PR_SHA\n        env:\n          PR_SHA: {head}"
+        );
+        assert!(blocked("", &steps));
+        // The job's env.
+        let job = format!("    env:\n      PR_SHA: {head}\n");
+        assert!(blocked(&job, "      - run: git fetch origin $PR_SHA"));
+        // A checkout that has nothing to do with the head in its inputs,
+        // in a job that reads the head elsewhere.
+        assert!(blocked(
+            &job,
+            "      - uses: actions/checkout@v4\n        with:\n          ref: main"
+        ));
+        assert!(blocked(&job, "      - checkout"));
+        // Read by an `if:`, a `with:` of another action or a later step.
+        let steps = "      - run: echo hi\n        if: github.event.pull_request.head.repo.fork\n      - run: git clone https://example.com/x\n";
+        assert!(blocked("", steps));
+        let steps = format!(
+            "      - uses: some/action@v1\n        with:\n          sha: {head}\n      - run: gh repo clone o/r"
+        );
+        assert!(blocked("", &steps));
+    }
+
+    #[test]
+    fn computed_indexes_and_parents_of_the_head_are_blocked() {
+        for expr in [
+            "github.event.pull_request[format('h{0}', 'ead')].sha",
+            "github.event.pull_request[inputs.field].sha",
+            "github.event[matrix.k].head.sha",
+            "toJSON(github.event.pull_request)",
+            "toJSON(github.event)",
+            "toJSON(github)",
+            "github.event.pull_request",
+            "format('{0}', github.event.pull_request)",
+            "fromJSON(toJSON(github.event.pull_request)).head.sha",
+        ] {
+            let steps = format!("      - run: git fetch origin \"${{{{ {expr} }}}}\"");
+            assert!(blocked("", &steps), "{expr}");
+            let steps = format!(
+                "      - uses: actions/checkout@v4\n        with:\n          ref: ${{{{ {expr} }}}}"
+            );
+            assert!(blocked("", &steps), "{expr}");
+        }
+    }
+
+    #[test]
+    fn a_job_that_never_reads_the_head_is_not_blocked_whatever_it_fetches() {
+        for steps in [
+            "      - run: git fetch origin main && git checkout release",
+            "      - run: git clone https://example.com/x && make",
+            "      - run: git fetch origin release/pull/2/head-fix",
+            "      - run: git fetch origin refs/heads/pull/1/head",
+            "      - run: git fetch origin pull/2/header",
+            "      - run: git fetch origin pull/head",
+            "      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.sha }}",
+            "      - run: git fetch origin ${{ github.event.pull_request.base.sha }}",
+            "      - run: echo ${{ github.event.pull_request.number }} ${{ github.event.pull_request.labels.*.name }}",
+        ] {
+            assert!(!blocked("", steps), "{steps}");
+        }
+        // The head read in a job that fetches nothing is only a warning
+        // for the job that checks out.
+        assert!(!blocked(
+            "",
+            "      - run: echo ${{ github.event.pull_request.head.sha }}"
+        ));
+    }
+
+    #[test]
+    fn a_pull_ref_is_a_whole_ref_and_nothing_longer() {
+        for yes in [
+            "pull/12/head",
+            "refs/pull/12/merge",
+            "+refs/pull/5/head:refs/remotes/pr/5",
+            "git fetch origin pull/7/merge",
+            "refs/pull/${{ github.event.number }}/head",
+            "refs/pull/$PR/head",
+            "refs/pull/${pr}/merge",
+            "refs/pull/{0}/head",
+            "\"refs/pull/3/head\"",
+        ] {
+            assert!(pull_ref(&yes.to_ascii_lowercase()), "{yes}");
+        }
+        for no in [
+            "release/pull/2/head-fix",
+            "refs/heads/pull/1/head",
+            "origin/pull/2/head",
+            "pull/2/header",
+            "pull/2/head_old",
+            "pull/head",
+            "refs/pull/x/head",
+            "pull/2/heads",
+            "pull/2/merged",
+        ] {
+            assert!(!pull_ref(no), "{no}");
+        }
     }
 
     #[test]

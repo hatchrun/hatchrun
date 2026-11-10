@@ -62,19 +62,6 @@ fn release_commit(found: Option<String>) -> std::result::Result<String, Outcome>
     found.ok_or_else(|| Outcome::Ignored("release tag is gone".to_owned()))
 }
 
-/// What a pull request's `pull_request_target` workflows run on: the
-/// ref (`refs/heads/<base>`, which is `GITHUB_REF`) and the commit
-/// (`GITHUB_SHA`) of the base branch, as GitHub sets them. `tip` is the
-/// base branch's head as GitHub answers now, not the `base.sha` the
-/// payload carries, which is as old as the pull request's last event
-/// and can be behind the branch. The config is read at this commit and
-/// the run is on it, so nothing of the pull request's head, which its
-/// author controls, picks the workflow or what it checks out by default.
-/// `None` when the branch has no head.
-fn target_base(pr: &PullRequest, tip: Option<String>) -> Option<(String, String)> {
-    tip.map(|sha| (runs::compile_ref_for(pr), sha))
-}
-
 /// The delivery key of the `pull_request_target` runs of a delivery. A
 /// run is unique per delivery and workflow, and a workflow that listens
 /// to `pull_request` and `pull_request_target` has a run of each for one
@@ -654,19 +641,32 @@ impl Cx<'_> {
         // The base branch's workflows need nothing of the head: they run
         // whatever happens to the fork's, and a late delivery is as good
         // as an early one.
-        let fork_policy = if pr.fork.is_some() {
-            Some(store::repo_policy(self.db, pr.repo.id, pr.repo.private).await?)
-        } else {
-            None
-        };
-        let mut ids = self.pull_request_target(pr, fork_policy).await?;
-        match self.pull_request_head(pr, applied, fork_policy).await? {
+        // The repository's policy is read once, by whichever group needs
+        // it first.
+        let mut policy = None;
+        let mut ids = self.pull_request_target(pr, &mut policy).await?;
+        match self.pull_request_head(pr, applied, &mut policy).await? {
             Outcome::Done(more) => ids.extend(more),
             Outcome::Ignored(reason) if ids.is_empty() => return Ok(Outcome::Ignored(reason)),
             Outcome::Ignored(_) => {}
             Outcome::Retry => return Ok(Outcome::Retry),
         }
         Ok(Outcome::Done(ids))
+    }
+
+    /// The repository's policy, read once for a delivery and kept in
+    /// `cache`.
+    async fn policy_of(
+        &self,
+        pr: &PullRequest,
+        cache: &mut Option<RepoPolicy>,
+    ) -> Result<RepoPolicy> {
+        if let Some(policy) = cache {
+            return Ok(*policy);
+        }
+        let policy = store::repo_policy(self.db, pr.repo.id, pr.repo.private).await?;
+        *cache = Some(policy);
+        Ok(policy)
     }
 
     /// The changed paths of a pull request, as GitHub lists them. Files
@@ -700,50 +700,34 @@ impl Cx<'_> {
     }
 
     /// The `pull_request_target` workflows of a pull request. As on
-    /// GitHub they run from the base branch: the config is read at the
-    /// base branch's head as it is now (never at the pull request's head,
-    /// which the author controls), `GITHUB_REF` is the base branch and
-    /// `GITHUB_SHA` its commit. The runs are trusted, so they get the
-    /// repository's secrets and a token that can write, and no approval
-    /// is asked of a fork's. The repository's policy says what a
-    /// workflow that checks out the head does (see [`runs::create`]).
-    ///
-    /// Most repositories have no such workflow, so the branch's config
-    /// is first read by name, one call, and only a config that names the
-    /// event costs the commit lookup, the second read at that commit and
-    /// the policy. `shared` is the policy when the delivery has read it
-    /// already.
+    /// GitHub they run from the base branch: the branch's head is
+    /// resolved now (the payload's `base.sha` is as old as the pull
+    /// request's last event and can be behind), the config is read at
+    /// that commit (never at the pull request's head, which the author
+    /// controls), `GITHUB_REF` is the base branch and `GITHUB_SHA` that
+    /// commit. The runs are trusted, so they get the repository's secrets
+    /// and a token that can write, and no approval is asked of a fork's.
+    /// The repository's policy, read only for a config that may have the
+    /// event, says what a workflow that checks out the head does (see
+    /// [`runs::create`]).
     async fn pull_request_target(
         &self,
         pr: &PullRequest,
-        shared: Option<RepoPolicy>,
+        cache: &mut Option<RepoPolicy>,
     ) -> Result<Vec<u64>> {
-        let probe_ref = runs::compile_ref_for(pr);
-        let probe = runs::read_config(
+        let git_ref = runs::compile_ref_for(pr);
+        let Some(sha) = runs::commit(
             self.tokens,
             self.settings,
             pr.installation_id,
             &pr.repo.full_name,
-            &probe_ref,
+            &git_ref,
         )
-        .await?;
-        if !matches!(&probe, Config::Text(Ok(source)) if planning::has_pull_request_target(source))
-        {
-            return Ok(Vec::new());
-        }
-        let tip = runs::commit(
-            self.tokens,
-            self.settings,
-            pr.installation_id,
-            &pr.repo.full_name,
-            &probe_ref,
-        )
-        .await?;
-        let Some((git_ref, sha)) = target_base(pr, tip) else {
+        .await?
+        else {
             return Ok(Vec::new());
         };
         let sha = sha.as_str();
-        // The run's config is the one at the commit it runs on.
         let config = runs::read_config(
             self.tokens,
             self.settings,
@@ -752,6 +736,15 @@ impl Cx<'_> {
             sha,
         )
         .await?;
+        // Most repositories have no such workflow. A config that cannot
+        // be read goes on, so that it is reported.
+        match &config {
+            Config::Missing => return Ok(Vec::new()),
+            Config::Text(Ok(source)) if !planning::may_have_pull_request_target(source) => {
+                return Ok(Vec::new());
+            }
+            Config::Text(_) => {}
+        }
         let wants_paths = matches!(&config, Config::Text(Ok(source))
             if planning::needs_pull_request_target_paths(source, &pr.action, &pr.base_ref));
         let changed = if wants_paths {
@@ -759,10 +752,7 @@ impl Cx<'_> {
         } else {
             Vec::new()
         };
-        let policy = match shared {
-            Some(policy) => policy,
-            None => store::repo_policy(self.db, pr.repo.id, pr.repo.private).await?,
-        };
+        let policy = self.policy_of(pr, cache).await?;
         // A pull_request run of the same delivery and workflow is a
         // different run, so its key differs.
         let delivery = target_delivery(self.delivery);
@@ -813,7 +803,7 @@ impl Cx<'_> {
         &self,
         pr: &PullRequest,
         applied: bool,
-        fork_policy: Option<RepoPolicy>,
+        cache: &mut Option<RepoPolicy>,
     ) -> Result<Outcome> {
         // A delivery older than what is recorded says nothing about the
         // pull request as it stands: it must not cancel the runs of the
@@ -823,6 +813,13 @@ impl Cx<'_> {
                 "the delivery is older than the pull request's recorded state".to_owned(),
             ));
         }
+        // Read after the stale check, which ends a delivery that has no
+        // use for it.
+        let fork_policy = if pr.fork.is_some() {
+            Some(self.policy_of(pr, cache).await?)
+        } else {
+            None
+        };
         let admitted = match self.fork_admission(pr, fork_policy).await? {
             Ok(admitted) => admitted,
             Err(outcome) => return Ok(outcome),
@@ -1009,31 +1006,6 @@ impl Cx<'_> {
         Ok(Outcome::Done(ids))
     }
 
-    /// Whether the plan of `run`'s workflow, read from the commit the run
-    /// was on, checks out the pull request head. `Err` when the config
-    /// there cannot be read or planned.
-    async fn target_plan_checks_out_head(
-        &self,
-        repo: &RepoRow,
-        run: &store::RunRow,
-    ) -> Result<std::result::Result<bool, String>> {
-        let config = runs::read_config(
-            self.tokens,
-            self.settings,
-            repo.installation_id,
-            &repo.full_name,
-            &run.sha,
-        )
-        .await?;
-        Ok(match config {
-            Config::Text(Ok(source)) => {
-                planning::plan_checks_out_head(&source, &run.workflow, &run.git_ref)
-            }
-            Config::Text(Err(diagnostic)) => Err(diagnostic.message),
-            Config::Missing => Err("the commit has no config".to_owned()),
-        })
-    }
-
     async fn rerun(&self, rerun: &Rerequested) -> Result<Outcome> {
         let Some(job) = store::job(self.db, rerun.job_id).await? else {
             return Ok(Outcome::Ignored("check run of an unknown job".to_owned()));
@@ -1055,23 +1027,37 @@ impl Cx<'_> {
             Some(repo) => Some(store::repo_policy(self.db, repo.id, repo.private).await?),
             None => None,
         };
-        let refusal = match (&repo, &policy) {
-            (Some(repo), Some(policy)) if run.event == "pull_request_target" => {
-                // The policy may have turned to block since the run
-                // started: the plan, read again from the commit it ran
-                // on, is checked against the rule as it is now.
-                let checked = self.target_plan_checks_out_head(repo, &run).await?;
+        // The policy may have turned to block since a pull_request_target
+        // run started: the plan it was made with is judged by the rule as
+        // it is now. Only a blocking policy looks at the run at all.
+        let refusal = match &policy {
+            Some(policy)
+                if run.event == "pull_request_target"
+                    && policy.pull_request_target_head_checkout == policy::HeadCheckout::Block =>
+            {
+                let head_checkout = store::run_head_checkout(self.db, run.id).await?;
                 fork::target_rerun_refusal(
                     &run.event,
                     policy.pull_request_target_head_checkout,
-                    &checked,
+                    head_checkout,
                 )
             }
             _ => None,
         };
         if let Some(reason) = refusal.or_else(|| fork::rerun_refusal(&run, policy.as_ref())) {
             if let Some(repo) = &repo {
-                fork::say_rerun_refused(self.tokens, self.settings, repo, &run, reason).await;
+                // The run of a pull_request_target event is on the base
+                // branch, where nobody looks: the refusal goes on the
+                // pull request's head.
+                let sha = match run
+                    .pull_number
+                    .filter(|_| run.event == "pull_request_target")
+                {
+                    Some(number) => store::pull_head_sha(self.db, repo.id, number).await?,
+                    None => None,
+                }
+                .unwrap_or_else(|| run.sha.clone());
+                fork::say_rerun_refused(self.tokens, self.settings, repo, &sha, &run, reason).await;
             }
             return Ok(Outcome::Ignored(reason.to_owned()));
         }
@@ -1125,31 +1111,21 @@ mod tests {
     }
 
     #[test]
-    fn a_pull_request_target_run_is_on_the_base_branch_and_never_the_forks_head() {
+    fn a_pull_request_target_run_is_on_the_base_branch_ref_whatever_the_head_is() {
         let fork = pull(include_str!("../testdata/pull_request_fork.json"));
         assert!(fork.fork.is_some());
-        let tip = "2222222222222222222222222222222222222222";
-        let (git_ref, sha) = target_base(&fork, Some(tip.to_owned())).unwrap();
-        // The config is read at this commit and the run is on it: the
-        // base branch's commit as it is now, not the head the fork wrote
-        // and not the base.sha the payload carried, which is behind.
-        assert_eq!(sha, tip);
-        assert_ne!(sha, fork.head_sha);
-        assert_ne!(
-            sha,
-            fork.payload["pull_request"]["base"]["sha"]
-                .as_str()
-                .unwrap(),
-            "a stale base.sha is not used"
-        );
+        // The ref is the base branch's; the commit is looked up on it
+        // when the delivery is handled, never taken from the payload (a
+        // PullRequest has no base commit to take) or from the head.
+        let git_ref = runs::compile_ref_for(&fork);
         assert_eq!(git_ref, "refs/heads/main");
         assert!(!git_ref.contains("pull"), "{git_ref}");
     }
 
     #[test]
-    fn a_base_branch_without_a_head_starts_nothing() {
-        let pr = pull(include_str!("../testdata/pull_request.json"));
-        assert_eq!(target_base(&pr, None), None);
+    fn the_target_delivery_key_differs_from_the_deliverys() {
+        assert_ne!(target_delivery("guid"), "guid");
+        assert_eq!(target_delivery("guid"), "guid:target");
     }
 
     #[test]

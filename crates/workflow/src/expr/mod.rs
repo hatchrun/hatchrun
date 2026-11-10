@@ -696,24 +696,33 @@ pub struct Reads {
 pub fn reads(text: &str) -> Result<Vec<Reads>, ExprError> {
     let mut out = Vec::new();
     for (start, inner) in expressions(text)? {
-        let ast = tree(inner).map_err(|e| ExprError {
+        out.push(reads_expression(inner).map_err(|e| ExprError {
             message: e.message,
             offset: e.offset + start,
-        })?;
-        let mut found = Reads {
-            plain: match &ast {
-                parser::Expr::Literal(_) | parser::Expr::Context { .. } => true,
-                parser::Expr::Access { base, .. } => {
-                    matches!(**base, parser::Expr::Context { .. })
-                }
-                _ => false,
-            },
-            ..Reads::default()
-        };
-        collect_reads(&ast, &mut found);
-        out.push(found);
+        })?);
     }
     Ok(out)
+}
+
+/// What one expression reads, written without `${{ }}` as an `if:` is.
+///
+/// # Errors
+///
+/// When the expression does not parse.
+pub fn reads_expression(expr: &str) -> Result<Reads, ExprError> {
+    let ast = tree(expr)?;
+    let mut found = Reads {
+        plain: match &ast {
+            parser::Expr::Literal(_) | parser::Expr::Context { .. } => true,
+            parser::Expr::Access { base, .. } => {
+                matches!(**base, parser::Expr::Context { .. })
+            }
+            _ => false,
+        },
+        ..Reads::default()
+    };
+    collect_reads(&ast, &mut found);
+    Ok(found)
 }
 
 fn collect_reads(expr: &parser::Expr<'_>, out: &mut Reads) {

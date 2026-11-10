@@ -98,6 +98,9 @@ pub struct NewRun {
     /// `NotGated`, or `Pending` or `Deferred` for a fork run that needs
     /// an approval.
     pub gate_status: GateStatus,
+    /// Whether the run's plan checks out the pull request head (a
+    /// `pull_request_target` run), as the planner found it.
+    pub head_checkout: bool,
     /// When the run is recorded.
     pub now: u64,
 }
@@ -213,7 +216,8 @@ const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE
 /// now, `$10` the pull request's base branch, `$11` the message, `$12` the
 /// pull request's number, `$13` its head branch, `$14` the trust, `$15` and
 /// `$16` the head repository's id and name, `$17` the author, `$18` the
-/// author's association, `$19` the gate and `$20` its status. The run expires after its tenant's retention tier (30 or 90 days), read
+/// author's association, `$19` the gate, `$20` its status and `$21`
+/// whether its plan has a head checkout. The run expires after its tenant's retention tier (30 or 90 days), read
 /// in the same statement. The number is taken only when no run of this
 /// delivery and workflow exists, so a duplicate leaves the counter
 /// alone, and the statement returns no row for it.
@@ -226,11 +230,11 @@ const INSERT_RUN: &str = "WITH n AS (\
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
        actor, base_ref, message, pull_number, head_ref, status, created_at, updated_at, \
        expires_at, trust, head_repo_id, head_repo_name, author_login, author_association, \
-       gate, gate_status) \
+       gate, gate_status, head_checkout) \
      SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, $10::text, $11::text, $12::bigint, $13::text, 'queued', $9, $9, \
        $9 + (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END * 86400000::bigint \
          FROM tenants WHERE id = $1), \
-       $14::text, $15::bigint, $16::text, $17::text, $18::text, $19::text, $20::text FROM n \
+       $14::text, $15::bigint, $16::text, $17::text, $18::text, $19::text, $20::text, $21::boolean FROM n \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
        ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
        completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
@@ -302,10 +306,31 @@ pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>> {
             } else {
                 "fork_approval"
             },
-            run.gate_status.as_str()
+            run.gate_status.as_str(),
+            run.head_checkout
         ],
     )
     .await
+}
+
+/// Whether the plan of run `$1` had a head checkout when it was made.
+const RUN_HEAD_CHECKOUT: &str = "SELECT head_checkout AS found FROM ci_runs WHERE id = $1";
+
+/// Whether the plan of run `run_id` had a head checkout when the run
+/// was made. A run that does not exist has none.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn run_head_checkout(db: &Db, run_id: u64) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct Found {
+        found: bool,
+    }
+    Ok(db
+        .first::<Found>(RUN_HEAD_CHECKOUT, &params![run_id])
+        .await?
+        .is_some_and(|row| row.found))
 }
 
 /// The run that `delivery` made for `workflow`, which a redelivery

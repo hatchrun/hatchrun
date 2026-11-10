@@ -157,6 +157,27 @@ pub async fn upsert_pull(db: &Db, pull: &NewPull) -> Result<PullWrite> {
     })
 }
 
+/// The head commit of pull request `$2` of repository `$1`.
+const PULL_HEAD: &str = "SELECT head_sha AS found FROM ci_pulls WHERE repo_id = $1 AND number = $2";
+
+/// The head commit of pull request `number` of repository `repo_id` as
+/// the newest delivery said it, `None` when the pull request is not
+/// recorded.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn pull_head_sha(db: &Db, repo_id: u64, number: u64) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Found {
+        found: String,
+    }
+    Ok(db
+        .first::<Found>(PULL_HEAD, &params![repo_id, number])
+        .await?
+        .map(|row| row.found))
+}
+
 /// What a repository page counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoCounts {

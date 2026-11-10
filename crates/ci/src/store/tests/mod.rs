@@ -89,6 +89,7 @@ pub(super) fn new_run(delivery: &str, workflow: &str, now: u64) -> NewRun {
         author_login: "octocat".into(),
         author_association: String::new(),
         gate_status: GateStatus::NotGated,
+        head_checkout: false,
         now,
     }
 }

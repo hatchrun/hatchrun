@@ -16,6 +16,12 @@ ALTER TABLE ci_repo_policy ADD COLUMN pull_request_target_head_checkout text NOT
 -- Worker that names the value, the previous Worker still saves policies
 -- without it, and 'warn' is the value they mean.
 
+-- Whether the plan of a run had a head checkout when it was made (see
+-- the planner's lints). A rerun of a pull_request_target run is refused
+-- under a blocking policy from this, which is exactly what the run's own
+-- plan, callee workflows included, was found to be.
+ALTER TABLE ci_runs ADD COLUMN head_checkout boolean NOT NULL DEFAULT false;
+
 -- 0022 kept defaults on its columns for the Worker that ran between that
 -- migration and its own deploy. That Worker is gone: every insert names
 -- the trust of the run, the author and the gate, so a row without them

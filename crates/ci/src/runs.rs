@@ -30,6 +30,12 @@ pub const CONFIG_CHECK: &str = "hatchrun / config";
 /// The name of the check run that asks a lapsed tenant for a card.
 pub const CARD_CHECK: &str = "hatchrun / billing";
 
+/// The name of the check run that reports an unusable base config for
+/// the `pull_request_target` workflows of a pull request. It is on the
+/// pull request's head and has a name of its own, so it never stands in
+/// for [`CONFIG_CHECK`], the same commit's report on its own config.
+pub const CONFIG_TARGET_CHECK: &str = "hatchrun config / pull_request_target";
+
 /// GitHub takes at most this many annotations in one request.
 const MAX_ANNOTATIONS: usize = 50;
 
@@ -516,6 +522,8 @@ pub async fn create(
     };
     let (plans, failed) =
         head_checkout_gate(plans, failed, req.origin.target.map(|t| t.head_checkout));
+    let started = plans.iter().map(|checked| checked.plan.workflow.clone());
+    let started: Vec<String> = started.collect();
     match billing_decision(tenant.ci_billing, plans.len()) {
         Billing::Run => {}
         Billing::AskForCard => {
@@ -526,8 +534,16 @@ pub async fn create(
         Billing::Nothing => return Ok(Vec::new()),
     }
     let mut ids = Vec::new();
-    for (plan, warnings) in &plans {
-        ids.push(start_plan(env, db, settings, req, plan, warnings, now).await?);
+    for checked in &plans {
+        ids.push(start_plan(env, db, settings, req, checked, now).await?);
+    }
+    // A workflow that started now has nothing to say about an earlier
+    // refusal on the same commit (the policy was loosened, or the
+    // workflow was fixed on the base branch): that report is cleared.
+    if req.origin.target.is_some() {
+        for workflow in &started {
+            clear_blocked(tokens, settings, req, workflow).await;
+        }
     }
     // The good workflows run first: a GitHub error on a failed
     // workflow's check run must not keep them from starting.
@@ -568,6 +584,17 @@ fn fork_limits(plans: Vec<Plan>, mut failed: Vec<Failed>, fork: bool) -> (Vec<Pl
     (kept, failed)
 }
 
+/// A plan with what the planner found in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Checked {
+    plan: Plan,
+    /// The findings, one line each, shown in the run's check runs.
+    warnings: Vec<String>,
+    /// Whether the plan has a head checkout. Recorded on the run, so a
+    /// rerun is judged against the policy of its day by the plan it had.
+    head_checkout: bool,
+}
+
 /// The message of a workflow that a repository blocks for checking out
 /// the head of a pull request in `pull_request_target`.
 const HEAD_CHECKOUT_BLOCKED: &str = "this repository blocks pull_request_target workflows that \
@@ -584,10 +611,17 @@ fn head_checkout_gate(
     plans: Vec<Plan>,
     mut failed: Vec<Failed>,
     rule: Option<HeadCheckout>,
-) -> (Vec<(Plan, Vec<String>)>, Vec<Failed>) {
+) -> (Vec<Checked>, Vec<Failed>) {
     let Some(rule) = rule else {
         return (
-            plans.into_iter().map(|plan| (plan, Vec::new())).collect(),
+            plans
+                .into_iter()
+                .map(|plan| Checked {
+                    plan,
+                    warnings: Vec::new(),
+                    head_checkout: false,
+                })
+                .collect(),
             failed,
         );
     };
@@ -608,8 +642,11 @@ fn head_checkout_gate(
             });
             continue;
         }
-        let lines = found.iter().map(hatchrun_workflow::Lint::text).collect();
-        kept.push((plan, lines));
+        kept.push(Checked {
+            warnings: found.iter().map(hatchrun_workflow::Lint::text).collect(),
+            head_checkout: found.iter().any(|lint| lint.kind.is_head_checkout()),
+            plan,
+        });
     }
     (kept, failed)
 }
@@ -646,8 +683,89 @@ async fn report_invalid(
     req: &Request<'_>,
     diagnostics: &[Diagnostic],
 ) -> Result<()> {
-    let check = invalid_config_check_run(diagnostics, report_sha(req));
+    let check = if req.origin.target.is_some() {
+        failed_check_run(
+            CONFIG_TARGET_CHECK,
+            "Invalid hatchrun config",
+            "so no pull_request_target workflow started",
+            diagnostics,
+            report_sha(req),
+        )
+    } else {
+        invalid_config_check_run(diagnostics, req.sha)
+    };
     report_once(tokens, settings, req, &check).await
+}
+
+/// Completes the failed `<workflow> / pull_request_target` check run on
+/// the pull request's head, if an earlier delivery made one, as neutral:
+/// the workflow starts now. Best effort.
+async fn clear_blocked(
+    tokens: &Tokens<'_, Kv, App, Counted>,
+    settings: &Settings,
+    req: &Request<'_>,
+    workflow: &str,
+) {
+    let name = format!("{workflow} / pull_request_target");
+    let sha = report_sha(req);
+    let cleared = async {
+        let listed = tokens
+            .send(req.installation_id, |token| {
+                github::check_runs_named(
+                    &settings.github_api,
+                    &req.repo.full_name,
+                    sha,
+                    &name,
+                    token,
+                )
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        let Some(id) = github::own_check_run(&listed, &settings.app_id)? else {
+            return Ok(());
+        };
+        let check = cleared_check_run(&name, sha, workflow);
+        tokens
+            .send(req.installation_id, |token| {
+                github::update_check_run(
+                    &settings.github_api,
+                    &req.repo.full_name,
+                    id,
+                    token,
+                    &check,
+                )
+            })
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+    .await;
+    if let Err(err) = cleared {
+        let repo = &req.repo.full_name;
+        worker::console_error!("{repo}: clear the refusal of {workflow}: {err}");
+    }
+}
+
+/// The check run that replaces a refusal once the workflow starts.
+#[must_use]
+pub fn cleared_check_run(name: &str, sha: &str, workflow: &str) -> CheckRun {
+    CheckRun {
+        name: name.to_owned(),
+        head_sha: sha.to_owned(),
+        external_id: String::new(),
+        details_url: String::new(),
+        status: "completed".to_owned(),
+        started_at: None,
+        conclusion: Some("neutral".to_owned()),
+        completed_at: None,
+        actions: Vec::new(),
+        output: Some(Output {
+            title: "Workflow started".to_owned(),
+            summary: format!("Workflow `{workflow}` started on the base branch."),
+            text: None,
+            annotations: Vec::new(),
+        }),
+    }
 }
 
 /// Creates `check` on the commit unless a check run of its name is
@@ -766,18 +884,16 @@ fn title_of(
     Ok((!title.is_empty()).then(|| title.chars().take(MAX_MESSAGE).collect()))
 }
 
-/// Records the run of `plan`, with its jobs, and has its object start.
-/// `warnings` are what the planner found in the plan, shown in the check
-/// runs of its jobs.
+/// Records the run of a plan, with its jobs, and has its object start.
 async fn start_plan(
     env: &Env,
     db: &Db,
     settings: &Settings,
     req: &Request<'_>,
-    plan: &Plan,
-    warnings: &[String],
+    checked: &Checked,
     now: u64,
 ) -> Result<u64> {
+    let (plan, warnings) = (&checked.plan, &checked.warnings);
     let limited;
     let plan = match &req.origin.policy {
         Some(policy) => {
@@ -806,6 +922,7 @@ async fn start_plan(
         author_login: req.origin.author.to_owned(),
         author_association: req.origin.association.to_owned(),
         gate_status: req.origin.gate,
+        head_checkout: checked.head_checkout,
         now,
     };
     let (run, fresh) = match store::insert_run(db, &new).await? {
@@ -1181,8 +1298,49 @@ mod tests {
         );
         assert_eq!(failed.len(), 0);
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].1.len(), 1);
-        assert!(plans[0].1[0].contains("checks out the pull request head"));
+        assert_eq!(plans[0].warnings.len(), 1);
+        assert!(plans[0].warnings[0].contains("checks out the pull request head"));
+        // The run records that its plan has one, for a rerun under a
+        // policy that has turned to block.
+        assert!(plans[0].head_checkout);
+    }
+
+    #[test]
+    fn a_plan_without_a_head_checkout_records_none() {
+        let (plans, _) = head_checkout_gate(
+            vec![target_plan(INJECTION)],
+            Vec::new(),
+            Some(HeadCheckout::Warn),
+        );
+        assert!(!plans[0].head_checkout);
+    }
+
+    #[test]
+    fn the_head_passed_through_env_is_blocked_at_planning() {
+        let steps = "      - run: git fetch origin $PR_SHA\n        env:\n          PR_SHA: ${{ github.event.pull_request.head.sha }}";
+        let (plans, failed) = head_checkout_gate(
+            vec![target_plan(steps)],
+            Vec::new(),
+            Some(HeadCheckout::Block),
+        );
+        assert_eq!((plans.len(), failed.len()), (0, 1));
+    }
+
+    #[test]
+    fn a_refusal_is_cleared_by_a_neutral_report_of_the_same_name_on_the_head() {
+        let check = cleared_check_run("w / pull_request_target", "headsha", "w");
+        assert_eq!(check.name, "w / pull_request_target");
+        assert_eq!(check.head_sha, "headsha");
+        assert_eq!(check.conclusion.as_deref(), Some("neutral"));
+        assert_eq!(check.status, "completed");
+        // It replaces the refusal: the same name the refusal was made with.
+        assert_eq!(check.name, blocked_check_run("w", &[], "headsha").name);
+    }
+
+    #[test]
+    fn a_base_config_error_for_a_target_run_has_its_own_name() {
+        assert_ne!(CONFIG_TARGET_CHECK, CONFIG_CHECK);
+        assert!(CONFIG_TARGET_CHECK.contains("pull_request_target"));
     }
 
     #[test]
@@ -1192,7 +1350,7 @@ mod tests {
                 head_checkout_gate(vec![target_plan(INJECTION)], Vec::new(), Some(rule));
             assert!(failed.is_empty(), "{rule:?}");
             assert_eq!(plans.len(), 1, "{rule:?}");
-            assert!(plans[0].1[0].contains("github.event.pull_request.title"));
+            assert!(plans[0].warnings[0].contains("github.event.pull_request.title"));
         }
     }
 
@@ -1204,13 +1362,13 @@ mod tests {
             Some(HeadCheckout::Block),
         );
         assert_eq!((plans.len(), failed.len()), (1, 0));
-        assert_eq!(plans[0].1.len(), 0);
+        assert_eq!(plans[0].warnings.len(), 0);
         // The rule is about pull_request_target; a pull_request run that
         // checks out its own head is what that event is for.
         let (plans, failed) =
             head_checkout_gate(vec![target_plan(HEAD_CHECKOUT)], Vec::new(), None);
         assert_eq!((plans.len(), failed.len()), (1, 0));
-        assert_eq!(plans[0].1.len(), 0);
+        assert_eq!(plans[0].warnings.len(), 0);
     }
 
     #[test]
@@ -1287,7 +1445,7 @@ mod tests {
             Some(HeadCheckout::Block),
         );
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].0.workflow, "clean");
+        assert_eq!(plans[0].plan.workflow, "clean");
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].workflow, "w");
     }
@@ -1484,6 +1642,7 @@ mod tests {
                     author_login: "octocat".into(),
                     author_association: String::new(),
                     gate_status: GateStatus::NotGated,
+                    head_checkout: false,
                     now: 1,
                 },
             ))

@@ -144,46 +144,18 @@ fn needs_paths(source: &str, event: &Event) -> bool {
     })
 }
 
-/// Whether any workflow of `source` listens to `pull_request_target`,
-/// so the base branch's config is worth planning for a pull request.
-/// False when the config does not parse.
+/// Whether `source` may have a workflow that listens to
+/// `pull_request_target`, so the base branch's config is worth planning
+/// for a pull request. A config that does not parse may: it is planned
+/// so that the error is reported.
 #[must_use]
-pub fn has_pull_request_target(source: &str) -> bool {
-    parse(source).is_ok_and(|config| {
+pub fn may_have_pull_request_target(source: &str) -> bool {
+    parse(source).map_or(true, |config| {
         config
             .workflows
             .values()
             .any(|wf| wf.on.pull_request_target.is_some())
     })
-}
-
-/// Whether the plan of `workflow` in `source`, compiled for
-/// `compile_ref`, checks out the pull request head (or something that
-/// may be it): what a repository that blocks head checkouts looks for
-/// again when a run is rerun.
-///
-/// # Errors
-///
-/// The config or the workflow does not compile, so the plan cannot be
-/// read.
-pub fn plan_checks_out_head(
-    source: &str,
-    workflow: &str,
-    compile_ref: &str,
-) -> Result<bool, String> {
-    let config = parse(source).map_err(|d| first_message(&d))?;
-    let plan = compile_with(&config, workflow, compile_ref, &Library::default())
-        .map_err(|d| first_message(&d))?;
-    Ok(hatchrun_workflow::plan_lints(&plan)
-        .iter()
-        .any(|lint| lint.kind.is_head_checkout()))
-}
-
-fn first_message(diagnostics: &[Diagnostic]) -> String {
-    diagnostics.first().map_or_else(
-        || "the config does not compile".to_owned(),
-        |d| d.message.clone(),
-    )
 }
 
 /// Every `(workflow, cron)` pair of `on: schedule`, in workflow name
@@ -255,35 +227,12 @@ workflows:
   a: { on: { pull_request: {} }, jobs: [t] }
   b: { on: { pull_request_target: {} }, jobs: [t] }
 ";
-        assert!(has_pull_request_target(config));
-        assert!(!has_pull_request_target(
+        assert!(may_have_pull_request_target(config));
+        assert!(!may_have_pull_request_target(
             &config.replace("pull_request_target", "push")
         ));
-        assert!(!has_pull_request_target("not: [valid"));
-    }
-
-    #[test]
-    fn a_plan_that_checks_out_the_head_is_found_for_a_rerun() {
-        let source = |steps: &str| {
-            format!(
-                "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n{steps}\n\
-                 workflows:\n  w:\n    on: {{ pull_request_target: {{}} }}\n    jobs: [t]\n"
-            )
-        };
-        let head = source(
-            "      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github['event'].pull_request.head.sha }}",
-        );
-        assert_eq!(
-            plan_checks_out_head(&head, "w", "refs/heads/main"),
-            Ok(true)
-        );
-        let clean = source("      - run: make test");
-        assert_eq!(
-            plan_checks_out_head(&clean, "w", "refs/heads/main"),
-            Ok(false)
-        );
-        assert!(plan_checks_out_head(&clean, "gone", "refs/heads/main").is_err());
-        assert!(plan_checks_out_head("jobs: [", "w", "refs/heads/main").is_err());
+        // A config that cannot be read is planned, to report it.
+        assert!(may_have_pull_request_target("not: [valid"));
     }
 
     #[test]

@@ -1319,6 +1319,22 @@ fn a_refresh_that_finishes_after_a_decision_cannot_clear_the_decisions_mark() {
 }
 
 #[test]
+fn a_run_records_whether_its_plan_has_a_head_checkout() {
+    let db = setup();
+    let mut with = new_run("d-head", "ci", 10);
+    with.event = "pull_request_target".into();
+    with.head_checkout = true;
+    let with = db.wait(insert_run(db.db(), &with)).unwrap().unwrap();
+    let without = db
+        .wait(insert_run(db.db(), &new_run("d-plain", "ci", 11)))
+        .unwrap()
+        .unwrap();
+    assert!(db.wait(run_head_checkout(db.db(), with.id)).unwrap());
+    assert!(!db.wait(run_head_checkout(db.db(), without.id)).unwrap());
+    assert!(!db.wait(run_head_checkout(db.db(), 999_999)).unwrap());
+}
+
+#[test]
 fn a_pull_request_and_a_pull_request_target_run_of_one_workflow_both_exist() {
     let db = setup();
     // One delivery starts both for a workflow that listens to both events.

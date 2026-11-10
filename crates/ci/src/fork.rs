@@ -1148,28 +1148,19 @@ pub const fn rerun_refusal(run: &RunRow, policy: Option<&RepoPolicy>) -> Option<
 /// repository now blocks head checkouts and the run's plan has one.
 pub const HEAD_CHECKOUT_BLOCKED: &str = "This repository blocks pull_request_target workflows that check out the pull request head, so the run was not rerun.";
 
-/// What a rerun of a `pull_request_target` run is told when its plan
-/// cannot be read to check it against a blocking repository policy.
-pub const HEAD_CHECKOUT_UNCHECKED: &str = "This repository blocks pull_request_target workflows that check out the pull request head, and the run's workflow could not be checked, so the run was not rerun.";
-
 /// Why a rerun of a `pull_request_target` run is refused under the
 /// repository's current `rule`: it blocks head checkouts and the plan
-/// `checked` (read again from the run's commit) has one, or cannot be
-/// read. `None` when the rule is `warn`, and for a run of another event.
+/// the run was made with (`head_checkout`, as the planner recorded it,
+/// callee workflows included) has one. `None` when the rule is `warn`,
+/// and for a run of another event.
 #[must_use]
 pub fn target_rerun_refusal(
     event: &str,
     rule: crate::policy::HeadCheckout,
-    checked: &Result<bool, String>,
+    head_checkout: bool,
 ) -> Option<&'static str> {
-    if event != "pull_request_target" || rule != crate::policy::HeadCheckout::Block {
-        return None;
-    }
-    match checked {
-        Ok(false) => None,
-        Ok(true) => Some(HEAD_CHECKOUT_BLOCKED),
-        Err(_) => Some(HEAD_CHECKOUT_UNCHECKED),
-    }
+    (event == "pull_request_target" && rule == crate::policy::HeadCheckout::Block && head_checkout)
+        .then_some(HEAD_CHECKOUT_BLOCKED)
 }
 
 /// The check run that says on commit `sha` why a rerun was refused.
@@ -1188,17 +1179,18 @@ pub async fn say_rerun_refused(
     tokens: &Tokens<'_, Kv, App, Counted>,
     settings: &Settings,
     repo: &RepoRow,
+    sha: &str,
     run: &RunRow,
     message: &str,
 ) {
-    let check = rerun_check_run(&run.sha, message);
+    let check = rerun_check_run(sha, message);
     let sent = async {
         let listed = tokens
             .send(repo.installation_id, |token| {
                 github::check_runs_named(
                     &settings.github_api,
                     &repo.full_name,
-                    &run.sha,
+                    sha,
                     RERUN_CHECK,
                     token,
                 )
@@ -1416,19 +1408,14 @@ mod tests {
         let target = "pull_request_target";
         // The policy was warn when the run started and is block now.
         assert_eq!(
-            target_rerun_refusal(target, Block, &Ok(true)),
+            target_rerun_refusal(target, Block, true),
             Some(HEAD_CHECKOUT_BLOCKED)
         );
-        // A plan that cannot be read cannot be shown clean.
-        assert_eq!(
-            target_rerun_refusal(target, Block, &Err("bad".into())),
-            Some(HEAD_CHECKOUT_UNCHECKED)
-        );
-        assert_eq!(target_rerun_refusal(target, Block, &Ok(false)), None);
-        assert_eq!(target_rerun_refusal(target, Warn, &Ok(true)), None);
+        assert_eq!(target_rerun_refusal(target, Block, false), None);
+        assert_eq!(target_rerun_refusal(target, Warn, true), None);
         // Runs of other events are not this rule's business.
-        assert_eq!(target_rerun_refusal("pull_request", Block, &Ok(true)), None);
-        assert_eq!(target_rerun_refusal("push", Block, &Ok(true)), None);
+        assert_eq!(target_rerun_refusal("pull_request", Block, true), None);
+        assert_eq!(target_rerun_refusal("push", Block, true), None);
     }
 
     #[test]
