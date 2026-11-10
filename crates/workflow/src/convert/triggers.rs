@@ -153,6 +153,10 @@ impl Cx {
                 Ok(pr) => triggers.pull_request = Some(pr.unwrap_or_default()),
                 Err(err) => self.error(bad(err)),
             },
+            "pull_request_target" => match Option::<PullRequestTrigger>::deserialize(body) {
+                Ok(pr) => triggers.pull_request_target = Some(pr.unwrap_or_default()),
+                Err(err) => self.error(bad(err)),
+            },
             "schedule" => match Vec::<Schedule>::deserialize(body) {
                 Ok(schedule) => triggers.schedule = schedule,
                 Err(err) => self.error(bad(err)),

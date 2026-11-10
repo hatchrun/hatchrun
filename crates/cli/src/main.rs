@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hatchrun_workflow::{Diagnostic, MAX_SOURCE, convert, parse, to_yaml, validate};
+use hatchrun_workflow::{Diagnostic, MAX_SOURCE, convert, lints, parse, to_yaml, validate};
 
 #[derive(Parser)]
 #[command(name = "hatchrun", version = env!("HATCHRUN_VERSION"), about)]
@@ -23,7 +23,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check a workflow file and print every problem found
+    /// Check a workflow file and print every problem found, and warnings about
+    /// workflows that run attacker-influenced input with secrets
     Validate {
         /// The workflow file
         #[arg(default_value = ".hatchrun/config.yml")]
@@ -85,12 +86,15 @@ fn read_source(path: &Path) -> Result<Result<String, String>> {
 
 fn run_validate(path: &Path) -> Result<ExitCode> {
     let source = read_source(path)?.map_err(anyhow::Error::msg)?;
-    let problems = match parse(&source) {
-        Ok(config) => validate(&config),
-        Err(problems) => problems,
+    let (problems, warnings) = match parse(&source) {
+        Ok(config) => (validate(&config), lints(&config)),
+        Err(problems) => (problems, Vec::new()),
     };
     for problem in &problems {
         println!("{}", located(path, problem));
+    }
+    for warning in &warnings {
+        eprintln!("warning: {}", located(path, warning));
     }
     Ok(exit(problems.is_empty()))
 }

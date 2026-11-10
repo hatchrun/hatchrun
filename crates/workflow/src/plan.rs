@@ -592,17 +592,25 @@ fn filter_errors(config: &Config, errors: &mut Vec<Diagnostic>) {
             check(&owner, "on.push.paths", push.paths.as_ref());
             check(&owner, "on.push.paths-ignore", push.paths_ignore.as_ref());
         }
-        if let Some(pr) = &wf.on.pull_request {
-            check(&owner, "on.pull_request.branches", pr.branches.as_ref());
+        for (event, pr) in [
+            ("pull_request", &wf.on.pull_request),
+            ("pull_request_target", &wf.on.pull_request_target),
+        ] {
+            let Some(pr) = pr else { continue };
             check(
                 &owner,
-                "on.pull_request.branches-ignore",
+                &format!("on.{event}.branches"),
+                pr.branches.as_ref(),
+            );
+            check(
+                &owner,
+                &format!("on.{event}.branches-ignore"),
                 pr.branches_ignore.as_ref(),
             );
-            check(&owner, "on.pull_request.paths", pr.paths.as_ref());
+            check(&owner, &format!("on.{event}.paths"), pr.paths.as_ref());
             check(
                 &owner,
-                "on.pull_request.paths-ignore",
+                &format!("on.{event}.paths-ignore"),
                 pr.paths_ignore.as_ref(),
             );
         }
@@ -1397,19 +1405,18 @@ fn trigger_errors(config: &Config, name: &str, on: &Triggers, errors: &mut Vec<D
             push.paths_ignore.as_ref(),
         );
     }
-    if let Some(pr) = &on.pull_request {
+    for (event, pr) in [
+        ("pull_request", &on.pull_request),
+        ("pull_request_target", &on.pull_request_target),
+    ] {
+        let Some(pr) = pr else { continue };
         both(
-            "pull_request",
+            event,
             "branches",
             pr.branches.as_ref(),
             pr.branches_ignore.as_ref(),
         );
-        both(
-            "pull_request",
-            "paths",
-            pr.paths.as_ref(),
-            pr.paths_ignore.as_ref(),
-        );
+        both(event, "paths", pr.paths.as_ref(), pr.paths_ignore.as_ref());
     }
     if let Some(run) = &on.workflow_run {
         both(

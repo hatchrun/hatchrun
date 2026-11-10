@@ -145,6 +145,37 @@ fn pull_request_filters() {
     assert!(!triggered(&t, &pr("opened", "main", &["src/a"])));
 }
 
+fn target(action: &str, base: &str, changed: &[&str]) -> Event {
+    Event::PullRequestTarget {
+        action: action.into(),
+        base_ref: base.into(),
+        changed: changed.iter().map(|c| (*c).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn pull_request_target_takes_the_types_and_filters_of_pull_request() {
+    let t = on("pull_request_target: {}");
+    assert!(triggered(&t, &target("opened", "main", &[])));
+    assert!(triggered(&t, &target("synchronize", "main", &[])));
+    assert!(!triggered(&t, &target("labeled", "main", &[])));
+    let t = on("pull_request_target: { types: [labeled], branches: [main], paths: ['src/**'] }");
+    assert!(triggered(&t, &target("labeled", "main", &["src/a"])));
+    assert!(!triggered(&t, &target("labeled", "dev", &["src/a"])));
+    assert!(!triggered(&t, &target("labeled", "main", &["x"])));
+    assert!(!triggered(&t, &target("opened", "main", &["src/a"])));
+}
+
+#[test]
+fn pull_request_and_pull_request_target_are_separate_triggers() {
+    let only_pr = on("pull_request: {}");
+    let only_target = on("pull_request_target: {}");
+    assert!(triggered(&only_pr, &pr("opened", "main", &[])));
+    assert!(!triggered(&only_pr, &target("opened", "main", &[])));
+    assert!(triggered(&only_target, &target("opened", "main", &[])));
+    assert!(!triggered(&only_target, &pr("opened", "main", &[])));
+}
+
 #[test]
 fn schedule_and_dispatch() {
     let t = on("schedule: [{ cron: '0 3 * * *' }]\nworkflow_dispatch:");

@@ -141,6 +141,8 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
             cx.errors.push(Diagnostic::new(plan::too_many_jobs(name)));
         }
     }
+    // The warnings of `validate` that do not stop a config from running.
+    cx.warnings.extend(crate::lint::lints(&cx.config));
     match to_yaml(&cx.config) {
         Ok(yaml) if yaml.len() > MAX_SOURCE => cx.errors.push(Diagnostic::new(format!(
             "the converted config is {} bytes; the limit is {MAX_SOURCE}",
@@ -224,11 +226,11 @@ const STEP_KEYS: &[&str] = &[
 const UNSUPPORTED_CONTEXTS: &[&str] = &["jobs"];
 
 /// The events hatchrun can start a workflow on.
-const EVENTS: &str = "push, pull_request, schedule, workflow_dispatch, workflow_run, release, create, delete, merge_group and repository_dispatch";
+const EVENTS: &str = "push, pull_request, pull_request_target, schedule, workflow_dispatch, workflow_run, release, create, delete, merge_group and repository_dispatch";
 
 /// Events that only GitHub can deliver, as they act on GitHub's own
 /// issues and pull requests with the base repository's secrets.
-const GITHUB_ONLY: &[&str] = &["pull_request_target", "issues", "issue_comment"];
+const GITHUB_ONLY: &[&str] = &["issues", "issue_comment"];
 
 /// The part of a GitHub workflow file the converter reads.
 #[derive(Deserialize, Clone)]

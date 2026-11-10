@@ -20,6 +20,7 @@ pub mod dynamic;
 pub mod environment;
 pub mod expr;
 pub mod job;
+pub mod lint;
 pub mod permissions;
 pub mod plan;
 pub mod secrets;
@@ -55,6 +56,7 @@ pub use job::{
     Annotation, AnnotationLevel, ArtifactService, CacheService, Conclusion, Github, IdTokenRequest,
     JobDocument, JobResult, Need, StepSummary,
 };
+pub use lint::{Lint, LintKind, lints, plan_lints};
 pub use permissions::{
     DEFAULT_SCOPES, ID_TOKEN, ID_TOKEN_SCOPE, Level, Permissions, SCOPES, token_scopes,
 };
