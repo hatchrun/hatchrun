@@ -5,7 +5,7 @@
 //! Runner image releases from hatchrun/images.
 //!
 //! Each release of hatchrun/images carries a `manifest.json` with the
-//! AMI that AWS Marketplace serves in every region, per architecture:
+//! AMI the build made in each region, per architecture:
 //!
 //! ```json
 //! { "version": "20261013.1915", "ubuntu": "26.04", "runner": "...",
@@ -14,7 +14,7 @@
 //! ```
 //!
 //! Its build posts the manifest to `POST /api/internal/images` once
-//! Marketplace serves the AMIs, with a GitHub Actions token that only
+//! the release exists, with a GitHub Actions token that only
 //! its release job can get (see [`POLICY`]). The Worker writes one row
 //! per region and architecture to the `images` table, which launches
 //! read.
@@ -31,8 +31,8 @@ pub const PATH: &str = "/api/internal/images";
 pub const AUDIENCE: &str = "https://app.hatchrun.io";
 /// The only callers: the `register.yml` job of hatchrun/images, on
 /// its protected main branch, in its `image-build` environment, on a
-/// GitHub-hosted runner. `build.yml` calls it once Marketplace serves
-/// the AMIs, on a push, the schedule or by hand, and it runs by hand on
+/// GitHub-hosted runner. `build.yml` calls it once the release exists,
+/// on a push, the schedule or by hand, and it runs by hand on
 /// its own to post a release again. Events that run code from outside
 /// the repository, such as `pull_request_target` or `workflow_run`,
 /// are refused even on main.

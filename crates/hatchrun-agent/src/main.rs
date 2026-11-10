@@ -54,8 +54,7 @@ enum Command {
     /// Mark the instance as launched for CI, for hatchrun-launch.service.
     ///
     /// Writes the mark file when user data names a CI launch. An instance
-    /// launched any other way, by hand or by the AWS Marketplace scan,
-    /// gets no mark, so hatchrun-agent.service stays off instead of
+    /// launched any other way, by hand, gets no mark, so hatchrun-agent.service stays off instead of
     /// powering it off. When the metadata cannot be read the instance is
     /// marked, so a CI instance never sits idle and billed.
     Detect {
