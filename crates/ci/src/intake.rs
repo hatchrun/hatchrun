@@ -75,9 +75,6 @@ pub struct PullRequest {
     pub head_ref: String,
     /// The base branch, as a short name.
     pub base_ref: String,
-    /// The head of the base branch when GitHub sent the delivery: what a
-    /// `pull_request_target` workflow is read at and runs on.
-    pub base_sha: String,
     /// The login of the user behind the activity.
     pub actor: String,
     /// The pull request's title.
@@ -549,7 +546,6 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
                 head_sha: p.pull_request.head.sha,
                 head_ref: p.pull_request.head.r#ref,
                 base_ref: p.pull_request.base.r#ref,
-                base_sha: p.pull_request.base.sha,
                 author: p
                     .pull_request
                     .user
@@ -747,7 +743,6 @@ mod tests {
         assert_eq!(p.head_sha, "3333333333333333333333333333333333333333");
         assert_eq!(p.head_ref, "feature");
         assert_eq!(p.base_ref, "main");
-        assert_eq!(p.base_sha, "1111111111111111111111111111111111111111");
         assert_eq!(p.actor, "octocat");
         assert_eq!(p.repo.id, 4242);
         assert!(!p.repo.private);

@@ -55,9 +55,19 @@ pub struct Origin<'a> {
     /// The repository's fork policy, for a fork pull request: its jobs
     /// are cut to the policy's timeout and to 4 vCPUs.
     pub policy: Option<RepoPolicy>,
-    /// What a `pull_request_target` workflow that checks out the pull
-    /// request head does. Read for that event only.
+    /// Set for the runs of a `pull_request_target` event only.
+    pub target: Option<Target<'a>>,
+}
+
+/// What a `pull_request_target` request needs beyond its origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Target<'a> {
+    /// What a workflow that checks out the pull request head does.
     pub head_checkout: HeadCheckout,
+    /// The pull request's head commit. The run is on the base commit,
+    /// where nobody looks, so what the planner has to say that must be
+    /// seen (a workflow that did not start) goes on this commit.
+    pub head_sha: &'a str,
 }
 
 impl<'a> Origin<'a> {
@@ -73,7 +83,7 @@ impl<'a> Origin<'a> {
             association: "",
             gate: GateStatus::NotGated,
             policy: None,
-            head_checkout: HeadCheckout::Warn,
+            target: None,
         }
     }
 }
@@ -290,6 +300,28 @@ pub fn invalid_workflow_check_run(
     )
 }
 
+/// The failed check run of a `pull_request_target` workflow that did not
+/// start (it did not compile, or the repository blocks what it does),
+/// named `<workflow> / pull_request_target` so it never stands in for
+/// the same workflow's `pull_request` run on the same commit.
+#[must_use]
+pub fn blocked_check_run(workflow: &str, diagnostics: &[Diagnostic], sha: &str) -> CheckRun {
+    failed_check_run(
+        &format!("{workflow} / pull_request_target"),
+        "Workflow did not start",
+        &format!("so workflow `{workflow}` did not start"),
+        diagnostics,
+        sha,
+    )
+}
+
+/// The commit the planner's reports go on: the head of the pull request
+/// for a `pull_request_target` request, whose own commit is the base
+/// branch's, and the request's commit otherwise.
+fn report_sha<'a>(req: &Request<'a>) -> &'a str {
+    req.origin.target.map_or(req.sha, |target| target.head_sha)
+}
+
 /// A completed, failed check run `name` that lists `diagnostics` in its
 /// summary, `consequence` ending the first line, and annotates the
 /// config file with them.
@@ -483,11 +515,11 @@ pub async fn create(
         }
     };
     let (plans, failed) =
-        head_checkout_gate(plans, failed, req.event_name, req.origin.head_checkout);
+        head_checkout_gate(plans, failed, req.origin.target.map(|t| t.head_checkout));
     match billing_decision(tenant.ci_billing, plans.len()) {
         Billing::Run => {}
         Billing::AskForCard => {
-            let check = no_card_check_run(req.sha, &tenant.org_login, &settings.app_url);
+            let check = no_card_check_run(report_sha(req), &tenant.org_login, &settings.app_url);
             report_once(tokens, settings, req, &check).await?;
             return Ok(Vec::new());
         }
@@ -500,7 +532,11 @@ pub async fn create(
     // The good workflows run first: a GitHub error on a failed
     // workflow's check run must not keep them from starting.
     for workflow in &failed {
-        let check = invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, req.sha);
+        let check = if req.origin.target.is_some() {
+            blocked_check_run(&workflow.workflow, &workflow.diagnostics, report_sha(req))
+        } else {
+            invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, req.sha)
+        };
         if let Err(err) = report_once(tokens, settings, req, &check).await {
             worker::console_error!(
                 "{}: check run for the invalid workflow {}: {err}",
@@ -547,21 +583,20 @@ const HEAD_CHECKOUT_BLOCKED: &str = "this repository blocks pull_request_target 
 fn head_checkout_gate(
     plans: Vec<Plan>,
     mut failed: Vec<Failed>,
-    event_name: &str,
-    rule: HeadCheckout,
+    rule: Option<HeadCheckout>,
 ) -> (Vec<(Plan, Vec<String>)>, Vec<Failed>) {
-    if event_name != "pull_request_target" {
+    let Some(rule) = rule else {
         return (
             plans.into_iter().map(|plan| (plan, Vec::new())).collect(),
             failed,
         );
-    }
+    };
     let mut kept = Vec::new();
     for plan in plans {
         let found = hatchrun_workflow::plan_lints(&plan);
         let head: Vec<String> = found
             .iter()
-            .filter(|lint| lint.kind == hatchrun_workflow::LintKind::HeadCheckout)
+            .filter(|lint| lint.kind.is_head_checkout())
             .map(hatchrun_workflow::Lint::text)
             .collect();
         if !head.is_empty() && rule == HeadCheckout::Block {
@@ -611,7 +646,7 @@ async fn report_invalid(
     req: &Request<'_>,
     diagnostics: &[Diagnostic],
 ) -> Result<()> {
-    let check = invalid_config_check_run(diagnostics, req.sha);
+    let check = invalid_config_check_run(diagnostics, report_sha(req));
     report_once(tokens, settings, req, &check).await
 }
 
@@ -629,7 +664,7 @@ async fn report_once(
             github::check_runs_named(
                 &settings.github_api,
                 &req.repo.full_name,
-                req.sha,
+                &check.head_sha,
                 &check.name,
                 token,
             )
@@ -1121,8 +1156,7 @@ mod tests {
         let (plans, failed) = head_checkout_gate(
             vec![target_plan(HEAD_CHECKOUT)],
             Vec::new(),
-            "pull_request_target",
-            HeadCheckout::Block,
+            Some(HeadCheckout::Block),
         );
         assert!(plans.is_empty(), "the plan must not start");
         assert_eq!(failed.len(), 1);
@@ -1143,8 +1177,7 @@ mod tests {
         let (plans, failed) = head_checkout_gate(
             vec![target_plan(HEAD_CHECKOUT)],
             Vec::new(),
-            "pull_request_target",
-            HeadCheckout::Warn,
+            Some(HeadCheckout::Warn),
         );
         assert_eq!(failed.len(), 0);
         assert_eq!(plans.len(), 1);
@@ -1155,12 +1188,8 @@ mod tests {
     #[test]
     fn script_injection_warns_and_is_never_blocked() {
         for rule in [HeadCheckout::Warn, HeadCheckout::Block] {
-            let (plans, failed) = head_checkout_gate(
-                vec![target_plan(INJECTION)],
-                Vec::new(),
-                "pull_request_target",
-                rule,
-            );
+            let (plans, failed) =
+                head_checkout_gate(vec![target_plan(INJECTION)], Vec::new(), Some(rule));
             assert!(failed.is_empty(), "{rule:?}");
             assert_eq!(plans.len(), 1, "{rule:?}");
             assert!(plans[0].1[0].contains("github.event.pull_request.title"));
@@ -1172,21 +1201,80 @@ mod tests {
         let (plans, failed) = head_checkout_gate(
             vec![target_plan("      - run: make test")],
             Vec::new(),
-            "pull_request_target",
-            HeadCheckout::Block,
+            Some(HeadCheckout::Block),
         );
         assert_eq!((plans.len(), failed.len()), (1, 0));
         assert_eq!(plans[0].1.len(), 0);
         // The rule is about pull_request_target; a pull_request run that
         // checks out its own head is what that event is for.
-        let (plans, failed) = head_checkout_gate(
-            vec![target_plan(HEAD_CHECKOUT)],
-            Vec::new(),
-            "pull_request",
-            HeadCheckout::Block,
-        );
+        let (plans, failed) =
+            head_checkout_gate(vec![target_plan(HEAD_CHECKOUT)], Vec::new(), None);
         assert_eq!((plans.len(), failed.len()), (1, 0));
         assert_eq!(plans[0].1.len(), 0);
+    }
+
+    #[test]
+    fn a_checkout_that_may_be_the_head_is_blocked_too_and_a_report_is_on_the_pull_request() {
+        let maybe =
+            "      - uses: actions/checkout@v4\n        with:\n          ref: ${{ matrix.ref }}";
+        let (plans, failed) = head_checkout_gate(
+            vec![target_plan(maybe)],
+            Vec::new(),
+            Some(HeadCheckout::Block),
+        );
+        assert_eq!(plans.len(), 0);
+        assert_eq!(failed.len(), 1);
+        let (plans, _) = head_checkout_gate(
+            vec![target_plan(maybe)],
+            Vec::new(),
+            Some(HeadCheckout::Warn),
+        );
+        assert_eq!(plans.len(), 1);
+        // The report of a workflow that did not start is named for the
+        // event and on the pull request's head, never the base commit.
+        let check = blocked_check_run("w", &failed[0].diagnostics, "headsha");
+        assert_eq!(check.name, "w / pull_request_target");
+        assert_eq!(check.head_sha, "headsha");
+        assert_eq!(check.conclusion.as_deref(), Some("failure"));
+        assert_ne!(check.name, invalid_workflow_check_run("w", &[], "x").name);
+    }
+
+    #[test]
+    fn the_planners_reports_go_on_the_head_for_a_target_request_only() {
+        let event = serde_json::json!({});
+        let trigger = hatchrun_workflow::Event::Dispatch;
+        let repo = Repo {
+            id: 1,
+            full_name: "o/r".into(),
+            default_branch: "main".into(),
+            private: false,
+        };
+        let request = |origin| Request {
+            tenant_id: "t",
+            installation_id: 1,
+            repo: &repo,
+            delivery: "d",
+            event_name: "pull_request_target",
+            event: &event,
+            trigger: &trigger,
+            compile_ref: "refs/heads/main",
+            git_ref: "refs/heads/main",
+            sha: "basesha",
+            actor: "a",
+            head_ref: "",
+            base_ref: "",
+            workflow: None,
+            origin,
+        };
+        let target = Origin {
+            target: Some(Target {
+                head_checkout: HeadCheckout::Block,
+                head_sha: "headsha",
+            }),
+            ..Origin::own("a")
+        };
+        assert_eq!(report_sha(&request(target)), "headsha");
+        assert_eq!(report_sha(&request(Origin::own("a"))), "basesha");
     }
 
     #[test]
@@ -1196,8 +1284,7 @@ mod tests {
         let (plans, failed) = head_checkout_gate(
             vec![clean, target_plan(HEAD_CHECKOUT)],
             Vec::new(),
-            "pull_request_target",
-            HeadCheckout::Block,
+            Some(HeadCheckout::Block),
         );
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].0.workflow, "clean");

@@ -217,6 +217,42 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_request_target_run_is_on_the_base_branch_and_passes_its_rules_as_on_github() {
+        // The run's ref is the base branch, so a branch rule that names
+        // it passes; the event is not `pull_request`, so no rule is
+        // skipped. An environment is the repository's own business: the
+        // run is trusted, and an approval rule still asks.
+        let patterns = ["main".to_owned()];
+        assert!(branch_allowed(
+            &patterns,
+            "pull_request_target",
+            "refs/heads/main"
+        ));
+        assert!(!branch_allowed(
+            &patterns,
+            "pull_request_target",
+            "refs/heads/release"
+        ));
+        assert!(!branch_allowed(
+            &patterns,
+            "pull_request_target",
+            "refs/pull/3/merge"
+        ));
+        assert!(branch_allowed(
+            &[],
+            "pull_request_target",
+            "refs/heads/main"
+        ));
+        let mut run = found(Some(production(&["main"], true)));
+        run.event = "pull_request_target".into();
+        run.git_ref = "refs/heads/main".into();
+        assert!(!matches!(
+            gate("production", &run, None, APP),
+            Gate::Fail(_)
+        ));
+    }
+
+    #[test]
     fn an_environment_without_patterns_still_refuses_a_fork() {
         // `branch_allowed` lets a pull request through when there are no
         // patterns; the fork rule is a separate check before them.

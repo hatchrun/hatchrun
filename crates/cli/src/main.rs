@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hatchrun_workflow::{Diagnostic, MAX_SOURCE, convert, lints, parse, to_yaml, validate};
+use hatchrun_workflow::{Diagnostic, MAX_SOURCE, convert, parse, to_yaml, validate_with_warnings};
 
 #[derive(Parser)]
 #[command(name = "hatchrun", version = env!("HATCHRUN_VERSION"), about)]
@@ -87,7 +87,7 @@ fn read_source(path: &Path) -> Result<Result<String, String>> {
 fn run_validate(path: &Path) -> Result<ExitCode> {
     let source = read_source(path)?.map_err(anyhow::Error::msg)?;
     let (problems, warnings) = match parse(&source) {
-        Ok(config) => (validate(&config), lints(&config)),
+        Ok(config) => validate_with_warnings(&config),
         Err(problems) => (problems, Vec::new()),
     };
     for problem in &problems {

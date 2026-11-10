@@ -671,6 +671,99 @@ fn job_output_read(tokens: &[lexer::Token<'_>], i: usize) -> Option<JobOutputRea
     })
 }
 
+/// What one `${{ }}` of a text reads, from its parsed expression.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reads {
+    /// Each context path the expression reads, lowercased, with a dot
+    /// and a bracket access written the same way: `github.event.x`,
+    /// `github['event']['x']` and `GitHub.Event['X']` are one path. A
+    /// step that is not a name (an index that is computed or not a
+    /// string, `.*`) is `*`.
+    pub paths: Vec<Vec<String>>,
+    /// The string literals in the expression, as written.
+    pub strings: Vec<String>,
+    /// Whether the whole expression is one read or one literal, not a
+    /// call, a comparison or a mix.
+    pub plain: bool,
+}
+
+/// What each `${{ }}` of `text` reads. Text with none gives an empty
+/// list.
+///
+/// # Errors
+///
+/// When a `${{` has no closing `}}` or an expression does not parse.
+pub fn reads(text: &str) -> Result<Vec<Reads>, ExprError> {
+    let mut out = Vec::new();
+    for (start, inner) in expressions(text)? {
+        let ast = tree(inner).map_err(|e| ExprError {
+            message: e.message,
+            offset: e.offset + start,
+        })?;
+        let mut found = Reads {
+            plain: match &ast {
+                parser::Expr::Literal(_) | parser::Expr::Context { .. } => true,
+                parser::Expr::Access { base, .. } => {
+                    matches!(**base, parser::Expr::Context { .. })
+                }
+                _ => false,
+            },
+            ..Reads::default()
+        };
+        collect_reads(&ast, &mut found);
+        out.push(found);
+    }
+    Ok(out)
+}
+
+fn collect_reads(expr: &parser::Expr<'_>, out: &mut Reads) {
+    use parser::{Expr, Step};
+    match expr {
+        Expr::Literal(value) => {
+            if let Value::String(text) = value {
+                out.strings.push(text.clone());
+            }
+        }
+        Expr::Context { name, .. } => out.paths.push(vec![name.to_ascii_lowercase()]),
+        Expr::Not(inner) => collect_reads(inner, out),
+        Expr::Access { base, path } => {
+            if let Expr::Context { name, .. } = &**base {
+                let mut names = vec![name.to_ascii_lowercase()];
+                for step in path {
+                    names.push(match step {
+                        Step::Property(name) => name.to_ascii_lowercase(),
+                        Step::Index(Expr::Literal(Value::String(name))) => {
+                            name.to_ascii_lowercase()
+                        }
+                        Step::Index(_) | Step::Filter => "*".to_owned(),
+                    });
+                }
+                out.paths.push(names);
+            } else {
+                collect_reads(base, out);
+            }
+            for step in path {
+                if let Step::Index(index) = step
+                    && !matches!(index, Expr::Literal(_))
+                {
+                    collect_reads(index, out);
+                }
+            }
+        }
+        Expr::Call { args, .. } | Expr::And(args) | Expr::Or(args) => {
+            for arg in args {
+                collect_reads(arg, out);
+            }
+        }
+        Expr::Compare { first, rest } => {
+            collect_reads(first, out);
+            for (_, operand) in rest {
+                collect_reads(operand, out);
+            }
+        }
+    }
+}
+
 /// Lexes and parses one expression, within the length limit.
 fn tree(expr: &str) -> Result<parser::Expr<'_>, ExprError> {
     if expr.len() > MAX_LEN {

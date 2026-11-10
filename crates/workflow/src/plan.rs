@@ -409,6 +409,15 @@ pub fn compile_with(
 /// substitutes; the plan carries no parameter values to run time.
 #[must_use]
 pub fn validate(config: &Config) -> Vec<Diagnostic> {
+    validate_with_warnings(config).0
+}
+
+/// [`validate`], and the warnings of [`crate::lint`] for the workflows
+/// that run on a guarded event, read from the plans `validate` compiles
+/// anyway. The warnings do not make a config invalid.
+#[must_use]
+pub fn validate_with_warnings(config: &Config) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
+    let mut warnings = Vec::new();
     let mut errors = config_errors(config);
     for (name, executor) in &config.executors {
         if template(&executor.runs_on).is_none() {
@@ -424,7 +433,7 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
         // A file of another repository is not read here: its calls plan
         // nothing, and the host checks them when it plans the workflow.
         let mut calls = Calls::new(None, name);
-        compile_workflow(
+        let plan = compile_workflow(
             config,
             name,
             wf,
@@ -433,11 +442,20 @@ pub fn validate(config: &Config) -> Vec<Diagnostic> {
             &mut calls,
             &mut errors,
         );
+        if let Some(plan) = plan
+            && crate::lint::guarded(&wf.on)
+        {
+            warnings.extend(
+                crate::lint::plan_lints(&plan)
+                    .iter()
+                    .map(|lint| Diagnostic::new(lint.text())),
+            );
+        }
         if budget.spent {
             break;
         }
     }
-    dedup(errors)
+    (dedup(errors), warnings)
 }
 
 /// Whether a planned job can start, as [`ready`] decides it.

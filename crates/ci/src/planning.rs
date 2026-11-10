@@ -100,7 +100,14 @@ pub fn remote_workflows(source: &str, event: &Event) -> Vec<String> {
 /// False when the config does not parse (it is reported without them).
 #[must_use]
 pub fn needs_pull_request_paths(source: &str, action: &str, base_ref: &str) -> bool {
-    needs_paths(source, action, base_ref, false)
+    needs_paths(
+        source,
+        &Event::PullRequest {
+            action: action.to_owned(),
+            base_ref: base_ref.to_owned(),
+            changed: Vec::new(),
+        },
+    )
 }
 
 /// As [`needs_pull_request_paths`], for the workflows of
@@ -108,38 +115,75 @@ pub fn needs_pull_request_paths(source: &str, action: &str, base_ref: &str) -> b
 /// of.
 #[must_use]
 pub fn needs_pull_request_target_paths(source: &str, action: &str, base_ref: &str) -> bool {
-    needs_paths(source, action, base_ref, true)
+    needs_paths(
+        source,
+        &Event::PullRequestTarget {
+            action: action.to_owned(),
+            base_ref: base_ref.to_owned(),
+            changed: Vec::new(),
+        },
+    )
 }
 
-fn needs_paths(source: &str, action: &str, base_ref: &str, target: bool) -> bool {
+/// Whether `event`, a pull request event, starts a workflow that filters
+/// on changed paths. Other events filter on none here.
+fn needs_paths(source: &str, event: &Event) -> bool {
     let Ok(config) = parse(source) else {
         return false;
     };
-    let (action, base_ref, changed) = (action.to_owned(), base_ref.to_owned(), Vec::new());
-    let event = if target {
-        Event::PullRequestTarget {
-            action,
-            base_ref,
-            changed,
-        }
-    } else {
-        Event::PullRequest {
-            action,
-            base_ref,
-            changed,
-        }
-    };
     config.workflows.values().any(|wf| {
-        let on = if target {
-            &wf.on.pull_request_target
-        } else {
-            &wf.on.pull_request
+        let on = match event {
+            Event::PullRequest { .. } => &wf.on.pull_request,
+            Event::PullRequestTarget { .. } => &wf.on.pull_request_target,
+            _ => return false,
         };
-        triggered(&wf.on, &event)
+        triggered(&wf.on, event)
             && on
                 .as_ref()
                 .is_some_and(|pr| pr.paths.is_some() || pr.paths_ignore.is_some())
     })
+}
+
+/// Whether any workflow of `source` listens to `pull_request_target`,
+/// so the base branch's config is worth planning for a pull request.
+/// False when the config does not parse.
+#[must_use]
+pub fn has_pull_request_target(source: &str) -> bool {
+    parse(source).is_ok_and(|config| {
+        config
+            .workflows
+            .values()
+            .any(|wf| wf.on.pull_request_target.is_some())
+    })
+}
+
+/// Whether the plan of `workflow` in `source`, compiled for
+/// `compile_ref`, checks out the pull request head (or something that
+/// may be it): what a repository that blocks head checkouts looks for
+/// again when a run is rerun.
+///
+/// # Errors
+///
+/// The config or the workflow does not compile, so the plan cannot be
+/// read.
+pub fn plan_checks_out_head(
+    source: &str,
+    workflow: &str,
+    compile_ref: &str,
+) -> Result<bool, String> {
+    let config = parse(source).map_err(|d| first_message(&d))?;
+    let plan = compile_with(&config, workflow, compile_ref, &Library::default())
+        .map_err(|d| first_message(&d))?;
+    Ok(hatchrun_workflow::plan_lints(&plan)
+        .iter()
+        .any(|lint| lint.kind.is_head_checkout()))
+}
+
+fn first_message(diagnostics: &[Diagnostic]) -> String {
+    diagnostics.first().map_or_else(
+        || "the config does not compile".to_owned(),
+        |d| d.message.clone(),
+    )
 }
 
 /// Every `(workflow, cron)` pair of `on: schedule`, in workflow name
@@ -200,6 +244,46 @@ workflows:
         assert!(needs_pull_request_paths(config, "labeled", "main"));
         assert!(!needs_pull_request_paths(config, "opened", "main"));
         assert!(!needs_pull_request_paths("not: [valid", "labeled", "main"));
+    }
+
+    #[test]
+    fn a_pull_request_target_listener_is_found_in_the_config() {
+        let config = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  a: { on: { pull_request: {} }, jobs: [t] }
+  b: { on: { pull_request_target: {} }, jobs: [t] }
+";
+        assert!(has_pull_request_target(config));
+        assert!(!has_pull_request_target(
+            &config.replace("pull_request_target", "push")
+        ));
+        assert!(!has_pull_request_target("not: [valid"));
+    }
+
+    #[test]
+    fn a_plan_that_checks_out_the_head_is_found_for_a_rerun() {
+        let source = |steps: &str| {
+            format!(
+                "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n{steps}\n\
+                 workflows:\n  w:\n    on: {{ pull_request_target: {{}} }}\n    jobs: [t]\n"
+            )
+        };
+        let head = source(
+            "      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github['event'].pull_request.head.sha }}",
+        );
+        assert_eq!(
+            plan_checks_out_head(&head, "w", "refs/heads/main"),
+            Ok(true)
+        );
+        let clean = source("      - run: make test");
+        assert_eq!(
+            plan_checks_out_head(&clean, "w", "refs/heads/main"),
+            Ok(false)
+        );
+        assert!(plan_checks_out_head(&clean, "gone", "refs/heads/main").is_err());
+        assert!(plan_checks_out_head("jobs: [", "w", "refs/heads/main").is_err());
     }
 
     #[test]

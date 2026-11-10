@@ -1144,6 +1144,34 @@ pub const fn rerun_refusal(run: &RunRow, policy: Option<&RepoPolicy>) -> Option<
     }
 }
 
+/// What a rerun of a `pull_request_target` run is told when the
+/// repository now blocks head checkouts and the run's plan has one.
+pub const HEAD_CHECKOUT_BLOCKED: &str = "This repository blocks pull_request_target workflows that check out the pull request head, so the run was not rerun.";
+
+/// What a rerun of a `pull_request_target` run is told when its plan
+/// cannot be read to check it against a blocking repository policy.
+pub const HEAD_CHECKOUT_UNCHECKED: &str = "This repository blocks pull_request_target workflows that check out the pull request head, and the run's workflow could not be checked, so the run was not rerun.";
+
+/// Why a rerun of a `pull_request_target` run is refused under the
+/// repository's current `rule`: it blocks head checkouts and the plan
+/// `checked` (read again from the run's commit) has one, or cannot be
+/// read. `None` when the rule is `warn`, and for a run of another event.
+#[must_use]
+pub fn target_rerun_refusal(
+    event: &str,
+    rule: crate::policy::HeadCheckout,
+    checked: &Result<bool, String>,
+) -> Option<&'static str> {
+    if event != "pull_request_target" || rule != crate::policy::HeadCheckout::Block {
+        return None;
+    }
+    match checked {
+        Ok(false) => None,
+        Ok(true) => Some(HEAD_CHECKOUT_BLOCKED),
+        Err(_) => Some(HEAD_CHECKOUT_UNCHECKED),
+    }
+}
+
 /// The check run that says on commit `sha` why a rerun was refused.
 #[must_use]
 pub fn rerun_check_run(sha: &str, message: &str) -> CheckRun {
@@ -1380,6 +1408,27 @@ mod tests {
         // The repository's own code has no approval to lack.
         assert_eq!(rerun_refusal(&row("trusted", "none"), Some(&on)), None);
         assert_eq!(rerun_refusal(&row("trusted", "cancelled"), Some(&on)), None);
+    }
+
+    #[test]
+    fn a_rerun_of_a_target_run_is_rechecked_against_the_policy_now() {
+        use crate::policy::HeadCheckout::{Block, Warn};
+        let target = "pull_request_target";
+        // The policy was warn when the run started and is block now.
+        assert_eq!(
+            target_rerun_refusal(target, Block, &Ok(true)),
+            Some(HEAD_CHECKOUT_BLOCKED)
+        );
+        // A plan that cannot be read cannot be shown clean.
+        assert_eq!(
+            target_rerun_refusal(target, Block, &Err("bad".into())),
+            Some(HEAD_CHECKOUT_UNCHECKED)
+        );
+        assert_eq!(target_rerun_refusal(target, Block, &Ok(false)), None);
+        assert_eq!(target_rerun_refusal(target, Warn, &Ok(true)), None);
+        // Runs of other events are not this rule's business.
+        assert_eq!(target_rerun_refusal("pull_request", Block, &Ok(true)), None);
+        assert_eq!(target_rerun_refusal("push", Block, &Ok(true)), None);
     }
 
     #[test]

@@ -1317,3 +1317,24 @@ fn a_refresh_that_finishes_after_a_decision_cannot_clear_the_decisions_mark() {
     let read = db.wait(super::run(db.db(), waiting.id)).unwrap().unwrap();
     assert!(read.gate_card_dirty);
 }
+
+#[test]
+fn a_pull_request_and_a_pull_request_target_run_of_one_workflow_both_exist() {
+    let db = setup();
+    // One delivery starts both for a workflow that listens to both events.
+    let delivery = "guid-1";
+    let mut pull = new_run(delivery, "ci", 10);
+    pull.event = "pull_request".into();
+    pull.git_ref = "refs/pull/4/merge".into();
+    pull.pull_number = Some(4);
+    let mut target = new_run(&crate::webhook::target_delivery(delivery), "ci", 10);
+    target.event = "pull_request_target".into();
+    target.git_ref = "refs/heads/main".into();
+    target.pull_number = Some(4);
+    let a = db.wait(insert_run(db.db(), &pull)).unwrap();
+    let b = db.wait(insert_run(db.db(), &target)).unwrap();
+    assert!(a.is_some() && b.is_some(), "neither run may be dropped");
+    assert_ne!(a.unwrap().id, b.unwrap().id);
+    // The same key again finds the run it made instead of a second one.
+    assert!(db.wait(insert_run(db.db(), &target)).unwrap().is_none());
+}

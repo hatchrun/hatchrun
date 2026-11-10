@@ -11,27 +11,44 @@
 //!
 //! - [`LintKind::HeadCheckout`]: the workflow checks out the pull
 //!   request's head (the fork's code) and runs it.
+//!   [`LintKind::UnverifiedCheckout`] is a checkout whose `ref` or
+//!   `repository` is an expression that is not provably the base, so
+//!   it may be the head; a repository that blocks head checkouts blocks
+//!   it too.
 //! - [`LintKind::ScriptInjection`]: a field the pull request's author
 //!   writes (title, body, branch name) is interpolated with `${{ }}`
 //!   straight into a `run:` script, where the shell reads it as code.
 //!
-//! The detectors are heuristics over the planned steps, so a workflow
-//! can still be unsafe without a warning. A warning never stops
-//! `validate` or `convert` from succeeding; the host decides what a
-//! head checkout does (see the repository's `pull_request_target_head_checkout`
-//! setting).
+//! Expressions are read from their parse, so `github.event.x`,
+//! `github['event']['x']` and `GitHub.Event.X` are the same read. The
+//! detectors still work on steps and not on what a script computes at
+//! run time, so a workflow can be unsafe without a warning. A warning
+//! never stops `validate` or `convert` from succeeding; the host decides
+//! what a head checkout does (see the repository's
+//! `pull_request_target_head_checkout` setting).
 
 use crate::config::{CheckoutStep, RunStep, UsesStep};
+use crate::expr::{Reads, reads};
 use crate::plan::{Plan, PlannedStep};
-use crate::{Config, Diagnostic, compile};
 
 /// What a lint found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintKind {
     /// The workflow checks out the pull request's head.
     HeadCheckout,
+    /// The workflow checks out a ref or repository that is an
+    /// expression not provably the base.
+    UnverifiedCheckout,
     /// An untrusted event field is interpolated into a `run:` script.
     ScriptInjection,
+}
+
+impl LintKind {
+    /// Whether a repository that blocks head checkouts blocks this.
+    #[must_use]
+    pub const fn is_head_checkout(self) -> bool {
+        matches!(self, Self::HeadCheckout | Self::UnverifiedCheckout)
+    }
 }
 
 /// One finding, with where it is.
@@ -66,8 +83,15 @@ const HEAD_CHECKOUT: &str = "checks out the pull request head in a pull_request_
      so the code of the pull request runs with the base repository's secrets and write token; \
      check out the base and run the pull request's code in a pull_request workflow instead";
 
-/// Fields of an event that the author of an issue, comment or pull
-/// request writes. Matched without regard to case and spaces.
+/// The text of the unverified checkout finding.
+const UNVERIFIED_CHECKOUT: &str = "checks out a ref or repository that is an expression not \
+     provably the base branch, so in a pull_request_target workflow it may be the pull request \
+     head, which runs the author's code with the base repository's secrets and write token; \
+     use `github.sha`, `github.base_ref` or a literal";
+
+/// Paths of an event that the author of an issue, comment or pull
+/// request writes. A read of one of them, or of anything under it,
+/// counts.
 const UNTRUSTED: &[&str] = &[
     "github.event.issue.title",
     "github.event.issue.body",
@@ -79,8 +103,8 @@ const UNTRUSTED: &[&str] = &[
     "github.event.comment.body",
     "github.event.review.body",
     "github.event.review_comment.body",
-    "github.event.pages.",
-    "github.event.commits.",
+    "github.event.pages",
+    "github.event.commits",
     "github.event.head_commit.message",
     "github.event.head_commit.author.email",
     "github.event.head_commit.author.name",
@@ -90,15 +114,27 @@ const UNTRUSTED: &[&str] = &[
     "github.head_ref",
 ];
 
-/// What in a `ref` or `repository` input names the pull request's head
-/// (or its merge commit, which contains it).
-const HEAD_REFS: &[&str] = &[
+/// Paths that name the pull request's head, or its merge commit, which
+/// contains it.
+const HEAD_PATHS: &[&str] = &[
     "github.event.pull_request.head",
     "github.event.pull_request.merge_commit_sha",
     "github.head_ref",
-    "GITHUB_HEAD_REF",
-    "refs/pull/",
+    "env.github_head_ref",
 ];
+
+/// Paths a `ref` input may read and still be the base.
+const BASE_REFS: &[&str] = &[
+    "github.base_ref",
+    "github.sha",
+    "github.ref",
+    "github.ref_name",
+    "github.event.pull_request.base",
+    "github.event.repository.default_branch",
+];
+
+/// Paths a `repository` input may read and still be the base.
+const BASE_REPOSITORIES: &[&str] = &["github.repository", "github.event.pull_request.base"];
 
 /// The git commands whose arguments can name the head.
 const GIT_FETCHERS: &[&str] = &[
@@ -140,16 +176,19 @@ pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
                     message,
                 });
             };
-            match step {
-                PlannedStep::Checkout(checkout) if checks_out_head_native(checkout) => {
+            let mut checkout = |kind: Option<LintKind>| match kind {
+                Some(LintKind::HeadCheckout) => {
                     add(LintKind::HeadCheckout, HEAD_CHECKOUT.to_owned());
                 }
+                Some(kind) => add(kind, UNVERIFIED_CHECKOUT.to_owned()),
+                None => {}
+            };
+            match step {
+                PlannedStep::Checkout(native) => checkout(native_checkout(native)),
                 PlannedStep::Uses(uses) => {
-                    if checks_out_head_action(uses) {
-                        add(LintKind::HeadCheckout, HEAD_CHECKOUT.to_owned());
-                    }
+                    checkout(action_checkout(uses));
                     if let Some(field) = script_input(uses).and_then(injected) {
-                        add(LintKind::ScriptInjection, injection(field));
+                        add(LintKind::ScriptInjection, injection(&field));
                     }
                 }
                 PlannedStep::Run(run) => {
@@ -157,7 +196,7 @@ pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
                         add(LintKind::HeadCheckout, HEAD_CHECKOUT.to_owned());
                     }
                     if let Some(field) = injected(&run.run) {
-                        add(LintKind::ScriptInjection, injection(field));
+                        add(LintKind::ScriptInjection, injection(&field));
                     }
                 }
                 _ => {}
@@ -167,30 +206,6 @@ pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
     found
 }
 
-/// The findings of every workflow of `config` that runs on a guarded
-/// event, as warnings. Each workflow is planned for `refs/heads/main`;
-/// one that does not compile has its own errors (see
-/// [`validate`](crate::validate)) and no findings here. A call of a file
-/// of another repository plans nothing, so its steps are not read.
-#[must_use]
-pub fn lints(config: &Config) -> Vec<Diagnostic> {
-    let mut out = Vec::new();
-    for (name, wf) in &config.workflows {
-        if !guarded(&wf.on) {
-            continue;
-        }
-        let Ok(plan) = compile(config, name, "refs/heads/main") else {
-            continue;
-        };
-        out.extend(
-            plan_lints(&plan)
-                .iter()
-                .map(|lint| Diagnostic::new(lint.text())),
-        );
-    }
-    out
-}
-
 fn injection(field: &str) -> String {
     format!(
         "interpolates `{field}` into a script, which lets whoever wrote it run commands; \
@@ -198,26 +213,102 @@ fn injection(field: &str) -> String {
     )
 }
 
-/// Whether `text` names the pull request head.
+/// Whether `path` is `under` or something below it.
+fn under(path: &[String], under: &str) -> bool {
+    let want: Vec<&str> = under.split('.').collect();
+    path.len() >= want.len() && path.iter().zip(&want).all(|(a, b)| a == b)
+}
+
+fn reads_any(read: &Reads, list: &[&str]) -> bool {
+    read.paths
+        .iter()
+        .any(|path| list.iter().any(|entry| under(path, entry)))
+}
+
+/// What the text of a `with.ref` reads cannot be parsed as: the text
+/// with case, spaces and quotes removed, for a substring match.
+fn squashed(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars().filter(|c| !c.is_whitespace()) {
+        let c = if matches!(c, '\'' | '"' | '[' | ']') {
+            '.'
+        } else {
+            c.to_ascii_lowercase()
+        };
+        if c != '.' || !out.ends_with('.') {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether `text` names the pull request head: a path of a `${{ }}` in
+/// it, a ref of the form `refs/pull/<n>/...` or `pull/<n>/head|merge`
+/// (in a string of an expression or outside one), or `GITHUB_HEAD_REF`.
 fn names_head(text: &str) -> bool {
-    HEAD_REFS.iter().any(|marker| text.contains(marker))
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("refs/pull/") || lower.contains("github_head_ref") || pull_ref(&lower) {
+        return true;
+    }
+    let Ok(list) = reads(text) else {
+        // An expression that does not parse is read as text.
+        let flat = squashed(text);
+        return HEAD_PATHS.iter().any(|p| flat.contains(p));
+    };
+    list.iter().any(|read| {
+        reads_any(read, HEAD_PATHS)
+            || read
+                .strings
+                .iter()
+                .any(|s| s.to_ascii_lowercase().contains("refs/pull/"))
+    })
 }
 
-fn checks_out_head_native(step: &CheckoutStep) -> bool {
-    step.r#ref.as_deref().is_some_and(names_head)
+/// Whether the text of a `ref` or `repository` input is provably the
+/// base: no expression, or only expressions that are one read of a path
+/// in `allowed` (or one literal).
+fn provably_base(text: &str, allowed: &[&str]) -> bool {
+    let Ok(list) = reads(text) else {
+        return false;
+    };
+    list.iter().all(|read| {
+        read.plain
+            && read
+                .paths
+                .iter()
+                .all(|path| allowed.iter().any(|entry| under(path, entry)))
+    })
 }
 
-fn checks_out_head_action(step: &UsesStep) -> bool {
+/// How a checkout's `ref` and `repository` rate: the head, an
+/// expression that may be, or fine.
+fn rate_checkout(inputs: &[(&str, &[&str])]) -> Option<LintKind> {
+    if inputs.iter().any(|(text, _)| names_head(text)) {
+        return Some(LintKind::HeadCheckout);
+    }
+    inputs
+        .iter()
+        .any(|(text, allowed)| !provably_base(text, allowed))
+        .then_some(LintKind::UnverifiedCheckout)
+}
+
+fn native_checkout(step: &CheckoutStep) -> Option<LintKind> {
+    let text = step.r#ref.as_deref()?;
+    rate_checkout(&[(text, BASE_REFS)])
+}
+
+fn action_checkout(step: &UsesStep) -> Option<LintKind> {
     let action = step.uses.to_ascii_lowercase();
     if action.split('@').next() != Some("actions/checkout") {
-        return false;
+        return None;
     }
-    ["ref", "repository"].iter().any(|input| {
-        step.with
-            .get(*input)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(names_head)
-    })
+    let mut inputs: Vec<(&str, &[&str])> = Vec::new();
+    for (name, allowed) in [("ref", BASE_REFS), ("repository", BASE_REPOSITORIES)] {
+        if let Some(text) = step.with.get(name).and_then(serde_json::Value::as_str) {
+            inputs.push((text, allowed));
+        }
+    }
+    rate_checkout(&inputs)
 }
 
 /// Whether a script checks out the head: `gh pr checkout`, or a git
@@ -272,43 +363,31 @@ fn script_input(step: &UsesStep) -> Option<&str> {
     step.with.get("script")?.as_str()
 }
 
-/// The first untrusted field that `script` interpolates with `${{ }}`.
-fn injected(script: &str) -> Option<&'static str> {
-    let mut rest = script;
-    while let Some(start) = rest.find("${{") {
-        let after = &rest[start + 3..];
-        let end = after.find("}}")?;
-        let body: String = after[..end]
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-            .to_ascii_lowercase();
-        // A field read through an index (`github.event['issue']`) is
-        // the same field; the quotes and brackets are dropped.
-        let mut dotted = String::with_capacity(body.len());
-        for c in body.chars() {
-            let c = if matches!(c, '\'' | '"' | '[' | ']') {
-                '.'
-            } else {
-                c
-            };
-            if c != '.' || !dotted.ends_with('.') {
-                dotted.push(c);
-            }
-        }
-        let body = dotted;
-        if let Some(field) = UNTRUSTED.iter().find(|field| body.contains(*field)) {
-            return Some(field.trim_end_matches('.'));
-        }
-        rest = &after[end + 2..];
-    }
-    None
+/// The first untrusted field that `script` interpolates with `${{ }}`,
+/// as a dotted path.
+fn injected(script: &str) -> Option<String> {
+    let Ok(list) = reads(script) else {
+        // An expression that does not parse is read as text.
+        let flat = squashed(script);
+        return UNTRUSTED
+            .iter()
+            .find(|entry| flat.contains(*entry))
+            .map(|entry| (*entry).to_owned());
+    };
+    list.iter().find_map(|read| {
+        read.paths.iter().find_map(|path| {
+            UNTRUSTED
+                .iter()
+                .find(|entry| under(path, entry))
+                .map(|entry| (*entry).to_owned())
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse;
+    use crate::{Config, compile, parse, validate_with_warnings};
 
     fn config(on: &str, steps: &str) -> Config {
         let yaml = format!(
@@ -336,6 +415,96 @@ mod tests {
             let steps =
                 format!("      - uses: actions/checkout@v4\n        with:\n          {with}");
             assert!(found(&steps).contains(&LintKind::HeadCheckout), "{with}");
+        }
+    }
+
+    #[test]
+    fn every_spelling_of_the_head_is_the_head() {
+        for expr in [
+            "github.event.pull_request.head.sha",
+            "github['event']['pull_request']['head']['sha']",
+            "github.event.pull_request['head'].sha",
+            "GitHub.Event.Pull_Request.Head.SHA",
+            "github[\"event\"].pull_request.head.ref",
+            "github.event.pull_request.MERGE_COMMIT_SHA",
+            "github.HEAD_REF",
+            "github['head_ref']",
+            "format('{0}', github.event.pull_request.head.sha)",
+            "github.head_ref || 'main'",
+            "format('refs/pull/{0}/head', github.event.number)",
+            "toJSON(github.event.pull_request.head)",
+        ] {
+            let steps = format!(
+                "      - uses: actions/checkout@v4\n        with:\n          ref: ${{{{ {expr} }}}}"
+            );
+            assert_eq!(found(&steps), [LintKind::HeadCheckout], "{expr}");
+            let steps = format!("      - run: git checkout ${{{{ {expr} }}}}");
+            assert!(found(&steps).contains(&LintKind::HeadCheckout), "{expr}");
+        }
+        for text in ["$GITHUB_HEAD_REF", "$github_head_ref", "${GITHUB_HEAD_REF}"] {
+            let steps = format!("      - run: git fetch origin {text}");
+            assert!(found(&steps).contains(&LintKind::HeadCheckout), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_ref_that_is_not_provably_the_base_is_unverified() {
+        for expr in [
+            "matrix.ref",
+            "inputs.ref",
+            "env.REF",
+            "steps.x.outputs.ref",
+            "fromJSON('{\"a\":1}').a",
+            "github.event.inputs.ref",
+            "github.event.pull_request.base.ref == 'x' && matrix.r",
+        ] {
+            let steps = format!(
+                "      - uses: actions/checkout@v4\n        with:\n          ref: ${{{{ {expr} }}}}"
+            );
+            assert_eq!(found(&steps), [LintKind::UnverifiedCheckout], "{expr}");
+        }
+        let steps = "      - uses: actions/checkout@v4\n        with:\n          repository: ${{ matrix.repo }}";
+        assert_eq!(found(steps), [LintKind::UnverifiedCheckout]);
+        let steps = "      - checkout:\n          ref: ${{ matrix.ref }}";
+        assert_eq!(found(steps), [LintKind::UnverifiedCheckout]);
+        assert!(LintKind::UnverifiedCheckout.is_head_checkout());
+        assert!(!LintKind::ScriptInjection.is_head_checkout());
+    }
+
+    #[test]
+    fn provably_base_refs_are_clean() {
+        for ref_ in [
+            "main",
+            "refs/heads/release",
+            "${{ github.base_ref }}",
+            "${{ github.sha }}",
+            "${{ github.ref }}",
+            "${{ GitHub['Base_Ref'] }}",
+            "${{ github.event.pull_request.base.sha }}",
+            "${{ github.event.pull_request['base']['ref'] }}",
+            "${{ 'main' }}",
+        ] {
+            let steps = format!(
+                "      - uses: actions/checkout@v4\n        with:\n          ref: \"{ref_}\""
+            );
+            assert_eq!(found(&steps), Vec::<LintKind>::new(), "{ref_}");
+        }
+        let steps = "      - uses: actions/checkout@v4\n        with:\n          repository: ${{ github.repository }}";
+        assert_eq!(found(steps), Vec::<LintKind>::new());
+    }
+
+    #[test]
+    fn injection_is_found_in_every_spelling() {
+        for expr in [
+            "GitHub.Event.Pull_Request.Title",
+            "github['event']['pull_request']['title']",
+            "github.event.pull_request['body']",
+            "github['head_ref']",
+            "github.event.commits[0].message",
+            "github.event.commits.*.message",
+        ] {
+            let steps = format!("      - run: echo \"${{{{ {expr} }}}}\"");
+            assert_eq!(found(&steps), [LintKind::ScriptInjection], "{expr}");
         }
     }
 
@@ -434,9 +603,24 @@ mod tests {
     #[test]
     fn only_a_pull_request_target_workflow_is_linted_in_a_config() {
         let step = "      - run: echo ${{ github.event.pull_request.title }}";
-        assert_eq!(lints(&config("{ pull_request_target: {} }", step)).len(), 1);
-        assert_eq!(lints(&config("{ pull_request: {} }", step)).len(), 0);
-        assert_eq!(lints(&config("{ push: {} }", step)).len(), 0);
+        assert_eq!(
+            validate_with_warnings(&config("{ pull_request_target: {} }", step))
+                .1
+                .len(),
+            1
+        );
+        assert_eq!(
+            validate_with_warnings(&config("{ pull_request: {} }", step))
+                .1
+                .len(),
+            0
+        );
+        assert_eq!(
+            validate_with_warnings(&config("{ push: {} }", step))
+                .1
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -459,6 +643,6 @@ workflows:
     jobs: [t]
 ";
         let config = parse(yaml).unwrap();
-        assert_eq!(lints(&config).len(), 1);
+        assert_eq!(validate_with_warnings(&config).1.len(), 1);
     }
 }

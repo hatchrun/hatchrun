@@ -142,7 +142,8 @@ pub fn convert(files: &[(String, String)]) -> Result<Conversion, Vec<Diagnostic>
         }
     }
     // The warnings of `validate` that do not stop a config from running.
-    cx.warnings.extend(crate::lint::lints(&cx.config));
+    cx.warnings
+        .extend(plan::validate_with_warnings(&cx.config).1);
     match to_yaml(&cx.config) {
         Ok(yaml) if yaml.len() > MAX_SOURCE => cx.errors.push(Diagnostic::new(format!(
             "the converted config is {} bytes; the limit is {MAX_SOURCE}",
