@@ -277,9 +277,7 @@ Resources:
                   Bool:
                     ec2:Encrypted: "true"
               # The runner images, built by hatchrun/images in this
-              # account. The accountless image ARN and the
-              # aws-marketplace owner applied while the images came from
-              # AWS Marketplace.
+              # account.
               - Sid: LaunchOwnImages
                 Effect: Allow
                 Action: [ec2:RunInstances, ec2:CreateFleet]
@@ -287,17 +285,6 @@ Resources:
                 Condition:
                   StringEquals:
                     ec2:Owner: !Ref AWS::AccountId
-              # Transition: releases registered before the images build
-              # stopped submitting to AWS Marketplace are still copies
-              # Marketplace owns. Remove this statement once the images
-              # table names an AMI this account owns.
-              - Sid: LaunchMarketplaceImages
-                Effect: Allow
-                Action: [ec2:RunInstances, ec2:CreateFleet]
-                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}::image/*"
-                Condition:
-                  StringEquals:
-                    ec2:Owner: aws-marketplace
               - Sid: LaunchNetwork
                 Effect: Allow
                 Action: [ec2:RunInstances, ec2:CreateFleet]
