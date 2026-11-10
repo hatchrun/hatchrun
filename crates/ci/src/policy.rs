@@ -55,6 +55,18 @@ pub enum ForkApproval {
     AllOutside,
 }
 
+/// What a `pull_request_target` workflow that checks out the pull
+/// request head does. Such a workflow runs the author's code with the
+/// base repository's secrets and write token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadCheckout {
+    /// The run starts, and its check runs say what the planner found.
+    Warn,
+    /// The run fails at planning and starts nothing.
+    Block,
+}
+
 /// A repository's policy for pull requests from forks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +79,9 @@ pub struct RepoPolicy {
     pub fork_max_running: u32,
     /// The longest a fork job may run, in minutes, 5 to 60.
     pub fork_timeout_minutes: u32,
+    /// What a `pull_request_target` workflow that checks out the pull
+    /// request head does.
+    pub pull_request_target_head_checkout: HeadCheckout,
 }
 
 impl RepoPolicy {
@@ -79,6 +94,7 @@ impl RepoPolicy {
             fork_approval: ForkApproval::FirstTimeContributors,
             fork_max_running: 2,
             fork_timeout_minutes: 30,
+            pull_request_target_head_checkout: HeadCheckout::Warn,
         }
     }
 
@@ -95,6 +111,27 @@ impl RepoPolicy {
             return Err("fork_timeout_minutes is 5 to 60".to_owned());
         }
         Ok(())
+    }
+}
+
+impl HeadCheckout {
+    /// The word the column stores.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Block => "block",
+        }
+    }
+
+    /// The rule a stored word names.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "warn" => Some(Self::Warn),
+            "block" => Some(Self::Block),
+            _ => None,
+        }
     }
 }
 
@@ -250,8 +287,9 @@ const fn strictness(level: ForkApproval) -> u8 {
 }
 
 /// Whether `new` lets more fork code run, or run longer, than `old`: fork
-/// runs turned on, an approval level that asks about fewer authors, or a
-/// higher cap on running jobs or on timeout. Such a change is made on the
+/// runs turned on, an approval level that asks about fewer authors, a
+/// higher cap on running jobs or on timeout, or a head checkout in a
+/// `pull_request_target` workflow no longer blocked. Such a change is made on the
 /// admin's access as GitHub says now.
 #[must_use]
 pub fn loosens(old: &RepoPolicy, new: &RepoPolicy) -> bool {
@@ -259,6 +297,8 @@ pub fn loosens(old: &RepoPolicy, new: &RepoPolicy) -> bool {
         || strictness(new.fork_approval) < strictness(old.fork_approval)
         || new.fork_max_running > old.fork_max_running
         || new.fork_timeout_minutes > old.fork_timeout_minutes
+        || (old.pull_request_target_head_checkout == HeadCheckout::Block
+            && new.pull_request_target_head_checkout == HeadCheckout::Warn)
 }
 
 /// The job timeout of a fork run: the workflow's, cut to the policy's.
@@ -404,6 +444,7 @@ mod tests {
             fork_approval: ForkApproval::AllOutside,
             fork_max_running: 2,
             fork_timeout_minutes: 30,
+            pull_request_target_head_checkout: HeadCheckout::Block,
         };
         assert!(!loosens(&strict, &strict));
         // Tightening is never loosening.
@@ -447,6 +488,25 @@ mod tests {
                 ..strict
             }
         ));
+        // Blocking a head checkout is tightening; allowing it again is not.
+        let warn = RepoPolicy {
+            pull_request_target_head_checkout: HeadCheckout::Warn,
+            ..strict
+        };
+        assert!(loosens(&strict, &warn));
+        assert!(!loosens(&warn, &strict));
+    }
+
+    #[test]
+    fn the_head_checkout_rule_defaults_to_warn_and_round_trips_its_word() {
+        assert_eq!(
+            RepoPolicy::default_for(false).pull_request_target_head_checkout,
+            HeadCheckout::Warn
+        );
+        for rule in [HeadCheckout::Warn, HeadCheckout::Block] {
+            assert_eq!(HeadCheckout::parse(rule.as_str()), Some(rule));
+        }
+        assert_eq!(HeadCheckout::parse("off"), None);
     }
 
     #[test]

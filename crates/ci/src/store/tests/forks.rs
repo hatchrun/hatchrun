@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
-use crate::policy::{ForkApproval, ForkRuns, RepoPolicy};
+use crate::policy::{ForkApproval, ForkRuns, HeadCheckout, RepoPolicy};
 
 /// A fork run of pull request `number` at `sha` by `author`, in `gate`.
 fn fork_run(
@@ -168,6 +168,7 @@ fn a_saved_policy_wins_over_the_defaults_and_can_be_changed() {
         fork_approval: ForkApproval::AllOutside,
         fork_max_running: 4,
         fork_timeout_minutes: 15,
+        pull_request_target_head_checkout: HeadCheckout::Block,
     };
     db.wait(put_repo_policy(db.db(), 7, &policy, 5, &audit(5)))
         .unwrap();
@@ -180,6 +181,14 @@ fn a_saved_policy_wins_over_the_defaults_and_can_be_changed() {
     db.wait(put_repo_policy(db.db(), 7, &lower, 6, &audit(6)))
         .unwrap();
     assert_eq!(db.wait(repo_policy(db.db(), 7, false)).unwrap(), lower);
+    // The head checkout rule is saved and read back with the rest.
+    let warn = RepoPolicy {
+        pull_request_target_head_checkout: HeadCheckout::Warn,
+        ..lower
+    };
+    db.wait(put_repo_policy(db.db(), 7, &warn, 7, &audit(7)))
+        .unwrap();
+    assert_eq!(db.wait(repo_policy(db.db(), 7, false)).unwrap(), warn);
 }
 
 #[test]

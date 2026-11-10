@@ -550,7 +550,7 @@ export const putCiItem = (scope: CiScope, kind: CiItemKind, name: string, value:
 export const deleteCiItem = (scope: CiScope, kind: CiItemKind, name: string) =>
   adminOnly(() => del<undefined>(`${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`));
 
-/** What a repository does with pull requests from forks. */
+/** What a repository does with pull requests from forks, and with pull_request_target workflows that check out the head. */
 export interface ForkPolicy {
   /** Whether fork pull requests run. On by default for a public repository, off for a private one. */
   fork_runs: "off" | "on";
@@ -560,6 +560,8 @@ export interface ForkPolicy {
   fork_max_running: number;
   /** The longest a fork job may run, in minutes, 5 to 60. */
   fork_timeout_minutes: number;
+  /** What a pull_request_target workflow that checks out the pull request head does: run with a warning, or fail before it starts. */
+  pull_request_target_head_checkout: "warn" | "block";
 }
 
 export const getForkPolicy = (owner: string, repo: string) => adminOnly(() => get<ForkPolicy>(`${repoPath(owner, repo)}/fork-policy`));

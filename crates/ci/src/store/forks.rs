@@ -22,17 +22,19 @@ use super::with_columns;
 use crate::policy::{APPROVAL_EXPIRES_MS, RepoPolicy, Waiting};
 
 /// The policy of repository `$1`.
-const POLICY: &str = "SELECT fork_runs, fork_approval, fork_max_running, fork_timeout_minutes \
-     FROM ci_repo_policy WHERE repo_id = $1";
+const POLICY: &str = "SELECT fork_runs, fork_approval, fork_max_running, fork_timeout_minutes, \
+     pull_request_target_head_checkout FROM ci_repo_policy WHERE repo_id = $1";
 
 /// Saves the policy of repository `$1`: fork runs `$2`, approval `$3`,
-/// running cap `$4`, timeout `$5`, at `$6`, returning the repository id
-/// for the audit row that goes in the same statement.
+/// running cap `$4`, timeout `$5`, at `$6`, head checkout rule `$7`,
+/// returning the repository id for the audit row that goes in the same
+/// statement.
 const PUT_POLICY: &str = "INSERT INTO ci_repo_policy (repo_id, fork_runs, fork_approval, \
-     fork_max_running, fork_timeout_minutes, updated_at) \
-     VALUES ($1, $2, $3, $4, $5, $6) \
+     fork_max_running, fork_timeout_minutes, updated_at, pull_request_target_head_checkout) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7) \
      ON CONFLICT (repo_id) DO UPDATE SET fork_runs = $2, fork_approval = $3, \
-     fork_max_running = $4, fork_timeout_minutes = $5, updated_at = $6 \
+     fork_max_running = $4, fork_timeout_minutes = $5, updated_at = $6, \
+     pull_request_target_head_checkout = $7 \
      RETURNING repo_id";
 
 /// What waits in repository `$1`, counted in groups (a pull request at a
@@ -215,7 +217,7 @@ pub async fn put_repo_policy(
 ) -> Result<()> {
     let sql = format!(
         "WITH saved AS ({PUT_POLICY}) {}",
-        NewAudit::insert_bound_sql(7, "saved")
+        NewAudit::insert_bound_sql(8, "saved")
     );
     let mut bound = params![
         repo_id,
@@ -223,7 +225,8 @@ pub async fn put_repo_policy(
         policy.fork_approval.as_str(),
         policy.fork_max_running,
         policy.fork_timeout_minutes,
-        now
+        now,
+        policy.pull_request_target_head_checkout.as_str()
     ];
     bound.extend(audit.binds_with_target());
     db.run(&sql, &bound).await?;
