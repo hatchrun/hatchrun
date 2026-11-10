@@ -51,7 +51,9 @@ backport fixes to older versions; upgrade to the latest release.
 ## What we already do
 
 CodeQL and `cargo audit` run on every pull request, Dependabot keeps
-dependencies current, gitleaks scans the full history for secrets and
-account IDs, and every release carries signed build provenance. These
-reduce the chance of a known problem reaching you, but they are not a
-substitute for a report.
+dependencies current, gitleaks scans the non-merge commit patches
+reachable from the checked-out commit for secrets and account IDs, and
+every release carries signed build provenance. The scan covers the
+commits reachable from the checked-out commit, not every branch or a
+change introduced only by a merge commit. These reduce the chance of a
+known problem reaching you, but they are not a substitute for a report.

@@ -23,11 +23,14 @@ pre-commit install
 ```
 
 `pre-commit install` runs gitleaks on staged changes, with the rules in
-`.gitleaks.toml`. It stops a commit that contains a secret or a
-Cloudflare or AWS account ID. CI scans the full history with the same
-rules. Pass account IDs through CI secrets or variables; a finding
-that is not a secret goes in `.gitleaksignore` by fingerprint, with a
-comment saying why.
+`.gitleaks.toml`. The scan is best-effort: the rules match known secret
+formats and the Cloudflare and AWS account-ID shapes they know, so a
+bare ID or an unusual secret can pass. Review staged changes for
+secrets and account IDs before you commit. CI runs the same rules over
+the non-merge commit patches reachable from the checked-out commit, not
+every branch or merge commit. Pass account IDs through CI secrets or
+variables; a finding that is not a secret goes in `.gitleaksignore` by
+fingerprint, with a comment saying why.
 
 ## Build and test
 
@@ -40,12 +43,14 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-The tests that switch users need root and a real account. CI runs them
-in the `root-tests` job with `cargo test --locked -- --ignored`; run
-the same in a container if you change that code.
+The `root-tests` job runs `cargo test --locked -- --ignored` as root
+and creates a real `hatchrun-test` account. No ignored test currently
+exercises user switching, so add one there when you change
+`crates/hatchrun-agent/src/account.rs`.
 
 The end-to-end suite runs a push webhook through `hatchrun-ci` to check
-runs and logs on a fake GitHub. It needs Docker and Node 24:
+runs and logs on a fake GitHub. It needs Docker (or `E2E_DATABASE_URL`
+and `psql`), Cargo, Node 24, `openssl`, `curl` and `jq`:
 
 ```sh
 crates/ci/scripts/e2e.sh
@@ -101,7 +106,7 @@ git commit -s
 
 The `dco` workflow rejects a pull request whose commits lack a
 `Signed-off-by` line from their author. Fix it with
-`git rebase --signoff -S <base>` and force-push.
+`git rebase --signoff <base>` and force-push.
 
 Keep a pull request to one change. Say what it does and why in the
 description, and link the issue it closes. If it changes the workflow
