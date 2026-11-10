@@ -50,6 +50,7 @@ use crate::oidc;
 use crate::secrets::{Keyring, SecretError, job_secrets};
 use crate::store::{self, JobRow, RepoRow, RunRow};
 use crate::token::{self, Claims, TokenError};
+use crate::trust::{Capability, Trust, limit_permissions};
 
 /// The largest body of an events or result call, in bytes.
 pub const MAX_BODY_BYTES: usize = 1 << 20;
@@ -360,7 +361,8 @@ async fn claim(
     }
     // Secrets and vars are opened before the object claims, so a
     // failure that may pass leaves nothing claimed or metered.
-    let (secrets, vars) = match open_values(env, db, row, &repo, &settings.app_url).await {
+    let (secrets, vars) = match open_values(env, db, row, &repo, run.trust, &settings.app_url).await
+    {
         Opened::Ready(secrets, vars) => (secrets, vars),
         Opened::Retry => return retry(),
         Opened::EndJob(message) => {
@@ -371,7 +373,7 @@ async fn claim(
             return status(409);
         }
     };
-    let (github_token, capped) = match mint(env, settings, row, &repo).await {
+    let (github_token, capped) = match mint(env, settings, row, &repo, run.trust).await {
         Ok(minted) => minted,
         Err(err) => {
             console_error!("job {}: installation token: {err}", row.id);
@@ -393,11 +395,14 @@ async fn claim(
     // of the attempt fixes them and a claim that overlaps it, or repeats
     // it, gets the same list. A job without a cache service has none.
     let scopes = if artifacts_bucket_ready(settings, job_token) {
-        let wanted = crate::cache::read_scopes(
-            &run.git_ref,
-            run.base_ref.as_deref(),
-            Some(&repo.default_branch),
-        );
+        let wanted = match crate::cache::run_scopes(&run, &repo.default_branch) {
+            Ok(wanted) => wanted,
+            Err(err) => {
+                // A job whose scopes cannot be trusted gets no cache.
+                console_error!("job {}: cache scopes: {err}", row.id);
+                Vec::new()
+            }
+        };
         match store::set_cache_scopes(db, row.id, row.attempt, &wanted).await {
             Ok(Some(scopes)) => scopes,
             Ok(None) => return status(409),
@@ -416,7 +421,13 @@ async fn claim(
     }
     let mut document = response.json::<JobDocument>().await?;
     fill(&mut document, &secrets, vars);
-    document.id_token = id_token_request(&settings.ci_url, &settings.token_key, row, claims.exp);
+    document.id_token = id_token_request(
+        &settings.ci_url,
+        &settings.token_key,
+        row,
+        run.trust,
+        claims.exp,
+    );
     offer_services(&mut document, settings, job_token, scopes);
     Response::from_json(&document)
 }
@@ -473,16 +484,18 @@ pub(crate) fn fill(
     doc.vars = vars;
 }
 
-/// The OIDC request for the job, when its permissions grant one: the
-/// token endpoint and a request token for this attempt that expires when
-/// the job token the claim carries does, at `exp`.
+/// The OIDC request for the job, when its permissions grant one and its
+/// run's `trust` may have one: the token endpoint and a request token
+/// for this attempt that expires when the job token the claim carries
+/// does, at `exp`. A fork run gets none, whatever its workflow asks.
 pub(crate) fn id_token_request(
     ci_url: &str,
     key: &[u8],
     row: &JobRow,
+    trust: Trust,
     exp: u64,
 ) -> Option<IdTokenRequest> {
-    if !oidc::granted(&row.token_permissions) {
+    if !trust.allows(Capability::IdToken) || !oidc::granted(&row.token_permissions) {
         return None;
     }
     let claims = Claims {
@@ -601,9 +614,17 @@ pub(crate) fn opened(outcome: Result<Values, OpenFailure>) -> Opened {
 }
 
 /// Reads and opens the secrets the job references and the repository's
-/// vars.
-async fn open_values(env: &Env, db: &Db, row: &JobRow, repo: &RepoRow, app_url: &str) -> Opened {
-    let outcome = read_values(env, db, row, repo, app_url).await;
+/// vars. A run that may not have secrets gets none and reads no sealed
+/// row, so nothing is decrypted for it.
+async fn open_values(
+    env: &Env,
+    db: &Db,
+    row: &JobRow,
+    repo: &RepoRow,
+    trust: Trust,
+    app_url: &str,
+) -> Opened {
+    let outcome = read_values(env, db, row, repo, trust, app_url).await;
     match &outcome {
         Err(OpenFailure::Unavailable(err)) => {
             console_error!("job {}: secrets: {err}", row.id);
@@ -630,8 +651,31 @@ async fn read_values(
     db: &Db,
     row: &JobRow,
     repo: &RepoRow,
+    trust: Trust,
     app_url: &str,
 ) -> Result<Values, OpenFailure> {
+    read_values_with(db, row, repo, trust, app_url, now_ms(), || {
+        Keyring::load(env)
+    })
+    .await
+}
+
+/// [`read_values`] with the keyring supplied by `keyring`, which is called
+/// only when a secret has to be opened: a run that may not have secrets
+/// never calls it, so nothing is decrypted for it.
+async fn read_values_with<F, Fut>(
+    db: &Db,
+    row: &JobRow,
+    repo: &RepoRow,
+    trust: Trust,
+    app_url: &str,
+    now: u64,
+    keyring: F,
+) -> Result<Values, OpenFailure>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Keyring, String>>,
+{
     let unavailable = |err: &dyn std::fmt::Display| OpenFailure::Unavailable(err.to_string());
     let refs: SecretRefs =
         serde_json::from_value(row.secret_refs.clone()).map_err(|e| unavailable(&e))?;
@@ -646,7 +690,9 @@ async fn read_values(
             Some(claim_environment(asked, &found, row, app_url)?)
         }
     };
-    let rows = if refs.all {
+    let rows = if !trust.allows(Capability::Secrets) {
+        Ok(Vec::new())
+    } else if refs.all {
         store::sealed_secrets(db, &repo.tenant_id, repo.id, environment_id, None).await
     } else {
         store::sealed_secrets(db, &repo.tenant_id, repo.id, environment_id, Some(&names)).await
@@ -658,7 +704,7 @@ async fn read_values(
     let secrets = if rows.is_empty() {
         BTreeMap::new()
     } else {
-        let keyring = Keyring::load(env).await.map_err(|e| unavailable(&e))?;
+        let keyring = keyring().await.map_err(|e| unavailable(&e))?;
         job_secrets(&refs, &rows, &keyring, &repo.tenant_id)
             .map_err(|(name, err)| OpenFailure::Unreadable(name, err))?
     };
@@ -666,8 +712,7 @@ async fn read_values(
     // the narrowest of each name.
     let got_secrets = store::winners(rows.iter().map(|r| (r.name.as_str(), r.owner())));
     let got_vars = store::winners(var_rows.iter().map(|r| (r.name.as_str(), r.owner())));
-    if let Err(err) = store::mark_used(db, &repo.tenant_id, &got_secrets, &got_vars, now_ms()).await
-    {
+    if let Err(err) = store::mark_used(db, &repo.tenant_id, &got_secrets, &got_vars, now).await {
         console_warn!("job {}: mark secrets used: {err}", row.id);
     }
     let vars = var_rows.into_iter().map(|r| (r.name, r.value)).collect();
@@ -760,11 +805,15 @@ async fn mint(
     settings: &Settings,
     row: &JobRow,
     repo: &RepoRow,
+    trust: Trust,
 ) -> std::result::Result<(String, Vec<github::Capped>), String> {
     let mut asked: BTreeMap<String, String> = serde_json::from_value(row.token_permissions.clone())
         .map_err(|err| format!("token permissions: {err}"))?;
     // `id_token` asks for OIDC tokens, not a GitHub permission.
     asked.remove(ID_TOKEN_SCOPE);
+    // A fork run's workflow can ask for less than the ceiling, never
+    // more.
+    let asked = limit_permissions(trust, asked);
     let jwt = app_jwt(&settings.app_id, &settings.app_key).await?;
     let held = held_permissions(env, settings, &jwt, repo.installation_id).await?;
     let (permissions, capped) = github::cap_permissions(&asked, &held);
@@ -933,7 +982,8 @@ mod tests {
             "repo_id": repo, "workflow": "ci.yml", "delivery": "d", "event": "push",
             "git_ref": "refs/heads/main", "sha": "abc", "actor": "a",
             "status": "queued", "conclusion": null, "created_at": 0, "completed_at": null,
-            "retention_days": 30
+            "retention_days": 30, "trust": "trusted", "author_login": "a",
+            "author_association": "", "gate_status": "none"
         }))
         .expect("a run row")
     }
@@ -953,7 +1003,8 @@ mod tests {
     fn only_a_job_with_the_grant_gets_an_id_token_request() {
         let mut granted = row("launched");
         granted.token_permissions = serde_json::json!({ "id_token": "write", "metadata": "read" });
-        let got = id_token_request("https://ci.example", &*KEY, &granted, 500).unwrap();
+        let got =
+            id_token_request("https://ci.example", &*KEY, &granted, Trust::Trusted, 500).unwrap();
         assert_eq!(got.url, "https://ci.example/v1/oidc/token?api-version=2.0");
         // The request token is for this attempt, not a job token.
         let claims = token::verify_oidc(&*KEY, &got.token, 101).unwrap();
@@ -964,8 +1015,155 @@ mod tests {
             Err(TokenError::Malformed)
         );
         assert_eq!(
-            id_token_request("https://ci.example", &*KEY, &row("launched"), 500),
+            id_token_request(
+                "https://ci.example",
+                &*KEY,
+                &row("launched"),
+                Trust::Trusted,
+                500
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn a_fork_run_gets_no_id_token_request_even_with_the_grant() {
+        let mut granted = row("launched");
+        granted.token_permissions = serde_json::json!({ "id_token": "write", "metadata": "read" });
+        assert_eq!(
+            id_token_request("https://ci.example", &*KEY, &granted, Trust::Fork, 500),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fork_job_document_holds_no_secret() {
+        // What a fork run opens is nothing, so nothing is in the
+        // document, whatever the job references or a call inherits.
+        let mut doc = document();
+        fill(&mut doc, &BTreeMap::new(), BTreeMap::new());
+        assert_eq!(doc.secrets.len(), 0);
+    }
+
+    /// A tenant and a repository in a temporary database, with a stored
+    /// secret `TOKEN` and a var `REGION`.
+    fn stored_secret() -> (hatchrun_cloud::testdb::Db, RepoRow) {
+        use crate::store::{Action, NewAudit, Owner};
+        let db = hatchrun_cloud::testdb::Db::new();
+        db.run(
+            "INSERT INTO tenants (id, org_id, org_login, installation_id, created_at, \
+             updated_at) VALUES ('t1', 1, 'acme', 99, 0, 0)",
+            &[],
+        );
+        let repo = repo_row("t1", 7);
+        db.wait(store::upsert_repo(db.db(), &repo, 1)).unwrap();
+        let audit = |action| NewAudit {
+            tenant: "t1",
+            actor: "octo",
+            action,
+            scope: "repo",
+            repo: None,
+            target: "x",
+            now: 5,
+        };
+        db.wait(store::put_secret(
+            db.db(),
+            "t1",
+            Owner::Repo(7),
+            None,
+            "TOKEN",
+            "k1",
+            "sealed-with-a-key-we-never-load",
+            100,
+            5,
+            &audit(Action::SecretPut),
+        ))
+        .unwrap();
+        db.wait(store::put_var(
+            db.db(),
+            "t1",
+            Owner::Repo(7),
+            None,
+            "REGION",
+            "eu",
+            100,
+            5,
+            &audit(Action::VarPut),
+        ))
+        .unwrap();
+        (db, repo)
+    }
+
+    fn refs_all() -> JobRow {
+        let mut job = row("launched");
+        job.secret_refs = serde_json::to_value(SecretRefs {
+            all: true,
+            ..SecretRefs::default()
+        })
+        .unwrap();
+        job
+    }
+
+    #[test]
+    fn a_fork_claim_reads_a_stored_secret_and_its_document_excludes_it() {
+        let (db, repo) = stored_secret();
+        let job = refs_all();
+        let loaded = std::cell::Cell::new(false);
+        // The secret exists and the job references it; a fork run goes
+        // through the real read, which never opens the keyring.
+        let (secrets, vars) = db
+            .wait(read_values_with(
+                db.db(),
+                &job,
+                &repo,
+                Trust::Fork,
+                "https://app.example",
+                9,
+                || async {
+                    loaded.set(true);
+                    Err("the keyring must not be loaded for a fork run".to_owned())
+                },
+            ))
+            .expect("a fork run reads its values");
+        assert!(!loaded.get(), "nothing was decrypted for the fork run");
+        assert_eq!(secrets.len(), 0);
+        // Vars are not secrets, and a fork run gets them.
+        assert_eq!(vars.get("REGION").map(String::as_str), Some("eu"));
+        // The document the claim answers holds neither the secret nor
+        // anything standing in for it.
+        let mut doc = document();
+        fill(&mut doc, &secrets, vars);
+        assert_eq!(doc.secrets.len(), 0);
+        assert!(!serde_json::to_string(&doc).unwrap().contains("sealed-with"));
+        assert_eq!(doc.vars.get("REGION").map(String::as_str), Some("eu"));
+    }
+
+    #[test]
+    fn a_trusted_claim_opens_the_same_secret_through_the_keyring() {
+        let (db, repo) = stored_secret();
+        let job = refs_all();
+        let loaded = std::cell::Cell::new(false);
+        // The control: the same job of a trusted run asks for the
+        // keyring, so the fork test above proves the trust check, not an
+        // empty store.
+        let outcome = db.wait(read_values_with(
+            db.db(),
+            &job,
+            &repo,
+            Trust::Trusted,
+            "https://app.example",
+            9,
+            || async {
+                loaded.set(true);
+                Err("no keyring in this test".to_owned())
+            },
+        ));
+        assert!(loaded.get(), "a trusted run opens its secrets");
+        assert_eq!(
+            outcome,
+            Err(OpenFailure::Unavailable(
+                "no keyring in this test".to_owned()
+            ))
         );
     }
 
@@ -1296,6 +1494,7 @@ mod tests {
             full_name: "octo/app".into(),
             event: "push".into(),
             git_ref: "refs/heads/main".into(),
+            trust: Trust::Trusted,
             environment: Some(store::EnvironmentRow {
                 id: 3,
                 repo_id: 7,

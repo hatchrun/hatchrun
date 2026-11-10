@@ -5,7 +5,7 @@
 import { ChevronDown } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { approveCiJob, getNeedsYou, type NeedsYou as NeedsYouData } from "@/api";
+import { approveCiJob, approveForkRun, getNeedsYou, type NeedsYou as NeedsYouData } from "@/api";
 import { Button } from "@/components/ui/button";
 import { LoadError } from "@/components/Status";
 import { STATUS, StatusGlyph, type Status } from "@/components/StatusPill";
@@ -58,17 +58,17 @@ export function NeedsYou({ org, onChange }: { org: string; onChange: () => void 
   if (loaded.state === "loading") {
     return null;
   }
-  const { approvals, failing } = loaded.data;
-  const count = approvals.length + failing.length;
+  const { approvals, fork_approvals: forkApprovals, failing } = loaded.data;
+  const count = approvals.length + forkApprovals.length + failing.length;
   if (count === 0) {
     return null;
   }
 
-  const approve = async (job: number) => {
+  const approve = async (job: number, fork = false) => {
     setBusy(job);
     setError(null);
     try {
-      await approveCiJob(job);
+      await (fork ? approveForkRun(job) : approveCiJob(job));
       reload();
       onChange();
     } catch (err) {
@@ -90,6 +90,24 @@ export function NeedsYou({ org, onChange }: { org: string; onChange: () => void 
       >
         <Button variant="outline" size="sm" disabled={busy === job.id} onClick={() => approve(job.id)} aria-label={`Approve ${run.repository} ${run.run_number}`}>
           {busy === job.id ? "Approving" : "Approve"}
+        </Button>
+      </Row>
+    )),
+    ...forkApprovals.map((run) => (
+      <Row
+        key={`p${run.id}`}
+        status="waiting"
+        href={runUrl(run.repository, run.id)}
+        label={`Review fork pull request ${run.repository} ${run.run_number}`}
+        head="fork pull request waiting for approval"
+        rest={
+          <>
+            {run.repository} #{run.pull_request?.number ?? run.run_number} · {[run.fork?.author ?? run.actor, run.workflow, ago(run.created_at, now)].join(" · ")}
+          </>
+        }
+      >
+        <Button variant="outline" size="sm" disabled={busy === run.id} onClick={() => approve(run.id, true)} aria-label={`Approve and run ${run.repository} ${run.run_number}`}>
+          {busy === run.id ? "Approving" : "Approve and run"}
         </Button>
       </Row>
     )),

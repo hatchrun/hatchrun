@@ -105,6 +105,9 @@ interface RunRow {
   actor: string;
   message: string | null;
   pull_request: PullRef | null;
+  trust: "trusted" | "fork";
+  fork: { head_repo: string | null; author: string; author_association: string } | null;
+  gate: { status: string; by: string | null; at: number | null } | null;
   status: string;
   conclusion: string | null;
   created_at: number;
@@ -299,6 +302,9 @@ function runAt(i: number): RunRow {
     // A scheduled run has no head commit message.
     message: i === BIG_AT ? MESSAGES[3] as string : event === "schedule" ? null : pr ? pr.title : pick(MESSAGES, i, 13),
     pull_request: pr ? pullRef(pr) : null,
+    trust: "trusted",
+    fork: null,
+    gate: null,
     status: o.status,
     conclusion: o.conclusion,
     created_at: created,
@@ -758,7 +764,7 @@ export function handleScale(
     return true;
   }
   if ((found = /^orgs\/([^/]+)\/needs-you$/.exec(path))) {
-    if (found[1] !== SCALE_ORG) return json(res, 200, { approvals: [], failing: [] }), true;
+    if (found[1] !== SCALE_ORG) return json(res, 200, { approvals: [], fork_approvals: [], failing: [] }), true;
     const approvals = [2, 25, 60, BIG_AT].flatMap((i) => {
       const run = runAt(i);
       const held = jobsOf(run).find((job) => job.held);
@@ -773,7 +779,7 @@ export function handleScale(
         failing.push({ repository: run.repository, branch: run.branch, run: viewOf(run) });
       }
     }
-    json(res, 200, { approvals, failing });
+    json(res, 200, { approvals, fork_approvals: [], failing });
     return true;
   }
   if ((found = /^orgs\/([^/]+)\/repos$/.exec(path))) {

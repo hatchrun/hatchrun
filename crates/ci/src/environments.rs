@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use hatchrun_workflow::Filter;
 
 use crate::store::{EnvironmentRow, JobEnvironment, JobRow};
+use crate::trust::Capability;
 
 /// The most environments one repository holds.
 pub const MAX_PER_REPO: u32 = 100;
@@ -112,8 +113,9 @@ pub enum Gate {
     Approval(String),
 }
 
-/// The check, in order: the environment exists, the run's ref is
-/// allowed, the attempt was not rejected, an approval environment has an
+/// The check, in order: the run's trust may use environments at all
+/// (a fork run never may, whatever the environment's patterns say), the
+/// environment exists, the run's ref is allowed, the attempt was not rejected, an approval environment has an
 /// approval for this attempt. `asked` is the name the job gave.
 #[must_use]
 pub fn gate(
@@ -123,6 +125,12 @@ pub fn gate(
     app_url: &str,
 ) -> Gate {
     let full_name = &found.full_name;
+    if !found.trust.allows(Capability::Environments) {
+        return Gate::Fail(format!(
+            "Environment `{asked}` is not available to runs from forks: an environment \
+             holds secrets, and a pull request from a fork gets none."
+        ));
+    }
     let Some(environment) = &found.environment else {
         return Gate::Fail(format!(
             "Environment `{asked}` does not exist in {full_name}. \
@@ -160,6 +168,7 @@ pub fn gone_message(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trust::Trust;
 
     fn found(environment: Option<EnvironmentRow>) -> JobEnvironment {
         JobEnvironment {
@@ -168,6 +177,7 @@ mod tests {
             full_name: "acme/app".into(),
             event: "push".into(),
             git_ref: "refs/heads/main".into(),
+            trust: Trust::Trusted,
             environment,
         }
     }
@@ -184,6 +194,40 @@ mod tests {
     }
 
     const APP: &str = "https://app.hatchrun.io";
+
+    #[test]
+    fn a_fork_run_never_gets_an_environment_whatever_its_rules() {
+        for environment in [
+            None,
+            Some(production(&[], false)),
+            Some(production(&["main"], false)),
+            Some(production(&[], true)),
+        ] {
+            let mut fork = found(environment);
+            fork.trust = Trust::Fork;
+            fork.event = "pull_request".into();
+            fork.git_ref = "refs/pull/3/merge".into();
+            for decision in [None, Some(Decision::Approved("octo"))] {
+                let Gate::Fail(message) = gate("production", &fork, decision, APP) else {
+                    panic!("a fork run passed the environment gate");
+                };
+                assert!(message.contains("not available to runs from forks"));
+            }
+        }
+    }
+
+    #[test]
+    fn an_environment_without_patterns_still_refuses_a_fork() {
+        // `branch_allowed` lets a pull request through when there are no
+        // patterns; the fork rule is a separate check before them.
+        assert!(branch_allowed(&[], "pull_request", "refs/pull/3/merge"));
+        let mut fork = found(Some(production(&[], false)));
+        fork.trust = Trust::Fork;
+        assert!(matches!(
+            gate("production", &fork, None, APP),
+            Gate::Fail(_)
+        ));
+    }
 
     #[test]
     fn empty_patterns_allow_any_ref() {

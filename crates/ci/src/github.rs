@@ -186,14 +186,44 @@ fn rate_limited(response: &Response) -> bool {
     text.contains("rate limit") || text.contains("abuse")
 }
 
-/// One page of the files a pull request changes, 100 to a page.
+/// Files GitHub lists on a page of a pull request's files.
+pub const FILES_PAGE_SIZE: usize = 100;
+
+/// Pages of a pull request's files that are read.
+pub const FILES_MAX_PAGES: u32 = 3;
+
+/// One page of the files a pull request changes, [`FILES_PAGE_SIZE`] to a
+/// page.
 #[must_use]
 pub fn pull_files(api: &str, repo: &str, number: u64, page: u32, token: &str) -> Request {
     rest(
         "GET",
-        format!("{api}/repos/{repo}/pulls/{number}/files?per_page=100&page={page}"),
+        format!("{api}/repos/{repo}/pulls/{number}/files?per_page={FILES_PAGE_SIZE}&page={page}"),
         token,
     )
+}
+
+/// A pull request, as GitHub has it now.
+#[must_use]
+pub fn pull_request(api: &str, repo: &str, number: u64, token: &str) -> Request {
+    rest("GET", format!("{api}/repos/{repo}/pulls/{number}"), token)
+}
+
+/// The head commit of the pull request [`pull_request`] read.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a pull request.
+pub fn pull_head_sha(response: &Response) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Pull {
+        head: Head,
+    }
+    #[derive(Deserialize)]
+    struct Head {
+        sha: String,
+    }
+    decode::<Pull>(response, "pull request").map(|pull| pull.head.sha)
 }
 
 /// The file names on one page of [`pull_files`].
@@ -354,9 +384,26 @@ pub struct CheckRun {
     /// RFC 3339 UTC, see [`rfc3339`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+    /// Buttons GitHub shows on the check run. A click arrives as a
+    /// `check_run` delivery with `requested_action`. Left out of the
+    /// body when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<CheckAction>,
     /// What the check run shows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<Output>,
+}
+
+/// A button on a check run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckAction {
+    /// The button's text, at most 20 characters.
+    pub label: String,
+    /// What it does, at most 40 characters.
+    pub description: String,
+    /// Names the button in the `requested_action` delivery, at most 20
+    /// characters.
+    pub identifier: String,
 }
 
 /// What a check run shows.
@@ -403,7 +450,7 @@ pub fn check_runs_named(api: &str, repo: &str, sha: &str, name: &str, token: &st
     rest(
         "GET",
         format!(
-            "{api}/repos/{repo}/commits/{}/check-runs?check_name={}&per_page=1",
+            "{api}/repos/{repo}/commits/{}/check-runs?check_name={}&per_page=100",
             encode(sha),
             encode(name)
         ),
@@ -424,6 +471,82 @@ pub fn check_run_total(response: &Response) -> Result<u64, String> {
     decode::<Listed>(response, "check runs").map(|l| l.total_count)
 }
 
+/// A check run of ours in the answer of [`check_runs_named`].
+struct OwnCheck {
+    id: u64,
+    external_id: Option<String>,
+}
+
+/// The check runs of an answer of [`check_runs_named`] that this App
+/// (`app_id`) made, in GitHub's order.
+fn own_check_runs(response: &Response, app_id: &str) -> Result<Vec<OwnCheck>, String> {
+    #[derive(Deserialize)]
+    struct Listed {
+        #[serde(default)]
+        check_runs: Vec<Found>,
+    }
+    #[derive(Deserialize)]
+    struct Found {
+        id: u64,
+        #[serde(default)]
+        external_id: Option<String>,
+        #[serde(default)]
+        app: Option<App>,
+    }
+    #[derive(Deserialize)]
+    struct App {
+        id: u64,
+    }
+    let listed = decode::<Listed>(response, "check runs")?;
+    Ok(listed
+        .check_runs
+        .into_iter()
+        .filter(|check| {
+            check
+                .app
+                .as_ref()
+                .is_some_and(|app| app.id.to_string() == app_id)
+        })
+        .map(|check| OwnCheck {
+            id: check.id,
+            external_id: check.external_id,
+        })
+        .collect())
+}
+
+/// The ids of the approval cards earlier attempts left on the commit for
+/// one run, oldest first, from the answer of [`check_runs_named`]: made
+/// by this App (`app_id`) and carrying `external_id` (the run's), in any
+/// state (asking, or waiting for a slot). A check run of anyone else, or
+/// for another run, is never one of them.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a check run list.
+pub fn own_cards(response: &Response, app_id: &str, external_id: &str) -> Result<Vec<u64>, String> {
+    let mut ids: Vec<u64> = own_check_runs(response, app_id)?
+        .into_iter()
+        .filter(|check| check.external_id.as_deref() == Some(external_id))
+        .map(|check| check.id)
+        .collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// The id of a check run of the answer of [`check_runs_named`] that this
+/// App (`app_id`) made, whatever its conclusion: the one to update
+/// instead of making another of the same name.
+///
+/// # Errors
+///
+/// GitHub's answer when it is not a check run list.
+pub fn own_check_run(response: &Response, app_id: &str) -> Result<Option<u64>, String> {
+    Ok(own_check_runs(response, app_id)?
+        .into_iter()
+        .next()
+        .map(|check| check.id))
+}
+
 /// Creates a check run.
 #[must_use]
 pub fn create_check_run(api: &str, repo: &str, token: &str, run: &CheckRun) -> Request {
@@ -433,20 +556,25 @@ pub fn create_check_run(api: &str, repo: &str, token: &str, run: &CheckRun) -> R
     )
 }
 
-/// Updates check run `id`. GitHub does not take `head_sha` here.
+/// Updates check run `id`. GitHub does not take `head_sha` here. The
+/// body always names `actions`, empty or not: a PATCH that leaves it out
+/// keeps the buttons the check run has, and a decided approval would
+/// still offer "Approve and run".
 #[must_use]
 pub fn update_check_run(api: &str, repo: &str, id: u64, token: &str, run: &CheckRun) -> Request {
     let run = CheckRun {
         head_sha: String::new(),
         ..run.clone()
     };
+    let mut body = serde_json::to_value(&run).unwrap_or_default();
+    body["actions"] = serde_json::to_value(&run.actions).unwrap_or_default();
     json_body(
         rest(
             "PATCH",
             format!("{api}/repos/{repo}/check-runs/{id}"),
             token,
         ),
-        &run,
+        &body,
     )
 }
 
@@ -461,6 +589,50 @@ pub fn check_run_id(response: &Response) -> Result<u64, String> {
         id: u64,
     }
     decode::<Created>(response, "check run").map(|c| c.id)
+}
+
+/// What `user` may do in `repo`: GitHub's collaborator permission.
+#[must_use]
+pub fn collaborator_permission(api: &str, repo: &str, user: &str, token: &str) -> Request {
+    rest(
+        "GET",
+        format!(
+            "{api}/repos/{repo}/collaborators/{}/permission",
+            encode(user)
+        ),
+        token,
+    )
+}
+
+/// Whether the answer of [`collaborator_permission`] says the user can
+/// write: `write`, `maintain` or `admin`. A user who is not a
+/// collaborator (`404`) cannot.
+///
+/// # Errors
+///
+/// GitHub's answer when it is neither a permission nor a `404`.
+pub fn can_write(response: &Response) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct Permission {
+        #[serde(default)]
+        permission: String,
+        #[serde(default)]
+        role_name: String,
+    }
+    if response.status == 404 {
+        return Ok(false);
+    }
+    let found = decode::<Permission>(response, "collaborator permission")?;
+    // The legacy `permission` is the base permission: a custom role
+    // built on `write` reads `write` there, and `maintain` reads
+    // `write` too. `role_name` is read only when GitHub sends no
+    // `permission`.
+    let level = if found.permission.is_empty() {
+        found.role_name.as_str()
+    } else {
+        found.permission.as_str()
+    };
+    Ok(matches!(level, "write" | "maintain" | "admin"))
 }
 
 /// A repository as a signed-in user sees it.
@@ -659,8 +831,190 @@ mod tests {
             started_at: Some(rfc3339(1_792_676_700_000)),
             conclusion: None,
             completed_at: None,
+            actions: Vec::new(),
             output: None,
         }
+    }
+
+    #[test]
+    fn a_check_run_with_a_button_sends_its_actions_and_one_without_sends_none() {
+        let mut with = run();
+        with.actions = vec![CheckAction {
+            label: "Approve and run".into(),
+            description: "Run this commit's workflows".into(),
+            identifier: "approve-fork-run".into(),
+        }];
+        let body = json(&create_check_run(
+            "https://api.github.com",
+            "o/w",
+            "tok",
+            &with,
+        ));
+        assert_eq!(body["actions"][0]["identifier"], "approve-fork-run");
+        assert_eq!(body["actions"][0]["label"], "Approve and run");
+        let body = json(&create_check_run(
+            "https://api.github.com",
+            "o/w",
+            "tok",
+            &run(),
+        ));
+        assert!(body.get("actions").is_none());
+    }
+
+    #[test]
+    fn every_card_of_ours_for_this_run_is_found_in_any_state() {
+        let list = |checks: &str| answered(200, &format!(r#"{{"check_runs":[{checks}]}}"#));
+        let card = |id: u64, app: u64, conclusion: &str, external: &str| {
+            format!(
+                r#"{{"id":{id},"conclusion":"{conclusion}","external_id":"{external}","app":{{"id":{app}}}}}"#
+            )
+        };
+        let mine = "hatchrun-ci-approval:9";
+        // Asking (a button) and waiting for a slot (neutral) are both
+        // this run's card.
+        let ours = list(&format!(
+            "{},{}",
+            card(5152, 77, "neutral", mine),
+            card(5150, 77, "action_required", mine)
+        ));
+        assert_eq!(own_cards(&ours, "77", mine), Ok(vec![5150, 5152]));
+        // Another App's check run of the same name is not ours.
+        let other = list(&card(5151, 78, "action_required", mine));
+        assert_eq!(own_cards(&other, "77", mine), Ok(vec![]));
+        // Another run's card, or one with no external id, is never this
+        // run's.
+        let theirs = list(&card(
+            5153,
+            77,
+            "action_required",
+            "hatchrun-ci-approval:10",
+        ));
+        assert_eq!(own_cards(&theirs, "77", mine), Ok(vec![]));
+        let bare = list(r#"{"id":5154,"conclusion":"action_required","app":{"id":77}}"#);
+        assert_eq!(own_cards(&bare, "77", mine), Ok(vec![]));
+        assert_eq!(own_cards(&answered(200, "{}"), "77", mine), Ok(vec![]));
+        assert!(own_cards(&answered(500, "boom"), "77", mine).is_err());
+    }
+
+    #[test]
+    fn our_own_check_run_is_found_whatever_its_conclusion() {
+        let list = |checks: &str| answered(200, &format!(r#"{{"check_runs":[{checks}]}}"#));
+        let ours =
+            list(r#"{"id":1,"conclusion":"neutral","app":{"id":77}},{"id":2,"app":{"id":77}}"#);
+        assert_eq!(own_check_run(&ours, "77"), Ok(Some(1)));
+        let other = list(r#"{"id":3,"conclusion":"neutral","app":{"id":78}}"#);
+        assert_eq!(own_check_run(&other, "77"), Ok(None));
+        assert_eq!(own_check_run(&answered(200, "{}"), "77"), Ok(None));
+        assert!(own_check_run(&answered(500, "boom"), "77").is_err());
+    }
+
+    #[test]
+    fn an_update_names_its_actions_so_a_decided_card_loses_its_button() {
+        let body = json(&update_check_run(
+            "https://api.github.com",
+            "o/w",
+            9,
+            "tok",
+            &run(),
+        ));
+        assert_eq!(body["actions"], serde_json::json!([]));
+        assert!(body.get("head_sha").is_none());
+        // A create leaves an empty list out; an update never does.
+        let create = json(&create_check_run(
+            "https://api.github.com",
+            "o/w",
+            "tok",
+            &run(),
+        ));
+        assert!(create.get("actions").is_none());
+        let mut with = run();
+        with.actions = vec![CheckAction {
+            label: "Approve and run".into(),
+            description: "d".into(),
+            identifier: "approve-fork-run".into(),
+        }];
+        let body = json(&update_check_run(
+            "https://api.github.com",
+            "o/w",
+            9,
+            "tok",
+            &with,
+        ));
+        assert_eq!(body["actions"][0]["identifier"], "approve-fork-run");
+    }
+
+    #[test]
+    fn a_pull_requests_head_is_read_from_githubs_answer() {
+        let ok = answered(200, r#"{"number":4,"head":{"sha":"abc123","ref":"x"}}"#);
+        assert_eq!(pull_head_sha(&ok), Ok("abc123".to_owned()));
+        assert!(pull_head_sha(&answered(404, "{}")).is_err());
+        assert!(pull_head_sha(&answered(200, "{}")).is_err());
+        let r = pull_request("https://api.github.com", "octo/widgets", 4, "tok");
+        assert_eq!(r.url, "https://api.github.com/repos/octo/widgets/pulls/4");
+    }
+
+    #[test]
+    fn the_file_pages_use_one_size_everywhere() {
+        let r = pull_files("https://api.github.com", "o/w", 4, 2, "tok");
+        assert!(
+            r.url.ends_with("/pulls/4/files?per_page=100&page=2"),
+            "{}",
+            r.url
+        );
+        assert_eq!(FILES_PAGE_SIZE, 100);
+        assert_eq!(FILES_MAX_PAGES, 3);
+    }
+
+    #[test]
+    fn the_collaborator_permission_is_asked_for_the_login() {
+        let r =
+            collaborator_permission("https://api.github.com", "octo/widgets", "ma-llory", "tok");
+        assert_eq!(r.method, "GET");
+        assert_eq!(
+            r.url,
+            "https://api.github.com/repos/octo/widgets/collaborators/ma-llory/permission"
+        );
+    }
+
+    fn answered(status: u16, body: &str) -> Response {
+        Response {
+            status,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn only_write_maintain_and_admin_can_approve() {
+        let role = |permission: &str, role_name: &str| {
+            can_write(&answered(
+                200,
+                &format!(r#"{{"permission":"{permission}","role_name":"{role_name}"}}"#),
+            ))
+        };
+        assert_eq!(role("admin", "admin"), Ok(true));
+        assert_eq!(role("write", "maintain"), Ok(true));
+        assert_eq!(role("write", "write"), Ok(true));
+        assert_eq!(role("read", "triage"), Ok(false));
+        assert_eq!(role("read", "read"), Ok(false));
+        assert_eq!(role("none", "none"), Ok(false));
+        // A custom role built on write has the base permission `write`.
+        assert_eq!(role("write", "custom-role"), Ok(true));
+        assert_eq!(role("admin", "custom-admin"), Ok(true));
+        // A custom role built on read stays read.
+        assert_eq!(role("read", "custom-role"), Ok(false));
+        // Without role_name the legacy field decides.
+        assert_eq!(
+            can_write(&answered(200, r#"{"permission":"write"}"#)),
+            Ok(true)
+        );
+        assert_eq!(
+            can_write(&answered(200, r#"{"permission":"read"}"#)),
+            Ok(false)
+        );
+        // Not a collaborator at all.
+        assert_eq!(can_write(&answered(404, "{}")), Ok(false));
+        assert!(can_write(&answered(500, "boom")).is_err());
     }
 
     #[test]

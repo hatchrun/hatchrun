@@ -18,6 +18,8 @@
 //! | `GET /api/ci/orgs/{org}/audit?repo=&cursor=&limit=` | org admin | `Page` of `{"id", "at", "actor", "action", "scope", "repo", "target"}`, newest first |
 //! | `GET /api/ci/orgs/{org}/setup` | org admin | `{"app", "enabled", "first_run", "billing"}` |
 //! | `GET /api/ci/orgs/{org}/environments?q=&repo=&cursor=&limit=` | org admin | `Page` of `{"repository", "name", "branches", "approval", "updatedAt", "secrets", "vars"}` |
+//! | `GET /api/ci/repos/{owner}/{repo}/fork-policy` | repo admin | the policy for pull requests from forks: `{"fork_runs", "fork_approval", "fork_max_running", "fork_timeout_minutes"}`, the defaults when none was saved |
+//! | `PUT /api/ci/repos/{owner}/{repo}/fork-policy` | repo admin, CSRF | the saved policy; every field is required |
 //! | `GET /api/ci/repos/{owner}/{repo}/environments` | repo admin | `[{"name", "branches", "approval", "updatedAt"}]` |
 //! | `PUT /api/ci/repos/{owner}/{repo}/environments/{env}` | repo admin, CSRF | the environment |
 //! | `DELETE /api/ci/repos/{owner}/{repo}/environments/{env}` | repo admin, CSRF | `204` |
@@ -53,6 +55,7 @@ use crate::environments::{self, environment_json};
 use crate::launches;
 use crate::org_api;
 use crate::page::{self, Query};
+use crate::policy::RepoPolicy;
 use crate::secrets::{self, Aad, Keyring};
 use crate::store::{self, Owner, Put, TenantRow};
 
@@ -125,6 +128,13 @@ pub enum SettingsRoute<'a> {
         /// The organization.
         org: &'a str,
     },
+    /// How a repository treats pull requests from forks.
+    ForkPolicy {
+        /// The owner.
+        owner: &'a str,
+        /// The repository.
+        repo: &'a str,
+    },
     /// The environments of a repository.
     Environments {
         /// The owner.
@@ -156,6 +166,7 @@ impl SettingsRoute<'_> {
             | SettingsRoute::Setup { .. }
             | SettingsRoute::OrgEnvironments { .. }
             | SettingsRoute::Environments { .. } => *method == Method::Get,
+            SettingsRoute::ForkPolicy { .. } => matches!(method, Method::Get | Method::Put),
             SettingsRoute::Cap { .. } => *method == Method::Put,
             SettingsRoute::EnableRepos { .. } => *method == Method::Patch,
             SettingsRoute::Secret(..)
@@ -209,6 +220,10 @@ pub fn find(path: &str) -> Option<SettingsRoute<'_>> {
             };
             Some(item_route(kind, scope, name(item)?))
         }
+        ["repos", owner, repo, "fork-policy"] => Some(SettingsRoute::ForkPolicy {
+            owner: name(owner)?,
+            repo: name(repo)?,
+        }),
         ["repos", owner, repo, "environments"] => Some(SettingsRoute::Environments {
             owner: name(owner)?,
             repo: name(repo)?,
@@ -297,6 +312,13 @@ pub(crate) async fn handle(
         SettingsRoute::Audit { org } => org_api::audit_list(cx, org, query).await,
         SettingsRoute::Setup { org } => org_api::setup(cx, org).await,
         SettingsRoute::OrgEnvironments { org } => org_api::environments(cx, org, query).await,
+        SettingsRoute::ForkPolicy { owner, repo } => {
+            if req.method() == Method::Put {
+                put_fork_policy(cx, owner, repo, req, body_cap(&route)).await
+            } else {
+                get_fork_policy(cx, owner, repo).await
+            }
+        }
         SettingsRoute::Environments { owner, repo } => list_environments(cx, owner, repo).await,
         SettingsRoute::Environment { owner, repo, name } => {
             if req.method() == Method::Put {
@@ -858,6 +880,86 @@ async fn put_var(
     saved(put, &target, Kind::Vars, max)
 }
 
+async fn get_fork_policy(cx: &Cx<'_>, owner: &str, repo: &str) -> Result<Served> {
+    let repo = match cx.repo(owner, repo, Access::Admin).await? {
+        Ok(repo) => repo,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let policy = store::repo_policy(cx.db, repo.id, repo.private).await?;
+    reply(200, &serde_json::to_value(policy)?).map(Ok)
+}
+
+/// The policy a `PUT .../fork-policy` body holds, range checked.
+fn parse_fork_policy(body: &[u8], max_body: usize) -> std::result::Result<RepoPolicy, Stop> {
+    if body.len() > max_body {
+        return stop(413, "the request is too large");
+    }
+    let Ok(policy) = serde_json::from_slice::<RepoPolicy>(body) else {
+        return stop(
+            400,
+            "expected {\"fork_runs\": \"on\", \"fork_approval\": \"first_time_contributors\", \
+             \"fork_max_running\": 2, \"fork_timeout_minutes\": 30}",
+        );
+    };
+    match policy.valid() {
+        Ok(()) => Ok(policy),
+        Err(message) => stop(422, message),
+    }
+}
+
+async fn put_fork_policy(
+    cx: &Cx<'_>,
+    owner: &str,
+    repo: &str,
+    req: &mut Request,
+    max_body: usize,
+) -> Result<Served> {
+    let repo = match cx.repo(owner, repo, Access::Admin).await? {
+        Ok(repo) => repo,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    let policy = match parse_fork_policy(&req.bytes().await?, max_body) {
+        Ok(policy) => policy,
+        Err(stop) => return Ok(Err(stop)),
+    };
+    // A change that lets more fork code run is made on the admin's access
+    // as GitHub says now, not on what was cached for a minute; viewing
+    // the policy can stay cached.
+    let current = store::repo_policy(cx.db, repo.id, repo.private).await?;
+    if crate::policy::loosens(&current, &policy) {
+        let Some(session) = cx.session else {
+            return Ok(stop(401, "sign in to change the policy"));
+        };
+        match access::resolve_fresh(session, cx.settings, &repo).await {
+            Ok(have) if have >= Access::Admin => {}
+            Ok(_) => {
+                return Ok(stop(
+                    403,
+                    "You need admin access to this repository to let more fork code run",
+                ));
+            }
+            Err(Failure::Retry(wait)) => {
+                return Ok(Err(Stop(
+                    503,
+                    "GitHub is rate limiting; try again shortly".to_owned(),
+                    Some(wait),
+                )));
+            }
+            Err(Failure::Worker(err)) => return Err(err),
+        }
+    }
+    let audit = audit_of(
+        cx,
+        &repo.tenant_id,
+        store::Action::ForkPolicyPut,
+        "repo",
+        Some(&repo.full_name),
+        &repo.full_name,
+    );
+    store::put_repo_policy(cx.db, repo.id, &policy, now_ms(), &audit).await?;
+    reply(200, &serde_json::to_value(policy)?).map(Ok)
+}
+
 async fn list_environments(cx: &Cx<'_>, owner: &str, repo: &str) -> Result<Served> {
     let repo = match cx.repo(owner, repo, Access::Admin).await? {
         Ok(repo) => repo,
@@ -1208,6 +1310,75 @@ mod tests {
         assert_eq!(
             settings_route("repos/acme/api/vars", &Method::Get),
             Some(SettingsRoute::Vars(repo))
+        );
+    }
+
+    #[test]
+    fn fork_policy_routes_parse() {
+        for method in [Method::Get, Method::Put] {
+            assert_eq!(
+                settings_route("repos/acme/api/fork-policy", &method),
+                Some(SettingsRoute::ForkPolicy {
+                    owner: "acme",
+                    repo: "api"
+                })
+            );
+        }
+        for method in [Method::Post, Method::Delete, Method::Patch] {
+            assert_eq!(settings_route("repos/acme/api/fork-policy", &method), None);
+        }
+        assert_eq!(
+            settings_route("repos/acme/api/fork-policy/x", &Method::Get),
+            None
+        );
+        assert_eq!(settings_route("orgs/acme/fork-policy", &Method::Get), None);
+    }
+
+    #[test]
+    fn a_fork_policy_body_needs_every_field_in_range() {
+        let body = |fork_runs: &str, approval: &str, running: u32, timeout: u32| {
+            json!({
+                "fork_runs": fork_runs, "fork_approval": approval,
+                "fork_max_running": running, "fork_timeout_minutes": timeout,
+            })
+            .to_string()
+            .into_bytes()
+        };
+        // The head checkout rule belongs to pull_request_target, not
+        // to this policy: a body that names it is refused.
+        let mut extra: serde_json::Value =
+            serde_json::from_slice(&body("on", "all_outside", 3, 20)).unwrap();
+        extra["pull_request_target_head_checkout"] = "warn".into();
+        assert_eq!(
+            parse_fork_policy(extra.to_string().as_bytes(), 1000)
+                .unwrap_err()
+                .0,
+            400
+        );
+        let ok = parse_fork_policy(&body("on", "all_outside", 3, 20), 1000).unwrap();
+        assert_eq!(ok.fork_max_running, 3);
+        assert_eq!(ok.fork_timeout_minutes, 20);
+        for bad in [
+            body("sometimes", "all_outside", 3, 20),
+            body("on", "everyone", 3, 20),
+            b"{}".to_vec(),
+            b"not json".to_vec(),
+        ] {
+            assert_eq!(parse_fork_policy(&bad, 1000).unwrap_err().0, 400);
+        }
+        for bad in [
+            body("on", "all_outside", 0, 20),
+            body("on", "all_outside", 11, 20),
+            body("on", "all_outside", 3, 4),
+            body("on", "all_outside", 3, 61),
+        ] {
+            assert_eq!(parse_fork_policy(&bad, 1000).unwrap_err().0, 422);
+        }
+        assert_eq!(
+            parse_fork_policy(&body("on", "all_outside", 3, 20), 5)
+                .unwrap_err()
+                .0,
+            413
         );
     }
 

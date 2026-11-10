@@ -30,6 +30,7 @@ const WORDS: Record<AuditAction, string> = {
   "environment.put": "environment saved",
   "environment.delete": "environment deleted",
   "repos.enabled": "enabled repositories changed",
+  "fork_policy.put": "fork policy saved",
 };
 
 export function Audit({ org, tenant }: OrgPageProps) {

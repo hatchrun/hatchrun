@@ -47,7 +47,8 @@ const STALE_HELD: &str = "SELECT job_id, attempt FROM (\
          row_number() OVER (PARTITION BY ci_runs.tenant_id ORDER BY ci_jobs.id) AS place \
        FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
        WHERE ci_jobs.status = 'queued' AND ci_jobs.held IS NOT NULL \
-         AND ci_jobs.held NOT IN ('approval', 'capacity') AND ci_jobs.updated_at < $1) ranked \
+         AND ci_jobs.held NOT IN ('approval', 'capacity', 'fork_approval') \
+         AND ci_jobs.updated_at < $1) ranked \
      WHERE place <= $2 ORDER BY job_id LIMIT $3";
 
 /// Turns the card and spend-cap holds of tenant `$1` into concurrency
@@ -75,6 +76,18 @@ const RELEASE_ORPHAN_APPROVALS: &str = "UPDATE ci_jobs SET held = NULL, next_lau
        AND ((ci_jobs.approval_attempt = ci_jobs.attempt AND ci_jobs.approval_decision IS NOT NULL) \
          OR NOT EXISTS (SELECT 1 FROM ci_environments e WHERE e.repo_id = ci_runs.repo_id \
            AND e.tenant_id = ci_runs.tenant_id AND lower(e.name) = lower(ci_jobs.environment) AND e.approval)) \
+       ORDER BY ci_jobs.id LIMIT $3) \
+     RETURNING ci_jobs.id AS job_id, ci_jobs.attempt";
+
+/// Frees up to `$3` fork approval holds nobody looked at since `$1`
+/// whose run no longer waits (a decision whose wake was lost), due at
+/// `$2`, and returns them. The consumer checks such a job again: it
+/// runs, or is left to its run's object when the run was cancelled.
+const RELEASE_ORPHAN_FORK_APPROVALS: &str = "UPDATE ci_jobs SET held = NULL, \
+       next_launch_at = $2, updated_at = $2 WHERE id IN (\
+       SELECT ci_jobs.id FROM ci_jobs JOIN ci_runs ON ci_runs.id = ci_jobs.run_id \
+       WHERE ci_jobs.status = 'queued' AND ci_jobs.held = 'fork_approval' \
+       AND ci_jobs.updated_at < $1 AND ci_runs.gate_status NOT IN ('pending', 'deferred') \
        ORDER BY ci_jobs.id LIMIT $3) \
      RETURNING ci_jobs.id AS job_id, ci_jobs.attempt";
 
@@ -138,6 +151,27 @@ pub async fn release_orphan_approvals(
 ) -> worker::Result<Vec<Woken>> {
     db.all(RELEASE_ORPHAN_APPROVALS, &params![quiet_before, now, limit])
         .await
+}
+
+/// Frees the fork approval holds whose run was decided and that nobody
+/// looked at since `quiet_before`, so a wake that failed after an
+/// approval never strands a job. The jobs come back to be sent to the
+/// launch queue.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn release_orphan_fork_approvals(
+    db: &Db,
+    quiet_before: u64,
+    now: u64,
+    limit: u32,
+) -> worker::Result<Vec<Woken>> {
+    db.all(
+        RELEASE_ORPHAN_FORK_APPROVALS,
+        &params![quiet_before, now, limit],
+    )
+    .await
 }
 
 /// The jobs the slow backstop wakes: held jobs nobody has looked at

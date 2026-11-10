@@ -218,7 +218,9 @@ pub(super) const LOCK_TENANT: &str = "SELECT id FROM tenants WHERE id = $1 FOR U
 /// so new jobs do not jump the line; run after [`LOCK_TENANT`]. The
 /// hold is over. With `$5` a job with a `max_parallel` also needs fewer
 /// than that many launching, launched or running jobs in its group, and
-/// no older job of the group held for `max_parallel`.
+/// no older job of the group held for `max_parallel`. With `$6` set, a job
+/// of a fork run also needs fewer than that many fork-run jobs of its
+/// repository launching, launched or running.
 const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL, \
      launch_attempts = launch_attempts + 1, updated_at = $2 \
      WHERE id = $1 AND status = 'queued' \
@@ -239,7 +241,37 @@ const CLAIM_LAUNCH: &str = "UPDATE ci_jobs SET status = 'launching', held = NULL
             AND older_sibling.strategy_group = ci_jobs.strategy_group \
             AND older_sibling.status = 'queued' AND older_sibling.held = 'max_parallel' \
             AND older_sibling.id < ci_jobs.id))) \
+     AND ($6::bigint IS NULL OR (SELECT count(*) FROM ci_jobs fork_job \
+          JOIN ci_runs fork_run ON fork_run.id = fork_job.run_id \
+          WHERE fork_run.trust = 'fork' \
+          AND fork_run.repo_id = (SELECT repo_id FROM ci_runs WHERE id = ci_jobs.run_id) \
+          AND fork_job.status IN ('launching', 'launched', 'running')) < $6::bigint \
+          OR NOT EXISTS (SELECT 1 FROM ci_runs own WHERE own.id = ci_jobs.run_id \
+          AND own.trust = 'fork')) \
      RETURNING {columns}";
+
+/// How many jobs of fork runs of the repository of job `$1` are
+/// launching, launched or running.
+const FORK_RUNNING: &str = "SELECT count(*) AS n FROM ci_jobs fork_job \
+     JOIN ci_runs fork_run ON fork_run.id = fork_job.run_id \
+     WHERE fork_run.trust = 'fork' \
+     AND fork_run.repo_id = (SELECT r.repo_id FROM ci_jobs j JOIN ci_runs r ON r.id = j.run_id \
+          WHERE j.id = $1) \
+     AND fork_job.status IN ('launching', 'launched', 'running')";
+
+/// The oldest queued job held for `fork_limit` in the repository of the
+/// fork run job `$1` belongs to, at most `$2`: what a fork job ending
+/// makes room for.
+const HELD_FORK_JOBS: &str = "SELECT held.id AS job_id, held.attempt FROM ci_jobs ended \
+     JOIN ci_runs ended_run ON ended_run.id = ended.run_id AND ended_run.trust = 'fork' \
+     JOIN ci_runs held_run ON held_run.repo_id = ended_run.repo_id AND held_run.trust = 'fork' \
+     JOIN ci_jobs held ON held.run_id = held_run.id \
+     WHERE ended.id = $1 AND held.status = 'queued' AND held.held = 'fork_limit' \
+     ORDER BY held.id LIMIT $2";
+
+/// The queued jobs of run `$1` held for its approval.
+const FORK_APPROVAL_HELD: &str = "SELECT id AS job_id, attempt FROM ci_jobs \
+     WHERE run_id = $1 AND status = 'queued' AND held = 'fork_approval' ORDER BY id";
 
 /// Whether queued job `$1` is over its group's limit now, and the limit:
 /// the same test as [`CLAIM_LAUNCH`], for telling a held group from a
@@ -779,6 +811,9 @@ pub enum Claim {
         /// The group's limit.
         max_parallel: u32,
     },
+    /// The job belongs to a fork run and its repository runs the most
+    /// fork jobs its policy allows.
+    ForkLimit,
     /// Somebody else took the launch, or the job moved on.
     Gone,
 }
@@ -790,7 +825,9 @@ pub enum Claim {
 /// `max_running` of the tenant's jobs are launching, launched or
 /// running. With `groups` a job of a matrix with `max-parallel` also
 /// waits for a place in its group: see [`Claim::Capped`]. A job that is
-/// only being ended takes no place and passes `false`.
+/// only being ended takes no place and passes `false`. With `fork_cap` a
+/// job of a fork run also waits while its repository runs that many fork
+/// jobs: see [`Claim::ForkLimit`].
 ///
 /// # Errors
 ///
@@ -801,6 +838,7 @@ pub async fn claim_launch(
     tenant_id: &str,
     max_running: u32,
     groups: bool,
+    fork_cap: Option<u32>,
     now: u64,
 ) -> Result<Claim> {
     #[derive(Deserialize)]
@@ -816,7 +854,7 @@ pub async fn claim_launch(
             (LOCK_TENANT, &lock),
             (
                 &with_columns(CLAIM_LAUNCH, JOB_COLUMNS),
-                &params![job_id, now, tenant_id, max_running, groups],
+                &params![job_id, now, tenant_id, max_running, groups, fork_cap],
             ),
             (GROUP_FULL, &params![job_id]),
         )
@@ -830,12 +868,55 @@ pub async fn claim_launch(
     if row.status != "queued" {
         return Ok(Claim::Gone);
     }
+    if let Some(cap) = fork_cap
+        && fork_running(db, job_id).await? >= u64::from(cap)
+    {
+        return Ok(Claim::ForkLimit);
+    }
     if groups && let Some(full) = full {
         return Ok(Claim::Capped {
             max_parallel: full.max_parallel,
         });
     }
     Ok(Claim::Busy)
+}
+
+/// How many jobs of fork runs of the repository of job `job_id` are
+/// launching, launched or running.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn fork_running(db: &Db, job_id: u64) -> Result<u64> {
+    #[derive(Deserialize)]
+    struct Count {
+        n: u64,
+    }
+    Ok(db
+        .first::<Count>(FORK_RUNNING, &params![job_id])
+        .await?
+        .map_or(0, |row| row.n))
+}
+
+/// The oldest queued job of a fork run held for `fork_limit` in the
+/// repository of fork job `job_id`, to wake when `job_id` ends and
+/// leaves a place.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn held_fork_jobs(db: &Db, job_id: u64) -> Result<Vec<Woken>> {
+    db.all(HELD_FORK_JOBS, &params![job_id, 1_u32]).await
+}
+
+/// The queued jobs of run `run_id` held for its approval, which a
+/// decision on the run wakes.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn fork_approval_held(db: &Db, run_id: u64) -> Result<Vec<Woken>> {
+    db.all(FORK_APPROVAL_HELD, &params![run_id]).await
 }
 
 /// The oldest queued job held for `max_parallel` in the group of job

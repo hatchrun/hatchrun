@@ -16,7 +16,7 @@
 //! | --- | --- | --- |
 //! | `GET /api/ci/orgs/{org}/runs?status=&repo=&branch=&actor=&q=&since=&until=&cursor=&limit=` | org member | `Page` of runs of the repositories the caller may read, last 7 days unless `since`, plus `counts` by state for the same filters |
 //! | `GET /api/ci/orgs/{org}/activity?range=24h\|7d&repo=` | org member | `{"bucket_ms", "buckets": [{"at", "started", "passed", "failed"}], "concurrency": {"running", "queued", "limit"}}` for the repositories the caller may read |
-//! | `GET /api/ci/orgs/{org}/needs-you` | org member | `{"approvals", "failing"}` |
+//! | `GET /api/ci/orgs/{org}/needs-you` | org member | `{"approvals", "fork_approvals", "failing"}` |
 //! | `GET /api/ci/repos/{owner}/{repo}/runs?status=&branch=&actor=&q=&since=&until=&cursor=&limit=` | read | `Page` of runs, newest first |
 //! | `GET /api/ci/runs/{run}` | read | the run and its jobs |
 //! | `GET /api/ci/jobs/{job}/log?offset=N` | read | the log text |
@@ -28,6 +28,8 @@
 //! | `GET /api/ci/runs/{run}/artifacts/{id}` | read | `302` to a presigned download |
 //! | `POST /api/ci/repos/{owner}/{repo}/dispatch` | write, CSRF | `202` `{"runs": [..]}` |
 //! | `POST /api/ci/runs/{run}/cancel` | write, CSRF | `204` |
+//! | `POST /api/ci/runs/{run}/approve-fork` | write, CSRF | `204`, runs a fork pull request's run that waits for approval |
+//! | `POST /api/ci/runs/{run}/reject-fork` | write, CSRF | `204`, cancels it |
 //! | `POST /api/ci/jobs/{job}/approve` | org admin, CSRF | `204` |
 //! | `POST /api/ci/jobs/{job}/reject` | org admin, CSRF | `204` |
 //!
@@ -62,6 +64,7 @@ use crate::access::{self, Access};
 use crate::alerts;
 use crate::env::{Settings, run_stub};
 use crate::environments::{self, Decision};
+use crate::fork;
 use crate::github;
 use crate::intake::Repo;
 use crate::launches;
@@ -153,6 +156,10 @@ pub enum Route<'a> {
     Run(u64),
     /// Stop a run.
     Cancel(u64),
+    /// Run a fork pull request's run that waits for approval.
+    ApproveFork(u64),
+    /// Cancel a fork pull request's run that waits for approval.
+    RejectFork(u64),
     /// Let a job held for approval run.
     Approve(u64),
     /// Fail a job held for approval.
@@ -176,9 +183,12 @@ impl Route<'_> {
     #[must_use]
     pub fn method(&self) -> Method {
         match self {
-            Route::Dispatch { .. } | Route::Cancel(_) | Route::Approve(_) | Route::Reject(_) => {
-                Method::Post
-            }
+            Route::Dispatch { .. }
+            | Route::Cancel(_)
+            | Route::ApproveFork(_)
+            | Route::RejectFork(_)
+            | Route::Approve(_)
+            | Route::Reject(_) => Method::Post,
             _ => Method::Get,
         }
     }
@@ -236,6 +246,8 @@ pub fn route(path: &str) -> Option<Route<'_>> {
         }),
         ["runs", run] => id(run).map(Route::Run),
         ["runs", run, "cancel"] => id(run).map(Route::Cancel),
+        ["runs", run, "approve-fork"] => id(run).map(Route::ApproveFork),
+        ["runs", run, "reject-fork"] => id(run).map(Route::RejectFork),
         ["jobs", job, "approve"] => id(job).map(Route::Approve),
         ["jobs", job, "reject"] => id(job).map(Route::Reject),
         ["jobs", job, "log"] => id(job).map(Route::Log),
@@ -513,6 +525,17 @@ pub(crate) fn run_json(run: &RunRow, repository: &str, jobs: JobCounts) -> Value
             "head_ref": run.head_ref,
             "base_ref": run.base_ref,
         })),
+        "trust": run.trust,
+        "fork": (run.trust == crate::trust::Trust::Fork).then(|| json!({
+            "head_repo": run.head_repo_name,
+            "author": run.author_login,
+            "author_association": run.author_association,
+        })),
+        "gate": (run.gate_status != store::GateStatus::NotGated).then(|| json!({
+            "status": run.gate_status,
+            "by": run.gate_by,
+            "at": run.gate_at,
+        })),
         "status": run.status,
         "conclusion": run.conclusion,
         "created_at": run.created_at,
@@ -535,6 +558,7 @@ fn artifact_json(row: &store::ArtifactRow, run: &RunRow) -> Value {
         "size": row.size.unwrap_or(0),
         "created_at": uploaded,
         "expires_at": run.created_at + u64::from(run.retention_days) * 86_400_000,
+        "trust": run.trust,
     })
 }
 
@@ -757,6 +781,8 @@ async fn serve(mut req: Request, env: &Env) -> Result<Served> {
         Route::Artifacts(run) => cx.artifacts(run).await,
         Route::Artifact(run, artifact) => cx.artifact(run, artifact).await,
         Route::Cancel(run) => cx.cancel(run).await,
+        Route::ApproveFork(run) => cx.decide_fork(run, true).await,
+        Route::RejectFork(run) => cx.decide_fork(run, false).await,
         Route::Approve(job) => cx.decide(job, true).await,
         Route::Reject(job) => cx.decide(job, false).await,
         Route::Dispatch { owner, repo } => cx.dispatch(owner, repo, &mut req).await,
@@ -1291,6 +1317,98 @@ impl Cx<'_> {
         no_content().map(Ok)
     }
 
+    /// Decides a fork pull request's run that waits for approval, one
+    /// run at a time (each has its own approval check run), for anyone
+    /// who can write to the repository (not only an admin of the
+    /// organization, which approving an environment needs). The first
+    /// decision wins: a repeat, or a run that expired or ended, answers
+    /// `409`. What follows the saved decision (waking the jobs, marking
+    /// the check run, cancelling) is best effort, and the reconciler's
+    /// backstops catch what fails.
+    async fn decide_fork(&self, run_id: u64, approve: bool) -> Result<Served> {
+        let Some(session) = self.session else {
+            return Ok(stop(401, "sign in to approve or reject runs"));
+        };
+        // The run is looked up as a reader: the write access is checked
+        // once, below, as GitHub says now. Asking for write here would
+        // make a second call to GitHub on a cache miss.
+        let found = match self.found(run_id, Access::Read).await? {
+            Ok(found) => found,
+            Err(stop) => return Ok(Err(stop)),
+        };
+        // The decision releases or cancels jobs, so the approver's write
+        // access to the base repository is asked of GitHub now, not read
+        // from the cache that serves page views for a minute.
+        match access::resolve_fresh(session, self.settings, &found.repo).await {
+            Ok(have) if have >= Access::Write => {}
+            Ok(_) => {
+                return Ok(stop(
+                    403,
+                    "You need write access to this repository to decide a fork pull request's run",
+                ));
+            }
+            Err(access::Failure::Retry(wait)) => {
+                return Ok(Err(Stop(
+                    503,
+                    "GitHub is rate limiting; try again shortly".to_owned(),
+                    Some(wait),
+                )));
+            }
+            Err(access::Failure::Worker(err)) => return Err(err),
+        }
+        let login = session.user.login.as_str();
+        let now = now_ms();
+        let github = Counted::default();
+        let tokens = Tokens::new(
+            Kv::new(self.env),
+            App::new(
+                self.settings.github_api.clone(),
+                self.settings.app_id.clone(),
+                self.settings.app_key.clone(),
+            ),
+            &github,
+            now,
+        );
+        // One run, scoped by its repository and tenant in the query: a
+        // run has its own approval check run and its own decision.
+        let (tenant, repo_id) = (&found.repo.tenant_id, found.repo.id);
+        if approve {
+            let Some(run) =
+                store::approve_run(self.db, tenant, repo_id, found.run.id, login, now).await?
+            else {
+                return Ok(stop(409, "This run is not waiting for approval"));
+            };
+            fork::after_approval(
+                self.env,
+                self.db,
+                self.settings,
+                &tokens,
+                &found.repo,
+                &[run],
+                login,
+            )
+            .await;
+        } else {
+            let Some(run) =
+                store::reject_run(self.db, tenant, repo_id, found.run.id, login, now).await?
+            else {
+                return Ok(stop(409, "This run is not waiting for approval"));
+            };
+            fork::after_end(
+                self.env,
+                self.db,
+                self.settings,
+                &tokens,
+                &found.repo,
+                &[run],
+                &fork::rejected_message(login),
+            )
+            .await;
+        }
+        alerts::note_rate_limits(self.db, &github, now).await;
+        no_content().map(Ok)
+    }
+
     /// Records an organization admin's decision on a job held for
     /// approval. The decision applies to the attempt the job is on and
     /// only once; a repeat answers `409`. Waking or ending the job can
@@ -1497,6 +1615,7 @@ impl Cx<'_> {
                 head_ref: "",
                 base_ref: "",
                 workflow: Some(&asked.workflow),
+                origin: runs::Origin::own(&session.user.login),
             },
             &config,
             now,
@@ -1672,6 +1791,70 @@ mod tests {
         ] {
             assert_eq!(route(path), None, "{path}");
         }
+    }
+
+    #[test]
+    fn fork_runs_are_decided_by_post() {
+        assert_eq!(
+            route("/api/ci/runs/12/approve-fork"),
+            Some(Route::ApproveFork(12))
+        );
+        assert_eq!(
+            route("/api/ci/runs/12/reject-fork"),
+            Some(Route::RejectFork(12))
+        );
+        for path in [
+            "/api/ci/runs/12/approve-fork",
+            "/api/ci/runs/12/reject-fork",
+        ] {
+            assert_eq!(route(path).unwrap().method(), Method::Post);
+            assert!(guarded(&Method::Post));
+        }
+        assert_eq!(route("/api/ci/runs/x/approve-fork"), None);
+        assert_eq!(route("/api/ci/runs/12/approve-fork/more"), None);
+    }
+
+    fn fork_run_row(trust: &str, gate: &str) -> RunRow {
+        serde_json::from_value(json!({
+            "id": 9, "run_number": 1, "run_attempt": 1, "tenant_id": "t1",
+            "repo_id": 7, "workflow": "ci", "delivery": "d", "event": "pull_request",
+            "git_ref": "refs/pull/4/merge", "sha": "abc", "actor": "a",
+            "status": "queued", "conclusion": null, "created_at": 1000,
+            "completed_at": null, "retention_days": 30, "pull_number": 4,
+            "trust": trust, "head_repo_name": "mallory/app", "author_login": "mallory",
+            "author_association": "FIRST_TIMER", "gate_status": gate,
+            "gate_by": "maintainer", "gate_at": 2000
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_run_shows_its_trust_origin_and_gate() {
+        let body = run_json(
+            &fork_run_row("fork", "pending"),
+            "acme/app",
+            JobCounts::default(),
+        );
+        assert_eq!(body["trust"], "fork");
+        assert_eq!(body["fork"]["head_repo"], "mallory/app");
+        assert_eq!(body["fork"]["author"], "mallory");
+        assert_eq!(body["fork"]["author_association"], "FIRST_TIMER");
+        assert_eq!(body["gate"]["status"], "pending");
+        assert_eq!(body["gate"]["by"], "maintainer");
+        let own = run_json(
+            &fork_run_row("trusted", "none"),
+            "acme/app",
+            JobCounts::default(),
+        );
+        assert_eq!(own["trust"], "trusted");
+        assert!(own["fork"].is_null());
+        assert!(own["gate"].is_null());
+        let approved = run_json(
+            &fork_run_row("fork", "approved"),
+            "acme/app",
+            JobCounts::default(),
+        );
+        assert_eq!(approved["gate"]["status"], "approved");
     }
 
     #[test]
@@ -1913,7 +2096,8 @@ workflows:
             "repo_id": 7, "workflow": "ci", "delivery": "d", "event": "push",
             "git_ref": "refs/heads/main", "sha": "abc", "actor": "a",
             "status": "completed", "conclusion": "success", "created_at": 1000,
-            "completed_at": null, "retention_days": 30
+            "completed_at": null, "retention_days": 30, "trust": "trusted",
+            "author_login": "a", "author_association": "", "gate_status": "none"
         }))
         .unwrap();
         let row = store::ArtifactRow {
@@ -1925,7 +2109,7 @@ workflows:
             artifact_json(&row, &run),
             json!({
                 "id": 3, "name": "dist", "size": 12, "created_at": 1000 + 86_400_000_u64,
-                "expires_at": 1000 + 30 * 86_400_000_u64,
+                "expires_at": 1000 + 30 * 86_400_000_u64, "trust": "trusted",
             })
         );
     }

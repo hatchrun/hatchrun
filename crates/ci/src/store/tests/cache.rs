@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
+use crate::trust::Trust;
 use hatchrun_cloud::testdb::Db as TestDb;
 
 const MAIN: CacheOwner<'static> = CacheOwner {
+    trust: Trust::Trusted,
     tenant_id: "t1",
     repo_id: 7,
     scope: "refs/heads/main",
@@ -416,4 +418,103 @@ fn a_pull_request_run_records_its_base_branch() {
         .unwrap()
         .unwrap();
     assert_eq!(push.base_ref, None);
+}
+
+#[test]
+fn a_fork_save_counts_against_the_fork_share_and_evicts_only_fork_entries() {
+    let db = TestDb::new();
+    let fork = |scope| CacheOwner {
+        trust: Trust::Fork,
+        ..on(scope)
+    };
+    // The base branch holds a big, old entry that a fork's saves must
+    // not push out.
+    save_sized(&db, MAIN, "base", 5_000, 1);
+    save_sized(&db, fork("refs/pull/3/merge"), "a", 100, 10);
+    save_sized(&db, fork("refs/pull/3/merge"), "b", 100, 20);
+    save_sized(&db, fork("refs/pull/4/merge"), "c", 100, 30);
+    assert_eq!(db.wait(fork_cache_bytes(db.db(), "t1", 7)).unwrap(), 300);
+    let gone = db
+        .wait(evict_over_fork_quota_cache_entries(
+            db.db(),
+            "t1",
+            7,
+            250,
+            10,
+        ))
+        .unwrap();
+    let keys: Vec<&str> = gone.iter().map(|row| row.key.as_str()).collect();
+    assert_eq!(keys, ["a"], "the least recently used fork entry goes");
+    assert!(find(&db, MAIN, "base", true).is_some(), "base entries stay");
+    assert_eq!(db.wait(fork_cache_bytes(db.db(), "t1", 7)).unwrap(), 200);
+    // Under the general quota rule the fork entries would not protect
+    // the base entry: the fork rule never reaches it, whatever the cap.
+    let none = db
+        .wait(evict_over_fork_quota_cache_entries(
+            db.db(),
+            "t1",
+            7,
+            1_000,
+            10,
+        ))
+        .unwrap();
+    assert_eq!(none.len(), 0);
+    let all = db
+        .wait(evict_over_fork_quota_cache_entries(db.db(), "t1", 7, 0, 10))
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(find(&db, MAIN, "base", true).is_some());
+}
+
+#[test]
+fn an_entry_records_the_trust_of_the_run_that_saved_it() {
+    let db = TestDb::new();
+    let owner = CacheOwner {
+        trust: Trust::Fork,
+        ..on("refs/pull/3/merge")
+    };
+    let row = save(&db, owner, "v", "k", 1);
+    let trust: String = db
+        .column(
+            "SELECT trust AS t FROM ci_cache_entries WHERE id = $1",
+            &params![row.id],
+            "t",
+        )
+        .unwrap();
+    assert_eq!(trust, "fork");
+    let base = save(&db, MAIN, "v", "k", 2);
+    let trust: String = db
+        .column(
+            "SELECT trust AS t FROM ci_cache_entries WHERE id = $1",
+            &params![base.id],
+            "t",
+        )
+        .unwrap();
+    assert_eq!(trust, "trusted");
+}
+
+#[test]
+fn a_flood_of_fork_entries_does_not_push_trusted_entries_out_of_their_share() {
+    let db = TestDb::new();
+    let fork = |scope| CacheOwner {
+        trust: Trust::Fork,
+        ..on(scope)
+    };
+    save_sized(&db, MAIN, "base", 500, 1);
+    save_sized(&db, MAIN, "default", 500, 2);
+    save_sized(&db, fork("refs/pull/3/merge"), "a", 5_000, 10);
+    save_sized(&db, fork("refs/pull/4/merge"), "b", 5_000, 20);
+    // The trusted share is 1000 bytes, which the two trusted entries
+    // fit exactly: the fork entries do not count against it.
+    let gone = db
+        .wait(evict_over_quota_cache_entries(db.db(), "t1", 7, 1_000, 10))
+        .unwrap();
+    assert_eq!(gone.len(), 0, "{gone:?}");
+    // Past the share, only trusted entries go.
+    let gone = db
+        .wait(evict_over_quota_cache_entries(db.db(), "t1", 7, 700, 10))
+        .unwrap();
+    let keys: Vec<&str> = gone.iter().map(|row| row.key.as_str()).collect();
+    assert_eq!(keys, ["base"], "the least recently used trusted entry");
+    assert_eq!(db.wait(fork_cache_bytes(db.db(), "t1", 7)).unwrap(), 10_000);
 }

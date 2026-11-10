@@ -94,9 +94,10 @@ export function useQueryList(name: string): string[] {
  *   /o/:org/environments                           Environments
  *   /o/:org/settings/billing                       Settings, Billing (/settings redirects here)
  *   /o/:org/settings/setup                         First run checklist
+ *   /o/:org/settings/forks                         Fork pull request policy (org admin)
  *   /o/:org/settings/audit                         Audit log (org admin)
  */
-export type OrgPage = "kit" | "runs" | "repositories" | "repository" | "secrets" | "environments" | "billing" | "audit" | "setup" | "run";
+export type OrgPage = "kit" | "runs" | "repositories" | "repository" | "secrets" | "environments" | "billing" | "audit" | "setup" | "forks" | "run";
 
 export type RepoTabId = "runs" | "workflows" | "branches" | "pulls";
 
@@ -121,6 +122,7 @@ const PAGES: Record<string, OrgPage> = {
   environments: "environments",
   "settings/billing": "billing",
   "settings/setup": "setup",
+  "settings/forks": "forks",
   "settings/audit": "audit",
   // The component gallery, under `npm run dev:mock` only.
   ...(import.meta.env.MODE === "mock" ? { kit: "kit" as const } : {}),

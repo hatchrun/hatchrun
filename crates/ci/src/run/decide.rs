@@ -1139,6 +1139,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t, { t: { name: b, requires: [t] } }
             started_at: None,
             conclusion: Some("failure".to_owned()),
             completed_at: Some("t".to_owned()),
+            actions: Vec::new(),
             output: Some(Output {
                 title: "Failed".to_owned(),
                 summary: "x".repeat(5000),

@@ -19,8 +19,10 @@ use crate::env::{Settings, run_stub};
 use crate::github::{self, CONFIG_PATH, CheckRun, GhAnnotation, Output};
 use crate::intake::{PullRequest, Repo};
 use crate::planning::{self, Failed, Selected};
+use crate::policy::RepoPolicy;
 use crate::run::{RunInfo, Start, github_context};
-use crate::store::{self, CiBilling, JobRow, NewJob, NewRun, RunRow};
+use crate::store::{self, CiBilling, GateStatus, JobRow, NewJob, NewRun, RunRow};
+use crate::trust::Trust;
 
 /// The name of the check run that reports an unusable config.
 pub const CONFIG_CHECK: &str = "hatchrun / config";
@@ -33,6 +35,44 @@ const MAX_ANNOTATIONS: usize = 50;
 
 /// Diagnostics beyond this many are left out of the summary.
 const MAX_LISTED: usize = 100;
+
+/// Whose code a request runs and who wrote it: what the runs record as
+/// their trust, and the approval a fork pull request's runs wait for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Origin<'a> {
+    /// Whether the code is the repository's own or a fork's.
+    pub trust: Trust,
+    /// The head repository of a fork pull request, by id.
+    pub head_repo_id: Option<u64>,
+    /// The head repository of a fork pull request, `owner/name`.
+    pub head_repo_name: Option<&'a str>,
+    /// The login of the pull request's author; the actor otherwise.
+    pub author: &'a str,
+    /// GitHub's `author_association` of the author; empty otherwise.
+    pub association: &'a str,
+    /// Whether the runs wait for an approval.
+    pub gate: GateStatus,
+    /// The repository's fork policy, for a fork pull request: its jobs
+    /// are cut to the policy's timeout and to 4 vCPUs.
+    pub policy: Option<RepoPolicy>,
+}
+
+impl<'a> Origin<'a> {
+    /// The origin of a run of the repository's own code started by
+    /// `actor`: trusted, and it waits for nobody.
+    #[must_use]
+    pub const fn own(actor: &'a str) -> Self {
+        Self {
+            trust: Trust::Trusted,
+            head_repo_id: None,
+            head_repo_name: None,
+            author: actor,
+            association: "",
+            gate: GateStatus::NotGated,
+            policy: None,
+        }
+    }
+}
 
 /// What starts runs.
 pub struct Request<'a> {
@@ -66,6 +106,8 @@ pub struct Request<'a> {
     /// Start only this workflow's plan. A schedule names its workflow;
     /// the other workflows that share its cron have their own entries.
     pub workflow: Option<&'a str>,
+    /// Whose code the runs execute.
+    pub origin: Origin<'a>,
 }
 
 fn fail(message: impl Into<String>) -> worker::Error {
@@ -303,6 +345,7 @@ fn failed_check_run(
         started_at: None,
         conclusion: Some("failure".to_owned()),
         completed_at: None,
+        actions: Vec::new(),
         output: Some(Output {
             title: title.to_owned(),
             summary,
@@ -326,6 +369,7 @@ pub fn no_card_check_run(sha: &str, org: &str, app_url: &str) -> CheckRun {
         started_at: None,
         conclusion: Some("action_required".to_owned()),
         completed_at: None,
+        actions: Vec::new(),
         output: Some(Output {
             title: "hatchrun needs a card".to_owned(),
             summary: format!("Add a card for {org} at {page} to run this commit's workflows."),
@@ -414,7 +458,7 @@ pub async fn create(
                 tenant_id: req.tenant_id,
             };
             let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
-            crate::remote::read_library(&github, &parsed, &names)
+            crate::remote::read_library(&github, &parsed, &names, req.origin.trust == Trust::Fork)
                 .await
                 .map_err(fail)?
         }
@@ -422,9 +466,10 @@ pub async fn create(
     };
     let selected = planning::select_with(source, req.trigger, req.compile_ref, &library);
     let (plans, failed) = match selected {
-        Selected::Plans { plans, failed } => (
+        Selected::Plans { plans, failed } => fork_limits(
             only_workflow(plans, req.workflow),
             only_failed(failed, req.workflow),
+            req.origin.policy.is_some(),
         ),
         Selected::Invalid(diagnostics) => {
             if card {
@@ -459,6 +504,35 @@ pub async fn create(
         }
     }
     Ok(ids)
+}
+
+/// For a fork pull request, moves the plans with a job on a runner
+/// template over 4 vCPUs to the workflows that failed, with a message
+/// that says so. Other requests keep what they have.
+fn fork_limits(plans: Vec<Plan>, mut failed: Vec<Failed>, fork: bool) -> (Vec<Plan>, Vec<Failed>) {
+    if !fork {
+        return (plans, failed);
+    }
+    let mut kept = Vec::new();
+    for plan in plans {
+        match crate::fork::oversized_job(&plan) {
+            Some(message) => failed.push(Failed {
+                workflow: plan.workflow.clone(),
+                diagnostics: vec![Diagnostic::new(message)],
+            }),
+            None => kept.push(plan),
+        }
+    }
+    (kept, failed)
+}
+
+/// `plan` with every job's timeout cut to the fork policy's.
+fn with_fork_timeouts(plan: &Plan, policy: &RepoPolicy) -> Plan {
+    let mut plan = plan.clone();
+    for job in &mut plan.jobs {
+        job.timeout_minutes = crate::policy::clamp_timeout(job.timeout_minutes, policy);
+    }
+    plan
 }
 
 /// The plans of `workflow` when one is named, all of them otherwise.
@@ -607,6 +681,14 @@ async fn start_plan(
     plan: &Plan,
     now: u64,
 ) -> Result<u64> {
+    let limited;
+    let plan = match &req.origin.policy {
+        Some(policy) => {
+            limited = with_fork_timeouts(plan, policy);
+            &limited
+        }
+        None => plan,
+    };
     let new = NewRun {
         tenant_id: req.tenant_id.to_owned(),
         repo_id: req.repo.id,
@@ -620,6 +702,12 @@ async fn start_plan(
         message: run_message(req.event_name, req.event),
         pull_number: pull_number(req),
         head_ref: pull_number(req).map(|_| req.head_ref.to_owned()),
+        trust: req.origin.trust,
+        head_repo_id: req.origin.head_repo_id,
+        head_repo_name: req.origin.head_repo_name.map(str::to_owned),
+        author_login: req.origin.author.to_owned(),
+        author_association: req.origin.association.to_owned(),
+        gate_status: req.origin.gate,
         now,
     };
     let (run, fresh) = match store::insert_run(db, &new).await? {
@@ -783,6 +871,7 @@ mod tests {
             head_ref: "",
             base_ref: "",
             workflow: None,
+            origin: Origin::own("octocat"),
         };
         let vars = std::collections::BTreeMap::from([("REGION".to_owned(), "eu".to_owned())]);
         let run = crate::store::RunRow {
@@ -807,6 +896,15 @@ mod tests {
             pull_number: None,
             head_ref: None,
             pull_title: None,
+            trust: Trust::Trusted,
+            head_repo_name: None,
+            author_login: "octocat".into(),
+            author_association: String::new(),
+            gate_status: GateStatus::NotGated,
+            gate_by: None,
+            gate_at: None,
+            gate_check_run_id: None,
+            gate_card_dirty: false,
         };
         title_of(&req, &plan, "https://api.github.com", &vars, &run)
     }
@@ -930,6 +1028,55 @@ mod tests {
         assert_eq!(output.annotations.len(), 1);
     }
 
+    fn plan_on(runs_on: &str, minutes: u32) -> Plan {
+        let yaml = format!(
+            "jobs: {{ t: {{ runs-on: {runs_on}, timeout-minutes: {minutes}, steps: [] }} }}\n\
+             workflows: {{ ci: {{ on: {{ pull_request: {{}} }}, jobs: [t] }} }}\n"
+        );
+        let config = hatchrun_workflow::parse(&yaml).unwrap();
+        hatchrun_workflow::compile(&config, "ci", "refs/heads/main").unwrap()
+    }
+
+    #[test]
+    fn a_fork_plan_on_a_big_template_fails_alone_with_a_message() {
+        let big = hatchrun_workflow::templates::TEMPLATES
+            .iter()
+            .find(|t| t.vcpu > crate::policy::FORK_MAX_VCPU)
+            .unwrap();
+        let (plans, failed) = fork_limits(
+            vec![plan_on("ubuntu-latest", 10), plan_on(big.labels[0], 10)],
+            Vec::new(),
+            true,
+        );
+        assert_eq!(plans.len(), 1);
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].diagnostics[0].message.contains("at most 4 vCPUs"));
+        // A run of the repository's own code keeps its big templates.
+        let (plans, failed) = fork_limits(vec![plan_on(big.labels[0], 10)], Vec::new(), false);
+        assert_eq!((plans.len(), failed.len()), (1, 0));
+    }
+
+    #[test]
+    fn a_fork_plans_timeouts_are_cut_to_the_policy() {
+        let policy = RepoPolicy {
+            fork_timeout_minutes: 15,
+            ..RepoPolicy::default_for(false)
+        };
+        let cut = with_fork_timeouts(&plan_on("ubuntu-latest", 360), &policy);
+        assert_eq!(cut.jobs[0].timeout_minutes, 15);
+        let short = with_fork_timeouts(&plan_on("ubuntu-latest", 5), &policy);
+        assert_eq!(short.jobs[0].timeout_minutes, 5);
+    }
+
+    #[test]
+    fn a_request_of_the_repositorys_own_code_waits_for_nobody() {
+        let origin = Origin::own("octocat");
+        assert_eq!(origin.trust, Trust::Trusted);
+        assert_eq!(origin.gate, GateStatus::NotGated);
+        assert_eq!(origin.policy, None);
+        assert_eq!(origin.author, "octocat");
+    }
+
     #[test]
     fn no_card_check_run_asks_for_a_card() {
         let run = no_card_check_run("abc", "acme", "https://app.example");
@@ -1029,6 +1176,12 @@ mod tests {
                     message: None,
                     pull_number: None,
                     head_ref: None,
+                    trust: Trust::Trusted,
+                    head_repo_id: None,
+                    head_repo_name: None,
+                    author_login: "octocat".into(),
+                    author_association: String::new(),
+                    gate_status: GateStatus::NotGated,
                     now: 1,
                 },
             ))

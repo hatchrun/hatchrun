@@ -6,13 +6,16 @@ import { cn } from "@/lib/utils";
 import { orgUrl } from "@/lib/urls";
 import { Link } from "@/router";
 
-export type SettingsPage = "billing" | "setup" | "audit";
+export type SettingsPage = "billing" | "setup" | "forks" | "audit";
 
-/** The sub-navigation of /o/:org/settings/*: Billing, Setup and, for admins, the Audit log. */
+/** The sub-navigation of /o/:org/settings/*: Billing, Setup, Fork pull requests and, for admins, the Audit log. */
 export function SettingsNav({ org, current, admin }: { org: string; current: SettingsPage; admin: boolean }) {
   const items: [SettingsPage, string][] = [
     ["billing", "Billing"],
     ["setup", "Setup"],
+    // Repository admins who are not org admins change a repository's fork
+    // policy here; the server decides who may.
+    ["forks", "Fork pull requests"],
     ...(admin ? ([["audit", "Audit log"]] as [SettingsPage, string][]) : []),
   ];
   return (

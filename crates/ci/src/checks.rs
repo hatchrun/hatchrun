@@ -137,7 +137,7 @@ fn cell(text: &str) -> String {
 /// `text` as one line of plain text in Markdown: every character that
 /// could start a link, an image, emphasis, HTML or a list is escaped, so
 /// a title from a pull request or a dispatch payload cannot make any.
-fn plain(text: &str) -> String {
+pub(crate) fn plain(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -307,6 +307,7 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
         started_at: view.started_at.map(rfc3339),
         conclusion: conclusion.map(str::to_owned),
         completed_at: view.completed_at.map(rfc3339),
+        actions: Vec::new(),
         output: Some(Output {
             title,
             summary,

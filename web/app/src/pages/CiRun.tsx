@@ -25,6 +25,7 @@ import { bytes, duration, shortRef, shortSha } from "@/lib/format";
 import { orgUrl, repoUrl, runUrl, workflowUrl } from "@/lib/urls";
 import { Link, useLocation, type CiRoute } from "@/router";
 import { ApprovalCard } from "./ci/ApprovalCard";
+import { ForkApprovalCard } from "./ci/ForkApprovalCard";
 import { JobLog } from "./ci/JobLog";
 import { JobsPanel } from "./ci/JobsPanel";
 import { BTN } from "./ci/runUi";
@@ -145,6 +146,7 @@ function RunScreen({
           Could not refresh: {stale.message}. Showing the last result.
         </p>
       )}
+      <ForkApprovalCard run={run} session={session} access={data.access} reload={reload} />
       <ApprovalCard
         run={run}
         jobs={jobs}

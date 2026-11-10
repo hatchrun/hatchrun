@@ -21,24 +21,21 @@ use worker::{Env, Method, Request, RequestInit, Response, Result};
 
 use crate::alerts;
 use crate::env::{Settings, run_stub};
+use crate::fork;
 use crate::github;
 use crate::installation;
 use crate::intake::{
-    self, MergeGroup, PullRequest, Push, RefChange, Release, Repo, RepositoryDispatch, Rerequested,
-    Trigger,
+    self, ApproveFork, MergeGroup, PullRequest, Push, RefChange, Release, Repo, RepositoryDispatch,
+    Rerequested, Trigger,
 };
 use crate::planning;
+use crate::policy::{self, Admission, RepoPolicy};
 use crate::runs::{self, Config};
-use crate::store::{self, RepoRow, TenantRow};
+use crate::store::{self, GateStatus, RepoRow, TenantRow};
+use crate::trust::Trust;
 
 /// Secret holding the App's webhook secret.
 const WEBHOOK_SECRET: &str = "GITHUB_WEBHOOK_SECRET";
-
-/// Pages of a pull request's files that are read, 100 files each.
-const FILE_PAGES: u32 = 3;
-
-/// Files GitHub lists on a full page.
-const PAGE_SIZE: usize = 100;
 
 fn now_ms() -> u64 {
     worker::Date::now().as_millis()
@@ -153,6 +150,7 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         Trigger::MergeGroup(g) => (g.installation_id, &g.repo),
         Trigger::RepositoryDispatch(d) => (d.installation_id, &d.repo),
         Trigger::Rerequested(r) => (r.installation_id, &r.repo),
+        Trigger::ApproveFork(a) => (a.installation_id, &a.repo),
         Trigger::Repository(r) => (r.installation_id, &r.repo),
     };
     let found = store::tenant_for_installation(&db, installation_id).await?;
@@ -361,6 +359,7 @@ impl Cx<'_> {
             Trigger::MergeGroup(group) => self.merge_group(group).await?,
             Trigger::RepositoryDispatch(dispatch) => self.repository_dispatch(dispatch).await?,
             Trigger::Rerequested(rerun) => self.rerun(rerun).await?,
+            Trigger::ApproveFork(approval) => self.approve_fork(approval).await?,
             // The row was updated before, with the tenant's other
             // repository writes; nothing runs.
             Trigger::Repository(_) => Outcome::Done(Vec::new()),
@@ -402,6 +401,7 @@ impl Cx<'_> {
                 head_ref: "",
                 base_ref: "",
                 workflow: None,
+                origin: runs::Origin::own(&push.actor),
             },
             &config,
             self.now,
@@ -425,25 +425,221 @@ impl Cx<'_> {
         Ok(Outcome::Done(ids))
     }
 
+    /// Settles a tie: two deliveries of the same second with different
+    /// head commits. GitHub's time has one second, so which is newer is
+    /// not in the deliveries; the pull request's head as GitHub has it
+    /// now is. The delivery counts only when it names that head, and then
+    /// the row is made to say so.
+    async fn tie_is_current(&self, pr: &PullRequest, record: &store::NewPull) -> Result<bool> {
+        let response = self
+            .tokens
+            .send(pr.installation_id, |token| {
+                github::pull_request(
+                    &self.settings.github_api,
+                    &pr.repo.full_name,
+                    pr.number,
+                    token,
+                )
+            })
+            .await
+            .map_err(|err| fail(err.to_string()))?;
+        let head = github::pull_head_sha(&response).map_err(fail)?;
+        if head != pr.head_sha {
+            return Ok(false);
+        }
+        store::upsert_pull_forced(self.db, record).await?;
+        Ok(true)
+    }
+
+    /// What a fork pull request becomes under its repository's policy:
+    /// the gate its runs get and the policy to plan them under, or the
+    /// outcome that starts nothing. A newer commit ends the waiting runs
+    /// of older ones, and a closed pull request ends them all. `None`
+    /// for a pull request from the same repository.
+    async fn fork_admission(
+        &self,
+        pr: &PullRequest,
+    ) -> Result<std::result::Result<Option<(GateStatus, RepoPolicy)>, Outcome>> {
+        if pr.fork.is_none() {
+            return Ok(Ok(None));
+        }
+        let policy = store::repo_policy(self.db, pr.repo.id, pr.repo.private).await?;
+        let open = pr.state == "open";
+        let keep = open.then_some(pr.head_sha.as_str());
+        self.end_waiting(pr, keep, if open { fork::SUPERSEDED } else { fork::CLOSED })
+            .await?;
+        if !open {
+            return Ok(Err(Outcome::Ignored("pull request is closed".to_owned())));
+        }
+        let waiting = store::fork_waiting(self.db, pr.repo.id, &pr.author, Some(pr.number)).await?;
+        let admission = policy::admission(&policy, &pr.author_association, waiting);
+        if let Some(reason) = policy::refusal(admission) {
+            return Ok(Err(Outcome::Ignored(reason.to_owned())));
+        }
+        let gate = match admission {
+            Admission::Pending => GateStatus::Pending,
+            Admission::Deferred => GateStatus::Deferred,
+            _ => GateStatus::NotGated,
+        };
+        Ok(Ok(Some((gate, policy))))
+    }
+
+    /// Cancels the runs of `pr` that wait for an approval, except those
+    /// at `keep`, and marks their card with `message`.
+    async fn end_waiting(&self, pr: &PullRequest, keep: Option<&str>, message: &str) -> Result<()> {
+        let ended = store::end_pull_gates(self.db, pr.repo.id, pr.number, keep, self.now).await?;
+        if ended.is_empty() {
+            return Ok(());
+        }
+        if let Some(repo) = store::repo(self.db, pr.repo.id).await? {
+            fork::after_end(
+                self.env,
+                self.db,
+                self.settings,
+                self.tokens,
+                &repo,
+                &ended,
+                message,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    /// Puts an approval check run on the head of `pr` for each of the
+    /// runs the delivery made that waits: its own card, with its own
+    /// button, named for its workflow. A delivery repeated after a
+    /// failure adopts the card an earlier attempt made and records its
+    /// id, so the button always finds its run (see
+    /// [`fork::ensure_card`]).
+    async fn ask_approval(
+        &self,
+        pr: &PullRequest,
+        run_ids: &[u64],
+        policy: &RepoPolicy,
+    ) -> Result<()> {
+        let Some(repo) = store::repo(self.db, pr.repo.id).await? else {
+            return Ok(());
+        };
+        // The runs exist: a card that cannot be made now is logged, and
+        // the reconciler makes it. The delivery does not fail for it.
+        for &run_id in run_ids {
+            let Some(run) = store::run(self.db, run_id).await? else {
+                continue;
+            };
+            if let Err(err) = fork::ensure_card(
+                self.tokens,
+                self.db,
+                self.settings,
+                &repo,
+                &run,
+                policy,
+                None,
+            )
+            .await
+            {
+                worker::console_error!("run {run_id}: the approval check run: {err}");
+            }
+        }
+        Ok(())
+    }
+
+    /// A click on "Approve and run". GitHub shows the button to people
+    /// who can write, and this does not rely on it: the sender's
+    /// permission on the base repository is asked of GitHub, and only
+    /// `write`, `maintain` and `admin` approve.
+    async fn approve_fork(&self, approval: &ApproveFork) -> Result<Outcome> {
+        let sent = self
+            .tokens
+            .send(approval.installation_id, |token| {
+                github::collaborator_permission(
+                    &self.settings.github_api,
+                    &approval.repo.full_name,
+                    &approval.sender,
+                    token,
+                )
+            })
+            .await
+            .map_err(|err| fail(err.to_string()))?;
+        if !github::can_write(&sent).map_err(fail)? {
+            worker::console_warn!(
+                "{}: {} cannot write and clicked approve on check run {}",
+                approval.repo.full_name,
+                approval.sender,
+                approval.check_run_id
+            );
+            return Ok(Outcome::Ignored(
+                "the sender cannot write to the repository".to_owned(),
+            ));
+        }
+        let approved = store::approve_by_check(
+            self.db,
+            self.tenant,
+            approval.repo.id,
+            approval.check_run_id,
+            &approval.sender,
+            self.now,
+        )
+        .await?;
+        if approved.is_empty() {
+            return Ok(Outcome::Ignored(
+                "no run waits on this check run".to_owned(),
+            ));
+        }
+        if let Some(repo) = store::repo(self.db, approval.repo.id).await? {
+            fork::after_approval(
+                self.env,
+                self.db,
+                self.settings,
+                self.tokens,
+                &repo,
+                &approved,
+                &approval.sender,
+            )
+            .await;
+        }
+        Ok(Outcome::Done(approved.iter().map(|run| run.id).collect()))
+    }
+
+    #[allow(clippy::too_many_lines)] // One delivery, read top to bottom.
     async fn pull_request(&self, pr: &PullRequest) -> Result<Outcome> {
         // Every action carries the pull request as it stands, and a run
         // of any of them (`labeled` included) needs its row, so all are
         // recorded. The time is GitHub's, so a late delivery cannot
         // replace newer data.
-        store::upsert_pull(
-            self.db,
-            &store::NewPull {
-                repo_id: pr.repo.id,
-                number: pr.number,
-                title: pr.title.clone(),
-                head_ref: pr.head_ref.clone(),
-                base_ref: pr.base_ref.clone(),
-                author: pr.author.clone(),
-                state: pr.state.to_owned(),
-                updated_at: pr.updated_at,
-            },
-        )
-        .await?;
+        let record = store::NewPull {
+            repo_id: pr.repo.id,
+            number: pr.number,
+            title: pr.title.clone(),
+            head_ref: pr.head_ref.clone(),
+            base_ref: pr.base_ref.clone(),
+            author: pr.author.clone(),
+            author_association: pr.author_association.clone(),
+            head_repo_id: pr
+                .fork
+                .as_ref()
+                .map_or(Some(pr.repo.id), |f| f.head_repo_id),
+            head_sha: pr.head_sha.clone(),
+            state: pr.state.to_owned(),
+            updated_at: pr.updated_at,
+        };
+        let applied = match store::upsert_pull(self.db, &record).await? {
+            store::PullWrite::Applied => true,
+            store::PullWrite::Stale => false,
+            store::PullWrite::Tied => self.tie_is_current(pr, &record).await?,
+        };
+        // A delivery older than what is recorded says nothing about the
+        // pull request as it stands: it must not cancel the runs of the
+        // newer commit as superseded, nor start runs of the older one.
+        if pr.fork.is_some() && !applied {
+            return Ok(Outcome::Ignored(
+                "the delivery is older than the pull request's recorded state".to_owned(),
+            ));
+        }
+        let admitted = match self.fork_admission(pr).await? {
+            Ok(admitted) => admitted,
+            Err(outcome) => return Ok(outcome),
+        };
         let config = runs::read_config(
             self.tokens,
             self.settings,
@@ -459,7 +655,7 @@ impl Cx<'_> {
             if planning::needs_pull_request_paths(source, &pr.action, &pr.base_ref));
         let mut changed = Vec::new();
         if wants_paths {
-            for page in 1..=FILE_PAGES {
+            for page in 1..=github::FILES_MAX_PAGES {
                 let response = self
                     .tokens
                     .send(pr.installation_id, |token| {
@@ -474,7 +670,7 @@ impl Cx<'_> {
                     .await
                     .map_err(|err| fail(err.to_string()))?;
                 let names = github::pull_file_names(&response).map_err(fail)?;
-                let full = names.len() >= PAGE_SIZE;
+                let full = names.len() >= github::FILES_PAGE_SIZE;
                 changed.extend(names);
                 if !full || changed.len() >= MAX_CHANGED {
                     break;
@@ -508,11 +704,32 @@ impl Cx<'_> {
                 head_ref: &pr.head_ref,
                 base_ref: &pr.base_ref,
                 workflow: None,
+                origin: match (&admitted, &pr.fork) {
+                    (Some((gate, policy)), Some(fork)) => runs::Origin {
+                        trust: Trust::Fork,
+                        head_repo_id: fork.head_repo_id,
+                        head_repo_name: fork.head_repo_name.as_deref(),
+                        author: &pr.author,
+                        association: &pr.author_association,
+                        gate: *gate,
+                        policy: Some(*policy),
+                    },
+                    _ => runs::Origin {
+                        author: &pr.author,
+                        association: &pr.author_association,
+                        ..runs::Origin::own(&pr.actor)
+                    },
+                },
             },
             &config,
             self.now,
         )
         .await?;
+        if let Some((gate, policy)) = &admitted
+            && *gate != GateStatus::NotGated
+        {
+            self.ask_approval(pr, &ids, policy).await?;
+        }
         Ok(Outcome::Done(ids))
     }
 
@@ -615,6 +832,7 @@ impl Cx<'_> {
                 head_ref: "",
                 base_ref: "",
                 workflow: None,
+                origin: runs::Origin::own(fired.actor),
             },
             config,
             self.now,
@@ -634,6 +852,21 @@ impl Cx<'_> {
             return Ok(Outcome::Ignored(
                 "check run of another repository".to_owned(),
             ));
+        }
+        // A fork run whose approval ended, or whose repository turned
+        // fork runs off, is not rerun: nothing is reset, and the commit
+        // says why in one check run that later refusals update. The
+        // not-approved reason needs only the run's row.
+        let repo = store::repo(self.db, run.repo_id).await?;
+        let policy = match &repo {
+            Some(repo) => Some(store::repo_policy(self.db, repo.id, repo.private).await?),
+            None => None,
+        };
+        if let Some(reason) = fork::rerun_refusal(&run, policy.as_ref()) {
+            if let Some(repo) = &repo {
+                fork::say_rerun_refused(self.tokens, self.settings, repo, &run, reason).await;
+            }
+            return Ok(Outcome::Ignored(reason.to_owned()));
         }
         let url = format!(
             "https://run/rerun?job={}&run={}&tenant={}&days={}",

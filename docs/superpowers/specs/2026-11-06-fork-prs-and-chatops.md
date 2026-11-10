@@ -637,7 +637,7 @@ ships without an owner prompt.
 
 ## Data model changes
 
-One migration, `crates/cloud/migrations/0019_ci_fork_runs.sql`. There is
+One migration, `crates/cloud/migrations/0022_ci_fork_runs.sql`. There is
 no compatibility path: new columns are `not null` and the migration
 backfills existing rows (`trusted`, no gate).
 
@@ -656,7 +656,7 @@ Fewer, larger PRs with a deploy order, as every merge to main releases.
 
 **PR 1: trust model and fork PRs** (`feat(ci): run pull requests from forks`)
 
-- Migration 0019, `trust.rs`, intake and webhook changes for forks, the
+- Migration 0022, `trust.rs`, intake and webhook changes for forks, the
   policy table and settings API, the approval gate, check run action,
   approval API, reconciler expiry, fork caps, agent, OIDC, environment and
   cache enforcement.
@@ -680,8 +680,13 @@ Fewer, larger PRs with a deploy order, as every merge to main releases.
 
 **Deploy order**
 
-1. Merge PR 1. The deploy workflow runs migration 0019 as the owner role,
-   then deploys the Worker and the app together. Fork PRs start running
+1. Merge PR 1. The deploy workflow runs migration 0022 as the owner role,
+   then deploys the Worker and the app together. The migration keeps the
+   defaults of its new `not null` columns (`trusted`, no gate, empty
+   author), because the old Worker runs between the two steps and its
+   scheduled runs, pull request rows and cache saves insert without them.
+   Everything the old Worker makes is the repository's own code, so the
+   defaults are the right values. PR 2 drops them. Fork PRs start running
    for public repositories at once, behind the default first-time
    contributor gate.
 2. Merge PR 2. Deploy the CLI release with it so `validate` and the

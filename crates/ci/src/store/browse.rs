@@ -29,6 +29,12 @@ pub struct NewPull {
     pub base_ref: String,
     /// The login of the user who opened it.
     pub author: String,
+    /// GitHub's `author_association` of the user who opened it.
+    pub author_association: String,
+    /// The repository the head is in; `None` for a deleted fork.
+    pub head_repo_id: Option<u64>,
+    /// The head commit.
+    pub head_sha: String,
     /// `open`, `closed` or `merged`.
     pub state: String,
     /// When GitHub last changed the pull request, in Unix milliseconds.
@@ -38,34 +44,117 @@ pub struct NewPull {
 
 /// Records pull request `$2` of repository `$1` as it stands: title
 /// `$3`, head `$4`, base `$5`, author `$6`, state `$7`, as of GitHub's
-/// time `$8`. A delivery older than the row leaves it alone.
+/// time `$8`, the author's association `$9`, the head repository `$10`
+/// and the head commit `$11`. A delivery older than the row leaves it
+/// alone, and so does one of the same second with another head commit:
+/// GitHub's times have one second, so two pushes in a second tie, and
+/// delivery order does not say which came last.
 const UPSERT_PULL: &str = "INSERT INTO ci_pulls \
-     (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) \
+     (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at, \
+      author_association, head_repo_id, head_sha) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10::bigint, $11) \
      ON CONFLICT (repo_id, number) DO UPDATE SET title = $3, head_ref = $4, base_ref = $5, \
-     author = $6, state = $7, updated_at = $8 WHERE ci_pulls.updated_at <= $8";
+     author = $6, state = $7, updated_at = $8, author_association = $9, \
+     head_repo_id = $10::bigint, head_sha = $11 \
+     WHERE ci_pulls.updated_at < $8 \
+        OR (ci_pulls.updated_at = $8 AND ci_pulls.head_sha = $11)";
 
-/// Records the state of a pull request.
+/// As [`UPSERT_PULL`], whatever the row holds: for a tie that GitHub's own
+/// answer settled.
+const UPSERT_PULL_FORCED: &str = "INSERT INTO ci_pulls \
+     (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at, \
+      author_association, head_repo_id, head_sha) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10::bigint, $11) \
+     ON CONFLICT (repo_id, number) DO UPDATE SET title = $3, head_ref = $4, base_ref = $5, \
+     author = $6, state = $7, updated_at = $8, author_association = $9, \
+     head_repo_id = $10::bigint, head_sha = $11";
+
+/// The time and head commit of pull request `$2` of repository `$1`.
+const PULL_STAMP: &str =
+    "SELECT updated_at, head_sha FROM ci_pulls WHERE repo_id = $1 AND number = $2";
+
+/// The time of a recorded pull request.
+#[derive(Deserialize)]
+struct Stamp {
+    updated_at: u64,
+}
+
+/// What recording a delivery of a pull request came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullWrite {
+    /// The row now says what the delivery says.
+    Applied,
+    /// The delivery is older than the row.
+    Stale,
+    /// The delivery has the row's time and another head commit: which is
+    /// newer is not known from the two, and GitHub's answer decides.
+    Tied,
+}
+
+fn pull_params(pull: &NewPull) -> Vec<hatchrun_cloud::db::Param> {
+    params![
+        pull.repo_id,
+        pull.number,
+        &pull.title,
+        &pull.head_ref,
+        &pull.base_ref,
+        &pull.author,
+        &pull.state,
+        pull.updated_at,
+        &pull.author_association,
+        pull.head_repo_id,
+        &pull.head_sha
+    ]
+}
+
+/// Records the pull request whatever the row holds, for a tie that
+/// GitHub's answer settled in favour of `pull`.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn upsert_pull(db: &Db, pull: &NewPull) -> Result<()> {
-    db.run(
-        UPSERT_PULL,
-        &params![
-            pull.repo_id,
-            pull.number,
-            &pull.title,
-            &pull.head_ref,
-            &pull.base_ref,
-            &pull.author,
-            &pull.state,
-            pull.updated_at
-        ],
-    )
-    .await?;
+pub async fn upsert_pull_forced(db: &Db, pull: &NewPull) -> Result<()> {
+    db.run(UPSERT_PULL_FORCED, &pull_params(pull)).await?;
     Ok(())
+}
+
+/// Records the state of a pull request. A delivery older than what is
+/// recorded is [`PullWrite::Stale`] and says nothing about the pull
+/// request as it stands now; one of the same second with another head
+/// commit is [`PullWrite::Tied`].
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn upsert_pull(db: &Db, pull: &NewPull) -> Result<PullWrite> {
+    let changed = db
+        .run(
+            UPSERT_PULL,
+            &params![
+                pull.repo_id,
+                pull.number,
+                &pull.title,
+                &pull.head_ref,
+                &pull.base_ref,
+                &pull.author,
+                &pull.state,
+                pull.updated_at,
+                &pull.author_association,
+                pull.head_repo_id,
+                &pull.head_sha
+            ],
+        )
+        .await?;
+    if changed == 1 {
+        return Ok(PullWrite::Applied);
+    }
+    let held: Option<Stamp> = db
+        .first(PULL_STAMP, &params![pull.repo_id, pull.number])
+        .await?;
+    Ok(match held {
+        Some(held) if held.updated_at == pull.updated_at => PullWrite::Tied,
+        _ => PullWrite::Stale,
+    })
 }
 
 /// What a repository page counts.

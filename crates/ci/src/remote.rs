@@ -63,7 +63,11 @@ pub fn refusal(call: &RemoteCall, owned: bool, private: bool) -> Option<String> 
 }
 
 /// Reads every file of another repository that the workflows `workflows`
-/// of `config` call, and those they call. A file that may not be used is recorded in the
+/// of `config` call, and those they call. With `public_only` (a fork
+/// pull request, whose config is the author's) only public repositories
+/// may be called: the read uses the installation token, and private
+/// source must not reach the job names, the approval card or the logs
+/// of code nobody reviewed. A file that may not be used is recorded in the
 /// library with the reason, for the plan to report where it is called.
 ///
 /// # Errors
@@ -73,6 +77,7 @@ pub async fn read_library<S: Source>(
     source: &S,
     config: &Config,
     workflows: &[&str],
+    public_only: bool,
 ) -> Result<Library, String> {
     let mut library = Library::default();
     // The limit counts the files one workflow reaches, as the planner
@@ -93,7 +98,7 @@ pub async fn read_library<S: Source>(
                     library.mark_limit();
                     continue 'workflow;
                 }
-                match read_one(source, &call).await? {
+                match read_one(source, &call, public_only).await? {
                     Ok(callee) => library.insert(call, callee),
                     Err(reason) => library.refuse(call, reason),
                 }
@@ -107,6 +112,7 @@ pub async fn read_library<S: Source>(
 async fn read_one<S: Source>(
     source: &S,
     call: &RemoteCall,
+    public_only: bool,
 ) -> Result<Result<Callee, String>, String> {
     let repo = call.repository();
     let Some(private) = source.private(&repo).await? else {
@@ -114,6 +120,11 @@ async fn read_one<S: Source>(
             "{repo} cannot be read: the GitHub App is not installed on it, or it does not exist"
         )));
     };
+    if public_only && private {
+        return Ok(Err(format!(
+            "{repo} is a private repository; a pull request from a fork may call workflows of public repositories only"
+        )));
+    }
     let owned = source.owned(&repo).await?;
     if let Some(reason) = refusal(call, owned, private) {
         return Ok(Err(reason));
@@ -344,7 +355,7 @@ workflows:
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(read_library(source, config, &["ci"]))
+            .block_on(read_library(source, config, &["ci"], false))
             .unwrap()
     }
 
@@ -371,6 +382,35 @@ workflows:
                 "acme/shared/.github/workflows/build.yml@0123456789abcdef0123456789abcdef01234567"
             )
         );
+    }
+
+    fn read_public_only(source: &Fake, config: &Config) -> Library {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(read_library(source, config, &["ci"], true))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_fork_pull_request_calls_public_repositories_only() {
+        let config = caller(CALL);
+        // The tenant's own private repository, which a trusted run may
+        // call, is refused to a fork: its source would reach the job
+        // names, the approval card and the logs.
+        let own = fake("acme/shared", true, true);
+        assert!(compile_with(&config, "ci", "refs/heads/main", &read(&own, &config)).is_ok());
+        let message = plan_error(&read_public_only(&own, &config), &config);
+        assert!(
+            message.contains(
+                "a pull request from a fork may call workflows of public repositories only"
+            ),
+            "{message}"
+        );
+        // A public repository is fine for a fork.
+        let public = fake("acme/shared", false, false);
+        let library = read_public_only(&public, &config);
+        assert!(compile_with(&config, "ci", "refs/heads/main", &library).is_ok());
     }
 
     #[test]
@@ -583,7 +623,7 @@ workflows:
         let both = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(read_library(&source, &config, &["a", "b"]))
+            .block_on(read_library(&source, &config, &["a", "b"], false))
             .unwrap();
         assert!(compile_with(&config, "a", "refs/heads/main", &both).is_ok());
         assert!(compile_with(&config, "b", "refs/heads/main", &both).is_ok());
@@ -591,7 +631,7 @@ workflows:
         let only_a = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(read_library(&source, &config, &["a"]))
+            .block_on(read_library(&source, &config, &["a"], false))
             .unwrap();
         assert!(compile_with(&config, "a", "refs/heads/main", &only_a).is_ok());
         assert!(compile_with(&config, "b", "refs/heads/main", &only_a).is_err());
@@ -610,7 +650,7 @@ workflows:
         let big = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(read_library(&source, &config, &["a"]))
+            .block_on(read_library(&source, &config, &["a"], false))
             .unwrap();
         let errors = compile_with(&config, "a", "refs/heads/main", &big).unwrap_err();
         assert!(
@@ -657,7 +697,7 @@ workflows:
         let library = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(read_library(&source, &config, &["big", "small"]))
+            .block_on(read_library(&source, &config, &["big", "small"], false))
             .unwrap();
         assert!(compile_with(&config, "small", "refs/heads/main", &library).is_ok());
         let errors = compile_with(&config, "big", "refs/heads/main", &library).unwrap_err();
@@ -694,7 +734,7 @@ workflows:
         let library = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(read_library(&source, &config, &["big", "small"]))
+            .block_on(read_library(&source, &config, &["big", "small"], false))
             .unwrap();
         assert!(compile_with(&config, "small", "refs/heads/main", &library).is_ok());
         assert!(compile_with(&config, "big", "refs/heads/main", &library).is_err());

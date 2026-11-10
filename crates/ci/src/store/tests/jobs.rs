@@ -508,7 +508,7 @@ fn claim_launch_only_once() {
     let first = claim(&db, job_id, 10);
     assert_eq!(first.launch_attempts, 1);
     assert_eq!(
-        db.wait(claim_launch(db.db(), job_id, "t1", 5, true, 11))
+        db.wait(claim_launch(db.db(), job_id, "t1", 5, true, None, 11))
             .unwrap(),
         Claim::Gone
     );
@@ -563,7 +563,7 @@ fn claim_launch_holds_the_sixth_job() {
     }
     let (_, sixth) = run_with_job_named(&db, "d9", "queued");
     assert_eq!(
-        db.wait(claim_launch(db.db(), sixth, "t1", 5, true, 10))
+        db.wait(claim_launch(db.db(), sixth, "t1", 5, true, None, 10))
             .unwrap(),
         Claim::Busy
     );
@@ -581,7 +581,7 @@ fn claim_launch_holds_the_sixth_job() {
     db.wait(set_job(db.db(), done, "completed", Some("success"), 1_002))
         .unwrap();
     assert_eq!(
-        db.wait(claim_launch(db.db(), sixth, "t1", 5, true, 11))
+        db.wait(claim_launch(db.db(), sixth, "t1", 5, true, None, 11))
             .unwrap(),
         Claim::Busy,
         "completed jobs do not count, but five still run"
@@ -602,12 +602,12 @@ fn claim_launch_holds_the_sixth_job() {
     ))
     .unwrap();
     assert!(matches!(
-        db.wait(claim_launch(db.db(), sixth, "t1", 5, true, 12))
+        db.wait(claim_launch(db.db(), sixth, "t1", 5, true, None, 12))
             .unwrap(),
         Claim::Claimed(_)
     ));
     let gone = db
-        .wait(claim_launch(db.db(), 999_999, "t1", 5, true, 13))
+        .wait(claim_launch(db.db(), 999_999, "t1", 5, true, None, 13))
         .unwrap();
     assert_eq!(gone, Claim::Gone);
 }
@@ -638,17 +638,17 @@ fn a_new_job_does_not_jump_a_held_one() {
     set_held(&db, older, "concurrency", 5);
     // One place is free, and the older job waits for it.
     assert_eq!(
-        db.wait(claim_launch(db.db(), newer, "t1", 5, true, 10))
+        db.wait(claim_launch(db.db(), newer, "t1", 5, true, None, 10))
             .unwrap(),
         Claim::Busy
     );
     assert!(matches!(
-        db.wait(claim_launch(db.db(), older, "t1", 5, true, 11))
+        db.wait(claim_launch(db.db(), older, "t1", 5, true, None, 11))
             .unwrap(),
         Claim::Claimed(_)
     ));
     assert_eq!(
-        db.wait(claim_launch(db.db(), newer, "t1", 5, true, 12))
+        db.wait(claim_launch(db.db(), newer, "t1", 5, true, None, 12))
             .unwrap(),
         Claim::Busy,
         "the tenant is full again"
@@ -690,7 +690,7 @@ fn a_held_job_of_another_reason_or_tenant_blocks_nobody() {
     set_held(&db, capped, "spend_cap", 5);
     let (_, newer) = run_with_job_named(&db, "newer", "queued");
     assert!(matches!(
-        db.wait(claim_launch(db.db(), newer, "t1", 5, true, 10))
+        db.wait(claim_launch(db.db(), newer, "t1", 5, true, None, 10))
             .unwrap(),
         Claim::Claimed(_)
     ));
@@ -811,7 +811,7 @@ fn an_approval_hold_blocks_nobody() {
     set_held(&db, older, "approval", 5);
     let (_, newer) = run_with_job_named(&db, "newer", "queued");
     assert!(matches!(
-        db.wait(claim_launch(db.db(), newer, "t1", 5, true, 10))
+        db.wait(claim_launch(db.db(), newer, "t1", 5, true, None, 10))
             .unwrap(),
         Claim::Claimed(_)
     ));
@@ -1078,7 +1078,7 @@ fn matrix_run(db: &TestDb, delivery: &str, count: usize, limit: Option<u32>) -> 
 }
 
 fn claim_group(db: &TestDb, job_id: u64, groups: bool, now: u64) -> Claim {
-    db.wait(claim_launch(db.db(), job_id, "t1", 5, groups, now))
+    db.wait(claim_launch(db.db(), job_id, "t1", 5, groups, None, now))
         .unwrap()
 }
 

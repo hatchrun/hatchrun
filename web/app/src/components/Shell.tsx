@@ -75,7 +75,7 @@ export function Shell({
   }, [login, user]);
 
   const current = route?.page ?? null;
-  const suffix = current === "runs" || current === null ? "" : current === "billing" || current === "setup" || current === "audit" ? `settings/${current}` : current === "repository" || current === "run" ? "repositories" : current;
+  const suffix = current === "runs" || current === null ? "" : current === "billing" || current === "setup" || current === "forks" || current === "audit" ? `settings/${current}` : current === "repository" || current === "run" ? "repositories" : current;
 
   const left =
     login && user ? (

@@ -49,7 +49,16 @@ pub struct Push {
     pub payload: Value,
 }
 
-/// Activity on a pull request from the same repository.
+/// Where the head of a pull request from another repository is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkInfo {
+    /// The head repository's id; `None` for a deleted fork.
+    pub head_repo_id: Option<u64>,
+    /// The head repository's `owner/name`; `None` for a deleted fork.
+    pub head_repo_name: Option<String>,
+}
+
+/// Activity on a pull request, from the same repository or a fork.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
     /// The App installation the delivery came through.
@@ -72,6 +81,12 @@ pub struct PullRequest {
     pub title: String,
     /// The login of the user who opened it.
     pub author: String,
+    /// GitHub's `author_association` of the user who opened it, such as
+    /// `FIRST_TIME_CONTRIBUTOR`; empty when the delivery has none.
+    pub author_association: String,
+    /// Where the head is when it is not in the base repository; `None`
+    /// for a pull request from the same repository.
+    pub fork: Option<ForkInfo>,
     /// `open`, `closed` or `merged`, as the delivery says it stands.
     pub state: &'static str,
     /// When GitHub last changed the pull request, in Unix milliseconds:
@@ -158,6 +173,19 @@ pub struct Rerequested {
     pub job_id: u64,
 }
 
+/// A click on the approval check run's button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproveFork {
+    /// The App installation the delivery came through.
+    pub installation_id: u64,
+    /// The repository of the check run.
+    pub repo: Repo,
+    /// The check run that carried the button.
+    pub check_run_id: u64,
+    /// The GitHub login of whoever clicked.
+    pub sender: String,
+}
+
 /// What a delivery asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trigger {
@@ -177,6 +205,8 @@ pub enum Trigger {
     RepositoryDispatch(RepositoryDispatch),
     /// A re-run of one job.
     Rerequested(Rerequested),
+    /// A maintainer's click on "Approve and run".
+    ApproveFork(ApproveFork),
     /// A repository changed visibility, name, owner or default branch.
     Repository(RepositoryChange),
     /// Repositories were added to or removed from an installation. The
@@ -260,6 +290,8 @@ struct PullRequestInfo {
     state: String,
     #[serde(default)]
     merged: bool,
+    #[serde(default)]
+    author_association: String,
     #[serde(deserialize_with = "rfc3339_ms")]
     updated_at: u64,
 }
@@ -282,6 +314,8 @@ struct Side {
 #[derive(Deserialize)]
 struct SideRepo {
     id: u64,
+    #[serde(default)]
+    full_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -338,12 +372,23 @@ struct CheckRunBody {
     action: String,
     check_run: CheckRun,
     repository: Repo,
+    #[serde(default)]
+    requested_action: Option<RequestedAction>,
+    #[serde(default)]
+    sender: Option<Sender>,
 }
 
 #[derive(Deserialize)]
 struct CheckRun {
     #[serde(default)]
+    id: u64,
+    #[serde(default)]
     external_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RequestedAction {
+    identifier: String,
 }
 
 fn ignored(reason: &str) -> Trigger {
@@ -480,15 +525,19 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
         }
         "pull_request" => {
             let p = PullRequestBody::deserialize(&payload)?;
-            let same_repo = p
-                .pull_request
-                .head
-                .repo
-                .as_ref()
-                .is_some_and(|r| r.id == p.repository.id);
-            if !same_repo {
-                return Ok(ignored("pull request from a fork"));
-            }
+            // A head repository that is not the base, or is gone (a
+            // deleted fork), makes a fork pull request.
+            let fork = match &p.pull_request.head.repo {
+                Some(head) if head.id == p.repository.id => None,
+                Some(head) => Some(ForkInfo {
+                    head_repo_id: Some(head.id),
+                    head_repo_name: head.full_name.clone(),
+                }),
+                None => Some(ForkInfo {
+                    head_repo_id: None,
+                    head_repo_name: None,
+                }),
+            };
             Ok(Trigger::PullRequest(PullRequest {
                 installation_id,
                 repo: p.repository,
@@ -503,6 +552,8 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
                     .map_or_else(|| p.sender.login.clone(), |user| user.login),
                 actor: p.sender.login,
                 title: p.pull_request.title,
+                author_association: p.pull_request.author_association,
+                fork,
                 updated_at: p.pull_request.updated_at,
                 state: if p.pull_request.merged {
                     "merged"
@@ -530,6 +581,23 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
         }
         _ => {
             let c = CheckRunBody::deserialize(&payload)?;
+            if c.action == "requested_action" {
+                let clicked = c
+                    .requested_action
+                    .as_ref()
+                    .is_some_and(|a| a.identifier == crate::policy::APPROVE_ACTION);
+                return Ok(match c.sender {
+                    Some(sender) if clicked && c.check_run.id != 0 => {
+                        Trigger::ApproveFork(ApproveFork {
+                            installation_id,
+                            repo: c.repository,
+                            check_run_id: c.check_run.id,
+                            sender: sender.login,
+                        })
+                    }
+                    _ => ignored("check_run action is not one hatchrun-ci offers"),
+                });
+            }
             if c.action != "rerequested" {
                 return Ok(ignored("check_run action is not rerequested"));
             }
@@ -553,6 +621,7 @@ pub fn parse(event: &str, body: &[u8]) -> Result<Trigger, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trust::Trust;
 
     const PUSH: &str = include_str!("../testdata/push.json");
     const PULL_REQUEST: &str = include_str!("../testdata/pull_request.json");
@@ -709,22 +778,51 @@ mod tests {
     }
 
     #[test]
-    fn fork_pull_request_is_ignored() {
-        assert_eq!(
-            parse("pull_request", FORK.as_bytes()).unwrap(),
-            Trigger::Ignored("pull request from a fork".into())
-        );
+    fn a_pull_request_from_the_same_repo_is_not_a_fork() {
+        let Trigger::PullRequest(p) = parse("pull_request", PULL_REQUEST.as_bytes()).unwrap()
+        else {
+            panic!("not a pull request");
+        };
+        assert_eq!(p.fork, None);
+        assert_eq!(p.author_association, "");
+        assert_eq!(Trust::of(&p), Trust::Trusted);
     }
 
     #[test]
-    fn fork_with_deleted_head_repo_is_ignored() {
+    fn a_pull_request_from_a_fork_is_read_with_its_head_and_association() {
+        let Trigger::PullRequest(p) = parse("pull_request", FORK.as_bytes()).unwrap() else {
+            panic!("not a pull request");
+        };
+        assert_eq!(
+            p.fork,
+            Some(ForkInfo {
+                head_repo_id: Some(9999),
+                head_repo_name: Some("mallory/widgets".into()),
+            })
+        );
+        assert_eq!(p.author, "mallory");
+        assert_eq!(p.author_association, "FIRST_TIME_CONTRIBUTOR");
+        assert_eq!(p.head_sha, "3333333333333333333333333333333333333333");
+        assert_eq!(p.repo.id, 4242, "the base repository is the one that runs");
+        assert_eq!(Trust::of(&p), Trust::Fork);
+    }
+
+    #[test]
+    fn a_deleted_fork_is_a_fork_with_no_name() {
         let body = edited(PULL_REQUEST, |v| {
             v["pull_request"]["head"]["repo"] = Value::Null;
         });
+        let Trigger::PullRequest(p) = parse("pull_request", &body).unwrap() else {
+            panic!("not a pull request");
+        };
         assert_eq!(
-            parse("pull_request", &body).unwrap(),
-            Trigger::Ignored("pull request from a fork".into())
+            p.fork,
+            Some(ForkInfo {
+                head_repo_id: None,
+                head_repo_name: None,
+            })
         );
+        assert_eq!(Trust::of(&p), Trust::Fork);
     }
 
     #[test]
@@ -750,6 +848,53 @@ mod tests {
                 Trigger::Ignored(_)
             ));
         }
+    }
+
+    #[test]
+    fn the_approve_button_is_read_with_who_clicked() {
+        let body = edited(RERUN, |v| {
+            v["action"] = "requested_action".into();
+            v["check_run"]["id"] = 5150.into();
+            v["requested_action"] = serde_json::json!({ "identifier": "approve-fork-run" });
+            v["sender"] = serde_json::json!({ "login": "maintainer" });
+        });
+        let Trigger::ApproveFork(a) = parse("check_run", &body).unwrap() else {
+            panic!("not an approval");
+        };
+        assert_eq!(a.check_run_id, 5150);
+        assert_eq!(a.sender, "maintainer");
+        assert_eq!(a.installation_id, 777);
+        assert_eq!(a.repo.full_name, "octo/widgets");
+    }
+
+    #[test]
+    fn another_button_or_no_sender_approves_nothing() {
+        let click = |identifier: &str, sender: bool| {
+            edited(RERUN, |v| {
+                v["action"] = "requested_action".into();
+                v["check_run"]["id"] = 5150.into();
+                v["requested_action"] = serde_json::json!({ "identifier": identifier });
+                if sender {
+                    v["sender"] = serde_json::json!({ "login": "maintainer" });
+                } else {
+                    v.as_object_mut().unwrap().remove("sender");
+                }
+            })
+        };
+        for body in [click("other", true), click("approve-fork-run", false)] {
+            assert!(matches!(
+                parse("check_run", &body).unwrap(),
+                Trigger::Ignored(_)
+            ));
+        }
+        let no_action = edited(RERUN, |v| {
+            v["action"] = "requested_action".into();
+            v["sender"] = serde_json::json!({ "login": "maintainer" });
+        });
+        assert!(matches!(
+            parse("check_run", &no_action).unwrap(),
+            Trigger::Ignored(_)
+        ));
     }
 
     #[test]

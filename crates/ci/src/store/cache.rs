@@ -16,6 +16,7 @@ use serde::Deserialize;
 use worker::Result;
 
 use super::{Finalized, with_columns};
+use crate::trust::Trust;
 
 /// A cache entry, or an upload that is not finalized yet.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -83,10 +84,10 @@ const TOUCH: &str = "UPDATE ci_cache_entries SET last_accessed_at = $3 \
 
 /// Records an upload for repository `$2` of tenant `$1` into scope `$3`
 /// at version `$4` and key `$5`, to S3 key `$6` as multipart upload `$7`,
-/// at `$8`.
+/// at `$8`, saved by a run of trust `$9`.
 const START: &str = "INSERT INTO ci_cache_entries (tenant_id, repo_id, scope, version, key, \
-     object_key, upload_id, created_at, last_accessed_at) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8) RETURNING {columns}";
+     object_key, upload_id, created_at, last_accessed_at, trust) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9) RETURNING {columns}";
 
 /// The upload `$1` into scope `$4` of repository `$3` of tenant `$2`,
 /// which is not finalized.
@@ -122,22 +123,46 @@ const EVICT_IDLE: &str = "DELETE FROM ci_cache_entries WHERE id IN (\
           OR (finalized_at IS NULL AND created_at < $2)) \
      RETURNING {columns}";
 
-/// Deletes and returns the finalized entries of repository `$2` of
-/// tenant `$1` that do not fit in `$3` bytes when the most recently used
-/// are kept first, the least recently used first, at most `$4`. An entry
-/// larger than the cap does not fit alone.
+/// Deletes and returns the finalized entries saved by trusted runs of
+/// repository `$2` of tenant `$1` that do not fit in `$3` bytes when the
+/// most recently used are kept first, the least recently used first, at
+/// most `$4`. An entry larger than the cap does not fit alone. Entries
+/// fork runs saved are not counted and never evicted here: they have
+/// their own share (see [`EVICT_FORK_OVER_QUOTA`]), so a flood of them
+/// cannot push a base or default branch entry out.
 const EVICT_OVER_QUOTA: &str = "DELETE FROM ci_cache_entries WHERE id IN (\
        SELECT id FROM (\
          SELECT id, last_accessed_at, \
            sum(size) OVER (ORDER BY last_accessed_at DESC, id DESC) AS kept \
          FROM ci_cache_entries \
-         WHERE tenant_id = $1 AND repo_id = $2 AND finalized_at IS NOT NULL) AS ranked \
+         WHERE tenant_id = $1 AND repo_id = $2 AND finalized_at IS NOT NULL \
+           AND trust = 'trusted') AS ranked \
        WHERE kept > $3 ORDER BY last_accessed_at, id LIMIT $4) \
      RETURNING {columns}";
+
+/// Like [`EVICT_OVER_QUOTA`], but only entries saved by fork runs are
+/// counted and deleted: a fork run's saves never push out an entry of
+/// the base or default branch.
+const EVICT_FORK_OVER_QUOTA: &str = "DELETE FROM ci_cache_entries WHERE id IN (\
+       SELECT id FROM (\
+         SELECT id, last_accessed_at, \
+           sum(size) OVER (ORDER BY last_accessed_at DESC, id DESC) AS kept \
+         FROM ci_cache_entries \
+         WHERE tenant_id = $1 AND repo_id = $2 AND finalized_at IS NOT NULL \
+           AND trust = 'fork') AS ranked \
+       WHERE kept > $3 ORDER BY last_accessed_at, id LIMIT $4) \
+     RETURNING {columns}";
+
+/// Bytes of finalized entries of repository `$2` of tenant `$1` that
+/// fork runs saved.
+const FORK_BYTES: &str = "SELECT COALESCE(sum(size), 0)::bigint AS n FROM ci_cache_entries \
+     WHERE tenant_id = $1 AND repo_id = $2 AND finalized_at IS NOT NULL AND trust = 'fork'";
 
 /// Who owns an entry: where a call looks for it.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheOwner<'a> {
+    /// The trust of the run that saves; recorded on a new entry.
+    pub trust: Trust,
     /// The tenant.
     pub tenant_id: &'a str,
     /// GitHub's repository id.
@@ -235,7 +260,8 @@ pub async fn start_cache_entry(
                 key,
                 object_key,
                 upload_id,
-                now
+                now,
+                owner.trust.as_str()
             ],
         )
         .await?;
@@ -348,4 +374,44 @@ pub async fn evict_over_quota_cache_entries(
         &params![tenant_id, repo_id, cap, limit],
     )
     .await
+}
+
+/// Deletes and returns the entries saved by fork runs of repository
+/// `repo_id` of `tenant_id` that push the fork entries past `cap`
+/// bytes: the least recently used, at most `limit`. Entries of base and
+/// default branches are never touched. The caller deletes their
+/// objects.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn evict_over_fork_quota_cache_entries(
+    db: &Db,
+    tenant_id: &str,
+    repo_id: u64,
+    cap: u64,
+    limit: u32,
+) -> Result<Vec<CacheRow>> {
+    db.all(
+        &with_columns(EVICT_FORK_OVER_QUOTA, CACHE_COLUMNS),
+        &params![tenant_id, repo_id, cap, limit],
+    )
+    .await
+}
+
+/// The bytes of finalized entries fork runs saved in repository
+/// `repo_id` of `tenant_id`.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn fork_cache_bytes(db: &Db, tenant_id: &str, repo_id: u64) -> Result<u64> {
+    #[derive(Deserialize)]
+    struct Bytes {
+        n: u64,
+    }
+    Ok(db
+        .first::<Bytes>(FORK_BYTES, &params![tenant_id, repo_id])
+        .await?
+        .map_or(0, |row| row.n))
 }

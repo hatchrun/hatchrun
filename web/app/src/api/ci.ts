@@ -30,6 +30,12 @@ export interface CiPullRef {
   base_ref: string;
 }
 
+/** Whose code a run executes: a fork run gets no secrets, no write token and no OIDC token. */
+export type Trust = "trusted" | "fork";
+
+/** Where a fork pull request's run stands with the approval it needs. */
+export type GateStatus = "pending" | "deferred" | "approved" | "expired" | "cancelled";
+
 /** A run of the orchestrator. */
 export interface CiRun {
   id: number;
@@ -49,6 +55,11 @@ export interface CiRun {
   message: string | null;
   /** The pull request a pull_request-triggered run belongs to. */
   pull_request: CiPullRef | null;
+  trust: Trust;
+  /** The author and head repository of a fork pull request's run; null for the repository's own code. */
+  fork: { head_repo: string | null; author: string; author_association: string } | null;
+  /** The approval a fork run needed; null when it never waited. */
+  gate: { status: GateStatus; by: string | null; at: number | null } | null;
   status: string;
   conclusion: string | null;
   created_at: number;
@@ -209,6 +220,8 @@ export interface CiFailing {
 
 export interface NeedsYou {
   approvals: CiApproval[];
+  /** Fork pull request runs that wait for a maintainer, the longest waiting first. */
+  fork_approvals: CiRun[];
   failing: CiFailing[];
 }
 
@@ -220,6 +233,8 @@ export const getCiRun = (id: string | number) => retrying(() => get<CiRunDetail>
 export interface CiArtifact {
   id: number;
   name: string;
+  /** Whose run uploaded it. */
+  trust: Trust;
   /** Bytes. */
   size: number;
   created_at: number;
@@ -238,6 +253,12 @@ export const cancelCiRun = (id: number) => post<undefined>(`/api/ci/runs/${id}/c
 
 /** Lets a job held for approval run. Answers 409 when the job is not waiting. */
 export const approveCiJob = (id: number) => post<undefined>(`/api/ci/jobs/${id}/approve`);
+
+/** Runs a fork pull request's run that waits for approval (write access). Answers 409 when it is not waiting. */
+export const approveForkRun = (id: number) => post<undefined>(`/api/ci/runs/${id}/approve-fork`);
+
+/** Cancels a fork pull request's run that waits for approval (write access). Answers 409 when it is not waiting. */
+export const rejectForkRun = (id: number) => post<undefined>(`/api/ci/runs/${id}/reject-fork`);
 
 /** Fails a job held for approval. Answers 409 when the job is not waiting. */
 export const rejectCiJob = (id: number) => post<undefined>(`/api/ci/jobs/${id}/reject`);
@@ -529,6 +550,23 @@ export const putCiItem = (scope: CiScope, kind: CiItemKind, name: string, value:
 export const deleteCiItem = (scope: CiScope, kind: CiItemKind, name: string) =>
   adminOnly(() => del<undefined>(`${scopePath(scope)}/${kind}/${encodeURIComponent(name)}`));
 
+/** What a repository does with pull requests from forks. */
+export interface ForkPolicy {
+  /** Whether fork pull requests run. On by default for a public repository, off for a private one. */
+  fork_runs: "off" | "on";
+  /** Which authors need a maintainer's approval first, by GitHub's author association. */
+  fork_approval: "first_timers" | "first_time_contributors" | "all_outside";
+  /** The most fork jobs of the repository that run at once, 1 to 10. */
+  fork_max_running: number;
+  /** The longest a fork job may run, in minutes, 5 to 60. */
+  fork_timeout_minutes: number;
+}
+
+export const getForkPolicy = (owner: string, repo: string) => adminOnly(() => get<ForkPolicy>(`${repoPath(owner, repo)}/fork-policy`));
+
+export const putForkPolicy = (owner: string, repo: string, body: ForkPolicy) =>
+  adminOnly(() => put<ForkPolicy>(`${repoPath(owner, repo)}/fork-policy`, body));
+
 /** A deployment environment of a repository. No branches means any branch. */
 export interface CiEnvironment {
   name: string;
@@ -566,7 +604,15 @@ export const deleteCiEnvironment = (owner: string, repo: string, name: string) =
   adminOnly(() => del<undefined>(`${environmentsPath(owner, repo)}/${encodeURIComponent(name)}`));
 
 /** What an audit entry did. */
-export type AuditAction = "secret.put" | "secret.delete" | "var.put" | "var.delete" | "environment.put" | "environment.delete" | "repos.enabled";
+export type AuditAction =
+  | "secret.put"
+  | "secret.delete"
+  | "var.put"
+  | "var.delete"
+  | "environment.put"
+  | "environment.delete"
+  | "repos.enabled"
+  | "fork_policy.put";
 
 export interface AuditEntry {
   id: number;
