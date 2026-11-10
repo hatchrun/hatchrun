@@ -685,6 +685,9 @@ pub struct Reads {
     /// Whether the whole expression is one read or one literal, not a
     /// call, a comparison or a mix.
     pub plain: bool,
+    /// The context paths read in the first argument of each call of
+    /// `contains`, in the form of `paths`: what is searched.
+    pub searched: Vec<Vec<String>>,
 }
 
 /// What each `${{ }}` of `text` reads. Text with none gives an empty
@@ -759,7 +762,19 @@ fn collect_reads(expr: &parser::Expr<'_>, out: &mut Reads) {
                 }
             }
         }
-        Expr::Call { args, .. } | Expr::And(args) | Expr::Or(args) => {
+        Expr::Call { name, args, .. } => {
+            if *name == "contains"
+                && let Some(first) = args.first()
+            {
+                let mut searched = Reads::default();
+                collect_reads(first, &mut searched);
+                out.searched.extend(searched.paths);
+            }
+            for arg in args {
+                collect_reads(arg, out);
+            }
+        }
+        Expr::And(args) | Expr::Or(args) => {
             for arg in args {
                 collect_reads(arg, out);
             }

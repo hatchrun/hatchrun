@@ -10,6 +10,7 @@
 pub mod agent;
 pub mod artifacts;
 pub mod call;
+pub mod command;
 pub mod concurrency;
 pub mod config;
 pub mod container;
@@ -56,7 +57,7 @@ pub use job::{
     Annotation, AnnotationLevel, ArtifactService, CacheService, Conclusion, Github, IdTokenRequest,
     JobDocument, JobResult, Need, StepSummary,
 };
-pub use lint::{Lint, LintKind, plan_lints};
+pub use lint::{Lint, LintKind, guarded, plan_lints, workflow_lints};
 pub use permissions::{
     DEFAULT_SCOPES, ID_TOKEN, ID_TOKEN_SCOPE, Level, Permissions, SCOPES, token_scopes,
 };
@@ -72,8 +73,10 @@ pub use templates::{
     template_labels,
 };
 pub use trigger::{
-    Dispatch, Event, Filter, MAX_CHANGED, MAX_GLOBS, MAX_PATTERNS, MERGE_GROUP_TYPES,
-    MergeGroupTrigger, PullRequestTrigger, PushTrigger, RELEASE_TYPES, RefTrigger, ReleaseTrigger,
-    RepositoryDispatchTrigger, Schedule, Triggers, WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
-    triggered,
+    CommandOptions, CommandPermission, CommandPlace, CommandReaction, Commands, Dispatch, Event,
+    Filter, ISSUE_COMMENT_TYPES, ISSUES_TYPES, IssueCommentTrigger, IssuesTrigger, MAX_CHANGED,
+    MAX_COMMAND_NAME, MAX_GLOBS, MAX_PATTERNS, MERGE_GROUP_TYPES, MergeGroupTrigger,
+    PullRequestTrigger, PushTrigger, RELEASE_TYPES, RefTrigger, ReleaseTrigger,
+    RepositoryDispatchTrigger, Schedule, ShaPolicy, Triggers, WORKFLOW_RUN_TYPES,
+    WorkflowRunTrigger, triggered, valid_command_name,
 };

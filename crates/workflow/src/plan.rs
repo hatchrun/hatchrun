@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::call::{CallFrame, Library, shared_depth};
+use crate::command::{APPROVE_RUN, MAX_WORDS};
 use crate::concurrency::{Cancel, Concurrency, JOB_CONTEXTS, WORKFLOW_CONTEXTS};
 use crate::config::{
     CacheStep, CheckoutStep, Config, Container, ContinueOnError, Job, Matrix, Outcome, Parameter,
@@ -30,7 +31,9 @@ use crate::expr::{self, ExprError};
 use crate::permissions::{Level, token_scopes};
 use crate::templates::{TEMPLATES, Template, template, template_labels};
 use crate::trigger::{
-    Filter, MAX_GLOBS, MAX_PATTERNS, MERGE_GROUP_TYPES, RELEASE_TYPES, Triggers, WORKFLOW_RUN_TYPES,
+    CommandPlace, Filter, ISSUE_COMMENT_TYPES, ISSUES_TYPES, MAX_COMMAND_NAME, MAX_GLOBS,
+    MAX_PATTERNS, MERGE_GROUP_TYPES, RELEASE_TYPES, ShaPolicy, Triggers, WORKFLOW_RUN_TYPES,
+    valid_command_name,
 };
 
 /// The timeout of a job that sets none.
@@ -446,7 +449,7 @@ pub fn validate_with_warnings(config: &Config) -> (Vec<Diagnostic>, Vec<Diagnost
             && crate::lint::guarded(&wf.on)
         {
             warnings.extend(
-                crate::lint::plan_lints(&plan)
+                crate::lint::workflow_lints(&plan, &wf.on)
                     .iter()
                     .map(|lint| Diagnostic::new(lint.text())),
             );
@@ -1477,8 +1480,22 @@ fn trigger_errors(config: &Config, name: &str, on: &Triggers, errors: &mut Vec<D
     queue_and_dispatch_errors(name, on, errors);
 }
 
-/// Problems in `on.merge_group` and `on.repository_dispatch`.
+/// Problems in `on.merge_group`, `on.repository_dispatch`, `on.issues`,
+/// `on.issue_comment` and `on.command`.
 fn queue_and_dispatch_errors(name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
+    if let Some(issues) = &on.issues {
+        types_errors(name, "issues", &issues.types, ISSUES_TYPES, errors);
+    }
+    if let Some(comment) = &on.issue_comment {
+        types_errors(
+            name,
+            "issue_comment",
+            &comment.types,
+            ISSUE_COMMENT_TYPES,
+            errors,
+        );
+    }
+    command_errors(name, on, errors);
     if let Some(group) = &on.merge_group {
         types_errors(name, "merge_group", &group.types, MERGE_GROUP_TYPES, errors);
     }
@@ -1488,6 +1505,64 @@ fn queue_and_dispatch_errors(name: &str, on: &Triggers, errors: &mut Vec<Diagnos
         errors.push(Diagnostic::new(format!(
             "workflow `{name}`: `on.repository_dispatch.types` has an empty type"
         )));
+    }
+}
+
+/// Problems in `on.command`: a name that is not a command name or is
+/// reserved, no place to run in, a sha that is required where there is
+/// no head, and argument names that cannot be read back.
+fn command_errors(name: &str, on: &Triggers, errors: &mut Vec<Diagnostic>) {
+    let Some(commands) = &on.command else { return };
+    if commands.is_empty() {
+        errors.push(Diagnostic::new(format!(
+            "workflow `{name}`: `on.command` names no command"
+        )));
+    }
+    for (command, options) in commands.iter() {
+        let at = format!("workflow `{name}`: `on.command.{command}`");
+        if command == APPROVE_RUN {
+            errors.push(Diagnostic::new(format!(
+                "{at}: `{APPROVE_RUN}` is reserved for the built-in command"
+            )));
+        } else if !valid_command_name(command) {
+            errors.push(Diagnostic::new(format!(
+                "{at}: a command name is lowercase letters, digits, `-` and `_`, \
+                 at most {MAX_COMMAND_NAME} characters"
+            )));
+        }
+        if options.places.is_empty() {
+            errors.push(Diagnostic::new(format!("{at}: `in` is empty")));
+        } else if options.sha == ShaPolicy::Required
+            && !options.places.contains(&CommandPlace::PullRequest)
+        {
+            errors.push(Diagnostic::new(format!(
+                "{at}: `sha: required` needs `in` to include `pull_request`; \
+                 issues have no head commit"
+            )));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for arg in &options.args {
+            if arg.is_empty()
+                || !arg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            {
+                errors.push(Diagnostic::new(format!(
+                    "{at}: argument name `{arg}` must be letters, digits, `-` and `_`"
+                )));
+            } else if seen.contains(&arg.as_str()) {
+                errors.push(Diagnostic::new(format!(
+                    "{at}: argument name `{arg}` is listed twice"
+                )));
+            }
+            seen.push(arg);
+        }
+        if options.args.len() > MAX_WORDS {
+            errors.push(Diagnostic::new(format!(
+                "{at}: `args` names {} words; a command reads at most {MAX_WORDS}",
+                options.args.len()
+            )));
+        }
     }
 }
 

@@ -1938,9 +1938,9 @@ fn workflows_with_no_events_left_are_dropped() {
             "triage.yml".into(),
             "
 on:
-  issues:
-    types: [opened]
-  issue_comment:
+  watch:
+    types: [started]
+  fork:
 jobs:
   label: { runs-on: windows-latest, steps: [{ run: x }] }
 "
@@ -1957,8 +1957,8 @@ jobs:
         &[
             "triage.yml",
             "dropped",
-            "`issues`",
-            "`issue_comment`",
+            "`watch`",
+            "`fork`",
             "GitHub Actions"
         ]
     ));
@@ -1991,29 +1991,11 @@ fn a_workflow_whose_events_all_fail_is_dropped() {
 }
 
 #[test]
-fn github_only_events_say_to_stay_on_github_actions() {
-    for event in ["issues", "issue_comment"] {
-        let out = ok(&format!(
-            "on: [push, {event}]\njobs:\n  t: {{ runs-on: ubuntu-latest, steps: [{{ run: x }}] }}\n"
-        ));
-        assert!(
-            has(
-                &out.warnings,
-                &[
-                    &format!("`on.{event}` is not supported"),
-                    "keep",
-                    "GitHub Actions"
-                ]
-            ),
-            "{event}: {:?}",
-            out.warnings
-        );
-    }
-    // Others do not.
+fn a_dropped_event_names_the_events_hatchrun_runs_on() {
     let out =
         ok("on: [push, watch]\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n");
     assert!(has(&out.warnings, &["`on.watch` is not supported"]));
-    assert!(!has(&out.warnings, &["GitHub Actions"]));
+    assert!(out.config.workflows["ci"].on.push.is_some());
 }
 
 #[test]
@@ -2171,7 +2153,7 @@ fn workflow_run_after_a_workflow_that_did_not_convert() {
     let out = many(&[
         (
             "ci.yml",
-            "name: CI\non: issues\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
+            "name: CI\non: watch\njobs:\n  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }\n",
         ),
         (
             "deploy.yml",
@@ -3247,4 +3229,102 @@ fn split_outputs_are_read_by_bracket_in_the_output_name_too() {
         split("${{ jobs['build'].outputs['tag'] }}"),
         "${{ (jobs.build-2.outputs['tag'] || jobs.build.outputs['tag']) }}"
     );
+}
+
+#[test]
+fn issues_and_issue_comment_convert_with_their_types() {
+    let out = ok("
+on:
+  issues:
+    types: [opened, labeled]
+  issue_comment:
+    types: created
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x, if: github.actor == 'a' }], if: github.actor == 'a' }
+");
+    let on = &out.config.workflows["ci"].on;
+    assert_eq!(on.issues.as_ref().unwrap().types, ["opened", "labeled"]);
+    assert_eq!(on.issue_comment.as_ref().unwrap().types, ["created"]);
+    assert!(
+        !has(&out.warnings, &["not supported"]),
+        "{:?}",
+        out.warnings
+    );
+    round_trips(&out);
+}
+
+#[test]
+fn issues_and_issue_comment_without_types_take_every_type() {
+    for form in [
+        "on: [issues, issue_comment]",
+        "on:\n  issues:\n  issue_comment:",
+    ] {
+        let out = ok(&format!(
+            "{form}\njobs:\n  t: {{ runs-on: ubuntu-latest, steps: [{{ run: x }}] }}\n"
+        ));
+        let on = &out.config.workflows["ci"].on;
+        assert_eq!(on.issues.as_ref().unwrap().types.len(), 20, "{form}");
+        assert_eq!(
+            on.issue_comment.as_ref().unwrap().types,
+            ["created", "edited", "deleted"],
+            "{form}"
+        );
+        assert!(!has(&out.warnings, &["`types`"]), "{:?}", out.warnings);
+    }
+}
+
+#[test]
+fn unknown_issue_types_are_dropped_with_a_warning() {
+    let out = ok("
+on:
+  issues: { types: [opened, bogus] }
+  issue_comment: { types: [pinned] }
+  push:
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: x }] }
+");
+    let on = &out.config.workflows["ci"].on;
+    assert_eq!(on.issues.as_ref().unwrap().types, ["opened"]);
+    assert!(on.issue_comment.is_none());
+    assert!(
+        has(&out.warnings, &["`on.issues`", "`bogus`"]),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        has(&out.warnings, &["`on.issue_comment`", "`pinned`"]),
+        "{:?}",
+        out.warnings
+    );
+}
+
+#[test]
+fn an_issue_comment_workflow_that_does_not_check_the_commenter_warns() {
+    let out = ok("
+on:
+  issue_comment:
+    types: [created]
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    if: contains(github.event.comment.body, '/retest')
+    steps:
+      - run: echo \"${{ github.event.comment.body }}\"
+");
+    assert!(
+        has(&out.warnings, &["ci", "job `t`", "who commented"]),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        has(&out.warnings, &["contains", "startsWith"]),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        has(&out.warnings, &["github.event.comment.body", "env:"]),
+        "{:?}",
+        out.warnings
+    );
+    assert!(out.errors.is_empty(), "{:?}", out.errors);
 }

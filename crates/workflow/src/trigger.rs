@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::de::{self, Deserializer, SeqAccess, Visitor};
-use serde::ser::{SerializeSeq, Serializer};
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 
 use crate::call::CallTrigger;
@@ -568,6 +568,42 @@ pub struct Triggers {
         skip_serializing_if = "Option::is_none"
     )]
     pub repository_dispatch: Option<RepositoryDispatchTrigger>,
+    /// Activity on an issue. A plain issue and a pull request's
+    /// conversation are different places: a pull request is not an issue
+    /// event here.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub issues: Option<IssuesTrigger>,
+    /// Activity on a comment of an issue or a pull request's
+    /// conversation.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub issue_comment: Option<IssueCommentTrigger>,
+    /// Chat commands: a comment whose line starts with `/<name>`. See
+    /// [`Commands`].
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub command: Option<Commands>,
+}
+
+impl Triggers {
+    /// The options of the chat command `name`, `None` when the workflow
+    /// has no `on.command` or no command of that name. The control plane
+    /// reads the permission, the sha rule and the reaction of a command
+    /// it matched from this.
+    #[must_use]
+    pub fn command_options(&self, name: &str) -> Option<&CommandOptions> {
+        self.command.as_ref()?.get(name)
+    }
 }
 
 /// `on: create` and `on: delete`, which take no filters.
@@ -742,6 +778,311 @@ pub struct RepositoryDispatchTrigger {
     pub types: Vec<String>,
 }
 
+/// `on: issues`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct IssuesTrigger {
+    /// Activity types, from [`ISSUES_TYPES`]; every one when absent. One
+    /// type may be written as a plain string.
+    #[serde(deserialize_with = "one_or_many")]
+    pub types: Vec<String>,
+}
+
+/// The activity types `on.issues` accepts: those GitHub starts
+/// workflows on.
+pub const ISSUES_TYPES: &[&str] = &[
+    "opened",
+    "edited",
+    "deleted",
+    "transferred",
+    "pinned",
+    "unpinned",
+    "closed",
+    "reopened",
+    "assigned",
+    "unassigned",
+    "labeled",
+    "unlabeled",
+    "locked",
+    "unlocked",
+    "milestoned",
+    "demilestoned",
+    "typed",
+    "untyped",
+    "field_added",
+    "field_removed",
+];
+
+impl Default for IssuesTrigger {
+    fn default() -> Self {
+        Self {
+            types: ISSUES_TYPES.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+}
+
+/// `on: issue_comment`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct IssueCommentTrigger {
+    /// Activity types, from [`ISSUE_COMMENT_TYPES`]; every one when
+    /// absent. One type may be written as a plain string.
+    #[serde(deserialize_with = "one_or_many")]
+    pub types: Vec<String>,
+}
+
+/// The activity types `on.issue_comment` accepts.
+pub const ISSUE_COMMENT_TYPES: &[&str] = &["created", "edited", "deleted"];
+
+impl Default for IssueCommentTrigger {
+    fn default() -> Self {
+        Self {
+            types: ISSUE_COMMENT_TYPES
+                .iter()
+                .map(|t| (*t).to_owned())
+                .collect(),
+        }
+    }
+}
+
+/// The GitHub repository permission a commenter must hold, lowest
+/// first, so `Write <= Maintain` compares as the roles do.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandPermission {
+    /// Read access.
+    Read,
+    /// Triage: manage issues and pull requests, no code.
+    Triage,
+    /// Write access, the default.
+    #[default]
+    Write,
+    /// Maintain: write, and manage the repository without its secrets.
+    Maintain,
+    /// Admin.
+    Admin,
+}
+
+impl CommandPermission {
+    /// The role's name as GitHub's collaborator permission API gives it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Triage => "triage",
+            Self::Write => "write",
+            Self::Maintain => "maintain",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+/// Where a command's comment may be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandPlace {
+    /// The conversation of a pull request.
+    PullRequest,
+    /// A plain issue.
+    Issue,
+}
+
+/// Whether a command's comment must name the pull request's head sha
+/// with `--sha=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShaPolicy {
+    /// Required when the pull request is from a fork, else optional.
+    #[default]
+    Auto,
+    /// Always required.
+    Required,
+    /// Never required; a sha that is given is still compared.
+    Optional,
+}
+
+/// The reactions the platform leaves on a command's comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandReaction {
+    /// `+1` on success, `-1` on failure.
+    #[default]
+    Default,
+    /// `rocket` on success, `confused` on failure.
+    Rocket,
+}
+
+/// The options of one `on.command` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommandOptions {
+    /// The permission the commenter must hold on the repository.
+    pub permission: CommandPermission,
+    /// Where the comment may be. Written `in:`.
+    #[serde(rename = "in")]
+    pub places: Vec<CommandPlace>,
+    /// Whether the comment must name the head sha.
+    pub sha: ShaPolicy,
+    /// Names for the positional words, read as
+    /// `github.event.command.named.<name>`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// The reactions the platform leaves.
+    pub reaction: CommandReaction,
+}
+
+impl Default for CommandOptions {
+    fn default() -> Self {
+        Self {
+            permission: CommandPermission::Write,
+            places: vec![CommandPlace::PullRequest],
+            sha: ShaPolicy::Auto,
+            args: Vec::new(),
+            reaction: CommandReaction::Default,
+        }
+    }
+}
+
+impl CommandOptions {
+    /// Whether a comment on a pull request (`true`) or on a plain issue
+    /// (`false`) may run the command.
+    #[must_use]
+    pub fn allows(&self, on_pull_request: bool) -> bool {
+        let place = if on_pull_request {
+            CommandPlace::PullRequest
+        } else {
+            CommandPlace::Issue
+        };
+        self.places.contains(&place)
+    }
+
+    /// Whether a command on a pull request must carry `--sha=`. `fork` is
+    /// whether the pull request's head is in another repository. A plain
+    /// issue has no head, so the question does not arise there.
+    #[must_use]
+    pub fn sha_required(&self, fork: bool) -> bool {
+        match self.sha {
+            ShaPolicy::Required => true,
+            ShaPolicy::Optional => false,
+            ShaPolicy::Auto => fork,
+        }
+    }
+}
+
+/// The longest name of a command.
+pub const MAX_COMMAND_NAME: usize = 32;
+
+/// Whether `name` is a command name: lowercase letters, digits, `-` and
+/// `_`, at most [`MAX_COMMAND_NAME`] of them.
+#[must_use]
+pub fn valid_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_COMMAND_NAME
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'))
+}
+
+/// `on: command`, the chat commands of a workflow by name.
+///
+/// In YAML it is a map of names to [`CommandOptions`] (an empty value
+/// takes the defaults), one name as a string, or a list of names, the
+/// last two with the defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Commands(BTreeMap<String, CommandOptions>);
+
+impl Commands {
+    /// The options of the command `name`.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&CommandOptions> {
+        self.0.get(name)
+    }
+
+    /// The commands by name, in name order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &CommandOptions)> {
+        self.0
+            .iter()
+            .map(|(name, options)| (name.as_str(), options))
+    }
+
+    /// Whether no command is named.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl FromIterator<(String, CommandOptions)> for Commands {
+    fn from_iter<T: IntoIterator<Item = (String, CommandOptions)>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl<'de> Deserialize<'de> for Commands {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CommandsVisitor;
+
+        impl<'de> Visitor<'de> for CommandsVisitor {
+            type Value = Commands;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a command name, a list of names or a map of names to options")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Commands, E> {
+                Ok(Commands(BTreeMap::from([(
+                    value.to_owned(),
+                    CommandOptions::default(),
+                )])))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Commands, A::Error> {
+                let mut commands = BTreeMap::new();
+                while let Some(name) = seq.next_element::<String>()? {
+                    if commands
+                        .insert(name.clone(), CommandOptions::default())
+                        .is_some()
+                    {
+                        return Err(de::Error::custom(format!(
+                            "command `{name}` is listed twice"
+                        )));
+                    }
+                }
+                Ok(Commands(commands))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Commands, A::Error> {
+                let mut commands = BTreeMap::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    let options = map
+                        .next_value::<Option<CommandOptions>>()?
+                        .unwrap_or_default();
+                    if commands.insert(name.clone(), options).is_some() {
+                        return Err(de::Error::custom(format!(
+                            "command `{name}` is given twice"
+                        )));
+                    }
+                }
+                Ok(Commands(commands))
+            }
+        }
+
+        deserializer.deserialize_any(CommandsVisitor)
+    }
+}
+
+impl Serialize for Commands {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, options) in &self.0 {
+            map.serialize_entry(name, options)?;
+        }
+        map.end()
+    }
+}
+
 /// The activity types `on.release` accepts.
 pub const RELEASE_TYPES: &[&str] = &[
     "published",
@@ -863,6 +1204,27 @@ pub enum Event {
         /// The request's `event_type`.
         action: String,
     },
+    /// Activity on an issue. A pull request's conversation is not an
+    /// issue event.
+    Issues {
+        /// The activity type, such as `opened`.
+        action: String,
+    },
+    /// Activity on a comment of an issue or of a pull request.
+    IssueComment {
+        /// The activity type: `created`, `edited` or `deleted`.
+        action: String,
+    },
+    /// A chat command found in a created comment (see
+    /// [`crate::command`]). It matches the workflows whose `on.command`
+    /// has the name and allows the place.
+    Command {
+        /// The command's name, without the `/`.
+        name: String,
+        /// Whether the comment is on a pull request, else on a plain
+        /// issue.
+        on_pull_request: bool,
+    },
 }
 
 /// Whether `event` starts a workflow with the triggers `on`.
@@ -916,6 +1278,20 @@ pub fn triggered(on: &Triggers, event: &Event) -> bool {
             .repository_dispatch
             .as_ref()
             .is_some_and(|d| d.types.is_empty() || d.types.iter().any(|t| t == action)),
+        Event::Issues { action } => on
+            .issues
+            .as_ref()
+            .is_some_and(|issues| issues.types.iter().any(|t| t == action)),
+        Event::IssueComment { action } => on
+            .issue_comment
+            .as_ref()
+            .is_some_and(|comment| comment.types.iter().any(|t| t == action)),
+        Event::Command {
+            name,
+            on_pull_request,
+        } => on
+            .command_options(name)
+            .is_some_and(|options| options.allows(*on_pull_request)),
     }
 }
 
