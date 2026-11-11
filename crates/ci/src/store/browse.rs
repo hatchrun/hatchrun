@@ -73,6 +73,28 @@ const UPSERT_PULL_FORCED: &str = "INSERT INTO ci_pulls \
 const PULL_STAMP: &str =
     "SELECT updated_at, head_sha FROM ci_pulls WHERE repo_id = $1 AND number = $2";
 
+/// The state and head commit of pull request `$2` of repository `$1`.
+const PULL_HEAD: &str = "SELECT state, head_sha FROM ci_pulls WHERE repo_id = $1 AND number = $2";
+
+/// The state and head commit a pull request was last recorded with.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullHead {
+    /// `open`, `closed` or `merged`.
+    pub state: String,
+    /// The head commit.
+    pub head_sha: String,
+}
+
+/// What is recorded of a pull request's state and head, `None` for a
+/// pull request with no row.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn pull_head(db: &Db, repo_id: u64, number: u64) -> Result<Option<PullHead>> {
+    db.first(PULL_HEAD, &params![repo_id, number]).await
+}
+
 /// The time of a recorded pull request.
 #[derive(Deserialize)]
 struct Stamp {

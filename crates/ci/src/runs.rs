@@ -615,13 +615,13 @@ fn failed_workflow_check(req: &Request<'_>, workflow: &Failed) -> CheckRun {
             report_sha(req),
         );
     }
-    let command = req.origin.chat.and_then(|chat| chat.command.as_ref());
+    let command = command_of(req);
     invalid_workflow_check_run(
         &workflow.workflow,
         &workflow.diagnostics,
         report_sha(req),
         req.event_name,
-        command.map(|command| command.name.as_str()),
+        command.as_ref().map(|command| command.name.as_str()),
     )
 }
 

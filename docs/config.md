@@ -284,9 +284,27 @@ needs a checked job is covered by it), and on a `contains` match against
 
 `on.command` fixes both caveats. The control plane finds the command in a
 created comment, checks the commenter's repository permission before a
-run exists. It replies in the comment only for a missing or stale sha
-prompt (below), an argument error, and an approval or remake failure. A
-commenter below the required permission gets no reply and no reaction.
+run exists. A commenter below the required permission gets no reply and
+no reaction. A command that starts runs gets an `eyes` reaction, and
+the run's end leaves the reaction of the `reaction` option.
+
+The control plane replies in the comment only to say why a command
+started nothing:
+
+- an argument error (too many words, a word that is too long, a bad
+  `--sha=`);
+- a missing `--sha=` (the reply quotes the line with the head to add),
+  a `--sha=` that is not the pull request's current head (the reply
+  names the head), and `Issues have no head commit` for a `--sha=` on a
+  plain issue;
+- for `/approve-run`: `The pull request is closed`, `This pull request is
+  from this repository, so there is nothing to approve` (when runs of
+  the head exist on such a pull request the command reacts `+1`
+  instead), `Fork runs are off for this repository`,
+  `No workflow runs on this pull request`, `Too many fork runs wait for
+  approval`, an invalid config reply (the head's or the base branch's,
+  naming the events that did not start), and `The approval went through,
+  but making the runs again failed`.
 
 ```yaml
 workflows:

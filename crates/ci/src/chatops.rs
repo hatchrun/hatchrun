@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::github::PullInfo;
 use crate::policy::{self, APPROVAL_EXPIRES_MS, Admission, ForkRuns};
-use crate::store::{GateStatus, RunRow};
+use crate::store::{GateStatus, PullHead, RunRow};
 
 /// The most runs of the `issue_comment` event that are not over for one
 /// issue or pull request. A comment over the cap starts nothing.
@@ -232,6 +232,21 @@ pub fn pin(options: &CommandOptions, args: &Args, line: &str, pull: Option<&Pull
     }
 }
 
+/// What `/approve-run` does when its snapshot of the pull request is
+/// older than the recorded row: the row decides. A closed pull request
+/// is answered as closed, a head other than the pinned sha with the
+/// stale-sha prompt naming the recorded head, and only a row whose head
+/// is the pin lets the command go on, at that head.
+#[must_use]
+pub fn pin_against_row(row: Option<&PullHead>, pin: &str, line: &str) -> Pin {
+    match row {
+        None => Pin::Reply(CLOSED_PULL_REQUEST.to_owned()),
+        Some(row) if row.state != "open" => Pin::Reply(CLOSED_PULL_REQUEST.to_owned()),
+        Some(row) if row.head_sha != pin => Pin::Reply(stale_pin(&row.head_sha, line)),
+        Some(row) => Pin::Run(Some(row.head_sha.clone())),
+    }
+}
+
 /// The sha rule of the built-in `/approve-run`: the pin is always
 /// required.
 #[must_use]
@@ -336,6 +351,33 @@ mod tests {
             updated_at: 0,
             raw: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn a_stale_snapshot_is_decided_by_the_recorded_row() {
+        let row = |state: &str, sha: &str| PullHead {
+            state: state.to_owned(),
+            head_sha: sha.to_owned(),
+        };
+        let line = "/approve-run";
+        assert_eq!(
+            pin_against_row(Some(&row("open", HEAD)), HEAD, line),
+            Pin::Run(Some(HEAD.to_owned()))
+        );
+        assert_eq!(
+            pin_against_row(Some(&row("open", OTHER)), HEAD, line),
+            Pin::Reply(stale_pin(OTHER, line))
+        );
+        for state in ["closed", "merged"] {
+            assert_eq!(
+                pin_against_row(Some(&row(state, HEAD)), HEAD, line),
+                Pin::Reply(CLOSED_PULL_REQUEST.to_owned())
+            );
+        }
+        assert_eq!(
+            pin_against_row(None, HEAD, line),
+            Pin::Reply(CLOSED_PULL_REQUEST.to_owned())
+        );
     }
 
     fn options(sha: ShaPolicy) -> CommandOptions {

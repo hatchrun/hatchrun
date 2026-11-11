@@ -38,8 +38,9 @@ pub use self::billing::{
     unsent_usage, usage_rejected, usage_sent,
 };
 pub use self::browse::{
-    BranchAfter, BranchRow, NewPull, PullAfter, PullRow, PullWrite, RepoCounts, WorkflowRow,
-    branches_page, pulls_page, repo_counts, upsert_pull, upsert_pull_forced, workflows_page,
+    BranchAfter, BranchRow, NewPull, PullAfter, PullHead, PullRow, PullWrite, RepoCounts,
+    WorkflowRow, branches_page, pull_head, pulls_page, repo_counts, upsert_pull,
+    upsert_pull_forced, workflows_page,
 };
 pub use self::cache::{
     CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, drop_pending_cache_entry,

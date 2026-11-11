@@ -1980,30 +1980,29 @@ impl Cx<'_> {
         // The pull request as it stands now: a push since the runs
         // were made supersedes what waits at older commits, and an
         // approval is only given while it is open at the run's commit.
-        let mut pr = pull_of_comment(comment, pull);
-        let mut record = pull_record(&pr);
-        let mut write = store::upsert_pull(self.db, &record).await?;
-        if write == store::PullWrite::Stale {
-            // Our snapshot is older than the row, so what it says of the
-            // head cannot decide which runs to cancel. Ask GitHub once
-            // more and go on only with a snapshot the row accepts.
-            let again = self.comment_pull(comment).await?;
-            if let Some(again) = again.as_ref().filter(|again| again.state == "open") {
-                pr = pull_of_comment(comment, again);
-                record = pull_record(&pr);
-                write = store::upsert_pull(self.db, &record).await?;
-            }
-        }
-        match write {
+        let pr = pull_of_comment(comment, pull);
+        let record = pull_record(&pr);
+        match store::upsert_pull(self.db, &record).await? {
             store::PullWrite::Applied => {}
             store::PullWrite::Tied => store::upsert_pull_forced(self.db, &record).await?,
             store::PullWrite::Stale => {
-                worker::console_warn!(
-                    "{}: /approve-run on #{} stopped, the pull request snapshot is stale",
-                    comment.repo.full_name,
-                    comment.number
-                );
-                return Ok(Vec::new());
+                // Our snapshot is older than the row, so what it says of
+                // the head cannot decide which runs to cancel. The row
+                // is newer: the command goes on only if it still has the
+                // pinned head, and says why it stops otherwise.
+                let row = store::pull_head(self.db, repo_id, number).await?;
+                match chatops::pin_against_row(row.as_ref(), &head, &found.line) {
+                    Pin::Run(_) => {}
+                    Pin::Reply(text) => {
+                        worker::console_warn!(
+                            "{}: /approve-run on #{} found a newer pull request row",
+                            comment.repo.full_name,
+                            number
+                        );
+                        self.reply(comment, &text).await;
+                        return Ok(Vec::new());
+                    }
+                }
             }
         }
         self.end_waiting(&pr, Some(&head), fork::SUPERSEDED).await?;
