@@ -4,7 +4,7 @@
 
 //! The cache service Twirp RPCs.
 
-use std::sync::{Arc, Mutex};
+use std::future::Future;
 
 use http_body_util::{BodyExt, Limited};
 use hyper::Request;
@@ -13,10 +13,11 @@ use hyper::body::Incoming;
 use serde::de::DeserializeOwned;
 use tracing::{debug, info, warn};
 
+use super::cloud::{JobEnded, Part, UploadGone};
 use super::twirp;
 use super::{
-    DOWNLOAD_PATH, Download, MAX_SMALL_BODY, Reply, State, UPLOAD_PATH, Upload, UploadState,
-    download_token, json, lock, refusal, twirp_error,
+    DOWNLOAD_PATH, Download, MAX_SMALL_BODY, Outcome, Reply, State, UPLOAD_PATH, Upload,
+    UploadState, download_token, json, lock, refusal, twirp_error,
 };
 
 /// A Twirp request body, or why it is malformed.
@@ -85,6 +86,7 @@ pub(super) async fn lookup(state: &State, request: twirp::LookupRequest) -> Repl
     json(&response)
 }
 
+/// Starts a cache save and hands out an upload URL for it.
 pub(super) async fn create(state: &State, request: twirp::CreateRequest) -> Reply {
     let Some(cloud) = &state.cloud else {
         return twirp_error(
@@ -112,21 +114,17 @@ pub(super) async fn create(state: &State, request: twirp::CreateRequest) -> Repl
         }
     };
     let url = format!("{}{UPLOAD_PATH}{id}", state.base);
-    let mut uploads = lock(&state.uploads);
-    if let Some(old) = uploads
-        .by_entry
-        .insert((request.key.clone(), request.version.clone()), id.clone())
-    {
-        uploads.by_id.remove(&old);
-    }
-    uploads.by_id.insert(
-        id.clone(),
-        Arc::new(Upload {
-            id,
-            cloud: cloud.clone(),
-            state: Mutex::new(UploadState::default()),
-        }),
+    let replaced = lock(&state.uploads).replace(
+        (request.key.clone(), request.version.clone()),
+        Upload::new(id, cloud.clone()),
     );
+    if let Some(old) = replaced {
+        warn!(
+            key = request.key,
+            "cache save created again, dropping the earlier upload"
+        );
+        abandon(&old).await;
+    }
     info!(key = request.key, "cache save started");
     json(&twirp::CreateResponse {
         ok: true,
@@ -135,15 +133,10 @@ pub(super) async fn create(state: &State, request: twirp::CreateRequest) -> Repl
     })
 }
 
+/// Completes the save of the entry, once however often it is asked.
 pub(super) async fn finalize(state: &State, request: twirp::FinalizeRequest) -> Reply {
     let entry = (request.key.clone(), request.version.clone());
-    let upload = {
-        let mut uploads = lock(&state.uploads);
-        uploads
-            .by_entry
-            .remove(&entry)
-            .and_then(|id| uploads.by_id.remove(&id))
-    };
+    let upload = lock(&state.uploads).claim(&entry);
     let refuse = |message: String| {
         json(&twirp::FinalizeResponse {
             ok: false,
@@ -154,43 +147,112 @@ pub(super) async fn finalize(state: &State, request: twirp::FinalizeRequest) -> 
     let Some(upload) = upload else {
         return refuse(format!("no upload for {}", request.key));
     };
-    let parts = {
-        let mut upload = upload.lock();
-        if upload.failed {
-            None
-        } else {
-            upload.committed.take()
-        }
-    };
-    let Some(parts) = parts else {
-        abandon(&upload).await;
-        warn!(
-            key = request.key,
-            "cache save finalized without a whole upload"
-        );
-        return refuse("the upload did not finish".into());
-    };
-    match upload.cloud.complete(&upload.id, &parts).await {
-        Ok(true) => {
+    let lost = format!("another job saved {} first", request.key);
+    let up = &*upload;
+    let outcome = settle(up, &lost, |parts| async move {
+        let saved = up.cloud.complete(&up.id, &parts).await?;
+        Ok(saved.then(|| state.next().to_string()))
+    })
+    .await;
+    match outcome {
+        Ok(Outcome::Saved(id)) => {
             info!(key = request.key, size = request.size_bytes, "cache saved");
             json(&twirp::FinalizeResponse {
                 ok: true,
-                entry_id: state.next().to_string(),
+                entry_id: id,
                 message: String::new(),
             })
         }
-        Ok(false) => {
-            info!(key = request.key, "another job saved the cache entry first");
-            refuse(format!("another job saved {} first", request.key))
+        Ok(Outcome::Refused(message)) => {
+            info!(key = request.key, "cache entry not saved: {message}");
+            refuse(message)
         }
         Err(err) => {
             warn!(key = request.key, "cache save failed: {err:#}");
-            abandon(&upload).await;
-            refuse(format!("{err:#}"))
+            refusal(&err)
         }
     }
 }
 
+/// Finalizes `upload` once: `complete` gets the parts and answers the
+/// id of the saved entry, `None` when it was lost to another job.
+///
+/// A definitive answer is kept, and a repeat or an overlapping finalize
+/// gets it again with no second call. An error to retry (the control
+/// plane or the network did not answer) leaves the upload as it was and
+/// comes back as `Err`, for the client's retry to complete again, and so
+/// does a job that ended. `lost` is the reason for a lost race.
+pub(super) async fn settle<F, Fut>(
+    upload: &Upload,
+    lost: &str,
+    complete: F,
+) -> Result<Outcome, anyhow::Error>
+where
+    F: FnOnce(Vec<Part>) -> Fut,
+    Fut: Future<Output = Result<Option<String>, anyhow::Error>>,
+{
+    let mut done = upload.outcome.lock().await;
+    if let Some(outcome) = &*done {
+        return Ok(outcome.clone());
+    }
+    let parts = {
+        let state = upload.lock();
+        if state.failed {
+            None
+        } else {
+            state.committed.clone()
+        }
+    };
+    let Some(parts) = parts else {
+        abandon(upload).await;
+        warn!(upload = upload.id, "finalized without a whole upload");
+        return Ok(settled(
+            upload,
+            &mut done,
+            "the upload did not finish".into(),
+        ));
+    };
+    let outcome = match complete(parts).await {
+        Ok(Some(id)) => Outcome::Saved(id),
+        Ok(None) => Outcome::Refused(lost.to_owned()),
+        Err(err) => {
+            if err.downcast_ref::<UploadGone>().is_some() {
+                abandon(upload).await;
+                return Ok(settled(upload, &mut done, err.to_string()));
+            }
+            if err.downcast_ref::<JobEnded>().is_some() {
+                abandon(upload).await;
+                return Err(err);
+            }
+            if matches!(
+                twirp::code_for(&err).0,
+                "unavailable" | "resource_exhausted"
+            ) {
+                return Err(err);
+            }
+            abandon(upload).await;
+            Outcome::Refused(format!("{err:#}"))
+        }
+    };
+    Ok(keep(upload, &mut done, outcome))
+}
+
+/// Records a refusal as the outcome.
+fn settled(upload: &Upload, done: &mut Option<Outcome>, message: String) -> Outcome {
+    keep(upload, done, Outcome::Refused(message))
+}
+
+/// Records the outcome and frees what the upload buffered: it takes no
+/// more data.
+fn keep(upload: &Upload, done: &mut Option<Outcome>, outcome: Outcome) -> Outcome {
+    *upload.lock() = UploadState {
+        settled: true,
+        ..UploadState::default()
+    };
+    done.insert(outcome).clone()
+}
+
+/// Aborts the upload on the control plane, ignoring a failure.
 pub(super) async fn abandon(upload: &Upload) {
     if let Err(err) = upload.cloud.abort(&upload.id).await {
         debug!(upload = upload.id, "abandon upload: {err:#}");

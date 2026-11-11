@@ -6,10 +6,10 @@
 
 use super::*;
 
-const ARTIFACT_RPC: &str = "twirp/github.actions.results.api.v1.ArtifactService/";
+pub(super) const ARTIFACT_RPC: &str = "twirp/github.actions.results.api.v1.ArtifactService/";
 
 /// A proxy that serves artifacts only, from `server`.
-async fn artifact_proxy(server: &MockServer) -> Proxy {
+pub(super) async fn artifact_proxy(server: &MockServer) -> Proxy {
     Proxy::start_with(
         Services {
             cache: None,
@@ -33,7 +33,7 @@ async fn artifact_proxy(server: &MockServer) -> Proxy {
     .unwrap()
 }
 
-async fn artifact_rpc(proxy: &Proxy, name: &str, body: Value) -> (u16, Value) {
+pub(super) async fn artifact_rpc(proxy: &Proxy, name: &str, body: Value) -> (u16, Value) {
     let token = proxy.runtime_token();
     let response = reqwest::Client::new()
         .post(format!("{}{ARTIFACT_RPC}{name}", proxy.url()))
@@ -48,7 +48,7 @@ async fn artifact_rpc(proxy: &Proxy, name: &str, body: Value) -> (u16, Value) {
 
 /// A control plane that hands out part URLs on itself, and an S3 that
 /// answers each part with the `ETag` `"e<number>"`.
-async fn control_plane() -> MockServer {
+pub(super) async fn control_plane() -> MockServer {
     let server = MockServer::start().await;
     let uri = server.uri();
     Mock::given(method("POST"))
