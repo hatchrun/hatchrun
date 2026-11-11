@@ -1273,6 +1273,7 @@ mod tests {
         assert!(plans[0].warnings[0].contains("checks out the pull request head"));
     }
 
+    /// Pins that script injection and a checkout that may be the head both raise warnings.
     #[test]
     fn injection_and_a_checkout_that_may_be_the_head_are_warnings_too() {
         let maybe =
@@ -1284,6 +1285,7 @@ mod tests {
         }
     }
 
+    /// Pins that a clean plan has no findings and that events other than the checked ones are not read.
     #[test]
     fn a_clean_plan_has_no_findings_and_another_event_is_not_read() {
         let plans = lint_steps("      - run: make test", true);
@@ -1383,6 +1385,7 @@ mod tests {
         assert_eq!(check_sha(&target), None);
     }
 
+    /// Pins that a comment workflow is linted against its own triggers.
     #[test]
     fn a_comment_workflow_is_read_for_findings_against_its_own_triggers() {
         let yaml = "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      \
@@ -1397,6 +1400,7 @@ mod tests {
         assert_eq!(plans[0].warnings.len(), 0);
     }
 
+    /// Pins that an issue run takes its message from the trimmed first line of the issue title.
     #[test]
     fn an_issue_run_shows_the_issue_title() {
         let comment = serde_json::json!({"issue": {"title": " Add a cache \nmore"}});

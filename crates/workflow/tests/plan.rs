@@ -455,6 +455,7 @@ workflows: { ci: { on: { push: {} }, jobs: [] } }
     );
 }
 
+/// Pins that a docker:// step plans and that an image is required.
 #[test]
 fn docker_uses_plans_and_needs_an_image() {
     let p = plan(
@@ -2646,6 +2647,7 @@ fn issues_and_issue_comment_types_are_checked() {
     );
 }
 
+/// Pins which command names, options and shorthand forms validate.
 #[test]
 fn command_names_options_and_shorthands_validate() {
     for on in [
@@ -2661,6 +2663,7 @@ fn command_names_options_and_shorthands_validate() {
     }
 }
 
+/// Pins that command errors name the command and the fix.
 #[test]
 fn command_errors_name_the_command_and_the_fix() {
     assert_error(
@@ -2710,6 +2713,7 @@ fn command_errors_name_the_command_and_the_fix() {
     );
 }
 
+/// Pins that unknown command options and values fail to parse.
 #[test]
 fn command_options_that_do_not_exist_do_not_parse() {
     for on in [

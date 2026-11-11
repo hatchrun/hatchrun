@@ -728,6 +728,7 @@ pub fn reads_expression(expr: &str) -> Result<Reads, ExprError> {
     Ok(found)
 }
 
+/// Walks an expression and records the context paths and string literals it reads.
 fn collect_reads(expr: &parser::Expr<'_>, out: &mut Reads) {
     use parser::{Expr, Step};
     match expr {

@@ -354,6 +354,7 @@ mod tests {
         }
     }
 
+    /// Pins that the recorded pull request row, not a stale snapshot, decides whether a pin matches.
     #[test]
     fn a_stale_snapshot_is_decided_by_the_recorded_row() {
         let row = |state: &str, sha: &str| PullHead {
@@ -431,6 +432,7 @@ mod tests {
 
     const PR: &str = "pull_request";
 
+    /// Pins that only runs still waiting at the gate are approved, and runs already going are left alone.
     #[test]
     fn a_waiting_run_is_approved_and_a_running_one_is_left_alone() {
         let ci = names(&["ci"]);
@@ -463,6 +465,7 @@ mod tests {
         assert_eq!(decide(&ci, &runs[..2], PR, NOW), decided(&[]));
     }
 
+    /// Pins that the invalid config reply names the config ref and the events that did not start.
     #[test]
     fn an_invalid_config_reply_names_the_config_and_the_events_that_did_not_start() {
         let head = invalid_head_config("abc");
@@ -473,6 +476,7 @@ mod tests {
         assert!(invalid_base_config("main", None).contains("on main,"));
     }
 
+    /// Pins that a workflow with no run, or only ended ones, is started again.
     #[test]
     fn a_workflow_with_no_run_or_only_ended_ones_is_made_again() {
         let ci = names(&["ci"]);
@@ -503,6 +507,7 @@ mod tests {
         assert_eq!(decide(&ci, &[on_time], PR, NOW), decided(&[]));
     }
 
+    /// Pins that each workflow and event pair is decided separately, so one good run does not hide a missing one.
     #[test]
     fn each_workflow_and_event_is_decided_on_its_own() {
         // w1 went well, w2 expired and w4 has no run (a partial failure
@@ -543,6 +548,7 @@ mod tests {
         );
     }
 
+    /// Pins that turning fork runs off refuses only the pull request part and leaves the target part alone.
     #[test]
     fn fork_runs_off_refuses_only_the_pull_request_part() {
         // A pull request of the repository is asked about first.
@@ -570,6 +576,7 @@ mod tests {
         assert!(!REMAKE_FAILED.contains(['\u{2014}', '\u{2013}']));
     }
 
+    /// Pins that only the cap refusal is reported as too many waiting runs.
     #[test]
     fn only_the_cap_refusal_is_said_as_too_many_waiting() {
         let cap = policy::refusal(Admission::Drop).unwrap();
@@ -582,6 +589,7 @@ mod tests {
         }
     }
 
+    /// Pins that approve-run asks for the head sha pin for forks and non-forks alike.
     #[test]
     fn approve_run_always_asks_for_the_pin() {
         let line = "/approve-run";
@@ -603,6 +611,7 @@ mod tests {
         ));
     }
 
+    /// Pins that permission roles order from read up to admin.
     #[test]
     fn roles_compare_from_read_up_to_admin() {
         use CommandPermission::{Admin, Maintain, Read, Triage, Write};
@@ -654,6 +663,7 @@ mod tests {
         assert!(matches!(got, Pin::Reply(_)));
     }
 
+    /// Pins that an optional or automatic sha policy does not ask for a pin.
     #[test]
     fn an_optional_pin_is_not_asked_for() {
         let line = "/retest";

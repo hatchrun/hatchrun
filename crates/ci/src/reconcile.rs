@@ -772,6 +772,7 @@ async fn head(
     }))
 }
 
+/// Starts the workflow for one due schedule fire at the given head and logs the runs it created.
 async fn start(
     env: &Env,
     db: &Db,

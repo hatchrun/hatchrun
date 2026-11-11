@@ -1433,6 +1433,7 @@ workflows:
         assert!(!guarded(&on("{ pull_request: {}, push: {} }")));
     }
 
+    /// Pins that checking out the pull request head is flagged in issue comment, issues and command workflows.
     #[test]
     fn the_head_is_a_checkout_in_issue_comment_and_command_workflows() {
         let steps = "      - uses: actions/checkout@v4\n        with:\n          ref: refs/pull/${{ github.event.issue.number }}/head";
@@ -1456,6 +1457,7 @@ workflows:
 
     const PINNED: &str = "      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.event.command.pull_request.head_sha }}";
 
+    /// Pins that a command which requires a sha pin may check out the sha the commenter named.
     #[test]
     fn a_command_may_check_out_the_sha_the_commenter_named() {
         for on in [
@@ -1475,6 +1477,7 @@ workflows:
         assert_eq!(warned("{ command: retest }", "", &steps), []);
     }
 
+    /// Pins that a command with an optional sha still warns on checking out the sha.
     #[test]
     fn a_command_with_an_optional_sha_warns_on_the_sha() {
         // The pin can be left out, so the checkout is the head as it is.
@@ -1496,6 +1499,7 @@ workflows:
         }
     }
 
+    /// Pins that a command below write permission, or mixed with one, warns on checking out the sha.
     #[test]
     fn a_command_below_write_or_mixed_with_one_warns_on_the_sha() {
         for on in [
@@ -1518,6 +1522,7 @@ workflows:
         assert_eq!(plan_lints(&plan).len(), 1);
     }
 
+    /// Pins that other ways to name the pull request head still warn in a command workflow.
     #[test]
     fn a_command_still_warns_on_the_other_head_forms() {
         for with in [
@@ -1543,6 +1548,7 @@ workflows:
         assert_eq!(warned("{ command: retest }", "", steps), []);
     }
 
+    /// Pins that script injection checks cover issue, comment and command text fields.
     #[test]
     fn script_injection_covers_issue_comment_and_command_text() {
         for field in [
@@ -1591,6 +1597,7 @@ workflows:
         );
     }
 
+    /// Pins that an issue comment job that never checks who commented gets a warning.
     #[test]
     fn an_issue_comment_job_with_no_check_on_the_commenter_warns() {
         let steps = "      - run: ./retest.sh";
@@ -1623,6 +1630,7 @@ workflows:
         assert_eq!(warned("{ issue_comment: {} }", job, steps), []);
     }
 
+    /// Pins that the commenter check applies only to issue comment workflows.
     #[test]
     fn only_issue_comment_workflows_are_asked_who_commented() {
         let steps = "      - run: ./triage.sh";
@@ -1669,6 +1677,7 @@ workflows:
         assert_eq!(unguarded, ["other"], "{found:?}");
     }
 
+    /// Pins that a contains test on the comment text does not count as a check on the commenter and warns.
     #[test]
     fn contains_on_the_comment_text_warns() {
         let steps = "      - run: ./retest.sh";
@@ -1696,6 +1705,7 @@ workflows:
         assert_eq!(found[0].step, 1);
     }
 
+    /// Pins that startsWith and contains on other values do not trigger the warning.
     #[test]
     fn startswith_and_other_contains_do_not_warn() {
         let steps = "      - run: ./retest.sh";

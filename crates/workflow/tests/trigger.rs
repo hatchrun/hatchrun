@@ -514,6 +514,7 @@ fn command(name: &str, on_pull_request: bool) -> Event {
     }
 }
 
+/// Pins that issues without types default to every type GitHub runs on.
 #[test]
 fn issues_default_to_every_type_github_runs_on() {
     let t = on("issues: {}");
@@ -531,6 +532,7 @@ fn issues_default_to_every_type_github_runs_on() {
     assert!(event_in("issues: { types: closed }", &issues("closed")));
 }
 
+/// Pins that `issue_comment` without types defaults to created, edited and deleted.
 #[test]
 fn issue_comment_defaults_to_all_three_types() {
     let t = on("issue_comment: {}");
@@ -565,6 +567,7 @@ fn a_command_matches_its_name_and_place() {
     ));
 }
 
+/// Pins the command option defaults and the lookup of options by command name.
 #[test]
 fn command_options_default_and_are_looked_up_by_name() {
     let t = on(
@@ -611,6 +614,7 @@ fn the_sha_rule_follows_the_policy_and_the_fork() {
     assert!(!rule(ShaPolicy::Optional, true));
 }
 
+/// Pins that command permissions order like GitHub roles and default to write.
 #[test]
 fn permissions_order_like_github_roles() {
     use CommandPermission::*;

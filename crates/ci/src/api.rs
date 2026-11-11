@@ -1485,6 +1485,7 @@ impl Cx<'_> {
         served
     }
 
+    /// Routes one request for a repository to its handler, counting GitHub calls on the shared counter.
     #[allow(clippy::too_many_lines)] // One request, read top to bottom.
     async fn dispatch_with(
         &self,

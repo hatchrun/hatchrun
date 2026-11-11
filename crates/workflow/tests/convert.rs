@@ -1612,6 +1612,7 @@ jobs:
     assert!(out.config.jobs.contains_key("ci-ok"), "{:?}", out.errors);
 }
 
+/// Pins that a job with an expression that does not parse is dropped with a note.
 #[test]
 fn a_job_with_a_bad_expression_is_dropped() {
     let out = ok(r"
@@ -1710,6 +1711,7 @@ fn a_converted_config_over_one_mebibyte_is_an_error() {
     );
 }
 
+/// Pins that the job environment converts into the plan.
 #[test]
 fn environment_carries_over() {
     let out = ok("
@@ -1741,6 +1743,7 @@ jobs:
     round_trips(&out);
 }
 
+/// Pins that run-name and its expressions convert into the plan.
 #[test]
 fn run_name_converts() {
     let out = ok("
@@ -1850,6 +1853,7 @@ jobs:
     assert!(!out.config.jobs.contains_key("ci-deploy"));
 }
 
+/// Pins that an environment expression that does not parse drops the job.
 #[test]
 fn an_environment_expression_that_does_not_parse_drops_the_job() {
     let out = convert(&[(
@@ -1931,6 +1935,7 @@ jobs:
     assert!(!out.config.jobs.contains_key("ci-deploy"));
 }
 
+/// Pins that a workflow left with no supported events is dropped.
 #[test]
 fn workflows_with_no_events_left_are_dropped() {
     let out = convert(&[
@@ -3253,6 +3258,7 @@ jobs:
     round_trips(&out);
 }
 
+/// Pins that `issues` and `issue_comment` without types take every type.
 #[test]
 fn issues_and_issue_comment_without_types_take_every_type() {
     for form in [

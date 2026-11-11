@@ -108,6 +108,7 @@ fn the_cap_leaves_out_the_runs_of_the_delivery_being_counted() {
     assert_eq!(count("d10"), 2);
 }
 
+/// Pins that the chat run cap counts only comment events of the same repository.
 #[test]
 fn the_cap_leaves_out_other_events_and_other_repositories() {
     let db = setup();

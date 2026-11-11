@@ -1198,6 +1198,7 @@ mod tests {
         assert!(i.actor_is_bot);
     }
 
+    /// Pins that issues actions which start no workflow parse as ignored.
     #[test]
     fn issue_actions_that_start_nothing_are_ignored() {
         let body = edited(ISSUES, |v| v["action"] = "review_requested".into());
@@ -1273,6 +1274,7 @@ mod tests {
         assert_eq!((c.body.as_str(), c.author_association.as_str()), ("", ""));
     }
 
+    /// Pins that edited and deleted comment actions are read and every other action is ignored.
     #[test]
     fn edited_and_deleted_comments_are_read_and_others_are_ignored() {
         for action in ["edited", "deleted"] {

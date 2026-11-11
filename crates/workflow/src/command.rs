@@ -547,6 +547,7 @@ mod tests {
         assert_eq!(names(&body), ["retest"]);
     }
 
+    /// Pins that every command argument error has a message that says what is wrong.
     #[test]
     fn errors_say_what_is_wrong() {
         for err in [

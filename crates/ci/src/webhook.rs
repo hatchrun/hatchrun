@@ -337,6 +337,7 @@ pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
     }
 }
 
+/// Handles one webhook delivery: drops duplicates, parses the event and starts the matching runs.
 async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Response> {
     let db = Db::connect(env).await?;
     if store::delivery_seen(&db, guid).await? {
@@ -713,6 +714,7 @@ impl Cx<'_> {
         })
     }
 
+    /// Plans and starts the workflows triggered by a push.
     async fn push(&self, push: &Push) -> Result<Outcome> {
         let trigger = Event::Push {
             r#ref: push.r#ref.clone(),

@@ -1080,6 +1080,7 @@ fn a_run_is_approved_only_while_its_pull_request_is_open_at_its_commit() {
     );
 }
 
+/// Pins that a delivery older than the recorded pull request is not applied.
 #[test]
 fn a_delivery_older_than_the_recorded_pull_request_does_not_apply() {
     let db = setup();
@@ -1195,6 +1196,7 @@ fn a_tie_write_leaves_a_row_a_newer_delivery_moved() {
     assert_eq!(head(&db), "D");
 }
 
+/// Pins that an end pinned to an old head does nothing once the recorded head has moved.
 #[test]
 fn a_pinned_end_skips_when_the_recorded_head_moved() {
     let db = setup();
@@ -1654,6 +1656,7 @@ fn a_pull_request_and_a_pull_request_target_run_of_one_workflow_both_exist() {
     assert!(db.wait(insert_run(db.db(), &target)).unwrap().is_none());
 }
 
+/// Pins that a comment approves every waiting run at the head and no run at another head.
 #[test]
 fn a_comment_approves_every_waiting_run_at_the_head_and_no_other() {
     let db = setup();
@@ -1778,6 +1781,7 @@ fn a_comment_approves_only_the_events_it_is_given() {
     );
 }
 
+/// Pins that a comment does not revive an ended run, or approve one after a push or a close.
 #[test]
 fn a_comment_never_revives_an_ended_run_or_approves_after_a_push_or_close() {
     let db = setup();

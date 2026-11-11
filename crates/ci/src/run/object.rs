@@ -1002,6 +1002,7 @@ impl<'a> Cx<'a> {
         .await
     }
 
+    /// Fires the pending chained workflows of a finished run as new runs in the same repository.
     async fn fire_chain(
         &self,
         info: &RunInfo,
