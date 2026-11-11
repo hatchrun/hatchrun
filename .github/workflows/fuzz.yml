@@ -1,0 +1,109 @@
+name: fuzz
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Prune the corpus, then fuzz it for longer than a PR allows.
+    - cron: "0 5 * * *"
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# Checkout and the code-change diff read contents. ClusterFuzzLite lists
+# and downloads the corpus from earlier runs' artifacts with the token,
+# which needs actions: read. Uploads use the runtime token.
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  # Every pull request and push gets a short run of every target, which
+  # split the fuzz-seconds between them. A crash fails the job and is
+  # uploaded as an artifact.
+  code-change:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: fuzz-code-change-${{ github.ref }}
+      # A newer push to a pull request replaces its run. Pushes to main
+      # each keep theirs, so every commit there gets a result.
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check fuzz lockfile matches the root one
+        run: python3 fuzz/check-lock.py
+
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: address
+
+      - name: Run fuzzers
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 300
+          mode: code-change
+          sanitizer: address
+
+  # Daily runs grow a corpus and keep it as a workflow artifact, so the
+  # next PR run starts from more than the seed inputs.
+  batch:
+    if: github.event.schedule == '0 6 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: address
+
+      - name: Run fuzzers
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 1800
+          mode: batch
+          sanitizer: address
+
+  # Batch fuzzing grows the corpus; pruning keeps it small without
+  # losing the coverage it buys.
+  prune:
+    if: github.event.schedule == '0 5 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: address
+
+      - name: Run fuzzers
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: prune
+          sanitizer: address

@@ -1,0 +1,1 @@
+--health-cmd 'pg_isready' --health-interval 2s --health-retries 30
