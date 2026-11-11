@@ -40,7 +40,7 @@ pub use self::billing::{
 pub use self::browse::{
     BranchAfter, BranchRow, NewPull, PullAfter, PullHead, PullRow, PullWrite, RepoCounts,
     WorkflowRow, branches_page, pull_head, pulls_page, repo_counts, upsert_pull,
-    upsert_pull_forced, workflows_page,
+    upsert_pull_forced, upsert_pull_if_tied, workflows_page,
 };
 pub use self::cache::{
     CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, drop_pending_cache_entry,
@@ -59,9 +59,10 @@ pub use self::environments::{
 };
 pub use self::forks::{
     admit_run, approve_at_head, approve_by_check, approve_run, clear_decided_mark, deferred_group,
-    deferred_runs, end_gate, end_pull_gates, expire_gates, fork_waiting, fork_waiting_beside,
-    mark_scanned, pending_gate_runs, pull_runs_at, put_repo_policy, reject_run, repo_policy,
-    runs_needing_card, set_card_dirty, set_gate_check, unfinished_decisions,
+    deferred_runs, end_gate, end_pull_gates, end_pull_gates_at_head, expire_gates, fork_waiting,
+    fork_waiting_beside, mark_scanned, pending_gate_runs, pull_runs_at, put_repo_policy,
+    reject_run, repo_policy, runs_needing_card, set_card_dirty, set_gate_check,
+    unfinished_decisions,
 };
 pub use self::installation::{
     LastRun, OrgRepo, RepoFilter, RepoVisibility, SetupRow, installation_synced, patch_enabled,

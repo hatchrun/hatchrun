@@ -150,6 +150,15 @@ const END_PULL: &str = "UPDATE ci_runs SET gate_status = 'cancelled', gate_by = 
      gate_card_dirty = (gate_check_run_id IS NOT NULL) WHERE repo_id = $1 AND pull_number = $2 AND gate_status IN ('pending', 'deferred') \
      AND ($3::text IS NULL OR COALESCE(head_sha, sha) <> $3::text) RETURNING {columns}";
 
+/// As [`END_PULL`] for sha `$3`, and only while the recorded pull
+/// request is open at that sha, in the same statement, so a newer head
+/// recorded meanwhile is not ended as superseded by an older one.
+const END_PULL_PINNED: &str = "UPDATE ci_runs SET gate_status = 'cancelled', gate_by = $4, gate_at = $5, \
+     gate_card_dirty = (gate_check_run_id IS NOT NULL) WHERE repo_id = $1 AND pull_number = $2 AND gate_status IN ('pending', 'deferred') \
+     AND COALESCE(head_sha, sha) <> $3::text \
+     AND EXISTS (SELECT 1 FROM ci_pulls p WHERE p.repo_id = $1 AND p.number = $2 \
+                 AND p.state = 'open' AND p.head_sha = $3::text) RETURNING {columns}";
+
 /// Expires up to `$3` runs that waited since before `$1`, at `$2`.
 const EXPIRE: &str = "UPDATE ci_runs SET gate_status = 'expired', gate_at = $2, \
        gate_card_dirty = (gate_check_run_id IS NOT NULL) WHERE id IN (\
@@ -532,6 +541,27 @@ pub async fn end_pull_gates(
     db.all(
         &with_columns(END_PULL, RUN_COLUMNS),
         &params![repo_id, number, keep_sha, "hatchrun", now],
+    )
+    .await
+}
+
+/// As [`end_pull_gates`] with `head` kept, and only while the recorded
+/// pull request is open at `head`. Nothing is ended, and the result is
+/// empty, when the row moved on.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn end_pull_gates_at_head(
+    db: &Db,
+    repo_id: u64,
+    number: u64,
+    head: &str,
+    now: u64,
+) -> Result<Vec<RunRow>> {
+    db.all(
+        &with_columns(END_PULL_PINNED, RUN_COLUMNS),
+        &params![repo_id, number, head, "hatchrun", now],
     )
     .await
 }

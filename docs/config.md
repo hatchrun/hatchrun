@@ -288,8 +288,8 @@ run exists. A commenter below the required permission gets no reply and
 no reaction. A command that starts runs gets an `eyes` reaction, and
 the run's end leaves the reaction of the `reaction` option.
 
-The control plane replies in the comment only to say why a command
-started nothing:
+The control plane replies in the comment only when a command started
+nothing or could not finish, and says why:
 
 - an argument error (too many words, a word that is too long, a bad
   `--sha=`);

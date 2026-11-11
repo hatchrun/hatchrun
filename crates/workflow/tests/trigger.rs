@@ -487,22 +487,26 @@ fn new_triggers_round_trip() {
     assert!(!written.contains("types"), "{written}");
 }
 
+/// Whether `event` triggers the workflow whose `on` is `on_yaml`.
 fn event_in(on_yaml: &str, event: &Event) -> bool {
     triggered(&on(on_yaml), event)
 }
 
+/// An `issues` event with `action`.
 fn issues(action: &str) -> Event {
     Event::Issues {
         action: action.into(),
     }
 }
 
+/// An `issue_comment` event with `action`.
 fn comment(action: &str) -> Event {
     Event::IssueComment {
         action: action.into(),
     }
 }
 
+/// A command event for `name`, on a pull request or not.
 fn command(name: &str, on_pull_request: bool) -> Event {
     Event::Command {
         name: name.into(),

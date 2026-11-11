@@ -88,6 +88,7 @@ pub enum ArgsError {
 }
 
 impl fmt::Display for ArgsError {
+    /// Says what is wrong with the arguments, for the reply to the comment.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ShortSha => f.write_str("`--sha=` needs the full 40 character commit sha"),
@@ -217,14 +218,17 @@ mod tests {
 
     const SHA: &str = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
 
+    /// Every command `body` holds, with `retest`, `deploy` and `ok` known.
     fn all(body: &str) -> Vec<Found> {
         parse_comment(body, |name| matches!(name, "retest" | "deploy" | "ok"))
     }
 
+    /// The names of the commands found in `body`.
     fn names(body: &str) -> Vec<String> {
         all(body).into_iter().map(|f| f.name).collect()
     }
 
+    /// The argument words of the first command found in `body`.
     fn words(body: &str) -> Vec<String> {
         all(body)[0].args.clone().unwrap().words
     }

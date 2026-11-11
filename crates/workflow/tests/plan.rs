@@ -2616,6 +2616,7 @@ workflows: { ci: { on: { push: {} }, jobs: [t] } }
     assert!(back.jobs[0].services.is_empty());
 }
 
+/// A config with one workflow whose `on` is `on`.
 fn on_yaml(on: &str) -> String {
     format!(
         "jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}\nworkflows:\n  ci:\n    on: {on}\n    jobs: [t]\n"

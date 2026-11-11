@@ -1132,6 +1132,94 @@ fn a_delivery_older_than_the_recorded_pull_request_does_not_apply() {
 }
 
 #[test]
+fn a_tie_write_leaves_a_row_a_newer_delivery_moved() {
+    let db = setup();
+    let mut pull = NewPull {
+        repo_id: 7,
+        number: 9,
+        title: "t".into(),
+        head_ref: "f".into(),
+        base_ref: "main".into(),
+        author: "mallory".into(),
+        author_association: "FIRST_TIMER".into(),
+        head_repo_id: Some(99),
+        head_sha: "B".into(),
+        state: "open".into(),
+        updated_at: 200,
+    };
+    let head = |db: &TestDb| -> String {
+        db.column(
+            "SELECT head_sha AS h FROM ci_pulls WHERE number = 9",
+            &[],
+            "h",
+        )
+        .unwrap()
+    };
+    db.wait(upsert_pull(db.db(), &pull)).unwrap();
+    pull.head_sha = "B2".into();
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &pull)).unwrap(),
+        PullWrite::Tied
+    );
+    // A newer delivery lands after the tie was found.
+    let mut newer = pull.clone();
+    newer.head_sha = "C".into();
+    newer.updated_at = 300;
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &newer)).unwrap(),
+        PullWrite::Applied
+    );
+    // The tie's write no longer applies, and the newer head stays.
+    assert!(!db.wait(upsert_pull_if_tied(db.db(), &pull)).unwrap());
+    assert_eq!(head(&db), "C");
+    // A row still at the tie's time takes it.
+    newer.head_sha = "D".into();
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &newer)).unwrap(),
+        PullWrite::Tied
+    );
+    assert!(db.wait(upsert_pull_if_tied(db.db(), &newer)).unwrap());
+    assert_eq!(head(&db), "D");
+}
+
+#[test]
+fn a_pinned_end_skips_when_the_recorded_head_moved() {
+    let db = setup();
+    let old = fork_run(&db, "o", 6, "old", "mallory", GateStatus::Pending, 1);
+    let new = fork_run(&db, "n", 6, "new", "mallory", GateStatus::Pending, 2);
+    // The row says `new`: an end pinned at `old` would cancel the newer
+    // run as superseded, and does nothing.
+    let ended = db
+        .wait(end_pull_gates_at_head(db.db(), 7, 6, "old", 9))
+        .unwrap();
+    assert_eq!(ended.len(), 0);
+    for id in [old.id, new.id] {
+        let gate: String = db
+            .column(
+                "SELECT gate_status AS g FROM ci_runs WHERE id = $1",
+                &params![id],
+                "g",
+            )
+            .unwrap();
+        assert_eq!(gate, "pending");
+    }
+    // Pinned at the recorded head, it ends the older run only.
+    let ended = db
+        .wait(end_pull_gates_at_head(db.db(), 7, 6, "new", 10))
+        .unwrap();
+    let ids: Vec<u64> = ended.iter().map(|run| run.id).collect();
+    assert_eq!(ids, [old.id]);
+    // A closed row ends nothing.
+    let third = fork_run(&db, "t", 6, "third", "mallory", GateStatus::Pending, 3);
+    db.run("UPDATE ci_pulls SET state = 'closed' WHERE number = 6", &[]);
+    let ended = db
+        .wait(end_pull_gates_at_head(db.db(), 7, 6, "new", 11))
+        .unwrap();
+    assert_eq!(ended.len(), 0);
+    let _ = third;
+}
+
+#[test]
 fn a_run_that_ends_while_it_waits_ends_its_gate_and_frees_its_slot() {
     let db = setup();
     let pending = fork_run(&db, "a", 1, "s1", "mallory", GateStatus::Pending, 1);

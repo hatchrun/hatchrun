@@ -69,6 +69,18 @@ const UPSERT_PULL_FORCED: &str = "INSERT INTO ci_pulls \
      author = $6, state = $7, updated_at = $8, author_association = $9, \
      head_repo_id = $10::bigint, head_sha = $11";
 
+/// As [`UPSERT_PULL_FORCED`], and only while the row still has the time
+/// `$8` the tie was found at, so a newer delivery that moved the row
+/// since is not overwritten.
+const UPSERT_PULL_TIED: &str = "INSERT INTO ci_pulls \
+     (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at, \
+      author_association, head_repo_id, head_sha) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10::bigint, $11) \
+     ON CONFLICT (repo_id, number) DO UPDATE SET title = $3, head_ref = $4, base_ref = $5, \
+     author = $6, state = $7, updated_at = $8, author_association = $9, \
+     head_repo_id = $10::bigint, head_sha = $11 \
+     WHERE ci_pulls.updated_at = $8";
+
 /// The time and head commit of pull request `$2` of repository `$1`.
 const PULL_STAMP: &str =
     "SELECT updated_at, head_sha FROM ci_pulls WHERE repo_id = $1 AND number = $2";
@@ -138,6 +150,18 @@ fn pull_params(pull: &NewPull) -> Vec<hatchrun_cloud::db::Param> {
 pub async fn upsert_pull_forced(db: &Db, pull: &NewPull) -> Result<()> {
     db.run(UPSERT_PULL_FORCED, &pull_params(pull)).await?;
     Ok(())
+}
+
+/// Records the pull request for a tie that GitHub's answer settled in
+/// favour of `pull`, only while the row still has the time of `pull`.
+/// `false` when the row moved since the tie: a newer delivery wrote it,
+/// and the row is left alone.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn upsert_pull_if_tied(db: &Db, pull: &NewPull) -> Result<bool> {
+    Ok(db.run(UPSERT_PULL_TIED, &pull_params(pull)).await? == 1)
 }
 
 /// Records the state of a pull request. A delivery older than what is

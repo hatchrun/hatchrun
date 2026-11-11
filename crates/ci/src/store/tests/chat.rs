@@ -25,6 +25,7 @@ fn comment_run(
     db.wait(insert_run(db.db(), &new)).unwrap().unwrap()
 }
 
+/// The active comment runs of issue `number` of repository 7 in the `none` set.
 fn active(db: &TestDb, number: u64) -> u64 {
     db.wait(active_comment_runs(db.db(), 7, number, "none"))
         .unwrap()

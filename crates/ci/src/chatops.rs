@@ -336,6 +336,7 @@ mod tests {
     const HEAD: &str = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
     const OTHER: &str = "ffffffffffffffffffffffffffffffffffffffff";
 
+    /// A pull request at [`HEAD`], from a fork or not.
     fn pull(fork: bool) -> PullInfo {
         PullInfo {
             head_sha: HEAD.to_owned(),
@@ -380,6 +381,7 @@ mod tests {
         );
     }
 
+    /// Command options with the given sha rule and the defaults otherwise.
     fn options(sha: ShaPolicy) -> CommandOptions {
         CommandOptions {
             sha,
@@ -387,10 +389,12 @@ mod tests {
         }
     }
 
+    /// The arguments of the one command in `line`.
     fn args(line: &str) -> Args {
         parse_comment(line, |_| true)[0].args.clone().unwrap()
     }
 
+    /// A run of the pull request at [`HEAD`] with the given gate, status, conclusion and creation time.
     fn run(gate: &str, status: &str, conclusion: Option<&str>, created_at: u64) -> RunRow {
         serde_json::from_value(json!({
             "id": 9, "run_number": 1, "run_attempt": 1, "tenant_id": "t1",
@@ -405,6 +409,7 @@ mod tests {
 
     const NOW: u64 = 10 * APPROVAL_EXPIRES_MS;
 
+    /// `run` as workflow `workflow` of `event`, with id `id`.
     fn named(mut run: RunRow, workflow: &str, event: &str, id: u64) -> RunRow {
         run.workflow = workflow.to_owned();
         run.event = event.to_owned();
@@ -412,10 +417,12 @@ mod tests {
         run
     }
 
+    /// `names` as owned strings.
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| (*n).to_owned()).collect()
     }
 
+    /// A decision that makes the named workflows again.
     fn decided(remake: &[&str]) -> Decision {
         Decision {
             remake: names(remake),

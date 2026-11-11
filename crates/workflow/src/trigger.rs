@@ -814,6 +814,7 @@ pub const ISSUES_TYPES: &[&str] = &[
 ];
 
 impl Default for IssuesTrigger {
+    /// Every type GitHub runs `issues` on.
     fn default() -> Self {
         Self {
             types: ISSUES_TYPES.iter().map(|t| (*t).to_owned()).collect(),
@@ -835,6 +836,7 @@ pub struct IssueCommentTrigger {
 pub const ISSUE_COMMENT_TYPES: &[&str] = &["created", "edited", "deleted"];
 
 impl Default for IssueCommentTrigger {
+    /// All three types GitHub runs `issue_comment` on.
     fn default() -> Self {
         Self {
             types: ISSUE_COMMENT_TYPES
@@ -934,6 +936,7 @@ pub struct CommandOptions {
 }
 
 impl Default for CommandOptions {
+    /// A `write` commenter, on pull requests, with an automatic sha rule and no arguments.
     fn default() -> Self {
         Self {
             permission: CommandPermission::Write,
@@ -1015,22 +1018,26 @@ impl Commands {
 }
 
 impl FromIterator<(String, CommandOptions)> for Commands {
+    /// Collects named options into the commands of a trigger.
     fn from_iter<T: IntoIterator<Item = (String, CommandOptions)>>(iter: T) -> Self {
         Self(iter.into_iter().collect())
     }
 }
 
 impl<'de> Deserialize<'de> for Commands {
+    /// Reads a name, a list of names or a map of names to options.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct CommandsVisitor;
 
         impl<'de> Visitor<'de> for CommandsVisitor {
             type Value = Commands;
 
+            /// Describes the shapes `on.command` takes, for error messages.
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a command name, a list of names or a map of names to options")
             }
 
+            /// One name, with the default options.
             fn visit_str<E: de::Error>(self, value: &str) -> Result<Commands, E> {
                 Ok(Commands(BTreeMap::from([(
                     value.to_owned(),
@@ -1038,6 +1045,7 @@ impl<'de> Deserialize<'de> for Commands {
                 )])))
             }
 
+            /// A list of names with the default options, each named once.
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Commands, A::Error> {
                 let mut commands = BTreeMap::new();
                 while let Some(name) = seq.next_element::<String>()? {
@@ -1053,6 +1061,7 @@ impl<'de> Deserialize<'de> for Commands {
                 Ok(Commands(commands))
             }
 
+            /// A map of names to options, each named once; an empty value takes the defaults.
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Commands, A::Error> {
                 let mut commands = BTreeMap::new();
                 while let Some(name) = map.next_key::<String>()? {
@@ -1074,6 +1083,7 @@ impl<'de> Deserialize<'de> for Commands {
 }
 
 impl Serialize for Commands {
+    /// Writes the commands as a map of names to options.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(self.0.len()))?;
         for (name, options) in &self.0 {

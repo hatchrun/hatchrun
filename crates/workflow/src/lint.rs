@@ -1415,6 +1415,7 @@ workflows:
         workflow_lints(&plan, &config.workflows["w"].on)
     }
 
+    /// The kinds of `found`, in order.
     fn kinds(found: &[Lint]) -> Vec<LintKind> {
         found.iter().map(|l| l.kind).collect()
     }
