@@ -3,6 +3,10 @@
 *.key
 
 /target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
 /dist
 /crates/broker/build
 /crates/broker/.wrangler

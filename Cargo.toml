@@ -4,6 +4,9 @@
 
 [workspace]
 members = ["crates/*"]
+# The fuzzers are their own workspace: they need nightly and cargo-fuzz,
+# which the rest of the build does not.
+exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]

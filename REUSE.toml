@@ -14,6 +14,7 @@ path = [
   ".github/**",
   ".gitignore",
   "Cargo.lock",
+  "fuzz/Cargo.lock",
   "crates/ci/r2-lifecycle.json",
   "crates/ci/testdata/*.json",
   "crates/ci/tests/e2e/*.json",
@@ -25,6 +26,12 @@ path = [
   "web/app/package-lock.json",
   "web/app/tsconfig.json",
 ]
+SPDX-FileCopyrightText = "Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+# Seed inputs for the fuzzers are data, not source.
+[[annotations]]
+path = ["fuzz/seeds/**"]
 SPDX-FileCopyrightText = "Copyright 2026 Gamunu Balagalla <gamunu.balagalla@gmail.com>"
 SPDX-License-Identifier = "AGPL-3.0-only"
 

@@ -7,13 +7,20 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+  # The fuzzers are their own workspace with their own lockfile. One
+  # entry for both keeps shared crates on the same version in one PR.
   - package-ecosystem: cargo
-    directory: /
+    directories: ["/", "/fuzz"]
     schedule:
       interval: weekly
     groups:
       cargo:
         patterns: ["*"]
+  # The ClusterFuzzLite base image, pinned by digest.
+  - package-ecosystem: docker
+    directory: /.clusterfuzzlite
+    schedule:
+      interval: weekly
   # The app in web/app. Releases younger than two weeks wait.
   - package-ecosystem: npm
     directory: /web/app
