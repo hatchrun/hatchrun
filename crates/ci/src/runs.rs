@@ -294,15 +294,20 @@ pub fn invalid_config_check_run(diagnostics: &[Diagnostic], sha: &str) -> CheckR
 }
 
 /// The failed check run of a workflow that did not compile, named
-/// `<workflow> / config`. The other workflows of the event still run.
+/// `<workflow> / config`, with the event or command suffix of
+/// [`crate::checks::check_name`] for an `issues` or `issue_comment` run
+/// or a chat command, so it never hides the pull request's own config
+/// failure. The other workflows of the event still run.
 #[must_use]
 pub fn invalid_workflow_check_run(
     workflow: &str,
     diagnostics: &[Diagnostic],
     sha: &str,
+    event_name: &str,
+    command: Option<&str>,
 ) -> CheckRun {
     failed_check_run(
-        &format!("{workflow} / config"),
+        &crate::checks::check_name(workflow, "config", event_name, command),
         "Invalid workflow",
         &format!("so workflow `{workflow}` did not start"),
         diagnostics,
@@ -589,11 +594,7 @@ pub async fn create(
     // The good workflows run first: a GitHub error on a failed
     // workflow's check run must not keep them from starting.
     for workflow in &failed {
-        let check = if req.event_name == "pull_request_target" {
-            invalid_target_check_run(&workflow.workflow, &workflow.diagnostics, report_sha(req))
-        } else {
-            invalid_workflow_check_run(&workflow.workflow, &workflow.diagnostics, report_sha(req))
-        };
+        let check = failed_workflow_check(req, workflow);
         if let Err(err) = report_once(tokens, settings, req, &check).await {
             worker::console_error!(
                 "{}: check run for the invalid workflow {}: {err}",
@@ -603,6 +604,25 @@ pub async fn create(
         }
     }
     Ok(ids)
+}
+
+/// The check run for a workflow of the request that did not compile.
+fn failed_workflow_check(req: &Request<'_>, workflow: &Failed) -> CheckRun {
+    if req.event_name == "pull_request_target" {
+        return invalid_target_check_run(
+            &workflow.workflow,
+            &workflow.diagnostics,
+            report_sha(req),
+        );
+    }
+    let command = req.origin.chat.and_then(|chat| chat.command.as_ref());
+    invalid_workflow_check_run(
+        &workflow.workflow,
+        &workflow.diagnostics,
+        report_sha(req),
+        req.event_name,
+        command.map(|command| command.name.as_str()),
+    )
 }
 
 /// For a fork pull request, moves the plans with a job on a runner
@@ -1195,7 +1215,7 @@ mod tests {
         let diagnostics = [Diagnostic::new(
             "job `t` has `runs-on: ubuntu-24.04`, which names no runner template",
         )];
-        let run = invalid_workflow_check_run("bad", &diagnostics, "abc");
+        let run = invalid_workflow_check_run("bad", &diagnostics, "abc", "pull_request", None);
         assert_eq!(run.name, "bad / config");
         assert_eq!(run.head_sha, "abc");
         assert_eq!(run.status, "completed");
@@ -1205,6 +1225,18 @@ mod tests {
         assert!(output.summary.contains("workflow `bad` did not start"));
         assert!(output.summary.contains("names no runner template"));
         assert_eq!(output.annotations.len(), 1);
+    }
+
+    #[test]
+    fn invalid_workflow_check_run_of_chat_events_has_a_suffix() {
+        let name =
+            |event, command| invalid_workflow_check_run("bad", &[], "abc", event, command).name;
+        assert_eq!(name("issue_comment", None), "bad / config (issue_comment)");
+        assert_eq!(name("issues", None), "bad / config (issues)");
+        assert_eq!(
+            name("issue_comment", Some("retest")),
+            "bad / config (/retest)"
+        );
     }
 
     fn plan_on(runs_on: &str, minutes: u32) -> Plan {
@@ -1282,7 +1314,10 @@ mod tests {
         assert_eq!(check.name, "w / pull_request_target");
         assert_eq!(check.head_sha, "headsha");
         assert_eq!(check.conclusion.as_deref(), Some("failure"));
-        assert_ne!(check.name, invalid_workflow_check_run("w", &[], "x").name);
+        assert_ne!(
+            check.name,
+            invalid_workflow_check_run("w", &[], "x", "pull_request", None).name
+        );
     }
 
     #[test]

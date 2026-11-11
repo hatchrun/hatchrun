@@ -1980,10 +1980,31 @@ impl Cx<'_> {
         // The pull request as it stands now: a push since the runs
         // were made supersedes what waits at older commits, and an
         // approval is only given while it is open at the run's commit.
-        let pr = pull_of_comment(comment, pull);
-        let record = pull_record(&pr);
-        if store::upsert_pull(self.db, &record).await? == store::PullWrite::Tied {
-            store::upsert_pull_forced(self.db, &record).await?;
+        let mut pr = pull_of_comment(comment, pull);
+        let mut record = pull_record(&pr);
+        let mut write = store::upsert_pull(self.db, &record).await?;
+        if write == store::PullWrite::Stale {
+            // Our snapshot is older than the row, so what it says of the
+            // head cannot decide which runs to cancel. Ask GitHub once
+            // more and go on only with a snapshot the row accepts.
+            let again = self.comment_pull(comment).await?;
+            if let Some(again) = again.as_ref().filter(|again| again.state == "open") {
+                pr = pull_of_comment(comment, again);
+                record = pull_record(&pr);
+                write = store::upsert_pull(self.db, &record).await?;
+            }
+        }
+        match write {
+            store::PullWrite::Applied => {}
+            store::PullWrite::Tied => store::upsert_pull_forced(self.db, &record).await?,
+            store::PullWrite::Stale => {
+                worker::console_warn!(
+                    "{}: /approve-run on #{} stopped, the pull request snapshot is stale",
+                    comment.repo.full_name,
+                    comment.number
+                );
+                return Ok(Vec::new());
+            }
         }
         self.end_waiting(&pr, Some(&head), fork::SUPERSEDED).await?;
         // Approving needs no config, so what waits is approved before
@@ -2253,6 +2274,7 @@ impl Cx<'_> {
         Ok(approved.iter().map(|run| run.id).collect())
     }
 
+    /// The workflow config at `sha` of `repo`, read from GitHub.
     async fn config_at(&self, installation_id: u64, repo: &Repo, sha: &str) -> Result<Config> {
         runs::read_config(
             self.tokens,

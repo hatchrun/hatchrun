@@ -381,6 +381,7 @@ pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
     lints(plan, &Rules::strict())
 }
 
+/// The findings in `plan` under `rules`.
 fn lints(plan: &Plan, rules: &Rules) -> Vec<Lint> {
     let mut found = Vec::new();
     // The jobs that read the head, by id, and why.
@@ -752,6 +753,8 @@ fn rate_checkout(inputs: &[(&str, &[&str])], rules: &Rules) -> Option<LintKind> 
         .then_some(LintKind::UnverifiedCheckout)
 }
 
+/// How the native checkout step's `ref` rates, if it is not provably the
+/// base.
 fn native_checkout(step: &CheckoutStep, rules: &Rules) -> Option<LintKind> {
     let text = step.r#ref.as_deref()?;
     rate_checkout(&[(text, &rules.base_refs)], rules)
@@ -761,6 +764,8 @@ fn is_action(step: &UsesStep, name: &str) -> bool {
     step.uses.to_ascii_lowercase().split('@').next() == Some(name)
 }
 
+/// How the `ref` and `repository` inputs of a checkout action rate, if
+/// they are not provably the base.
 fn action_checkout(step: &UsesStep, rules: &Rules) -> Option<LintKind> {
     let mut inputs: Vec<(&str, &[&str])> = Vec::new();
     for (name, allowed) in [

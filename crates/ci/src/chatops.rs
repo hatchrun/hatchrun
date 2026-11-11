@@ -156,6 +156,8 @@ enum Stage {
     Ended,
 }
 
+/// Where a run stands for a command: waiting for approval, settled, or
+/// ended. A run waiting past its approval deadline counts as ended.
 fn stage(run: &RunRow, now: u64) -> Stage {
     let completed = run.status == "completed";
     match run.gate_status {

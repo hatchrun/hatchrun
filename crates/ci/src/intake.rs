@@ -533,6 +533,7 @@ fn repository_dispatch(installation_id: u64, payload: Value) -> Result<Trigger, 
     }))
 }
 
+/// Reads an `issues` delivery. Actions that start nothing are ignored.
 fn issues(installation_id: u64, payload: Value) -> Result<Trigger, serde_json::Error> {
     let i = IssuesBody::deserialize(&payload)?;
     if !ISSUES_TYPES.contains(&i.action.as_str()) {
@@ -550,6 +551,8 @@ fn issues(installation_id: u64, payload: Value) -> Result<Trigger, serde_json::E
     }))
 }
 
+/// Reads an `issue_comment` delivery. Actions that start nothing are
+/// ignored.
 fn issue_comment(installation_id: u64, payload: Value) -> Result<Trigger, serde_json::Error> {
     let c = IssueCommentBody::deserialize(&payload)?;
     if !ISSUE_COMMENT_TYPES.contains(&c.action.as_str()) {

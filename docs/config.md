@@ -284,7 +284,9 @@ needs a checked job is covered by it), and on a `contains` match against
 
 `on.command` fixes both caveats. The control plane finds the command in a
 created comment, checks the commenter's repository permission before a
-run exists, and replies in the comment only for the sha prompts below.
+run exists. It replies in the comment only for a missing or stale sha
+prompt (below), an argument error, and an approval or remake failure. A
+commenter below the required permission gets no reply and no reaction.
 
 ```yaml
 workflows:

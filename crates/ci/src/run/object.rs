@@ -1028,6 +1028,8 @@ impl<'a> Cx<'a> {
             })
             .collect();
         for change in &changes {
+            // Stays ahead of `chain::fire`: a retry of this send reacts
+            // again, and GitHub answers a repeated reaction with 200.
             if let ("completed", Some(conclusion)) = (change.action, change.conclusion) {
                 self.react_to_command(&tokens, info, conclusion).await;
             }
