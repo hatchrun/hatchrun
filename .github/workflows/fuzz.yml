@@ -10,7 +10,12 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
-permissions: read-all
+# Checkout and the code-change diff read contents. ClusterFuzzLite lists
+# and downloads the corpus from earlier runs' artifacts with the token,
+# which needs actions: read. Uploads use the runtime token.
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   # Every pull request and push gets a short run of every target, which
