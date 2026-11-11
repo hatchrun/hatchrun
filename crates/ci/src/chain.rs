@@ -232,7 +232,7 @@ pub async fn fire(
                     actor: &info.actor,
                     head_ref: "",
                     base_ref: "",
-                    workflow: None,
+                    workflows: None,
                     origin: runs::Origin::own(&info.actor),
                 },
                 &config,
@@ -273,6 +273,8 @@ mod tests {
             concurrency: None,
             title: None,
             warnings: Vec::new(),
+            check_sha: None,
+            command: None,
         }
     }
 

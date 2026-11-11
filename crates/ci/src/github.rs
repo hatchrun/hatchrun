@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use hatchrun_cloud::http::{Request, Response, encode};
-use hatchrun_workflow::MAX_SOURCE;
+use hatchrun_workflow::{CommandPermission, MAX_SOURCE};
 use serde::{Deserialize, Serialize};
 
 /// Where a repository keeps its config.
@@ -226,6 +226,113 @@ pub fn pull_head_sha(response: &Response) -> Result<String, String> {
     decode::<Pull>(response, "pull request").map(|pull| pull.head.sha)
 }
 
+/// A pull request's head, as [`pull_info`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullInfo {
+    /// The head commit.
+    pub head_sha: String,
+    /// The head repository's id; `None` for a deleted fork.
+    pub head_repo_id: Option<u64>,
+    /// The head repository's `owner/name`; `None` for a deleted fork.
+    pub head_repo_name: Option<String>,
+    /// The base branch, as a short name.
+    pub base_ref: String,
+    /// Whether the head is in a repository other than the base (or in
+    /// one that is gone).
+    pub fork: bool,
+    /// `open`, `closed` or `merged`.
+    pub state: &'static str,
+    /// The head branch, as a short name.
+    pub head_ref: String,
+    /// The pull request's title.
+    pub title: String,
+    /// The login of the user who opened it; empty when GitHub has none.
+    pub author: String,
+    /// GitHub's `author_association` of that user; empty when absent.
+    pub author_association: String,
+    /// When GitHub last changed the pull request, in Unix milliseconds;
+    /// 0 when the answer has no time.
+    pub updated_at: u64,
+    /// The answer as GitHub gave it, the `pull_request` of a payload.
+    pub raw: serde_json::Value,
+}
+
+/// The head, base and state of the pull request [`pull_request`] read,
+/// `None` when GitHub has no such pull request.
+///
+/// # Errors
+///
+/// GitHub's answer when it is neither a pull request nor a `404`.
+pub fn pull_info(response: &Response) -> Result<Option<PullInfo>, String> {
+    #[derive(Deserialize)]
+    struct Pull {
+        head: Side,
+        base: Side,
+        #[serde(default)]
+        state: String,
+        #[serde(default)]
+        merged: bool,
+        #[serde(default)]
+        title: String,
+        user: Option<User>,
+        #[serde(default)]
+        author_association: String,
+        #[serde(default)]
+        updated_at: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct User {
+        login: String,
+    }
+    #[derive(Deserialize)]
+    struct Side {
+        #[serde(default)]
+        r#ref: String,
+        #[serde(default)]
+        sha: String,
+        repo: Option<SideRepo>,
+    }
+    #[derive(Deserialize)]
+    struct SideRepo {
+        id: u64,
+        #[serde(default)]
+        full_name: Option<String>,
+    }
+    if response.status == 404 {
+        return Ok(None);
+    }
+    let raw = decode::<serde_json::Value>(response, "pull request")?;
+    let pull = Pull::deserialize(&raw).map_err(|err| format!("pull request: {err}"))?;
+    let base_id = pull.base.repo.as_ref().map(|repo| repo.id);
+    let fork = match &pull.head.repo {
+        Some(head) => Some(head.id) != base_id,
+        None => true,
+    };
+    Ok(Some(PullInfo {
+        head_sha: pull.head.sha,
+        head_repo_id: pull.head.repo.as_ref().map(|repo| repo.id),
+        head_repo_name: pull.head.repo.and_then(|repo| repo.full_name),
+        base_ref: pull.base.r#ref,
+        fork,
+        state: if pull.merged {
+            "merged"
+        } else if pull.state == "closed" {
+            "closed"
+        } else {
+            "open"
+        },
+        head_ref: pull.head.r#ref,
+        title: pull.title,
+        author: pull.user.map_or_else(String::new, |user| user.login),
+        author_association: pull.author_association,
+        updated_at: pull
+            .updated_at
+            .and_then(|time| hatchrun_cloud::parse_rfc3339(&time))
+            .unwrap_or(0),
+        raw,
+    }))
+}
+
 /// The file names on one page of [`pull_files`].
 ///
 /// # Errors
@@ -349,6 +456,30 @@ pub fn installation_token(response: &Response) -> Result<String, String> {
         token: String,
     }
     decode::<Minted>(response, "installation token").map(|m| m.token)
+}
+
+/// The App itself, asked with the App's JWT.
+#[must_use]
+pub fn app(api: &str, app_jwt: &str) -> Request {
+    rest("GET", format!("{api}/app"), app_jwt)
+}
+
+/// The login GitHub gives the App's bot user, `<slug>[bot]`, from the
+/// answer to [`app`]. It is the `sender.login` of what the App does.
+///
+/// # Errors
+///
+/// GitHub's answer when it names no slug.
+pub fn bot_login(response: &Response) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct App {
+        slug: String,
+    }
+    let app: App = decode(response, "app")?;
+    if app.slug.is_empty() {
+        return Err("app: GitHub gave no slug".to_owned());
+    }
+    Ok(format!("{}[bot]", app.slug))
 }
 
 /// Revokes the installation token it is sent with.
@@ -633,6 +764,70 @@ pub fn can_write(response: &Response) -> Result<bool, String> {
         found.permission.as_str()
     };
     Ok(matches!(level, "write" | "maintain" | "admin"))
+}
+
+/// What `user` holds on a repository, from the answer of
+/// [`collaborator_permission`]: the repository role, `None` for a user
+/// with no access (`404`, or the role `none`).
+///
+/// GitHub's `role_name` carries `triage` and `maintain`, which the legacy
+/// `permission` field folds into `read` and `write`, so a role name of
+/// the five is read first. A custom role has another name, and the
+/// legacy field gives the base permission it was built on.
+///
+/// # Errors
+///
+/// GitHub's answer when it is neither a permission nor a `404`.
+pub fn collaborator_role(response: &Response) -> Result<Option<CommandPermission>, String> {
+    #[derive(Deserialize)]
+    struct Permission {
+        #[serde(default)]
+        permission: String,
+        #[serde(default)]
+        role_name: String,
+    }
+    if response.status == 404 {
+        return Ok(None);
+    }
+    let found = decode::<Permission>(response, "collaborator permission")?;
+    let named = |word: &str| match word {
+        "read" => Some(CommandPermission::Read),
+        "triage" => Some(CommandPermission::Triage),
+        "write" => Some(CommandPermission::Write),
+        "maintain" => Some(CommandPermission::Maintain),
+        "admin" => Some(CommandPermission::Admin),
+        _ => None,
+    };
+    Ok(named(&found.role_name).or_else(|| named(&found.permission)))
+}
+
+/// Posts `body` as a comment on issue or pull request `number`.
+#[must_use]
+pub fn create_comment(api: &str, repo: &str, number: u64, token: &str, body: &str) -> Request {
+    json_body(
+        rest(
+            "POST",
+            format!("{api}/repos/{repo}/issues/{number}/comments"),
+            token,
+        ),
+        &serde_json::json!({ "body": body }),
+    )
+}
+
+/// Reacts to comment `comment_id` with `content` (`eyes`, `+1`, `-1`,
+/// `rocket`, `confused`). It needs `Issues: write` on the repository for
+/// comments on issues and on pull requests alike. GitHub answers 201 for
+/// a new reaction and 200 for one the App already left.
+#[must_use]
+pub fn add_reaction(api: &str, repo: &str, comment_id: u64, token: &str, content: &str) -> Request {
+    json_body(
+        rest(
+            "POST",
+            format!("{api}/repos/{repo}/issues/comments/{comment_id}/reactions"),
+            token,
+        ),
+        &serde_json::json!({ "content": content }),
+    )
 }
 
 /// A repository as a signed-in user sees it.
@@ -982,6 +1177,18 @@ mod tests {
             headers: Vec::new(),
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn the_apps_bot_login_is_its_slug_with_bot() {
+        let request = app("https://api.github.com", "jwt");
+        assert_eq!(request.url, "https://api.github.com/app");
+        assert_eq!(
+            bot_login(&answered(200, r#"{"id":1,"slug":"hatchrun"}"#)).unwrap(),
+            "hatchrun[bot]"
+        );
+        assert!(bot_login(&answered(200, r#"{"slug":""}"#)).is_err());
+        assert!(bot_login(&answered(401, "{}")).is_err());
     }
 
     #[test]
@@ -1386,6 +1593,91 @@ mod tests {
         };
         assert_eq!(permissions(&answer(404, &[], "{}")), none);
         assert_eq!(permissions(&answer(200, &[], "nope")), none);
+    }
+
+    #[test]
+    fn the_collaborator_role_is_the_most_specific_name_github_gives() {
+        let role = |status: u16, body: &str| collaborator_role(&answered(status, body));
+        let held = |permission: &str, role_name: &str| {
+            role(
+                200,
+                &format!(r#"{{"permission":"{permission}","role_name":"{role_name}"}}"#),
+            )
+        };
+        assert_eq!(held("admin", "admin"), Ok(Some(CommandPermission::Admin)));
+        // The legacy field folds maintain into write and triage into read.
+        assert_eq!(
+            held("write", "maintain"),
+            Ok(Some(CommandPermission::Maintain))
+        );
+        assert_eq!(held("read", "triage"), Ok(Some(CommandPermission::Triage)));
+        assert_eq!(held("write", "write"), Ok(Some(CommandPermission::Write)));
+        assert_eq!(held("read", "read"), Ok(Some(CommandPermission::Read)));
+        // A custom role has the base permission it was built on.
+        assert_eq!(
+            held("write", "deployer"),
+            Ok(Some(CommandPermission::Write))
+        );
+        assert_eq!(held("read", "auditor"), Ok(Some(CommandPermission::Read)));
+        assert_eq!(held("none", "none"), Ok(None));
+        assert_eq!(
+            role(200, r#"{"permission":"admin"}"#),
+            Ok(Some(CommandPermission::Admin))
+        );
+        assert_eq!(role(404, "{}"), Ok(None));
+        assert!(role(500, "boom").is_err());
+    }
+
+    #[test]
+    fn a_comment_and_a_reaction_are_posted_to_the_issue_endpoints() {
+        let comment = create_comment("https://api.github.com", "octo/widgets", 7, "tok", "hi");
+        assert_eq!(comment.method, "POST");
+        assert_eq!(
+            comment.url,
+            "https://api.github.com/repos/octo/widgets/issues/7/comments"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&comment.body).unwrap();
+        assert_eq!(body["body"], "hi");
+        let reaction = add_reaction("https://api.github.com", "octo/widgets", 9001, "tok", "+1");
+        assert_eq!(reaction.method, "POST");
+        assert_eq!(
+            reaction.url,
+            "https://api.github.com/repos/octo/widgets/issues/comments/9001/reactions"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&reaction.body).unwrap();
+        assert_eq!(body["content"], "+1");
+    }
+
+    #[test]
+    fn a_pull_request_says_where_its_head_is() {
+        let pull = |head_repo: &str, state: &str, merged: bool| {
+            pull_info(&answered(
+                200,
+                &format!(
+                    r#"{{"state":"{state}","merged":{merged},
+                    "head":{{"ref":"f","sha":"aaa","repo":{head_repo}}},
+                    "base":{{"ref":"main","sha":"bbb","repo":{{"id":4242,"full_name":"octo/widgets"}}}}}}"#
+                ),
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        let own = pull(r#"{"id":4242,"full_name":"octo/widgets"}"#, "open", false);
+        assert!(!own.fork);
+        assert_eq!(own.head_sha, "aaa");
+        assert_eq!(own.base_ref, "main");
+        assert_eq!(own.state, "open");
+        let fork = pull(r#"{"id":9,"full_name":"mallory/widgets"}"#, "closed", true);
+        assert!(fork.fork);
+        assert_eq!(fork.head_repo_id, Some(9));
+        assert_eq!(fork.head_repo_name.as_deref(), Some("mallory/widgets"));
+        assert_eq!(fork.state, "merged");
+        let gone = pull("null", "closed", false);
+        assert!(gone.fork);
+        assert_eq!(gone.head_repo_id, None);
+        assert_eq!(gone.state, "closed");
+        assert_eq!(pull_info(&answered(404, "{}")), Ok(None));
+        assert!(pull_info(&answered(500, "boom")).is_err());
     }
 
     #[test]

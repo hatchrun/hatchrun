@@ -4,7 +4,10 @@
 
 //! Trigger matching with GitHub filter rules.
 
-use hatchrun_workflow::{Event, Filter, RELEASE_TYPES, Triggers, triggered};
+use hatchrun_workflow::{
+    CommandOptions, CommandPermission, CommandPlace, CommandReaction, Event, Filter, ISSUES_TYPES,
+    RELEASE_TYPES, ShaPolicy, Triggers, triggered,
+};
 
 fn f(patterns: &[&str]) -> Filter {
     Filter::new(patterns.iter().map(|p| (*p).to_owned()).collect())
@@ -482,4 +485,149 @@ fn new_triggers_round_trip() {
     // The default type is left out when written.
     let written = serde_saphyr::to_string(&on("workflow_run: { workflows: [ci] }")).unwrap();
     assert!(!written.contains("types"), "{written}");
+}
+
+/// Whether `event` triggers the workflow whose `on` is `on_yaml`.
+fn event_in(on_yaml: &str, event: &Event) -> bool {
+    triggered(&on(on_yaml), event)
+}
+
+/// An `issues` event with `action`.
+fn issues(action: &str) -> Event {
+    Event::Issues {
+        action: action.into(),
+    }
+}
+
+/// An `issue_comment` event with `action`.
+fn comment(action: &str) -> Event {
+    Event::IssueComment {
+        action: action.into(),
+    }
+}
+
+/// A command event for `name`, on a pull request or not.
+fn command(name: &str, on_pull_request: bool) -> Event {
+    Event::Command {
+        name: name.into(),
+        on_pull_request,
+    }
+}
+
+/// Pins that issues without types default to every type GitHub runs on.
+#[test]
+fn issues_default_to_every_type_github_runs_on() {
+    let t = on("issues: {}");
+    for action in ISSUES_TYPES {
+        assert!(triggered(&t, &issues(action)), "{action}");
+    }
+    assert_eq!(ISSUES_TYPES.len(), 20);
+    assert!(!triggered(&t, &issues("bogus")));
+    assert!(!triggered(&t, &comment("created")));
+    // A bare key means the same.
+    assert!(event_in("issues:", &issues("opened")));
+    let t = on("issues: { types: [opened, labeled] }");
+    assert!(triggered(&t, &issues("labeled")));
+    assert!(!triggered(&t, &issues("closed")));
+    assert!(event_in("issues: { types: closed }", &issues("closed")));
+}
+
+/// Pins that `issue_comment` without types defaults to created, edited and deleted.
+#[test]
+fn issue_comment_defaults_to_all_three_types() {
+    let t = on("issue_comment: {}");
+    for action in ["created", "edited", "deleted"] {
+        assert!(triggered(&t, &comment(action)), "{action}");
+    }
+    assert!(!triggered(&t, &comment("pinned")));
+    assert!(!triggered(&t, &issues("opened")));
+    let t = on("issue_comment: { types: [created] }");
+    assert!(triggered(&t, &comment("created")));
+    assert!(!triggered(&t, &comment("edited")));
+}
+
+#[test]
+fn a_command_matches_its_name_and_place() {
+    let t = on("command: retest");
+    assert!(triggered(&t, &command("retest", true)));
+    assert!(!triggered(&t, &command("retest", false)));
+    assert!(!triggered(&t, &command("deploy", true)));
+    let t = on("command: [retest, deploy]");
+    assert!(triggered(&t, &command("deploy", true)));
+    let t = on("command: { triage: { in: [issue] }, both: { in: [pull_request, issue] } }");
+    assert!(triggered(&t, &command("triage", false)));
+    assert!(!triggered(&t, &command("triage", true)));
+    assert!(triggered(&t, &command("both", true)));
+    assert!(triggered(&t, &command("both", false)));
+    // A command does not make the workflow an issue_comment workflow.
+    assert!(!triggered(&t, &comment("created")));
+    assert!(!triggered(
+        &on("issue_comment: {}"),
+        &command("retest", true)
+    ));
+}
+
+/// Pins the command option defaults and the lookup of options by command name.
+#[test]
+fn command_options_default_and_are_looked_up_by_name() {
+    let t = on(
+        "command: { retest: {}, deploy: { permission: maintain, in: [issue, pull_request], sha: required, args: [environment], reaction: rocket } }",
+    );
+    let retest = t.command_options("retest").unwrap();
+    assert_eq!(retest, &CommandOptions::default());
+    assert_eq!(retest.permission, CommandPermission::Write);
+    assert_eq!(retest.places, [CommandPlace::PullRequest]);
+    assert_eq!(retest.sha, ShaPolicy::Auto);
+    assert_eq!(retest.reaction, CommandReaction::Default);
+    let deploy = t.command_options("deploy").unwrap();
+    assert_eq!(deploy.permission, CommandPermission::Maintain);
+    assert_eq!(deploy.args, ["environment"]);
+    assert_eq!(deploy.reaction, CommandReaction::Rocket);
+    assert!(deploy.allows(true) && deploy.allows(false));
+    assert!(!retest.allows(false));
+    assert!(t.command_options("other").is_none());
+    assert!(on("push: {}").command_options("retest").is_none());
+    // The shorthands take the defaults.
+    assert_eq!(
+        on("command: retest").command_options("retest"),
+        Some(&CommandOptions::default())
+    );
+    assert_eq!(
+        on("command: [a, b]").command_options("b"),
+        Some(&CommandOptions::default())
+    );
+}
+
+#[test]
+fn the_sha_rule_follows_the_policy_and_the_fork() {
+    let rule = |sha: ShaPolicy, fork: bool| {
+        CommandOptions {
+            sha,
+            ..CommandOptions::default()
+        }
+        .sha_required(fork)
+    };
+    assert!(rule(ShaPolicy::Auto, true));
+    assert!(!rule(ShaPolicy::Auto, false));
+    assert!(rule(ShaPolicy::Required, false));
+    assert!(rule(ShaPolicy::Required, true));
+    assert!(!rule(ShaPolicy::Optional, true));
+}
+
+/// Pins that command permissions order like GitHub roles and default to write.
+#[test]
+fn permissions_order_like_github_roles() {
+    use CommandPermission::*;
+    assert!(Read < Triage && Triage < Write && Write < Maintain && Maintain < Admin);
+    assert_eq!(Maintain.as_str(), "maintain");
+    assert_eq!(CommandPermission::default(), Write);
+}
+
+#[test]
+fn commands_round_trip_through_yaml() {
+    let t = on(
+        "command: { deploy: { permission: admin, in: [issue], sha: optional, args: [env], reaction: rocket }, retest: {} }",
+    );
+    let yaml = serde_saphyr::to_string(&t).unwrap();
+    assert_eq!(on(&yaml), t, "{yaml}");
 }

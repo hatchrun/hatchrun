@@ -5,9 +5,10 @@
 //! Warnings about workflows that run attacker-influenced input with the
 //! base repository's secrets.
 //!
-//! A `pull_request_target` workflow runs trusted (secrets, a write
-//! token) on an event that anyone can cause. Two mistakes turn that into
-//! remote code execution, and both are found by reading the plan:
+//! A `pull_request_target`, `issues`, `issue_comment` or `on.command`
+//! workflow runs trusted (secrets, a write token) on an event that
+//! anyone can cause. Two mistakes turn that into remote code execution,
+//! and both are found by reading the plan:
 //!
 //! - [`LintKind::HeadCheckout`]: the workflow gets the pull request's
 //!   head (the fork's code) onto the runner and runs it. A job is
@@ -28,6 +29,21 @@
 //! - [`LintKind::ScriptInjection`]: a field the pull request's author
 //!   writes (title, body, branch name) is interpolated with `${{ }}`
 //!   straight into a `run:` script, where the shell reads it as code.
+//!   The text of an issue or comment and the line and arguments of a
+//!   command are such fields.
+//!
+//! Two more are about who may start an `issue_comment` workflow, and
+//! are found in the plan's `if:` expressions:
+//!
+//! - [`LintKind::UnguardedComment`]: a job that nothing in its `if:`
+//!   (or the `if:` of a job it needs) ties to the commenter.
+//! - [`LintKind::BodyContains`]: an `if:` that finds a command in the
+//!   comment with `contains`, which matches a quote and a code block.
+//!
+//! A command's checkout of `github.event.command.pull_request.head_sha`
+//! is the one head read that is accepted, when every command of the
+//! workflow needs `write` or higher: the commenter named the sha and
+//! the control plane compared it with the pull request's head.
 //!
 //! Expressions are read from their parse, so `github.event.x`,
 //! `github['event']['x']` and `GitHub.Event.X` are the same read, a
@@ -44,8 +60,9 @@
 use serde_json::Value;
 
 use crate::config::{CheckoutStep, UsesStep};
-use crate::expr::reads;
+use crate::expr::{reads, reads_expression};
 use crate::plan::{Plan, PlannedJob, PlannedStep};
+use crate::trigger::{CommandPermission, ShaPolicy};
 
 /// What a lint found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +74,11 @@ pub enum LintKind {
     UnverifiedCheckout,
     /// An untrusted event field is interpolated into a `run:` script.
     ScriptInjection,
+    /// A job of an `issue_comment` workflow that nothing ties to who
+    /// commented.
+    UnguardedComment,
+    /// An `if:` that finds a command in the comment with `contains`.
+    BodyContains,
 }
 
 impl LintKind {
@@ -76,7 +98,8 @@ pub struct Lint {
     pub workflow: String,
     /// The planned job's id.
     pub job: String,
-    /// The step's position in the job, from 1.
+    /// The step's position in the job, from 1; 0 for a finding about the
+    /// job as a whole.
     pub step: usize,
     /// What is wrong and how to fix it, in one sentence or two.
     pub message: String,
@@ -86,6 +109,12 @@ impl Lint {
     /// The finding as one line that names its place.
     #[must_use]
     pub fn text(&self) -> String {
+        if self.step == 0 {
+            return format!(
+                "workflow `{}`, job `{}`: {}",
+                self.workflow, self.job, self.message
+            );
+        }
         format!(
             "workflow `{}`, job `{}`, step {}: {}",
             self.workflow, self.job, self.step, self.message
@@ -95,14 +124,15 @@ impl Lint {
 
 /// The text of the head checkout finding. The head checkout is what the
 /// repository setting `pull_request_target_head_checkout` blocks.
-const HEAD_CHECKOUT: &str = "checks out the pull request head in a pull_request_target workflow, \
-     so the code of the pull request runs with the base repository's secrets and write token; \
+const HEAD_CHECKOUT: &str = "checks out the pull request head in a workflow that runs with the base \
+     repository's secrets (pull_request_target, issues, issue_comment or on.command), \
+     so the code of the pull request runs with them and the write token; \
      check out the base and run the pull request's code in a pull_request workflow instead";
 
 /// The text of the unverified checkout finding.
 const UNVERIFIED_CHECKOUT: &str = "checks out a ref or repository that is an expression not \
-     provably the base branch, so in a pull_request_target workflow it may be the pull request \
-     head, which runs the author's code with the base repository's secrets and write token; \
+     provably the base branch, so in a workflow that runs with the base repository's secrets it \
+     may be the pull request head, which runs the author's code with them and the write token; \
      use `github.sha`, `github.base_ref` or a literal";
 
 /// Paths of an event that the author of an issue, comment or pull
@@ -116,6 +146,9 @@ const UNTRUSTED: &[&str] = &[
     "github.event.pull_request.head.label",
     "github.event.pull_request.head.repo.default_branch",
     "github.event.comment.body",
+    "github.event.command.line",
+    "github.event.command.args",
+    "github.event.command.named",
     "github.event.review.body",
     "github.event.review_comment.body",
     "github.event.pages",
@@ -135,7 +168,13 @@ const HEAD_PATHS: &[&str] = &[
     "github.event.pull_request.head",
     "github.event.pull_request.merge_commit_sha",
     "github.head_ref",
+    COMMAND_HEAD_SHA,
+    "github.event.command.pull_request.head_repo",
 ];
+
+/// The head sha the commenter named, which the control plane compared
+/// with the pull request's head before the run was made.
+const COMMAND_HEAD_SHA: &str = "github.event.command.pull_request.head_sha";
 
 /// Paths a `ref` input may read and still be the base.
 const BASE_REFS: &[&str] = &[
@@ -164,25 +203,191 @@ const GIT_FETCHERS: &[&str] = &[
     "restore",
 ];
 
+/// What a workflow's events make of the paths it reads.
+struct Rules {
+    /// Paths that name the pull request head.
+    head: Vec<&'static str>,
+    /// Paths a `ref` input may read and still be the base.
+    base_refs: Vec<&'static str>,
+}
+
+impl Rules {
+    /// The rules for a workflow whose event is not known: the commenter's
+    /// sha pin counts as a head.
+    fn strict() -> Self {
+        Self {
+            head: HEAD_PATHS.to_vec(),
+            base_refs: BASE_REFS.to_vec(),
+        }
+    }
+
+    /// The rules for the workflow with triggers `on`. A command's sha pin
+    /// is accepted when every command of the workflow needs `write` or
+    /// higher and has a sha rule of `required` or `auto`: with
+    /// `optional` the sha can be left out, and then the run is on the
+    /// head the pull request has when the command is read.
+    fn for_triggers(on: &crate::Triggers) -> Self {
+        let mut rules = Self::strict();
+        let pinned = on.command.as_ref().is_some_and(|commands| {
+            !commands.is_empty()
+                && commands.iter().all(|(_, options)| {
+                    options.permission >= CommandPermission::Write
+                        && options.sha != ShaPolicy::Optional
+                })
+        });
+        if pinned {
+            rules.head.retain(|path| *path != COMMAND_HEAD_SHA);
+            rules.base_refs.push(COMMAND_HEAD_SHA);
+        }
+        rules
+    }
+}
+
 /// Whether `on` names an event this module warns about: the workflows
 /// that run attacker-influenced events with the base repository's
-/// secrets.
+/// secrets (`pull_request_target`, `issues`, `issue_comment` and
+/// `command`).
 #[must_use]
 pub fn guarded(on: &crate::Triggers) -> bool {
     on.pull_request_target.is_some()
+        || on.issues.is_some()
+        || on.issue_comment.is_some()
+        || on.command.is_some()
 }
 
-/// The findings in the jobs of `plan`, in job and step order. The
-/// caller decides whether the plan's event is one to warn about (see
-/// [`guarded`]). Commands and called workflows are already expanded in a
-/// plan, so their steps are read too.
+/// The findings in the jobs of `plan`, which is the plan of a workflow
+/// with triggers `on`: those of [`plan_lints`], and for an
+/// `issue_comment` workflow the findings about who may start it. A
+/// command's checkout of its pinned head sha is accepted when every
+/// command of `on` needs `write` or higher and has a sha rule of
+/// `required` or `auto`. The caller decides whether
+/// the workflow is one to warn about (see [`guarded`]).
+#[must_use]
+pub fn workflow_lints(plan: &Plan, on: &crate::Triggers) -> Vec<Lint> {
+    let mut found = lints(plan, &Rules::for_triggers(on));
+    if on.issue_comment.is_some() {
+        found.extend(comment_lints(plan));
+    }
+    found
+}
+
+/// The findings about who may start an `issue_comment` workflow: jobs
+/// whose `if:` does not look at the commenter, and `if:` expressions
+/// that find a command with `contains`.
+fn comment_lints(plan: &Plan) -> Vec<Lint> {
+    let mut found = Vec::new();
+    // The jobs that something ties to the commenter, by id.
+    let mut checked: Vec<&str> = Vec::new();
+    for job in &plan.jobs {
+        // A job that needs a checked job does not run when that one is
+        // skipped.
+        let ties = job.if_.as_deref().is_some_and(checks_commenter)
+            || job.requires.iter().any(|id| checked.contains(&id.as_str()));
+        if ties {
+            checked.push(&job.id);
+        } else {
+            found.push(at(
+                plan,
+                job,
+                0,
+                LintKind::UnguardedComment,
+                UNGUARDED_COMMENT,
+            ));
+        }
+        for (step, cond) in conditions(job) {
+            if searches_comment_body(&cond) {
+                found.push(at(plan, job, step, LintKind::BodyContains, BODY_CONTAINS));
+            }
+        }
+    }
+    found
+}
+
+/// The text of the unguarded comment finding.
+const UNGUARDED_COMMENT: &str = "runs on issue_comment and no `if:` of it or of a job it needs \
+     checks who commented (`author_association`, `github.actor` or a permission), so anyone who \
+     can comment can run it with the base repository's secrets; check the commenter, or use \
+     `on.command`, which checks the repository permission before the run exists";
+
+/// The text of the `contains` finding.
+const BODY_CONTAINS: &str = "finds a command with `contains` on the comment text, which also \
+     matches a quote of an earlier comment and text in a code block; use \
+     `startsWith(github.event.comment.body, '/name')` or `on.command`";
+
+/// Whether an `if:` looks at who commented: it names `author_association`,
+/// an actor or a permission.
+fn checks_commenter(cond: &str) -> bool {
+    let lower = cond.to_ascii_lowercase();
+    ["author_association", "actor", "permission"]
+        .iter()
+        .any(|word| lower.contains(word))
+}
+
+/// The `if:` of a job and of its steps, with the step's position in the
+/// job from 1, and 0 for the job's own.
+fn conditions(job: &PlannedJob) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    if let Some(cond) = &job.if_ {
+        out.push((0, cond.clone()));
+    }
+    let Ok(Value::Object(fields)) = serde_json::to_value(job) else {
+        return out;
+    };
+    // A step is `{ "<kind>": { fields } }`.
+    for (i, step) in fields
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let cond = step
+            .as_object()
+            .into_iter()
+            .flat_map(|kinds| kinds.values())
+            .find_map(|inner| inner.get("if")?.as_str());
+        if let Some(cond) = cond {
+            out.push((i + 1, cond.to_owned()));
+        }
+    }
+    out
+}
+
+/// Whether an `if:` calls `contains` on the comment's text.
+fn searches_comment_body(cond: &str) -> bool {
+    const BODY: &str = "github.event.comment.body";
+    let found = if cond.contains("${{") {
+        reads(cond)
+    } else {
+        reads_expression(cond).map(|one| vec![one])
+    };
+    let Ok(list) = found else {
+        let flat = squashed(cond);
+        return flat.contains("contains(") && flat.contains(BODY);
+    };
+    list.iter()
+        .any(|read| read.searched.iter().any(|path| touches(path, BODY)))
+}
+
+/// The findings in the jobs of `plan`, in job and step order, whatever
+/// its event: a sha a command pins counts as a head here, and nothing is
+/// said about who may start the workflow (see [`workflow_lints`], which
+/// reads the workflow's triggers too). The caller decides whether the
+/// plan's event is one to warn about (see [`guarded`]). Commands and
+/// called workflows are already expanded in a plan, so their steps are
+/// read too.
 #[must_use]
 pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
+    lints(plan, &Rules::strict())
+}
+
+/// The findings in `plan` under `rules`.
+fn lints(plan: &Plan, rules: &Rules) -> Vec<Lint> {
     let mut found = Vec::new();
     // The jobs that read the head, by id, and why.
     let mut tainted_jobs: Vec<(&str, String)> = Vec::new();
     for job in &plan.jobs {
-        let taint = job_taint(job).or_else(|| {
+        let taint = job_taint(job, rules).or_else(|| {
             // A job that reads what a tainted job it needs produced.
             let from = job
                 .requires
@@ -197,16 +402,19 @@ pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
             taint.as_ref().map(|reason| {
                 format!(
                     "{what} in a job that reads the pull request head ({reason}) in a \
-                     pull_request_target workflow, so the code of the pull request can run with \
-                     the base repository's secrets and write token; keep the head out of this job \
-                     and run the pull request's code in a pull_request workflow instead"
+                     workflow that runs with the base repository's secrets, so the code of the \
+                     pull request can run with them and the write token; keep the head out of \
+                     this job and run the pull request's code in a pull_request workflow instead"
                 )
             })
         };
         for (i, step) in job.steps.iter().enumerate() {
             let (kind, message) = match step {
                 PlannedStep::Checkout(native) => {
-                    match checkout_finding(native_checkout(native), tainted("checks out code")) {
+                    match checkout_finding(
+                        native_checkout(native, rules),
+                        tainted("checks out code"),
+                    ) {
                         Some(hit) => hit,
                         None => continue,
                     }
@@ -222,7 +430,10 @@ pub fn plan_lints(plan: &Plan) -> Vec<Lint> {
                         ));
                     }
                     if is_action(uses, "actions/checkout") {
-                        match checkout_finding(action_checkout(uses), tainted("checks out code")) {
+                        match checkout_finding(
+                            action_checkout(uses, rules),
+                            tainted("checks out code"),
+                        ) {
                             Some(hit) => hit,
                             None => continue,
                         }
@@ -278,6 +489,17 @@ fn lint(plan: &Plan, job: &PlannedJob, step: usize, kind: LintKind, message: Str
         job: job.id.clone(),
         step: step + 1,
         message,
+    }
+}
+
+/// A finding at `step` of `job`, counted from 1, or 0 for the job.
+fn at(plan: &Plan, job: &PlannedJob, step: usize, kind: LintKind, message: &str) -> Lint {
+    Lint {
+        kind,
+        workflow: plan.workflow.clone(),
+        job: job.id.clone(),
+        step,
+        message: message.to_owned(),
     }
 }
 
@@ -337,7 +559,7 @@ fn squashed(text: &str) -> String {
 /// What reading `text` says about the pull request head, `None` when it
 /// says nothing: the path it reads, or the ref it names. Text with an
 /// expression that does not parse counts as reading it.
-fn head_read(text: &str) -> Option<String> {
+fn head_read(text: &str, rules: &Rules) -> Option<String> {
     let lower = text.to_ascii_lowercase();
     if lower.contains("github_head_ref") {
         return Some("GITHUB_HEAD_REF".to_owned());
@@ -347,14 +569,15 @@ fn head_read(text: &str) -> Option<String> {
     }
     let Ok(list) = reads(text) else {
         let flat = squashed(text);
-        return HEAD_PATHS
+        return rules
+            .head
             .iter()
             .any(|entry| flat.contains(entry))
             .then(|| "an expression that cannot be read".to_owned());
     };
     for read in &list {
         for path in &read.paths {
-            if HEAD_PATHS.iter().any(|entry| touches(path, entry)) {
+            if rules.head.iter().any(|entry| touches(path, entry)) {
                 return Some(path.join("."));
             }
         }
@@ -370,8 +593,8 @@ fn head_read(text: &str) -> Option<String> {
 }
 
 /// Whether `text` names the pull request head.
-fn names_head(text: &str) -> bool {
-    head_read(text).is_some()
+fn names_head(text: &str, rules: &Rules) -> bool {
+    head_read(text, rules).is_some()
 }
 
 /// Why the job is tainted: the first read of the pull request head found
@@ -380,11 +603,11 @@ fn names_head(text: &str) -> bool {
 /// is not a read: the job's own `if:`, `continue-on-error`,
 /// `concurrency:` and `name:`, and a step's. A job that cannot be read
 /// counts as tainted.
-fn job_taint(job: &PlannedJob) -> Option<String> {
+fn job_taint(job: &PlannedJob, rules: &Rules) -> Option<String> {
     let Some(texts) = job_texts(job) else {
         return Some("a job that could not be read".to_owned());
     };
-    texts.iter().find_map(|text| head_read(text))
+    texts.iter().find_map(|text| head_read(text, rules))
 }
 
 /// Whether anything in the job reads the `needs` context.
@@ -489,9 +712,13 @@ fn looks_up_pull_request(script: &str) -> Option<&'static str> {
     let numbered = reads(script).is_ok_and(|list| {
         list.iter().any(|read| {
             read.paths.iter().any(|path| {
-                ["github.event.number", "github.event.pull_request.number"]
-                    .iter()
-                    .any(|entry| touches(path, entry))
+                [
+                    "github.event.number",
+                    "github.event.pull_request.number",
+                    "github.event.issue.number",
+                ]
+                .iter()
+                .any(|entry| touches(path, entry))
             })
         })
     });
@@ -516,8 +743,8 @@ fn provably_base(text: &str, allowed: &[&str]) -> bool {
 
 /// How a checkout's `ref` and `repository` rate: the head, an
 /// expression that may be, or fine.
-fn rate_checkout(inputs: &[(&str, &[&str])]) -> Option<LintKind> {
-    if inputs.iter().any(|(text, _)| names_head(text)) {
+fn rate_checkout(inputs: &[(&str, &[&str])], rules: &Rules) -> Option<LintKind> {
+    if inputs.iter().any(|(text, _)| names_head(text, rules)) {
         return Some(LintKind::HeadCheckout);
     }
     inputs
@@ -526,23 +753,30 @@ fn rate_checkout(inputs: &[(&str, &[&str])]) -> Option<LintKind> {
         .then_some(LintKind::UnverifiedCheckout)
 }
 
-fn native_checkout(step: &CheckoutStep) -> Option<LintKind> {
+/// How the native checkout step's `ref` rates, if it is not provably the
+/// base.
+fn native_checkout(step: &CheckoutStep, rules: &Rules) -> Option<LintKind> {
     let text = step.r#ref.as_deref()?;
-    rate_checkout(&[(text, BASE_REFS)])
+    rate_checkout(&[(text, &rules.base_refs)], rules)
 }
 
 fn is_action(step: &UsesStep, name: &str) -> bool {
     step.uses.to_ascii_lowercase().split('@').next() == Some(name)
 }
 
-fn action_checkout(step: &UsesStep) -> Option<LintKind> {
+/// How the `ref` and `repository` inputs of a checkout action rate, if
+/// they are not provably the base.
+fn action_checkout(step: &UsesStep, rules: &Rules) -> Option<LintKind> {
     let mut inputs: Vec<(&str, &[&str])> = Vec::new();
-    for (name, allowed) in [("ref", BASE_REFS), ("repository", BASE_REPOSITORIES)] {
+    for (name, allowed) in [
+        ("ref", &rules.base_refs[..]),
+        ("repository", BASE_REPOSITORIES),
+    ] {
         if let Some(text) = step.with.get(name).and_then(Value::as_str) {
             inputs.push((text, allowed));
         }
     }
-    rate_checkout(&inputs)
+    rate_checkout(&inputs, rules)
 }
 
 /// Whether a script runs a command that fetches code or moves a
@@ -1166,5 +1400,342 @@ workflows:
 ";
         let config = parse(yaml).unwrap();
         assert_eq!(validate_with_warnings(&config).1.len(), 1);
+    }
+
+    /// The findings of a workflow with triggers `on` (YAML) and a job
+    /// with `job` (more keys of the job) and `steps`, as `validate` reads
+    /// them.
+    fn warned(on: &str, job: &str, steps: &str) -> Vec<Lint> {
+        let yaml = format!(
+            "jobs:\n  t:\n    runs-on: ubuntu-latest\n{job}    steps:\n{steps}\n\
+             workflows:\n  w:\n    on: {on}\n    jobs: [t]\n"
+        );
+        let config = parse(&yaml).unwrap();
+        let plan = compile(&config, "w", "refs/heads/main").unwrap();
+        workflow_lints(&plan, &config.workflows["w"].on)
+    }
+
+    /// The kinds of `found`, in order.
+    fn kinds(found: &[Lint]) -> Vec<LintKind> {
+        found.iter().map(|l| l.kind).collect()
+    }
+
+    const GUARD: &str =
+        "    if: contains(fromJSON('[\"OWNER\"]'), github.event.comment.author_association)\n";
+
+    #[test]
+    fn issues_issue_comment_and_command_workflows_are_guarded() {
+        let on = |yaml: &str| -> crate::Triggers { serde_saphyr::from_str(yaml).unwrap() };
+        assert!(guarded(&on("{ issues: {} }")));
+        assert!(guarded(&on("{ issue_comment: {} }")));
+        assert!(guarded(&on("{ command: retest }")));
+        assert!(guarded(&on("{ pull_request_target: {} }")));
+        assert!(!guarded(&on("{ pull_request: {}, push: {} }")));
+    }
+
+    /// Pins that checking out the pull request head is flagged in issue comment, issues and command workflows.
+    #[test]
+    fn the_head_is_a_checkout_in_issue_comment_and_command_workflows() {
+        let steps = "      - uses: actions/checkout@v4\n        with:\n          ref: refs/pull/${{ github.event.issue.number }}/head";
+        for on in [
+            "{ issue_comment: {} }",
+            "{ issues: {} }",
+            "{ command: retest }",
+        ] {
+            let job = if on.contains("comment") { GUARD } else { "" };
+            assert!(
+                kinds(&warned(on, job, steps)).contains(&LintKind::HeadCheckout),
+                "{on}"
+            );
+        }
+        // A script that finds the pull request from the issue.
+        let steps = "      - run: git fetch origin pull/${{ github.event.issue.number }}/head";
+        assert!(kinds(&warned("{ issues: {} }", "", steps)).contains(&LintKind::HeadCheckout));
+        let steps = "      - run: gh pr checkout ${{ github.event.issue.number }}";
+        assert!(kinds(&warned("{ command: retest }", "", steps)).contains(&LintKind::HeadCheckout));
+    }
+
+    const PINNED: &str = "      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.event.command.pull_request.head_sha }}";
+
+    /// Pins that a command which requires a sha pin may check out the sha the commenter named.
+    #[test]
+    fn a_command_may_check_out_the_sha_the_commenter_named() {
+        for on in [
+            "{ command: retest }",
+            "{ command: { deploy: { permission: maintain } } }",
+            "{ command: { a: { permission: write }, b: { permission: admin } } }",
+        ] {
+            assert_eq!(warned(on, "", PINNED), [], "{on}");
+        }
+        let native =
+            "      - checkout:\n          ref: ${{ github.event.command.pull_request.head_sha }}";
+        assert_eq!(warned("{ command: retest }", "", native), []);
+        // In a job that fetches too.
+        let steps = format!(
+            "{PINNED}\n      - run: git fetch origin ${{{{ github.event.command.pull_request.head_sha }}}}"
+        );
+        assert_eq!(warned("{ command: retest }", "", &steps), []);
+    }
+
+    /// Pins that a command with an optional sha still warns on checking out the sha.
+    #[test]
+    fn a_command_with_an_optional_sha_warns_on_the_sha() {
+        // The pin can be left out, so the checkout is the head as it is.
+        for on in [
+            "{ command: { deploy: { permission: write, sha: optional } } }",
+            "{ command: { a: { permission: admin, sha: required }, b: { permission: write, sha: optional } } }",
+        ] {
+            assert_eq!(
+                kinds(&warned(on, "", PINNED)),
+                [LintKind::HeadCheckout],
+                "{on}"
+            );
+        }
+        for on in [
+            "{ command: { deploy: { permission: write, sha: required } } }",
+            "{ command: { deploy: { permission: write, sha: auto } } }",
+        ] {
+            assert_eq!(warned(on, "", PINNED), [], "{on}");
+        }
+    }
+
+    /// Pins that a command below write permission, or mixed with one, warns on checking out the sha.
+    #[test]
+    fn a_command_below_write_or_mixed_with_one_warns_on_the_sha() {
+        for on in [
+            "{ command: { look: { permission: triage } } }",
+            "{ command: { look: { permission: read } } }",
+            "{ command: { a: { permission: triage }, b: { permission: admin } } }",
+        ] {
+            assert_eq!(
+                kinds(&warned(on, "", PINNED)),
+                [LintKind::HeadCheckout],
+                "{on}"
+            );
+        }
+        // Without the workflow's triggers the pin counts as a head.
+        let yaml = format!(
+            "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n{PINNED}\nworkflows:\n  w:\n    on: {{ command: retest }}\n    jobs: [t]\n"
+        );
+        let config = parse(&yaml).unwrap();
+        let plan = compile(&config, "w", "refs/heads/main").unwrap();
+        assert_eq!(plan_lints(&plan).len(), 1);
+    }
+
+    /// Pins that other ways to name the pull request head still warn in a command workflow.
+    #[test]
+    fn a_command_still_warns_on_the_other_head_forms() {
+        for with in [
+            "ref: ${{ github.head_ref }}",
+            "ref: refs/pull/${{ github.event.command.pull_request.number }}/head",
+            "ref: refs/pull/12/merge",
+            "repository: ${{ github.event.command.pull_request.head_repo }}",
+            "ref: ${{ github.event.pull_request.head.sha }}",
+            "ref: ${{ github.event.command.args[0] }}",
+            "ref: ${{ github.event.command.pull_request.base_ref }}${{ github.event.command.line }}",
+        ] {
+            let steps =
+                format!("      - uses: actions/checkout@v4\n        with:\n          {with}");
+            let kinds = kinds(&warned("{ command: retest }", "", &steps));
+            assert!(
+                kinds.iter().any(|k| k.is_head_checkout()),
+                "{with}: {kinds:?}"
+            );
+        }
+        // Another ref of the command is a base-like value.
+        let steps =
+            "      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.sha }}";
+        assert_eq!(warned("{ command: retest }", "", steps), []);
+    }
+
+    /// Pins that script injection checks cover issue, comment and command text fields.
+    #[test]
+    fn script_injection_covers_issue_comment_and_command_text() {
+        for field in [
+            "github.event.issue.title",
+            "github.event.issue.body",
+            "github.event.comment.body",
+            "github.event.command.line",
+            "github.event.command.args",
+            "github.event.command.args[0]",
+            "github.event.command.named.environment",
+            "toJSON(github.event.command)",
+        ] {
+            let steps = format!("      - run: echo \"${{{{ {field} }}}}\"");
+            let on = "{ issues: {}, command: retest }";
+            assert!(
+                kinds(&warned(on, "", &steps)).contains(&LintKind::ScriptInjection),
+                "{field}"
+            );
+            let script = format!(
+                "      - uses: actions/github-script@v7\n        with:\n          script: console.log('${{{{ {field} }}}}')"
+            );
+            assert!(
+                kinds(&warned(on, "", &script)).contains(&LintKind::ScriptInjection),
+                "script {field}"
+            );
+        }
+        // Safe fields, and the value passed through env.
+        for safe in [
+            "github.event.command.name",
+            "github.event.command.actor",
+            "github.event.command.permission",
+            "github.event.command.pull_request.number",
+            "github.event.issue.number",
+        ] {
+            let steps = format!("      - run: echo \"${{{{ {safe} }}}}\"");
+            assert!(
+                !kinds(&warned("{ command: retest }", "", &steps))
+                    .contains(&LintKind::ScriptInjection),
+                "{safe}"
+            );
+        }
+        let steps = "      - run: echo \"$BODY\"\n        env:\n          BODY: ${{ github.event.comment.body }}";
+        assert!(
+            !kinds(&warned("{ issue_comment: {} }", GUARD, steps))
+                .contains(&LintKind::ScriptInjection)
+        );
+    }
+
+    /// Pins that an issue comment job that never checks who commented gets a warning.
+    #[test]
+    fn an_issue_comment_job_with_no_check_on_the_commenter_warns() {
+        let steps = "      - run: ./retest.sh";
+        let found = warned("{ issue_comment: {} }", "", steps);
+        assert_eq!(kinds(&found), [LintKind::UnguardedComment]);
+        assert_eq!(found[0].step, 0);
+        assert!(
+            found[0].text().starts_with("workflow `w`, job `t`: "),
+            "{}",
+            found[0].text()
+        );
+        // An if that has nothing to do with the commenter.
+        let job = "    if: github.event.issue.pull_request\n";
+        assert_eq!(
+            kinds(&warned("{ issue_comment: {} }", job, steps)),
+            [LintKind::UnguardedComment]
+        );
+        // Each of the three checks.
+        for cond in [
+            "github.event.comment.author_association == 'OWNER'",
+            "github.actor == 'alice'",
+            "github.triggering_actor == 'alice'",
+            "contains(fromJSON(vars.MAINTAINERS), github.actor)",
+            "needs_permission(github.actor)",
+        ] {
+            let job = format!("    if: {cond}\n");
+            assert_eq!(warned("{ issue_comment: {} }", &job, steps), [], "{cond}");
+        }
+        let job = "    if: ${{ github.event.comment.author_association == 'OWNER' }}\n";
+        assert_eq!(warned("{ issue_comment: {} }", job, steps), []);
+    }
+
+    /// Pins that the commenter check applies only to issue comment workflows.
+    #[test]
+    fn only_issue_comment_workflows_are_asked_who_commented() {
+        let steps = "      - run: ./triage.sh";
+        for on in [
+            "{ issues: {} }",
+            "{ command: retest }",
+            "{ pull_request_target: {} }",
+        ] {
+            assert!(
+                !kinds(&warned(on, "", steps)).contains(&LintKind::UnguardedComment),
+                "{on}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_that_needs_a_checked_job_is_covered_by_it() {
+        let yaml = "jobs:
+  gate:
+    runs-on: ubuntu-latest
+    if: github.actor == 'alice'
+    steps:
+      - run: ./gate.sh
+  work:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./work.sh
+  other:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./other.sh
+workflows:
+  w:
+    on: { issue_comment: {} }
+    jobs:
+      - gate
+      - work: { requires: [gate] }
+      - other
+";
+        let config = parse(yaml).unwrap();
+        let plan = compile(&config, "w", "refs/heads/main").unwrap();
+        let found = workflow_lints(&plan, &config.workflows["w"].on);
+        let unguarded: Vec<&str> = found.iter().map(|l| l.job.as_str()).collect();
+        assert_eq!(unguarded, ["other"], "{found:?}");
+    }
+
+    /// Pins that a contains test on the comment text does not count as a check on the commenter and warns.
+    #[test]
+    fn contains_on_the_comment_text_warns() {
+        let steps = "      - run: ./retest.sh";
+        for cond in [
+            "contains(github.event.comment.body, '/retest')",
+            "contains(github.event.comment.body, '/retest') && github.actor == 'alice'",
+            "github.actor == 'alice' && contains(github.event.comment.body, '/retest')",
+            "contains(github['event']['comment']['body'], '/retest')",
+            "contains(toLower(github.event.comment.body), '/retest')",
+            "!contains(github.event.comment.body, 'wip')",
+            "${{ contains(github.event.comment.body, '/retest') }}",
+        ] {
+            let job = format!("    if: \"{cond}\"\n");
+            let found = warned("{ issue_comment: {} }", &job, steps);
+            assert!(
+                kinds(&found).contains(&LintKind::BodyContains),
+                "{cond}: {found:?}"
+            );
+        }
+        // A step's if counts, and says its step.
+        let steps =
+            "      - run: ./retest.sh\n        if: contains(github.event.comment.body, '/retest')";
+        let found = warned("{ issue_comment: {} }", GUARD, steps);
+        assert_eq!(kinds(&found), [LintKind::BodyContains]);
+        assert_eq!(found[0].step, 1);
+    }
+
+    /// Pins that startsWith and contains on other values do not trigger the warning.
+    #[test]
+    fn startswith_and_other_contains_do_not_warn() {
+        let steps = "      - run: ./retest.sh";
+        for cond in [
+            "startsWith(github.event.comment.body, '/retest') && github.actor == 'alice'",
+            "contains(github.event.issue.labels.*.name, 'bug') && github.actor == 'alice'",
+            "contains('/retest', github.event.comment.body) && github.actor == 'alice'",
+            "contains(fromJSON('[\"OWNER\"]'), github.event.comment.author_association)",
+        ] {
+            let job = format!("    if: {cond}\n");
+            assert_eq!(warned("{ issue_comment: {} }", &job, steps), [], "{cond}");
+        }
+    }
+
+    #[test]
+    fn validate_reports_the_comment_findings_and_still_passes() {
+        let yaml = "
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    if: contains(github.event.comment.body, '/retest')
+    steps:
+      - run: ./retest.sh
+workflows:
+  w:
+    on: { issue_comment: { types: [created] } }
+    jobs: [t]
+";
+        let (errors, warnings) = validate_with_warnings(&parse(yaml).unwrap());
+        assert_eq!(errors, Vec::new());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
     }
 }

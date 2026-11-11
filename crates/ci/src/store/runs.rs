@@ -104,8 +104,32 @@ pub struct NewRun {
     /// What the planner found in the run's workflow, one finding to a
     /// line.
     pub lints: Option<String>,
+    /// The issue or comment the run is for, for the runs of the
+    /// `issues` and `issue_comment` events.
+    pub chat: Option<Chat>,
     /// When the run is recorded.
     pub now: u64,
+}
+
+/// What ties a run to an issue, a pull request or a chat command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chat {
+    /// The issue or pull request the event is about.
+    pub issue_number: u64,
+    /// The command the run answers, for a run started by one.
+    pub command: Option<CommentCommand>,
+}
+
+/// The chat command a run was started by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentCommand {
+    /// The comment the command was written in.
+    pub comment_id: u64,
+    /// The command's name, without the slash.
+    pub name: String,
+    /// Whether the run's end reacts with `rocket` and `confused`
+    /// instead of `+1` and `-1`.
+    pub rocket: bool,
 }
 
 /// A recorded run.
@@ -239,7 +263,9 @@ const LOCK_REPO: &str = "SELECT id FROM ci_repos WHERE id = $1 FOR NO KEY UPDATE
 /// pull request's number, `$13` its head branch, `$14` the trust, `$15` and
 /// `$16` the head repository's id and name, `$17` the author, `$18` the
 /// author's association, `$19` the gate, `$20` its status, `$21` the
-/// pull request's head commit and `$22` the planner's findings. The run expires after its tenant's retention tier (30 or 90 days), read
+/// pull request's head commit, `$22` the planner's findings, `$23` the
+/// issue number, `$24` the comment id, `$25` the command's name and
+/// `$26` its reaction set. The run expires after its tenant's retention tier (30 or 90 days), read
 /// in the same statement. The number is taken only when no run of this
 /// delivery and workflow exists, so a duplicate leaves the counter
 /// alone, and the statement returns no row for it.
@@ -252,11 +278,12 @@ const INSERT_RUN: &str = "WITH n AS (\
      INSERT INTO ci_runs (tenant_id, repo_id, workflow, run_number, delivery, event, ref, sha, \
        actor, base_ref, message, pull_number, head_ref, status, created_at, updated_at, \
        expires_at, trust, head_repo_id, head_repo_name, author_login, author_association, \
-       gate, gate_status, head_sha, lints) \
+       gate, gate_status, head_sha, lints, issue_number, comment_id, command_name, \
+       command_reaction) \
      SELECT $1, $2, $3, n.last, $4, $5, $6, $7, $8, $10::text, $11::text, $12::bigint, $13::text, 'queued', $9, $9, \
        $9 + (SELECT CASE WHEN retention_days > 30 THEN 90 ELSE 30 END * 86400000::bigint \
          FROM tenants WHERE id = $1), \
-       $14::text, $15::bigint, $16::text, $17::text, $18::text, $19::text, $20::text, $21::text, $22::text FROM n \
+       $14::text, $15::bigint, $16::text, $17::text, $18::text, $19::text, $20::text, $21::text, $22::text, $23::bigint, $24::bigint, $25::text, $26::text FROM n \
      RETURNING id, run_number, run_attempt, tenant_id, repo_id, workflow, delivery, event, \
        ref AS git_ref, sha, actor, base_ref, status, conclusion, created_at, \
        completed_at, (expires_at - created_at) / 86400000 AS retention_days, message, \
@@ -301,6 +328,7 @@ const FINISH_RUN: &str = "UPDATE ci_runs SET status = 'completed', conclusion = 
 ///
 /// Postgres refused the statement.
 pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>> {
+    let command = run.chat.as_ref().and_then(|chat| chat.command.as_ref());
     db.first_locked(
         (LOCK_REPO, &params![run.repo_id]),
         INSERT_RUN,
@@ -330,7 +358,11 @@ pub async fn insert_run(db: &Db, run: &NewRun) -> Result<Option<RunRow>> {
             },
             run.gate_status.as_str(),
             &run.head_sha,
-            &run.lints
+            &run.lints,
+            run.chat.as_ref().map(|chat| chat.issue_number),
+            command.map(|command| command.comment_id),
+            command.map(|command| &command.name),
+            command.map(|command| if command.rocket { "rocket" } else { "default" })
         ],
     )
     .await
@@ -368,6 +400,39 @@ pub async fn set_run_message(db: &Db, run_id: u64, message: &str) -> Result<()> 
 pub async fn run(db: &Db, run_id: u64) -> Result<Option<RunRow>> {
     db.first(&with_columns(RUN, RUN_COLUMNS), &params![run_id])
         .await
+}
+
+/// How many runs of the `issue_comment` event of issue or pull request
+/// `$2` of repository `$1` are not over, leaving out those of delivery
+/// `$3`: its own runs under the delivery's key and under
+/// `<delivery>:command:<name>`.
+const ACTIVE_COMMENT_RUNS: &str = "SELECT count(*)::bigint AS n FROM ci_runs \
+     WHERE repo_id = $1 AND issue_number = $2 AND event = 'issue_comment' \
+     AND status <> 'completed' \
+     AND NOT (delivery = $3 OR starts_with(delivery, $3 || ':command:'))";
+
+/// How many runs of the `issue_comment` event of issue or pull request
+/// `number` are not over, leaving out those `delivery` made already, so
+/// a retry of a delivery is not refused for its own runs. The cap on
+/// them is [`crate::chatops::MAX_ACTIVE_PER_ISSUE`].
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn active_comment_runs(
+    db: &Db,
+    repo_id: u64,
+    number: u64,
+    delivery: &str,
+) -> Result<u64> {
+    #[derive(Deserialize)]
+    struct Count {
+        n: u64,
+    }
+    let count: Option<Count> = db
+        .first(ACTIVE_COMMENT_RUNS, &params![repo_id, number, delivery])
+        .await?;
+    Ok(count.map_or(0, |count| count.n))
 }
 
 /// What a run's status is for a list: the filter's words.

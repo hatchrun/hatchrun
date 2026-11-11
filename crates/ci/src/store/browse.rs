@@ -42,45 +42,77 @@ pub struct NewPull {
     pub updated_at: u64,
 }
 
-/// Records pull request `$2` of repository `$1` as it stands: title
-/// `$3`, head `$4`, base `$5`, author `$6`, state `$7`, as of GitHub's
-/// time `$8`, the author's association `$9`, the head repository `$10`
-/// and the head commit `$11`. A delivery older than the row leaves it
+/// `INSERT ... ON CONFLICT DO UPDATE` of a pull request, with a `WHERE`
+/// condition on the row it replaces. Parameters: repository `$1`, pull
+/// request `$2`, title `$3`, head `$4`, base `$5`, author `$6`, state
+/// `$7`, GitHub's time `$8`, the author's association `$9`, the head
+/// repository `$10` and the head commit `$11`.
+macro_rules! upsert_pull_sql {
+    ($when:literal) => {
+        concat!(
+            "INSERT INTO ci_pulls \
+             (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at, \
+              author_association, head_repo_id, head_sha) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10::bigint, $11) \
+             ON CONFLICT (repo_id, number) DO UPDATE SET title = $3, head_ref = $4, base_ref = $5, \
+             author = $6, state = $7, updated_at = $8, author_association = $9, \
+             head_repo_id = $10::bigint, head_sha = $11 WHERE ",
+            $when
+        )
+    };
+}
+
+/// Records pull request `$2` of repository `$1` as it stands (see
+/// [`upsert_pull_sql`]). A delivery older than the row leaves it
 /// alone, and so does one of the same second with another head commit:
 /// GitHub's times have one second, so two pushes in a second tie, and
 /// delivery order does not say which came last.
-const UPSERT_PULL: &str = "INSERT INTO ci_pulls \
-     (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at, \
-      author_association, head_repo_id, head_sha) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10::bigint, $11) \
-     ON CONFLICT (repo_id, number) DO UPDATE SET title = $3, head_ref = $4, base_ref = $5, \
-     author = $6, state = $7, updated_at = $8, author_association = $9, \
-     head_repo_id = $10::bigint, head_sha = $11 \
-     WHERE ci_pulls.updated_at < $8 \
-        OR (ci_pulls.updated_at = $8 AND ci_pulls.head_sha = $11)";
+const UPSERT_PULL: &str = upsert_pull_sql!(
+    "ci_pulls.updated_at < $8 OR (ci_pulls.updated_at = $8 AND ci_pulls.head_sha = $11)"
+);
 
-/// As [`UPSERT_PULL`], whatever the row holds: for a tie that GitHub's own
-/// answer settled.
-const UPSERT_PULL_FORCED: &str = "INSERT INTO ci_pulls \
-     (repo_id, number, title, head_ref, base_ref, author, state, created_at, updated_at, \
-      author_association, head_repo_id, head_sha) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10::bigint, $11) \
-     ON CONFLICT (repo_id, number) DO UPDATE SET title = $3, head_ref = $4, base_ref = $5, \
-     author = $6, state = $7, updated_at = $8, author_association = $9, \
-     head_repo_id = $10::bigint, head_sha = $11";
+/// As [`UPSERT_PULL`] for a tie that GitHub's answer settled in favour
+/// of the delivery: it applies only while the row still has the time
+/// `$8` and the head `$12` it had at the tie, so a delivery that moved
+/// the row since is not overwritten.
+const UPSERT_PULL_TIED: &str =
+    upsert_pull_sql!("ci_pulls.updated_at = $8 AND ci_pulls.head_sha = $12");
 
 /// The time and head commit of pull request `$2` of repository `$1`.
 const PULL_STAMP: &str =
     "SELECT updated_at, head_sha FROM ci_pulls WHERE repo_id = $1 AND number = $2";
 
-/// The time of a recorded pull request.
+/// The state and head commit of pull request `$2` of repository `$1`.
+const PULL_HEAD: &str = "SELECT state, head_sha FROM ci_pulls WHERE repo_id = $1 AND number = $2";
+
+/// The state and head commit a pull request was last recorded with.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullHead {
+    /// `open`, `closed` or `merged`.
+    pub state: String,
+    /// The head commit.
+    pub head_sha: String,
+}
+
+/// What is recorded of a pull request's state and head, `None` for a
+/// pull request with no row.
+///
+/// # Errors
+///
+/// Postgres refused the statement.
+pub async fn pull_head(db: &Db, repo_id: u64, number: u64) -> Result<Option<PullHead>> {
+    db.first(PULL_HEAD, &params![repo_id, number]).await
+}
+
+/// The time and head commit of a recorded pull request.
 #[derive(Deserialize)]
 struct Stamp {
     updated_at: u64,
+    head_sha: String,
 }
 
 /// What recording a delivery of a pull request came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PullWrite {
     /// The row now says what the delivery says.
     Applied,
@@ -88,7 +120,8 @@ pub enum PullWrite {
     Stale,
     /// The delivery has the row's time and another head commit: which is
     /// newer is not known from the two, and GitHub's answer decides.
-    Tied,
+    /// Holds the head commit the row has.
+    Tied(String),
 }
 
 fn pull_params(pull: &NewPull) -> Vec<hatchrun_cloud::db::Param> {
@@ -107,15 +140,18 @@ fn pull_params(pull: &NewPull) -> Vec<hatchrun_cloud::db::Param> {
     ]
 }
 
-/// Records the pull request whatever the row holds, for a tie that
-/// GitHub's answer settled in favour of `pull`.
+/// Records the pull request for a tie that GitHub's answer settled in
+/// favour of `pull`, only while the row still has the time of `pull`
+/// and the head commit `held` it had at the tie. `false` when the row
+/// moved since: another delivery wrote it, and the row is left alone.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn upsert_pull_forced(db: &Db, pull: &NewPull) -> Result<()> {
-    db.run(UPSERT_PULL_FORCED, &pull_params(pull)).await?;
-    Ok(())
+pub async fn upsert_pull_if_tied(db: &Db, pull: &NewPull, held: &str) -> Result<bool> {
+    let mut params = pull_params(pull);
+    params.extend(params![held]);
+    Ok(db.run(UPSERT_PULL_TIED, &params).await? == 1)
 }
 
 /// Records the state of a pull request. A delivery older than what is
@@ -152,7 +188,7 @@ pub async fn upsert_pull(db: &Db, pull: &NewPull) -> Result<PullWrite> {
         .first(PULL_STAMP, &params![pull.repo_id, pull.number])
         .await?;
     Ok(match held {
-        Some(held) if held.updated_at == pull.updated_at => PullWrite::Tied,
+        Some(held) if held.updated_at == pull.updated_at => PullWrite::Tied(held.head_sha),
         _ => PullWrite::Stale,
     })
 }

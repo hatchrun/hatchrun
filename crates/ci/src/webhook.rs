@@ -3,33 +3,38 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! `POST /github/webhook`: the `push`, `pull_request`, `check_run`,
-//! `release`, `create`, `delete`, `repository` and
-//! `installation_repositories` deliveries that `hatchrun-cloud`
+//! `release`, `create`, `delete`, `repository`, `issues`, `issue_comment`
+//! and `installation_repositories` deliveries that `hatchrun-cloud`
 //! forwards.
 //!
 //! A repository that is not enabled for its tenant (see
 //! [`crate::installation`]) starts no runs: its deliveries are
 //! answered as ignored.
 
+use std::borrow::Cow;
+
 use hatchrun_cloud::db::Db;
 use hatchrun_cloud::fetch::Counted;
 use hatchrun_cloud::tokens::{App, Kv, Tokens};
 use hatchrun_cloud::webhook::verify;
-use hatchrun_workflow::{Event, MAX_CHANGED};
+use hatchrun_workflow::command::{APPROVE_RUN, Found};
+use hatchrun_workflow::{CommandPermission, CommandReaction, Event, MAX_CHANGED};
 use serde_json::{Value, json};
 use worker::{Env, Method, Request, RequestInit, Response, Result};
 
 use crate::alerts;
+use crate::chatops::{self, CommandContext, Pin, Unapprovable};
 use crate::env::{Settings, run_stub};
 use crate::fork;
 use crate::github;
+use crate::github::PullInfo;
 use crate::installation;
 use crate::intake::{
-    self, ApproveFork, MergeGroup, PullRequest, Push, RefChange, Release, Repo, RepositoryDispatch,
-    Rerequested, Trigger,
+    self, ApproveFork, ForkInfo, IssueComment, Issues, MergeGroup, PullRequest, Push, RefChange,
+    Release, Repo, RepositoryDispatch, Rerequested, Trigger,
 };
 use crate::planning;
-use crate::policy::{self, Admission, RepoPolicy, Waiting};
+use crate::policy::{self, Admission, ForkRuns, RepoPolicy, Waiting};
 use crate::runs::{self, Config};
 use crate::store::{self, GateStatus, RepoRow, TenantRow};
 use crate::trust::Trust;
@@ -115,6 +120,155 @@ fn target_gate(
     })
 }
 
+/// Which workflows a pull request function makes runs of.
+#[derive(Clone, Copy)]
+enum Wanted<'a> {
+    /// Those the delivery's own action starts.
+    Delivery,
+    /// `/approve-run` making workflows again. The comment has no pull
+    /// request action of its own.
+    Remake {
+        /// The workflows to make, each as the first of `actions` that it
+        /// listens to.
+        among: &'a [String],
+        /// The actions to try (see [`planning::remake_actions`]).
+        actions: &'static [&'static str],
+    },
+}
+
+/// What a pull request function makes its runs from. The caller reads
+/// it, for a delivery and for `/approve-run` alike.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    /// The commit the runs are on.
+    sha: &'a str,
+    /// The config at that commit, and the same parsed (`None` when it
+    /// is missing or unusable, which makes no run).
+    config: &'a Config,
+    parsed: Option<&'a hatchrun_workflow::Config>,
+    /// The pull request's changed paths, empty when no workflow looks at
+    /// them.
+    changed: &'a [String],
+}
+
+/// The runs to make for one action: the delivery to see as the event,
+/// the workflows to limit it to (`None` for all that it triggers) and
+/// its trigger.
+struct Batch<'p> {
+    pr: Cow<'p, PullRequest>,
+    workflows: Option<Vec<String>>,
+    trigger: Event,
+}
+
+impl Wanted<'_> {
+    /// The pull request deliveries to make runs for. `event` builds the
+    /// trigger of an action. A remake has none when the config did not
+    /// parse.
+    fn batches<'p>(
+        &self,
+        pr: &'p PullRequest,
+        parsed: Option<&hatchrun_workflow::Config>,
+        event: impl Fn(&str) -> Event,
+    ) -> Vec<Batch<'p>> {
+        let Self::Remake { among, actions } = self else {
+            return vec![Batch {
+                pr: Cow::Borrowed(pr),
+                workflows: None,
+                trigger: event(&pr.action),
+            }];
+        };
+        let Some(parsed) = parsed else {
+            return Vec::new();
+        };
+        planning::remake_batches(parsed, event, Some(among), actions)
+            .into_iter()
+            .map(|(action, names, trigger)| Batch {
+                pr: Cow::Owned(with_action(pr, action)),
+                workflows: Some(names),
+                trigger,
+            })
+            .collect()
+    }
+}
+
+/// The config as the planner parses it: `Ok(None)` when it is missing,
+/// `Err` when it cannot be read or does not parse.
+fn parsed(config: &Config) -> std::result::Result<Option<hatchrun_workflow::Config>, ()> {
+    match config {
+        Config::Missing => Ok(None),
+        Config::Text(Ok(source)) => hatchrun_workflow::parse(source).map(Some).map_err(|_| ()),
+        Config::Text(Err(_)) => Err(()),
+    }
+}
+
+/// The workflows of `parsed` that listen to the event `event` builds the
+/// trigger of, under `actions` (see [`planning::remake_batches`]).
+fn listed(
+    parsed: Option<&hatchrun_workflow::Config>,
+    event: impl Fn(&str) -> Event,
+    actions: &[&'static str],
+) -> Vec<String> {
+    parsed
+        .map(|parsed| {
+            planning::remake_batches(parsed, event, None, actions)
+                .into_iter()
+                .flat_map(|(_, names, _)| names)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The trigger of a `pull_request` delivery of an action, for a pull
+/// request against `base_ref` that changed `changed`.
+fn head_event<'a>(base_ref: &'a str, changed: &'a [String]) -> impl Fn(&str) -> Event + 'a {
+    move |action| Event::PullRequest {
+        action: action.to_owned(),
+        base_ref: base_ref.to_owned(),
+        changed: changed.to_vec(),
+    }
+}
+
+/// As [`head_event`], for `pull_request_target`.
+fn target_event<'a>(base_ref: &'a str, changed: &'a [String]) -> impl Fn(&str) -> Event + 'a {
+    move |action| Event::PullRequestTarget {
+        action: action.to_owned(),
+        base_ref: base_ref.to_owned(),
+        changed: changed.to_vec(),
+    }
+}
+
+/// `pr` as the delivery of `action`: its payload says so too.
+fn with_action(pr: &PullRequest, action: &str) -> PullRequest {
+    let mut made = pr.clone();
+    action.clone_into(&mut made.action);
+    made.payload["action"] = action.into();
+    made
+}
+
+/// The KV namespace that keeps the App's bot login: the one the
+/// installation tokens are in.
+const BOT_LOGIN_BINDING: &str = "TOKENS";
+
+/// The KV key of the App's bot login.
+const BOT_LOGIN_KEY: &str = "ci:app-bot-login";
+
+/// How long the bot login is kept, in seconds.
+const BOT_LOGIN_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Whether `sender` is `bot`, the App's own login. GitHub logins do not
+/// differ by case.
+fn is_bot_login(sender: &str, bot: &str) -> bool {
+    sender.eq_ignore_ascii_case(bot)
+}
+
+/// Whether the delivery of `actor`, a bot, is the App's own, given the
+/// bot login the lookup found, `None` when it failed. A failed lookup
+/// counts as the App's own: a loop is worse than a bot-triggered run that
+/// is missed.
+fn own_sender(actor: &str, login: Option<&str>) -> bool {
+    login.is_none_or(|login| is_bot_login(actor, login))
+}
+
 /// The delivery key of the `pull_request_target` runs of a delivery. A
 /// run is unique per delivery and workflow, and a workflow that listens
 /// to `pull_request` and `pull_request_target` has a run of each for one
@@ -183,6 +337,7 @@ pub async fn handle(mut req: Request, env: &Env) -> Result<Response> {
     }
 }
 
+/// Handles one webhook delivery: drops duplicates, parses the event and starts the matching runs.
 async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Response> {
     let db = Db::connect(env).await?;
     if store::delivery_seen(&db, guid).await? {
@@ -210,6 +365,8 @@ async fn process(env: &Env, kind: &str, guid: &str, body: &[u8]) -> Result<Respo
         Trigger::Create(c) | Trigger::Delete(c) => (c.installation_id, &c.repo),
         Trigger::MergeGroup(g) => (g.installation_id, &g.repo),
         Trigger::RepositoryDispatch(d) => (d.installation_id, &d.repo),
+        Trigger::Issues(i) => (i.installation_id, &i.repo),
+        Trigger::IssueComment(c) => (c.installation_id, &c.repo),
         Trigger::Rerequested(r) => (r.installation_id, &r.repo),
         Trigger::ApproveFork(a) => (a.installation_id, &a.repo),
         Trigger::Repository(r) => (r.installation_id, &r.repo),
@@ -398,6 +555,132 @@ fn dispatch_fired(dispatch: &RepositoryDispatch, sha: String) -> Fired<'_> {
     }
 }
 
+/// An issue activity runs on the default branch, at its head `sha`, as
+/// on GitHub.
+fn issues_fired(issue: &Issues, sha: String) -> Fired<'_> {
+    Fired {
+        installation_id: issue.installation_id,
+        repo: &issue.repo,
+        event_name: "issues",
+        payload: &issue.payload,
+        trigger: Event::Issues {
+            action: issue.action.clone(),
+        },
+        git_ref: default_ref(&issue.repo),
+        sha,
+        actor: &issue.actor,
+    }
+}
+
+/// The full ref of the repository's default branch.
+fn default_ref(repo: &Repo) -> String {
+    format!("refs/heads/{}", repo.default_branch)
+}
+
+/// What one comment's commands run against.
+struct CommentRun<'a> {
+    comment: &'a IssueComment,
+    /// The default branch's config, parsed once for the comment; `None`
+    /// when it is missing or does not parse.
+    workflows: Option<&'a hatchrun_workflow::Config>,
+    /// The same as read, for the planner.
+    config: &'a Config,
+    /// The head of the default branch, which the runs are on.
+    sha: &'a str,
+    /// The full ref of the default branch.
+    default_ref: &'a str,
+    /// The pull request the comment is on, `None` on a plain issue.
+    pull: Option<&'a PullInfo>,
+}
+
+/// Where a comment's runs report: trusted runs of the default branch,
+/// with their check runs on the head of the pull request the comment is
+/// on (see [`runs::Target`]).
+fn comment_origin<'a>(
+    comment: &'a IssueComment,
+    pull: Option<&'a PullInfo>,
+    chat: &'a store::Chat,
+) -> runs::Origin<'a> {
+    runs::Origin {
+        target: pull.map(|pull| runs::Target {
+            head_sha: &pull.head_sha,
+            refused: None,
+        }),
+        chat: Some(chat),
+        ..runs::Origin::own(&comment.actor)
+    }
+}
+
+/// The row of `pr` in the table of pull requests.
+fn pull_record(pr: &PullRequest) -> store::NewPull {
+    store::NewPull {
+        repo_id: pr.repo.id,
+        number: pr.number,
+        title: pr.title.clone(),
+        head_ref: pr.head_ref.clone(),
+        base_ref: pr.base_ref.clone(),
+        author: pr.author.clone(),
+        author_association: pr.author_association.clone(),
+        head_repo_id: pr
+            .fork
+            .as_ref()
+            .map_or(Some(pr.repo.id), |f| f.head_repo_id),
+        head_sha: pr.head_sha.clone(),
+        state: pr.state.to_owned(),
+        updated_at: pr.updated_at,
+    }
+}
+
+/// The pull request a comment is on, as GitHub has it now, in the shape
+/// of a `pull_request` delivery: `/approve-run` starts the runs that
+/// delivery would have, and they see this payload as their event. Its
+/// action is `synchronize`; a remade workflow gets the action it listens
+/// to (see [`Wanted::Remake`]).
+fn pull_of_comment(comment: &IssueComment, pull: &PullInfo) -> PullRequest {
+    let fork = pull.fork.then(|| ForkInfo {
+        head_repo_id: pull.head_repo_id,
+        head_repo_name: pull.head_repo_name.clone(),
+    });
+    let author = if pull.author.is_empty() {
+        "ghost".to_owned()
+    } else {
+        pull.author.clone()
+    };
+    let payload = json!({
+        "action": "synchronize",
+        "number": comment.number,
+        "pull_request": pull.raw,
+        "repository": comment.payload["repository"],
+        "sender": comment.payload["sender"],
+    });
+    PullRequest {
+        installation_id: comment.installation_id,
+        repo: comment.repo.clone(),
+        action: "synchronize".to_owned(),
+        number: comment.number,
+        head_sha: pull.head_sha.clone(),
+        head_ref: pull.head_ref.clone(),
+        base_ref: pull.base_ref.clone(),
+        actor: comment.actor.clone(),
+        title: pull.title.clone(),
+        author,
+        author_association: pull.author_association.clone(),
+        fork,
+        state: pull.state,
+        updated_at: pull.updated_at,
+        payload,
+    }
+}
+
+/// Adds `text` to the replies of a comment unless the same reply is
+/// there already: two workflows that define a command can ask for the
+/// same thing, and the maintainer reads it once.
+fn push_reply(replies: &mut Vec<String>, text: String) {
+    if !replies.contains(&text) {
+        replies.push(text);
+    }
+}
+
 struct Cx<'a> {
     env: &'a Env,
     db: &'a Db,
@@ -419,6 +702,8 @@ impl Cx<'_> {
             Trigger::Delete(change) => self.delete(change).await?,
             Trigger::MergeGroup(group) => self.merge_group(group).await?,
             Trigger::RepositoryDispatch(dispatch) => self.repository_dispatch(dispatch).await?,
+            Trigger::Issues(issue) => self.issues(issue).await?,
+            Trigger::IssueComment(comment) => self.issue_comment(comment).await?,
             Trigger::Rerequested(rerun) => self.rerun(rerun).await?,
             Trigger::ApproveFork(approval) => self.approve_fork(approval).await?,
             // The row was updated before, with the tenant's other
@@ -429,6 +714,7 @@ impl Cx<'_> {
         })
     }
 
+    /// Plans and starts the workflows triggered by a push.
     async fn push(&self, push: &Push) -> Result<Outcome> {
         let trigger = Event::Push {
             r#ref: push.r#ref.clone(),
@@ -461,7 +747,7 @@ impl Cx<'_> {
                 actor: &push.actor,
                 head_ref: "",
                 base_ref: "",
-                workflow: None,
+                workflows: None,
                 origin: runs::Origin::own(&push.actor),
             },
             &config,
@@ -491,7 +777,12 @@ impl Cx<'_> {
     /// not in the deliveries; the pull request's head as GitHub has it
     /// now is. The delivery counts only when it names that head, and then
     /// the row is made to say so.
-    async fn tie_is_current(&self, pr: &PullRequest, record: &store::NewPull) -> Result<bool> {
+    async fn tie_is_current(
+        &self,
+        pr: &PullRequest,
+        record: &store::NewPull,
+        recorded: &str,
+    ) -> Result<bool> {
         let response = self
             .tokens
             .send(pr.installation_id, |token| {
@@ -508,8 +799,9 @@ impl Cx<'_> {
         if head != pr.head_sha {
             return Ok(false);
         }
-        store::upsert_pull_forced(self.db, record).await?;
-        Ok(true)
+        // Only while the row is still what it was at the tie: a delivery
+        // that moved it since wins, and this one is stale.
+        store::upsert_pull_if_tied(self.db, record, recorded).await
     }
 
     /// What a fork pull request becomes under its repository's policy:
@@ -545,10 +837,53 @@ impl Cx<'_> {
         Ok(Ok(Some((gate, policy))))
     }
 
+    /// Reads the recorded row of the pull request `comment` is on and
+    /// decides `/approve-run` pinned at `head` from it. Replies with why
+    /// and returns `true` when the row says to stop (closed, or another
+    /// head); `false` when it is open at `head`.
+    async fn stops_on_row(&self, comment: &IssueComment, head: &str, line: &str) -> Result<bool> {
+        let row = store::pull_head(self.db, comment.repo.id, comment.number).await?;
+        let Pin::Reply(text) = chatops::pin_against_row(row.as_ref(), head, line) else {
+            return Ok(false);
+        };
+        worker::console_warn!(
+            "{}: /approve-run on #{} found a newer pull request row",
+            comment.repo.full_name,
+            comment.number
+        );
+        self.reply(comment, &text).await;
+        Ok(true)
+    }
+
     /// Cancels the runs of `pr` that wait for an approval, except those
     /// at `keep`, and marks their card with `message`.
     async fn end_waiting(&self, pr: &PullRequest, keep: Option<&str>, message: &str) -> Result<()> {
         let ended = store::end_pull_gates(self.db, pr.repo.id, pr.number, keep, self.now).await?;
+        self.after_ended(pr, &ended, message).await
+    }
+
+    /// As [`Self::end_waiting`] keeping `head`, and only while the
+    /// recorded pull request is open at `head`: a newer head recorded
+    /// since is not superseded by it. Returns whether anything ended.
+    async fn end_waiting_at_head(
+        &self,
+        pr: &PullRequest,
+        head: &str,
+        message: &str,
+    ) -> Result<bool> {
+        let ended =
+            store::end_pull_gates_at_head(self.db, pr.repo.id, pr.number, head, self.now).await?;
+        self.after_ended(pr, &ended, message).await?;
+        Ok(!ended.is_empty())
+    }
+
+    /// Marks the cards of the `ended` runs of `pr` with `message`.
+    async fn after_ended(
+        &self,
+        pr: &PullRequest,
+        ended: &[store::RunRow],
+        message: &str,
+    ) -> Result<()> {
         if ended.is_empty() {
             return Ok(());
         }
@@ -559,7 +894,7 @@ impl Cx<'_> {
                 self.settings,
                 self.tokens,
                 &repo,
-                &ended,
+                ended,
                 message,
             )
             .await;
@@ -670,26 +1005,11 @@ impl Cx<'_> {
         // of any of them (`labeled` included) needs its row, so all are
         // recorded. The time is GitHub's, so a late delivery cannot
         // replace newer data.
-        let record = store::NewPull {
-            repo_id: pr.repo.id,
-            number: pr.number,
-            title: pr.title.clone(),
-            head_ref: pr.head_ref.clone(),
-            base_ref: pr.base_ref.clone(),
-            author: pr.author.clone(),
-            author_association: pr.author_association.clone(),
-            head_repo_id: pr
-                .fork
-                .as_ref()
-                .map_or(Some(pr.repo.id), |f| f.head_repo_id),
-            head_sha: pr.head_sha.clone(),
-            state: pr.state.to_owned(),
-            updated_at: pr.updated_at,
-        };
+        let record = pull_record(pr);
         let applied = match store::upsert_pull(self.db, &record).await? {
             store::PullWrite::Applied => true,
             store::PullWrite::Stale => false,
-            store::PullWrite::Tied => self.tie_is_current(pr, &record).await?,
+            store::PullWrite::Tied(recorded) => self.tie_is_current(pr, &record, &recorded).await?,
         };
         // The base branch's workflows need nothing of the head: they run
         // whatever happens to the fork's, and a late delivery is as good
@@ -697,14 +1017,109 @@ impl Cx<'_> {
         // The repository's policy is read once, by whichever group needs
         // it first.
         let mut policy = None;
-        let mut ids = self.pull_request_target(pr, applied, &mut policy).await?;
-        match self.pull_request_head(pr, applied, &mut policy).await? {
+        // The base branch's config and the head's are read together. The
+        // branch is probed by its name first: most repositories have no
+        // `pull_request_target` workflow, so that read is all they cost.
+        let base = async {
+            let probe = runs::read_config(
+                self.tokens,
+                self.settings,
+                pr.installation_id,
+                &pr.repo.full_name,
+                &runs::compile_ref_for(pr),
+            )
+            .await?;
+            // A config that is missing or cannot be read has nothing to
+            // run: the push that made it was told, on its own commit.
+            if !matches!(&probe, Config::Text(Ok(source))
+                if planning::has_pull_request_target(source))
+            {
+                return Ok(None);
+            }
+            self.base_config(pr).await
+        };
+        let head = self.config_at(pr.installation_id, &pr.repo, &pr.head_sha);
+        let (base, head) = futures_util::future::join(base, head).await;
+        let (base, head) = (base?, head?);
+        let head_parsed = parsed(&head).ok().flatten();
+        let base_parsed = base
+            .as_ref()
+            .and_then(|(_, config)| parsed(config).ok().flatten());
+        // Files cost up to three calls, so they are read only for a
+        // workflow that listens to this action and filters on paths.
+        let wants_paths = head_parsed.as_ref().is_some_and(|parsed| {
+            planning::needs_pull_request_paths(parsed, &pr.action, &pr.base_ref, None)
+        }) || base_parsed.as_ref().is_some_and(|parsed| {
+            planning::needs_pull_request_target_paths(parsed, &pr.action, &pr.base_ref, None)
+        });
+        let changed = if wants_paths {
+            self.pull_paths(pr).await?
+        } else {
+            Vec::new()
+        };
+        let mut ids = Vec::new();
+        if let Some((sha, config)) = &base {
+            let source = Source {
+                sha,
+                config,
+                parsed: base_parsed.as_ref(),
+                changed: &changed,
+            };
+            ids = self
+                .pull_request_target(
+                    pr,
+                    applied,
+                    &mut policy,
+                    self.delivery,
+                    Wanted::Delivery,
+                    source,
+                )
+                .await?
+                .0;
+        }
+        let source = Source {
+            sha: &pr.head_sha,
+            config: &head,
+            parsed: head_parsed.as_ref(),
+            changed: &changed,
+        };
+        match self
+            .pull_request_head(
+                pr,
+                applied,
+                &mut policy,
+                self.delivery,
+                Wanted::Delivery,
+                source,
+            )
+            .await?
+        {
             Outcome::Done(more) => ids.extend(more),
             Outcome::Ignored(reason) if ids.is_empty() => return Ok(Outcome::Ignored(reason)),
             Outcome::Ignored(_) => {}
             Outcome::Retry => return Ok(Outcome::Retry),
         }
         Ok(Outcome::Done(ids))
+    }
+
+    /// The base branch's head commit as it is now, and the config at it.
+    /// The commit comes first and the config is read at it, so the plan
+    /// and the `GITHUB_SHA` of the steps are of one commit. `None` when
+    /// the branch is gone.
+    async fn base_config(&self, pr: &PullRequest) -> Result<Option<(String, Config)>> {
+        let Some(sha) = runs::commit(
+            self.tokens,
+            self.settings,
+            pr.installation_id,
+            &pr.repo.full_name,
+            &runs::compile_ref_for(pr),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let config = self.config_at(pr.installation_id, &pr.repo, &sha).await?;
+        Ok(Some((sha, config)))
     }
 
     /// The repository's policy, read once for a delivery and kept in
@@ -768,56 +1183,32 @@ impl Cx<'_> {
     /// delivery older than what is recorded, start no run that would wait
     /// for an approval that cannot be given.
     ///
-    /// Most repositories have no such workflow, so one config read, by
-    /// the branch's name, is all they cost; the commit lookup and the
-    /// policy are for those that have one. The commit comes after the
-    /// read, and a branch that moved between them runs the config of the
-    /// moment before on the commit of the moment after.
+    /// The caller reads the commit and the config at it (see
+    /// [`Self::base_config`]), and the policy is read here. A branch that
+    /// moved since runs the config of the moment before on the commit of
+    /// the moment after.
+    ///
+    /// `delivery` is the key the runs are recorded under (see
+    /// [`target_delivery`]) and `wanted` says which workflows and as what
+    /// action. Returns the runs made and why the group was refused, if it
+    /// was.
     #[allow(clippy::too_many_lines)] // One delivery, read top to bottom.
     async fn pull_request_target(
         &self,
         pr: &PullRequest,
         applied: bool,
         cache: &mut Option<RepoPolicy>,
-    ) -> Result<Vec<u64>> {
+        delivery: &str,
+        wanted: Wanted<'_>,
+        source: Source<'_>,
+    ) -> Result<(Vec<u64>, Option<&'static str>)> {
         let git_ref = runs::compile_ref_for(pr);
-        // Whether the branch has a listener, read by its name.
-        let probe = runs::read_config(
-            self.tokens,
-            self.settings,
-            pr.installation_id,
-            &pr.repo.full_name,
-            &git_ref,
-        )
-        .await?;
-        // A config that is missing or cannot be read has nothing to run:
-        // the push that made it was told, on its own commit.
-        if !matches!(&probe, Config::Text(Ok(source)) if planning::has_pull_request_target(source))
-        {
-            return Ok(Vec::new());
-        }
-        let Some(sha) = runs::commit(
-            self.tokens,
-            self.settings,
-            pr.installation_id,
-            &pr.repo.full_name,
-            &git_ref,
-        )
-        .await?
-        else {
-            return Ok(Vec::new());
-        };
-        let sha = sha.as_str();
-        // The plan is the config at the commit the run is on, which is
-        // the `GITHUB_SHA` its steps see.
-        let config = runs::read_config(
-            self.tokens,
-            self.settings,
-            pr.installation_id,
-            &pr.repo.full_name,
+        let Source {
             sha,
-        )
-        .await?;
+            config,
+            parsed,
+            changed,
+        } = source;
         let policy = self.policy_of(pr, cache).await?;
         let waits = target_waits(&policy, pr.fork.is_some());
         if waits && applied {
@@ -852,82 +1243,92 @@ impl Cx<'_> {
         ) {
             TargetGate::Start(gate) => (gate, None),
             TargetGate::Refused(reason) => (GateStatus::NotGated, Some(reason)),
-            TargetGate::Stale => return Ok(Vec::new()),
-        };
-        let wants_paths = matches!(&config, Config::Text(Ok(source))
-            if planning::needs_pull_request_target_paths(source, &pr.action, &pr.base_ref));
-        let changed = if wants_paths {
-            self.pull_paths(pr).await?
-        } else {
-            Vec::new()
+            TargetGate::Stale => return Ok((Vec::new(), None)),
         };
         // A pull_request run of the same delivery and workflow is a
         // different run, so its key differs.
-        let delivery = target_delivery(self.delivery);
-        let trigger = Event::PullRequestTarget {
-            action: pr.action.clone(),
+        let delivery = target_delivery(delivery);
+        let batches = wanted.batches(pr, parsed, |action| Event::PullRequestTarget {
+            action: action.to_owned(),
             base_ref: pr.base_ref.clone(),
-            changed,
-        };
-        let ids = runs::create(
-            self.env,
-            self.db,
-            self.settings,
-            self.tokens,
-            &runs::Request {
-                tenant_id: self.tenant,
-                installation_id: pr.installation_id,
-                repo: &pr.repo,
-                delivery: &delivery,
-                event_name: "pull_request_target",
-                event: &pr.payload,
-                trigger: &trigger,
-                compile_ref: &git_ref,
-                git_ref: &git_ref,
-                sha,
-                actor: &pr.actor,
-                head_ref: &pr.head_ref,
-                base_ref: &pr.base_ref,
-                workflow: None,
-                origin: runs::Origin {
-                    // The fork the pull request is from, for the card and
-                    // the run's page; the run's trust stays the
-                    // repository's own.
-                    head_repo_id: pr.fork.as_ref().and_then(|fork| fork.head_repo_id),
-                    // A deleted fork has no name; an empty one still marks
-                    // the run as a fork's.
-                    head_repo_name: pr
-                        .fork
-                        .as_ref()
-                        .map(|fork| fork.head_repo_name.as_deref().unwrap_or("")),
-                    author: &pr.author,
-                    association: &pr.author_association,
-                    gate,
-                    target: Some(runs::Target {
-                        head_sha: &pr.head_sha,
-                        refused,
-                    }),
-                    ..runs::Origin::own(&pr.actor)
+            changed: changed.to_vec(),
+        });
+        // The gate and the waiting count above hold for all the batches:
+        // the group is admitted once.
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let started = runs::create(
+                self.env,
+                self.db,
+                self.settings,
+                self.tokens,
+                &runs::Request {
+                    tenant_id: self.tenant,
+                    installation_id: pr.installation_id,
+                    repo: &pr.repo,
+                    delivery: &delivery,
+                    event_name: "pull_request_target",
+                    event: &batch.pr.payload,
+                    trigger: &batch.trigger,
+                    compile_ref: &git_ref,
+                    git_ref: &git_ref,
+                    sha,
+                    actor: &pr.actor,
+                    head_ref: &pr.head_ref,
+                    base_ref: &pr.base_ref,
+                    workflows: batch.workflows.as_deref(),
+                    origin: runs::Origin {
+                        // The fork the pull request is from, for the card
+                        // and the run's page; the run's trust stays the
+                        // repository's own.
+                        head_repo_id: pr.fork.as_ref().and_then(|fork| fork.head_repo_id),
+                        // A deleted fork has no name; an empty one still
+                        // marks the run as a fork's.
+                        head_repo_name: pr
+                            .fork
+                            .as_ref()
+                            .map(|fork| fork.head_repo_name.as_deref().unwrap_or("")),
+                        author: &pr.author,
+                        association: &pr.author_association,
+                        gate,
+                        target: Some(runs::Target {
+                            head_sha: &pr.head_sha,
+                            refused,
+                        }),
+                        ..runs::Origin::own(&pr.actor)
+                    },
                 },
-            },
-            &config,
-            self.now,
-        )
-        .await?;
+                config,
+                self.now,
+            )
+            .await?;
+            ids.extend(started);
+        }
         if gate != GateStatus::NotGated {
             self.ask_approval(pr, &ids, &policy).await?;
         }
-        Ok(ids)
+        Ok((ids, refused))
     }
 
-    /// The `pull_request` workflows of a pull request, read at the head.
+    /// The `pull_request` workflows of a pull request, read at the head,
+    /// recorded under `delivery`; `wanted` says which workflows and as what
+    /// action.
     #[allow(clippy::too_many_lines)] // One delivery, read top to bottom.
     async fn pull_request_head(
         &self,
         pr: &PullRequest,
         applied: bool,
         cache: &mut Option<RepoPolicy>,
+        delivery: &str,
+        wanted: Wanted<'_>,
+        source: Source<'_>,
     ) -> Result<Outcome> {
+        let Source {
+            sha,
+            config,
+            parsed,
+            changed,
+        } = source;
         // A delivery older than what is recorded says nothing about the
         // pull request as it stands: it must not cancel the runs of the
         // newer commit as superseded, nor start runs of the older one.
@@ -947,72 +1348,60 @@ impl Cx<'_> {
             Ok(admitted) => admitted,
             Err(outcome) => return Ok(outcome),
         };
-        let config = runs::read_config(
-            self.tokens,
-            self.settings,
-            pr.installation_id,
-            &pr.repo.full_name,
-            &pr.head_sha,
-        )
-        .await?;
         let compile_ref = runs::compile_ref_for(pr);
-        // Files cost up to three calls, so they are read only for a
-        // workflow that listens to this action and filters on paths.
-        let wants_paths = matches!(&config, Config::Text(Ok(source))
-            if planning::needs_pull_request_paths(source, &pr.action, &pr.base_ref));
-        let changed = if wants_paths {
-            self.pull_paths(pr).await?
-        } else {
-            Vec::new()
-        };
-        let trigger = Event::PullRequest {
-            action: pr.action.clone(),
+        let batches = wanted.batches(pr, parsed, |action| Event::PullRequest {
+            action: action.to_owned(),
             base_ref: pr.base_ref.clone(),
-            changed,
-        };
+            changed: changed.to_vec(),
+        });
         let git_ref = format!("refs/pull/{}/merge", pr.number);
-        let ids = runs::create(
-            self.env,
-            self.db,
-            self.settings,
-            self.tokens,
-            &runs::Request {
-                tenant_id: self.tenant,
-                installation_id: pr.installation_id,
-                repo: &pr.repo,
-                delivery: self.delivery,
-                event_name: "pull_request",
-                event: &pr.payload,
-                trigger: &trigger,
-                compile_ref: &compile_ref,
-                git_ref: &git_ref,
-                sha: &pr.head_sha,
-                actor: &pr.actor,
-                head_ref: &pr.head_ref,
-                base_ref: &pr.base_ref,
-                workflow: None,
-                origin: match (&admitted, &pr.fork) {
-                    (Some((gate, policy)), Some(fork)) => runs::Origin {
-                        trust: Trust::Fork,
-                        head_repo_id: fork.head_repo_id,
-                        head_repo_name: fork.head_repo_name.as_deref(),
-                        author: &pr.author,
-                        association: &pr.author_association,
-                        gate: *gate,
-                        policy: Some(*policy),
-                        target: None,
-                    },
-                    _ => runs::Origin {
-                        author: &pr.author,
-                        association: &pr.author_association,
-                        ..runs::Origin::own(&pr.actor)
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let started = runs::create(
+                self.env,
+                self.db,
+                self.settings,
+                self.tokens,
+                &runs::Request {
+                    tenant_id: self.tenant,
+                    installation_id: pr.installation_id,
+                    repo: &pr.repo,
+                    delivery,
+                    event_name: "pull_request",
+                    event: &batch.pr.payload,
+                    trigger: &batch.trigger,
+                    compile_ref: &compile_ref,
+                    git_ref: &git_ref,
+                    sha,
+                    actor: &pr.actor,
+                    head_ref: &pr.head_ref,
+                    base_ref: &pr.base_ref,
+                    workflows: batch.workflows.as_deref(),
+                    origin: match (&admitted, &pr.fork) {
+                        (Some((gate, policy)), Some(fork)) => runs::Origin {
+                            trust: Trust::Fork,
+                            head_repo_id: fork.head_repo_id,
+                            head_repo_name: fork.head_repo_name.as_deref(),
+                            author: &pr.author,
+                            association: &pr.author_association,
+                            gate: *gate,
+                            policy: Some(*policy),
+                            target: None,
+                            chat: None,
+                        },
+                        _ => runs::Origin {
+                            author: &pr.author,
+                            association: &pr.author_association,
+                            ..runs::Origin::own(&pr.actor)
+                        },
                     },
                 },
-            },
-            &config,
-            self.now,
-        )
-        .await?;
+                config,
+                self.now,
+            )
+            .await?;
+            ids.extend(started);
+        }
         if let Some((gate, policy)) = &admitted
             && *gate != GateStatus::NotGated
         {
@@ -1086,6 +1475,853 @@ impl Cx<'_> {
         self.fire(&dispatch_fired(dispatch, sha), &config).await
     }
 
+    /// The login of this App's bot user, `<slug>[bot]`: the slug is
+    /// read from `GET /app` with the App's JWT and kept in KV, where it
+    /// never changes. Without it the loop guard could not tell, so a
+    /// failure fails the delivery to be tried again.
+    async fn bot_login(&self) -> Result<String> {
+        let kv = match self.env.kv(BOT_LOGIN_BINDING) {
+            Ok(kv) => Some(kv),
+            Err(err) => {
+                worker::console_warn!("app bot login: {BOT_LOGIN_BINDING} binding: {err}");
+                None
+            }
+        };
+        if let Some(kv) = &kv {
+            match kv.get(BOT_LOGIN_KEY).text().await {
+                Ok(Some(login)) if !login.is_empty() => return Ok(login),
+                Ok(_) => {}
+                Err(err) => worker::console_warn!("app bot login: cache: {err}"),
+            }
+        }
+        let jwt = hatchrun_cloud::start::app_jwt(&self.settings.app_id, &self.settings.app_key)
+            .await
+            .map_err(fail)?;
+        let response = hatchrun_cloud::fetch::send(&github::app(&self.settings.github_api, &jwt))
+            .await
+            .map_err(fail)?;
+        let login = github::bot_login(&response).map_err(fail)?;
+        if let Some(kv) = &kv {
+            let stored = match kv.put(BOT_LOGIN_KEY, login.as_str()) {
+                Ok(put) => put
+                    .expiration_ttl(BOT_LOGIN_TTL_SECS)
+                    .execute()
+                    .await
+                    .map_err(|err| err.to_string()),
+                Err(err) => Err(err.to_string()),
+            };
+            if let Err(err) = stored {
+                worker::console_warn!("app bot login: cache write: {err}");
+            }
+        }
+        Ok(login)
+    }
+
+    /// Whether the delivery's sender `actor`, a `Bot`, is this App's bot
+    /// user: what the App does starts no workflow, as an event of
+    /// `GITHUB_TOKEN` does not on GitHub, so a step's comment cannot start
+    /// another run. The caller asks only for a bot's delivery that some
+    /// workflow would act on. A lookup that fails counts as the App's own
+    /// and the delivery is skipped, logged and not failed: a loop is worse
+    /// than a bot-triggered run that is missed.
+    async fn is_own_app_sender(&self, actor: &str) -> bool {
+        let login = match self.bot_login().await {
+            Ok(login) => Some(login),
+            Err(err) => {
+                worker::console_error!(
+                    "{actor}: the App's bot login is unknown, so its delivery is skipped: {err}"
+                );
+                None
+            }
+        };
+        own_sender(actor, login.as_deref())
+    }
+
+    /// An issue activity runs on the head of the default branch, as on
+    /// GitHub.
+    async fn issues(&self, issue: &Issues) -> Result<Outcome> {
+        let id = issue.installation_id;
+        let Some((sha, config)) =
+            runs::default_head(self.tokens, self.settings, id, &issue.repo).await?
+        else {
+            return Ok(Outcome::Ignored("the repository has no commits".to_owned()));
+        };
+        if issue.actor_is_bot {
+            let event = Event::Issues {
+                action: issue.action.clone(),
+            };
+            let listens = matches!(&config, Config::Text(Ok(source))
+                if hatchrun_workflow::parse(source)
+                    .is_ok_and(|workflows| planning::listens(&workflows, &event)));
+            if !listens {
+                return Ok(Outcome::Ignored(
+                    "no workflow listens to this activity".to_owned(),
+                ));
+            }
+            if self.is_own_app_sender(&issue.actor).await {
+                return Ok(Outcome::Ignored(
+                    "the activity is the hatchrun App's own".to_owned(),
+                ));
+            }
+        }
+        let chat = store::Chat {
+            issue_number: issue.number,
+            command: None,
+        };
+        self.fire_with(&issues_fired(issue, sha), &config, Some(&chat))
+            .await
+    }
+
+    /// The pull request a comment is on, as GitHub has it now: the head
+    /// a command is pinned to, and where the checks go.
+    async fn comment_pull(&self, comment: &IssueComment) -> Result<Option<PullInfo>> {
+        let response = self
+            .tokens
+            .send(comment.installation_id, |token| {
+                github::pull_request(
+                    &self.settings.github_api,
+                    &comment.repo.full_name,
+                    comment.number,
+                    token,
+                )
+            })
+            .await
+            .map_err(|err| fail(err.to_string()))?;
+        github::pull_info(&response).map_err(fail)
+    }
+
+    /// What the commenter holds on the repository, asked of GitHub once
+    /// for the comment. `None` for no access at all.
+    async fn commenter_role(&self, comment: &IssueComment) -> Result<Option<CommandPermission>> {
+        let response = self
+            .tokens
+            .send(comment.installation_id, |token| {
+                github::collaborator_permission(
+                    &self.settings.github_api,
+                    &comment.repo.full_name,
+                    &comment.actor,
+                    token,
+                )
+            })
+            .await
+            .map_err(|err| fail(err.to_string()))?;
+        github::collaborator_role(&response).map_err(fail)
+    }
+
+    /// Posts `text` on the comment's issue or pull request as the App. A
+    /// failure is logged: the runs are made, and the delivery does not
+    /// fail for a reply.
+    async fn reply(&self, comment: &IssueComment, text: &str) {
+        let sent = self
+            .tokens
+            .send(comment.installation_id, |token| {
+                github::create_comment(
+                    &self.settings.github_api,
+                    &comment.repo.full_name,
+                    comment.number,
+                    token,
+                    text,
+                )
+            })
+            .await;
+        match sent {
+            Ok(response) if response.ok() => {}
+            Ok(response) => worker::console_warn!(
+                "{}: reply on #{}: GitHub answered {}",
+                comment.repo.full_name,
+                comment.number,
+                response.status
+            ),
+            Err(err) => worker::console_warn!(
+                "{}: reply on #{}: {err}",
+                comment.repo.full_name,
+                comment.number
+            ),
+        }
+    }
+
+    /// Reacts to the comment as the App. A failure is logged, as for
+    /// [`Self::reply`].
+    async fn react(&self, comment: &IssueComment, content: &str) {
+        let sent = self
+            .tokens
+            .send(comment.installation_id, |token| {
+                github::add_reaction(
+                    &self.settings.github_api,
+                    &comment.repo.full_name,
+                    comment.comment_id,
+                    token,
+                    content,
+                )
+            })
+            .await;
+        match sent {
+            Ok(response) if response.ok() => {}
+            Ok(response) => worker::console_warn!(
+                "{}: reaction on comment {}: GitHub answered {}",
+                comment.repo.full_name,
+                comment.comment_id,
+                response.status
+            ),
+            Err(err) => worker::console_warn!(
+                "{}: reaction on comment {}: {err}",
+                comment.repo.full_name,
+                comment.comment_id
+            ),
+        }
+    }
+
+    /// A comment runs the `issue_comment` workflows on the head of the
+    /// default branch, as on GitHub, and the chat commands it holds.
+    ///
+    /// The loop filter drops what the App itself wrote. A `created`
+    /// comment from a person is read for commands (see
+    /// [`Self::comment_commands`]); a bot's is not. The runs of one
+    /// issue or pull request are capped, and a comment over the cap
+    /// starts nothing.
+    #[allow(clippy::too_many_lines)] // One comment, read top to bottom.
+    async fn issue_comment(&self, comment: &IssueComment) -> Result<Outcome> {
+        let id = comment.installation_id;
+        let Some((sha, config)) =
+            runs::default_head(self.tokens, self.settings, id, &comment.repo).await?
+        else {
+            return Ok(Outcome::Ignored("the repository has no commits".to_owned()));
+        };
+        // The config is the default branch's. One that is missing or
+        // unusable has no workflow to run, and a comment is not the place
+        // to report it: the push that made it was told. The built-in
+        // `/approve-run` needs no config, so it is still read.
+        let workflows = match &config {
+            Config::Text(Ok(source)) => hatchrun_workflow::parse(source).ok(),
+            _ => None,
+        };
+        let event = Event::IssueComment {
+            action: comment.action.clone(),
+        };
+        let listens = workflows
+            .as_ref()
+            .is_some_and(|workflows| planning::listens(workflows, &event));
+        let commands = if comment.action == "created" && !comment.actor_is_bot {
+            let known = workflows
+                .as_ref()
+                .map(planning::command_names)
+                .unwrap_or_default();
+            hatchrun_workflow::command::parse_comment(&comment.body, |name| known.contains(name))
+        } else {
+            Vec::new()
+        };
+        if !listens && commands.is_empty() {
+            return Ok(Outcome::Ignored(
+                "no workflow listens to this comment".to_owned(),
+            ));
+        }
+        // A bot's comment starts only `issue_comment` workflows, and
+        // only when it is not the App's own.
+        if listens && comment.actor_is_bot && self.is_own_app_sender(&comment.actor).await {
+            return Ok(Outcome::Ignored(
+                "the comment is the hatchrun App's own".to_owned(),
+            ));
+        }
+        // The runs this delivery made already (a retry) are not counted,
+        // so a retry is not refused for its own runs. Two comments that
+        // arrive at once both read the count before either has made its
+        // runs and can together pass the cap: that overshoot is accepted,
+        // and the cap stays a soft one.
+        let active =
+            store::active_comment_runs(self.db, comment.repo.id, comment.number, self.delivery)
+                .await?;
+        let mut room = chatops::room(active);
+        if room == 0 {
+            worker::console_warn!(
+                "{}: #{} has {active} active runs from comments, so comment {} starts none",
+                comment.repo.full_name,
+                comment.number,
+                comment.comment_id
+            );
+            return Ok(Outcome::Ignored(
+                "too many active runs for this issue".to_owned(),
+            ));
+        }
+        // One call for the pull request's head, for the checks and for
+        // the sha of a command.
+        let pull = if comment.is_pull_request {
+            match self.comment_pull(comment).await? {
+                Some(pull) => Some(pull),
+                None => return Ok(Outcome::Ignored("the pull request is gone".to_owned())),
+            }
+        } else {
+            None
+        };
+        let default_ref = default_ref(&comment.repo);
+        let chat = store::Chat {
+            issue_number: comment.number,
+            command: None,
+        };
+        let mut ids = Vec::new();
+        if listens {
+            let started = runs::create(
+                self.env,
+                self.db,
+                self.settings,
+                self.tokens,
+                &runs::Request {
+                    tenant_id: self.tenant,
+                    installation_id: id,
+                    repo: &comment.repo,
+                    delivery: self.delivery,
+                    event_name: "issue_comment",
+                    event: &comment.payload,
+                    trigger: &event,
+                    compile_ref: &default_ref,
+                    git_ref: &default_ref,
+                    sha: &sha,
+                    actor: &comment.actor,
+                    head_ref: "",
+                    base_ref: "",
+                    workflows: None,
+                    origin: comment_origin(comment, pull.as_ref(), &chat),
+                },
+                &config,
+                self.now,
+            )
+            .await?;
+            room = room.saturating_sub(started.len() as u64);
+            ids.extend(started);
+        }
+        if !commands.is_empty() {
+            let run = CommentRun {
+                comment,
+                workflows: workflows.as_ref(),
+                config: &config,
+                sha: &sha,
+                default_ref: &default_ref,
+                pull: pull.as_ref(),
+            };
+            ids.extend(self.comment_commands(&run, &commands, room).await?);
+        }
+        Ok(Outcome::Done(ids))
+    }
+
+    /// The chat commands of a created comment. One call asks GitHub for
+    /// the commenter's role; a command whose workflow needs more starts
+    /// nothing and is only logged, so a stranger learns nothing of which
+    /// commands exist. A command that cannot run for want of a head sha
+    /// (or has a bad line) gets one reply from the App; a command that
+    /// started a run gets the `eyes` reaction.
+    #[allow(clippy::too_many_lines)] // One comment, read top to bottom.
+    async fn comment_commands(
+        &self,
+        run: &CommentRun<'_>,
+        commands: &[Found],
+        mut room: u64,
+    ) -> Result<Vec<u64>> {
+        let comment = run.comment;
+        let role = self.commenter_role(comment).await?;
+        let mut ids = Vec::new();
+        let mut replies: Vec<String> = Vec::new();
+        for found in commands {
+            if found.name == APPROVE_RUN {
+                ids.extend(self.approve_run(comment, found, role, run.pull).await?);
+                continue;
+            }
+            // A command of the config is known only when the config
+            // parsed.
+            let Some(workflows) = run.workflows else {
+                continue;
+            };
+            let defined =
+                planning::command_workflows(workflows, &found.name, comment.is_pull_request);
+            let allowed: Vec<_> = defined
+                .into_iter()
+                .filter(|wf| chatops::permits(role, wf.options.permission))
+                .collect();
+            let Some(role) = role.filter(|_| !allowed.is_empty()) else {
+                worker::console_warn!(
+                    "{}: {} may not run /{} on #{}",
+                    comment.repo.full_name,
+                    comment.actor,
+                    found.name,
+                    comment.number
+                );
+                continue;
+            };
+            let args = match &found.args {
+                Ok(args) => args,
+                Err(err) => {
+                    push_reply(&mut replies, err.to_string());
+                    continue;
+                }
+            };
+            for wf in allowed {
+                let head = match chatops::pin(&wf.options, args, &found.line, run.pull) {
+                    Pin::Reply(text) => {
+                        push_reply(&mut replies, text);
+                        continue;
+                    }
+                    Pin::Run(head) => head,
+                };
+                if room == 0 {
+                    worker::console_warn!(
+                        "{}: #{} is at its cap of active runs, so /{} starts nothing",
+                        comment.repo.full_name,
+                        comment.number,
+                        found.name
+                    );
+                    break;
+                }
+                let context = CommandContext {
+                    name: &found.name,
+                    line: &found.line,
+                    words: &args.words,
+                    names: &wf.options.args,
+                    actor: &comment.actor,
+                    role,
+                    pull: run.pull.map(|pull| (comment.number, pull)),
+                };
+                let event = chatops::event_with_command(&comment.payload, &context);
+                let chat = store::Chat {
+                    issue_number: comment.number,
+                    command: Some(store::CommentCommand {
+                        comment_id: comment.comment_id,
+                        name: found.name.clone(),
+                        rocket: wf.options.reaction == CommandReaction::Rocket,
+                    }),
+                };
+                let trigger = Event::Command {
+                    name: found.name.clone(),
+                    on_pull_request: comment.is_pull_request,
+                };
+                // One comment can carry several commands, and a workflow
+                // makes one run for each delivery.
+                let delivery = format!("{}:command:{}", self.delivery, found.name);
+                let started = runs::create(
+                    self.env,
+                    self.db,
+                    self.settings,
+                    self.tokens,
+                    &runs::Request {
+                        tenant_id: self.tenant,
+                        installation_id: comment.installation_id,
+                        repo: &comment.repo,
+                        delivery: &delivery,
+                        event_name: "issue_comment",
+                        event: &event,
+                        trigger: &trigger,
+                        compile_ref: run.default_ref,
+                        git_ref: run.default_ref,
+                        sha: run.sha,
+                        actor: &comment.actor,
+                        head_ref: "",
+                        base_ref: "",
+                        workflows: Some(std::slice::from_ref(&wf.workflow)),
+                        origin: runs::Origin {
+                            target: head.as_deref().map(|head_sha| runs::Target {
+                                head_sha,
+                                refused: None,
+                            }),
+                            ..comment_origin(comment, run.pull, &chat)
+                        },
+                    },
+                    run.config,
+                    self.now,
+                )
+                .await?;
+                room = room.saturating_sub(started.len() as u64);
+                ids.extend(started);
+            }
+        }
+        if !ids.is_empty() {
+            self.react(comment, chatops::ACCEPTED).await;
+        }
+        for text in &replies {
+            self.reply(comment, text).await;
+        }
+        Ok(ids)
+    }
+
+    /// The built-in `/approve-run --sha=<head>`: a second way into the
+    /// approval of a fork's pull request, with the checks of the check
+    /// run's button. It is called for the comment's line, in the order
+    /// of the comment, after the commenter's role was read and the pull
+    /// request fetched, and returns the ids of the runs it approved or
+    /// made.
+    ///
+    /// The commenter needs `write` and is told nothing below it. Then a
+    /// plain issue, a closed pull request, a missing or stale pin, a
+    /// pull request of this repository and fork runs turned off are
+    /// answered with a reply. For a fork's pull request each workflow is
+    /// decided on its own, for `pull_request` and for
+    /// `pull_request_target` (see [`chatops::decide`]): the waiting
+    /// runs at that head are approved (each approval is one statement
+    /// that only moves a waiting run, and expired, rejected or
+    /// superseded runs stay as they are); a run that is going is left
+    /// alone; and a workflow whose runs all ended is made again as a
+    /// delivery of its event makes it, counted against the same caps, and
+    /// approved by this comment.
+    #[allow(clippy::too_many_lines)] // One command, read top to bottom.
+    async fn approve_run(
+        &self,
+        comment: &IssueComment,
+        found: &Found,
+        role: Option<CommandPermission>,
+        pull: Option<&PullInfo>,
+    ) -> Result<Vec<u64>> {
+        if !chatops::permits(role, CommandPermission::Write) {
+            worker::console_warn!(
+                "{}: {} may not run /{} on #{}",
+                comment.repo.full_name,
+                comment.actor,
+                found.name,
+                comment.number
+            );
+            return Ok(Vec::new());
+        }
+        let args = match &found.args {
+            Ok(args) => args,
+            Err(err) => {
+                self.reply(comment, &err.to_string()).await;
+                return Ok(Vec::new());
+            }
+        };
+        let Some(pull) = pull else {
+            self.reply(comment, chatops::NO_HEAD_COMMIT).await;
+            return Ok(Vec::new());
+        };
+        if pull.state != "open" {
+            self.reply(comment, chatops::CLOSED_PULL_REQUEST).await;
+            return Ok(Vec::new());
+        }
+        let head = match chatops::approve_pin(args, &found.line, Some(pull)) {
+            Pin::Run(Some(head)) => head,
+            Pin::Run(None) => return Ok(Vec::new()),
+            Pin::Reply(text) => {
+                self.reply(comment, &text).await;
+                return Ok(Vec::new());
+            }
+        };
+        let (repo_id, number) = (comment.repo.id, comment.number);
+        let policy = store::repo_policy(self.db, repo_id, comment.repo.private).await?;
+        let target_approves = target_waits(&policy, true);
+        match chatops::unapprovable(pull.fork, policy.fork_runs, target_approves) {
+            Some(Unapprovable::NotAFork) => {
+                let made = store::pull_runs_at(self.db, repo_id, number, &head).await?;
+                if made.is_empty() {
+                    self.reply(comment, chatops::NOTHING_TO_APPROVE).await;
+                } else {
+                    self.react(comment, "+1").await;
+                }
+                return Ok(Vec::new());
+            }
+            Some(Unapprovable::ForkRunsOff) => {
+                self.reply(comment, fork::FORK_RUNS_OFF).await;
+                return Ok(Vec::new());
+            }
+            None => {}
+        }
+        // Fork runs off refuse the `pull_request` part only: it is never
+        // approved or made again, and the `pull_request_target` part goes
+        // on under the `approve` policy.
+        let forks_run = policy.fork_runs != ForkRuns::Off;
+        let events: &[&str] = if forks_run {
+            &["pull_request", "pull_request_target"]
+        } else {
+            &["pull_request_target"]
+        };
+        let mut policy = Some(policy);
+        // The pull request as it stands now: a push since the runs
+        // were made supersedes what waits at older commits, and an
+        // approval is only given while it is open at the run's commit.
+        let pr = pull_of_comment(comment, pull);
+        let record = pull_record(&pr);
+        // A snapshot that is not the newest word on the pull request
+        // (older than the row, or tied with it) never overwrites the row
+        // and cannot decide which runs to cancel. The row decides: the
+        // command goes on only if it is open at the pinned head, and says
+        // why it stops otherwise.
+        if store::upsert_pull(self.db, &record).await? != store::PullWrite::Applied
+            && self.stops_on_row(comment, &head, &found.line).await?
+        {
+            return Ok(Vec::new());
+        }
+        // The cancelling checks the row in its own statement: a newer
+        // head recorded since the pin was checked is not superseded by
+        // the pinned one. Nothing ended is also the case of nothing
+        // waiting, so the row is read again to tell the two apart.
+        if !self
+            .end_waiting_at_head(&pr, &head, fork::SUPERSEDED)
+            .await?
+            && self.stops_on_row(comment, &head, &found.line).await?
+        {
+            return Ok(Vec::new());
+        }
+        // Approving needs no config, so what waits is approved before
+        // anything is read from GitHub.
+        let approved = self.approve_head(comment, &head, events).await?;
+        // From here on, an error does not fail the delivery once runs
+        // were approved: they stay approved, and a retry of the comment
+        // would only say the same again.
+        let remade = async {
+            let mut ids = approved.clone();
+            let made: Vec<_> = store::pull_runs_at(self.db, repo_id, number, &head)
+                .await?
+                .into_iter()
+                .filter(|run| events.contains(&run.event.as_str()))
+                .collect();
+            // What each event may make again comes from the config it
+            // runs from, the head's for `pull_request` and the base
+            // branch's, at its head commit, for `pull_request_target`,
+            // and from its runs at the head.
+            let read_head = async {
+                if forks_run {
+                    self.config_at(comment.installation_id, &comment.repo, &head)
+                        .await
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            };
+            let read_base = async {
+                if target_approves {
+                    self.base_config(&pr).await
+                } else {
+                    Ok(None)
+                }
+            };
+            let (head_config, base) = futures_util::future::join(read_head, read_base).await;
+            let (head_config, base) = (head_config?, base?);
+            let head_parsed = head_config.as_ref().map_or(Ok(None), parsed);
+            let base_parsed = base.as_ref().map_or(Ok(None), |(_, config)| parsed(config));
+            let mut unusable = Vec::new();
+            if head_parsed.is_err() {
+                unusable.push(chatops::invalid_head_config(&head));
+            }
+            if base_parsed.is_err() {
+                let sha = base.as_ref().map(|(sha, _)| sha.as_str());
+                unusable.push(chatops::invalid_base_config(&pr.base_ref, sha));
+            }
+            let (head_parsed, base_parsed) =
+                (head_parsed.unwrap_or(None), base_parsed.unwrap_or(None));
+            let has_runs = |event: &str| made.iter().any(|run| run.event == event);
+            let head_actions = planning::remake_actions(has_runs("pull_request"));
+            let target_actions = planning::remake_actions(has_runs("pull_request_target"));
+            let decide = |changed: &[String]| {
+                (
+                    chatops::decide(
+                        &listed(
+                            head_parsed.as_ref(),
+                            head_event(&pr.base_ref, changed),
+                            head_actions,
+                        ),
+                        &made,
+                        "pull_request",
+                        self.now,
+                    ),
+                    chatops::decide(
+                        &listed(
+                            base_parsed.as_ref(),
+                            target_event(&pr.base_ref, changed),
+                            target_actions,
+                        ),
+                        &made,
+                        "pull_request_target",
+                        self.now,
+                    ),
+                )
+            };
+            let (mut head_decision, mut target_decision) = decide(&[]);
+            // The files are fetched once, and only when a workflow that
+            // would be made again filters on paths; the listing is then
+            // redone with them, so a workflow the files do not trigger
+            // is not made.
+            let wants_paths = |parsed: &Option<hatchrun_workflow::Config>,
+                               names: &[String],
+                               actions: &[&str],
+                               target: bool| {
+                parsed.as_ref().is_some_and(|parsed| {
+                    actions.iter().any(|action| {
+                        if target {
+                            planning::needs_pull_request_target_paths(
+                                parsed,
+                                action,
+                                &pr.base_ref,
+                                Some(names),
+                            )
+                        } else {
+                            planning::needs_pull_request_paths(
+                                parsed,
+                                action,
+                                &pr.base_ref,
+                                Some(names),
+                            )
+                        }
+                    })
+                })
+            };
+            let mut changed = Vec::new();
+            if wants_paths(&head_parsed, &head_decision.remake, head_actions, false)
+                || wants_paths(&base_parsed, &target_decision.remake, target_actions, true)
+            {
+                changed = self.pull_paths(&pr).await?;
+                (head_decision, target_decision) = decide(&changed);
+            }
+            let remakes = !head_decision.remake.is_empty() || !target_decision.remake.is_empty();
+            // An unusable config is answered with its own reply, ahead of
+            // any other.
+            for text in &unusable {
+                self.reply(comment, text).await;
+            }
+            if !remakes && ids.is_empty() {
+                if !unusable.is_empty() {
+                    self.react(comment, "-1").await;
+                } else if !forks_run {
+                    self.reply(comment, fork::FORK_RUNS_OFF).await;
+                } else if made.is_empty() {
+                    self.reply(comment, chatops::NOTHING_TO_RUN).await;
+                    self.react(comment, "-1").await;
+                } else {
+                    self.react(comment, "+1").await;
+                }
+                return Ok(Vec::new());
+            }
+            self.react(comment, chatops::ACCEPTED).await;
+            if remakes {
+                // The comment's delivery made no run of these workflows
+                // before, or a retry of it finds the ones it made (a run
+                // is one per delivery and workflow) and makes the rest.
+                // One call for each event makes all of its workflows, so
+                // the admission is counted once for the group. The make
+                // calls do not retry: a failure is an error, and the
+                // delivery is not asked to come again.
+                let delivery = format!("{}:approve-run", self.delivery);
+                let mut made_ids = Vec::new();
+                let mut refusals: Vec<String> = Vec::new();
+                if !head_decision.remake.is_empty()
+                    && let Some(config) = &head_config
+                {
+                    let source = Source {
+                        sha: &head,
+                        config,
+                        parsed: head_parsed.as_ref(),
+                        changed: &changed,
+                    };
+                    let wanted = Wanted::Remake {
+                        among: &head_decision.remake,
+                        actions: head_actions,
+                    };
+                    match self
+                        .pull_request_head(&pr, true, &mut policy, &delivery, wanted, source)
+                        .await?
+                    {
+                        Outcome::Done(started) => made_ids.extend(started),
+                        Outcome::Ignored(reason) => {
+                            worker::console_warn!(
+                                "{}: /approve-run on #{number} made no run: {reason}",
+                                comment.repo.full_name
+                            );
+                            refusals.push(chatops::refusal_reply(&reason).to_owned());
+                        }
+                        // The make calls never ask for a retry.
+                        Outcome::Retry => {}
+                    }
+                }
+                if !target_decision.remake.is_empty()
+                    && let Some((sha, config)) = &base
+                {
+                    let source = Source {
+                        sha,
+                        config,
+                        parsed: base_parsed.as_ref(),
+                        changed: &changed,
+                    };
+                    let wanted = Wanted::Remake {
+                        among: &target_decision.remake,
+                        actions: target_actions,
+                    };
+                    let (started, refused) = self
+                        .pull_request_target(&pr, true, &mut policy, &delivery, wanted, source)
+                        .await?;
+                    made_ids.extend(started);
+                    refusals
+                        .extend(refused.map(|reason| chatops::refusal_reply(reason).to_owned()));
+                }
+                refusals.dedup();
+                for text in &refusals {
+                    self.reply(comment, text).await;
+                }
+                // The new runs wait for an approval, and this comment is
+                // it.
+                if !made_ids.is_empty() {
+                    ids.extend(self.approve_head(comment, &head, events).await?);
+                }
+                ids.extend(made_ids);
+                if ids.is_empty() {
+                    // Nothing could be made: no workflow has a plan for
+                    // the actions it is made as.
+                    if refusals.is_empty() {
+                        self.reply(comment, chatops::NOTHING_TO_RUN).await;
+                    }
+                    self.react(comment, "-1").await;
+                    return Ok(Vec::new());
+                }
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            self.react(comment, "+1").await;
+            Ok::<_, worker::Error>(ids)
+        }
+        .await;
+        match remade {
+            Err(err) if !approved.is_empty() => {
+                worker::console_error!(
+                    "{}: /approve-run on #{number} approved runs, then failed: {err}",
+                    comment.repo.full_name
+                );
+                self.reply(comment, chatops::REMAKE_FAILED).await;
+                self.react(comment, "-1").await;
+                self.react(comment, "+1").await;
+                Ok(approved)
+            }
+            other => other,
+        }
+    }
+
+    /// Approves the waiting runs of `events` at `head` for the commenter
+    /// and has the cards updated. Returns the ids of the runs approved.
+    async fn approve_head(
+        &self,
+        comment: &IssueComment,
+        head: &str,
+        events: &[&str],
+    ) -> Result<Vec<u64>> {
+        let approved = store::approve_at_head(
+            self.db,
+            self.tenant,
+            comment.repo.id,
+            comment.number,
+            head,
+            &comment.actor,
+            self.now,
+            events,
+        )
+        .await?;
+        if !approved.is_empty()
+            && let Some(repo) = store::repo(self.db, comment.repo.id).await?
+        {
+            fork::after_approval(
+                self.env,
+                self.db,
+                self.settings,
+                self.tokens,
+                &repo,
+                &approved,
+                &comment.actor,
+            )
+            .await;
+        }
+        Ok(approved.iter().map(|run| run.id).collect())
+    }
+
+    /// The workflow config at `sha` of `repo`, read from GitHub.
     async fn config_at(&self, installation_id: u64, repo: &Repo, sha: &str) -> Result<Config> {
         runs::read_config(
             self.tokens,
@@ -1100,6 +2336,16 @@ impl Cx<'_> {
     /// Starts the workflows that `fired.trigger` matches in `config`,
     /// compiled for `fired.git_ref`.
     async fn fire(&self, fired: &Fired<'_>, config: &Config) -> Result<Outcome> {
+        self.fire_with(fired, config, None).await
+    }
+
+    /// [`Self::fire`], for runs tied to an issue (`chat`).
+    async fn fire_with(
+        &self,
+        fired: &Fired<'_>,
+        config: &Config,
+        chat: Option<&store::Chat>,
+    ) -> Result<Outcome> {
         let ids = runs::create(
             self.env,
             self.db,
@@ -1119,8 +2365,11 @@ impl Cx<'_> {
                 actor: fired.actor,
                 head_ref: "",
                 base_ref: "",
-                workflow: None,
-                origin: runs::Origin::own(fired.actor),
+                workflows: None,
+                origin: runs::Origin {
+                    chat,
+                    ..runs::Origin::own(fired.actor)
+                },
             },
             config,
             self.now,
@@ -1181,6 +2430,7 @@ impl Cx<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// The repository the tests deliver for.
     fn repo() -> Repo {
         Repo {
             id: 4242,
@@ -1190,6 +2440,7 @@ mod tests {
         }
     }
 
+    /// A push of `ref` by the test actor.
     fn ref_change(r#ref: &str) -> RefChange {
         RefChange {
             installation_id: 7,
@@ -1200,11 +2451,67 @@ mod tests {
         }
     }
 
+    /// The pull request a `pull_request` delivery of `body` reads as.
     fn pull(body: &str) -> PullRequest {
         match intake::parse("pull_request", body.as_bytes()).unwrap() {
             Trigger::PullRequest(pr) => pr,
             other => panic!("not a pull request: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_missing_config_is_kept_apart_from_an_unusable_one() {
+        assert!(matches!(parsed(&Config::Missing), Ok(None)));
+        let good = "workflows:\n  w:\n    on: { push: {} }\n    jobs: [t]\n";
+        assert!(matches!(
+            parsed(&Config::Text(Ok(good.to_owned()))),
+            Ok(Some(_))
+        ));
+        assert!(parsed(&Config::Text(Ok("not: [valid".to_owned()))).is_err());
+    }
+
+    #[test]
+    fn a_remake_without_a_parsed_config_makes_nothing() {
+        let pr = pull(include_str!("../testdata/pull_request_fork.json"));
+        let wanted = Wanted::Remake {
+            among: &[],
+            actions: planning::remake_actions(false),
+        };
+        assert!(
+            wanted
+                .batches(&pr, None, head_event("main", &[]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn approve_run_is_found_in_a_comment_without_any_config() {
+        // A config that is missing or does not parse knows no command,
+        // and the built-in one is still read.
+        let sha = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+        let body = format!("/retest\n/approve-run --sha={sha}");
+        let found = hatchrun_workflow::command::parse_comment(&body, |_| false);
+        let names: Vec<&str> = found.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, [APPROVE_RUN]);
+    }
+
+    #[test]
+    fn a_bot_login_that_cannot_be_read_skips_the_delivery() {
+        assert!(own_sender("hatchrun[bot]", Some("hatchrun[bot]")));
+        assert!(!own_sender("dependabot[bot]", Some("hatchrun[bot]")));
+        // The lookup failed: the delivery counts as the App's own.
+        assert!(own_sender("dependabot[bot]", None));
+    }
+
+    #[test]
+    fn only_the_apps_own_bot_login_is_its_sender() {
+        assert!(is_bot_login("hatchrun[bot]", "hatchrun[bot]"));
+        assert!(is_bot_login("Hatchrun[bot]", "hatchrun[bot]"));
+        // Another App's bot, a person who made the App's slug their
+        // name, and the slug without the suffix are not it.
+        assert!(!is_bot_login("dependabot[bot]", "hatchrun[bot]"));
+        assert!(!is_bot_login("hatchrun", "hatchrun[bot]"));
+        assert!(!is_bot_login("octocat", "hatchrun[bot]"));
     }
 
     #[test]

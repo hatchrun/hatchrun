@@ -32,9 +32,10 @@ use crate::permissions::{Level, Permissions, SCOPES};
 use crate::plan;
 use crate::templates::{template, template_labels, vendor_template};
 use crate::trigger::{
-    Dispatch, Filter, MERGE_GROUP_TYPES, MergeGroupTrigger, PullRequestTrigger, PushTrigger,
-    RELEASE_TYPES, RefTrigger, ReleaseTrigger, RepositoryDispatchTrigger, Schedule, Triggers,
-    WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
+    Dispatch, Filter, ISSUE_COMMENT_TYPES, ISSUES_TYPES, IssueCommentTrigger, IssuesTrigger,
+    MERGE_GROUP_TYPES, MergeGroupTrigger, PullRequestTrigger, PushTrigger, RELEASE_TYPES,
+    RefTrigger, ReleaseTrigger, RepositoryDispatchTrigger, Schedule, Triggers, WORKFLOW_RUN_TYPES,
+    WorkflowRunTrigger,
 };
 
 /// The result of a conversion: the config and what was dropped on the way.
@@ -63,7 +64,7 @@ pub struct Conversion {
 /// no name before its extension or repeats another file's name is
 /// skipped. Each problem is in [`Conversion::errors`]. A workflow left
 /// with no event hatchrun runs on, such as one that runs only on
-/// `issues`, is dropped with its jobs and a warning.
+/// `watch`, is dropped with its jobs and a warning.
 ///
 /// A file with `on: workflow_call` becomes a workflow with `on: call`,
 /// its inputs, secrets and outputs declared. A job with
@@ -227,11 +228,7 @@ const STEP_KEYS: &[&str] = &[
 const UNSUPPORTED_CONTEXTS: &[&str] = &["jobs"];
 
 /// The events hatchrun can start a workflow on.
-const EVENTS: &str = "push, pull_request, pull_request_target, schedule, workflow_dispatch, workflow_run, release, create, delete, merge_group and repository_dispatch";
-
-/// Events that only GitHub can deliver, as they act on GitHub's own
-/// issues and pull requests with the base repository's secrets.
-const GITHUB_ONLY: &[&str] = &["issues", "issue_comment"];
+const EVENTS: &str = "push, pull_request, pull_request_target, issues, issue_comment, schedule, workflow_dispatch, workflow_run, release, create, delete, merge_group and repository_dispatch";
 
 /// The part of a GitHub workflow file the converter reads.
 #[derive(Deserialize, Clone)]
@@ -418,6 +415,14 @@ struct GhMergeGroup {
     branches: Option<Value>,
     #[serde(default)]
     branches_ignore: Option<Value>,
+}
+
+/// `on.issues` and `on.issue_comment`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GhIssues {
+    #[serde(default)]
+    types: Option<Value>,
 }
 
 /// `on.repository_dispatch`.

@@ -173,6 +173,28 @@ pub struct RunInfo {
     /// the planner kept them has none.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// The commit the run's check runs go on when it is not `sha`: the
+    /// pull request head of an `issue_comment` run, which is on the
+    /// default branch. A run stored before this has none.
+    #[serde(default)]
+    pub check_sha: Option<String>,
+    /// The chat command that started the run: its check runs carry its
+    /// name, and the run's end reacts on its comment. A run stored before
+    /// this, or one no command started, has none.
+    #[serde(default)]
+    pub command: Option<RunCommand>,
+}
+
+/// The chat command a run was started by, as [`RunInfo`] keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCommand {
+    /// The comment the command was written in.
+    pub comment_id: u64,
+    /// The command's name, without the slash.
+    pub name: String,
+    /// Whether the run's end reacts with `rocket` and `confused`
+    /// instead of `+1` and `-1`.
+    pub rocket: bool,
 }
 
 /// The body of `POST /start`.

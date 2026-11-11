@@ -25,11 +25,12 @@ use worker::{
 };
 
 use crate::chain::{self, Change};
+use crate::chatops;
 use crate::checks::{JobView, Outbox, conclusion_word, details_url, render};
 use crate::concurrency;
 use crate::env::Settings;
 use crate::github::{
-    Capped, CheckRun, check_run_id, create_check_run, revoke_token, update_check_run,
+    self, Capped, CheckRun, check_run_id, create_check_run, revoke_token, update_check_run,
 };
 use crate::graph::{Action, Graph, State as NodeState};
 use crate::launches::{self, LaunchMessage};
@@ -45,7 +46,7 @@ use super::decide::{
 use super::log::{events_message, log_keys, log_prefix, mark_upload_due, tail_key};
 use super::{
     ALARM_FALLBACK_MS, BUCKET, CHAIN_LEASE_MS, DEADLINES, Deadlines, ESCALATE_AFTER_MS, EVENT,
-    GRAPH, INFO, JobState, LAUNCHES, OUTBOX, PendingChain, RESTORED_KEEP_MS, RunInfo,
+    GRAPH, INFO, JobState, LAUNCHES, OUTBOX, PendingChain, RESTORED_KEEP_MS, RunCommand, RunInfo,
     SNAPSHOT_RETRY_MS, Start, TODO, Todo, Work, is_run, job_key, restore_key, snapshot_key,
 };
 
@@ -350,6 +351,7 @@ impl<'a> Cx<'a> {
         self.db.get().ok_or_else(|| fail("no database"))
     }
 
+    #[allow(clippy::too_many_lines)] // One route table, read top to bottom.
     async fn route(
         &self,
         req: &mut Request,
@@ -1000,6 +1002,7 @@ impl<'a> Cx<'a> {
         .await
     }
 
+    /// Fires the pending chained workflows of a finished run as new runs in the same repository.
     async fn fire_chain(
         &self,
         info: &RunInfo,
@@ -1025,6 +1028,13 @@ impl<'a> Cx<'a> {
                 conclusion: pending.conclusion.as_deref(),
             })
             .collect();
+        for change in &changes {
+            // Stays ahead of `chain::fire`: a retry of this send reacts
+            // again, and GitHub answers a repeated reaction with 200.
+            if let ("completed", Some(conclusion)) = (change.action, change.conclusion) {
+                self.react_to_command(&tokens, info, conclusion).await;
+            }
+        }
         let ids = chain::fire(
             &chain::Services {
                 env: &self.env,
@@ -1042,6 +1052,52 @@ impl<'a> Cx<'a> {
             worker::console_log!("run {}: workflow_run started runs {ids:?}", info.run_id);
         }
         Ok(())
+    }
+
+    /// Leaves the result of a run that a chat command started on the
+    /// command's comment, as the App: `+1` or `-1`, or `rocket` or
+    /// `confused` for a command that asks for those (see
+    /// [`chatops::finished`]). A run no command started has none, and a
+    /// failure is only logged: it must not hold up the `workflow_run`
+    /// changes sent next, and GitHub answers a reaction the App already
+    /// left with 200, so a change sent again reacts again harmlessly.
+    async fn react_to_command(
+        &self,
+        tokens: &Tokens<'_, Kv, App, Counted>,
+        info: &RunInfo,
+        conclusion: &str,
+    ) {
+        let Some(RunCommand {
+            comment_id, rocket, ..
+        }) = &info.command
+        else {
+            return;
+        };
+        let (comment_id, rocket) = (*comment_id, *rocket);
+        let content = chatops::finished(rocket, conclusion);
+        let sent = tokens
+            .send(info.installation_id, |token| {
+                github::add_reaction(
+                    &self.settings.github_api,
+                    &info.repo.full_name,
+                    comment_id,
+                    token,
+                    content,
+                )
+            })
+            .await;
+        match sent {
+            Ok(response) if response.ok() => {}
+            Ok(response) => worker::console_warn!(
+                "run {}: reaction {content} on comment {comment_id}: GitHub answered {}",
+                info.run_id,
+                response.status
+            ),
+            Err(err) => worker::console_warn!(
+                "run {}: reaction {content} on comment {comment_id}: {err}",
+                info.run_id
+            ),
+        }
     }
 
     /// Gives the graph the variables of the run's scope when the job
@@ -1784,10 +1840,12 @@ impl<'a> Cx<'a> {
             };
             let view = JobView {
                 workflow: &run.info.workflow,
+                event_name: &run.info.event_name,
+                command: run.info.command.as_ref().map(|c| c.name.as_str()),
                 run_title: run.info.title.as_deref(),
                 warnings: &run.info.warnings,
                 node,
-                head_sha: &run.info.sha,
+                head_sha: run.info.check_sha.as_deref().unwrap_or(&run.info.sha),
                 details_url: details_url(
                     &self.settings.app_url,
                     &run.info.repo.full_name,

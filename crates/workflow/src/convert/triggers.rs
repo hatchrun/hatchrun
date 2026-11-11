@@ -7,11 +7,12 @@
 use super::calls::{scalar, show};
 use super::jobs::fit_default;
 use super::{
-    BTreeMap, Cx, Deserialize, Dispatch, EVENTS, GITHUB_ONLY, GhInput, GhMergeGroup, GhRef,
-    GhRelease, GhRepositoryDispatch, GhWorkflowRun, Level, MERGE_GROUP_TYPES, MergeGroupTrigger,
-    Parameter, ParameterKind, Permissions, PullRequestTrigger, PushTrigger, RELEASE_TYPES,
-    RefTrigger, ReleaseTrigger, RepositoryDispatchTrigger, SCOPES, Schedule, Triggers, Value,
-    WORKFLOW_RUN_TYPES, WorkflowRunTrigger,
+    BTreeMap, Cx, Deserialize, Dispatch, EVENTS, GhInput, GhIssues, GhMergeGroup, GhRef, GhRelease,
+    GhRepositoryDispatch, GhWorkflowRun, ISSUE_COMMENT_TYPES, ISSUES_TYPES, IssueCommentTrigger,
+    IssuesTrigger, Level, MERGE_GROUP_TYPES, MergeGroupTrigger, Parameter, ParameterKind,
+    Permissions, PullRequestTrigger, PushTrigger, RELEASE_TYPES, RefTrigger, ReleaseTrigger,
+    RepositoryDispatchTrigger, SCOPES, Schedule, Triggers, Value, WORKFLOW_RUN_TYPES,
+    WorkflowRunTrigger,
 };
 
 impl Cx {
@@ -157,6 +158,34 @@ impl Cx {
                 Ok(pr) => triggers.pull_request_target = Some(pr.unwrap_or_default()),
                 Err(err) => self.error(bad(err)),
             },
+            "issues" => match Option::<GhIssues>::deserialize(body) {
+                Ok(issues) => {
+                    let types = issues.and_then(|i| i.types).filter(|t| !t.is_null());
+                    triggers.issues = match types {
+                        None => Some(IssuesTrigger::default()),
+                        Some(types) => self
+                            .types(&format!("`{file}`: `on.issues`"), &types, ISSUES_TYPES)
+                            .map(|types| IssuesTrigger { types }),
+                    };
+                }
+                Err(err) => self.error(bad(err)),
+            },
+            "issue_comment" => match Option::<GhIssues>::deserialize(body) {
+                Ok(comment) => {
+                    let types = comment.and_then(|c| c.types).filter(|t| !t.is_null());
+                    triggers.issue_comment = match types {
+                        None => Some(IssueCommentTrigger::default()),
+                        Some(types) => self
+                            .types(
+                                &format!("`{file}`: `on.issue_comment`"),
+                                &types,
+                                ISSUE_COMMENT_TYPES,
+                            )
+                            .map(|types| IssueCommentTrigger { types }),
+                    };
+                }
+                Err(err) => self.error(bad(err)),
+            },
             "schedule" => match Vec::<Schedule>::deserialize(body) {
                 Ok(schedule) => triggers.schedule = schedule,
                 Err(err) => self.error(bad(err)),
@@ -210,16 +239,11 @@ impl Cx {
     }
 
     /// Warns about each event of a workflow that hatchrun does not run
-    /// on, and for those only GitHub delivers, to keep them there.
+    /// on.
     pub(super) fn dropped_events(&mut self, file: &str, unsupported: &[String]) {
         for event in unsupported {
-            let keep = if GITHUB_ONLY.contains(&event.as_str()) {
-                format!("; keep `on.{event}` on GitHub Actions")
-            } else {
-                String::new()
-            };
             self.warn(format!(
-                "`{file}`: `on.{event}` is not supported and was dropped; hatchrun runs on {EVENTS}{keep}"
+                "`{file}`: `on.{event}` is not supported and was dropped; hatchrun runs on {EVENTS}"
             ));
         }
     }

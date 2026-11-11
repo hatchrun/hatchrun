@@ -4,8 +4,11 @@
 
 //! Picks the workflows a GitHub event starts.
 
+use std::collections::BTreeSet;
+
 use hatchrun_workflow::{
-    Diagnostic, Event, Library, Plan, compile_with, config_errors, parse, triggered,
+    CommandOptions, Config, Diagnostic, Event, Library, Plan, compile_with, config_errors, parse,
+    triggered,
 };
 
 /// A triggered workflow that did not compile.
@@ -96,52 +99,65 @@ pub fn remote_workflows(source: &str, event: &Event) -> Vec<String> {
 }
 
 /// Whether a pull request `action` against `base_ref` starts a workflow
-/// that filters on changed paths, so the files are worth fetching.
-/// False when the config does not parse (it is reported without them).
+/// of `config` that filters on changed paths, so the files are worth
+/// fetching. With `among` only those workflows count.
 #[must_use]
-pub fn needs_pull_request_paths(source: &str, action: &str, base_ref: &str) -> bool {
+pub fn needs_pull_request_paths(
+    config: &Config,
+    action: &str,
+    base_ref: &str,
+    among: Option<&[String]>,
+) -> bool {
     needs_paths(
-        source,
+        config,
         &Event::PullRequest {
             action: action.to_owned(),
             base_ref: base_ref.to_owned(),
             changed: Vec::new(),
         },
+        among,
     )
 }
 
 /// As [`needs_pull_request_paths`], for the workflows of
-/// `on: pull_request_target`, which `source` is the base branch's config
-/// of.
+/// `on: pull_request_target`, which `config` is the base branch's of.
 #[must_use]
-pub fn needs_pull_request_target_paths(source: &str, action: &str, base_ref: &str) -> bool {
+pub fn needs_pull_request_target_paths(
+    config: &Config,
+    action: &str,
+    base_ref: &str,
+    among: Option<&[String]>,
+) -> bool {
     needs_paths(
-        source,
+        config,
         &Event::PullRequestTarget {
             action: action.to_owned(),
             base_ref: base_ref.to_owned(),
             changed: Vec::new(),
         },
+        among,
     )
 }
 
-/// Whether `event`, a pull request event, starts a workflow that filters
-/// on changed paths. Other events filter on none here.
-fn needs_paths(source: &str, event: &Event) -> bool {
-    let Ok(config) = parse(source) else {
-        return false;
-    };
-    config.workflows.values().any(|wf| {
-        let on = match event {
-            Event::PullRequest { .. } => &wf.on.pull_request,
-            Event::PullRequestTarget { .. } => &wf.on.pull_request_target,
-            _ => return false,
-        };
-        triggered(&wf.on, event)
-            && on
-                .as_ref()
-                .is_some_and(|pr| pr.paths.is_some() || pr.paths_ignore.is_some())
-    })
+/// Whether `event`, a pull request event, starts a workflow of `config`
+/// (of `among`, when given) that filters on changed paths. Other events
+/// filter on none here.
+fn needs_paths(config: &Config, event: &Event, among: Option<&[String]>) -> bool {
+    config
+        .workflows
+        .iter()
+        .filter(|(name, _)| among.is_none_or(|among| among.contains(name)))
+        .any(|(_, wf)| {
+            let on = match event {
+                Event::PullRequest { .. } => &wf.on.pull_request,
+                Event::PullRequestTarget { .. } => &wf.on.pull_request_target,
+                _ => return false,
+            };
+            triggered(&wf.on, event)
+                && on
+                    .as_ref()
+                    .is_some_and(|pr| pr.paths.is_some() || pr.paths_ignore.is_some())
+        })
 }
 
 /// Whether any workflow of `source` listens to `pull_request_target`,
@@ -155,6 +171,136 @@ pub fn has_pull_request_target(source: &str) -> bool {
             .values()
             .any(|wf| wf.on.pull_request_target.is_some())
     })
+}
+
+/// Whether any workflow of `config` listens to `event`, so the event is
+/// worth the calls that plan it.
+#[must_use]
+pub fn listens(config: &Config, event: &Event) -> bool {
+    config.workflows.values().any(|wf| triggered(&wf.on, event))
+}
+
+/// The pull request actions `/approve-run` makes a workflow again as, in
+/// the order it tries them.
+pub const REMAKE_ACTIONS: [&str; 3] = ["synchronize", "opened", "reopened"];
+
+/// The actions `/approve-run` makes workflows again as, for an event that
+/// `has_runs` at the head. The comment is no pull request delivery, so
+/// the action that starts a workflow is the one a commit gives:
+/// `synchronize`, and a workflow that only listens to `opened` or
+/// `reopened` is not made again. Only a head with no run of the event at
+/// all, where the whole delivery was lost, makes a workflow as the first
+/// of [`REMAKE_ACTIONS`] that it listens to.
+#[must_use]
+pub fn remake_actions(has_runs: bool) -> &'static [&'static str] {
+    if has_runs {
+        &REMAKE_ACTIONS[..1]
+    } else {
+        &REMAKE_ACTIONS
+    }
+}
+
+/// The workflows of `config` (those in `among`, all when `None`) that
+/// `/approve-run` makes again, grouped by the first of `actions` they
+/// listen to (see [`remake_actions`]). A workflow that listens to none
+/// of them (one that only runs on `labeled`, say) is not made again.
+/// `event` builds the trigger for an action, which is returned with the
+/// workflows it starts.
+#[must_use]
+pub fn remake_batches(
+    config: &Config,
+    event: impl Fn(&str) -> Event,
+    among: Option<&[String]>,
+    actions: &[&'static str],
+) -> Vec<(&'static str, Vec<String>, Event)> {
+    let mut left: Vec<&String> = config
+        .workflows
+        .keys()
+        .filter(|name| among.is_none_or(|among| among.contains(name)))
+        .collect();
+    let mut batches = Vec::new();
+    for action in actions {
+        let trigger = event(action);
+        let (hit, rest): (Vec<&String>, Vec<&String>) = left
+            .into_iter()
+            .partition(|name| triggered(&config.workflows[*name].on, &trigger));
+        left = rest;
+        if !hit.is_empty() {
+            batches.push((*action, hit.into_iter().cloned().collect(), trigger));
+        }
+    }
+    batches
+}
+
+/// The names of the chat commands any workflow of `config` defines, for
+/// the comment parser to look for.
+#[must_use]
+pub fn command_names(config: &Config) -> BTreeSet<String> {
+    config
+        .workflows
+        .values()
+        .filter_map(|wf| wf.on.command.as_ref())
+        .flat_map(|commands| commands.iter().map(|(name, _)| name.to_owned()))
+        .collect()
+}
+
+/// A workflow that defines a chat command, with the command's options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandWorkflow {
+    /// The workflow's name.
+    pub workflow: String,
+    /// The command's permission, places, sha rule and reaction.
+    pub options: CommandOptions,
+}
+
+/// The workflows of `config` that define the command `name` for a
+/// comment on a pull request (`on_pull_request`) or on a plain issue, in
+/// workflow name order. Each decides alone who may run it, so the caller
+/// checks each one's options.
+#[must_use]
+pub fn command_workflows(
+    config: &Config,
+    name: &str,
+    on_pull_request: bool,
+) -> Vec<CommandWorkflow> {
+    let event = Event::Command {
+        name: name.to_owned(),
+        on_pull_request,
+    };
+    config
+        .workflows
+        .iter()
+        .filter(|(_, wf)| triggered(&wf.on, &event))
+        .filter_map(|(workflow, wf)| {
+            Some(CommandWorkflow {
+                workflow: workflow.clone(),
+                options: wf.on.command_options(name)?.clone(),
+            })
+        })
+        .collect()
+}
+
+/// What the planner finds in each of `plans`, workflows of `source`:
+/// the findings of [`hatchrun_workflow::workflow_lints`] for the
+/// workflow's own triggers, one line each.
+#[must_use]
+pub fn workflow_findings(source: &str, plans: &[Plan]) -> Vec<Vec<String>> {
+    let config = parse(source).ok();
+    plans
+        .iter()
+        .map(|plan| {
+            config
+                .as_ref()
+                .and_then(|config| config.workflows.get(&plan.workflow))
+                .map(|wf| {
+                    hatchrun_workflow::workflow_lints(plan, &wf.on)
+                        .iter()
+                        .map(hatchrun_workflow::Lint::text)
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 /// Every `(workflow, cron)` pair of `on: schedule`, in workflow name
@@ -212,9 +358,24 @@ workflows:
     on: { pull_request: { types: [labeled], paths: ['docs/**'] } }
     jobs: [t]
 ";
-        assert!(needs_pull_request_paths(config, "labeled", "main"));
-        assert!(!needs_pull_request_paths(config, "opened", "main"));
-        assert!(!needs_pull_request_paths("not: [valid", "labeled", "main"));
+        let config = parse(config).unwrap();
+        assert!(needs_pull_request_paths(&config, "labeled", "main", None));
+        assert!(!needs_pull_request_paths(&config, "opened", "main", None));
+        // Only the workflows asked about count.
+        let plain = ["plain".to_owned()];
+        assert!(!needs_pull_request_paths(
+            &config,
+            "labeled",
+            "main",
+            Some(&plain)
+        ));
+        let docs = ["docs".to_owned()];
+        assert!(needs_pull_request_paths(
+            &config,
+            "labeled",
+            "main",
+            Some(&docs)
+        ));
     }
 
     #[test]
@@ -234,6 +395,184 @@ workflows:
         assert!(!has_pull_request_target("not: [valid"));
     }
 
+    const CHAT: &str = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  retest:
+    on:
+      command:
+        retest: {}
+    jobs: [t]
+  deploy:
+    on:
+      command:
+        deploy: { permission: maintain, in: [pull_request, issue] }
+        retest: { permission: admin }
+    jobs: [t]
+  triage:
+    on: { issue_comment: { types: [created] } }
+    jobs: [t]
+";
+
+    #[test]
+    fn the_commands_of_every_workflow_are_known() {
+        let names: Vec<String> = command_names(&parse(CHAT).unwrap()).into_iter().collect();
+        assert_eq!(names, ["deploy", "retest"]);
+        assert!(command_names(&parse(CONFIG).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_command_finds_the_workflows_that_define_it_for_the_place() {
+        let on_pr = command_workflows(&parse(CHAT).unwrap(), "retest", true);
+        let names: Vec<&str> = on_pr.iter().map(|c| c.workflow.as_str()).collect();
+        assert_eq!(names, ["deploy", "retest"]);
+        // Each workflow keeps its own options.
+        assert_eq!(
+            on_pr[0].options.permission,
+            hatchrun_workflow::CommandPermission::Admin
+        );
+        assert_eq!(
+            on_pr[1].options.permission,
+            hatchrun_workflow::CommandPermission::Write
+        );
+        // `deploy` allows issues, `retest` does not.
+        assert_eq!(
+            command_workflows(&parse(CHAT).unwrap(), "deploy", false).len(),
+            1
+        );
+        assert_eq!(
+            command_workflows(&parse(CHAT).unwrap(), "retest", false).len(),
+            0
+        );
+        assert_eq!(
+            command_workflows(&parse(CHAT).unwrap(), "nope", true).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_remade_workflow_runs_as_the_first_action_it_listens_to() {
+        let config = parse(
+            "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  a: { on: { pull_request: { types: [opened, reopened] } }, jobs: [t] }
+  b: { on: { pull_request: {} }, jobs: [t] }
+  c: { on: { pull_request: { types: [reopened] } }, jobs: [t] }
+  d: { on: { pull_request: { types: [labeled] } }, jobs: [t] }
+  e: { on: { push: {} }, jobs: [t] }
+",
+        )
+        .unwrap();
+        let event = |action: &str| Event::PullRequest {
+            action: action.into(),
+            base_ref: "main".into(),
+            changed: Vec::new(),
+        };
+        // `b` has the default types, which include `synchronize`; `d`
+        // and `e` listen to none of the three.
+        assert_eq!(
+            remake_batches(&config, event, None, &REMAKE_ACTIONS),
+            [
+                ("synchronize", vec!["b".to_owned()], event("synchronize")),
+                ("opened", vec!["a".to_owned()], event("opened")),
+                ("reopened", vec!["c".to_owned()], event("reopened")),
+            ]
+        );
+        // With runs at the head only `synchronize` makes a workflow again.
+        assert_eq!(
+            remake_batches(&config, event, None, remake_actions(true)),
+            [("synchronize", vec!["b".to_owned()], event("synchronize"))]
+        );
+        let among = ["a".to_owned(), "d".to_owned()];
+        assert_eq!(
+            remake_batches(&config, event, Some(&among), &REMAKE_ACTIONS),
+            [("opened", vec!["a".to_owned()], event("opened"))]
+        );
+    }
+
+    #[test]
+    fn a_remade_workflow_is_left_out_when_the_files_do_not_trigger_it() {
+        let config = parse(
+            "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [] }
+workflows:
+  docs: { on: { pull_request: { paths: ['docs/**'] } }, jobs: [t] }
+  all: { on: { pull_request: {} }, jobs: [t] }
+",
+        )
+        .unwrap();
+        let event = |changed: &[&str]| {
+            let changed: Vec<String> = changed.iter().map(|c| (*c).to_owned()).collect();
+            move |action: &str| Event::PullRequest {
+                action: action.into(),
+                base_ref: "main".into(),
+                changed: changed.clone(),
+            }
+        };
+        let names = |changed: &[&str]| {
+            remake_batches(&config, event(changed), None, remake_actions(true))
+                .into_iter()
+                .flat_map(|(_, names, _)| names)
+                .collect::<Vec<_>>()
+        };
+        // Unknown files list both, and the files decide.
+        assert_eq!(names(&[]), ["all", "docs"]);
+        assert_eq!(names(&["src/main.rs"]), ["all"]);
+        assert_eq!(names(&["docs/a.md"]), ["all", "docs"]);
+    }
+
+    #[test]
+    fn an_event_is_listened_to_by_a_workflow_that_names_it() {
+        let comment = |action: &str| Event::IssueComment {
+            action: action.into(),
+        };
+        let chat = parse(CHAT).unwrap();
+        assert!(listens(&chat, &comment("created")));
+        assert!(!listens(&chat, &comment("edited")));
+        assert!(!listens(
+            &chat,
+            &Event::Issues {
+                action: "opened".into()
+            }
+        ));
+    }
+
+    #[test]
+    fn a_workflows_findings_use_its_own_triggers() {
+        let config = "
+jobs:
+  t: { runs-on: ubuntu-latest, steps: [{ run: 'echo ${{ github.event.comment.body }}' }] }
+workflows:
+  talk:
+    on: { issue_comment: {} }
+    jobs: [t]
+  quiet:
+    on: { push: {} }
+    jobs: [t]
+";
+        let event = Event::IssueComment {
+            action: "created".into(),
+        };
+        let Selected::Plans { plans, .. } = select(config, &event, "refs/heads/main") else {
+            panic!("config is unusable");
+        };
+        assert_eq!(plans.len(), 1);
+        let found = workflow_findings(config, &plans);
+        assert!(!found[0].is_empty(), "{found:?}");
+        assert!(
+            found[0].iter().any(|line| line.contains("comment")),
+            "{found:?}"
+        );
+        assert_eq!(
+            workflow_findings("not: [valid", &plans),
+            [Vec::<String>::new()]
+        );
+    }
+
     #[test]
     fn pull_request_target_paths_are_needed_by_its_own_workflows_only() {
         let config = "
@@ -250,11 +589,16 @@ workflows:
     on: { pull_request: { types: [labeled], paths: ['src/**'] } }
     jobs: [t]
 ";
-        assert!(needs_pull_request_target_paths(config, "opened", "main"));
-        assert!(!needs_pull_request_target_paths(config, "labeled", "main"));
+        let config = parse(config).unwrap();
+        assert!(needs_pull_request_target_paths(
+            &config, "opened", "main", None
+        ));
+        assert!(!needs_pull_request_target_paths(
+            &config, "labeled", "main", None
+        ));
         // The pull_request workflow's filter is not the target's.
-        assert!(needs_pull_request_paths(config, "labeled", "main"));
-        assert!(!needs_pull_request_paths(config, "opened", "main"));
+        assert!(needs_pull_request_paths(&config, "labeled", "main", None));
+        assert!(!needs_pull_request_paths(&config, "opened", "main", None));
     }
 
     #[test]

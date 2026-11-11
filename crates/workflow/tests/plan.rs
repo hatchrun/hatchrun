@@ -455,6 +455,7 @@ workflows: { ci: { on: { push: {} }, jobs: [] } }
     );
 }
 
+/// Pins that a docker:// step plans and that an image is required.
 #[test]
 fn docker_uses_plans_and_needs_an_image() {
     let p = plan(
@@ -2614,4 +2615,116 @@ workflows: { ci: { on: { push: {} }, jobs: [t] } }
     json["jobs"][0].as_object_mut().unwrap().remove("services");
     let back: Plan = serde_json::from_value(json).unwrap();
     assert!(back.jobs[0].services.is_empty());
+}
+
+/// A config with one workflow whose `on` is `on`.
+fn on_yaml(on: &str) -> String {
+    format!(
+        "jobs: {{ t: {{ runs-on: ubuntu-latest, steps: [] }} }}\nworkflows:\n  ci:\n    on: {on}\n    jobs: [t]\n"
+    )
+}
+
+#[test]
+fn issues_and_issue_comment_types_are_checked() {
+    assert_eq!(errors(&on_yaml("{ issues: {}, issue_comment: {} }")), []);
+    assert_eq!(
+        errors(&on_yaml(
+            "{ issues: { types: [opened, field_added] }, issue_comment: { types: created } }"
+        )),
+        []
+    );
+    assert_error(
+        &on_yaml("{ issues: { types: [reopen] } }"),
+        &["on.issues", "`reopen`", "not supported"],
+    );
+    assert_error(
+        &on_yaml("{ issue_comment: { types: [] } }"),
+        &["on.issue_comment.types", "empty"],
+    );
+    assert_error(
+        &on_yaml("{ issue_comment: { types: [created, pinned] } }"),
+        &["on.issue_comment", "`pinned`"],
+    );
+}
+
+/// Pins which command names, options and shorthand forms validate.
+#[test]
+fn command_names_options_and_shorthands_validate() {
+    for on in [
+        "{ command: retest }",
+        "{ command: [retest, deploy] }",
+        "{ command: { retest: {}, deploy: { permission: maintain, in: [pull_request, issue], sha: optional, args: [environment], reaction: rocket } } }",
+        "{ command: { retest: } }",
+        "{ command: { a_b-9: {} } }",
+        "{ command: { issue-only: { in: [issue], sha: auto } } }",
+        "{ command: { both: { in: [pull_request, issue], sha: required } } }",
+    ] {
+        assert_eq!(errors(&on_yaml(on)), [], "{on}");
+    }
+}
+
+/// Pins that command errors name the command and the fix.
+#[test]
+fn command_errors_name_the_command_and_the_fix() {
+    assert_error(
+        &on_yaml("{ command: approve-run }"),
+        &["on.command.approve-run", "reserved"],
+    );
+    assert_error(
+        &on_yaml("{ command: { approve-run: {} } }"),
+        &["approve-run", "reserved"],
+    );
+    for bad in [
+        "Retest",
+        "re test",
+        "re/test",
+        "r\u{e9}test",
+        &"x".repeat(33),
+        "\"\"",
+    ] {
+        assert_error(
+            &on_yaml(&format!("{{ command: {{ {bad}: {{}} }} }}")),
+            &["on.command", "lowercase letters, digits"],
+        );
+    }
+    assert_eq!(
+        errors(&on_yaml(&format!("{{ command: {} }}", "x".repeat(32)))),
+        []
+    );
+    assert_error(
+        &on_yaml("{ command: { look: { sha: required, in: [issue] } } }"),
+        &["on.command.look", "sha: required", "pull_request"],
+    );
+    assert_error(
+        &on_yaml("{ command: { look: { in: [] } } }"),
+        &["on.command.look", "`in` is empty"],
+    );
+    assert_error(
+        &on_yaml("{ command: [] }"),
+        &["on.command", "names no command"],
+    );
+    assert_error(
+        &on_yaml("{ command: { a: { args: [x, x] } } }"),
+        &["argument name `x`", "twice"],
+    );
+    assert_error(
+        &on_yaml("{ command: { a: { args: ['x y'] } } }"),
+        &["argument name `x y`"],
+    );
+}
+
+/// Pins that unknown command options and values fail to parse.
+#[test]
+fn command_options_that_do_not_exist_do_not_parse() {
+    for on in [
+        "{ command: { a: { permission: owner } } }",
+        "{ command: { a: { in: [discussion] } } }",
+        "{ command: { a: { sha: maybe } } }",
+        "{ command: { a: { reaction: tada } } }",
+        "{ command: { a: { color: red } } }",
+        "{ command: 3 }",
+        "{ command: [a, a] }",
+    ] {
+        assert!(parse(&on_yaml(on)).is_err(), "{on}");
+    }
 }

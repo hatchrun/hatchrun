@@ -208,9 +208,181 @@ that runs a job, set them on the job under `jobs:`.
 | `call`                | `inputs`, `secrets`, `outputs`; started by another workflow.   |
 | `merge_group`         | `types` (default `checks_requested`).                          |
 | `repository_dispatch` | `types`, the `event_type` values.                              |
+| `issues`              | `types` (default all, see below).                              |
+| `issue_comment`       | `types` (default `created`, `edited`, `deleted`).              |
+| `command`             | Chat commands, see [Chat commands](#chat-commands).            |
 
 Filters are lists of glob patterns. `branches`/`tags` include, the
 `-ignore` form excludes, and a pattern starting with `!` negates.
+
+## Issues, comments and chat commands
+
+`issues` and `issue_comment` run the workflow on the default branch with
+the repository's secrets, as on GitHub. The workflow file and its checkout
+are the base repository's: a comment cannot change what runs, it can only
+choose whether it runs. `github.event` is GitHub's payload, so
+`github.event.issue.*` and `github.event.comment.*` work as documented. A
+comment on a pull request is an `issue_comment` with
+`github.event.issue.pull_request` set; the pull request's head is not
+checked out unless the workflow does it.
+
+`issues` types are `opened`, `edited`, `deleted`, `transferred`, `pinned`,
+`unpinned`, `closed`, `reopened`, `assigned`, `unassigned`, `labeled`,
+`unlabeled`, `locked`, `unlocked`, `milestoned`, `demilestoned`, `typed`,
+`untyped`, `field_added` and `field_removed`. `issue_comment` types are
+`created`, `edited` and `deleted`. A type may be written as a plain
+string. A review comment on a diff line is not covered.
+
+Text in these events is written by whoever opened the issue or comment.
+`hatchrun validate` and `hatchrun convert` warn when a script interpolates
+`github.event.issue.title`, `github.event.issue.body`,
+`github.event.comment.body` or `github.event.command.line`, `args` or
+`named` with `${{ }}`. Pass the value through `env:` and read it as a
+shell variable. The same warning covers `pull_request_target`.
+
+### ChatOps by hand
+
+The portable form works on GitHub Actions too, and conversion keeps it:
+
+```yaml
+workflows:
+  retest:
+    on:
+      issue_comment:
+        types: [created]
+    jobs:
+      - retest
+
+jobs:
+  retest:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/retest') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+               github.event.comment.author_association)
+    steps:
+      - run: ./retest.sh
+```
+
+It has two caveats:
+
+1. `contains(github.event.comment.body, '/retest')` matches the command
+   anywhere, including a quote of an earlier comment and a code block.
+   Anchor it with `startsWith`.
+2. `author_association` is not a permission level. `MEMBER` includes
+   organization members with read access, and `COLLABORATOR` can be a
+   read-only invitee. A command that deploys or spends money should not
+   trust it.
+
+`hatchrun validate` warns on an `issue_comment` job that has no `if:`
+mentioning `author_association`, `actor` or a permission (a job that
+needs a checked job is covered by it), and on a `contains` match against
+`comment.body`.
+
+### Chat commands
+
+`on.command` fixes both caveats. The control plane finds the command in a
+created comment, checks the commenter's repository permission before a
+run exists. A commenter below the required permission gets no reply and
+no reaction. A command that starts runs gets an `eyes` reaction, and
+the run's end leaves the reaction of the `reaction` option.
+
+The control plane replies in the comment only when a command started
+nothing or could not finish, and says why:
+
+- an argument error (too many words, a word that is too long, a bad
+  `--sha=`);
+- a missing `--sha=` (the reply quotes the line with the head to add),
+  a `--sha=` that is not the pull request's current head (the reply
+  names the head), and `Issues have no head commit` for a `--sha=` on a
+  plain issue;
+- for `/approve-run`: `The pull request is closed`, `This pull request is
+  from this repository, so there is nothing to approve` (when runs of
+  the head exist on such a pull request the command reacts `+1`
+  instead), `Fork runs are off for this repository`,
+  `No workflow runs on this pull request`, `Too many fork runs wait for
+  approval`, an invalid config reply (the head's or the base branch's,
+  naming the events that did not start), and `The approval went through,
+  but making the runs again failed`.
+
+```yaml
+workflows:
+  retest:
+    on:
+      command:
+        retest: {}                       # permission: write, in: [pull_request]
+        deploy:
+          permission: maintain
+          args: [environment]            # names the words after the command
+          sha: auto
+    jobs:
+      - go
+```
+
+`command: retest` and `command: [retest, deploy]` take the defaults.
+
+| Option       | Meaning                                                           | Default          |
+| ------------ | ----------------------------------------------------------------- | ---------------- |
+| `permission` | Repository permission the commenter must hold: `read`, `triage`, `write`, `maintain`, `admin`. | `write`          |
+| `in`         | Where the comment may be: `pull_request`, `issue`.                | `[pull_request]` |
+| `sha`        | Whether the comment must name the head sha: `required`, `optional`, or `auto` (required when the pull request is from a fork). | `auto`           |
+| `args`       | Names for the words after the command, read as `github.event.command.named.<name>`. | none             |
+| `reaction`   | `default` leaves `+1` or `-1`; `rocket` leaves `rocket` or `confused`. | `default`        |
+
+A command name is lowercase letters, digits, `-` and `_`, at most 32
+characters. `approve-run` is reserved. `sha: required` needs `in` to
+include `pull_request`, since an issue has no head commit.
+
+A line of the comment is a command when it starts, after optional
+whitespace, with `/<name>` and then ends or goes on after a space.
+`/retestx` is not `/retest`. The first line of each name wins, lines in
+fenced code blocks (``` or ~~~) and block quotes (`>`) never match, and at
+most 3 commands are read from one comment. Edits and deletes never run a
+command.
+
+The words after the name are arguments, passed unchanged, at most 20
+words of 200 characters each. They are untrusted text: read them through
+`env:`. The word `--sha=<40 hex digits>` is the sha pin and is not an
+argument. A short or non-hex value, or a second `--sha=`, refuses the
+command with a reply.
+
+The run's `github.event.command` has `name`, `line`, `args`, `named`,
+`actor`, `permission` and, for a comment on a pull request,
+`pull_request` with `number`, `head_sha`, `head_repo`, `base_ref` and
+`fork`. A job that runs the pull request's code checks out the sha the
+commenter named:
+
+```yaml
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.command.pull_request.head_sha }}
+      - run: ./deploy.sh "$ENVIRONMENT"
+        env:
+          ENVIRONMENT: ${{ github.event.command.named.environment }}
+```
+
+A command that needs a sha and has no `--sha=` starts nothing; the reply
+quotes the line with the head sha to add, as in
+`Add --sha=<head> to: /deploy staging`. A sha that is not the pull
+request's current head starts nothing and the reply names the new head.
+A match runs with `head_sha` set to that sha, and a push after that
+changes nothing. On a plain issue `--sha=` is refused.
+
+`hatchrun validate` accepts the `head_sha` checkout without a warning when
+every command of the workflow needs `write` or higher and has `sha` set
+to `required` or `auto`, and warns on `github.head_ref`, `refs/pull/`
+refs, `head_repo` and the head of a command that needs less than `write`
+or has `sha: optional`.
+
+`/approve-run --sha=<40 hex digits>` is a built-in command that needs no
+workflow. A commenter with `write` or higher approves the waiting fork run
+for exactly that sha. It follows the same pin rule: the sha is required and
+a stale one approves nothing.
 
 ## Parameters
 

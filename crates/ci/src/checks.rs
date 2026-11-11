@@ -37,10 +37,26 @@ pub const TAIL_LINES: usize = 100;
 
 const EXTERNAL_ID_PREFIX: &str = "hatchrun-ci:";
 
-/// The check run's name: the workflow and the planned job's id.
+/// The check run's name: the workflow and the planned job's id. The
+/// runs of an `issues` or `issue_comment` event or of a chat command
+/// are started by anyone who can open an issue or comment, and may
+/// report on a pull request's head, so their names end in the event or
+/// the command. They can then never replace a required check of the
+/// pull request's own runs.
 #[must_use]
-pub fn check_name(workflow: &str, plan_id: &str) -> String {
-    format!("{workflow} / {plan_id}")
+pub fn check_name(
+    workflow: &str,
+    plan_id: &str,
+    event_name: &str,
+    command: Option<&str>,
+) -> String {
+    match (command, event_name) {
+        (Some(command), _) => format!("{workflow} / {plan_id} (/{command})"),
+        (None, event @ ("issue_comment" | "issues")) => {
+            format!("{workflow} / {plan_id} ({event})")
+        }
+        (None, _) => format!("{workflow} / {plan_id}"),
+    }
 }
 
 /// The `external_id` that names job `job_id` again when GitHub asks for
@@ -78,6 +94,10 @@ pub struct StepView {
 pub struct JobView<'a> {
     /// The workflow's name.
     pub workflow: &'a str,
+    /// The event that started the run.
+    pub event_name: &'a str,
+    /// The chat command that started the run, without the slash.
+    pub command: Option<&'a str>,
     /// The run's title, from the workflow's `run-name`.
     pub run_title: Option<&'a str>,
     /// What the planner found in the workflow, one line each.
@@ -212,6 +232,7 @@ fn capped_lines(capped: &[Capped]) -> String {
 /// [`MAX_TOTAL_ANNOTATIONS`]; the summary says how many were left out
 /// past that. Summary and text are cut to [`MAX_OUTPUT_CHARS`].
 #[must_use]
+#[allow(clippy::too_many_lines)] // One request, built top to bottom.
 pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
     let held = view.held.filter(|_| view.node.state == State::Queued);
     let (status, conclusion, title) = match view.node.state {
@@ -301,7 +322,12 @@ pub fn render(view: &JobView<'_>) -> (CheckRun, usize) {
         .map(|tail| tail_text(tail, step_failed));
 
     let run = CheckRun {
-        name: check_name(view.workflow, &view.node.job.id),
+        name: check_name(
+            view.workflow,
+            &view.node.job.id,
+            view.event_name,
+            view.command,
+        ),
         head_sha: view.head_sha.to_owned(),
         external_id: external_id(view.node.id),
         details_url: view.details_url.clone(),
@@ -520,6 +546,8 @@ mod tests {
     fn view<'a>(node: &'a Node, steps: &'a [StepView], notes: &'a [Annotation]) -> JobView<'a> {
         JobView {
             workflow: "ci",
+            event_name: "push",
+            command: None,
             run_title: None,
             warnings: &[],
             node,
@@ -563,8 +591,34 @@ mod tests {
     }
 
     #[test]
+    fn comment_and_command_runs_never_share_a_name_with_the_pull_request_runs() {
+        let own = check_name("ci", "test", "pull_request", None);
+        let comment = check_name("ci", "test", "issue_comment", None);
+        let command = check_name("ci", "test", "issue_comment", Some("retest"));
+        assert_eq!(comment, "ci / test (issue_comment)");
+        assert_eq!(
+            check_name("ci", "test", "issues", None),
+            "ci / test (issues)"
+        );
+        assert_eq!(command, "ci / test (/retest)");
+        assert_ne!(own, comment);
+        assert_ne!(own, command);
+        assert_ne!(comment, command);
+        let node = node(State::Queued, None);
+        let (run, _) = render(&JobView {
+            event_name: "issue_comment",
+            command: Some("retest"),
+            ..view(&node, &[], &[])
+        });
+        assert_eq!(run.name, format!("ci / {} (/retest)", node.job.id));
+    }
+
+    #[test]
     fn names_and_external_ids_round_trip() {
-        assert_eq!(check_name("ci", "test (linux)"), "ci / test (linux)");
+        assert_eq!(
+            check_name("ci", "test (linux)", "push", None),
+            "ci / test (linux)"
+        );
         assert_eq!(external_id(42), "hatchrun-ci:42");
         assert_eq!(parse_external_id("hatchrun-ci:42"), Some(42));
         assert_eq!(parse_external_id("hatchrun-ci:x"), None);

@@ -485,7 +485,11 @@ head-checkout detector applies to all three events and `workflow_run`.
 GitHub attaches no check run to these events. hatchrun attaches them to
 an `issue_comment` on a PR, on the PR head sha (one `GET /pulls/{n}` at
 intake), so `/retest` shows next to the other checks. A plain issue has no
-commit and no check run; the run shows in the app.
+commit and no check run; the run shows in the app. These check runs are
+named `{workflow} / {job} (issue_comment)` or `(issues)`, and
+`{workflow} / {job} (/<command>)` for a command run, never the `{workflow} / {job}` of the pull request's own
+runs: anyone who can comment starts them, and on the same name they could
+replace a required check with `success`.
 
 The platform reacts to command comments itself, with the App's own
 identity: `eyes` when the delivery is accepted, then `+1` on success or
@@ -644,8 +648,9 @@ command with `sha: required` and `in: [issue]` is a validation error, and
 one that lists both places refuses on issues with the same reason.
 
 The validator accepts the `head_sha` form without the head-checkout
-warning when the command requires `write` or higher, and warns on
-`github.head_ref` and `refs/pull/` forms.
+warning when every command requires `write` or higher and has `sha` set
+to `required` or `auto` (with `optional` the pin can be left out), and
+warns on `github.head_ref` and `refs/pull/` forms.
 
 A command on a fork PR from a maintainer is deliberately trusted. The
 maintainer chose to run it with secrets. This is the `/ok-to-test` and
@@ -665,8 +670,10 @@ command refuses with `The pull request is closed`.
 
 The commenter needs `write` or higher (same collaborator permission
 call). The command runs the rules of the repository policy first: with
-`fork_runs = off` (the default for private repositories) it creates and
-approves nothing and replies `Fork runs are off for this repository`.
+`fork_runs = off` (the default for private repositories) it leaves the
+`pull_request` runs alone and replies `Fork runs are off for this
+repository` when it did nothing else; `pull_request_target` runs that wait
+under `approve` are still approved and made again.
 
 Then, for that sha:
 
@@ -679,6 +686,20 @@ Then, for that sha:
   The new run starts gated and this comment is its approval, recorded as
   `gate_by` the commenter;
 - with no run at all, it creates one the same way.
+
+Each workflow that listens is decided on its own, for `pull_request`
+(the head's config) and for `pull_request_target` (the base branch's), from
+its runs at the head; a listed workflow with no run is made too, so a retry
+after a partial failure makes the missing ones. With `fork_runs = off` the
+`pull_request` runs are never approved or made. What waits is approved
+before any config is read. A workflow is made again as `synchronize`, the
+action a commit gives; one that only listens to `opened`, `reopened` or
+`labeled` is not. Only when the head has no run of the event at all (the
+whole delivery was dropped) is a workflow made as the first of
+`synchronize`, `opened` and `reopened` that it listens to. A workflow the
+pull request's files do not trigger is not made. When nothing could be
+made, the reply says so, and a config that cannot be used is named in a
+reply (the head sha, or the base branch and its sha).
 
 A new run still counts against the pending, deferred and per-author caps.
 `/approve-run` is the only built-in command, and the name is reserved.
@@ -717,6 +738,12 @@ backfills existing rows (`trusted`, no gate).
 - `ci_repo_policy`: new table, columns in "Repository policy".
 - `ci_jobs`: no change. Environment approval stays per job attempt.
   Fork approval lives on the run so one decision releases every job.
+
+Migration `0024_ci_chatops.sql` adds nullable columns to `ci_runs` (a run
+that is not from an issue or a comment has none, so nothing is
+backfilled): `issue_number` (the issue or pull request, for the cap),
+`comment_id`, `command_name` and `command_reaction` (`default` or
+`rocket`), the last three set together for a run a chat command started.
 
 ## Phases and pull requests
 

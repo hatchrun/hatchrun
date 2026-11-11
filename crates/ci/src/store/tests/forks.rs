@@ -5,6 +5,20 @@
 use super::*;
 use crate::policy::{ForkApproval, ForkRuns, HeadCheckout, RepoPolicy};
 
+const BOTH: &[&str] = &["pull_request", "pull_request_target"];
+
+/// Records `pull` as the row, whatever the row holds.
+fn put_pull(db: &TestDb, pull: &NewPull) {
+    db.run(
+        "DELETE FROM ci_pulls WHERE repo_id = $1 AND number = $2",
+        &params![pull.repo_id, pull.number],
+    );
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), pull)).unwrap(),
+        PullWrite::Applied
+    );
+}
+
 /// A fork run of pull request `number` at `sha` by `author`, in `gate`.
 fn fork_run(
     db: &TestDb,
@@ -33,8 +47,8 @@ fn fork_run(
     // run is approved only while its pull request is open at its commit.
     // Forced, so a later call for the same pull request wins whatever the
     // time says.
-    db.wait(upsert_pull_forced(
-        db.db(),
+    put_pull(
+        db,
         &NewPull {
             repo_id: 7,
             number,
@@ -48,8 +62,7 @@ fn fork_run(
             state: "open".into(),
             updated_at: 5_000_000,
         },
-    ))
-    .unwrap();
+    );
     run
 }
 
@@ -1067,6 +1080,7 @@ fn a_run_is_approved_only_while_its_pull_request_is_open_at_its_commit() {
     );
 }
 
+/// Pins that a delivery older than the recorded pull request is not applied.
 #[test]
 fn a_delivery_older_than_the_recorded_pull_request_does_not_apply() {
     let db = setup();
@@ -1115,11 +1129,11 @@ fn a_delivery_older_than_the_recorded_pull_request_does_not_apply() {
     pull.head_sha = "B2".into();
     assert_eq!(
         db.wait(upsert_pull(db.db(), &pull)).unwrap(),
-        PullWrite::Tied
+        PullWrite::Tied("B".into())
     );
     assert_eq!(head(&db), "B", "a tie changes nothing by itself");
     // GitHub's answer says B2 is the head: the row is made to say so.
-    db.wait(upsert_pull_forced(db.db(), &pull)).unwrap();
+    assert!(db.wait(upsert_pull_if_tied(db.db(), &pull, "B")).unwrap());
     assert_eq!(head(&db), "B2");
     pull.head_sha = "C".into();
     pull.updated_at = 300;
@@ -1127,6 +1141,107 @@ fn a_delivery_older_than_the_recorded_pull_request_does_not_apply() {
         db.wait(upsert_pull(db.db(), &pull)).unwrap(),
         PullWrite::Applied
     );
+}
+
+#[test]
+fn a_tie_write_leaves_a_row_a_newer_delivery_moved() {
+    let db = setup();
+    let mut pull = NewPull {
+        repo_id: 7,
+        number: 9,
+        title: "t".into(),
+        head_ref: "f".into(),
+        base_ref: "main".into(),
+        author: "mallory".into(),
+        author_association: "FIRST_TIMER".into(),
+        head_repo_id: Some(99),
+        head_sha: "B".into(),
+        state: "open".into(),
+        updated_at: 200,
+    };
+    let head = |db: &TestDb| -> String {
+        db.column(
+            "SELECT head_sha AS h FROM ci_pulls WHERE number = 9",
+            &[],
+            "h",
+        )
+        .unwrap()
+    };
+    db.wait(upsert_pull(db.db(), &pull)).unwrap();
+    pull.head_sha = "B2".into();
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &pull)).unwrap(),
+        PullWrite::Tied("B".into())
+    );
+    // A newer delivery lands after the tie was found.
+    let mut newer = pull.clone();
+    newer.head_sha = "C".into();
+    newer.updated_at = 300;
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &newer)).unwrap(),
+        PullWrite::Applied
+    );
+    // The tie's write no longer applies, and the newer head stays.
+    assert!(!db.wait(upsert_pull_if_tied(db.db(), &pull, "B")).unwrap());
+    assert_eq!(head(&db), "C");
+    // A row still at the tie's time takes it.
+    newer.head_sha = "D".into();
+    assert_eq!(
+        db.wait(upsert_pull(db.db(), &newer)).unwrap(),
+        PullWrite::Tied("C".into())
+    );
+    // A same-second write with another head, since the tie, is kept too.
+    assert!(!db.wait(upsert_pull_if_tied(db.db(), &newer, "X")).unwrap());
+    assert!(db.wait(upsert_pull_if_tied(db.db(), &newer, "C")).unwrap());
+    assert_eq!(head(&db), "D");
+}
+
+/// Pins that an end pinned to an old head does nothing once the recorded head has moved.
+#[test]
+fn a_pinned_end_skips_when_the_recorded_head_moved() {
+    let db = setup();
+    let old = fork_run(&db, "o", 6, "old", "mallory", GateStatus::Pending, 1);
+    let new = fork_run(&db, "n", 6, "new", "mallory", GateStatus::Pending, 2);
+    // The row says `new`: an end pinned at `old` would cancel the newer
+    // run as superseded, and does nothing.
+    let ended = db
+        .wait(end_pull_gates_at_head(db.db(), 7, 6, "old", 9))
+        .unwrap();
+    assert_eq!(ended.len(), 0);
+    for id in [old.id, new.id] {
+        let gate: String = db
+            .column(
+                "SELECT gate_status AS g FROM ci_runs WHERE id = $1",
+                &params![id],
+                "g",
+            )
+            .unwrap();
+        assert_eq!(gate, "pending");
+    }
+    // Pinned at the recorded head, it ends the older run only.
+    let ended = db
+        .wait(end_pull_gates_at_head(db.db(), 7, 6, "new", 10))
+        .unwrap();
+    let ids: Vec<u64> = ended.iter().map(|run| run.id).collect();
+    assert_eq!(ids, [old.id]);
+    // A closed row at the pinned head ends nothing.
+    let third = fork_run(&db, "t", 6, "third", "mallory", GateStatus::Pending, 3);
+    db.run(
+        "UPDATE ci_pulls SET head_sha = 'new', state = 'closed' WHERE number = 6",
+        &[],
+    );
+    let ended = db
+        .wait(end_pull_gates_at_head(db.db(), 7, 6, "new", 11))
+        .unwrap();
+    assert_eq!(ended.len(), 0);
+    let gate: String = db
+        .column(
+            "SELECT gate_status AS g FROM ci_runs WHERE id = $1",
+            &params![third.id],
+            "g",
+        )
+        .unwrap();
+    assert_eq!(gate, "pending");
 }
 
 #[test]
@@ -1539,4 +1654,220 @@ fn a_pull_request_and_a_pull_request_target_run_of_one_workflow_both_exist() {
     assert_ne!(a.unwrap().id, b.unwrap().id);
     // The same key again finds the run it made instead of a second one.
     assert!(db.wait(insert_run(db.db(), &target)).unwrap().is_none());
+}
+
+/// Pins that a comment approves every waiting run at the head and no run at another head.
+#[test]
+fn a_comment_approves_every_waiting_run_at_the_head_and_no_other() {
+    let db = setup();
+    let ci = fork_run(&db, "d1", 4, "h1", "mallory", GateStatus::Pending, 10);
+    let target = target_run(&db, "d1:target", 4, "h1", GateStatus::Pending);
+    let mut lint = new_run("d1", "lint", 10);
+    lint.event = "pull_request".into();
+    lint.git_ref = "refs/pull/4/merge".into();
+    lint.sha = "h1".into();
+    lint.pull_number = Some(4);
+    lint.trust = Trust::Fork;
+    lint.gate_status = GateStatus::Deferred;
+    let lint = db.wait(insert_run(db.db(), &lint)).unwrap().unwrap();
+    // A run of an older commit of the same pull request, and a command
+    // run of the comment event on the same head, are not touched.
+    let old = fork_run(&db, "d0", 4, "h0", "mallory", GateStatus::Pending, 9);
+    put_pull(
+        &db,
+        &NewPull {
+            repo_id: 7,
+            number: 4,
+            title: "change".into(),
+            head_ref: "feature".into(),
+            base_ref: "main".into(),
+            author: "mallory".into(),
+            author_association: "NONE".into(),
+            head_repo_id: Some(99),
+            head_sha: "h1".into(),
+            state: "open".into(),
+            updated_at: 6_000_000,
+        },
+    );
+    let seen = db.wait(pull_runs_at(db.db(), 7, 4, "h1")).unwrap();
+    let ids: Vec<u64> = seen.iter().map(|run| run.id).collect();
+    assert_eq!(ids, [ci.id, target.id, lint.id]);
+    // Another repository, tenant or pull request finds nothing.
+    for (tenant, repo, number) in [("t1", 8, 4), ("t2", 7, 4), ("t1", 7, 5)] {
+        assert_eq!(
+            db.wait(approve_at_head(
+                db.db(),
+                tenant,
+                repo,
+                number,
+                "h1",
+                "m",
+                20,
+                BOTH
+            ))
+            .unwrap()
+            .len(),
+            0
+        );
+    }
+    let approved = db
+        .wait(approve_at_head(
+            db.db(),
+            "t1",
+            7,
+            4,
+            "h1",
+            "maintainer",
+            20,
+            BOTH,
+        ))
+        .unwrap();
+    let mut ids: Vec<u64> = approved.iter().map(|run| run.id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [ci.id, target.id, lint.id]);
+    assert!(approved.iter().all(|run| {
+        run.gate_status == GateStatus::Approved
+            && run.gate_by.as_deref() == Some("maintainer")
+            && run.gate_at == Some(20)
+    }));
+    let read = db.wait(super::run(db.db(), old.id)).unwrap().unwrap();
+    assert_eq!(read.gate_status, GateStatus::Pending);
+    // Whoever decides first wins; the second comment finds nothing.
+    assert_eq!(
+        db.wait(approve_at_head(
+            db.db(),
+            "t1",
+            7,
+            4,
+            "h1",
+            "again",
+            21,
+            BOTH
+        ))
+        .unwrap()
+        .len(),
+        0
+    );
+}
+
+#[test]
+fn a_comment_approves_only_the_events_it_is_given() {
+    let db = setup();
+    let ci = fork_run(&db, "d1", 4, "h1", "mallory", GateStatus::Pending, 10);
+    let target = target_run(&db, "d1:target", 4, "h1", GateStatus::Pending);
+    // With fork runs off the `pull_request` run stays as it is.
+    let approved = db
+        .wait(approve_at_head(
+            db.db(),
+            "t1",
+            7,
+            4,
+            "h1",
+            "maintainer",
+            20,
+            &["pull_request_target"],
+        ))
+        .unwrap();
+    let ids: Vec<u64> = approved.iter().map(|run| run.id).collect();
+    assert_eq!(ids, [target.id]);
+    let read = db.wait(super::run(db.db(), ci.id)).unwrap().unwrap();
+    assert_eq!(read.gate_status, GateStatus::Pending);
+    // No event, no approval.
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 4, "h1", "m", 21, &[]))
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+/// Pins that a comment does not revive an ended run, or approve one after a push or a close.
+#[test]
+fn a_comment_never_revives_an_ended_run_or_approves_after_a_push_or_close() {
+    let db = setup();
+    let cancelled = fork_run(&db, "d1", 4, "h1", "mallory", GateStatus::Cancelled, 10);
+    let expired = fork_run(&db, "d2", 4, "h1", "mallory", GateStatus::Expired, 10);
+    let done = fork_run(&db, "d3", 4, "h1", "mallory", GateStatus::Pending, 10);
+    db.run(
+        "UPDATE ci_runs SET status = 'completed' WHERE id = $1",
+        &params![done.id],
+    );
+    let none = fork_run(&db, "d4", 4, "h1", "mallory", GateStatus::NotGated, 10);
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 4, "h1", "m", 20, BOTH))
+            .unwrap()
+            .len(),
+        0
+    );
+    for id in [cancelled.id, expired.id, done.id, none.id] {
+        let read = db.wait(super::run(db.db(), id)).unwrap().unwrap();
+        assert_ne!(read.gate_by.as_deref(), Some("m"), "run {id}");
+    }
+    // A waiting run past its deadline, though not yet expired by the
+    // reconciler, stays waiting: the comment does not revive it.
+    let late = fork_run(&db, "d5", 5, "h5", "mallory", GateStatus::Pending, 10);
+    let after = 10 + APPROVAL_EXPIRES_MS + 1;
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 5, "h5", "m", after, BOTH))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.wait(approve_at_head(
+            db.db(),
+            "t1",
+            7,
+            5,
+            "h5",
+            "m",
+            after - 1,
+            BOTH
+        ))
+        .unwrap()
+        .len(),
+        1,
+        "run {} on time",
+        late.id
+    );
+    // A push moved the pull request to a new head: the old one is not
+    // approved. A closed pull request approves nothing either.
+    let old = fork_run(&db, "d6", 6, "h6", "mallory", GateStatus::Pending, 30);
+    db.run(
+        "UPDATE ci_pulls SET head_sha = 'h7' WHERE repo_id = 7 AND number = 6",
+        &[],
+    );
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 6, "h6", "m", 31, BOTH))
+            .unwrap()
+            .len(),
+        0
+    );
+    db.run(
+        "UPDATE ci_pulls SET head_sha = 'h6', state = 'closed' WHERE repo_id = 7 AND number = 6",
+        &[],
+    );
+    assert_eq!(
+        db.wait(approve_at_head(db.db(), "t1", 7, 6, "h6", "m", 31, BOTH))
+            .unwrap()
+            .len(),
+        0
+    );
+    let read = db.wait(super::run(db.db(), old.id)).unwrap().unwrap();
+    assert_eq!(read.gate_status, GateStatus::Pending);
+}
+
+#[test]
+fn the_runs_of_a_head_leave_out_what_other_events_made() {
+    let db = setup();
+    let fork = fork_run(&db, "d1", 4, "h1", "mallory", GateStatus::Pending, 10);
+    let mut comment = new_run("d2", "retest", 10);
+    comment.event = "issue_comment".into();
+    comment.pull_number = Some(4);
+    comment.head_sha = Some("h1".into());
+    db.wait(insert_run(db.db(), &comment)).unwrap().unwrap();
+    let seen = db.wait(pull_runs_at(db.db(), 7, 4, "h1")).unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].id, fork.id);
+    assert_eq!(db.wait(pull_runs_at(db.db(), 7, 4, "h2")).unwrap().len(), 0);
 }

@@ -772,6 +772,7 @@ async fn head(
     }))
 }
 
+/// Starts the workflow for one due schedule fire at the given head and logs the runs it created.
 async fn start(
     env: &Env,
     db: &Db,
@@ -808,7 +809,7 @@ async fn start(
             actor: "schedule",
             head_ref: "",
             base_ref: "",
-            workflow: Some(&fire.workflow),
+            workflows: Some(std::slice::from_ref(&fire.workflow)),
             origin: runs::Origin::own("schedule"),
         },
         &head.config,
