@@ -7,9 +7,11 @@
 //! This file holds every price and cap amount of the CI service. Nothing
 //! else in the workspace may hard-code one.
 
-/// The billing unit is one 2 vCPU second. The price of one 2 vCPU
-/// minute (60 units), in millionths of a dollar.
-pub const UNIT_PRICE_MICROS_PER_MINUTE: u64 = 2_000;
+/// The billing unit is one 2 vCPU second at the amd64 rate. The price
+/// of one amd64 2 vCPU minute (60 units), in millionths of a dollar.
+/// Changing this reprices every unit already recorded, so it only
+/// changes while there is nothing recorded to reprice.
+pub const UNIT_PRICE_MICROS_PER_MINUTE: u64 = 4_000;
 /// Jobs one organization may have launching or running at once.
 pub const MAX_RUNNING_JOBS: u32 = 5;
 /// The monthly spend cap until the owner changes it: $50.
@@ -39,12 +41,13 @@ pub struct Template {
     pub vcpu: u32,
     /// Memory in GiB.
     pub memory_gib: u32,
-    /// Price in millionths of a dollar per minute ($0.002 is `2_000`).
+    /// Price in millionths of a dollar per minute ($0.004 is `4_000`).
     pub price_micros_per_minute: u64,
 }
 
 impl Template {
-    /// Billing units of `seconds` on this template: seconds times vCPUs / 2.
+    /// Billing units of `seconds` on this template: the seconds weighted
+    /// by the template's price relative to the amd64 2 vCPU rate.
     #[must_use]
     pub fn units(&self, seconds: u64) -> u64 {
         seconds * self.price_micros_per_minute / UNIT_PRICE_MICROS_PER_MINUTE
@@ -58,56 +61,56 @@ pub const TEMPLATES: &[Template] = &[
         arch: Arch::Amd64,
         vcpu: 2,
         memory_gib: 8,
-        price_micros_per_minute: 2000,
+        price_micros_per_minute: 4000,
     },
     Template {
         labels: &["ubuntu-26.04-arm"],
         arch: Arch::Arm64,
         vcpu: 2,
         memory_gib: 8,
-        price_micros_per_minute: 2000,
+        price_micros_per_minute: 3500,
     },
     Template {
         labels: &["ubuntu-26.04-4core"],
         arch: Arch::Amd64,
         vcpu: 4,
         memory_gib: 16,
-        price_micros_per_minute: 4000,
+        price_micros_per_minute: 8000,
     },
     Template {
         labels: &["ubuntu-26.04-4core-arm"],
         arch: Arch::Arm64,
         vcpu: 4,
         memory_gib: 16,
-        price_micros_per_minute: 4000,
+        price_micros_per_minute: 6500,
     },
     Template {
         labels: &["ubuntu-26.04-8core"],
         arch: Arch::Amd64,
         vcpu: 8,
         memory_gib: 32,
-        price_micros_per_minute: 8000,
+        price_micros_per_minute: 16000,
     },
     Template {
         labels: &["ubuntu-26.04-8core-arm"],
         arch: Arch::Arm64,
         vcpu: 8,
         memory_gib: 32,
-        price_micros_per_minute: 8000,
+        price_micros_per_minute: 12000,
     },
     Template {
         labels: &["ubuntu-26.04-16core"],
         arch: Arch::Amd64,
         vcpu: 16,
         memory_gib: 64,
-        price_micros_per_minute: 16000,
+        price_micros_per_minute: 32000,
     },
     Template {
         labels: &["ubuntu-26.04-16core-arm"],
         arch: Arch::Arm64,
         vcpu: 16,
         memory_gib: 64,
-        price_micros_per_minute: 16000,
+        price_micros_per_minute: 23000,
     },
 ];
 
@@ -288,7 +291,7 @@ mod tests {
         let t = template("ubuntu-latest").unwrap();
         assert_eq!(
             (t.arch, t.vcpu, t.memory_gib, t.price_micros_per_minute),
-            (Arch::Amd64, 2, 8, 2_000)
+            (Arch::Amd64, 2, 8, 4_000)
         );
         assert!(std::ptr::eq(t, template("ubuntu-26.04").unwrap()));
     }
@@ -298,7 +301,7 @@ mod tests {
         let t = template("ubuntu-26.04-16core-arm").unwrap();
         assert_eq!(
             (t.arch, t.vcpu, t.memory_gib, t.price_micros_per_minute),
-            (Arch::Arm64, 16, 64, 16_000)
+            (Arch::Arm64, 16, 64, 23_000)
         );
     }
 
@@ -360,28 +363,36 @@ mod tests {
                     Arch::Amd64,
                     2,
                     8,
-                    2_000
+                    4_000
                 ),
-                (vec!["ubuntu-26.04-arm"], Arch::Arm64, 2, 8, 2_000),
-                (vec!["ubuntu-26.04-4core"], Arch::Amd64, 4, 16, 4_000),
-                (vec!["ubuntu-26.04-4core-arm"], Arch::Arm64, 4, 16, 4_000),
-                (vec!["ubuntu-26.04-8core"], Arch::Amd64, 8, 32, 8_000),
-                (vec!["ubuntu-26.04-8core-arm"], Arch::Arm64, 8, 32, 8_000),
-                (vec!["ubuntu-26.04-16core"], Arch::Amd64, 16, 64, 16_000),
-                (vec!["ubuntu-26.04-16core-arm"], Arch::Arm64, 16, 64, 16_000),
+                (vec!["ubuntu-26.04-arm"], Arch::Arm64, 2, 8, 3_500),
+                (vec!["ubuntu-26.04-4core"], Arch::Amd64, 4, 16, 8_000),
+                (vec!["ubuntu-26.04-4core-arm"], Arch::Arm64, 4, 16, 6_500),
+                (vec!["ubuntu-26.04-8core"], Arch::Amd64, 8, 32, 16_000),
+                (vec!["ubuntu-26.04-8core-arm"], Arch::Arm64, 8, 32, 12_000),
+                (vec!["ubuntu-26.04-16core"], Arch::Amd64, 16, 64, 32_000),
+                (vec!["ubuntu-26.04-16core-arm"], Arch::Arm64, 16, 64, 23_000),
             ]
         );
     }
 
     #[test]
-    fn prices_follow_vcpus() {
+    fn prices_follow_arch_ladders() {
         for t in TEMPLATES {
-            assert_eq!(
-                t.price_micros_per_minute,
-                u64::from(t.vcpu) * UNIT_PRICE_MICROS_PER_MINUTE / 2
-            );
+            if t.arch == Arch::Amd64 {
+                assert_eq!(
+                    t.price_micros_per_minute,
+                    u64::from(t.vcpu) * UNIT_PRICE_MICROS_PER_MINUTE / 2
+                );
+            }
             assert_eq!(t.memory_gib, 4 * t.vcpu);
         }
+        let arm: Vec<(u32, u64)> = TEMPLATES
+            .iter()
+            .filter(|t| t.arch == Arch::Arm64)
+            .map(|t| (t.vcpu, t.price_micros_per_minute))
+            .collect();
+        assert_eq!(arm, [(2, 3_500), (4, 6_500), (8, 12_000), (16, 23_000)]);
     }
 
     /// The first label of the template a vendor label maps to, and the
@@ -428,9 +439,9 @@ mod tests {
     }
 
     #[test]
-    fn units_are_two_vcpu_seconds() {
+    fn units_weight_seconds_by_template_price() {
         assert_eq!(template("ubuntu-latest").unwrap().units(61), 61);
-        assert_eq!(template("ubuntu-26.04-4core-arm").unwrap().units(60), 120);
+        assert_eq!(template("ubuntu-26.04-4core-arm").unwrap().units(60), 97);
         assert_eq!(template("ubuntu-26.04-8core").unwrap().units(90), 360);
         assert_eq!(template("ubuntu-26.04-16core").unwrap().units(90), 720);
     }
@@ -438,10 +449,10 @@ mod tests {
     #[test]
     fn spend_is_exact_with_no_free_units() {
         assert_eq!(spend_micros(0), 0);
-        assert_eq!(spend_micros(1), 33);
-        assert_eq!(spend_micros(3), 100);
-        assert_eq!(spend_micros(60), 2_000);
-        assert_eq!(spend_micros(1_500_000), 50_000_000);
+        assert_eq!(spend_micros(1), 66);
+        assert_eq!(spend_micros(3), 200);
+        assert_eq!(spend_micros(60), 4_000);
+        assert_eq!(spend_micros(1_500_000), 100_000_000);
     }
 
     #[test]

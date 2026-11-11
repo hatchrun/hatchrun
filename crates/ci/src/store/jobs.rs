@@ -358,9 +358,10 @@ const FINISH_JOB: &str = "UPDATE ci_jobs SET status = 'completed', conclusion = 
 /// already), or the job never started or has no template. A beta
 /// tenant's row is written already rejected, so Polar never gets it. Seconds run
 /// from start to completion, rounded up, at least 60. `$4` is the JSON
-/// map of label to price per minute and `$5` the price of one 2 vCPU
-/// minute, so the units (one 2 vCPU second each) are those of the price
-/// when the job ended; a label the map lacks records nothing.
+/// map of label to price per minute and `$5` the price of one amd64 2
+/// vCPU minute, so the units weight each second by the template's price
+/// relative to that rate, as priced when the job ended; a label the map
+/// lacks records nothing.
 const RECORD_USAGE: &str = "INSERT INTO ci_usage \
        (job_id, attempt, tenant_id, template, seconds, units, ended_at, \
         rejected_at, reject_reason) \

@@ -131,8 +131,8 @@ pub struct CiUsage<'a> {
     pub template: &'a str,
     /// The billed seconds of the attempt, at least 60.
     pub seconds: u64,
-    /// The billing units: the seconds weighted by the template, one
-    /// unit per 2 vCPU second.
+    /// The billing units: the seconds weighted by the template's price
+    /// relative to the amd64 2 vCPU rate.
     pub units: u64,
     /// When it completed, ISO 8601.
     pub at: String,
