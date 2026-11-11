@@ -17,6 +17,17 @@ fn on(scope: &'static str) -> CacheOwner<'static> {
     CacheOwner { scope, ..MAIN }
 }
 
+/// Upload `id` into `owner`'s scope, while it is not finalized.
+async fn pending_cache_entry(
+    db: &hatchrun_cloud::db::Db,
+    id: u64,
+    owner: CacheOwner<'_>,
+) -> worker::Result<Option<CacheRow>> {
+    Ok(cache_upload(db, id, owner)
+        .await?
+        .filter(|row| row.finalized_at.is_none()))
+}
+
 /// Starts an upload and finalizes it at `at`.
 fn save(db: &TestDb, owner: CacheOwner<'_>, version: &str, key: &str, at: u64) -> CacheRow {
     let row = db
@@ -517,4 +528,51 @@ fn a_flood_of_fork_entries_does_not_push_trusted_entries_out_of_their_share() {
     let keys: Vec<&str> = gone.iter().map(|row| row.key.as_str()).collect();
     assert_eq!(keys, ["base"], "the least recently used trusted entry");
     assert_eq!(db.wait(fork_cache_bytes(db.db(), "t1", 7)).unwrap(), 10_000);
+}
+
+#[test]
+fn a_retried_finalize_reads_refused_and_the_upload_stays_finalized() {
+    let db = setup();
+    let row = save(&db, MAIN, "v1", "deps", 10);
+    assert_eq!(
+        db.wait(finalize_cache_entry(db.db(), row.id, MAIN, 9, 99))
+            .unwrap(),
+        Finalized::Refused
+    );
+    let found = db
+        .wait(cache_upload(db.db(), row.id, MAIN))
+        .unwrap()
+        .unwrap();
+    assert_eq!((found.finalized_at, found.size), (Some(11), Some(100)));
+}
+
+#[test]
+fn a_lost_name_race_leaves_the_upload_pending() {
+    let db = setup();
+    save(&db, MAIN, "v1", "deps", 10);
+    let second = start(&db, "deps", 30);
+    assert_eq!(
+        db.wait(finalize_cache_entry(db.db(), second.id, MAIN, 5, 31))
+            .unwrap(),
+        Finalized::Refused
+    );
+    let found = db
+        .wait(cache_upload(db.db(), second.id, MAIN))
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.finalized_at, None);
+}
+
+#[test]
+fn the_upload_lookup_is_scoped_to_its_owner() {
+    let db = setup();
+    let row = save(&db, MAIN, "v1", "deps", 10);
+    let other_repo = CacheOwner { repo_id: 8, ..MAIN };
+    for owner in [on("refs/heads/dev"), other_repo] {
+        assert!(
+            db.wait(cache_upload(db.db(), row.id, owner))
+                .unwrap()
+                .is_none()
+        );
+    }
 }

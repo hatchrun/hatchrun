@@ -90,11 +90,11 @@ const START: &str = "INSERT INTO ci_cache_entries (tenant_id, repo_id, scope, ve
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9) RETURNING {columns}";
 
 /// The upload `$1` into scope `$4` of repository `$3` of tenant `$2`,
-/// which is not finalized.
-const PENDING: &str = "SELECT {columns} FROM ci_cache_entries \
-     WHERE id = $1 AND tenant_id = $2 AND repo_id = $3 AND scope = $4 AND finalized_at IS NULL";
+/// finalized or not.
+const UPLOAD: &str = "SELECT {columns} FROM ci_cache_entries \
+     WHERE id = $1 AND tenant_id = $2 AND repo_id = $3 AND scope = $4";
 
-/// Finalizes upload `$1` of the same owner as [`PENDING`] at `$5` with
+/// Finalizes upload `$1` of the same owner as [`UPLOAD`] at `$5` with
 /// `$6` bytes, unless a finalized entry holds its version and key. Two
 /// finalizes at once can both pass the check; the unique index stops the
 /// second, which [`finalize_cache_entry`] reads as a refusal.
@@ -106,7 +106,7 @@ const FINALIZE: &str = "UPDATE ci_cache_entries SET finalized_at = $5, last_acce
        AND held.version = ci_cache_entries.version AND held.key = ci_cache_entries.key \
        AND held.finalized_at IS NOT NULL)";
 
-/// Forgets upload `$1` of the same owner as [`PENDING`].
+/// Forgets upload `$1` of the same owner as [`UPLOAD`].
 const DROP_PENDING: &str = "DELETE FROM ci_cache_entries \
      WHERE id = $1 AND tenant_id = $2 AND repo_id = $3 AND scope = $4 AND finalized_at IS NULL";
 
@@ -268,18 +268,15 @@ pub async fn start_cache_entry(
     row.ok_or_else(|| worker::Error::RustError("cache insert returned no row".to_owned()))
 }
 
-/// Upload `id` into `owner`'s scope, while it is not finalized.
+/// Upload `id` into `owner`'s scope, finalized or not, so a retried
+/// complete finds the entry its first try made.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn pending_cache_entry(
-    db: &Db,
-    id: u64,
-    owner: CacheOwner<'_>,
-) -> Result<Option<CacheRow>> {
+pub async fn cache_upload(db: &Db, id: u64, owner: CacheOwner<'_>) -> Result<Option<CacheRow>> {
     db.first(
-        &with_columns(PENDING, CACHE_COLUMNS),
+        &with_columns(UPLOAD, CACHE_COLUMNS),
         &params![id, owner.tenant_id, owner.repo_id, owner.scope],
     )
     .await

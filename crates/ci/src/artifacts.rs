@@ -336,7 +336,16 @@ async fn start(ctx: &Context<'_>, request: StartRequest) -> Answer {
 
 /// The unfinished upload `id` of the job's run.
 async fn pending(ctx: &Context<'_>, id: &str) -> std::result::Result<ArtifactRow, Refusal> {
-    let row = store::pending_artifact(&ctx.db, id_of(id)?, ctx.run.id)
+    let row = upload(ctx, id).await?;
+    if row.finalized_at.is_some() {
+        return Err(Refusal::new(404, "no such upload"));
+    }
+    Ok(row)
+}
+
+/// Upload `id` of the run, finalized or not.
+async fn upload(ctx: &Context<'_>, id: &str) -> std::result::Result<ArtifactRow, Refusal> {
+    let row = store::artifact_upload(&ctx.db, id_of(id)?, ctx.run.id)
         .await?
         .ok_or_else(|| Refusal::new(404, "no such upload"))?;
     // The row's key must be one this run would have made.
@@ -389,11 +398,17 @@ async fn parts(ctx: &Context<'_>, id: &str, request: serde_json::Value) -> Answe
     json(&serde_json::json!({ "parts": parts }), 200)
 }
 
+/// Completes the upload. Idempotent per upload id: a retry of a
+/// complete that went through answers what the first did, and never
+/// touches the object.
 async fn complete(ctx: &Context<'_>, id: &str, request: serde_json::Value) -> Answer {
     let request: CompleteRequest = serde_json::from_value(request)
         .map_err(|err| Refusal::new(400, format!("bad request: {err}")))?;
     let parts = complete_parts(request.parts).map_err(|err| Refusal::new(400, err))?;
-    let row = pending(ctx, id).await?;
+    let row = upload(ctx, id).await?;
+    if row.finalized_at.is_some() {
+        return json(&serde_json::json!({ "id": row.id }), 200);
+    }
     let upload_id = row
         .upload_id
         .clone()
@@ -406,7 +421,17 @@ async fn complete(ctx: &Context<'_>, id: &str, request: serde_json::Value) -> An
         s3::complete_multipart_upload(&url, &upload_id, &parts),
     )
     .await?;
-    s3::completed(&response).map_err(aws_failure("CompleteMultipartUpload"))?;
+    let done = s3::completed(&response).map_err(aws_failure("CompleteMultipartUpload"))?;
+    if done == s3::Completed::NoUpload {
+        // S3 lost the upload: an earlier complete of it finished only if
+        // its object is there.
+        if object_size(ctx.settings, ctx.bucket, &credentials, &row.object_key)
+            .await?
+            .is_none()
+        {
+            return Err(Refusal::new(404, "no such upload"));
+        }
+    }
     let replaced = store::replaced_artifact(&ctx.db, row.id, ctx.run.id).await?;
     let done = store::finalize_artifact(
         &ctx.db,
@@ -430,6 +455,11 @@ async fn complete(ctx: &Context<'_>, id: &str, request: serde_json::Value) -> An
             json(&serde_json::json!({ "id": row.id }), 200)
         }
         Finalized::Refused => {
+            // A duplicate complete that lost the race to the first one.
+            let now = store::artifact_upload(&ctx.db, row.id, ctx.run.id).await?;
+            if now.is_some_and(|row| row.finalized_at.is_some()) {
+                return json(&serde_json::json!({ "id": row.id }), 200);
+            }
             // Another artifact took the name first. The object is of no
             // use; the lifecycle rule would remove it, this does it now.
             if let Err(err) = signed(ctx, &credentials, s3::delete_object(&url)).await {
@@ -521,6 +551,30 @@ async fn delete(ctx: &Context<'_>, request: NameRequest) -> Answer {
         Err(err) => console_warn!("artifacts: delete {}: {}", row.id, err.message),
     }
     json(&DeleteResponse { id: row.id }, 200)
+}
+
+/// The size of the object at `key`, `None` when there is none. The
+/// role has no `s3:ListBucket`, so S3 answers 403 for a missing key; a
+/// key under the granted prefix is not forbidden, so both mean absent.
+pub(crate) async fn object_size(
+    settings: &Settings,
+    bucket: &str,
+    credentials: &Credentials,
+    key: &str,
+) -> std::result::Result<Option<u64>, Refusal> {
+    let url = s3::object_url(
+        bucket,
+        &settings.ci_region,
+        settings.aws_endpoint.as_deref(),
+        key,
+    );
+    let response = sign_send(settings, credentials, s3::head_object(&url)).await?;
+    if matches!(response.status, 403 | 404) {
+        return Ok(None);
+    }
+    s3::content_length(&response)
+        .map(Some)
+        .map_err(aws_failure("HeadObject"))
 }
 
 pub(crate) fn now_ms() -> u64 {

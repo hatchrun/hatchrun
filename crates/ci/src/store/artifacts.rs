@@ -52,9 +52,8 @@ const START: &str = "INSERT INTO ci_artifacts (run_id, job_id, attempt, name, ob
 const BY_NAME: &str = "SELECT {columns} FROM ci_artifacts \
      WHERE run_id = $1 AND name = $2 AND finalized_at IS NOT NULL";
 
-/// The upload `$1` of run `$2`, which is not finalized.
-const PENDING: &str =
-    "SELECT {columns} FROM ci_artifacts WHERE id = $1 AND run_id = $2 AND finalized_at IS NULL";
+/// The upload `$1` of run `$2`, finalized or not.
+const UPLOAD: &str = "SELECT {columns} FROM ci_artifacts WHERE id = $1 AND run_id = $2";
 
 /// The finalized artifacts of run `$1`, those named `$2` and those with
 /// id `$3` when they are set.
@@ -110,7 +109,8 @@ pub enum Finalized {
     /// The upload is an artifact now.
     Done,
     /// The upload is gone or already finalized, or another artifact of
-    /// the run holds its name.
+    /// the run holds its name. A caller that must tell them apart reads
+    /// the row again.
     Refused,
 }
 
@@ -152,14 +152,15 @@ pub async fn artifact_by_name(db: &Db, run_id: u64, name: &str) -> Result<Option
     .await
 }
 
-/// Upload `id` of `run_id`, while it is not finalized.
+/// Upload `id` of `run_id`, finalized or not, so a retried complete
+/// finds the artifact its first try made.
 ///
 /// # Errors
 ///
 /// Postgres refused the statement.
-pub async fn pending_artifact(db: &Db, id: u64, run_id: u64) -> Result<Option<ArtifactRow>> {
+pub async fn artifact_upload(db: &Db, id: u64, run_id: u64) -> Result<Option<ArtifactRow>> {
     db.first(
-        &with_columns(PENDING, ARTIFACT_COLUMNS),
+        &with_columns(UPLOAD, ARTIFACT_COLUMNS),
         &params![id, run_id],
     )
     .await
