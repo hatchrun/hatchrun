@@ -40,7 +40,7 @@ pub use self::billing::{
 pub use self::browse::{
     BranchAfter, BranchRow, NewPull, PullAfter, PullHead, PullRow, PullWrite, RepoCounts,
     WorkflowRow, branches_page, pull_head, pulls_page, repo_counts, upsert_pull,
-    upsert_pull_forced, upsert_pull_if_tied, workflows_page,
+    upsert_pull_if_tied, workflows_page,
 };
 pub use self::cache::{
     CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, drop_pending_cache_entry,

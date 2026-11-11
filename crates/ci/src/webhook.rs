@@ -775,7 +775,12 @@ impl Cx<'_> {
     /// not in the deliveries; the pull request's head as GitHub has it
     /// now is. The delivery counts only when it names that head, and then
     /// the row is made to say so.
-    async fn tie_is_current(&self, pr: &PullRequest, record: &store::NewPull) -> Result<bool> {
+    async fn tie_is_current(
+        &self,
+        pr: &PullRequest,
+        record: &store::NewPull,
+        recorded: &str,
+    ) -> Result<bool> {
         let response = self
             .tokens
             .send(pr.installation_id, |token| {
@@ -792,9 +797,9 @@ impl Cx<'_> {
         if head != pr.head_sha {
             return Ok(false);
         }
-        // Only while the row is still at the tie: a newer delivery that
-        // moved it since wins, and this one is stale.
-        store::upsert_pull_if_tied(self.db, record).await
+        // Only while the row is still what it was at the tie: a delivery
+        // that moved it since wins, and this one is stale.
+        store::upsert_pull_if_tied(self.db, record, recorded).await
     }
 
     /// What a fork pull request becomes under its repository's policy:
@@ -828,6 +833,24 @@ impl Cx<'_> {
             _ => GateStatus::NotGated,
         };
         Ok(Ok(Some((gate, policy))))
+    }
+
+    /// Reads the recorded row of the pull request `comment` is on and
+    /// decides `/approve-run` pinned at `head` from it. Replies with why
+    /// and returns `true` when the row says to stop (closed, or another
+    /// head); `false` when it is open at `head`.
+    async fn stops_on_row(&self, comment: &IssueComment, head: &str, line: &str) -> Result<bool> {
+        let row = store::pull_head(self.db, comment.repo.id, comment.number).await?;
+        let Pin::Reply(text) = chatops::pin_against_row(row.as_ref(), head, line) else {
+            return Ok(false);
+        };
+        worker::console_warn!(
+            "{}: /approve-run on #{} found a newer pull request row",
+            comment.repo.full_name,
+            comment.number
+        );
+        self.reply(comment, &text).await;
+        Ok(true)
     }
 
     /// Cancels the runs of `pr` that wait for an approval, except those
@@ -984,7 +1007,7 @@ impl Cx<'_> {
         let applied = match store::upsert_pull(self.db, &record).await? {
             store::PullWrite::Applied => true,
             store::PullWrite::Stale => false,
-            store::PullWrite::Tied => self.tie_is_current(pr, &record).await?,
+            store::PullWrite::Tied(recorded) => self.tie_is_current(pr, &record, &recorded).await?,
         };
         // The base branch's workflows need nothing of the head: they run
         // whatever happens to the fork's, and a late delivery is as good
@@ -2008,26 +2031,15 @@ impl Cx<'_> {
         // approval is only given while it is open at the run's commit.
         let pr = pull_of_comment(comment, pull);
         let record = pull_record(&pr);
-        let written = match store::upsert_pull(self.db, &record).await? {
-            store::PullWrite::Applied => true,
-            store::PullWrite::Tied => store::upsert_pull_if_tied(self.db, &record).await?,
-            store::PullWrite::Stale => false,
-        };
-        if !written {
-            // Our snapshot is older than the row, so what it says of
-            // the head cannot decide which runs to cancel. The row
-            // is newer: the command goes on only if it still has the
-            // pinned head, and says why it stops otherwise.
-            let row = store::pull_head(self.db, repo_id, number).await?;
-            if let Pin::Reply(text) = chatops::pin_against_row(row.as_ref(), &head, &found.line) {
-                worker::console_warn!(
-                    "{}: /approve-run on #{} found a newer pull request row",
-                    comment.repo.full_name,
-                    number
-                );
-                self.reply(comment, &text).await;
-                return Ok(Vec::new());
-            }
+        // A snapshot that is not the newest word on the pull request
+        // (older than the row, or tied with it) never overwrites the row
+        // and cannot decide which runs to cancel. The row decides: the
+        // command goes on only if it is open at the pinned head, and says
+        // why it stops otherwise.
+        if store::upsert_pull(self.db, &record).await? != store::PullWrite::Applied
+            && self.stops_on_row(comment, &head, &found.line).await?
+        {
+            return Ok(Vec::new());
         }
         // The cancelling checks the row in its own statement: a newer
         // head recorded since the pin was checked is not superseded by
@@ -2036,12 +2048,9 @@ impl Cx<'_> {
         if !self
             .end_waiting_at_head(&pr, &head, fork::SUPERSEDED)
             .await?
+            && self.stops_on_row(comment, &head, &found.line).await?
         {
-            let row = store::pull_head(self.db, repo_id, number).await?;
-            if let Pin::Reply(text) = chatops::pin_against_row(row.as_ref(), &head, &found.line) {
-                self.reply(comment, &text).await;
-                return Ok(Vec::new());
-            }
+            return Ok(Vec::new());
         }
         // Approving needs no config, so what waits is approved before
         // anything is read from GitHub.
