@@ -12,7 +12,7 @@
 //!   entry exists.
 //! - `POST uploads/{id}/parts` answers presigned `UploadPart` URLs.
 //! - `POST uploads/{id}/complete` completes the upload; 409 when
-//!   another job saved the entry first.
+//!   another job saved the entry first. A retry answers 204 again.
 //! - `DELETE uploads/{id}` abandons it.
 //!
 //! The bytes are one S3 object per entry in the artifacts bucket of the
@@ -48,7 +48,8 @@ use hatchrun_cloud::{jwt, webcrypto};
 use worker::{Env, Method, Request, Response, Result, console_warn};
 
 use crate::artifacts::{
-    Answer, Refusal, aws_failure, body, check_job, credentials, json, now_ms, sign_send,
+    Answer, Refusal, aws_failure, body, check_job, credentials, json, now_ms, object_size,
+    sign_send,
 };
 use crate::env::Settings;
 use crate::store::{self, CacheOwner, CacheRow, Finalized, RunRow};
@@ -424,7 +425,16 @@ async fn start(ctx: &Context<'_>, request: UploadRequest) -> Answer {
 
 /// The unfinished upload `id` of the job's repository and ref.
 async fn pending(ctx: &Context<'_>, id: &str) -> std::result::Result<CacheRow, Refusal> {
-    let row = store::pending_cache_entry(&ctx.db, id_of(id)?, ctx.owner()?)
+    let row = upload(ctx, id).await?;
+    if row.finalized_at.is_some() {
+        return Err(Refusal::new(404, "no such upload"));
+    }
+    Ok(row)
+}
+
+/// Upload `id` into the run's scope, finalized or not.
+async fn upload(ctx: &Context<'_>, id: &str) -> std::result::Result<CacheRow, Refusal> {
+    let row = store::cache_upload(&ctx.db, id_of(id)?, ctx.owner()?)
         .await?
         .ok_or_else(|| Refusal::new(404, "no such upload"))?;
     // The row's key must be one this repository would have made.
@@ -461,6 +471,9 @@ async fn parts(ctx: &Context<'_>, id: &str, request: PartsRequest) -> Answer {
     json(&PartsResponse { parts }, 200)
 }
 
+/// Completes the upload. Idempotent per upload id: a retry of a
+/// complete that went through answers 204 again, and never touches the
+/// object.
 async fn complete(ctx: &Context<'_>, id: &str, request: CompleteRequest) -> Answer {
     let parts: Vec<s3::Part> = complete_parts(request.parts)
         .map_err(|err| Refusal::new(400, err))?
@@ -470,7 +483,10 @@ async fn complete(ctx: &Context<'_>, id: &str, request: CompleteRequest) -> Answ
             etag: part.etag,
         })
         .collect();
-    let row = pending(ctx, id).await?;
+    let row = upload(ctx, id).await?;
+    if row.finalized_at.is_some() {
+        return Ok(Response::empty()?.with_status(204));
+    }
     let upload_id = row
         .upload_id
         .clone()
@@ -483,23 +499,14 @@ async fn complete(ctx: &Context<'_>, id: &str, request: CompleteRequest) -> Answ
         s3::complete_multipart_upload(&url, &upload_id, &parts),
     )
     .await?;
-    let written = s3::completed(&response).map_err(aws_failure("CompleteMultipartUpload"))?;
-    if written == s3::Completed::Exists {
-        // The parts are of no use now, and nothing else would delete
-        // them or the object that stopped the upload.
-        for request in [
-            s3::abort_multipart_upload(&url, &upload_id),
-            s3::delete_object(&url),
-        ] {
-            if let Err(err) = signed(ctx, &credentials, request).await {
-                console_warn!("cache: clean up upload {}: {}", row.id, err.message);
-            }
-        }
-        store::drop_pending_cache_entry(&ctx.db, row.id, ctx.owner()?).await?;
-        return Err(Refusal::new(409, "another job saved the entry first"));
-    }
-    // The agent does not send the size, and S3 knows it.
-    let size = object_size(ctx, &credentials, &row.object_key).await?;
+    // Written and Exists both leave our object at the key. A lost upload
+    // leaves one only when an earlier complete finished.
+    s3::completed(&response).map_err(aws_failure("CompleteMultipartUpload"))?;
+    // The agent does not send the size, and S3 knows it. A missing object
+    // means a lost upload with nothing to finalize.
+    let size = object_size(ctx.settings, ctx.bucket, &credentials, &row.object_key)
+        .await?
+        .ok_or_else(|| Refusal::new(404, "no such upload"))?;
     let done = store::finalize_cache_entry(&ctx.db, row.id, ctx.owner()?, size, now_ms()).await?;
     match done {
         Finalized::Done => {
@@ -510,6 +517,11 @@ async fn complete(ctx: &Context<'_>, id: &str, request: CompleteRequest) -> Answ
             Ok(Response::empty()?.with_status(204))
         }
         Finalized::Refused => {
+            // A duplicate complete that lost the race to the first one.
+            let now = store::cache_upload(&ctx.db, row.id, ctx.owner()?).await?;
+            if now.is_some_and(|row| row.finalized_at.is_some()) {
+                return Ok(Response::empty()?.with_status(204));
+            }
             // Another job finalized the same entry first: this object
             // belongs to no row.
             if let Err(err) = signed(ctx, &credentials, s3::delete_object(&url)).await {
@@ -625,16 +637,6 @@ async fn delete_objects(
         }
     }
     deleted
-}
-
-/// The size of the object at `key`.
-async fn object_size(
-    ctx: &Context<'_>,
-    credentials: &Credentials,
-    key: &str,
-) -> std::result::Result<u64, Refusal> {
-    let response = signed(ctx, credentials, s3::head_object(&object_url(ctx, key))).await?;
-    s3::content_length(&response).map_err(aws_failure("HeadObject"))
 }
 
 fn object_url(ctx: &Context<'_>, key: &str) -> String {

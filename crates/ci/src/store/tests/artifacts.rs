@@ -5,6 +5,17 @@
 use super::*;
 use hatchrun_cloud::testdb::Db as TestDb;
 
+/// Upload `id` of `run_id`, while it is not finalized.
+async fn pending_artifact(
+    db: &hatchrun_cloud::db::Db,
+    id: u64,
+    run_id: u64,
+) -> worker::Result<Option<ArtifactRow>> {
+    Ok(artifact_upload(db, id, run_id)
+        .await?
+        .filter(|row| row.finalized_at.is_none()))
+}
+
 /// Starts an upload of job `job` and finalizes it.
 fn upload(db: &TestDb, run: u64, job: u64, attempt: u32, name: &str, size: u64) -> ArtifactRow {
     let row = start(db, run, job, attempt, name);
@@ -264,4 +275,54 @@ fn a_run_takes_its_artifacts_with_it() {
     db.run("DELETE FROM ci_runs WHERE id = $1", &params![run.id]);
     let left: Option<u64> = db.column("SELECT count(*) AS n FROM ci_artifacts", &[], "n");
     assert_eq!(left, Some(0));
+}
+
+#[test]
+fn a_retried_finalize_reads_refused_and_the_upload_stays_finalized() {
+    let db = setup();
+    let (run, job) = run_with_job(&db, "running");
+    let row = upload(&db, run.id, job, 1, "dist", 1);
+    assert_eq!(
+        db.wait(finalize_artifact(db.db(), row.id, run.id, 9, None, 99))
+            .unwrap(),
+        Finalized::Refused
+    );
+    let found = db
+        .wait(artifact_upload(db.db(), row.id, run.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!((found.finalized_at, found.size), (Some(50), Some(1)));
+}
+
+#[test]
+fn a_lost_name_race_leaves_the_upload_pending() {
+    let db = setup();
+    let (run, job) = run_with_job(&db, "running");
+    let ids = db
+        .wait(insert_jobs(db.db(), run.id, &[new_job("test")], 1_000))
+        .unwrap();
+    upload(&db, run.id, job, 1, "dist", 1);
+    let theirs = start(&db, run.id, ids[0].1, 5, "dist");
+    assert_eq!(
+        db.wait(finalize_artifact(db.db(), theirs.id, run.id, 2, None, 60))
+            .unwrap(),
+        Finalized::Refused
+    );
+    let found = db
+        .wait(artifact_upload(db.db(), theirs.id, run.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.finalized_at, None);
+}
+
+#[test]
+fn the_upload_lookup_is_scoped_to_its_run() {
+    let db = setup();
+    let (run, job) = run_with_job(&db, "running");
+    let row = upload(&db, run.id, job, 1, "dist", 1);
+    assert!(
+        db.wait(artifact_upload(db.db(), row.id, run.id + 1))
+            .unwrap()
+            .is_none()
+    );
 }

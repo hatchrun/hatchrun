@@ -4,6 +4,8 @@
 
 //! The Azure Blob upload to the URL a create hands out.
 
+use std::sync::MutexGuard;
+
 use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
@@ -13,10 +15,18 @@ use tracing::warn;
 
 use super::blob::{Chunker, Operation, Placement};
 use super::cloud::Part;
-use super::{MAX_SMALL_BODY, Reply, State, Upload, azure_error, blob, created, lock};
+use super::{MAX_SMALL_BODY, Reply, State, Upload, UploadState, azure_error, blob, created, lock};
 
 pub(super) async fn put(state: &State, id: &str, req: Request<Incoming>) -> Reply {
-    let upload = lock(&state.uploads).by_id.get(id).cloned();
+    // An upload that is finalizing or settled takes no more data.
+    let upload = {
+        let uploads = lock(&state.uploads);
+        uploads
+            .by_id
+            .get(id)
+            .filter(|upload| upload.idle())
+            .cloned()
+    };
     let Some(upload) = upload else {
         return azure_error(
             state,
@@ -41,6 +51,16 @@ pub(super) async fn put(state: &State, id: &str, req: Request<Incoming>) -> Repl
             azure_error(state, &err)
         }
     }
+}
+
+/// The upload's state for a write, or the 404 of an upload that has
+/// settled meanwhile: the data is dropped.
+fn open(upload: &Upload) -> Result<MutexGuard<'_, UploadState>, blob::Error> {
+    let state = upload.lock();
+    if state.settled {
+        return Err(blob::Error::new(404, "BlobNotFound", "no such upload"));
+    }
+    Ok(state)
 }
 
 /// Uploads a part, marking the upload failed when it does not arrive.
@@ -81,7 +101,7 @@ async fn put_blob(upload: &Upload, mut body: Incoming) -> Result<(), blob::Error
         number = next_part(number)?;
         parts.push(put_part(upload, number, last).await?);
     }
-    upload.lock().committed = Some(parts);
+    open(upload)?.committed = Some(parts);
     Ok(())
 }
 
@@ -125,7 +145,7 @@ async fn put_block(
     block: &str,
     body: Incoming,
 ) -> Result<(), blob::Error> {
-    let placement = upload.lock().blocks.place(block)?;
+    let placement = open(upload)?.blocks.place(block)?;
     let _permit = state
         .blocks
         .acquire()
@@ -139,13 +159,13 @@ async fn put_block(
     match placement {
         Placement::Part(number) => {
             let part = put_part(upload, number, bytes).await?;
-            upload.lock().blocks.uploaded(block, part);
+            open(upload)?.blocks.uploaded(block, part);
         }
         Placement::Append => {
-            let full = upload.lock().blocks.append(block, bytes)?;
+            let full = open(upload)?.blocks.append(block, bytes)?;
             for (number, bytes) in full {
                 let part = put_part(upload, number, bytes).await?;
-                upload.lock().blocks.joined(part);
+                open(upload)?.blocks.joined(part);
             }
         }
     }
@@ -161,10 +181,10 @@ async fn put_block_list(upload: &Upload, body: Incoming) -> Result<(), blob::Err
     let xml = std::str::from_utf8(&bytes)
         .map_err(|_| blob::Error::new(400, "InvalidXmlDocument", "the block list is not UTF-8"))?;
     let ids = blob::block_list(xml)?;
-    let blob::Commit { mut parts, tail } = upload.lock().blocks.commit(&ids)?;
+    let blob::Commit { mut parts, tail } = open(upload)?.blocks.commit(&ids)?;
     if let Some((number, bytes)) = tail {
         parts.push(put_part(upload, number, bytes).await?);
     }
-    upload.lock().committed = Some(parts);
+    open(upload)?.committed = Some(parts);
     Ok(())
 }

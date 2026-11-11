@@ -29,8 +29,8 @@ mod secrets;
 mod tenants;
 
 pub use self::artifacts::{
-    ArtifactRow, Finalized, artifact_by_name, artifact_count, artifacts, delete_artifact,
-    drop_pending_artifact, finalize_artifact, pending_artifact, replaced_artifact, start_artifact,
+    ArtifactRow, Finalized, artifact_by_name, artifact_count, artifact_upload, artifacts,
+    delete_artifact, drop_pending_artifact, finalize_artifact, replaced_artifact, start_artifact,
 };
 pub use self::audit::{Action, AuditRow, NewAudit, audit_page, record_audit};
 pub use self::billing::{
@@ -43,10 +43,10 @@ pub use self::browse::{
     upsert_pull_if_tied, workflows_page,
 };
 pub use self::cache::{
-    CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, drop_pending_cache_entry,
+    CacheOwner, CacheRow, TOUCH_EVERY_MS, cache_entry, cache_upload, drop_pending_cache_entry,
     evict_idle_cache_entries, evict_over_fork_quota_cache_entries, evict_over_quota_cache_entries,
-    finalize_cache_entry, fork_cache_bytes, lookup_cache_entry, pending_cache_entry,
-    start_cache_entry, touch_cache_entry,
+    finalize_cache_entry, fork_cache_bytes, lookup_cache_entry, start_cache_entry,
+    touch_cache_entry,
 };
 pub use self::concurrency::{
     Blocker, NewSlot, Slot, Victim, blocker, enter, leave, register, slots, unfinished_superseded,

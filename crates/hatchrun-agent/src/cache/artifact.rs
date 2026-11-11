@@ -15,8 +15,6 @@
 //! it; the URL is a download URL of this proxy for the presigned S3 GET,
 //! like a cache hit.
 
-use std::sync::{Arc, Mutex};
-
 use anyhow::{Result, anyhow};
 use hatchrun_workflow::artifacts as wire;
 use hyper::body::Incoming;
@@ -28,11 +26,11 @@ use super::artifact_twirp::{
     self as twirp, CreateRequest, CreateResponse, DeleteResponse, FinalizeRequest,
     FinalizeResponse, ListRequest, ListResponse, Listed, NamedRequest, Rpc, UrlResponse,
 };
-use super::cloud::{Cloud, JobEnded, Part, answer};
-use super::rpc::{abandon, body, malformed};
+use super::cloud::{Cloud, Part, UploadGone, answer};
+use super::rpc::{abandon, body, malformed, settle};
 use super::{
-    Artifacts, DOWNLOAD_PATH, Download, Reply, State, UPLOAD_PATH, Upload, UploadState,
-    download_token, json, lock, refusal, twirp_error,
+    Artifacts, DOWNLOAD_PATH, Download, Outcome, Reply, State, UPLOAD_PATH, Upload, download_token,
+    json, lock, refusal, twirp_error,
 };
 
 /// The version an artifact upload has in the upload table, which cache
@@ -86,6 +84,7 @@ pub(super) async fn serve(
     }
 }
 
+/// Reserves the name and hands out an upload URL for it.
 async fn create(state: &State, cloud: &Cloud, request: CreateRequest) -> Reply {
     if let Err(msg) = wire::check_name(&request.name) {
         return twirp_error(StatusCode::BAD_REQUEST, "invalid_argument", msg);
@@ -109,27 +108,14 @@ async fn create(state: &State, cloud: &Cloud, request: CreateRequest) -> Reply {
         }
     };
     let url = format!("{}{UPLOAD_PATH}{id}", state.base);
-    let replaced = {
-        let mut uploads = lock(&state.uploads);
-        let old = uploads
-            .by_entry
-            .insert(
-                (request.name.clone(), ARTIFACT_VERSION.to_owned()),
-                id.clone(),
-            )
-            .and_then(|old| uploads.by_id.remove(&old));
-        uploads.by_id.insert(
-            id.clone(),
-            Arc::new(Upload {
-                id,
-                cloud: cloud.clone(),
-                state: Mutex::new(UploadState::default()),
-            }),
-        );
-        old
-    };
+    let replaced = lock(&state.uploads).replace(
+        (request.name.clone(), ARTIFACT_VERSION.to_owned()),
+        Upload::new(id, cloud.clone()),
+    );
     // A client that creates the name again has given up on the earlier
-    // upload; its S3 multipart upload and pending row would stay.
+    // upload; its S3 multipart upload and pending row would stay. One
+    // that is finalizing or settled is not given up: its answer may be on
+    // the way or lost.
     if let Some(old) = replaced {
         warn!(
             name = request.name,
@@ -144,15 +130,10 @@ async fn create(state: &State, cloud: &Cloud, request: CreateRequest) -> Reply {
     })
 }
 
+/// Completes the upload of the name, once however often it is asked.
 async fn finalize(state: &State, request: FinalizeRequest) -> Reply {
     let entry = (request.name.clone(), ARTIFACT_VERSION.to_owned());
-    let upload = {
-        let mut uploads = lock(&state.uploads);
-        uploads
-            .by_entry
-            .remove(&entry)
-            .and_then(|id| uploads.by_id.remove(&id))
-    };
+    let upload = lock(&state.uploads).claim(&entry);
     let refuse = || {
         json(&FinalizeResponse {
             ok: false,
@@ -163,46 +144,33 @@ async fn finalize(state: &State, request: FinalizeRequest) -> Reply {
         warn!(name = request.name, "no artifact upload to finalize");
         return refuse();
     };
-    let parts = {
-        let mut upload = upload.lock();
-        if upload.failed {
-            None
-        } else {
-            upload.committed.take()
-        }
-    };
-    let Some(parts) = parts else {
-        abandon(&upload).await;
-        warn!(
-            name = request.name,
-            "artifact finalized without a whole upload"
-        );
-        return refuse();
-    };
     let size = u64::try_from(request.size).unwrap_or(0);
-    match upload
-        .cloud
-        .complete_artifact(&upload.id, &parts, size, request.hash.as_deref())
-        .await
-    {
-        Ok(Some(id)) => {
+    let lost = format!("another job saved {} first", request.name);
+    let up = &*upload;
+    let hash = request.hash.as_deref();
+    let outcome = settle(up, &lost, |parts| async move {
+        let saved = up
+            .cloud
+            .complete_artifact(&up.id, &parts, size, hash)
+            .await?;
+        Ok(saved.map(|id| id.to_string()))
+    })
+    .await;
+    match outcome {
+        Ok(Outcome::Saved(id)) => {
             info!(name = request.name, size, "artifact saved");
             json(&FinalizeResponse {
                 ok: true,
-                artifact_id: id.to_string(),
+                artifact_id: id,
             })
         }
-        Ok(None) => {
-            info!(name = request.name, "another job saved the artifact first");
+        Ok(Outcome::Refused(message)) => {
+            info!(name = request.name, "artifact not saved: {message}");
             refuse()
         }
         Err(err) => {
             warn!(name = request.name, "artifact save failed: {err:#}");
-            abandon(&upload).await;
-            if err.downcast_ref::<JobEnded>().is_some() {
-                return refusal(&err);
-            }
-            refuse()
+            refusal(&err)
         }
     }
 }
@@ -311,7 +279,7 @@ impl Cloud {
     }
 
     /// Completes an upload and makes it an artifact; its id, or `None`
-    /// when the name was taken first.
+    /// when the name was taken first; a 404 is [`UploadGone`].
     async fn complete_artifact(
         &self,
         upload: &str,
@@ -333,8 +301,10 @@ impl Cloud {
         let response = self
             .post(&["uploads", upload, "complete"], &request)
             .await?;
-        if response.status() == StatusCode::CONFLICT {
-            return Ok(None);
+        match response.status() {
+            StatusCode::CONFLICT => return Ok(None),
+            StatusCode::NOT_FOUND => return Err(UploadGone.into()),
+            _ => {}
         }
         let done: Done = answer(response, "complete artifact").await?.json().await?;
         Ok(Some(done.id))

@@ -217,13 +217,15 @@ impl Cloud {
     }
 
     /// Completes an upload. `false` when another job saved the entry
-    /// first.
+    /// first. A 404 is [`UploadGone`], not a lost race.
     pub async fn complete(&self, upload: &str, parts: &[Part]) -> Result<bool> {
         let response = self
             .post(&["uploads", upload, "complete"], &CompleteRequest { parts })
             .await?;
-        if response.status() == StatusCode::CONFLICT {
-            return Ok(false);
+        match response.status() {
+            StatusCode::CONFLICT => return Ok(false),
+            StatusCode::NOT_FOUND => return Err(UploadGone.into()),
+            _ => {}
         }
         answer(response, "complete upload").await?;
         Ok(true)
@@ -265,6 +267,19 @@ impl std::fmt::Display for JobEnded {
 }
 
 impl std::error::Error for JobEnded {}
+
+/// The control plane answered `404` to a complete: it has no such upload,
+/// as after an earlier lost answer to a refused complete.
+#[derive(Debug)]
+pub(super) struct UploadGone;
+
+impl std::fmt::Display for UploadGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the upload is gone")
+    }
+}
+
+impl std::error::Error for UploadGone {}
 
 /// The control plane refused a call: its status and the start of its
 /// body.

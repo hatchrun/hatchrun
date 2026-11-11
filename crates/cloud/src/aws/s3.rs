@@ -257,8 +257,8 @@ pub struct Part {
 }
 
 /// Completes `upload_id` from `parts`, in order. `If-None-Match: *`
-/// makes S3 refuse when the key already exists, so of two jobs saving
-/// the same key the first one wins.
+/// makes S3 refuse when the key already exists. Keys are one upload's
+/// own, so that happens only to a repeat of a complete that finished.
 #[must_use]
 pub fn complete_multipart_upload(object_url: &str, upload_id: &str, parts: &[Part]) -> Request {
     let mut body = String::from("<CompleteMultipartUpload>");
@@ -285,8 +285,11 @@ pub fn complete_multipart_upload(object_url: &str, upload_id: &str, parts: &[Par
 pub enum Completed {
     /// The object exists now.
     Written,
-    /// Another upload wrote the key first.
+    /// The key exists already. Keys are one upload's own, so an earlier
+    /// complete of the same upload wrote it.
     Exists,
+    /// S3 no longer has the upload: it was completed or aborted.
+    NoUpload,
 }
 
 /// Reads a `CompleteMultipartUpload` answer. S3 can answer 200 and
@@ -299,12 +302,19 @@ pub fn completed(response: &Response) -> Result<Completed, Error> {
     if response.status == 412 {
         return Ok(Completed::Exists);
     }
-    let doc = document(response)?;
+    let doc = match document(response) {
+        Ok(doc) => doc,
+        Err(err) if err.code == "NoSuchUpload" => return Ok(Completed::NoUpload),
+        Err(err) => return Err(err),
+    };
     let root = doc.root_element();
     if root.has_tag_name("Error") {
         let code = child_text(root, "Code").unwrap_or_default();
         if code == "PreconditionFailed" {
             return Ok(Completed::Exists);
+        }
+        if code == "NoSuchUpload" {
+            return Ok(Completed::NoUpload);
         }
         return Err(Error {
             status: response.status,
@@ -522,6 +532,14 @@ mod tests {
             Completed::Written
         );
         assert_eq!(completed(&response(412, "")).unwrap(), Completed::Exists);
+        assert_eq!(
+            completed(&response(
+                404,
+                "<Error><Code>NoSuchUpload</Code><Message>gone</Message></Error>"
+            ))
+            .unwrap(),
+            Completed::NoUpload
+        );
         // S3 can fail a complete after answering 200.
         let failed = completed(&response(
             200,

@@ -11,6 +11,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 
 mod artifacts;
+mod finalize;
 
 const RPC: &str = "/twirp/github.actions.results.api.v1.CacheService/";
 

@@ -45,7 +45,7 @@ mod upload;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -206,11 +206,73 @@ struct Uploads {
     by_entry: HashMap<(String, String), String>,
 }
 
+impl Uploads {
+    /// The upload of `entry`, claimed. The claim is taken under the lock
+    /// that `replace` and `stop` check idleness under, so neither can
+    /// abandon the upload between the lookup and the finalize.
+    fn claim(&self, entry: &(String, String)) -> Option<Claim> {
+        let upload = self.by_id.get(self.by_entry.get(entry)?)?;
+        upload.claims.fetch_add(1, Ordering::SeqCst);
+        Some(Claim(Arc::clone(upload)))
+    }
+
+    /// Makes `upload` the one for `entry`. The upload it replaces is
+    /// returned to abandon when it is idle. One that is finalizing or
+    /// settled stays in `by_id`: `stop` aborts it once it is idle, and
+    /// until then the control plane's stale-upload sweep and the S3
+    /// lifecycle rule are its cleanup.
+    fn replace(&mut self, entry: (String, String), upload: Arc<Upload>) -> Option<Arc<Upload>> {
+        let old = self.by_entry.insert(entry, upload.id.clone());
+        self.by_id.insert(upload.id.clone(), upload);
+        let old = self.by_id.get(&old?)?;
+        if !old.idle() {
+            return None;
+        }
+        let old = Arc::clone(old);
+        self.by_id.remove(&old.id);
+        Some(old)
+    }
+}
+
+/// A finalize's hold on an upload, released when it returns or is
+/// dropped.
+struct Claim(Arc<Upload>);
+
+impl std::ops::Deref for Claim {
+    type Target = Upload;
+
+    fn deref(&self) -> &Upload {
+        &self.0
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.claims.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 struct Upload {
     id: String,
     /// The service the upload goes to.
     cloud: Cloud,
     state: Mutex<UploadState>,
+    /// The definitive answer of the finalize, once there is one. Held
+    /// across the call to the control plane, so finalizes of one upload
+    /// run one at a time and a repeat gets the same answer. Dropping a
+    /// request mid-finalize releases it with no answer, so a retry runs.
+    outcome: tokio::sync::Mutex<Option<Outcome>>,
+    /// Finalizes that looked the upload up and have not returned.
+    claims: AtomicUsize,
+}
+
+/// What a finalize came to.
+#[derive(Clone)]
+enum Outcome {
+    /// Saved, as this id.
+    Saved(String),
+    /// Not saved, and why.
+    Refused(String),
 }
 
 #[derive(Default)]
@@ -222,6 +284,9 @@ struct UploadState {
     /// A part failed to reach S3. A client retrying the block would not
     /// bring it back, so the upload cannot finish.
     failed: bool,
+    /// The finalize settled. Nothing is kept, and a put still streaming
+    /// drops its data.
+    settled: bool,
 }
 
 /// Locks `m`, taking the data back from a poisoned lock. One panicking
@@ -231,6 +296,26 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Upload {
+    /// No finalize holds the upload and none has settled, so it is still
+    /// the proxy's to abandon. Call under the uploads lock, which
+    /// claims are taken under.
+    fn idle(&self) -> bool {
+        self.claims.load(Ordering::SeqCst) == 0
+            && self.outcome.try_lock().is_ok_and(|done| done.is_none())
+    }
+
+    /// A new upload with nothing received.
+    fn new(id: String, cloud: Cloud) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            cloud,
+            state: Mutex::new(UploadState::default()),
+            outcome: tokio::sync::Mutex::new(None),
+            claims: AtomicUsize::new(0),
+        })
+    }
+
+    /// Locks the upload's blocks and parts.
     fn lock(&self) -> MutexGuard<'_, UploadState> {
         lock(&self.state)
     }
@@ -349,14 +434,20 @@ impl Proxy {
     }
 
     /// Stops serving and abandons the uploads the job started and never
-    /// finalized.
+    /// finalized. An upload with a finalize in flight or settled is left
+    /// alone: the control plane's stale-upload sweep and the S3 lifecycle
+    /// rule clean up after it.
     pub async fn stop(self) {
         self.server.abort();
-        let uploads: Vec<(String, Cloud)> = lock(&self.state.uploads)
-            .by_id
-            .values()
-            .map(|upload| (upload.id.clone(), upload.cloud.clone()))
-            .collect();
+        let uploads: Vec<(String, Cloud)> = {
+            let uploads = lock(&self.state.uploads);
+            uploads
+                .by_id
+                .values()
+                .filter(|upload| upload.idle())
+                .map(|upload| (upload.id.clone(), upload.cloud.clone()))
+                .collect()
+        };
         for (id, cloud) in uploads {
             match tokio::time::timeout(Duration::from_secs(3), cloud.abort(&id)).await {
                 Ok(Ok(())) => debug!(upload = id, "abandoned unfinished cache upload"),
