@@ -1,6 +1,8 @@
 name: dco
 
-on: pull_request
+on:
+  pull_request:
+  merge_group:
 
 permissions:
   contents: read
@@ -9,6 +11,13 @@ jobs:
   dco:
     runs-on: ubuntu-latest
     steps:
+      # Merge queue entries are tested on a temporary branch assembled from
+      # already-approved PRs, each of which passed this check individually.
+      # Report success without re-checking so the required status resolves.
+      - name: Skip DCO check on merge group
+        if: github.event_name == 'merge_group'
+        run: exit 0
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
