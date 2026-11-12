@@ -15,7 +15,6 @@ path = [
   ".gitignore",
   "Cargo.lock",
   "fuzz/Cargo.lock",
-  "crates/ci/r2-lifecycle.json",
   "crates/ci/testdata/*.json",
   "crates/ci/tests/e2e/*.json",
   "crates/cli/tests/fixtures/e2e/**/*.json",

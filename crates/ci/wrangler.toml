@@ -49,8 +49,8 @@ new_sqlite_classes = ["RunObject"]
 # enterprise tenants):
 # logs/<days>d/<tenant>/<repo_id>/<run>/<job>/<attempt>.log.gz and its
 # .index.json, and state/<days>d/<tenant>/<run>.json.
-# Created by hand once; deploy-ci.yml applies r2-lifecycle.json, which
-# has one rule per tier and prefix.
+# Its lifecycle rules, one per tier and prefix, are managed with
+# Terraform outside this repository.
 [[r2_buckets]]
 binding = "LOGS"
 bucket_name = "hatchrun-ci-logs"
@@ -113,9 +113,8 @@ secret_name = "ci-secrets-key-2026-10"
 # key of job tokens), POLAR_ACCESS_TOKEN (the usage events only; the
 # same token hatchrun-cloud holds) and ALERT_EMAIL (the inbox alerts go
 # to), uploaded by deploy-ci.yml, and CI_ROLE_ARN, set once on the
-# Worker by hand: the RoleArn output of
-# deploy/cloudformation/ci-account.yaml, the role the Worker assumes in
-# the CI AWS account. The Worker finds the
+# Worker by hand: the ARN of the LauncherRole, the role the Worker
+# assumes in the CI AWS account. The Worker finds the
 # launch template and subnets there by name and tag.
 # Variables: those below.
 [vars]
@@ -142,9 +141,9 @@ OIDC_KEY_ID = "2026-10-14"
 CI_OIDC_KEY_ID = "2026-11-03"
 # The region of the CI AWS account, where jobs run.
 CI_REGION = "us-east-1"
-# The S3 bucket of job artifacts: the ArtifactsBucket output of
-# deploy/cloudformation/ci-account.yaml. A bucket name is an id, not a
-# secret, and is committed here like the other ids in this file. The
+# The S3 bucket of job artifacts, managed with Terraform. A bucket
+# name is an id, not a secret, and is committed here like the other ids
+# in this file. The
 # agent gets the artifact service and the job cache, which keeps its
 # entries under cache/, only once it is set.
 ARTIFACTS_BUCKET = "hatchrun-ci-artifactsbucket-flrtihmpyo4z"

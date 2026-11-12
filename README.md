@@ -164,8 +164,8 @@ active or trialing subscription.
 ### OIDC issuer
 
 hatchrun CI reaches its AWS account by signing a five-minute token
-for `tenant:hatchrun-ci` and trading it for the role that
-[`ci-account.yaml`](deploy/cloudformation/ci-account.yaml) creates,
+for `tenant:hatchrun-ci` and trading it for the LauncherRole (defined
+by the Terraform module `terraform-aws-hatchrun`),
 through `AssumeRoleWithWebIdentity`. STS checks the token against the
 keys the Worker serves on `oidc.hatchrun.io`:
 

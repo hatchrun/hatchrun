@@ -8,8 +8,8 @@
 //!
 //! The bytes are one S3 object per artifact in the CI account's bucket,
 //! at `artifacts/<days>d/<tenant>/<repo id>/<run id>/<random>`, where
-//! `days` is the retention tier of the run (the lifecycle rules in
-//! `deploy/cloudformation/ci-account.yaml` delete by that prefix). The
+//! `days` is the retention tier of the run (the bucket's lifecycle rules
+//! delete by that prefix). The
 //! key and every query come from the job token's run, never from a
 //! request: the token names the job, the job row names the run, and the
 //! run row names the tenant and repository. A job therefore reads and

@@ -438,7 +438,7 @@ impl LogWriter {
 }
 
 /// Whether `days` is a retention tier: 30, or 90 for enterprise tenants.
-/// The R2 lifecycle rules of `r2-lifecycle.json` are one per tier.
+/// The logs bucket has one R2 lifecycle rule per tier.
 #[must_use]
 pub fn is_tier(days: u32) -> bool {
     matches!(days, 30 | 90)
